@@ -1,0 +1,180 @@
+# Publishes the container images and the Linux binaries for a tagged release.
+#
+# Triggered by pushing a version tag:
+#
+#   git tag v0.1.0 && git push origin v0.1.0
+#
+# A manual run builds and uploads artifacts but publishes nothing, so the whole
+# path can be exercised without cutting a release.
+name: release
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  # Both targets are cross-compiled from the x86 runner with cargo-zigbuild,
+  # which is what `cargo xtask build` already uses locally. The C dependencies
+  # (rusqlite's bundled sqlite, ring, userfaultfd) need a musl toolchain for
+  # the *target*, which plain musl-tools only provides for the host.
+  build:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        include:
+          - arch: x86_64
+            docker_arch: amd64
+            target: x86_64-unknown-linux-musl
+          - arch: aarch64
+            docker_arch: arm64
+            target: aarch64-unknown-linux-musl
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Resolve version
+        id: version
+        # A tag is authoritative; a manual run has none, so it falls back to the
+        # workspace version and a short sha, which cannot be mistaken for a
+        # release.
+        run: |
+          if [ "${GITHUB_REF_TYPE}" = "tag" ]; then
+            echo "version=${GITHUB_REF_NAME#v}" >> "$GITHUB_OUTPUT"
+          else
+            crate=$(grep -m1 '^version' Cargo.toml | cut -d'"' -f2)
+            echo "version=${crate}-dev.${GITHUB_SHA::7}" >> "$GITHUB_OUTPUT"
+          fi
+
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/bin
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+            target
+          key: ${{ runner.os }}-${{ matrix.target }}-cargo-${{ hashFiles('Cargo.lock') }}
+          restore-keys: ${{ runner.os }}-${{ matrix.target }}-cargo-
+
+      - name: Install cross toolchain
+        run: |
+          set -eu
+          python3 -m pip install ziglang
+          command -v cargo-zigbuild >/dev/null || cargo install cargo-zigbuild --locked
+          rustup target add ${{ matrix.target }}
+
+      # Same invocation `cargo xtask build` wraps, spelled out here: the wrapper
+      # only adds `rustup target add`, which the step above already did.
+      # burrow-agent is the guest init rather than a host binary, but the node
+      # copies it into every template it builds, so it is built too.
+      - name: Build
+        run: |
+          cargo zigbuild --release --target ${{ matrix.target }} \
+            -p burrow-orchestrator -p burrow-daemon -p burrow-cli -p burrow-agent
+
+      # Two layouts of the same four binaries: dist/<docker-arch>/ is what the
+      # Dockerfiles COPY from, and release/ is what people download.
+      - name: Stage
+        run: |
+          set -eu
+          out=target/${{ matrix.target }}/release
+          mkdir -p dist/${{ matrix.docker_arch }} release
+          for bin in burrow-orchestrator burrowd burrow burrow-agent; do
+            cp "$out/$bin" "dist/${{ matrix.docker_arch }}/$bin"
+            cp "$out/$bin" "release/$bin-${{ matrix.arch }}-${{ steps.version.outputs.version }}"
+          done
+          cd release && sha256sum * > "SHA256SUMS-${{ matrix.arch }}-${{ steps.version.outputs.version }}"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: dist-${{ matrix.docker_arch }}
+          path: dist/${{ matrix.docker_arch }}/
+          retention-days: 1
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: release-${{ matrix.arch }}
+          path: release/
+
+  # One buildx invocation per image covering both architectures. The binaries
+  # are prebuilt, but the RUN steps (apt, the firecracker download) execute
+  # under the target platform, so arm64 needs emulation on this runner.
+  images:
+    needs: build
+    if: github.ref_type == 'tag'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: dist-*
+          path: dist
+
+      - name: Restore executable bits
+        # Artifact upload does not preserve them, and a COPY of a non-executable
+        # binary produces an image that fails at ENTRYPOINT rather than at build.
+        run: chmod +x dist/*/*
+
+      - uses: docker/setup-qemu-action@v3
+      - uses: docker/setup-buildx-action@v3
+
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Version
+        id: version
+        run: echo "version=${GITHUB_REF_NAME#v}" >> "$GITHUB_OUTPUT"
+
+      - name: Orchestrator image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: deploy/orchestrator.Dockerfile
+          platforms: linux/amd64,linux/arm64
+          push: true
+          tags: |
+            ghcr.io/${{ github.repository }}-orchestrator:${{ steps.version.outputs.version }}
+            ghcr.io/${{ github.repository }}-orchestrator:latest
+
+      - name: Node image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: deploy/node.Dockerfile
+          # The harness builds `dev` from the same file; be explicit rather
+          # than relying on release happening to be the last stage.
+          target: release
+          platforms: linux/amd64,linux/arm64
+          push: true
+          tags: |
+            ghcr.io/${{ github.repository }}-node:${{ steps.version.outputs.version }}
+            ghcr.io/${{ github.repository }}-node:latest
+
+  release:
+    needs: build
+    if: github.ref_type == 'tag'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: release-*
+          path: release
+          merge-multiple: true
+
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: release/*
+          generate_release_notes: true

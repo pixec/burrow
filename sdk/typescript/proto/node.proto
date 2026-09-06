@@ -1,0 +1,318 @@
+syntax = "proto3";
+
+package burrow.node.v1;
+
+import "common.proto";
+import "api.proto";
+
+// Served by burrow-orchestrator; called by burrowd nodes.
+service NodeRegistry {
+  rpc Register(RegisterRequest) returns (RegisterResponse);
+  rpc Heartbeat(HeartbeatRequest) returns (HeartbeatResponse);
+}
+
+// Served by burrowd; called by the orchestrator to drive sandbox lifecycle.
+//
+// The streaming RPCs reuse burrow.api.v1 messages verbatim: they are pure
+// pass-through to the guest agent, and a parallel message set would add a
+// translation layer with no versioning benefit.
+service NodeService {
+  rpc Health(NodeHealthRequest) returns (NodeHealthResponse);
+  rpc SetDrain(burrow.api.v1.DrainNodeRequest) returns (burrow.api.v1.DrainNodeResponse);
+
+  rpc CreateSandbox(NodeCreateRequest) returns (burrow.common.v1.Sandbox);
+  rpc GetSandbox(NodeSandboxRef) returns (burrow.common.v1.Sandbox);
+  rpc ListSandboxes(NodeListRequest) returns (NodeListResponse);
+  rpc DeleteSandbox(NodeSandboxRef) returns (NodeDeleteResponse);
+  rpc PauseSandbox(NodeSandboxRef) returns (burrow.common.v1.Sandbox);
+  rpc ResumeSandbox(NodeSandboxRef) returns (burrow.common.v1.Sandbox);
+  // Sessions are recorded by the node that started the VMs, so they are read
+  // from it like any other per-sandbox fact.
+  rpc ListSessions(NodeSandboxRef) returns (burrow.api.v1.ListSessionsResponse);
+  rpc UpdateResources(NodeUpdateResourcesRequest) returns (burrow.common.v1.Sandbox);
+  // Forks on this node only: a sandbox's snapshot and disks are node-local, so
+  // the child is built where the source already is.
+  rpc ForkSandbox(NodeForkRequest) returns (burrow.common.v1.Sandbox);
+  rpc UpdateNetworkPolicy(NodeUpdateNetworkRequest) returns (burrow.common.v1.Sandbox);
+  rpc UpdateTags(NodeUpdateTagsRequest) returns (burrow.common.v1.Sandbox);
+  rpc UpdateAccessPolicy(NodeUpdateAccessRequest) returns (burrow.common.v1.Sandbox);
+
+  // Snapshots. Node-local like templates, so all four act on this node's own
+  // store; the orchestrator routes by the node it recorded for the snapshot.
+  rpc CreateSnapshot(NodeCreateSnapshotRequest) returns (burrow.common.v1.Snapshot);
+  rpc ListSnapshots(NodeListSnapshotsRequest) returns (burrow.api.v1.ListSnapshotsResponse);
+  rpc GetSnapshot(burrow.api.v1.SnapshotRef) returns (burrow.common.v1.Snapshot);
+  rpc DeleteSnapshot(burrow.api.v1.SnapshotRef) returns (burrow.api.v1.DeleteSnapshotResponse);
+
+  rpc CreateVolume(burrow.api.v1.CreateVolumeRequest) returns (burrow.common.v1.Volume);
+  rpc ListVolumes(burrow.api.v1.ListVolumesRequest) returns (burrow.api.v1.ListVolumesResponse);
+  rpc GetVolume(burrow.api.v1.VolumeRef) returns (burrow.common.v1.Volume);
+  rpc DeleteVolume(burrow.api.v1.VolumeRef) returns (burrow.api.v1.DeleteVolumeResponse);
+
+  rpc BuildTemplate(burrow.api.v1.BuildTemplateRequest) returns (stream burrow.api.v1.BuildLog);
+  rpc ListTemplates(burrow.api.v1.ListTemplatesRequest) returns (burrow.api.v1.ListTemplatesResponse);
+  rpc DeleteTemplate(burrow.api.v1.DeleteTemplateRequest) returns (burrow.api.v1.DeleteTemplateResponse);
+
+  // Template distribution. A template is only runnable on the node that built
+  // it until its artifacts are copied elsewhere; these three RPCs are what
+  // move them.
+  rpc GetTemplateManifest(TemplateManifestRequest) returns (TemplateManifest);
+  rpc FetchBlob(BlobRequest) returns (stream BlobChunk);
+  rpc PullTemplate(PullTemplateRequest) returns (PullTemplateResponse);
+
+  rpc ExposePort(burrow.api.v1.ExposePortRequest) returns (burrow.api.v1.PortMapping);
+  rpc ListPorts(NodeSandboxRef) returns (burrow.api.v1.ListPortsResponse);
+  rpc ClosePort(burrow.api.v1.ClosePortRequest) returns (burrow.api.v1.ClosePortResponse);
+
+  rpc Exec(stream burrow.api.v1.ExecInput) returns (stream burrow.api.v1.ExecOutput);
+  rpc ListCommands(burrow.api.v1.ListCommandsRequest) returns (burrow.api.v1.ListCommandsResponse);
+  rpc GetCommand(burrow.api.v1.GetCommandRequest) returns (burrow.api.v1.CommandInfo);
+  rpc AttachCommand(burrow.api.v1.AttachCommandRequest) returns (stream burrow.api.v1.ExecOutput);
+  rpc SignalCommand(burrow.api.v1.SignalCommandRequest) returns (burrow.api.v1.SignalCommandResponse);
+  rpc CreateUser(burrow.api.v1.CreateUserRequest) returns (burrow.api.v1.CreateUserResponse);
+  rpc CreateGroup(burrow.api.v1.CreateGroupRequest) returns (burrow.api.v1.CreateGroupResponse);
+  rpc AddUserToGroup(burrow.api.v1.GroupMembershipRequest) returns (burrow.api.v1.GroupMembershipResponse);
+  rpc RemoveUserFromGroup(burrow.api.v1.GroupMembershipRequest) returns (burrow.api.v1.GroupMembershipResponse);
+  rpc UploadFile(stream burrow.api.v1.FileChunk) returns (burrow.api.v1.UploadResult);
+  rpc DownloadFile(burrow.api.v1.DownloadRequest) returns (stream burrow.api.v1.FileChunk);
+  rpc ListDir(burrow.api.v1.ListDirRequest) returns (burrow.api.v1.ListDirResponse);
+  rpc Watch(burrow.api.v1.WatchRequest) returns (stream burrow.api.v1.WatchEvent);
+  rpc QueryAudit(burrow.api.v1.AuditQuery) returns (burrow.api.v1.AuditPage);  // collected, not streamed: the orchestrator merges pages from every node
+}
+
+message NodeCreateRequest {
+  // The orchestrator owns the id namespace and assigns it.
+  string sandbox_id = 1;
+  string template = 2;
+  burrow.common.v1.Policy policy = 3;
+  map<string, string> metadata = 4;
+  reserved 5;
+  // Recorded on the sandbox so it survives a restart and comes back in the
+  // node's inventory. The orchestrator owns name uniqueness; the node just
+  // keeps what it is told.
+  string name = 6;
+  // Snapshot on this node to restore from instead of booting. The template and
+  // the machine shape come from the snapshot; a policy that disagrees with them
+  // is refused.
+  string snapshot = 7;
+}
+
+message NodeCreateSnapshotRequest {
+  string sandbox_id = 1;
+  // The orchestrator owns the id namespace, so it names the snapshot.
+  string snapshot_id = 2;
+  // 0 falls back to the sandbox's `snapshot_expiration_secs`.
+  uint64 expiration_secs = 3;
+}
+
+message NodeListSnapshotsRequest {
+  // Empty lists every snapshot this node holds, which is what reconciliation
+  // wants.
+  string sandbox_id = 1;
+}
+
+// What a template is made of, named by content so a node can tell what it
+// already has without transferring anything.
+//
+// Warm snapshots are deliberately absent: they encode host cpu features and
+// the exact firecracker version, so the receiving node builds its own.
+message TemplateManifest {
+  string name = 1;
+  string kernel_digest = 2;
+  string rootfs_digest = 3;
+  uint64 rootfs_bytes = 4;
+  // The image config an imported template carries (`image.json`): the
+  // environment and working directory the image declared. Carried inline
+  // rather than as a blob because it is a few hundred bytes, and a node that
+  // received a template without it would silently run sandboxes with no PATH,
+  // no WORKDIR, and no idea which trust bundles the image points its tooling
+  // at. Empty for a template that has none.
+  string image_config = 5;
+}
+
+message TemplateManifestRequest {
+  string name = 1;
+}
+
+message BlobRequest {
+  string digest = 1;
+}
+
+message BlobChunk {
+  bytes data = 1;
+}
+
+message PullTemplateRequest {
+  // Node to pull from, as an address this node can dial.
+  string source_address = 1;
+  TemplateManifest manifest = 2;
+}
+
+message PullTemplateResponse {
+  uint64 bytes_transferred = 1;
+  // Artifacts that were already present and did not need transferring.
+  uint32 blobs_reused = 2;
+}
+
+message NodeSandboxRef {
+  string sandbox_id = 1;
+}
+
+message NodeUpdateNetworkRequest {
+  string sandbox_id = 1;
+  // Replaces the sandbox's network policy wholesale.
+  burrow.common.v1.NetworkPolicy network = 2;
+}
+
+message NodeUpdateTagsRequest {
+  string sandbox_id = 1;
+  // Replaces the sandbox's tags wholesale.
+  map<string, string> tags = 2;
+}
+
+// The exec and file policies, as the orchestrator forwards them. A present
+// section replaces that section wholesale; an absent one is left as it is,
+// which is what keeps a caller tightening one from re-opening the other.
+message NodeUpdateAccessRequest {
+  string sandbox_id = 1;
+  optional burrow.common.v1.ExecPolicy exec = 2;
+  optional burrow.common.v1.FsPolicy fs = 3;
+}
+
+// The lifetime clocks, as the orchestrator forwards them. Absent leaves a field
+// as it is; the machine shape is carried only so the node can refuse it with
+// the same message a create would.
+message NodeUpdateResourcesRequest {
+  string sandbox_id = 1;
+  optional uint64 max_lifetime_secs = 2;
+  optional uint64 idle_suspend_secs = 3;
+  optional uint64 suspended_ttl_secs = 4;
+  uint32 vcpus = 5;
+  uint32 mem_mib = 6;
+  uint32 scratch_disk_mib = 7;
+}
+
+message NodeForkRequest {
+  // The sandbox to fork.
+  string sandbox_id = 1;
+  // The orchestrator owns the id namespace, so it names the child.
+  string child_id = 2;
+  // Replaces the source's policy on the child; empty inherits it. An override
+  // may not change the shape the snapshot was taken with.
+  burrow.common.v1.Policy policy = 3;
+  // Name for the child, recorded on its sandbox record.
+  string name = 4;
+}
+
+// Carries no filter: the orchestrator answers ListSandboxes from its own
+// registry and filters there, and this exists for reconciliation, which wants
+// everything the node holds.
+message NodeListRequest {}
+
+message NodeListResponse {
+  repeated burrow.common.v1.Sandbox sandboxes = 1;
+}
+
+message NodeDeleteResponse {}
+
+message RegisterRequest {
+  burrow.common.v1.NodeInfo info = 1;
+  // The node's mesh identity. Empty when the node has no WireGuard support,
+  // which leaves it reachable only by sandboxes on itself.
+  string wireguard_public_key = 2;
+  // host:port other nodes dial for the mesh.
+  string wireguard_endpoint = 3;
+  // Address-pool slice this node is already using, if any. Its sandboxes'
+  // addresses derive from it, so the node claims rather than requests; the
+  // orchestrator honours the claim unless another node holds it.
+  optional uint32 claimed_node_index = 4;
+}
+
+message RegisterResponse {
+  // Assigned (or confirmed) node id.
+  string node_id = 1;
+  // Seconds between heartbeats the orchestrator expects.
+  uint32 heartbeat_interval_secs = 2;
+  // Index of this node's slice of the sandbox address pool. Stable for the
+  // node's lifetime, because its sandboxes' addresses derive from it.
+  uint32 node_index = 3;
+}
+
+message HeartbeatRequest {
+  string node_id = 1;
+  burrow.common.v1.NodeStatus status = 2;
+  // Every sandbox this node holds, with its current state. Nodes change state
+  // on their own (an idle sandbox is suspended, an expired one destroyed), and
+  // without this the orchestrator would keep reporting the state it last
+  // caused rather than the one that is true.
+  repeated SandboxStateReport sandboxes = 3;
+  // Ids of every snapshot this node holds. Snapshots are swept by the node's
+  // own reaper and evicted by retention, so without this the orchestrator would
+  // keep listing snapshots whose files are gone.
+  repeated string snapshots = 4;
+  // What this node is, restated on every beat so an operator's relabel or a
+  // changed advertised address converges without waiting for a re-registration.
+  // The orchestrator keeps the id it assigned; everything else is the node's to
+  // say.
+  burrow.common.v1.NodeInfo info = 5;
+}
+
+message SandboxStateReport {
+  string sandbox_id = 1;
+  burrow.common.v1.SandboxState state = 2;
+  // What the sandbox has consumed, as of the node's last sample. Carried on
+  // the heartbeat because these move constantly and nothing else asks: the
+  // orchestrator answers reads from its registry, and a figure that only
+  // changed on a lifecycle call would be a figure from the last suspend.
+  uint64 cpu_usage_usec = 3;
+  uint64 rx_bytes = 4;
+  uint64 tx_bytes = 5;
+  // Whether the VM's guest agent has answered yet. Carried here for the same
+  // reason as the usage figures: a warm create returns before its guest has,
+  // so the record the orchestrator registered can say `running` for a sandbox
+  // whose agent is still coming up, or never did. Nothing else would correct
+  // it.
+  bool agent_unconfirmed = 6;
+}
+
+message HeartbeatResponse {
+  // Node is unknown (e.g. orchestrator restarted); it must re-register.
+  bool reregister = 1;
+  // Every other node on the mesh. Delivered on each heartbeat so a node
+  // converges on the current fleet without a separate watch.
+  repeated MeshPeer peers = 2;
+  // Guest addresses reachable on each private network, across the fleet.
+  repeated NetworkMembers network_members = 3;
+  // Hosts running an edge router, this node's own included. Denied to every
+  // sandbox: an edge proxies into published ports by design, so a sandbox that
+  // reaches one reaches sandboxes it shares no private network with. Delivered
+  // on each beat because a node cannot know which of its peers serves an edge.
+  repeated string edge_hosts = 4;
+}
+
+message MeshPeer {
+  string node_id = 1;
+  string public_key = 2;
+  string endpoint = 3;
+  // The address range this peer owns.
+  string subnet = 4;
+}
+
+message NetworkMembers {
+  string network = 1;
+  repeated NetworkMember members = 2;
+}
+
+// A sandbox reachable on a private network. Carries names as well as an
+// address because peers address each other by name: an address is a placement
+// detail that changes, and no one writes it into their code.
+message NetworkMember {
+  string sandbox_id = 1;
+  string alias = 2;
+  string guest_ip = 3;
+}
+
+message NodeHealthRequest {}
+message NodeHealthResponse {
+  string version = 1;
+}

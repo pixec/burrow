@@ -1,0 +1,22 @@
+[package]
+name = "burrow-cli"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "burrow"
+path = "src/main.rs"
+
+[dependencies]
+burrow-proto = { workspace = true }
+tokio = { workspace = true }
+tokio-stream = { workspace = true, features = ["sync"] }
+tonic = { workspace = true }
+clap = { workspace = true }
+anyhow = { workspace = true }
+nix = { workspace = true }
+# Only for reading --rule. A matcher has four dimensions and three
+# comparators, and any flag grammar that expressed it would be a language
+# nobody could read back.
+serde_json = { workspace = true }

@@ -1,0 +1,73 @@
+# The control plane. One replica: the orchestrator holds the sandbox-to-node
+# mapping in a single durable store and has no leader election, so a second
+# replica would be a second source of truth rather than failover.
+#
+# A StatefulSet rather than a Deployment for the volume: its state only covers
+# the case nodes cannot (the whole fleet restarting at once, losing the
+# mapping), but losing it strands every placement.
+apiVersion: v1
+kind: Service
+metadata:
+  name: orchestrator
+  namespace: burrow
+spec:
+  selector:
+    app: burrow-orchestrator
+  ports:
+    - name: grpc
+      port: 7070
+      targetPort: 7070
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: orchestrator
+  namespace: burrow
+spec:
+  serviceName: orchestrator
+  replicas: 1
+  selector:
+    matchLabels:
+      app: burrow-orchestrator
+  template:
+    metadata:
+      labels:
+        app: burrow-orchestrator
+    spec:
+      containers:
+        - name: orchestrator
+          image: ghcr.io/pixec/burrow-orchestrator:latest
+          args:
+            - --listen
+            - 0.0.0.0:7070
+            - --data-dir
+            - /var/lib/burrow
+          env:
+            # Tokens by env rather than argv: a token on the command line is
+            # visible in `ps` to every process in the container.
+            - name: BURROW_API_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: burrow-tokens
+                  key: api-key
+            - name: BURROW_NODE_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: burrow-tokens
+                  key: node-token
+            - name: RUST_LOG
+              value: info
+          ports:
+            - name: grpc
+              containerPort: 7070
+          volumeMounts:
+            - name: data
+              mountPath: /var/lib/burrow
+  volumeClaimTemplates:
+    - metadata:
+        name: data
+      spec:
+        accessModes: ["ReadWriteOnce"]
+        resources:
+          requests:
+            storage: 10Gi

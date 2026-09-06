@@ -1,0 +1,18 @@
+# Dev-harness collector: accept OTLP over gRPC and print what arrives.
+# Enough to answer "are spans being exported and do the hops join up"; a real
+# deployment points these daemons at whatever collector it already runs.
+receivers:
+  otlp:
+    protocols:
+      grpc:
+        endpoint: 0.0.0.0:4317
+
+exporters:
+  debug:
+    verbosity: detailed
+
+service:
+  pipelines:
+    traces:
+      receivers: [otlp]
+      exporters: [debug]

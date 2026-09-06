@@ -1,0 +1,25 @@
+[package]
+name = "burrow-orchestrator"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "burrow-orchestrator"
+path = "src/main.rs"
+
+[dependencies]
+burrow-proto = { workspace = true }
+burrow-core = { workspace = true }
+burrow-net = { workspace = true }
+burrow-store = { workspace = true }
+prost = { workspace = true }
+tokio = { workspace = true }
+tokio-stream = { workspace = true }
+async-stream = { workspace = true }
+tonic = { workspace = true }
+clap = { workspace = true }
+anyhow = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }

@@ -1,0 +1,23 @@
+[package]
+name = "burrow-vmm"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+tokio = { workspace = true }
+hyper = { workspace = true }
+hyper-util = { workspace = true }
+http-body-util = { workspace = true }
+bytes = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+nix = { workspace = true }
+
+# The page-fault handler is Linux-only; keeping it off the default target lets
+# `cargo build` still work on a macOS dev machine.
+[target.'cfg(target_os = "linux")'.dependencies]
+userfaultfd = { workspace = true }
+libc = { workspace = true }

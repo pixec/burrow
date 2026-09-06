@@ -1,0 +1,600 @@
+syntax = "proto3";
+
+package burrow.api.v1;
+
+import "common.proto";
+
+// Public control-plane API, served by burrow-orchestrator.
+// Per-sandbox RPCs are routed to the node that owns the sandbox.
+service Burrow {
+  rpc Health(HealthRequest) returns (HealthResponse);
+
+  // Nodes
+  rpc ListNodes(ListNodesRequest) returns (ListNodesResponse);
+  // Stop placing new sandboxes on a node, optionally suspending what it runs.
+  rpc DrainNode(DrainNodeRequest) returns (DrainNodeResponse);
+
+  // Sandboxes
+  rpc CreateSandbox(CreateSandboxRequest) returns (burrow.common.v1.Sandbox);
+  rpc GetSandbox(SandboxRef) returns (burrow.common.v1.Sandbox);
+  rpc ListSandboxes(ListSandboxesRequest) returns (ListSandboxesResponse);
+  rpc DeleteSandbox(SandboxRef) returns (DeleteSandboxResponse);
+  rpc PauseSandbox(SandboxRef) returns (burrow.common.v1.Sandbox);
+  rpc ResumeSandbox(SandboxRef) returns (burrow.common.v1.Sandbox);
+  // Every VM this sandbox has run, newest first.
+  rpc ListSessions(SandboxRef) returns (ListSessionsResponse);
+  // Move the clocks a running sandbox is measured against: lifetime, idle
+  // suspension and suspended retention. The machine shape is not movable.
+  rpc UpdateResources(UpdateResourcesRequest) returns (burrow.common.v1.Sandbox);
+  // Create a sandbox from another's current state, on the source's node.
+  rpc ForkSandbox(ForkSandboxRequest) returns (burrow.common.v1.Sandbox);
+  // Replace a running sandbox's egress policy: firewall rules, proxy
+  // allowlist, DNS filtering and header injection all re-render at once.
+  rpc UpdateNetworkPolicy(UpdateNetworkPolicyRequest) returns (burrow.common.v1.Sandbox);
+  // Replace a sandbox's tags wholesale.
+  rpc UpdateTags(UpdateTagsRequest) returns (burrow.common.v1.Sandbox);
+  // Replace a live sandbox's exec and file policies. Enforced on the node, so
+  // the change is in force on the next call without disturbing the guest.
+  rpc UpdateAccessPolicy(UpdateAccessPolicyRequest) returns (burrow.common.v1.Sandbox);
+
+  // Snapshots: a sandbox's state, kept as an object of its own.
+  //
+  // Node-local, like templates: a snapshot can only be restored on the node
+  // that took it, so a create from one is placed there.
+  rpc CreateSnapshot(CreateSnapshotRequest) returns (burrow.common.v1.Snapshot);
+  rpc ListSnapshots(ListSnapshotsRequest) returns (ListSnapshotsResponse);
+  rpc GetSnapshot(SnapshotRef) returns (burrow.common.v1.Snapshot);
+  rpc DeleteSnapshot(SnapshotRef) returns (DeleteSnapshotResponse);
+
+  // Volumes: persistent storage, mounted into sandboxes.
+  rpc CreateVolume(CreateVolumeRequest) returns (burrow.common.v1.Volume);
+  rpc ListVolumes(ListVolumesRequest) returns (ListVolumesResponse);
+  rpc GetVolume(VolumeRef) returns (burrow.common.v1.Volume);
+  rpc DeleteVolume(VolumeRef) returns (DeleteVolumeResponse);
+
+  // Exec: bidirectional stream, PTY-capable.
+  rpc Exec(stream ExecInput) returns (stream ExecOutput);
+
+  // Commands: a command outlives the stream that started it, so it can be
+  // listed, followed and signalled from another process.
+  rpc ListCommands(ListCommandsRequest) returns (ListCommandsResponse);
+  rpc GetCommand(GetCommandRequest) returns (CommandInfo);
+  rpc AttachCommand(AttachCommandRequest) returns (stream ExecOutput);
+  rpc SignalCommand(SignalCommandRequest) returns (SignalCommandResponse);
+
+  // Users and groups inside the guest. Each runs a command in the sandbox, so
+  // all four are held to the sandbox's exec policy.
+  rpc CreateUser(CreateUserRequest) returns (CreateUserResponse);
+  rpc CreateGroup(CreateGroupRequest) returns (CreateGroupResponse);
+  rpc AddUserToGroup(GroupMembershipRequest) returns (GroupMembershipResponse);
+  rpc RemoveUserFromGroup(GroupMembershipRequest) returns (GroupMembershipResponse);
+
+  // Templates: build a reusable guest image by running steps in a sandbox.
+  rpc BuildTemplate(BuildTemplateRequest) returns (stream BuildLog);
+  rpc ListTemplates(ListTemplatesRequest) returns (ListTemplatesResponse);
+  rpc DeleteTemplate(DeleteTemplateRequest) returns (DeleteTemplateResponse);
+
+  // Ports: publish a guest port on the node's address.
+  rpc ExposePort(ExposePortRequest) returns (PortMapping);
+  rpc ListPorts(SandboxRef) returns (ListPortsResponse);
+  rpc ClosePort(ClosePortRequest) returns (ClosePortResponse);
+
+  // Files
+  rpc UploadFile(stream FileChunk) returns (UploadResult);
+  rpc DownloadFile(DownloadRequest) returns (stream FileChunk);
+  rpc ListDir(ListDirRequest) returns (ListDirResponse);
+
+  // Audit: every egress attempt and DNS lookup a sandbox made.
+  rpc QueryAudit(AuditQuery) returns (stream AuditEvent);
+  rpc Watch(WatchRequest) returns (stream WatchEvent);
+}
+
+message AuditQuery {
+  // Empty means every sandbox.
+  string sandbox_id = 1;
+  bool denied_only = 2;
+  // RFC 3339 lower bound.
+  string since = 3;
+  // 0 selects a server default.
+  uint32 limit = 4;
+}
+
+message AuditEvent {
+  string at = 1;
+  string sandbox_id = 2;
+  string source_ip = 3;
+  string destination = 4;
+  string host = 5;
+  uint32 port = 6;
+  bool allowed = 7;
+  string reason = 8;
+  uint64 bytes_sent = 9;
+  uint64 bytes_received = 10;
+  string node_id = 11;
+}
+
+message AuditPage {
+  repeated AuditEvent events = 1;
+}
+
+message WatchRequest {
+  string sandbox_id = 1;
+  string path = 2;
+  bool recursive = 3;
+  uint32 interval_ms = 4;
+}
+
+message WatchEvent {
+  string type = 1;
+  string path = 2;
+  bool is_dir = 3;
+}
+
+message BuildStep {
+  // Shell command run inside the build sandbox. A non-zero exit fails the
+  // build, so a broken step never ends up baked into an image.
+  string run = 1;
+}
+
+message BuildTemplateRequest {
+  // Name the finished image is published under.
+  string name = 1;
+  // Template to start from, as imported by a pull. Required unless `snapshot`
+  // is set, which carries its own: burrow has no built-in image to fall back
+  // on, and choosing one would boot something the caller did not ask for.
+  string from = 2;
+  repeated BuildStep steps = 3;
+  uint32 vcpus = 4;
+  uint32 mem_mib = 5;
+  // Domains the build sandbox may reach. Empty means unrestricted, since a
+  // build that installs packages needs the network by definition.
+  repeated string allow_domains = 6;
+  // OCI image to base the template on, e.g. "python:3.12-slim" or
+  // "ghcr.io/org/img@sha256:...". Takes the place of `from`, which names a
+  // template that already exists on the node.
+  string from_image = 7;
+}
+
+message BuildDone {
+  string template = 1;
+  uint64 size_bytes = 2;
+}
+
+message BuildLog {
+  oneof event {
+    // A step is starting; carries the command.
+    string step = 1;
+    bytes stdout = 2;
+    bytes stderr = 3;
+    BuildDone done = 4;
+  }
+}
+
+message ListTemplatesRequest {}
+
+message TemplateInfo {
+  string name = 1;
+  uint64 size_bytes = 2;
+  // Whether creates from this template restore a snapshot instead of booting.
+  bool warm = 3;
+}
+
+message ListTemplatesResponse {
+  repeated TemplateInfo templates = 1;
+}
+
+message DeleteTemplateRequest {
+  string name = 1;
+}
+
+message DeleteTemplateResponse {}
+
+message ExposePortRequest {
+  string sandbox_id = 1;
+  uint32 guest_port = 2;
+  // Preferred host port; 0 lets the node allocate one.
+  uint32 host_port = 3;
+}
+
+message PortMapping {
+  string sandbox_id = 1;
+  uint32 guest_port = 2;
+  uint32 host_port = 3;
+  // Address a client outside the sandbox should connect to.
+  string host_address = 4;
+  // Stable URL for this port through the edge router on the node holding the
+  // sandbox, as `http://<guest-port>-<sandbox-id>.<edge-domain>/`. Empty when
+  // that node runs no edge, which is the only case in which `host_address` is
+  // the whole answer. Filled in by the orchestrator: only it knows which node
+  // holds the sandbox and what that node advertises.
+  string edge_url = 5;
+}
+
+message ListPortsResponse {
+  repeated PortMapping ports = 1;
+}
+
+message ClosePortRequest {
+  string sandbox_id = 1;
+  uint32 host_port = 2;
+}
+
+message ClosePortResponse {}
+
+message FileChunk {
+  // Both set on the first message of an upload only.
+  string sandbox_id = 1;
+  string path = 2;
+  // Unix mode for a created file; 0 means 0644.
+  uint32 mode = 3;
+  bytes data = 4;
+}
+
+message UploadResult {
+  uint64 bytes_written = 1;
+}
+
+message DownloadRequest {
+  string sandbox_id = 1;
+  string path = 2;
+}
+
+message ListDirRequest {
+  string sandbox_id = 1;
+  string path = 2;
+}
+
+message DirEntry {
+  string name = 1;
+  bool is_dir = 2;
+  uint64 size = 3;
+  uint32 mode = 4;
+}
+
+message ListDirResponse {
+  repeated DirEntry entries = 1;
+}
+
+message HealthRequest {}
+message HealthResponse {
+  string version = 1;
+}
+
+message ListNodesRequest {}
+message ListNodesResponse {
+  repeated Node nodes = 1;
+}
+
+message Node {
+  burrow.common.v1.NodeInfo info = 1;
+  burrow.common.v1.NodeStatus status = 2;
+  bool healthy = 3;
+  // RFC 3339 time of last heartbeat.
+  string last_heartbeat_at = 4;
+}
+
+message DrainNodeRequest {
+  string node_id = 1;
+  // False lifts a drain.
+  bool drain = 2;
+  // Suspend the node's sandboxes as part of draining, so they can be resumed
+  // elsewhere once template distribution exists.
+  bool suspend_sandboxes = 3;
+}
+
+message DrainNodeResponse {
+  uint32 suspended = 1;
+}
+
+// Names a sandbox, by its id or by the name it was created with. The id is
+// tried first; ids carry a "sbx_" prefix that a name may not, so the two
+// namespaces cannot collide.
+message SandboxRef {
+  string id = 1;
+}
+
+message UpdateNetworkPolicyRequest {
+  SandboxRef ref = 1;
+  // The whole policy, not a patch: an omitted field is an allowance withdrawn,
+  // which is what makes "lock this sandbox down" a single call.
+  burrow.common.v1.NetworkPolicy network = 2;
+}
+
+// Replaces a live sandbox's exec and file policies.
+//
+// A section that is present replaces that section wholesale, so a field
+// omitted inside one is an allowance withdrawn. A section that is absent is
+// left exactly as it is.
+//
+// Absence deliberately does not mean "allow everything" here, unlike the
+// create path where an unset section is what a sandbox with no restriction
+// looks like. On a live sandbox that reading would make tightening `fs` a
+// silent re-opening of `exec`, which is the opposite of what the caller asked
+// for.
+message UpdateAccessPolicyRequest {
+  SandboxRef ref = 1;
+  optional burrow.common.v1.ExecPolicy exec = 2;
+  optional burrow.common.v1.FsPolicy fs = 3;
+}
+
+message ListSessionsResponse {
+  // Newest first, and bounded: a node keeps the most recent sessions of each
+  // sandbox and evicts the rest, so a long-lived sandbox does not grow the
+  // list without bound.
+  repeated burrow.common.v1.Session sessions = 1;
+}
+
+// Moves the clocks a sandbox is measured against.
+//
+// One call rather than an ExtendLifetime taking a single number, because all
+// three fields answer the same question, how long this sandbox stays paid for,
+// and are read by the same reaper on the same pass. Each is optional so that
+// 0 keeps its meaning of "unlimited" instead of colliding with "leave it".
+//
+// The machine shape is here only so a caller who sends one is told why it was
+// refused: a running VM's configuration is fixed, and a restore takes it from
+// the snapshot, so vcpus, memory and scratch disk cannot move.
+message UpdateResourcesRequest {
+  SandboxRef ref = 1;
+  optional uint64 max_lifetime_secs = 2;
+  optional uint64 idle_suspend_secs = 3;
+  optional uint64 suspended_ttl_secs = 4;
+  uint32 vcpus = 5;
+  uint32 mem_mib = 6;
+  uint32 scratch_disk_mib = 7;
+}
+
+// Replaces a sandbox's whole tag set: an omitted tag is a tag removed, and an
+// empty map clears them, which is what makes "retag this sandbox" one call.
+message UpdateTagsRequest {
+  SandboxRef ref = 1;
+  map<string, string> tags = 2;
+}
+
+message ForkSandboxRequest {
+  // The sandbox to fork. It keeps running; a running source's state is written
+  // first so the child starts from its state as of the call.
+  SandboxRef ref = 1;
+  // Id for the child; empty has one generated.
+  string sandbox_id = 2;
+  // Replaces the source's policy on the child. Empty inherits it, which is the
+  // usual case: a fork is meant to be the same sandbox again. `resources` is
+  // the exception: a restore takes its machine configuration from the
+  // snapshot, so an override naming different vcpus, memory or scratch disk is
+  // refused rather than silently ignored.
+  burrow.common.v1.Policy policy = 3;
+  // Name for the child, under the same rules as on a create. A fork does not
+  // inherit its source's name: names are unique, and there can only be one.
+  string name = 4;
+  // Labels the child's node must carry. A fork is built where its source's
+  // state already is, so this cannot move it: it is a precondition, refused
+  // with FAILED_PRECONDITION when the source's node does not satisfy it. That
+  // is what makes "fork this, but only on our own hardware" say something
+  // rather than nothing.
+  map<string, string> node_labels = 5;
+}
+
+// Takes a sandbox's current state and keeps it as a snapshot object.
+//
+// The sandbox goes on running: the guest is paused only long enough to write
+// its state. Stopping a sandbox is what PauseSandbox is for.
+message CreateSnapshotRequest {
+  SandboxRef ref = 1;
+  // Seconds from last use before the snapshot is swept, refreshed whenever a
+  // sandbox is created from it. 0 falls back to the sandbox's
+  // `snapshot_expiration_secs`, and no expiry at all when that is 0 too.
+  uint64 expiration_secs = 2;
+}
+
+message ListSnapshotsRequest {
+  // Only snapshots taken of this sandbox; empty lists every one in the fleet.
+  // A reference, so a sandbox's name works here too.
+  string sandbox = 1;
+}
+
+message ListSnapshotsResponse {
+  repeated burrow.common.v1.Snapshot snapshots = 1;
+}
+
+message CreateVolumeRequest {
+  // Unique across the fleet, under the same rules as a sandbox name: a volume
+  // is addressed by the name you chose, since nothing generates one for you.
+  string name = 1;
+  uint64 size_mib = 2;
+  // Labels the node holding this volume must carry. A volume never moves, so
+  // this is the only chance to influence where it lands.
+  map<string, string> node_labels = 3;
+}
+
+message ListVolumesRequest {
+  // Only volumes on this node. Empty lists the fleet's.
+  string node_id = 1;
+}
+
+message ListVolumesResponse {
+  repeated burrow.common.v1.Volume volumes = 1;
+}
+
+message VolumeRef {
+  string name = 1;
+}
+
+message DeleteVolumeResponse {}
+
+message SnapshotRef {
+  string id = 1;
+}
+
+message DeleteSnapshotResponse {}
+
+message CreateSandboxRequest {
+  string template = 1;
+  burrow.common.v1.Policy policy = 2;
+  // Tags, at most 16. Keys are 1..=64 bytes and values up to 256, neither
+  // carrying control characters.
+  map<string, string> metadata = 3;
+  reserved 4;
+  // Name for the new sandbox, and the only identity a caller gets to choose:
+  // ids are always generated by the server. 1-63 characters of [a-z0-9-], not
+  // starting or ending with '-'. Unique across the fleet: a name already in
+  // use is refused with ALREADY_EXISTS, which is what makes get-or-create
+  // possible. Empty leaves the sandbox unnamed.
+  string name = 5;
+  // Snapshot to start from. The new sandbox **restores** that state rather
+  // than cold-booting, and inherits the snapshot's template and machine shape:
+  // `template` may only name the snapshot's own, and `resources` may only
+  // repeat the shape it was taken with, because a restore takes its
+  // configuration from the snapshot, so anything else is refused rather than
+  // ignored.
+  // Placed on the node holding the snapshot, since snapshots do not travel.
+  string snapshot = 6;
+  // Labels the hosting node must carry, all of them, matched exactly. This is
+  // what burrow has instead of regions: operators label nodes, and a caller
+  // names the labels its workload needs. A map rather than a Placement message
+  // of its own, because every other constraint burrow has (the template, the
+  // machine shape, a private network's peers) is already derived from fields
+  // on this request, and a wrapper around one map would be the only member of
+  // a category.
+  //
+  // No node carrying every pair is FAILED_PRECONDITION, never a placement
+  // somewhere else. Ignored for a create from a snapshot, which is pinned to
+  // the node holding it; a constraint the snapshot's node does not satisfy is
+  // refused rather than dropped.
+  map<string, string> node_labels = 7;
+}
+
+message ListSandboxesRequest {
+  // Return only sandboxes carrying this tag, as "key=value". One tag at a
+  // time, matched exactly; empty lists everything.
+  string tag = 1;
+}
+message ListSandboxesResponse {
+  repeated burrow.common.v1.Sandbox sandboxes = 1;
+}
+
+message DeleteSandboxResponse {}
+
+message ExecInput {
+  oneof input {
+    ExecStart start = 1;
+    bytes stdin = 2;
+    ExecResize resize = 3;
+    // Signal number to deliver to the process.
+    int32 signal = 4;
+    // Close the command's stdin (EOF).
+    bool stdin_eof = 5;
+  }
+}
+
+message ExecStart {
+  string sandbox_id = 1;
+  repeated string cmd = 2;
+  map<string, string> env = 3;
+  string cwd = 4;
+  bool pty = 5;
+  uint32 rows = 6;
+  uint32 cols = 7;
+  // Guest user to run as; empty is root. The user has to exist already, which
+  // CreateUser is for. HOME, USER, LOGNAME and the default cwd follow it.
+  string user = 8;
+}
+
+message ExecResize {
+  uint32 rows = 1;
+  uint32 cols = 2;
+}
+
+message ExecOutput {
+  oneof output {
+    bytes stdout = 1;
+    bytes stderr = 2;
+    int32 exit_code = 3;
+    // Sent once, before any output, naming the command this stream started.
+    // Pass it to GetCommand, AttachCommand or SignalCommand later.
+    string command_id = 4;
+  }
+}
+
+message ListCommandsRequest {
+  string sandbox_id = 1;
+}
+
+message ListCommandsResponse {
+  repeated CommandInfo commands = 1;
+}
+
+message GetCommandRequest {
+  string sandbox_id = 1;
+  string command_id = 2;
+}
+
+message AttachCommandRequest {
+  string sandbox_id = 1;
+  string command_id = 2;
+}
+
+message SignalCommandRequest {
+  string sandbox_id = 1;
+  string command_id = 2;
+  // Signal number; 0 selects SIGKILL.
+  int32 signal = 3;
+}
+
+message SignalCommandResponse {}
+
+// One command the sandbox has run.
+//
+// The agent keeps a bounded ring buffer of each command's recent output (256
+// KiB, oldest dropped) and retains the 64 most recent finished commands, so a
+// long-lived sandbox does not grow without bound. A command evicted from that
+// list is no longer listed and can no longer be attached to.
+message CommandInfo {
+  string command_id = 1;
+  repeated string cmd = 2;
+  // Empty means the command ran as root.
+  string user = 3;
+  // "running" or "exited".
+  string state = 4;
+  // Meaningful only once `state` is "exited".
+  int32 exit_code = 5;
+  int64 started_at_unix_ms = 6;
+  // 0 while the command is still running.
+  int64 ended_at_unix_ms = 7;
+  // Bytes of output still held for a later attach.
+  uint64 buffered_bytes = 8;
+}
+
+message CreateUserRequest {
+  string sandbox_id = 1;
+  // POSIX portable name: [a-z_][a-z0-9_-]*, at most 32 characters.
+  string name = 2;
+}
+
+message CreateUserResponse {
+  string username = 1;
+  uint32 uid = 2;
+  uint32 gid = 3;
+  // The user's home, created 0700 so other sandbox users cannot read it.
+  string home = 4;
+}
+
+message CreateGroupRequest {
+  string sandbox_id = 1;
+  string name = 2;
+}
+
+message CreateGroupResponse {
+  string groupname = 1;
+  uint32 gid = 2;
+  // A directory the group's members share: group-owned and 2770 setgid, so
+  // files created inside it stay readable by the rest of the group.
+  string shared_dir = 3;
+}
+
+message GroupMembershipRequest {
+  string sandbox_id = 1;
+  string user = 2;
+  string group = 3;
+}
+
+message GroupMembershipResponse {}

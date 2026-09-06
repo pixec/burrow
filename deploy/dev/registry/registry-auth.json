@@ -1,0 +1,6 @@
+{
+  "_comment": "Local dev-harness credentials for deploy/docker/compose.yaml's test-registry ONLY. Committed to the repo, so treat them as public: never reuse this pair, and never mount this file for a real registry.",
+  "auths": {
+    "test-registry:5000": { "username": "burrowtest", "password": "s3cret" }
+  }
+}

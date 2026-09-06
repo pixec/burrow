@@ -1,0 +1,283 @@
+syntax = "proto3";
+
+package burrow.agent.v1;
+
+// Served by burrow-agent inside the guest, over vsock; called by burrowd.
+service Agent {
+  rpc Handshake(HandshakeRequest) returns (HandshakeResponse);
+  rpc Health(AgentHealthRequest) returns (AgentHealthResponse);
+  // Mirrors the public Exec RPC. Deliberately a separate message set from
+  // burrow.api.v1 so the guest protocol can version independently of the
+  // public API (guests outlive deploys: a paused sandbox resumes with the
+  // agent it was snapshotted with).
+  rpc Exec(stream ExecInput) returns (stream ExecOutput);
+
+  rpc UploadFile(stream FileChunk) returns (UploadResult);
+  rpc DownloadFile(DownloadRequest) returns (stream FileChunk);
+  rpc ListDir(ListDirRequest) returns (ListDirResponse);
+  rpc Watch(WatchRequest) returns (stream WatchEvent);
+
+  // Commands the agent has run, addressable after the stream that started
+  // them is gone.
+  rpc ListCommands(ListCommandsRequest) returns (ListCommandsResponse);
+  rpc GetCommand(GetCommandRequest) returns (CommandInfo);
+  // Replays what the command's ring buffer still holds, then follows it live
+  // until it exits. Several attachers are supported.
+  rpc AttachCommand(AttachCommandRequest) returns (stream ExecOutput);
+  rpc SignalCommand(SignalCommandRequest) returns (SignalCommandResponse);
+
+  // Users and groups, created with whatever tooling the guest image ships.
+  rpc CreateUser(CreateUserRequest) returns (CreateUserResponse);
+  rpc CreateGroup(CreateGroupRequest) returns (CreateGroupResponse);
+  rpc AddUserToGroup(GroupMembership) returns (GroupMembershipResponse);
+  rpc RemoveUserFromGroup(GroupMembership) returns (GroupMembershipResponse);
+}
+
+message CreateUserRequest {
+  string name = 1;
+}
+
+message CreateUserResponse {
+  string username = 1;
+  uint32 uid = 2;
+  uint32 gid = 3;
+  // Private to the user: 0700, so another sandbox user cannot read it.
+  string home = 4;
+}
+
+message CreateGroupRequest {
+  string name = 1;
+}
+
+message CreateGroupResponse {
+  string groupname = 1;
+  uint32 gid = 2;
+  // Group-owned, 2770 setgid, so files created inside stay group-readable.
+  string shared_dir = 3;
+}
+
+message GroupMembership {
+  string user = 1;
+  string group = 2;
+}
+
+message GroupMembershipResponse {}
+
+message ListCommandsRequest {}
+
+message ListCommandsResponse {
+  repeated CommandInfo commands = 1;
+}
+
+message GetCommandRequest {
+  string command_id = 1;
+}
+
+message AttachCommandRequest {
+  string command_id = 1;
+}
+
+message SignalCommandRequest {
+  string command_id = 1;
+  int32 signal = 2;
+}
+
+message SignalCommandResponse {}
+
+message CommandInfo {
+  string command_id = 1;
+  repeated string cmd = 2;
+  // Empty means the command runs as root.
+  string user = 3;
+  // "running" or "exited".
+  string state = 4;
+  // Meaningful only once `state` is "exited".
+  int32 exit_code = 5;
+  // Unix milliseconds; `ended_at_unix_ms` is 0 while the command runs.
+  int64 started_at_unix_ms = 6;
+  int64 ended_at_unix_ms = 7;
+  // Bytes of output the agent is still holding for a later attach. Output
+  // beyond the per-command ring buffer is dropped oldest first, so a chatty
+  // command replays only its tail.
+  uint64 buffered_bytes = 8;
+}
+
+message WatchRequest {
+  string path = 1;
+  bool recursive = 2;
+  // Poll interval; 0 selects the agent's default.
+  uint32 interval_ms = 3;
+}
+
+message WatchEvent {
+  // "created", "modified", or "deleted".
+  string type = 1;
+  string path = 2;
+  bool is_dir = 3;
+}
+
+message FileChunk {
+  // Set on the first message of an upload only.
+  string path = 1;
+  // Unix mode for a created file; 0 means 0644.
+  uint32 mode = 2;
+  bytes data = 3;
+}
+
+message UploadResult {
+  uint64 bytes_written = 1;
+}
+
+message DownloadRequest {
+  string path = 1;
+}
+
+message ListDirRequest {
+  string path = 1;
+}
+
+message DirEntry {
+  string name = 1;
+  bool is_dir = 2;
+  uint64 size = 3;
+  uint32 mode = 4;
+}
+
+message ListDirResponse {
+  repeated DirEntry entries = 1;
+}
+
+message ExecInput {
+  oneof input {
+    ExecStart start = 1;
+    bytes stdin = 2;
+    ExecResize resize = 3;
+    // Signal number to deliver to the process group.
+    int32 signal = 4;
+    // Close the child's stdin (EOF).
+    bool stdin_eof = 5;
+  }
+}
+
+message ExecStart {
+  repeated string cmd = 1;
+  map<string, string> env = 2;
+  string cwd = 3;
+  bool pty = 4;
+  uint32 rows = 5;
+  uint32 cols = 6;
+  // User to run as. Empty is root, which is what every command was before
+  // this field existed. HOME, USER, LOGNAME and the default cwd follow it.
+  string user = 7;
+}
+
+message ExecResize {
+  uint32 rows = 1;
+  uint32 cols = 2;
+}
+
+message ExecOutput {
+  oneof output {
+    bytes stdout = 1;
+    bytes stderr = 2;
+    int32 exit_code = 3;
+    // Sent once, before any output, so a caller that means to come back to
+    // this command has its id without waiting for it to finish.
+    string command_id = 4;
+  }
+}
+
+message HandshakeRequest {
+  // Entropy from the host for post-restore RNG reseed.
+  bytes entropy = 1;
+  // Host wall-clock, unix nanos, for post-restore clock fixup.
+  int64 host_time_unix_nanos = 2;
+  // True when this boot is a snapshot restore, not a cold boot.
+  bool restored = 3;
+  // Address this sandbox should use. A clone restored from a shared warm
+  // snapshot wakes up holding the address that was baked into it, which
+  // belongs to no one; the host is the only party that knows the right one.
+  NetworkConfig network = 4;
+  // PEM of the certificate authority this sandbox should trust, when it opted
+  // in to having its TLS inspected. Empty otherwise, and an empty value must
+  // not disturb a trust store the image shipped with.
+  string inspection_ca_pem = 5;
+  // Bundles this image's own environment points its tooling at, which the
+  // well-known system paths do not cover. Empty unless the image named one.
+  repeated TrustBundle extra_trust_bundles = 6;
+  // Volumes to mount, in order. Sent on every handshake rather than only the
+  // first: a resumed guest has the devices but not the mounts, since a mount
+  // does not survive the VM it was made in.
+  repeated VolumeMount volumes = 7;
+}
+
+// Deliberately not burrow.common.v1.VolumeMount: the guest protocol versions
+// separately from the public API, and a paused sandbox resumes with the agent
+// it was snapshotted with.
+message VolumeMount {
+  // Guest device the host attached this volume as, e.g. /dev/vdc.
+  string device = 1;
+  string path = 2;
+  bool read_only = 3;
+}
+
+// A trust store outside the system paths that the CA also has to reach.
+message TrustBundle {
+  // Absolute, and checked again in the guest: the value came from an image.
+  string path = 1;
+  // True only for a file of *additional* CAs, where nothing existing yet means
+  // no extra CAs yet. A full bundle that is absent is a broken image
+  // reference, and inventing one would leave every other root out of it.
+  bool create_if_missing = 2;
+}
+
+message NetworkConfig {
+  string ip = 1;
+  uint32 prefix_len = 2;
+  string gateway = 3;
+  string dns = 4;
+}
+
+message HandshakeResponse {
+  string agent_version = 1;
+
+  // Where the guest's share of a warm create went, in microseconds. Purely
+  // diagnostic: the host logs it at debug level so a slow create can be
+  // attributed to a guest-side step rather than guessed at. A guest that does
+  // not fill these in reports zeros, which read as "not measured".
+  GuestResumeTiming timing = 2;
+}
+
+// Guest-side costs of waking from a snapshot and handshaking, in microseconds.
+message GuestResumeTiming {
+  // Time the accepting task spent inside `accept()` before this connection
+  // arrived, on the guest's monotonic clock, which does not advance while the
+  // VM is paused.
+  //
+  // Read it as a difference, not an absolute: for the first connection after
+  // a restore the interval *begins before the snapshot was taken*, so it
+  // carries a fixed tail of whatever the guest was doing between re-entering
+  // accept and being paused. That tail is identical for every sandbox
+  // restored from one snapshot, so what moves between restores is guest wake.
+  uint64 parked_us = 1;
+  // Accept to the handshake handler running: the guest's HTTP/2 and gRPC
+  // machinery.
+  uint64 accept_to_call_us = 2;
+  uint64 reseed_us = 3;
+  uint64 clock_us = 4;
+  uint64 trust_us = 5;
+  uint64 network_us = 6;
+  uint64 total_us = 7;
+
+  // `trust_us` split three ways, summed over every bundle touched: reading
+  // the existing store, searching it for a certificate already there, and
+  // writing the replacement. A trust store is a few hundred kilobytes and the
+  // certificate is under a kilobyte, so which of the three dominates is not
+  // guessable. It was measured, and the answer decided what to fix.
+  uint64 trust_read_us = 8;
+  uint64 trust_scan_us = 9;
+  uint64 trust_write_us = 10;
+}
+
+message AgentHealthRequest {}
+message AgentHealthResponse {}

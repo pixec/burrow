@@ -1,0 +1,395 @@
+syntax = "proto3";
+
+package burrow.common.v1;
+
+// Lifecycle states of a sandbox. Every transition is persisted and audited.
+enum SandboxState {
+  SANDBOX_STATE_UNSPECIFIED = 0;
+  SANDBOX_STATE_CREATING = 1;
+  SANDBOX_STATE_RUNNING = 2;
+  // VMM alive, vCPUs paused (in-memory; fastest resume).
+  SANDBOX_STATE_PAUSED = 3;
+  // Snapshotted to disk, VMM gone; survives daemon restarts.
+  SANDBOX_STATE_SUSPENDED = 4;
+  SANDBOX_STATE_STOPPING = 5;
+  SANDBOX_STATE_DESTROYED = 6;
+  SANDBOX_STATE_FAILED = 7;
+}
+
+enum NetworkMode {
+  NETWORK_MODE_UNSPECIFIED = 0;
+  // No egress at all.
+  NETWORK_MODE_NONE = 1;
+  // Egress only through the proxy, restricted to allow_domains/allow_cidrs.
+  NETWORK_MODE_ALLOWLIST = 2;
+  // NAT'd egress (still audited at L3/L4).
+  NETWORK_MODE_OPEN = 3;
+}
+
+message ResourcePolicy {
+  uint32 vcpus = 1;
+  uint32 mem_mib = 2;
+  uint32 scratch_disk_mib = 3;
+  // Seconds; 0 = unlimited.
+  uint64 max_lifetime_secs = 4;
+  // Auto-suspend after this many idle seconds; 0 = never.
+  uint64 idle_suspend_secs = 5;
+  // A sandbox left suspended this long is deleted by the node's reaper,
+  // releasing its disk and its address lease; 0 = keep suspended sandboxes
+  // forever. Measured from the moment it entered SUSPENDED, so it composes
+  // with idle_suspend_secs: idle parks a sandbox, and this is how long the
+  // parked state is worth paying for.
+  uint64 suspended_ttl_secs = 6;
+  // Default lifetime of a snapshot taken of this sandbox, in seconds; 0 =
+  // never expires. Measured from last use and refreshed whenever a sandbox is
+  // created from the snapshot, so an environment people keep starting from
+  // stays, and one nobody has touched since it was taken does not.
+  uint64 snapshot_expiration_secs = 7;
+  // Keep only the N most recent snapshots of this sandbox, oldest evicted
+  // first as a new one is taken. 1..=10; 0 = unlimited.
+  //
+  // Here rather than in a section of its own because every field beside it
+  // answers the same question, how long the disk this sandbox holds stays paid
+  // for, and a separate section would be empty for every sandbox that never
+  // takes a snapshot.
+  uint32 keep_last_snapshots = 8;
+  // Let a snapshot evicted by keep_last_snapshots live out its expiration
+  // instead of being deleted at once. Only meaningful with both of the fields
+  // above set, and refused without them: with no expiry an evicted snapshot
+  // would be kept forever by a policy whose whole purpose is to bound what is
+  // kept.
+  //
+  // Spelled as "keep" rather than "delete evicted" so the proto3 default, and
+  // therefore every caller that says nothing, gets the bounded behaviour.
+  bool keep_evicted_snapshots = 9;
+}
+
+// Whether callers may run commands in the sandbox.
+//
+// An absent ExecPolicy allows exec, which is what a sandbox created without one
+// has always done. A present one is enforced by the node, before an Exec ever
+// reaches the guest agent.
+message ExecPolicy {
+  bool allow_exec = 1;
+}
+
+// What callers may do to the sandbox's filesystem.
+//
+// An absent FsPolicy allows everything. A present one is enforced by the node
+// on upload, download, list_dir and watch, before a path or a byte reaches the
+// guest agent.
+message FsPolicy {
+  bool allow_upload = 1;
+  bool allow_download = 2;
+  // Absolute path prefixes file operations are confined to, matched on whole
+  // path components; empty = whole fs. At most 16, none containing "..".
+  repeated string path_scopes = 3;
+  // Ceiling on a single upload; 0 = unlimited. An upload that exceeds it is
+  // cut off with RESOURCE_EXHAUSTED.
+  uint64 max_upload_bytes = 4;
+}
+
+// How one string is compared against the part of a request it names.
+//
+// All three are linear in the length of what they examine: the regex engine on
+// the node has no backtracking, so a pattern cannot make a request cost
+// unbounded work no matter what the guest sends.
+enum StringMatchOp {
+  STRING_MATCH_OP_UNSPECIFIED = 0;
+  STRING_MATCH_OP_EXACT = 1;
+  STRING_MATCH_OP_STARTS_WITH = 2;
+  STRING_MATCH_OP_REGEX = 3;
+}
+
+message StringMatch {
+  StringMatchOp op = 1;
+  // At most 256 bytes. A regex that does not compile is refused at the API
+  // door, so a rule is never in force in a form the node could not read.
+  string value = 2;
+}
+
+// One named entry of a request: a query parameter or a header.
+message FieldMatch {
+  // Query keys are compared case-sensitively, header names case-insensitively,
+  // which is what each of the two is defined to mean.
+  string key = 1;
+  StringMatch value = 2;
+}
+
+// Which requests a rule applies to.
+//
+// A matcher never blocks: it selects which requests the rule's action applies
+// to. A request matching no rule is still allowed, it simply leaves unmodified.
+// Every dimension given must match; a dimension left out is not examined.
+message RequestMatch {
+  // Compared against the path alone, without the query string, case-sensitively.
+  StringMatch path = 1;
+  // Any one of these matching is enough. Compared exactly and case-sensitively,
+  // so they are written as "GET", "POST". At most 8.
+  repeated string methods = 2;
+  // All must match. A request that repeats a key satisfies the entry if any of
+  // its values does. At most 8.
+  repeated FieldMatch query = 3;
+  // All must match, on the same any-value rule. Values are compared
+  // case-sensitively. At most 8.
+  repeated FieldMatch headers = 4;
+}
+
+message HeaderValue {
+  // An RFC 9110 token.
+  string name = 1;
+  // Secret. Never leaves the node: redacted in every response that carries a
+  // policy back to a caller.
+  string value = 2;
+}
+
+// Set these headers on the request before it leaves.
+//
+// Whatever the client sent under the same name is removed first, so untrusted
+// code in the guest can use a credential without ever holding it, and cannot
+// send a value of its own that survives.
+message SetHeaders {
+  repeated HeaderValue headers = 1;
+}
+
+// Send the request to an endpoint the operator controls instead of to the
+// origin the sandbox named.
+message ForwardRequest {
+  // An http:// or https:// endpoint, with no query string and no fragment. The
+  // forwarded request keeps the original method, headers and body, and its
+  // target is this URL's path followed by the original path and query.
+  string url = 1;
+  // Shared secret sent as `burrow-forwarded-secret`. It proves the request came
+  // from a node holding the secret; it says nothing about which sandbox made
+  // it. The endpoint must therefore be reachable only by the node. Redacted on
+  // every read, like an injected header value.
+  string secret = 2;
+}
+
+// A rule the proxy applies to inspected requests to one domain.
+//
+// Rules are evaluated in order and the first whose domain and matcher both
+// match wins, so a rule with no matcher shadows every rule after it for that
+// domain.
+message RequestRule {
+  // Domain glob, matched exactly like allow_domains.
+  string domain = 1;
+  // Absent: every request to the domain.
+  RequestMatch match = 2;
+  oneof action {
+    SetHeaders set_headers = 3;
+    ForwardRequest forward = 4;
+  }
+}
+
+message NetworkPolicy {
+  NetworkMode mode = 1;
+  // Domain globs, e.g. "pypi.org", "*.pythonhosted.org".
+  repeated string allow_domains = 2;
+  repeated string allow_cidrs = 3;
+  repeated uint32 allow_ports = 4;
+  // Terminate this sandbox's TLS so the host named *inside* the session is
+  // checked too, not just the SNI. Closes domain fronting, at the cost of the
+  // proxy being able to read the payload, which is why it is opt-in.
+  bool inspect_tls = 5;
+  // IPv4 ranges this sandbox may never reach, in any mode. Deny beats every
+  // allowance: an allowed domain resolving into one of these is refused too.
+  repeated string deny_cidrs = 6;
+  // What the host does to requests it inspects: broker a credential onto them,
+  // or send them to an endpoint the operator controls. Requires inspect_tls,
+  // since the proxy has to terminate TLS to touch a request at all. At most 32.
+  //
+  // Field 7 was `repeated HeaderInjection inject_headers`, which is the special
+  // case of a rule with no matcher and a set_headers action.
+  reserved 7;
+  reserved "inject_headers";
+  repeated RequestRule rules = 8;
+}
+
+// Membership in a named private inter-sandbox network.
+message NetworkMembership {
+  string network = 1;
+  // Ports this member accepts from peers; empty = all.
+  repeated uint32 ingress_ports = 2;
+  bool allow_egress = 3;
+  bool allow_ingress = 4;
+  // Name this sandbox answers to on the network, as
+  // "<alias>.<network>.internal". Empty means the sandbox id.
+  string alias = 5;
+}
+
+message Policy {
+  ResourcePolicy resources = 1;
+  ExecPolicy exec = 2;
+  FsPolicy fs = 3;
+  NetworkPolicy network = 4;
+  repeated NetworkMembership networks = 5;
+  // Volumes to attach, in the order the guest should mount them.
+  repeated VolumeMount volumes = 6;
+}
+
+// A volume attached to one sandbox at one path.
+message VolumeMount {
+  string volume = 1;
+  // Absolute path in the guest. Checked again inside the guest, since a mount
+  // point is a path the host was told rather than one it derived.
+  string path = 2;
+  // Read-only mounts of one volume can be held by any number of sandboxes at
+  // once. A writable mount is exclusive, because the filesystem on a volume is
+  // ext4 rather than a cluster filesystem, and two guests writing one image
+  // corrupt it.
+  bool read_only = 3;
+}
+
+// Storage that outlives the sandboxes that mount it.
+//
+// Node-local, like a snapshot and for the same reason: it is a disk image on
+// one machine, attached to the guest as a virtio block device. A sandbox that
+// mounts one is placed on the node holding it.
+message Volume {
+  string name = 1;
+  string node_id = 2;
+  uint64 size_mib = 3;
+  // RFC 3339.
+  string created_at = 4;
+  // Sandbox currently holding the writable claim, empty when free. Read-only
+  // mounts are not tracked here: they do not exclude anything.
+  string attached_to = 5;
+}
+
+message Sandbox {
+  string id = 1;
+  string node_id = 2;
+  // Guest address, so the orchestrator can tell nodes which remote addresses
+  // belong to a shared private network.
+  string guest_ip = 8;
+  string template = 3;
+  SandboxState state = 4;
+  Policy policy = 5;
+  // RFC 3339.
+  string created_at = 6;
+  map<string, string> metadata = 7;
+  // Caller-chosen name, unique across the fleet and fixed for the sandbox's
+  // life. Empty when the caller did not ask for one: a name is a convenience,
+  // not a second identity, and nothing generates one. Anywhere the API takes a
+  // sandbox reference, a name works in place of the id.
+  string name = 9;
+  // Set by the orchestrator on read paths when the hosting node has missed
+  // heartbeats, so a last-known record is not mistaken for a live one. Never
+  // persisted and never sent by a node: it describes the node's reachability
+  // at the moment of the read, not anything about the sandbox itself.
+  bool unreachable = 10;
+  // Host CPU every VM this sandbox has run has consumed, in microseconds.
+  // Read from the sandbox's own cgroup, so it covers the whole VMM (the
+  // guest's vCPU threads and Firecracker's own work on their behalf) and
+  // accumulates across suspends, resumes and restores. A sandbox that never
+  // ran reports 0.
+  uint64 cpu_usage_usec = 11;
+  // Bytes the sandbox has received and sent on its tap, accumulated the same
+  // way. Counted at the tap, which is where the guest's own traffic is: egress
+  // that goes through the host proxy is counted as the guest sent it, not
+  // again as the proxy forwarded it.
+  uint64 rx_bytes = 12;
+  uint64 tx_bytes = 13;
+  // The VM is running but its guest agent has not answered yet, or never did.
+  //
+  // A warm create returns as soon as the VM is restored and the firewall is in
+  // place, without waiting for the guest, so RUNNING here means "the VM is
+  // up", not "something can run inside it". Anything that reaches the guest
+  // waits for the agent and fails with a clear error if it never comes, but a
+  // caller reading a record in between would otherwise have no way to tell the
+  // two apart. Never persisted: it describes the VM currently running, and a
+  // sandbox that is resumed handshakes again.
+  bool agent_unconfirmed = 14;
+}
+
+// One VM boot inside a sandbox's life.
+//
+// A sandbox outlives its VMs: a suspend stops one and a resume starts the next,
+// and a fork or a create from a snapshot starts one from state written
+// somewhere else. A session is the interval between those two events, which is
+// what makes "how long has this been running" and "how many times has it come
+// back" answerable without inferring them from a state field that only ever
+// shows the present.
+message Session {
+  string id = 1;
+  string sandbox_id = 2;
+  // RFC 3339.
+  string started_at = 3;
+  // RFC 3339. Empty while the session is open, and empty for a session the
+  // node died during: nothing recorded when that VM actually stopped.
+  string ended_at = 4;
+  // How the VM started: "boot" from a template, "restore" from a fork or a
+  // snapshot, "resume" from the sandbox's own suspend state.
+  string started_by = 5;
+  // How it stopped: "suspended", "deleted", "failed", or "unknown" for a
+  // session that was still open when the node died. Empty while it is open.
+  string ended_by = 6;
+}
+
+// A sandbox's saved state, addressable on its own.
+//
+// Node-local, like a template: a snapshot encodes the host's cpu features and
+// the exact Firecracker version, so it can only be restored on the node that
+// took it. Unlike a sandbox's own suspend state, it outlives the sandbox it
+// came from, which is the point, since many sandboxes can be started from one.
+message Snapshot {
+  string id = 1;
+  // Sandbox the state was taken from. It may since have been deleted.
+  string sandbox_id = 2;
+  string template = 3;
+  // Filled in by the orchestrator from its own view of the fleet; a node knows
+  // its snapshots are its own and does not set it.
+  string node_id = 4;
+  // The machine the snapshot was taken on. A restore takes its configuration
+  // from the snapshot, so a create from it cannot ask for a different shape.
+  uint32 vcpus = 5;
+  uint32 mem_mib = 6;
+  uint32 scratch_disk_mib = 7;
+  // RFC 3339.
+  string created_at = 8;
+  // Everything the snapshot occupies on the node: memory image, vmstate and
+  // scratch disk.
+  uint64 size_bytes = 9;
+  // RFC 3339; empty means the snapshot does not expire.
+  string expires_at = 10;
+}
+
+message NodeInfo {
+  string id = 1;
+  // Address the orchestrator dials for the node API, e.g. "10.0.0.5:7071".
+  string address = 2;
+  uint32 total_vcpus = 3;
+  uint64 total_mem_mib = 4;
+  string hostname = 5;
+  // Where this node accepts forwarded sandbox traffic, e.g. "10.0.0.5:7072".
+  // Separate from the API address because it carries tenant traffic rather
+  // than control calls.
+  string sandbox_proxy_address = 6;
+  // Operator-set facts about where this node is and what it is for, e.g.
+  // {"rack": "b7", "tenant": "acme"}. Burrow has no regions; a caller
+  // constrains placement by naming labels a node must carry. Held to the same
+  // limits as tags, since both are set by an operator and rendered back.
+  map<string, string> labels = 7;
+  // Domain this node's edge router serves, e.g. "node-a.example.com", and the
+  // port it listens on. Empty when the node runs no edge, which is the default
+  // and means its published ports have no hostname routing at all. Sandboxes
+  // are node-pinned, so a node-scoped hostname is stable for a sandbox's whole
+  // life.
+  string edge_domain = 8;
+  uint32 edge_port = 9;
+}
+
+message NodeStatus {
+  uint32 running_sandboxes = 1;
+  uint64 free_mem_mib = 2;
+  // Warm snapshots ready, per template.
+  map<string, uint32> warm_templates = 3;
+  bool draining = 4;
+  // Templates this node holds. Images are node-local, so placement has to
+  // know where they are rather than assuming every node is interchangeable.
+  repeated string templates = 5;
+  // vCPUs promised to sandboxes on this node, running or suspended. Free
+  // memory alone hides a node that is memory-rich and cpu-saturated.
+  uint32 committed_vcpus = 6;
+}

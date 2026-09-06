@@ -1,0 +1,13 @@
+# Docker does not read .gitignore, so without this the build context is the
+# whole workspace -- target/ alone is multiple GB, and tarring it can fill the
+# daemon's disk before the first instruction runs.
+#
+# The images copy binaries from dist/<arch>/ and the rootfs builder from
+# deploy/, so only those need to reach the daemon.
+target/
+.git/
+node_modules/
+sdk/
+docs/
+.github/
+*.md

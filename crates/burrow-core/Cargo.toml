@@ -1,0 +1,21 @@
+[package]
+name = "burrow-core"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+serde = { workspace = true }
+# For the edge machinery both routers share: reading a request head off a
+# socket is half of what is being shared, and a pure-function half would leave
+# the bound on the read in two places.
+tokio = { workspace = true }
+uuid = { workspace = true }
+thiserror = { workspace = true }
+tonic = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+opentelemetry = { workspace = true }
+opentelemetry_sdk = { workspace = true }
+opentelemetry-otlp = { workspace = true }
+tracing-opentelemetry = { workspace = true }

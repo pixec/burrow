@@ -1,0 +1,128 @@
+# The data plane: one burrowd per KVM-capable machine.
+#
+# A DaemonSet rather than a Deployment because a node is not a replica. It owns
+# the machine's /dev/kvm, its tap devices, its nftables rules and its sandbox
+# state on local disk, and sandboxes never move between nodes. "One per
+# machine, pinned to that machine's disk" is exactly what a DaemonSet is.
+#
+# Scheduled only onto machines you have labelled:
+#   kubectl label node <machine> burrow.pixec.net/kvm=true
+#
+# To run pools with different placement labels (burrow's stand-in for regions),
+# copy this DaemonSet, give it its own nodeSelector and its own --label flags.
+# The downward API cannot read a machine's labels, so they are set here.
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: burrow-node
+  namespace: burrow
+spec:
+  selector:
+    matchLabels:
+      app: burrow-node
+  template:
+    metadata:
+      labels:
+        app: burrow-node
+    spec:
+      nodeSelector:
+        burrow.pixec.net/kvm: "true"
+      # The mesh, the guest resolver and the edge all need to be reachable at
+      # the machine's own address: peers dial the WireGuard endpoint directly,
+      # and a sandbox's gateway address is a host address, not a pod one.
+      hostNetwork: true
+      dnsPolicy: ClusterFirstWithHostNet
+      containers:
+        - name: burrowd
+          image: ghcr.io/pixec/burrow-node:latest
+          args:
+            - serve
+            - --orchestrator
+            - http://orchestrator.burrow.svc.cluster.local:7070
+            - --listen
+            - 0.0.0.0:7071
+            # The orchestrator dials this to reach the node, and peers dial the
+            # mesh endpoint. Both are the machine's address under hostNetwork.
+            - --advertise
+            - $(HOST_IP):7071
+            - --mesh-endpoint
+            - $(HOST_IP):51820
+            # Stable per machine, so a restarted node re-registers as itself and
+            # keeps its sandboxes rather than arriving as a stranger.
+            - --node-id
+            - $(NODE_NAME)
+            - --data-dir
+            - /var/lib/burrow
+            - --agent-binary
+            - /burrow/bin/burrow-agent
+            # Chroot each firecracker and drop it to an unprivileged uid. Worth
+            # having on wherever sandboxes share a machine with anything else.
+            - --jailer
+            - /usr/local/bin/jailer
+            - --require-resource-limits
+            - --label
+            - tier=general
+            # This node's edge. Point a wildcard record at the machine:
+            # *.<node-name>.sandbox.example.com. An edge serves only the
+            # sandboxes its own node holds, so the domain must be unique to it.
+            - --edge-listen
+            - 0.0.0.0:7081
+            - --edge-domain
+            - $(NODE_NAME).sandbox.example.com
+          env:
+            - name: HOST_IP
+              valueFrom:
+                fieldRef:
+                  fieldPath: status.hostIP
+            - name: NODE_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: spec.nodeName
+            - name: BURROW_API_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: burrow-tokens
+                  key: api-key
+            - name: BURROW_NODE_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: burrow-tokens
+                  key: node-token
+            - name: RUST_LOG
+              value: info
+          securityContext:
+            # Firecracker needs /dev/kvm, guest NICs need /dev/net/tun, taps and
+            # nftables need NET_ADMIN, and capping sandboxes needs a writable
+            # cgroup2 tree. Same privilege the dev harness takes, for the same
+            # reasons -- a burrow node is a hypervisor host, and containing it
+            # inside a pod does not change what a hypervisor needs.
+            privileged: true
+          volumeMounts:
+            - name: kvm
+              mountPath: /dev/kvm
+            - name: tun
+              mountPath: /dev/net/tun
+            - name: cgroup
+              mountPath: /sys/fs/cgroup
+            # Sandbox state, templates and snapshots, on the machine's own disk.
+            # Snapshots are node-local and sandboxes do not move, so this
+            # follows the machine and not the pod.
+            - name: data
+              mountPath: /var/lib/burrow
+      volumes:
+        - name: kvm
+          hostPath:
+            path: /dev/kvm
+            type: CharDevice
+        - name: tun
+          hostPath:
+            path: /dev/net/tun
+            type: CharDevice
+        - name: cgroup
+          hostPath:
+            path: /sys/fs/cgroup
+            type: Directory
+        - name: data
+          hostPath:
+            path: /var/lib/burrow
+            type: DirectoryOrCreate

@@ -1,0 +1,99 @@
+[workspace]
+resolver = "3"
+members = [
+    "crates/burrow-proto",
+    "crates/burrow-core",
+    "crates/burrow-vmm",
+    "crates/burrow-net",
+    "crates/burrow-proxy",
+    "crates/burrow-store",
+    "crates/burrow-agent",
+    "crates/burrow-orchestrator",
+    "crates/burrow-daemon",
+    "crates/burrow-cli",
+    "xtask",
+]
+# burrow-agent is a Linux-only guest binary (vsock, mount syscalls). Excluding
+# it here keeps a bare `cargo build`/`cargo clippy` working on macOS; xtask
+# builds it explicitly for the Linux target.
+default-members = [
+    "crates/burrow-proto",
+    "crates/burrow-core",
+    "crates/burrow-vmm",
+    "crates/burrow-net",
+    "crates/burrow-proxy",
+    "crates/burrow-store",
+    "crates/burrow-orchestrator",
+    "crates/burrow-daemon",
+    "crates/burrow-cli",
+    "xtask",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+license = "MIT OR Apache-2.0"
+
+[workspace.dependencies]
+burrow-proto = { path = "crates/burrow-proto" }
+burrow-core = { path = "crates/burrow-core" }
+burrow-vmm = { path = "crates/burrow-vmm" }
+burrow-net = { path = "crates/burrow-net" }
+burrow-proxy = { path = "crates/burrow-proxy" }
+burrow-store = { path = "crates/burrow-store" }
+
+tokio = { version = "1", features = ["full"] }
+tokio-stream = "0.1"
+tonic = "0.13"
+prost = "0.13"
+tonic-build = "0.13"
+protoc-bin-vendored = "3"
+
+hyper = { version = "1", features = ["client", "http1"] }
+hyper-util = { version = "0.1", features = ["tokio"] }
+http-body-util = "0.1"
+bytes = "1"
+# HTTP/2 framing and HPACK for the inspecting proxy. Hand-rolling either on a
+# policy path is how CONTINUATION floods and HPACK bombs get written.
+h2 = "0.4"
+http = "1"
+
+# Linear-time matching for policy patterns. No backtracking, which is what
+# makes a regex safe to evaluate against guest-controlled requests.
+regex = "1"
+
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+toml = "0.8"
+uuid = { version = "1", features = ["v4", "serde"] }
+thiserror = "2"
+anyhow = "1"
+clap = { version = "4", features = ["derive", "env"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+sysinfo = "0.33"
+tokio-vsock = "0.7"
+rtnetlink = "0.23"
+netlink-packet-route = "0.33"
+futures = "0.3"
+nix = { version = "0.31", features = ["mount", "process", "fs", "time", "ioctl", "signal", "term", "socket", "uio", "mman", "poll"] }
+tower = "0.5"
+async-stream = "0.3"
+rusqlite = { version = "0.32", features = ["bundled"] }
+userfaultfd = "0.8"
+opentelemetry = "0.27"
+opentelemetry_sdk = { version = "0.27", features = ["rt-tokio"] }
+opentelemetry-otlp = { version = "0.27", features = ["grpc-tonic"] }
+tracing-opentelemetry = "0.28"
+libc = "0.2"
+sha2 = "0.10"
+base64 = "0.22"
+ruzstd = "0.7"
+rcgen = { version = "0.13", features = ["x509-parser"] }
+tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "tls12"] }
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
+rustls-pemfile = "2"
+webpki-roots = "0.26"
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls-native-roots", "json", "stream"] }
+flate2 = "1"
+tar = "0.4"
