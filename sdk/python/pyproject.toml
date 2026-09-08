@@ -5,8 +5,8 @@ build-backend = "hatchling.build"
 [project]
 name = "pixec-burrow"
 version = "0.1.0"
-description = "Python SDK for burrow - run AI agent code in Firecracker microVMs"
-license = { text = "MIT OR Apache-2.0" }
+description = "Python client for Burrow, sandboxes that run untrusted code in Firecracker microVMs"
+license = { text = "AGPL-3.0-only" }
 requires-python = ">=3.9"
 # Floors match what the committed `_pb` modules were generated against:
 # api_pb2_grpc.py refuses grpcio older than 1.80, and api_pb2.py validates

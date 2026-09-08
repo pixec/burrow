@@ -554,7 +554,6 @@ fn receive_layout(stream: &UnixStream) -> io::Result<(Vec<RegionMapping>, OwnedF
             }
         }
         let bytes = msg.bytes;
-        drop(msg);
 
         last_body = String::from_utf8_lossy(&buf[..bytes]).into_owned();
         let Some(uffd) = received else {
@@ -677,87 +676,6 @@ fn zero_range(fd: RawFd, start: u64, end: u64) -> io::Result<()> {
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn ioctl_numbers_match_the_kernel_abi() {
-        // Values from linux/userfaultfd.h on both x86_64 and aarch64; a
-        // mismatch here means every fault fails with ENOTTY.
-        assert_eq!(UFFDIO_COPY, 0xc028aa03);
-        assert_eq!(UFFDIO_ZEROPAGE, 0xc020aa04);
-    }
-
-    #[test]
-    fn struct_layouts_match_the_kernel_abi() {
-        assert_eq!(std::mem::size_of::<UffdioCopy>(), 40);
-        assert_eq!(std::mem::size_of::<UffdioZeropage>(), 32);
-        assert_eq!(std::mem::size_of::<UffdioRange>(), 16);
-    }
-
-    #[test]
-    fn a_pagefault_message_yields_its_address() {
-        let mut buf = [0u8; UFFD_MSG_SIZE];
-        buf[0] = UFFD_EVENT_PAGEFAULT;
-        // arg.pagefault = { flags, address, ptid }
-        buf[16..24].copy_from_slice(&0xdead_0000u64.to_ne_bytes());
-        match parse_event(&buf) {
-            Event::PageFault { address } => assert_eq!(address, 0xdead_0000),
-            _ => panic!("expected a page fault"),
-        }
-    }
-
-    #[test]
-    fn a_remove_message_yields_its_range() {
-        let mut buf = [0u8; UFFD_MSG_SIZE];
-        buf[0] = UFFD_EVENT_REMOVE;
-        buf[8..16].copy_from_slice(&0x1000u64.to_ne_bytes());
-        buf[16..24].copy_from_slice(&0x3000u64.to_ne_bytes());
-        match parse_event(&buf) {
-            Event::Remove { start, end } => {
-                assert_eq!((start, end), (0x1000, 0x3000));
-            }
-            _ => panic!("expected a remove"),
-        }
-    }
-
-    #[test]
-    fn a_fault_is_matched_to_the_region_holding_it() {
-        let regions = vec![
-            RegionMapping {
-                base_host_virt_addr: 0x1000,
-                size: 0x1000,
-                offset: 0,
-                page_size: 0x1000,
-            },
-            RegionMapping {
-                base_host_virt_addr: 0x100000,
-                size: 0x2000,
-                offset: 0x1000,
-                page_size: 0x1000,
-            },
-        ];
-        assert!(regions[0].contains(0x1fff));
-        assert!(!regions[0].contains(0x2000));
-        assert!(regions[1].contains(0x101000));
-        // The gap between regions belongs to neither.
-        assert!(!regions.iter().any(|r| r.contains(0x50000)));
-    }
-
-    #[test]
-    fn firecrackers_layout_wire_format_parses() {
-        // Field names are Firecracker's; a rename on its side must fail here
-        // rather than silently produce zero regions.
-        let body = r#"[{"base_host_virt_addr":140244897726464,"size":268435456,
-                        "offset":0,"page_size":4096}]"#;
-        let regions: Vec<RegionMapping> = serde_json::from_str(body).unwrap();
-        assert_eq!(regions.len(), 1);
-        assert_eq!(regions[0].size, 268435456);
-        assert_eq!(regions[0].page_size, 4096);
-    }
-}
-
 /// Copies a snapshot file without filling in its holes.
 ///
 /// `std::fs::copy` expands every hole into real zeroes, which turns merging a
@@ -828,4 +746,85 @@ pub fn merge_chain(chain: &[PathBuf], out: &Path) -> io::Result<()> {
     merged.flush()?;
     drop(merged);
     std::fs::rename(&temp, out)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn ioctl_numbers_match_the_kernel_abi() {
+        // Values from linux/userfaultfd.h on both x86_64 and aarch64; a
+        // mismatch here means every fault fails with ENOTTY.
+        assert_eq!(UFFDIO_COPY, 0xc028aa03);
+        assert_eq!(UFFDIO_ZEROPAGE, 0xc020aa04);
+    }
+
+    #[test]
+    fn struct_layouts_match_the_kernel_abi() {
+        assert_eq!(std::mem::size_of::<UffdioCopy>(), 40);
+        assert_eq!(std::mem::size_of::<UffdioZeropage>(), 32);
+        assert_eq!(std::mem::size_of::<UffdioRange>(), 16);
+    }
+
+    #[test]
+    fn a_pagefault_message_yields_its_address() {
+        let mut buf = [0u8; UFFD_MSG_SIZE];
+        buf[0] = UFFD_EVENT_PAGEFAULT;
+        // arg.pagefault = { flags, address, ptid }
+        buf[16..24].copy_from_slice(&0xdead_0000u64.to_ne_bytes());
+        match parse_event(&buf) {
+            Event::PageFault { address } => assert_eq!(address, 0xdead_0000),
+            _ => panic!("expected a page fault"),
+        }
+    }
+
+    #[test]
+    fn a_remove_message_yields_its_range() {
+        let mut buf = [0u8; UFFD_MSG_SIZE];
+        buf[0] = UFFD_EVENT_REMOVE;
+        buf[8..16].copy_from_slice(&0x1000u64.to_ne_bytes());
+        buf[16..24].copy_from_slice(&0x3000u64.to_ne_bytes());
+        match parse_event(&buf) {
+            Event::Remove { start, end } => {
+                assert_eq!((start, end), (0x1000, 0x3000));
+            }
+            _ => panic!("expected a remove"),
+        }
+    }
+
+    #[test]
+    fn a_fault_is_matched_to_the_region_holding_it() {
+        let regions = [
+            RegionMapping {
+                base_host_virt_addr: 0x1000,
+                size: 0x1000,
+                offset: 0,
+                page_size: 0x1000,
+            },
+            RegionMapping {
+                base_host_virt_addr: 0x100000,
+                size: 0x2000,
+                offset: 0x1000,
+                page_size: 0x1000,
+            },
+        ];
+        assert!(regions[0].contains(0x1fff));
+        assert!(!regions[0].contains(0x2000));
+        assert!(regions[1].contains(0x101000));
+        // The gap between regions belongs to neither.
+        assert!(!regions.iter().any(|r| r.contains(0x50000)));
+    }
+
+    #[test]
+    fn firecrackers_layout_wire_format_parses() {
+        // Field names are Firecracker's; a rename on its side must fail here
+        // rather than silently produce zero regions.
+        let body = r#"[{"base_host_virt_addr":140244897726464,"size":268435456,
+                        "offset":0,"page_size":4096}]"#;
+        let regions: Vec<RegionMapping> = serde_json::from_str(body).unwrap();
+        assert_eq!(regions.len(), 1);
+        assert_eq!(regions[0].size, 268435456);
+        assert_eq!(regions[0].page_size, 4096);
+    }
 }

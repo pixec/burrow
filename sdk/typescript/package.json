@@ -1,8 +1,8 @@
 {
   "name": "@pixec/burrow",
   "version": "0.1.0",
-  "description": "TypeScript SDK for burrow - run AI agent code in Firecracker microVMs",
-  "license": "MIT OR Apache-2.0",
+  "description": "TypeScript client for Burrow, sandboxes that run untrusted code in Firecracker microVMs",
+  "license": "AGPL-3.0-only",
   "type": "module",
   "main": "./dist/index.js",
   "types": "./dist/index.d.ts",
@@ -24,7 +24,7 @@
     "build": "npm run sync-protos && tsc",
     "prepublishOnly": "npm run build",
     "typecheck": "tsc --noEmit",
-    "test": "npm run build && node --test 'test/*.test.mjs'",
+    "test": "npm run build && node --test",
     "example": "node examples/quickstart.mjs"
   },
   "dependencies": {
