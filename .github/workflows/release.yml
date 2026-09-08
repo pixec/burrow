@@ -115,8 +115,12 @@ jobs:
 
       - uses: actions/download-artifact@v4
         with:
-          pattern: dist-*
-          path: dist
+          name: dist-amd64
+          path: dist/amd64
+      - uses: actions/download-artifact@v4
+        with:
+          name: dist-arm64
+          path: dist/arm64
 
       - name: Restore executable bits
         # Artifact upload does not preserve them, and a COPY of a non-executable
