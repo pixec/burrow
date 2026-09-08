@@ -1,11 +1,14 @@
-# Namespace and the two cluster tokens.
+# The namespace. The two cluster tokens are deliberately not here: create the
+# Secret yourself, before applying anything else. The manifests that reference
+# it stay Pending until you do.
 #
 # The tokens are distinct on purpose: --api-key is what tenants present to the
-# orchestrator, --node-token is what a node presents to register. Registration
-# decides where exec and logs are routed, so a leaked tenant key must not be
-# able to enrol a node.
+# orchestrator; --node-token guards the node-facing hop in both directions. A
+# node presents it to register, and the orchestrator presents it on every call
+# to a node's own API, which accepts nothing else. A leaked tenant key must
+# neither enrol a node nor drive one directly.
 #
-# Replace both values before applying anywhere real:
+#   kubectl create namespace burrow
 #   kubectl -n burrow create secret generic burrow-tokens \
 #     --from-literal=api-key="$(openssl rand -hex 32)" \
 #     --from-literal=node-token="$(openssl rand -hex 32)"
@@ -18,13 +21,3 @@ metadata:
     # Security Admission, the namespace has to admit them or the DaemonSet is
     # rejected with no pod ever created.
     pod-security.kubernetes.io/enforce: privileged
----
-apiVersion: v1
-kind: Secret
-metadata:
-  name: burrow-tokens
-  namespace: burrow
-type: Opaque
-stringData:
-  api-key: CHANGE-ME-tenant-token
-  node-token: CHANGE-ME-node-token

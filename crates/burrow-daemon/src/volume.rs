@@ -18,6 +18,8 @@
 //! what makes a node restart release them, and is correct because nothing is
 //! touching the image while no VM is running.
 
+#![allow(clippy::result_large_err)]
+
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
@@ -57,6 +59,15 @@ pub struct Meta {
 struct Claim {
     writer: Option<String>,
     readers: std::collections::HashSet<String>,
+    /// Who owned the image before a jailed sandbox was given write access to
+    /// it, if anyone had to be displaced.
+    ///
+    /// A writable mount under the jailer has to be writable by the uid the VMM
+    /// drops to, and the image is the volume's own inode rather than a copy of
+    /// it, so that chown lands on storage every future sandbox will mount. It
+    /// is put back the moment the claim goes, which makes the grant last
+    /// exactly as long as the mount: see [`VolumeStore::remember_owner`].
+    restore_owner: Option<(u32, u32)>,
 }
 
 impl Claim {
@@ -218,9 +229,8 @@ impl VolumeStore {
             let claim = claims.entry(mount.volume.clone()).or_default();
             // A sandbox re-claiming what it already holds is a resume, not a
             // conflict with itself.
-            let held_by_someone_else = |who: &Option<String>| {
-                who.as_deref().is_some_and(|holder| holder != sandbox_id)
-            };
+            let held_by_someone_else =
+                |who: &Option<String>| who.as_deref().is_some_and(|holder| holder != sandbox_id);
             let refusal = if mount.read_only {
                 held_by_someone_else(&claim.writer).then(|| {
                     format!(
@@ -266,30 +276,94 @@ impl VolumeStore {
         Ok(())
     }
 
-    /// Drops every claim one sandbox holds, on stop, suspend or delete.
-    pub fn release_all(&self, sandbox_id: &str) {
+    /// Records who owns a volume's image before a jailed sandbox writes to it.
+    ///
+    /// Called with the claim already taken, so the owner recorded is the one
+    /// that was in place before this sandbox's [`crate::sandbox`] chown. What
+    /// is recorded is whatever the inode says now: if an earlier release could
+    /// not put the ownership back, this hands on the owner it actually has
+    /// rather than inventing one.
+    pub async fn remember_owner(&self, volume: &str) {
+        use std::os::unix::fs::MetadataExt as _;
+
+        let Ok(meta) = tokio::fs::metadata(self.image(volume)).await else {
+            return;
+        };
+        let owner = (meta.uid(), meta.gid());
         let mut claims = self.claims.lock().unwrap();
-        for claim in claims.values_mut() {
-            if claim.writer.as_deref() == Some(sandbox_id) {
-                claim.writer = None;
-            }
-            claim.readers.remove(sandbox_id);
+        if let Some(claim) = claims.get_mut(volume) {
+            // Only the first writer of a claim records one; a resume re-taking
+            // its own claim must not record the jail uid as the original.
+            claim.restore_owner.get_or_insert(owner);
         }
-        claims.retain(|_, claim| !claim.is_free());
     }
 
-    /// Rolls back a partial claim, leaving other sandboxes' holds alone.
-    fn release_named(&self, sandbox_id: &str, volumes: &[String]) {
-        let mut claims = self.claims.lock().unwrap();
-        for name in volumes {
-            if let Some(claim) = claims.get_mut(name) {
+    /// Drops every claim one sandbox holds, on stop, suspend or delete.
+    pub fn release_all(&self, sandbox_id: &str) {
+        let restore = {
+            let mut claims = self.claims.lock().unwrap();
+            for claim in claims.values_mut() {
                 if claim.writer.as_deref() == Some(sandbox_id) {
                     claim.writer = None;
                 }
                 claim.readers.remove(sandbox_id);
             }
+            Self::drop_free(&mut claims)
+        };
+        self.restore_owners(restore);
+    }
+
+    /// Forgets the claims nobody holds, naming the images whose ownership has
+    /// to travel back with them.
+    fn drop_free(claims: &mut HashMap<String, Claim>) -> Vec<(String, (u32, u32))> {
+        let mut restore = Vec::new();
+        claims.retain(|name, claim| {
+            if !claim.is_free() {
+                return true;
+            }
+            if let Some(owner) = claim.restore_owner.take() {
+                restore.push((name.clone(), owner));
+            }
+            false
+        });
+        restore
+    }
+
+    /// Undoes the chown a writable mount under the jailer needed.
+    ///
+    /// Without this the grant is permanent: every jailed VMM on the node runs
+    /// as one uid, so an image left owned by it is host-level writable by every
+    /// other sandbox on the node for as long as the volume exists, whether or
+    /// not they were ever allowed to mount it.
+    fn restore_owners(&self, restore: Vec<(String, (u32, u32))>) {
+        for (name, (uid, gid)) in restore {
+            let image = self.image(&name);
+            if let Err(err) = std::os::unix::fs::chown(&image, Some(uid), Some(gid)) {
+                tracing::warn!(
+                    volume = name,
+                    %err,
+                    "could not put a volume image's owner back; it stays writable by \
+                     the jail uid until a later release succeeds"
+                );
+            }
         }
-        claims.retain(|_, claim| !claim.is_free());
+    }
+
+    /// Rolls back a partial claim, leaving other sandboxes' holds alone.
+    fn release_named(&self, sandbox_id: &str, volumes: &[String]) {
+        let restore = {
+            let mut claims = self.claims.lock().unwrap();
+            for name in volumes {
+                if let Some(claim) = claims.get_mut(name) {
+                    if claim.writer.as_deref() == Some(sandbox_id) {
+                        claim.writer = None;
+                    }
+                    claim.readers.remove(sandbox_id);
+                }
+            }
+            Self::drop_free(&mut claims)
+        };
+        self.restore_owners(restore);
     }
 
     fn to_proto(&self, meta: &Meta) -> common::Volume {
@@ -379,11 +453,14 @@ fn validate_path(path: &str) -> Result<(), Status> {
     }
     // Mounting over these breaks the guest in ways that look like anything but
     // a bad mount point.
-    const RESERVED: [&str; 8] = ["/proc", "/sys", "/dev", "/tmp", "/run", "/etc", "/usr", "/bin"];
+    const RESERVED: [&str; 8] = [
+        "/proc", "/sys", "/dev", "/tmp", "/run", "/etc", "/usr", "/bin",
+    ];
     let trimmed = path.trim_end_matches('/');
-    if RESERVED.iter().any(|reserved| {
-        trimmed == *reserved || trimmed.starts_with(&format!("{reserved}/"))
-    }) {
+    if RESERVED
+        .iter()
+        .any(|reserved| trimmed == *reserved || trimmed.starts_with(&format!("{reserved}/")))
+    {
         return Err(Status::invalid_argument(format!(
             "mount path {path:?} is inside a reserved directory"
         )));
@@ -401,9 +478,7 @@ pub fn device_for(index: usize) -> String {
 ///
 /// The order here must be the order the drives were attached, which is why
 /// both come from the same slice.
-pub fn agent_mounts(
-    mounts: &[common::VolumeMount],
-) -> Vec<burrow_proto::agent::v1::VolumeMount> {
+pub fn agent_mounts(mounts: &[common::VolumeMount]) -> Vec<burrow_proto::agent::v1::VolumeMount> {
     mounts
         .iter()
         .enumerate()
@@ -452,7 +527,9 @@ mod tests {
 
     #[test]
     fn one_path_or_one_volume_cannot_be_used_twice() {
-        assert!(validate_mounts(&[mount("a", "/data", false), mount("b", "/data", false)]).is_err());
+        assert!(
+            validate_mounts(&[mount("a", "/data", false), mount("b", "/data", false)]).is_err()
+        );
         // Nested, not equal: the inner mount would be hidden by the outer one.
         assert!(
             validate_mounts(&[mount("a", "/data", false), mount("b", "/data/cache", false)])
@@ -511,6 +588,10 @@ mod tests {
         // "free" was claimed before the conflict was found, and gave it back.
         assert!(store.claim("sbx_c", &[mount("free", "/f", false)]).is_ok());
         // Rolling back must not disturb the holder that caused the refusal.
-        assert!(store.claim("sbx_d", &[mount("taken", "/t", false)]).is_err());
+        assert!(
+            store
+                .claim("sbx_d", &[mount("taken", "/t", false)])
+                .is_err()
+        );
     }
 }

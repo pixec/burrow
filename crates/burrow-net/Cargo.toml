@@ -8,3 +8,6 @@ license.workspace = true
 tokio = { workspace = true }
 thiserror = { workspace = true }
 tracing = { workspace = true }
+# Only to check that a peer's WireGuard public key really is 32 bytes of
+# base64 before it is written into a config, never to produce one.
+base64 = { workspace = true }

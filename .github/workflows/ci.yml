@@ -1,0 +1,102 @@
+# Everything that has to hold on every change: the Rust workspace, and the two
+# SDKs, which are separate builds this workspace's tests cannot reach.
+name: ci
+
+on:
+  push:
+  pull_request:
+
+# Read-only by default. Nothing in this workflow publishes.
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+
+jobs:
+  rust:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+
+      # rust-toolchain.toml pins the channel and asks for rustfmt and clippy,
+      # so the components are installed by the first cargo invocation rather
+      # than by an action here.
+      - uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
+        with:
+          path: |
+            ~/.cargo/bin
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+            target
+          key: ${{ runner.os }}-ci-cargo-${{ hashFiles('Cargo.lock') }}
+          restore-keys: ${{ runner.os }}-ci-cargo-
+
+      - name: Format
+        run: cargo fmt --all --check
+
+      # burrow-agent is excluded from default-members (it is Linux-only), but
+      # this runner is Linux, so --workspace covers it.
+      - name: Clippy
+        run: cargo clippy --workspace --all-targets -- -D warnings
+
+      - name: Test
+        run: cargo test --workspace
+
+      # The SDKs carry their own copies of the .proto files, since they are
+      # published and cannot reach into this workspace.
+      - name: SDK protos are in sync
+        run: cargo xtask protos --check
+
+  # The Python SDK additionally commits code generated from its proto copies,
+  # so there are two ways to drift: the copies, checked above, and the
+  # generated modules, checked here.
+  python-sdk:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: sdk/python
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
+        with:
+          # The floor in pyproject.toml, so testing here keeps that floor
+          # honest.
+          python-version: "3.9"
+
+      # `dev` pins grpcio-tools to the minor that produced the committed _pb,
+      # which is what makes the drift check below meaningful.
+      - name: Install
+        run: pip install -e '.[dev]'
+
+      - name: Test
+        run: pytest
+
+      - name: Generated protobuf modules are in sync
+        run: python scripts/genproto.py --check
+
+  typescript-sdk:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: sdk/typescript
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          # The floor in package.json's engines.
+          node-version: "18"
+          cache: npm
+          cache-dependency-path: sdk/typescript/package-lock.json
+
+      # ci, not install: the lockfile is authoritative.
+      - name: Install
+        run: npm ci
+
+      # `npm test` builds first, so this covers the type check too.
+      - name: Test
+        run: npm test

@@ -1,5 +1,5 @@
 // End-to-end tour of the SDK. Needs a running burrow stack:
-//   docker --context colima-burrow compose -f deploy/docker/compose.yaml up -d
+//   docker --context colima-burrow compose -f deploy/dev/compose.yaml up -d
 //
 //   node examples/quickstart.mjs
 import { tmpdir } from "node:os";

@@ -34,7 +34,10 @@ spec:
       dnsPolicy: ClusterFirstWithHostNet
       containers:
         - name: burrowd
-          image: ghcr.io/pixec/burrow-node:latest
+          # Pinned, not :latest. A DaemonSet rolls onto every KVM machine at
+          # once, so :latest means an unplanned fleet-wide hypervisor upgrade
+          # the next time a pod restarts. Set this to the release you mean.
+          image: ghcr.io/pixec/burrow-node:0.1.0
           args:
             - serve
             - --orchestrator
@@ -90,6 +93,19 @@ spec:
                   key: node-token
             - name: RUST_LOG
               value: info
+          # What burrowd itself needs, not what its sandboxes do: a sandbox is
+          # a firecracker process this pod spawns, and its vCPU and memory come
+          # out of the machine rather than out of this cgroup, so a memory
+          # limit here would cap the sandboxes too. burrowd already enforces
+          # per-sandbox limits itself (--require-resource-limits above).
+          #
+          # Requests are set anyway so the pod is Burstable rather than
+          # BestEffort. Evicting the node daemon strands every microVM on the
+          # machine: they are not pods, so nothing reschedules them.
+          resources:
+            requests:
+              cpu: 200m
+              memory: 512Mi
           securityContext:
             # Firecracker needs /dev/kvm, guest NICs need /dev/net/tun, taps and
             # nftables need NET_ADMIN, and capping sandboxes needs a writable

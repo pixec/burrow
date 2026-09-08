@@ -6,6 +6,9 @@ pub enum NetError {
     #[error("no free /30 blocks left in the sandbox address pool")]
     AddressPoolExhausted,
 
+    #[error("node index {index} is outside the pool: only {max} nodes are addressable")]
+    NodeIndexOutOfRange { index: u32, max: u32 },
+
     #[error("{command} failed ({status}): {stderr}")]
     Command {
         command: String,

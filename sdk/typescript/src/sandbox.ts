@@ -125,12 +125,21 @@ function toCreateRequest(options: CreateOptions): any {
     memoryMib: options.memoryMib,
   };
   // A snapshot carries its own template, and one that disagrees is an error,
-  // so the default is not sent as if the caller had asked for it.
+  // so nothing is sent as if the caller had asked for it.
   const template = options.template ?? options.image ?? "";
+  // Without a snapshot there is nothing to boot from, and a made-up "default"
+  // would turn a missing argument into a not_found for a template nobody
+  // named.
+  if (!template && !options.snapshot) {
+    throw new BurrowError(
+      "a template is required: pass `template` (or `snapshot` to restore one)",
+      "invalid_argument",
+    );
+  }
   return {
     name: options.name ?? "",
     snapshot: options.snapshot ?? "",
-    template: template || (options.snapshot ? "" : "default"),
+    template,
     policy: {
       resources: toResourcePolicy(resources),
       // Left off the request entirely unless the caller asked for a limit:

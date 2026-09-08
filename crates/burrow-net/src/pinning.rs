@@ -40,6 +40,23 @@ pub enum Verdict {
     Learned,
     /// Contradicts the pin. The peer is refused.
     Conflict { pinned: String },
+    /// The node id is not one this file can hold; see [`valid_node_id`]. The
+    /// peer is refused and nothing is learned.
+    InvalidNodeId,
+}
+
+/// Whether a node id may be pinned.
+///
+/// A pin file is `<node-id> <public-key>` lines, so an id carrying whitespace
+/// does not round-trip: written out it reads back as a different id, or as an
+/// extra line pinning a node of the writer's choosing to a key they hold.
+/// Ids come from the operator's own naming, so everything outside
+/// `[A-Za-z0-9_.-]`, an empty id included, is refused rather than escaped.
+pub fn valid_node_id(node_id: &str) -> bool {
+    !node_id.is_empty()
+        && node_id
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'.' | b'-'))
 }
 
 impl PinnedKeys {
@@ -91,7 +108,13 @@ impl PinnedKeys {
     }
 
     /// Checks a reported key, pinning it if the peer is new.
+    ///
+    /// An id [`valid_node_id`] refuses never reaches the lookup: a pin that
+    /// cannot be written back would last only until the next restart.
     pub fn check(&mut self, node_id: &str, public_key: &str) -> Verdict {
+        if !valid_node_id(node_id) {
+            return Verdict::InvalidNodeId;
+        }
         match self.pins.get(node_id) {
             Some(pin) if pin.public_key == public_key => Verdict::Known,
             Some(pin) => Verdict::Conflict {
@@ -122,7 +145,9 @@ impl PinnedKeys {
         let mut lines: Vec<String> = self
             .pins
             .iter()
-            .filter(|(_, pin)| !pin.explicit)
+            // Checked again here: whatever route a pin took into the map, it
+            // must not write a line the parser would read as two.
+            .filter(|(node_id, pin)| !pin.explicit && valid_node_id(node_id))
             .map(|(node_id, pin)| format!("{node_id} {}", pin.public_key))
             .collect();
         lines.sort();
@@ -144,7 +169,8 @@ fn parse(text: &str) -> Vec<(String, String)> {
         .filter_map(|line| {
             let (node_id, key) = line.split_once(char::is_whitespace)?;
             let key = key.trim();
-            (!node_id.is_empty() && !key.is_empty()).then(|| (node_id.to_string(), key.to_string()))
+            (valid_node_id(node_id) && !key.is_empty())
+                .then(|| (node_id.to_string(), key.to_string()))
         })
         .collect()
 }
@@ -267,6 +293,61 @@ mod tests {
             !text.contains("operator-key"),
             "explicit pins must not be rewritten: {text}"
         );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The orchestrator supplies these ids and is precisely what pinning
+    /// distrusts, so an id the file cannot hold is refused, not escaped.
+    #[test]
+    fn a_node_id_outside_the_identifier_charset_is_never_learned() {
+        let mut pins = PinnedKeys::default();
+        for bad in [
+            "",
+            "node a",
+            "node-a\nnode-b attacker-key",
+            "node/a",
+            "nöde",
+        ] {
+            assert_eq!(
+                pins.check(bad, "keyA"),
+                Verdict::InvalidNodeId,
+                "{bad:?} must not be pinnable"
+            );
+            assert!(pins.get(bad).is_none(), "{bad:?} must not be recorded");
+        }
+        // The charset the operator actually uses still works.
+        for good in ["node-a", "node_a", "node.a", "NodeA1"] {
+            assert_eq!(pins.check(good, "keyA"), Verdict::Learned);
+        }
+    }
+
+    /// The line such an id produces could be read back as a pin for a node the
+    /// writer named, so it is neither written nor parsed.
+    #[tokio::test]
+    async fn an_unwritable_node_id_is_neither_saved_nor_loaded() {
+        let dir = std::env::temp_dir().join(format!("burrow-pins-id-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("mesh-pins");
+
+        let pins = PinnedKeys {
+            pins: [pinned("node-a\nnode-b attacker-key", "keyA", false)]
+                .into_iter()
+                .collect(),
+            path: Some(path.clone()),
+        };
+        pins.save().await.unwrap();
+        let text = tokio::fs::read_to_string(&path).await.unwrap();
+        assert!(!text.contains("attacker-key"), "{text}");
+
+        // And a file written by something else naming such an id is not read.
+        tokio::fs::write(&path, "no/de keyA\nnode-b keyB\n")
+            .await
+            .unwrap();
+        let loaded = PinnedKeys::load(&path, &dir.join("absent")).await;
+        assert!(loaded.get("no/de").is_none());
+        assert_eq!(loaded.get("node-b").unwrap().public_key, "keyB");
 
         let _ = std::fs::remove_dir_all(&dir);
     }

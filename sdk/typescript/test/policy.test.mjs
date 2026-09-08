@@ -245,3 +245,26 @@ test("a comparator nobody defined is refused", () => {
     },
   );
 });
+
+test("a network mode nobody defined is refused", () => {
+  assert.throws(
+    () => toNetworkPolicy({ mode: "allow-all" }),
+    (err) => {
+      assert.equal(err.code, "invalid_argument");
+      assert.match(err.message, /unknown mode/);
+      assert.match(err.message, /none, allowlist, open/);
+      return true;
+    },
+  );
+});
+
+test("the three defined modes still pass", () => {
+  assert.equal(toNetworkPolicy({ mode: "none" }).mode, "NETWORK_MODE_NONE");
+  assert.equal(
+    toNetworkPolicy({ mode: "allowlist" }).mode,
+    "NETWORK_MODE_ALLOWLIST",
+  );
+  assert.equal(toNetworkPolicy({ mode: "open" }).mode, "NETWORK_MODE_OPEN");
+  // Omitted is the documented default rather than an unknown mode.
+  assert.equal(toNetworkPolicy().mode, "NETWORK_MODE_NONE");
+});

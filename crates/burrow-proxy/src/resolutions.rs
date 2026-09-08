@@ -92,6 +92,39 @@ impl Resolutions {
     }
 }
 
+/// The addresses burrow's own control plane answers on, which no sandbox may
+/// reach through the proxy.
+///
+/// The firewall denies these to every sandbox at the IP layer (see
+/// `burrow-net`'s `firewall::render_with`), but the proxy is a hole through
+/// that: it runs on the host, outside the sandbox chain, and opens the
+/// upstream connection with its own source address. A name resolving to the
+/// orchestrator's API or a node's edge router would otherwise be reachable
+/// through the proxy even though a packet addressed there directly is dropped,
+/// and reaching either means creating, deleting or exec'ing into sandboxes
+/// this one shares nothing with.
+///
+/// Unlike [`is_forbidden_destination`], these are this deployment's own
+/// addresses, so the daemon supplies them and keeps the set in step with what
+/// it renders into the ruleset.
+#[derive(Debug, Default)]
+pub struct DeniedAddresses {
+    addresses: RwLock<std::collections::HashSet<Ipv4Addr>>,
+}
+
+impl DeniedAddresses {
+    /// Replaces the set wholesale, the way the ruleset is re-rendered
+    /// wholesale: an address that has stopped being control plane stops being
+    /// denied, and one that has started is denied from the next connection on.
+    pub fn replace(&self, addresses: impl IntoIterator<Item = Ipv4Addr>) {
+        *self.addresses.write().unwrap() = addresses.into_iter().collect();
+    }
+
+    pub fn contains(&self, address: Ipv4Addr) -> bool {
+        self.addresses.read().unwrap().contains(&address)
+    }
+}
+
 /// Addresses the proxy will never connect to on a sandbox's behalf.
 ///
 /// Independent of pinning, because a name can legitimately resolve into these
@@ -189,6 +222,27 @@ fn skip_name(packet: &[u8], mut pos: usize) -> Option<usize> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A control-plane address on a public range is exactly what the fixed
+    /// SSRF list cannot cover, so the daemon supplies the set and re-supplies
+    /// it wholesale the way the ruleset is re-rendered.
+    #[test]
+    fn the_control_plane_set_is_replaced_wholesale() {
+        let orchestrator = Ipv4Addr::new(172, 18, 0, 4);
+        let edge = Ipv4Addr::new(203, 0, 113, 9);
+        assert!(!is_forbidden_destination(edge));
+
+        let denied = DeniedAddresses::default();
+        assert!(!denied.contains(orchestrator));
+        denied.replace([orchestrator, edge]);
+        assert!(denied.contains(orchestrator) && denied.contains(edge));
+
+        // An address that stopped being control plane stops being denied, the
+        // same way a re-render drops the rule that named it.
+        denied.replace([edge]);
+        assert!(!denied.contains(orchestrator));
+        assert!(denied.contains(edge));
+    }
 
     fn response(host: &str, addresses: &[Ipv4Addr], ttl: u32) -> Vec<u8> {
         let mut packet = vec![0u8; 12];

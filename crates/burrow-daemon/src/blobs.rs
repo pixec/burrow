@@ -50,13 +50,17 @@ impl std::fmt::Display for Digest {
 /// not thousands of round trips, small enough to stay off the stack.
 const CHUNK: usize = 1024 * 1024;
 
-/// Longest a single blob transfer may run before it is abandoned.
+/// Most a single blob transfer may write before it is abandoned.
 ///
-/// Digest verification only happens on the last chunk, so a peer (or a node
-/// impersonating one) that just never sends it can stream forever. Matches
-/// the OCI pull path's own [`crate::oci`] layer cap, since a peer-distributed
-/// template's rootfs and kernel are exactly what an OCI pull would fetch
-/// instead.
+/// A byte cap, not a time limit: digest verification only happens once the
+/// stream ends, so a peer (or a node impersonating one) that never ends it
+/// would otherwise fill the disk. What bounds how *long* one may run is the
+/// per-chunk deadline in `template::distribute::fetch_blob`; a peer that
+/// trickles bytes slowly enough is stopped by that rather than by this.
+///
+/// Matches the OCI pull path's own [`crate::oci`] layer cap, since a
+/// peer-distributed template's rootfs and kernel are exactly what an OCI pull
+/// would fetch instead.
 const MAX_BLOB_BYTES: u64 = 8 * 1024 * 1024 * 1024;
 
 pub struct BlobStore {
@@ -113,6 +117,70 @@ impl BlobStore {
             Ok(()) => Ok(()),
             Err(_) => tokio::fs::copy(&source, dest).await.map(|_| ()),
         }
+    }
+
+    /// Removes blobs nothing refers to any more.
+    ///
+    /// Deliberately timid, because a blob wrongly collected is a template that
+    /// no longer boots. Three things have to be true before one goes:
+    ///
+    /// - **Nothing links to it.** A template's `vmlinux` and `rootfs.ext4` are
+    ///   hard links to their blob ([`Self::insert`] links rather than copies),
+    ///   so a link count above one means the bytes are in use as an artifact
+    ///   somewhere on this node and the blob is only the second name for them.
+    /// - **No layer index entry names it.** Those are the build cache's own
+    ///   references, and they outlive the sandbox the layer came from.
+    /// - **It is older than `min_age`.** The window between a blob being
+    ///   adopted and whatever is fetching it linking it into a template is
+    ///   exactly when it has neither a link nor an index entry, and a pull of a
+    ///   multi-gigabyte rootfs can sit in it for a while.
+    ///
+    /// Returns how many were removed and the bytes they occupied.
+    pub async fn collect_garbage(
+        &self,
+        referenced: &std::collections::HashSet<String>,
+        min_age: std::time::Duration,
+    ) -> (usize, u64) {
+        use std::os::unix::fs::MetadataExt as _;
+
+        let Ok(mut entries) = tokio::fs::read_dir(&self.root).await else {
+            return (0, 0);
+        };
+        let (mut removed, mut freed) = (0usize, 0u64);
+        while let Ok(Some(entry)) = entries.next_entry().await {
+            let name = entry.file_name().to_string_lossy().into_owned();
+            // A transfer in progress owns its temporary and removes it itself;
+            // one left by a process that died is collected on age alone, since
+            // no digest ever names it.
+            let incoming = name.starts_with(".incoming-");
+            if !incoming && Digest::parse(&name).is_none() {
+                continue;
+            }
+            if !incoming && referenced.contains(&name) {
+                continue;
+            }
+            let Ok(meta) = tokio::fs::metadata(entry.path()).await else {
+                continue;
+            };
+            if !incoming && meta.nlink() > 1 {
+                continue;
+            }
+            // Unreadable timestamps read as "recent", so nothing is collected
+            // on the strength of a failed stat.
+            let old_enough = meta
+                .modified()
+                .ok()
+                .and_then(|at| at.elapsed().ok())
+                .is_some_and(|elapsed| elapsed > min_age);
+            if !old_enough {
+                continue;
+            }
+            if tokio::fs::remove_file(entry.path()).await.is_ok() {
+                removed += 1;
+                freed += meta.len();
+            }
+        }
+        (removed, freed)
     }
 
     /// Begins receiving a blob whose digest is known in advance.
@@ -353,6 +421,70 @@ mod tests {
             leftovers.is_empty(),
             "an abandoned transfer left files behind"
         );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// What may be collected is narrow, and this is the shape of it.
+    #[tokio::test]
+    async fn only_an_old_unlinked_unreferenced_blob_is_collected() {
+        let dir = scratch("gc");
+        let store = BlobStore::new(&dir);
+        let ancient = std::time::Duration::from_secs(0);
+
+        // Linked into a template, the way a real artifact is.
+        tokio::fs::write(dir.join("rootfs"), b"a template's rootfs")
+            .await
+            .unwrap();
+        let linked = store.insert(&dir.join("rootfs")).await.unwrap();
+
+        // Named by a layer index entry, though nothing links to it.
+        tokio::fs::write(dir.join("layer"), b"a cached build layer")
+            .await
+            .unwrap();
+        let referenced = store.insert(&dir.join("layer")).await.unwrap();
+        tokio::fs::remove_file(dir.join("layer")).await.unwrap();
+
+        // Neither: a template that was deleted, or a pull nobody finished.
+        tokio::fs::write(dir.join("orphan"), b"nothing refers to this")
+            .await
+            .unwrap();
+        let orphan = store.insert(&dir.join("orphan")).await.unwrap();
+        tokio::fs::remove_file(dir.join("orphan")).await.unwrap();
+
+        let keep: std::collections::HashSet<String> = [referenced.to_string()].into();
+        let (removed, freed) = store.collect_garbage(&keep, ancient).await;
+
+        assert_eq!(removed, 1);
+        assert_eq!(freed, b"nothing refers to this".len() as u64);
+        assert!(
+            store.has(&linked).await,
+            "a template's rootfs was collected"
+        );
+        assert!(store.has(&referenced).await, "a cached layer was collected");
+        assert!(!store.has(&orphan).await, "an orphan was kept");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The window between a blob being adopted and whatever fetched it linking
+    /// it into a template is exactly when it looks like an orphan.
+    #[tokio::test]
+    async fn a_blob_younger_than_the_retention_is_left_alone() {
+        let dir = scratch("gc-young");
+        let store = BlobStore::new(&dir);
+        tokio::fs::write(dir.join("fresh"), b"just arrived")
+            .await
+            .unwrap();
+        let digest = store.insert(&dir.join("fresh")).await.unwrap();
+        tokio::fs::remove_file(dir.join("fresh")).await.unwrap();
+
+        let (removed, _) = store
+            .collect_garbage(
+                &std::collections::HashSet::new(),
+                std::time::Duration::from_secs(3600),
+            )
+            .await;
+        assert_eq!(removed, 0);
+        assert!(store.has(&digest).await);
         let _ = std::fs::remove_dir_all(&dir);
     }
 

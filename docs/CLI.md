@@ -18,14 +18,40 @@ alias burrow='cargo run -q -p burrow-cli --'
 | --- | --- |
 | `--orchestrator <URL>` | Orchestrator endpoint. Defaults to `http://127.0.0.1:7070`. Reads `BURROW_ORCHESTRATOR`. |
 | `--api-key <TOKEN>` | Bearer token, when the orchestrator requires one. Reads `BURROW_API_KEY`. |
+| `--api-key-file <PATH>` | Read the token from a file instead. First non-blank, non-`#` line. Reads `BURROW_API_KEY_FILE`. |
+| `--insecure` | Allow a plaintext `http://` endpoint that is not on this machine. Reads `BURROW_INSECURE`. |
 | `-h`, `--help` | Print help for the command. |
 
-Set both once and leave them out of the examples below:
+Set them once and leave them out of the examples below:
 
 ```sh
 export BURROW_ORCHESTRATOR=http://127.0.0.1:7070
 export BURROW_API_KEY=dev-token
 ```
+
+Prefer `--api-key-file` on a shared machine: a token on a command line is
+visible in `ps` output to every user on the host.
+
+### Reaching a remote orchestrator
+
+An `https://` endpoint is verified against the platform's own CA store:
+
+```sh
+burrow --orchestrator https://burrow.example.com:7070 ps
+```
+
+The api key travels in a header on every call, so `http://` to anything but
+this machine is refused rather than quietly leaking it:
+
+```
+refusing to send the api key in plaintext to burrow.example.com: use https://,
+or pass --insecure if the endpoint is reached over a network you trust
+```
+
+`--insecure` says the plaintext hop is over a network you trust: a private
+link, or a tunnel that is already encrypting it. `http://127.0.0.1:7070` and
+`http://localhost:7070` need no flag, since there is no network to eavesdrop
+on.
 
 ## Ids and names
 

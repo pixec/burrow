@@ -73,15 +73,25 @@ pub struct ServeArgs {
     /// rows grow without bound.
     #[arg(long, default_value_t = 7)]
     pub audit_retention_days: u32,
-    /// Shared cluster token. The node requires it on incoming calls and
-    /// presents it when registering with the orchestrator.
+    /// Days a cached build layer and an unreferenced content-addressed blob
+    /// are kept. 0 disables collection, which lets `blobs/` and `layers/` grow
+    /// for the life of the node.
+    #[arg(long, default_value_t = 7)]
+    pub artifact_retention_days: u32,
+    /// Fallback for --node-token, kept so a single-binary dev setup can hand
+    /// one token to everything. A node has no client-facing surface of its
+    /// own, so using the tenant api key here lets a leaked tenant key drive
+    /// this node directly; the node warns at startup when it falls back.
     #[arg(long, env = "BURROW_API_KEY")]
     pub api_key: Option<String>,
     #[arg(long, env = "BURROW_API_KEY_FILE")]
     pub api_key_file: Option<PathBuf>,
-    /// Token presented to the orchestrator when registering. Set this to the
-    /// orchestrator's --node-token so tenant API keys cannot register nodes;
-    /// unset, the node falls back to presenting its --api-key.
+    /// The node-facing secret, matching the orchestrator's --node-token.
+    ///
+    /// Used in both directions: this node requires it on incoming calls (from
+    /// the orchestrator and from peer nodes) and presents it when registering
+    /// and when dialling a peer. Keeping it distinct from --api-key is what
+    /// stops a tenant key registering a node or calling one.
     #[arg(long, env = "BURROW_NODE_TOKEN")]
     pub node_token: Option<String>,
     #[arg(long, env = "BURROW_NODE_TOKEN_FILE")]
@@ -527,6 +537,17 @@ async fn apply_mesh(
                 refused += 1;
                 false
             }
+            // Nothing can be pinned against an id the pin file cannot hold, so
+            // there is no key here to trust or to contradict.
+            Verdict::InvalidNodeId => {
+                tracing::error!(
+                    node_id = p.node_id,
+                    "REFUSING a mesh peer: the orchestrator gave it a node id that \
+                     cannot be pinned"
+                );
+                refused += 1;
+                false
+            }
         })
         .map(|p| Peer {
             node_id: p.node_id,
@@ -773,6 +794,9 @@ pub async fn run(args: ServeArgs) -> anyhow::Result<()> {
     // writes it whenever sandboxes change, the proxy reads it per connection.
     let proxy_policies = Arc::new(burrow_proxy::PolicyTable::default());
     let resolutions = Arc::new(burrow_proxy::Resolutions::default());
+    // Shared the same way: the manager renders the denied set on every firewall
+    // sync, the proxy consults it per connection.
+    let denied = Arc::new(burrow_proxy::DeniedAddresses::default());
     let directory = Arc::new(burrow_proxy::directory::Directory::default());
     let sandboxes = SandboxManager::new(
         NodeConfig {
@@ -784,10 +808,14 @@ pub async fn run(args: ServeArgs) -> anyhow::Result<()> {
             require_resource_limits: args.require_resource_limits,
             lazy_memory: args.lazy_memory,
             jail: args.jail(),
+            artifact_retention: Duration::from_secs(
+                u64::from(args.artifact_retention_days) * 24 * 60 * 60,
+            ),
             control_plane: control_plane_addresses(&args.orchestrator).await,
         },
         Arc::clone(&proxy_policies),
         Arc::clone(&resolutions),
+        Arc::clone(&denied),
         Arc::clone(&directory),
         Arc::clone(&store),
     );
@@ -838,6 +866,7 @@ pub async fn run(args: ServeArgs) -> anyhow::Result<()> {
         audit: audit.clone(),
         resolutions: Arc::clone(&resolutions),
         authority: Some(Arc::clone(&authority)),
+        denied: Arc::clone(&denied),
     });
     match tokio::net::TcpListener::bind(args.proxy_listen).await {
         Ok(listener) => {
@@ -900,8 +929,30 @@ pub async fn run(args: ServeArgs) -> anyhow::Result<()> {
     // client never sees a window where recovered sandboxes appear missing.
     sandboxes.recover().await;
 
-    let tokens =
+    // A node has no client-facing surface: everything on it is reached over the
+    // node-facing hop, from the orchestrator or from a peer node. So one secret
+    // guards all of it, in both directions -- the NodeService interceptor, the
+    // sandbox proxy prelude, peer template pulls, and registration.
+    //
+    // `--api-key` is the fallback only so the single-binary dev setup, where
+    // one token is handed to everything, keeps working. Sharing the client key
+    // here means a leaked tenant key drives nodes directly.
+    let api_tokens =
         burrow_core::auth::load_tokens(args.api_key.as_deref(), args.api_key_file.as_deref());
+    let node_tokens =
+        burrow_core::auth::load_tokens(args.node_token.as_deref(), args.node_token_file.as_deref());
+    let tokens = if node_tokens.is_empty() {
+        if !api_tokens.is_empty() {
+            tracing::warn!(
+                "no --node-token configured: this node's API accepts the client \
+                 api key, so any API client can call it directly. Set --node-token \
+                 (or BURROW_NODE_TOKEN) to the same value the orchestrator uses."
+            );
+        }
+        api_tokens
+    } else {
+        node_tokens
+    };
     let api = NodeApi {
         sandboxes: sandboxes.clone(),
         node_id: node_id.clone(),
@@ -916,16 +967,14 @@ pub async fn run(args: ServeArgs) -> anyhow::Result<()> {
     };
     let auth = burrow_core::auth::TokenAuth::new(tokens.clone());
     if !auth.is_enabled() {
-        tracing::warn!("no --api-key configured: this node's API is UNAUTHENTICATED");
+        tracing::warn!(
+            "no --node-token or --api-key configured: this node's API is UNAUTHENTICATED"
+        );
     }
     let cluster_token = tokens.first().cloned();
-    // Registration presents the dedicated node token when one is configured;
-    // peer-node and forwarded sandbox traffic keep using the cluster api key.
-    let registration_token =
-        burrow_core::auth::load_tokens(args.node_token.as_deref(), args.node_token_file.as_deref())
-            .first()
-            .cloned()
-            .or_else(|| cluster_token.clone());
+    // One token for the whole node-facing hop, so what this node accepts is
+    // also what it presents when registering and when dialling a peer.
+    let registration_token = cluster_token.clone();
 
     // Accepts traffic forwarded for sandboxes on this node, behind the cluster
     // token's prelude. Guests cannot reach it: the `tohost` chain admits only

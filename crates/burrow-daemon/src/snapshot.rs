@@ -564,12 +564,28 @@ fn merge_chain(_paths: &[PathBuf], _target: &Path) -> std::io::Result<()> {
     Err(std::io::Error::other("merging is linux-only"))
 }
 
+/// Writes a snapshot's manifest, atomically.
+///
+/// Via a temporary and a rename, the same way a publish stages a whole
+/// directory and renames it into place: the manifest is the marker that says a
+/// directory *is* a snapshot, so a crash part way through overwriting one (a
+/// `touch` refreshing a TTL, a `release` clearing retention) would leave a
+/// truncated file, and [`read_manifest`] reads that as "not a snapshot",
+/// which is exactly what [`SnapshotStore::collect_orphans`] deletes.
 async fn write_manifest(dir: &Path, manifest: &Manifest) -> Result<(), Status> {
     let json = serde_json::to_vec_pretty(manifest)
         .map_err(|err| Status::internal(format!("encoding the manifest: {err}")))?;
-    tokio::fs::write(dir.join(MANIFEST), json)
+    let temp = dir.join(format!(".{MANIFEST}.{}.tmp", std::process::id()));
+    tokio::fs::write(&temp, json)
         .await
-        .map_err(|err| Status::internal(format!("writing the manifest: {err}")))
+        .map_err(|err| Status::internal(format!("writing the manifest: {err}")))?;
+    match tokio::fs::rename(&temp, dir.join(MANIFEST)).await {
+        Ok(()) => Ok(()),
+        Err(err) => {
+            let _ = tokio::fs::remove_file(&temp).await;
+            Err(Status::internal(format!("publishing the manifest: {err}")))
+        }
+    }
 }
 
 /// Reads a snapshot's manifest, or `None` for anything that is not one.

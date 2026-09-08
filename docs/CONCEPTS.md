@@ -72,7 +72,7 @@ where a boundary sits, what it holds, and what it does not.
 | Guest to network | Every packet a guest emits | Per-sandbox tap, nftables antispoof and policy chains, the egress proxy, the DNS resolver |
 | Guest to guest | Sandboxes on the same node or across the mesh | Per-sandbox `/30` on its own tap, no shared L2, private-network membership checks; the sandbox address pool is denied to every egress mode, published ports admit only off-fleet traffic, and the orchestrator's API and every node's edge router, which proxies into published ports, are denied to sandboxes |
 | Client to control plane | Anyone who can reach the API port | Bearer-token authentication |
-| Node to control plane | Anyone who can reach the node-registration surface | A separate node token |
+| Node to control plane | Anyone who can reach a node's API or the node-registration surface | A separate node token, required in both directions |
 | Image content to node | Registry bytes and build output | Digest verification, escape-proof unpack, size budgets |
 | Secrets to guest | Credentials the workload must use but must not hold | Host-side header injection, redaction in API responses |
 
@@ -159,17 +159,28 @@ Clients present a bearer token (`--api-key` or `--api-key-file`, sent as
 `authorization: Bearer <token>`). Several tokens in a file let a key rotate
 without downtime.
 
-Nodes present a separate node token (`--node-token` or `--node-token-file`) to
-register and heartbeat. Separate on purpose: an API client must not be able to
-register a node of its own over a real one and receive other tenants' exec and
-log traffic.
+The node-facing hop uses a separate token (`--node-token` or
+`--node-token-file`), in both directions: nodes present it to register and to
+heartbeat, the orchestrator presents it when it calls a node, and a node
+requires it on every incoming call, its `NodeService`, its sandbox-proxy
+prelude, and peer-to-peer template pulls alike.
+
+Separate on purpose. An API client must not be able to register a node of its
+own over a real one and receive other tenants' exec and log traffic, and a
+client key must not be a key to a node: nodes have no client-facing surface, so
+a tenant token that also opened a node's API would turn one leaked key into
+direct access to every sandbox on the fleet.
+
+Give every node and the orchestrator the same `--node-token` value. Unset, both
+fall back to `--api-key` so the single-binary dev setup keeps working, and both
+warn loudly at startup that they have done so.
 
 Authentication is off unless a token is configured, and both daemons say so
 loudly at startup when it is not. Do not run a node without one.
 
 A node's edge is denied to every sandbox in the fleet, its own included, and
 answers only for the sandboxes its node holds. Forwarded sandbox traffic carries
-the cluster token in its prelude, so the node's sandbox-proxy port is not an open
+the node token in its prelude, so the node's sandbox-proxy port is not an open
 relay into anyone's sandbox.
 
 ### Image content is hostile

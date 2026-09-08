@@ -393,6 +393,7 @@ dependencies = [
 name = "burrow-net"
 version = "0.1.0"
 dependencies = [
+ "base64",
  "thiserror 2.0.20",
  "tokio",
  "tracing",
@@ -409,6 +410,7 @@ dependencies = [
  "burrow-proto",
  "burrow-store",
  "clap",
+ "futures",
  "prost",
  "thiserror 2.0.20",
  "tokio",
@@ -2224,6 +2226,7 @@ version = "0.23.43"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "0283386ce02abc0151e1761d08802dfe86c173b0b494af5cbc086574e453da06"
 dependencies = [
+ "log",
  "once_cell",
  "ring",
  "rustls-pki-types",
@@ -2803,8 +2806,10 @@ dependencies = [
  "percent-encoding",
  "pin-project",
  "prost",
+ "rustls-native-certs",
  "socket2 0.5.10",
  "tokio",
+ "tokio-rustls",
  "tokio-stream",
  "tower 0.5.3",
  "tower-layer",

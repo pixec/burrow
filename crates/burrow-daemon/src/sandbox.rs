@@ -42,7 +42,7 @@ const HOST_PORT_RANGE: std::ops::Range<u16> = 20000..30000;
 
 /// Slack added to a sandbox's guest memory when sizing its cgroup, covering
 /// Firecracker's own allocations and page tables.
-const VMM_MEMORY_HEADROOM_MIB: u32 = 128;
+pub(crate) const VMM_MEMORY_HEADROOM_MIB: u32 = 128;
 
 #[derive(Clone)]
 pub struct NodeConfig {
@@ -61,6 +61,14 @@ pub struct NodeConfig {
     /// Confines each VMM to a chroot under an unprivileged uid. `None` runs
     /// firecracker as root with the whole host visible.
     pub jail: Option<burrow_vmm::Jail>,
+    /// How long a build layer and an unreferenced blob are kept.
+    ///
+    /// Neither has an owner that could delete it: a cached layer outlives the
+    /// build that produced it (that is the point of it), and a blob outlives
+    /// the template it was stored for. Zero disables collection, which lets a
+    /// node keep every artifact it has ever built at the cost of a directory
+    /// that only grows.
+    pub artifact_retention: std::time::Duration,
     /// Where this node's orchestrator answers, denied to every sandbox.
     ///
     /// The control plane is the fleet's: its API creates and destroys
@@ -71,7 +79,7 @@ pub struct NodeConfig {
 }
 
 impl NodeConfig {
-    fn templates_dir(&self) -> PathBuf {
+    pub(crate) fn templates_dir(&self) -> PathBuf {
         self.data_dir.join("images")
     }
 
@@ -95,13 +103,17 @@ impl NodeConfig {
 /// which costs one slow pause and resets the chain.
 const MAX_MEMORY_CHAIN: usize = 4;
 
-
 /// Rebuilds a sandbox's memory chain from the files in its working directory.
 ///
 /// Used on recovery: a node restart has no in-memory chain, and the files are
-/// the authority anyway. One more slot than the cap is searched, because the
-/// chain is flattened *after* the diff that exceeds it is written; a crash in
-/// that window leaves the longer chain on disk, and it is still valid.
+/// the authority anyway.
+///
+/// The directory is enumerated rather than probed up to [`MAX_MEMORY_CHAIN`].
+/// That cap is a policy about when to flatten, not a fact about what is on
+/// disk: flattening happens *after* the diff that exceeds it is written, and a
+/// crash or a failed compaction in that window leaves a chain longer than the
+/// cap. Probing to the cap would silently truncate it here and restore the
+/// guest from a prefix of its own memory, which is worse than a long chain.
 async fn discover_memory_chain(workdir: &std::path::Path) -> Vec<String> {
     if !tokio::fs::try_exists(workdir.join(burrow_vmm::SNAPSHOT_MEM_FILE))
         .await
@@ -111,18 +123,38 @@ async fn discover_memory_chain(workdir: &std::path::Path) -> Vec<String> {
     }
     let mut chain = vec![burrow_vmm::SNAPSHOT_MEM_FILE.to_string()];
 
-    // Diffs are numbered by the chain length at the time they were written, so
-    // walking upward from 1 finds them in the order they must be applied.
-    for index in 1..=MAX_MEMORY_CHAIN {
-        let name = format!("snapshot.diff{index}.mem");
-        if tokio::fs::try_exists(workdir.join(&name))
-            .await
-            .unwrap_or(false)
+    let Ok(mut entries) = tokio::fs::read_dir(workdir).await else {
+        return chain;
+    };
+    let mut diffs: Vec<usize> = Vec::new();
+    while let Ok(Some(entry)) = entries.next_entry().await {
+        let name = entry.file_name().to_string_lossy().into_owned();
+        if let Some(index) = name
+            .strip_prefix("snapshot.diff")
+            .and_then(|rest| rest.strip_suffix(".mem"))
+            .and_then(|index| index.parse::<usize>().ok())
         {
-            chain.push(name);
-        } else {
+            diffs.push(index);
+        }
+    }
+    // Numerically, not by filename: `diff10` sorts before `diff9` as text, and
+    // a chain applied out of order restores pages from the wrong generation.
+    diffs.sort_unstable();
+
+    // Diffs are numbered by the chain length at the time they were written, so
+    // a complete chain is 1, 2, 3… without gaps. A gap means a diff is missing,
+    // and the ones past it describe memory that no longer exists on disk;
+    // stopping there restores from the last consistent point.
+    for (expected, index) in (1..).zip(diffs) {
+        if index != expected {
+            tracing::warn!(
+                workdir = %workdir.display(),
+                missing = expected,
+                "memory chain has a gap; restoring from what precedes it"
+            );
             break;
         }
+        chain.push(format!("snapshot.diff{index}.mem"));
     }
     chain
 }
@@ -207,6 +239,114 @@ enum Handshake {
 /// A handshake that has already happened, for every path that waits for one.
 fn settled() -> Arc<tokio::sync::watch::Sender<Handshake>> {
     Arc::new(tokio::sync::watch::channel(Handshake::Done).0)
+}
+
+/// Everything a half-provisioned sandbox is holding, given back unless the
+/// create reaches the end.
+///
+/// A create takes an address lease, volume claims, a working directory, a tap
+/// and finally a VMM, and every failure between the first of those and the
+/// record being handed back has to undo all of them. Written out per error
+/// path, that is five copies of the same five lines, and the one that gets
+/// forgotten leaks an address and an interface for the life of the node.
+///
+/// So the guard owns the cleanup and the success path is what has to say
+/// something, by calling [`Self::keep`]. Release is deliberately explicit
+/// rather than done from `Drop`: the ordering matters (the VMM must die before
+/// its tap goes, and the workdir must not be removed while firecracker is
+/// still in it), and a create that returns before its directory is gone can be
+/// retried straight into the middle of its own cleanup. `Drop` is left as the
+/// backstop that says loudly when a path forgot.
+struct Provisioning<'a> {
+    manager: &'a SandboxManager,
+    id: String,
+    workdir: PathBuf,
+    /// `None` until the tap is up; taken back out once the sandbox owns it.
+    tap: Option<String>,
+    /// `None` until the VM boots or restores.
+    vm: Option<MicroVm>,
+    kept: bool,
+}
+
+impl<'a> Provisioning<'a> {
+    /// Starts guarding a create that has already taken its lease and claims.
+    fn new(manager: &'a SandboxManager, id: &str, workdir: &Path) -> Self {
+        Self {
+            manager,
+            id: id.to_string(),
+            workdir: workdir.to_path_buf(),
+            tap: None,
+            vm: None,
+            kept: false,
+        }
+    }
+
+    /// The VM this create started, which it has by the time anything asks.
+    fn vm(&self) -> &MicroVm {
+        self.vm
+            .as_ref()
+            .expect("the vm is recorded before anything uses it")
+    }
+
+    /// Gives everything back and turns `err` into the create's answer.
+    ///
+    /// Every failure path goes through here, so the order below is the only
+    /// order teardown happens in.
+    async fn fail(mut self, err: Status) -> Status {
+        if let Some(vm) = self.vm.take() {
+            let _ = vm.kill().await;
+        }
+        if let Some(tap) = self.tap.take() {
+            tap::delete(&tap).await;
+        }
+        self.manager.release_lease(&self.id).await;
+        self.manager.volumes.release_all(&self.id);
+        let _ = tokio::fs::remove_dir_all(&self.workdir).await;
+        self.kept = true;
+        err
+    }
+
+    /// The create succeeded: the sandbox owns all of this now.
+    fn keep(mut self) -> Option<MicroVm> {
+        self.kept = true;
+        self.vm.take()
+    }
+}
+
+impl Drop for Provisioning<'_> {
+    fn drop(&mut self) {
+        if self.kept {
+            return;
+        }
+        // Reached only if a path added later returns without going through
+        // `fail`. Cleaning up from here cannot be awaited, so it is spawned
+        // and the node is told: a leaked lease and tap is a bug worth a log
+        // line even when the spawn puts them back.
+        tracing::error!(
+            sandbox = self.id,
+            "a create returned without releasing what it had provisioned"
+        );
+        let (manager, id, tap, workdir) = (
+            self.manager.clone(),
+            self.id.clone(),
+            self.tap.take(),
+            self.workdir.clone(),
+        );
+        let vm = self.vm.take();
+        if let Ok(handle) = tokio::runtime::Handle::try_current() {
+            handle.spawn(async move {
+                if let Some(vm) = vm {
+                    let _ = vm.kill().await;
+                }
+                if let Some(tap) = tap {
+                    tap::delete(&tap).await;
+                }
+                manager.release_lease(&id).await;
+                manager.volumes.release_all(&id);
+                let _ = tokio::fs::remove_dir_all(&workdir).await;
+            });
+        }
+    }
 }
 
 /// Runs a warm create's handshake behind the create that started it.
@@ -358,6 +498,13 @@ pub struct RunningSandbox {
     /// The session opened by the VM currently running, if any.
     session: std::sync::Mutex<Option<String>>,
     workdir: PathBuf,
+    /// Deadline every unary call to this sandbox's agent runs under.
+    ///
+    /// Carried on the sandbox rather than passed in because [`Self::agent`] is
+    /// what every exec, transfer and watch goes through, and most of its
+    /// callers hold nothing else from the node's configuration. Streaming
+    /// calls are deliberately not bounded by it; see [`crate::agentconn`].
+    agent_timeout: std::time::Duration,
     pub lease: Lease,
     pub tap: String,
 }
@@ -420,7 +567,6 @@ impl RunningSandbox {
     pub fn template(&self) -> &str {
         &self.template
     }
-
 
     /// vCPUs this sandbox is promised, whether or not its VMM is running.
     pub fn vcpus(&self) -> u32 {
@@ -514,11 +660,12 @@ impl RunningSandbox {
             // again, which is the whole point.
             return Ok(client.clone());
         }
-        let client = agentconn::connect(self.workdir.join(burrow_vmm::VSOCK_UDS))
-            .await
-            .map_err(|err| {
-                Status::unavailable(format!("agent unreachable: {}", error_chain(&*err)))
-            })?;
+        let client =
+            agentconn::connect(self.workdir.join(burrow_vmm::VSOCK_UDS), self.agent_timeout)
+                .await
+                .map_err(|err| {
+                    Status::unavailable(format!("agent unreachable: {}", error_chain(&*err)))
+                })?;
         *cached = Some(client.clone());
         Ok(client)
     }
@@ -719,7 +866,7 @@ impl RunningSandbox {
 
         // `restored: true` is what tells the guest to reseed its RNG and reset
         // its clock, which it cannot know on its own.
-        let mut agent = agentconn::connect(self.workdir.join(burrow_vmm::VSOCK_UDS))
+        let mut agent = agentconn::connect(self.workdir.join(burrow_vmm::VSOCK_UDS), agent_timeout)
             .await
             .map_err(|err| Status::internal(format!("agent connect: {err}")))?;
         agent.handshake(agentconn::handshake_request(true)).await?;
@@ -952,6 +1099,13 @@ pub struct SandboxManager {
     /// DNS pins, pruned alongside the policy table so a recycled address never
     /// inherits the previous sandbox's resolutions.
     resolutions: Arc<burrow_proxy::Resolutions>,
+    /// What the proxy refuses to dial on any sandbox's behalf.
+    ///
+    /// The same set [`Self::denied_addresses`] renders into the ruleset, and
+    /// written from the same place: the proxy runs on the host, outside the
+    /// chain that denies these, so a rule the proxy did not hear about is a
+    /// rule a sandbox can walk around.
+    denied: Arc<burrow_proxy::DeniedAddresses>,
     /// Reported in heartbeats; the orchestrator stops placing here when set.
     draining: Arc<std::sync::atomic::AtomicBool>,
     /// Guest addresses on other nodes that share a private network with a
@@ -985,12 +1139,104 @@ pub struct SandboxManager {
     /// PEM handed to sandboxes that opted in to TLS inspection. Set once at
     /// startup, read on every create.
     inspection_ca: Arc<std::sync::Mutex<Option<String>>>,
-    /// Shapes an automatic warm build has already been started for.
+    /// Serialises the whole of [`SandboxManager::sync_firewall`].
     ///
-    /// One attempt per shape for the life of the daemon: a build costs a boot
-    /// and holds the node's warm build lock, and one that failed usually fails
-    /// again for the same reason. A restart is what asks for another.
-    warm_attempted: Arc<std::sync::Mutex<std::collections::HashSet<ShapeKey>>>,
+    /// The render is taken from a snapshot of the sandbox map, but applying it
+    /// touches nftables, the proxy's policy table and the resolver's pins, none
+    /// of which are under that lock. Two syncs that overlapped could therefore
+    /// apply in the opposite order to the one they rendered in, leaving the
+    /// node enforcing an older ruleset than it believes, including one that
+    /// still names a sandbox that has been deleted. Held across snapshot,
+    /// render and apply, so the last render to start is the last to land.
+    firewall: Arc<tokio::sync::Mutex<()>>,
+    /// What each template has been asked for, and what has been warmed.
+    ///
+    /// Both halves are bounded per template. The shapes come from create
+    /// requests, so a caller choosing a fresh vcpu/memory pair every time would
+    /// otherwise grow this for the life of the node *and* queue a full warm
+    /// build, costing a boot, a snapshot and the node's one warm build lock,
+    /// for every novel one.
+    warm_shapes: Arc<std::sync::Mutex<HashMap<String, WarmShapes>>>,
+}
+
+/// Shapes one template will build a warm snapshot for before it stops.
+///
+/// A snapshot is disk and a build is a boot, so the node warms a handful of
+/// shapes per template rather than every shape anyone has ever asked for. The
+/// oldest attempt is forgotten past this, which lets a template whose traffic
+/// has moved to a new shape eventually warm it.
+const MAX_WARM_SHAPES: usize = 4;
+
+/// Distinct shapes of one template whose demand is counted.
+///
+/// Only a tally, so it is cheap, but it is keyed by numbers a caller chooses
+/// and therefore has to be bounded like everything else. The least-requested
+/// entry makes way, which keeps the shapes that recur and drops the one-offs.
+const MAX_TRACKED_SHAPES: usize = 16;
+
+/// Creates of one shape before an automatic warm build is worth its cost.
+///
+/// A template's default shape is exempt: it is what a create with no resource
+/// policy asks for, so it is warmed on the first sight of it. Anything else has
+/// to recur, because a snapshot built for a shape that is never asked for again
+/// is a boot and a memory image spent on nothing.
+const WARM_DEMAND_THRESHOLD: u32 = 3;
+
+/// One template's warm bookkeeping.
+#[derive(Default)]
+struct WarmShapes {
+    /// Creates seen per shape, capped at [`MAX_TRACKED_SHAPES`].
+    demand: Vec<(ShapeKey, u32)>,
+    /// Shapes a build has already been started for, oldest first.
+    ///
+    /// One attempt per shape while it is remembered: a build holds the node's
+    /// warm build lock, and one that failed usually fails again for the same
+    /// reason.
+    attempted: Vec<ShapeKey>,
+}
+
+impl WarmShapes {
+    /// Counts one create of `key` and says whether it now deserves a snapshot.
+    fn record_demand(&mut self, key: &ShapeKey) -> bool {
+        // The shape a create with no resource policy asks for, which is the one
+        // an explicit warm builds too: warmed on sight rather than on repetition.
+        if key.is_default() {
+            return true;
+        }
+        if let Some(entry) = self.demand.iter_mut().find(|(shape, _)| shape == key) {
+            entry.1 = entry.1.saturating_add(1);
+            return entry.1 >= WARM_DEMAND_THRESHOLD;
+        }
+        if self.demand.len() >= MAX_TRACKED_SHAPES {
+            // The least-requested entry, which is the one a burst of novel
+            // shapes would otherwise be able to push the recurring ones out with.
+            let (weakest, _) = self
+                .demand
+                .iter()
+                .enumerate()
+                .min_by_key(|(_, (_, count))| *count)
+                .map(|(index, entry)| (index, entry.1))
+                .expect("the tally is not empty here");
+            self.demand.swap_remove(weakest);
+        }
+        self.demand.push((key.clone(), 1));
+        WARM_DEMAND_THRESHOLD <= 1
+    }
+
+    /// Claims the one attempt this shape gets, or says it is already taken.
+    fn claim_attempt(&mut self, key: &ShapeKey) -> bool {
+        if self.attempted.iter().any(|shape| shape == key) {
+            return false;
+        }
+        self.attempted.push(key.clone());
+        // Oldest first, so the cap forgets the shape that has gone longest
+        // without being asked for rather than refusing the new one: an explicit
+        // warm must never be turned away because of what a create asked for.
+        if self.attempted.len() > MAX_WARM_SHAPES {
+            self.attempted.remove(0);
+        }
+        true
+    }
 }
 
 /// The machine a warm snapshot was taken as.
@@ -1009,6 +1255,12 @@ struct ShapeKey {
 }
 
 impl ShapeKey {
+    /// The shape a create that named no resources asks for, which is also the
+    /// one an explicit warm builds.
+    fn is_default(&self) -> bool {
+        *self == Self::of(&self.template, &common::ResourcePolicy::default())
+    }
+
     fn of(template: &str, resources: &common::ResourcePolicy) -> Self {
         Self {
             template: template.to_string(),
@@ -1032,22 +1284,29 @@ impl SandboxManager {
         config: NodeConfig,
         proxy_policies: Arc<burrow_proxy::PolicyTable>,
         resolutions: Arc<burrow_proxy::Resolutions>,
+        denied: Arc<burrow_proxy::DeniedAddresses>,
         directory: Arc<burrow_proxy::directory::Directory>,
         store: Arc<burrow_store::Store>,
     ) -> Self {
         Self {
             inspection_ca: Arc::new(std::sync::Mutex::new(None)),
-            warm_attempted: Arc::new(std::sync::Mutex::new(std::collections::HashSet::new())),
+            warm_shapes: Arc::new(std::sync::Mutex::new(HashMap::new())),
+            firewall: Arc::new(tokio::sync::Mutex::new(())),
             snapshots: Arc::new(crate::snapshot::SnapshotStore::new(&config.data_dir)),
             volumes: Arc::new(crate::volume::VolumeStore::new(&config.data_dir)),
             config,
             sandboxes: Arc::new(Mutex::new(HashMap::new())),
             creating: Arc::new(Mutex::new(std::collections::HashSet::new())),
             // Replaced once the orchestrator assigns this node its slice.
-            ipam: Arc::new(Mutex::new(Arc::new(Ipam::for_node(0)))),
+            // Node 0 is the first slice of the pool and always in range, so
+            // the only way this fails is a pool with no slices at all.
+            ipam: Arc::new(Mutex::new(Arc::new(
+                Ipam::for_node(0).expect("node 0 is always inside the address pool"),
+            ))),
             ports: Arc::new(Mutex::new(HashMap::new())),
             proxy_policies,
             resolutions,
+            denied,
             directory,
             store,
             draining: Arc::new(std::sync::atomic::AtomicBool::new(false)),
@@ -1069,6 +1328,17 @@ impl SandboxManager {
     ) -> Result<(), Status> {
         *self.edge_addresses.lock().unwrap() = addresses;
         self.sync_firewall().await
+    }
+
+    /// Records who owns each writable volume image before the jail is handed
+    /// it, so the grant can be taken back when the sandbox lets go.
+    ///
+    /// Only the writable ones: a read-only mount is left in `shared` and never
+    /// chowned at all.
+    async fn remember_volume_owners(&self, mounts: &[common::VolumeMount]) {
+        for mount in mounts.iter().filter(|mount| !mount.read_only) {
+            self.volumes.remember_owner(&mount.volume).await;
+        }
     }
 
     /// Every address a sandbox is denied outright, whatever its policy says.
@@ -1103,7 +1373,21 @@ impl SandboxManager {
         if ipam.node_index() == index {
             return;
         }
-        *ipam = Arc::new(Ipam::for_node(index));
+        // An index past the end of the pool is the orchestrator's mistake, not
+        // this node's: keep the slice already in use and say so, rather than
+        // taking the node down over an assignment it did not choose.
+        let assigned = match Ipam::for_node(index) {
+            Ok(ipam) => ipam,
+            Err(err) => {
+                tracing::error!(
+                    index, %err,
+                    "refusing an address slice this node cannot allocate from; \
+                     keeping the current one"
+                );
+                return;
+            }
+        };
+        *ipam = Arc::new(assigned);
         tracing::info!(index, subnet = %ipam.subnet(), "address pool assigned");
     }
 
@@ -1385,12 +1669,12 @@ impl SandboxManager {
                     // taps and address blocks nothing will ever use.
                     tap::delete(&row.tap).await;
                     self.ipam.lock().await.release(&row.id);
-                self.volumes.release_all(&row.id);
+                    self.volumes.release_all(&row.id);
                     continue;
                 }
             };
             let stored_policy = record.policy.clone().unwrap_or_default();
-            let resources = stored_policy.resources.clone().unwrap_or_default();
+            let resources = stored_policy.resources.unwrap_or_default();
             // Recovery has to describe the VM exactly as it was, volumes
             // included, or a restore is refused for a drive set that does not
             // match the snapshot.
@@ -1420,6 +1704,7 @@ impl SandboxManager {
                     at => at,
                 }),
                 agent_channel: Mutex::new(None),
+                agent_timeout: self.config.agent_timeout,
                 // A recovered sandbox is suspended: it has no VM, so there is
                 // no handshake in flight. The resume that starts one does its
                 // own, synchronously.
@@ -1684,6 +1969,26 @@ impl SandboxManager {
         Ok(())
     }
 
+    /// Gives a sandbox's address block back to the pool and forgets every
+    /// connection conntrack still associates with it.
+    ///
+    /// The ruleset stops new packets, but conntrack keeps an established
+    /// flow's NAT binding for days, and the block is reissued to the very
+    /// next create. Without the flush, a tenant that inherits the address
+    /// also inherits the previous sandbox's live connections, whatever its
+    /// own policy says.
+    async fn release_lease(&self, id: &str) {
+        let guest_ip = {
+            let ipam = self.ipam.lock().await;
+            let lease = ipam.get(id);
+            ipam.release(id);
+            lease.map(|lease| lease.guest_ip)
+        };
+        if let Some(guest_ip) = guest_ip {
+            firewall::flush_conntrack(guest_ip).await;
+        }
+    }
+
     /// Rebuilds the entire nftables ruleset from the currently running
     /// sandboxes. Called after any change to the set or to a policy; a full
     /// render can never drift from what the daemon believes is running.
@@ -1692,6 +1997,11 @@ impl SandboxManager {
     /// rules never landed is a sandbox whose network policy is not being
     /// enforced, and whoever asked for it has to hear about that.
     async fn sync_firewall(&self) -> Result<(), Status> {
+        // Held for the whole of this function, snapshot through apply: see the
+        // field's own comment for what overlapping syncs would otherwise leave
+        // the node enforcing.
+        let _ordered = self.firewall.lock().await;
+
         // The render below flushes the counter table, so what it has counted
         // has to be banked before it is rebuilt.
         self.sample_usage().await;
@@ -1902,7 +2212,12 @@ impl SandboxManager {
         self.resolutions
             .retain_live(&proxy_table.keys().copied().collect());
         self.proxy_policies.replace(proxy_table);
-        firewall::apply(&firewall::render_with(&rules, &self.denied_addresses()))
+        let denied = self.denied_addresses();
+        // The proxy is told before the ruleset is applied, not after: it is the
+        // path that does not go through nftables at all, so the moment to have
+        // it enforcing a wider deny list is ahead of the render, never behind.
+        self.denied.replace(denied.iter().copied());
+        firewall::apply(&firewall::render_with(&rules, &denied))
             .await
             .map_err(|err| {
                 tracing::error!(%err, "failed to apply firewall ruleset");
@@ -1959,6 +2274,9 @@ impl SandboxManager {
             let _ = self.sync_firewall().await;
             return Err(err);
         }
+        // The new rules govern new packets; connections opened under the old
+        // policy would otherwise ride their conntrack entries past it.
+        firewall::flush_conntrack(sandbox.lease.guest_ip).await;
         tracing::info!(sandbox = sandbox_id, "network policy updated");
         Ok(sandbox.record())
     }
@@ -2121,13 +2439,23 @@ impl SandboxManager {
         }
     }
 
-
-
     /// Warms the exact shape a create asked for, so the next one restores.
     ///
     /// The caller that missed still cold-boots: nothing here is awaited on the
     /// create path.
     fn warm_for_demand(&self, key: &ShapeKey) {
+        // Not every shape a caller can name is worth a snapshot; see
+        // [`WarmShapes::record_demand`] for which ones are.
+        let wanted = self
+            .warm_shapes
+            .lock()
+            .unwrap()
+            .entry(key.template.clone())
+            .or_default()
+            .record_demand(key);
+        if !wanted {
+            return;
+        }
         self.warm_in_background(
             key.template.clone(),
             common::ResourcePolicy {
@@ -2148,15 +2476,12 @@ impl SandboxManager {
     /// is what lets the replacement be built, since the key is only ever
     /// inserted.
     pub async fn invalidate_warm(&self, template: &str) {
-        self.warm_attempted
-            .lock()
-            .unwrap()
-            .retain(|key| key.template != template);
+        self.warm_shapes.lock().unwrap().remove(template);
         let warm = crate::warm::warm_dir(&self.config.templates_dir(), template);
-        if let Err(err) = tokio::fs::remove_dir_all(&warm).await {
-            if err.kind() != std::io::ErrorKind::NotFound {
-                tracing::warn!(template, %err, "could not discard the warm snapshot");
-            }
+        if let Err(err) = tokio::fs::remove_dir_all(&warm).await
+            && err.kind() != std::io::ErrorKind::NotFound
+        {
+            tracing::warn!(template, %err, "could not discard the warm snapshot");
         }
     }
 
@@ -2182,7 +2507,14 @@ impl SandboxManager {
         };
         // Claimed before the task is spawned, so a burst of creates of one
         // shape queues one build rather than one each.
-        if !self.warm_attempted.lock().unwrap().insert(key) {
+        let claimed = self
+            .warm_shapes
+            .lock()
+            .unwrap()
+            .entry(template.clone())
+            .or_default()
+            .claim_attempt(&key);
+        if !claimed {
             return;
         }
 
@@ -2196,11 +2528,8 @@ impl SandboxManager {
             }
             let trust = manager.warm_trust(&template).await;
             match crate::warm::build_warm_snapshot(
-                &templates_dir,
+                &manager.config,
                 &template,
-                &manager.config.firecracker_bin,
-                &manager.config.extra_boot_args,
-                manager.config.agent_timeout,
                 scratch_disk_mib,
                 shape,
                 &trust,
@@ -2226,9 +2555,34 @@ impl SandboxManager {
         });
     }
 
-
-
-
+    /// Retires build layers and the blobs nothing refers to any more.
+    ///
+    /// Run from the reaper because it is the only thing on this node that runs
+    /// regularly and holds no lock anyone waits on.
+    ///
+    /// The index is pruned first, so the blob sweep is told what the surviving
+    /// entries still refer to. Both use the same age, because they are two
+    /// halves of one retention: an entry that has just been dropped leaves a
+    /// blob that is now unreferenced, and it goes on the same pass.
+    async fn collect_artifacts(&self) {
+        let age = self.config.artifact_retention;
+        if age.is_zero() {
+            return;
+        }
+        let data_dir = &self.config.data_dir;
+        let (entries, referenced) = crate::template::layers::prune(data_dir, age).await;
+        let (blobs, freed) = crate::blobs::BlobStore::new(data_dir)
+            .collect_garbage(&referenced, age)
+            .await;
+        if entries > 0 || blobs > 0 {
+            tracing::info!(
+                layer_entries = entries,
+                blobs,
+                freed_bytes = freed,
+                "collected unreferenced template artifacts"
+            );
+        }
+    }
 
     /// Gives back everything a sandbox whose guest never answered is holding.
     ///
@@ -2267,7 +2621,6 @@ impl SandboxManager {
         }
     }
 
-
     /// Applies `idle_suspend_secs` and `max_lifetime_secs`, returning what it
     /// did.
     ///
@@ -2288,6 +2641,7 @@ impl SandboxManager {
             acted.push((id, "snapshot-expired"));
         }
         self.snapshots.collect_orphans().await;
+        self.collect_artifacts().await;
         for sandbox in candidates {
             let resources = sandbox.resources();
             let id = sandbox.id().to_string();
@@ -2407,7 +2761,6 @@ impl SandboxManager {
             .sum();
         live
     }
-
 
     pub async fn get(&self, id: &str) -> Result<Arc<RunningSandbox>, Status> {
         self.sandboxes
@@ -2597,6 +2950,15 @@ impl SandboxManager {
         let persist_ms = registered.elapsed();
         // Only now that the sandbox is registered does its policy exist to
         // render, so the firewall is applied after insertion, not before.
+        //
+        // Nothing is rendered earlier, even though the tap exists and the guest
+        // has booted by this point. A render before insertion would be a render
+        // *without* this sandbox, which is the ruleset that is already
+        // installed; there is nothing for it to correct. The window it might
+        // otherwise have closed, a recycled address block inheriting the
+        // previous holder's rules, is closed at the source instead, by
+        // [`Self::delete`] returning the lease only after the render that
+        // stopped naming it.
         self.sync_firewall().await?;
         tracing::debug!(
             sandbox = id,
@@ -2611,8 +2973,6 @@ impl SandboxManager {
         Ok(record)
     }
 
-
-
     async fn provision_with(
         &self,
         id: String,
@@ -2622,6 +2982,11 @@ impl SandboxManager {
         node_id: String,
     ) -> Result<Arc<RunningSandbox>, Status> {
         let began = std::time::Instant::now();
+        // The last place it can be checked before it is joined onto the
+        // templates directory. The API checks it too, but every create on this
+        // node funnels through here, including the ones a build starts for
+        // itself, so this is the one that cannot be routed around.
+        crate::template::validate_name(&template)?;
         let templates_dir = self.config.templates_dir();
         let workdir = self.config.sandbox_dir(&id);
         let resources = policy.resources.unwrap_or_default();
@@ -2650,6 +3015,10 @@ impl SandboxManager {
             }
         }
         self.volumes.claim(&id, &policy.volumes)?;
+        // The claims above are the first thing this create holds, so the guard
+        // starts here: everything taken from now on is given back by it, and
+        // every failure below answers through [`Provisioning::fail`].
+        let mut guard = Provisioning::new(self, &id, &workdir);
 
         let from_warm = seed_scratch.is_none()
             && crate::warm::is_warm_for(
@@ -2663,12 +3032,19 @@ impl SandboxManager {
         // Networking: a private /30 on a dedicated tap. The guest configures
         // itself from the kernel command line, so no DHCP client is needed.
         // The address is taken first because the tap is named after it.
-        let lease = self
-            .ipam
-            .lock()
-            .await
-            .allocate(&id)
-            .map_err(|err| Status::resource_exhausted(format!("address allocation: {err}")))?;
+        // Bound to its own statement so the ipam lock is released before the
+        // failure path, which takes it again to hand back the volume claims.
+        let allocated = self.ipam.lock().await.allocate(&id);
+        let lease = match allocated {
+            Ok(lease) => lease,
+            Err(err) => {
+                return Err(guard
+                    .fail(Status::resource_exhausted(format!(
+                        "address allocation: {err}"
+                    )))
+                    .await);
+            }
+        };
         let ipam_ms = began.elapsed() - warm_check_ms;
 
         // Copying a scratch disk is disk work and programming a tap is netlink,
@@ -2742,6 +3118,10 @@ impl SandboxManager {
                         shared.insert(crate::sandbox::volume_image(index));
                     }
                 }
+                // A writable mount is the one shared inode that does get
+                // chowned, so its owner is recorded first and put back when the
+                // claim goes.
+                self.remember_volume_owners(&policy.volumes).await;
                 grant_to_jail(&workdir, jail, &shared)
                     .await
                     .map_err(|err| Status::internal(format!("preparing the jail: {err}")))?;
@@ -2760,29 +3140,21 @@ impl SandboxManager {
         let staged_at = std::time::Instant::now();
         let (staged, (tap, tap_ms)) = tokio::join!(stage, tap_timed);
         let stage_wall_ms = staged_at.elapsed();
+        // Recorded before either half is inspected: the tap may well have come
+        // up alongside a staging failure, and an interface belonging to a
+        // sandbox that never existed must not be left behind.
+        guard.tap = tap.as_ref().ok().cloned();
         let (from_warm, files_ms, jail_ms) = match staged {
             Ok(parts) => parts,
-            Err(err) => {
-                // The tap may have come up alongside the failure; take it down
-                // rather than leak an interface for a sandbox that never
-                // existed.
-                if let Ok(name) = &tap {
-                    tap::delete(name).await;
-                }
-                self.ipam.lock().await.release(&id);
-                self.volumes.release_all(&id);
-                let _ = tokio::fs::remove_dir_all(&workdir).await;
-                return Err(err);
-            }
+            Err(err) => return Err(guard.fail(err).await),
         };
         tracing::Span::current().record("from_warm", from_warm);
         let tap_name = match tap {
             Ok(name) => name,
             Err(err) => {
-                self.ipam.lock().await.release(&id);
-                self.volumes.release_all(&id);
-                let _ = tokio::fs::remove_dir_all(&workdir).await;
-                return Err(Status::internal(format!("tap setup: {err}")));
+                return Err(guard
+                    .fail(Status::internal(format!("tap setup: {err}")))
+                    .await);
             }
         };
 
@@ -2791,8 +3163,7 @@ impl SandboxManager {
         // once it is running. A cold boot has no such constraint and takes them
         // at boot, which needs no rescan in the guest.
         let boot_volumes: &[common::VolumeMount] = if from_warm { &[] } else { &policy.volumes };
-        let mut spec =
-            self.build_spec(&id, &workdir, &resources, &lease, &tap_name, boot_volumes);
+        let mut spec = self.build_spec(&id, &workdir, &resources, &lease, &tap_name, boot_volumes);
         // Only meaningful on a restore, and only when the template was
         // profiled; a create that boots cold has no snapshot to prefetch from.
         if from_warm
@@ -2805,17 +3176,21 @@ impl SandboxManager {
         let boot_spec = spec.clone();
         let started = std::time::Instant::now();
         let spec_ms = started - staged_at - stage_wall_ms;
-        let vm = if from_warm {
+        let started_vm = if from_warm {
             // The override points the snapshotted interface at this sandbox's
             // own tap; the address inside the guest is corrected on handshake.
             MicroVm::restore(spec, true)
                 .await
-                .map_err(|err| Status::internal(format!("warm restore failed: {err}")))?
+                .map_err(|err| Status::internal(format!("warm restore failed: {err}")))
         } else {
             MicroVm::boot(spec)
                 .await
-                .map_err(|err| Status::internal(format!("boot failed: {err}")))?
+                .map_err(|err| Status::internal(format!("boot failed: {err}")))
         };
+        match started_vm {
+            Ok(vm) => guard.vm = Some(vm),
+            Err(err) => return Err(guard.fail(err).await),
+        }
 
         // Attached before the handshake, which is what tells the guest to rescan
         // its bus and mount them: firecracker cannot notify the guest itself.
@@ -2827,16 +3202,9 @@ impl SandboxManager {
                     is_root: false,
                     read_only: mount.read_only,
                 };
-                if let Err(err) = vm.attach_drive(&drive).await {
-                    let _ = vm.kill().await;
-                    tap::delete(&tap_name).await;
-                    self.ipam.lock().await.release(&id);
-                    self.volumes.release_all(&id);
-                    let _ = tokio::fs::remove_dir_all(&workdir).await;
-                    return Err(Status::internal(format!(
-                        "attaching volume {}: {err}",
-                        mount.volume
-                    )));
+                if let Err(err) = guard.vm().attach_drive(&drive).await {
+                    let message = format!("attaching volume {}: {err}", mount.volume);
+                    return Err(guard.fail(Status::internal(message)).await);
                 }
             }
         }
@@ -2882,23 +3250,22 @@ impl SandboxManager {
             // down rather than leaving an unusable sandbox in the registry. The
             // first connection that succeeds is kept, rather than probing with
             // one and then dialling another.
-            let (mut agent, accepted_at) =
-                match agentconn::connect_when_ready(vm.vsock_uds_path(), self.config.agent_timeout)
-                    .await
-                {
-                    Ok(ready) => ready,
-                    Err(err) => {
-                        let console = vm.console_tail(30).await;
-                        let _ = vm.kill().await;
-                        tap::delete(&tap_name).await;
-                        self.ipam.lock().await.release(&id);
-                self.volumes.release_all(&id);
-                        let _ = tokio::fs::remove_dir_all(&workdir).await;
-                        return Err(Status::internal(format!(
+            let connected = agentconn::connect_when_ready(
+                guard.vm().vsock_uds_path(),
+                self.config.agent_timeout,
+            )
+            .await;
+            let (mut agent, accepted_at) = match connected {
+                Ok(ready) => ready,
+                Err(err) => {
+                    let console = guard.vm().console_tail(30).await;
+                    return Err(guard
+                        .fail(Status::internal(format!(
                             "agent never became reachable: {err}\nconsole:\n{console}"
-                        )));
-                    }
-                };
+                        )))
+                        .await);
+                }
+            };
             let agent_up = vmm_ready.elapsed();
             // Guest wake proper: the VM resuming far enough for the agent's
             // vsock listener to accept. What is left of `agent_up` is the
@@ -2910,14 +3277,7 @@ impl SandboxManager {
             // exhaust the node's taps and address blocks one create at a time.
             let guest_timing = match agent.handshake(request.clone()).await {
                 Ok(response) => response.into_inner().timing.unwrap_or_default(),
-                Err(err) => {
-                    let _ = vm.kill().await;
-                    tap::delete(&tap_name).await;
-                    self.ipam.lock().await.release(&id);
-                self.volumes.release_all(&id);
-                    let _ = tokio::fs::remove_dir_all(&workdir).await;
-                    return Err(err);
-                }
+                Err(err) => return Err(guard.fail(err).await),
             };
             (
                 settled(),
@@ -2927,6 +3287,10 @@ impl SandboxManager {
                 guest_timing,
             )
         };
+
+        // Nothing below this line can fail, so it is where the sandbox takes
+        // over what the guard was holding on its behalf.
+        let vm = guard.keep().expect("a create that reaches here has a vm");
 
         let record = common::Sandbox {
             id: id.clone(),
@@ -3007,6 +3371,7 @@ impl SandboxManager {
             last_activity: std::sync::atomic::AtomicI64::new(burrow_core::unix_now()),
             suspended_at: std::sync::atomic::AtomicI64::new(0),
             agent_channel: Mutex::new(None),
+            agent_timeout: self.config.agent_timeout,
             handshake,
             // A warm-created sandbox already restores from the template's
             // memory file, so its first suspend has a base to diff against.
@@ -3382,12 +3747,38 @@ impl SandboxManager {
         let workdir = self.config.sandbox_dir(&id);
         let resources = policy.resources.unwrap_or_default();
 
-        let lease = self
-            .ipam
-            .lock()
-            .await
-            .allocate(&id)
-            .map_err(|err| Status::resource_exhausted(format!("address allocation: {err}")))?;
+        // A restored sandbox mounts volumes exactly as a created one does. It
+        // used to take them only as far as the spec and the handshake, which
+        // told the guest to mount devices no one had attached and left the
+        // volume unclaimed, so a second sandbox could take it writable at the
+        // same time. Claimed first, for the reason the create path gives: a
+        // conflict must fail before there is a tap or an address to give back.
+        crate::volume::validate_mounts(&policy.volumes)?;
+        for mount in &policy.volumes {
+            if !tokio::fs::try_exists(self.volumes.image(&mount.volume))
+                .await
+                .unwrap_or(false)
+            {
+                return Err(Status::not_found(format!(
+                    "no volume {} on this node",
+                    mount.volume
+                )));
+            }
+        }
+        self.volumes.claim(&id, &policy.volumes)?;
+        let mut guard = Provisioning::new(self, &id, &workdir);
+
+        let allocated = self.ipam.lock().await.allocate(&id);
+        let lease = match allocated {
+            Ok(lease) => lease,
+            Err(err) => {
+                return Err(guard
+                    .fail(Status::resource_exhausted(format!(
+                        "address allocation: {err}"
+                    )))
+                    .await);
+            }
+        };
 
         let stage = async {
             if tokio::fs::try_exists(&workdir).await.unwrap_or(false) {
@@ -3399,13 +3790,32 @@ impl SandboxManager {
                 .await
                 .map_err(|err| Status::internal(format!("creating the workdir: {err}")))?;
             let chain = source.stage_into(&self.snapshots, &workdir).await?;
+            // Linked in the same shape as a create's, so the guest sees the
+            // same devices in the same order as the handshake describes.
+            for (index, mount) in policy.volumes.iter().enumerate() {
+                let dest = workdir.join(crate::sandbox::volume_image(index));
+                let _ = tokio::fs::remove_file(&dest).await;
+                tokio::fs::hard_link(self.volumes.image(&mount.volume), &dest)
+                    .await
+                    .map_err(|err| {
+                        Status::internal(format!("attaching volume {}: {err}", mount.volume))
+                    })?;
+            }
             if let Some(jail) = &self.config.jail {
                 // Both a fork and a snapshot restore hard-link only the
                 // template's own kernel and rootfs; the snapshot state, the
                 // memory chain and the scratch disk are copies (or reflinks)
-                // made just for this sandbox, so they still need the chown.
-                let shared: std::collections::HashSet<String> =
+                // made just for this sandbox, so they still need the chown. A
+                // read-only volume mount is a link into the volume store and is
+                // left alone, for the reason [`grant_to_jail`] spells out.
+                let mut shared: std::collections::HashSet<String> =
                     [TEMPLATE_KERNEL.to_string(), TEMPLATE_ROOTFS.to_string()].into();
+                for (index, mount) in policy.volumes.iter().enumerate() {
+                    if mount.read_only {
+                        shared.insert(crate::sandbox::volume_image(index));
+                    }
+                }
+                self.remember_volume_owners(&policy.volumes).await;
                 grant_to_jail(&workdir, jail, &shared)
                     .await
                     .map_err(|err| Status::internal(format!("preparing the jail: {err}")))?;
@@ -3414,51 +3824,61 @@ impl SandboxManager {
         };
 
         let (staged, tap) = tokio::join!(stage, tap::create(&lease));
+        guard.tap = tap.as_ref().ok().cloned();
         let chain = match staged {
             Ok(chain) => chain,
-            Err(err) => {
-                if let Ok(name) = &tap {
-                    tap::delete(name).await;
-                }
-                self.ipam.lock().await.release(&id);
-                self.volumes.release_all(&id);
-                let _ = tokio::fs::remove_dir_all(&workdir).await;
-                return Err(err);
-            }
+            Err(err) => return Err(guard.fail(err).await),
         };
         let tap_name = match tap {
             Ok(name) => name,
             Err(err) => {
-                self.ipam.lock().await.release(&id);
-                self.volumes.release_all(&id);
-                let _ = tokio::fs::remove_dir_all(&workdir).await;
-                return Err(Status::internal(format!("tap setup: {err}")));
+                return Err(guard
+                    .fail(Status::internal(format!("tap setup: {err}")))
+                    .await);
             }
         };
 
-        let mut spec = self.build_spec(&id, &workdir, &resources, &lease, &tap_name, &policy.volumes);
+        // No volumes in the spec, exactly as a warm create's restore describes
+        // none: firecracker takes a restored VM's drives from the snapshot, and
+        // the snapshot this is restoring was taken without them. They are
+        // hotplugged below instead, before the handshake that tells the guest
+        // to rescan for them.
+        let mut spec = self.build_spec(&id, &workdir, &resources, &lease, &tap_name, &[]);
         let boot_spec = spec.clone();
         spec.memory_chain = chain.clone();
 
         let started = std::time::Instant::now();
-        let vm = match MicroVm::restore(spec, true).await {
-            Ok(vm) => vm,
+        match MicroVm::restore(spec, true).await {
+            Ok(vm) => guard.vm = Some(vm),
             Err(err) => {
-                tap::delete(&tap_name).await;
-                self.ipam.lock().await.release(&id);
-                self.volumes.release_all(&id);
-                let _ = tokio::fs::remove_dir_all(&workdir).await;
-                return Err(Status::internal(format!("restore failed: {err}")));
+                return Err(guard
+                    .fail(Status::internal(format!("restore failed: {err}")))
+                    .await);
             }
-        };
+        }
+
+        for (index, mount) in policy.volumes.iter().enumerate() {
+            let drive = burrow_vmm::DriveSpec {
+                id: format!("volume{index}"),
+                path: volume_image(index),
+                is_root: false,
+                read_only: mount.read_only,
+            };
+            if let Err(err) = guard.vm().attach_drive(&drive).await {
+                let message = format!("attaching volume {}: {err}", mount.volume);
+                return Err(guard.fail(Status::internal(message)).await);
+            }
+        }
 
         let handshake = async {
-            let (mut agent, _accepted) =
-                agentconn::connect_when_ready(vm.vsock_uds_path(), self.config.agent_timeout)
-                    .await
-                    .map_err(|err| {
-                        Status::internal(format!("restored agent never became reachable: {err}"))
-                    })?;
+            let (mut agent, _accepted) = agentconn::connect_when_ready(
+                guard.vm().vsock_uds_path(),
+                self.config.agent_timeout,
+            )
+            .await
+            .map_err(|err| {
+                Status::internal(format!("restored agent never became reachable: {err}"))
+            })?;
             // The guest wakes holding the address baked into the snapshot,
             // which belongs to someone else; only the host knows this
             // sandbox's own lease.
@@ -3480,13 +3900,10 @@ impl SandboxManager {
         }
         .await;
         if let Err(err) = handshake {
-            let _ = vm.kill().await;
-            tap::delete(&tap_name).await;
-            self.ipam.lock().await.release(&id);
-                self.volumes.release_all(&id);
-            let _ = tokio::fs::remove_dir_all(&workdir).await;
-            return Err(err);
+            return Err(guard.fail(err).await);
         }
+        // Nothing below can fail, so the sandbox takes over here.
+        let vm = guard.keep().expect("a restore that reaches here has a vm");
 
         let record = common::Sandbox {
             id: id.clone(),
@@ -3524,6 +3941,7 @@ impl SandboxManager {
             last_activity: std::sync::atomic::AtomicI64::new(burrow_core::unix_now()),
             suspended_at: std::sync::atomic::AtomicI64::new(0),
             agent_channel: Mutex::new(None),
+            agent_timeout: self.config.agent_timeout,
             // A restore from a snapshot handshakes before it gets here.
             handshake: settled(),
             memory_chain: Mutex::new(chain),
@@ -3543,11 +3961,7 @@ impl SandboxManager {
         // Suspending gave the volumes back, so another sandbox may hold them
         // now. Taken before the VM starts, so a sandbox that cannot have them
         // stays suspended rather than resuming without its data.
-        let volumes = sandbox
-            .record()
-            .policy
-            .unwrap_or_default()
-            .volumes;
+        let volumes = sandbox.record().policy.unwrap_or_default().volumes;
         self.volumes.claim(id, &volumes)?;
         if let Err(err) = sandbox.resume(self.config.agent_timeout).await {
             self.volumes.release_all(id);
@@ -3590,9 +4004,10 @@ impl SandboxManager {
 
         // Order matters: the VM must be gone before its tap is removed, and
         // the lease must not be reissued while the old rules still reference
-        // it, so the firewall is re-rendered last.
+        // it, so the firewall is re-rendered before the address goes back to
+        // the pool. Releasing first left a window in which a create could take
+        // the recycled block and inherit this sandbox's rules.
         tap::delete(&tap_name).await;
-        self.ipam.lock().await.release(id);
         self.volumes.release_all(id);
         self.ports.lock().await.remove(id);
         if let Err(err) = self.store.delete_sandbox(id) {
@@ -3607,6 +4022,13 @@ impl SandboxManager {
         // Reported, but only after the directory is gone: a ruleset that would
         // not apply must not also leave a scratch disk behind.
         let rendered = self.sync_firewall().await;
+        // Only now, once the render that stopped naming this address has been
+        // applied. Held back rather than skipped when that render fails: the
+        // lease has to come back either way, since a node that could not reach
+        // nftables would otherwise leak a block per delete forever, and the
+        // failure is already being returned to the caller and logged, which is
+        // the part someone can act on.
+        self.release_lease(id).await;
 
         if let Err(err) = tokio::fs::remove_dir_all(&workdir).await {
             tracing::warn!(sandbox = id, %err, "failed to remove sandbox directory");
@@ -3614,6 +4036,156 @@ impl SandboxManager {
         tracing::info!(sandbox = id, "sandbox deleted");
         rendered
     }
+}
+
+/// Writes the sections a caller named onto a sandbox's policy.
+///
+/// Present replaces, absent leaves. Written out rather than assigned from a
+/// whole `Policy` because `None` here means "the caller said nothing about
+/// this", not "the caller wants no restriction": the two are the same value on
+/// a create and must not be on an update.
+fn apply_access_policy(
+    policy: &mut common::Policy,
+    exec: Option<common::ExecPolicy>,
+    fs: Option<common::FsPolicy>,
+) {
+    if let Some(exec) = exec {
+        policy.exec = Some(exec);
+    }
+    if let Some(fs) = fs {
+        policy.fs = Some(fs);
+    }
+}
+
+/// Names of the private networks a sandbox belongs to.
+fn networks_of(record: &common::Sandbox) -> impl Iterator<Item = &str> {
+    record
+        .policy
+        .iter()
+        .flat_map(|p| p.networks.iter())
+        .map(|n| n.network.as_str())
+        .filter(|name| !name.is_empty())
+}
+
+/// Maps a sandbox's declared network policy onto a firewall mode.
+///
+/// An unset policy means no egress: a sandbox that never stated what it needs
+/// gets nothing, rather than inheriting whatever the default happens to be.
+fn policy_mode(record: &common::Sandbox) -> firewall::Mode {
+    let mode = record
+        .policy
+        .as_ref()
+        .and_then(|p| p.network.as_ref())
+        .map(|n| n.mode)
+        .unwrap_or(common::NetworkMode::Unspecified as i32);
+
+    match common::NetworkMode::try_from(mode) {
+        Ok(common::NetworkMode::Open) => firewall::Mode::Open,
+        Ok(common::NetworkMode::Allowlist) => firewall::Mode::Allowlist,
+        _ => firewall::Mode::None,
+    }
+}
+
+/// Formats a sparse ext4 image for the sandbox's writable layer.
+///
+/// The file is sparse, so a 1 GiB disk costs only what the guest actually
+/// writes. `lazy_itable_init` and `lazy_journal_init` keep formatting off the
+/// sandbox-creation critical path; the kernel finishes the work in the guest.
+pub(crate) async fn create_scratch(path: &Path, size_mib: u32) -> std::io::Result<()> {
+    let output = tokio::process::Command::new("mkfs.ext4")
+        .args([
+            "-q",
+            "-F",
+            "-L",
+            "burrow-scratch",
+            "-b",
+            "4096",
+            "-E",
+            "lazy_itable_init=1,lazy_journal_init=1",
+        ])
+        .arg(path)
+        .arg(format!("{size_mib}M"))
+        .output()
+        .await?;
+
+    if !output.status.success() {
+        return Err(std::io::Error::other(format!(
+            "mkfs.ext4 failed ({}): {}",
+            output.status,
+            String::from_utf8_lossy(&output.stderr).trim()
+        )));
+    }
+    Ok(())
+}
+
+/// Hands a sandbox's staged files to the uid firecracker will drop to.
+///
+/// `shared` names the entries in `workdir` that are hard links into a
+/// directory this sandbox does not own alone (the template's kernel and
+/// rootfs, a warm snapshot's memory image, a read-only volume mount), and
+/// those are left untouched. Every jailed VMM on the node runs as the same
+/// fixed uid, so chowning a shared inode to it doesn't just grant "the jail"
+/// read access (an ordinary umask already does that): it grants every other
+/// jailed VMM on that uid host-level write access, which the virtio
+/// read-only flag can't take back. A guest that escapes Firecracker into its
+/// own chroot could then `open(O_RDWR)` the same inode every future sandbox
+/// from that template (or every other reader of that volume) boots from.
+/// What's not in `shared` is this sandbox's alone, a copy rather than a
+/// link, and still needs the chown to be guest-writable.
+///
+/// The one shared inode that is *not* in `shared` is a writable volume mount,
+/// which has to be writable by the jail uid and cannot be a copy without
+/// ceasing to be the volume. That grant is therefore made temporary rather
+/// than avoided: the image's owner is recorded before this runs (see
+/// [`crate::volume::VolumeStore::remember_owner`]) and put back the moment the
+/// sandbox's claim is released, so it lasts as long as the mount and not the
+/// life of the volume.
+pub(crate) async fn grant_to_jail(
+    workdir: &Path,
+    jail: &burrow_vmm::Jail,
+    shared: &std::collections::HashSet<String>,
+) -> std::io::Result<()> {
+    let workdir = workdir.to_path_buf();
+    let shared = shared.clone();
+    let (uid, gid) = (jail.uid, jail.gid);
+    tokio::task::spawn_blocking(move || {
+        fn chown(path: &Path, uid: u32, gid: u32) -> std::io::Result<()> {
+            std::os::unix::fs::chown(path, Some(uid), Some(gid))
+        }
+        // The directory itself is this sandbox's alone, so it is always
+        // handed over: firecracker cannot traverse its own chroot without it.
+        chown(&workdir, uid, gid)?;
+        for entry in std::fs::read_dir(&workdir)?.flatten() {
+            if shared.contains(&entry.file_name().to_string_lossy().into_owned()) {
+                continue;
+            }
+            chown(&entry.path(), uid, gid)?;
+        }
+        Ok(())
+    })
+    .await
+    .map_err(|err| std::io::Error::other(format!("chown did not run: {err}")))?
+}
+
+/// Creates a sandbox working directory backed by the template's kernel and
+/// rootfs. Hard links keep creation cheap and let many sandboxes share one
+/// read-only base image; the guest mounts it read-only so nothing writes back.
+async fn prepare_workdir(template_dir: &Path, workdir: &Path) -> std::io::Result<()> {
+    if tokio::fs::try_exists(workdir).await.unwrap_or(false) {
+        tokio::fs::remove_dir_all(workdir).await?;
+    }
+    tokio::fs::create_dir_all(workdir).await?;
+    for file in [TEMPLATE_KERNEL, TEMPLATE_ROOTFS] {
+        let source = template_dir.join(file);
+        if !tokio::fs::try_exists(&source).await.unwrap_or(false) {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                format!("missing {}", source.display()),
+            ));
+        }
+        tokio::fs::hard_link(&source, workdir.join(file)).await?;
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -3633,10 +4205,12 @@ pub(crate) mod tests {
                 require_resource_limits: false,
                 lazy_memory: false,
                 jail: None,
+                artifact_retention: std::time::Duration::from_secs(7 * 24 * 60 * 60),
                 control_plane: Vec::new(),
             },
             Arc::new(burrow_proxy::PolicyTable::default()),
             Arc::new(burrow_proxy::Resolutions::default()),
+            Arc::new(burrow_proxy::DeniedAddresses::default()),
             Arc::new(burrow_proxy::directory::Directory::default()),
             Arc::new(burrow_store::Store::open_in_memory().unwrap()),
         )
@@ -3664,6 +4238,17 @@ pub(crate) mod tests {
         );
     }
 
+    /// Every shape a warm build has been started for, across templates.
+    fn attempted(manager: &SandboxManager) -> Vec<ShapeKey> {
+        manager
+            .warm_shapes
+            .lock()
+            .unwrap()
+            .values()
+            .flat_map(|shapes| shapes.attempted.clone())
+            .collect()
+    }
+
     fn shape(vcpus: u32, mem_mib: u32) -> common::ResourcePolicy {
         common::ResourcePolicy {
             vcpus,
@@ -3680,18 +4265,18 @@ pub(crate) mod tests {
         for _ in 0..5 {
             manager.warm_in_background("app".into(), shape(2, 1024));
         }
-        assert_eq!(manager.warm_attempted.lock().unwrap().len(), 1);
+        assert_eq!(attempted(&manager).len(), 1);
 
         // A different shape is a different snapshot, so it gets its own
         // attempt; the same shape spelled as defaults does not.
         manager.warm_in_background("app".into(), shape(4, 1024));
         manager.warm_in_background("app".into(), common::ResourcePolicy::default());
         manager.warm_in_background("app".into(), shape(1, 512));
-        assert_eq!(manager.warm_attempted.lock().unwrap().len(), 3);
+        assert_eq!(attempted(&manager).len(), 3);
 
         // And a template of its own, however alike its shape.
         manager.warm_in_background("other".into(), shape(2, 1024));
-        assert_eq!(manager.warm_attempted.lock().unwrap().len(), 4);
+        assert_eq!(attempted(&manager).len(), 4);
     }
 
     /// A republished template's old snapshot restores a guest onto a rootfs it
@@ -3714,9 +4299,48 @@ pub(crate) mod tests {
 
         assert!(!tokio::fs::try_exists(&warm).await.unwrap());
         // Every shape of that template, and nothing of any other.
-        let attempted = manager.warm_attempted.lock().unwrap();
-        assert!(attempted.iter().all(|key| key.template == "other"));
-        assert_eq!(attempted.len(), 1);
+        let attempts = attempted(&manager);
+        assert!(attempts.iter().all(|key| key.template == "other"));
+        assert_eq!(attempts.len(), 1);
+    }
+
+    /// The shapes come from create requests, so a caller naming a fresh one
+    /// every time must not be able to grow this for the life of the node, nor
+    /// to queue a boot and a memory image for each.
+    #[tokio::test]
+    async fn a_novel_shape_does_not_buy_itself_a_warm_build() {
+        let manager = manager();
+        manager.warm_for_demand(&ShapeKey::of("app", &shape(7, 3333)));
+        assert!(attempted(&manager).is_empty());
+
+        // The shape a create with no resource policy asks for is the exception:
+        // it is what an explicit warm builds, and it is warmed on sight.
+        manager.warm_for_demand(&ShapeKey::of("app", &common::ResourcePolicy::default()));
+        assert_eq!(attempted(&manager).len(), 1);
+
+        // A thousand one-off shapes leave the tally bounded and add no builds.
+        for mem in 0..1000u32 {
+            manager.warm_for_demand(&ShapeKey::of("app", &shape(2, 1000 + mem)));
+        }
+        let shapes = manager.warm_shapes.lock().unwrap();
+        assert!(shapes["app"].demand.len() <= MAX_TRACKED_SHAPES);
+        drop(shapes);
+        assert_eq!(attempted(&manager).len(), 1);
+    }
+
+    /// A build is a boot and a snapshot is disk, so one template warms a
+    /// handful of shapes rather than every shape ever asked for. The oldest
+    /// makes way, so an explicit warm is never refused.
+    #[tokio::test]
+    async fn attempts_are_capped_per_template() {
+        let manager = manager();
+        for vcpus in 1..=(MAX_WARM_SHAPES as u32 + 3) {
+            manager.warm_in_background("app".into(), shape(vcpus, 1024));
+        }
+        let shapes = manager.warm_shapes.lock().unwrap();
+        assert_eq!(shapes["app"].attempted.len(), MAX_WARM_SHAPES);
+        // Oldest first: the earliest shapes are the ones forgotten.
+        assert_eq!(shapes["app"].attempted[0].vcpus, 4);
     }
 
     /// A shape firecracker would refuse is not worth an attempt, and must not
@@ -3725,7 +4349,7 @@ pub(crate) mod tests {
     async fn an_unbuildable_shape_is_not_attempted() {
         let manager = manager();
         manager.warm_in_background("app".into(), shape(1, u32::MAX));
-        assert!(manager.warm_attempted.lock().unwrap().is_empty());
+        assert!(attempted(&manager).is_empty());
     }
 
     /// The demand path warms the shape that was asked for, not the default:
@@ -3733,11 +4357,63 @@ pub(crate) mod tests {
     #[tokio::test]
     async fn demand_warms_the_shape_that_was_asked_for() {
         let manager = manager();
-        manager.warm_for_demand(&ShapeKey::of("app", &shape(4, 2048)));
-        let attempted = manager.warm_attempted.lock().unwrap();
-        let key = attempted.iter().next().expect("an attempt was recorded");
+        // Once is not demand; a shape has to recur before it is worth a boot.
+        for _ in 0..WARM_DEMAND_THRESHOLD {
+            manager.warm_for_demand(&ShapeKey::of("app", &shape(4, 2048)));
+        }
+        let attempts = attempted(&manager);
+        let key = attempts.first().expect("an attempt was recorded");
         assert_eq!((key.vcpus, key.mem_mib), (4, 2048));
         assert_eq!(key.template, "app");
+    }
+
+    /// A chain longer than the cap is what a failed compaction leaves behind,
+    /// and it is still valid: flattening happens *after* the diff that exceeds
+    /// the cap is written.
+    #[tokio::test]
+    async fn a_memory_chain_past_the_cap_is_discovered_whole() {
+        let dir = std::env::temp_dir().join(format!("burrow-chain-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        // Nothing at all until there is a base image to build a chain on.
+        assert!(discover_memory_chain(&dir).await.is_empty());
+
+        std::fs::write(dir.join(burrow_vmm::SNAPSHOT_MEM_FILE), b"base").unwrap();
+        // Two past the cap, and written out of order so nothing can be reading
+        // the directory's order as the chain's.
+        for index in [3usize, 1, 6, 2, 5, 4] {
+            std::fs::write(dir.join(format!("snapshot.diff{index}.mem")), b"diff").unwrap();
+        }
+        // Names that are nearly a diff but are not one.
+        std::fs::write(dir.join("snapshot.diff.mem"), b"no index").unwrap();
+        std::fs::write(dir.join("snapshot.diffx.mem"), b"not a number").unwrap();
+        std::fs::write(dir.join("scratch.ext4"), b"unrelated").unwrap();
+
+        assert_eq!(
+            discover_memory_chain(&dir).await,
+            vec![
+                burrow_vmm::SNAPSHOT_MEM_FILE.to_string(),
+                "snapshot.diff1.mem".to_string(),
+                "snapshot.diff2.mem".to_string(),
+                "snapshot.diff3.mem".to_string(),
+                "snapshot.diff4.mem".to_string(),
+                "snapshot.diff5.mem".to_string(),
+                "snapshot.diff6.mem".to_string(),
+            ]
+        );
+
+        // A gap means a diff is missing, and everything past it describes
+        // memory that is no longer on disk.
+        std::fs::remove_file(dir.join("snapshot.diff3.mem")).unwrap();
+        assert_eq!(
+            discover_memory_chain(&dir).await,
+            vec![
+                burrow_vmm::SNAPSHOT_MEM_FILE.to_string(),
+                "snapshot.diff1.mem".to_string(),
+                "snapshot.diff2.mem".to_string(),
+            ]
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[tokio::test]
@@ -3817,11 +4493,10 @@ pub(crate) mod tests {
         );
     }
 
-
     /// A registered, running sandbox, for tests about what happens after one
     /// exists rather than about how it was built.
     fn running(id: &str) -> Arc<RunningSandbox> {
-        let lease = Ipam::for_node(0).allocate(id).unwrap();
+        let lease = Ipam::for_node(0).unwrap().allocate(id).unwrap();
         let workdir = std::env::temp_dir().join(format!("burrow-test-{id}"));
         Arc::new(RunningSandbox {
             id: id.into(),
@@ -3831,6 +4506,7 @@ pub(crate) mod tests {
             vm: Mutex::new(None),
             spec: MicroVmSpec::new(id, &workdir),
             agent_channel: Mutex::new(None),
+            agent_timeout: std::time::Duration::from_millis(1),
             handshake: settled(),
             memory_chain: Mutex::new(Vec::new()),
             last_activity: std::sync::atomic::AtomicI64::new(burrow_core::unix_now()),
@@ -3951,11 +4627,8 @@ pub(crate) mod tests {
         );
     }
 
-
-
-
     fn suspended_sandbox() -> RunningSandbox {
-        let lease = Ipam::for_node(0).allocate("sbx_a").unwrap();
+        let lease = Ipam::for_node(0).unwrap().allocate("sbx_a").unwrap();
         let workdir = std::path::PathBuf::from("/tmp/burrow-test");
         RunningSandbox {
             id: "sbx_a".into(),
@@ -3965,6 +4638,7 @@ pub(crate) mod tests {
             vm: Mutex::new(None),
             spec: MicroVmSpec::new("sbx_a", &workdir),
             agent_channel: Mutex::new(None),
+            agent_timeout: std::time::Duration::from_millis(1),
             handshake: settled(),
             memory_chain: Mutex::new(Vec::new()),
             last_activity: std::sync::atomic::AtomicI64::new(burrow_core::unix_now()),
@@ -4141,146 +4815,4 @@ pub(crate) mod tests {
             "an unnamed section must stay absent rather than become permissive"
         );
     }
-}
-
-/// Writes the sections a caller named onto a sandbox's policy.
-///
-/// Present replaces, absent leaves. Written out rather than assigned from a
-/// whole `Policy` because `None` here means "the caller said nothing about
-/// this", not "the caller wants no restriction": the two are the same value on
-/// a create and must not be on an update.
-fn apply_access_policy(
-    policy: &mut common::Policy,
-    exec: Option<common::ExecPolicy>,
-    fs: Option<common::FsPolicy>,
-) {
-    if let Some(exec) = exec {
-        policy.exec = Some(exec);
-    }
-    if let Some(fs) = fs {
-        policy.fs = Some(fs);
-    }
-}
-
-/// Names of the private networks a sandbox belongs to.
-fn networks_of(record: &common::Sandbox) -> impl Iterator<Item = &str> {
-    record
-        .policy
-        .iter()
-        .flat_map(|p| p.networks.iter())
-        .map(|n| n.network.as_str())
-        .filter(|name| !name.is_empty())
-}
-
-/// Maps a sandbox's declared network policy onto a firewall mode.
-///
-/// An unset policy means no egress: a sandbox that never stated what it needs
-/// gets nothing, rather than inheriting whatever the default happens to be.
-fn policy_mode(record: &common::Sandbox) -> firewall::Mode {
-    let mode = record
-        .policy
-        .as_ref()
-        .and_then(|p| p.network.as_ref())
-        .map(|n| n.mode)
-        .unwrap_or(common::NetworkMode::Unspecified as i32);
-
-    match common::NetworkMode::try_from(mode) {
-        Ok(common::NetworkMode::Open) => firewall::Mode::Open,
-        Ok(common::NetworkMode::Allowlist) => firewall::Mode::Allowlist,
-        _ => firewall::Mode::None,
-    }
-}
-
-/// Formats a sparse ext4 image for the sandbox's writable layer.
-///
-/// The file is sparse, so a 1 GiB disk costs only what the guest actually
-/// writes. `lazy_itable_init` and `lazy_journal_init` keep formatting off the
-/// sandbox-creation critical path; the kernel finishes the work in the guest.
-pub(crate) async fn create_scratch(path: &Path, size_mib: u32) -> std::io::Result<()> {
-    let output = tokio::process::Command::new("mkfs.ext4")
-        .args([
-            "-q",
-            "-F",
-            "-L",
-            "burrow-scratch",
-            "-b",
-            "4096",
-            "-E",
-            "lazy_itable_init=1,lazy_journal_init=1",
-        ])
-        .arg(path)
-        .arg(format!("{size_mib}M"))
-        .output()
-        .await?;
-
-    if !output.status.success() {
-        return Err(std::io::Error::other(format!(
-            "mkfs.ext4 failed ({}): {}",
-            output.status,
-            String::from_utf8_lossy(&output.stderr).trim()
-        )));
-    }
-    Ok(())
-}
-
-/// Hands a sandbox's staged files to the uid firecracker will drop to.
-///
-/// `shared` names the entries in `workdir` that are hard links into a
-/// directory this sandbox does not own alone (the template's kernel and
-/// rootfs, a warm snapshot's memory image, a read-only volume mount), and
-/// those are left untouched. Every jailed VMM on the node runs as the same
-/// fixed uid, so chowning a shared inode to it doesn't just grant "the jail"
-/// read access (an ordinary umask already does that): it grants every other
-/// jailed VMM on that uid host-level write access, which the virtio
-/// read-only flag can't take back. A guest that escapes Firecracker into its
-/// own chroot could then `open(O_RDWR)` the same inode every future sandbox
-/// from that template (or every other reader of that volume) boots from.
-/// What's not in `shared` is this sandbox's alone, a copy rather than a
-/// link, and still needs the chown to be guest-writable.
-async fn grant_to_jail(
-    workdir: &Path,
-    jail: &burrow_vmm::Jail,
-    shared: &std::collections::HashSet<String>,
-) -> std::io::Result<()> {
-    let workdir = workdir.to_path_buf();
-    let shared = shared.clone();
-    let (uid, gid) = (jail.uid, jail.gid);
-    tokio::task::spawn_blocking(move || {
-        fn chown(path: &Path, uid: u32, gid: u32) -> std::io::Result<()> {
-            std::os::unix::fs::chown(path, Some(uid), Some(gid))
-        }
-        // The directory itself is this sandbox's alone, so it is always
-        // handed over: firecracker cannot traverse its own chroot without it.
-        chown(&workdir, uid, gid)?;
-        for entry in std::fs::read_dir(&workdir)?.flatten() {
-            if shared.contains(&entry.file_name().to_string_lossy().into_owned()) {
-                continue;
-            }
-            chown(&entry.path(), uid, gid)?;
-        }
-        Ok(())
-    })
-    .await
-    .map_err(|err| std::io::Error::other(format!("chown did not run: {err}")))?
-}
-
-/// Creates a sandbox working directory backed by the template's kernel and
-/// rootfs. Hard links keep creation cheap and let many sandboxes share one
-/// read-only base image; the guest mounts it read-only so nothing writes back.
-async fn prepare_workdir(template_dir: &Path, workdir: &Path) -> std::io::Result<()> {
-    if tokio::fs::try_exists(workdir).await.unwrap_or(false) {
-        tokio::fs::remove_dir_all(workdir).await?;
-    }
-    tokio::fs::create_dir_all(workdir).await?;
-    for file in [TEMPLATE_KERNEL, TEMPLATE_ROOTFS] {
-        let source = template_dir.join(file);
-        if !tokio::fs::try_exists(&source).await.unwrap_or(false) {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::NotFound,
-                format!("missing {}", source.display()),
-            ));
-        }
-        tokio::fs::hard_link(&source, workdir.join(file)).await?;
-    }
-    Ok(())
 }

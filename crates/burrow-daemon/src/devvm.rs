@@ -158,7 +158,8 @@ pub async fn agent_boot(args: VmBootArgs) -> anyhow::Result<()> {
         }
     };
 
-    let mut client = crate::agentconn::connect(vm.vsock_uds_path()).await?;
+    let mut client =
+        crate::agentconn::connect(vm.vsock_uds_path(), Duration::from_secs(args.timeout)).await?;
     let handshake = client
         .handshake(crate::agentconn::handshake_request(false))
         .await?
@@ -182,7 +183,8 @@ pub async fn agent_boot(args: VmBootArgs) -> anyhow::Result<()> {
 /// Runs a command in a freshly booted agent sandbox and streams the result.
 pub async fn agent_exec(args: VmBootArgs, cmd: Vec<String>) -> anyhow::Result<()> {
     let vm = boot_agent_vm(&args, "exectest").await?;
-    let mut client = crate::agentconn::connect(vm.vsock_uds_path()).await?;
+    let mut client =
+        crate::agentconn::connect(vm.vsock_uds_path(), Duration::from_secs(args.timeout)).await?;
     client
         .handshake(crate::agentconn::handshake_request(false))
         .await?;
@@ -273,7 +275,8 @@ const RNG_PROBE: &str = "head -c 16 /dev/urandom | od -An -tx1 | tr -d ' \\n'";
 /// answers whether clones can share one memory file, which warm snapshots rely on.
 pub async fn clone_divergence(args: VmBootArgs) -> anyhow::Result<()> {
     let base = boot_agent_vm(&args, "clonebase").await?;
-    let mut client = crate::agentconn::connect(base.vsock_uds_path()).await?;
+    let mut client =
+        crate::agentconn::connect(base.vsock_uds_path(), Duration::from_secs(args.timeout)).await?;
     client
         .handshake(crate::agentconn::handshake_request(false))
         .await?;
@@ -304,7 +307,9 @@ pub async fn clone_divergence(args: VmBootArgs) -> anyhow::Result<()> {
         )
         .await?;
 
-        let mut client = crate::agentconn::connect(vm.vsock_uds_path()).await?;
+        let mut client =
+            crate::agentconn::connect(vm.vsock_uds_path(), Duration::from_secs(args.timeout))
+                .await?;
 
         // Before the handshake the clone still carries the snapshot's RNG.
         let mut pre = String::new();

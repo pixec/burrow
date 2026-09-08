@@ -279,6 +279,16 @@ pub fn render_with(sandboxes: &[SandboxRules], control_plane: &[Ipv4Addr]) -> St
             "add rule inet {FILTER_TABLE} sandbox ip daddr {address} drop"
         );
     }
+
+    // Every unconditional denial, for the same reason as the control plane
+    // above: the established accept below is a hole a conntrack entry keeps
+    // open, so a denial rendered after it never sees the packets of a
+    // connection opened under the looser policy. Entries already in the table
+    // are cleared separately; see [`flush_conntrack`].
+    for sandbox in sandboxes {
+        render_sandbox_denials(&mut out, sandbox);
+    }
+
     // Return traffic for connections burrow already allowed.
     let _ = writeln!(
         out,
@@ -286,7 +296,7 @@ pub fn render_with(sandboxes: &[SandboxRules], control_plane: &[Ipv4Addr]) -> St
     );
 
     for sandbox in sandboxes {
-        render_sandbox(&mut out, sandbox);
+        render_sandbox_allowances(&mut out, sandbox);
     }
 
     // Anything in the sandbox range that no rule above accepted.
@@ -498,13 +508,16 @@ fn render_host_input(out: &mut String, sandboxes: &[SandboxRules]) {
         // *some* egress reach it. `none` does not: a name is arbitrary
         // attacker-chosen bytes leaving the sandbox, so a resolver is an exfil
         // channel like any other.
+        //
+        // UDP only: the resolver binds a UDP socket and nothing else, so a
+        // TCP/53 accept is a hole pointed at whatever might later listen on
+        // the gateway's port 53. Nothing needs the TCP fallback, because the
+        // resolver never truncates (see `burrow-proxy`'s `dns` module).
         if sandbox.mode != Mode::None {
-            for protocol in ["udp", "tcp"] {
-                let _ = writeln!(
-                    out,
-                    "add rule inet {FILTER_TABLE} tohost ip saddr {guest} ip daddr {host} {protocol} dport {DNS_PORT} accept"
-                );
-            }
+            let _ = writeln!(
+                out,
+                "add rule inet {FILTER_TABLE} tohost ip saddr {guest} ip daddr {host} udp dport {DNS_PORT} accept"
+            );
         }
 
         // The proxy only serves sandboxes whose policy routes through it.
@@ -544,10 +557,16 @@ fn label(sandbox_id: &str) -> String {
         .collect()
 }
 
-fn render_sandbox(out: &mut String, sandbox: &SandboxRules) {
+/// A sandbox's unconditional drops.
+///
+/// Rendered before the chain's `ct state established,related accept`, and so
+/// before anything at all that accepts: nftables takes the first terminating
+/// verdict, so a range named here is unreachable whatever the mode is,
+/// whatever else the policy allows, and whatever conntrack remembers of a
+/// connection opened under an earlier policy.
+fn render_sandbox_denials(out: &mut String, sandbox: &SandboxRules) {
     let guest = sandbox.guest_ip;
-    let external = external_only();
-    let _ = writeln!(out, "# sandbox {}", label(&sandbox.sandbox_id));
+    let _ = writeln!(out, "# sandbox {} denials", label(&sandbox.sandbox_id));
 
     // The cloud metadata address, ahead of everything else including the
     // operator's own deny_cidrs: unlike those, this is not something an
@@ -558,10 +577,6 @@ fn render_sandbox(out: &mut String, sandbox: &SandboxRules) {
         "add rule inet {FILTER_TABLE} sandbox ip saddr {guest} ip daddr {METADATA_CIDR} drop"
     );
 
-    // Denials before anything that accepts, because nftables takes the first
-    // terminating verdict: a range named here is unreachable whatever the mode
-    // is and whatever else the policy allows, which is the only reading of
-    // "deny" worth having.
     match validated_denials(sandbox) {
         Some(denied) => {
             for cidr in &denied {
@@ -578,9 +593,25 @@ fn render_sandbox(out: &mut String, sandbox: &SandboxRules) {
                 out,
                 "add rule inet {FILTER_TABLE} sandbox ip saddr {guest} drop"
             );
-            return;
         }
     }
+}
+
+/// A sandbox's accepts, and the open-mode pool drop that scopes them.
+///
+/// Rendered after the established accept, unlike [`render_sandbox_denials`]:
+/// nothing here needs to outrank a conntrack entry, since an entry only exists
+/// for a connection one of these accepts already permitted.
+fn render_sandbox_allowances(out: &mut String, sandbox: &SandboxRules) {
+    // A sandbox whose denials did not parse was blanket-dropped, and renders
+    // no policy at all.
+    if validated_denials(sandbox).is_none() {
+        return;
+    }
+
+    let guest = sandbox.guest_ip;
+    let external = external_only();
+    let _ = writeln!(out, "# sandbox {}", label(&sandbox.sandbox_id));
 
     // Peers first: private-network membership is granted regardless of the
     // egress mode, since it is a separate axis of the policy.
@@ -746,6 +777,45 @@ fn render_nat(out: &mut String, sandboxes: &[SandboxRules]) {
                 "add rule ip {NAT_TABLE} prerouting {external} tcp dport {} dnat to {}:{}",
                 port.host_port, sandbox.guest_ip, port.guest_port
             );
+        }
+    }
+}
+
+/// Deletes every conntrack entry with `guest_ip` on either side.
+///
+/// The sandbox chain accepts anything in `established` state so that replies
+/// to permitted traffic get back, which is also how a connection survives the
+/// policy that permitted it: tightening `deny_cidrs`, leaving `open` mode, or
+/// deleting the sandbox leaves the kernel holding entries whose reply
+/// direction no rule names, keeping the NAT binding alive. Both directions are
+/// cleared, since a published port means inbound entries whose *destination*
+/// is the guest. Recycled leases make this sharper still: the address goes to
+/// the next sandbox created, which would inherit the previous tenant's open
+/// connections.
+///
+/// `conntrack` from conntrack-tools is the only interface the kernel offers
+/// for deleting selected entries; `nft` can match on conntrack state but
+/// cannot delete. Its absence is logged rather than fatal, because a node
+/// missing it still applies its rules to every *new* connection.
+pub async fn flush_conntrack(guest_ip: Ipv4Addr) {
+    let address = guest_ip.to_string();
+    // One call per direction: `conntrack -D` ANDs its selectors, so a single
+    // call naming both would only match entries that are from *and* to the
+    // guest. It exits non-zero when it matched nothing, which is the ordinary
+    // case, so only a failure to run it at all is worth reporting.
+    for selector in ["--src", "--dst"] {
+        let run = tokio::process::Command::new("conntrack")
+            .args(["-D", selector, &address])
+            .output()
+            .await;
+        if let Err(err) = run {
+            tracing::warn!(
+                guest = %address,
+                %err,
+                "could not flush conntrack entries; connections opened under a \
+                 previous policy may outlive it until they idle out"
+            );
+            return;
         }
     }
 }
@@ -1026,7 +1096,10 @@ mod tests {
         let ruleset = render(&[sandbox(Mode::Open)]);
 
         let deny = "sandbox ip saddr 10.99.0.6 ip daddr 169.254.0.0/16 drop";
-        assert!(ruleset.contains(deny), "missing the metadata denial:\n{ruleset}");
+        assert!(
+            ruleset.contains(deny),
+            "missing the metadata denial:\n{ruleset}"
+        );
 
         let accept = "sandbox ip saddr 10.99.0.6 accept";
         assert!(
@@ -1046,7 +1119,10 @@ mod tests {
 
         let deny = "sandbox ip saddr 10.99.0.6 ip daddr 169.254.0.0/16 drop";
         let peer_accept = "sandbox ip saddr 10.99.0.6 ip daddr 169.254.169.254 accept";
-        assert!(ruleset.contains(deny), "missing the metadata denial:\n{ruleset}");
+        assert!(
+            ruleset.contains(deny),
+            "missing the metadata denial:\n{ruleset}"
+        );
         assert!(
             ruleset.find(deny) < ruleset.find(peer_accept),
             "the metadata denial must precede any peer accept naming it"
@@ -1142,8 +1218,21 @@ mod tests {
         assert!(!ruleset.contains(&format!(
             "tohost ip saddr 10.99.0.6 ip daddr 10.99.0.5 udp dport {DNS_PORT} accept"
         )));
-        assert!(!ruleset.contains(&format!(
-            "tohost ip saddr 10.99.0.6 ip daddr 10.99.0.5 tcp dport {DNS_PORT} accept"
+    }
+
+    /// The resolver binds UDP and nothing else, so a TCP/53 accept is a hole
+    /// pointed at a port with no listener behind it.
+    #[test]
+    fn the_resolver_is_reachable_over_udp_only() {
+        for mode in [Mode::None, Mode::Allowlist, Mode::Open] {
+            let ruleset = render(&[sandbox(mode)]);
+            assert!(
+                !ruleset.contains(&format!("tcp dport {DNS_PORT}")),
+                "{mode:?} opens TCP/53, which nothing on the host answers"
+            );
+        }
+        assert!(render(&[sandbox(Mode::Allowlist)]).contains(&format!(
+            "tohost ip saddr 10.99.0.6 ip daddr 10.99.0.5 udp dport {DNS_PORT} accept"
         )));
     }
 
@@ -1520,6 +1609,62 @@ mod tests {
             Some(&Traffic::default())
         );
         assert!(parse_counters("").is_empty());
+    }
+
+    /// A denial rendered after the `established` accept applies only to
+    /// connections that are not already open, so the sandbox keeps whatever it
+    /// had until the entry idles out. Every unconditional drop must precede
+    /// the accept.
+    #[test]
+    fn every_denial_precedes_the_established_accept() {
+        for mode in [Mode::None, Mode::Allowlist, Mode::Open] {
+            let mut s = sandbox(mode);
+            s.deny_cidrs = vec!["10.77.0.0/16".into()];
+            s.allow_cidrs = vec!["10.88.0.0/16".into()];
+            s.peers = vec![Ipv4Addr::new(10, 99, 0, 10)];
+            let rules = render_with(&[s], &[Ipv4Addr::new(172, 18, 0, 4)]);
+
+            let established = rules
+                .find("sandbox ct state established,related accept")
+                .expect("the chain must accept return traffic");
+            for deny in [
+                "sandbox ip daddr 172.18.0.4 drop",
+                "sandbox ip saddr 10.99.0.6 ip daddr 169.254.0.0/16 drop",
+                "sandbox ip saddr 10.99.0.6 ip daddr 10.77.0.0/16 drop",
+            ] {
+                let at = rules
+                    .find(deny)
+                    .unwrap_or_else(|| panic!("{mode:?} must render {deny}:\n{rules}"));
+                assert!(
+                    at < established,
+                    "{mode:?}: {deny} must precede the established accept"
+                );
+            }
+        }
+    }
+
+    /// The blanket drop a malformed `deny_cidrs` earns is a denial like any
+    /// other, so it too outranks the established accept, and the sandbox's
+    /// allowances are not rendered at all.
+    #[test]
+    fn a_malformed_denial_drops_ahead_of_the_established_accept() {
+        let mut s = sandbox(Mode::Open);
+        s.deny_cidrs = vec!["nonsense\n".into()];
+        s.allow_cidrs = vec!["10.77.0.0/16".into()];
+        s.peers = vec![Ipv4Addr::new(10, 99, 0, 10)];
+        let rules = render(&[s]);
+
+        let drop = rules
+            .find("sandbox ip saddr 10.99.0.6 drop")
+            .expect("a malformed denial must cost the sandbox its egress");
+        let established = rules
+            .find("sandbox ct state established,related accept")
+            .expect("the chain must accept return traffic");
+        assert!(drop < established);
+        // Nothing of this sandbox's policy is rendered at all, so no accept
+        // survives to be reached by a conntrack entry.
+        assert!(!rules.contains("ip saddr 10.99.0.6 ip daddr 10.99.0.10 accept"));
+        assert!(!rules.contains("ip daddr 10.77.0.0/16 accept"));
     }
 
     /// Everything not explicitly permitted falls to the chain's drop, which is

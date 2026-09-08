@@ -1275,7 +1275,7 @@ loop is build and up:
 
 ```sh
 cargo xtask build      # cross-compiles to aarch64-unknown-linux-musl
-docker --context colima-burrow compose -f deploy/docker/compose.yaml up -d --build
+docker --context colima-burrow compose -f deploy/dev/compose.yaml up -d --build
 ```
 
 `cargo xtask build` output is mounted at `/burrow/bin` in the containers, so
@@ -1293,10 +1293,27 @@ sandbox is a microVM `burrowd` places itself, and `kubectl` cannot see one.
 
 ### Keeping the SDK protos in sync
 
-The TypeScript SDK ships its own copies of the `.proto` files, because it is
-published to npm and loads them at runtime. Copies drift, and these did, so
-`cargo xtask protos` writes them and a test in `burrow-proto` fails if a proto
-changes without it. `cargo xtask protos --check` is the CI form.
+Both SDKs ship their own copies of the `.proto` files, because they are
+published separately and cannot reach into this workspace; the TypeScript one
+loads them at runtime. Copies drift, and these did, so `cargo xtask protos`
+writes them and a test in `burrow-proto` fails if a proto changes without it.
+
+The Python SDK also commits the code generated from its copies, so installing it
+needs neither protoc nor grpcio-tools. That is a second way to drift: the copies
+can be current while the generated modules are stale, and stale modules import
+and run while disagreeing with the server about the wire.
+
+[`.github/workflows/ci.yml`](../.github/workflows/ci.yml) checks both on every
+push and pull request, alongside `cargo fmt --check`, `cargo clippy --workspace
+--all-targets -D warnings` and `cargo test --workspace`:
+
+```sh
+cargo xtask protos --check                       # the .proto copies in both SDKs
+python sdk/python/scripts/genproto.py --check    # the generated Python modules
+```
+
+It also runs each SDK's own tests, which the Rust workspace cannot reach, on the
+lowest Node and Python each declares support for.
 
 ### The guest kernel and templates
 

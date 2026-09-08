@@ -12,7 +12,10 @@ path = "src/main.rs"
 burrow-proto = { workspace = true }
 tokio = { workspace = true }
 tokio-stream = { workspace = true, features = ["sync"] }
-tonic = { workspace = true }
+# TLS so an `https://` orchestrator endpoint works at all: `tls-ring` is the
+# crypto provider the rest of the workspace uses, and `tls-native-roots` trusts
+# the platform's CA store, where an operator's certificate already is.
+tonic = { workspace = true, features = ["tls-ring", "tls-native-roots"] }
 clap = { workspace = true }
 anyhow = { workspace = true }
 nix = { workspace = true }

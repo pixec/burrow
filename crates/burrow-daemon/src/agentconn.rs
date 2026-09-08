@@ -19,8 +19,18 @@ pub const AGENT_PORT: u32 = 1024;
 ///
 /// Channels must not be held across a pause/resume: the underlying vsock
 /// connection dies with the snapshot. Reconnect after every resume.
-pub async fn connect(uds_path: PathBuf) -> anyhow::Result<AgentClient<Channel>> {
-    connect_timed(uds_path).await.map(|(client, _)| client)
+///
+/// `timeout` bounds every unary call the client makes, which is what keeps a
+/// guest that accepts the connection and then goes quiet from parking the task
+/// that called it for the life of the node. See [`connect_timed`] for why it
+/// does not bound the streaming ones.
+pub async fn connect(
+    uds_path: PathBuf,
+    timeout: std::time::Duration,
+) -> anyhow::Result<AgentClient<Channel>> {
+    connect_timed(uds_path, timeout)
+        .await
+        .map(|(client, _)| client)
 }
 
 /// Connects, and says when the guest's vsock listener accepted.
@@ -28,13 +38,22 @@ pub async fn connect(uds_path: PathBuf) -> anyhow::Result<AgentClient<Channel>> 
 /// That instant is guest wake; the gRPC HTTP/2 handshake that follows it is
 /// not, and conflating the two hides whether a slow create is the hypervisor's
 /// fault or the agent's.
+///
+/// The deadline is tonic's per-request one, which bounds the wait for a
+/// response *head* rather than the body that follows it. That is the boundary
+/// we want: a handshake or a health check that never answers fails, while an
+/// exec, a log watch or a download goes on streaming for as long as the caller
+/// wants it to. Streams need their own deadline where the daemon, rather than
+/// a caller, is waiting on one.
 async fn connect_timed(
     uds_path: PathBuf,
+    timeout: std::time::Duration,
 ) -> anyhow::Result<(AgentClient<Channel>, Option<std::time::Instant>)> {
     let accepted: std::sync::Arc<std::sync::Mutex<Option<std::time::Instant>>> =
         std::sync::Arc::default();
     let recorder = accepted.clone();
     let channel = Endpoint::try_from("http://vsock.invalid")?
+        .timeout(timeout)
         .connect_with_connector(service_fn(move |_: Uri| {
             let uds_path = uds_path.clone();
             let recorder = recorder.clone();
@@ -60,7 +79,7 @@ pub async fn connect_when_ready(
 ) -> anyhow::Result<(AgentClient<Channel>, Option<std::time::Instant>)> {
     let deadline = std::time::Instant::now() + timeout;
     loop {
-        match connect_timed(uds_path.clone()).await {
+        match connect_timed(uds_path.clone(), timeout).await {
             Ok(ready) => return Ok(ready),
             Err(err) if std::time::Instant::now() >= deadline => {
                 return Err(err.context(format!("agent did not accept within {timeout:?}")));

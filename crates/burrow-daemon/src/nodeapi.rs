@@ -117,6 +117,10 @@ impl NodeService for NodeApi {
         // template and shape from what the snapshot holds; it shares nothing
         // with the cold path but the checks above.
         let sandbox = if req.snapshot.is_empty() {
+            // The template names a directory under `images/`, and a create is
+            // the one path that reaches it with a string the orchestrator
+            // passed straight through from a tenant.
+            crate::template::validate_name(&req.template)?;
             self.sandboxes
                 .create(
                     req.sandbox_id,
@@ -218,11 +222,7 @@ impl NodeService for NodeApi {
         &self,
         req: Request<api::VolumeRef>,
     ) -> Result<Response<common::Volume>, Status> {
-        let volume = self
-            .sandboxes
-            .volumes()
-            .get(&req.into_inner().name)
-            .await?;
+        let volume = self.sandboxes.volumes().get(&req.into_inner().name).await?;
         Ok(Response::new(volume))
     }
 
@@ -707,7 +707,12 @@ impl NodeService for NodeApi {
         // and must not have an existing file at that path cleaned up under it.
         let exceeded = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
         let wrote = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
-        let (tripped, started) = (exceeded.clone(), wrote.clone());
+        // The caller's stream breaking is the third way this ends, and it is
+        // reported the same way the cap is. Ending the outbound stream on an
+        // inbound error would otherwise look to the agent exactly like a
+        // complete upload, and the truncated file would be reported written.
+        let broken: std::sync::Arc<std::sync::Mutex<Option<Status>>> = Default::default();
+        let (tripped, started, failed) = (exceeded.clone(), wrote.clone(), broken.clone());
         let outbound = async_stream::stream! {
             use std::sync::atomic::Ordering::Relaxed;
 
@@ -718,7 +723,15 @@ impl NodeService for NodeApi {
             }
             started.store(true, Relaxed);
             yield agent_first;
-            while let Some(Ok(chunk)) = inbound.next().await {
+            loop {
+                let chunk = match inbound.next().await {
+                    Some(Ok(chunk)) => chunk,
+                    Some(Err(err)) => {
+                        *failed.lock().unwrap() = Some(err);
+                        return;
+                    }
+                    None => break,
+                };
                 sent += chunk.data.len() as u64;
                 if over_cap(max_bytes, sent) {
                     tripped.store(true, Relaxed);
@@ -742,6 +755,18 @@ impl NodeService for NodeApi {
             return Err(Status::resource_exhausted(format!(
                 "upload exceeds this sandbox's max_upload_bytes ({max_bytes})"
             )));
+        }
+        // Same order and the same reason: what the caller's stream did is a
+        // truer account of the failure than whatever the agent made of it.
+        let broken = broken.lock().unwrap().take();
+        if let Some(err) = broken {
+            if wrote.load(std::sync::atomic::Ordering::Relaxed) {
+                remove_partial_upload(&sandbox, &path).await;
+            }
+            return Err(Status::new(
+                err.code(),
+                format!("upload stream ended early: {}", err.message()),
+            ));
         }
         let result = result?.into_inner();
         Ok(Response::new(api::UploadResult {
@@ -1217,6 +1242,13 @@ fn check_read_path(policy: &common::Policy, path: &str) -> Result<(), Status> {
     }
 }
 
+/// How long the node waits on its own cleanup inside a guest.
+///
+/// The exec below is a stream, and a stream is not covered by the per-call
+/// deadline the agent channel carries, so a guest that accepts the command and
+/// then never finishes it would hold this task open forever.
+const CLEANUP_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+
 /// Best-effort removal of what a refused upload had already written.
 ///
 /// A cap that trips mid-stream leaves a truncated file behind. Nothing rests on
@@ -1225,6 +1257,19 @@ fn check_read_path(policy: &common::Policy, path: &str) -> Result<(), Status> {
 /// still cleaned up, this being the node's own housekeeping rather than a
 /// caller's command.
 async fn remove_partial_upload(sandbox: &RunningSandbox, path: &str) {
+    if tokio::time::timeout(CLEANUP_TIMEOUT, remove_partial_upload_inner(sandbox, path))
+        .await
+        .is_err()
+    {
+        tracing::warn!(
+            sandbox = sandbox.id(),
+            path,
+            "gave up cleaning up a refused upload; the guest did not finish the removal"
+        );
+    }
+}
+
+async fn remove_partial_upload_inner(sandbox: &RunningSandbox, path: &str) {
     let Ok(mut agent) = sandbox.agent().await else {
         return;
     };
@@ -1736,6 +1781,20 @@ fn translate_exec_input(msg: api::ExecInput) -> Option<agentpb::ExecInput> {
     Some(agentpb::ExecInput { input: Some(input) })
 }
 
+fn translate_exec_output(msg: agentpb::ExecOutput) -> api::ExecOutput {
+    use agentpb::exec_output::Output as AgentOutput;
+    use api::exec_output::Output as ApiOutput;
+
+    api::ExecOutput {
+        output: msg.output.map(|out| match out {
+            AgentOutput::Stdout(b) => ApiOutput::Stdout(b),
+            AgentOutput::Stderr(b) => ApiOutput::Stderr(b),
+            AgentOutput::ExitCode(c) => ApiOutput::ExitCode(c),
+            AgentOutput::CommandId(id) => ApiOutput::CommandId(bounded(id, MAX_COMMAND_ID)),
+        }),
+    }
+}
+
 #[cfg(test)]
 mod policy_tests {
     use super::*;
@@ -1799,14 +1858,16 @@ mod policy_tests {
         assert!(validate_policy(&resources(3, 3_600)).is_ok());
 
         // And the flag is not required: the default deletes, as it always did.
-        assert!(validate_policy(&common::Policy {
-            resources: Some(common::ResourcePolicy {
-                keep_last_snapshots: 3,
+        assert!(
+            validate_policy(&common::Policy {
+                resources: Some(common::ResourcePolicy {
+                    keep_last_snapshots: 3,
+                    ..Default::default()
+                }),
                 ..Default::default()
-            }),
-            ..Default::default()
-        })
-        .is_ok());
+            })
+            .is_ok()
+        );
     }
 
     #[test]
@@ -2354,19 +2415,5 @@ mod policy_tests {
 
         assert_eq!(scratch_mib(0).unwrap(), 1024);
         assert!(scratch_mib(u32::MAX).is_err());
-    }
-}
-
-fn translate_exec_output(msg: agentpb::ExecOutput) -> api::ExecOutput {
-    use agentpb::exec_output::Output as AgentOutput;
-    use api::exec_output::Output as ApiOutput;
-
-    api::ExecOutput {
-        output: msg.output.map(|out| match out {
-            AgentOutput::Stdout(b) => ApiOutput::Stdout(b),
-            AgentOutput::Stderr(b) => ApiOutput::Stderr(b),
-            AgentOutput::ExitCode(c) => ApiOutput::ExitCode(c),
-            AgentOutput::CommandId(id) => ApiOutput::CommandId(bounded(id, MAX_COMMAND_ID)),
-        }),
     }
 }

@@ -32,9 +32,13 @@ struct Args {
     /// tokens let a key be rotated without downtime.
     #[arg(long, env = "BURROW_API_KEY_FILE")]
     api_key_file: Option<std::path::PathBuf>,
-    /// Bearer token nodes must present to register and heartbeat. Distinct
-    /// from --api-key: registration decides where exec and logs are routed.
-    /// Unset falls back to the api key, which the startup warning calls out.
+    /// The node-facing secret, shared with every node's --node-token.
+    ///
+    /// Used in both directions: nodes present it to register and heartbeat,
+    /// and this orchestrator presents it when calling nodes. Distinct from
+    /// --api-key because registration decides where exec and logs are routed,
+    /// and because a client key should not drive a node directly. Unset falls
+    /// back to the api key, which the startup warning calls out.
     #[arg(long, env = "BURROW_NODE_TOKEN")]
     node_token: Option<String>,
     /// File of accepted node tokens, one per line; `#` comments allowed.
@@ -68,9 +72,10 @@ pub struct OrchestratorState {
     pub volumes: volumes::VolumeRegistry,
     /// Reused channels to nodes, so routing a call does not dial one.
     pub channels: api::NodeChannels,
-    /// Presented when calling *out* to nodes, which are guarded by their own
-    /// `--api-key`. Not the token nodes present when registering: that is
-    /// `--node-token`, checked by the registry interceptor.
+    /// Presented when calling *out* to nodes. This is `--node-token`, which
+    /// guards the node-facing hop in both directions, so the client api key
+    /// never reaches a node. Falls back to `--api-key` only when no node token
+    /// is set, which the startup warning calls out.
     pub node_token: Option<String>,
 }
 
@@ -93,12 +98,27 @@ impl NodeRegistry for NodeRegistryService {
         // Labels are rendered into operator output and into placement errors,
         // so they are bounded at the door like any other caller-supplied map.
         burrow_core::tags::validate_labels(&info.labels)?;
-        let (node_id, node_index) = self.0.nodes.register(
-            info,
-            req.wireguard_public_key,
-            req.wireguard_endpoint,
-            req.claimed_node_index,
-        );
+        // A node that cannot be given a guest-address slice of its own is
+        // refused: admitting it on someone else's slice would give two nodes
+        // the same guest addresses, which is what the slicing exists to
+        // prevent.
+        let (node_id, node_index) = self
+            .0
+            .nodes
+            .register(
+                info,
+                req.wireguard_public_key,
+                req.wireguard_endpoint,
+                req.claimed_node_index,
+            )
+            .map_err(|err| match err {
+                crate::registry::RegisterError::NoAddressSlice(_) => {
+                    Status::resource_exhausted(err.to_string())
+                }
+                crate::registry::RegisterError::ClaimOutOfRange { .. } => {
+                    Status::invalid_argument(err.to_string())
+                }
+            })?;
         tracing::info!(node_id, node_index, "node registered");
 
         // Adopt whatever the node currently has. Done off the registration
@@ -143,14 +163,29 @@ impl NodeRegistry for NodeRegistryService {
                     "forgot snapshots the node no longer holds"
                 );
             }
-            let (restated, forgotten) = self.0.sandboxes.apply_states(&req.node_id, &req.sandboxes);
-            if restated > 0 || forgotten > 0 {
+            let applied = self.0.sandboxes.apply_states(&req.node_id, &req.sandboxes);
+            if applied.restated > 0 || applied.forgotten > 0 {
                 tracing::info!(
                     node_id = req.node_id,
-                    restated,
-                    forgotten,
+                    restated = applied.restated,
+                    forgotten = applied.forgotten,
                     "adopted node-initiated sandbox changes"
                 );
+            }
+            // The node is running sandboxes this orchestrator has no record
+            // of. A heartbeat carries too little to adopt them from, so the
+            // node's full listing is pulled instead, off the request path for
+            // the same reason as the reconcile after a registration.
+            if !applied.unknown.is_empty() {
+                tracing::warn!(
+                    node_id = req.node_id,
+                    count = applied.unknown.len(),
+                    first = applied.unknown.first(),
+                    "node reports sandboxes with no placement record; reconciling"
+                );
+                let state = Arc::clone(&self.0);
+                let id = req.node_id.clone();
+                tokio::spawn(async move { reconcile_node(state, id).await });
             }
         }
         // The peer list and cross-node membership ride on the heartbeat, so a
@@ -325,24 +360,30 @@ async fn run(args: Args) -> anyhow::Result<()> {
         );
     }
 
-    // Registering a node says where sandbox traffic goes, so it is a separate
-    // privilege from using the API. Sharing one secret lets any API client
-    // register a node over a real one and have other tenants' exec and log
-    // streams routed to it.
+    // The node-facing hop is a separate privilege from using the API, and it is
+    // symmetric: `--node-token` both guards inbound registration *and* is what
+    // this orchestrator presents when it dials a node. Sharing one secret with
+    // clients lets any API client register a node over a real one and have
+    // other tenants' exec and log streams routed to it, and hands every client
+    // a key that drives nodes directly.
     let node_tokens =
         burrow_core::auth::load_tokens(args.node_token.as_deref(), args.node_token_file.as_deref());
-    let node_auth = if node_tokens.is_empty() {
+    let (node_auth, outbound_node_token) = if node_tokens.is_empty() {
         if auth.is_enabled() {
             tracing::warn!(
                 "no --node-token configured: node registration accepts the client \
-                 api key, so any API client can register a node and have other \
-                 tenants' sandboxes routed to it. Set --node-token (or \
-                 BURROW_NODE_TOKEN) and give nodes the same value."
+                 api key and that key is what this orchestrator presents to nodes, \
+                 so any API client can register a node over a real one, have other \
+                 tenants' sandboxes routed to it, and call nodes directly. Set \
+                 --node-token (or BURROW_NODE_TOKEN) and give nodes the same value."
             );
         }
-        auth.clone()
+        (auth.clone(), tokens.first().cloned())
     } else {
-        burrow_core::auth::TokenAuth::new(node_tokens)
+        (
+            burrow_core::auth::TokenAuth::new(node_tokens.clone()),
+            node_tokens.first().cloned(),
+        )
     };
 
     let sandboxes = match burrow_store::Store::open(&args.data_dir.join("orchestrator.db")) {
@@ -364,7 +405,7 @@ async fn run(args: Args) -> anyhow::Result<()> {
         snapshots: snapshots::SnapshotRegistry::default(),
         volumes: volumes::VolumeRegistry::default(),
         channels: api::NodeChannels::default(),
-        node_token: tokens.first().cloned(),
+        node_token: outbound_node_token,
     });
 
     tracing::info!(

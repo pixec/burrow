@@ -59,6 +59,21 @@ pub enum PlacementError {
     NoNodeWithLabels(String),
 }
 
+/// Why a node could not be admitted to the fleet.
+#[derive(Debug, thiserror::Error)]
+pub enum RegisterError {
+    #[error(
+        "the fleet is full: all {0} guest-address slices are held by registered nodes; \
+         a slice frees when a departed node's record is reaped"
+    )]
+    NoAddressSlice(u32),
+    #[error(
+        "node claimed address slice {index}, but the guest address pool has only {max}; \
+         the stored index is from a build with a different pool and has to be cleared"
+    )]
+    ClaimOutOfRange { index: u32, max: u32 },
+}
+
 /// Whether a node carries every label asked for.
 fn labelled(entry: &NodeEntry, want: &HashMap<String, String>) -> bool {
     want.iter()
@@ -180,7 +195,18 @@ impl NodeRegistry {
         wireguard_public_key: String,
         wireguard_endpoint: String,
         claimed_index: Option<u32>,
-    ) -> (String, u32) {
+    ) -> Result<(String, u32), RegisterError> {
+        // A slice out of range is refused rather than reassigned. The node
+        // already has sandboxes addressed from it, and handing it a different
+        // slice would leave those addresses pointing into another node's range.
+        if let Some(claimed) = claimed_index
+            && claimed >= burrow_net::ipam::MAX_NODES
+        {
+            return Err(RegisterError::ClaimOutOfRange {
+                index: claimed,
+                max: burrow_net::ipam::MAX_NODES,
+            });
+        }
         let node_id = if info.id.is_empty() {
             NodeId::generate().to_string()
         } else {
@@ -200,9 +226,13 @@ impl NodeRegistry {
             // are derived from it and cannot be moved.
             (_, Some(claimed)) if !taken.contains(&claimed) => claimed,
             (Some(existing), _) => existing.index,
+            // A full fleet is refused rather than folded onto slice 0: two
+            // nodes handing out the same guest addresses makes cross-node
+            // routing ambiguous and lets one node's sandbox answer for
+            // another's.
             (None, _) => (0..burrow_net::ipam::MAX_NODES)
                 .find(|candidate| !taken.contains(candidate))
-                .unwrap_or(0),
+                .ok_or(RegisterError::NoAddressSlice(burrow_net::ipam::MAX_NODES))?,
         };
         if let Some(claimed) = claimed_index
             && claimed != index
@@ -231,7 +261,7 @@ impl NodeRegistry {
                 reported: false,
             },
         );
-        (node_id, index)
+        Ok((node_id, index))
     }
 
     /// Every healthy node except `exclude`, as mesh peers.
@@ -243,11 +273,16 @@ impl NodeRegistry {
         nodes
             .values()
             .filter(|e| e.info.id != exclude && e.healthy() && !e.wireguard_public_key.is_empty())
-            .map(|e| burrow_proto::node::v1::MeshPeer {
-                node_id: e.info.id.clone(),
-                public_key: e.wireguard_public_key.clone(),
-                endpoint: e.wireguard_endpoint.clone(),
-                subnet: burrow_net::Ipam::for_node(e.index).subnet(),
+            // `register` refuses an index the pool cannot hold, so this only
+            // fails for a node registered by an older build; such a peer is
+            // omitted rather than advertised with someone else's subnet.
+            .filter_map(|e| {
+                Some(burrow_proto::node::v1::MeshPeer {
+                    node_id: e.info.id.clone(),
+                    public_key: e.wireguard_public_key.clone(),
+                    endpoint: e.wireguard_endpoint.clone(),
+                    subnet: burrow_net::Ipam::for_node(e.index).ok()?.subnet(),
+                })
             })
             .collect()
     }
@@ -605,7 +640,7 @@ mod tests {
     fn registry(nodes: &[(&str, NodeStatus)]) -> NodeRegistry {
         let registry = NodeRegistry::default();
         for (id, status) in nodes {
-            registry.register(
+            let _ = registry.register(
                 NodeInfo {
                     id: (*id).into(),
                     address: format!("{id}:7071"),
@@ -688,16 +723,18 @@ mod tests {
         // The node is authoritative: its sandboxes already hold addresses
         // from the slice it claims.
         let registry = NodeRegistry::default();
-        let (_, index) = registry.register(
-            NodeInfo {
-                id: "a".into(),
-                address: "a:7071".into(),
-                ..Default::default()
-            },
-            String::new(),
-            String::new(),
-            Some(7),
-        );
+        let (_, index) = registry
+            .register(
+                NodeInfo {
+                    id: "a".into(),
+                    address: "a:7071".into(),
+                    ..Default::default()
+                },
+                String::new(),
+                String::new(),
+                Some(7),
+            )
+            .expect("slice 7 is free");
         assert_eq!(index, 7);
     }
 
@@ -705,17 +742,92 @@ mod tests {
     fn a_claim_on_a_taken_slice_is_refused() {
         let registry = registry(&[("a", status(&[], &[], 1))]);
         let held = registry.nodes.lock().unwrap()["a"].index;
-        let (_, index) = registry.register(
-            NodeInfo {
-                id: "b".into(),
-                address: "b:7071".into(),
-                ..Default::default()
-            },
-            String::new(),
-            String::new(),
-            Some(held),
-        );
+        let (_, index) = registry
+            .register(
+                NodeInfo {
+                    id: "b".into(),
+                    address: "b:7071".into(),
+                    ..Default::default()
+                },
+                String::new(),
+                String::new(),
+                Some(held),
+            )
+            .expect("another slice is free");
         assert_ne!(index, held, "two nodes must never share a slice");
+    }
+
+    /// Handing a new node slice 0 because nothing was free put it on the same
+    /// guest addresses as whoever already held slice 0, with no way for
+    /// cross-node routing to tell the two apart.
+    #[test]
+    fn a_full_fleet_refuses_a_new_node_rather_than_sharing_a_slice() {
+        let registry = NodeRegistry::default();
+        for index in 0..burrow_net::ipam::MAX_NODES {
+            registry
+                .register(
+                    NodeInfo {
+                        id: format!("node{index}"),
+                        address: format!("node{index}:7071"),
+                        ..Default::default()
+                    },
+                    String::new(),
+                    String::new(),
+                    Some(index),
+                )
+                .expect("every slice is claimed exactly once");
+        }
+        let err = registry
+            .register(
+                NodeInfo {
+                    id: "one-too-many".into(),
+                    address: "extra:7071".into(),
+                    ..Default::default()
+                },
+                String::new(),
+                String::new(),
+                None,
+            )
+            .expect_err("the pool is exhausted");
+        assert!(matches!(err, RegisterError::NoAddressSlice(_)), "{err:?}");
+        // A node already in the fleet is still admitted: it keeps its own slice.
+        assert!(
+            registry
+                .register(
+                    NodeInfo {
+                        id: "node0".into(),
+                        address: "node0:7071".into(),
+                        ..Default::default()
+                    },
+                    String::new(),
+                    String::new(),
+                    None,
+                )
+                .is_ok()
+        );
+    }
+
+    /// A claim the pool cannot hold was once silently reassigned, which left
+    /// the node's existing sandbox addresses inside another node's range.
+    #[test]
+    fn a_claim_past_the_pool_is_refused() {
+        let registry = NodeRegistry::default();
+        let err = registry
+            .register(
+                NodeInfo {
+                    id: "a".into(),
+                    address: "a:7071".into(),
+                    ..Default::default()
+                },
+                String::new(),
+                String::new(),
+                Some(burrow_net::ipam::MAX_NODES),
+            )
+            .expect_err("the pool has no such slice");
+        assert!(
+            matches!(err, RegisterError::ClaimOutOfRange { .. }),
+            "{err:?}"
+        );
     }
 
     #[test]
@@ -724,16 +836,18 @@ mod tests {
         // strand every address it still holds.
         let registry = registry(&[("a", status(&[], &[], 1))]);
         let before = registry.nodes.lock().unwrap()["a"].index;
-        let (_, after) = registry.register(
-            NodeInfo {
-                id: "a".into(),
-                address: "a:7071".into(),
-                ..Default::default()
-            },
-            "a-pubkey".into(),
-            "a:51820".into(),
-            None,
-        );
+        let (_, after) = registry
+            .register(
+                NodeInfo {
+                    id: "a".into(),
+                    address: "a:7071".into(),
+                    ..Default::default()
+                },
+                "a-pubkey".into(),
+                "a:51820".into(),
+                None,
+            )
+            .expect("a returning node is always admitted");
         assert_eq!(before, after);
     }
 
@@ -751,7 +865,7 @@ mod tests {
     #[test]
     fn a_node_without_a_key_is_not_a_mesh_peer() {
         let registry = NodeRegistry::default();
-        registry.register(
+        let _ = registry.register(
             NodeInfo {
                 id: "keyless".into(),
                 address: "keyless:7071".into(),
@@ -1261,7 +1375,7 @@ mod tests {
     #[test]
     fn a_node_that_reports_an_empty_inventory_is_not_a_candidate() {
         let registry = NodeRegistry::default();
-        registry.register(
+        let _ = registry.register(
             NodeInfo {
                 id: "fresh".into(),
                 address: "fresh:7071".into(),

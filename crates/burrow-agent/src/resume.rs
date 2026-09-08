@@ -184,6 +184,9 @@ pub fn install_inspection_ca(
     Ok(timing)
 }
 
+/// One bundle's path and whether the certificate was already present in it.
+type BundleNote = (String, bool);
+
 /// What the last successful install put where.
 ///
 /// Recorded only after every bundle succeeded, so a partial install leaves no
@@ -191,8 +194,7 @@ pub fn install_inspection_ca(
 /// keeps the fast path honest: the note can only ever say "this exact
 /// certificate is in all of these bundles", and it is written by the code that
 /// just made that true.
-static INSTALLED: std::sync::Mutex<Option<(String, Vec<(String, bool)>)>> =
-    std::sync::Mutex::new(None);
+static INSTALLED: std::sync::Mutex<Option<(String, Vec<BundleNote>)>> = std::sync::Mutex::new(None);
 
 /// The request's identity, for comparing one install against the next.
 ///
@@ -367,6 +369,30 @@ fn write_atomically(path: &std::path::Path, contents: &[u8]) -> std::io::Result<
         let _ = std::fs::remove_file(&temp);
         return Err(err);
     }
+    Ok(())
+}
+
+/// Reapplies the guest's network address after a restore.
+///
+/// A clone restored from a shared warm snapshot wakes holding whatever address
+/// was baked into that snapshot. Every clone would otherwise claim the same
+/// one, and the host, which routes a distinct /30 to each tap, would have no
+/// way to deliver their traffic. The host tells each clone its real address on
+/// handshake; this applies it.
+pub async fn apply_network(config: &burrow_proto::agent::v1::NetworkConfig) -> anyhow::Result<()> {
+    if config.ip.is_empty() {
+        return Ok(());
+    }
+    let ip = config.ip.parse()?;
+    let gateway = if config.gateway.is_empty() {
+        None
+    } else {
+        Some(config.gateway.parse()?)
+    };
+    let dns = (!config.dns.is_empty()).then_some(config.dns.as_str());
+
+    crate::netconf::apply(ip, config.prefix_len.max(1) as u8, gateway, dns).await?;
+    tracing::debug!(ip = config.ip, "network reapplied after restore");
     Ok(())
 }
 
@@ -614,28 +640,4 @@ mod trust_bundle_tests {
         std::fs::create_dir_all(&dir).unwrap();
         dir
     }
-}
-
-/// Reapplies the guest's network address after a restore.
-///
-/// A clone restored from a shared warm snapshot wakes holding whatever address
-/// was baked into that snapshot. Every clone would otherwise claim the same
-/// one, and the host, which routes a distinct /30 to each tap, would have no
-/// way to deliver their traffic. The host tells each clone its real address on
-/// handshake; this applies it.
-pub async fn apply_network(config: &burrow_proto::agent::v1::NetworkConfig) -> anyhow::Result<()> {
-    if config.ip.is_empty() {
-        return Ok(());
-    }
-    let ip = config.ip.parse()?;
-    let gateway = if config.gateway.is_empty() {
-        None
-    } else {
-        Some(config.gateway.parse()?)
-    };
-    let dns = (!config.dns.is_empty()).then_some(config.dns.as_str());
-
-    crate::netconf::apply(ip, config.prefix_len.max(1) as u8, gateway, dns).await?;
-    tracing::debug!(ip = config.ip, "network reapplied after restore");
-    Ok(())
 }

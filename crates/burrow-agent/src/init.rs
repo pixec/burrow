@@ -200,7 +200,11 @@ pub fn mount_volumes(volumes: &[burrow_proto::agent::v1::VolumeMount]) -> anyhow
             || volume.path.split('/').any(|part| part == "..")
             || !volume.device.starts_with("/dev/")
         {
-            anyhow::bail!("refusing volume mount {:?} at {:?}", volume.device, volume.path);
+            anyhow::bail!(
+                "refusing volume mount {:?} at {:?}",
+                volume.device,
+                volume.path
+            );
         }
         // A hotplugged device does not exist until the bus is rescanned:
         // firecracker has no way to tell the guest one arrived. Only done when

@@ -16,6 +16,7 @@ burrow-store = { workspace = true }
 prost = { workspace = true }
 tokio = { workspace = true }
 tokio-stream = { workspace = true }
+futures = { workspace = true }
 async-stream = { workspace = true }
 tonic = { workspace = true }
 clap = { workspace = true }

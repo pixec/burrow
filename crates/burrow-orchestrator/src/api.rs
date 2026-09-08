@@ -74,18 +74,70 @@ impl NodeChannels {
     }
 }
 
+/// How long a node gets to answer a dial.
+///
+/// A node that is down but whose address still resolves answers nothing, and
+/// the OS gives up on that only after minutes. Every call routed through such
+/// a node would hold its caller for that long, and the fan-outs below would
+/// hold it once per dead node.
+const NODE_CONNECT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
+
+/// Deadline for a node call that is not a stream.
+///
+/// Only for the unary fan-outs: this is set on the endpoint, so it applies to
+/// every request made over the channel, and an exec or a watch cut off after
+/// thirty seconds would be a bug rather than a safeguard.
+const NODE_REQUEST_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+
+fn node_endpoint(endpoint: String) -> Result<tonic::transport::Endpoint, tonic::transport::Error> {
+    Ok(tonic::transport::Endpoint::try_from(endpoint)?.connect_timeout(NODE_CONNECT_TIMEOUT))
+}
+
 /// Dials a node's API with the cluster token attached.
+///
+/// No per-request deadline: the same channel carries exec, watch and file
+/// streams, which are long-lived by design.
 pub async fn connect_node(
     endpoint: String,
     token: Option<&str>,
 ) -> Result<NodeClient, tonic::transport::Error> {
-    let channel = tonic::transport::Endpoint::try_from(endpoint)?
+    let channel = node_endpoint(endpoint)?.connect().await?;
+    Ok(NodeServiceClient::with_interceptor(
+        channel,
+        NodeAuth(token.map(str::to_string)),
+    ))
+}
+
+/// Dials a node for a one-shot call, with a deadline on it.
+///
+/// Used by the fan-outs, where one wedged node must not hold up an answer the
+/// rest of the fleet has already given.
+async fn connect_node_unary(
+    endpoint: String,
+    token: Option<&str>,
+) -> Result<NodeClient, tonic::transport::Error> {
+    let channel = node_endpoint(endpoint)?
+        .timeout(NODE_REQUEST_TIMEOUT)
         .connect()
         .await?;
     Ok(NodeServiceClient::with_interceptor(
         channel,
         NodeAuth(token.map(str::to_string)),
     ))
+}
+
+/// The nodes a fan-out should ask: those that are registered and addressable.
+fn reachable_nodes(state: &OrchestratorState) -> Vec<(String, String)> {
+    state
+        .nodes
+        .snapshot()
+        .into_iter()
+        .filter_map(|node| {
+            let id = node.info.as_ref().map(|i| i.id.clone())?;
+            let endpoint = state.nodes.endpoint(&id)?;
+            Some((id, endpoint))
+        })
+        .collect()
 }
 
 #[derive(Clone)]
@@ -227,7 +279,7 @@ impl ApiService {
         let endpoint = self
             .0
             .nodes
-            .endpoint(&target)
+            .endpoint(target)
             .ok_or_else(|| Status::unavailable(format!("node {target} is unreachable")))?;
         let mut client = connect_node(endpoint, self.0.node_token.as_deref())
             .await
@@ -528,7 +580,11 @@ impl Burrow for ApiService {
             // The node is fixed by where the snapshot is, so a label constraint
             // is a precondition here rather than a choice.
             self.require_labels(&snapshot.node_id, &req.node_labels)?;
-            let mounts = req.policy.as_ref().map(|p| p.volumes.clone()).unwrap_or_default();
+            let mounts = req
+                .policy
+                .as_ref()
+                .map(|p| p.volumes.clone())
+                .unwrap_or_default();
             if let Some(node) = self.node_for_volumes(&mounts)?
                 && node != snapshot.node_id
             {
@@ -610,10 +666,19 @@ impl Burrow for ApiService {
         // A mounted volume fixes the node, so placement is not a choice: it is
         // a check that the node holding the volumes can take the sandbox.
         let pinned = self.node_for_volumes(
-            &req.policy.as_ref().map(|p| p.volumes.clone()).unwrap_or_default(),
+            &req.policy
+                .as_ref()
+                .map(|p| p.volumes.clone())
+                .unwrap_or_default(),
         )?;
+        // Whether `place_for` charged the node for this sandbox. A
+        // volume-pinned create never goes through placement, so nothing was
+        // reserved for it, and a guard over it would refund a charge it never
+        // took, out of capacity belonging to whatever create runs alongside it.
+        let mut charged = true;
         let node_id = match pinned {
             Some(node_id) => {
+                charged = false;
                 self.require_labels(&node_id, &want.node_labels)?;
                 if self.0.nodes.endpoint(&node_id).is_none() {
                     return Err(Status::failed_precondition(format!(
@@ -627,26 +692,26 @@ impl Burrow for ApiService {
                 node_id
             }
             None => match self.0.nodes.place_for(&want) {
-            Ok(node_id) => node_id,
-            // Every node that could take the sandbox lacks the template.
-            // Refusing would make placement hostage to wherever a build
-            // happened to land, so copy the template to a node with room.
-            Err(crate::registry::PlacementError::TemplateNotOnAnyNode(name)) => {
-                self.replicate_then_place(&name, &want).await?
-            }
-            Err(err) => {
-                return Err(match err {
-                    crate::registry::PlacementError::NoHealthyNode
-                    | crate::registry::PlacementError::NoCapacity { .. } => {
-                        Status::resource_exhausted(err.to_string())
-                    }
-                    crate::registry::PlacementError::PeersUnreachable(_)
-                    | crate::registry::PlacementError::NoNodeWithLabels(_) => {
-                        Status::failed_precondition(err.to_string())
-                    }
-                    other => Status::not_found(other.to_string()),
-                });
-            }
+                Ok(node_id) => node_id,
+                // Every node that could take the sandbox lacks the template.
+                // Refusing would make placement hostage to wherever a build
+                // happened to land, so copy the template to a node with room.
+                Err(crate::registry::PlacementError::TemplateNotOnAnyNode(name)) => {
+                    self.replicate_then_place(&name, &want).await?
+                }
+                Err(err) => {
+                    return Err(match err {
+                        crate::registry::PlacementError::NoHealthyNode
+                        | crate::registry::PlacementError::NoCapacity { .. } => {
+                            Status::resource_exhausted(err.to_string())
+                        }
+                        crate::registry::PlacementError::PeersUnreachable(_)
+                        | crate::registry::PlacementError::NoNodeWithLabels(_) => {
+                            Status::failed_precondition(err.to_string())
+                        }
+                        other => Status::not_found(other.to_string()),
+                    });
+                }
             },
         };
         tracing::Span::current().record("template", template.as_str());
@@ -654,8 +719,8 @@ impl Burrow for ApiService {
 
         // Placement charged the node for this sandbox; every failure from here
         // has to give that back, or a run of failed creates makes a healthy
-        // node look full.
-        let placed = self.place_guard(&node_id, &want);
+        // node look full. Nothing to give back on the pinned path.
+        let placed = charged.then(|| self.place_guard(&node_id, &want));
         let endpoint = self
             .0
             .nodes
@@ -679,7 +744,9 @@ impl Burrow for ApiService {
             .into_inner();
         // The sandbox exists and the node will report it; the optimistic
         // charge is now the registry's job, not the guard's.
-        placed.keep();
+        if let Some(placed) = placed {
+            placed.keep();
+        }
 
         self.0.sandboxes.insert(sandbox.clone());
         // The registry now holds the sandbox, so the id no longer needs
@@ -1001,7 +1068,10 @@ impl Burrow for ApiService {
         let req = req.into_inner();
         burrow_core::tags::validate_labels(&req.node_labels)?;
         if self.0.volumes.get(&req.name).is_some() {
-            return Err(Status::already_exists(format!("volume {} exists", req.name)));
+            return Err(Status::already_exists(format!(
+                "volume {} exists",
+                req.name
+            )));
         }
 
         // Sized as the sandbox charge is: a volume takes disk rather than
@@ -1211,34 +1281,36 @@ impl Burrow for ApiService {
         // not exist on the others.
         let mut seen: std::collections::BTreeMap<String, api::TemplateInfo> =
             std::collections::BTreeMap::new();
-        for node in self.0.nodes.snapshot() {
-            let Some(id) = node.info.as_ref().map(|i| i.id.clone()) else {
-                continue;
-            };
-            let Some(endpoint) = self.0.nodes.endpoint(&id) else {
-                continue;
-            };
-            let Ok(mut client) = connect_node(endpoint, self.0.node_token.as_deref()).await else {
-                continue;
-            };
-            if let Ok(resp) = client.list_templates(api::ListTemplatesRequest {}).await {
-                for template in resp.into_inner().templates {
-                    match seen.get_mut(&template.name) {
-                        // Merged rather than overwritten. A warm snapshot is
-                        // node-local, so one node holding the template cold
-                        // says nothing about another holding it warm, and
-                        // letting the last node polled win reported a template
-                        // as cold while a create from it restored in
-                        // milliseconds. Warm anywhere is the answer that
-                        // matches what placement does with it, since placement
-                        // prefers a node that has one.
-                        Some(existing) => {
-                            existing.warm |= template.warm;
-                            existing.size_bytes = existing.size_bytes.max(template.size_bytes);
-                        }
-                        None => {
-                            seen.insert(template.name.clone(), template);
-                        }
+        // Dialled together rather than one after another: sequentially, this
+        // costs the sum of the fleet's round trips.
+        let polled = futures::future::join_all(reachable_nodes(&self.0).into_iter().map(
+            |(_, endpoint)| async move {
+                let mut client = connect_node_unary(endpoint, self.0.node_token.as_deref())
+                    .await
+                    .ok()?;
+                client
+                    .list_templates(api::ListTemplatesRequest {})
+                    .await
+                    .ok()
+            },
+        ))
+        .await;
+        for resp in polled.into_iter().flatten() {
+            for template in resp.into_inner().templates {
+                match seen.get_mut(&template.name) {
+                    // Merged rather than overwritten. A warm snapshot is
+                    // node-local, so one node holding the template cold says
+                    // nothing about another holding it warm, and letting the
+                    // last node polled win reported a template as cold while a
+                    // create from it restored in milliseconds. Warm anywhere is
+                    // the answer that matches what placement does with it,
+                    // since placement prefers a node that has one.
+                    Some(existing) => {
+                        existing.warm |= template.warm;
+                        existing.size_bytes = existing.size_bytes.max(template.size_bytes);
+                    }
+                    None => {
+                        seen.insert(template.name.clone(), template);
                     }
                 }
             }
@@ -1255,17 +1327,20 @@ impl Burrow for ApiService {
         let req = req.into_inner();
         let mut removed = false;
         let mut last_error = None;
-        for node in self.0.nodes.snapshot() {
-            let Some(id) = node.info.as_ref().map(|i| i.id.clone()) else {
-                continue;
-            };
-            let Some(endpoint) = self.0.nodes.endpoint(&id) else {
-                continue;
-            };
-            let Ok(mut client) = connect_node(endpoint, self.0.node_token.as_deref()).await else {
-                continue;
-            };
-            match client.delete_template(req.clone()).await {
+        // A template can be on any number of nodes, so every node is asked,
+        // and asked at once.
+        let outcomes = futures::future::join_all(reachable_nodes(&self.0).into_iter().map({
+            let req = &req;
+            move |(_, endpoint)| async move {
+                let mut client = connect_node_unary(endpoint, self.0.node_token.as_deref())
+                    .await
+                    .ok()?;
+                Some(client.delete_template(req.clone()).await)
+            }
+        }))
+        .await;
+        for outcome in outcomes.into_iter().flatten() {
+            match outcome {
                 Ok(_) => removed = true,
                 Err(err) if err.code() == tonic::Code::NotFound => {}
                 Err(err) => last_error = Some(err),
@@ -1378,15 +1453,36 @@ impl Burrow for ApiService {
         let mut first = first;
         first.sandbox_id = self.resolve(&first.sandbox_id);
         let mut client = self.node_for(&first.sandbox_id).await?;
+
+        // tonic's client streaming takes messages, not results, so a failed
+        // read from the caller cannot be forwarded down the stream, and ending
+        // it quietly is what the node reads as a complete upload. The error is
+        // parked here instead and becomes this RPC's own failure.
+        let failed: Arc<std::sync::Mutex<Option<Status>>> = Arc::default();
+        let sink = Arc::clone(&failed);
         let outbound = async_stream::stream! {
             yield first;
-            while let Some(Ok(chunk)) = inbound.next().await {
-                yield chunk;
+            while let Some(chunk) = inbound.next().await {
+                match chunk {
+                    Ok(chunk) => yield chunk,
+                    Err(err) => {
+                        *sink.lock().unwrap() = Some(err);
+                        break;
+                    }
+                }
             }
         };
-        Ok(Response::new(
-            client.upload_file(outbound).await?.into_inner(),
-        ))
+        let result = client.upload_file(outbound).await;
+        if let Some(err) = failed.lock().unwrap().take() {
+            return Err(Status::new(
+                err.code(),
+                format!(
+                    "the upload was cut short, leaving a partial file: {}",
+                    err.message()
+                ),
+            ));
+        }
+        Ok(Response::new(result?.into_inner()))
     }
 
     type DownloadFileStream = BoxStream<api::FileChunk>;
@@ -1417,20 +1513,21 @@ impl Burrow for ApiService {
         query.sandbox_id = self.resolve(&query.sandbox_id);
         let limit = if query.limit == 0 { 100 } else { query.limit } as usize;
 
-        let mut events = Vec::new();
-        for node in self.0.nodes.snapshot() {
-            let Some(id) = node.info.as_ref().map(|i| i.id.clone()) else {
-                continue;
-            };
-            let Some(endpoint) = self.0.nodes.endpoint(&id) else {
-                continue;
-            };
-            let Ok(mut client) = connect_node(endpoint, self.0.node_token.as_deref()).await else {
-                continue;
-            };
-            if let Ok(page) = client.query_audit(query.clone()).await {
-                events.extend(page.into_inner().events);
+        // Every node holds part of the answer, and the pages are merged
+        // anyway, so all of them are asked at once.
+        let pages = futures::future::join_all(reachable_nodes(&self.0).into_iter().map({
+            let query = &query;
+            move |(_, endpoint)| async move {
+                let mut client = connect_node_unary(endpoint, self.0.node_token.as_deref())
+                    .await
+                    .ok()?;
+                client.query_audit(query.clone()).await.ok()
             }
+        }))
+        .await;
+        let mut events = Vec::new();
+        for page in pages.into_iter().flatten() {
+            events.extend(page.into_inner().events);
         }
 
         // Timestamps are RFC 3339, which sorts lexically.

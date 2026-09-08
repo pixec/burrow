@@ -39,6 +39,11 @@ pub const POOL_PREFIX: u8 = 16;
 pub const BLOCKS_PER_NODE: u32 = 256;
 /// Nodes addressable within the pool.
 pub const MAX_NODES: u32 = MAX_BLOCKS / BLOCKS_PER_NODE;
+/// Prefix of one node's slice: [`BLOCKS_PER_NODE`] /30s is 1024 addresses.
+///
+/// A mesh peer claiming a range shorter than this is claiming more than a node
+/// can own, so [`crate::mesh`] refuses it.
+pub const NODE_PREFIX: u8 = 22;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Lease {
@@ -73,7 +78,7 @@ impl Lease {
     }
 }
 
-#[derive(Default)]
+#[derive(Debug, Default)]
 pub struct Ipam {
     /// sandbox id -> allocated block
     allocated: Mutex<HashMap<String, u32>>,
@@ -86,11 +91,22 @@ impl Ipam {
     ///
     /// `node_index` is assigned by the orchestrator and stable for a node's
     /// lifetime, so a node keeps its addresses across restarts.
-    pub fn for_node(node_index: u32) -> Self {
-        Self {
-            allocated: Mutex::new(HashMap::new()),
-            base_block: node_index.min(MAX_NODES - 1) * BLOCKS_PER_NODE,
+    ///
+    /// An index at or past [`MAX_NODES`] is an error rather than something to
+    /// clamp: clamping would put it on the same slice as the last legitimate
+    /// node, so both would hand out the same guest addresses and cross-node
+    /// routing would be ambiguous.
+    pub fn for_node(node_index: u32) -> Result<Self> {
+        if node_index >= MAX_NODES {
+            return Err(NetError::NodeIndexOutOfRange {
+                index: node_index,
+                max: MAX_NODES,
+            });
         }
+        Ok(Self {
+            allocated: Mutex::new(HashMap::new()),
+            base_block: node_index * BLOCKS_PER_NODE,
+        })
     }
 
     /// The slice of the pool this allocator owns.
@@ -102,9 +118,8 @@ impl Ipam {
     ///
     /// Peers route this range to the node over the mesh.
     pub fn subnet(&self) -> String {
-        // BLOCKS_PER_NODE /30s is 1024 addresses, which is a /22.
         let base = u32::from_be_bytes(BASE) + self.base_block * 4;
-        format!("{}/22", std::net::Ipv4Addr::from(base))
+        format!("{}/{NODE_PREFIX}", std::net::Ipv4Addr::from(base))
     }
 
     /// Allocates the lowest free /30. Re-allocating for a sandbox that already
@@ -178,8 +193,8 @@ mod tests {
     fn nodes_allocate_from_disjoint_ranges() {
         // Two nodes never coordinate, so overlapping addresses would be
         // undetectable until traffic went to the wrong sandbox.
-        let a = Ipam::for_node(0);
-        let b = Ipam::for_node(1);
+        let a = Ipam::for_node(0).unwrap();
+        let b = Ipam::for_node(1).unwrap();
         let from_a = a.allocate("x").unwrap();
         let from_b = b.allocate("y").unwrap();
         assert_ne!(from_a.guest_ip, from_b.guest_ip);
@@ -188,19 +203,37 @@ mod tests {
 
     #[test]
     fn a_node_subnet_covers_exactly_its_blocks() {
-        assert_eq!(Ipam::for_node(0).subnet(), "10.99.0.0/22");
-        assert_eq!(Ipam::for_node(1).subnet(), "10.99.4.0/22");
-        assert_eq!(Ipam::for_node(2).subnet(), "10.99.8.0/22");
+        assert_eq!(Ipam::for_node(0).unwrap().subnet(), "10.99.0.0/22");
+        assert_eq!(Ipam::for_node(1).unwrap().subnet(), "10.99.4.0/22");
+        assert_eq!(Ipam::for_node(2).unwrap().subnet(), "10.99.8.0/22");
     }
 
     #[test]
     fn a_node_cannot_allocate_past_its_slice() {
-        let ipam = Ipam::for_node(0);
+        let ipam = Ipam::for_node(0).unwrap();
         // Block 0 is skipped, so a node gets one fewer than its full share.
         for i in 0..BLOCKS_PER_NODE - 1 {
             ipam.allocate(&format!("s{i}")).unwrap();
         }
         assert!(ipam.allocate("one-too-many").is_err());
+    }
+
+    /// An index the pool cannot hold is refused, since clamping it would put
+    /// the node on a slice another node already owns.
+    #[test]
+    fn an_out_of_range_node_index_is_refused_rather_than_clamped() {
+        // The bound is exclusive, so the last index is still legitimate.
+        assert_eq!(
+            Ipam::for_node(MAX_NODES - 1).unwrap().node_index(),
+            MAX_NODES - 1
+        );
+        for index in [MAX_NODES, u32::MAX] {
+            let err = Ipam::for_node(index).unwrap_err();
+            assert!(
+                matches!(err, NetError::NodeIndexOutOfRange { index: got, .. } if got == index),
+                "{index} must be refused, got {err}"
+            );
+        }
     }
 
     #[test]

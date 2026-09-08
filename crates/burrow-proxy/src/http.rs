@@ -326,10 +326,8 @@ pub fn inject_headers(head: &[u8], injections: &[(&str, &str)]) -> Result<Vec<u8
 pub(crate) fn target_authority(target: &str) -> Option<Option<String>> {
     let rest = if let Some(rest) = strip_scheme(target, "http://") {
         rest
-    } else if let Some(rest) = strip_scheme(target, "https://") {
-        rest
     } else {
-        return None;
+        strip_scheme(target, "https://")?
     };
     let authority_end = rest.find(['/', '?', '#']).unwrap_or(rest.len());
     Some(parse_host_value(&rest[..authority_end]))
@@ -1127,8 +1125,9 @@ mod tests {
 
     #[test]
     fn absolute_form_target_is_stripped_for_matching() {
-        let parsed = parse_head("GET http://example.com/x?a=1 HTTP/1.1\r\nHost: example.com\r\n\r\n")
-            .unwrap();
+        let parsed =
+            parse_head("GET http://example.com/x?a=1 HTTP/1.1\r\nHost: example.com\r\n\r\n")
+                .unwrap();
         assert_eq!(parsed.origin_form(), "/x?a=1");
     }
 }

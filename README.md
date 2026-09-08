@@ -79,13 +79,18 @@ cargo xtask build
 docker --context colima-burrow compose -f deploy/dev/compose.yaml up -d --build
 ```
 
-The harness sets the API token to `dev-token` and the orchestrator listens on
+The harness sets the client token to `dev-token` and gives the orchestrator and
+both nodes `dev-node-token` for the node-facing hop. The orchestrator listens on
 `127.0.0.1:7070`, which is where the CLI looks by default:
 
 ```sh
 export BURROW_API_KEY=dev-token
 alias burrow='cargo run -q -p burrow-cli --'
 ```
+
+The two are separate on purpose: `--api-key` is what clients present to the
+orchestrator, `--node-token` what the orchestrator and its nodes present to each
+other. See [docs/CONCEPTS.md](docs/CONCEPTS.md#api-callers-are-authenticated).
 
 Give the node a kernel. An OCI image carries a userland and no kernel, so the
 node supplies one for every template it builds. `--guest-kernel` names it, and

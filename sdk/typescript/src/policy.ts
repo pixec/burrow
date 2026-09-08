@@ -383,8 +383,17 @@ function fromShorthand(
 
 /** Builds the wire `NetworkPolicy`. Defaults to no egress at all. */
 export function toNetworkPolicy(options: NetworkPolicyOptions = {}): any {
+  const mode = options.mode ?? "none";
+  // A mode with no wire name would otherwise go out as `undefined` and be
+  // decoded as NETWORK_MODE_NONE, a typo costing the sandbox all its egress.
+  if (!(mode in MODE_TO_WIRE)) {
+    throw new BurrowError(
+      `networkPolicy: unknown mode ${JSON.stringify(mode)}; one of none, allowlist, open`,
+      "invalid_argument",
+    );
+  }
   return {
-    mode: MODE_TO_WIRE[options.mode ?? "none"],
+    mode: MODE_TO_WIRE[mode],
     allowDomains: options.allowDomains ?? [],
     allowCidrs: options.allowCidrs ?? [],
     allowPorts: options.allowPorts ?? [],

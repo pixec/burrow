@@ -133,12 +133,21 @@ def _to_create_request(options: Dict[str, Any]) -> api_pb2.CreateSandboxRequest:
         "memory_mib": options.get("memory_mib"),
     }
     # A snapshot carries its own template, and one that disagrees is an error,
-    # so the default is not sent as if the caller had asked for it.
+    # so nothing is sent as if the caller had asked for it.
     template = options.get("template") or options.get("image") or ""
+    # Without a snapshot there is nothing to boot from, and a made-up
+    # "default" would turn a missing argument into a not_found for a template
+    # nobody named.
+    if not template and not options.get("snapshot"):
+        raise BurrowError(
+            "a template is required: pass template=... (or snapshot=... to "
+            "restore one)",
+            "invalid_argument",
+        )
     request = api_pb2.CreateSandboxRequest(
         name=options.get("name") or "",
         snapshot=options.get("snapshot") or "",
-        template=template or ("" if options.get("snapshot") else "default"),
+        template=template,
         metadata=options.get("tags") or options.get("metadata") or {},
         node_labels=options.get("node_labels") or {},
     )
@@ -268,12 +277,20 @@ class DetachedCommand:
         logs: Callable[[], Iterator[OutputChunk]],
         signal: Callable[[str, int], None],
         info: Optional[CommandInfo] = None,
+        release: Optional[Callable[[], None]] = None,
+        close: Optional[Callable[[], None]] = None,
     ):
         self.sandbox_id = sandbox_id
         self.cmd_id = cmd_id
         self._logs = logs
         self._signal = signal
         self.info = info
+        # A spawned command holds its request stream open (see `_start_exec`).
+        # `release` ends the request side and leaves the output readable;
+        # `close` also cancels the call. Neither exists on a handle from
+        # `get_command`, which owns no stream.
+        self._release = release
+        self._close = close
 
     def logs(self) -> Iterator[OutputChunk]:
         """The command's output, replayed from what the guest holds and then
@@ -291,12 +308,35 @@ class DetachedCommand:
         what kill wanted anyway. Every other failure raises, because a sandbox
         tightened to deny exec refuses signals too, and silently doing nothing
         there is indistinguishable from having killed it.
+
+        The request side is released either way: a killed command is never
+        going to read stdin again, and leaving it open strands the thread
+        blocked on it. The output stays readable.
         """
         try:
             self._signal(self.cmd_id, signal)
         except BurrowError as err:
             if not err.is_already_exited:
                 raise
+        finally:
+            if self._release is not None:
+                self._release()
+
+    def close(self) -> None:
+        """Releases the call without waiting for the command.
+
+        The command keeps running in the sandbox; this drops the client's half
+        of it, which a spawned command that is never drained would otherwise
+        hold for the life of the process. Safe to call more than once.
+        """
+        if self._close is not None:
+            self._close()
+
+    def __enter__(self) -> "DetachedCommand":
+        return self
+
+    def __exit__(self, *exc: Any) -> None:
+        self.close()
 
 
 class Watcher:
@@ -751,7 +791,9 @@ class Sandbox:
         options: Dict[str, Any],
         keep_open: bool = False,
     ):
-        """Starts a command, returning its output and the id the guest gave it."""
+        """Starts a command, returning its output, the id the guest gave it,
+        and the two ways of letting go of the call: `release` ends the request
+        side, `close` also cancels."""
         self._assert_live()
         cmd = ["/bin/sh", "-c", command] if isinstance(command, str) else list(command)
 
@@ -819,13 +861,23 @@ class Sandbox:
                 done.set()
                 call.cancel()
 
-        return chunks(), command_id
+        # Ends the request side, leaving the output stream readable.
+        def release() -> None:
+            done.set()
+
+        def close() -> None:
+            done.set()
+            call.cancel()
+
+        return chunks(), command_id, release, close
 
     def _spawn(
         self, command: Union[str, Sequence[str]], options: Dict[str, Any]
     ) -> DetachedCommand:
         """Starts a command and returns a handle without waiting for it."""
-        output, cmd_id = self._start_exec(command, options, keep_open=True)
+        output, cmd_id, release, close = self._start_exec(
+            command, options, keep_open=True
+        )
 
         on_stdout = options.get("on_stdout")
         on_stderr = options.get("on_stderr")
@@ -854,7 +906,9 @@ class Sandbox:
 
         # The same RPC `get_command(...).kill()` uses: the command lives in the
         # sandbox, not on this stream.
-        return DetachedCommand(self.id, cmd_id, take, self._signal_command)
+        return DetachedCommand(
+            self.id, cmd_id, take, self._signal_command, release=release, close=close
+        )
 
     def list_commands(self) -> List[CommandInfo]:
         """Lists the commands this sandbox has run, oldest first.
@@ -1046,8 +1100,12 @@ class Sandbox:
         return res.bytes_written
 
     def read_file(self, path: str) -> str:
-        """Reads a file as a string. Raises when it does not exist."""
-        return self.read_file_bytes(path).decode("utf-8")
+        """Reads a file as a UTF-8 string. Raises when it does not exist.
+
+        Undecodable bytes become U+FFFD rather than raising, matching the
+        TypeScript SDK. Use `read_file_bytes` when the bytes themselves matter.
+        """
+        return self.read_file_bytes(path).decode("utf-8", errors="replace")
 
     def read_file_bytes(self, path: str) -> bytes:
         """Reads a file as raw bytes. Raises when it does not exist."""

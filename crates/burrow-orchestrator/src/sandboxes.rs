@@ -6,6 +6,7 @@
 
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 use burrow_proto::common::v1 as common;
 
@@ -31,6 +32,26 @@ fn alias_of(membership: &common::NetworkMembership, sandbox_id: &str) -> String 
     } else {
         membership.alias.clone()
     }
+}
+
+/// How long a freshly created sandbox is immune to being forgotten by a
+/// heartbeat.
+///
+/// It covers a report sampled before the sandbox existed and only now
+/// arriving: one heartbeat interval of sampling lag plus flight time. Wide,
+/// because being wrong the other way only keeps a deleted sandbox's record for
+/// one more heartbeat.
+const SETTLING_GRACE: Duration = Duration::from_secs(30);
+
+/// What a heartbeat's state report changed. See [`SandboxRegistry::apply_states`].
+#[derive(Debug, Default)]
+pub struct Applied {
+    /// Sandboxes whose state the node moved on its own.
+    pub restated: usize,
+    /// Placements dropped because the node no longer lists them.
+    pub forgotten: usize,
+    /// Ids the node lists that this registry holds no placement for.
+    pub unknown: Vec<String>,
 }
 
 /// How long a tombstone is kept before it is assumed no longer needed.
@@ -77,6 +98,14 @@ pub struct SandboxRegistry {
     creating: Mutex<HashSet<String>>,
     /// Names whose create is in flight, held for the same reason as `creating`.
     naming: Mutex<HashSet<String>>,
+    /// Ids whose create finished too recently to trust a heartbeat about them.
+    ///
+    /// A node samples its inventory and then sends it, so a sandbox created
+    /// after the sample is simply not in the report. Reading that as "the node
+    /// no longer has it" destroys the record of a sandbox that is running, and
+    /// whose id the caller already holds. The id sits here for a grace window
+    /// instead, after which the node has had a chance to list it.
+    settling: Mutex<HashMap<String, Instant>>,
     /// Survives a restart of the whole fleet, the one case nodes cannot cover.
     store: Option<Arc<burrow_store::Store>>,
 }
@@ -132,6 +161,7 @@ impl SandboxRegistry {
             tombstones: Mutex::new(tombstones),
             creating: Mutex::new(HashSet::new()),
             naming: Mutex::new(HashSet::new()),
+            settling: Mutex::new(HashMap::new()),
             store: Some(store),
         }
     }
@@ -196,6 +226,10 @@ impl SandboxRegistry {
     pub fn insert(&self, sandbox: common::Sandbox) {
         let mut sandboxes = self.sandboxes.lock().unwrap();
         self.persist(&sandbox);
+        self.settling
+            .lock()
+            .unwrap()
+            .insert(sandbox.id.clone(), Instant::now());
         sandboxes.insert(sandbox.id.clone(), sandbox);
     }
 
@@ -210,6 +244,15 @@ impl SandboxRegistry {
         }) {
             tracing::warn!(sandbox = sandbox.id, %err, "could not persist a placement");
         }
+    }
+
+    /// Ages every settling entry out, as if `SETTLING_GRACE` had passed.
+    ///
+    /// Tests that are about what a heartbeat forgets have to get past the
+    /// grace window without sleeping through it.
+    #[cfg(test)]
+    fn settled(&self) {
+        self.settling.lock().unwrap().clear();
     }
 
     fn forget(&self, id: &str) {
@@ -438,13 +481,25 @@ impl SandboxRegistry {
     /// lists is gone: a sandbox that outlived its policy is destroyed there, and
     /// continuing to list it would be inventing one.
     ///
-    /// Returns `(restated, forgotten)`.
+    /// Two things a report is *not* evidence of, both of them ordering rather
+    /// than disagreement:
+    ///
+    /// * A sandbox created after the node sampled its inventory is missing from
+    ///   the report because it did not exist yet, not because it is gone. Ids
+    ///   still being created, and ids created inside [`SETTLING_GRACE`], are
+    ///   therefore never dropped by a heartbeat.
+    /// * An id the node lists that this registry has never heard of is a real
+    ///   sandbox whose placement record was lost, by a restart without a store
+    ///   or otherwise. It is returned in [`Applied::unknown`] so the caller can
+    ///   pull the node's full listing; a state report carries no name, policy
+    ///   or address, so there is nothing here to rebuild a record from.
     pub fn apply_states(
         &self,
         node_id: &str,
         reported: &[burrow_proto::node::v1::SandboxStateReport],
-    ) -> (usize, usize) {
+    ) -> Applied {
         let mut sandboxes = self.sandboxes.lock().unwrap();
+        let mut out = Applied::default();
 
         // Only what actually moved is written back. A heartbeat arrives every
         // few seconds and almost always says nothing new; rewriting every
@@ -460,6 +515,11 @@ impl SandboxRegistry {
                 continue;
             }
             let Some(sandbox) = sandboxes.get_mut(&report.sandbox_id) else {
+                // Not ours yet: a create in flight is inserted only once the
+                // node answers, and this report may have overtaken it.
+                if !self.creating.lock().unwrap().contains(&report.sandbox_id) {
+                    out.unknown.push(report.sandbox_id.clone());
+                }
                 continue;
             };
             if sandbox.node_id != node_id {
@@ -481,7 +541,7 @@ impl SandboxRegistry {
                 changed.push(sandbox.clone());
             }
         }
-        let restated = changed.len();
+        out.restated = changed.len();
 
         let mut gone = Vec::new();
         if reported.is_empty() {
@@ -501,8 +561,17 @@ impl SandboxRegistry {
         } else {
             let known: std::collections::HashSet<&str> =
                 reported.iter().map(|r| r.sandbox_id.as_str()).collect();
+            // Expired entries are dropped here rather than on a timer: this is
+            // the only reader, and it runs every few seconds per node.
+            let mut settling = self.settling.lock().unwrap();
+            settling.retain(|_, at| at.elapsed() < SETTLING_GRACE);
+            let creating = self.creating.lock().unwrap();
             sandboxes.retain(|id, sandbox| {
-                let keep = sandbox.node_id != node_id || known.contains(id.as_str());
+                let keep = sandbox.node_id != node_id
+                    || known.contains(id.as_str())
+                    // Too new for this report to have seen; see the doc comment.
+                    || creating.contains(id)
+                    || settling.contains_key(id);
                 if !keep {
                     gone.push(id.clone());
                 }
@@ -518,7 +587,8 @@ impl SandboxRegistry {
         for id in &gone {
             self.forget(id);
         }
-        (restated, gone.len())
+        out.forgotten = gone.len();
+        out
     }
 
     /// The node already hosting members of any of `networks`.
@@ -707,14 +777,93 @@ mod tests {
         let registry = SandboxRegistry::default();
         registry.insert(sandbox("a", "node1", common::SandboxState::Running));
 
-        let (restated, forgotten) =
+        let applied =
             registry.apply_states("node1", &[report("a", common::SandboxState::Suspended)]);
+        let (restated, forgotten) = (applied.restated, applied.forgotten);
 
         assert_eq!((restated, forgotten), (1, 0));
         assert_eq!(
             registry.get("a").unwrap().state,
             common::SandboxState::Suspended as i32
         );
+    }
+
+    /// A heartbeat is a snapshot of a moment, and that moment may be older
+    /// than the sandbox. Reading "not in the report" as "gone" then erases the
+    /// record of a sandbox the caller has already been handed the id of.
+    #[test]
+    fn a_just_created_sandbox_survives_a_heartbeat_that_predates_it() {
+        let registry = SandboxRegistry::default();
+        registry.insert(sandbox("old", "node1", common::SandboxState::Running));
+        registry.settled();
+        // Created after the node sampled the report below.
+        registry.insert(sandbox("brand-new", "node1", common::SandboxState::Running));
+
+        let applied =
+            registry.apply_states("node1", &[report("old", common::SandboxState::Running)]);
+
+        assert_eq!(applied.forgotten, 0);
+        assert!(registry.get("brand-new").is_some());
+        // And once the grace window is over, a report that still omits it is
+        // taken at its word.
+        registry.settled();
+        let applied =
+            registry.apply_states("node1", &[report("old", common::SandboxState::Running)]);
+        assert_eq!(applied.forgotten, 1);
+        assert!(registry.get("brand-new").is_none());
+    }
+
+    /// The id is claimed before the node is asked to build the sandbox, so a
+    /// heartbeat can arrive while the create is still in flight.
+    #[test]
+    fn an_id_still_being_created_is_not_forgotten() {
+        let registry = SandboxRegistry::default();
+        let reserved = registry.reserve("in-flight", "").expect("free id");
+        registry.insert(sandbox("in-flight", "node1", common::SandboxState::Running));
+        // Not `settled()`: the point is that `creating` alone is enough.
+        registry.settling.lock().unwrap().clear();
+
+        let applied = registry.apply_states("node1", &[]);
+        assert_eq!(applied.forgotten, 0);
+        assert!(registry.get("in-flight").is_some());
+        drop(reserved);
+    }
+
+    /// An orchestrator that lost its store still has a fleet full of running
+    /// sandboxes. Ignoring the ids it does not recognise would leave them
+    /// unreachable through the API for as long as the node stays registered.
+    #[test]
+    fn a_reported_sandbox_with_no_record_is_reported_for_reconciling() {
+        let registry = SandboxRegistry::default();
+        registry.insert(sandbox("known", "node1", common::SandboxState::Running));
+        registry.settled();
+
+        let applied = registry.apply_states(
+            "node1",
+            &[
+                report("known", common::SandboxState::Running),
+                report("stranger", common::SandboxState::Running),
+            ],
+        );
+
+        assert_eq!(applied.unknown, vec!["stranger".to_string()]);
+        // Nothing is invented from a state report: it carries no name, policy
+        // or address, so the caller pulls the node's full listing instead.
+        assert!(registry.get("stranger").is_none());
+    }
+
+    /// A delete that could not reach its node stays deleted. The tombstone is
+    /// the record of that, and it must not read as a sandbox to go adopt.
+    #[test]
+    fn a_tombstoned_id_is_not_reported_as_unknown() {
+        let registry = SandboxRegistry::default();
+        registry.insert(sandbox("deleted", "node1", common::SandboxState::Running));
+        registry.forget_deleted("deleted");
+        registry.settled();
+
+        let applied =
+            registry.apply_states("node1", &[report("deleted", common::SandboxState::Running)]);
+        assert!(applied.unknown.is_empty());
     }
 
     /// A sandbox that outlived its policy is destroyed on the node; continuing
@@ -724,9 +873,11 @@ mod tests {
         let registry = SandboxRegistry::default();
         registry.insert(sandbox("gone", "node1", common::SandboxState::Running));
         registry.insert(sandbox("kept", "node1", common::SandboxState::Running));
+        registry.settled();
 
-        let (_, forgotten) =
-            registry.apply_states("node1", &[report("kept", common::SandboxState::Running)]);
+        let forgotten = registry
+            .apply_states("node1", &[report("kept", common::SandboxState::Running)])
+            .forgotten;
 
         assert_eq!(forgotten, 1);
         assert!(registry.get("gone").is_none());
@@ -740,8 +891,9 @@ mod tests {
         registry.insert(sandbox("mine", "node1", common::SandboxState::Running));
         registry.insert(sandbox("theirs", "node2", common::SandboxState::Running));
 
-        let (_, forgotten) =
-            registry.apply_states("node1", &[report("mine", common::SandboxState::Running)]);
+        let forgotten = registry
+            .apply_states("node1", &[report("mine", common::SandboxState::Running)])
+            .forgotten;
 
         assert_eq!(forgotten, 0);
         assert!(registry.get("theirs").is_some());
@@ -753,10 +905,12 @@ mod tests {
         let registry = SandboxRegistry::default();
         registry.insert(sandbox("elsewhere", "node2", common::SandboxState::Running));
 
-        let (restated, _) = registry.apply_states(
-            "node1",
-            &[report("elsewhere", common::SandboxState::Suspended)],
-        );
+        let restated = registry
+            .apply_states(
+                "node1",
+                &[report("elsewhere", common::SandboxState::Suspended)],
+            )
+            .restated;
 
         assert_eq!(restated, 0);
         assert_eq!(
@@ -773,7 +927,8 @@ mod tests {
         let registry = SandboxRegistry::default();
         registry.insert(sandbox("a", "node1", common::SandboxState::Running));
 
-        let (restated, forgotten) = registry.apply_states("node1", &[]);
+        let applied = registry.apply_states("node1", &[]);
+        let (restated, forgotten) = (applied.restated, applied.forgotten);
 
         assert_eq!((restated, forgotten), (0, 0));
         assert!(registry.get("a").is_some());
@@ -813,8 +968,8 @@ mod tests {
     fn an_unchanged_inventory_reports_no_churn() {
         let registry = SandboxRegistry::default();
         registry.insert(sandbox("a", "node1", common::SandboxState::Running));
-        let (restated, forgotten) =
-            registry.apply_states("node1", &[report("a", common::SandboxState::Running)]);
+        let applied = registry.apply_states("node1", &[report("a", common::SandboxState::Running)]);
+        let (restated, forgotten) = (applied.restated, applied.forgotten);
         assert_eq!((restated, forgotten), (0, 0));
     }
 
@@ -1020,6 +1175,7 @@ mod store_tests {
             let registry = SandboxRegistry::with_store(Arc::clone(&store));
             registry.insert(sandbox("sbx_a", "node1"));
             registry.insert(sandbox("dropped", "node1"));
+            registry.settled();
             registry.apply_states(
                 "node1",
                 &[SandboxStateReport {

@@ -32,7 +32,7 @@ use tokio::net::{TcpListener, TcpStream};
 pub use audit::{AuditLog, EgressEvent};
 pub use dns::Resolver;
 pub use policy::{Decision, NetworkMode, PolicyTable, SandboxPolicy};
-pub use resolutions::Resolutions;
+pub use resolutions::{DeniedAddresses, Resolutions};
 
 /// Longest first-flight read used to identify the destination. A ClientHello
 /// is comfortably under this; anything larger is not something we can classify
@@ -45,6 +45,74 @@ const PEEK_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 /// faster than it uses them. Beyond this the backlog waits in the kernel,
 /// which is where an unserved connection is cheapest.
 const MAX_CONNECTIONS: usize = 1024;
+/// How many of those one sandbox may hold at once.
+///
+/// The global limit is shared, not divided: a single sandbox opening
+/// connections in a loop would take every slot and the proxy would stop
+/// serving its neighbours. Generous enough for a browser or a package manager
+/// fanning out, and far below the global ceiling.
+const MAX_CONNECTIONS_PER_SOURCE: usize = 96;
+
+/// How long the upstream TCP connection may take to establish.
+const CONNECT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+/// How long the two TLS handshakes of an inspected session may take between
+/// them.
+///
+/// One deadline covers both: the sandbox's handshake is not started until the
+/// server's has finished, so a peer that stalls either half holds the same
+/// task, the same two sockets and the same connection slot. Without it a
+/// server that accepts and then says nothing pins those indefinitely, which a
+/// sandbox can arrange by connecting to a host it controls.
+const HANDSHAKE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15);
+
+/// Per-source connection counts, enforcing [`MAX_CONNECTIONS_PER_SOURCE`].
+///
+/// Keyed by source address, which under the transparent redirect is the guest
+/// address and therefore the sandbox: it is assigned by burrow and anti-spoofed
+/// in the firewall, so a guest cannot claim another sandbox's budget by forging
+/// one.
+#[derive(Default)]
+struct SourceLimits {
+    counts: std::sync::Mutex<std::collections::HashMap<Ipv4Addr, usize>>,
+}
+
+impl SourceLimits {
+    /// Claims a slot for `source`, or `None` if that sandbox is already at its
+    /// limit.
+    fn acquire(self: &Arc<Self>, source: Ipv4Addr) -> Option<SourceSlot> {
+        let mut counts = self.counts.lock().unwrap();
+        let held = counts.entry(source).or_insert(0);
+        if *held >= MAX_CONNECTIONS_PER_SOURCE {
+            return None;
+        }
+        *held += 1;
+        Some(SourceSlot {
+            limits: Arc::clone(self),
+            source,
+        })
+    }
+}
+
+/// Releases a source's slot when the connection ends, however it ends.
+struct SourceSlot {
+    limits: Arc<SourceLimits>,
+    source: Ipv4Addr,
+}
+
+impl Drop for SourceSlot {
+    fn drop(&mut self) {
+        let mut counts = self.limits.counts.lock().unwrap();
+        // The entry is removed at zero rather than left at zero, so a node
+        // that has served many short-lived sandboxes does not accumulate a map
+        // entry per recycled address.
+        if let std::collections::hash_map::Entry::Occupied(mut entry) = counts.entry(self.source) {
+            *entry.get_mut() -= 1;
+            if *entry.get() == 0 {
+                entry.remove();
+            }
+        }
+    }
+}
 
 pub struct Proxy {
     pub policies: Arc<PolicyTable>,
@@ -55,6 +123,10 @@ pub struct Proxy {
     /// Signs the certificates presented to sandboxes that opted in to having
     /// their TLS inspected. `None` disables inspection entirely.
     pub authority: Option<Arc<inspect::Authority>>,
+    /// This deployment's control-plane addresses, which the firewall denies to
+    /// every sandbox and the proxy must therefore deny too. Kept in step by
+    /// the daemon, which renders the same set into the ruleset.
+    pub denied: Arc<DeniedAddresses>,
 }
 
 impl Proxy {
@@ -62,6 +134,7 @@ impl Proxy {
     /// independently; one sandbox's misbehaviour cannot stall another's.
     pub async fn serve(self: Arc<Self>, listener: TcpListener) {
         let slots = Arc::new(tokio::sync::Semaphore::new(MAX_CONNECTIONS));
+        let per_source = Arc::new(SourceLimits::default());
         loop {
             // Claimed before accepting: at the limit new connections stay in
             // the listen backlog instead of becoming tasks holding buffers.
@@ -76,9 +149,22 @@ impl Proxy {
                     continue;
                 }
             };
+            // Refused rather than queued: the sandbox is over its own budget,
+            // and making it wait would hold the global slot it is not entitled
+            // to. A source that cannot be attributed to a sandbox is dropped,
+            // the same way `handle` refuses to serve one.
+            let source_slot = match peer.ip() {
+                std::net::IpAddr::V4(ip) => per_source.acquire(ip),
+                std::net::IpAddr::V6(_) => None,
+            };
+            let Some(source_slot) = source_slot else {
+                tracing::warn!(%peer, "refusing a connection: source is at its limit");
+                continue;
+            };
             let proxy = Arc::clone(&self);
             tokio::spawn(async move {
                 let _slot = slot;
+                let _source_slot = source_slot;
                 if let Err(err) = proxy.handle(client, peer).await {
                     tracing::debug!(%peer, %err, "proxy connection ended");
                 }
@@ -123,6 +209,17 @@ impl Proxy {
         };
 
         let (policy, mut decision) = self.policies.decide(source_ip, host.as_deref());
+        // Checked on the address alone, before anything about the hostname:
+        // the proxy runs on the host and so sits outside the sandbox chain
+        // that denies these, and a connection here needs no name at all to
+        // reach one. Ahead of the pinning check too, since a control-plane
+        // address a sandbox was legitimately told about is still one it may
+        // not reach.
+        if let std::net::IpAddr::V4(destination) = original.ip()
+            && self.denied.contains(destination)
+        {
+            decision = Decision::Deny("destination is a control-plane address");
+        }
         if hides_destination {
             // The visible name is a cover name, so there is nothing here an
             // allowlist can decide.
@@ -176,11 +273,24 @@ impl Proxy {
                 reason: decision.reason().to_string(),
                 bytes_sent: 0,
                 bytes_received: 0,
+                dropped_records: 0,
             });
             return Ok(());
         }
 
-        let mut upstream = match TcpStream::connect(original).await {
+        // Bounded, because the connection slot and the sandbox's own budget
+        // are held for as long as this takes: a destination that accepts SYNs
+        // and never completes would otherwise hold both until the kernel gave
+        // up, minutes later.
+        let connected = tokio::time::timeout(CONNECT_TIMEOUT, TcpStream::connect(original))
+            .await
+            .unwrap_or_else(|_| {
+                Err(std::io::Error::new(
+                    std::io::ErrorKind::TimedOut,
+                    "upstream did not answer in time",
+                ))
+            });
+        let mut upstream = match connected {
             Ok(stream) => stream,
             Err(err) => {
                 self.audit.record(EgressEvent {
@@ -194,6 +304,7 @@ impl Proxy {
                     reason: format!("upstream connect failed: {err}"),
                     bytes_sent: 0,
                     bytes_received: 0,
+                    dropped_records: 0,
                 });
                 return Err(err);
             }
@@ -238,6 +349,7 @@ impl Proxy {
                         reason: outcome.reason,
                         bytes_sent: outcome.sent,
                         bytes_received: outcome.received,
+                        dropped_records: 0,
                     });
                 }) as Arc<dyn Fn(http2::StreamOutcome) + Send + Sync>
             };
@@ -281,6 +393,7 @@ impl Proxy {
                 reason,
                 bytes_sent: sent,
                 bytes_received: received,
+                dropped_records: 0,
             });
             return Ok(());
         }
@@ -316,6 +429,7 @@ impl Proxy {
                 reason: relayed.refusal.unwrap_or_else(|| "allowed".to_string()),
                 bytes_sent: relayed.sent,
                 bytes_received: relayed.received,
+                dropped_records: 0,
             });
             return Ok(());
         }
@@ -335,6 +449,7 @@ impl Proxy {
             reason: "allowed".into(),
             bytes_sent: sent,
             bytes_received: received,
+            dropped_records: 0,
         });
         Ok(())
     }
@@ -565,12 +680,21 @@ impl Proxy {
             alpn = vec![b"http/1.1".to_vec()];
         }
 
+        // One deadline for both handshakes: they run one after the other on
+        // this task, holding both sockets and the sandbox's connection budget,
+        // so a peer that stalls either half costs the same either way.
+        let deadline = tokio::time::Instant::now() + HANDSHAKE_TIMEOUT;
+
         let server_name = rustls::pki_types::ServerName::try_from(sni.to_string())
             .map_err(|err| format!("{sni} is not a usable server name: {err}"))?;
-        let mut outer = tokio_rustls::TlsConnector::from(inspect::verified_client(alpn))
-            .connect(server_name, upstream)
-            .await
-            .map_err(|err| format!("tls handshake with the server failed: {err}"))?;
+        let mut outer = tokio::time::timeout_at(
+            deadline,
+            tokio_rustls::TlsConnector::from(inspect::verified_client(alpn))
+                .connect(server_name, upstream),
+        )
+        .await
+        .map_err(|_| "tls handshake with the server timed out".to_string())?
+        .map_err(|err| format!("tls handshake with the server failed: {err}"))?;
 
         let negotiated = outer.get_ref().1.alpn_protocol().map(<[u8]>::to_vec);
         let protocol = match negotiated.as_deref() {
@@ -589,10 +713,13 @@ impl Proxy {
         let server_config = authority
             .server_config(sni, protocol)
             .map_err(|err| err.to_string())?;
-        let mut inner = tokio_rustls::TlsAcceptor::from(server_config)
-            .accept(client)
-            .await
-            .map_err(|err| format!("tls handshake with the sandbox failed: {err}"))?;
+        let mut inner = tokio::time::timeout_at(
+            deadline,
+            tokio_rustls::TlsAcceptor::from(server_config).accept(client),
+        )
+        .await
+        .map_err(|_| "tls handshake with the sandbox timed out".to_string())?
+        .map_err(|err| format!("tls handshake with the sandbox failed: {err}"))?;
 
         // Every request in the session is checked, not merely the first, and
         // each is pinned to the name the session was opened for.
@@ -961,15 +1088,14 @@ async fn peek_head(client: &TcpStream, buf: &mut [u8], port: u16) -> usize {
 fn is_classifiable(port: u16, head: &[u8]) -> bool {
     match port {
         443 => {
-            // Not a TLS handshake record at all: no amount of waiting makes it
-            // one, and the parser will say so.
-            if head.first().is_some_and(|&byte| byte != 0x16) {
-                return true;
-            }
-            match head.get(3..5) {
-                Some(len) => head.len() >= 5 + u16::from_be_bytes([len[0], len[1]]) as usize,
-                None => false,
-            }
+            // The whole ClientHello, not merely the first record: a hello may
+            // be split across records, and stopping at the end of the first
+            // one would classify a fragment whose extensions had not arrived,
+            // which is a split the sandbox chooses.
+            //
+            // `Malformed` counts as classifiable: no amount of waiting turns
+            // it into a hello, and the parser will refuse it.
+            !matches!(sni::reassemble_handshake(head), sni::Handshake::Incomplete)
         }
         80 => head.windows(4).any(|window| window == b"\r\n\r\n"),
         _ => !head.is_empty(),
@@ -1047,6 +1173,7 @@ mod tests {
             ),
             resolutions: Arc::new(resolutions::Resolutions::default()),
             authority: None,
+            denied: Arc::new(DeniedAddresses::default()),
         }
     }
 
@@ -1128,8 +1255,7 @@ mod tests {
     /// `Host` alone.
     #[test]
     fn absolute_form_authority_disagreeing_with_host_is_refused() {
-        let head =
-            b"GET http://evil.example/path HTTP/1.1\r\nHost: api.example.com\r\n\r\n";
+        let head = b"GET http://evil.example/path HTTP/1.1\r\nHost: api.example.com\r\n\r\n";
         let allowed = vec!["api.example.com".to_string()];
         let err = check_request(head, &allowed, None, false).unwrap_err();
         assert!(err.contains("does not match Host"), "{err}");
@@ -1141,7 +1267,8 @@ mod tests {
     /// matched.
     #[tokio::test]
     async fn matching_absolute_form_target_is_normalized_before_forwarding() {
-        let request = b"GET http://api.example.com/v1?a=1 HTTP/1.1\r\nHost: api.example.com\r\n\r\n";
+        let request =
+            b"GET http://api.example.com/v1?a=1 HTTP/1.1\r\nHost: api.example.com\r\n\r\n";
         let seen = relayed(request, vec![]).await;
         assert!(seen.starts_with("GET /v1?a=1 HTTP/1.1\r\n"), "{seen}");
         assert!(!seen.contains("http://"), "{seen}");
@@ -1316,5 +1443,90 @@ mod tests {
         .await;
 
         assert_eq!(seen, String::from_utf8_lossy(request));
+    }
+
+    /// The global limit is shared, so a sandbox opening connections in a loop
+    /// would take every slot. Each source gets its own budget on top.
+    #[test]
+    fn one_source_cannot_take_more_than_its_share_of_connections() {
+        let limits = Arc::new(SourceLimits::default());
+        let noisy = Ipv4Addr::new(10, 99, 0, 6);
+        let quiet = Ipv4Addr::new(10, 99, 0, 10);
+
+        let held: Vec<_> = (0..MAX_CONNECTIONS_PER_SOURCE)
+            .map(|n| {
+                limits
+                    .acquire(noisy)
+                    .unwrap_or_else(|| panic!("connection {n} is within the budget"))
+            })
+            .collect();
+        assert!(
+            limits.acquire(noisy).is_none(),
+            "a sandbox past its budget must be refused"
+        );
+        // And the neighbour is unaffected, which is the whole point.
+        assert!(limits.acquire(quiet).is_some());
+
+        // A finished connection gives its slot back.
+        drop(held);
+        assert!(limits.acquire(noisy).is_some());
+    }
+
+    /// The map is keyed by a recycled address, so an entry that outlived its
+    /// connections would accumulate one per sandbox the node has run.
+    #[test]
+    fn a_sources_entry_is_forgotten_once_it_holds_nothing() {
+        let limits = Arc::new(SourceLimits::default());
+        let source = Ipv4Addr::new(10, 99, 0, 6);
+        let a = limits.acquire(source).unwrap();
+        let b = limits.acquire(source).unwrap();
+        assert_eq!(limits.counts.lock().unwrap().get(&source), Some(&2));
+        drop(a);
+        assert_eq!(limits.counts.lock().unwrap().get(&source), Some(&1));
+        drop(b);
+        assert!(limits.counts.lock().unwrap().is_empty());
+    }
+
+    /// The client chooses the record boundaries, so classifying the first
+    /// record alone would let a sandbox make its destination unreadable by
+    /// splitting the hello.
+    #[test]
+    fn a_fragmented_client_hello_is_not_classifiable_until_it_is_whole() {
+        // A minimal hello, refragmented one byte per record.
+        let mut whole = vec![0x16, 0x03, 0x01];
+        let handshake = {
+            let mut body = Vec::new();
+            body.extend_from_slice(&[0x03, 0x03]);
+            body.extend_from_slice(&[0u8; 32]);
+            body.push(0);
+            body.extend_from_slice(&2u16.to_be_bytes());
+            body.extend_from_slice(&[0x13, 0x01]);
+            body.push(1);
+            body.push(0);
+            body.extend_from_slice(&0u16.to_be_bytes()); // no extensions
+            let mut handshake = vec![0x01];
+            handshake.extend_from_slice(&(body.len() as u32).to_be_bytes()[1..]);
+            handshake.extend_from_slice(&body);
+            handshake
+        };
+        whole.extend_from_slice(&(handshake.len() as u16).to_be_bytes());
+        whole.extend_from_slice(&handshake);
+
+        let mut split = Vec::new();
+        for byte in &handshake {
+            split.extend_from_slice(&[0x16, 0x03, 0x01, 0x00, 0x01, *byte]);
+        }
+
+        assert!(is_classifiable(443, &whole));
+        assert!(is_classifiable(443, &split));
+        // Every prefix of the fragmented form is still arriving.
+        for cut in 0..split.len() {
+            assert!(
+                !is_classifiable(443, &split[..cut]),
+                "{cut} bytes of a fragmented hello must not be classified"
+            );
+        }
+        // Something that is not TLS at all needs no waiting.
+        assert!(is_classifiable(443, b"GET / HTTP/1.1\r\n\r\n"));
     }
 }

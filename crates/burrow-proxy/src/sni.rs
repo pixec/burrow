@@ -77,25 +77,108 @@ pub struct ClientHello {
     pub alpn: Vec<String>,
 }
 
+/// The largest TLS record body, from the protocol itself (2^14). A length
+/// field claiming more than this is not a record any peer would have sent.
+const MAX_RECORD: usize = 16_384;
+
+/// How much reassembled handshake is read before giving up.
+///
+/// A ClientHello is a couple of kilobytes, but the record layer would happily
+/// let a sandbox describe a megabyte-long one across sixty records, and
+/// buffering that per connection is a cost the proxy declines to pay.
+const MAX_HANDSHAKE: usize = 32 * 1024;
+
+/// What the record layer has so far.
+#[derive(Debug, PartialEq, Eq)]
+pub enum Handshake {
+    /// One complete handshake message, record framing stripped.
+    Complete(Vec<u8>),
+    /// Well-formed so far, but the message is not all here yet. More bytes may
+    /// change the answer, so a caller reading from a socket should come back.
+    Incomplete,
+    /// Not a TLS handshake, or framing that contradicts itself. No amount of
+    /// waiting makes this parse.
+    Malformed,
+}
+
+/// Reassembles the first handshake message from the TLS record layer.
+///
+/// A ClientHello is a *handshake message*, not a record: the record layer is
+/// free to split one across several records, and a client that wants to be
+/// hard to inspect will. Reading only the first record would find the name in
+/// the common case and miss it whenever the hello was fragmented, so a
+/// sandbox could put the extensions in a second record and make its own
+/// destination unclassifiable on demand.
+///
+/// Every record's declared length is honoured rather than assumed: records are
+/// concatenated by their own framing, so a length that overruns the buffer is
+/// "not here yet" and one that claims more than a record may hold is a lie.
+pub fn reassemble_handshake(buf: &[u8]) -> Handshake {
+    let mut payload: Vec<u8> = Vec::new();
+    let mut pos = 0usize;
+
+    loop {
+        // A handshake message is 1 type byte and a 3-byte length, and once
+        // both are in hand the message's own length says when to stop, whether
+        // or not more records follow.
+        if payload.len() >= 4 {
+            if payload[0] != 0x01 {
+                return Handshake::Malformed; // not a ClientHello
+            }
+            let length = u32::from_be_bytes([0, payload[1], payload[2], payload[3]]) as usize;
+            if length + 4 > MAX_HANDSHAKE {
+                return Handshake::Malformed;
+            }
+            if payload.len() >= length + 4 {
+                payload.truncate(length + 4);
+                return Handshake::Complete(payload);
+            }
+        }
+
+        let Some(header) = buf.get(pos..pos + 5) else {
+            // Not even a full record header: nothing here contradicts a
+            // well-formed hello that has not finished arriving.
+            return if buf.get(pos).is_some_and(|&byte| byte != 0x16) {
+                Handshake::Malformed
+            } else {
+                Handshake::Incomplete
+            };
+        };
+        if header[0] != 0x16 {
+            // Only handshake records carry a ClientHello. Anything else here
+            // is a peer speaking a protocol this parser does not read.
+            return Handshake::Malformed;
+        }
+        let length = u16::from_be_bytes([header[3], header[4]]) as usize;
+        if length == 0 || length > MAX_RECORD {
+            return Handshake::Malformed;
+        }
+        let Some(body) = buf.get(pos + 5..pos + 5 + length) else {
+            return Handshake::Incomplete;
+        };
+        if payload.len() + body.len() > MAX_HANDSHAKE {
+            return Handshake::Malformed;
+        }
+        payload.extend_from_slice(body);
+        pos += 5 + length;
+    }
+}
+
 /// Parses a TLS ClientHello for everything policy needs from it.
 ///
-/// Returns `None` for anything that is not a well-formed ClientHello. Callers
-/// must treat that as "unknown destination", never as "allowed".
+/// Returns `None` for anything that is not a well-formed ClientHello,
+/// including one that has not finished arriving. Callers must treat that as
+/// "unknown destination", never as "allowed".
 pub fn parse_client_hello(buf: &[u8]) -> Option<ClientHello> {
-    let mut r = Reader::new(buf);
-
-    // TLS record header: handshake type, version, length.
-    if r.u8()? != 0x16 {
+    let Handshake::Complete(message) = reassemble_handshake(buf) else {
         return None;
-    }
-    r.u16()?; // legacy record version
-    r.u16()?; // record length
+    };
 
-    // Handshake header: ClientHello, 3-byte length.
-    if r.u8()? != 0x01 {
-        return None;
-    }
-    r.take(3)?;
+    // The handshake message, its own header stripped. Everything below is
+    // bounded by this slice, so a length field inside the hello can overrun
+    // nothing but the message that declared it.
+    let body = message.get(4..)?;
+    let mut r = Reader::new(body);
 
     r.u16()?; // client version
     r.take(32)?; // random
@@ -103,8 +186,15 @@ pub fn parse_client_hello(buf: &[u8]) -> Option<ClientHello> {
     r.skip_u16_prefixed()?; // cipher suites
     r.skip_u8_prefixed()?; // compression methods
 
+    // The extensions block is walked as its own slice rather than by an offset
+    // into the message: an `extensions_len` reaching past the end of the
+    // handshake is a claim about bytes the client never sent, and reading it
+    // against whatever followed in the buffer is how a hello gets parsed one
+    // way here and another way by the server.
     let extensions_len = r.u16()? as usize;
-    let end = r.pos + extensions_len;
+    let extensions = r.take(extensions_len)?;
+    let mut r = Reader::new(extensions);
+    let end = extensions.len();
 
     // Every extension is walked rather than stopping at the first server_name:
     // ECH can appear after it, and missing it would mean trusting a cover name.
@@ -390,5 +480,132 @@ mod tests {
         record.extend_from_slice(&(handshake.len() as u16).to_be_bytes());
         record.extend_from_slice(&handshake);
         record
+    }
+
+    /// Splits a whole record's payload into records of at most `chunk` bytes.
+    fn refragment(record: &[u8], chunk: usize) -> Vec<u8> {
+        let payload = &record[5..];
+        let mut out = Vec::new();
+        for piece in payload.chunks(chunk) {
+            out.extend_from_slice(&[0x16, 0x03, 0x01]);
+            out.extend_from_slice(&(piece.len() as u16).to_be_bytes());
+            out.extend_from_slice(piece);
+        }
+        out
+    }
+
+    /// The client chooses where the record boundaries fall, so the name has to
+    /// be found however it fragmented.
+    #[test]
+    fn a_hello_split_across_two_records_still_names_its_host() {
+        let whole = client_hello("pypi.org");
+        // A boundary in the middle of the extensions block, where a client
+        // trying to hide the name would put one.
+        let split = refragment(&whole, (whole.len() - 5) / 2);
+        assert!(split.len() > whole.len(), "the split must add a header");
+
+        assert_eq!(parse_sni(&split).as_deref(), Some("pypi.org"));
+        // And down to one byte per record, which is legal framing.
+        assert_eq!(
+            parse_sni(&refragment(&whole, 1)).as_deref(),
+            Some("pypi.org")
+        );
+    }
+
+    /// The proxy waits for a hello to finish arriving rather than classifying
+    /// a fragment, so a partial one has to say it is partial rather than parse
+    /// to a name or to a refusal.
+    #[test]
+    fn a_partly_arrived_hello_is_incomplete_rather_than_malformed() {
+        let whole = client_hello("pypi.org");
+        let split = refragment(&whole, 16);
+        for cut in 0..split.len() {
+            match reassemble_handshake(&split[..cut]) {
+                Handshake::Incomplete => {}
+                other => panic!("{cut} bytes of a valid hello read as {other:?}"),
+            }
+            assert_eq!(parse_sni(&split[..cut]), None);
+        }
+        assert!(matches!(
+            reassemble_handshake(&split),
+            Handshake::Complete(_)
+        ));
+    }
+
+    /// A record header that is not a handshake record, or a length no record
+    /// may carry, is a lie rather than a slow arrival: waiting on it would
+    /// hold a connection open for the peek timeout every time.
+    #[test]
+    fn framing_that_contradicts_itself_is_malformed_not_incomplete() {
+        // An application-data record where a handshake belongs.
+        assert_eq!(
+            reassemble_handshake(&[0x17, 0x03, 0x01, 0x00, 0x05, 1, 2, 3, 4, 5]),
+            Handshake::Malformed
+        );
+        // A record claiming more than the 2^14 a record may hold.
+        assert_eq!(
+            reassemble_handshake(&[0x16, 0x03, 0x01, 0xff, 0xff]),
+            Handshake::Malformed
+        );
+        // A complete record whose handshake message is not a ClientHello.
+        let server_hello = [0x16, 0x03, 0x01, 0x00, 0x04, 0x02, 0x00, 0x00, 0x00];
+        assert_eq!(reassemble_handshake(&server_hello), Handshake::Malformed);
+        // Plain HTTP, which is what a misdirected connection looks like.
+        assert_eq!(
+            reassemble_handshake(b"GET / HTTP/1.1\r\n\r\n"),
+            Handshake::Malformed
+        );
+    }
+
+    /// Builds a hello whose `extensions_len` claims `overrun` more bytes than
+    /// the handshake message actually carries. The block is last, so only the
+    /// length field in front of it moves.
+    fn hello_overrunning_its_extensions(host: &str, overrun: u16) -> Vec<u8> {
+        let entry = server_name_extension(host);
+        let block_len = entry.len() + 4;
+        let mut record = client_hello_with(&[(EXT_SERVER_NAME, entry)]);
+        let at = record.len() - block_len - 2;
+        let declared = u16::from_be_bytes([record[at], record[at + 1]]) + overrun;
+        record[at..at + 2].copy_from_slice(&declared.to_be_bytes());
+        record
+    }
+
+    /// `extensions_len` is attacker-supplied. Walking it against whatever
+    /// followed in the read buffer would let the proxy reach a verdict on
+    /// bytes that are not part of this handshake message, and so on a name the
+    /// server will never see. It is bounded by the message's own length.
+    #[test]
+    fn an_extensions_length_past_the_handshake_is_refused() {
+        // With nothing following it, the over-claim is refused.
+        let bare = hello_overrunning_its_extensions("pypi.org", 64);
+        assert_eq!(parse_client_hello(&bare), None);
+
+        // And with the bytes the overrun would have read present in the
+        // buffer, inside a record of their own: still refused, rather than
+        // parsed against bytes the handshake did not declare.
+        let mut with_bait = bare.clone();
+        with_bait.extend_from_slice(&[0x16, 0x03, 0x01, 0x00, 64]);
+        with_bait.extend_from_slice(&[0u8; 64]);
+        assert_eq!(
+            parse_client_hello(&with_bait),
+            None,
+            "extensions must not be read past the handshake message"
+        );
+
+        // The same hello without the lie parses, so the test is about the
+        // overrun and not about the builder.
+        let honest = hello_overrunning_its_extensions("pypi.org", 0);
+        assert_eq!(parse_sni(&honest).as_deref(), Some("pypi.org"));
+    }
+
+    /// A single extension whose length runs past the end of the extensions
+    /// block is the same lie one level down.
+    #[test]
+    fn an_extension_longer_than_the_block_is_refused() {
+        // A server_name extension declaring 200 bytes of body but carrying 2.
+        let mut record = client_hello_with(&[(EXT_SERVER_NAME, vec![0x00, 0x00])]);
+        let at = record.len() - 4;
+        record[at..at + 2].copy_from_slice(&200u16.to_be_bytes());
+        assert_eq!(parse_client_hello(&record), None);
     }
 }

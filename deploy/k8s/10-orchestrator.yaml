@@ -34,9 +34,23 @@ spec:
       labels:
         app: burrow-orchestrator
     spec:
+      # The image runs as 65532 (see deploy/orchestrator.Dockerfile). fsGroup
+      # makes the PVC group-writable by that uid: a freshly provisioned volume
+      # is owned by root, and a non-root process cannot create its database in
+      # it.
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 65532
+        runAsGroup: 65532
+        fsGroup: 65532
+        seccompProfile:
+          type: RuntimeDefault
       containers:
         - name: orchestrator
-          image: ghcr.io/pixec/burrow-orchestrator:latest
+          # Pinned, not :latest: a redeploy should not silently upgrade the
+          # one component holding the sandbox-to-node mapping. Set this to the
+          # release you mean to run.
+          image: ghcr.io/pixec/burrow-orchestrator:0.1.0
           args:
             - --listen
             - 0.0.0.0:7070
@@ -60,9 +74,30 @@ spec:
           ports:
             - name: grpc
               containerPort: 7070
+          # Requests so the pod is not BestEffort, which is the first thing
+          # evicted under memory pressure. The limit is generous against the
+          # request: the store grows with the fleet, and a control plane
+          # OOMKilled mid-write is worse than one using more than its share.
+          resources:
+            requests:
+              cpu: 100m
+              memory: 256Mi
+            limits:
+              memory: 1Gi
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
           volumeMounts:
             - name: data
               mountPath: /var/lib/burrow
+            # readOnlyRootFilesystem leaves nowhere else to write scratch.
+            - name: tmp
+              mountPath: /tmp
+      volumes:
+        - name: tmp
+          emptyDir: {}
   volumeClaimTemplates:
     - metadata:
         name: data

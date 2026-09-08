@@ -67,9 +67,24 @@ the escape hatch if you are stuck on it.
 
 ## Deploy
 
-Replace the two `CHANGE-ME` tokens first. The manifests point at
-`ghcr.io/pixec/...:latest`; pin them to a released version for anything you care
-about, so a redeploy is not a silent upgrade.
+The tokens are not in the manifests, on purpose. Create the namespace and the
+Secret first; without them both workloads stay Pending on a Secret that does
+not exist, rather than running on a token published in this repository.
+
+```sh
+kubectl create namespace burrow
+kubectl -n burrow create secret generic burrow-tokens \
+  --from-literal=api-key="$(openssl rand -hex 32)" \
+  --from-literal=node-token="$(openssl rand -hex 32)"
+```
+
+Keep the two distinct: `api-key` is what tenants present, `node-token` is what
+a node presents to register, and registration decides where exec and logs get
+routed. A leaked tenant key must not be able to enrol a node.
+
+Then label the machines and apply. `00-namespace.yaml` is still applied: it
+carries the Pod Security label the node DaemonSet needs, and is a no-op against
+the namespace you just created.
 
 ```sh
 kubectl label node <machine> burrow.pixec.net/kvm=true
@@ -77,6 +92,10 @@ kubectl apply -f deploy/k8s/00-namespace.yaml
 kubectl apply -f deploy/k8s/10-orchestrator.yaml
 kubectl apply -f deploy/k8s/20-node.yaml
 ```
+
+Both manifests pin `ghcr.io/pixec/...:0.1.0`. Change that to the release you
+want before applying; they are deliberately not `:latest`, so a redeploy is
+never a silent upgrade of the control plane or a fleet-wide hypervisor bump.
 
 Give each machine a kernel. Templates are built from OCI images, which carry a
 userland and no kernel, so the node supplies one. The Firecracker CI kernels are

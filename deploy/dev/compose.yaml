@@ -47,7 +47,9 @@ services:
     image: debian:bookworm-slim
     command: /burrow/bin/burrow-orchestrator --data-dir /var/lib/burrow --listen 0.0.0.0:7070 --api-key dev-token --node-token dev-node-token --otlp-endpoint http://otel-collector:4317
     ports:
-      - "7070:7070"
+      # Loopback only, like the registry above: the compose network is what
+      # the nodes use, and the API key here is the committed `dev-token`.
+      - "127.0.0.1:7070:7070"
     # The whole release dir is mounted, not individual binaries: bind-mounting
     # a single file pins its inode, so rebuilt binaries would never appear.
     volumes:
@@ -76,7 +78,10 @@ services:
       # Opt-in, and off by default. A node without one has no hostname routing,
       # and its published ports are reachable at the node address alone. A real
       # deployment points a wildcard record for the node's domain at the node.
-      - "7081:7081"
+      #
+      # Loopback only: this fronts whatever the sandboxes are serving, and a
+      # dev harness should not put that on every interface of the host.
+      - "127.0.0.1:7081:7081"
     depends_on:
       - orchestrator
     # Firecracker needs KVM; guest NICs need /dev/net/tun; creating taps and
@@ -121,8 +126,9 @@ services:
     command: /burrow/bin/burrowd serve --orchestrator http://orchestrator:7070 --listen 0.0.0.0:7071 --advertise node2:7071 --node-id node_local_docker_2 --label rack=b7 --label tier=dedicated --mesh-endpoint node2:51820 --api-key dev-token --node-token dev-node-token --otlp-endpoint http://otel-collector:4317 --agent-binary /burrow/bin/burrow-agent --insecure-registry test-registry:5000 --jailer /usr/local/bin/jailer --edge-listen 0.0.0.0:7081 --edge-domain node2.sandbox.local
     ports:
       # node2's edge, on its own domain: an edge serves only the sandboxes its
-      # node holds, so each node needs a wildcard of its own.
-      - "7082:7081"
+      # node holds, so each node needs a wildcard of its own. Loopback only,
+      # for the same reason as node's.
+      - "127.0.0.1:7082:7081"
     depends_on:
       - orchestrator
     # Firecracker needs KVM; guest NICs need /dev/net/tun; creating taps and

@@ -75,8 +75,7 @@ fn sync_protos(check: bool) -> anyhow::Result<()> {
             }
             stale.push(to.strip_prefix(&root).unwrap_or(&to).display().to_string());
             if !check {
-                std::fs::write(&to, &want)
-                    .with_context(|| format!("writing {}", to.display()))?;
+                std::fs::write(&to, &want).with_context(|| format!("writing {}", to.display()))?;
             }
         }
     }

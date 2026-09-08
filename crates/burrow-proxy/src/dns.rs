@@ -19,7 +19,98 @@ use crate::policy::PolicyTable;
 /// Bounded well above a normal query; anything larger is not something to
 /// forward blindly.
 const MAX_PACKET: usize = 4096;
+/// Receive buffer for an upstream answer.
+///
+/// The whole 16-bit DNS length, because a `recv` on a UDP socket discards
+/// whatever does not fit and reports only what did. A smaller buffer would cut
+/// a large answer, a fat TXT set or a DNSSEC-signed response, down to a packet
+/// handed to the guest with no TC bit set, which is a resolver claiming to
+/// have answered completely. There is no TCP fallback to recover with either:
+/// the firewall opens UDP/53 to the resolver and nothing else.
+const MAX_ANSWER: usize = 65_535;
 const UPSTREAM_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// Queries being forwarded at once, across every sandbox.
+///
+/// Each forward holds an ephemeral UDP socket for up to [`UPSTREAM_TIMEOUT`],
+/// so the ceiling on file descriptors is this number and not the rate at which
+/// sandboxes can send datagrams. Without it a sandbox emitting queries in a
+/// loop exhausts the process's descriptors, which takes the proxy and the
+/// resolver down for every sandbox on the node.
+const MAX_INFLIGHT_FORWARDS: usize = 256;
+
+/// Sustained queries per second one sandbox may forward, and the burst it may
+/// do it in.
+///
+/// A token bucket rather than a flat cap: resolution is bursty, a page load or
+/// a package install fans out to dozens of names at once, and refusing those
+/// would break ordinary work. What it stops is the *sustained* flood, which is
+/// the shape of both a descriptor exhaustion attempt and of using the question
+/// name as an exfiltration channel.
+const QUERIES_PER_SECOND: f64 = 32.0;
+const QUERY_BURST: f64 = 128.0;
+/// Buckets kept for sources that have gone quiet, before they are forgotten.
+///
+/// Addresses are recycled between sandboxes, so an entry per address ever seen
+/// would grow without bound on a busy node.
+const BUCKET_IDLE: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// What one source has spent of its query budget.
+struct Bucket {
+    tokens: f64,
+    last: std::time::Instant,
+    /// Queries dropped since the last warning, so a flood produces a log line
+    /// occasionally rather than one per datagram.
+    dropped: u64,
+}
+
+/// The resolver's share of the node, split so one sandbox cannot spend it all.
+#[derive(Default)]
+struct Limits {
+    buckets: std::sync::Mutex<std::collections::HashMap<Ipv4Addr, Bucket>>,
+}
+
+impl Limits {
+    /// Whether `source` may forward one more query now.
+    fn allow(&self, source: Ipv4Addr) -> bool {
+        let now = std::time::Instant::now();
+        let mut buckets = self.buckets.lock().unwrap();
+
+        // Pruned here rather than on a timer: the map is only ever touched
+        // from this path, and a sandbox that stopped asking has nothing worth
+        // remembering.
+        if buckets.len() > 1024 {
+            buckets.retain(|_, bucket| now.duration_since(bucket.last) < BUCKET_IDLE);
+        }
+
+        let bucket = buckets.entry(source).or_insert(Bucket {
+            tokens: QUERY_BURST,
+            last: now,
+            dropped: 0,
+        });
+        let elapsed = now.duration_since(bucket.last).as_secs_f64();
+        bucket.last = now;
+        bucket.tokens = (bucket.tokens + elapsed * QUERIES_PER_SECOND).min(QUERY_BURST);
+
+        if bucket.tokens >= 1.0 {
+            bucket.tokens -= 1.0;
+            return true;
+        }
+        bucket.dropped += 1;
+        // Dropped without a reply and without an audit record: a record per
+        // over-limit query would be a second flood, through the audit queue,
+        // evicting the records of every other sandbox on the node. The count
+        // is what an operator needs, and it is logged.
+        if bucket.dropped.is_power_of_two() {
+            tracing::warn!(
+                %source,
+                dropped = bucket.dropped,
+                "dns queries dropped: source is over its rate limit"
+            );
+        }
+        false
+    }
+}
 
 pub struct Resolver {
     pub policies: Arc<PolicyTable>,
@@ -37,7 +128,12 @@ impl Resolver {
     /// Serves until the socket fails.
     pub async fn serve(self: Arc<Self>, socket: UdpSocket) {
         let socket = Arc::new(socket);
-        let mut buf = vec![0u8; MAX_PACKET];
+        // Received into the full datagram size so that an oversized query is
+        // seen to be oversized rather than silently cut down to something that
+        // parses differently here than it would upstream.
+        let mut buf = vec![0u8; MAX_ANSWER];
+        let limits = Arc::new(Limits::default());
+        let forwards = Arc::new(tokio::sync::Semaphore::new(MAX_INFLIGHT_FORWARDS));
 
         loop {
             let (len, from) = match socket.recv_from(&mut buf).await {
@@ -47,24 +143,44 @@ impl Resolver {
                     continue;
                 }
             };
+            if len > MAX_PACKET {
+                tracing::debug!(%from, len, "dropping an oversized dns query");
+                continue;
+            }
 
             let query = buf[..len].to_vec();
             let resolver = Arc::clone(&self);
             let socket = Arc::clone(&socket);
+            let limits = Arc::clone(&limits);
+            let forwards = Arc::clone(&forwards);
             // Each query is independent; a slow upstream must not stall the
             // whole resolver.
             tokio::spawn(async move {
-                resolver.handle(query, from, socket).await;
+                resolver
+                    .handle(query, from, socket, &limits, &forwards)
+                    .await;
             });
         }
     }
 
-    async fn handle(&self, query: Vec<u8>, from: SocketAddr, socket: Arc<UdpSocket>) {
+    async fn handle(
+        &self,
+        query: Vec<u8>,
+        from: SocketAddr,
+        socket: Arc<UdpSocket>,
+        limits: &Limits,
+        forwards: &Arc<tokio::sync::Semaphore>,
+    ) {
         let name = parse_question(&query);
         let source_ip = match from.ip() {
             std::net::IpAddr::V4(ip) => ip,
             std::net::IpAddr::V6(_) => return,
         };
+        // Before anything is parsed, logged or recorded, so a flood costs this
+        // one lookup and nothing downstream of it.
+        if !limits.allow(source_ip) {
+            return;
+        }
         // `.internal` is burrow's zone, answered from the directory and never
         // forwarded: a name that leaked upstream would both fail and tell a
         // public resolver what the fleet is called.
@@ -81,7 +197,7 @@ impl Resolver {
         let answer = if internal {
             Some(self.answer_internal(&query, source_ip, &name))
         } else if decision.allowed() {
-            self.forward(&query).await
+            self.forward(&query, forwards).await
         } else {
             // REFUSED rather than a forged NXDOMAIN: the name may well exist,
             // and saying so is the honest answer to "you may not ask".
@@ -127,6 +243,7 @@ impl Resolver {
             },
             bytes_sent: query.len() as u64,
             bytes_received: answer.as_ref().map(|a| a.len() as u64).unwrap_or(0),
+            dropped_records: 0,
         });
 
         if let Some(answer) = answer
@@ -148,7 +265,21 @@ impl Resolver {
         }
     }
 
-    async fn forward(&self, query: &[u8]) -> Option<Vec<u8>> {
+    async fn forward(
+        &self,
+        query: &[u8],
+        forwards: &Arc<tokio::sync::Semaphore>,
+    ) -> Option<Vec<u8>> {
+        // One descriptor per in-flight forward, held for up to
+        // `UPSTREAM_TIMEOUT`. Claimed without waiting: a query that has to
+        // queue for a slot has already lost the client's patience, and the
+        // caller records the refusal as an upstream failure, which is what it
+        // is.
+        let Ok(_slot) = forwards.try_acquire() else {
+            tracing::warn!("dns forward refused: too many queries already in flight");
+            return None;
+        };
+
         // An ephemeral socket per query keeps replies unambiguous. It is
         // `connect`ed to the upstream so the kernel drops any datagram from a
         // different source outright, and every datagram that does get through
@@ -163,7 +294,10 @@ impl Resolver {
         socket.send(query).await.ok()?;
 
         let deadline = tokio::time::Instant::now() + UPSTREAM_TIMEOUT;
-        let mut buf = vec![0u8; MAX_PACKET];
+        // The full datagram size: see [`MAX_ANSWER`]. A short buffer would
+        // hand the guest a truncated answer with no TC bit and no TCP to fall
+        // back to.
+        let mut buf = vec![0u8; MAX_ANSWER];
         loop {
             let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
             if remaining.is_zero() {
@@ -474,5 +608,72 @@ mod tests {
         // 12 header + (1+1)+(1+1)+(1+8) labels + 1 root + 4 = 30
         assert_eq!(question_end(&query), Some(query.len()));
         assert_eq!(question_end(&[0u8; 12]), None);
+    }
+
+    /// A sandbox emitting queries in a loop would otherwise exhaust the
+    /// process's descriptors, taking the resolver down for every sandbox on
+    /// the node. The burst is generous but finite, and it is its own.
+    #[test]
+    fn one_source_can_burst_but_not_flood() {
+        let limits = Limits::default();
+        let noisy = Ipv4Addr::new(10, 99, 0, 6);
+        let quiet = Ipv4Addr::new(10, 99, 0, 10);
+
+        for n in 0..QUERY_BURST as usize {
+            assert!(limits.allow(noisy), "query {n} is within the burst");
+        }
+        assert!(!limits.allow(noisy), "the burst must be finite");
+        // The neighbour's budget is untouched, which is the point of keying
+        // this by source at all.
+        assert!(limits.allow(quiet));
+    }
+
+    /// The bucket refills, or a sandbox that burst once would be refused for
+    /// the rest of its life.
+    #[test]
+    fn a_spent_budget_refills_over_time() {
+        let limits = Limits::default();
+        let source = Ipv4Addr::new(10, 99, 0, 6);
+        for _ in 0..QUERY_BURST as usize {
+            assert!(limits.allow(source));
+        }
+        assert!(!limits.allow(source));
+
+        // Rewind the bucket's clock rather than sleeping: one second of
+        // refill is QUERIES_PER_SECOND more queries.
+        {
+            let mut buckets = limits.buckets.lock().unwrap();
+            let bucket = buckets.get_mut(&source).unwrap();
+            bucket.last -= std::time::Duration::from_secs(1);
+        }
+        for n in 0..QUERIES_PER_SECOND as usize {
+            assert!(limits.allow(source), "refilled query {n}");
+        }
+        assert!(!limits.allow(source), "refill must not exceed the rate");
+    }
+
+    /// Addresses are recycled, so a bucket per address ever seen would grow
+    /// without bound on a long-lived node.
+    #[test]
+    fn buckets_for_sources_that_went_quiet_are_forgotten() {
+        let limits = Limits::default();
+        for n in 0..1200u32 {
+            limits.allow(Ipv4Addr::from(n.to_be_bytes()));
+        }
+        {
+            // Age every bucket past the idle window, then touch one more
+            // source to trigger the prune.
+            let mut buckets = limits.buckets.lock().unwrap();
+            for bucket in buckets.values_mut() {
+                bucket.last -= BUCKET_IDLE * 2;
+            }
+        }
+        limits.allow(Ipv4Addr::new(10, 99, 0, 6));
+        let buckets = limits.buckets.lock().unwrap();
+        assert_eq!(
+            buckets.len(),
+            1,
+            "only the live source should still have a bucket"
+        );
     }
 }

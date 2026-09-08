@@ -206,8 +206,10 @@ pub async fn build(
         let _ = tx.send(Err(status)).await;
         return;
     }
-    // Any snapshot here was captured on the rootfs this build just replaced.
-    manager.invalidate_warm(&request.name).await;
+    // Nothing to invalidate here: every rootfs this build published, the
+    // `-base` image an OCI import leaves behind included, discarded its own
+    // warm snapshot as it was renamed into place.
+    //
     // Whoever just built a template is about to create from it, and a template
     // with no snapshot cold-boots.
     manager.warm_in_background(request.name.clone(), Default::default());
@@ -239,6 +241,7 @@ async fn run_build(
             format!("{}-base", request.name)
         };
         from_image::import(
+            manager,
             data_dir,
             &base,
             &request.from_image,
@@ -258,6 +261,10 @@ async fn run_build(
     } else {
         &request.from
     };
+    // The base names a directory under `images/` just as the target does, and
+    // it is a caller's string on the `request.from` path: unvalidated, a `..`
+    // in it would have the build read its rootfs from anywhere on the node.
+    validate_name(from)?;
     if !tokio::fs::try_exists(templates_dir(data_dir).join(from).join("rootfs.ext4"))
         .await
         .unwrap_or(false)
@@ -434,7 +441,7 @@ async fn build_in_sandbox(
     let bytes = download_to(manager, build_id, EXPORT_PATH, &tar_path).await?;
     tracing::info!(build = build_id, bytes, "captured build filesystem");
 
-    let result = assemble_image(data_dir, &staging, &tar_path, &request.name, bytes).await;
+    let result = assemble_image(manager, data_dir, &staging, &tar_path, &request.name, bytes).await;
     let _ = tokio::fs::remove_dir_all(&staging).await;
     let size_bytes = result?;
 
@@ -449,6 +456,7 @@ async fn build_in_sandbox(
 
 /// Unpacks the captured tar and turns it into a bootable image.
 async fn assemble_image(
+    manager: &SandboxManager,
     data_dir: &Path,
     staging: &Path,
     tar_path: &Path,
@@ -515,6 +523,10 @@ async fn assemble_image(
     tokio::fs::rename(&pending, &final_path)
         .await
         .map_err(|err| Status::internal(format!("publishing image: {err}")))?;
+    // Paired with the rename, for the reason in [`from_image::import`]: the
+    // old snapshot's memory image is only valid over the rootfs it was
+    // captured on, and that rootfs is gone as of the line above.
+    manager.invalidate_warm(name).await;
 
     let size = tokio::fs::metadata(&final_path)
         .await
@@ -677,6 +689,10 @@ pub mod distribute {
     /// Describes a local template by content, storing its artifacts as blobs
     /// on the way so a later fetch has something to serve.
     pub async fn manifest(data_dir: &Path, name: &str) -> Result<nodepb::TemplateManifest, Status> {
+        // The name arrives from a peer asking what this node holds, and it
+        // becomes a path here as surely as it does on the receiving side, where
+        // `pull` already refuses one that escapes.
+        super::validate_name(name)?;
         let dir = super::templates_dir(data_dir).join(name);
         if !tokio::fs::try_exists(dir.join("rootfs.ext4"))
             .await
@@ -852,6 +868,9 @@ pub mod distribute {
         )
     }
 
+    /// Longest a peer may go without sending the next chunk of a blob.
+    const BLOB_CHUNK_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
+
     async fn fetch_blob(
         client: &mut PeerClient,
         store: &BlobStore,
@@ -869,7 +888,18 @@ pub mod distribute {
             .await
             .map_err(|err| Status::internal(format!("staging blob: {err}")))?;
         let mut bytes = 0u64;
-        while let Some(chunk) = stream.message().await? {
+        // Per chunk, not for the transfer as a whole: a rootfs is gigabytes and
+        // may legitimately take minutes, but a peer that opens the stream and
+        // then says nothing must not hold a fetch open for the life of the
+        // node.
+        while let Some(chunk) = tokio::time::timeout(BLOB_CHUNK_TIMEOUT, stream.message())
+            .await
+            .map_err(|_| {
+                Status::deadline_exceeded(format!(
+                    "peer sent nothing for {BLOB_CHUNK_TIMEOUT:?} while serving blob {digest}"
+                ))
+            })??
+        {
             bytes += chunk.data.len() as u64;
             writer
                 .write(&chunk.data)
@@ -1101,6 +1131,52 @@ pub mod layers {
         tokio::fs::rename(&temp, index.join(key)).await
     }
 
+    /// Drops index entries older than `max_age` and names what is left.
+    ///
+    /// Age is the only measure available: an entry carries no record of when it
+    /// was last useful, and its own mtime is when the layer was recorded.
+    ///
+    /// The returned digests are the ones still referenced, which is what keeps
+    /// [`BlobStore::collect_garbage`] from removing a layer that is still
+    /// cached.
+    pub async fn prune(
+        data_dir: &Path,
+        max_age: std::time::Duration,
+    ) -> (usize, std::collections::HashSet<String>) {
+        let index = index_dir(data_dir);
+        let Ok(mut entries) = tokio::fs::read_dir(&index).await else {
+            return (0, std::collections::HashSet::new());
+        };
+        let mut removed = 0;
+        let mut referenced = std::collections::HashSet::new();
+        while let Ok(Some(entry)) = entries.next_entry().await {
+            let path = entry.path();
+            let expired = tokio::fs::metadata(&path)
+                .await
+                .ok()
+                .and_then(|meta| meta.modified().ok())
+                .and_then(|at| at.elapsed().ok())
+                // An unreadable timestamp reads as "recent", so an entry is
+                // never dropped on the strength of a failed stat.
+                .is_some_and(|elapsed| elapsed > max_age);
+            if expired {
+                if tokio::fs::remove_file(&path).await.is_ok() {
+                    removed += 1;
+                }
+                continue;
+            }
+            // A surviving entry keeps its blob alive, half-written temporaries
+            // included: one of those names a digest a concurrent `record` is
+            // about to publish.
+            if let Ok(recorded) = tokio::fs::read_to_string(&path).await
+                && let Some(digest) = Digest::parse(recorded.trim())
+            {
+                referenced.insert(digest.to_string());
+            }
+        }
+        (removed, referenced)
+    }
+
     /// How many leading steps are already cached, and the disk to resume from.
     ///
     /// Returns the *longest* cached prefix, because layers are cumulative:
@@ -1211,6 +1287,34 @@ mod layer_tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// An entry that survives keeps its blob alive; one past its retention
+    /// takes the blob with it.
+    #[tokio::test]
+    async fn old_index_entries_are_dropped_and_the_rest_keep_their_blobs() {
+        let dir = std::env::temp_dir().join(format!("burrow-prune-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let scratch = dir.join("scratch.ext4");
+        tokio::fs::write(&scratch, b"layer contents").await.unwrap();
+
+        let key = layers::key(&base('a'), &steps(&["one"]));
+        layers::record(&dir, &key, &scratch).await.unwrap();
+
+        // Nothing is old yet, and the surviving entry names the blob that must
+        // therefore survive with it.
+        let (removed, referenced) = layers::prune(&dir, std::time::Duration::from_secs(3600)).await;
+        assert_eq!(removed, 0);
+        assert_eq!(referenced.len(), 1);
+        assert!(layers::lookup(&dir, &key).await.is_some());
+
+        // Past its retention it goes, and nothing refers to its blob any more.
+        let (removed, referenced) = layers::prune(&dir, std::time::Duration::ZERO).await;
+        assert_eq!(removed, 1);
+        assert!(referenced.is_empty());
+        assert!(layers::lookup(&dir, &key).await.is_none());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// Layers are cumulative, so the longest cached prefix is the one to resume
     /// from, and a gap ends the run because a later layer was built from a base
     /// this node does not have.
@@ -1280,8 +1384,15 @@ pub mod from_image {
     const REQUIRED_DIRS: [&str; 7] = ["proc", "sys", "dev", "tmp", "run", "scratch", "usr/bin"];
 
     /// Pulls an image, converts it, and publishes it as a template.
+    ///
+    /// Takes the manager because publishing a rootfs invalidates whatever warm
+    /// snapshot stood over the old one, and that has to happen with the rename
+    /// rather than at the end of the caller's build: an import that publishes
+    /// `<name>-base` and then fails would leave the base warm over a rootfs the
+    /// snapshot was never captured on.
     #[allow(clippy::too_many_arguments)]
     pub async fn import(
+        manager: &crate::sandbox::SandboxManager,
         data_dir: &Path,
         name: &str,
         image: &str,
@@ -1336,7 +1447,7 @@ pub mod from_image {
             .map_err(|err| Status::internal(format!("installing the agent: {err}")))?;
         set_executable(&rootdir.join("usr/bin/burrow-agent")).await?;
 
-        let outcome = assemble(data_dir, &rootdir, name, &pulled.environment, tx).await;
+        let outcome = assemble(manager, data_dir, &rootdir, name, &pulled.environment, tx).await;
         let _ = tokio::fs::remove_dir_all(&staging).await;
         outcome
     }
@@ -1353,6 +1464,7 @@ pub mod from_image {
     }
 
     async fn assemble(
+        manager: &crate::sandbox::SandboxManager,
         data_dir: &Path,
         rootdir: &Path,
         name: &str,
@@ -1406,6 +1518,9 @@ pub mod from_image {
         tokio::fs::rename(&pending, target.join("rootfs.ext4"))
             .await
             .map_err(|err| Status::internal(format!("publishing image: {err}")))?;
+        // Paired with the rename: a warm snapshot of the previous rootfs would
+        // restore a guest onto the disk that just replaced it.
+        manager.invalidate_warm(name).await;
 
         let size_bytes = tokio::fs::metadata(target.join("rootfs.ext4"))
             .await

@@ -26,6 +26,8 @@ use tonic::Status;
 
 use burrow_vmm::{DriveSpec, MicroVm, MicroVmSpec, NetSpec};
 
+use crate::sandbox::NodeConfig;
+
 /// Files that make up a template's warm snapshot.
 const WARM_DIR: &str = "warm";
 /// Where a rebuild is assembled before it is swapped in.
@@ -258,17 +260,21 @@ pub async fn copy_sparse(source: &Path, dest: &Path) -> std::io::Result<()> {
 /// The warm VM runs on a fixed tap of its own. It never carries a policy or
 /// serves anyone: its only job is to reach the point where a sandbox would be
 /// ready, and stop there.
-#[allow(clippy::too_many_arguments)]
+///
+/// It runs under the node's confinement all the same, taking the jailer, the
+/// cgroup root and the resource limits straight off [`NodeConfig`] the way
+/// `SandboxManager::build_spec` does. A warm build boots a tenant's own image
+/// and runs its init: exempting it would have the one VM on the node that
+/// nobody is watching be the only one running unjailed and uncapped.
 pub async fn build_warm_snapshot(
-    templates_dir: &Path,
+    config: &NodeConfig,
     template: &str,
-    firecracker_bin: &Path,
-    extra_boot_args: &str,
-    agent_timeout: std::time::Duration,
     scratch_mib: u32,
     shape: Shape,
     trust: &Trust,
 ) -> Result<u64, Status> {
+    let templates_dir = config.templates_dir();
+    let agent_timeout = config.agent_timeout;
     // Defence in depth: the name becomes a directory under `templates_dir` and
     // this function removes and recreates it, so a caller that skipped
     // validation must not be able to point it at an arbitrary host path.
@@ -289,21 +295,48 @@ pub async fn build_warm_snapshot(
     // Assembled beside the live snapshot and swapped in at the end. Rebuilding
     // in place would delete the files out from under a create that has already
     // decided to restore from them.
-    let live = warm_dir(templates_dir, template);
-    let dir = warm_staging_dir(templates_dir, template);
+    let live = warm_dir(&templates_dir, template);
+    let dir = warm_staging_dir(&templates_dir, template);
     let _ = tokio::fs::remove_dir_all(&dir).await;
     tokio::fs::create_dir_all(&dir)
         .await
         .map_err(|err| Status::internal(format!("warm dir: {err}")))?;
 
+    // Under the jailer the VM's files have to live in the chroot the jailer
+    // builds, which is fixed by the vm id and is not the staging directory the
+    // snapshot is published from. So the VM runs there and its products are
+    // moved into the staging directory afterwards; without the jailer the two
+    // are the same place and nothing moves.
+    let vm_id = format!("warm-{template}");
+    let run_dir = match &config.jail {
+        Some(jail) => jail.chroot_for(&vm_id),
+        None => dir.clone(),
+    };
+    if run_dir != dir {
+        let _ = tokio::fs::remove_dir_all(&run_dir).await;
+        tokio::fs::create_dir_all(&run_dir)
+            .await
+            .map_err(|err| Status::internal(format!("warm chroot: {err}")))?;
+    }
+
     for name in ["vmlinux", "rootfs.ext4"] {
-        tokio::fs::hard_link(template_dir.join(name), dir.join(name))
+        tokio::fs::hard_link(template_dir.join(name), run_dir.join(name))
             .await
             .map_err(|err| Status::internal(format!("staging {name}: {err}")))?;
     }
-    crate::sandbox::create_scratch(&dir.join("scratch.ext4"), scratch_mib)
+    crate::sandbox::create_scratch(&run_dir.join("scratch.ext4"), scratch_mib)
         .await
         .map_err(|err| Status::internal(format!("warm scratch: {err}")))?;
+    if let Some(jail) = &config.jail {
+        // The kernel and rootfs are hard links into the template's own
+        // directory and are left alone for the reason
+        // [`crate::sandbox::grant_to_jail`] gives; the scratch disk is this
+        // build's own and has to be writable by the uid the VMM drops to.
+        let shared = ["vmlinux".to_string(), "rootfs.ext4".to_string()].into();
+        crate::sandbox::grant_to_jail(&run_dir, jail, &shared)
+            .await
+            .map_err(|err| Status::internal(format!("preparing the warm jail: {err}")))?;
+    }
 
     // A throwaway lease: the address only has to be valid enough for the guest
     // to finish booting, and every clone is re-addressed on resume anyway.
@@ -313,11 +346,11 @@ pub async fn build_warm_snapshot(
         .await
         .map_err(|err| Status::internal(format!("warm tap: {err}")))?;
 
-    let mut spec = MicroVmSpec::new(format!("warm-{template}"), &dir);
+    let mut spec = MicroVmSpec::new(vm_id.clone(), &run_dir);
     // Taken under the transport it will be restored under: a snapshot does not
     // cross between PCI and MMIO.
     spec.enable_pci = true;
-    spec.firecracker_bin = firecracker_bin.to_path_buf();
+    spec.firecracker_bin = config.firecracker_bin.clone();
     spec.kernel = "vmlinux".into();
     // Baked into the snapshot: a restore takes its machine configuration from
     // here, not from what a later caller asks for.
@@ -336,11 +369,9 @@ pub async fn build_warm_snapshot(
         "{} root=/dev/vda ro init=/usr/bin/burrow-agent {} {}",
         burrow_vmm::DEFAULT_BOOT_ARGS,
         lease.kernel_ip_arg(),
-        extra_boot_args
+        config.extra_boot_args
     );
-    // The warm VM is transient and shares the node with real sandboxes only
-    // briefly, so it takes no cgroup of its own.
-    spec.cgroup_root = None;
+    apply_confinement(&mut spec, config, shape);
 
     let outcome = snapshot_when_ready(spec, agent_timeout, &lease, trust).await;
     burrow_net::tap::delete(WARM_TAP).await;
@@ -350,10 +381,14 @@ pub async fn build_warm_snapshot(
             // Restore the snapshot once, purely to learn which pages a guest
             // reaches for. Doing it here costs one boot at warm time and saves
             // thousands of faults on every create afterwards.
-            if let Err(err) =
-                profile_restore(&dir, firecracker_bin, agent_timeout, shape, trust).await
-            {
+            if let Err(err) = profile_restore(&vm_id, &run_dir, config, shape, trust).await {
                 tracing::warn!(template, %err, "could not record a prefetch plan");
+            }
+            if run_dir != dir
+                && let Err(err) = collect_products(&run_dir, &dir).await
+            {
+                let _ = tokio::fs::remove_dir_all(&dir).await;
+                return Err(err);
             }
             // Shape first, format last: `format` is the commit marker that
             // makes a snapshot warm, and one that is warm without a shape can
@@ -388,9 +423,80 @@ pub async fn build_warm_snapshot(
             // A partial warm snapshot would be picked up by the next create.
             // The live one is left alone: it is still usable.
             let _ = tokio::fs::remove_dir_all(&dir).await;
+            if run_dir != dir {
+                let _ = tokio::fs::remove_dir_all(&run_dir).await;
+            }
             Err(err)
         }
     }
+}
+
+/// Gives a warm VM the same jail, cgroup and limits a sandbox of this shape
+/// would get.
+///
+/// Kept beside the two specs that need it rather than derived from a sandbox's,
+/// because a warm VM has no policy and no lease to build one from; what it
+/// shares with a sandbox is exactly the confinement, and that is what is copied.
+fn apply_confinement(spec: &mut MicroVmSpec, config: &NodeConfig, shape: Shape) {
+    spec.jail = config.jail.clone();
+    spec.cgroup_root = config.cgroup_root.clone();
+    spec.require_limits = config.require_resource_limits;
+    spec.limits = burrow_vmm::Limits {
+        cpus: shape.vcpus,
+        // The same headroom over guest memory a sandbox gets, and for the same
+        // reason: too tight and firecracker itself is what the kernel kills.
+        memory_mib: shape.mem_mib + crate::sandbox::VMM_MEMORY_HEADROOM_MIB,
+        pids_max: 0,
+    };
+}
+
+/// Moves what the jailed build produced into the directory it is published
+/// from, and gives it back to the daemon.
+///
+/// The files come out owned by the uid the VMM dropped to. A warm snapshot is
+/// hard-linked into every sandbox restored from it and is never rewritten, so
+/// leaving it owned by that uid would make one shared memory image writable by
+/// every jailed VMM on the node, the very thing
+/// [`crate::sandbox::grant_to_jail`] refuses to do for a template's rootfs.
+/// Ownership goes back to whoever owns the staging directory, which is the
+/// daemon, leaving the files readable by the jail and writable by nobody in it.
+async fn collect_products(run_dir: &Path, dir: &Path) -> Result<(), Status> {
+    use std::os::unix::fs::MetadataExt as _;
+
+    let owner = tokio::fs::metadata(dir)
+        .await
+        .map_err(|err| Status::internal(format!("reading the warm staging dir: {err}")))?;
+    let (uid, gid) = (owner.uid(), owner.gid());
+
+    for name in [
+        burrow_vmm::SNAPSHOT_FILE,
+        burrow_vmm::SNAPSHOT_MEM_FILE,
+        "scratch.ext4",
+    ] {
+        tokio::fs::rename(run_dir.join(name), dir.join(name))
+            .await
+            .map_err(|err| Status::internal(format!("collecting {name}: {err}")))?;
+    }
+    // Optional: a build whose profiling pass failed simply has no plan.
+    let plan = run_dir.join(PREFETCH_PLAN);
+    if tokio::fs::try_exists(&plan).await.unwrap_or(false) {
+        let _ = tokio::fs::rename(&plan, dir.join(PREFETCH_PLAN)).await;
+    }
+
+    let collected = dir.to_path_buf();
+    tokio::task::spawn_blocking(move || {
+        for entry in std::fs::read_dir(&collected)?.flatten() {
+            std::os::unix::fs::chown(entry.path(), Some(uid), Some(gid))?;
+        }
+        Ok::<(), std::io::Error>(())
+    })
+    .await
+    .map_err(|err| Status::internal(format!("chown did not run: {err}")))?
+    .map_err(|err| Status::internal(format!("reclaiming the warm snapshot: {err}")))?;
+
+    // The chroot itself is the jailer's; what was worth keeping is out of it.
+    let _ = tokio::fs::remove_dir_all(run_dir).await;
+    Ok(())
 }
 
 /// Drives the agent through the paths a clone will take on create.
@@ -402,8 +508,9 @@ async fn exercise_agent(
     vm: &MicroVm,
     lease: &burrow_net::ipam::Lease,
     trust: &Trust,
+    agent_timeout: std::time::Duration,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    let mut agent = crate::agentconn::connect(vm.vsock_uds_path()).await?;
+    let mut agent = crate::agentconn::connect(vm.vsock_uds_path(), agent_timeout).await?;
     agent
         .handshake(crate::agentconn::handshake_full(
             true,
@@ -435,21 +542,25 @@ async fn exercise_agent(
 /// handshake, because a plan gathered from a different code path would prefetch
 /// the wrong pages.
 async fn profile_restore(
+    vm_id: &str,
     dir: &Path,
-    firecracker_bin: &Path,
-    agent_timeout: std::time::Duration,
+    config: &NodeConfig,
     shape: Shape,
     trust: &Trust,
 ) -> Result<(), Status> {
+    let agent_timeout = config.agent_timeout;
     let lease = burrow_net::ipam::warm_lease();
     burrow_net::tap::delete(WARM_TAP).await;
     let tap = burrow_net::tap::create_named(WARM_TAP, &lease)
         .await
         .map_err(|err| Status::internal(format!("profiling tap: {err}")))?;
 
-    let mut spec = MicroVmSpec::new("warm-profile", dir);
+    // The build's own id, not one of its own: under the jailer the chroot is
+    // derived from the id, and this VM restores the files that are inside the
+    // one the build already filled.
+    let mut spec = MicroVmSpec::new(vm_id.to_string(), dir);
     spec.enable_pci = true;
-    spec.firecracker_bin = firecracker_bin.to_path_buf();
+    spec.firecracker_bin = config.firecracker_bin.clone();
     spec.kernel = "vmlinux".into();
     spec.drives = vec![
         DriveSpec::root_ro("rootfs.ext4"),
@@ -460,10 +571,10 @@ async fn profile_restore(
         tap: tap.clone(),
         guest_mac: Some(lease.guest_mac()),
     });
-    spec.cgroup_root = None;
     spec.vcpus = shape.vcpus;
     spec.mem_mib = shape.mem_mib;
     spec.record_prefetch = Some(PREFETCH_PLAN.to_string());
+    apply_confinement(&mut spec, config, shape);
 
     // The profiling guest writes to the scratch disk *after* the snapshot was
     // taken, so a clone restoring that snapshot would find a disk that had
@@ -486,7 +597,7 @@ async fn profile_restore(
             .wait_for_vsock(crate::agentconn::AGENT_PORT, agent_timeout)
             .await;
         if ready.is_ok() {
-            let _ = exercise_agent(&vm, &lease, trust).await;
+            let _ = exercise_agent(&vm, &lease, trust, agent_timeout).await;
         }
         vm.kill()
             .await
@@ -533,7 +644,7 @@ async fn snapshot_when_ready(
     // the warmed guest-side state into the snapshot. Measured: the first
     // handshake after a restore cost ~180ms against ~9ms for a second on a
     // fresh channel, so the cost is guest coldness rather than transport.
-    if let Err(err) = exercise_agent(&vm, lease, trust).await {
+    if let Err(err) = exercise_agent(&vm, lease, trust, agent_timeout).await {
         // Not fatal: a snapshot without the warm-up is slower, not wrong.
         tracing::warn!(%err, "could not pre-warm the guest before snapshotting");
     }

@@ -421,15 +421,23 @@ impl MicroVm {
     pub async fn wait_for_vsock(&self, port: u32, timeout: Duration) -> Result<Duration> {
         let start = Instant::now();
         let deadline = start + timeout;
+        let uds = self.vsock_uds_path();
         loop {
-            if self.connect_vsock(port).await.is_ok() {
-                return Ok(start.elapsed());
-            }
-            if Instant::now() >= deadline {
+            let now = Instant::now();
+            if now >= deadline {
                 return Err(VmmError::Timeout {
                     what: format!("guest vsock port {port}"),
                     timeout_ms: timeout.as_millis() as u64,
                 });
+            }
+            // Bound each attempt by what is left of the overall deadline, so
+            // a guest that accepts and then goes quiet costs one attempt
+            // rather than the whole wait.
+            if vsock::connect_within(&uds, port, deadline - now)
+                .await
+                .is_ok()
+            {
+                return Ok(start.elapsed());
             }
             tokio::time::sleep(Duration::from_millis(5)).await;
         }

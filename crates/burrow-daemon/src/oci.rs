@@ -544,16 +544,57 @@ async fn check(response: reqwest::Response, url: &str) -> Result<reqwest::Respon
         return Ok(response);
     }
     // The body usually names the actual problem ("manifest unknown"), which is
-    // far more useful than the status alone.
+    // far more useful than the status alone. Only a registry's own error
+    // document is quoted back, though: the caller chooses the registry, so
+    // echoing arbitrary response bodies would turn a pull into a read oracle
+    // for whatever the node can reach and the caller cannot. A body that is
+    // not registry-shaped becomes the status alone.
     let body = response.text().await.unwrap_or_default();
-    let detail = body.chars().take(200).collect::<String>();
+    let detail = registry_error_detail(&body)
+        .map(|detail| format!(": {detail}"))
+        .unwrap_or_default();
     Err(match status {
-        reqwest::StatusCode::NOT_FOUND => Status::not_found(format!("{url} not found: {detail}")),
+        reqwest::StatusCode::NOT_FOUND => Status::not_found(format!("{url} not found{detail}")),
         reqwest::StatusCode::UNAUTHORIZED | reqwest::StatusCode::FORBIDDEN => {
-            Status::permission_denied(format!("{url} denied: {detail}"))
+            Status::permission_denied(format!("{url} denied{detail}"))
         }
-        other => Status::unavailable(format!("{url} returned {other}: {detail}")),
+        other => Status::unavailable(format!("{url} returned {other}{detail}")),
     })
+}
+
+/// The `errors` array an OCI registry returns, rendered for a human.
+///
+/// Returns `None` for anything that is not that document, which is what keeps
+/// the bytes of an unrelated HTTP server off the caller's error path. Only the
+/// registry's own `code` and `message` fields travel, never the whole body,
+/// and the result is capped so a hostile registry cannot use it as a channel
+/// of its own.
+fn registry_error_detail(body: &str) -> Option<String> {
+    #[derive(serde::Deserialize)]
+    struct Errors {
+        errors: Vec<Entry>,
+    }
+    #[derive(serde::Deserialize)]
+    struct Entry {
+        #[serde(default)]
+        code: String,
+        #[serde(default)]
+        message: String,
+    }
+
+    let parsed: Errors = serde_json::from_str(body).ok()?;
+    let rendered = parsed
+        .errors
+        .iter()
+        .map(|entry| match (entry.code.trim(), entry.message.trim()) {
+            ("", message) => message.to_string(),
+            (code, "") => code.to_string(),
+            (code, message) => format!("{code}: {message}"),
+        })
+        .filter(|entry| !entry.is_empty())
+        .collect::<Vec<_>>()
+        .join("; ");
+    (!rendered.is_empty()).then(|| rendered.chars().take(200).collect())
 }
 
 /// Splits `Bearer realm="x",service="y"` into its parameters.
@@ -1080,6 +1121,40 @@ fn remove_any(path: &Path) -> std::io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_registry_error_document_is_quoted_back() {
+        let detail = registry_error_detail(
+            r#"{"errors":[{"code":"MANIFEST_UNKNOWN","message":"manifest unknown"}]}"#,
+        );
+        assert_eq!(
+            detail.as_deref(),
+            Some("MANIFEST_UNKNOWN: manifest unknown")
+        );
+    }
+
+    /// The caller picks the URL a pull dials, so a body echoed back verbatim
+    /// would read out whatever the node can reach and the caller cannot.
+    #[test]
+    fn a_body_that_is_not_a_registry_error_is_not_echoed() {
+        for body in [
+            "<html><body>internal admin console</body></html>",
+            r#"{"instance-id":"i-0123456789","iam":{"role":"admin"}}"#,
+            "",
+            "{}",
+            r#"{"errors":[]}"#,
+            r#"{"errors":[{"code":"","message":"  "}]}"#,
+        ] {
+            assert_eq!(registry_error_detail(body), None, "{body:?} was echoed");
+        }
+    }
+
+    /// The registry controls this field, so it is capped.
+    #[test]
+    fn a_registry_error_is_capped() {
+        let body = format!(r#"{{"errors":[{{"message":"{}"}}]}}"#, "x".repeat(5000));
+        assert_eq!(registry_error_detail(&body).unwrap().chars().count(), 200);
+    }
 
     #[test]
     fn a_bare_name_is_an_official_docker_hub_image() {

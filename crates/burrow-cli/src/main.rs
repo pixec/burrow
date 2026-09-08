@@ -44,8 +44,86 @@ struct Args {
     /// Bearer token, when the orchestrator requires one.
     #[arg(long, global = true, env = "BURROW_API_KEY")]
     api_key: Option<String>,
+    /// Read the bearer token from a file instead: the first non-blank,
+    /// non-`#` line. Preferred on a shared machine, where a token on the
+    /// command line is visible in `ps` to every user on the host.
+    #[arg(long, global = true, env = "BURROW_API_KEY_FILE")]
+    api_key_file: Option<std::path::PathBuf>,
+    /// Allow a plaintext `http://` endpoint that is not on this machine.
+    ///
+    /// The api key travels in a header, so plaintext to a remote orchestrator
+    /// hands it to anything on the path.
+    #[arg(long, global = true, env = "BURROW_INSECURE")]
+    insecure: bool,
     #[command(subcommand)]
     command: Command,
+}
+
+/// Loads the bearer token from `--api-key` or `--api-key-file`.
+///
+/// The file is read the way the daemons read theirs: the first non-blank,
+/// non-`#` line, so a token file can be annotated. A file that cannot be read
+/// is an error, not a silent fall back to calling unauthenticated.
+fn load_api_key(
+    inline: Option<&str>,
+    path: Option<&std::path::Path>,
+) -> anyhow::Result<Option<String>> {
+    if let Some(value) = inline {
+        return Ok(Some(value.to_string()));
+    }
+    let Some(path) = path else {
+        return Ok(None);
+    };
+    let contents = std::fs::read_to_string(path)
+        .map_err(|err| anyhow::anyhow!("cannot read --api-key-file {}: {err}", path.display()))?;
+    let token = contents
+        .lines()
+        .map(str::trim)
+        .find(|line| !line.is_empty() && !line.starts_with('#'))
+        .map(str::to_string)
+        .ok_or_else(|| anyhow::anyhow!("--api-key-file {} holds no token", path.display()))?;
+    Ok(Some(token))
+}
+
+/// Builds the channel to the orchestrator, refusing to leak the api key.
+///
+/// `https://` gets TLS against the platform's CA store. Plaintext is allowed
+/// only to this machine, where there is no network to eavesdrop on; anywhere
+/// else it needs `--insecure`, because the bearer token goes out in a header
+/// on every call. An endpoint with no scheme counts as plaintext, which is
+/// what tonic makes of it.
+async fn connect(endpoint: &str, insecure: bool) -> anyhow::Result<tonic::transport::Channel> {
+    let uri: tonic::transport::Uri = endpoint
+        .parse()
+        .map_err(|err| anyhow::anyhow!("--orchestrator {endpoint} is not a URL: {err}"))?;
+    let mut builder = tonic::transport::Endpoint::from(uri.clone());
+
+    if uri.scheme_str() == Some("https") {
+        builder = builder.tls_config(
+            tonic::transport::ClientTlsConfig::new()
+                .with_native_roots()
+                .with_enabled_roots(),
+        )?;
+    } else if !insecure && !is_loopback(uri.host().unwrap_or_default()) {
+        anyhow::bail!(
+            "refusing to send the api key in plaintext to {}: use https://, or pass \
+             --insecure if the endpoint is reached over a network you trust",
+            uri.host().unwrap_or(endpoint)
+        );
+    }
+
+    Ok(builder.connect().await?)
+}
+
+/// Whether a host names this machine, where plaintext has no network to cross.
+fn is_loopback(host: &str) -> bool {
+    // A URL's v6 literal keeps its brackets; the address inside is what parses.
+    let host = host.strip_prefix('[').unwrap_or(host);
+    let host = host.strip_suffix(']').unwrap_or(host);
+    host.eq_ignore_ascii_case("localhost")
+        || host
+            .parse::<std::net::IpAddr>()
+            .is_ok_and(|addr| addr.is_loopback())
 }
 
 #[derive(Subcommand)]
@@ -811,10 +889,9 @@ enum NodesCommand {
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     let args = Args::parse();
-    let channel = tonic::transport::Endpoint::try_from(args.orchestrator.clone())?
-        .connect()
-        .await?;
-    let mut client = BurrowClient::with_interceptor(channel, BearerAuth(args.api_key.clone()));
+    let api_key = load_api_key(args.api_key.as_deref(), args.api_key_file.as_deref())?;
+    let channel = connect(&args.orchestrator, args.insecure).await?;
+    let mut client = BurrowClient::with_interceptor(channel, BearerAuth(api_key));
 
     match args.command {
         Command::Health => {
@@ -863,7 +940,7 @@ async fn main() -> anyhow::Result<()> {
             if connect {
                 let code = connect_shell(&mut client, &sandbox.id, None, Vec::new()).await?;
                 if code != 0 {
-                    std::process::exit(code);
+                    std::process::exit(exit_status(code));
                 }
             }
         }
@@ -925,13 +1002,13 @@ async fn main() -> anyhow::Result<()> {
         Command::Exec { id, exec, cmd } => {
             let code = run_exec(&mut client, &id, &exec, cmd).await?;
             if code != 0 {
-                std::process::exit(code);
+                std::process::exit(exit_status(code));
             }
         }
         Command::Connect { id, user, cmd } => {
             let code = connect_shell(&mut client, &id, user, cmd).await?;
             if code != 0 {
-                std::process::exit(code);
+                std::process::exit(exit_status(code));
             }
         }
         Command::Logs { id, command_id } => {
@@ -946,7 +1023,7 @@ async fn main() -> anyhow::Result<()> {
             };
             let code = attach_command(&mut client, &id, &command_id).await?;
             if code != 0 {
-                std::process::exit(code);
+                std::process::exit(exit_status(code));
             }
         }
         Command::Kill {
@@ -1030,7 +1107,7 @@ async fn main() -> anyhow::Result<()> {
         } => {
             let code = run_in_sandbox(&mut client, create, exec, stop, rm, detach, cmd).await?;
             if code != 0 {
-                std::process::exit(code);
+                std::process::exit(exit_status(code));
             }
         }
         Command::Copy { src, dst } => copy(&mut client, &src, &dst).await?,
@@ -1250,7 +1327,10 @@ async fn main() -> anyhow::Result<()> {
                 })
                 .await?
                 .into_inner();
-            println!("{} ({}MiB) on {}", volume.name, volume.size_mib, volume.node_id);
+            println!(
+                "{} ({}MiB) on {}",
+                volume.name, volume.size_mib, volume.node_id
+            );
         }
         Command::Volume(VolumeCommand::Ls { node }) => {
             let resp = client
@@ -1394,18 +1474,18 @@ async fn main() -> anyhow::Result<()> {
                 let event = event?;
                 println!(
                     "{:<21} {:<24} {:<7} {:<28} {}",
-                    event.at,
-                    truncate(&event.sandbox_id, 24),
+                    sanitize(&event.at),
+                    truncate(&sanitize(&event.sandbox_id), 24),
                     if event.allowed { "yes" } else { "no" },
                     truncate(
-                        if event.host.is_empty() {
+                        &sanitize(if event.host.is_empty() {
                             &event.destination
                         } else {
                             &event.host
-                        },
+                        }),
                         28
                     ),
-                    event.reason,
+                    sanitize(&event.reason),
                 );
             }
         }
@@ -1422,7 +1502,7 @@ async fn main() -> anyhow::Result<()> {
                     "{:>10}  {:o}  {}{}",
                     entry.size,
                     entry.mode & 0o7777,
-                    entry.name,
+                    sanitize(&entry.name),
                     if entry.is_dir { "/" } else { "" }
                 );
             }
@@ -1581,20 +1661,32 @@ async fn run_in_sandbox(
         return Ok(0);
     }
 
-    let code = run_exec(client, &id, &exec, cmd).await?;
+    // The sandbox `run` created is this function's to clean up, so --stop and
+    // --rm happen whatever the exec did. An exec that failed is exactly the
+    // case where a sandbox left behind holds capacity the caller cannot get
+    // back without digging its id out of the error.
+    let result = run_exec(client, &id, &exec, cmd).await;
 
     if stop {
-        client
+        match client
             .pause_sandbox(api::SandboxRef { id: id.clone() })
-            .await?;
-        eprintln!("stopped {id}");
+            .await
+        {
+            Ok(_) => eprintln!("stopped {id}"),
+            // Reported, not returned: losing the exec's own outcome to a
+            // cleanup error would hide a command that did run.
+            Err(err) => eprintln!("could not stop {id}: {}", err.message()),
+        }
     } else if rm {
-        client
+        match client
             .delete_sandbox(api::SandboxRef { id: id.clone() })
-            .await?;
-        eprintln!("deleted {id}");
+            .await
+        {
+            Ok(_) => eprintln!("deleted {id}"),
+            Err(err) => eprintln!("could not delete {id}: {}", err.message()),
+        }
     }
-    Ok(code)
+    result
 }
 
 /// `connect`: an interactive shell, which is `exec --pty` with a default
@@ -2490,12 +2582,47 @@ fn shape_value(value: u64, default: u64) -> String {
 }
 
 /// Keeps table columns aligned when a value is longer than its column.
+///
+/// Counted in `char`s, not bytes: the names, paths and commands shown here are
+/// written by tenants and by whoever is inside the sandbox, and a byte slice
+/// that lands inside a multi-byte character panics. Still not display width, a
+/// CJK character counts as one and takes two columns, but a column that is a
+/// little wide beats a CLI that aborts on a filename.
 fn truncate(value: &str, width: usize) -> String {
-    if value.len() <= width {
-        value.to_string()
-    } else {
-        format!("{}…", &value[..width.saturating_sub(1)])
+    if value.chars().count() <= width {
+        return value.to_string();
     }
+    let mut out: String = value.chars().take(width.saturating_sub(1)).collect();
+    out.push('…');
+    out
+}
+
+/// Makes a guest-controlled string safe to print to a terminal.
+///
+/// Command lines, file names, audit hosts and deny reasons are all chosen by
+/// whoever is inside the sandbox. Printed raw, an escape sequence in one of
+/// them repaints the screen, hides the lines around it, or on terminals that
+/// answer a status query gets the terminal to type text back on this process's
+/// stdin. Only the human-readable path needs it; `serde_json` escapes control
+/// characters on the `--json` path already.
+///
+/// Tab survives because it is what a column of output is made of. Every other
+/// control character becomes `?`; ordinary non-ASCII text is left alone.
+fn sanitize(value: &str) -> String {
+    value
+        .chars()
+        // `char::is_control` is exactly C0, DEL and C1.
+        .map(|c| if c == '\t' || !c.is_control() { c } else { '?' })
+        .collect()
+}
+
+/// Maps an exit status the guest reported onto one this process can exit with.
+///
+/// `exit(2)` keeps only the low 8 bits, so a command reporting 256 would leave
+/// this process exiting 0 and a script would read a failure as a success.
+/// Anything nonzero therefore lands in 1..=255, and only a real 0 stays 0.
+fn exit_status(code: i32) -> i32 {
+    if code == 0 { 0 } else { code.clamp(1, 255) }
 }
 
 /// The state to show a reader, which is not always the state on record.
@@ -2569,16 +2696,19 @@ async fn run_exec(
     // A terminal that is not driving a pty has nothing to send: closing stdin
     // straight away lets the command see EOF rather than hang on a user who is
     // not typing at it. Anything else (a pipe, a file, an interactive pty) is
-    // forwarded.
-    if interactive || !std::io::stdin().is_terminal() {
-        tokio::spawn(forward_stdin(tx.clone(), flags.pty));
+    // forwarded, and the pump's handle is kept so it can be stopped once the
+    // command is over: it sits in a read of stdin, and a pipe nobody is writing
+    // to keeps it there long after there is anywhere to send the bytes.
+    let stdin_pump = if interactive || !std::io::stdin().is_terminal() {
+        Some(tokio::spawn(forward_stdin(tx.clone(), flags.pty)))
     } else {
         tx.send(api::ExecInput {
             input: Some(api::exec_input::Input::StdinEof(true)),
         })
         .await
         .ok();
-    }
+        None
+    };
     if interactive {
         tokio::spawn(forward_resizes(tx.clone()));
     }
@@ -2594,9 +2724,21 @@ async fn run_exec(
 
     let mut stream = client.exec(ReceiverStream::new(rx)).await?.into_inner();
     let (mut stdout, mut stderr) = (std::io::stdout(), std::io::stderr());
-    let mut code = 0;
+    // `None` until the guest says how the command ended: defaulting to 0 would
+    // report a command whose stream was cut as a success.
+    let mut code = None;
+    let mut outcome = Ok(());
     while let Some(msg) = stream.next().await {
-        match msg?.output {
+        let msg = match msg {
+            Ok(msg) => msg,
+            // Kept rather than returned so the pump below is stopped on this
+            // path too.
+            Err(err) => {
+                outcome = Err(err);
+                break;
+            }
+        };
+        match msg.output {
             Some(api::exec_output::Output::Stdout(b)) => {
                 stdout.write_all(&b)?;
                 stdout.flush()?;
@@ -2605,13 +2747,22 @@ async fn run_exec(
                 stderr.write_all(&b)?;
                 stderr.flush()?;
             }
-            Some(api::exec_output::Output::ExitCode(c)) => code = c,
+            Some(api::exec_output::Output::ExitCode(c)) => code = Some(c),
             // Not printed: it would land in the middle of the command's own
             // output. `burrow ps` is where a command's id is read.
             Some(api::exec_output::Output::CommandId(_)) | None => {}
         }
     }
-    Ok(code)
+    if let Some(pump) = stdin_pump {
+        pump.abort();
+    }
+    outcome?;
+    code.ok_or_else(|| {
+        anyhow::anyhow!(
+            "the exec stream ended without an exit status; `burrow top` lists \
+             what the sandbox is still running"
+        )
+    })
 }
 
 /// `run --detach`: start a command and leave it running.
@@ -2673,15 +2824,15 @@ async fn list_commands(client: &mut Client, id: &str) -> anyhow::Result<()> {
         };
         println!(
             "{:<10} {:<10} {:<8} {:<6} {}",
-            command.command_id,
-            if command.user.is_empty() {
+            sanitize(&command.command_id),
+            sanitize(if command.user.is_empty() {
                 "root"
             } else {
                 &command.user
-            },
-            command.state,
+            }),
+            sanitize(&command.state),
             code,
-            truncate(&command.cmd.join(" "), 60)
+            truncate(&sanitize(&command.cmd.join(" ")), 60)
         );
     }
     Ok(())
@@ -2698,7 +2849,8 @@ async fn attach_command(client: &mut Client, id: &str, command_id: &str) -> anyh
         .into_inner();
 
     let (mut stdout, mut stderr) = (std::io::stdout(), std::io::stderr());
-    let mut code = 0;
+    // As in `run_exec`: no status on the stream is not the same as an exit 0.
+    let mut code = None;
     while let Some(msg) = stream.next().await {
         match msg?.output {
             Some(api::exec_output::Output::Stdout(b)) => {
@@ -2709,11 +2861,16 @@ async fn attach_command(client: &mut Client, id: &str, command_id: &str) -> anyh
                 stderr.write_all(&b)?;
                 stderr.flush()?;
             }
-            Some(api::exec_output::Output::ExitCode(c)) => code = c,
+            Some(api::exec_output::Output::ExitCode(c)) => code = Some(c),
             Some(api::exec_output::Output::CommandId(_)) | None => {}
         }
     }
-    Ok(code)
+    code.ok_or_else(|| {
+        anyhow::anyhow!(
+            "the log stream ended without an exit status; `burrow top` shows \
+             the command's state"
+        )
+    })
 }
 
 /// Pumps local stdin into the command until it ends, then tells the command's
@@ -2833,43 +2990,63 @@ async fn push(
     remote: &str,
 ) -> anyhow::Result<u64> {
     use std::os::unix::fs::PermissionsExt;
+    use tokio::io::AsyncReadExt;
 
-    let data = tokio::fs::read(local).await?;
-    let mode = tokio::fs::metadata(local)
+    let mut file = tokio::fs::File::open(local).await?;
+    let mode = file
+        .metadata()
         .await
         .map(|m| m.permissions().mode())
         .unwrap_or(0o644);
 
-    // Chunked so a large file does not have to fit in one gRPC message.
-    // Matches the SDK and the guest: HTTP/2's default flow-control window.
+    // Chunked so a large file has to fit neither in one gRPC message nor in
+    // memory. Matches the SDK and the guest: HTTP/2's default flow-control
+    // window.
     const CHUNK: usize = 64 * 1024;
-    let mut chunks = Vec::new();
-    let mut offset = 0;
-    let mut first = true;
-    while offset < data.len() || first {
-        let end = (offset + CHUNK).min(data.len());
-        chunks.push(api::FileChunk {
-            sandbox_id: if first {
-                sandbox_id.to_string()
-            } else {
-                String::new()
-            },
-            path: if first {
-                remote.to_string()
-            } else {
-                String::new()
-            },
-            mode: if first { mode } else { 0 },
-            data: data[offset..end].to_vec(),
-        });
-        offset = end;
-        first = false;
-    }
+
+    // Shallow, so the reader stays roughly a chunk ahead of the wire rather
+    // than racing to buffer the whole file behind a slow link.
+    let (tx, rx) = tokio::sync::mpsc::channel(4);
+    let sandbox_id = sandbox_id.to_string();
+    let remote = remote.to_string();
+    let reader = tokio::spawn(async move {
+        let mut buf = vec![0u8; CHUNK];
+        let mut first = true;
+        loop {
+            let n = file.read(&mut buf).await?;
+            // An empty file still sends one chunk: the first chunk is what
+            // carries the path and the mode, so skipping it would upload
+            // nothing at all.
+            if n == 0 && !first {
+                break;
+            }
+            let chunk = api::FileChunk {
+                sandbox_id: if first {
+                    sandbox_id.clone()
+                } else {
+                    String::new()
+                },
+                path: if first { remote.clone() } else { String::new() },
+                mode: if first { mode } else { 0 },
+                data: buf[..n].to_vec(),
+            };
+            first = false;
+            // The receiver is gone when the RPC has already failed; its error
+            // is the one worth reporting, so this one is dropped.
+            if tx.send(chunk).await.is_err() || n == 0 {
+                break;
+            }
+        }
+        Ok::<(), std::io::Error>(())
+    });
 
     let result = client
-        .upload_file(tokio_stream::iter(chunks))
+        .upload_file(ReceiverStream::new(rx))
         .await?
         .into_inner();
+    // A read that failed part way leaves a truncated file in the sandbox, and
+    // the RPC would report that as a successful upload of fewer bytes.
+    reader.await??;
     Ok(result.bytes_written)
 }
 
@@ -2887,8 +3064,21 @@ async fn pull(
         .await?
         .into_inner();
 
+    // 0600: a file copied out of a sandbox can hold anything that sandbox
+    // held, and the guest's own mode is not a permission grant to every other
+    // user of this machine. Only on create; an existing file keeps its mode.
     let mut out: Box<dyn Write> = match &local {
-        Some(path) => Box::new(std::fs::File::create(path)?),
+        Some(path) => {
+            use std::os::unix::fs::OpenOptionsExt as _;
+            Box::new(
+                std::fs::OpenOptions::new()
+                    .write(true)
+                    .create(true)
+                    .truncate(true)
+                    .mode(0o600)
+                    .open(path)?,
+            )
+        }
         None => Box::new(std::io::stdout()),
     };
     let mut total = 0u64;
@@ -3144,6 +3334,88 @@ fn sandbox_json(sandbox: &common::Sandbox) -> String {
 
 #[cfg(test)]
 mod tests {
+    /// The names, paths and command lines shown here are written by tenants
+    /// and by whoever is inside the sandbox; a byte slice through a multi-byte
+    /// character aborts the whole command over a filename.
+    #[test]
+    fn truncation_counts_characters_not_bytes() {
+        let truncate = super::truncate;
+        assert_eq!(truncate("short", 10), "short");
+        assert_eq!(truncate("exactly-10", 10), "exactly-10");
+        assert_eq!(truncate("abcdefghijk", 10), "abcdefghi…");
+        assert_eq!(truncate("ααααααααααα", 10), "ααααααααα…");
+        assert_eq!(truncate("日本語のファイル名です", 5), "日本語の…");
+    }
+
+    /// A guest that writes an escape sequence into a filename or a deny reason
+    /// must not get to drive the operator's terminal with it.
+    #[test]
+    fn control_characters_are_stripped_from_guest_strings() {
+        let sanitize = super::sanitize;
+        // A cursor-up plus erase-line would overwrite the line above it.
+        assert_eq!(sanitize("safe\u{1b}[1A\u{1b}[2Kfake"), "safe?[1A?[2Kfake");
+        assert_eq!(sanitize("del\u{7f}"), "del?");
+        // C1 in its 8-bit form, which some terminals still honour.
+        assert_eq!(sanitize("csi\u{9b}31m"), "csi?31m");
+        // Tab is what a column of output is made of, and ordinary text is
+        // left alone.
+        assert_eq!(sanitize("a\tb"), "a\tb");
+        assert_eq!(sanitize("naïve 日本語 ✓"), "naïve 日本語 ✓");
+    }
+
+    /// `exit(2)` keeps only the low 8 bits, so an unclamped 256 exits 0 and a
+    /// script reads a failed command as a successful one.
+    #[test]
+    fn a_nonzero_status_never_clamps_to_success() {
+        let status = super::exit_status;
+        assert_eq!(status(0), 0);
+        assert_eq!(status(137), 137);
+        assert_eq!(status(256), 255);
+        assert_eq!(status(-1), 1);
+    }
+
+    /// The api key travels in a header on every call, so plaintext to anywhere
+    /// but this machine has to be asked for explicitly.
+    #[test]
+    fn only_this_machine_is_plaintext_by_default() {
+        let loopback = super::is_loopback;
+        assert!(loopback("127.9.9.9"));
+        assert!(loopback("LocalHost"));
+        // A URL keeps a v6 literal's brackets.
+        assert!(loopback("[::1]"));
+
+        assert!(!loopback("10.0.0.5"));
+        assert!(!loopback("burrow.example.com"));
+        assert!(!loopback(""));
+    }
+
+    /// Mirrors the daemons' token files, comments and all.
+    #[test]
+    fn a_token_file_yields_its_first_real_line() {
+        let dir = std::env::temp_dir().join(format!("burrow-cli-key-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("key");
+        std::fs::write(&path, "# rotated 2026-01-01\n\n  secret-token  \nolder\n").unwrap();
+
+        assert_eq!(
+            super::load_api_key(None, Some(&path)).unwrap(),
+            Some("secret-token".to_string())
+        );
+        // --api-key wins, so a flag can override an environment-set file.
+        assert_eq!(
+            super::load_api_key(Some("inline"), Some(&path)).unwrap(),
+            Some("inline".to_string())
+        );
+        assert_eq!(super::load_api_key(None, None).unwrap(), None);
+
+        // A file that is there but holds nothing usable is an error, not a
+        // silent fall back to calling unauthenticated.
+        std::fs::write(&path, "# nothing but a comment\n").unwrap();
+        assert!(super::load_api_key(None, Some(&path)).is_err());
+        assert!(super::load_api_key(None, Some(&dir.join("absent"))).is_err());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// Two tags of one repository are two templates. Before this, both
     /// `python:3.12-slim` and `python:3.13` imported as `python`, and the
     /// second silently replaced the first.
