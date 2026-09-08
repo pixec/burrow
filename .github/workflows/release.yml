@@ -75,6 +75,23 @@ jobs:
             cargo install cargo-zigbuild --locked --version 0.19.8
           rustup target add ${{ matrix.target }}
 
+      # The tag is the version, so the binaries report it too: `burrow
+      # --version` on a v0.2.0 download must not say 0.1.0 because nobody
+      # edited Cargo.toml. Every crate inherits `workspace.package.version`,
+      # and the build below is not `--locked`, so cargo refreshes the
+      # lockfile's own entries. The change is not committed back.
+      - name: Set crate versions from the tag
+        if: github.ref_type == 'tag'
+        run: |
+          set -eu
+          v='${{ steps.version.outputs.version }}'
+          case "$v" in
+            [0-9]*.[0-9]*.[0-9]*) ;;
+            *) echo "tag ${GITHUB_REF_NAME} is not a version" >&2; exit 1 ;;
+          esac
+          sed -i "0,/^version = \"[^\"]*\"/s//version = \"$v\"/" Cargo.toml
+          grep -m1 '^version' Cargo.toml
+
       # Same invocation `cargo xtask build` wraps, spelled out here: the wrapper
       # only adds `rustup target add`, which the step above already did.
       # burrow-agent is the guest init rather than a host binary, but the node
