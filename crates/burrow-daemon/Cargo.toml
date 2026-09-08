@@ -15,6 +15,7 @@ burrow-vmm = { workspace = true }
 burrow-net = { workspace = true }
 burrow-proxy = { workspace = true }
 burrow-store = { workspace = true }
+tailcat-rs = { workspace = true }
 tokio = { workspace = true }
 tokio-stream = { workspace = true }
 tonic = { workspace = true }

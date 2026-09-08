@@ -323,6 +323,36 @@ enum Command {
     Port { id: String },
     /// Withdraw a published port.
     Unexpose { id: String, host_port: u32 },
+    /// Share a sandbox through a tailcat address: a WireGuard tunnel over a
+    /// DERP relay that any `tailcat` client can dial, with no host port and
+    /// no edge. The address is the credential, so treat it as a secret.
+    Share {
+        id: String,
+        /// Guest TCP port reachable through the share. Repeatable; omitted
+        /// shares every port.
+        #[arg(long = "port", value_delimiter = ',')]
+        ports: Vec<u32>,
+        /// Client node key admitted, as `nodekey:<hex>`. Repeatable; omitted
+        /// admits anyone holding the address.
+        #[arg(long = "allow")]
+        allowed_clients: Vec<String>,
+        /// Issue new keys, and so a new address, to an existing share.
+        #[arg(long)]
+        rotate: bool,
+        /// Prefix each connection into the guest with a PROXY protocol v2
+        /// header carrying the client's identity.
+        #[arg(long)]
+        proxy_protocol: bool,
+        /// Guest UDP port reachable through the share, or `all`. Repeatable;
+        /// omitted shares no UDP.
+        #[arg(long = "udp-port", value_delimiter = ',')]
+        udp_ports: Vec<String>,
+        /// Print the existing share without changing it.
+        #[arg(long, conflicts_with_all = ["ports", "allowed_clients", "rotate", "proxy_protocol", "udp_ports"])]
+        show: bool,
+    },
+    /// Revoke a sandbox's share.
+    Unshare { id: String },
     /// List a directory inside a sandbox.
     Dir { id: String, path: String },
     /// Template operations.
@@ -1304,6 +1334,46 @@ async fn main() -> anyhow::Result<()> {
                 .await?;
             println!("closed {host_port}");
         }
+        Command::Share {
+            id,
+            ports,
+            allowed_clients,
+            rotate,
+            proxy_protocol,
+            udp_ports,
+            show,
+        } => {
+            let share = if show {
+                client.get_share(api::SandboxRef { id }).await?.into_inner()
+            } else {
+                let all_udp = udp_ports.iter().any(|p| p == "all");
+                let udp_ports = udp_ports
+                    .iter()
+                    .filter(|p| *p != "all")
+                    .map(|p| {
+                        p.parse::<u32>()
+                            .map_err(|_| anyhow::anyhow!("invalid UDP port {p:?}"))
+                    })
+                    .collect::<Result<Vec<_>, _>>()?;
+                client
+                    .share_sandbox(api::ShareRequest {
+                        sandbox_id: id,
+                        ports,
+                        allowed_clients,
+                        rotate,
+                        proxy_protocol,
+                        udp_ports,
+                        all_udp,
+                    })
+                    .await?
+                    .into_inner()
+            };
+            print_share(&share);
+        }
+        Command::Unshare { id } => {
+            client.unshare_sandbox(api::SandboxRef { id }).await?;
+            println!("share revoked");
+        }
         Command::Templates(TemplatesCommand::Ls) => list_templates(&mut client).await?,
         Command::Templates(TemplatesCommand::Import { image, name }) => {
             import_template(&mut client, image, name).await?
@@ -2040,6 +2110,41 @@ fn print_port(mapping: &api::PortMapping) {
             url, mapping.guest_port, mapping.host_address
         ),
     }
+}
+
+/// The address goes on stdout by itself, so `burrow share <id>` composes with
+/// a pipe; what it admits goes to stderr.
+fn print_share(share: &api::Share) {
+    println!("{}", share.address);
+    let ports = if share.ports.is_empty() {
+        "all".to_string()
+    } else {
+        share
+            .ports
+            .iter()
+            .map(|p| p.to_string())
+            .collect::<Vec<_>>()
+            .join(",")
+    };
+    eprintln!("# ports: {ports}");
+    if share.all_udp {
+        eprintln!("# udp ports: all");
+    } else if !share.udp_ports.is_empty() {
+        let udp = share
+            .udp_ports
+            .iter()
+            .map(|p| p.to_string())
+            .collect::<Vec<_>>()
+            .join(",");
+        eprintln!("# udp ports: {udp}");
+    }
+    if !share.allowed_clients.is_empty() {
+        eprintln!("# allowed clients: {}", share.allowed_clients.join(", "));
+    }
+    if share.proxy_protocol {
+        eprintln!("# PROXY protocol v2 header on every connection");
+    }
+    eprintln!("# connect with: tailcat {} <port>", share.address);
 }
 
 async fn list_nodes(client: &mut Client) -> anyhow::Result<()> {

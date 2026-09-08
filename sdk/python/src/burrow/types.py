@@ -192,6 +192,27 @@ class PortMapping:
 
 
 @dataclass
+class Share:
+    """A sandbox reachable through a tailcat address.
+
+    The address is the credential: any `tailcat` client holding it can
+    connect, unless `allowed_clients` narrows that. Treat it as a secret.
+    """
+
+    address: str
+    # Guest TCP ports reachable through the share; empty means every port.
+    ports: List[int]
+    # `nodekey:<hex>` of each admitted client; empty admits anyone.
+    allowed_clients: List[str]
+    proxy_protocol: bool
+    # RFC 3339; when the current keys were issued.
+    created_at: str
+    # Guest UDP ports reachable through the share; none unless listed or all_udp.
+    udp_ports: List[int] = field(default_factory=list)
+    all_udp: bool = False
+
+
+@dataclass
 class GuestUser:
     username: str
     uid: int

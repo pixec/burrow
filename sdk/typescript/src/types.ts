@@ -861,6 +861,45 @@ export interface PortMapping {
   edgeUrl?: string;
 }
 
+/**
+ * A sandbox reachable through a tailcat address.
+ *
+ * The address is the credential: any `tailcat` client holding it can connect,
+ * unless `allowedClients` narrows that. Treat it as a secret.
+ */
+export interface Share {
+  address: string;
+  /** Guest TCP ports reachable through the share; empty means every port. */
+  ports: number[];
+  /** `nodekey:<hex>` of each admitted client; empty admits anyone. */
+  allowedClients: string[];
+  proxyProtocol: boolean;
+  /** RFC 3339; when the current keys were issued. */
+  createdAt: string;
+  /** Guest UDP ports reachable through the share; none unless listed or `allUdp`. */
+  udpPorts: number[];
+  allUdp: boolean;
+}
+
+export interface ShareOptions {
+  /** Guest TCP ports reachable through the share. Omitted shares every port. */
+  ports?: number[];
+  /** Client node keys admitted, as `nodekey:<hex>`. Omitted admits anyone. */
+  allowedClients?: string[];
+  /** Issue new keys, and so a new address, to an existing share. */
+  rotate?: boolean;
+  /**
+   * Prefix each connection into the guest with a PROXY protocol v2 header
+   * carrying the client's identity.
+   */
+  proxyProtocol?: boolean;
+  /** Guest UDP ports reachable through the share. Omitted shares no UDP. */
+  udpPorts?: number[];
+  /** Share every UDP port. */
+  allUdp?: boolean;
+  signal?: AbortSignal;
+}
+
 export interface NodeInfo {
   id: string;
   address: string;

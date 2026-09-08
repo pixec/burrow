@@ -41,6 +41,8 @@ import type {
   NodeInfo,
   OutputChunk,
   PortMapping,
+  Share,
+  ShareOptions,
   RunCommandOptions,
   RunCommandParams,
   RunOptions,
@@ -1488,6 +1490,63 @@ export class Sandbox {
   }
 
   /**
+   * Shares the sandbox through a tailcat address.
+   *
+   * A share is a WireGuard tunnel bootstrapped over a DERP relay, dialed with
+   * the `tailcat` CLI: no host port, no edge, and a connection wakes a
+   * suspended sandbox. Calling it again reshapes an existing share and keeps
+   * its address; `rotate` issues new keys and so a new address. TCP is shared
+   * on every port unless `ports` narrows it; UDP only on `udpPorts`, or
+   * everywhere with `allUdp`.
+   *
+   * ```ts
+   * const share = await sandbox.share({ ports: [22] });
+   * console.log(`tailcat ssh ${share.address}`);
+   * ```
+   */
+  async share(options: ShareOptions = {}): Promise<Share> {
+    this.assertLive();
+    const res = await this.transport.unary<any, any>(
+      "ShareSandbox",
+      {
+        sandboxId: this.id,
+        ports: options.ports ?? [],
+        allowedClients: options.allowedClients ?? [],
+        rotate: options.rotate ?? false,
+        proxyProtocol: options.proxyProtocol ?? false,
+        udpPorts: options.udpPorts ?? [],
+        allUdp: options.allUdp ?? false,
+      },
+      undefined,
+      options.signal,
+    );
+    return toShare(res);
+  }
+
+  /** The sandbox's share. Throws `not_found` when it has none. */
+  async getShare(options: { signal?: AbortSignal } = {}): Promise<Share> {
+    this.assertLive();
+    const res = await this.transport.unary<any, any>(
+      "GetShare",
+      { id: this.id },
+      undefined,
+      options.signal,
+    );
+    return toShare(res);
+  }
+
+  /** Revokes the share; its address stops working at once. */
+  async unshare(options: { signal?: AbortSignal } = {}): Promise<void> {
+    this.assertLive();
+    await this.transport.unary(
+      "UnshareSandbox",
+      { id: this.id },
+      undefined,
+      options.signal,
+    );
+  }
+
+  /**
    * Updates tags, the network policy, the access policy, or any combination.
    *
    * Each section named is replaced wholesale rather than merged, so one call
@@ -1930,6 +1989,18 @@ function toFinished(result: CommandResult): FinishedCommand {
     success: result.success,
     stdout: () => result.stdout,
     stderr: () => result.stderr,
+  };
+}
+
+function toShare(raw: any): Share {
+  return {
+    address: raw.address ?? "",
+    ports: (raw.ports ?? []).map((p: any) => Number(p)),
+    allowedClients: raw.allowedClients ?? [],
+    proxyProtocol: Boolean(raw.proxyProtocol),
+    createdAt: raw.createdAt ?? "",
+    udpPorts: (raw.udpPorts ?? []).map((p: any) => Number(p)),
+    allUdp: Boolean(raw.allUdp),
   };
 }
 

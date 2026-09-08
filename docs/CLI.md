@@ -165,6 +165,8 @@ No Docker counterpart at all: [`fork`](#fork), [`sessions`](#sessions),
 | [`expose`](#expose) | Publish a guest port |
 | [`port`](#port) | List published ports |
 | [`unexpose`](#unexpose) | Withdraw a published port |
+| [`share`](#share) | Share a sandbox through a tailcat address |
+| [`unshare`](#unshare) | Revoke a share |
 | [`images`](#images) | List templates |
 | [`pull`](#pull) | Import an OCI image as a template |
 | [`templates`](#templates) | Manage templates |
@@ -1206,6 +1208,53 @@ burrow unexpose sbx_2f0c 20002
 | --- | --- |
 | `<ID>` | Sandbox to update. |
 | `<HOST_PORT>` | Host port to close, as [`port`](#port) reports it. |
+
+## share
+
+Share a sandbox through a tailcat address: a WireGuard tunnel bootstrapped over
+a DERP relay that any `tailcat` client can dial, with no host port and no edge.
+
+```
+burrow share [--port <PORT>]... [--udp-port <PORT|all>]... [--allow <NODEKEY>]... [--rotate] [--proxy-protocol] [--show] <ID>
+```
+
+```sh
+burrow share sbx_2f0c --port 22
+# tcXXXXXXXXXXXXXXXXXXXX
+tailcat ssh tcXXXXXXXXXXXXXXXXXXXX
+```
+
+| Argument | Description |
+| --- | --- |
+| `<ID>` | Sandbox to share. |
+
+| Option | Description |
+| --- | --- |
+| `--port <PORT>` | Guest TCP port reachable through the share. Repeatable, or comma-separated. Omitted shares every port. |
+| `--udp-port <PORT>` | Guest UDP port reachable through the share, or `all`. Repeatable. Omitted shares no UDP. |
+| `--allow <NODEKEY>` | Client node key admitted, as `nodekey:<hex>`. Repeatable. Omitted admits anyone holding the address. |
+| `--rotate` | Issue new keys, and so a new address, to an existing share. The old address stops working. |
+| `--proxy-protocol` | Prefix each connection into the guest with a PROXY protocol v2 header carrying the client's identity. |
+| `--show` | Print the existing share without changing it. |
+
+The address alone goes to stdout; what the share admits goes to stderr. Running
+`share` again on a shared sandbox reshapes it and keeps the address. The
+address is the credential: anyone holding it can connect, so treat it as a
+secret. A connection through a share wakes a suspended sandbox. See
+[SHARE.md](SHARE.md).
+
+## unshare
+
+Revoke a sandbox's share. Its address stops working at once.
+
+```
+burrow unshare <ID>
+```
+
+```sh
+burrow unshare sbx_2f0c
+# share revoked
+```
 
 ## images
 

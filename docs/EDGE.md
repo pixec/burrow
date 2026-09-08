@@ -231,6 +231,12 @@ port goes straight to the guest, so a sandbox parked by `idle_suspend_secs` is
 not there to accept it. Leave idle suspension off for a sandbox whose only way in
 is a raw TCP port, or resume it through the API before you connect.
 
+The other way in for raw TCP is a share, which is a tunnel rather than a port:
+`burrow share` hands out a tailcat address that a `tailcat` client dials from
+anywhere, the connection is terminated on the node and dialed into the guest,
+and so it wakes a suspended sandbox and needs no port on the node at all. See
+[SHARE.md](SHARE.md).
+
 ### A published port is not reachable from another sandbox
 
 The DNAT rule matches only traffic that arrived from outside the fleet. Traffic

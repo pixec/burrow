@@ -128,6 +128,7 @@ burrow create --template python-3.12-slim --net allowlist --allow-domain pypi.or
 | [docs/TEMPLATES.md](docs/TEMPLATES.md) | OCI imports, builds, warm snapshots, and distribution between nodes |
 | [docs/FIREWALL.md](docs/FIREWALL.md) | Egress modes, denied ranges, live policy updates, and request rules: brokering, matchers and forwarding |
 | [docs/EDGE.md](docs/EDGE.md) | Reaching a sandbox from outside: the node edge, HTTPS, wildcard DNS, a Caddyfile, raw TCP, and custom domains |
+| [docs/SHARE.md](docs/SHARE.md) | Sharing a sandbox through a tailcat address: a WireGuard tunnel over a DERP relay, no port on the node |
 | [docs/PERSISTENCE.md](docs/PERSISTENCE.md) | Suspend and resume, sessions, fork, and snapshot retention |
 | [docs/VOLUMES.md](docs/VOLUMES.md) | Storage that outlives a sandbox, and the rules that follow from block devices |
 | [docs/TAGS.md](docs/TAGS.md) | Tagging sandboxes and filtering by tag |

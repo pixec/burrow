@@ -1402,6 +1402,44 @@ impl Burrow for ApiService {
         Ok(Response::new(client.close_port(req).await?.into_inner()))
     }
 
+    async fn share_sandbox(
+        &self,
+        req: Request<api::ShareRequest>,
+    ) -> Result<Response<api::Share>, Status> {
+        let mut req = req.into_inner();
+        req.sandbox_id = self.resolve(&req.sandbox_id);
+        let mut client = self.node_for(&req.sandbox_id).await?;
+        Ok(Response::new(client.share_sandbox(req).await?.into_inner()))
+    }
+
+    async fn get_share(
+        &self,
+        req: Request<api::SandboxRef>,
+    ) -> Result<Response<api::Share>, Status> {
+        let id = self.resolve(&req.into_inner().id);
+        let mut client = self.node_for(&id).await?;
+        Ok(Response::new(
+            client
+                .get_share(nodepb::NodeSandboxRef { sandbox_id: id })
+                .await?
+                .into_inner(),
+        ))
+    }
+
+    async fn unshare_sandbox(
+        &self,
+        req: Request<api::SandboxRef>,
+    ) -> Result<Response<api::UnshareResponse>, Status> {
+        let id = self.resolve(&req.into_inner().id);
+        let mut client = self.node_for(&id).await?;
+        Ok(Response::new(
+            client
+                .unshare_sandbox(nodepb::NodeSandboxRef { sandbox_id: id })
+                .await?
+                .into_inner(),
+        ))
+    }
+
     type ExecStream = BoxStream<api::ExecOutput>;
 
     async fn exec(

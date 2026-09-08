@@ -227,6 +227,21 @@ class BurrowStub(object):
                 request_serializer=api__pb2.ClosePortRequest.SerializeToString,
                 response_deserializer=api__pb2.ClosePortResponse.FromString,
                 _registered_method=True)
+        self.ShareSandbox = channel.unary_unary(
+                '/burrow.api.v1.Burrow/ShareSandbox',
+                request_serializer=api__pb2.ShareRequest.SerializeToString,
+                response_deserializer=api__pb2.Share.FromString,
+                _registered_method=True)
+        self.GetShare = channel.unary_unary(
+                '/burrow.api.v1.Burrow/GetShare',
+                request_serializer=api__pb2.SandboxRef.SerializeToString,
+                response_deserializer=api__pb2.Share.FromString,
+                _registered_method=True)
+        self.UnshareSandbox = channel.unary_unary(
+                '/burrow.api.v1.Burrow/UnshareSandbox',
+                request_serializer=api__pb2.SandboxRef.SerializeToString,
+                response_deserializer=api__pb2.UnshareResponse.FromString,
+                _registered_method=True)
         self.UploadFile = channel.stream_unary(
                 '/burrow.api.v1.Burrow/UploadFile',
                 request_serializer=api__pb2.FileChunk.SerializeToString,
@@ -511,6 +526,27 @@ class BurrowServicer(object):
         context.set_details('Method not implemented!')
         raise NotImplementedError('Method not implemented!')
 
+    def ShareSandbox(self, request, context):
+        """Shares: reach a sandbox's ports through a tailcat address, a WireGuard
+        tunnel bootstrapped over a DERP relay. No host port, no edge, and the
+        connection wakes a suspended sandbox. The address is the credential.
+        """
+        context.set_code(grpc.StatusCode.UNIMPLEMENTED)
+        context.set_details('Method not implemented!')
+        raise NotImplementedError('Method not implemented!')
+
+    def GetShare(self, request, context):
+        """Missing associated documentation comment in .proto file."""
+        context.set_code(grpc.StatusCode.UNIMPLEMENTED)
+        context.set_details('Method not implemented!')
+        raise NotImplementedError('Method not implemented!')
+
+    def UnshareSandbox(self, request, context):
+        """Missing associated documentation comment in .proto file."""
+        context.set_code(grpc.StatusCode.UNIMPLEMENTED)
+        context.set_details('Method not implemented!')
+        raise NotImplementedError('Method not implemented!')
+
     def UploadFile(self, request_iterator, context):
         """Files
         """
@@ -735,6 +771,21 @@ def add_BurrowServicer_to_server(servicer, server):
                     servicer.ClosePort,
                     request_deserializer=api__pb2.ClosePortRequest.FromString,
                     response_serializer=api__pb2.ClosePortResponse.SerializeToString,
+            ),
+            'ShareSandbox': grpc.unary_unary_rpc_method_handler(
+                    servicer.ShareSandbox,
+                    request_deserializer=api__pb2.ShareRequest.FromString,
+                    response_serializer=api__pb2.Share.SerializeToString,
+            ),
+            'GetShare': grpc.unary_unary_rpc_method_handler(
+                    servicer.GetShare,
+                    request_deserializer=api__pb2.SandboxRef.FromString,
+                    response_serializer=api__pb2.Share.SerializeToString,
+            ),
+            'UnshareSandbox': grpc.unary_unary_rpc_method_handler(
+                    servicer.UnshareSandbox,
+                    request_deserializer=api__pb2.SandboxRef.FromString,
+                    response_serializer=api__pb2.UnshareResponse.SerializeToString,
             ),
             'UploadFile': grpc.stream_unary_rpc_method_handler(
                     servicer.UploadFile,
@@ -1790,6 +1841,87 @@ class Burrow(object):
             '/burrow.api.v1.Burrow/ClosePort',
             api__pb2.ClosePortRequest.SerializeToString,
             api__pb2.ClosePortResponse.FromString,
+            options,
+            channel_credentials,
+            insecure,
+            call_credentials,
+            compression,
+            wait_for_ready,
+            timeout,
+            metadata,
+            _registered_method=True)
+
+    @staticmethod
+    def ShareSandbox(request,
+            target,
+            options=(),
+            channel_credentials=None,
+            call_credentials=None,
+            insecure=False,
+            compression=None,
+            wait_for_ready=None,
+            timeout=None,
+            metadata=None):
+        return grpc.experimental.unary_unary(
+            request,
+            target,
+            '/burrow.api.v1.Burrow/ShareSandbox',
+            api__pb2.ShareRequest.SerializeToString,
+            api__pb2.Share.FromString,
+            options,
+            channel_credentials,
+            insecure,
+            call_credentials,
+            compression,
+            wait_for_ready,
+            timeout,
+            metadata,
+            _registered_method=True)
+
+    @staticmethod
+    def GetShare(request,
+            target,
+            options=(),
+            channel_credentials=None,
+            call_credentials=None,
+            insecure=False,
+            compression=None,
+            wait_for_ready=None,
+            timeout=None,
+            metadata=None):
+        return grpc.experimental.unary_unary(
+            request,
+            target,
+            '/burrow.api.v1.Burrow/GetShare',
+            api__pb2.SandboxRef.SerializeToString,
+            api__pb2.Share.FromString,
+            options,
+            channel_credentials,
+            insecure,
+            call_credentials,
+            compression,
+            wait_for_ready,
+            timeout,
+            metadata,
+            _registered_method=True)
+
+    @staticmethod
+    def UnshareSandbox(request,
+            target,
+            options=(),
+            channel_credentials=None,
+            call_credentials=None,
+            insecure=False,
+            compression=None,
+            wait_for_ready=None,
+            timeout=None,
+            metadata=None):
+        return grpc.experimental.unary_unary(
+            request,
+            target,
+            '/burrow.api.v1.Burrow/UnshareSandbox',
+            api__pb2.SandboxRef.SerializeToString,
+            api__pb2.UnshareResponse.FromString,
             options,
             channel_credentials,
             insecure,

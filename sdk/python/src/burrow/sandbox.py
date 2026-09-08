@@ -35,6 +35,7 @@ from .types import (
     NodeInfo,
     OutputChunk,
     PortMapping,
+    Share,
     SandboxInfo,
     Session,
     Usage,
@@ -233,6 +234,18 @@ def _collect(chunks: Iterator[OutputChunk]) -> CommandResult:
         stderr="".join(stderr),
         exit_code=exit_code,
         success=exit_code == 0,
+    )
+
+
+def _to_share(raw: api_pb2.Share) -> Share:
+    return Share(
+        address=raw.address,
+        ports=list(raw.ports),
+        allowed_clients=list(raw.allowed_clients),
+        proxy_protocol=raw.proxy_protocol,
+        created_at=raw.created_at,
+        udp_ports=list(raw.udp_ports),
+        all_udp=raw.all_udp,
     )
 
 
@@ -1296,6 +1309,54 @@ class Sandbox:
         self._transport.unary(
             "ClosePort", api_pb2.ClosePortRequest(sandbox_id=self.id, host_port=host_port)
         )
+
+    def share(
+        self,
+        ports: Optional[Sequence[int]] = None,
+        allowed_clients: Optional[Sequence[str]] = None,
+        rotate: bool = False,
+        proxy_protocol: bool = False,
+        udp_ports: Optional[Sequence[int]] = None,
+        all_udp: bool = False,
+    ) -> Share:
+        """Shares the sandbox through a tailcat address.
+
+        A share is a WireGuard tunnel bootstrapped over a DERP relay, dialed
+        with the `tailcat` CLI: no host port, no edge, and a connection wakes
+        a suspended sandbox. Calling it again reshapes an existing share and
+        keeps its address; `rotate=True` issues new keys and so a new address.
+        TCP is shared on every port unless `ports` narrows it; UDP only on
+        `udp_ports`, or everywhere with `all_udp=True`.
+
+        ```python
+        share = sandbox.share(ports=[22])
+        print(f"tailcat ssh {share.address}")
+        ```
+        """
+        self._assert_live()
+        res = self._transport.unary(
+            "ShareSandbox",
+            api_pb2.ShareRequest(
+                sandbox_id=self.id,
+                ports=list(ports or []),
+                allowed_clients=list(allowed_clients or []),
+                rotate=rotate,
+                proxy_protocol=proxy_protocol,
+                udp_ports=list(udp_ports or []),
+                all_udp=all_udp,
+            ),
+        )
+        return _to_share(res)
+
+    def get_share(self) -> Share:
+        """The sandbox's share. Raises `not_found` when it has none."""
+        self._assert_live()
+        return _to_share(self._transport.unary("GetShare", api_pb2.SandboxRef(id=self.id)))
+
+    def unshare(self) -> None:
+        """Revokes the share; its address stops working at once."""
+        self._assert_live()
+        self._transport.unary("UnshareSandbox", api_pb2.SandboxRef(id=self.id))
 
     def update(self, **options: Any) -> SandboxInfo:
         """Updates tags, the network policy, the access policy, or any

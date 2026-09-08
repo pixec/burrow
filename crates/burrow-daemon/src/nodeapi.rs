@@ -600,6 +600,47 @@ impl NodeService for NodeApi {
         Ok(Response::new(api::ClosePortResponse {}))
     }
 
+    async fn share_sandbox(
+        &self,
+        req: Request<api::ShareRequest>,
+    ) -> Result<Response<api::Share>, Status> {
+        let req = req.into_inner();
+        let ports = share_ports(&req.ports)?;
+        let udp_ports = share_ports(&req.udp_ports)?;
+        let info = self
+            .sandboxes
+            .share(
+                &req.sandbox_id,
+                crate::share::ShareShape {
+                    ports,
+                    allowed_clients: req.allowed_clients,
+                    proxy_protocol: req.proxy_protocol,
+                    udp_ports,
+                    all_udp: req.all_udp,
+                },
+                req.rotate,
+            )
+            .await?;
+        Ok(Response::new(share_proto(req.sandbox_id, info)))
+    }
+
+    async fn get_share(
+        &self,
+        req: Request<nodepb::NodeSandboxRef>,
+    ) -> Result<Response<api::Share>, Status> {
+        let sandbox_id = req.into_inner().sandbox_id;
+        let info = self.sandboxes.get_share(&sandbox_id).await?;
+        Ok(Response::new(share_proto(sandbox_id, info)))
+    }
+
+    async fn unshare_sandbox(
+        &self,
+        req: Request<nodepb::NodeSandboxRef>,
+    ) -> Result<Response<api::UnshareResponse>, Status> {
+        self.sandboxes.unshare(&req.into_inner().sandbox_id).await?;
+        Ok(Response::new(api::UnshareResponse {}))
+    }
+
     type ExecStream = BoxStream<api::ExecOutput>;
 
     async fn exec(
@@ -1291,6 +1332,30 @@ async fn remove_partial_upload_inner(sandbox: &RunningSandbox, path: &str) {
         // cancel the command that is doing the cleaning.
         let mut stream = response.into_inner();
         while let Some(Ok(_)) = stream.next().await {}
+    }
+}
+
+fn share_ports(ports: &[u32]) -> Result<Vec<u16>, Status> {
+    let ports = ports
+        .iter()
+        .map(|p| port_u16(*p))
+        .collect::<Result<Vec<_>, _>>()?;
+    if ports.contains(&0) {
+        return Err(Status::invalid_argument("port 0 cannot be shared"));
+    }
+    Ok(ports)
+}
+
+fn share_proto(sandbox_id: String, info: crate::share::ShareInfo) -> api::Share {
+    api::Share {
+        sandbox_id,
+        address: info.address,
+        ports: info.spec.ports.iter().map(|p| u32::from(*p)).collect(),
+        allowed_clients: info.spec.allowed_clients,
+        proxy_protocol: info.spec.proxy_protocol,
+        created_at: burrow_core::rfc3339_from_unix_secs(info.spec.created_at),
+        udp_ports: info.spec.udp_ports.iter().map(|p| u32::from(*p)).collect(),
+        all_udp: info.spec.all_udp,
     }
 }
 
