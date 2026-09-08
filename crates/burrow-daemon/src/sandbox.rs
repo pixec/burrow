@@ -4611,8 +4611,10 @@ pub(crate) mod tests {
         // another would look like an in-flight request.
         drop(sandbox);
 
+        // The lease goes back last, after the registry entry and the firewall
+        // re-render, so it is the condition to wait on.
         for _ in 0..200 {
-            if manager.sandboxes.lock().await.is_empty() {
+            if manager.ipam.lock().await.get("sbx_no_agent").is_none() {
                 break;
             }
             tokio::time::sleep(std::time::Duration::from_millis(10)).await;
