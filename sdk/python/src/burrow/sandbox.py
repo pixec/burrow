@@ -35,6 +35,7 @@ from .types import (
     NodeInfo,
     OutputChunk,
     PortMapping,
+    Share,
     SandboxInfo,
     Session,
     Usage,
@@ -236,6 +237,18 @@ def _collect(chunks: Iterator[OutputChunk]) -> CommandResult:
     )
 
 
+def _to_share(raw: api_pb2.Share) -> Share:
+    return Share(
+        address=raw.address,
+        ports=list(raw.ports),
+        allowed_clients=list(raw.allowed_clients),
+        created_at=raw.created_at,
+        udp_ports=list(raw.udp_ports),
+        all_udp=raw.all_udp,
+        transparent_ip=raw.transparent_ip,
+    )
+
+
 def _to_port(raw: api_pb2.PortMapping, fallback_host: str) -> PortMapping:
     # The node advertises where it accepts traffic; when it has not, the
     # control plane's own host is the best guess, and the right one for a
@@ -248,6 +261,7 @@ def _to_port(raw: api_pb2.PortMapping, fallback_host: str) -> PortMapping:
         # Empty unless the holding node's edge is serving, rather than a name
         # that resolves nowhere.
         edge_url=raw.edge_url,
+        udp=raw.udp,
     )
 
 
@@ -1252,8 +1266,13 @@ class Sandbox:
 
         return watcher
 
-    def expose_port(self, guest_port: int, host_port: int = 0) -> PortMapping:
+    def expose_port(
+        self, guest_port: int, host_port: int = 0, udp: bool = False
+    ) -> PortMapping:
         """Publishes a port from inside the sandbox on its node's address.
+
+        A host port carries one protocol, so publishing both TCP and UDP for
+        a guest port takes two calls.
 
         ```python
         mapping = sandbox.expose_port(8000)
@@ -1264,7 +1283,10 @@ class Sandbox:
         res = self._transport.unary(
             "ExposePort",
             api_pb2.ExposePortRequest(
-                sandbox_id=self.id, guest_port=guest_port, host_port=host_port
+                sandbox_id=self.id,
+                guest_port=guest_port,
+                host_port=host_port,
+                udp=udp,
             ),
         )
         return _to_port(res, self._transport.host)
@@ -1296,6 +1318,56 @@ class Sandbox:
         self._transport.unary(
             "ClosePort", api_pb2.ClosePortRequest(sandbox_id=self.id, host_port=host_port)
         )
+
+    def share(
+        self,
+        ports: Optional[Sequence[int]] = None,
+        allowed_clients: Optional[Sequence[str]] = None,
+        rotate: bool = False,
+        udp_ports: Optional[Sequence[int]] = None,
+        all_udp: bool = False,
+        no_transparent_ip: bool = False,
+    ) -> Share:
+        """Shares the sandbox through a tailcat address.
+
+        A share is a WireGuard tunnel bootstrapped over a DERP relay, dialed
+        with the `tailcat` CLI: no host port, no edge, and a connection wakes
+        a suspended sandbox. Calling it again reshapes an existing share and
+        keeps its address; `rotate=True` issues new keys and so a new address.
+        TCP is shared on every port unless `ports` narrows it; UDP only on
+        `udp_ports`, or everywhere with `all_udp=True`. The guest sees each
+        client's own public IPv4 as the packet source; `no_transparent_ip`
+        sources from the gateway instead.
+
+        ```python
+        share = sandbox.share(ports=[22])
+        print(f"tailcat ssh {share.address}")
+        ```
+        """
+        self._assert_live()
+        res = self._transport.unary(
+            "ShareSandbox",
+            api_pb2.ShareRequest(
+                sandbox_id=self.id,
+                ports=list(ports or []),
+                allowed_clients=list(allowed_clients or []),
+                rotate=rotate,
+                udp_ports=list(udp_ports or []),
+                all_udp=all_udp,
+                no_transparent_ip=no_transparent_ip,
+            ),
+        )
+        return _to_share(res)
+
+    def get_share(self) -> Share:
+        """The sandbox's share. Raises `not_found` when it has none."""
+        self._assert_live()
+        return _to_share(self._transport.unary("GetShare", api_pb2.SandboxRef(id=self.id)))
+
+    def unshare(self) -> None:
+        """Revokes the share; its address stops working at once."""
+        self._assert_live()
+        self._transport.unary("UnshareSandbox", api_pb2.SandboxRef(id=self.id))
 
     def update(self, **options: Any) -> SandboxInfo:
         """Updates tags, the network policy, the access policy, or any

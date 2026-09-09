@@ -68,6 +68,8 @@ export type {
   StringMatch,
   Session,
   SessionEnd,
+  Share,
+  ShareOptions,
   SessionStart,
   UpdateOptions,
   Usage,

@@ -217,8 +217,10 @@ where
 /// [`crate::sandbox::SandboxManager::list_ports`] returns them. Shared with
 /// [`crate::sandboxproxy`], which forwards traffic too and needs the same
 /// check.
-pub(crate) fn port_is_published(ports: &[(u16, u16)], guest_port: u16) -> bool {
-    ports.iter().any(|&(_, published)| published == guest_port)
+pub(crate) fn port_is_published(ports: &[burrow_net::PortMap], guest_port: u16) -> bool {
+    ports
+        .iter()
+        .any(|port| port.guest_port == guest_port && port.protocol == burrow_net::Protocol::Tcp)
 }
 
 /// An answer the edge gives instead of a guest.
@@ -263,14 +265,34 @@ mod tests {
         answer
     }
 
+    fn published(
+        host_port: u16,
+        guest_port: u16,
+        protocol: burrow_net::Protocol,
+    ) -> burrow_net::PortMap {
+        burrow_net::PortMap {
+            host_port,
+            guest_port,
+            protocol,
+        }
+    }
+
     /// The edge must not treat every guest port as reachable just because
     /// the hostname names it, only a port the sandbox actually published.
+    /// A UDP mapping is not one of them: the edge carries HTTP, so routing to
+    /// it would splice an HTTP request into a port serving datagrams.
     #[test]
-    fn only_a_published_port_is_reachable() {
-        let ports = [(20005, 8080), (20006, 22)];
+    fn only_a_published_tcp_port_is_reachable() {
+        use burrow_net::Protocol;
+        let ports = [
+            published(20005, 8080, Protocol::Tcp),
+            published(20006, 22, Protocol::Tcp),
+            published(20007, 5353, Protocol::Udp),
+        ];
         assert!(port_is_published(&ports, 8080));
         assert!(port_is_published(&ports, 22));
         assert!(!port_is_published(&ports, 6379));
+        assert!(!port_is_published(&ports, 5353));
         assert!(!port_is_published(&[], 8080));
     }
 

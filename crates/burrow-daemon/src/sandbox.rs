@@ -76,6 +76,8 @@ pub struct NodeConfig {
     /// has reached every other sandbox, without a packet ever crossing a rule
     /// about them.
     pub control_plane: Vec<std::net::Ipv4Addr>,
+    /// Whether and through which relay sandboxes here can be shared.
+    pub share: crate::share::ShareOptions,
 }
 
 impl NodeConfig {
@@ -1094,6 +1096,8 @@ pub struct SandboxManager {
     ipam: Arc<Mutex<Arc<Ipam>>>,
     /// sandbox id -> published ports.
     ports: Arc<Mutex<HashMap<String, Vec<firewall::PortMap>>>>,
+    /// Tailcat servers for the sandboxes shared here.
+    shares: Arc<crate::share::Shares>,
     /// Source-address -> egress policy, consulted by the proxy.
     proxy_policies: Arc<burrow_proxy::PolicyTable>,
     /// DNS pins, pruned alongside the policy table so a recycled address never
@@ -1294,6 +1298,10 @@ impl SandboxManager {
             firewall: Arc::new(tokio::sync::Mutex::new(())),
             snapshots: Arc::new(crate::snapshot::SnapshotStore::new(&config.data_dir)),
             volumes: Arc::new(crate::volume::VolumeStore::new(&config.data_dir)),
+            shares: Arc::new(crate::share::Shares::new(
+                config.share.clone(),
+                &config.data_dir,
+            )),
             config,
             sandboxes: Arc::new(Mutex::new(HashMap::new())),
             creating: Arc::new(Mutex::new(std::collections::HashSet::new())),
@@ -1490,7 +1498,15 @@ impl SandboxManager {
             state: record.state,
             lease_block: sandbox.lease.block,
             tap: sandbox.tap.clone(),
-            ports: ports.iter().map(|p| (p.host_port, p.guest_port)).collect(),
+            ports: ports
+                .iter()
+                .map(|p| burrow_store::PortRow {
+                    host_port: p.host_port,
+                    guest_port: p.guest_port,
+                    udp: p.protocol == firewall::Protocol::Udp,
+                })
+                .collect(),
+            share: self.shares.spec(sandbox.id()).await,
             suspended_at: sandbox.suspended_at(),
         };
         if let Err(err) = self.store.put_sandbox(&row) {
@@ -1728,15 +1744,28 @@ impl SandboxManager {
                     row.id.clone(),
                     row.ports
                         .iter()
-                        .map(|(host_port, guest_port)| firewall::PortMap {
-                            host_port: *host_port,
-                            guest_port: *guest_port,
+                        .map(|p| firewall::PortMap {
+                            host_port: p.host_port,
+                            guest_port: p.guest_port,
+                            protocol: if p.udp {
+                                firewall::Protocol::Udp
+                            } else {
+                                firewall::Protocol::Tcp
+                            },
                         })
                         .collect(),
                 );
             }
             self.sandboxes.lock().await.insert(row.id.clone(), sandbox);
             restored += 1;
+            // Restarted from its stored keys, so the address clients hold is
+            // still the one that works. A relay that is unreachable right now
+            // is not a reason to lose the share: the server keeps trying.
+            if let Some(share) = row.share
+                && let Err(err) = self.shares.start(self, &row.id, share).await
+            {
+                tracing::error!(sandbox = row.id, %err, "could not restart the sandbox's share");
+            }
         }
 
         self.collect_orphan_workdirs().await;
@@ -1887,7 +1916,8 @@ impl SandboxManager {
         sandbox_id: &str,
         guest_port: u16,
         requested_host_port: u16,
-    ) -> Result<(u16, u16), Status> {
+        protocol: firewall::Protocol,
+    ) -> Result<firewall::PortMap, Status> {
         if guest_port == 0 {
             return Err(Status::invalid_argument("guest_port is required"));
         }
@@ -1929,6 +1959,7 @@ impl SandboxManager {
             .push(firewall::PortMap {
                 host_port,
                 guest_port,
+                protocol,
             });
         drop(ports);
 
@@ -1937,17 +1968,22 @@ impl SandboxManager {
             sandbox = sandbox_id,
             host_port,
             guest_port,
+            protocol = protocol.keyword(),
             "port published"
         );
-        Ok((host_port, guest_port))
+        Ok(firewall::PortMap {
+            host_port,
+            guest_port,
+            protocol,
+        })
     }
 
-    pub async fn list_ports(&self, sandbox_id: &str) -> Vec<(u16, u16)> {
+    pub async fn list_ports(&self, sandbox_id: &str) -> Vec<firewall::PortMap> {
         self.ports
             .lock()
             .await
             .get(sandbox_id)
-            .map(|ports| ports.iter().map(|p| (p.host_port, p.guest_port)).collect())
+            .cloned()
             .unwrap_or_default()
     }
 
@@ -1966,6 +2002,47 @@ impl SandboxManager {
             }
         }
         self.sync_firewall().await?;
+        Ok(())
+    }
+
+    /// Shares a sandbox through a tailcat address, or reshapes an existing
+    /// share. The keys, and so the address, are kept unless `rotate` asks for
+    /// new ones.
+    pub async fn share(
+        &self,
+        sandbox_id: &str,
+        shape: crate::share::ShareShape,
+        rotate: bool,
+    ) -> Result<crate::share::ShareInfo, Status> {
+        for key in &shape.allowed_clients {
+            key.parse::<tailcat_rs::NodePublic>()
+                .map_err(|_| Status::invalid_argument(format!("invalid client key {key:?}")))?;
+        }
+        let sandbox = self.get(sandbox_id).await?;
+        let spec = match self.shares.spec(sandbox_id).await {
+            Some(existing) if !rotate => shape.onto(existing),
+            _ => crate::share::Shares::new_spec(shape),
+        };
+        let info = self.shares.start(self, sandbox_id, spec).await?;
+        self.persist(&sandbox).await;
+        Ok(info)
+    }
+
+    pub async fn get_share(&self, sandbox_id: &str) -> Result<crate::share::ShareInfo, Status> {
+        self.get(sandbox_id).await?;
+        self.shares
+            .get(sandbox_id)
+            .await
+            .ok_or_else(|| Status::not_found("sandbox is not shared"))
+    }
+
+    pub async fn unshare(&self, sandbox_id: &str) -> Result<(), Status> {
+        let sandbox = self.get(sandbox_id).await?;
+        if !self.shares.stop(sandbox_id).await {
+            return Err(Status::not_found("sandbox is not shared"));
+        }
+        self.persist(&sandbox).await;
+        tracing::info!(sandbox = sandbox_id, "share revoked");
         Ok(())
     }
 
@@ -2699,10 +2776,12 @@ impl SandboxManager {
             }
 
             // A suspended sandbox is already idle; only a running one has
-            // anything to reclaim.
+            // anything to reclaim, and one with a shared connection open is
+            // in use however long ago it was last asked for anything.
             if resources.idle_suspend_secs > 0
                 && sandbox.is_running()
                 && sandbox.idle_secs() >= resources.idle_suspend_secs as i64
+                && self.shares.open_connections(&id).await == 0
             {
                 match self.pause(&id).await {
                     Ok(_) => {
@@ -4010,6 +4089,7 @@ impl SandboxManager {
         tap::delete(&tap_name).await;
         self.volumes.release_all(id);
         self.ports.lock().await.remove(id);
+        self.shares.stop(id).await;
         if let Err(err) = self.store.delete_sandbox(id) {
             tracing::error!(sandbox = id, %err, "failed to remove sandbox from store");
         }
@@ -4207,6 +4287,12 @@ pub(crate) mod tests {
                 jail: None,
                 artifact_retention: std::time::Duration::from_secs(7 * 24 * 60 * 60),
                 control_plane: Vec::new(),
+                share: crate::share::ShareOptions {
+                    enabled: false,
+                    transparent: false,
+                    region: None,
+                    derp_map_url: None,
+                },
             },
             Arc::new(burrow_proxy::PolicyTable::default()),
             Arc::new(burrow_proxy::Resolutions::default()),

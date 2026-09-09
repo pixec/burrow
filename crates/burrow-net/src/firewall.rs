@@ -61,10 +61,31 @@ pub enum Mode {
     Open,
 }
 
+/// Transport a published port forwards. A mapping is one or the other, and a
+/// host port belongs to one mapping whichever it is, so `tcp/20000` and
+/// `udp/20000` are never two different sandboxes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Protocol {
+    #[default]
+    Tcp,
+    Udp,
+}
+
+impl Protocol {
+    /// The nftables keyword, which is also how the CLI and the API spell it.
+    pub fn keyword(self) -> &'static str {
+        match self {
+            Protocol::Tcp => "tcp",
+            Protocol::Udp => "udp",
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct PortMap {
     pub host_port: u16,
     pub guest_port: u16,
+    pub protocol: Protocol,
 }
 
 #[derive(Debug, Clone)]
@@ -703,7 +724,8 @@ fn render_sandbox_allowances(out: &mut String, sandbox: &SandboxRules) {
     for port in &sandbox.ports {
         let _ = writeln!(
             out,
-            "add rule inet {FILTER_TABLE} sandbox {external} ip daddr {guest} tcp dport {} accept",
+            "add rule inet {FILTER_TABLE} sandbox {external} ip daddr {guest} {} dport {} accept",
+            port.protocol.keyword(),
             port.guest_port
         );
     }
@@ -774,8 +796,11 @@ fn render_nat(out: &mut String, sandboxes: &[SandboxRules]) {
         for port in &sandbox.ports {
             let _ = writeln!(
                 out,
-                "add rule ip {NAT_TABLE} prerouting {external} tcp dport {} dnat to {}:{}",
-                port.host_port, sandbox.guest_ip, port.guest_port
+                "add rule ip {NAT_TABLE} prerouting {external} {} dport {} dnat to {}:{}",
+                port.protocol.keyword(),
+                port.host_port,
+                sandbox.guest_ip,
+                port.guest_port
             );
         }
     }
@@ -1257,10 +1282,29 @@ mod tests {
         s.ports = vec![PortMap {
             host_port: 18080,
             guest_port: 8000,
+            protocol: Protocol::Tcp,
         }];
         let ruleset = render(&[s]);
         assert!(ruleset.contains("tcp dport 18080 dnat to 10.99.0.6:8000"));
         assert!(ruleset.contains("ip daddr 10.99.0.6 tcp dport 8000 accept"));
+    }
+
+    /// A UDP mapping is the same two rules with the other keyword. Getting
+    /// the protocol from the mapping is what keeps the DNAT and the accept
+    /// from ever disagreeing about which one a port carries.
+    #[test]
+    fn a_udp_mapping_renders_udp_rules_and_no_tcp_ones() {
+        let mut s = sandbox(Mode::Open);
+        s.ports = vec![PortMap {
+            host_port: 18080,
+            guest_port: 5353,
+            protocol: Protocol::Udp,
+        }];
+        let ruleset = render(&[s]);
+        assert!(ruleset.contains("udp dport 18080 dnat to 10.99.0.6:5353"));
+        assert!(ruleset.contains("ip daddr 10.99.0.6 udp dport 5353 accept"));
+        assert!(!ruleset.contains("tcp dport 18080"));
+        assert!(!ruleset.contains("tcp dport 5353"));
     }
 
     /// A published port is a door from outside. Matching on destination port
@@ -1273,6 +1317,7 @@ mod tests {
         s.ports = vec![PortMap {
             host_port: 18080,
             guest_port: 8000,
+            protocol: Protocol::Tcp,
         }];
         let ruleset = render(&[s]);
 

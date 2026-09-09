@@ -64,6 +64,10 @@ service NodeService {
   rpc ListPorts(NodeSandboxRef) returns (burrow.api.v1.ListPortsResponse);
   rpc ClosePort(burrow.api.v1.ClosePortRequest) returns (burrow.api.v1.ClosePortResponse);
 
+  rpc ShareSandbox(burrow.api.v1.ShareRequest) returns (burrow.api.v1.Share);
+  rpc GetShare(NodeSandboxRef) returns (burrow.api.v1.Share);
+  rpc UnshareSandbox(NodeSandboxRef) returns (burrow.api.v1.UnshareResponse);
+
   rpc Exec(stream burrow.api.v1.ExecInput) returns (stream burrow.api.v1.ExecOutput);
   rpc ListCommands(burrow.api.v1.ListCommandsRequest) returns (burrow.api.v1.ListCommandsResponse);
   rpc GetCommand(burrow.api.v1.GetCommandRequest) returns (burrow.api.v1.CommandInfo);

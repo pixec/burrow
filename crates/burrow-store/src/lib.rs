@@ -40,12 +40,54 @@ pub struct SandboxRow {
     /// address rather than having it handed to a new one.
     pub lease_block: u32,
     pub tap: String,
-    /// `[(host_port, guest_port)]`.
-    pub ports: Vec<(u16, u16)>,
+    /// Ports published on the node's address.
+    pub ports: Vec<PortRow>,
+    /// The sandbox's tailcat share, if it has one.
+    pub share: Option<ShareRow>,
     /// Unix seconds the sandbox entered SUSPENDED; 0 while it is running.
     /// Persisted because `suspended_ttl_secs` is measured from it, and a node
     /// restart that reset it would let a sandbox outlive its retention forever.
     pub suspended_at: i64,
+}
+
+/// One published port.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PortRow {
+    pub host_port: u16,
+    pub guest_port: u16,
+    pub udp: bool,
+}
+
+/// A sandbox's tailcat share: the keys its address is made of and what the
+/// share admits. The keys are what keep the address stable across a daemon
+/// restart, which is why they are stored rather than regenerated.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ShareRow {
+    /// `privkey:<hex>`.
+    pub key: String,
+    /// `psk:<hex>`.
+    pub preshared_key: String,
+    /// Guest TCP ports admitted; empty means every port.
+    pub ports: Vec<u16>,
+    /// `nodekey:<hex>` of each admitted client; empty admits any.
+    pub allowed_clients: Vec<String>,
+    /// Unix seconds the current keys were issued.
+    pub created_at: i64,
+    /// Guest UDP ports admitted; `all_udp` admits every one. Absent from rows
+    /// written before UDP shares existed, which admitted none.
+    #[serde(default)]
+    pub udp_ports: Vec<u16>,
+    #[serde(default)]
+    pub all_udp: bool,
+    /// Source each connection from the last pong-verified public IPv4.
+    /// Rows written before this existed take today's default rather than
+    /// silently keeping the old behaviour.
+    #[serde(default = "yes")]
+    pub transparent_ip: bool,
+}
+
+fn yes() -> bool {
+    true
 }
 
 /// One VM boot inside a sandbox's life.
@@ -182,13 +224,13 @@ impl Store {
         let conn = self.conn.lock().unwrap();
         conn.execute(
             "INSERT INTO sandboxes
-                (id, template, record, state, lease_block, tap, ports_json, suspended_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
+                (id, template, record, state, lease_block, tap, ports_json, suspended_at, share_json)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
              ON CONFLICT(id) DO UPDATE SET
                 template=excluded.template, record=excluded.record,
                 state=excluded.state, lease_block=excluded.lease_block,
                 tap=excluded.tap, ports_json=excluded.ports_json,
-                suspended_at=excluded.suspended_at",
+                suspended_at=excluded.suspended_at, share_json=excluded.share_json",
             rusqlite::params![
                 row.id,
                 row.template,
@@ -198,6 +240,10 @@ impl Store {
                 row.tap,
                 serde_json::to_string(&row.ports)?,
                 row.suspended_at,
+                match &row.share {
+                    Some(share) => serde_json::to_string(share)?,
+                    None => String::new(),
+                },
             ],
         )?;
         Ok(())
@@ -221,12 +267,13 @@ impl Store {
     pub fn list_sandboxes(&self) -> Result<Vec<SandboxRow>> {
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn.prepare(
-            "SELECT id, template, record, state, lease_block, tap, ports_json, suspended_at
+            "SELECT id, template, record, state, lease_block, tap, ports_json, suspended_at, share_json
              FROM sandboxes ORDER BY id",
         )?;
         let rows = stmt
             .query_map([], |row| {
                 let ports_json: String = row.get(6)?;
+                let share_json: String = row.get(8)?;
                 Ok((
                     SandboxRow {
                         id: row.get(0)?,
@@ -236,16 +283,19 @@ impl Store {
                         lease_block: row.get(4)?,
                         tap: row.get(5)?,
                         ports: Vec::new(),
+                        share: None,
                         suspended_at: row.get(7)?,
                     },
                     ports_json,
+                    share_json,
                 ))
             })?
             .collect::<std::result::Result<Vec<_>, _>>()?;
 
         rows.into_iter()
-            .map(|(mut row, ports_json)| {
+            .map(|(mut row, ports_json, share_json)| {
                 row.ports = serde_json::from_str(&ports_json).unwrap_or_default();
+                row.share = serde_json::from_str(&share_json).ok();
                 Ok(row)
             })
             .collect()
@@ -512,8 +562,10 @@ impl Store {
 /// expected to fail with "duplicate column" on a database that already has it,
 /// which is why the result is discarded rather than checked.
 fn migrate(conn: &Connection) {
-    const ADDED_COLUMNS: &[&str] =
-        &["ALTER TABLE sandboxes ADD COLUMN suspended_at INTEGER NOT NULL DEFAULT 0"];
+    const ADDED_COLUMNS: &[&str] = &[
+        "ALTER TABLE sandboxes ADD COLUMN suspended_at INTEGER NOT NULL DEFAULT 0",
+        "ALTER TABLE sandboxes ADD COLUMN share_json TEXT NOT NULL DEFAULT ''",
+    ];
     for statement in ADDED_COLUMNS {
         let _ = conn.execute(statement, []);
     }
@@ -528,7 +580,8 @@ CREATE TABLE IF NOT EXISTS sandboxes (
     lease_block  INTEGER NOT NULL,
     tap          TEXT NOT NULL,
     ports_json   TEXT NOT NULL DEFAULT '[]',
-    suspended_at INTEGER NOT NULL DEFAULT 0
+    suspended_at INTEGER NOT NULL DEFAULT 0,
+    share_json   TEXT NOT NULL DEFAULT ''
 );
 CREATE TABLE IF NOT EXISTS sessions (
     id           TEXT PRIMARY KEY,
@@ -580,9 +633,54 @@ mod tests {
             state: 2,
             lease_block: block,
             tap: format!("bt{block}"),
-            ports: vec![(20000, 8000)],
+            ports: vec![PortRow {
+                host_port: 20000,
+                guest_port: 8000,
+                udp: false,
+            }],
+            share: None,
             suspended_at: 0,
         }
+    }
+
+    #[test]
+    fn a_share_survives_a_reload() {
+        let store = Store::open_in_memory().unwrap();
+        let mut shared = row("sbx_a", 1);
+        shared.share = Some(ShareRow {
+            key: "privkey:00".into(),
+            preshared_key: "psk:00".into(),
+            ports: vec![22, 8080],
+            allowed_clients: vec!["nodekey:11".into()],
+            created_at: 1_800_000_000,
+            udp_ports: vec![53],
+            all_udp: false,
+            transparent_ip: true,
+        });
+        store.put_sandbox(&shared).unwrap();
+        store.put_sandbox(&row("sbx_b", 2)).unwrap();
+        let rows = store.list_sandboxes().unwrap();
+        assert_eq!(rows[0].share, shared.share);
+        assert_eq!(rows[1].share, None);
+    }
+
+    /// A share persisted before `transparent_ip` existed still loads, taking
+    /// the current default, and a `proxy_protocol` field written by an older
+    /// daemon is ignored.
+    #[test]
+    fn an_old_share_without_transparent_ip_loads() {
+        let json = r#"{
+            "key":"privkey:00",
+            "preshared_key":"psk:00",
+            "ports":[22],
+            "allowed_clients":[],
+            "proxy_protocol":false,
+            "created_at":1
+        }"#;
+        let row: ShareRow = serde_json::from_str(json).unwrap();
+        assert!(row.transparent_ip, "an old row takes today's default");
+        assert!(!row.all_udp);
+        assert!(row.udp_ports.is_empty());
     }
 
     /// `suspended_ttl_secs` is measured from this, so a restart that lost it
@@ -608,7 +706,14 @@ mod tests {
         assert_eq!(listed.len(), 1);
         assert_eq!(listed[0].lease_block, 1);
         assert_eq!(listed[0].tap, "bt1");
-        assert_eq!(listed[0].ports, vec![(20000, 8000)]);
+        assert_eq!(
+            listed[0].ports,
+            vec![PortRow {
+                host_port: 20000,
+                guest_port: 8000,
+                udp: false
+            }]
+        );
     }
 
     #[test]

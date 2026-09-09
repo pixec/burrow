@@ -317,12 +317,45 @@ enum Command {
         /// Preferred host port; omitted lets the node pick.
         #[arg(long, default_value_t = 0)]
         host_port: u32,
+        /// Forward UDP rather than TCP. Publishing both takes two mappings.
+        #[arg(long)]
+        udp: bool,
     },
     /// List published ports for a sandbox.
     #[command(visible_alias = "ports")]
     Port { id: String },
     /// Withdraw a published port.
     Unexpose { id: String, host_port: u32 },
+    /// Share a sandbox through a tailcat address: a WireGuard tunnel over a
+    /// DERP relay that any `tailcat` client can dial, with no host port and
+    /// no edge. The address is the credential, so treat it as a secret.
+    Share {
+        id: String,
+        /// Guest TCP port reachable through the share. Repeatable; omitted
+        /// shares every port.
+        #[arg(long = "port", value_delimiter = ',')]
+        ports: Vec<u32>,
+        /// Client node key admitted, as `nodekey:<hex>`. Repeatable; omitted
+        /// admits anyone holding the address.
+        #[arg(long = "allow")]
+        allowed_clients: Vec<String>,
+        /// Issue new keys, and so a new address, to an existing share.
+        #[arg(long)]
+        rotate: bool,
+        /// Source connections from the gateway instead of from the client's
+        /// own address, which is what the guest sees by default.
+        #[arg(long)]
+        no_transparent_ip: bool,
+        /// Guest UDP port reachable through the share, or `all`. Repeatable;
+        /// omitted shares no UDP.
+        #[arg(long = "udp-port", value_delimiter = ',')]
+        udp_ports: Vec<String>,
+        /// Print the existing share without changing it.
+        #[arg(long, conflicts_with_all = ["ports", "allowed_clients", "rotate", "udp_ports", "no_transparent_ip"])]
+        show: bool,
+    },
+    /// Revoke a sandbox's share.
+    Unshare { id: String },
     /// List a directory inside a sandbox.
     Dir { id: String, path: String },
     /// Template operations.
@@ -1272,12 +1305,14 @@ async fn main() -> anyhow::Result<()> {
             id,
             guest_port,
             host_port,
+            udp,
         } => {
             let mapping = client
                 .expose_port(api::ExposePortRequest {
                     sandbox_id: id,
                     guest_port,
                     host_port,
+                    udp,
                 })
                 .await?
                 .into_inner();
@@ -1303,6 +1338,46 @@ async fn main() -> anyhow::Result<()> {
                 })
                 .await?;
             println!("closed {host_port}");
+        }
+        Command::Share {
+            id,
+            ports,
+            allowed_clients,
+            rotate,
+            udp_ports,
+            no_transparent_ip,
+            show,
+        } => {
+            let share = if show {
+                client.get_share(api::SandboxRef { id }).await?.into_inner()
+            } else {
+                let all_udp = udp_ports.iter().any(|p| p == "all");
+                let udp_ports = udp_ports
+                    .iter()
+                    .filter(|p| *p != "all")
+                    .map(|p| {
+                        p.parse::<u32>()
+                            .map_err(|_| anyhow::anyhow!("invalid UDP port {p:?}"))
+                    })
+                    .collect::<Result<Vec<_>, _>>()?;
+                client
+                    .share_sandbox(api::ShareRequest {
+                        sandbox_id: id,
+                        ports,
+                        allowed_clients,
+                        rotate,
+                        udp_ports,
+                        all_udp,
+                        no_transparent_ip,
+                    })
+                    .await?
+                    .into_inner()
+            };
+            print_share(&share);
+        }
+        Command::Unshare { id } => {
+            client.unshare_sandbox(api::SandboxRef { id }).await?;
+            println!("share revoked");
         }
         Command::Templates(TemplatesCommand::Ls) => list_templates(&mut client).await?,
         Command::Templates(TemplatesCommand::Import { image, name }) => {
@@ -2033,13 +2108,55 @@ fn describe_match(value: &common::StringMatch) -> String {
 /// its node's edge answers for, so both are shown. A node running no edge has no
 /// hostname routing, and the address is then printed alone.
 fn print_port(mapping: &api::PortMapping) {
+    let proto = if mapping.udp { "/udp" } else { "" };
     match mapping.edge_url.as_str() {
-        "" => println!("{} -> guest :{}", mapping.host_address, mapping.guest_port),
+        // A UDP mapping never has an edge URL: the edge carries HTTP.
+        "" => println!(
+            "{} -> guest :{}{proto}",
+            mapping.host_address, mapping.guest_port
+        ),
         url => println!(
-            "{} -> guest :{} ({})",
+            "{} -> guest :{}{proto} ({})",
             url, mapping.guest_port, mapping.host_address
         ),
     }
+}
+
+/// The address goes on stdout by itself, so `burrow share <id>` composes with
+/// a pipe; what it admits goes to stderr.
+fn print_share(share: &api::Share) {
+    println!("{}", share.address);
+    let ports = if share.ports.is_empty() {
+        "all".to_string()
+    } else {
+        share
+            .ports
+            .iter()
+            .map(|p| p.to_string())
+            .collect::<Vec<_>>()
+            .join(",")
+    };
+    eprintln!("# ports: {ports}");
+    if share.all_udp {
+        eprintln!("# udp ports: all");
+    } else if !share.udp_ports.is_empty() {
+        let udp = share
+            .udp_ports
+            .iter()
+            .map(|p| p.to_string())
+            .collect::<Vec<_>>()
+            .join(",");
+        eprintln!("# udp ports: {udp}");
+    }
+    if !share.allowed_clients.is_empty() {
+        eprintln!("# allowed clients: {}", share.allowed_clients.join(", "));
+    }
+    if share.transparent_ip {
+        eprintln!("# source: the client's last verified public IPv4");
+    } else {
+        eprintln!("# source: the gateway");
+    }
+    eprintln!("# connect with: tailcat {} <port>", share.address);
 }
 
 async fn list_nodes(client: &mut Client) -> anyhow::Result<()> {
@@ -2211,6 +2328,7 @@ async fn publish_ports(client: &mut Client, id: &str, ports: &[u32]) -> anyhow::
                 sandbox_id: id.to_string(),
                 guest_port: *port,
                 host_port: 0,
+                udp: false,
             })
             .await
         {
@@ -2531,6 +2649,7 @@ async fn set_ports(client: &mut Client, id: &str, ports: &[u32]) -> anyhow::Resu
                 sandbox_id: id.to_string(),
                 guest_port: *port,
                 host_port: 0,
+                udp: false,
             })
             .await?
             .into_inner();

@@ -83,6 +83,7 @@ SDK, so there is no second REST surface to drift.
 | `burrow-net` | Address allocation, tap devices, nftables policy, mesh |
 | `burrow-proxy` | Transparent egress proxy, domain allowlisting, DNS, egress audit |
 | `burrow-store` | SQLite persistence |
+| `tailcat-rs` | Tailcat server: WireGuard through a DERP relay with NAT traversal, terminated in a userspace TCP/UDP stack |
 | `burrow-agent` | Guest binary: runs as PID 1, serves gRPC over vsock |
 | `burrow-orchestrator` | Control plane binary |
 | `burrow-daemon` | `burrowd` node binary |
@@ -1210,9 +1211,10 @@ sum of node reports rather than an independently kept number.
 
 ```
 /var/lib/burrow/
-├── node.db                    sandboxes · sessions · published ports · egress audit
+├── node.db                    sandboxes · sessions · published ports · shares · egress audit
 ├── node-index                 this node's address-pool slice
 ├── wireguard.key              mesh identity (0600)
+├── tailcat-region.json        the DERP region shares listen through
 ├── images/<template>/
 │   ├── vmlinux
 │   ├── rootfs.ext4            read-only base, shared by hard link

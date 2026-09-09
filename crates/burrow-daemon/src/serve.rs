@@ -217,6 +217,31 @@ pub struct ServeArgs {
     /// values up to 256, neither carrying control characters.
     #[arg(long = "label", value_delimiter = ',', env = "BURROW_NODE_LABELS")]
     pub labels: Vec<String>,
+    /// Refuse to share sandboxes through tailcat addresses.
+    ///
+    /// A share is a WireGuard tunnel bootstrapped over a DERP relay, so a
+    /// node that can reach a relay can serve them without any port of its own
+    /// being reachable. Off means `burrow share` fails on this node.
+    #[arg(long, env = "BURROWD_NO_TAILCAT")]
+    pub no_tailcat: bool,
+    /// DERP region shares listen through. Unset picks the nearest region of
+    /// the DERP map by latency, once, and remembers it: the region is part of
+    /// every share's address.
+    #[arg(long, env = "BURROWD_TAILCAT_REGION")]
+    pub tailcat_region: Option<i64>,
+    /// Where to fetch the DERP map from. The default is tailcat's public map,
+    /// whose relays are free and rate limited; a fleet with real traffic runs
+    /// its own `derper` and points this at a map naming it.
+    #[arg(long, env = "BURROWD_TAILCAT_DERP_MAP_URL")]
+    pub tailcat_derp_map_url: Option<String>,
+    /// Make every share on this node source guest connections from the
+    /// gateway instead of the client's own address.
+    ///
+    /// Sourcing from the client needs a policy route and an nftables chain,
+    /// which this node installs the first time a share wants them. Set this
+    /// on a node where that state is unwelcome.
+    #[arg(long, env = "BURROWD_NO_TRANSPARENT_IP")]
+    pub no_transparent_ip: bool,
 }
 
 impl ServeArgs {
@@ -812,6 +837,12 @@ pub async fn run(args: ServeArgs) -> anyhow::Result<()> {
                 u64::from(args.artifact_retention_days) * 24 * 60 * 60,
             ),
             control_plane: control_plane_addresses(&args.orchestrator).await,
+            share: crate::share::ShareOptions {
+                enabled: !args.no_tailcat,
+                transparent: !args.no_transparent_ip,
+                region: args.tailcat_region,
+                derp_map_url: args.tailcat_derp_map_url.clone(),
+            },
         },
         Arc::clone(&proxy_policies),
         Arc::clone(&resolutions),
