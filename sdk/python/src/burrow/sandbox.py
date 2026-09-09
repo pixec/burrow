@@ -242,10 +242,10 @@ def _to_share(raw: api_pb2.Share) -> Share:
         address=raw.address,
         ports=list(raw.ports),
         allowed_clients=list(raw.allowed_clients),
-        proxy_protocol=raw.proxy_protocol,
         created_at=raw.created_at,
         udp_ports=list(raw.udp_ports),
         all_udp=raw.all_udp,
+        transparent_ip=raw.transparent_ip,
     )
 
 
@@ -1315,9 +1315,9 @@ class Sandbox:
         ports: Optional[Sequence[int]] = None,
         allowed_clients: Optional[Sequence[str]] = None,
         rotate: bool = False,
-        proxy_protocol: bool = False,
         udp_ports: Optional[Sequence[int]] = None,
         all_udp: bool = False,
+        no_transparent_ip: bool = False,
     ) -> Share:
         """Shares the sandbox through a tailcat address.
 
@@ -1326,7 +1326,9 @@ class Sandbox:
         a suspended sandbox. Calling it again reshapes an existing share and
         keeps its address; `rotate=True` issues new keys and so a new address.
         TCP is shared on every port unless `ports` narrows it; UDP only on
-        `udp_ports`, or everywhere with `all_udp=True`.
+        `udp_ports`, or everywhere with `all_udp=True`. The guest sees each
+        client's own public IPv4 as the packet source; `no_transparent_ip`
+        sources from the gateway instead.
 
         ```python
         share = sandbox.share(ports=[22])
@@ -1341,9 +1343,9 @@ class Sandbox:
                 ports=list(ports or []),
                 allowed_clients=list(allowed_clients or []),
                 rotate=rotate,
-                proxy_protocol=proxy_protocol,
                 udp_ports=list(udp_ports or []),
                 all_udp=all_udp,
+                no_transparent_ip=no_transparent_ip,
             ),
         )
         return _to_share(res)

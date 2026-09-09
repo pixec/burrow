@@ -63,7 +63,6 @@ pub struct ShareRow {
     pub ports: Vec<u16>,
     /// `nodekey:<hex>` of each admitted client; empty admits any.
     pub allowed_clients: Vec<String>,
-    pub proxy_protocol: bool,
     /// Unix seconds the current keys were issued.
     pub created_at: i64,
     /// Guest UDP ports admitted; `all_udp` admits every one. Absent from rows
@@ -72,6 +71,15 @@ pub struct ShareRow {
     pub udp_ports: Vec<u16>,
     #[serde(default)]
     pub all_udp: bool,
+    /// Source each connection from the last pong-verified public IPv4.
+    /// Rows written before this existed take today's default rather than
+    /// silently keeping the old behaviour.
+    #[serde(default = "yes")]
+    pub transparent_ip: bool,
+}
+
+fn yes() -> bool {
+    true
 }
 
 /// One VM boot inside a sandbox's life.
@@ -632,16 +640,35 @@ mod tests {
             preshared_key: "psk:00".into(),
             ports: vec![22, 8080],
             allowed_clients: vec!["nodekey:11".into()],
-            proxy_protocol: true,
             created_at: 1_800_000_000,
             udp_ports: vec![53],
             all_udp: false,
+            transparent_ip: true,
         });
         store.put_sandbox(&shared).unwrap();
         store.put_sandbox(&row("sbx_b", 2)).unwrap();
         let rows = store.list_sandboxes().unwrap();
         assert_eq!(rows[0].share, shared.share);
         assert_eq!(rows[1].share, None);
+    }
+
+    /// A share persisted before `transparent_ip` existed still loads, taking
+    /// the current default, and a `proxy_protocol` field written by an older
+    /// daemon is ignored.
+    #[test]
+    fn an_old_share_without_transparent_ip_loads() {
+        let json = r#"{
+            "key":"privkey:00",
+            "preshared_key":"psk:00",
+            "ports":[22],
+            "allowed_clients":[],
+            "proxy_protocol":false,
+            "created_at":1
+        }"#;
+        let row: ShareRow = serde_json::from_str(json).unwrap();
+        assert!(row.transparent_ip, "an old row takes today's default");
+        assert!(!row.all_udp);
+        assert!(row.udp_ports.is_empty());
     }
 
     /// `suspended_ttl_secs` is measured from this, so a restart that lost it

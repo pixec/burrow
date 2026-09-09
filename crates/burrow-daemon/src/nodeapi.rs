@@ -614,9 +614,9 @@ impl NodeService for NodeApi {
                 crate::share::ShareShape {
                     ports,
                     allowed_clients: req.allowed_clients,
-                    proxy_protocol: req.proxy_protocol,
                     udp_ports,
                     all_udp: req.all_udp,
+                    transparent_ip: !req.no_transparent_ip,
                 },
                 req.rotate,
             )
@@ -1352,10 +1352,10 @@ fn share_proto(sandbox_id: String, info: crate::share::ShareInfo) -> api::Share 
         address: info.address,
         ports: info.spec.ports.iter().map(|p| u32::from(*p)).collect(),
         allowed_clients: info.spec.allowed_clients,
-        proxy_protocol: info.spec.proxy_protocol,
         created_at: burrow_core::rfc3339_from_unix_secs(info.spec.created_at),
         udp_ports: info.spec.udp_ports.iter().map(|p| u32::from(*p)).collect(),
         all_udp: info.spec.all_udp,
+        transparent_ip: info.transparent_ip,
     }
 }
 

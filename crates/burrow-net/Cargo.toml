@@ -11,3 +11,8 @@ tracing = { workspace = true }
 # Only to check that a peer's WireGuard public key really is 32 bytes of
 # base64 before it is written into a config, never to produce one.
 base64 = { workspace = true }
+# IP_TRANSPARENT, so a share can bind the client's public address.
+libc = { workspace = true }
+# UDP sockets have to set IP_TRANSPARENT before bind; tokio's UdpSocket
+# does not expose that order.
+socket2 = "0.5"

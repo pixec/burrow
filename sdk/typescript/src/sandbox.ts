@@ -1497,7 +1497,8 @@ export class Sandbox {
    * suspended sandbox. Calling it again reshapes an existing share and keeps
    * its address; `rotate` issues new keys and so a new address. TCP is shared
    * on every port unless `ports` narrows it; UDP only on `udpPorts`, or
-   * everywhere with `allUdp`.
+   * everywhere with `allUdp`. The guest sees each client's own public IPv4
+   * as the packet source; `noTransparentIp` sources from the gateway.
    *
    * ```ts
    * const share = await sandbox.share({ ports: [22] });
@@ -1513,9 +1514,9 @@ export class Sandbox {
         ports: options.ports ?? [],
         allowedClients: options.allowedClients ?? [],
         rotate: options.rotate ?? false,
-        proxyProtocol: options.proxyProtocol ?? false,
         udpPorts: options.udpPorts ?? [],
         allUdp: options.allUdp ?? false,
+        noTransparentIp: options.noTransparentIp ?? false,
       },
       undefined,
       options.signal,
@@ -1997,10 +1998,10 @@ function toShare(raw: any): Share {
     address: raw.address ?? "",
     ports: (raw.ports ?? []).map((p: any) => Number(p)),
     allowedClients: raw.allowedClients ?? [],
-    proxyProtocol: Boolean(raw.proxyProtocol),
     createdAt: raw.createdAt ?? "",
     udpPorts: (raw.udpPorts ?? []).map((p: any) => Number(p)),
     allUdp: Boolean(raw.allUdp),
+    transparentIp: Boolean(raw.transparentIp),
   };
 }
 

@@ -238,13 +238,18 @@ message ShareRequest {
   // Issue new keys to an existing share, which gives it a new address and
   // ends every client's ability to connect with the old one.
   bool rotate = 4;
-  // Prefix each connection into the guest with a PROXY protocol v2 header
-  // carrying the client's identity, for services that understand it.
-  bool proxy_protocol = 5;
+  reserved 5;
+  reserved "proxy_protocol";
   // Guest UDP ports reachable through the share. Unlike TCP, UDP is off
   // unless asked for: `udp_ports` names ports, `all_udp` admits every one.
   repeated uint32 udp_ports = 6;
   bool all_udp = 7;
+  reserved 8;
+  reserved "transparent_ip";
+  // Source connections from the gateway rather than from the client's own
+  // address. On by default: a guest that can see who is calling can log,
+  // rate-limit and authorise on it with no idea a tunnel is involved.
+  bool no_transparent_ip = 9;
 }
 
 message Share {
@@ -255,11 +260,18 @@ message Share {
   // Empty means every port.
   repeated uint32 ports = 3;
   repeated string allowed_clients = 4;
-  bool proxy_protocol = 5;
+  reserved 5;
+  reserved "proxy_protocol";
   // RFC 3339; the moment the current keys were issued.
   string created_at = 6;
   repeated uint32 udp_ports = 7;
   bool all_udp = 8;
+  // What the share is actually doing, which is not always what was asked
+  // for: a node whose kernel cannot carry the reply path serves from the
+  // gateway and says so here.
+  bool transparent_ip = 9;
+  reserved 10, 11;
+  reserved "client_range", "client_source_ips";
 }
 
 message UnshareResponse {}

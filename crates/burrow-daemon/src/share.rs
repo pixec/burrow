@@ -11,19 +11,20 @@
 //! does, which is what makes a share wake a suspended sandbox, and what keeps
 //! the guest unable to reach the tunnel sockets: a guest cannot initiate a
 //! connection to the host at all, so a share is not a way to reach a
-//! neighbour. The client's identity travels only as far as the guest asks
-//! for it, as a PROXY protocol header.
+//! neighbour. With `--transparent-ip`, each connection is sourced from the
+//! last disco-pong-verified public IPv4, so the guest sees that address on
+//! the packet. A client that has never hole-punched has no such address and
+//! is sourced from the gateway.
 
 #![allow(clippy::result_large_err)]
 
 use std::collections::HashMap;
-use std::net::{IpAddr, SocketAddr, SocketAddrV6};
+use std::net::{Ipv4Addr, SocketAddr};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::Duration;
 
-use tokio::io::AsyncWriteExt;
 use tokio::net::{TcpStream, UdpSocket};
 use tokio::sync::Mutex;
 use tokio::task::JoinHandle;
@@ -49,6 +50,9 @@ const GUEST_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 #[derive(Clone, Debug)]
 pub struct ShareOptions {
     pub enabled: bool,
+    /// Whether shares here may source connections from the client's own
+    /// address. Off makes every share on this node use the gateway.
+    pub transparent: bool,
     /// The DERP region to listen through, or the nearest when unset.
     pub region: Option<i64>,
     pub derp_map_url: Option<String>,
@@ -60,10 +64,11 @@ pub struct ShareShape {
     /// Guest TCP ports; empty means every port.
     pub ports: Vec<u16>,
     pub allowed_clients: Vec<String>,
-    pub proxy_protocol: bool,
     /// Guest UDP ports; none unless listed or `all_udp`.
     pub udp_ports: Vec<u16>,
     pub all_udp: bool,
+    /// Source each connection from the last pong-verified public IPv4.
+    pub transparent_ip: bool,
 }
 
 impl ShareShape {
@@ -72,9 +77,9 @@ impl ShareShape {
         ShareRow {
             ports: self.ports,
             allowed_clients: self.allowed_clients,
-            proxy_protocol: self.proxy_protocol,
             udp_ports: self.udp_ports,
             all_udp: self.all_udp,
+            transparent_ip: self.transparent_ip,
             ..existing
         }
     }
@@ -85,10 +90,15 @@ impl ShareShape {
 pub struct ShareInfo {
     pub address: String,
     pub spec: ShareRow,
+    /// Whether connections really are sourced from the client's address.
+    pub transparent_ip: bool,
 }
 
 struct Active {
     spec: ShareRow,
+    /// What the share ended up doing, which is what a caller is told: a node
+    /// that could not install the reply path serves from the gateway.
+    transparent_ip: bool,
     server: Arc<Server>,
     task: JoinHandle<()>,
     /// Connections currently relayed into the guest. A sandbox with any is in
@@ -107,6 +117,9 @@ pub struct Shares {
     options: ShareOptions,
     data_dir: PathBuf,
     region: tokio::sync::OnceCell<DerpRegion>,
+    /// Reply-path host setup, installed once the first share needs it. Left
+    /// empty on failure so the next share retries.
+    transparent_ready: tokio::sync::OnceCell<()>,
     active: Mutex<HashMap<String, Active>>,
 }
 
@@ -121,6 +134,7 @@ impl Shares {
             options,
             data_dir: data_dir.to_path_buf(),
             region: tokio::sync::OnceCell::new(),
+            transparent_ready: tokio::sync::OnceCell::new(),
             active: Mutex::new(HashMap::new()),
         }
     }
@@ -132,10 +146,10 @@ impl Shares {
             preshared_key: PresharedKey::generate().to_string(),
             ports: shape.ports,
             allowed_clients: shape.allowed_clients,
-            proxy_protocol: shape.proxy_protocol,
             created_at: burrow_core::unix_now(),
             udp_ports: shape.udp_ports,
             all_udp: shape.all_udp,
+            transparent_ip: shape.transparent_ip,
         }
     }
 
@@ -198,6 +212,7 @@ impl Shares {
                 "tailcat shares are disabled on this node",
             ));
         }
+        let transparent_ip = spec.transparent_ip && self.transparent_ready().await;
         let region = self.region().await?;
         let key: NodePrivate = parse_key(&spec.key, "key")?;
         let preshared_key: PresharedKey = parse_key(&spec.preshared_key, "pre-shared key")?;
@@ -234,20 +249,25 @@ impl Shares {
             manager.clone(),
             id.to_string(),
             server.clone(),
-            spec.proxy_protocol,
+            Dial { transparent_ip },
             open.clone(),
         ));
         self.active.lock().await.insert(
             id.to_string(),
             Active {
                 spec: spec.clone(),
+                transparent_ip,
                 server,
                 task,
                 open,
             },
         );
-        tracing::info!(sandbox = id, "sandbox shared");
-        Ok(ShareInfo { address, spec })
+        tracing::info!(sandbox = id, transparent_ip, "sandbox shared");
+        Ok(ShareInfo {
+            address,
+            spec,
+            transparent_ip,
+        })
     }
 
     pub async fn stop(&self, id: &str) -> bool {
@@ -258,6 +278,7 @@ impl Shares {
         self.active.lock().await.get(id).map(|a| ShareInfo {
             address: a.server.tailcat_addr().to_string(),
             spec: a.spec.clone(),
+            transparent_ip: a.transparent_ip,
         })
     }
 
@@ -271,13 +292,47 @@ impl Shares {
             None => 0,
         }
     }
+
+    /// Whether this node can source a connection from the client's own
+    /// address, installing the reply path the first time it is asked.
+    ///
+    /// A node whose kernel or privileges cannot carry it still serves the
+    /// share, from the gateway: losing the client's address is a worse guest
+    /// experience, but refusing to share at all is a worse outage, and the
+    /// same call is what brings persisted shares back after a restart.
+    async fn transparent_ready(&self) -> bool {
+        if !self.options.transparent {
+            return false;
+        }
+        match self
+            .transparent_ready
+            .get_or_try_init(burrow_net::transparent::install)
+            .await
+        {
+            Ok(()) => true,
+            Err(err) => {
+                tracing::warn!(
+                    %err,
+                    "cannot install the reply path for client source addresses; \
+                     shares on this node will be sourced from the gateway"
+                );
+                false
+            }
+        }
+    }
+}
+
+/// How a share dials the guest for one connection or flow.
+#[derive(Clone, Copy)]
+struct Dial {
+    transparent_ip: bool,
 }
 
 async fn serve(
     manager: SandboxManager,
     id: String,
     server: Arc<Server>,
-    proxy_protocol: bool,
+    dial: Dial,
     open: Arc<AtomicU32>,
 ) {
     loop {
@@ -286,16 +341,16 @@ async fn serve(
                 let Some(conn) = conn else { return };
                 let (manager, id, server, open) = (manager.clone(), id.clone(), server.clone(), open.clone());
                 tokio::spawn(async move {
-                    if let Err(err) = relay(&manager, &id, &server, conn, proxy_protocol, &open).await {
+                    if let Err(err) = relay(&manager, &id, &server, conn, dial, &open).await {
                         tracing::debug!(sandbox = id, %err, "share connection ended");
                     }
                 });
             }
             flow = server.accept_udp() => {
                 let Some(flow) = flow else { return };
-                let (manager, id, open) = (manager.clone(), id.clone(), open.clone());
+                let (manager, id, server, open) = (manager.clone(), id.clone(), server.clone(), open.clone());
                 tokio::spawn(async move {
-                    if let Err(err) = relay_udp(&manager, &id, flow, &open).await {
+                    if let Err(err) = relay_udp(&manager, &id, &server, flow, dial, &open).await {
                         tracing::debug!(sandbox = id, %err, "share flow ended");
                     }
                 });
@@ -343,14 +398,37 @@ async fn admit<'a>(
 async fn relay_udp(
     manager: &SandboxManager,
     id: &str,
+    server: &Server,
     mut flow: UdpFlow,
+    dial: Dial,
     open: &AtomicU32,
 ) -> Result<(), String> {
     let (sandbox, _guard) = admit(manager, id, open).await?;
     let guest = SocketAddr::from((sandbox.lease.guest_ip, flow.local_addr().port()));
-    let sock = UdpSocket::bind("0.0.0.0:0")
-        .await
-        .map_err(|err| format!("bind: {err}"))?;
+    let public = flow
+        .peer_key()
+        .and_then(|k| server.peer(&k))
+        .and_then(|p| p.last_udp);
+    let from = client_src(dial, public);
+    if let Some(src) = from {
+        tracing::debug!(
+            sandbox = id,
+            client = %flow.peer_key().map(|k| k.short()).unwrap_or_default(),
+            %src,
+            %guest,
+            "share flow from client public address"
+        );
+    }
+    let sock = match from {
+        Some(src) => {
+            let std = burrow_net::transparent::bind_udp(src)
+                .map_err(|err| format!("bind {src}: {err}"))?;
+            UdpSocket::from_std(std).map_err(|err| format!("bind {src}: {err}"))?
+        }
+        None => UdpSocket::bind(SocketAddr::from((Ipv4Addr::UNSPECIFIED, 0)))
+            .await
+            .map_err(|err| format!("bind: {err}"))?,
+    };
     sock.connect(guest)
         .await
         .map_err(|err| format!("connect to {guest}: {err}"))?;
@@ -376,37 +454,60 @@ async fn relay(
     id: &str,
     server: &Server,
     mut conn: TcpConn,
-    proxy_protocol: bool,
+    dial: Dial,
     open: &AtomicU32,
 ) -> Result<(), String> {
     let (sandbox, _guard) = admit(manager, id, open).await?;
     let guest = SocketAddr::from((sandbox.lease.guest_ip, conn.local_addr().port()));
-    let mut upstream = tokio::time::timeout(GUEST_CONNECT_TIMEOUT, TcpStream::connect(guest))
-        .await
-        .map_err(|_| format!("connect to {guest} timed out"))?
-        .map_err(|err| format!("connect to {guest}: {err}"))?;
-    if proxy_protocol {
-        // Only a direct path's address is the client's real one: those
-        // packets authenticated under its key, and nothing it merely claimed
-        // about itself did.
-        let public = conn
-            .peer_key()
-            .and_then(|k| server.peer(&k))
-            .and_then(|p| p.direct);
-        let header = proxy_header(
-            conn.remote_addr(),
-            SocketAddrV6::new(server.addr(), conn.local_addr().port(), 0, 0),
-            guest,
-            public,
-            conn.peer_key(),
+    let public = conn
+        .peer_key()
+        .and_then(|k| server.peer(&k))
+        .and_then(|p| p.last_udp);
+    let from = client_src(dial, public);
+    if let Some(src) = from {
+        tracing::debug!(
+            sandbox = id,
+            client = %conn.peer_key().map(|k| k.short()).unwrap_or_default(),
+            %src,
+            %guest,
+            "share connection from client public address"
         );
-        upstream
-            .write_all(&header)
-            .await
-            .map_err(|err| format!("write PROXY header: {err}"))?;
     }
+    let mut upstream = dial_guest(guest, from).await?;
     let _ = tokio::io::copy_bidirectional(&mut conn, &mut upstream).await;
     Ok(())
+}
+
+/// The client's last pong-verified IPv4, or `None` to use the gateway.
+fn client_src(dial: Dial, public: Option<SocketAddr>) -> Option<Ipv4Addr> {
+    if !dial.transparent_ip {
+        return None;
+    }
+    match public {
+        Some(SocketAddr::V4(src)) => Some(*src.ip()),
+        _ => None,
+    }
+}
+
+async fn dial_guest(guest: SocketAddr, from: Option<Ipv4Addr>) -> Result<TcpStream, String> {
+    let connecting = async {
+        match from {
+            None => TcpStream::connect(guest).await,
+            Some(src) => {
+                let sock = tokio::net::TcpSocket::new_v4()?;
+                burrow_net::transparent::enable_socket(&sock)?;
+                sock.bind(SocketAddr::from((src, 0)))?;
+                sock.connect(guest).await
+            }
+        }
+    };
+    tokio::time::timeout(GUEST_CONNECT_TIMEOUT, connecting)
+        .await
+        .map_err(|_| format!("connect to {guest} timed out"))?
+        .map_err(|err| match from {
+            Some(src) => format!("connect to {guest} from {src}: {err}"),
+            None => format!("connect to {guest}: {err}"),
+        })
 }
 
 struct OpenGuard<'a> {
@@ -421,132 +522,37 @@ impl Drop for OpenGuard<'_> {
     }
 }
 
-const PP2_SIGNATURE: [u8; 12] = [
-    0x0d, 0x0a, 0x0d, 0x0a, 0x00, 0x0d, 0x0a, 0x51, 0x55, 0x49, 0x54, 0x0a,
-];
-const PP2_VERSION_PROXY: u8 = 0x21;
-const PP2_TCP4: u8 = 0x11;
-const PP2_TCP6: u8 = 0x21;
-/// Custom TLVs, in the range the spec reserves for applications.
-const PP2_TYPE_TUNNEL_ADDR: u8 = 0xe0;
-const PP2_TYPE_NODE_KEY: u8 = 0xe1;
-
-/// A PROXY protocol v2 header describing one shared connection.
-///
-/// The source is the client's public address when the tunnel has a verified
-/// direct path to it, with the guest as destination, so a service that logs
-/// or rate-limits by source sees what it would see on the open internet.
-/// Otherwise the source is the client's tunnel address, an IPv6 derived from
-/// its key, with the share's own tunnel address as destination. The tunnel
-/// address and node key always travel as TLVs, so a service can key on the
-/// identity that does not change when the client moves networks.
-fn proxy_header(
-    tunnel_src: SocketAddrV6,
-    tunnel_dst: SocketAddrV6,
-    guest: SocketAddr,
-    public: Option<SocketAddr>,
-    node_key: Option<NodePublic>,
-) -> Vec<u8> {
-    let mut body = Vec::with_capacity(128);
-    let family = match public {
-        Some(SocketAddr::V4(src)) => {
-            body.extend_from_slice(&src.ip().octets());
-            match guest.ip() {
-                IpAddr::V4(dst) => body.extend_from_slice(&dst.octets()),
-                IpAddr::V6(dst) => body.extend_from_slice(&dst.octets()[12..]),
-            }
-            body.extend_from_slice(&src.port().to_be_bytes());
-            body.extend_from_slice(&guest.port().to_be_bytes());
-            PP2_TCP4
-        }
-        Some(SocketAddr::V6(src)) => {
-            body.extend_from_slice(&src.ip().octets());
-            body.extend_from_slice(&tunnel_dst.ip().octets());
-            body.extend_from_slice(&src.port().to_be_bytes());
-            body.extend_from_slice(&tunnel_dst.port().to_be_bytes());
-            PP2_TCP6
-        }
-        None => {
-            body.extend_from_slice(&tunnel_src.ip().octets());
-            body.extend_from_slice(&tunnel_dst.ip().octets());
-            body.extend_from_slice(&tunnel_src.port().to_be_bytes());
-            body.extend_from_slice(&tunnel_dst.port().to_be_bytes());
-            PP2_TCP6
-        }
-    };
-    let mut tlv = |typ: u8, value: &[u8]| {
-        body.push(typ);
-        body.extend_from_slice(&(value.len() as u16).to_be_bytes());
-        body.extend_from_slice(value);
-    };
-    tlv(PP2_TYPE_TUNNEL_ADDR, tunnel_src.to_string().as_bytes());
-    if let Some(key) = node_key {
-        tlv(PP2_TYPE_NODE_KEY, key.to_string().as_bytes());
-    }
-
-    let mut header = Vec::with_capacity(16 + body.len());
-    header.extend_from_slice(&PP2_SIGNATURE);
-    header.push(PP2_VERSION_PROXY);
-    header.push(family);
-    header.extend_from_slice(&(body.len() as u16).to_be_bytes());
-    header.extend_from_slice(&body);
-    header
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    fn tunnel(last: u16, port: u16) -> SocketAddrV6 {
-        SocketAddrV6::new(
-            std::net::Ipv6Addr::new(0xfd7a, 0x115c, 0xa1e0, 0, 0, 0, 0, last),
-            port,
-            0,
-            0,
-        )
-    }
-
     #[test]
-    fn header_without_a_public_address_names_the_tunnel() {
-        let key = NodePrivate::generate().public();
-        let h = proxy_header(
-            tunnel(2, 40000),
-            tunnel(1, 8080),
-            "10.99.0.2:8080".parse().unwrap(),
-            None,
-            Some(key),
-        );
-        assert_eq!(&h[..12], &PP2_SIGNATURE);
-        assert_eq!((h[12], h[13]), (PP2_VERSION_PROXY, PP2_TCP6));
-        let len = u16::from_be_bytes([h[14], h[15]]) as usize;
-        assert_eq!(h.len(), 16 + len);
-        assert_eq!(&h[16..32], &tunnel(2, 40000).ip().octets());
-        assert_eq!(&h[32..48], &tunnel(1, 8080).ip().octets());
-        assert_eq!(&h[48..52], &[0x9c, 0x40, 0x1f, 0x90]);
-        // First TLV: the tunnel address as text.
-        assert_eq!(h[52], PP2_TYPE_TUNNEL_ADDR);
-        let tlv_len = u16::from_be_bytes([h[53], h[54]]) as usize;
+    fn transparent_ip_is_only_the_verified_public_ipv4() {
+        let dial = Dial {
+            transparent_ip: true,
+        };
+        let public: SocketAddr = "203.0.113.9:4444".parse().unwrap();
         assert_eq!(
-            &h[55..55 + tlv_len],
-            tunnel(2, 40000).to_string().as_bytes()
+            client_src(dial, Some(public)),
+            Some("203.0.113.9".parse().unwrap())
         );
-        assert_eq!(h[55 + tlv_len], PP2_TYPE_NODE_KEY);
-        assert!(h.ends_with(key.to_string().as_bytes()));
+        // No address, or IPv6-only, means the gateway: we do not invent one.
+        assert_eq!(client_src(dial, None), None);
+        let v6: SocketAddr = "[2001:db8::1]:4444".parse().unwrap();
+        assert_eq!(client_src(dial, Some(v6)), None);
+        let off = Dial {
+            transparent_ip: false,
+        };
+        assert_eq!(client_src(off, Some(public)), None);
     }
 
-    #[test]
-    fn header_with_a_public_address_is_ipv4_to_the_guest() {
-        let h = proxy_header(
-            tunnel(2, 40000),
-            tunnel(1, 22),
-            "10.99.0.2:22".parse().unwrap(),
-            Some("203.0.113.9:4444".parse().unwrap()),
-            None,
-        );
-        assert_eq!((h[12], h[13]), (PP2_VERSION_PROXY, PP2_TCP4));
-        assert_eq!(&h[16..20], &[203, 0, 113, 9]);
-        assert_eq!(&h[20..24], &[10, 99, 0, 2]);
-        assert_eq!(&h[24..28], &[0x11, 0x5c, 0, 22]);
-        assert_eq!(h[28], PP2_TYPE_TUNNEL_ADDR);
+    #[tokio::test]
+    async fn dial_guest_binds_the_requested_source() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let accept = tokio::spawn(async move { listener.accept().await.unwrap() });
+        let _client = dial_guest(addr, Some(Ipv4Addr::LOCALHOST)).await.unwrap();
+        let (_, peer) = accept.await.unwrap();
+        assert_eq!(peer.ip(), std::net::IpAddr::V4(Ipv4Addr::LOCALHOST));
     }
 }

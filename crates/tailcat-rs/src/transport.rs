@@ -69,8 +69,11 @@ pub struct Config {
 pub struct PeerStatus {
     pub key: NodePublic,
     pub addr: Ipv6Addr,
-    /// The UDP address currently trusted for direct traffic, if any.
+    /// The UDP address currently trusted for sending, if any.
     pub direct: Option<SocketAddr>,
+    /// Last UDP address a disco pong authenticated. Kept after the sending
+    /// path falls back to DERP, so a share can still spoof that public IP.
+    pub last_udp: Option<SocketAddr>,
     pub idle: Duration,
 }
 
@@ -99,6 +102,9 @@ struct Peer {
     tunn: Tunn,
     addr: Ipv6Addr,
     direct: Option<Direct>,
+    /// Last pong-verified UDP address, independent of whether it is still
+    /// trusted for sending.
+    last_udp: Option<SocketAddr>,
     candidates: HashMap<SocketAddr, Candidate>,
     sent_pings: HashMap<TxId, (SocketAddr, Instant)>,
     last_activity: Instant,
@@ -260,6 +266,7 @@ impl State {
                     tunn,
                     addr,
                     direct: None,
+                    last_udp: None,
                     candidates: HashMap::new(),
                     sent_pings: HashMap::new(),
                     last_activity: now,
@@ -337,6 +344,7 @@ impl State {
                             d.latency = latency;
                             d.last_pong = now;
                             d.trust_until = now + TRUST_UDP_ADDR;
+                            peer.last_udp = Some(to);
                         }
                     }
                     slot => {
@@ -347,6 +355,7 @@ impl State {
                             trust_until: now + TRUST_UDP_ADDR,
                             last_pong: now,
                         });
+                        peer.last_udp = Some(to);
                     }
                 }
             }
@@ -807,6 +816,7 @@ impl Transport {
                 key: p.key,
                 addr: p.addr,
                 direct: p.direct_path(now),
+                last_udp: p.last_udp,
                 idle: now.duration_since(p.last_activity),
             })
             .collect()

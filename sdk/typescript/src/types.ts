@@ -873,12 +873,17 @@ export interface Share {
   ports: number[];
   /** `nodekey:<hex>` of each admitted client; empty admits anyone. */
   allowedClients: string[];
-  proxyProtocol: boolean;
   /** RFC 3339; when the current keys were issued. */
   createdAt: string;
   /** Guest UDP ports reachable through the share; none unless listed or `allUdp`. */
   udpPorts: number[];
   allUdp: boolean;
+  /**
+   * Whether the guest really sees each client's own public IPv4 as the
+   * packet source. A node that cannot carry the reply path serves from the
+   * gateway whatever was asked for.
+   */
+  transparentIp: boolean;
 }
 
 export interface ShareOptions {
@@ -888,15 +893,15 @@ export interface ShareOptions {
   allowedClients?: string[];
   /** Issue new keys, and so a new address, to an existing share. */
   rotate?: boolean;
-  /**
-   * Prefix each connection into the guest with a PROXY protocol v2 header
-   * carrying the client's identity.
-   */
-  proxyProtocol?: boolean;
   /** Guest UDP ports reachable through the share. Omitted shares no UDP. */
   udpPorts?: number[];
   /** Share every UDP port. */
   allUdp?: boolean;
+  /**
+   * Source connections from the gateway instead of from the client's own
+   * public IPv4, which is what the guest sees by default.
+   */
+  noTransparentIp?: boolean;
   signal?: AbortSignal;
 }
 

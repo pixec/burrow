@@ -19,6 +19,25 @@ tailcat forward <addr> 15432:5432           # a local port onto guest :5432
 tailcat socks <addr> curl http://server.tailcat:8080/
 ```
 
+## When to use one
+
+A share is the answer whenever you control what runs at the far end, because it
+carries any protocol including UDP, wakes a parked sandbox, and needs no port on
+the node standing open to whoever finds it. It asks one thing in return: the far
+end has to run the `tailcat` client.
+
+It is not the way to get the caller's address into the guest. A published port
+already does that, and does it for every caller rather than only the ones that
+managed to hole-punch; what a share adds there is that the same is true of a
+protocol the edge cannot route and of a node with nothing open to the internet.
+
+That rules it out for anyone you cannot ask to install something, which is most
+of the internet. A browser, a webhook from a payment provider, an OAuth
+callback: those need a public hostname, which is what the [edge](EDGE.md) is
+for. A customer pointing their own `psql` at you with no burrow-specific
+software needs a [published port](EDGE.md#raw-tcp-and-other-protocols). There
+is a table comparing all three in [EDGE.md](EDGE.md#which-way-in).
+
 ## The address is the credential
 
 An address encodes the share's WireGuard public key, its path-discovery key,
@@ -39,10 +58,8 @@ is reachable, on the grounds that the sandbox is yours and the address is the
 gate. UDP is the other way round: nothing is reachable unless `--udp-port`
 names it, or `--udp-port all` opens every port. A UDP flow is one client
 source talking to one guest port; it ends after two minutes without a
-datagram in either direction, and the client's identity does not travel with
-it, since the PROXY protocol has no form for datagrams. The `tailcat` CLI
-reaches UDP through `tailcat socks` (SOCKS5 UDP ASSOCIATE); the Go library has
-`DialUDPPort`.
+datagram in either direction. The `tailcat` CLI reaches UDP through
+`tailcat socks` (SOCKS5 UDP ASSOCIATE); the Go library has `DialUDPPort`.
 
 ## What the guest sees
 
@@ -54,26 +71,41 @@ open is never suspended as idle, however long the session. This is the answer
 to the raw-TCP gap in [EDGE.md](EDGE.md): a published port cannot wake a
 sandbox, a share can.
 
-The guest sees every connection arrive from the host side of its own /30, not
-from the client. If a service in the guest needs to know who connected, share
-with `--proxy-protocol`: burrowd then prefixes each connection with a PROXY
-protocol v2 header, which nginx, Caddy, HAProxy, pgbouncer and most
-frameworks accept with a flag. The header carries:
+The guest sees each client's own public IPv4 as the packet source, so it can
+tell its callers apart with no idea a tunnel is involved.
 
-- as source, the client's public IP and port when the tunnel has a verified
-  direct path to it, with the guest as destination; otherwise the client's
-  tunnel address, an IPv6 in `fd7a:115c:a1e0::/48` derived from its key;
-- TLV `0xE0`, the client's tunnel address as text, always;
-- TLV `0xE1`, the client's node key as `nodekey:<hex>`, always.
+## Client source addresses
 
-The tunnel address and node key are the stable identity: they follow the
-client across networks and cannot be forged, because the tunnel authenticated
-them. The public IP is what an ordinary server on the internet would see, and
-is absent for a client still on the relay. It is never taken from anything the
-client merely claimed about itself.
+The guest sees the client's public IPv4 on the packet, the way it would on
+the open internet. No header to parse. TCP and UDP both. This is the
+default; `--no-transparent-ip` sources from the sandbox gateway instead.
 
-Only enable the header for a service that expects it. A service that does not
-will read the header bytes as the start of the client's request.
+Disco authenticates a UDP address with a pong. That address is the real
+IP. burrowd binds it with `IP_TRANSPARENT` and dials the guest from it, so
+`getpeername` inside the sandbox is `203.0.113.9`, or whatever the client
+was on. Guest replies are addressed to that public IP; a prerouting mark on
+packets that belong to a transparent socket, plus a policy rule that delivers
+marked packets locally, is what brings them back instead of forwarding them
+out as if the guest had dialled the internet.
+
+The sending path can fall back to the relay a few seconds after idle. The
+verified address is not forgotten: the next connection still comes from that
+IPv4, until disco pongs a different one (the client moved networks). A
+client that has never hole-punched has no public IPv4 we can put on the
+packet, and is sourced from the sandbox gateway. An IPv6-only path cannot
+appear on the IPv4 tap, same treatment.
+
+The first share on a node installs the policy rule and the nftables mark. The
+sandbox firewall is not involved.
+
+`socket transparent` needs the `nft_socket` module and the privileges to add
+a route, so a node can fail to install any of it. That does not cost you the
+share: the node logs what it could not do and serves from the gateway, which
+is also what happens to shares it restores after a restart. `burrow share
+--show` reports what a share is actually doing rather than what was asked
+for. An operator who does not want that routing and nftables state on a
+machine at all can start `burrowd --no-transparent-ip`, which pins every
+share there to the gateway.
 
 ## Isolation
 

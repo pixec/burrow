@@ -204,12 +204,15 @@ class Share:
     ports: List[int]
     # `nodekey:<hex>` of each admitted client; empty admits anyone.
     allowed_clients: List[str]
-    proxy_protocol: bool
     # RFC 3339; when the current keys were issued.
     created_at: str
     # Guest UDP ports reachable through the share; none unless listed or all_udp.
     udp_ports: List[int] = field(default_factory=list)
     all_udp: bool = False
+    # Packet source is the last disco-pong-verified public IPv4.
+    # What the share is doing: a node that cannot carry the reply path
+    # serves from the gateway whatever was asked for.
+    transparent_ip: bool = True
 
 
 @dataclass

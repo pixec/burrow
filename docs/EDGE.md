@@ -1,14 +1,36 @@
 # Reaching a sandbox from outside
 
-Two ways in, and the protocol decides which one you get.
+Three ways in. What the far end is decides which one you get.
 
-HTTP goes through the edge router on the node holding the sandbox, which serves
-a published guest port at `<port>-<sandbox-id>.<domain>`. The edge speaks
-plaintext, so a reverse proxy in front of it terminates TLS for those hostnames.
+HTTP for the open internet goes through the edge router on the node holding the
+sandbox, which serves a published guest port at `<port>-<sandbox-id>.<domain>`.
+The edge speaks plaintext, so a reverse proxy in front of it terminates TLS for
+those hostnames.
 
-Everything else goes to the published port on the node's own address: raw TCP,
-no hostname routing, no inspection. See [Raw TCP and other
-protocols](#raw-tcp-and-other-protocols).
+Anything else, for someone who can run a client of your choosing, goes through
+a [share](SHARE.md): a WireGuard tunnel dialled with the `tailcat` client, any
+protocol, no port on the node.
+
+Anything else, for someone who cannot, goes to a published port on the node's
+own address: raw TCP, no hostname routing, no inspection. See [Raw TCP and
+other protocols](#raw-tcp-and-other-protocols).
+
+## Which way in
+
+|  | Edge | Published port | Share |
+| --- | --- | --- | --- |
+| The far end needs | nothing; any browser or HTTP client | an ordinary client for the protocol | the `tailcat` client |
+| Protocols | HTTP, and WebSocket because it starts as HTTP | any TCP | any TCP, and UDP on request |
+| Address | `http://<port>-<id>.<domain>/` | `<node-address>:<host-port>` | a `tc…` address |
+| Who may use it | anyone who can resolve the name | anyone who can reach the node | whoever holds the address |
+| Address is | public, and safe to put in a URL | public | the credential, so a secret |
+| Wakes a suspended sandbox | yes | no | yes |
+| Inbound port on the node | the edge's, shared by every sandbox | one per mapping, from `20000-29999` | none; the relay connection is outbound |
+| Client address the guest sees | the node's, with the caller's in `X-Forwarded-For` | the caller's own, preserved by DNAT | the client's own IPv4, or the gateway if it never hole-punched |
+
+The edge is the only one a third party can use without your cooperation, which
+is what makes it the answer for browsers, webhooks and OAuth callbacks. A share
+is the better answer whenever you control what runs at the other end.
 
 ## Where the edge runs
 
@@ -210,13 +232,19 @@ The edge routes on `Host`, so it only ever handles HTTP. A raw TCP connection
 carries nothing that names a sandbox, so there is nothing to route on. WebSocket
 works only because it begins life as an HTTP request.
 
-Postgres, Redis, SSH, a game server, anything that is not HTTP: reach it through
-the published port on the node address.
+Postgres, Redis, SSH, a game server, anything that is not HTTP: a
+[share](SHARE.md) is the usual answer. `burrow share` hands out a tailcat
+address, the tunnel is terminated on the node and dialled into the guest, so a
+connection wakes a suspended sandbox, carries UDP as well as TCP, and needs no
+port on the node standing open to whoever finds it. It costs the far end one
+thing: it has to run the `tailcat` client.
 
-`burrow expose` maps a guest port onto a host port of the node holding the
-sandbox, using DNAT. Your customer connects to `<node-address>:<host-port>` with
-an ordinary client for that protocol. No hostname routing, no TLS termination,
-nothing inspects the bytes. Burrow moves them and does nothing else.
+A published port is what to use when it cannot. `burrow expose` maps a guest
+port onto a host port of the node holding the sandbox, using DNAT. Your
+customer connects to `<node-address>:<host-port>` with an ordinary client for
+that protocol, and nothing else is needed at their end. No hostname routing, no
+TLS termination, nothing inspects the bytes. Burrow moves them and does nothing
+else.
 
 Host ports come from `20000-29999`, chosen to sit above the ephemeral ports the
 host uses for its own outbound sockets. It is a constant in the daemon with no
@@ -226,16 +254,12 @@ refused, and so is one already taken.
 The address is the node's and sandboxes are node-pinned, so the mapping is stable
 for the sandbox's whole life. It disappears when the sandbox is deleted.
 
-Wake-on-traffic belongs to the edge, not to the port. A connection to a published
-port goes straight to the guest, so a sandbox parked by `idle_suspend_secs` is
-not there to accept it. Leave idle suspension off for a sandbox whose only way in
-is a raw TCP port, or resume it through the API before you connect.
-
-The other way in for raw TCP is a share, which is a tunnel rather than a port:
-`burrow share` hands out a tailcat address that a `tailcat` client dials from
-anywhere, the connection is terminated on the node and dialed into the guest,
-and so it wakes a suspended sandbox and needs no port on the node at all. See
-[SHARE.md](SHARE.md).
+A published port cannot wake a sandbox. The connection goes straight to the
+guest by DNAT, with nothing on the host in the path to notice, so a sandbox
+parked by `idle_suspend_secs` is not there to accept it. Leave idle suspension
+off for a sandbox whose only way in is a published port, or resume it through
+the API before you connect. The edge and shares both terminate on the node, so
+both wake it.
 
 ### A published port is not reachable from another sandbox
 
@@ -293,6 +317,8 @@ delete one.
 ### Hostname-addressed TCP is not supported
 
 There is no way today to give a non-HTTP service its own hostname through burrow.
+A [share](SHARE.md) reaches such a service from anywhere without one, but its
+address is a secret rather than a name, so it does not answer this.
 
 The plausible future shape is SNI routing. A TLS ClientHello carries the server
 name before any application bytes, and the egress proxy already parses SNI, so an

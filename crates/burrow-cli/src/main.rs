@@ -339,16 +339,16 @@ enum Command {
         /// Issue new keys, and so a new address, to an existing share.
         #[arg(long)]
         rotate: bool,
-        /// Prefix each connection into the guest with a PROXY protocol v2
-        /// header carrying the client's identity.
+        /// Source connections from the gateway instead of from the client's
+        /// own address, which is what the guest sees by default.
         #[arg(long)]
-        proxy_protocol: bool,
+        no_transparent_ip: bool,
         /// Guest UDP port reachable through the share, or `all`. Repeatable;
         /// omitted shares no UDP.
         #[arg(long = "udp-port", value_delimiter = ',')]
         udp_ports: Vec<String>,
         /// Print the existing share without changing it.
-        #[arg(long, conflicts_with_all = ["ports", "allowed_clients", "rotate", "proxy_protocol", "udp_ports"])]
+        #[arg(long, conflicts_with_all = ["ports", "allowed_clients", "rotate", "udp_ports", "no_transparent_ip"])]
         show: bool,
     },
     /// Revoke a sandbox's share.
@@ -1339,8 +1339,8 @@ async fn main() -> anyhow::Result<()> {
             ports,
             allowed_clients,
             rotate,
-            proxy_protocol,
             udp_ports,
+            no_transparent_ip,
             show,
         } => {
             let share = if show {
@@ -1361,9 +1361,9 @@ async fn main() -> anyhow::Result<()> {
                         ports,
                         allowed_clients,
                         rotate,
-                        proxy_protocol,
                         udp_ports,
                         all_udp,
+                        no_transparent_ip,
                     })
                     .await?
                     .into_inner()
@@ -2141,8 +2141,10 @@ fn print_share(share: &api::Share) {
     if !share.allowed_clients.is_empty() {
         eprintln!("# allowed clients: {}", share.allowed_clients.join(", "));
     }
-    if share.proxy_protocol {
-        eprintln!("# PROXY protocol v2 header on every connection");
+    if share.transparent_ip {
+        eprintln!("# source: the client's last verified public IPv4");
+    } else {
+        eprintln!("# source: the gateway");
     }
     eprintln!("# connect with: tailcat {} <port>", share.address);
 }

@@ -234,6 +234,14 @@ pub struct ServeArgs {
     /// its own `derper` and points this at a map naming it.
     #[arg(long, env = "BURROWD_TAILCAT_DERP_MAP_URL")]
     pub tailcat_derp_map_url: Option<String>,
+    /// Make every share on this node source guest connections from the
+    /// gateway instead of the client's own address.
+    ///
+    /// Sourcing from the client needs a policy route and an nftables chain,
+    /// which this node installs the first time a share wants them. Set this
+    /// on a node where that state is unwelcome.
+    #[arg(long, env = "BURROWD_NO_TRANSPARENT_IP")]
+    pub no_transparent_ip: bool,
 }
 
 impl ServeArgs {
@@ -831,6 +839,7 @@ pub async fn run(args: ServeArgs) -> anyhow::Result<()> {
             control_plane: control_plane_addresses(&args.orchestrator).await,
             share: crate::share::ShareOptions {
                 enabled: !args.no_tailcat,
+                transparent: !args.no_transparent_ip,
                 region: args.tailcat_region,
                 derp_map_url: args.tailcat_derp_map_url.clone(),
             },

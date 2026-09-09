@@ -4270,6 +4270,7 @@ pub(crate) mod tests {
                 control_plane: Vec::new(),
                 share: crate::share::ShareOptions {
                     enabled: false,
+                    transparent: false,
                     region: None,
                     derp_map_url: None,
                 },

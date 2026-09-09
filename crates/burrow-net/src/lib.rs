@@ -9,6 +9,7 @@ pub mod ipam;
 pub mod mesh;
 pub mod pinning;
 pub mod tap;
+pub mod transparent;
 
 pub use error::{NetError, Result};
 pub use firewall::{Mode, PortMap, SandboxRules};

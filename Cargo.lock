@@ -445,6 +445,8 @@ name = "burrow-net"
 version = "0.1.0"
 dependencies = [
  "base64",
+ "libc",
+ "socket2 0.5.10",
  "thiserror 2.0.20",
  "tokio",
  "tracing",
