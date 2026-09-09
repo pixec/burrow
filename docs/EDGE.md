@@ -20,8 +20,8 @@ other protocols](#raw-tcp-and-other-protocols).
 |  | Edge | Published port | Share |
 | --- | --- | --- | --- |
 | The far end needs | nothing; any browser or HTTP client | an ordinary client for the protocol | the `tailcat` client |
-| Protocols | HTTP, and WebSocket because it starts as HTTP | any TCP | any TCP, and UDP on request |
-| Address | `http://<port>-<id>.<domain>/` | `<node-address>:<host-port>` | a `tc…` address |
+| Protocols | HTTP, and WebSocket because it starts as HTTP | any TCP or UDP | any TCP, and UDP on request |
+| Address | `http://<port>-<id>.<domain>/` | `<node-address>:<host-port>` | a `tc...` address |
 | Who may use it | anyone who can resolve the name | anyone who can reach the node | whoever holds the address |
 | Address is | public, and safe to put in a URL | public | the credential, so a secret |
 | Wakes a suspended sandbox | yes | no | yes |
@@ -31,6 +31,7 @@ other protocols](#raw-tcp-and-other-protocols).
 The edge is the only one a third party can use without your cooperation, which
 is what makes it the answer for browsers, webhooks and OAuth callbacks. A share
 is the better answer whenever you control what runs at the other end.
+
 
 ## Where the edge runs
 
@@ -245,6 +246,10 @@ customer connects to `<node-address>:<host-port>` with an ordinary client for
 that protocol, and nothing else is needed at their end. No hostname routing, no
 TLS termination, nothing inspects the bytes. Burrow moves them and does nothing
 else.
+
+`--udp` forwards datagrams instead. A host port carries one protocol, so a
+service that wants both takes two mappings, and they need not share a host
+port. A UDP mapping has no edge URL, because the edge only ever carries HTTP.
 
 Host ports come from `20000-29999`, chosen to sit above the ephemeral ports the
 host uses for its own outbound sockets. It is a constant in the daemon with no

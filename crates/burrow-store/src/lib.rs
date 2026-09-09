@@ -40,14 +40,22 @@ pub struct SandboxRow {
     /// address rather than having it handed to a new one.
     pub lease_block: u32,
     pub tap: String,
-    /// `[(host_port, guest_port)]`.
-    pub ports: Vec<(u16, u16)>,
+    /// Ports published on the node's address.
+    pub ports: Vec<PortRow>,
     /// The sandbox's tailcat share, if it has one.
     pub share: Option<ShareRow>,
     /// Unix seconds the sandbox entered SUSPENDED; 0 while it is running.
     /// Persisted because `suspended_ttl_secs` is measured from it, and a node
     /// restart that reset it would let a sandbox outlive its retention forever.
     pub suspended_at: i64,
+}
+
+/// One published port.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PortRow {
+    pub host_port: u16,
+    pub guest_port: u16,
+    pub udp: bool,
 }
 
 /// A sandbox's tailcat share: the keys its address is made of and what the
@@ -625,7 +633,11 @@ mod tests {
             state: 2,
             lease_block: block,
             tap: format!("bt{block}"),
-            ports: vec![(20000, 8000)],
+            ports: vec![PortRow {
+                host_port: 20000,
+                guest_port: 8000,
+                udp: false,
+            }],
             share: None,
             suspended_at: 0,
         }
@@ -694,7 +706,14 @@ mod tests {
         assert_eq!(listed.len(), 1);
         assert_eq!(listed[0].lease_block, 1);
         assert_eq!(listed[0].tap, "bt1");
-        assert_eq!(listed[0].ports, vec![(20000, 8000)]);
+        assert_eq!(
+            listed[0].ports,
+            vec![PortRow {
+                host_port: 20000,
+                guest_port: 8000,
+                udp: false
+            }]
+        );
     }
 
     #[test]

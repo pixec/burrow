@@ -317,6 +317,9 @@ enum Command {
         /// Preferred host port; omitted lets the node pick.
         #[arg(long, default_value_t = 0)]
         host_port: u32,
+        /// Forward UDP rather than TCP. Publishing both takes two mappings.
+        #[arg(long)]
+        udp: bool,
     },
     /// List published ports for a sandbox.
     #[command(visible_alias = "ports")]
@@ -1302,12 +1305,14 @@ async fn main() -> anyhow::Result<()> {
             id,
             guest_port,
             host_port,
+            udp,
         } => {
             let mapping = client
                 .expose_port(api::ExposePortRequest {
                     sandbox_id: id,
                     guest_port,
                     host_port,
+                    udp,
                 })
                 .await?
                 .into_inner();
@@ -2103,10 +2108,15 @@ fn describe_match(value: &common::StringMatch) -> String {
 /// its node's edge answers for, so both are shown. A node running no edge has no
 /// hostname routing, and the address is then printed alone.
 fn print_port(mapping: &api::PortMapping) {
+    let proto = if mapping.udp { "/udp" } else { "" };
     match mapping.edge_url.as_str() {
-        "" => println!("{} -> guest :{}", mapping.host_address, mapping.guest_port),
+        // A UDP mapping never has an edge URL: the edge carries HTTP.
+        "" => println!(
+            "{} -> guest :{}{proto}",
+            mapping.host_address, mapping.guest_port
+        ),
         url => println!(
-            "{} -> guest :{} ({})",
+            "{} -> guest :{}{proto} ({})",
             url, mapping.guest_port, mapping.host_address
         ),
     }
@@ -2318,6 +2328,7 @@ async fn publish_ports(client: &mut Client, id: &str, ports: &[u32]) -> anyhow::
                 sandbox_id: id.to_string(),
                 guest_port: *port,
                 host_port: 0,
+                udp: false,
             })
             .await
         {
@@ -2638,6 +2649,7 @@ async fn set_ports(client: &mut Client, id: &str, ports: &[u32]) -> anyhow::Resu
                 sandbox_id: id.to_string(),
                 guest_port: *port,
                 host_port: 0,
+                udp: false,
             })
             .await?
             .into_inner();

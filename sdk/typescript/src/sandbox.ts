@@ -1414,7 +1414,8 @@ export class Sandbox {
   }
 
   /**
-   * Publishes a port from inside the sandbox on its node's address.
+   * Publishes a port from inside the sandbox on its node's address. A host
+   * port carries one protocol, so publishing TCP and UDP takes two calls.
    *
    * ```ts
    * const { url } = await sandbox.exposePort(8000);
@@ -1422,14 +1423,19 @@ export class Sandbox {
    */
   async exposePort(
     guestPort: number,
-    hostPort?: number | { hostPort?: number; signal?: AbortSignal },
+    hostPort?: number | { hostPort?: number; udp?: boolean; signal?: AbortSignal },
   ): Promise<PortMapping> {
     this.assertLive();
     const options =
       typeof hostPort === "number" ? { hostPort } : (hostPort ?? {});
     const res = await this.transport.unary<any, any>(
       "ExposePort",
-      { sandboxId: this.id, guestPort, hostPort: options.hostPort ?? 0 },
+      {
+        sandboxId: this.id,
+        guestPort,
+        hostPort: options.hostPort ?? 0,
+        udp: options.udp ?? false,
+      },
       undefined,
       options.signal,
     );
@@ -2013,6 +2019,7 @@ function toPort(raw: any, fallbackHost: string): PortMapping {
   return {
     guestPort: Number(raw.guestPort ?? 0),
     hostPort,
+    udp: Boolean(raw.udp),
     url: `http://${address}`,
     // Empty unless the holding node's edge is serving, rather than a name
     // that resolves nowhere.

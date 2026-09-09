@@ -549,24 +549,23 @@ impl NodeService for NodeApi {
         req: Request<api::ExposePortRequest>,
     ) -> Result<Response<api::PortMapping>, Status> {
         let req = req.into_inner();
-        let (host_port, guest_port) = self
+        let mapping = self
             .sandboxes
             .expose_port(
                 &req.sandbox_id,
                 port_u16(req.guest_port)?,
                 port_u16(req.host_port)?,
+                if req.udp {
+                    burrow_net::Protocol::Udp
+                } else {
+                    burrow_net::Protocol::Tcp
+                },
             )
             .await?;
-        Ok(Response::new(api::PortMapping {
-            sandbox_id: req.sandbox_id,
-            guest_port: guest_port as u32,
-            host_port: host_port as u32,
-            // The node does not know which address callers reach it on, nor
-            // whether an edge is serving; the orchestrator fills both in from
-            // its own view of the fleet.
-            host_address: String::new(),
-            edge_url: String::new(),
-        }))
+        // The node does not know which address callers reach it on, nor
+        // whether an edge is serving; the orchestrator fills both in from its
+        // own view of the fleet.
+        Ok(Response::new(port_proto(req.sandbox_id, &mapping)))
     }
 
     async fn list_ports(
@@ -577,14 +576,8 @@ impl NodeService for NodeApi {
         let ports = self.sandboxes.list_ports(&sandbox_id).await;
         Ok(Response::new(api::ListPortsResponse {
             ports: ports
-                .into_iter()
-                .map(|(host_port, guest_port)| api::PortMapping {
-                    sandbox_id: sandbox_id.clone(),
-                    guest_port: guest_port as u32,
-                    host_port: host_port as u32,
-                    host_address: String::new(),
-                    edge_url: String::new(),
-                })
+                .iter()
+                .map(|port| port_proto(sandbox_id.clone(), port))
                 .collect(),
         }))
     }
@@ -1332,6 +1325,17 @@ async fn remove_partial_upload_inner(sandbox: &RunningSandbox, path: &str) {
         // cancel the command that is doing the cleaning.
         let mut stream = response.into_inner();
         while let Some(Ok(_)) = stream.next().await {}
+    }
+}
+
+fn port_proto(sandbox_id: String, port: &burrow_net::PortMap) -> api::PortMapping {
+    api::PortMapping {
+        sandbox_id,
+        guest_port: u32::from(port.guest_port),
+        host_port: u32::from(port.host_port),
+        udp: port.protocol == burrow_net::Protocol::Udp,
+        host_address: String::new(),
+        edge_url: String::new(),
     }
 }
 

@@ -261,6 +261,7 @@ def _to_port(raw: api_pb2.PortMapping, fallback_host: str) -> PortMapping:
         # Empty unless the holding node's edge is serving, rather than a name
         # that resolves nowhere.
         edge_url=raw.edge_url,
+        udp=raw.udp,
     )
 
 
@@ -1265,8 +1266,13 @@ class Sandbox:
 
         return watcher
 
-    def expose_port(self, guest_port: int, host_port: int = 0) -> PortMapping:
+    def expose_port(
+        self, guest_port: int, host_port: int = 0, udp: bool = False
+    ) -> PortMapping:
         """Publishes a port from inside the sandbox on its node's address.
+
+        A host port carries one protocol, so publishing both TCP and UDP for
+        a guest port takes two calls.
 
         ```python
         mapping = sandbox.expose_port(8000)
@@ -1277,7 +1283,10 @@ class Sandbox:
         res = self._transport.unary(
             "ExposePort",
             api_pb2.ExposePortRequest(
-                sandbox_id=self.id, guest_port=guest_port, host_port=host_port
+                sandbox_id=self.id,
+                guest_port=guest_port,
+                host_port=host_port,
+                udp=udp,
             ),
         )
         return _to_port(res, self._transport.host)

@@ -1142,7 +1142,7 @@ burrow config ports sbx_2f0c -p 8080 -p 9000
 Publish one guest port on the node's address.
 
 ```
-burrow expose [--host-port <PORT>] <ID> <GUEST_PORT>
+burrow expose [--host-port <PORT>] [--udp] <ID> <GUEST_PORT>
 ```
 
 ```sh
@@ -1158,6 +1158,7 @@ burrow expose sbx_2f0c 8000
 | Option | Description |
 | --- | --- |
 | `--host-port <PORT>` | Preferred host port. Omitted lets the node pick. |
+| `--udp` | Forward UDP rather than TCP. A host port carries one protocol, so a service wanting both takes two mappings. |
 
 When the node holding the sandbox runs an edge router, the port also answers on
 `http://<guest-port>-<sandbox-id>.<edge-domain>/`, shown first with the node
@@ -1173,7 +1174,8 @@ node to give it one.
 A published port cannot wake a suspended sandbox, and it holds a port on the
 node open to anyone who can reach it. For a non-HTTP service, prefer
 [`share`](#share) unless the far end has to connect with an ordinary client and
-no burrow-specific software.
+no burrow-specific software. A UDP mapping has no edge URL either way, since
+the edge only carries HTTP.
 
 To publish at creation instead, use [`create -p`](#create).
 

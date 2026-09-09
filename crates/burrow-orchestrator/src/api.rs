@@ -1366,7 +1366,9 @@ impl Burrow for ApiService {
         // Only the orchestrator knows how callers address the node, or what
         // domain its edge serves.
         mapping.host_address = self.node_host(&node_id, mapping.host_port);
-        mapping.edge_url = self.edge_url(&node_id, &sandbox_id, mapping.guest_port);
+        if !mapping.udp {
+            mapping.edge_url = self.edge_url(&node_id, &sandbox_id, mapping.guest_port);
+        }
         Ok(Response::new(mapping))
     }
 
@@ -1386,8 +1388,11 @@ impl Burrow for ApiService {
         for mapping in &mut resp.ports {
             mapping.host_address = self.node_host(&node_id, mapping.host_port);
             // The node names the sandbox by whatever it recorded; the edge
-            // hostname has to carry the id the router will resolve.
-            mapping.edge_url = self.edge_url(&node_id, &id, mapping.guest_port);
+            // hostname has to carry the id the router will resolve. A UDP
+            // mapping gets none, because the edge only ever carries HTTP.
+            if !mapping.udp {
+                mapping.edge_url = self.edge_url(&node_id, &id, mapping.guest_port);
+            }
         }
         Ok(Response::new(resp))
     }

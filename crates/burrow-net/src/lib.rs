@@ -12,6 +12,6 @@ pub mod tap;
 pub mod transparent;
 
 pub use error::{NetError, Result};
-pub use firewall::{Mode, PortMap, SandboxRules};
+pub use firewall::{Mode, PortMap, Protocol, SandboxRules};
 pub use ipam::{Ipam, Lease};
 pub use mesh::{MESH_INTERFACE, Peer};

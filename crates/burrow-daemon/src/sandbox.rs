@@ -1498,7 +1498,14 @@ impl SandboxManager {
             state: record.state,
             lease_block: sandbox.lease.block,
             tap: sandbox.tap.clone(),
-            ports: ports.iter().map(|p| (p.host_port, p.guest_port)).collect(),
+            ports: ports
+                .iter()
+                .map(|p| burrow_store::PortRow {
+                    host_port: p.host_port,
+                    guest_port: p.guest_port,
+                    udp: p.protocol == firewall::Protocol::Udp,
+                })
+                .collect(),
             share: self.shares.spec(sandbox.id()).await,
             suspended_at: sandbox.suspended_at(),
         };
@@ -1737,9 +1744,14 @@ impl SandboxManager {
                     row.id.clone(),
                     row.ports
                         .iter()
-                        .map(|(host_port, guest_port)| firewall::PortMap {
-                            host_port: *host_port,
-                            guest_port: *guest_port,
+                        .map(|p| firewall::PortMap {
+                            host_port: p.host_port,
+                            guest_port: p.guest_port,
+                            protocol: if p.udp {
+                                firewall::Protocol::Udp
+                            } else {
+                                firewall::Protocol::Tcp
+                            },
                         })
                         .collect(),
                 );
@@ -1904,7 +1916,8 @@ impl SandboxManager {
         sandbox_id: &str,
         guest_port: u16,
         requested_host_port: u16,
-    ) -> Result<(u16, u16), Status> {
+        protocol: firewall::Protocol,
+    ) -> Result<firewall::PortMap, Status> {
         if guest_port == 0 {
             return Err(Status::invalid_argument("guest_port is required"));
         }
@@ -1946,6 +1959,7 @@ impl SandboxManager {
             .push(firewall::PortMap {
                 host_port,
                 guest_port,
+                protocol,
             });
         drop(ports);
 
@@ -1954,17 +1968,22 @@ impl SandboxManager {
             sandbox = sandbox_id,
             host_port,
             guest_port,
+            protocol = protocol.keyword(),
             "port published"
         );
-        Ok((host_port, guest_port))
+        Ok(firewall::PortMap {
+            host_port,
+            guest_port,
+            protocol,
+        })
     }
 
-    pub async fn list_ports(&self, sandbox_id: &str) -> Vec<(u16, u16)> {
+    pub async fn list_ports(&self, sandbox_id: &str) -> Vec<firewall::PortMap> {
         self.ports
             .lock()
             .await
             .get(sandbox_id)
-            .map(|ports| ports.iter().map(|p| (p.host_port, p.guest_port)).collect())
+            .cloned()
             .unwrap_or_default()
     }
 

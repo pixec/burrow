@@ -187,8 +187,10 @@ class PortMapping:
     guest_port: int
     host_port: int
     url: str
-    # Empty unless the holding node's edge is serving.
+    # Empty unless the holding node's edge is serving, and always empty for a
+    # UDP mapping, which the edge cannot route.
     edge_url: str = ""
+    udp: bool = False
 
 
 @dataclass

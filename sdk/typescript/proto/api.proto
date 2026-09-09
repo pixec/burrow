@@ -201,12 +201,16 @@ message ExposePortRequest {
   uint32 guest_port = 2;
   // Preferred host port; 0 lets the node allocate one.
   uint32 host_port = 3;
+  // Forward UDP rather than TCP. A host port carries one or the other, so
+  // publishing both for a guest port takes two mappings.
+  bool udp = 4;
 }
 
 message PortMapping {
   string sandbox_id = 1;
   uint32 guest_port = 2;
   uint32 host_port = 3;
+  bool udp = 6;
   // Address a client outside the sandbox should connect to.
   string host_address = 4;
   // Stable URL for this port through the edge router on the node holding the

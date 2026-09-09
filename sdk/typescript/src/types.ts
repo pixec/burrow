@@ -850,13 +850,16 @@ export interface DirEntry {
 export interface PortMapping {
   guestPort: number;
   hostPort: number;
+  /** Whether the mapping forwards UDP rather than TCP. */
+  udp: boolean;
   /** Address to reach the published port from outside the sandbox. */
   url: string;
   /**
    * Stable per-sandbox URL through the edge router on the node holding the
    * sandbox, `http://<port>-<sandbox-id>.<edge-domain>/`. Traffic arriving on it
    * for a stopped sandbox wakes it. Absent when that node runs no edge, which
-   * means it has no hostname routing and {@link url} is the whole answer.
+   * means it has no hostname routing and {@link url} is the whole answer, and
+   * always absent for a UDP mapping, which the edge cannot route.
    */
   edgeUrl?: string;
 }
