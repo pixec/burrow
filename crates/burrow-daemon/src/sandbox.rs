@@ -75,7 +75,7 @@ pub struct NodeConfig {
     /// sandboxes, and routes exec and logs into them. A sandbox that reaches it
     /// has reached every other sandbox, without a packet ever crossing a rule
     /// about them.
-    pub control_plane: Vec<std::net::Ipv4Addr>,
+    pub control_plane: Vec<std::net::IpAddr>,
     /// Whether and through which relay sandboxes here can be shared.
     pub share: crate::share::ShareOptions,
 }
@@ -1134,7 +1134,7 @@ pub struct SandboxManager {
     /// Learned on the heartbeat rather than configured: an edge is opt-in per
     /// node, so this node cannot know from its own flags which of its peers
     /// serves one. Its own is in here too.
-    edge_addresses: Arc<std::sync::Mutex<Vec<std::net::Ipv4Addr>>>,
+    edge_addresses: Arc<std::sync::Mutex<Vec<std::net::IpAddr>>>,
     /// Sandboxes provisioned ahead of demand, ready to be handed out.
     ///
     /// A create otherwise spends its whole time restoring a VM, waiting for its
@@ -1330,10 +1330,7 @@ impl SandboxManager {
     /// sandbox that can reach one has reached every sandbox that edge serves,
     /// without a packet crossing a rule about private networks. Every node's
     /// edge is in here, this node's own included.
-    pub async fn set_edge_addresses(
-        &self,
-        addresses: Vec<std::net::Ipv4Addr>,
-    ) -> Result<(), Status> {
+    pub async fn set_edge_addresses(&self, addresses: Vec<std::net::IpAddr>) -> Result<(), Status> {
         *self.edge_addresses.lock().unwrap() = addresses;
         self.sync_firewall().await
     }
@@ -1350,7 +1347,7 @@ impl SandboxManager {
     }
 
     /// Every address a sandbox is denied outright, whatever its policy says.
-    fn denied_addresses(&self) -> Vec<std::net::Ipv4Addr> {
+    fn denied_addresses(&self) -> Vec<std::net::IpAddr> {
         let mut denied = self.config.control_plane.clone();
         denied.extend(self.edge_addresses.lock().unwrap().iter().copied());
         denied.sort();
@@ -2176,6 +2173,8 @@ impl SandboxManager {
                     tap: sandbox.tap.clone(),
                     host_ip: sandbox.lease.host_ip,
                     guest_ip: own_ip,
+                    host_ip6: sandbox.lease.host_ip6(),
+                    guest_ip6: sandbox.lease.guest_ip6(),
                     mode: policy_mode(&record),
                     allow_cidrs: record
                         .policy
@@ -2205,7 +2204,11 @@ impl SandboxManager {
         // refreshed from the same snapshot that produced the firewall rules;
         // otherwise a sandbox could be redirected to a proxy that does not yet
         // know its policy and would deny everything.
-        let proxy_table: HashMap<std::net::Ipv4Addr, burrow_proxy::SandboxPolicy> = sandboxes
+        let sandbox_ip6: HashMap<std::net::Ipv4Addr, std::net::Ipv6Addr> = sandboxes
+            .values()
+            .map(|sandbox| (sandbox.lease.guest_ip, sandbox.lease.guest_ip6()))
+            .collect();
+        let by_guest_ip: HashMap<std::net::Ipv4Addr, burrow_proxy::SandboxPolicy> = sandboxes
             .values()
             .map(|sandbox| {
                 let record = sandbox.record();
@@ -2284,15 +2287,34 @@ impl SandboxManager {
         drop(ports);
         drop(sandboxes);
 
-        // Pins are keyed by sandbox address and leases are recycled, so they
-        // are pruned from the same snapshot that defines who exists.
-        self.resolutions
-            .retain_live(&proxy_table.keys().copied().collect());
+        // Both of a sandbox's addresses map to its one policy: it is the same
+        // sandbox whichever it reaches the proxy from, and an entry missing
+        // for one family would read as an unknown source and deny everything.
+        let proxy_table: HashMap<std::net::IpAddr, burrow_proxy::SandboxPolicy> = by_guest_ip
+            .into_iter()
+            .flat_map(|(guest_ip, policy)| {
+                let guest_ip6 = sandbox_ip6.get(&guest_ip).copied();
+                std::iter::once((std::net::IpAddr::V4(guest_ip), policy.clone()))
+                    .chain(guest_ip6.map(|ip6| (std::net::IpAddr::V6(ip6), policy)))
+            })
+            .collect();
+
+        // Pins are keyed by sandbox id, so they are pruned from the same
+        // snapshot that defines who exists; a deleted sandbox's promises must
+        // not outlive it into whatever reuses its address.
+        self.resolutions.retain_live(
+            &proxy_table
+                .values()
+                .map(|policy| policy.sandbox_id.clone())
+                .collect(),
+        );
         self.proxy_policies.replace(proxy_table);
         let denied = self.denied_addresses();
         // The proxy is told before the ruleset is applied, not after: it is the
         // path that does not go through nftables at all, so the moment to have
         // it enforcing a wider deny list is ahead of the render, never behind.
+        // Both families: the proxy dials v6 now, so a control plane reachable
+        // over it has to be refused there as well as in the ruleset.
         self.denied.replace(denied.iter().copied());
         firewall::apply(&firewall::render_with(&rules, &denied))
             .await
@@ -2931,10 +2953,13 @@ impl SandboxManager {
             guest_mac: Some(lease.guest_mac()),
         });
         spec.boot_args = format!(
-            "{} root=/dev/vda ro init=/usr/bin/burrow-agent {} burrow.dns={} {}",
+            "{} root=/dev/vda ro init=/usr/bin/burrow-agent {} burrow.dns={} burrow.ip6={}/{} burrow.ip6gw={} {}",
             burrow_vmm::DEFAULT_BOOT_ARGS,
             lease.kernel_ip_arg(),
             lease.host_ip,
+            lease.guest_ip6(),
+            lease.prefix_len6(),
+            lease.host_ip6(),
             self.config.extra_boot_args
         );
         spec
@@ -3298,6 +3323,9 @@ impl SandboxManager {
                 prefix_len: lease.prefix_len as u32,
                 gateway: lease.host_ip.to_string(),
                 dns: lease.host_ip.to_string(),
+                ip6: lease.guest_ip6().to_string(),
+                prefix_len6: lease.prefix_len6() as u32,
+                gateway6: lease.host_ip6().to_string(),
             }),
             self.inspection_ca_for(&policy),
             self.trust_bundles_for(&template, &policy).await,
@@ -3969,6 +3997,9 @@ impl SandboxManager {
                         prefix_len: lease.prefix_len as u32,
                         gateway: lease.host_ip.to_string(),
                         dns: lease.host_ip.to_string(),
+                        ip6: lease.guest_ip6().to_string(),
+                        prefix_len6: lease.prefix_len6() as u32,
+                        gateway6: lease.host_ip6().to_string(),
                     }),
                     self.inspection_ca_for(&policy),
                     self.trust_bundles_for(&source.template(), &policy).await,

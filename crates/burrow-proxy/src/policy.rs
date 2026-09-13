@@ -2,7 +2,7 @@
 //! requests that are allowed through.
 
 use std::collections::HashMap;
-use std::net::Ipv4Addr;
+use std::net::IpAddr;
 use std::sync::{Arc, RwLock};
 
 /// Rules one policy may carry.
@@ -387,7 +387,7 @@ impl SandboxPolicy {
     /// these at the door, so one arriving malformed means the policy is not
     /// the one that was written, and the safe reading of a denial is the
     /// broader one.
-    pub fn denies(&self, address: Ipv4Addr) -> bool {
+    pub fn denies(&self, address: IpAddr) -> bool {
         self.deny_cidrs.iter().any(|entry| match parse_cidr(entry) {
             Some((network, prefix)) => contains(network, prefix, address),
             None => true,
@@ -395,34 +395,80 @@ impl SandboxPolicy {
     }
 }
 
-/// Parses `a.b.c.d/len` exactly, or a bare address as a /32.
+/// Parses `a.b.c.d/len` or `v6/len`, or a bare address as a host route.
 ///
 /// Deliberately as strict as the nftables renderer: the two must not disagree
 /// about what a policy denies.
-fn parse_cidr(value: &str) -> Option<(Ipv4Addr, u8)> {
+fn parse_cidr(value: &str) -> Option<(IpAddr, u8)> {
     let (address, prefix) = match value.split_once('/') {
         Some((address, len)) => {
             if len.is_empty() || !len.bytes().all(|b| b.is_ascii_digit()) {
                 return None;
             }
             let prefix: u8 = len.parse().ok()?;
-            if prefix > 32 {
-                return None;
-            }
             (address, prefix)
         }
-        None => (value, 32),
+        None => (value, u8::MAX),
     };
-    Some((address.parse::<Ipv4Addr>().ok()?, prefix))
+    let address: IpAddr = address.parse().ok()?;
+    let full = match address {
+        IpAddr::V4(_) => 32,
+        IpAddr::V6(_) => 128,
+    };
+    let prefix = match prefix {
+        u8::MAX => full,
+        prefix if prefix <= full => prefix,
+        _ => return None,
+    };
+    Some((address, prefix))
 }
 
-fn contains(network: Ipv4Addr, prefix: u8, address: Ipv4Addr) -> bool {
-    // A /0 covers everything, and shifting a u32 by 32 is undefined.
-    let mask = match prefix {
-        0 => 0,
-        bits => u32::MAX << (32 - bits),
-    };
-    u32::from(network) & mask == u32::from(address) & mask
+/// Whether `address` is inside `network/prefix`.
+///
+/// A CIDR only ever matches its own family. An IPv4-mapped v6 address is
+/// compared as the v4 address it is, so `10.0.0.0/8` still denies
+/// `::ffff:10.0.0.1`; without that a v6 destination would walk through every
+/// v4 denial an operator wrote.
+fn contains(network: IpAddr, prefix: u8, address: IpAddr) -> bool {
+    let address = unmap(address);
+    match (network, unmap(network), address) {
+        (IpAddr::V4(network), _, IpAddr::V4(address)) => {
+            // A /0 covers everything, and shifting a u32 by 32 is undefined.
+            let mask = match prefix {
+                0 => 0,
+                bits => u32::MAX << (32 - bits),
+            };
+            u32::from(network) & mask == u32::from(address) & mask
+        }
+        (IpAddr::V6(_), IpAddr::V4(mapped), IpAddr::V4(address)) => {
+            // A mapped network written as v6 still denies the v4 it names.
+            let bits = prefix.saturating_sub(96);
+            contains(IpAddr::V4(mapped), bits.min(32), IpAddr::V4(address))
+        }
+        (IpAddr::V6(network), _, IpAddr::V6(address)) => {
+            let mask = match prefix {
+                0 => 0,
+                bits => u128::MAX << (128 - u32::from(bits)),
+            };
+            u128::from(network) & mask == u128::from(address) & mask
+        }
+        _ => false,
+    }
+}
+
+/// An IPv4-mapped address as the IPv4 address it is, anything else unchanged.
+///
+/// Every address predicate in the proxy goes through this. `::ffff:169.254.169.254`
+/// is the cloud metadata endpoint and none of the v4 checks would recognise it
+/// while it is still wearing a v6 shape.
+pub fn unmap(address: IpAddr) -> IpAddr {
+    match address {
+        IpAddr::V6(v6) => match v6.to_ipv4_mapped() {
+            Some(v4) => IpAddr::V4(v4),
+            None => IpAddr::V6(v6),
+        },
+        v4 => v4,
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -467,15 +513,15 @@ pub fn matches(pattern: &str, host: &str) -> bool {
 /// or policies change.
 #[derive(Default)]
 pub struct PolicyTable {
-    by_ip: RwLock<HashMap<Ipv4Addr, SandboxPolicy>>,
+    by_ip: RwLock<HashMap<IpAddr, SandboxPolicy>>,
 }
 
 impl PolicyTable {
-    pub fn replace(&self, entries: HashMap<Ipv4Addr, SandboxPolicy>) {
+    pub fn replace(&self, entries: HashMap<IpAddr, SandboxPolicy>) {
         *self.by_ip.write().unwrap() = entries;
     }
 
-    pub fn get(&self, ip: Ipv4Addr) -> Option<SandboxPolicy> {
+    pub fn get(&self, ip: IpAddr) -> Option<SandboxPolicy> {
         self.by_ip.read().unwrap().get(&ip).cloned()
     }
 
@@ -483,7 +529,7 @@ impl PolicyTable {
     ///
     /// An unknown source or an unknown destination is denied: the proxy only
     /// ever permits what it can positively identify and match.
-    pub fn decide(&self, ip: Ipv4Addr, host: Option<&str>) -> (Option<SandboxPolicy>, Decision) {
+    pub fn decide(&self, ip: IpAddr, host: Option<&str>) -> (Option<SandboxPolicy>, Decision) {
         let Some(policy) = self.get(ip) else {
             return (None, Decision::Deny("unknown source sandbox"));
         };
@@ -511,7 +557,7 @@ impl PolicyTable {
     /// encode whatever it likes into a name and watch a public resolver receive
     /// it. The same allowlist that governs connections governs lookups, with
     /// `.internal` handled elsewhere before this is consulted.
-    pub fn may_resolve(&self, ip: Ipv4Addr, name: &str) -> (Option<SandboxPolicy>, Decision) {
+    pub fn may_resolve(&self, ip: IpAddr, name: &str) -> (Option<SandboxPolicy>, Decision) {
         let Some(policy) = self.get(ip) else {
             return (None, Decision::Deny("unknown source sandbox"));
         };
@@ -565,9 +611,9 @@ mod tests {
         assert!(matches("*.example.com", "WWW.Example.Com"));
     }
 
-    fn table_with(mode: NetworkMode, domains: &[&str]) -> (PolicyTable, Ipv4Addr) {
+    fn table_with(mode: NetworkMode, domains: &[&str]) -> (PolicyTable, IpAddr) {
         let table = PolicyTable::default();
-        let ip = Ipv4Addr::new(10, 99, 0, 6);
+        let ip = IpAddr::from([10, 99, 0, 6]);
         table.replace(HashMap::from([(
             ip,
             SandboxPolicy {
@@ -607,7 +653,7 @@ mod tests {
         assert!(table.may_resolve(ip, "anything.example").1.allowed());
         assert!(
             !table
-                .may_resolve(Ipv4Addr::new(10, 99, 0, 7), "anything.example")
+                .may_resolve(IpAddr::from([10, 99, 0, 7]), "anything.example")
                 .1
                 .allowed()
         );
@@ -622,16 +668,16 @@ mod tests {
             deny_cidrs: vec!["10.0.0.0/8".into(), "169.254.169.254".into()],
             ..Default::default()
         };
-        assert!(policy.denies(Ipv4Addr::new(10, 1, 2, 3)));
-        assert!(policy.denies(Ipv4Addr::new(169, 254, 169, 254)));
-        assert!(!policy.denies(Ipv4Addr::new(169, 254, 169, 253)));
-        assert!(!policy.denies(Ipv4Addr::new(11, 0, 0, 1)));
+        assert!(policy.denies(IpAddr::from([10, 1, 2, 3])));
+        assert!(policy.denies(IpAddr::from([169, 254, 169, 254])));
+        assert!(!policy.denies(IpAddr::from([169, 254, 169, 253])));
+        assert!(!policy.denies(IpAddr::from([11, 0, 0, 1])));
 
         let everything = SandboxPolicy {
             deny_cidrs: vec!["0.0.0.0/0".into()],
             ..Default::default()
         };
-        assert!(everything.denies(Ipv4Addr::new(93, 184, 216, 34)));
+        assert!(everything.denies(IpAddr::from([93, 184, 216, 34])));
     }
 
     /// The daemon validates these at the door, so a malformed entry means the
@@ -643,7 +689,7 @@ mod tests {
             deny_cidrs: vec!["10.0.0.0/33".into()],
             ..Default::default()
         };
-        assert!(policy.denies(Ipv4Addr::new(93, 184, 216, 34)));
+        assert!(policy.denies(IpAddr::from([93, 184, 216, 34])));
     }
 
     fn set_headers(domain: &str, matcher: Option<RequestMatch>, name: &str) -> Rule {
@@ -935,7 +981,7 @@ mod tests {
     #[test]
     fn unknown_source_is_denied() {
         let table = PolicyTable::default();
-        let (policy, decision) = table.decide(Ipv4Addr::new(10, 99, 0, 6), Some("pypi.org"));
+        let (policy, decision) = table.decide(IpAddr::from([10, 99, 0, 6]), Some("pypi.org"));
         assert!(policy.is_none());
         assert_eq!(decision, Decision::Deny("unknown source sandbox"));
     }
@@ -943,7 +989,7 @@ mod tests {
     #[test]
     fn unidentifiable_destination_is_denied_even_with_a_permissive_policy() {
         let table = PolicyTable::default();
-        let ip = Ipv4Addr::new(10, 99, 0, 6);
+        let ip = IpAddr::from([10, 99, 0, 6]);
         table.replace(HashMap::from([(
             ip,
             SandboxPolicy {
@@ -963,7 +1009,7 @@ mod tests {
     #[test]
     fn allowed_host_passes() {
         let table = PolicyTable::default();
-        let ip = Ipv4Addr::new(10, 99, 0, 6);
+        let ip = IpAddr::from([10, 99, 0, 6]);
         table.replace(HashMap::from([(
             ip,
             SandboxPolicy {

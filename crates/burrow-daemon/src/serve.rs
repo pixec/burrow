@@ -354,7 +354,7 @@ async fn registration_loop(
     );
     let claimed_index = load_node_index(&args.data_dir).await;
     let mut applied_peers: Vec<burrow_net::Peer> = Vec::new();
-    let mut denied_edges: Vec<std::net::Ipv4Addr> = Vec::new();
+    let mut denied_edges: Vec<std::net::IpAddr> = Vec::new();
     let mut pins =
         burrow_net::pinning::PinnedKeys::load(&args.data_dir.join("mesh-pins"), &args.mesh_pins)
             .await;
@@ -473,20 +473,20 @@ async fn store_node_index(data_dir: &std::path::Path, index: u32) {
 async fn apply_edge_denial(
     sandboxes: &SandboxManager,
     hosts: &[String],
-    applied: &mut Vec<std::net::Ipv4Addr>,
+    applied: &mut Vec<std::net::IpAddr>,
 ) {
     let mut addresses = Vec::new();
     for host in hosts {
         // Tolerant of a host:port, since an operator's advertisement may carry
         // one; every port on the address is denied either way.
-        addresses.extend(resolve_v4(endpoint_host(host)).await);
+        addresses.extend(resolve_denied(endpoint_host(host)).await);
     }
     addresses.sort();
     addresses.dedup();
     if addresses.is_empty() && !hosts.is_empty() {
         tracing::warn!(
             ?hosts,
-            "no edge router resolved to an IPv4 address; keeping the denial already applied"
+            "no edge router resolved to an address; keeping the denial already applied"
         );
         return;
     }
@@ -640,12 +640,12 @@ fn spawn_audit_pruner(store: Arc<burrow_store::Store>, retention_days: u32) {
 /// resolve yet leaves the node no worse off than before there was a rule, and
 /// is why the orchestrator should not share an address with anything a sandbox
 /// is meant to reach.
-async fn control_plane_addresses(endpoint: &str) -> Vec<std::net::Ipv4Addr> {
-    let addresses = resolve_v4(endpoint_host(endpoint)).await;
+async fn control_plane_addresses(endpoint: &str) -> Vec<std::net::IpAddr> {
+    let addresses = resolve_denied(endpoint_host(endpoint)).await;
     if addresses.is_empty() {
         tracing::warn!(
             orchestrator = endpoint,
-            "the orchestrator resolves to no IPv4 address; sandboxes will not be denied it by address"
+            "the orchestrator resolves to no address; sandboxes will not be denied it by address"
         );
     } else {
         tracing::info!(
@@ -662,14 +662,32 @@ async fn control_plane_addresses(endpoint: &str) -> Vec<std::net::Ipv4Addr> {
 /// Port 0 because every port on the address is denied, not just the one burrow
 /// dials. A v6 address is dropped: the ruleset matches on `ip daddr` and cannot
 /// render one.
-async fn resolve_v4(host: &str) -> Vec<std::net::Ipv4Addr> {
+/// Binds a listener that serves both families where the host allows it.
+///
+/// An IPv6 wildcard socket accepts IPv4 too, as v4-mapped addresses, which is
+/// why the proxy unmaps every source it sees. A host with IPv6 unavailable
+/// falls back to the address as configured rather than leaving allowlist
+/// sandboxes with nowhere to be redirected.
+async fn bind_dual_stack(
+    configured: std::net::SocketAddr,
+) -> std::io::Result<(tokio::net::TcpListener, std::net::SocketAddr)> {
+    if configured.ip().is_unspecified() {
+        let dual = std::net::SocketAddr::from((std::net::Ipv6Addr::UNSPECIFIED, configured.port()));
+        match tokio::net::TcpListener::bind(dual).await {
+            Ok(listener) => return Ok((listener, dual)),
+            Err(err) => tracing::warn!(%dual, %err, "no dual-stack listener; IPv4 only"),
+        }
+    }
+    let listener = tokio::net::TcpListener::bind(configured).await?;
+    Ok((listener, configured))
+}
+
+async fn resolve_denied(host: &str) -> Vec<std::net::IpAddr> {
     match tokio::net::lookup_host((host, 0u16)).await {
-        Ok(addresses) => addresses
-            .filter_map(|address| match address.ip() {
-                std::net::IpAddr::V4(v4) => Some(v4),
-                std::net::IpAddr::V6(_) => None,
-            })
-            .collect(),
+        // Both families. The ruleset renders a matcher per family, so a host
+        // reachable only over IPv6 is denied like any other; dropping those
+        // here is what used to leave one undenied.
+        Ok(addresses) => addresses.map(|address| address.ip()).collect(),
         Err(err) => {
             tracing::warn!(host, %err, "could not resolve a host that must be denied to sandboxes");
             Vec::new()
@@ -899,9 +917,9 @@ pub async fn run(args: ServeArgs) -> anyhow::Result<()> {
         authority: Some(Arc::clone(&authority)),
         denied: Arc::clone(&denied),
     });
-    match tokio::net::TcpListener::bind(args.proxy_listen).await {
-        Ok(listener) => {
-            tracing::info!(listen = %args.proxy_listen, "egress proxy listening");
+    match bind_dual_stack(args.proxy_listen).await {
+        Ok((listener, listen)) => {
+            tracing::info!(%listen, "egress proxy listening");
             tokio::spawn(proxy.serve(listener));
         }
         // Without the proxy, allowlist-mode sandboxes have their traffic

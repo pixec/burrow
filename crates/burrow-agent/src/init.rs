@@ -168,6 +168,26 @@ pub fn write_resolv_conf() {
     }
 }
 
+/// The guest's IPv6 address, as `<address>/<prefix>`, from `burrow.ip6=`.
+///
+/// The kernel's `ip=` argument is IPv4 by design and has no v6 form, so a
+/// cold boot has nowhere else to learn one. A warm start is told over the
+/// handshake instead, which is why this returns `None` rather than failing
+/// when the argument is absent.
+pub fn boot_ipv6() -> Option<(std::net::Ipv6Addr, u8, Option<std::net::Ipv6Addr>)> {
+    let cmdline = std::fs::read_to_string("/proc/cmdline").ok()?;
+    let arg = |key: &str| {
+        cmdline
+            .split_whitespace()
+            .find_map(|arg| arg.strip_prefix(key))
+            .map(str::to_owned)
+    };
+    let value = arg("burrow.ip6=")?;
+    let (address, prefix) = value.split_once('/')?;
+    let gateway = arg("burrow.ip6gw=").and_then(|g| g.parse().ok());
+    Some((address.parse().ok()?, prefix.parse().ok()?, gateway))
+}
+
 fn mount_one(source: &str, target: &str, fstype: &str, flags: MsFlags, options: Option<&str>) {
     if !Path::new(target).exists()
         && let Err(err) = std::fs::create_dir_all(target)

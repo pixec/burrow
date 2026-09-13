@@ -221,8 +221,10 @@ What that asks of you:
 
 - Do not put anything a sandbox is meant to reach on an address that also serves
   an edge or the orchestrator. The denial is per address, not per port.
-- Give the orchestrator and each node's edge an IPv4 address. The ruleset matches
-  on `ip daddr`, so an edge reachable only over IPv6 cannot be denied.
+- Either family works. The ruleset renders a matcher per family, so an edge or
+  orchestrator reachable only over IPv6 is denied like any other. Guests have no
+  IPv6 address today and the anti-spoof chain drops any v6 they emit, so this is
+  groundwork rather than something load-bearing yet.
 - Check it after a topology change. `burrow exec` into a sandbox in open mode and
   try to fetch another sandbox's published port through an edge hostname. It
   should hang and time out, not answer.

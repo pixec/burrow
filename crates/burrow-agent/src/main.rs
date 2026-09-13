@@ -354,6 +354,16 @@ async fn main() {
             tracing::error!(%err, "failed to mount essential filesystems");
         }
         init::write_resolv_conf();
+        // The kernel brought the interface up over IPv4; v6 has no equivalent
+        // boot argument the kernel understands, so burrow passes its own and
+        // the address is added here.
+        if let Some((address, prefix, gateway)) = init::boot_ipv6() {
+            if let Err(err) = netconf::add_ipv6(address, prefix, gateway).await {
+                tracing::warn!(%address, %err, "could not add the guest's IPv6 address");
+            } else {
+                tracing::debug!(%address, prefix, "IPv6 configured");
+            }
+        }
     }
     // Exec depends on the reaper for exit statuses, so it runs even when the
     // agent is not PID 1 (development outside a microVM).

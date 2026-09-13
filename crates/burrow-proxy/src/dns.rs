@@ -8,7 +8,7 @@
 //! question name is decoded, for the log; EDNS, DNSSEC and unusual record types
 //! pass through untouched, so this cannot become a source of resolution bugs.
 
-use std::net::{Ipv4Addr, SocketAddr};
+use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::sync::Arc;
 
 use tokio::net::UdpSocket;
@@ -67,12 +67,12 @@ struct Bucket {
 /// The resolver's share of the node, split so one sandbox cannot spend it all.
 #[derive(Default)]
 struct Limits {
-    buckets: std::sync::Mutex<std::collections::HashMap<Ipv4Addr, Bucket>>,
+    buckets: std::sync::Mutex<std::collections::HashMap<IpAddr, Bucket>>,
 }
 
 impl Limits {
     /// Whether `source` may forward one more query now.
-    fn allow(&self, source: Ipv4Addr) -> bool {
+    fn allow(&self, source: IpAddr) -> bool {
         let now = std::time::Instant::now();
         let mut buckets = self.buckets.lock().unwrap();
 
@@ -172,10 +172,9 @@ impl Resolver {
         forwards: &Arc<tokio::sync::Semaphore>,
     ) {
         let name = parse_question(&query);
-        let source_ip = match from.ip() {
-            std::net::IpAddr::V4(ip) => ip,
-            std::net::IpAddr::V6(_) => return,
-        };
+        // A sandbox reaching the resolver over IPv6 is the same sandbox; an
+        // IPv4-mapped source is looked up as the v4 address it is.
+        let source_ip = crate::policy::unmap(from.ip());
         // Before anything is parsed, logged or recorded, so a flood costs this
         // one lookup and nothing downstream of it.
         if !limits.allow(source_ip) {
@@ -212,7 +211,7 @@ impl Resolver {
             && !name.is_empty()
         {
             let (addresses, ttl) = crate::resolutions::parse_answers(answer);
-            self.resolutions.record(source_ip, &name, addresses, ttl);
+            self.resolutions.record(&sandbox_id, &name, addresses, ttl);
         }
 
         self.audit.record(EgressEvent {
@@ -258,10 +257,20 @@ impl Resolver {
     /// A name the caller may not see is answered `NXDOMAIN`, identically to one
     /// that does not exist: whether a private network has a member called
     /// `db` is not something an outsider should be able to probe.
-    fn answer_internal(&self, query: &[u8], client: Ipv4Addr, name: &str) -> Vec<u8> {
-        match self.directory.resolve(client, name) {
-            Some(address) => a_record_response(query, address),
-            None => rcode_response(query, RCODE_NXDOMAIN),
+    fn answer_internal(&self, query: &[u8], client: IpAddr, name: &str) -> Vec<u8> {
+        // The directory is v4: a private network's members are named by their
+        // v4 addresses, so an AAAA for an internal name has no answer rather
+        // than a wrong one, and NOERROR with no records is how DNS says that.
+        // Private networks are named by their v4 addresses, so the lookup
+        // key is the v4 form of whichever address the query arrived from.
+        let client = match crate::policy::unmap(client) {
+            IpAddr::V4(v4) => v4,
+            IpAddr::V6(_) => return rcode_response(query, RCODE_NXDOMAIN),
+        };
+        match (query_is_aaaa(query), self.directory.resolve(client, name)) {
+            (true, Some(_)) => rcode_response(query, RCODE_NOERROR),
+            (false, Some(address)) => a_record_response(query, address),
+            (_, None) => rcode_response(query, RCODE_NXDOMAIN),
         }
     }
 
@@ -349,6 +358,37 @@ fn answers_query(query: &[u8], reply: &[u8]) -> bool {
 const INTERNAL_TTL_SECS: u32 = 30;
 
 const RCODE_NXDOMAIN: u8 = 3;
+const RCODE_NOERROR: u8 = 0;
+/// QTYPE 28.
+const QTYPE_AAAA: u16 = 28;
+
+/// Whether the question is for an AAAA record.
+///
+/// Only the first question is read, which is the only one any resolver in
+/// practice sends and the only one [`parse_question`] decodes.
+fn query_is_aaaa(packet: &[u8]) -> bool {
+    let Some(end) = skip_question_name(packet, 12) else {
+        return false;
+    };
+    packet
+        .get(end..end + 2)
+        .is_some_and(|qtype| u16::from_be_bytes([qtype[0], qtype[1]]) == QTYPE_AAAA)
+}
+
+/// The offset just past the first question's name.
+fn skip_question_name(packet: &[u8], mut pos: usize) -> Option<usize> {
+    loop {
+        let len = *packet.get(pos)? as usize;
+        if len == 0 {
+            return Some(pos + 1);
+        }
+        // A question name is never compressed.
+        if len & 0xc0 != 0 {
+            return None;
+        }
+        pos += 1 + len;
+    }
+}
 /// The answer to a name this sandbox's policy does not let it ask about.
 const RCODE_REFUSED: u8 = 5;
 
@@ -569,7 +609,7 @@ mod tests {
         let query = query_for("beta.team.internal");
         let reply = a_record_response(&query, Ipv4Addr::new(10, 99, 0, 10));
         let (addresses, ttl) = crate::resolutions::parse_answers(&reply);
-        assert_eq!(addresses, vec![Ipv4Addr::new(10, 99, 0, 10)]);
+        assert_eq!(addresses, vec![IpAddr::from([10, 99, 0, 10])]);
         assert_eq!(ttl.as_secs(), INTERNAL_TTL_SECS as u64);
     }
 
@@ -616,8 +656,8 @@ mod tests {
     #[test]
     fn one_source_can_burst_but_not_flood() {
         let limits = Limits::default();
-        let noisy = Ipv4Addr::new(10, 99, 0, 6);
-        let quiet = Ipv4Addr::new(10, 99, 0, 10);
+        let noisy = IpAddr::from([10, 99, 0, 6]);
+        let quiet = IpAddr::from([10, 99, 0, 10]);
 
         for n in 0..QUERY_BURST as usize {
             assert!(limits.allow(noisy), "query {n} is within the burst");
@@ -633,7 +673,7 @@ mod tests {
     #[test]
     fn a_spent_budget_refills_over_time() {
         let limits = Limits::default();
-        let source = Ipv4Addr::new(10, 99, 0, 6);
+        let source = IpAddr::from([10, 99, 0, 6]);
         for _ in 0..QUERY_BURST as usize {
             assert!(limits.allow(source));
         }
@@ -658,7 +698,7 @@ mod tests {
     fn buckets_for_sources_that_went_quiet_are_forgotten() {
         let limits = Limits::default();
         for n in 0..1200u32 {
-            limits.allow(Ipv4Addr::from(n.to_be_bytes()));
+            limits.allow(IpAddr::from(Ipv4Addr::from(n.to_be_bytes())));
         }
         {
             // Age every bucket past the idle window, then touch one more
@@ -668,7 +708,7 @@ mod tests {
                 bucket.last -= BUCKET_IDLE * 2;
             }
         }
-        limits.allow(Ipv4Addr::new(10, 99, 0, 6));
+        limits.allow(IpAddr::from([10, 99, 0, 6]));
         let buckets = limits.buckets.lock().unwrap();
         assert_eq!(
             buckets.len(),
