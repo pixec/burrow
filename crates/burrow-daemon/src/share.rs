@@ -551,7 +551,16 @@ mod tests {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         let accept = tokio::spawn(async move { listener.accept().await.unwrap() });
-        let _client = dial_guest(addr, Some(Ipv4Addr::LOCALHOST)).await.unwrap();
+        let client = dial_guest(addr, Some(Ipv4Addr::LOCALHOST)).await;
+        // The source bind goes through IP_TRANSPARENT, which needs
+        // CAP_NET_ADMIN. An unprivileged runner cannot exercise this at all.
+        if client
+            .as_ref()
+            .is_err_and(|err| err.contains("Operation not permitted"))
+        {
+            return;
+        }
+        let _client = client.unwrap();
         let (_, peer) = accept.await.unwrap();
         assert_eq!(peer.ip(), std::net::IpAddr::V4(Ipv4Addr::LOCALHOST));
     }
