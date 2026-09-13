@@ -187,8 +187,34 @@ class PortMapping:
     guest_port: int
     host_port: int
     url: str
-    # Empty unless the holding node's edge is serving.
+    # Empty unless the holding node's edge is serving, and always empty for a
+    # UDP mapping, which the edge cannot route.
     edge_url: str = ""
+    udp: bool = False
+
+
+@dataclass
+class Share:
+    """A sandbox reachable through a tailcat address.
+
+    The address is the credential: any `tailcat` client holding it can
+    connect, unless `allowed_clients` narrows that. Treat it as a secret.
+    """
+
+    address: str
+    # Guest TCP ports reachable through the share; empty means every port.
+    ports: List[int]
+    # `nodekey:<hex>` of each admitted client; empty admits anyone.
+    allowed_clients: List[str]
+    # RFC 3339; when the current keys were issued.
+    created_at: str
+    # Guest UDP ports reachable through the share; none unless listed or all_udp.
+    udp_ports: List[int] = field(default_factory=list)
+    all_udp: bool = False
+    # Packet source is the last disco-pong-verified public IPv4.
+    # What the share is doing: a node that cannot carry the reply path
+    # serves from the gateway whatever was asked for.
+    transparent_ip: bool = True
 
 
 @dataclass

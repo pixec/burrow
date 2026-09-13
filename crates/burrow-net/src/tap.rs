@@ -15,6 +15,24 @@ pub fn tap_name(lease: &Lease) -> String {
     format!("bt{}", lease.block)
 }
 
+/// Turns off autoconfiguration on one tap.
+///
+/// Best effort, and per interface rather than globally: burrow has no
+/// business changing a host-wide sysctl, and a host with IPv6 disabled
+/// outright has no such knob to write.
+async fn accept_no_router_advertisements(tap: &str) {
+    for key in [
+        format!("net.ipv6.conf.{tap}.accept_ra"),
+        format!("net.ipv6.conf.{tap}.autoconf"),
+    ] {
+        let _ = tokio::process::Command::new("sysctl")
+            .arg("-qw")
+            .arg(format!("{key}=0"))
+            .output()
+            .await;
+    }
+}
+
 async fn run(args: &[&str]) -> Result<()> {
     let output = tokio::process::Command::new("ip")
         .args(args)
@@ -48,8 +66,23 @@ pub async fn create_named(name: &str, lease: &Lease) -> Result<String> {
     run(&["tuntap", "add", "dev", &name, "mode", "tap"]).await?;
     let cidr = format!("{}/{}", lease.host_ip, lease.prefix_len);
     run(&["addr", "add", &cidr, "dev", &name]).await?;
+
+    // Router advertisements are refused before the interface is up, so the
+    // guest never learns an address from anything but us. Burrow assigns both
+    // families itself, and a tap that autoconfigured from a neighbouring
+    // router would carry an address no rule names.
+    accept_no_router_advertisements(&name).await;
+
+    let cidr6 = format!("{}/{}", lease.host_ip6(), lease.prefix_len6());
+    // Non-fatal: a host with IPv6 compiled out still runs sandboxes, they
+    // just have no v6 link. Failing the create would take the v4 sandbox with
+    // it for the sake of an address nothing yet routes.
+    if let Err(err) = run(&["-6", "addr", "add", &cidr6, "dev", &name]).await {
+        tracing::warn!(tap = name, %cidr6, %err, "tap has no IPv6 address");
+    }
+
     run(&["link", "set", &name, "up"]).await?;
-    tracing::debug!(tap = name, %cidr, "tap device up");
+    tracing::debug!(tap = name, %cidr, %cidr6, "tap device up");
     Ok(name)
 }
 

@@ -79,6 +79,13 @@ service Burrow {
   rpc ListPorts(SandboxRef) returns (ListPortsResponse);
   rpc ClosePort(ClosePortRequest) returns (ClosePortResponse);
 
+  // Shares: reach a sandbox's ports through a tailcat address, a WireGuard
+  // tunnel bootstrapped over a DERP relay. No host port, no edge, and the
+  // connection wakes a suspended sandbox. The address is the credential.
+  rpc ShareSandbox(ShareRequest) returns (Share);
+  rpc GetShare(SandboxRef) returns (Share);
+  rpc UnshareSandbox(SandboxRef) returns (UnshareResponse);
+
   // Files
   rpc UploadFile(stream FileChunk) returns (UploadResult);
   rpc DownloadFile(DownloadRequest) returns (stream FileChunk);
@@ -194,12 +201,16 @@ message ExposePortRequest {
   uint32 guest_port = 2;
   // Preferred host port; 0 lets the node allocate one.
   uint32 host_port = 3;
+  // Forward UDP rather than TCP. A host port carries one or the other, so
+  // publishing both for a guest port takes two mappings.
+  bool udp = 4;
 }
 
 message PortMapping {
   string sandbox_id = 1;
   uint32 guest_port = 2;
   uint32 host_port = 3;
+  bool udp = 6;
   // Address a client outside the sandbox should connect to.
   string host_address = 4;
   // Stable URL for this port through the edge router on the node holding the
@@ -220,6 +231,54 @@ message ClosePortRequest {
 }
 
 message ClosePortResponse {}
+
+message ShareRequest {
+  string sandbox_id = 1;
+  // Guest TCP ports reachable through the share. Empty means every port.
+  repeated uint32 ports = 2;
+  // Client node keys admitted, as `nodekey:<hex>`. Empty admits any client
+  // that knows the address.
+  repeated string allowed_clients = 3;
+  // Issue new keys to an existing share, which gives it a new address and
+  // ends every client's ability to connect with the old one.
+  bool rotate = 4;
+  reserved 5;
+  reserved "proxy_protocol";
+  // Guest UDP ports reachable through the share. Unlike TCP, UDP is off
+  // unless asked for: `udp_ports` names ports, `all_udp` admits every one.
+  repeated uint32 udp_ports = 6;
+  bool all_udp = 7;
+  reserved 8;
+  reserved "transparent_ip";
+  // Source connections from the gateway rather than from the client's own
+  // address. On by default: a guest that can see who is calling can log,
+  // rate-limit and authorise on it with no idea a tunnel is involved.
+  bool no_transparent_ip = 9;
+}
+
+message Share {
+  string sandbox_id = 1;
+  // The tailcat address clients connect with. Anyone holding it can connect,
+  // unless `allowed_clients` narrows that.
+  string address = 2;
+  // Empty means every port.
+  repeated uint32 ports = 3;
+  repeated string allowed_clients = 4;
+  reserved 5;
+  reserved "proxy_protocol";
+  // RFC 3339; the moment the current keys were issued.
+  string created_at = 6;
+  repeated uint32 udp_ports = 7;
+  bool all_udp = 8;
+  // What the share is actually doing, which is not always what was asked
+  // for: a node whose kernel cannot carry the reply path serves from the
+  // gateway and says so here.
+  bool transparent_ip = 9;
+  reserved 10, 11;
+  reserved "client_range", "client_source_ips";
+}
+
+message UnshareResponse {}
 
 message FileChunk {
   // Both set on the first message of an upload only.

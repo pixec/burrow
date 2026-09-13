@@ -549,24 +549,23 @@ impl NodeService for NodeApi {
         req: Request<api::ExposePortRequest>,
     ) -> Result<Response<api::PortMapping>, Status> {
         let req = req.into_inner();
-        let (host_port, guest_port) = self
+        let mapping = self
             .sandboxes
             .expose_port(
                 &req.sandbox_id,
                 port_u16(req.guest_port)?,
                 port_u16(req.host_port)?,
+                if req.udp {
+                    burrow_net::Protocol::Udp
+                } else {
+                    burrow_net::Protocol::Tcp
+                },
             )
             .await?;
-        Ok(Response::new(api::PortMapping {
-            sandbox_id: req.sandbox_id,
-            guest_port: guest_port as u32,
-            host_port: host_port as u32,
-            // The node does not know which address callers reach it on, nor
-            // whether an edge is serving; the orchestrator fills both in from
-            // its own view of the fleet.
-            host_address: String::new(),
-            edge_url: String::new(),
-        }))
+        // The node does not know which address callers reach it on, nor
+        // whether an edge is serving; the orchestrator fills both in from its
+        // own view of the fleet.
+        Ok(Response::new(port_proto(req.sandbox_id, &mapping)))
     }
 
     async fn list_ports(
@@ -577,14 +576,8 @@ impl NodeService for NodeApi {
         let ports = self.sandboxes.list_ports(&sandbox_id).await;
         Ok(Response::new(api::ListPortsResponse {
             ports: ports
-                .into_iter()
-                .map(|(host_port, guest_port)| api::PortMapping {
-                    sandbox_id: sandbox_id.clone(),
-                    guest_port: guest_port as u32,
-                    host_port: host_port as u32,
-                    host_address: String::new(),
-                    edge_url: String::new(),
-                })
+                .iter()
+                .map(|port| port_proto(sandbox_id.clone(), port))
                 .collect(),
         }))
     }
@@ -598,6 +591,47 @@ impl NodeService for NodeApi {
             .close_port(&req.sandbox_id, port_u16(req.host_port)?)
             .await?;
         Ok(Response::new(api::ClosePortResponse {}))
+    }
+
+    async fn share_sandbox(
+        &self,
+        req: Request<api::ShareRequest>,
+    ) -> Result<Response<api::Share>, Status> {
+        let req = req.into_inner();
+        let ports = share_ports(&req.ports)?;
+        let udp_ports = share_ports(&req.udp_ports)?;
+        let info = self
+            .sandboxes
+            .share(
+                &req.sandbox_id,
+                crate::share::ShareShape {
+                    ports,
+                    allowed_clients: req.allowed_clients,
+                    udp_ports,
+                    all_udp: req.all_udp,
+                    transparent_ip: !req.no_transparent_ip,
+                },
+                req.rotate,
+            )
+            .await?;
+        Ok(Response::new(share_proto(req.sandbox_id, info)))
+    }
+
+    async fn get_share(
+        &self,
+        req: Request<nodepb::NodeSandboxRef>,
+    ) -> Result<Response<api::Share>, Status> {
+        let sandbox_id = req.into_inner().sandbox_id;
+        let info = self.sandboxes.get_share(&sandbox_id).await?;
+        Ok(Response::new(share_proto(sandbox_id, info)))
+    }
+
+    async fn unshare_sandbox(
+        &self,
+        req: Request<nodepb::NodeSandboxRef>,
+    ) -> Result<Response<api::UnshareResponse>, Status> {
+        self.sandboxes.unshare(&req.into_inner().sandbox_id).await?;
+        Ok(Response::new(api::UnshareResponse {}))
     }
 
     type ExecStream = BoxStream<api::ExecOutput>;
@@ -1291,6 +1325,41 @@ async fn remove_partial_upload_inner(sandbox: &RunningSandbox, path: &str) {
         // cancel the command that is doing the cleaning.
         let mut stream = response.into_inner();
         while let Some(Ok(_)) = stream.next().await {}
+    }
+}
+
+fn port_proto(sandbox_id: String, port: &burrow_net::PortMap) -> api::PortMapping {
+    api::PortMapping {
+        sandbox_id,
+        guest_port: u32::from(port.guest_port),
+        host_port: u32::from(port.host_port),
+        udp: port.protocol == burrow_net::Protocol::Udp,
+        host_address: String::new(),
+        edge_url: String::new(),
+    }
+}
+
+fn share_ports(ports: &[u32]) -> Result<Vec<u16>, Status> {
+    let ports = ports
+        .iter()
+        .map(|p| port_u16(*p))
+        .collect::<Result<Vec<_>, _>>()?;
+    if ports.contains(&0) {
+        return Err(Status::invalid_argument("port 0 cannot be shared"));
+    }
+    Ok(ports)
+}
+
+fn share_proto(sandbox_id: String, info: crate::share::ShareInfo) -> api::Share {
+    api::Share {
+        sandbox_id,
+        address: info.address,
+        ports: info.spec.ports.iter().map(|p| u32::from(*p)).collect(),
+        allowed_clients: info.spec.allowed_clients,
+        created_at: burrow_core::rfc3339_from_unix_secs(info.spec.created_at),
+        udp_ports: info.spec.udp_ports.iter().map(|p| u32::from(*p)).collect(),
+        all_udp: info.spec.all_udp,
+        transparent_ip: info.transparent_ip,
     }
 }
 

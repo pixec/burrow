@@ -14,12 +14,15 @@
 //! anti-spoofed (see [`render_antispoof`]) before the address-based rules run.
 
 use std::fmt::Write as _;
-use std::net::Ipv4Addr;
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 
 use crate::error::{NetError, Result};
 
 /// The address range every sandbox lease comes from.
 pub const SANDBOX_CIDR: &str = "10.99.0.0/16";
+/// The v6 pool, as [`SANDBOX_CIDR`] is for v4: the range a rule names when it
+/// means any sandbox anywhere rather than one on this node.
+pub const POOL6: &str = "fd99:b070::/48";
 /// The renderer's validated form of [`SANDBOX_CIDR`]. Nothing reaches the nft
 /// script that was not parsed first, a constant included, so this is built from
 /// [`crate::ipam`]'s numbers rather than from the string above.
@@ -47,6 +50,7 @@ pub const MESH_INTERFACE: &str = crate::mesh::MESH_INTERFACE;
 
 const FILTER_TABLE: &str = "burrow";
 const NAT_TABLE: &str = "burrow_nat";
+const NAT6_TABLE: &str = "burrow_nat6";
 /// Holds nothing but per-sandbox byte counters, in a table of its own so that
 /// reading usage never has to walk the policy rules.
 const METER_TABLE: &str = "burrow_meter";
@@ -61,10 +65,31 @@ pub enum Mode {
     Open,
 }
 
+/// Transport a published port forwards. A mapping is one or the other, and a
+/// host port belongs to one mapping whichever it is, so `tcp/20000` and
+/// `udp/20000` are never two different sandboxes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Protocol {
+    #[default]
+    Tcp,
+    Udp,
+}
+
+impl Protocol {
+    /// The nftables keyword, which is also how the CLI and the API spell it.
+    pub fn keyword(self) -> &'static str {
+        match self {
+            Protocol::Tcp => "tcp",
+            Protocol::Udp => "udp",
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct PortMap {
     pub host_port: u16,
     pub guest_port: u16,
+    pub protocol: Protocol,
 }
 
 #[derive(Debug, Clone)]
@@ -76,6 +101,12 @@ pub struct SandboxRules {
     pub tap: String,
     pub host_ip: Ipv4Addr,
     pub guest_ip: Ipv4Addr,
+    /// The same link's IPv6 addresses. A guest may talk to its gateway over
+    /// them and nothing else: v6 is not forwarded, because the egress proxy
+    /// and the resolver are still IPv4-only, and letting it route before they
+    /// understand it would be egress nothing inspects.
+    pub host_ip6: Ipv6Addr,
+    pub guest_ip6: Ipv6Addr,
     pub mode: Mode,
     /// Extra destinations permitted at L3 regardless of mode.
     pub allow_cidrs: Vec<String>,
@@ -225,7 +256,7 @@ pub fn render(sandboxes: &[SandboxRules]) -> String {
 ///
 /// Open mode is what makes them reachable at all: it has NAT'd egress to
 /// anywhere the node can route.
-pub fn render_with(sandboxes: &[SandboxRules], control_plane: &[Ipv4Addr]) -> String {
+pub fn render_with(sandboxes: &[SandboxRules], control_plane: &[IpAddr]) -> String {
     let mut out = String::new();
 
     // Declaring before flushing makes this work on a fresh host too: `flush`
@@ -234,6 +265,10 @@ pub fn render_with(sandboxes: &[SandboxRules], control_plane: &[Ipv4Addr]) -> St
     let _ = writeln!(out, "flush table inet {FILTER_TABLE}");
     let _ = writeln!(out, "add table ip {NAT_TABLE}");
     let _ = writeln!(out, "flush table ip {NAT_TABLE}");
+    // Its own table: nftables has no `inet` nat family, so v6 translation
+    // cannot share the one above and the two are rendered in step instead.
+    let _ = writeln!(out, "add table ip6 {NAT6_TABLE}");
+    let _ = writeln!(out, "flush table ip6 {NAT6_TABLE}");
 
     render_antispoof(&mut out, sandboxes);
 
@@ -274,9 +309,17 @@ pub fn render_with(sandboxes: &[SandboxRules], control_plane: &[Ipv4Addr]) -> St
     // On the destination only: traffic *from* one of these addresses is how a
     // node's edge reaches a guest port.
     for address in control_plane {
+        // Per family, because the matcher is. Only the v4 one used to be
+        // emitted, and a v6 control-plane address was dropped from the list
+        // rather than denied, so a sandbox that ever gained a v6 route would
+        // have reached it.
+        let matcher = match address {
+            IpAddr::V4(_) => "ip daddr",
+            IpAddr::V6(_) => "ip6 daddr",
+        };
         let _ = writeln!(
             out,
-            "add rule inet {FILTER_TABLE} sandbox ip daddr {address} drop"
+            "add rule inet {FILTER_TABLE} sandbox {matcher} {address} drop"
         );
     }
 
@@ -304,6 +347,7 @@ pub fn render_with(sandboxes: &[SandboxRules], control_plane: &[Ipv4Addr]) -> St
 
     render_host_input(&mut out, sandboxes);
     render_nat(&mut out, sandboxes);
+    render_nat6(&mut out, sandboxes);
     render_meter(&mut out, sandboxes);
     out
 }
@@ -456,6 +500,24 @@ fn render_antispoof(out: &mut String, sandboxes: &[SandboxRules]) {
             "add rule inet {FILTER_TABLE} antispoof iifname \"{}\" ip saddr {} return",
             sandbox.tap, sandbox.guest_ip
         );
+        // Per tap and per address, exactly as the v4 rule above. A blanket
+        // `ip6 saddr` return would pass every forged v6 source and make every
+        // address-based rule below decorative.
+        let _ = writeln!(
+            out,
+            "add rule inet {FILTER_TABLE} antispoof iifname \"{}\" ip6 saddr {} return",
+            sandbox.tap, sandbox.guest_ip6
+        );
+        // Neighbour discovery is sourced from a link-local address the guest
+        // picks itself, so it can never match the rule above, and a v6 link
+        // does not come up without it. Narrowed to the discovery types: this
+        // is not a general link-local allowance.
+        let _ = writeln!(
+            out,
+            "add rule inet {FILTER_TABLE} antispoof iifname \"{}\" ip6 saddr fe80::/10 \
+             icmpv6 type {{ nd-neighbor-solicit, nd-neighbor-advert, nd-router-solicit }} return",
+            sandbox.tap
+        );
     }
     // Reached only by a packet on a burrow tap whose source is not that
     // sandbox's own address. Counted and logged rather than dropped in silence:
@@ -500,6 +562,14 @@ fn render_host_input(out: &mut String, sandboxes: &[SandboxRules]) {
         out,
         "add rule inet {FILTER_TABLE} tohost icmp type echo-request accept"
     );
+    // The v6 equivalents. Neighbour discovery is not optional the way ICMP
+    // echo is: without it the guest cannot resolve its gateway's address and
+    // the link never works at all.
+    let _ = writeln!(
+        out,
+        "add rule inet {FILTER_TABLE} tohost icmpv6 type {{ nd-neighbor-solicit, \
+         nd-neighbor-advert, nd-router-solicit, echo-request }} accept"
+    );
 
     for sandbox in sandboxes {
         let (guest, host) = (sandbox.guest_ip, sandbox.host_ip);
@@ -521,10 +591,22 @@ fn render_host_input(out: &mut String, sandboxes: &[SandboxRules]) {
         }
 
         // The proxy only serves sandboxes whose policy routes through it.
+        //
+        // Both families: the v6 redirect in `burrow_nat6` rewrites the
+        // destination to this address and port, and the packet then arrives
+        // here on the input hook. Without the v6 accept the redirect would
+        // deliver every allowlisted v6 connection straight into the closing
+        // drop, which looks like the proxy being down rather than a missing
+        // rule.
         if sandbox.mode == Mode::Allowlist {
             let _ = writeln!(
                 out,
                 "add rule inet {FILTER_TABLE} tohost ip saddr {guest} ip daddr {host} tcp dport {PROXY_PORT} accept"
+            );
+            let _ = writeln!(
+                out,
+                "add rule inet {FILTER_TABLE} tohost ip6 saddr {} ip6 daddr {} tcp dport {PROXY_PORT} accept",
+                sandbox.guest_ip6, sandbox.host_ip6
             );
         }
     }
@@ -567,6 +649,15 @@ fn label(sandbox_id: &str) -> String {
 fn render_sandbox_denials(out: &mut String, sandbox: &SandboxRules) {
     let guest = sandbox.guest_ip;
     let _ = writeln!(out, "# sandbox {} denials", label(&sandbox.sandbox_id));
+
+    // Link-local, in every mode and ahead of everything, the v6 counterpart
+    // of the metadata denial below: `fe80::/10` is where a v6 metadata
+    // service lives, and no sandbox has a reason to reach one.
+    let _ = writeln!(
+        out,
+        "add rule inet {FILTER_TABLE} sandbox ip6 saddr {} ip6 daddr fe80::/10 drop",
+        sandbox.guest_ip6
+    );
 
     // The cloud metadata address, ahead of everything else including the
     // operator's own deny_cidrs: unlike those, this is not something an
@@ -660,6 +751,20 @@ fn render_sandbox_allowances(out: &mut String, sandbox: &SandboxRules) {
                 out,
                 "add rule inet {FILTER_TABLE} sandbox ip saddr {guest} accept"
             );
+            // The same two rules in the other family. Private networks are
+            // addressed in v4, so there are no v6 peer accepts above this and
+            // the pool drop is the whole of the neighbour policy: an open
+            // sandbox reaches the internet over v6 and no sandbox at all.
+            let _ = writeln!(
+                out,
+                "add rule inet {FILTER_TABLE} sandbox ip6 saddr {} ip6 daddr {POOL6} drop",
+                sandbox.guest_ip6
+            );
+            let _ = writeln!(
+                out,
+                "add rule inet {FILTER_TABLE} sandbox ip6 saddr {} accept",
+                sandbox.guest_ip6
+            );
         }
     }
 
@@ -703,9 +808,39 @@ fn render_sandbox_allowances(out: &mut String, sandbox: &SandboxRules) {
     for port in &sandbox.ports {
         let _ = writeln!(
             out,
-            "add rule inet {FILTER_TABLE} sandbox {external} ip daddr {guest} tcp dport {} accept",
+            "add rule inet {FILTER_TABLE} sandbox {external} ip daddr {guest} {} dport {} accept",
+            port.protocol.keyword(),
             port.guest_port
         );
+    }
+}
+
+/// The v6 half of [`render_nat`]: the same redirect and the same masquerade,
+/// in the family that needs its own table for them.
+fn render_nat6(out: &mut String, sandboxes: &[SandboxRules]) {
+    let _ = writeln!(
+        out,
+        "add chain ip6 {NAT6_TABLE} postrouting {{ type nat hook postrouting priority 100; policy accept; }}"
+    );
+    let _ = writeln!(
+        out,
+        "add chain ip6 {NAT6_TABLE} prerouting {{ type nat hook prerouting priority -100; policy accept; }}"
+    );
+
+    for sandbox in sandboxes {
+        let guest = sandbox.guest_ip6;
+        if sandbox.mode == Mode::Allowlist {
+            let _ = writeln!(
+                out,
+                "add rule ip6 {NAT6_TABLE} prerouting ip6 saddr {guest} tcp dport {{ 80, 443 }} redirect to :{PROXY_PORT}"
+            );
+        }
+        if sandbox.mode == Mode::Open {
+            let _ = writeln!(
+                out,
+                "add rule ip6 {NAT6_TABLE} postrouting ip6 saddr {guest} ip6 daddr != {POOL6} masquerade"
+            );
+        }
     }
 }
 
@@ -774,8 +909,11 @@ fn render_nat(out: &mut String, sandboxes: &[SandboxRules]) {
         for port in &sandbox.ports {
             let _ = writeln!(
                 out,
-                "add rule ip {NAT_TABLE} prerouting {external} tcp dport {} dnat to {}:{}",
-                port.host_port, sandbox.guest_ip, port.guest_port
+                "add rule ip {NAT_TABLE} prerouting {external} {} dport {} dnat to {}:{}",
+                port.protocol.keyword(),
+                port.host_port,
+                sandbox.guest_ip,
+                port.guest_port
             );
         }
     }
@@ -859,6 +997,8 @@ mod tests {
             tap: "bt1".into(),
             host_ip: Ipv4Addr::new(10, 99, 0, 5),
             guest_ip: Ipv4Addr::new(10, 99, 0, 6),
+            host_ip6: "fd99:b070:0:1::1".parse().unwrap(),
+            guest_ip6: "fd99:b070:0:1::2".parse().unwrap(),
             mode,
             allow_cidrs: vec![],
             deny_cidrs: vec![],
@@ -1181,7 +1321,7 @@ mod tests {
     /// without a packet ever being matched against a rule about them.
     #[test]
     fn the_control_plane_is_denied_to_every_sandbox() {
-        let orchestrator = Ipv4Addr::new(172, 18, 0, 4);
+        let orchestrator = IpAddr::V4(Ipv4Addr::new(172, 18, 0, 4));
         for mode in [Mode::None, Mode::Allowlist, Mode::Open] {
             let mut s = sandbox(mode);
             s.peers = vec![Ipv4Addr::new(10, 99, 0, 10)];
@@ -1207,6 +1347,145 @@ mod tests {
         );
         // And a node with none named renders none.
         assert!(!render(&[sandbox(Mode::Open)]).contains("172.18.0.4"));
+    }
+
+    /// The matcher is family-specific, so an address of either family has to
+    /// render its own. A v6 control plane used to be discarded before it got
+    /// here, which denied it to nobody.
+    #[test]
+    fn a_control_plane_is_denied_whichever_family_it_has() {
+        let v6: IpAddr = "2001:db8::4".parse().unwrap();
+        let ruleset = render_with(&[sandbox(Mode::Open)], &[v6]);
+        assert!(
+            ruleset.contains("sandbox ip6 daddr 2001:db8::4 drop"),
+            "a v6 control plane must be denied with a v6 matcher:\n{ruleset}"
+        );
+        // Never the v4 matcher, which nft would refuse to load.
+        assert!(!ruleset.contains("ip daddr 2001:db8::4"));
+
+        // Both families at once, which is what a dual-stack control plane
+        // resolves to.
+        let both = render_with(
+            &[sandbox(Mode::Open)],
+            &[IpAddr::V4(Ipv4Addr::new(172, 18, 0, 4)), v6],
+        );
+        assert!(both.contains("sandbox ip daddr 172.18.0.4 drop"));
+        assert!(both.contains("sandbox ip6 daddr 2001:db8::4 drop"));
+    }
+
+    /// Anti-spoofing is per tap and per address in both families. A blanket
+    /// `ip6 saddr` return would let a guest forge any v6 source, which is
+    /// what every address-based rule below trusts it cannot do.
+    #[test]
+    fn antispoof_binds_each_tap_to_its_own_address_in_both_families() {
+        let ruleset = render(&[sandbox(Mode::Open)]);
+        let returns: Vec<&str> = ruleset
+            .lines()
+            .filter(|line| line.contains("antispoof") && line.contains("return"))
+            .collect();
+        assert_eq!(
+            returns.len(),
+            3,
+            "v4, v6 and neighbour discovery:\n{ruleset}"
+        );
+        assert!(
+            returns
+                .iter()
+                .any(|l| l.contains("ip saddr 10.99.0.6 return"))
+        );
+        assert!(
+            returns
+                .iter()
+                .any(|l| l.contains("ip6 saddr fd99:b070:0:1::2 return"))
+        );
+        // The one link-local allowance is narrowed to discovery, not traffic.
+        let nd = returns
+            .iter()
+            .find(|l| l.contains("fe80::/10"))
+            .expect("neighbour discovery must be allowed");
+        assert!(
+            nd.contains("icmpv6 type"),
+            "link-local must be ND-only: {nd}"
+        );
+        assert!(!nd.contains("return\n") || nd.contains("nd-neighbor-solicit"));
+        // And nothing returns on a bare family match.
+        assert!(
+            !returns
+                .iter()
+                .any(|l| l.trim().ends_with("ip6 saddr return"))
+        );
+        assert!(ruleset.contains(&format!(
+            "antispoof iifname \"{TAP_PREFIX}*\" counter log prefix \"burrow-spoof \" level warn drop"
+        )));
+    }
+
+    /// IPv6 egress follows the same policy as IPv4, mode for mode. Open
+    /// reaches the internet, the other two reach nothing, and the chain's
+    /// closing drop is what enforces the latter.
+    #[test]
+    fn ipv6_egress_follows_the_same_mode_as_ipv4() {
+        let accept = "sandbox ip6 saddr fd99:b070:0:1::2 accept";
+        for mode in [Mode::None, Mode::Allowlist] {
+            let ruleset = render(&[sandbox(mode)]);
+            assert!(
+                !ruleset.contains(accept),
+                "{mode:?} must not accept guest v6:\n{ruleset}"
+            );
+        }
+        let open = render(&[sandbox(Mode::Open)]);
+        assert!(open.contains(accept), "open must accept guest v6:\n{open}");
+        // And the fleet is not the internet: the pool is dropped first, so an
+        // open sandbox reaches out and never sideways.
+        let pool = format!("sandbox ip6 saddr fd99:b070:0:1::2 ip6 daddr {POOL6} drop");
+        assert!(open.contains(&pool), "{open}");
+        assert!(
+            open.find(&pool) < open.find(accept),
+            "the pool drop must precede the accept, or neighbours are reachable"
+        );
+    }
+
+    /// Link-local is denied in every mode, the v6 counterpart of the metadata
+    /// denial: it is where a v6 metadata service lives.
+    #[test]
+    fn ipv6_link_local_is_denied_in_every_mode() {
+        for mode in [Mode::None, Mode::Allowlist, Mode::Open] {
+            let ruleset = render(&[sandbox(mode)]);
+            let deny = "sandbox ip6 saddr fd99:b070:0:1::2 ip6 daddr fe80::/10 drop";
+            assert!(ruleset.contains(deny), "{mode:?}:\n{ruleset}");
+            // Ahead of the conntrack accept, like every other denial.
+            assert!(
+                ruleset.find(deny) < ruleset.find("sandbox ct state established,related accept")
+            );
+            // Discovery to the host still has to work, or the link is dead.
+            assert!(ruleset.contains("tohost icmpv6 type"));
+            assert!(ruleset.contains("nd-neighbor-solicit"));
+        }
+    }
+
+    /// Allowlist mode redirects v6 web traffic to the proxy exactly as it does
+    /// v4, and only open mode masquerades. nftables has no dual-family nat, so
+    /// these live in their own table and the two must not drift apart.
+    #[test]
+    fn the_ipv6_nat_table_mirrors_the_ipv4_one() {
+        let allowlist = render(&[sandbox(Mode::Allowlist)]);
+        assert!(allowlist.contains(&format!(
+            "ip6 burrow_nat6 prerouting ip6 saddr fd99:b070:0:1::2 tcp dport {{ 80, 443 }} redirect to :{PROXY_PORT}"
+        )));
+        assert!(!allowlist.contains("burrow_nat6 postrouting ip6 saddr fd99:b070:0:1::2"));
+        // The redirect lands on the input hook, so the accept has to exist in
+        // the same family or every redirected v6 connection hits the drop.
+        assert!(allowlist.contains(&format!(
+            "tohost ip6 saddr fd99:b070:0:1::2 ip6 daddr fd99:b070:0:1::1 tcp dport {PROXY_PORT} accept"
+        )));
+        assert!(!render(&[sandbox(Mode::Open)]).contains(&format!(
+            "tohost ip6 saddr fd99:b070:0:1::2 ip6 daddr fd99:b070:0:1::1 tcp dport {PROXY_PORT}"
+        )));
+
+        let open = render(&[sandbox(Mode::Open)]);
+        assert!(open.contains(&format!(
+            "ip6 burrow_nat6 postrouting ip6 saddr fd99:b070:0:1::2 ip6 daddr != {POOL6} masquerade"
+        )));
+        assert!(!render(&[sandbox(Mode::None)]).contains("burrow_nat6 prerouting ip6 saddr"));
     }
 
     #[test]
@@ -1257,10 +1536,29 @@ mod tests {
         s.ports = vec![PortMap {
             host_port: 18080,
             guest_port: 8000,
+            protocol: Protocol::Tcp,
         }];
         let ruleset = render(&[s]);
         assert!(ruleset.contains("tcp dport 18080 dnat to 10.99.0.6:8000"));
         assert!(ruleset.contains("ip daddr 10.99.0.6 tcp dport 8000 accept"));
+    }
+
+    /// A UDP mapping is the same two rules with the other keyword. Getting
+    /// the protocol from the mapping is what keeps the DNAT and the accept
+    /// from ever disagreeing about which one a port carries.
+    #[test]
+    fn a_udp_mapping_renders_udp_rules_and_no_tcp_ones() {
+        let mut s = sandbox(Mode::Open);
+        s.ports = vec![PortMap {
+            host_port: 18080,
+            guest_port: 5353,
+            protocol: Protocol::Udp,
+        }];
+        let ruleset = render(&[s]);
+        assert!(ruleset.contains("udp dport 18080 dnat to 10.99.0.6:5353"));
+        assert!(ruleset.contains("ip daddr 10.99.0.6 udp dport 5353 accept"));
+        assert!(!ruleset.contains("tcp dport 18080"));
+        assert!(!ruleset.contains("tcp dport 5353"));
     }
 
     /// A published port is a door from outside. Matching on destination port
@@ -1273,6 +1571,7 @@ mod tests {
         s.ports = vec![PortMap {
             host_port: 18080,
             guest_port: 8000,
+            protocol: Protocol::Tcp,
         }];
         let ruleset = render(&[s]);
 
@@ -1622,7 +1921,7 @@ mod tests {
             s.deny_cidrs = vec!["10.77.0.0/16".into()];
             s.allow_cidrs = vec!["10.88.0.0/16".into()];
             s.peers = vec![Ipv4Addr::new(10, 99, 0, 10)];
-            let rules = render_with(&[s], &[Ipv4Addr::new(172, 18, 0, 4)]);
+            let rules = render_with(&[s], &[IpAddr::V4(Ipv4Addr::new(172, 18, 0, 4))]);
 
             let established = rules
                 .find("sandbox ct state established,related accept")

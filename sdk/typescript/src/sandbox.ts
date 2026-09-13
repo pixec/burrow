@@ -41,6 +41,8 @@ import type {
   NodeInfo,
   OutputChunk,
   PortMapping,
+  Share,
+  ShareOptions,
   RunCommandOptions,
   RunCommandParams,
   RunOptions,
@@ -1412,7 +1414,8 @@ export class Sandbox {
   }
 
   /**
-   * Publishes a port from inside the sandbox on its node's address.
+   * Publishes a port from inside the sandbox on its node's address. A host
+   * port carries one protocol, so publishing TCP and UDP takes two calls.
    *
    * ```ts
    * const { url } = await sandbox.exposePort(8000);
@@ -1420,14 +1423,19 @@ export class Sandbox {
    */
   async exposePort(
     guestPort: number,
-    hostPort?: number | { hostPort?: number; signal?: AbortSignal },
+    hostPort?: number | { hostPort?: number; udp?: boolean; signal?: AbortSignal },
   ): Promise<PortMapping> {
     this.assertLive();
     const options =
       typeof hostPort === "number" ? { hostPort } : (hostPort ?? {});
     const res = await this.transport.unary<any, any>(
       "ExposePort",
-      { sandboxId: this.id, guestPort, hostPort: options.hostPort ?? 0 },
+      {
+        sandboxId: this.id,
+        guestPort,
+        hostPort: options.hostPort ?? 0,
+        udp: options.udp ?? false,
+      },
       undefined,
       options.signal,
     );
@@ -1482,6 +1490,64 @@ export class Sandbox {
     await this.transport.unary(
       "ClosePort",
       { sandboxId: this.id, hostPort },
+      undefined,
+      options.signal,
+    );
+  }
+
+  /**
+   * Shares the sandbox through a tailcat address.
+   *
+   * A share is a WireGuard tunnel bootstrapped over a DERP relay, dialed with
+   * the `tailcat` CLI: no host port, no edge, and a connection wakes a
+   * suspended sandbox. Calling it again reshapes an existing share and keeps
+   * its address; `rotate` issues new keys and so a new address. TCP is shared
+   * on every port unless `ports` narrows it; UDP only on `udpPorts`, or
+   * everywhere with `allUdp`. The guest sees each client's own public IPv4
+   * as the packet source; `noTransparentIp` sources from the gateway.
+   *
+   * ```ts
+   * const share = await sandbox.share({ ports: [22] });
+   * console.log(`tailcat ssh ${share.address}`);
+   * ```
+   */
+  async share(options: ShareOptions = {}): Promise<Share> {
+    this.assertLive();
+    const res = await this.transport.unary<any, any>(
+      "ShareSandbox",
+      {
+        sandboxId: this.id,
+        ports: options.ports ?? [],
+        allowedClients: options.allowedClients ?? [],
+        rotate: options.rotate ?? false,
+        udpPorts: options.udpPorts ?? [],
+        allUdp: options.allUdp ?? false,
+        noTransparentIp: options.noTransparentIp ?? false,
+      },
+      undefined,
+      options.signal,
+    );
+    return toShare(res);
+  }
+
+  /** The sandbox's share. Throws `not_found` when it has none. */
+  async getShare(options: { signal?: AbortSignal } = {}): Promise<Share> {
+    this.assertLive();
+    const res = await this.transport.unary<any, any>(
+      "GetShare",
+      { id: this.id },
+      undefined,
+      options.signal,
+    );
+    return toShare(res);
+  }
+
+  /** Revokes the share; its address stops working at once. */
+  async unshare(options: { signal?: AbortSignal } = {}): Promise<void> {
+    this.assertLive();
+    await this.transport.unary(
+      "UnshareSandbox",
+      { id: this.id },
       undefined,
       options.signal,
     );
@@ -1933,6 +1999,18 @@ function toFinished(result: CommandResult): FinishedCommand {
   };
 }
 
+function toShare(raw: any): Share {
+  return {
+    address: raw.address ?? "",
+    ports: (raw.ports ?? []).map((p: any) => Number(p)),
+    allowedClients: raw.allowedClients ?? [],
+    createdAt: raw.createdAt ?? "",
+    udpPorts: (raw.udpPorts ?? []).map((p: any) => Number(p)),
+    allUdp: Boolean(raw.allUdp),
+    transparentIp: Boolean(raw.transparentIp),
+  };
+}
+
 function toPort(raw: any, fallbackHost: string): PortMapping {
   const hostPort = Number(raw.hostPort ?? 0);
   // The node advertises where it accepts traffic; when it has not, the control
@@ -1941,6 +2019,7 @@ function toPort(raw: any, fallbackHost: string): PortMapping {
   return {
     guestPort: Number(raw.guestPort ?? 0),
     hostPort,
+    udp: Boolean(raw.udp),
     url: `http://${address}`,
     // Empty unless the holding node's edge is serving, rather than a name
     // that resolves nowhere.

@@ -236,6 +236,12 @@ message NetworkConfig {
   uint32 prefix_len = 2;
   string gateway = 3;
   string dns = 4;
+  // The same link's IPv6 address. Empty on a host that could not give the tap
+  // one, in which case the guest has no v6 link and stays v4-only.
+  string ip6 = 5;
+  uint32 prefix_len6 = 6;
+  // The v6 gateway, empty when the sandbox has no v6 link.
+  string gateway6 = 7;
 }
 
 message HandshakeResponse {

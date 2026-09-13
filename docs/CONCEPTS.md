@@ -131,7 +131,10 @@ A sandbox created without `--net` has no egress at all. The three modes are
   connect on a sandbox's behalf to loopback, link-local, private,
   carrier-grade-NAT, broadcast, multicast or unspecified addresses. The proxy
   runs on the host, so `169.254.169.254` there is the host's own metadata
-  service. IPv6 destinations are refused outright.
+  service. IPv6 destinations are refused outright: a sandbox has an IPv6
+  address on its own link, but nothing forwards it, because the proxy that
+  inspects egress and the resolver that pins it both speak IPv4 only. Routing
+  it before they understand it would be egress under no policy at all.
 - DNS is filtered, and a guest cannot route around it. The only accept for
   port 53 is to the sandbox's own gateway, where burrow's resolver listens, so
   rewriting `/etc/resolv.conf` to a public resolver produces packets that match

@@ -9,7 +9,7 @@
 //! A /30 holds four addresses: network, host, guest, broadcast.
 
 use std::collections::HashMap;
-use std::net::Ipv4Addr;
+use std::net::{Ipv4Addr, Ipv6Addr};
 use std::sync::Mutex;
 
 use crate::error::{NetError, Result};
@@ -45,6 +45,20 @@ pub const MAX_NODES: u32 = MAX_BLOCKS / BLOCKS_PER_NODE;
 /// can own, so [`crate::mesh`] refuses it.
 pub const NODE_PREFIX: u8 = 22;
 
+/// The fleet's IPv6 pool, mirroring [`POOL_ADDRESS`].
+///
+/// A ULA rather than a routed prefix: a sandbox's egress goes through the
+/// host's proxy exactly as it does over IPv4, so nothing here needs to be
+/// globally routable, and a constant means a node needs no address
+/// delegation to bring sandboxes up. An operator wanting real global
+/// addresses changes this the same way they would change the v4 pool.
+pub const POOL6_ADDRESS: Ipv6Addr = Ipv6Addr::new(0xfd99, 0xb070, 0, 0, 0, 0, 0, 0);
+pub const POOL6_PREFIX: u8 = 48;
+/// One `/64` per sandbox, which is the smallest prefix anything in IPv6 land
+/// expects to be handed. The `/48` above holds 65536 of them, comfortably
+/// more than the [`MAX_BLOCKS`] the v4 pool can index.
+pub const GUEST6_PREFIX: u8 = 64;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Lease {
     /// Index of the /30 block, which is what makes the lease releasable.
@@ -55,6 +69,33 @@ pub struct Lease {
 }
 
 impl Lease {
+    /// The sandbox's `/64`, indexed by the same block as its `/30` so the two
+    /// families name the same sandbox and neither can drift from the other.
+    fn subnet6(&self) -> [u16; 8] {
+        let mut groups = POOL6_ADDRESS.segments();
+        groups[3] = self.block as u16;
+        groups
+    }
+
+    /// Host side of the link, `::1` in the sandbox's `/64`.
+    pub fn host_ip6(&self) -> Ipv6Addr {
+        let mut groups = self.subnet6();
+        groups[7] = 1;
+        Ipv6Addr::from(groups)
+    }
+
+    /// Guest side, `::2`, mirroring the v4 layout where the host takes the
+    /// first usable address and the guest the second.
+    pub fn guest_ip6(&self) -> Ipv6Addr {
+        let mut groups = self.subnet6();
+        groups[7] = 2;
+        Ipv6Addr::from(groups)
+    }
+
+    pub fn prefix_len6(&self) -> u8 {
+        GUEST6_PREFIX
+    }
+
     pub fn netmask(&self) -> Ipv4Addr {
         Ipv4Addr::new(255, 255, 255, 252)
     }
@@ -188,6 +229,32 @@ fn lease_for(block: u32) -> Lease {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Both families are indexed by the same block, so a sandbox's v4 and v6
+    /// addresses always name the same sandbox and a released block frees
+    /// both.
+    #[test]
+    fn a_lease_carries_a_matching_v6_link() {
+        let ipam = Ipam::for_node(0).unwrap();
+        let lease = ipam.allocate("sbx_a").unwrap();
+        assert_eq!(lease.prefix_len6(), 64);
+        assert_eq!(
+            lease.host_ip6(),
+            format!("fd99:b070:0:{:x}::1", lease.block)
+                .parse::<Ipv6Addr>()
+                .unwrap()
+        );
+        assert_eq!(
+            lease.guest_ip6(),
+            format!("fd99:b070:0:{:x}::2", lease.block)
+                .parse::<Ipv6Addr>()
+                .unwrap()
+        );
+        // Distinct sandboxes never share a /64.
+        let other = ipam.allocate("sbx_b").unwrap();
+        assert_ne!(lease.guest_ip6(), other.guest_ip6());
+        assert_ne!(lease.host_ip6(), other.host_ip6());
+    }
 
     #[test]
     fn nodes_allocate_from_disjoint_ranges() {

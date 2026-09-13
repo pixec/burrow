@@ -850,15 +850,62 @@ export interface DirEntry {
 export interface PortMapping {
   guestPort: number;
   hostPort: number;
+  /** Whether the mapping forwards UDP rather than TCP. */
+  udp: boolean;
   /** Address to reach the published port from outside the sandbox. */
   url: string;
   /**
    * Stable per-sandbox URL through the edge router on the node holding the
    * sandbox, `http://<port>-<sandbox-id>.<edge-domain>/`. Traffic arriving on it
    * for a stopped sandbox wakes it. Absent when that node runs no edge, which
-   * means it has no hostname routing and {@link url} is the whole answer.
+   * means it has no hostname routing and {@link url} is the whole answer, and
+   * always absent for a UDP mapping, which the edge cannot route.
    */
   edgeUrl?: string;
+}
+
+/**
+ * A sandbox reachable through a tailcat address.
+ *
+ * The address is the credential: any `tailcat` client holding it can connect,
+ * unless `allowedClients` narrows that. Treat it as a secret.
+ */
+export interface Share {
+  address: string;
+  /** Guest TCP ports reachable through the share; empty means every port. */
+  ports: number[];
+  /** `nodekey:<hex>` of each admitted client; empty admits anyone. */
+  allowedClients: string[];
+  /** RFC 3339; when the current keys were issued. */
+  createdAt: string;
+  /** Guest UDP ports reachable through the share; none unless listed or `allUdp`. */
+  udpPorts: number[];
+  allUdp: boolean;
+  /**
+   * Whether the guest really sees each client's own public IPv4 as the
+   * packet source. A node that cannot carry the reply path serves from the
+   * gateway whatever was asked for.
+   */
+  transparentIp: boolean;
+}
+
+export interface ShareOptions {
+  /** Guest TCP ports reachable through the share. Omitted shares every port. */
+  ports?: number[];
+  /** Client node keys admitted, as `nodekey:<hex>`. Omitted admits anyone. */
+  allowedClients?: string[];
+  /** Issue new keys, and so a new address, to an existing share. */
+  rotate?: boolean;
+  /** Guest UDP ports reachable through the share. Omitted shares no UDP. */
+  udpPorts?: number[];
+  /** Share every UDP port. */
+  allUdp?: boolean;
+  /**
+   * Source connections from the gateway instead of from the client's own
+   * public IPv4, which is what the guest sees by default.
+   */
+  noTransparentIp?: boolean;
+  signal?: AbortSignal;
 }
 
 export interface NodeInfo {

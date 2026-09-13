@@ -390,8 +390,18 @@ pub async fn apply_network(config: &burrow_proto::agent::v1::NetworkConfig) -> a
         Some(config.gateway.parse()?)
     };
     let dns = (!config.dns.is_empty()).then_some(config.dns.as_str());
+    let ip6 = match config.ip6.is_empty() {
+        true => None,
+        false => Some((
+            config.ip6.parse()?,
+            config.prefix_len6.max(1) as u8,
+            (!config.gateway6.is_empty())
+                .then(|| config.gateway6.parse())
+                .transpose()?,
+        )),
+    };
 
-    crate::netconf::apply(ip, config.prefix_len.max(1) as u8, gateway, dns).await?;
+    crate::netconf::apply(ip, config.prefix_len.max(1) as u8, gateway, dns, ip6).await?;
     tracing::debug!(ip = config.ip, "network reapplied after restore");
     Ok(())
 }

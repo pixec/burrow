@@ -73,13 +73,13 @@ const HANDSHAKE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15
 /// one.
 #[derive(Default)]
 struct SourceLimits {
-    counts: std::sync::Mutex<std::collections::HashMap<Ipv4Addr, usize>>,
+    counts: std::sync::Mutex<std::collections::HashMap<std::net::IpAddr, usize>>,
 }
 
 impl SourceLimits {
     /// Claims a slot for `source`, or `None` if that sandbox is already at its
     /// limit.
-    fn acquire(self: &Arc<Self>, source: Ipv4Addr) -> Option<SourceSlot> {
+    fn acquire(self: &Arc<Self>, source: std::net::IpAddr) -> Option<SourceSlot> {
         let mut counts = self.counts.lock().unwrap();
         let held = counts.entry(source).or_insert(0);
         if *held >= MAX_CONNECTIONS_PER_SOURCE {
@@ -96,7 +96,7 @@ impl SourceLimits {
 /// Releases a source's slot when the connection ends, however it ends.
 struct SourceSlot {
     limits: Arc<SourceLimits>,
-    source: Ipv4Addr,
+    source: std::net::IpAddr,
 }
 
 impl Drop for SourceSlot {
@@ -153,11 +153,9 @@ impl Proxy {
             // and making it wait would hold the global slot it is not entitled
             // to. A source that cannot be attributed to a sandbox is dropped,
             // the same way `handle` refuses to serve one.
-            let source_slot = match peer.ip() {
-                std::net::IpAddr::V4(ip) => per_source.acquire(ip),
-                std::net::IpAddr::V6(_) => None,
-            };
-            let Some(source_slot) = source_slot else {
+            // Counted against the unmapped address, so a sandbox cannot get
+            // two budgets by reaching the proxy over both of its addresses.
+            let Some(source_slot) = per_source.acquire(policy::unmap(peer.ip())) else {
                 tracing::warn!(%peer, "refusing a connection: source is at its limit");
                 continue;
             };
@@ -174,12 +172,10 @@ impl Proxy {
 
     async fn handle(&self, mut client: TcpStream, peer: SocketAddr) -> std::io::Result<()> {
         let original = original_dst(&client)?;
-        let source_ip = match peer.ip() {
-            std::net::IpAddr::V4(ip) => ip,
-            // Sandbox networking is IPv4-only; an IPv6 source cannot be
-            // attributed to a sandbox, so it is not served.
-            std::net::IpAddr::V6(_) => return Ok(()),
-        };
+        // Both families reach here now. A source is looked up as itself, and
+        // an IPv4-mapped one as the v4 address it is, so a sandbox is the same
+        // sandbox whichever shape its address arrives in.
+        let source_ip = policy::unmap(peer.ip());
 
         // Read (without consuming) enough to identify the destination. A
         // client that says nothing, or too little, gets no route: we cannot
@@ -215,9 +211,7 @@ impl Proxy {
         // reach one. Ahead of the pinning check too, since a control-plane
         // address a sandbox was legitimately told about is still one it may
         // not reach.
-        if let std::net::IpAddr::V4(destination) = original.ip()
-            && self.denied.contains(destination)
-        {
+        if self.denied.contains(original.ip()) {
             decision = Decision::Deny("destination is a control-plane address");
         }
         if hides_destination {
@@ -236,15 +230,7 @@ impl Proxy {
         if decision.allowed()
             && let Some(host) = host.as_deref()
         {
-            let destination = match original.ip() {
-                std::net::IpAddr::V4(ip) => ip,
-                std::net::IpAddr::V6(_) => {
-                    // Sandbox networking is IPv4-only; an IPv6 destination
-                    // cannot have been pinned.
-                    decision = Decision::Deny("destination address is not pinned to this name");
-                    Ipv4Addr::UNSPECIFIED
-                }
-            };
+            let destination = policy::unmap(original.ip());
             if decision.allowed() {
                 // Deny beats every allowance, and it is checked against the
                 // address rather than the name: an allowlisted domain that
@@ -255,7 +241,10 @@ impl Proxy {
                     decision = Decision::Deny("destination is in a denied range");
                 } else if resolutions::is_forbidden_destination(destination) {
                     decision = Decision::Deny("destination is an internal or metadata address");
-                } else if !self.resolutions.is_pinned(source_ip, host, destination) {
+                } else if !self
+                    .resolutions
+                    .is_pinned(sandbox_id.as_str(), host, destination)
+                {
                     decision = Decision::Deny("destination address is not pinned to this name");
                 }
             }
@@ -1107,10 +1096,40 @@ const SOL_IP: nix::libc::c_int = 0;
 /// Linux's `SO_ORIGINAL_DST`: netfilter stashes the pre-redirect destination
 /// here. Not in libc for all targets, so it is spelled out.
 const SO_ORIGINAL_DST: nix::libc::c_int = 80;
+/// `SOL_IPV6`, and netfilter's v6 spelling of the same option. The number is
+/// shared with the v4 one but the level is not, and asking the wrong level
+/// returns the wrong answer rather than an error.
+const SOL_IPV6: nix::libc::c_int = 41;
+const IP6T_SO_ORIGINAL_DST: nix::libc::c_int = 80;
 
 /// Recovers the address the client was originally connecting to, before
 /// nftables redirected the connection here.
 fn original_dst(stream: &TcpStream) -> std::io::Result<SocketAddr> {
+    // The option is per family and the kernel answers only the one the socket
+    // belongs to, so which to ask is decided by the connection, not guessed.
+    if asks_ipv4(stream.local_addr()?) {
+        original_dst_v4(stream)
+    } else {
+        original_dst_v6(stream)
+    }
+}
+
+/// Whether a connection whose local address is `local` carries its original
+/// destination under the IPv4 option.
+///
+/// The listener is dual stack, so an IPv4 connection arrives on an IPv6 socket
+/// and reports a v4-mapped local address. The kernel answers only the option
+/// for the family the packet was really in: asking IPv6 for a mapped
+/// connection fails, and the connection then dies before any policy decision
+/// is made or audited, which reads as the destination being unreachable.
+fn asks_ipv4(local: SocketAddr) -> bool {
+    match local {
+        SocketAddr::V4(_) => true,
+        SocketAddr::V6(local) => local.ip().to_ipv4_mapped().is_some(),
+    }
+}
+
+fn original_dst_v4(stream: &TcpStream) -> std::io::Result<SocketAddr> {
     use std::os::fd::AsRawFd;
 
     let fd = stream.as_raw_fd();
@@ -1134,6 +1153,32 @@ fn original_dst(stream: &TcpStream) -> std::io::Result<SocketAddr> {
     Ok(SocketAddr::from((
         Ipv4Addr::from(u32::from_be(addr.sin_addr.s_addr)),
         u16::from_be(addr.sin_port),
+    )))
+}
+
+fn original_dst_v6(stream: &TcpStream) -> std::io::Result<SocketAddr> {
+    use std::os::fd::AsRawFd;
+
+    let fd = stream.as_raw_fd();
+    let mut addr: nix::libc::sockaddr_in6 = unsafe { std::mem::zeroed() };
+    let mut len = std::mem::size_of::<nix::libc::sockaddr_in6>() as nix::libc::socklen_t;
+
+    // SAFETY: as above, sized for the v6 option on an IPv6 socket.
+    let rc = unsafe {
+        nix::libc::getsockopt(
+            fd,
+            SOL_IPV6,
+            IP6T_SO_ORIGINAL_DST,
+            (&raw mut addr).cast(),
+            &mut len,
+        )
+    };
+    if rc != 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(SocketAddr::from((
+        std::net::Ipv6Addr::from(addr.sin6_addr.s6_addr),
+        u16::from_be(addr.sin6_port),
     )))
 }
 
@@ -1162,6 +1207,7 @@ pub(crate) fn now_rfc3339() -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::net::IpAddr;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
     fn proxy() -> Proxy {
@@ -1448,10 +1494,18 @@ mod tests {
     /// The global limit is shared, so a sandbox opening connections in a loop
     /// would take every slot. Each source gets its own budget on top.
     #[test]
+    fn a_mapped_connection_asks_for_its_original_destination_as_ipv4() {
+        assert!(asks_ipv4("10.99.4.1:3128".parse().unwrap()));
+        // What a dual-stack listener reports for an IPv4 client.
+        assert!(asks_ipv4("[::ffff:10.99.4.1]:3128".parse().unwrap()));
+        assert!(!asks_ipv4("[fd99:b070:0:100::1]:3128".parse().unwrap()));
+    }
+
+    #[test]
     fn one_source_cannot_take_more_than_its_share_of_connections() {
         let limits = Arc::new(SourceLimits::default());
-        let noisy = Ipv4Addr::new(10, 99, 0, 6);
-        let quiet = Ipv4Addr::new(10, 99, 0, 10);
+        let noisy = IpAddr::from([10, 99, 0, 6]);
+        let quiet = IpAddr::from([10, 99, 0, 10]);
 
         let held: Vec<_> = (0..MAX_CONNECTIONS_PER_SOURCE)
             .map(|n| {
@@ -1477,7 +1531,7 @@ mod tests {
     #[test]
     fn a_sources_entry_is_forgotten_once_it_holds_nothing() {
         let limits = Arc::new(SourceLimits::default());
-        let source = Ipv4Addr::new(10, 99, 0, 6);
+        let source = IpAddr::from([10, 99, 0, 6]);
         let a = limits.acquire(source).unwrap();
         let b = limits.acquire(source).unwrap();
         assert_eq!(limits.counts.lock().unwrap().get(&source), Some(&2));

@@ -7,6 +7,7 @@ mod oci;
 mod sandbox;
 mod sandboxproxy;
 mod serve;
+mod share;
 mod snapshot;
 mod template;
 mod volume;

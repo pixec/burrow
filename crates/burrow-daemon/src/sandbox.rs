@@ -75,7 +75,9 @@ pub struct NodeConfig {
     /// sandboxes, and routes exec and logs into them. A sandbox that reaches it
     /// has reached every other sandbox, without a packet ever crossing a rule
     /// about them.
-    pub control_plane: Vec<std::net::Ipv4Addr>,
+    pub control_plane: Vec<std::net::IpAddr>,
+    /// Whether and through which relay sandboxes here can be shared.
+    pub share: crate::share::ShareOptions,
 }
 
 impl NodeConfig {
@@ -1094,6 +1096,8 @@ pub struct SandboxManager {
     ipam: Arc<Mutex<Arc<Ipam>>>,
     /// sandbox id -> published ports.
     ports: Arc<Mutex<HashMap<String, Vec<firewall::PortMap>>>>,
+    /// Tailcat servers for the sandboxes shared here.
+    shares: Arc<crate::share::Shares>,
     /// Source-address -> egress policy, consulted by the proxy.
     proxy_policies: Arc<burrow_proxy::PolicyTable>,
     /// DNS pins, pruned alongside the policy table so a recycled address never
@@ -1130,7 +1134,7 @@ pub struct SandboxManager {
     /// Learned on the heartbeat rather than configured: an edge is opt-in per
     /// node, so this node cannot know from its own flags which of its peers
     /// serves one. Its own is in here too.
-    edge_addresses: Arc<std::sync::Mutex<Vec<std::net::Ipv4Addr>>>,
+    edge_addresses: Arc<std::sync::Mutex<Vec<std::net::IpAddr>>>,
     /// Sandboxes provisioned ahead of demand, ready to be handed out.
     ///
     /// A create otherwise spends its whole time restoring a VM, waiting for its
@@ -1294,6 +1298,10 @@ impl SandboxManager {
             firewall: Arc::new(tokio::sync::Mutex::new(())),
             snapshots: Arc::new(crate::snapshot::SnapshotStore::new(&config.data_dir)),
             volumes: Arc::new(crate::volume::VolumeStore::new(&config.data_dir)),
+            shares: Arc::new(crate::share::Shares::new(
+                config.share.clone(),
+                &config.data_dir,
+            )),
             config,
             sandboxes: Arc::new(Mutex::new(HashMap::new())),
             creating: Arc::new(Mutex::new(std::collections::HashSet::new())),
@@ -1322,10 +1330,7 @@ impl SandboxManager {
     /// sandbox that can reach one has reached every sandbox that edge serves,
     /// without a packet crossing a rule about private networks. Every node's
     /// edge is in here, this node's own included.
-    pub async fn set_edge_addresses(
-        &self,
-        addresses: Vec<std::net::Ipv4Addr>,
-    ) -> Result<(), Status> {
+    pub async fn set_edge_addresses(&self, addresses: Vec<std::net::IpAddr>) -> Result<(), Status> {
         *self.edge_addresses.lock().unwrap() = addresses;
         self.sync_firewall().await
     }
@@ -1342,7 +1347,7 @@ impl SandboxManager {
     }
 
     /// Every address a sandbox is denied outright, whatever its policy says.
-    fn denied_addresses(&self) -> Vec<std::net::Ipv4Addr> {
+    fn denied_addresses(&self) -> Vec<std::net::IpAddr> {
         let mut denied = self.config.control_plane.clone();
         denied.extend(self.edge_addresses.lock().unwrap().iter().copied());
         denied.sort();
@@ -1490,7 +1495,15 @@ impl SandboxManager {
             state: record.state,
             lease_block: sandbox.lease.block,
             tap: sandbox.tap.clone(),
-            ports: ports.iter().map(|p| (p.host_port, p.guest_port)).collect(),
+            ports: ports
+                .iter()
+                .map(|p| burrow_store::PortRow {
+                    host_port: p.host_port,
+                    guest_port: p.guest_port,
+                    udp: p.protocol == firewall::Protocol::Udp,
+                })
+                .collect(),
+            share: self.shares.spec(sandbox.id()).await,
             suspended_at: sandbox.suspended_at(),
         };
         if let Err(err) = self.store.put_sandbox(&row) {
@@ -1728,15 +1741,28 @@ impl SandboxManager {
                     row.id.clone(),
                     row.ports
                         .iter()
-                        .map(|(host_port, guest_port)| firewall::PortMap {
-                            host_port: *host_port,
-                            guest_port: *guest_port,
+                        .map(|p| firewall::PortMap {
+                            host_port: p.host_port,
+                            guest_port: p.guest_port,
+                            protocol: if p.udp {
+                                firewall::Protocol::Udp
+                            } else {
+                                firewall::Protocol::Tcp
+                            },
                         })
                         .collect(),
                 );
             }
             self.sandboxes.lock().await.insert(row.id.clone(), sandbox);
             restored += 1;
+            // Restarted from its stored keys, so the address clients hold is
+            // still the one that works. A relay that is unreachable right now
+            // is not a reason to lose the share: the server keeps trying.
+            if let Some(share) = row.share
+                && let Err(err) = self.shares.start(self, &row.id, share).await
+            {
+                tracing::error!(sandbox = row.id, %err, "could not restart the sandbox's share");
+            }
         }
 
         self.collect_orphan_workdirs().await;
@@ -1887,7 +1913,8 @@ impl SandboxManager {
         sandbox_id: &str,
         guest_port: u16,
         requested_host_port: u16,
-    ) -> Result<(u16, u16), Status> {
+        protocol: firewall::Protocol,
+    ) -> Result<firewall::PortMap, Status> {
         if guest_port == 0 {
             return Err(Status::invalid_argument("guest_port is required"));
         }
@@ -1929,6 +1956,7 @@ impl SandboxManager {
             .push(firewall::PortMap {
                 host_port,
                 guest_port,
+                protocol,
             });
         drop(ports);
 
@@ -1937,17 +1965,22 @@ impl SandboxManager {
             sandbox = sandbox_id,
             host_port,
             guest_port,
+            protocol = protocol.keyword(),
             "port published"
         );
-        Ok((host_port, guest_port))
+        Ok(firewall::PortMap {
+            host_port,
+            guest_port,
+            protocol,
+        })
     }
 
-    pub async fn list_ports(&self, sandbox_id: &str) -> Vec<(u16, u16)> {
+    pub async fn list_ports(&self, sandbox_id: &str) -> Vec<firewall::PortMap> {
         self.ports
             .lock()
             .await
             .get(sandbox_id)
-            .map(|ports| ports.iter().map(|p| (p.host_port, p.guest_port)).collect())
+            .cloned()
             .unwrap_or_default()
     }
 
@@ -1966,6 +1999,47 @@ impl SandboxManager {
             }
         }
         self.sync_firewall().await?;
+        Ok(())
+    }
+
+    /// Shares a sandbox through a tailcat address, or reshapes an existing
+    /// share. The keys, and so the address, are kept unless `rotate` asks for
+    /// new ones.
+    pub async fn share(
+        &self,
+        sandbox_id: &str,
+        shape: crate::share::ShareShape,
+        rotate: bool,
+    ) -> Result<crate::share::ShareInfo, Status> {
+        for key in &shape.allowed_clients {
+            key.parse::<tailcat_rs::NodePublic>()
+                .map_err(|_| Status::invalid_argument(format!("invalid client key {key:?}")))?;
+        }
+        let sandbox = self.get(sandbox_id).await?;
+        let spec = match self.shares.spec(sandbox_id).await {
+            Some(existing) if !rotate => shape.onto(existing),
+            _ => crate::share::Shares::new_spec(shape),
+        };
+        let info = self.shares.start(self, sandbox_id, spec).await?;
+        self.persist(&sandbox).await;
+        Ok(info)
+    }
+
+    pub async fn get_share(&self, sandbox_id: &str) -> Result<crate::share::ShareInfo, Status> {
+        self.get(sandbox_id).await?;
+        self.shares
+            .get(sandbox_id)
+            .await
+            .ok_or_else(|| Status::not_found("sandbox is not shared"))
+    }
+
+    pub async fn unshare(&self, sandbox_id: &str) -> Result<(), Status> {
+        let sandbox = self.get(sandbox_id).await?;
+        if !self.shares.stop(sandbox_id).await {
+            return Err(Status::not_found("sandbox is not shared"));
+        }
+        self.persist(&sandbox).await;
+        tracing::info!(sandbox = sandbox_id, "share revoked");
         Ok(())
     }
 
@@ -2099,6 +2173,8 @@ impl SandboxManager {
                     tap: sandbox.tap.clone(),
                     host_ip: sandbox.lease.host_ip,
                     guest_ip: own_ip,
+                    host_ip6: sandbox.lease.host_ip6(),
+                    guest_ip6: sandbox.lease.guest_ip6(),
                     mode: policy_mode(&record),
                     allow_cidrs: record
                         .policy
@@ -2128,7 +2204,11 @@ impl SandboxManager {
         // refreshed from the same snapshot that produced the firewall rules;
         // otherwise a sandbox could be redirected to a proxy that does not yet
         // know its policy and would deny everything.
-        let proxy_table: HashMap<std::net::Ipv4Addr, burrow_proxy::SandboxPolicy> = sandboxes
+        let sandbox_ip6: HashMap<std::net::Ipv4Addr, std::net::Ipv6Addr> = sandboxes
+            .values()
+            .map(|sandbox| (sandbox.lease.guest_ip, sandbox.lease.guest_ip6()))
+            .collect();
+        let by_guest_ip: HashMap<std::net::Ipv4Addr, burrow_proxy::SandboxPolicy> = sandboxes
             .values()
             .map(|sandbox| {
                 let record = sandbox.record();
@@ -2207,15 +2287,34 @@ impl SandboxManager {
         drop(ports);
         drop(sandboxes);
 
-        // Pins are keyed by sandbox address and leases are recycled, so they
-        // are pruned from the same snapshot that defines who exists.
-        self.resolutions
-            .retain_live(&proxy_table.keys().copied().collect());
+        // Both of a sandbox's addresses map to its one policy: it is the same
+        // sandbox whichever it reaches the proxy from, and an entry missing
+        // for one family would read as an unknown source and deny everything.
+        let proxy_table: HashMap<std::net::IpAddr, burrow_proxy::SandboxPolicy> = by_guest_ip
+            .into_iter()
+            .flat_map(|(guest_ip, policy)| {
+                let guest_ip6 = sandbox_ip6.get(&guest_ip).copied();
+                std::iter::once((std::net::IpAddr::V4(guest_ip), policy.clone()))
+                    .chain(guest_ip6.map(|ip6| (std::net::IpAddr::V6(ip6), policy)))
+            })
+            .collect();
+
+        // Pins are keyed by sandbox id, so they are pruned from the same
+        // snapshot that defines who exists; a deleted sandbox's promises must
+        // not outlive it into whatever reuses its address.
+        self.resolutions.retain_live(
+            &proxy_table
+                .values()
+                .map(|policy| policy.sandbox_id.clone())
+                .collect(),
+        );
         self.proxy_policies.replace(proxy_table);
         let denied = self.denied_addresses();
         // The proxy is told before the ruleset is applied, not after: it is the
         // path that does not go through nftables at all, so the moment to have
         // it enforcing a wider deny list is ahead of the render, never behind.
+        // Both families: the proxy dials v6 now, so a control plane reachable
+        // over it has to be refused there as well as in the ruleset.
         self.denied.replace(denied.iter().copied());
         firewall::apply(&firewall::render_with(&rules, &denied))
             .await
@@ -2699,10 +2798,12 @@ impl SandboxManager {
             }
 
             // A suspended sandbox is already idle; only a running one has
-            // anything to reclaim.
+            // anything to reclaim, and one with a shared connection open is
+            // in use however long ago it was last asked for anything.
             if resources.idle_suspend_secs > 0
                 && sandbox.is_running()
                 && sandbox.idle_secs() >= resources.idle_suspend_secs as i64
+                && self.shares.open_connections(&id).await == 0
             {
                 match self.pause(&id).await {
                     Ok(_) => {
@@ -2852,10 +2953,13 @@ impl SandboxManager {
             guest_mac: Some(lease.guest_mac()),
         });
         spec.boot_args = format!(
-            "{} root=/dev/vda ro init=/usr/bin/burrow-agent {} burrow.dns={} {}",
+            "{} root=/dev/vda ro init=/usr/bin/burrow-agent {} burrow.dns={} burrow.ip6={}/{} burrow.ip6gw={} {}",
             burrow_vmm::DEFAULT_BOOT_ARGS,
             lease.kernel_ip_arg(),
             lease.host_ip,
+            lease.guest_ip6(),
+            lease.prefix_len6(),
+            lease.host_ip6(),
             self.config.extra_boot_args
         );
         spec
@@ -3219,6 +3323,9 @@ impl SandboxManager {
                 prefix_len: lease.prefix_len as u32,
                 gateway: lease.host_ip.to_string(),
                 dns: lease.host_ip.to_string(),
+                ip6: lease.guest_ip6().to_string(),
+                prefix_len6: lease.prefix_len6() as u32,
+                gateway6: lease.host_ip6().to_string(),
             }),
             self.inspection_ca_for(&policy),
             self.trust_bundles_for(&template, &policy).await,
@@ -3890,6 +3997,9 @@ impl SandboxManager {
                         prefix_len: lease.prefix_len as u32,
                         gateway: lease.host_ip.to_string(),
                         dns: lease.host_ip.to_string(),
+                        ip6: lease.guest_ip6().to_string(),
+                        prefix_len6: lease.prefix_len6() as u32,
+                        gateway6: lease.host_ip6().to_string(),
                     }),
                     self.inspection_ca_for(&policy),
                     self.trust_bundles_for(&source.template(), &policy).await,
@@ -4010,6 +4120,7 @@ impl SandboxManager {
         tap::delete(&tap_name).await;
         self.volumes.release_all(id);
         self.ports.lock().await.remove(id);
+        self.shares.stop(id).await;
         if let Err(err) = self.store.delete_sandbox(id) {
             tracing::error!(sandbox = id, %err, "failed to remove sandbox from store");
         }
@@ -4207,6 +4318,12 @@ pub(crate) mod tests {
                 jail: None,
                 artifact_retention: std::time::Duration::from_secs(7 * 24 * 60 * 60),
                 control_plane: Vec::new(),
+                share: crate::share::ShareOptions {
+                    enabled: false,
+                    transparent: false,
+                    region: None,
+                    derp_map_url: None,
+                },
             },
             Arc::new(burrow_proxy::PolicyTable::default()),
             Arc::new(burrow_proxy::Resolutions::default()),

@@ -5,7 +5,7 @@
 //! dynamic-linker run and, under nested virtualisation, doubled vmexit costs,
 //! for work that is a handful of netlink messages.
 
-use std::net::Ipv4Addr;
+use std::net::{Ipv4Addr, Ipv6Addr};
 use std::sync::OnceLock;
 
 use futures::TryStreamExt;
@@ -53,6 +53,65 @@ pub async fn prepare() {
     }
 }
 
+/// Adds an IPv6 address to the guest's interface, leaving everything else
+/// alone.
+///
+/// Separate from [`apply`] because a cold boot has already been addressed by
+/// the kernel over IPv4 and only wants the v6 half; flushing and reapplying
+/// would tear down a working interface to add to it.
+pub async fn add_ipv6(
+    address: Ipv6Addr,
+    prefix_len: u8,
+    gateway: Option<Ipv6Addr>,
+) -> anyhow::Result<()> {
+    match NETLINK.get() {
+        Some(netlink) => {
+            add_one_ipv6(&netlink.handle, netlink.index, address, prefix_len, gateway).await
+        }
+        None => {
+            let (connection, handle, _) = rtnetlink::new_connection()?;
+            let connection = tokio::spawn(connection);
+            let index = link_index(&handle).await?;
+            let result = add_one_ipv6(&handle, index, address, prefix_len, gateway).await;
+            drop(handle);
+            connection.abort();
+            result
+        }
+    }
+}
+
+async fn add_one_ipv6(
+    handle: &Handle,
+    index: u32,
+    address: Ipv6Addr,
+    prefix_len: u8,
+    gateway: Option<Ipv6Addr>,
+) -> anyhow::Result<()> {
+    handle
+        .address()
+        .add(index, std::net::IpAddr::V6(address), prefix_len)
+        .execute()
+        .await?;
+    // Without a default route the address is decorative: every destination
+    // outside the sandbox's own /64 is unreachable before a rule sees it.
+    if let Some(gateway) = gateway {
+        // A clone wakes holding the warm snapshot's v6 default route, whose
+        // gateway sits in a /64 this sandbox does not have an address in. The
+        // kernel keeps the first default route it has and the add below is a
+        // no-op, so the guest keeps routing at an address that is not its
+        // gateway and every v6 destination is unreachable.
+        remove_default_routes6(handle).await;
+        let route = RouteMessageBuilder::<Ipv6Addr>::new()
+            .gateway(gateway)
+            .output_interface(index)
+            .build();
+        if let Err(err) = handle.route().add(route).execute().await {
+            tracing::warn!(%gateway, %err, "could not add the guest's IPv6 default route");
+        }
+    }
+    Ok(())
+}
+
 /// Applies an address, gateway, and resolver to the guest's interface.
 ///
 /// Existing addresses are removed first: a clone wakes holding whatever the
@@ -63,6 +122,7 @@ pub async fn apply(
     prefix_len: u8,
     gateway: Option<Ipv4Addr>,
     dns: Option<&str>,
+    ip6: Option<(Ipv6Addr, u8, Option<Ipv6Addr>)>,
 ) -> anyhow::Result<()> {
     // The resolver is a file write with no kernel round trip, so it is done
     // first and costs nothing against the netlink work.
@@ -71,14 +131,16 @@ pub async fn apply(
     }
 
     match NETLINK.get() {
-        Some(netlink) => configure(&netlink.handle, netlink.index, ip, prefix_len, gateway).await,
+        Some(netlink) => {
+            configure(&netlink.handle, netlink.index, ip, prefix_len, gateway, ip6).await
+        }
         // Fall back to opening one: a guest that failed to prepare at boot
         // should still be re-addressable, just more slowly.
         None => {
             let (connection, handle, _) = rtnetlink::new_connection()?;
             let connection = tokio::spawn(connection);
             let index = link_index(&handle).await?;
-            let result = configure(&handle, index, ip, prefix_len, gateway).await;
+            let result = configure(&handle, index, ip, prefix_len, gateway, ip6).await;
             drop(handle);
             connection.abort();
             result
@@ -92,6 +154,7 @@ async fn configure(
     ip: Ipv4Addr,
     prefix_len: u8,
     gateway: Option<Ipv4Addr>,
+    ip6: Option<(Ipv6Addr, u8, Option<Ipv6Addr>)>,
 ) -> anyhow::Result<()> {
     flush_addresses(handle, index).await?;
     handle
@@ -109,6 +172,14 @@ async fn configure(
         )
         .execute()
         .await?;
+
+    // After the link is up, and never fatal: a guest whose kernel has IPv6
+    // disabled still wants the v4 address it just got.
+    if let Some((address, prefix, gateway6)) = ip6
+        && let Err(err) = add_one_ipv6(handle, index, address, prefix, gateway6).await
+    {
+        tracing::warn!(%address, %err, "could not add the guest's IPv6 address");
+    }
 
     if let Some(gateway) = gateway {
         // The snapshot's default route points through a gateway that is not
@@ -153,6 +224,34 @@ async fn flush_addresses(handle: &Handle, index: u32) -> anyhow::Result<()> {
         }
     }
     Ok(())
+}
+
+async fn remove_default_routes6(handle: &Handle) {
+    use netlink_packet_route::route::{RouteAddress, RouteAttribute};
+
+    let query = RouteMessageBuilder::<Ipv6Addr>::new().build();
+    let routes: Vec<_> = match handle.route().get(query).execute().try_collect().await {
+        Ok(routes) => routes,
+        Err(err) => {
+            tracing::warn!(%err, "could not list IPv6 routes");
+            return;
+        }
+    };
+
+    for route in routes {
+        let is_default = route.header.destination_prefix_length == 0
+            && !route
+                .attributes
+                .iter()
+                .any(|attr| matches!(attr, RouteAttribute::Destination(RouteAddress::Inet6(_))))
+            && route
+                .attributes
+                .iter()
+                .any(|attr| matches!(attr, RouteAttribute::Gateway(RouteAddress::Inet6(_))));
+        if is_default && let Err(err) = handle.route().del(route).execute().await {
+            tracing::warn!(%err, "could not remove the stale IPv6 default route");
+        }
+    }
 }
 
 async fn remove_default_routes(handle: &Handle) {
