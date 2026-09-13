@@ -1107,9 +1107,25 @@ const IP6T_SO_ORIGINAL_DST: nix::libc::c_int = 80;
 fn original_dst(stream: &TcpStream) -> std::io::Result<SocketAddr> {
     // The option is per family and the kernel answers only the one the socket
     // belongs to, so which to ask is decided by the connection, not guessed.
-    match stream.local_addr()? {
-        SocketAddr::V4(_) => original_dst_v4(stream),
-        SocketAddr::V6(_) => original_dst_v6(stream),
+    if asks_ipv4(stream.local_addr()?) {
+        original_dst_v4(stream)
+    } else {
+        original_dst_v6(stream)
+    }
+}
+
+/// Whether a connection whose local address is `local` carries its original
+/// destination under the IPv4 option.
+///
+/// The listener is dual stack, so an IPv4 connection arrives on an IPv6 socket
+/// and reports a v4-mapped local address. The kernel answers only the option
+/// for the family the packet was really in: asking IPv6 for a mapped
+/// connection fails, and the connection then dies before any policy decision
+/// is made or audited, which reads as the destination being unreachable.
+fn asks_ipv4(local: SocketAddr) -> bool {
+    match local {
+        SocketAddr::V4(_) => true,
+        SocketAddr::V6(local) => local.ip().to_ipv4_mapped().is_some(),
     }
 }
 
@@ -1477,6 +1493,14 @@ mod tests {
 
     /// The global limit is shared, so a sandbox opening connections in a loop
     /// would take every slot. Each source gets its own budget on top.
+    #[test]
+    fn a_mapped_connection_asks_for_its_original_destination_as_ipv4() {
+        assert!(asks_ipv4("10.99.4.1:3128".parse().unwrap()));
+        // What a dual-stack listener reports for an IPv4 client.
+        assert!(asks_ipv4("[::ffff:10.99.4.1]:3128".parse().unwrap()));
+        assert!(!asks_ipv4("[fd99:b070:0:100::1]:3128".parse().unwrap()));
+    }
+
     #[test]
     fn one_source_cannot_take_more_than_its_share_of_connections() {
         let limits = Arc::new(SourceLimits::default());
