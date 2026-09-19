@@ -1660,7 +1660,11 @@ impl SandboxManager {
 
             // Hold the recorded lease before anything else can be allocated,
             // so a recovered sandbox keeps the address baked into its snapshot.
-            self.ipam.lock().await.reserve(&row.id, row.lease_block);
+            if let Err(err) = self.ipam.lock().await.reserve(&row.id, row.lease_block) {
+                tracing::error!(sandbox = row.id, %err, "cannot restore recorded lease; skipping");
+                self.volumes.release_all(&row.id);
+                continue;
+            }
             let Some(lease) = self.ipam.lock().await.get(&row.id) else {
                 self.ipam.lock().await.release(&row.id);
                 self.volumes.release_all(&row.id);
@@ -4708,7 +4712,8 @@ pub(crate) mod tests {
             .ipam
             .lock()
             .await
-            .reserve(sandbox.id(), sandbox.lease.block);
+            .reserve(sandbox.id(), sandbox.lease.block)
+            .unwrap();
         manager
             .sandboxes
             .lock()
