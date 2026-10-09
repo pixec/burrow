@@ -50,11 +50,12 @@ impl Resolutions {
         if sandbox_id.is_empty() || host.is_empty() || addresses.is_empty() {
             return;
         }
+        let host = host.trim_end_matches('.').to_ascii_lowercase();
         let lifetime = ttl.clamp(MIN_PIN, MAX_PIN);
         let mut table = self.by_sandbox.write().unwrap();
         let names = table.entry(sandbox_id.to_string()).or_default();
 
-        if names.len() >= MAX_NAMES_PER_SANDBOX {
+        if !names.contains_key(&host) && names.len() >= MAX_NAMES_PER_SANDBOX {
             let now = Instant::now();
             names.retain(|_, pin| pin.expires > now);
             // Still full of live entries: refuse to grow rather than evict
@@ -65,7 +66,7 @@ impl Resolutions {
         }
 
         names.insert(
-            host.trim_end_matches('.').to_ascii_lowercase(),
+            host,
             Pin {
                 addresses,
                 expires: Instant::now() + lifetime,
@@ -279,6 +280,30 @@ fn skip_name(packet: &[u8], mut pos: usize) -> Option<usize> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn an_existing_pin_is_refreshed_when_the_name_table_is_full() {
+        let table = Resolutions::default();
+        for index in 0..MAX_NAMES_PER_SANDBOX {
+            table.record(
+                "sandbox",
+                &format!("host-{index}.example"),
+                vec![IpAddr::from([192, 0, 2, 1])],
+                Duration::from_secs(300),
+            );
+        }
+
+        let replacement = IpAddr::from([198, 51, 100, 2]);
+        table.record(
+            "sandbox",
+            "HOST-0.EXAMPLE.",
+            vec![replacement],
+            Duration::from_secs(300),
+        );
+
+        assert!(table.is_pinned("sandbox", "host-0.example", replacement));
+        assert!(!table.is_pinned("sandbox", "host-0.example", IpAddr::from([192, 0, 2, 1])));
+    }
 
     /// A control-plane address on a public range is exactly what the fixed
     /// SSRF list cannot cover, so the daemon supplies the set and re-supplies

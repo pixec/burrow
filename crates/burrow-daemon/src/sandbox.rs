@@ -1660,7 +1660,21 @@ impl SandboxManager {
 
             // Hold the recorded lease before anything else can be allocated,
             // so a recovered sandbox keeps the address baked into its snapshot.
-            self.ipam.lock().await.reserve(&row.id, row.lease_block);
+            if let Err(err) = self.ipam.lock().await.reserve(&row.id, row.lease_block) {
+                tracing::error!(sandbox = row.id, %err, "cannot restore recorded lease; skipping");
+                // A duplicate lease may name a tap the accepted sandbox owns;
+                // the orphan sweep below removes only taps no sandbox kept.
+                let _ = tokio::fs::remove_dir_all(&workdir).await;
+                self.volumes.release_all(&row.id);
+                if let Err(cleanup_err) = self.store.delete_sandbox(&row.id) {
+                    tracing::error!(sandbox = row.id, %cleanup_err, "failed to remove rejected sandbox from store");
+                }
+                if let Err(cleanup_err) = self.store.delete_sessions(&row.id) {
+                    tracing::error!(sandbox = row.id, %cleanup_err, "failed to remove rejected sandbox sessions");
+                }
+                discarded += 1;
+                continue;
+            }
             let Some(lease) = self.ipam.lock().await.get(&row.id) else {
                 self.ipam.lock().await.release(&row.id);
                 self.volumes.release_all(&row.id);
@@ -4333,6 +4347,55 @@ pub(crate) mod tests {
         )
     }
 
+    #[tokio::test]
+    async fn an_invalid_recovered_lease_is_removed_from_store() {
+        let id = "ghost-invalid-lease";
+        let data_dir = std::env::temp_dir().join(format!("burrow-recovery-{}", std::process::id()));
+        let _ = tokio::fs::remove_dir_all(&data_dir).await;
+        let mut manager = manager();
+        manager.config.data_dir = data_dir.clone();
+        let workdir = manager.config.sandbox_dir(id);
+        tokio::fs::create_dir_all(&workdir).await.unwrap();
+        tokio::fs::write(workdir.join(burrow_vmm::SNAPSHOT_FILE), b"snapshot")
+            .await
+            .unwrap();
+
+        let invalid_block = burrow_net::ipam::BLOCKS_PER_NODE;
+        manager
+            .store
+            .put_sandbox(&burrow_store::SandboxRow {
+                id: id.into(),
+                template: "default".into(),
+                record: Vec::new(),
+                state: common::SandboxState::Suspended as i32,
+                lease_block: invalid_block,
+                tap: format!("bt{invalid_block}"),
+                ports: Vec::new(),
+                share: None,
+                suspended_at: 1,
+            })
+            .unwrap();
+        manager
+            .store
+            .put_session(&burrow_store::SessionRow {
+                id: "session-ghost-invalid-lease".into(),
+                sandbox_id: id.into(),
+                started_at: 1,
+                ended_at: 1,
+                started_by: "test".into(),
+                ended_by: "test".into(),
+            })
+            .unwrap();
+
+        manager.recover().await;
+
+        assert!(manager.store.list_sandboxes().unwrap().is_empty());
+        assert!(manager.store.list_sessions(id).unwrap().is_empty());
+        assert!(manager.sandboxes.lock().await.is_empty());
+        assert!(!workdir.exists());
+        let _ = tokio::fs::remove_dir_all(&data_dir).await;
+    }
+
     /// A fork of a sandbox this node does not hold must fail before it claims
     /// an id, or a mistyped source would reserve a child id nothing releases.
     #[tokio::test]
@@ -4708,7 +4771,8 @@ pub(crate) mod tests {
             .ipam
             .lock()
             .await
-            .reserve(sandbox.id(), sandbox.lease.block);
+            .reserve(sandbox.id(), sandbox.lease.block)
+            .unwrap();
         manager
             .sandboxes
             .lock()

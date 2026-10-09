@@ -173,8 +173,8 @@ impl Ipam {
         let used: std::collections::HashSet<u32> = allocated.values().copied().collect();
         // Block 0 of the whole pool is skipped so the first host address is
         // never the network address; later nodes may use their first block.
-        let first = self.base_block.max(1);
-        let block = (first..self.base_block + BLOCKS_PER_NODE)
+        let mut range = self.block_range();
+        let block = range
             .find(|b| !used.contains(b))
             .ok_or(NetError::AddressPoolExhausted)?;
         allocated.insert(sandbox_id.to_string(), block);
@@ -195,11 +195,32 @@ impl Ipam {
 
     /// Restores a lease recorded elsewhere (e.g. loaded from disk at startup),
     /// so recovered sandboxes do not have their addresses handed to others.
-    pub fn reserve(&self, sandbox_id: &str, block: u32) {
-        self.allocated
-            .lock()
-            .unwrap()
-            .insert(sandbox_id.to_string(), block);
+    pub fn reserve(&self, sandbox_id: &str, block: u32) -> Result<()> {
+        let range = self.block_range();
+        if !range.contains(&block) {
+            return Err(NetError::LeaseBlockOutOfRange {
+                block,
+                first: range.start,
+                end: range.end,
+            });
+        }
+
+        let mut allocated = self.allocated.lock().unwrap();
+        if let Some((owner, _)) = allocated
+            .iter()
+            .find(|(owner, reserved)| owner.as_str() != sandbox_id && **reserved == block)
+        {
+            return Err(NetError::LeaseBlockInUse {
+                block,
+                sandbox_id: owner.clone(),
+            });
+        }
+        allocated.insert(sandbox_id.to_string(), block);
+        Ok(())
+    }
+
+    fn block_range(&self) -> std::ops::Range<u32> {
+        self.base_block.max(1)..self.base_block + BLOCKS_PER_NODE
     }
 }
 
@@ -229,6 +250,30 @@ fn lease_for(block: u32) -> Lease {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn restored_leases_cannot_collide() {
+        let ipam = Ipam::for_node(0).unwrap();
+        ipam.reserve("first", 1).unwrap();
+
+        assert!(matches!(
+            ipam.reserve("second", 1),
+            Err(NetError::LeaseBlockInUse { block: 1, .. })
+        ));
+        assert_eq!(ipam.get("first").unwrap().block, 1);
+        assert_eq!(ipam.get("second"), None);
+    }
+
+    #[test]
+    fn restored_leases_must_belong_to_the_node() {
+        let ipam = Ipam::for_node(1).unwrap();
+        for block in [1, BLOCKS_PER_NODE - 1, BLOCKS_PER_NODE * 2] {
+            assert!(matches!(
+                ipam.reserve("sandbox", block),
+                Err(NetError::LeaseBlockOutOfRange { block: got, .. }) if got == block
+            ));
+        }
+    }
 
     /// Both families are indexed by the same block, so a sandbox's v4 and v6
     /// addresses always name the same sandbox and a released block frees
