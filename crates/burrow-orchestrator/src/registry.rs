@@ -20,14 +20,14 @@ pub struct Placement {
     /// only way members reach each other.
     pub prefer_node: Option<String>,
     /// Whether peers can be reached from another node.
-    pub mesh_available: bool,
+    pub is_mesh_available: bool,
     /// What the sandbox will consume, so a node is not handed work it cannot
     /// honour.
     pub vcpus: u32,
     pub mem_mib: u64,
     /// Consider nodes that do not hold the template yet, because the caller
     /// intends to copy it there first.
-    pub allow_template_transfer: bool,
+    pub is_template_transfer_allowed: bool,
     /// Labels the node must carry, all of them, matched exactly.
     ///
     /// Burrow's stand-in for regions: operators label their nodes and a caller
@@ -75,7 +75,7 @@ pub enum RegisterError {
 }
 
 /// Whether a node carries every label asked for.
-fn labelled(entry: &NodeEntry, want: &HashMap<String, String>) -> bool {
+fn is_labelled(entry: &NodeEntry, want: &HashMap<String, String>) -> bool {
     want.iter()
         .all(|(key, value)| entry.info.labels.get(key) == Some(value))
 }
@@ -119,17 +119,17 @@ pub struct NodeEntry {
     /// Without it, "has no templates" and "has not said yet" are the same
     /// empty list, and a node that genuinely holds nothing looks like a
     /// candidate for every template on the fleet.
-    pub reported: bool,
+    pub is_reported: bool,
 }
 
 impl NodeEntry {
-    pub fn healthy(&self) -> bool {
+    pub fn is_healthy(&self) -> bool {
         self.last_heartbeat.elapsed() < STALE_AFTER
     }
 }
 
 /// In-memory node registry: nodes re-register after an orchestrator restart,
-/// because Heartbeat answers `reregister` for an id it does not know.
+/// because Heartbeat answers `is_reregistration_required` for an id it does not know.
 #[derive(Default)]
 pub struct NodeRegistry {
     nodes: Mutex<HashMap<String, NodeEntry>>,
@@ -146,7 +146,7 @@ struct Reserved {
 }
 
 /// Whether a node can take this sandbox without oversubscribing itself.
-fn fits(entry: &NodeEntry, pending: &HashMap<String, Reserved>, want: &Placement) -> bool {
+fn is_fit(entry: &NodeEntry, pending: &HashMap<String, Reserved>, want: &Placement) -> bool {
     let held = pending.get(&entry.info.id).copied().unwrap_or_default();
     let committed = entry.status.committed_vcpus as u64 + held.vcpus as u64 + want.vcpus as u64;
     // A node that has not reported its cpu count cannot be checked; trusting it
@@ -258,7 +258,7 @@ impl NodeRegistry {
                 wireguard_endpoint,
                 // A re-registering node re-reports on its next heartbeat; until
                 // then its previous inventory is not carried over.
-                reported: false,
+                is_reported: false,
             },
         );
         Ok((node_id, index))
@@ -272,7 +272,9 @@ impl NodeRegistry {
         let nodes = self.nodes.lock().unwrap();
         nodes
             .values()
-            .filter(|e| e.info.id != exclude && e.healthy() && !e.wireguard_public_key.is_empty())
+            .filter(|e| {
+                e.info.id != exclude && e.is_healthy() && !e.wireguard_public_key.is_empty()
+            })
             // `register` refuses an index the pool cannot hold, so this only
             // fails for a node registered by an older build; such a peer is
             // omitted rather than advertised with someone else's subnet.
@@ -288,7 +290,7 @@ impl NodeRegistry {
     }
 
     /// Whether any healthy node other than `exclude` can carry mesh traffic.
-    pub fn mesh_is_available(&self, exclude: &str) -> bool {
+    pub fn is_mesh_available(&self, exclude: &str) -> bool {
         !self.mesh_peers(exclude).is_empty()
     }
 
@@ -310,7 +312,7 @@ impl NodeRegistry {
                     };
                 }
                 entry.status = status;
-                entry.reported = true;
+                entry.is_reported = true;
                 entry.last_heartbeat = Instant::now();
                 entry.last_heartbeat_at = burrow_core::now_rfc3339();
                 drop(nodes);
@@ -341,7 +343,7 @@ impl NodeRegistry {
     /// a transient failure, while a node that has stopped heartbeating may
     /// never come back, and only the second may be written off.
     pub fn health(&self, node_id: &str) -> Option<bool> {
-        Some(self.nodes.lock().unwrap().get(node_id)?.healthy())
+        Some(self.nodes.lock().unwrap().get(node_id)?.is_healthy())
     }
 
     /// Ids of every node still heartbeating.
@@ -353,7 +355,7 @@ impl NodeRegistry {
             .lock()
             .unwrap()
             .values()
-            .filter(|e| e.healthy())
+            .filter(|e| e.is_healthy())
             .map(|e| e.info.id.clone())
             .collect()
     }
@@ -382,7 +384,7 @@ impl NodeRegistry {
     pub fn endpoint(&self, node_id: &str) -> Option<String> {
         let nodes = self.nodes.lock().unwrap();
         let entry = nodes.get(node_id)?;
-        if !entry.healthy() {
+        if !entry.is_healthy() {
             return None;
         }
         Some(format!("http://{}", entry.info.address))
@@ -417,7 +419,7 @@ impl NodeRegistry {
 
         let live: Vec<_> = nodes
             .values()
-            .filter(|e| e.healthy() && !e.status.draining)
+            .filter(|e| e.is_healthy() && !e.status.is_draining)
             .collect();
         if live.is_empty() {
             return Err(PlacementError::NoHealthyNode);
@@ -428,7 +430,7 @@ impl NodeRegistry {
         let labelled_live: Vec<_> = live
             .iter()
             .copied()
-            .filter(|e| labelled(e, &want.node_labels))
+            .filter(|e| is_labelled(e, &want.node_labels))
             .collect();
         if labelled_live.is_empty() {
             return Err(PlacementError::NoNodeWithLabels(unsatisfied(
@@ -441,11 +443,11 @@ impl NodeRegistry {
         let with_template: Vec<_> = live
             .iter()
             .filter(|e| {
-                want.allow_template_transfer
+                want.is_template_transfer_allowed
                     || want.template.is_empty()
                     // A node that has not reported yet is given the benefit of
                     // the doubt; one that has is taken at its word.
-                    || !e.reported
+                    || !e.is_reported
                     || e.status.templates.contains(&want.template)
             })
             .collect();
@@ -456,7 +458,7 @@ impl NodeRegistry {
         // Without a mesh, peers on another node are simply unreachable, so
         // co-location is the only correct answer rather than the fast one.
         if let Some(node_id) = &want.prefer_node
-            && !want.mesh_available
+            && !want.is_mesh_available
         {
             return with_template
                 .iter()
@@ -468,7 +470,7 @@ impl NodeRegistry {
         let pending = self.pending.lock().unwrap();
         let with_room: Vec<_> = with_template
             .into_iter()
-            .filter(|e| fits(e, &pending, want))
+            .filter(|e| is_fit(e, &pending, want))
             .collect();
         if with_room.is_empty() {
             return Err(PlacementError::NoCapacity {
@@ -590,6 +592,15 @@ impl NodeRegistry {
             .is_some_and(|e| e.status.templates.iter().any(|t| t == template))
     }
 
+    /// Whether a node reports `template` as imported from Kits.
+    pub fn is_kit_template(&self, node_id: &str, template: &str) -> bool {
+        self.nodes
+            .lock()
+            .unwrap()
+            .get(node_id)
+            .is_some_and(|e| e.status.kit_templates.iter().any(|t| t == template))
+    }
+
     /// A healthy node holding `template`, to copy it from.
     ///
     /// Any node with the artifacts will do: they are content-addressed, so
@@ -599,7 +610,7 @@ impl NodeRegistry {
         let nodes = self.nodes.lock().unwrap();
         nodes
             .values()
-            .find(|e| e.healthy() && e.status.templates.iter().any(|t| t == template))
+            .find(|e| e.is_healthy() && e.status.templates.iter().any(|t| t == template))
             .map(|e| (e.info.id.clone(), e.info.address.clone()))
     }
 
@@ -607,7 +618,7 @@ impl NodeRegistry {
     /// node's next heartbeat to report it.
     pub fn set_draining(&self, node_id: &str, draining: bool) {
         if let Some(entry) = self.nodes.lock().unwrap().get_mut(node_id) {
-            entry.status.draining = draining;
+            entry.status.is_draining = draining;
         }
     }
 
@@ -618,7 +629,7 @@ impl NodeRegistry {
             .map(|e| burrow_proto::api::v1::Node {
                 info: Some(e.info.clone()),
                 status: Some(e.status.clone()),
-                healthy: e.healthy(),
+                is_healthy: e.is_healthy(),
                 last_heartbeat_at: e.last_heartbeat_at.clone(),
             })
             .collect();
@@ -877,7 +888,7 @@ mod tests {
         );
         registry.heartbeat("keyless", status(&[], &[], 1), None);
         assert!(registry.mesh_peers("other").is_empty());
-        assert!(!registry.mesh_is_available("other"));
+        assert!(!registry.is_mesh_available("other"));
     }
 
     #[test]
@@ -891,7 +902,7 @@ mod tests {
             .place_for(&Placement {
                 template: "wanted".into(),
                 prefer_node: None,
-                mesh_available: false,
+                is_mesh_available: false,
                 ..Default::default()
             })
             .unwrap();
@@ -908,7 +919,7 @@ mod tests {
             .place_for(&Placement {
                 template: "missing".into(),
                 prefer_node: None,
-                mesh_available: false,
+                is_mesh_available: false,
                 ..Default::default()
             })
             .unwrap_err();
@@ -925,7 +936,7 @@ mod tests {
             .place_for(&Placement {
                 template: "t".into(),
                 prefer_node: None,
-                mesh_available: false,
+                is_mesh_available: false,
                 ..Default::default()
             })
             .unwrap();
@@ -942,7 +953,7 @@ mod tests {
             .place_for(&Placement {
                 template: "t".into(),
                 prefer_node: Some("b".into()),
-                mesh_available: false,
+                is_mesh_available: false,
                 ..Default::default()
             })
             .unwrap();
@@ -958,7 +969,7 @@ mod tests {
             .place_for(&Placement {
                 template: "t".into(),
                 prefer_node: Some("gone".into()),
-                mesh_available: false,
+                is_mesh_available: false,
                 ..Default::default()
             })
             .unwrap_err();
@@ -977,7 +988,7 @@ mod tests {
                 .place_for(&Placement {
                     template: "t".into(),
                     prefer_node: Some("b".into()),
-                    mesh_available: true,
+                    is_mesh_available: true,
                     ..Default::default()
                 })
                 .unwrap(),
@@ -990,7 +1001,7 @@ mod tests {
                 .place_for(&Placement {
                     template: "t".into(),
                     prefer_node: Some("gone".into()),
-                    mesh_available: true,
+                    is_mesh_available: true,
                     ..Default::default()
                 })
                 .unwrap(),
@@ -1142,14 +1153,14 @@ mod tests {
     #[test]
     fn draining_nodes_are_skipped() {
         let mut draining = status(&["t"], &[], 9999);
-        draining.draining = true;
+        draining.is_draining = true;
         let registry = registry(&[("a", draining), ("b", status(&["t"], &[], 1))]);
         assert_eq!(
             registry
                 .place_for(&Placement {
                     template: "t".into(),
                     prefer_node: None,
-                    mesh_available: false,
+                    is_mesh_available: false,
                     ..Default::default()
                 })
                 .unwrap(),
@@ -1361,7 +1372,7 @@ mod tests {
         assert_eq!(
             registry
                 .place_for(&Placement {
-                    allow_template_transfer: true,
+                    is_template_transfer_allowed: true,
                     ..want
                 })
                 .unwrap(),

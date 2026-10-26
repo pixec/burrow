@@ -2,6 +2,7 @@
 
 #![allow(clippy::result_large_err)]
 
+use std::collections::HashMap;
 use std::pin::Pin;
 use std::sync::Arc;
 
@@ -149,18 +150,18 @@ struct PlacementGuard<'a> {
     node_id: String,
     vcpus: u32,
     mem_mib: u64,
-    keep: bool,
+    is_kept: bool,
 }
 
 impl PlacementGuard<'_> {
     fn keep(mut self) {
-        self.keep = true;
+        self.is_kept = true;
     }
 }
 
 impl Drop for PlacementGuard<'_> {
     fn drop(&mut self) {
-        if !self.keep {
+        if !self.is_kept {
             self.nodes.release(&self.node_id, self.vcpus, self.mem_mib);
         }
     }
@@ -196,7 +197,7 @@ impl ApiService {
             node_id: node_id.to_string(),
             vcpus: want.vcpus,
             mem_mib: want.mem_mib,
-            keep: false,
+            is_kept: false,
         }
     }
 
@@ -222,7 +223,7 @@ impl ApiService {
             .0
             .nodes
             .place_for(&crate::registry::Placement {
-                allow_template_transfer: true,
+                is_template_transfer_allowed: true,
                 ..want.clone()
             })
             .map_err(|err| match err {
@@ -271,6 +272,7 @@ impl ApiService {
             source
                 .get_template_manifest(nodepb::TemplateManifestRequest {
                     name: template.to_string(),
+                    is_config_only: false,
                 })
                 .await?
                 .into_inner()
@@ -360,6 +362,76 @@ impl ApiService {
         )))
     }
 
+    fn secrets(&self) -> Result<&crate::secrets::Secrets, Status> {
+        self.0
+            .secrets
+            .as_ref()
+            .ok_or_else(|| Status::failed_precondition("no durable store; secrets cannot be kept"))
+    }
+
+    /// Replaces every `${secret:<name>}` in a policy's brokered values with
+    /// the stored secret, so a header can name a credential without the
+    /// value ever being on a command line or in a request. The node only ever
+    /// sees the resolved policy, which it seals at rest like any other.
+    fn resolve_secret_refs(&self, network: &mut common::NetworkPolicy) -> Result<(), Status> {
+        let mut values: Vec<&mut String> = Vec::new();
+        for rule in &mut network.rules {
+            match rule.action.as_mut() {
+                Some(common::request_rule::Action::SetHeaders(set)) => {
+                    values.extend(set.headers.iter_mut().map(|h| &mut h.value));
+                }
+                Some(common::request_rule::Action::Forward(forward)) => {
+                    values.push(&mut forward.secret)
+                }
+                None => {}
+            }
+        }
+        for value in values {
+            if value.contains(SECRET_REF) {
+                *value = substitute_secret_refs(value, |name| {
+                    self.secrets()?.get(name).map_err(internal)?.ok_or_else(|| {
+                        Status::failed_precondition(format!(
+                            "no secret {name:?}; store one with `burrow secret set`"
+                        ))
+                    })
+                })?;
+            }
+        }
+        Ok(())
+    }
+
+    /// The bound secrets for the credential services a Kit template's
+    /// descriptors request, read through `client` on `node_id`; empty for any
+    /// other template. An unbound service is left out: whether that refuses
+    /// or skips is the descriptor's `optional` to say, and the node judges it.
+    async fn kit_credentials(
+        &self,
+        client: &mut NodeClient,
+        node_id: &str,
+        template: &str,
+    ) -> Result<HashMap<String, String>, Status> {
+        let mut out = HashMap::new();
+        if !self.0.nodes.is_kit_template(node_id, template) {
+            return Ok(out);
+        }
+        let manifest = client
+            .get_template_manifest(nodepb::TemplateManifestRequest {
+                name: template.to_string(),
+                is_config_only: true,
+            })
+            .await?
+            .into_inner();
+        let Some(secrets) = &self.0.secrets else {
+            return Ok(out);
+        };
+        for service in burrow_kit::credential_services(&manifest.image_config) {
+            if let Some(value) = secrets.get(&service).map_err(internal)? {
+                out.insert(service, value);
+            }
+        }
+        Ok(out)
+    }
+
     /// Opens a connection to the node hosting `sandbox_id`.
     ///
     /// The address is looked up per request, because a node's address can
@@ -398,7 +470,7 @@ impl ApiService {
     /// to dial, so nothing can ever be delivered to it. Both are distinct from
     /// a healthy node that happened to refuse one connection, which is a
     /// transient failure and stays an error.
-    fn node_is_dead(&self, node_id: &str) -> bool {
+    fn is_node_dead(&self, node_id: &str) -> bool {
         !self.0.nodes.health(node_id).unwrap_or(false)
     }
 
@@ -438,7 +510,7 @@ impl ApiService {
     /// nodes is refused rather than half satisfied: nothing can attach both.
     fn node_for_volumes(&self, mounts: &[common::VolumeMount]) -> Result<Option<String>, Status> {
         let mut pinned: Option<String> = None;
-        for mount in mounts {
+        for mount in mounts.iter().filter(|mount| !mount.is_tmpfs) {
             let volume = self
                 .0
                 .volumes
@@ -539,7 +611,7 @@ impl Burrow for ApiService {
         // Reflected locally too: placement consults the cached status, and
         // waiting for the next heartbeat would leave a window where a drained
         // node still receives sandboxes.
-        self.0.nodes.set_draining(&req.node_id, req.drain);
+        self.0.nodes.set_draining(&req.node_id, req.is_draining);
         Ok(Response::new(resp))
     }
 
@@ -548,12 +620,15 @@ impl Burrow for ApiService {
         &self,
         req: Request<api::CreateSandboxRequest>,
     ) -> Result<Response<common::Sandbox>, Status> {
-        let req = req.into_inner();
+        let mut req = req.into_inner();
         // Refused here as well as on the node: placement charges a node and
         // may replicate a template before the create is ever sent, and none of
         // that should be spent on a request the node will reject anyway.
         burrow_core::tags::validate(&req.metadata)?;
         burrow_core::tags::validate_labels(&req.node_labels)?;
+        if let Some(network) = req.policy.as_mut().and_then(|p| p.network.as_mut()) {
+            self.resolve_secret_refs(network)?;
+        }
         // A name has to be settled before placement: refusing a duplicate
         // afterwards would mean charging a node for a sandbox that was never
         // going to be built.
@@ -608,6 +683,8 @@ impl Burrow for ApiService {
                     metadata: req.metadata,
                     name: req.name,
                     snapshot: snapshot.id.clone(),
+                    kit: None,
+                    credentials: HashMap::new(),
                 })
                 .await?
                 .into_inner();
@@ -650,7 +727,7 @@ impl Burrow for ApiService {
         let want = crate::registry::Placement {
             template: template.clone(),
             prefer_node: self.0.sandboxes.node_hosting_networks(&networks),
-            mesh_available: self.0.nodes.mesh_is_available(""),
+            is_mesh_available: self.0.nodes.is_mesh_available(""),
             vcpus: resources.as_ref().map(|r| r.vcpus).unwrap_or(0).max(1),
             mem_mib: match resources.as_ref().map(|r| r.mem_mib).unwrap_or(0) {
                 0 => 512,
@@ -658,7 +735,7 @@ impl Burrow for ApiService {
             },
             // First pass insists the template is already there; only if that
             // finds nothing do we consider copying it.
-            allow_template_transfer: false,
+            is_template_transfer_allowed: false,
             // Carried into the transfer pass too, so copying a template never
             // widens placement past the hardware the caller asked for.
             node_labels: req.node_labels,
@@ -730,6 +807,9 @@ impl Burrow for ApiService {
         let mut client = connect_node(endpoint, self.0.node_token.as_deref())
             .await
             .map_err(|err| Status::unavailable(format!("cannot reach node {node_id}: {err}")))?;
+        let credentials = self
+            .kit_credentials(&mut client, &node_id, &template)
+            .await?;
 
         let sandbox = client
             .create_sandbox(nodepb::NodeCreateRequest {
@@ -739,6 +819,8 @@ impl Burrow for ApiService {
                 metadata: req.metadata,
                 name: req.name,
                 snapshot: String::new(),
+                kit: req.kit,
+                credentials,
             })
             .await?
             .into_inner();
@@ -770,7 +852,7 @@ impl Burrow for ApiService {
             .ok_or_else(|| Status::not_found(format!("no sandbox {id}")))?;
         // The registry holds the last state the node reported, which is a stale
         // guess once that node stops heartbeating.
-        sandbox.unreachable = self.node_is_dead(&sandbox.node_id);
+        sandbox.is_unreachable = self.is_node_dead(&sandbox.node_id);
         Ok(Response::new(sandbox))
     }
 
@@ -788,7 +870,7 @@ impl Burrow for ApiService {
         let healthy = self.0.nodes.healthy_ids();
         let mut sandboxes = self.0.sandboxes.list_tagged(filter);
         for sandbox in &mut sandboxes {
-            sandbox.unreachable = !healthy.contains(&sandbox.node_id);
+            sandbox.is_unreachable = !healthy.contains(&sandbox.node_id);
         }
         Ok(Response::new(api::ListSandboxesResponse { sandboxes }))
     }
@@ -807,7 +889,7 @@ impl Burrow for ApiService {
             // down, which for a node that never returns is forever. So the
             // placement is dropped on the orchestrator's word, and a tombstone
             // remembers the delete in case the node comes back still holding it.
-            Err(_) if self.node_is_dead(&node_id) => {
+            Err(_) if self.is_node_dead(&node_id) => {
                 let forgotten = self.0.sandboxes.forget_deleted(&id);
                 if let Some(sandbox) = &forgotten {
                     self.release_charge(sandbox);
@@ -865,6 +947,106 @@ impl Burrow for ApiService {
             .into_inner();
         self.0.sandboxes.insert(sandbox.clone());
         Ok(Response::new(sandbox))
+    }
+
+    async fn stop_sandbox(
+        &self,
+        req: Request<api::SandboxRef>,
+    ) -> Result<Response<common::Sandbox>, Status> {
+        let id = self.resolve(&req.into_inner().id);
+        let mut client = self.node_for(&id).await?;
+        let sandbox = client
+            .stop_sandbox(nodepb::NodeSandboxRef { sandbox_id: id })
+            .await?
+            .into_inner();
+        self.0.sandboxes.insert(sandbox.clone());
+        Ok(Response::new(sandbox))
+    }
+
+    async fn start_sandbox(
+        &self,
+        req: Request<api::SandboxRef>,
+    ) -> Result<Response<common::Sandbox>, Status> {
+        let id = self.resolve(&req.into_inner().id);
+        let mut client = self.node_for(&id).await?;
+        let sandbox = client
+            .start_sandbox(nodepb::NodeSandboxRef { sandbox_id: id })
+            .await?
+            .into_inner();
+        self.0.sandboxes.insert(sandbox.clone());
+        Ok(Response::new(sandbox))
+    }
+
+    async fn recreate_sandbox(
+        &self,
+        req: Request<api::RecreateSandboxRequest>,
+    ) -> Result<Response<common::Sandbox>, Status> {
+        let req = req.into_inner();
+        let id = self.resolve(&req.sandbox_id);
+        let current = self
+            .0
+            .sandboxes
+            .get(&id)
+            .ok_or_else(|| Status::not_found(format!("no sandbox {id}")))?;
+        let node_id = current.node_id.clone();
+        // A replacement template has to be where the sandbox is: its disks
+        // and volumes do not move, so the template comes to them.
+        if !req.template.is_empty() {
+            self.replicate_to(&req.template, &node_id).await?;
+        }
+        let judged = if req.template.is_empty() {
+            &current.template
+        } else {
+            &req.template
+        };
+        let mut client = self.node_for(&id).await?;
+        let credentials = self.kit_credentials(&mut client, &node_id, judged).await?;
+        let sandbox = client
+            .recreate_sandbox(nodepb::NodeRecreateRequest {
+                sandbox_id: id,
+                template: req.template,
+                kit: req.kit,
+                credentials,
+            })
+            .await?
+            .into_inner();
+        self.0.sandboxes.insert(sandbox.clone());
+        Ok(Response::new(sandbox))
+    }
+
+    async fn set_secret(
+        &self,
+        req: Request<api::SetSecretRequest>,
+    ) -> Result<Response<api::SetSecretResponse>, Status> {
+        let req = req.into_inner();
+        validate_secret_name(&req.name)?;
+        if req.value.is_empty() {
+            return Err(Status::invalid_argument("a secret needs a value"));
+        }
+        self.secrets()?
+            .set(&req.name, &req.value)
+            .map_err(internal)?;
+        Ok(Response::new(api::SetSecretResponse {}))
+    }
+
+    async fn list_secrets(
+        &self,
+        _req: Request<api::ListSecretsRequest>,
+    ) -> Result<Response<api::ListSecretsResponse>, Status> {
+        let names = self.secrets()?.list().map_err(internal)?;
+        Ok(Response::new(api::ListSecretsResponse { names }))
+    }
+
+    async fn delete_secret(
+        &self,
+        req: Request<api::DeleteSecretRequest>,
+    ) -> Result<Response<api::DeleteSecretResponse>, Status> {
+        let name = req.into_inner().name;
+        let removed = self.secrets()?.delete(&name).map_err(internal)?;
+        if !removed {
+            return Err(Status::not_found(format!("no secret {name}")));
+        }
+        Ok(Response::new(api::DeleteSecretResponse {}))
     }
 
     /// Read from the node that ran the VMs, like any other per-sandbox fact.
@@ -927,7 +1109,10 @@ impl Burrow for ApiService {
         &self,
         req: Request<api::ForkSandboxRequest>,
     ) -> Result<Response<common::Sandbox>, Status> {
-        let req = req.into_inner();
+        let mut req = req.into_inner();
+        if let Some(network) = req.policy.as_mut().and_then(|p| p.network.as_mut()) {
+            self.resolve_secret_refs(network)?;
+        }
         let source_id = self.resolve(
             &req.r#ref
                 .map(|r| r.id)
@@ -1079,10 +1264,10 @@ impl Burrow for ApiService {
         let want = crate::registry::Placement {
             template: String::new(),
             prefer_node: None,
-            mesh_available: self.0.nodes.mesh_is_available(""),
+            is_mesh_available: self.0.nodes.is_mesh_available(""),
             vcpus: 1,
             mem_mib: 0,
-            allow_template_transfer: true,
+            is_template_transfer_allowed: true,
             node_labels: req.node_labels.clone(),
         };
         let node_id = self.0.nodes.place_for(&want).map_err(|err| match err {
@@ -1229,9 +1414,10 @@ impl Burrow for ApiService {
                 .map(|r| r.id)
                 .ok_or_else(|| Status::invalid_argument("ref is required"))?,
         );
-        let network = req
+        let mut network = req
             .network
             .ok_or_else(|| Status::invalid_argument("network is required"))?;
+        self.resolve_secret_refs(&mut network)?;
         let mut client = self.node_for(&id).await?;
         let sandbox = client
             .update_network_policy(nodepb::NodeUpdateNetworkRequest {
@@ -1306,7 +1492,7 @@ impl Burrow for ApiService {
                     // the answer that matches what placement does with it,
                     // since placement prefers a node that has one.
                     Some(existing) => {
-                        existing.warm |= template.warm;
+                        existing.is_warm |= template.is_warm;
                         existing.size_bytes = existing.size_bytes.max(template.size_bytes);
                     }
                     None => {
@@ -1366,7 +1552,7 @@ impl Burrow for ApiService {
         // Only the orchestrator knows how callers address the node, or what
         // domain its edge serves.
         mapping.host_address = self.node_host(&node_id, mapping.host_port);
-        if !mapping.udp {
+        if !mapping.is_udp {
             mapping.edge_url = self.edge_url(&node_id, &sandbox_id, mapping.guest_port);
         }
         Ok(Response::new(mapping))
@@ -1390,7 +1576,7 @@ impl Burrow for ApiService {
             // The node names the sandbox by whatever it recorded; the edge
             // hostname has to carry the id the router will resolve. A UDP
             // mapping gets none, because the edge only ever carries HTTP.
-            if !mapping.udp {
+            if !mapping.is_udp {
                 mapping.edge_url = self.edge_url(&node_id, &id, mapping.guest_port);
             }
         }
@@ -1724,6 +1910,53 @@ fn validate_sandbox_id(id: &str) -> Result<(), Status> {
     Ok(())
 }
 
+const SECRET_REF: &str = "${secret:";
+
+fn internal(err: anyhow::Error) -> Status {
+    Status::internal(format!("{err:#}"))
+}
+
+fn substitute_secret_refs(
+    value: &str,
+    mut lookup: impl FnMut(&str) -> Result<String, Status>,
+) -> Result<String, Status> {
+    let mut out = String::with_capacity(value.len());
+    let mut rest = value;
+    while let Some(start) = rest.find(SECRET_REF) {
+        out.push_str(&rest[..start]);
+        let after = &rest[start + SECRET_REF.len()..];
+        let end = after
+            .find('}')
+            .ok_or_else(|| Status::invalid_argument("unterminated ${secret:...} reference"))?;
+        let name = &after[..end];
+        validate_secret_name(name)?;
+        out.push_str(&lookup(name)?);
+        rest = &after[end + 1..];
+    }
+    out.push_str(rest);
+    Ok(out)
+}
+
+/// Lowercase letters, digits and dashes, at most `max` bytes, with no
+/// leading or trailing dash.
+fn is_kebab(name: &str, max: usize) -> bool {
+    (1..=max).contains(&name.len())
+        && name
+            .bytes()
+            .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-')
+        && !name.starts_with('-')
+        && !name.ends_with('-')
+}
+
+fn validate_secret_name(name: &str) -> Result<(), Status> {
+    if !is_kebab(name, 64) {
+        return Err(Status::invalid_argument(format!(
+            "secret name {name:?} must be lowercase kebab-case, 1 to 64 characters"
+        )));
+    }
+    Ok(())
+}
+
 /// Checks a caller-chosen sandbox name.
 ///
 /// A name goes into hostnames and command lines, and it has to be told apart
@@ -1732,13 +1965,7 @@ fn validate_sandbox_id(id: &str) -> Result<(), Status> {
 /// underscores, neither of which a name may contain, so the two namespaces
 /// cannot overlap.
 fn validate_name(name: &str) -> Result<(), Status> {
-    let ok = (1..=63).contains(&name.len())
-        && name
-            .chars()
-            .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-')
-        && !name.starts_with('-')
-        && !name.ends_with('-');
-    if !ok {
+    if !is_kebab(name, 63) {
         return Err(Status::invalid_argument(
             "name must be 1-63 characters of lowercase letters, digits and '-', \
              and may not start or end with '-'",
@@ -1749,7 +1976,27 @@ fn validate_name(name: &str) -> Result<(), Status> {
 
 #[cfg(test)]
 mod tests {
-    use super::{validate_name, validate_sandbox_id};
+    use super::*;
+
+    #[test]
+    fn secret_references_substitute_in_place() {
+        let lookup = |name: &str| match name {
+            "github" => Ok("ghp_x".to_string()),
+            other => Err(Status::failed_precondition(format!("no secret {other}"))),
+        };
+        assert_eq!(
+            substitute_secret_refs("Bearer ${secret:github}", lookup).unwrap(),
+            "Bearer ghp_x"
+        );
+        assert_eq!(substitute_secret_refs("plain", lookup).unwrap(), "plain");
+        assert_eq!(
+            substitute_secret_refs("${secret:github}:${secret:github}", lookup).unwrap(),
+            "ghp_x:ghp_x"
+        );
+        assert!(substitute_secret_refs("${secret:missing}", lookup).is_err());
+        assert!(substitute_secret_refs("${secret:github", lookup).is_err());
+        assert!(substitute_secret_refs("${secret:Bad Name}", lookup).is_err());
+    }
 
     #[test]
     fn a_name_is_a_dns_label() {

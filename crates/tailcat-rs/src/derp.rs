@@ -62,7 +62,7 @@ pub struct Options {
     /// Speak plain HTTP to the relay, as `derper --dev` expects. Never for
     /// a real relay: the node key exchange is authenticated by the box, but
     /// the relay's identity is only TLS.
-    pub plaintext_http: bool,
+    pub is_plaintext_http: bool,
     /// Announced to the relay; some relays refuse app names they know to be
     /// abusive.
     pub app_name: String,
@@ -248,7 +248,7 @@ async fn read_frame(reader: &mut Reader, max: usize) -> std::io::Result<(u8, Vec
 struct ClientInfo {
     version: u32,
     #[serde(rename = "CanAckPings")]
-    can_ack_pings: bool,
+    is_ping_ack_capable: bool,
     #[serde(rename = "AppName")]
     app_name: String,
 }
@@ -262,7 +262,7 @@ async fn connect_once(
     opts: &Options,
 ) -> Result<(Reader, Writer, String)> {
     let mut last_err = Error::Derp(format!("region {} has no DERP nodes", region.region_id));
-    for node in region.nodes.iter().filter(|n| !n.stun_only) {
+    for node in region.nodes.iter().filter(|n| !n.is_stun_only) {
         match connect_node(node, key, opts).await {
             Ok((r, w)) => return Ok((r, w, node.host_name.clone())),
             Err(err) => {
@@ -277,7 +277,7 @@ async fn connect_once(
 fn port_of(node: &DerpNode, opts: &Options) -> u16 {
     match u16::try_from(node.derp_port) {
         Ok(p) if p != 0 => p,
-        _ if opts.plaintext_http => DEV_HTTP_PORT,
+        _ if opts.is_plaintext_http => DEV_HTTP_PORT,
         _ => HTTPS_PORT,
     }
 }
@@ -373,12 +373,12 @@ async fn connect_node(
 ) -> Result<(Reader, Writer)> {
     let port = port_of(node, opts);
     let tcp = dial(node, port).await?;
-    let stream: Stream = if opts.plaintext_http {
+    let stream: Stream = if opts.is_plaintext_http {
         Box::new(tcp)
     } else {
         let name = ServerName::try_from(node.host_name.clone())
             .map_err(|err| Error::Derp(format!("bad host name {:?}: {err}", node.host_name)))?;
-        let connector = tokio_rustls::TlsConnector::from(tls_config(node.insecure_for_tests));
+        let connector = tokio_rustls::TlsConnector::from(tls_config(node.is_insecure_for_tests));
         Box::new(
             connector
                 .connect(name, tcp)
@@ -389,7 +389,7 @@ async fn connect_node(
     let (rd, mut wr) = tokio::io::split(stream);
     let mut rd = BufReader::new(rd);
 
-    let default_port = if opts.plaintext_http {
+    let default_port = if opts.is_plaintext_http {
         DEV_HTTP_PORT
     } else {
         HTTPS_PORT
@@ -436,7 +436,7 @@ async fn connect_node(
 
     let info = serde_json::to_vec(&ClientInfo {
         version: PROTOCOL_VERSION,
-        can_ack_pings: true,
+        is_ping_ack_capable: true,
         app_name: opts.app_name.clone(),
     })
     .expect("static struct serialises");

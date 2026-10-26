@@ -40,7 +40,7 @@ pub struct DriveSpec {
     /// Path relative to the VM working directory.
     pub path: String,
     pub is_root: bool,
-    pub read_only: bool,
+    pub is_read_only: bool,
 }
 
 impl DriveSpec {
@@ -49,7 +49,7 @@ impl DriveSpec {
             id: "rootfs".into(),
             path: path.into(),
             is_root: true,
-            read_only: true,
+            is_read_only: true,
         }
     }
 
@@ -58,7 +58,7 @@ impl DriveSpec {
             id: "scratch".into(),
             path: path.into(),
             is_root: false,
-            read_only: false,
+            is_read_only: false,
         }
     }
 }
@@ -88,21 +88,21 @@ pub struct MicroVmSpec {
     /// every sandbox restored from it. Enabling it changes the transport for
     /// every device, so a snapshot taken under one setting cannot be restored
     /// under the other.
-    pub enable_pci: bool,
+    pub is_pci_enabled: bool,
     pub vcpus: u32,
     pub mem_mib: u32,
     pub net: Option<NetSpec>,
     /// Enable virtio-vsock, the transport the guest agent speaks.
-    pub vsock: bool,
+    pub is_vsock_enabled: bool,
     /// Needed for diff snapshots.
-    pub track_dirty_pages: bool,
+    pub is_dirty_pages_tracked: bool,
     /// Confines firecracker to a chroot under an unprivileged uid. `None`
     /// runs it as root with the host filesystem visible.
     pub jail: Option<process::Jail>,
     /// Serve guest memory lazily on restore instead of letting the kernel page
     /// the whole memory file in. Ignored on a cold boot, which has no memory
     /// file to serve from.
-    pub lazy_memory: bool,
+    pub is_memory_lazy: bool,
     /// Memory files to restore from, oldest first: a full base followed by any
     /// diff snapshots layered over it. Empty means the conventional
     /// `snapshot.mem` alone. More than one entry forces the page-fault handler
@@ -122,7 +122,7 @@ pub struct MicroVmSpec {
     /// Whether a sandbox may run when its limits could not be applied. False
     /// keeps the stack usable where cgroups are unavailable, at the cost of
     /// unbounded CPU; true refuses to run an unbounded guest at all.
-    pub require_limits: bool,
+    pub is_limits_required: bool,
 }
 
 impl MicroVmSpec {
@@ -134,20 +134,20 @@ impl MicroVmSpec {
             kernel: "vmlinux".into(),
             boot_args: DEFAULT_BOOT_ARGS.into(),
             drives: Vec::new(),
-            enable_pci: false,
+            is_pci_enabled: false,
             vcpus: 1,
             mem_mib: 512,
             net: None,
-            vsock: false,
-            track_dirty_pages: false,
+            is_vsock_enabled: false,
+            is_dirty_pages_tracked: false,
             prefetch: None,
             record_prefetch: None,
             jail: None,
-            lazy_memory: false,
+            is_memory_lazy: false,
             memory_chain: Vec::new(),
             limits: Limits::default(),
             cgroup_root: Some(PathBuf::from("/sys/fs/cgroup")),
-            require_limits: false,
+            is_limits_required: false,
         }
     }
 }
@@ -227,7 +227,7 @@ async fn detach_snapshot_targets(workdir: &Path, mem_file: &str) -> Result<()> {
 /// also creates one `<uds>_<port>` socket per guest-initiated connection,
 /// which are stale for the same reason.
 async fn clear_stale_sockets(spec: &MicroVmSpec) -> Result<()> {
-    if !spec.vsock {
+    if !spec.is_vsock_enabled {
         return Ok(());
     }
     let mut entries = match tokio::fs::read_dir(&spec.workdir).await {
@@ -257,7 +257,7 @@ impl MicroVm {
             &spec.workdir,
             API_SOCK,
             spec.jail.as_ref(),
-            spec.enable_pci,
+            spec.is_pci_enabled,
         )
         .await?;
         let api = FcApi::new(spec.workdir.join(API_SOCK));
@@ -275,7 +275,7 @@ impl MicroVm {
         };
         vm.cgroup = match apply_limits(&vm.spec, vm.process.pid()) {
             Ok(cgroup) => cgroup,
-            Err(err) if !vm.spec.require_limits => {
+            Err(err) if !vm.spec.is_limits_required => {
                 // Loud, because the sandbox is now running without the CPU cap
                 // its policy asked for.
                 tracing::error!(
@@ -313,7 +313,7 @@ impl MicroVm {
                 vcpu_count: self.spec.vcpus,
                 mem_size_mib: self.spec.mem_mib,
                 smt: None,
-                track_dirty_pages: self.spec.track_dirty_pages,
+                is_dirty_pages_tracked: self.spec.is_dirty_pages_tracked,
             })
             .await?;
 
@@ -331,7 +331,7 @@ impl MicroVm {
                     drive_id: drive.id.clone(),
                     path_on_host: drive.path.clone(),
                     is_root_device: drive.is_root,
-                    is_read_only: drive.read_only,
+                    is_read_only: drive.is_read_only,
                 })
                 .await?;
         }
@@ -346,7 +346,7 @@ impl MicroVm {
                 .await?;
         }
 
-        if self.spec.vsock {
+        if self.spec.is_vsock_enabled {
             self.api
                 .set_vsock(&Vsock {
                     guest_cid: GUEST_CID,
@@ -478,7 +478,7 @@ impl MicroVm {
 
     /// Attaches a drive to a running VM.
     ///
-    /// Only possible with `enable_pci`, and the guest sees nothing until it
+    /// Only possible with `is_pci_enabled`, and the guest sees nothing until it
     /// rescans its PCI bus: firecracker has no way to notify it. This is how a
     /// volume reaches a sandbox restored from a warm snapshot, which was
     /// captured without it.
@@ -488,7 +488,7 @@ impl MicroVm {
                 drive_id: drive.id.clone(),
                 path_on_host: drive.path.clone(),
                 is_root_device: drive.is_root,
-                is_read_only: drive.read_only,
+                is_read_only: drive.is_read_only,
             })
             .await
     }
@@ -505,7 +505,7 @@ impl MicroVm {
             &spec.workdir,
             API_SOCK,
             spec.jail.as_ref(),
-            spec.enable_pci,
+            spec.is_pci_enabled,
         )
         .await?;
         let api = FcApi::new(spec.workdir.join(API_SOCK));
@@ -521,7 +521,7 @@ impl MicroVm {
         };
         vm.cgroup = match apply_limits(&vm.spec, vm.process.pid()) {
             Ok(cgroup) => cgroup,
-            Err(err) if !vm.spec.require_limits => {
+            Err(err) if !vm.spec.is_limits_required => {
                 // Loud, because the sandbox is now running without the CPU cap
                 // its policy asked for.
                 tracing::error!(
@@ -556,8 +556,8 @@ impl MicroVm {
         let req = LoadSnapshot {
             snapshot_path: SNAPSHOT_FILE.into(),
             mem_backend,
-            enable_diff_snapshots: vm.spec.track_dirty_pages,
-            resume_vm: resume,
+            is_diff_snapshots_enabled: vm.spec.is_dirty_pages_tracked,
+            is_vm_resumed: resume,
             // Point the snapshotted interface at this sandbox's own tap.
             network_overrides: vm
                 .spec
@@ -579,7 +579,7 @@ impl MicroVm {
         tracing::info!(
             vm_id = vm.spec.vm_id,
             latency_ms = vm.boot_latency.as_millis() as u64,
-            lazy_memory = vm.lazy_memory_active(),
+            lazy_memory = vm.is_lazy_memory_active(),
             "microvm restored from snapshot"
         );
         Ok(vm)
@@ -593,7 +593,7 @@ impl MicroVm {
         // A prefetch plan can only be served by the handler, so asking for one
         // is asking for lazy memory.
         let prefetching = self.spec.prefetch.is_some() || self.spec.record_prefetch.is_some();
-        if !self.spec.lazy_memory && !chained && !prefetching {
+        if !self.spec.is_memory_lazy && !chained && !prefetching {
             return Ok(None);
         }
         let chain: Vec<PathBuf> = if self.spec.memory_chain.is_empty() {
@@ -632,7 +632,7 @@ impl MicroVm {
     }
 
     /// Whether this VM's memory is being served lazily.
-    pub fn lazy_memory_active(&self) -> bool {
+    pub fn is_lazy_memory_active(&self) -> bool {
         #[cfg(target_os = "linux")]
         {
             self.memory.is_some()

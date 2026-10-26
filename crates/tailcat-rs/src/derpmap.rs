@@ -42,13 +42,14 @@ pub struct DerpNode {
     #[serde(rename = "STUNPort")]
     pub stun_port: i32,
     #[serde(rename = "STUNOnly")]
-    pub stun_only: bool,
+    pub is_stun_only: bool,
     /// The DERP port, `0` for the default.
     #[serde(rename = "DERPPort")]
     pub derp_port: i32,
-    pub insecure_for_tests: bool,
+    #[serde(rename = "InsecureForTests")]
+    pub is_insecure_for_tests: bool,
     #[serde(rename = "CanPort80")]
-    pub can_port80: bool,
+    pub is_port80_reachable: bool,
 }
 
 impl DerpNode {
@@ -78,7 +79,8 @@ pub struct DerpRegion {
     pub region_id: i64,
     pub region_code: String,
     pub region_name: String,
-    pub avoid: bool,
+    #[serde(rename = "Avoid")]
+    pub is_avoided: bool,
     pub nodes: Vec<DerpNode>,
 }
 
@@ -202,7 +204,7 @@ pub struct ExpandOptions {
     /// A DERP map to expand from instead of fetching one.
     pub derp_map: Option<DerpMap>,
     /// Whether the fetch is on behalf of a server; see [`Mode`].
-    pub for_server: bool,
+    pub is_for_server: bool,
 }
 
 impl ConnInfo {
@@ -233,7 +235,7 @@ impl ConnInfo {
         let (mut map, source) = match &opts.derp_map {
             Some(m) => (m.clone(), "provided DERP map".to_string()),
             None => {
-                let mode = if opts.for_server {
+                let mode = if opts.is_for_server {
                     Mode::Server
                 } else {
                     Mode::Client
@@ -288,7 +290,7 @@ mod tests {
         assert_eq!(r.region_code, "nyc");
         let n = &r.nodes[0];
         assert_eq!(n.host_name, "tc301a.ipn.dev");
-        assert!(n.can_port80);
+        assert!(n.is_port80_reachable);
         assert_eq!(n.stun_port(), Some(DEFAULT_STUN_PORT));
         assert_eq!(n.ip_addrs().len(), 2);
     }

@@ -49,7 +49,7 @@ class Terminal:
                     cmd=cmd,
                     env=options.get("env") or {},
                     cwd=options.get("cwd") or "",
-                    pty=True,
+                    is_pty=True,
                     rows=options.get("rows") or 24,
                     cols=options.get("cols") or 80,
                 )

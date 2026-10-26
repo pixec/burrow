@@ -126,7 +126,7 @@ impl DeniedAddresses {
 
     /// Checked against the unmapped address, so a control plane cannot be
     /// reached by asking for it in the other family's notation.
-    pub fn contains(&self, address: IpAddr) -> bool {
+    pub fn is_denied(&self, address: IpAddr) -> bool {
         self.addresses
             .read()
             .unwrap()
@@ -146,12 +146,12 @@ pub fn is_forbidden_destination(address: IpAddr) -> bool {
     // endpoint and every v4 predicate below answers `false` for it while it
     // is still wearing a v6 shape.
     match crate::policy::unmap(address) {
-        IpAddr::V4(address) => forbidden_v4(address),
-        IpAddr::V6(address) => forbidden_v6(address),
+        IpAddr::V4(address) => is_forbidden_v4(address),
+        IpAddr::V6(address) => is_forbidden_v6(address),
     }
 }
 
-fn forbidden_v4(address: Ipv4Addr) -> bool {
+fn is_forbidden_v4(address: Ipv4Addr) -> bool {
     address.is_loopback()
         || address.is_link_local()
         || address.is_private()
@@ -166,9 +166,9 @@ fn forbidden_v4(address: Ipv4Addr) -> bool {
 /// a v6 one. `::ffff:…` is handled by unmapping before this is reached; the
 /// NAT64 well-known prefix is handled here, because the embedded address is
 /// what the packet actually reaches.
-fn forbidden_v6(address: Ipv6Addr) -> bool {
+fn is_forbidden_v6(address: Ipv6Addr) -> bool {
     if let Some(embedded) = nat64_embedded(address) {
-        return forbidden_v4(embedded);
+        return is_forbidden_v4(embedded);
     }
     address.is_loopback()
         || address.is_unspecified()
@@ -315,15 +315,15 @@ mod tests {
         assert!(!is_forbidden_destination(edge));
 
         let denied = DeniedAddresses::default();
-        assert!(!denied.contains(orchestrator));
+        assert!(!denied.is_denied(orchestrator));
         denied.replace([orchestrator, edge]);
-        assert!(denied.contains(orchestrator) && denied.contains(edge));
+        assert!(denied.is_denied(orchestrator) && denied.is_denied(edge));
 
         // An address that stopped being control plane stops being denied, the
         // same way a re-render drops the rule that named it.
         denied.replace([edge]);
-        assert!(!denied.contains(orchestrator));
-        assert!(denied.contains(edge));
+        assert!(!denied.is_denied(orchestrator));
+        assert!(denied.is_denied(edge));
     }
 
     fn response(host: &str, addresses: &[Ipv4Addr], ttl: u32) -> Vec<u8> {

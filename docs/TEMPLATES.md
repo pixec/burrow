@@ -42,7 +42,8 @@ What you get is a template on a node, and you create sandboxes from the template
 Docker `ENTRYPOINT` and `CMD` are not run, because the guest agent is PID 1 and
 you start processes with `burrow exec`. The image's `ENV` and `WORKDIR` are
 applied to exec'd commands, and a request's `--env` and `--workdir` win where
-they name the same thing.
+they name the same thing. The exception is a [Sandbox Kit](#sandbox-kits),
+whose descriptor asks for the entrypoint to be launched.
 
 ### How an import is named
 
@@ -146,6 +147,83 @@ Some limits, because this runs a binary as root on the node:
 - Secrets are never logged, and a helper's stderr is discarded rather than
   captured, since diagnostics are one careless line away from carrying one.
 
+## Sandbox Kits
+
+A [Docker Sandbox Kit](https://github.com/docker/sandbox-kit-spec) is an OCI
+image whose manifest annotation carries a descriptor: what the image needs from
+the runtime that composes it. A pull keeps that descriptor beside the rootfs,
+so a Kit is a template that knows more about itself. One Kit is the workload;
+any number of mixins overlay tools, credentials, network grants and hooks onto
+it, and a pull of several composes the set into one template named
+`kit-<digest>`, so the same set always produces the same image.
+
+```sh
+burrow secret set github --value ghp_...
+burrow pull docker/sbx-kit-shell:1.0.0 docker/sbx-kit-gh:2.72.0
+burrow create --template kit-0123456789abcdef --arg team=alpha
+```
+
+A create from such a template is provisioned the way the descriptors ask,
+instead of from flags on the request:
+
+1. **Compose.** The descriptors are expanded with `--arg` values and the
+   container environment, then merged under the spec's rules: network policies
+   union per phase, lifecycle hooks and files concatenate, volumes and ports
+   reconcile on their paths and numbers, resources take the maximum. A
+   required capability burrow does not implement refuses the create; an
+   optional one is skipped.
+2. **Install phase.** The sandbox boots with the install-phase network policy
+   and credentials. Declared files are written, then each install hook runs
+   in dependency order, seeing only the variables it declared plus the
+   platform baseline.
+3. **Runtime phase.** The policy is swapped to the runtime one. Startup hooks
+   run, then the workload's entrypoint and cmd are launched as the image's
+   user, in its working directory, under bash.
+
+`burrow shutdown` followed by `burrow boot` runs startup hooks and the
+entrypoint again on the same writable disk, which is what the spec means by a
+stop and start. `burrow recreate` replaces the writable disk under the same
+id, keeping the sandbox's volumes; with `--template` it moves the sandbox onto
+another Kit template, pulled first.
+
+What burrow answers:
+
+| Capability | Behaviour |
+|---|---|
+| `network-policy@1`, `@2` | Hosts to the allowlist, deny hosts to `deny_domains`, bounded entries to HTTP rules the inspecting proxy enforces with 403. A bounded host is refused outright where it cannot be inspected. |
+| `credential@1` | API keys only. The secret stays on the host and is injected as a header; the named variable carries a sentinel. Bind one with `burrow secret set <service>`. |
+| `volume@1` | One ext4 volume per sandbox and path, named `kit-<sandbox>-<hash>` and labelled with both. Retained across recreation, including paths no longer declared; deleted with the sandbox. `tmpfs: true` mounts a tmpfs. |
+| `lifecycle@1` | Install and startup hooks, files, and the interactive tail. |
+| `resources@1` | `cpu` and `memory` raise the sandbox's vcpus and memory. |
+| `port@1` | Published after the create, like `--publish`. |
+| `long-running@1`, `sbx@1` | Accepted; burrow never auto-stops a sandbox unless asked. |
+
+Everything else (`host-mount@1`, `ssh-agent@1`, `agent-skills@1`,
+`git-identity@1`, OAuth credentials, the session verbs) is unclaimed: a Kit
+that requires one is refused by name, and an optional one is recorded and
+skipped. A Kit that is a mixin on its own cannot compose and imports as a
+plain template.
+
+Secrets are held by the orchestrator, encrypted at rest under a key generated
+at `<data-dir>/secrets.key` on first use. A node sees a secret only inside the
+sandbox record that brokers it, sealed the same way in its own store and
+redacted on every read like any injected header.
+
+A create or recreation may decline capability types with
+`--reject-capability <type>`, which refuses a Kit requiring one and skips one
+asking optionally. `burrow inspect --json` carries the selection records and
+the permission surface the sandbox was created with under `selection`.
+
+`deploy/kit-tck/burrow-adapter` drives burrow through the spec's runtime
+conformance suite. It builds the suite's fixture Kits with the spec's BuildKit
+frontend and pushes them to the dev harness's registry, so it needs
+`docker buildx` and the harness up:
+
+```sh
+export BURROW_API_KEY=dev-token BURROW=target/debug/burrow
+kit-tck runtime --adapter deploy/kit-tck/burrow-adapter
+```
+
 ## Built templates
 
 `BuildTemplate` boots a base template, runs build steps inside the guest, exports
@@ -172,12 +250,11 @@ and the exact shape of any create that found no snapshot to restore from is
 warmed too. So the first create of a shape cold-boots and the ones after it
 restore.
 
-What that costs, measured on the dev harness: the first two creates of a shape
-with no snapshot took 4.7 s and 2.5 s, the second still cold because warming runs
-behind the create that triggered it. Creates after the snapshot landed settled at
+Measured on the dev harness, creates after the snapshot landed settled at
 54 to 79 ms, and with pooling off a warm create is about 45 ms for alpine and
-41 ms for python. The cold pair is a one-off per template and shape per node, and
-it is paid again after a node restart only if the snapshot is gone.
+41 ms for python. The first create of a shape is a one-off per template and
+shape per node, and it is paid again after a node restart only if the snapshot
+is gone.
 
 A template holds **one** warm snapshot, at one shape. Warming a second shape
 replaces the first rather than joining it, and each template and shape gets one

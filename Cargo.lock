@@ -393,9 +393,11 @@ dependencies = [
 name = "burrow-core"
 version = "0.1.0"
 dependencies = [
+ "base64",
  "opentelemetry",
  "opentelemetry-otlp",
  "opentelemetry_sdk",
+ "ring",
  "serde",
  "thiserror 2.0.20",
  "tokio",
@@ -414,6 +416,7 @@ dependencies = [
  "async-stream",
  "base64",
  "burrow-core",
+ "burrow-kit",
  "burrow-net",
  "burrow-proto",
  "burrow-proxy",
@@ -438,6 +441,19 @@ dependencies = [
  "tower 0.5.3",
  "tracing",
  "tracing-subscriber",
+ "uuid",
+]
+
+[[package]]
+name = "burrow-kit"
+version = "0.1.0"
+dependencies = [
+ "burrow-core",
+ "regex",
+ "serde",
+ "serde_json",
+ "sha2",
+ "thiserror 2.0.20",
 ]
 
 [[package]]
@@ -459,6 +475,7 @@ dependencies = [
  "anyhow",
  "async-stream",
  "burrow-core",
+ "burrow-kit",
  "burrow-net",
  "burrow-proto",
  "burrow-store",
@@ -487,6 +504,7 @@ dependencies = [
 name = "burrow-proxy"
 version = "0.1.0"
 dependencies = [
+ "burrow-core",
  "burrow-store",
  "bytes",
  "h2",

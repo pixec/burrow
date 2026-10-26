@@ -204,7 +204,7 @@ set when the sandbox is created:
 | --- | --- | --- | --- |
 | `snapshot_expiration_secs` | `--snapshot-expiration-secs` | Sweep a snapshot this long after it was last used | `0`, keep indefinitely |
 | `keep_last_snapshots` | `--keep-last-snapshots` | Keep only this many snapshots of the sandbox, evicting the oldest | `0`, unlimited; 1 to 10 otherwise |
-| `keep_evicted_snapshots` | `--keep-evicted-snapshots` | Let an evicted snapshot expire on its own instead of being deleted at once | off, evictions delete |
+| `is_evicted_snapshot_kept` | `--keep-evicted-snapshots` | Let an evicted snapshot expire on its own instead of being deleted at once | off, evictions delete |
 
 ```sh
 burrow create --template python --name build-env --keep-last-snapshots 2 --snapshot-expiration-secs 604800

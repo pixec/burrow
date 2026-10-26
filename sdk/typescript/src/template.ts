@@ -253,7 +253,7 @@ factory.list = async function list(
     return (res.templates ?? []).map((t: any) => ({
       name: t.name,
       sizeBytes: Number(t.sizeBytes ?? 0),
-      warm: Boolean(t.warm),
+      warm: Boolean(t.isWarm),
     }));
   } finally {
     transport.close();

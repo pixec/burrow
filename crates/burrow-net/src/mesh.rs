@@ -98,8 +98,8 @@ pub async fn configure(
     ensure_interface(subnet).await?;
 
     // Nothing unvalidated reaches the config or the routing table; see
-    // [`valid_peer`].
-    let peers: Vec<&Peer> = peers.iter().filter(|peer| valid_peer(peer)).collect();
+    // [`is_valid_peer`].
+    let peers: Vec<&Peer> = peers.iter().filter(|peer| is_valid_peer(peer)).collect();
 
     // `syncconf` removes peers absent from the config, which is what makes a
     // node that left the fleet stop being routable.
@@ -136,12 +136,12 @@ pub async fn configure(
 ///
 /// A peer failing any check is dropped rather than corrected: a malformed
 /// record says nothing reliable about which node it describes.
-fn valid_peer(peer: &Peer) -> bool {
-    let reason = if !valid_subnet(&peer.subnet) {
+fn is_valid_peer(peer: &Peer) -> bool {
+    let reason = if !is_valid_subnet(&peer.subnet) {
         "subnet is not a CIDR inside the sandbox pool, or claims more than one node's slice"
-    } else if !valid_public_key(&peer.public_key) {
+    } else if !is_valid_public_key(&peer.public_key) {
         "public key is not 32 bytes of base64"
-    } else if !valid_endpoint(&peer.endpoint) {
+    } else if !is_valid_endpoint(&peer.endpoint) {
         "endpoint is not host:port"
     } else {
         return true;
@@ -161,7 +161,7 @@ fn valid_peer(peer: &Peer) -> bool {
 /// shorter than [`crate::ipam::NODE_PREFIX`] because no node legitimately owns
 /// more than its slice, and a shorter prefix would authorise the peer to speak
 /// for addresses another node hands out.
-fn valid_subnet(subnet: &str) -> bool {
+fn is_valid_subnet(subnet: &str) -> bool {
     let Some((address, prefix)) = subnet.split_once('/') else {
         return false;
     };
@@ -186,7 +186,7 @@ fn valid_subnet(subnet: &str) -> bool {
 
 /// A WireGuard public key: 32 raw bytes, which base64 spells as exactly 44
 /// characters ending in one `=` of padding.
-fn valid_public_key(key: &str) -> bool {
+fn is_valid_public_key(key: &str) -> bool {
     use base64::Engine as _;
     key.len() == 44
         && base64::engine::general_purpose::STANDARD
@@ -199,7 +199,7 @@ fn valid_public_key(key: &str) -> bool {
 ///
 /// Empty is legitimate: a peer behind NAT has no reachable endpoint until it
 /// speaks first, and the line is then simply omitted.
-fn valid_endpoint(endpoint: &str) -> bool {
+fn is_valid_endpoint(endpoint: &str) -> bool {
     if endpoint.is_empty() {
         return true;
     }
@@ -236,7 +236,7 @@ fn label(node_id: &str) -> String {
 }
 
 /// Renders the `wg` config for `peers`, which must already have passed
-/// [`valid_peer`].
+/// [`is_valid_peer`].
 fn render_config(identity: &Identity, listen_port: u16, peers: &[&Peer]) -> String {
     use std::fmt::Write as _;
     let mut config = String::new();
@@ -355,7 +355,7 @@ mod tests {
 
     /// Validates and renders, the way `configure` does.
     fn render(identity: &Identity, port: u16, peers: &[Peer]) -> String {
-        let peers: Vec<&Peer> = peers.iter().filter(|peer| valid_peer(peer)).collect();
+        let peers: Vec<&Peer> = peers.iter().filter(|peer| is_valid_peer(peer)).collect();
         render_config(identity, port, &peers)
     }
 
@@ -425,7 +425,7 @@ mod tests {
     #[test]
     fn a_peer_may_only_claim_a_range_inside_the_pool() {
         for good in ["10.99.4.0/22", "10.99.8.0/24", "10.99.0.2/32"] {
-            assert!(valid_subnet(good), "{good} should be accepted");
+            assert!(is_valid_subnet(good), "{good} should be accepted");
         }
         for bad in [
             // Wider than a node's slice: covers ranges other nodes own.
@@ -444,13 +444,13 @@ mod tests {
             "10.99.4.0/22\nAllowedIPs = 0.0.0.0/0",
             "",
         ] {
-            assert!(!valid_subnet(bad), "{bad:?} should be refused");
+            assert!(!is_valid_subnet(bad), "{bad:?} should be refused");
         }
     }
 
     #[test]
     fn a_public_key_must_be_thirty_two_bytes_of_base64() {
-        assert!(valid_public_key(&key("a")));
+        assert!(is_valid_public_key(&key("a")));
         for bad in [
             "",
             "a-key",
@@ -465,14 +465,14 @@ mod tests {
             &format!("{}\n", key("a")),
             &format!(" {}", key("a")),
         ] {
-            assert!(!valid_public_key(bad), "{bad:?} should be refused");
+            assert!(!is_valid_public_key(bad), "{bad:?} should be refused");
         }
     }
 
     #[test]
     fn an_endpoint_must_be_host_and_port_and_nothing_else() {
         for good in ["a.example:51820", "10.0.0.1:1", "[::1]:51820", ""] {
-            assert!(valid_endpoint(good), "{good:?} should be accepted");
+            assert!(is_valid_endpoint(good), "{good:?} should be accepted");
         }
         for bad in [
             "a.example",
@@ -485,7 +485,7 @@ mod tests {
             "a.example:51820\nPersistentKeepalive = 0",
             "a.example:51820\t",
         ] {
-            assert!(!valid_endpoint(bad), "{bad:?} should be refused");
+            assert!(!is_valid_endpoint(bad), "{bad:?} should be refused");
         }
     }
 

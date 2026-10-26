@@ -21,7 +21,7 @@ def test_naming_a_domain_makes_an_allowlist():
     wire = to_network_policy(options)
     assert wire.mode == common_pb2.NETWORK_MODE_ALLOWLIST
     assert list(wire.allow_domains) == ["pypi.org", "*.pythonhosted.org"]
-    assert not wire.inspect_tls
+    assert not wire.is_tls_inspected
 
 
 def test_subnets_shorthand_carries_denies():
@@ -44,7 +44,7 @@ def test_a_transform_becomes_an_inspected_rule():
         }
     )
     wire = to_network_policy(options)
-    assert wire.inspect_tls
+    assert wire.is_tls_inspected
     rule = wire.rules[0]
     assert rule.domain == "api.example.com"
     assert rule.match.path.op == common_pb2.STRING_MATCH_OP_STARTS_WITH

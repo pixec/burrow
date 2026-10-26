@@ -13,6 +13,7 @@ burrow-proto = { workspace = true }
 burrow-core = { workspace = true }
 burrow-net = { workspace = true }
 burrow-store = { workspace = true }
+burrow-kit = { workspace = true }
 prost = { workspace = true }
 tokio = { workspace = true }
 tokio-stream = { workspace = true }

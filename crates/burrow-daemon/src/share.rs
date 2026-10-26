@@ -49,10 +49,10 @@ const GUEST_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 
 #[derive(Clone, Debug)]
 pub struct ShareOptions {
-    pub enabled: bool,
+    pub is_enabled: bool,
     /// Whether shares here may source connections from the client's own
     /// address. Off makes every share on this node use the gateway.
-    pub transparent: bool,
+    pub is_transparent: bool,
     /// The DERP region to listen through, or the nearest when unset.
     pub region: Option<i64>,
     pub derp_map_url: Option<String>,
@@ -64,11 +64,11 @@ pub struct ShareShape {
     /// Guest TCP ports; empty means every port.
     pub ports: Vec<u16>,
     pub allowed_clients: Vec<String>,
-    /// Guest UDP ports; none unless listed or `all_udp`.
+    /// Guest UDP ports; none unless listed or `is_all_udp_shared`.
     pub udp_ports: Vec<u16>,
-    pub all_udp: bool,
+    pub is_all_udp_shared: bool,
     /// Source each connection from the last pong-verified public IPv4.
-    pub transparent_ip: bool,
+    pub is_ip_transparent: bool,
 }
 
 impl ShareShape {
@@ -78,8 +78,8 @@ impl ShareShape {
             ports: self.ports,
             allowed_clients: self.allowed_clients,
             udp_ports: self.udp_ports,
-            all_udp: self.all_udp,
-            transparent_ip: self.transparent_ip,
+            is_all_udp_shared: self.is_all_udp_shared,
+            is_ip_transparent: self.is_ip_transparent,
             ..existing
         }
     }
@@ -91,14 +91,14 @@ pub struct ShareInfo {
     pub address: String,
     pub spec: ShareRow,
     /// Whether connections really are sourced from the client's address.
-    pub transparent_ip: bool,
+    pub is_ip_transparent: bool,
 }
 
 struct Active {
     spec: ShareRow,
     /// What the share ended up doing, which is what a caller is told: a node
     /// that could not install the reply path serves from the gateway.
-    transparent_ip: bool,
+    is_ip_transparent: bool,
     server: Arc<Server>,
     task: JoinHandle<()>,
     /// Connections currently relayed into the guest. A sandbox with any is in
@@ -148,8 +148,8 @@ impl Shares {
             allowed_clients: shape.allowed_clients,
             created_at: burrow_core::unix_now(),
             udp_ports: shape.udp_ports,
-            all_udp: shape.all_udp,
-            transparent_ip: shape.transparent_ip,
+            is_all_udp_shared: shape.is_all_udp_shared,
+            is_ip_transparent: shape.is_ip_transparent,
         }
     }
 
@@ -175,7 +175,7 @@ impl Shares {
                 ci.expand(&ExpandOptions {
                     derp_map_url: self.options.derp_map_url.clone(),
                     derp_map: None,
-                    for_server: true,
+                    is_for_server: true,
                 })
                 .await
                 .map_err(|err| Status::unavailable(format!("cannot pick a DERP region: {err}")))?;
@@ -207,12 +207,12 @@ impl Shares {
         id: &str,
         spec: ShareRow,
     ) -> Result<ShareInfo, Status> {
-        if !self.options.enabled {
+        if !self.options.is_enabled {
             return Err(Status::failed_precondition(
                 "tailcat shares are disabled on this node",
             ));
         }
-        let transparent_ip = spec.transparent_ip && self.transparent_ready().await;
+        let transparent_ip = spec.is_ip_transparent && self.is_transparent_ready().await;
         let region = self.region().await?;
         let key: NodePrivate = parse_key(&spec.key, "key")?;
         let preshared_key: PresharedKey = parse_key(&spec.preshared_key, "pre-shared key")?;
@@ -231,7 +231,7 @@ impl Shares {
             } else {
                 Ports::list(spec.ports.iter().copied())
             },
-            udp_ports: if spec.all_udp {
+            udp_ports: if spec.is_all_udp_shared {
                 Some(Ports::All)
             } else if spec.udp_ports.is_empty() {
                 None
@@ -249,14 +249,16 @@ impl Shares {
             manager.clone(),
             id.to_string(),
             server.clone(),
-            Dial { transparent_ip },
+            Dial {
+                is_ip_transparent: transparent_ip,
+            },
             open.clone(),
         ));
         self.active.lock().await.insert(
             id.to_string(),
             Active {
                 spec: spec.clone(),
-                transparent_ip,
+                is_ip_transparent: transparent_ip,
                 server,
                 task,
                 open,
@@ -266,7 +268,7 @@ impl Shares {
         Ok(ShareInfo {
             address,
             spec,
-            transparent_ip,
+            is_ip_transparent: transparent_ip,
         })
     }
 
@@ -278,7 +280,7 @@ impl Shares {
         self.active.lock().await.get(id).map(|a| ShareInfo {
             address: a.server.tailcat_addr().to_string(),
             spec: a.spec.clone(),
-            transparent_ip: a.transparent_ip,
+            is_ip_transparent: a.is_ip_transparent,
         })
     }
 
@@ -300,8 +302,8 @@ impl Shares {
     /// share, from the gateway: losing the client's address is a worse guest
     /// experience, but refusing to share at all is a worse outage, and the
     /// same call is what brings persisted shares back after a restart.
-    async fn transparent_ready(&self) -> bool {
-        if !self.options.transparent {
+    async fn is_transparent_ready(&self) -> bool {
+        if !self.options.is_transparent {
             return false;
         }
         match self
@@ -325,7 +327,7 @@ impl Shares {
 /// How a share dials the guest for one connection or flow.
 #[derive(Clone, Copy)]
 struct Dial {
-    transparent_ip: bool,
+    is_ip_transparent: bool,
 }
 
 async fn serve(
@@ -480,7 +482,7 @@ async fn relay(
 
 /// The client's last pong-verified IPv4, or `None` to use the gateway.
 fn client_src(dial: Dial, public: Option<SocketAddr>) -> Option<Ipv4Addr> {
-    if !dial.transparent_ip {
+    if !dial.is_ip_transparent {
         return None;
     }
     match public {
@@ -529,7 +531,7 @@ mod tests {
     #[test]
     fn transparent_ip_is_only_the_verified_public_ipv4() {
         let dial = Dial {
-            transparent_ip: true,
+            is_ip_transparent: true,
         };
         let public: SocketAddr = "203.0.113.9:4444".parse().unwrap();
         assert_eq!(
@@ -541,7 +543,7 @@ mod tests {
         let v6: SocketAddr = "[2001:db8::1]:4444".parse().unwrap();
         assert_eq!(client_src(dial, Some(v6)), None);
         let off = Dial {
-            transparent_ip: false,
+            is_ip_transparent: false,
         };
         assert_eq!(client_src(off, Some(public)), None);
     }

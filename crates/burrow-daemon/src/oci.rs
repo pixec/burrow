@@ -10,11 +10,12 @@
 //! the result is written out with `mkfs.ext4 -d`: no loop devices, no mounting,
 //! no privileges beyond what the node already has.
 //!
-//! What is *not* carried over is how the image expects to be run as a
-//! container. Entrypoint, user and signals belong to a container runtime, and
-//! burrow runs a VM whose PID 1 is its own agent. The environment and working
-//! directory are kept, because those are what a shell inside the sandbox would
-//! otherwise get wrong.
+//! What is *not* acted on is how the image expects to be run as a container.
+//! Entrypoint, user and signals belong to a container runtime, and burrow runs
+//! a VM whose PID 1 is its own agent. The environment and working directory
+//! are applied to every command, because those are what a shell inside the
+//! sandbox would otherwise get wrong; entrypoint, cmd and user are recorded
+//! for a Sandbox Kit, whose workload the node launches the way the image says.
 
 #![allow(clippy::result_large_err)]
 
@@ -170,6 +171,8 @@ struct Platform {
 struct Manifest {
     config: Descriptor,
     layers: Vec<Descriptor>,
+    #[serde(default)]
+    annotations: HashMap<String, String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -193,6 +196,12 @@ struct ImageConfigInner {
     env: Vec<String>,
     #[serde(rename = "WorkingDir", default)]
     working_dir: String,
+    #[serde(rename = "Entrypoint", default)]
+    entrypoint: Vec<String>,
+    #[serde(rename = "Cmd", default)]
+    cmd: Vec<String>,
+    #[serde(rename = "User", default)]
+    user: String,
 }
 
 /// What a sandbox needs to behave like the image it came from.
@@ -201,6 +210,15 @@ pub struct ImageEnvironment {
     /// `KEY=value`, as the image declared them.
     pub env: Vec<String>,
     pub working_dir: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub entrypoint: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub cmd: Vec<String>,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub user: String,
+    /// The Kit composition this template was imported from, when it was one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub kit: Option<crate::kit::KitTemplate>,
 }
 
 impl ImageEnvironment {
@@ -226,7 +244,7 @@ impl ImageEnvironment {
             let Some(path) = map.get(variable) else {
                 continue;
             };
-            if !usable_bundle_path(path) {
+            if !is_usable_bundle_path(path) {
                 tracing::warn!(
                     variable,
                     path,
@@ -241,7 +259,7 @@ impl ImageEnvironment {
             }
             bundles.push(burrow_proto::agent::v1::TrustBundle {
                 path: path.clone(),
-                create_if_missing,
+                is_created_if_missing: create_if_missing,
             });
         }
         bundles
@@ -279,7 +297,7 @@ const TRUST_BUNDLE_VARIABLES: [(&str, bool); 4] = [
 /// The value is the image's, not the operator's, so it is held to the same
 /// bar as any other untrusted path: absolute, and with no component that
 /// walks back out of wherever it appears to lead.
-pub fn usable_bundle_path(path: &str) -> bool {
+pub fn is_usable_bundle_path(path: &str) -> bool {
     !path.is_empty()
         && path.starts_with('/')
         && !path.contains('\0')
@@ -513,23 +531,27 @@ fn check_realm(realm: &str, registry: &str, insecure: bool) -> Result<(), Status
     Ok(())
 }
 
+/// Lowercase hex SHA-256 of `bytes`.
+pub fn sha256_hex(bytes: &[u8]) -> String {
+    use sha2::Digest as _;
+    sha2::Sha256::digest(bytes)
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect()
+}
+
 /// Verifies raw bytes against a `sha256:…` digest before anything parses them.
 ///
 /// Without this, pinning an image by digest buys nothing: the layers are
 /// content-addressed and checked on arrival, but the manifest that names them
 /// and the config that describes the image are taken on trust.
 fn verify_digest(what: &str, bytes: &[u8], expected: &str) -> Result<(), Status> {
-    use sha2::Digest as _;
-
     let Some(hex) = expected.strip_prefix("sha256:") else {
         return Err(Status::unimplemented(format!(
             "{what} is addressed by {expected}, which burrow cannot verify"
         )));
     };
-    let actual: String = sha2::Sha256::digest(bytes)
-        .iter()
-        .map(|b| format!("{b:02x}"))
-        .collect();
+    let actual = sha256_hex(bytes);
     if !actual.eq_ignore_ascii_case(hex) {
         return Err(Status::data_loss(format!(
             "{what} does not match its digest: asked for {expected}, received sha256:{actual}"
@@ -629,6 +651,12 @@ pub struct PulledImage {
     /// Layer blobs in application order.
     pub layers: Vec<PathBuf>,
     pub environment: ImageEnvironment,
+    /// The platform manifest's digest.
+    pub digest: String,
+    /// Layer digests in application order.
+    pub layer_digests: Vec<String>,
+    /// The manifest's annotations, where a Sandbox Kit carries its descriptor.
+    pub annotations: HashMap<String, String>,
 }
 
 /// Fetches an image's layers and config, storing layers in the blob store.
@@ -654,7 +682,7 @@ pub async fn pull(
         "resolving {}/{}:{}",
         reference.registry, reference.repository, reference.reference
     ));
-    let manifest = resolve_manifest(&mut registry, reference).await?;
+    let (manifest, digest) = resolve_manifest(&mut registry, reference).await?;
 
     // The config is small and describes how the image expects to run.
     let config_bytes = registry
@@ -668,6 +696,7 @@ pub async fn pull(
         .map_err(|err| Status::internal(format!("image config: {err}")))?;
 
     let mut layers = Vec::new();
+    let mut layer_digests = Vec::new();
     for (index, layer) in manifest.layers.iter().enumerate() {
         if !is_supported_layer(&layer.media_type) {
             return Err(Status::unimplemented(format!(
@@ -702,6 +731,7 @@ pub async fn pull(
             .await?;
         }
         layers.push(store.path(&digest));
+        layer_digests.push(layer.digest.clone());
     }
 
     Ok(PulledImage {
@@ -709,15 +739,23 @@ pub async fn pull(
         environment: ImageEnvironment {
             env: envelope.config.env,
             working_dir: envelope.config.working_dir,
+            entrypoint: envelope.config.entrypoint,
+            cmd: envelope.config.cmd,
+            user: envelope.config.user,
+            kit: None,
         },
+        digest,
+        layer_digests,
+        annotations: manifest.annotations,
     })
 }
 
-/// Follows an index to the manifest for this node's platform.
+/// Follows an index to the manifest for this node's platform, returning it
+/// with its digest.
 async fn resolve_manifest(
     registry: &mut Registry,
     reference: &Reference,
-) -> Result<Manifest, Status> {
+) -> Result<(Manifest, String), Status> {
     let response = registry
         .get(
             &reference.manifest_url(&registry.insecure.clone()),
@@ -747,7 +785,8 @@ async fn resolve_manifest(
     // A manifest and an index are told apart by shape rather than by the
     // content-type header, which registries are inconsistent about.
     if let Ok(manifest) = serde_json::from_slice::<Manifest>(&body) {
-        return Ok(manifest);
+        let digest = claimed.unwrap_or_else(|| format!("sha256:{}", sha256_hex(&body)));
+        return Ok((manifest, digest));
     }
     let index: Index = serde_json::from_slice(&body)
         .map_err(|err| Status::internal(format!("manifest is neither image nor index: {err}")))?;
@@ -794,8 +833,9 @@ async fn resolve_manifest(
     // This one is addressed by digest, so there is no excuse for not checking:
     // the index just told us exactly what these bytes must hash to.
     verify_digest("platform manifest", &body, &entry.digest)?;
-    serde_json::from_slice(&body)
-        .map_err(|err| Status::internal(format!("platform manifest: {err}")))
+    let manifest = serde_json::from_slice(&body)
+        .map_err(|err| Status::internal(format!("platform manifest: {err}")))?;
+    Ok((manifest, entry.digest.clone()))
 }
 
 fn is_supported_layer(media_type: &str) -> bool {
@@ -996,6 +1036,10 @@ fn apply_entries<R: std::io::Read>(
     mut archive: tar::Archive<R>,
     dest: &Path,
 ) -> std::io::Result<()> {
+    // Ownership is part of an image's contract: a workload that runs as a
+    // non-root user needs its home to be that user's, and the node extracts
+    // as root so it can say so.
+    archive.set_preserve_ownerships(true);
     let mut seen = 0usize;
     for entry in archive.entries()? {
         seen += 1;
@@ -1231,6 +1275,7 @@ mod tests {
                 "BROKEN".into(),
             ],
             working_dir: "/app".into(),
+            ..Default::default()
         };
         let map = env.as_map();
         assert_eq!(map["PATH"], "/usr/bin");
@@ -1249,17 +1294,18 @@ mod tests {
                 "NODE_EXTRA_CA_CERTS=/opt/node/extra.pem".into(),
             ],
             working_dir: String::new(),
+            ..Default::default()
         };
         let bundles = env.trust_bundles();
         assert_eq!(bundles.len(), 2);
         assert_eq!(bundles[0].path, "/cacert.pem");
         assert!(
-            !bundles[0].create_if_missing,
+            !bundles[0].is_created_if_missing,
             "a full bundle that is absent is not invented"
         );
         assert_eq!(bundles[1].path, "/opt/node/extra.pem");
         assert!(
-            bundles[1].create_if_missing,
+            bundles[1].is_created_if_missing,
             "no extra ca file yet simply means no extra cas yet"
         );
     }
@@ -1269,20 +1315,21 @@ mod tests {
         let env = ImageEnvironment {
             env: vec!["PATH=/usr/bin".into()],
             working_dir: String::new(),
+            ..Default::default()
         };
         assert!(env.trust_bundles().is_empty());
     }
 
     #[test]
     fn a_bundle_path_an_image_chose_is_held_to_the_untrusted_path_rules() {
-        assert!(usable_bundle_path("/cacert.pem"));
-        assert!(!usable_bundle_path(""));
-        assert!(!usable_bundle_path("cacert.pem"));
-        assert!(!usable_bundle_path("../../etc/shadow"));
-        assert!(!usable_bundle_path(
+        assert!(is_usable_bundle_path("/cacert.pem"));
+        assert!(!is_usable_bundle_path(""));
+        assert!(!is_usable_bundle_path("cacert.pem"));
+        assert!(!is_usable_bundle_path("../../etc/shadow"));
+        assert!(!is_usable_bundle_path(
             "/etc/ssl/../../root/.ssh/authorized_keys"
         ));
-        assert!(!usable_bundle_path("/etc/ssl/\0certs"));
+        assert!(!is_usable_bundle_path("/etc/ssl/\0certs"));
 
         let env = ImageEnvironment {
             env: vec![
@@ -1290,6 +1337,7 @@ mod tests {
                 "REQUESTS_CA_BUNDLE=/etc/../root/ca.pem".into(),
             ],
             working_dir: String::new(),
+            ..Default::default()
         };
         assert!(env.trust_bundles().is_empty());
     }
@@ -1302,6 +1350,7 @@ mod tests {
                 "SSL_CERT_FILE=/cacert.pem".into(),
             ],
             working_dir: String::new(),
+            ..Default::default()
         };
         assert_eq!(env.trust_bundles().len(), 1);
     }
@@ -1553,11 +1602,20 @@ mod tests {
             entries.len() * 31 + entries.first().map_or(0, |e| e.0.len())
         ));
         let file = std::fs::File::create(&path).unwrap();
+        // Extraction preserves ownership, so entries name an owner the test
+        // process may chown to: its own.
+        let meta = file.metadata().unwrap();
+        let (owner, group) = (
+            std::os::unix::fs::MetadataExt::uid(&meta),
+            std::os::unix::fs::MetadataExt::gid(&meta),
+        );
         let mut builder = tar::Builder::new(file);
         for (name, body) in entries {
             let mut header = tar::Header::new_gnu();
             header.set_size(body.len() as u64);
             header.set_mode(0o644);
+            header.set_uid(owner.into());
+            header.set_gid(group.into());
             header.set_cksum();
             builder.append_data(&mut header, name, *body).unwrap();
         }

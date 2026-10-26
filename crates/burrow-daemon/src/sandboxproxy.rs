@@ -72,7 +72,7 @@ impl SandboxProxy {
                 "malformed prelude",
             ));
         };
-        if !token_matches(self.cluster_token.as_deref(), request.token) {
+        if !is_token_match(self.cluster_token.as_deref(), request.token) {
             // Deliberately terse: an unauthenticated peer learns nothing about
             // whether the sandbox exists.
             tracing::warn!(%from, "forwarded connection presented the wrong token");
@@ -94,7 +94,7 @@ impl SandboxProxy {
         // would be enough to reach every TCP service inside a sandbox, not
         // only the ones it published.
         let ports = self.sandboxes.list_ports(request.sandbox_id).await;
-        if !crate::edge::port_is_published(&ports, request.port) {
+        if !crate::edge::is_port_published(&ports, request.port) {
             tracing::warn!(
                 sandbox = request.sandbox_id,
                 port = request.port,
@@ -125,7 +125,7 @@ impl SandboxProxy {
 }
 
 /// Whether a presented token satisfies the configured one. `None` accepts any.
-fn token_matches(expected: Option<&str>, presented: &str) -> bool {
+fn is_token_match(expected: Option<&str>, presented: &str) -> bool {
     match expected {
         None => true,
         Some(expected) => {
@@ -170,10 +170,10 @@ mod tests {
 
     #[test]
     fn the_token_is_checked_when_one_is_configured() {
-        assert!(token_matches(Some("secret"), "secret"));
-        assert!(!token_matches(Some("secret"), "wrong"));
-        assert!(!token_matches(Some("secret"), ""));
+        assert!(is_token_match(Some("secret"), "secret"));
+        assert!(!is_token_match(Some("secret"), "wrong"));
+        assert!(!is_token_match(Some("secret"), ""));
         // Unauthenticated nodes accept anything, like the rest of the node API.
-        assert!(token_matches(None, "anything"));
+        assert!(is_token_match(None, "anything"));
     }
 }

@@ -1,135 +1,106 @@
 # Burrow
 
-Burrow runs untrusted code in Firecracker microVMs on hardware you own. A
-sandbox is a long-lived Linux machine with its own kernel, its own disk, and a
-network that denies everything until you allow something. You drive it from a
-gRPC API, a CLI, or the TypeScript and Python SDKs.
+Firecracker microVM sandboxes for untrusted code, run on your own hardware.
 
-## Why not just a container
+[![License: AGPL-3.0](https://img.shields.io/badge/license-AGPL--3.0-blue.svg)](LICENSE)
+[![Releases](https://img.shields.io/github/v/release/pixec/burrow?display_name=tag)](https://github.com/pixec/burrow/releases)
+[![TypeScript SDK](https://img.shields.io/npm/v/%40pixec%2Fburrow?label=npm)](https://www.npmjs.com/package/@pixec/burrow)
+[![Python SDK](https://img.shields.io/pypi/v/pixec-burrow?label=pypi)](https://pypi.org/project/pixec-burrow/)
 
-A container shares the host kernel with the code it is confining. For running
-AI-generated or user-submitted code, that is one bug away from being no
-boundary at all. A Burrow sandbox gets its own kernel behind Firecracker's very
-small device model, and optionally the Firecracker jailer on top of that.
+A sandbox is a Linux VM with its own kernel and disk and a network that denies
+everything until a rule allows it. Sandboxes are created from OCI images,
+restore from warm snapshots in about 30 ms, suspend and resume with their
+memory intact, and are driven from a gRPC API, a CLI, or the TypeScript and
+Python SDKs.
 
-The cost is a boot: 1.2s to 2.2s cold. Most creates do not pay it, because
-nodes keep warm snapshots of each template and restore from one in 40ms to
-50ms. See [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) for how the pieces fit
-together.
+```ts
+import { Sandbox } from "@pixec/burrow";
 
-## What you get on top of the VM
-
-Sandboxes are meant to stick around. Pause one to disk and resume it later with
-its processes where they were, snapshot a prepared workspace and fork it into
-as many independent copies as you need, and list every VM a sandbox has ever
-run as a session. Each sandbox reports the CPU and bytes it actually consumed.
-See [docs/PERSISTENCE.md](docs/PERSISTENCE.md).
-
-Egress starts at nothing. You grant it by domain or by CIDR; allowed names are
-pinned to the addresses that sandbox was told they resolve to, DNS is filtered
-in every mode, and refusals are audited. Turn on TLS inspection for a sandbox
-and the proxy can also inject credentials on the host side, so the workload
-calls an authenticated API without ever holding the key. See
-[docs/FIREWALL.md](docs/FIREWALL.md).
-
-Templates come from OCI images. `burrow pull python:3.12-slim` converts a
-registry image into a bootable rootfs, or you can build a template from cached
-steps ([docs/TEMPLATES.md](docs/TEMPLATES.md)). Sandboxes carry key-value tags you
-can filter on ([docs/TAGS.md](docs/TAGS.md)).
-
-It is multi-node from the start: an orchestrator places sandboxes across KVM
-nodes joined by a WireGuard mesh, and private inter-sandbox networks work
-across hosts.
-
-## Releases
-
-Tagged releases publish static musl binaries for `x86_64` and `aarch64`:
-`burrowd`, `burrow-orchestrator`, `burrow` and `burrow-agent`, each named
-`<binary>-<arch>-<version>`, with a `SHA256SUMS` file per architecture. The
-same tag publishes multi-arch container images:
-
-```
-ghcr.io/pixec/burrow-orchestrator:<version>
-ghcr.io/pixec/burrow-node:<version>
+await using sandbox = await Sandbox.create({
+  template: "python-3.12-slim",
+  network: { mode: "allowlist", allowDomains: ["pypi.org", "*.pythonhosted.org"] },
+});
+const result = await sandbox.runCommand("python3", ["-c", "print(1 + 1)"]);
+console.log(result.stdout()); // "2\n"
 ```
 
-To run those images on Kubernetes, see [deploy/k8s](deploy/k8s/README.md).
+## Features
 
-## Quickstart
+<table>
+<tr>
+<td width="50%" valign="top">
 
-Burrow needs KVM. On Linux you can run `burrowd` on the host directly. On macOS
-the dev harness runs inside a nested-virtualization VM, which needs an M3 or
-newer Mac on macOS 15 or later.
+**Persistence.** Suspend a sandbox to disk and resume it later with its
+processes where they were. Snapshot a prepared workspace and fork it into
+independent copies. Every VM a sandbox has run is recorded as a session.
+[Read PERSISTENCE.md](docs/PERSISTENCE.md)
 
-Set up the VM and the cross-compiler once:
+</td>
+<td width="50%" valign="top">
 
-```sh
-colima start burrow --vm-type vz --nested-virtualization --cpu 4 --memory 8 --disk 40
-brew install zig
-cargo install cargo-zigbuild
-```
+**Egress policy.** No egress by default. Grant it by domain or CIDR; allowed
+names are pinned to the addresses the sandbox was told they resolve to, DNS is
+filtered in every mode, and every refusal is audited and queryable.
+[Read FIREWALL.md](docs/FIREWALL.md)
 
-Build the Linux binaries and bring up the stack. `cargo xtask build` targets
-`aarch64-unknown-linux-musl` by default, which is what the harness runs; pass
-`--target` for anything else. The harness runs an orchestrator and two nodes,
-so cross-node behaviour is exercised rather than assumed.
+</td>
+</tr>
+<tr>
+<td valign="top">
 
-```sh
-cargo xtask build
-docker --context colima-burrow compose -f deploy/dev/compose.yaml up -d --build
-```
+**Credential brokering.** With TLS inspection on, the proxy injects an API key
+on the host side, by domain, method and path, so the workload calls an
+authenticated API without holding the secret.
+[Read FIREWALL.md](docs/FIREWALL.md#credentials-brokering)
 
-The harness sets the client token to `dev-token` and gives the orchestrator and
-both nodes `dev-node-token` for the node-facing hop. The orchestrator listens on
-`127.0.0.1:7070`, which is where the CLI looks by default:
+</td>
+<td valign="top">
 
-```sh
-export BURROW_API_KEY=dev-token
-alias burrow='cargo run -q -p burrow-cli --'
-```
+**Templates from OCI images.** `burrow pull python:3.12-slim` converts a
+registry image into a bootable rootfs. An image that is a [Docker Sandbox
+Kit](docs/TEMPLATES.md#sandbox-kits) carries a descriptor saying what to
+provision: hooks, credentials, volumes and network policy.
+[Read TEMPLATES.md](docs/TEMPLATES.md)
 
-The two are separate on purpose: `--api-key` is what clients present to the
-orchestrator, `--node-token` what the orchestrator and its nodes present to each
-other. See [docs/CONCEPTS.md](docs/CONCEPTS.md#api-callers-are-authenticated).
+</td>
+</tr>
+<tr>
+<td valign="top">
 
-Give the node a kernel. An OCI image carries a userland and no kernel, so the
-node supplies one for every template it builds. `--guest-kernel` names it, and
-it defaults to `vmlinux` under the data directory:
+**Volumes.** Block devices on a node that outlive the sandboxes mounting them:
+one writer or many readers, attached at create, kept through a rebuild of the
+root disk. [Read VOLUMES.md](docs/VOLUMES.md)
 
-```sh
-docker --context colima-burrow exec burrow-node-1 sh -c '
-  curl -fsSL -o /var/lib/burrow/vmlinux \
-    https://s3.amazonaws.com/spec.ccfc.min/firecracker-ci/v1.13/aarch64/vmlinux-6.1.141'
-```
+</td>
+<td valign="top">
 
-Then import an image as a template, create a sandbox from it, and run
-something. Templates come from OCI images; burrow ships none of its own, and a
-create must name one:
+**Multiple nodes.** An orchestrator places sandboxes across KVM nodes joined
+by a WireGuard mesh. Private inter-sandbox networks work across hosts, and
+published ports are reachable through a per-node edge with wildcard DNS.
+[Read EDGE.md](docs/EDGE.md)
 
-```sh
-burrow pull python:3.12-slim
-burrow create --template python-3.12-slim
-burrow exec <id> -- python3 -c 'print(1 + 1)'
-```
-
-That sandbox has no egress. To give it some:
-
-```sh
-burrow create --template python-3.12-slim --net allowlist --allow-domain pypi.org --allow-domain '*.pythonhosted.org'
-```
+</td>
+</tr>
+</table>
 
 ## Documentation
 
 | Page | Covers |
 | --- | --- |
+| [docs/GETTING-STARTED.md](docs/GETTING-STARTED.md) | Dev harness setup, first sandbox, CLI and SDK examples, releases |
 | [docs/CONCEPTS.md](docs/CONCEPTS.md) | What a sandbox is, its lifecycle, and the security model |
 | [docs/CLI.md](docs/CLI.md) | Every `burrow` command, its flags, and an example |
 | [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) | Request path, guest, networking, snapshots, placement, and the dev harness |
-| [docs/TEMPLATES.md](docs/TEMPLATES.md) | OCI imports, builds, warm snapshots, and distribution between nodes |
+| [docs/TEMPLATES.md](docs/TEMPLATES.md) | OCI imports, Sandbox Kits, builds, warm snapshots, and distribution between nodes |
 | [docs/FIREWALL.md](docs/FIREWALL.md) | Egress modes, denied ranges, live policy updates, and request rules: brokering, matchers and forwarding |
 | [docs/EDGE.md](docs/EDGE.md) | Reaching a sandbox from outside: choosing between the edge, a published port and a share, then HTTPS, wildcard DNS, a Caddyfile and custom domains |
 | [docs/SHARE.md](docs/SHARE.md) | Sharing a sandbox through a tailcat address: a WireGuard tunnel over a DERP relay, no port on the node, and the client's own IP into the guest |
 | [docs/PERSISTENCE.md](docs/PERSISTENCE.md) | Suspend and resume, sessions, fork, and snapshot retention |
 | [docs/VOLUMES.md](docs/VOLUMES.md) | Storage that outlives a sandbox, and the rules that follow from block devices |
 | [docs/TAGS.md](docs/TAGS.md) | Tagging sandboxes and filtering by tag |
-| [docs/COMPARISON.md](docs/COMPARISON.md) | How Burrow compares to Vercel Sandbox and E2B |
+| [docs/COMPARISON.md](docs/COMPARISON.md) | How Burrow compares to Vercel Sandbox, E2B |
+
+## License
+
+Burrow is licensed under the GNU Affero General Public License, version 3.
+See [LICENSE](LICENSE) for the full text.

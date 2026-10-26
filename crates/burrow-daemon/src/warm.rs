@@ -349,7 +349,7 @@ pub async fn build_warm_snapshot(
     let mut spec = MicroVmSpec::new(vm_id.clone(), &run_dir);
     // Taken under the transport it will be restored under: a snapshot does not
     // cross between PCI and MMIO.
-    spec.enable_pci = true;
+    spec.is_pci_enabled = true;
     spec.firecracker_bin = config.firecracker_bin.clone();
     spec.kernel = "vmlinux".into();
     // Baked into the snapshot: a restore takes its machine configuration from
@@ -360,7 +360,7 @@ pub async fn build_warm_snapshot(
         DriveSpec::root_ro("rootfs.ext4"),
         DriveSpec::scratch_rw("scratch.ext4"),
     ];
-    spec.vsock = true;
+    spec.is_vsock_enabled = true;
     spec.net = Some(NetSpec {
         tap: tap.clone(),
         guest_mac: Some(lease.guest_mac()),
@@ -440,7 +440,7 @@ pub async fn build_warm_snapshot(
 fn apply_confinement(spec: &mut MicroVmSpec, config: &NodeConfig, shape: Shape) {
     spec.jail = config.jail.clone();
     spec.cgroup_root = config.cgroup_root.clone();
-    spec.require_limits = config.require_resource_limits;
+    spec.is_limits_required = config.is_resource_limits_required;
     spec.limits = burrow_vmm::Limits {
         cpus: shape.vcpus,
         // The same headroom over guest memory a sandbox gets, and for the same
@@ -562,14 +562,14 @@ async fn profile_restore(
     // derived from the id, and this VM restores the files that are inside the
     // one the build already filled.
     let mut spec = MicroVmSpec::new(vm_id.to_string(), dir);
-    spec.enable_pci = true;
+    spec.is_pci_enabled = true;
     spec.firecracker_bin = config.firecracker_bin.clone();
     spec.kernel = "vmlinux".into();
     spec.drives = vec![
         DriveSpec::root_ro("rootfs.ext4"),
         DriveSpec::scratch_rw("scratch.ext4"),
     ];
-    spec.vsock = true;
+    spec.is_vsock_enabled = true;
     spec.net = Some(NetSpec {
         tap: tap.clone(),
         guest_mac: Some(lease.guest_mac()),

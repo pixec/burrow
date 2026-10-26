@@ -53,11 +53,11 @@ pub struct NodeConfig {
     pub agent_timeout: std::time::Duration,
     /// cgroup2 mount point; `None` disables resource limits entirely.
     pub cgroup_root: Option<PathBuf>,
-    pub require_resource_limits: bool,
+    pub is_resource_limits_required: bool,
     /// Serve restored guest memory on demand rather than paging the whole
     /// snapshot in. What a sandbox never touches then costs nothing, and
     /// sandboxes restored from one template share the backing page cache.
-    pub lazy_memory: bool,
+    pub is_memory_lazy: bool,
     /// Confines each VMM to a chroot under an unprivileged uid. `None` runs
     /// firecracker as root with the whole host visible.
     pub jail: Option<burrow_vmm::Jail>,
@@ -176,6 +176,7 @@ const STARTED_RESUME: &str = "resume";
 const ENDED_SUSPENDED: &str = "suspended";
 const ENDED_DELETED: &str = "deleted";
 const ENDED_FAILED: &str = "failed";
+const ENDED_STOPPED: &str = "stopped";
 /// A session that was still open when the node died. Nothing observed when its
 /// VM stopped, so its end time stays unset rather than being invented.
 const ENDED_UNKNOWN: &str = "unknown";
@@ -267,7 +268,7 @@ struct Provisioning<'a> {
     tap: Option<String>,
     /// `None` until the VM boots or restores.
     vm: Option<MicroVm>,
-    kept: bool,
+    is_kept: bool,
 }
 
 impl<'a> Provisioning<'a> {
@@ -279,7 +280,7 @@ impl<'a> Provisioning<'a> {
             workdir: workdir.to_path_buf(),
             tap: None,
             vm: None,
-            kept: false,
+            is_kept: false,
         }
     }
 
@@ -304,20 +305,20 @@ impl<'a> Provisioning<'a> {
         self.manager.release_lease(&self.id).await;
         self.manager.volumes.release_all(&self.id);
         let _ = tokio::fs::remove_dir_all(&self.workdir).await;
-        self.kept = true;
+        self.is_kept = true;
         err
     }
 
     /// The create succeeded: the sandbox owns all of this now.
     fn keep(mut self) -> Option<MicroVm> {
-        self.kept = true;
+        self.is_kept = true;
         self.vm.take()
     }
 }
 
 impl Drop for Provisioning<'_> {
     fn drop(&mut self) {
-        if self.kept {
+        if self.is_kept {
             return;
         }
         // Reached only if a path added later returns without going through
@@ -461,8 +462,9 @@ pub struct RunningSandbox {
     /// only as a snapshot on disk.
     vm: Mutex<Option<MicroVm>>,
     /// Kept so a suspended sandbox can be restored with byte-identical
-    /// resource paths, which Firecracker requires.
-    spec: MicroVmSpec,
+    /// resource paths, which Firecracker requires. Replaced by a boot from a
+    /// stop, which describes the drives afresh.
+    spec: std::sync::Mutex<MicroVmSpec>,
     /// A live channel to this sandbox's agent.
     ///
     /// Reused across calls: a vsock connect plus an HTTP/2 handshake into a
@@ -517,7 +519,7 @@ impl RunningSandbox {
         record.state = self.state.load(std::sync::atomic::Ordering::Relaxed);
         // Read rather than stored, for the same reason `state` is: it belongs
         // to the VM running now, and a create returns while it is still true.
-        record.agent_unconfirmed = *self.handshake.borrow() != Handshake::Done;
+        record.is_agent_unconfirmed = *self.handshake.borrow() != Handshake::Done;
         let usage = *self.usage.lock().unwrap();
         record.cpu_usage_usec = usage.cpu_usec;
         record.rx_bytes = usage.rx_bytes;
@@ -572,7 +574,7 @@ impl RunningSandbox {
 
     /// vCPUs this sandbox is promised, whether or not its VMM is running.
     pub fn vcpus(&self) -> u32 {
-        self.spec.vcpus
+        self.spec.lock().unwrap().vcpus
     }
 
     /// Marks the sandbox as used, deferring idle suspension.
@@ -857,7 +859,7 @@ impl RunningSandbox {
             return Err(Status::failed_precondition("sandbox is already running"));
         }
 
-        let mut spec = self.spec.clone();
+        let mut spec = self.spec.lock().unwrap().clone();
         spec.memory_chain = self.memory_chain.lock().await.clone();
         let vm = MicroVm::restore(spec, true)
             .await
@@ -885,6 +887,87 @@ impl RunningSandbox {
         *slot = Some(vm);
         self.suspended_at
             .store(0, std::sync::atomic::Ordering::Relaxed);
+        self.set_state(common::SandboxState::Running);
+        Ok(())
+    }
+
+    /// Kills the VM without snapshotting it. The sandbox keeps its address,
+    /// tap and disks; what it loses is its memory, so a later boot starts the
+    /// image's init over the same writable disk rather than resuming.
+    #[tracing::instrument(skip_all, fields(sandbox = %self.id()))]
+    async fn shutdown(&self) -> Result<(), Status> {
+        self.forget_agent().await;
+        let mut slot = self.vm.lock().await;
+        if let Some(vm) = slot.take() {
+            self.absorb_cpu(&vm);
+            if let Err(err) = vm.kill().await {
+                tracing::error!(sandbox = self.id(), %err, "vmm did not stop");
+            }
+        } else if self.state.load(std::sync::atomic::Ordering::Relaxed)
+            != common::SandboxState::Suspended as i32
+        {
+            return Err(Status::failed_precondition("sandbox is already stopped"));
+        }
+        // A suspended sandbox's memory is on disk; stopping it discards that
+        // too, since a boot must not come back to a snapshot a later resume
+        // would restore around.
+        self.memory_chain.lock().await.clear();
+        let _ = tokio::fs::remove_file(self.workdir.join(burrow_vmm::SNAPSHOT_FILE)).await;
+        let _ = tokio::fs::remove_file(self.workdir.join(burrow_vmm::SNAPSHOT_MEM_FILE)).await;
+        Self::remove_stale_diffs(&self.workdir).await;
+        self.suspended_at
+            .store(0, std::sync::atomic::Ordering::Relaxed);
+        self.set_state(common::SandboxState::Stopped);
+        Ok(())
+    }
+
+    /// Cold-boots a stopped sandbox on its existing disks and handshakes.
+    #[tracing::instrument(skip_all, fields(sandbox = %self.id()))]
+    async fn boot(
+        &self,
+        spec: MicroVmSpec,
+        request: burrow_proto::agent::v1::HandshakeRequest,
+        agent_timeout: std::time::Duration,
+    ) -> Result<(), Status> {
+        self.forget_agent().await;
+        let mut slot = self.vm.lock().await;
+        if slot.is_some() {
+            return Err(Status::failed_precondition("sandbox is already running"));
+        }
+        if self.state.load(std::sync::atomic::Ordering::Relaxed)
+            != common::SandboxState::Stopped as i32
+        {
+            return Err(Status::failed_precondition(
+                "sandbox is not stopped; resume a suspended one instead",
+            ));
+        }
+        let vm = MicroVm::boot(spec.clone())
+            .await
+            .map_err(|err| Status::internal(format!("boot failed: {err}")))?;
+        let (mut agent, _) =
+            match agentconn::connect_when_ready(vm.vsock_uds_path(), agent_timeout).await {
+                Ok(ready) => ready,
+                Err(err) => {
+                    let console = vm.console_tail(30).await;
+                    let _ = vm.kill().await;
+                    return Err(Status::internal(format!(
+                        "agent never became reachable: {err}\nconsole:\n{console}"
+                    )));
+                }
+            };
+        if let Err(err) = agent.handshake(request).await {
+            let _ = vm.kill().await;
+            return Err(err);
+        }
+        self.handshake.send_replace(Handshake::Done);
+        self.touch();
+        tracing::info!(
+            sandbox = self.id(),
+            boot_ms = vm.boot_latency().as_millis() as u64,
+            "sandbox booted"
+        );
+        *slot = Some(vm);
+        *self.spec.lock().unwrap() = spec;
         self.set_state(common::SandboxState::Running);
         Ok(())
     }
@@ -1029,11 +1112,15 @@ impl RunningSandbox {
     async fn stage_snapshot(&self, dest: &Path) -> Result<crate::snapshot::Staged, Status> {
         let chain = self.stage_fork(dest).await?;
         let resources = self.resources();
+        let (vcpus, mem_mib) = {
+            let spec = self.spec.lock().unwrap();
+            (spec.vcpus, spec.mem_mib)
+        };
         Ok(crate::snapshot::Staged {
             sandbox_id: self.id.clone(),
             template: self.template.clone(),
-            vcpus: self.spec.vcpus,
-            mem_mib: self.spec.mem_mib,
+            vcpus,
+            mem_mib,
             scratch_disk_mib: if resources.scratch_disk_mib == 0 {
                 DEFAULT_SCRATCH_MIB
             } else {
@@ -1087,6 +1174,10 @@ fn error_chain(err: &dyn std::error::Error) -> String {
 
 #[derive(Clone)]
 pub struct SandboxManager {
+    /// Seals the secrets a persisted record carries: brokered header values,
+    /// forward tokens and Kit credentials. The record in memory stays plain,
+    /// since the proxy injects from it.
+    vault: Arc<burrow_core::vault::Vault>,
     config: NodeConfig,
     sandboxes: Arc<Mutex<HashMap<String, Arc<RunningSandbox>>>>,
     /// Ids claimed by a create that has not finished provisioning. Held so a
@@ -1291,8 +1382,10 @@ impl SandboxManager {
         denied: Arc<burrow_proxy::DeniedAddresses>,
         directory: Arc<burrow_proxy::directory::Directory>,
         store: Arc<burrow_store::Store>,
+        vault: burrow_core::vault::Vault,
     ) -> Self {
         Self {
+            vault: Arc::new(vault),
             inspection_ca: Arc::new(std::sync::Mutex::new(None)),
             warm_shapes: Arc::new(std::sync::Mutex::new(HashMap::new())),
             firewall: Arc::new(tokio::sync::Mutex::new(())),
@@ -1341,7 +1434,10 @@ impl SandboxManager {
     /// Only the writable ones: a read-only mount is left in `shared` and never
     /// chowned at all.
     async fn remember_volume_owners(&self, mounts: &[common::VolumeMount]) {
-        for mount in mounts.iter().filter(|mount| !mount.read_only) {
+        for mount in mounts
+            .iter()
+            .filter(|mount| !mount.is_tmpfs && !mount.is_read_only)
+        {
             self.volumes.remember_owner(&mount.volume).await;
         }
     }
@@ -1488,10 +1584,15 @@ impl SandboxManager {
             .get(sandbox.id())
             .cloned()
             .unwrap_or_default();
+        let mut sealed = record.clone();
+        if let Err(err) = seal_secrets(&self.vault, &mut sealed) {
+            tracing::error!(sandbox = record.id, %err, "could not seal the record's secrets; not persisting it");
+            return;
+        }
         let row = burrow_store::SandboxRow {
             id: record.id.clone(),
             template: record.template.clone(),
-            record: prost::Message::encode_to_vec(&record),
+            record: prost::Message::encode_to_vec(&sealed),
             state: record.state,
             lease_block: sandbox.lease.block,
             tap: sandbox.tap.clone(),
@@ -1500,7 +1601,7 @@ impl SandboxManager {
                 .map(|p| burrow_store::PortRow {
                     host_port: p.host_port,
                     guest_port: p.guest_port,
-                    udp: p.protocol == firewall::Protocol::Udp,
+                    is_udp: p.protocol == firewall::Protocol::Udp,
                 })
                 .collect(),
             share: self.shares.spec(sandbox.id()).await,
@@ -1642,8 +1743,13 @@ impl SandboxManager {
             let snapshot = workdir.join(burrow_vmm::SNAPSHOT_FILE);
             let resumable = row.state == common::SandboxState::Suspended as i32
                 && tokio::fs::try_exists(&snapshot).await.unwrap_or(false);
+            // A stopped sandbox is its disks: nothing of the VM to find.
+            let stopped = row.state == common::SandboxState::Stopped as i32
+                && tokio::fs::try_exists(workdir.join(SCRATCH_IMAGE))
+                    .await
+                    .unwrap_or(false);
 
-            if !resumable {
+            if !resumable && !stopped {
                 tracing::warn!(
                     sandbox = row.id,
                     "no usable snapshot; discarding sandbox and releasing its resources"
@@ -1687,7 +1793,13 @@ impl SandboxManager {
                 continue;
             }
 
-            let record = match <common::Sandbox as prost::Message>::decode(&row.record[..]) {
+            let record = match <common::Sandbox as prost::Message>::decode(&row.record[..])
+                .map_err(|err| err.to_string())
+                .and_then(|mut record| {
+                    open_secrets(&self.vault, &mut record)
+                        .map(|()| record)
+                        .map_err(|err| err.to_string())
+                }) {
                 Ok(record) => record,
                 Err(err) => {
                     tracing::error!(sandbox = row.id, %err, "unreadable stored record; skipping");
@@ -1718,9 +1830,9 @@ impl SandboxManager {
                 id: record.id.clone(),
                 template: record.template.clone(),
                 base_record: std::sync::Mutex::new(record),
-                state: std::sync::atomic::AtomicI32::new(common::SandboxState::Suspended as i32),
+                state: std::sync::atomic::AtomicI32::new(row.state),
                 vm: Mutex::new(None),
-                spec,
+                spec: std::sync::Mutex::new(spec),
                 last_activity: std::sync::atomic::AtomicI64::new(burrow_core::unix_now()),
                 // A row written before this column existed says 0, which read
                 // literally is 1970, putting every recovered sandbox instantly
@@ -1758,7 +1870,7 @@ impl SandboxManager {
                         .map(|p| firewall::PortMap {
                             host_port: p.host_port,
                             guest_port: p.guest_port,
-                            protocol: if p.udp {
+                            protocol: if p.is_udp {
                                 firewall::Protocol::Udp
                             } else {
                                 firewall::Protocol::Tcp
@@ -1792,6 +1904,17 @@ impl SandboxManager {
     /// store existed. Each holds a scratch disk and possibly a memory
     /// snapshot, so left alone they quietly consume the node's disk.
     async fn collect_orphan_workdirs(&self) {
+        // An import stages under build/ and removes its directory when it is
+        // done; one that died mid-unpack, out of disk say, left gigabytes
+        // nothing will read.
+        let build = self.config.data_dir.join("build");
+        if let Ok(mut entries) = tokio::fs::read_dir(&build).await {
+            while let Ok(Some(entry)) = entries.next_entry().await {
+                if entry.file_name().to_string_lossy().starts_with("import-") {
+                    let _ = tokio::fs::remove_dir_all(entry.path()).await;
+                }
+            }
+        }
         let known: std::collections::HashSet<String> =
             self.sandboxes.lock().await.keys().cloned().collect();
 
@@ -2226,6 +2349,7 @@ impl SandboxManager {
             .values()
             .map(|sandbox| {
                 let record = sandbox.record();
+                let network = record.policy.as_ref().and_then(|p| p.network.as_ref());
                 (
                     sandbox.lease.guest_ip,
                     burrow_proxy::SandboxPolicy {
@@ -2241,23 +2365,15 @@ impl SandboxManager {
                             }
                             firewall::Mode::None => burrow_proxy::policy::NetworkMode::None,
                         },
-                        allow_domains: record
-                            .policy
-                            .as_ref()
-                            .and_then(|p| p.network.as_ref())
-                            .map(|n| n.allow_domains.clone())
-                            .unwrap_or_default(),
-                        inspect_tls: record
-                            .policy
-                            .as_ref()
-                            .and_then(|p| p.network.as_ref())
-                            .is_some_and(|n| n.inspect_tls),
-                        deny_cidrs: record
-                            .policy
-                            .as_ref()
-                            .and_then(|p| p.network.as_ref())
-                            .map(|n| n.deny_cidrs.clone())
-                            .unwrap_or_default(),
+                        allow_domains: network.map(|n| n.allow_domains.clone()).unwrap_or_default(),
+                        is_tls_inspected: network.is_some_and(|n| n.is_tls_inspected),
+                        deny_cidrs: network.map(|n| n.deny_cidrs.clone()).unwrap_or_default(),
+                        deny_domains: network.map(|n| n.deny_domains.clone()).unwrap_or_default(),
+                        http_rules: std::sync::Arc::new(
+                            network
+                                .map(|n| n.http_rules.iter().map(proxy_http_rule).collect())
+                                .unwrap_or_default(),
+                        ),
                         // The stored record keeps the real values, redaction
                         // happening on the way out to callers, so the proxy
                         // goes on brokering across a restart and a recover.
@@ -2270,10 +2386,7 @@ impl SandboxManager {
                         // was written; it becomes a refusal rather than an
                         // allowance.
                         rules: std::sync::Arc::new(
-                            record
-                                .policy
-                                .as_ref()
-                                .and_then(|p| p.network.as_ref())
+                            network
                                 .map(|n| {
                                     n.rules
                                         .iter()
@@ -2343,7 +2456,7 @@ impl SandboxManager {
     /// Nothing in the guest is told: the policy is enforced entirely on the
     /// host, by the ruleset and the proxy that [`Self::sync_firewall`]
     /// re-renders here. The one thing that cannot be turned on this way is
-    /// `inspect_tls`, because the guest trusts burrow's CA only through the
+    /// `is_tls_inspected`, because the guest trusts burrow's CA only through the
     /// handshake that installed it; enabling inspection later would break every
     /// TLS connection the sandbox makes rather than inspecting it.
     ///
@@ -2361,7 +2474,7 @@ impl SandboxManager {
             let mut record = sandbox.base_record.lock().unwrap();
             let policy = record.policy.get_or_insert_with(Default::default);
             let previous = policy.network.take();
-            if network.inspect_tls && !previous.as_ref().is_some_and(|n| n.inspect_tls) {
+            if network.is_tls_inspected && !previous.as_ref().is_some_and(|n| n.is_tls_inspected) {
                 policy.network = previous;
                 return Err(Status::invalid_argument(
                     "inspect_tls can only be enabled at creation: the guest is given the \
@@ -2495,7 +2608,7 @@ impl SandboxManager {
         let wants = policy
             .network
             .as_ref()
-            .is_some_and(|network| network.inspect_tls);
+            .is_some_and(|network| network.is_tls_inspected);
         if !wants {
             return String::new();
         }
@@ -2855,7 +2968,7 @@ impl SandboxManager {
                     cpu_usage_usec: record.cpu_usage_usec,
                     rx_bytes: record.rx_bytes,
                     tx_bytes: record.tx_bytes,
-                    agent_unconfirmed: record.agent_unconfirmed,
+                    is_agent_unconfirmed: record.is_agent_unconfirmed,
                 }
             })
             .collect()
@@ -2933,19 +3046,19 @@ impl SandboxManager {
             pids_max: 0,
         };
         spec.cgroup_root = self.config.cgroup_root.clone();
-        spec.require_limits = self.config.require_resource_limits;
+        spec.is_limits_required = self.config.is_resource_limits_required;
         spec.jail = self.config.jail.clone();
         // Only consulted on restore; a cold boot has no memory file to serve.
-        spec.lazy_memory = self.config.lazy_memory;
+        spec.is_memory_lazy = self.config.is_memory_lazy;
         // Required for diff snapshots, and only useful for them. It costs a
         // little guest write performance, which is a good trade against
         // writing the whole of memory on every suspend.
-        spec.track_dirty_pages = true;
+        spec.is_dirty_pages_tracked = true;
         // Volumes are hotplugged onto sandboxes restored from a warm snapshot,
         // and hotplug needs PCI. Set for every VM rather than only those with
         // volumes, because a snapshot cannot be restored under a different
         // transport than it was taken with, and warm snapshots are shared.
-        spec.enable_pci = true;
+        spec.is_pci_enabled = true;
 
         spec.drives = vec![
             DriveSpec::root_ro(TEMPLATE_ROOTFS),
@@ -2953,15 +3066,15 @@ impl SandboxManager {
         ];
         // After the two fixed drives, so the guest devices are /dev/vdc
         // onwards and match what the handshake tells the agent to mount.
-        for (index, mount) in volumes.iter().enumerate() {
+        for (index, mount) in crate::volume::block_mounts(volumes) {
             spec.drives.push(DriveSpec {
                 id: format!("volume{index}"),
                 path: volume_image(index),
                 is_root: false,
-                read_only: mount.read_only,
+                is_read_only: mount.is_read_only,
             });
         }
-        spec.vsock = true;
+        spec.is_vsock_enabled = true;
         spec.net = Some(NetSpec {
             tap: tap_name.to_string(),
             guest_mac: Some(lease.guest_mac()),
@@ -3121,7 +3234,7 @@ impl SandboxManager {
         // Taken before any resource is, so a volume conflict fails the create
         // without a tap, an address or a directory to give back.
         crate::volume::validate_mounts(&policy.volumes)?;
-        for mount in &policy.volumes {
+        for (_, mount) in crate::volume::block_mounts(&policy.volumes) {
             if !tokio::fs::try_exists(self.volumes.image(&mount.volume))
                 .await
                 .unwrap_or(false)
@@ -3204,7 +3317,7 @@ impl SandboxManager {
             }
             // Hard-linked in after the template's own files, so a cold boot
             // that rebuilt the directory does not clear them again.
-            for (index, mount) in policy.volumes.iter().enumerate() {
+            for (index, mount) in crate::volume::block_mounts(&policy.volumes) {
                 let dest = workdir.join(crate::sandbox::volume_image(index));
                 let _ = tokio::fs::remove_file(&dest).await;
                 tokio::fs::hard_link(self.volumes.image(&mount.volume), &dest)
@@ -3231,8 +3344,8 @@ impl SandboxManager {
                     shared.insert(burrow_vmm::SNAPSHOT_MEM_FILE.to_string());
                     shared.insert(crate::warm::PREFETCH_PLAN.to_string());
                 }
-                for (index, mount) in policy.volumes.iter().enumerate() {
-                    if mount.read_only {
+                for (index, mount) in crate::volume::block_mounts(&policy.volumes) {
+                    if mount.is_read_only {
                         shared.insert(crate::sandbox::volume_image(index));
                     }
                 }
@@ -3313,12 +3426,12 @@ impl SandboxManager {
         // Attached before the handshake, which is what tells the guest to rescan
         // its bus and mount them: firecracker cannot notify the guest itself.
         if from_warm {
-            for (index, mount) in policy.volumes.iter().enumerate() {
+            for (index, mount) in crate::volume::block_mounts(&policy.volumes) {
                 let drive = burrow_vmm::DriveSpec {
                     id: format!("volume{index}"),
                     path: volume_image(index),
                     is_root: false,
-                    read_only: mount.read_only,
+                    is_read_only: mount.is_read_only,
                 };
                 if let Err(err) = guard.vm().attach_drive(&drive).await {
                     let message = format!("attaching volume {}: {err}", mount.volume);
@@ -3426,7 +3539,7 @@ impl SandboxManager {
             guest_ip: lease.guest_ip.to_string(),
             // Describes the node's reachability, which is the orchestrator's
             // to judge on a read. A node cannot report itself unreachable.
-            unreachable: false,
+            is_unreachable: false,
             // Filled in from the sandbox's own totals on every read; a record
             // built here has none yet.
             cpu_usage_usec: 0,
@@ -3434,7 +3547,11 @@ impl SandboxManager {
             tx_bytes: 0,
             // Filled in from the live handshake on every read; this is only its
             // starting value.
-            agent_unconfirmed: false,
+            is_agent_unconfirmed: false,
+            env: HashMap::new(),
+            kit: None,
+            kit_credentials: HashMap::new(),
+            kit_selection: String::new(),
         };
 
         // The one-line summary, unchanged in shape: VM, guest wake, handshake,
@@ -3488,7 +3605,7 @@ impl SandboxManager {
             base_record: std::sync::Mutex::new(record.clone()),
             state: std::sync::atomic::AtomicI32::new(common::SandboxState::Running as i32),
             vm: Mutex::new(Some(vm)),
-            spec: boot_spec,
+            spec: std::sync::Mutex::new(boot_spec),
             last_activity: std::sync::atomic::AtomicI64::new(burrow_core::unix_now()),
             suspended_at: std::sync::atomic::AtomicI64::new(0),
             agent_channel: Mutex::new(None),
@@ -3619,7 +3736,7 @@ impl SandboxManager {
             .retain_newest(
                 sandbox_id,
                 resources.keep_last_snapshots,
-                resources.keep_evicted_snapshots,
+                resources.is_evicted_snapshot_kept,
             )
             .await;
         tracing::info!(
@@ -3875,7 +3992,7 @@ impl SandboxManager {
         // same time. Claimed first, for the reason the create path gives: a
         // conflict must fail before there is a tap or an address to give back.
         crate::volume::validate_mounts(&policy.volumes)?;
-        for mount in &policy.volumes {
+        for (_, mount) in crate::volume::block_mounts(&policy.volumes) {
             if !tokio::fs::try_exists(self.volumes.image(&mount.volume))
                 .await
                 .unwrap_or(false)
@@ -3913,7 +4030,7 @@ impl SandboxManager {
             let chain = source.stage_into(&self.snapshots, &workdir).await?;
             // Linked in the same shape as a create's, so the guest sees the
             // same devices in the same order as the handshake describes.
-            for (index, mount) in policy.volumes.iter().enumerate() {
+            for (index, mount) in crate::volume::block_mounts(&policy.volumes) {
                 let dest = workdir.join(crate::sandbox::volume_image(index));
                 let _ = tokio::fs::remove_file(&dest).await;
                 tokio::fs::hard_link(self.volumes.image(&mount.volume), &dest)
@@ -3931,8 +4048,8 @@ impl SandboxManager {
                 // left alone, for the reason [`grant_to_jail`] spells out.
                 let mut shared: std::collections::HashSet<String> =
                     [TEMPLATE_KERNEL.to_string(), TEMPLATE_ROOTFS.to_string()].into();
-                for (index, mount) in policy.volumes.iter().enumerate() {
-                    if mount.read_only {
+                for (index, mount) in crate::volume::block_mounts(&policy.volumes) {
+                    if mount.is_read_only {
                         shared.insert(crate::sandbox::volume_image(index));
                     }
                 }
@@ -3978,12 +4095,12 @@ impl SandboxManager {
             }
         }
 
-        for (index, mount) in policy.volumes.iter().enumerate() {
+        for (index, mount) in crate::volume::block_mounts(&policy.volumes) {
             let drive = burrow_vmm::DriveSpec {
                 id: format!("volume{index}"),
                 path: volume_image(index),
                 is_root: false,
-                read_only: mount.read_only,
+                is_read_only: mount.is_read_only,
             };
             if let Err(err) = guard.vm().attach_drive(&drive).await {
                 let message = format!("attaching volume {}: {err}", mount.volume);
@@ -4041,11 +4158,15 @@ impl SandboxManager {
             // sandbox is named by the caller or not at all.
             name,
             guest_ip: lease.guest_ip.to_string(),
-            unreachable: false,
+            is_unreachable: false,
             cpu_usage_usec: 0,
             rx_bytes: 0,
             tx_bytes: 0,
-            agent_unconfirmed: false,
+            is_agent_unconfirmed: false,
+            env: HashMap::new(),
+            kit: None,
+            kit_credentials: HashMap::new(),
+            kit_selection: String::new(),
         };
         tracing::info!(
             sandbox = id,
@@ -4061,7 +4182,7 @@ impl SandboxManager {
             base_record: std::sync::Mutex::new(record),
             state: std::sync::atomic::AtomicI32::new(common::SandboxState::Running as i32),
             vm: Mutex::new(Some(vm)),
-            spec: boot_spec,
+            spec: std::sync::Mutex::new(boot_spec),
             last_activity: std::sync::atomic::AtomicI64::new(burrow_core::unix_now()),
             suspended_at: std::sync::atomic::AtomicI64::new(0),
             agent_channel: Mutex::new(None),
@@ -4094,6 +4215,91 @@ impl SandboxManager {
         self.open_session(&sandbox, STARTED_RESUME).await;
         self.persist(&sandbox).await;
         Ok(sandbox.record())
+    }
+
+    /// Shuts a sandbox down, keeping its disks. Unlike a pause, nothing of
+    /// the guest's memory survives: a start boots the image's init again.
+    pub async fn stop(&self, id: &str) -> Result<common::Sandbox, Status> {
+        let sandbox = self.get(id).await?;
+        sandbox.shutdown().await?;
+        self.volumes.release_all(id);
+        self.close_session(&sandbox, ENDED_STOPPED).await;
+        self.persist(&sandbox).await;
+        tracing::info!(sandbox = id, "sandbox stopped");
+        Ok(sandbox.record())
+    }
+
+    /// Boots a stopped sandbox on its existing disks.
+    pub async fn start(&self, id: &str) -> Result<common::Sandbox, Status> {
+        let sandbox = self.get(id).await?;
+        let record = sandbox.record();
+        let policy = record.policy.unwrap_or_default();
+        self.volumes.claim(id, &policy.volumes)?;
+        // A stop handed the volume images' ownership back with the claims, so
+        // the jail has to be given them again before the VMM opens them.
+        if let Some(jail) = &self.config.jail {
+            let mut shared: std::collections::HashSet<String> =
+                [TEMPLATE_KERNEL.to_string(), TEMPLATE_ROOTFS.to_string()].into();
+            for (index, mount) in crate::volume::block_mounts(&policy.volumes) {
+                if mount.is_read_only {
+                    shared.insert(volume_image(index));
+                }
+            }
+            self.remember_volume_owners(&policy.volumes).await;
+            if let Err(err) = grant_to_jail(&sandbox.workdir, jail, &shared).await {
+                self.volumes.release_all(id);
+                return Err(Status::internal(format!("preparing the jail: {err}")));
+            }
+        }
+        let resources = policy.resources.unwrap_or_default();
+        let spec = self.build_spec(
+            id,
+            &sandbox.workdir,
+            &resources,
+            &sandbox.lease,
+            &sandbox.tap,
+            &policy.volumes,
+        );
+        let request = agentconn::handshake_full(
+            false,
+            None,
+            self.inspection_ca_for(&policy),
+            self.trust_bundles_for(sandbox.template(), &policy).await,
+            crate::volume::agent_mounts(&policy.volumes),
+        );
+        if let Err(err) = sandbox.boot(spec, request, self.config.agent_timeout).await {
+            self.volumes.release_all(id);
+            return Err(err);
+        }
+        self.open_session(&sandbox, STARTED_BOOT).await;
+        self.persist(&sandbox).await;
+        Ok(sandbox.record())
+    }
+
+    /// The environment a template declared.
+    pub async fn image_environment(&self, template: &str) -> crate::oci::ImageEnvironment {
+        crate::oci::image_environment(&self.config.data_dir, template).await
+    }
+
+    /// Records what a Kit sandbox runs with, so execs and later boots see it.
+    pub async fn set_kit(
+        &self,
+        id: &str,
+        kit: common::KitSpec,
+        env: HashMap<String, String>,
+        credentials: HashMap<String, String>,
+        selection: String,
+    ) -> Result<(), Status> {
+        let sandbox = self.get(id).await?;
+        {
+            let mut record = sandbox.base_record.lock().unwrap();
+            record.kit = Some(kit);
+            record.env = env;
+            record.kit_credentials = credentials;
+            record.kit_selection = selection;
+        }
+        self.persist(&sandbox).await;
+        Ok(())
     }
 
     pub async fn delete(&self, id: &str) -> Result<(), Status> {
@@ -4160,6 +4366,66 @@ impl SandboxManager {
         }
         tracing::info!(sandbox = id, "sandbox deleted");
         rendered
+    }
+}
+
+/// Replaces every secret on a record with its sealed form, keyed by the
+/// sandbox and the place the value sits, for the row on disk.
+fn seal_secrets(
+    vault: &burrow_core::vault::Vault,
+    record: &mut common::Sandbox,
+) -> Result<(), burrow_core::vault::Error> {
+    map_secrets(record, |context, value| vault.seal(context, value))
+}
+
+fn open_secrets(
+    vault: &burrow_core::vault::Vault,
+    record: &mut common::Sandbox,
+) -> Result<(), burrow_core::vault::Error> {
+    map_secrets(record, |context, value| vault.unseal(context, value))
+}
+
+/// Rewrites each secret on a record in place, passing `f` the value and a
+/// context naming the sandbox and where the value sits.
+fn map_secrets(
+    record: &mut common::Sandbox,
+    f: impl Fn(&str, &str) -> Result<String, burrow_core::vault::Error>,
+) -> Result<(), burrow_core::vault::Error> {
+    let id = &record.id;
+    let apply = |place: String, value: &mut String| -> Result<(), burrow_core::vault::Error> {
+        *value = f(&format!("{id}/{place}"), value)?;
+        Ok(())
+    };
+    if let Some(network) = record.policy.as_mut().and_then(|p| p.network.as_mut()) {
+        for (i, rule) in network.rules.iter_mut().enumerate() {
+            match rule.action.as_mut() {
+                Some(common::request_rule::Action::SetHeaders(set)) => {
+                    for (j, header) in set.headers.iter_mut().enumerate() {
+                        apply(format!("rules/{i}/headers/{j}"), &mut header.value)?;
+                    }
+                }
+                Some(common::request_rule::Action::Forward(forward))
+                    if !forward.secret.is_empty() =>
+                {
+                    apply(format!("rules/{i}/forward"), &mut forward.secret)?;
+                }
+                _ => {}
+            }
+        }
+    }
+    for (service, value) in record.kit_credentials.iter_mut() {
+        apply(format!("credentials/{service}"), value)?;
+    }
+    Ok(())
+}
+
+/// The proxy's form of a policy's HTTP rule.
+fn proxy_http_rule(rule: &common::HttpRule) -> burrow_proxy::policy::HttpRule {
+    burrow_proxy::policy::HttpRule {
+        hosts: rule.hosts.clone(),
+        methods: rule.methods.clone(),
+        paths: rule.paths.clone(),
+        is_denying: rule.is_denied,
     }
 }
 
@@ -4327,14 +4593,14 @@ pub(crate) mod tests {
                 extra_boot_args: String::new(),
                 agent_timeout: std::time::Duration::from_millis(1),
                 cgroup_root: None,
-                require_resource_limits: false,
-                lazy_memory: false,
+                is_resource_limits_required: false,
+                is_memory_lazy: false,
                 jail: None,
                 artifact_retention: std::time::Duration::from_secs(7 * 24 * 60 * 60),
                 control_plane: Vec::new(),
                 share: crate::share::ShareOptions {
-                    enabled: false,
-                    transparent: false,
+                    is_enabled: false,
+                    is_transparent: false,
                     region: None,
                     derp_map_url: None,
                 },
@@ -4344,6 +4610,12 @@ pub(crate) mod tests {
             Arc::new(burrow_proxy::DeniedAddresses::default()),
             Arc::new(burrow_proxy::directory::Directory::default()),
             Arc::new(burrow_store::Store::open_in_memory().unwrap()),
+            burrow_core::vault::Vault::open(&std::env::temp_dir().join(format!(
+                "burrow-test-{}-{}.key",
+                std::process::id(),
+                burrow_core::SandboxId::generate()
+            )))
+            .unwrap(),
         )
     }
 
@@ -4394,6 +4666,45 @@ pub(crate) mod tests {
         assert!(manager.sandboxes.lock().await.is_empty());
         assert!(!workdir.exists());
         let _ = tokio::fs::remove_dir_all(&data_dir).await;
+    }
+
+    #[test]
+    fn a_persisted_record_carries_its_secrets_sealed() {
+        let manager = manager();
+        let mut record = common::Sandbox {
+            id: "sbx_a".into(),
+            policy: Some(common::Policy {
+                network: Some(common::NetworkPolicy {
+                    rules: vec![common::RequestRule {
+                        domain: "api.example.com".into(),
+                        r#match: None,
+                        action: Some(common::request_rule::Action::SetHeaders(
+                            common::SetHeaders {
+                                headers: vec![common::HeaderValue {
+                                    name: "Authorization".into(),
+                                    value: "Bearer token".into(),
+                                }],
+                            },
+                        )),
+                    }],
+                    ..Default::default()
+                }),
+                ..Default::default()
+            }),
+            kit_credentials: [("github".to_string(), "ghp_x".to_string())].into(),
+            ..Default::default()
+        };
+        seal_secrets(&manager.vault, &mut record).unwrap();
+        let encoded = prost::Message::encode_to_vec(&record);
+        assert!(!String::from_utf8_lossy(&encoded).contains("Bearer token"));
+        assert!(!String::from_utf8_lossy(&encoded).contains("ghp_x"));
+        open_secrets(&manager.vault, &mut record).unwrap();
+        assert_eq!(record.kit_credentials["github"], "ghp_x");
+        let mut moved = record.clone();
+        moved.id = "sbx_b".into();
+        seal_secrets(&manager.vault, &mut moved).unwrap();
+        moved.id = "sbx_a".into();
+        assert!(open_secrets(&manager.vault, &mut moved).is_err());
     }
 
     /// A fork of a sandbox this node does not hold must fail before it claims
@@ -4608,7 +4919,7 @@ pub(crate) mod tests {
     fn inspected() -> common::Policy {
         common::Policy {
             network: Some(common::NetworkPolicy {
-                inspect_tls: true,
+                is_tls_inspected: true,
                 ..Default::default()
             }),
             ..Default::default()
@@ -4647,7 +4958,7 @@ pub(crate) mod tests {
         assert_eq!(bundles.len(), 1, "the image's bundle was lost: {bundles:?}");
         assert_eq!(bundles[0].path, "/cacert.pem");
         assert!(
-            !bundles[0].create_if_missing,
+            !bundles[0].is_created_if_missing,
             "a full bundle that is absent must not be invented"
         );
     }
@@ -4684,7 +4995,7 @@ pub(crate) mod tests {
             base_record: std::sync::Mutex::new(common::Sandbox::default()),
             state: std::sync::atomic::AtomicI32::new(common::SandboxState::Running as i32),
             vm: Mutex::new(None),
-            spec: MicroVmSpec::new(id, &workdir),
+            spec: std::sync::Mutex::new(MicroVmSpec::new(id, &workdir)),
             agent_channel: Mutex::new(None),
             agent_timeout: std::time::Duration::from_millis(1),
             handshake: settled(),
@@ -4723,7 +5034,7 @@ pub(crate) mod tests {
             "must blame the agent rather than the network: {text}"
         );
         // And the record says as much on its own, for a reader who never calls.
-        assert!(sandbox.record().agent_unconfirmed);
+        assert!(sandbox.record().is_agent_unconfirmed);
     }
 
     /// The other half: while the handshake is still in flight the call waits
@@ -4733,7 +5044,7 @@ pub(crate) mod tests {
         let sandbox = running("sbx_pending");
         sandbox.handshake.send_replace(Handshake::Pending);
         assert!(
-            sandbox.record().agent_unconfirmed,
+            sandbox.record().is_agent_unconfirmed,
             "a create that has not been confirmed must not read as plain running"
         );
 
@@ -4753,7 +5064,7 @@ pub(crate) mod tests {
             .await
             .expect("the waiter must not panic")
             .expect("a landed handshake releases the wait");
-        assert!(!sandbox.record().agent_unconfirmed);
+        assert!(!sandbox.record().is_agent_unconfirmed);
     }
 
     /// A warm create returns before its guest has answered, so the handshake
@@ -4819,7 +5130,7 @@ pub(crate) mod tests {
             base_record: std::sync::Mutex::new(common::Sandbox::default()),
             state: std::sync::atomic::AtomicI32::new(common::SandboxState::Running as i32),
             vm: Mutex::new(None),
-            spec: MicroVmSpec::new("sbx_a", &workdir),
+            spec: std::sync::Mutex::new(MicroVmSpec::new("sbx_a", &workdir)),
             agent_channel: Mutex::new(None),
             agent_timeout: std::time::Duration::from_millis(1),
             handshake: settled(),
@@ -4924,10 +5235,12 @@ pub(crate) mod tests {
     #[test]
     fn an_absent_section_leaves_that_policy_alone() {
         let mut policy = common::Policy {
-            exec: Some(common::ExecPolicy { allow_exec: false }),
+            exec: Some(common::ExecPolicy {
+                is_exec_allowed: false,
+            }),
             fs: Some(common::FsPolicy {
-                allow_upload: true,
-                allow_download: true,
+                is_upload_allowed: true,
+                is_download_allowed: true,
                 path_scopes: vec!["/work".into()],
                 max_upload_bytes: 0,
             }),
@@ -4938,19 +5251,19 @@ pub(crate) mod tests {
             &mut policy,
             None,
             Some(common::FsPolicy {
-                allow_upload: false,
-                allow_download: true,
+                is_upload_allowed: false,
+                is_download_allowed: true,
                 path_scopes: vec!["/data".into()],
                 max_upload_bytes: 64,
             }),
         );
 
         assert!(
-            !policy.exec.as_ref().unwrap().allow_exec,
+            !policy.exec.as_ref().unwrap().is_exec_allowed,
             "an untouched exec policy was re-opened"
         );
         let fs = policy.fs.as_ref().unwrap();
-        assert!(!fs.allow_upload);
+        assert!(!fs.is_upload_allowed);
         assert_eq!(fs.path_scopes, vec!["/data".to_string()]);
         assert_eq!(fs.max_upload_bytes, 64);
     }
@@ -4959,10 +5272,12 @@ pub(crate) mod tests {
     #[test]
     fn a_present_section_replaces_that_policy_wholesale() {
         let mut policy = common::Policy {
-            exec: Some(common::ExecPolicy { allow_exec: false }),
+            exec: Some(common::ExecPolicy {
+                is_exec_allowed: false,
+            }),
             fs: Some(common::FsPolicy {
-                allow_upload: false,
-                allow_download: false,
+                is_upload_allowed: false,
+                is_download_allowed: false,
                 path_scopes: vec!["/work".into()],
                 max_upload_bytes: 8,
             }),
@@ -4971,13 +5286,15 @@ pub(crate) mod tests {
 
         apply_access_policy(
             &mut policy,
-            Some(common::ExecPolicy { allow_exec: true }),
+            Some(common::ExecPolicy {
+                is_exec_allowed: true,
+            }),
             None,
         );
 
-        assert!(policy.exec.as_ref().unwrap().allow_exec);
+        assert!(policy.exec.as_ref().unwrap().is_exec_allowed);
         let fs = policy.fs.as_ref().unwrap();
-        assert!(!fs.allow_upload, "the fs policy was not left alone");
+        assert!(!fs.is_upload_allowed, "the fs policy was not left alone");
         assert_eq!(fs.path_scopes, vec!["/work".to_string()]);
         assert_eq!(fs.max_upload_bytes, 8);
     }
@@ -4989,10 +5306,12 @@ pub(crate) mod tests {
         let mut policy = common::Policy::default();
         apply_access_policy(
             &mut policy,
-            Some(common::ExecPolicy { allow_exec: false }),
+            Some(common::ExecPolicy {
+                is_exec_allowed: false,
+            }),
             None,
         );
-        assert!(!policy.exec.as_ref().unwrap().allow_exec);
+        assert!(!policy.exec.as_ref().unwrap().is_exec_allowed);
         assert!(
             policy.fs.is_none(),
             "an unnamed section must stay absent rather than become permissive"

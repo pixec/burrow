@@ -82,6 +82,21 @@ class BurrowStub(object):
                 request_serializer=api__pb2.SandboxRef.SerializeToString,
                 response_deserializer=common__pb2.Sandbox.FromString,
                 _registered_method=True)
+        self.StopSandbox = channel.unary_unary(
+                '/burrow.api.v1.Burrow/StopSandbox',
+                request_serializer=api__pb2.SandboxRef.SerializeToString,
+                response_deserializer=common__pb2.Sandbox.FromString,
+                _registered_method=True)
+        self.StartSandbox = channel.unary_unary(
+                '/burrow.api.v1.Burrow/StartSandbox',
+                request_serializer=api__pb2.SandboxRef.SerializeToString,
+                response_deserializer=common__pb2.Sandbox.FromString,
+                _registered_method=True)
+        self.RecreateSandbox = channel.unary_unary(
+                '/burrow.api.v1.Burrow/RecreateSandbox',
+                request_serializer=api__pb2.RecreateSandboxRequest.SerializeToString,
+                response_deserializer=common__pb2.Sandbox.FromString,
+                _registered_method=True)
         self.ListSessions = channel.unary_unary(
                 '/burrow.api.v1.Burrow/ListSessions',
                 request_serializer=api__pb2.SandboxRef.SerializeToString,
@@ -131,6 +146,21 @@ class BurrowStub(object):
                 '/burrow.api.v1.Burrow/DeleteSnapshot',
                 request_serializer=api__pb2.SnapshotRef.SerializeToString,
                 response_deserializer=api__pb2.DeleteSnapshotResponse.FromString,
+                _registered_method=True)
+        self.SetSecret = channel.unary_unary(
+                '/burrow.api.v1.Burrow/SetSecret',
+                request_serializer=api__pb2.SetSecretRequest.SerializeToString,
+                response_deserializer=api__pb2.SetSecretResponse.FromString,
+                _registered_method=True)
+        self.ListSecrets = channel.unary_unary(
+                '/burrow.api.v1.Burrow/ListSecrets',
+                request_serializer=api__pb2.ListSecretsRequest.SerializeToString,
+                response_deserializer=api__pb2.ListSecretsResponse.FromString,
+                _registered_method=True)
+        self.DeleteSecret = channel.unary_unary(
+                '/burrow.api.v1.Burrow/DeleteSecret',
+                request_serializer=api__pb2.DeleteSecretRequest.SerializeToString,
+                response_deserializer=api__pb2.DeleteSecretResponse.FromString,
                 _registered_method=True)
         self.CreateVolume = channel.unary_unary(
                 '/burrow.api.v1.Burrow/CreateVolume',
@@ -331,6 +361,30 @@ class BurrowServicer(object):
         context.set_details('Method not implemented!')
         raise NotImplementedError('Method not implemented!')
 
+    def StopSandbox(self, request, context):
+        """Shut the VM down, keeping the writable disk and volumes, and boot it
+        again. Unlike pause and resume, the guest's processes do not survive and
+        a Kit's startup hooks run again on the way up.
+        """
+        context.set_code(grpc.StatusCode.UNIMPLEMENTED)
+        context.set_details('Method not implemented!')
+        raise NotImplementedError('Method not implemented!')
+
+    def StartSandbox(self, request, context):
+        """Missing associated documentation comment in .proto file."""
+        context.set_code(grpc.StatusCode.UNIMPLEMENTED)
+        context.set_details('Method not implemented!')
+        raise NotImplementedError('Method not implemented!')
+
+    def RecreateSandbox(self, request, context):
+        """Replace a sandbox's root disk, discarding everything written to it, while
+        keeping its id, address, name and volumes. With a Kit, the composition
+        may change too.
+        """
+        context.set_code(grpc.StatusCode.UNIMPLEMENTED)
+        context.set_details('Method not implemented!')
+        raise NotImplementedError('Method not implemented!')
+
     def ListSessions(self, request, context):
         """Every VM this sandbox has run, newest first.
         """
@@ -399,6 +453,27 @@ class BurrowServicer(object):
         raise NotImplementedError('Method not implemented!')
 
     def DeleteSnapshot(self, request, context):
+        """Missing associated documentation comment in .proto file."""
+        context.set_code(grpc.StatusCode.UNIMPLEMENTED)
+        context.set_details('Method not implemented!')
+        raise NotImplementedError('Method not implemented!')
+
+    def SetSecret(self, request, context):
+        """Secrets: credentials Kits ask for by service name. Held by the
+        orchestrator and handed to a node only as header-injection rules for the
+        sandbox that needs them, so a guest never sees a value.
+        """
+        context.set_code(grpc.StatusCode.UNIMPLEMENTED)
+        context.set_details('Method not implemented!')
+        raise NotImplementedError('Method not implemented!')
+
+    def ListSecrets(self, request, context):
+        """Missing associated documentation comment in .proto file."""
+        context.set_code(grpc.StatusCode.UNIMPLEMENTED)
+        context.set_details('Method not implemented!')
+        raise NotImplementedError('Method not implemented!')
+
+    def DeleteSecret(self, request, context):
         """Missing associated documentation comment in .proto file."""
         context.set_code(grpc.StatusCode.UNIMPLEMENTED)
         context.set_details('Method not implemented!')
@@ -627,6 +702,21 @@ def add_BurrowServicer_to_server(servicer, server):
                     request_deserializer=api__pb2.SandboxRef.FromString,
                     response_serializer=common__pb2.Sandbox.SerializeToString,
             ),
+            'StopSandbox': grpc.unary_unary_rpc_method_handler(
+                    servicer.StopSandbox,
+                    request_deserializer=api__pb2.SandboxRef.FromString,
+                    response_serializer=common__pb2.Sandbox.SerializeToString,
+            ),
+            'StartSandbox': grpc.unary_unary_rpc_method_handler(
+                    servicer.StartSandbox,
+                    request_deserializer=api__pb2.SandboxRef.FromString,
+                    response_serializer=common__pb2.Sandbox.SerializeToString,
+            ),
+            'RecreateSandbox': grpc.unary_unary_rpc_method_handler(
+                    servicer.RecreateSandbox,
+                    request_deserializer=api__pb2.RecreateSandboxRequest.FromString,
+                    response_serializer=common__pb2.Sandbox.SerializeToString,
+            ),
             'ListSessions': grpc.unary_unary_rpc_method_handler(
                     servicer.ListSessions,
                     request_deserializer=api__pb2.SandboxRef.FromString,
@@ -676,6 +766,21 @@ def add_BurrowServicer_to_server(servicer, server):
                     servicer.DeleteSnapshot,
                     request_deserializer=api__pb2.SnapshotRef.FromString,
                     response_serializer=api__pb2.DeleteSnapshotResponse.SerializeToString,
+            ),
+            'SetSecret': grpc.unary_unary_rpc_method_handler(
+                    servicer.SetSecret,
+                    request_deserializer=api__pb2.SetSecretRequest.FromString,
+                    response_serializer=api__pb2.SetSecretResponse.SerializeToString,
+            ),
+            'ListSecrets': grpc.unary_unary_rpc_method_handler(
+                    servicer.ListSecrets,
+                    request_deserializer=api__pb2.ListSecretsRequest.FromString,
+                    response_serializer=api__pb2.ListSecretsResponse.SerializeToString,
+            ),
+            'DeleteSecret': grpc.unary_unary_rpc_method_handler(
+                    servicer.DeleteSecret,
+                    request_deserializer=api__pb2.DeleteSecretRequest.FromString,
+                    response_serializer=api__pb2.DeleteSecretResponse.SerializeToString,
             ),
             'CreateVolume': grpc.unary_unary_rpc_method_handler(
                     servicer.CreateVolume,
@@ -1069,6 +1174,87 @@ class Burrow(object):
             _registered_method=True)
 
     @staticmethod
+    def StopSandbox(request,
+            target,
+            options=(),
+            channel_credentials=None,
+            call_credentials=None,
+            insecure=False,
+            compression=None,
+            wait_for_ready=None,
+            timeout=None,
+            metadata=None):
+        return grpc.experimental.unary_unary(
+            request,
+            target,
+            '/burrow.api.v1.Burrow/StopSandbox',
+            api__pb2.SandboxRef.SerializeToString,
+            common__pb2.Sandbox.FromString,
+            options,
+            channel_credentials,
+            insecure,
+            call_credentials,
+            compression,
+            wait_for_ready,
+            timeout,
+            metadata,
+            _registered_method=True)
+
+    @staticmethod
+    def StartSandbox(request,
+            target,
+            options=(),
+            channel_credentials=None,
+            call_credentials=None,
+            insecure=False,
+            compression=None,
+            wait_for_ready=None,
+            timeout=None,
+            metadata=None):
+        return grpc.experimental.unary_unary(
+            request,
+            target,
+            '/burrow.api.v1.Burrow/StartSandbox',
+            api__pb2.SandboxRef.SerializeToString,
+            common__pb2.Sandbox.FromString,
+            options,
+            channel_credentials,
+            insecure,
+            call_credentials,
+            compression,
+            wait_for_ready,
+            timeout,
+            metadata,
+            _registered_method=True)
+
+    @staticmethod
+    def RecreateSandbox(request,
+            target,
+            options=(),
+            channel_credentials=None,
+            call_credentials=None,
+            insecure=False,
+            compression=None,
+            wait_for_ready=None,
+            timeout=None,
+            metadata=None):
+        return grpc.experimental.unary_unary(
+            request,
+            target,
+            '/burrow.api.v1.Burrow/RecreateSandbox',
+            api__pb2.RecreateSandboxRequest.SerializeToString,
+            common__pb2.Sandbox.FromString,
+            options,
+            channel_credentials,
+            insecure,
+            call_credentials,
+            compression,
+            wait_for_ready,
+            timeout,
+            metadata,
+            _registered_method=True)
+
+    @staticmethod
     def ListSessions(request,
             target,
             options=(),
@@ -1328,6 +1514,87 @@ class Burrow(object):
             '/burrow.api.v1.Burrow/DeleteSnapshot',
             api__pb2.SnapshotRef.SerializeToString,
             api__pb2.DeleteSnapshotResponse.FromString,
+            options,
+            channel_credentials,
+            insecure,
+            call_credentials,
+            compression,
+            wait_for_ready,
+            timeout,
+            metadata,
+            _registered_method=True)
+
+    @staticmethod
+    def SetSecret(request,
+            target,
+            options=(),
+            channel_credentials=None,
+            call_credentials=None,
+            insecure=False,
+            compression=None,
+            wait_for_ready=None,
+            timeout=None,
+            metadata=None):
+        return grpc.experimental.unary_unary(
+            request,
+            target,
+            '/burrow.api.v1.Burrow/SetSecret',
+            api__pb2.SetSecretRequest.SerializeToString,
+            api__pb2.SetSecretResponse.FromString,
+            options,
+            channel_credentials,
+            insecure,
+            call_credentials,
+            compression,
+            wait_for_ready,
+            timeout,
+            metadata,
+            _registered_method=True)
+
+    @staticmethod
+    def ListSecrets(request,
+            target,
+            options=(),
+            channel_credentials=None,
+            call_credentials=None,
+            insecure=False,
+            compression=None,
+            wait_for_ready=None,
+            timeout=None,
+            metadata=None):
+        return grpc.experimental.unary_unary(
+            request,
+            target,
+            '/burrow.api.v1.Burrow/ListSecrets',
+            api__pb2.ListSecretsRequest.SerializeToString,
+            api__pb2.ListSecretsResponse.FromString,
+            options,
+            channel_credentials,
+            insecure,
+            call_credentials,
+            compression,
+            wait_for_ready,
+            timeout,
+            metadata,
+            _registered_method=True)
+
+    @staticmethod
+    def DeleteSecret(request,
+            target,
+            options=(),
+            channel_credentials=None,
+            call_credentials=None,
+            insecure=False,
+            compression=None,
+            wait_for_ready=None,
+            timeout=None,
+            metadata=None):
+        return grpc.experimental.unary_unary(
+            request,
+            target,
+            '/burrow.api.v1.Burrow/DeleteSecret',
+            api__pb2.DeleteSecretRequest.SerializeToString,
+            api__pb2.DeleteSecretResponse.FromString,
             options,
             channel_credentials,
             insecure,

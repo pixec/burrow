@@ -561,7 +561,7 @@ that.
 A warm snapshot is a template booted once and frozen with its agent ready.
 Creates then restore instead of booting: measured on real OCI templates with
 45ms median for alpine (36 to 98ms) and 41ms for python (33 to
-46ms), against 1.2 to 2.2s for a cold boot. Nodes warm templates on their own,
+46ms). Nodes warm templates on their own,
 as each one lands and as creates ask for shapes nothing has warmed yet.
 
 ```mermaid
@@ -1026,7 +1026,7 @@ readable, because reads are answered from the orchestrator's records, but
 nothing can be done to them, since every per-sandbox call is routed to the
 hosting node and fails with `unavailable` rather than waiting.
 
-Reads say so. The orchestrator stamps `unreachable` on any record whose node is
+Reads say so. The orchestrator stamps `is_unreachable` on any record whose node is
 unhealthy, and `burrow ps -a` shows the state as `lost`. The point is that the
 state on record is the last one the node reported, which is a good answer while
 the node is up and a stale guess once it is not.
@@ -1259,9 +1259,8 @@ A create from a warm snapshot, on OCI templates imported with `burrow pull`:
 | `alpine` | 30ms | 16 to 109ms | 14 |
 | `python:3.12-slim` | 33ms | 20 to 71ms | 13 |
 
-A cold boot of the same alpine template is 1.9 to 2.4s, nearly all of it kernel
-and userland init. The first create of a template at a shape nothing has warmed
-pays that plus building the snapshot; see [one snapshot per
+The first create of a template at a shape nothing has warmed boots instead
+and builds the snapshot behind it; see [one snapshot per
 template](#one-snapshot-per-template).
 
 ## Development

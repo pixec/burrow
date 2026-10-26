@@ -78,7 +78,7 @@ def _to_sandbox_info(raw: common_pb2.Sandbox) -> SandboxInfo:
         guest_ip=raw.guest_ip,
         tags=dict(raw.metadata),
         policy=from_policy(raw.policy),
-        unreachable=raw.unreachable,
+        unreachable=raw.is_unreachable,
         usage=Usage(
             cpu_usage_usec=raw.cpu_usage_usec,
             rx_bytes=raw.rx_bytes,
@@ -244,8 +244,8 @@ def _to_share(raw: api_pb2.Share) -> Share:
         allowed_clients=list(raw.allowed_clients),
         created_at=raw.created_at,
         udp_ports=list(raw.udp_ports),
-        all_udp=raw.all_udp,
-        transparent_ip=raw.transparent_ip,
+        all_udp=raw.is_all_udp,
+        transparent_ip=raw.is_transparent_ip,
     )
 
 
@@ -261,7 +261,7 @@ def _to_port(raw: api_pb2.PortMapping, fallback_host: str) -> PortMapping:
         # Empty unless the holding node's edge is serving, rather than a name
         # that resolves nowhere.
         edge_url=raw.edge_url,
-        udp=raw.udp,
+        udp=raw.is_udp,
     )
 
 
@@ -819,7 +819,7 @@ class Sandbox:
                 # one call can override what every other call inherits.
                 env={**self._env, **(options.get("env") or {})},
                 cwd=options.get("cwd") or "",
-                pty=options.get("pty") or False,
+                is_pty=options.get("pty") or False,
                 rows=options.get("rows") or 24,
                 cols=options.get("cols") or 80,
                 user=options.get("user", self._default_user),
@@ -833,7 +833,7 @@ class Sandbox:
             if keep_open:
                 # Closes the child's stdin without closing the request side,
                 # which a detached command keeps open until its stream ends.
-                yield api_pb2.ExecInput(stdin_eof=True)
+                yield api_pb2.ExecInput(is_stdin_eof=True)
                 done.wait()
 
         # A detached command outlives any request deadline.
@@ -1242,7 +1242,7 @@ class Sandbox:
             api_pb2.WatchRequest(
                 sandbox_id=self.id,
                 path=path,
-                recursive=recursive,
+                is_recursive=recursive,
                 interval_ms=int(interval * 1000),
             ),
             # Watches outlive any request deadline.
@@ -1286,7 +1286,7 @@ class Sandbox:
                 sandbox_id=self.id,
                 guest_port=guest_port,
                 host_port=host_port,
-                udp=udp,
+                is_udp=udp,
             ),
         )
         return _to_port(res, self._transport.host)
@@ -1351,10 +1351,10 @@ class Sandbox:
                 sandbox_id=self.id,
                 ports=list(ports or []),
                 allowed_clients=list(allowed_clients or []),
-                rotate=rotate,
+                is_rotating=rotate,
                 udp_ports=list(udp_ports or []),
-                all_udp=all_udp,
-                no_transparent_ip=no_transparent_ip,
+                is_all_udp=all_udp,
+                is_transparent_ip_disabled=no_transparent_ip,
             ),
         )
         return _to_share(res)
@@ -1709,7 +1709,7 @@ class Burrow:
                 destination=raw.destination,
                 host=raw.host,
                 port=raw.port,
-                allowed=raw.allowed,
+                allowed=raw.is_allowed,
                 reason=raw.reason,
                 bytes_sent=raw.bytes_sent,
                 bytes_received=raw.bytes_received,
@@ -1719,7 +1719,7 @@ class Burrow:
                 "QueryAudit",
                 api_pb2.AuditQuery(
                     sandbox_id=sandbox_id,
-                    denied_only=denied_only,
+                    is_denied_only=denied_only,
                     since=since,
                     limit=limit,
                 ),
@@ -1734,7 +1734,7 @@ class Burrow:
         res = self._transport.unary(
             "DrainNode",
             api_pb2.DrainNodeRequest(
-                node_id=node_id, drain=drain, suspend_sandboxes=suspend_sandboxes
+                node_id=node_id, is_draining=drain, is_suspending_sandboxes=suspend_sandboxes
             ),
         )
         return res.suspended
@@ -1750,8 +1750,8 @@ class Burrow:
                 total_memory_mib=n.info.total_mem_mib,
                 free_memory_mib=n.status.free_mem_mib,
                 running_sandboxes=n.status.running_sandboxes,
-                healthy=n.healthy,
-                draining=n.status.draining,
+                healthy=n.is_healthy,
+                draining=n.status.is_draining,
                 labels=dict(n.info.labels),
             )
             for n in res.nodes

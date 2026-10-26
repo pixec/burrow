@@ -72,7 +72,7 @@ function toSandboxInfo(raw: any): SandboxInfo {
     tags,
     metadata: tags,
     policy: fromPolicy(raw.policy),
-    unreachable: raw.unreachable ?? false,
+    unreachable: raw.isUnreachable ?? false,
     usage: {
       // 64-bit on the wire, but nothing a sandbox consumes reaches the range
       // where handing them over as numbers costs precision.
@@ -801,7 +801,7 @@ export class Sandbox {
         // can override what every other call inherits.
         env: { ...this.env, ...(options.env ?? {}) },
         cwd: options.cwd ?? "",
-        pty: options.pty ?? false,
+        isPty: options.pty ?? false,
         rows: options.rows ?? 24,
         cols: options.cols ?? 80,
         user: options.user ?? this.defaultUser,
@@ -814,10 +814,10 @@ export class Sandbox {
       options.timeoutMs,
       options.signal,
     );
-    // Either way the command sees an empty stdin: `stdinEof` closes the
+    // Either way the command sees an empty stdin: `isStdinEof` closes the
     // child's stdin without closing the request side, which a detached command
     // keeps open.
-    if (keepOpen) call.write({ stdinEof: true });
+    if (keepOpen) call.write({ isStdinEof: true });
     else call.end();
 
     // The guest names the command before anything else. Pulled here rather
@@ -1369,7 +1369,7 @@ export class Sandbox {
       {
         sandboxId: this.id,
         path,
-        recursive: options.recursive ?? false,
+        isRecursive: options.recursive ?? false,
         intervalMs: options.intervalMs ?? 0,
       },
       // Watches outlive any request deadline.
@@ -1434,7 +1434,7 @@ export class Sandbox {
         sandboxId: this.id,
         guestPort,
         hostPort: options.hostPort ?? 0,
-        udp: options.udp ?? false,
+        isUdp: options.udp ?? false,
       },
       undefined,
       options.signal,
@@ -1519,10 +1519,10 @@ export class Sandbox {
         sandboxId: this.id,
         ports: options.ports ?? [],
         allowedClients: options.allowedClients ?? [],
-        rotate: options.rotate ?? false,
+        isRotating: options.rotate ?? false,
         udpPorts: options.udpPorts ?? [],
-        allUdp: options.allUdp ?? false,
-        noTransparentIp: options.noTransparentIp ?? false,
+        isAllUdp: options.allUdp ?? false,
+        isTransparentIpDisabled: options.noTransparentIp ?? false,
       },
       undefined,
       options.signal,
@@ -2006,8 +2006,8 @@ function toShare(raw: any): Share {
     allowedClients: raw.allowedClients ?? [],
     createdAt: raw.createdAt ?? "",
     udpPorts: (raw.udpPorts ?? []).map((p: any) => Number(p)),
-    allUdp: Boolean(raw.allUdp),
-    transparentIp: Boolean(raw.transparentIp),
+    allUdp: Boolean(raw.isAllUdp),
+    transparentIp: Boolean(raw.isTransparentIp),
   };
 }
 
@@ -2019,7 +2019,7 @@ function toPort(raw: any, fallbackHost: string): PortMapping {
   return {
     guestPort: Number(raw.guestPort ?? 0),
     hostPort,
-    udp: Boolean(raw.udp),
+    udp: Boolean(raw.isUdp),
     url: `http://${address}`,
     // Empty unless the holding node's edge is serving, rather than a name
     // that resolves nowhere.
@@ -2085,7 +2085,7 @@ export class Burrow {
     const events: AuditEvent[] = [];
     for await (const raw of this.transport.serverStream<any, any>("QueryAudit", {
       sandboxId: query.sandboxId ?? "",
-      deniedOnly: query.deniedOnly ?? false,
+      isDeniedOnly: query.deniedOnly ?? false,
       since: query.since ?? "",
       limit: query.limit ?? 0,
     })) {
@@ -2096,7 +2096,7 @@ export class Burrow {
         destination: raw.destination,
         host: raw.host ?? "",
         port: Number(raw.port ?? 0),
-        allowed: Boolean(raw.allowed),
+        allowed: Boolean(raw.isAllowed),
         reason: raw.reason ?? "",
         bytesSent: Number(raw.bytesSent ?? 0),
         bytesReceived: Number(raw.bytesReceived ?? 0),
@@ -2113,8 +2113,8 @@ export class Burrow {
   ): Promise<{ suspended: number }> {
     const res = await this.transport.unary<any, any>("DrainNode", {
       nodeId,
-      drain: options.drain ?? true,
-      suspendSandboxes: options.suspendSandboxes ?? false,
+      isDraining: options.drain ?? true,
+      isSuspendingSandboxes: options.suspendSandboxes ?? false,
     });
     return { suspended: Number(res.suspended ?? 0) };
   }
@@ -2129,8 +2129,8 @@ export class Burrow {
       totalMemoryMib: Number(n.info?.totalMemMib ?? 0),
       freeMemoryMib: Number(n.status?.freeMemMib ?? 0),
       runningSandboxes: Number(n.status?.runningSandboxes ?? 0),
-      healthy: Boolean(n.healthy),
-      draining: Boolean(n.status?.draining),
+      healthy: Boolean(n.isHealthy),
+      draining: Boolean(n.status?.isDraining),
       labels: n.info?.labels ?? {},
     }));
   }

@@ -2,6 +2,7 @@
 
 #![allow(clippy::result_large_err)]
 
+use std::collections::HashMap;
 use std::pin::Pin;
 
 use tokio_stream::{Stream, StreamExt};
@@ -66,6 +67,81 @@ impl NodeApi {
     async fn image_environment(&self, template: &str) -> crate::oci::ImageEnvironment {
         crate::oci::image_environment(&self.data_dir, template).await
     }
+
+    /// Creates a sandbox from a Kit template and walks its lifecycle.
+    ///
+    /// For a recreation the previous instance is deleted here, after the
+    /// composition has been planned against its retained storage and before
+    /// the replacement takes its id.
+    async fn create_kit(
+        &self,
+        request: KitCreate,
+        recorded: &crate::kit::KitTemplate,
+        boot: crate::kit::Boot,
+    ) -> Result<common::Sandbox, Status> {
+        let KitCreate {
+            id,
+            template,
+            kit,
+            credentials,
+            mut policy,
+            metadata,
+            name,
+        } = request;
+        let plan = crate::kit::plan(
+            recorded,
+            &kit,
+            &credentials,
+            &policy.resources.unwrap_or_default(),
+        )?;
+        let mounts = crate::kit::prepare_volumes(&self.sandboxes, &id, &plan).await?;
+        let fresh = boot == crate::kit::Boot::Create;
+        if !fresh {
+            self.sandboxes.delete(&id).await?;
+        }
+        policy.resources = Some(plan.resources);
+        policy.network = Some(plan.install_network.clone());
+        policy.volumes.extend(mounts);
+        validate_policy(&policy)?;
+
+        let outcome = async {
+            self.sandboxes
+                .create(id.clone(), template, policy, metadata, self.node_id(), name)
+                .await?;
+            let provisioned = async {
+                let env = plan.env.clone().into_iter().collect();
+                self.sandboxes
+                    .set_kit(&id, kit, env, credentials, plan.selection.clone())
+                    .await?;
+                let running = self.sandboxes.get(&id).await?;
+                crate::kit::provision(&self.sandboxes, &running, &plan, boot).await
+            }
+            .await;
+            if provisioned.is_err() {
+                let _ = self.sandboxes.delete(&id).await;
+            }
+            provisioned
+        }
+        .await;
+        if let Err(err) = outcome {
+            if fresh {
+                crate::kit::remove_volumes(&self.sandboxes, &id).await;
+            }
+            return Err(err);
+        }
+        Ok(self.sandboxes.get(&id).await?.record())
+    }
+}
+
+/// What a Kit sandbox is created from, by a create or a recreation.
+struct KitCreate {
+    id: String,
+    template: String,
+    kit: common::KitSpec,
+    credentials: HashMap<String, String>,
+    policy: common::Policy,
+    metadata: HashMap<String, String>,
+    name: String,
 }
 
 type BoxStream<T> = Pin<Box<dyn Stream<Item = Result<T, Status>> + Send>>;
@@ -88,7 +164,7 @@ impl NodeService for NodeApi {
         let req = req.into_inner();
         let suspended = self
             .sandboxes
-            .set_drain(req.drain, req.suspend_sandboxes)
+            .set_drain(req.is_draining, req.is_suspending_sandboxes)
             .await;
         Ok(Response::new(api::DrainNodeResponse { suspended }))
     }
@@ -113,6 +189,26 @@ impl NodeService for NodeApi {
         let policy = req.policy.unwrap_or_default();
         validate_policy(&policy)?;
         burrow_core::tags::validate(&req.metadata)?;
+        // A template imported from Kits is provisioned through their
+        // lifecycle whether or not the caller passed inputs.
+        if req.snapshot.is_empty()
+            && let Some(recorded) = self.image_environment(&req.template).await.kit
+        {
+            crate::template::validate_name(&req.template)?;
+            let request = KitCreate {
+                id: req.sandbox_id,
+                template: req.template,
+                kit: req.kit.unwrap_or_default(),
+                credentials: req.credentials,
+                policy,
+                metadata: req.metadata,
+                name: req.name,
+            };
+            let sandbox = self
+                .create_kit(request, &recorded, crate::kit::Boot::Create)
+                .await?;
+            return Ok(Response::new(redact_secrets(sandbox)));
+        }
         // A create from a snapshot restores rather than boots, and takes its
         // template and shape from what the snapshot holds; it shares nothing
         // with the cold path but the checks above.
@@ -204,7 +300,7 @@ impl NodeService for NodeApi {
         let volume = self
             .sandboxes
             .volumes()
-            .create(&req.name, req.size_mib)
+            .create(&req.name, req.size_mib, req.labels)
             .await?;
         Ok(Response::new(volume))
     }
@@ -264,8 +360,115 @@ impl NodeService for NodeApi {
         &self,
         req: Request<nodepb::NodeSandboxRef>,
     ) -> Result<Response<nodepb::NodeDeleteResponse>, Status> {
-        self.sandboxes.delete(&req.into_inner().sandbox_id).await?;
+        let id = req.into_inner().sandbox_id;
+        let kit = self.sandboxes.get(&id).await?.record().kit.is_some();
+        self.sandboxes.delete(&id).await?;
+        // Removing the instance ends its storage, retained paths included.
+        if kit {
+            crate::kit::remove_volumes(&self.sandboxes, &id).await;
+        }
         Ok(Response::new(nodepb::NodeDeleteResponse {}))
+    }
+
+    async fn stop_sandbox(
+        &self,
+        req: Request<nodepb::NodeSandboxRef>,
+    ) -> Result<Response<common::Sandbox>, Status> {
+        let sandbox = self.sandboxes.stop(&req.into_inner().sandbox_id).await?;
+        Ok(Response::new(redact_secrets(sandbox)))
+    }
+
+    async fn start_sandbox(
+        &self,
+        req: Request<nodepb::NodeSandboxRef>,
+    ) -> Result<Response<common::Sandbox>, Status> {
+        let id = req.into_inner().sandbox_id;
+        let sandbox = self.sandboxes.start(&id).await?;
+        if let Some(kit) = &sandbox.kit {
+            // A boot is a boot: files land again and startup hooks run again,
+            // under the runtime policy the record already carries.
+            let Some(template) = self.image_environment(&sandbox.template).await.kit else {
+                return Err(Status::failed_precondition(format!(
+                    "template {} is no longer a kit template",
+                    sandbox.template
+                )));
+            };
+            let running = self.sandboxes.get(&id).await?;
+            let plan = crate::kit::plan(
+                &template,
+                kit,
+                &sandbox.kit_credentials,
+                &running.policy().resources.unwrap_or_default(),
+            )?;
+            crate::kit::provision(&self.sandboxes, &running, &plan, crate::kit::Boot::Restart)
+                .await?;
+        }
+        Ok(Response::new(redact_secrets(
+            self.sandboxes.get(&id).await?.record(),
+        )))
+    }
+
+    /// Replaces a sandbox's root disk under the same id.
+    ///
+    /// Judged before anything is destroyed: the replacement composition is
+    /// planned and its storage compared against what is retained, so a
+    /// refusal leaves the previous sandbox running. Only then is the old
+    /// instance deleted, volumes kept, and a new one created in its place.
+    async fn recreate_sandbox(
+        &self,
+        req: Request<nodepb::NodeRecreateRequest>,
+    ) -> Result<Response<common::Sandbox>, Status> {
+        let req = req.into_inner();
+        let mut previous = self.sandboxes.get(&req.sandbox_id).await?.record();
+        let mut policy = previous.policy.take().unwrap_or_default();
+        let template = if req.template.is_empty() {
+            std::mem::take(&mut previous.template)
+        } else {
+            req.template
+        };
+        crate::template::validate_name(&template)?;
+        let Some(recorded) = self.image_environment(&template).await.kit else {
+            // Nothing a Kit asked for: the same template on a fresh disk.
+            self.sandboxes.delete(&req.sandbox_id).await?;
+            let sandbox = self
+                .sandboxes
+                .create(
+                    req.sandbox_id,
+                    template,
+                    policy,
+                    previous.metadata,
+                    self.node_id(),
+                    previous.name,
+                )
+                .await?;
+            return Ok(Response::new(redact_secrets(sandbox)));
+        };
+        let mut kit = previous.kit.unwrap_or_default();
+        if let Some(replacement) = req.kit {
+            kit.args.extend(replacement.args);
+            kit.env.extend(replacement.env);
+            kit.reject_types = replacement.reject_types;
+        }
+        let mut credentials = previous.kit_credentials;
+        credentials.extend(req.credentials);
+        // The kit's own contributions are rebuilt from the new composition;
+        // what the caller set outside the kit stays.
+        policy
+            .volumes
+            .retain(|m| !m.is_tmpfs && !m.volume.starts_with("kit-"));
+        let request = KitCreate {
+            id: req.sandbox_id,
+            template,
+            kit,
+            credentials,
+            policy,
+            metadata: previous.metadata,
+            name: previous.name,
+        };
+        let sandbox = self
+            .create_kit(request, &recorded, crate::kit::Boot::Restart)
+            .await?;
+        Ok(Response::new(redact_secrets(sandbox)))
     }
 
     async fn pause_sandbox(
@@ -478,8 +681,10 @@ impl NodeService for NodeApi {
         &self,
         req: Request<nodepb::TemplateManifestRequest>,
     ) -> Result<Response<nodepb::TemplateManifest>, Status> {
+        let req = req.into_inner();
         let manifest =
-            crate::template::distribute::manifest(&self.data_dir, &req.into_inner().name).await?;
+            crate::template::distribute::manifest(&self.data_dir, &req.name, req.is_config_only)
+                .await?;
         Ok(Response::new(manifest))
     }
 
@@ -555,7 +760,7 @@ impl NodeService for NodeApi {
                 &req.sandbox_id,
                 port_u16(req.guest_port)?,
                 port_u16(req.host_port)?,
-                if req.udp {
+                if req.is_udp {
                     burrow_net::Protocol::Udp
                 } else {
                     burrow_net::Protocol::Tcp
@@ -608,10 +813,10 @@ impl NodeService for NodeApi {
                     ports,
                     allowed_clients: req.allowed_clients,
                     udp_ports,
-                    all_udp: req.all_udp,
-                    transparent_ip: !req.no_transparent_ip,
+                    is_all_udp_shared: req.is_all_udp,
+                    is_ip_transparent: !req.is_transparent_ip_disabled,
                 },
-                req.rotate,
+                req.is_rotating,
             )
             .await?;
         Ok(Response::new(share_proto(req.sandbox_id, info)))
@@ -665,6 +870,7 @@ impl NodeService for NodeApi {
         // are the more specific instruction.
         let image = self.image_environment(sandbox.template()).await;
         let mut env = image.as_map();
+        env.extend(sandbox.record().env);
         env.extend(start.env);
         let cwd = if !start.cwd.is_empty() {
             start.cwd
@@ -690,10 +896,11 @@ impl NodeService for NodeApi {
                 cmd: start.cmd,
                 env,
                 cwd,
-                pty: start.pty,
+                is_pty: start.is_pty,
                 rows: start.rows,
                 cols: start.cols,
                 user: start.user,
+                is_env_cleared: false,
             })),
         };
 
@@ -734,6 +941,8 @@ impl NodeService for NodeApi {
             path: first.path,
             mode: first.mode,
             data: first.data,
+            owner: String::new(),
+            is_existing_skipped: false,
         };
         // A cap can only be checked as the bytes go past, so the stream stops
         // at the chunk that crosses it and says so here. Two flags rather than
@@ -751,7 +960,7 @@ impl NodeService for NodeApi {
             use std::sync::atomic::Ordering::Relaxed;
 
             let mut sent = agent_first.data.len() as u64;
-            if over_cap(max_bytes, sent) {
+            if is_over_cap(max_bytes, sent) {
                 tripped.store(true, Relaxed);
                 return;
             }
@@ -767,14 +976,13 @@ impl NodeService for NodeApi {
                     None => break,
                 };
                 sent += chunk.data.len() as u64;
-                if over_cap(max_bytes, sent) {
+                if is_over_cap(max_bytes, sent) {
                     tripped.store(true, Relaxed);
                     return;
                 }
                 yield agentpb::FileChunk {
-                    path: String::new(),
-                    mode: 0,
                     data: chunk.data,
+                    ..Default::default()
                 };
             }
         };
@@ -844,7 +1052,7 @@ impl NodeService for NodeApi {
             .store
             .query_egress(&burrow_store::EgressFilter {
                 sandbox_id: (!req.sandbox_id.is_empty()).then(|| req.sandbox_id.clone()),
-                denied_only: req.denied_only,
+                is_denied_only: req.is_denied_only,
                 since: (!req.since.is_empty()).then(|| req.since.clone()),
                 limit: req.limit,
             })
@@ -860,7 +1068,7 @@ impl NodeService for NodeApi {
                     destination: r.destination,
                     host: r.host,
                     port: r.port,
-                    allowed: r.allowed,
+                    is_allowed: r.is_allowed,
                     reason: r.reason,
                     bytes_sent: r.bytes_sent as u64,
                     bytes_received: r.bytes_received as u64,
@@ -886,7 +1094,7 @@ impl NodeService for NodeApi {
         let stream = agent
             .watch(agentpb::WatchRequest {
                 path: req.path,
-                recursive: req.recursive,
+                is_recursive: req.is_recursive,
                 interval_ms: req.interval_ms,
             })
             .await?
@@ -1179,7 +1387,7 @@ fn command_info(info: agentpb::CommandInfo) -> api::CommandInfo {
 const MAX_PATH_SCOPES: usize = 16;
 
 /// Whether an upload of `sent` bytes has passed `max`. 0 is unlimited.
-fn over_cap(max: u64, sent: u64) -> bool {
+fn is_over_cap(max: u64, sent: u64) -> bool {
     max != 0 && sent > max
 }
 
@@ -1233,7 +1441,7 @@ fn within_scopes(scopes: &[String], path: &str) -> Result<(), Status> {
 /// before these policies were enforced carries.
 fn check_exec(policy: &common::Policy) -> Result<(), Status> {
     match &policy.exec {
-        Some(exec) if !exec.allow_exec => Err(Status::permission_denied(
+        Some(exec) if !exec.is_exec_allowed => Err(Status::permission_denied(
             "this sandbox's policy does not allow exec",
         )),
         _ => Ok(()),
@@ -1245,7 +1453,7 @@ fn check_upload(policy: &common::Policy, path: &str) -> Result<u64, Status> {
     let Some(fs) = &policy.fs else {
         return Ok(0);
     };
-    if !fs.allow_upload {
+    if !fs.is_upload_allowed {
         return Err(Status::permission_denied(
             "this sandbox's policy does not allow uploads",
         ));
@@ -1258,7 +1466,7 @@ fn check_download(policy: &common::Policy, path: &str) -> Result<(), Status> {
     let Some(fs) = &policy.fs else {
         return Ok(());
     };
-    if !fs.allow_download {
+    if !fs.is_download_allowed {
         return Err(Status::permission_denied(
             "this sandbox's policy does not allow downloads",
         ));
@@ -1268,7 +1476,7 @@ fn check_download(policy: &common::Policy, path: &str) -> Result<(), Status> {
 
 /// Calls that read a path without carrying its contents out: list_dir, watch.
 ///
-/// The scopes apply, but `allow_download` does not: a listing is not the file.
+/// The scopes apply, but `is_download_allowed` does not: a listing is not the file.
 fn check_read_path(policy: &common::Policy, path: &str) -> Result<(), Status> {
     match &policy.fs {
         Some(fs) => within_scopes(&fs.path_scopes, path),
@@ -1313,11 +1521,12 @@ async fn remove_partial_upload_inner(sandbox: &RunningSandbox, path: &str) {
             cmd: vec!["/bin/rm".into(), "-f".into(), "--".into(), path.to_string()],
             env: Default::default(),
             cwd: String::new(),
-            pty: false,
+            is_pty: false,
             rows: 0,
             cols: 0,
             // The node's own housekeeping, which is root's.
             user: String::new(),
+            is_env_cleared: false,
         })),
     };
     if let Ok(response) = agent.exec(tokio_stream::iter(vec![start])).await {
@@ -1333,7 +1542,7 @@ fn port_proto(sandbox_id: String, port: &burrow_net::PortMap) -> api::PortMappin
         sandbox_id,
         guest_port: u32::from(port.guest_port),
         host_port: u32::from(port.host_port),
-        udp: port.protocol == burrow_net::Protocol::Udp,
+        is_udp: port.protocol == burrow_net::Protocol::Udp,
         host_address: String::new(),
         edge_url: String::new(),
     }
@@ -1358,8 +1567,8 @@ fn share_proto(sandbox_id: String, info: crate::share::ShareInfo) -> api::Share 
         allowed_clients: info.spec.allowed_clients,
         created_at: burrow_core::rfc3339_from_unix_secs(info.spec.created_at),
         udp_ports: info.spec.udp_ports.iter().map(|p| u32::from(*p)).collect(),
-        all_udp: info.spec.all_udp,
-        transparent_ip: info.transparent_ip,
+        is_all_udp: info.spec.is_all_udp_shared,
+        is_transparent_ip: info.is_ip_transparent,
     }
 }
 
@@ -1509,7 +1718,7 @@ fn validate_policy(policy: &common::Policy) -> Result<(), Status> {
         // Keeping what retention evicted only bounds anything if the evicted
         // snapshot expires on its own. Refused rather than accepted as a policy
         // that says "bound this" and then keeps every snapshot forever.
-        if resources.keep_evicted_snapshots {
+        if resources.is_evicted_snapshot_kept {
             if resources.keep_last_snapshots == 0 {
                 return Err(Status::invalid_argument(
                     "keep_evicted_snapshots needs keep_last_snapshots: nothing is evicted without it",
@@ -1583,16 +1792,23 @@ fn validate_network_policy(policy: &common::NetworkPolicy) -> Result<(), Status>
             )));
         }
     }
+    for domain in &policy.deny_domains {
+        if !is_host_glob(domain) {
+            return Err(Status::invalid_argument(format!(
+                "deny_domains entry {domain:?} is not a domain glob"
+            )));
+        }
+    }
 
     // Inspection happens in the egress proxy, and only allowlist mode
     // redirects traffic there. Anywhere else it is a promise the boundary
     // cannot keep, which is worse than refusing it.
-    if policy.inspect_tls && policy.mode != common::NetworkMode::Allowlist as i32 {
+    if policy.is_tls_inspected && policy.mode != common::NetworkMode::Allowlist as i32 {
         return Err(Status::invalid_argument(
             "inspect_tls requires the allowlist network mode",
         ));
     }
-    if !policy.rules.is_empty() && !policy.inspect_tls {
+    if !policy.rules.is_empty() && !policy.is_tls_inspected {
         return Err(Status::invalid_argument(
             "rules require inspect_tls: the proxy must terminate TLS to read a request at all",
         ));
@@ -1607,7 +1823,64 @@ fn validate_network_policy(policy: &common::NetworkPolicy) -> Result<(), Status>
     for rule in &policy.rules {
         compile_rule(rule).map_err(Status::invalid_argument)?;
     }
+    if !policy.http_rules.is_empty() && !policy.is_tls_inspected {
+        return Err(Status::invalid_argument(
+            "http_rules require inspect_tls: the proxy must terminate TLS to read a request at all",
+        ));
+    }
+    if policy.http_rules.len() > MAX_HTTP_RULES {
+        return Err(Status::invalid_argument(format!(
+            "at most {MAX_HTTP_RULES} http rules ({} given)",
+            policy.http_rules.len()
+        )));
+    }
+    for rule in &policy.http_rules {
+        validate_http_rule(rule).map_err(Status::invalid_argument)?;
+    }
     Ok(())
+}
+
+/// HTTP rules one policy may carry. Every request to an inspected host walks
+/// the list, so its length is part of the per-request cost.
+const MAX_HTTP_RULES: usize = 64;
+
+fn validate_http_rule(rule: &common::HttpRule) -> Result<(), String> {
+    if rule.hosts.is_empty() {
+        return Err("an http rule names no hosts".into());
+    }
+    for host in &rule.hosts {
+        if !is_host_glob(host) {
+            return Err(format!("http rule host {host:?} is not a domain glob"));
+        }
+    }
+    for method in &rule.methods {
+        if method.is_empty()
+            || !method
+                .bytes()
+                .all(|b| b.is_ascii_uppercase() || b == b'-' || b == b'_')
+        {
+            return Err(format!(
+                "http rule method {method:?} is not an uppercase token or ANY"
+            ));
+        }
+    }
+    for path in &rule.paths {
+        if !path.starts_with('/') {
+            return Err(format!("http rule path {path:?} must start with '/'"));
+        }
+        if path.len() > proxypolicy::MAX_PATTERN {
+            return Err(format!(
+                "an http rule path is at most {} bytes",
+                proxypolicy::MAX_PATTERN
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// A domain glob, or the `*` / `**` that names every host.
+fn is_host_glob(value: &str) -> bool {
+    value == "*" || value == "**" || is_domain_glob(value)
 }
 
 /// Turns one wire rule into the compiled rule the proxy evaluates.
@@ -1826,6 +2099,9 @@ fn redact_secrets(mut sandbox: common::Sandbox) -> common::Sandbox {
             }
         }
     }
+    for value in sandbox.kit_credentials.values_mut() {
+        *value = REDACTED.to_string();
+    }
     sandbox
 }
 
@@ -1844,7 +2120,7 @@ fn translate_exec_input(msg: api::ExecInput) -> Option<agentpb::ExecInput> {
             rows: size.rows,
             cols: size.cols,
         }),
-        ApiInput::StdinEof(eof) => AgentInput::StdinEof(eof),
+        ApiInput::IsStdinEof(eof) => AgentInput::IsStdinEof(eof),
         ApiInput::Start(_) => return None,
     };
     Some(agentpb::ExecInput { input: Some(input) })
@@ -1913,7 +2189,7 @@ mod policy_tests {
     fn keeping_evicted_snapshots_needs_a_cap_and_an_expiry() {
         let resources = |keep_last, expiry| common::Policy {
             resources: Some(common::ResourcePolicy {
-                keep_evicted_snapshots: true,
+                is_evicted_snapshot_kept: true,
                 keep_last_snapshots: keep_last,
                 snapshot_expiration_secs: expiry,
                 ..Default::default()
@@ -1979,7 +2255,7 @@ mod policy_tests {
     fn inspected(rules: Vec<common::RequestRule>) -> common::NetworkPolicy {
         common::NetworkPolicy {
             mode: common::NetworkMode::Allowlist as i32,
-            inspect_tls: true,
+            is_tls_inspected: true,
             rules,
             ..Default::default()
         }
@@ -2057,7 +2333,7 @@ mod policy_tests {
 
         // Without inspection the proxy never sees a request to rewrite.
         let mut uninspected = inspected(vec![header("api.example.com", "X-Key", "k")]);
-        uninspected.inspect_tls = false;
+        uninspected.is_tls_inspected = false;
         assert!(validate_network_policy(&uninspected).is_err());
 
         // And inspection itself only means something in allowlist mode.
@@ -2225,7 +2501,7 @@ mod policy_tests {
         }
 
         let mut uninspected = inspected(vec![forwarding("api.example.com", "http://gate/")]);
-        uninspected.inspect_tls = false;
+        uninspected.is_tls_inspected = false;
         assert!(validate_network_policy(&uninspected).is_err());
 
         // A rule naming no action at all says nothing about what to do.
@@ -2365,10 +2641,12 @@ mod policy_tests {
     #[test]
     fn a_present_section_is_enforced() {
         let locked = common::Policy {
-            exec: Some(common::ExecPolicy { allow_exec: false }),
+            exec: Some(common::ExecPolicy {
+                is_exec_allowed: false,
+            }),
             fs: Some(common::FsPolicy {
-                allow_upload: true,
-                allow_download: false,
+                is_upload_allowed: true,
+                is_download_allowed: false,
                 path_scopes: scopes(&["/work"]),
                 max_upload_bytes: 1024,
             }),
@@ -2385,10 +2663,12 @@ mod policy_tests {
 
         // A section that permits everything it names still reads as permission.
         let open = common::Policy {
-            exec: Some(common::ExecPolicy { allow_exec: true }),
+            exec: Some(common::ExecPolicy {
+                is_exec_allowed: true,
+            }),
             fs: Some(common::FsPolicy {
-                allow_upload: true,
-                allow_download: true,
+                is_upload_allowed: true,
+                is_download_allowed: true,
                 ..Default::default()
             }),
             ..Default::default()
@@ -2400,9 +2680,9 @@ mod policy_tests {
 
     #[test]
     fn an_upload_cap_counts_the_whole_stream() {
-        assert!(!over_cap(0, u64::MAX));
-        assert!(!over_cap(1024, 1024));
-        assert!(over_cap(1024, 1025));
+        assert!(!is_over_cap(0, u64::MAX));
+        assert!(!is_over_cap(1024, 1024));
+        assert!(is_over_cap(1024, 1025));
     }
 
     /// A scope the matcher would refuse on sight is a confinement the caller

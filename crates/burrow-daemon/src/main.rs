@@ -2,6 +2,7 @@ mod agentconn;
 mod blobs;
 mod devvm;
 mod edge;
+mod kit;
 mod nodeapi;
 mod oci;
 mod sandbox;

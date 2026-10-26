@@ -34,7 +34,7 @@ pub struct Member {
 
 impl Member {
     /// Whether this member answers to `name`, by alias or by id.
-    fn answers_to(&self, name: &str) -> bool {
+    fn is_known_as(&self, name: &str) -> bool {
         self.alias.eq_ignore_ascii_case(name) || self.sandbox_id.eq_ignore_ascii_case(name)
     }
 }
@@ -88,7 +88,7 @@ impl Directory {
         if let Some((alias, network)) = stem.rsplit_once('.')
             && joined.contains(network)
             && let Some(members) = networks.get(network)
-            && let Some(member) = members.iter().find(|m| m.answers_to(alias))
+            && let Some(member) = members.iter().find(|m| m.is_known_as(alias))
         {
             return Some(member.address);
         }
@@ -100,7 +100,7 @@ impl Directory {
             .find_map(|(_, members)| {
                 members
                     .iter()
-                    .find(|m| m.answers_to(stem))
+                    .find(|m| m.is_known_as(stem))
                     .map(|m| m.address)
             })
     }

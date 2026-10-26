@@ -70,7 +70,8 @@ fn proc_path(dir: &std::fs::File) -> std::path::PathBuf {
 }
 
 /// Creates every missing directory in `path`, one component at a time, without
-/// walking through a symlink.
+/// walking through a symlink. Directories it creates are given to `owner`;
+/// ones that already existed are left as they are.
 ///
 /// `create_dir_all` resolves the whole path by the ordinary rules, so a caller
 /// confined to `/work` who plants `/work/out -> /etc` and uploads to
@@ -79,7 +80,10 @@ fn proc_path(dir: &std::fs::File) -> std::path::PathBuf {
 /// and passed it. Each component is instead made and reopened relative to the
 /// one before it under `RESOLVE_NO_SYMLINKS`, which is the same guarantee the
 /// final open already gives.
-fn create_dir_all_no_symlinks(path: &std::path::Path) -> std::io::Result<()> {
+fn create_dir_all_no_symlinks(
+    path: &std::path::Path,
+    owner: Option<(u32, u32)>,
+) -> std::io::Result<()> {
     use std::path::Component;
 
     let mut components = path.components().peekable();
@@ -109,11 +113,28 @@ fn create_dir_all_no_symlinks(path: &std::path::Path) -> std::io::Result<()> {
         // EEXIST is the common case: only the tail of the path is usually
         // new. An existing *symlink* also reports EEXIST, and is caught by the
         // open below refusing it.
-        match nix::sys::stat::mkdirat(&dir, name, Mode::from_bits_truncate(0o755)) {
-            Ok(()) | Err(nix::errno::Errno::EEXIST) => {}
+        let created = match nix::sys::stat::mkdirat(&dir, name, Mode::from_bits_truncate(0o755)) {
+            Ok(()) => true,
+            Err(nix::errno::Errno::EEXIST) => false,
             Err(err) => return Err(std::io::Error::from(err)),
-        }
+        };
         dir = openat_no_symlinks(&dir, name, OFlag::O_RDONLY | OFlag::O_DIRECTORY)?;
+        if created && let Some((uid, gid)) = owner {
+            fchown(&dir, uid, gid)?;
+        }
+    }
+    Ok(())
+}
+
+/// `libc::fchown` directly, for the same reason `users` has its own `chown`:
+/// nix gates the wrapper behind a feature this workspace does not enable. On
+/// the descriptor rather than the path, so it cannot land on anything but the
+/// inode the no-symlink open just returned.
+fn fchown(file: &std::fs::File, uid: u32, gid: u32) -> std::io::Result<()> {
+    use std::os::fd::AsRawFd as _;
+    // SAFETY: `file` holds the descriptor open for the call.
+    if unsafe { nix::libc::fchown(file.as_raw_fd(), uid, gid) } < 0 {
+        return Err(std::io::Error::last_os_error());
     }
     Ok(())
 }
@@ -135,12 +156,13 @@ fn io_status(action: &str, path: &str, err: std::io::Error) -> Status {
     }
 }
 
-/// Streams an uploaded file to disk. The first chunk carries the path and
-/// mode; every chunk including the first may carry data.
+/// Streams an uploaded file to disk. The first chunk carries the path, mode,
+/// owner and whether to leave an existing file alone; every chunk including
+/// the first may carry data.
 pub async fn upload(
     mut inbound: Streaming<agentpb::FileChunk>,
 ) -> Result<agentpb::UploadResult, Status> {
-    let first = inbound
+    let mut first = inbound
         .next()
         .await
         .transpose()?
@@ -148,30 +170,50 @@ pub async fn upload(
     if first.path.is_empty() {
         return Err(Status::invalid_argument("first chunk must set path"));
     }
-    let path = first.path.clone();
+    let path = std::mem::take(&mut first.path);
     let mode = if first.mode == 0 { 0o644 } else { first.mode };
+    // Resolved before anything is created: an owner who does not exist must
+    // fail the upload as a request, not leave a root-owned file behind.
+    let owner = if first.owner.is_empty() {
+        None
+    } else {
+        let passwd = crate::users::lookup_user(&first.owner)?;
+        Some((passwd.uid, passwd.gid))
+    };
 
     if let Some(parent) = std::path::Path::new(&path).parent()
         && !parent.as_os_str().is_empty()
     {
         let parent = parent.to_path_buf();
-        tokio::task::spawn_blocking(move || create_dir_all_no_symlinks(&parent))
+        tokio::task::spawn_blocking(move || create_dir_all_no_symlinks(&parent, owner))
             .await
             .map_err(|err| Status::internal(format!("mkdir did not run: {err}")))?
             .map_err(|err| io_status("create parent of", &path, err))?;
     }
 
+    // O_EXCL rather than a stat first: there is no window in which a file
+    // appearing between the check and the open gets truncated anyway.
+    let flags = OFlag::O_WRONLY
+        | OFlag::O_CREAT
+        | if first.is_existing_skipped {
+            OFlag::O_EXCL
+        } else {
+            OFlag::O_TRUNC
+        };
     let open_path = path.clone();
-    let std_file = tokio::task::spawn_blocking(move || {
-        open_no_symlinks(
-            &open_path,
-            OFlag::O_WRONLY | OFlag::O_CREAT | OFlag::O_TRUNC,
-            Mode::from_bits_truncate(0o644),
-        )
+    let opened = tokio::task::spawn_blocking(move || {
+        open_no_symlinks(&open_path, flags, Mode::from_bits_truncate(0o644))
     })
     .await
-    .map_err(|err| Status::internal(format!("open did not run: {err}")))?
-    .map_err(|err| io_status("create", &path, err))?;
+    .map_err(|err| Status::internal(format!("open did not run: {err}")))?;
+    let std_file = match opened {
+        Err(err)
+            if first.is_existing_skipped && err.kind() == std::io::ErrorKind::AlreadyExists =>
+        {
+            return Ok(agentpb::UploadResult { bytes_written: 0 });
+        }
+        other => other.map_err(|err| io_status("create", &path, err))?,
+    };
     let mut file = tokio::fs::File::from_std(std_file);
 
     let mut written = 0u64;
@@ -197,10 +239,12 @@ pub async fn upload(
     let file = file.into_std().await;
     tokio::task::spawn_blocking(move || {
         nix::sys::stat::fchmod(&file, Mode::from_bits_truncate(mode))
+            .map_err(std::io::Error::from)?;
+        owner.map_or(Ok(()), |(uid, gid)| fchown(&file, uid, gid))
     })
     .await
     .map_err(|err| Status::internal(format!("chmod did not run: {err}")))?
-    .map_err(|err| io_status("chmod", &path, std::io::Error::from(err)))?;
+    .map_err(|err| io_status("chmod", &path, err))?;
 
     Ok(agentpb::UploadResult {
         bytes_written: written,
@@ -228,9 +272,8 @@ pub async fn download(
                 Ok(0) => break,
                 Ok(n) => {
                     let chunk = agentpb::FileChunk {
-                        path: String::new(),
-                        mode: 0,
                         data: buf[..n].to_vec(),
+                        ..Default::default()
                     };
                     if tx.send(Ok(chunk)).await.is_err() {
                         break;
@@ -470,8 +513,9 @@ mod tests {
         std::fs::create_dir_all(tmp.path("elsewhere")).unwrap();
         std::os::unix::fs::symlink(tmp.path("elsewhere"), tmp.path("scope/escape")).unwrap();
 
-        let err = create_dir_all_no_symlinks(std::path::Path::new(&tmp.path("scope/escape/sub")))
-            .expect_err("the link must be refused");
+        let err =
+            create_dir_all_no_symlinks(std::path::Path::new(&tmp.path("scope/escape/sub")), None)
+                .expect_err("the link must be refused");
         // ELOOP is what openat2 reports for a RESOLVE_NO_SYMLINKS violation.
         assert_eq!(err.raw_os_error(), Some(nix::libc::ELOOP), "{err:?}");
         assert!(!std::path::Path::new(&tmp.path("elsewhere/sub")).exists());
@@ -480,10 +524,10 @@ mod tests {
     #[test]
     fn a_missing_parent_is_still_created() {
         let tmp = Tmp::new("mkdir-ok");
-        create_dir_all_no_symlinks(std::path::Path::new(&tmp.path("a/b/c"))).unwrap();
+        create_dir_all_no_symlinks(std::path::Path::new(&tmp.path("a/b/c")), None).unwrap();
         assert!(std::path::Path::new(&tmp.path("a/b/c")).is_dir());
         // Idempotent, which is what `create_dir_all` callers rely on.
-        create_dir_all_no_symlinks(std::path::Path::new(&tmp.path("a/b/c"))).unwrap();
+        create_dir_all_no_symlinks(std::path::Path::new(&tmp.path("a/b/c")), None).unwrap();
     }
 
     /// `..` is an escape however it is resolved, so it is refused outright
@@ -491,7 +535,7 @@ mod tests {
     #[test]
     fn a_parent_reference_is_refused() {
         let tmp = Tmp::new("mkdir-dotdot");
-        let err = create_dir_all_no_symlinks(std::path::Path::new(&tmp.path("a/../b")))
+        let err = create_dir_all_no_symlinks(std::path::Path::new(&tmp.path("a/../b")), None)
             .expect_err("`..` must be refused");
         assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
     }

@@ -210,7 +210,7 @@ class Template(TemplateBuilder):
         try:
             res = transport.unary("ListTemplates", api_pb2.ListTemplatesRequest())
             return [
-                TemplateInfo(name=t.name, size_bytes=t.size_bytes, warm=t.warm)
+                TemplateInfo(name=t.name, size_bytes=t.size_bytes, warm=t.is_warm)
                 for t in res.templates
             ]
         finally:

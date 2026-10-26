@@ -49,6 +49,8 @@ pub struct Meta {
     pub size_mib: u64,
     /// RFC 3339.
     pub created_at: String,
+    #[serde(default)]
+    pub labels: HashMap<String, String>,
 }
 
 /// Who currently holds one volume.
@@ -107,7 +109,12 @@ impl VolumeStore {
         self.dir(name).join(IMAGE)
     }
 
-    pub async fn create(&self, name: &str, size_mib: u64) -> Result<common::Volume, Status> {
+    pub async fn create(
+        &self,
+        name: &str,
+        size_mib: u64,
+        labels: HashMap<String, String>,
+    ) -> Result<common::Volume, Status> {
         validate_name(name)?;
         if !(MIN_SIZE_MIB..=MAX_SIZE_MIB).contains(&size_mib) {
             return Err(Status::invalid_argument(format!(
@@ -145,6 +152,7 @@ impl VolumeStore {
             name: name.to_string(),
             size_mib,
             created_at: burrow_core::now_rfc3339(),
+            labels,
         };
         let json = serde_json::to_vec_pretty(&meta)
             .map_err(|err| Status::internal(format!("volume metadata: {err}")))?;
@@ -225,13 +233,13 @@ impl VolumeStore {
     pub fn claim(&self, sandbox_id: &str, mounts: &[common::VolumeMount]) -> Result<(), Status> {
         let mut claims = self.claims.lock().unwrap();
         let mut taken = Vec::new();
-        for mount in mounts {
+        for (_, mount) in block_mounts(mounts) {
             let claim = claims.entry(mount.volume.clone()).or_default();
             // A sandbox re-claiming what it already holds is a resume, not a
             // conflict with itself.
             let held_by_someone_else =
                 |who: &Option<String>| who.as_deref().is_some_and(|holder| holder != sandbox_id);
-            let refusal = if mount.read_only {
+            let refusal = if mount.is_read_only {
                 held_by_someone_else(&claim.writer).then(|| {
                     format!(
                         "volume {} is attached writable to sandbox {}; a read-only mount \
@@ -266,7 +274,7 @@ impl VolumeStore {
                 self.release_named(sandbox_id, &taken);
                 return Err(Status::failed_precondition(message));
             }
-            if mount.read_only {
+            if mount.is_read_only {
                 claim.readers.insert(sandbox_id.to_string());
             } else {
                 claim.writer = Some(sandbox_id.to_string());
@@ -375,6 +383,7 @@ impl VolumeStore {
             size_mib: meta.size_mib,
             created_at: meta.created_at.clone(),
             attached_to: self.holder(&meta.name).unwrap_or_default(),
+            labels: meta.labels.clone(),
         }
     }
 }
@@ -395,18 +404,38 @@ pub fn validate_name(name: &str) -> Result<(), Status> {
 }
 
 /// Checks the mounts a create asked for, before any of them is acted on.
+///
+/// A tmpfs entry names no volume and takes no device, so the cap on block
+/// devices does not count it; it shares the path rules, since it lands in
+/// the same guest tree.
 pub fn validate_mounts(mounts: &[common::VolumeMount]) -> Result<(), Status> {
-    if mounts.len() > MAX_MOUNTS {
+    let block = block_mounts(mounts).count();
+    if block > MAX_MOUNTS {
         return Err(Status::invalid_argument(format!(
-            "at most {MAX_MOUNTS} volume mounts, got {}",
-            mounts.len()
+            "at most {MAX_MOUNTS} volume mounts, got {block}"
         )));
     }
     let mut paths: Vec<&String> = Vec::new();
     let mut names: Vec<&String> = Vec::new();
     for mount in mounts {
-        validate_name(&mount.volume)?;
+        if mount.is_tmpfs {
+            if !mount.volume.is_empty() {
+                return Err(Status::invalid_argument(format!(
+                    "tmpfs mount at {} names volume {}; a tmpfs has no volume behind it",
+                    mount.path, mount.volume
+                )));
+            }
+        } else {
+            validate_name(&mount.volume)?;
+            if mount.size_mib != 0 {
+                return Err(Status::invalid_argument(format!(
+                    "volume {} has its size already; size_mib is for tmpfs mounts",
+                    mount.volume
+                )));
+            }
+        }
         validate_path(&mount.path)?;
+        validate_mode(&mount.mode)?;
         // Not just equal paths: one mount nested inside another is shadowed by
         // it, so the caller would find an empty directory rather than a
         // volume, with nothing to say why.
@@ -424,14 +453,29 @@ pub fn validate_mounts(mounts: &[common::VolumeMount]) -> Result<(), Status> {
         }
         // One volume at two paths would be one block device mounted twice,
         // which ext4 refuses in the guest rather than here.
-        if names.contains(&&mount.volume) {
+        if !mount.is_tmpfs && names.contains(&&mount.volume) {
             return Err(Status::invalid_argument(format!(
                 "volume {} mounted twice",
                 mount.volume
             )));
         }
         paths.push(&mount.path);
-        names.push(&mount.volume);
+        if !mount.is_tmpfs {
+            names.push(&mount.volume);
+        }
+    }
+    Ok(())
+}
+
+/// Checks a mount root's mode: octal as a caller would type it to chmod, with
+/// or without the leading setuid/setgid/sticky digit.
+fn validate_mode(mode: &str) -> Result<(), Status> {
+    let ok = mode.is_empty()
+        || ((3..=4).contains(&mode.len()) && mode.bytes().all(|b| (b'0'..=b'7').contains(&b)));
+    if !ok {
+        return Err(Status::invalid_argument(format!(
+            "mount mode {mode:?} must be 3 or 4 octal digits"
+        )));
     }
     Ok(())
 }
@@ -473,19 +517,41 @@ pub fn device_for(index: usize) -> String {
     format!("/dev/vd{}", (FIRST_DEVICE + index as u8) as char)
 }
 
+/// The mounts that are block devices, each with its drive index.
+///
+/// Every place that links an image, attaches a drive or names a guest device
+/// counts through this, so a tmpfs anywhere in the list does not shift the
+/// device names of the volumes after it.
+pub fn block_mounts(
+    mounts: &[common::VolumeMount],
+) -> impl Iterator<Item = (usize, &common::VolumeMount)> {
+    mounts.iter().filter(|mount| !mount.is_tmpfs).enumerate()
+}
+
 /// What the guest is told: devices rather than volume names, since the name is
 /// a host-side handle and the guest only has the block device.
 ///
 /// The order here must be the order the drives were attached, which is why
 /// both come from the same slice.
 pub fn agent_mounts(mounts: &[common::VolumeMount]) -> Vec<burrow_proto::agent::v1::VolumeMount> {
+    let mut block = 0;
     mounts
         .iter()
-        .enumerate()
-        .map(|(index, mount)| burrow_proto::agent::v1::VolumeMount {
-            device: device_for(index),
-            path: mount.path.clone(),
-            read_only: mount.read_only,
+        .map(|mount| {
+            let device = if mount.is_tmpfs {
+                String::new()
+            } else {
+                block += 1;
+                device_for(block - 1)
+            };
+            burrow_proto::agent::v1::VolumeMount {
+                device,
+                path: mount.path.clone(),
+                is_read_only: mount.is_read_only,
+                is_tmpfs: mount.is_tmpfs,
+                size_mib: mount.size_mib,
+                mode: mount.mode.clone(),
+            }
         })
         .collect()
 }
@@ -498,7 +564,18 @@ mod tests {
         common::VolumeMount {
             volume: volume.into(),
             path: path.into(),
-            read_only,
+            is_read_only: read_only,
+            ..Default::default()
+        }
+    }
+
+    fn tmpfs(path: &str, size_mib: u64, mode: &str) -> common::VolumeMount {
+        common::VolumeMount {
+            path: path.into(),
+            is_tmpfs: true,
+            size_mib,
+            mode: mode.into(),
+            ..Default::default()
         }
     }
 
@@ -545,6 +622,61 @@ mod tests {
         );
         assert!(validate_mounts(&[mount("a", "/one", false), mount("a", "/two", false)]).is_err());
         assert!(validate_mounts(&[mount("a", "/one", false), mount("b", "/two", false)]).is_ok());
+    }
+
+    #[test]
+    fn a_tmpfs_is_a_mount_without_a_volume() {
+        assert!(validate_mounts(&[tmpfs("/scratch", 0, "")]).is_ok());
+        assert!(validate_mounts(&[tmpfs("/scratch", 512, "1777")]).is_ok());
+        assert!(validate_mounts(&[tmpfs("/scratch", 0, "755")]).is_ok());
+        // Two tmpfs mounts share no name, so only their paths can clash.
+        assert!(validate_mounts(&[tmpfs("/a", 0, ""), tmpfs("/b", 0, "")]).is_ok());
+        assert!(validate_mounts(&[tmpfs("/a", 0, ""), tmpfs("/a", 0, "")]).is_err());
+        assert!(validate_mounts(&[mount("v", "/data", false), tmpfs("/data/tmp", 0, "")]).is_err());
+        // It obeys the same path rules as a volume.
+        assert!(validate_mounts(&[tmpfs("/tmp/x", 0, "")]).is_err());
+
+        let mut named = tmpfs("/scratch", 0, "");
+        named.volume = "v".into();
+        assert!(validate_mounts(&[named]).is_err());
+        for bad in ["17777", "77", "1778", "rwx"] {
+            assert!(
+                validate_mounts(&[tmpfs("/scratch", 0, bad)]).is_err(),
+                "{bad:?} should be refused"
+            );
+        }
+        let mut sized = mount("v", "/data", false);
+        sized.size_mib = 64;
+        assert!(validate_mounts(&[sized]).is_err());
+    }
+
+    /// A tmpfs takes no drive, so the volumes around it keep the devices they
+    /// would have had without it.
+    #[test]
+    fn a_tmpfs_does_not_shift_device_names() {
+        let mounts = [
+            mount("a", "/a", false),
+            tmpfs("/scratch", 256, "1777"),
+            mount("b", "/b", true),
+        ];
+        let agent = agent_mounts(&mounts);
+        assert_eq!(agent[0].device, "/dev/vdc");
+        assert_eq!(agent[1].device, "");
+        assert!(agent[1].is_tmpfs);
+        assert_eq!(agent[1].size_mib, 256);
+        assert_eq!(agent[1].mode, "1777");
+        assert_eq!(agent[2].device, "/dev/vdd");
+        assert!(agent[2].is_read_only);
+
+        let block: Vec<(usize, &str)> = block_mounts(&mounts)
+            .map(|(index, mount)| (index, mount.volume.as_str()))
+            .collect();
+        assert_eq!(block, [(0, "a"), (1, "b")]);
+
+        // Nor does it take a claim: there is nothing to hold.
+        let store = VolumeStore::new(Path::new("/tmp/burrow-volume-test"));
+        assert!(store.claim("sbx_a", &[tmpfs("/scratch", 0, "")]).is_ok());
+        assert!(store.claim("sbx_b", &[tmpfs("/scratch", 0, "")]).is_ok());
     }
 
     /// Many readers or one writer, never both: a reader alongside a writer

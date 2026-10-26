@@ -21,6 +21,15 @@ service Burrow {
   rpc DeleteSandbox(SandboxRef) returns (DeleteSandboxResponse);
   rpc PauseSandbox(SandboxRef) returns (burrow.common.v1.Sandbox);
   rpc ResumeSandbox(SandboxRef) returns (burrow.common.v1.Sandbox);
+  // Shut the VM down, keeping the writable disk and volumes, and boot it
+  // again. Unlike pause and resume, the guest's processes do not survive and
+  // a Kit's startup hooks run again on the way up.
+  rpc StopSandbox(SandboxRef) returns (burrow.common.v1.Sandbox);
+  rpc StartSandbox(SandboxRef) returns (burrow.common.v1.Sandbox);
+  // Replace a sandbox's root disk, discarding everything written to it, while
+  // keeping its id, address, name and volumes. With a Kit, the composition
+  // may change too.
+  rpc RecreateSandbox(RecreateSandboxRequest) returns (burrow.common.v1.Sandbox);
   // Every VM this sandbox has run, newest first.
   rpc ListSessions(SandboxRef) returns (ListSessionsResponse);
   // Move the clocks a running sandbox is measured against: lifetime, idle
@@ -45,6 +54,13 @@ service Burrow {
   rpc ListSnapshots(ListSnapshotsRequest) returns (ListSnapshotsResponse);
   rpc GetSnapshot(SnapshotRef) returns (burrow.common.v1.Snapshot);
   rpc DeleteSnapshot(SnapshotRef) returns (DeleteSnapshotResponse);
+
+  // Secrets: credentials Kits ask for by service name. Held by the
+  // orchestrator and handed to a node only as header-injection rules for the
+  // sandbox that needs them, so a guest never sees a value.
+  rpc SetSecret(SetSecretRequest) returns (SetSecretResponse);
+  rpc ListSecrets(ListSecretsRequest) returns (ListSecretsResponse);
+  rpc DeleteSecret(DeleteSecretRequest) returns (DeleteSecretResponse);
 
   // Volumes: persistent storage, mounted into sandboxes.
   rpc CreateVolume(CreateVolumeRequest) returns (burrow.common.v1.Volume);
@@ -99,7 +115,7 @@ service Burrow {
 message AuditQuery {
   // Empty means every sandbox.
   string sandbox_id = 1;
-  bool denied_only = 2;
+  bool is_denied_only = 2;
   // RFC 3339 lower bound.
   string since = 3;
   // 0 selects a server default.
@@ -113,7 +129,7 @@ message AuditEvent {
   string destination = 4;
   string host = 5;
   uint32 port = 6;
-  bool allowed = 7;
+  bool is_allowed = 7;
   string reason = 8;
   uint64 bytes_sent = 9;
   uint64 bytes_received = 10;
@@ -127,7 +143,7 @@ message AuditPage {
 message WatchRequest {
   string sandbox_id = 1;
   string path = 2;
-  bool recursive = 3;
+  bool is_recursive = 3;
   uint32 interval_ms = 4;
 }
 
@@ -160,6 +176,11 @@ message BuildTemplateRequest {
   // "ghcr.io/org/img@sha256:...". Takes the place of `from`, which names a
   // template that already exists on the node.
   string from_image = 7;
+  // Kit images to import as `name`: their layers are overlaid in dependency
+  // order and their descriptors recorded with the template. Takes the place
+  // of `from` and `from_image`; `steps` must be empty. An empty `name` is
+  // derived from the set's digests.
+  repeated string kits = 8;
 }
 
 message BuildDone {
@@ -183,7 +204,9 @@ message TemplateInfo {
   string name = 1;
   uint64 size_bytes = 2;
   // Whether creates from this template restore a snapshot instead of booting.
-  bool warm = 3;
+  bool is_warm = 3;
+  // Imported from Kits: creates run their lifecycle.
+  bool is_kit = 4;
 }
 
 message ListTemplatesResponse {
@@ -203,14 +226,14 @@ message ExposePortRequest {
   uint32 host_port = 3;
   // Forward UDP rather than TCP. A host port carries one or the other, so
   // publishing both for a guest port takes two mappings.
-  bool udp = 4;
+  bool is_udp = 4;
 }
 
 message PortMapping {
   string sandbox_id = 1;
   uint32 guest_port = 2;
   uint32 host_port = 3;
-  bool udp = 6;
+  bool is_udp = 6;
   // Address a client outside the sandbox should connect to.
   string host_address = 4;
   // Stable URL for this port through the edge router on the node holding the
@@ -241,19 +264,19 @@ message ShareRequest {
   repeated string allowed_clients = 3;
   // Issue new keys to an existing share, which gives it a new address and
   // ends every client's ability to connect with the old one.
-  bool rotate = 4;
+  bool is_rotating = 4;
   reserved 5;
   reserved "proxy_protocol";
   // Guest UDP ports reachable through the share. Unlike TCP, UDP is off
-  // unless asked for: `udp_ports` names ports, `all_udp` admits every one.
+  // unless asked for: `udp_ports` names ports, `is_all_udp` admits every one.
   repeated uint32 udp_ports = 6;
-  bool all_udp = 7;
+  bool is_all_udp = 7;
   reserved 8;
   reserved "transparent_ip";
   // Source connections from the gateway rather than from the client's own
   // address. On by default: a guest that can see who is calling can log,
   // rate-limit and authorise on it with no idea a tunnel is involved.
-  bool no_transparent_ip = 9;
+  bool is_transparent_ip_disabled = 9;
 }
 
 message Share {
@@ -269,11 +292,11 @@ message Share {
   // RFC 3339; the moment the current keys were issued.
   string created_at = 6;
   repeated uint32 udp_ports = 7;
-  bool all_udp = 8;
+  bool is_all_udp = 8;
   // What the share is actually doing, which is not always what was asked
   // for: a node whose kernel cannot carry the reply path serves from the
   // gateway and says so here.
-  bool transparent_ip = 9;
+  bool is_transparent_ip = 9;
   reserved 10, 11;
   reserved "client_range", "client_source_ips";
 }
@@ -327,7 +350,7 @@ message ListNodesResponse {
 message Node {
   burrow.common.v1.NodeInfo info = 1;
   burrow.common.v1.NodeStatus status = 2;
-  bool healthy = 3;
+  bool is_healthy = 3;
   // RFC 3339 time of last heartbeat.
   string last_heartbeat_at = 4;
 }
@@ -335,10 +358,10 @@ message Node {
 message DrainNodeRequest {
   string node_id = 1;
   // False lifts a drain.
-  bool drain = 2;
+  bool is_draining = 2;
   // Suspend the node's sandboxes as part of draining, so they can be resumed
   // elsewhere once template distribution exists.
-  bool suspend_sandboxes = 3;
+  bool is_suspending_sandboxes = 3;
 }
 
 message DrainNodeResponse {
@@ -463,6 +486,8 @@ message CreateVolumeRequest {
   // Labels the node holding this volume must carry. A volume never moves, so
   // this is the only chance to influence where it lands.
   map<string, string> node_labels = 3;
+  // Recorded on the volume; see `Volume.labels`.
+  map<string, string> labels = 4;
 }
 
 message ListVolumesRequest {
@@ -520,7 +545,39 @@ message CreateSandboxRequest {
   // the node holding it; a constraint the snapshot's node does not satisfy is
   // refused rather than dropped.
   map<string, string> node_labels = 7;
+  // Inputs for a Kit template: arg values and environment overrides. A
+  // template imported from Kits is provisioned the way their descriptors
+  // ask whether or not this is set: volumes, install hooks under the
+  // install-phase network policy, the runtime policy, startup hooks and the
+  // workload's entrypoint.
+  burrow.common.v1.KitSpec kit = 8;
 }
+
+message RecreateSandboxRequest {
+  string sandbox_id = 1;
+  // Replacement inputs; arg values and environment replace the recorded
+  // ones by name.
+  burrow.common.v1.KitSpec kit = 2;
+  // Template to boot the replacement disk from; empty keeps the current one.
+  // A Kit sandbox moved onto another Kit template keeps its volumes, under
+  // the same compatibility rule a recreation always applies.
+  string template = 3;
+}
+
+message SetSecretRequest {
+  // Lowercase kebab-case, the `service` a Kit credential names.
+  string name = 1;
+  string value = 2;
+}
+message SetSecretResponse {}
+message ListSecretsRequest {}
+message ListSecretsResponse {
+  repeated string names = 1;
+}
+message DeleteSecretRequest {
+  string name = 1;
+}
+message DeleteSecretResponse {}
 
 message ListSandboxesRequest {
   // Return only sandboxes carrying this tag, as "key=value". One tag at a
@@ -541,7 +598,7 @@ message ExecInput {
     // Signal number to deliver to the process.
     int32 signal = 4;
     // Close the command's stdin (EOF).
-    bool stdin_eof = 5;
+    bool is_stdin_eof = 5;
   }
 }
 
@@ -550,7 +607,7 @@ message ExecStart {
   repeated string cmd = 2;
   map<string, string> env = 3;
   string cwd = 4;
-  bool pty = 5;
+  bool is_pty = 5;
   uint32 rows = 6;
   uint32 cols = 7;
   // Guest user to run as; empty is root. The user has to exist already, which

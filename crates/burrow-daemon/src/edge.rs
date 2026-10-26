@@ -108,7 +108,7 @@ impl NodeEdge {
         // than a boundary. Checked before the sandbox is woken, so naming an
         // unpublished port cannot be used to wake a parked tenant either.
         let ports = self.sandboxes.list_ports(&target.sandbox_id).await;
-        if !port_is_published(&ports, target.port) {
+        if !is_port_published(&ports, target.port) {
             return Err(Refusal::new(
                 404,
                 format!(
@@ -167,7 +167,7 @@ where
     let (client_read, mut client_write) = tokio::io::split(client);
     let (mut upstream_read, mut upstream_write) = tokio::io::split(upstream);
 
-    if exchange.upgrade {
+    if exchange.is_upgrade_requested {
         let (head, status) = read_response_head(&mut upstream_read).await?;
         client_write.write_all(&head).await?;
         if status != 101 {
@@ -185,7 +185,7 @@ where
     // A tunnel's bytes are the one request that never ends. Anything past an
     // ordinary request's body is a second request, and this connection belongs
     // to the sandbox the first one named.
-    let allowance = if exchange.upgrade {
+    let allowance = if exchange.is_upgrade_requested {
         u64::MAX
     } else {
         exchange.body
@@ -194,7 +194,7 @@ where
 
     let upward = async {
         let moved = tokio::io::copy(&mut request, &mut upstream_write).await;
-        if exchange.upgrade {
+        if exchange.is_upgrade_requested {
             // The client half of a tunnel has ended, which the guest is
             // entitled to see. Not done for an ordinary request: a guest that
             // reads EOF before it has answered is entitled to abandon it.
@@ -217,7 +217,7 @@ where
 /// [`crate::sandbox::SandboxManager::list_ports`] returns them. Shared with
 /// [`crate::sandboxproxy`], which forwards traffic too and needs the same
 /// check.
-pub(crate) fn port_is_published(ports: &[burrow_net::PortMap], guest_port: u16) -> bool {
+pub(crate) fn is_port_published(ports: &[burrow_net::PortMap], guest_port: u16) -> bool {
     ports
         .iter()
         .any(|port| port.guest_port == guest_port && port.protocol == burrow_net::Protocol::Tcp)
@@ -289,11 +289,11 @@ mod tests {
             published(20006, 22, Protocol::Tcp),
             published(20007, 5353, Protocol::Udp),
         ];
-        assert!(port_is_published(&ports, 8080));
-        assert!(port_is_published(&ports, 22));
-        assert!(!port_is_published(&ports, 6379));
-        assert!(!port_is_published(&ports, 5353));
-        assert!(!port_is_published(&[], 8080));
+        assert!(is_port_published(&ports, 8080));
+        assert!(is_port_published(&ports, 22));
+        assert!(!is_port_published(&ports, 6379));
+        assert!(!is_port_published(&ports, 5353));
+        assert!(!is_port_published(&[], 8080));
     }
 
     /// The whole point of the node edge: it answers for its own sandboxes and
@@ -383,7 +383,7 @@ mod tests {
             "GET /b HTTP/1.1\r\nHost: 8000-sbx_b.node-a.local\r\n\r\n",
             Exchange {
                 body: 0,
-                upgrade: false,
+                is_upgrade_requested: false,
             },
             "HTTP/1.1 200 OK\r\nContent-Length: 1\r\n\r\na",
         )
@@ -408,7 +408,7 @@ mod tests {
             "hello",
             Exchange {
                 body: 5,
-                upgrade: false,
+                is_upgrade_requested: false,
             },
             "HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok",
         )
@@ -428,7 +428,7 @@ mod tests {
             "FRAME",
             Exchange {
                 body: 0,
-                upgrade: true,
+                is_upgrade_requested: true,
             },
             "HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\n\
              Connection: Upgrade\r\n\r\n",
@@ -452,7 +452,7 @@ mod tests {
             "GET /b HTTP/1.1\r\nHost: 8000-sbx_b.node-a.local\r\n\r\n",
             Exchange {
                 body: 0,
-                upgrade: true,
+                is_upgrade_requested: true,
             },
             "HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nno",
         )

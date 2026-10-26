@@ -14,6 +14,9 @@ enum SandboxState {
   SANDBOX_STATE_STOPPING = 5;
   SANDBOX_STATE_DESTROYED = 6;
   SANDBOX_STATE_FAILED = 7;
+  // Shut down: VMM gone, writable disk and volumes kept. A start cold-boots
+  // the same disk, unlike a resume, which restores the memory of a suspend.
+  SANDBOX_STATE_STOPPED = 8;
 }
 
 enum NetworkMode {
@@ -61,7 +64,7 @@ message ResourcePolicy {
   //
   // Spelled as "keep" rather than "delete evicted" so the proto3 default, and
   // therefore every caller that says nothing, gets the bounded behaviour.
-  bool keep_evicted_snapshots = 9;
+  bool is_evicted_snapshot_kept = 9;
 }
 
 // Whether callers may run commands in the sandbox.
@@ -70,7 +73,7 @@ message ResourcePolicy {
 // has always done. A present one is enforced by the node, before an Exec ever
 // reaches the guest agent.
 message ExecPolicy {
-  bool allow_exec = 1;
+  bool is_exec_allowed = 1;
 }
 
 // What callers may do to the sandbox's filesystem.
@@ -79,8 +82,8 @@ message ExecPolicy {
 // on upload, download, list_dir and watch, before a path or a byte reaches the
 // guest agent.
 message FsPolicy {
-  bool allow_upload = 1;
-  bool allow_download = 2;
+  bool is_upload_allowed = 1;
+  bool is_download_allowed = 2;
   // Absolute path prefixes file operations are confined to, matched on whole
   // path components; empty = whole fs. At most 16, none containing "..".
   repeated string path_scopes = 3;
@@ -191,7 +194,7 @@ message NetworkPolicy {
   // Terminate this sandbox's TLS so the host named *inside* the session is
   // checked too, not just the SNI. Closes domain fronting, at the cost of the
   // proxy being able to read the payload, which is why it is opt-in.
-  bool inspect_tls = 5;
+  bool is_tls_inspected = 5;
   // IPv4 ranges this sandbox may never reach, in any mode. Deny beats every
   // allowance: an allowed domain resolving into one of these is refused too.
   repeated string deny_cidrs = 6;
@@ -204,6 +207,30 @@ message NetworkPolicy {
   reserved 7;
   reserved "inject_headers";
   repeated RequestRule rules = 8;
+  // Domain globs refused in every mode, before any allowance is consulted. A
+  // name matching one is not resolved, not connected to and, inside an
+  // inspected session, not requested.
+  repeated string deny_domains = 9;
+  // Per-request grants and refusals for hosts whose traffic is inspected. A
+  // host named only by allow rules here, and not in allow_domains, is bounded:
+  // it carries the HTTP requests its rules admit and nothing else, and traffic
+  // the proxy cannot inspect is refused. Requires inspect_tls.
+  repeated HttpRule http_rules = 10;
+}
+
+// One HTTP-level entry of a network policy.
+//
+// Matches a request when its host matches one of `hosts`, its method one of
+// `methods` (empty, or the single entry ANY, is every method) and its path one
+// of `paths` (empty is every path). A deny rule refuses matching requests with
+// 403, whatever allow rules say; an allow rule admits them on a bounded host.
+message HttpRule {
+  repeated string hosts = 1;
+  repeated string methods = 2;
+  // Globs starting with '/': '*' matches within one segment, '**' across
+  // segments.
+  repeated string paths = 3;
+  bool is_denied = 4;
 }
 
 // Membership in a named private inter-sandbox network.
@@ -211,8 +238,8 @@ message NetworkMembership {
   string network = 1;
   // Ports this member accepts from peers; empty = all.
   repeated uint32 ingress_ports = 2;
-  bool allow_egress = 3;
-  bool allow_ingress = 4;
+  bool is_egress_allowed = 3;
+  bool is_ingress_allowed = 4;
   // Name this sandbox answers to on the network, as
   // "<alias>.<network>.internal". Empty means the sandbox id.
   string alias = 5;
@@ -238,7 +265,33 @@ message VolumeMount {
   // once. A writable mount is exclusive, because the filesystem on a volume is
   // ext4 rather than a cluster filesystem, and two guests writing one image
   // corrupt it.
-  bool read_only = 3;
+  bool is_read_only = 3;
+  // RAM-backed scratch at `path` instead of a volume: `volume` is empty, the
+  // contents live in guest memory and are gone when the VM is.
+  bool is_tmpfs = 4;
+  // Capacity of a tmpfs mount in MiB; 0 leaves it to the guest's default.
+  uint64 size_mib = 5;
+  // Octal permissions applied to the mount root when it is created, e.g.
+  // "1777". Empty leaves the filesystem's default.
+  string mode = 6;
+}
+
+// The create-phase inputs a Docker Sandbox Kit template is expanded with.
+// The Kits themselves are the template: importing a set records their
+// descriptors beside the rootfs, and a create from such a template is
+// provisioned the way they ask. See docs/TEMPLATES.md.
+message KitSpec {
+  reserved 1;
+  reserved "refs";
+  // Create-phase arg values by arg name, applied to every Kit declaring it.
+  map<string, string> args = 2;
+  // Container environment overrides, applied after image defaults and arg
+  // exports.
+  map<string, string> env = 3;
+  // Capability types the host declines for this sandbox, by full type
+  // name. A required request of one refuses the create; an optional one is
+  // skipped and recorded. A recreation replaces the list wholesale.
+  repeated string reject_types = 4;
 }
 
 // Storage that outlives the sandboxes that mount it.
@@ -255,6 +308,10 @@ message Volume {
   // Sandbox currently holding the writable claim, empty when free. Read-only
   // mounts are not tracked here: they do not exclude anything.
   string attached_to = 5;
+  // Free-form key/value pairs fixed at creation. A Kit volume carries the
+  // sandbox it belongs to and the path it mounts at, which is how storage
+  // for a path no longer declared stays findable.
+  map<string, string> labels = 6;
 }
 
 message Sandbox {
@@ -278,7 +335,7 @@ message Sandbox {
   // heartbeats, so a last-known record is not mistaken for a live one. Never
   // persisted and never sent by a node: it describes the node's reachability
   // at the moment of the read, not anything about the sandbox itself.
-  bool unreachable = 10;
+  bool is_unreachable = 10;
   // Host CPU every VM this sandbox has run has consumed, in microseconds.
   // Read from the sandbox's own cgroup, so it covers the whole VMM (the
   // guest's vCPU threads and Firecracker's own work on their behalf) and
@@ -300,7 +357,23 @@ message Sandbox {
   // caller reading a record in between would otherwise have no way to tell the
   // two apart. Never persisted: it describes the VM currently running, and a
   // sandbox that is resumed handshakes again.
-  bool agent_unconfirmed = 14;
+  bool is_agent_unconfirmed = 14;
+  // Environment every process in the sandbox starts with, on top of the
+  // image's: a Kit's arg exports, credential sentinels and create-time
+  // overrides. Empty for a sandbox created without any.
+  map<string, string> env = 16;
+  // The inputs this sandbox's Kit template was expanded with, when it has
+  // one.
+  KitSpec kit = 17;
+  // Secret values by service for the credentials the composition declares,
+  // kept so a boot or a recreation can broker them again. Redacted on every
+  // read, like a brokered header's value.
+  map<string, string> kit_credentials = 18;
+  // The selection a Kit sandbox was created with and the permission surface
+  // it was granted, as JSON in the spec library's shape: `{"selection":
+  // {"selected": [...], "skipped": [...]}, "surface": {...}}`. Retained
+  // across stop and start; a recreation selects afresh.
+  string kit_selection = 19;
 }
 
 // One VM boot inside a sandbox's life.
@@ -385,11 +458,14 @@ message NodeStatus {
   uint64 free_mem_mib = 2;
   // Warm snapshots ready, per template.
   map<string, uint32> warm_templates = 3;
-  bool draining = 4;
+  bool is_draining = 4;
   // Templates this node holds. Images are node-local, so placement has to
   // know where they are rather than assuming every node is interchangeable.
   repeated string templates = 5;
   // vCPUs promised to sandboxes on this node, running or suspended. Free
   // memory alone hides a node that is memory-rich and cpu-saturated.
   uint32 committed_vcpus = 6;
+  // The subset of `templates` imported from Kits, whose creates the node
+  // provisions through the Kit lifecycle.
+  repeated string kit_templates = 7;
 }

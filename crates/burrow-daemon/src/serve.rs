@@ -99,8 +99,8 @@ pub struct ServeArgs {
     /// Refuse to start a sandbox whose resource limits cannot be applied.
     /// Off by default so the stack runs where cgroups are unavailable; worth
     /// turning on wherever sandboxes share a host with anything that matters.
-    #[arg(long)]
-    pub require_resource_limits: bool,
+    #[arg(long = "require-resource-limits")]
+    pub is_resource_limits_required: bool,
     /// Serve restored guest memory from burrow's own page-fault handler.
     ///
     /// Off by default: firecracker's `File` backend already maps the snapshot
@@ -112,8 +112,8 @@ pub struct ServeArgs {
     /// Kept wired up because it is the only way to serve pages from something
     /// that is not a local file: a lazily fetched remote chunk, or a prefetch
     /// plan.
-    #[arg(long, default_value_t = false, action = clap::ArgAction::Set)]
-    pub lazy_memory: bool,
+    #[arg(long = "lazy-memory", default_value_t = false, action = clap::ArgAction::Set)]
+    pub is_memory_lazy: bool,
     /// OTLP collector to export traces to, e.g. `http://collector:4317`.
     /// Unset leaves tracing local to this node's logs.
     #[arg(long, env = "OTEL_EXPORTER_OTLP_ENDPOINT")]
@@ -222,8 +222,8 @@ pub struct ServeArgs {
     /// A share is a WireGuard tunnel bootstrapped over a DERP relay, so a
     /// node that can reach a relay can serve them without any port of its own
     /// being reachable. Off means `burrow share` fails on this node.
-    #[arg(long, env = "BURROWD_NO_TAILCAT")]
-    pub no_tailcat: bool,
+    #[arg(long = "no-tailcat", env = "BURROWD_NO_TAILCAT")]
+    pub is_tailcat_disabled: bool,
     /// DERP region shares listen through. Unset picks the nearest region of
     /// the DERP map by latency, once, and remembers it: the region is part of
     /// every share's address.
@@ -240,8 +240,8 @@ pub struct ServeArgs {
     /// Sourcing from the client needs a policy route and an nftables chain,
     /// which this node installs the first time a share wants them. Set this
     /// on a node where that state is unwelcome.
-    #[arg(long, env = "BURROWD_NO_TRANSPARENT_IP")]
-    pub no_transparent_ip: bool,
+    #[arg(long = "no-transparent-ip", env = "BURROWD_NO_TRANSPARENT_IP")]
+    pub is_transparent_ip_disabled: bool,
 }
 
 impl ServeArgs {
@@ -311,10 +311,14 @@ async fn current_status(sandboxes: &SandboxManager, data_dir: &std::path::Path) 
     sys.refresh_memory();
 
     let mut templates = Vec::new();
+    let mut kit_templates = Vec::new();
     let mut warm_templates = std::collections::HashMap::new();
     for template in crate::template::list(data_dir).await {
-        if template.warm {
+        if template.is_warm {
             warm_templates.insert(template.name.clone(), 1);
+        }
+        if template.is_kit {
+            kit_templates.push(template.name.clone());
         }
         templates.push(template.name);
     }
@@ -328,7 +332,8 @@ async fn current_status(sandboxes: &SandboxManager, data_dir: &std::path::Path) 
         free_mem_mib: avail / (1024 * 1024),
         warm_templates,
         templates,
-        draining: sandboxes.is_draining(),
+        kit_templates,
+        is_draining: sandboxes.is_draining(),
         // Suspended sandboxes count: they hold their address, disks and
         // snapshot, and resuming must not find the node oversubscribed.
         committed_vcpus: sandboxes.committed_vcpus().await,
@@ -420,7 +425,7 @@ async fn registration_loop(
             {
                 Ok(resp) => {
                     let resp = resp.into_inner();
-                    if resp.reregister {
+                    if resp.is_reregistration_required {
                         tracing::warn!("orchestrator asked us to re-register");
                         break;
                     }
@@ -848,16 +853,16 @@ pub async fn run(args: ServeArgs) -> anyhow::Result<()> {
             extra_boot_args: args.guest_boot_args.clone(),
             agent_timeout: Duration::from_secs(args.agent_timeout),
             cgroup_root: Some(args.cgroup_root.clone()),
-            require_resource_limits: args.require_resource_limits,
-            lazy_memory: args.lazy_memory,
+            is_resource_limits_required: args.is_resource_limits_required,
+            is_memory_lazy: args.is_memory_lazy,
             jail: args.jail(),
             artifact_retention: Duration::from_secs(
                 u64::from(args.artifact_retention_days) * 24 * 60 * 60,
             ),
             control_plane: control_plane_addresses(&args.orchestrator).await,
             share: crate::share::ShareOptions {
-                enabled: !args.no_tailcat,
-                transparent: !args.no_transparent_ip,
+                is_enabled: !args.is_tailcat_disabled,
+                is_transparent: !args.is_transparent_ip_disabled,
                 region: args.tailcat_region,
                 derp_map_url: args.tailcat_derp_map_url.clone(),
             },
@@ -867,6 +872,8 @@ pub async fn run(args: ServeArgs) -> anyhow::Result<()> {
         Arc::clone(&denied),
         Arc::clone(&directory),
         Arc::clone(&store),
+        burrow_core::vault::Vault::open(&args.data_dir.join("secrets.key"))
+            .map_err(|err| anyhow::anyhow!("secrets key: {err}"))?,
     );
 
     // Policy fields are only real if something acts on them; this is what

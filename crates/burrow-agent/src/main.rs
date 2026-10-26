@@ -46,7 +46,7 @@ impl Agent for AgentService {
     ) -> Result<Response<agentpb::HandshakeResponse>, Status> {
         let arrival = req.extensions().get::<vsock::Arrival>().copied();
         let req = req.into_inner();
-        tracing::debug!(restored = req.restored, "handshake from host");
+        tracing::debug!(restored = req.is_restored, "handshake from host");
         let started = std::time::Instant::now();
 
         // Best-effort: a guest that cannot reseed is still usable, but it is
@@ -86,7 +86,7 @@ impl Agent for AgentService {
         // a guest that fails this keeps the source's address and MAC for
         // whatever it does next, and the host needs to know the handshake
         // did not really succeed.
-        if req.restored
+        if req.is_restored
             && let Some(network) = &req.network
             && let Err(err) = resume::apply_network(network).await
         {
@@ -190,7 +190,7 @@ impl Agent for AgentService {
         } else {
             req.interval_ms.max(50) as u64
         });
-        let rx = files::watch(req.path, req.recursive, interval).await?;
+        let rx = files::watch(req.path, req.is_recursive, interval).await?;
         Ok(Response::new(tokio_stream::wrappers::ReceiverStream::new(
             rx,
         )))

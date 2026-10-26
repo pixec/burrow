@@ -68,7 +68,7 @@ pub struct RequestHead {
     /// the `upgrade` token. An `Upgrade` header alone is *not* enough, being a
     /// hop-by-hop hint; treating it as a licence to tunnel would make the
     /// allowlist decorative.
-    pub upgrade: bool,
+    pub is_upgrade_requested: bool,
 }
 
 /// Parses and validates a request head.
@@ -88,7 +88,7 @@ pub fn parse_head(head: &str) -> Result<RequestHead, &'static str> {
     let Some(request_line) = lines.next() else {
         return Err("empty request head");
     };
-    if request_line.is_empty() || starts_with_space(request_line) {
+    if request_line.is_empty() || is_space_prefixed(request_line) {
         return Err("malformed request line");
     }
     if has_stray_control(request_line) {
@@ -121,7 +121,7 @@ pub fn parse_head(head: &str) -> Result<RequestHead, &'static str> {
         // Obsolete line folding: upstream reads this as a continuation of the
         // header before it, a proxy that trims it reads it as a header of its
         // own. That disagreement is exactly a smuggled Content-Length.
-        if starts_with_space(line) {
+        if is_space_prefixed(line) {
             return Err("obsolete line folding in a request head");
         }
         if has_stray_control(line) {
@@ -211,7 +211,7 @@ pub fn parse_head(head: &str) -> Result<RequestHead, &'static str> {
         target: target.to_string(),
         headers,
         framing,
-        upgrade,
+        is_upgrade_requested: upgrade,
     })
 }
 
@@ -417,7 +417,7 @@ fn is_port_suffix(text: &str) -> bool {
         .is_some_and(|port| !port.is_empty() && port.bytes().all(|b| b.is_ascii_digit()))
 }
 
-fn starts_with_space(line: &str) -> bool {
+fn is_space_prefixed(line: &str) -> bool {
     line.starts_with(' ') || line.starts_with('\t')
 }
 
@@ -931,22 +931,26 @@ mod tests {
     /// `Connection` is a request to leave HTTP.
     #[test]
     fn only_the_connection_token_marks_an_upgrade() {
-        assert!(!parse_head(&head("Upgrade: websocket\r\n")).unwrap().upgrade);
+        assert!(
+            !parse_head(&head("Upgrade: websocket\r\n"))
+                .unwrap()
+                .is_upgrade_requested
+        );
         assert!(
             parse_head(&head("Upgrade: websocket\r\nConnection: Upgrade\r\n"))
                 .unwrap()
-                .upgrade
+                .is_upgrade_requested
         );
         assert!(
             parse_head(&head("Connection: keep-alive, Upgrade\r\n"))
                 .unwrap()
-                .upgrade
+                .is_upgrade_requested
         );
         // A token that merely contains the word is not the token.
         assert!(
             !parse_head(&head("Connection: upgrades\r\n"))
                 .unwrap()
-                .upgrade
+                .is_upgrade_requested
         );
     }
 
@@ -959,7 +963,7 @@ mod tests {
         ))
         .unwrap();
         assert_eq!(parsed.framing, Body::Fixed(100));
-        assert!(parsed.upgrade);
+        assert!(parsed.is_upgrade_requested);
     }
 
     /// The point of brokering: the guest's own value never reaches the server,

@@ -1,0 +1,313 @@
+#!/usr/bin/env bash
+# Drives burrow through the Docker Sandbox Kit conformance contract
+# (docs/spec/conformance.md in github.com/docker/sandbox-kit-spec):
+#
+#   kit-tck runtime --adapter deploy/kit-tck/burrow-adapter
+#
+# Every verb maps onto a burrow CLI command. The suite hands over kits as
+# directories, which burrow does not build, so a directory is built with the
+# spec's BuildKit frontend and pushed to a registry the nodes can pull from
+# before it is named to burrow. The dev harness's registry is the default: it
+# is 127.0.0.1:5000 from this machine and test-registry:5000 from a node. A
+# create is then a pull of the set, which composes it into one template, and
+# a create from that template.
+#
+# Configuration, all optional:
+#   BURROW                       the CLI (default: burrow on PATH)
+#   BURROW_API_KEY               passed through to the CLI
+#   BURROW_KIT_TCK_DOCKER        docker context that builds (colima-burrow)
+#   BURROW_KIT_TCK_PUSH          registry prefix builds push to
+#   BURROW_KIT_TCK_PULL          the same registry as a node names it
+#   BURROW_KIT_TCK_USER          the agent identity exec runs as (agent)
+#   BURROW_KIT_TCK_STATE         where build markers live
+#
+# Exit 2 is a refusal: burrow says "kit refused" for every one the spec
+# requires, and "kit:" for a descriptor that fails validation after
+# expansion, which the suite also expects refused. Nothing else is read as
+# one.
+set -euo pipefail
+
+burrow="${BURROW:-burrow}"
+docker_context="${BURROW_KIT_TCK_DOCKER:-colima-burrow}"
+push_prefix="${BURROW_KIT_TCK_PUSH:-127.0.0.1:5000/kit-tck}"
+pull_prefix="${BURROW_KIT_TCK_PULL:-test-registry:5000/kit-tck}"
+agent_user="${BURROW_KIT_TCK_USER:-agent}"
+state="${BURROW_KIT_TCK_STATE:-${TMPDIR:-/tmp}/burrow-kit-tck}"
+mkdir -p "$state"
+
+capabilities=(
+	com.docker.sandbox/network-policy@1
+	com.docker.sandbox/network-policy@2
+	com.docker.sandbox/credential@1
+	com.docker.sandbox/volume@1
+	com.docker.sandbox/port@1
+	com.docker.sandbox/resources@1
+	com.docker.sandbox/lifecycle@1
+	com.docker.sandbox/long-running@1
+	com.docker.sandbox/sbx@1
+)
+
+die() {
+	echo "burrow-adapter: $*" >&2
+	exit 1
+}
+
+# Runs burrow, keeping its stderr for the caller and mapping a refusal onto
+# exit 2 and any other failure onto 1.
+run_burrow() {
+	local output status
+	set +e
+	output="$("$burrow" "$@" 2>&1)"
+	status=$?
+	set -e
+	if [ "$status" -ne 0 ]; then
+		printf '%s\n' "$output" >&2
+		if grep -qE 'kit refused|kit: ' <<<"$output"; then
+			exit 2
+		fi
+		exit 1
+	fi
+	printf '%s\n' "$output"
+}
+
+# A kit directory becomes an image: built once per content hash, pushed, and
+# named to burrow by the registry's node-side name.
+kit_reference() {
+	local ref="$1"
+	if [ ! -d "$ref" ]; then
+		printf '%s\n' "$ref"
+		return
+	fi
+	local dir stem hash marker
+	dir="$(cd "$ref" && pwd)"
+	stem="$(basename "$dir")"
+	[ -f "$dir/$stem.yaml" ] || die "$dir has no $stem.yaml"
+	hash="$(cd "$dir" && find . -type f | LC_ALL=C sort | xargs shasum -a 256 | shasum -a 256 | cut -c1-12)"
+	marker="$state/built-$stem-$hash"
+	if [ ! -e "$marker" ]; then
+		# Straight to the registry: the docker driver would otherwise keep a
+		# copy of every fixture image in the VM's image store as well.
+		docker --context "$docker_context" buildx build "$dir" -f "$dir/$stem.yaml" \
+			--output "type=registry,name=$push_prefix/$stem:$hash" >&2 ||
+			die "building kit $dir failed"
+		# The docker driver keeps a copy in the daemon's image store however
+		# the output is addressed; the registry has it now.
+		docker --context "$docker_context" image rm -f "$push_prefix/$stem:$hash" >/dev/null 2>&1 || true
+		: >"$marker"
+	fi
+	# Remembered so selection records can name the kit the way the suite
+	# named it: a consumption reference is the identity, and the registry
+	# name is this adapter's own detour.
+	printf '%s %s\n' "$pull_prefix/$stem:$hash" "$ref" >>"$state/refs"
+	printf '%s/%s:%s\n' "$pull_prefix" "$stem" "$hash"
+}
+
+# Composed templates are 3 GiB or more each. One with no sandbox left on it
+# is finished with, whichever verb last touched it.
+sweep_templates() {
+	local used
+	used="$("$burrow" ps -a 2>/dev/null | awk 'NR > 1 {print $5}')"
+	"$burrow" images 2>/dev/null | awk 'NR > 1 && $1 ~ /^kit-/ {print $1}' | while read -r template; do
+		grep -qx "$template" <<<"$used" || "$burrow" templates rm "$template" >/dev/null 2>&1 || true
+	done
+}
+
+# Composes a kit set into a template and prints its name. A refusal here is
+# the set's, and the suite expects it from create.
+pull_set() {
+	run_burrow pull "$@" | sed -n 's/.* as template \([^ ]*\) .*/\1/p' | tail -1
+}
+
+bind_credential() {
+	[ -n "${KIT_TCK_BOUND_SECRET:-}" ] || return 0
+	"$burrow" secret set kit-tck --value "$KIT_TCK_BOUND_SECRET" >/dev/null 2>&1 ||
+		echo "burrow-adapter: binding the kit-tck credential failed; its checks will report what the sandbox saw" >&2
+}
+
+state_of() {
+	"$burrow" inspect --json "$1" | python3 -c 'import json,sys; print(json.load(sys.stdin)["state"])'
+}
+
+verb="${1:-}"
+shift || true
+
+case "$verb" in
+capabilities)
+	printf '%s\n' "${capabilities[@]}"
+	;;
+
+create)
+	sweep_templates
+	kits=()
+	args=()
+	name=""
+	while [ $# -gt 0 ]; do
+		case "$1" in
+		--name)
+			# burrow names are [a-z0-9-]; the suite's aliases are not always.
+			name="$(tr 'A-Z_' 'a-z-' <<<"$2")"
+			shift 2
+			;;
+		--arg)
+			args+=(--arg "$2")
+			shift 2
+			;;
+		--env)
+			args+=(--kit-env "$2")
+			shift 2
+			;;
+		--reject-capability)
+			args+=(--reject-capability "$2")
+			shift 2
+			;;
+		--skills-host-mode | --skills-host-store | --ssh-agent | --ssh-known-hosts | --git-identity-config)
+			# Capabilities this runtime does not claim; the suite never
+			# judges what these would have arranged.
+			shift 2
+			;;
+		*)
+			kits+=("$(kit_reference "$1")")
+			shift
+			;;
+		esac
+	done
+	[ "${#kits[@]}" -gt 0 ] || die "create needs at least one kit reference"
+	bind_credential
+	args+=(--template "$(pull_set "${kits[@]}")")
+	[ -z "$name" ] || args+=(--name "$name")
+	# The create prints "<id>" or "<id> (<name>)"; only the id is the answer.
+	run_burrow create "${args[@]}" | head -1 | cut -d' ' -f1
+	;;
+
+exec)
+	id="$1"
+	shift
+	[ "${1:-}" = "--" ] && shift
+	exec "$burrow" exec --user "$agent_user" "$id" -- "$@"
+	;;
+
+stop)
+	run_burrow shutdown "$1" >/dev/null
+	;;
+
+start)
+	run_burrow boot "$1" >/dev/null
+	;;
+
+status)
+	case "$(state_of "$1")" in
+	running | starting) echo running ;;
+	stopped) echo stopped ;;
+	other) die "sandbox $1 is in state $other" ;;
+	esac
+	;;
+
+recreate)
+	id="$1"
+	shift
+	args=()
+	kits=()
+	while [ $# -gt 0 ]; do
+		case "$1" in
+		--arg)
+			args+=(--arg "$2")
+			shift 2
+			;;
+		*)
+			kits+=("$(kit_reference "$1")")
+			shift
+			;;
+		esac
+	done
+	[ "${#kits[@]}" -eq 0 ] || args+=(--template "$(pull_set "${kits[@]}")")
+	# The policy set since the create, if any, decides this selection.
+	if [ -f "$state/$id.selection-policy" ]; then
+		while read -r type; do
+			[ -n "$type" ] && args+=(--reject-capability "$type")
+		done <"$state/$id.selection-policy"
+	fi
+	run_burrow recreate "$id" ${args[@]+"${args[@]}"} >/dev/null
+	;;
+
+selection)
+	# The records burrow kept at create, with the registry names this
+	# adapter pulled through translated back to the references the suite
+	# gave.
+	"$burrow" inspect --json "$1" | python3 -c '
+import json, sys
+refs = {}
+try:
+    for line in open(sys.argv[1]):
+        registry, original = line.rstrip("\n").split(" ", 1)
+        refs[registry] = original
+except FileNotFoundError:
+    pass
+record = json.load(sys.stdin)
+state = record.get("selection")
+if state is None:
+    sys.exit("no selection retained; create must succeed before selection is observed")
+def rename(obj):
+    if isinstance(obj, dict):
+        return {k: (refs.get(v, v) if k == "kit" else rename(v)) for k, v in obj.items()}
+    if isinstance(obj, list):
+        return [rename(v) for v in obj]
+    return obj
+print(json.dumps(rename(state)))
+' "$state/refs"
+	;;
+
+selection-policy)
+	id="$1"
+	shift || true
+	: >"$state/$id.selection-policy"
+	while [ $# -gt 0 ]; do
+		case "$1" in
+		--reject-capability)
+			printf '%s\n' "$2" >>"$state/$id.selection-policy"
+			shift 2
+			;;
+		*)
+			shift
+			;;
+		esac
+	done
+	;;
+
+rm)
+	# A composed template is 3 GiB or more of rootfs plus a warm snapshot,
+	# and the suite composes a fresh set for nearly every check, so the
+	# template goes with the last sandbox that used it.
+	template="$("$burrow" inspect --json "$1" | python3 -c 'import json,sys; print(json.load(sys.stdin)["template"])')"
+	run_burrow remove "$1" >/dev/null
+	rm -f "$state/$1.selection-policy"
+	case "$template" in
+	kit-*)
+		if ! "$burrow" ps -a 2>/dev/null | awk 'NR > 1 {print $5}' | grep -qx "$template"; then
+			"$burrow" templates rm "$template" >/dev/null 2>&1 || true
+		fi
+		;;
+	esac
+	;;
+
+volume-paths)
+	"$burrow" volume ls --json | python3 -c '
+import json, sys
+sandbox = sys.argv[1]
+paths = []
+for volume in json.load(sys.stdin):
+    labels = dict(label.split("=", 1) for label in volume["labels"])
+    if labels.get("burrow.kit/sandbox") == sandbox:
+        paths.append(labels["burrow.kit/path"])
+print(json.dumps(sorted(paths)))
+' "$1"
+	;;
+
+wait-idle)
+	# burrow has no session-based auto-stop: a sandbox runs until it is told
+	# otherwise, so there is no grace period to outwait.
+	;;
+
+*)
+	die "unknown verb ${verb:-<none>}"
+	;;
+esac

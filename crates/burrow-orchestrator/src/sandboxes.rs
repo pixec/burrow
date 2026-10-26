@@ -535,7 +535,7 @@ impl SandboxRegistry {
             // node is running now, and a recovered or resumed sandbox
             // handshakes again. It is here for the durable case of a guest that
             // never came up, which nothing else would correct.
-            sandbox.agent_unconfirmed = report.agent_unconfirmed;
+            sandbox.is_agent_unconfirmed = report.is_agent_unconfirmed;
             if sandbox.state != report.state {
                 sandbox.state = report.state;
                 changed.push(sandbox.clone());

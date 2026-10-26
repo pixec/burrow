@@ -12,7 +12,7 @@
 
 use std::path::Path;
 
-use rusqlite::Connection;
+use rusqlite::{Connection, OptionalExtension as _};
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, thiserror::Error)]
@@ -55,7 +55,7 @@ pub struct SandboxRow {
 pub struct PortRow {
     pub host_port: u16,
     pub guest_port: u16,
-    pub udp: bool,
+    pub is_udp: bool,
 }
 
 /// A sandbox's tailcat share: the keys its address is made of and what the
@@ -73,17 +73,17 @@ pub struct ShareRow {
     pub allowed_clients: Vec<String>,
     /// Unix seconds the current keys were issued.
     pub created_at: i64,
-    /// Guest UDP ports admitted; `all_udp` admits every one. Absent from rows
+    /// Guest UDP ports admitted; `is_all_udp_shared` admits every one. Absent from rows
     /// written before UDP shares existed, which admitted none.
     #[serde(default)]
     pub udp_ports: Vec<u16>,
     #[serde(default)]
-    pub all_udp: bool,
+    pub is_all_udp_shared: bool,
     /// Source each connection from the last pong-verified public IPv4.
     /// Rows written before this existed take today's default rather than
     /// silently keeping the old behaviour.
     #[serde(default = "yes")]
-    pub transparent_ip: bool,
+    pub is_ip_transparent: bool,
 }
 
 fn yes() -> bool {
@@ -115,7 +115,7 @@ pub struct EgressRow {
     pub destination: String,
     pub host: String,
     pub port: u32,
-    pub allowed: bool,
+    pub is_allowed: bool,
     pub reason: String,
     pub bytes_sent: i64,
     pub bytes_received: i64,
@@ -125,7 +125,7 @@ pub struct EgressRow {
 pub struct EgressFilter {
     pub sandbox_id: Option<String>,
     /// Only records the proxy refused.
-    pub denied_only: bool,
+    pub is_denied_only: bool,
     /// RFC 3339 lower bound, compared lexically (the format sorts correctly).
     pub since: Option<String>,
     pub limit: u32,
@@ -407,7 +407,7 @@ impl Store {
                 row.destination,
                 row.host,
                 row.port,
-                row.allowed,
+                row.is_allowed,
                 row.reason,
                 row.bytes_sent,
                 row.bytes_received,
@@ -429,7 +429,7 @@ impl Store {
         if filter.sandbox_id.is_some() {
             sql.push_str(" AND sandbox_id = :sandbox_id");
         }
-        if filter.denied_only {
+        if filter.is_denied_only {
             sql.push_str(" AND allowed = 0");
         }
         if filter.since.is_some() {
@@ -456,7 +456,7 @@ impl Store {
                     destination: row.get(3)?,
                     host: row.get(4)?,
                     port: row.get(5)?,
-                    allowed: row.get(6)?,
+                    is_allowed: row.get(6)?,
                     reason: row.get(7)?,
                     bytes_sent: row.get(8)?,
                     bytes_received: row.get(9)?,
@@ -553,6 +553,39 @@ impl Store {
         let conn = self.conn.lock().unwrap();
         Ok(conn.execute("DELETE FROM tombstones WHERE at < ?1", [cutoff])?)
     }
+
+    pub fn put_secret(&self, name: &str, value: &str) -> Result<()> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "INSERT INTO secrets (name, value) VALUES (?1, ?2)
+             ON CONFLICT(name) DO UPDATE SET value=excluded.value",
+            rusqlite::params![name, value],
+        )?;
+        Ok(())
+    }
+
+    pub fn get_secret(&self, name: &str) -> Result<Option<String>> {
+        let conn = self.conn.lock().unwrap();
+        Ok(conn
+            .query_row("SELECT value FROM secrets WHERE name=?1", [name], |row| {
+                row.get(0)
+            })
+            .optional()?)
+    }
+
+    pub fn list_secret_names(&self) -> Result<Vec<String>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare("SELECT name FROM secrets ORDER BY name")?;
+        let names = stmt
+            .query_map([], |row| row.get(0))?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        Ok(names)
+    }
+
+    pub fn delete_secret(&self, name: &str) -> Result<bool> {
+        let conn = self.conn.lock().unwrap();
+        Ok(conn.execute("DELETE FROM secrets WHERE name=?1", [name])? > 0)
+    }
 }
 
 /// Columns added after the schema first shipped.
@@ -604,6 +637,10 @@ CREATE TABLE IF NOT EXISTS tombstones (
     at           INTEGER NOT NULL
 );
 CREATE INDEX IF NOT EXISTS tombstones_by_node ON tombstones(node_id);
+CREATE TABLE IF NOT EXISTS secrets (
+    name         TEXT PRIMARY KEY,
+    value        TEXT NOT NULL
+);
 CREATE TABLE IF NOT EXISTS audit_egress (
     id             INTEGER PRIMARY KEY AUTOINCREMENT,
     at             TEXT NOT NULL,
@@ -636,7 +673,7 @@ mod tests {
             ports: vec![PortRow {
                 host_port: 20000,
                 guest_port: 8000,
-                udp: false,
+                is_udp: false,
             }],
             share: None,
             suspended_at: 0,
@@ -654,8 +691,8 @@ mod tests {
             allowed_clients: vec!["nodekey:11".into()],
             created_at: 1_800_000_000,
             udp_ports: vec![53],
-            all_udp: false,
-            transparent_ip: true,
+            is_all_udp_shared: false,
+            is_ip_transparent: true,
         });
         store.put_sandbox(&shared).unwrap();
         store.put_sandbox(&row("sbx_b", 2)).unwrap();
@@ -664,7 +701,7 @@ mod tests {
         assert_eq!(rows[1].share, None);
     }
 
-    /// A share persisted before `transparent_ip` existed still loads, taking
+    /// A share persisted before `is_ip_transparent` existed still loads, taking
     /// the current default, and a `proxy_protocol` field written by an older
     /// daemon is ignored.
     #[test]
@@ -678,8 +715,8 @@ mod tests {
             "created_at":1
         }"#;
         let row: ShareRow = serde_json::from_str(json).unwrap();
-        assert!(row.transparent_ip, "an old row takes today's default");
-        assert!(!row.all_udp);
+        assert!(row.is_ip_transparent, "an old row takes today's default");
+        assert!(!row.is_all_udp_shared);
         assert!(row.udp_ports.is_empty());
     }
 
@@ -711,7 +748,7 @@ mod tests {
             vec![PortRow {
                 host_port: 20000,
                 guest_port: 8000,
-                udp: false
+                is_udp: false
             }]
         );
     }
@@ -870,7 +907,7 @@ mod tests {
             destination: "1.2.3.4:443".into(),
             host: "example.com".into(),
             port: 443,
-            allowed,
+            is_allowed: allowed,
             reason: if allowed {
                 "allowed"
             } else {
@@ -916,12 +953,12 @@ mod tests {
 
         let denied = store
             .query_egress(&EgressFilter {
-                denied_only: true,
+                is_denied_only: true,
                 ..Default::default()
             })
             .unwrap();
         assert_eq!(denied.len(), 1);
-        assert!(!denied[0].allowed);
+        assert!(!denied[0].is_allowed);
 
         let since = store
             .query_egress(&EgressFilter {

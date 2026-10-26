@@ -187,7 +187,7 @@ fn encode_region(r: &DerpRegion) -> Value {
     let nodes: Vec<Value> = r
         .nodes
         .iter()
-        .filter(|n| !n.stun_only)
+        .filter(|n| !n.is_stun_only)
         .map(encode_node)
         .collect();
     if !nodes.is_empty() {
@@ -207,7 +207,7 @@ fn encode_node(n: &DerpNode) -> Value {
     text_entry(&mut m, "6", &n.ipv6);
     int_entry(&mut m, "s", n.stun_port.into());
     int_entry(&mut m, "d", n.derp_port.into());
-    if n.insecure_for_tests {
+    if n.is_insecure_for_tests {
         entry(&mut m, "x", Value::Bool(true));
     }
     Value::Map(m)
@@ -328,7 +328,7 @@ fn decode_node(v: &Value) -> Result<DerpNode> {
             "6" => n.ipv6 = as_text(v, "IPv6")?,
             "s" => n.stun_port = as_i64(v, "STUN port")? as i32,
             "d" => n.derp_port = as_i64(v, "DERP port")? as i32,
-            "x" => n.insecure_for_tests = as_bool(v, "insecure-for-tests")?,
+            "x" => n.is_insecure_for_tests = as_bool(v, "insecure-for-tests")?,
             _ => {}
         }
     }
@@ -453,13 +453,13 @@ mod tests {
                         ipv6: "2001:db8::4".into(),
                         stun_port: 3478,
                         derp_port: 8443,
-                        can_port80: true,
+                        is_port80_reachable: true,
                         ..Default::default()
                     },
                     DerpNode {
                         name: "s".into(),
                         host_name: "stun-only.example.net".into(),
-                        stun_only: true,
+                        is_stun_only: true,
                         ..Default::default()
                     },
                     DerpNode {
@@ -467,7 +467,7 @@ mod tests {
                         host_name: "relay-c.example.net".into(),
                         ipv6: "none".into(),
                         stun_port: -1,
-                        insecure_for_tests: true,
+                        is_insecure_for_tests: true,
                         ..Default::default()
                     },
                 ],
@@ -482,12 +482,12 @@ mod tests {
         assert_eq!(nodes[0].stun_port, 3478);
         assert_eq!(nodes[0].derp_port, 8443);
         assert!(
-            !nodes[0].can_port80,
+            !nodes[0].is_port80_reachable,
             "CanPort80 is not part of the wire format"
         );
         assert_eq!(nodes[1].ipv6, "none");
         assert_eq!(nodes[1].stun_port, -1);
-        assert!(nodes[1].insecure_for_tests);
+        assert!(nodes[1].is_insecure_for_tests);
     }
 
     #[test]
