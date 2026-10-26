@@ -75,7 +75,7 @@ pub struct StreamOutcome {
     /// The host the request named, as it named it. Present even on a refusal:
     /// which host was refused is the useful part of the record.
     pub host: Option<String>,
-    pub allowed: bool,
+    pub is_allowed: bool,
     pub reason: String,
     pub sent: u64,
     pub received: u64,
@@ -85,10 +85,10 @@ pub struct StreamOutcome {
 struct Session {
     /// The name the TLS session was opened for. Every stream must name it.
     opened_for: String,
-    allowed: Vec<String>,
-    /// The same rules the HTTP/1.1 relay applies, evaluated per stream. h2 must
-    /// not be the way around a rule, so nothing here is a weaker check.
-    rules: Vec<policy::Rule>,
+    /// Its rules are the same ones the HTTP/1.1 relay applies, evaluated per
+    /// stream. h2 must not be the way around a rule, so nothing here is a
+    /// weaker check.
+    policy: policy::SandboxPolicy,
     sandbox_id: String,
 }
 
@@ -136,7 +136,7 @@ pub struct Checked {
 /// connection-specific header; and a `TE` naming anything but `trailers`.
 pub fn check_request(
     parts: &::http::request::Parts,
-    allowed: &[String],
+    policy: &policy::SandboxPolicy,
     opened_for: &str,
 ) -> Result<Checked, String> {
     // CONNECT would turn the stream into a tunnel, and a tunnel is exactly what
@@ -208,8 +208,9 @@ pub fn check_request(
         content_length = Some(parsed);
     }
 
-    inspect::inner_host_allowed(opened_for, &host, allowed)
+    inspect::inner_host_allowed(opened_for, &host, policy)
         .map_err(|reason| format!("{reason} ({host})"))?;
+    policy.check_request(&host, parts.method.as_str(), parts.uri.path())?;
     Ok(Checked {
         host,
         content_length,
@@ -252,8 +253,7 @@ pub(crate) async fn relay<C, U>(
     client: C,
     upstream: U,
     opened_for: &str,
-    allowed: &[String],
-    rules: &[policy::Rule],
+    policy: &policy::SandboxPolicy,
     sandbox_id: &str,
     audit: Arc<dyn Fn(StreamOutcome) + Send + Sync>,
 ) -> Result<crate::Relayed, String>
@@ -263,8 +263,7 @@ where
 {
     let session = Arc::new(Session {
         opened_for: opened_for.to_string(),
-        allowed: allowed.to_vec(),
-        rules: rules.to_vec(),
+        policy: policy.clone(),
         sandbox_id: sandbox_id.to_string(),
     });
 
@@ -325,7 +324,7 @@ where
         running.spawn(async move {
             let outcome = serve_stream(request, respond, sender, session).await;
             streams.fetch_add(1, Ordering::Relaxed);
-            if !outcome.allowed {
+            if !outcome.is_allowed {
                 refused.fetch_add(1, Ordering::Relaxed);
             }
             audit(outcome);
@@ -379,13 +378,13 @@ async fn serve_stream(
                 .map(str::to_string)
         });
 
-    let checked = match check_request(&parts, &session.allowed, &session.opened_for) {
+    let checked = match check_request(&parts, &session.policy, &session.opened_for) {
         Ok(checked) => checked,
         Err(reason) => {
             refuse(&mut respond);
             return StreamOutcome {
                 host: named,
-                allowed: false,
+                is_allowed: false,
                 reason,
                 sent: 0,
                 received: 0,
@@ -402,13 +401,13 @@ async fn serve_stream(
     };
     // Matching nothing is not a refusal: the stream is forwarded exactly as it
     // was written.
-    let action = crate::select_rule(&session.rules, &checked.host, &request).cloned();
+    let action = crate::select_rule(&session.policy.rules, &checked.host, &request).cloned();
 
     if let Some(policy::Action::Refuse(reason)) = &action {
         refuse(&mut respond);
         return StreamOutcome {
             host: named,
-            allowed: false,
+            is_allowed: false,
             reason: reason.clone(),
             sent: 0,
             received: 0,
@@ -443,7 +442,7 @@ async fn serve_stream(
             refuse(&mut respond);
             return StreamOutcome {
                 host: named,
-                allowed: false,
+                is_allowed: false,
                 reason,
                 sent: 0,
                 received: 0,
@@ -458,7 +457,7 @@ async fn serve_stream(
             refuse(&mut respond);
             return StreamOutcome {
                 host: named,
-                allowed: false,
+                is_allowed: false,
                 reason: format!("the server would not accept another stream: {err}"),
                 sent: 0,
                 received: 0,
@@ -471,7 +470,7 @@ async fn serve_stream(
             refuse(&mut respond);
             return StreamOutcome {
                 host: named,
-                allowed: false,
+                is_allowed: false,
                 reason: format!("forwarding a request: {err}"),
                 sent: 0,
                 received: 0,
@@ -514,7 +513,7 @@ async fn serve_stream(
     let refusal = sent.as_ref().err().or(received.as_ref().err()).cloned();
     StreamOutcome {
         host: Some(checked.host),
-        allowed: refusal.is_none(),
+        is_allowed: refusal.is_none(),
         reason: refusal.unwrap_or_else(|| "allowed (inspected)".to_string()),
         sent: sent.unwrap_or(0),
         received: received.unwrap_or(0),
@@ -541,7 +540,7 @@ async fn forward_stream(
         refuse(respond);
         StreamOutcome {
             host: Some(host.to_string()),
-            allowed: false,
+            is_allowed: false,
             reason,
             sent,
             received: 0,
@@ -628,7 +627,7 @@ async fn forward_stream(
                 if let Err(reason) = send_data(&mut send, chunk).await {
                     return StreamOutcome {
                         host: Some(host.to_string()),
-                        allowed: false,
+                        is_allowed: false,
                         reason,
                         sent,
                         received,
@@ -640,7 +639,7 @@ async fn forward_stream(
                 send.send_reset(::h2::Reason::INTERNAL_ERROR);
                 return StreamOutcome {
                     host: Some(host.to_string()),
-                    allowed: false,
+                    is_allowed: false,
                     reason,
                     sent,
                     received,
@@ -652,7 +651,7 @@ async fn forward_stream(
 
     StreamOutcome {
         host: Some(host.to_string()),
-        allowed: true,
+        is_allowed: true,
         reason: format!("forwarded to {}", forward.url),
         sent,
         received,
@@ -786,8 +785,8 @@ async fn send_data(to: &mut ::h2::SendStream<Bytes>, mut data: Bytes) -> Result<
 mod tests {
     use super::*;
 
-    fn allowed() -> Vec<String> {
-        vec!["api.example.com".to_string(), "other.example".to_string()]
+    fn allowed() -> policy::SandboxPolicy {
+        policy::SandboxPolicy::allowing(&["api.example.com", "other.example"])
     }
 
     fn request(uri: &str) -> ::http::request::Builder {
@@ -828,7 +827,7 @@ mod tests {
             "api.example.com",
         )
         .unwrap_err();
-        assert!(refusal.contains("not in the allowlist"));
+        assert!(refusal.contains("not in allowlist"));
     }
 
     #[test]
@@ -1065,8 +1064,10 @@ mod tests {
                 relay_client,
                 relay_upstream,
                 "api.example.com",
-                &allowed(),
-                &rules,
+                &policy::SandboxPolicy {
+                    rules: Arc::new(rules),
+                    ..allowed()
+                },
                 "sbx",
                 audit,
             )
@@ -1119,7 +1120,7 @@ mod tests {
         assert_eq!(forwarded.headers.get("accept").unwrap(), "*/*");
 
         let outcome = audited.recv().await.unwrap();
-        assert!(outcome.allowed, "{}", outcome.reason);
+        assert!(outcome.is_allowed, "{}", outcome.reason);
         assert_eq!(outcome.host.as_deref(), Some("api.example.com"));
     }
 
@@ -1234,7 +1235,7 @@ mod tests {
 
         assert!(seen.try_recv().is_err(), "nothing may reach the origin");
         let outcome = audited.recv().await.unwrap();
-        assert!(outcome.allowed, "{}", outcome.reason);
+        assert!(outcome.is_allowed, "{}", outcome.reason);
         assert_eq!(outcome.reason, format!("forwarded to {url}"));
         assert_eq!(outcome.sent, 5);
         assert_eq!(outcome.received, 2);
@@ -1258,7 +1259,7 @@ mod tests {
         assert_eq!(fronted.await.unwrap().status(), 403);
 
         let refusal = audited.recv().await.unwrap();
-        assert!(!refusal.allowed);
+        assert!(!refusal.is_allowed);
         assert!(
             refusal
                 .reason
@@ -1285,7 +1286,7 @@ mod tests {
             Some("api.example.com")
         );
         assert!(seen.try_recv().is_err(), "only one stream may be forwarded");
-        assert!(audited.recv().await.unwrap().allowed);
+        assert!(audited.recv().await.unwrap().is_allowed);
     }
 
     #[tokio::test]
@@ -1303,7 +1304,7 @@ mod tests {
         assert_eq!(response.await.unwrap().status(), 403);
 
         let refusal = audited.recv().await.unwrap();
-        assert!(!refusal.allowed);
+        assert!(!refusal.is_allowed);
         assert_eq!(refusal.reason, ":authority and Host name different hosts");
         assert!(seen.try_recv().is_err(), "nothing may reach the origin");
     }
@@ -1329,7 +1330,7 @@ mod tests {
         // `forward_request_body` is the backstop for the same disagreement
         // arriving some other way. Either way the stream is refused and
         // recorded, which is the property that matters.
-        assert!(!outcome.allowed, "{}", outcome.reason);
+        assert!(!outcome.is_allowed, "{}", outcome.reason);
     }
 
     #[tokio::test]
@@ -1349,7 +1350,7 @@ mod tests {
 
         assert!(seen.recv().await.is_some());
         let outcome = audited.recv().await.unwrap();
-        assert!(outcome.allowed, "{}", outcome.reason);
+        assert!(outcome.is_allowed, "{}", outcome.reason);
         assert_eq!(outcome.sent, 5);
         assert_eq!(outcome.received, 2);
     }

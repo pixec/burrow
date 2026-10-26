@@ -131,10 +131,15 @@ pub async fn list(data_dir: &Path) -> Vec<api::TemplateInfo> {
             continue;
         };
         let warm = crate::warm::is_warm(&templates_dir(data_dir), &name).await;
+        let kit = crate::oci::image_environment(data_dir, &name)
+            .await
+            .kit
+            .is_some();
         out.push(api::TemplateInfo {
             name,
             size_bytes: meta.len(),
-            warm,
+            is_warm: warm,
+            is_kit: kit,
         });
     }
     out.sort_by(|a, b| a.name.cmp(&b.name));
@@ -202,17 +207,20 @@ pub async fn build(
         &tx,
     )
     .await;
-    if let Err(status) = result {
-        let _ = tx.send(Err(status)).await;
-        return;
-    }
+    let published = match result {
+        Ok(name) => name,
+        Err(status) => {
+            let _ = tx.send(Err(status)).await;
+            return;
+        }
+    };
     // Nothing to invalidate here: every rootfs this build published, the
     // `-base` image an OCI import leaves behind included, discarded its own
     // warm snapshot as it was renamed into place.
     //
     // Whoever just built a template is about to create from it, and a template
     // with no snapshot cold-boots.
-    manager.warm_in_background(request.name.clone(), Default::default());
+    manager.warm_in_background(published, Default::default());
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -225,7 +233,25 @@ async fn run_build(
     credentials: &crate::oci::auth::Store,
     insecure: &[String],
     tx: &LogTx,
-) -> Result<(), Status> {
+) -> Result<String, Status> {
+    if !request.kits.is_empty() {
+        if !request.steps.is_empty() || !request.from.is_empty() || !request.from_image.is_empty() {
+            return Err(Status::invalid_argument(
+                "a kit import takes no steps and no base; the kits are the whole image",
+            ));
+        }
+        return from_image::import_kit(
+            manager,
+            data_dir,
+            &request.name,
+            &request.kits,
+            agent_binary,
+            credentials,
+            insecure,
+            tx,
+        )
+        .await;
+    }
     validate_name(&request.name)?;
 
     // An OCI base has to be converted into a template before anything can be
@@ -252,7 +278,7 @@ async fn run_build(
         )
         .await?;
         if request.steps.is_empty() {
-            return Ok(());
+            return Ok(request.name.clone());
         }
         from_owned = base;
         &from_owned
@@ -359,7 +385,7 @@ async fn run_build(
     if let Err(err) = manager.delete(&build_id).await {
         tracing::warn!(build = build_id, %err, "could not remove build sandbox");
     }
-    outcome
+    outcome.map(|()| request.name.clone())
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -573,11 +599,12 @@ async fn exec_streaming(
             cmd: vec!["/bin/sh".into(), "-c".into(), command.to_string()],
             env: Default::default(),
             cwd: String::new(),
-            pty: false,
+            is_pty: false,
             rows: 0,
             cols: 0,
             // The node's own housekeeping, which is root's.
             user: String::new(),
+            is_env_cleared: false,
         })),
     };
 
@@ -688,7 +715,11 @@ pub mod distribute {
 
     /// Describes a local template by content, storing its artifacts as blobs
     /// on the way so a later fetch has something to serve.
-    pub async fn manifest(data_dir: &Path, name: &str) -> Result<nodepb::TemplateManifest, Status> {
+    pub async fn manifest(
+        data_dir: &Path,
+        name: &str,
+        config_only: bool,
+    ) -> Result<nodepb::TemplateManifest, Status> {
         // The name arrives from a peer asking what this node holds, and it
         // becomes a path here as surely as it does on the receiving side, where
         // `pull` already refuses one that escapes.
@@ -704,12 +735,16 @@ pub mod distribute {
 
         let mut digests = Vec::new();
         for artifact in ARTIFACTS {
+            if config_only {
+                digests.push(String::new());
+                continue;
+            }
             let path = dir.join(artifact);
             let digest = store
                 .insert(&path)
                 .await
                 .map_err(|err| Status::internal(format!("hashing {artifact} of {name}: {err}")))?;
-            digests.push(digest);
+            digests.push(digest.to_string());
         }
         let rootfs_bytes = tokio::fs::metadata(dir.join("rootfs.ext4"))
             .await
@@ -724,8 +759,8 @@ pub mod distribute {
 
         Ok(nodepb::TemplateManifest {
             name: name.to_string(),
-            kernel_digest: digests[0].to_string(),
-            rootfs_digest: digests[1].to_string(),
+            kernel_digest: digests[0].clone(),
+            rootfs_digest: digests[1].clone(),
             rootfs_bytes,
             image_config,
         })
@@ -958,7 +993,7 @@ pub mod distribute {
             let dest = scratch("dest");
             template(&source, "curlh2", Some(CONFIG)).await;
 
-            let manifest = manifest(&source, "curlh2").await.unwrap();
+            let manifest = manifest(&source, "curlh2", false).await.unwrap();
             assert_eq!(manifest.image_config, CONFIG);
 
             // What `pull` does once the artifacts are in place.
@@ -988,7 +1023,7 @@ pub mod distribute {
             template(&source, "default", None).await;
             template(&dest, "default", Some(CONFIG)).await;
 
-            let manifest = manifest(&source, "default").await.unwrap();
+            let manifest = manifest(&source, "default", false).await.unwrap();
             assert!(manifest.image_config.is_empty());
 
             let dir = super::super::templates_dir(&dest).join("default");
@@ -1404,19 +1439,110 @@ pub mod from_image {
         validate_name(name)?;
         let reference = crate::oci::Reference::parse(image)?;
 
-        if !tokio::fs::try_exists(agent_binary).await.unwrap_or(false) {
-            return Err(Status::failed_precondition(format!(
-                "the guest agent is not at {}; set --agent-binary",
-                agent_binary.display()
-            )));
-        }
+        require_agent(agent_binary).await?;
 
         let mut progress = |line: String| {
             let _ = tx.try_send(event(api::build_log::Event::Step(line)));
         };
         let pulled =
             crate::oci::pull(&reference, data_dir, credentials, insecure, &mut progress).await?;
+        // A Kit pulled on its own is a one-Kit set: its descriptor is recorded
+        // so a create runs its lifecycle, exactly as an import of several
+        // would. A mixin alone cannot compose, and stays an ordinary template.
+        if crate::kit::is_kit(&pulled) {
+            let loaded = crate::kit::load(image, &pulled)?;
+            let blobs = [(pulled.digest.clone(), pulled.layers.clone())].into();
+            match crate::kit::assemble(vec![loaded], blobs, &mut progress) {
+                Ok((template, layers)) => {
+                    let environment = template.environment();
+                    return stage(
+                        manager,
+                        data_dir,
+                        name,
+                        &layers,
+                        &environment,
+                        agent_binary,
+                        tx,
+                    )
+                    .await;
+                }
+                Err(err) => progress(format!(
+                    "{image} is a kit but not a runnable set ({err}); importing it as a plain template"
+                )),
+            }
+        }
+        stage(
+            manager,
+            data_dir,
+            name,
+            &pulled.layers,
+            &pulled.environment,
+            agent_binary,
+            tx,
+        )
+        .await
+    }
 
+    /// Pulls a Sandbox Kit composition and publishes it as one template: the
+    /// Kits' layers overlaid in dependency order, the workload's config merged
+    /// with its mixins', and every descriptor recorded beside the rootfs so a
+    /// create can compose what the Kits asked for.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn import_kit(
+        manager: &crate::sandbox::SandboxManager,
+        data_dir: &Path,
+        name: &str,
+        refs: &[String],
+        agent_binary: &Path,
+        credentials: &crate::oci::auth::Store,
+        insecure: &[String],
+        tx: &LogTx,
+    ) -> Result<String, Status> {
+        require_agent(agent_binary).await?;
+        let mut progress = |line: String| {
+            let _ = tx.try_send(event(api::build_log::Event::Step(line)));
+        };
+        let (template, layers) =
+            crate::kit::load_set(refs, data_dir, credentials, insecure, &mut progress).await?;
+        let name = if name.is_empty() {
+            template.template_name()
+        } else {
+            name.to_string()
+        };
+        validate_name(&name)?;
+        let environment = template.environment();
+        stage(
+            manager,
+            data_dir,
+            &name,
+            &layers,
+            &environment,
+            agent_binary,
+            tx,
+        )
+        .await?;
+        Ok(name)
+    }
+
+    async fn require_agent(agent_binary: &Path) -> Result<(), Status> {
+        if !tokio::fs::try_exists(agent_binary).await.unwrap_or(false) {
+            return Err(Status::failed_precondition(format!(
+                "the guest agent is not at {}; set --agent-binary",
+                agent_binary.display()
+            )));
+        }
+        Ok(())
+    }
+
+    async fn stage(
+        manager: &crate::sandbox::SandboxManager,
+        data_dir: &Path,
+        name: &str,
+        layers: &[std::path::PathBuf],
+        environment: &crate::oci::ImageEnvironment,
+        agent_binary: &Path,
+        tx: &LogTx,
+    ) -> Result<(), Status> {
         let staging = data_dir.join("build").join(format!("import-{name}"));
         let _ = tokio::fs::remove_dir_all(&staging).await;
         let rootdir = staging.join("root");
@@ -1424,15 +1550,43 @@ pub mod from_image {
             .await
             .map_err(|err| Status::internal(format!("staging: {err}")))?;
 
+        let outcome = populate(
+            manager,
+            data_dir,
+            &rootdir,
+            name,
+            layers,
+            environment,
+            agent_binary,
+            tx,
+        )
+        .await;
+        // Removed on every path: a failed unpack of a large image is the
+        // likeliest way to leave gigabytes behind.
+        let _ = tokio::fs::remove_dir_all(&staging).await;
+        outcome
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn populate(
+        manager: &crate::sandbox::SandboxManager,
+        data_dir: &Path,
+        rootdir: &Path,
+        name: &str,
+        layers: &[std::path::PathBuf],
+        environment: &crate::oci::ImageEnvironment,
+        agent_binary: &Path,
+        tx: &LogTx,
+    ) -> Result<(), Status> {
         let _ = tx
             .send(event(api::build_log::Event::Step(format!(
                 "unpacking {} layer(s)",
-                pulled.layers.len()
+                layers.len()
             ))))
             .await;
         // Blocking file work, and a large image is a lot of it.
-        let layers = pulled.layers.clone();
-        let unpack_into = rootdir.clone();
+        let layers = layers.to_vec();
+        let unpack_into = rootdir.to_path_buf();
         tokio::task::spawn_blocking(move || crate::oci::unpack_layers(&layers, &unpack_into))
             .await
             .map_err(|err| Status::internal(format!("unpack did not run: {err}")))?
@@ -1447,9 +1601,50 @@ pub mod from_image {
             .map_err(|err| Status::internal(format!("installing the agent: {err}")))?;
         set_executable(&rootdir.join("usr/bin/burrow-agent")).await?;
 
-        let outcome = assemble(manager, data_dir, &rootdir, name, &pulled.environment, tx).await;
-        let _ = tokio::fs::remove_dir_all(&staging).await;
-        outcome
+        // A container runtime takes HOME and USER from the image user's passwd
+        // entry rather than from ENV, and a Kit's descriptors reference them
+        // as `${{ kit.env.HOME }}`. Read them out of the rootfs the same way.
+        let mut environment = environment.clone();
+        if environment.kit.is_some() {
+            let passwd = tokio::fs::read_to_string(rootdir.join("etc/passwd"))
+                .await
+                .unwrap_or_default();
+            add_login_env(&mut environment, &passwd);
+        }
+
+        assemble(manager, data_dir, rootdir, name, &environment, tx).await
+    }
+
+    /// Adds HOME and USER for the image's user, where the image did not
+    /// declare them, to the merged env and to the workload's own config: a
+    /// create composes from the recorded Kits, not from the merge.
+    fn add_login_env(environment: &mut crate::oci::ImageEnvironment, passwd: &str) {
+        let user = environment.user.split(':').next().unwrap_or_default();
+        let user = if user.is_empty() { "root" } else { user };
+        let (login, home) = passwd_entry(passwd, user).unwrap_or(("root", "/root"));
+        let declared = environment.as_map();
+        let mut additions = Vec::new();
+        if !declared.contains_key("HOME") {
+            additions.push(format!("HOME={home}"));
+        }
+        if !declared.contains_key("USER") {
+            additions.push(format!("USER={login}"));
+        }
+        environment.env.extend(additions.iter().cloned());
+        if let Some(kit) = environment.kit.as_mut() {
+            kit.kits[kit.workload].config.env.extend(additions);
+        }
+    }
+
+    /// The login name and home of a user named by login or uid.
+    fn passwd_entry<'a>(passwd: &'a str, user: &str) -> Option<(&'a str, &'a str)> {
+        passwd.lines().find_map(|line| {
+            let fields: Vec<&str> = line.split(':').collect();
+            if fields.len() < 7 {
+                return None;
+            }
+            (fields[0] == user || fields[2] == user).then_some((fields[0], fields[5]))
+        })
     }
 
     async fn set_executable(path: &Path) -> Result<(), Status> {

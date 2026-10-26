@@ -21,7 +21,7 @@ pub struct EgressEvent {
     pub destination: String,
     pub host: Option<String>,
     pub port: u16,
-    pub allowed: bool,
+    pub is_allowed: bool,
     pub reason: String,
     pub bytes_sent: u64,
     pub bytes_received: u64,
@@ -140,7 +140,7 @@ impl AuditLog {
             sandbox = event.sandbox_id,
             destination = event.destination,
             host = event.host.as_deref().unwrap_or("-"),
-            allowed = event.allowed,
+            allowed = event.is_allowed,
             reason = event.reason,
             "egress"
         );
@@ -150,7 +150,7 @@ impl AuditLog {
         // the send, and put back if this record is itself dropped.
         event.dropped_records = self.take_dropped(&event.sandbox_id);
 
-        let queue = if event.allowed {
+        let queue = if event.is_allowed {
             &self.allowed
         } else {
             &self.refusals
@@ -167,7 +167,7 @@ impl AuditLog {
             }
         };
 
-        if event.allowed {
+        if event.is_allowed {
             // Volume, not evidence. Dropped rather than waited on, which is
             // what leaves room for the refusals.
             self.count_drop(event);
@@ -225,7 +225,7 @@ fn count_drop_in(dropped: &Mutex<HashMap<String, u64>>, event: EgressEvent) {
         tracing::warn!(
             sandbox = event.sandbox_id,
             dropped = *count,
-            allowed = event.allowed,
+            allowed = event.is_allowed,
             "audit queue full; dropped an egress record"
         );
     }
@@ -244,7 +244,7 @@ async fn write(
             destination: event.destination.clone(),
             host: event.host.clone().unwrap_or_default(),
             port: event.port as u32,
-            allowed: event.allowed,
+            is_allowed: event.is_allowed,
             reason: event.reason.clone(),
             bytes_sent: event.bytes_sent as i64,
             bytes_received: event.bytes_received as i64,
@@ -274,7 +274,7 @@ mod tests {
             destination: "93.184.216.34:443".into(),
             host: Some("example.com".into()),
             port: 443,
-            allowed,
+            is_allowed: allowed,
             reason: if allowed { "allowed" } else { "denied" }.into(),
             bytes_sent: 0,
             bytes_received: 0,
@@ -316,7 +316,7 @@ mod tests {
         log.record(event("sbx", false));
 
         let received = refusals.try_recv().expect("the refusal must be queued");
-        assert!(!received.allowed);
+        assert!(!received.is_allowed);
         assert_eq!(received.reason, "denied");
     }
 
@@ -376,7 +376,7 @@ mod tests {
                 .await
                 .expect("the waiting refusal must be delivered")
                 .expect("the queue is open");
-            assert!(!received.allowed);
+            assert!(!received.is_allowed);
         }
         assert!(log.dropped.lock().unwrap().is_empty());
     }
@@ -406,7 +406,7 @@ mod tests {
 
         // And a record written before the field existed still reads back.
         let old = r#"{"at":"t","sandbox_id":"s","source_ip":"1.2.3.4",
-            "destination":"d","host":null,"port":443,"allowed":true,
+            "destination":"d","host":null,"port":443,"is_allowed":true,
             "reason":"allowed","bytes_sent":0,"bytes_received":0}"#;
         let parsed: EgressEvent = serde_json::from_str(old).unwrap();
         assert_eq!(parsed.dropped_records, 0);

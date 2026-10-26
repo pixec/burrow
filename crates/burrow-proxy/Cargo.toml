@@ -24,3 +24,4 @@ rustls = { workspace = true }
 rustls-pemfile = { workspace = true }
 webpki-roots = { workspace = true }
 burrow-store = { workspace = true }
+burrow-core = { workspace = true }

@@ -189,7 +189,7 @@ pub struct Exchange {
     /// The client asked to leave HTTP behind, and the head forwarded says so.
     /// A `101` is then one request that never ends, rather than a second one,
     /// which is the only case where this connection outlives a response.
-    pub upgrade: bool,
+    pub is_upgrade_requested: bool,
 }
 
 /// What [`route`] made of a connection.
@@ -234,7 +234,7 @@ pub async fn route<S: AsyncRead + Unpin>(
         return Ok(refused(404, "hostname does not name a sandbox"));
     };
     let peer = peer.to_canonical();
-    let trusted = trusted_proxies.iter().any(|cidr| cidr.contains(peer));
+    let trusted = trusted_proxies.iter().any(|cidr| cidr.is_covering(peer));
     let (head, exchange) = match rewrite_head(&head, peer, &host, trusted) {
         Ok(rewritten) => rewritten,
         Err(message) => return Ok(refused(400, message)),
@@ -258,7 +258,7 @@ pub struct Cidr {
 }
 
 impl Cidr {
-    fn contains(&self, addr: IpAddr) -> bool {
+    fn is_covering(&self, addr: IpAddr) -> bool {
         // Canonical on both sides, so a v4 client arriving on a dual-stack
         // listener as `::ffff:10.0.0.1` matches a `10.0.0.0/8` proxy.
         let (network, addr) = (self.addr, addr.to_canonical());
@@ -440,7 +440,13 @@ fn rewrite_head(
         return Err("request head too large");
     }
     let body = body_length(&lengths, encoded).ok_or("ambiguous request framing")?;
-    Ok((out, Exchange { body, upgrade }))
+    Ok((
+        out,
+        Exchange {
+            body,
+            is_upgrade_requested: upgrade,
+        },
+    ))
 }
 
 /// How many bytes of body the head says follow it.
@@ -968,7 +974,7 @@ mod tests {
         assert_eq!(header(&head, "connection"), ["close"]);
         assert!(header(&head, "keep-alive").is_empty(), "{head}");
         assert!(header(&head, "proxy-connection").is_empty(), "{head}");
-        assert!(!exchange.upgrade);
+        assert!(!exchange.is_upgrade_requested);
         assert_eq!(exchange.body, 0);
     }
 
@@ -985,7 +991,7 @@ mod tests {
         .unwrap();
         assert_eq!(header(&head, "connection"), ["upgrade"]);
         assert_eq!(header(&head, "upgrade"), ["websocket"]);
-        assert!(exchange.upgrade);
+        assert!(exchange.is_upgrade_requested);
     }
 
     /// `Upgrade` alone is a hop-by-hop hint, not an ask. Treating it as one
@@ -999,7 +1005,7 @@ mod tests {
         )
         .unwrap();
         assert_eq!(header(&head, "connection"), ["close"]);
-        assert!(!exchange.upgrade);
+        assert!(!exchange.is_upgrade_requested);
     }
 
     /// The body is the only thing the client may still send, so how long it is
@@ -1041,20 +1047,20 @@ mod tests {
     #[test]
     fn a_trusted_proxy_is_an_address_or_a_network() {
         let host = parse_trusted_proxy("10.0.0.2").unwrap();
-        assert!(host.contains("10.0.0.2".parse().unwrap()));
-        assert!(!host.contains("10.0.0.3".parse().unwrap()));
+        assert!(host.is_covering("10.0.0.2".parse().unwrap()));
+        assert!(!host.is_covering("10.0.0.3".parse().unwrap()));
 
         let net = parse_trusted_proxy("10.0.0.0/24").unwrap();
-        assert!(net.contains("10.0.0.255".parse().unwrap()));
-        assert!(!net.contains("10.0.1.1".parse().unwrap()));
+        assert!(net.is_covering("10.0.0.255".parse().unwrap()));
+        assert!(!net.is_covering("10.0.1.1".parse().unwrap()));
         // A mapped v4 peer is the same peer.
-        assert!(net.contains("::ffff:10.0.0.5".parse().unwrap()));
+        assert!(net.is_covering("::ffff:10.0.0.5".parse().unwrap()));
 
         let six = parse_trusted_proxy("2001:db8::/32").unwrap();
-        assert!(six.contains("2001:db8::1".parse().unwrap()));
-        assert!(!six.contains("2001:db9::1".parse().unwrap()));
+        assert!(six.is_covering("2001:db8::1".parse().unwrap()));
+        assert!(!six.is_covering("2001:db9::1".parse().unwrap()));
         // Families do not cross.
-        assert!(!six.contains("10.0.0.2".parse().unwrap()));
+        assert!(!six.is_covering("10.0.0.2".parse().unwrap()));
     }
 
     #[test]

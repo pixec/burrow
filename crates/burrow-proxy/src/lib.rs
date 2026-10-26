@@ -194,7 +194,7 @@ impl Proxy {
         let host = match original.port() {
             443 => match sni::parse_client_hello(head) {
                 Some(hello) => {
-                    hides_destination = hello.encrypted_client_hello;
+                    hides_destination = hello.is_hello_encrypted;
                     offered = hello.alpn;
                     hello.server_name
                 }
@@ -205,13 +205,16 @@ impl Proxy {
         };
 
         let (policy, mut decision) = self.policies.decide(source_ip, host.as_deref());
+        // `decide` already denied an unknown source; the default only stands
+        // in so the checks below need not each handle its absence.
+        let policy = policy.unwrap_or_default();
         // Checked on the address alone, before anything about the hostname:
         // the proxy runs on the host and so sits outside the sandbox chain
         // that denies these, and a connection here needs no name at all to
         // reach one. Ahead of the pinning check too, since a control-plane
         // address a sandbox was legitimately told about is still one it may
         // not reach.
-        if self.denied.contains(original.ip()) {
+        if self.denied.is_denied(original.ip()) {
             decision = Decision::Deny("destination is a control-plane address");
         }
         if hides_destination {
@@ -219,38 +222,48 @@ impl Proxy {
             // allowlist can decide.
             decision = Decision::Deny("client hello encrypts its destination (ECH)");
         }
-        let sandbox_id = policy
-            .as_ref()
-            .map(|p| p.sandbox_id.clone())
-            .unwrap_or_default();
+        // The outer name is checked and the address pinned, but neither sees
+        // the host named *inside* the session. A sandbox that asked for
+        // inspection has its TLS terminated here so that host is checked too.
+        let inspecting =
+            original.port() == 443 && policy.is_tls_inspected && self.authority.is_some();
+        // A bounded host is reachable only for the requests its rules admit,
+        // and a connection nothing here will read carries requests nothing
+        // here can judge. Refused rather than passed through blind.
+        if decision.is_allowed()
+            && let Some(host) = host.as_deref()
+            && policy.is_bounded(host)
+            && !inspecting
+            && original.port() != 80
+        {
+            decision = Decision::Deny("bounded host requires inspection");
+        }
+        let sandbox_id = policy.sandbox_id.clone();
 
         // A hostname is what the client says; the address is where it is
         // actually going. Allowing on the former while connecting to the
         // latter is what turns a domain allowlist into no restriction at all.
-        if decision.allowed()
+        if decision.is_allowed()
             && let Some(host) = host.as_deref()
         {
             let destination = policy::unmap(original.ip());
-            if decision.allowed() {
-                // Deny beats every allowance, and it is checked against the
-                // address rather than the name: an allowlisted domain that
-                // resolves into a denied range must not be reachable through
-                // the proxy either, or the nftables denial is only half a
-                // denial.
-                if policy.as_ref().is_some_and(|p| p.denies(destination)) {
-                    decision = Decision::Deny("destination is in a denied range");
-                } else if resolutions::is_forbidden_destination(destination) {
-                    decision = Decision::Deny("destination is an internal or metadata address");
-                } else if !self
-                    .resolutions
-                    .is_pinned(sandbox_id.as_str(), host, destination)
-                {
-                    decision = Decision::Deny("destination address is not pinned to this name");
-                }
+            // Deny beats every allowance, and it is checked against the address
+            // rather than the name: an allowlisted domain that resolves into a
+            // denied range must not be reachable through the proxy either, or
+            // the nftables denial is only half a denial.
+            if policy.is_denied(destination) {
+                decision = Decision::Deny("destination is in a denied range");
+            } else if resolutions::is_forbidden_destination(destination) {
+                decision = Decision::Deny("destination is an internal or metadata address");
+            } else if !self
+                .resolutions
+                .is_pinned(sandbox_id.as_str(), host, destination)
+            {
+                decision = Decision::Deny("destination address is not pinned to this name");
             }
         }
 
-        if !decision.allowed() {
+        if !decision.is_allowed() {
             self.audit.record(EgressEvent {
                 at: now_rfc3339(),
                 sandbox_id,
@@ -258,7 +271,7 @@ impl Proxy {
                 destination: original.to_string(),
                 host,
                 port: original.port(),
-                allowed: false,
+                is_allowed: false,
                 reason: decision.reason().to_string(),
                 bytes_sent: 0,
                 bytes_received: 0,
@@ -289,7 +302,7 @@ impl Proxy {
                     destination: original.to_string(),
                     host,
                     port: original.port(),
-                    allowed: true,
+                    is_allowed: true,
                     reason: format!("upstream connect failed: {err}"),
                     bytes_sent: 0,
                     bytes_received: 0,
@@ -299,24 +312,7 @@ impl Proxy {
             }
         };
 
-        // The outer name is checked and the address pinned, but neither sees
-        // the host named *inside* the session. A sandbox that asked for
-        // inspection has its TLS terminated here so that host is checked too.
-        let inspecting = original.port() == 443
-            && policy.as_ref().is_some_and(|p| p.inspect_tls)
-            && self.authority.is_some();
         if inspecting && let Some(sni) = host.clone() {
-            let allowed = policy
-                .as_ref()
-                .map(|p| p.allow_domains.clone())
-                .unwrap_or_default();
-            // Rules go only down the inspected path: acting on a request means
-            // reading it, and outside an inspected session there is no request
-            // to read.
-            let rules = policy
-                .as_ref()
-                .map(|p| Arc::clone(&p.rules))
-                .unwrap_or_default();
             // An HTTP/2 session multiplexes requests that each name their own
             // host and each get their own decision, so each is recorded on its
             // own rather than summarised into the connection's record.
@@ -334,7 +330,7 @@ impl Proxy {
                         destination: destination.clone(),
                         host: outcome.host,
                         port,
-                        allowed: outcome.allowed,
+                        is_allowed: outcome.is_allowed,
                         reason: outcome.reason,
                         bytes_sent: outcome.sent,
                         bytes_received: outcome.received,
@@ -348,8 +344,7 @@ impl Proxy {
                     upstream,
                     Inspection {
                         sni: &sni,
-                        allowed: &allowed,
-                        rules: &rules,
+                        policy: &policy,
                         sandbox_id: &sandbox_id,
                         offered: &offered,
                         audit_stream,
@@ -378,7 +373,7 @@ impl Proxy {
                 destination: original.to_string(),
                 host: Some(sni),
                 port: original.port(),
-                allowed: allowed_inner,
+                is_allowed: allowed_inner,
                 reason,
                 bytes_sent: sent,
                 bytes_received: received,
@@ -393,16 +388,12 @@ impl Proxy {
         // Without TLS there is no session identity to pin them to, but every
         // request must still be allowlisted.
         if original.port() == 80 {
-            let allowed = policy
-                .as_ref()
-                .map(|p| p.allow_domains.clone())
-                .unwrap_or_default();
             let relayed = self
                 .relay_http(
                     &mut client,
                     &mut upstream,
                     host.as_deref(),
-                    &allowed,
+                    &policy,
                     false,
                     &[],
                 )
@@ -414,7 +405,7 @@ impl Proxy {
                 destination: original.to_string(),
                 host,
                 port: original.port(),
-                allowed: relayed.refusal.is_none(),
+                is_allowed: relayed.refusal.is_none(),
                 reason: relayed.refusal.unwrap_or_else(|| "allowed".to_string()),
                 bytes_sent: relayed.sent,
                 bytes_received: relayed.received,
@@ -434,7 +425,7 @@ impl Proxy {
             destination: original.to_string(),
             host,
             port: original.port(),
-            allowed: true,
+            is_allowed: true,
             reason: "allowed".into(),
             bytes_sent: sent,
             bytes_received: received,
@@ -470,7 +461,7 @@ impl Proxy {
         client: &mut C,
         upstream: &mut U,
         opened_for: Option<&str>,
-        allowed: &[String],
+        policy: &policy::SandboxPolicy,
         require_match: bool,
         rules: &[policy::Rule],
     ) -> Relayed
@@ -500,7 +491,7 @@ impl Proxy {
             let Some(head) = client_read.read_head().await? else {
                 return Ok(First::Closed);
             };
-            let parsed = check_request(&head, allowed, opened_for, require_match)?;
+            let parsed = check_request(&head, policy, opened_for, require_match)?;
             let head = apply_rules(head, &parsed, rules)?;
             upstream_write
                 .write_all(&head)
@@ -513,7 +504,7 @@ impl Proxy {
             sent += client_read
                 .forward_body(&mut upstream_write, &parsed.framing)
                 .await?;
-            if !parsed.upgrade {
+            if !parsed.is_upgrade_requested {
                 return Ok(First::Continue);
             }
 
@@ -535,7 +526,10 @@ impl Proxy {
         .await;
 
         match first {
-            Err(reason) => refusal = Some(reason),
+            Err(reason) => {
+                write_refusal(&mut client_write).await;
+                refusal = Some(reason);
+            }
             Ok(First::Closed) => {}
             Ok(First::Upgraded) => {
                 // The server agreed to switch protocols, so nothing further
@@ -565,15 +559,14 @@ impl Proxy {
                             Ok(None) => break Ok(()),
                             Err(err) => break Err(err),
                         };
-                        let parsed = match check_request(&head, allowed, opened_for, require_match)
-                        {
+                        let parsed = match check_request(&head, policy, opened_for, require_match) {
                             Ok(parsed) => parsed,
                             Err(reason) => break Err(reason),
                         };
                         // Upgrading here would mean judging the server's answer
                         // while the response direction is already being copied
                         // blind. Refused rather than tunnelled unchecked.
-                        if parsed.upgrade {
+                        if parsed.is_upgrade_requested {
                             break Err(
                                 "an upgrade after the first request is not relayed".to_string()
                             );
@@ -615,6 +608,7 @@ impl Proxy {
                     Ok(body) => sent += body,
                     Err((body, reason)) => {
                         sent += body;
+                        write_refusal(&mut client_write).await;
                         refusal = Some(reason);
                     }
                 }
@@ -641,12 +635,15 @@ impl Proxy {
     ) -> Result<Relayed, String> {
         let Inspection {
             sni,
-            allowed,
-            rules,
+            policy,
             sandbox_id,
             offered,
             audit_stream,
         } = session;
+        // Rules go only down the inspected path: acting on a request means
+        // reading it, and outside an inspected session there is no request to
+        // read.
+        let rules = policy.rules.as_slice();
         let authority = self
             .authority
             .as_ref()
@@ -717,14 +714,14 @@ impl Proxy {
             // is served one request at a time: the answer may come from
             // somewhere `upstream` is not, and there is no writing that down a
             // socket a blind copy is already draining.
-            inspect::Protocol::Http11 if rules.iter().any(policy::Rule::diverts) => Ok(self
-                .relay_diverted(&mut inner, &mut outer, sni, allowed, rules, sandbox_id)
+            inspect::Protocol::Http11 if rules.iter().any(policy::Rule::is_diverted) => Ok(self
+                .relay_diverted(&mut inner, &mut outer, sni, policy, sandbox_id)
                 .await),
             inspect::Protocol::Http11 => Ok(self
-                .relay_http(&mut inner, &mut outer, Some(sni), allowed, true, rules)
+                .relay_http(&mut inner, &mut outer, Some(sni), policy, true, rules)
                 .await),
             inspect::Protocol::H2 => {
-                http2::relay(inner, outer, sni, allowed, rules, sandbox_id, audit_stream).await
+                http2::relay(inner, outer, sni, policy, sandbox_id, audit_stream).await
             }
         }
     }
@@ -741,8 +738,7 @@ impl Proxy {
         client: &mut C,
         upstream: &mut U,
         opened_for: &str,
-        allowed: &[String],
-        rules: &[policy::Rule],
+        policy: &policy::SandboxPolicy,
         sandbox_id: &str,
     ) -> Relayed
     where
@@ -750,6 +746,8 @@ impl Proxy {
         U: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
     {
         use tokio::io::AsyncWriteExt;
+
+        let rules = policy.rules.as_slice();
 
         let (client_read, mut client_write) = tokio::io::split(client);
         let (upstream_read, mut upstream_write) = tokio::io::split(upstream);
@@ -764,11 +762,11 @@ impl Proxy {
             let Some(head) = client_read.read_head().await? else {
                 return Ok(());
             };
-            let parsed = check_request(&head, allowed, Some(opened_for), true)?;
+            let parsed = check_request(&head, policy, Some(opened_for), true)?;
             // An upgrade leaves HTTP behind, and what follows could not be
             // matched against a rule that may forward it. Refused rather than
             // tunnelled past the rule.
-            if parsed.upgrade {
+            if parsed.is_upgrade_requested {
                 return Err("an upgrade is not relayed on a connection that may forward".into());
             }
             let host = parsed.host.clone().unwrap_or_default();
@@ -825,6 +823,9 @@ impl Proxy {
         }
         .await;
 
+        if outcome.is_err() {
+            write_refusal(&mut client_write).await;
+        }
         let _ = client_write.shutdown().await;
         Relayed {
             sent,
@@ -833,6 +834,20 @@ impl Proxy {
             note,
         }
     }
+}
+
+/// Answers a refused request with `403`, so the client learns the request was
+/// refused rather than seeing its connection vanish. Nothing further is sent
+/// on the connection, which is what `Connection: close` tells it.
+async fn write_refusal<W>(to: &mut W)
+where
+    W: tokio::io::AsyncWrite + Unpin,
+{
+    use tokio::io::AsyncWriteExt;
+
+    let _ = to
+        .write_all(b"HTTP/1.1 403 Forbidden\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
+        .await;
 }
 
 /// Writes a forwarded answer back to the sandbox as HTTP/1.1.
@@ -888,9 +903,9 @@ struct Inspection<'a> {
     /// The name the session was opened for. Every request inside it must name
     /// this host: two allowed names behind one address are still two names.
     sni: &'a str,
-    allowed: &'a [String],
-    /// What happens to the requests inside the session, in policy order.
-    rules: &'a [policy::Rule],
+    /// Also carries what happens to the requests inside the session, in
+    /// policy order.
+    policy: &'a policy::SandboxPolicy,
     /// Stamped onto forwarded requests, so the endpoint knows whose request it
     /// is looking at.
     sandbox_id: &'a str,
@@ -940,7 +955,7 @@ enum First {
 /// plaintext.
 fn check_request(
     head: &[u8],
-    allowed: &[String],
+    policy: &policy::SandboxPolicy,
     opened_for: Option<&str>,
     require_match: bool,
 ) -> Result<http::RequestHead, String> {
@@ -967,10 +982,12 @@ fn check_request(
     let verdict = match opened_for {
         // An inspected session is pinned to the name it was opened for: two
         // allowed names behind one address are still two names.
-        Some(name) if require_match => inspect::inner_host_allowed(name, &host, allowed),
-        _ => inspect::host_allowed(allowed, &host),
+        Some(name) if require_match => inspect::inner_host_allowed(name, &host, policy),
+        _ => inspect::host_allowed(policy, &host),
     };
     verdict.map_err(|reason| format!("{reason} ({host})"))?;
+    let (path, _) = parsed.path_and_query();
+    policy.check_request(&host, &parsed.method, path)?;
     Ok(parsed)
 }
 
@@ -1030,11 +1047,11 @@ pub(crate) fn select_rule<'a>(
     rules
         .iter()
         .find(|rule| {
-            policy::matches(&rule.domain, host)
+            burrow_core::glob::is_host_match(&rule.domain, host)
                 && rule
                     .matcher
                     .as_ref()
-                    .is_none_or(|matcher| matcher.matches(facts))
+                    .is_none_or(|matcher| matcher.is_match(facts))
         })
         .map(|rule| &rule.action)
 }
@@ -1107,7 +1124,7 @@ const IP6T_SO_ORIGINAL_DST: nix::libc::c_int = 80;
 fn original_dst(stream: &TcpStream) -> std::io::Result<SocketAddr> {
     // The option is per family and the kernel answers only the one the socket
     // belongs to, so which to ask is decided by the connection, not guessed.
-    if asks_ipv4(stream.local_addr()?) {
+    if is_ipv4_request(stream.local_addr()?) {
         original_dst_v4(stream)
     } else {
         original_dst_v6(stream)
@@ -1122,7 +1139,7 @@ fn original_dst(stream: &TcpStream) -> std::io::Result<SocketAddr> {
 /// for the family the packet was really in: asking IPv6 for a mapped
 /// connection fails, and the connection then dies before any policy decision
 /// is made or audited, which reads as the destination being unreachable.
-fn asks_ipv4(local: SocketAddr) -> bool {
+fn is_ipv4_request(local: SocketAddr) -> bool {
     match local {
         SocketAddr::V4(_) => true,
         SocketAddr::V6(local) => local.ip().to_ipv4_mapped().is_some(),
@@ -1232,7 +1249,7 @@ mod tests {
         sandbox.shutdown().await.unwrap();
 
         let mut client = client;
-        let allowed = vec!["api.example.com".to_string(), "other.example".to_string()];
+        let allowed = policy::SandboxPolicy::allowing(&["api.example.com", "other.example"]);
         let relay = tokio::spawn(async move {
             let proxy = proxy();
             proxy
@@ -1302,7 +1319,7 @@ mod tests {
     #[test]
     fn absolute_form_authority_disagreeing_with_host_is_refused() {
         let head = b"GET http://evil.example/path HTTP/1.1\r\nHost: api.example.com\r\n\r\n";
-        let allowed = vec!["api.example.com".to_string()];
+        let allowed = policy::SandboxPolicy::allowing(&["api.example.com"]);
         let err = check_request(head, &allowed, None, false).unwrap_err();
         assert!(err.contains("does not match Host"), "{err}");
     }
@@ -1427,15 +1444,17 @@ mod tests {
             .await
             .unwrap();
 
-        let allowed = vec!["api.example.com".to_string()];
+        let policy = policy::SandboxPolicy {
+            rules: Arc::new(vec![forward]),
+            ..policy::SandboxPolicy::allowing(&["api.example.com"])
+        };
         let relay = tokio::spawn(async move {
             proxy()
                 .relay_diverted(
                     &mut client,
                     &mut upstream,
                     "api.example.com",
-                    &allowed,
-                    &[forward],
+                    &policy,
                     "sbx-1",
                 )
                 .await
@@ -1493,12 +1512,57 @@ mod tests {
 
     /// The global limit is shared, so a sandbox opening connections in a loop
     /// would take every slot. Each source gets its own budget on top.
+    /// A refused request is answered, not dropped: the client sees a `403`
+    /// naming the refusal instead of a connection that vanished.
+    #[tokio::test]
+    async fn a_request_refused_by_an_http_rule_is_answered_with_403() {
+        let (mut sandbox, mut client) = tokio::io::duplex(8 * 1024);
+        let (_origin, mut upstream) = tokio::io::duplex(8 * 1024);
+        sandbox
+            .write_all(b"POST /repos/o/r HTTP/1.1\r\nHost: api.example.com\r\n\r\n")
+            .await
+            .unwrap();
+        sandbox.shutdown().await.unwrap();
+
+        let policy = policy::SandboxPolicy {
+            http_rules: Arc::new(vec![policy::HttpRule {
+                hosts: vec!["api.example.com".into()],
+                methods: vec!["GET".into()],
+                paths: vec!["/repos/**".into()],
+                is_denying: false,
+            }]),
+            ..Default::default()
+        };
+        let relay = tokio::spawn(async move {
+            proxy()
+                .relay_http(
+                    &mut client,
+                    &mut upstream,
+                    Some("api.example.com"),
+                    &policy,
+                    true,
+                    &[],
+                )
+                .await
+        });
+
+        let mut answer = Vec::new();
+        sandbox.read_to_end(&mut answer).await.unwrap();
+        let answer = String::from_utf8(answer).unwrap();
+        assert!(answer.starts_with("HTTP/1.1 403 Forbidden\r\n"), "{answer}");
+        let outcome = relay.await.unwrap();
+        let refusal = outcome.refusal.unwrap();
+        assert!(refusal.contains("no http rule admits POST"), "{refusal}");
+    }
+
     #[test]
     fn a_mapped_connection_asks_for_its_original_destination_as_ipv4() {
-        assert!(asks_ipv4("10.99.4.1:3128".parse().unwrap()));
+        assert!(is_ipv4_request("10.99.4.1:3128".parse().unwrap()));
         // What a dual-stack listener reports for an IPv4 client.
-        assert!(asks_ipv4("[::ffff:10.99.4.1]:3128".parse().unwrap()));
-        assert!(!asks_ipv4("[fd99:b070:0:100::1]:3128".parse().unwrap()));
+        assert!(is_ipv4_request("[::ffff:10.99.4.1]:3128".parse().unwrap()));
+        assert!(!is_ipv4_request(
+            "[fd99:b070:0:100::1]:3128".parse().unwrap()
+        ));
     }
 
     #[test]

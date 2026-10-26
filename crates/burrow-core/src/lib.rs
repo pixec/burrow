@@ -1,7 +1,9 @@
 pub mod auth;
 pub mod edge;
+pub mod glob;
 pub mod tags;
 pub mod telemetry;
+pub mod vault;
 
 use serde::{Deserialize, Serialize};
 

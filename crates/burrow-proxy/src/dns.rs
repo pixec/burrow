@@ -195,7 +195,7 @@ impl Resolver {
         let mut refusal = None;
         let answer = if internal {
             Some(self.answer_internal(&query, source_ip, &name))
-        } else if decision.allowed() {
+        } else if decision.is_allowed() {
             self.forward(&query, forwards).await
         } else {
             // REFUSED rather than a forged NXDOMAIN: the name may well exist,
@@ -233,7 +233,7 @@ impl Resolver {
             port: 53,
             // A lookup is not a connection: resolving a name is recorded, but
             // whether the sandbox may *reach* it is still the proxy's call.
-            allowed: answer.is_some() && refusal.is_none(),
+            is_allowed: answer.is_some() && refusal.is_none(),
             reason: match (&answer, internal, refusal) {
                 (_, _, Some(reason)) => format!("dns query refused: {reason}"),
                 (Some(_), true, None) => "internal dns query".into(),
@@ -267,7 +267,7 @@ impl Resolver {
             IpAddr::V4(v4) => v4,
             IpAddr::V6(_) => return rcode_response(query, RCODE_NXDOMAIN),
         };
-        match (query_is_aaaa(query), self.directory.resolve(client, name)) {
+        match (is_aaaa_query(query), self.directory.resolve(client, name)) {
             (true, Some(_)) => rcode_response(query, RCODE_NOERROR),
             (false, Some(address)) => a_record_response(query, address),
             (_, None) => rcode_response(query, RCODE_NXDOMAIN),
@@ -317,7 +317,7 @@ impl Resolver {
                 .ok()?
                 .ok()?;
             let candidate = &buf[..len];
-            if answers_query(query, candidate) {
+            if is_reply_to(query, candidate) {
                 return Some(candidate.to_vec());
             }
             // Not this query's answer (stale reply, or a forged/off-path
@@ -332,7 +332,7 @@ impl Resolver {
 /// transaction id, the QR bit set, and the same question (name, qtype,
 /// qclass). This is what stands between a forged UDP datagram and a pinned
 /// answer, so it checks the whole question rather than just the id.
-fn answers_query(query: &[u8], reply: &[u8]) -> bool {
+fn is_reply_to(query: &[u8], reply: &[u8]) -> bool {
     if query.len() < 12 || reply.len() < 12 {
         return false;
     }
@@ -366,7 +366,7 @@ const QTYPE_AAAA: u16 = 28;
 ///
 /// Only the first question is read, which is the only one any resolver in
 /// practice sends and the only one [`parse_question`] decodes.
-fn query_is_aaaa(packet: &[u8]) -> bool {
+fn is_aaaa_query(packet: &[u8]) -> bool {
     let Some(end) = skip_question_name(packet, 12) else {
         return false;
     };
@@ -575,7 +575,7 @@ mod tests {
         let mut forged = query.clone();
         forged[2] |= 0x80; // pretend to be a response
         forged[0] ^= 0xff; // wrong transaction id
-        assert!(!answers_query(&query, &forged));
+        assert!(!is_reply_to(&query, &forged));
     }
 
     #[test]
@@ -585,7 +585,7 @@ mod tests {
         forged[0] = query[0];
         forged[1] = query[1];
         forged[2] |= 0x80;
-        assert!(!answers_query(&query, &forged));
+        assert!(!is_reply_to(&query, &forged));
     }
 
     #[test]
@@ -593,14 +593,14 @@ mod tests {
         // Same id and question, but never marked as a response (e.g. an
         // echoed query rather than an answer).
         let query = query_for("example.com");
-        assert!(!answers_query(&query, &query));
+        assert!(!is_reply_to(&query, &query));
     }
 
     #[test]
     fn a_matching_reply_is_accepted() {
         let query = query_for("example.com");
         let reply = a_record_response(&query, Ipv4Addr::new(93, 184, 216, 34));
-        assert!(answers_query(&query, &reply));
+        assert!(is_reply_to(&query, &reply));
     }
 
     /// The parser burrow already has must be able to read back what it wrote.

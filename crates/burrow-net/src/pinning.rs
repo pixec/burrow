@@ -21,7 +21,7 @@ use std::path::{Path, PathBuf};
 pub struct Pin {
     pub public_key: String,
     /// Operator-provided pins are never overwritten and never learned over.
-    pub explicit: bool,
+    pub is_explicit: bool,
 }
 
 /// Keys this node has committed to, per peer node id.
@@ -40,7 +40,7 @@ pub enum Verdict {
     Learned,
     /// Contradicts the pin. The peer is refused.
     Conflict { pinned: String },
-    /// The node id is not one this file can hold; see [`valid_node_id`]. The
+    /// The node id is not one this file can hold; see [`is_valid_node_id`]. The
     /// peer is refused and nothing is learned.
     InvalidNodeId,
 }
@@ -52,7 +52,7 @@ pub enum Verdict {
 /// extra line pinning a node of the writer's choosing to a key they hold.
 /// Ids come from the operator's own naming, so everything outside
 /// `[A-Za-z0-9_.-]`, an empty id included, is refused rather than escaped.
-pub fn valid_node_id(node_id: &str) -> bool {
+pub fn is_valid_node_id(node_id: &str) -> bool {
     !node_id.is_empty()
         && node_id
             .bytes()
@@ -71,7 +71,7 @@ impl PinnedKeys {
                     node_id,
                     Pin {
                         public_key: key,
-                        explicit: false,
+                        is_explicit: false,
                     },
                 );
             }
@@ -83,7 +83,7 @@ impl PinnedKeys {
                     node_id,
                     Pin {
                         public_key: key,
-                        explicit: true,
+                        is_explicit: true,
                     },
                 );
             }
@@ -109,10 +109,10 @@ impl PinnedKeys {
 
     /// Checks a reported key, pinning it if the peer is new.
     ///
-    /// An id [`valid_node_id`] refuses never reaches the lookup: a pin that
+    /// An id [`is_valid_node_id`] refuses never reaches the lookup: a pin that
     /// cannot be written back would last only until the next restart.
     pub fn check(&mut self, node_id: &str, public_key: &str) -> Verdict {
-        if !valid_node_id(node_id) {
+        if !is_valid_node_id(node_id) {
             return Verdict::InvalidNodeId;
         }
         match self.pins.get(node_id) {
@@ -125,7 +125,7 @@ impl PinnedKeys {
                     node_id.to_string(),
                     Pin {
                         public_key: public_key.to_string(),
-                        explicit: false,
+                        is_explicit: false,
                     },
                 );
                 Verdict::Learned
@@ -147,7 +147,7 @@ impl PinnedKeys {
             .iter()
             // Checked again here: whatever route a pin took into the map, it
             // must not write a line the parser would read as two.
-            .filter(|(node_id, pin)| !pin.explicit && valid_node_id(node_id))
+            .filter(|(node_id, pin)| !pin.is_explicit && is_valid_node_id(node_id))
             .map(|(node_id, pin)| format!("{node_id} {}", pin.public_key))
             .collect();
         lines.sort();
@@ -169,7 +169,7 @@ fn parse(text: &str) -> Vec<(String, String)> {
         .filter_map(|line| {
             let (node_id, key) = line.split_once(char::is_whitespace)?;
             let key = key.trim();
-            (valid_node_id(node_id) && !key.is_empty())
+            (is_valid_node_id(node_id) && !key.is_empty())
                 .then(|| (node_id.to_string(), key.to_string()))
         })
         .collect()
@@ -184,7 +184,7 @@ mod tests {
             node_id.to_string(),
             Pin {
                 public_key: key.to_string(),
-                explicit,
+                is_explicit: explicit,
             },
         )
     }
@@ -279,7 +279,7 @@ mod tests {
             .unwrap();
 
         let mut pins = PinnedKeys::load(&learned, &explicit).await;
-        assert!(pins.get("node-a").unwrap().explicit);
+        assert!(pins.get("node-a").unwrap().is_explicit);
         assert!(matches!(
             pins.check("node-a", "learned-key"),
             Verdict::Conflict { .. }

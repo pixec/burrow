@@ -15,7 +15,8 @@ pub struct MachineConfig {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub smt: Option<bool>,
     /// Required for diff snapshots; costs a little write performance.
-    pub track_dirty_pages: bool,
+    #[serde(rename = "track_dirty_pages")]
+    pub is_dirty_pages_tracked: bool,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -53,8 +54,10 @@ pub struct Vsock {
 pub struct Logger {
     pub log_path: String,
     pub level: String,
-    pub show_level: bool,
-    pub show_log_origin: bool,
+    #[serde(rename = "show_level")]
+    pub is_level_shown: bool,
+    #[serde(rename = "show_log_origin")]
+    pub is_log_origin_shown: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -95,8 +98,10 @@ pub struct NetworkOverride {
 pub struct LoadSnapshot {
     pub snapshot_path: String,
     pub mem_backend: MemBackend,
-    pub enable_diff_snapshots: bool,
-    pub resume_vm: bool,
+    #[serde(rename = "enable_diff_snapshots")]
+    pub is_diff_snapshots_enabled: bool,
+    #[serde(rename = "resume_vm")]
+    pub is_vm_resumed: bool,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub network_overrides: Vec<NetworkOverride>,
 }

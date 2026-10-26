@@ -85,7 +85,7 @@ enum Path {
 
 #[derive(Default)]
 struct Candidate {
-    from_call_me_maybe: bool,
+    is_from_call_me_maybe: bool,
     last_ping: Option<Instant>,
 }
 
@@ -178,7 +178,7 @@ struct State {
     mapped: HashMap<SocketAddr, (SocketAddr, Instant)>,
     endpoints: Vec<SocketAddr>,
     last_stun: Option<Instant>,
-    stun_wanted: bool,
+    is_stun_wanted: bool,
 }
 
 impl State {
@@ -189,7 +189,7 @@ impl State {
         now: Instant,
         out: &mut Vec<Vec<u8>>,
     ) {
-        if disco::looks_like_disco(data) {
+        if disco::is_disco(data) {
             self.handle_disco(data, Path::Derp, Some(src), now);
         } else if meow::is_meow(data) {
             if let Some((_, disco_pub)) = meow::parse_ping(data) {
@@ -211,7 +211,7 @@ impl State {
             self.on_stun(tx, mapped, now);
             return;
         }
-        if disco::looks_like_disco(data) {
+        if disco::is_disco(data) {
             self.handle_disco(data, Path::Udp(from), None, now);
             return;
         }
@@ -285,7 +285,7 @@ impl State {
             .last_stun
             .is_none_or(|t| now.duration_since(t) > ENDPOINTS_FRESH)
         {
-            self.stun_wanted = true;
+            self.is_stun_wanted = true;
         }
         let peer = self.peers.get_mut(&src).expect("just inserted");
         send_call_me_maybe(&self.io, &self.disco_pub, &self.endpoints, peer, now);
@@ -364,14 +364,14 @@ impl State {
                     return;
                 }
                 peer.candidates
-                    .retain(|addr, c| !c.from_call_me_maybe || endpoints.contains(addr));
+                    .retain(|addr, c| !c.is_from_call_me_maybe || endpoints.contains(addr));
                 for ep in endpoints {
                     if let IpAddr::V6(v6) = ep.ip()
                         && v6.is_unicast_link_local()
                     {
                         continue;
                     }
-                    peer.candidates.entry(ep).or_default().from_call_me_maybe = true;
+                    peer.candidates.entry(ep).or_default().is_from_call_me_maybe = true;
                 }
                 let addrs: Vec<SocketAddr> = peer.candidates.keys().copied().collect();
                 tracing::debug!(client = %peer.key.short(), ?addrs, "call-me-maybe");
@@ -427,8 +427,8 @@ impl State {
                 );
             }
         }
-        if n.is_multiple_of(TICKS_PER_STUN) || self.stun_wanted {
-            self.stun_wanted = false;
+        if n.is_multiple_of(TICKS_PER_STUN) || self.is_stun_wanted {
+            self.is_stun_wanted = false;
             self.stun_probe(now);
             self.update_endpoints(now);
         }
@@ -725,7 +725,7 @@ impl Transport {
             mapped: HashMap::new(),
             endpoints: Vec::new(),
             last_stun: None,
-            stun_wanted: false,
+            is_stun_wanted: false,
         }));
 
         let mut tasks = Vec::new();

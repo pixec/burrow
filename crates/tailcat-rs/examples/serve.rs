@@ -29,8 +29,8 @@ struct Args {
     #[arg(long)]
     allow: Vec<NodePublic>,
     /// Also forward connections to any destination the client names.
-    #[arg(long)]
-    exit_node: bool,
+    #[arg(long = "exit-node")]
+    is_exit_node: bool,
     /// Comma-separated ports forwarded to 127.0.0.1, or "all".
     ports: String,
 }
@@ -75,7 +75,7 @@ fn dev_region(hostport: &str, stun_port: Option<u16>) -> Result<DerpRegion, Stri
             },
             derp_port: port,
             stun_port: stun_port.map(i32::from).unwrap_or(-1),
-            insecure_for_tests: true,
+            is_insecure_for_tests: true,
             ..Default::default()
         }],
         ..Default::default()
@@ -108,7 +108,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let mut config = Config {
         tcp_ports: parse_ports(&args.ports)?,
-        forward_tcp: args.exit_node,
+        is_tcp_forwarded: args.is_exit_node,
         ..Default::default()
     };
     if !args.allow.is_empty() {
@@ -116,7 +116,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
     if let Some(dev) = &args.dev_derp {
         config.region = Region::Embedded(dev_region(dev, args.stun_port)?);
-        config.insecure_derp_http = true;
+        config.is_derp_http_insecure = true;
     } else if let Some(id) = args.region {
         config.region = Region::Id(id);
     }

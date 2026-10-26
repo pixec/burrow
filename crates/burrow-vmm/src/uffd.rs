@@ -58,7 +58,7 @@ struct RegionMapping {
 }
 
 impl RegionMapping {
-    fn contains(&self, addr: u64) -> bool {
+    fn is_in_region(&self, addr: u64) -> bool {
         addr >= self.base_host_virt_addr && addr < self.base_host_virt_addr + self.size as u64
     }
 }
@@ -222,7 +222,7 @@ impl Layer {
     }
 
     /// Whether this layer defines the page at `offset`.
-    fn holds(&self, offset: u64) -> bool {
+    fn is_defined_at(&self, offset: u64) -> bool {
         self.extents
             .binary_search_by(|(start, end)| {
                 if offset < *start {
@@ -604,7 +604,7 @@ fn handle_faults(
 
         match parse_event(&buf) {
             Event::PageFault { address } => {
-                let Some(region) = regions.iter().find(|r| r.contains(address)) else {
+                let Some(region) = regions.iter().find(|r| r.is_in_region(address)) else {
                     // Serving the wrong address would corrupt the guest, so
                     // leave it stalled and say why.
                     return Err(io::Error::other(format!(
@@ -629,7 +629,11 @@ fn handle_faults(
 /// means it is zero, so it is filled rather than treated as an error.
 fn copy_page(fd: RawFd, region: &RegionMapping, page: u64, layers: &[Layer]) -> io::Result<()> {
     let offset = region.offset + (page - region.base_host_virt_addr);
-    let Some(layer) = layers.iter().rev().find(|layer| layer.holds(offset)) else {
+    let Some(layer) = layers
+        .iter()
+        .rev()
+        .find(|layer| layer.is_defined_at(offset))
+    else {
         return zero_range(fd, page, page + region.page_size as u64);
     };
     let mut arg = UffdioCopy {
@@ -809,11 +813,11 @@ mod tests {
                 page_size: 0x1000,
             },
         ];
-        assert!(regions[0].contains(0x1fff));
-        assert!(!regions[0].contains(0x2000));
-        assert!(regions[1].contains(0x101000));
+        assert!(regions[0].is_in_region(0x1fff));
+        assert!(!regions[0].is_in_region(0x2000));
+        assert!(regions[1].is_in_region(0x101000));
         // The gap between regions belongs to neither.
-        assert!(!regions.iter().any(|r| r.contains(0x50000)));
+        assert!(!regions.iter().any(|r| r.is_in_region(0x50000)));
     }
 
     #[test]

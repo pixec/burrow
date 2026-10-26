@@ -218,13 +218,24 @@ pub fn mount_volumes(volumes: &[burrow_proto::agent::v1::VolumeMount]) -> anyhow
         // wire, and this is the code that turns it into a mount.
         if !volume.path.starts_with('/')
             || volume.path.split('/').any(|part| part == "..")
-            || !volume.device.starts_with("/dev/")
+            || (!volume.is_tmpfs && !volume.device.starts_with("/dev/"))
         {
             anyhow::bail!(
                 "refusing volume mount {:?} at {:?}",
                 volume.device,
                 volume.path
             );
+        }
+        let mode = match volume.mode.as_str() {
+            "" => None,
+            mode => Some(
+                u32::from_str_radix(mode, 8)
+                    .map_err(|_| anyhow::anyhow!("mount mode {mode:?} is not octal"))?,
+            ),
+        };
+        if volume.is_tmpfs {
+            mount_tmpfs(volume, mode)?;
+            continue;
         }
         // A hotplugged device does not exist until the bus is rescanned:
         // firecracker has no way to tell the guest one arrived. Only done when
@@ -237,14 +248,14 @@ pub fn mount_volumes(volumes: &[burrow_proto::agent::v1::VolumeMount]) -> anyhow
         std::fs::create_dir_all(&volume.path)?;
 
         let mut flags = MsFlags::MS_NOSUID | MsFlags::MS_NODEV;
-        if volume.read_only {
+        if volume.is_read_only {
             flags |= MsFlags::MS_RDONLY;
         }
         // `norecovery` for a read-only mount: the device is read-only at the
         // hypervisor, so ext4 cannot replay a journal even to mount, and a
         // volume last used by a writer has one. Without this the mount fails
         // with EROFS rather than coming up.
-        let data = volume.read_only.then_some("norecovery");
+        let data = volume.is_read_only.then_some("norecovery");
         match mount(
             Some(volume.device.as_str()),
             volume.path.as_str(),
@@ -252,12 +263,23 @@ pub fn mount_volumes(volumes: &[burrow_proto::agent::v1::VolumeMount]) -> anyhow
             flags,
             data,
         ) {
-            Ok(()) => tracing::debug!(
-                device = volume.device,
-                path = volume.path,
-                read_only = volume.read_only,
-                "volume mounted"
-            ),
+            Ok(()) => {
+                tracing::debug!(
+                    device = volume.device,
+                    path = volume.path,
+                    read_only = volume.is_read_only,
+                    "volume mounted"
+                );
+                // Only a filesystem nobody has written to yet: the mode is a
+                // default for a new volume, not an instruction to reset one
+                // that has data and permissions of its own.
+                if let Some(mode) = mode
+                    && !volume.is_read_only
+                    && is_fresh(&volume.path)?
+                {
+                    set_mode(&volume.path, mode)?;
+                }
+            }
             // Already mounted, which a second handshake on one boot would hit.
             Err(nix::errno::Errno::EBUSY) => {}
             Err(err) => {
@@ -266,6 +288,57 @@ pub fn mount_volumes(volumes: &[burrow_proto::agent::v1::VolumeMount]) -> anyhow
         }
     }
     Ok(())
+}
+
+/// RAM-backed scratch space at `path`: nothing to wait for and nothing that
+/// outlives the VM, so every boot starts it empty.
+fn mount_tmpfs(
+    volume: &burrow_proto::agent::v1::VolumeMount,
+    mode: Option<u32>,
+) -> anyhow::Result<()> {
+    std::fs::create_dir_all(&volume.path)?;
+    let mut flags = MsFlags::MS_NOSUID | MsFlags::MS_NODEV;
+    if volume.is_read_only {
+        flags |= MsFlags::MS_RDONLY;
+    }
+    let data = (volume.size_mib > 0).then(|| format!("size={}m", volume.size_mib));
+    match mount(
+        Some("tmpfs"),
+        volume.path.as_str(),
+        Some("tmpfs"),
+        flags,
+        data.as_deref(),
+    ) {
+        Ok(()) => tracing::debug!(
+            path = volume.path,
+            size_mib = volume.size_mib,
+            "tmpfs mounted"
+        ),
+        Err(nix::errno::Errno::EBUSY) => return Ok(()),
+        Err(err) => anyhow::bail!("mounting tmpfs at {}: {err}", volume.path),
+    }
+    if let Some(mode) = mode {
+        set_mode(&volume.path, mode)?;
+    }
+    Ok(())
+}
+
+/// Whether a just-mounted filesystem has never been written to. A new ext4
+/// holds only `lost+found`.
+fn is_fresh(path: &str) -> anyhow::Result<bool> {
+    for entry in std::fs::read_dir(path)? {
+        if entry?.file_name() != "lost+found" {
+            return Ok(false);
+        }
+    }
+    Ok(true)
+}
+
+fn set_mode(path: &str, mode: u32) -> anyhow::Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode))
+        .map_err(|err| anyhow::anyhow!("chmod {path} to {mode:o}: {err}"))
 }
 
 /// Asks the kernel to look for devices that appeared since boot.

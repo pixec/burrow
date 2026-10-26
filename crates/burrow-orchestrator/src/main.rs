@@ -1,6 +1,7 @@
 mod api;
 mod registry;
 mod sandboxes;
+mod secrets;
 mod snapshots;
 mod volumes;
 
@@ -64,6 +65,9 @@ struct Args {
 pub struct OrchestratorState {
     pub nodes: registry::NodeRegistry,
     pub sandboxes: sandboxes::SandboxRegistry,
+    /// Credentials Kits ask for by service name, encrypted at rest. `None`
+    /// without a durable store, in which case no secret can be bound.
+    pub secrets: Option<secrets::Secrets>,
     /// Which node holds which snapshot. Snapshots do not travel, so a create
     /// from one has to be placed where it is.
     pub snapshots: snapshots::SnapshotRegistry,
@@ -191,7 +195,7 @@ impl NodeRegistry for NodeRegistryService {
         // The peer list and cross-node membership ride on the heartbeat, so a
         // node converges on the current fleet without a separate subscription.
         Ok(Response::new(nodepb::HeartbeatResponse {
-            reregister: !known,
+            is_reregistration_required: !known,
             peers: self.0.nodes.mesh_peers(&req.node_id),
             network_members: self.0.sandboxes.network_members(&req.node_id),
             // Including the beating node's own: every edge in the fleet is
@@ -386,8 +390,16 @@ async fn run(args: Args) -> anyhow::Result<()> {
         )
     };
 
+    let mut secrets = None;
     let sandboxes = match burrow_store::Store::open(&args.data_dir.join("orchestrator.db")) {
-        Ok(store) => sandboxes::SandboxRegistry::with_store(Arc::new(store)),
+        Ok(store) => {
+            let store = Arc::new(store);
+            match secrets::Secrets::open(Arc::clone(&store), &args.data_dir.join("secrets.key")) {
+                Ok(opened) => secrets = Some(opened),
+                Err(err) => tracing::error!(%err, "secrets are unavailable: no usable key"),
+            }
+            sandboxes::SandboxRegistry::with_store(store)
+        }
         Err(err) => {
             // Not fatal: the registry works in memory, and nodes rebuild it on
             // registration. Only a simultaneous fleet restart would notice.
@@ -402,6 +414,7 @@ async fn run(args: Args) -> anyhow::Result<()> {
     let state = Arc::new(OrchestratorState {
         nodes: registry::NodeRegistry::default(),
         sandboxes,
+        secrets,
         snapshots: snapshots::SnapshotRegistry::default(),
         volumes: volumes::VolumeRegistry::default(),
         channels: api::NodeChannels::default(),

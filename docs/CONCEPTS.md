@@ -64,6 +64,17 @@ key-value tags for filtering ([TAGS.md](TAGS.md)).
 Burrow assumes the code inside a sandbox is hostile. Everything below states
 where a boundary sits, what it holds, and what it does not.
 
+### Why a VM and not a container
+
+A container shares the host kernel with the code it is confining. For
+AI-generated or user-submitted code, that is one bug away from being no
+boundary at all. A Burrow sandbox gets its own kernel behind Firecracker's very
+small device model, and optionally the Firecracker jailer on top of that.
+
+Nodes keep a warm snapshot of each template and restore from it in about
+30 ms, so a create is not a boot. See
+[ARCHITECTURE.md](ARCHITECTURE.md) for how the pieces fit together.
+
 ### Trust boundaries
 
 | Boundary | What is on the untrusted side | What enforces it |
@@ -221,9 +232,9 @@ sandbox. The node enforces them in its own handlers, before a path or a byte
 reaches the guest agent, because the agent sits inside the boundary these
 sections draw and so cannot be the thing that holds them.
 
-- `allow_exec: false` refuses `Exec`, and with it `burrow connect` and
+- `is_exec_allowed: false` refuses `Exec`, and with it `burrow connect` and
   `burrow run`, with `PERMISSION_DENIED`.
-- `allow_upload: false` and `allow_download: false` refuse `UploadFile` and
+- `is_upload_allowed: false` and `is_download_allowed: false` refuse `UploadFile` and
   `DownloadFile`.
 - `path_scopes` confines uploads, downloads, listings and watches to paths under
   one of the given prefixes. Matching is on whole path components, so `/data`
@@ -271,9 +282,9 @@ what they asked for. So tightening one section never touches the other, and
 there is no way to loosen a policy by not mentioning it.
 
 Within a section there is no partial update: sending `fs` at all replaces
-`allow_upload`, `allow_download`, `path_scopes` and `max_upload_bytes` together,
-so restate the parts you want kept. Scopes are validated exactly as a create
-validates them.
+`is_upload_allowed`, `is_download_allowed`, `path_scopes` and
+`max_upload_bytes` together, so restate the parts you want kept. Scopes are
+validated exactly as a create validates them.
 
 ### Running as separate users
 

@@ -132,7 +132,7 @@ fn median(values: &mut [u64]) -> u64 {
 pub async fn agent_boot(args: VmBootArgs) -> anyhow::Result<()> {
     let mut spec = args.spec("agenttest");
     spec.drives = vec![DriveSpec::root_ro(&args.rootfs)];
-    spec.vsock = true;
+    spec.is_vsock_enabled = true;
     spec.boot_args = format!(
         "{} root=/dev/vda ro init=/usr/bin/burrow-agent {}",
         burrow_vmm::DEFAULT_BOOT_ARGS,
@@ -200,7 +200,7 @@ pub async fn agent_exec(args: VmBootArgs, cmd: Vec<String>) -> anyhow::Result<()
 /// Boots a VM running the agent rootfs and waits for the agent to accept.
 async fn boot_agent_vm(args: &VmBootArgs, id: &str) -> anyhow::Result<MicroVm> {
     let mut spec = args.spec(id);
-    spec.vsock = true;
+    spec.is_vsock_enabled = true;
     spec.boot_args = format!(
         "{} root=/dev/vda ro init=/usr/bin/burrow-agent {}",
         burrow_vmm::DEFAULT_BOOT_ARGS,
@@ -236,11 +236,12 @@ async fn exec_capture(
             cmd: cmd.to_vec(),
             env: Default::default(),
             cwd: String::new(),
-            pty: false,
+            is_pty: false,
             rows: 0,
             cols: 0,
             // The node's own housekeeping, which is root's.
             user: String::new(),
+            is_env_cleared: false,
         })),
     };
     // The command takes no stdin, so close the request stream immediately;
@@ -299,7 +300,7 @@ pub async fn clone_divergence(args: VmBootArgs) -> anyhow::Result<()> {
 
         let mut spec = args.spec(name);
         spec.workdir = dir;
-        spec.vsock = true;
+        spec.is_vsock_enabled = true;
         let vm = MicroVm::restore(spec, true).await?;
         vm.wait_for_vsock(
             crate::agentconn::AGENT_PORT,

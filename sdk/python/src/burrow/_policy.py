@@ -348,7 +348,7 @@ def to_network_policy(options: Optional[Dict[str, Any]] = None) -> common_pb2.Ne
         allow_cidrs=options.get("allow_cidrs") or [],
         allow_ports=options.get("allow_ports") or [],
         deny_cidrs=options.get("deny_cidrs") or [],
-        inspect_tls=options.get("inspect_tls") or False,
+        is_tls_inspected=options.get("inspect_tls") or False,
         rules=[_to_request_rule(rule) for rule in rules],
     )
 
@@ -362,7 +362,7 @@ def from_network_policy(raw: common_pb2.NetworkPolicy) -> NetworkPolicy:
         allow_cidrs=list(raw.allow_cidrs),
         allow_ports=list(raw.allow_ports),
         deny_cidrs=list(raw.deny_cidrs),
-        inspect_tls=raw.inspect_tls,
+        inspect_tls=raw.is_tls_inspected,
         rules=rules,
         inject_headers=[
             HeaderInjection(domain=rule.domain, name=name, value=value)
@@ -387,7 +387,7 @@ def to_resource_policy(options: Optional[Dict[str, Any]] = None) -> common_pb2.R
         suspended_ttl_secs=options.get("suspended_ttl_secs") or 0,
         snapshot_expiration_secs=options.get("snapshot_expiration_secs") or 0,
         keep_last_snapshots=options.get("keep_last_snapshots") or 0,
-        keep_evicted_snapshots=options.get("keep_evicted_snapshots") or False,
+        is_evicted_snapshot_kept=options.get("keep_evicted_snapshots") or False,
     )
 
 
@@ -401,7 +401,7 @@ def from_resource_policy(raw: common_pb2.ResourcePolicy) -> ResourcePolicy:
         suspended_ttl_secs=raw.suspended_ttl_secs,
         snapshot_expiration_secs=raw.snapshot_expiration_secs,
         keep_last_snapshots=raw.keep_last_snapshots,
-        keep_evicted_snapshots=raw.keep_evicted_snapshots,
+        keep_evicted_snapshots=raw.is_evicted_snapshot_kept,
     )
 
 
@@ -421,8 +421,8 @@ def to_networks(
             common_pb2.NetworkMembership(
                 network=membership["network"],
                 ingress_ports=membership.get("ingress_ports") or [],
-                allow_egress=membership.get("allow_egress", True),
-                allow_ingress=membership.get("allow_ingress", True),
+                is_egress_allowed=membership.get("allow_egress", True),
+                is_ingress_allowed=membership.get("allow_ingress", True),
                 alias=membership.get("alias") or alias or "",
             )
         )
@@ -434,8 +434,8 @@ def from_networks(raw: Any) -> List[NetworkMembership]:
         NetworkMembership(
             network=entry.network,
             ingress_ports=list(entry.ingress_ports),
-            allow_egress=entry.allow_egress,
-            allow_ingress=entry.allow_ingress,
+            allow_egress=entry.is_egress_allowed,
+            allow_ingress=entry.is_ingress_allowed,
             alias=entry.alias,
         )
         for entry in raw
@@ -450,7 +450,7 @@ def to_exec_policy(options: Optional[Dict[str, Any]]) -> Optional[common_pb2.Exe
     """
     if options is None:
         return None
-    return common_pb2.ExecPolicy(allow_exec=options.get("allow_exec", True))
+    return common_pb2.ExecPolicy(is_exec_allowed=options.get("allow_exec", True))
 
 
 def to_fs_policy(options: Optional[Dict[str, Any]]) -> Optional[common_pb2.FsPolicy]:
@@ -458,8 +458,8 @@ def to_fs_policy(options: Optional[Dict[str, Any]]) -> Optional[common_pb2.FsPol
     if options is None:
         return None
     return common_pb2.FsPolicy(
-        allow_upload=options.get("allow_upload", True),
-        allow_download=options.get("allow_download", True),
+        is_upload_allowed=options.get("allow_upload", True),
+        is_download_allowed=options.get("allow_download", True),
         path_scopes=options.get("path_scopes") or [],
         max_upload_bytes=options.get("max_upload_bytes") or 0,
     )
@@ -468,15 +468,15 @@ def to_fs_policy(options: Optional[Dict[str, Any]]) -> Optional[common_pb2.FsPol
 def from_exec_policy(raw: Any, present: bool) -> Optional[ExecPolicy]:
     if not present:
         return None
-    return ExecPolicy(allow_exec=raw.allow_exec)
+    return ExecPolicy(allow_exec=raw.is_exec_allowed)
 
 
 def from_fs_policy(raw: Any, present: bool) -> Optional[FsPolicy]:
     if not present:
         return None
     return FsPolicy(
-        allow_upload=raw.allow_upload,
-        allow_download=raw.allow_download,
+        allow_upload=raw.is_upload_allowed,
+        allow_download=raw.is_download_allowed,
         path_scopes=list(raw.path_scopes),
         max_upload_bytes=raw.max_upload_bytes,
     )
@@ -489,7 +489,7 @@ def to_volume_mounts(
         common_pb2.VolumeMount(
             volume=mount["volume"],
             path=mount["path"],
-            read_only=mount.get("read_only", False),
+            is_read_only=mount.get("read_only", False),
         )
         for mount in mounts or []
     ]
@@ -497,7 +497,7 @@ def to_volume_mounts(
 
 def from_volume_mounts(raw: Any) -> List[VolumeMount]:
     return [
-        VolumeMount(volume=mount.volume, path=mount.path, read_only=mount.read_only)
+        VolumeMount(volume=mount.volume, path=mount.path, read_only=mount.is_read_only)
         for mount in raw
     ]
 

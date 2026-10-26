@@ -53,8 +53,8 @@ struct Args {
     ///
     /// The api key travels in a header, so plaintext to a remote orchestrator
     /// hands it to anything on the path.
-    #[arg(long, global = true, env = "BURROW_INSECURE")]
-    insecure: bool,
+    #[arg(long = "insecure", global = true, env = "BURROW_INSECURE")]
+    is_insecure: bool,
     #[command(subcommand)]
     command: Command,
 }
@@ -138,8 +138,8 @@ enum Command {
         #[command(flatten)]
         create: CreateFlags,
         /// Open an interactive shell in the sandbox once it is running.
-        #[arg(long)]
-        connect: bool,
+        #[arg(long = "connect")]
+        is_connecting: bool,
     },
     /// List sandboxes.
     ///
@@ -149,8 +149,8 @@ enum Command {
     Ps {
         /// Include sandboxes that are not running: stopped, suspended, failed
         /// and lost ones.
-        #[arg(long, short = 'a')]
-        all: bool,
+        #[arg(long = "all", short = 'a')]
+        is_all_shown: bool,
         /// Show only sandboxes carrying this key=value tag.
         #[arg(long)]
         tag: Option<String>,
@@ -161,24 +161,27 @@ enum Command {
     Inspect {
         id: String,
         /// Emit the record as JSON instead of the readable field list.
-        #[arg(long)]
-        json: bool,
+        #[arg(long = "json")]
+        is_json_requested: bool,
     },
     /// Show what sandboxes have consumed.
     Stats {
         /// Sandbox to report on. Omitted covers every sandbox.
         id: Option<String>,
         /// Include sandboxes that are not running.
-        #[arg(long, short = 'a')]
-        all: bool,
+        #[arg(long = "all", short = 'a')]
+        is_all_shown: bool,
     },
     /// List templates.
     Images,
     /// Import an OCI image as a template, e.g. `python:3.12-slim`.
     Pull {
-        /// Image reference: [registry/]repository[:tag|@digest].
-        image: String,
-        /// Template name. Defaults to the image's repository name.
+        /// Image references: [registry/]repository[:tag|@digest]. Several
+        /// are a Docker Sandbox Kit set, composed into one template.
+        #[arg(required = true)]
+        images: Vec<String>,
+        /// Template name. Defaults to the image's repository name, or for a
+        /// kit set to one derived from its digests.
         #[arg(long)]
         name: Option<String>,
     },
@@ -272,15 +275,15 @@ enum Command {
         #[command(flatten)]
         exec: ExecFlags,
         /// Suspend the sandbox once the command exits.
-        #[arg(long, conflicts_with = "rm")]
-        stop: bool,
+        #[arg(long = "stop", conflicts_with = "is_removed_after")]
+        is_suspended_after: bool,
         /// Delete the sandbox once the command exits.
-        #[arg(long)]
-        rm: bool,
+        #[arg(long = "rm")]
+        is_removed_after: bool,
         /// Start the command and return, printing the sandbox id. The command
         /// keeps running; follow it with `burrow logs`.
-        #[arg(long, short = 'd', conflicts_with_all = ["stop", "rm"])]
-        detach: bool,
+        #[arg(long = "detach", short = 'd', conflicts_with_all = ["is_suspended_after", "is_removed_after"])]
+        is_detached: bool,
         #[arg(last = true, required = true)]
         cmd: Vec<String>,
     },
@@ -299,6 +302,36 @@ enum Command {
     /// Restore a stopped sandbox from its snapshot.
     #[command(visible_alias = "resume")]
     Start { id: String },
+    /// Shut a sandbox's VM down, keeping its disks. Unlike `stop`, nothing
+    /// in memory survives: `boot` starts the image's init again on the same
+    /// writable disk, and a kit's startup hooks run again.
+    Shutdown {
+        #[arg(required = true)]
+        ids: Vec<String>,
+    },
+    /// Cold-boot a shut-down sandbox on its existing disks.
+    Boot { id: String },
+    /// Replace a sandbox's root disk, discarding everything written to it,
+    /// while keeping its id, name and volumes.
+    Recreate {
+        id: String,
+        /// Template for the new disk; omitted keeps the current one.
+        #[arg(long)]
+        template: Option<String>,
+        /// Kit arg values replacing the recorded ones by name.
+        #[arg(long = "arg")]
+        kit_args: Vec<String>,
+        /// Environment overrides replacing the recorded ones by name.
+        #[arg(long = "kit-env")]
+        kit_env: Vec<String>,
+        /// Capability types to decline, replacing the recorded list. Passing
+        /// none clears it.
+        #[arg(long = "reject-capability")]
+        reject_capabilities: Vec<String>,
+    },
+    /// Credentials kits ask for by service name.
+    #[command(subcommand)]
+    Secret(SecretCommand),
     /// List the VMs a sandbox has run, newest first.
     Sessions { id: String },
     /// Destroy sandboxes.
@@ -318,8 +351,8 @@ enum Command {
         #[arg(long, default_value_t = 0)]
         host_port: u32,
         /// Forward UDP rather than TCP. Publishing both takes two mappings.
-        #[arg(long)]
-        udp: bool,
+        #[arg(long = "udp")]
+        is_udp: bool,
     },
     /// List published ports for a sandbox.
     #[command(visible_alias = "ports")]
@@ -340,19 +373,19 @@ enum Command {
         #[arg(long = "allow")]
         allowed_clients: Vec<String>,
         /// Issue new keys, and so a new address, to an existing share.
-        #[arg(long)]
-        rotate: bool,
+        #[arg(long = "rotate")]
+        is_rotating: bool,
         /// Source connections from the gateway instead of from the client's
         /// own address, which is what the guest sees by default.
-        #[arg(long)]
-        no_transparent_ip: bool,
+        #[arg(long = "no-transparent-ip")]
+        is_transparent_ip_disabled: bool,
         /// Guest UDP port reachable through the share, or `all`. Repeatable;
         /// omitted shares no UDP.
         #[arg(long = "udp-port", value_delimiter = ',')]
         udp_ports: Vec<String>,
         /// Print the existing share without changing it.
-        #[arg(long, conflicts_with_all = ["ports", "allowed_clients", "rotate", "udp_ports", "no_transparent_ip"])]
-        show: bool,
+        #[arg(long = "show", conflicts_with_all = ["ports", "allowed_clients", "is_rotating", "udp_ports", "is_transparent_ip_disabled"])]
+        is_showing: bool,
     },
     /// Revoke a sandbox's share.
     Unshare { id: String },
@@ -373,8 +406,8 @@ enum Command {
         #[arg(long)]
         sandbox: Option<String>,
         /// Only attempts the proxy refused.
-        #[arg(long)]
-        denied: bool,
+        #[arg(long = "denied")]
+        is_denied_only: bool,
         /// RFC 3339 lower bound, e.g. 2026-08-27T00:00:00Z.
         #[arg(long)]
         since: Option<String>,
@@ -414,8 +447,8 @@ enum ConfigCommand {
     List {
         id: String,
         /// Emit the record as JSON instead of the readable field list.
-        #[arg(long)]
-        json: bool,
+        #[arg(long = "json")]
+        is_json_requested: bool,
     },
     /// Replace a running sandbox's egress policy.
     NetworkPolicy {
@@ -476,9 +509,24 @@ struct CreateFlags {
     #[arg(long)]
     name: Option<String>,
     /// Template to boot, as imported by `burrow pull`. Required unless
-    /// `--snapshot` is given, which carries its own.
+    /// `--snapshot` is given, which carries its own. A template pulled from
+    /// Docker Sandbox Kits is provisioned the way their descriptors ask; see
+    /// docs/TEMPLATES.md.
     #[arg(long)]
     template: Option<String>,
+    /// Create-phase value for a kit template's arg, as name=value.
+    /// Repeatable.
+    #[arg(long = "arg")]
+    kit_args: Vec<String>,
+    /// Environment override for a kit template's processes, as NAME=value.
+    /// Repeatable.
+    #[arg(long = "kit-env")]
+    kit_env: Vec<String>,
+    /// Capability type to decline for this sandbox, by full name. A kit
+    /// requiring it is refused; one asking optionally does without.
+    /// Repeatable.
+    #[arg(long = "reject-capability")]
+    reject_capabilities: Vec<String>,
     /// Snapshot to start from. The sandbox restores that state instead of
     /// booting, and takes its template and machine shape from the snapshot,
     /// so --template, --vcpus and --mem-mib may not disagree with it.
@@ -514,11 +562,12 @@ struct CreateFlags {
     /// Let a snapshot that --keep-last-snapshots evicts live out its
     /// expiration instead of being deleted at once. Needs both
     /// --keep-last-snapshots and --snapshot-expiration-secs.
-    #[arg(long)]
-    keep_evicted_snapshots: bool,
-    /// Mount a volume, as `name:/path` or `name:/path:ro`. Repeatable.
-    /// A sandbox that mounts a volume is placed on the node holding it, and
-    /// boots cold rather than restoring a warm snapshot.
+    #[arg(long = "keep-evicted-snapshots")]
+    is_evicted_snapshots_kept: bool,
+    /// Mount a volume, as `name:/path` or `name:/path:ro`, or a tmpfs as
+    /// `tmpfs:/path[:size=512m][:mode=1777]`. Repeatable. A sandbox that
+    /// mounts a volume is placed on the node holding it, and boots cold
+    /// rather than restoring a warm snapshot.
     #[arg(long = "mount")]
     mounts: Vec<String>,
     /// Tag as key=value. Repeatable; at most 16.
@@ -554,7 +603,7 @@ impl CreateFlags {
     /// can be applied, and a silently ignored `--mem-mib` is worse than an
     /// error. `--name` and `--publish` are excluded: one is what was matched
     /// on, the other still applies to a sandbox that already exists.
-    fn stated(&self) -> bool {
+    fn is_stated(&self) -> bool {
         self.template.is_some()
             || self.snapshot.is_some()
             || self.vcpus.is_some()
@@ -564,14 +613,14 @@ impl CreateFlags {
             || self.suspended_ttl_secs != 0
             || self.snapshot_expiration_secs != 0
             || self.keep_last_snapshots != 0
-            || self.keep_evicted_snapshots
+            || self.is_evicted_snapshots_kept
             || !self.mounts.is_empty()
             || !self.tags.is_empty()
             || !self.node_labels.is_empty()
             || !self.networks.is_empty()
             || self.alias.is_some()
-            || self.network.stated()
-            || self.access.stated()
+            || self.network.is_stated()
+            || self.access.is_stated()
     }
 }
 
@@ -584,14 +633,14 @@ impl CreateFlags {
 struct AccessFlags {
     /// Refuse `exec`, `run` and `connect` against this sandbox. It still
     /// boots, and its files can still be copied in and out.
-    #[arg(long)]
-    no_exec: bool,
+    #[arg(long = "no-exec")]
+    is_exec_denied: bool,
     /// Refuse uploads into this sandbox.
-    #[arg(long)]
-    no_upload: bool,
+    #[arg(long = "no-upload")]
+    is_upload_denied: bool,
     /// Refuse downloads out of this sandbox.
-    #[arg(long)]
-    no_download: bool,
+    #[arg(long = "no-download")]
+    is_download_denied: bool,
     /// Absolute path uploads, downloads and listings are confined to, e.g.
     /// /work. Repeatable; at most 16. Without any, the whole filesystem is
     /// reachable.
@@ -603,10 +652,10 @@ struct AccessFlags {
 }
 
 impl AccessFlags {
-    fn stated(&self) -> bool {
-        self.no_exec
-            || self.no_upload
-            || self.no_download
+    fn is_stated(&self) -> bool {
+        self.is_exec_denied
+            || self.is_upload_denied
+            || self.is_download_denied
             || !self.fs_scopes.is_empty()
             || self.max_upload_bytes != 0
     }
@@ -616,20 +665,21 @@ impl AccessFlags {
     /// An absent section means "allowed" to the node, so sending one that says
     /// exactly that would be noise in every record.
     fn exec_policy(&self) -> Option<common::ExecPolicy> {
-        self.no_exec
-            .then_some(common::ExecPolicy { allow_exec: false })
+        self.is_exec_denied.then_some(common::ExecPolicy {
+            is_exec_allowed: false,
+        })
     }
 
     /// The fs section, set only when the caller restricted file access. One
     /// fs flag settles all four fields, since the message is enforced whole.
     fn fs_policy(&self) -> Option<common::FsPolicy> {
-        let stated = self.no_upload
-            || self.no_download
+        let stated = self.is_upload_denied
+            || self.is_download_denied
             || !self.fs_scopes.is_empty()
             || self.max_upload_bytes != 0;
         stated.then(|| common::FsPolicy {
-            allow_upload: !self.no_upload,
-            allow_download: !self.no_download,
+            is_upload_allowed: !self.is_upload_denied,
+            is_download_allowed: !self.is_download_denied,
             path_scopes: self.fs_scopes.clone(),
             max_upload_bytes: self.max_upload_bytes,
         })
@@ -646,23 +696,23 @@ impl AccessFlags {
 #[derive(ClapArgs)]
 struct AccessUpdateFlags {
     /// Refuse `exec`, `run` and `connect` against this sandbox.
-    #[arg(long, conflicts_with = "allow_exec")]
-    no_exec: bool,
+    #[arg(long = "no-exec", conflicts_with = "is_exec_allowed")]
+    is_exec_denied: bool,
     /// Allow them again.
-    #[arg(long)]
-    allow_exec: bool,
+    #[arg(long = "allow-exec")]
+    is_exec_allowed: bool,
     /// Refuse uploads into this sandbox.
-    #[arg(long, conflicts_with = "allow_upload")]
-    no_upload: bool,
+    #[arg(long = "no-upload", conflicts_with = "is_upload_allowed")]
+    is_upload_denied: bool,
     /// Allow uploads again.
-    #[arg(long)]
-    allow_upload: bool,
+    #[arg(long = "allow-upload")]
+    is_upload_allowed: bool,
     /// Refuse downloads out of this sandbox.
-    #[arg(long, conflicts_with = "allow_download")]
-    no_download: bool,
+    #[arg(long = "no-download", conflicts_with = "is_download_allowed")]
+    is_download_denied: bool,
     /// Allow downloads again.
-    #[arg(long)]
-    allow_download: bool,
+    #[arg(long = "allow-download")]
+    is_download_allowed: bool,
     /// Absolute path uploads, downloads and listings are confined to.
     /// Repeatable; at most 16. Naming none while setting another fs flag
     /// reopens the whole filesystem, since the section is replaced whole.
@@ -676,8 +726,8 @@ struct AccessUpdateFlags {
 impl AccessUpdateFlags {
     /// The exec section, sent only when the caller said something about exec.
     fn exec_policy(&self) -> Option<common::ExecPolicy> {
-        (self.no_exec || self.allow_exec).then_some(common::ExecPolicy {
-            allow_exec: !self.no_exec,
+        (self.is_exec_denied || self.is_exec_allowed).then_some(common::ExecPolicy {
+            is_exec_allowed: !self.is_exec_denied,
         })
     }
 
@@ -685,15 +735,15 @@ impl AccessUpdateFlags {
     /// One fs flag settles all four fields, because the node replaces the
     /// section whole.
     fn fs_policy(&self) -> Option<common::FsPolicy> {
-        let stated = self.no_upload
-            || self.allow_upload
-            || self.no_download
-            || self.allow_download
+        let stated = self.is_upload_denied
+            || self.is_upload_allowed
+            || self.is_download_denied
+            || self.is_download_allowed
             || !self.fs_scopes.is_empty()
             || self.max_upload_bytes.is_some();
         stated.then(|| common::FsPolicy {
-            allow_upload: !self.no_upload,
-            allow_download: !self.no_download,
+            is_upload_allowed: !self.is_upload_denied,
+            is_download_allowed: !self.is_download_denied,
             path_scopes: self.fs_scopes.clone(),
             max_upload_bytes: self.max_upload_bytes.unwrap_or(0),
         })
@@ -705,7 +755,7 @@ impl AccessUpdateFlags {
 struct ExecFlags {
     /// Allocate a pty, so the command sees a terminal.
     #[arg(long = "pty", short = 't', visible_alias = "tty")]
-    pty: bool,
+    is_pty_allocated: bool,
     /// Environment variable as key=value. Repeatable; wins over the image's
     /// own environment.
     #[arg(long = "env", short = 'e')]
@@ -743,11 +793,16 @@ struct NetworkFlags {
     /// allowance, in every mode. Repeatable.
     #[arg(long = "deny-cidr")]
     deny_cidrs: Vec<String>,
+    /// Domain the sandbox may never reach, e.g. *.internal.example. Beats
+    /// every allowance, in every mode: not resolved, not connected to.
+    /// Repeatable.
+    #[arg(long = "deny-domain")]
+    deny_domains: Vec<String>,
     /// Terminate this sandbox's TLS so the host named inside the session
     /// is checked, not just the SNI. Closes domain fronting, at the cost
     /// of the proxy being able to read the payload.
-    #[arg(long)]
-    inspect_tls: bool,
+    #[arg(long = "inspect-tls")]
+    is_tls_inspected: bool,
     /// Credential the host adds to requests for a domain, as
     /// 'domain:Name=Value'. Requires --inspect-tls; the value never enters the
     /// guest. Repeatable.
@@ -769,29 +824,35 @@ impl NetworkFlags {
     /// `--net` defaults to `none`, which is a real instruction on `create` and
     /// would be a silent lockdown on `fork`: a child given nothing should
     /// inherit its source's policy, not lose it.
-    fn stated(&self) -> bool {
+    fn is_stated(&self) -> bool {
         self.net != "none"
-            || self.inspect_tls
+            || self.is_tls_inspected
             || !self.allow_domains.is_empty()
             || !self.allow_cidrs.is_empty()
             || !self.allow_ports.is_empty()
             || !self.deny_cidrs.is_empty()
+            || !self.deny_domains.is_empty()
             || !self.inject_headers.is_empty()
             || !self.rules.is_empty()
     }
 }
 
-/// Parses repeated `--mount name:/path[:ro|rw]` flags.
+/// Parses repeated `--mount name:/path[:ro|rw]` and
+/// `--mount tmpfs:/path[:size=512m][:mode=1777]` flags.
 ///
-/// The mode is last so the common case reads as `name:/path`, and a path may
-/// itself contain colons: the volume name is taken up to the first colon, and
-/// a trailing `:ro` or `:rw` off the end.
+/// The options are last so the common case reads as `name:/path`, and a path
+/// may itself contain colons: the volume name is taken up to the first colon,
+/// and a trailing `:ro`, `:rw`, `:size=` or `:mode=` off the end.
 fn parse_mounts(mounts: &[String]) -> anyhow::Result<Vec<common::VolumeMount>> {
     let mut out = Vec::new();
     for raw in mounts {
         let (volume, rest) = raw.split_once(':').ok_or_else(|| {
             anyhow::anyhow!("--mount {raw:?} must be name:/path, optionally with :ro or :rw")
         })?;
+        if volume == "tmpfs" {
+            out.push(parse_tmpfs_mount(raw, rest)?);
+            continue;
+        }
         let (path, read_only) = match rest.rsplit_once(':') {
             Some((path, "ro" | "read-only")) => (path, true),
             Some((path, "rw" | "read-write")) => (path, false),
@@ -804,10 +865,54 @@ fn parse_mounts(mounts: &[String]) -> anyhow::Result<Vec<common::VolumeMount>> {
         out.push(common::VolumeMount {
             volume: volume.to_string(),
             path: path.to_string(),
-            read_only,
+            is_read_only: read_only,
+            ..Default::default()
         });
     }
     Ok(out)
+}
+
+/// The `/path[:size=512m][:mode=1777]` part of a tmpfs mount, in either order.
+fn parse_tmpfs_mount(raw: &str, mut rest: &str) -> anyhow::Result<common::VolumeMount> {
+    let usage = || {
+        anyhow::anyhow!(
+            "--mount {raw:?} must be tmpfs:/path, optionally with :size=512m or :mode=1777"
+        )
+    };
+    let mut size_mib = 0;
+    let mut mode = String::new();
+    while let Some((path, option)) = rest.rsplit_once(':') {
+        if let Some(size) = option.strip_prefix("size=") {
+            size_mib = parse_mib(size).ok_or_else(usage)?;
+        } else if let Some(octal) = option.strip_prefix("mode=") {
+            mode = octal.to_string();
+        } else {
+            // A colon that is part of the path.
+            break;
+        }
+        rest = path;
+    }
+    if rest.is_empty() {
+        return Err(usage());
+    }
+    Ok(common::VolumeMount {
+        path: rest.to_string(),
+        is_tmpfs: true,
+        size_mib,
+        mode,
+        ..Default::default()
+    })
+}
+
+/// `512m`, `2g` or a bare number of MiB.
+fn parse_mib(size: &str) -> Option<u64> {
+    let (digits, scale) = match size.as_bytes().last()? {
+        b'm' | b'M' => (&size[..size.len() - 1], 1),
+        b'g' | b'G' => (&size[..size.len() - 1], 1024),
+        _ => (size, 1),
+    };
+    let n: u64 = digits.parse().ok().filter(|n| *n > 0)?;
+    n.checked_mul(scale)
 }
 
 /// Parses repeated `key=value` flags.
@@ -838,9 +943,12 @@ enum TemplatesCommand {
     Ls,
     /// Import an OCI image as a template, e.g. `python:3.12-slim`.
     Import {
-        /// Image reference: [registry/]repository[:tag|@digest].
-        image: String,
-        /// Template name. Defaults to the image's repository name.
+        /// Image references: [registry/]repository[:tag|@digest]. Several
+        /// are a Docker Sandbox Kit set, composed into one template.
+        #[arg(required = true)]
+        images: Vec<String>,
+        /// Template name. Defaults to the image's repository name, or for a
+        /// kit set to one derived from its digests.
         #[arg(long)]
         name: Option<String>,
     },
@@ -893,6 +1001,9 @@ enum VolumeCommand {
         /// Only volumes on this node.
         #[arg(long)]
         node: Option<String>,
+        /// Emit the list as JSON, labels included.
+        #[arg(long = "json")]
+        is_json_requested: bool,
     },
     /// Show one volume, including which sandbox holds it writable.
     Inspect { name: String },
@@ -905,6 +1016,23 @@ enum VolumeCommand {
 }
 
 #[derive(Subcommand)]
+enum SecretCommand {
+    /// Store a secret. The value is read from --value, else from stdin.
+    Set {
+        /// Lowercase kebab-case, the `service` a kit credential names.
+        name: String,
+        #[arg(long)]
+        value: Option<String>,
+    },
+    /// List secret names. Values are never shown.
+    #[command(visible_alias = "list")]
+    Ls,
+    /// Delete a secret.
+    #[command(visible_alias = "remove")]
+    Rm { name: String },
+}
+
+#[derive(Subcommand)]
 enum NodesCommand {
     /// List registered nodes.
     Ls,
@@ -912,8 +1040,8 @@ enum NodesCommand {
     Drain {
         node_id: String,
         /// Also snapshot the sandboxes it is running.
-        #[arg(long)]
-        suspend: bool,
+        #[arg(long = "suspend")]
+        is_suspending: bool,
     },
     /// Resume placing sandboxes on a node.
     Undrain { node_id: String },
@@ -923,7 +1051,7 @@ enum NodesCommand {
 async fn main() -> anyhow::Result<()> {
     let args = Args::parse();
     let api_key = load_api_key(args.api_key.as_deref(), args.api_key_file.as_deref())?;
-    let channel = connect(&args.orchestrator, args.insecure).await?;
+    let channel = connect(&args.orchestrator, args.is_insecure).await?;
     let mut client = BurrowClient::with_interceptor(channel, BearerAuth(api_key));
 
     match args.command {
@@ -932,12 +1060,15 @@ async fn main() -> anyhow::Result<()> {
             println!("ok (orchestrator v{})", resp.version);
         }
         Command::Nodes(NodesCommand::Ls) => list_nodes(&mut client).await?,
-        Command::Nodes(NodesCommand::Drain { node_id, suspend }) => {
+        Command::Nodes(NodesCommand::Drain {
+            node_id,
+            is_suspending: suspend,
+        }) => {
             let resp = client
                 .drain_node(api::DrainNodeRequest {
                     node_id: node_id.clone(),
-                    drain: true,
-                    suspend_sandboxes: suspend,
+                    is_draining: true,
+                    is_suspending_sandboxes: suspend,
                 })
                 .await?
                 .into_inner();
@@ -947,13 +1078,16 @@ async fn main() -> anyhow::Result<()> {
             client
                 .drain_node(api::DrainNodeRequest {
                     node_id: node_id.clone(),
-                    drain: false,
-                    suspend_sandboxes: false,
+                    is_draining: false,
+                    is_suspending_sandboxes: false,
                 })
                 .await?;
             println!("{node_id} accepting sandboxes again");
         }
-        Command::Create { create, connect } => {
+        Command::Create {
+            create,
+            is_connecting: connect,
+        } => {
             let publish = create.publish.clone();
             let sandbox = client
                 .create_sandbox(create_request(create)?)
@@ -977,11 +1111,15 @@ async fn main() -> anyhow::Result<()> {
                 }
             }
         }
-        Command::Ps { all, tag } => {
-            list_sandboxes(&mut client, tag.unwrap_or_default(), all).await?
-        }
+        Command::Ps {
+            is_all_shown: all,
+            tag,
+        } => list_sandboxes(&mut client, tag.unwrap_or_default(), all).await?,
         Command::Top { id } => list_commands(&mut client, &id).await?,
-        Command::Inspect { id, json } => {
+        Command::Inspect {
+            id,
+            is_json_requested: json,
+        } => {
             let sandbox = client
                 .get_sandbox(api::SandboxRef { id })
                 .await?
@@ -992,9 +1130,12 @@ async fn main() -> anyhow::Result<()> {
                 print_config(&sandbox);
             }
         }
-        Command::Stats { id, all } => show_stats(&mut client, id, all).await?,
+        Command::Stats {
+            id,
+            is_all_shown: all,
+        } => show_stats(&mut client, id, all).await?,
         Command::Images => list_templates(&mut client).await?,
-        Command::Pull { image, name } => import_template(&mut client, image, name).await?,
+        Command::Pull { images, name } => import_template(&mut client, images, name).await?,
         Command::Commit {
             sandbox,
             expiration_secs,
@@ -1010,10 +1151,10 @@ async fn main() -> anyhow::Result<()> {
             // Only an override the caller actually asked for: an unset flag
             // group means "inherit", not "no egress" and not "no access".
             let egress = network
-                .stated()
+                .is_stated()
                 .then(|| network_policy(network))
                 .transpose()?;
-            let policy = (egress.is_some() || access.stated()).then(|| common::Policy {
+            let policy = (egress.is_some() || access.is_stated()).then(|| common::Policy {
                 network: egress,
                 exec: access.exec_policy(),
                 fs: access.fs_policy(),
@@ -1133,50 +1274,82 @@ async fn main() -> anyhow::Result<()> {
         Command::Run {
             create,
             exec,
-            stop,
-            rm,
-            detach,
+            is_suspended_after,
+            is_removed_after,
+            is_detached,
             cmd,
         } => {
-            let code = run_in_sandbox(&mut client, create, exec, stop, rm, detach, cmd).await?;
+            let code = run_in_sandbox(
+                &mut client,
+                create,
+                exec,
+                is_suspended_after,
+                is_removed_after,
+                is_detached,
+                cmd,
+            )
+            .await?;
             if code != 0 {
                 std::process::exit(exit_status(code));
             }
         }
         Command::Copy { src, dst } => copy(&mut client, &src, &dst).await?,
-        Command::Stop { ids } => {
-            let mut failed = false;
-            for id in ids {
-                match client
-                    .pause_sandbox(api::SandboxRef { id: id.clone() })
-                    .await
-                {
-                    Ok(resp) => {
-                        let sandbox = resp.into_inner();
-                        println!("{} {}", sandbox.id, state_name(sandbox.state));
-                    }
-                    Err(err) => {
-                        eprintln!("{id}: {}", err.message());
-                        failed = true;
-                    }
-                }
-            }
-            if failed {
-                std::process::exit(1);
-            }
-        }
-        Command::Start { id } => {
-            let started = std::time::Instant::now();
+        Command::Stop { ids } => transition_each(&mut client, ids, Transition::Pause).await,
+        Command::Start { id } => transition_timed(&mut client, id, Transition::Resume).await?,
+        Command::Shutdown { ids } => transition_each(&mut client, ids, Transition::Stop).await,
+        Command::Boot { id } => transition_timed(&mut client, id, Transition::Start).await?,
+        Command::Recreate {
+            id,
+            template,
+            kit_args,
+            kit_env,
+            reject_capabilities,
+        } => {
+            // Always sent: a recreation's reject list replaces the recorded
+            // one, and an empty flag set is how it is cleared.
+            let kit = kit_spec(&kit_args, &kit_env, reject_capabilities)?;
             let sandbox = client
-                .resume_sandbox(api::SandboxRef { id })
+                .recreate_sandbox(api::RecreateSandboxRequest {
+                    sandbox_id: id,
+                    kit: Some(kit),
+                    template: template.unwrap_or_default(),
+                })
                 .await?
                 .into_inner();
-            println!(
-                "{} {} in {}ms",
-                sandbox.id,
-                state_name(sandbox.state),
-                started.elapsed().as_millis()
-            );
+            println!("{} {}", sandbox.id, state_name(sandbox.state));
+        }
+        Command::Secret(SecretCommand::Set { name, value }) => {
+            let value = match value {
+                Some(value) => value,
+                None => {
+                    let mut buf = String::new();
+                    std::io::Read::read_to_string(&mut std::io::stdin(), &mut buf)?;
+                    buf.trim_end_matches(['\r', '\n']).to_string()
+                }
+            };
+            client
+                .set_secret(api::SetSecretRequest {
+                    name: name.clone(),
+                    value,
+                })
+                .await?;
+            println!("stored {name}");
+        }
+        Command::Secret(SecretCommand::Ls) => {
+            let names = client
+                .list_secrets(api::ListSecretsRequest {})
+                .await?
+                .into_inner()
+                .names;
+            for name in names {
+                println!("{name}");
+            }
+        }
+        Command::Secret(SecretCommand::Rm { name }) => {
+            client
+                .delete_secret(api::DeleteSecretRequest { name: name.clone() })
+                .await?;
+            println!("deleted {name}");
         }
         Command::Sessions { id } => list_sessions(&mut client, id).await?,
         Command::Remove { ids } => {
@@ -1197,7 +1370,10 @@ async fn main() -> anyhow::Result<()> {
                 std::process::exit(1);
             }
         }
-        Command::Config(ConfigCommand::List { id, json }) => {
+        Command::Config(ConfigCommand::List {
+            id,
+            is_json_requested: json,
+        }) => {
             let sandbox = client
                 .get_sandbox(api::SandboxRef { id })
                 .await?
@@ -1275,15 +1451,15 @@ async fn main() -> anyhow::Result<()> {
                 sandbox.id,
                 // An absent section is no restriction, here as everywhere.
                 match &policy.exec {
-                    Some(exec) if !exec.allow_exec => "denied",
+                    Some(exec) if !exec.is_exec_allowed => "denied",
                     _ => "allowed",
                 },
                 match &policy.fs {
-                    Some(fs) if !fs.allow_upload => "denied",
+                    Some(fs) if !fs.is_upload_allowed => "denied",
                     _ => "allowed",
                 },
                 match &policy.fs {
-                    Some(fs) if !fs.allow_download => "denied",
+                    Some(fs) if !fs.is_download_allowed => "denied",
                     _ => "allowed",
                 },
             );
@@ -1305,14 +1481,14 @@ async fn main() -> anyhow::Result<()> {
             id,
             guest_port,
             host_port,
-            udp,
+            is_udp: udp,
         } => {
             let mapping = client
                 .expose_port(api::ExposePortRequest {
                     sandbox_id: id,
                     guest_port,
                     host_port,
-                    udp,
+                    is_udp: udp,
                 })
                 .await?
                 .into_inner();
@@ -1343,12 +1519,12 @@ async fn main() -> anyhow::Result<()> {
             id,
             ports,
             allowed_clients,
-            rotate,
+            is_rotating,
             udp_ports,
-            no_transparent_ip,
-            show,
+            is_transparent_ip_disabled,
+            is_showing,
         } => {
-            let share = if show {
+            let share = if is_showing {
                 client.get_share(api::SandboxRef { id }).await?.into_inner()
             } else {
                 let all_udp = udp_ports.iter().any(|p| p == "all");
@@ -1365,10 +1541,10 @@ async fn main() -> anyhow::Result<()> {
                         sandbox_id: id,
                         ports,
                         allowed_clients,
-                        rotate,
+                        is_rotating,
                         udp_ports,
-                        all_udp,
-                        no_transparent_ip,
+                        is_all_udp: all_udp,
+                        is_transparent_ip_disabled,
                     })
                     .await?
                     .into_inner()
@@ -1380,8 +1556,8 @@ async fn main() -> anyhow::Result<()> {
             println!("share revoked");
         }
         Command::Templates(TemplatesCommand::Ls) => list_templates(&mut client).await?,
-        Command::Templates(TemplatesCommand::Import { image, name }) => {
-            import_template(&mut client, image, name).await?
+        Command::Templates(TemplatesCommand::Import { images, name }) => {
+            import_template(&mut client, images, name).await?
         }
         Command::Templates(TemplatesCommand::Rm { name }) => {
             client
@@ -1399,6 +1575,7 @@ async fn main() -> anyhow::Result<()> {
                     name,
                     size_mib,
                     node_labels: parse_pairs("--node-label", &node_labels)?,
+                    labels: Default::default(),
                 })
                 .await?
                 .into_inner();
@@ -1407,14 +1584,19 @@ async fn main() -> anyhow::Result<()> {
                 volume.name, volume.size_mib, volume.node_id
             );
         }
-        Command::Volume(VolumeCommand::Ls { node }) => {
+        Command::Volume(VolumeCommand::Ls {
+            node,
+            is_json_requested: json,
+        }) => {
             let resp = client
                 .list_volumes(api::ListVolumesRequest {
                     node_id: node.unwrap_or_default(),
                 })
                 .await?
                 .into_inner();
-            if resp.volumes.is_empty() {
+            if json {
+                println!("{}", volumes_json(&resp.volumes));
+            } else if resp.volumes.is_empty() {
                 println!("no volumes");
             } else {
                 println!(
@@ -1528,14 +1710,14 @@ async fn main() -> anyhow::Result<()> {
         }
         Command::Audit {
             sandbox,
-            denied,
+            is_denied_only: denied,
             since,
             limit,
         } => {
             let mut stream = client
                 .query_audit(api::AuditQuery {
                     sandbox_id: sandbox.unwrap_or_default(),
-                    denied_only: denied,
+                    is_denied_only: denied,
                     since: since.unwrap_or_default(),
                     limit,
                 })
@@ -1551,7 +1733,7 @@ async fn main() -> anyhow::Result<()> {
                     "{:<21} {:<24} {:<7} {:<28} {}",
                     sanitize(&event.at),
                     truncate(&sanitize(&event.sandbox_id), 24),
-                    if event.allowed { "yes" } else { "no" },
+                    if event.is_allowed { "yes" } else { "no" },
                     truncate(
                         &sanitize(if event.host.is_empty() {
                             &event.destination
@@ -1591,6 +1773,9 @@ fn create_request(flags: CreateFlags) -> anyhow::Result<api::CreateSandboxReques
     let CreateFlags {
         name,
         template,
+        kit_args,
+        kit_env,
+        reject_capabilities,
         snapshot,
         vcpus,
         mem_mib,
@@ -1599,7 +1784,7 @@ fn create_request(flags: CreateFlags) -> anyhow::Result<api::CreateSandboxReques
         suspended_ttl_secs,
         snapshot_expiration_secs,
         keep_last_snapshots,
-        keep_evicted_snapshots,
+        is_evicted_snapshots_kept: keep_evicted_snapshots,
         mounts,
         tags,
         // Published after the sandbox exists, by its caller: the create RPC
@@ -1631,7 +1816,7 @@ fn create_request(flags: CreateFlags) -> anyhow::Result<api::CreateSandboxReques
                 suspended_ttl_secs,
                 snapshot_expiration_secs,
                 keep_last_snapshots,
-                keep_evicted_snapshots,
+                is_evicted_snapshot_kept: keep_evicted_snapshots,
                 ..Default::default()
             }),
             network: Some(network_policy(network)?),
@@ -1643,15 +1828,83 @@ fn create_request(flags: CreateFlags) -> anyhow::Result<api::CreateSandboxReques
                 .map(|network| common::NetworkMembership {
                     network,
                     ingress_ports: vec![],
-                    allow_egress: true,
-                    allow_ingress: true,
+                    is_egress_allowed: true,
+                    is_ingress_allowed: true,
                     alias: alias.clone().unwrap_or_default(),
                 })
                 .collect(),
         }),
         metadata,
         node_labels: parse_pairs("--node-label", &node_labels)?,
+        kit: if kit_args.is_empty() && kit_env.is_empty() && reject_capabilities.is_empty() {
+            None
+        } else {
+            Some(kit_spec(&kit_args, &kit_env, reject_capabilities)?)
+        },
     })
+}
+
+fn kit_spec(
+    args: &[String],
+    env: &[String],
+    reject_types: Vec<String>,
+) -> anyhow::Result<common::KitSpec> {
+    Ok(common::KitSpec {
+        args: parse_pairs("--arg", args)?,
+        env: parse_pairs("--kit-env", env)?,
+        reject_types,
+    })
+}
+
+/// The lifecycle moves `stop`, `start`, `shutdown` and `boot` make.
+#[derive(Clone, Copy)]
+enum Transition {
+    Pause,
+    Resume,
+    Stop,
+    Start,
+}
+
+impl Transition {
+    async fn call(self, client: &mut Client, id: String) -> Result<common::Sandbox, tonic::Status> {
+        let id = api::SandboxRef { id };
+        let resp = match self {
+            Transition::Pause => client.pause_sandbox(id).await,
+            Transition::Resume => client.resume_sandbox(id).await,
+            Transition::Stop => client.stop_sandbox(id).await,
+            Transition::Start => client.start_sandbox(id).await,
+        }?;
+        Ok(resp.into_inner())
+    }
+}
+
+/// Moves every sandbox in `ids`, reporting each failure and exiting 1 if any.
+async fn transition_each(client: &mut Client, ids: Vec<String>, to: Transition) {
+    let mut failed = false;
+    for id in ids {
+        match to.call(client, id.clone()).await {
+            Ok(sandbox) => println!("{} {}", sandbox.id, state_name(sandbox.state)),
+            Err(err) => {
+                eprintln!("{id}: {}", err.message());
+                failed = true;
+            }
+        }
+    }
+    if failed {
+        std::process::exit(1);
+    }
+}
+
+async fn transition_timed(client: &mut Client, id: String, to: Transition) -> anyhow::Result<()> {
+    let started = std::time::Instant::now();
+    let sandbox = to.call(client, id).await?;
+    println!(
+        "{} {} in {}ms",
+        sandbox.id,
+        state_name(sandbox.state),
+        started.elapsed().as_millis()
+    );
+    Ok(())
 }
 
 /// `run`: one command, in a sandbox that may or may not exist yet.
@@ -1680,7 +1933,7 @@ async fn run_in_sandbox(
             {
                 Ok(existing) => {
                     let sandbox = existing.into_inner();
-                    if create.stated() {
+                    if create.is_stated() {
                         eprintln!(
                             "warning: sandbox {name} already exists, so the create flags are ignored"
                         );
@@ -1783,7 +2036,7 @@ async fn connect_shell(
         cmd
     };
     let flags = ExecFlags {
-        pty: true,
+        is_pty_allocated: true,
         envs: Vec::new(),
         workdir: None,
         user,
@@ -1804,18 +2057,18 @@ fn network_policy(flags: NetworkFlags) -> anyhow::Result<common::NetworkPolicy> 
     // Inspection happens in the egress proxy, and only allowlist mode
     // redirects traffic there. Asking for it in any other mode gets a
     // sandbox that believes it is inspected and is not.
-    if flags.inspect_tls && mode != common::NetworkMode::Allowlist {
+    if flags.is_tls_inspected && mode != common::NetworkMode::Allowlist {
         anyhow::bail!("--inspect-tls requires --net allowlist");
     }
-    if !flags.inject_headers.is_empty() && !flags.inspect_tls {
+    if !flags.inject_headers.is_empty() && !flags.is_tls_inspected {
         anyhow::bail!("--inject-header requires --inspect-tls");
     }
-    if !flags.rules.is_empty() && !flags.inspect_tls {
+    if !flags.rules.is_empty() && !flags.is_tls_inspected {
         anyhow::bail!("--rule requires --inspect-tls");
     }
     // --allow-cidr is an L3 allowance: those destinations are reached
     // directly, never through the proxy, so nothing inspects them.
-    if flags.inspect_tls && !flags.allow_cidrs.is_empty() {
+    if flags.is_tls_inspected && !flags.allow_cidrs.is_empty() {
         eprintln!(
             "warning: --allow-cidr destinations bypass the egress proxy, so \
              --inspect-tls does not apply to them"
@@ -1827,7 +2080,8 @@ fn network_policy(flags: NetworkFlags) -> anyhow::Result<common::NetworkPolicy> 
         allow_cidrs: flags.allow_cidrs,
         allow_ports: flags.allow_ports.into_iter().map(|p| p as u32).collect(),
         deny_cidrs: flags.deny_cidrs,
-        inspect_tls: flags.inspect_tls,
+        deny_domains: flags.deny_domains,
+        is_tls_inspected: flags.is_tls_inspected,
         // `--rule` first: an `--inject-header` rule carries no matcher, so it
         // claims every request to its domain and would shadow any narrower
         // rule written after it.
@@ -1842,6 +2096,7 @@ fn network_policy(flags: NetworkFlags) -> anyhow::Result<common::NetworkPolicy> 
                     .map(|spec| parse_injection(spec)),
             )
             .collect::<anyhow::Result<Vec<_>>>()?,
+        ..Default::default()
     })
 }
 
@@ -2108,7 +2363,7 @@ fn describe_match(value: &common::StringMatch) -> String {
 /// its node's edge answers for, so both are shown. A node running no edge has no
 /// hostname routing, and the address is then printed alone.
 fn print_port(mapping: &api::PortMapping) {
-    let proto = if mapping.udp { "/udp" } else { "" };
+    let proto = if mapping.is_udp { "/udp" } else { "" };
     match mapping.edge_url.as_str() {
         // A UDP mapping never has an edge URL: the edge carries HTTP.
         "" => println!(
@@ -2137,7 +2392,7 @@ fn print_share(share: &api::Share) {
             .join(",")
     };
     eprintln!("# ports: {ports}");
-    if share.all_udp {
+    if share.is_all_udp {
         eprintln!("# udp ports: all");
     } else if !share.udp_ports.is_empty() {
         let udp = share
@@ -2151,7 +2406,7 @@ fn print_share(share: &api::Share) {
     if !share.allowed_clients.is_empty() {
         eprintln!("# allowed clients: {}", share.allowed_clients.join(", "));
     }
-    if share.transparent_ip {
+    if share.is_transparent_ip {
         eprintln!("# source: the client's last verified public IPv4");
     } else {
         eprintln!("# source: the gateway");
@@ -2175,9 +2430,9 @@ async fn list_nodes(client: &mut Client) -> anyhow::Result<()> {
     for node in resp.nodes {
         let info = node.info.unwrap_or_default();
         let status = node.status.unwrap_or_default();
-        let state = if !node.healthy {
+        let state = if !node.is_healthy {
             "stale"
-        } else if status.draining {
+        } else if status.is_draining {
             "draining"
         } else {
             "ready"
@@ -2259,7 +2514,7 @@ async fn list_sandboxes(client: &mut Client, tag: String, all: bool) -> anyhow::
 /// belongs in the same listing. Suspended, finished and lost records are what
 /// --all is for.
 fn is_running(sandbox: &common::Sandbox) -> bool {
-    !sandbox.unreachable
+    !sandbox.is_unreachable
         && matches!(
             common::SandboxState::try_from(sandbox.state),
             Ok(common::SandboxState::Creating)
@@ -2328,7 +2583,7 @@ async fn publish_ports(client: &mut Client, id: &str, ports: &[u32]) -> anyhow::
                 sandbox_id: id.to_string(),
                 guest_port: *port,
                 host_port: 0,
-                udp: false,
+                is_udp: false,
             })
             .await
         {
@@ -2360,7 +2615,7 @@ async fn list_templates(client: &mut Client) -> anyhow::Result<()> {
             "{:<24} {:>9}M  {}",
             template.name,
             template.size_bytes / (1024 * 1024),
-            if template.warm { "yes" } else { "no" },
+            if template.is_warm { "yes" } else { "no" },
         );
     }
     Ok(())
@@ -2398,18 +2653,25 @@ fn template_name_for(image: &str) -> String {
 
 async fn import_template(
     client: &mut Client,
-    image: String,
+    images: Vec<String>,
     name: Option<String>,
 ) -> anyhow::Result<()> {
-    let name = name.unwrap_or_else(|| template_name_for(&image));
-    let mut stream = client
-        .build_template(api::BuildTemplateRequest {
-            name: name.clone(),
-            from_image: image.clone(),
+    // One image converts as it is; several are a kit set, which the node
+    // names after its digests unless told otherwise.
+    let image = images.join(" + ");
+    let request = match <[String; 1]>::try_from(images) {
+        Ok([from_image]) => api::BuildTemplateRequest {
+            name: name.unwrap_or_else(|| template_name_for(&from_image)),
+            from_image,
             ..Default::default()
-        })
-        .await?
-        .into_inner();
+        },
+        Err(kits) => api::BuildTemplateRequest {
+            name: name.unwrap_or_default(),
+            kits,
+            ..Default::default()
+        },
+    };
+    let mut stream = client.build_template(request).await?.into_inner();
     while let Some(log) = stream.message().await? {
         match log.event {
             Some(api::build_log::Event::Step(step)) => println!("  {step}"),
@@ -2499,7 +2761,7 @@ fn print_config(sandbox: &common::Sandbox) {
     field("sandbox", &sandbox.id);
     field("state", display_state(sandbox));
     field("node", &sandbox.node_id);
-    if sandbox.unreachable {
+    if sandbox.is_unreachable {
         field(
             "unreachable",
             &format!(
@@ -2548,13 +2810,27 @@ fn print_config(sandbox: &common::Sandbox) {
     // saying "exec allowed" on every unrestricted sandbox would bury the one
     // sandbox where it is not.
     if let Some(exec) = &policy.exec {
-        field("exec", if exec.allow_exec { "allowed" } else { "denied" });
+        field(
+            "exec",
+            if exec.is_exec_allowed {
+                "allowed"
+            } else {
+                "denied"
+            },
+        );
     }
     if let Some(fs) = &policy.fs {
-        field("upload", if fs.allow_upload { "allowed" } else { "denied" });
+        field(
+            "upload",
+            if fs.is_upload_allowed {
+                "allowed"
+            } else {
+                "denied"
+            },
+        );
         field(
             "download",
-            if fs.allow_download {
+            if fs.is_download_allowed {
                 "allowed"
             } else {
                 "denied"
@@ -2589,7 +2865,10 @@ fn print_config(sandbox: &common::Sandbox) {
     for cidr in &network.deny_cidrs {
         field("deny-cidr", cidr);
     }
-    if network.inspect_tls {
+    for domain in &network.deny_domains {
+        field("deny-domain", domain);
+    }
+    if network.is_tls_inspected {
         field("inspect-tls", "yes");
     }
     for rule in &network.rules {
@@ -2649,7 +2928,7 @@ async fn set_ports(client: &mut Client, id: &str, ports: &[u32]) -> anyhow::Resu
                 sandbox_id: id.to_string(),
                 guest_port: *port,
                 host_port: 0,
-                udp: false,
+                is_udp: false,
             })
             .await?
             .into_inner();
@@ -2753,9 +3032,10 @@ fn exit_status(code: i32) -> i32 {
 /// is up, so a sandbox can be `running` with a guest that has not answered yet.
 /// Anything sent to it waits.
 fn display_state(sandbox: &common::Sandbox) -> &'static str {
-    if sandbox.unreachable {
+    if sandbox.is_unreachable {
         "lost"
-    } else if sandbox.agent_unconfirmed && sandbox.state == common::SandboxState::Running as i32 {
+    } else if sandbox.is_agent_unconfirmed && sandbox.state == common::SandboxState::Running as i32
+    {
         "starting"
     } else {
         state_name(sandbox.state)
@@ -2771,6 +3051,7 @@ fn state_name(state: i32) -> &'static str {
         Ok(common::SandboxState::Stopping) => "stopping",
         Ok(common::SandboxState::Destroyed) => "destroyed",
         Ok(common::SandboxState::Failed) => "failed",
+        Ok(common::SandboxState::Stopped) => "stopped",
         _ => "unknown",
     }
 }
@@ -2787,7 +3068,7 @@ async fn run_exec(
     cmd: Vec<String>,
 ) -> anyhow::Result<i32> {
     let env = parse_pairs("--env", &flags.envs)?;
-    let interactive = flags.pty && std::io::stdin().is_terminal();
+    let interactive = flags.is_pty_allocated && std::io::stdin().is_terminal();
     let (rows, cols) = if interactive {
         term::size().unwrap_or((24, 80))
     } else {
@@ -2800,7 +3081,7 @@ async fn run_exec(
             cmd,
             env,
             cwd: flags.workdir.clone().unwrap_or_default(),
-            pty: flags.pty,
+            is_pty: flags.is_pty_allocated,
             rows,
             cols,
             user: flags.user.clone().unwrap_or_default(),
@@ -2819,10 +3100,13 @@ async fn run_exec(
     // command is over: it sits in a read of stdin, and a pipe nobody is writing
     // to keeps it there long after there is anywhere to send the bytes.
     let stdin_pump = if interactive || !std::io::stdin().is_terminal() {
-        Some(tokio::spawn(forward_stdin(tx.clone(), flags.pty)))
+        Some(tokio::spawn(forward_stdin(
+            tx.clone(),
+            flags.is_pty_allocated,
+        )))
     } else {
         tx.send(api::ExecInput {
-            input: Some(api::exec_input::Input::StdinEof(true)),
+            input: Some(api::exec_input::Input::IsStdinEof(true)),
         })
         .await
         .ok();
@@ -2901,7 +3185,7 @@ async fn start_detached(
             cmd,
             env: parse_pairs("--env", &flags.envs)?,
             cwd: flags.workdir.clone().unwrap_or_default(),
-            pty: flags.pty,
+            is_pty: flags.is_pty_allocated,
             rows: 24,
             cols: 80,
             user: flags.user.clone().unwrap_or_default(),
@@ -3023,7 +3307,7 @@ async fn forward_stdin(tx: tokio::sync::mpsc::Sender<api::ExecInput>, pty: bool)
     let end = if pty {
         api::exec_input::Input::Stdin(vec![EOT])
     } else {
-        api::exec_input::Input::StdinEof(true)
+        api::exec_input::Input::IsStdinEof(true)
     };
     tx.send(api::ExecInput { input: Some(end) }).await.ok();
 }
@@ -3224,6 +3508,8 @@ enum Json {
     Str(String),
     Arr(Vec<Json>),
     Obj(Vec<(&'static str, Json)>),
+    /// Already-encoded JSON, written as it is.
+    Raw(String),
 }
 
 impl Json {
@@ -3237,6 +3523,7 @@ impl Json {
             Json::Bool(value) => out.push_str(if *value { "true" } else { "false" }),
             Json::Num(value) => out.push_str(&value.to_string()),
             Json::Str(value) => escape(value, out),
+            Json::Raw(value) => out.push_str(value),
             Json::Arr(items) if items.is_empty() => out.push_str("[]"),
             Json::Arr(items) => {
                 out.push_str("[\n");
@@ -3285,6 +3572,37 @@ fn escape(value: &str, out: &mut String) {
     out.push('"');
 }
 
+/// `k=v` strings, ordered so two renderings of the same map agree.
+fn pairs_json(pairs: &std::collections::HashMap<String, String>) -> Json {
+    let mut pairs: Vec<_> = pairs.iter().collect();
+    pairs.sort();
+    Json::Arr(
+        pairs
+            .into_iter()
+            .map(|(key, value)| Json::str(format!("{key}={value}")))
+            .collect(),
+    )
+}
+
+fn volumes_json(volumes: &[common::Volume]) -> String {
+    let items = volumes
+        .iter()
+        .map(|volume| {
+            Json::Obj(vec![
+                ("name", Json::str(&volume.name)),
+                ("node", Json::str(&volume.node_id)),
+                ("size_mib", Json::Num(volume.size_mib)),
+                ("created_at", Json::str(&volume.created_at)),
+                ("attached_to", Json::str(&volume.attached_to)),
+                ("labels", pairs_json(&volume.labels)),
+            ])
+        })
+        .collect();
+    let mut out = String::new();
+    Json::Arr(items).write(&mut out, 0);
+    out
+}
+
 /// One sandbox's record as JSON, for `inspect --json`.
 ///
 /// The same fields the readable form prints, including the zeroes it shows and
@@ -3307,15 +3625,15 @@ fn sandbox_json(sandbox: &common::Sandbox) -> String {
         .map(|exec| {
             (
                 "exec",
-                Json::Obj(vec![("allow_exec", Json::Bool(exec.allow_exec))]),
+                Json::Obj(vec![("allow_exec", Json::Bool(exec.is_exec_allowed))]),
             )
         })
         .chain(policy.fs.iter().map(|fs| {
             (
                 "fs",
                 Json::Obj(vec![
-                    ("allow_upload", Json::Bool(fs.allow_upload)),
-                    ("allow_download", Json::Bool(fs.allow_download)),
+                    ("allow_upload", Json::Bool(fs.is_upload_allowed)),
+                    ("allow_download", Json::Bool(fs.is_download_allowed)),
                     ("path_scopes", strings(&fs.path_scopes)),
                     ("max_upload_bytes", Json::Num(fs.max_upload_bytes)),
                 ]),
@@ -3327,8 +3645,11 @@ fn sandbox_json(sandbox: &common::Sandbox) -> String {
         ("id", Json::str(&sandbox.id)),
         ("name", Json::str(&sandbox.name)),
         ("state", Json::str(display_state(sandbox))),
-        ("unreachable", Json::Bool(sandbox.unreachable)),
-        ("agent_unconfirmed", Json::Bool(sandbox.agent_unconfirmed)),
+        ("unreachable", Json::Bool(sandbox.is_unreachable)),
+        (
+            "agent_unconfirmed",
+            Json::Bool(sandbox.is_agent_unconfirmed),
+        ),
         ("node", Json::str(&sandbox.node_id)),
         ("template", Json::str(&sandbox.template)),
         ("created_at", Json::str(&sandbox.created_at)),
@@ -3362,7 +3683,7 @@ fn sandbox_json(sandbox: &common::Sandbox) -> String {
                 ),
                 (
                     "keep_evicted_snapshots",
-                    Json::Bool(resources.keep_evicted_snapshots),
+                    Json::Bool(resources.is_evicted_snapshot_kept),
                 ),
             ]),
         ),
@@ -3391,7 +3712,8 @@ fn sandbox_json(sandbox: &common::Sandbox) -> String {
                     ),
                 ),
                 ("deny_cidrs", strings(&network.deny_cidrs)),
-                ("inspect_tls", Json::Bool(network.inspect_tls)),
+                ("deny_domains", strings(&network.deny_domains)),
+                ("inspect_tls", Json::Bool(network.is_tls_inspected)),
                 (
                     "rules",
                     Json::Arr(
@@ -3445,6 +3767,21 @@ fn sandbox_json(sandbox: &common::Sandbox) -> String {
         ),
     ];
     fields.extend(access);
+    if !sandbox.env.is_empty() {
+        fields.push(("env", pairs_json(&sandbox.env)));
+    }
+    if let Some(kit) = &sandbox.kit {
+        fields.push((
+            "kit",
+            Json::Obj(vec![
+                ("args", pairs_json(&kit.args)),
+                ("reject_types", strings(&kit.reject_types)),
+            ]),
+        ));
+    }
+    if !sandbox.kit_selection.is_empty() {
+        fields.push(("selection", Json::Raw(sandbox.kit_selection.clone())));
+    }
     let doc = Json::Obj(fields);
     let mut out = String::new();
     doc.write(&mut out, 0);
@@ -3569,17 +3906,49 @@ mod tests {
         .unwrap();
         assert_eq!(parsed[0].volume, "cache");
         assert_eq!(parsed[0].path, "/data");
-        assert!(!parsed[0].read_only, "read-write is the default");
-        assert!(parsed[1].read_only);
+        assert!(!parsed[0].is_read_only, "read-write is the default");
+        assert!(parsed[1].is_read_only);
         assert_eq!(parsed[1].path, "/ro");
-        assert!(!parsed[2].read_only);
+        assert!(!parsed[2].is_read_only);
 
         // A colon that is part of the path is not a mode.
         let odd = super::parse_mounts(&["v:/data/a:b".into()]).unwrap();
         assert_eq!(odd[0].path, "/data/a:b");
-        assert!(!odd[0].read_only);
+        assert!(!odd[0].is_read_only);
 
         for bad in ["cache", "", ":/data", "cache:"] {
+            assert!(
+                super::parse_mounts(&[bad.into()]).is_err(),
+                "{bad:?} should be refused"
+            );
+        }
+    }
+
+    #[test]
+    fn a_tmpfs_mount_takes_a_size_and_a_mode() {
+        let parsed = super::parse_mounts(&[
+            "tmpfs:/scratch".into(),
+            "tmpfs:/big:size=2g".into(),
+            "tmpfs:/shared:mode=1777:size=512m".into(),
+            "tmpfs:/odd:x:size=64".into(),
+        ])
+        .unwrap();
+        assert!(parsed.iter().all(|m| m.is_tmpfs && m.volume.is_empty()));
+        assert_eq!(parsed[0].path, "/scratch");
+        assert_eq!(parsed[0].size_mib, 0);
+        assert_eq!(parsed[1].size_mib, 2048);
+        assert_eq!(parsed[2].path, "/shared");
+        assert_eq!(parsed[2].size_mib, 512);
+        assert_eq!(parsed[2].mode, "1777");
+        assert_eq!(parsed[3].path, "/odd:x");
+        assert_eq!(parsed[3].size_mib, 64);
+
+        for bad in [
+            "tmpfs:",
+            "tmpfs:/x:size=",
+            "tmpfs:/x:size=0",
+            "tmpfs:/x:size=lots",
+        ] {
             assert!(
                 super::parse_mounts(&[bad.into()]).is_err(),
                 "{bad:?} should be refused"
@@ -3601,19 +3970,22 @@ mod tests {
             assert!(matches!(
                 parse(&["burrow", spelling]).command,
                 Command::Ps {
-                    all: false,
+                    is_all_shown: false,
                     tag: None
                 }
             ));
         }
         assert!(matches!(
             parse(&["burrow", "ps", "-a"]).command,
-            Command::Ps { all: true, .. }
+            Command::Ps {
+                is_all_shown: true,
+                ..
+            }
         ));
         assert!(matches!(
             parse(&["burrow", "ps", "--all", "--tag", "env=ci"]).command,
             Command::Ps {
-                all: true,
+                is_all_shown: true,
                 tag: Some(_)
             }
         ));
@@ -3695,7 +4067,10 @@ mod tests {
     fn detach_rules_out_the_cleanup_flags() {
         assert!(matches!(
             parse(&["burrow", "run", "-d", "--", "sh"]).command,
-            Command::Run { detach: true, .. }
+            Command::Run {
+                is_detached: true,
+                ..
+            }
         ));
         assert!(Args::try_parse_from(["burrow", "run", "-d", "--rm", "--", "sh"]).is_err());
         assert!(Args::try_parse_from(["burrow", "run", "-d", "--stop", "--", "sh"]).is_err());
@@ -3716,7 +4091,7 @@ mod tests {
     fn a_bare_listing_holds_only_live_sandboxes() {
         let sandbox = |state: common::SandboxState, unreachable: bool| common::Sandbox {
             state: state as i32,
-            unreachable,
+            is_unreachable: unreachable,
             ..Default::default()
         };
         for live in [
@@ -3817,7 +4192,8 @@ mod tests {
             allow_cidrs: vec![],
             allow_ports: vec![],
             deny_cidrs: vec!["10.0.0.0/8".into()],
-            inspect_tls,
+            deny_domains: vec![],
+            is_tls_inspected: inspect_tls,
             inject_headers: inject.iter().map(|s| (*s).to_string()).collect(),
             rules: vec![],
         }
@@ -3935,15 +4311,18 @@ mod tests {
     fn an_untouched_flag_group_is_not_an_override() {
         let mut untouched = flags("none", false, &[]);
         untouched.deny_cidrs.clear();
-        assert!(!untouched.stated());
+        assert!(!untouched.is_stated());
 
-        assert!(flags("open", false, &[]).stated());
-        assert!(flags("none", false, &[]).stated(), "a deny_cidr was named");
+        assert!(flags("open", false, &[]).is_stated());
+        assert!(
+            flags("none", false, &[]).is_stated(),
+            "a deny_cidr was named"
+        );
 
         let mut domains = flags("none", false, &[]);
         domains.deny_cidrs.clear();
         domains.allow_domains.push("pypi.org".into());
-        assert!(domains.stated());
+        assert!(domains.is_stated());
     }
 
     #[test]
@@ -3994,12 +4373,15 @@ mod tests {
             CreateFlags {
                 name: None,
                 template: None,
+                kit_args: Vec::new(),
+                kit_env: Vec::new(),
+                reject_capabilities: Vec::new(),
                 snapshot: None,
                 vcpus: None,
                 mem_mib: None,
                 snapshot_expiration_secs: 0,
                 keep_last_snapshots: 0,
-                keep_evicted_snapshots: false,
+                is_evicted_snapshots_kept: false,
                 mounts: vec![],
                 max_lifetime_secs: 0,
                 idle_suspend_secs: 0,
@@ -4012,14 +4394,15 @@ mod tests {
                     allow_cidrs: vec![],
                     allow_ports: vec![],
                     deny_cidrs: vec![],
-                    inspect_tls: false,
+                    deny_domains: vec![],
+                    is_tls_inspected: false,
                     inject_headers: vec![],
                     rules: vec![],
                 },
                 access: AccessFlags {
-                    no_exec: false,
-                    no_upload: false,
-                    no_download: false,
+                    is_exec_denied: false,
+                    is_upload_denied: false,
+                    is_download_denied: false,
                     fs_scopes: vec![],
                     max_upload_bytes: 0,
                 },
@@ -4028,41 +4411,41 @@ mod tests {
                 node_labels: vec![],
             }
         }
-        assert!(!base().stated());
+        assert!(!base().is_stated());
 
         // The name is what `run` matched on, not a configuration that went
         // unapplied, so naming a sandbox is not on its own a create.
         let mut named = base();
         named.name = Some("builder".into());
-        assert!(!named.stated());
+        assert!(!named.is_stated());
 
         // A publish is applied after the fact, so it is not a create flag that
         // went unapplied either.
         let mut published = base();
         published.publish.push(8080);
-        assert!(!published.stated());
+        assert!(!published.is_stated());
 
         let mut template = base();
         template.template = Some("python".into());
-        assert!(template.stated());
+        assert!(template.is_stated());
 
         let mut tagged = base();
         tagged.tags.push("env=ci".into());
-        assert!(tagged.stated());
+        assert!(tagged.is_stated());
 
         let mut networked = base();
         networked.network.net = "open".into();
-        assert!(networked.stated());
+        assert!(networked.is_stated());
 
         let mut confined = base();
         confined.access.fs_scopes.push("/work".into());
-        assert!(confined.stated());
+        assert!(confined.is_stated());
 
         // A placement constraint is a configuration: `run --name` landing on an
         // existing sandbox somewhere else cannot honour it.
         let mut placed = base();
         placed.node_labels.push("rack=b7".into());
-        assert!(placed.stated());
+        assert!(placed.is_stated());
     }
 
     /// Absent means allowed on the wire, so a create that restricted nothing
@@ -4070,9 +4453,9 @@ mod tests {
     #[test]
     fn access_sections_are_sent_only_when_something_was_restricted() {
         let open = AccessFlags {
-            no_exec: false,
-            no_upload: false,
-            no_download: false,
+            is_exec_denied: false,
+            is_upload_denied: false,
+            is_download_denied: false,
             fs_scopes: vec![],
             max_upload_bytes: 0,
         };
@@ -4080,24 +4463,24 @@ mod tests {
         assert!(open.fs_policy().is_none());
 
         let scoped = AccessFlags {
-            no_exec: true,
-            no_download: true,
+            is_exec_denied: true,
+            is_download_denied: true,
             fs_scopes: vec!["/work".into()],
             max_upload_bytes: 4096,
             ..open
         };
-        assert!(!scoped.exec_policy().unwrap().allow_exec);
+        assert!(!scoped.exec_policy().unwrap().is_exec_allowed);
         let fs = scoped.fs_policy().unwrap();
-        assert!(fs.allow_upload);
-        assert!(!fs.allow_download);
+        assert!(fs.is_upload_allowed);
+        assert!(!fs.is_download_allowed);
         assert_eq!(fs.path_scopes, vec!["/work".to_string()]);
         assert_eq!(fs.max_upload_bytes, 4096);
 
         // An exec restriction on its own leaves the fs section absent.
         let no_exec = AccessFlags {
-            no_exec: true,
-            no_upload: false,
-            no_download: false,
+            is_exec_denied: true,
+            is_upload_denied: false,
+            is_download_denied: false,
             fs_scopes: vec![],
             max_upload_bytes: 0,
         };
@@ -4110,12 +4493,12 @@ mod tests {
     fn an_update_sends_only_the_sections_the_caller_named() {
         fn quiet() -> AccessUpdateFlags {
             AccessUpdateFlags {
-                no_exec: false,
-                allow_exec: false,
-                no_upload: false,
-                allow_upload: false,
-                no_download: false,
-                allow_download: false,
+                is_exec_denied: false,
+                is_exec_allowed: false,
+                is_upload_denied: false,
+                is_upload_allowed: false,
+                is_download_denied: false,
+                is_download_allowed: false,
                 fs_scopes: vec![],
                 max_upload_bytes: None,
             }
@@ -4126,28 +4509,28 @@ mod tests {
         // Tightening files says nothing about exec, which is the case the
         // node must not read as "allow everything".
         let files = AccessUpdateFlags {
-            no_upload: true,
+            is_upload_denied: true,
             fs_scopes: vec!["/work".into()],
             ..quiet()
         };
         assert!(files.exec_policy().is_none());
         let fs = files.fs_policy().unwrap();
-        assert!(!fs.allow_upload);
-        assert!(fs.allow_download);
+        assert!(!fs.is_upload_allowed);
+        assert!(fs.is_download_allowed);
         assert_eq!(fs.path_scopes, vec!["/work".to_string()]);
 
         // Both spellings of an exec allowance produce a section; they differ
         // only in what it says.
         let denied = AccessUpdateFlags {
-            no_exec: true,
+            is_exec_denied: true,
             ..quiet()
         };
-        assert!(!denied.exec_policy().unwrap().allow_exec);
+        assert!(!denied.exec_policy().unwrap().is_exec_allowed);
         let allowed = AccessUpdateFlags {
-            allow_exec: true,
+            is_exec_allowed: true,
             ..quiet()
         };
-        assert!(allowed.exec_policy().unwrap().allow_exec);
+        assert!(allowed.exec_policy().unwrap().is_exec_allowed);
         assert!(allowed.fs_policy().is_none());
 
         // A cap of 0 is "unlimited", and is distinguishable from not saying so.

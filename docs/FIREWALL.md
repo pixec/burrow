@@ -56,6 +56,10 @@ proxy, which checks every connection.
   a denied range stays unreachable even if an allowed domain resolves into it or
   `allow_cidrs` or `open` would otherwise grant it. An entry that does not parse
   costs the sandbox its egress rather than being skipped.
+- **`deny_domains`** (`--deny-domain`): block by domain glob. Like `deny_cidrs`
+  it beats every allowance in every mode, `open` included: a name matching one
+  is not resolved, not connected to, and not requested inside an inspected
+  session. See [Denied domains and HTTP rules](#denied-domains-and-http-rules).
 
 An allowlist policy with nothing in it behaves like `none`: no egress, and DNS
 answers `.internal` names only.
@@ -76,11 +80,12 @@ The only wildcard is a leading `*.`, and it stands for one or more labels.
 | `example.com` | `example.com` | `www.example.com` |
 | `*.example.com` | `www.example.com`, `a.b.example.com` | `example.com` |
 
-A wildcard anywhere else is not a pattern at all. `a.*.example.com` and a bare
-`*` match nothing, and as a rule's `domain` they are refused when the policy is
-set. In `allow_domains` they are simply dead entries, so an allowance you thought
-you had is one nothing can use. A leading wildcard never covers the apex: add
-`example.com` alongside it when the sandbox needs both.
+A bare `*` matches every host. A wildcard anywhere else, such as
+`a.*.example.com`, is not a pattern at all: as a rule's `domain` it is refused
+when the policy is set, and in `allow_domains` it is simply a dead entry, so an
+allowance you thought you had is one nothing can use. A port suffix on either
+side is ignored. A leading wildcard never covers the apex: add `example.com`
+alongside it when the sandbox needs both.
 
 ## How enforcement works
 
@@ -135,7 +140,7 @@ origin you did not allow. Many providers reject the mismatch, but the boundary
 itself cannot see inside the session.
 
 Two answers, depending on your threat model. Prefer narrow, single-purpose
-hostnames whose infrastructure hosts nothing else. Or turn on `inspect_tls`: the
+hostnames whose infrastructure hosts nothing else. Or turn on `is_tls_inspected`: the
 proxy then terminates TLS for that sandbox using a per-node CA installed into the
 guest's trust store at handshake, parses every request inside the session, and
 requires the inner `Host` to be allowlisted *and* to match the name the session
@@ -241,7 +246,7 @@ matcher both match wins. A rule with no matcher applies to every request to its
 domain, so it shadows every rule after it for that domain: write the narrow rules
 first.
 
-All of this needs `inspect_tls`. Acting on a request means reading it, and
+All of this needs `is_tls_inspected`. Acting on a request means reading it, and
 outside an inspected session there is no request to read, so a policy carrying
 rules without inspection is refused at the API door rather than half-applied.
 
@@ -261,6 +266,20 @@ That is shorthand for a rule with no matcher: on every request to a matching
 domain the proxy sets the header, replacing any value the client sent, so code
 inside the sandbox can neither read it nor spoof it.
 
+The value need not be on the command line. A header value, or a forward rule's
+secret, may name a stored secret as `${secret:<name>}`, which the orchestrator
+substitutes before the policy reaches a node:
+
+```sh
+burrow secret set github --value ghp_...
+burrow create --template base --net allowlist \
+  --allow-domain api.github.com --inspect-tls \
+  --inject-header 'api.github.com:Authorization=Bearer ${secret:github}'
+```
+
+A reference to a secret that is not stored refuses the create rather than
+sending the literal text.
+
 - Brokering only applies to domains the policy already allows. A rule never
   widens access, it only decides what a permitted request carries.
 - It applies inside inspected TLS sessions, over HTTP/1.1 and HTTP/2 alike.
@@ -269,7 +288,10 @@ inside the sandbox can neither read it nor spoof it.
   A value that could forge a header line is refused at the API door rather than
   written into a request.
 
-The secret lives in the sandbox's policy on the host. Every response that carries
+The secret lives in the sandbox's policy on the host, sealed at rest: the node
+writes its sandbox records with every brokered value encrypted under a key at
+`<data-dir>/secrets.key`, generated on first start and readable by the daemon
+alone, so a copy of `node.db` without it says nothing. Every response that carries
 a policy back out of a node (`CreateSandbox`, `GetSandbox`, `ListSandboxes`,
 `PauseSandbox`, `ResumeSandbox`, `UpdateNetworkPolicy`) replaces each value with
 `<redacted>`, keeping the domain and header name visible so an operator can still
@@ -406,7 +428,7 @@ should not also grant, because a node compromise grants it.
 
 #### Limits
 
-- Forwarding requires `inspect_tls`, like every other rule.
+- Forwarding requires `is_tls_inspected`, like every other rule.
 - The URL is `http://` or `https://` with no query string and no fragment,
   validated at the API door. A port you do not name defaults to 80 for `http://`
   and 443 for `https://`.
@@ -440,6 +462,43 @@ to evaluate is bounded:
 A request head is already capped at 16 KiB on both protocols, so the work one
 request can cost is the product of two bounded numbers.
 
+## Denied domains and HTTP rules
+
+Two more fields narrow a policy below the host. Both come from the Sandbox Kit
+network policy, and `deny_domains` also has a flag.
+
+**`deny_domains`** refuses a set of domain globs before anything grants them.
+It applies in every mode, so an `open` sandbox with `--deny-domain
+'*.corp.example'` cannot resolve or connect to those names however unfiltered
+the rest of its egress is, and an allowlist that names `*.example.com` and
+denies `internal.example.com` reaches every subdomain but that one. Inside an
+inspected session a request naming a denied host is answered `403`. Besides the
+patterns in [Domain patterns](#domain-patterns), a deny entry may be `*`, which
+denies every host.
+
+**`http_rules`** decide per request, by host, method and path. A rule names a
+list of host globs (`*` is every host), a list of methods (empty, or `ANY`, is
+every method) and a list of path globs (empty is every path; `*` matches within
+one segment, `**` across segments, so `/repos/**` covers `/repos` and everything
+under it). Each rule is either an allow or a deny:
+
+- A **deny** rule refuses matching requests with `403`, whatever `allow_domains`
+  or any allow rule says. `DELETE` on an allowed host, or anything under
+  `/admin/`, can be closed off this way.
+- An **allow** rule for a host that `allow_domains` does not grant makes it a
+  *bounded host*: the proxy admits connections to it and resolves it, but every
+  request must match some allow rule by method and path or it is answered
+  `403`. Traffic the proxy cannot read is refused outright: a connection to a
+  bounded host on a port other than 80 or 443, or on 443 without inspection, is
+  closed and audited as `bounded host requires inspection`. A host granted by
+  `allow_domains` is not bounded and carries any traffic, deny rules aside.
+
+Like request rules, `http_rules` need `is_tls_inspected`, and a policy carrying them
+without it is refused at the API door. Plain HTTP on port 80 is already read
+request by request, so both fields apply there too. A policy carries at most 64
+HTTP rules, methods are uppercase tokens, and every path glob starts with `/`.
+The refusing rule is named in the audit record's reason.
+
 ## Live updates
 
 `UpdateNetworkPolicy` replaces a running sandbox's policy without restarting
@@ -468,7 +527,7 @@ sessions, while connections already established keep their conntrack entry. So a
 tightening bites new connections and, inside an inspected session, the next
 request, rather than cutting a transfer in flight.
 
-One transition is refused rather than applied: **`inspect_tls` can only be
+One transition is refused rather than applied: **`is_tls_inspected` can only be
 enabled at creation.** The guest trusts Burrow's CA because it was installed into
 its trust store during the agent handshake, so turning inspection on later would
 break every TLS connection the sandbox makes instead of inspecting them. Turning

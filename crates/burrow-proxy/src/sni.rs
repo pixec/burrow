@@ -67,7 +67,7 @@ pub struct ClientHello {
     /// provider's own, and the name actually asked for is sealed in this
     /// extension. An allowlist containing the cover name would wave through a
     /// connection to anywhere the provider hosts.
-    pub encrypted_client_hello: bool,
+    pub is_hello_encrypted: bool,
     /// The protocols the client offered in ALPN, in the order it listed them.
     ///
     /// An inspected session negotiates upstream with exactly this offer, so
@@ -205,7 +205,7 @@ pub fn parse_client_hello(buf: &[u8]) -> Option<ClientHello> {
         let body = r.take(ext_len)?;
 
         match ext_type {
-            EXT_ENCRYPTED_CLIENT_HELLO => hello.encrypted_client_hello = true,
+            EXT_ENCRYPTED_CLIENT_HELLO => hello.is_hello_encrypted = true,
             EXT_SERVER_NAME => {
                 // server_name extension: list length, then entries of
                 // (type, length, name). Only host_name (type 0) is defined.
@@ -381,7 +381,7 @@ mod tests {
         let parsed = parse_client_hello(&hello).expect("should parse");
         assert_eq!(parsed.server_name.as_deref(), Some("cover.example.com"));
         assert!(
-            parsed.encrypted_client_hello,
+            parsed.is_hello_encrypted,
             "ECH must be reported, not ignored"
         );
     }
@@ -394,7 +394,7 @@ mod tests {
             (0x002b, vec![0x02, 0x03, 0x04]),
             (0xfe0d, vec![0x01]),
         ]);
-        assert!(parse_client_hello(&hello).unwrap().encrypted_client_hello);
+        assert!(parse_client_hello(&hello).unwrap().is_hello_encrypted);
     }
 
     #[test]
@@ -402,7 +402,7 @@ mod tests {
         let hello = client_hello_with(&[(0x0000, server_name_extension("example.com"))]);
         let parsed = parse_client_hello(&hello).unwrap();
         assert_eq!(parsed.server_name.as_deref(), Some("example.com"));
-        assert!(!parsed.encrypted_client_hello);
+        assert!(!parsed.is_hello_encrypted);
     }
 
     /// What the sandbox offered is what an inspected session may negotiate
@@ -440,7 +440,7 @@ mod tests {
         let hello = client_hello_with(&[(0xfe0d, vec![0x01, 0x02])]);
         let parsed = parse_client_hello(&hello).unwrap();
         assert_eq!(parsed.server_name, None);
-        assert!(parsed.encrypted_client_hello);
+        assert!(parsed.is_hello_encrypted);
     }
 
     fn server_name_extension(name: &str) -> Vec<u8> {

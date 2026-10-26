@@ -16,6 +16,7 @@ burrow-net = { workspace = true }
 burrow-proxy = { workspace = true }
 burrow-store = { workspace = true }
 tailcat-rs = { workspace = true }
+burrow-kit = { workspace = true }
 tokio = { workspace = true }
 tokio-stream = { workspace = true }
 tonic = { workspace = true }
@@ -37,3 +38,4 @@ flate2 = { workspace = true }
 tar = { workspace = true }
 tracing-subscriber = { workspace = true }
 sysinfo = { workspace = true }
+uuid = { workspace = true }

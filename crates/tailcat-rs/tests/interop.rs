@@ -46,7 +46,7 @@ fn dev_region() -> DerpRegion {
             ipv4: "127.0.0.1".into(),
             derp_port: DERP_PORT.into(),
             stun_port: STUN_PORT.into(),
-            insecure_for_tests: true,
+            is_insecure_for_tests: true,
             ..Default::default()
         }],
         ..Default::default()
@@ -85,7 +85,7 @@ async fn go_client_pipes_through_rust_server() {
     let server = std::sync::Arc::new(
         Server::start(Config {
             region: Region::Embedded(dev_region()),
-            insecure_derp_http: true,
+            is_derp_http_insecure: true,
             tcp_ports: Ports::list([echo_port]),
             ..Default::default()
         })

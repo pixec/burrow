@@ -47,7 +47,7 @@ pub struct Config {
     pub preshared_key: Option<PresharedKey>,
     /// Drop the pre-shared-key layer for shorter addresses that clients
     /// before tailcat v0.6 accept. Not recommended.
-    pub disable_preshared_key: bool,
+    pub is_preshared_key_disabled: bool,
     pub region: Region,
     /// Where to fetch the DERP map from, when a region has to be looked up.
     pub derp_map_url: Option<String>,
@@ -61,13 +61,13 @@ pub struct Config {
     /// Also accept TCP addressed to any other destination, exit-node style.
     /// Such connections report the dialed address through
     /// [`TcpConn::local_addr`].
-    pub forward_tcp: bool,
-    pub forward_udp: bool,
+    pub is_tcp_forwarded: bool,
+    pub is_udp_forwarded: bool,
     /// Zero means [`DEFAULT_UDP_IDLE_TIMEOUT`].
     pub udp_idle_timeout: Duration,
     /// Speak plaintext HTTP to the relay, for a `derper --dev`. Never for a
     /// real relay.
-    pub insecure_derp_http: bool,
+    pub is_derp_http_insecure: bool,
 }
 
 impl Default for Config {
@@ -75,16 +75,16 @@ impl Default for Config {
         Config {
             key: None,
             preshared_key: None,
-            disable_preshared_key: false,
+            is_preshared_key_disabled: false,
             region: Region::Nearest,
             derp_map_url: None,
             allowed_clients: None,
             tcp_ports: Ports::All,
             udp_ports: None,
-            forward_tcp: false,
-            forward_udp: false,
+            is_tcp_forwarded: false,
+            is_udp_forwarded: false,
             udp_idle_timeout: Duration::ZERO,
-            insecure_derp_http: false,
+            is_derp_http_insecure: false,
         }
     }
 }
@@ -108,7 +108,7 @@ async fn expand_region(region_id: i64, url: Option<String>) -> Result<DerpRegion
     ci.expand(&ExpandOptions {
         derp_map_url: url,
         derp_map: None,
-        for_server: true,
+        is_for_server: true,
     })
     .await?;
     ci.region
@@ -121,7 +121,7 @@ impl Server {
     /// Resolves the relay, connects to it, and starts accepting clients.
     pub async fn start(config: Config) -> Result<Server> {
         let key = config.key.unwrap_or_else(NodePrivate::generate);
-        let preshared_key = if config.disable_preshared_key {
+        let preshared_key = if config.is_preshared_key_disabled {
             None
         } else {
             Some(config.preshared_key.unwrap_or_else(PresharedKey::generate))
@@ -141,8 +141,8 @@ impl Server {
             self_addr,
             tcp_ports: config.tcp_ports,
             udp_ports: config.udp_ports,
-            forward_tcp: config.forward_tcp,
-            forward_udp: config.forward_udp,
+            is_tcp_forwarded: config.is_tcp_forwarded,
+            is_udp_forwarded: config.is_udp_forwarded,
             udp_idle_timeout: if config.udp_idle_timeout.is_zero() {
                 DEFAULT_UDP_IDLE_TIMEOUT
             } else {
@@ -156,7 +156,7 @@ impl Server {
                 region: region.clone(),
                 allowed_clients: config.allowed_clients.map(HashSet::from_iter),
                 derp: derp::Options {
-                    plaintext_http: config.insecure_derp_http,
+                    is_plaintext_http: config.is_derp_http_insecure,
                     app_name: DERP_APP_NAME.into(),
                 },
             },

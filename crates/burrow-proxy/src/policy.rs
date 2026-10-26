@@ -98,7 +98,7 @@ impl Match {
         })
     }
 
-    pub fn matches(&self, subject: &str) -> bool {
+    pub fn is_match(&self, subject: &str) -> bool {
         match self {
             Match::Exact(value) => subject == value,
             Match::StartsWith(value) => subject.starts_with(value.as_str()),
@@ -139,9 +139,9 @@ pub struct Request<'a> {
 }
 
 impl RequestMatch {
-    pub fn matches(&self, request: &Request<'_>) -> bool {
+    pub fn is_match(&self, request: &Request<'_>) -> bool {
         if let Some(path) = &self.path
-            && !path.matches(request.path)
+            && !path.is_match(request.path)
         {
             return false;
         }
@@ -153,7 +153,7 @@ impl RequestMatch {
             // which is the only reading that does not depend on which
             // occurrence a server happens to take.
             if !query_pairs(request.query)
-                .any(|(name, found)| name == key.as_str() && value.matches(&found))
+                .any(|(name, found)| name == key.as_str() && value.is_match(&found))
             {
                 return false;
             }
@@ -162,7 +162,7 @@ impl RequestMatch {
             if !request
                 .headers
                 .iter()
-                .any(|(found, text)| found.eq_ignore_ascii_case(name) && value.matches(text))
+                .any(|(found, text)| found.eq_ignore_ascii_case(name) && value.is_match(text))
             {
                 return false;
             }
@@ -338,7 +338,7 @@ pub enum Action {
 /// One rule: which requests, and what happens to them.
 #[derive(Debug, Clone)]
 pub struct Rule {
-    /// Domain glob, matched with [`matches`] like an allowlist entry.
+    /// Domain glob, matched with [`burrow_core::glob::is_host_match`] like an allowlist entry.
     pub domain: String,
     /// `None` matches every request to the domain, and therefore shadows every
     /// rule after it for that domain.
@@ -351,8 +351,41 @@ impl Rule {
     ///
     /// A refusal counts, because the request does not reach the origin either
     /// way, and both need the relay that can answer without one.
-    pub fn diverts(&self) -> bool {
+    pub fn is_diverted(&self) -> bool {
         matches!(self.action, Action::Forward(_) | Action::Refuse(_))
+    }
+}
+
+/// One HTTP-level grant or refusal: the hosts, methods and paths it names.
+///
+/// Hosts are globs like allowlist entries, with `*` meaning every host; paths
+/// are matched with [`burrow_core::glob::is_path_match`] against the path alone,
+/// without the query string.
+#[derive(Debug, Clone, Default)]
+pub struct HttpRule {
+    pub hosts: Vec<String>,
+    /// Empty, or the single entry `ANY`, means every method.
+    pub methods: Vec<String>,
+    /// Empty means every path.
+    pub paths: Vec<String>,
+    pub is_denying: bool,
+}
+
+impl HttpRule {
+    pub fn is_for_host(&self, host: &str) -> bool {
+        self.hosts
+            .iter()
+            .any(|pattern| burrow_core::glob::is_host_match(pattern, host))
+    }
+
+    pub fn is_match(&self, host: &str, method: &str, path: &str) -> bool {
+        self.is_for_host(host)
+            && (self.methods.is_empty() || self.methods.iter().any(|m| m == "ANY" || m == method))
+            && (self.paths.is_empty()
+                || self
+                    .paths
+                    .iter()
+                    .any(|glob| burrow_core::glob::is_path_match(glob, path)))
     }
 }
 
@@ -367,11 +400,17 @@ pub struct SandboxPolicy {
     /// Whether this sandbox's TLS may be terminated so the host named inside
     /// the session can be checked. Off unless the caller asked for it: it
     /// trades payload privacy for closing domain fronting.
-    pub inspect_tls: bool,
+    pub is_tls_inspected: bool,
     /// IPv4 ranges this sandbox may never reach. Checked against the address
     /// the proxy would dial, not against the name: an allowed domain that
     /// resolves into a denied range is still denied.
     pub deny_cidrs: Vec<String>,
+    /// Domain globs refused in every mode before any allowance is consulted:
+    /// not resolved, not connected to, not requested inside a session.
+    pub deny_domains: Vec<String>,
+    /// Per-request grants and refusals. A host named only by allow rules here
+    /// is bounded: it carries the requests they admit and nothing else.
+    pub http_rules: Arc<Vec<HttpRule>>,
     /// What the host does to the requests it inspects, in policy order.
     ///
     /// Behind an `Arc` so cloning a policy per connection does not clone the
@@ -387,11 +426,89 @@ impl SandboxPolicy {
     /// these at the door, so one arriving malformed means the policy is not
     /// the one that was written, and the safe reading of a denial is the
     /// broader one.
-    pub fn denies(&self, address: IpAddr) -> bool {
+    pub fn is_denied(&self, address: IpAddr) -> bool {
         self.deny_cidrs.iter().any(|entry| match parse_cidr(entry) {
-            Some((network, prefix)) => contains(network, prefix, address),
+            Some((network, prefix)) => is_in_prefix(network, prefix, address),
             None => true,
         })
+    }
+
+    pub fn is_host_denied(&self, host: &str) -> bool {
+        self.deny_domains
+            .iter()
+            .any(|pattern| burrow_core::glob::is_host_match(pattern, host))
+    }
+
+    fn is_granted(&self, host: &str) -> bool {
+        self.allow_domains
+            .iter()
+            .any(|p| burrow_core::glob::is_host_match(p, host))
+    }
+
+    fn is_named_by_allow_rule(&self, host: &str) -> bool {
+        self.http_rules
+            .iter()
+            .any(|rule| !rule.is_denying && rule.is_for_host(host))
+    }
+
+    /// Whether `host` is reachable only through its http rules: named by an
+    /// allow rule and by no `allow_domains` entry. Such a host carries nothing
+    /// the proxy cannot read, so a connection to it that will not be inspected
+    /// is refused.
+    pub fn is_bounded(&self, host: &str) -> bool {
+        !self.is_host_denied(host) && !self.is_granted(host) && self.is_named_by_allow_rule(host)
+    }
+
+    /// Whether this sandbox may open a connection to `host` at all.
+    pub fn admits(&self, host: &str) -> Decision {
+        if self.is_host_denied(host) {
+            Decision::Deny("host is denied")
+        } else if self.is_granted(host) || self.is_named_by_allow_rule(host) {
+            Decision::Allow
+        } else {
+            Decision::Deny("host not in allowlist")
+        }
+    }
+
+    /// Judges one request to a host [`Self::admits`] already passed.
+    ///
+    /// Deny rules win whatever granted the host. On a bounded host the request
+    /// must also be claimed by an allow rule, since those rules are the only
+    /// reason the host is reachable.
+    pub fn check_request(&self, host: &str, method: &str, path: &str) -> Result<(), String> {
+        if self.is_host_denied(host) {
+            return Err(format!("host is denied ({host})"));
+        }
+        if let Some(rule) = self
+            .http_rules
+            .iter()
+            .find(|rule| rule.is_denying && rule.is_match(host, method, path))
+        {
+            return Err(format!(
+                "refused by deny rule {:?} ({method} {host}{path})",
+                rule.hosts
+            ));
+        }
+        if !self.is_granted(host)
+            && !self
+                .http_rules
+                .iter()
+                .any(|rule| !rule.is_denying && rule.is_match(host, method, path))
+        {
+            return Err(format!("no http rule admits {method} {host}{path}"));
+        }
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+impl SandboxPolicy {
+    /// A policy granting exactly `domains` and nothing else.
+    pub(crate) fn allowing(domains: &[&str]) -> Self {
+        Self {
+            allow_domains: domains.iter().map(|d| d.to_string()).collect(),
+            ..Default::default()
+        }
     }
 }
 
@@ -429,7 +546,7 @@ fn parse_cidr(value: &str) -> Option<(IpAddr, u8)> {
 /// compared as the v4 address it is, so `10.0.0.0/8` still denies
 /// `::ffff:10.0.0.1`; without that a v6 destination would walk through every
 /// v4 denial an operator wrote.
-fn contains(network: IpAddr, prefix: u8, address: IpAddr) -> bool {
+fn is_in_prefix(network: IpAddr, prefix: u8, address: IpAddr) -> bool {
     let address = unmap(address);
     match (network, unmap(network), address) {
         (IpAddr::V4(network), _, IpAddr::V4(address)) => {
@@ -443,7 +560,7 @@ fn contains(network: IpAddr, prefix: u8, address: IpAddr) -> bool {
         (IpAddr::V6(_), IpAddr::V4(mapped), IpAddr::V4(address)) => {
             // A mapped network written as v6 still denies the v4 it names.
             let bits = prefix.saturating_sub(96);
-            contains(IpAddr::V4(mapped), bits.min(32), IpAddr::V4(address))
+            is_in_prefix(IpAddr::V4(mapped), bits.min(32), IpAddr::V4(address))
         }
         (IpAddr::V6(network), _, IpAddr::V6(address)) => {
             let mask = match prefix {
@@ -479,7 +596,7 @@ pub enum Decision {
 }
 
 impl Decision {
-    pub fn allowed(&self) -> bool {
+    pub fn is_allowed(&self) -> bool {
         matches!(self, Decision::Allow)
     }
 
@@ -488,21 +605,6 @@ impl Decision {
             Decision::Allow => "allowed",
             Decision::Deny(reason) => reason,
         }
-    }
-}
-
-/// Matches a hostname against one glob.
-///
-/// `*.example.com` matches any single-or-multi-label subdomain but *not*
-/// `example.com` itself, matching how people read such a rule. A bare
-/// `example.com` matches only itself.
-pub fn matches(pattern: &str, host: &str) -> bool {
-    let pattern = pattern.trim().to_ascii_lowercase();
-    let host = host.trim().trim_end_matches('.').to_ascii_lowercase();
-
-    match pattern.strip_prefix("*.") {
-        Some(suffix) => host.len() > suffix.len() + 1 && host.ends_with(&format!(".{suffix}")),
-        None => pattern == host,
     }
 }
 
@@ -542,12 +644,7 @@ impl PolicyTable {
                 Decision::Deny("destination host not identifiable"),
             );
         };
-        let allowed = policy.allow_domains.iter().any(|p| matches(p, host));
-        let decision = if allowed {
-            Decision::Allow
-        } else {
-            Decision::Deny("host not in allowlist")
-        };
+        let decision = policy.admits(host);
         (Some(policy), decision)
     }
 
@@ -562,14 +659,17 @@ impl PolicyTable {
             return (None, Decision::Deny("unknown source sandbox"));
         };
         let decision = match policy.mode {
-            // Open egress is unfiltered by definition; filtering its DNS would
-            // stop nothing it cannot do directly.
+            // A denied name is denied in every mode, open included: the
+            // denial is the one thing an open sandbox is told it may not do.
+            _ if policy.is_host_denied(name) => Decision::Deny("name is denied"),
+            // Open egress is otherwise unfiltered by definition; filtering its
+            // DNS would stop nothing it cannot do directly.
             NetworkMode::Open => Decision::Allow,
             NetworkMode::None => Decision::Deny("sandbox has no egress"),
             NetworkMode::Allowlist => {
                 if name.is_empty() {
                     Decision::Deny("query names no host")
-                } else if policy.allow_domains.iter().any(|p| matches(p, name)) {
+                } else if policy.admits(name).is_allowed() {
                     Decision::Allow
                 } else {
                     Decision::Deny("name not in allowlist")
@@ -584,46 +684,24 @@ impl PolicyTable {
 mod tests {
     use super::*;
 
-    #[test]
-    fn exact_patterns_match_only_themselves() {
-        assert!(matches("pypi.org", "pypi.org"));
-        assert!(!matches("pypi.org", "evil-pypi.org"));
-        assert!(!matches("pypi.org", "sub.pypi.org"));
+    fn strings(items: &[&str]) -> Vec<String> {
+        items.iter().map(|item| item.to_string()).collect()
     }
 
-    #[test]
-    fn wildcard_matches_subdomains_but_not_the_apex() {
-        assert!(matches("*.pythonhosted.org", "files.pythonhosted.org"));
-        assert!(matches("*.pythonhosted.org", "a.b.pythonhosted.org"));
-        assert!(!matches("*.pythonhosted.org", "pythonhosted.org"));
-    }
-
-    #[test]
-    fn wildcard_does_not_match_a_lookalike_suffix() {
-        // The classic bypass: registering evilpythonhosted.org.
-        assert!(!matches("*.pythonhosted.org", "evilpythonhosted.org"));
-        assert!(!matches("*.pythonhosted.org", "pythonhosted.org.evil.com"));
-    }
-
-    #[test]
-    fn matching_ignores_case_and_trailing_dot() {
-        assert!(matches("PyPI.org", "pypi.org."));
-        assert!(matches("*.example.com", "WWW.Example.Com"));
+    /// A table holding `policy` for one sandbox, and that sandbox's address.
+    fn table_holding(policy: SandboxPolicy) -> (PolicyTable, IpAddr) {
+        let table = PolicyTable::default();
+        let ip = IpAddr::from([10, 99, 0, 6]);
+        table.replace(HashMap::from([(ip, policy)]));
+        (table, ip)
     }
 
     fn table_with(mode: NetworkMode, domains: &[&str]) -> (PolicyTable, IpAddr) {
-        let table = PolicyTable::default();
-        let ip = IpAddr::from([10, 99, 0, 6]);
-        table.replace(HashMap::from([(
-            ip,
-            SandboxPolicy {
-                sandbox_id: "sbx".into(),
-                mode,
-                allow_domains: domains.iter().map(|d| d.to_string()).collect(),
-                ..Default::default()
-            },
-        )]));
-        (table, ip)
+        table_holding(SandboxPolicy {
+            sandbox_id: "sbx".into(),
+            mode,
+            ..SandboxPolicy::allowing(domains)
+        })
     }
 
     /// A resolver that answers anything is egress: a sandbox with no network
@@ -632,30 +710,35 @@ mod tests {
     #[test]
     fn a_sandbox_without_egress_may_not_resolve_anything() {
         let (table, ip) = table_with(NetworkMode::None, &["pypi.org"]);
-        assert!(!table.may_resolve(ip, "pypi.org").1.allowed());
-        assert!(!table.may_resolve(ip, "secret.exfil.example").1.allowed());
+        assert!(!table.may_resolve(ip, "pypi.org").1.is_allowed());
+        assert!(!table.may_resolve(ip, "secret.exfil.example").1.is_allowed());
     }
 
     #[test]
     fn allowlist_mode_resolves_only_allowlisted_names() {
         let (table, ip) = table_with(NetworkMode::Allowlist, &["pypi.org", "*.pythonhosted.org"]);
-        assert!(table.may_resolve(ip, "pypi.org").1.allowed());
-        assert!(table.may_resolve(ip, "files.pythonhosted.org").1.allowed());
-        assert!(!table.may_resolve(ip, "evil.example").1.allowed());
+        assert!(table.may_resolve(ip, "pypi.org").1.is_allowed());
+        assert!(
+            table
+                .may_resolve(ip, "files.pythonhosted.org")
+                .1
+                .is_allowed()
+        );
+        assert!(!table.may_resolve(ip, "evil.example").1.is_allowed());
         // Exfiltration by subdomain of an allowed apex is not an allowed name.
-        assert!(!table.may_resolve(ip, "leak.pypi.org").1.allowed());
-        assert!(!table.may_resolve(ip, "").1.allowed());
+        assert!(!table.may_resolve(ip, "leak.pypi.org").1.is_allowed());
+        assert!(!table.may_resolve(ip, "").1.is_allowed());
     }
 
     #[test]
     fn open_mode_resolves_freely_and_an_unknown_source_does_not() {
         let (table, ip) = table_with(NetworkMode::Open, &[]);
-        assert!(table.may_resolve(ip, "anything.example").1.allowed());
+        assert!(table.may_resolve(ip, "anything.example").1.is_allowed());
         assert!(
             !table
                 .may_resolve(IpAddr::from([10, 99, 0, 7]), "anything.example")
                 .1
-                .allowed()
+                .is_allowed()
         );
     }
 
@@ -668,16 +751,16 @@ mod tests {
             deny_cidrs: vec!["10.0.0.0/8".into(), "169.254.169.254".into()],
             ..Default::default()
         };
-        assert!(policy.denies(IpAddr::from([10, 1, 2, 3])));
-        assert!(policy.denies(IpAddr::from([169, 254, 169, 254])));
-        assert!(!policy.denies(IpAddr::from([169, 254, 169, 253])));
-        assert!(!policy.denies(IpAddr::from([11, 0, 0, 1])));
+        assert!(policy.is_denied(IpAddr::from([10, 1, 2, 3])));
+        assert!(policy.is_denied(IpAddr::from([169, 254, 169, 254])));
+        assert!(!policy.is_denied(IpAddr::from([169, 254, 169, 253])));
+        assert!(!policy.is_denied(IpAddr::from([11, 0, 0, 1])));
 
         let everything = SandboxPolicy {
             deny_cidrs: vec!["0.0.0.0/0".into()],
             ..Default::default()
         };
-        assert!(everything.denies(IpAddr::from([93, 184, 216, 34])));
+        assert!(everything.is_denied(IpAddr::from([93, 184, 216, 34])));
     }
 
     /// The daemon validates these at the door, so a malformed entry means the
@@ -689,7 +772,7 @@ mod tests {
             deny_cidrs: vec!["10.0.0.0/33".into()],
             ..Default::default()
         };
-        assert!(policy.denies(IpAddr::from([93, 184, 216, 34])));
+        assert!(policy.is_denied(IpAddr::from([93, 184, 216, 34])));
     }
 
     fn set_headers(domain: &str, matcher: Option<RequestMatch>, name: &str) -> Rule {
@@ -745,17 +828,17 @@ mod tests {
     #[test]
     fn each_comparator_compares_what_it_says() {
         let exact = Match::compile(MatchOp::Exact, "/v1/users").unwrap();
-        assert!(exact.matches("/v1/users"));
-        assert!(!exact.matches("/v1/users/1"));
+        assert!(exact.is_match("/v1/users"));
+        assert!(!exact.is_match("/v1/users/1"));
 
         let prefix = Match::compile(MatchOp::StartsWith, "/v1/").unwrap();
-        assert!(prefix.matches("/v1/users"));
-        assert!(!prefix.matches("/v2/users"));
+        assert!(prefix.is_match("/v1/users"));
+        assert!(!prefix.is_match("/v2/users"));
 
         let pattern = Match::compile(MatchOp::Regex, r"^/v\d+/users$").unwrap();
-        assert!(pattern.matches("/v1/users"));
-        assert!(pattern.matches("/v22/users"));
-        assert!(!pattern.matches("/v1/users/1"));
+        assert!(pattern.is_match("/v1/users"));
+        assert!(pattern.is_match("/v22/users"));
+        assert!(!pattern.is_match("/v1/users/1"));
     }
 
     /// Vercel's rules, and the ones people get wrong in both directions: a path
@@ -779,20 +862,20 @@ mod tests {
             query: "",
             headers: &headers,
         };
-        assert!(matcher.matches(&hit));
+        assert!(matcher.is_match(&hit));
 
         let wrong_path = Request {
             path: "/v1/users",
             ..hit
         };
-        assert!(!matcher.matches(&wrong_path));
+        assert!(!matcher.is_match(&wrong_path));
 
         let wrong_value = [("X-Tenant".to_string(), "acme".to_string())];
         let wrong_value = Request {
             headers: &wrong_value,
             ..hit
         };
-        assert!(!matcher.matches(&wrong_value));
+        assert!(!matcher.is_match(&wrong_value));
     }
 
     #[test]
@@ -802,19 +885,19 @@ mod tests {
             ..Default::default()
         };
         let base = get("/", "");
-        assert!(matcher.matches(&Request {
+        assert!(matcher.is_match(&Request {
             method: "GET",
             ..base
         }));
-        assert!(matcher.matches(&Request {
+        assert!(matcher.is_match(&Request {
             method: "HEAD",
             ..base
         }));
-        assert!(!matcher.matches(&Request {
+        assert!(!matcher.is_match(&Request {
             method: "POST",
             ..base
         }));
-        assert!(!matcher.matches(&Request {
+        assert!(!matcher.is_match(&Request {
             method: "get",
             ..base
         }));
@@ -835,10 +918,10 @@ mod tests {
             ],
             ..Default::default()
         };
-        assert!(matcher.matches(&get("/", "kind=a&kind=b&page=20")));
-        assert!(!matcher.matches(&get("/", "kind=a&page=20")));
+        assert!(matcher.is_match(&get("/", "kind=a&kind=b&page=20")));
+        assert!(!matcher.is_match(&get("/", "kind=a&page=20")));
         // Missing entirely is not a match either.
-        assert!(!matcher.matches(&get("/", "kind=b")));
+        assert!(!matcher.is_match(&get("/", "kind=b")));
     }
 
     #[test]
@@ -850,10 +933,10 @@ mod tests {
             )],
             ..Default::default()
         };
-        assert!(matcher.matches(&get("/", "file=a%20b%26c")));
+        assert!(matcher.is_match(&get("/", "file=a%20b%26c")));
         // Splitting before decoding is what keeps an encoded separator inside
         // the value instead of ending it.
-        assert!(!matcher.matches(&get("/", "file=a%20b&c=")));
+        assert!(!matcher.is_match(&get("/", "file=a%20b&c=")));
     }
 
     #[test]
@@ -966,16 +1049,16 @@ mod tests {
                 secret: "s".into(),
             }),
         };
-        assert!(forwarding.diverts());
+        assert!(forwarding.is_diverted());
 
         let refusing = Rule {
             domain: "api.example.com".into(),
             matcher: None,
             action: Action::Refuse("unreadable".into()),
         };
-        assert!(refusing.diverts());
+        assert!(refusing.is_diverted());
 
-        assert!(!set_headers("api.example.com", None, "X-K").diverts());
+        assert!(!set_headers("api.example.com", None, "X-K").is_diverted());
     }
 
     #[test]
@@ -1019,8 +1102,103 @@ mod tests {
                 ..Default::default()
             },
         )]));
-        assert!(table.decide(ip, Some("pypi.org")).1.allowed());
-        assert!(table.decide(ip, Some("files.pythonhosted.org")).1.allowed());
-        assert!(!table.decide(ip, Some("example.com")).1.allowed());
+        assert!(table.decide(ip, Some("pypi.org")).1.is_allowed());
+        assert!(
+            table
+                .decide(ip, Some("files.pythonhosted.org"))
+                .1
+                .is_allowed()
+        );
+        assert!(!table.decide(ip, Some("example.com")).1.is_allowed());
+    }
+
+    fn http_rule(hosts: &[&str], methods: &[&str], paths: &[&str], deny: bool) -> HttpRule {
+        HttpRule {
+            hosts: strings(hosts),
+            methods: strings(methods),
+            paths: strings(paths),
+            is_denying: deny,
+        }
+    }
+
+    fn bounded_policy() -> SandboxPolicy {
+        SandboxPolicy {
+            mode: NetworkMode::Allowlist,
+            allow_domains: vec!["pypi.org".into()],
+            deny_domains: vec!["*.evil.example".into()],
+            http_rules: Arc::new(vec![
+                http_rule(&["api.github.com"], &["GET", "HEAD"], &["/repos/**"], false),
+                http_rule(&["*"], &["ANY"], &["/admin/**"], true),
+                http_rule(&["pypi.org"], &["DELETE"], &[], true),
+            ]),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn a_denied_domain_beats_every_allowance() {
+        let mut policy = bounded_policy();
+        policy.allow_domains.push("*.evil.example".into());
+        let (table, ip) = table_holding(policy);
+        assert!(!table.decide(ip, Some("c2.evil.example")).1.is_allowed());
+        assert!(!table.may_resolve(ip, "c2.evil.example").1.is_allowed());
+        assert!(table.decide(ip, Some("pypi.org")).1.is_allowed());
+
+        let mut open = bounded_policy();
+        open.mode = NetworkMode::Open;
+        table.replace(HashMap::from([(ip, open)]));
+        assert!(table.may_resolve(ip, "anything.example").1.is_allowed());
+        assert!(!table.may_resolve(ip, "c2.evil.example").1.is_allowed());
+    }
+
+    #[test]
+    fn a_bounded_host_is_admitted_and_resolved() {
+        let (table, ip) = table_holding(bounded_policy());
+        assert!(table.decide(ip, Some("api.github.com")).1.is_allowed());
+        assert!(table.may_resolve(ip, "api.github.com").1.is_allowed());
+        assert!(!table.decide(ip, Some("github.com")).1.is_allowed());
+        let policy = table.get(ip).unwrap();
+        assert!(policy.is_bounded("api.github.com"));
+        assert!(!policy.is_bounded("pypi.org"));
+    }
+
+    #[test]
+    fn requests_are_judged_by_rule_kind_and_host_grant() {
+        let policy = bounded_policy();
+        let cases = [
+            // Deny rules win whatever granted the host.
+            ("pypi.org", "GET", "/simple/", true),
+            ("pypi.org", "DELETE", "/simple/", false),
+            ("pypi.org", "GET", "/admin/users", false),
+            ("api.github.com", "GET", "/admin", false),
+            // A bounded host admits only what an allow rule claims.
+            ("api.github.com", "GET", "/repos/o/r", true),
+            ("api.github.com", "HEAD", "/repos", true),
+            ("api.github.com", "POST", "/repos/o/r", false),
+            ("api.github.com", "GET", "/user", false),
+            ("c2.evil.example", "GET", "/", false),
+        ];
+        for (host, method, path, admitted) in cases {
+            assert_eq!(
+                policy.check_request(host, method, path).is_ok(),
+                admitted,
+                "{method} {host}{path}"
+            );
+        }
+    }
+
+    #[test]
+    fn omitted_methods_and_paths_mean_every_one() {
+        let policy = SandboxPolicy {
+            http_rules: Arc::new(vec![
+                http_rule(&["a.example"], &[], &[], false),
+                http_rule(&["b.example"], &["ANY"], &["/x/*"], false),
+            ]),
+            ..Default::default()
+        };
+        let admitted = |host, method, path| policy.check_request(host, method, path).is_ok();
+        assert!(admitted("a.example", "PATCH", "/anything/at/all"));
+        assert!(admitted("b.example", "PUT", "/x/y"));
+        assert!(!admitted("b.example", "PUT", "/x/y/z"));
     }
 }

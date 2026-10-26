@@ -10,7 +10,12 @@ use hyper_util::rt::TokioIo;
 use tonic::transport::{Channel, Endpoint, Uri};
 use tower::service_fn;
 
+use burrow_proto::agent::v1 as agentpb;
 use burrow_proto::agent::v1::agent_client::AgentClient;
+use tokio_stream::StreamExt;
+use tonic::Status;
+
+use crate::sandbox::RunningSandbox;
 
 /// vsock port the agent listens on inside the guest.
 pub const AGENT_PORT: u32 = 1024;
@@ -128,7 +133,7 @@ pub fn handshake_full(
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_nanos() as i64)
             .unwrap_or(0),
-        restored,
+        is_restored: restored,
         network,
         volumes,
     }
@@ -146,4 +151,104 @@ fn fresh_entropy() -> Vec<u8> {
             Vec::new()
         }
     }
+}
+
+/// What a command run to completion left behind.
+pub struct Finished {
+    pub exit_code: i32,
+    /// stdout and stderr interleaved as they arrived.
+    pub output: Vec<u8>,
+}
+
+/// Runs a command in a sandbox and waits for it, as the node's own lifecycle
+/// work does for Kit hooks.
+pub async fn run_to_completion(
+    sandbox: &RunningSandbox,
+    start: agentpb::ExecStart,
+) -> Result<Finished, Status> {
+    let mut agent = sandbox.agent().await?;
+    let begin = agentpb::ExecInput {
+        input: Some(agentpb::exec_input::Input::Start(start)),
+    };
+    let mut stream = agent
+        .exec(tokio_stream::iter(vec![begin]))
+        .await?
+        .into_inner();
+    let mut finished = Finished {
+        exit_code: -1,
+        output: Vec::new(),
+    };
+    while let Some(msg) = stream.next().await {
+        match msg?.output {
+            Some(agentpb::exec_output::Output::Stdout(bytes))
+            | Some(agentpb::exec_output::Output::Stderr(bytes)) => finished.output.extend(bytes),
+            Some(agentpb::exec_output::Output::ExitCode(code)) => finished.exit_code = code,
+            _ => {}
+        }
+    }
+    Ok(finished)
+}
+
+/// Starts a command and returns once the agent has registered it, leaving it
+/// to run. The agent keeps a command alive after the stream that started it
+/// is gone, which is what makes a workload's entrypoint survive this call.
+pub async fn spawn_detached(
+    sandbox: &RunningSandbox,
+    start: agentpb::ExecStart,
+) -> Result<String, Status> {
+    let mut agent = sandbox.agent().await?;
+    let begin = agentpb::ExecInput {
+        input: Some(agentpb::exec_input::Input::Start(start)),
+    };
+    // The sender side stays open and parked, so the agent sees no stdin EOF
+    // and no hangup until this task is dropped along with the stream.
+    let (tx, rx) = tokio::sync::mpsc::channel::<agentpb::ExecInput>(1);
+    tx.send(begin)
+        .await
+        .map_err(|_| Status::internal("exec stream closed"))?;
+    let mut stream = agent
+        .exec(tokio_stream::wrappers::ReceiverStream::new(rx))
+        .await?
+        .into_inner();
+    let mut command_id = String::new();
+    while let Some(msg) = stream.next().await {
+        match msg?.output {
+            Some(agentpb::exec_output::Output::CommandId(id)) => {
+                command_id = id;
+                break;
+            }
+            Some(agentpb::exec_output::Output::ExitCode(code)) => {
+                return Err(Status::internal(format!(
+                    "command exited with status {code} before it was registered"
+                )));
+            }
+            _ => {}
+        }
+    }
+    tokio::spawn(async move {
+        let _keep = tx;
+        while let Some(Ok(_)) = stream.next().await {}
+    });
+    Ok(command_id)
+}
+
+/// Writes a small file into a sandbox.
+pub async fn upload(
+    sandbox: &RunningSandbox,
+    path: &str,
+    content: &[u8],
+    mode: u32,
+    owner: &str,
+    skip_existing: bool,
+) -> Result<(), Status> {
+    let mut agent = sandbox.agent().await?;
+    let first = agentpb::FileChunk {
+        path: path.to_string(),
+        mode,
+        data: content.to_vec(),
+        owner: owner.to_string(),
+        is_existing_skipped: skip_existing,
+    };
+    agent.upload_file(tokio_stream::iter(vec![first])).await?;
+    Ok(())
 }

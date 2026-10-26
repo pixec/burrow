@@ -88,7 +88,7 @@ pub struct Manifest {
     /// and passed over again on every later pass. Defaulted so manifests
     /// written before the field existed read as not evicted.
     #[serde(default)]
-    pub evicted: bool,
+    pub is_evicted: bool,
 }
 
 impl Manifest {
@@ -221,7 +221,7 @@ impl SnapshotStore {
                 secs => now + secs as i64,
             },
             expiration_secs,
-            evicted: false,
+            is_evicted: false,
         };
         write_manifest(&dir, &manifest).await?;
 
@@ -391,7 +391,7 @@ impl SnapshotStore {
             // so only a stale one is a crash rather than work in progress. A
             // published directory cannot be mid-write: the rename that names it
             // happens after its manifest is on disk.
-            if staging && !older_than(&entry.path(), STAGING_ORPHAN_AFTER).await {
+            if staging && !is_older_than(&entry.path(), STAGING_ORPHAN_AFTER).await {
                 continue;
             }
             if tokio::fs::remove_dir_all(entry.path()).await.is_ok() {
@@ -455,7 +455,7 @@ impl SnapshotStore {
             // A released snapshot is still listable and still restorable until
             // it expires; it has just stopped being retained.
             match self.manifest(&snapshot.id).await {
-                Ok(manifest) if manifest.evicted => continue,
+                Ok(manifest) if manifest.is_evicted => continue,
                 Ok(_) => live.push(snapshot),
                 Err(_) => continue,
             }
@@ -499,7 +499,7 @@ impl SnapshotStore {
     /// Marks a snapshot as no longer retained, leaving its files and its TTL.
     async fn release(&self, id: &str) -> Result<(), Status> {
         let mut manifest = self.manifest(id).await?;
-        manifest.evicted = true;
+        manifest.is_evicted = true;
         write_manifest(&self.dir(id), &manifest).await
     }
 }
@@ -508,7 +508,7 @@ impl SnapshotStore {
 ///
 /// Unreadable metadata reads as "recent", so a directory is never collected on
 /// the strength of a failed stat.
-async fn older_than(path: &Path, age: std::time::Duration) -> bool {
+async fn is_older_than(path: &Path, age: std::time::Duration) -> bool {
     let Ok(meta) = tokio::fs::metadata(path).await else {
         return false;
     };
@@ -650,7 +650,7 @@ mod tests {
             size_bytes: 12_345,
             expires_at: 0,
             expiration_secs: 0,
-            evicted: false,
+            is_evicted: false,
         }
     }
 
@@ -785,7 +785,7 @@ mod tests {
         assert_eq!(released, vec!["snap_ddd1".to_string()]);
         // Still on disk and still restorable, unlike an eviction.
         assert!(store.get("snap_ddd1").await.is_ok());
-        assert!(store.manifest("snap_ddd1").await.unwrap().evicted);
+        assert!(store.manifest("snap_ddd1").await.unwrap().is_evicted);
 
         // A second pass has nothing to do: the release is remembered.
         assert!(store.retain_newest("sbx_a", 2, true).await.is_empty());

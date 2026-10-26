@@ -21,6 +21,8 @@ use std::sync::{Arc, RwLock};
 
 use rustls::pki_types::{CertificateDer, PrivateKeyDer};
 
+use crate::policy::{Decision, SandboxPolicy};
+
 /// Filenames the authority is kept under, beside the node's other state.
 const CA_CERT: &str = "inspect-ca.pem";
 const CA_KEY: &str = "inspect-ca.key";
@@ -302,14 +304,11 @@ impl Authority {
 ///
 /// The one place that decision is made, so the plaintext relay and the
 /// inspected one cannot drift apart on what counts as allowed.
-pub fn host_allowed(allowed: &[String], host: &str) -> Result<(), &'static str> {
-    if !allowed
-        .iter()
-        .any(|pattern| crate::policy::matches(pattern, host))
-    {
-        return Err("request host is not in the allowlist");
+pub fn host_allowed(policy: &SandboxPolicy, host: &str) -> Result<(), &'static str> {
+    match policy.admits(host) {
+        Decision::Allow => Ok(()),
+        Decision::Deny(reason) => Err(reason),
     }
-    Ok(())
 }
 
 /// Checks the host a request asked for once TLS has been stripped.
@@ -317,8 +316,12 @@ pub fn host_allowed(allowed: &[String], host: &str) -> Result<(), &'static str> 
 /// This is the check that fronting fails: the outer name passed the allowlist
 /// and the address passed pinning, and now the inner request names somewhere
 /// else entirely.
-pub fn inner_host_allowed(sni: &str, inner: &str, allowed: &[String]) -> Result<(), &'static str> {
-    host_allowed(allowed, inner)?;
+pub fn inner_host_allowed(
+    sni: &str,
+    inner: &str,
+    policy: &SandboxPolicy,
+) -> Result<(), &'static str> {
+    host_allowed(policy, inner)?;
     // Even an allowlisted inner host is refused when it disagrees with the
     // name the connection was opened for: that is fronting between two
     // permitted names, and it defeats per-name reasoning about where a sandbox
@@ -427,7 +430,7 @@ mod tests {
     /// The case that motivates all of this.
     #[test]
     fn fronting_is_refused_even_between_two_allowed_names() {
-        let allowed = vec!["allowed.example".to_string(), "other.example".to_string()];
+        let allowed = SandboxPolicy::allowing(&["allowed.example", "other.example"]);
         assert!(inner_host_allowed("allowed.example", "allowed.example", &allowed).is_ok());
 
         // Outer name allowed, inner name allowed, but they disagree.
@@ -439,22 +442,22 @@ mod tests {
 
     #[test]
     fn an_inner_host_outside_the_allowlist_is_refused() {
-        let allowed = vec!["allowed.example".to_string()];
+        let allowed = SandboxPolicy::allowing(&["allowed.example"]);
         assert_eq!(
             inner_host_allowed("allowed.example", "evil.example", &allowed),
-            Err("request host is not in the allowlist")
+            Err("host not in allowlist")
         );
     }
 
     #[test]
     fn host_comparison_ignores_case() {
-        let allowed = vec!["allowed.example".to_string()];
+        let allowed = SandboxPolicy::allowing(&["allowed.example"]);
         assert!(inner_host_allowed("allowed.example", "ALLOWED.example", &allowed).is_ok());
     }
 
     #[test]
     fn a_wildcard_allowlist_still_pins_the_session_to_one_name() {
-        let allowed = vec!["*.example.com".to_string()];
+        let allowed = SandboxPolicy::allowing(&["*.example.com"]);
         assert!(inner_host_allowed("a.example.com", "a.example.com", &allowed).is_ok());
         // Both match the wildcard, but the session was opened for one of them.
         assert!(inner_host_allowed("a.example.com", "b.example.com", &allowed).is_err());

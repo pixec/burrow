@@ -204,7 +204,7 @@ impl BlobStore {
             hasher: Sha256::new(),
             written: 0,
             cap: MAX_BLOB_BYTES,
-            finished: false,
+            is_finished: false,
         })
     }
 }
@@ -231,7 +231,7 @@ pub struct BlobWriter {
     cap: u64,
     /// Set once the temporary has been renamed into place, so the drop guard
     /// does not remove a blob that was adopted.
-    finished: bool,
+    is_finished: bool,
 }
 
 impl BlobWriter {
@@ -266,7 +266,7 @@ impl BlobWriter {
         // Rename is atomic within a filesystem, so a concurrent reader sees
         // either no blob or a complete one.
         tokio::fs::rename(&self.temp, &self.dest).await?;
-        self.finished = true;
+        self.is_finished = true;
         Ok(self.expected.clone())
     }
 }
@@ -275,7 +275,7 @@ impl BlobWriter {
 /// pull leaves an `.incoming-*` file behind for every attempt.
 impl Drop for BlobWriter {
     fn drop(&mut self) {
-        if !self.finished {
+        if !self.is_finished {
             let _ = std::fs::remove_file(&self.temp);
         }
     }

@@ -38,8 +38,8 @@ test("tightening files says nothing about exec", async () => {
     "an exec section was invented, which would re-open exec",
   );
   assert.deepEqual(request.fs, {
-    allowUpload: false,
-    allowDownload: true,
+    isUploadAllowed: false,
+    isDownloadAllowed: true,
     pathScopes: ["/work"],
     maxUploadBytes: 0,
   });
@@ -49,7 +49,7 @@ test("denying exec says nothing about files", async () => {
   const { sandbox, sent } = recordingSandbox();
   await sandbox.updateAccessPolicy({ exec: { allowExec: false } });
 
-  assert.deepEqual(sent[0].request.exec, { allowExec: false });
+  assert.deepEqual(sent[0].request.exec, { isExecAllowed: false });
   assert.equal(sent[0].request.fs, undefined);
 });
 
@@ -61,11 +61,11 @@ test("both sections travel together when both are named", async () => {
   });
 
   const call = sent.find((c) => c.method === "UpdateAccessPolicy");
-  assert.deepEqual(call.request.exec, { allowExec: true });
-  assert.equal(call.request.fs.allowDownload, false);
+  assert.deepEqual(call.request.exec, { isExecAllowed: true });
+  assert.equal(call.request.fs.isDownloadAllowed, false);
   // A present section is replaced whole, so the fields not restated take
   // their permissive defaults rather than being carried over.
-  assert.equal(call.request.fs.allowUpload, true);
+  assert.equal(call.request.fs.isUploadAllowed, true);
 });
 
 test("update() without exec or fs sends no access call at all", async () => {

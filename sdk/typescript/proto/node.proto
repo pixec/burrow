@@ -26,6 +26,9 @@ service NodeService {
   rpc DeleteSandbox(NodeSandboxRef) returns (NodeDeleteResponse);
   rpc PauseSandbox(NodeSandboxRef) returns (burrow.common.v1.Sandbox);
   rpc ResumeSandbox(NodeSandboxRef) returns (burrow.common.v1.Sandbox);
+  rpc StopSandbox(NodeSandboxRef) returns (burrow.common.v1.Sandbox);
+  rpc StartSandbox(NodeSandboxRef) returns (burrow.common.v1.Sandbox);
+  rpc RecreateSandbox(NodeRecreateRequest) returns (burrow.common.v1.Sandbox);
   // Sessions are recorded by the node that started the VMs, so they are read
   // from it like any other per-sandbox fact.
   rpc ListSessions(NodeSandboxRef) returns (burrow.api.v1.ListSessionsResponse);
@@ -99,6 +102,21 @@ message NodeCreateRequest {
   // the machine shape come from the snapshot; a policy that disagrees with them
   // is refused.
   string snapshot = 7;
+  // Inputs for a Kit template. The node provisions any such template the way
+  // its recorded descriptors ask, with these or with none.
+  burrow.common.v1.KitSpec kit = 8;
+  // Secret values by service name for the credentials the composition
+  // declares. Held in the sandbox record as header-injection rules and
+  // redacted on every read, like any brokered header.
+  map<string, string> credentials = 9;
+}
+
+message NodeRecreateRequest {
+  string sandbox_id = 1;
+  // Template to boot the replacement disk from; empty keeps the current one.
+  string template = 2;
+  burrow.common.v1.KitSpec kit = 3;
+  map<string, string> credentials = 4;
 }
 
 message NodeCreateSnapshotRequest {
@@ -136,6 +154,10 @@ message TemplateManifest {
 
 message TemplateManifestRequest {
   string name = 1;
+  // Return only `image_config`, leaving the digests empty. Hashing a rootfs
+  // is seconds of work a caller that wants the recorded config has no use
+  // for.
+  bool is_config_only = 2;
 }
 
 message BlobRequest {
@@ -276,12 +298,12 @@ message SandboxStateReport {
   // so the record the orchestrator registered can say `running` for a sandbox
   // whose agent is still coming up, or never did. Nothing else would correct
   // it.
-  bool agent_unconfirmed = 6;
+  bool is_agent_unconfirmed = 6;
 }
 
 message HeartbeatResponse {
   // Node is unknown (e.g. orchestrator restarted); it must re-register.
-  bool reregister = 1;
+  bool is_reregistration_required = 1;
   // Every other node on the mesh. Delivered on each heartbeat so a node
   // converges on the current fleet without a separate watch.
   repeated MeshPeer peers = 2;

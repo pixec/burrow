@@ -108,7 +108,7 @@ pub fn install_inspection_ca(
     // live in, so a restored clone inherits the note and the files it
     // describes together, or neither. That makes the trust store the one piece
     // of handshake work a create does not have to repeat.
-    if installed_already(pem, extra) {
+    if is_installed_already(pem, extra) {
         tracing::debug!("the inspection ca is already installed; nothing to do");
         return Ok(timing);
     }
@@ -132,7 +132,7 @@ pub fn install_inspection_ca(
     // in that environment is the image's; it is checked again here because
     // this is the process that would do the writing.
     for bundle in extra {
-        if !usable_bundle_path(&bundle.path) {
+        if !is_usable_bundle_path(&bundle.path) {
             tracing::warn!(
                 path = bundle.path,
                 "refusing a trust bundle path that is not absolute and free of .."
@@ -141,7 +141,7 @@ pub fn install_inspection_ca(
         }
         targets.push((
             std::path::PathBuf::from(&bundle.path),
-            bundle.create_if_missing,
+            bundle.is_created_if_missing,
         ));
     }
 
@@ -204,11 +204,11 @@ static INSTALLED: std::sync::Mutex<Option<(String, Vec<BundleNote>)>> = std::syn
 fn install_identity(extra: &[burrow_proto::agent::v1::TrustBundle]) -> Vec<(String, bool)> {
     extra
         .iter()
-        .map(|bundle| (bundle.path.clone(), bundle.create_if_missing))
+        .map(|bundle| (bundle.path.clone(), bundle.is_created_if_missing))
         .collect()
 }
 
-fn installed_already(pem: &str, extra: &[burrow_proto::agent::v1::TrustBundle]) -> bool {
+fn is_installed_already(pem: &str, extra: &[burrow_proto::agent::v1::TrustBundle]) -> bool {
     INSTALLED
         .lock()
         .map(|seen| seen.as_ref() == Some(&(pem.to_string(), install_identity(extra))))
@@ -250,7 +250,7 @@ enum Bundle {
 /// The same rule the host applies, repeated because the guest is where the
 /// write happens: an image naming a relative path, or one walking out through
 /// `..`, gets nothing rather than a write somewhere it chose.
-fn usable_bundle_path(path: &str) -> bool {
+fn is_usable_bundle_path(path: &str) -> bool {
     !path.is_empty()
         && path.starts_with('/')
         && !path.contains('\0')
@@ -289,7 +289,7 @@ fn append_ca(path: &std::path::Path, pem: &str, create: bool, timing: &mut Trust
     // Read-modify-write rather than append, so a re-handshake after a
     // resume does not add the certificate a second time.
     let began = std::time::Instant::now();
-    let already = contains(&existing, pem.trim().as_bytes());
+    let already = is_carrying(&existing, pem.trim().as_bytes());
     timing.scan += began.elapsed();
     if already {
         return Bundle::Installed;
@@ -323,7 +323,7 @@ fn append_ca(path: &std::path::Path, pem: &str, create: bool, timing: &mut Trust
 }
 
 /// Whether `haystack` already carries `needle`.
-fn contains(haystack: &[u8], needle: &[u8]) -> bool {
+fn is_carrying(haystack: &[u8], needle: &[u8]) -> bool {
     !needle.is_empty()
         && haystack
             .windows(needle.len())
@@ -423,8 +423,8 @@ mod trust_bundle_tests {
         write_atomically(&bundle, &merged).unwrap();
 
         let after = std::fs::read(&bundle).unwrap();
-        assert!(contains(&after, b"-----EXISTING-----"));
-        assert!(contains(&after, b"-----NEW-----"));
+        assert!(is_carrying(&after, b"-----EXISTING-----"));
+        assert!(is_carrying(&after, b"-----NEW-----"));
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -460,31 +460,31 @@ mod trust_bundle_tests {
         fn bundle(path: &str) -> burrow_proto::agent::v1::TrustBundle {
             burrow_proto::agent::v1::TrustBundle {
                 path: path.into(),
-                create_if_missing: false,
+                is_created_if_missing: false,
             }
         }
         let extra = [bundle("/etc/ssl/one.pem")];
 
         // Nothing recorded yet, so there is nothing to skip.
-        assert!(!installed_already(PEM, &extra));
+        assert!(!is_installed_already(PEM, &extra));
 
         remember_installed(PEM, &extra);
-        assert!(installed_already(PEM, &extra));
+        assert!(is_installed_already(PEM, &extra));
 
         // A different certificate is a different job.
-        assert!(!installed_already(
+        assert!(!is_installed_already(
             "-----BEGIN CERTIFICATE-----\nother\n",
             &extra
         ));
         // So is the same certificate into a different set of bundles.
-        assert!(!installed_already(PEM, &[]));
-        assert!(!installed_already(PEM, &[bundle("/etc/ssl/two.pem")]));
+        assert!(!is_installed_already(PEM, &[]));
+        assert!(!is_installed_already(PEM, &[bundle("/etc/ssl/two.pem")]));
         // Down to the flag, which decides whether a missing bundle is created.
-        assert!(!installed_already(
+        assert!(!is_installed_already(
             PEM,
             &[burrow_proto::agent::v1::TrustBundle {
                 path: "/etc/ssl/one.pem".into(),
-                create_if_missing: true,
+                is_created_if_missing: true,
             }]
         ));
 
@@ -505,7 +505,10 @@ mod trust_bundle_tests {
         );
 
         let after = std::fs::read(&bundle).unwrap();
-        assert!(contains(&after, b"-----END CERTIFICATE-----\n-----BEGIN"));
+        assert!(is_carrying(
+            &after,
+            b"-----END CERTIFICATE-----\n-----BEGIN"
+        ));
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -521,7 +524,7 @@ mod trust_bundle_tests {
         );
 
         let after = std::fs::read(&bundle).unwrap();
-        assert!(!contains(&after, b"\n\n"));
+        assert!(!is_carrying(&after, b"\n\n"));
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -566,14 +569,14 @@ mod trust_bundle_tests {
 
     #[test]
     fn only_absolute_paths_free_of_parent_links_are_written() {
-        assert!(usable_bundle_path("/cacert.pem"));
-        assert!(usable_bundle_path("/etc/ssl/certs/ca-certificates.crt"));
-        assert!(!usable_bundle_path(""));
-        assert!(!usable_bundle_path("cacert.pem"));
-        assert!(!usable_bundle_path("./cacert.pem"));
-        assert!(!usable_bundle_path("/etc/../root/.ssh/authorized_keys"));
-        assert!(!usable_bundle_path("/etc/ssl/.."));
-        assert!(!usable_bundle_path("/etc/ssl/\0cert.pem"));
+        assert!(is_usable_bundle_path("/cacert.pem"));
+        assert!(is_usable_bundle_path("/etc/ssl/certs/ca-certificates.crt"));
+        assert!(!is_usable_bundle_path(""));
+        assert!(!is_usable_bundle_path("cacert.pem"));
+        assert!(!is_usable_bundle_path("./cacert.pem"));
+        assert!(!is_usable_bundle_path("/etc/../root/.ssh/authorized_keys"));
+        assert!(!is_usable_bundle_path("/etc/ssl/.."));
+        assert!(!is_usable_bundle_path("/etc/ssl/\0cert.pem"));
     }
 
     /// The bug this exists to prevent: Alpine's `/etc/ssl/cert.pem` is a
@@ -611,8 +614,8 @@ mod trust_bundle_tests {
             "the link is still a link"
         );
         let after = std::fs::read(&real).unwrap();
-        assert!(contains(&after, b"-----EXISTING-----"));
-        assert!(contains(&after, PEM.trim().as_bytes()));
+        assert!(is_carrying(&after, b"-----EXISTING-----"));
+        assert!(is_carrying(&after, PEM.trim().as_bytes()));
         let _ = std::fs::remove_dir_all(&dir);
     }
 

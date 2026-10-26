@@ -141,6 +141,14 @@ holds it, reader or writer. Stop them first.
 read-only; `:rw` is accepted and is the default. The long spellings
 `:read-only` and `:read-write` work too.
 
+`--mount tmpfs:/path` mounts a tmpfs instead of a volume: RAM-backed, empty on
+every boot, and shared with nobody, so it takes no claim and counts toward no
+device. `:size=512m` (or `2g`, or a bare number of MiB) caps it, and
+`:mode=1777` sets the permissions on its root, which is what a world-writable
+scratch directory wants. A volume mount takes `:mode=` too, applied only when
+the filesystem is still empty, so a volume that already has data keeps the
+permissions it has.
+
 Mount paths must be absolute, and:
 
 - They may not overlap. `/data` and `/data/cache` together are refused, because

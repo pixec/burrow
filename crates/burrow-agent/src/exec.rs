@@ -65,6 +65,9 @@ pub async fn run(mut inbound: Streaming<agentpb::ExecInput>) -> Result<OutputRx,
 
     let mut command = std::process::Command::new(&start.cmd[0]);
     command.args(&start.cmd[1..]);
+    if start.is_env_cleared {
+        command.env_clear();
+    }
     // The user's own environment first, so a caller's variables still win.
     if let Some(creds) = &credentials {
         command
@@ -89,7 +92,7 @@ pub async fn run(mut inbound: Streaming<agentpb::ExecInput>) -> Result<OutputRx,
         }
     }
 
-    if start.pty {
+    if start.is_pty {
         run_pty(command, &start, credentials, inbound)
     } else {
         run_pipes(command, &start, credentials, inbound)
@@ -272,11 +275,11 @@ async fn control_pipes(
                 }
             }
             // Dropping the pipe is what the child sees as EOF.
-            Some(Input::StdinEof(true)) => drop(stdin.take()),
+            Some(Input::IsStdinEof(true)) => drop(stdin.take()),
             Some(Input::Signal(sig)) => send_signal(pid, sig),
             // Resize is meaningless without a pty; ignore rather than failing
             // an otherwise healthy stream.
-            Some(Input::Resize(_)) | Some(Input::StdinEof(false)) => {}
+            Some(Input::Resize(_)) | Some(Input::IsStdinEof(false)) => {}
             Some(Input::Start(_)) => {
                 tracing::warn!("ignoring duplicate Start on an active Exec stream");
             }
@@ -300,7 +303,7 @@ async fn control_pty(mut inbound: Streaming<agentpb::ExecInput>, mut master: Asy
             Some(Input::Signal(sig)) => send_signal(pid, sig),
             // Closing the master would tear down the terminal; a pty client
             // signals EOF by sending the terminal's EOF character instead.
-            Some(Input::StdinEof(_)) => {}
+            Some(Input::IsStdinEof(_)) => {}
             Some(Input::Start(_)) => {
                 tracing::warn!("ignoring duplicate Start on an active Exec stream");
             }

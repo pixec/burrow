@@ -140,14 +140,14 @@ impl Message {
     }
 }
 
-pub fn looks_like_disco(pkt: &[u8]) -> bool {
+pub fn is_disco(pkt: &[u8]) -> bool {
     pkt.len() >= HEADER_LEN + NONCE_LEN && &pkt[..MAGIC.len()] == MAGIC
 }
 
 /// The disco public key a frame claims to come from. Only meaningful if
 /// the box later opens with that key.
 pub fn sender(pkt: &[u8]) -> Option<DiscoPublic> {
-    if !looks_like_disco(pkt) {
+    if !is_disco(pkt) {
         return None;
     }
     DiscoPublic::from_slice(&pkt[MAGIC.len()..HEADER_LEN])
@@ -163,7 +163,7 @@ pub fn seal(shared: &DiscoShared, sender: &DiscoPublic, msg: &Message) -> Vec<u8
     pkt
 }
 
-/// Opens a frame previously checked with [`looks_like_disco`].
+/// Opens a frame previously checked with [`is_disco`].
 pub fn open(shared: &DiscoShared, pkt: &[u8]) -> Option<Message> {
     let payload = shared.open(&pkt[HEADER_LEN..])?;
     Message::parse(&payload)
@@ -232,7 +232,7 @@ mod tests {
             endpoints: vec!["10.0.0.1:41641".parse().unwrap()],
         };
         let pkt = seal(&a.shared(&b.public()), &a.public(), &msg);
-        assert!(looks_like_disco(&pkt));
+        assert!(is_disco(&pkt));
         assert_eq!(sender(&pkt), Some(a.public()));
         assert_eq!(open(&b.shared(&a.public()), &pkt), Some(msg));
         assert_eq!(open(&c.shared(&a.public()), &pkt), None);

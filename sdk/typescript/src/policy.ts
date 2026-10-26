@@ -398,7 +398,7 @@ export function toNetworkPolicy(options: NetworkPolicyOptions = {}): any {
     allowCidrs: options.allowCidrs ?? [],
     allowPorts: options.allowPorts ?? [],
     denyCidrs: options.denyCidrs ?? [],
-    inspectTls: options.inspectTls ?? false,
+    isTlsInspected: options.inspectTls ?? false,
     // Rules first, then the injections: an injection carries no matcher, so it
     // claims every request to its domain and would shadow anything after it.
     rules: [
@@ -422,7 +422,7 @@ export function fromNetworkPolicy(raw: any): NetworkPolicy {
     allowCidrs: raw?.allowCidrs ?? [],
     allowPorts: (raw?.allowPorts ?? []).map(Number),
     denyCidrs: raw?.denyCidrs ?? [],
-    inspectTls: Boolean(raw?.inspectTls),
+    inspectTls: Boolean(raw?.isTlsInspected),
     rules,
     // The rules that are exactly what `injectHeaders` used to describe, so
     // code written before rules existed still reads what it wrote.
@@ -451,7 +451,7 @@ export function toResourcePolicy(options: ResourceOptions = {}): any {
     suspendedTtlSecs: options.suspendedTtlSecs ?? 0,
     snapshotExpirationSecs: options.snapshotExpirationSecs ?? 0,
     keepLastSnapshots: options.keepLastSnapshots ?? 0,
-    keepEvictedSnapshots: options.keepEvictedSnapshots ?? false,
+    isEvictedSnapshotKept: options.keepEvictedSnapshots ?? false,
   };
 }
 
@@ -465,7 +465,7 @@ export function fromResourcePolicy(raw: any): ResourcePolicy {
     suspendedTtlSecs: Number(raw?.suspendedTtlSecs ?? 0),
     snapshotExpirationSecs: Number(raw?.snapshotExpirationSecs ?? 0),
     keepLastSnapshots: Number(raw?.keepLastSnapshots ?? 0),
-    keepEvictedSnapshots: Boolean(raw?.keepEvictedSnapshots ?? false),
+    keepEvictedSnapshots: Boolean(raw?.isEvictedSnapshotKept ?? false),
   };
 }
 
@@ -485,8 +485,8 @@ export function toNetworks(
     return {
       network: membership.network,
       ingressPorts: membership.ingressPorts ?? [],
-      allowEgress: membership.allowEgress ?? true,
-      allowIngress: membership.allowIngress ?? true,
+      isEgressAllowed: membership.allowEgress ?? true,
+      isIngressAllowed: membership.allowIngress ?? true,
       alias: membership.alias ?? alias ?? "",
     };
   });
@@ -496,8 +496,8 @@ export function fromNetworks(raw: any): NetworkMembership[] {
   return (raw ?? []).map((entry: any) => ({
     network: entry.network ?? "",
     ingressPorts: (entry.ingressPorts ?? []).map(Number),
-    allowEgress: Boolean(entry.allowEgress),
-    allowIngress: Boolean(entry.allowIngress),
+    allowEgress: Boolean(entry.isEgressAllowed),
+    allowIngress: Boolean(entry.isIngressAllowed),
     alias: entry.alias ?? "",
   }));
 }
@@ -510,15 +510,15 @@ export function fromNetworks(raw: any): NetworkMembership[] {
  */
 export function toExecPolicy(options: ExecOptions | undefined): any {
   if (!options) return undefined;
-  return { allowExec: options.allowExec ?? true };
+  return { isExecAllowed: options.allowExec ?? true };
 }
 
 /** Builds the wire `FsPolicy`, or nothing at all. */
 export function toFsPolicy(options: FsOptions | undefined): any {
   if (!options) return undefined;
   return {
-    allowUpload: options.allowUpload ?? true,
-    allowDownload: options.allowDownload ?? true,
+    isUploadAllowed: options.allowUpload ?? true,
+    isDownloadAllowed: options.allowDownload ?? true,
     pathScopes: options.pathScopes ?? [],
     maxUploadBytes: options.maxUploadBytes ?? 0,
   };
@@ -526,14 +526,14 @@ export function toFsPolicy(options: FsOptions | undefined): any {
 
 export function fromExecPolicy(raw: any): ExecPolicy | undefined {
   if (!raw) return undefined;
-  return { allowExec: Boolean(raw.allowExec) };
+  return { allowExec: Boolean(raw.isExecAllowed) };
 }
 
 export function fromFsPolicy(raw: any): FsPolicy | undefined {
   if (!raw) return undefined;
   return {
-    allowUpload: Boolean(raw.allowUpload),
-    allowDownload: Boolean(raw.allowDownload),
+    allowUpload: Boolean(raw.isUploadAllowed),
+    allowDownload: Boolean(raw.isDownloadAllowed),
     pathScopes: raw.pathScopes ?? [],
     maxUploadBytes: Number(raw.maxUploadBytes ?? 0),
   };
@@ -545,7 +545,7 @@ export function toVolumeMounts(
   return (mounts ?? []).map((mount) => ({
     volume: mount.volume,
     path: mount.path,
-    readOnly: mount.readOnly ?? false,
+    isReadOnly: mount.readOnly ?? false,
   }));
 }
 
@@ -553,7 +553,7 @@ export function fromVolumeMounts(raw: any): import("./types.js").VolumeMount[] {
   return (raw ?? []).map((mount: any) => ({
     volume: String(mount?.volume ?? ""),
     path: String(mount?.path ?? ""),
-    readOnly: Boolean(mount?.readOnly),
+    readOnly: Boolean(mount?.isReadOnly),
   }));
 }
 

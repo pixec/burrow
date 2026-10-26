@@ -65,7 +65,7 @@ pub enum Ports {
 }
 
 impl Ports {
-    pub fn contains(&self, port: u16) -> bool {
+    pub fn is_included(&self, port: u16) -> bool {
         match self {
             Ports::All => true,
             Ports::Ranges(ranges) => ranges.iter().any(|r| r.contains(&port)),
@@ -85,8 +85,8 @@ pub struct Policy {
     /// `None` means no UDP is served at all.
     pub udp_ports: Option<Ports>,
     /// Also admit TCP aimed past us, which is what makes an exit node.
-    pub forward_tcp: bool,
-    pub forward_udp: bool,
+    pub is_tcp_forwarded: bool,
+    pub is_udp_forwarded: bool,
     pub udp_idle_timeout: Duration,
 }
 
@@ -181,7 +181,7 @@ struct Inner {
     closing: Vec<SocketHandle>,
     udp_sockets: HashMap<(Ipv6Addr, u16), SocketHandle>,
     flows: HashMap<FlowKey, Flow>,
-    closed: bool,
+    is_closed: bool,
 }
 
 fn endpoint_v6(ep: IpEndpoint) -> SocketAddrV6 {
@@ -206,9 +206,9 @@ impl Inner {
                 }
                 let port = u16::from_be_bytes([payload[2], payload[3]]);
                 let admitted = if to_self {
-                    self.policy.tcp_ports.contains(port)
+                    self.policy.tcp_ports.is_included(port)
                 } else {
-                    self.policy.forward_tcp
+                    self.policy.is_tcp_forwarded
                 };
                 if !admitted {
                     return false;
@@ -228,9 +228,9 @@ impl Inner {
                     self.policy
                         .udp_ports
                         .as_ref()
-                        .is_some_and(|p| p.contains(port))
+                        .is_some_and(|p| p.is_included(port))
                 } else {
-                    self.policy.forward_udp
+                    self.policy.is_udp_forwarded
                 };
                 if !admitted {
                     return false;
@@ -422,7 +422,7 @@ impl Netstack {
                 .push(IpCidr::new(IpAddress::Ipv6(policy.self_addr), 128))
                 .expect("one address fits");
         });
-        iface.set_any_ip(policy.forward_tcp || policy.forward_udp);
+        iface.set_any_ip(policy.is_tcp_forwarded || policy.is_udp_forwarded);
 
         let inner = Arc::new(Mutex::new(Inner {
             iface,
@@ -433,7 +433,7 @@ impl Netstack {
             closing: Vec::new(),
             udp_sockets: HashMap::new(),
             flows: HashMap::new(),
-            closed: false,
+            is_closed: false,
         }));
         let wake = Arc::new(Notify::new());
         let (egress_tx, egress_rx) = mpsc::channel(EGRESS_QUEUE);
@@ -463,7 +463,7 @@ impl Netstack {
     /// Feeds one decrypted IPv6 packet from a peer into the stack.
     pub fn inject(&self, pkt: Vec<u8>) {
         let mut inner = self.lock();
-        if inner.closed || !inner.admit(&pkt) {
+        if inner.is_closed || !inner.admit(&pkt) {
             return;
         }
         inner.device.rx.push_back(pkt);
@@ -473,7 +473,7 @@ impl Netstack {
 
     pub fn close(&self) {
         let mut inner = self.lock();
-        inner.closed = true;
+        inner.is_closed = true;
         inner.abort_all();
         for flow in inner.flows.values() {
             flow.shared.closed.store(true, Ordering::Relaxed);
@@ -494,7 +494,7 @@ impl Netstack {
         loop {
             let (out, accepted, new_flows, delay) = {
                 let mut inner = self.lock();
-                if inner.closed {
+                if inner.is_closed {
                     return;
                 }
                 inner.poll(Instant::now())
@@ -649,7 +649,7 @@ impl AsyncWrite for TcpConn {
 impl Drop for TcpConn {
     fn drop(&mut self) {
         let mut inner = self.inner.lock().unwrap();
-        if inner.closed {
+        if inner.is_closed {
             return;
         }
         inner.sockets.get_mut::<tcp::Socket>(self.handle).close();
@@ -758,8 +758,8 @@ mod tests {
             self_addr: SELF,
             tcp_ports,
             udp_ports,
-            forward_tcp: false,
-            forward_udp: false,
+            is_tcp_forwarded: false,
+            is_udp_forwarded: false,
             udp_idle_timeout: Duration::from_secs(60),
         }
     }

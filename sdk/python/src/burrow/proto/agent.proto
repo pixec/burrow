@@ -104,7 +104,7 @@ message CommandInfo {
 
 message WatchRequest {
   string path = 1;
-  bool recursive = 2;
+  bool is_recursive = 2;
   // Poll interval; 0 selects the agent's default.
   uint32 interval_ms = 3;
 }
@@ -122,6 +122,11 @@ message FileChunk {
   // Unix mode for a created file; 0 means 0644.
   uint32 mode = 2;
   bytes data = 3;
+  // User to own the file and its created parents. Empty leaves them root's.
+  string owner = 4;
+  // Leave an existing file as it is instead of truncating it. The upload then
+  // reports zero bytes written.
+  bool is_existing_skipped = 5;
 }
 
 message UploadResult {
@@ -155,7 +160,7 @@ message ExecInput {
     // Signal number to deliver to the process group.
     int32 signal = 4;
     // Close the child's stdin (EOF).
-    bool stdin_eof = 5;
+    bool is_stdin_eof = 5;
   }
 }
 
@@ -163,12 +168,15 @@ message ExecStart {
   repeated string cmd = 1;
   map<string, string> env = 2;
   string cwd = 3;
-  bool pty = 4;
+  bool is_pty = 4;
   uint32 rows = 5;
   uint32 cols = 6;
   // User to run as. Empty is root, which is what every command was before
   // this field existed. HOME, USER, LOGNAME and the default cwd follow it.
   string user = 7;
+  // Start from an empty environment instead of the agent's own, so the
+  // command sees `env` plus the per-user variables and nothing else.
+  bool is_env_cleared = 8;
 }
 
 message ExecResize {
@@ -193,7 +201,7 @@ message HandshakeRequest {
   // Host wall-clock, unix nanos, for post-restore clock fixup.
   int64 host_time_unix_nanos = 2;
   // True when this boot is a snapshot restore, not a cold boot.
-  bool restored = 3;
+  bool is_restored = 3;
   // Address this sandbox should use. A clone restored from a shared warm
   // snapshot wakes up holding the address that was baked into it, which
   // belongs to no one; the host is the only party that knows the right one.
@@ -216,9 +224,15 @@ message HandshakeRequest {
 // it was snapshotted with.
 message VolumeMount {
   // Guest device the host attached this volume as, e.g. /dev/vdc.
+  // Empty for a tmpfs mount.
   string device = 1;
   string path = 2;
-  bool read_only = 3;
+  bool is_read_only = 3;
+  bool is_tmpfs = 4;
+  uint64 size_mib = 5;
+  // Octal permissions for a freshly created mount root; empty keeps the
+  // filesystem's default.
+  string mode = 6;
 }
 
 // A trust store outside the system paths that the CA also has to reach.
@@ -228,7 +242,7 @@ message TrustBundle {
   // True only for a file of *additional* CAs, where nothing existing yet means
   // no extra CAs yet. A full bundle that is absent is a broken image
   // reference, and inventing one would leave every other root out of it.
-  bool create_if_missing = 2;
+  bool is_created_if_missing = 2;
 }
 
 message NetworkConfig {

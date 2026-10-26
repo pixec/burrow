@@ -66,7 +66,7 @@ export class Terminal {
         cmd,
         env: options.env ?? {},
         cwd: options.cwd ?? "",
-        pty: true,
+        isPty: true,
         rows: options.rows ?? 24,
         cols: options.cols ?? 80,
       },
