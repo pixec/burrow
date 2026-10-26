@@ -19,6 +19,7 @@ tailcat-rs = { workspace = true }
 burrow-kit = { workspace = true }
 tokio = { workspace = true }
 tokio-stream = { workspace = true }
+tokio-util = { workspace = true }
 tonic = { workspace = true }
 prost = { workspace = true }
 tower = { workspace = true }
@@ -29,6 +30,9 @@ anyhow = { workspace = true }
 serde_json = { workspace = true }
 tracing = { workspace = true }
 sha2 = { workspace = true }
+hmac = { workspace = true }
+hex = { workspace = true }
+bytes = { workspace = true }
 base64 = { workspace = true }
 ruzstd = { workspace = true }
 reqwest = { workspace = true }

@@ -292,6 +292,15 @@ impl NodeService for NodeApi {
         Ok(Response::new(api::DeleteSnapshotResponse {}))
     }
 
+    async fn list_durable_snapshots(
+        &self,
+        _req: Request<nodepb::NodeListSnapshotsRequest>,
+    ) -> Result<Response<api::ListSnapshotsResponse>, Status> {
+        Ok(Response::new(api::ListSnapshotsResponse {
+            snapshots: self.sandboxes.snapshots().list_remote().await?,
+        }))
+    }
+
     async fn create_volume(
         &self,
         req: Request<api::CreateVolumeRequest>,

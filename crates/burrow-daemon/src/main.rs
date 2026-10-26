@@ -4,6 +4,7 @@ mod devvm;
 mod edge;
 mod kit;
 mod nodeapi;
+mod objstore;
 mod oci;
 mod sandbox;
 mod sandboxproxy;

@@ -8,6 +8,11 @@
 //! In memory only, deliberately: a snapshot is a directory a node can list, and
 //! every node lists its snapshots when it registers. The node is the authority,
 //! so a restart re-learns rather than remembers.
+//!
+//! A durable snapshot, one copied to the object store, is the exception to
+//! "only where it was taken": it survives its node here with an empty
+//! `node_id`, and nodes list what the store holds on registration so a
+//! restarted orchestrator re-learns those too.
 
 use std::collections::HashMap;
 use std::sync::Mutex;
@@ -32,6 +37,25 @@ impl SnapshotRegistry {
 
     pub fn get(&self, id: &str) -> Option<common::Snapshot> {
         self.snapshots.lock().unwrap().get(id).cloned()
+    }
+
+    /// Records snapshots a node found in the object store, without a holder.
+    ///
+    /// A snapshot a node already lists keeps its node: the local copy is the
+    /// one a create should use.
+    pub fn adopt_remote(&self, reported: Vec<common::Snapshot>) -> usize {
+        let mut snapshots = self.snapshots.lock().unwrap();
+        let mut adopted = 0;
+        for mut snapshot in reported {
+            if snapshots.contains_key(&snapshot.id) {
+                continue;
+            }
+            snapshot.node_id = String::new();
+            snapshot.is_durable = true;
+            snapshots.insert(snapshot.id.clone(), snapshot);
+            adopted += 1;
+        }
+        adopted
     }
 
     pub fn remove(&self, id: &str) -> Option<common::Snapshot> {
@@ -59,7 +83,7 @@ impl SnapshotRegistry {
     /// that an orchestrator restart rebuilds from the fleet.
     pub fn reconcile_node(&self, node_id: &str, reported: Vec<common::Snapshot>) -> usize {
         let mut snapshots = self.snapshots.lock().unwrap();
-        snapshots.retain(|_, snapshot| snapshot.node_id != node_id);
+        release_node(&mut snapshots, node_id, |_| false);
         for mut snapshot in reported {
             snapshot.node_id = node_id.to_string();
             snapshots.insert(snapshot.id.clone(), snapshot);
@@ -78,24 +102,56 @@ impl SnapshotRegistry {
     ///
     /// An empty report is not read as an empty node: one that has just started
     /// may not have scanned its store yet.
-    pub fn apply_report(&self, node_id: &str, reported: &[String]) -> usize {
+    pub fn apply_report(&self, node_id: &str, reported: &[String], durable: &[String]) -> usize {
+        let mut snapshots = self.snapshots.lock().unwrap();
+        for id in durable {
+            if let Some(snapshot) = snapshots.get_mut(id) {
+                snapshot.is_durable = true;
+            }
+        }
         if reported.is_empty() {
             return 0;
         }
+        // A durable snapshot this node fetched has a holder again. One whose
+        // holder is another node keeps it: that node may well still be up.
+        for id in reported {
+            if let Some(snapshot) = snapshots.get_mut(id)
+                && snapshot.node_id.is_empty()
+            {
+                snapshot.node_id = node_id.to_string();
+            }
+        }
         let held: std::collections::HashSet<&str> = reported.iter().map(String::as_str).collect();
-        let mut snapshots = self.snapshots.lock().unwrap();
-        let before = snapshots.len();
-        snapshots.retain(|id, snapshot| snapshot.node_id != node_id || held.contains(id.as_str()));
-        before - snapshots.len()
+        release_node(&mut snapshots, node_id, |id| held.contains(id))
     }
 
     /// Drops every snapshot recorded against a node written off entirely.
+    /// Durable ones stay, with no holder, since the store still has them.
     pub fn forget_node(&self, node_id: &str) {
-        self.snapshots
-            .lock()
-            .unwrap()
-            .retain(|_, snapshot| snapshot.node_id != node_id);
+        release_node(&mut self.snapshots.lock().unwrap(), node_id, |_| false);
     }
+}
+
+/// Detaches a node's snapshots other than those `is_kept`: a durable one loses
+/// its holder, anything else is forgotten. Returns how many were detached.
+fn release_node(
+    snapshots: &mut HashMap<String, common::Snapshot>,
+    node_id: &str,
+    is_kept: impl Fn(&str) -> bool,
+) -> usize {
+    let mut released = 0;
+    snapshots.retain(|id, snapshot| {
+        if snapshot.node_id != node_id || is_kept(id) {
+            return true;
+        }
+        released += 1;
+        if snapshot.is_durable {
+            snapshot.node_id = String::new();
+            return true;
+        }
+        false
+    });
+    released
 }
 
 #[cfg(test)]
@@ -110,6 +166,53 @@ mod tests {
             created_at: created_at.into(),
             ..Default::default()
         }
+    }
+
+    #[test]
+    fn a_durable_snapshot_outlives_its_node() {
+        let registry = SnapshotRegistry::default();
+        registry.insert(
+            "node1",
+            snapshot("snap_local", "sbx_a", "2026-09-01T00:00:00Z"),
+        );
+        registry.insert(
+            "node1",
+            snapshot("snap_durable", "sbx_a", "2026-09-01T00:00:01Z"),
+        );
+        registry.apply_report(
+            "node1",
+            &["snap_local".to_string(), "snap_durable".to_string()],
+            &["snap_durable".to_string()],
+        );
+        assert!(registry.get("snap_durable").unwrap().is_durable);
+
+        registry.forget_node("node1");
+        assert!(registry.get("snap_local").is_none());
+        let kept = registry.get("snap_durable").unwrap();
+        assert!(kept.is_durable);
+        assert_eq!(kept.node_id, "");
+
+        // A node that fetched it becomes its holder again, on its next beat.
+        registry.apply_report("node2", &["snap_durable".to_string()], &[]);
+        assert_eq!(registry.get("snap_durable").unwrap().node_id, "node2");
+    }
+
+    #[test]
+    fn the_object_store_listing_fills_gaps_without_taking_holders() {
+        let registry = SnapshotRegistry::default();
+        registry.insert(
+            "node1",
+            snapshot("snap_held", "sbx_a", "2026-09-01T00:00:00Z"),
+        );
+        let adopted = registry.adopt_remote(vec![
+            snapshot("snap_held", "sbx_a", "2026-09-01T00:00:00Z"),
+            snapshot("snap_orphan", "sbx_b", "2026-09-01T00:00:00Z"),
+        ]);
+        assert_eq!(adopted, 1);
+        assert_eq!(registry.get("snap_held").unwrap().node_id, "node1");
+        let orphan = registry.get("snap_orphan").unwrap();
+        assert!(orphan.is_durable);
+        assert_eq!(orphan.node_id, "");
     }
 
     #[test]
@@ -152,7 +255,7 @@ mod tests {
         );
 
         assert_eq!(
-            registry.apply_report("node1", &["snap_kept".to_string()]),
+            registry.apply_report("node1", &["snap_kept".to_string()], &[]),
             1
         );
         assert!(registry.get("snap_gone").is_none());
@@ -164,7 +267,7 @@ mod tests {
 
         // A node that has not scanned its store yet reports nothing, which is
         // not the same claim as holding nothing.
-        assert_eq!(registry.apply_report("node1", &[]), 0);
+        assert_eq!(registry.apply_report("node1", &[], &[]), 0);
         assert!(registry.get("snap_kept").is_some());
     }
 

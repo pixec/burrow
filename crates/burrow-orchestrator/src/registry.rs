@@ -35,12 +35,26 @@ pub struct Placement {
     /// sandbox asked for on dedicated hardware and placed elsewhere is worse
     /// than one that was refused.
     pub node_labels: HashMap<String, String>,
+    /// What the node must be able to restore, when the sandbox starts from
+    /// state written elsewhere. Empty means anything. Hard, because a
+    /// snapshot restored under another Firecracker or on another architecture
+    /// does not fail cleanly; it boots a guest whose memory lies about the
+    /// machine.
+    pub arch: String,
+    pub firecracker_version: String,
 }
 
 #[derive(Debug, thiserror::Error)]
 pub enum PlacementError {
     #[error("no healthy node available")]
     NoHealthyNode,
+    #[error(
+        "no node can restore this snapshot: it needs {arch} and Firecracker {firecracker_version}"
+    )]
+    NoCompatibleNode {
+        arch: String,
+        firecracker_version: String,
+    },
     #[error("no node has room for {vcpus} vcpu / {mem_mib} MiB")]
     NoCapacity { vcpus: u32, mem_mib: u64 },
     #[error(
@@ -439,6 +453,23 @@ impl NodeRegistry {
             )));
         }
         let live = labelled_live;
+
+        let compatible: Vec<_> = live
+            .iter()
+            .copied()
+            .filter(|e| {
+                (want.arch.is_empty() || e.info.arch == want.arch)
+                    && (want.firecracker_version.is_empty()
+                        || e.info.firecracker_version == want.firecracker_version)
+            })
+            .collect();
+        if compatible.is_empty() {
+            return Err(PlacementError::NoCompatibleNode {
+                arch: want.arch.clone(),
+                firecracker_version: want.firecracker_version.clone(),
+            });
+        }
+        let live = compatible;
 
         let with_template: Vec<_> = live
             .iter()
@@ -889,6 +920,40 @@ mod tests {
         registry.heartbeat("keyless", status(&[], &[], 1), None);
         assert!(registry.mesh_peers("other").is_empty());
         assert!(!registry.is_mesh_available("other"));
+    }
+
+    /// A snapshot fetched from the object store only restores under the
+    /// Firecracker and architecture that wrote it, so placement of one is
+    /// limited to nodes that match, whatever their capacity.
+    #[test]
+    fn a_snapshot_is_placed_only_on_a_node_that_can_restore_it() {
+        let registry = registry(&[("a", status(&[], &[], 9999)), ("b", status(&[], &[], 1))]);
+        for (id, version) in [("a", "v1.15.0"), ("b", "v1.16.1")] {
+            registry.heartbeat(
+                id,
+                status(&[], &[], if id == "a" { 9999 } else { 1 }),
+                Some(NodeInfo {
+                    id: id.into(),
+                    address: format!("{id}:7071"),
+                    arch: "aarch64".into(),
+                    firecracker_version: version.into(),
+                    ..Default::default()
+                }),
+            );
+        }
+        let want = Placement {
+            arch: "aarch64".into(),
+            firecracker_version: "v1.16.1".into(),
+            vcpus: 1,
+            mem_mib: 1,
+            ..Default::default()
+        };
+        assert_eq!(registry.place_for(&want).unwrap(), "b");
+        let none = registry.place_for(&Placement {
+            firecracker_version: "v2.0.0".into(),
+            ..want
+        });
+        assert!(matches!(none, Err(PlacementError::NoCompatibleNode { .. })));
     }
 
     #[test]

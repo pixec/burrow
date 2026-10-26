@@ -78,6 +78,12 @@ pub struct NodeConfig {
     pub control_plane: Vec<std::net::IpAddr>,
     /// Whether and through which relay sandboxes here can be shared.
     pub share: crate::share::ShareOptions,
+    /// Where snapshots are copied so they outlive this node. `None` keeps
+    /// them node-local.
+    pub object_store: Option<crate::objstore::ObjectStore>,
+    /// What `firecracker_bin` reports, recorded on every snapshot: guest state
+    /// only restores under the Firecracker that wrote it.
+    pub firecracker_version: String,
 }
 
 impl NodeConfig {
@@ -104,6 +110,16 @@ impl NodeConfig {
 /// accumulate one per suspend. Past this a full snapshot is taken instead,
 /// which costs one slow pause and resets the chain.
 const MAX_MEMORY_CHAIN: usize = 4;
+
+/// Longest chain a restored sandbox is left with.
+///
+/// A fork copies its source's chain whole, so a fork of a fork restores
+/// through three layers and every page fault consults each of them. Past this
+/// the child's chain is flattened behind the create, which is sequential file
+/// work the running guest never notices, rather than on the fork's critical
+/// path. Lower than [`MAX_MEMORY_CHAIN`] because a fork's chain only grows from
+/// here, and a flatten now is cheaper than one under a later suspend.
+const MAX_RESTORED_CHAIN: usize = 2;
 
 /// Rebuilds a sandbox's memory chain from the files in its working directory.
 ///
@@ -1091,15 +1107,21 @@ impl RunningSandbox {
         .await
         .map_err(|err| io(burrow_vmm::SNAPSHOT_FILE, err))?;
 
-        // Copies, not links: the child diverges from here, and a shared inode
-        // would have one sandbox's writes appear inside the other.
-        // `copy_sparse` reflinks where the filesystem supports it, which makes
-        // this metadata-only rather than a full duplication of the guest.
-        for file in std::iter::once(SCRATCH_IMAGE.to_string()).chain(chain.iter().cloned()) {
-            crate::warm::copy_sparse(&self.workdir.join(&file), &dest.join(&file))
+        // The chain is linked, not copied. A layer is never written again
+        // once it exists: a suspend writes a new diff, and a flatten renames
+        // a merged base into place and unlinks the old names, so the child's
+        // links keep serving the bytes the source had at the fork. The base
+        // is already a link to the template's warm image for the same reason.
+        for file in &chain {
+            tokio::fs::hard_link(self.workdir.join(file), dest.join(file))
                 .await
-                .map_err(|err| io(&file, err))?;
+                .map_err(|err| io(file, err))?;
         }
+        // The one file both sides write: a copy, reflinked where the
+        // filesystem supports it, which makes it metadata-only.
+        crate::warm::copy_sparse(&self.workdir.join(SCRATCH_IMAGE), &dest.join(SCRATCH_IMAGE))
+            .await
+            .map_err(|err| io(SCRATCH_IMAGE, err))?;
         Ok(chain)
     }
 
@@ -1389,7 +1411,11 @@ impl SandboxManager {
             inspection_ca: Arc::new(std::sync::Mutex::new(None)),
             warm_shapes: Arc::new(std::sync::Mutex::new(HashMap::new())),
             firewall: Arc::new(tokio::sync::Mutex::new(())),
-            snapshots: Arc::new(crate::snapshot::SnapshotStore::new(&config.data_dir)),
+            snapshots: Arc::new(crate::snapshot::SnapshotStore::new(
+                &config.data_dir,
+                config.object_store.clone(),
+                config.firecracker_version.clone(),
+            )),
             volumes: Arc::new(crate::volume::VolumeStore::new(&config.data_dir)),
             shares: Arc::new(crate::share::Shares::new(
                 config.share.clone(),
@@ -3763,7 +3789,7 @@ impl SandboxManager {
         node_id: String,
         name: String,
     ) -> Result<common::Sandbox, Status> {
-        let manifest = self.snapshots.manifest(snapshot_id).await?;
+        let manifest = self.snapshots.manifest_for_restore(snapshot_id).await?;
         let mut policy = policy;
         let wanted = policy.resources.unwrap_or_default();
         let shape = (
@@ -3830,6 +3856,7 @@ impl SandboxManager {
         self.sync_firewall().await?;
         // The snapshot has just proved itself worth keeping.
         self.snapshots.touch(snapshot_id).await;
+        self.compact_if_deep(&sandbox);
         tracing::info!("sandbox created from a snapshot");
         Ok(record)
     }
@@ -3881,6 +3908,7 @@ impl SandboxManager {
         // The child has its own address and its own policy, neither of which
         // the ruleset knows about until now.
         self.sync_firewall().await?;
+        self.compact_if_deep(&sandbox);
         tracing::info!(source = source_id, sandbox = child_id, "sandbox forked");
         Ok(record)
     }
@@ -3973,6 +4001,35 @@ impl SandboxManager {
     /// is the same restore, the same re-addressing handshake and the same
     /// record.
     ///
+    /// Links the template's prefetch plan into a restore's working directory,
+    /// returning whether there is one to use. A plan is an optimisation, so a
+    /// missing or unlinkable one costs faults rather than the restore.
+    async fn link_prefetch_plan(&self, template: &str, workdir: &Path) -> bool {
+        let dest = workdir.join(crate::warm::PREFETCH_PLAN);
+        if tokio::fs::try_exists(&dest).await.unwrap_or(false) {
+            return true;
+        }
+        let plan = self
+            .config
+            .templates_dir()
+            .join(template)
+            .join("warm")
+            .join(crate::warm::PREFETCH_PLAN);
+        tokio::fs::hard_link(&plan, &dest).await.is_ok()
+            || tokio::fs::copy(&plan, &dest).await.is_ok()
+    }
+
+    /// Flattens a restored sandbox's chain behind the create when it is deep.
+    fn compact_if_deep(&self, sandbox: &Arc<RunningSandbox>) {
+        let sandbox = Arc::clone(sandbox);
+        tokio::spawn(async move {
+            let depth = sandbox.memory_chain.lock().await.len();
+            if depth > MAX_RESTORED_CHAIN {
+                sandbox.compact_memory_chain().await;
+            }
+        });
+    }
+
     async fn provision_restored(
         &self,
         source: RestoreSource<'_>,
@@ -4048,6 +4105,13 @@ impl SandboxManager {
                 // left alone, for the reason [`grant_to_jail`] spells out.
                 let mut shared: std::collections::HashSet<String> =
                     [TEMPLATE_KERNEL.to_string(), TEMPLATE_ROOTFS.to_string()].into();
+                // A fork links its source's memory chain rather than copying
+                // it, and those inodes are the source's, already readable by
+                // the jail's uid; a snapshot restore copies its chain and
+                // the copies are this sandbox's to own.
+                if matches!(source, RestoreSource::Sandbox(_)) {
+                    shared.extend(chain.iter().cloned());
+                }
                 for (index, mount) in crate::volume::block_mounts(&policy.volumes) {
                     if mount.is_read_only {
                         shared.insert(crate::sandbox::volume_image(index));
@@ -4082,6 +4146,15 @@ impl SandboxManager {
         // hotplugged below instead, before the handshake that tells the guest
         // to rescan for them.
         let mut spec = self.build_spec(&id, &workdir, &resources, &lease, &tap_name, &[]);
+        // The template's plan names the pages its agent touches on the way to
+        // a usable handshake, which is the same code whether the guest was
+        // just warmed or has been running for an hour, and the offsets hold
+        // across a chain, since every layer is laid out as the base is. A
+        // fork or a snapshot restore would otherwise take those pages one
+        // stalled vCPU at a time.
+        if self.link_prefetch_plan(&source.template(), &workdir).await {
+            spec.prefetch = Some(crate::warm::PREFETCH_PLAN.to_string());
+        }
         let boot_spec = spec.clone();
         spec.memory_chain = chain.clone();
 
@@ -4108,41 +4181,26 @@ impl SandboxManager {
             }
         }
 
-        let handshake = async {
-            let (mut agent, _accepted) = agentconn::connect_when_ready(
-                guard.vm().vsock_uds_path(),
-                self.config.agent_timeout,
-            )
-            .await
-            .map_err(|err| {
-                Status::internal(format!("restored agent never became reachable: {err}"))
-            })?;
-            // The guest wakes holding the address baked into the snapshot,
-            // which belongs to someone else; only the host knows this
-            // sandbox's own lease.
-            agent
-                .handshake(agentconn::handshake_full(
-                    true,
-                    Some(burrow_proto::agent::v1::NetworkConfig {
-                        ip: lease.guest_ip.to_string(),
-                        prefix_len: lease.prefix_len as u32,
-                        gateway: lease.host_ip.to_string(),
-                        dns: lease.host_ip.to_string(),
-                        ip6: lease.guest_ip6().to_string(),
-                        prefix_len6: lease.prefix_len6() as u32,
-                        gateway6: lease.host_ip6().to_string(),
-                    }),
-                    self.inspection_ca_for(&policy),
-                    self.trust_bundles_for(&source.template(), &policy).await,
-                    crate::volume::agent_mounts(&policy.volumes),
-                ))
-                .await?;
-            Ok::<(), Status>(())
-        }
-        .await;
-        if let Err(err) = handshake {
-            return Err(guard.fail(err).await);
-        }
+        // The guest wakes holding the address baked into the snapshot, which
+        // belongs to someone else; only the host knows this sandbox's own
+        // lease. Told behind the response, as a warm create does: the caller
+        // has its sandbox as soon as the VM is up, and the first call into
+        // the guest waits for the handshake to settle.
+        let request = agentconn::handshake_full(
+            true,
+            Some(burrow_proto::agent::v1::NetworkConfig {
+                ip: lease.guest_ip.to_string(),
+                prefix_len: lease.prefix_len as u32,
+                gateway: lease.host_ip.to_string(),
+                dns: lease.host_ip.to_string(),
+                ip6: lease.guest_ip6().to_string(),
+                prefix_len6: lease.prefix_len6() as u32,
+                gateway6: lease.host_ip6().to_string(),
+            }),
+            self.inspection_ca_for(&policy),
+            self.trust_bundles_for(&source.template(), &policy).await,
+            crate::volume::agent_mounts(&policy.volumes),
+        );
         // Nothing below can fail, so the sandbox takes over here.
         let vm = guard.keep().expect("a restore that reaches here has a vm");
 
@@ -4162,7 +4220,7 @@ impl SandboxManager {
             cpu_usage_usec: 0,
             rx_bytes: 0,
             tx_bytes: 0,
-            is_agent_unconfirmed: false,
+            is_agent_unconfirmed: true,
             env: HashMap::new(),
             kit: None,
             kit_credentials: HashMap::new(),
@@ -4173,10 +4231,10 @@ impl SandboxManager {
             layers = chain.len(),
             restore_ms = vm.boot_latency().as_millis() as u64,
             total_ms = started.elapsed().as_millis() as u64,
-            "restored sandbox running"
+            "restored sandbox running; handshake deferred"
         );
 
-        Ok(Arc::new(RunningSandbox {
+        let sandbox = Arc::new(RunningSandbox {
             id: record.id.clone(),
             template: record.template.clone(),
             base_record: std::sync::Mutex::new(record),
@@ -4187,8 +4245,7 @@ impl SandboxManager {
             suspended_at: std::sync::atomic::AtomicI64::new(0),
             agent_channel: Mutex::new(None),
             agent_timeout: self.config.agent_timeout,
-            // A restore from a snapshot handshakes before it gets here.
-            handshake: settled(),
+            handshake: Arc::new(tokio::sync::watch::channel(Handshake::Pending).0),
             memory_chain: Mutex::new(chain),
             // A restore copies state, not the bill for producing it: the child
             // is a new sandbox and starts from nothing.
@@ -4197,7 +4254,9 @@ impl SandboxManager {
             workdir,
             lease,
             tap: tap_name,
-        }))
+        });
+        spawn_handshake(self, &sandbox, request, self.config.agent_timeout);
+        Ok(sandbox)
     }
 
     /// Restores a suspended sandbox from its snapshot.
@@ -4604,6 +4663,8 @@ pub(crate) mod tests {
                     region: None,
                     derp_map_url: None,
                 },
+                object_store: None,
+                firecracker_version: String::new(),
             },
             Arc::new(burrow_proxy::PolicyTable::default()),
             Arc::new(burrow_proxy::Resolutions::default()),

@@ -43,6 +43,18 @@ services:
     volumes:
       - ./otel-collector.yaml:/etc/otel/config.yaml:ro
 
+  # S3 for the harness, so snapshots can be restored on the node that did not
+  # take them. versitygw serves a directory as a bucket store; the nodes
+  # create the bucket themselves. The keys are the committed dev ones.
+  objstore:
+    image: versity/versitygw:v1.0.14
+    command: ["--port", ":9000", "posix", "/data"]
+    environment:
+      ROOT_ACCESS_KEY_ID: burrow
+      ROOT_SECRET_ACCESS_KEY: dev-objstore-secret
+    volumes:
+      - burrow-objstore-data:/data
+
   orchestrator:
     image: debian:bookworm-slim
     command: /burrow/bin/burrow-orchestrator --data-dir /var/lib/burrow --listen 0.0.0.0:7070 --api-key dev-token --node-token dev-node-token --otlp-endpoint http://otel-collector:4317
@@ -72,7 +84,7 @@ services:
       target: dev
       args:
         FC_ARCH: aarch64
-    command: /burrow/bin/burrowd serve --orchestrator http://orchestrator:7070 --listen 0.0.0.0:7071 --advertise node:7071 --node-id node_local_docker --label rack=a1 --label tier=general --mesh-endpoint node:51820 --api-key dev-token --node-token dev-node-token --otlp-endpoint http://otel-collector:4317 --agent-binary /burrow/bin/burrow-agent --insecure-registry test-registry:5000 --jailer /usr/local/bin/jailer --edge-listen 0.0.0.0:7081 --edge-domain node.sandbox.local
+    command: /burrow/bin/burrowd serve --orchestrator http://orchestrator:7070 --listen 0.0.0.0:7071 --advertise node:7071 --node-id node_local_docker --label rack=a1 --label tier=general --mesh-endpoint node:51820 --api-key dev-token --node-token dev-node-token --otlp-endpoint http://otel-collector:4317 --agent-binary /burrow/bin/burrow-agent --insecure-registry test-registry:5000 --jailer /usr/local/bin/jailer --edge-listen 0.0.0.0:7081 --edge-domain node.sandbox.local --object-store s3://burrow/dev --object-store-endpoint http://objstore:9000
     ports:
       # This node's edge: http://<port>-<sandbox-id>.node.sandbox.local:7081/
       # Opt-in, and off by default. A node without one has no hostname routing,
@@ -84,6 +96,7 @@ services:
       - "127.0.0.1:7081:7081"
     depends_on:
       - orchestrator
+      - objstore
     # Firecracker needs KVM; guest NICs need /dev/net/tun; creating taps and
     # programming nftables needs NET_ADMIN; capping sandboxes needs a writable
     # cgroup2 tree, which Docker only grants to a privileged container.
@@ -112,6 +125,8 @@ services:
       - burrow-data:/var/lib/burrow
     environment:
       RUST_LOG: info
+      AWS_ACCESS_KEY_ID: burrow
+      AWS_SECRET_ACCESS_KEY: dev-objstore-secret
 
   node2:
     build:
@@ -123,7 +138,7 @@ services:
       target: dev
       args:
         FC_ARCH: aarch64
-    command: /burrow/bin/burrowd serve --orchestrator http://orchestrator:7070 --listen 0.0.0.0:7071 --advertise node2:7071 --node-id node_local_docker_2 --label rack=b7 --label tier=dedicated --mesh-endpoint node2:51820 --api-key dev-token --node-token dev-node-token --otlp-endpoint http://otel-collector:4317 --agent-binary /burrow/bin/burrow-agent --insecure-registry test-registry:5000 --jailer /usr/local/bin/jailer --edge-listen 0.0.0.0:7081 --edge-domain node2.sandbox.local
+    command: /burrow/bin/burrowd serve --orchestrator http://orchestrator:7070 --listen 0.0.0.0:7071 --advertise node2:7071 --node-id node_local_docker_2 --label rack=b7 --label tier=dedicated --mesh-endpoint node2:51820 --api-key dev-token --node-token dev-node-token --otlp-endpoint http://otel-collector:4317 --agent-binary /burrow/bin/burrow-agent --insecure-registry test-registry:5000 --jailer /usr/local/bin/jailer --edge-listen 0.0.0.0:7081 --edge-domain node2.sandbox.local --object-store s3://burrow/dev --object-store-endpoint http://objstore:9000
     ports:
       # node2's edge, on its own domain: an edge serves only the sandboxes its
       # node holds, so each node needs a wildcard of its own. Loopback only,
@@ -131,6 +146,7 @@ services:
       - "127.0.0.1:7082:7081"
     depends_on:
       - orchestrator
+      - objstore
     # Firecracker needs KVM; guest NICs need /dev/net/tun; creating taps and
     # programming nftables needs NET_ADMIN; capping sandboxes needs a writable
     # cgroup2 tree, which Docker only grants to a privileged container.
@@ -157,8 +173,11 @@ services:
       - burrow-data-2:/var/lib/burrow
     environment:
       RUST_LOG: info
+      AWS_ACCESS_KEY_ID: burrow
+      AWS_SECRET_ACCESS_KEY: dev-objstore-secret
 
 volumes:
+  burrow-objstore-data:
   burrow-orchestrator-data:
   burrow-data:
   burrow-data-2:

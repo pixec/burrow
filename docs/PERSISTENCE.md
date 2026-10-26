@@ -190,10 +190,15 @@ Two things follow from how snapshots are stored:
 - **They outlive their source.** The kernel and rootfs are linked in beside the
   state, so deleting the sandbox, or even the template, leaves the snapshot
   restorable.
-- **They are node-local.** A snapshot encodes host cpu features and the exact
-  Firecracker version, like a warm template snapshot, so it never moves between
-  nodes. A create from a snapshot is placed on the node holding it, and fails
-  rather than being placed elsewhere if that node is unreachable.
+- **They live on the node that took them, and optionally in an object
+  store.** A create from a snapshot is placed on the node holding it. With
+  `burrowd serve --object-store s3://bucket/prefix --object-store-endpoint
+  <url>` on the nodes, every snapshot is also uploaded behind the create, and
+  `burrow snapshot ls` shows `+store` once that has finished. A durable
+  snapshot survives its node: if the node is unreachable, or gone, the create
+  is placed on any node of the same architecture running the same Firecracker,
+  which fetches it from the store first. Without the store a snapshot on an
+  unreachable node is unusable until the node returns.
 
 ### Snapshot retention
 

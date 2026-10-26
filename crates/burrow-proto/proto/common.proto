@@ -426,6 +426,15 @@ message Snapshot {
   uint64 size_bytes = 9;
   // RFC 3339; empty means the snapshot does not expire.
   string expires_at = 10;
+  // A copy of the snapshot is in the fleet's object store, so a create from
+  // it can be placed on any compatible node, including when the node that
+  // took it is gone. `node_id` is empty when no node holds it locally.
+  bool is_durable = 11;
+  // What the snapshot was taken on. Guest state only restores on a node of
+  // the same architecture running the same Firecracker, so placement of a
+  // durable snapshot is limited to nodes that match.
+  string arch = 12;
+  string firecracker_version = 13;
 }
 
 message NodeInfo {
@@ -451,6 +460,10 @@ message NodeInfo {
   // life.
   string edge_domain = 8;
   uint32 edge_port = 9;
+  // What this node can restore: its cpu architecture and the Firecracker it
+  // runs. A snapshot taken elsewhere is only placed here when both match.
+  string arch = 10;
+  string firecracker_version = 11;
 }
 
 message NodeStatus {

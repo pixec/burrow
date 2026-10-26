@@ -72,6 +72,15 @@ spec:
             - 0.0.0.0:7081
             - --edge-domain
             - $(NODE_NAME).sandbox.example.com
+            # Optional: copy every snapshot to S3 so it can be restored on
+            # another node, and survives this one. Needs AWS_ACCESS_KEY_ID and
+            # AWS_SECRET_ACCESS_KEY in env, from a secret.
+            # - --object-store
+            # - s3://burrow-snapshots
+            # - --object-store-endpoint
+            # - https://s3.eu-west-1.amazonaws.com
+            # - --object-store-region
+            # - eu-west-1
           env:
             - name: HOST_IP
               valueFrom:

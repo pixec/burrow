@@ -713,13 +713,70 @@ therefore only valid to a caller that consumes it at once *and* copies the disk
 alongside it, which is what the two callers below do. A "save a restore point"
 call could not, which is why there is not one.
 
-A fork copies that state into a new sandbox: the chain whole rather than
-flattened, since the restore path reads a chain anyway, and the scratch disk
-through the same sparse or reflink copy a warm create uses. The child then takes
-the restore path, so it wakes holding the source's processes and the source's
-address, which is why the handshake carries the child's real lease exactly as it
-does for a warm restore. Forks stay on the source's node: the snapshot, the
+A fork links that state into a new sandbox. The chain is hard-linked whole,
+which is safe because a layer is never written again once it exists: a suspend
+writes a new diff, and a flatten renames a merged base into place and unlinks
+the old names, so the child's links keep serving the bytes the source had at
+the fork. Only the scratch disk, which both sides write, is copied, through the
+same sparse or reflink copy a warm create uses. The child then takes the
+restore path, so it wakes holding the source's processes and the source's
+address, which is why the handshake carries the child's real lease exactly as
+it does for a warm restore. Forks stay on the source's node: the snapshot, the
 disks and the lease are all node-local files, so there is nothing to place.
+
+Three things keep a fork as quick as a warm create. The handshake runs behind
+the response, as a warm create's does: the caller has its sandbox as soon as
+the VM is up, and the first call into the guest waits for the agent to settle.
+The template's prefetch plan is linked into every restore, fork and snapshot
+alike: the pages an agent touches on the way to a usable handshake are the same
+whether the guest was just warmed or has run for an hour, and an offset into
+the base is the same offset into every diff, so the plan replays through the
+chain. And a child whose chain is deeper than two layers is flattened behind
+the create, sequential file work the running guest never notices, so a fork of
+a fork of a fork restores through two layers rather than four. Measured on the
+dev harness, three successive forks took 138, 124 and 175ms end to end, against
+882, 484 and 730ms before, with the restore itself 45 to 57ms of that.
+
+### Snapshots in the object store
+
+A snapshot object is node-local for the same reason a warm snapshot is: it
+encodes the host's cpu features and the exact Firecracker that wrote it. That
+is a constraint on *where it restores*, not on where it is stored, and a fleet
+of alike nodes is the common case. So with `--object-store` a node copies every
+snapshot it publishes to an S3 bucket, behind the create, and marks the
+snapshot durable once the remote manifest is written. The manifest goes last,
+there as here, so a crash mid-upload leaves objects nothing reads as a
+snapshot.
+
+The kernel and rootfs go up as blobs under their digest, so snapshots of one
+template share them and a fetching node verifies what it received before
+adopting it into its own blob store. The memory image, vmstate and scratch disk
+go under the snapshot's id. The first two of those are sparse, and mostly
+holes: a snapshot occupying 40 MiB has a 512 MiB memory file and a scratch
+disk the size of the guest's allowance. They go as their data extents, each
+prefixed by its offset, and the fetch writes them back at those offsets into a
+file truncated to the apparent length, so what arrives is as sparse as what
+left. Measured on the dev harness, that took the upload of a 40 MiB snapshot
+from minutes to under a second, and a fetch to 92 ms once the template's blobs
+were already there. Nothing is streamed lazily: a fetch is a whole copy, paid
+once per node, since a fetched snapshot is then local.
+
+The orchestrator keeps the holder as the place to restore, because a local
+copy costs nothing. A durable snapshot whose holder is unreachable, or written
+off, is kept with no holder rather than forgotten, and a create from it is
+placed like any sandbox among the nodes whose architecture and Firecracker
+version match what the manifest records; the chosen node fetches it on the
+first create. Every node lists what the store holds when it registers, so a
+restarted orchestrator re-learns durable snapshots from any node that can
+reach the bucket, not only from the one that took them. Deleting a snapshot
+removes it from the store too, and the delete goes to whichever compatible
+node is up when the holder is not.
+
+The S3 client is Burrow's own: SigV4 with an unsigned payload, so a
+multi-gigabyte memory image streams from disk without being hashed first, over
+the same reqwest and rustls the node already uses for registries. Credentials
+come from `AWS_ACCESS_KEY_ID` and `AWS_SECRET_ACCESS_KEY`; any S3-compatible
+store works, and the node creates its bucket if it is missing.
 
 ## Lifecycle and reclamation
 

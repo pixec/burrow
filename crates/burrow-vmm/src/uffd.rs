@@ -238,7 +238,7 @@ impl Layer {
 }
 
 /// The byte ranges of a sparse file that actually hold data.
-fn data_extents(file: &std::fs::File) -> io::Result<Vec<(u64, u64)>> {
+pub fn data_extents(file: &std::fs::File) -> io::Result<Vec<(u64, u64)>> {
     let fd = file.as_raw_fd();
     let size = file.metadata()?.len() as i64;
     let mut extents = Vec::new();

@@ -37,6 +37,18 @@ pub struct ServeArgs {
     pub data_dir: PathBuf,
     #[arg(long, default_value = "/usr/local/bin/firecracker")]
     pub firecracker: PathBuf,
+    /// Bucket snapshots are copied to so they outlive this node, as
+    /// `s3://bucket[/prefix]`. Credentials come from AWS_ACCESS_KEY_ID and
+    /// AWS_SECRET_ACCESS_KEY. Unset keeps snapshots node-local.
+    #[arg(long, env = "BURROW_OBJECT_STORE")]
+    pub object_store: Option<String>,
+    /// The store's S3 endpoint, e.g. `https://s3.eu-west-1.amazonaws.com` or
+    /// a self-hosted one. Required with --object-store.
+    #[arg(long, env = "BURROW_OBJECT_STORE_ENDPOINT")]
+    pub object_store_endpoint: Option<String>,
+    /// Region the endpoint signs for. Self-hosted stores accept anything.
+    #[arg(long, default_value = "us-east-1", env = "BURROW_OBJECT_STORE_REGION")]
+    pub object_store_region: String,
     /// Appended to every guest kernel command line.
     #[arg(
         long,
@@ -272,6 +284,27 @@ impl ServeArgs {
     }
 }
 
+/// What `firecracker --version` prints on its first line, e.g. `v1.16.1`.
+///
+/// Recorded on snapshots and reported to the orchestrator, because a snapshot
+/// only restores under the Firecracker that wrote it, and placement of one
+/// fetched from the object store has to know that before it sends the create.
+async fn firecracker_version(bin: &std::path::Path) -> String {
+    let output = tokio::process::Command::new(bin)
+        .arg("--version")
+        .output()
+        .await;
+    let Ok(output) = output else {
+        return String::new();
+    };
+    String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .next()
+        .and_then(|line| line.split_whitespace().last())
+        .unwrap_or_default()
+        .to_string()
+}
+
 fn local_node_info(args: &ServeArgs) -> anyhow::Result<NodeInfo> {
     let mut sys = sysinfo::System::new();
     sys.refresh_memory();
@@ -297,6 +330,9 @@ fn local_node_info(args: &ServeArgs) -> anyhow::Result<NodeInfo> {
         // router that never bound resolves nowhere.
         edge_domain: String::new(),
         edge_port: 0,
+        arch: std::env::consts::ARCH.to_string(),
+        // Filled in once the binary has been asked.
+        firecracker_version: String::new(),
     })
 }
 
@@ -417,6 +453,7 @@ async fn registration_loop(
                     // evicts old ones, neither of which the orchestrator asked
                     // for; this is how it learns they are gone.
                     snapshots: sandboxes.snapshots().ids().await,
+                    durable_snapshots: sandboxes.snapshots().durable_ids().await,
                     // Restated so a relabelled node converges on its next beat
                     // rather than on its next registration.
                     info: Some(info.clone()),
@@ -838,6 +875,29 @@ pub async fn run(args: ServeArgs) -> anyhow::Result<()> {
             .map_err(|err| anyhow::anyhow!("cannot open node store: {err}"))?,
     );
 
+    let firecracker_version = firecracker_version(&args.firecracker).await;
+    node_info.firecracker_version = firecracker_version.clone();
+    let object_store = match (&args.object_store, &args.object_store_endpoint) {
+        (Some(url), Some(endpoint)) => {
+            let store = crate::objstore::ObjectStore::open(&crate::objstore::Options {
+                url: url.clone(),
+                endpoint: endpoint.clone(),
+                region: args.object_store_region.clone(),
+            })?;
+            store
+                .ensure_bucket()
+                .await
+                .map_err(|err| anyhow::anyhow!("--object-store: {}", err.message()))?;
+            tracing::info!(
+                store = store.describe(),
+                "snapshots are copied to the object store"
+            );
+            Some(store)
+        }
+        (Some(_), None) => anyhow::bail!("--object-store needs --object-store-endpoint"),
+        (None, _) => None,
+    };
+
     // The proxy and the sandbox manager share one policy table: the manager
     // writes it whenever sandboxes change, the proxy reads it per connection.
     let proxy_policies = Arc::new(burrow_proxy::PolicyTable::default());
@@ -866,6 +926,8 @@ pub async fn run(args: ServeArgs) -> anyhow::Result<()> {
                 region: args.tailcat_region,
                 derp_map_url: args.tailcat_derp_map_url.clone(),
             },
+            object_store,
+            firecracker_version,
         },
         Arc::clone(&proxy_policies),
         Arc::clone(&resolutions),

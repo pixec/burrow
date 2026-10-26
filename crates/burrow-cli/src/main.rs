@@ -1670,17 +1670,23 @@ async fn main() -> anyhow::Result<()> {
                 println!("no snapshots");
             } else {
                 println!(
-                    "{:<38} {:<24} {:<16} {:>8}  {:<21} EXPIRES",
-                    "SNAPSHOT", "SANDBOX", "TEMPLATE", "SIZE", "CREATED"
+                    "{:<38} {:<24} {:<16} {:>8}  {:<21} {:<21} EXPIRES",
+                    "SNAPSHOT", "SANDBOX", "TEMPLATE", "SIZE", "CREATED", "WHERE"
                 );
                 for snapshot in resp.snapshots {
+                    let location = match (snapshot.node_id.is_empty(), snapshot.is_durable) {
+                        (false, true) => format!("{} +store", snapshot.node_id),
+                        (false, false) => snapshot.node_id.clone(),
+                        (true, _) => "object store".to_string(),
+                    };
                     println!(
-                        "{:<38} {:<24} {:<16} {:>7}M  {:<21} {}",
+                        "{:<38} {:<24} {:<16} {:>7}M  {:<21} {:<21} {}",
                         snapshot.id,
                         truncate(&snapshot.sandbox_id, 24),
                         truncate(&snapshot.template, 16),
                         snapshot.size_bytes / (1024 * 1024),
                         snapshot.created_at,
+                        truncate(&location, 21),
                         if snapshot.expires_at.is_empty() {
                             "never"
                         } else {

@@ -159,7 +159,10 @@ impl NodeRegistry for NodeRegistryService {
                 "heartbeat from unknown node; asking to re-register"
             );
         } else {
-            let dropped = self.0.snapshots.apply_report(&req.node_id, &req.snapshots);
+            let dropped =
+                self.0
+                    .snapshots
+                    .apply_report(&req.node_id, &req.snapshots, &req.durable_snapshots);
             if dropped > 0 {
                 tracing::info!(
                     node_id = req.node_id,
@@ -280,6 +283,22 @@ async fn reconcile_node(state: Arc<OrchestratorState>, node_id: String) {
             }
         }
         Err(err) => tracing::warn!(node_id, %err, "node snapshot inventory unavailable"),
+    }
+    // What the object store holds, as this node sees it. Any node with the
+    // store configured answers the same, and one without answers nothing.
+    match client
+        .list_durable_snapshots(nodepb::NodeListSnapshotsRequest {
+            sandbox_id: String::new(),
+        })
+        .await
+    {
+        Ok(resp) => {
+            let adopted = state.snapshots.adopt_remote(resp.into_inner().snapshots);
+            if adopted > 0 {
+                tracing::info!(node_id, adopted, "adopted snapshots from the object store");
+            }
+        }
+        Err(err) => tracing::warn!(node_id, %err, "object store snapshot inventory unavailable"),
     }
 
     match client

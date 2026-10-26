@@ -8,6 +8,8 @@ mod model;
 mod process;
 #[cfg(target_os = "linux")]
 pub mod uffd;
+#[cfg(target_os = "linux")]
+pub use uffd::data_extents;
 pub mod vsock;
 
 use std::path::{Path, PathBuf};

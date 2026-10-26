@@ -474,33 +474,70 @@ impl ApiService {
         !self.0.nodes.health(node_id).unwrap_or(false)
     }
 
-    /// The snapshot and a client for the node that holds it.
+    /// The snapshot, the node a create from it should go to, and a client
+    /// for that node.
     ///
-    /// A snapshot never leaves the node that took it, so an unreachable node
-    /// means the snapshot is unusable right now. Placing elsewhere would boot a
-    /// different image and call it a restore.
-    async fn node_for_snapshot(&self, id: &str) -> Result<(common::Snapshot, NodeClient), Status> {
+    /// The node holding it, when reachable: restoring a local copy costs
+    /// nothing. Otherwise a durable snapshot is placed like a sandbox, among
+    /// nodes that can restore it, and that node fetches it from the object
+    /// store. A snapshot that is neither is unusable right now, and placing it
+    /// elsewhere would boot a different image and call it a restore.
+    async fn node_for_snapshot(
+        &self,
+        id: &str,
+        want: &crate::registry::Placement,
+    ) -> Result<(common::Snapshot, String, NodeClient), Status> {
         let snapshot = self
             .0
             .snapshots
             .get(id)
             .ok_or_else(|| Status::not_found(format!("no snapshot {id}")))?;
-        let endpoint = self.0.nodes.endpoint(&snapshot.node_id).ok_or_else(|| {
-            Status::failed_precondition(format!(
-                "snapshot {id} lives on node {}, which is unreachable; snapshots are \
-                 node-local and cannot be restored anywhere else",
-                snapshot.node_id
-            ))
-        })?;
+        let holder = (!snapshot.node_id.is_empty()
+            && self.0.nodes.endpoint(&snapshot.node_id).is_some())
+        .then(|| snapshot.node_id.clone());
+        let node_id = match holder {
+            Some(node_id) => {
+                self.require_labels(&node_id, &want.node_labels)?;
+                node_id
+            }
+            None if snapshot.is_durable => {
+                let want = crate::registry::Placement {
+                    // The snapshot carries its own kernel and rootfs, so the
+                    // template need not be on the node.
+                    template: String::new(),
+                    arch: snapshot.arch.clone(),
+                    firecracker_version: snapshot.firecracker_version.clone(),
+                    ..want.clone()
+                };
+                self.0.nodes.place_for(&want).map_err(|err| match err {
+                    crate::registry::PlacementError::NoHealthyNode
+                    | crate::registry::PlacementError::NoCapacity { .. } => {
+                        Status::resource_exhausted(err.to_string())
+                    }
+                    other => Status::failed_precondition(other.to_string()),
+                })?
+            }
+            None => {
+                return Err(Status::failed_precondition(format!(
+                    "snapshot {id} lives on node {}, which is unreachable, and is not in the \
+                     object store; configure --object-store on the nodes for snapshots that \
+                     outlive their node",
+                    snapshot.node_id
+                )));
+            }
+        };
+        let endpoint = self
+            .0
+            .nodes
+            .endpoint(&node_id)
+            .ok_or_else(|| Status::unavailable(format!("node {node_id} went away")))?;
         let client = self
             .0
             .channels
             .get(&endpoint, self.0.node_token.as_deref())
             .await
-            .map_err(|err| {
-                Status::unavailable(format!("cannot reach node {}: {err}", snapshot.node_id))
-            })?;
-        Ok((snapshot, client))
+            .map_err(|err| Status::unavailable(format!("cannot reach node {node_id}: {err}")))?;
+        Ok((snapshot, node_id, client))
     }
 
     /// The node every requested volume lives on, if any were requested.
@@ -647,25 +684,31 @@ impl Burrow for ApiService {
             .reserve(&sandbox_id, &req.name)
             .map_err(Status::already_exists)?;
 
-        // A create from a snapshot is not placed: the snapshot is node-local,
-        // so the node is already decided, and the template and machine shape
-        // come from what the snapshot holds rather than from the request.
+        // A create from a snapshot goes where the snapshot is, or, for one
+        // the object store holds, to a node that can restore it; the template
+        // and machine shape come from what the snapshot holds rather than
+        // from the request.
         if !req.snapshot.is_empty() {
-            let (snapshot, mut client) = self.node_for_snapshot(&req.snapshot).await?;
-            // The node is fixed by where the snapshot is, so a label constraint
-            // is a precondition here rather than a choice.
-            self.require_labels(&snapshot.node_id, &req.node_labels)?;
+            let placement = crate::registry::Placement {
+                vcpus: 1,
+                mem_mib: 512,
+                node_labels: req.node_labels.clone(),
+                ..Default::default()
+            };
+            let (snapshot, node_id, mut client) =
+                self.node_for_snapshot(&req.snapshot, &placement).await?;
             let mounts = req
                 .policy
                 .as_ref()
                 .map(|p| p.volumes.clone())
                 .unwrap_or_default();
             if let Some(node) = self.node_for_volumes(&mounts)?
-                && node != snapshot.node_id
+                && node != node_id
             {
                 return Err(Status::failed_precondition(format!(
-                    "snapshot {} is on node {}, but the requested volumes are on node {node};                      neither travels",
-                    snapshot.id, snapshot.node_id
+                    "snapshot {} is on node {node_id}, but the requested volumes are on node {node}; \
+                     volumes do not travel",
+                    snapshot.id
                 )));
             }
             if !req.template.is_empty() && req.template != snapshot.template {
@@ -693,7 +736,8 @@ impl Burrow for ApiService {
             tracing::info!(
                 sandbox = sandbox.id,
                 snapshot = snapshot.id,
-                node = snapshot.node_id,
+                node = node_id,
+                is_fetched = node_id != snapshot.node_id,
                 "sandbox created from a snapshot"
             );
             return Ok(Response::new(sandbox));
@@ -739,6 +783,8 @@ impl Burrow for ApiService {
             // Carried into the transfer pass too, so copying a template never
             // widens placement past the hardware the caller asked for.
             node_labels: req.node_labels,
+            arch: String::new(),
+            firecracker_version: String::new(),
         };
         // A mounted volume fixes the node, so placement is not a choice: it is
         // a check that the node holding the volumes can take the sandbox.
@@ -1232,7 +1278,9 @@ impl Burrow for ApiService {
         req: Request<api::SnapshotRef>,
     ) -> Result<Response<api::DeleteSnapshotResponse>, Status> {
         let id = req.into_inner().id;
-        let (_, mut client) = self.node_for_snapshot(&id).await?;
+        let (_, _, mut client) = self
+            .node_for_snapshot(&id, &crate::registry::Placement::default())
+            .await?;
         client
             .delete_snapshot(api::SnapshotRef { id: id.clone() })
             .await?;
@@ -1269,6 +1317,8 @@ impl Burrow for ApiService {
             mem_mib: 0,
             is_template_transfer_allowed: true,
             node_labels: req.node_labels.clone(),
+            arch: String::new(),
+            firecracker_version: String::new(),
         };
         let node_id = self.0.nodes.place_for(&want).map_err(|err| match err {
             crate::registry::PlacementError::NoHealthyNode

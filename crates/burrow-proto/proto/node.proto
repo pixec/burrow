@@ -46,6 +46,10 @@ service NodeService {
   rpc ListSnapshots(NodeListSnapshotsRequest) returns (burrow.api.v1.ListSnapshotsResponse);
   rpc GetSnapshot(burrow.api.v1.SnapshotRef) returns (burrow.common.v1.Snapshot);
   rpc DeleteSnapshot(burrow.api.v1.SnapshotRef) returns (burrow.api.v1.DeleteSnapshotResponse);
+  // Snapshots in the fleet's object store, as this node sees it. Any node
+  // with the store configured answers the same; the orchestrator asks so it
+  // can place a create from a snapshot whose node is gone.
+  rpc ListDurableSnapshots(NodeListSnapshotsRequest) returns (burrow.api.v1.ListSnapshotsResponse);
 
   rpc CreateVolume(burrow.api.v1.CreateVolumeRequest) returns (burrow.common.v1.Volume);
   rpc ListVolumes(burrow.api.v1.ListVolumesRequest) returns (burrow.api.v1.ListVolumesResponse);
@@ -276,6 +280,10 @@ message HeartbeatRequest {
   // own reaper and evicted by retention, so without this the orchestrator would
   // keep listing snapshots whose files are gone.
   repeated string snapshots = 4;
+  // The subset of `snapshots` whose upload to the object store has finished.
+  // Uploads run behind the create, so this is how the orchestrator learns a
+  // snapshot became durable.
+  repeated string durable_snapshots = 6;
   // What this node is, restated on every beat so an operator's relabel or a
   // changed advertised address converges without waiting for a re-registration.
   // The orchestrator keeps the id it assigned; everything else is the node's to
