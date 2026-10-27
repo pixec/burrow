@@ -36,6 +36,14 @@ service NodeService {
   // Forks on this node only: a sandbox's snapshot and disks are node-local, so
   // the child is built where the source already is.
   rpc ForkSandbox(NodeForkRequest) returns (burrow.common.v1.Sandbox);
+  // Takes over a durable sandbox from the object store and resumes it here.
+  rpc AdoptSandbox(NodeAdoptRequest) returns (burrow.common.v1.Sandbox);
+  // Suspends a sandbox, waits for its state to reach the object store, and
+  // lets go of it here, leaving the stored state for another node to adopt.
+  rpc ReleaseSandbox(NodeSandboxRef) returns (burrow.common.v1.Sandbox);
+  // Deletes a durable sandbox's state from the object store, for a sandbox
+  // no node holds.
+  rpc PurgeSandbox(NodeSandboxRef) returns (NodeDeleteResponse);
   rpc UpdateNetworkPolicy(NodeUpdateNetworkRequest) returns (burrow.common.v1.Sandbox);
   rpc UpdateTags(NodeUpdateTagsRequest) returns (burrow.common.v1.Sandbox);
   rpc UpdateAccessPolicy(NodeUpdateAccessRequest) returns (burrow.common.v1.Sandbox);
@@ -50,6 +58,9 @@ service NodeService {
   // with the store configured answers the same; the orchestrator asks so it
   // can place a create from a snapshot whose node is gone.
   rpc ListDurableSnapshots(NodeListSnapshotsRequest) returns (burrow.api.v1.ListSnapshotsResponse);
+
+  // This node's event log from a position, then live while `is_follow`.
+  rpc TailEvents(NodeTailEventsRequest) returns (stream burrow.common.v1.Event);
 
   rpc CreateVolume(burrow.api.v1.CreateVolumeRequest) returns (burrow.common.v1.Volume);
   rpc ListVolumes(burrow.api.v1.ListVolumesRequest) returns (burrow.api.v1.ListVolumesResponse);
@@ -245,6 +256,13 @@ message NodeListResponse {
 
 message NodeDeleteResponse {}
 
+message NodeAdoptRequest {
+  // The orchestrator's record of the sandbox: its policy, name, metadata and
+  // secrets travel from here, never through the object store.
+  burrow.common.v1.Sandbox record = 1;
+  string node_id = 2;
+}
+
 message RegisterRequest {
   burrow.common.v1.NodeInfo info = 1;
   // The node's mesh identity. Empty when the node has no WireGuard support,
@@ -307,6 +325,11 @@ message SandboxStateReport {
   // whose agent is still coming up, or never did. Nothing else would correct
   // it.
   bool is_agent_unconfirmed = 6;
+  // Suspended, and its latest suspend is in the object store.
+  bool is_durable = 7;
+  // The node will not resume this durable sandbox until the orchestrator
+  // confirms it still lives here: the node restarted, or lost its lease.
+  bool is_fenced = 8;
 }
 
 message HeartbeatResponse {
@@ -322,6 +345,20 @@ message HeartbeatResponse {
   // reaches one reaches sandboxes it shares no private network with. Delivered
   // on each beat because a node cannot know which of its peers serves an edge.
   repeated string edge_hosts = 4;
+  // Every orchestrator replica's own address. The node denies these to
+  // sandboxes along with the address it was told to reach the control plane
+  // at, which with several replicas is only a balancer in front of them.
+  repeated string control_plane_hosts = 5;
+  // How long the node may go without a successful heartbeat before it must
+  // stop resuming durable sandboxes on its own say. Shorter than the silence
+  // after which the orchestrator writes a node off and lets another node
+  // adopt them, so the two never both think they hold one. 0 means the
+  // orchestrator never writes nodes off.
+  uint32 sandbox_lease_secs = 6;
+  // Fenced sandboxes the orchestrator still places on this node.
+  repeated string confirmed_sandboxes = 7;
+  // Fenced sandboxes another node has adopted. The node drops its copy.
+  repeated string relinquished_sandboxes = 8;
 }
 
 message MeshPeer {
@@ -349,4 +386,10 @@ message NetworkMember {
 message NodeHealthRequest {}
 message NodeHealthResponse {
   string version = 1;
+}
+
+message NodeTailEventsRequest {
+  // Replay starts after this `node_seq`; 0 from the beginning of what is kept.
+  uint64 after_seq = 1;
+  bool is_follow = 2;
 }

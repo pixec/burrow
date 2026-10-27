@@ -10,7 +10,7 @@
 //! channel; everything else reaped is an orphan and is simply discarded.
 
 use std::collections::HashMap;
-use std::sync::{Mutex, OnceLock};
+use std::sync::{Mutex, OnceLock, RwLock, RwLockReadGuard};
 
 use nix::sys::wait::{WaitPidFlag, WaitStatus, waitpid};
 use tokio::sync::oneshot;
@@ -20,10 +20,18 @@ fn waiters() -> &'static Mutex<HashMap<i32, oneshot::Sender<i32>>> {
     WAITERS.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
-/// Registers interest in a child's exit status.
-///
-/// Must be called with no await point between spawning the child and this
-/// call, so the reaper cannot consume the status before the waiter exists.
+/// Held by the reaper while it collects statuses, and by a spawn until its
+/// child is watched: the reaper runs on another thread, so a child that exits
+/// at once could otherwise be reaped as an orphan before anyone waits for it.
+static GATE: RwLock<()> = RwLock::new(());
+
+/// Keeps the reaper away until the guard drops. Taken before the spawn and
+/// held until [`watch`] has run.
+pub fn hold() -> RwLockReadGuard<'static, ()> {
+    GATE.read().unwrap()
+}
+
+/// Registers interest in a child's exit status, under [`hold`].
 pub fn watch(pid: i32) -> oneshot::Receiver<i32> {
     let (tx, rx) = oneshot::channel();
     waiters().lock().unwrap().insert(pid, tx);
@@ -52,6 +60,7 @@ pub fn spawn() {
 }
 
 fn reap_once() {
+    let _gate = GATE.write().unwrap();
     loop {
         match waitpid(None, Some(WaitPidFlag::WNOHANG)) {
             // No child has exited right now.

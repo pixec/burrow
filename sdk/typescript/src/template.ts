@@ -18,6 +18,12 @@ export interface BuildOptions extends TransportOptions {
    * that installs packages needs the network by definition.
    */
   allowDomains?: string[];
+  /**
+   * Boot the image's own systemd under the agent instead of the agent alone.
+   * Everything created from the template keeps the mode. The image has to
+   * ship systemd.
+   */
+  systemd?: boolean;
   /** Called for every build log line. */
   onBuildLogs?: (log: BuildLogEvent) => void;
   /** Milliseconds before the build is abandoned. */
@@ -35,6 +41,10 @@ export interface TemplateInfo {
   sizeBytes: number;
   /** True when creates from this template restore a snapshot instead of booting. */
   warm: boolean;
+  /** Imported from Sandbox Kits: creates run their lifecycle. */
+  kit: boolean;
+  /** Sandboxes from it run systemd under the agent. */
+  systemd: boolean;
 }
 
 /** Prints build logs the way a build tool would. */
@@ -176,6 +186,7 @@ export class TemplateBuilder {
       vcpus: options.cpuCount ?? 1,
       memMib: options.memoryMB ?? 1024,
       allowDomains: options.allowDomains ?? [],
+      isSystemd: options.systemd ?? false,
     };
   }
 
@@ -232,6 +243,8 @@ factory.build = async function build(
           sizeBytes: event.sizeBytes,
           // A freshly built template has no snapshot until the node warms it.
           warm: false,
+          kit: false,
+          systemd: options.systemd ?? false,
         };
       }
     }
@@ -254,6 +267,8 @@ factory.list = async function list(
       name: t.name,
       sizeBytes: Number(t.sizeBytes ?? 0),
       warm: Boolean(t.isWarm),
+      kit: Boolean(t.isKit),
+      systemd: Boolean(t.isSystemd),
     }));
   } finally {
     transport.close();

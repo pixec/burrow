@@ -165,8 +165,7 @@ pub async fn is_warm(templates_dir: &Path, template: &str) -> bool {
             return false;
         }
     }
-    // A snapshot from an older agent would resume into a guest that cannot be
-    // re-addressed, which is worse than a cold boot.
+    // A snapshot in another format is rebuilt rather than restored.
     matches!(
         tokio::fs::read_to_string(dir.join("format")).await,
         Ok(version) if version.trim() == WARM_FORMAT
@@ -206,7 +205,8 @@ pub async fn stage_from_warm(
 
     let linked = std::time::Instant::now();
 
-    // Optional: a snapshot built before profiling existed simply has none.
+    // Optional: profiling is best effort, and a warm snapshot whose profiling
+    // run failed simply has no plan.
     let plan = warm.join(PREFETCH_PLAN);
     if tokio::fs::try_exists(&plan).await.unwrap_or(false) {
         let dest = workdir.join(PREFETCH_PLAN);
@@ -291,6 +291,9 @@ pub async fn build_warm_snapshot(
     {
         return Err(Status::not_found(format!("no template {template}")));
     }
+    let is_systemd = crate::oci::image_environment(&config.data_dir, template)
+        .await
+        .systemd;
 
     // Assembled beside the live snapshot and swapped in at the end. Rebuilding
     // in place would delete the files out from under a create that has already
@@ -366,9 +369,10 @@ pub async fn build_warm_snapshot(
         guest_mac: Some(lease.guest_mac()),
     });
     spec.boot_args = format!(
-        "{} root=/dev/vda ro init=/usr/bin/burrow-guest {} {}",
+        "{} root=/dev/vda ro init=/usr/bin/burrow-guest {} {} {}",
         burrow_firecracker::DEFAULT_BOOT_ARGS,
         lease.kernel_ip_arg(),
+        crate::sandbox::guest_mode_arg(is_systemd),
         config.extra_boot_args
     );
     apply_confinement(&mut spec, config, shape);

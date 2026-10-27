@@ -110,8 +110,9 @@ fn registry() -> &'static Mutex<Registry> {
     REGISTRY.get_or_init(Mutex::default)
 }
 
+static COUNTER: AtomicU64 = AtomicU64::new(1);
+
 fn next_id() -> String {
-    static COUNTER: AtomicU64 = AtomicU64::new(1);
     format!("cmd_{}", COUNTER.fetch_add(1, Ordering::Relaxed))
 }
 
@@ -204,6 +205,17 @@ fn entry(id: &str) -> Result<Arc<Mutex<Entry>>, Status> {
         .get(id)
         .cloned()
         .ok_or_else(|| Status::not_found(format!("no such command: {id}")))
+}
+
+/// Whether any command is still running. An upgrade re-executes the agent,
+/// and a running command's pipes and pty would not survive that.
+pub fn has_running() -> bool {
+    registry()
+        .lock()
+        .unwrap()
+        .entries
+        .values()
+        .any(|entry| entry.lock().unwrap().exit_code.is_none())
 }
 
 pub fn list() -> guestpb::ListCommandsResponse {
@@ -337,5 +349,107 @@ mod tests {
             signal(handle.id(), 15).unwrap_err().code(),
             tonic::Code::FailedPrecondition
         );
+    }
+}
+
+/// A finished command as written to disk across an agent re-exec.
+///
+/// Only finished ones travel: a running command's pipes and pty belong to
+/// the old process, which is why an upgrade refuses while one runs.
+#[derive(serde::Serialize, serde::Deserialize)]
+struct SavedEntry {
+    id: String,
+    cmd: Vec<String>,
+    user: String,
+    pid: i32,
+    started_at_ms: i64,
+    ended_at_ms: i64,
+    exit_code: i32,
+    /// (0 stdout, 1 stderr, 2 exit) and the bytes or the code's LE bytes.
+    frames: Vec<(u8, Vec<u8>)>,
+}
+
+#[derive(serde::Serialize, serde::Deserialize)]
+struct Saved {
+    next_id: u64,
+    entries: Vec<SavedEntry>,
+}
+
+/// Writes every finished command to `path`, for the agent that replaces this
+/// one to read back. Ids keep counting from where they were, so an id a
+/// client holds stays unique.
+pub fn save(path: &str) -> std::io::Result<()> {
+    let registry = registry().lock().unwrap();
+    let entries = registry
+        .order
+        .iter()
+        .filter_map(|id| registry.entries.get(id))
+        .filter_map(|entry| {
+            let entry = entry.lock().unwrap();
+            let exit_code = entry.exit_code?;
+            Some(SavedEntry {
+                id: entry.id.clone(),
+                cmd: entry.cmd.clone(),
+                user: entry.user.clone(),
+                pid: entry.pid,
+                started_at_ms: entry.started_at_ms,
+                ended_at_ms: entry.ended_at_ms,
+                exit_code,
+                frames: entry
+                    .buffer
+                    .iter()
+                    .map(|frame| match frame {
+                        Frame::Stdout(bytes) => (0, bytes.clone()),
+                        Frame::Stderr(bytes) => (1, bytes.clone()),
+                        Frame::Exit(code) => (2, code.to_le_bytes().to_vec()),
+                    })
+                    .collect(),
+            })
+        })
+        .collect();
+    let saved = Saved {
+        next_id: COUNTER.load(Ordering::Relaxed),
+        entries,
+    };
+    let bytes = serde_json::to_vec(&saved).map_err(std::io::Error::other)?;
+    std::fs::write(path, bytes)
+}
+
+/// Reads what [`save`] wrote and removes the file. Best effort: a table that
+/// cannot be read is an empty history, not a failed upgrade.
+pub fn restore(path: &str) {
+    let Ok(bytes) = std::fs::read(path) else {
+        return;
+    };
+    let _ = std::fs::remove_file(path);
+    let Ok(saved) = serde_json::from_slice::<Saved>(&bytes) else {
+        return;
+    };
+    COUNTER.fetch_max(saved.next_id, Ordering::Relaxed);
+    let mut registry = registry().lock().unwrap();
+    for saved in saved.entries {
+        let mut entry = Entry {
+            id: saved.id.clone(),
+            cmd: saved.cmd,
+            user: saved.user,
+            pid: saved.pid,
+            started_at_ms: saved.started_at_ms,
+            ended_at_ms: saved.ended_at_ms,
+            exit_code: Some(saved.exit_code),
+            buffer: VecDeque::new(),
+            buffered: 0,
+            live: broadcast::channel(LIVE_BACKLOG).0,
+        };
+        for (kind, bytes) in saved.frames {
+            entry.push(match kind {
+                0 => Frame::Stdout(bytes),
+                1 => Frame::Stderr(bytes),
+                _ => Frame::Exit(i32::from_le_bytes(bytes.try_into().unwrap_or_default())),
+            });
+        }
+        registry.order.push_back(saved.id.clone());
+        registry
+            .entries
+            .insert(saved.id, Arc::new(Mutex::new(entry)));
     }
 }

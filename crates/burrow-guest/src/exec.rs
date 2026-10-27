@@ -23,7 +23,7 @@ use burrow_proto::guest::v1::exec_output::Output;
 
 use crate::asyncfd::AsyncPipe;
 use crate::commands::{self, Frame, Handle};
-use crate::{pty, reaper, users};
+use crate::{pty, reaper, systemd, users};
 
 /// Bounded so a chatty command cannot outrun the network and exhaust guest
 /// memory; back-pressure propagates to the child through the pipe.
@@ -79,23 +79,31 @@ pub async fn run(mut inbound: Streaming<guestpb::ExecInput>) -> Result<OutputRx,
         }
     }
     command.envs(&start.env);
-    match (start.cwd.as_str(), &credentials) {
-        ("", None) => {}
+    let cwd = match (start.cwd.as_str(), &credentials) {
+        ("", None) => None,
         // A user's commands start in their own home rather than wherever the
         // agent happens to be, which is `/`.
-        ("", Some(creds)) if !creds.home.is_empty() => {
-            command.current_dir(&creds.home);
-        }
-        ("", Some(_)) => {}
-        (cwd, _) => {
-            command.current_dir(cwd);
+        ("", Some(creds)) if !creds.home.is_empty() => Some(creds.home.as_str()),
+        ("", Some(_)) => None,
+        (cwd, _) => Some(cwd),
+    };
+    let namespaces = systemd::Namespaces::current()
+        .map_err(|err| Status::unavailable(format!("entering systemd's namespaces: {err}")))?;
+    match &namespaces {
+        Some(namespaces) => namespaces
+            .enter(&mut command, cwd)
+            .map_err(|err| Status::invalid_argument(format!("cwd {cwd:?}: {err}")))?,
+        None => {
+            if let Some(cwd) = cwd {
+                command.current_dir(cwd);
+            }
         }
     }
 
     if start.is_pty {
-        run_pty(command, &start, credentials, inbound)
+        run_pty(command, &start, credentials, inbound, namespaces.as_ref())
     } else {
-        run_pipes(command, &start, credentials, inbound)
+        run_pipes(command, &start, credentials, inbound, namespaces.as_ref())
     }
 }
 
@@ -129,6 +137,16 @@ fn drop_privileges(command: &mut std::process::Command, credentials: &users::Cre
     }
 }
 
+fn spawn(
+    command: &mut std::process::Command,
+    namespaces: Option<&systemd::Namespaces>,
+) -> std::io::Result<std::process::Child> {
+    match namespaces {
+        Some(namespaces) => namespaces.spawn(command),
+        None => command.spawn(),
+    }
+}
+
 fn spawn_failed(cmd: &str, err: std::io::Error) -> Status {
     Status::failed_precondition(format!("spawn {cmd:?}: {err}"))
 }
@@ -143,6 +161,7 @@ fn run_pipes(
     start: &guestpb::ExecStart,
     credentials: Option<users::Credentials>,
     inbound: Streaming<guestpb::ExecInput>,
+    namespaces: Option<&systemd::Namespaces>,
 ) -> Result<OutputRx, Status> {
     command
         .stdin(Stdio::piped())
@@ -152,14 +171,12 @@ fn run_pipes(
         drop_privileges(&mut command, creds);
     }
 
-    let mut child = command
-        .spawn()
-        .map_err(|err| spawn_failed(&start.cmd[0], err))?;
-
-    // No await between spawn and watch, so the reaper cannot deliver this
-    // child's status before there is somewhere to deliver it to.
+    let gate = reaper::hold();
+    let mut child =
+        spawn(&mut command, namespaces).map_err(|err| spawn_failed(&start.cmd[0], err))?;
     let pid = child.id() as i32;
     let exit = reaper::watch(pid);
+    drop(gate);
     let handle = commands::register(start.cmd.clone(), start.user.clone(), pid);
 
     let stdin = child.stdin.take().map(pipe).transpose()?;
@@ -197,6 +214,7 @@ fn run_pty(
     start: &guestpb::ExecStart,
     credentials: Option<users::Credentials>,
     inbound: Streaming<guestpb::ExecInput>,
+    namespaces: Option<&systemd::Namespaces>,
 ) -> Result<OutputRx, Status> {
     use std::os::unix::process::CommandExt;
 
@@ -241,11 +259,11 @@ fn run_pty(
         drop_privileges(&mut command, creds);
     }
 
-    let child = command
-        .spawn()
-        .map_err(|err| spawn_failed(&start.cmd[0], err))?;
+    let gate = reaper::hold();
+    let child = spawn(&mut command, namespaces).map_err(|err| spawn_failed(&start.cmd[0], err))?;
     let pid = child.id() as i32;
     let exit = reaper::watch(pid);
+    drop(gate);
     let handle = commands::register(start.cmd.clone(), start.user.clone(), pid);
     drop(child);
 

@@ -126,14 +126,18 @@ burrow fork <source-id> --name worker-a
 - **Resources cannot be overridden.** Firecracker takes a restored VM's machine
   configuration from the snapshot, so a fork asking for different vcpus, memory
   or scratch disk is refused rather than silently given the source's shape.
-- Filesystem and memory start as copies and nothing is shared afterwards, so both
-  sides can diverge freely. The memory chain is copied whole rather than
-  flattened, because the restore path reads a chain anyway.
+- Filesystem and memory start as copy-on-write copies, so both sides can
+  diverge freely. The memory chain is hard-linked into the child, which is safe
+  because a layer is never written again once it exists. The scratch disk is
+  reflink or sparse copied. A child whose chain is deeper than two layers is
+  flattened behind the create, so a fork of a fork restores as fast as the
+  first.
 - The child gets its own id, address lease, tap, working directory and firewall
   rules. It never comes from the warm pool: a spare holds a template with nothing
   in it, and a fork's whole content is the state copied into it.
 - Fork does not stop the source, and the child lands on the source's node.
-  Snapshots and disks are node-local, so there is nothing to place.
+  The suspend state and disks it copies are node-local, so there is nothing to
+  place.
 
 ## Retention
 
@@ -162,9 +166,10 @@ is how long the parked state is worth paying for. The timestamp is persisted, so
 a node restart hands neither a fresh TTL to every recovered sandbox nor an
 expired one to a record written before the field existed.
 
-`burrow rm <id>` removes the suspend state in the sandbox's working directory.
-That state is not a snapshot object and does not outlive the sandbox, whereas
-snapshots taken with `burrow commit` are separate and survive. A forked child is
+`burrow rm <id>` removes the suspend state in the sandbox's working directory,
+and the copy in the object store if it has one. That state is not a snapshot
+object and does not outlive the sandbox, whereas snapshots taken with
+`burrow commit` are separate and survive. A forked child is
 independent, so deleting the source does not affect it.
 
 ## Snapshots
@@ -205,9 +210,10 @@ Two things follow from how snapshots are stored:
   <url>` on the nodes, every snapshot is also uploaded behind the create, and
   `burrow snapshot ls` shows `+store` once that has finished. A durable
   snapshot survives its node: if the node is unreachable, or gone, the create
-  is placed on any node of the same architecture running the same Firecracker,
-  which fetches it from the store first. Without the store a snapshot on an
-  unreachable node is unusable until the node returns.
+  is placed on any node of the same architecture running the same Firecracker.
+  That node fetches the disk before the restore and takes memory as the guest
+  touches it, so the create does not wait for the whole image. Without the
+  store a snapshot on an unreachable node is unusable until the node returns.
 
 ### Snapshot retention
 
@@ -250,6 +256,77 @@ refused. Without a cap nothing is ever evicted, so the flag could not mean
 anything; without an expiry a released snapshot is never reclaimed by anything,
 which would turn a policy meant to bound disk into one that grows without
 limit.
+
+## Surviving a node
+
+With an object store on the nodes, a suspended sandbox outlives its node too.
+After every suspend the node uploads the sandbox's state behind the call that
+suspended it, and `burrow ps -a` shows `+store` beside the node once the copy
+is current. Only what changed since the last upload is sent: the state is
+stored as content-addressed chunks, and a suspend that wrote a few megabytes of
+memory uploads a few megabytes.
+
+```sh
+burrow stop api
+burrow ps -a
+# SANDBOX      NAME   STATE       NODE             TEMPLATE  TAGS  CREATED
+# sbx_2f0c...  api    suspended   node_a +store    python          2026-09-02T07:55:39Z
+```
+
+Two things use that copy.
+
+- **`burrow move`.** The sandbox is suspended if it is running, its copy is
+  brought up to date, and another node adopts it and resumes it. Its processes
+  carry on where they were, with the same id, name and policy and a new
+  address. Measured on the dev harness, a running sandbox moved in 2.3 to
+  2.8 s and a suspended one in about 0.5 s.
+- **A node that dies.** When the orchestrator writes a node off, after
+  `--node-expiry-secs` of silence (a day by default; the dev harness uses two
+  minutes), every sandbox that was suspended there with
+  a current copy is kept with no node, and `burrow ps -a` shows its node as
+  `object store`. `burrow start` places it on a node of the same architecture
+  and Firecracker version and resumes it there; on the harness that took about
+  0.6 s. A sandbox that was running when its node died is lost, as before: the
+  copy is from its last suspend, and the guest had moved on since.
+
+The adopting node fetches the vmstate and the scratch disk, then starts the
+guest at once and serves its memory as it faults, fetching the chunk under
+each fault while the rest arrives behind it.
+
+What does not move: volumes, which are storage on a node, so a sandbox with a
+volume stays where it is; published ports and shares; and the session history.
+An edge hostname names the node, so it changes with the move.
+
+Brokered credentials are never written to the store in the clear. They travel
+sealed under a key every node shares, `--object-store-key-file`, which burrowd
+never generates: a key each node made for itself would seal what no other node
+can open. A sandbox holding credentials on a node without the key stays on its
+node. Create one key for the fleet and give every node the same file.
+
+```sh
+head -c 32 /dev/urandom > store.key
+burrowd serve ... --object-store s3://bucket/prefix \
+  --object-store-endpoint <url> --object-store-key-file store.key
+```
+
+### One sandbox, one node
+
+A sandbox must never run in two places, and two things make sure of it.
+
+- **The store says where it runs.** A node records a sandbox as running in the
+  store *before* it resumes the guest, and a node adopting a sandbox refuses
+  one the store says is running. So a node that resumed a sandbox and then
+  died leaves a copy nobody will resume in its place.
+- **A node that cannot reach the orchestrator stops resuming.** Every
+  heartbeat renews a lease a little shorter than the expiry after which the
+  orchestrator writes a node off. Once it lapses the node resumes none of its
+  stored sandboxes, edge wake-ups included, until the orchestrator confirms
+  they are still its own. A restarted node starts that way too. If another node
+  adopted one meanwhile, the orchestrator says so on the next heartbeat and
+  the node drops its copy.
+
+A resume of a sandbox with a stored copy writes one small object to the store
+first, and fails rather than resuming if the store cannot be reached.
 
 ## Warm template snapshots
 

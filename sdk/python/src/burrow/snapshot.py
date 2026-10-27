@@ -23,9 +23,12 @@ class Snapshot:
     worker = Sandbox.create(snapshot=snapshot.id)
     ```
 
-    A snapshot is **node-local**: it encodes the host's cpu features and the
-    exact Firecracker version, so it can only be restored on the node that took
-    it, and a sandbox created from one is placed there.
+    A snapshot encodes the host's cpu architecture and the exact Firecracker
+    version. A create from one is placed on the node holding it. When the nodes
+    run with an object store, the snapshot is also uploaded there and
+    `is_durable` turns true; a create from a durable snapshot can then be
+    placed on any node with the same `arch` and `firecracker_version`,
+    including when the node that took it is gone.
     """
 
     def __init__(self, transport: Transport, raw: common_pb2.Snapshot):
@@ -36,7 +39,8 @@ class Snapshot:
         # The sandbox the state was taken from. It may since have been deleted.
         self.sandbox_id = raw.sandbox_id
         self.template = raw.template
-        # The node holding it, and the only node it can be restored on.
+        # The node holding it locally. Empty when only the object store holds
+        # it.
         self.node_id = raw.node_id
         # The machine the snapshot was taken on, and the only one it restores
         # as.
@@ -49,6 +53,11 @@ class Snapshot:
         self.size_bytes = raw.size_bytes
         # RFC 3339, or "" when the snapshot does not expire.
         self.expires_at = raw.expires_at
+        # A copy is in the fleet's object store, so a create from it can be
+        # placed on any node matching `arch` and `firecracker_version`.
+        self.is_durable = raw.is_durable
+        self.arch = raw.arch
+        self.firecracker_version = raw.firecracker_version
 
     @staticmethod
     def _adopt(transport: Transport, raw: common_pb2.Snapshot) -> "Snapshot":
@@ -88,7 +97,7 @@ class Snapshot:
             transport.close()
 
     def delete(self) -> None:
-        """Deletes the snapshot, freeing its disk on the node holding it."""
+        """Deletes the snapshot, from the node holding it and from the object store."""
         try:
             self._transport.unary("DeleteSnapshot", api_pb2.SnapshotRef(id=self.id))
         finally:

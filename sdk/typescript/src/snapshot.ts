@@ -32,16 +32,21 @@ export interface ListSnapshotsOptions {
  * const worker = await Sandbox.create({ snapshot: snapshot.id });
  * ```
  *
- * A snapshot is **node-local**: it encodes the host's cpu features and the
- * exact Firecracker version, so it can only be restored on the node that took
- * it, and a sandbox created from one is placed there.
+ * A snapshot encodes the host's cpu architecture and the exact Firecracker
+ * version. A create from one is placed on the node holding it. When the nodes
+ * run with an object store, the snapshot is also uploaded there and
+ * {@link isDurable} turns true; a create from a durable snapshot can then be
+ * placed on any node with the same {@link arch} and {@link firecrackerVersion},
+ * including when the node that took it is gone.
  */
 export class Snapshot {
   readonly id: string;
   /** The sandbox the state was taken from. It may since have been deleted. */
   readonly sandboxId: string;
   readonly template: string;
-  /** The node holding it, and the only node it can be restored on. */
+  /**
+   * The node holding it locally. Empty when only the object store holds it.
+   */
   readonly nodeId: string;
   /** The machine the snapshot was taken on, and the only one it restores as. */
   readonly vcpus: number;
@@ -53,6 +58,15 @@ export class Snapshot {
   readonly sizeBytes: number;
   /** RFC 3339, or `""` when the snapshot does not expire. */
   readonly expiresAt: string;
+  /**
+   * A copy is in the fleet's object store, so a create from it can be placed
+   * on any node matching {@link arch} and {@link firecrackerVersion}.
+   */
+  readonly isDurable: boolean;
+  /** Cpu architecture it was taken on. */
+  readonly arch: string;
+  /** Firecracker version it was taken with. */
+  readonly firecrackerVersion: string;
 
   private readonly transport: Transport;
 
@@ -71,6 +85,9 @@ export class Snapshot {
     this.createdAt = String(raw.createdAt ?? "");
     this.sizeBytes = Number(raw.sizeBytes ?? 0);
     this.expiresAt = String(raw.expiresAt ?? "");
+    this.isDurable = Boolean(raw.isDurable);
+    this.arch = String(raw.arch ?? "");
+    this.firecrackerVersion = String(raw.firecrackerVersion ?? "");
   }
 
   /** @internal: lets a sandbox hand its own connection to the snapshot. */
@@ -128,7 +145,7 @@ export class Snapshot {
     }
   }
 
-  /** Deletes a snapshot, freeing its disk on the node holding it. */
+  /** Deletes a snapshot, from the node holding it and from the object store. */
   async delete(options: { signal?: AbortSignal } = {}): Promise<void> {
     try {
       await this.transport.unary(

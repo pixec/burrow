@@ -3,16 +3,17 @@
 Yes, with one caveat worth stating before the steps: Kubernetes schedules
 burrow's daemons, not its sandboxes. A burrow sandbox is a firecracker microVM
 that `burrowd` places, snapshots and restores itself, and the orchestrator does
-its own placement across nodes. So the cluster's job here is narrow: run one
-control plane, run one node daemon per KVM-capable machine, and keep them
-addressable. Nothing about a sandbox is a pod, and `kubectl` cannot see one.
+its own placement across nodes. So the cluster's job here is narrow: run the
+control plane's replicas and their database, run one node daemon per
+KVM-capable machine, and keep them addressable. Nothing about a sandbox is a pod, and `kubectl` cannot see one.
 
 That makes the mapping straightforward:
 
 | Burrow | Kubernetes | Why |
 | --- | --- | --- |
-| orchestrator | StatefulSet, 1 replica + Service | Single source of truth for the sandbox-to-node mapping; no leader election, so a second replica is a second answer |
-| node (`burrowd`) | DaemonSet, `hostNetwork`, privileged | Owns a machine's `/dev/kvm`, taps, nftables and local sandbox state; sandboxes never move between nodes |
+| orchestrator | Deployment, 2 replicas + Service + PodDisruptionBudget | Stateless over PostgreSQL; any replica serves, one leads background work |
+| PostgreSQL | Your own, or CloudNativePG (`05-postgres.yaml`) | Where every replica's state meets; its failover is the control plane's |
+| node (`burrowd`) | DaemonSet, `hostNetwork`, privileged | Owns a machine's `/dev/kvm`, taps, nftables and local sandbox state; a running sandbox never moves between nodes |
 | sandbox | *nothing* | A microVM `burrowd` manages directly |
 
 ## What the cluster has to give you
@@ -76,8 +77,18 @@ not exist, rather than running on a token published in this repository.
 kubectl create namespace burrow
 kubectl -n burrow create secret generic burrow-tokens \
   --from-literal=api-key="$(openssl rand -hex 32)" \
-  --from-literal=node-token="$(openssl rand -hex 32)"
+  --from-literal=node-token="$(openssl rand -hex 32)" \
+  --from-literal=database-url="postgres://burrow:...@burrow-postgres-rw:5432/burrow"
+head -c 32 /dev/urandom > secrets.key
+kubectl -n burrow create secret generic burrow-secrets-key --from-file=secrets.key
+rm secrets.key
 ```
+
+`database-url` is the orchestrator's PostgreSQL; with `05-postgres.yaml`, take
+the URI from the `burrow-postgres-app` secret CloudNativePG creates and set it
+once the cluster is up. `burrow-secrets-key` seals stored secrets and is shared
+by every replica, so it is made once rather than per pod; keep a copy, because
+losing it makes every stored secret unreadable.
 
 Keep the two distinct: `api-key` is what tenants present, `node-token` is what
 a node presents to register, and registration decides where exec and logs get
@@ -90,6 +101,7 @@ the namespace you just created.
 ```sh
 kubectl label node <machine> burrow.pixec.net/kvm=true
 kubectl apply -f deploy/k8s/00-namespace.yaml
+kubectl apply -f deploy/k8s/05-postgres.yaml   # or skip, with a managed Postgres
 kubectl apply -f deploy/k8s/10-orchestrator.yaml
 kubectl apply -f deploy/k8s/20-node.yaml
 ```

@@ -237,18 +237,20 @@ async fn write(
     event: EgressEvent,
 ) {
     if let Some(store) = store
-        && let Err(err) = store.insert_egress(&burrow_store::EgressRow {
-            at: event.at.clone(),
-            sandbox_id: event.sandbox_id.clone(),
-            source_ip: event.source_ip.clone(),
-            destination: event.destination.clone(),
-            host: event.host.clone().unwrap_or_default(),
-            port: event.port as u32,
-            is_allowed: event.is_allowed,
-            reason: event.reason.clone(),
-            bytes_sent: event.bytes_sent as i64,
-            bytes_received: event.bytes_received as i64,
-        })
+        && let Err(err) = store
+            .insert_egress(&burrow_store::EgressRow {
+                at: event.at.clone(),
+                sandbox_id: event.sandbox_id.clone(),
+                source_ip: event.source_ip.clone(),
+                destination: event.destination.clone(),
+                host: event.host.clone().unwrap_or_default(),
+                port: event.port as u32,
+                is_allowed: event.is_allowed,
+                reason: event.reason.clone(),
+                bytes_sent: event.bytes_sent as i64,
+                bytes_received: event.bytes_received as i64,
+            })
+            .await
     {
         tracing::error!(%err, "failed to record audit row");
     }
@@ -404,7 +406,7 @@ mod tests {
         let line = serde_json::to_string(&lossy).unwrap();
         assert!(line.contains("\"dropped_records\":7"), "{line}");
 
-        // And a record written before the field existed still reads back.
+        // A record with no drops omits the field, and reads back as zero.
         let old = r#"{"at":"t","sandbox_id":"s","source_ip":"1.2.3.4",
             "destination":"d","host":null,"port":443,"is_allowed":true,
             "reason":"allowed","bytes_sent":0,"bytes_received":0}"#;

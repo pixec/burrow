@@ -17,7 +17,6 @@ use aws_sdk_s3::operation::get_object::GetObjectError;
 use aws_sdk_s3::operation::head_object::HeadObjectError;
 use aws_sdk_s3::primitives::ByteStream;
 use aws_smithy_http_client::tls;
-use futures::TryStreamExt as _;
 use tokio::io::{AsyncReadExt as _, AsyncSeekExt as _, AsyncWriteExt as _};
 use tonic::Status;
 
@@ -254,6 +253,36 @@ impl ObjectStore {
     }
 }
 
+impl ObjectStore {
+    /// Keys under `prefix` with when each was last written, for collecting
+    /// what nothing references any more.
+    pub async fn list_aged(
+        &self,
+        prefix: &str,
+    ) -> Result<Vec<(String, Option<std::time::SystemTime>)>, Status> {
+        let mut keys = Vec::new();
+        let mut pages = self
+            .client
+            .list_objects_v2()
+            .bucket(&self.bucket)
+            .prefix(self.key(prefix))
+            .into_paginator()
+            .send();
+        while let Some(page) = pages.next().await {
+            let page = page.map_err(|err| unavailable("list", prefix, err))?;
+            for object in page.contents() {
+                if let Some(rest) = object.key().and_then(|k| k.strip_prefix(&self.prefix)) {
+                    let modified = object
+                        .last_modified()
+                        .and_then(|at| std::time::SystemTime::try_from(*at).ok());
+                    keys.push((rest.to_string(), modified));
+                }
+            }
+        }
+        Ok(keys)
+    }
+}
+
 fn unavailable<E: std::error::Error + 'static, R: std::fmt::Debug>(
     what: &str,
     key: &str,
@@ -268,78 +297,21 @@ fn unavailable<E: std::error::Error + 'static, R: std::fmt::Debug>(
     Status::unavailable(format!("object store {what} {key}: {detail}"))
 }
 
-/// Sparse files over the wire.
+/// Sparse files, as snapshots were stored before they were chunked.
 ///
-/// A memory image and a scratch disk are mostly holes: a snapshot that occupies
-/// 40 MiB on disk has a 512 MiB memory file and a scratch disk the size of the
-/// guest's allowance. Sent as bytes they cost the apparent size on every
-/// upload and fetch, and arrive dense. So they go as their data extents, each
-/// prefixed by where it sits, under a key with a `.sparse` suffix, and the
-/// fetch writes them back at those offsets into a file truncated to the
-/// apparent length, so the holes come back as holes.
+/// Each was one object of its data extents, each prefixed by where it sits,
+/// under a key with a `.sparse` suffix. Kept so a snapshot uploaded in that
+/// form still restores; nothing is written this way any more.
 ///
 /// Format, all little-endian: `BRSPARSE` + u64 apparent length, then
 /// (u64 offset, u64 length, bytes) per extent in ascending order.
 const SPARSE_MAGIC: &[u8; 8] = b"BRSPARSE";
-const SPARSE_CHUNK: usize = 1 << 20;
 
 pub fn sparse_key(key: &str) -> String {
     format!("{key}.sparse")
 }
 
 impl ObjectStore {
-    pub async fn put_sparse_file(&self, key: &str, path: &Path) -> Result<(), Status> {
-        let std_file = std::fs::File::open(path)
-            .map_err(|err| Status::internal(format!("opening {}: {err}", path.display())))?;
-        let apparent = std_file
-            .metadata()
-            .map_err(|err| Status::internal(format!("sizing {}: {err}", path.display())))?
-            .len();
-        let extents = data_extents(&std_file, apparent)
-            .map_err(|err| Status::internal(format!("walking {}: {err}", path.display())))?;
-        let content_length = 16 + extents.iter().map(|(s, e)| 16 + (e - s)).sum::<u64>();
-        let mut file = tokio::fs::File::from_std(std_file);
-        let stream = async_stream::stream! {
-            let mut header = Vec::with_capacity(16);
-            header.extend_from_slice(SPARSE_MAGIC);
-            header.extend_from_slice(&apparent.to_le_bytes());
-            yield Ok::<_, std::io::Error>(bytes::Bytes::from(header));
-            for (start, end) in extents {
-                let mut extent = Vec::with_capacity(16);
-                extent.extend_from_slice(&start.to_le_bytes());
-                extent.extend_from_slice(&(end - start).to_le_bytes());
-                yield Ok(bytes::Bytes::from(extent));
-                if let Err(err) = file.seek(std::io::SeekFrom::Start(start)).await {
-                    yield Err(err);
-                    return;
-                }
-                let mut left = end - start;
-                while left > 0 {
-                    let want = left.min(SPARSE_CHUNK as u64) as usize;
-                    let mut buf = vec![0u8; want];
-                    if let Err(err) = file.read_exact(&mut buf).await {
-                        yield Err(err);
-                        return;
-                    }
-                    left -= want as u64;
-                    yield Ok(bytes::Bytes::from(buf));
-                }
-            }
-        };
-        let body = http_body_util::StreamBody::new(stream.map_ok(http_body::Frame::data));
-        let body = ByteStream::new(aws_sdk_s3::primitives::SdkBody::from_body_1_x(body));
-        self.client
-            .put_object()
-            .bucket(&self.bucket)
-            .key(self.key(&sparse_key(key)))
-            .content_length(content_length as i64)
-            .body(body)
-            .send()
-            .await
-            .map(drop)
-            .map_err(|err| unavailable("put", key, err))
-    }
-
     /// Rebuilds a sparse file from the store. `None` when the key is absent.
     pub async fn get_sparse_file(&self, key: &str, path: &Path) -> Result<Option<()>, Status> {
         let sparse = sparse_key(key);
@@ -389,19 +361,4 @@ impl ObjectStore {
         file.flush().await.map_err(write_err)?;
         Ok(Some(()))
     }
-}
-
-#[cfg(target_os = "linux")]
-fn data_extents(file: &std::fs::File, _apparent: u64) -> std::io::Result<Vec<(u64, u64)>> {
-    burrow_firecracker::data_extents(file)
-}
-
-/// Without SEEK_DATA the whole file is one extent, which is correct and dense.
-#[cfg(not(target_os = "linux"))]
-fn data_extents(_file: &std::fs::File, apparent: u64) -> std::io::Result<Vec<(u64, u64)>> {
-    Ok(if apparent == 0 {
-        Vec::new()
-    } else {
-        vec![(0, apparent)]
-    })
 }

@@ -374,6 +374,12 @@ message Sandbox {
   // {"selected": [...], "skipped": [...]}, "surface": {...}}`. Retained
   // across stop and start; a recreation selects afresh.
   string kit_selection = 19;
+  // Whether this suspended sandbox's state is in the object store as of its
+  // latest suspend, which is what lets it resume on another node.
+  bool is_durable = 20;
+  // What the saved state needs to be restored on, while it is durable.
+  string arch = 21;
+  string firecracker_version = 22;
 }
 
 // One VM boot inside a sandbox's life.
@@ -481,4 +487,39 @@ message NodeStatus {
   // The subset of `templates` imported from Kits, whose creates the node
   // provisions through the Kit lifecycle.
   repeated string kit_templates = 7;
+  // Volumes on this node, including those a Kit's lifecycle created on it,
+  // which the orchestrator never saw a request for.
+  repeated Volume volumes = 8;
+}
+
+// One thing that happened to a sandbox, as the node that did it recorded it.
+//
+// Nodes append events to their own log as they act, and the orchestrator
+// tails every node's log into one, so a consumer reads a single ordered
+// stream and can resume it from the last `seq` it saw. The usage figures are
+// the sandbox's totals at that instant, which is what lets a bill be built
+// from the intervals between events.
+message Event {
+  // The orchestrator's position in the fleet-wide log. 0 on a node's own log.
+  uint64 seq = 1;
+  string node_id = 2;
+  // The node's position in its own log; with `node_id` it names the event
+  // exactly once, however many times a tail reconnects.
+  uint64 node_seq = 3;
+  int64 at_unix_ms = 4;
+  string sandbox_id = 5;
+  // "created", "started", "agent_ready", "stopped", "destroyed",
+  // "snapshot_created".
+  string type = 6;
+  SandboxState state = 7;
+  // Why or from what: a session's started_by or ended_by, a snapshot id, a
+  // fork's source.
+  string detail = 8;
+  string template = 9;
+  map<string, string> metadata = 10;
+  uint64 cpu_usage_usec = 11;
+  uint64 rx_bytes = 12;
+  uint64 tx_bytes = 13;
+  uint32 vcpus = 14;
+  uint32 mem_mib = 15;
 }

@@ -1143,8 +1143,14 @@ the processes and memory the source had. It takes its template and machine shape
 from the snapshot, so passing a `template` or `resources` that disagree is
 refused rather than silently ignored.
 
-Snapshots are node-local, because one encodes host cpu features and the exact
-Firecracker version. A create from a snapshot is placed on the node holding it.
+A snapshot encodes the host's cpu architecture and the exact Firecracker
+version. A create from one is placed on the node holding it. When the nodes run
+with an object store (`burrowd serve --object-store`), every snapshot is also
+uploaded there, and `snapshot.isDurable` turns true once the upload finishes. A
+create from a durable snapshot can then be placed on any node with the same
+`snapshot.arch` and `snapshot.firecrackerVersion`, including when the node that
+took it is gone. `snapshot.nodeId` is empty when only the store holds it. See
+[PERSISTENCE.md](../../docs/PERSISTENCE.md#snapshots).
 
 Bound how much disk they hold with three `resources` fields, set when the
 sandbox is created:
@@ -1229,6 +1235,17 @@ filesystem and burrow's agent is installed as the VM's init. The image's `Env`
 and `WorkingDir` carry over, so commands see the `PATH` the image intended.
 Entrypoint, user, and signal handling do not, because a sandbox is a VM whose
 PID 1 is burrow's agent rather than a container running the image's process.
+
+An image that expects systemd can boot it under the agent. Pass
+`systemd: true` and every sandbox from the template keeps the mode.
+`Template.list` reports it as `systemd`. The image has to ship systemd; see
+[Systemd templates](../../docs/TEMPLATES.md#systemd-templates).
+
+```ts
+await Template.build(Template().fromImage("registry.example/ubuntu-systemd:24.04"), "ubuntu-systemd", {
+  systemd: true,
+});
+```
 
 ### Warm templates
 
@@ -1318,6 +1335,30 @@ for (const event of denied) {
 Lookups are permitted in every network mode, so a sandbox that tried to reach a
 blocked host shows up twice: the DNS query that resolved it, and the connection
 the proxy refused.
+
+## Follow lifecycle events
+
+The orchestrator keeps one ordered log of what happened to every sandbox:
+`created`, `started`, `agent_ready`, `stopped`, `destroyed` and
+`snapshot_created`. `burrow.events()` replays it oldest first and, with
+`follow`, keeps yielding new events as they happen.
+
+```ts
+let after = 0;
+for await (const event of burrow.events({ after, sandbox: "build-482", follow: true })) {
+  console.log(event.seq, event.type, event.state, event.detail);
+  after = event.seq; // resume from here after a disconnect
+}
+```
+
+`detail` says how a VM started (`boot`, `restore`, `resume`) or stopped
+(`suspended`, `deleted`, `stopped`, `failed`), what a sandbox was created from
+(`fork:<id>`, `snapshot:<id>`), or the snapshot a commit produced. Each event
+also carries the sandbox's `cpuUsageUsec`, `rxBytes`, `txBytes`, `vcpus` and
+`memoryMib` at that instant. Without `follow` the iterator ends after the
+replay; `limit` caps how many events are replayed. Break out of the loop or pass
+a `signal` to stop following. See
+[The event log](../../docs/ARCHITECTURE.md#the-event-log).
 
 ## Cancel calls
 
@@ -1442,6 +1483,7 @@ sandbox.usage;         // { cpuUsageUsec, rxBytes, txBytes }
 | `sandbox.snapshot`, `Snapshot.list`, `get`, `delete` | `CreateSnapshot`, `ListSnapshots`, `GetSnapshot`, `DeleteSnapshot` |
 | `Template.build`, `list`, `delete` | `BuildTemplate`, `ListTemplates`, `DeleteTemplate` |
 | `burrow.audit` | `QueryAudit` |
+| `burrow.events` | `TailEvents` |
 | `burrow.nodes`, `drainNode` | `ListNodes`, `DrainNode` |
 | `burrow.setSecret`, `listSecrets`, `deleteSecret` | `SetSecret`, `ListSecrets`, `DeleteSecret` |
 | `burrow.health` | `Health` |

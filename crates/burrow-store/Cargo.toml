@@ -5,9 +5,12 @@ edition.workspace = true
 license.workspace = true
 
 [dependencies]
-rusqlite = { workspace = true }
+sqlx = { version = "0.8", default-features = false, features = ["runtime-tokio", "tls-rustls-ring-webpki", "sqlite", "postgres", "migrate", "macros"] }
 serde = { workspace = true }
 serde_json = { workspace = true }
 thiserror = { workspace = true }
 tokio = { workspace = true }
 tracing = { workspace = true }
+
+[dev-dependencies]
+futures = { workspace = true }

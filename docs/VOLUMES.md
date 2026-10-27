@@ -69,7 +69,7 @@ that sandbox go, then fan out as many readers as you like.
 ### A volume never moves
 
 The image is a file on one machine. A sandbox that mounts one is placed on the
-node holding it, exactly as a create from a snapshot is. Mounting two volumes
+node holding it, exactly as a fork is placed on its source's node. Mounting two volumes
 that live on different nodes is refused, because nothing can attach both.
 
 Choose where a volume lands when you create it, since it is the only chance:

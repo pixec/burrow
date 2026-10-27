@@ -32,7 +32,10 @@ console.log(result.stdout()); // "2\n"
 
 **Persistence.** Suspend a sandbox to disk and resume it later with its
 processes where they were. Snapshot a prepared workspace and fork it into
-independent copies. Every VM a sandbox has run is recorded as a session.
+independent copies. With an object store, suspended sandboxes and snapshots
+restore on any matching node, including after the node that held them is gone,
+with memory paged in as the guest touches it. Every VM a sandbox has
+run is recorded as a session.
 [Read PERSISTENCE.md](docs/PERSISTENCE.md)
 
 </td>
@@ -40,7 +43,8 @@ independent copies. Every VM a sandbox has run is recorded as a session.
 
 **Egress policy.** No egress by default. Grant it by domain or CIDR; allowed
 names are pinned to the addresses the sandbox was told they resolve to, DNS is
-filtered in every mode, and every refusal is audited and queryable.
+filtered in every mode, and every decision the proxy and resolver make is
+audited and queryable.
 [Read FIREWALL.md](docs/FIREWALL.md)
 
 </td>
@@ -75,8 +79,9 @@ root disk. [Read VOLUMES.md](docs/VOLUMES.md)
 <td valign="top">
 
 **Multiple nodes.** An orchestrator places sandboxes across KVM nodes joined
-by a WireGuard mesh. Private inter-sandbox networks work across hosts, and
-published ports are reachable through a per-node edge with wildcard DNS.
+by a WireGuard mesh, and runs as several replicas over PostgreSQL. Private
+inter-sandbox networks work across hosts, and published ports are reachable
+through a per-node edge with wildcard DNS.
 [Read EDGE.md](docs/EDGE.md)
 
 </td>
@@ -87,7 +92,7 @@ published ports are reachable through a per-node edge with wildcard DNS.
 
 | Page | Covers |
 | --- | --- |
-| [docs/GETTING-STARTED.md](docs/GETTING-STARTED.md) | Dev harness setup, first sandbox, CLI and SDK examples, releases |
+| [docs/GETTING-STARTED.md](docs/GETTING-STARTED.md) | Development harness setup, first sandbox, CLI and SDK examples, releases |
 | [docs/CONCEPTS.md](docs/CONCEPTS.md) | What a sandbox is, its lifecycle, and the security model |
 | [docs/CLI.md](docs/CLI.md) | Every `burrow` command, its flags, and an example |
 | [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) | Request path, guest, networking, snapshots, placement, and the dev harness |
@@ -97,8 +102,9 @@ published ports are reachable through a per-node edge with wildcard DNS.
 | [docs/SHARE.md](docs/SHARE.md) | Sharing a sandbox through a tailcat address: a WireGuard tunnel over a DERP relay, no port on the node, and the client's own IP into the guest |
 | [docs/PERSISTENCE.md](docs/PERSISTENCE.md) | Suspend and resume, sessions, fork, and snapshot retention |
 | [docs/VOLUMES.md](docs/VOLUMES.md) | Storage that outlives a sandbox, and the rules that follow from block devices |
+| [docs/METERING.md](docs/METERING.md) | What is metered, where the record lives, and how it survives a deleted sandbox or a dead node |
 | [docs/TAGS.md](docs/TAGS.md) | Tagging sandboxes and filtering by tag |
-| [docs/COMPARISON.md](docs/COMPARISON.md) | How Burrow compares to Vercel Sandbox, E2B |
+| [docs/COMPARISON.md](docs/COMPARISON.md) | How Burrow compares to Vercel Sandbox, E2B, microsandbox, PandaStack, Modal and Cloudflare Sandbox |
 
 ## License
 

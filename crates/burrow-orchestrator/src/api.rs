@@ -18,7 +18,7 @@ use burrow_proto::node::v1::node_service_client::NodeServiceClient;
 use crate::OrchestratorState;
 
 type BoxStream<T> = Pin<Box<dyn Stream<Item = Result<T, Status>> + Send>>;
-type NodeClient = NodeServiceClient<
+pub type NodeClient = NodeServiceClient<
     tonic::service::interceptor::InterceptedService<tonic::transport::Channel, NodeAuth>,
 >;
 
@@ -147,6 +147,7 @@ pub struct ApiService(pub Arc<OrchestratorState>);
 /// Holds a placement's optimistic capacity charge until the create commits.
 struct PlacementGuard<'a> {
     nodes: &'a crate::registry::NodeRegistry,
+    store: Option<Arc<burrow_store::Store>>,
     node_id: String,
     vcpus: u32,
     mem_mib: u64,
@@ -163,6 +164,7 @@ impl Drop for PlacementGuard<'_> {
     fn drop(&mut self) {
         if !self.is_kept {
             self.nodes.release(&self.node_id, self.vcpus, self.mem_mib);
+            release_in_store(self.store.clone(), &self.node_id, self.vcpus, self.mem_mib);
         }
     }
 }
@@ -173,14 +175,19 @@ impl ApiService {
     /// The public API takes a sandbox by id or by name; nodes are only ever
     /// told ids. A reference that matches nothing is passed through unchanged,
     /// so the caller gets the usual "no sandbox X".
-    fn resolve(&self, reference: &str) -> String {
+    async fn resolve(&self, reference: &str) -> String {
         if self.0.sandboxes.get(reference).is_some() {
             return reference.to_string();
         }
-        self.0
-            .sandboxes
-            .id_by_name(reference)
-            .unwrap_or_else(|| reference.to_string())
+        if let Some(id) = self.0.sandboxes.id_by_name(reference) {
+            return id;
+        }
+        // Not in this replica's cache: possibly created through another one
+        // in the last second.
+        match self.0.sandboxes.load(reference).await {
+            Some(sandbox) => sandbox.id,
+            None => reference.to_string(),
+        }
     }
 
     fn node_of(&self, sandbox_id: &str) -> Result<String, Status> {
@@ -191,9 +198,52 @@ impl ApiService {
     }
 
     /// Returns a placement's reservation unless the create succeeds.
+    /// Chooses a node and takes the capacity on it in the store.
+    ///
+    /// The choice is made from this replica's view of the fleet, which other
+    /// replicas may have placed on since; the store's reservation is the one
+    /// that is checked and taken in a single statement. A node it refuses is
+    /// passed over and the next best is tried.
+    async fn place(
+        &self,
+        want: &crate::registry::Placement,
+    ) -> Result<String, crate::registry::PlacementError> {
+        self.place_avoiding(want, std::collections::HashSet::new())
+            .await
+    }
+
+    /// [`place`](Self::place), never choosing a node in `excluded`.
+    async fn place_avoiding(
+        &self,
+        want: &crate::registry::Placement,
+        mut excluded: std::collections::HashSet<String>,
+    ) -> Result<String, crate::registry::PlacementError> {
+        loop {
+            let node_id = self.0.nodes.place_excluding(want, &excluded)?;
+            let Some(store) = &self.0.store else {
+                return Ok(node_id);
+            };
+            match store
+                .reserve_capacity(&node_id, want.vcpus, want.mem_mib)
+                .await
+            {
+                Ok(true) => return Ok(node_id),
+                Ok(false) => {
+                    self.0.nodes.release(&node_id, want.vcpus, want.mem_mib);
+                    excluded.insert(node_id);
+                }
+                Err(err) => {
+                    self.0.nodes.release(&node_id, want.vcpus, want.mem_mib);
+                    return Err(crate::registry::PlacementError::Store(err.to_string()));
+                }
+            }
+        }
+    }
+
     fn place_guard(&self, node_id: &str, want: &crate::registry::Placement) -> PlacementGuard<'_> {
         PlacementGuard {
             nodes: &self.0.nodes,
+            store: self.0.store.clone(),
             node_id: node_id.to_string(),
             vcpus: want.vcpus,
             mem_mib: want.mem_mib,
@@ -220,12 +270,11 @@ impl ApiService {
         };
 
         let target = self
-            .0
-            .nodes
-            .place_for(&crate::registry::Placement {
+            .place(&crate::registry::Placement {
                 is_template_transfer_allowed: true,
                 ..want.clone()
             })
+            .await
             .map_err(|err| match err {
                 // A constraint the fleet cannot satisfy is not a capacity
                 // problem, and telling a caller to try again later would be
@@ -373,7 +422,7 @@ impl ApiService {
     /// the stored secret, so a header can name a credential without the
     /// value ever being on a command line or in a request. The node only ever
     /// sees the resolved policy, which it seals at rest like any other.
-    fn resolve_secret_refs(&self, network: &mut common::NetworkPolicy) -> Result<(), Status> {
+    async fn resolve_secret_refs(&self, network: &mut common::NetworkPolicy) -> Result<(), Status> {
         let mut values: Vec<&mut String> = Vec::new();
         for rule in &mut network.rules {
             match rule.action.as_mut() {
@@ -386,10 +435,27 @@ impl ApiService {
                 None => {}
             }
         }
+        // Names first, then the store, then the substitution: the store is
+        // async and the substitution is not.
+        let mut names = Vec::new();
+        for value in values.iter().filter(|v| v.contains(SECRET_REF)) {
+            substitute_secret_refs(value, |name| {
+                names.push(name.to_string());
+                Ok(String::new())
+            })?;
+        }
+        let mut resolved = HashMap::new();
+        for name in names {
+            if resolved.contains_key(&name) {
+                continue;
+            }
+            let value = self.secrets()?.get(&name).await.map_err(internal)?;
+            resolved.insert(name, value);
+        }
         for value in values {
             if value.contains(SECRET_REF) {
                 *value = substitute_secret_refs(value, |name| {
-                    self.secrets()?.get(name).map_err(internal)?.ok_or_else(|| {
+                    resolved.get(name).cloned().flatten().ok_or_else(|| {
                         Status::failed_precondition(format!(
                             "no secret {name:?}; store one with `burrow secret set`"
                         ))
@@ -425,7 +491,7 @@ impl ApiService {
             return Ok(out);
         };
         for service in burrow_kit::credential_services(&manifest.image_config) {
-            if let Some(value) = secrets.get(&service).map_err(internal)? {
+            if let Some(value) = secrets.get(&service).await.map_err(internal)? {
                 out.insert(service, value);
             }
         }
@@ -439,6 +505,12 @@ impl ApiService {
     /// reused; see [`NodeChannels`].
     async fn node_for(&self, sandbox_id: &str) -> Result<NodeClient, Status> {
         let node_id = self.node_of(sandbox_id)?;
+        if node_id.is_empty() {
+            return Err(Status::failed_precondition(format!(
+                "sandbox {sandbox_id} is suspended with its state in the object store, \
+                 and no node holds it; start it to place it"
+            )));
+        }
         let endpoint = self.0.nodes.endpoint(&node_id).ok_or_else(|| {
             Status::unavailable(format!(
                 "node {node_id} hosting {sandbox_id} is unreachable"
@@ -508,6 +580,79 @@ impl ApiService {
         false
     }
 
+    /// A snapshot this replica has not heard of, asked of every node.
+    ///
+    /// Snapshots are learned from nodes, and with several replicas only the
+    /// one that took a snapshot, or the one its node heartbeats to, knows of
+    /// it at once; the others catch up within half a minute. A caller who
+    /// took a snapshot and used it straight away should not be told it does
+    /// not exist in that window.
+    async fn find_snapshot(&self, id: &str) -> Option<common::Snapshot> {
+        let found = futures::future::join_all(reachable_nodes(&self.0).into_iter().map(
+            |(node_id, endpoint)| async move {
+                let mut client = self
+                    .0
+                    .channels
+                    .get(&endpoint, self.0.node_token.as_deref())
+                    .await
+                    .ok()?;
+                let snapshot = client
+                    .get_snapshot(api::SnapshotRef { id: id.to_string() })
+                    .await
+                    .ok()?
+                    .into_inner();
+                Some((node_id, snapshot))
+            },
+        ))
+        .await;
+        let (node_id, snapshot) = found.into_iter().flatten().next()?;
+        self.0.snapshots.insert(&node_id, snapshot);
+        self.0.snapshots.get(id)
+    }
+
+    /// A volume this replica has not heard of, asked of every node, for the
+    /// same reason as [`Self::find_snapshot`].
+    async fn find_volume(&self, name: &str) -> Option<common::Volume> {
+        let found = futures::future::join_all(reachable_nodes(&self.0).into_iter().map(
+            |(node_id, endpoint)| async move {
+                let mut client = self
+                    .0
+                    .channels
+                    .get(&endpoint, self.0.node_token.as_deref())
+                    .await
+                    .ok()?;
+                let volume = client
+                    .get_volume(api::VolumeRef {
+                        name: name.to_string(),
+                    })
+                    .await
+                    .ok()?
+                    .into_inner();
+                Some((node_id, volume))
+            },
+        ))
+        .await;
+        let (node_id, volume) = found.into_iter().flatten().next()?;
+        self.0.volumes.insert(&node_id, volume);
+        self.0.volumes.get(name)
+    }
+
+    /// A snapshot by id, from this replica's view or, failing that, the fleet's.
+    async fn snapshot(&self, id: &str) -> Option<common::Snapshot> {
+        match self.0.snapshots.get(id) {
+            Some(snapshot) => Some(snapshot),
+            None => self.find_snapshot(id).await,
+        }
+    }
+
+    /// A volume by name, from this replica's view or, failing that, the fleet's.
+    async fn volume(&self, name: &str) -> Option<common::Volume> {
+        match self.0.volumes.get(name) {
+            Some(volume) => Some(volume),
+            None => self.find_volume(name).await,
+        }
+    }
+
     /// The snapshot, the node a create from it should go to, and a client
     /// for that node.
     ///
@@ -522,9 +667,8 @@ impl ApiService {
         want: &crate::registry::Placement,
     ) -> Result<(common::Snapshot, String, NodeClient), Status> {
         let mut snapshot = self
-            .0
-            .snapshots
-            .get(id)
+            .snapshot(id)
+            .await
             .ok_or_else(|| Status::not_found(format!("no snapshot {id}")))?;
         let holder = (!snapshot.node_id.is_empty()
             && self.0.nodes.endpoint(&snapshot.node_id).is_some())
@@ -549,7 +693,7 @@ impl ApiService {
                     firecracker_version: snapshot.firecracker_version.clone(),
                     ..want.clone()
                 };
-                self.0.nodes.place_for(&want).map_err(|err| match err {
+                self.place(&want).await.map_err(|err| match err {
                     crate::registry::PlacementError::NoHealthyNode
                     | crate::registry::PlacementError::NoCapacity { .. } => {
                         Status::resource_exhausted(err.to_string())
@@ -585,13 +729,15 @@ impl ApiService {
     /// A volume is a disk image on one machine, so mounting one fixes
     /// placement the way a snapshot does. Mounting two that live on different
     /// nodes is refused rather than half satisfied: nothing can attach both.
-    fn node_for_volumes(&self, mounts: &[common::VolumeMount]) -> Result<Option<String>, Status> {
+    async fn node_for_volumes(
+        &self,
+        mounts: &[common::VolumeMount],
+    ) -> Result<Option<String>, Status> {
         let mut pinned: Option<String> = None;
         for mount in mounts.iter().filter(|mount| !mount.is_tmpfs) {
             let volume = self
-                .0
-                .volumes
-                .get(&mount.volume)
+                .volume(&mount.volume)
+                .await
                 .ok_or_else(|| Status::not_found(format!("no volume {}", mount.volume)))?;
             match &pinned {
                 Some(node) if *node != volume.node_id => {
@@ -610,9 +756,8 @@ impl ApiService {
     /// A client for the node holding one volume.
     async fn node_holding_volume(&self, name: &str) -> Result<(String, NodeClient), Status> {
         let volume = self
-            .0
-            .volumes
-            .get(name)
+            .volume(name)
+            .await
             .ok_or_else(|| Status::not_found(format!("no volume {name}")))?;
         let endpoint = self.0.nodes.endpoint(&volume.node_id).ok_or_else(|| {
             Status::failed_precondition(format!(
@@ -632,6 +777,157 @@ impl ApiService {
         Ok((volume.node_id, client))
     }
 
+    /// Hands a sandbox no node holds to one, which takes it up from the
+    /// object store and resumes it.
+    ///
+    /// `node_id` names the destination outright; otherwise it is placed like
+    /// a create, on hardware carrying `node_labels` and able to restore what
+    /// the sandbox's state was written on, passing over `excluded`.
+    async fn adopt(
+        &self,
+        sandbox: common::Sandbox,
+        node_id: &str,
+        node_labels: HashMap<String, String>,
+        excluded: Option<&str>,
+    ) -> Result<common::Sandbox, Status> {
+        let _adoption = self
+            .0
+            .sandboxes
+            .claim_adoption(&sandbox.id)
+            .await
+            .map_err(Status::aborted)?;
+        let resources = sandbox
+            .policy
+            .as_ref()
+            .and_then(|p| p.resources)
+            .unwrap_or_default();
+        let networks: Vec<String> = sandbox
+            .policy
+            .iter()
+            .flat_map(|p| p.networks.iter())
+            .map(|m| m.network.clone())
+            .filter(|name| !name.is_empty())
+            .collect();
+        let want = crate::registry::Placement {
+            template: sandbox.template.clone(),
+            prefer_node: self.0.sandboxes.node_hosting_networks(&networks),
+            is_mesh_available: self.0.nodes.is_mesh_available(""),
+            vcpus: resources.vcpus.max(1),
+            mem_mib: match resources.mem_mib {
+                0 => 512,
+                mem => mem as u64,
+            },
+            // The kernel and rootfs travel with the state.
+            is_template_transfer_allowed: true,
+            node_labels,
+            arch: sandbox.arch.clone(),
+            firecracker_version: sandbox.firecracker_version.clone(),
+        };
+        let (target, placed) = if node_id.is_empty() {
+            let target = self
+                .place_avoiding(&want, excluded.into_iter().map(str::to_string).collect())
+                .await
+                .map_err(placement_status)?;
+            let placed = self.place_guard(&target, &want);
+            (target, Some(placed))
+        } else {
+            let info = self
+                .0
+                .nodes
+                .info(node_id)
+                .ok_or_else(|| Status::not_found(format!("no node {node_id}")))?;
+            if (!want.arch.is_empty() && info.arch != want.arch)
+                || (!want.firecracker_version.is_empty()
+                    && info.firecracker_version != want.firecracker_version)
+            {
+                return Err(Status::failed_precondition(format!(
+                    "node {node_id} cannot restore sandbox {}: its state needs {} and \
+                     Firecracker {}",
+                    sandbox.id, want.arch, want.firecracker_version
+                )));
+            }
+            self.require_labels(node_id, &want.node_labels)?;
+            (node_id.to_string(), None)
+        };
+        let endpoint = self
+            .0
+            .nodes
+            .endpoint(&target)
+            .ok_or_else(|| Status::unavailable(format!("node {target} is unreachable")))?;
+        let mut client = self
+            .0
+            .channels
+            .get(&endpoint, self.0.node_token.as_deref())
+            .await
+            .map_err(|err| Status::unavailable(format!("cannot reach node {target}: {err}")))?;
+        let adopted = client
+            .adopt_sandbox(nodepb::NodeAdoptRequest {
+                record: Some(sandbox),
+                node_id: target.clone(),
+            })
+            .await?
+            .into_inner();
+        if let Some(placed) = placed {
+            placed.keep();
+        }
+        self.0.sandboxes.insert(adopted.clone());
+        tracing::info!(
+            sandbox = adopted.id,
+            node = target,
+            "sandbox adopted from the object store"
+        );
+        Ok(adopted)
+    }
+
+    /// The unplaced sandbox `id` names, if that is what it is.
+    fn unplaced(&self, id: &str) -> Option<common::Sandbox> {
+        self.0
+            .sandboxes
+            .get(id)
+            .filter(|sandbox| sandbox.node_id.is_empty())
+    }
+
+    /// Deletes the stored state of a sandbox no node holds, through any node
+    /// that can reach the object store.
+    async fn purge(&self, id: &str) -> Result<(), Status> {
+        let mut last = Status::unavailable(format!(
+            "no healthy node to delete sandbox {id}'s stored state through"
+        ));
+        for (node_id, endpoint) in reachable_nodes(&self.0) {
+            let mut client = match self
+                .0
+                .channels
+                .get(&endpoint, self.0.node_token.as_deref())
+                .await
+            {
+                Ok(client) => client,
+                Err(err) => {
+                    last = Status::unavailable(format!("cannot reach node {node_id}: {err}"));
+                    continue;
+                }
+            };
+            match client
+                .purge_sandbox(nodepb::NodeSandboxRef {
+                    sandbox_id: id.to_string(),
+                })
+                .await
+            {
+                Ok(_) => return Ok(()),
+                // A node without the store, or one older than the call.
+                Err(status)
+                    if matches!(
+                        status.code(),
+                        tonic::Code::FailedPrecondition | tonic::Code::Unimplemented
+                    ) =>
+                {
+                    last = status;
+                }
+                Err(status) => return Err(status),
+            }
+        }
+        Err(last)
+    }
+
     /// Returns the capacity a placement is still optimistically charged.
     fn release_charge(&self, sandbox: &common::Sandbox) {
         let resources = sandbox
@@ -639,14 +935,13 @@ impl ApiService {
             .as_ref()
             .and_then(|policy| policy.resources)
             .unwrap_or_default();
-        self.0.nodes.release(
-            &sandbox.node_id,
-            resources.vcpus.max(1),
-            match resources.mem_mib {
-                0 => 512,
-                mem => mem as u64,
-            },
-        );
+        let vcpus = resources.vcpus.max(1);
+        let mem_mib = match resources.mem_mib {
+            0 => 512,
+            mem => mem as u64,
+        };
+        self.0.nodes.release(&sandbox.node_id, vcpus, mem_mib);
+        release_in_store(self.0.store.clone(), &sandbox.node_id, vcpus, mem_mib);
     }
 }
 
@@ -704,7 +999,7 @@ impl Burrow for ApiService {
         burrow_common::tags::validate(&req.metadata)?;
         burrow_common::tags::validate_labels(&req.node_labels)?;
         if let Some(network) = req.policy.as_mut().and_then(|p| p.network.as_mut()) {
-            self.resolve_secret_refs(network)?;
+            self.resolve_secret_refs(network).await?;
         }
         // A name has to be settled before placement: refusing a duplicate
         // afterwards would mean charging a node for a sandbox that was never
@@ -721,7 +1016,8 @@ impl Burrow for ApiService {
         let reserved = self
             .0
             .sandboxes
-            .reserve(&sandbox_id, &req.name)
+            .reserve_claimed(&sandbox_id, &req.name)
+            .await
             .map_err(Status::already_exists)?;
 
         // A create from a snapshot goes where the snapshot is, or, for one
@@ -742,7 +1038,7 @@ impl Burrow for ApiService {
                 .as_ref()
                 .map(|p| p.volumes.clone())
                 .unwrap_or_default();
-            if let Some(node) = self.node_for_volumes(&mounts)?
+            if let Some(node) = self.node_for_volumes(&mounts).await?
                 && node != node_id
             {
                 return Err(Status::failed_precondition(format!(
@@ -828,12 +1124,14 @@ impl Burrow for ApiService {
         };
         // A mounted volume fixes the node, so placement is not a choice: it is
         // a check that the node holding the volumes can take the sandbox.
-        let pinned = self.node_for_volumes(
-            &req.policy
-                .as_ref()
-                .map(|p| p.volumes.clone())
-                .unwrap_or_default(),
-        )?;
+        let pinned = self
+            .node_for_volumes(
+                &req.policy
+                    .as_ref()
+                    .map(|p| p.volumes.clone())
+                    .unwrap_or_default(),
+            )
+            .await?;
         // Whether `place_for` charged the node for this sandbox. A
         // volume-pinned create never goes through placement, so nothing was
         // reserved for it, and a guard over it would refund a charge it never
@@ -854,7 +1152,7 @@ impl Burrow for ApiService {
                 self.replicate_to(&template, &node_id).await?;
                 node_id
             }
-            None => match self.0.nodes.place_for(&want) {
+            None => match self.place(&want).await {
                 Ok(node_id) => node_id,
                 // Every node that could take the sandbox lacks the template.
                 // Refusing would make placement hostage to wherever a build
@@ -930,7 +1228,7 @@ impl Burrow for ApiService {
         &self,
         req: Request<api::SandboxRef>,
     ) -> Result<Response<common::Sandbox>, Status> {
-        let id = self.resolve(&req.into_inner().id);
+        let id = self.resolve(&req.into_inner().id).await;
         let mut sandbox = self
             .0
             .sandboxes
@@ -938,7 +1236,7 @@ impl Burrow for ApiService {
             .ok_or_else(|| Status::not_found(format!("no sandbox {id}")))?;
         // The registry holds the last state the node reported, which is a stale
         // guess once that node stops heartbeating.
-        sandbox.is_unreachable = self.is_node_dead(&sandbox.node_id);
+        sandbox.is_unreachable = !sandbox.node_id.is_empty() && self.is_node_dead(&sandbox.node_id);
         Ok(Response::new(sandbox))
     }
 
@@ -956,7 +1254,8 @@ impl Burrow for ApiService {
         let healthy = self.0.nodes.healthy_ids();
         let mut sandboxes = self.0.sandboxes.list_tagged(filter);
         for sandbox in &mut sandboxes {
-            sandbox.is_unreachable = !healthy.contains(&sandbox.node_id);
+            sandbox.is_unreachable =
+                !sandbox.node_id.is_empty() && !healthy.contains(&sandbox.node_id);
         }
         Ok(Response::new(api::ListSandboxesResponse { sandboxes }))
     }
@@ -965,8 +1264,15 @@ impl Burrow for ApiService {
         &self,
         req: Request<api::SandboxRef>,
     ) -> Result<Response<api::DeleteSandboxResponse>, Status> {
-        let id = self.resolve(&req.into_inner().id);
+        let id = self.resolve(&req.into_inner().id).await;
         let node_id = self.node_of(&id)?;
+        // Nothing on any node to destroy, so no tombstone either: the stored
+        // state is all there is.
+        if node_id.is_empty() {
+            self.purge(&id).await?;
+            self.0.sandboxes.remove(&id);
+            return Ok(Response::new(api::DeleteSandboxResponse {}));
+        }
         let mut client = match self.node_for(&id).await {
             Ok(client) => client,
             // The node is not merely refusing this connection, it has stopped
@@ -1010,7 +1316,7 @@ impl Burrow for ApiService {
         &self,
         req: Request<api::SandboxRef>,
     ) -> Result<Response<common::Sandbox>, Status> {
-        let id = self.resolve(&req.into_inner().id);
+        let id = self.resolve(&req.into_inner().id).await;
         let mut client = self.node_for(&id).await?;
         let sandbox = client
             .pause_sandbox(nodepb::NodeSandboxRef { sandbox_id: id })
@@ -1025,7 +1331,12 @@ impl Burrow for ApiService {
         &self,
         req: Request<api::SandboxRef>,
     ) -> Result<Response<common::Sandbox>, Status> {
-        let id = self.resolve(&req.into_inner().id);
+        let id = self.resolve(&req.into_inner().id).await;
+        if let Some(sandbox) = self.unplaced(&id) {
+            return Ok(Response::new(
+                self.adopt(sandbox, "", HashMap::new(), None).await?,
+            ));
+        }
         let mut client = self.node_for(&id).await?;
         let sandbox = client
             .resume_sandbox(nodepb::NodeSandboxRef { sandbox_id: id })
@@ -1039,7 +1350,7 @@ impl Burrow for ApiService {
         &self,
         req: Request<api::SandboxRef>,
     ) -> Result<Response<common::Sandbox>, Status> {
-        let id = self.resolve(&req.into_inner().id);
+        let id = self.resolve(&req.into_inner().id).await;
         let mut client = self.node_for(&id).await?;
         let sandbox = client
             .stop_sandbox(nodepb::NodeSandboxRef { sandbox_id: id })
@@ -1053,7 +1364,12 @@ impl Burrow for ApiService {
         &self,
         req: Request<api::SandboxRef>,
     ) -> Result<Response<common::Sandbox>, Status> {
-        let id = self.resolve(&req.into_inner().id);
+        let id = self.resolve(&req.into_inner().id).await;
+        if let Some(sandbox) = self.unplaced(&id) {
+            return Ok(Response::new(
+                self.adopt(sandbox, "", HashMap::new(), None).await?,
+            ));
+        }
         let mut client = self.node_for(&id).await?;
         let sandbox = client
             .start_sandbox(nodepb::NodeSandboxRef { sandbox_id: id })
@@ -1068,13 +1384,14 @@ impl Burrow for ApiService {
         req: Request<api::RecreateSandboxRequest>,
     ) -> Result<Response<common::Sandbox>, Status> {
         let req = req.into_inner();
-        let id = self.resolve(&req.sandbox_id);
+        let id = self.resolve(&req.sandbox_id).await;
         let current = self
             .0
             .sandboxes
             .get(&id)
             .ok_or_else(|| Status::not_found(format!("no sandbox {id}")))?;
         let node_id = current.node_id.clone();
+        let mut client = self.node_for(&id).await?;
         // A replacement template has to be where the sandbox is: its disks
         // and volumes do not move, so the template comes to them.
         if !req.template.is_empty() {
@@ -1085,7 +1402,6 @@ impl Burrow for ApiService {
         } else {
             &req.template
         };
-        let mut client = self.node_for(&id).await?;
         let credentials = self.kit_credentials(&mut client, &node_id, judged).await?;
         let sandbox = client
             .recreate_sandbox(nodepb::NodeRecreateRequest {
@@ -1111,6 +1427,7 @@ impl Burrow for ApiService {
         }
         self.secrets()?
             .set(&req.name, &req.value)
+            .await
             .map_err(internal)?;
         Ok(Response::new(api::SetSecretResponse {}))
     }
@@ -1119,7 +1436,7 @@ impl Burrow for ApiService {
         &self,
         _req: Request<api::ListSecretsRequest>,
     ) -> Result<Response<api::ListSecretsResponse>, Status> {
-        let names = self.secrets()?.list().map_err(internal)?;
+        let names = self.secrets()?.list().await.map_err(internal)?;
         Ok(Response::new(api::ListSecretsResponse { names }))
     }
 
@@ -1128,7 +1445,7 @@ impl Burrow for ApiService {
         req: Request<api::DeleteSecretRequest>,
     ) -> Result<Response<api::DeleteSecretResponse>, Status> {
         let name = req.into_inner().name;
-        let removed = self.secrets()?.delete(&name).map_err(internal)?;
+        let removed = self.secrets()?.delete(&name).await.map_err(internal)?;
         if !removed {
             return Err(Status::not_found(format!("no secret {name}")));
         }
@@ -1144,7 +1461,7 @@ impl Burrow for ApiService {
         &self,
         req: Request<api::SandboxRef>,
     ) -> Result<Response<api::ListSessionsResponse>, Status> {
-        let id = self.resolve(&req.into_inner().id);
+        let id = self.resolve(&req.into_inner().id).await;
         let mut client = self.node_for(&id).await?;
         let sessions = client
             .list_sessions(nodepb::NodeSandboxRef { sandbox_id: id })
@@ -1163,11 +1480,13 @@ impl Burrow for ApiService {
         req: Request<api::UpdateResourcesRequest>,
     ) -> Result<Response<common::Sandbox>, Status> {
         let req = req.into_inner();
-        let id = self.resolve(
-            &req.r#ref
-                .map(|r| r.id)
-                .ok_or_else(|| Status::invalid_argument("ref is required"))?,
-        );
+        let id = self
+            .resolve(
+                &req.r#ref
+                    .map(|r| r.id)
+                    .ok_or_else(|| Status::invalid_argument("ref is required"))?,
+            )
+            .await;
         let mut client = self.node_for(&id).await?;
         let sandbox = client
             .update_resources(nodepb::NodeUpdateResourcesRequest {
@@ -1197,13 +1516,15 @@ impl Burrow for ApiService {
     ) -> Result<Response<common::Sandbox>, Status> {
         let mut req = req.into_inner();
         if let Some(network) = req.policy.as_mut().and_then(|p| p.network.as_mut()) {
-            self.resolve_secret_refs(network)?;
+            self.resolve_secret_refs(network).await?;
         }
-        let source_id = self.resolve(
-            &req.r#ref
-                .map(|r| r.id)
-                .ok_or_else(|| Status::invalid_argument("ref is required"))?,
-        );
+        let source_id = self
+            .resolve(
+                &req.r#ref
+                    .map(|r| r.id)
+                    .ok_or_else(|| Status::invalid_argument("ref is required"))?,
+            )
+            .await;
         let node_id = self.node_of(&source_id)?;
         // A fork has no placement decision to constrain: the child is built
         // where its source's state is, so labels are checked against that node
@@ -1221,7 +1542,8 @@ impl Burrow for ApiService {
         let _reserved = self
             .0
             .sandboxes
-            .reserve(&child_id, &req.name)
+            .reserve_claimed(&child_id, &req.name)
+            .await
             .map_err(Status::already_exists)?;
 
         let mut client = self.node_for(&source_id).await?;
@@ -1249,16 +1571,91 @@ impl Burrow for ApiService {
     ///
     /// The sandbox keeps running. Nothing is placed: a snapshot is written
     /// beside the sandbox whose state it holds, and it stays on that node.
+    async fn move_sandbox(
+        &self,
+        req: Request<api::MoveSandboxRequest>,
+    ) -> Result<Response<common::Sandbox>, Status> {
+        let req = req.into_inner();
+        burrow_common::tags::validate_labels(&req.node_labels)?;
+        let id = self
+            .resolve(&req.r#ref.map(|r| r.id).unwrap_or_default())
+            .await;
+        let current = self
+            .0
+            .sandboxes
+            .get(&id)
+            .ok_or_else(|| Status::not_found(format!("no sandbox {id}")))?;
+        if current.node_id.is_empty() {
+            let moved = self
+                .adopt(current, &req.node_id, req.node_labels, None)
+                .await?;
+            return Ok(Response::new(moved));
+        }
+        let source = current.node_id.clone();
+        if req.node_id == source {
+            return Err(Status::invalid_argument(format!(
+                "sandbox {id} is already on node {source}"
+            )));
+        }
+        // Refused before anything is suspended: a volume is a disk on the
+        // source node and cannot follow the sandbox.
+        let mounts = current
+            .policy
+            .as_ref()
+            .map(|p| p.volumes.as_slice())
+            .unwrap_or_default();
+        if mounts.iter().any(|mount| !mount.is_tmpfs) {
+            return Err(Status::failed_precondition(format!(
+                "sandbox {id} mounts volumes, which are node-local and do not move"
+            )));
+        }
+        // Checked up front too, so a move that has nowhere to go does not
+        // suspend the sandbox on the way to finding that out.
+        if !req.node_id.is_empty() && self.0.nodes.endpoint(&req.node_id).is_none() {
+            return Err(Status::unavailable(format!(
+                "node {} is unreachable",
+                req.node_id
+            )));
+        }
+        let mut client = self.node_for(&id).await?;
+        let released = client
+            .release_sandbox(nodepb::NodeSandboxRef {
+                sandbox_id: id.clone(),
+            })
+            .await?
+            .into_inner();
+        // Between the two nodes the sandbox is nowhere, and recorded so: if
+        // the adopt fails, a later start places it rather than routing to a
+        // node that has let go of it.
+        let mut released = self.0.sandboxes.unplace(released);
+        self.release_charge(&common::Sandbox {
+            node_id: source.clone(),
+            ..released.clone()
+        });
+        if released.arch.is_empty() {
+            let info = self.0.nodes.info(&source).unwrap_or_default();
+            released.arch = info.arch;
+            released.firecracker_version = info.firecracker_version;
+        }
+        tracing::info!(sandbox = id, node = source, "sandbox released for a move");
+        let moved = self
+            .adopt(released, &req.node_id, req.node_labels, Some(&source))
+            .await?;
+        Ok(Response::new(moved))
+    }
+
     async fn create_snapshot(
         &self,
         req: Request<api::CreateSnapshotRequest>,
     ) -> Result<Response<common::Snapshot>, Status> {
         let req = req.into_inner();
-        let sandbox_id = self.resolve(
-            &req.r#ref
-                .map(|r| r.id)
-                .ok_or_else(|| Status::invalid_argument("ref is required"))?,
-        );
+        let sandbox_id = self
+            .resolve(
+                &req.r#ref
+                    .map(|r| r.id)
+                    .ok_or_else(|| Status::invalid_argument("ref is required"))?,
+            )
+            .await;
         let node_id = self.node_of(&sandbox_id)?;
         // The orchestrator owns the id namespace, here as everywhere else.
         let snapshot_id = burrow_common::SnapshotId::generate().to_string();
@@ -1295,7 +1692,11 @@ impl Burrow for ApiService {
         req: Request<api::ListSnapshotsRequest>,
     ) -> Result<Response<api::ListSnapshotsResponse>, Status> {
         let sandbox = req.into_inner().sandbox;
-        let sandbox = (!sandbox.is_empty()).then(|| self.resolve(&sandbox));
+        let sandbox = if sandbox.is_empty() {
+            None
+        } else {
+            Some(self.resolve(&sandbox).await)
+        };
         Ok(Response::new(api::ListSnapshotsResponse {
             snapshots: self.0.snapshots.list(sandbox.as_deref()),
         }))
@@ -1306,9 +1707,8 @@ impl Burrow for ApiService {
         req: Request<api::SnapshotRef>,
     ) -> Result<Response<common::Snapshot>, Status> {
         let id = req.into_inner().id;
-        self.0
-            .snapshots
-            .get(&id)
+        self.snapshot(&id)
+            .await
             .map(Response::new)
             .ok_or_else(|| Status::not_found(format!("no snapshot {id}")))
     }
@@ -1360,7 +1760,7 @@ impl Burrow for ApiService {
             arch: String::new(),
             firecracker_version: String::new(),
         };
-        let node_id = self.0.nodes.place_for(&want).map_err(|err| match err {
+        let node_id = self.place(&want).await.map_err(|err| match err {
             crate::registry::PlacementError::NoHealthyNode
             | crate::registry::PlacementError::NoCapacity { .. } => {
                 Status::resource_exhausted(err.to_string())
@@ -1443,11 +1843,13 @@ impl Burrow for ApiService {
         req: Request<api::UpdateTagsRequest>,
     ) -> Result<Response<common::Sandbox>, Status> {
         let req = req.into_inner();
-        let id = self.resolve(
-            &req.r#ref
-                .map(|r| r.id)
-                .ok_or_else(|| Status::invalid_argument("ref is required"))?,
-        );
+        let id = self
+            .resolve(
+                &req.r#ref
+                    .map(|r| r.id)
+                    .ok_or_else(|| Status::invalid_argument("ref is required"))?,
+            )
+            .await;
         burrow_common::tags::validate(&req.tags)?;
         let mut client = self.node_for(&id).await?;
         let sandbox = client
@@ -1471,11 +1873,13 @@ impl Burrow for ApiService {
         req: Request<api::UpdateAccessPolicyRequest>,
     ) -> Result<Response<common::Sandbox>, Status> {
         let req = req.into_inner();
-        let id = self.resolve(
-            &req.r#ref
-                .map(|r| r.id)
-                .ok_or_else(|| Status::invalid_argument("ref is required"))?,
-        );
+        let id = self
+            .resolve(
+                &req.r#ref
+                    .map(|r| r.id)
+                    .ok_or_else(|| Status::invalid_argument("ref is required"))?,
+            )
+            .await;
         let mut client = self.node_for(&id).await?;
         let sandbox = client
             .update_access_policy(nodepb::NodeUpdateAccessRequest {
@@ -1499,15 +1903,17 @@ impl Burrow for ApiService {
         req: Request<api::UpdateNetworkPolicyRequest>,
     ) -> Result<Response<common::Sandbox>, Status> {
         let req = req.into_inner();
-        let id = self.resolve(
-            &req.r#ref
-                .map(|r| r.id)
-                .ok_or_else(|| Status::invalid_argument("ref is required"))?,
-        );
+        let id = self
+            .resolve(
+                &req.r#ref
+                    .map(|r| r.id)
+                    .ok_or_else(|| Status::invalid_argument("ref is required"))?,
+            )
+            .await;
         let mut network = req
             .network
             .ok_or_else(|| Status::invalid_argument("network is required"))?;
-        self.resolve_secret_refs(&mut network)?;
+        self.resolve_secret_refs(&mut network).await?;
         let mut client = self.node_for(&id).await?;
         let sandbox = client
             .update_network_policy(nodepb::NodeUpdateNetworkRequest {
@@ -1634,7 +2040,7 @@ impl Burrow for ApiService {
         req: Request<api::ExposePortRequest>,
     ) -> Result<Response<api::PortMapping>, Status> {
         let mut req = req.into_inner();
-        req.sandbox_id = self.resolve(&req.sandbox_id);
+        req.sandbox_id = self.resolve(&req.sandbox_id).await;
         let node_id = self.node_of(&req.sandbox_id)?;
         let mut client = self.node_for(&req.sandbox_id).await?;
         let sandbox_id = req.sandbox_id.clone();
@@ -1652,7 +2058,7 @@ impl Burrow for ApiService {
         &self,
         req: Request<api::SandboxRef>,
     ) -> Result<Response<api::ListPortsResponse>, Status> {
-        let id = self.resolve(&req.into_inner().id);
+        let id = self.resolve(&req.into_inner().id).await;
         let node_id = self.node_of(&id)?;
         let mut client = self.node_for(&id).await?;
         let mut resp = client
@@ -1678,7 +2084,7 @@ impl Burrow for ApiService {
         req: Request<api::ClosePortRequest>,
     ) -> Result<Response<api::ClosePortResponse>, Status> {
         let mut req = req.into_inner();
-        req.sandbox_id = self.resolve(&req.sandbox_id);
+        req.sandbox_id = self.resolve(&req.sandbox_id).await;
         let mut client = self.node_for(&req.sandbox_id).await?;
         Ok(Response::new(client.close_port(req).await?.into_inner()))
     }
@@ -1688,7 +2094,7 @@ impl Burrow for ApiService {
         req: Request<api::ShareRequest>,
     ) -> Result<Response<api::Share>, Status> {
         let mut req = req.into_inner();
-        req.sandbox_id = self.resolve(&req.sandbox_id);
+        req.sandbox_id = self.resolve(&req.sandbox_id).await;
         let mut client = self.node_for(&req.sandbox_id).await?;
         Ok(Response::new(client.share_sandbox(req).await?.into_inner()))
     }
@@ -1697,7 +2103,7 @@ impl Burrow for ApiService {
         &self,
         req: Request<api::SandboxRef>,
     ) -> Result<Response<api::Share>, Status> {
-        let id = self.resolve(&req.into_inner().id);
+        let id = self.resolve(&req.into_inner().id).await;
         let mut client = self.node_for(&id).await?;
         Ok(Response::new(
             client
@@ -1711,7 +2117,7 @@ impl Burrow for ApiService {
         &self,
         req: Request<api::SandboxRef>,
     ) -> Result<Response<api::UnshareResponse>, Status> {
-        let id = self.resolve(&req.into_inner().id);
+        let id = self.resolve(&req.into_inner().id).await;
         let mut client = self.node_for(&id).await?;
         Ok(Response::new(
             client
@@ -1742,7 +2148,7 @@ impl Burrow for ApiService {
         };
         // Rewritten rather than merely resolved: the node is handed this same
         // message, and it only speaks ids.
-        start.sandbox_id = self.resolve(&start.sandbox_id);
+        start.sandbox_id = self.resolve(&start.sandbox_id).await;
 
         let mut client = self.node_for(&start.sandbox_id).await?;
         let outbound = async_stream::stream! {
@@ -1770,7 +2176,7 @@ impl Burrow for ApiService {
         // Only the first chunk names the sandbox, so this is the one place the
         // reference can be turned into the id the node expects.
         let mut first = first;
-        first.sandbox_id = self.resolve(&first.sandbox_id);
+        first.sandbox_id = self.resolve(&first.sandbox_id).await;
         let mut client = self.node_for(&first.sandbox_id).await?;
 
         // tonic's client streaming takes messages, not results, so a failed
@@ -1811,7 +2217,7 @@ impl Burrow for ApiService {
         req: Request<api::DownloadRequest>,
     ) -> Result<Response<Self::DownloadFileStream>, Status> {
         let mut req = req.into_inner();
-        req.sandbox_id = self.resolve(&req.sandbox_id);
+        req.sandbox_id = self.resolve(&req.sandbox_id).await;
         let mut client = self.node_for(&req.sandbox_id).await?;
         let stream = client.download_file(req).await?.into_inner();
         Ok(Response::new(Box::pin(stream)))
@@ -1829,7 +2235,7 @@ impl Burrow for ApiService {
         req: Request<api::AuditQuery>,
     ) -> Result<Response<Self::QueryAuditStream>, Status> {
         let mut query = req.into_inner();
-        query.sandbox_id = self.resolve(&query.sandbox_id);
+        query.sandbox_id = self.resolve(&query.sandbox_id).await;
         let limit = if query.limit == 0 { 100 } else { query.limit } as usize;
 
         // Every node holds part of the answer, and the pages are merged
@@ -1858,6 +2264,98 @@ impl Burrow for ApiService {
         ))))
     }
 
+    type TailEventsStream = BoxStream<common::Event>;
+
+    /// Replays the fleet log after a position, then follows it. Subscribed
+    /// before the replay so nothing between the two is missed, and live
+    /// events at or below the last replayed position are dropped so nothing
+    /// is doubled.
+    async fn tail_events(
+        &self,
+        req: Request<api::TailEventsRequest>,
+    ) -> Result<Response<Self::TailEventsStream>, Status> {
+        let req = req.into_inner();
+        let sandbox = if req.sandbox.is_empty() {
+            None
+        } else {
+            Some(self.resolve(&req.sandbox).await)
+        };
+        let limit = if req.limit == 0 {
+            1000
+        } else {
+            req.limit as usize
+        };
+        let mut live = self.0.events.subscribe();
+        let state = Arc::clone(&self.0);
+        let stream = async_stream::try_stream! {
+            let mut last = req.after_seq;
+            let mut sent = 0usize;
+            while sent < limit {
+                let batch = state
+                    .events
+                    .replay(last, sandbox.as_deref(), (limit - sent).min(1000))
+                    .await
+                    .map_err(|err| Status::internal(format!("reading events: {err}")))?;
+                if batch.is_empty() {
+                    break;
+                }
+                for event in batch {
+                    last = event.seq;
+                    sent += 1;
+                    yield event;
+                }
+            }
+            if !req.is_follow {
+                return;
+            }
+            // Only the leader copies node logs, so with several replicas the
+            // live broadcast is only fed on one of them; every replica can read
+            // the shared log, so followers poll it instead.
+            if state.events.is_shared() {
+                loop {
+                    let batch = state
+                        .events
+                        .replay(last, sandbox.as_deref(), 1000)
+                        .await
+                        .map_err(|err| Status::internal(format!("reading events: {err}")))?;
+                    if batch.is_empty() {
+                        tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+                        continue;
+                    }
+                    for event in batch {
+                        last = event.seq;
+                        yield event;
+                    }
+                }
+            }
+            loop {
+                match live.recv().await {
+                    Ok(event) => {
+                        if event.seq > last
+                            && sandbox.as_deref().is_none_or(|id| event.sandbox_id == id)
+                        {
+                            last = event.seq;
+                            yield event;
+                        }
+                    }
+                    Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {
+                        let batch = state
+                            .events
+                            .replay(last, sandbox.as_deref(), 1000)
+                            .await
+                            .map_err(|err| Status::internal(format!("reading events: {err}")))?;
+                        for event in batch {
+                            last = event.seq;
+                            yield event;
+                        }
+                    }
+                    Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+                }
+            }
+        };
+        Ok(Response::new(Box::pin(stream)))
+    }
+
     type WatchStream = BoxStream<api::WatchEvent>;
 
     async fn watch(
@@ -1865,7 +2363,7 @@ impl Burrow for ApiService {
         req: Request<api::WatchRequest>,
     ) -> Result<Response<Self::WatchStream>, Status> {
         let mut req = req.into_inner();
-        req.sandbox_id = self.resolve(&req.sandbox_id);
+        req.sandbox_id = self.resolve(&req.sandbox_id).await;
         let mut client = self.node_for(&req.sandbox_id).await?;
         // Watches are long-lived by nature, so no deadline is imposed here;
         // the client ends it by dropping the stream.
@@ -1878,7 +2376,7 @@ impl Burrow for ApiService {
         req: Request<api::ListDirRequest>,
     ) -> Result<Response<api::ListDirResponse>, Status> {
         let mut req = req.into_inner();
-        req.sandbox_id = self.resolve(&req.sandbox_id);
+        req.sandbox_id = self.resolve(&req.sandbox_id).await;
         let mut client = self.node_for(&req.sandbox_id).await?;
         Ok(Response::new(client.list_dir(req).await?.into_inner()))
     }
@@ -1888,7 +2386,7 @@ impl Burrow for ApiService {
         req: Request<api::ListCommandsRequest>,
     ) -> Result<Response<api::ListCommandsResponse>, Status> {
         let mut req = req.into_inner();
-        req.sandbox_id = self.resolve(&req.sandbox_id);
+        req.sandbox_id = self.resolve(&req.sandbox_id).await;
         let mut client = self.node_for(&req.sandbox_id).await?;
         Ok(Response::new(client.list_commands(req).await?.into_inner()))
     }
@@ -1898,7 +2396,7 @@ impl Burrow for ApiService {
         req: Request<api::GetCommandRequest>,
     ) -> Result<Response<api::CommandInfo>, Status> {
         let mut req = req.into_inner();
-        req.sandbox_id = self.resolve(&req.sandbox_id);
+        req.sandbox_id = self.resolve(&req.sandbox_id).await;
         let mut client = self.node_for(&req.sandbox_id).await?;
         Ok(Response::new(client.get_command(req).await?.into_inner()))
     }
@@ -1910,7 +2408,7 @@ impl Burrow for ApiService {
         req: Request<api::AttachCommandRequest>,
     ) -> Result<Response<Self::AttachCommandStream>, Status> {
         let mut req = req.into_inner();
-        req.sandbox_id = self.resolve(&req.sandbox_id);
+        req.sandbox_id = self.resolve(&req.sandbox_id).await;
         let mut client = self.node_for(&req.sandbox_id).await?;
         // An attach lasts as long as the command does, which no request
         // deadline should cut short.
@@ -1923,7 +2421,7 @@ impl Burrow for ApiService {
         req: Request<api::SignalCommandRequest>,
     ) -> Result<Response<api::SignalCommandResponse>, Status> {
         let mut req = req.into_inner();
-        req.sandbox_id = self.resolve(&req.sandbox_id);
+        req.sandbox_id = self.resolve(&req.sandbox_id).await;
         let mut client = self.node_for(&req.sandbox_id).await?;
         Ok(Response::new(
             client.signal_command(req).await?.into_inner(),
@@ -1935,7 +2433,7 @@ impl Burrow for ApiService {
         req: Request<api::CreateUserRequest>,
     ) -> Result<Response<api::CreateUserResponse>, Status> {
         let mut req = req.into_inner();
-        req.sandbox_id = self.resolve(&req.sandbox_id);
+        req.sandbox_id = self.resolve(&req.sandbox_id).await;
         let mut client = self.node_for(&req.sandbox_id).await?;
         Ok(Response::new(client.create_user(req).await?.into_inner()))
     }
@@ -1945,7 +2443,7 @@ impl Burrow for ApiService {
         req: Request<api::CreateGroupRequest>,
     ) -> Result<Response<api::CreateGroupResponse>, Status> {
         let mut req = req.into_inner();
-        req.sandbox_id = self.resolve(&req.sandbox_id);
+        req.sandbox_id = self.resolve(&req.sandbox_id).await;
         let mut client = self.node_for(&req.sandbox_id).await?;
         Ok(Response::new(client.create_group(req).await?.into_inner()))
     }
@@ -1955,7 +2453,7 @@ impl Burrow for ApiService {
         req: Request<api::GroupMembershipRequest>,
     ) -> Result<Response<api::GroupMembershipResponse>, Status> {
         let mut req = req.into_inner();
-        req.sandbox_id = self.resolve(&req.sandbox_id);
+        req.sandbox_id = self.resolve(&req.sandbox_id).await;
         let mut client = self.node_for(&req.sandbox_id).await?;
         Ok(Response::new(
             client.add_user_to_group(req).await?.into_inner(),
@@ -1967,7 +2465,7 @@ impl Burrow for ApiService {
         req: Request<api::GroupMembershipRequest>,
     ) -> Result<Response<api::GroupMembershipResponse>, Status> {
         let mut req = req.into_inner();
-        req.sandbox_id = self.resolve(&req.sandbox_id);
+        req.sandbox_id = self.resolve(&req.sandbox_id).await;
         let mut client = self.node_for(&req.sandbox_id).await?;
         Ok(Response::new(
             client.remove_user_from_group(req).await?.into_inner(),
@@ -1982,6 +2480,22 @@ impl Burrow for ApiService {
 /// length is capped short of a DNS label. Generated ids (`sbx_<uuid>`) satisfy
 /// the same rules, which keeps chosen and generated ids interchangeable
 /// everywhere downstream.
+/// The status a caller is given for a placement that found nowhere to go.
+fn placement_status(err: crate::registry::PlacementError) -> Status {
+    match err {
+        crate::registry::PlacementError::NoHealthyNode
+        | crate::registry::PlacementError::NoCapacity { .. } => {
+            Status::resource_exhausted(err.to_string())
+        }
+        crate::registry::PlacementError::PeersUnreachable(_)
+        | crate::registry::PlacementError::NoNodeWithLabels(_)
+        | crate::registry::PlacementError::NoCompatibleNode { .. } => {
+            Status::failed_precondition(err.to_string())
+        }
+        other => Status::not_found(other.to_string()),
+    }
+}
+
 fn validate_sandbox_id(id: &str) -> Result<(), Status> {
     if id.len() > 63 {
         return Err(Status::invalid_argument(
@@ -2004,6 +2518,22 @@ const SECRET_REF: &str = "${secret:";
 
 fn internal(err: anyhow::Error) -> Status {
     Status::internal(format!("{err:#}"))
+}
+
+/// Gives back capacity in the store from code that cannot wait for it.
+fn release_in_store(
+    store: Option<Arc<burrow_store::Store>>,
+    node_id: &str,
+    vcpus: u32,
+    mem_mib: u64,
+) {
+    let Some(store) = store else { return };
+    let node_id = node_id.to_string();
+    tokio::spawn(async move {
+        if let Err(err) = store.release_capacity(&node_id, vcpus, mem_mib).await {
+            tracing::warn!(node_id, %err, "could not release capacity in the store");
+        }
+    });
 }
 
 fn substitute_secret_refs(

@@ -62,10 +62,21 @@ unless `tls=False` (or an `http://` scheme) says it is intended.
 - `sandbox.commands` (`run`, `stream`, `list`, `connect`, `kill`) and
   `sandbox.pty.create()`, which is `sandbox.terminal`.
 - `Burrow`: one connection for many sandboxes: `health`, `list`, `get`,
-  `audit`, `nodes`, `drain_node`, and the secrets Sandbox Kits ask for by
-  service name: `set_secret`, `list_secrets`, `delete_secret`.
+  `audit`, `events`, `nodes`, `drain_node`, and the secrets Sandbox Kits ask
+  for by service name: `set_secret`, `list_secrets`, `delete_secret`.
+  `events` reads the fleet's lifecycle log, oldest first, and with
+  `follow=True` keeps yielding new events as they happen:
+
+  ```python
+  for event in burrow.events(sandbox="build-482", follow=True):
+      print(event.seq, event.type, event.state, event.detail)
+  ```
+
+  Pass the last `seq` seen as `after=` to resume after a disconnect.
 - `Snapshot`, `Volume`: saved state and persistent storage, addressable on
-  their own.
+  their own. A snapshot reports `is_durable` once a copy is in the fleet's
+  object store, and the `arch` and `firecracker_version` a node needs to
+  restore it.
 - `Template`: build guest images by running steps in a sandbox:
 
   ```python
@@ -74,6 +85,9 @@ unless `tls=False` (or an `http://` scheme) says it is intended.
   template = Template().from_image("python:3.12-slim").pip_install(["requests"])
   Template.build(template, "python-tools", on_build_logs=default_build_logger())
   ```
+
+  `systemd=True` boots the image's own systemd under the agent;
+  `Template.list()` reports it as `systemd`.
 
 - `Terminal`: a live pty for interactive use, callback-driven:
 

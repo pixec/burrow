@@ -425,6 +425,12 @@ export interface SandboxInfo {
   unreachable: boolean;
   /** What the sandbox has consumed, as of this reading. */
   usage: Usage;
+  /**
+   * Suspended with its latest suspend in the object store, so it can resume
+   * on another node. A durable sandbox with an empty `nodeId` is held by no
+   * node, and its next resume places it.
+   */
+  durable: boolean;
 }
 
 /** Inputs for a template pulled from a Sandbox Kit. */
@@ -637,6 +643,15 @@ export interface UpdateOptions {
    * restate the ones you want kept. Omitted leaves the policy as it is.
    */
   fs?: FsOptions;
+  signal?: AbortSignal;
+}
+
+/** Options for {@link Sandbox.move}. */
+export interface MoveOptions {
+  /** The node to move to. Omitted places it like a create. */
+  nodeId?: string;
+  /** Labels the destination must carry, when no node is named. */
+  nodeLabels?: Record<string, string>;
   signal?: AbortSignal;
 }
 
@@ -962,6 +977,10 @@ export interface NodeInfo {
    * carrying particular labels with {@link CreateOptions.nodeLabels}.
    */
   labels: Record<string, string>;
+  /** Cpu architecture. Durable snapshots only restore on a matching node. */
+  arch: string;
+  /** The Firecracker this node runs. Durable snapshots need an exact match. */
+  firecrackerVersion: string;
 }
 
 /** A filesystem change reported by {@link Sandbox.watch}. */
@@ -1011,4 +1030,53 @@ export interface AuditQuery {
   /** RFC 3339 lower bound. */
   since?: string;
   limit?: number;
+}
+
+/**
+ * One thing that happened to a sandbox, from the fleet's lifecycle log.
+ *
+ * Each event carries the sandbox's cpu and network totals at that instant, so
+ * the interval between two events is time spent in one state at one shape.
+ */
+export interface LifecycleEvent {
+  /** Position in the fleet-wide log. Pass it as `after` to resume. */
+  seq: number;
+  nodeId: string;
+  /** Position in the recording node's own log. */
+  nodeSeq: number;
+  /** Milliseconds since the Unix epoch. */
+  atUnixMs: number;
+  sandboxId: string;
+  /**
+   * `created`, `started`, `agent_ready`, `stopped`, `destroyed` or
+   * `snapshot_created`.
+   */
+  type: string;
+  state: SandboxState;
+  /**
+   * How a VM started (`boot`, `restore`, `resume`) or stopped (`suspended`,
+   * `deleted`, `stopped`, `failed`), what a sandbox was created from
+   * (`fork:<id>`, `snapshot:<id>`), or the snapshot a commit produced.
+   */
+  detail: string;
+  template: string;
+  metadata: Record<string, string>;
+  cpuUsageUsec: number;
+  rxBytes: number;
+  txBytes: number;
+  vcpus: number;
+  memoryMib: number;
+}
+
+/** Options for {@link Burrow.events}. */
+export interface EventsOptions {
+  /** Start after this `seq`. Omitted replays from the oldest event kept. */
+  after?: number;
+  /** Only events for this sandbox, by id or name. */
+  sandbox?: string;
+  /** Keep yielding new events after the replay instead of ending. */
+  follow?: boolean;
+  /** Cap on replayed events. Omitted lets the server choose. */
+  limit?: number;
+  signal?: AbortSignal;
 }

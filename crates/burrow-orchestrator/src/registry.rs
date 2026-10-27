@@ -48,6 +48,8 @@ pub struct Placement {
 pub enum PlacementError {
     #[error("no healthy node available")]
     NoHealthyNode,
+    #[error("could not reserve capacity: {0}")]
+    Store(String),
     #[error(
         "no node can restore this snapshot: it needs {arch} and Firecracker {firecracker_version}"
     )]
@@ -134,6 +136,10 @@ pub struct NodeEntry {
     /// empty list, and a node that genuinely holds nothing looks like a
     /// candidate for every template on the fleet.
     pub is_reported: bool,
+    /// Capacity other orchestrator replicas have promised on this node since
+    /// its last heartbeat, as the store last said.
+    pub reserved_vcpus: u32,
+    pub reserved_mem_mib: u64,
 }
 
 impl NodeEntry {
@@ -159,9 +165,22 @@ struct Reserved {
     mem_mib: u64,
 }
 
+/// What is promised on a node beyond its last report: this replica's own
+/// reservations, or the store's count of every replica's if that is larger.
+/// The store's includes this replica's once it has been reloaded, so the two
+/// are not added; the store's conditional reservation is the real gate, and
+/// this only ranks.
+fn held(entry: &NodeEntry, pending: &HashMap<String, Reserved>) -> Reserved {
+    let local = pending.get(&entry.info.id).copied().unwrap_or_default();
+    Reserved {
+        vcpus: local.vcpus.max(entry.reserved_vcpus),
+        mem_mib: local.mem_mib.max(entry.reserved_mem_mib),
+    }
+}
+
 /// Whether a node can take this sandbox without oversubscribing itself.
 fn is_fit(entry: &NodeEntry, pending: &HashMap<String, Reserved>, want: &Placement) -> bool {
-    let held = pending.get(&entry.info.id).copied().unwrap_or_default();
+    let held = held(entry, pending);
     let committed = entry.status.committed_vcpus as u64 + held.vcpus as u64 + want.vcpus as u64;
     // A node that has not reported its cpu count cannot be checked; trusting it
     // beats refusing to place anything on it.
@@ -173,7 +192,7 @@ fn is_fit(entry: &NodeEntry, pending: &HashMap<String, Reserved>, want: &Placeme
 
 /// Reported free memory, less anything placed since that report.
 fn free_mem(entry: &NodeEntry, pending: &HashMap<String, Reserved>) -> u64 {
-    let held = pending.get(&entry.info.id).copied().unwrap_or_default();
+    let held = held(entry, pending);
     entry.status.free_mem_mib.saturating_sub(held.mem_mib)
 }
 
@@ -183,7 +202,7 @@ fn free_mem(entry: &NodeEntry, pending: &HashMap<String, Reserved>) -> u64 {
 /// stops a node with plenty of free RAM and every core committed from looking
 /// like the best place to put more work.
 fn headroom(entry: &NodeEntry, pending: &HashMap<String, Reserved>) -> f64 {
-    let held = pending.get(&entry.info.id).copied().unwrap_or_default();
+    let held = held(entry, pending);
     let cpu_free = if entry.info.total_vcpus == 0 {
         1.0
     } else {
@@ -273,9 +292,101 @@ impl NodeRegistry {
                 // A re-registering node re-reports on its next heartbeat; until
                 // then its previous inventory is not carried over.
                 is_reported: false,
+                reserved_vcpus: 0,
+                reserved_mem_mib: 0,
             },
         );
         Ok((node_id, index))
+    }
+
+    /// Records a registration whose address slice the store already chose.
+    ///
+    /// With several orchestrator replicas the slice cannot be chosen from one
+    /// replica's view of the fleet, so the store decides and this only keeps
+    /// the cache in step.
+    pub fn register_at(
+        &self,
+        info: NodeInfo,
+        wireguard_public_key: String,
+        wireguard_endpoint: String,
+        index: u32,
+    ) {
+        let mut nodes = self.nodes.lock().unwrap();
+        nodes.retain(|id, entry| id == &info.id || entry.index != index);
+        nodes.insert(
+            info.id.clone(),
+            NodeEntry {
+                info,
+                status: NodeStatus::default(),
+                last_heartbeat: Instant::now(),
+                last_heartbeat_at: burrow_common::now_rfc3339(),
+                index,
+                wireguard_public_key,
+                wireguard_endpoint,
+                is_reported: false,
+                reserved_vcpus: 0,
+                reserved_mem_mib: 0,
+            },
+        );
+    }
+
+    /// Replaces the cache with the fleet as the store records it, for a
+    /// replica catching up with registrations and heartbeats that reached
+    /// other replicas.
+    ///
+    /// A heartbeat is wall-clock milliseconds in the store and an instant
+    /// here; a node this replica heard from more recently than the store
+    /// says keeps the newer one. A node whose heartbeat moved on has its local
+    /// reservations dropped, as a heartbeat arriving here would.
+    pub fn reload(&self, rows: Vec<(NodeInfo, NodeStatus, burrow_store::NodeRow)>) {
+        let now_ms = unix_ms();
+        let mut nodes = self.nodes.lock().unwrap();
+        let mut pending = self.pending.lock().unwrap();
+        let mut fresh = HashMap::new();
+        for (info, status, row) in rows {
+            let age =
+                Duration::from_millis(now_ms.saturating_sub(row.last_heartbeat_ms).max(0) as u64);
+            let stored = Instant::now().checked_sub(age).unwrap_or_else(Instant::now);
+            let previous = nodes.remove(&row.id);
+            let last_heartbeat = match &previous {
+                Some(held) if held.last_heartbeat > stored => held.last_heartbeat,
+                _ => {
+                    if previous.is_some() {
+                        pending.remove(&row.id);
+                    }
+                    stored
+                }
+            };
+            let (status, is_reported) = match previous {
+                Some(held) if held.last_heartbeat > stored => (held.status, held.is_reported),
+                _ => (status, row.is_reported),
+            };
+            fresh.insert(
+                row.id.clone(),
+                NodeEntry {
+                    info,
+                    status,
+                    last_heartbeat,
+                    last_heartbeat_at: burrow_common::rfc3339_from_unix_secs(
+                        row.last_heartbeat_ms / 1000,
+                    ),
+                    index: row.index,
+                    wireguard_public_key: row.wireguard_public_key,
+                    wireguard_endpoint: row.wireguard_endpoint,
+                    is_reported,
+                    reserved_vcpus: row.reserved_vcpus,
+                    reserved_mem_mib: row.reserved_mem_mib,
+                },
+            );
+        }
+        pending.retain(|id, _| fresh.contains_key(id));
+        *nodes = fresh;
+    }
+
+    /// Whether this replica's cache holds a node, for a heartbeat that may
+    /// have registered through another replica.
+    pub fn knows(&self, node_id: &str) -> bool {
+        self.nodes.lock().unwrap().contains_key(node_id)
     }
 
     /// Every healthy node except `exclude`, as mesh peers.
@@ -388,6 +499,15 @@ impl NodeRegistry {
             .collect()
     }
 
+    /// What a node said about itself, healthy or not.
+    pub fn info(&self, node_id: &str) -> Option<NodeInfo> {
+        self.nodes
+            .lock()
+            .unwrap()
+            .get(node_id)
+            .map(|e| e.info.clone())
+    }
+
     /// Drops a node entirely, along with anything charged against it.
     pub fn remove_node(&self, node_id: &str) {
         self.nodes.lock().unwrap().remove(node_id);
@@ -395,6 +515,13 @@ impl NodeRegistry {
     }
 
     /// gRPC endpoint for a node, if it is known and healthy.
+    /// A registered node's endpoint whether or not it is answering, for
+    /// callers that keep trying until the node is forgotten.
+    pub fn endpoint_any(&self, node_id: &str) -> Option<String> {
+        let nodes = self.nodes.lock().unwrap();
+        Some(format!("http://{}", nodes.get(node_id)?.info.address))
+    }
+
     pub fn endpoint(&self, node_id: &str) -> Option<String> {
         let nodes = self.nodes.lock().unwrap();
         let entry = nodes.get(node_id)?;
@@ -429,11 +556,21 @@ impl NodeRegistry {
     /// has the most headroom: a memory-rich but cpu-saturated node would
     /// otherwise look like the best place for more work.
     pub fn place_for(&self, want: &Placement) -> Result<String, PlacementError> {
+        self.place_excluding(want, &std::collections::HashSet::new())
+    }
+
+    /// [`place_for`](Self::place_for), passing over `excluded`: nodes another
+    /// replica filled between this one's view of them and its reservation.
+    pub fn place_excluding(
+        &self,
+        want: &Placement,
+        excluded: &std::collections::HashSet<String>,
+    ) -> Result<String, PlacementError> {
         let nodes = self.nodes.lock().unwrap();
 
         let live: Vec<_> = nodes
             .values()
-            .filter(|e| e.is_healthy() && !e.status.is_draining)
+            .filter(|e| e.is_healthy() && !e.status.is_draining && !excluded.contains(&e.info.id))
             .collect();
         if live.is_empty() {
             return Err(PlacementError::NoHealthyNode);
@@ -672,6 +809,13 @@ impl NodeRegistry {
         });
         out
     }
+}
+
+pub fn unix_ms() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as i64)
+        .unwrap_or(0)
 }
 
 #[cfg(test)]

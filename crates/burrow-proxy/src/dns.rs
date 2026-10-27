@@ -195,6 +195,11 @@ impl Resolver {
         let mut refusal = None;
         let answer = if internal {
             Some(self.answer_internal(&query, source_ip, &name))
+        } else if decision.is_allowed() && is_aaaa_query(&query) {
+            // Sandbox egress is v4: a v6 answer is one a dual-stack client
+            // tries first and fails on, and NOERROR with no records is how
+            // DNS says the name has no address of that kind.
+            Some(rcode_response(&query, RCODE_NOERROR))
         } else if decision.is_allowed() {
             self.forward(&query, forwards).await
         } else {

@@ -1,0 +1,32 @@
+# Optional: the orchestrator's PostgreSQL, run in the cluster by the
+# CloudNativePG operator (https://cloudnative-pg.io). Install the operator
+# first; skip this file entirely if you use a managed Postgres.
+#
+# Three instances with one synchronous standby: a primary that dies is
+# replaced by a standby that has every committed write, within seconds, and
+# the `burrow-postgres-rw` Service follows whichever instance is primary. The
+# orchestrator's write volume is small, so modest storage goes a long way.
+#
+# CloudNativePG generates the application credentials in the
+# `burrow-postgres-app` secret. Point database-url at the rw Service with them:
+#
+#   kubectl -n burrow get secret burrow-postgres-app -o jsonpath='{.data.uri}' | base64 -d
+#
+# and store that URI as the `database-url` key of `burrow-tokens`.
+apiVersion: postgresql.cnpg.io/v1
+kind: Cluster
+metadata:
+  name: burrow-postgres
+  namespace: burrow
+spec:
+  instances: 3
+  minSyncReplicas: 1
+  maxSyncReplicas: 1
+  bootstrap:
+    initdb:
+      database: burrow
+      owner: burrow
+  storage:
+    size: 10Gi
+  affinity:
+    topologyKey: kubernetes.io/hostname

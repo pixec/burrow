@@ -20,17 +20,19 @@ impl Secrets {
         })
     }
 
-    pub fn set(&self, name: &str, value: &str) -> anyhow::Result<()> {
+    pub async fn set(&self, name: &str, value: &str) -> anyhow::Result<()> {
         let sealed = self.vault.seal(name, value).context("sealing secret")?;
         self.store
             .put_secret(name, &sealed)
+            .await
             .context("storing secret")
     }
 
-    pub fn get(&self, name: &str) -> anyhow::Result<Option<String>> {
+    pub async fn get(&self, name: &str) -> anyhow::Result<Option<String>> {
         let Some(sealed) = self
             .store
             .get_secret(name)
+            .await
             .with_context(|| format!("reading secret {name}"))?
         else {
             return Ok(None);
@@ -38,12 +40,18 @@ impl Secrets {
         Ok(Some(self.vault.unseal(name, &sealed)?))
     }
 
-    pub fn list(&self) -> anyhow::Result<Vec<String>> {
-        self.store.list_secret_names().context("listing secrets")
+    pub async fn list(&self) -> anyhow::Result<Vec<String>> {
+        self.store
+            .list_secret_names()
+            .await
+            .context("listing secrets")
     }
 
-    pub fn delete(&self, name: &str) -> anyhow::Result<bool> {
-        self.store.delete_secret(name).context("deleting secret")
+    pub async fn delete(&self, name: &str) -> anyhow::Result<bool> {
+        self.store
+            .delete_secret(name)
+            .await
+            .context("deleting secret")
     }
 }
 
@@ -51,7 +59,7 @@ impl Secrets {
 mod tests {
     use super::*;
 
-    fn secrets() -> Secrets {
+    async fn secrets() -> Secrets {
         let nanos = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()
@@ -59,28 +67,32 @@ mod tests {
         let dir =
             std::env::temp_dir().join(format!("burrow-secrets-{}-{nanos}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
-        let store = Arc::new(burrow_store::Store::open_in_memory().unwrap());
+        let store: Arc<burrow_store::Store> =
+            Arc::new(burrow_store::Store::open_in_memory().await.unwrap());
         Secrets::open(store, &dir.join("secrets.key")).unwrap()
     }
 
-    #[test]
-    fn round_trips_and_stores_ciphertext() {
-        let secrets = secrets();
-        secrets.set("github", "ghp_value").unwrap();
-        assert_eq!(secrets.get("github").unwrap().as_deref(), Some("ghp_value"));
-        let raw = secrets.store.get_secret("github").unwrap().unwrap();
+    #[tokio::test]
+    async fn round_trips_and_stores_ciphertext() {
+        let secrets = secrets().await;
+        secrets.set("github", "ghp_value").await.unwrap();
+        assert_eq!(
+            secrets.get("github").await.unwrap().as_deref(),
+            Some("ghp_value")
+        );
+        let raw = secrets.store.get_secret("github").await.unwrap().unwrap();
         assert!(!raw.contains("ghp_value"));
-        assert_eq!(secrets.list().unwrap(), vec!["github"]);
-        assert!(secrets.delete("github").unwrap());
-        assert!(secrets.get("github").unwrap().is_none());
+        assert_eq!(secrets.list().await.unwrap(), vec!["github"]);
+        assert!(secrets.delete("github").await.unwrap());
+        assert!(secrets.get("github").await.unwrap().is_none());
     }
 
-    #[test]
-    fn a_row_cannot_be_renamed_into_another_service() {
-        let secrets = secrets();
-        secrets.set("github", "ghp_value").unwrap();
-        let raw = secrets.store.get_secret("github").unwrap().unwrap();
-        secrets.store.put_secret("other", &raw).unwrap();
-        assert!(secrets.get("other").is_err());
+    #[tokio::test]
+    async fn a_row_cannot_be_renamed_into_another_service() {
+        let secrets = secrets().await;
+        secrets.set("github", "ghp_value").await.unwrap();
+        let raw = secrets.store.get_secret("github").await.unwrap().unwrap();
+        secrets.store.put_secret("other", &raw).await.unwrap();
+        assert!(secrets.get("other").await.is_err());
     }
 }

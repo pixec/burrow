@@ -1,5 +1,7 @@
 mod blobs;
+mod chunks;
 mod devvm;
+mod durable;
 mod edge;
 mod guestconn;
 mod kit;

@@ -252,3 +252,118 @@ pub async fn upload(
     agent.upload_file(tokio_stream::iter(vec![first])).await?;
     Ok(())
 }
+
+/// The agent binary this node ships, for upgrading guests that run another.
+#[derive(Debug, Clone)]
+pub struct GuestUpgrade {
+    pub path: PathBuf,
+    /// SHA-256 of `path`, lowercase hex.
+    pub digest: String,
+}
+
+/// Handshakes, and brings the guest's agent up to this node's if it differs.
+///
+/// A guest reports the digest of the agent it runs. One that matches, or that
+/// predates reporting, is left alone. One that differs is sent the node's
+/// binary; it re-executes itself as PID 1, so the connection drops and this
+/// reconnects and handshakes the new agent, which is the client handed back.
+/// A guest that cannot upgrade right now, because a command is running, is
+/// logged and left on the old agent until its next handshake.
+pub async fn handshake_upgrading(
+    mut agent: GuestClient<Channel>,
+    uds_path: PathBuf,
+    request: guestpb::HandshakeRequest,
+    upgrade: Option<&GuestUpgrade>,
+    timeout: std::time::Duration,
+) -> Result<(GuestClient<Channel>, guestpb::HandshakeResponse), tonic::Status> {
+    let response = agent.handshake(request.clone()).await?.into_inner();
+    let Some(upgrade) = upgrade else {
+        return Ok((agent, response));
+    };
+    // An agent that reports no digest was built before in-place upgrades and
+    // cannot be upgraded; the template it came from has to be imported again.
+    if response.agent_digest.is_empty() {
+        return Err(tonic::Status::failed_precondition(format!(
+            "the guest runs agent {}, which predates in-place upgrades; import its \
+             template again",
+            response.agent_version
+        )));
+    }
+    if response.agent_digest == upgrade.digest {
+        return Ok((agent, response));
+    }
+    // The digest sent is of the bytes read now, not the one hashed at
+    // startup: the binary on disk may have been replaced since, and the guest
+    // verifies what it receives against what it is told.
+    let bytes = tokio::fs::read(&upgrade.path).await.map_err(|err| {
+        tonic::Status::internal(format!("reading {}: {err}", upgrade.path.display()))
+    })?;
+    let digest = {
+        use sha2::Digest as _;
+        hex::encode(sha2::Sha256::digest(&bytes))
+    };
+    if digest == response.agent_digest {
+        return Ok((agent, response));
+    }
+    tracing::info!(
+        from = response.agent_version,
+        "guest runs another agent build; upgrading it"
+    );
+    let chunks = bytes
+        .chunks(256 * 1024)
+        .map(|chunk| guestpb::UpgradeChunk {
+            data: chunk.to_vec(),
+            digest: digest.clone(),
+        })
+        .collect::<Vec<_>>();
+    let started = std::time::Instant::now();
+    // A guest with a command running cannot be upgraded until it is idle,
+    // because the command's pipes live in the agent's process; that guest is
+    // upgraded on its next handshake. Any other refusal is an error.
+    let restarting = match agent.upgrade(tokio_stream::iter(chunks)).await {
+        Ok(resp) => resp.into_inner().is_restarting,
+        Err(err) if err.code() == tonic::Code::FailedPrecondition => {
+            tracing::warn!(%err, "guest agent busy; upgrading it on its next handshake");
+            return Ok((agent, response));
+        }
+        Err(err) => return Err(err),
+    };
+    if !restarting {
+        return Ok((agent, response));
+    }
+    drop(agent);
+    // The old agent answers and then re-executes, and how long that takes
+    // is the guest's business, so a reconnect can still land on the old
+    // process and be cut off as it is replaced. The new agent is the one
+    // reporting the digest it was sent, so connecting and handshaking is
+    // repeated until that is who answers.
+    let deadline = std::time::Instant::now() + timeout;
+    loop {
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        let attempt = async {
+            let (mut agent, _) = connect_when_ready(uds_path.clone(), timeout)
+                .await
+                .map_err(|err| tonic::Status::internal(format!("upgraded agent: {err}")))?;
+            let response = agent.handshake(request.clone()).await?.into_inner();
+            Ok::<_, tonic::Status>((agent, response))
+        };
+        match attempt.await {
+            Ok((agent, response)) if response.agent_digest == digest => {
+                tracing::info!(
+                    version = response.agent_version,
+                    took_ms = started.elapsed().as_millis() as u64,
+                    "guest agent upgraded"
+                );
+                return Ok((agent, response));
+            }
+            Ok(_) | Err(_) if std::time::Instant::now() < deadline => continue,
+            Ok((_, response)) => {
+                return Err(tonic::Status::internal(format!(
+                    "the guest agent did not come back as the new build: it reports {}",
+                    response.agent_digest
+                )));
+            }
+            Err(err) => return Err(err),
+        }
+    }
+}

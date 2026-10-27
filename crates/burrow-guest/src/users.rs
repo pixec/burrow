@@ -83,12 +83,12 @@ async fn run_tool(tool: &Path, args: &[&str]) -> Result<(), Status> {
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
 
+    let gate = reaper::hold();
     let mut child = command
         .spawn()
         .map_err(|err| Status::internal(format!("spawn {}: {err}", tool.display())))?;
-    // No await between spawn and watch, so the reaper cannot deliver this
-    // child's status before there is somewhere to deliver it to.
     let exit = reaper::watch(child.id() as i32);
+    drop(gate);
     let stdout = child.stdout.take();
     let stderr = child.stderr.take();
     drop(child);
@@ -166,6 +166,23 @@ pub fn lookup_user(name: &str) -> Result<Passwd, Status> {
     )))
 }
 
+fn lookup_uid(uid: u32) -> Option<Passwd> {
+    let text = std::fs::read_to_string("/etc/passwd").ok()?;
+    text.lines().find_map(|line| {
+        let fields: Vec<&str> = line.split(':').collect();
+        if fields.len() < 7 || fields[2].parse::<u32>().ok()? != uid {
+            return None;
+        }
+        Some(Passwd {
+            name: fields[0].to_string(),
+            uid,
+            gid: fields[3].parse().ok()?,
+            home: fields[5].to_string(),
+            shell: fields[6].to_string(),
+        })
+    })
+}
+
 fn lookup_group(name: &str) -> Result<u32, Status> {
     let text = std::fs::read_to_string("/etc/group")
         .map_err(|err| Status::internal(format!("read /etc/group: {err}")))?;
@@ -218,8 +235,35 @@ pub struct Credentials {
 }
 
 pub fn credentials(name: &str) -> Result<Credentials, Status> {
-    validate_name(name)?;
-    let passwd = lookup_user(name)?;
+    let (user, group) = match name.split_once(':') {
+        Some((user, group)) => (user, Some(group)),
+        None => (name, None),
+    };
+    let passwd = if let Ok(uid) = user.parse::<u32>() {
+        // A numeric user is honoured as an image's USER is: by uid, with or
+        // without an account behind it.
+        lookup_uid(uid).unwrap_or(Passwd {
+            name: user.to_string(),
+            uid,
+            gid: uid,
+            home: "/".to_string(),
+            shell: "/bin/sh".to_string(),
+        })
+    } else {
+        validate_name(user)?;
+        lookup_user(user)?
+    };
+    let gid = match group {
+        Some(group) => match group.parse::<u32>() {
+            Ok(gid) => gid,
+            Err(_) => {
+                validate_name(group)?;
+                lookup_group(group)?
+            }
+        },
+        None => passwd.gid,
+    };
+    let passwd = Passwd { gid, ..passwd };
     Ok(Credentials {
         groups: supplementary_groups(&passwd.name, passwd.gid),
         uid: passwd.uid,

@@ -49,6 +49,12 @@ pub struct ServeArgs {
     /// Region the endpoint signs for. Self-hosted stores accept anything.
     #[arg(long, default_value = "us-east-1", env = "BURROW_OBJECT_STORE_REGION")]
     pub object_store_region: String,
+    /// A 32-byte key every node shares, sealing the brokered credentials a
+    /// suspended sandbox carries into the object store. Without it a sandbox
+    /// holding any stays on its node. Never generated: a key each node made
+    /// for itself would seal what no other node can open.
+    #[arg(long, env = "BURROW_OBJECT_STORE_KEY_FILE")]
+    pub object_store_key_file: Option<PathBuf>,
     /// Appended to every guest kernel command line.
     #[arg(
         long,
@@ -373,6 +379,7 @@ async fn current_status(sandboxes: &SandboxManager, data_dir: &std::path::Path) 
         // Suspended sandboxes count: they hold their address, disks and
         // snapshot, and resuming must not find the node oversubscribed.
         committed_vcpus: sandboxes.committed_vcpus().await,
+        volumes: sandboxes.volumes().list().await,
     }
 }
 
@@ -466,7 +473,19 @@ async fn registration_loop(
                         tracing::warn!("orchestrator asked us to re-register");
                         break;
                     }
-                    apply_edge_denial(&sandboxes, &resp.edge_hosts, &mut denied_edges).await;
+                    sandboxes.renew_lease(resp.sandbox_lease_secs);
+                    sandboxes.confirm(&resp.confirmed_sandboxes);
+                    sandboxes.relinquish(&resp.relinquished_sandboxes).await;
+                    apply_edge_denial(
+                        &sandboxes,
+                        &[
+                            resp.edge_hosts.as_slice(),
+                            resp.control_plane_hosts.as_slice(),
+                        ]
+                        .concat(),
+                        &mut denied_edges,
+                    )
+                    .await;
                     apply_mesh(
                         &sandboxes,
                         identity.as_deref(),
@@ -506,8 +525,9 @@ async fn store_node_index(data_dir: &std::path::Path, index: u32) {
 /// An edge proxies into a published port addressed by sandbox id alone, so a
 /// sandbox that can reach one has reached every sandbox that edge serves. Edges
 /// are opt-in per node, so this node's own flags cannot say which peers run
-/// one. The orchestrator's address is denied separately at startup, for its API
-/// rather than for any edge.
+/// one. Every orchestrator replica's own address rides in the same list: the
+/// address this node was configured with is denied at startup, but with
+/// several replicas that is only the balancer in front of them.
 ///
 /// Applied only when it changes, because a render rewrites the whole ruleset.
 /// An empty result for a non-empty list is a resolver failure rather than a
@@ -537,7 +557,10 @@ async fn apply_edge_denial(
     }
     match sandboxes.set_edge_addresses(addresses.clone()).await {
         Ok(()) => {
-            tracing::info!(?addresses, "denying the fleet's edge routers to sandboxes");
+            tracing::info!(
+                ?addresses,
+                "denying the fleet's edge routers and control plane to sandboxes"
+            );
             *applied = addresses;
         }
         // Left unrecorded so the next beat tries again: a sandbox that can
@@ -663,7 +686,7 @@ fn spawn_audit_pruner(store: Arc<burrow_store::Store>, retention_days: u32) {
         loop {
             ticker.tick().await;
             let cutoff = burrow_common::rfc3339_days_ago(retention_days as u64);
-            match store.prune_egress(&cutoff) {
+            match store.prune_egress(&cutoff).await {
                 Ok(0) => {}
                 Ok(removed) => tracing::info!(removed, %cutoff, "pruned audit records"),
                 Err(err) => tracing::error!(%err, "audit pruning failed"),
@@ -872,10 +895,22 @@ pub async fn run(args: ServeArgs) -> anyhow::Result<()> {
 
     let store = Arc::new(
         burrow_store::Store::open(&args.data_dir.join("node.db"))
+            .await
             .map_err(|err| anyhow::anyhow!("cannot open node store: {err}"))?,
     );
 
     let firecracker_version = firecracker_version(&args.firecracker).await;
+    // Hashed once: every handshake compares the guest's agent against it, and
+    // a guest running another build is upgraded in place.
+    let guest_upgrade = Some(Arc::new(crate::guestconn::GuestUpgrade {
+        digest: crate::blobs::hash_file(&args.guest_binary)
+            .await
+            .map_err(|err| {
+                anyhow::anyhow!("--guest-binary {}: {err}", args.guest_binary.display())
+            })?
+            .to_string(),
+        path: args.guest_binary.clone(),
+    }));
     node_info.firecracker_version = firecracker_version.clone();
     let object_store = match (&args.object_store, &args.object_store_endpoint) {
         (Some(url), Some(endpoint)) => {
@@ -896,6 +931,22 @@ pub async fn run(args: ServeArgs) -> anyhow::Result<()> {
         }
         (Some(_), None) => anyhow::bail!("--object-store needs --object-store-endpoint"),
         (None, _) => None,
+    };
+    let store_vault = match &args.object_store_key_file {
+        Some(path) => {
+            if !path.exists() {
+                anyhow::bail!(
+                    "--object-store-key-file {} does not exist; create one key for the whole \
+                     fleet, e.g. `head -c 32 /dev/urandom > {}`, and give every node the same file",
+                    path.display(),
+                    path.display()
+                );
+            }
+            Some(Arc::new(burrow_common::vault::Vault::open(path).map_err(
+                |err| anyhow::anyhow!("--object-store-key-file: {err}"),
+            )?))
+        }
+        None => None,
     };
 
     // The proxy and the sandbox manager share one policy table: the manager
@@ -927,7 +978,9 @@ pub async fn run(args: ServeArgs) -> anyhow::Result<()> {
                 derp_map_url: args.tailcat_derp_map_url.clone(),
             },
             object_store,
+            store_vault,
             firecracker_version,
+            guest_upgrade,
         },
         Arc::clone(&proxy_policies),
         Arc::clone(&resolutions),
@@ -951,6 +1004,10 @@ pub async fn run(args: ServeArgs) -> anyhow::Result<()> {
                 sandboxes.reap().await;
             }
         });
+    }
+    {
+        let sandboxes = sandboxes.clone();
+        tokio::spawn(async move { sandboxes.collect_stored_garbage().await });
     }
 
     let audit = burrow_proxy::AuditLog::new(

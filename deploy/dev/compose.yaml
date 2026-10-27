@@ -56,9 +56,30 @@ services:
     volumes:
       - burrow-objstore-data:/data
 
+  # The orchestrator's store. Placements, tombstones and secrets live here;
+  # nodes keep their own SQLite and are the authority on their sandboxes, so
+  # this holds only what a whole-fleet restart could not rebuild. The
+  # password is the committed dev one and the port is not published.
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: burrow
+      POSTGRES_PASSWORD: dev-postgres
+      POSTGRES_DB: burrow
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U burrow -d burrow"]
+      interval: 2s
+      timeout: 2s
+      retries: 15
+    volumes:
+      - burrow-postgres-data:/var/lib/postgresql/data
+
   orchestrator:
     image: debian:bookworm-slim
-    command: /burrow/bin/burrow-orchestrator --data-dir /var/lib/burrow --listen 0.0.0.0:7070 --api-key dev-token --node-token dev-node-token --otlp-endpoint http://otel-collector:4317
+    command: /burrow/bin/burrow-orchestrator --data-dir /var/lib/burrow --listen 0.0.0.0:7070 --api-key dev-token --node-token dev-node-token --otlp-endpoint http://otel-collector:4317 --node-expiry-secs 120
+    depends_on:
+      postgres:
+        condition: service_healthy
     ports:
       # Loopback only, like the registry above: the compose network is what
       # the nodes use, and the API key here is the committed `dev-token`.
@@ -70,6 +91,9 @@ services:
       - burrow-orchestrator-data:/var/lib/burrow
     environment:
       RUST_LOG: info
+      # Plain TCP inside the compose network; a real deployment leaves
+      # sslmode at its default so TLS is attempted.
+      BURROW_DATABASE_URL: postgres://burrow:dev-postgres@postgres:5432/burrow?sslmode=disable
 
   # The two nodes carry different labels, which is what makes placement
   # affinity testable here: `burrow create --node-label rack=b7` can only land
@@ -85,7 +109,7 @@ services:
       target: dev
       args:
         FC_ARCH: aarch64
-    command: /burrow/bin/burrowd serve --orchestrator http://orchestrator:7070 --listen 0.0.0.0:7071 --advertise node:7071 --node-id node_local_docker --label rack=a1 --label tier=general --mesh-endpoint node:51820 --api-key dev-token --node-token dev-node-token --otlp-endpoint http://otel-collector:4317 --guest-binary /burrow/bin/burrow-guest --insecure-registry test-registry:5000 --jailer /usr/local/bin/jailer --edge-listen 0.0.0.0:7081 --edge-domain node.sandbox.local --object-store s3://burrow/dev --object-store-endpoint http://objstore:9000
+    command: /burrow/bin/burrowd serve --orchestrator http://orchestrator:7070 --listen 0.0.0.0:7071 --advertise node:7071 --node-id node_local_docker --label rack=a1 --label tier=general --mesh-endpoint node:51820 --api-key dev-token --node-token dev-node-token --otlp-endpoint http://otel-collector:4317 --guest-binary /burrow/bin/burrow-guest --insecure-registry test-registry:5000 --jailer /usr/local/bin/jailer --edge-listen 0.0.0.0:7081 --edge-domain node.sandbox.local --object-store s3://burrow/dev --object-store-endpoint http://objstore:9000 --object-store-key-file /etc/burrow/store.key
     ports:
       # This node's edge: http://<port>-<sandbox-id>.node.sandbox.local:7081/
       # Opt-in, and off by default. A node without one has no hostname routing,
@@ -120,9 +144,13 @@ services:
       - net.ipv4.ip_forward=1
     volumes:
       - ../../target/aarch64-unknown-linux-musl/release:/burrow/bin:ro
-      # Dev-harness credentials for the local test registry. Not secrets: the
+      # Development-harness credentials for the local test registry. Not secrets: the
       # registry they open is created by this file too.
       - ./registry/registry-auth.json:/etc/burrow/registry-auth.json:ro
+      # The fleet's store key, sealing brokered credentials a suspended
+      # sandbox carries into the object store. Every node mounts the same
+      # one. Committed for the harness only, like the registry credentials.
+      - ./objstore/store.key:/etc/burrow/store.key:ro
       - burrow-data:/var/lib/burrow
     environment:
       RUST_LOG: info
@@ -139,7 +167,7 @@ services:
       target: dev
       args:
         FC_ARCH: aarch64
-    command: /burrow/bin/burrowd serve --orchestrator http://orchestrator:7070 --listen 0.0.0.0:7071 --advertise node2:7071 --node-id node_local_docker_2 --label rack=b7 --label tier=dedicated --mesh-endpoint node2:51820 --api-key dev-token --node-token dev-node-token --otlp-endpoint http://otel-collector:4317 --guest-binary /burrow/bin/burrow-guest --insecure-registry test-registry:5000 --jailer /usr/local/bin/jailer --edge-listen 0.0.0.0:7081 --edge-domain node2.sandbox.local --object-store s3://burrow/dev --object-store-endpoint http://objstore:9000
+    command: /burrow/bin/burrowd serve --orchestrator http://orchestrator:7070 --listen 0.0.0.0:7071 --advertise node2:7071 --node-id node_local_docker_2 --label rack=b7 --label tier=dedicated --mesh-endpoint node2:51820 --api-key dev-token --node-token dev-node-token --otlp-endpoint http://otel-collector:4317 --guest-binary /burrow/bin/burrow-guest --insecure-registry test-registry:5000 --jailer /usr/local/bin/jailer --edge-listen 0.0.0.0:7081 --edge-domain node2.sandbox.local --object-store s3://burrow/dev --object-store-endpoint http://objstore:9000 --object-store-key-file /etc/burrow/store.key
     ports:
       # node2's edge, on its own domain: an edge serves only the sandboxes its
       # node holds, so each node needs a wildcard of its own. Loopback only,
@@ -171,6 +199,7 @@ services:
     volumes:
       - ../../target/aarch64-unknown-linux-musl/release:/burrow/bin:ro
       - ./registry/registry-auth.json:/etc/burrow/registry-auth.json:ro
+      - ./objstore/store.key:/etc/burrow/store.key:ro
       - burrow-data-2:/var/lib/burrow
     environment:
       RUST_LOG: info
@@ -179,6 +208,7 @@ services:
 
 volumes:
   burrow-objstore-data:
+  burrow-postgres-data:
   burrow-orchestrator-data:
   burrow-data:
   burrow-data-2:

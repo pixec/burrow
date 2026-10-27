@@ -10,7 +10,7 @@ or fork one prepared workspace into fifty.
 
 You create a sandbox from a template: a prepared rootfs image, usually imported
 from an OCI image ([TEMPLATES.md](TEMPLATES.md)). The node boots that as a microVM,
-or restores it from a warm snapshot in 40ms to 50ms, against 1.2s to 2.2s for
+or restores it from a warm snapshot in about 30 ms, against 1.2s to 2.2s for
 a cold boot. Inside, `burrow-guest` runs as init (`init=/usr/bin/burrow-guest`
 on the kernel command line) and executes your commands over vsock.
 
@@ -47,7 +47,7 @@ A sandbox keeps its identity across VM boots.
 
 | Action | What happens |
 | --- | --- |
-| Create | Boots or restores a VM, applies network policy, returns when the agent is ready |
+| Create | Boots or restores a VM and applies network policy. A warm create returns once the VM is up, and the first call into the guest waits for the agent |
 | Exec | Runs commands inside the guest, streaming output |
 | Pause | Snapshots memory and disks, stops the VM |
 | Resume | Boots a new VM from the snapshot, processes continue |
@@ -56,7 +56,7 @@ A sandbox keeps its identity across VM boots.
 | Recreate | Replaces the root disk, keeping the id, name, address and volumes |
 | Snapshot | Keeps the current state as an object new sandboxes can start from |
 | Fork | Copies the current state into a new, independent sandbox |
-| Delete | Destroys the VM, its snapshots, lease, and firewall rules |
+| Delete | Destroys the VM, its suspend state, lease and firewall rules. Snapshots taken with `commit` survive |
 
 [PERSISTENCE.md](PERSISTENCE.md) covers this in detail. Network policy is set at
 creation and can be replaced live ([FIREWALL.md](FIREWALL.md)). Sandboxes carry
@@ -158,9 +158,10 @@ A sandbox created without `--net` has no egress at all. The three modes are
   policy allows the name, which closes DNS-tunnel exfiltration. A refused query
   is answered `REFUSED` rather than a forged `NXDOMAIN`, and every refusal is
   audited.
-- A sandbox in `none` mode has no DNS at all, rather than filtered DNS. A name
-  is attacker-chosen bytes leaving the sandbox, so a resolver is an exfil
-  channel like any other and `none` means none.
+- A sandbox in `none` mode resolves only `.internal` names. Every other query
+  is refused and audited, never forwarded. A name is attacker-chosen bytes
+  leaving the sandbox, so a resolver is an exfil channel like any other and
+  `none` means none.
 - Inspection is opt-in. With `--inspect-tls` the proxy terminates TLS for that
   sandbox and checks the host inside the session, which is the only way to catch
   domain fronting. Without it, Burrow sees hostnames and never payloads.

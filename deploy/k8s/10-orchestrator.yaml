@@ -1,10 +1,17 @@
-# The control plane. One replica: the orchestrator holds the sandbox-to-node
-# mapping in a single durable store and has no leader election, so a second
-# replica would be a second source of truth rather than failover.
+# The control plane: replicas behind one Service, over a shared PostgreSQL.
 #
-# A StatefulSet rather than a Deployment for the volume: its state only covers
-# the case nodes cannot (the whole fleet restarting at once, losing the
-# mapping), but losing it strands every placement.
+# Replicas hold nothing of their own. Placements, names, tombstones, sealed
+# secrets and the event log are in Postgres, and every replica catches up with
+# the others' writes within a second. Anything two replicas could race on, a
+# name, the last capacity on a node, an address slice, is decided by the
+# database in the statement that takes it. One replica at a time runs the
+# fleet's background work, chosen by a Postgres advisory lock that moves to
+# another replica within seconds of the holder dying. Nodes and clients use
+# the Service; a replica going away costs at most the calls in flight on it.
+#
+# Requires the burrow-tokens secret with a database-url key and the
+# burrow-secrets-key secret; see 00-namespace.yaml. Postgres itself is yours to
+# run: a managed instance, or 05-postgres.yaml with CloudNativePG.
 apiVersion: v1
 kind: Service
 metadata:
@@ -19,43 +26,54 @@ spec:
       targetPort: 7070
 ---
 apiVersion: apps/v1
-kind: StatefulSet
+kind: Deployment
 metadata:
   name: orchestrator
   namespace: burrow
 spec:
-  serviceName: orchestrator
-  replicas: 1
+  replicas: 2
   selector:
     matchLabels:
       app: burrow-orchestrator
+  # One at a time, and never below one ready replica: a rollout replaces the
+  # control plane without a moment in which nothing answers.
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxUnavailable: 0
+      maxSurge: 1
   template:
     metadata:
       labels:
         app: burrow-orchestrator
     spec:
-      # The image runs as 65532 (see deploy/orchestrator.Dockerfile). fsGroup
-      # makes the PVC group-writable by that uid: a freshly provisioned volume
-      # is owned by root, and a non-root process cannot create its database in
-      # it.
+      # On different machines where the cluster has them, so losing one
+      # machine does not take every replica with it.
+      topologySpreadConstraints:
+        - maxSkew: 1
+          topologyKey: kubernetes.io/hostname
+          whenUnsatisfiable: ScheduleAnyway
+          labelSelector:
+            matchLabels:
+              app: burrow-orchestrator
       securityContext:
         runAsNonRoot: true
         runAsUser: 65532
         runAsGroup: 65532
-        fsGroup: 65532
         seccompProfile:
           type: RuntimeDefault
       containers:
         - name: orchestrator
           # Pinned, not :latest: a redeploy should not silently upgrade the
-          # one component holding the sandbox-to-node mapping. Set this to the
-          # release you mean to run.
+          # control plane. Set this to the release you mean to run.
           image: ghcr.io/pixec/burrow-orchestrator:0.1.0
           args:
             - --listen
             - 0.0.0.0:7070
             - --data-dir
             - /var/lib/burrow
+            - --secrets-key-file
+            - /etc/burrow/secrets.key
           env:
             # Tokens by env rather than argv: a token on the command line is
             # visible in `ps` to every process in the container.
@@ -69,15 +87,33 @@ spec:
                 secretKeyRef:
                   name: burrow-tokens
                   key: node-token
+            # postgres://user:pass@host:5432/burrow; TLS is attempted unless
+            # the URL says sslmode=disable.
+            - name: BURROW_DATABASE_URL
+              valueFrom:
+                secretKeyRef:
+                  name: burrow-tokens
+                  key: database-url
+            # Nodes deny every replica's own address to sandboxes, not only
+            # the Service's; each replica publishes its pod IP for that.
+            - name: BURROW_ORCHESTRATOR_ADVERTISE
+              valueFrom:
+                fieldRef:
+                  fieldPath: status.podIP
             - name: RUST_LOG
               value: info
           ports:
             - name: grpc
               containerPort: 7070
-          # Requests so the pod is not BestEffort, which is the first thing
-          # evicted under memory pressure. The limit is generous against the
-          # request: the store grows with the fleet, and a control plane
-          # OOMKilled mid-write is worse than one using more than its share.
+          readinessProbe:
+            tcpSocket:
+              port: grpc
+            periodSeconds: 2
+            failureThreshold: 2
+          livenessProbe:
+            tcpSocket:
+              port: grpc
+            periodSeconds: 10
           resources:
             requests:
               cpu: 100m
@@ -90,19 +126,34 @@ spec:
             capabilities:
               drop: ["ALL"]
           volumeMounts:
+            # The key that seals stored secrets. Every replica must have the
+            # same one, so it comes from a Secret rather than being generated
+            # per pod.
+            - name: secrets-key
+              mountPath: /etc/burrow
+              readOnly: true
+            # --data-dir; with Postgres nothing durable is written here.
             - name: data
               mountPath: /var/lib/burrow
-            # readOnlyRootFilesystem leaves nowhere else to write scratch.
             - name: tmp
               mountPath: /tmp
       volumes:
+        - name: secrets-key
+          secret:
+            secretName: burrow-secrets-key
+            defaultMode: 0400
+        - name: data
+          emptyDir: {}
         - name: tmp
           emptyDir: {}
-  volumeClaimTemplates:
-    - metadata:
-        name: data
-      spec:
-        accessModes: ["ReadWriteOnce"]
-        resources:
-          requests:
-            storage: 10Gi
+---
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: orchestrator
+  namespace: burrow
+spec:
+  minAvailable: 1
+  selector:
+    matchLabels:
+      app: burrow-orchestrator

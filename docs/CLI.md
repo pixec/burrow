@@ -113,9 +113,10 @@ Three deviate on purpose:
   microVM boots. Nothing is cached locally, and there is no `docker push`
   equivalent.
 
-No Docker counterpart at all: [`fork`](#fork), [`sessions`](#sessions),
-[`recreate`](#recreate), [`expose`](#expose), [`audit`](#audit),
-[`secret`](#secret), [`user`](#user), [`group`](#group) and [`config`](#config).
+No Docker counterpart at all: [`fork`](#fork), [`move`](#move),
+[`sessions`](#sessions), [`recreate`](#recreate), [`expose`](#expose),
+[`events`](#events), [`audit`](#audit), [`secret`](#secret), [`user`](#user),
+[`group`](#group) and [`config`](#config).
 
 ## Aliases
 
@@ -167,6 +168,7 @@ No Docker counterpart at all: [`fork`](#fork), [`sessions`](#sessions),
 | [`snapshot`](#snapshot) | List and delete snapshots |
 | [`volume`](#volume) | Storage that outlives a sandbox |
 | [`fork`](#fork) | Create a sandbox from another's state |
+| [`move`](#move) | Move a sandbox to another node |
 | [`remove`](#remove) | Destroy sandboxes |
 | [`recreate`](#recreate) | Replace a sandbox's root disk under the same id |
 | [`config`](#config) | Read and replace a sandbox's configuration |
@@ -179,6 +181,7 @@ No Docker counterpart at all: [`fork`](#fork), [`sessions`](#sessions),
 | [`pull`](#pull) | Import an OCI image as a template |
 | [`templates`](#templates) | Manage templates |
 | [`secret`](#secret) | Credentials Sandbox Kits ask for by service name |
+| [`events`](#events) | Show and follow what happened to sandboxes |
 | [`audit`](#audit) | Show egress attempts and DNS lookups |
 | [`nodes`](#nodes) | Inspect and drain nodes |
 
@@ -384,6 +387,11 @@ burrow ps --tag env=staging
 | --- | --- |
 | `-a`, `--all` | Include sandboxes that are not running: stopped, suspended, failed and lost ones. |
 | `--tag <KEY=VALUE>` | Show only sandboxes carrying this tag. Matched exactly. |
+
+A suspended sandbox whose state is in the object store shows `+store` after its
+node, and one that no node holds any more, because its node was written off,
+shows `object store` as its node. Starting either works; the second is placed
+on a node first. See [PERSISTENCE.md](PERSISTENCE.md#surviving-a-node).
 
 An unnamed sandbox shows `-` in the name column. Nothing is hidden silently:
 when every sandbox is stopped, the empty listing says how many there are and how
@@ -944,8 +952,12 @@ burrow snapshot rm snap_c53d56f0c90c44979070dd02e95801df
 
 A sandbox created with `--snapshot` restores rather than boots, and takes its
 template and machine shape from the snapshot, so `--template`, `--vcpus` and
-`--mem-mib` may not disagree with it. Snapshots are node-local, so the sandbox is
-placed on the node holding the snapshot.
+`--mem-mib` may not disagree with it. The sandbox is placed on the node holding
+the snapshot. With an object store configured on the nodes, a durable snapshot
+whose node is unreachable restores on any node of the same architecture and
+Firecracker version. That node fetches the disk first and takes memory as the
+guest touches it. `snapshot ls` marks those `+store`. See
+[PERSISTENCE.md](PERSISTENCE.md#snapshots).
 
 ## volume
 
@@ -1009,10 +1021,43 @@ configuration always comes from the snapshot.
 state already is. It is a precondition: a source on a node without those labels
 is refused rather than the constraint being dropped.
 
+## move
+
+Move a sandbox to another node through the object store. A running sandbox is
+suspended, carried over and resumed, so its processes carry on where they were.
+It keeps its id, name and policy, and gets a new address on the new node.
+
+```
+burrow move [OPTIONS] <ID>
+```
+
+```sh
+burrow move api --node node_b
+# sbx_2f0c0d1e2f3a4b5c6d7e8f9a0b1c2d3e on node_b in 2782ms
+```
+
+| Argument | Description |
+| --- | --- |
+| `<ID>` | Sandbox to move. |
+
+| Option | Description |
+| --- | --- |
+| `--node <NODE>` | The node to move to. Omitted places it as a create would, never on the node it is leaving. |
+| `--node-label <KEY=VALUE>` | Require the destination to carry this label, when no node is named. Repeatable. |
+
+The nodes need a shared object store, and a sandbox holding brokered
+credentials needs `--object-store-key-file` on every node. A sandbox with
+volumes cannot move, since its volumes stay where they are. Published ports, a
+share and the session history are this node's and do not come along, and an
+edge hostname names the node, so it changes with the move. If the destination
+fails to restore it, the sandbox is left in the object store and a later
+`start` places it again.
+
 ## remove
 
-Destroy sandboxes and everything they hold, including their snapshots. Aliased
-as `rm`.
+Destroy sandboxes and everything they hold, including their suspend state.
+Snapshots taken with [`commit`](#commit) are separate objects and survive.
+Aliased as `rm`.
 
 ```
 burrow remove <ID> [ID...]
@@ -1395,7 +1440,8 @@ burrow unshare sbx_2f0c
 
 ## images
 
-List templates, with their size and whether a warm snapshot is ready. Same as
+List templates, with their size, whether a warm snapshot is ready, and
+whether they boot systemd under the agent. Same as
 [`templates ls`](#templates-ls).
 
 ```
@@ -1404,9 +1450,9 @@ burrow images
 
 ```sh
 burrow images
-# TEMPLATE                       SIZE  WARM
-# default                         64M  yes
-# python                         398M  no
+# TEMPLATE                       SIZE  WARM  INIT
+# default                         64M  yes   agent
+# python                         398M  no    agent
 ```
 
 A template is the rootfs a sandbox boots, held on the nodes. There is no local
@@ -1419,7 +1465,7 @@ Import an OCI image as a template. Build progress streams as it runs. Same as
 [`templates import`](#templates-import).
 
 ```
-burrow pull [--name <NAME>] <IMAGE>
+burrow pull [--name <NAME>] [--systemd] <IMAGE>
 ```
 
 ```sh
@@ -1436,6 +1482,7 @@ burrow create --template python-3.12-slim
 | Option | Description |
 | --- | --- |
 | `--name <NAME>` | Template name. Defaults to the repository plus the tag, so `ghcr.io/org/tool:v1` becomes `tool-v1` and `alpine:latest` becomes `alpine`. A digest reference keeps the bare repository name. See [TEMPLATES.md](TEMPLATES.md#how-an-import-is-named). |
+| `--systemd` | Boot the image's own systemd under the agent. See [TEMPLATES.md](TEMPLATES.md#systemd-templates). |
 
 This is a conversion, not a download into a cache. The image's layers are
 flattened into a rootfs on a node and kept as a template, and its `ENV`,
@@ -1452,7 +1499,8 @@ burrow templates <SUBCOMMAND>
 
 ### templates ls
 
-List templates, with their size and whether a warm snapshot is ready. Same as
+List templates, with their size, whether a warm snapshot is ready, and
+whether they boot systemd under the agent. Same as
 [`images`](#images).
 
 ```
@@ -1461,9 +1509,9 @@ burrow templates ls
 
 ```sh
 burrow templates ls
-# TEMPLATE                       SIZE  WARM
-# default                         64M  yes
-# python                         398M  no
+# TEMPLATE                       SIZE  WARM  INIT
+# default                         64M  yes   agent
+# python                         398M  no    agent
 ```
 
 ### templates import
@@ -1471,7 +1519,7 @@ burrow templates ls
 Import an OCI image as a template. Same as [`pull`](#pull).
 
 ```
-burrow templates import [--name <NAME>] <IMAGE>
+burrow templates import [--name <NAME>] [--systemd] <IMAGE>
 ```
 
 ```sh
@@ -1486,6 +1534,7 @@ burrow templates import python:3.12-slim
 | Option | Description |
 | --- | --- |
 | `--name <NAME>` | Template name. Defaults to the repository plus the tag, as [`pull`](#pull) does. |
+| `--systemd` | Boot the image's own systemd under the agent. See [TEMPLATES.md](TEMPLATES.md#systemd-templates). |
 
 ### templates rm
 
@@ -1532,6 +1581,44 @@ burrow secret ls
 
 Prefer stdin on a shared machine: a value on the command line is visible in `ps`
 to every user on the host.
+
+## events
+
+Show what happened to sandboxes, oldest first, and optionally follow the
+stream. Every node records what it does to its sandboxes, and the orchestrator
+copies every node's log into one, so `SEQ` is a position you can resume from.
+See [ARCHITECTURE.md](ARCHITECTURE.md#the-event-log).
+
+```
+burrow events [OPTIONS]
+```
+
+```sh
+burrow events --after 46 --sandbox sbx_397227c398ff43e6a206316be8d685a0
+#    SEQ AT                       SANDBOX                  EVENT             STATE      DETAIL
+#     47 2026-10-27T03:35:27Z     sbx_397227c398ff43e6a20… created           running
+#     48 2026-10-27T03:35:27Z     sbx_397227c398ff43e6a20… started           running    boot
+#     49 2026-10-27T03:35:27Z     sbx_397227c398ff43e6a20… agent_ready       running
+#     50 2026-10-27T03:35:29Z     sbx_397227c398ff43e6a20… stopped           suspended  suspended
+#     51 2026-10-27T03:35:30Z     sbx_397227c398ff43e6a20… started           running    resume
+#     52 2026-10-27T03:35:30Z     sbx_397227c398ff43e6a20… snapshot_created  running    snap_43d2cf499e5946f1912bab4a7182a27c
+#     53 2026-10-27T03:35:30Z     sbx_397227c398ff43e6a20… stopped           running    deleted
+#     54 2026-10-27T03:35:30Z     sbx_397227c398ff43e6a20… destroyed         running
+```
+
+| Option | Description |
+| --- | --- |
+| `--sandbox <ID>` | Restrict to one sandbox. |
+| `--after <SEQ>` | Start after this position, from an earlier listing. |
+| `--follow`, `-f` | Keep printing new events as they happen. |
+| `--limit <N>` | Rows to replay. Defaults to 100. |
+
+The events are `created`, `started`, `agent_ready`, `stopped`, `destroyed` and
+`snapshot_created`. `DETAIL` carries how a VM started (`boot`, `restore`,
+`resume`) or stopped (`suspended`, `deleted`, `stopped`, `failed`), what a
+sandbox was created from (`fork:<id>`, `snapshot:<id>`), or the snapshot a
+commit produced. Each event also carries the sandbox's cpu and network totals
+at that instant, which the SDKs expose.
 
 ## audit
 

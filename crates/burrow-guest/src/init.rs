@@ -1,6 +1,7 @@
 //! PID 1 duties.
 //!
-//! The agent runs as init inside the guest: no systemd, no udev, no getty.
+//! The agent runs as init inside the guest: no udev, no getty, and no systemd
+//! unless the template asks for one under it (see [`crate::systemd`]).
 //! This module brings up the filesystems: the writable overlay root and the
 //! pseudo-filesystems. Reaping, init's other duty, lives in [`crate::reaper`].
 
@@ -160,6 +161,11 @@ pub fn write_resolv_conf() {
     };
     if dns.is_empty() {
         return;
+    }
+    // Images built for systemd-resolved link it into /run, which is empty
+    // here; writing through the link would fail on the missing directory.
+    if std::fs::symlink_metadata("/etc/resolv.conf").is_ok_and(|meta| meta.is_symlink()) {
+        let _ = std::fs::remove_file("/etc/resolv.conf");
     }
     if let Err(err) = std::fs::write("/etc/resolv.conf", format!("nameserver {dns}\n")) {
         tracing::warn!(dns, %err, "could not write /etc/resolv.conf");

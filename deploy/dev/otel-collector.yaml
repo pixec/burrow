@@ -1,4 +1,4 @@
-# Dev-harness collector: accept OTLP over gRPC and print what arrives.
+# Development-harness collector: accept OTLP over gRPC and print what arrives.
 # Enough to answer "are spans being exported and do the hops join up"; a real
 # deployment points these daemons at whatever collector it already runs.
 receivers:

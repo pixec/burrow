@@ -112,6 +112,10 @@ class SandboxInfo:
     policy: SandboxPolicy
     unreachable: bool
     usage: Usage
+    # Suspended with its latest suspend in the object store, so it can resume
+    # on another node. A durable sandbox with an empty `node_id` is held by no
+    # node, and its next resume places it.
+    durable: bool = False
 
     @property
     def metadata(self) -> Dict[str, str]:
@@ -255,6 +259,10 @@ class NodeInfo:
     healthy: bool
     draining: bool
     labels: Dict[str, str]
+    # Cpu architecture and Firecracker version. A durable snapshot only
+    # restores on a node where both match.
+    arch: str = ""
+    firecracker_version: str = ""
 
 
 @dataclass
@@ -273,9 +281,45 @@ class AuditEvent:
 
 
 @dataclass
+class LifecycleEvent:
+    """One thing that happened to a sandbox, from the fleet's lifecycle log.
+
+    Each event carries the sandbox's cpu and network totals at that instant, so
+    the interval between two events is time spent in one state at one shape.
+    """
+
+    # Position in the fleet-wide log. Pass it as `after` to resume.
+    seq: int
+    node_id: str
+    # Position in the recording node's own log.
+    node_seq: int
+    at_unix_ms: int
+    sandbox_id: str
+    # "created", "started", "agent_ready", "stopped", "destroyed" or
+    # "snapshot_created".
+    type: str
+    state: str
+    # How a VM started ("boot", "restore", "resume") or stopped ("suspended",
+    # "deleted", "stopped", "failed"), what a sandbox was created from
+    # ("fork:<id>", "snapshot:<id>"), or the snapshot a commit produced.
+    detail: str
+    template: str
+    metadata: Dict[str, str]
+    cpu_usage_usec: int
+    rx_bytes: int
+    tx_bytes: int
+    vcpus: int
+    memory_mib: int
+
+
+@dataclass
 class TemplateInfo:
     name: str
     size_bytes: int
     # True when creates from this template restore a snapshot instead of
     # booting.
     warm: bool
+    # Imported from Sandbox Kits: creates run their lifecycle.
+    kit: bool = False
+    # Sandboxes from it run systemd under the agent.
+    systemd: bool = False

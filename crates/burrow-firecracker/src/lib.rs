@@ -25,6 +25,37 @@ pub use uffd::{UffdBackend, merge_chain};
 
 use model::*;
 
+/// A memory file that is still being filled in while a guest runs from it.
+///
+/// The page-fault handler maps the file as usual, but a page may not have
+/// arrived yet, so before serving one it asks the source to make it present.
+/// Which ranges hold data comes from the source as well: a file being written
+/// out of order has holes that are not yet data, and `SEEK_DATA` cannot tell
+/// those apart from the guest's own zero pages.
+pub trait PageSource: Send + Sync {
+    /// Byte ranges of the finished file that hold data, sorted.
+    fn extents(&self) -> Vec<(u64, u64)>;
+    /// Blocks until `[offset, offset + len)` of the file holds its contents.
+    fn ensure(&self, offset: u64, len: u64) -> std::io::Result<()>;
+    /// Makes many pages present at once, before the guest runs. Fetching them
+    /// one fault at a time would pay a round trip per page.
+    fn ensure_all(&self, offsets: &[u64], page_size: u64) -> std::io::Result<()> {
+        offsets
+            .iter()
+            .try_for_each(|&offset| self.ensure(offset, page_size))
+    }
+}
+
+/// The source of a restore's base memory file, when it is still arriving.
+#[derive(Clone)]
+pub struct MemorySource(pub std::sync::Arc<dyn PageSource>);
+
+impl std::fmt::Debug for MemorySource {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("MemorySource")
+    }
+}
+
 /// Conventional filenames inside a VM's working directory. Keeping these
 /// identical for every sandbox is what makes snapshot restore portable across
 /// sandboxes on a node.
@@ -116,6 +147,10 @@ pub struct MicroVmSpec {
     /// Where to record the pages this VM faults on, relative to the working
     /// directory. Set only when profiling a snapshot.
     pub record_prefetch: Option<String>,
+    /// Where the base of `memory_chain` is still being filled in from. Forces
+    /// the page-fault handler on, since the kernel would map the holes as
+    /// zeroes.
+    pub memory_source: Option<MemorySource>,
     /// Host resource caps. Applied to the VMM process, so they bound the guest
     /// and Firecracker's own overhead together.
     pub limits: Limits,
@@ -144,6 +179,7 @@ impl MicroVmSpec {
             is_dirty_pages_tracked: false,
             prefetch: None,
             record_prefetch: None,
+            memory_source: None,
             jail: None,
             is_memory_lazy: false,
             memory_chain: Vec::new(),
@@ -595,7 +631,11 @@ impl MicroVm {
         // A prefetch plan can only be served by the handler, so asking for one
         // is asking for lazy memory.
         let prefetching = self.spec.prefetch.is_some() || self.spec.record_prefetch.is_some();
-        if !self.spec.is_memory_lazy && !chained && !prefetching {
+        if !self.spec.is_memory_lazy
+            && !chained
+            && !prefetching
+            && self.spec.memory_source.is_none()
+        {
             return Ok(None);
         }
         let chain: Vec<PathBuf> = if self.spec.memory_chain.is_empty() {
@@ -622,6 +662,7 @@ impl MicroVm {
                     .record_prefetch
                     .as_ref()
                     .map(|name| self.spec.workdir.join(name)),
+                base_source: self.spec.memory_source.as_ref().map(|s| s.0.clone()),
             },
         )?;
         self.memory = Some(backend);

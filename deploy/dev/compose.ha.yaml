@@ -1,0 +1,46 @@
+# Two orchestrator replicas on the harness's Postgres, behind one address.
+#
+#   docker --context colima-burrow compose -f deploy/dev/compose.yaml \
+#     -f deploy/dev/compose.ha.yaml up -d
+#
+# Nodes and the CLI reach the control plane through `lb`, as they would
+# through a Kubernetes Service. Both replicas mount the same data volume so
+# they seal secrets with the same key; with Postgres nothing else in it is
+# used. Stop either replica and the other keeps serving: the leader lock moves
+# with it, and placements, names and the event log are in Postgres.
+services:
+  orchestrator:
+    ports: !reset []
+
+  orchestrator2:
+    image: debian:bookworm-slim
+    command: /burrow/bin/burrow-orchestrator --data-dir /var/lib/burrow --listen 0.0.0.0:7070 --api-key dev-token --node-token dev-node-token --otlp-endpoint http://otel-collector:4317 --node-expiry-secs 120
+    depends_on:
+      postgres:
+        condition: service_healthy
+    volumes:
+      - ../../target/aarch64-unknown-linux-musl/release:/burrow/bin:ro
+      - burrow-orchestrator-data:/var/lib/burrow
+    environment:
+      RUST_LOG: info
+      BURROW_DATABASE_URL: postgres://burrow:dev-postgres@postgres:5432/burrow?sslmode=disable
+
+  lb:
+    image: haproxy:3.0.5-alpine
+    volumes:
+      - ./ha/haproxy.cfg:/usr/local/etc/haproxy/haproxy.cfg:ro
+    ports:
+      - "127.0.0.1:7070:7070"
+    depends_on:
+      - orchestrator
+      - orchestrator2
+
+  node:
+    command: /burrow/bin/burrowd serve --orchestrator http://lb:7070 --listen 0.0.0.0:7071 --advertise node:7071 --node-id node_local_docker --label rack=a1 --label tier=general --mesh-endpoint node:51820 --api-key dev-token --node-token dev-node-token --otlp-endpoint http://otel-collector:4317 --guest-binary /burrow/bin/burrow-guest --insecure-registry test-registry:5000 --jailer /usr/local/bin/jailer --edge-listen 0.0.0.0:7081 --edge-domain node.sandbox.local --object-store s3://burrow/dev --object-store-endpoint http://objstore:9000 --object-store-key-file /etc/burrow/store.key
+    depends_on:
+      - lb
+
+  node2:
+    command: /burrow/bin/burrowd serve --orchestrator http://lb:7070 --listen 0.0.0.0:7071 --advertise node2:7071 --node-id node_local_docker_2 --label rack=b7 --label tier=dedicated --mesh-endpoint node2:51820 --api-key dev-token --node-token dev-node-token --otlp-endpoint http://otel-collector:4317 --guest-binary /burrow/bin/burrow-guest --insecure-registry test-registry:5000 --jailer /usr/local/bin/jailer --edge-listen 0.0.0.0:7081 --edge-domain node2.sandbox.local --object-store s3://burrow/dev --object-store-endpoint http://objstore:9000 --object-store-key-file /etc/burrow/store.key
+    depends_on:
+      - lb

@@ -59,9 +59,11 @@ hostname that resolves nowhere.
 hostname and advertises no URL for its sandboxes. The daemon warns about it.
 Give every edge a domain.
 
-Node-scoped hostnames are safe because sandboxes are node-pinned. Snapshots and
-disks are node-local and a sandbox never moves, so the node named in a hostname
-is settled at creation and stays correct for the sandbox's whole life.
+Node-scoped hostnames are safe because a sandbox runs on one node at a time,
+and its edge serves it only from there. A sandbox moves only through the object
+store, by `burrow move` or by being adopted after its node is written off, and
+then its hostname names the new node: a client holding the old one gets the old
+node's edge, which no longer has it.
 
 ### What the edge does
 

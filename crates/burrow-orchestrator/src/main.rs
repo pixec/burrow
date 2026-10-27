@@ -1,4 +1,8 @@
 mod api;
+mod cluster;
+mod events;
+mod leader;
+mod persist;
 mod registry;
 mod sandboxes;
 mod secrets;
@@ -6,6 +10,8 @@ mod snapshots;
 mod volumes;
 
 use std::sync::Arc;
+
+use anyhow::Context as _;
 
 use clap::Parser;
 use tonic::{Request, Response, Status, transport::Server};
@@ -49,11 +55,29 @@ struct Args {
     /// Unset leaves tracing local to this process's logs.
     #[arg(long, env = "OTEL_EXPORTER_OTLP_ENDPOINT")]
     otlp_endpoint: Option<String>,
-    /// Where the orchestrator keeps its durable state. Nodes stay
-    /// authoritative, so this only covers the case they cannot: the whole
-    /// fleet restarting at once, losing the sandbox-to-node mapping.
+    /// Where the orchestrator keeps its key material and, without
+    /// --database-url, its SQLite store. Nodes stay authoritative, so the
+    /// store only covers the case they cannot: the whole fleet restarting at
+    /// once, losing the sandbox-to-node mapping.
     #[arg(long, default_value = "/var/lib/burrow")]
     data_dir: std::path::PathBuf,
+    /// PostgreSQL to keep placements, tombstones and secrets in, as a libpq
+    /// URL. Unset keeps them in SQLite under --data-dir, which is fine for one
+    /// host but ties the control plane to its disk. `sslmode` in the URL
+    /// governs TLS; it is attempted by default.
+    #[arg(long, env = "BURROW_DATABASE_URL")]
+    database_url: Option<String>,
+    /// Key that seals stored secrets. Every replica must use the same one,
+    /// so with several, mount it from one place. Defaults to `secrets.key`
+    /// under --data-dir, created on first start.
+    #[arg(long, env = "BURROW_SECRETS_KEY_FILE")]
+    secrets_key_file: Option<std::path::PathBuf>,
+    /// This replica's own address, which nodes deny to sandboxes alongside
+    /// every other replica's. Defaults to what this host's name resolves to,
+    /// which in a container or a pod is its own IP. In Kubernetes, set it
+    /// from the pod IP with the downward API.
+    #[arg(long, env = "BURROW_ORCHESTRATOR_ADVERTISE")]
+    advertise: Option<String>,
     /// Seconds without a heartbeat after which a node is written off: its entry
     /// and every placement against it are dropped, releasing the names and
     /// capacity they held. 0 disables it. Far longer than the 15s health
@@ -65,6 +89,17 @@ struct Args {
 pub struct OrchestratorState {
     pub nodes: registry::NodeRegistry,
     pub sandboxes: sandboxes::SandboxRegistry,
+    /// Where every replica's state meets. `None` only when even the local
+    /// SQLite file could not be opened, which leaves a single process
+    /// running from memory.
+    pub store: Option<Arc<burrow_store::Store>>,
+    /// Whether this replica runs the fleet's background work.
+    pub leader: Arc<leader::Leader>,
+    /// Every live replica's address, as last read from the store, for nodes
+    /// to deny to their sandboxes.
+    pub control_plane_hosts: std::sync::Mutex<Vec<String>>,
+    /// Every node's lifecycle events, copied here as they happen.
+    pub events: events::EventLog,
     /// Credentials Kits ask for by service name, encrypted at rest. `None`
     /// without a durable store, in which case no secret can be bound.
     pub secrets: Option<secrets::Secrets>,
@@ -81,6 +116,9 @@ pub struct OrchestratorState {
     /// never reaches a node. Falls back to `--api-key` only when no node token
     /// is set, which the startup warning calls out.
     pub node_token: Option<String>,
+    /// How long a node may go unheard before it must stop resuming durable
+    /// sandboxes on its own say. 0 when nodes are never written off.
+    pub sandbox_lease_secs: u32,
 }
 
 #[derive(Clone)]
@@ -106,23 +144,81 @@ impl NodeRegistry for NodeRegistryService {
         // refused: admitting it on someone else's slice would give two nodes
         // the same guest addresses, which is what the slicing exists to
         // prevent.
-        let (node_id, node_index) = self
-            .0
-            .nodes
-            .register(
-                info,
-                req.wireguard_public_key,
-                req.wireguard_endpoint,
-                req.claimed_node_index,
-            )
-            .map_err(|err| match err {
-                crate::registry::RegisterError::NoAddressSlice(_) => {
-                    Status::resource_exhausted(err.to_string())
+        let (node_id, node_index) = match &self.0.store {
+            // The slice is chosen by the store, so two replicas registering
+            // two nodes at once cannot hand out the same one.
+            Some(store) => {
+                if let Some(claimed) = req.claimed_node_index
+                    && claimed >= burrow_net::ipam::MAX_NODES
+                {
+                    return Err(Status::invalid_argument(
+                        crate::registry::RegisterError::ClaimOutOfRange {
+                            index: claimed,
+                            max: burrow_net::ipam::MAX_NODES,
+                        }
+                        .to_string(),
+                    ));
                 }
-                crate::registry::RegisterError::ClaimOutOfRange { .. } => {
-                    Status::invalid_argument(err.to_string())
+                let mut info = info;
+                if info.id.is_empty() {
+                    info.id = burrow_common::NodeId::generate().to_string();
                 }
-            })?;
+                let row = cluster::node_row(
+                    &info,
+                    &burrow_proto::common::v1::NodeStatus::default(),
+                    &req.wireguard_public_key,
+                    &req.wireguard_endpoint,
+                );
+                let index = store
+                    .register_node(&row, req.claimed_node_index, burrow_net::ipam::MAX_NODES)
+                    .await
+                    .map_err(|err| Status::unavailable(format!("recording the node: {err}")))?
+                    .ok_or_else(|| {
+                        Status::resource_exhausted(
+                            crate::registry::RegisterError::NoAddressSlice(
+                                burrow_net::ipam::MAX_NODES,
+                            )
+                            .to_string(),
+                        )
+                    })?;
+                if let Some(claimed) = req.claimed_node_index
+                    && claimed != index
+                {
+                    tracing::error!(
+                        node_id = info.id,
+                        claimed,
+                        assigned = index,
+                        "node claimed an address slice another node holds; its existing \
+                         sandboxes may have colliding addresses"
+                    );
+                }
+                let node_id = info.id.clone();
+                self.0.nodes.register_at(
+                    info,
+                    req.wireguard_public_key,
+                    req.wireguard_endpoint,
+                    index,
+                );
+                (node_id, index)
+            }
+            None => self
+                .0
+                .nodes
+                .register(
+                    info,
+                    req.wireguard_public_key,
+                    req.wireguard_endpoint,
+                    req.claimed_node_index,
+                )
+                .map_err(|err| match err {
+                    crate::registry::RegisterError::NoAddressSlice(_) => {
+                        Status::resource_exhausted(err.to_string())
+                    }
+                    crate::registry::RegisterError::ClaimOutOfRange { .. } => {
+                        Status::invalid_argument(err.to_string())
+                    }
+                })?,
+        };
         tracing::info!(node_id, node_index, "node registered");
 
         // Adopt whatever the node currently has. Done off the registration
@@ -149,10 +245,38 @@ impl NodeRegistry for NodeRegistryService {
         if let Some(info) = &req.info {
             burrow_common::tags::validate_labels(&info.labels)?;
         }
-        let known = self
-            .0
-            .nodes
-            .heartbeat(&req.node_id, req.status.unwrap_or_default(), req.info);
+        let mut status = req.status.unwrap_or_default();
+        let volumes = std::mem::take(&mut status.volumes);
+        if let Some(store) = &self.0.store {
+            // The store decides whether the fleet knows this node: it may have
+            // registered through another replica, whose cache this one only
+            // catches up with once a second.
+            let mut info = req.info.clone().unwrap_or_default();
+            info.id = req.node_id.clone();
+            let row = cluster::node_row(&info, &status, "", "");
+            let row = burrow_store::NodeRow {
+                is_reported: true,
+                ..row
+            };
+            let in_store = store
+                .heartbeat_node(&burrow_store::NodeRow {
+                    info: match &req.info {
+                        Some(_) => row.info.clone(),
+                        None => Vec::new(),
+                    },
+                    ..row
+                })
+                .await
+                .map_err(|err| Status::unavailable(format!("recording the heartbeat: {err}")))?;
+            if in_store && !self.0.nodes.knows(&req.node_id) {
+                let _ = cluster::reload_nodes(&self.0, store).await;
+            }
+            if !in_store {
+                self.0.nodes.remove_node(&req.node_id);
+            }
+        }
+        let known = self.0.nodes.heartbeat(&req.node_id, status, req.info);
+        let mut applied = sandboxes::Applied::default();
         if !known {
             tracing::warn!(
                 node_id = req.node_id,
@@ -170,7 +294,10 @@ impl NodeRegistry for NodeRegistryService {
                     "forgot snapshots the node no longer holds"
                 );
             }
-            let applied = self.0.sandboxes.apply_states(&req.node_id, &req.sandboxes);
+            // A Kit's lifecycle creates volumes on the node itself, so the
+            // node's own inventory is what the registry reflects.
+            self.0.volumes.reconcile_node(&req.node_id, volumes);
+            applied = self.0.sandboxes.apply_states(&req.node_id, &req.sandboxes);
             if applied.restated > 0 || applied.forgotten > 0 {
                 tracing::info!(
                     node_id = req.node_id,
@@ -194,6 +321,13 @@ impl NodeRegistry for NodeRegistryService {
                 let id = req.node_id.clone();
                 tokio::spawn(async move { reconcile_node(state, id).await });
             }
+            if !applied.relinquished.is_empty() {
+                tracing::warn!(
+                    node_id = req.node_id,
+                    count = applied.relinquished.len(),
+                    "node still holds sandboxes another node adopted; telling it to let go"
+                );
+            }
         }
         // The peer list and cross-node membership ride on the heartbeat, so a
         // node converges on the current fleet without a separate subscription.
@@ -205,12 +339,19 @@ impl NodeRegistry for NodeRegistryService {
             // denied to every sandbox, and a node cannot know from its own
             // flags which of its peers serves one.
             edge_hosts: self.0.nodes.edge_hosts(),
+            control_plane_hosts: self.0.control_plane_hosts.lock().unwrap().clone(),
+            sandbox_lease_secs: self.0.sandbox_lease_secs,
+            confirmed_sandboxes: applied.confirmed,
+            relinquished_sandboxes: applied.relinquished,
         }))
     }
 }
 
 /// Rebuilds the orchestrator's view of one node from that node's own listing.
 async fn reconcile_node(state: Arc<OrchestratorState>, node_id: String) {
+    // The node's log is followed from here on, resuming after whatever an
+    // earlier tail copied; a node that re-registers does not start a second.
+    events::ensure_tailing(Arc::clone(&state), node_id.clone());
     let Some(endpoint) = state.nodes.endpoint(&node_id) else {
         return;
     };
@@ -265,6 +406,23 @@ async fn reconcile_node(state: Arc<OrchestratorState>, node_id: String) {
         Err(err) => tracing::warn!(node_id, %err, "node inventory unavailable"),
     }
 
+    inventory(&state, &node_id, &mut client).await;
+}
+
+/// Re-reads a node's snapshots and volumes, for a replica that does not get
+/// that node's heartbeats.
+pub async fn refresh_inventory(state: &OrchestratorState, node_id: &str) {
+    let Some(endpoint) = state.nodes.endpoint(node_id) else {
+        return;
+    };
+    match crate::api::connect_node(endpoint, state.node_token.as_deref()).await {
+        Ok(mut client) => inventory(state, node_id, &mut client).await,
+        Err(err) => tracing::debug!(node_id, %err, "cannot reach node to refresh its inventory"),
+    }
+}
+
+async fn inventory(state: &OrchestratorState, node_id: &str, client: &mut crate::api::NodeClient) {
+    let node_id = node_id.to_string();
     // Snapshots are only recorded here, so a restarted orchestrator has no
     // idea where any of them live until each node says. The node is the
     // authority, exactly as it is for its sandboxes.
@@ -319,9 +477,66 @@ async fn reconcile_node(state: Arc<OrchestratorState>, node_id: String) {
     }
 }
 
+/// Publishes this replica's address and reads every live replica's back, so
+/// heartbeat responses carry the whole control plane for nodes to deny.
+async fn advertise_replica(state: Arc<OrchestratorState>, address: Option<String>) {
+    let id = burrow_common::NodeId::generate().to_string();
+    let mut ticker = tokio::time::interval(std::time::Duration::from_secs(5));
+    loop {
+        ticker.tick().await;
+        let now = registry::unix_ms();
+        let mut hosts = match &state.store {
+            Some(store) => {
+                if let Some(address) = &address
+                    && let Err(err) = store.touch_replica(&id, address, now).await
+                {
+                    tracing::warn!(%err, "could not advertise this replica");
+                }
+                store
+                    .replica_addresses(now - REPLICA_SEEN_MS)
+                    .await
+                    .unwrap_or_default()
+            }
+            None => Vec::new(),
+        };
+        if let Some(address) = &address
+            && !hosts.contains(address)
+        {
+            hosts.push(address.clone());
+        }
+        *state.control_plane_hosts.lock().unwrap() = hosts;
+    }
+}
+
+/// How recently a replica must have advertised itself to be denied. A dead
+/// replica's address is still denied for this long, which costs nothing.
+const REPLICA_SEEN_MS: i64 = 60_000;
+
+/// What this host's name resolves to, skipping loopback.
+async fn own_address() -> Option<String> {
+    let name = std::env::var("HOSTNAME")
+        .ok()
+        .filter(|name| !name.is_empty())
+        .or_else(|| {
+            std::fs::read_to_string("/etc/hostname")
+                .ok()
+                .map(|name| name.trim().to_string())
+        })?;
+    tokio::net::lookup_host((name.as_str(), 0))
+        .await
+        .ok()?
+        .map(|address| address.ip())
+        .find(|ip| !ip.is_loopback())
+        .map(|ip| ip.to_string())
+}
+
 /// How often the reaper looks, capped so a short expiry is still enforced
 /// promptly and a long one does not mean a busy loop.
 const REAP_INTERVAL: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// How long a claim may sit without a sandbox before it is read as an
+/// abandoned create. Far longer than any create takes.
+const CLAIM_ORPHAN_SECS: i64 = 600;
 
 /// Writes off nodes that have been silent far longer than unhealthy.
 ///
@@ -329,7 +544,9 @@ const REAP_INTERVAL: std::time::Duration = std::time::Duration::from_secs(60);
 /// the names and capacity they held come back, and its entry with them. No
 /// tombstones are recorded, unlike a caller's delete against a dead node,
 /// because nobody asked for these sandboxes to be destroyed; if the node comes
-/// back, reconcile re-adopts its own inventory.
+/// back, reconcile re-adopts its own inventory. A suspended sandbox whose
+/// state is in the object store is kept, unplaced, for the next start to put
+/// on another node.
 ///
 /// Ageing out tombstones rides on the same tick, and happens even when reaping
 /// is switched off: they are bounded by their own TTL either way.
@@ -339,8 +556,21 @@ async fn reap_dead_nodes(state: Arc<OrchestratorState>, expiry: Option<std::time
     ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     loop {
         ticker.tick().await;
+        // Once for the fleet, not once per replica.
+        if !state.leader.is_leader() {
+            continue;
+        }
         for node_id in expiry.map(|e| state.nodes.expired(e)).unwrap_or_default() {
-            let dropped = state.sandboxes.forget_node(&node_id);
+            let info = state.nodes.info(&node_id).unwrap_or_default();
+            let (dropped, unplaced) =
+                state
+                    .sandboxes
+                    .forget_node(&node_id, &info.arch, &info.firecracker_version);
+            if let Some(store) = &state.store
+                && let Err(err) = store.delete_node(&node_id).await
+            {
+                tracing::warn!(node_id, %err, "could not remove a written-off node from the store");
+            }
             // Its snapshots go with it: they only ever existed on that node.
             state.snapshots.forget_node(&node_id);
             state.volumes.forget_node(&node_id);
@@ -349,8 +579,9 @@ async fn reap_dead_nodes(state: Arc<OrchestratorState>, expiry: Option<std::time
                 node_id,
                 placements = dropped.len(),
                 names = dropped.iter().filter(|s| !s.name.is_empty()).count(),
+                unplaced,
                 "node has been silent past its expiry; forgetting it and every \
-                 placement recorded against it"
+                 placement recorded against it, except those the object store can bring back"
             );
         }
         let pruned = state
@@ -358,6 +589,20 @@ async fn reap_dead_nodes(state: Arc<OrchestratorState>, expiry: Option<std::time
             .prune_tombstones(sandboxes::TOMBSTONE_TTL_SECS);
         if pruned > 0 {
             tracing::info!(pruned, "aged out tombstones for nodes that never returned");
+        }
+        // A replica that died half way through a create leaves its claims on
+        // an id and a name with no sandbox behind them.
+        if let Some(store) = &state.store {
+            match store
+                .sweep_claims(burrow_common::unix_now() - CLAIM_ORPHAN_SECS)
+                .await
+            {
+                Ok(0) => {}
+                Ok(swept) => {
+                    tracing::info!(swept, "released claims of creates that never finished")
+                }
+                Err(err) => tracing::warn!(%err, "could not sweep abandoned claims"),
+            }
         }
     }
 }
@@ -412,34 +657,63 @@ async fn run(args: Args) -> anyhow::Result<()> {
     };
 
     let mut secrets = None;
-    let sandboxes = match burrow_store::Store::open(&args.data_dir.join("orchestrator.db")) {
-        Ok(store) => {
-            let store = Arc::new(store);
-            match secrets::Secrets::open(Arc::clone(&store), &args.data_dir.join("secrets.key")) {
+    let store: Option<Arc<burrow_store::Store>> = match &args.database_url {
+        // A database that was asked for and cannot be reached is a
+        // misconfiguration, not something to paper over with an empty
+        // in-memory registry that would then diverge from it.
+        Some(url) => Some(Arc::new(
+            burrow_store::Store::connect_postgres(url)
+                .await
+                .context("connecting to --database-url")?,
+        )),
+        None => Some(Arc::new(
+            burrow_store::Store::open(&args.data_dir.join("orchestrator.db"))
+                .await
+                .with_context(|| {
+                    format!(
+                        "opening {}",
+                        args.data_dir.join("orchestrator.db").display()
+                    )
+                })?,
+        )),
+    };
+    let sandboxes = match &store {
+        Some(store) => {
+            let key = args
+                .secrets_key_file
+                .clone()
+                .unwrap_or_else(|| args.data_dir.join("secrets.key"));
+            match secrets::Secrets::open(Arc::clone(store), &key) {
                 Ok(opened) => secrets = Some(opened),
                 Err(err) => tracing::error!(%err, "secrets are unavailable: no usable key"),
             }
-            sandboxes::SandboxRegistry::with_store(store)
+            sandboxes::SandboxRegistry::with_store(Arc::clone(store)).await
         }
-        Err(err) => {
-            // Not fatal: the registry works in memory, and nodes rebuild it on
-            // registration. Only a simultaneous fleet restart would notice.
-            tracing::error!(
-                path = %args.data_dir.join("orchestrator.db").display(), %err,
-                "no durable placement store; placements will not survive a full restart"
-            );
-            sandboxes::SandboxRegistry::default()
-        }
+        None => sandboxes::SandboxRegistry::default(),
     };
 
+    let sandbox_lease_secs = match args.node_expiry_secs {
+        0 => 0,
+        // Short of the expiry by a few beats, so a node has stopped resuming
+        // its durable sandboxes before any other node can be handed them.
+        secs => secs
+            .saturating_sub(3 * HEARTBEAT_INTERVAL.as_secs())
+            .max(1)
+            .min(u32::MAX as u64) as u32,
+    };
     let state = Arc::new(OrchestratorState {
         nodes: registry::NodeRegistry::default(),
         sandboxes,
+        leader: leader::Leader::spawn(store.clone()),
+        events: events::EventLog::new(store.clone()),
+        store: store.clone(),
+        control_plane_hosts: std::sync::Mutex::new(Vec::new()),
         secrets,
         snapshots: snapshots::SnapshotRegistry::default(),
         volumes: volumes::VolumeRegistry::default(),
         channels: api::NodeChannels::default(),
         node_token: outbound_node_token,
+        sandbox_lease_secs,
     });
 
     tracing::info!(
@@ -461,6 +735,47 @@ async fn run(args: Args) -> anyhow::Result<()> {
         secs => Some(std::time::Duration::from_secs(secs)),
     };
     tokio::spawn(reap_dead_nodes(Arc::clone(&state), expiry));
+    let advertise = match args.advertise.clone() {
+        Some(address) => Some(address),
+        None => own_address().await,
+    };
+    match &advertise {
+        Some(address) => tracing::info!(
+            address,
+            "advertising this replica to nodes as a host to deny"
+        ),
+        None => tracing::warn!(
+            "cannot tell this replica's own address; set --advertise, or sandboxes \
+             may be able to reach it directly"
+        ),
+    }
+    tokio::spawn(advertise_replica(Arc::clone(&state), advertise));
+    // A node's log is followed from the moment it registers, but only by the
+    // leader, and a replica that becomes leader later has seen no
+    // registrations. Every known node is made sure of a tail while this
+    // replica leads; a node already tailed is left alone.
+    tokio::spawn({
+        let state = Arc::clone(&state);
+        async move {
+            loop {
+                state.leader.wait().await;
+                for node_id in state.nodes.healthy_ids() {
+                    events::ensure_tailing(Arc::clone(&state), node_id);
+                }
+                tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+            }
+        }
+    });
+    // Several replicas share a Postgres; each catches up with the others'
+    // writes. One replica on SQLite has nobody to catch up with.
+    if let Some(store) = &store
+        && store.is_postgres()
+    {
+        if let Err(err) = cluster::reload_nodes(&state, store).await {
+            tracing::warn!(%err, "could not read the fleet from the store");
+        }
+        cluster::spawn(Arc::clone(&state), Arc::clone(store));
+    }
 
     Server::builder()
         .add_service(BurrowServer::with_interceptor(

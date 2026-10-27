@@ -112,6 +112,11 @@ class BurrowStub(object):
                 request_serializer=api__pb2.ForkSandboxRequest.SerializeToString,
                 response_deserializer=common__pb2.Sandbox.FromString,
                 _registered_method=True)
+        self.MoveSandbox = channel.unary_unary(
+                '/burrow.api.v1.Burrow/MoveSandbox',
+                request_serializer=api__pb2.MoveSandboxRequest.SerializeToString,
+                response_deserializer=common__pb2.Sandbox.FromString,
+                _registered_method=True)
         self.UpdateNetworkPolicy = channel.unary_unary(
                 '/burrow.api.v1.Burrow/UpdateNetworkPolicy',
                 request_serializer=api__pb2.UpdateNetworkPolicyRequest.SerializeToString,
@@ -297,6 +302,11 @@ class BurrowStub(object):
                 request_serializer=api__pb2.WatchRequest.SerializeToString,
                 response_deserializer=api__pb2.WatchEvent.FromString,
                 _registered_method=True)
+        self.TailEvents = channel.unary_stream(
+                '/burrow.api.v1.Burrow/TailEvents',
+                request_serializer=api__pb2.TailEventsRequest.SerializeToString,
+                response_deserializer=common__pb2.Event.FromString,
+                _registered_method=True)
 
 
 class BurrowServicer(object):
@@ -402,6 +412,14 @@ class BurrowServicer(object):
 
     def ForkSandbox(self, request, context):
         """Create a sandbox from another's current state, on the source's node.
+        """
+        context.set_code(grpc.StatusCode.UNIMPLEMENTED)
+        context.set_details('Method not implemented!')
+        raise NotImplementedError('Method not implemented!')
+
+    def MoveSandbox(self, request, context):
+        """Move a sandbox to another node through the object store. A running one
+        is suspended first and arrives running; a suspended one arrives running.
         """
         context.set_code(grpc.StatusCode.UNIMPLEMENTED)
         context.set_details('Method not implemented!')
@@ -654,6 +672,14 @@ class BurrowServicer(object):
         context.set_details('Method not implemented!')
         raise NotImplementedError('Method not implemented!')
 
+    def TailEvents(self, request, context):
+        """The fleet's lifecycle log: what happened to which sandbox, in order,
+        resumable from the last `seq` seen.
+        """
+        context.set_code(grpc.StatusCode.UNIMPLEMENTED)
+        context.set_details('Method not implemented!')
+        raise NotImplementedError('Method not implemented!')
+
 
 def add_BurrowServicer_to_server(servicer, server):
     rpc_method_handlers = {
@@ -730,6 +756,11 @@ def add_BurrowServicer_to_server(servicer, server):
             'ForkSandbox': grpc.unary_unary_rpc_method_handler(
                     servicer.ForkSandbox,
                     request_deserializer=api__pb2.ForkSandboxRequest.FromString,
+                    response_serializer=common__pb2.Sandbox.SerializeToString,
+            ),
+            'MoveSandbox': grpc.unary_unary_rpc_method_handler(
+                    servicer.MoveSandbox,
+                    request_deserializer=api__pb2.MoveSandboxRequest.FromString,
                     response_serializer=common__pb2.Sandbox.SerializeToString,
             ),
             'UpdateNetworkPolicy': grpc.unary_unary_rpc_method_handler(
@@ -916,6 +947,11 @@ def add_BurrowServicer_to_server(servicer, server):
                     servicer.Watch,
                     request_deserializer=api__pb2.WatchRequest.FromString,
                     response_serializer=api__pb2.WatchEvent.SerializeToString,
+            ),
+            'TailEvents': grpc.unary_stream_rpc_method_handler(
+                    servicer.TailEvents,
+                    request_deserializer=api__pb2.TailEventsRequest.FromString,
+                    response_serializer=common__pb2.Event.SerializeToString,
             ),
     }
     generic_handler = grpc.method_handlers_generic_handler(
@@ -1324,6 +1360,33 @@ class Burrow(object):
             target,
             '/burrow.api.v1.Burrow/ForkSandbox',
             api__pb2.ForkSandboxRequest.SerializeToString,
+            common__pb2.Sandbox.FromString,
+            options,
+            channel_credentials,
+            insecure,
+            call_credentials,
+            compression,
+            wait_for_ready,
+            timeout,
+            metadata,
+            _registered_method=True)
+
+    @staticmethod
+    def MoveSandbox(request,
+            target,
+            options=(),
+            channel_credentials=None,
+            call_credentials=None,
+            insecure=False,
+            compression=None,
+            wait_for_ready=None,
+            timeout=None,
+            metadata=None):
+        return grpc.experimental.unary_unary(
+            request,
+            target,
+            '/burrow.api.v1.Burrow/MoveSandbox',
+            api__pb2.MoveSandboxRequest.SerializeToString,
             common__pb2.Sandbox.FromString,
             options,
             channel_credentials,
@@ -2324,6 +2387,33 @@ class Burrow(object):
             '/burrow.api.v1.Burrow/Watch',
             api__pb2.WatchRequest.SerializeToString,
             api__pb2.WatchEvent.FromString,
+            options,
+            channel_credentials,
+            insecure,
+            call_credentials,
+            compression,
+            wait_for_ready,
+            timeout,
+            metadata,
+            _registered_method=True)
+
+    @staticmethod
+    def TailEvents(request,
+            target,
+            options=(),
+            channel_credentials=None,
+            call_credentials=None,
+            insecure=False,
+            compression=None,
+            wait_for_ready=None,
+            timeout=None,
+            metadata=None):
+        return grpc.experimental.unary_stream(
+            request,
+            target,
+            '/burrow.api.v1.Burrow/TailEvents',
+            api__pb2.TailEventsRequest.SerializeToString,
+            common__pb2.Event.FromString,
             options,
             channel_credentials,
             insecure,

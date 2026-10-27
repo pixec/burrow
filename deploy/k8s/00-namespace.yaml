@@ -11,7 +11,21 @@
 #   kubectl create namespace burrow
 #   kubectl -n burrow create secret generic burrow-tokens \
 #     --from-literal=api-key="$(openssl rand -hex 32)" \
-#     --from-literal=node-token="$(openssl rand -hex 32)"
+#     --from-literal=node-token="$(openssl rand -hex 32)" \
+#     --from-literal=database-url="postgres://burrow:...@postgres:5432/burrow"
+#
+# database-url names the orchestrator's PostgreSQL. Bring your own: a managed
+# instance, or 05-postgres.yaml with CloudNativePG. The orchestrator creates its
+# own tables on first start.
+#
+# The key that seals stored secrets is shared by every orchestrator replica,
+# so it is made once, here, rather than by each pod:
+#
+#   head -c 32 /dev/urandom > secrets.key
+#   kubectl -n burrow create secret generic burrow-secrets-key --from-file=secrets.key
+#   rm secrets.key
+#
+# Lose it and every stored secret is unreadable; keep a copy somewhere safe.
 apiVersion: v1
 kind: Namespace
 metadata:

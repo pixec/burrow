@@ -28,6 +28,7 @@ import type {
   DetachedCommand,
   DirEntry,
   DownloadFileOptions,
+  EventsOptions,
   FileInfo,
   FileRef,
   FileWrite,
@@ -39,7 +40,9 @@ import type {
   GuestGroup,
   GuestUser,
   KitOptions,
+  LifecycleEvent,
   ListOptions,
+  MoveOptions,
   NodeInfo,
   OutputChunk,
   PortMapping,
@@ -83,6 +86,7 @@ function toSandboxInfo(raw: any): SandboxInfo {
       rxBytes: Number(raw.rxBytes ?? 0),
       txBytes: Number(raw.txBytes ?? 0),
     },
+    durable: raw.isDurable ?? false,
   };
 }
 
@@ -2020,6 +2024,32 @@ export class Sandbox {
   }
 
   /**
+   * Moves the sandbox to another node through the object store.
+   *
+   * A running sandbox is suspended, carried over and resumed. It keeps its id,
+   * name and policy and gets an address on the new node. Volumes do not move.
+   *
+   * ```ts
+   * await sandbox.move({ nodeLabels: { tier: "dedicated" } });
+   * ```
+   */
+  async move(options: MoveOptions = {}): Promise<SandboxInfo> {
+    this.assertLive();
+    const raw = await this.transport.unary<any, any>(
+      "MoveSandbox",
+      {
+        ref: { id: this.id },
+        nodeId: options.nodeId ?? "",
+        nodeLabels: options.nodeLabels ?? {},
+      },
+      300_000,
+      options.signal,
+    );
+    this.info = toSandboxInfo(raw);
+    return this.info;
+  }
+
+  /**
    * Saves the sandbox's state as a snapshot object and keeps running.
    *
    * The guest is paused only long enough to write its state. Unlike the
@@ -2278,6 +2308,52 @@ export class Burrow {
     return events;
   }
 
+  /**
+   * Reads the fleet's lifecycle log, oldest first.
+   *
+   * Without `follow` the iterator ends after the replay. With it, the stream
+   * stays open and yields events as they happen until `signal` aborts or the
+   * loop breaks. Keep the last `seq` seen to resume after a disconnect.
+   *
+   * ```ts
+   * for await (const event of burrow.events({ sandbox: "build-482", follow: true })) {
+   *   console.log(event.seq, event.type, event.detail);
+   * }
+   * ```
+   */
+  async *events(options: EventsOptions = {}): AsyncGenerator<LifecycleEvent> {
+    for await (const raw of this.transport.serverStream<any, any>(
+      "TailEvents",
+      {
+        afterSeq: options.after ?? 0,
+        sandbox: options.sandbox ?? "",
+        isFollow: options.follow ?? false,
+        limit: options.limit ?? 0,
+      },
+      // A follow outlives any request deadline.
+      options.follow ? Infinity : undefined,
+      options.signal,
+    )) {
+      yield {
+        seq: Number(raw.seq ?? 0),
+        nodeId: raw.nodeId ?? "",
+        nodeSeq: Number(raw.nodeSeq ?? 0),
+        atUnixMs: Number(raw.atUnixMs ?? 0),
+        sandboxId: raw.sandboxId ?? "",
+        type: raw.type ?? "",
+        state: stateOf(raw.state),
+        detail: raw.detail ?? "",
+        template: raw.template ?? "",
+        metadata: raw.metadata ?? {},
+        cpuUsageUsec: Number(raw.cpuUsageUsec ?? 0),
+        rxBytes: Number(raw.rxBytes ?? 0),
+        txBytes: Number(raw.txBytes ?? 0),
+        vcpus: Number(raw.vcpus ?? 0),
+        memoryMib: Number(raw.memMib ?? 0),
+      };
+    }
+  }
+
   /** Stops (or resumes) placing new sandboxes on a node. */
   async drainNode(
     nodeId: string,
@@ -2324,6 +2400,8 @@ export class Burrow {
       healthy: Boolean(n.isHealthy),
       draining: Boolean(n.status?.isDraining),
       labels: n.info?.labels ?? {},
+      arch: n.info?.arch ?? "",
+      firecrackerVersion: n.info?.firecrackerVersion ?? "",
     }));
   }
 

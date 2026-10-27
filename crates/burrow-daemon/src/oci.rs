@@ -219,6 +219,10 @@ pub struct ImageEnvironment {
     /// The Kit composition this template was imported from, when it was one.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub kit: Option<crate::kit::KitTemplate>,
+    /// The guest runs the image's systemd under the agent rather than the
+    /// agent alone.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub systemd: bool,
 }
 
 impl ImageEnvironment {
@@ -743,6 +747,7 @@ pub async fn pull(
             cmd: envelope.config.cmd,
             user: envelope.config.user,
             kit: None,
+            systemd: false,
         },
         digest,
         layer_digests,

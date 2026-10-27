@@ -21,14 +21,21 @@
 //! configured a published snapshot is also uploaded, behind the create, and a
 //! node that lacks one fetches it on the first create that asks; the
 //! orchestrator only sends such a create to a node of the same architecture
-//! running the same Firecracker.
+//! running the same Firecracker. The fetch takes everything but the memory
+//! image up front; memory arrives behind the restored guest, served page by
+//! page as it faults, see [`crate::chunks`].
 
 #![allow(clippy::result_large_err)]
 
 use std::path::{Path, PathBuf};
 
+use std::collections::HashMap;
+use std::sync::Arc;
+
 use serde::{Deserialize, Serialize};
 use tonic::Status;
+
+use crate::chunks::Hydrator;
 
 use burrow_proto::common::v1 as common;
 
@@ -89,26 +96,24 @@ pub struct Manifest {
     /// Passed over by retention once, and left to expire on its own.
     ///
     /// Without this a snapshot the policy declined to delete would be counted
-    /// and passed over again on every later pass. Defaulted so manifests
-    /// written before the field existed read as not evicted.
-    #[serde(default)]
+    /// and passed over again on every later pass.
     pub is_evicted: bool,
     /// What the snapshot was taken on, which bounds where it can be restored.
-    #[serde(default)]
     pub arch: String,
-    #[serde(default)]
     pub firecracker_version: String,
     /// Set once every object is in the store and the remote manifest is
     /// written, so a half-finished upload never reads as restorable.
-    #[serde(default)]
     pub is_durable: bool,
     /// The kernel and rootfs by content, filled in when uploaded. They go to
     /// the store as blobs under their digest, so snapshots of one template
     /// share them and a fetching node can verify what it received.
-    #[serde(default)]
     pub kernel_digest: String,
-    #[serde(default)]
     pub rootfs_digest: String,
+    /// Memory and scratch disk are stored as chunk indexes rather than as
+    /// whole sparse objects. Written before chunking existed, a snapshot is
+    /// fetched whole.
+    #[serde(default)]
+    pub is_chunked: bool,
 }
 
 impl Manifest {
@@ -144,6 +149,10 @@ fn blob_key(digest: &str) -> String {
     format!("blobs/{digest}")
 }
 
+fn index_key(id: &str, file: &str) -> String {
+    remote_key(id, &format!("{file}.index.json"))
+}
+
 /// Checks an id before it becomes a path.
 ///
 /// Only the orchestrator mints snapshot ids, so the accepted shape is exactly
@@ -168,6 +177,11 @@ pub struct SnapshotStore {
     blobs: std::sync::Arc<crate::blobs::BlobStore>,
     remote: Option<crate::objstore::ObjectStore>,
     firecracker_version: String,
+    /// Memory images of fetched snapshots still arriving, by snapshot id.
+    hydrators: std::sync::Arc<std::sync::Mutex<HashMap<String, Arc<Hydrator>>>>,
+    /// Held across a fetch, so two creates from one remote snapshot fetch it
+    /// once rather than racing to rename the same directory into place.
+    fetching: std::sync::Arc<tokio::sync::Mutex<()>>,
 }
 
 /// Everything a create needs from the sandbox it is snapshotting, gathered
@@ -193,6 +207,8 @@ impl SnapshotStore {
             blobs: std::sync::Arc::new(crate::blobs::BlobStore::new(data_dir)),
             remote,
             firecracker_version,
+            hydrators: Default::default(),
+            fetching: Default::default(),
         }
     }
 
@@ -269,6 +285,7 @@ impl SnapshotStore {
             is_durable: false,
             kernel_digest: String::new(),
             rootfs_digest: String::new(),
+            is_chunked: false,
         };
         write_manifest(&dir, &manifest).await?;
 
@@ -309,15 +326,7 @@ impl SnapshotStore {
 
         let mut digests = Vec::new();
         for file in [TEMPLATE_KERNEL, TEMPLATE_ROOTFS] {
-            let path = dir.join(file);
-            let digest = crate::blobs::hash_file(&path)
-                .await
-                .map_err(|err| Status::internal(format!("hashing {file} of {id}: {err}")))?;
-            let key = blob_key(digest.as_str());
-            if !remote.exists(&key).await? {
-                remote.put_file(&key, &path).await?;
-            }
-            digests.push(digest.to_string());
+            digests.push(put_blob(remote, &dir.join(file)).await?);
         }
         remote
             .put_file(
@@ -325,15 +334,25 @@ impl SnapshotStore {
                 &dir.join(burrow_firecracker::SNAPSHOT_FILE),
             )
             .await?;
-        // The memory image and the scratch disk are sparse, and go as their
-        // data extents rather than as the apparent size of zeros.
+        // As chunks, so the memory image can be served page by page on a node
+        // restoring it, and so what the snapshot shares with its sandbox's own
+        // stored state is stored once.
         for file in [burrow_firecracker::SNAPSHOT_MEM_FILE, SCRATCH_IMAGE] {
-            remote
-                .put_sparse_file(&remote_key(id, file), &dir.join(file))
-                .await?;
+            let index = crate::chunks::put_image(
+                remote,
+                &dir,
+                &[file.to_string()],
+                None,
+                &Default::default(),
+            )
+            .await?;
+            let json = serde_json::to_vec(&index)
+                .map_err(|err| Status::internal(format!("encoding an index: {err}")))?;
+            remote.put_bytes(&index_key(id, file), json).await?;
         }
         manifest.kernel_digest = digests[0].clone();
         manifest.rootfs_digest = digests[1].clone();
+        manifest.is_chunked = true;
         manifest.is_durable = true;
         let json = serde_json::to_vec_pretty(&manifest)
             .map_err(|err| Status::internal(format!("encoding the manifest: {err}")))?;
@@ -380,66 +399,93 @@ impl SnapshotStore {
         }
         let started = std::time::Instant::now();
         let dir = self.begin(id).await?;
-        let result = self.fetch_into(remote, &manifest, &dir).await;
-        if let Err(err) = result {
-            self.abandon(id).await;
-            return Err(err);
-        }
+        let memory = match self.fetch_into(remote, &manifest, &dir).await {
+            Ok(memory) => memory,
+            Err(err) => {
+                self.abandon(id).await;
+                return Err(err);
+            }
+        };
         write_manifest(&dir, &manifest).await?;
         let live = self.dir(id);
         let _ = tokio::fs::remove_dir_all(&live).await;
         tokio::fs::rename(&dir, &live)
             .await
             .map_err(|err| Status::internal(format!("publishing the fetched snapshot: {err}")))?;
+        // Begun at the path it will be served from: a hydrator names its file
+        // by path, for the links it hands out. Readers of a snapshot all
+        // arrive through `fetching`, which this call still holds.
+        if let Some(index) = memory {
+            let path = live.join(burrow_firecracker::SNAPSHOT_MEM_FILE);
+            let hydrator = Hydrator::begin(remote.clone(), index, &path)
+                .map_err(|err| Status::internal(format!("preparing {}: {err}", path.display())))?;
+            hydrator.start();
+            self.hydrators
+                .lock()
+                .unwrap()
+                .insert(id.to_string(), hydrator);
+        }
         tracing::info!(
             snapshot = id,
             size_bytes = manifest.size_bytes,
             took_ms = started.elapsed().as_millis() as u64,
+            is_memory_lazy = manifest.is_chunked,
             "snapshot fetched from the object store"
         );
         Ok(())
     }
 
+    /// The memory image of a snapshot that is still arriving, picking up a
+    /// fill a restart interrupted.
+    fn hydrator(&self, id: &str) -> Result<Option<Arc<Hydrator>>, Status> {
+        let mut hydrators = self.hydrators.lock().unwrap();
+        if let Some(hydrator) = hydrators.get(id) {
+            if !hydrator.is_complete() {
+                return Ok(Some(Arc::clone(hydrator)));
+            }
+            hydrators.remove(id);
+            return Ok(None);
+        }
+        let Some(remote) = &self.remote else {
+            return Ok(None);
+        };
+        let path = self.dir(id).join(burrow_firecracker::SNAPSHOT_MEM_FILE);
+        match Hydrator::resume(remote.clone(), &path) {
+            None => Ok(None),
+            Some(Ok(hydrator)) => {
+                hydrator.start();
+                hydrators.insert(id.to_string(), Arc::clone(&hydrator));
+                Ok(Some(hydrator))
+            }
+            Some(Err(err)) => Err(Status::internal(format!(
+                "resuming the fetch of snapshot {id}'s memory: {err}"
+            ))),
+        }
+    }
+
+    /// Fetches a snapshot from the store unless this node already has it.
+    async fn ensure_local(&self, id: &str) -> Result<(), Status> {
+        let _fetching = self.fetching.lock().await;
+        if read_manifest(&self.dir(id)).await.is_none() {
+            self.fetch(id).await?;
+        }
+        Ok(())
+    }
+
+    /// Fetches everything a restore needs before it can start, returning the
+    /// memory image's index when memory is to arrive behind the guest.
     async fn fetch_into(
         &self,
         remote: &crate::objstore::ObjectStore,
         manifest: &Manifest,
         dir: &Path,
-    ) -> Result<(), Status> {
+    ) -> Result<Option<crate::chunks::ImageIndex>, Status> {
         let id = &manifest.id;
         for (file, digest) in [
             (TEMPLATE_KERNEL, &manifest.kernel_digest),
             (TEMPLATE_ROOTFS, &manifest.rootfs_digest),
         ] {
-            let digest = crate::blobs::Digest::parse(digest).ok_or_else(|| {
-                Status::internal(format!("snapshot {id} names no digest for {file}"))
-            })?;
-            let dest = dir.join(file);
-            if self.blobs.has(&digest).await {
-                self.blobs
-                    .materialise(&digest, &dest)
-                    .await
-                    .map_err(|err| Status::internal(format!("linking {file}: {err}")))?;
-                continue;
-            }
-            if remote
-                .get_to_file(&blob_key(digest.as_str()), &dest)
-                .await?
-                .is_none()
-            {
-                return Err(Status::not_found(format!(
-                    "snapshot {id} refers to blob {digest} missing from the object store"
-                )));
-            }
-            let actual = crate::blobs::hash_file(&dest)
-                .await
-                .map_err(|err| Status::internal(format!("hashing fetched {file}: {err}")))?;
-            if actual != digest {
-                return Err(Status::data_loss(format!(
-                    "blob {digest} from the object store hashed as {actual}"
-                )));
-            }
-            let _ = self.blobs.insert(&dest).await;
+            self.fetch_blob(remote, digest, &dir.join(file)).await?;
         }
         let missing = |file: &str| {
             Status::not_found(format!(
@@ -454,6 +500,19 @@ impl SnapshotStore {
         {
             return Err(missing(file));
         }
+        if manifest.is_chunked {
+            let scratch = read_index(remote, &index_key(id, SCRATCH_IMAGE))
+                .await?
+                .ok_or_else(|| missing(SCRATCH_IMAGE))?;
+            crate::chunks::get_image(remote, &scratch, &dir.join(SCRATCH_IMAGE)).await?;
+            let memory = read_index(
+                remote,
+                &index_key(id, burrow_firecracker::SNAPSHOT_MEM_FILE),
+            )
+            .await?
+            .ok_or_else(|| missing(burrow_firecracker::SNAPSHOT_MEM_FILE))?;
+            return Ok(Some(memory));
+        }
         for file in [burrow_firecracker::SNAPSHOT_MEM_FILE, SCRATCH_IMAGE] {
             if remote
                 .get_sparse_file(&remote_key(id, file), &dir.join(file))
@@ -461,6 +520,63 @@ impl SnapshotStore {
                 .is_none()
             {
                 return Err(missing(file));
+            }
+        }
+        Ok(None)
+    }
+
+    /// Brings a blob onto this node at `dest`: linked from the node's blob
+    /// store when it is there, fetched and verified when it is not.
+    pub async fn fetch_blob(
+        &self,
+        remote: &crate::objstore::ObjectStore,
+        digest: &str,
+        dest: &Path,
+    ) -> Result<(), Status> {
+        let digest = crate::blobs::Digest::parse(digest)
+            .ok_or_else(|| Status::internal(format!("{digest:?} is not a blob digest")))?;
+        if self.blobs.has(&digest).await {
+            return self
+                .blobs
+                .materialise(&digest, dest)
+                .await
+                .map_err(|err| Status::internal(format!("linking blob {digest}: {err}")));
+        }
+        if remote
+            .get_to_file(&blob_key(digest.as_str()), dest)
+            .await?
+            .is_none()
+        {
+            return Err(Status::not_found(format!(
+                "blob {digest} is missing from the object store"
+            )));
+        }
+        let actual = crate::blobs::hash_file(dest)
+            .await
+            .map_err(|err| Status::internal(format!("hashing fetched blob {digest}: {err}")))?;
+        if actual != digest {
+            return Err(Status::data_loss(format!(
+                "blob {digest} from the object store hashed as {actual}"
+            )));
+        }
+        let _ = self.blobs.insert(dest).await;
+        Ok(())
+    }
+
+    /// Every chunk digest the stored snapshots' indexes reference.
+    pub async fn remote_chunk_refs(
+        &self,
+        out: &mut std::collections::HashSet<String>,
+    ) -> Result<(), Status> {
+        let Some(remote) = &self.remote else {
+            return Ok(());
+        };
+        for key in remote.list("snapshots/").await? {
+            if !key.ends_with(".index.json") {
+                continue;
+            }
+            if let Some(index) = read_index(remote, &key).await? {
+                out.extend(index.digests().map(str::to_string));
             }
         }
         Ok(())
@@ -526,9 +642,7 @@ impl SnapshotStore {
     /// Only a create pays that: a read of a snapshot stays a read.
     pub async fn manifest_for_restore(&self, id: &str) -> Result<Manifest, Status> {
         validate_id(id)?;
-        if read_manifest(&self.dir(id)).await.is_none() {
-            self.fetch(id).await?;
-        }
+        self.ensure_local(id).await?;
         self.manifest(id).await
     }
 
@@ -592,7 +706,11 @@ impl SnapshotStore {
                 remote
                     .delete(&crate::objstore::sparse_key(&remote_key(id, file)))
                     .await?;
+                remote.delete(&index_key(id, file)).await?;
             }
+        }
+        if let Some(hydrator) = self.hydrators.lock().unwrap().remove(id) {
+            hydrator.detach(&dir.join(burrow_firecracker::SNAPSHOT_MEM_FILE));
         }
         if !is_local && !is_remote {
             return Err(Status::not_found(format!("no snapshot {id} on this node")));
@@ -613,12 +731,18 @@ impl SnapshotStore {
     /// time, so the files have to be under the sandbox's own directory with the
     /// names they had. Read-only artifacts are linked; what the guest writes is
     /// copied, sparsely and by reflink where the filesystem allows it.
-    pub async fn stage_into(&self, id: &str, dest: &Path) -> Result<Vec<String>, Status> {
+    ///
+    /// A memory image still arriving is linked rather than copied, and handed
+    /// back so the restore serves it through the same fill: the link shares
+    /// the inode, so every byte the fill writes lands in both.
+    pub async fn stage_into(
+        &self,
+        id: &str,
+        dest: &Path,
+    ) -> Result<(Vec<String>, Option<Arc<Hydrator>>), Status> {
         validate_id(id)?;
         let dir = self.dir(id);
-        if read_manifest(&dir).await.is_none() {
-            self.fetch(id).await?;
-        }
+        self.ensure_local(id).await?;
         let io = |what: &str, err: std::io::Error| {
             Status::internal(format!("staging snapshot {id} ({what}): {err}"))
         };
@@ -637,12 +761,27 @@ impl SnapshotStore {
         .await
         .map_err(|err| io(burrow_firecracker::SNAPSHOT_FILE, err))?;
 
-        for file in [SCRATCH_IMAGE, burrow_firecracker::SNAPSHOT_MEM_FILE] {
-            crate::warm::copy_sparse(&dir.join(file), &dest.join(file))
+        crate::warm::copy_sparse(&dir.join(SCRATCH_IMAGE), &dest.join(SCRATCH_IMAGE))
+            .await
+            .map_err(|err| io(SCRATCH_IMAGE, err))?;
+        let memory = burrow_firecracker::SNAPSHOT_MEM_FILE;
+        let arriving = match self.hydrator(id)? {
+            Some(hydrator) => hydrator
+                .link_to(&dest.join(memory))
+                .map_err(|err| io(memory, err))?
+                .then_some(hydrator),
+            None => None,
+        };
+        if arriving.is_none()
+            && !tokio::fs::try_exists(dest.join(memory))
                 .await
-                .map_err(|err| io(file, err))?;
+                .unwrap_or(false)
+        {
+            crate::warm::copy_sparse(&dir.join(memory), &dest.join(memory))
+                .await
+                .map_err(|err| io(memory, err))?;
         }
-        Ok(vec![burrow_firecracker::SNAPSHOT_MEM_FILE.to_string()])
+        Ok((vec![memory.to_string()], arriving))
     }
 
     /// Re-arms a snapshot's TTL, because it was just used.
@@ -810,6 +949,34 @@ impl SnapshotStore {
     }
 }
 
+/// Puts a file in the store under its digest unless it is already there,
+/// returning the digest.
+pub async fn put_blob(
+    remote: &crate::objstore::ObjectStore,
+    path: &Path,
+) -> Result<String, Status> {
+    let digest = crate::blobs::hash_file(path)
+        .await
+        .map_err(|err| Status::internal(format!("hashing {}: {err}", path.display())))?;
+    let key = blob_key(digest.as_str());
+    if !remote.exists(&key).await? {
+        remote.put_file(&key, path).await?;
+    }
+    Ok(digest.to_string())
+}
+
+pub async fn read_index(
+    remote: &crate::objstore::ObjectStore,
+    key: &str,
+) -> Result<Option<crate::chunks::ImageIndex>, Status> {
+    let Some(bytes) = remote.get_bytes(key).await? else {
+        return Ok(None);
+    };
+    serde_json::from_slice(&bytes)
+        .map(Some)
+        .map_err(|err| Status::data_loss(format!("index {key} is unreadable: {err}")))
+}
+
 /// Whether a path was last written longer ago than `age`.
 ///
 /// Unreadable metadata reads as "recent", so a directory is never collected on
@@ -962,6 +1129,7 @@ mod tests {
             is_durable: false,
             kernel_digest: String::new(),
             rootfs_digest: String::new(),
+            is_chunked: false,
         }
     }
 

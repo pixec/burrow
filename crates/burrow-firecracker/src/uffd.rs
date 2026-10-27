@@ -208,16 +208,21 @@ struct Layer {
     backing: Backing,
     /// Sorted, non-overlapping `[start, end)` byte ranges that hold data.
     extents: Vec<(u64, u64)>,
+    /// Set when the file is still arriving: every page is asked for before it
+    /// is read.
+    source: Option<Arc<dyn crate::PageSource>>,
 }
 
 impl Layer {
-    fn open(path: &Path) -> io::Result<Self> {
-        let file = std::fs::File::open(path)?;
-        let extents = data_extents(&file)?;
-        drop(file);
+    fn open(path: &Path, source: Option<Arc<dyn crate::PageSource>>) -> io::Result<Self> {
+        let extents = match &source {
+            Some(source) => source.extents(),
+            None => data_extents(&std::fs::File::open(path)?)?,
+        };
         Ok(Self {
             backing: Backing::map(path)?,
             extents,
+            source,
         })
     }
 
@@ -275,7 +280,7 @@ pub fn data_extents(file: &std::fs::File) -> io::Result<Vec<(u64, u64)>> {
 }
 
 /// How guest memory should be served for one restored VM.
-#[derive(Debug, Default, Clone)]
+#[derive(Default, Clone)]
 pub struct MemoryPlan {
     /// Memory files oldest first: a full base, then diffs layered over it.
     pub chain: Vec<PathBuf>,
@@ -287,6 +292,18 @@ pub struct MemoryPlan {
     /// Where to write the offsets this VM faults on, to become a future
     /// prefetch plan.
     pub record_to: Option<PathBuf>,
+    /// Where the oldest layer is still being filled in from.
+    pub base_source: Option<Arc<dyn crate::PageSource>>,
+}
+
+impl std::fmt::Debug for MemoryPlan {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("MemoryPlan")
+            .field("chain", &self.chain)
+            .field("prefetch", &self.prefetch)
+            .field("is_base_arriving", &self.base_source.is_some())
+            .finish()
+    }
 }
 
 /// Reads a prefetch plan: little-endian `u64` file offsets, nothing else.
@@ -322,6 +339,15 @@ fn write_plan(path: &Path, offsets: &[u64]) -> io::Result<()> {
 /// into this process. Filling them in one pass turns that into a sequential
 /// copy.
 fn prefetch(fd: RawFd, regions: &[RegionMapping], layers: &[Layer], offsets: &[u64]) -> usize {
+    // A base still arriving is asked for the whole plan in one go, so its
+    // pages come in parallel rather than one blocking fetch per offset below.
+    if let (Some(source), Some(region)) = (
+        layers.first().and_then(|layer| layer.source.as_ref()),
+        regions.first(),
+    ) && let Err(err) = source.ensure_all(offsets, region.page_size as u64)
+    {
+        tracing::warn!(%err, "could not fetch the prefetch plan's pages ahead of the guest");
+    }
     let mut filled = 0;
     for &offset in offsets {
         // The plan stores file offsets; the address to populate depends on
@@ -387,7 +413,13 @@ impl UffdBackend {
 
         let layers: Vec<Layer> = chain
             .iter()
-            .map(|path| Layer::open(path))
+            .enumerate()
+            .map(|(index, path)| {
+                Layer::open(
+                    path,
+                    (index == 0).then(|| plan.base_source.clone()).flatten(),
+                )
+            })
             .collect::<io::Result<_>>()?;
         let stop = Arc::new(AtomicBool::new(false));
 
@@ -636,6 +668,9 @@ fn copy_page(fd: RawFd, region: &RegionMapping, page: u64, layers: &[Layer]) -> 
     else {
         return zero_range(fd, page, page + region.page_size as u64);
     };
+    if let Some(source) = &layer.source {
+        source.ensure(offset, region.page_size as u64)?;
+    }
     let mut arg = UffdioCopy {
         dst: page,
         src: layer.backing.addr as u64 + offset,

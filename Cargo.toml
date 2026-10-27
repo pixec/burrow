@@ -83,7 +83,6 @@ futures = "0.3"
 nix = { version = "0.31", features = ["mount", "process", "fs", "time", "ioctl", "signal", "term", "socket", "uio", "mman", "poll"] }
 tower = "0.5"
 async-stream = "0.3"
-rusqlite = { version = "0.32", features = ["bundled"] }
 userfaultfd = "0.8"
 opentelemetry = "0.27"
 opentelemetry_sdk = { version = "0.27", features = ["rt-tokio"] }
@@ -91,6 +90,7 @@ opentelemetry-otlp = { version = "0.27", features = ["grpc-tonic"] }
 tracing-opentelemetry = "0.28"
 libc = "0.2"
 sha2 = "0.10"
+hex = "0.4"
 base64 = "0.22"
 ruzstd = "0.7"
 rcgen = { version = "0.13", features = ["x509-parser"] }

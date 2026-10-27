@@ -165,6 +165,9 @@ class TemplateBuilder:
             # Omitted means unrestricted, because a build that installs
             # packages needs the network by definition.
             allow_domains=options.get("allow_domains") or [],
+            # Boot the image's own systemd under the agent. The image has to
+            # ship systemd.
+            is_systemd=bool(options.get("systemd")),
         )
 
 
@@ -196,6 +199,7 @@ class Template(TemplateBuilder):
                         # A freshly built template has no snapshot until the
                         # node warms it.
                         warm=False,
+                        systemd=bool(options.get("systemd")),
                     )
             if result is None:
                 raise BurrowError("build ended without producing an image", "internal")
@@ -210,7 +214,13 @@ class Template(TemplateBuilder):
         try:
             res = transport.unary("ListTemplates", api_pb2.ListTemplatesRequest())
             return [
-                TemplateInfo(name=t.name, size_bytes=t.size_bytes, warm=t.is_warm)
+                TemplateInfo(
+                    name=t.name,
+                    size_bytes=t.size_bytes,
+                    warm=t.is_warm,
+                    kit=t.is_kit,
+                    systemd=t.is_systemd,
+                )
                 for t in res.templates
             ]
         finally:

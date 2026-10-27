@@ -49,7 +49,9 @@ Docker `ENTRYPOINT` and `CMD` are not run, because the guest agent is PID 1 and
 you start processes with `burrow exec`. The image's `ENV` and `WORKDIR` are
 applied to exec'd commands, and a request's `--env` and `--workdir` win where
 they name the same thing. The exception is a [Sandbox Kit](#sandbox-kits),
-whose descriptor asks for the entrypoint to be launched.
+whose descriptor asks for the entrypoint to be launched, and whose commands
+run as the image's `USER` unless `--user` names someone else. A user may be
+a name or a uid, with a group or gid after a colon, as Docker takes it.
 
 ### How an import is named
 
@@ -90,8 +92,8 @@ their own copy.
 burrow pull python:3.13 --name python
 ```
 
-The delete takes the warm snapshot with it, so creates cold-boot until the node
-restarts and warms the template again.
+The new rootfs is warmed in the background as soon as the import finishes,
+so creates cold-boot only until that snapshot lands.
 
 ### What the daemon enforces on every pull
 
@@ -230,6 +232,53 @@ export BURROW_API_KEY=dev-token BURROW=target/debug/burrow
 kit-tck runtime --adapter deploy/kit-tck/burrow-adapter
 ```
 
+## Systemd templates
+
+By default the agent is the guest's only init. An image that expects systemd,
+such as a full Ubuntu root with services, can be imported with `--systemd`:
+
+```sh
+burrow templates import --systemd --name ubuntu-systemd registry.example/ubuntu-systemd:24.04
+```
+
+The agent stays PID 1 and does everything it does without systemd. It then
+starts the image's `/usr/lib/systemd/systemd` as its child, in new PID, mount
+and cgroup namespaces with a cgroup2 subtree of its own, the way a container
+manager runs it (`container=burrow`). The network namespace is shared, so the
+address burrow configures is the one systemd's services see.
+
+- `exec` runs inside systemd's namespaces: `ps` shows systemd as PID 1, and
+  `systemctl` works as it would on a VM.
+- File transfer resolves paths in systemd's mount namespace, so `/run` and
+  anything its units mount are what `cp` reads and writes.
+- `systemctl reboot` restarts systemd on the same disk without resetting the
+  VM. `systemctl poweroff` shuts the VM down.
+- A create waits for systemd to report it has finished booting, up to 20
+  seconds. A warm snapshot is taken after that point, so restored sandboxes
+  start with systemd already up.
+
+The mode is recorded in the template's `image.json` and carries over to
+templates built on it. `templates ls` shows it in the `INIT` column.
+
+What the image has to provide, and what burrow handles:
+
+- systemd itself. Most base images (`ubuntu`, `debian`) ship without it.
+- Nothing for the network. Burrow configures the address and the resolver, so
+  the agent masks systemd-networkd, NetworkManager and cloud-init for every
+  boot, and replaces a `/etc/resolv.conf` symlink into `/run` with its own
+  file. The masks are runtime only; the image on disk is left as it is.
+- `iptables-legacy` for anything that programs a firewall. The stock guest
+  kernel (Firecracker's CI build) has no nf_tables and no iptables `raw`
+  table, so Docker 28 and later also needs
+  `DOCKER_INSECURE_NO_IPTABLES_RAW=1` in its unit's environment.
+
+Docker and other tools that stack overlay filesystems cannot keep their
+storage on `/`, because the guest root is itself an overlay. Give them a
+mount of their own, for example
+`--mount tmpfs:/var/lib/docker --mount tmpfs:/var/lib/containerd`, or a
+volume. [deploy/dev/systemd-docker](../deploy/dev/systemd-docker) is a working
+example and a live test against the dev harness.
+
 ## Built templates
 
 `BuildTemplate` boots a base template, runs build steps inside the guest, exports
@@ -279,7 +328,7 @@ placement. See
 
 Templates are per-node. When no node that could take a sandbox holds its
 template, the orchestrator picks a target with room and tells it to pull the
-template from a node that has it (`PullTemplate`, guarded by the cluster token),
+template from a node that has it (`PullTemplate`, guarded by the node token),
 then places there. The transfer is node to node, so a rootfs never crosses the
 control plane, and artifacts are verified against their digests before they are
 adopted.

@@ -242,9 +242,9 @@ mod tests {
 
     /// A node edge serving no sandboxes: enough for the answers that never
     /// reach a guest.
-    fn empty_edge(domain: &str) -> Arc<NodeEdge> {
+    async fn empty_edge(domain: &str) -> Arc<NodeEdge> {
         Arc::new(NodeEdge {
-            sandboxes: crate::sandbox::tests::manager(),
+            sandboxes: crate::sandbox::tests::manager().await,
             domain: domain.into(),
             trusted_proxies: Vec::new(),
         })
@@ -301,7 +301,7 @@ mod tests {
     #[tokio::test]
     async fn a_sandbox_this_node_does_not_hold_is_a_404() {
         let answer = ask(
-            empty_edge("node-a.local"),
+            empty_edge("node-a.local").await,
             "8000-sbx_elsewhere.node-a.local",
         )
         .await;
@@ -311,7 +311,7 @@ mod tests {
 
     #[tokio::test]
     async fn a_hostname_outside_the_domain_is_a_404() {
-        let answer = ask(empty_edge("node-a.local"), "evil.example.com").await;
+        let answer = ask(empty_edge("node-a.local").await, "evil.example.com").await;
         assert!(answer.starts_with("HTTP/1.1 404 Not Found\r\n"), "{answer}");
     }
 

@@ -19,13 +19,15 @@ sandbox with `burrow config network-policy`.
 
 ### `none`
 
-No traffic in or out, DNS included. A `none`-mode sandbox cannot resolve a
-public name, so it cannot tunnel data out through queries either.
+No egress, DNS included. A `none`-mode sandbox's queries for public names are
+refused and audited, never forwarded, so it cannot tunnel data out through
+queries either. Private-network peers and `.internal` names still work.
 
 ### `open`
 
-NAT'd egress to the public internet. Traffic is still audited at L3 and L4 and
-`deny_cidrs` still applies, but nothing is enforced per domain.
+NAT'd egress to the public internet. DNS lookups are still audited and
+`deny_cidrs` still applies, but connections bypass the proxy, so nothing is
+enforced or audited per connection or per domain.
 
 Open means off the fleet, not everywhere. Every sandbox address comes out of one
 pool (`10.99.0.0/16`), and an open-mode sandbox is denied that whole range, on
@@ -106,8 +108,8 @@ alongside it when the sandbox needs both.
   own gateway, so rewriting `/etc/resolv.conf` to `8.8.8.8` does not reach
   `8.8.8.8`: the packets match no rule and the chain drops them, over TCP as
   well as UDP. Where burrow's own resolver forwards to is the node's business,
-  set with `--dns-upstream`. A sandbox in `none` mode gets no DNS at all rather
-  than filtered DNS, since a name is attacker-chosen bytes leaving the sandbox.
+  set with `--dns-upstream`. A sandbox in `none` mode has every public name
+  refused, since a name is attacker-chosen bytes leaving the sandbox.
 - **The control plane is not a destination.** Every sandbox on a node is denied
   the address its orchestrator answers on, ahead of every accept and of
   conntrack. An open-mode sandbox has NAT'd egress to anywhere the node can
@@ -570,5 +572,5 @@ burrow unexpose <id> <host-port>
 ```
 
 Published ports are reachable only from external traffic, never from
-other sandboxes or mesh peers, and host ports are constrained to the
-operator-configured range.
+other sandboxes or mesh peers. Host ports come from the fixed range 20000 to
+29999.

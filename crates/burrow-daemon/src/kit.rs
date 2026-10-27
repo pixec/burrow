@@ -170,6 +170,7 @@ impl KitTemplate {
             cmd: merged.cmd,
             user: merged.user,
             kit: Some(self.clone()),
+            systemd: false,
         }
     }
 }
@@ -298,10 +299,15 @@ pub fn plan(
     let mut env = composition.env.clone();
     env.extend(runtime_sentinels.clone());
 
+    let mut install_network = render_network(&composition, Phase::Install, credentials);
+    let runtime_network = render_network(&composition, Phase::Runtime, credentials);
+    // Inspection is settled at creation, when the guest is handed the CA, so
+    // a runtime phase that needs it asks for it from the first boot.
+    install_network.is_tls_inspected |= runtime_network.is_tls_inspected;
     Ok(Plan {
         env,
-        install_network: render_network(&composition, Phase::Install, credentials),
-        runtime_network: render_network(&composition, Phase::Runtime, credentials),
+        install_network,
+        runtime_network,
         resources: fit_resources(*requested, &composition.resources),
         selection: selection_record(&composition),
         install_sentinels,

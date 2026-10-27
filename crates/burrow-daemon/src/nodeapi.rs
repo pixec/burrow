@@ -292,6 +292,59 @@ impl NodeService for NodeApi {
         Ok(Response::new(api::DeleteSnapshotResponse {}))
     }
 
+    type TailEventsStream = BoxStream<common::Event>;
+
+    /// Replays the log after a position, then follows it. Subscribed before
+    /// the replay is read, and replay rows win over live ones at the same
+    /// position, so nothing between the two is lost or doubled.
+    async fn tail_events(
+        &self,
+        req: Request<nodepb::NodeTailEventsRequest>,
+    ) -> Result<Response<Self::TailEventsStream>, Status> {
+        let req = req.into_inner();
+        let mut live = self.sandboxes.subscribe_events();
+        let store = std::sync::Arc::clone(&self.store);
+        let stream = async_stream::try_stream! {
+            let mut last = req.after_seq;
+            loop {
+                let rows = store.list_events(last, None, 1000).await
+                    .map_err(|err| Status::internal(format!("reading events: {err}")))?;
+                if rows.is_empty() {
+                    break;
+                }
+                for row in rows {
+                    last = row.seq;
+                    yield crate::sandbox::event_to_proto(row);
+                }
+            }
+            if !req.is_follow {
+                return;
+            }
+            loop {
+                match live.recv().await {
+                    Ok(event) => {
+                        if event.seq > last {
+                            last = event.seq;
+                            yield event;
+                        }
+                    }
+                    // Fell behind the broadcast: the store still has what was
+                    // missed, so read forward from the last position.
+                    Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {
+                        let rows = store.list_events(last, None, 1000).await
+                            .map_err(|err| Status::internal(format!("reading events: {err}")))?;
+                        for row in rows {
+                            last = row.seq;
+                            yield crate::sandbox::event_to_proto(row);
+                        }
+                    }
+                    Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+                }
+            }
+        };
+        Ok(Response::new(Box::pin(stream)))
+    }
+
     async fn list_durable_snapshots(
         &self,
         _req: Request<nodepb::NodeListSnapshotsRequest>,
@@ -494,6 +547,34 @@ impl NodeService for NodeApi {
     ) -> Result<Response<common::Sandbox>, Status> {
         let sandbox = self.sandboxes.resume(&req.into_inner().sandbox_id).await?;
         Ok(Response::new(redact_secrets(sandbox)))
+    }
+
+    async fn adopt_sandbox(
+        &self,
+        req: Request<nodepb::NodeAdoptRequest>,
+    ) -> Result<Response<common::Sandbox>, Status> {
+        let req = req.into_inner();
+        let record = req
+            .record
+            .ok_or_else(|| Status::invalid_argument("adopting needs the sandbox's record"))?;
+        let sandbox = self.sandboxes.adopt(record, req.node_id).await?;
+        Ok(Response::new(redact_secrets(sandbox)))
+    }
+
+    async fn release_sandbox(
+        &self,
+        req: Request<nodepb::NodeSandboxRef>,
+    ) -> Result<Response<common::Sandbox>, Status> {
+        let sandbox = self.sandboxes.release(&req.into_inner().sandbox_id).await?;
+        Ok(Response::new(redact_secrets(sandbox)))
+    }
+
+    async fn purge_sandbox(
+        &self,
+        req: Request<nodepb::NodeSandboxRef>,
+    ) -> Result<Response<nodepb::NodeDeleteResponse>, Status> {
+        self.sandboxes.purge(&req.into_inner().sandbox_id).await?;
+        Ok(Response::new(nodepb::NodeDeleteResponse {}))
     }
 
     async fn list_sessions(
@@ -881,13 +962,20 @@ impl NodeService for NodeApi {
         let mut env = image.as_map();
         env.extend(sandbox.record().env);
         env.extend(start.env);
+        // A Kit sandbox is the image's process: a command in it runs as the
+        // image's USER unless the caller names someone else.
+        let user = if start.user.is_empty() && sandbox.record().kit.is_some() {
+            image.user.clone()
+        } else {
+            start.user
+        };
         let cwd = if !start.cwd.is_empty() {
             start.cwd
-        } else if !start.user.is_empty() {
+        } else if !user.is_empty() && user != image.user {
             // A command running as a user starts in that user's home, which
             // only the guest knows. The image's WORKDIR is the default for
-            // root, not a reason to drop somebody into a directory that is
-            // not theirs.
+            // the image's own user, not a reason to drop somebody else into
+            // a directory that is not theirs.
             String::new()
         } else {
             image.working_dir.clone()
@@ -896,8 +984,8 @@ impl NodeService for NodeApi {
         // Checked here as well as in the guest: the name reaches an argv and a
         // `/etc/passwd` lookup, and the daemon does not take the guest's word
         // for what is safe to send it.
-        if !start.user.is_empty() {
-            check_user_name(&start.user)?;
+        if !user.is_empty() {
+            check_exec_user(&user)?;
         }
 
         let agent_start = guestpb::ExecInput {
@@ -908,7 +996,7 @@ impl NodeService for NodeApi {
                 is_pty: start.is_pty,
                 rows: start.rows,
                 cols: start.cols,
-                user: start.user,
+                user,
                 is_env_cleared: false,
             })),
         };
@@ -1065,6 +1153,7 @@ impl NodeService for NodeApi {
                 since: (!req.since.is_empty()).then(|| req.since.clone()),
                 limit: req.limit,
             })
+            .await
             .map_err(|err| Status::internal(format!("reading audit: {err}")))?;
 
         Ok(Response::new(api::AuditPage {
@@ -1352,6 +1441,21 @@ fn check_user_name(name: &str) -> Result<(), Status> {
     Ok(())
 }
 
+/// An exec's user is what a container runtime accepts for `USER`: a name or
+/// uid, optionally with a group or gid after a colon.
+fn check_exec_user(user: &str) -> Result<(), Status> {
+    let (user, group) = user.split_once(':').unwrap_or((user, ""));
+    for part in [user, group] {
+        if !part.is_empty() && part.parse::<u32>().is_err() {
+            check_user_name(part)?;
+        }
+    }
+    if user.is_empty() {
+        return Err(Status::invalid_argument("an exec user names a user"));
+    }
+    Ok(())
+}
+
 /// Trims a string a guest reported to something a client can be handed.
 fn bounded(mut value: String, max: usize) -> String {
     value.retain(|c| !c.is_control());
@@ -1434,8 +1538,8 @@ fn within_scopes(scopes: &[String], path: &str) -> Result<(), Status> {
     }
     let wanted = path_components(path)?;
     for scope in scopes {
-        // A scope is validated at create, so this only fails for a record
-        // written before that check existed, where refusing is the safe read.
+        // A scope is validated at create; a malformed one is refused here
+        // rather than read as matching nothing or everything.
         let scope = path_components(scope)?;
         if wanted.len() >= scope.len() && wanted[..scope.len()] == scope[..] {
             return Ok(());
@@ -2635,8 +2739,8 @@ mod policy_tests {
         assert!(within_scopes(&work, "/work/..hidden").is_ok());
     }
 
-    /// Absent means allowed: every sandbox created before these sections were
-    /// enforced carries no exec or fs policy at all.
+    /// Absent means allowed: a sandbox created without an exec or fs policy
+    /// has neither restricted.
     #[test]
     fn an_absent_section_allows_everything() {
         let open = common::Policy::default();

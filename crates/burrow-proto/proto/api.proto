@@ -37,6 +37,9 @@ service Burrow {
   rpc UpdateResources(UpdateResourcesRequest) returns (burrow.common.v1.Sandbox);
   // Create a sandbox from another's current state, on the source's node.
   rpc ForkSandbox(ForkSandboxRequest) returns (burrow.common.v1.Sandbox);
+  // Move a sandbox to another node through the object store. A running one
+  // is suspended first and arrives running; a suspended one arrives running.
+  rpc MoveSandbox(MoveSandboxRequest) returns (burrow.common.v1.Sandbox);
   // Replace a running sandbox's egress policy: firewall rules, proxy
   // allowlist, DNS filtering and header injection all re-render at once.
   rpc UpdateNetworkPolicy(UpdateNetworkPolicyRequest) returns (burrow.common.v1.Sandbox);
@@ -110,6 +113,9 @@ service Burrow {
   // Audit: every egress attempt and DNS lookup a sandbox made.
   rpc QueryAudit(AuditQuery) returns (stream AuditEvent);
   rpc Watch(WatchRequest) returns (stream WatchEvent);
+  // The fleet's lifecycle log: what happened to which sandbox, in order,
+  // resumable from the last `seq` seen.
+  rpc TailEvents(TailEventsRequest) returns (stream burrow.common.v1.Event);
 }
 
 message AuditQuery {
@@ -138,6 +144,17 @@ message AuditEvent {
 
 message AuditPage {
   repeated AuditEvent events = 1;
+}
+
+message TailEventsRequest {
+  // Replay starts after this `seq`; 0 from the beginning of what is kept.
+  uint64 after_seq = 1;
+  // Empty means every sandbox.
+  string sandbox = 2;
+  // Keep streaming new events after the replay instead of ending.
+  bool is_follow = 3;
+  // Cap on replayed events; 0 selects a server default.
+  uint32 limit = 4;
 }
 
 message WatchRequest {
@@ -181,6 +198,10 @@ message BuildTemplateRequest {
   // of `from` and `from_image`; `steps` must be empty. An empty `name` is
   // derived from the set's digests.
   repeated string kits = 8;
+  // Boot the template's own systemd under the agent instead of the agent
+  // alone. Recorded with the template, so everything built on it or restored
+  // from it keeps the mode. The image has to ship systemd.
+  bool is_systemd = 9;
 }
 
 message BuildDone {
@@ -207,6 +228,8 @@ message TemplateInfo {
   bool is_warm = 3;
   // Imported from Kits: creates run their lifecycle.
   bool is_kit = 4;
+  // Sandboxes from it run systemd under the agent.
+  bool is_systemd = 5;
 }
 
 message ListTemplatesResponse {
@@ -454,6 +477,14 @@ message ForkSandboxRequest {
   // is what makes "fork this, but only on our own hardware" say something
   // rather than nothing.
   map<string, string> node_labels = 5;
+}
+
+message MoveSandboxRequest {
+  SandboxRef ref = 1;
+  // The node to move to. Empty lets the orchestrator place it.
+  string node_id = 2;
+  // Labels the destination must carry, when no node is named.
+  map<string, string> node_labels = 3;
 }
 
 // Takes a sandbox's current state and keeps it as a snapshot object.

@@ -81,9 +81,15 @@ pub struct NodeConfig {
     /// Where snapshots are copied so they outlive this node. `None` keeps
     /// them node-local.
     pub object_store: Option<crate::objstore::ObjectStore>,
+    /// Seals the brokered credentials of a sandbox stored in `object_store`,
+    /// shared by every node so whichever adopts it can open them.
+    pub store_vault: Option<Arc<burrow_common::vault::Vault>>,
     /// What `firecracker_bin` reports, recorded on every snapshot: guest state
     /// only restores under the Firecracker that wrote it.
     pub firecracker_version: String,
+    /// The agent this node ships. A guest found running another build on
+    /// handshake is upgraded to it in place.
+    pub guest_upgrade: Option<Arc<guestconn::GuestUpgrade>>,
 }
 
 impl NodeConfig {
@@ -196,6 +202,43 @@ const ENDED_STOPPED: &str = "stopped";
 /// A session that was still open when the node died. Nothing observed when its
 /// VM stopped, so its end time stays unset rather than being invented.
 const ENDED_UNKNOWN: &str = "unknown";
+
+/// Event kinds, as the log records them. A sandbox's life reads
+/// created, started, agent_ready, then stopped and started per suspend and
+/// resume, then destroyed; snapshot_created sits wherever a commit happened.
+const EVENT_CREATED: &str = "created";
+const EVENT_STARTED: &str = "started";
+const EVENT_AGENT_READY: &str = "agent_ready";
+const EVENT_STOPPED: &str = "stopped";
+const EVENT_DESTROYED: &str = "destroyed";
+const EVENT_SNAPSHOT_CREATED: &str = "snapshot_created";
+
+fn unix_now_ms() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as i64)
+        .unwrap_or(0)
+}
+
+pub fn event_to_proto(row: burrow_store::EventRow) -> common::Event {
+    common::Event {
+        seq: row.seq,
+        node_id: row.node_id,
+        node_seq: row.node_seq,
+        at_unix_ms: row.at_unix_ms,
+        sandbox_id: row.sandbox_id,
+        r#type: row.kind,
+        state: row.state,
+        detail: row.detail,
+        template: row.template,
+        metadata: serde_json::from_str(&row.metadata_json).unwrap_or_default(),
+        cpu_usage_usec: row.cpu_usage_usec,
+        rx_bytes: row.rx_bytes,
+        tx_bytes: row.tx_bytes,
+        vcpus: row.vcpus,
+        mem_mib: row.mem_mib,
+    }
+}
 
 /// What a sandbox has consumed, and the raw readings the totals came from.
 ///
@@ -393,9 +436,12 @@ fn spawn_handshake(
     let weak = Arc::downgrade(sandbox);
     tokio::spawn(async move {
         let began = std::time::Instant::now();
+        let upgrade = manager.config.guest_upgrade.clone();
         let outcome = match tokio::time::timeout(timeout, async {
-            let (mut agent, _) = guestconn::connect_when_ready(uds, timeout).await?;
-            agent.handshake(request).await?;
+            let (agent, _) = guestconn::connect_when_ready(uds.clone(), timeout).await?;
+            let (agent, _) =
+                guestconn::handshake_upgrading(agent, uds, request, upgrade.as_deref(), timeout)
+                    .await?;
             Ok::<_, anyhow::Error>(agent)
         })
         .await
@@ -429,6 +475,7 @@ fn spawn_handshake(
                 // The channel this was made on is the one the first exec would
                 // otherwise have to dial for itself.
                 *sandbox.agent_channel.lock().await = Some(agent.expect("done means connected"));
+                manager.emit(&sandbox, EVENT_AGENT_READY, "").await;
                 tracing::debug!(
                     sandbox = id,
                     took_ms = began.elapsed().as_millis() as u64,
@@ -500,6 +547,8 @@ pub struct RunningSandbox {
     /// a snapshot at all; `[snapshot.mem]` after a full one, with a diff
     /// appended per suspend after that.
     memory_chain: Mutex<Vec<String>>,
+    /// Where the sandbox stands with the object store.
+    durable: crate::durable::Durability,
     /// Unix seconds of the last thing anyone asked this sandbox to do.
     ///
     /// Idle suspension is measured from here rather than from the VM's own
@@ -540,6 +589,13 @@ impl RunningSandbox {
         record.cpu_usage_usec = usage.cpu_usec;
         record.rx_bytes = usage.rx_bytes;
         record.tx_bytes = usage.tx_bytes;
+        record.is_durable = self.durable.is_current();
+        if record.is_durable
+            && let Some(stored) = self.durable.stored.lock().unwrap().as_ref()
+        {
+            record.arch = stored.manifest.arch.clone();
+            record.firecracker_version = stored.manifest.firecracker_version.clone();
+        }
         record
     }
 
@@ -656,6 +712,11 @@ impl RunningSandbox {
     fn is_running(&self) -> bool {
         self.state.load(std::sync::atomic::Ordering::Relaxed)
             == common::SandboxState::Running as i32
+    }
+
+    fn is_suspended(&self) -> bool {
+        self.state.load(std::sync::atomic::Ordering::Relaxed)
+            == common::SandboxState::Suspended as i32
     }
 
     pub async fn agent(&self) -> Result<GuestClient<Channel>, Status> {
@@ -807,6 +868,7 @@ impl RunningSandbox {
 
     /// Merges the memory chain back down to a single base file.
     async fn compact_memory_chain(&self) {
+        self.durable.settle_memory().await;
         let mut chain = self.memory_chain.lock().await;
         let paths: Vec<std::path::PathBuf> =
             chain.iter().map(|name| self.workdir.join(name)).collect();
@@ -869,7 +931,11 @@ impl RunningSandbox {
 
     /// Restores from the on-disk snapshot and re-handshakes with the agent.
     #[tracing::instrument(skip_all, fields(sandbox = %self.id()))]
-    async fn resume(&self, agent_timeout: std::time::Duration) -> Result<(), Status> {
+    async fn resume(
+        &self,
+        agent_timeout: std::time::Duration,
+        upgrade: Option<&guestconn::GuestUpgrade>,
+    ) -> Result<(), Status> {
         self.forget_agent().await;
         let mut slot = self.vm.lock().await;
         if slot.is_some() {
@@ -878,6 +944,10 @@ impl RunningSandbox {
 
         let mut spec = self.spec.lock().unwrap().clone();
         spec.memory_chain = self.memory_chain.lock().await.clone();
+        spec.memory_source = self
+            .durable
+            .arriving()
+            .map(|h| burrow_firecracker::MemorySource(h));
         let vm = MicroVm::restore(spec, true)
             .await
             .map_err(|err| Status::internal(format!("restore failed: {err}")))?;
@@ -887,13 +957,18 @@ impl RunningSandbox {
 
         // `restored: true` is what tells the guest to reseed its RNG and reset
         // its clock, which it cannot know on its own.
-        let mut agent = guestconn::connect(
-            self.workdir.join(burrow_firecracker::VSOCK_UDS),
+        let uds = self.workdir.join(burrow_firecracker::VSOCK_UDS);
+        let agent = guestconn::connect(uds.clone(), agent_timeout)
+            .await
+            .map_err(|err| Status::internal(format!("agent connect: {err}")))?;
+        guestconn::handshake_upgrading(
+            agent,
+            uds,
+            guestconn::handshake_request(true),
+            upgrade,
             agent_timeout,
         )
-        .await
-        .map_err(|err| Status::internal(format!("agent connect: {err}")))?;
-        agent.handshake(guestconn::handshake_request(true)).await?;
+        .await?;
         // This VM handshook synchronously, whatever the last one did. A failure
         // recorded there was a verdict on a VM that no longer exists.
         self.handshake.send_replace(Handshake::Done);
@@ -935,6 +1010,9 @@ impl RunningSandbox {
         let _ = tokio::fs::remove_file(self.workdir.join(burrow_firecracker::SNAPSHOT_FILE)).await;
         let _ =
             tokio::fs::remove_file(self.workdir.join(burrow_firecracker::SNAPSHOT_MEM_FILE)).await;
+        if let Some(hydrator) = self.durable.hydration.lock().unwrap().take() {
+            hydrator.detach(&self.workdir.join(burrow_firecracker::SNAPSHOT_MEM_FILE));
+        }
         Self::remove_stale_diffs(&self.workdir).await;
         self.suspended_at
             .store(0, std::sync::atomic::Ordering::Relaxed);
@@ -949,6 +1027,7 @@ impl RunningSandbox {
         spec: MicroVmSpec,
         request: burrow_proto::guest::v1::HandshakeRequest,
         agent_timeout: std::time::Duration,
+        upgrade: Option<&guestconn::GuestUpgrade>,
     ) -> Result<(), Status> {
         self.forget_agent().await;
         let mut slot = self.vm.lock().await;
@@ -965,7 +1044,7 @@ impl RunningSandbox {
         let vm = MicroVm::boot(spec.clone())
             .await
             .map_err(|err| Status::internal(format!("boot failed: {err}")))?;
-        let (mut agent, _) =
+        let (agent, _) =
             match guestconn::connect_when_ready(vm.vsock_uds_path(), agent_timeout).await {
                 Ok(ready) => ready,
                 Err(err) => {
@@ -976,7 +1055,15 @@ impl RunningSandbox {
                     )));
                 }
             };
-        if let Err(err) = agent.handshake(request).await {
+        if let Err(err) = guestconn::handshake_upgrading(
+            agent,
+            vm.vsock_uds_path(),
+            request,
+            upgrade,
+            agent_timeout,
+        )
+        .await
+        {
             let _ = vm.kill().await;
             return Err(err);
         }
@@ -1087,6 +1174,7 @@ impl RunningSandbox {
     /// flattening here would put an extra full-image rewrite on the fork's
     /// critical path for a cost the child pays lazily anyway.
     async fn stage_fork(&self, dest: &Path) -> Result<Vec<String>, Status> {
+        self.durable.settle_memory().await;
         let _slot = self.vm.lock().await;
         let chain = self.memory_chain.lock().await.clone();
         if chain.is_empty() {
@@ -1165,18 +1253,31 @@ impl RunningSandbox {
 /// names, which is what makes both restorable, so they differ only in the copy.
 enum RestoreSource<'a> {
     Sandbox(&'a Arc<RunningSandbox>),
-    Snapshot { id: &'a str, template: String },
+    Snapshot {
+        id: &'a str,
+        template: String,
+    },
+    /// A sandbox's own state in the object store, being adopted here.
+    Stored {
+        store: &'a crate::objstore::ObjectStore,
+        manifest: &'a crate::durable::Manifest,
+    },
 }
 
 impl RestoreSource<'_> {
+    /// Stages the state, returning the memory chain and, when the base is
+    /// still arriving, what it is arriving from.
     async fn stage_into(
         &self,
         snapshots: &crate::snapshot::SnapshotStore,
         dest: &Path,
-    ) -> Result<Vec<String>, Status> {
+    ) -> Result<(Vec<String>, Option<Arc<crate::chunks::Hydrator>>), Status> {
         match self {
-            Self::Sandbox(source) => source.stage_fork(dest).await,
+            Self::Sandbox(source) => Ok((source.stage_fork(dest).await?, None)),
             Self::Snapshot { id, .. } => snapshots.stage_into(id, dest).await,
+            Self::Stored { store, manifest } => {
+                crate::durable::stage(store, snapshots, manifest, dest).await
+            }
         }
     }
 
@@ -1184,6 +1285,7 @@ impl RestoreSource<'_> {
         match self {
             Self::Sandbox(source) => source.template().to_string(),
             Self::Snapshot { template, .. } => template.clone(),
+            Self::Stored { manifest, .. } => manifest.template.clone(),
         }
     }
 }
@@ -1243,6 +1345,9 @@ pub struct SandboxManager {
     /// Snapshot objects this node holds. Outside the sandbox map deliberately:
     /// a snapshot outlives the sandbox it was taken from.
     snapshots: Arc<crate::snapshot::SnapshotStore>,
+    /// Live copy of the event log, for tails that are following it. The log
+    /// itself is the `events` table; this only carries what is appended.
+    events: tokio::sync::broadcast::Sender<common::Event>,
     volumes: Arc<crate::volume::VolumeStore>,
     /// Woken when this node has something the orchestrator should hear about
     /// before the next scheduled heartbeat.
@@ -1280,6 +1385,18 @@ pub struct SandboxManager {
     /// build, costing a boot, a snapshot and the node's one warm build lock,
     /// for every novel one.
     warm_shapes: Arc<std::sync::Mutex<HashMap<String, WarmShapes>>>,
+    /// How long this node may go on resuming durable sandboxes without
+    /// hearing from the orchestrator.
+    lease: Arc<std::sync::Mutex<NodeLease>>,
+}
+
+/// Renewed by every heartbeat the orchestrator answers. Once it runs out the
+/// orchestrator may write this node off and let another adopt its durable
+/// sandboxes, so from then on this node resumes none of them on its own say.
+#[derive(Default)]
+struct NodeLease {
+    renewed: Option<std::time::Instant>,
+    length: std::time::Duration,
 }
 
 /// Shapes one template will build a warm snapshot for before it stops.
@@ -1423,6 +1540,7 @@ impl SandboxManager {
                 config.firecracker_version.clone(),
             )),
             volumes: Arc::new(crate::volume::VolumeStore::new(&config.data_dir)),
+            events: tokio::sync::broadcast::channel(1024).0,
             shares: Arc::new(crate::share::Shares::new(
                 config.share.clone(),
                 &config.data_dir,
@@ -1446,6 +1564,7 @@ impl SandboxManager {
             remote_members: Arc::new(Mutex::new(HashMap::new())),
             announce: Arc::new(tokio::sync::Notify::new()),
             edge_addresses: Arc::new(std::sync::Mutex::new(Vec::new())),
+            lease: Default::default(),
         }
     }
 
@@ -1596,6 +1715,7 @@ impl SandboxManager {
                     self.volumes.release_all(sandbox.id());
                     self.close_session(&sandbox, ENDED_SUSPENDED).await;
                     self.persist(&sandbox).await;
+                    self.spawn_upload(&sandbox);
                     suspended += 1;
                 }
                 Err(err) => {
@@ -1639,9 +1759,54 @@ impl SandboxManager {
             share: self.shares.spec(sandbox.id()).await,
             suspended_at: sandbox.suspended_at(),
         };
-        if let Err(err) = self.store.put_sandbox(&row) {
+        if let Err(err) = self.store.put_sandbox(&row).await {
             tracing::error!(sandbox = record.id, %err, "failed to persist sandbox");
         }
+    }
+
+    /// Appends to the event log and hands the event to anyone following it.
+    ///
+    /// Written before it is broadcast, and with the position the store gave
+    /// it, so a tail that replays and then follows sees every event exactly
+    /// once. The usage figures are the sandbox's totals at this instant.
+    async fn emit(&self, sandbox: &RunningSandbox, kind: &str, detail: &str) {
+        let record = sandbox.record();
+        let resources = record
+            .policy
+            .as_ref()
+            .and_then(|p| p.resources)
+            .unwrap_or_default();
+        let row = burrow_store::EventRow {
+            seq: 0,
+            node_id: String::new(),
+            node_seq: 0,
+            at_unix_ms: unix_now_ms(),
+            sandbox_id: record.id.clone(),
+            kind: kind.to_string(),
+            state: record.state,
+            detail: detail.to_string(),
+            template: record.template.clone(),
+            metadata_json: serde_json::to_string(&record.metadata).unwrap_or_else(|_| "{}".into()),
+            cpu_usage_usec: record.cpu_usage_usec,
+            rx_bytes: record.rx_bytes,
+            tx_bytes: record.tx_bytes,
+            vcpus: resources.vcpus,
+            mem_mib: resources.mem_mib,
+        };
+        let seq = match self.store.append_event(&row).await {
+            Ok(seq) => seq,
+            Err(err) => {
+                tracing::error!(sandbox = record.id, kind, %err, "could not record an event");
+                return;
+            }
+        };
+        let _ = self
+            .events
+            .send(event_to_proto(burrow_store::EventRow { seq, ..row }));
+    }
+
+    pub fn subscribe_events(&self) -> tokio::sync::broadcast::Receiver<common::Event> {
+        self.events.subscribe()
     }
 
     /// Records that a VM has started for this sandbox.
@@ -1658,15 +1823,17 @@ impl SandboxManager {
             started_by: started_by.to_string(),
             ended_by: String::new(),
         };
-        if let Err(err) = self.store.put_session(&row) {
+        if let Err(err) = self.store.put_session(&row).await {
             tracing::error!(sandbox = sandbox.id(), %err, "could not record a session");
             return;
         }
         *sandbox.session.lock().unwrap() = Some(row.id);
+        self.emit(sandbox, EVENT_STARTED, started_by).await;
         // Applied as a session lands, which is the one moment the count grows.
         if let Err(err) = self
             .store
             .retain_recent_sessions(sandbox.id(), MAX_SESSIONS)
+            .await
         {
             tracing::warn!(sandbox = sandbox.id(), %err, "could not bound the session list");
         }
@@ -1680,9 +1847,11 @@ impl SandboxManager {
         if let Err(err) = self
             .store
             .end_session(&id, burrow_common::unix_now(), ended_by)
+            .await
         {
             tracing::error!(sandbox = sandbox.id(), %err, "could not close a session");
         }
+        self.emit(sandbox, EVENT_STOPPED, ended_by).await;
     }
 
     /// Every VM a sandbox has run, newest first.
@@ -1693,6 +1862,7 @@ impl SandboxManager {
         let rows = self
             .store
             .list_sessions(id)
+            .await
             .map_err(|err| Status::internal(format!("reading sessions: {err}")))?;
         Ok(rows
             .into_iter()
@@ -1750,7 +1920,7 @@ impl SandboxManager {
     /// anything that was running when the daemon died has no snapshot and is
     /// unrecoverable, so its resources are released rather than leaked.
     pub async fn recover(&self) {
-        let rows = match self.store.list_sandboxes() {
+        let rows = match self.store.list_sandboxes().await {
             Ok(rows) => rows,
             Err(err) => {
                 tracing::error!(%err, "cannot read sandbox store; starting empty");
@@ -1761,7 +1931,7 @@ impl SandboxManager {
         // belongs to a VM that is already gone. Closed here rather than left
         // open forever, and without an end time: nothing observed when those
         // VMs stopped.
-        match self.store.close_open_sessions(ENDED_UNKNOWN) {
+        match self.store.close_open_sessions(ENDED_UNKNOWN).await {
             Ok(0) => {}
             Ok(closed) => tracing::info!(closed, "closed sessions left open by the previous run"),
             Err(err) => tracing::error!(%err, "could not close open sessions"),
@@ -1788,10 +1958,10 @@ impl SandboxManager {
                 );
                 tap::delete(&row.tap).await;
                 let _ = tokio::fs::remove_dir_all(&workdir).await;
-                let _ = self.store.delete_sandbox(&row.id);
+                let _ = self.store.delete_sandbox(&row.id).await;
                 // Sessions describe a sandbox's VMs and have no owner once it
                 // is gone.
-                let _ = self.store.delete_sessions(&row.id);
+                let _ = self.store.delete_sessions(&row.id).await;
                 discarded += 1;
                 continue;
             }
@@ -1804,10 +1974,10 @@ impl SandboxManager {
                 // the orphan sweep below removes only taps no sandbox kept.
                 let _ = tokio::fs::remove_dir_all(&workdir).await;
                 self.volumes.release_all(&row.id);
-                if let Err(cleanup_err) = self.store.delete_sandbox(&row.id) {
+                if let Err(cleanup_err) = self.store.delete_sandbox(&row.id).await {
                     tracing::error!(sandbox = row.id, %cleanup_err, "failed to remove rejected sandbox from store");
                 }
-                if let Err(cleanup_err) = self.store.delete_sessions(&row.id) {
+                if let Err(cleanup_err) = self.store.delete_sessions(&row.id).await {
                     tracing::error!(sandbox = row.id, %cleanup_err, "failed to remove rejected sandbox sessions");
                 }
                 discarded += 1;
@@ -1856,7 +2026,10 @@ impl SandboxManager {
                 tx_bytes: record.tx_bytes,
                 ..Default::default()
             };
-            let spec = self.build_spec(&row.id, &workdir, &resources, &lease, &row.tap, &volumes);
+            let is_systemd = self.image_environment(&record.template).await.systemd;
+            let spec = self.build_spec(
+                &row.id, &workdir, &resources, &lease, &row.tap, &volumes, is_systemd,
+            );
 
             let sandbox = Arc::new(RunningSandbox {
                 id: record.id.clone(),
@@ -1866,10 +2039,10 @@ impl SandboxManager {
                 vm: Mutex::new(None),
                 spec: std::sync::Mutex::new(spec),
                 last_activity: std::sync::atomic::AtomicI64::new(burrow_common::unix_now()),
-                // A row written before this column existed says 0, which read
-                // literally is 1970, putting every recovered sandbox instantly
-                // past its retention. Backfilled with now instead: the worst
-                // that costs is one extra TTL's grace after an upgrade.
+                // A sandbox that was running when the node went down never
+                // recorded a suspension, so its row says 0, which read
+                // literally is 1970 and would put it instantly past its
+                // retention. Its suspension starts now, at recovery.
                 suspended_at: std::sync::atomic::AtomicI64::new(match row.suspended_at {
                     0 => burrow_common::unix_now(),
                     at => at,
@@ -1890,10 +2063,12 @@ impl SandboxManager {
                 // came from are gone.
                 usage: std::sync::Mutex::new(usage),
                 session: std::sync::Mutex::new(None),
+                durable: Default::default(),
                 workdir,
                 lease,
                 tap: row.tap.clone(),
             });
+            self.recover_durability(&sandbox).await;
             if !row.ports.is_empty() {
                 self.ports.lock().await.insert(
                     row.id.clone(),
@@ -1932,9 +2107,8 @@ impl SandboxManager {
 
     /// Removes sandbox directories with no corresponding record.
     ///
-    /// These accumulate from crashes and from sandboxes created before the
-    /// store existed. Each holds a scratch disk and possibly a memory
-    /// snapshot, so left alone they quietly consume the node's disk.
+    /// These accumulate from crashes. Each holds a scratch disk and possibly
+    /// a memory snapshot, so left alone they quietly consume the node's disk.
     async fn collect_orphan_workdirs(&self) {
         // An import stages under build/ and removes its directory when it is
         // done; one that died mid-unpack, out of disk say, left gigabytes
@@ -2990,6 +3164,7 @@ impl SandboxManager {
     /// on where they started, and a full list makes a missed heartbeat
     /// self-correcting.
     pub async fn state_reports(&self) -> Vec<burrow_proto::node::v1::SandboxStateReport> {
+        self.fence_if_lapsed().await;
         self.sandboxes
             .lock()
             .await
@@ -3003,6 +3178,8 @@ impl SandboxManager {
                     rx_bytes: record.rx_bytes,
                     tx_bytes: record.tx_bytes,
                     is_agent_unconfirmed: record.is_agent_unconfirmed,
+                    is_durable: record.is_durable,
+                    is_fenced: sandbox.durable.is_fenced(),
                 }
             })
             .collect()
@@ -3050,6 +3227,7 @@ impl SandboxManager {
     /// Shared by creation and recovery: Firecracker requires a restored VM to
     /// be described with the same resources it was snapshotted with, so the
     /// two paths must not be able to drift apart.
+    #[allow(clippy::too_many_arguments)]
     fn build_spec(
         &self,
         id: &str,
@@ -3058,6 +3236,7 @@ impl SandboxManager {
         lease: &Lease,
         tap_name: &str,
         volumes: &[common::VolumeMount],
+        is_systemd: bool,
     ) -> MicroVmSpec {
         let mut spec = MicroVmSpec::new(id.to_string(), workdir);
         spec.firecracker_bin = self.config.firecracker_bin.clone();
@@ -3114,13 +3293,14 @@ impl SandboxManager {
             guest_mac: Some(lease.guest_mac()),
         });
         spec.boot_args = format!(
-            "{} root=/dev/vda ro init=/usr/bin/burrow-guest {} burrow.dns={} burrow.ip6={}/{} burrow.ip6gw={} {}",
+            "{} root=/dev/vda ro init=/usr/bin/burrow-guest {} burrow.dns={} burrow.ip6={}/{} burrow.ip6gw={} {} {}",
             burrow_firecracker::DEFAULT_BOOT_ARGS,
             lease.kernel_ip_arg(),
             lease.host_ip,
             lease.guest_ip6(),
             lease.prefix_len6(),
             lease.host_ip6(),
+            guest_mode_arg(is_systemd),
             self.config.extra_boot_args
         );
         spec
@@ -3208,6 +3388,7 @@ impl SandboxManager {
         // A create is a VM starting, whether it cold-booted or restored a warm
         // template snapshot: either way the guest begins at the image's state
         // rather than at one this sandbox left behind.
+        self.emit(&sandbox, EVENT_CREATED, "").await;
         self.open_session(&sandbox, STARTED_BOOT).await;
         let record = sandbox.record();
         let registered = std::time::Instant::now();
@@ -3428,7 +3609,16 @@ impl SandboxManager {
         // once it is running. A cold boot has no such constraint and takes them
         // at boot, which needs no rescan in the guest.
         let boot_volumes: &[common::VolumeMount] = if from_warm { &[] } else { &policy.volumes };
-        let mut spec = self.build_spec(&id, &workdir, &resources, &lease, &tap_name, boot_volumes);
+        let is_systemd = self.image_environment(&template).await.systemd;
+        let mut spec = self.build_spec(
+            &id,
+            &workdir,
+            &resources,
+            &lease,
+            &tap_name,
+            boot_volumes,
+            is_systemd,
+        );
         // Only meaningful on a restore, and only when the template was
         // profiled; a create that boots cold has no snapshot to prefetch from.
         if from_warm
@@ -3523,7 +3713,7 @@ impl SandboxManager {
                 self.config.agent_timeout,
             )
             .await;
-            let (mut agent, accepted_at) = match connected {
+            let (agent, accepted_at) = match connected {
                 Ok(ready) => ready,
                 Err(err) => {
                     let console = guard.vm().console_tail(30).await;
@@ -3543,8 +3733,16 @@ impl SandboxManager {
             // A failed handshake gets the same teardown as a failed connect. It
             // did not, and a template that reliably fails to handshake would
             // exhaust the node's taps and address blocks one create at a time.
-            let guest_timing = match agent.handshake(request.clone()).await {
-                Ok(response) => response.into_inner().timing.unwrap_or_default(),
+            let guest_timing = match guestconn::handshake_upgrading(
+                agent,
+                guard.vm().vsock_uds_path(),
+                request.clone(),
+                self.config.guest_upgrade.as_deref(),
+                self.config.agent_timeout,
+            )
+            .await
+            {
+                Ok((_, response)) => response.timing.unwrap_or_default(),
                 Err(err) => return Err(guard.fail(err).await),
             };
             (
@@ -3586,6 +3784,9 @@ impl SandboxManager {
             kit: None,
             kit_credentials: HashMap::new(),
             kit_selection: String::new(),
+            is_durable: false,
+            arch: String::new(),
+            firecracker_version: String::new(),
         };
 
         // The one-line summary, unchanged in shape: VM, guest wake, handshake,
@@ -3654,6 +3855,7 @@ impl SandboxManager {
             }),
             usage: std::sync::Mutex::new(Usage::default()),
             session: std::sync::Mutex::new(None),
+            durable: Default::default(),
             workdir,
             lease,
             tap: tap_name,
@@ -3675,6 +3877,7 @@ impl SandboxManager {
         self.volumes.release_all(id);
         self.close_session(&sandbox, ENDED_SUSPENDED).await;
         self.persist(&sandbox).await;
+        self.spawn_upload(&sandbox);
         tracing::info!(sandbox = id, "sandbox suspended");
         Ok(sandbox.record())
     }
@@ -3773,6 +3976,8 @@ impl SandboxManager {
                 resources.is_evicted_snapshot_kept,
             )
             .await;
+        self.emit(&sandbox, EVENT_SNAPSHOT_CREATED, &snapshot.id)
+            .await;
         tracing::info!(
             size_bytes = snapshot.size_bytes,
             took_ms = started.elapsed().as_millis() as u64,
@@ -3858,6 +4063,8 @@ impl SandboxManager {
             .lock()
             .await
             .insert(id.clone(), sandbox.clone());
+        self.emit(&sandbox, EVENT_CREATED, &format!("snapshot:{snapshot_id}"))
+            .await;
         self.open_session(&sandbox, STARTED_RESTORE).await;
         let record = sandbox.record();
         self.persist(&sandbox).await;
@@ -3910,6 +4117,8 @@ impl SandboxManager {
             .lock()
             .await
             .insert(child_id.clone(), sandbox.clone());
+        self.emit(&sandbox, EVENT_CREATED, &format!("fork:{source_id}"))
+            .await;
         self.open_session(&sandbox, STARTED_RESTORE).await;
         let record = sandbox.record();
         self.persist(&sandbox).await;
@@ -4092,7 +4301,7 @@ impl SandboxManager {
             tokio::fs::create_dir_all(&workdir)
                 .await
                 .map_err(|err| Status::internal(format!("creating the workdir: {err}")))?;
-            let chain = source.stage_into(&self.snapshots, &workdir).await?;
+            let (chain, arriving) = source.stage_into(&self.snapshots, &workdir).await?;
             // Linked in the same shape as a create's, so the guest sees the
             // same devices in the same order as the handshake describes.
             for (index, mount) in crate::volume::block_mounts(&policy.volumes) {
@@ -4130,13 +4339,13 @@ impl SandboxManager {
                     .await
                     .map_err(|err| Status::internal(format!("preparing the jail: {err}")))?;
             }
-            Ok::<Vec<String>, Status>(chain)
+            Ok::<_, Status>((chain, arriving))
         };
 
         let (staged, tap) = tokio::join!(stage, tap::create(&lease));
         guard.tap = tap.as_ref().ok().cloned();
-        let chain = match staged {
-            Ok(chain) => chain,
+        let (chain, arriving) = match staged {
+            Ok(staged) => staged,
             Err(err) => return Err(guard.fail(err).await),
         };
         let tap_name = match tap {
@@ -4153,7 +4362,19 @@ impl SandboxManager {
         // the snapshot this is restoring was taken without them. They are
         // hotplugged below instead, before the handshake that tells the guest
         // to rescan for them.
-        let mut spec = self.build_spec(&id, &workdir, &resources, &lease, &tap_name, &[]);
+        let is_systemd = match &source {
+            RestoreSource::Stored { manifest, .. } => manifest.is_systemd,
+            _ => self.image_environment(&source.template()).await.systemd,
+        };
+        let mut spec = self.build_spec(
+            &id,
+            &workdir,
+            &resources,
+            &lease,
+            &tap_name,
+            &[],
+            is_systemd,
+        );
         // The template's plan names the pages its agent touches on the way to
         // a usable handshake, which is the same code whether the guest was
         // just warmed or has been running for an hour, and the offsets hold
@@ -4165,6 +4386,9 @@ impl SandboxManager {
         }
         let boot_spec = spec.clone();
         spec.memory_chain = chain.clone();
+        spec.memory_source = arriving
+            .clone()
+            .map(|h| burrow_firecracker::MemorySource(h));
 
         let started = std::time::Instant::now();
         match MicroVm::restore(spec, true).await {
@@ -4233,6 +4457,9 @@ impl SandboxManager {
             kit: None,
             kit_credentials: HashMap::new(),
             kit_selection: String::new(),
+            is_durable: false,
+            arch: String::new(),
+            firecracker_version: String::new(),
         };
         tracing::info!(
             sandbox = id,
@@ -4259,10 +4486,12 @@ impl SandboxManager {
             // is a new sandbox and starts from nothing.
             usage: std::sync::Mutex::new(Usage::default()),
             session: std::sync::Mutex::new(None),
+            durable: Default::default(),
             workdir,
             lease,
             tap: tap_name,
         });
+        *sandbox.durable.hydration.lock().unwrap() = arriving;
         spawn_handshake(self, &sandbox, request, self.config.agent_timeout);
         Ok(sandbox)
     }
@@ -4270,13 +4499,36 @@ impl SandboxManager {
     /// Restores a suspended sandbox from its snapshot.
     pub async fn resume(&self, id: &str) -> Result<common::Sandbox, Status> {
         let sandbox = self.get(id).await?;
+        self.fence_if_lapsed().await;
+        if sandbox.durable.is_fenced() {
+            return Err(Status::unavailable(format!(
+                "sandbox {id} is kept in the object store, and this node is waiting for the \
+                 orchestrator to confirm it still holds it; try again shortly"
+            )));
+        }
         // Suspending gave the volumes back, so another sandbox may hold them
         // now. Taken before the VM starts, so a sandbox that cannot have them
         // stays suspended rather than resuming without its data.
         let volumes = sandbox.record().policy.unwrap_or_default().volumes;
         self.volumes.claim(id, &volumes)?;
-        if let Err(err) = sandbox.resume(self.config.agent_timeout).await {
+        let uploading = sandbox.durable.stop_uploading().await;
+        if let Err(err) = self.mark_running(&sandbox).await {
             self.volumes.release_all(id);
+            return Err(err);
+        }
+        sandbox.durable.invalidate();
+        let resumed = sandbox
+            .resume(
+                self.config.agent_timeout,
+                self.config.guest_upgrade.as_deref(),
+            )
+            .await;
+        drop(uploading);
+        if let Err(err) = resumed {
+            self.volumes.release_all(id);
+            // Still suspended on files that did not change, so the stored
+            // copy can be made current again.
+            self.spawn_upload(&sandbox);
             return Err(err);
         }
         self.open_session(&sandbox, STARTED_RESUME).await;
@@ -4288,7 +4540,23 @@ impl SandboxManager {
     /// the guest's memory survives: a start boots the image's init again.
     pub async fn stop(&self, id: &str) -> Result<common::Sandbox, Status> {
         let sandbox = self.get(id).await?;
+        // The VMM is killed, not powered off, so the guest's page cache
+        // would otherwise die with it and the disk a boot comes back to
+        // would miss what was last written. Best effort: a guest that has
+        // stopped answering is stopped all the same.
+        let sync = burrow_proto::guest::v1::ExecStart {
+            cmd: vec!["sync".to_string()],
+            ..Default::default()
+        };
+        let _ = tokio::time::timeout(
+            std::time::Duration::from_secs(15),
+            guestconn::run_to_completion(&sandbox, sync),
+        )
+        .await;
         sandbox.shutdown().await?;
+        // Its memory is gone, so what the store holds is a guest that no
+        // longer exists.
+        self.forget_stored(&sandbox).await;
         self.volumes.release_all(id);
         self.close_session(&sandbox, ENDED_STOPPED).await;
         self.persist(&sandbox).await;
@@ -4319,6 +4587,7 @@ impl SandboxManager {
             }
         }
         let resources = policy.resources.unwrap_or_default();
+        let is_systemd = self.image_environment(sandbox.template()).await.systemd;
         let spec = self.build_spec(
             id,
             &sandbox.workdir,
@@ -4326,6 +4595,7 @@ impl SandboxManager {
             &sandbox.lease,
             &sandbox.tap,
             &policy.volumes,
+            is_systemd,
         );
         let request = guestconn::handshake_full(
             false,
@@ -4334,7 +4604,15 @@ impl SandboxManager {
             self.trust_bundles_for(sandbox.template(), &policy).await,
             crate::volume::agent_mounts(&policy.volumes),
         );
-        if let Err(err) = sandbox.boot(spec, request, self.config.agent_timeout).await {
+        if let Err(err) = sandbox
+            .boot(
+                spec,
+                request,
+                self.config.agent_timeout,
+                self.config.guest_upgrade.as_deref(),
+            )
+            .await
+        {
             self.volumes.release_all(id);
             return Err(err);
         }
@@ -4376,14 +4654,27 @@ impl SandboxManager {
             .await
             .remove(id)
             .ok_or_else(|| Status::not_found(format!("no sandbox {id} on this node")))?;
+        self.forget_stored(&sandbox).await;
+        // Closed before the rows go, so the same one function ends every
+        // session and the store is never left holding an open one.
+        self.close_session(&sandbox, ENDED_DELETED).await;
+        self.emit(&sandbox, EVENT_DESTROYED, "").await;
+        let released = self.tear_down(sandbox).await;
+        tracing::info!(sandbox = id, "sandbox deleted");
+        released
+    }
 
+    /// Releases everything a sandbox held on this node once it is out of the
+    /// map. What the object store holds is the caller's business.
+    async fn tear_down(&self, sandbox: Arc<RunningSandbox>) -> Result<(), Status> {
+        let id = &sandbox.id().to_string();
+        if let Some(hydrator) = sandbox.durable.arriving() {
+            hydrator.detach(&sandbox.workdir.join(burrow_firecracker::SNAPSHOT_MEM_FILE));
+        }
         let tap_name = sandbox.tap.clone();
         // Taken from the sandbox rather than derived from its id: a sandbox
         // handed out from the pool was provisioned under a different one.
         let workdir = sandbox.workdir.clone();
-        // Closed before the rows go, so the same one function ends every
-        // session and the store is never left holding an open one.
-        self.close_session(&sandbox, ENDED_DELETED).await;
 
         // The VMM is taken out of the sandbox rather than out of an unwrapped
         // `Arc`: an in-flight request holding a clone is ordinary (a warm
@@ -4408,13 +4699,13 @@ impl SandboxManager {
         self.volumes.release_all(id);
         self.ports.lock().await.remove(id);
         self.shares.stop(id).await;
-        if let Err(err) = self.store.delete_sandbox(id) {
+        if let Err(err) = self.store.delete_sandbox(id).await {
             tracing::error!(sandbox = id, %err, "failed to remove sandbox from store");
         }
         // A session list describes one sandbox's VMs and has no owner once the
         // sandbox is gone, so it goes with it rather than accumulating on the
         // node for every sandbox ever created here.
-        if let Err(err) = self.store.delete_sessions(id) {
+        if let Err(err) = self.store.delete_sessions(id).await {
             tracing::error!(sandbox = id, %err, "failed to remove sessions from store");
         }
         // Reported, but only after the directory is gone: a ruleset that would
@@ -4431,8 +4722,585 @@ impl SandboxManager {
         if let Err(err) = tokio::fs::remove_dir_all(&workdir).await {
             tracing::warn!(sandbox = id, %err, "failed to remove sandbox directory");
         }
-        tracing::info!(sandbox = id, "sandbox deleted");
         rendered
+    }
+}
+
+/// Keeping suspended sandboxes in the object store, and taking them over.
+impl SandboxManager {
+    /// Whether a sandbox can live in the object store at all. A volume is
+    /// storage on this node with an identity of its own, and does not move.
+    fn is_movable(sandbox: &RunningSandbox) -> bool {
+        sandbox
+            .record()
+            .policy
+            .unwrap_or_default()
+            .volumes
+            .is_empty()
+    }
+
+    /// Uploads a suspended sandbox's state behind whatever suspended it.
+    fn spawn_upload(&self, sandbox: &Arc<RunningSandbox>) {
+        if self.config.object_store.is_none() || !Self::is_movable(sandbox) {
+            return;
+        }
+        let manager = self.clone();
+        let sandbox = Arc::clone(sandbox);
+        tokio::spawn(async move {
+            if let Err(err) = manager.make_durable(&sandbox).await {
+                tracing::warn!(
+                    sandbox = sandbox.id(),
+                    %err,
+                    "could not store the suspended sandbox; it stays on this node until its next suspend"
+                );
+            }
+        });
+    }
+
+    /// Brings the stored copy of a suspended sandbox up to date, returning
+    /// whether it is. A resume cancels this, so it only ever reads a guest
+    /// that is not running.
+    async fn make_durable(&self, sandbox: &Arc<RunningSandbox>) -> Result<bool, Status> {
+        let Some(store) = &self.config.object_store else {
+            return Ok(false);
+        };
+        if !Self::is_movable(sandbox) {
+            return Ok(false);
+        }
+        let token = sandbox.durable.cancel.lock().unwrap().clone();
+        let _uploading = sandbox.durable.upload.lock().await;
+        if token.is_cancelled() || !sandbox.is_suspended() {
+            return Ok(false);
+        }
+        let chain = sandbox.memory_chain.lock().await.clone();
+        let previous = sandbox.durable.stored.lock().unwrap().clone();
+        if previous
+            .as_ref()
+            .is_some_and(|stored| stored.is_current(&sandbox.workdir, &chain))
+        {
+            sandbox
+                .durable
+                .is_current
+                .store(true, std::sync::atomic::Ordering::Relaxed);
+            return Ok(true);
+        }
+        let record = sandbox.record();
+        let Some(secrets) = self.seal_for_store(&record)? else {
+            tracing::warn!(
+                sandbox = sandbox.id(),
+                "sandbox holds brokered credentials and this node has no \
+                 --object-store-key-file; it stays on this node"
+            );
+            return Ok(false);
+        };
+        let resources = sandbox.resources();
+        let (vcpus, mem_mib) = {
+            let spec = sandbox.spec.lock().unwrap();
+            (spec.vcpus, spec.mem_mib)
+        };
+        let is_systemd = match &previous {
+            Some(previous) => previous.manifest.is_systemd,
+            None => self.image_environment(sandbox.template()).await.systemd,
+        };
+        let draft = crate::durable::Manifest {
+            format: 0,
+            id: sandbox.id().to_string(),
+            generation: 0,
+            node_id: record.node_id.clone(),
+            state: String::new(),
+            template: sandbox.template().to_string(),
+            vcpus,
+            mem_mib,
+            scratch_disk_mib: match resources.scratch_disk_mib {
+                0 => DEFAULT_SCRATCH_MIB,
+                mib => mib,
+            },
+            is_systemd,
+            arch: std::env::consts::ARCH.to_string(),
+            firecracker_version: self.config.firecracker_version.clone(),
+            kernel_digest: String::new(),
+            rootfs_digest: String::new(),
+            cpu_usage_usec: record.cpu_usage_usec,
+            rx_bytes: record.rx_bytes,
+            tx_bytes: record.tx_bytes,
+            secrets,
+        };
+        let uploaded = tokio::select! {
+            () = token.cancelled() => return Ok(false),
+            uploaded = async {
+                // The base of a chain that arrived from the store is read
+                // directly here, so it has to have arrived.
+                sandbox.durable.settle_memory().await;
+                crate::durable::upload(store, &sandbox.workdir, &chain, draft, previous.as_ref())
+                    .await
+            } => uploaded?,
+        };
+        *sandbox.durable.stored.lock().unwrap() = Some(uploaded);
+        sandbox
+            .durable
+            .is_current
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+        self.announce_now();
+        Ok(true)
+    }
+
+    /// The record's brokered credentials sealed for the store, or `None` when
+    /// it has some and there is no key to seal them with.
+    #[allow(clippy::result_large_err)]
+    fn seal_for_store(
+        &self,
+        record: &common::Sandbox,
+    ) -> Result<Option<std::collections::BTreeMap<String, String>>, Status> {
+        let found = std::cell::RefCell::new(Vec::new());
+        let mut copy = record.clone();
+        map_secrets(&mut copy, |context, value| {
+            found
+                .borrow_mut()
+                .push((context.to_string(), value.to_string()));
+            Ok(value.to_string())
+        })
+        .map_err(|err| Status::internal(format!("reading the record's secrets: {err}")))?;
+        let found = found.into_inner();
+        if found.is_empty() {
+            return Ok(Some(Default::default()));
+        }
+        let Some(vault) = &self.config.store_vault else {
+            return Ok(None);
+        };
+        found
+            .into_iter()
+            .map(|(context, value)| {
+                vault
+                    .seal(&context, &value)
+                    .map(|sealed| (context, sealed))
+                    .map_err(|err| Status::internal(format!("sealing a secret: {err}")))
+            })
+            .collect::<Result<_, _>>()
+            .map(Some)
+    }
+
+    /// Puts the brokered credentials stored with a sandbox back into the
+    /// redacted record the orchestrator holds.
+    #[allow(clippy::result_large_err)]
+    fn unseal_from_store(
+        &self,
+        record: &mut common::Sandbox,
+        sealed: &std::collections::BTreeMap<String, String>,
+    ) -> Result<(), Status> {
+        map_secrets(record, |context, _| {
+            let value = sealed.get(context).ok_or_else(|| {
+                burrow_common::vault::Error::Open(format!(
+                    "{context}, which the stored state does not carry"
+                ))
+            })?;
+            match &self.config.store_vault {
+                Some(vault) => vault.unseal(context, value),
+                None => Err(burrow_common::vault::Error::Key(
+                    "this node has no --object-store-key-file".into(),
+                )),
+            }
+        })
+        .map_err(|err| {
+            Status::failed_precondition(format!(
+                "sandbox {}'s brokered credentials cannot be restored here: {err}",
+                record.id
+            ))
+        })
+    }
+
+    /// Records in the store that a sandbox with stored state is about to run
+    /// here. Refused rather than skipped when the store cannot be reached: a
+    /// node that adopted the sandbox after this one was written off would
+    /// otherwise resume the same stored state alongside it.
+    async fn mark_running(&self, sandbox: &Arc<RunningSandbox>) -> Result<(), Status> {
+        let Some(store) = &self.config.object_store else {
+            return Ok(());
+        };
+        let stored = sandbox.durable.stored.lock().unwrap().clone();
+        let Some(mut stored) = stored else {
+            return Ok(());
+        };
+        if stored.manifest.state == crate::durable::STATE_RUNNING {
+            return Ok(());
+        }
+        let node_id = sandbox.record().node_id;
+        crate::durable::mark_running(store, &sandbox.workdir, &mut stored, &node_id)
+            .await
+            .map_err(|err| {
+                Status::unavailable(format!(
+                    "sandbox {} is kept in the object store and cannot resume until the store \
+                     records it as running here: {}",
+                    sandbox.id(),
+                    err.message()
+                ))
+            })?;
+        *sandbox.durable.stored.lock().unwrap() = Some(stored);
+        Ok(())
+    }
+
+    /// Removes a sandbox's stored state, for a sandbox whose guest is gone.
+    async fn forget_stored(&self, sandbox: &RunningSandbox) {
+        let _uploading = sandbox.durable.stop_uploading().await;
+        sandbox.durable.invalidate();
+        let Some(store) = &self.config.object_store else {
+            return;
+        };
+        if sandbox.durable.stored.lock().unwrap().take().is_none() {
+            return;
+        }
+        crate::durable::remove_local(&sandbox.workdir).await;
+        if let Err(err) = crate::durable::purge(store, sandbox.id()).await {
+            tracing::warn!(sandbox = sandbox.id(), %err, "could not remove the sandbox's stored state");
+        }
+    }
+
+    /// Reads back what a recovered sandbox has in the store. Every sandbox
+    /// with stored state comes back fenced: while this node was down another
+    /// may have adopted it, and only the orchestrator can say.
+    async fn recover_durability(&self, sandbox: &Arc<RunningSandbox>) {
+        let Some(store) = &self.config.object_store else {
+            return;
+        };
+        let workdir = &sandbox.workdir;
+        match crate::chunks::Hydrator::resume(
+            store.clone(),
+            &workdir.join(burrow_firecracker::SNAPSHOT_MEM_FILE),
+        ) {
+            Some(Ok(hydrator)) => {
+                hydrator.start();
+                *sandbox.durable.hydration.lock().unwrap() = Some(hydrator);
+            }
+            Some(Err(err)) => {
+                tracing::error!(sandbox = sandbox.id(), %err, "cannot resume filling guest memory")
+            }
+            None => {}
+        }
+        let Some(stored) = crate::durable::load_local(workdir).await else {
+            if sandbox.is_suspended() {
+                self.spawn_upload(sandbox);
+            }
+            return;
+        };
+        let chain = sandbox.memory_chain.lock().await.clone();
+        let is_current = sandbox.is_suspended() && stored.is_current(workdir, &chain);
+        sandbox
+            .durable
+            .is_current
+            .store(is_current, std::sync::atomic::Ordering::Relaxed);
+        sandbox.durable.set_fenced(true);
+        *sandbox.durable.stored.lock().unwrap() = Some(stored);
+        if sandbox.is_suspended() && !is_current {
+            self.spawn_upload(sandbox);
+        }
+    }
+
+    pub fn renew_lease(&self, secs: u32) {
+        let mut lease = self.lease.lock().unwrap();
+        lease.renewed = Some(std::time::Instant::now());
+        lease.length = std::time::Duration::from_secs(secs.into());
+    }
+
+    /// Fences every sandbox with stored state once the lease has run out.
+    async fn fence_if_lapsed(&self) {
+        let lapsed = {
+            let lease = self.lease.lock().unwrap();
+            !lease.length.is_zero() && lease.renewed.is_none_or(|at| at.elapsed() >= lease.length)
+        };
+        if !lapsed {
+            return;
+        }
+        for sandbox in self.sandboxes.lock().await.values() {
+            if sandbox.durable.has_stored() && !sandbox.is_running() && !sandbox.durable.is_fenced()
+            {
+                tracing::warn!(
+                    sandbox = sandbox.id(),
+                    "lost the orchestrator's lease; not resuming this sandbox until it confirms \
+                     this node still holds it"
+                );
+                sandbox.durable.set_fenced(true);
+            }
+        }
+    }
+
+    /// Unfences sandboxes the orchestrator still places here.
+    pub fn confirm(&self, ids: &[String]) {
+        if ids.is_empty() {
+            return;
+        }
+        let sandboxes = self.sandboxes.clone();
+        let ids = ids.to_vec();
+        tokio::spawn(async move {
+            let sandboxes = sandboxes.lock().await;
+            for id in ids {
+                if let Some(sandbox) = sandboxes.get(&id) {
+                    sandbox.durable.set_fenced(false);
+                }
+            }
+        });
+    }
+
+    /// Drops this node's copy of sandboxes another node has adopted. Only a
+    /// fenced one, which this node has not resumed since it could have lost
+    /// it, is dropped: anything else would be a guest someone is using.
+    pub async fn relinquish(&self, ids: &[String]) {
+        for id in ids {
+            let sandbox = {
+                let mut sandboxes = self.sandboxes.lock().await;
+                match sandboxes.get(id) {
+                    Some(sandbox) if sandbox.durable.is_fenced() && !sandbox.is_running() => {
+                        sandboxes.remove(id)
+                    }
+                    Some(_) => {
+                        tracing::error!(
+                            sandbox = id,
+                            "orchestrator says another node holds this sandbox, but it is not \
+                             fenced here; keeping it"
+                        );
+                        None
+                    }
+                    None => None,
+                }
+            };
+            let Some(sandbox) = sandbox else { continue };
+            self.emit(&sandbox, EVENT_STOPPED, "relinquished").await;
+            if let Err(err) = self.tear_down(sandbox).await {
+                tracing::warn!(sandbox = id, %err, "could not fully release a relinquished sandbox");
+            }
+            tracing::info!(
+                sandbox = id,
+                "another node adopted this sandbox; dropped the copy here"
+            );
+        }
+    }
+
+    /// Suspends a sandbox, makes sure its state is in the store, and lets go
+    /// of it here.
+    pub async fn release(&self, id: &str) -> Result<common::Sandbox, Status> {
+        if self.config.object_store.is_none() {
+            return Err(Status::failed_precondition(
+                "this node has no object store to move sandboxes through",
+            ));
+        }
+        let sandbox = self.get(id).await?;
+        if !Self::is_movable(&sandbox) {
+            return Err(Status::failed_precondition(
+                "a sandbox with volumes cannot move: its volumes stay on the node that holds them",
+            ));
+        }
+        if sandbox.is_running() {
+            self.pause(id).await?;
+        }
+        if !self.make_durable(&sandbox).await? {
+            return Err(Status::failed_precondition(format!(
+                "sandbox {id} could not be stored: it must be suspended, and one holding \
+                 brokered credentials needs --object-store-key-file on every node"
+            )));
+        }
+        // Out of the map before anything else, so nothing can resume it here
+        // while it is let go.
+        let sandbox = {
+            let mut sandboxes = self.sandboxes.lock().await;
+            if !sandbox.durable.is_current() {
+                return Err(Status::aborted(format!(
+                    "sandbox {id} was resumed while moving"
+                )));
+            }
+            sandboxes
+                .remove(id)
+                .ok_or_else(|| Status::not_found(format!("no sandbox {id} on this node")))?
+        };
+        let record = sandbox.record();
+        self.emit(&sandbox, EVENT_STOPPED, "released").await;
+        self.tear_down(sandbox).await?;
+        tracing::info!(sandbox = id, "sandbox released to the object store");
+        Ok(record)
+    }
+
+    /// Deletes a stored sandbox no node holds.
+    pub async fn purge(&self, id: &str) -> Result<(), Status> {
+        let store = self
+            .config
+            .object_store
+            .as_ref()
+            .ok_or_else(|| Status::failed_precondition("this node has no object store"))?;
+        crate::durable::purge(store, id).await
+    }
+
+    /// Takes over a sandbox from the object store and resumes it here.
+    ///
+    /// `record` is the orchestrator's: its id, name, policy, metadata and
+    /// tags are the sandbox's, and only its secrets come from the store.
+    #[tracing::instrument(skip_all, fields(sandbox = %record.id))]
+    pub async fn adopt(
+        &self,
+        record: common::Sandbox,
+        node_id: String,
+    ) -> Result<common::Sandbox, Status> {
+        let store = self.config.object_store.as_ref().ok_or_else(|| {
+            Status::failed_precondition("this node has no object store to adopt sandboxes from")
+        })?;
+        let id = record.id.clone();
+        if !record.policy.clone().unwrap_or_default().volumes.is_empty() {
+            return Err(Status::failed_precondition(
+                "a sandbox with volumes cannot move: its volumes stay on the node that holds them",
+            ));
+        }
+        let manifest = crate::durable::read_manifest(store, &id)
+            .await?
+            .ok_or_else(|| {
+                Status::not_found(format!("sandbox {id} has no state in the object store"))
+            })?;
+        if manifest.state != crate::durable::STATE_SUSPENDED {
+            return Err(Status::failed_precondition(format!(
+                "sandbox {id} was running on {} when it was last heard of; what the object store \
+                 holds is from before that, and is not resumed in its place",
+                manifest.node_id
+            )));
+        }
+        if manifest.arch != std::env::consts::ARCH
+            || manifest.firecracker_version != self.config.firecracker_version
+        {
+            return Err(Status::failed_precondition(format!(
+                "sandbox {id} was stored on {} under Firecracker {} and cannot restore on this \
+                 node ({} under Firecracker {})",
+                manifest.arch,
+                manifest.firecracker_version,
+                std::env::consts::ARCH,
+                self.config.firecracker_version
+            )));
+        }
+        let mut record = record;
+        self.unseal_from_store(&mut record, &manifest.secrets)?;
+        {
+            let sandboxes = self.sandboxes.lock().await;
+            let mut creating = self.creating.lock().await;
+            if sandboxes.contains_key(&id) || !creating.insert(id.clone()) {
+                return Err(Status::already_exists(format!("sandbox {id} exists")));
+            }
+        }
+        let adopted = self.adopt_inner(store, &manifest, record, node_id).await;
+        self.creating.lock().await.remove(&id);
+        let (sandbox, from) = adopted?;
+        // Waited for here, unlike a create: a sandbox whose guest never
+        // answers would otherwise be reclaimed as a failed create, and its
+        // stored state is the only copy there is. Failing the adopt hands
+        // that state back untouched for another attempt.
+        if let Err(err) = sandbox.await_handshake().await {
+            if let Some(vm) = sandbox.vm.lock().await.take() {
+                let _ = vm.kill().await;
+            }
+            if let Err(err) = self.tear_down(Arc::clone(&sandbox)).await {
+                tracing::warn!(sandbox = id, %err, "could not release a failed adopt");
+            }
+            if let Err(err) = crate::durable::write_manifest(store, &manifest).await {
+                tracing::error!(
+                    sandbox = id,
+                    %err,
+                    "adopt failed and the store still says the sandbox runs here"
+                );
+            }
+            return Err(err);
+        }
+
+        self.sandboxes
+            .lock()
+            .await
+            .insert(id.clone(), sandbox.clone());
+        self.emit(&sandbox, EVENT_STARTED, &format!("adopted:{from}"))
+            .await;
+        self.open_session(&sandbox, STARTED_RESUME).await;
+        let record = sandbox.record();
+        self.persist(&sandbox).await;
+        self.sync_firewall().await?;
+        tracing::info!(from, "sandbox adopted from the object store");
+        Ok(record)
+    }
+
+    async fn adopt_inner(
+        &self,
+        store: &crate::objstore::ObjectStore,
+        manifest: &crate::durable::Manifest,
+        record: common::Sandbox,
+        node_id: String,
+    ) -> Result<(Arc<RunningSandbox>, String), Status> {
+        let from = manifest.node_id.clone();
+        let mut claimed = manifest.clone();
+        claimed.state = crate::durable::STATE_RUNNING.to_string();
+        claimed.node_id = node_id.clone();
+        let mut policy = record.policy.clone().unwrap_or_default();
+        let wanted = policy.resources.unwrap_or_default();
+        policy.resources = Some(common::ResourcePolicy {
+            vcpus: manifest.vcpus,
+            mem_mib: manifest.mem_mib,
+            scratch_disk_mib: manifest.scratch_disk_mib,
+            ..wanted
+        });
+        // Claimed in the store before the guest starts, the rule a resume
+        // follows too, and handed back if it never does.
+        crate::durable::write_manifest(store, &claimed).await?;
+        let provisioned = self
+            .provision_restored(
+                RestoreSource::Stored {
+                    store,
+                    manifest: &claimed,
+                },
+                record.id.clone(),
+                policy,
+                record.metadata.clone(),
+                node_id,
+                record.name.clone(),
+            )
+            .await;
+        let sandbox = match provisioned {
+            Ok(sandbox) => sandbox,
+            Err(err) => {
+                if let Err(err) = crate::durable::write_manifest(store, manifest).await {
+                    tracing::error!(
+                        sandbox = record.id,
+                        %err,
+                        "adopt failed and the store still says the sandbox runs here; it cannot \
+                         be adopted again until that is corrected"
+                    );
+                }
+                return Err(err);
+            }
+        };
+        *sandbox.durable.stored.lock().unwrap() =
+            crate::durable::load_local(&sandbox.workdir).await;
+        {
+            let mut base = sandbox.base_record.lock().unwrap();
+            base.created_at = record.created_at.clone();
+            base.env = record.env.clone();
+            base.kit = record.kit.clone();
+            base.kit_credentials = record.kit_credentials.clone();
+            base.kit_selection = record.kit_selection.clone();
+        }
+        *sandbox.usage.lock().unwrap() = Usage {
+            cpu_usec: record.cpu_usage_usec.max(manifest.cpu_usage_usec),
+            rx_bytes: record.rx_bytes.max(manifest.rx_bytes),
+            tx_bytes: record.tx_bytes.max(manifest.tx_bytes),
+            ..Default::default()
+        };
+        Ok((sandbox, from))
+    }
+
+    /// Collects stored state nothing references, every few hours, with
+    /// jitter so a fleet started together does not list the bucket together.
+    pub async fn collect_stored_garbage(&self) {
+        let Some(store) = self.config.object_store.clone() else {
+            return;
+        };
+        loop {
+            let jitter = std::time::Duration::from_secs(
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map_or(0, |d| u64::from(d.subsec_nanos()) % 3600),
+            );
+            tokio::time::sleep(std::time::Duration::from_secs(6 * 3600) + jitter).await;
+            if let Err(err) = crate::durable::collect_garbage(&store, &self.snapshots).await {
+                tracing::warn!(%err, "could not collect unreferenced stored state");
+            }
+        }
     }
 }
 
@@ -4544,6 +5412,11 @@ fn policy_mode(record: &common::Sandbox) -> firewall::Mode {
     }
 }
 
+/// Tells the agent to run the template's systemd under it.
+pub(crate) fn guest_mode_arg(is_systemd: bool) -> &'static str {
+    if is_systemd { "burrow.systemd=1" } else { "" }
+}
+
 /// Formats a sparse ext4 image for the sandbox's writable layer.
 ///
 /// The file is sparse, so a 1 GiB disk costs only what the guest actually
@@ -4652,7 +5525,7 @@ pub(crate) mod tests {
 
     /// A manager with no VMs behind it. Shared with the node edge's tests,
     /// which need a sandbox map to miss in.
-    pub(crate) fn manager() -> SandboxManager {
+    pub(crate) async fn manager() -> SandboxManager {
         SandboxManager::new(
             NodeConfig {
                 data_dir: std::env::temp_dir().join(format!("burrow-fork-{}", std::process::id())),
@@ -4672,13 +5545,15 @@ pub(crate) mod tests {
                     derp_map_url: None,
                 },
                 object_store: None,
+                store_vault: None,
                 firecracker_version: String::new(),
+                guest_upgrade: None,
             },
             Arc::new(burrow_proxy::PolicyTable::default()),
             Arc::new(burrow_proxy::Resolutions::default()),
             Arc::new(burrow_proxy::DeniedAddresses::default()),
             Arc::new(burrow_proxy::directory::Directory::default()),
-            Arc::new(burrow_store::Store::open_in_memory().unwrap()),
+            Arc::new(burrow_store::Store::open_in_memory().await.unwrap()),
             burrow_common::vault::Vault::open(&std::env::temp_dir().join(format!(
                 "burrow-test-{}-{}.key",
                 std::process::id(),
@@ -4693,7 +5568,7 @@ pub(crate) mod tests {
         let id = "ghost-invalid-lease";
         let data_dir = std::env::temp_dir().join(format!("burrow-recovery-{}", std::process::id()));
         let _ = tokio::fs::remove_dir_all(&data_dir).await;
-        let mut manager = manager();
+        let mut manager = manager().await;
         manager.config.data_dir = data_dir.clone();
         let workdir = manager.config.sandbox_dir(id);
         tokio::fs::create_dir_all(&workdir).await.unwrap();
@@ -4715,6 +5590,7 @@ pub(crate) mod tests {
                 share: None,
                 suspended_at: 1,
             })
+            .await
             .unwrap();
         manager
             .store
@@ -4726,20 +5602,21 @@ pub(crate) mod tests {
                 started_by: "test".into(),
                 ended_by: "test".into(),
             })
+            .await
             .unwrap();
 
         manager.recover().await;
 
-        assert!(manager.store.list_sandboxes().unwrap().is_empty());
-        assert!(manager.store.list_sessions(id).unwrap().is_empty());
+        assert!(manager.store.list_sandboxes().await.unwrap().is_empty());
+        assert!(manager.store.list_sessions(id).await.unwrap().is_empty());
         assert!(manager.sandboxes.lock().await.is_empty());
         assert!(!workdir.exists());
         let _ = tokio::fs::remove_dir_all(&data_dir).await;
     }
 
-    #[test]
-    fn a_persisted_record_carries_its_secrets_sealed() {
-        let manager = manager();
+    #[tokio::test]
+    async fn a_persisted_record_carries_its_secrets_sealed() {
+        let manager = manager().await;
         let mut record = common::Sandbox {
             id: "sbx_a".into(),
             policy: Some(common::Policy {
@@ -4780,7 +5657,7 @@ pub(crate) mod tests {
     /// an id, or a mistyped source would reserve a child id nothing releases.
     #[tokio::test]
     async fn forking_an_unknown_sandbox_reserves_nothing() {
-        let manager = manager();
+        let manager = manager().await;
         let err = manager
             .fork(
                 "sbx_missing",
@@ -4821,7 +5698,7 @@ pub(crate) mod tests {
     /// creates of one shape must queue a single build, not one each.
     #[tokio::test]
     async fn a_shape_is_warmed_at_most_once() {
-        let manager = manager();
+        let manager = manager().await;
         for _ in 0..5 {
             manager.warm_in_background("app".into(), shape(2, 1024));
         }
@@ -4844,7 +5721,7 @@ pub(crate) mod tests {
     /// be built: `warm_attempted` is otherwise insert-only for the node's life.
     #[tokio::test]
     async fn republishing_a_template_discards_its_warm_snapshot() {
-        let manager = manager();
+        let manager = manager().await;
         manager.warm_in_background("app".into(), shape(2, 1024));
         manager.warm_in_background("app".into(), shape(4, 2048));
         manager.warm_in_background("other".into(), shape(2, 1024));
@@ -4869,7 +5746,7 @@ pub(crate) mod tests {
     /// to queue a boot and a memory image for each.
     #[tokio::test]
     async fn a_novel_shape_does_not_buy_itself_a_warm_build() {
-        let manager = manager();
+        let manager = manager().await;
         manager.warm_for_demand(&ShapeKey::of("app", &shape(7, 3333)));
         assert!(attempted(&manager).is_empty());
 
@@ -4893,7 +5770,7 @@ pub(crate) mod tests {
     /// makes way, so an explicit warm is never refused.
     #[tokio::test]
     async fn attempts_are_capped_per_template() {
-        let manager = manager();
+        let manager = manager().await;
         for vcpus in 1..=(MAX_WARM_SHAPES as u32 + 3) {
             manager.warm_in_background("app".into(), shape(vcpus, 1024));
         }
@@ -4907,7 +5784,7 @@ pub(crate) mod tests {
     /// be recorded as one either.
     #[tokio::test]
     async fn an_unbuildable_shape_is_not_attempted() {
-        let manager = manager();
+        let manager = manager().await;
         manager.warm_in_background("app".into(), shape(1, u32::MAX));
         assert!(attempted(&manager).is_empty());
     }
@@ -4916,7 +5793,7 @@ pub(crate) mod tests {
     /// a snapshot of the wrong shape is one no create can restore from.
     #[tokio::test]
     async fn demand_warms_the_shape_that_was_asked_for() {
-        let manager = manager();
+        let manager = manager().await;
         // Once is not demand; a shape has to recur before it is worth a boot.
         for _ in 0..WARM_DEMAND_THRESHOLD {
             manager.warm_for_demand(&ShapeKey::of("app", &shape(4, 2048)));
@@ -4979,6 +5856,7 @@ pub(crate) mod tests {
     #[tokio::test]
     async fn tagging_a_sandbox_this_node_does_not_hold_is_refused() {
         let err = manager()
+            .await
             .update_tags("sbx_missing", HashMap::new())
             .await
             .unwrap_err();
@@ -5014,7 +5892,7 @@ pub(crate) mod tests {
     /// returned empty on every node except the one the image was imported on.
     #[tokio::test]
     async fn an_inspected_sandbox_gets_the_bundles_its_image_names() {
-        let manager = manager();
+        let manager = manager().await;
         with_image_config(
             &manager,
             "curl-image",
@@ -5036,7 +5914,7 @@ pub(crate) mod tests {
     /// sandbox that never asked for inspection.
     #[tokio::test]
     async fn a_sandbox_that_did_not_opt_in_gets_no_bundles() {
-        let manager = manager();
+        let manager = manager().await;
         with_image_config(
             &manager,
             "curl-image-2",
@@ -5073,6 +5951,7 @@ pub(crate) mod tests {
             suspended_at: std::sync::atomic::AtomicI64::new(0),
             usage: std::sync::Mutex::new(Usage::default()),
             session: std::sync::Mutex::new(None),
+            durable: Default::default(),
             workdir,
             tap: tap::tap_name(&lease),
             lease,
@@ -5143,7 +6022,7 @@ pub(crate) mod tests {
     /// which nothing would: the create looked like it had succeeded.
     #[tokio::test]
     async fn a_terminal_handshake_failure_reclaims_the_sandbox() {
-        let manager = manager();
+        let manager = manager().await;
         let sandbox = running("sbx_no_agent");
         // The registry and the allocator as a warm create leaves them: the
         // record is registered and its lease is held.
@@ -5208,6 +6087,7 @@ pub(crate) mod tests {
             suspended_at: std::sync::atomic::AtomicI64::new(0),
             usage: std::sync::Mutex::new(Usage::default()),
             session: std::sync::Mutex::new(None),
+            durable: Default::default(),
             workdir,
             tap: tap::tap_name(&lease),
             lease,

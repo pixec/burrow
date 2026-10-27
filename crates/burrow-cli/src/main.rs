@@ -184,6 +184,10 @@ enum Command {
         /// kit set to one derived from its digests.
         #[arg(long)]
         name: Option<String>,
+        /// Boot the image's own systemd under the agent. The image has to
+        /// ship systemd.
+        #[arg(long)]
+        systemd: bool,
     },
     /// Save a sandbox's state as a snapshot. The sandbox keeps running.
     Commit {
@@ -217,6 +221,20 @@ enum Command {
         /// Require the source's node to carry this key=value label. A fork is
         /// built where its source is, so a mismatch is refused rather than
         /// moved. Repeatable.
+        #[arg(long = "node-label")]
+        node_labels: Vec<String>,
+    },
+    /// Move a sandbox to another node through the object store. A running
+    /// sandbox is suspended, carried over and resumed; it keeps its id, name
+    /// and policy, and gets a new address on the new node. Needs the nodes
+    /// to share an object store. Volumes do not move.
+    Move {
+        id: String,
+        /// The node to move to; omitted places it like a create.
+        #[arg(long)]
+        node: Option<String>,
+        /// Require the destination to carry this key=value label, when no
+        /// node is named. Repeatable.
         #[arg(long = "node-label")]
         node_labels: Vec<String>,
     },
@@ -400,6 +418,20 @@ enum Command {
     /// Volume operations.
     #[command(subcommand, visible_alias = "volumes")]
     Volume(VolumeCommand),
+    /// Show what happened to sandboxes, in order, and optionally follow it.
+    Events {
+        /// Restrict to one sandbox.
+        #[arg(long)]
+        sandbox: Option<String>,
+        /// Start after this position, from a previous listing's SEQ column.
+        #[arg(long, default_value_t = 0)]
+        after: u64,
+        /// Keep printing new events as they happen.
+        #[arg(long, short = 'f')]
+        follow: bool,
+        #[arg(long, default_value_t = 100)]
+        limit: u32,
+    },
     /// Show recorded egress attempts and DNS lookups.
     Audit {
         /// Restrict to one sandbox.
@@ -951,6 +983,10 @@ enum TemplatesCommand {
         /// kit set to one derived from its digests.
         #[arg(long)]
         name: Option<String>,
+        /// Boot the image's own systemd under the agent. The image has to
+        /// ship systemd.
+        #[arg(long)]
+        systemd: bool,
     },
     /// Remove a template.
     Rm { name: String },
@@ -1132,7 +1168,11 @@ async fn main() -> anyhow::Result<()> {
             is_all_shown: all,
         } => show_stats(&mut client, id, all).await?,
         Command::Images => list_templates(&mut client).await?,
-        Command::Pull { images, name } => import_template(&mut client, images, name).await?,
+        Command::Pull {
+            images,
+            name,
+            systemd,
+        } => import_template(&mut client, images, name, systemd).await?,
         Command::Commit {
             sandbox,
             expiration_secs,
@@ -1169,6 +1209,27 @@ async fn main() -> anyhow::Result<()> {
                 .await?
                 .into_inner();
             println!("{} in {}ms", sandbox.id, started.elapsed().as_millis());
+        }
+        Command::Move {
+            id,
+            node,
+            node_labels,
+        } => {
+            let started = std::time::Instant::now();
+            let sandbox = client
+                .move_sandbox(api::MoveSandboxRequest {
+                    r#ref: Some(api::SandboxRef { id }),
+                    node_id: node.unwrap_or_default(),
+                    node_labels: parse_pairs("--node-label", &node_labels)?,
+                })
+                .await?
+                .into_inner();
+            println!(
+                "{} on {} in {}ms",
+                sandbox.id,
+                sandbox.node_id,
+                started.elapsed().as_millis()
+            );
         }
         Command::Exec { id, exec, cmd } => {
             let code = run_exec(&mut client, &id, &exec, cmd).await?;
@@ -1553,9 +1614,11 @@ async fn main() -> anyhow::Result<()> {
             println!("share revoked");
         }
         Command::Templates(TemplatesCommand::Ls) => list_templates(&mut client).await?,
-        Command::Templates(TemplatesCommand::Import { images, name }) => {
-            import_template(&mut client, images, name).await?
-        }
+        Command::Templates(TemplatesCommand::Import {
+            images,
+            name,
+            systemd,
+        }) => import_template(&mut client, images, name, systemd).await?,
         Command::Templates(TemplatesCommand::Rm { name }) => {
             client
                 .delete_template(api::DeleteTemplateRequest { name: name.clone() })
@@ -1709,6 +1772,71 @@ async fn main() -> anyhow::Result<()> {
             }
             if failed {
                 std::process::exit(1);
+            }
+        }
+        Command::Events {
+            sandbox,
+            after,
+            follow,
+            limit,
+        } => {
+            println!(
+                "{:>6} {:<24} {:<24} {:<17} {:<10} DETAIL",
+                "SEQ", "AT", "SANDBOX", "EVENT", "STATE"
+            );
+            // The log is resumable by position, so a follow whose connection
+            // drops, as it does when the replica serving it goes away,
+            // reconnects and carries on from the last event it printed.
+            let mut last = after;
+            loop {
+                let opened = client
+                    .tail_events(api::TailEventsRequest {
+                        after_seq: last,
+                        sandbox: sandbox.clone().unwrap_or_default(),
+                        is_follow: follow,
+                        limit,
+                    })
+                    .await;
+                let mut stream = match opened {
+                    Ok(stream) => stream.into_inner(),
+                    Err(status) if follow && is_transient(&status) => {
+                        tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+                        continue;
+                    }
+                    Err(status) => return Err(status.into()),
+                };
+                let ended = loop {
+                    match stream.next().await {
+                        Some(Ok(event)) => {
+                            last = event.seq;
+                            let state = common::SandboxState::try_from(event.state)
+                                .map(|s| {
+                                    s.as_str_name()
+                                        .trim_start_matches("SANDBOX_STATE_")
+                                        .to_lowercase()
+                                })
+                                .unwrap_or_default();
+                            println!(
+                                "{:>6} {:<24} {:<24} {:<17} {:<10} {}",
+                                event.seq,
+                                rfc3339_from_unix_ms(event.at_unix_ms),
+                                truncate(&sanitize(&event.sandbox_id), 24),
+                                sanitize(&event.r#type),
+                                state,
+                                sanitize(&event.detail),
+                            );
+                        }
+                        Some(Err(status)) => break Some(status),
+                        None => break None,
+                    }
+                };
+                match ended {
+                    Some(status) if follow && is_transient(&status) => {
+                        tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+                    }
+                    Some(status) => return Err(status.into()),
+                    None => break,
+                }
             }
         }
         Command::Audit {
@@ -2502,7 +2630,7 @@ async fn list_sandboxes(client: &mut Client, tag: String, all: bool) -> anyhow::
                 &sandbox.name
             },
             display_state(&sandbox),
-            sandbox.node_id,
+            display_node(&sandbox),
             sandbox.template,
             truncate(&format_tags(&sandbox.metadata), 24),
             sandbox.created_at,
@@ -2612,13 +2740,18 @@ async fn list_templates(client: &mut Client) -> anyhow::Result<()> {
         println!("no templates");
         return Ok(());
     }
-    println!("{:<24} {:>10}  WARM", "TEMPLATE", "SIZE");
+    println!("{:<24} {:>10}  WARM  INIT", "TEMPLATE", "SIZE");
     for template in resp.templates {
         println!(
-            "{:<24} {:>9}M  {}",
+            "{:<24} {:>9}M  {:<4}  {}",
             template.name,
             template.size_bytes / (1024 * 1024),
             if template.is_warm { "yes" } else { "no" },
+            if template.is_systemd {
+                "systemd"
+            } else {
+                "agent"
+            },
         );
     }
     Ok(())
@@ -2658,6 +2791,7 @@ async fn import_template(
     client: &mut Client,
     images: Vec<String>,
     name: Option<String>,
+    is_systemd: bool,
 ) -> anyhow::Result<()> {
     // One image converts as it is; several are a kit set, which the node
     // names after its digests unless told otherwise.
@@ -2666,11 +2800,13 @@ async fn import_template(
         Ok([from_image]) => api::BuildTemplateRequest {
             name: name.unwrap_or_else(|| template_name_for(&from_image)),
             from_image,
+            is_systemd,
             ..Default::default()
         },
         Err(kits) => api::BuildTemplateRequest {
             name: name.unwrap_or_default(),
             kits,
+            is_systemd,
             ..Default::default()
         },
     };
@@ -2763,7 +2899,7 @@ fn print_config(sandbox: &common::Sandbox) {
     let field = |name: &str, value: &str| println!("{name:<16}{value}");
     field("sandbox", &sandbox.id);
     field("state", display_state(sandbox));
-    field("node", &sandbox.node_id);
+    field("node", &display_node(sandbox));
     if sandbox.is_unreachable {
         field(
             "unreachable",
@@ -3042,6 +3178,17 @@ fn display_state(sandbox: &common::Sandbox) -> &'static str {
         "starting"
     } else {
         state_name(sandbox.state)
+    }
+}
+
+/// Where a sandbox is, in the same terms `snapshot ls` uses: `+store` once
+/// its latest suspend is in the object store, and the store alone for one no
+/// node holds, which the next start places.
+fn display_node(sandbox: &common::Sandbox) -> String {
+    match (sandbox.node_id.is_empty(), sandbox.is_durable) {
+        (false, true) => format!("{} +store", sandbox.node_id),
+        (false, false) => sandbox.node_id.clone(),
+        (true, _) => "object store".to_string(),
     }
 }
 
@@ -3649,6 +3796,7 @@ fn sandbox_json(sandbox: &common::Sandbox) -> String {
         ("name", Json::str(&sandbox.name)),
         ("state", Json::str(display_state(sandbox))),
         ("unreachable", Json::Bool(sandbox.is_unreachable)),
+        ("durable", Json::Bool(sandbox.is_durable)),
         (
             "agent_unconfirmed",
             Json::Bool(sandbox.is_agent_unconfirmed),
@@ -3789,6 +3937,38 @@ fn sandbox_json(sandbox: &common::Sandbox) -> String {
     let mut out = String::new();
     doc.write(&mut out, 0);
     out
+}
+
+/// Whether a failed call is worth repeating: the server went away or the
+/// connection did, rather than the request being refused.
+fn is_transient(status: &tonic::Status) -> bool {
+    matches!(
+        status.code(),
+        tonic::Code::Unavailable | tonic::Code::Unknown | tonic::Code::Internal
+    ) && (status.code() == tonic::Code::Unavailable
+        || status.message().contains("transport")
+        || status.message().contains("broken pipe")
+        || status.message().contains("h2 protocol"))
+}
+
+/// Unix milliseconds as RFC 3339 to the second, without pulling in a date
+/// crate for one column.
+fn rfc3339_from_unix_ms(ms: i64) -> String {
+    let secs = ms.div_euclid(1000);
+    let days = secs.div_euclid(86_400);
+    let rem = secs.rem_euclid(86_400);
+    let (h, m, s) = (rem / 3600, (rem % 3600) / 60, rem % 60);
+    let z = days + 719_468;
+    let era = z.div_euclid(146_097);
+    let doe = z.rem_euclid(146_097);
+    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
+    let y = yoe + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let month = if mp < 10 { mp + 3 } else { mp - 9 };
+    let year = if month <= 2 { y + 1 } else { y };
+    format!("{year:04}-{month:02}-{d:02}T{h:02}:{m:02}:{s:02}Z")
 }
 
 #[cfg(test)]

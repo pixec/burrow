@@ -1,6 +1,7 @@
 //! The burrow guest agent.
 //!
-//! Runs as PID 1 inside the microVM and serves the node daemon over vsock.
+//! Runs as PID 1 inside the microVM and serves the node daemon over vsock,
+//! alone or with the template's systemd under it (see [`systemd`]).
 
 mod asyncfd;
 mod commands;
@@ -11,9 +12,11 @@ mod netconf;
 mod pty;
 mod reaper;
 mod resume;
+mod systemd;
 mod users;
 mod vsock;
 
+use std::os::unix::fs::PermissionsExt as _;
 use tonic::{Request, Response, Status, transport::Server};
 
 use burrow_proto::guest::v1 as guestpb;
@@ -34,6 +37,38 @@ const AGENT_PORT: u32 = 1024;
 const HOST_CID: u32 = tokio_vsock::VMADDR_CID_HOST;
 
 const VERSION: &str = env!("CARGO_PKG_VERSION");
+
+/// Set in the environment of an agent that replaced itself, so the new
+/// process skips the one-time init a fresh PID 1 does: the root is already
+/// pivoted and the pseudo-filesystems are mounted, and mounting a second tmpfs
+/// over `/run` would hide the very binary it is running from.
+const REEXEC_MARK: &str = "BURROW_GUEST_REEXEC";
+
+/// Where an upgraded agent binary is written. tmpfs, so it costs memory
+/// rather than the read-only root, and survives a snapshot with the rest of
+/// the guest's memory.
+const UPGRADE_PATH: &str = "/run/burrow-guest";
+/// Where the finished-command table is handed across the re-exec.
+const COMMANDS_STATE: &str = "/run/burrow-guest.commands";
+/// How long a handshake waits for systemd to finish booting. Under the host's
+/// default 30s bound on the call, so a slow systemd delays the handshake
+/// rather than failing it.
+const SYSTEMD_READY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(20);
+
+/// SHA-256 of the binary this process is running, as the host compares it.
+fn self_digest() -> &'static str {
+    static DIGEST: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    DIGEST.get_or_init(|| {
+        use sha2::Digest as _;
+        std::fs::read("/proc/self/exe")
+            .map(|bytes| hex_lower(&sha2::Sha256::digest(&bytes)))
+            .unwrap_or_default()
+    })
+}
+
+fn hex_lower(bytes: &[u8]) -> String {
+    bytes.iter().map(|b| format!("{b:02x}")).collect()
+}
 
 #[derive(Default)]
 struct AgentService;
@@ -102,6 +137,9 @@ impl Guest for AgentService {
             tracing::error!(%err, "failed to mount volumes");
             return Err(Status::internal(format!("mounting volumes: {err}")));
         }
+        // Last, because it can take as long as systemd's boot. A warm snapshot
+        // is taken when this returns, so its clones restore with systemd up.
+        systemd::wait_ready(SYSTEMD_READY_TIMEOUT).await;
 
         let total = started.elapsed();
         let timing = guestpb::GuestResumeTiming {
@@ -136,6 +174,92 @@ impl Guest for AgentService {
         Ok(Response::new(guestpb::HandshakeResponse {
             agent_version: VERSION.into(),
             timing: Some(timing),
+            agent_digest: self_digest().to_string(),
+        }))
+    }
+
+    /// Replaces this agent with the binary streamed in.
+    ///
+    /// Written to tmpfs and verified against the digest before anything
+    /// changes, then the process re-executes itself: PID 1 survives an
+    /// `execve`, so the kernel sees the same init, and the host reconnects to
+    /// the listener the new process binds. Refused while a command is running,
+    /// because its pipes and pty live in this process.
+    async fn upgrade(
+        &self,
+        req: Request<tonic::Streaming<guestpb::UpgradeChunk>>,
+    ) -> Result<Response<guestpb::UpgradeResponse>, Status> {
+        use sha2::Digest as _;
+        use tokio::io::AsyncWriteExt as _;
+        if commands::has_running() {
+            return Err(Status::failed_precondition(
+                "a command is running; the agent upgrades once it is idle",
+            ));
+        }
+        let mut stream = req.into_inner();
+        let temp = format!("{UPGRADE_PATH}.{}.new", std::process::id());
+        let mut file = tokio::fs::File::create(&temp)
+            .await
+            .map_err(|err| Status::internal(format!("creating {temp}: {err}")))?;
+        let mut hasher = sha2::Sha256::new();
+        let mut expected = String::new();
+        let mut written = 0usize;
+        while let Some(chunk) = stream.message().await? {
+            if !chunk.digest.is_empty() {
+                expected = chunk.digest;
+            }
+            hasher.update(&chunk.data);
+            file.write_all(&chunk.data)
+                .await
+                .map_err(|err| Status::internal(format!("writing {temp}: {err}")))?;
+            written += chunk.data.len();
+        }
+        file.sync_all()
+            .await
+            .map_err(|err| Status::internal(format!("syncing {temp}: {err}")))?;
+        drop(file);
+        let actual = hex_lower(&hasher.finalize());
+        if written == 0 || expected.is_empty() || actual != expected {
+            let _ = tokio::fs::remove_file(&temp).await;
+            return Err(Status::invalid_argument(format!(
+                "upgrade binary hashed as {actual}, expected {expected}"
+            )));
+        }
+        if actual == self_digest() {
+            let _ = tokio::fs::remove_file(&temp).await;
+            return Ok(Response::new(guestpb::UpgradeResponse {
+                is_restarting: false,
+            }));
+        }
+        tokio::fs::set_permissions(&temp, std::fs::Permissions::from_mode(0o755))
+            .await
+            .map_err(|err| Status::internal(format!("chmod {temp}: {err}")))?;
+        tokio::fs::rename(&temp, UPGRADE_PATH)
+            .await
+            .map_err(|err| Status::internal(format!("installing {UPGRADE_PATH}: {err}")))?;
+        if let Err(err) = commands::save(COMMANDS_STATE) {
+            tracing::warn!(%err, "command history will not survive the upgrade");
+        }
+        tracing::warn!(digest = actual, "agent upgrading; re-executing");
+        // After the response has gone out, from a plain thread: `execve`
+        // replaces the whole process and must not run under the runtime that
+        // is still writing the reply.
+        std::thread::spawn(|| {
+            std::thread::sleep(std::time::Duration::from_millis(100));
+            let path = std::ffi::CString::new(UPGRADE_PATH).expect("static path");
+            // SAFETY: setting an environment variable before exec, from a
+            // thread that does nothing else.
+            unsafe {
+                std::env::set_var(REEXEC_MARK, "1");
+                if let Some(pid) = systemd::pid() {
+                    std::env::set_var(systemd::PID_MARK, pid.to_string());
+                }
+            };
+            let Err(err) = nix::unistd::execv(&path, &[path.as_c_str()]);
+            tracing::error!(%err, "re-exec failed; the old agent keeps serving");
+        });
+        Ok(Response::new(guestpb::UpgradeResponse {
+            is_restarting: true,
         }))
     }
 
@@ -335,6 +459,7 @@ async fn serve() -> anyhow::Result<()> {
 #[tokio::main]
 async fn main() {
     let is_init = std::process::id() == 1;
+    let is_reexec = std::env::var_os(REEXEC_MARK).is_some();
 
     // The agent's stdout is the guest's serial console, which Firecracker
     // emulates a byte at a time: every log line costs milliseconds of guest
@@ -346,7 +471,7 @@ async fn main() {
         )
         .init();
 
-    if is_init {
+    if is_init && !is_reexec {
         // Pivot into the writable overlay before mounting anything else, so
         // the pseudo-filesystems land inside the final root.
         init::setup_writable_root();
@@ -365,6 +490,10 @@ async fn main() {
             }
         }
     }
+    let is_systemd = is_init && systemd::is_requested();
+    if is_systemd && is_reexec {
+        systemd::adopt();
+    }
     // Exec depends on the reaper for exit statuses, so it runs even when the
     // agent is not PID 1 (development outside a microVM).
     reaper::spawn();
@@ -372,6 +501,17 @@ async fn main() {
     // Established before any snapshot is taken, so a restored clone does not
     // pay for it on the critical path of a warm create.
     netconf::prepare().await;
+    if is_reexec {
+        commands::restore(COMMANDS_STATE);
+        tracing::warn!(
+            version = VERSION,
+            digest = self_digest(),
+            "agent upgraded in place"
+        );
+    }
+    if is_systemd && !is_reexec {
+        systemd::start();
+    }
 
     if let Err(err) = serve().await {
         tracing::error!(%err, "agent server exited");

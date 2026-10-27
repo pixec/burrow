@@ -5,6 +5,10 @@ package burrow.guest.v1;
 // Served by burrow-guest inside the guest, over vsock; called by burrowd.
 service Guest {
   rpc Handshake(HandshakeRequest) returns (HandshakeResponse);
+  // Replaces the running agent with the binary streamed in. The agent
+  // verifies the digest, answers, and re-executes itself as PID 1, so the
+  // host reconnects and handshakes again. Refused while a command runs.
+  rpc Upgrade(stream UpgradeChunk) returns (UpgradeResponse);
   rpc Health(GuestHealthRequest) returns (GuestHealthResponse);
   // Mirrors the public Exec RPC. Deliberately a separate message set from
   // burrow.api.v1 so the guest protocol can version independently of the
@@ -266,6 +270,21 @@ message HandshakeResponse {
   // attributed to a guest-side step rather than guessed at. A guest that does
   // not fill these in reports zeros, which read as "not measured".
   GuestResumeTiming timing = 2;
+  // SHA-256 of the running agent binary, lowercase hex. The host compares it
+  // with the binary it ships and upgrades a guest that differs.
+  string agent_digest = 3;
+}
+
+message UpgradeChunk {
+  bytes data = 1;
+  // Expected SHA-256 of the whole binary, lowercase hex, on every chunk.
+  string digest = 2;
+}
+
+message UpgradeResponse {
+  // The binary was accepted and the agent is about to re-execute; the
+  // connection will drop.
+  bool is_restarting = 1;
 }
 
 // Guest-side costs of waking from a snapshot and handshaking, in microseconds.

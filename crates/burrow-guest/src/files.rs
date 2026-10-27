@@ -4,7 +4,7 @@
 
 use std::os::unix::fs::PermissionsExt;
 
-use nix::fcntl::{AT_FDCWD, OFlag, OpenHow, ResolveFlag, openat2};
+use nix::fcntl::{OFlag, OpenHow, ResolveFlag, openat2};
 use nix::sys::stat::Mode;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::sync::mpsc;
@@ -25,13 +25,25 @@ use burrow_proto::guest::v1 as guestpb;
 /// `RESOLVE_NO_SYMLINKS` resolves the whole path in one kernel call, so
 /// there's no gap between checking a component and opening it for a link to
 /// exploit.
+///
+/// Resolved inside [`guest_root`], so with systemd running a path means what
+/// it means to the guest's own processes.
 fn open_no_symlinks(path: &str, flags: OFlag, mode: Mode) -> std::io::Result<std::fs::File> {
     let how = OpenHow::new()
         .flags(flags | OFlag::O_CLOEXEC)
         .mode(mode)
-        .resolve(ResolveFlag::RESOLVE_NO_SYMLINKS);
-    let fd = openat2(AT_FDCWD, path, how).map_err(std::io::Error::from)?;
+        .resolve(ResolveFlag::RESOLVE_NO_SYMLINKS | ResolveFlag::RESOLVE_IN_ROOT);
+    let fd = openat2(&guest_root()?, path, how).map_err(std::io::Error::from)?;
     Ok(std::fs::File::from(fd))
+}
+
+/// The root of systemd's mount namespace when it runs, which mounts its own
+/// `/run` and whatever its units ask for; the agent's root otherwise.
+fn guest_root() -> std::io::Result<std::fs::File> {
+    match crate::systemd::pid() {
+        Some(pid) => std::fs::File::open(format!("/proc/{pid}/root")),
+        None => std::fs::File::open("/"),
+    }
 }
 
 /// Opens one component *inside* a directory already held open.

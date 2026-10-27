@@ -33,6 +33,7 @@ from .types import (
     FileInfo,
     GuestGroup,
     GuestUser,
+    LifecycleEvent,
     NodeInfo,
     OutputChunk,
     PortMapping,
@@ -94,6 +95,7 @@ def _to_sandbox_info(raw: common_pb2.Sandbox) -> SandboxInfo:
             rx_bytes=raw.rx_bytes,
             tx_bytes=raw.tx_bytes,
         ),
+        durable=raw.is_durable,
     )
 
 
@@ -1738,6 +1740,29 @@ class Sandbox:
             self._env,
         )
 
+    def move(
+        self, node_id: str = "", node_labels: Optional[Dict[str, str]] = None
+    ) -> SandboxInfo:
+        """Moves the sandbox to another node through the object store.
+
+        A running sandbox is suspended, carried over and resumed. It keeps its
+        id, name and policy and gets an address on the new node. `node_id`
+        names the destination; otherwise it is placed like a create, on a node
+        carrying `node_labels`. Volumes do not move.
+        """
+        self._assert_live()
+        raw = self._transport.unary(
+            "MoveSandbox",
+            api_pb2.MoveSandboxRequest(
+                ref=api_pb2.SandboxRef(id=self.id),
+                node_id=node_id,
+                node_labels=node_labels or {},
+            ),
+            300.0,
+        )
+        self._info = _to_sandbox_info(raw)
+        return self._info
+
     def snapshot(self, expiration: int = 0) -> Snapshot:
         """Saves the sandbox's state as a snapshot object and keeps running.
 
@@ -1931,6 +1956,51 @@ class Burrow:
             )
         ]
 
+    def events(
+        self,
+        after: int = 0,
+        sandbox: str = "",
+        follow: bool = False,
+        limit: int = 0,
+    ) -> Iterator[LifecycleEvent]:
+        """Reads the fleet's lifecycle log, oldest first.
+
+        Without `follow` the iterator ends after the replay. With it, the
+        stream stays open and yields events as they happen until the loop
+        breaks. `sandbox` takes an id or name. Keep the last `seq` seen and
+        pass it as `after` to resume after a disconnect.
+
+        ```python
+        for event in burrow.events(sandbox="build-482", follow=True):
+            print(event.seq, event.type, event.detail)
+        ```
+        """
+        for raw in self._transport.server_stream(
+            "TailEvents",
+            api_pb2.TailEventsRequest(
+                after_seq=after, sandbox=sandbox, is_follow=follow, limit=limit
+            ),
+            # A follow outlives any request deadline.
+            None if follow else _DEFAULT,
+        ):
+            yield LifecycleEvent(
+                seq=raw.seq,
+                node_id=raw.node_id,
+                node_seq=raw.node_seq,
+                at_unix_ms=raw.at_unix_ms,
+                sandbox_id=raw.sandbox_id,
+                type=raw.type,
+                state=_state_of(raw.state),
+                detail=raw.detail,
+                template=raw.template,
+                metadata=dict(raw.metadata),
+                cpu_usage_usec=raw.cpu_usage_usec,
+                rx_bytes=raw.rx_bytes,
+                tx_bytes=raw.tx_bytes,
+                vcpus=raw.vcpus,
+                memory_mib=raw.mem_mib,
+            )
+
     def drain_node(
         self, node_id: str, drain: bool = True, suspend_sandboxes: bool = False
     ) -> int:
@@ -1973,6 +2043,8 @@ class Burrow:
                 healthy=n.is_healthy,
                 draining=n.status.is_draining,
                 labels=dict(n.info.labels),
+                arch=n.info.arch,
+                firecracker_version=n.info.firecracker_version,
             )
             for n in res.nodes
         ]

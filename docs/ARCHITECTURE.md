@@ -24,14 +24,16 @@ nftables.
   networking, the egress proxy, snapshots, and the edge router. It registers
   with the orchestrator and heartbeats capacity. Listens on `127.0.0.1:7071`.
 
-Sandboxes are node-pinned, because snapshots and disks are node-local files.
-The orchestrator routes every per-sandbox call to the owning node.
+A sandbox runs on one node, because its disks and suspend state are files
+there. With an object store, a suspended sandbox and a snapshot both outlive
+that node and restore on another. The orchestrator routes every per-sandbox
+call to the owning node.
 
 ```mermaid
 flowchart TB
     subgraph clients["clients"]
         CLI["burrow CLI"]
-        SDK["@pixec/burrow<br/>TypeScript SDK"]
+        SDK["TypeScript and<br/>Python SDKs"]
     end
 
     SCHED["burrow-orchestrator :7070<br/>public API · node registry<br/>placement · audit fan-out"]
@@ -68,29 +70,83 @@ contradiction and is not: it is never consulted in preference to a node. It
 covers the one case the fleet cannot answer for itself, every node restarting at
 once, after which the sandbox to node mapping would otherwise be gone rather
 than merely stale. The moment a node registers, its inventory replaces what was
-stored for it.
+stored for it. That copy, with tombstones, sealed secrets, the fleet's event
+log and the claims below, is the whole of the orchestrator's store: SQLite
+under `--data-dir` for a single process, or PostgreSQL when `--database-url`
+names one, which is what lets several replicas run at once.
 
 Everything is gRPC. The same `.proto` files build the daemons and ship with the
 SDK, so there is no second REST surface to drift.
+
+### Several control plane replicas
+
+With PostgreSQL, any number of orchestrator replicas can run behind one
+address, a Kubernetes Service or any TCP balancer. Nodes and clients connect
+through it, and a replica going away costs only the calls in flight on it.
+
+Each replica answers reads from memory, which is what keeps routing a call
+cheap, and keeps that memory honest three ways:
+
+- **It writes through.** A replica's own changes go to the store in the order
+  it made them, through one writer task, so the ordering guarantees a single
+  process always had still hold.
+- **It catches up once a second.** Nodes, placements and tombstones are
+  reloaded from the store. A reload waits for the replica's own writer to
+  drain first, and is thrown away if anything was queued meanwhile, so it can
+  never replace a local change with the older row it superseded.
+- **A miss reads through.** A sandbox created through another replica in the
+  last second is looked up in the store, by id or by name, instead of being
+  reported as missing.
+
+Anything two replicas could race on is decided by the database, in the one
+statement that takes it:
+
+| Decision | How |
+| --- | --- |
+| A sandbox id or name | A row in `claims` keyed by `id:` or `name:`. Of two creates of one name, one insert lands. The claim lives as long as the sandbox. |
+| The last capacity on a node | `UPDATE nodes SET reserved = reserved + n WHERE committed + reserved + n <= total`. Exactly one of two racing replicas sees a row change; the other passes the node over and tries the next. |
+| A node's address slice | A unique column. A registration that loses the race reads again and chooses again. |
+| Schema setup | Under a transaction-scoped advisory lock, since replicas start together. |
+
+Background work runs once for the fleet, on one replica: writing off dead
+nodes, ageing out tombstones, sweeping the claims of creates a replica died in
+the middle of, and copying every node's event log into the store. The leader
+is whichever replica holds a Postgres advisory lock on a connection of its own;
+when it dies its connection does, the lock is released, and another replica's
+next attempt, within two seconds, takes over. A new leader starts copying every
+known node's log from where the last copy stopped, so events recorded while
+nobody was copying are not lost: the node's own log held them. On SQLite there
+is one process and it is always the leader.
+
+Every replica publishes its own address, its pod IP in Kubernetes, and
+heartbeat responses carry the whole set. Nodes deny those to sandboxes
+alongside the address they were configured with, which with several replicas
+is only the balancer in front of them.
+
+Measured on the dev harness with two replicas behind HAProxy
+(`compose.ha.yaml`): killing the leader during a loop of execs and creates
+lost no calls, leadership moved within a second, six concurrent creates of one
+name produced one sandbox, and event followers on either replica carried on
+from their last position.
 
 ## Crates
 
 | Crate | Role |
 | --- | --- |
-| `burrow-proto` | `api` (client to orchestrator), `node` (orchestrator to burrowd), `agent` (burrowd to guest) protos |
+| `burrow-proto` | `api` (client to orchestrator), `node` (orchestrator to burrowd), `guest` (burrowd to guest) and `common` protos |
 | `burrow-common` | Shared by both daemons: auth, edge wire format, policy globs, tags, telemetry, secrets vault |
 | `burrow-firecracker` | Firecracker process supervision, API client, snapshots, cgroups |
 | `burrow-net` | Address allocation, tap devices, nftables policy, mesh |
 | `burrow-proxy` | Transparent egress proxy, domain allowlisting, DNS, egress audit |
-| `burrow-store` | SQLite persistence |
+| `burrow-store` | Persistence: SQLite on nodes, SQLite or PostgreSQL for the orchestrator |
 | `tailcat-rs` | Tailcat server: WireGuard through a DERP relay with NAT traversal, terminated in a userspace TCP/UDP stack |
 | `burrow-guest` | Guest binary: runs as PID 1, serves gRPC over vsock |
 | `burrow-orchestrator` | Control plane binary |
 | `burrow-daemon` | `burrowd` node binary |
 | `burrow-cli` | `burrow` CLI |
 
-`burrow-proto` is used by everything. `burrow-firecracker`, `burrow-net`,
-`burrow-proxy` and `burrow-store` are used only by `burrowd`.
+`burrow-proto` is used by everything. `burrow-firecracker` and `burrow-proxy`
+are used only by `burrowd`; `burrow-net` and `burrow-store` by both daemons.
 
 `burrow-guest` is Linux only: vsock, mount syscalls, netlink. It is excluded
 from the workspace's `default-members` so a bare `cargo build` still works on
@@ -160,8 +216,10 @@ fall between them.
 
 ## Inside a sandbox
 
-The agent is PID 1. No systemd, no udev, no getty, which is why a cold boot
-reaches a working agent in about a second instead of eight. It mounts the
+The agent is PID 1. No udev, no getty and, unless the template asks for it, no
+systemd, which is why a cold boot reaches a working agent in about a second
+instead of eight. A systemd template runs systemd as the agent's child in
+namespaces of its own; see [TEMPLATES.md](TEMPLATES.md#systemd-templates). It mounts the
 per-sandbox scratch disk (`/dev/vdb`, `scratch.ext4`) as the writable upper
 layer of an overlay over the read-only template rootfs (`/dev/vda`), brings up
 the pseudo-filesystems, and serves gRPC over vsock port 1024.
@@ -193,6 +251,34 @@ The reply is read one byte at a time, deliberately. The guest speaks first,
 because a gRPC server emits its HTTP/2 SETTINGS frame immediately, so a buffered
 read swallows the first frame of the real protocol. That presented as an
 intermittent 40% "transport error" before it was understood.
+
+### Upgrading the agent in place
+
+The agent is copied into a template's rootfs when the template is imported,
+so a template, every warm snapshot built from it, and every sandbox suspended
+with it carry the agent of that moment. Re-importing fixes the template and
+nothing else; the suspended sandbox still wakes with the old agent in memory.
+
+So the agent reports the digest of the binary it is running on every
+handshake, and a node that ships a different one sends it over. The guest
+writes the binary to tmpfs, verifies the digest, answers, and `execve`s
+itself. PID 1 survives an exec, so the kernel sees the same init; the new
+process skips the one-time mounts a fresh init does, binds the vsock listener
+again, and the node reconnects and handshakes it. That happens at the three
+points a guest handshakes, a cold boot, a resume and a restore, so a stale
+template heals on first boot and a suspended sandbox heals on its next start,
+wherever it is restored. A guest with a command running refuses, since the
+command's pipes and pty belong to the old process, and is upgraded on its
+next handshake instead. The cost is one extra round trip, about the price of a
+second handshake.
+
+The agent's table of finished commands, with their buffered output, is written
+to tmpfs before the exec and read back by the new process, so `burrow top` and
+`burrow logs` see the same history after an upgrade as before. Agents older
+than the upgrade RPC cannot be reached this way, which is why templates
+imported before it need one re-import, on every node that holds a copy: an
+import lands on one node, and the others keep what they have until it is
+removed and replicated again.
 
 ### Confining the VMM
 
@@ -323,7 +409,7 @@ anyway.
 
 | Mode | Behaviour |
 | --- | --- |
-| `none` (default) | No egress. Name resolution still works, so an attempt is visible in the audit trail. |
+| `none` (default) | No egress. Public names are refused by the resolver and each query is audited, so an attempt is visible; `.internal` names still resolve. |
 | `allowlist` | Web traffic is redirected to the proxy, which reads the TLS SNI or HTTP `Host` header and permits only the named domains. |
 | `open` | NAT'd egress to anywhere. |
 
@@ -559,9 +645,9 @@ that.
 ## Snapshots and warm creates
 
 A warm snapshot is a template booted once and frozen with its agent ready.
-Creates then restore instead of booting: measured on real OCI templates with
-45ms median for alpine (36 to 98ms) and 41ms for python (33 to
-46ms). Nodes warm templates on their own,
+Creates then restore instead of booting, in tens of milliseconds against
+roughly two seconds for a cold boot; the numbers are in
+[performance](#performance). Nodes warm templates on their own,
 as each one lands and as creates ask for shapes nothing has warmed yet.
 
 ```mermaid
@@ -635,8 +721,9 @@ sandboxes touching 768 MiB cost 857 to 876 MiB with the handler and 792 to
 860 MiB without, because serving a fault in userspace produces a private copy of
 every page including ones only read. So `--lazy-memory` is off by default.
 
-The handler earns its place in the two cases the kernel cannot cover: a diff
-chain, which has no single file to map, and a prefetch plan.
+The handler earns its place in the three cases the kernel cannot cover: a diff
+chain, which has no single file to map, a prefetch plan, and a memory image
+still arriving from the object store, whose holes are not yet data.
 
 #### Prefetching
 
@@ -750,16 +837,28 @@ snapshot.
 
 The kernel and rootfs go up as blobs under their digest, so snapshots of one
 template share them and a fetching node verifies what it received before
-adopting it into its own blob store. The memory image, vmstate and scratch disk
-go under the snapshot's id. The first two of those are sparse, and mostly
-holes: a snapshot occupying 40 MiB has a 512 MiB memory file and a scratch
-disk the size of the guest's allowance. They go as their data extents, each
-prefixed by its offset, and the fetch writes them back at those offsets into a
-file truncated to the apparent length, so what arrives is as sparse as what
-left. Measured on the dev harness, that took the upload of a 40 MiB snapshot
-from minutes to under a second, and a fetch to 92 ms once the template's blobs
-were already there. Nothing is streamed lazily: a fetch is a whole copy, paid
-once per node, since a fetched snapshot is then local.
+adopting it into its own blob store. The vmstate goes under the snapshot's id.
+The memory image and the scratch disk go as chunks: each is cut into 1 MiB
+pieces, every piece holding data is stored once at `chunks/<sha256>`, and an
+index under the snapshot's id names the digest of each. Both files are mostly
+holes, a snapshot occupying 40 MiB having a 512 MiB memory file, so a chunk of
+zeroes is simply absent from the index, and a fetch leaves zero pages as holes,
+so what arrives is as sparse as what left.
+
+A fetch takes the scratch disk whole, then restores the guest at once with its
+memory served lazily. The page-fault handler maps the memory file as it is
+being written, and before it serves a page it asks for the chunk under it: one
+already present is served at once, one in flight is waited for, and one nobody
+has asked for yet is fetched on the spot. The prefetch plan is fetched in
+parallel before the guest is unpaused. Everything else is filled in behind the
+guest, eight chunks at a time. A marker beside the file holds its index for as
+long as it is incomplete, so a node restarted mid-fill fills it again rather
+than trusting holes that are not zeroes, and anything that reads the file
+directly rather than through the handler, a fork, a snapshot, a compaction,
+waits for the fill to finish first. Measured on the dev harness, a create from
+a snapshot on a node that had never seen it took 355 ms end to end, and its 64
+MiB of memory had all arrived about 70 ms after the guest started. A fetched
+snapshot is then local, so a node pays for each snapshot once.
 
 The orchestrator keeps the holder as the place to restore, because a local
 copy costs nothing. A durable snapshot whose holder is unreachable, or written
@@ -774,6 +873,55 @@ orchestrator declares a holderless snapshot stranded it asks one healthy node
 what the store holds and adopts the answer. Deleting a snapshot
 removes it from the store too, and the delete goes to whichever compatible
 node is up when the holder is not.
+
+### Suspended sandboxes in the object store
+
+A suspended sandbox's state goes to the store the same way, under
+`sandboxes/<id>/`, uploaded behind every suspend. The memory chain is flattened
+on the way, newest layer winning page by page, into one chunked image, so
+another node restores one file rather than rebuilding a chain. Only chunks a
+layer newer than the last upload touched are read again; the rest keep the
+digests they had, and a suspend that dirtied a few megabytes uploads a few
+megabytes. The scratch disk is chunked whole, and reused outright when it has
+not changed. Each upload is a generation of its own: its vmstate and indexes go
+under `sandboxes/<id>/<generation>/`, and a manifest written last names the
+generation that is complete and the node holding the sandbox. The node keeps
+its own record of the last upload in the working directory, which is how it
+knows the stored copy is current: the same layer inodes, the same vmstate and
+the same scratch disk.
+
+The manifest also says whether the sandbox is running. A node writes `running`
+before it resumes a sandbox with a stored copy, and refuses to resume when the
+store cannot be reached; a node asked to adopt one the manifest says is
+running refuses, because what the store holds is from before the guest moved
+on. That closes the case of a node that resumed a sandbox and then died. The
+case of a node that is alive but cut off is closed by a lease: every heartbeat
+renews one three intervals shorter than `--node-expiry-secs`, and once it
+lapses the node fences its stored sandboxes and resumes none of them until the
+orchestrator confirms, on a later heartbeat, that they are still placed there.
+Recovery fences them all too. The orchestrator only lets another node adopt a
+sandbox after writing its node off, which is after the lease has run out, so
+the two never both believe they hold it; a fenced sandbox another node has
+adopted is reported back as relinquished, and the old node drops its copy
+without touching the store.
+
+Adopting runs through the same restore path as a fork and a snapshot, with the
+store as the source: the claim goes to the store first, then the vmstate and
+scratch disk arrive, the guest restores with lazy memory, and the handshake
+re-addresses it. Unlike a create, an adopt waits for the handshake, and one
+that fails hands the stored state back as suspended, since it is the only copy.
+The orchestrator's record supplies the policy, name and metadata. It holds
+brokered credentials only redacted, so those travel in the manifest sealed
+under `--object-store-key-file`, a key the fleet shares, and are matched back
+into the record by where each sits.
+
+Chunks are shared between generations, sandboxes and snapshots, so none is
+deleted when its owner is. Every node runs a collector every few hours that
+reads every manifest and index, and deletes chunks and old generations nothing
+references and that are more than a day old. The age is what makes an
+unsynchronised collector safe: an upload puts its chunks before the manifest
+that names them, and an uploader only skips putting a chunk that its own
+current manifest already references.
 
 The store is spoken to through the AWS S3 SDK, built on the rustls and ring
 the node already uses so the musl cross build carries one TLS stack.
@@ -852,8 +1000,8 @@ out stops one. A session is that interval, recorded by the node in its own store
 as the VM starts and closed as it stops.
 
 Every path that produces a VM opens one, so the list is the whole history rather
-than the subset one code path remembered to write: a cold or warm boot and a
-a cold boot and a warm restore both record `boot`, a fork or a create from a snapshot records
+than the subset one code path remembered to write: a cold boot and a warm
+restore both record `boot`, a fork or a create from a snapshot records
 `restore`, and a resume records `resume`. Suspend, delete, and a failed resume
 after a successful state write close it.
 
@@ -1081,8 +1229,9 @@ What it is good for:
 
 The paths that cannot place check instead of choosing. A fork is built where its
 source's state already is, and a create from a snapshot lands where the snapshot
-is, so labels there are a precondition: a node that does not carry them is
-refused rather than the constraint being dropped.
+is while that node is up, so labels there are a precondition: a node that does
+not carry them is refused rather than the constraint being dropped. A durable
+snapshot whose node is down is placed among matching nodes like any create.
 
 Labels ride on `NodeInfo`, sent at registration and restated on every heartbeat,
 so relabelling a node and restarting it converges within one beat. They are held
@@ -1238,6 +1387,25 @@ trace context crosses the orchestrator to node hop, so a create is one trace
 spanning both processes rather than two unrelated ones. Without the flag,
 tracing stays local and nothing is exported.
 
+### The event log
+
+Every node appends to an `events` table in its own store as it acts: a
+sandbox is created, its VM starts and its agent answers, it stops and starts
+again across suspends, a snapshot is taken of it, it is destroyed. The row is
+written before anyone is told about it, and carries the position the store
+gave it, so a tail that replays the table and then follows a live broadcast
+sees each event once. Each row also carries the sandbox's cpu and network
+totals at that instant, which is what a bill can be built from later: the
+interval between two events is time spent in one state at one shape.
+
+The orchestrator tails every node's log into one of its own. Each copied row
+keeps its origin, the node id and the node's position, and the pair is unique
+in the table, so a tail that reconnects and replays from the last position it
+copied cannot store anything twice. That one log is what `burrow events` and
+the API's `TailEvents` read, resumable by its own `seq`, and it is where
+webhooks will be delivered from. An event therefore outlives the node that
+recorded it, which the node's own log does not.
+
 ### Usage metering
 
 Every sandbox record carries `cpu_usage_usec`, `rx_bytes` and `tx_bytes`,
@@ -1347,7 +1515,7 @@ assumed. The containers are privileged, which is an artifact of running a node
 inside a container rather than the deployment model. A real node is `burrowd`
 running as root on the host.
 
-See the [README](../README.md#quickstart) for first-time setup. The everyday
+See [GETTING-STARTED.md](GETTING-STARTED.md) for first-time setup. The everyday
 loop is build and up:
 
 ```sh
@@ -1361,13 +1529,14 @@ rebuilt binaries are picked up by the next `docker exec` without recreating
 anything. Long-running services still need a restart to pick up a new build.
 
 Production nodes are x86_64: build with `--target x86_64-unknown-linux-musl`
-and rsync `burrow-orchestrator`, `burrowd` and `burrow` from
+and rsync `burrow-orchestrator`, `burrowd`, `burrow-guest` and `burrow` from
 `target/x86_64-unknown-linux-musl/release/` to `/usr/local/bin` on the host.
-Snapshots are per node, so mixed
-architectures across the fleet are fine.
+Mixed architectures across the fleet work, with one limit: a durable snapshot
+only restores on a node of the architecture that took it.
 
-To run the same two components on Kubernetes, the orchestrator as a StatefulSet
-and one `burrowd` per KVM-capable machine as a DaemonSet, see
+To run the same two components on Kubernetes, the orchestrator as a Deployment
+of replicas over PostgreSQL and one `burrowd` per KVM-capable machine as a
+DaemonSet, see
 [deploy/k8s](../deploy/k8s/README.md). The cluster schedules the daemons only: a
 sandbox is a microVM `burrowd` places itself, and `kubectl` cannot see one.
 

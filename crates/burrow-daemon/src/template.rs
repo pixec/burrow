@@ -109,39 +109,29 @@ pub fn set_guest_kernel(path: PathBuf) {
 /// An OCI image carries a userland and no kernel, so the node supplies one.
 /// Hard-linked rather than copied: it is the same bytes for every template,
 /// and a sandbox hard-links both artifacts out of one directory.
-async fn link_kernel(data_dir: &Path, target: &Path) -> Result<(), Status> {
+async fn link_kernel(target: &Path) -> Result<(), Status> {
     let kernel = target.join("vmlinux");
     if tokio::fs::try_exists(&kernel).await.unwrap_or(false) {
         return Ok(());
     }
-    let configured = GUEST_KERNEL.get().cloned();
-    // The `default` template is the fallback for nodes set up before there was
-    // a flag for this, where the kernel arrived as part of that template.
-    let legacy = templates_dir(data_dir).join("default").join("vmlinux");
-    let mut candidates = Vec::new();
-    candidates.extend(configured);
-    candidates.push(legacy);
-
-    for source in &candidates {
-        if !tokio::fs::try_exists(source).await.unwrap_or(false) {
-            continue;
-        }
-        // Across filesystems a link is refused, and a copy is still correct.
-        if tokio::fs::hard_link(source, &kernel).await.is_ok()
-            || tokio::fs::copy(source, &kernel).await.is_ok()
-        {
-            return Ok(());
-        }
+    let source = GUEST_KERNEL.get().ok_or_else(|| {
+        Status::failed_precondition(
+            "no guest kernel on this node: point --guest-kernel at a vmlinux",
+        )
+    })?;
+    // Across filesystems a link is refused, and a copy is still correct.
+    if tokio::fs::hard_link(source, &kernel).await.is_ok() {
+        return Ok(());
     }
-    Err(Status::failed_precondition(format!(
-        "no guest kernel on this node: looked in {}. Point --guest-kernel at a \
-         vmlinux, or put one at <data-dir>/vmlinux",
-        candidates
-            .iter()
-            .map(|p| p.display().to_string())
-            .collect::<Vec<_>>()
-            .join(", ")
-    )))
+    tokio::fs::copy(source, &kernel)
+        .await
+        .map(drop)
+        .map_err(|err| {
+            Status::failed_precondition(format!(
+                "no guest kernel at {}: {err}; point --guest-kernel at a vmlinux",
+                source.display()
+            ))
+        })
 }
 
 pub async fn list(data_dir: &Path) -> Vec<api::TemplateInfo> {
@@ -157,15 +147,13 @@ pub async fn list(data_dir: &Path) -> Vec<api::TemplateInfo> {
             continue;
         };
         let warm = crate::warm::is_warm(&templates_dir(data_dir), &name).await;
-        let kit = crate::oci::image_environment(data_dir, &name)
-            .await
-            .kit
-            .is_some();
+        let environment = crate::oci::image_environment(data_dir, &name).await;
         out.push(api::TemplateInfo {
             name,
             size_bytes: meta.len(),
             is_warm: warm,
-            is_kit: kit,
+            is_kit: environment.kit.is_some(),
+            is_systemd: environment.systemd,
         });
     }
     out.sort_by(|a, b| a.name.cmp(&b.name));
@@ -271,6 +259,7 @@ async fn run_build(
             data_dir,
             &request.name,
             &request.kits,
+            request.is_systemd,
             guest_binary,
             credentials,
             insecure,
@@ -297,6 +286,7 @@ async fn run_build(
             data_dir,
             &base,
             &request.from_image,
+            request.is_systemd,
             guest_binary,
             credentials,
             insecure,
@@ -396,6 +386,11 @@ async fn run_build(
         )
         .await?;
 
+    // Steps run on a systemd base, under its systemd, and the image they make
+    // keeps it.
+    let is_systemd =
+        request.is_systemd || crate::oci::image_environment(data_dir, from).await.systemd;
+
     // From here on the sandbox exists and must be cleaned up on every path.
     let outcome = build_in_sandbox(
         manager,
@@ -406,6 +401,7 @@ async fn run_build(
         &base_rootfs,
         &commands,
         cached_steps,
+        is_systemd,
     )
     .await;
     if let Err(err) = manager.delete(&build_id).await {
@@ -424,6 +420,7 @@ async fn build_in_sandbox(
     base_rootfs: &crate::blobs::Digest,
     commands: &[String],
     cached_steps: usize,
+    is_systemd: bool,
 ) -> Result<(), Status> {
     for (index, run) in commands.iter().enumerate() {
         // Steps the cache already covers are represented by the seeded scratch
@@ -493,7 +490,16 @@ async fn build_in_sandbox(
     let bytes = download_to(manager, build_id, EXPORT_PATH, &tar_path).await?;
     tracing::info!(build = build_id, bytes, "captured build filesystem");
 
-    let result = assemble_image(manager, data_dir, &staging, &tar_path, &request.name, bytes).await;
+    let result = assemble_image(
+        manager,
+        data_dir,
+        &staging,
+        &tar_path,
+        &request.name,
+        bytes,
+        is_systemd,
+    )
+    .await;
     let _ = tokio::fs::remove_dir_all(&staging).await;
     let size_bytes = result?;
 
@@ -514,6 +520,7 @@ async fn assemble_image(
     tar_path: &Path,
     name: &str,
     tar_bytes: u64,
+    is_systemd: bool,
 ) -> Result<u64, Status> {
     let rootdir = staging.join("root");
     tokio::fs::create_dir_all(&rootdir)
@@ -569,7 +576,19 @@ async fn assemble_image(
     )
     .await?;
 
-    link_kernel(data_dir, &target).await?;
+    link_kernel(&target).await?;
+
+    if is_systemd {
+        let config = crate::oci::ImageEnvironment {
+            systemd: true,
+            ..Default::default()
+        };
+        let config = serde_json::to_vec_pretty(&config)
+            .map_err(|err| Status::internal(format!("image config: {err}")))?;
+        tokio::fs::write(target.join("image.json"), config)
+            .await
+            .map_err(|err| Status::internal(format!("writing image config: {err}")))?;
+    }
 
     let final_path = target.join("rootfs.ext4");
     tokio::fs::rename(&pending, &final_path)
@@ -1459,6 +1478,7 @@ pub mod from_image {
         data_dir: &Path,
         name: &str,
         image: &str,
+        is_systemd: bool,
         guest_binary: &Path,
         credentials: &crate::oci::auth::Store,
         insecure: &[String],
@@ -1482,7 +1502,8 @@ pub mod from_image {
             let blobs = [(pulled.digest.clone(), pulled.layers.clone())].into();
             match crate::kit::assemble(vec![loaded], blobs, &mut progress) {
                 Ok((template, layers)) => {
-                    let environment = template.environment();
+                    let mut environment = template.environment();
+                    environment.systemd = is_systemd;
                     return stage(
                         manager,
                         data_dir,
@@ -1499,12 +1520,14 @@ pub mod from_image {
                 )),
             }
         }
+        let mut environment = pulled.environment;
+        environment.systemd = is_systemd;
         stage(
             manager,
             data_dir,
             name,
             &pulled.layers,
-            &pulled.environment,
+            &environment,
             guest_binary,
             tx,
         )
@@ -1521,6 +1544,7 @@ pub mod from_image {
         data_dir: &Path,
         name: &str,
         refs: &[String],
+        is_systemd: bool,
         guest_binary: &Path,
         credentials: &crate::oci::auth::Store,
         insecure: &[String],
@@ -1538,7 +1562,8 @@ pub mod from_image {
             name.to_string()
         };
         validate_name(&name)?;
-        let environment = template.environment();
+        let mut environment = template.environment();
+        environment.systemd = is_systemd;
         stage(
             manager,
             data_dir,
@@ -1740,7 +1765,7 @@ pub mod from_image {
         )
         .await?;
 
-        super::link_kernel(data_dir, &target).await?;
+        super::link_kernel(&target).await?;
 
         // The image's environment and working directory are what a shell in
         // the sandbox would otherwise get wrong.
