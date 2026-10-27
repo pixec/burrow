@@ -1,11 +1,11 @@
 syntax = "proto3";
 
-package burrow.agent.v1;
+package burrow.guest.v1;
 
-// Served by burrow-agent inside the guest, over vsock; called by burrowd.
-service Agent {
+// Served by burrow-guest inside the guest, over vsock; called by burrowd.
+service Guest {
   rpc Handshake(HandshakeRequest) returns (HandshakeResponse);
-  rpc Health(AgentHealthRequest) returns (AgentHealthResponse);
+  rpc Health(GuestHealthRequest) returns (GuestHealthResponse);
   // Mirrors the public Exec RPC. Deliberately a separate message set from
   // burrow.api.v1 so the guest protocol can version independently of the
   // public API (guests outlive deploys: a paused sandbox resumes with the
@@ -299,5 +299,5 @@ message GuestResumeTiming {
   uint64 trust_write_us = 10;
 }
 
-message AgentHealthRequest {}
-message AgentHealthResponse {}
+message GuestHealthRequest {}
+message GuestHealthResponse {}

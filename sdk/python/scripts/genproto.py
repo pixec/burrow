@@ -1,11 +1,11 @@
 """Regenerates burrow/_pb from burrow/proto.
 
-Run after `cargo xtask protos` updates the copies here:
+Run after `scripts/sync-protos.sh` updates the copies here:
 
     python scripts/genproto.py
 
 `--check` reports drift and exits non-zero instead of writing, which is the
-CI form (mirroring `cargo xtask protos --check` for the .proto copies).
+CI form (mirroring `scripts/sync-protos.sh --check` for the .proto copies).
 
 The generated modules are committed, so installing the SDK needs neither
 protoc nor grpcio-tools; only regenerating does.

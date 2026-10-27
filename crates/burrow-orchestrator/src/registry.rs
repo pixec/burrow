@@ -2,7 +2,7 @@ use std::collections::HashMap;
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
-use burrow_core::NodeId;
+use burrow_common::NodeId;
 use burrow_proto::common::v1::{NodeInfo, NodeStatus};
 
 pub const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(5);
@@ -266,7 +266,7 @@ impl NodeRegistry {
                 info,
                 status: NodeStatus::default(),
                 last_heartbeat: Instant::now(),
-                last_heartbeat_at: burrow_core::now_rfc3339(),
+                last_heartbeat_at: burrow_common::now_rfc3339(),
                 index,
                 wireguard_public_key,
                 wireguard_endpoint,
@@ -328,7 +328,7 @@ impl NodeRegistry {
                 entry.status = status;
                 entry.is_reported = true;
                 entry.last_heartbeat = Instant::now();
-                entry.last_heartbeat_at = burrow_core::now_rfc3339();
+                entry.last_heartbeat_at = burrow_common::now_rfc3339();
                 drop(nodes);
                 self.clear_pending(node_id);
                 true

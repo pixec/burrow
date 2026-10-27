@@ -1,11 +1,11 @@
 [package]
-name = "burrow-agent"
+name = "burrow-guest"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
 
 [[bin]]
-name = "burrow-agent"
+name = "burrow-guest"
 path = "src/main.rs"
 
 [dependencies]

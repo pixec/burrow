@@ -27,7 +27,7 @@ and your users' code is the thing being sandboxed.
 | Egress audit trail | Yes, queryable | Not documented | Not documented |
 | Billing and quotas | None, you own the capacity | Per plan | Per plan |
 
-## Where burrow genuinely differs
+## Where burrow differs
 
 **Egress is denied until you allow it.** Both managed services give a new
 sandbox the open internet and let you restrict it afterwards. Burrow starts at
@@ -54,7 +54,7 @@ forwarded.
 
 **Optional TLS inspection, and credentials the sandbox never holds.** Turn on
 inspection for a sandbox and burrow terminates its TLS, so the host named
-inside the session is checked too, not just the SNI. On top of that the proxy
+inside the session is checked as well as the SNI. The proxy
 can inject an API key into matching requests on the host side, which means the
 workload calls an authenticated API without the key ever being readable from
 inside the guest. E2B has per-host header injection for TLS traffic, including

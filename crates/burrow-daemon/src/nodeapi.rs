@@ -8,9 +8,9 @@ use std::pin::Pin;
 use tokio_stream::{Stream, StreamExt};
 use tonic::{Request, Response, Status};
 
-use burrow_proto::agent::v1 as agentpb;
 use burrow_proto::api::v1 as api;
 use burrow_proto::common::v1 as common;
+use burrow_proto::guest::v1 as guestpb;
 use burrow_proto::node::v1 as nodepb;
 use burrow_proto::node::v1::node_service_server::NodeService;
 use burrow_proxy::policy as proxypolicy;
@@ -26,7 +26,7 @@ pub struct NodeApi {
     pub cluster_token: Option<String>,
     /// Guest agent binary, installed into images imported from OCI. Those
     /// images have no init of their own, and a VM booted without one panics.
-    pub agent_binary: std::path::PathBuf,
+    pub guest_binary: std::path::PathBuf,
     /// Credentials for registries that need them. Empty means anonymous pulls
     /// only, which covers public images.
     pub registry_credentials: crate::oci::auth::Store,
@@ -50,7 +50,7 @@ impl NodeApi {
         (
             String,
             String,
-            burrow_proto::agent::v1::agent_client::AgentClient<tonic::transport::Channel>,
+            burrow_proto::guest::v1::guest_client::GuestClient<tonic::transport::Channel>,
         ),
         Status,
     > {
@@ -153,7 +153,7 @@ impl NodeService for NodeApi {
         _req: Request<nodepb::NodeHealthRequest>,
     ) -> Result<Response<nodepb::NodeHealthResponse>, Status> {
         Ok(Response::new(nodepb::NodeHealthResponse {
-            version: burrow_core::VERSION.into(),
+            version: burrow_common::VERSION.into(),
         }))
     }
 
@@ -164,7 +164,7 @@ impl NodeService for NodeApi {
         let req = req.into_inner();
         let suspended = self
             .sandboxes
-            .set_drain(req.is_draining, req.is_suspending_sandboxes)
+            .set_drain(req.is_draining, req.suspend_sandboxes)
             .await;
         Ok(Response::new(api::DrainNodeResponse { suspended }))
     }
@@ -176,7 +176,7 @@ impl NodeService for NodeApi {
     ) -> Result<Response<common::Sandbox>, Status> {
         // Joins the orchestrator's trace rather than starting a new one, so the
         // node's share of a create is visible against the request that caused it.
-        burrow_core::telemetry::propagation::adopt(req.metadata());
+        burrow_common::telemetry::propagation::adopt(req.metadata());
         let req = req.into_inner();
         tracing::Span::current().record("sandbox_id", req.sandbox_id.as_str());
         tracing::Span::current().record("template", req.template.as_str());
@@ -188,7 +188,7 @@ impl NodeService for NodeApi {
         }
         let policy = req.policy.unwrap_or_default();
         validate_policy(&policy)?;
-        burrow_core::tags::validate(&req.metadata)?;
+        burrow_common::tags::validate(&req.metadata)?;
         // A template imported from Kits is provisioned through their
         // lifecycle whether or not the caller passed inputs.
         if req.snapshot.is_empty()
@@ -247,7 +247,7 @@ impl NodeService for NodeApi {
         &self,
         req: Request<nodepb::NodeCreateSnapshotRequest>,
     ) -> Result<Response<common::Snapshot>, Status> {
-        burrow_core::telemetry::propagation::adopt(req.metadata());
+        burrow_common::telemetry::propagation::adopt(req.metadata());
         let req = req.into_inner();
         if req.snapshot_id.is_empty() {
             return Err(Status::invalid_argument("snapshot_id is required"));
@@ -541,7 +541,7 @@ impl NodeService for NodeApi {
         &self,
         req: Request<nodepb::NodeForkRequest>,
     ) -> Result<Response<common::Sandbox>, Status> {
-        burrow_core::telemetry::propagation::adopt(req.metadata());
+        burrow_common::telemetry::propagation::adopt(req.metadata());
         let req = req.into_inner();
         if req.sandbox_id.is_empty() {
             return Err(Status::invalid_argument("sandbox_id is required"));
@@ -575,7 +575,7 @@ impl NodeService for NodeApi {
         req: Request<nodepb::NodeUpdateTagsRequest>,
     ) -> Result<Response<common::Sandbox>, Status> {
         let req = req.into_inner();
-        burrow_core::tags::validate(&req.tags)?;
+        burrow_common::tags::validate(&req.tags)?;
         let sandbox = self
             .sandboxes
             .update_tags(&req.sandbox_id, req.tags)
@@ -644,7 +644,7 @@ impl NodeService for NodeApi {
         let manager = self.sandboxes.clone();
         let data_dir = self.data_dir.clone();
         let node_id = self.node_id();
-        let agent_binary = self.agent_binary.clone();
+        let guest_binary = self.guest_binary.clone();
         let credentials = self.registry_credentials.clone();
         let insecure = self.insecure_registries.clone();
         tokio::spawn(async move {
@@ -654,7 +654,7 @@ impl NodeService for NodeApi {
                 data_dir,
                 node_id,
                 req.into_inner(),
-                agent_binary,
+                guest_binary,
                 credentials,
                 insecure,
                 tx,
@@ -900,8 +900,8 @@ impl NodeService for NodeApi {
             check_user_name(&start.user)?;
         }
 
-        let agent_start = agentpb::ExecInput {
-            input: Some(agentpb::exec_input::Input::Start(agentpb::ExecStart {
+        let agent_start = guestpb::ExecInput {
+            input: Some(guestpb::exec_input::Input::Start(guestpb::ExecStart {
                 cmd: start.cmd,
                 env,
                 cwd,
@@ -946,7 +946,7 @@ impl NodeService for NodeApi {
         let mut agent = sandbox.agent().await?;
 
         let path = first.path.clone();
-        let agent_first = agentpb::FileChunk {
+        let agent_first = guestpb::FileChunk {
             path: first.path,
             mode: first.mode,
             data: first.data,
@@ -989,7 +989,7 @@ impl NodeService for NodeApi {
                     tripped.store(true, Relaxed);
                     return;
                 }
-                yield agentpb::FileChunk {
+                yield guestpb::FileChunk {
                     data: chunk.data,
                     ..Default::default()
                 };
@@ -1037,7 +1037,7 @@ impl NodeService for NodeApi {
         let mut agent = sandbox.agent().await?;
 
         let stream = agent
-            .download_file(agentpb::DownloadRequest { path: req.path })
+            .download_file(guestpb::DownloadRequest { path: req.path })
             .await?
             .into_inner()
             .map(|res| {
@@ -1101,7 +1101,7 @@ impl NodeService for NodeApi {
         let mut agent = sandbox.agent().await?;
 
         let stream = agent
-            .watch(agentpb::WatchRequest {
+            .watch(guestpb::WatchRequest {
                 path: req.path,
                 is_recursive: req.is_recursive,
                 interval_ms: req.interval_ms,
@@ -1128,7 +1128,7 @@ impl NodeService for NodeApi {
         let mut agent = sandbox.agent().await?;
 
         let resp = agent
-            .list_dir(agentpb::ListDirRequest { path: req.path })
+            .list_dir(guestpb::ListDirRequest { path: req.path })
             .await?
             .into_inner();
         Ok(Response::new(api::ListDirResponse {
@@ -1158,7 +1158,7 @@ impl NodeService for NodeApi {
         let mut agent = sandbox.agent().await?;
 
         let resp = agent
-            .list_commands(agentpb::ListCommandsRequest {})
+            .list_commands(guestpb::ListCommandsRequest {})
             .await?
             .into_inner();
         Ok(Response::new(api::ListCommandsResponse {
@@ -1182,7 +1182,7 @@ impl NodeService for NodeApi {
         let mut agent = sandbox.agent().await?;
 
         let info = agent
-            .get_command(agentpb::GetCommandRequest { command_id })
+            .get_command(guestpb::GetCommandRequest { command_id })
             .await?
             .into_inner();
         Ok(Response::new(command_info(info)))
@@ -1205,7 +1205,7 @@ impl NodeService for NodeApi {
         let mut agent = sandbox.agent().await?;
 
         let stream = agent
-            .attach_command(agentpb::AttachCommandRequest { command_id })
+            .attach_command(guestpb::AttachCommandRequest { command_id })
             .await?
             .into_inner()
             .map(|res| res.map(translate_exec_output));
@@ -1223,7 +1223,7 @@ impl NodeService for NodeApi {
         let mut agent = sandbox.agent().await?;
 
         agent
-            .signal_command(agentpb::SignalCommandRequest {
+            .signal_command(guestpb::SignalCommandRequest {
                 command_id,
                 signal: req.signal,
             })
@@ -1247,7 +1247,7 @@ impl NodeService for NodeApi {
         let mut agent = sandbox.agent().await?;
 
         let resp = agent
-            .create_user(agentpb::CreateUserRequest { name: req.name })
+            .create_user(guestpb::CreateUserRequest { name: req.name })
             .await?
             .into_inner();
         Ok(Response::new(api::CreateUserResponse {
@@ -1269,7 +1269,7 @@ impl NodeService for NodeApi {
         let mut agent = sandbox.agent().await?;
 
         let resp = agent
-            .create_group(agentpb::CreateGroupRequest { name: req.name })
+            .create_group(guestpb::CreateGroupRequest { name: req.name })
             .await?
             .into_inner();
         Ok(Response::new(api::CreateGroupResponse {
@@ -1285,7 +1285,7 @@ impl NodeService for NodeApi {
     ) -> Result<Response<api::GroupMembershipResponse>, Status> {
         let (user, group, mut agent) = self.membership(req.into_inner()).await?;
         agent
-            .add_user_to_group(agentpb::GroupMembership { user, group })
+            .add_user_to_group(guestpb::GroupMembership { user, group })
             .await?;
         Ok(Response::new(api::GroupMembershipResponse {}))
     }
@@ -1296,7 +1296,7 @@ impl NodeService for NodeApi {
     ) -> Result<Response<api::GroupMembershipResponse>, Status> {
         let (user, group, mut agent) = self.membership(req.into_inner()).await?;
         agent
-            .remove_user_from_group(agentpb::GroupMembership { user, group })
+            .remove_user_from_group(guestpb::GroupMembership { user, group })
             .await?;
         Ok(Response::new(api::GroupMembershipResponse {}))
     }
@@ -1365,7 +1365,7 @@ fn bounded(mut value: String, max: usize) -> String {
 
 /// Maps a guest's report of one command onto the public shape, bounding every
 /// field the guest chose the size of.
-fn command_info(info: agentpb::CommandInfo) -> api::CommandInfo {
+fn command_info(info: guestpb::CommandInfo) -> api::CommandInfo {
     api::CommandInfo {
         command_id: bounded(info.command_id, MAX_COMMAND_ID),
         cmd: info
@@ -1524,8 +1524,8 @@ async fn remove_partial_upload_inner(sandbox: &RunningSandbox, path: &str) {
     let Ok(mut agent) = sandbox.agent().await else {
         return;
     };
-    let start = agentpb::ExecInput {
-        input: Some(agentpb::exec_input::Input::Start(agentpb::ExecStart {
+    let start = guestpb::ExecInput {
+        input: Some(guestpb::exec_input::Input::Start(guestpb::ExecStart {
             // argv, not a shell line: the path is a caller's string.
             cmd: vec!["/bin/rm".into(), "-f".into(), "--".into(), path.to_string()],
             env: Default::default(),
@@ -1574,7 +1574,7 @@ fn share_proto(sandbox_id: String, info: crate::share::ShareInfo) -> api::Share 
         address: info.address,
         ports: info.spec.ports.iter().map(|p| u32::from(*p)).collect(),
         allowed_clients: info.spec.allowed_clients,
-        created_at: burrow_core::rfc3339_from_unix_secs(info.spec.created_at),
+        created_at: burrow_common::rfc3339_from_unix_secs(info.spec.created_at),
         udp_ports: info.spec.udp_ports.iter().map(|p| u32::from(*p)).collect(),
         is_all_udp: info.spec.is_all_udp_shared,
         is_transparent_ip: info.is_ip_transparent,
@@ -2118,26 +2118,26 @@ const REDACTED: &str = "<redacted>";
 
 /// Maps a public Exec message onto the agent protocol. A second `Start` is
 /// dropped: the stream already has one, and the agent rejects duplicates.
-fn translate_exec_input(msg: api::ExecInput) -> Option<agentpb::ExecInput> {
-    use agentpb::exec_input::Input as AgentInput;
+fn translate_exec_input(msg: api::ExecInput) -> Option<guestpb::ExecInput> {
     use api::exec_input::Input as ApiInput;
+    use guestpb::exec_input::Input as AgentInput;
 
     let input = match msg.input? {
         ApiInput::Stdin(bytes) => AgentInput::Stdin(bytes),
         ApiInput::Signal(sig) => AgentInput::Signal(sig),
-        ApiInput::Resize(size) => AgentInput::Resize(agentpb::ExecResize {
+        ApiInput::Resize(size) => AgentInput::Resize(guestpb::ExecResize {
             rows: size.rows,
             cols: size.cols,
         }),
         ApiInput::IsStdinEof(eof) => AgentInput::IsStdinEof(eof),
         ApiInput::Start(_) => return None,
     };
-    Some(agentpb::ExecInput { input: Some(input) })
+    Some(guestpb::ExecInput { input: Some(input) })
 }
 
-fn translate_exec_output(msg: agentpb::ExecOutput) -> api::ExecOutput {
-    use agentpb::exec_output::Output as AgentOutput;
+fn translate_exec_output(msg: guestpb::ExecOutput) -> api::ExecOutput {
     use api::exec_output::Output as ApiOutput;
+    use guestpb::exec_output::Output as AgentOutput;
 
     api::ExecOutput {
         output: msg.output.map(|out| match out {
@@ -2569,17 +2569,17 @@ mod policy_tests {
         let ok: HashMap<String, String> = [("env".to_string(), "staging".to_string())]
             .into_iter()
             .collect();
-        assert!(burrow_core::tags::validate(&ok).is_ok());
+        assert!(burrow_common::tags::validate(&ok).is_ok());
 
         let forged: HashMap<String, String> = [("env".to_string(), "a\nb".to_string())]
             .into_iter()
             .collect();
-        assert!(burrow_core::tags::validate(&forged).is_err());
+        assert!(burrow_common::tags::validate(&forged).is_err());
 
-        let too_many: HashMap<String, String> = (0..=burrow_core::tags::MAX_TAGS)
+        let too_many: HashMap<String, String> = (0..=burrow_common::tags::MAX_TAGS)
             .map(|i| (format!("k{i}"), String::new()))
             .collect();
-        assert!(burrow_core::tags::validate(&too_many).is_err());
+        assert!(burrow_common::tags::validate(&too_many).is_err());
     }
 
     fn scopes(paths: &[&str]) -> Vec<String> {

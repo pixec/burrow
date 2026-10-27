@@ -393,7 +393,7 @@ impl ObjectStore {
 
 #[cfg(target_os = "linux")]
 fn data_extents(file: &std::fs::File, _apparent: u64) -> std::io::Result<Vec<(u64, u64)>> {
-    burrow_vmm::data_extents(file)
+    burrow_firecracker::data_extents(file)
 }
 
 /// Without SEEK_DATA the whole file is one extent, which is correct and dense.

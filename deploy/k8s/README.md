@@ -49,9 +49,10 @@ tooling versions cannot drift between what you test on and what you ship.
 To build one yourself, stage the binaries where `release` expects them:
 
 ```sh
-cargo xtask build --target x86_64-unknown-linux-musl
+cargo zigbuild --release --target x86_64-unknown-linux-musl \
+  -p burrow-orchestrator -p burrow-daemon -p burrow-cli -p burrow-guest
 mkdir -p dist/amd64
-cp target/x86_64-unknown-linux-musl/release/{burrow-orchestrator,burrowd,burrow-agent} dist/amd64/
+cp target/x86_64-unknown-linux-musl/release/{burrow-orchestrator,burrowd,burrow-guest} dist/amd64/
 
 docker buildx build --platform linux/amd64 --load \
   -f deploy/orchestrator.Dockerfile -t <registry>/burrow-orchestrator:latest .

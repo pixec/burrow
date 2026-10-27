@@ -3,8 +3,8 @@
 A Burrow sandbox outlives the VM that runs it. Suspending captures the guest's
 memory and disks and stops the VM; resuming boots a fresh Firecracker VM from
 that state, and the processes inside carry on where they were. The sandbox id,
-its name, its network lease, published ports and policy all survive the gap, so a
-suspend and a resume is a pause rather than a restart.
+its name, its network lease, published ports and policy all survive the
+suspension, so a suspend and a resume is a pause rather than a restart.
 
 Every command below takes the sandbox's name in place of its id.
 
@@ -18,6 +18,9 @@ volumes accumulate data across environments.
 | --- | --- | --- | --- |
 | Suspend | `burrow stop <id>` | `PauseSandbox` | Snapshot written, VM stopped, state `suspended` |
 | Resume | `burrow start <id>` | `ResumeSandbox` | Snapshot restored into a new VM, processes continue |
+| Shutdown | `burrow shutdown <id>` | `StopSandbox` | VM stopped, writable disk and volumes kept, state `stopped` |
+| Boot | `burrow boot <id>` | `StartSandbox` | New VM cold-booted on the kept disk, init runs again |
+| Recreate | `burrow recreate <id>` | `RecreateSandbox` | Root disk replaced from the template, id and volumes kept |
 | Snapshot | `burrow commit <id>` | `CreateSnapshot` | State kept as an object of its own, VM still running |
 | Fork | `burrow fork <id>` | `ForkSandbox` | New sandbox restored from a copy of that state |
 
@@ -25,6 +28,12 @@ volumes accumulate data across environments.
 burrow stop <id>
 burrow start <id>
 ```
+
+A shutdown is what `docker stop` does: processes end and nothing in memory
+survives, so a boot runs the image's init again, and a Kit template's startup
+hooks with it. A suspend keeps the processes. Choose shutdown when the guest
+should start clean on the data it has written, and suspend when it should carry
+on where it was.
 
 Two suspends happen without you asking. `idle_suspend_secs` in `ResourcePolicy`
 (`--idle-suspend-secs`, `0` to disable) parks a sandbox after that many idle
@@ -116,7 +125,7 @@ burrow fork <source-id> --name worker-a
   replaced by the default deny.
 - **Resources cannot be overridden.** Firecracker takes a restored VM's machine
   configuration from the snapshot, so a fork asking for different vcpus, memory
-  or scratch disk is refused rather than quietly given the source's shape.
+  or scratch disk is refused rather than silently given the source's shape.
 - Filesystem and memory start as copies and nothing is shared afterwards, so both
   sides can diverge freely. The memory chain is copied whole rather than
   flattened, because the restore path reads a chain anyway.
@@ -175,7 +184,7 @@ burrow snapshot rm snap_c53d56f0c90c44979070dd02e95801df
 ```
 
 `burrow snapshot create` is the same command as `burrow commit`. Unlike
-`docker commit` it captures the live machine, not just a filesystem layer: the
+`docker commit` it captures the live machine rather than a filesystem layer: the
 sandbox keeps running, the guest is paused only for the write, and the disk is
 copied alongside the memory. That copy is what makes a snapshot a restore point
 where a bare memory write is not.

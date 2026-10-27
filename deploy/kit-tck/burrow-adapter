@@ -102,12 +102,14 @@ kit_reference() {
 	printf '%s/%s:%s\n' "$pull_prefix" "$stem" "$hash"
 }
 
-# Composed templates are 3 GiB or more each. One with no sandbox left on it
-# is finished with, whichever verb last touched it.
+# Every template this adapter pulled is 3 GiB or more of rootfs plus a warm
+# snapshot, a workload on its own as much as a composition. One with no
+# sandbox left on it is finished with, whichever verb last touched it.
 sweep_templates() {
 	local used
+	[ -f "$state/templates" ] || return 0
 	used="$("$burrow" ps -a 2>/dev/null | awk 'NR > 1 {print $5}')"
-	"$burrow" images 2>/dev/null | awk 'NR > 1 && $1 ~ /^kit-/ {print $1}' | while read -r template; do
+	sort -u "$state/templates" | while read -r template; do
 		grep -qx "$template" <<<"$used" || "$burrow" templates rm "$template" >/dev/null 2>&1 || true
 	done
 }
@@ -115,7 +117,10 @@ sweep_templates() {
 # Composes a kit set into a template and prints its name. A refusal here is
 # the set's, and the suite expects it from create.
 pull_set() {
-	run_burrow pull "$@" | sed -n 's/.* as template \([^ ]*\) .*/\1/p' | tail -1
+	local template
+	template="$(run_burrow pull "$@" | sed -n 's/.* as template \([^ ]*\) .*/\1/p' | tail -1)"
+	[ -z "$template" ] || printf '%s\n' "$template" >>"$state/templates"
+	printf '%s\n' "$template"
 }
 
 bind_credential() {
@@ -280,13 +285,7 @@ rm)
 	template="$("$burrow" inspect --json "$1" | python3 -c 'import json,sys; print(json.load(sys.stdin)["template"])')"
 	run_burrow remove "$1" >/dev/null
 	rm -f "$state/$1.selection-policy"
-	case "$template" in
-	kit-*)
-		if ! "$burrow" ps -a 2>/dev/null | awk 'NR > 1 {print $5}' | grep -qx "$template"; then
-			"$burrow" templates rm "$template" >/dev/null 2>&1 || true
-		fi
-		;;
-	esac
+	sweep_templates
 	;;
 
 volume-paths)

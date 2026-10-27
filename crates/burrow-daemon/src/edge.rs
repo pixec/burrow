@@ -17,7 +17,7 @@
 //! what chose the sandbox; see [`relay`].
 //!
 //! Reading the head, validating it and rewriting it so a guest sees the real
-//! client belong to [`burrow_core::edge`], whose tests check that faithfulness.
+//! client belong to [`burrow_common::edge`], whose tests check that faithfulness.
 
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -25,7 +25,7 @@ use std::sync::Arc;
 use tokio::io::AsyncWriteExt;
 use tokio::net::{TcpListener, TcpStream};
 
-use burrow_core::edge::{Cidr, Exchange, Routed, Target, read_response_head, respond, route};
+use burrow_common::edge::{Cidr, Exchange, Routed, Target, read_response_head, respond, route};
 use burrow_proto::common::v1 as common;
 
 use crate::sandbox::SandboxManager;

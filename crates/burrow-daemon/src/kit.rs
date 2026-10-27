@@ -16,8 +16,8 @@ use std::fmt;
 use std::path::{Path, PathBuf};
 
 use burrow_kit::{HookPhase, Phase};
-use burrow_proto::agent::v1 as agentpb;
 use burrow_proto::common::v1 as common;
+use burrow_proto::guest::v1 as guestpb;
 use serde::{Deserialize, Serialize};
 use tonic::Status;
 
@@ -646,8 +646,8 @@ fn lifecycle_exec(
     env: HashMap<String, String>,
     cwd: String,
     user: &str,
-) -> agentpb::ExecStart {
-    agentpb::ExecStart {
+) -> guestpb::ExecStart {
+    guestpb::ExecStart {
         cmd,
         env,
         cwd,
@@ -692,12 +692,12 @@ async fn run_hook(
     };
     let start = lifecycle_exec(hook.argv.clone(), env, cwd, &hook.user);
     if hook.is_background {
-        crate::agentconn::spawn_detached(sandbox, start)
+        crate::guestconn::spawn_detached(sandbox, start)
             .await
             .map_err(in_context)?;
         return Ok(());
     }
-    let outcome = crate::agentconn::run_to_completion(sandbox, start)
+    let outcome = crate::guestconn::run_to_completion(sandbox, start)
         .await
         .map_err(in_context)?;
     if outcome.exit_code != 0 {
@@ -729,7 +729,7 @@ async fn write_files(
             .as_deref()
             .and_then(|m| u32::from_str_radix(m, 8).ok())
             .unwrap_or(DEFAULT_FILE_MODE);
-        crate::agentconn::upload(
+        crate::guestconn::upload(
             sandbox,
             &file.path,
             file.content.as_bytes(),
@@ -767,7 +767,7 @@ async fn launch_entrypoint(
         image.working_dir.clone(),
         plan.composition.agent_user(),
     );
-    crate::agentconn::spawn_detached(sandbox, start)
+    crate::guestconn::spawn_detached(sandbox, start)
         .await
         .map(drop)
         .map_err(|e| Status::internal(format!("launching the workload: {e}")))

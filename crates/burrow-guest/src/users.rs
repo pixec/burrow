@@ -16,7 +16,7 @@ use std::process::Stdio;
 use tokio::io::AsyncReadExt;
 use tonic::Status;
 
-use burrow_proto::agent::v1 as agentpb;
+use burrow_proto::guest::v1 as guestpb;
 
 use crate::asyncfd::AsyncPipe;
 use crate::reaper;
@@ -230,7 +230,7 @@ pub fn credentials(name: &str) -> Result<Credentials, Status> {
     })
 }
 
-pub async fn create_user(name: &str) -> Result<agentpb::CreateUserResponse, Status> {
+pub async fn create_user(name: &str) -> Result<guestpb::CreateUserResponse, Status> {
     validate_name(name)?;
     if lookup_user(name).is_ok() {
         return Err(Status::already_exists(format!("user {name} exists")));
@@ -265,7 +265,7 @@ pub async fn create_user(name: &str) -> Result<agentpb::CreateUserResponse, Stat
             .map_err(|err| Status::internal(format!("chmod {}: {err}", passwd.home)))?;
     }
 
-    Ok(agentpb::CreateUserResponse {
+    Ok(guestpb::CreateUserResponse {
         username: passwd.name,
         uid: passwd.uid,
         gid: passwd.gid,
@@ -273,7 +273,7 @@ pub async fn create_user(name: &str) -> Result<agentpb::CreateUserResponse, Stat
     })
 }
 
-pub async fn create_group(name: &str) -> Result<agentpb::CreateGroupResponse, Status> {
+pub async fn create_group(name: &str) -> Result<guestpb::CreateGroupResponse, Status> {
     validate_name(name)?;
     if lookup_group(name).is_ok() {
         return Err(Status::already_exists(format!("group {name} exists")));
@@ -300,7 +300,7 @@ pub async fn create_group(name: &str) -> Result<agentpb::CreateGroupResponse, St
     std::fs::set_permissions(&shared, std::fs::Permissions::from_mode(0o2770))
         .map_err(|err| Status::internal(format!("chmod {}: {err}", shared.display())))?;
 
-    Ok(agentpb::CreateGroupResponse {
+    Ok(guestpb::CreateGroupResponse {
         groupname: name.to_string(),
         gid,
         shared_dir: shared.to_string_lossy().into_owned(),

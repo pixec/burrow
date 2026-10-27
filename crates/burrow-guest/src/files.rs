@@ -11,7 +11,7 @@ use tokio::sync::mpsc;
 use tokio_stream::StreamExt;
 use tonic::{Status, Streaming};
 
-use burrow_proto::agent::v1 as agentpb;
+use burrow_proto::guest::v1 as guestpb;
 
 /// Opens `path` like [`std::fs::File::open`]/[`std::fs::File::create`] would,
 /// except a symlink anywhere along it (not just the final component) is
@@ -160,8 +160,8 @@ fn io_status(action: &str, path: &str, err: std::io::Error) -> Status {
 /// owner and whether to leave an existing file alone; every chunk including
 /// the first may carry data.
 pub async fn upload(
-    mut inbound: Streaming<agentpb::FileChunk>,
-) -> Result<agentpb::UploadResult, Status> {
+    mut inbound: Streaming<guestpb::FileChunk>,
+) -> Result<guestpb::UploadResult, Status> {
     let mut first = inbound
         .next()
         .await
@@ -210,7 +210,7 @@ pub async fn upload(
         Err(err)
             if first.is_existing_skipped && err.kind() == std::io::ErrorKind::AlreadyExists =>
         {
-            return Ok(agentpb::UploadResult { bytes_written: 0 });
+            return Ok(guestpb::UploadResult { bytes_written: 0 });
         }
         other => other.map_err(|err| io_status("create", &path, err))?,
     };
@@ -246,7 +246,7 @@ pub async fn upload(
     .map_err(|err| Status::internal(format!("chmod did not run: {err}")))?
     .map_err(|err| io_status("chmod", &path, err))?;
 
-    Ok(agentpb::UploadResult {
+    Ok(guestpb::UploadResult {
         bytes_written: written,
     })
 }
@@ -254,7 +254,7 @@ pub async fn upload(
 /// Streams a file out of the sandbox.
 pub async fn download(
     path: String,
-) -> Result<mpsc::Receiver<Result<agentpb::FileChunk, Status>>, Status> {
+) -> Result<mpsc::Receiver<Result<guestpb::FileChunk, Status>>, Status> {
     let open_path = path.clone();
     let std_file = tokio::task::spawn_blocking(move || {
         open_no_symlinks(&open_path, OFlag::O_RDONLY, Mode::empty())
@@ -271,7 +271,7 @@ pub async fn download(
             match file.read(&mut buf).await {
                 Ok(0) => break,
                 Ok(n) => {
-                    let chunk = agentpb::FileChunk {
+                    let chunk = guestpb::FileChunk {
                         data: buf[..n].to_vec(),
                         ..Default::default()
                     };
@@ -299,7 +299,7 @@ pub async fn download(
 ///
 /// Entries are described by `lstat`, which `DirEntry::metadata` already uses,
 /// so a symlink inside the directory is reported as the link it is.
-pub async fn list_dir(path: &str) -> Result<agentpb::ListDirResponse, Status> {
+pub async fn list_dir(path: &str) -> Result<guestpb::ListDirResponse, Status> {
     let owned = path.to_string();
     let dir = tokio::task::spawn_blocking(move || open_dir_no_symlinks(&owned))
         .await
@@ -322,7 +322,7 @@ pub async fn list_dir(path: &str) -> Result<agentpb::ListDirResponse, Status> {
             // failing the whole listing.
             Err(_) => continue,
         };
-        out.push(agentpb::DirEntry {
+        out.push(guestpb::DirEntry {
             name: entry.file_name().to_string_lossy().into_owned(),
             is_dir: meta.is_dir(),
             size: meta.len(),
@@ -333,7 +333,7 @@ pub async fn list_dir(path: &str) -> Result<agentpb::ListDirResponse, Status> {
     // Held until here: the listing above is only of the checked directory for
     // as long as this descriptor is open.
     drop(dir);
-    Ok(agentpb::ListDirResponse { entries: out })
+    Ok(guestpb::ListDirResponse { entries: out })
 }
 
 /// Watches a directory for changes.
@@ -348,7 +348,7 @@ pub async fn watch(
     path: String,
     recursive: bool,
     interval: std::time::Duration,
-) -> Result<mpsc::Receiver<Result<agentpb::WatchEvent, Status>>, Status> {
+) -> Result<mpsc::Receiver<Result<guestpb::WatchEvent, Status>>, Status> {
     // Opened rather than `try_exists`, which follows symlinks: a watch on
     // `/work/peek -> /` would otherwise scan the whole guest and stream every
     // change in it out to the caller.
@@ -378,7 +378,7 @@ pub async fn watch(
                     Some(_) => continue,
                 };
                 if tx
-                    .send(Ok(agentpb::WatchEvent {
+                    .send(Ok(guestpb::WatchEvent {
                         r#type: event.into(),
                         path: entry.clone(),
                         is_dir: meta.is_dir,
@@ -392,7 +392,7 @@ pub async fn watch(
             for (entry, meta) in &previous {
                 if !current.contains_key(entry)
                     && tx
-                        .send(Ok(agentpb::WatchEvent {
+                        .send(Ok(guestpb::WatchEvent {
                             r#type: "deleted".into(),
                             path: entry.clone(),
                             is_dir: meta.is_dir,

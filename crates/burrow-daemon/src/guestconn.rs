@@ -10,8 +10,8 @@ use hyper_util::rt::TokioIo;
 use tonic::transport::{Channel, Endpoint, Uri};
 use tower::service_fn;
 
-use burrow_proto::agent::v1 as agentpb;
-use burrow_proto::agent::v1::agent_client::AgentClient;
+use burrow_proto::guest::v1 as guestpb;
+use burrow_proto::guest::v1::guest_client::GuestClient;
 use tokio_stream::StreamExt;
 use tonic::Status;
 
@@ -32,7 +32,7 @@ pub const AGENT_PORT: u32 = 1024;
 pub async fn connect(
     uds_path: PathBuf,
     timeout: std::time::Duration,
-) -> anyhow::Result<AgentClient<Channel>> {
+) -> anyhow::Result<GuestClient<Channel>> {
     connect_timed(uds_path, timeout)
         .await
         .map(|(client, _)| client)
@@ -53,7 +53,7 @@ pub async fn connect(
 async fn connect_timed(
     uds_path: PathBuf,
     timeout: std::time::Duration,
-) -> anyhow::Result<(AgentClient<Channel>, Option<std::time::Instant>)> {
+) -> anyhow::Result<(GuestClient<Channel>, Option<std::time::Instant>)> {
     let accepted: std::sync::Arc<std::sync::Mutex<Option<std::time::Instant>>> =
         std::sync::Arc::default();
     let recorder = accepted.clone();
@@ -63,14 +63,14 @@ async fn connect_timed(
             let uds_path = uds_path.clone();
             let recorder = recorder.clone();
             async move {
-                let stream = burrow_vmm::vsock::connect(&uds_path, AGENT_PORT).await?;
+                let stream = burrow_firecracker::vsock::connect(&uds_path, AGENT_PORT).await?;
                 *recorder.lock().unwrap() = Some(std::time::Instant::now());
-                Ok::<_, burrow_vmm::VmmError>(TokioIo::new(stream))
+                Ok::<_, burrow_firecracker::VmmError>(TokioIo::new(stream))
             }
         }))
         .await?;
     let at = *accepted.lock().unwrap();
-    Ok((AgentClient::new(channel), at))
+    Ok((GuestClient::new(channel), at))
 }
 
 /// Connects as soon as the guest's agent accepts, or gives up.
@@ -81,7 +81,7 @@ async fn connect_timed(
 pub async fn connect_when_ready(
     uds_path: PathBuf,
     timeout: std::time::Duration,
-) -> anyhow::Result<(AgentClient<Channel>, Option<std::time::Instant>)> {
+) -> anyhow::Result<(GuestClient<Channel>, Option<std::time::Instant>)> {
     let deadline = std::time::Instant::now() + timeout;
     loop {
         match connect_timed(uds_path.clone(), timeout).await {
@@ -96,7 +96,7 @@ pub async fn connect_when_ready(
 }
 
 /// Fresh entropy and the host clock, for the guest to apply on handshake.
-pub fn handshake_request(restored: bool) -> burrow_proto::agent::v1::HandshakeRequest {
+pub fn handshake_request(restored: bool) -> burrow_proto::guest::v1::HandshakeRequest {
     handshake_with_network(restored, None)
 }
 
@@ -107,8 +107,8 @@ pub fn handshake_request(restored: bool) -> burrow_proto::agent::v1::HandshakeRe
 /// which lease is actually its own.
 pub fn handshake_with_network(
     restored: bool,
-    network: Option<burrow_proto::agent::v1::NetworkConfig>,
-) -> burrow_proto::agent::v1::HandshakeRequest {
+    network: Option<burrow_proto::guest::v1::NetworkConfig>,
+) -> burrow_proto::guest::v1::HandshakeRequest {
     handshake_full(restored, network, String::new(), Vec::new(), Vec::new())
 }
 
@@ -120,12 +120,12 @@ pub fn handshake_with_network(
 /// into the system store either way.
 pub fn handshake_full(
     restored: bool,
-    network: Option<burrow_proto::agent::v1::NetworkConfig>,
+    network: Option<burrow_proto::guest::v1::NetworkConfig>,
     inspection_ca_pem: String,
-    extra_trust_bundles: Vec<burrow_proto::agent::v1::TrustBundle>,
-    volumes: Vec<burrow_proto::agent::v1::VolumeMount>,
-) -> burrow_proto::agent::v1::HandshakeRequest {
-    burrow_proto::agent::v1::HandshakeRequest {
+    extra_trust_bundles: Vec<burrow_proto::guest::v1::TrustBundle>,
+    volumes: Vec<burrow_proto::guest::v1::VolumeMount>,
+) -> burrow_proto::guest::v1::HandshakeRequest {
+    burrow_proto::guest::v1::HandshakeRequest {
         inspection_ca_pem,
         extra_trust_bundles,
         entropy: fresh_entropy(),
@@ -164,11 +164,11 @@ pub struct Finished {
 /// work does for Kit hooks.
 pub async fn run_to_completion(
     sandbox: &RunningSandbox,
-    start: agentpb::ExecStart,
+    start: guestpb::ExecStart,
 ) -> Result<Finished, Status> {
     let mut agent = sandbox.agent().await?;
-    let begin = agentpb::ExecInput {
-        input: Some(agentpb::exec_input::Input::Start(start)),
+    let begin = guestpb::ExecInput {
+        input: Some(guestpb::exec_input::Input::Start(start)),
     };
     let mut stream = agent
         .exec(tokio_stream::iter(vec![begin]))
@@ -180,9 +180,9 @@ pub async fn run_to_completion(
     };
     while let Some(msg) = stream.next().await {
         match msg?.output {
-            Some(agentpb::exec_output::Output::Stdout(bytes))
-            | Some(agentpb::exec_output::Output::Stderr(bytes)) => finished.output.extend(bytes),
-            Some(agentpb::exec_output::Output::ExitCode(code)) => finished.exit_code = code,
+            Some(guestpb::exec_output::Output::Stdout(bytes))
+            | Some(guestpb::exec_output::Output::Stderr(bytes)) => finished.output.extend(bytes),
+            Some(guestpb::exec_output::Output::ExitCode(code)) => finished.exit_code = code,
             _ => {}
         }
     }
@@ -194,15 +194,15 @@ pub async fn run_to_completion(
 /// is gone, which is what makes a workload's entrypoint survive this call.
 pub async fn spawn_detached(
     sandbox: &RunningSandbox,
-    start: agentpb::ExecStart,
+    start: guestpb::ExecStart,
 ) -> Result<String, Status> {
     let mut agent = sandbox.agent().await?;
-    let begin = agentpb::ExecInput {
-        input: Some(agentpb::exec_input::Input::Start(start)),
+    let begin = guestpb::ExecInput {
+        input: Some(guestpb::exec_input::Input::Start(start)),
     };
     // The sender side stays open and parked, so the agent sees no stdin EOF
     // and no hangup until this task is dropped along with the stream.
-    let (tx, rx) = tokio::sync::mpsc::channel::<agentpb::ExecInput>(1);
+    let (tx, rx) = tokio::sync::mpsc::channel::<guestpb::ExecInput>(1);
     tx.send(begin)
         .await
         .map_err(|_| Status::internal("exec stream closed"))?;
@@ -213,11 +213,11 @@ pub async fn spawn_detached(
     let mut command_id = String::new();
     while let Some(msg) = stream.next().await {
         match msg?.output {
-            Some(agentpb::exec_output::Output::CommandId(id)) => {
+            Some(guestpb::exec_output::Output::CommandId(id)) => {
                 command_id = id;
                 break;
             }
-            Some(agentpb::exec_output::Output::ExitCode(code)) => {
+            Some(guestpb::exec_output::Output::ExitCode(code)) => {
                 return Err(Status::internal(format!(
                     "command exited with status {code} before it was registered"
                 )));
@@ -242,7 +242,7 @@ pub async fn upload(
     skip_existing: bool,
 ) -> Result<(), Status> {
     let mut agent = sandbox.agent().await?;
-    let first = agentpb::FileChunk {
+    let first = guestpb::FileChunk {
         path: path.to_string(),
         mode,
         data: content.to_vec(),

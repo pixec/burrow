@@ -78,23 +78,23 @@ SDK, so there is no second REST surface to drift.
 | Crate | Role |
 | --- | --- |
 | `burrow-proto` | `api` (client to orchestrator), `node` (orchestrator to burrowd), `agent` (burrowd to guest) protos |
-| `burrow-core` | Shared domain types: ids, auth, time |
-| `burrow-vmm` | Firecracker process supervision, API client, snapshots, cgroups |
+| `burrow-common` | Shared by both daemons: auth, edge wire format, policy globs, tags, telemetry, secrets vault |
+| `burrow-firecracker` | Firecracker process supervision, API client, snapshots, cgroups |
 | `burrow-net` | Address allocation, tap devices, nftables policy, mesh |
 | `burrow-proxy` | Transparent egress proxy, domain allowlisting, DNS, egress audit |
 | `burrow-store` | SQLite persistence |
 | `tailcat-rs` | Tailcat server: WireGuard through a DERP relay with NAT traversal, terminated in a userspace TCP/UDP stack |
-| `burrow-agent` | Guest binary: runs as PID 1, serves gRPC over vsock |
+| `burrow-guest` | Guest binary: runs as PID 1, serves gRPC over vsock |
 | `burrow-orchestrator` | Control plane binary |
 | `burrow-daemon` | `burrowd` node binary |
 | `burrow-cli` | `burrow` CLI |
 
-`burrow-proto` is used by everything. `burrow-vmm`, `burrow-net`,
+`burrow-proto` is used by everything. `burrow-firecracker`, `burrow-net`,
 `burrow-proxy` and `burrow-store` are used only by `burrowd`.
 
-`burrow-agent` is Linux only: vsock, mount syscalls, netlink. It is excluded
+`burrow-guest` is Linux only: vsock, mount syscalls, netlink. It is excluded
 from the workspace's `default-members` so a bare `cargo build` still works on
-macOS, and `cargo xtask build` compiles it for the guest target.
+macOS, and the zigbuild invocation names it explicitly for the guest target.
 
 ## The create path
 
@@ -505,7 +505,7 @@ the traffic rides the mesh.
 One interaction is easy to miss. In `allowlist` mode every guest packet to
 80/443 is redirected into the egress proxy, which decides by *domain*, so a peer
 on port 80 would be denied for not being on the allowlist and private networks
-would quietly stop working for any sandbox that also had an egress policy. Peer
+would stop working for any sandbox that also had an egress policy. Peer
 addresses are therefore accepted in `prerouting` ahead of the redirect rule,
 since nftables takes the first terminating verdict.
 
@@ -768,7 +768,10 @@ placed like any sandbox among the nodes whose architecture and Firecracker
 version match what the manifest records; the chosen node fetches it on the
 first create. Every node lists what the store holds when it registers, so a
 restarted orchestrator re-learns durable snapshots from any node that can
-reach the bucket, not only from the one that took them. Deleting a snapshot
+reach the bucket, not only from the one that took them. A node that finished
+an upload and died before its next heartbeat never reported it, so before the
+orchestrator declares a holderless snapshot stranded it asks one healthy node
+what the store holds and adopts the answer. Deleting a snapshot
 removes it from the store too, and the delete goes to whichever compatible
 node is up when the holder is not.
 
@@ -787,18 +790,28 @@ stateDiagram-v2
     CREATING --> FAILED: boot or agent failure
     RUNNING --> SUSPENDED: pause · drain w/ suspend · SIGTERM
     SUSPENDED --> RUNNING: resume (150-250ms)
+    RUNNING --> STOPPED: shutdown
+    STOPPED --> RUNNING: boot (cold)
     RUNNING --> DESTROYED: delete
     SUSPENDED --> DESTROYED: delete
+    STOPPED --> DESTROYED: delete
     FAILED --> [*]
     DESTROYED --> [*]
 ```
 
+`suspended` and `stopped` differ in what the next VM starts from. A suspend
+writes the guest's memory and a resume restores it, so processes continue. A
+shutdown keeps only the writable disk and volumes, and a boot runs the image's
+init again on them, which for a Kit template means its startup hooks and
+entrypoint run again. Both keep the sandbox's id, name, address and ports.
+
 A restart is a pause and a resume. On `SIGTERM` the node snapshots every running
 sandbox. On startup it reattaches, reserving address leases before anything else
 can allocate, recreating taps, re-rendering the firewall, then garbage
-collecting directories with no record. A sandbox that was running when the
-daemon *died* has no snapshot and is unrecoverable, so its resources are
-released rather than leaked.
+collecting directories with no record, a template rootfs an import was still
+writing when the daemon died, and staged layer trees nobody has used for a week.
+A sandbox that was running when the daemon *died* has no snapshot and is
+unrecoverable, so its resources are released rather than leaked.
 
 `idle_suspend_secs`, `max_lifetime_secs` and `suspended_ttl_secs` are enforced
 on the node by a sweep every ten seconds. The two outcomes are deliberately
@@ -874,7 +887,7 @@ flowchart LR
     man --> cfg["config<br/>Env · WorkingDir"]
     man --> blobs[("layer blobs<br/>content-addressed")]
     blobs --> stage["staging dir<br/>layers applied in order<br/>whiteouts honoured"]
-    agent["burrow-agent"] --> stage
+    agent["burrow-guest"] --> stage
     stage --> mkfs["mkfs.ext4 -d"] --> tmpl["template rootfs.ext4"]
     cfg --> meta["image.json"]
 ```
@@ -889,7 +902,13 @@ or a setuid binary is a security bug, not a cosmetic one.
 **Layers are already content-addressed**, by the same SHA-256 the blob store
 uses. So a layer is fetched once across every image that shares it, and is
 verified against its digest on arrival by the same code that verifies a template
-pulled from a peer.
+pulled from a peer. Unpacking is cached too: every prefix of an image's layer
+list leaves its tree under `build/staged`, keyed by the layer digests, and the
+next import starts from the longest prefix it finds as a hardlink farm and
+unpacks only the layers after it. Hardlinks are safe because a layer never
+writes through an existing file: an entry is unlinked before it is replaced and
+a whiteout unlinks it outright, so the shared inodes are never modified. A tree
+unused for a week is removed.
 
 **The agent is installed as init.** An OCI image has no init, and a VM booted
 without one panics. The conversion adds the agent and the mount points a
@@ -1048,7 +1067,7 @@ A create carrying labels is only ever placed on a node carrying every one of
 them, matched as whole pairs. When no healthy node does, the create fails with
 `failed_precondition` naming the labels nothing satisfies, and never lands
 somewhere else. That is the whole point: a workload asked for on particular
-hardware and quietly placed elsewhere is worse than one that was refused.
+hardware and placed elsewhere without a word is worse than one that was refused.
 
 What it is good for:
 
@@ -1332,16 +1351,19 @@ See the [README](../README.md#quickstart) for first-time setup. The everyday
 loop is build and up:
 
 ```sh
-cargo xtask build      # cross-compiles to aarch64-unknown-linux-musl
+cargo zigbuild --release --target aarch64-unknown-linux-musl \
+  -p burrow-orchestrator -p burrow-daemon -p burrow-cli -p burrow-guest
 docker --context colima-burrow compose -f deploy/dev/compose.yaml up -d --build
 ```
 
-`cargo xtask build` output is mounted at `/burrow/bin` in the containers, so
+The build output is mounted at `/burrow/bin` in the containers, so
 rebuilt binaries are picked up by the next `docker exec` without recreating
 anything. Long-running services still need a restart to pick up a new build.
 
-Production nodes are x86_64. `cargo xtask deploy --host <ssh-host>` builds for
-`x86_64-unknown-linux-musl` and rsyncs. Snapshots are per node, so mixed
+Production nodes are x86_64: build with `--target x86_64-unknown-linux-musl`
+and rsync `burrow-orchestrator`, `burrowd` and `burrow` from
+`target/x86_64-unknown-linux-musl/release/` to `/usr/local/bin` on the host.
+Snapshots are per node, so mixed
 architectures across the fleet are fine.
 
 To run the same two components on Kubernetes, the orchestrator as a StatefulSet
@@ -1353,7 +1375,7 @@ sandbox is a microVM `burrowd` places itself, and `kubectl` cannot see one.
 
 Both SDKs ship their own copies of the `.proto` files, because they are
 published separately and cannot reach into this workspace; the TypeScript one
-loads them at runtime. Copies drift, and these did, so `cargo xtask protos`
+loads them at runtime. Copies drift, and these did, so `scripts/sync-protos.sh`
 writes them and a test in `burrow-proto` fails if a proto changes without it.
 
 The Python SDK also commits the code generated from its copies, so installing it
@@ -1366,7 +1388,7 @@ push and pull request, alongside `cargo fmt --check`, `cargo clippy --workspace
 --all-targets -D warnings` and `cargo test --workspace`:
 
 ```sh
-cargo xtask protos --check                       # the .proto copies in both SDKs
+scripts/sync-protos.sh --check                   # the .proto copies in both SDKs
 python sdk/python/scripts/genproto.py --check    # the generated Python modules
 ```
 

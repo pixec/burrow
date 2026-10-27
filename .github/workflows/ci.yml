@@ -37,7 +37,7 @@ jobs:
       - name: Format
         run: cargo fmt --all --check
 
-      # burrow-agent is excluded from default-members (it is Linux-only), but
+      # burrow-guest is excluded from default-members (it is Linux-only), but
       # this runner is Linux, so --workspace covers it.
       - name: Clippy
         run: cargo clippy --workspace --all-targets -- -D warnings
@@ -48,7 +48,7 @@ jobs:
       # The SDKs carry their own copies of the .proto files, since they are
       # published and cannot reach into this workspace.
       - name: SDK protos are in sync
-        run: cargo xtask protos --check
+        run: scripts/sync-protos.sh --check
 
   # The Python SDK additionally commits code generated from its proto copies,
   # so there are two ways to drift: the copies, checked above, and the

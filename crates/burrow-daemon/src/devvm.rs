@@ -2,14 +2,14 @@
 //!
 //! Boots microVMs from local images, times how long they take to reach
 //! userspace, and tears them down. The real lifecycle, driven by the
-//! orchestrator over the node API, reuses `burrow_vmm` the same way.
+//! orchestrator over the node API, reuses `burrow_firecracker` the same way.
 
 use std::path::PathBuf;
 use std::time::Duration;
 
 use clap::Args;
 
-use burrow_vmm::{DriveSpec, MicroVm, MicroVmSpec, SnapshotType};
+use burrow_firecracker::{DriveSpec, MicroVm, MicroVmSpec, SnapshotType};
 
 #[derive(Args, Clone)]
 pub struct VmBootArgs {
@@ -53,7 +53,7 @@ impl VmBootArgs {
         // Squashfs and ext4 roots both come up on /dev/vda as the first drive.
         spec.boot_args = format!(
             "{} root=/dev/vda ro {}",
-            burrow_vmm::DEFAULT_BOOT_ARGS,
+            burrow_firecracker::DEFAULT_BOOT_ARGS,
             self.extra_boot_args
         );
         spec
@@ -134,8 +134,8 @@ pub async fn agent_boot(args: VmBootArgs) -> anyhow::Result<()> {
     spec.drives = vec![DriveSpec::root_ro(&args.rootfs)];
     spec.is_vsock_enabled = true;
     spec.boot_args = format!(
-        "{} root=/dev/vda ro init=/usr/bin/burrow-agent {}",
-        burrow_vmm::DEFAULT_BOOT_ARGS,
+        "{} root=/dev/vda ro init=/usr/bin/burrow-guest {}",
+        burrow_firecracker::DEFAULT_BOOT_ARGS,
         args.extra_boot_args
     );
 
@@ -144,7 +144,7 @@ pub async fn agent_boot(args: VmBootArgs) -> anyhow::Result<()> {
 
     let ready = match vm
         .wait_for_vsock(
-            crate::agentconn::AGENT_PORT,
+            crate::guestconn::AGENT_PORT,
             Duration::from_secs(args.timeout),
         )
         .await
@@ -159,13 +159,13 @@ pub async fn agent_boot(args: VmBootArgs) -> anyhow::Result<()> {
     };
 
     let mut client =
-        crate::agentconn::connect(vm.vsock_uds_path(), Duration::from_secs(args.timeout)).await?;
+        crate::guestconn::connect(vm.vsock_uds_path(), Duration::from_secs(args.timeout)).await?;
     let handshake = client
-        .handshake(crate::agentconn::handshake_request(false))
+        .handshake(crate::guestconn::handshake_request(false))
         .await?
         .into_inner();
     client
-        .health(burrow_proto::agent::v1::AgentHealthRequest {})
+        .health(burrow_proto::guest::v1::GuestHealthRequest {})
         .await?;
 
     println!("vmm start:        {}ms", vm.boot_latency().as_millis());
@@ -184,9 +184,9 @@ pub async fn agent_boot(args: VmBootArgs) -> anyhow::Result<()> {
 pub async fn agent_exec(args: VmBootArgs, cmd: Vec<String>) -> anyhow::Result<()> {
     let vm = boot_agent_vm(&args, "exectest").await?;
     let mut client =
-        crate::agentconn::connect(vm.vsock_uds_path(), Duration::from_secs(args.timeout)).await?;
+        crate::guestconn::connect(vm.vsock_uds_path(), Duration::from_secs(args.timeout)).await?;
     client
-        .handshake(crate::agentconn::handshake_request(false))
+        .handshake(crate::guestconn::handshake_request(false))
         .await?;
 
     let code = exec_capture(&mut client, &cmd, |line| print!("{line}")).await?;
@@ -202,14 +202,14 @@ async fn boot_agent_vm(args: &VmBootArgs, id: &str) -> anyhow::Result<MicroVm> {
     let mut spec = args.spec(id);
     spec.is_vsock_enabled = true;
     spec.boot_args = format!(
-        "{} root=/dev/vda ro init=/usr/bin/burrow-agent {}",
-        burrow_vmm::DEFAULT_BOOT_ARGS,
+        "{} root=/dev/vda ro init=/usr/bin/burrow-guest {}",
+        burrow_firecracker::DEFAULT_BOOT_ARGS,
         args.extra_boot_args
     );
     let vm = MicroVm::boot(spec).await?;
     if let Err(err) = vm
         .wait_for_vsock(
-            crate::agentconn::AGENT_PORT,
+            crate::guestconn::AGENT_PORT,
             Duration::from_secs(args.timeout),
         )
         .await
@@ -224,15 +224,15 @@ async fn boot_agent_vm(args: &VmBootArgs, id: &str) -> anyhow::Result<MicroVm> {
 /// Drives one Exec stream to completion, handing each output chunk to `sink`,
 /// and returns the exit code.
 async fn exec_capture(
-    client: &mut burrow_proto::agent::v1::agent_client::AgentClient<tonic::transport::Channel>,
+    client: &mut burrow_proto::guest::v1::guest_client::GuestClient<tonic::transport::Channel>,
     cmd: &[String],
     mut sink: impl FnMut(&str),
 ) -> anyhow::Result<i32> {
-    use burrow_proto::agent::v1 as agentpb;
+    use burrow_proto::guest::v1 as guestpb;
     use tokio_stream::StreamExt;
 
-    let start = agentpb::ExecInput {
-        input: Some(agentpb::exec_input::Input::Start(agentpb::ExecStart {
+    let start = guestpb::ExecInput {
+        input: Some(guestpb::exec_input::Input::Start(guestpb::ExecStart {
             cmd: cmd.to_vec(),
             env: Default::default(),
             cwd: String::new(),
@@ -252,14 +252,14 @@ async fn exec_capture(
     let mut code = 0;
     while let Some(msg) = stream.next().await {
         match msg?.output {
-            Some(agentpb::exec_output::Output::Stdout(b))
-            | Some(agentpb::exec_output::Output::Stderr(b)) => {
+            Some(guestpb::exec_output::Output::Stdout(b))
+            | Some(guestpb::exec_output::Output::Stderr(b)) => {
                 sink(&String::from_utf8_lossy(&b));
             }
-            Some(agentpb::exec_output::Output::ExitCode(c)) => code = c,
+            Some(guestpb::exec_output::Output::ExitCode(c)) => code = c,
             // The id is for coming back to a command later; this one is
             // collected here and now.
-            Some(agentpb::exec_output::Output::CommandId(_)) | None => {}
+            Some(guestpb::exec_output::Output::CommandId(_)) | None => {}
         }
     }
     Ok(code)
@@ -277,9 +277,9 @@ const RNG_PROBE: &str = "head -c 16 /dev/urandom | od -An -tx1 | tr -d ' \\n'";
 pub async fn clone_divergence(args: VmBootArgs) -> anyhow::Result<()> {
     let base = boot_agent_vm(&args, "clonebase").await?;
     let mut client =
-        crate::agentconn::connect(base.vsock_uds_path(), Duration::from_secs(args.timeout)).await?;
+        crate::guestconn::connect(base.vsock_uds_path(), Duration::from_secs(args.timeout)).await?;
     client
-        .handshake(crate::agentconn::handshake_request(false))
+        .handshake(crate::guestconn::handshake_request(false))
         .await?;
     base.pause().await?;
     base.snapshot(SnapshotType::Full).await?;
@@ -288,7 +288,7 @@ pub async fn clone_divergence(args: VmBootArgs) -> anyhow::Result<()> {
 
     // Warm snapshots are restored by many sandboxes from one memory file, so
     // the file must come back unmodified after being restored from.
-    let mem_path = args.workdir.join(burrow_vmm::SNAPSHOT_MEM_FILE);
+    let mem_path = args.workdir.join(burrow_firecracker::SNAPSHOT_MEM_FILE);
     let mem_before = file_digest(&mem_path).await?;
 
     let mut before = Vec::new();
@@ -303,13 +303,13 @@ pub async fn clone_divergence(args: VmBootArgs) -> anyhow::Result<()> {
         spec.is_vsock_enabled = true;
         let vm = MicroVm::restore(spec, true).await?;
         vm.wait_for_vsock(
-            crate::agentconn::AGENT_PORT,
+            crate::guestconn::AGENT_PORT,
             Duration::from_secs(args.timeout),
         )
         .await?;
 
         let mut client =
-            crate::agentconn::connect(vm.vsock_uds_path(), Duration::from_secs(args.timeout))
+            crate::guestconn::connect(vm.vsock_uds_path(), Duration::from_secs(args.timeout))
                 .await?;
 
         // Before the handshake the clone still carries the snapshot's RNG.
@@ -317,7 +317,7 @@ pub async fn clone_divergence(args: VmBootArgs) -> anyhow::Result<()> {
         exec_capture(&mut client, &sh(RNG_PROBE), |s| pre.push_str(s)).await?;
 
         client
-            .handshake(crate::agentconn::handshake_request(true))
+            .handshake(crate::guestconn::handshake_request(true))
             .await?;
 
         let mut post = String::new();
@@ -400,8 +400,8 @@ async fn link_clone(
     }
     tokio::fs::create_dir_all(clone).await?;
     for file in [
-        burrow_vmm::SNAPSHOT_FILE,
-        burrow_vmm::SNAPSHOT_MEM_FILE,
+        burrow_firecracker::SNAPSHOT_FILE,
+        burrow_firecracker::SNAPSHOT_MEM_FILE,
         rootfs,
     ] {
         tokio::fs::hard_link(base.join(file), clone.join(file)).await?;
@@ -417,7 +417,7 @@ pub async fn boot_floor(args: VmBootArgs) -> anyhow::Result<()> {
     let mut spec = args.spec("floortest");
     spec.boot_args = format!(
         "{} root=/dev/vda ro init=/bin/sh {}",
-        burrow_vmm::DEFAULT_BOOT_ARGS,
+        burrow_firecracker::DEFAULT_BOOT_ARGS,
         args.extra_boot_args
     );
 

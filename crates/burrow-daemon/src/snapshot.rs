@@ -126,7 +126,7 @@ impl Manifest {
             size_bytes: self.size_bytes,
             expires_at: match self.expires_at {
                 0 => String::new(),
-                at => burrow_core::rfc3339_from_unix_secs(at),
+                at => burrow_common::rfc3339_from_unix_secs(at),
             },
             is_durable: self.is_durable,
             arch: self.arch.clone(),
@@ -246,7 +246,7 @@ impl SnapshotStore {
         flatten(&dir, &staged.chain).await?;
 
         let size_bytes = directory_size(&dir).await;
-        let now = burrow_core::unix_now();
+        let now = burrow_common::unix_now();
         let manifest = Manifest {
             format: MANIFEST_FORMAT,
             id: id.to_string(),
@@ -255,7 +255,7 @@ impl SnapshotStore {
             vcpus: staged.vcpus,
             mem_mib: staged.mem_mib,
             scratch_disk_mib: staged.scratch_disk_mib,
-            created_at: burrow_core::now_rfc3339(),
+            created_at: burrow_common::now_rfc3339(),
             created_unix_ms: unix_now_ms(),
             size_bytes,
             expires_at: match expiration_secs {
@@ -321,13 +321,13 @@ impl SnapshotStore {
         }
         remote
             .put_file(
-                &remote_key(id, burrow_vmm::SNAPSHOT_FILE),
-                &dir.join(burrow_vmm::SNAPSHOT_FILE),
+                &remote_key(id, burrow_firecracker::SNAPSHOT_FILE),
+                &dir.join(burrow_firecracker::SNAPSHOT_FILE),
             )
             .await?;
         // The memory image and the scratch disk are sparse, and go as their
         // data extents rather than as the apparent size of zeros.
-        for file in [burrow_vmm::SNAPSHOT_MEM_FILE, SCRATCH_IMAGE] {
+        for file in [burrow_firecracker::SNAPSHOT_MEM_FILE, SCRATCH_IMAGE] {
             remote
                 .put_sparse_file(&remote_key(id, file), &dir.join(file))
                 .await?;
@@ -446,7 +446,7 @@ impl SnapshotStore {
                 "snapshot {id} is missing {file} in the object store"
             ))
         };
-        let file = burrow_vmm::SNAPSHOT_FILE;
+        let file = burrow_firecracker::SNAPSHOT_FILE;
         if remote
             .get_to_file(&remote_key(id, file), &dir.join(file))
             .await?
@@ -454,7 +454,7 @@ impl SnapshotStore {
         {
             return Err(missing(file));
         }
-        for file in [burrow_vmm::SNAPSHOT_MEM_FILE, SCRATCH_IMAGE] {
+        for file in [burrow_firecracker::SNAPSHOT_MEM_FILE, SCRATCH_IMAGE] {
             if remote
                 .get_sparse_file(&remote_key(id, file), &dir.join(file))
                 .await?
@@ -585,10 +585,10 @@ impl SnapshotStore {
             is_remote = true;
             // Manifest first, so a fetch racing this sees nothing rather than
             // a manifest naming files that are going.
-            for file in [MANIFEST, burrow_vmm::SNAPSHOT_FILE] {
+            for file in [MANIFEST, burrow_firecracker::SNAPSHOT_FILE] {
                 remote.delete(&remote_key(id, file)).await?;
             }
-            for file in [burrow_vmm::SNAPSHOT_MEM_FILE, SCRATCH_IMAGE] {
+            for file in [burrow_firecracker::SNAPSHOT_MEM_FILE, SCRATCH_IMAGE] {
                 remote
                     .delete(&crate::objstore::sparse_key(&remote_key(id, file)))
                     .await?;
@@ -631,18 +631,18 @@ impl SnapshotStore {
         // Copied, not linked: the sandbox writes its own over it on its first
         // suspend, and a shared inode would have that land in the snapshot.
         tokio::fs::copy(
-            dir.join(burrow_vmm::SNAPSHOT_FILE),
-            dest.join(burrow_vmm::SNAPSHOT_FILE),
+            dir.join(burrow_firecracker::SNAPSHOT_FILE),
+            dest.join(burrow_firecracker::SNAPSHOT_FILE),
         )
         .await
-        .map_err(|err| io(burrow_vmm::SNAPSHOT_FILE, err))?;
+        .map_err(|err| io(burrow_firecracker::SNAPSHOT_FILE, err))?;
 
-        for file in [SCRATCH_IMAGE, burrow_vmm::SNAPSHOT_MEM_FILE] {
+        for file in [SCRATCH_IMAGE, burrow_firecracker::SNAPSHOT_MEM_FILE] {
             crate::warm::copy_sparse(&dir.join(file), &dest.join(file))
                 .await
                 .map_err(|err| io(file, err))?;
         }
-        Ok(vec![burrow_vmm::SNAPSHOT_MEM_FILE.to_string()])
+        Ok(vec![burrow_firecracker::SNAPSHOT_MEM_FILE.to_string()])
     }
 
     /// Re-arms a snapshot's TTL, because it was just used.
@@ -656,7 +656,7 @@ impl SnapshotStore {
         if manifest.expiration_secs == 0 {
             return;
         }
-        manifest.expires_at = burrow_core::unix_now() + manifest.expiration_secs as i64;
+        manifest.expires_at = burrow_common::unix_now() + manifest.expiration_secs as i64;
         if let Err(err) = write_manifest(&self.dir(id), &manifest).await {
             tracing::warn!(snapshot = id, %err, "could not refresh a snapshot's expiry");
         }
@@ -711,7 +711,7 @@ impl SnapshotStore {
 
     /// Deletes snapshots whose TTL has run out, returning their ids.
     pub async fn sweep_expired(&self) -> Vec<String> {
-        let now = burrow_core::unix_now();
+        let now = burrow_common::unix_now();
         let mut swept = Vec::new();
         for snapshot in self.list(None).await {
             let Ok(manifest) = self.manifest(&snapshot.id).await else {
@@ -839,7 +839,7 @@ async fn flatten(dir: &Path, chain: &[String]) -> Result<(), Status> {
             "sandbox has no state to snapshot",
         ));
     }
-    let target = dir.join(burrow_vmm::SNAPSHOT_MEM_FILE);
+    let target = dir.join(burrow_firecracker::SNAPSHOT_MEM_FILE);
     if chain.len() > 1 {
         let paths: Vec<PathBuf> = chain.iter().map(|name| dir.join(name)).collect();
         let target = target.clone();
@@ -862,7 +862,7 @@ async fn flatten(dir: &Path, chain: &[String]) -> Result<(), Status> {
 
 #[cfg(target_os = "linux")]
 fn merge_chain(paths: &[PathBuf], target: &Path) -> std::io::Result<()> {
-    burrow_vmm::merge_chain(paths, target)
+    burrow_firecracker::merge_chain(paths, target)
 }
 
 #[cfg(not(target_os = "linux"))]
@@ -952,7 +952,7 @@ mod tests {
             mem_mib: 1024,
             scratch_disk_mib: 2048,
             created_at: created_at.into(),
-            created_unix_ms: burrow_core::unix_from_rfc3339(created_at).unwrap_or(0) * 1_000,
+            created_unix_ms: burrow_common::unix_from_rfc3339(created_at).unwrap_or(0) * 1_000,
             size_bytes: 12_345,
             expires_at: 0,
             expiration_secs: 0,
@@ -969,7 +969,7 @@ mod tests {
         let dir = std::env::temp_dir().join(format!(
             "burrow-snapshots-{}-{}",
             std::process::id(),
-            burrow_core::SnapshotId::generate()
+            burrow_common::SnapshotId::generate()
         ));
         (SnapshotStore::new(&dir, None, String::new()), dir)
     }
@@ -1015,7 +1015,7 @@ mod tests {
     /// of its own is refused rather than sanitised.
     #[test]
     fn only_a_generated_snapshot_id_is_accepted() {
-        assert!(validate_id(&burrow_core::SnapshotId::generate().to_string()).is_ok());
+        assert!(validate_id(&burrow_common::SnapshotId::generate().to_string()).is_ok());
         for bad in [
             "",
             "snap_",
@@ -1115,7 +1115,7 @@ mod tests {
     #[tokio::test]
     async fn only_snapshots_past_their_expiry_are_swept() {
         let (store, root) = store();
-        let now = burrow_core::unix_now();
+        let now = burrow_common::unix_now();
         seed(
             &store,
             &[

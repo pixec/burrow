@@ -359,9 +359,9 @@ message DrainNodeRequest {
   string node_id = 1;
   // False lifts a drain.
   bool is_draining = 2;
-  // Suspend the node's sandboxes as part of draining, so they can be resumed
-  // elsewhere once template distribution exists.
-  bool is_suspending_sandboxes = 3;
+  // Also suspend every sandbox the node is running, so the drain leaves
+  // nothing live on it.
+  bool suspend_sandboxes = 3;
 }
 
 message DrainNodeResponse {

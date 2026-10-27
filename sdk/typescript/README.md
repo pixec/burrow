@@ -77,6 +77,7 @@ const sandbox = await Sandbox.create({
 | `alias` | sandbox id | Name this sandbox answers to on those networks |
 | `exec` | everything allowed | Whether callers may run commands in the sandbox |
 | `fs` | everything allowed | What callers may do to the sandbox's filesystem |
+| `kit` | none | Inputs for a template pulled from a [Sandbox Kit](../../docs/TEMPLATES.md#sandbox-kits): `args`, `env` and `rejectCapabilities`. Ignored on any other template |
 | `autoResume` | `true` | Resume and retry once when a call finds the sandbox stopped |
 | `timeoutMs` | `120000` | How long to wait for the boot |
 | `signal` | none | `AbortSignal` that cancels the call |
@@ -535,7 +536,7 @@ the destination's parent directories unless you pass
 const path = await sandbox.downloadFile("/work/report.pdf", "./out/report.pdf");
 ```
 
-List directories and create them.
+List directories, create them, and move or remove what is in them.
 
 ```ts
 for (const entry of await sandbox.listDir("/work")) {
@@ -543,12 +544,41 @@ for (const entry of await sandbox.listDir("/work")) {
 }
 
 await sandbox.mkDir("/work/src/components");
+await sandbox.rename("/work/draft.md", "/work/final.md");
+await sandbox.remove("/work/tmp");
 ```
 
-`sandbox.fs` groups the common ones for SDKs that namespace them, with
-`listDir` spelled `readDir` there: `readFile`, `readFileToBuffer`, `writeFile`,
-`writeFiles`, `readDir`, `mkDir`. Messages are capped at 64 MiB in both
-directions, which is the ceiling on a single file transfer.
+`mkDir`, `rename` and `remove` run `mkdir -p`, `mv` and `rm -rf` in the
+sandbox, since there is no RPC for them, so each costs one exec and fails the
+way a command does.
+
+Ask about one path with `stat`, which returns `null` for a path that is not
+there, or `exists`. Both list the parent directory, so they respect the
+sandbox's file policy and cost no exec.
+
+```ts
+const info = await sandbox.stat("/work/app.py"); // { path, name, type, isDir, size, mode } | null
+await sandbox.exists("/work/app.py");           // true
+```
+
+`sandbox.fs` is the same thing under the `node:fs/promises` names and shapes,
+so code written against the real module reads the same here: `readFile`,
+`writeFile`, `readdir`, `mkdir`, `rm`, `rename` and `stat`. As in Node,
+`fs.stat` on a missing path throws `not_found`, and `fs.rm` refuses a directory
+without `{ recursive: true }` and a missing path without `{ force: true }`.
+Watching has no `fs/promises` counterpart, so it stays `sandbox.watch`.
+
+```ts
+await sandbox.fs.writeFile("/work/app.py", "print('hi')\n");
+const names = await sandbox.fs.readdir("/work");
+await sandbox.fs.rm("/work/tmp", { recursive: true, force: true });
+```
+
+Commands and terminals are grouped too: `sandbox.commands` has `run`, `stream`,
+`list`, `connect` and `kill`, and `sandbox.pty.create()` is `sandbox.terminal`.
+
+Messages are capped at 64 MiB in both directions, which is the ceiling on a
+single file transfer.
 
 ### Watch for changes
 
@@ -660,7 +690,7 @@ Give a domain a list of rules to have several. They are evaluated in order and
 the first match wins, so a rule with no `match` shadows everything after it for
 that domain: write the narrow ones first.
 
-Rules are validated before anything is sent, because a rule that was quietly
+Rules are validated before anything is sent, because a rule that was silently
 dropped would widen a credential from one path to a whole domain. All of these
 throw `invalid_argument`: an unknown key on a rule or a matcher, `transform` and
 `forwardURL` on the same rule, a `match` with neither action, a rule naming a
@@ -746,7 +776,7 @@ await Sandbox.create({
 | `allowCidrs` | Extra destinations permitted at the IP layer |
 | `allowPorts` | Destination ports permitted |
 | `denyCidrs` | Ranges the sandbox may never reach, in any mode |
-| `inspectTls` | Terminate the sandbox's TLS so the host inside the session is checked, not just the SNI |
+| `inspectTls` | Terminate the sandbox's TLS so the host inside the session is checked as well as the SNI |
 | `rules` | What the host does to the requests it inspects, in order |
 | `injectHeaders` | Credentials the host attaches on the sandbox's behalf, appended after `rules` |
 
@@ -905,7 +935,7 @@ published port. Only that node can answer the hostname, so a sandbox that ends
 up on a node without an edge has no `edgeUrl` at all and `domain` falls back to
 the bare `host:port` of the node.
 
-## Stop, resume, and fork
+## Stop, resume, shut down, and fork
 
 `stop` snapshots the sandbox, memory and processes and filesystem, and shuts its
 VM down. `resume` restores it from that snapshot rather than booting, and
@@ -943,10 +973,32 @@ the source's name, because a name belongs to one sandbox. It cannot be reshaped
 either: a restored VM takes its vcpus and memory from the snapshot, so a fork
 asking for a different shape is refused.
 
+`shutdown` is what `docker stop` does. The VM stops and nothing in memory
+survives, but the writable disk and volumes stay, and `boot` runs the image's
+init again on them. For a sandbox created from a Sandbox Kit that is the stop
+and start the Kit spec describes, and its startup hooks run again. A boot takes
+as long as a create, since there is no memory to restore.
+
+```ts
+await sandbox.shutdown();
+await sandbox.boot();
+```
+
+`recreate` replaces the root disk, discarding everything written to it, while
+the sandbox keeps its id, name, address and volumes. Pass `template` to move it
+onto another template, and `kit` to change the recorded Kit inputs.
+
+```ts
+await sandbox.recreate();
+await sandbox.recreate({ template: "kit-9a8b7c6d5e4f3a2b", kit: { args: { team: "beta" } } });
+```
+
 | Method | What happens to the VM | Can you resume it |
 |---|---|---|
 | `snapshot()` | Briefly paused, then keeps running | Already running |
-| `stop()` / `pause()` | Snapshotted, then shut down | Yes, with `resume()` |
+| `stop()` / `pause()` | Snapshotted, then shut down | Yes, with `resume()`, memory intact |
+| `shutdown()` | Shut down, disks kept | Yes, with `boot()`, which runs init again |
+| `recreate()` | Replaced by a fresh one on a new root disk | Already running |
 | `delete()` | Destroyed, disk released | No |
 
 There is no `checkpoint()`. Burrow can write a running guest's memory without
@@ -1089,7 +1141,7 @@ await snapshot.delete();
 A sandbox created from a snapshot restores rather than boots, so it arrives with
 the processes and memory the source had. It takes its template and machine shape
 from the snapshot, so passing a `template` or `resources` that disagree is
-refused rather than quietly ignored.
+refused rather than silently ignored.
 
 Snapshots are node-local, because one encodes host cpu features and the exact
 Firecracker version. A create from a snapshot is placed on the node holding it.
@@ -1214,6 +1266,19 @@ burrow.close();
 `burrow.health()` checks the orchestrator is answering, and a `Burrow` also
 works with `using` for scope-bound cleanup.
 
+### Secrets
+
+Sandbox Kits ask for credentials by service name. A `Burrow` stores them. The
+value stays on the node and is injected into matching requests by the egress
+proxy, so a guest never holds it. See
+[Credentials brokering](../../docs/FIREWALL.md#credentials-brokering).
+
+```ts
+await burrow.setSecret("github", process.env.GITHUB_TOKEN);
+await burrow.listSecrets(); // ["github"], values are never returned
+await burrow.deleteSecret("github");
+```
+
 ## Choose where a sandbox runs
 
 Burrow is self-hosted, so there are no regions to pick from. What there is
@@ -1314,7 +1379,7 @@ await sandbox.refresh();
 sandbox.id;            // "sbx_b4929ded..."
 sandbox.name;          // "build-482", or the id when it was never named
 sandbox.status;        // "pending" | "running" | "stopping" | "stopped" | "failed"
-sandbox.state;         // the full state, including "suspended" and "paused"
+sandbox.state;         // the full state, including "suspended", "paused" and "stopped"
 sandbox.template;      // also `image`
 sandbox.tags;
 sandbox.vcpus;
@@ -1330,7 +1395,7 @@ sandbox.usage;         // { cpuUsageUsec, rxBytes, txBytes }
 |---|---|
 | `id` | Assigned by the orchestrator, `sbx_` and a uuid |
 | `name` | The name it was created with, falling back to `id` when it has none |
-| `status` | The five-state view. `suspended`, `paused` and `destroyed` all read as `stopped`, and a state this client does not recognise reads as `failed` |
+| `status` | The five-state view. `suspended`, `paused`, `stopped` and `destroyed` all read as `stopped`, and a state this client does not recognise reads as `failed` |
 | `state` | Burrow's own state, when the difference matters |
 | `template`, `image` | The same string |
 | `tags`, `metadata` | The same map |
@@ -1346,7 +1411,7 @@ sandbox.usage;         // { cpuUsageUsec, rxBytes, txBytes }
 |---|---|
 | `Sandbox.create` | `CreateSandbox` |
 | `Sandbox.getOrCreate` | `GetSandbox`, then `CreateSandbox` |
-| `Sandbox.get`, `sandbox.refresh` | `GetSandbox` |
+| `Sandbox.get`, `sandbox.refresh`, `getInfo`, `isRunning` | `GetSandbox` |
 | `Sandbox.list` | `ListSandboxes` |
 | `Sandbox.fork`, `sandbox.fork` | `ForkSandbox` |
 | `sandbox.runCommand`, `exec`, `execStream`, `terminal`, `asUser` | `Exec` |
@@ -1359,23 +1424,35 @@ sandbox.usage;         // { cpuUsageUsec, rxBytes, txBytes }
 | `sandbox.readFile`, `readFileToBuffer`, `readFileBytes`, `downloadFile` | `DownloadFile` |
 | `sandbox.listDir` | `ListDir` |
 | `sandbox.mkDir` | `Exec`, running `mkdir -p` |
+| `sandbox.remove`, `rename` | `Exec`, running `rm -rf` and `mv` |
+| `sandbox.stat`, `exists` | `ListDir` on the parent |
 | `sandbox.watch` | `Watch` |
 | `sandbox.exposePort`, `listPorts`, `closePort`, `domain` | `ExposePort`, `ListPorts`, `ClosePort` |
 | `sandbox.update`, `updateTags` | `UpdateTags` |
 | `sandbox.update`, `updateNetworkPolicy` | `UpdateNetworkPolicy` |
-| `sandbox.update`, `updateResources`, `extendTimeout` | `UpdateResources` |
+| `sandbox.update`, `updateResources`, `extendTimeout`, `setTimeout` | `UpdateResources` |
 | `sandbox.update`, `updateAccessPolicy` | `UpdateAccessPolicy` |
 | `sandbox.listSessions`, `currentSession` | `ListSessions` |
 | `sandbox.stop`, `pause` | `PauseSandbox` |
 | `sandbox.resume` | `ResumeSandbox` |
+| `sandbox.shutdown` | `StopSandbox` |
+| `sandbox.boot` | `StartSandbox` |
+| `sandbox.recreate` | `RecreateSandbox` |
 | `sandbox.delete`, `kill` | `DeleteSandbox` |
 | `sandbox.snapshot`, `Snapshot.list`, `get`, `delete` | `CreateSnapshot`, `ListSnapshots`, `GetSnapshot`, `DeleteSnapshot` |
 | `Template.build`, `list`, `delete` | `BuildTemplate`, `ListTemplates`, `DeleteTemplate` |
 | `burrow.audit` | `QueryAudit` |
 | `burrow.nodes`, `drainNode` | `ListNodes`, `DrainNode` |
+| `burrow.setSecret`, `listSecrets`, `deleteSecret` | `SetSecret`, `ListSecrets`, `DeleteSecret` |
 | `burrow.health` | `Health` |
 
 ## Migrating from earlier versions
+
+`sandbox.files` is gone. It was a third spelling of the file methods, beside
+the top-level ones and `sandbox.fs`. Use the top-level methods, or `sandbox.fs`
+for the `node:fs/promises` names: `files.read` is `readFile`, `files.write` is
+`writeFile`, `files.list` is `listDir` or `fs.readdir`, `files.mkdir` is
+`mkDir`.
 
 `sandbox.checkpoint()` is gone. Memory written without the disk is not a restore
 point, and the guest keeps writing to its disk the moment it resumes, so the two

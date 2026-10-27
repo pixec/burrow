@@ -19,8 +19,8 @@ use std::sync::{Arc, Mutex, OnceLock};
 use tokio::sync::{broadcast, mpsc};
 use tonic::Status;
 
-use burrow_proto::agent::v1 as agentpb;
-use burrow_proto::agent::v1::exec_output::Output;
+use burrow_proto::guest::v1 as guestpb;
+use burrow_proto::guest::v1::exec_output::Output;
 
 /// Output retained per command for a later attach.
 const RING_BYTES: usize = 256 * 1024;
@@ -69,8 +69,8 @@ struct Entry {
 }
 
 impl Entry {
-    fn info(&self) -> agentpb::CommandInfo {
-        agentpb::CommandInfo {
+    fn info(&self) -> guestpb::CommandInfo {
+        guestpb::CommandInfo {
             command_id: self.id.clone(),
             cmd: self.cmd.clone(),
             user: self.user.clone(),
@@ -206,9 +206,9 @@ fn entry(id: &str) -> Result<Arc<Mutex<Entry>>, Status> {
         .ok_or_else(|| Status::not_found(format!("no such command: {id}")))
 }
 
-pub fn list() -> agentpb::ListCommandsResponse {
+pub fn list() -> guestpb::ListCommandsResponse {
     let registry = registry().lock().unwrap();
-    agentpb::ListCommandsResponse {
+    guestpb::ListCommandsResponse {
         commands: registry
             .order
             .iter()
@@ -218,7 +218,7 @@ pub fn list() -> agentpb::ListCommandsResponse {
     }
 }
 
-pub fn get(id: &str) -> Result<agentpb::CommandInfo, Status> {
+pub fn get(id: &str) -> Result<guestpb::CommandInfo, Status> {
     Ok(entry(id)?.lock().unwrap().info())
 }
 
@@ -248,7 +248,7 @@ pub fn signal(id: &str, signal: i32) -> Result<(), Status> {
 /// produced between the two is delivered once by the broadcast rather than
 /// missed. A command that has already exited replays its buffer, which ends
 /// with its exit status, and the stream then closes.
-pub fn attach(id: &str) -> Result<mpsc::Receiver<Result<agentpb::ExecOutput, Status>>, Status> {
+pub fn attach(id: &str) -> Result<mpsc::Receiver<Result<guestpb::ExecOutput, Status>>, Status> {
     let entry = entry(id)?;
     let (replay, mut live, finished) = {
         let entry = entry.lock().unwrap();
@@ -289,8 +289,8 @@ pub fn attach(id: &str) -> Result<mpsc::Receiver<Result<agentpb::ExecOutput, Sta
     Ok(rx)
 }
 
-fn wrap(frame: Frame) -> agentpb::ExecOutput {
-    agentpb::ExecOutput {
+fn wrap(frame: Frame) -> guestpb::ExecOutput {
+    guestpb::ExecOutput {
         output: Some(frame.output()),
     }
 }

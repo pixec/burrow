@@ -39,6 +39,13 @@ impl SnapshotRegistry {
         self.snapshots.lock().unwrap().get(id).cloned()
     }
 
+    /// Marks a snapshot already recorded as also being in the object store.
+    pub fn mark_durable(&self, id: &str) {
+        if let Some(snapshot) = self.snapshots.lock().unwrap().get_mut(id) {
+            snapshot.is_durable = true;
+        }
+    }
+
     /// Records snapshots a node found in the object store, without a holder.
     ///
     /// A snapshot a node already lists keeps its node: the local copy is the

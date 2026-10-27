@@ -569,6 +569,6 @@ burrow port <id>
 burrow unexpose <id> <host-port>
 ```
 
-Published ports are reachable only from genuinely external traffic, never from
+Published ports are reachable only from external traffic, never from
 other sandboxes or mesh peers, and host ports are constrained to the
 operator-configured range.

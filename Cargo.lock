@@ -700,25 +700,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "72f5acc6cb2ba439de613abc23857ec3d78374d8ed5ac84e9d11336e87da8649"
 
 [[package]]
-name = "burrow-agent"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "async-stream",
- "burrow-proto",
- "futures",
- "netlink-packet-route",
- "nix 0.31.3",
- "rtnetlink",
- "tokio",
- "tokio-stream",
- "tokio-vsock",
- "tonic 0.13.1",
- "tracing",
- "tracing-subscriber",
-]
-
-[[package]]
 name = "burrow-cli"
 version = "0.1.0"
 dependencies = [
@@ -733,7 +714,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "burrow-core"
+name = "burrow-common"
 version = "0.1.0"
 dependencies = [
  "base64",
@@ -761,13 +742,13 @@ dependencies = [
  "aws-smithy-async",
  "aws-smithy-http-client",
  "base64",
- "burrow-core",
+ "burrow-common",
+ "burrow-firecracker",
  "burrow-kit",
  "burrow-net",
  "burrow-proto",
  "burrow-proxy",
  "burrow-store",
- "burrow-vmm",
  "bytes",
  "clap",
  "flate2",
@@ -795,10 +776,47 @@ dependencies = [
 ]
 
 [[package]]
+name = "burrow-firecracker"
+version = "0.1.0"
+dependencies = [
+ "bytes",
+ "http-body-util",
+ "hyper",
+ "hyper-util",
+ "libc",
+ "nix 0.31.3",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.20",
+ "tokio",
+ "tracing",
+ "userfaultfd",
+]
+
+[[package]]
+name = "burrow-guest"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "async-stream",
+ "burrow-proto",
+ "futures",
+ "netlink-packet-route",
+ "nix 0.31.3",
+ "rtnetlink",
+ "tokio",
+ "tokio-stream",
+ "tokio-vsock",
+ "tonic 0.13.1",
+ "tracing",
+ "tracing-subscriber",
+]
+
+[[package]]
 name = "burrow-kit"
 version = "0.1.0"
 dependencies = [
- "burrow-core",
+ "burrow-common",
  "regex",
  "serde",
  "serde_json",
@@ -824,7 +842,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "async-stream",
- "burrow-core",
+ "burrow-common",
  "burrow-kit",
  "burrow-net",
  "burrow-proto",
@@ -854,7 +872,7 @@ dependencies = [
 name = "burrow-proxy"
 version = "0.1.0"
 dependencies = [
- "burrow-core",
+ "burrow-common",
  "burrow-store",
  "bytes",
  "h2",
@@ -886,24 +904,6 @@ dependencies = [
  "thiserror 2.0.20",
  "tokio",
  "tracing",
-]
-
-[[package]]
-name = "burrow-vmm"
-version = "0.1.0"
-dependencies = [
- "bytes",
- "http-body-util",
- "hyper",
- "hyper-util",
- "libc",
- "nix 0.31.3",
- "serde",
- "serde_json",
- "thiserror 2.0.20",
- "tokio",
- "tracing",
- "userfaultfd",
 ]
 
 [[package]]
@@ -4363,14 +4363,6 @@ name = "xmlparser"
 version = "0.13.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "66fee0b777b0f5ac1c69bb06d361268faafa61cd4682ae064a171c16c433e9e4"
-
-[[package]]
-name = "xtask"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "clap",
-]
 
 [[package]]
 name = "yasna"

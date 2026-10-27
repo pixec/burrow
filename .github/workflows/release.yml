@@ -23,7 +23,7 @@ env:
 
 jobs:
   # Both targets are cross-compiled from the x86 runner with cargo-zigbuild,
-  # which is what `cargo xtask build` already uses locally. The C dependencies
+  # which is what the docs use locally too. The C dependencies
   # (rusqlite's bundled sqlite, ring, userfaultfd) need a musl toolchain for
   # the *target*, which plain musl-tools only provides for the host.
   build:
@@ -92,14 +92,14 @@ jobs:
           sed -i "0,/^version = \"[^\"]*\"/s//version = \"$v\"/" Cargo.toml
           grep -m1 '^version' Cargo.toml
 
-      # Same invocation `cargo xtask build` wraps, spelled out here: the wrapper
-      # only adds `rustup target add`, which the step above already did.
-      # burrow-agent is the guest init rather than a host binary, but the node
+      # Same invocation as docs/GETTING-STARTED.md, minus `rustup target add`,
+      # which the step above already did.
+      # burrow-guest is the guest init rather than a host binary, but the node
       # copies it into every template it builds, so it is built too.
       - name: Build
         run: |
           cargo zigbuild --release --target ${{ matrix.target }} \
-            -p burrow-orchestrator -p burrow-daemon -p burrow-cli -p burrow-agent
+            -p burrow-orchestrator -p burrow-daemon -p burrow-cli -p burrow-guest
 
       # Two layouts of the same four binaries: dist/<docker-arch>/ is what the
       # Dockerfiles COPY from, and release/ is what people download.
@@ -108,7 +108,7 @@ jobs:
           set -eu
           out=target/${{ matrix.target }}/release
           mkdir -p dist/${{ matrix.docker_arch }} release
-          for bin in burrow-orchestrator burrowd burrow burrow-agent; do
+          for bin in burrow-orchestrator burrowd burrow burrow-guest; do
             cp "$out/$bin" "dist/${{ matrix.docker_arch }}/$bin"
             cp "$out/$bin" "release/$bin-${{ matrix.arch }}-${{ steps.version.outputs.version }}"
           done

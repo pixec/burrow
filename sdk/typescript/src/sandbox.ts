@@ -28,6 +28,7 @@ import type {
   DetachedCommand,
   DirEntry,
   DownloadFileOptions,
+  FileInfo,
   FileRef,
   FileWrite,
   FinishedCommand,
@@ -37,10 +38,12 @@ import type {
   GetOrCreateOptions,
   GuestGroup,
   GuestUser,
+  KitOptions,
   ListOptions,
   NodeInfo,
   OutputChunk,
   PortMapping,
+  RecreateOptions,
   Share,
   ShareOptions,
   RunCommandOptions,
@@ -109,6 +112,7 @@ function stateOf(state: string | number | undefined): SandboxState {
     "running",
     "paused",
     "suspended",
+    "stopped",
     "stopping",
     "destroyed",
     "failed",
@@ -154,6 +158,16 @@ function toCreateRequest(options: CreateOptions): any {
     },
     metadata: options.tags ?? options.metadata ?? {},
     nodeLabels: options.nodeLabels ?? {},
+    kit: toKitSpec(options.kit),
+  };
+}
+
+/** Builds a `KitSpec`. Absent inputs are sent empty, which the node reads as none. */
+function toKitSpec(kit: KitOptions | undefined): any {
+  return {
+    args: kit?.args ?? {},
+    env: kit?.env ?? {},
+    rejectTypes: [...(kit?.rejectCapabilities ?? [])],
   };
 }
 
@@ -166,9 +180,10 @@ function statusOf(state: SandboxState): SandboxStatus {
       return "running";
     case "stopping":
       return "stopping";
-    // All three are "not going to run anything until something is done".
+    // All four are "not going to run anything until something is done".
     case "paused":
     case "suspended":
+    case "stopped":
     case "destroyed":
       return "stopped";
     // `failed`, and any state a newer server reports that this client has no
@@ -563,6 +578,30 @@ export class Sandbox {
   }
 
   /** Re-reads the sandbox's current state from the server. */
+  /** The id, under the name other sandbox SDKs give it. */
+  get sandboxId(): string {
+    return this.id;
+  }
+
+  /** Re-reads the record. Alias of {@link refresh}. */
+  getInfo(options: { signal?: AbortSignal } = {}): Promise<SandboxInfo> {
+    return this.refresh(options);
+  }
+
+  /** Whether the sandbox is running right now, after a fresh read. */
+  async isRunning(options: { signal?: AbortSignal } = {}): Promise<boolean> {
+    const info = await this.refresh(options);
+    return info.state === "running";
+  }
+
+  /**
+   * Sets the sandbox's total lifetime, in milliseconds from when it was
+   * created. Alias of {@link extendTimeout}, under the name other SDKs use.
+   */
+  setTimeout(ms: number, options: { signal?: AbortSignal } = {}): Promise<SandboxInfo> {
+    return this.extendTimeout(ms, options);
+  }
+
   async refresh(options: { signal?: AbortSignal } = {}): Promise<SandboxInfo> {
     this.assertLive();
     const raw = await this.transport.unary<any, any>(
@@ -1075,12 +1114,26 @@ export class Sandbox {
     return handle;
   }
 
-  /** Alias of {@link exec}, for parity with SDKs that group commands. */
-  get commands(): { run: Sandbox["exec"]; stream: Sandbox["execStream"] } {
+  /**
+   * Command helpers grouped, for parity with SDKs that namespace them:
+   * `run`, `stream`, `list`, `connect` (reattach by id) and `kill`.
+   */
+  get commands() {
     return {
       run: this.exec.bind(this),
       stream: this.execStream.bind(this),
+      list: this.listCommands.bind(this),
+      connect: this.getCommand.bind(this),
+      kill: async (cmdId: string, signal = 9): Promise<void> => {
+        const command = await this.getCommand(cmdId);
+        await command.killed(signal);
+      },
     };
+  }
+
+  /** The terminal under the name other SDKs give it: `sandbox.pty.create()`. */
+  get pty() {
+    return { create: this.terminal.bind(this) };
   }
 
   /**
@@ -1323,26 +1376,85 @@ export class Sandbox {
     return this.mkDir(path, options);
   }
 
-  /** File helpers grouped, for parity with SDKs that namespace them. */
+  /**
+   * Removes a file or directory tree. Like {@link mkDir} this runs a command
+   * (`rm -rf`) in the sandbox, since there is no remove RPC, and a missing
+   * path is not an error.
+   */
+  async remove(path: string): Promise<void> {
+    const res = await this.exec(`rm -rf ${shellQuote(path)}`);
+    if (!res.success) {
+      throw new BurrowError(`rm ${path} failed: ${res.stderr.trim()}`, "internal");
+    }
+  }
+
+  /** Renames or moves a file or directory, by running `mv` in the sandbox. */
+  async rename(from: string, to: string): Promise<void> {
+    const res = await this.exec(`mv ${shellQuote(from)} ${shellQuote(to)}`);
+    if (!res.success) {
+      throw new BurrowError(`mv ${from} ${to} failed: ${res.stderr.trim()}`, "internal");
+    }
+  }
+
+  /**
+   * Describes one path, or returns `null` when nothing is there. Lists the
+   * parent directory over the `ListDir` RPC, so it respects the sandbox's
+   * file policy and costs no exec.
+   */
+  async stat(path: string, options: { signal?: AbortSignal } = {}): Promise<FileInfo | null> {
+    const trimmed = path.replace(/\/+$/, "") || "/";
+    if (trimmed === "/") {
+      return { path: "/", name: "/", isDir: true, size: 0, mode: 0o755, type: "dir" };
+    }
+    const slash = trimmed.lastIndexOf("/");
+    const parent = slash <= 0 ? "/" : trimmed.slice(0, slash);
+    const name = trimmed.slice(slash + 1);
+    let entries: DirEntry[];
+    try {
+      entries = await this.listDir(parent, options);
+    } catch (err) {
+      if (err instanceof BurrowError && err.code === "not_found") return null;
+      throw err;
+    }
+    const entry = entries.find((e) => e.name === name);
+    if (!entry) return null;
+    return { ...entry, path: trimmed, type: entry.isDir ? "dir" : "file" };
+  }
+
+  /** Whether a path exists. See {@link stat}. */
+  async exists(path: string, options: { signal?: AbortSignal } = {}): Promise<boolean> {
+    return (await this.stat(path, options)) !== null;
+  }
+
+  /**
+   * The file methods under the `node:fs/promises` names and shapes, so code
+   * written against the real module reads the same here: `readFile`,
+   * `writeFile`, `readdir`, `mkdir`, `rm`, `rename` and `stat`. As in Node,
+   * `stat` on a missing path throws (`not_found`) and `rm` refuses a directory
+   * without `recursive` and a missing path without `force`.
+   */
   get fs() {
     return {
       readFile: this.readFile.bind(this) as Sandbox["readFile"],
-      readFileToBuffer: this.readFileToBuffer.bind(this),
       writeFile: this.writeFile.bind(this),
-      writeFiles: this.writeFiles.bind(this),
-      readDir: this.listDir.bind(this),
-      mkDir: this.mkDir.bind(this),
-    };
-  }
-
-  /** The same helpers under the names earlier versions used. */
-  get files() {
-    return {
-      read: this.readFile.bind(this) as Sandbox["readFile"],
-      readBytes: this.readFileBytes.bind(this),
-      write: this.writeFile.bind(this),
-      list: this.listDir.bind(this),
+      readdir: this.listDir.bind(this),
       mkdir: this.mkDir.bind(this),
+      rm: async (
+        path: string,
+        options: { recursive?: boolean; force?: boolean } = {},
+      ): Promise<void> => {
+        const flags = `${options.recursive ? "r" : ""}${options.force ? "f" : ""}`;
+        const res = await this.exec(`rm ${flags ? `-${flags} ` : ""}${shellQuote(path)}`);
+        if (!res.success) {
+          throw new BurrowError(`rm ${path} failed: ${res.stderr.trim()}`, "internal");
+        }
+      },
+      rename: this.rename.bind(this),
+      stat: async (path: string, options: { signal?: AbortSignal } = {}): Promise<FileInfo> => {
+        const info = await this.stat(path, options);
+        if (!info) throw new BurrowError(`no such file or directory: ${path}`, "not_found");
+        return info;
+      },
     };
   }
 
@@ -1774,6 +1886,66 @@ export class Sandbox {
   }
 
   /**
+   * Shuts the VM down, keeping the writable disk and volumes. Unlike
+   * {@link stop}, nothing in memory survives: processes end, and {@link boot}
+   * runs the image's init again on the same disk. For a Sandbox Kit template
+   * that is the stop and start its spec describes, and the Kit's startup hooks
+   * run again on the way up.
+   */
+  async shutdown(options: { signal?: AbortSignal } = {}): Promise<SandboxInfo> {
+    this.assertLive();
+    const raw = await this.transport.unary<any, any>(
+      "StopSandbox",
+      { id: this.id },
+      undefined,
+      options.signal,
+    );
+    this.info = toSandboxInfo(raw);
+    return this.info;
+  }
+
+  /**
+   * Cold-boots a shut-down sandbox on its existing disks. It takes as long as a
+   * create, since there is no memory image to restore, and the sandbox keeps
+   * its id, name, address and published ports.
+   */
+  async boot(options: { signal?: AbortSignal } = {}): Promise<SandboxInfo> {
+    this.assertLive();
+    const raw = await this.transport.unary<any, any>(
+      "StartSandbox",
+      { id: this.id },
+      undefined,
+      options.signal,
+    );
+    this.info = toSandboxInfo(raw);
+    await this.onResume?.(this);
+    return this.info;
+  }
+
+  /**
+   * Replaces the root disk, discarding everything written to it, while
+   * keeping the sandbox's id, name, address and volumes. With `template` the
+   * sandbox moves onto another template; a Kit is provisioned again on the
+   * new disk with the recorded inputs, as changed by `kit`.
+   */
+  async recreate(options: RecreateOptions = {}): Promise<SandboxInfo> {
+    this.assertLive();
+    const raw = await this.transport.unary<any, any>(
+      "RecreateSandbox",
+      {
+        sandboxId: this.id,
+        template: options.template ?? "",
+        kit: toKitSpec(options.kit),
+      },
+      undefined,
+      options.signal,
+    );
+    this.info = toSandboxInfo(raw);
+    await this.onResume?.(this);
+    return this.info;
+  }
+
+  /**
    * Every VM this sandbox has run, newest first.
    *
    * A sandbox outlives its VMs: {@link stop} ends one and {@link resume}
@@ -2114,9 +2286,29 @@ export class Burrow {
     const res = await this.transport.unary<any, any>("DrainNode", {
       nodeId,
       isDraining: options.drain ?? true,
-      isSuspendingSandboxes: options.suspendSandboxes ?? false,
+      suspendSandboxes: options.suspendSandboxes ?? false,
     });
     return { suspended: Number(res.suspended ?? 0) };
+  }
+
+  /**
+   * Stores a credential that Sandbox Kits ask for by service name. The value
+   * stays on the node and is injected into matching requests by the egress
+   * proxy, so a guest never holds it. `name` is lowercase kebab-case, the
+   * `service` a Kit credential names.
+   */
+  async setSecret(name: string, value: string): Promise<void> {
+    await this.transport.unary<any, any>("SetSecret", { name, value });
+  }
+
+  /** Names of the stored secrets. Values are never returned. */
+  async listSecrets(): Promise<string[]> {
+    const res = await this.transport.unary<any, any>("ListSecrets", {});
+    return [...(res.names ?? [])];
+  }
+
+  async deleteSecret(name: string): Promise<void> {
+    await this.transport.unary<any, any>("DeleteSecret", { name });
   }
 
   async nodes(): Promise<NodeInfo[]> {

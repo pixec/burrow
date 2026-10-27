@@ -93,7 +93,7 @@ pub const CA_PATH: &str = "/etc/ssl/certs/burrow-inspection-ca.pem";
 /// there ever was to give it.
 pub fn install_inspection_ca(
     pem: &str,
-    extra: &[burrow_proto::agent::v1::TrustBundle],
+    extra: &[burrow_proto::guest::v1::TrustBundle],
 ) -> anyhow::Result<TrustTiming> {
     let mut timing = TrustTiming::default();
     if pem.trim().is_empty() {
@@ -201,21 +201,21 @@ static INSTALLED: std::sync::Mutex<Option<(String, Vec<BundleNote>)>> = std::syn
 /// The bundle list is part of it, not just the certificate: the same CA going
 /// into a template that names an extra bundle is a different job, and matching
 /// on the certificate alone would skip it.
-fn install_identity(extra: &[burrow_proto::agent::v1::TrustBundle]) -> Vec<(String, bool)> {
+fn install_identity(extra: &[burrow_proto::guest::v1::TrustBundle]) -> Vec<(String, bool)> {
     extra
         .iter()
         .map(|bundle| (bundle.path.clone(), bundle.is_created_if_missing))
         .collect()
 }
 
-fn is_installed_already(pem: &str, extra: &[burrow_proto::agent::v1::TrustBundle]) -> bool {
+fn is_installed_already(pem: &str, extra: &[burrow_proto::guest::v1::TrustBundle]) -> bool {
     INSTALLED
         .lock()
         .map(|seen| seen.as_ref() == Some(&(pem.to_string(), install_identity(extra))))
         .unwrap_or(false)
 }
 
-fn remember_installed(pem: &str, extra: &[burrow_proto::agent::v1::TrustBundle]) {
+fn remember_installed(pem: &str, extra: &[burrow_proto::guest::v1::TrustBundle]) {
     if let Ok(mut seen) = INSTALLED.lock() {
         *seen = Some((pem.to_string(), install_identity(extra)));
     }
@@ -379,7 +379,7 @@ fn write_atomically(path: &std::path::Path, contents: &[u8]) -> std::io::Result<
 /// one, and the host, which routes a distinct /30 to each tap, would have no
 /// way to deliver their traffic. The host tells each clone its real address on
 /// handshake; this applies it.
-pub async fn apply_network(config: &burrow_proto::agent::v1::NetworkConfig) -> anyhow::Result<()> {
+pub async fn apply_network(config: &burrow_proto::guest::v1::NetworkConfig) -> anyhow::Result<()> {
     if config.ip.is_empty() {
         return Ok(());
     }
@@ -457,8 +457,8 @@ mod trust_bundle_tests {
     /// inspected and has no certificate to prove it.
     #[test]
     fn the_install_note_matches_only_the_same_job() {
-        fn bundle(path: &str) -> burrow_proto::agent::v1::TrustBundle {
-            burrow_proto::agent::v1::TrustBundle {
+        fn bundle(path: &str) -> burrow_proto::guest::v1::TrustBundle {
+            burrow_proto::guest::v1::TrustBundle {
                 path: path.into(),
                 is_created_if_missing: false,
             }
@@ -482,7 +482,7 @@ mod trust_bundle_tests {
         // Down to the flag, which decides whether a missing bundle is created.
         assert!(!is_installed_already(
             PEM,
-            &[burrow_proto::agent::v1::TrustBundle {
+            &[burrow_proto::guest::v1::TrustBundle {
                 path: "/etc/ssl/one.pem".into(),
                 is_created_if_missing: true,
             }]

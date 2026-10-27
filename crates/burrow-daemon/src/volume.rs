@@ -151,7 +151,7 @@ impl VolumeStore {
         let meta = Meta {
             name: name.to_string(),
             size_mib,
-            created_at: burrow_core::now_rfc3339(),
+            created_at: burrow_common::now_rfc3339(),
             labels,
         };
         let json = serde_json::to_vec_pretty(&meta)
@@ -533,7 +533,7 @@ pub fn block_mounts(
 ///
 /// The order here must be the order the drives were attached, which is why
 /// both come from the same slice.
-pub fn agent_mounts(mounts: &[common::VolumeMount]) -> Vec<burrow_proto::agent::v1::VolumeMount> {
+pub fn agent_mounts(mounts: &[common::VolumeMount]) -> Vec<burrow_proto::guest::v1::VolumeMount> {
     let mut block = 0;
     mounts
         .iter()
@@ -544,7 +544,7 @@ pub fn agent_mounts(mounts: &[common::VolumeMount]) -> Vec<burrow_proto::agent::
                 block += 1;
                 device_for(block - 1)
             };
-            burrow_proto::agent::v1::VolumeMount {
+            burrow_proto::guest::v1::VolumeMount {
                 device,
                 path: mount.path.clone(),
                 is_read_only: mount.is_read_only,

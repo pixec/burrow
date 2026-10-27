@@ -237,9 +237,9 @@ impl ImageEnvironment {
     /// `/etc/ssl/certs`, so every inspected request from it fails verification
     /// against a CA that was installed correctly. `curlimages/curl` sets
     /// `CURL_CA_BUNDLE=/cacert.pem`.
-    pub fn trust_bundles(&self) -> Vec<burrow_proto::agent::v1::TrustBundle> {
+    pub fn trust_bundles(&self) -> Vec<burrow_proto::guest::v1::TrustBundle> {
         let map = self.as_map();
-        let mut bundles: Vec<burrow_proto::agent::v1::TrustBundle> = Vec::new();
+        let mut bundles: Vec<burrow_proto::guest::v1::TrustBundle> = Vec::new();
         for (variable, create_if_missing) in TRUST_BUNDLE_VARIABLES {
             let Some(path) = map.get(variable) else {
                 continue;
@@ -257,7 +257,7 @@ impl ImageEnvironment {
             if bundles.iter().any(|bundle| bundle.path == *path) {
                 continue;
             }
-            bundles.push(burrow_proto::agent::v1::TrustBundle {
+            bundles.push(burrow_proto::guest::v1::TrustBundle {
                 path: path.clone(),
                 is_created_if_missing: create_if_missing,
             });
@@ -980,7 +980,7 @@ fn sniff(layer: &Path) -> std::io::Result<Compression> {
     })
 }
 
-fn unpack_layer(layer: &Path, dest: &Path) -> std::io::Result<()> {
+pub(crate) fn unpack_layer(layer: &Path, dest: &Path) -> std::io::Result<()> {
     let file = std::fs::File::open(layer)?;
     match sniff(layer)? {
         Compression::Gzip => apply_entries(

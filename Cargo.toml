@@ -2,26 +2,25 @@
 resolver = "3"
 members = [
     "crates/burrow-proto",
-    "crates/burrow-core",
-    "crates/burrow-vmm",
+    "crates/burrow-common",
+    "crates/burrow-firecracker",
     "crates/burrow-net",
     "crates/burrow-proxy",
     "crates/burrow-store",
     "crates/tailcat-rs",
     "crates/burrow-kit",
-    "crates/burrow-agent",
+    "crates/burrow-guest",
     "crates/burrow-orchestrator",
     "crates/burrow-daemon",
     "crates/burrow-cli",
-    "xtask",
 ]
-# burrow-agent is a Linux-only guest binary (vsock, mount syscalls). Excluding
-# it here keeps a bare `cargo build`/`cargo clippy` working on macOS; xtask
-# builds it explicitly for the Linux target.
+# burrow-guest is a Linux-only guest binary (vsock, mount syscalls). Excluding
+# it here keeps a bare `cargo build`/`cargo clippy` working on macOS; the
+# zigbuild invocation in docs/GETTING-STARTED.md builds it for the Linux target.
 default-members = [
     "crates/burrow-proto",
-    "crates/burrow-core",
-    "crates/burrow-vmm",
+    "crates/burrow-common",
+    "crates/burrow-firecracker",
     "crates/burrow-net",
     "crates/burrow-proxy",
     "crates/burrow-store",
@@ -30,7 +29,6 @@ default-members = [
     "crates/burrow-orchestrator",
     "crates/burrow-daemon",
     "crates/burrow-cli",
-    "xtask",
 ]
 
 [workspace.package]
@@ -40,8 +38,8 @@ license = "AGPL-3.0-only"
 
 [workspace.dependencies]
 burrow-proto = { path = "crates/burrow-proto" }
-burrow-core = { path = "crates/burrow-core" }
-burrow-vmm = { path = "crates/burrow-vmm" }
+burrow-common = { path = "crates/burrow-common" }
+burrow-firecracker = { path = "crates/burrow-firecracker" }
 burrow-net = { path = "crates/burrow-net" }
 burrow-proxy = { path = "crates/burrow-proxy" }
 burrow-store = { path = "crates/burrow-store" }

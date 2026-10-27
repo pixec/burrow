@@ -298,7 +298,7 @@ impl SandboxRegistry {
             .as_ref()
             .map(|s| s.node_id.clone())
             .unwrap_or_default();
-        let at = burrow_core::unix_now();
+        let at = burrow_common::unix_now();
         self.tombstones.lock().unwrap().insert(
             id.to_string(),
             Tombstone {
@@ -342,7 +342,7 @@ impl SandboxRegistry {
     /// A node that never returns would otherwise accumulate them for the life
     /// of the cluster.
     pub fn prune_tombstones(&self, ttl_secs: i64) -> usize {
-        let cutoff = burrow_core::unix_now().saturating_sub(ttl_secs);
+        let cutoff = burrow_common::unix_now().saturating_sub(ttl_secs);
         let mut tombstones = self.tombstones.lock().unwrap();
         let expired: Vec<String> = tombstones
             .iter()

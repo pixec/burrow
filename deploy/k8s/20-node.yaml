@@ -56,8 +56,8 @@ spec:
             - $(NODE_NAME)
             - --data-dir
             - /var/lib/burrow
-            - --agent-binary
-            - /burrow/bin/burrow-agent
+            - --guest-binary
+            - /burrow/bin/burrow-guest
             # Chroot each firecracker and drop it to an unprivileged uid. Worth
             # having on wherever sandboxes share a machine with anything else.
             - --jailer

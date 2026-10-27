@@ -41,7 +41,7 @@ burrow --orchestrator https://burrow.example.com:7070 ps
 ```
 
 The api key travels in a header on every call, so `http://` to anything but
-this machine is refused rather than quietly leaking it:
+this machine is refused rather than leaking it:
 
 ```
 refusing to send the api key in plaintext to burrow.example.com: use https://,
@@ -89,8 +89,8 @@ underscore.
 | `docker stats` | [`stats`](#stats) | Totals since creation, not a live meter. |
 | `docker logs` | [`logs`](#logs) | Takes a command id as well as the sandbox. |
 | `docker kill` | [`kill`](#kill) | Signals one command, never the sandbox. |
-| `docker stop` | [`stop`](#stop) | Snapshots the VM to disk instead of killing it. |
-| `docker start` | [`start`](#start) | Restores the snapshot the stop wrote. |
+| `docker stop` | [`shutdown`](#shutdown) | Shuts the VM down and keeps its disks. [`stop`](#stop) is the other choice: it suspends the VM with its memory intact. |
+| `docker start` | [`boot`](#boot) | Cold-boots the kept disk. [`start`](#start) is the counterpart of `stop`. |
 | `docker rm` | [`remove`](#remove) | |
 | `docker commit` | [`commit`](#commit) | Saves live VM state, memory included. |
 | `docker images` | [`images`](#images) | Templates, on the nodes. |
@@ -98,6 +98,7 @@ underscore.
 | `docker rmi` | [`templates rm`](#templates-rm) | |
 | `docker cp` | [`copy`](#copy) | |
 | `docker port` | [`port`](#port) | |
+| `docker volume` | [`volume`](#volume) | Block devices on a node, not host directories. |
 | `docker version` | [`health`](#health) | |
 | `docker node ls` | [`nodes ls`](#nodes-ls) | |
 
@@ -113,8 +114,8 @@ Three deviate on purpose:
   equivalent.
 
 No Docker counterpart at all: [`fork`](#fork), [`sessions`](#sessions),
-[`expose`](#expose), [`audit`](#audit), [`user`](#user), [`group`](#group) and
-[`config`](#config).
+[`recreate`](#recreate), [`expose`](#expose), [`audit`](#audit),
+[`secret`](#secret), [`user`](#user), [`group`](#group) and [`config`](#config).
 
 ## Aliases
 
@@ -131,6 +132,9 @@ No Docker counterpart at all: [`fork`](#fork), [`sessions`](#sessions),
 | `remove` | `rm` |
 | `port` | `ports` |
 | `snapshot` | `snapshots` |
+| `volume` | `volumes` |
+| `secret ls` | `secret list` |
+| `secret rm` | `secret remove` |
 | `snapshot ls` | `snapshot list` (hidden) |
 | `snapshot rm` | `snapshot delete` (hidden) |
 | `--pty` | `--tty` |
@@ -154,13 +158,17 @@ No Docker counterpart at all: [`fork`](#fork), [`sessions`](#sessions),
 | [`group`](#group) | Create guest groups and manage membership |
 | [`copy`](#copy) | Copy a file in or out |
 | [`dir`](#dir) | List a directory inside a sandbox |
-| [`stop`](#stop) | Snapshot a sandbox and stop its VM |
-| [`start`](#start) | Restore a stopped sandbox |
+| [`stop`](#stop) | Suspend a sandbox: snapshot it and stop its VM |
+| [`start`](#start) | Resume a suspended sandbox |
+| [`shutdown`](#shutdown) | Shut a sandbox's VM down, keeping its disks |
+| [`boot`](#boot) | Cold-boot a shut-down sandbox on its disks |
 | [`sessions`](#sessions) | List the VMs a sandbox has run |
 | [`commit`](#commit) | Save a sandbox's state as a snapshot |
 | [`snapshot`](#snapshot) | List and delete snapshots |
+| [`volume`](#volume) | Storage that outlives a sandbox |
 | [`fork`](#fork) | Create a sandbox from another's state |
 | [`remove`](#remove) | Destroy sandboxes |
+| [`recreate`](#recreate) | Replace a sandbox's root disk under the same id |
 | [`config`](#config) | Read and replace a sandbox's configuration |
 | [`expose`](#expose) | Publish a guest port |
 | [`port`](#port) | List published ports |
@@ -170,6 +178,7 @@ No Docker counterpart at all: [`fork`](#fork), [`sessions`](#sessions),
 | [`images`](#images) | List templates |
 | [`pull`](#pull) | Import an OCI image as a template |
 | [`templates`](#templates) | Manage templates |
+| [`secret`](#secret) | Credentials Sandbox Kits ask for by service name |
 | [`audit`](#audit) | Show egress attempts and DNS lookups |
 | [`nodes`](#nodes) | Inspect and drain nodes |
 
@@ -219,11 +228,13 @@ burrow create --template python --name api
 | `--tag <KEY=VALUE>` | Tag to attach. Repeatable, up to 16. |
 | `-p`, `--publish <PORT>` | Guest port to publish once the sandbox exists, as [`expose`](#expose) would. The node picks the host port. Repeatable. |
 | `--node-label <KEY=VALUE>` | Only place this sandbox on a node carrying this label. Repeatable, and every one must match. |
+| `--mount <SPEC>` | Mount a [volume](#volume) as `name:/path` or `name:/path:ro`, or a tmpfs as `tmpfs:/path[:size=512m][:mode=1777]`. Repeatable. A sandbox mounting a volume is placed on the node holding it and boots cold rather than from a warm snapshot. |
 | `--network <NAME>` | Private network to join. Repeatable. |
 | `--alias <NAME>` | Name this sandbox answers to on its networks, as `<alias>.<network>.internal`. Defaults to the sandbox id. |
 | `--connect` | Open an interactive shell once the sandbox is running. |
 | `--net <MODE>` | Egress policy: `none` (default), `allowlist`, or `open`. |
 | `--allow-domain <DOMAIN>` | Domain the sandbox may reach in allowlist mode. Repeatable. |
+| `--deny-domain <DOMAIN>` | Domain the sandbox may never reach, such as `*.internal.example`. Beats every allowance in every mode: not resolved, not connected to. Repeatable. |
 | `--allow-cidr <CIDR>` | Destination permitted at L3, bypassing the egress proxy. Repeatable. |
 | `--allow-port <PORT>` | Port the `--allow-cidr` allowance is limited to. Repeatable. |
 | `--deny-cidr <CIDR>` | Range the sandbox may never reach, in any mode. Repeatable. |
@@ -235,6 +246,9 @@ burrow create --template python --name api
 | `--no-download` | Refuse downloads out of this sandbox. |
 | `--fs-scope <PATH>` | Absolute path uploads, downloads and listings are confined to. Repeatable, up to 16. |
 | `--max-upload-bytes <N>` | Largest single upload accepted. 0 (default) is unlimited. |
+| `--arg <NAME=VALUE>` | Create-phase value for a [Sandbox Kit](TEMPLATES.md#sandbox-kits) template's arg. Repeatable. |
+| `--kit-env <NAME=VALUE>` | Environment override for a Kit template's processes. Repeatable. |
+| `--reject-capability <NAME>` | Kit capability type to decline, by full name. A Kit requiring it is refused; one asking optionally does without. Repeatable. |
 
 `-p` publishes at creation, so a server is reachable as soon as it is up. The
 mapping is printed under the id:
@@ -262,6 +276,10 @@ burrow create --node-label rack=b7 --node-label tier=dedicated
 The network options are the same group [`config
 network-policy`](#config-network-policy) takes, so a policy means the same thing
 wherever you write it. See [FIREWALL.md](FIREWALL.md).
+
+The three Kit options only mean something when the template was pulled from a
+Sandbox Kit, whose descriptor says what to provision. On any other template they
+are ignored.
 
 The five access options are enforced by the node, before anything reaches the
 guest. Naming none of them leaves the sandbox able to do everything. Naming any
@@ -746,9 +764,10 @@ burrow dir sbx_2f0c /work
 
 ## stop
 
-Snapshot sandboxes to disk and stop their VMs. Aliased as `pause`. A stopped
+Snapshot sandboxes to disk and stop their VMs. Aliased as `pause`. A suspended
 sandbox keeps its disk, its memory image, and its address, and [`start`](#start)
-brings it back where it left off.
+brings it back where it left off. To stop the VM without keeping its memory, use
+[`shutdown`](#shutdown).
 
 ```
 burrow stop <ID> [ID...]
@@ -773,7 +792,7 @@ exits nonzero if any of them failed.
 
 ## start
 
-Restore a stopped sandbox from its snapshot, and report how long it took.
+Restore a suspended sandbox from its snapshot, and report how long it took.
 Aliased as `resume`.
 
 ```
@@ -788,6 +807,54 @@ burrow start sbx_2f0c
 | Argument | Description |
 | --- | --- |
 | `<ID>` | Sandbox to start. |
+
+## shutdown
+
+Shut sandboxes' VMs down, keeping their writable disks and volumes.
+
+```
+burrow shutdown <ID> [ID...]
+```
+
+```sh
+burrow shutdown sbx_2f0c
+# sbx_2f0c stopped
+```
+
+| Argument | Description |
+| --- | --- |
+| `<ID> [ID...]` | Sandboxes to shut down. |
+
+This is `docker stop`. Unlike [`stop`](#stop), nothing in memory survives: the
+processes are gone, and [`boot`](#boot) starts the image's init again on the same
+disk. Files written to the root disk and to volumes are still there. For a
+sandbox created from a [Sandbox Kit](TEMPLATES.md#sandbox-kits), a shutdown and a
+boot is the stop and start the Kit spec describes, and the Kit's startup hooks
+and entrypoint run again.
+
+Each id is attempted. A failure is reported and the rest still run, and the CLI
+exits nonzero if any of them failed.
+
+## boot
+
+Cold-boot a shut-down sandbox on its existing disks, and report how long it
+took.
+
+```
+burrow boot <ID>
+```
+
+```sh
+burrow boot sbx_2f0c
+# sbx_2f0c running in 1480ms
+```
+
+| Argument | Description |
+| --- | --- |
+| `<ID>` | Sandbox to boot. |
+
+A boot takes as long as a cold create, since there is no memory image to
+restore. The sandbox keeps its id, name, address and published ports.
 
 ## sessions
 
@@ -841,9 +908,9 @@ burrow commit build-env
 | --- | --- |
 | `--expiration-secs <SECS>` | Seconds from last use before the snapshot is swept. Falls back to the sandbox's `--snapshot-expiration-secs`, then to no expiry. |
 
-Unlike `docker commit`, this captures the live machine and not just a filesystem
-layer: memory, open files and running processes are all in the snapshot, so a
-sandbox created from it comes up where the source was rather than booting.
+Where `docker commit` saves a filesystem layer, this captures the live machine:
+memory, open files and running processes are all in the snapshot, so a sandbox
+created from it comes up where the source was rather than booting.
 
 `burrow snapshot create` is the same command under its older name, and
 [`snapshot`](#snapshot) is where you list and delete what it writes.
@@ -879,6 +946,34 @@ A sandbox created with `--snapshot` restores rather than boots, and takes its
 template and machine shape from the snapshot, so `--template`, `--vcpus` and
 `--mem-mib` may not disagree with it. Snapshots are node-local, so the sandbox is
 placed on the node holding the snapshot.
+
+## volume
+
+Block devices on a node that outlive the sandboxes mounting them. Aliased as
+`volumes`. See [VOLUMES.md](VOLUMES.md).
+
+```
+burrow volume create <NAME> [--size-mib <MIB>] [--node-label <KEY=VALUE>]
+burrow volume ls [--node <NODE>] [--json]
+burrow volume inspect <NAME>
+burrow volume rm <NAME> [NAME...]
+```
+
+```sh
+burrow volume create build-cache --size-mib 20480
+burrow create --template python --mount build-cache:/cache
+burrow volume inspect build-cache
+```
+
+| Command | Description |
+| --- | --- |
+| `volume create <NAME>` | Create a volume on one node, which is then where it lives. `--size-mib` defaults to 1024. `--node-label` picks the node, repeatable, and is the only chance to say where, since a volume never moves. |
+| `volume ls` | List volumes. `--node` restricts to one node, `--json` emits the list with labels. |
+| `volume inspect <NAME>` | Show one volume, including which sandbox holds it writable. |
+| `volume rm <NAME>...` | Delete volumes and everything stored in them. |
+
+A volume is mounted at create with [`--mount`](#create). One sandbox may hold it
+writable at a time; any number may mount it read-only.
 
 ## fork
 
@@ -940,6 +1035,41 @@ Removing a sandbox whose node has missed its heartbeats works too. The
 orchestrator cannot tell the node, so it drops the sandbox on its own word: the
 name and the capacity come back at once, and if that node ever returns still
 holding the sandbox, it is destroyed there rather than reappearing here.
+
+## recreate
+
+Replace a sandbox's root disk, discarding everything written to it, while
+keeping its id, name, address and volumes.
+
+```
+burrow recreate [OPTIONS] <ID>
+```
+
+```sh
+burrow recreate sbx_2f0c
+# sbx_2f0c running
+
+burrow recreate sbx_2f0c --template kit-9a8b7c6d5e4f3a2b --arg team=beta
+# sbx_2f0c running
+```
+
+| Argument | Description |
+| --- | --- |
+| `<ID>` | Sandbox to recreate. |
+
+| Option | Description |
+| --- | --- |
+| `--template <NAME>` | Template for the new disk. Omitted keeps the current one. |
+| `--arg <NAME=VALUE>` | Kit arg value replacing the recorded one of the same name. Repeatable. |
+| `--kit-env <NAME=VALUE>` | Kit environment override replacing the recorded one of the same name. Repeatable. |
+| `--reject-capability <NAME>` | Kit capability types to decline, replacing the recorded list. Passing none clears it. Repeatable. |
+
+Volumes stay mounted where they were, so a recreate is how you throw away a
+broken root disk without losing the data that was kept outside it. With
+`--template` the sandbox moves onto another template, which for a
+[Sandbox Kit](TEMPLATES.md#sandbox-kits) means the Kit is provisioned again on
+the new disk with the recorded args and environment, as changed by the options
+above.
 
 ## config
 
@@ -1019,7 +1149,7 @@ value already in the past destroys it on the next pass.
 
 The machine shape is not movable. A running VM's configuration is fixed and a
 restore takes it from the snapshot, so `vcpus`, memory, and scratch disk are
-refused rather than quietly ignored. To change those, create a new sandbox, or
+refused rather than silently ignored. To change those, create a new sandbox, or
 take a snapshot and create from it at the shape you want.
 
 ### config network-policy
@@ -1164,7 +1294,7 @@ When the node holding the sandbox runs an edge router, the port also answers on
 `http://<guest-port>-<sandbox-id>.<edge-domain>/`, shown first with the node
 address beside it in brackets. The node address is where the port actually is;
 the URL is the name that node's own edge answers for, and traffic arriving on it
-for a stopped sandbox wakes it.
+for a suspended sandbox wakes it.
 
 The edge lives on the node, and it is the only one: a node with none has no
 hostname routing at all, and you get the node address alone. The port still
@@ -1373,6 +1503,35 @@ burrow templates rm python
 | Argument | Description |
 | --- | --- |
 | `<NAME>` | Template to remove. |
+
+## secret
+
+Credentials that [Sandbox Kits](TEMPLATES.md#sandbox-kits) ask for by service
+name. The value stays on the node and is injected into matching requests by the
+egress proxy, so the guest never holds it. See
+[FIREWALL.md](FIREWALL.md#credentials-brokering).
+
+```
+burrow secret set <NAME> [--value <VALUE>]
+burrow secret ls
+burrow secret rm <NAME>
+```
+
+```sh
+burrow secret set github --value ghp_...
+printf '%s' "$TOKEN" | burrow secret set github
+burrow secret ls
+# github
+```
+
+| Command | Description |
+| --- | --- |
+| `secret set <NAME>` | Store a secret. `<NAME>` is lowercase kebab-case, the `service` a Kit credential names. The value comes from `--value`, else from stdin with the trailing newline removed. |
+| `secret ls` | List secret names. Values are never shown. Aliased as `list`. |
+| `secret rm <NAME>` | Delete a secret. Aliased as `remove`. |
+
+Prefer stdin on a shared machine: a value on the command line is visible in `ps`
+to every user on the host.
 
 ## audit
 

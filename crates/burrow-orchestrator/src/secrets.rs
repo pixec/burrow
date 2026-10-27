@@ -1,11 +1,11 @@
 //! Credentials Kits ask for by service name, sealed at rest by
-//! [`burrow_core::vault::Vault`] with the service name as the context.
+//! [`burrow_common::vault::Vault`] with the service name as the context.
 
 use std::path::Path;
 use std::sync::Arc;
 
 use anyhow::Context as _;
-use burrow_core::vault::Vault;
+use burrow_common::vault::Vault;
 
 pub struct Secrets {
     store: Arc<burrow_store::Store>,

@@ -1,5 +1,5 @@
 [package]
-name = "burrow-vmm"
+name = "burrow-firecracker"
 version.workspace = true
 edition.workspace = true
 license.workspace = true

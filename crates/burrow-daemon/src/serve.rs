@@ -164,8 +164,8 @@ pub struct ServeArgs {
     ///
     /// An OCI image has no init of its own, and a microVM booted without one
     /// panics, so the agent is copied in as part of the conversion.
-    #[arg(long, default_value = "/usr/local/bin/burrow-agent")]
-    pub agent_binary: PathBuf,
+    #[arg(long, default_value = "/usr/local/bin/burrow-guest")]
+    pub guest_binary: PathBuf,
     /// Kernel every guest boots.
     ///
     /// An OCI image carries a userland and no kernel, so the node supplies
@@ -258,8 +258,8 @@ pub struct ServeArgs {
 
 impl ServeArgs {
     /// How firecracker should be confined, if at all.
-    fn jail(&self) -> Option<burrow_vmm::Jail> {
-        self.jailer.as_ref().map(|jailer| burrow_vmm::Jail {
+    fn jail(&self) -> Option<burrow_firecracker::Jail> {
+        self.jailer.as_ref().map(|jailer| burrow_firecracker::Jail {
             jailer: jailer.clone(),
             uid: self.jail_uid,
             gid: self.jail_gid,
@@ -311,7 +311,7 @@ fn local_node_info(args: &ServeArgs) -> anyhow::Result<NodeInfo> {
     // Refused at startup rather than at registration: a node that came up and
     // then quietly registered without the labels it was given would be placed
     // on by nobody, and the operator would have no line saying why.
-    let labels = burrow_core::tags::parse_labels(&args.labels)
+    let labels = burrow_common::tags::parse_labels(&args.labels)
         .map_err(|err| anyhow::anyhow!("--label: {}", err.message()))?;
     Ok(NodeInfo {
         id: args.node_id.clone(),
@@ -662,7 +662,7 @@ fn spawn_audit_pruner(store: Arc<burrow_store::Store>, retention_days: u32) {
         let mut ticker = tokio::time::interval(Duration::from_secs(3600));
         loop {
             ticker.tick().await;
-            let cutoff = burrow_core::rfc3339_days_ago(retention_days as u64);
+            let cutoff = burrow_common::rfc3339_days_ago(retention_days as u64);
             match store.prune_egress(&cutoff) {
                 Ok(0) => {}
                 Ok(removed) => tracing::info!(removed, %cutoff, "pruned audit records"),
@@ -842,7 +842,7 @@ pub async fn run(args: ServeArgs) -> anyhow::Result<()> {
         .edge_trusted_proxy
         .iter()
         .map(|entry| {
-            burrow_core::edge::parse_trusted_proxy(entry).ok_or_else(|| {
+            burrow_common::edge::parse_trusted_proxy(entry).ok_or_else(|| {
                 anyhow::anyhow!("--edge-trusted-proxy {entry:?} is not an address or a CIDR")
             })
         })
@@ -934,7 +934,7 @@ pub async fn run(args: ServeArgs) -> anyhow::Result<()> {
         Arc::clone(&denied),
         Arc::clone(&directory),
         Arc::clone(&store),
-        burrow_core::vault::Vault::open(&args.data_dir.join("secrets.key"))
+        burrow_common::vault::Vault::open(&args.data_dir.join("secrets.key"))
             .map_err(|err| anyhow::anyhow!("secrets key: {err}"))?,
     );
 
@@ -1056,9 +1056,11 @@ pub async fn run(args: ServeArgs) -> anyhow::Result<()> {
     // one token is handed to everything, keeps working. Sharing the client key
     // here means a leaked tenant key drives nodes directly.
     let api_tokens =
-        burrow_core::auth::load_tokens(args.api_key.as_deref(), args.api_key_file.as_deref());
-    let node_tokens =
-        burrow_core::auth::load_tokens(args.node_token.as_deref(), args.node_token_file.as_deref());
+        burrow_common::auth::load_tokens(args.api_key.as_deref(), args.api_key_file.as_deref());
+    let node_tokens = burrow_common::auth::load_tokens(
+        args.node_token.as_deref(),
+        args.node_token_file.as_deref(),
+    );
     let tokens = if node_tokens.is_empty() {
         if !api_tokens.is_empty() {
             tracing::warn!(
@@ -1079,11 +1081,11 @@ pub async fn run(args: ServeArgs) -> anyhow::Result<()> {
         // Pulling a template means dialling a peer node, which is guarded by
         // the same cluster secret this node presents to the orchestrator.
         cluster_token: tokens.first().cloned(),
-        agent_binary: args.agent_binary.clone(),
+        guest_binary: args.guest_binary.clone(),
         registry_credentials: crate::oci::auth::Store::load(&args.registry_auth).await,
         insecure_registries: args.insecure_registry.clone(),
     };
-    let auth = burrow_core::auth::TokenAuth::new(tokens.clone());
+    let auth = burrow_common::auth::TokenAuth::new(tokens.clone());
     if !auth.is_enabled() {
         tracing::warn!(
             "no --node-token or --api-key configured: this node's API is UNAUTHENTICATED"

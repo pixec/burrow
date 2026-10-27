@@ -6,7 +6,8 @@
 # than assumed. `docker compose up node` alone still works for single-node
 # work.
 #
-#   cargo xtask build --target aarch64-unknown-linux-musl
+#   cargo zigbuild --release --target aarch64-unknown-linux-musl \
+#     -p burrow-orchestrator -p burrow-daemon -p burrow-cli -p burrow-guest
 #   docker --context colima-burrow compose -f deploy/dev/compose.yaml up
 #
 # Binaries are bind-mounted from target/, so the loop is: zigbuild + restart.
@@ -84,7 +85,7 @@ services:
       target: dev
       args:
         FC_ARCH: aarch64
-    command: /burrow/bin/burrowd serve --orchestrator http://orchestrator:7070 --listen 0.0.0.0:7071 --advertise node:7071 --node-id node_local_docker --label rack=a1 --label tier=general --mesh-endpoint node:51820 --api-key dev-token --node-token dev-node-token --otlp-endpoint http://otel-collector:4317 --agent-binary /burrow/bin/burrow-agent --insecure-registry test-registry:5000 --jailer /usr/local/bin/jailer --edge-listen 0.0.0.0:7081 --edge-domain node.sandbox.local --object-store s3://burrow/dev --object-store-endpoint http://objstore:9000
+    command: /burrow/bin/burrowd serve --orchestrator http://orchestrator:7070 --listen 0.0.0.0:7071 --advertise node:7071 --node-id node_local_docker --label rack=a1 --label tier=general --mesh-endpoint node:51820 --api-key dev-token --node-token dev-node-token --otlp-endpoint http://otel-collector:4317 --guest-binary /burrow/bin/burrow-guest --insecure-registry test-registry:5000 --jailer /usr/local/bin/jailer --edge-listen 0.0.0.0:7081 --edge-domain node.sandbox.local --object-store s3://burrow/dev --object-store-endpoint http://objstore:9000
     ports:
       # This node's edge: http://<port>-<sandbox-id>.node.sandbox.local:7081/
       # Opt-in, and off by default. A node without one has no hostname routing,
@@ -138,7 +139,7 @@ services:
       target: dev
       args:
         FC_ARCH: aarch64
-    command: /burrow/bin/burrowd serve --orchestrator http://orchestrator:7070 --listen 0.0.0.0:7071 --advertise node2:7071 --node-id node_local_docker_2 --label rack=b7 --label tier=dedicated --mesh-endpoint node2:51820 --api-key dev-token --node-token dev-node-token --otlp-endpoint http://otel-collector:4317 --agent-binary /burrow/bin/burrow-agent --insecure-registry test-registry:5000 --jailer /usr/local/bin/jailer --edge-listen 0.0.0.0:7081 --edge-domain node2.sandbox.local --object-store s3://burrow/dev --object-store-endpoint http://objstore:9000
+    command: /burrow/bin/burrowd serve --orchestrator http://orchestrator:7070 --listen 0.0.0.0:7071 --advertise node2:7071 --node-id node_local_docker_2 --label rack=b7 --label tier=dedicated --mesh-endpoint node2:51820 --api-key dev-token --node-token dev-node-token --otlp-endpoint http://otel-collector:4317 --guest-binary /burrow/bin/burrow-guest --insecure-registry test-registry:5000 --jailer /usr/local/bin/jailer --edge-listen 0.0.0.0:7081 --edge-domain node2.sandbox.local --object-store s3://burrow/dev --object-store-endpoint http://objstore:9000
     ports:
       # node2's edge, on its own domain: an edge serves only the sandboxes its
       # node holds, so each node needs a wildcard of its own. Loopback only,

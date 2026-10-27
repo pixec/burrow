@@ -30,6 +30,7 @@ from .types import (
     CommandInfo,
     CommandResult,
     DirEntry,
+    FileInfo,
     GuestGroup,
     GuestUser,
     NodeInfo,
@@ -49,7 +50,16 @@ def _state_of(state: int) -> str:
     except ValueError:
         return "unknown"
     name = name.replace("SANDBOX_STATE_", "").lower()
-    known = ("creating", "running", "paused", "suspended", "stopping", "destroyed", "failed")
+    known = (
+        "creating",
+        "running",
+        "paused",
+        "suspended",
+        "stopped",
+        "stopping",
+        "destroyed",
+        "failed",
+    )
     return name if name in known else "unknown"
 
 
@@ -59,8 +69,8 @@ def _status_of(state: str) -> str:
         return "pending"
     if state in ("running", "stopping"):
         return state
-    # All three are "not going to run anything until something is done".
-    if state in ("paused", "suspended", "destroyed"):
+    # All four are "not going to run anything until something is done".
+    if state in ("paused", "suspended", "stopped", "destroyed"):
         return "stopped"
     # `failed`, and any state a newer server reports that this client has no
     # name for.
@@ -166,7 +176,20 @@ def _to_create_request(options: Dict[str, Any]) -> api_pb2.CreateSandboxRequest:
         to_networks(options.get("networks"), options.get("alias"))
     )
     request.policy.volumes.extend(to_volume_mounts(options.get("volumes")))
+    request.kit.CopyFrom(_to_kit_spec(options.get("kit")))
     return request
+
+
+def _to_kit_spec(kit: Optional[Dict[str, Any]]) -> common_pb2.KitSpec:
+    """Builds a `KitSpec` from `{"args": {...}, "env": {...},
+    "reject_capabilities": [...]}`. Absent inputs are sent empty, which the
+    node reads as none."""
+    kit = kit or {}
+    spec = common_pb2.KitSpec()
+    spec.args.update(kit.get("args") or {})
+    spec.env.update(kit.get("env") or {})
+    spec.reject_types.extend(kit.get("reject_capabilities") or [])
+    return spec
 
 
 def _to_fork_request(source: str, options: Dict[str, Any]) -> api_pb2.ForkSandboxRequest:
@@ -664,6 +687,44 @@ class Sandbox:
     def policy(self):
         """The whole policy in force, with injected header values redacted."""
         return self._info.policy
+
+    @property
+    def sandbox_id(self) -> str:
+        """The id, under the name other sandbox SDKs give it."""
+        return self.id
+
+    def get_info(self) -> SandboxInfo:
+        """Re-reads the record. Alias of `refresh`."""
+        return self.refresh()
+
+    def is_running(self) -> bool:
+        """Whether the sandbox is running right now, after a fresh read."""
+        return self.refresh().state == "running"
+
+    def set_timeout(self, secs: int) -> SandboxInfo:
+        """Sets the sandbox's total lifetime, in seconds from when it was
+        created. Alias of `extend_timeout`, under the name other SDKs use."""
+        return self.extend_timeout(secs)
+
+    @property
+    def commands(self) -> "_Commands":
+        """Command helpers grouped, for parity with SDKs that namespace them:
+        `run`, `stream`, `list`, `connect` (reattach by id) and `kill`."""
+        return _Commands(self)
+
+    @property
+    def fs(self) -> "_Fs":
+        """The file methods under the names and shapes of `os` and `pathlib`:
+        `listdir`, `mkdir`, `makedirs`, `remove`, `rename`, `stat`, `exists`,
+        and `read_text`, `read_bytes`, `write_text`, `write_bytes`. As in
+        `os`, `stat` on a missing path raises (`not_found`) and `remove` does
+        not take directories; `rmtree` does."""
+        return _Fs(self)
+
+    @property
+    def pty(self) -> "_Pty":
+        """The terminal under the name other SDKs give it: `sandbox.pty.create()`."""
+        return _Pty(self)
 
     def refresh(self) -> SandboxInfo:
         """Re-reads the sandbox's current state from the server."""
@@ -1215,6 +1276,49 @@ class Sandbox:
         if not res.success:
             raise BurrowError(f"mkdir {path} failed: {res.stderr.strip()}", "internal")
 
+    def remove(self, path: str) -> None:
+        """Removes a file or directory tree. Like `mkdir` this runs a command
+        (`rm -rf`) in the sandbox, since there is no remove RPC, and a missing
+        path is not an error."""
+        res = self.exec(f"rm -rf {_shell_quote(path)}")
+        if not res.success:
+            raise BurrowError(f"rm {path} failed: {res.stderr.strip()}", "internal")
+
+    def rename(self, src: str, dst: str) -> None:
+        """Renames or moves a file or directory, by running `mv` in the sandbox."""
+        res = self.exec(f"mv {_shell_quote(src)} {_shell_quote(dst)}")
+        if not res.success:
+            raise BurrowError(f"mv {src} {dst} failed: {res.stderr.strip()}", "internal")
+
+    def stat(self, path: str) -> Optional[FileInfo]:
+        """Describes one path, or returns None when nothing is there. Lists the
+        parent directory over the `ListDir` RPC, so it respects the sandbox's
+        file policy and costs no exec."""
+        trimmed = path.rstrip("/") or "/"
+        if trimmed == "/":
+            return FileInfo(name="/", is_dir=True, size=0, mode=0o755, path="/")
+        parent, _, name = trimmed.rpartition("/")
+        try:
+            entries = self.list_dir(parent or "/")
+        except BurrowError as err:
+            if err.code == "not_found":
+                return None
+            raise
+        for entry in entries:
+            if entry.name == name:
+                return FileInfo(
+                    name=entry.name,
+                    is_dir=entry.is_dir,
+                    size=entry.size,
+                    mode=entry.mode,
+                    path=trimmed,
+                )
+        return None
+
+    def exists(self, path: str) -> bool:
+        """Whether a path exists. See `stat`."""
+        return self.stat(path) is not None
+
     def watch(
         self,
         path: str,
@@ -1542,6 +1646,49 @@ class Sandbox:
             self._on_resume(self)
         return self._info
 
+    def shutdown(self) -> SandboxInfo:
+        """Shuts the VM down, keeping the writable disk and volumes. Unlike
+        `stop`, nothing in memory survives: processes end, and `boot` runs the
+        image's init again on the same disk. For a Sandbox Kit template that
+        is the stop and start its spec describes, and the Kit's startup hooks
+        run again on the way up."""
+        self._assert_live()
+        raw = self._transport.unary("StopSandbox", api_pb2.SandboxRef(id=self.id))
+        self._info = _to_sandbox_info(raw)
+        return self._info
+
+    def boot(self) -> SandboxInfo:
+        """Cold-boots a shut-down sandbox on its existing disks. It takes as
+        long as a create, since there is no memory image to restore, and the
+        sandbox keeps its id, name, address and published ports."""
+        self._assert_live()
+        raw = self._transport.unary("StartSandbox", api_pb2.SandboxRef(id=self.id))
+        self._info = _to_sandbox_info(raw)
+        if self._on_resume:
+            self._on_resume(self)
+        return self._info
+
+    def recreate(
+        self, template: Optional[str] = None, kit: Optional[Dict[str, Any]] = None
+    ) -> SandboxInfo:
+        """Replaces the root disk, discarding everything written to it, while
+        keeping the sandbox's id, name, address and volumes. With `template`
+        the sandbox moves onto another template; a Kit is provisioned again on
+        the new disk with the recorded inputs, as changed by `kit`: `args` and
+        `env` replace by name, `reject_capabilities` wholesale, so an empty
+        list clears it."""
+        self._assert_live()
+        raw = self._transport.unary(
+            "RecreateSandbox",
+            api_pb2.RecreateSandboxRequest(
+                sandbox_id=self.id, template=template or "", kit=_to_kit_spec(kit)
+            ),
+        )
+        self._info = _to_sandbox_info(raw)
+        if self._on_resume:
+            self._on_resume(self)
+        return self._info
+
     def list_sessions(self) -> List[Session]:
         """Every VM this sandbox has run, newest first.
 
@@ -1660,6 +1807,64 @@ class Sandbox:
         self.delete()
 
 
+class _Commands:
+    """`sandbox.commands`: the command methods under grouped names."""
+
+    def __init__(self, sandbox: Sandbox):
+        self.run = sandbox.exec
+        self.stream = sandbox.exec_stream
+        self.list = sandbox.list_commands
+        self.connect = sandbox.get_command
+        self._sandbox = sandbox
+
+    def kill(self, cmd_id: str, signal: int = 9) -> None:
+        self._sandbox.get_command(cmd_id).kill(signal)
+
+
+class _Fs:
+    """`sandbox.fs`: the file methods under the `os` and `pathlib` names."""
+
+    def __init__(self, sandbox: Sandbox):
+        self._sandbox = sandbox
+        self.listdir = sandbox.list_dir
+        self.rename = sandbox.rename
+        self.exists = sandbox.exists
+        self.rmtree = sandbox.remove
+        self.read_text = sandbox.read_file
+        self.read_bytes = sandbox.read_file_bytes
+
+    def mkdir(self, path: str) -> None:
+        self._sandbox.mkdir(path, recursive=False)
+
+    def makedirs(self, path: str) -> None:
+        self._sandbox.mkdir(path, recursive=True)
+
+    def remove(self, path: str) -> None:
+        """Removes one file. A directory is refused, as `os.remove` refuses it."""
+        res = self._sandbox.exec(f"rm {_shell_quote(path)}")
+        if not res.success:
+            raise BurrowError(f"rm {path} failed: {res.stderr.strip()}", "internal")
+
+    def stat(self, path: str) -> FileInfo:
+        info = self._sandbox.stat(path)
+        if info is None:
+            raise BurrowError(f"no such file or directory: {path}", "not_found")
+        return info
+
+    def write_text(self, path: str, data: str, mode: int = 0) -> None:
+        self._sandbox.write_file(path, data, mode=mode)
+
+    def write_bytes(self, path: str, data: bytes, mode: int = 0) -> None:
+        self._sandbox.write_file(path, data, mode=mode)
+
+
+class _Pty:
+    """`sandbox.pty`: the terminal under the name other SDKs give it."""
+
+    def __init__(self, sandbox: Sandbox):
+        self.create = sandbox.terminal
+
+
 class Burrow:
     """A connection to a burrow control plane, for listing or reattaching to
     sandboxes over one channel. `Sandbox.create` is the shortcut when you only
@@ -1734,10 +1939,25 @@ class Burrow:
         res = self._transport.unary(
             "DrainNode",
             api_pb2.DrainNodeRequest(
-                node_id=node_id, is_draining=drain, is_suspending_sandboxes=suspend_sandboxes
+                node_id=node_id, is_draining=drain, suspend_sandboxes=suspend_sandboxes
             ),
         )
         return res.suspended
+
+    def set_secret(self, name: str, value: str) -> None:
+        """Stores a credential that Sandbox Kits ask for by service name. The
+        value stays on the node and is injected into matching requests by the
+        egress proxy, so a guest never holds it. `name` is lowercase
+        kebab-case, the `service` a Kit credential names."""
+        self._transport.unary("SetSecret", api_pb2.SetSecretRequest(name=name, value=value))
+
+    def list_secrets(self) -> List[str]:
+        """Names of the stored secrets. Values are never returned."""
+        res = self._transport.unary("ListSecrets", api_pb2.ListSecretsRequest())
+        return list(res.names)
+
+    def delete_secret(self, name: str) -> None:
+        self._transport.unary("DeleteSecret", api_pb2.DeleteSecretRequest(name=name))
 
     def nodes(self) -> List[NodeInfo]:
         res = self._transport.unary("ListNodes", api_pb2.ListNodesRequest())

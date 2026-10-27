@@ -11,7 +11,7 @@ or fork one prepared workspace into fifty.
 You create a sandbox from a template: a prepared rootfs image, usually imported
 from an OCI image ([TEMPLATES.md](TEMPLATES.md)). The node boots that as a microVM,
 or restores it from a warm snapshot in 40ms to 50ms, against 1.2s to 2.2s for
-a cold boot. Inside, `burrow-agent` runs as init (`init=/usr/bin/burrow-agent`
+a cold boot. Inside, `burrow-guest` runs as init (`init=/usr/bin/burrow-guest`
 on the kernel command line) and executes your commands over vsock.
 
 Defaults are 1 vCPU and 512 MiB of guest memory, changed with `--vcpus` and
@@ -51,6 +51,9 @@ A sandbox keeps its identity across VM boots.
 | Exec | Runs commands inside the guest, streaming output |
 | Pause | Snapshots memory and disks, stops the VM |
 | Resume | Boots a new VM from the snapshot, processes continue |
+| Shutdown | Stops the VM, keeping the writable disk and volumes; memory is lost |
+| Boot | Cold-boots a shut-down sandbox on its existing disks, init runs again |
+| Recreate | Replaces the root disk, keeping the id, name, address and volumes |
 | Snapshot | Keeps the current state as an object new sandboxes can start from |
 | Fork | Copies the current state into a new, independent sandbox |
 | Delete | Destroys the VM, its snapshots, lease, and firewall rules |
@@ -107,7 +110,7 @@ to start rather than run without them. `vcpu_count` decides how many vCPU
 threads exist, not how much host CPU they consume, so `cpu.max` is what stops
 one sandbox starving its neighbours.
 
-The guest agent is reachable only from the host. `burrow-agent` binds
+The guest agent is reachable only from the host. `burrow-guest` binds
 `VMADDR_CID_ANY`, because a guest cannot bind its own cid, and then refuses any
 accepted connection whose peer cid is not `VMADDR_CID_HOST`. Its API is
 unauthenticated by design: a process inside the guest reaching it over vsock

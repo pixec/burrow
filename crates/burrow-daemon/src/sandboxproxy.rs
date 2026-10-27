@@ -22,7 +22,7 @@ use std::sync::Arc;
 use tokio::io::AsyncReadExt;
 use tokio::net::{TcpListener, TcpStream};
 
-use burrow_core::edge::Prelude;
+use burrow_common::edge::Prelude;
 
 use crate::sandbox::SandboxManager;
 
@@ -129,7 +129,7 @@ fn is_token_match(expected: Option<&str>, presented: &str) -> bool {
     match expected {
         None => true,
         Some(expected) => {
-            burrow_core::auth::constant_time_eq(expected.as_bytes(), presented.as_bytes())
+            burrow_common::auth::constant_time_eq(expected.as_bytes(), presented.as_bytes())
         }
     }
 }

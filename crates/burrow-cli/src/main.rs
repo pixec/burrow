@@ -1041,7 +1041,7 @@ enum NodesCommand {
         node_id: String,
         /// Also snapshot the sandboxes it is running.
         #[arg(long = "suspend")]
-        is_suspending: bool,
+        suspend: bool,
     },
     /// Resume placing sandboxes on a node.
     Undrain { node_id: String },
@@ -1060,15 +1060,12 @@ async fn main() -> anyhow::Result<()> {
             println!("ok (orchestrator v{})", resp.version);
         }
         Command::Nodes(NodesCommand::Ls) => list_nodes(&mut client).await?,
-        Command::Nodes(NodesCommand::Drain {
-            node_id,
-            is_suspending: suspend,
-        }) => {
+        Command::Nodes(NodesCommand::Drain { node_id, suspend }) => {
             let resp = client
                 .drain_node(api::DrainNodeRequest {
                     node_id: node_id.clone(),
                     is_draining: true,
-                    is_suspending_sandboxes: suspend,
+                    suspend_sandboxes: suspend,
                 })
                 .await?
                 .into_inner();
@@ -1079,7 +1076,7 @@ async fn main() -> anyhow::Result<()> {
                 .drain_node(api::DrainNodeRequest {
                     node_id: node_id.clone(),
                     is_draining: false,
-                    is_suspending_sandboxes: false,
+                    suspend_sandboxes: false,
                 })
                 .await?;
             println!("{node_id} accepting sandboxes again");

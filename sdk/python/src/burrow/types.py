@@ -176,6 +176,17 @@ class DirEntry:
 
 
 @dataclass
+class FileInfo(DirEntry):
+    """One file or directory, as `Sandbox.stat` reports it."""
+
+    path: str = ""
+
+    @property
+    def type(self) -> str:
+        return "dir" if self.is_dir else "file"
+
+
+@dataclass
 class WatchEvent:
     type: str
     path: str

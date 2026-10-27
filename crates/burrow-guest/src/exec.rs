@@ -17,9 +17,9 @@ use tokio::sync::mpsc;
 use tokio_stream::StreamExt;
 use tonic::{Status, Streaming};
 
-use burrow_proto::agent::v1 as agentpb;
-use burrow_proto::agent::v1::exec_input::Input;
-use burrow_proto::agent::v1::exec_output::Output;
+use burrow_proto::guest::v1 as guestpb;
+use burrow_proto::guest::v1::exec_input::Input;
+use burrow_proto::guest::v1::exec_output::Output;
 
 use crate::asyncfd::AsyncPipe;
 use crate::commands::{self, Frame, Handle};
@@ -30,18 +30,18 @@ use crate::{pty, reaper, users};
 const CHANNEL_CAPACITY: usize = 64;
 const READ_CHUNK: usize = 32 * 1024;
 
-type OutputTx = mpsc::Sender<Result<agentpb::ExecOutput, Status>>;
-type OutputRx = mpsc::Receiver<Result<agentpb::ExecOutput, Status>>;
+type OutputTx = mpsc::Sender<Result<guestpb::ExecOutput, Status>>;
+type OutputRx = mpsc::Receiver<Result<guestpb::ExecOutput, Status>>;
 
-fn chunk(output: Output) -> Result<agentpb::ExecOutput, Status> {
-    Ok(agentpb::ExecOutput {
+fn chunk(output: Output) -> Result<guestpb::ExecOutput, Status> {
+    Ok(guestpb::ExecOutput {
         output: Some(output),
     })
 }
 
 /// Handles one Exec stream: reads the mandatory `Start`, spawns the child,
 /// and pumps its output back until it exits.
-pub async fn run(mut inbound: Streaming<agentpb::ExecInput>) -> Result<OutputRx, Status> {
+pub async fn run(mut inbound: Streaming<guestpb::ExecInput>) -> Result<OutputRx, Status> {
     let start = match inbound.next().await {
         Some(Ok(msg)) => match msg.input {
             Some(Input::Start(start)) => start,
@@ -140,9 +140,9 @@ fn pipe(fd: impl Into<OwnedFd>) -> Result<AsyncPipe, Status> {
 /// Non-interactive execution: separate stdout and stderr over pipes.
 fn run_pipes(
     mut command: std::process::Command,
-    start: &agentpb::ExecStart,
+    start: &guestpb::ExecStart,
     credentials: Option<users::Credentials>,
-    inbound: Streaming<agentpb::ExecInput>,
+    inbound: Streaming<guestpb::ExecInput>,
 ) -> Result<OutputRx, Status> {
     command
         .stdin(Stdio::piped())
@@ -194,9 +194,9 @@ fn announce(tx: &OutputTx, id: &str) {
 /// stderr are inherently merged and reported as stdout.
 fn run_pty(
     mut command: std::process::Command,
-    start: &agentpb::ExecStart,
+    start: &guestpb::ExecStart,
     credentials: Option<users::Credentials>,
-    inbound: Streaming<agentpb::ExecInput>,
+    inbound: Streaming<guestpb::ExecInput>,
 ) -> Result<OutputRx, Status> {
     use std::os::unix::process::CommandExt;
 
@@ -262,7 +262,7 @@ fn run_pty(
 
 /// Client -> child stdin, plus signal control, for the pipe case.
 async fn control_pipes(
-    mut inbound: Streaming<agentpb::ExecInput>,
+    mut inbound: Streaming<guestpb::ExecInput>,
     mut stdin: Option<AsyncPipe>,
     pid: i32,
 ) {
@@ -290,7 +290,7 @@ async fn control_pipes(
 }
 
 /// Client -> pty, plus resize and signal control.
-async fn control_pty(mut inbound: Streaming<agentpb::ExecInput>, mut master: AsyncPipe, pid: i32) {
+async fn control_pty(mut inbound: Streaming<guestpb::ExecInput>, mut master: AsyncPipe, pid: i32) {
     while let Some(Ok(msg)) = inbound.next().await {
         match msg.input {
             Some(Input::Stdin(bytes)) if master.write_all(&bytes).await.is_err() => break,

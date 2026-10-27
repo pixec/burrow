@@ -101,7 +101,7 @@ impl NodeRegistry for NodeRegistryService {
         }
         // Labels are rendered into operator output and into placement errors,
         // so they are bounded at the door like any other caller-supplied map.
-        burrow_core::tags::validate_labels(&info.labels)?;
+        burrow_common::tags::validate_labels(&info.labels)?;
         // A node that cannot be given a guest-address slice of its own is
         // refused: admitting it on someone else's slice would give two nodes
         // the same guest addresses, which is what the slicing exists to
@@ -147,7 +147,7 @@ impl NodeRegistry for NodeRegistryService {
         // is checked exactly as it is at registration: an unbounded label map
         // would otherwise reach the registry and every `nodes ls` after it.
         if let Some(info) = &req.info {
-            burrow_core::tags::validate_labels(&info.labels)?;
+            burrow_common::tags::validate_labels(&info.labels)?;
         }
         let known = self
             .0
@@ -366,7 +366,7 @@ async fn reap_dead_nodes(state: Arc<OrchestratorState>, expiry: Option<std::time
 async fn main() -> anyhow::Result<()> {
     let args = Args::parse();
     let telemetry =
-        burrow_core::telemetry::init("burrow-orchestrator", args.otlp_endpoint.as_deref());
+        burrow_common::telemetry::init("burrow-orchestrator", args.otlp_endpoint.as_deref());
     let result = run(args).await;
     telemetry.shutdown();
     result
@@ -374,8 +374,8 @@ async fn main() -> anyhow::Result<()> {
 
 async fn run(args: Args) -> anyhow::Result<()> {
     let tokens =
-        burrow_core::auth::load_tokens(args.api_key.as_deref(), args.api_key_file.as_deref());
-    let auth = burrow_core::auth::TokenAuth::new(tokens.clone());
+        burrow_common::auth::load_tokens(args.api_key.as_deref(), args.api_key_file.as_deref());
+    let auth = burrow_common::auth::TokenAuth::new(tokens.clone());
     if !auth.is_enabled() {
         tracing::warn!(
             "no --api-key configured: the API is UNAUTHENTICATED and anyone \
@@ -389,8 +389,10 @@ async fn run(args: Args) -> anyhow::Result<()> {
     // clients lets any API client register a node over a real one and have
     // other tenants' exec and log streams routed to it, and hands every client
     // a key that drives nodes directly.
-    let node_tokens =
-        burrow_core::auth::load_tokens(args.node_token.as_deref(), args.node_token_file.as_deref());
+    let node_tokens = burrow_common::auth::load_tokens(
+        args.node_token.as_deref(),
+        args.node_token_file.as_deref(),
+    );
     let (node_auth, outbound_node_token) = if node_tokens.is_empty() {
         if auth.is_enabled() {
             tracing::warn!(
@@ -404,7 +406,7 @@ async fn run(args: Args) -> anyhow::Result<()> {
         (auth.clone(), tokens.first().cloned())
     } else {
         (
-            burrow_core::auth::TokenAuth::new(node_tokens.clone()),
+            burrow_common::auth::TokenAuth::new(node_tokens.clone()),
             node_tokens.first().cloned(),
         )
     };

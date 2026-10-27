@@ -212,7 +212,7 @@ fn mount_one(source: &str, target: &str, fstype: &str, flags: MsFlags, options: 
 /// A failure here is reported to the host. A sandbox whose volume is missing
 /// would otherwise write to the underlying directory instead, and the caller
 /// would find the data gone rather than be told the mount never happened.
-pub fn mount_volumes(volumes: &[burrow_proto::agent::v1::VolumeMount]) -> anyhow::Result<()> {
+pub fn mount_volumes(volumes: &[burrow_proto::guest::v1::VolumeMount]) -> anyhow::Result<()> {
     for volume in volumes {
         // Checked again here, not only on the host: the path arrived over the
         // wire, and this is the code that turns it into a mount.
@@ -293,7 +293,7 @@ pub fn mount_volumes(volumes: &[burrow_proto::agent::v1::VolumeMount]) -> anyhow
 /// RAM-backed scratch space at `path`: nothing to wait for and nothing that
 /// outlives the VM, so every boot starts it empty.
 fn mount_tmpfs(
-    volume: &burrow_proto::agent::v1::VolumeMount,
+    volume: &burrow_proto::guest::v1::VolumeMount,
     mode: Option<u32>,
 ) -> anyhow::Result<()> {
     std::fs::create_dir_all(&volume.path)?;

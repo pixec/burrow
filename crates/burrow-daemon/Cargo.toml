@@ -10,8 +10,8 @@ path = "src/main.rs"
 
 [dependencies]
 burrow-proto = { workspace = true }
-burrow-core = { workspace = true }
-burrow-vmm = { workspace = true }
+burrow-common = { workspace = true }
+burrow-firecracker = { workspace = true }
 burrow-net = { workspace = true }
 burrow-proxy = { workspace = true }
 burrow-store = { workspace = true }

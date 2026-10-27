@@ -1,7 +1,7 @@
-mod agentconn;
 mod blobs;
 mod devvm;
 mod edge;
+mod guestconn;
 mod kit;
 mod nodeapi;
 mod objstore;
@@ -11,6 +11,7 @@ mod sandboxproxy;
 mod serve;
 mod share;
 mod snapshot;
+mod staged;
 mod template;
 mod volume;
 mod warm;
@@ -59,7 +60,7 @@ enum VmCommand {
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     let args = Args::parse();
-    let telemetry = burrow_core::telemetry::init(
+    let telemetry = burrow_common::telemetry::init(
         "burrowd",
         match &args.command {
             Command::Serve(serve) => serve.otlp_endpoint.as_deref(),

@@ -338,7 +338,7 @@ pub enum Action {
 /// One rule: which requests, and what happens to them.
 #[derive(Debug, Clone)]
 pub struct Rule {
-    /// Domain glob, matched with [`burrow_core::glob::is_host_match`] like an allowlist entry.
+    /// Domain glob, matched with [`burrow_common::glob::is_host_match`] like an allowlist entry.
     pub domain: String,
     /// `None` matches every request to the domain, and therefore shadows every
     /// rule after it for that domain.
@@ -359,7 +359,7 @@ impl Rule {
 /// One HTTP-level grant or refusal: the hosts, methods and paths it names.
 ///
 /// Hosts are globs like allowlist entries, with `*` meaning every host; paths
-/// are matched with [`burrow_core::glob::is_path_match`] against the path alone,
+/// are matched with [`burrow_common::glob::is_path_match`] against the path alone,
 /// without the query string.
 #[derive(Debug, Clone, Default)]
 pub struct HttpRule {
@@ -375,7 +375,7 @@ impl HttpRule {
     pub fn is_for_host(&self, host: &str) -> bool {
         self.hosts
             .iter()
-            .any(|pattern| burrow_core::glob::is_host_match(pattern, host))
+            .any(|pattern| burrow_common::glob::is_host_match(pattern, host))
     }
 
     pub fn is_match(&self, host: &str, method: &str, path: &str) -> bool {
@@ -385,7 +385,7 @@ impl HttpRule {
                 || self
                     .paths
                     .iter()
-                    .any(|glob| burrow_core::glob::is_path_match(glob, path)))
+                    .any(|glob| burrow_common::glob::is_path_match(glob, path)))
     }
 }
 
@@ -436,13 +436,13 @@ impl SandboxPolicy {
     pub fn is_host_denied(&self, host: &str) -> bool {
         self.deny_domains
             .iter()
-            .any(|pattern| burrow_core::glob::is_host_match(pattern, host))
+            .any(|pattern| burrow_common::glob::is_host_match(pattern, host))
     }
 
     fn is_granted(&self, host: &str) -> bool {
         self.allow_domains
             .iter()
-            .any(|p| burrow_core::glob::is_host_match(p, host))
+            .any(|p| burrow_common::glob::is_host_match(p, host))
     }
 
     fn is_named_by_allow_rule(&self, host: &str) -> bool {

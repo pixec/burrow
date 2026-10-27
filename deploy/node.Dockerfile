@@ -70,7 +70,7 @@ RUN set -eu; \
     rm -rf "/tmp/release-${FIRECRACKER_VERSION}-${arch}"; \
     firecracker --version
 
-# Dev harness: burrowd, burrow-agent and the rootfs builder are bind-mounted
+# Dev harness: burrowd, burrow-guest and the rootfs builder are bind-mounted
 # from the host build, so a rebuild is zigbuild + restart with no image work.
 FROM base AS dev
 CMD ["/burrow/bin/burrowd"]
@@ -80,5 +80,5 @@ CMD ["/burrow/bin/burrowd"]
 FROM base AS release
 ARG TARGETARCH
 COPY dist/${TARGETARCH}/burrowd /burrow/bin/burrowd
-COPY dist/${TARGETARCH}/burrow-agent /burrow/bin/burrow-agent
+COPY dist/${TARGETARCH}/burrow-guest /burrow/bin/burrow-guest
 ENTRYPOINT ["/burrow/bin/burrowd"]

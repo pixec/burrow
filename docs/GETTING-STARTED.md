@@ -12,13 +12,16 @@ brew install zig
 cargo install cargo-zigbuild
 ```
 
-**2. Build and bring up the stack.** `cargo xtask build` targets
-`aarch64-unknown-linux-musl`, which is what the harness runs; pass `--target`
-for anything else. The harness runs an orchestrator and two nodes, so
-cross-node behaviour is exercised rather than assumed.
+**2. Build and bring up the stack.** The harness runs
+`aarch64-unknown-linux-musl`; swap the target for anything else. `burrow-guest`
+is the guest init and is excluded from the workspace defaults, so it is named
+explicitly. The harness runs an orchestrator and two nodes, so cross-node
+behaviour is exercised rather than assumed.
 
 ```sh
-cargo xtask build
+rustup target add aarch64-unknown-linux-musl
+cargo zigbuild --release --target aarch64-unknown-linux-musl \
+  -p burrow-orchestrator -p burrow-daemon -p burrow-cli -p burrow-guest
 docker --context colima-burrow compose -f deploy/dev/compose.yaml up -d --build
 ```
 
@@ -94,7 +97,7 @@ burrow fork "$id"      # an independent copy
 ## Releases
 
 Tagged releases publish static musl binaries for `x86_64` and `aarch64`:
-`burrowd`, `burrow-orchestrator`, `burrow` and `burrow-agent`, each named
+`burrowd`, `burrow-orchestrator`, `burrow` and `burrow-guest`, each named
 `<binary>-<arch>-<version>`, with a `SHA256SUMS` file per architecture. The
 same tag publishes multi-arch container images:
 

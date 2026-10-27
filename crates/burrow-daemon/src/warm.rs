@@ -24,7 +24,7 @@ use std::path::{Path, PathBuf};
 
 use tonic::Status;
 
-use burrow_vmm::{DriveSpec, MicroVm, MicroVmSpec, NetSpec};
+use burrow_firecracker::{DriveSpec, MicroVm, MicroVmSpec, NetSpec};
 
 use crate::sandbox::NodeConfig;
 
@@ -87,7 +87,7 @@ const SHAPE_FILE: &str = "shape";
 #[derive(Debug, Clone, Default)]
 pub struct Trust {
     pub ca: String,
-    pub bundles: Vec<burrow_proto::agent::v1::TrustBundle>,
+    pub bundles: Vec<burrow_proto::guest::v1::TrustBundle>,
 }
 
 /// vcpus and memory a warm snapshot was built with.
@@ -157,8 +157,8 @@ pub async fn is_warm_for(templates_dir: &Path, template: &str, wanted: Shape) ->
 pub async fn is_warm(templates_dir: &Path, template: &str) -> bool {
     let dir = warm_dir(templates_dir, template);
     for file in [
-        burrow_vmm::SNAPSHOT_FILE,
-        burrow_vmm::SNAPSHOT_MEM_FILE,
+        burrow_firecracker::SNAPSHOT_FILE,
+        burrow_firecracker::SNAPSHOT_MEM_FILE,
         "scratch.ext4",
     ] {
         if !tokio::fs::try_exists(dir.join(file)).await.unwrap_or(false) {
@@ -191,12 +191,12 @@ pub async fn stage_from_warm(
         (template_dir.join("vmlinux"), "vmlinux"),
         (template_dir.join("rootfs.ext4"), "rootfs.ext4"),
         (
-            warm.join(burrow_vmm::SNAPSHOT_FILE),
-            burrow_vmm::SNAPSHOT_FILE,
+            warm.join(burrow_firecracker::SNAPSHOT_FILE),
+            burrow_firecracker::SNAPSHOT_FILE,
         ),
         (
-            warm.join(burrow_vmm::SNAPSHOT_MEM_FILE),
-            burrow_vmm::SNAPSHOT_MEM_FILE,
+            warm.join(burrow_firecracker::SNAPSHOT_MEM_FILE),
+            burrow_firecracker::SNAPSHOT_MEM_FILE,
         ),
     ] {
         let dest = workdir.join(name);
@@ -366,8 +366,8 @@ pub async fn build_warm_snapshot(
         guest_mac: Some(lease.guest_mac()),
     });
     spec.boot_args = format!(
-        "{} root=/dev/vda ro init=/usr/bin/burrow-agent {} {}",
-        burrow_vmm::DEFAULT_BOOT_ARGS,
+        "{} root=/dev/vda ro init=/usr/bin/burrow-guest {} {}",
+        burrow_firecracker::DEFAULT_BOOT_ARGS,
         lease.kernel_ip_arg(),
         config.extra_boot_args
     );
@@ -403,7 +403,7 @@ pub async fn build_warm_snapshot(
             tokio::fs::write(dir.join("format"), WARM_FORMAT)
                 .await
                 .map_err(|err| Status::internal(format!("marking warm snapshot: {err}")))?;
-            let size = tokio::fs::metadata(dir.join(burrow_vmm::SNAPSHOT_MEM_FILE))
+            let size = tokio::fs::metadata(dir.join(burrow_firecracker::SNAPSHOT_MEM_FILE))
                 .await
                 .map(|m| m.len())
                 .unwrap_or(0);
@@ -441,7 +441,7 @@ fn apply_confinement(spec: &mut MicroVmSpec, config: &NodeConfig, shape: Shape) 
     spec.jail = config.jail.clone();
     spec.cgroup_root = config.cgroup_root.clone();
     spec.is_limits_required = config.is_resource_limits_required;
-    spec.limits = burrow_vmm::Limits {
+    spec.limits = burrow_firecracker::Limits {
         cpus: shape.vcpus,
         // The same headroom over guest memory a sandbox gets, and for the same
         // reason: too tight and firecracker itself is what the kernel kills.
@@ -469,8 +469,8 @@ async fn collect_products(run_dir: &Path, dir: &Path) -> Result<(), Status> {
     let (uid, gid) = (owner.uid(), owner.gid());
 
     for name in [
-        burrow_vmm::SNAPSHOT_FILE,
-        burrow_vmm::SNAPSHOT_MEM_FILE,
+        burrow_firecracker::SNAPSHOT_FILE,
+        burrow_firecracker::SNAPSHOT_MEM_FILE,
         "scratch.ext4",
     ] {
         tokio::fs::rename(run_dir.join(name), dir.join(name))
@@ -510,11 +510,11 @@ async fn exercise_agent(
     trust: &Trust,
     agent_timeout: std::time::Duration,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    let mut agent = crate::agentconn::connect(vm.vsock_uds_path(), agent_timeout).await?;
+    let mut agent = crate::guestconn::connect(vm.vsock_uds_path(), agent_timeout).await?;
     agent
-        .handshake(crate::agentconn::handshake_full(
+        .handshake(crate::guestconn::handshake_full(
             true,
-            Some(burrow_proto::agent::v1::NetworkConfig {
+            Some(burrow_proto::guest::v1::NetworkConfig {
                 // Its own address: re-applying it changes nothing, and the
                 // point is to touch the code rather than the configuration.
                 ip: lease.guest_ip.to_string(),
@@ -533,7 +533,7 @@ async fn exercise_agent(
         ))
         .await?;
     agent
-        .health(burrow_proto::agent::v1::AgentHealthRequest {})
+        .health(burrow_proto::guest::v1::GuestHealthRequest {})
         .await?;
     Ok(())
 }
@@ -597,7 +597,7 @@ async fn profile_restore(
         // Faults taken while reaching a usable agent are exactly the ones a
         // real create pays for.
         let ready = vm
-            .wait_for_vsock(crate::agentconn::AGENT_PORT, agent_timeout)
+            .wait_for_vsock(crate::guestconn::AGENT_PORT, agent_timeout)
             .await;
         if ready.is_ok() {
             let _ = exercise_agent(&vm, &lease, trust, agent_timeout).await;
@@ -632,7 +632,7 @@ async fn snapshot_when_ready(
         .map_err(|err| Status::internal(format!("warm boot: {err}")))?;
 
     if let Err(err) = vm
-        .wait_for_vsock(crate::agentconn::AGENT_PORT, agent_timeout)
+        .wait_for_vsock(crate::guestconn::AGENT_PORT, agent_timeout)
         .await
     {
         let console = vm.console_tail(30).await;
@@ -658,7 +658,7 @@ async fn snapshot_when_ready(
         let _ = vm.kill().await;
         return Err(Status::internal(format!("pausing warm vm: {err}")));
     }
-    if let Err(err) = vm.snapshot(burrow_vmm::SnapshotType::Full).await {
+    if let Err(err) = vm.snapshot(burrow_firecracker::SnapshotType::Full).await {
         let _ = vm.kill().await;
         return Err(Status::internal(format!("snapshotting warm vm: {err}")));
     }

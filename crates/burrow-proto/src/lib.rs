@@ -16,9 +16,9 @@ pub mod node {
     }
 }
 
-pub mod agent {
+pub mod guest {
     pub mod v1 {
-        tonic::include_proto!("burrow.agent.v1");
+        tonic::include_proto!("burrow.guest.v1");
     }
 }
 
@@ -30,16 +30,16 @@ pub mod agent {
 /// that has quietly diverged is worse than one that never existed, because
 /// both sides believe they agree.
 ///
-/// So the copies are checked rather than trusted. `cargo xtask protos` writes
+/// So the copies are checked rather than trusted. `scripts/sync-protos.sh` writes
 /// them; this test fails if anyone changes a proto without running it.
 #[cfg(test)]
 mod sdk_protos {
     use std::path::PathBuf;
 
-    /// Every proto the SDKs carry, including `node` and `agent`: they are not
+    /// Every proto the SDKs carry, including `node` and `guest`: they are not
     /// used by an SDK today, but a stale copy is a trap for whoever reaches
     /// for one next.
-    const SHIPPED: [&str; 4] = ["common", "api", "node", "agent"];
+    const SHIPPED: [&str; 4] = ["common", "api", "node", "guest"];
 
     const SDK_DIRS: [&str; 2] = [
         "../../sdk/typescript/proto",
@@ -75,7 +75,7 @@ mod sdk_protos {
         assert!(
             stale.is_empty(),
             "the SDK's proto copies have drifted from this crate's: {}.\n\
-             Run `cargo xtask protos` to update them.",
+             Run scripts/sync-protos.sh to update them.",
             stale.join(", ")
         );
     }

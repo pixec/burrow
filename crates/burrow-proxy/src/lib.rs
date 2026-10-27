@@ -1047,7 +1047,7 @@ pub(crate) fn select_rule<'a>(
     rules
         .iter()
         .find(|rule| {
-            burrow_core::glob::is_host_match(&rule.domain, host)
+            burrow_common::glob::is_host_match(&rule.domain, host)
                 && rule
                     .matcher
                     .as_ref()

@@ -67,6 +67,32 @@ pub fn templates_dir(data_dir: &Path) -> PathBuf {
     data_dir.join("images")
 }
 
+/// A rootfs being written, renamed into place once it is complete.
+const PENDING_ROOTFS: &str = "rootfs.ext4.building";
+
+/// Removes rootfs files an import was writing when the node died, and the
+/// template directories that hold nothing else.
+pub async fn sweep_pending(data_dir: &Path) {
+    let Ok(mut entries) = tokio::fs::read_dir(templates_dir(data_dir)).await else {
+        return;
+    };
+    while let Ok(Some(entry)) = entries.next_entry().await {
+        let dir = entry.path();
+        if tokio::fs::remove_file(dir.join(PENDING_ROOTFS))
+            .await
+            .is_err()
+        {
+            continue;
+        }
+        if !tokio::fs::try_exists(dir.join("rootfs.ext4"))
+            .await
+            .unwrap_or(true)
+        {
+            let _ = tokio::fs::remove_dir_all(&dir).await;
+        }
+    }
+}
+
 /// The kernel this node boots guests with, set once from `--guest-kernel`.
 ///
 /// Held here rather than threaded through every build because it is decided at
@@ -191,7 +217,7 @@ pub async fn build(
     data_dir: PathBuf,
     node_id: String,
     request: api::BuildTemplateRequest,
-    agent_binary: PathBuf,
+    guest_binary: PathBuf,
     credentials: crate::oci::auth::Store,
     insecure: Vec<String>,
     tx: LogTx,
@@ -201,7 +227,7 @@ pub async fn build(
         &data_dir,
         &node_id,
         &request,
-        &agent_binary,
+        &guest_binary,
         &credentials,
         &insecure,
         &tx,
@@ -229,7 +255,7 @@ async fn run_build(
     data_dir: &Path,
     node_id: &str,
     request: &api::BuildTemplateRequest,
-    agent_binary: &Path,
+    guest_binary: &Path,
     credentials: &crate::oci::auth::Store,
     insecure: &[String],
     tx: &LogTx,
@@ -245,7 +271,7 @@ async fn run_build(
             data_dir,
             &request.name,
             &request.kits,
-            agent_binary,
+            guest_binary,
             credentials,
             insecure,
             tx,
@@ -271,7 +297,7 @@ async fn run_build(
             data_dir,
             &base,
             &request.from_image,
-            agent_binary,
+            guest_binary,
             credentials,
             insecure,
             tx,
@@ -341,7 +367,7 @@ async fn run_build(
         );
     }
 
-    let build_id = format!("bld_{}", burrow_core::SandboxId::generate());
+    let build_id = format!("bld_{}", burrow_common::SandboxId::generate());
     let policy = common::Policy {
         resources: Some(common::ResourcePolicy {
             vcpus: request.vcpus.max(1),
@@ -524,7 +550,7 @@ async fn assemble_image(
 
     // Built beside the destination and renamed, so a failed build never
     // leaves a half-written image where a usable one is expected.
-    let pending = target.join("rootfs.ext4.building");
+    let pending = target.join(PENDING_ROOTFS);
     let _ = tokio::fs::remove_file(&pending).await;
     run(
         "mkfs.ext4",
@@ -588,14 +614,14 @@ async fn exec_streaming(
     command: &str,
     tx: &LogTx,
 ) -> Result<i32, Status> {
-    use burrow_proto::agent::v1 as agentpb;
+    use burrow_proto::guest::v1 as guestpb;
     use tokio_stream::StreamExt;
 
     let sandbox = manager.get(sandbox_id).await?;
     let mut agent = sandbox.agent().await?;
 
-    let start = agentpb::ExecInput {
-        input: Some(agentpb::exec_input::Input::Start(agentpb::ExecStart {
+    let start = guestpb::ExecInput {
+        input: Some(guestpb::exec_input::Input::Start(guestpb::ExecStart {
             cmd: vec!["/bin/sh".into(), "-c".into(), command.to_string()],
             env: Default::default(),
             cwd: String::new(),
@@ -616,16 +642,16 @@ async fn exec_streaming(
     let mut exit = 0;
     while let Some(msg) = stream.next().await {
         match msg?.output {
-            Some(agentpb::exec_output::Output::Stdout(b)) => {
+            Some(guestpb::exec_output::Output::Stdout(b)) => {
                 let _ = tx.send(event(api::build_log::Event::Stdout(b))).await;
             }
-            Some(agentpb::exec_output::Output::Stderr(b)) => {
+            Some(guestpb::exec_output::Output::Stderr(b)) => {
                 let _ = tx.send(event(api::build_log::Event::Stderr(b))).await;
             }
-            Some(agentpb::exec_output::Output::ExitCode(code)) => exit = code,
+            Some(guestpb::exec_output::Output::ExitCode(code)) => exit = code,
             // A build step is watched to completion here; there is nothing to
             // come back to it for.
-            Some(agentpb::exec_output::Output::CommandId(_)) | None => {}
+            Some(guestpb::exec_output::Output::CommandId(_)) | None => {}
         }
     }
     Ok(exit)
@@ -638,7 +664,7 @@ async fn download_to(
     guest_path: &str,
     dest: &Path,
 ) -> Result<u64, Status> {
-    use burrow_proto::agent::v1 as agentpb;
+    use burrow_proto::guest::v1 as guestpb;
     use tokio::io::AsyncWriteExt;
     use tokio_stream::StreamExt;
 
@@ -646,7 +672,7 @@ async fn download_to(
     let mut agent = sandbox.agent().await?;
 
     let mut stream = agent
-        .download_file(agentpb::DownloadRequest {
+        .download_file(guestpb::DownloadRequest {
             path: guest_path.to_string(),
         })
         .await?
@@ -1408,7 +1434,9 @@ pub mod from_image {
 
     use tonic::Status;
 
-    use super::{IMAGE_SLACK_MIB, LogTx, event, path, run, templates_dir, validate_name};
+    use super::{
+        IMAGE_SLACK_MIB, LogTx, PENDING_ROOTFS, event, path, run, templates_dir, validate_name,
+    };
     use burrow_proto::api::v1 as api;
 
     /// Directories the guest needs that an image will not contain.
@@ -1431,7 +1459,7 @@ pub mod from_image {
         data_dir: &Path,
         name: &str,
         image: &str,
-        agent_binary: &Path,
+        guest_binary: &Path,
         credentials: &crate::oci::auth::Store,
         insecure: &[String],
         tx: &LogTx,
@@ -1439,7 +1467,7 @@ pub mod from_image {
         validate_name(name)?;
         let reference = crate::oci::Reference::parse(image)?;
 
-        require_agent(agent_binary).await?;
+        require_agent(guest_binary).await?;
 
         let mut progress = |line: String| {
             let _ = tx.try_send(event(api::build_log::Event::Step(line)));
@@ -1461,7 +1489,7 @@ pub mod from_image {
                         name,
                         &layers,
                         &environment,
-                        agent_binary,
+                        guest_binary,
                         tx,
                     )
                     .await;
@@ -1477,7 +1505,7 @@ pub mod from_image {
             name,
             &pulled.layers,
             &pulled.environment,
-            agent_binary,
+            guest_binary,
             tx,
         )
         .await
@@ -1493,12 +1521,12 @@ pub mod from_image {
         data_dir: &Path,
         name: &str,
         refs: &[String],
-        agent_binary: &Path,
+        guest_binary: &Path,
         credentials: &crate::oci::auth::Store,
         insecure: &[String],
         tx: &LogTx,
     ) -> Result<String, Status> {
-        require_agent(agent_binary).await?;
+        require_agent(guest_binary).await?;
         let mut progress = |line: String| {
             let _ = tx.try_send(event(api::build_log::Event::Step(line)));
         };
@@ -1517,18 +1545,18 @@ pub mod from_image {
             &name,
             &layers,
             &environment,
-            agent_binary,
+            guest_binary,
             tx,
         )
         .await?;
         Ok(name)
     }
 
-    async fn require_agent(agent_binary: &Path) -> Result<(), Status> {
-        if !tokio::fs::try_exists(agent_binary).await.unwrap_or(false) {
+    async fn require_agent(guest_binary: &Path) -> Result<(), Status> {
+        if !tokio::fs::try_exists(guest_binary).await.unwrap_or(false) {
             return Err(Status::failed_precondition(format!(
-                "the guest agent is not at {}; set --agent-binary",
-                agent_binary.display()
+                "the guest agent is not at {}; set --guest-binary",
+                guest_binary.display()
             )));
         }
         Ok(())
@@ -1540,15 +1568,15 @@ pub mod from_image {
         name: &str,
         layers: &[std::path::PathBuf],
         environment: &crate::oci::ImageEnvironment,
-        agent_binary: &Path,
+        guest_binary: &Path,
         tx: &LogTx,
     ) -> Result<(), Status> {
         let staging = data_dir.join("build").join(format!("import-{name}"));
         let _ = tokio::fs::remove_dir_all(&staging).await;
-        let rootdir = staging.join("root");
-        tokio::fs::create_dir_all(&rootdir)
+        tokio::fs::create_dir_all(&staging)
             .await
             .map_err(|err| Status::internal(format!("staging: {err}")))?;
+        let rootdir = staging.join("root");
 
         let outcome = populate(
             manager,
@@ -1557,7 +1585,7 @@ pub mod from_image {
             name,
             layers,
             environment,
-            agent_binary,
+            guest_binary,
             tx,
         )
         .await;
@@ -1575,7 +1603,7 @@ pub mod from_image {
         name: &str,
         layers: &[std::path::PathBuf],
         environment: &crate::oci::ImageEnvironment,
-        agent_binary: &Path,
+        guest_binary: &Path,
         tx: &LogTx,
     ) -> Result<(), Status> {
         let _ = tx
@@ -1587,19 +1615,31 @@ pub mod from_image {
         // Blocking file work, and a large image is a lot of it.
         let layers = layers.to_vec();
         let unpack_into = rootdir.to_path_buf();
-        tokio::task::spawn_blocking(move || crate::oci::unpack_layers(&layers, &unpack_into))
-            .await
-            .map_err(|err| Status::internal(format!("unpack did not run: {err}")))?
-            .map_err(|err| Status::internal(format!("unpacking image: {err}")))?;
+        let cache = crate::staged::Cache::new(data_dir);
+        let cached = tokio::task::spawn_blocking(move || {
+            let cached = cache.populate(&layers, &unpack_into)?;
+            cache.prune();
+            Ok::<_, std::io::Error>(cached)
+        })
+        .await
+        .map_err(|err| Status::internal(format!("unpack did not run: {err}")))?
+        .map_err(|err| Status::internal(format!("unpacking image: {err}")))?;
+        if cached > 0 {
+            let _ = tx
+                .send(event(api::build_log::Event::Step(format!(
+                    "{cached} layer(s) already staged"
+                ))))
+                .await;
+        }
 
         for dir in REQUIRED_DIRS {
             let _ = tokio::fs::create_dir_all(rootdir.join(dir)).await;
         }
         // Without this the VM boots an image with no init and panics.
-        tokio::fs::copy(agent_binary, rootdir.join("usr/bin/burrow-agent"))
+        tokio::fs::copy(guest_binary, rootdir.join("usr/bin/burrow-guest"))
             .await
             .map_err(|err| Status::internal(format!("installing the agent: {err}")))?;
-        set_executable(&rootdir.join("usr/bin/burrow-agent")).await?;
+        set_executable(&rootdir.join("usr/bin/burrow-guest")).await?;
 
         // A container runtime takes HOME and USER from the image user's passwd
         // entry rather than from ENV, and a Kit's descriptors reference them
@@ -1681,7 +1721,7 @@ pub mod from_image {
                 "building a {size_mib}MiB rootfs"
             ))))
             .await;
-        let pending = target.join("rootfs.ext4.building");
+        let pending = target.join(PENDING_ROOTFS);
         let _ = tokio::fs::remove_file(&pending).await;
         run(
             "mkfs.ext4",

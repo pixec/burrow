@@ -10,12 +10,12 @@ use std::sync::Arc;
 use tokio::sync::Mutex;
 use tonic::{Status, transport::Channel};
 
+use burrow_firecracker::{DriveSpec, MicroVm, MicroVmSpec, NetSpec};
 use burrow_net::{Ipam, Lease, firewall, tap};
-use burrow_proto::agent::v1::agent_client::AgentClient;
 use burrow_proto::common::v1 as common;
-use burrow_vmm::{DriveSpec, MicroVm, MicroVmSpec, NetSpec};
+use burrow_proto::guest::v1::guest_client::GuestClient;
 
-use crate::agentconn;
+use crate::guestconn;
 
 /// Conventional filenames inside a template directory.
 const TEMPLATE_KERNEL: &str = "vmlinux";
@@ -60,7 +60,7 @@ pub struct NodeConfig {
     pub is_memory_lazy: bool,
     /// Confines each VMM to a chroot under an unprivileged uid. `None` runs
     /// firecracker as root with the whole host visible.
-    pub jail: Option<burrow_vmm::Jail>,
+    pub jail: Option<burrow_firecracker::Jail>,
     /// How long a build layer and an unreferenced blob are kept.
     ///
     /// Neither has an owner that could delete it: a cached layer outlives the
@@ -133,13 +133,13 @@ const MAX_RESTORED_CHAIN: usize = 2;
 /// cap. Probing to the cap would silently truncate it here and restore the
 /// guest from a prefix of its own memory, which is worse than a long chain.
 async fn discover_memory_chain(workdir: &std::path::Path) -> Vec<String> {
-    if !tokio::fs::try_exists(workdir.join(burrow_vmm::SNAPSHOT_MEM_FILE))
+    if !tokio::fs::try_exists(workdir.join(burrow_firecracker::SNAPSHOT_MEM_FILE))
         .await
         .unwrap_or(false)
     {
         return Vec::new();
     }
-    let mut chain = vec![burrow_vmm::SNAPSHOT_MEM_FILE.to_string()];
+    let mut chain = vec![burrow_firecracker::SNAPSHOT_MEM_FILE.to_string()];
 
     let Ok(mut entries) = tokio::fs::read_dir(workdir).await else {
         return chain;
@@ -381,11 +381,11 @@ impl Drop for Provisioning<'_> {
 fn spawn_handshake(
     manager: &SandboxManager,
     sandbox: &Arc<RunningSandbox>,
-    request: burrow_proto::agent::v1::HandshakeRequest,
+    request: burrow_proto::guest::v1::HandshakeRequest,
     timeout: std::time::Duration,
 ) {
     let id = sandbox.id.clone();
-    let uds = sandbox.workdir.join(burrow_vmm::VSOCK_UDS);
+    let uds = sandbox.workdir.join(burrow_firecracker::VSOCK_UDS);
     let signal = sandbox.handshake.clone();
     let manager = manager.clone();
     // Weak: a sandbox deleted while its guest is still waking must not be kept
@@ -394,7 +394,7 @@ fn spawn_handshake(
     tokio::spawn(async move {
         let began = std::time::Instant::now();
         let outcome = match tokio::time::timeout(timeout, async {
-            let (mut agent, _) = agentconn::connect_when_ready(uds, timeout).await?;
+            let (mut agent, _) = guestconn::connect_when_ready(uds, timeout).await?;
             agent.handshake(request).await?;
             Ok::<_, anyhow::Error>(agent)
         })
@@ -486,7 +486,7 @@ pub struct RunningSandbox {
     /// Reused across calls: a vsock connect plus an HTTP/2 handshake into a
     /// 1-vCPU guest is a real cost to pay on every exec. Dropped whenever the
     /// VM goes away, because a channel does not survive a pause.
-    agent_channel: Mutex<Option<AgentClient<Channel>>>,
+    agent_channel: Mutex<Option<GuestClient<Channel>>>,
     /// Where this VM's handshake with the guest has got to.
     ///
     /// A warm create returns before the guest has answered, so its address,
@@ -523,7 +523,7 @@ pub struct RunningSandbox {
     /// Carried on the sandbox rather than passed in because [`Self::agent`] is
     /// what every exec, transfer and watch goes through, and most of its
     /// callers hold nothing else from the node's configuration. Streaming
-    /// calls are deliberately not bounded by it; see [`crate::agentconn`].
+    /// calls are deliberately not bounded by it; see [`crate::guestconn`].
     agent_timeout: std::time::Duration,
     pub lease: Lease,
     pub tap: String,
@@ -596,13 +596,13 @@ impl RunningSandbox {
     /// Marks the sandbox as used, deferring idle suspension.
     pub fn touch(&self) {
         self.last_activity.store(
-            burrow_core::unix_now(),
+            burrow_common::unix_now(),
             std::sync::atomic::Ordering::Relaxed,
         );
     }
 
     fn idle_secs(&self) -> i64 {
-        burrow_core::unix_now()
+        burrow_common::unix_now()
             - self
                 .last_activity
                 .load(std::sync::atomic::Ordering::Relaxed)
@@ -622,8 +622,8 @@ impl RunningSandbox {
     /// 0 reads as "brand new", so an unparseable timestamp never causes a
     /// deletion.
     fn age_secs(&self) -> i64 {
-        burrow_core::unix_from_rfc3339(&self.base_record.lock().unwrap().created_at)
-            .map(|created| burrow_core::unix_now() - created)
+        burrow_common::unix_from_rfc3339(&self.base_record.lock().unwrap().created_at)
+            .map(|created| burrow_common::unix_now() - created)
             .unwrap_or(0)
     }
 
@@ -635,7 +635,7 @@ impl RunningSandbox {
     /// Marks the sandbox suspended and starts its retention clock.
     fn enter_suspended(&self) {
         self.suspended_at.store(
-            burrow_core::unix_now(),
+            burrow_common::unix_now(),
             std::sync::atomic::Ordering::Relaxed,
         );
         self.set_state(common::SandboxState::Suspended);
@@ -645,7 +645,7 @@ impl RunningSandbox {
     fn suspended_secs(&self) -> i64 {
         match self.suspended_at.load(std::sync::atomic::Ordering::Relaxed) {
             0 => 0,
-            at => burrow_core::unix_now() - at,
+            at => burrow_common::unix_now() - at,
         }
     }
 
@@ -658,7 +658,7 @@ impl RunningSandbox {
             == common::SandboxState::Running as i32
     }
 
-    pub async fn agent(&self) -> Result<AgentClient<Channel>, Status> {
+    pub async fn agent(&self) -> Result<GuestClient<Channel>, Status> {
         // Every exec, file transfer and watch reaches the guest through here,
         // which makes it the honest definition of "in use". It excludes the
         // orchestrator's own bookkeeping, which must not keep an otherwise
@@ -680,12 +680,12 @@ impl RunningSandbox {
             // again, which is the whole point.
             return Ok(client.clone());
         }
-        let client =
-            agentconn::connect(self.workdir.join(burrow_vmm::VSOCK_UDS), self.agent_timeout)
-                .await
-                .map_err(|err| {
-                    Status::unavailable(format!("agent unreachable: {}", error_chain(&*err)))
-                })?;
+        let client = guestconn::connect(
+            self.workdir.join(burrow_firecracker::VSOCK_UDS),
+            self.agent_timeout,
+        )
+        .await
+        .map_err(|err| Status::unavailable(format!("agent unreachable: {}", error_chain(&*err))))?;
         *cached = Some(client.clone());
         Ok(client)
     }
@@ -750,9 +750,10 @@ impl RunningSandbox {
         let result = async {
             vm.pause().await?;
             if diff {
-                vm.snapshot_to(burrow_vmm::SnapshotType::Diff, &next).await
+                vm.snapshot_to(burrow_firecracker::SnapshotType::Diff, &next)
+                    .await
             } else {
-                vm.snapshot(burrow_vmm::SnapshotType::Full).await
+                vm.snapshot(burrow_firecracker::SnapshotType::Full).await
             }
         }
         .await;
@@ -777,7 +778,7 @@ impl RunningSandbox {
                 current.push(next);
             } else {
                 // A full snapshot supersedes everything before it.
-                *current = vec![burrow_vmm::SNAPSHOT_MEM_FILE.to_string()];
+                *current = vec![burrow_firecracker::SNAPSHOT_MEM_FILE.to_string()];
                 Self::remove_stale_diffs(&self.workdir).await;
             }
             current.len() > MAX_MEMORY_CHAIN
@@ -809,7 +810,7 @@ impl RunningSandbox {
         let mut chain = self.memory_chain.lock().await;
         let paths: Vec<std::path::PathBuf> =
             chain.iter().map(|name| self.workdir.join(name)).collect();
-        let target = self.workdir.join(burrow_vmm::SNAPSHOT_MEM_FILE);
+        let target = self.workdir.join(burrow_firecracker::SNAPSHOT_MEM_FILE);
         let started = std::time::Instant::now();
 
         let merged = tokio::task::spawn_blocking({
@@ -821,7 +822,7 @@ impl RunningSandbox {
 
         match merged {
             Ok(Ok(())) => {
-                *chain = vec![burrow_vmm::SNAPSHOT_MEM_FILE.to_string()];
+                *chain = vec![burrow_firecracker::SNAPSHOT_MEM_FILE.to_string()];
                 drop(chain);
                 Self::remove_stale_diffs(&self.workdir).await;
                 tracing::info!(
@@ -844,7 +845,7 @@ impl RunningSandbox {
 
     #[cfg(target_os = "linux")]
     fn merge_chain(paths: &[std::path::PathBuf], target: &Path) -> std::io::Result<()> {
-        burrow_vmm::merge_chain(paths, target)
+        burrow_firecracker::merge_chain(paths, target)
     }
 
     #[cfg(not(target_os = "linux"))]
@@ -880,16 +881,19 @@ impl RunningSandbox {
         let vm = MicroVm::restore(spec, true)
             .await
             .map_err(|err| Status::internal(format!("restore failed: {err}")))?;
-        vm.wait_for_vsock(agentconn::AGENT_PORT, agent_timeout)
+        vm.wait_for_vsock(guestconn::AGENT_PORT, agent_timeout)
             .await
             .map_err(|err| Status::internal(format!("agent did not come back: {err}")))?;
 
         // `restored: true` is what tells the guest to reseed its RNG and reset
         // its clock, which it cannot know on its own.
-        let mut agent = agentconn::connect(self.workdir.join(burrow_vmm::VSOCK_UDS), agent_timeout)
-            .await
-            .map_err(|err| Status::internal(format!("agent connect: {err}")))?;
-        agent.handshake(agentconn::handshake_request(true)).await?;
+        let mut agent = guestconn::connect(
+            self.workdir.join(burrow_firecracker::VSOCK_UDS),
+            agent_timeout,
+        )
+        .await
+        .map_err(|err| Status::internal(format!("agent connect: {err}")))?;
+        agent.handshake(guestconn::handshake_request(true)).await?;
         // This VM handshook synchronously, whatever the last one did. A failure
         // recorded there was a verdict on a VM that no longer exists.
         self.handshake.send_replace(Handshake::Done);
@@ -928,8 +932,9 @@ impl RunningSandbox {
         // too, since a boot must not come back to a snapshot a later resume
         // would restore around.
         self.memory_chain.lock().await.clear();
-        let _ = tokio::fs::remove_file(self.workdir.join(burrow_vmm::SNAPSHOT_FILE)).await;
-        let _ = tokio::fs::remove_file(self.workdir.join(burrow_vmm::SNAPSHOT_MEM_FILE)).await;
+        let _ = tokio::fs::remove_file(self.workdir.join(burrow_firecracker::SNAPSHOT_FILE)).await;
+        let _ =
+            tokio::fs::remove_file(self.workdir.join(burrow_firecracker::SNAPSHOT_MEM_FILE)).await;
         Self::remove_stale_diffs(&self.workdir).await;
         self.suspended_at
             .store(0, std::sync::atomic::Ordering::Relaxed);
@@ -942,7 +947,7 @@ impl RunningSandbox {
     async fn boot(
         &self,
         spec: MicroVmSpec,
-        request: burrow_proto::agent::v1::HandshakeRequest,
+        request: burrow_proto::guest::v1::HandshakeRequest,
         agent_timeout: std::time::Duration,
     ) -> Result<(), Status> {
         self.forget_agent().await;
@@ -961,7 +966,7 @@ impl RunningSandbox {
             .await
             .map_err(|err| Status::internal(format!("boot failed: {err}")))?;
         let (mut agent, _) =
-            match agentconn::connect_when_ready(vm.vsock_uds_path(), agent_timeout).await {
+            match guestconn::connect_when_ready(vm.vsock_uds_path(), agent_timeout).await {
                 Ok(ready) => ready,
                 Err(err) => {
                     let console = vm.console_tail(30).await;
@@ -1017,9 +1022,10 @@ impl RunningSandbox {
         let result = async {
             vm.pause().await?;
             if diff {
-                vm.snapshot_to(burrow_vmm::SnapshotType::Diff, &next).await
+                vm.snapshot_to(burrow_firecracker::SnapshotType::Diff, &next)
+                    .await
             } else {
-                vm.snapshot(burrow_vmm::SnapshotType::Full).await
+                vm.snapshot(burrow_firecracker::SnapshotType::Full).await
             }
         }
         .await;
@@ -1035,7 +1041,7 @@ impl RunningSandbox {
             if diff {
                 current.push(next);
             } else {
-                *current = vec![burrow_vmm::SNAPSHOT_MEM_FILE.to_string()];
+                *current = vec![burrow_firecracker::SNAPSHOT_MEM_FILE.to_string()];
                 Self::remove_stale_diffs(&self.workdir).await;
             }
             current.len() > MAX_MEMORY_CHAIN
@@ -1101,11 +1107,11 @@ impl RunningSandbox {
         }
         // Small, and the child writes its own over it on its first suspend.
         tokio::fs::copy(
-            self.workdir.join(burrow_vmm::SNAPSHOT_FILE),
-            dest.join(burrow_vmm::SNAPSHOT_FILE),
+            self.workdir.join(burrow_firecracker::SNAPSHOT_FILE),
+            dest.join(burrow_firecracker::SNAPSHOT_FILE),
         )
         .await
-        .map_err(|err| io(burrow_vmm::SNAPSHOT_FILE, err))?;
+        .map_err(|err| io(burrow_firecracker::SNAPSHOT_FILE, err))?;
 
         // The chain is linked, not copied. A layer is never written again
         // once it exists: a suspend writes a new diff, and a flatten renames
@@ -1199,7 +1205,7 @@ pub struct SandboxManager {
     /// Seals the secrets a persisted record carries: brokered header values,
     /// forward tokens and Kit credentials. The record in memory stays plain,
     /// since the proxy injects from it.
-    vault: Arc<burrow_core::vault::Vault>,
+    vault: Arc<burrow_common::vault::Vault>,
     config: NodeConfig,
     sandboxes: Arc<Mutex<HashMap<String, Arc<RunningSandbox>>>>,
     /// Ids claimed by a create that has not finished provisioning. Held so a
@@ -1404,7 +1410,7 @@ impl SandboxManager {
         denied: Arc<burrow_proxy::DeniedAddresses>,
         directory: Arc<burrow_proxy::directory::Directory>,
         store: Arc<burrow_store::Store>,
-        vault: burrow_core::vault::Vault,
+        vault: burrow_common::vault::Vault,
     ) -> Self {
         Self {
             vault: Arc::new(vault),
@@ -1645,9 +1651,9 @@ impl SandboxManager {
     /// history rather than the subset one code path remembered to write.
     async fn open_session(&self, sandbox: &RunningSandbox, started_by: &'static str) {
         let row = burrow_store::SessionRow {
-            id: burrow_core::SessionId::generate().to_string(),
+            id: burrow_common::SessionId::generate().to_string(),
             sandbox_id: sandbox.id().to_string(),
-            started_at: burrow_core::unix_now(),
+            started_at: burrow_common::unix_now(),
             ended_at: 0,
             started_by: started_by.to_string(),
             ended_by: String::new(),
@@ -1673,7 +1679,7 @@ impl SandboxManager {
         };
         if let Err(err) = self
             .store
-            .end_session(&id, burrow_core::unix_now(), ended_by)
+            .end_session(&id, burrow_common::unix_now(), ended_by)
         {
             tracing::error!(sandbox = sandbox.id(), %err, "could not close a session");
         }
@@ -1693,12 +1699,12 @@ impl SandboxManager {
             .map(|row| common::Session {
                 id: row.id,
                 sandbox_id: row.sandbox_id,
-                started_at: burrow_core::rfc3339_from_unix_secs(row.started_at),
+                started_at: burrow_common::rfc3339_from_unix_secs(row.started_at),
                 // 0 means nothing observed when it ended, which is exactly what
                 // an empty timestamp says.
                 ended_at: match row.ended_at {
                     0 => String::new(),
-                    at => burrow_core::rfc3339_from_unix_secs(at),
+                    at => burrow_common::rfc3339_from_unix_secs(at),
                 },
                 started_by: row.started_by,
                 ended_by: row.ended_by,
@@ -1766,7 +1772,7 @@ impl SandboxManager {
         let (mut restored, mut discarded) = (0, 0);
         for row in rows {
             let workdir = self.config.sandbox_dir(&row.id);
-            let snapshot = workdir.join(burrow_vmm::SNAPSHOT_FILE);
+            let snapshot = workdir.join(burrow_firecracker::SNAPSHOT_FILE);
             let resumable = row.state == common::SandboxState::Suspended as i32
                 && tokio::fs::try_exists(&snapshot).await.unwrap_or(false);
             // A stopped sandbox is its disks: nothing of the VM to find.
@@ -1859,13 +1865,13 @@ impl SandboxManager {
                 state: std::sync::atomic::AtomicI32::new(row.state),
                 vm: Mutex::new(None),
                 spec: std::sync::Mutex::new(spec),
-                last_activity: std::sync::atomic::AtomicI64::new(burrow_core::unix_now()),
+                last_activity: std::sync::atomic::AtomicI64::new(burrow_common::unix_now()),
                 // A row written before this column existed says 0, which read
                 // literally is 1970, putting every recovered sandbox instantly
                 // past its retention. Backfilled with now instead: the worst
                 // that costs is one extra TTL's grace after an upgrade.
                 suspended_at: std::sync::atomic::AtomicI64::new(match row.suspended_at {
-                    0 => burrow_core::unix_now(),
+                    0 => burrow_common::unix_now(),
                     at => at,
                 }),
                 agent_channel: Mutex::new(None),
@@ -1941,6 +1947,8 @@ impl SandboxManager {
                 }
             }
         }
+        crate::staged::Cache::new(&self.config.data_dir).prune();
+        crate::template::sweep_pending(&self.config.data_dir).await;
         let known: std::collections::HashSet<String> =
             self.sandboxes.lock().await.keys().cloned().collect();
 
@@ -2654,7 +2662,7 @@ impl SandboxManager {
         &self,
         template: &str,
         policy: &common::Policy,
-    ) -> Vec<burrow_proto::agent::v1::TrustBundle> {
+    ) -> Vec<burrow_proto::guest::v1::TrustBundle> {
         if self.inspection_ca_for(policy).is_empty() {
             return Vec::new();
         }
@@ -3064,7 +3072,7 @@ impl SandboxManager {
         // Firecracker bounds guest memory on its own, but nothing bounds host
         // CPU: a 1-vCPU guest spinning saturates a core. The cgroup is what
         // stops one sandbox starving its neighbours.
-        spec.limits = burrow_vmm::Limits {
+        spec.limits = burrow_firecracker::Limits {
             cpus: spec.vcpus,
             // Headroom over the guest allocation for the VMM's own footprint;
             // too tight and Firecracker itself gets OOM-killed.
@@ -3106,8 +3114,8 @@ impl SandboxManager {
             guest_mac: Some(lease.guest_mac()),
         });
         spec.boot_args = format!(
-            "{} root=/dev/vda ro init=/usr/bin/burrow-agent {} burrow.dns={} burrow.ip6={}/{} burrow.ip6gw={} {}",
-            burrow_vmm::DEFAULT_BOOT_ARGS,
+            "{} root=/dev/vda ro init=/usr/bin/burrow-guest {} burrow.dns={} burrow.ip6={}/{} burrow.ip6gw={} {}",
+            burrow_firecracker::DEFAULT_BOOT_ARGS,
             lease.kernel_ip_arg(),
             lease.host_ip,
             lease.guest_ip6(),
@@ -3366,8 +3374,8 @@ impl SandboxManager {
                 let mut shared: std::collections::HashSet<String> =
                     [TEMPLATE_KERNEL.to_string(), TEMPLATE_ROOTFS.to_string()].into();
                 if warm {
-                    shared.insert(burrow_vmm::SNAPSHOT_FILE.to_string());
-                    shared.insert(burrow_vmm::SNAPSHOT_MEM_FILE.to_string());
+                    shared.insert(burrow_firecracker::SNAPSHOT_FILE.to_string());
+                    shared.insert(burrow_firecracker::SNAPSHOT_MEM_FILE.to_string());
                     shared.insert(crate::warm::PREFETCH_PLAN.to_string());
                 }
                 for (index, mount) in crate::volume::block_mounts(&policy.volumes) {
@@ -3453,7 +3461,7 @@ impl SandboxManager {
         // its bus and mount them: firecracker cannot notify the guest itself.
         if from_warm {
             for (index, mount) in crate::volume::block_mounts(&policy.volumes) {
-                let drive = burrow_vmm::DriveSpec {
+                let drive = burrow_firecracker::DriveSpec {
                     id: format!("volume{index}"),
                     path: volume_image(index),
                     is_root: false,
@@ -3469,9 +3477,9 @@ impl SandboxManager {
         // What a guest still has to be told. Assembled before any clock starts,
         // because reading host entropy and the image's trust bundles is host
         // work and charging it to the guest would hide what the guest costs.
-        let request = agentconn::handshake_full(
+        let request = guestconn::handshake_full(
             from_warm,
-            from_warm.then(|| burrow_proto::agent::v1::NetworkConfig {
+            from_warm.then(|| burrow_proto::guest::v1::NetworkConfig {
                 ip: lease.guest_ip.to_string(),
                 prefix_len: lease.prefix_len as u32,
                 gateway: lease.host_ip.to_string(),
@@ -3503,14 +3511,14 @@ impl SandboxManager {
                 std::time::Duration::ZERO,
                 std::time::Duration::ZERO,
                 std::time::Duration::ZERO,
-                burrow_proto::agent::v1::GuestResumeTiming::default(),
+                burrow_proto::guest::v1::GuestResumeTiming::default(),
             )
         } else {
             // A VM that never produces a reachable agent is useless; tear it
             // down rather than leaving an unusable sandbox in the registry. The
             // first connection that succeeds is kept, rather than probing with
             // one and then dialling another.
-            let connected = agentconn::connect_when_ready(
+            let connected = guestconn::connect_when_ready(
                 guard.vm().vsock_uds_path(),
                 self.config.agent_timeout,
             )
@@ -3558,7 +3566,7 @@ impl SandboxManager {
             template,
             state: common::SandboxState::Running as i32,
             policy: Some(policy),
-            created_at: burrow_core::now_rfc3339(),
+            created_at: burrow_common::now_rfc3339(),
             // Both are stamped a moment later by the caller's create.
             metadata: HashMap::new(),
             name: String::new(),
@@ -3632,7 +3640,7 @@ impl SandboxManager {
             state: std::sync::atomic::AtomicI32::new(common::SandboxState::Running as i32),
             vm: Mutex::new(Some(vm)),
             spec: std::sync::Mutex::new(boot_spec),
-            last_activity: std::sync::atomic::AtomicI64::new(burrow_core::unix_now()),
+            last_activity: std::sync::atomic::AtomicI64::new(burrow_common::unix_now()),
             suspended_at: std::sync::atomic::AtomicI64::new(0),
             agent_channel: Mutex::new(None),
             agent_timeout: self.config.agent_timeout,
@@ -3640,7 +3648,7 @@ impl SandboxManager {
             // A warm-created sandbox already restores from the template's
             // memory file, so its first suspend has a base to diff against.
             memory_chain: Mutex::new(if from_warm {
-                vec![burrow_vmm::SNAPSHOT_MEM_FILE.to_string()]
+                vec![burrow_firecracker::SNAPSHOT_MEM_FILE.to_string()]
             } else {
                 Vec::new()
             }),
@@ -4169,7 +4177,7 @@ impl SandboxManager {
         }
 
         for (index, mount) in crate::volume::block_mounts(&policy.volumes) {
-            let drive = burrow_vmm::DriveSpec {
+            let drive = burrow_firecracker::DriveSpec {
                 id: format!("volume{index}"),
                 path: volume_image(index),
                 is_root: false,
@@ -4186,9 +4194,9 @@ impl SandboxManager {
         // lease. Told behind the response, as a warm create does: the caller
         // has its sandbox as soon as the VM is up, and the first call into
         // the guest waits for the handshake to settle.
-        let request = agentconn::handshake_full(
+        let request = guestconn::handshake_full(
             true,
-            Some(burrow_proto::agent::v1::NetworkConfig {
+            Some(burrow_proto::guest::v1::NetworkConfig {
                 ip: lease.guest_ip.to_string(),
                 prefix_len: lease.prefix_len as u32,
                 gateway: lease.host_ip.to_string(),
@@ -4210,7 +4218,7 @@ impl SandboxManager {
             template: source.template(),
             state: common::SandboxState::Running as i32,
             policy: Some(policy),
-            created_at: burrow_core::now_rfc3339(),
+            created_at: burrow_common::now_rfc3339(),
             metadata,
             // A restore does not inherit a name: names are unique, so the new
             // sandbox is named by the caller or not at all.
@@ -4241,7 +4249,7 @@ impl SandboxManager {
             state: std::sync::atomic::AtomicI32::new(common::SandboxState::Running as i32),
             vm: Mutex::new(Some(vm)),
             spec: std::sync::Mutex::new(boot_spec),
-            last_activity: std::sync::atomic::AtomicI64::new(burrow_core::unix_now()),
+            last_activity: std::sync::atomic::AtomicI64::new(burrow_common::unix_now()),
             suspended_at: std::sync::atomic::AtomicI64::new(0),
             agent_channel: Mutex::new(None),
             agent_timeout: self.config.agent_timeout,
@@ -4319,7 +4327,7 @@ impl SandboxManager {
             &sandbox.tap,
             &policy.volumes,
         );
-        let request = agentconn::handshake_full(
+        let request = guestconn::handshake_full(
             false,
             None,
             self.inspection_ca_for(&policy),
@@ -4431,16 +4439,16 @@ impl SandboxManager {
 /// Replaces every secret on a record with its sealed form, keyed by the
 /// sandbox and the place the value sits, for the row on disk.
 fn seal_secrets(
-    vault: &burrow_core::vault::Vault,
+    vault: &burrow_common::vault::Vault,
     record: &mut common::Sandbox,
-) -> Result<(), burrow_core::vault::Error> {
+) -> Result<(), burrow_common::vault::Error> {
     map_secrets(record, |context, value| vault.seal(context, value))
 }
 
 fn open_secrets(
-    vault: &burrow_core::vault::Vault,
+    vault: &burrow_common::vault::Vault,
     record: &mut common::Sandbox,
-) -> Result<(), burrow_core::vault::Error> {
+) -> Result<(), burrow_common::vault::Error> {
     map_secrets(record, |context, value| vault.unseal(context, value))
 }
 
@@ -4448,10 +4456,10 @@ fn open_secrets(
 /// context naming the sandbox and where the value sits.
 fn map_secrets(
     record: &mut common::Sandbox,
-    f: impl Fn(&str, &str) -> Result<String, burrow_core::vault::Error>,
-) -> Result<(), burrow_core::vault::Error> {
+    f: impl Fn(&str, &str) -> Result<String, burrow_common::vault::Error>,
+) -> Result<(), burrow_common::vault::Error> {
     let id = &record.id;
-    let apply = |place: String, value: &mut String| -> Result<(), burrow_core::vault::Error> {
+    let apply = |place: String, value: &mut String| -> Result<(), burrow_common::vault::Error> {
         *value = f(&format!("{id}/{place}"), value)?;
         Ok(())
     };
@@ -4592,7 +4600,7 @@ pub(crate) async fn create_scratch(path: &Path, size_mib: u32) -> std::io::Resul
 /// life of the volume.
 pub(crate) async fn grant_to_jail(
     workdir: &Path,
-    jail: &burrow_vmm::Jail,
+    jail: &burrow_firecracker::Jail,
     shared: &std::collections::HashSet<String>,
 ) -> std::io::Result<()> {
     let workdir = workdir.to_path_buf();
@@ -4671,10 +4679,10 @@ pub(crate) mod tests {
             Arc::new(burrow_proxy::DeniedAddresses::default()),
             Arc::new(burrow_proxy::directory::Directory::default()),
             Arc::new(burrow_store::Store::open_in_memory().unwrap()),
-            burrow_core::vault::Vault::open(&std::env::temp_dir().join(format!(
+            burrow_common::vault::Vault::open(&std::env::temp_dir().join(format!(
                 "burrow-test-{}-{}.key",
                 std::process::id(),
-                burrow_core::SandboxId::generate()
+                burrow_common::SandboxId::generate()
             )))
             .unwrap(),
         )
@@ -4689,7 +4697,7 @@ pub(crate) mod tests {
         manager.config.data_dir = data_dir.clone();
         let workdir = manager.config.sandbox_dir(id);
         tokio::fs::create_dir_all(&workdir).await.unwrap();
-        tokio::fs::write(workdir.join(burrow_vmm::SNAPSHOT_FILE), b"snapshot")
+        tokio::fs::write(workdir.join(burrow_firecracker::SNAPSHOT_FILE), b"snapshot")
             .await
             .unwrap();
 
@@ -4843,7 +4851,7 @@ pub(crate) mod tests {
 
         let warm = crate::warm::warm_dir(&manager.config.templates_dir(), "app");
         tokio::fs::create_dir_all(&warm).await.unwrap();
-        tokio::fs::write(warm.join(burrow_vmm::SNAPSHOT_MEM_FILE), b"stale")
+        tokio::fs::write(warm.join(burrow_firecracker::SNAPSHOT_MEM_FILE), b"stale")
             .await
             .unwrap();
 
@@ -4930,7 +4938,7 @@ pub(crate) mod tests {
         // Nothing at all until there is a base image to build a chain on.
         assert!(discover_memory_chain(&dir).await.is_empty());
 
-        std::fs::write(dir.join(burrow_vmm::SNAPSHOT_MEM_FILE), b"base").unwrap();
+        std::fs::write(dir.join(burrow_firecracker::SNAPSHOT_MEM_FILE), b"base").unwrap();
         // Two past the cap, and written out of order so nothing can be reading
         // the directory's order as the chain's.
         for index in [3usize, 1, 6, 2, 5, 4] {
@@ -4944,7 +4952,7 @@ pub(crate) mod tests {
         assert_eq!(
             discover_memory_chain(&dir).await,
             vec![
-                burrow_vmm::SNAPSHOT_MEM_FILE.to_string(),
+                burrow_firecracker::SNAPSHOT_MEM_FILE.to_string(),
                 "snapshot.diff1.mem".to_string(),
                 "snapshot.diff2.mem".to_string(),
                 "snapshot.diff3.mem".to_string(),
@@ -4960,7 +4968,7 @@ pub(crate) mod tests {
         assert_eq!(
             discover_memory_chain(&dir).await,
             vec![
-                burrow_vmm::SNAPSHOT_MEM_FILE.to_string(),
+                burrow_firecracker::SNAPSHOT_MEM_FILE.to_string(),
                 "snapshot.diff1.mem".to_string(),
                 "snapshot.diff2.mem".to_string(),
             ]
@@ -5061,7 +5069,7 @@ pub(crate) mod tests {
             agent_timeout: std::time::Duration::from_millis(1),
             handshake: settled(),
             memory_chain: Mutex::new(Vec::new()),
-            last_activity: std::sync::atomic::AtomicI64::new(burrow_core::unix_now()),
+            last_activity: std::sync::atomic::AtomicI64::new(burrow_common::unix_now()),
             suspended_at: std::sync::atomic::AtomicI64::new(0),
             usage: std::sync::Mutex::new(Usage::default()),
             session: std::sync::Mutex::new(None),
@@ -5157,7 +5165,7 @@ pub(crate) mod tests {
         spawn_handshake(
             &manager,
             &sandbox,
-            burrow_proto::agent::v1::HandshakeRequest::default(),
+            burrow_proto::guest::v1::HandshakeRequest::default(),
             std::time::Duration::from_millis(1),
         );
         // The registry's reference is the one that matters; a test holding
@@ -5196,7 +5204,7 @@ pub(crate) mod tests {
             agent_timeout: std::time::Duration::from_millis(1),
             handshake: settled(),
             memory_chain: Mutex::new(Vec::new()),
-            last_activity: std::sync::atomic::AtomicI64::new(burrow_core::unix_now()),
+            last_activity: std::sync::atomic::AtomicI64::new(burrow_common::unix_now()),
             suspended_at: std::sync::atomic::AtomicI64::new(0),
             usage: std::sync::Mutex::new(Usage::default()),
             session: std::sync::Mutex::new(None),
@@ -5280,7 +5288,7 @@ pub(crate) mod tests {
         assert!(sandbox.suspended_at() > 0);
         // Backdated, because a test cannot wait out a real TTL.
         sandbox.suspended_at.store(
-            burrow_core::unix_now() - 120,
+            burrow_common::unix_now() - 120,
             std::sync::atomic::Ordering::Relaxed,
         );
         assert!(sandbox.suspended_secs() >= 120);

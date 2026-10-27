@@ -16,8 +16,8 @@ mod vsock;
 
 use tonic::{Request, Response, Status, transport::Server};
 
-use burrow_proto::agent::v1 as agentpb;
-use burrow_proto::agent::v1::agent_server::{Agent, AgentServer};
+use burrow_proto::guest::v1 as guestpb;
+use burrow_proto::guest::v1::guest_server::{Guest, GuestServer};
 
 /// vsock port the node daemon dials.
 const AGENT_PORT: u32 = 1024;
@@ -39,11 +39,11 @@ const VERSION: &str = env!("CARGO_PKG_VERSION");
 struct AgentService;
 
 #[tonic::async_trait]
-impl Agent for AgentService {
+impl Guest for AgentService {
     async fn handshake(
         &self,
-        req: Request<agentpb::HandshakeRequest>,
-    ) -> Result<Response<agentpb::HandshakeResponse>, Status> {
+        req: Request<guestpb::HandshakeRequest>,
+    ) -> Result<Response<guestpb::HandshakeResponse>, Status> {
         let arrival = req.extensions().get::<vsock::Arrival>().copied();
         let req = req.into_inner();
         tracing::debug!(restored = req.is_restored, "handshake from host");
@@ -104,7 +104,7 @@ impl Agent for AgentService {
         }
 
         let total = started.elapsed();
-        let timing = agentpb::GuestResumeTiming {
+        let timing = guestpb::GuestResumeTiming {
             parked_us: arrival.map_or(0, |a| a.parked.as_micros() as u64),
             accept_to_call_us: arrival.map_or(0, |a| {
                 a.accepted_at.elapsed().saturating_sub(total).as_micros() as u64
@@ -133,7 +133,7 @@ impl Agent for AgentService {
             "handshake timing"
         );
 
-        Ok(Response::new(agentpb::HandshakeResponse {
+        Ok(Response::new(guestpb::HandshakeResponse {
             agent_version: VERSION.into(),
             timing: Some(timing),
         }))
@@ -141,16 +141,16 @@ impl Agent for AgentService {
 
     async fn health(
         &self,
-        _req: Request<agentpb::AgentHealthRequest>,
-    ) -> Result<Response<agentpb::AgentHealthResponse>, Status> {
-        Ok(Response::new(agentpb::AgentHealthResponse {}))
+        _req: Request<guestpb::GuestHealthRequest>,
+    ) -> Result<Response<guestpb::GuestHealthResponse>, Status> {
+        Ok(Response::new(guestpb::GuestHealthResponse {}))
     }
 
-    type ExecStream = tokio_stream::wrappers::ReceiverStream<Result<agentpb::ExecOutput, Status>>;
+    type ExecStream = tokio_stream::wrappers::ReceiverStream<Result<guestpb::ExecOutput, Status>>;
 
     async fn exec(
         &self,
-        req: Request<tonic::Streaming<agentpb::ExecInput>>,
+        req: Request<tonic::Streaming<guestpb::ExecInput>>,
     ) -> Result<Response<Self::ExecStream>, Status> {
         let rx = exec::run(req.into_inner()).await?;
         Ok(Response::new(tokio_stream::wrappers::ReceiverStream::new(
@@ -160,17 +160,17 @@ impl Agent for AgentService {
 
     async fn upload_file(
         &self,
-        req: Request<tonic::Streaming<agentpb::FileChunk>>,
-    ) -> Result<Response<agentpb::UploadResult>, Status> {
+        req: Request<tonic::Streaming<guestpb::FileChunk>>,
+    ) -> Result<Response<guestpb::UploadResult>, Status> {
         Ok(Response::new(files::upload(req.into_inner()).await?))
     }
 
     type DownloadFileStream =
-        tokio_stream::wrappers::ReceiverStream<Result<agentpb::FileChunk, Status>>;
+        tokio_stream::wrappers::ReceiverStream<Result<guestpb::FileChunk, Status>>;
 
     async fn download_file(
         &self,
-        req: Request<agentpb::DownloadRequest>,
+        req: Request<guestpb::DownloadRequest>,
     ) -> Result<Response<Self::DownloadFileStream>, Status> {
         let rx = files::download(req.into_inner().path).await?;
         Ok(Response::new(tokio_stream::wrappers::ReceiverStream::new(
@@ -178,11 +178,11 @@ impl Agent for AgentService {
         )))
     }
 
-    type WatchStream = tokio_stream::wrappers::ReceiverStream<Result<agentpb::WatchEvent, Status>>;
+    type WatchStream = tokio_stream::wrappers::ReceiverStream<Result<guestpb::WatchEvent, Status>>;
 
     async fn watch(
         &self,
-        req: Request<agentpb::WatchRequest>,
+        req: Request<guestpb::WatchRequest>,
     ) -> Result<Response<Self::WatchStream>, Status> {
         let req = req.into_inner();
         let interval = std::time::Duration::from_millis(if req.interval_ms == 0 {
@@ -198,8 +198,8 @@ impl Agent for AgentService {
 
     async fn list_dir(
         &self,
-        req: Request<agentpb::ListDirRequest>,
-    ) -> Result<Response<agentpb::ListDirResponse>, Status> {
+        req: Request<guestpb::ListDirRequest>,
+    ) -> Result<Response<guestpb::ListDirResponse>, Status> {
         Ok(Response::new(
             files::list_dir(&req.into_inner().path).await?,
         ))
@@ -207,24 +207,24 @@ impl Agent for AgentService {
 
     async fn list_commands(
         &self,
-        _req: Request<agentpb::ListCommandsRequest>,
-    ) -> Result<Response<agentpb::ListCommandsResponse>, Status> {
+        _req: Request<guestpb::ListCommandsRequest>,
+    ) -> Result<Response<guestpb::ListCommandsResponse>, Status> {
         Ok(Response::new(commands::list()))
     }
 
     async fn get_command(
         &self,
-        req: Request<agentpb::GetCommandRequest>,
-    ) -> Result<Response<agentpb::CommandInfo>, Status> {
+        req: Request<guestpb::GetCommandRequest>,
+    ) -> Result<Response<guestpb::CommandInfo>, Status> {
         Ok(Response::new(commands::get(&req.into_inner().command_id)?))
     }
 
     type AttachCommandStream =
-        tokio_stream::wrappers::ReceiverStream<Result<agentpb::ExecOutput, Status>>;
+        tokio_stream::wrappers::ReceiverStream<Result<guestpb::ExecOutput, Status>>;
 
     async fn attach_command(
         &self,
-        req: Request<agentpb::AttachCommandRequest>,
+        req: Request<guestpb::AttachCommandRequest>,
     ) -> Result<Response<Self::AttachCommandStream>, Status> {
         let rx = commands::attach(&req.into_inner().command_id)?;
         Ok(Response::new(tokio_stream::wrappers::ReceiverStream::new(
@@ -234,17 +234,17 @@ impl Agent for AgentService {
 
     async fn signal_command(
         &self,
-        req: Request<agentpb::SignalCommandRequest>,
-    ) -> Result<Response<agentpb::SignalCommandResponse>, Status> {
+        req: Request<guestpb::SignalCommandRequest>,
+    ) -> Result<Response<guestpb::SignalCommandResponse>, Status> {
         let req = req.into_inner();
         commands::signal(&req.command_id, req.signal)?;
-        Ok(Response::new(agentpb::SignalCommandResponse {}))
+        Ok(Response::new(guestpb::SignalCommandResponse {}))
     }
 
     async fn create_user(
         &self,
-        req: Request<agentpb::CreateUserRequest>,
-    ) -> Result<Response<agentpb::CreateUserResponse>, Status> {
+        req: Request<guestpb::CreateUserRequest>,
+    ) -> Result<Response<guestpb::CreateUserResponse>, Status> {
         Ok(Response::new(
             users::create_user(&req.into_inner().name).await?,
         ))
@@ -252,8 +252,8 @@ impl Agent for AgentService {
 
     async fn create_group(
         &self,
-        req: Request<agentpb::CreateGroupRequest>,
-    ) -> Result<Response<agentpb::CreateGroupResponse>, Status> {
+        req: Request<guestpb::CreateGroupRequest>,
+    ) -> Result<Response<guestpb::CreateGroupResponse>, Status> {
         Ok(Response::new(
             users::create_group(&req.into_inner().name).await?,
         ))
@@ -261,20 +261,20 @@ impl Agent for AgentService {
 
     async fn add_user_to_group(
         &self,
-        req: Request<agentpb::GroupMembership>,
-    ) -> Result<Response<agentpb::GroupMembershipResponse>, Status> {
+        req: Request<guestpb::GroupMembership>,
+    ) -> Result<Response<guestpb::GroupMembershipResponse>, Status> {
         let req = req.into_inner();
         users::add_to_group(&req.user, &req.group).await?;
-        Ok(Response::new(agentpb::GroupMembershipResponse {}))
+        Ok(Response::new(guestpb::GroupMembershipResponse {}))
     }
 
     async fn remove_user_from_group(
         &self,
-        req: Request<agentpb::GroupMembership>,
-    ) -> Result<Response<agentpb::GroupMembershipResponse>, Status> {
+        req: Request<guestpb::GroupMembership>,
+    ) -> Result<Response<guestpb::GroupMembershipResponse>, Status> {
         let req = req.into_inner();
         users::remove_from_group(&req.user, &req.group).await?;
-        Ok(Response::new(agentpb::GroupMembershipResponse {}))
+        Ok(Response::new(guestpb::GroupMembershipResponse {}))
     }
 }
 
@@ -286,7 +286,7 @@ async fn serve() -> anyhow::Result<()> {
     tracing::debug!(
         port = AGENT_PORT,
         version = VERSION,
-        "burrow-agent listening on vsock"
+        "burrow-guest listening on vsock"
     );
 
     let incoming = async_stream::stream! {
@@ -326,7 +326,7 @@ async fn serve() -> anyhow::Result<()> {
     };
 
     Server::builder()
-        .add_service(AgentServer::new(AgentService))
+        .add_service(GuestServer::new(AgentService))
         .serve_with_incoming(incoming)
         .await?;
     Ok(())

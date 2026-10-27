@@ -17,7 +17,7 @@ use crate::image::ImageConfig;
 use crate::resolve::{Loaded, Resolved};
 use crate::surface::{Surface, service_entry};
 use crate::{Result, invalid, refused};
-use burrow_core::glob::is_host_match;
+use burrow_common::glob::is_host_match;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum Phase {

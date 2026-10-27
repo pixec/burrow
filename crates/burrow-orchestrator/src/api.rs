@@ -36,7 +36,7 @@ impl tonic::service::Interceptor for NodeAuth {
         }
         // Every call to a node goes through here, which makes it the one place
         // that can link a node's spans to the request that caused them.
-        burrow_core::telemetry::propagation::inject(req.metadata_mut());
+        burrow_common::telemetry::propagation::inject(req.metadata_mut());
         Ok(req)
     }
 }
@@ -331,7 +331,7 @@ impl ApiService {
             .nodes
             .node_edge(node_id)
             .and_then(|(domain, port)| {
-                burrow_core::edge::sandbox_url(&domain, port, sandbox_id, guest_port)
+                burrow_common::edge::sandbox_url(&domain, port, sandbox_id, guest_port)
             })
             .unwrap_or_default()
     }
@@ -474,6 +474,40 @@ impl ApiService {
         !self.0.nodes.health(node_id).unwrap_or(false)
     }
 
+    /// Asks a healthy node what the object store holds and records it,
+    /// returning whether `id` turned out to be there.
+    async fn refresh_durable(&self, id: &str) -> bool {
+        for node_id in self.0.nodes.healthy_ids() {
+            let Some(endpoint) = self.0.nodes.endpoint(&node_id) else {
+                continue;
+            };
+            let Ok(mut client) = self
+                .0
+                .channels
+                .get(&endpoint, self.0.node_token.as_deref())
+                .await
+            else {
+                continue;
+            };
+            let Ok(resp) = client
+                .list_durable_snapshots(nodepb::NodeListSnapshotsRequest {
+                    sandbox_id: String::new(),
+                })
+                .await
+            else {
+                continue;
+            };
+            let listed = resp.into_inner().snapshots;
+            let is_there = listed.iter().any(|snapshot| snapshot.id == id);
+            self.0.snapshots.adopt_remote(listed);
+            if is_there {
+                self.0.snapshots.mark_durable(id);
+            }
+            return is_there;
+        }
+        false
+    }
+
     /// The snapshot, the node a create from it should go to, and a client
     /// for that node.
     ///
@@ -487,7 +521,7 @@ impl ApiService {
         id: &str,
         want: &crate::registry::Placement,
     ) -> Result<(common::Snapshot, String, NodeClient), Status> {
-        let snapshot = self
+        let mut snapshot = self
             .0
             .snapshots
             .get(id)
@@ -495,6 +529,12 @@ impl ApiService {
         let holder = (!snapshot.node_id.is_empty()
             && self.0.nodes.endpoint(&snapshot.node_id).is_some())
         .then(|| snapshot.node_id.clone());
+        // A node that uploaded a snapshot and died before its next heartbeat
+        // never said so. The store knows, and any node with it configured can
+        // ask, so one is asked before the snapshot is declared stranded.
+        if holder.is_none() && !snapshot.is_durable && self.refresh_durable(id).await {
+            snapshot.is_durable = true;
+        }
         let node_id = match holder {
             Some(node_id) => {
                 self.require_labels(&node_id, &want.node_labels)?;
@@ -617,7 +657,7 @@ impl Burrow for ApiService {
         _req: Request<api::HealthRequest>,
     ) -> Result<Response<api::HealthResponse>, Status> {
         Ok(Response::new(api::HealthResponse {
-            version: burrow_core::VERSION.into(),
+            version: burrow_common::VERSION.into(),
         }))
     }
 
@@ -661,8 +701,8 @@ impl Burrow for ApiService {
         // Refused here as well as on the node: placement charges a node and
         // may replicate a template before the create is ever sent, and none of
         // that should be spent on a request the node will reject anyway.
-        burrow_core::tags::validate(&req.metadata)?;
-        burrow_core::tags::validate_labels(&req.node_labels)?;
+        burrow_common::tags::validate(&req.metadata)?;
+        burrow_common::tags::validate_labels(&req.node_labels)?;
         if let Some(network) = req.policy.as_mut().and_then(|p| p.network.as_mut()) {
             self.resolve_secret_refs(network)?;
         }
@@ -674,7 +714,7 @@ impl Burrow for ApiService {
         }
         // The orchestrator owns the id namespace outright: a caller names a
         // sandbox, and the server says what it is called.
-        let sandbox_id = burrow_core::SandboxId::generate().to_string();
+        let sandbox_id = burrow_common::SandboxId::generate().to_string();
         // Held until the record is in the registry: an id and a name are both
         // claims on a namespace, and a create that is still building has to
         // hold them or a second create makes a duplicate.
@@ -912,7 +952,7 @@ impl Burrow for ApiService {
         req: Request<api::ListSandboxesRequest>,
     ) -> Result<Response<api::ListSandboxesResponse>, Status> {
         let filter = req.into_inner().tag;
-        let filter = burrow_core::tags::parse_filter(&filter)?;
+        let filter = burrow_common::tags::parse_filter(&filter)?;
         let healthy = self.0.nodes.healthy_ids();
         let mut sandboxes = self.0.sandboxes.list_tagged(filter);
         for sandbox in &mut sandboxes {
@@ -1168,10 +1208,10 @@ impl Burrow for ApiService {
         // A fork has no placement decision to constrain: the child is built
         // where its source's state is, so labels are checked against that node
         // before anything is built.
-        burrow_core::tags::validate_labels(&req.node_labels)?;
+        burrow_common::tags::validate_labels(&req.node_labels)?;
         self.require_labels(&node_id, &req.node_labels)?;
         let child_id = if req.sandbox_id.is_empty() {
-            burrow_core::SandboxId::generate().to_string()
+            burrow_common::SandboxId::generate().to_string()
         } else {
             validate_sandbox_id(&req.sandbox_id)?;
             req.sandbox_id
@@ -1221,7 +1261,7 @@ impl Burrow for ApiService {
         );
         let node_id = self.node_of(&sandbox_id)?;
         // The orchestrator owns the id namespace, here as everywhere else.
-        let snapshot_id = burrow_core::SnapshotId::generate().to_string();
+        let snapshot_id = burrow_common::SnapshotId::generate().to_string();
 
         let mut client = self.node_for(&sandbox_id).await?;
         let snapshot = client
@@ -1299,7 +1339,7 @@ impl Burrow for ApiService {
         req: Request<api::CreateVolumeRequest>,
     ) -> Result<Response<common::Volume>, Status> {
         let req = req.into_inner();
-        burrow_core::tags::validate_labels(&req.node_labels)?;
+        burrow_common::tags::validate_labels(&req.node_labels)?;
         if self.0.volumes.get(&req.name).is_some() {
             return Err(Status::already_exists(format!(
                 "volume {} exists",
@@ -1408,7 +1448,7 @@ impl Burrow for ApiService {
                 .map(|r| r.id)
                 .ok_or_else(|| Status::invalid_argument("ref is required"))?,
         );
-        burrow_core::tags::validate(&req.tags)?;
+        burrow_common::tags::validate(&req.tags)?;
         let mut client = self.node_for(&id).await?;
         let sandbox = client
             .update_tags(nodepb::NodeUpdateTagsRequest {
@@ -2076,7 +2116,7 @@ mod tests {
         for good in ["build-482", "my_sandbox", "a.b", "sbx_abc123", "x"] {
             assert!(validate_sandbox_id(good).is_ok(), "{good:?}");
         }
-        assert!(validate_sandbox_id(&burrow_core::SandboxId::generate().to_string()).is_ok());
+        assert!(validate_sandbox_id(&burrow_common::SandboxId::generate().to_string()).is_ok());
     }
 
     #[test]

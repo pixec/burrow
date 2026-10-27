@@ -11,6 +11,7 @@ export type SandboxState =
   | "running"
   | "paused"
   | "suspended"
+  | "stopped"
   | "stopping"
   | "destroyed"
   | "failed"
@@ -18,8 +19,9 @@ export type SandboxState =
 
 /**
  * The coarse lifecycle a sandbox is in, a narrower view of
- * {@link SandboxState}. `suspended` and `paused` both read as `stopped`:
- * either way the sandbox must be resumed before it will run anything.
+ * {@link SandboxState}. `suspended`, `paused` and `stopped` all read as
+ * `stopped`: either way the sandbox must be resumed, or booted, before it will
+ * run anything.
  */
 export type SandboxStatus =
   | "pending"
@@ -425,6 +427,30 @@ export interface SandboxInfo {
   usage: Usage;
 }
 
+/** Inputs for a template pulled from a Sandbox Kit. */
+export interface KitOptions {
+  /** Create-phase arg values by name, applied to every Kit declaring the arg. */
+  args?: Record<string, string>;
+  /** Environment overrides for the Kit's processes, applied after image defaults. */
+  env?: Record<string, string>;
+  /**
+   * Capability types to decline, by full name. A Kit requiring one is refused;
+   * one asking optionally does without.
+   */
+  rejectCapabilities?: ReadonlyArray<string>;
+}
+
+/** Options for {@link Sandbox.recreate}. */
+export interface RecreateOptions extends CallOptions {
+  /** Template for the new root disk. Omitted keeps the current one. */
+  template?: string;
+  /**
+   * Kit inputs replacing the recorded ones: `args` and `env` by name,
+   * `rejectCapabilities` wholesale, so an empty list clears it.
+   */
+  kit?: KitOptions;
+}
+
 export interface CreateOptions {
   /**
    * Name for the sandbox, usable anywhere its id is, and the only identity a
@@ -475,6 +501,12 @@ export interface CreateOptions {
    * it, and boots cold rather than restoring a warm snapshot.
    */
   volumes?: ReadonlyArray<VolumeMount>;
+  /**
+   * Inputs for a template pulled from a Sandbox Kit. A Kit template is
+   * provisioned the way its descriptors ask whether or not this is set; on
+   * any other template it is ignored.
+   */
+  kit?: KitOptions;
   /**
    * Name this sandbox answers to on the networks it joins. Defaults to the
    * sandbox id, which always resolves.
@@ -845,6 +877,13 @@ export interface DirEntry {
   isDir: boolean;
   size: number;
   mode: number;
+}
+
+/** One file or directory, as {@link Sandbox.stat} reports it. */
+export interface FileInfo extends DirEntry {
+  /** The absolute path that was asked about. */
+  path: string;
+  type: "file" | "dir";
 }
 
 export interface PortMapping {

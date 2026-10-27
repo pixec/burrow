@@ -39,6 +39,12 @@ agent as init (OCI images have no init of their own), records the image's
 declared environment in `image.json`, and packs the result into an ext4 rootfs.
 What you get is a template on a node, and you create sandboxes from the template.
 
+Unpacked layers are kept. Every prefix of an image's layer list leaves its
+tree under `build/staged` in the node's data directory, so a second image on
+the same base, or a Kit composition on a workload already imported, starts
+from that tree and unpacks only the layers that differ. A tree nobody has
+used for a week is removed.
+
 Docker `ENTRYPOINT` and `CMD` are not run, because the guest agent is PID 1 and
 you start processes with `burrow exec`. The image's `ENV` and `WORKDIR` are
 applied to exec'd commands, and a request's `--env` and `--workdir` win where
