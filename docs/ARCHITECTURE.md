@@ -772,11 +772,11 @@ reach the bucket, not only from the one that took them. Deleting a snapshot
 removes it from the store too, and the delete goes to whichever compatible
 node is up when the holder is not.
 
-The S3 client is Burrow's own: SigV4 with an unsigned payload, so a
-multi-gigabyte memory image streams from disk without being hashed first, over
-the same reqwest and rustls the node already uses for registries. Credentials
-come from `AWS_ACCESS_KEY_ID` and `AWS_SECRET_ACCESS_KEY`; any S3-compatible
-store works, and the node creates its bucket if it is missing.
+The store is spoken to through the AWS S3 SDK, built on the rustls and ring
+the node already uses so the musl cross build carries one TLS stack.
+Credentials come from `AWS_ACCESS_KEY_ID` and `AWS_SECRET_ACCESS_KEY`, the
+endpoint is addressed path-style, any S3-compatible store works, and the node
+creates its bucket if it is missing.
 
 ## Lifecycle and reclamation
 

@@ -1,39 +1,33 @@
-//! The fleet's object store, spoken to as S3.
+//! The fleet's object store, spoken to as S3 through the AWS SDK.
 //!
-//! Just enough of the protocol for whole objects: put, get, head, delete and a
-//! prefix listing, signed with SigV4 and an unsigned payload so a multi-gigabyte
-//! memory image streams from disk without being hashed first. Written here
-//! rather than taken from a crate because every S3 crate pulls its own TLS and
-//! HTTP stacks, and the node already has reqwest on rustls.
-//!
-//! Credentials come from the environment, `AWS_ACCESS_KEY_ID` and
-//! `AWS_SECRET_ACCESS_KEY`, the way every S3 tool reads them.
+//! Whole objects only: put, get, head, delete and a prefix listing. The SDK is
+//! built on the node's own TLS stack, rustls on ring, so the musl cross build
+//! stays free of a second one. Credentials come from the environment,
+//! `AWS_ACCESS_KEY_ID` and `AWS_SECRET_ACCESS_KEY`, the way every S3 tool
+//! reads them; the endpoint is always addressed path-style, which every
+//! self-hosted store supports and which a bucket name with a dot needs.
 
 use std::path::Path;
 
-use hmac::{Hmac, Mac as _};
-use sha2::{Digest as _, Sha256};
+use aws_sdk_s3::Client;
+use aws_sdk_s3::config::{BehaviorVersion, Credentials, Region};
+use aws_sdk_s3::error::SdkError;
+use aws_sdk_s3::operation::create_bucket::CreateBucketError;
+use aws_sdk_s3::operation::get_object::GetObjectError;
+use aws_sdk_s3::operation::head_object::HeadObjectError;
+use aws_sdk_s3::primitives::ByteStream;
+use aws_smithy_http_client::tls;
+use futures::TryStreamExt as _;
+use tokio::io::{AsyncReadExt as _, AsyncSeekExt as _, AsyncWriteExt as _};
 use tonic::Status;
-
-type HmacSha256 = Hmac<Sha256>;
-
-const UNSIGNED: &str = "UNSIGNED-PAYLOAD";
 
 #[derive(Clone)]
 pub struct ObjectStore {
-    http: reqwest::Client,
-    /// Scheme and host of the endpoint, no trailing slash.
+    client: Client,
     endpoint: String,
     bucket: String,
     /// Key prefix inside the bucket, empty or ending in `/`.
     prefix: String,
-    region: String,
-    access_key: String,
-    secret_key: String,
-    /// `endpoint/bucket/key` rather than `bucket.endpoint/key`. Always, since
-    /// every self-hosted store supports it and a bucket name with a dot
-    /// breaks the other form's TLS.
-    host: String,
 }
 
 /// Where the store is, from the flags: `s3://bucket/prefix` and an endpoint.
@@ -56,36 +50,51 @@ impl ObjectStore {
         if bucket.is_empty() {
             anyhow::bail!("--object-store names no bucket");
         }
-        let endpoint = options.endpoint.trim_end_matches('/').to_string();
-        let host = reqwest::Url::parse(&endpoint)
-            .ok()
-            .and_then(|url| {
-                url.host_str().map(|h| match url.port() {
-                    Some(port) => format!("{h}:{port}"),
-                    None => h.to_string(),
-                })
-            })
-            .ok_or_else(|| anyhow::anyhow!("--object-store-endpoint is not a URL"))?;
         let access_key = std::env::var("AWS_ACCESS_KEY_ID").unwrap_or_default();
         let secret_key = std::env::var("AWS_SECRET_ACCESS_KEY").unwrap_or_default();
         if access_key.is_empty() || secret_key.is_empty() {
             anyhow::bail!("--object-store needs AWS_ACCESS_KEY_ID and AWS_SECRET_ACCESS_KEY");
         }
+        let http = aws_smithy_http_client::Builder::new()
+            .tls_provider(tls::Provider::Rustls(
+                tls::rustls_provider::CryptoMode::Ring,
+            ))
+            .build_https();
+        let config = aws_sdk_s3::Config::builder()
+            .behavior_version(BehaviorVersion::latest())
+            .region(Region::new(options.region.clone()))
+            .endpoint_url(options.endpoint.trim_end_matches('/'))
+            .credentials_provider(Credentials::new(
+                access_key,
+                secret_key,
+                None,
+                None,
+                "burrow-flags",
+            ))
+            .force_path_style(true)
+            // No trailing checksum on puts: a memory image is streamed with a
+            // known length, and the self-hosted stores this targets either
+            // ignore the trailer or pay for parsing it.
+            .request_checksum_calculation(
+                aws_sdk_s3::config::RequestChecksumCalculation::WhenRequired,
+            )
+            .response_checksum_validation(
+                aws_sdk_s3::config::ResponseChecksumValidation::WhenRequired,
+            )
+            .http_client(http)
+            .sleep_impl(aws_sdk_s3::config::SharedAsyncSleep::new(
+                aws_smithy_async::rt::sleep::TokioSleep::new(),
+            ))
+            .build();
         Ok(Self {
-            http: reqwest::Client::builder()
-                .connect_timeout(std::time::Duration::from_secs(10))
-                .build()?,
-            endpoint,
+            client: Client::from_conf(config),
+            endpoint: options.endpoint.trim_end_matches('/').to_string(),
             bucket: bucket.to_string(),
             prefix: if prefix.is_empty() {
                 String::new()
             } else {
                 format!("{prefix}/")
             },
-            region: options.region.clone(),
-            access_key,
-            secret_key,
-            host,
         })
     }
 
@@ -93,14 +102,24 @@ impl ObjectStore {
     /// start empty, and a node that can create its own tables should not
     /// need an operator to make its bucket by hand.
     pub async fn ensure_bucket(&self) -> Result<(), Status> {
-        let resp = self
-            .signed(reqwest::Method::PUT, "", &[])
+        match self
+            .client
+            .create_bucket()
+            .bucket(&self.bucket)
             .send()
             .await
-            .map_err(|err| Status::unavailable(format!("object store: {err}")))?;
-        match resp.status().as_u16() {
-            200 | 409 => Ok(()),
-            _ => ok(resp, "").await.map(drop),
+        {
+            Ok(_) => Ok(()),
+            Err(SdkError::ServiceError(err))
+                if matches!(
+                    err.err(),
+                    CreateBucketError::BucketAlreadyOwnedByYou(_)
+                        | CreateBucketError::BucketAlreadyExists(_)
+                ) =>
+            {
+                Ok(())
+            }
+            Err(err) => Err(unavailable("create bucket", &self.bucket, err)),
         }
     }
 
@@ -112,289 +131,141 @@ impl ObjectStore {
         format!("{}{key}", self.prefix)
     }
 
-    fn url(&self, key: &str) -> String {
-        format!(
-            "{}/{}/{}",
-            self.endpoint,
-            self.bucket,
-            uri_encode(&self.key(key), false)
-        )
-    }
-
-    /// Signs a request against the object at `key`, or the bucket when `key`
-    /// is empty, with `query` already in canonical order.
-    fn signed(
-        &self,
-        method: reqwest::Method,
-        key: &str,
-        query: &[(&str, &str)],
-    ) -> reqwest::RequestBuilder {
-        let now = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_secs())
-            .unwrap_or(0);
-        let (date, stamp) = amz_date(now);
-        let canonical_uri = if key.is_empty() {
-            format!("/{}", self.bucket)
-        } else {
-            format!("/{}/{}", self.bucket, uri_encode(&self.key(key), false))
-        };
-        let canonical_query = query
-            .iter()
-            .map(|(k, v)| format!("{}={}", uri_encode(k, true), uri_encode(v, true)))
-            .collect::<Vec<_>>()
-            .join("&");
-        let canonical_headers = format!(
-            "host:{}\nx-amz-content-sha256:{UNSIGNED}\nx-amz-date:{stamp}\n",
-            self.host
-        );
-        let signed_headers = "host;x-amz-content-sha256;x-amz-date";
-        let canonical = format!(
-            "{}\n{canonical_uri}\n{canonical_query}\n{canonical_headers}\n{signed_headers}\n{UNSIGNED}",
-            method.as_str()
-        );
-        let scope = format!("{date}/{}/s3/aws4_request", self.region);
-        let to_sign = format!(
-            "AWS4-HMAC-SHA256\n{stamp}\n{scope}\n{}",
-            hex::encode(Sha256::digest(canonical.as_bytes()))
-        );
-        let key_date = hmac(
-            format!("AWS4{}", self.secret_key).as_bytes(),
-            date.as_bytes(),
-        );
-        let key_region = hmac(&key_date, self.region.as_bytes());
-        let key_service = hmac(&key_region, b"s3");
-        let key_signing = hmac(&key_service, b"aws4_request");
-        let signature = hex::encode(hmac(&key_signing, to_sign.as_bytes()));
-        let authorization = format!(
-            "AWS4-HMAC-SHA256 Credential={}/{scope}, SignedHeaders={signed_headers}, Signature={signature}",
-            self.access_key
-        );
-        let url = if key.is_empty() {
-            format!("{}/{}", self.endpoint, self.bucket)
-        } else {
-            self.url(key)
-        };
-        let url = if canonical_query.is_empty() {
-            url
-        } else {
-            format!("{url}?{canonical_query}")
-        };
-        self.http
-            .request(method, url)
-            .header("x-amz-date", stamp)
-            .header("x-amz-content-sha256", UNSIGNED)
-            .header("authorization", authorization)
-    }
-
     pub async fn put_file(&self, key: &str, path: &Path) -> Result<(), Status> {
-        let file = tokio::fs::File::open(path).await.map_err(|err| {
+        let body = ByteStream::from_path(path).await.map_err(|err| {
             Status::internal(format!("opening {} to upload: {err}", path.display()))
         })?;
-        let len = file
-            .metadata()
-            .await
-            .map_err(|err| Status::internal(format!("sizing {}: {err}", path.display())))?
-            .len();
-        let stream = tokio_util::io::ReaderStream::new(file);
-        let resp = self
-            .signed(reqwest::Method::PUT, key, &[])
-            .header("content-length", len)
-            .body(reqwest::Body::wrap_stream(stream))
+        self.client
+            .put_object()
+            .bucket(&self.bucket)
+            .key(self.key(key))
+            .body(body)
             .send()
             .await
-            .map_err(|err| Status::unavailable(format!("object store put {key}: {err}")))?;
-        ok(resp, key).await.map(drop)
+            .map(drop)
+            .map_err(|err| unavailable("put", key, err))
     }
 
     pub async fn put_bytes(&self, key: &str, bytes: Vec<u8>) -> Result<(), Status> {
-        let resp = self
-            .signed(reqwest::Method::PUT, key, &[])
-            .body(bytes)
+        self.client
+            .put_object()
+            .bucket(&self.bucket)
+            .key(self.key(key))
+            .body(ByteStream::from(bytes))
             .send()
             .await
-            .map_err(|err| Status::unavailable(format!("object store put {key}: {err}")))?;
-        ok(resp, key).await.map(drop)
+            .map(drop)
+            .map_err(|err| unavailable("put", key, err))
+    }
+
+    async fn get(&self, key: &str) -> Result<Option<ByteStream>, Status> {
+        match self
+            .client
+            .get_object()
+            .bucket(&self.bucket)
+            .key(self.key(key))
+            .send()
+            .await
+        {
+            Ok(resp) => Ok(Some(resp.body)),
+            Err(SdkError::ServiceError(err))
+                if matches!(err.err(), GetObjectError::NoSuchKey(_)) =>
+            {
+                Ok(None)
+            }
+            Err(err) => Err(unavailable("get", key, err)),
+        }
     }
 
     /// Streams an object into a file, created fresh. `None` when it does not
     /// exist.
     pub async fn get_to_file(&self, key: &str, path: &Path) -> Result<Option<()>, Status> {
-        use tokio::io::AsyncWriteExt as _;
-        let resp = self
-            .signed(reqwest::Method::GET, key, &[])
-            .send()
-            .await
-            .map_err(|err| Status::unavailable(format!("object store get {key}: {err}")))?;
-        if resp.status() == reqwest::StatusCode::NOT_FOUND {
+        let Some(body) = self.get(key).await? else {
             return Ok(None);
-        }
-        let mut resp = ok(resp, key).await?;
+        };
         let mut file = tokio::fs::File::create(path)
             .await
             .map_err(|err| Status::internal(format!("creating {}: {err}", path.display())))?;
-        while let Some(chunk) = resp
-            .chunk()
+        tokio::io::copy(&mut body.into_async_read(), &mut file)
             .await
-            .map_err(|err| Status::unavailable(format!("object store read {key}: {err}")))?
-        {
-            file.write_all(&chunk)
-                .await
-                .map_err(|err| Status::internal(format!("writing {}: {err}", path.display())))?;
-        }
-        file.flush()
-            .await
-            .map_err(|err| Status::internal(format!("writing {}: {err}", path.display())))?;
+            .map_err(|err| Status::unavailable(format!("object store read {key}: {err}")))?;
         Ok(Some(()))
     }
 
     pub async fn get_bytes(&self, key: &str) -> Result<Option<Vec<u8>>, Status> {
-        let resp = self
-            .signed(reqwest::Method::GET, key, &[])
-            .send()
-            .await
-            .map_err(|err| Status::unavailable(format!("object store get {key}: {err}")))?;
-        if resp.status() == reqwest::StatusCode::NOT_FOUND {
+        let Some(body) = self.get(key).await? else {
             return Ok(None);
-        }
-        let resp = ok(resp, key).await?;
-        resp.bytes()
+        };
+        body.collect()
             .await
-            .map(|b| Some(b.to_vec()))
+            .map(|data| Some(data.into_bytes().to_vec()))
             .map_err(|err| Status::unavailable(format!("object store read {key}: {err}")))
     }
 
     pub async fn exists(&self, key: &str) -> Result<bool, Status> {
-        let resp = self
-            .signed(reqwest::Method::HEAD, key, &[])
+        match self
+            .client
+            .head_object()
+            .bucket(&self.bucket)
+            .key(self.key(key))
             .send()
             .await
-            .map_err(|err| Status::unavailable(format!("object store head {key}: {err}")))?;
-        match resp.status() {
-            reqwest::StatusCode::NOT_FOUND => Ok(false),
-            status if status.is_success() => Ok(true),
-            status => Err(Status::unavailable(format!(
-                "object store head {key}: {status}"
-            ))),
+        {
+            Ok(_) => Ok(true),
+            Err(SdkError::ServiceError(err))
+                if matches!(err.err(), HeadObjectError::NotFound(_)) =>
+            {
+                Ok(false)
+            }
+            Err(err) => Err(unavailable("head", key, err)),
         }
     }
 
     pub async fn delete(&self, key: &str) -> Result<(), Status> {
-        let resp = self
-            .signed(reqwest::Method::DELETE, key, &[])
+        self.client
+            .delete_object()
+            .bucket(&self.bucket)
+            .key(self.key(key))
             .send()
             .await
-            .map_err(|err| Status::unavailable(format!("object store delete {key}: {err}")))?;
-        if resp.status() == reqwest::StatusCode::NOT_FOUND {
-            return Ok(());
-        }
-        ok(resp, key).await.map(drop)
+            .map(drop)
+            .map_err(|err| unavailable("delete", key, err))
     }
 
     /// Keys under `prefix`, relative to the store's own prefix.
     pub async fn list(&self, prefix: &str) -> Result<Vec<String>, Status> {
         let mut keys = Vec::new();
-        let mut token: Option<String> = None;
-        let full_prefix = self.key(prefix);
-        loop {
-            let mut query: Vec<(&str, &str)> = Vec::new();
-            if let Some(token) = &token {
-                query.push(("continuation-token", token));
-            }
-            query.push(("list-type", "2"));
-            query.push(("prefix", &full_prefix));
-            query.sort();
-            let resp = self
-                .signed(reqwest::Method::GET, "", &query)
-                .send()
-                .await
-                .map_err(|err| Status::unavailable(format!("object store list: {err}")))?;
-            let body = ok(resp, "")
-                .await?
-                .text()
-                .await
-                .map_err(|err| Status::unavailable(format!("object store list: {err}")))?;
-            for key in between_all(&body, "<Key>", "</Key>") {
-                if let Some(rest) = key.strip_prefix(&self.prefix) {
+        let mut pages = self
+            .client
+            .list_objects_v2()
+            .bucket(&self.bucket)
+            .prefix(self.key(prefix))
+            .into_paginator()
+            .send();
+        while let Some(page) = pages.next().await {
+            let page = page.map_err(|err| unavailable("list", prefix, err))?;
+            for object in page.contents() {
+                if let Some(rest) = object.key().and_then(|k| k.strip_prefix(&self.prefix)) {
                     keys.push(rest.to_string());
                 }
             }
-            match between_all(&body, "<NextContinuationToken>", "</NextContinuationToken>").pop() {
-                Some(next) if body.contains("<IsTruncated>true</IsTruncated>") => {
-                    token = Some(next)
-                }
-                _ => return Ok(keys),
-            }
         }
+        Ok(keys)
     }
 }
 
-async fn ok(resp: reqwest::Response, key: &str) -> Result<reqwest::Response, Status> {
-    if resp.status().is_success() {
-        return Ok(resp);
-    }
-    let status = resp.status();
-    let body = resp.text().await.unwrap_or_default();
-    let detail = between_all(&body, "<Message>", "</Message>")
-        .pop()
-        .unwrap_or_else(|| body.chars().take(200).collect());
-    Err(Status::unavailable(format!(
-        "object store {key}: {status} {detail}"
-    )))
-}
-
-fn hmac(key: &[u8], data: &[u8]) -> Vec<u8> {
-    let mut mac = HmacSha256::new_from_slice(key).expect("hmac accepts any key length");
-    mac.update(data);
-    mac.finalize().into_bytes().to_vec()
-}
-
-/// SigV4's URI encoding: unreserved characters pass, `/` passes in a path and
-/// is encoded in a query value, everything else is percent-encoded.
-fn uri_encode(text: &str, is_query: bool) -> String {
-    let mut out = String::with_capacity(text.len());
-    for byte in text.bytes() {
-        match byte {
-            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
-                out.push(byte as char)
-            }
-            b'/' if !is_query => out.push('/'),
-            _ => out.push_str(&format!("%{byte:02X}")),
-        }
-    }
-    out
-}
-
-/// `YYYYMMDD` and `YYYYMMDDTHHMMSSZ` for a unix time.
-fn amz_date(secs: u64) -> (String, String) {
-    let days = secs / 86_400;
-    let rem = secs % 86_400;
-    let (h, m, s) = (rem / 3600, (rem % 3600) / 60, rem % 60);
-    // Civil-from-days, Howard Hinnant's algorithm.
-    let z = days as i64 + 719_468;
-    let era = z.div_euclid(146_097);
-    let doe = z.rem_euclid(146_097);
-    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
-    let y = yoe + era * 400;
-    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
-    let mp = (5 * doy + 2) / 153;
-    let d = doy - (153 * mp + 2) / 5 + 1;
-    let month = if mp < 10 { mp + 3 } else { mp - 9 };
-    let year = if month <= 2 { y + 1 } else { y };
-    let date = format!("{year:04}{month:02}{d:02}");
-    (date.clone(), format!("{date}T{h:02}{m:02}{s:02}Z"))
-}
-
-fn between_all(text: &str, open: &str, close: &str) -> Vec<String> {
-    let mut out = Vec::new();
-    let mut rest = text;
-    while let Some(start) = rest.find(open) {
-        let after = &rest[start + open.len()..];
-        let Some(end) = after.find(close) else { break };
-        out.push(after[..end].to_string());
-        rest = &after[end + close.len()..];
-    }
-    out
+fn unavailable<E: std::error::Error + 'static, R: std::fmt::Debug>(
+    what: &str,
+    key: &str,
+    err: SdkError<E, R>,
+) -> Status {
+    // The service error carries the message; the SDK's Display for the
+    // wrapper says only that a service error happened.
+    let detail = match &err {
+        SdkError::ServiceError(inner) => inner.err().to_string(),
+        other => other.to_string(),
+    };
+    Status::unavailable(format!("object store {what} {key}: {detail}"))
 }
 
 /// Sparse files over the wire.
@@ -418,7 +289,6 @@ pub fn sparse_key(key: &str) -> String {
 
 impl ObjectStore {
     pub async fn put_sparse_file(&self, key: &str, path: &Path) -> Result<(), Status> {
-        use tokio::io::{AsyncReadExt as _, AsyncSeekExt as _};
         let std_file = std::fs::File::open(path)
             .map_err(|err| Status::internal(format!("opening {}: {err}", path.display())))?;
         let apparent = std_file
@@ -456,90 +326,67 @@ impl ObjectStore {
                 }
             }
         };
-        let resp = self
-            .signed(reqwest::Method::PUT, &sparse_key(key), &[])
-            .header("content-length", content_length)
-            .body(reqwest::Body::wrap_stream(stream))
+        let body = http_body_util::StreamBody::new(stream.map_ok(http_body::Frame::data));
+        let body = ByteStream::new(aws_sdk_s3::primitives::SdkBody::from_body_1_x(body));
+        self.client
+            .put_object()
+            .bucket(&self.bucket)
+            .key(self.key(&sparse_key(key)))
+            .content_length(content_length as i64)
+            .body(body)
             .send()
             .await
-            .map_err(|err| Status::unavailable(format!("object store put {key}: {err}")))?;
-        ok(resp, key).await.map(drop)
+            .map(drop)
+            .map_err(|err| unavailable("put", key, err))
     }
 
     /// Rebuilds a sparse file from the store. `None` when the key is absent.
     pub async fn get_sparse_file(&self, key: &str, path: &Path) -> Result<Option<()>, Status> {
-        use tokio::io::{AsyncSeekExt as _, AsyncWriteExt as _};
         let sparse = sparse_key(key);
-        let resp = self
-            .signed(reqwest::Method::GET, &sparse, &[])
-            .send()
-            .await
-            .map_err(|err| Status::unavailable(format!("object store get {sparse}: {err}")))?;
-        if resp.status() == reqwest::StatusCode::NOT_FOUND {
+        let Some(body) = self.get(&sparse).await? else {
             return Ok(None);
-        }
-        let mut resp = ok(resp, &sparse).await?;
+        };
+        let mut reader = body.into_async_read();
         let mut file = tokio::fs::File::create(path)
             .await
             .map_err(|err| Status::internal(format!("creating {}: {err}", path.display())))?;
+        let read_err =
+            |err: std::io::Error| Status::unavailable(format!("object store read {sparse}: {err}"));
+        let write_err =
+            |err: std::io::Error| Status::internal(format!("writing {}: {err}", path.display()));
         let corrupt = || Status::data_loss(format!("object {sparse} is not a sparse image"));
 
-        let mut buf: Vec<u8> = Vec::new();
-        let mut extent_left: u64 = 0;
-        let mut is_header_read = false;
-        loop {
-            // Drain what the buffer can satisfy before reading more.
-            loop {
-                if extent_left > 0 {
-                    if buf.is_empty() {
-                        break;
-                    }
-                    let take = buf.len().min(extent_left as usize);
-                    file.write_all(&buf[..take]).await.map_err(|err| {
-                        Status::internal(format!("writing {}: {err}", path.display()))
-                    })?;
-                    buf.drain(..take);
-                    extent_left -= take as u64;
-                    continue;
-                }
-                if buf.len() < 16 {
-                    break;
-                }
-                if !is_header_read {
-                    if &buf[..8] != SPARSE_MAGIC {
-                        return Err(corrupt());
-                    }
-                    let apparent = u64::from_le_bytes(buf[8..16].try_into().unwrap());
-                    file.set_len(apparent).await.map_err(|err| {
-                        Status::internal(format!("sizing {}: {err}", path.display()))
-                    })?;
-                    is_header_read = true;
-                } else {
-                    let start = u64::from_le_bytes(buf[..8].try_into().unwrap());
-                    extent_left = u64::from_le_bytes(buf[8..16].try_into().unwrap());
-                    file.seek(std::io::SeekFrom::Start(start))
-                        .await
-                        .map_err(|err| {
-                            Status::internal(format!("seeking {}: {err}", path.display()))
-                        })?;
-                }
-                buf.drain(..16);
-            }
-            match resp
-                .chunk()
-                .await
-                .map_err(|err| Status::unavailable(format!("object store read {sparse}: {err}")))?
-            {
-                Some(chunk) => buf.extend_from_slice(&chunk),
-                None => break,
-            }
-        }
-        if !is_header_read || extent_left > 0 || !buf.is_empty() {
+        let mut header = [0u8; 16];
+        reader.read_exact(&mut header).await.map_err(read_err)?;
+        if &header[..8] != SPARSE_MAGIC {
             return Err(corrupt());
         }
-        file.flush()
-            .await
-            .map_err(|err| Status::internal(format!("writing {}: {err}", path.display())))?;
+        let apparent = u64::from_le_bytes(header[8..].try_into().unwrap());
+        file.set_len(apparent).await.map_err(write_err)?;
+
+        let mut extent = [0u8; 16];
+        loop {
+            match reader.read_exact(&mut extent).await {
+                Ok(_) => {}
+                Err(err) if err.kind() == std::io::ErrorKind::UnexpectedEof => break,
+                Err(err) => return Err(read_err(err)),
+            }
+            let start = u64::from_le_bytes(extent[..8].try_into().unwrap());
+            let len = u64::from_le_bytes(extent[8..].try_into().unwrap());
+            if start.checked_add(len).is_none_or(|end| end > apparent) {
+                return Err(corrupt());
+            }
+            file.seek(std::io::SeekFrom::Start(start))
+                .await
+                .map_err(write_err)?;
+            let copied = tokio::io::copy(&mut (&mut reader).take(len), &mut file)
+                .await
+                .map_err(read_err)?;
+            if copied != len {
+                return Err(corrupt());
+            }
+        }
+        file.flush().await.map_err(write_err)?;
         Ok(Some(()))
     }
 }
@@ -557,28 +404,4 @@ fn data_extents(_file: &std::fs::File, apparent: u64) -> std::io::Result<Vec<(u6
     } else {
         vec![(0, apparent)]
     })
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn dates_render_as_sigv4_expects() {
-        assert_eq!(amz_date(0).1, "19700101T000000Z");
-        assert_eq!(amz_date(1_700_000_000).1, "20231114T221320Z");
-        assert_eq!(amz_date(1_709_164_800).0, "20240229");
-    }
-
-    #[test]
-    fn encoding_keeps_slashes_in_paths_only() {
-        assert_eq!(uri_encode("a/b c", false), "a/b%20c");
-        assert_eq!(uri_encode("a/b c", true), "a%2Fb%20c");
-    }
-
-    #[test]
-    fn listing_bodies_are_parsed_without_an_xml_crate() {
-        let body = "<R><Contents><Key>p/a</Key></Contents><Contents><Key>p/b</Key></Contents></R>";
-        assert_eq!(between_all(body, "<Key>", "</Key>"), ["p/a", "p/b"]);
-    }
 }
