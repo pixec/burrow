@@ -794,7 +794,7 @@ message PruneCommandsRequest {
 
 message PruneCommandsResponse {
   uint32 removed = 1;
-  // Log bytes freed on the guest's disk.
+  // Log bytes freed on the node.
   uint64 freed_bytes = 2;
 }
 
@@ -816,7 +816,7 @@ message CommandInfo {
   int64 started_at_unix_ms = 6;
   // 0 while the command is still running.
   int64 ended_at_unix_ms = 7;
-  // Bytes of output held for a later attach, in a log on the guest's disk.
+  // Bytes of output held for a later attach, in a log on the node.
   // All of `output_bytes` unless a write to the log failed.
   uint64 buffered_bytes = 8;
   // The signal that ended the command, when one did; 0 otherwise.

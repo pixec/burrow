@@ -1158,7 +1158,7 @@ class Sandbox:
     def prune_commands(self) -> Dict[str, int]:
         """Removes finished commands and their output, as `docker container
         prune` does. Running commands are left alone. Returns how many were
-        removed and the bytes freed in the sandbox.
+        removed and the log bytes freed on the node.
         """
         self._assert_live()
         res = self._transport.unary(

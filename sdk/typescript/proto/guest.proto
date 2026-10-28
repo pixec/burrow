@@ -31,6 +31,11 @@ service Guest {
   // AttachCommand with input and a resume offset. An agent that serves it
   // lists "attach-input" in its health response.
   rpc Attach(stream AttachInput) returns (stream ExecOutput);
+  // Every command's output, for the host to keep: the guest holds only what
+  // the host has not yet confirmed writing, and resends it after a
+  // reconnect. The host opens one at a time; a new one replaces the last. An
+  // agent that serves it lists "output-feed" in its health response.
+  rpc Feed(stream FeedAck) returns (stream FeedFrame);
   rpc SignalCommand(SignalCommandRequest) returns (SignalCommandResponse);
   // Removes finished commands and their logs, as `docker container prune`
   // does. Running commands are left alone. Nothing else removes a command's
@@ -120,8 +125,49 @@ message PruneCommandsRequest {}
 
 message PruneCommandsResponse {
   uint32 removed = 1;
-  // Log bytes freed on the guest's disk.
+  // Unused since output is kept on the host, which frees its own.
   uint64 freed_bytes = 2;
+  // The commands removed, whose logs the host removes in turn.
+  repeated string command_ids = 3;
+}
+
+// One piece of one command's output, on its way to the host.
+message FeedFrame {
+  // Orders frames across commands; what an ack names.
+  uint64 seq = 1;
+  string command_id = 2;
+  // Output offset of the frame's first byte, stdout and stderr counted
+  // together from the command's start. A jump from the last frame's end is
+  // output the guest had to drop before the host took it.
+  uint64 at = 3;
+  oneof output {
+    bytes stdout = 4;
+    bytes stderr = 5;
+    FeedExit exit = 6;
+  }
+  // On a command's first frame: how its log rotates, as the exec asked.
+  uint64 log_max_bytes = 7;
+  uint32 log_max_files = 8;
+}
+
+message FeedExit {
+  int32 code = 1;
+  // The signal that ended the command; 0 if none did.
+  int32 signal = 2;
+}
+
+// From the host: what it has written. The first message on a feed says where
+// each command's log ends, so nothing it already holds is sent again; every
+// later one confirms frames up to `seq`, which the guest then lets go of.
+message FeedAck {
+  uint64 seq = 1;
+  repeated FeedPosition positions = 2;
+}
+
+message FeedPosition {
+  string command_id = 1;
+  // Output offset the host's log holds up to.
+  uint64 logged = 2;
 }
 
 message CommandInfo {
@@ -397,5 +443,6 @@ message GuestHealthResponse {
   // an agent that honours a newer field from an older one that would ignore
   // it. "files-as-user": the `user` fields on file transfers.
   // "attach-input": Attach, exit_signal and lost_bytes.
+  // "output-feed": Feed, and command output kept on the host.
   repeated string features = 1;
 }
