@@ -9,6 +9,10 @@ import { BurrowError, Sandbox } from "../dist/index.js";
 function sandboxListing(entries) {
   return Sandbox.adopt(
     {
+      // List calls go wherever the route sends them; this stub is both.
+      route() {
+        return this;
+      },
       async unary(method, request) {
         assert.equal(method, "ListDir");
         if (request.path === "/gone") throw new BurrowError("no such directory", "not_found");

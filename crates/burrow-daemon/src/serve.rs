@@ -227,6 +227,25 @@ pub struct ServeArgs {
     /// address can put whatever it likes in the header a guest then believes.
     #[arg(long = "edge-trusted-proxy", value_name = "CIDR")]
     pub edge_trusted_proxy: Vec<String>,
+    /// Where the Access service listens: exec, attach and files for this
+    /// node's sandboxes, called by clients directly with a token from the
+    /// orchestrator's IssueAccess. It is the only way that traffic reaches a
+    /// sandbox, so clients have to be able to reach it.
+    #[arg(long, default_value = "0.0.0.0:7073", env = "BURROWD_ACCESS_LISTEN")]
+    pub access_listen: std::net::SocketAddr,
+    /// URL clients reach --access-listen at, scheme included, e.g.
+    /// `https://node-a.example.com:7073`. Handed out with every token for
+    /// this node. Defaults to --advertise's host on --access-listen's port,
+    /// over https when a certificate is given and plain http otherwise.
+    #[arg(long, env = "BURROWD_ACCESS_ADVERTISE")]
+    pub access_advertise: Option<String>,
+    /// Certificate chain, PEM, the Access service presents. With
+    /// --access-tls-key. Without both it is plaintext, which is for a test
+    /// harness only: the tokens it carries are bearer credentials.
+    #[arg(long, env = "BURROWD_ACCESS_TLS_CERT")]
+    pub access_tls_cert: Option<PathBuf>,
+    #[arg(long, env = "BURROWD_ACCESS_TLS_KEY")]
+    pub access_tls_key: Option<PathBuf>,
     /// Fact about this node, as key=value, e.g. `--label rack=b7`. Repeatable,
     /// and comma-separated in BURROW_NODE_LABELS.
     ///
@@ -274,6 +293,29 @@ impl ServeArgs {
     }
 
     /// What this node tells the orchestrator to send sandbox traffic to.
+    fn access_advertisement(&self) -> String {
+        if let Some(explicit) = &self.access_advertise {
+            return explicit.clone();
+        }
+        let scheme = if self.access_tls_cert.is_some() {
+            "https"
+        } else {
+            "http"
+        };
+        let port = self.access_listen.port();
+        let host = match &self.advertise {
+            Some(advertised) => advertised
+                .rsplit_once(':')
+                .map_or(advertised.as_str(), |(host, _)| host)
+                .to_string(),
+            None if !self.access_listen.ip().is_unspecified() => {
+                self.access_listen.ip().to_string()
+            }
+            None => sysinfo::System::host_name().unwrap_or_else(|| "localhost".into()),
+        };
+        format!("{scheme}://{host}:{port}")
+    }
+
     fn sandbox_proxy_advertisement(&self) -> String {
         if let Some(explicit) = &self.advertise_sandbox_proxy {
             return explicit.clone();
@@ -339,6 +381,8 @@ fn local_node_info(args: &ServeArgs) -> anyhow::Result<NodeInfo> {
         arch: std::env::consts::ARCH.to_string(),
         // Filled in once the binary has been asked.
         firecracker_version: String::new(),
+        // Filled in once the Access listener is serving, like the edge.
+        access_endpoint: String::new(),
     })
 }
 
@@ -383,6 +427,54 @@ async fn current_status(sandboxes: &SandboxManager, data_dir: &std::path::Path) 
     }
 }
 
+/// Sets up the Access service, refusing a configuration that would advertise
+/// an endpoint clients cannot use, and saying so when bearer tokens would
+/// cross the wire in plaintext.
+fn serve_access(
+    args: &ServeArgs,
+    listen: std::net::SocketAddr,
+    access: crate::access::AccessApi,
+) -> anyhow::Result<impl std::future::Future<Output = Result<(), tonic::transport::Error>> + use<>>
+{
+    use anyhow::Context as _;
+    use burrow_proto::api::v1::access_server::AccessServer;
+
+    let advertised = args.access_advertisement();
+    let advertised = advertised.as_str();
+    let is_https = advertised.starts_with("https://");
+    if !is_https && !advertised.starts_with("http://") {
+        anyhow::bail!("--access-advertise must start with https:// or http://");
+    }
+    let mut builder = Server::builder();
+    match (&args.access_tls_cert, &args.access_tls_key) {
+        (Some(cert), Some(key)) => {
+            if !is_https {
+                anyhow::bail!(
+                    "the Access service serves TLS, so --access-advertise must be https://"
+                );
+            }
+            let identity = tonic::transport::Identity::from_pem(
+                std::fs::read(cert).with_context(|| format!("reading {}", cert.display()))?,
+                std::fs::read(key).with_context(|| format!("reading {}", key.display()))?,
+            );
+            builder = builder
+                .tls_config(tonic::transport::ServerTlsConfig::new().identity(identity))
+                .context("--access-tls-cert/--access-tls-key")?;
+        }
+        (None, None) if is_https => anyhow::bail!(
+            "--access-advertise is https:// but no --access-tls-cert/--access-tls-key is set"
+        ),
+        (None, None) => tracing::warn!(
+            "the Access service is PLAINTEXT: anyone on the path can read the access tokens \
+             and the exec and file traffic they carry. Set --access-tls-cert and \
+             --access-tls-key outside a test harness."
+        ),
+        _ => anyhow::bail!("--access-tls-cert and --access-tls-key go together"),
+    }
+    tracing::info!(listen = %listen, advertised, "Access service listening");
+    Ok(builder.add_service(AccessServer::new(access)).serve(listen))
+}
+
 /// Registers with the orchestrator and heartbeats forever, reconnecting and
 /// re-registering as needed (e.g. across orchestrator restarts).
 async fn registration_loop(
@@ -392,6 +484,7 @@ async fn registration_loop(
     node_id: Arc<Mutex<String>>,
     token: Option<String>,
     identity: Option<Arc<burrow_net::mesh::Identity>>,
+    access_keys: crate::access::SharedKeys,
 ) {
     // Claimed rather than requested: sandboxes here already hold addresses
     // from this slice.
@@ -437,6 +530,7 @@ async fn registration_loop(
         };
         info.id = resp.node_id.clone();
         *node_id.lock().unwrap() = resp.node_id.clone();
+        crate::access::apply_keys(&access_keys, &resp.access_keys);
         // Confines address allocation to this node's slice before any sandbox
         // is created, so no address can collide with another node's.
         sandboxes.set_node_index(resp.node_index).await;
@@ -474,6 +568,7 @@ async fn registration_loop(
                         break;
                     }
                     sandboxes.renew_lease(resp.sandbox_lease_secs);
+                    crate::access::apply_keys(&access_keys, &resp.access_keys);
                     sandboxes.confirm(&resp.confirmed_sandboxes);
                     sandboxes.relinquish(&resp.relinquished_sandboxes).await;
                     apply_edge_denial(
@@ -481,6 +576,7 @@ async fn registration_loop(
                         &[
                             resp.edge_hosts.as_slice(),
                             resp.control_plane_hosts.as_slice(),
+                            resp.node_hosts.as_slice(),
                         ]
                         .concat(),
                         &mut denied_edges,
@@ -559,7 +655,7 @@ async fn apply_edge_denial(
         Ok(()) => {
             tracing::info!(
                 ?addresses,
-                "denying the fleet's edge routers and control plane to sandboxes"
+                "denying the fleet's nodes, edge routers and control plane to sandboxes"
             );
             *applied = addresses;
         }
@@ -1141,6 +1237,7 @@ pub async fn run(args: ServeArgs) -> anyhow::Result<()> {
         guest_binary: args.guest_binary.clone(),
         registry_credentials: crate::oci::auth::Store::load(&args.registry_auth).await,
         insecure_registries: args.insecure_registry.clone(),
+        access_sessions: Arc::default(),
     };
     let auth = burrow_common::auth::TokenAuth::new(tokens.clone());
     if !auth.is_enabled() {
@@ -1223,13 +1320,29 @@ pub async fn run(args: ServeArgs) -> anyhow::Result<()> {
         }
     }
 
+    let api = Arc::new(api);
+    let access_keys = crate::access::SharedKeys::default();
+    let access = crate::access::AccessApi {
+        sessions: Arc::clone(&api.access_sessions),
+        api: Arc::clone(&api),
+        keys: Arc::clone(&access_keys),
+    };
+    let access_server = serve_access(&args, args.access_listen, access)?;
+    node_info.access_endpoint = args.access_advertisement();
+
     let server = Server::builder()
-        .add_service(NodeServiceServer::with_interceptor(api, auth))
+        .add_service(tonic::service::interceptor::InterceptedService::new(
+            NodeServiceServer::from_arc(api),
+            auth,
+        ))
         .serve(args.listen);
 
     tokio::select! {
         result = server => result?,
-        _ = registration_loop(&args, node_info, sandboxes.clone(), node_id, registration_token, identity) => {
+        // Without it no exec or file call reaches this node's sandboxes, so
+        // its stopping stops the node rather than leaving it half there.
+        result = access_server => anyhow::Context::context(result, "the Access service stopped")?,
+        _ = registration_loop(&args, node_info, sandboxes.clone(), node_id, registration_token, identity, access_keys) => {
             unreachable!("registration loop never returns")
         }
         // A stop signal would otherwise destroy every sandbox on the node.

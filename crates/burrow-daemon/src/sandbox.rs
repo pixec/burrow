@@ -534,6 +534,9 @@ pub struct RunningSandbox {
     /// 1-vCPU guest is a real cost to pay on every exec. Dropped whenever the
     /// VM goes away, because a channel does not survive a pause.
     agent_channel: Mutex<Option<GuestClient<Channel>>>,
+    /// What the agent behind `agent_channel` says it supports, asked once per
+    /// channel and dropped with it: an upgrade can change the answer.
+    agent_features: Mutex<Option<Vec<String>>>,
     /// Where this VM's handshake with the guest has got to.
     ///
     /// A warm create returns before the guest has answered, so its address,
@@ -788,6 +791,24 @@ impl RunningSandbox {
     /// look like the guest is broken rather than the connection.
     async fn forget_agent(&self) {
         *self.agent_channel.lock().await = None;
+        *self.agent_features.lock().await = None;
+    }
+
+    /// Whether the agent says it supports `feature`. An agent that predates
+    /// the list says nothing, which reads as no.
+    pub async fn agent_has(&self, feature: &str) -> Result<bool, Status> {
+        let mut agent = self.agent().await?;
+        let mut features = self.agent_features.lock().await;
+        if features.is_none() {
+            let health = agent
+                .health(burrow_proto::guest::v1::GuestHealthRequest {})
+                .await?
+                .into_inner();
+            *features = Some(health.features);
+        }
+        Ok(features
+            .as_ref()
+            .is_some_and(|held| held.iter().any(|f| f == feature)))
     }
 
     /// Snapshots to disk and stops the VMM. The sandbox keeps its address,
@@ -2055,6 +2076,7 @@ impl SandboxManager {
                     at => at,
                 }),
                 agent_channel: Mutex::new(None),
+                agent_features: Mutex::new(None),
                 agent_timeout: self.config.agent_timeout,
                 // A recovered sandbox is suspended: it has no VM, so there is
                 // no handshake in flight. The resume that starts one does its
@@ -2736,6 +2758,17 @@ impl SandboxManager {
         sandbox.base_record.lock().unwrap().metadata = tags;
         self.persist(&sandbox).await;
         Ok(sandbox.record())
+    }
+
+    /// Stamps every Access token issued for a sandbox so far as revoked,
+    /// returning the stamp. Persisted with the record, which is what carries
+    /// it to the next node when the sandbox moves.
+    pub async fn revoke_access(&self, sandbox_id: &str) -> Result<i64, Status> {
+        let sandbox = self.get(sandbox_id).await?;
+        let now = burrow_common::unix_now();
+        sandbox.base_record.lock().unwrap().access_revoked_at = now;
+        self.persist(&sandbox).await;
+        Ok(now)
     }
 
     /// Replaces a sandbox's exec and file policies.
@@ -3795,6 +3828,7 @@ impl SandboxManager {
             is_durable: false,
             arch: String::new(),
             firecracker_version: String::new(),
+            access_revoked_at: 0,
         };
 
         // The one-line summary, unchanged in shape: VM, guest wake, handshake,
@@ -3852,6 +3886,7 @@ impl SandboxManager {
             last_activity: std::sync::atomic::AtomicI64::new(burrow_common::unix_now()),
             suspended_at: std::sync::atomic::AtomicI64::new(0),
             agent_channel: Mutex::new(None),
+            agent_features: Mutex::new(None),
             agent_timeout: self.config.agent_timeout,
             handshake,
             // A warm-created sandbox already restores from the template's
@@ -4474,6 +4509,7 @@ impl SandboxManager {
             is_durable: false,
             arch: String::new(),
             firecracker_version: String::new(),
+            access_revoked_at: 0,
         };
         tracing::info!(
             sandbox = id,
@@ -4493,6 +4529,7 @@ impl SandboxManager {
             last_activity: std::sync::atomic::AtomicI64::new(burrow_common::unix_now()),
             suspended_at: std::sync::atomic::AtomicI64::new(0),
             agent_channel: Mutex::new(None),
+            agent_features: Mutex::new(None),
             agent_timeout: self.config.agent_timeout,
             handshake: Arc::new(tokio::sync::watch::channel(Handshake::Pending).0),
             memory_chain: Mutex::new(chain),
@@ -5328,6 +5365,7 @@ impl SandboxManager {
             base.kit = record.kit.clone();
             base.kit_credentials = record.kit_credentials.clone();
             base.kit_selection = record.kit_selection.clone();
+            base.access_revoked_at = record.access_revoked_at;
         }
         *sandbox.usage.lock().unwrap() = Usage {
             cpu_usec: record.cpu_usage_usec.max(manifest.cpu_usage_usec),
@@ -6012,6 +6050,7 @@ pub(crate) mod tests {
             vm: Mutex::new(None),
             spec: std::sync::Mutex::new(MicroVmSpec::new(id, &workdir)),
             agent_channel: Mutex::new(None),
+            agent_features: Mutex::new(None),
             agent_timeout: std::time::Duration::from_millis(1),
             handshake: settled(),
             memory_chain: Mutex::new(Vec::new()),
@@ -6148,6 +6187,7 @@ pub(crate) mod tests {
             vm: Mutex::new(None),
             spec: std::sync::Mutex::new(MicroVmSpec::new("sbx_a", &workdir)),
             agent_channel: Mutex::new(None),
+            agent_features: Mutex::new(None),
             agent_timeout: std::time::Duration::from_millis(1),
             handshake: settled(),
             memory_chain: Mutex::new(Vec::new()),

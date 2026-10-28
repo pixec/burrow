@@ -27,7 +27,8 @@ nftables.
 A sandbox runs on one node, because its disks and suspend state are files
 there. With an object store, a suspended sandbox and a snapshot both outlive
 that node and restore on another. The orchestrator routes every per-sandbox
-call to the owning node.
+call to the owning node. Exec, attach and file traffic can go that way too, or
+straight to the node; see [direct access](#direct-access).
 
 ```mermaid
 flowchart TB
@@ -390,15 +391,18 @@ masqueraded for the same complement, `ip daddr != 10.99.0.0/16`: peer traffic is
 not egress, and translating it would present a remote peer with this node's mesh
 address, which its rules do not recognise.
 
-**The control plane and every edge are denied to every sandbox**, ahead of the
-conntrack accept and every mode rule. An edge router will proxy a request into
-any sandbox's published port by id, so reaching one is reaching every sandbox it
-serves without ever meeting a rule about sandboxes; the orchestrator's API
-creates and deletes sandboxes and routes exec and logs into them, which is a
-control surface no sandbox may reach. The orchestrator's address comes from the
-node's own `--orchestrator`; the other nodes' edges arrive on the heartbeat,
-since an edge is opt-in per node and no node can know from its own flags which
-of its peers runs one.
+**The control plane, every edge and every node are denied to every sandbox**,
+ahead of the conntrack accept and every mode rule. An edge router will proxy a
+request into any sandbox's published port by id, so reaching one is reaching
+every sandbox it serves without ever meeting a rule about sandboxes; the
+orchestrator's API creates and deletes sandboxes, routes exec into them and
+issues the tokens exec is done with, which is a control surface no sandbox may
+reach; and every
+node's API address and Access endpoint are ways into sandboxes that only a
+token guards. The orchestrator's address comes from the node's own
+`--orchestrator`; the other nodes' edges, addresses and Access endpoints arrive
+on the heartbeat, since no node can know from its own flags what its peers
+serve.
 
 **Mesh traffic skips antispoofing.** WireGuard's `AllowedIPs` already refuses
 packets sourced outside the sending node's own slice, which is a cryptographic
@@ -1276,6 +1280,139 @@ stopped tracking a node it could not reach, so if the node does come back its
 own inventory is the truth and reconcile adopts it. One consequence is worth
 stating: a name freed that way may belong to another sandbox by then, and the
 returning sandbox is adopted without its name rather than taking it back.
+
+## Direct access
+
+Exec, attach and file traffic takes one of two routes, and the client picks:
+
+- **Direct**, the default. The client calls the node that holds the sandbox,
+  with a token the orchestrator issues; the orchestrator carries none of the
+  traffic. It saves a round trip between orchestrator and node on every call,
+  and keeps output and files off the control plane, but the node has to be
+  reachable from the client.
+- **Through the orchestrator.** The orchestrator relays the same calls to the
+  node over the node API, for clients that can reach the orchestrator and not
+  the nodes.
+
+Neither falls back to the other: a client that asked for direct and cannot
+reach the node is told so. The CLI takes `--route direct|orchestrator`, the
+SDKs a `route` option, and both read `BURROW_ROUTE`. Every node serves the
+`Access` service for direct calls, on `--access-listen`, `0.0.0.0:7073` by
+default:
+
+```sh
+burrowd serve ... --access-advertise https://node-a.example.com:7073 \
+  --access-tls-cert node-a.pem --access-tls-key node-a.key
+```
+
+A client calls `IssueAccess` on the orchestrator and gets back the node's
+endpoint, the sandbox's id and a token, then calls the node's `Access` service:
+`Exec`, `Attach`, `UploadFile`, `DownloadFile`, `ListDir` and `Watch`, the same
+calls the orchestrator relays. Nothing else the node serves accepts the token,
+and the node API keeps requiring the node token. The SDKs reuse a token until it
+nears expiry. The endpoint `--access-advertise` names has to be routable from
+wherever direct clients run.
+
+The token is a JWT signed with Ed25519, and checked with ring; no other
+algorithm is linked in. The orchestrator signs with `--access-key-file`, which
+defaults to `access.key` under `--data-dir` and is created on first start.
+Replicas must share it, like the secrets key. Nodes are handed the public keys
+on registration and on every heartbeat, so they can verify tokens but never
+mint one. A token carries:
+
+| Claim | Meaning |
+| --- | --- |
+| `aud` | The node it is for. Any other node refuses it, including the one a sandbox moved to. |
+| `sub` | The sandbox id. Requests for any other sandbox are refused. |
+| `ops` | `exec` (exec and attach), `files:read` (download, list, watch) and `files:write` (upload). Defaults to all three. |
+| `user` | When set, every exec runs as this guest user, attach reaches only that user's commands, and file transfers are done as that user. Empty is root, which may run as anyone. |
+| `exp` | Five minutes by default, an hour at most. Checked with 30 seconds of leeway for clock drift. |
+
+The node accepts EdDSA and nothing else, whatever the token's header says, so
+neither `alg: none` nor a token signed with some other kind of key gets
+through. After the token check a call runs through the same node handlers the
+orchestrator's relay reaches, so the sandbox's exec and file policies apply
+whichever way the call came.
+
+A file transfer under a user-bound token is done as that user inside the
+guest: the agent takes on the user's filesystem identity on a thread of its
+own before it opens anything, so the guest kernel decides what the user may
+read and write, and what an upload creates is theirs. An agent too old to do
+that is refused the call rather than doing it as root.
+
+### Revoking tokens
+
+`RevokeAccess`, or `burrow token revoke`, works the way a lock does in
+Teleport. It stamps the sandbox, and from then on the node refuses every
+token issued at or before the stamp, including any issued in the same second.
+The direct sessions those tokens opened are ended on the spot: an exec stream,
+an attach, a transfer or a watch fails with `unauthenticated`, and the command
+an exec started is killed, along with everything in its process group. Tokens
+issued afterwards work as before. The stamp is part of the sandbox's record,
+so it follows the sandbox to whichever node holds it next.
+
+A node that has not heard from the orchestrator for 30 seconds refuses every
+token until it does: it cannot know whether a revoke is waiting for it.
+
+### Rotating the signing key
+
+As Teleport's CA rotation, in phases, with no token failing along the way.
+`--access-trusted-key-file`, repeatable, names keys nodes accept but nothing
+signs with; it takes a public key PEM or a private key, of which only the
+public half is used.
+
+1. Trust the new key on every replica: `--access-trusted-key-file new.key`.
+   Nodes learn it on the next heartbeat.
+2. Sign with it: `--access-key-file new.key --access-trusted-key-file old.key`.
+3. An hour later, the longest a token lives, drop `old.key`.
+
+Without `--access-tls-cert` and `--access-tls-key` the service is plaintext,
+and the node warns at startup. That is for a test harness only: the token is a
+bearer credential. An `https://` advertisement without a certificate, or a
+certificate with an `http://` advertisement, is refused at startup, and without
+`--access-advertise` the endpoint defaults to `--advertise`'s host on the
+listen port, `https` when a certificate is given.
+
+Measured on the development harness, median, with the orchestrator 5ms from
+the node:
+
+| | Through the orchestrator | Direct |
+| --- | --- | --- |
+| stdin echo round trip | 5.8ms | 0.27ms |
+| 1 KiB upload / download | 6.0 / 6.0ms | 0.46 / 0.57ms |
+| `exec true` | 18.7ms | 1.7ms |
+| 32 MiB upload / download | 148 / 252 MiB/s | 528 / 371 MiB/s |
+
+### Commands and their output
+
+A command outlives the stream that started it. It runs until it exits or is
+killed: a client that goes away or restarts, or a sandbox that suspends and
+drops the host's connection, closes the stream and leaves the command
+running, stdin still open. Only an explicit stdin EOF closes it.
+`Attach` follows a command from any stream and feeds its stdin, terminal size
+and signals, so a shell started by a process that has since gone takes input
+from the next one.
+
+Every byte of a command's output is kept, the way Docker keeps a container's
+log. The agent writes it to a log on the guest's own disk, under
+`/var/lib/burrow/commands`, readable by root alone, and keeps it for as long as
+the command is listed. Nothing is evicted by count or age: `PruneCommands`, or
+`burrow prune`, removes finished commands and their logs, as `docker container
+prune` does. A fresh boot clears them. An exec can bound its log instead, as
+Docker's `max-size` and `max-file` do: `log_max_bytes` per file, and
+`log_max_files` files kept, the oldest dropped first.
+
+Output is counted by offset, stdout and stderr bytes together from the
+command's start. An attacher passes the offset it got to and is sent exactly
+what followed, from the log and then live; one that falls behind the live feed
+catches up from the log rather than losing frames. Output it cannot have is
+reported by how much, as `lost_bytes`: what a rotating log dropped before the
+requested offset, or what a failed write never recorded, a full disk being the
+likely cause. The log stops at that point and the command carries on.
+
+A command ended by a signal reports which one, as `exit_signal` ahead of an
+exit code of 128 plus it, whether the signal came from `SignalCommand` or the
+command sent it to itself. Signals reach the command's whole process group.
 
 ## Reaching a sandbox from outside
 

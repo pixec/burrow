@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import codecs
 import queue
 import threading
 from typing import Any, Callable, Dict, Iterator, List, Optional, Union
@@ -9,7 +10,6 @@ from typing import Any, Callable, Dict, Iterator, List, Optional, Union
 import grpc
 
 from ._pb import api_pb2
-from ._transport import Transport
 from .errors import BurrowError
 
 
@@ -30,7 +30,7 @@ class Terminal:
     Output callbacks are delivered from a background reader thread.
     """
 
-    def __init__(self, transport: Transport, sandbox_id: str, options: Dict[str, Any]):
+    def __init__(self, transport: Any, sandbox_id: str, options: Dict[str, Any]):
         command = options.get("command") or "/bin/sh"
         cmd = [command] if isinstance(command, str) else list(command)
 
@@ -68,16 +68,19 @@ class Terminal:
         threading.Thread(target=self._pump, daemon=True).start()
 
     def _pump(self) -> None:
+        # One decoder across the whole session, so a character a read split in
+        # two arrives whole rather than as two replacement characters.
+        decoder = codecs.getincrementaldecoder("utf-8")("replace")
         try:
             for msg in self._call:
                 kind = msg.WhichOneof("output")
                 if kind == "stdout" and msg.stdout:
-                    self._emit_data(msg.stdout.decode("utf-8", "replace"))
+                    self._emit_data(decoder.decode(msg.stdout))
                 elif kind == "stderr" and msg.stderr:
                     # A pty merges stderr into stdout, so anything arriving
                     # here came from a non-pty program; it is still terminal
                     # output to the reader.
-                    self._emit_data(msg.stderr.decode("utf-8", "replace"))
+                    self._emit_data(decoder.decode(msg.stderr))
                 elif kind == "exit_code":
                     self._finish(msg.exit_code)
             self._finish(0)

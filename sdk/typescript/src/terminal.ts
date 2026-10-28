@@ -1,7 +1,7 @@
 import { Buffer } from "node:buffer";
 import { EventEmitter } from "node:events";
 
-import type { Transport } from "./transport.js";
+import type { Direct, Transport } from "./transport.js";
 
 export interface TerminalOptions {
   /** Program to run. Defaults to an interactive shell. */
@@ -32,20 +32,24 @@ export class Terminal {
   private exited = false;
 
   /** @internal */
-  constructor(transport: Transport, sandboxId: string, options: TerminalOptions) {
+  constructor(transport: Direct | Transport, sandboxId: string, options: TerminalOptions) {
     const command = options.command ?? "/bin/sh";
     const cmd = Array.isArray(command) ? command : [command];
 
     this.call = transport.duplex("Exec");
+    // One decoder across the whole session, so a character a read split in
+    // two arrives whole rather than as two replacement characters.
+    const decoder = new TextDecoder("utf-8");
 
     this.call.on("data", (msg: any) => {
-      if (msg.stdout?.length) {
-        this.emitter.emit("data", Buffer.from(msg.stdout).toString("utf8"));
-      } else if (msg.stderr?.length) {
-        // A pty merges stderr into stdout, so anything arriving here came
-        // from a non-pty program; it is still terminal output to the reader.
-        this.emitter.emit("data", Buffer.from(msg.stderr).toString("utf8"));
-      } else if (typeof msg.exitCode === "number") {
+      // A pty merges stderr into stdout, so anything on stderr came from a
+      // non-pty program; it is still terminal output to the reader.
+      const bytes = msg.stdout?.length ? msg.stdout : msg.stderr;
+      if (bytes?.length) {
+        const raw = new Uint8Array(bytes);
+        this.emitter.emit("bytes", raw);
+        this.emitter.emit("data", decoder.decode(raw, { stream: true }));
+      } else if (msg.output === "exitCode") {
         this.exited = true;
         this.emitter.emit("exit", msg.exitCode);
       }
@@ -92,9 +96,15 @@ export class Terminal {
     this.call.write({ signal });
   }
 
-  /** Subscribes to terminal output. */
+  /** Subscribes to terminal output, as text. */
   onData(listener: (chunk: string) => void): this {
     this.emitter.on("data", listener);
+    return this;
+  }
+
+  /** Subscribes to terminal output exactly as the program wrote it. */
+  onBytes(listener: (chunk: Uint8Array) => void): this {
+    this.emitter.on("bytes", listener);
     return this;
   }
 

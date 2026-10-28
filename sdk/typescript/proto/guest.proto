@@ -28,7 +28,14 @@ service Guest {
   // Replays what the command's ring buffer still holds, then follows it live
   // until it exits. Several attachers are supported.
   rpc AttachCommand(AttachCommandRequest) returns (stream ExecOutput);
+  // AttachCommand with input and a resume offset. An agent that serves it
+  // lists "attach-input" in its health response.
+  rpc Attach(stream AttachInput) returns (stream ExecOutput);
   rpc SignalCommand(SignalCommandRequest) returns (SignalCommandResponse);
+  // Removes finished commands and their logs, as `docker container prune`
+  // does. Running commands are left alone. Nothing else removes a command's
+  // log while its sandbox lives.
+  rpc PruneCommands(PruneCommandsRequest) returns (PruneCommandsResponse);
 
   // Users and groups, created with whatever tooling the guest image ships.
   rpc CreateUser(CreateUserRequest) returns (CreateUserResponse);
@@ -81,12 +88,41 @@ message AttachCommandRequest {
   string command_id = 1;
 }
 
+// Follows a command and feeds it, from any stream, not only the one that
+// started it: the first message names the command, the rest are its input.
+message AttachInput {
+  oneof input {
+    AttachStart start = 1;
+    bytes stdin = 2;
+    ExecResize resize = 3;
+    int32 signal = 4;
+    bool is_stdin_eof = 5;
+  }
+}
+
+message AttachStart {
+  reserved 1;
+  string command_id = 2;
+  // Output offset to resume from, counting stdout and stderr bytes together
+  // from the command's start. An attacher that saw N bytes passes N and gets
+  // only what came after; 0 replays everything still held.
+  uint64 from_offset = 3;
+}
+
 message SignalCommandRequest {
   string command_id = 1;
   int32 signal = 2;
 }
 
 message SignalCommandResponse {}
+
+message PruneCommandsRequest {}
+
+message PruneCommandsResponse {
+  uint32 removed = 1;
+  // Log bytes freed on the guest's disk.
+  uint64 freed_bytes = 2;
+}
 
 message CommandInfo {
   string command_id = 1;
@@ -100,10 +136,14 @@ message CommandInfo {
   // Unix milliseconds; `ended_at_unix_ms` is 0 while the command runs.
   int64 started_at_unix_ms = 6;
   int64 ended_at_unix_ms = 7;
-  // Bytes of output the agent is still holding for a later attach. Output
-  // beyond the per-command ring buffer is dropped oldest first, so a chatty
-  // command replays only its tail.
+  // Bytes of output the agent holds for a later attach, in a log on the
+  // guest's disk. All of `output_bytes` unless a write to the log failed.
   uint64 buffered_bytes = 8;
+  // The signal that ended the command, when one did; 0 otherwise.
+  int32 exit_signal = 9;
+  // Bytes of output the command has produced in all, stdout and stderr
+  // together, which is the offset an attach that is up to date resumes from.
+  uint64 output_bytes = 10;
 }
 
 message WatchRequest {
@@ -111,6 +151,10 @@ message WatchRequest {
   bool is_recursive = 2;
   // Poll interval; 0 selects the agent's default.
   uint32 interval_ms = 3;
+  // Do it as this guest user rather than as root: the guest kernel checks
+  // the user may, and what is created is theirs. Empty is root. An agent that
+  // honours this lists "files-as-user" in its health response.
+  string user = 4;
 }
 
 message WatchEvent {
@@ -131,6 +175,10 @@ message FileChunk {
   // Leave an existing file as it is instead of truncating it. The upload then
   // reports zero bytes written.
   bool is_existing_skipped = 5;
+  // Do the write as this guest user rather than as root: the guest kernel
+  // checks the user may, and a file it creates is theirs, so `owner` does
+  // not go with it. An existing file keeps its mode. Empty is root.
+  string user = 6;
 }
 
 message UploadResult {
@@ -139,10 +187,18 @@ message UploadResult {
 
 message DownloadRequest {
   string path = 1;
+  // Do it as this guest user rather than as root: the guest kernel checks
+  // the user may, and what is created is theirs. Empty is root. An agent that
+  // honours this lists "files-as-user" in its health response.
+  string user = 2;
 }
 
 message ListDirRequest {
   string path = 1;
+  // Do it as this guest user rather than as root: the guest kernel checks
+  // the user may, and what is created is theirs. Empty is root. An agent that
+  // honours this lists "files-as-user" in its health response.
+  string user = 2;
 }
 
 message DirEntry {
@@ -181,6 +237,14 @@ message ExecStart {
   // Start from an empty environment instead of the agent's own, so the
   // command sees `env` plus the per-user variables and nothing else.
   bool is_env_cleared = 8;
+  // Rotate this command's output log once a file reaches this many bytes,
+  // as Docker's `max-size`. 0 keeps every byte in one file, unbounded, which
+  // is the default.
+  uint64 log_max_bytes = 9;
+  // Log files kept once rotating, as Docker's `max-file`: the oldest is
+  // dropped when there would be more, and an attach is told how many bytes
+  // went with it. 0 means 1. Ignored without `log_max_bytes`.
+  uint32 log_max_files = 10;
 }
 
 message ExecResize {
@@ -196,6 +260,15 @@ message ExecOutput {
     // Sent once, before any output, so a caller that means to come back to
     // this command has its id without waiting for it to finish.
     string command_id = 4;
+    // Sent just before `exit_code` when a signal ended the command: which
+    // one. `exit_code` is then 128 plus it, as a shell reports it. A command
+    // ended by its own `kill` reports one just the same.
+    int32 exit_signal = 5;
+    // Sent on an attach in place of output it cannot have: how many bytes.
+    // First, for output from before the requested offset that a rotating log
+    // has since dropped. After the replay, for output a failed write never
+    // recorded, most likely on a full disk, from which point on nothing was.
+    uint64 lost_bytes = 6;
   }
 }
 
@@ -319,4 +392,10 @@ message GuestResumeTiming {
 }
 
 message GuestHealthRequest {}
-message GuestHealthResponse {}
+message GuestHealthResponse {
+  // What this agent does beyond the original protocol, so the host can tell
+  // an agent that honours a newer field from an older one that would ignore
+  // it. "files-as-user": the `user` fields on file transfers.
+  // "attach-input": Attach, exit_signal and lost_bytes.
+  repeated string features = 1;
+}

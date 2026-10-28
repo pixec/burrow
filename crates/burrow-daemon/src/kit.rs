@@ -666,6 +666,8 @@ fn lifecycle_exec(
             user.to_string()
         },
         is_env_cleared: true,
+        log_max_bytes: 0,
+        log_max_files: 0,
     }
 }
 

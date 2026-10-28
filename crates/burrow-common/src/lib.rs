@@ -1,3 +1,4 @@
+pub mod access;
 pub mod auth;
 pub mod edge;
 pub mod glob;

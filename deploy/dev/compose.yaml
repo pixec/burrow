@@ -109,7 +109,14 @@ services:
       target: dev
       args:
         FC_ARCH: aarch64
-    command: /burrow/bin/burrowd serve --orchestrator http://orchestrator:7070 --listen 0.0.0.0:7071 --advertise node:7071 --node-id node_local_docker --label rack=a1 --label tier=general --mesh-endpoint node:51820 --api-key dev-token --node-token dev-node-token --otlp-endpoint http://otel-collector:4317 --guest-binary /burrow/bin/burrow-guest --insecure-registry test-registry:5000 --jailer /usr/local/bin/jailer --edge-listen 0.0.0.0:7081 --edge-domain node.sandbox.local --object-store s3://burrow/dev --object-store-endpoint http://objstore:9000 --object-store-key-file /etc/burrow/store.key
+    # --access-listen is where clients send exec, attach and file traffic,
+    # with a token from IssueAccess; the orchestrator carries none of it, so a
+    # client has to reach this port. Plaintext here, which the node warns
+    # about; a real node serves it over TLS, the tokens being bearer
+    # credentials. A CLI on this machine reaches it through the published
+    # port once `node` and `node2` resolve here: add
+    # `127.0.0.1 node node2` to /etc/hosts.
+    command: /burrow/bin/burrowd serve --orchestrator http://orchestrator:7070 --listen 0.0.0.0:7071 --advertise node:7071 --access-listen 0.0.0.0:7073 --access-advertise http://node:7073 --node-id node_local_docker --label rack=a1 --label tier=general --mesh-endpoint node:51820 --api-key dev-token --node-token dev-node-token --otlp-endpoint http://otel-collector:4317 --guest-binary /burrow/bin/burrow-guest --insecure-registry test-registry:5000 --jailer /usr/local/bin/jailer --edge-listen 0.0.0.0:7081 --edge-domain node.sandbox.local --object-store s3://burrow/dev --object-store-endpoint http://objstore:9000 --object-store-key-file /etc/burrow/store.key
     ports:
       # This node's edge: http://<port>-<sandbox-id>.node.sandbox.local:7081/
       # Opt-in, and off by default. A node without one has no hostname routing,
@@ -119,6 +126,8 @@ services:
       # Loopback only: this fronts whatever the sandboxes are serving, and a
       # dev harness should not put that on every interface of the host.
       - "127.0.0.1:7081:7081"
+      # Access, loopback only like the edge.
+      - "127.0.0.1:7073:7073"
     depends_on:
       - orchestrator
       - objstore
@@ -167,12 +176,13 @@ services:
       target: dev
       args:
         FC_ARCH: aarch64
-    command: /burrow/bin/burrowd serve --orchestrator http://orchestrator:7070 --listen 0.0.0.0:7071 --advertise node2:7071 --node-id node_local_docker_2 --label rack=b7 --label tier=dedicated --mesh-endpoint node2:51820 --api-key dev-token --node-token dev-node-token --otlp-endpoint http://otel-collector:4317 --guest-binary /burrow/bin/burrow-guest --insecure-registry test-registry:5000 --jailer /usr/local/bin/jailer --edge-listen 0.0.0.0:7081 --edge-domain node2.sandbox.local --object-store s3://burrow/dev --object-store-endpoint http://objstore:9000 --object-store-key-file /etc/burrow/store.key
+    command: /burrow/bin/burrowd serve --orchestrator http://orchestrator:7070 --listen 0.0.0.0:7071 --advertise node2:7071 --access-listen 0.0.0.0:7074 --access-advertise http://node2:7074 --node-id node_local_docker_2 --label rack=b7 --label tier=dedicated --mesh-endpoint node2:51820 --api-key dev-token --node-token dev-node-token --otlp-endpoint http://otel-collector:4317 --guest-binary /burrow/bin/burrow-guest --insecure-registry test-registry:5000 --jailer /usr/local/bin/jailer --edge-listen 0.0.0.0:7081 --edge-domain node2.sandbox.local --object-store s3://burrow/dev --object-store-endpoint http://objstore:9000 --object-store-key-file /etc/burrow/store.key
     ports:
       # node2's edge, on its own domain: an edge serves only the sandboxes its
       # node holds, so each node needs a wildcard of its own. Loopback only,
       # for the same reason as node's.
       - "127.0.0.1:7082:7081"
+      - "127.0.0.1:7074:7074"
     depends_on:
       - orchestrator
       - objstore

@@ -64,3 +64,16 @@ test("no api key at all is never refused, plaintext or not", () => {
     transport({ endpoint: "orchestrator.example.com:7070" }),
   );
 });
+
+test("the route decides where exec and files go", () => {
+  const direct = new Transport({ endpoint: "localhost:7070" });
+  assert.notEqual(direct.route("sbx_a"), direct);
+  const relayed = new Transport({ endpoint: "localhost:7070", route: "orchestrator" });
+  assert.equal(relayed.route("sbx_a"), relayed);
+  direct.close();
+  relayed.close();
+});
+
+test("an unknown route is refused", () => {
+  assert.throws(() => new Transport({ endpoint: "localhost:7070", route: "sideways" }));
+});

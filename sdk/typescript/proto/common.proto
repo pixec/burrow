@@ -380,6 +380,9 @@ message Sandbox {
   // What the saved state needs to be restored on, while it is durable.
   string arch = 21;
   string firecracker_version = 22;
+  // Unix seconds of the last RevokeAccess. Access tokens issued at or before
+  // it are refused, wherever the sandbox has moved since.
+  int64 access_revoked_at = 23;
 }
 
 // One VM boot inside a sandbox's life.
@@ -470,6 +473,10 @@ message NodeInfo {
   // runs. A snapshot taken elsewhere is only placed here when both match.
   string arch = 10;
   string firecracker_version = 11;
+  // Where clients reach this node's Access service directly, scheme
+  // included, e.g. "https://node-a.example.com:7073". Empty when it serves
+  // none, the default, and then exec and files go through the orchestrator.
+  string access_endpoint = 12;
 }
 
 message NodeStatus {

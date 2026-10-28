@@ -711,6 +711,13 @@ export interface RunOptions {
   rows?: number;
   cols?: number;
   timeoutMs?: number;
+  /**
+   * Rotate the command's output log once a file reaches this many bytes, as
+   * Docker's `--log-opt max-size`. Unset keeps every byte the command prints.
+   */
+  logMaxBytes?: number;
+  /** Log files kept once rotating, as Docker's `--log-opt max-file`. */
+  logMaxFiles?: number;
   /** Called with each chunk of stdout as it arrives. */
   onStdout?: (chunk: string) => void;
   /** Called with each chunk of stderr as it arrives. */
@@ -728,6 +735,11 @@ export interface CommandResult {
   exitCode: number;
   /** True when `exitCode === 0`. */
   success: boolean;
+  /** The signal that ended the command; 0 if it exited on its own. */
+  exitSignal: number;
+  /** The output exactly as written, for output that is not text. */
+  stdoutBytes: Uint8Array;
+  stderrBytes: Uint8Array;
 }
 
 /** Options accepted by every call, alongside whatever else it takes. */
@@ -771,8 +783,13 @@ export interface FinishedCommand {
   exitCode: number;
   /** True when `exitCode === 0`. */
   success: boolean;
+  /** The signal that ended the command; 0 if it exited on its own. */
+  exitSignal: number;
   stdout(): string;
   stderr(): string;
+  /** The output exactly as written. */
+  stdoutBytes(): Uint8Array;
+  stderrBytes(): Uint8Array;
 }
 
 /**
@@ -812,6 +829,14 @@ export interface DetachedCommand {
    * already exited.
    */
   killed(signal?: number): Promise<void>;
+  /**
+   * Writes to the command's stdin, or its terminal for a pty command. On a
+   * handle from {@link Sandbox.getCommand}, whichever process started the
+   * command: a shell whose original stream is long gone takes input here.
+   */
+  sendStdin?(data: string | Uint8Array): void;
+  /** Ends the command's stdin, which a pipe command reads as EOF. */
+  closeStdin?(): void;
 }
 
 /**
@@ -834,8 +859,15 @@ export interface CommandInfo {
   startedAt: Date;
   /** `null` while the command is still running. */
   endedAt: Date | null;
-  /** Output still held for a later `logs()`. */
+  /** Output held in the sandbox for a later `logs()`. */
   bufferedBytes: number;
+  /** The signal that ended the command; 0 if none did. */
+  exitSignal: number;
+  /**
+   * Output produced in all, stdout and stderr together: the offset a reader
+   * that is up to date resumes from.
+   */
+  outputBytes: number;
 }
 
 /** A user created inside the guest. */
@@ -882,10 +914,19 @@ export interface FileRef {
 }
 
 /** One chunk of a streaming command. */
+/**
+ * One piece of a command's output.
+ *
+ * `data` is decoded across chunk boundaries, so a character split between two
+ * chunks arrives whole; invalid UTF-8 becomes U+FFFD. `raw` is the bytes
+ * exactly as the command wrote them. A `"lost"` chunk stands for output the
+ * sandbox no longer holds or never recorded, by how many bytes.
+ */
 export type OutputChunk =
-  | { type: "stdout"; data: string }
-  | { type: "stderr"; data: string }
-  | { type: "exit"; exitCode: number };
+  | { type: "stdout"; data: string; raw: Uint8Array }
+  | { type: "stderr"; data: string; raw: Uint8Array }
+  | { type: "exit"; exitCode: number; exitSignal: number }
+  | { type: "lost"; lostBytes: number };
 
 export interface DirEntry {
   name: string;

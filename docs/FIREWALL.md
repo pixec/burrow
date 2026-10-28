@@ -115,12 +115,16 @@ alongside it when the sandbox needs both.
   conntrack. An open-mode sandbox has NAT'd egress to anywhere the node can
   route, and the orchestrator is somewhere the node can route, so without that
   denial it could reach an API that creates and deletes sandboxes and routes exec
-  and logs into them. Every node's edge router is denied the same way, for a
-  related reason: an edge proxies into a sandbox's published port by id, so
-  reaching one reaches every sandbox it serves without a packet ever meeting a
-  rule about sandboxes. The orchestrator's address is resolved from
-  `--orchestrator` when the node starts and the edges arrive on the heartbeat, so
-  neither should share an address with anything sandboxes are meant to reach.
+  into them. Every node's edge router is denied the
+  same way, for a related reason: an edge proxies into a sandbox's published
+  port by id, so reaching one reaches every sandbox it serves without a packet
+  ever meeting a rule about sandboxes. So is every node itself, at its API
+  address and at its Access endpoint, which may be another host: both are ways
+  into sandboxes, and a token is all that stands between a sandbox and another
+  node's Access service. The orchestrator's address is resolved from
+  `--orchestrator` when the node starts and the edges and nodes arrive on the
+  heartbeat, so none of them should share an address with anything sandboxes
+  are meant to reach.
 - **Everything is audited.** Every connection decision, allowed or refused, with
   destination, byte counts and reason, and every refused DNS query, goes to the
   node's audit log.

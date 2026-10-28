@@ -163,10 +163,17 @@ fn run_pipes(
     inbound: Streaming<guestpb::ExecInput>,
     namespaces: Option<&systemd::Namespaces>,
 ) -> Result<OutputRx, Status> {
+    use std::os::unix::process::CommandExt;
+
     command
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
+    // A group of its own, as a pty command gets from its session, so a
+    // signal reaches what the command started and not only the command.
+    // Without one it would share the agent's, and nothing could be sent to
+    // the group without hitting the agent too.
+    command.process_group(0);
     if let Some(creds) = &credentials {
         drop_privileges(&mut command, creds);
     }
@@ -177,7 +184,7 @@ fn run_pipes(
     let pid = child.id() as i32;
     let exit = reaper::watch(pid);
     drop(gate);
-    let handle = commands::register(start.cmd.clone(), start.user.clone(), pid);
+    let handle = commands::register(start.cmd.clone(), start.user.clone(), pid, rotation(start));
 
     let stdin = child.stdin.take().map(pipe).transpose()?;
     let stdout = child.stdout.take().map(pipe).transpose()?;
@@ -187,7 +194,7 @@ fn run_pipes(
 
     let (tx, rx) = mpsc::channel(CHANNEL_CAPACITY);
     announce(&tx, handle.id());
-    tokio::spawn(control_pipes(inbound, stdin, pid));
+    tokio::spawn(control_pipes(feed(inbound, &handle), stdin, pid));
     if let Some(pipe) = stdout {
         tokio::spawn(pump(pipe, tx.clone(), handle.clone(), Frame::Stdout));
     }
@@ -196,6 +203,14 @@ fn run_pipes(
     }
     tokio::spawn(report_exit(exit, tx, handle));
     Ok(rx)
+}
+
+/// How the command's log is bounded, from what the caller asked for.
+fn rotation(start: &guestpb::ExecStart) -> commands::Rotation {
+    commands::Rotation {
+        max_bytes: start.log_max_bytes,
+        max_files: start.log_max_files.max(1),
+    }
 }
 
 /// Puts the command's id on the stream before any of its output.
@@ -264,7 +279,7 @@ fn run_pty(
     let pid = child.id() as i32;
     let exit = reaper::watch(pid);
     drop(gate);
-    let handle = commands::register(start.cmd.clone(), start.user.clone(), pid);
+    let handle = commands::register(start.cmd.clone(), start.user.clone(), pid, rotation(start));
     drop(child);
 
     // The parent's copy of the slave must go, or the master never sees EOF.
@@ -272,19 +287,42 @@ fn run_pty(
 
     let (tx, rx) = mpsc::channel(CHANNEL_CAPACITY);
     announce(&tx, handle.id());
-    tokio::spawn(control_pty(inbound, pty.writer, pid));
+    tokio::spawn(control_pty(feed(inbound, &handle), pty.writer, pid));
     tokio::spawn(pump(pty.reader, tx.clone(), handle.clone(), Frame::Stdout));
     tokio::spawn(report_exit(exit, tx, handle));
     Ok(rx)
 }
 
-/// Client -> child stdin, plus signal control, for the pipe case.
-async fn control_pipes(
+/// Gives the command an input channel any stream can feed, and feeds it from
+/// the stream that started the command for as long as that lasts.
+///
+/// The stream ending does not end the input. A client that went away, or a
+/// sandbox that slept and dropped the host's connection, is not the child
+/// reaching EOF: only an explicit `is_stdin_eof` closes stdin, so a shell
+/// survives for the next attacher to type into.
+fn feed(
     mut inbound: Streaming<guestpb::ExecInput>,
+    handle: &Handle,
+) -> mpsc::Receiver<guestpb::ExecInput> {
+    let (tx, rx) = mpsc::channel(CHANNEL_CAPACITY);
+    handle.set_input(tx.clone());
+    tokio::spawn(async move {
+        while let Some(Ok(msg)) = inbound.next().await {
+            if tx.send(msg).await.is_err() {
+                return;
+            }
+        }
+    });
+    rx
+}
+
+/// Input -> child stdin, plus signal control, for the pipe case.
+async fn control_pipes(
+    mut inbound: mpsc::Receiver<guestpb::ExecInput>,
     mut stdin: Option<AsyncPipe>,
     pid: i32,
 ) {
-    while let Some(Ok(msg)) = inbound.next().await {
+    while let Some(msg) = inbound.recv().await {
         match msg.input {
             Some(Input::Stdin(bytes)) => {
                 let Some(pipe) = stdin.as_mut() else { continue };
@@ -308,8 +346,12 @@ async fn control_pipes(
 }
 
 /// Client -> pty, plus resize and signal control.
-async fn control_pty(mut inbound: Streaming<guestpb::ExecInput>, mut master: AsyncPipe, pid: i32) {
-    while let Some(Ok(msg)) = inbound.next().await {
+async fn control_pty(
+    mut inbound: mpsc::Receiver<guestpb::ExecInput>,
+    mut master: AsyncPipe,
+    pid: i32,
+) {
+    while let Some(msg) = inbound.recv().await {
         match msg.input {
             Some(Input::Stdin(bytes)) if master.write_all(&bytes).await.is_err() => break,
             Some(Input::Stdin(_)) => {}
@@ -330,19 +372,34 @@ async fn control_pty(mut inbound: Streaming<guestpb::ExecInput>, mut master: Asy
     }
 }
 
-async fn report_exit(exit: tokio::sync::oneshot::Receiver<i32>, tx: OutputTx, handle: Handle) {
-    let message = match exit.await {
-        Ok(code) => {
-            handle.finish(code);
-            chunk(Output::ExitCode(code))
+async fn report_exit(
+    exit: tokio::sync::oneshot::Receiver<reaper::Exit>,
+    tx: OutputTx,
+    handle: Handle,
+) {
+    let messages = match exit.await {
+        Ok(exit) => {
+            handle.finish(exit.code, exit.signal);
+            Frame::Exit {
+                code: exit.code,
+                signal: exit.signal,
+            }
+            .outputs()
+            .into_iter()
+            .map(chunk)
+            .collect()
         }
         // The reaper dropped the sender, which should not happen while the
         // agent is alive.
-        Err(_) => Err(Status::internal("lost track of the child process")),
+        Err(_) => vec![Err(Status::internal("lost track of the child process"))],
     };
     // The pump tasks hold clones of `tx`; the exit code queues behind whatever
     // output they have already sent, so clients see complete output first.
-    let _ = tx.send(message).await;
+    for message in messages {
+        if tx.send(message).await.is_err() {
+            return;
+        }
+    }
 }
 
 /// Child output -> the registry, and the stream that started it while it lasts.
@@ -362,8 +419,10 @@ where
             Ok(0) | Err(_) => break,
             Ok(n) => {
                 let frame = wrap(buf[..n].to_vec());
-                if streaming {
-                    streaming = tx.send(chunk(frame.output())).await.is_ok();
+                for output in frame.outputs() {
+                    if streaming {
+                        streaming = tx.send(chunk(output)).await.is_ok();
+                    }
                 }
                 handle.record(frame);
             }
@@ -376,7 +435,7 @@ fn send_signal(pid: i32, signal: i32) {
         tracing::warn!(signal, "ignoring unknown signal");
         return;
     };
-    if let Err(err) = nix::sys::signal::kill(nix::unistd::Pid::from_raw(pid), Some(signal)) {
+    if let Err(err) = nix::sys::signal::killpg(nix::unistd::Pid::from_raw(pid), Some(signal)) {
         tracing::warn!(pid, %err, "failed to signal child");
     }
 }

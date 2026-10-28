@@ -267,7 +267,12 @@ impl Guest for AgentService {
         &self,
         _req: Request<guestpb::GuestHealthRequest>,
     ) -> Result<Response<guestpb::GuestHealthResponse>, Status> {
-        Ok(Response::new(guestpb::GuestHealthResponse {}))
+        Ok(Response::new(guestpb::GuestHealthResponse {
+            features: vec![
+                files::FEATURE_FILES_AS_USER.to_string(),
+                "attach-input".to_string(),
+            ],
+        }))
     }
 
     type ExecStream = tokio_stream::wrappers::ReceiverStream<Result<guestpb::ExecOutput, Status>>;
@@ -296,7 +301,8 @@ impl Guest for AgentService {
         &self,
         req: Request<guestpb::DownloadRequest>,
     ) -> Result<Response<Self::DownloadFileStream>, Status> {
-        let rx = files::download(req.into_inner().path).await?;
+        let req = req.into_inner();
+        let rx = files::download(req.path, &req.user).await?;
         Ok(Response::new(tokio_stream::wrappers::ReceiverStream::new(
             rx,
         )))
@@ -314,7 +320,7 @@ impl Guest for AgentService {
         } else {
             req.interval_ms.max(50) as u64
         });
-        let rx = files::watch(req.path, req.is_recursive, interval).await?;
+        let rx = files::watch(req.path, req.is_recursive, interval, &req.user).await?;
         Ok(Response::new(tokio_stream::wrappers::ReceiverStream::new(
             rx,
         )))
@@ -324,9 +330,8 @@ impl Guest for AgentService {
         &self,
         req: Request<guestpb::ListDirRequest>,
     ) -> Result<Response<guestpb::ListDirResponse>, Status> {
-        Ok(Response::new(
-            files::list_dir(&req.into_inner().path).await?,
-        ))
+        let req = req.into_inner();
+        Ok(Response::new(files::list_dir(&req.path, &req.user).await?))
     }
 
     async fn list_commands(
@@ -350,10 +355,78 @@ impl Guest for AgentService {
         &self,
         req: Request<guestpb::AttachCommandRequest>,
     ) -> Result<Response<Self::AttachCommandStream>, Status> {
-        let rx = commands::attach(&req.into_inner().command_id)?;
+        let rx = commands::attach(&req.into_inner().command_id, 0)?;
         Ok(Response::new(tokio_stream::wrappers::ReceiverStream::new(
             rx,
         )))
+    }
+
+    type AttachStream = tokio_stream::wrappers::ReceiverStream<Result<guestpb::ExecOutput, Status>>;
+
+    async fn attach(
+        &self,
+        req: Request<tonic::Streaming<guestpb::AttachInput>>,
+    ) -> Result<Response<Self::AttachStream>, Status> {
+        use guestpb::attach_input::Input as Attach;
+        use guestpb::exec_input::Input as Exec;
+        use tokio_stream::StreamExt as _;
+
+        let mut inbound = req.into_inner();
+        let Some(Attach::Start(start)) = inbound.next().await.transpose()?.and_then(|m| m.input)
+        else {
+            return Err(Status::invalid_argument(
+                "first Attach message must be Start",
+            ));
+        };
+        let rx = commands::attach(&start.command_id, start.from_offset)?;
+        // Looked up on the first input rather than now: following a command
+        // that has finished is fine, and only feeding it is not.
+        let id = start.command_id;
+        tokio::spawn(async move {
+            let mut input = None;
+            while let Some(Ok(msg)) = inbound.next().await {
+                let translated = match msg.input {
+                    Some(Attach::Stdin(bytes)) => Exec::Stdin(bytes),
+                    Some(Attach::Resize(size)) => Exec::Resize(size),
+                    Some(Attach::Signal(signal)) => Exec::Signal(signal),
+                    Some(Attach::IsStdinEof(eof)) => Exec::IsStdinEof(eof),
+                    Some(Attach::Start(_)) | None => continue,
+                };
+                if input.is_none() {
+                    match commands::input(&id) {
+                        Ok(tx) => input = Some(tx),
+                        Err(err) => {
+                            tracing::debug!(%err, "input for a command that takes none");
+                            return;
+                        }
+                    }
+                }
+                let msg = guestpb::ExecInput {
+                    input: Some(translated),
+                };
+                // Waits for room rather than dropping: this task carries only
+                // input, so a slow child holds up nobody's output.
+                if let Some(tx) = &input
+                    && tx.send(msg).await.is_err()
+                {
+                    return;
+                }
+            }
+        });
+        Ok(Response::new(tokio_stream::wrappers::ReceiverStream::new(
+            rx,
+        )))
+    }
+
+    async fn prune_commands(
+        &self,
+        _req: Request<guestpb::PruneCommandsRequest>,
+    ) -> Result<Response<guestpb::PruneCommandsResponse>, Status> {
+        Ok(Response::new(
+            tokio::task::spawn_blocking(commands::prune)
+                .await
+                .map_err(|err| Status::internal(format!("pruning did not run: {err}")))?,
+        ))
     }
 
     async fn signal_command(

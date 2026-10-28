@@ -248,6 +248,7 @@ pub async fn upload(
         data: content.to_vec(),
         owner: owner.to_string(),
         is_existing_skipped: skip_existing,
+        user: String::new(),
     };
     agent.upload_file(tokio_stream::iter(vec![first])).await?;
     Ok(())

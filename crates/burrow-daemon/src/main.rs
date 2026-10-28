@@ -1,3 +1,4 @@
+mod access;
 mod blobs;
 mod chunks;
 mod devvm;

@@ -13,6 +13,110 @@ mod term;
 type Client = BurrowClient<
     tonic::service::interceptor::InterceptedService<tonic::transport::Channel, BearerAuth>,
 >;
+type AccessClient = api::access_client::AccessClient<
+    tonic::service::interceptor::InterceptedService<tonic::transport::Channel, BearerAuth>,
+>;
+
+/// Where a sandbox's exec, attach and file calls go: the node that holds it,
+/// called with a token the orchestrator issues, or the orchestrator, which
+/// relays them. Both serve the same calls.
+enum Passage {
+    Direct(AccessClient),
+    Relay(Client),
+}
+
+impl Passage {
+    async fn exec(
+        &mut self,
+        input: impl tonic::IntoStreamingRequest<Message = api::ExecInput>,
+    ) -> Result<tonic::Response<tonic::Streaming<api::ExecOutput>>, tonic::Status> {
+        match self {
+            Self::Direct(client) => client.exec(input).await,
+            Self::Relay(client) => client.exec(input).await,
+        }
+    }
+
+    async fn attach(
+        &mut self,
+        input: impl tonic::IntoStreamingRequest<Message = api::AttachInput>,
+    ) -> Result<tonic::Response<tonic::Streaming<api::ExecOutput>>, tonic::Status> {
+        match self {
+            Self::Direct(client) => client.attach(input).await,
+            Self::Relay(client) => client.attach(input).await,
+        }
+    }
+
+    async fn upload_file(
+        &mut self,
+        chunks: impl tonic::IntoStreamingRequest<Message = api::FileChunk>,
+    ) -> Result<tonic::Response<api::UploadResult>, tonic::Status> {
+        match self {
+            Self::Direct(client) => client.upload_file(chunks).await,
+            Self::Relay(client) => client.upload_file(chunks).await,
+        }
+    }
+
+    async fn download_file(
+        &mut self,
+        req: api::DownloadRequest,
+    ) -> Result<tonic::Response<tonic::Streaming<api::FileChunk>>, tonic::Status> {
+        match self {
+            Self::Direct(client) => client.download_file(req).await,
+            Self::Relay(client) => client.download_file(req).await,
+        }
+    }
+
+    async fn list_dir(
+        &mut self,
+        req: api::ListDirRequest,
+    ) -> Result<tonic::Response<api::ListDirResponse>, tonic::Status> {
+        match self {
+            Self::Direct(client) => client.list_dir(req).await,
+            Self::Relay(client) => client.list_dir(req).await,
+        }
+    }
+}
+
+/// One sandbox's calls and the reference they carry: the id a token names
+/// when direct, which the node matches exactly, or what the caller gave the
+/// orchestrator, which resolves names.
+struct Route {
+    client: Passage,
+    sandbox_id: String,
+}
+
+/// `--insecure`, which governs the node a token goes to as much as the
+/// orchestrator, set once from the command line.
+static INSECURE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+/// Whether `--route orchestrator` was asked for, set once like `INSECURE`.
+static RELAYED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+
+async fn route(client: &Client, sandbox: &str) -> anyhow::Result<Route> {
+    if *RELAYED.get().unwrap_or(&false) {
+        return Ok(Route {
+            client: Passage::Relay(client.clone()),
+            sandbox_id: sandbox.to_string(),
+        });
+    }
+    let grant = client
+        .clone()
+        .issue_access(api::IssueAccessRequest {
+            r#ref: Some(api::SandboxRef {
+                id: sandbox.to_string(),
+            }),
+            ..Default::default()
+        })
+        .await?
+        .into_inner();
+    let channel = connect(&grant.endpoint, *INSECURE.get().unwrap_or(&false)).await?;
+    Ok(Route {
+        client: Passage::Direct(api::access_client::AccessClient::with_interceptor(
+            channel,
+            BearerAuth(Some(grant.token)),
+        )),
+        sandbox_id: grant.sandbox_id,
+    })
+}
 
 /// Attaches the bearer token, when one is configured.
 #[derive(Clone)]
@@ -55,6 +159,19 @@ struct Args {
     /// hands it to anything on the path.
     #[arg(long = "insecure", global = true, env = "BURROW_INSECURE")]
     is_insecure: bool,
+    /// Where exec, attach and file traffic goes. `direct`, the default, calls
+    /// the node holding the sandbox with a short-lived token from the
+    /// orchestrator, which the node has to be reachable for. `orchestrator`
+    /// sends it through the orchestrator, which relays it. Neither falls back
+    /// to the other.
+    #[arg(
+        long,
+        global = true,
+        default_value = "direct",
+        value_parser = ["direct", "orchestrator"],
+        env = "BURROW_ROUTE"
+    )]
+    route: String,
     #[command(subcommand)]
     command: Command,
 }
@@ -95,7 +212,7 @@ fn load_api_key(
 async fn connect(endpoint: &str, insecure: bool) -> anyhow::Result<tonic::transport::Channel> {
     let uri: tonic::transport::Uri = endpoint
         .parse()
-        .map_err(|err| anyhow::anyhow!("--orchestrator {endpoint} is not a URL: {err}"))?;
+        .map_err(|err| anyhow::anyhow!("{endpoint} is not a URL: {err}"))?;
     let mut builder = tonic::transport::Endpoint::from(uri.clone());
 
     if uri.scheme_str() == Some("https") {
@@ -106,7 +223,7 @@ async fn connect(endpoint: &str, insecure: bool) -> anyhow::Result<tonic::transp
         )?;
     } else if !insecure && !is_loopback(uri.host().unwrap_or_default()) {
         anyhow::bail!(
-            "refusing to send the api key in plaintext to {}: use https://, or pass \
+            "refusing to send a bearer token in plaintext to {}: use https://, or pass \
              --insecure if the endpoint is reached over a network you trust",
             uri.host().unwrap_or(endpoint)
         );
@@ -267,6 +384,9 @@ enum Command {
         /// to a command, not to the sandbox as a whole.
         command_id: Option<String>,
     },
+    /// Remove finished commands and their output logs, as `docker container
+    /// prune`. Running commands are left alone.
+    Prune { id: String },
     /// Signal a running command.
     Kill {
         id: String,
@@ -352,6 +472,9 @@ enum Command {
     Secret(SecretCommand),
     /// List the VMs a sandbox has run, newest first.
     Sessions { id: String },
+    /// Tokens for calling a sandbox's node directly, without the orchestrator.
+    #[command(subcommand)]
+    Token(TokenCommand),
     /// Destroy sandboxes.
     #[command(visible_alias = "rm")]
     Remove {
@@ -800,6 +923,36 @@ struct ExecFlags {
     /// `burrow user create`.
     #[arg(long = "user", short = 'u')]
     user: Option<String>,
+    /// Rotate the command's output log once a file reaches this size, e.g.
+    /// 20m, as Docker's `--log-opt max-size`. Unset keeps every byte.
+    #[arg(long = "log-max-size", value_parser = parse_size)]
+    log_max_size: Option<u64>,
+    /// Log files kept once rotating, as Docker's `--log-opt max-file`.
+    #[arg(long = "log-max-files", default_value_t = 1, requires = "log_max_size")]
+    log_max_files: u32,
+}
+
+/// A size as Docker writes one: bytes, or a number with k, m or g.
+fn parse_size(text: &str) -> Result<u64, String> {
+    let text = text.trim().to_ascii_lowercase();
+    let (digits, scale) = match text.strip_suffix(['k', 'm', 'g']) {
+        Some(digits) => (
+            digits,
+            match text.chars().last() {
+                Some('k') => 1u64 << 10,
+                Some('m') => 1 << 20,
+                _ => 1 << 30,
+            },
+        ),
+        None => (text.as_str(), 1),
+    };
+    let value: u64 = digits
+        .parse()
+        .map_err(|_| format!("{text:?} is not a size like 20m"))?;
+    match value.checked_mul(scale) {
+        Some(0) | None => Err(format!("{text:?} is not a size above zero")),
+        Some(bytes) => Ok(bytes),
+    }
 }
 
 /// Egress policy, shared by `create`, `run` and `config network-policy` so they
@@ -1052,6 +1205,27 @@ enum VolumeCommand {
 }
 
 #[derive(Subcommand)]
+enum TokenCommand {
+    /// Issue a token and print it with the endpoint it works at.
+    Issue {
+        id: String,
+        /// What it may do: exec, files:read or files:write. Repeatable; all
+        /// three when left out.
+        #[arg(long = "op")]
+        ops: Vec<String>,
+        /// Guest user every exec under it runs as, and every file transfer.
+        #[arg(long)]
+        user: Option<String>,
+        /// Seconds it lasts, at most 3600. Five minutes when left out.
+        #[arg(long, default_value_t = 0)]
+        ttl: u32,
+    },
+    /// Refuse every token issued for a sandbox so far, and end the sessions
+    /// they opened.
+    Revoke { id: String },
+}
+
+#[derive(Subcommand)]
 enum SecretCommand {
     /// Store a secret. The value is read from --value, else from stdin.
     Set {
@@ -1087,6 +1261,8 @@ enum NodesCommand {
 async fn main() -> anyhow::Result<()> {
     let args = Args::parse();
     let api_key = load_api_key(args.api_key.as_deref(), args.api_key_file.as_deref())?;
+    let _ = INSECURE.set(args.is_insecure);
+    let _ = RELAYED.set(args.route == "orchestrator");
     let channel = connect(&args.orchestrator, args.is_insecure).await?;
     let mut client = BurrowClient::with_interceptor(channel, BearerAuth(api_key));
 
@@ -1138,7 +1314,7 @@ async fn main() -> anyhow::Result<()> {
                 std::process::exit(1);
             }
             if connect {
-                let code = connect_shell(&mut client, &sandbox.id, None, Vec::new()).await?;
+                let code = connect_shell(&client, &sandbox.id, None, Vec::new()).await?;
                 if code != 0 {
                     std::process::exit(exit_status(code));
                 }
@@ -1232,13 +1408,14 @@ async fn main() -> anyhow::Result<()> {
             );
         }
         Command::Exec { id, exec, cmd } => {
-            let code = run_exec(&mut client, &id, &exec, cmd).await?;
+            let mut node = route(&client, &id).await?;
+            let code = run_exec(&mut node.client, &node.sandbox_id, &exec, cmd).await?;
             if code != 0 {
                 std::process::exit(exit_status(code));
             }
         }
         Command::Connect { id, user, cmd } => {
-            let code = connect_shell(&mut client, &id, user, cmd).await?;
+            let code = connect_shell(&client, &id, user, cmd).await?;
             if code != 0 {
                 std::process::exit(exit_status(code));
             }
@@ -1253,10 +1430,20 @@ async fn main() -> anyhow::Result<()> {
                      `burrow logs {id} <COMMAND-ID>`. `burrow top {id}` lists them"
                 );
             };
-            let code = attach_command(&mut client, &id, &command_id).await?;
+            let code = attach_command(&client, &id, &command_id).await?;
             if code != 0 {
                 std::process::exit(exit_status(code));
             }
+        }
+        Command::Prune { id } => {
+            let pruned = client
+                .prune_commands(api::PruneCommandsRequest { sandbox_id: id })
+                .await?
+                .into_inner();
+            println!(
+                "removed {} finished command(s), freed {} bytes",
+                pruned.removed, pruned.freed_bytes
+            );
         }
         Command::Kill {
             id,
@@ -1351,7 +1538,7 @@ async fn main() -> anyhow::Result<()> {
                 std::process::exit(exit_status(code));
             }
         }
-        Command::Copy { src, dst } => copy(&mut client, &src, &dst).await?,
+        Command::Copy { src, dst } => copy(&client, &src, &dst).await?,
         Command::Stop { ids } => transition_each(&mut client, ids, Transition::Pause).await,
         Command::Start { id } => transition_timed(&mut client, id, Transition::Resume).await?,
         Command::Shutdown { ids } => transition_each(&mut client, ids, Transition::Stop).await,
@@ -1410,6 +1597,35 @@ async fn main() -> anyhow::Result<()> {
             println!("deleted {name}");
         }
         Command::Sessions { id } => list_sessions(&mut client, id).await?,
+        Command::Token(TokenCommand::Issue { id, ops, user, ttl }) => {
+            let grant = client
+                .issue_access(api::IssueAccessRequest {
+                    r#ref: Some(api::SandboxRef { id }),
+                    ops,
+                    user: user.unwrap_or_default(),
+                    ttl_secs: ttl,
+                })
+                .await?
+                .into_inner();
+            println!("endpoint  {}", sanitize(&grant.endpoint));
+            println!("sandbox   {}", sanitize(&grant.sandbox_id));
+            println!(
+                "expires   {}",
+                rfc3339_from_unix_ms(grant.expires_at * 1000)
+            );
+            println!("token     {}", sanitize(&grant.token));
+        }
+        Command::Token(TokenCommand::Revoke { id }) => {
+            let revoked = client
+                .revoke_access(api::SandboxRef { id: id.clone() })
+                .await?
+                .into_inner();
+            println!(
+                "revoked every token for {id} issued by {}; ended {} open session(s)",
+                rfc3339_from_unix_ms(revoked.revoked_at * 1000),
+                revoked.ended_sessions
+            );
+        }
         Command::Remove { ids } => {
             let mut failed = false;
             for id in ids {
@@ -1878,7 +2094,10 @@ async fn main() -> anyhow::Result<()> {
             }
         }
         Command::Dir { id, path } => {
-            let resp = client
+            let mut node = route(&client, &id).await?;
+            let id = node.sandbox_id;
+            let resp = node
+                .client
                 .list_dir(api::ListDirRequest {
                     sandbox_id: id,
                     path,
@@ -2113,8 +2332,9 @@ async fn run_in_sandbox(
 
     // Detached: the command is started and left running, so there is no exit
     // status to wait for and nothing to clean up afterwards.
+    let mut node = route(client, &id).await?;
     if detach {
-        let command_id = start_detached(client, &id, &exec, cmd).await?;
+        let command_id = start_detached(&mut node.client, &node.sandbox_id, &exec, cmd).await?;
         eprintln!("command {command_id}");
         println!("{id}");
         return Ok(0);
@@ -2124,7 +2344,7 @@ async fn run_in_sandbox(
     // --rm happen whatever the exec did. An exec that failed is exactly the
     // case where a sandbox left behind holds capacity the caller cannot get
     // back without digging its id out of the error.
-    let result = run_exec(client, &id, &exec, cmd).await;
+    let result = run_exec(&mut node.client, &node.sandbox_id, &exec, cmd).await;
 
     if stop {
         match client
@@ -2151,7 +2371,7 @@ async fn run_in_sandbox(
 /// `connect`: an interactive shell, which is `exec --pty` with a default
 /// command.
 async fn connect_shell(
-    client: &mut Client,
+    client: &Client,
     id: &str,
     user: Option<String>,
     cmd: Vec<String>,
@@ -2171,8 +2391,11 @@ async fn connect_shell(
         envs: Vec::new(),
         workdir: None,
         user,
+        log_max_size: None,
+        log_max_files: 1,
     };
-    run_exec(client, id, &flags, cmd).await
+    let mut node = route(client, id).await?;
+    run_exec(&mut node.client, &node.sandbox_id, &flags, cmd).await
 }
 
 /// Turns the network flags into the policy the server enforces.
@@ -3212,7 +3435,7 @@ fn state_name(state: i32) -> &'static str {
 /// reach the guest program rather than the local line discipline, and the
 /// window size is sent along and resent when it changes.
 async fn run_exec(
-    client: &mut Client,
+    client: &mut Passage,
     sandbox_id: &str,
     flags: &ExecFlags,
     cmd: Vec<String>,
@@ -3235,6 +3458,8 @@ async fn run_exec(
             rows,
             cols,
             user: flags.user.clone().unwrap_or_default(),
+            log_max_bytes: flags.log_max_size.unwrap_or(0),
+            log_max_files: flags.log_max_files,
         })),
     };
 
@@ -3303,7 +3528,10 @@ async fn run_exec(
             Some(api::exec_output::Output::ExitCode(c)) => code = Some(c),
             // Not printed: it would land in the middle of the command's own
             // output. `burrow ps` is where a command's id is read.
-            Some(api::exec_output::Output::CommandId(_)) | None => {}
+            Some(api::exec_output::Output::CommandId(_))
+            | Some(api::exec_output::Output::ExitSignal(_))
+            | Some(api::exec_output::Output::LostBytes(_))
+            | None => {}
         }
     }
     if let Some(pump) = stdin_pump {
@@ -3324,7 +3552,7 @@ async fn run_exec(
 /// what `logs` and `kill` need afterwards. A command outlives the exec that
 /// started it, so nothing here has to stay attached; it gets no stdin.
 async fn start_detached(
-    client: &mut Client,
+    client: &mut Passage,
     sandbox_id: &str,
     flags: &ExecFlags,
     cmd: Vec<String>,
@@ -3339,6 +3567,8 @@ async fn start_detached(
             rows: 24,
             cols: 80,
             user: flags.user.clone().unwrap_or_default(),
+            log_max_bytes: flags.log_max_size.unwrap_or(0),
+            log_max_files: flags.log_max_files,
         })),
     };
     let (tx, rx) = tokio::sync::mpsc::channel(1);
@@ -3392,12 +3622,18 @@ async fn list_commands(client: &mut Client, id: &str) -> anyhow::Result<()> {
 }
 
 /// `logs`: what the guest still holds of a command, then the rest of it live.
-async fn attach_command(client: &mut Client, id: &str, command_id: &str) -> anyhow::Result<i32> {
-    let mut stream = client
-        .attach_command(api::AttachCommandRequest {
-            sandbox_id: id.to_string(),
+async fn attach_command(client: &Client, id: &str, command_id: &str) -> anyhow::Result<i32> {
+    let mut node = route(client, id).await?;
+    let start = api::AttachInput {
+        input: Some(api::attach_input::Input::Start(api::AttachStart {
+            sandbox_id: node.sandbox_id.clone(),
             command_id: command_id.to_string(),
-        })
+            from_offset: 0,
+        })),
+    };
+    let mut stream = node
+        .client
+        .attach(tokio_stream::iter(vec![start]))
         .await?
         .into_inner();
 
@@ -3415,7 +3651,13 @@ async fn attach_command(client: &mut Client, id: &str, command_id: &str) -> anyh
                 stderr.flush()?;
             }
             Some(api::exec_output::Output::ExitCode(c)) => code = Some(c),
-            Some(api::exec_output::Output::CommandId(_)) | None => {}
+            // Said on stderr, where it does not land in the output itself.
+            Some(api::exec_output::Output::LostBytes(lost)) => {
+                eprintln!("burrow: {lost} bytes of earlier output are no longer held");
+            }
+            Some(api::exec_output::Output::CommandId(_))
+            | Some(api::exec_output::Output::ExitSignal(_))
+            | None => {}
         }
     }
     code.ok_or_else(|| {
@@ -3514,10 +3756,17 @@ fn parse_endpoint(spec: &str) -> Endpoint {
 /// Two sandbox paths would be a sandbox-to-sandbox transfer the API does not
 /// offer, and two local paths are a job for `cp`; both are refused rather than
 /// half-performed.
-async fn copy(client: &mut Client, src: &str, dst: &str) -> anyhow::Result<()> {
+async fn copy(client: &Client, src: &str, dst: &str) -> anyhow::Result<()> {
     match (parse_endpoint(src), parse_endpoint(dst)) {
         (Endpoint::Local(local), Endpoint::Sandbox { id, path }) => {
-            let bytes = push(client, &id, std::path::Path::new(&local), &path).await?;
+            let mut node = route(client, &id).await?;
+            let bytes = push(
+                &mut node.client,
+                &node.sandbox_id,
+                std::path::Path::new(&local),
+                &path,
+            )
+            .await?;
             println!("uploaded {bytes} bytes to {id}:{path}");
             Ok(())
         }
@@ -3525,7 +3774,8 @@ async fn copy(client: &mut Client, src: &str, dst: &str) -> anyhow::Result<()> {
             // `-` is the usual spelling of "stdout" and cannot be a filename
             // anyone meant.
             let local = (local != "-").then(|| std::path::PathBuf::from(local));
-            pull(client, &id, &path, local).await
+            let mut node = route(client, &id).await?;
+            pull(&mut node.client, &node.sandbox_id, &path, local).await
         }
         (Endpoint::Sandbox { .. }, Endpoint::Sandbox { .. }) => {
             anyhow::bail!("copy moves a file between this machine and a sandbox, not between two")
@@ -3537,7 +3787,7 @@ async fn copy(client: &mut Client, src: &str, dst: &str) -> anyhow::Result<()> {
 }
 
 async fn push(
-    client: &mut Client,
+    client: &mut Passage,
     sandbox_id: &str,
     local: &std::path::Path,
     remote: &str,
@@ -3604,7 +3854,7 @@ async fn push(
 }
 
 async fn pull(
-    client: &mut Client,
+    client: &mut Passage,
     sandbox_id: &str,
     remote: &str,
     local: Option<std::path::PathBuf>,

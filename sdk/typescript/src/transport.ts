@@ -7,6 +7,7 @@
  * same `.proto` files the daemons are built from.
  */
 
+import { EventEmitter } from "node:events";
 import { createRequire } from "node:module";
 import { dirname, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -46,6 +47,14 @@ export interface TransportOptions {
   tls?: boolean;
   /** Default per-call deadline in milliseconds. */
   timeoutMs?: number;
+  /**
+   * Where exec, attach and file traffic goes. `"direct"`, the default, calls
+   * the node holding the sandbox with a short-lived token from the
+   * orchestrator, and needs the node reachable from here. `"orchestrator"`
+   * has the orchestrator relay the calls. Neither falls back to the other.
+   * Reads `BURROW_ROUTE`.
+   */
+  route?: "direct" | "orchestrator";
 }
 
 type AnyClient = grpc.Client & Record<string, Function>;
@@ -77,8 +86,27 @@ function bindSignal(call: any, signal: AbortSignal | undefined): () => void {
   return () => signal.removeEventListener("abort", onAbort);
 }
 
+/** A token is replaced this long before it expires. */
+const GRANT_MARGIN_MS = 30_000;
+
+/**
+ * What a node says about a token that no longer works there: expired,
+ * revoked, or for a sandbox that has moved to another node.
+ */
+const STALE_GRANT = new Set(["unauthenticated", "not_found"]);
+
+const CHANNEL_OPTIONS = {
+  // Exec and file transfers can carry large payloads; the 4MB default turns a
+  // big file into a confusing RESOURCE_EXHAUSTED.
+  "grpc.max_receive_message_length": 64 * 1024 * 1024,
+  "grpc.max_send_message_length": 64 * 1024 * 1024,
+};
+
 export class Transport {
   private readonly client: AnyClient;
+  private readonly pkg: any;
+  private readonly directs = new Map<string, Direct>();
+  private readonly nodes = new Map<string, AnyClient>();
   readonly timeoutMs: number;
   /**
    * Host this client dials, without its port. A published port whose node
@@ -86,6 +114,7 @@ export class Transport {
    */
   readonly host: string;
   private readonly apiKey?: string;
+  private readonly isRelayed: boolean;
   /** Handles sharing this connection; the channel outlives the first release. */
   private refs = 1;
 
@@ -98,6 +127,14 @@ export class Transport {
     this.host = address.replace(/:\d+$/, "") || "localhost";
     this.timeoutMs = options.timeoutMs ?? 60_000;
     this.apiKey = options.apiKey ?? process.env.BURROW_API_KEY;
+    const route = options.route ?? process.env.BURROW_ROUTE ?? "direct";
+    if (route !== "direct" && route !== "orchestrator") {
+      throw new BurrowError(
+        `route must be "direct" or "orchestrator", not ${JSON.stringify(route)}`,
+        "invalid_argument",
+      );
+    }
+    this.isRelayed = route === "orchestrator";
 
     // A bare `host:port` endpoint leaves `tls` false, which is fine with no
     // credential in play but an easy way to ship an API key in cleartext to
@@ -126,21 +163,53 @@ export class Transport {
       defaults: true,
       oneofs: true,
     });
-    const pkg = grpc.loadPackageDefinition(definition) as any;
-    const Ctor = pkg.burrow.api.v1.Burrow;
+    this.pkg = grpc.loadPackageDefinition(definition) as any;
+    const Ctor = this.pkg.burrow.api.v1.Burrow;
 
     this.client = new Ctor(
       address,
       secure
         ? grpc.credentials.createSsl()
         : grpc.credentials.createInsecure(),
-      {
-        // Exec and file transfers can carry large payloads; the 4MB default
-        // turns a big file into a confusing RESOURCE_EXHAUSTED.
-        "grpc.max_receive_message_length": 64 * 1024 * 1024,
-        "grpc.max_send_message_length": 64 * 1024 * 1024,
-      },
+      CHANNEL_OPTIONS,
     ) as AnyClient;
+  }
+
+  /**
+   * Where a sandbox's exec, attach and file calls go: its node, or this
+   * connection to the orchestrator, which relays them. Both take the same
+   * calls.
+   */
+  route(sandboxId: string): Transport | Direct {
+    return this.isRelayed ? this : this.direct(sandboxId);
+  }
+
+  /** The way to a sandbox's exec, attach and file calls: its node. */
+  direct(sandboxId: string): Direct {
+    let direct = this.directs.get(sandboxId);
+    if (!direct) {
+      direct = new Direct(this, sandboxId);
+      this.directs.set(sandboxId, direct);
+    }
+    return direct;
+  }
+
+  /** @internal One client per node, shared by every sandbox on it. */
+  nodeClient(endpoint: string): AnyClient {
+    let client = this.nodes.get(endpoint);
+    if (!client) {
+      const address = endpoint.replace(/^https?:\/\//, "");
+      let credentials: grpc.ChannelCredentials;
+      if (endpoint.startsWith("https://")) credentials = grpc.credentials.createSsl();
+      // The node's operator advertised it as plain http, which is as explicit
+      // as a caller passing `http://` here.
+      else if (endpoint.startsWith("http://")) credentials = grpc.credentials.createInsecure();
+      else throw new BurrowError(`node endpoint ${endpoint} names no scheme`, "internal");
+      const Ctor = this.pkg.burrow.api.v1.Access;
+      client = new Ctor(address, credentials, CHANNEL_OPTIONS) as AnyClient;
+      this.nodes.set(endpoint, client);
+    }
+    return client;
   }
 
   private metadata(): grpc.Metadata {
@@ -230,8 +299,10 @@ export class Transport {
    * Raw bidirectional call, for streams whose input stays open. {@link pipe}
    * closes the request side at once, which an interactive terminal cannot use.
    */
-  duplex(method: string): any {
-    return this.client[method]!(this.metadata(), {});
+  duplex(method: string, timeoutMs = Infinity, signal?: AbortSignal): any {
+    const call = this.client[method]!(this.metadata(), this.deadline(timeoutMs));
+    bindSignal(call, signal);
+    return call;
   }
 
   /**
@@ -291,7 +362,233 @@ export class Transport {
 
   /** Releases one share; the channel closes when the last one goes. */
   close(): void {
-    if (--this.refs <= 0) this.client.close();
+    if (--this.refs <= 0) {
+      this.client.close();
+      for (const node of this.nodes.values()) node.close();
+    }
+  }
+}
+
+interface Grant {
+  endpoint: string;
+  token: string;
+  /** Unix seconds. */
+  expiresAt: number;
+  sandboxId: string;
+}
+
+/**
+ * A sandbox's exec, attach and file calls, made on the node that holds it.
+ *
+ * The orchestrator carries none of that traffic: it issues a short-lived token
+ * for the sandbox's node, and the node is called with it. The token is reused
+ * until it nears expiry, and replaced when the node refuses it, as it does once
+ * it has expired, been revoked, or the sandbox has moved. A call that sends one
+ * message is then made once more; a stream is not, since what it already sent
+ * cannot be taken back, and the next one gets a fresh token.
+ */
+export class Direct {
+  private grant?: Promise<Grant>;
+
+  /** @internal */
+  constructor(
+    private readonly transport: Transport,
+    readonly sandboxId: string,
+  ) {}
+
+  private current(renew = false): Promise<Grant> {
+    const held = this.grant;
+    if (!renew && held) {
+      return held.then((grant) =>
+        grant.expiresAt * 1000 - Date.now() < GRANT_MARGIN_MS ? this.current(true) : grant,
+      );
+    }
+    const issued = this.transport
+      .unary<any, Grant>("IssueAccess", { ref: { id: this.sandboxId } })
+      .catch((err) => {
+        // A failed issue is not kept, so the next call asks again.
+        if (this.grant === issued) this.grant = undefined;
+        throw err;
+      });
+    this.grant = issued;
+    return issued;
+  }
+
+  private target(grant: Grant): { client: AnyClient; metadata: grpc.Metadata } {
+    const metadata = new grpc.Metadata();
+    metadata.set("authorization", `Bearer ${grant.token}`);
+    return { client: this.transport.nodeClient(grant.endpoint), metadata };
+  }
+
+  private deadline(timeoutMs?: number): grpc.CallOptions {
+    const timeout = timeoutMs ?? this.transport.timeoutMs;
+    if (!Number.isFinite(timeout)) return {};
+    return { deadline: Date.now() + timeout };
+  }
+
+  private async onceMore<T>(call: (grant: Grant) => Promise<T>): Promise<T> {
+    try {
+      return await call(await this.current());
+    } catch (err) {
+      if (!(err instanceof BurrowError) || !STALE_GRANT.has(err.code)) throw err;
+    }
+    return call(await this.current(true));
+  }
+
+  /** Unary call. */
+  unary<Req, Res>(
+    method: string,
+    request: Req,
+    timeoutMs?: number,
+    signal?: AbortSignal,
+  ): Promise<Res> {
+    return this.onceMore(
+      (grant) =>
+        new Promise<Res>((resolvePromise, reject) => {
+          const { client, metadata } = this.target(grant);
+          let release = () => {};
+          const call = client[method]!(
+            request,
+            metadata,
+            this.deadline(timeoutMs),
+            (err: grpc.ServiceError | null, res: Res) => {
+              release();
+              if (err) reject(BurrowError.fromGrpc(err));
+              else resolvePromise(res);
+            },
+          );
+          release = bindSignal(call, signal);
+        }),
+    );
+  }
+
+  /** Server-streaming call, surfaced as an async iterable. */
+  async *serverStream<Req, Res>(
+    method: string,
+    request: Req,
+    timeoutMs?: number,
+    signal?: AbortSignal,
+  ): AsyncGenerator<Res> {
+    const { client, metadata } = this.target(await this.current());
+    const call = client[method]!(request, metadata, this.deadline(timeoutMs));
+    const release = bindSignal(call, signal);
+    try {
+      yield* iterate<Res>(call);
+    } finally {
+      release();
+    }
+  }
+
+  /** Bidi call whose single response is awaited (upload). */
+  pipeUnary<Req, Res>(
+    method: string,
+    requests: Req[],
+    timeoutMs?: number,
+    signal?: AbortSignal,
+  ): Promise<Res> {
+    return this.onceMore(
+      (grant) =>
+        new Promise<Res>((resolvePromise, reject) => {
+          const { client, metadata } = this.target(grant);
+          let release = () => {};
+          const call = client[method]!(
+            metadata,
+            this.deadline(timeoutMs),
+            (err: grpc.ServiceError | null, res: Res) => {
+              release();
+              if (err) reject(BurrowError.fromGrpc(err));
+              else resolvePromise(res);
+            },
+          );
+          release = bindSignal(call, signal);
+          for (const request of requests) call.write(request);
+          call.end();
+        }),
+    );
+  }
+
+  /**
+   * Bidirectional call, returned at once and opened once the token is in
+   * hand: writes, `end` and `cancel` made before then are applied in order
+   * when it opens, and its events are passed on.
+   */
+  duplex(method: string, timeoutMs = Infinity, signal?: AbortSignal): any {
+    const call = new LazyCall();
+    this.current().then(
+      (grant) => {
+        const { client, metadata } = this.target(grant);
+        const opened = client[method]!(metadata, this.deadline(timeoutMs));
+        bindSignal(opened, signal);
+        call.open(opened);
+      },
+      (err) => call.fail(err),
+    );
+    return call;
+  }
+
+  /**
+   * Bidirectional call, opened with `first` and left writable: a command's
+   * output is read as a stream while it can still be fed and signalled.
+   */
+  openStream<Res>(
+    method: string,
+    first: unknown,
+    timeoutMs?: number,
+    signal?: AbortSignal,
+  ): { call: any; output: AsyncGenerator<Res> } {
+    const call = this.duplex(method, timeoutMs ?? this.transport.timeoutMs, signal);
+    call.write(first);
+    // Eager, so output produced before the caller reads is buffered.
+    return { call, output: iterate<Res>(call) };
+  }
+}
+
+/** A call that exists before the one it stands in for has been opened. */
+class LazyCall extends EventEmitter {
+  private real?: any;
+  private pending: Array<(call: any) => void> = [];
+  private cancelled = false;
+
+  /** @internal */
+  open(call: any): void {
+    if (this.cancelled) {
+      call.cancel();
+      return;
+    }
+    this.real = call;
+    for (const event of ["data", "error", "end", "status"]) {
+      call.on(event, (value: unknown) => this.emit(event, value));
+    }
+    for (const apply of this.pending) apply(call);
+    this.pending = [];
+  }
+
+  /** @internal The token could not be had, so the call never opens. */
+  fail(err: unknown): void {
+    if (this.cancelled) return;
+    this.emit(
+      "error",
+      err instanceof BurrowError ? err : new BurrowError(String(err), "unavailable"),
+    );
+  }
+
+  private apply(action: (call: any) => void): void {
+    if (this.real) action(this.real);
+    else this.pending.push(action);
+  }
+
+  write(message: unknown): boolean {
+    this.apply((call) => call.write(message));
+    return true;
+  }
+
+  end(): void {
+    this.apply((call) => call.end());
+  }
+
+  cancel(): void {
+    if (this.real) this.real.cancel();
+    else this.cancelled = true;
   }
 }
 
@@ -315,10 +612,12 @@ function iterate<T>(call: any): AsyncGenerator<T> {
     queue.push(msg);
     notify();
   });
-  call.on("error", (err: grpc.ServiceError) => {
+  call.on("error", (err: grpc.ServiceError | BurrowError) => {
     // CANCELLED after a clean end is how grpc-js reports a stream the caller
     // stopped reading; it is not a failure worth surfacing.
-    if (!done || err.code !== grpc.status.CANCELLED) {
+    if (err instanceof BurrowError) {
+      failure = err;
+    } else if (!done || err.code !== grpc.status.CANCELLED) {
       failure = BurrowError.fromGrpc(err);
     }
     done = true;

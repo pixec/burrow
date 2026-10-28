@@ -220,6 +220,8 @@ function toCommandInfo(raw: any): CommandInfo {
     startedAt: new Date(Number(raw.startedAtUnixMs ?? 0)),
     endedAt: ended > 0 ? new Date(ended) : null,
     bufferedBytes: Number(raw.bufferedBytes ?? 0),
+    exitSignal: Number(raw.exitSignal ?? 0),
+    outputBytes: Number(raw.outputBytes ?? 0),
   };
 }
 
@@ -768,31 +770,16 @@ export class Sandbox {
     options: RunCommandOptions = {},
   ): Promise<CommandResult> {
     const run = async (): Promise<CommandResult> => {
-      let stdout = "";
-      let stderr = "";
-      let exitCode = 0;
-
       // Auto-resume is handled here rather than in `execStream`: a stream that
       // has already yielded cannot be restarted without replaying output.
-      for await (const chunk of this.execStream(command, {
-        ...options,
-        autoResume: false,
-      })) {
-        switch (chunk.type) {
-          case "stdout":
-            stdout += chunk.data;
-            options.onStdout?.(chunk.data);
-            break;
-          case "stderr":
-            stderr += chunk.data;
-            options.onStderr?.(chunk.data);
-            break;
-          case "exit":
-            exitCode = chunk.exitCode;
-            break;
+      const chunks = (async function* (stream: AsyncGenerator<OutputChunk>) {
+        for await (const chunk of stream) {
+          if (chunk.type === "stdout") options.onStdout?.(chunk.data);
+          else if (chunk.type === "stderr") options.onStderr?.(chunk.data);
+          yield chunk;
         }
-      }
-      return { stdout, stderr, exitCode, success: exitCode === 0 };
+      })(this.execStream(command, { ...options, autoResume: false }));
+      return gather(chunks);
     };
 
     const result = await this.withResume(run, options.autoResume ?? this.autoResume);
@@ -848,10 +835,14 @@ export class Sandbox {
         rows: options.rows ?? 24,
         cols: options.cols ?? 80,
         user: options.user ?? this.defaultUser,
+        // As Docker's `--log-opt max-size` and `max-file`. Unset keeps every
+        // byte the command prints.
+        logMaxBytes: options.logMaxBytes ?? 0,
+        logMaxFiles: options.logMaxFiles ?? 0,
       },
     };
 
-    const { call, output } = this.transport.openStream<any>(
+    const { call, output } = this.node().openStream<any>(
       "Exec",
       start,
       options.timeoutMs,
@@ -876,15 +867,16 @@ export class Sandbox {
     );
 
     const chunks = (async function* (): AsyncGenerator<OutputChunk> {
+      const chunker = new Chunker();
       const opening = await first;
       if (opening.done) return;
       // An older agent starts straight in on output, with no id at all.
-      if (opening.value?.output !== "commandId") yield* toChunk(opening.value);
+      if (opening.value?.output !== "commandId") yield* chunker.feed(opening.value);
       for await (const msg of output) {
         // Only ever the first message, but an agent that repeated it must not
         // put an empty chunk into the caller's stream.
         if (msg.output === "commandId") continue;
-        yield* toChunk(msg);
+        yield* chunker.feed(msg);
       }
     })();
 
@@ -922,13 +914,17 @@ export class Sandbox {
    * ```
    *
    * The command need not have been started by this process: it lives in the
-   * sandbox. `logs()` replays what the guest still holds and then follows the
-   * command live, and several readers may do that at once. Throws `not_found`
-   * when the id names nothing, an evicted command included.
+   * sandbox, and so does every byte it has printed. `logs()` replays from
+   * `fromOffset`, counting stdout and stderr bytes together from the command's
+   * start, and then follows the command live; a reader that saw N bytes
+   * passes N and gets only what came after. `sendStdin` feeds a running
+   * command, a shell whose original stream is long gone included. Several
+   * readers may follow one command at once. Throws `not_found` when the id
+   * names nothing, a pruned command included.
    */
   async getCommand(
     cmdId: string,
-    options: { signal?: AbortSignal } = {},
+    options: { signal?: AbortSignal; fromOffset?: number } = {},
   ): Promise<DetachedCommand & { info: CommandInfo }> {
     this.assertLive();
     // Read first, so a bad id fails here rather than on the first `logs()`.
@@ -938,7 +934,38 @@ export class Sandbox {
       undefined,
       options.signal,
     );
-    return { ...this.commandHandle(cmdId), info: toCommandInfo(raw) };
+    return {
+      ...this.commandHandle(cmdId, options.fromOffset ?? 0),
+      info: toCommandInfo(raw),
+    };
+  }
+
+  /**
+   * Removes finished commands and their output, as `docker container prune`
+   * does. Running commands are left alone.
+   */
+  async pruneCommands(
+    options: { signal?: AbortSignal } = {},
+  ): Promise<{ removed: number; freedBytes: number }> {
+    this.assertLive();
+    const res = await this.transport.unary<any, any>(
+      "PruneCommands",
+      { sandboxId: this.id },
+      undefined,
+      options.signal,
+    );
+    return {
+      removed: Number(res.removed ?? 0),
+      freedBytes: Number(res.freedBytes ?? 0),
+    };
+  }
+
+  /**
+   * The way to this sandbox's exec, attach and file calls: its node, or the
+   * orchestrator when the transport was opened with `route: "orchestrator"`.
+   */
+  private node() {
+    return this.transport.route(this.id);
   }
 
   /**
@@ -946,17 +973,35 @@ export class Sandbox {
    * opens its own call, so `logs()` and `wait()` do not compete for one stream
    * the way a locally started detached command's do.
    */
-  private commandHandle(cmdId: string): DetachedCommand {
+  private commandHandle(cmdId: string, fromOffset = 0): DetachedCommand {
+    const start = (offset: number) => ({
+      start: { sandboxId: this.id, commandId: cmdId, fromOffset: offset },
+    });
     const attach = (): AsyncGenerator<OutputChunk> => {
-      const stream = this.transport.serverStream<any, any>(
-        "AttachCommand",
-        { sandboxId: this.id, commandId: cmdId },
-        // A command outlives any request deadline.
-        Infinity,
-      );
+      // A command outlives any request deadline.
+      const { call, output } = this.node().openStream<any>("Attach", start(fromOffset), Infinity);
       return (async function* () {
-        for await (const msg of stream) yield* toChunk(msg);
+        const chunker = new Chunker();
+        try {
+          for await (const msg of output) yield* chunker.feed(msg);
+        } finally {
+          call.cancel();
+        }
       })();
+    };
+
+    // Input goes over a call of its own, opened on the first write. It asks
+    // for output from past anything the command could have printed, so
+    // nothing is replayed down it, and what follows live is dropped.
+    let feeder: any;
+    const feed = (message: unknown) => {
+      if (!feeder) {
+        feeder = this.node().duplex("Attach");
+        feeder.on("data", () => {});
+        feeder.on("error", () => {});
+        feeder.write(start(Number.MAX_SAFE_INTEGER));
+      }
+      feeder.write(message);
     };
 
     return {
@@ -966,6 +1011,9 @@ export class Sandbox {
       kill: (signal = 9) => this.killCommand(cmdId, signal),
       killed: (signal = 9) => this.signalCommand(cmdId, signal),
       wait: () => collect(attach()),
+      sendStdin: (data) =>
+        feed({ stdin: typeof data === "string" ? Buffer.from(data, "utf8") : data }),
+      closeStdin: () => feed({ isStdinEof: true }),
     };
   }
 
@@ -1147,7 +1195,7 @@ export class Sandbox {
    */
   terminal(options: TerminalOptions = {}): Terminal {
     this.assertLive();
-    return new Terminal(this.transport, this.id, options);
+    return new Terminal(this.node(), this.id, options);
   }
 
   /**
@@ -1197,7 +1245,7 @@ export class Sandbox {
     }
 
     const res = await this.withResume(() =>
-      this.transport.pipeUnary<any, any>(
+      this.node().pipeUnary<any, any>(
         "UploadFile",
         chunks,
         undefined,
@@ -1281,7 +1329,7 @@ export class Sandbox {
     const parts: Buffer[] = [];
     await this.withResume(async () => {
       parts.length = 0;
-      for await (const chunk of this.transport.serverStream<any, any>(
+      for await (const chunk of this.node().serverStream<any, any>(
         "DownloadFile",
         { sandboxId: this.id, path },
         undefined,
@@ -1304,7 +1352,7 @@ export class Sandbox {
   ): Promise<AsyncGenerator<Buffer> | null> {
     this.assertLive();
     const open = async () => {
-      const source = this.transport.serverStream<any, any>(
+      const source = this.node().serverStream<any, any>(
         "DownloadFile",
         { sandboxId: this.id, path: params.path },
         undefined,
@@ -1340,7 +1388,7 @@ export class Sandbox {
   ): Promise<DirEntry[]> {
     this.assertLive();
     const res = await this.withResume(() =>
-      this.transport.unary<any, any>(
+      this.node().unary<any, any>(
         "ListDir",
         { sandboxId: this.id, path },
         undefined,
@@ -1480,7 +1528,7 @@ export class Sandbox {
    */
   async watch(path: string, options: WatchOptions = {}): Promise<Watcher> {
     this.assertLive();
-    const stream = this.transport.serverStream<any, any>(
+    const stream = this.node().serverStream<any, any>(
       "Watch",
       {
         sandboxId: this.id,
@@ -2162,42 +2210,91 @@ function toForkRequest(source: string, options: ForkOptions): any {
 }
 
 /**
- * One `ExecOutput` message as the SDK's chunk, if it carries anything. Shared
- * by a running exec and a later attach. The oneof tag is checked rather than
- * the fields: proto defaults give every message an `exitCode` of 0 and empty
- * byte fields.
+ * Turns one command's `ExecOutput` messages into the SDK's chunks.
+ *
+ * Shared by a running exec and a later attach. Each stream is decoded by a
+ * decoder of its own that holds a partial character over to the next message,
+ * so text split mid-character arrives whole; the bytes go along untouched. The
+ * oneof tag is checked rather than the fields: proto defaults give every
+ * message an `exitCode` of 0 and empty byte fields.
  */
-function* toChunk(msg: any): Generator<OutputChunk> {
-  if (msg.stdout?.length) {
-    yield { type: "stdout", data: Buffer.from(msg.stdout).toString("utf8") };
-  } else if (msg.stderr?.length) {
-    yield { type: "stderr", data: Buffer.from(msg.stderr).toString("utf8") };
-  } else if (msg.output === "exitCode") {
-    yield { type: "exit", exitCode: msg.exitCode ?? 0 };
+class Chunker {
+  private readonly decoders = {
+    stdout: new TextDecoder("utf-8"),
+    stderr: new TextDecoder("utf-8"),
+  };
+  private signal = 0;
+
+  *feed(msg: any): Generator<OutputChunk> {
+    if (msg.output === "stdout" || msg.output === "stderr") {
+      const type: "stdout" | "stderr" = msg.output;
+      const raw = new Uint8Array(msg[type] ?? []);
+      if (raw.length) {
+        yield { type, data: this.decoders[type].decode(raw, { stream: true }), raw };
+      }
+    } else if (msg.output === "exitSignal") {
+      this.signal = Number(msg.exitSignal ?? 0);
+    } else if (msg.output === "lostBytes") {
+      yield { type: "lost", lostBytes: Number(msg.lostBytes ?? 0) };
+    } else if (msg.output === "exitCode") {
+      // What a decoder still held was the start of a character that never
+      // finished; it is said as such, before the exit.
+      for (const type of ["stdout", "stderr"] as const) {
+        const rest = this.decoders[type].decode();
+        if (rest) yield { type, data: rest, raw: new Uint8Array() };
+      }
+      yield { type: "exit", exitCode: Number(msg.exitCode ?? 0), exitSignal: this.signal };
+    }
   }
+}
+
+/** Drains a command's output into its result, text and bytes both. */
+async function gather(chunks: AsyncIterable<OutputChunk>): Promise<CommandResult> {
+  let stdout = "";
+  let stderr = "";
+  const stdoutBytes: Uint8Array[] = [];
+  const stderrBytes: Uint8Array[] = [];
+  let exitCode = 0;
+  let exitSignal = 0;
+  for await (const chunk of chunks) {
+    if (chunk.type === "stdout") {
+      stdout += chunk.data;
+      stdoutBytes.push(chunk.raw);
+    } else if (chunk.type === "stderr") {
+      stderr += chunk.data;
+      stderrBytes.push(chunk.raw);
+    } else if (chunk.type === "exit") {
+      exitCode = chunk.exitCode;
+      exitSignal = chunk.exitSignal;
+    }
+  }
+  return {
+    stdout,
+    stderr,
+    exitCode,
+    success: exitCode === 0,
+    exitSignal,
+    stdoutBytes: Buffer.concat(stdoutBytes),
+    stderrBytes: Buffer.concat(stderrBytes),
+  };
 }
 
 /** Drains a command's output into the result a finished command reports. */
 async function collect(
   chunks: AsyncIterable<OutputChunk>,
 ): Promise<FinishedCommand> {
-  let stdout = "";
-  let stderr = "";
-  let exitCode = 0;
-  for await (const chunk of chunks) {
-    if (chunk.type === "stdout") stdout += chunk.data;
-    else if (chunk.type === "stderr") stderr += chunk.data;
-    else exitCode = chunk.exitCode;
-  }
-  return toFinished({ stdout, stderr, exitCode, success: exitCode === 0 });
+  return toFinished(await gather(chunks));
 }
 
 function toFinished(result: CommandResult): FinishedCommand {
   return {
     exitCode: result.exitCode,
     success: result.success,
+    exitSignal: result.exitSignal,
     stdout: () => result.stdout,
     stderr: () => result.stderr,
+    stdoutBytes: () => result.stdoutBytes,
+    stderrBytes: () => result.stderrBytes,
   };
 }
 

@@ -504,21 +504,7 @@ impl ApiService {
     /// change across re-registration. The channel for a given address is
     /// reused; see [`NodeChannels`].
     async fn node_for(&self, sandbox_id: &str) -> Result<NodeClient, Status> {
-        let mut node_id = self.node_of(sandbox_id)?;
-        // Beside other replicas the cache can be a second behind a move made
-        // through one of them, naming a node that has already let go.
-        let is_replicated = self.0.control_plane_hosts.lock().unwrap().len() > 1;
-        if (node_id.is_empty() || is_replicated)
-            && let Some(sandbox) = self.0.sandboxes.refresh(sandbox_id).await
-        {
-            node_id = sandbox.node_id;
-        }
-        if node_id.is_empty() {
-            return Err(Status::failed_precondition(format!(
-                "sandbox {sandbox_id} is suspended with its state in the object store, \
-                 and no node holds it; start it to place it"
-            )));
-        }
+        let node_id = self.placed_on(sandbox_id).await?;
         let endpoint = self.0.nodes.endpoint(&node_id).ok_or_else(|| {
             Status::unavailable(format!(
                 "node {node_id} hosting {sandbox_id} is unreachable"
@@ -541,6 +527,26 @@ impl ApiService {
                 )))
             }
         }
+    }
+
+    /// The node holding `sandbox_id` now.
+    async fn placed_on(&self, sandbox_id: &str) -> Result<String, Status> {
+        let mut node_id = self.node_of(sandbox_id)?;
+        // Beside other replicas the cache can be a second behind a move made
+        // through one of them, naming a node that has already let go.
+        let is_replicated = self.0.control_plane_hosts.lock().unwrap().len() > 1;
+        if (node_id.is_empty() || is_replicated)
+            && let Some(sandbox) = self.0.sandboxes.refresh(sandbox_id).await
+        {
+            node_id = sandbox.node_id;
+        }
+        if node_id.is_empty() {
+            return Err(Status::failed_precondition(format!(
+                "sandbox {sandbox_id} is suspended with its state in the object store, \
+                 and no node holds it; start it to place it"
+            )));
+        }
+        Ok(node_id)
     }
 
     /// Whether the orchestrator has given up on ever reaching a node.
@@ -2169,102 +2175,6 @@ impl Burrow for ApiService {
         ))
     }
 
-    type ExecStream = BoxStream<api::ExecOutput>;
-
-    async fn exec(
-        &self,
-        req: Request<tonic::Streaming<api::ExecInput>>,
-    ) -> Result<Response<Self::ExecStream>, Status> {
-        let mut inbound = req.into_inner();
-
-        // Routing needs the sandbox id, which only the first message carries,
-        // so it is read here and replayed unchanged to the node.
-        let first = inbound
-            .next()
-            .await
-            .transpose()?
-            .ok_or_else(|| Status::invalid_argument("Exec stream closed before Start"))?;
-        let mut first = first;
-        let Some(api::exec_input::Input::Start(ref mut start)) = first.input else {
-            return Err(Status::invalid_argument("first Exec message must be Start"));
-        };
-        // Rewritten rather than merely resolved: the node is handed this same
-        // message, and it only speaks ids.
-        start.sandbox_id = self.resolve(&start.sandbox_id).await;
-
-        let mut client = self.node_for(&start.sandbox_id).await?;
-        let outbound = async_stream::stream! {
-            yield first;
-            while let Some(Ok(msg)) = inbound.next().await {
-                yield msg;
-            }
-        };
-
-        let responses = client.exec(outbound).await?.into_inner();
-        Ok(Response::new(Box::pin(responses)))
-    }
-
-    async fn upload_file(
-        &self,
-        req: Request<tonic::Streaming<api::FileChunk>>,
-    ) -> Result<Response<api::UploadResult>, Status> {
-        let mut inbound = req.into_inner();
-        let first = inbound
-            .next()
-            .await
-            .transpose()?
-            .ok_or_else(|| Status::invalid_argument("upload stream was empty"))?;
-
-        // Only the first chunk names the sandbox, so this is the one place the
-        // reference can be turned into the id the node expects.
-        let mut first = first;
-        first.sandbox_id = self.resolve(&first.sandbox_id).await;
-        let mut client = self.node_for(&first.sandbox_id).await?;
-
-        // tonic's client streaming takes messages, not results, so a failed
-        // read from the caller cannot be forwarded down the stream, and ending
-        // it quietly is what the node reads as a complete upload. The error is
-        // parked here instead and becomes this RPC's own failure.
-        let failed: Arc<std::sync::Mutex<Option<Status>>> = Arc::default();
-        let sink = Arc::clone(&failed);
-        let outbound = async_stream::stream! {
-            yield first;
-            while let Some(chunk) = inbound.next().await {
-                match chunk {
-                    Ok(chunk) => yield chunk,
-                    Err(err) => {
-                        *sink.lock().unwrap() = Some(err);
-                        break;
-                    }
-                }
-            }
-        };
-        let result = client.upload_file(outbound).await;
-        if let Some(err) = failed.lock().unwrap().take() {
-            return Err(Status::new(
-                err.code(),
-                format!(
-                    "the upload was cut short, leaving a partial file: {}",
-                    err.message()
-                ),
-            ));
-        }
-        Ok(Response::new(result?.into_inner()))
-    }
-
-    type DownloadFileStream = BoxStream<api::FileChunk>;
-
-    async fn download_file(
-        &self,
-        req: Request<api::DownloadRequest>,
-    ) -> Result<Response<Self::DownloadFileStream>, Status> {
-        let mut req = req.into_inner();
-        req.sandbox_id = self.resolve(&req.sandbox_id).await;
-        let mut client = self.node_for(&req.sandbox_id).await?;
-        let stream = client.download_file(req).await?.into_inner();
-        Ok(Response::new(Box::pin(stream)))
-    }
-
     type QueryAuditStream = BoxStream<api::AuditEvent>;
 
     /// Merges audit records from every node into one newest-first stream.
@@ -2398,6 +2308,102 @@ impl Burrow for ApiService {
         Ok(Response::new(Box::pin(stream)))
     }
 
+    type ExecStream = BoxStream<api::ExecOutput>;
+
+    async fn exec(
+        &self,
+        req: Request<tonic::Streaming<api::ExecInput>>,
+    ) -> Result<Response<Self::ExecStream>, Status> {
+        let mut inbound = req.into_inner();
+
+        // Routing needs the sandbox id, which only the first message carries,
+        // so it is read here and replayed unchanged to the node.
+        let first = inbound
+            .next()
+            .await
+            .transpose()?
+            .ok_or_else(|| Status::invalid_argument("Exec stream closed before Start"))?;
+        let mut first = first;
+        let Some(api::exec_input::Input::Start(ref mut start)) = first.input else {
+            return Err(Status::invalid_argument("first Exec message must be Start"));
+        };
+        // Rewritten rather than merely resolved: the node is handed this same
+        // message, and it only speaks ids.
+        start.sandbox_id = self.resolve(&start.sandbox_id).await;
+
+        let mut client = self.node_for(&start.sandbox_id).await?;
+        let outbound = async_stream::stream! {
+            yield first;
+            while let Some(Ok(msg)) = inbound.next().await {
+                yield msg;
+            }
+        };
+
+        let responses = client.exec(outbound).await?.into_inner();
+        Ok(Response::new(Box::pin(responses)))
+    }
+
+    async fn upload_file(
+        &self,
+        req: Request<tonic::Streaming<api::FileChunk>>,
+    ) -> Result<Response<api::UploadResult>, Status> {
+        let mut inbound = req.into_inner();
+        let first = inbound
+            .next()
+            .await
+            .transpose()?
+            .ok_or_else(|| Status::invalid_argument("upload stream was empty"))?;
+
+        // Only the first chunk names the sandbox, so this is the one place the
+        // reference can be turned into the id the node expects.
+        let mut first = first;
+        first.sandbox_id = self.resolve(&first.sandbox_id).await;
+        let mut client = self.node_for(&first.sandbox_id).await?;
+
+        // tonic's client streaming takes messages, not results, so a failed
+        // read from the caller cannot be forwarded down the stream, and ending
+        // it quietly is what the node reads as a complete upload. The error is
+        // parked here instead and becomes this RPC's own failure.
+        let failed: Arc<std::sync::Mutex<Option<Status>>> = Arc::default();
+        let sink = Arc::clone(&failed);
+        let outbound = async_stream::stream! {
+            yield first;
+            while let Some(chunk) = inbound.next().await {
+                match chunk {
+                    Ok(chunk) => yield chunk,
+                    Err(err) => {
+                        *sink.lock().unwrap() = Some(err);
+                        break;
+                    }
+                }
+            }
+        };
+        let result = client.upload_file(outbound).await;
+        if let Some(err) = failed.lock().unwrap().take() {
+            return Err(Status::new(
+                err.code(),
+                format!(
+                    "the upload was cut short, leaving a partial file: {}",
+                    err.message()
+                ),
+            ));
+        }
+        Ok(Response::new(result?.into_inner()))
+    }
+
+    type DownloadFileStream = BoxStream<api::FileChunk>;
+
+    async fn download_file(
+        &self,
+        req: Request<api::DownloadRequest>,
+    ) -> Result<Response<Self::DownloadFileStream>, Status> {
+        let mut req = req.into_inner();
+        req.sandbox_id = self.resolve(&req.sandbox_id).await;
+        let mut client = self.node_for(&req.sandbox_id).await?;
+        let stream = client.download_file(req).await?.into_inner();
+        Ok(Response::new(Box::pin(stream)))
+    }
+
     type WatchStream = BoxStream<api::WatchEvent>;
 
     async fn watch(
@@ -2423,6 +2429,144 @@ impl Burrow for ApiService {
         Ok(Response::new(client.list_dir(req).await?.into_inner()))
     }
 
+    type AttachStream = BoxStream<api::ExecOutput>;
+
+    async fn attach(
+        &self,
+        req: Request<tonic::Streaming<api::AttachInput>>,
+    ) -> Result<Response<Self::AttachStream>, Status> {
+        let mut inbound = req.into_inner();
+        // Routed by the first message, as an exec is, and replayed unchanged.
+        let mut first = inbound
+            .next()
+            .await
+            .transpose()?
+            .ok_or_else(|| Status::invalid_argument("Attach stream closed before Start"))?;
+        let Some(api::attach_input::Input::Start(ref mut start)) = first.input else {
+            return Err(Status::invalid_argument(
+                "first Attach message must be Start",
+            ));
+        };
+        start.sandbox_id = self.resolve(&start.sandbox_id).await;
+        let mut client = self.node_for(&start.sandbox_id).await?;
+        let outbound = async_stream::stream! {
+            yield first;
+            while let Some(Ok(msg)) = inbound.next().await {
+                yield msg;
+            }
+        };
+        let responses = client.attach(outbound).await?.into_inner();
+        Ok(Response::new(Box::pin(responses)))
+    }
+
+    async fn issue_access(
+        &self,
+        req: Request<api::IssueAccessRequest>,
+    ) -> Result<Response<api::AccessGrant>, Status> {
+        use burrow_common::access;
+
+        let req = req.into_inner();
+        let signer = self.0.access.as_ref().ok_or_else(|| {
+            Status::failed_precondition("this orchestrator has no key to sign access tokens with")
+        })?;
+        let id = self
+            .resolve(&req.r#ref.map(|r| r.id).unwrap_or_default())
+            .await;
+        let node_id = self.placed_on(&id).await?;
+        let endpoint = self
+            .0
+            .nodes
+            .info(&node_id)
+            .map(|info| info.access_endpoint)
+            .unwrap_or_default();
+        if endpoint.is_empty() {
+            return Err(Status::failed_precondition(format!(
+                "node {node_id} serves no Access endpoint; exec and files for {id} go \
+                 through the orchestrator"
+            )));
+        }
+        let mut ops = if req.ops.is_empty() {
+            access::ALL_OPS.map(String::from).to_vec()
+        } else {
+            req.ops
+        };
+        ops.sort();
+        ops.dedup();
+        if let Some(unknown) = ops
+            .iter()
+            .find(|op| !access::ALL_OPS.contains(&op.as_str()))
+        {
+            return Err(Status::invalid_argument(format!(
+                "unknown access op {unknown:?}; expected one of {}",
+                access::ALL_OPS.join(", ")
+            )));
+        }
+        let ttl_secs = match req.ttl_secs {
+            0 => access::DEFAULT_TTL_SECS,
+            secs if secs > access::MAX_TTL_SECS => {
+                return Err(Status::invalid_argument(format!(
+                    "ttl_secs is at most {}",
+                    access::MAX_TTL_SECS
+                )));
+            }
+            secs => secs,
+        };
+        let claims = access::Claims::new(&node_id, &id, ops, req.user, ttl_secs);
+        let token = signer
+            .sign(&claims)
+            .map_err(|err| Status::internal(err.to_string()))?;
+        tracing::info!(
+            sandbox = id,
+            node = node_id,
+            ops = ?claims.ops,
+            ttl_secs,
+            jti = claims.jti,
+            "issued an access token"
+        );
+        Ok(Response::new(api::AccessGrant {
+            endpoint,
+            token,
+            expires_at: claims.exp as i64,
+            node_id,
+            sandbox_id: claims.sub,
+        }))
+    }
+
+    async fn revoke_access(
+        &self,
+        req: Request<api::SandboxRef>,
+    ) -> Result<Response<api::RevokeAccessResponse>, Status> {
+        let id = self.resolve(&req.into_inner().id).await;
+        // A sandbox no node holds has no sessions to end, and its tokens are
+        // refused by whichever node adopts it, which is handed this record.
+        if let Some(mut sandbox) = self.unplaced(&id).await {
+            sandbox.access_revoked_at = burrow_common::unix_now();
+            let revoked_at = sandbox.access_revoked_at;
+            self.0.sandboxes.insert(sandbox);
+            if let Some(writer) = self.0.sandboxes.writer() {
+                writer.flush().await;
+            }
+            tracing::info!(sandbox = id, "access tokens revoked");
+            return Ok(Response::new(api::RevokeAccessResponse {
+                revoked_at,
+                ended_sessions: 0,
+            }));
+        }
+        let mut client = self.node_for(&id).await?;
+        let revoked = client
+            .revoke_access(nodepb::NodeSandboxRef {
+                sandbox_id: id.clone(),
+            })
+            .await?
+            .into_inner();
+        tracing::info!(
+            sandbox = id,
+            ended_sessions = revoked.ended_sessions,
+            "access tokens revoked"
+        );
+        Ok(Response::new(revoked))
+    }
+
     async fn list_commands(
         &self,
         req: Request<api::ListCommandsRequest>,
@@ -2443,21 +2587,6 @@ impl Burrow for ApiService {
         Ok(Response::new(client.get_command(req).await?.into_inner()))
     }
 
-    type AttachCommandStream = BoxStream<api::ExecOutput>;
-
-    async fn attach_command(
-        &self,
-        req: Request<api::AttachCommandRequest>,
-    ) -> Result<Response<Self::AttachCommandStream>, Status> {
-        let mut req = req.into_inner();
-        req.sandbox_id = self.resolve(&req.sandbox_id).await;
-        let mut client = self.node_for(&req.sandbox_id).await?;
-        // An attach lasts as long as the command does, which no request
-        // deadline should cut short.
-        let stream = client.attach_command(req).await?.into_inner();
-        Ok(Response::new(Box::pin(stream)))
-    }
-
     async fn signal_command(
         &self,
         req: Request<api::SignalCommandRequest>,
@@ -2467,6 +2596,18 @@ impl Burrow for ApiService {
         let mut client = self.node_for(&req.sandbox_id).await?;
         Ok(Response::new(
             client.signal_command(req).await?.into_inner(),
+        ))
+    }
+
+    async fn prune_commands(
+        &self,
+        req: Request<api::PruneCommandsRequest>,
+    ) -> Result<Response<api::PruneCommandsResponse>, Status> {
+        let mut req = req.into_inner();
+        req.sandbox_id = self.resolve(&req.sandbox_id).await;
+        let mut client = self.node_for(&req.sandbox_id).await?;
+        Ok(Response::new(
+            client.prune_commands(req).await?.into_inner(),
         ))
     }
 

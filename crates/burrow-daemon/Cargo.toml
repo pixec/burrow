@@ -20,7 +20,8 @@ burrow-kit = { workspace = true }
 tokio = { workspace = true }
 tokio-stream = { workspace = true }
 tokio-util = { workspace = true }
-tonic = { workspace = true }
+# TLS for the Access listener, which clients reach directly.
+tonic = { workspace = true, features = ["tls-ring"] }
 prost = { workspace = true }
 tower = { workspace = true }
 async-stream = { workspace = true }

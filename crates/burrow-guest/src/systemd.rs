@@ -220,7 +220,7 @@ fn supervise(binary: &'static str, pid: i32) {
     let exit = reaper::watch(pid);
     PID.store(pid, Ordering::Release);
     tokio::spawn(async move {
-        let code = exit.await.unwrap_or(-1);
+        let code = exit.await.map(|exit| exit.code).unwrap_or(-1);
         PID.store(0, Ordering::Release);
         ready().send_replace(false);
         match code {

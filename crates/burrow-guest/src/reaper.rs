@@ -15,8 +15,18 @@ use std::sync::{Mutex, OnceLock, RwLock, RwLockReadGuard};
 use nix::sys::wait::{WaitPidFlag, WaitStatus, waitpid};
 use tokio::sync::oneshot;
 
-fn waiters() -> &'static Mutex<HashMap<i32, oneshot::Sender<i32>>> {
-    static WAITERS: OnceLock<Mutex<HashMap<i32, oneshot::Sender<i32>>>> = OnceLock::new();
+/// How a child ended.
+#[derive(Clone, Copy, Debug)]
+pub struct Exit {
+    /// The exit code, or 128 plus the signal for one a signal ended, as a
+    /// shell reports it.
+    pub code: i32,
+    /// The signal that ended it; 0 when it exited on its own.
+    pub signal: i32,
+}
+
+fn waiters() -> &'static Mutex<HashMap<i32, oneshot::Sender<Exit>>> {
+    static WAITERS: OnceLock<Mutex<HashMap<i32, oneshot::Sender<Exit>>>> = OnceLock::new();
     WAITERS.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
@@ -32,7 +42,7 @@ pub fn hold() -> RwLockReadGuard<'static, ()> {
 }
 
 /// Registers interest in a child's exit status, under [`hold`].
-pub fn watch(pid: i32) -> oneshot::Receiver<i32> {
+pub fn watch(pid: i32) -> oneshot::Receiver<Exit> {
     let (tx, rx) = oneshot::channel();
     waiters().lock().unwrap().insert(pid, tx);
     rx
@@ -65,9 +75,15 @@ fn reap_once() {
         match waitpid(None, Some(WaitPidFlag::WNOHANG)) {
             // No child has exited right now.
             Ok(WaitStatus::StillAlive) => break,
-            Ok(WaitStatus::Exited(pid, code)) => deliver(pid.as_raw(), code),
+            Ok(WaitStatus::Exited(pid, code)) => deliver(pid.as_raw(), Exit { code, signal: 0 }),
             // Shell convention for a signal-terminated process.
-            Ok(WaitStatus::Signaled(pid, sig, _)) => deliver(pid.as_raw(), 128 + sig as i32),
+            Ok(WaitStatus::Signaled(pid, sig, _)) => deliver(
+                pid.as_raw(),
+                Exit {
+                    code: 128 + sig as i32,
+                    signal: sig as i32,
+                },
+            ),
             // Stop/continue notifications are not requested; ignore any that
             // arrive rather than treating them as exits.
             Ok(_) => continue,
@@ -81,13 +97,13 @@ fn reap_once() {
     }
 }
 
-fn deliver(pid: i32, code: i32) {
+fn deliver(pid: i32, exit: Exit) {
     match waiters().lock().unwrap().remove(&pid) {
         Some(tx) => {
-            let _ = tx.send(code);
+            let _ = tx.send(exit);
         }
         // An orphan re-parented to us: nothing to report it to, and reaping it
         // is the whole job.
-        None => tracing::debug!(pid, code, "reaped orphan"),
+        None => tracing::debug!(pid, code = exit.code, "reaped orphan"),
     }
 }

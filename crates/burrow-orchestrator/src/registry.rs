@@ -748,6 +748,27 @@ impl NodeRegistry {
         hosts
     }
 
+    /// Every node's API address and Access endpoint, for nodes to deny to
+    /// their sandboxes. The Access endpoint is listed as well as the address
+    /// because it may be another host altogether, a public name in front of a
+    /// private one. Unhealthy nodes are included, as for edges.
+    pub fn node_hosts(&self) -> Vec<String> {
+        let nodes = self.nodes.lock().unwrap();
+        let mut hosts: Vec<String> = nodes
+            .values()
+            .flat_map(|entry| {
+                [
+                    entry.info.address.clone(),
+                    entry.info.access_endpoint.clone(),
+                ]
+            })
+            .filter(|host| !host.is_empty())
+            .collect();
+        hosts.sort();
+        hosts.dedup();
+        hosts
+    }
+
     /// Whether a node already reports holding `template`.
     ///
     /// Read from the node's last heartbeat, so a template imported since then
@@ -867,6 +888,28 @@ mod tests {
         // The machine, not the wildcard domain: a firewall rule needs an
         // address, and the domain resolves per hostname.
         assert_eq!(registry.edge_hosts(), ["node-a:7071"]);
+    }
+
+    /// A node's Access endpoint is denied to sandboxes whether or not it runs
+    /// an edge, and so is its API address.
+    #[test]
+    fn every_node_s_api_and_access_endpoint_are_listed() {
+        let registry = registry(&[("node-a", NodeStatus::default())]);
+        registry.heartbeat(
+            "node-a",
+            NodeStatus::default(),
+            Some(NodeInfo {
+                id: "node-a".into(),
+                address: "10.0.0.5:7071".into(),
+                access_endpoint: "https://node-a.example.com:7073".into(),
+                ..Default::default()
+            }),
+        );
+        assert_eq!(
+            registry.node_hosts(),
+            ["10.0.0.5:7071", "https://node-a.example.com:7073"]
+        );
+        assert!(registry.edge_hosts().is_empty());
     }
 
     /// Sets what an operator labelled a node with.

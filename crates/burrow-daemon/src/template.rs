@@ -650,6 +650,8 @@ async fn exec_streaming(
             // The node's own housekeeping, which is root's.
             user: String::new(),
             is_env_cleared: false,
+            log_max_bytes: 0,
+            log_max_files: 0,
         })),
     };
 
@@ -670,7 +672,10 @@ async fn exec_streaming(
             Some(guestpb::exec_output::Output::ExitCode(code)) => exit = code,
             // A build step is watched to completion here; there is nothing to
             // come back to it for.
-            Some(guestpb::exec_output::Output::CommandId(_)) | None => {}
+            Some(guestpb::exec_output::Output::CommandId(_))
+            | Some(guestpb::exec_output::Output::ExitSignal(_))
+            | Some(guestpb::exec_output::Output::LostBytes(_))
+            | None => {}
         }
     }
     Ok(exit)
@@ -693,6 +698,7 @@ async fn download_to(
     let mut stream = agent
         .download_file(guestpb::DownloadRequest {
             path: guest_path.to_string(),
+            user: String::new(),
         })
         .await?
         .into_inner();

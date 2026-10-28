@@ -32,11 +32,373 @@ pub struct NodeApi {
     pub registry_credentials: crate::oci::auth::Store,
     /// Registry hosts allowed to be plain HTTP.
     pub insecure_registries: Vec<String>,
+    /// Direct sessions open through the Access service, which a revoke ends.
+    pub access_sessions: std::sync::Arc<crate::access::Sessions>,
 }
 
 impl NodeApi {
-    fn node_id(&self) -> String {
+    pub(crate) fn node_id(&self) -> String {
         self.node_id.lock().unwrap().clone()
+    }
+
+    /// Follows and feeds a command from a stream other than the one that
+    /// started it. `user`, when set, may only reach its own commands.
+    pub(crate) async fn attach_stream<S>(
+        &self,
+        mut inbound: S,
+        user: String,
+    ) -> Result<BoxStream<api::ExecOutput>, Status>
+    where
+        S: Stream<Item = Result<api::AttachInput, Status>> + Send + Unpin + 'static,
+    {
+        use api::attach_input::Input as ApiInput;
+        use guestpb::attach_input::Input as AgentInput;
+
+        let Some(ApiInput::Start(start)) = inbound.next().await.transpose()?.and_then(|m| m.input)
+        else {
+            return Err(Status::invalid_argument(
+                "first Attach message must be Start",
+            ));
+        };
+        let command_id = check_command_id(&start.command_id)?;
+        let sandbox = self.sandboxes.get(&start.sandbox_id).await?;
+        check_exec(&sandbox.policy())?;
+        if !sandbox.agent_has(ATTACH_INPUT).await? {
+            return Err(Status::failed_precondition(
+                "this sandbox's guest agent cannot attach with input; it is upgraded on the \
+                 sandbox's next resume",
+            ));
+        }
+        let mut agent = sandbox.agent().await?;
+        if !user.is_empty() {
+            let info = agent
+                .get_command(guestpb::GetCommandRequest {
+                    command_id: command_id.clone(),
+                })
+                .await?
+                .into_inner();
+            if info.user != user {
+                return Err(Status::permission_denied(format!(
+                    "command {command_id} is not {user}'s"
+                )));
+            }
+        }
+
+        let first = guestpb::AttachInput {
+            input: Some(AgentInput::Start(guestpb::AttachStart {
+                command_id,
+                from_offset: start.from_offset,
+            })),
+        };
+        let outbound = async_stream::stream! {
+            yield first;
+            while let Some(Ok(msg)) = inbound.next().await {
+                let input = match msg.input {
+                    Some(ApiInput::Stdin(bytes)) => AgentInput::Stdin(bytes),
+                    Some(ApiInput::Resize(size)) => AgentInput::Resize(guestpb::ExecResize {
+                        rows: size.rows,
+                        cols: size.cols,
+                    }),
+                    Some(ApiInput::Signal(signal)) => AgentInput::Signal(signal),
+                    Some(ApiInput::IsStdinEof(eof)) => AgentInput::IsStdinEof(eof),
+                    Some(ApiInput::Start(_)) | None => continue,
+                };
+                yield guestpb::AttachInput { input: Some(input) };
+            }
+        };
+        let stream = agent
+            .attach(outbound)
+            .await?
+            .into_inner()
+            .map(|res| res.map(translate_exec_output));
+        Ok(Box::pin(stream))
+    }
+
+    /// Download, as `user` when one is given; see [`exec_stream`](Self::exec_stream).
+    pub(crate) async fn download_as(
+        &self,
+        req: api::DownloadRequest,
+        user: String,
+    ) -> Result<BoxStream<api::FileChunk>, Status> {
+        let sandbox = self.sandboxes.get(&req.sandbox_id).await?;
+        check_download(&sandbox.policy(), &req.path)?;
+        require_files_as_user(&sandbox, &user).await?;
+        let mut agent = sandbox.agent().await?;
+
+        let stream = agent
+            .download_file(guestpb::DownloadRequest {
+                path: req.path,
+                user,
+            })
+            .await?
+            .into_inner()
+            .map(|res| {
+                res.map(|chunk| api::FileChunk {
+                    sandbox_id: String::new(),
+                    path: String::new(),
+                    mode: 0,
+                    data: chunk.data,
+                })
+            });
+        Ok(Box::pin(stream))
+    }
+
+    /// Watch, as `user` when one is given.
+    pub(crate) async fn watch_as(
+        &self,
+        req: api::WatchRequest,
+        user: String,
+    ) -> Result<BoxStream<api::WatchEvent>, Status> {
+        let sandbox = self.sandboxes.get(&req.sandbox_id).await?;
+        // A watch reports every path under the one it is given, so it is held
+        // to the same scopes a listing is.
+        check_read_path(&sandbox.policy(), &req.path)?;
+        require_files_as_user(&sandbox, &user).await?;
+        let mut agent = sandbox.agent().await?;
+
+        let stream = agent
+            .watch(guestpb::WatchRequest {
+                path: req.path,
+                is_recursive: req.is_recursive,
+                interval_ms: req.interval_ms,
+                user,
+            })
+            .await?
+            .into_inner()
+            .map(|res| {
+                res.map(|e| api::WatchEvent {
+                    r#type: e.r#type,
+                    path: e.path,
+                    is_dir: e.is_dir,
+                })
+            });
+        Ok(Box::pin(stream))
+    }
+
+    /// List, as `user` when one is given.
+    pub(crate) async fn list_dir_as(
+        &self,
+        req: api::ListDirRequest,
+        user: String,
+    ) -> Result<api::ListDirResponse, Status> {
+        let sandbox = self.sandboxes.get(&req.sandbox_id).await?;
+        check_read_path(&sandbox.policy(), &req.path)?;
+        require_files_as_user(&sandbox, &user).await?;
+        let mut agent = sandbox.agent().await?;
+
+        let resp = agent
+            .list_dir(guestpb::ListDirRequest {
+                path: req.path,
+                user,
+            })
+            .await?
+            .into_inner();
+        Ok(api::ListDirResponse {
+            entries: resp
+                .entries
+                .into_iter()
+                .map(|e| api::DirEntry {
+                    name: e.name,
+                    is_dir: e.is_dir,
+                    size: e.size,
+                    mode: e.mode,
+                })
+                .collect(),
+        })
+    }
+
+    /// Exec over any inbound stream, so the Access service can hand on one it
+    /// has read the start of.
+    pub(crate) async fn exec_stream<S>(
+        &self,
+        mut inbound: S,
+    ) -> Result<BoxStream<api::ExecOutput>, Status>
+    where
+        S: Stream<Item = Result<api::ExecInput, Status>> + Send + Unpin + 'static,
+    {
+        // The first message names the sandbox, so it must be read here to
+        // route; it is then replayed to the agent without its sandbox_id.
+        let first = inbound
+            .next()
+            .await
+            .transpose()?
+            .ok_or_else(|| Status::invalid_argument("Exec stream closed before Start"))?;
+        let Some(api::exec_input::Input::Start(start)) = first.input else {
+            return Err(Status::invalid_argument("first Exec message must be Start"));
+        };
+
+        let sandbox = self.sandboxes.get(&start.sandbox_id).await?;
+        // Checked here rather than in the guest: the agent is inside the
+        // boundary this policy draws, so it cannot be the thing that holds it.
+        check_exec(&sandbox.policy())?;
+        let mut agent = sandbox.agent().await?;
+
+        // A sandbox from an OCI image should behave like that image: its `PATH`
+        // is usually the only reason an interpreter installed at an unusual
+        // prefix is findable at all. The caller's own values win, because they
+        // are the more specific instruction.
+        let image = self.image_environment(sandbox.template()).await;
+        let mut env = image.as_map();
+        env.extend(sandbox.record().env);
+        env.extend(start.env);
+        // A Kit sandbox is the image's process: a command in it runs as the
+        // image's USER unless the caller names someone else.
+        let user = if start.user.is_empty() && sandbox.record().kit.is_some() {
+            image.user.clone()
+        } else {
+            start.user
+        };
+        let cwd = if !start.cwd.is_empty() {
+            start.cwd
+        } else if !user.is_empty() && user != image.user {
+            // A command running as a user starts in that user's home, which
+            // only the guest knows. The image's WORKDIR is the default for
+            // the image's own user, not a reason to drop somebody else into
+            // a directory that is not theirs.
+            String::new()
+        } else {
+            image.working_dir.clone()
+        };
+
+        // Checked here as well as in the guest: the name reaches an argv and a
+        // `/etc/passwd` lookup, and the daemon does not take the guest's word
+        // for what is safe to send it.
+        if !user.is_empty() {
+            check_exec_user(&user)?;
+        }
+
+        let agent_start = guestpb::ExecInput {
+            input: Some(guestpb::exec_input::Input::Start(guestpb::ExecStart {
+                cmd: start.cmd,
+                env,
+                cwd,
+                is_pty: start.is_pty,
+                rows: start.rows,
+                cols: start.cols,
+                user,
+                is_env_cleared: false,
+                log_max_bytes: start.log_max_bytes,
+                log_max_files: start.log_max_files,
+            })),
+        };
+
+        let outbound = async_stream::stream! {
+            yield agent_start;
+            while let Some(Ok(msg)) = inbound.next().await {
+                if let Some(translated) = translate_exec_input(msg) {
+                    yield translated;
+                }
+            }
+        };
+
+        let responses = agent.exec(outbound).await?.into_inner();
+        let mapped = responses.map(|res| res.map(translate_exec_output));
+        Ok(Box::pin(mapped))
+    }
+
+    /// Upload over any inbound stream, for the same reason as
+    /// [`exec_stream`](Self::exec_stream).
+    pub(crate) async fn upload_stream<S>(
+        &self,
+        mut inbound: S,
+        user: String,
+    ) -> Result<api::UploadResult, Status>
+    where
+        S: Stream<Item = Result<api::FileChunk, Status>> + Send + Unpin + 'static,
+    {
+        let first = inbound
+            .next()
+            .await
+            .transpose()?
+            .ok_or_else(|| Status::invalid_argument("upload stream was empty"))?;
+
+        let sandbox = self.sandboxes.get(&first.sandbox_id).await?;
+        // The destination arrives in this first chunk, so this is the only
+        // point where it can be refused before the agent has been handed a
+        // byte of it.
+        let max_bytes = check_upload(&sandbox.policy(), &first.path)?;
+        require_files_as_user(&sandbox, &user).await?;
+        let mut agent = sandbox.agent().await?;
+
+        let path = first.path.clone();
+        let agent_first = guestpb::FileChunk {
+            path: first.path,
+            mode: first.mode,
+            data: first.data,
+            owner: String::new(),
+            is_existing_skipped: false,
+            user,
+        };
+        // A cap can only be checked as the bytes go past, so the stream stops
+        // at the chunk that crosses it and says so here. Two flags rather than
+        // one: an upload refused before its first chunk never opened the file,
+        // and must not have an existing file at that path cleaned up under it.
+        let exceeded = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let wrote = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        // The caller's stream breaking is the third way this ends, and it is
+        // reported the same way the cap is. Ending the outbound stream on an
+        // inbound error would otherwise look to the agent exactly like a
+        // complete upload, and the truncated file would be reported written.
+        let broken: std::sync::Arc<std::sync::Mutex<Option<Status>>> = Default::default();
+        let (tripped, started, failed) = (exceeded.clone(), wrote.clone(), broken.clone());
+        let outbound = async_stream::stream! {
+            use std::sync::atomic::Ordering::Relaxed;
+
+            let mut sent = agent_first.data.len() as u64;
+            if is_over_cap(max_bytes, sent) {
+                tripped.store(true, Relaxed);
+                return;
+            }
+            started.store(true, Relaxed);
+            yield agent_first;
+            loop {
+                let chunk = match inbound.next().await {
+                    Some(Ok(chunk)) => chunk,
+                    Some(Err(err)) => {
+                        *failed.lock().unwrap() = Some(err);
+                        return;
+                    }
+                    None => break,
+                };
+                sent += chunk.data.len() as u64;
+                if is_over_cap(max_bytes, sent) {
+                    tripped.store(true, Relaxed);
+                    return;
+                }
+                yield guestpb::FileChunk {
+                    data: chunk.data,
+                    ..Default::default()
+                };
+            }
+        };
+
+        let result = agent.upload_file(outbound).await;
+        // Read before the agent's own result: an upload cut short may well
+        // have failed on its side too, and the cap is the truer reason.
+        if exceeded.load(std::sync::atomic::Ordering::Relaxed) {
+            if wrote.load(std::sync::atomic::Ordering::Relaxed) {
+                remove_partial_upload(&sandbox, &path).await;
+            }
+            return Err(Status::resource_exhausted(format!(
+                "upload exceeds this sandbox's max_upload_bytes ({max_bytes})"
+            )));
+        }
+        // Same order and the same reason: what the caller's stream did is a
+        // truer account of the failure than whatever the agent made of it.
+        let broken = broken.lock().unwrap().take();
+        if let Some(err) = broken {
+            if wrote.load(std::sync::atomic::Ordering::Relaxed) {
+                remove_partial_upload(&sandbox, &path).await;
+            }
+            return Err(Status::new(
+                err.code(),
+                format!("upload stream ended early: {}", err.message()),
+            ));
+        }
+        let result = result?.into_inner();
+        Ok(api::UploadResult {
+            bytes_written: result.bytes_written,
+        })
     }
 
     /// Checks a membership change and opens the agent that will make it.
@@ -144,7 +506,25 @@ struct KitCreate {
     name: String,
 }
 
-type BoxStream<T> = Pin<Box<dyn Stream<Item = Result<T, Status>> + Send>>;
+/// What an agent lists in its health response when it does file transfers
+/// as the user it is handed.
+const FILES_AS_USER: &str = "files-as-user";
+/// What an agent lists when it serves Attach.
+const ATTACH_INPUT: &str = "attach-input";
+
+/// Refuses to hand a user to an agent that would ignore the field and do the
+/// transfer as root.
+async fn require_files_as_user(sandbox: &RunningSandbox, user: &str) -> Result<(), Status> {
+    if user.is_empty() || sandbox.agent_has(FILES_AS_USER).await? {
+        return Ok(());
+    }
+    Err(Status::failed_precondition(
+        "this sandbox's guest agent cannot transfer files as a user; it is upgraded \
+         on the sandbox's next resume",
+    ))
+}
+
+pub(crate) type BoxStream<T> = Pin<Box<dyn Stream<Item = Result<T, Status>> + Send>>;
 
 #[tonic::async_trait]
 impl NodeService for NodeApi {
@@ -929,188 +1309,35 @@ impl NodeService for NodeApi {
         Ok(Response::new(api::UnshareResponse {}))
     }
 
+    // What the orchestrator relays: the same handlers the Access service
+    // calls, with no token user to bind them to.
     type ExecStream = BoxStream<api::ExecOutput>;
 
     async fn exec(
         &self,
         req: Request<tonic::Streaming<api::ExecInput>>,
     ) -> Result<Response<Self::ExecStream>, Status> {
-        let mut inbound = req.into_inner();
+        self.exec_stream(req.into_inner()).await.map(Response::new)
+    }
 
-        // The first message names the sandbox, so it must be read here to
-        // route; it is then replayed to the agent without its sandbox_id.
-        let first = inbound
-            .next()
+    type AttachStream = BoxStream<api::ExecOutput>;
+
+    async fn attach(
+        &self,
+        req: Request<tonic::Streaming<api::AttachInput>>,
+    ) -> Result<Response<Self::AttachStream>, Status> {
+        self.attach_stream(req.into_inner(), String::new())
             .await
-            .transpose()?
-            .ok_or_else(|| Status::invalid_argument("Exec stream closed before Start"))?;
-        let Some(api::exec_input::Input::Start(start)) = first.input else {
-            return Err(Status::invalid_argument("first Exec message must be Start"));
-        };
-
-        let sandbox = self.sandboxes.get(&start.sandbox_id).await?;
-        // Checked here rather than in the guest: the agent is inside the
-        // boundary this policy draws, so it cannot be the thing that holds it.
-        check_exec(&sandbox.policy())?;
-        let mut agent = sandbox.agent().await?;
-
-        // A sandbox from an OCI image should behave like that image: its `PATH`
-        // is usually the only reason an interpreter installed at an unusual
-        // prefix is findable at all. The caller's own values win, because they
-        // are the more specific instruction.
-        let image = self.image_environment(sandbox.template()).await;
-        let mut env = image.as_map();
-        env.extend(sandbox.record().env);
-        env.extend(start.env);
-        // A Kit sandbox is the image's process: a command in it runs as the
-        // image's USER unless the caller names someone else.
-        let user = if start.user.is_empty() && sandbox.record().kit.is_some() {
-            image.user.clone()
-        } else {
-            start.user
-        };
-        let cwd = if !start.cwd.is_empty() {
-            start.cwd
-        } else if !user.is_empty() && user != image.user {
-            // A command running as a user starts in that user's home, which
-            // only the guest knows. The image's WORKDIR is the default for
-            // the image's own user, not a reason to drop somebody else into
-            // a directory that is not theirs.
-            String::new()
-        } else {
-            image.working_dir.clone()
-        };
-
-        // Checked here as well as in the guest: the name reaches an argv and a
-        // `/etc/passwd` lookup, and the daemon does not take the guest's word
-        // for what is safe to send it.
-        if !user.is_empty() {
-            check_exec_user(&user)?;
-        }
-
-        let agent_start = guestpb::ExecInput {
-            input: Some(guestpb::exec_input::Input::Start(guestpb::ExecStart {
-                cmd: start.cmd,
-                env,
-                cwd,
-                is_pty: start.is_pty,
-                rows: start.rows,
-                cols: start.cols,
-                user,
-                is_env_cleared: false,
-            })),
-        };
-
-        let outbound = async_stream::stream! {
-            yield agent_start;
-            while let Some(Ok(msg)) = inbound.next().await {
-                if let Some(translated) = translate_exec_input(msg) {
-                    yield translated;
-                }
-            }
-        };
-
-        let responses = agent.exec(outbound).await?.into_inner();
-        let mapped = responses.map(|res| res.map(translate_exec_output));
-        Ok(Response::new(Box::pin(mapped)))
+            .map(Response::new)
     }
 
     async fn upload_file(
         &self,
         req: Request<tonic::Streaming<api::FileChunk>>,
     ) -> Result<Response<api::UploadResult>, Status> {
-        let mut inbound = req.into_inner();
-        let first = inbound
-            .next()
+        self.upload_stream(req.into_inner(), String::new())
             .await
-            .transpose()?
-            .ok_or_else(|| Status::invalid_argument("upload stream was empty"))?;
-
-        let sandbox = self.sandboxes.get(&first.sandbox_id).await?;
-        // The destination arrives in this first chunk, so this is the only
-        // point where it can be refused before the agent has been handed a
-        // byte of it.
-        let max_bytes = check_upload(&sandbox.policy(), &first.path)?;
-        let mut agent = sandbox.agent().await?;
-
-        let path = first.path.clone();
-        let agent_first = guestpb::FileChunk {
-            path: first.path,
-            mode: first.mode,
-            data: first.data,
-            owner: String::new(),
-            is_existing_skipped: false,
-        };
-        // A cap can only be checked as the bytes go past, so the stream stops
-        // at the chunk that crosses it and says so here. Two flags rather than
-        // one: an upload refused before its first chunk never opened the file,
-        // and must not have an existing file at that path cleaned up under it.
-        let exceeded = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
-        let wrote = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
-        // The caller's stream breaking is the third way this ends, and it is
-        // reported the same way the cap is. Ending the outbound stream on an
-        // inbound error would otherwise look to the agent exactly like a
-        // complete upload, and the truncated file would be reported written.
-        let broken: std::sync::Arc<std::sync::Mutex<Option<Status>>> = Default::default();
-        let (tripped, started, failed) = (exceeded.clone(), wrote.clone(), broken.clone());
-        let outbound = async_stream::stream! {
-            use std::sync::atomic::Ordering::Relaxed;
-
-            let mut sent = agent_first.data.len() as u64;
-            if is_over_cap(max_bytes, sent) {
-                tripped.store(true, Relaxed);
-                return;
-            }
-            started.store(true, Relaxed);
-            yield agent_first;
-            loop {
-                let chunk = match inbound.next().await {
-                    Some(Ok(chunk)) => chunk,
-                    Some(Err(err)) => {
-                        *failed.lock().unwrap() = Some(err);
-                        return;
-                    }
-                    None => break,
-                };
-                sent += chunk.data.len() as u64;
-                if is_over_cap(max_bytes, sent) {
-                    tripped.store(true, Relaxed);
-                    return;
-                }
-                yield guestpb::FileChunk {
-                    data: chunk.data,
-                    ..Default::default()
-                };
-            }
-        };
-
-        let result = agent.upload_file(outbound).await;
-        // Read before the agent's own result: an upload cut short may well
-        // have failed on its side too, and the cap is the truer reason.
-        if exceeded.load(std::sync::atomic::Ordering::Relaxed) {
-            if wrote.load(std::sync::atomic::Ordering::Relaxed) {
-                remove_partial_upload(&sandbox, &path).await;
-            }
-            return Err(Status::resource_exhausted(format!(
-                "upload exceeds this sandbox's max_upload_bytes ({max_bytes})"
-            )));
-        }
-        // Same order and the same reason: what the caller's stream did is a
-        // truer account of the failure than whatever the agent made of it.
-        let broken = broken.lock().unwrap().take();
-        if let Some(err) = broken {
-            if wrote.load(std::sync::atomic::Ordering::Relaxed) {
-                remove_partial_upload(&sandbox, &path).await;
-            }
-            return Err(Status::new(
-                err.code(),
-                format!("upload stream ended early: {}", err.message()),
-            ));
-        }
-        let result = result?.into_inner();
-        Ok(Response::new(api::UploadResult {
-            bytes_written: result.bytes_written,
-        }))
+            .map(Response::new)
     }
 
     type DownloadFileStream = BoxStream<api::FileChunk>;
@@ -1119,24 +1346,45 @@ impl NodeService for NodeApi {
         &self,
         req: Request<api::DownloadRequest>,
     ) -> Result<Response<Self::DownloadFileStream>, Status> {
-        let req = req.into_inner();
-        let sandbox = self.sandboxes.get(&req.sandbox_id).await?;
-        check_download(&sandbox.policy(), &req.path)?;
-        let mut agent = sandbox.agent().await?;
+        self.download_as(req.into_inner(), String::new())
+            .await
+            .map(Response::new)
+    }
 
-        let stream = agent
-            .download_file(guestpb::DownloadRequest { path: req.path })
-            .await?
-            .into_inner()
-            .map(|res| {
-                res.map(|chunk| api::FileChunk {
-                    sandbox_id: String::new(),
-                    path: String::new(),
-                    mode: 0,
-                    data: chunk.data,
-                })
-            });
-        Ok(Response::new(Box::pin(stream)))
+    async fn list_dir(
+        &self,
+        req: Request<api::ListDirRequest>,
+    ) -> Result<Response<api::ListDirResponse>, Status> {
+        self.list_dir_as(req.into_inner(), String::new())
+            .await
+            .map(Response::new)
+    }
+
+    type WatchStream = BoxStream<api::WatchEvent>;
+
+    async fn watch(
+        &self,
+        req: Request<api::WatchRequest>,
+    ) -> Result<Response<Self::WatchStream>, Status> {
+        self.watch_as(req.into_inner(), String::new())
+            .await
+            .map(Response::new)
+    }
+
+    async fn revoke_access(
+        &self,
+        req: Request<nodepb::NodeSandboxRef>,
+    ) -> Result<Response<api::RevokeAccessResponse>, Status> {
+        let sandbox_id = req.into_inner().sandbox_id;
+        // The stamp first: a direct call racing this one either reads it, or
+        // registered its session in time to be ended below.
+        let revoked_at = self.sandboxes.revoke_access(&sandbox_id).await?;
+        let ended = self.access_sessions.end_all(&sandbox_id);
+        tracing::info!(sandbox = sandbox_id, ended, "access tokens revoked");
+        Ok(Response::new(api::RevokeAccessResponse {
+            revoked_at,
+            ended_sessions: ended as u32,
+        }))
     }
 
     async fn query_audit(
@@ -1171,64 +1419,6 @@ impl NodeService for NodeApi {
                     bytes_sent: r.bytes_sent as u64,
                     bytes_received: r.bytes_received as u64,
                     node_id: node_id.clone(),
-                })
-                .collect(),
-        }))
-    }
-
-    type WatchStream = BoxStream<api::WatchEvent>;
-
-    async fn watch(
-        &self,
-        req: Request<api::WatchRequest>,
-    ) -> Result<Response<Self::WatchStream>, Status> {
-        let req = req.into_inner();
-        let sandbox = self.sandboxes.get(&req.sandbox_id).await?;
-        // A watch reports every path under the one it is given, so it is held
-        // to the same scopes a listing is.
-        check_read_path(&sandbox.policy(), &req.path)?;
-        let mut agent = sandbox.agent().await?;
-
-        let stream = agent
-            .watch(guestpb::WatchRequest {
-                path: req.path,
-                is_recursive: req.is_recursive,
-                interval_ms: req.interval_ms,
-            })
-            .await?
-            .into_inner()
-            .map(|res| {
-                res.map(|e| api::WatchEvent {
-                    r#type: e.r#type,
-                    path: e.path,
-                    is_dir: e.is_dir,
-                })
-            });
-        Ok(Response::new(Box::pin(stream)))
-    }
-
-    async fn list_dir(
-        &self,
-        req: Request<api::ListDirRequest>,
-    ) -> Result<Response<api::ListDirResponse>, Status> {
-        let req = req.into_inner();
-        let sandbox = self.sandboxes.get(&req.sandbox_id).await?;
-        check_read_path(&sandbox.policy(), &req.path)?;
-        let mut agent = sandbox.agent().await?;
-
-        let resp = agent
-            .list_dir(guestpb::ListDirRequest { path: req.path })
-            .await?
-            .into_inner();
-        Ok(Response::new(api::ListDirResponse {
-            entries: resp
-                .entries
-                .into_iter()
-                .map(|e| api::DirEntry {
-                    name: e.name,
-                    is_dir: e.is_dir,
-                    size: e.size,
-                    mode: e.mode,
                 })
                 .collect(),
         }))
@@ -1277,30 +1467,10 @@ impl NodeService for NodeApi {
         Ok(Response::new(command_info(info)))
     }
 
-    type AttachCommandStream = BoxStream<api::ExecOutput>;
-
     /// Follows a command that is already running.
     ///
     /// The same permission as starting one: what comes back is the output of a
     /// command, and a sandbox that forbids exec must not hand it over.
-    async fn attach_command(
-        &self,
-        req: Request<api::AttachCommandRequest>,
-    ) -> Result<Response<Self::AttachCommandStream>, Status> {
-        let req = req.into_inner();
-        let command_id = check_command_id(&req.command_id)?;
-        let sandbox = self.sandboxes.get(&req.sandbox_id).await?;
-        check_exec(&sandbox.policy())?;
-        let mut agent = sandbox.agent().await?;
-
-        let stream = agent
-            .attach_command(guestpb::AttachCommandRequest { command_id })
-            .await?
-            .into_inner()
-            .map(|res| res.map(translate_exec_output));
-        Ok(Response::new(Box::pin(stream)))
-    }
-
     async fn signal_command(
         &self,
         req: Request<api::SignalCommandRequest>,
@@ -1318,6 +1488,24 @@ impl NodeService for NodeApi {
             })
             .await?;
         Ok(Response::new(api::SignalCommandResponse {}))
+    }
+
+    /// Held to the exec policy like the commands it removes.
+    async fn prune_commands(
+        &self,
+        req: Request<api::PruneCommandsRequest>,
+    ) -> Result<Response<api::PruneCommandsResponse>, Status> {
+        let sandbox = self.sandboxes.get(&req.into_inner().sandbox_id).await?;
+        check_exec(&sandbox.policy())?;
+        let mut agent = sandbox.agent().await?;
+        let pruned = agent
+            .prune_commands(guestpb::PruneCommandsRequest {})
+            .await?
+            .into_inner();
+        Ok(Response::new(api::PruneCommandsResponse {
+            removed: pruned.removed,
+            freed_bytes: pruned.freed_bytes,
+        }))
     }
 
     /// Creates a guest user.
@@ -1490,6 +1678,8 @@ fn command_info(info: guestpb::CommandInfo) -> api::CommandInfo {
         started_at_unix_ms: info.started_at_unix_ms,
         ended_at_unix_ms: info.ended_at_unix_ms,
         buffered_bytes: info.buffered_bytes,
+        exit_signal: info.exit_signal,
+        output_bytes: info.output_bytes,
     }
 }
 
@@ -1640,6 +1830,8 @@ async fn remove_partial_upload_inner(sandbox: &RunningSandbox, path: &str) {
             // The node's own housekeeping, which is root's.
             user: String::new(),
             is_env_cleared: false,
+            log_max_bytes: 0,
+            log_max_files: 0,
         })),
     };
     if let Ok(response) = agent.exec(tokio_stream::iter(vec![start])).await {
@@ -2249,6 +2441,8 @@ fn translate_exec_output(msg: guestpb::ExecOutput) -> api::ExecOutput {
             AgentOutput::Stderr(b) => ApiOutput::Stderr(b),
             AgentOutput::ExitCode(c) => ApiOutput::ExitCode(c),
             AgentOutput::CommandId(id) => ApiOutput::CommandId(bounded(id, MAX_COMMAND_ID)),
+            AgentOutput::ExitSignal(signal) => ApiOutput::ExitSignal(signal),
+            AgentOutput::LostBytes(lost) => ApiOutput::LostBytes(lost),
         }),
     }
 }

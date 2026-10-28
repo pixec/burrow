@@ -242,6 +242,8 @@ async fn exec_capture(
             // The node's own housekeeping, which is root's.
             user: String::new(),
             is_env_cleared: false,
+            log_max_bytes: 0,
+            log_max_files: 0,
         })),
     };
     // The command takes no stdin, so close the request stream immediately;
@@ -259,7 +261,10 @@ async fn exec_capture(
             Some(guestpb::exec_output::Output::ExitCode(c)) => code = c,
             // The id is for coming back to a command later; this one is
             // collected here and now.
-            Some(guestpb::exec_output::Output::CommandId(_)) | None => {}
+            Some(guestpb::exec_output::Output::CommandId(_))
+            | Some(guestpb::exec_output::Output::ExitSignal(_))
+            | Some(guestpb::exec_output::Output::LostBytes(_))
+            | None => {}
         }
     }
     Ok(code)

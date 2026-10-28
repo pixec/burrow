@@ -71,15 +71,25 @@ service Burrow {
   rpc GetVolume(VolumeRef) returns (burrow.common.v1.Volume);
   rpc DeleteVolume(VolumeRef) returns (DeleteVolumeResponse);
 
-  // Exec: bidirectional stream, PTY-capable.
+  // Exec, attach and files, relayed to the node holding the sandbox. The same
+  // calls the node's Access service serves directly; a client picks either.
+  // Exec is bidirectional and PTY-capable.
   rpc Exec(stream ExecInput) returns (stream ExecOutput);
+  rpc Attach(stream AttachInput) returns (stream ExecOutput);
+  rpc UploadFile(stream FileChunk) returns (UploadResult);
+  rpc DownloadFile(DownloadRequest) returns (stream FileChunk);
+  rpc ListDir(ListDirRequest) returns (ListDirResponse);
+  rpc Watch(WatchRequest) returns (stream WatchEvent);
 
   // Commands: a command outlives the stream that started it, so it can be
   // listed, followed and signalled from another process.
   rpc ListCommands(ListCommandsRequest) returns (ListCommandsResponse);
   rpc GetCommand(GetCommandRequest) returns (CommandInfo);
-  rpc AttachCommand(AttachCommandRequest) returns (stream ExecOutput);
   rpc SignalCommand(SignalCommandRequest) returns (SignalCommandResponse);
+  // Removes finished commands and their logs, as `docker container prune`
+  // does. Running commands are left alone. Nothing else removes a command's
+  // log while its sandbox lives.
+  rpc PruneCommands(PruneCommandsRequest) returns (PruneCommandsResponse);
 
   // Users and groups inside the guest. Each runs a command in the sandbox, so
   // all four are held to the sandbox's exec policy.
@@ -105,17 +115,73 @@ service Burrow {
   rpc GetShare(SandboxRef) returns (Share);
   rpc UnshareSandbox(SandboxRef) returns (UnshareResponse);
 
-  // Files
-  rpc UploadFile(stream FileChunk) returns (UploadResult);
-  rpc DownloadFile(DownloadRequest) returns (stream FileChunk);
-  rpc ListDir(ListDirRequest) returns (ListDirResponse);
+  // A token for one sandbox's Access service on the node that holds it, so
+  // exec, attach and file traffic can go there directly rather than through
+  // this service.
+  rpc IssueAccess(IssueAccessRequest) returns (AccessGrant);
+  // Invalidates every Access token issued for a sandbox so far and ends the
+  // direct sessions they opened, killing the commands those started. Tokens
+  // issued afterwards work as before.
+  rpc RevokeAccess(SandboxRef) returns (RevokeAccessResponse);
 
   // Audit: every egress attempt and DNS lookup a sandbox made.
   rpc QueryAudit(AuditQuery) returns (stream AuditEvent);
-  rpc Watch(WatchRequest) returns (stream WatchEvent);
   // The fleet's lifecycle log: what happened to which sandbox, in order,
   // resumable from the last `seq` seen.
   rpc TailEvents(TailEventsRequest) returns (stream burrow.common.v1.Event);
+}
+
+// Exec and files for one sandbox, served by the node that holds it rather
+// than by the orchestrator. Authenticated by a token from IssueAccess, which
+// names the sandbox and the node: a token is refused for any other sandbox,
+// and by any other node, including after the sandbox moves.
+service Access {
+  // Bidirectional and PTY-capable. A command outlives its stream: one whose
+  // stream breaks without sending stdin EOF keeps its stdin open for Attach.
+  rpc Exec(stream ExecInput) returns (stream ExecOutput);
+  // Follows a running or finished command from any stream, resuming from an
+  // output offset, and feeds its stdin, terminal size and signals.
+  rpc Attach(stream AttachInput) returns (stream ExecOutput);
+  rpc UploadFile(stream FileChunk) returns (UploadResult);
+  rpc DownloadFile(DownloadRequest) returns (stream FileChunk);
+  rpc ListDir(ListDirRequest) returns (ListDirResponse);
+  rpc Watch(WatchRequest) returns (stream WatchEvent);
+}
+
+message IssueAccessRequest {
+  SandboxRef ref = 1;
+  // What the token may do: "exec", "files:read" (download, list, watch) and
+  // "files:write" (upload). Empty grants all three.
+  repeated string ops = 2;
+  // Guest user every exec under this token runs as. Empty is root, which may
+  // also run a command as anyone else. File transfers are not bound by it,
+  // so a token meant to be confined to one user should not carry
+  // "files:write".
+  string user = 3;
+  // 0 selects the default of 300; at most 3600.
+  uint32 ttl_secs = 4;
+}
+
+message AccessGrant {
+  // Where the Access service is, e.g. "https://node-a.example.com:7073".
+  string endpoint = 1;
+  // Bearer token for that endpoint, a JWT signed by the orchestrator.
+  string token = 2;
+  // Unix seconds after which the node refuses the token.
+  int64 expires_at = 3;
+  string node_id = 4;
+  // The sandbox's id, which requests to the endpoint have to carry: the node
+  // matches it against the token and does not resolve names.
+  string sandbox_id = 5;
+}
+
+message RevokeAccessResponse {
+  // Tokens issued at or before this unix second are refused, including any
+  // issued within the same second as the revoke.
+  int64 revoked_at = 1;
+  // Direct sessions that were open and have been ended: execs, transfers and
+  // watches.
+  uint32 ended_sessions = 2;
 }
 
 message AuditQuery {
@@ -644,6 +710,14 @@ message ExecStart {
   // Guest user to run as; empty is root. The user has to exist already, which
   // CreateUser is for. HOME, USER, LOGNAME and the default cwd follow it.
   string user = 8;
+  // Rotate this command's output log once a file reaches this many bytes,
+  // as Docker's `max-size`. 0 keeps every byte in one file, unbounded, which
+  // is the default.
+  uint64 log_max_bytes = 9;
+  // Log files kept once rotating, as Docker's `max-file`: the oldest is
+  // dropped when there would be more, and an attach is told how many bytes
+  // went with it. 0 means 1. Ignored without `log_max_bytes`.
+  uint32 log_max_files = 10;
 }
 
 message ExecResize {
@@ -659,6 +733,15 @@ message ExecOutput {
     // Sent once, before any output, naming the command this stream started.
     // Pass it to GetCommand, AttachCommand or SignalCommand later.
     string command_id = 4;
+    // Sent just before `exit_code` when a signal ended the command: which
+    // one. `exit_code` is then 128 plus it, as a shell reports it. A command
+    // ended by its own `kill` reports one just the same.
+    int32 exit_signal = 5;
+    // Sent on an attach in place of output it cannot have: how many bytes.
+    // First, for output from before the requested offset that a rotating log
+    // has since dropped. After the replay, for output a failed write never
+    // recorded, most likely on a full disk, from which point on nothing was.
+    uint64 lost_bytes = 6;
   }
 }
 
@@ -675,9 +758,25 @@ message GetCommandRequest {
   string command_id = 2;
 }
 
-message AttachCommandRequest {
+// Follows a command and feeds it, from any stream, not only the one that
+// started it: the first message names the command, the rest are its input.
+message AttachInput {
+  oneof input {
+    AttachStart start = 1;
+    bytes stdin = 2;
+    ExecResize resize = 3;
+    int32 signal = 4;
+    bool is_stdin_eof = 5;
+  }
+}
+
+message AttachStart {
   string sandbox_id = 1;
   string command_id = 2;
+  // Output offset to resume from, counting stdout and stderr bytes together
+  // from the command's start. An attacher that saw N bytes passes N and gets
+  // only what came after; 0 replays everything still held.
+  uint64 from_offset = 3;
 }
 
 message SignalCommandRequest {
@@ -688,6 +787,16 @@ message SignalCommandRequest {
 }
 
 message SignalCommandResponse {}
+
+message PruneCommandsRequest {
+  string sandbox_id = 1;
+}
+
+message PruneCommandsResponse {
+  uint32 removed = 1;
+  // Log bytes freed on the guest's disk.
+  uint64 freed_bytes = 2;
+}
 
 // One command the sandbox has run.
 //
@@ -707,8 +816,14 @@ message CommandInfo {
   int64 started_at_unix_ms = 6;
   // 0 while the command is still running.
   int64 ended_at_unix_ms = 7;
-  // Bytes of output still held for a later attach.
+  // Bytes of output held for a later attach, in a log on the guest's disk.
+  // All of `output_bytes` unless a write to the log failed.
   uint64 buffered_bytes = 8;
+  // The signal that ended the command, when one did; 0 otherwise.
+  int32 exit_signal = 9;
+  // Bytes of output the command has produced in all, stdout and stderr
+  // together, which is the offset an attach that is up to date resumes from.
+  uint64 output_bytes = 10;
 }
 
 message CreateUserRequest {

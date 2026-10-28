@@ -20,6 +20,7 @@ alias burrow='cargo run -q -p burrow-cli --'
 | `--api-key <TOKEN>` | Bearer token, when the orchestrator requires one. Reads `BURROW_API_KEY`. |
 | `--api-key-file <PATH>` | Read the token from a file instead. First non-blank, non-`#` line. Reads `BURROW_API_KEY_FILE`. |
 | `--insecure` | Allow a plaintext `http://` endpoint that is not on this machine. Reads `BURROW_INSECURE`. |
+| `--route <ROUTE>` | Where `exec`, `run`, `connect`, `logs`, `copy` and `dir` send their traffic: `direct`, the default, to the node holding the sandbox with a short-lived token, or `orchestrator`, relayed. Neither falls back to the other. Reads `BURROW_ROUTE`. See [direct access](ARCHITECTURE.md#direct-access). |
 | `-h`, `--help` | Print help for the command. |
 
 Set them once and leave them out of the examples below:
@@ -41,10 +42,14 @@ burrow --orchestrator https://burrow.example.com:7070 ps
 ```
 
 The api key travels in a header on every call, so `http://` to anything but
-this machine is refused rather than leaking it:
+this machine is refused rather than leaking it. The same rule covers the
+token that `exec`, `run`, `connect`, `logs`, `copy` and `dir` send to the
+node holding the sandbox, which they call directly unless `--route
+orchestrator` says otherwise. That node has to be reachable from where the CLI
+runs, at the address it advertises:
 
 ```
-refusing to send the api key in plaintext to burrow.example.com: use https://,
+refusing to send a bearer token in plaintext to burrow.example.com: use https://,
 or pass --insecure if the endpoint is reached over a network you trust
 ```
 
@@ -155,6 +160,7 @@ No Docker counterpart at all: [`fork`](#fork), [`move`](#move),
 | [`connect`](#connect) | Open an interactive shell |
 | [`logs`](#logs) | Replay and follow a command's output |
 | [`kill`](#kill) | Signal a running command |
+| [`prune`](#prune) | Remove finished commands and their output |
 | [`user`](#user) | Create guest users |
 | [`group`](#group) | Create guest groups and manage membership |
 | [`copy`](#copy) | Copy a file in or out |
@@ -181,6 +187,7 @@ No Docker counterpart at all: [`fork`](#fork), [`move`](#move),
 | [`pull`](#pull) | Import an OCI image as a template |
 | [`templates`](#templates) | Manage templates |
 | [`secret`](#secret) | Credentials Sandbox Kits ask for by service name |
+| [`token`](#token) | Issue and revoke tokens for calling a sandbox's node |
 | [`events`](#events) | Show and follow what happened to sandboxes |
 | [`audit`](#audit) | Show egress attempts and DNS lookups |
 | [`nodes`](#nodes) | Inspect and drain nodes |
@@ -537,6 +544,8 @@ burrow exec -e TOKEN=xyz -w /work sbx_2f0c -- /bin/sh -c 'echo $TOKEN'
 | `-w`, `--workdir <DIR>` | Directory to run in. Defaults to the image's `WORKDIR`, or the user's home when `--user` is given. |
 | `-t`, `--pty` | Allocate a pty, so the command sees a terminal. Also spelled `--tty`. |
 | `-u`, `--user <NAME>` | Guest user to run as. Defaults to root. Create one with [`user create`](#user-create). |
+| `--log-max-size <SIZE>` | Rotate the command's output log once a file reaches this size, e.g. `20m`, as Docker's `--log-opt max-size`. Unset keeps every byte. |
+| `--log-max-files <N>` | Log files kept once rotating, as Docker's `--log-opt max-file`. Defaults to 1. Needs `--log-max-size`. |
 
 The image's own environment still applies. Your `--env` values win where the two
 name the same variable, and `--workdir` wins over the image's `WORKDIR`. See
@@ -605,10 +614,29 @@ burrow logs sbx_2f0c
 # `burrow logs sbx_2f0c <COMMAND-ID>`. `burrow top sbx_2f0c` lists them
 ```
 
-The guest keeps the last 256 KiB of each command's output, so a chatty command
-replays its tail rather than everything it has said. Attaching to a command that
-has already finished replays what is left and prints nothing more. Any number of
-terminals can follow the same command at once.
+Every byte a command prints is kept, in a log on the sandbox's own disk, until
+[`prune`](#prune) removes it, so `logs` replays from the very start. A command
+run with `--log-max-size` keeps only its newest files; what rotation dropped is
+reported on stderr by how many bytes, as is anything a failed write never
+recorded. Attaching to a command that has already finished replays it and
+prints nothing more. Any number of terminals can follow the same command at
+once.
+
+## prune
+
+Remove a sandbox's finished commands and their output logs, as `docker
+container prune` does. Running commands are left alone.
+
+```
+burrow prune <ID>
+```
+
+```sh
+burrow prune sbx_2f0c
+# removed 12 finished command(s), freed 48213 bytes
+```
+
+Nothing else removes a command's output while the sandbox lives.
 
 ## kill
 
@@ -1552,6 +1580,41 @@ burrow templates rm python
 | Argument | Description |
 | --- | --- |
 | `<NAME>` | Template to remove. |
+
+## token
+
+Tokens for calling a sandbox's node directly, the way `exec` and `copy` do.
+For scripts and services that talk to the `Access` service themselves; see
+[direct access](ARCHITECTURE.md#direct-access).
+
+### token issue
+
+```
+burrow token issue [OPTIONS] <ID>
+```
+
+```sh
+burrow token issue --op files:read --ttl 600 sbx_2f0c
+# endpoint  https://node-a.example.com:7073
+# sandbox   sbx_2f0c
+# expires   2026-10-28T09:15:00Z
+# token     eyJ0eXAiOiJKV1Qi...
+```
+
+| Option | Description |
+| --- | --- |
+| `--op <OP>` | What the token may do: `exec`, `files:read` or `files:write`. Repeatable; all three when left out. |
+| `--user <NAME>` | Guest user every exec under it runs as, and every file transfer is done as. |
+| `--ttl <SECS>` | How long it lasts, at most 3600. Five minutes when left out. |
+
+### token revoke
+
+Refuse every token issued for a sandbox so far, end the sessions they opened,
+and kill the commands those started.
+
+```
+burrow token revoke <ID>
+```
 
 ## secret
 

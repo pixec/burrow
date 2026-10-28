@@ -86,19 +86,24 @@ service NodeService {
   rpc GetShare(NodeSandboxRef) returns (burrow.api.v1.Share);
   rpc UnshareSandbox(NodeSandboxRef) returns (burrow.api.v1.UnshareResponse);
 
+  // What the orchestrator relays for a client that does not call the node's
+  // Access service itself.
   rpc Exec(stream burrow.api.v1.ExecInput) returns (stream burrow.api.v1.ExecOutput);
-  rpc ListCommands(burrow.api.v1.ListCommandsRequest) returns (burrow.api.v1.ListCommandsResponse);
-  rpc GetCommand(burrow.api.v1.GetCommandRequest) returns (burrow.api.v1.CommandInfo);
-  rpc AttachCommand(burrow.api.v1.AttachCommandRequest) returns (stream burrow.api.v1.ExecOutput);
-  rpc SignalCommand(burrow.api.v1.SignalCommandRequest) returns (burrow.api.v1.SignalCommandResponse);
-  rpc CreateUser(burrow.api.v1.CreateUserRequest) returns (burrow.api.v1.CreateUserResponse);
-  rpc CreateGroup(burrow.api.v1.CreateGroupRequest) returns (burrow.api.v1.CreateGroupResponse);
-  rpc AddUserToGroup(burrow.api.v1.GroupMembershipRequest) returns (burrow.api.v1.GroupMembershipResponse);
-  rpc RemoveUserFromGroup(burrow.api.v1.GroupMembershipRequest) returns (burrow.api.v1.GroupMembershipResponse);
+  rpc Attach(stream burrow.api.v1.AttachInput) returns (stream burrow.api.v1.ExecOutput);
   rpc UploadFile(stream burrow.api.v1.FileChunk) returns (burrow.api.v1.UploadResult);
   rpc DownloadFile(burrow.api.v1.DownloadRequest) returns (stream burrow.api.v1.FileChunk);
   rpc ListDir(burrow.api.v1.ListDirRequest) returns (burrow.api.v1.ListDirResponse);
   rpc Watch(burrow.api.v1.WatchRequest) returns (stream burrow.api.v1.WatchEvent);
+  // Refuses the sandbox's outstanding Access tokens and ends what they opened.
+  rpc RevokeAccess(NodeSandboxRef) returns (burrow.api.v1.RevokeAccessResponse);
+  rpc ListCommands(burrow.api.v1.ListCommandsRequest) returns (burrow.api.v1.ListCommandsResponse);
+  rpc GetCommand(burrow.api.v1.GetCommandRequest) returns (burrow.api.v1.CommandInfo);
+  rpc SignalCommand(burrow.api.v1.SignalCommandRequest) returns (burrow.api.v1.SignalCommandResponse);
+  rpc PruneCommands(burrow.api.v1.PruneCommandsRequest) returns (burrow.api.v1.PruneCommandsResponse);
+  rpc CreateUser(burrow.api.v1.CreateUserRequest) returns (burrow.api.v1.CreateUserResponse);
+  rpc CreateGroup(burrow.api.v1.CreateGroupRequest) returns (burrow.api.v1.CreateGroupResponse);
+  rpc AddUserToGroup(burrow.api.v1.GroupMembershipRequest) returns (burrow.api.v1.GroupMembershipResponse);
+  rpc RemoveUserFromGroup(burrow.api.v1.GroupMembershipRequest) returns (burrow.api.v1.GroupMembershipResponse);
   rpc QueryAudit(burrow.api.v1.AuditQuery) returns (burrow.api.v1.AuditPage);  // collected, not streamed: the orchestrator merges pages from every node
 }
 
@@ -284,6 +289,17 @@ message RegisterResponse {
   // Index of this node's slice of the sandbox address pool. Stable for the
   // node's lifetime, because its sandboxes' addresses derive from it.
   uint32 node_index = 3;
+  // Keys Access tokens are signed with. Empty when the orchestrator issues
+  // none, and then the node refuses every Access call.
+  repeated AccessKey access_keys = 4;
+}
+
+// An orchestrator's public key for Access tokens, named by the `kid` in the
+// tokens it signs.
+message AccessKey {
+  string kid = 1;
+  // Raw 32-byte Ed25519 public key.
+  bytes public_key = 2;
 }
 
 message HeartbeatRequest {
@@ -349,6 +365,11 @@ message HeartbeatResponse {
   // sandboxes along with the address it was told to reach the control plane
   // at, which with several replicas is only a balancer in front of them.
   repeated string control_plane_hosts = 5;
+  // Every node's API address and Access endpoint, this node's own included.
+  // Denied to every sandbox as edges are: both are APIs into sandboxes, the
+  // Access service one a sandbox could reach on any node, and a token is the
+  // only thing between it and the node. A sandbox has no business there.
+  repeated string node_hosts = 10;
   // How long the node may go without a successful heartbeat before it must
   // stop resuming durable sandboxes on its own say. Shorter than the silence
   // after which the orchestrator writes a node off and lets another node
@@ -359,6 +380,9 @@ message HeartbeatResponse {
   repeated string confirmed_sandboxes = 7;
   // Fenced sandboxes another node has adopted. The node drops its copy.
   repeated string relinquished_sandboxes = 8;
+  // As in RegisterResponse, repeated on every beat so a rotated key reaches
+  // nodes without a re-registration.
+  repeated AccessKey access_keys = 9;
 }
 
 message MeshPeer {

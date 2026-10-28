@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+import codecs
 import os
+import queue
 import threading
 import time
 from datetime import datetime
@@ -128,6 +130,8 @@ def _to_command_info(raw: api_pb2.CommandInfo) -> CommandInfo:
         if raw.ended_at_unix_ms > 0
         else None,
         buffered_bytes=raw.buffered_bytes,
+        exit_signal=raw.exit_signal,
+        output_bytes=raw.output_bytes,
     )
 
 
@@ -228,37 +232,72 @@ def _to_fork_request(source: str, options: Dict[str, Any]) -> api_pb2.ForkSandbo
     return request
 
 
-def _to_chunks(msg: api_pb2.ExecOutput) -> Iterator[OutputChunk]:
-    """One `ExecOutput` message as the SDK's chunk, if it carries anything.
-    Shared by a running exec and a later attach. The oneof tag is checked
-    rather than the fields: proto defaults give every message an exit code of 0
-    and empty byte fields."""
-    kind = msg.WhichOneof("output")
-    if kind == "stdout" and msg.stdout:
-        yield OutputChunk(type="stdout", data=msg.stdout.decode("utf-8", "replace"))
-    elif kind == "stderr" and msg.stderr:
-        yield OutputChunk(type="stderr", data=msg.stderr.decode("utf-8", "replace"))
-    elif kind == "exit_code":
-        yield OutputChunk(type="exit", exit_code=msg.exit_code)
+class _Chunker:
+    """Turns one command's `ExecOutput` messages into the SDK's chunks.
+
+    Shared by a running exec and a later attach. Each stream is decoded with a
+    decoder of its own that carries a partial character over to the next
+    message, so text split mid-character arrives whole; the bytes go along
+    untouched. The oneof tag is checked rather than the fields: proto defaults
+    give every message an exit code of 0 and empty byte fields.
+    """
+
+    def __init__(self) -> None:
+        self._decoders = {
+            "stdout": codecs.getincrementaldecoder("utf-8")("replace"),
+            "stderr": codecs.getincrementaldecoder("utf-8")("replace"),
+        }
+        self._signal = 0
+
+    def feed(self, msg: api_pb2.ExecOutput) -> Iterator[OutputChunk]:
+        kind = msg.WhichOneof("output")
+        if kind in ("stdout", "stderr"):
+            raw = getattr(msg, kind)
+            if raw:
+                text = self._decoders[kind].decode(raw)
+                yield OutputChunk(type=kind, data=text, raw=raw)
+        elif kind == "exit_signal":
+            self._signal = msg.exit_signal
+        elif kind == "lost_bytes":
+            yield OutputChunk(type="lost", lost_bytes=msg.lost_bytes)
+        elif kind == "exit_code":
+            # What a decoder still held was the start of a character that never
+            # finished; it is said as such, before the exit.
+            for name, decoder in self._decoders.items():
+                rest = decoder.decode(b"", final=True)
+                if rest:
+                    yield OutputChunk(type=name, data=rest)
+            yield OutputChunk(
+                type="exit", exit_code=msg.exit_code, exit_signal=self._signal
+            )
 
 
 def _collect(chunks: Iterator[OutputChunk]) -> CommandResult:
     """Drains a command's output into the result a finished command reports."""
     stdout: List[str] = []
     stderr: List[str] = []
+    stdout_bytes: List[bytes] = []
+    stderr_bytes: List[bytes] = []
     exit_code = 0
+    exit_signal = 0
     for chunk in chunks:
         if chunk.type == "stdout":
             stdout.append(chunk.data)
+            stdout_bytes.append(chunk.raw)
         elif chunk.type == "stderr":
             stderr.append(chunk.data)
-        else:
+            stderr_bytes.append(chunk.raw)
+        elif chunk.type == "exit":
             exit_code = chunk.exit_code
+            exit_signal = chunk.exit_signal
     return CommandResult(
         stdout="".join(stdout),
         stderr="".join(stderr),
         exit_code=exit_code,
         success=exit_code == 0,
+        exit_signal=exit_signal,
+        stdout_bytes=b"".join(stdout_bytes),
+        stderr_bytes=b"".join(stderr_bytes),
     )
 
 
@@ -318,6 +357,7 @@ class DetachedCommand:
         info: Optional[CommandInfo] = None,
         release: Optional[Callable[[], None]] = None,
         close: Optional[Callable[[], None]] = None,
+        write: Optional[Callable[[Any], None]] = None,
     ):
         self.sandbox_id = sandbox_id
         self.cmd_id = cmd_id
@@ -330,11 +370,35 @@ class DetachedCommand:
         # `get_command`, which owns no stream.
         self._release = release
         self._close = close
+        self._write = write
 
     def logs(self) -> Iterator[OutputChunk]:
         """The command's output, replayed from what the guest holds and then
         followed live."""
         return self._logs()
+
+    def send_stdin(self, data: Union[str, bytes]) -> None:
+        """Writes to the command's stdin, or its terminal for a pty command.
+
+        Works on a handle from `get_command`, whichever process started the
+        command: a shell started elsewhere, or by a process that has since
+        gone, takes input here just the same.
+        """
+        if self._write is None:
+            raise BurrowError(
+                "this handle cannot feed the command; reattach with get_command",
+                "failed_precondition",
+            )
+        self._write(api_pb2.AttachInput(stdin=data.encode() if isinstance(data, str) else data))
+
+    def close_stdin(self) -> None:
+        """Ends the command's stdin, which a pipe command reads as EOF."""
+        if self._write is None:
+            raise BurrowError(
+                "this handle cannot feed the command; reattach with get_command",
+                "failed_precondition",
+            )
+        self._write(api_pb2.AttachInput(is_stdin_eof=True))
 
     def wait(self) -> CommandResult:
         """Drains the output and returns the result."""
@@ -886,6 +950,10 @@ class Sandbox:
                 rows=options.get("rows") or 24,
                 cols=options.get("cols") or 80,
                 user=options.get("user", self._default_user),
+                # As Docker's `--log-opt max-size` and `max-file`. Unset keeps
+                # every byte the command prints.
+                log_max_bytes=options.get("log_max_bytes") or 0,
+                log_max_files=options.get("log_max_files") or 0,
             )
         )
 
@@ -901,7 +969,7 @@ class Sandbox:
 
         # A detached command outlives any request deadline.
         timeout = options.get("timeout", None if keep_open else _DEFAULT)
-        call = self._transport.duplex("Exec", requests(), timeout)
+        call = self._transport.route(self.id).duplex("Exec", requests(), timeout)
         output = iter(call)
 
         # The guest names the command before anything else. Pulled here rather
@@ -919,18 +987,19 @@ class Sandbox:
         )
 
         def chunks() -> Iterator[OutputChunk]:
+            chunker = _Chunker()
             try:
                 # An older agent starts straight in on output, with no id at
                 # all.
                 if first is not None and first.WhichOneof("output") != "command_id":
-                    for chunk in _to_chunks(first):
+                    for chunk in chunker.feed(first):
                         yield chunk
                 for msg in output:
                     # Only ever the first message, but an agent that repeated
                     # it must not put an empty chunk into the caller's stream.
                     if msg.WhichOneof("output") == "command_id":
                         continue
-                    for chunk in _to_chunks(msg):
+                    for chunk in chunker.feed(msg):
                         yield chunk
             except grpc.RpcError as err:
                 raise BurrowError.from_grpc(err) from None
@@ -1001,7 +1070,7 @@ class Sandbox:
         )
         return [_to_command_info(raw) for raw in res.commands]
 
-    def get_command(self, cmd_id: str) -> DetachedCommand:
+    def get_command(self, cmd_id: str, from_offset: int = 0) -> DetachedCommand:
         """Reattaches to a command by id, from anywhere.
 
         ```python
@@ -1011,9 +1080,13 @@ class Sandbox:
         ```
 
         The command need not have been started by this process: it lives in the
-        sandbox. `logs()` replays what the guest still holds and then follows
-        the command live, and several readers may do that at once. Raises
-        `not_found` when the id names nothing, an evicted command included.
+        sandbox, and so does every byte it has printed. `logs()` replays from
+        `from_offset`, counting stdout and stderr bytes together from the
+        command's start, and then follows the command live; a reader that saw N
+        bytes passes N and gets only what came after. `send_stdin` feeds a
+        running command, a shell whose original stream is long gone included.
+        Several handles may follow one command at once. Raises `not_found` when
+        the id names nothing, a pruned command included.
         """
         self._assert_live()
         # Read first, so a bad id fails here rather than on the first `logs()`.
@@ -1022,20 +1095,76 @@ class Sandbox:
             api_pb2.GetCommandRequest(sandbox_id=self.id, command_id=cmd_id),
         )
 
-        def attach() -> Iterator[OutputChunk]:
-            stream = self._transport.server_stream(
-                "AttachCommand",
-                api_pb2.AttachCommandRequest(sandbox_id=self.id, command_id=cmd_id),
-                # A command outlives any request deadline.
-                None,
+        # One Attach call per handle, opened by whichever of reading and
+        # writing comes first, and fed from this queue for as long as it lasts.
+        inputs: "queue.Queue[Optional[api_pb2.AttachInput]]" = queue.Queue()
+        inputs.put(
+            api_pb2.AttachInput(
+                start=api_pb2.AttachStart(
+                    sandbox_id=self.id, command_id=cmd_id, from_offset=from_offset
+                )
             )
-            for msg in stream:
-                for chunk in _to_chunks(msg):
-                    yield chunk
+        )
+        opened: Dict[str, Any] = {}
+        lock = threading.Lock()
+
+        def requests() -> Iterator[api_pb2.AttachInput]:
+            while True:
+                item = inputs.get()
+                if item is None:
+                    return
+                yield item
+
+        def call() -> Any:
+            with lock:
+                if "call" not in opened:
+                    # A command outlives any request deadline.
+                    opened["call"] = self._transport.route(self.id).duplex(
+                        "Attach", requests(), None
+                    )
+                return opened["call"]
+
+        def attach() -> Iterator[OutputChunk]:
+            chunker = _Chunker()
+            stream = call()
+            try:
+                for msg in stream:
+                    for chunk in chunker.feed(msg):
+                        yield chunk
+            except grpc.RpcError as err:
+                if not stream.cancelled():
+                    raise BurrowError.from_grpc(err) from None
+
+        def write(msg: api_pb2.AttachInput) -> None:
+            call()
+            inputs.put(msg)
+
+        def close() -> None:
+            inputs.put(None)
+            with lock:
+                if "call" in opened:
+                    opened["call"].cancel()
 
         return DetachedCommand(
-            self.id, cmd_id, attach, self._signal_command, info=_to_command_info(raw)
+            self.id,
+            cmd_id,
+            attach,
+            self._signal_command,
+            info=_to_command_info(raw),
+            close=close,
+            write=write,
         )
+
+    def prune_commands(self) -> Dict[str, int]:
+        """Removes finished commands and their output, as `docker container
+        prune` does. Running commands are left alone. Returns how many were
+        removed and the bytes freed in the sandbox.
+        """
+        self._assert_live()
+        res = self._transport.unary(
+            "PruneCommands", api_pb2.PruneCommandsRequest(sandbox_id=self.id)
+        )
+        return {"removed": res.removed, "freed_bytes": res.freed_bytes}
 
     def _signal_command(self, cmd_id: str, signal: int) -> None:
         self._transport.unary(
@@ -1127,7 +1256,7 @@ class Sandbox:
         time (a browser terminal, an agent driving a REPL). For a command that
         runs to completion, use `run_command`."""
         self._assert_live()
-        return Terminal(self._transport, self.id, options)
+        return Terminal(self._transport.route(self.id), self.id, options)
 
     def write_files(self, files: Sequence[Dict[str, Any]]) -> None:
         """Writes files, creating parent directories as needed.
@@ -1166,7 +1295,7 @@ class Sandbox:
                 offset = end
 
         res = self._with_resume(
-            lambda: self._transport.client_stream("UploadFile", chunks())
+            lambda: self._transport.route(self.id).client_stream("UploadFile", chunks)
         )
         # The agent writes as root, so a handle from `as_user` has to hand the
         # file over or the user could not touch what it wrote.
@@ -1190,7 +1319,7 @@ class Sandbox:
 
         def read() -> bytes:
             parts = []
-            for chunk in self._transport.server_stream(
+            for chunk in self._transport.route(self.id).server_stream(
                 "DownloadFile", api_pb2.DownloadRequest(sandbox_id=self.id, path=path)
             ):
                 if chunk.data:
@@ -1208,7 +1337,7 @@ class Sandbox:
         self._assert_live()
 
         def opened():
-            source = self._transport.server_stream(
+            source = self._transport.route(self.id).server_stream(
                 "DownloadFile", api_pb2.DownloadRequest(sandbox_id=self.id, path=path)
             )
             return source, next(source, None)
@@ -1257,7 +1386,7 @@ class Sandbox:
         """Lists a directory."""
         self._assert_live()
         res = self._with_resume(
-            lambda: self._transport.unary(
+            lambda: self._transport.route(self.id).unary(
                 "ListDir", api_pb2.ListDirRequest(sandbox_id=self.id, path=path)
             )
         )
@@ -1343,7 +1472,7 @@ class Sandbox:
         ```
         """
         self._assert_live()
-        call = self._transport.open_server_stream(
+        call = self._transport.route(self.id).open_server_stream(
             "Watch",
             api_pb2.WatchRequest(
                 sandbox_id=self.id,

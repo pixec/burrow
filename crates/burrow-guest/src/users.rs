@@ -100,7 +100,8 @@ async fn run_tool(tool: &Path, args: &[&str]) -> Result<(), Status> {
 
     let code = exit
         .await
-        .map_err(|_| Status::internal("lost track of the child process"))?;
+        .map_err(|_| Status::internal("lost track of the child process"))?
+        .code;
     if code != 0 {
         let detail = diagnostics.trim();
         return Err(Status::internal(format!(

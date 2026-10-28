@@ -387,12 +387,46 @@ job.info.user;     // who it runs as, empty for root
 for await (const chunk of job.logs()) process.stdout.write(chunk.data);
 ```
 
-`logs()` replays the output the guest still holds and then follows the command
-live until it exits. Attaching to a command that has already finished replays
-what is left and ends with its exit status, so the same code covers both. A
-reattached handle differs from a detached one here: each `logs()` and `wait()`
-opens its own attachment with no deadline, so any number of readers can attach
-at once and each gets its own stream.
+`logs()` replays the command's output from the start and then follows it live
+until it exits; the sandbox keeps every byte. Attaching to a command that has
+already finished replays it and ends with its exit status, so the same code
+covers both. A reattached handle differs from a detached one here: each `logs()`
+and `wait()` opens its own attachment with no deadline, so any number of
+readers can attach at once and each gets its own stream.
+
+A reader that comes back after a disconnect passes the offset it got to, stdout
+and stderr bytes counted together, and is sent only what followed:
+
+```ts
+let seen = 0;
+const job = await sandbox.getCommand(cmdId, { fromOffset: seen });
+for await (const chunk of job.logs()) {
+  if (chunk.type === "stdout" || chunk.type === "stderr") seen += chunk.raw.length;
+  if (chunk.type === "lost") console.warn(`${chunk.lostBytes} bytes are gone`);
+}
+```
+
+A `"lost"` chunk stands for output the sandbox cannot send: what a rotating log
+dropped (see `logMaxBytes`), or what a failed write, most likely on a full
+disk, never recorded.
+
+A reattached handle can also feed the command. A shell started by a process
+that has since gone keeps its stdin open, and takes input from the next one:
+
+```ts
+const shell = await sandbox.getCommand(shellId);
+shell.sendStdin("ls /work\n");
+for await (const chunk of shell.logs()) process.stdout.write(chunk.raw);
+```
+
+`closeStdin()` sends EOF. Only an explicit EOF closes a command's stdin: a
+stream that breaks, a client restart, or the sandbox sleeping leaves it open.
+
+Every chunk carries `raw`, the bytes exactly as written, beside `data`, the
+text. `data` is decoded across chunk boundaries, so a character split between
+two chunks arrives whole; results carry `stdoutBytes` and `stderrBytes` too.
+An exit a signal caused names it: `exitSignal` is 15 and `exitCode` 143 for a
+command ended by SIGTERM, whoever sent it.
 
 `wait()` drains an attachment and returns the finished result.
 
@@ -425,8 +459,9 @@ What can fail: `permission_denied` when the sandbox's exec policy forbids
 commands, since signals go through the same door as exec and a sandbox
 tightened with `update({ exec: { allowExec: false } })` refuses them too;
 `failed_precondition` when the sandbox is suspended, or when the command had
-already exited; `not_found` for a command the guest has since evicted; and
-transport failures when the node cannot be reached.
+already exited; `not_found` for a command since pruned; and transport failures
+when the node cannot be reached. A signal reaches the command's whole process
+group.
 
 `listCommands()` returns everything the sandbox has run, oldest first.
 
@@ -436,11 +471,26 @@ for (const command of await sandbox.listCommands()) {
 }
 ```
 
-Two bounds are worth knowing. The guest keeps the last 256 KiB of each
-command's output, oldest dropped, so a chatty command replays its tail rather
-than everything it said. And it retains the 64 most recent finished commands;
-past that the oldest is evicted, and `getCommand` on it fails with
-`not_found`. A running command is never evicted.
+Output is kept the way Docker keeps a container's log: all of it, on the
+sandbox's own disk, for as long as the command is listed. A command that would
+print more than you want kept can rotate instead, as Docker's `max-size` and
+`max-file`:
+
+```ts
+await sandbox.runCommand({
+  cmd: "./serve.sh",
+  detached: true,
+  logMaxBytes: 20 * 1024 * 1024,
+  logMaxFiles: 5,
+});
+```
+
+Finished commands stay until `pruneCommands()` removes them and their output,
+as `docker container prune` does; running ones are never touched.
+
+```ts
+const { removed, freedBytes } = await sandbox.pruneCommands();
+```
 
 ## Users and groups
 
@@ -1448,6 +1498,14 @@ sandbox.usage;         // { cpuUsageUsec, rxBytes, txBytes }
 
 ## Method reference
 
+Calls marked "on the node" go to the node holding the sandbox by default, with
+a token the SDK gets from the orchestrator's `IssueAccess` and reuses until it
+nears expiry; the orchestrator carries none of that traffic, and the node has
+to be reachable from where the SDK runs. Open the connection with
+`route: "orchestrator"` (or set `BURROW_ROUTE=orchestrator`) and the
+orchestrator relays the same calls instead. Neither falls back to the other.
+Everything else goes to the orchestrator.
+
 | Method | RPC |
 |---|---|
 | `Sandbox.create` | `CreateSandbox` |
@@ -1455,19 +1513,20 @@ sandbox.usage;         // { cpuUsageUsec, rxBytes, txBytes }
 | `Sandbox.get`, `sandbox.refresh`, `getInfo`, `isRunning` | `GetSandbox` |
 | `Sandbox.list` | `ListSandboxes` |
 | `Sandbox.fork`, `sandbox.fork` | `ForkSandbox` |
-| `sandbox.runCommand`, `exec`, `execStream`, `terminal`, `asUser` | `Exec` |
+| `sandbox.runCommand`, `exec`, `execStream`, `terminal`, `asUser` | `Exec` on the node |
 | `sandbox.listCommands` | `ListCommands` |
-| `sandbox.getCommand` | `GetCommand`, then `AttachCommand` per `logs()` |
+| `sandbox.getCommand` | `GetCommand`, then `Attach` on the node per `logs()`, and one for `sendStdin` |
 | `command.kill`, `killed` | `SignalCommand` |
+| `sandbox.pruneCommands` | `PruneCommands` |
 | `sandbox.createUser`, `createGroup` | `CreateUser`, `CreateGroup` |
 | `sandbox.addUserToGroup`, `removeUserFromGroup` | `AddUserToGroup`, `RemoveUserFromGroup` |
-| `sandbox.writeFile`, `writeFiles` | `UploadFile`, one per file |
-| `sandbox.readFile`, `readFileToBuffer`, `readFileBytes`, `downloadFile` | `DownloadFile` |
-| `sandbox.listDir` | `ListDir` |
+| `sandbox.writeFile`, `writeFiles` | `UploadFile` on the node, one per file |
+| `sandbox.readFile`, `readFileToBuffer`, `readFileBytes`, `downloadFile` | `DownloadFile` on the node |
+| `sandbox.listDir` | `ListDir` on the node |
 | `sandbox.mkDir` | `Exec`, running `mkdir -p` |
 | `sandbox.remove`, `rename` | `Exec`, running `rm -rf` and `mv` |
 | `sandbox.stat`, `exists` | `ListDir` on the parent |
-| `sandbox.watch` | `Watch` |
+| `sandbox.watch` | `Watch` on the node |
 | `sandbox.exposePort`, `listPorts`, `closePort`, `domain` | `ExposePort`, `ListPorts`, `ClosePort` |
 | `sandbox.update`, `updateTags` | `UpdateTags` |
 | `sandbox.update`, `updateNetworkPolicy` | `UpdateNetworkPolicy` |

@@ -39,7 +39,13 @@ fn open_no_symlinks(path: &str, flags: OFlag, mode: Mode) -> std::io::Result<std
 
 /// The root of systemd's mount namespace when it runs, which mounts its own
 /// `/run` and whatever its units ask for; the agent's root otherwise.
+///
+/// A thread working as a user has it opened already, as root: `/proc/<pid>/root`
+/// of a root process is not something that user may open.
 fn guest_root() -> std::io::Result<std::fs::File> {
+    if let Some(root) = USER_ROOT.with(|root| root.borrow().as_ref().map(|file| file.try_clone())) {
+        return root;
+    }
     match crate::systemd::pid() {
         Some(pid) => std::fs::File::open(format!("/proc/{pid}/root")),
         None => std::fs::File::open("/"),
@@ -151,6 +157,94 @@ fn fchown(file: &std::fs::File, uid: u32, gid: u32) -> std::io::Result<()> {
     Ok(())
 }
 
+thread_local! {
+    static USER_ROOT: std::cell::RefCell<Option<std::fs::File>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// What `files-as-user` in the health response promises.
+pub const FEATURE_FILES_AS_USER: &str = "files-as-user";
+
+/// Whose filesystem permissions a transfer is held to.
+pub struct FsUser {
+    uid: u32,
+    gid: u32,
+    groups: Vec<u32>,
+}
+
+/// The user a request names, or `None` for root's own transfer.
+pub fn fs_user(name: &str) -> Result<Option<std::sync::Arc<FsUser>>, Status> {
+    if name.is_empty() {
+        return Ok(None);
+    }
+    let creds = crate::users::credentials(name)?;
+    Ok(Some(std::sync::Arc::new(FsUser {
+        uid: creds.uid,
+        gid: creds.gid,
+        groups: creds.groups,
+    })))
+}
+
+/// Takes on `user`'s filesystem identity for the calling thread alone.
+///
+/// Raw syscalls throughout: musl's `setgroups` applies to every thread in the
+/// process, and only this one may change. Moving the filesystem uid off 0 also
+/// drops root's file capabilities from the thread, `CAP_DAC_OVERRIDE` among
+/// them, so from here every open is checked as the user would be.
+fn become_user(user: &FsUser) -> std::io::Result<()> {
+    use nix::libc;
+    // SAFETY: plain syscalls on the calling thread's credentials; `groups`
+    // outlives the call.
+    unsafe {
+        if libc::syscall(libc::SYS_setgroups, user.groups.len(), user.groups.as_ptr()) != 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        libc::syscall(libc::SYS_setfsgid, user.gid);
+        libc::syscall(libc::SYS_setfsuid, user.uid);
+        // Neither call reports failure, only the id it replaced, so the ids
+        // are read back: one that could not be set is the old one still.
+        let fsgid = libc::syscall(libc::SYS_setfsgid, u32::MAX) as u32;
+        let fsuid = libc::syscall(libc::SYS_setfsuid, u32::MAX) as u32;
+        if fsuid != user.uid || fsgid != user.gid {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                "could not take on the user's filesystem identity",
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// Runs filesystem work off the runtime, as `user` when one is given.
+///
+/// A user's work gets a thread of its own that exits afterwards, never a pool
+/// thread: the identity stays with the thread, and the next task to land on a
+/// pooled one would inherit it.
+async fn blocking<T: Send + 'static>(
+    user: Option<std::sync::Arc<FsUser>>,
+    work: impl FnOnce() -> std::io::Result<T> + Send + 'static,
+) -> Result<std::io::Result<T>, Status> {
+    let Some(user) = user else {
+        return tokio::task::spawn_blocking(work)
+            .await
+            .map_err(|err| Status::internal(format!("file work did not run: {err}")));
+    };
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    std::thread::Builder::new()
+        .name("burrow-as-user".into())
+        .spawn(move || {
+            let result = guest_root().and_then(|root| {
+                USER_ROOT.with(|held| *held.borrow_mut() = Some(root));
+                become_user(&user)?;
+                work()
+            });
+            let _ = tx.send(result);
+        })
+        .map_err(|err| Status::internal(format!("starting file work: {err}")))?;
+    rx.await
+        .map_err(|_| Status::internal("file work ended without a result"))
+}
+
 /// Bytes per streamed chunk.
 ///
 /// Matches HTTP/2's default flow-control window. 256 KiB was tried and showed
@@ -184,6 +278,12 @@ pub async fn upload(
     }
     let path = std::mem::take(&mut first.path);
     let mode = if first.mode == 0 { 0o644 } else { first.mode };
+    let user = fs_user(&first.user)?;
+    if user.is_some() && !first.owner.is_empty() {
+        return Err(Status::invalid_argument(
+            "an upload made as a user is that user's; it takes no owner",
+        ));
+    }
     // Resolved before anything is created: an owner who does not exist must
     // fail the upload as a request, not leave a root-owned file behind.
     let owner = if first.owner.is_empty() {
@@ -197,28 +297,40 @@ pub async fn upload(
         && !parent.as_os_str().is_empty()
     {
         let parent = parent.to_path_buf();
-        tokio::task::spawn_blocking(move || create_dir_all_no_symlinks(&parent, owner))
-            .await
-            .map_err(|err| Status::internal(format!("mkdir did not run: {err}")))?
-            .map_err(|err| io_status("create parent of", &path, err))?;
+        blocking(user.clone(), move || {
+            create_dir_all_no_symlinks(&parent, owner)
+        })
+        .await?
+        .map_err(|err| io_status("create parent of", &path, err))?;
     }
 
     // O_EXCL rather than a stat first: there is no window in which a file
     // appearing between the check and the open gets truncated anyway.
-    let flags = OFlag::O_WRONLY
-        | OFlag::O_CREAT
-        | if first.is_existing_skipped {
-            OFlag::O_EXCL
-        } else {
-            OFlag::O_TRUNC
-        };
+    let is_skipping = first.is_existing_skipped;
+    let is_as_user = user.is_some();
     let open_path = path.clone();
-    let opened = tokio::task::spawn_blocking(move || {
-        open_no_symlinks(&open_path, flags, Mode::from_bits_truncate(0o644))
+    let opened = blocking(user, move || {
+        let created = Mode::from_bits_truncate(0o644);
+        let exclusive = OFlag::O_WRONLY | OFlag::O_CREAT | OFlag::O_EXCL;
+        if is_skipping {
+            return open_no_symlinks(&open_path, exclusive, created).map(|file| (file, true));
+        }
+        if !is_as_user {
+            let flags = OFlag::O_WRONLY | OFlag::O_CREAT | OFlag::O_TRUNC;
+            return open_no_symlinks(&open_path, flags, created).map(|file| (file, true));
+        }
+        // A user may write a file that is not theirs to chmod, so whether
+        // this upload created it decides whether the mode is applied.
+        match open_no_symlinks(&open_path, exclusive, created) {
+            Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => {
+                open_no_symlinks(&open_path, OFlag::O_WRONLY | OFlag::O_TRUNC, Mode::empty())
+                    .map(|file| (file, false))
+            }
+            other => other.map(|file| (file, true)),
+        }
     })
-    .await
-    .map_err(|err| Status::internal(format!("open did not run: {err}")))?;
-    let std_file = match opened {
+    .await?;
+    let (std_file, is_created) = match opened {
         Err(err)
             if first.is_existing_skipped && err.kind() == std::io::ErrorKind::AlreadyExists =>
         {
@@ -250,8 +362,10 @@ pub async fn upload(
     // upload's own open just refused.
     let file = file.into_std().await;
     tokio::task::spawn_blocking(move || {
-        nix::sys::stat::fchmod(&file, Mode::from_bits_truncate(mode))
-            .map_err(std::io::Error::from)?;
+        if is_created {
+            nix::sys::stat::fchmod(&file, Mode::from_bits_truncate(mode))
+                .map_err(std::io::Error::from)?;
+        }
         owner.map_or(Ok(()), |(uid, gid)| fchown(&file, uid, gid))
     })
     .await
@@ -266,13 +380,13 @@ pub async fn upload(
 /// Streams a file out of the sandbox.
 pub async fn download(
     path: String,
+    user: &str,
 ) -> Result<mpsc::Receiver<Result<guestpb::FileChunk, Status>>, Status> {
     let open_path = path.clone();
-    let std_file = tokio::task::spawn_blocking(move || {
+    let std_file = blocking(fs_user(user)?, move || {
         open_no_symlinks(&open_path, OFlag::O_RDONLY, Mode::empty())
     })
-    .await
-    .map_err(|err| Status::internal(format!("open did not run: {err}")))?
+    .await?
     .map_err(|err| io_status("open", &path, err))?;
     let mut file = tokio::fs::File::from_std(std_file);
 
@@ -311,24 +425,20 @@ pub async fn download(
 ///
 /// Entries are described by `lstat`, which `DirEntry::metadata` already uses,
 /// so a symlink inside the directory is reported as the link it is.
-pub async fn list_dir(path: &str) -> Result<guestpb::ListDirResponse, Status> {
+pub async fn list_dir(path: &str, user: &str) -> Result<guestpb::ListDirResponse, Status> {
     let owned = path.to_string();
-    let dir = tokio::task::spawn_blocking(move || open_dir_no_symlinks(&owned))
-        .await
-        .map_err(|err| Status::internal(format!("open did not run: {err}")))?
+    let entries = blocking(fs_user(user)?, move || list_dir_blocking(&owned))
+        .await?
         .map_err(|err| io_status("read_dir", path, err))?;
+    Ok(guestpb::ListDirResponse { entries })
+}
 
-    let mut entries = tokio::fs::read_dir(proc_path(&dir))
-        .await
-        .map_err(|err| io_status("read_dir", path, err))?;
-
+fn list_dir_blocking(path: &str) -> std::io::Result<Vec<guestpb::DirEntry>> {
+    let dir = open_dir_no_symlinks(path)?;
     let mut out = Vec::new();
-    while let Some(entry) = entries
-        .next_entry()
-        .await
-        .map_err(|err| io_status("read_dir", path, err))?
-    {
-        let meta = match entry.metadata().await {
+    for entry in std::fs::read_dir(proc_path(&dir))? {
+        let entry = entry?;
+        let meta = match entry.metadata() {
             Ok(meta) => meta,
             // A file can vanish between listing and stat; skip it rather than
             // failing the whole listing.
@@ -345,7 +455,7 @@ pub async fn list_dir(path: &str) -> Result<guestpb::ListDirResponse, Status> {
     // Held until here: the listing above is only of the checked directory for
     // as long as this descriptor is open.
     drop(dir);
-    Ok(guestpb::ListDirResponse { entries: out })
+    Ok(out)
 }
 
 /// Watches a directory for changes.
@@ -360,28 +470,29 @@ pub async fn watch(
     path: String,
     recursive: bool,
     interval: std::time::Duration,
+    user: &str,
 ) -> Result<mpsc::Receiver<Result<guestpb::WatchEvent, Status>>, Status> {
+    let user = fs_user(user)?;
     // Opened rather than `try_exists`, which follows symlinks: a watch on
     // `/work/peek -> /` would otherwise scan the whole guest and stream every
     // change in it out to the caller.
     {
         let probe = path.clone();
-        tokio::task::spawn_blocking(move || open_dir_no_symlinks(&probe))
-            .await
-            .map_err(|err| Status::internal(format!("open did not run: {err}")))?
+        blocking(user.clone(), move || open_dir_no_symlinks(&probe))
+            .await?
             .map_err(|err| io_status("watch", &path, err))?;
     }
 
     let (tx, rx) = mpsc::channel(CHANNEL_CAPACITY);
     tokio::spawn(async move {
-        let mut previous = scan(&path, recursive).await;
+        let mut previous = scan(&path, recursive, user.clone()).await;
         loop {
             tokio::time::sleep(interval).await;
             // The receiver going away is how a client cancels a watch.
             if tx.is_closed() {
                 return;
             }
-            let current = scan(&path, recursive).await;
+            let current = scan(&path, recursive, user.clone()).await;
 
             for (entry, meta) in &current {
                 let event = match previous.get(entry) {
@@ -430,10 +541,18 @@ struct Fingerprint {
     mtime: Option<std::time::SystemTime>,
 }
 
-async fn scan(root: &str, recursive: bool) -> std::collections::HashMap<String, Fingerprint> {
+/// One poll, as `user` when there is one, so a watch sees no more of the tree
+/// than that user could list.
+async fn scan(
+    root: &str,
+    recursive: bool,
+    user: Option<std::sync::Arc<FsUser>>,
+) -> std::collections::HashMap<String, Fingerprint> {
     let root = root.to_string();
-    tokio::task::spawn_blocking(move || scan_blocking(&root, recursive))
+    blocking(user, move || Ok(scan_blocking(&root, recursive)))
         .await
+        .ok()
+        .and_then(Result::ok)
         .unwrap_or_default()
 }
 
@@ -561,9 +680,9 @@ mod tests {
         std::fs::write(tmp.path("real/secret"), b"x").unwrap();
         std::os::unix::fs::symlink(tmp.path("real"), tmp.path("peek")).unwrap();
 
-        assert!(list_dir(&tmp.path("peek")).await.is_err());
+        assert!(list_dir(&tmp.path("peek"), "").await.is_err());
         // The directory itself still lists.
-        let listed = list_dir(&tmp.path("real")).await.unwrap();
+        let listed = list_dir(&tmp.path("real"), "").await.unwrap();
         assert_eq!(listed.entries.len(), 1);
         assert_eq!(listed.entries[0].name, "secret");
     }

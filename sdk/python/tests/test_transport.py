@@ -40,3 +40,21 @@ def test_an_https_endpoint_needs_no_api_key_opt_in():
 
 def test_no_api_key_at_all_is_never_refused_plaintext_or_not():
     transport(endpoint="orchestrator.example.com:7070")
+
+
+def test_the_route_decides_where_exec_and_files_go():
+    from burrow._transport import Direct, Transport
+
+    direct = Transport(endpoint="localhost:7070")
+    assert isinstance(direct.route("sbx_a"), Direct)
+    relayed = Transport(endpoint="localhost:7070", route="orchestrator")
+    assert relayed.route("sbx_a") is relayed
+
+
+def test_an_unknown_route_is_refused():
+    import pytest
+    from burrow._transport import Transport
+    from burrow.errors import BurrowError
+
+    with pytest.raises(BurrowError):
+        Transport(endpoint="localhost:7070", route="sideways")

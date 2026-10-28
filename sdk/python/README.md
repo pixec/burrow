@@ -60,7 +60,23 @@ unless `tls=False` (or an `http://` scheme) says it is intended.
   policy and cost no exec. Watching has no `os` counterpart, so it stays
   `sandbox.watch`.
 - `sandbox.commands` (`run`, `stream`, `list`, `connect`, `kill`) and
-  `sandbox.pty.create()`, which is `sandbox.terminal`.
+  `sandbox.pty.create()`, which is `sandbox.terminal`. A command outlives the
+  process that started it, and so does every byte it prints, kept in the
+  sandbox the way Docker keeps a container's log. `get_command(cmd_id,
+  from_offset=n)` replays from the offset a reader got to, counting stdout and
+  stderr bytes together, and `send_stdin` feeds a shell whose original stream
+  is long gone. Chunks carry `raw`, the exact bytes, beside `data`, text decoded
+  across chunk boundaries; a `"lost"` chunk says how many bytes a rotating log
+  (`log_max_bytes`, `log_max_files`) dropped. An exit a signal caused reports
+  `exit_signal`. `prune_commands()` removes finished commands and their output,
+  as `docker container prune`.
+
+Exec, attach and file calls go to the node holding the sandbox by default,
+with a token the SDK gets from the orchestrator and reuses until it nears
+expiry; the node has to be reachable from where the SDK runs. Pass
+`route="orchestrator"` (or set `BURROW_ROUTE=orchestrator`) and the
+orchestrator relays them instead. Neither falls back to the other. Everything
+else goes to the orchestrator.
 - `Burrow`: one connection for many sandboxes: `health`, `list`, `get`,
   `audit`, `events`, `nodes`, `drain_node`, and the secrets Sandbox Kits ask
   for by service name: `set_secret`, `list_secrets`, `delete_secret`.

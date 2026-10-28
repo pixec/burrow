@@ -72,6 +72,20 @@ struct Args {
     /// under --data-dir, created on first start.
     #[arg(long, env = "BURROW_SECRETS_KEY_FILE")]
     secrets_key_file: Option<std::path::PathBuf>,
+    /// Ed25519 key, PKCS#8 PEM, that Access tokens are signed with. Every
+    /// replica must use the same one, so with several, mount it from one
+    /// place. Defaults to `access.key` under --data-dir, created on first
+    /// start.
+    #[arg(long, env = "BURROW_ACCESS_KEY_FILE")]
+    access_key_file: Option<std::path::PathBuf>,
+    /// A key nodes accept tokens from but this orchestrator never signs
+    /// with, public PEM or private; repeatable. How the signing key is
+    /// rotated without a token failing: trust the new key on every replica,
+    /// switch --access-key-file to it with the old one trusted here instead,
+    /// and drop the old one an hour later, once every token it signed has
+    /// expired.
+    #[arg(long = "access-trusted-key-file", value_name = "PATH")]
+    access_trusted_key_files: Vec<std::path::PathBuf>,
     /// This replica's own address, which nodes deny to sandboxes alongside
     /// every other replica's. Defaults to what this host's name resolves to,
     /// which in a container or a pod is its own IP. In Kubernetes, set it
@@ -103,6 +117,11 @@ pub struct OrchestratorState {
     /// Credentials Kits ask for by service name, encrypted at rest. `None`
     /// without a durable store, in which case no secret can be bound.
     pub secrets: Option<secrets::Secrets>,
+    /// Signs Access tokens. `None` when the key could not be opened, and
+    /// then IssueAccess is refused and exec and files go through here.
+    pub access: Option<burrow_common::access::Signer>,
+    /// Keys announced alongside the signing key, as `(kid, public key)`.
+    pub access_trusted: Vec<(String, Vec<u8>)>,
     /// Which node holds which snapshot. Snapshots do not travel, so a create
     /// from one has to be placed where it is.
     pub snapshots: snapshots::SnapshotRegistry,
@@ -231,6 +250,7 @@ impl NodeRegistry for NodeRegistryService {
             node_id,
             heartbeat_interval_secs: HEARTBEAT_INTERVAL.as_secs() as u32,
             node_index,
+            access_keys: access_keys(&self.0),
         }))
     }
 
@@ -339,12 +359,28 @@ impl NodeRegistry for NodeRegistryService {
             // denied to every sandbox, and a node cannot know from its own
             // flags which of its peers serves one.
             edge_hosts: self.0.nodes.edge_hosts(),
+            node_hosts: self.0.nodes.node_hosts(),
             control_plane_hosts: self.0.control_plane_hosts.lock().unwrap().clone(),
             sandbox_lease_secs: self.0.sandbox_lease_secs,
             confirmed_sandboxes: applied.confirmed,
             relinquished_sandboxes: applied.relinquished,
+            access_keys: access_keys(&self.0),
         }))
     }
+}
+
+fn access_keys(state: &OrchestratorState) -> Vec<nodepb::AccessKey> {
+    let signing = state
+        .access
+        .iter()
+        .map(|signer| (signer.kid().to_string(), signer.public_key().to_vec()));
+    let mut keys: Vec<nodepb::AccessKey> = signing
+        .chain(state.access_trusted.iter().cloned())
+        .map(|(kid, public_key)| nodepb::AccessKey { kid, public_key })
+        .collect();
+    keys.sort_by(|a, b| a.kid.cmp(&b.kid));
+    keys.dedup_by(|a, b| a.kid == b.kid);
+    keys
 }
 
 /// Rebuilds the orchestrator's view of one node from that node's own listing.
@@ -692,6 +728,24 @@ async fn run(args: Args) -> anyhow::Result<()> {
         None => sandboxes::SandboxRegistry::default(),
     };
 
+    let access_key = args
+        .access_key_file
+        .clone()
+        .unwrap_or_else(|| args.data_dir.join("access.key"));
+    let access_trusted = args
+        .access_trusted_key_files
+        .iter()
+        .map(|path| burrow_common::access::trusted_key(path))
+        .collect::<Result<Vec<_>, _>>()
+        .context("--access-trusted-key-file")?;
+    let access = match burrow_common::access::Signer::open(&access_key) {
+        Ok(signer) => Some(signer),
+        Err(err) => {
+            tracing::error!(%err, "access tokens are unavailable: no usable key");
+            None
+        }
+    };
+
     let sandbox_lease_secs = match args.node_expiry_secs {
         0 => 0,
         // Short of the expiry by a few beats, so a node has stopped resuming
@@ -709,6 +763,8 @@ async fn run(args: Args) -> anyhow::Result<()> {
         store: store.clone(),
         control_plane_hosts: std::sync::Mutex::new(Vec::new()),
         secrets,
+        access,
+        access_trusted,
         snapshots: snapshots::SnapshotRegistry::default(),
         volumes: volumes::VolumeRegistry::default(),
         channels: api::NodeChannels::default(),

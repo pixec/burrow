@@ -210,8 +210,7 @@ The policy rules never see those packets.
 Burrow enforces this itself. Every node denies its sandboxes every edge router
 in the fleet, its own included, and the orchestrator's address as well. The
 orchestrator is denied for its own reason: its API creates and deletes sandboxes
-and routes exec and logs into them, which is a control surface no sandbox may
-reach. The drop is rendered ahead of every accept, the conntrack established
+and routes exec into them, which is a control surface no sandbox may reach. The drop is rendered ahead of every accept, the conntrack established
 accept included, and it matches on destination only, since traffic *from* those
 addresses is how an edge reaches a guest port in the first place. Nodes learn
 which peers serve an edge from the orchestrator on each heartbeat, so turning one
