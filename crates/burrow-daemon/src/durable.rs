@@ -45,6 +45,11 @@ const SCRATCH_IMAGE: &str = "scratch.ext4";
 const TEMPLATE_KERNEL: &str = "vmlinux";
 const TEMPLATE_ROOTFS: &str = "rootfs.ext4";
 
+/// The guest-memory offsets a VM faulted on while it ran, recorded by the
+/// page-fault handler as it exits. Uploaded with the state, so a node adopting
+/// the sandbox fetches what the guest was using before the guest asks for it.
+pub const WORKING_SET: &str = "workingset.bin";
+
 pub const STATE_SUSPENDED: &str = "suspended";
 pub const STATE_RUNNING: &str = "running";
 
@@ -328,6 +333,17 @@ pub async fn upload(
             &workdir.join(burrow_firecracker::SNAPSHOT_FILE),
         )
         .await?;
+    if tokio::fs::try_exists(workdir.join(WORKING_SET))
+        .await
+        .unwrap_or(false)
+    {
+        store
+            .put_file(
+                &generation_key(&id, generation, WORKING_SET),
+                &workdir.join(WORKING_SET),
+            )
+            .await?;
+    }
     for (file, index) in [
         (burrow_firecracker::SNAPSHOT_MEM_FILE, &memory),
         (SCRATCH_IMAGE, &scratch_index),
@@ -458,32 +474,61 @@ pub async fn stage(
     let generation = manifest.generation;
     let missing =
         |file: &str| Status::not_found(format!("sandbox {id}'s stored state is missing {file}"));
-    snapshots
-        .fetch_blob(store, &manifest.kernel_digest, &dest.join(TEMPLATE_KERNEL))
-        .await?;
-    snapshots
-        .fetch_blob(store, &manifest.rootfs_digest, &dest.join(TEMPLATE_ROOTFS))
-        .await?;
+    let started = std::time::Instant::now();
     let vmstate = burrow_firecracker::SNAPSHOT_FILE;
-    store
-        .get_to_file(
-            &generation_key(id, generation, vmstate),
-            &dest.join(vmstate),
-        )
-        .await?
-        .ok_or_else(|| missing(vmstate))?;
-    let scratch_index =
-        crate::snapshot::read_index(store, &index_key(id, generation, SCRATCH_IMAGE))
-            .await?
-            .ok_or_else(|| missing(SCRATCH_IMAGE))?;
-    crate::chunks::get_image(store, &scratch_index, &dest.join(SCRATCH_IMAGE)).await?;
     let memory_file = burrow_firecracker::SNAPSHOT_MEM_FILE;
-    let memory = crate::snapshot::read_index(store, &index_key(id, generation, memory_file))
-        .await?
-        .ok_or_else(|| missing(memory_file))?;
+    // Everything small at once: each is a round trip, and none depends on
+    // another.
+    let (kernel_path, rootfs_path) = (dest.join(TEMPLATE_KERNEL), dest.join(TEMPLATE_ROOTFS));
+    let (vmstate_path, working_set_path) = (dest.join(vmstate), dest.join(WORKING_SET));
+    let vmstate_key = generation_key(id, generation, vmstate);
+    let working_set_key = generation_key(id, generation, WORKING_SET);
+    let scratch_key = index_key(id, generation, SCRATCH_IMAGE);
+    let memory_key = index_key(id, generation, memory_file);
+    let (kernel, rootfs, vmstate_fetched, working_set, scratch_index, memory) = tokio::join!(
+        snapshots.fetch_blob(store, &manifest.kernel_digest, &kernel_path),
+        snapshots.fetch_blob(store, &manifest.rootfs_digest, &rootfs_path),
+        store.get_to_file(&vmstate_key, &vmstate_path),
+        store.get_to_file(&working_set_key, &working_set_path),
+        crate::snapshot::read_index(store, &scratch_key),
+        crate::snapshot::read_index(store, &memory_key),
+    );
+    kernel?;
+    rootfs?;
+    vmstate_fetched?.ok_or_else(|| missing(vmstate))?;
+    let scratch_index = scratch_index?.ok_or_else(|| missing(SCRATCH_IMAGE))?;
+    let memory = memory?.ok_or_else(|| missing(memory_file))?;
+    let working_set = match working_set? {
+        Some(()) => read_offsets(&working_set_path).await,
+        None => Vec::new(),
+    };
+    let fetched_small = started.elapsed();
+
     let hydrator = Hydrator::begin(store.clone(), memory.clone(), &dest.join(memory_file))
         .map_err(|err| Status::internal(format!("preparing guest memory: {err}")))?;
+    // The pages the guest was using, fetched alongside the scratch disk
+    // rather than one fault at a time once it runs. A failure here costs
+    // only faults later, which fetch for themselves. The rest of the image
+    // waits until both are in: it is what the guest does not need yet, and
+    // fetching it alongside them only makes the restore wait longer.
+    let warming = {
+        let hydrator = Arc::clone(&hydrator);
+        tokio::task::spawn_blocking(move || {
+            use burrow_firecracker::PageSource as _;
+            hydrator.ensure_all(&working_set, PAGE)
+        })
+    };
+    let scratch_path = dest.join(SCRATCH_IMAGE);
+    let (scratch, warmed) = tokio::join!(
+        crate::chunks::get_image(store, &scratch_index, &scratch_path),
+        warming
+    );
+    scratch?;
+    if let Ok(Err(err)) = warmed {
+        tracing::warn!(sandbox = %id, %err, "could not fetch the working set ahead of the guest");
+    }
     hydrator.start();
+    let fetched_scratch = started.elapsed();
 
     let io = |what: &str, err: std::io::Error| Status::internal(format!("{what}: {err}"));
     let stamp = |file: &str| Stamp::of(&dest.join(file)).map_err(|err| io(file, err));
@@ -499,7 +544,46 @@ pub async fn stage(
         scratch_index,
     };
     save_local(dest, &local).await?;
+    tracing::info!(
+        sandbox = %id,
+        small_ms = fetched_small.as_millis() as u64,
+        scratch_and_working_set_ms = (fetched_scratch - fetched_small).as_millis() as u64,
+        scratch_bytes = local.scratch_index.stored_bytes(),
+        rest_ms = (started.elapsed() - fetched_scratch).as_millis() as u64,
+        "staged stored state"
+    );
     Ok((vec![memory_file.to_string()], Some(hydrator)))
+}
+
+const PAGE: u64 = 4096;
+
+/// A plan file's offsets: little-endian `u64`s, the page-fault handler's
+/// format. One that cannot be read is empty, since a plan only saves faults.
+async fn read_offsets(path: &Path) -> Vec<u64> {
+    tokio::fs::read(path)
+        .await
+        .unwrap_or_default()
+        .chunks_exact(8)
+        .map(|chunk| u64::from_le_bytes(chunk.try_into().expect("8 bytes")))
+        .collect()
+}
+
+/// Folds an adopted sandbox's working set into its prefetch plan, so the
+/// restore populates both before the guest runs. Written by rename, because
+/// the plan may be a link to the template's.
+pub async fn merge_working_set(workdir: &Path, plan: &str) -> std::io::Result<bool> {
+    let mut offsets = read_offsets(&workdir.join(WORKING_SET)).await;
+    if offsets.is_empty() {
+        return Ok(false);
+    }
+    offsets.extend(read_offsets(&workdir.join(plan)).await);
+    offsets.sort_unstable();
+    offsets.dedup();
+    let bytes: Vec<u8> = offsets.iter().flat_map(|o| o.to_le_bytes()).collect();
+    let temp = workdir.join(format!(".{plan}.merging"));
+    tokio::fs::write(&temp, bytes).await?;
+    tokio::fs::rename(&temp, workdir.join(plan)).await?;
+    Ok(true)
 }
 
 /// Deletes chunks and old generations nothing references any more.

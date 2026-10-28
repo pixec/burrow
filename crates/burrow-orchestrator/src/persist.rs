@@ -30,6 +30,11 @@ pub enum Op {
         sandbox_id: String,
     },
     ReleaseClaims(String),
+    /// `ReleaseClaims`, kept if the sandbox is now placed off this node.
+    ReleaseClaimsUnlessMoved {
+        sandbox_id: String,
+        node_id: String,
+    },
     /// One claim, given up by the holder that took it.
     ReleaseClaim {
         key: String,
@@ -117,6 +122,10 @@ async fn apply(store: &burrow_store::Store, op: &Op) -> burrow_store::Result<()>
             .await
             .map(drop),
         Op::ReleaseClaims(id) => store.release_claims(id).await,
+        Op::ReleaseClaimsUnlessMoved {
+            sandbox_id,
+            node_id,
+        } => store.release_claims_unless_moved(sandbox_id, node_id).await,
         Op::ReleaseClaim { key, holder } => store.release_claim(key, holder).await,
     }
 }
@@ -130,7 +139,7 @@ fn describe(op: &Op) -> &'static str {
         Op::DeleteTombstone(_) => "remove a stored tombstone",
         Op::PruneTombstones(_) => "prune stored tombstones",
         Op::Claim { .. } => "record a name claim",
-        Op::ReleaseClaims(_) => "release a sandbox's claims",
+        Op::ReleaseClaims(_) | Op::ReleaseClaimsUnlessMoved { .. } => "release a sandbox's claims",
         Op::ReleaseClaim { .. } => "release a claim",
     }
 }

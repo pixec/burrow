@@ -935,6 +935,7 @@ impl RunningSandbox {
         &self,
         agent_timeout: std::time::Duration,
         upgrade: Option<&guestconn::GuestUpgrade>,
+        is_stored: bool,
     ) -> Result<(), Status> {
         self.forget_agent().await;
         let mut slot = self.vm.lock().await;
@@ -948,6 +949,7 @@ impl RunningSandbox {
             .durable
             .arriving()
             .map(|h| burrow_firecracker::MemorySource(h));
+        record_working_set(&mut spec, is_stored);
         let vm = MicroVm::restore(spec, true)
             .await
             .map_err(|err| Status::internal(format!("restore failed: {err}")))?;
@@ -1388,6 +1390,10 @@ pub struct SandboxManager {
     /// How long this node may go on resuming durable sandboxes without
     /// hearing from the orchestrator.
     lease: Arc<std::sync::Mutex<NodeLease>>,
+    /// Sandboxes moved off this node whose teardown is still running, each
+    /// gate held until it finishes. A move straight back waits on it, or the
+    /// teardown would take the returning sandbox's directory and lease too.
+    releasing: Arc<std::sync::Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>>,
 }
 
 /// Renewed by every heartbeat the orchestrator answers. Once it runs out the
@@ -1565,6 +1571,7 @@ impl SandboxManager {
             announce: Arc::new(tokio::sync::Notify::new()),
             edge_addresses: Arc::new(std::sync::Mutex::new(Vec::new())),
             lease: Default::default(),
+            releasing: Default::default(),
         }
     }
 
@@ -3629,6 +3636,7 @@ impl SandboxManager {
             spec.prefetch = Some(crate::warm::PREFETCH_PLAN.to_string());
         }
         let boot_spec = spec.clone();
+        record_working_set(&mut spec, self.config.object_store.is_some());
         let started = std::time::Instant::now();
         let spec_ms = started - staged_at - stage_wall_ms;
         let started_vm = if from_warm {
@@ -4381,7 +4389,12 @@ impl SandboxManager {
         // across a chain, since every layer is laid out as the base is. A
         // fork or a snapshot restore would otherwise take those pages one
         // stalled vCPU at a time.
-        if self.link_prefetch_plan(&source.template(), &workdir).await {
+        let linked = self.link_prefetch_plan(&source.template(), &workdir).await;
+        let merged = matches!(source, RestoreSource::Stored { .. })
+            && crate::durable::merge_working_set(&workdir, crate::warm::PREFETCH_PLAN)
+                .await
+                .unwrap_or(false);
+        if linked || merged {
             spec.prefetch = Some(crate::warm::PREFETCH_PLAN.to_string());
         }
         let boot_spec = spec.clone();
@@ -4389,6 +4402,7 @@ impl SandboxManager {
         spec.memory_source = arriving
             .clone()
             .map(|h| burrow_firecracker::MemorySource(h));
+        record_working_set(&mut spec, self.config.object_store.is_some());
 
         let started = std::time::Instant::now();
         match MicroVm::restore(spec, true).await {
@@ -4521,6 +4535,7 @@ impl SandboxManager {
             .resume(
                 self.config.agent_timeout,
                 self.config.guest_upgrade.as_deref(),
+                self.config.object_store.is_some(),
             )
             .await;
         drop(uploading);
@@ -5111,7 +5126,31 @@ impl SandboxManager {
         };
         let record = sandbox.record();
         self.emit(&sandbox, EVENT_STOPPED, "released").await;
-        self.tear_down(sandbox).await?;
+        // Behind the response: the sandbox is out of the map and its state is
+        // in the store, so the node adopting it has nothing to wait for here.
+        let gate = Arc::new(tokio::sync::Mutex::new(()));
+        let held = Arc::clone(&gate)
+            .try_lock_owned()
+            .expect("a new gate is free");
+        self.releasing
+            .lock()
+            .unwrap()
+            .insert(id.to_string(), Arc::clone(&gate));
+        let manager = self.clone();
+        let released = id.to_string();
+        tokio::spawn(async move {
+            if let Err(err) = manager.tear_down(sandbox).await {
+                tracing::warn!(sandbox = released, %err, "could not fully release a moved sandbox");
+            }
+            drop(held);
+            let mut releasing = manager.releasing.lock().unwrap();
+            if releasing
+                .get(&released)
+                .is_some_and(|held| Arc::ptr_eq(held, &gate))
+            {
+                releasing.remove(&released);
+            }
+        });
         tracing::info!(sandbox = id, "sandbox released to the object store");
         Ok(record)
     }
@@ -5145,6 +5184,11 @@ impl SandboxManager {
                 "a sandbox with volumes cannot move: its volumes stay on the node that holds them",
             ));
         }
+        let releasing = self.releasing.lock().unwrap().get(&id).cloned();
+        if let Some(gate) = releasing {
+            drop(gate.lock().await);
+        }
+        let started = std::time::Instant::now();
         let manifest = crate::durable::read_manifest(store, &id)
             .await?
             .ok_or_else(|| {
@@ -5178,9 +5222,11 @@ impl SandboxManager {
                 return Err(Status::already_exists(format!("sandbox {id} exists")));
             }
         }
+        let read = started.elapsed();
         let adopted = self.adopt_inner(store, &manifest, record, node_id).await;
         self.creating.lock().await.remove(&id);
         let (sandbox, from) = adopted?;
+        let restored = started.elapsed();
         // Waited for here, unlike a create: a sandbox whose guest never
         // answers would otherwise be reclaimed as a failed create, and its
         // stored state is the only copy there is. Failing the adopt hands
@@ -5201,6 +5247,7 @@ impl SandboxManager {
             }
             return Err(err);
         }
+        let handshaken = started.elapsed();
 
         self.sandboxes
             .lock()
@@ -5212,7 +5259,14 @@ impl SandboxManager {
         let record = sandbox.record();
         self.persist(&sandbox).await;
         self.sync_firewall().await?;
-        tracing::info!(from, "sandbox adopted from the object store");
+        tracing::info!(
+            from,
+            manifest_ms = read.as_millis() as u64,
+            restore_ms = (restored - read).as_millis() as u64,
+            handshake_ms = (handshaken - restored).as_millis() as u64,
+            total_ms = started.elapsed().as_millis() as u64,
+            "sandbox adopted from the object store"
+        );
         Ok(record)
     }
 
@@ -5301,6 +5355,20 @@ impl SandboxManager {
                 tracing::warn!(%err, "could not collect unreferenced stored state");
             }
         }
+    }
+}
+
+/// Has the page-fault handler record what the guest touches, for a sandbox
+/// whose state goes to the object store. Only where the handler serves memory
+/// anyway: asking for a recording turns it on, and for a single snapshot file
+/// the kernel serves memory more cheaply.
+fn record_working_set(spec: &mut burrow_firecracker::MicroVmSpec, is_stored: bool) {
+    let is_served = spec.is_memory_lazy
+        || spec.memory_chain.len() > 1
+        || spec.prefetch.is_some()
+        || spec.memory_source.is_some();
+    if is_stored && is_served {
+        spec.record_prefetch = Some(crate::durable::WORKING_SET.to_string());
     }
 }
 

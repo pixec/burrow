@@ -309,6 +309,28 @@ impl SandboxRegistry {
         self.cache(row)
     }
 
+    /// Re-reads one sandbox from the store and caches what it says, for a
+    /// replica about to act on a placement another replica may have changed
+    /// since the last reload. A move does that, and a second is long enough
+    /// for the caller to come back through this replica.
+    ///
+    /// Like [`reload`](Self::reload), the row is dropped if this replica has
+    /// queued a write since reading it.
+    pub async fn refresh(&self, id: &str) -> Option<common::Sandbox> {
+        let (Some(store), Some(writer)) = (&self.store, &self.writer) else {
+            return self.get(id);
+        };
+        let mark = writer.flush().await;
+        let row = store.get_placement(id).await.ok().flatten();
+        let mut sandboxes = self.sandboxes.lock().unwrap();
+        if writer.enqueued() != mark {
+            return sandboxes.get(id).cloned();
+        }
+        let sandbox = decode(&row?.record)?;
+        sandboxes.insert(sandbox.id.clone(), sandbox.clone());
+        Some(sandbox)
+    }
+
     fn cache(&self, row: burrow_store::PlacementRow) -> Option<common::Sandbox> {
         let sandbox = decode(&row.record)?;
         self.sandboxes
@@ -631,7 +653,10 @@ impl SandboxRegistry {
         sandboxes.retain(|id, s| {
             let keep = s.node_id != node_id;
             if !keep && !reported_ids.contains(id) {
-                self.write(crate::persist::Op::ReleaseClaims(id.clone()));
+                self.write(crate::persist::Op::ReleaseClaimsUnlessMoved {
+                    sandbox_id: id.clone(),
+                    node_id: node_id.to_string(),
+                });
             }
             keep
         });

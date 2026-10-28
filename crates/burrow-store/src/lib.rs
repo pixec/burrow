@@ -1145,6 +1145,23 @@ impl Store {
         Ok(())
     }
 
+    /// [`release_claims`](Self::release_claims), unless the sandbox is placed
+    /// anywhere but `node_id`. A node that stops reporting a sandbox may only
+    /// mean it moved, and a replica that has not caught up with the move
+    /// would otherwise free a name that is still in use.
+    pub async fn release_claims_unless_moved(&self, sandbox_id: &str, node_id: &str) -> Result<()> {
+        on_pool!(self, pool => sqlx::query(
+            "DELETE FROM claims WHERE sandbox_id=$1
+               AND NOT EXISTS (SELECT 1 FROM placements WHERE id=$1 AND node_id<>$2)",
+        )
+            .bind(sandbox_id)
+            .bind(node_id)
+            .execute(pool)
+            .await
+            .map(drop))?;
+        Ok(())
+    }
+
     /// Drops claims older than `before` held by sandboxes with no placement:
     /// a create that a replica abandoned by dying half way through.
     pub async fn sweep_claims(&self, before: i64) -> Result<usize> {
@@ -1659,6 +1676,30 @@ mod tests {
         let left = store.list_placements().await.unwrap();
         assert_eq!(left.len(), 1);
         assert_eq!(left[0].node_id, "n2");
+    }
+
+    #[tokio::test]
+    async fn claims_of_a_sandbox_that_moved_are_kept() {
+        let store = Store::open_in_memory().await.unwrap();
+        for (id, node) in [("moved", "n2"), ("gone", "n1")] {
+            store.claim(&format!("name:{id}"), id, 1).await.unwrap();
+            store
+                .put_placement(&PlacementRow {
+                    id: id.into(),
+                    node_id: node.into(),
+                    record: Vec::new(),
+                })
+                .await
+                .unwrap();
+        }
+        for id in ["moved", "gone"] {
+            store.release_claims_unless_moved(id, "n1").await.unwrap();
+        }
+        assert_eq!(
+            store.claim_holder("name:moved").await.unwrap().as_deref(),
+            Some("moved")
+        );
+        assert_eq!(store.claim_holder("name:gone").await.unwrap(), None);
     }
 
     /// A delete accepted while the node was down has to outlive the process

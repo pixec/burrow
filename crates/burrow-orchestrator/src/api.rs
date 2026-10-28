@@ -504,7 +504,15 @@ impl ApiService {
     /// change across re-registration. The channel for a given address is
     /// reused; see [`NodeChannels`].
     async fn node_for(&self, sandbox_id: &str) -> Result<NodeClient, Status> {
-        let node_id = self.node_of(sandbox_id)?;
+        let mut node_id = self.node_of(sandbox_id)?;
+        // Beside other replicas the cache can be a second behind a move made
+        // through one of them, naming a node that has already let go.
+        let is_replicated = self.0.control_plane_hosts.lock().unwrap().len() > 1;
+        if (node_id.is_empty() || is_replicated)
+            && let Some(sandbox) = self.0.sandboxes.refresh(sandbox_id).await
+        {
+            node_id = sandbox.node_id;
+        }
         if node_id.is_empty() {
             return Err(Status::failed_precondition(format!(
                 "sandbox {sandbox_id} is suspended with its state in the object store, \
@@ -782,13 +790,12 @@ impl ApiService {
     ///
     /// `node_id` names the destination outright; otherwise it is placed like
     /// a create, on hardware carrying `node_labels` and able to restore what
-    /// the sandbox's state was written on, passing over `excluded`.
+    /// the sandbox's state was written on.
     async fn adopt(
         &self,
         sandbox: common::Sandbox,
         node_id: &str,
         node_labels: HashMap<String, String>,
-        excluded: Option<&str>,
     ) -> Result<common::Sandbox, Status> {
         let _adoption = self
             .0
@@ -796,38 +803,9 @@ impl ApiService {
             .claim_adoption(&sandbox.id)
             .await
             .map_err(Status::aborted)?;
-        let resources = sandbox
-            .policy
-            .as_ref()
-            .and_then(|p| p.resources)
-            .unwrap_or_default();
-        let networks: Vec<String> = sandbox
-            .policy
-            .iter()
-            .flat_map(|p| p.networks.iter())
-            .map(|m| m.network.clone())
-            .filter(|name| !name.is_empty())
-            .collect();
-        let want = crate::registry::Placement {
-            template: sandbox.template.clone(),
-            prefer_node: self.0.sandboxes.node_hosting_networks(&networks),
-            is_mesh_available: self.0.nodes.is_mesh_available(""),
-            vcpus: resources.vcpus.max(1),
-            mem_mib: match resources.mem_mib {
-                0 => 512,
-                mem => mem as u64,
-            },
-            // The kernel and rootfs travel with the state.
-            is_template_transfer_allowed: true,
-            node_labels,
-            arch: sandbox.arch.clone(),
-            firecracker_version: sandbox.firecracker_version.clone(),
-        };
+        let want = self.adoption_placement(&sandbox, node_labels);
         let (target, placed) = if node_id.is_empty() {
-            let target = self
-                .place_avoiding(&want, excluded.into_iter().map(str::to_string).collect())
-                .await
-                .map_err(placement_status)?;
+            let target = self.place(&want).await.map_err(placement_status)?;
             let placed = self.place_guard(&target, &want);
             (target, Some(placed))
         } else {
@@ -871,6 +849,11 @@ impl ApiService {
             placed.keep();
         }
         self.0.sandboxes.insert(adopted.clone());
+        // Written through before the caller hears of it, so their next call
+        // finds the sandbox here whichever replica it reaches.
+        if let Some(writer) = self.0.sandboxes.writer() {
+            writer.flush().await;
+        }
         tracing::info!(
             sandbox = adopted.id,
             node = target,
@@ -879,11 +862,51 @@ impl ApiService {
         Ok(adopted)
     }
 
+    /// What a node needs to take up `sandbox` from the object store.
+    fn adoption_placement(
+        &self,
+        sandbox: &common::Sandbox,
+        node_labels: HashMap<String, String>,
+    ) -> crate::registry::Placement {
+        let resources = sandbox
+            .policy
+            .as_ref()
+            .and_then(|p| p.resources)
+            .unwrap_or_default();
+        let networks: Vec<String> = sandbox
+            .policy
+            .iter()
+            .flat_map(|p| p.networks.iter())
+            .map(|m| m.network.clone())
+            .filter(|name| !name.is_empty())
+            .collect();
+        crate::registry::Placement {
+            template: sandbox.template.clone(),
+            prefer_node: self.0.sandboxes.node_hosting_networks(&networks),
+            is_mesh_available: self.0.nodes.is_mesh_available(""),
+            vcpus: resources.vcpus.max(1),
+            mem_mib: match resources.mem_mib {
+                0 => 512,
+                mem => mem as u64,
+            },
+            // The kernel and rootfs travel with the state.
+            is_template_transfer_allowed: true,
+            node_labels,
+            arch: sandbox.arch.clone(),
+            firecracker_version: sandbox.firecracker_version.clone(),
+        }
+    }
+
     /// The unplaced sandbox `id` names, if that is what it is.
-    fn unplaced(&self, id: &str) -> Option<common::Sandbox> {
+    ///
+    /// A cached record saying so is checked against the store first: it may
+    /// be from before another replica moved the sandbox onto a node.
+    async fn unplaced(&self, id: &str) -> Option<common::Sandbox> {
+        self.0.sandboxes.get(id).filter(|s| s.node_id.is_empty())?;
         self.0
             .sandboxes
-            .get(id)
+            .refresh(id)
+            .await
             .filter(|sandbox| sandbox.node_id.is_empty())
     }
 
@@ -1332,9 +1355,9 @@ impl Burrow for ApiService {
         req: Request<api::SandboxRef>,
     ) -> Result<Response<common::Sandbox>, Status> {
         let id = self.resolve(&req.into_inner().id).await;
-        if let Some(sandbox) = self.unplaced(&id) {
+        if let Some(sandbox) = self.unplaced(&id).await {
             return Ok(Response::new(
-                self.adopt(sandbox, "", HashMap::new(), None).await?,
+                self.adopt(sandbox, "", HashMap::new()).await?,
             ));
         }
         let mut client = self.node_for(&id).await?;
@@ -1365,9 +1388,9 @@ impl Burrow for ApiService {
         req: Request<api::SandboxRef>,
     ) -> Result<Response<common::Sandbox>, Status> {
         let id = self.resolve(&req.into_inner().id).await;
-        if let Some(sandbox) = self.unplaced(&id) {
+        if let Some(sandbox) = self.unplaced(&id).await {
             return Ok(Response::new(
-                self.adopt(sandbox, "", HashMap::new(), None).await?,
+                self.adopt(sandbox, "", HashMap::new()).await?,
             ));
         }
         let mut client = self.node_for(&id).await?;
@@ -1580,15 +1603,16 @@ impl Burrow for ApiService {
         let id = self
             .resolve(&req.r#ref.map(|r| r.id).unwrap_or_default())
             .await;
-        let current = self
+        // Read from the store rather than the cache: the sandbox may have
+        // moved through another replica in the last second.
+        let mut current = self
             .0
             .sandboxes
-            .get(&id)
+            .refresh(&id)
+            .await
             .ok_or_else(|| Status::not_found(format!("no sandbox {id}")))?;
         if current.node_id.is_empty() {
-            let moved = self
-                .adopt(current, &req.node_id, req.node_labels, None)
-                .await?;
+            let moved = self.adopt(current, &req.node_id, req.node_labels).await?;
             return Ok(Response::new(moved));
         }
         let source = current.node_id.clone();
@@ -1609,14 +1633,32 @@ impl Burrow for ApiService {
                 "sandbox {id} mounts volumes, which are node-local and do not move"
             )));
         }
-        // Checked up front too, so a move that has nowhere to go does not
-        // suspend the sandbox on the way to finding that out.
-        if !req.node_id.is_empty() && self.0.nodes.endpoint(&req.node_id).is_none() {
+        if current.arch.is_empty() {
+            let info = self.0.nodes.info(&source).unwrap_or_default();
+            current.arch = info.arch;
+            current.firecracker_version = info.firecracker_version;
+        }
+        // The destination is chosen before anything is suspended, so a move
+        // that has nowhere to go leaves the sandbox running where it is.
+        let placed = if req.node_id.is_empty() {
+            let want = self.adoption_placement(&current, req.node_labels.clone());
+            let target = self
+                .place_avoiding(&want, std::collections::HashSet::from([source.clone()]))
+                .await
+                .map_err(placement_status)?;
+            let guard = self.place_guard(&target, &want);
+            Some((target, guard))
+        } else if self.0.nodes.endpoint(&req.node_id).is_none() {
             return Err(Status::unavailable(format!(
                 "node {} is unreachable",
                 req.node_id
             )));
-        }
+        } else {
+            None
+        };
+        let target = placed
+            .as_ref()
+            .map_or_else(|| req.node_id.clone(), |(target, _)| target.clone());
         let mut client = self.node_for(&id).await?;
         let released = client
             .release_sandbox(nodepb::NodeSandboxRef {
@@ -1633,14 +1675,14 @@ impl Burrow for ApiService {
             ..released.clone()
         });
         if released.arch.is_empty() {
-            let info = self.0.nodes.info(&source).unwrap_or_default();
-            released.arch = info.arch;
-            released.firecracker_version = info.firecracker_version;
+            released.arch = current.arch;
+            released.firecracker_version = current.firecracker_version;
         }
         tracing::info!(sandbox = id, node = source, "sandbox released for a move");
-        let moved = self
-            .adopt(released, &req.node_id, req.node_labels, Some(&source))
-            .await?;
+        let moved = self.adopt(released, &target, req.node_labels).await?;
+        if let Some((_, guard)) = placed {
+            guard.keep();
+        }
         Ok(Response::new(moved))
     }
 

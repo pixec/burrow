@@ -671,26 +671,29 @@ fn copy_page(fd: RawFd, region: &RegionMapping, page: u64, layers: &[Layer]) -> 
     if let Some(source) = &layer.source {
         source.ensure(offset, region.page_size as u64)?;
     }
-    let mut arg = UffdioCopy {
-        dst: page,
-        src: layer.backing.addr as u64 + offset,
-        len: region.page_size as u64,
-        mode: 0,
-        copy: 0,
-    };
-    // SAFETY: `fd` is the userfaultfd and `arg` matches `struct uffdio_copy`.
-    if unsafe { libc::ioctl(fd, UFFDIO_COPY as _, &mut arg) } == 0 {
-        return Ok(());
-    }
-    let err = io::Error::last_os_error();
-    match err.raw_os_error() {
-        // Another thread faulted the same page first; the guest is unblocked
-        // either way.
-        Some(libc::EEXIST) => Ok(()),
-        // A remove event overtook this fault in the queue. The refaulted
-        // address comes back around, so dropping this attempt is correct.
-        Some(libc::EAGAIN) => Ok(()),
-        _ => Err(err),
+    loop {
+        let mut arg = UffdioCopy {
+            dst: page,
+            src: layer.backing.addr as u64 + offset,
+            len: region.page_size as u64,
+            mode: 0,
+            copy: 0,
+        };
+        // SAFETY: `fd` is the userfaultfd and `arg` matches `struct uffdio_copy`.
+        if unsafe { libc::ioctl(fd, UFFDIO_COPY as _, &mut arg) } == 0 {
+            return Ok(());
+        }
+        let err = io::Error::last_os_error();
+        match err.raw_os_error() {
+            // Another thread faulted the same page first; the guest is
+            // unblocked either way.
+            Some(libc::EEXIST) => return Ok(()),
+            // The address space changed under the copy, which filled nothing
+            // and woke nobody. A vCPU stalled on this page stays stalled
+            // until it is filled, so the copy is tried again.
+            Some(libc::EAGAIN) => continue,
+            _ => return Err(err),
+        }
     }
 }
 
@@ -704,14 +707,21 @@ fn zero_range(fd: RawFd, start: u64, end: u64) -> io::Result<()> {
         mode: 0,
         zeropage: 0,
     };
-    // SAFETY: `fd` is the userfaultfd and `arg` matches `struct uffdio_zeropage`.
-    if unsafe { libc::ioctl(fd, UFFDIO_ZEROPAGE as _, &mut arg) } == 0 {
-        return Ok(());
-    }
-    let err = io::Error::last_os_error();
-    match err.raw_os_error() {
-        Some(libc::EEXIST) | Some(libc::EAGAIN) => Ok(()),
-        _ => Err(err),
+    loop {
+        // SAFETY: `fd` is the userfaultfd and `arg` matches `struct uffdio_zeropage`.
+        if unsafe { libc::ioctl(fd, UFFDIO_ZEROPAGE as _, &mut arg) } == 0 {
+            return Ok(());
+        }
+        let err = io::Error::last_os_error();
+        match err.raw_os_error() {
+            Some(libc::EEXIST) => return Ok(()),
+            // As for a copy: nothing was filled, so it is tried again.
+            Some(libc::EAGAIN) => {
+                arg.zeropage = 0;
+                continue;
+            }
+            _ => return Err(err),
+        }
     }
 }
 
