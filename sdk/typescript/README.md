@@ -471,8 +471,8 @@ for (const command of await sandbox.listCommands()) {
 }
 ```
 
-Output is kept the way Docker keeps a container's log: all of it, on the
-sandbox's own disk, for as long as the command is listed. A command that would
+Output is kept the way Docker keeps a container's log: all of it, on the node
+rather than in the sandbox, for as long as the command is listed. A command that would
 print more than you want kept can rotate instead, as Docker's `max-size` and
 `max-file`:
 

@@ -51,6 +51,8 @@ pub struct NodeConfig {
     /// Appended to every guest kernel command line.
     pub extra_boot_args: String,
     pub agent_timeout: std::time::Duration,
+    /// How a command's log rotates when its exec does not say.
+    pub command_log_rotation: burrow_common::cmdlog::Rotation,
     /// cgroup2 mount point; `None` disables resource limits entirely.
     pub cgroup_root: Option<PathBuf>,
     pub is_resource_limits_required: bool,
@@ -107,6 +109,12 @@ impl NodeConfig {
             Some(jail) => jail.chroot_for(id),
             None => self.data_dir.join("sandboxes").join(id),
         }
+    }
+
+    /// Where a sandbox's command output is kept: beside its directory rather
+    /// than in it, since under the jailer that is the VMM's own root.
+    fn command_logs_dir(&self, id: &str) -> PathBuf {
+        self.data_dir.join("command-logs").join(id)
     }
 }
 
@@ -364,6 +372,7 @@ impl<'a> Provisioning<'a> {
         self.manager.release_lease(&self.id).await;
         self.manager.volumes.release_all(&self.id);
         let _ = tokio::fs::remove_dir_all(&self.workdir).await;
+        let _ = tokio::fs::remove_dir_all(self.manager.config.command_logs_dir(&self.id)).await;
         self.is_kept = true;
         err
     }
@@ -511,6 +520,49 @@ fn spawn_handshake(
     });
 }
 
+/// What the guest calls the feed of command output it keeps for the host.
+pub const OUTPUT_FEED: &str = "output-feed";
+
+/// Writes the guest's command output to the node's logs as it arrives,
+/// confirming each frame so the guest can let go of it. Holds the sandbox only
+/// long enough to reach its agent, so a deleted one is not kept alive.
+async fn feed(
+    sandbox: std::sync::Weak<RunningSandbox>,
+    logs: &crate::cmdlogs::CommandLogs,
+) -> Result<(), Status> {
+    let mut agent = {
+        let Some(sandbox) = sandbox.upgrade() else {
+            return Ok(());
+        };
+        if !sandbox.agent_has(OUTPUT_FEED).await? {
+            return Ok(());
+        }
+        sandbox.reach_agent().await?
+    };
+    let (acks, inbound) = tokio::sync::mpsc::channel(64);
+    let _ = acks
+        .send(burrow_proto::guest::v1::FeedAck {
+            seq: 0,
+            positions: logs.positions(),
+        })
+        .await;
+    let mut frames = agent
+        .feed(tokio_stream::wrappers::ReceiverStream::new(inbound))
+        .await?
+        .into_inner();
+    while let Some(frame) = frames.message().await? {
+        let seq = frame.seq;
+        logs.append(frame);
+        // Acks are cumulative, so one dropped for want of room is covered by
+        // the next.
+        let _ = acks.try_send(burrow_proto::guest::v1::FeedAck {
+            seq,
+            positions: Vec::new(),
+        });
+    }
+    Ok(())
+}
+
 pub struct RunningSandbox {
     /// Fixed for the sandbox's life, and held outside the record because the
     /// record is rebuilt from policy while these two never change.
@@ -570,6 +622,8 @@ pub struct RunningSandbox {
     /// The session opened by the VM currently running, if any.
     session: std::sync::Mutex<Option<String>>,
     workdir: PathBuf,
+    /// Every command's output, as the guest feeds it.
+    pub logs: Arc<crate::cmdlogs::CommandLogs>,
     /// Deadline every unary call to this sandbox's agent runs under.
     ///
     /// Carried on the sandbox rather than passed in because [`Self::agent`] is
@@ -728,6 +782,11 @@ impl RunningSandbox {
         // orchestrator's own bookkeeping, which must not keep an otherwise
         // idle sandbox alive.
         self.touch();
+        self.reach_agent().await
+    }
+
+    /// [`Self::agent`] without counting as use, for the node's own traffic.
+    async fn reach_agent(&self) -> Result<GuestClient<Channel>, Status> {
         if !self.is_running() {
             return Err(Status::failed_precondition(
                 "sandbox is suspended; resume it first",
@@ -797,7 +856,7 @@ impl RunningSandbox {
     /// Whether the agent says it supports `feature`. An agent that predates
     /// the list says nothing, which reads as no.
     pub async fn agent_has(&self, feature: &str) -> Result<bool, Status> {
-        let mut agent = self.agent().await?;
+        let mut agent = self.reach_agent().await?;
         let mut features = self.agent_features.lock().await;
         if features.is_none() {
             let health = agent
@@ -809,6 +868,22 @@ impl RunningSandbox {
         Ok(features
             .as_ref()
             .is_some_and(|held| held.iter().any(|f| f == feature)))
+    }
+
+    /// Starts draining the guest's output feed into this sandbox's logs, if
+    /// nothing is yet. Ends with the VM; the next call starts it again.
+    pub fn ensure_feed(self: &Arc<Self>) {
+        if !self.is_running() || !self.logs.claim_feed() {
+            return;
+        }
+        let weak = Arc::downgrade(self);
+        let logs = Arc::clone(&self.logs);
+        tokio::spawn(async move {
+            if let Err(err) = feed(weak, &logs).await {
+                tracing::debug!(%err, "command output feed ended");
+            }
+            logs.release_feed();
+        });
     }
 
     /// Snapshots to disk and stops the VMM. The sandbox keeps its address,
@@ -1064,6 +1139,8 @@ impl RunningSandbox {
                 "sandbox is not stopped; resume a suspended one instead",
             ));
         }
+        // The guest starts its command ids over.
+        self.logs.clear();
         let vm = MicroVm::boot(spec.clone())
             .await
             .map_err(|err| Status::internal(format!("boot failed: {err}")))?;
@@ -1294,12 +1371,13 @@ impl RestoreSource<'_> {
         &self,
         snapshots: &crate::snapshot::SnapshotStore,
         dest: &Path,
+        logs_dir: &Path,
     ) -> Result<(Vec<String>, Option<Arc<crate::chunks::Hydrator>>), Status> {
         match self {
             Self::Sandbox(source) => Ok((source.stage_fork(dest).await?, None)),
             Self::Snapshot { id, .. } => snapshots.stage_into(id, dest).await,
             Self::Stored { store, manifest } => {
-                crate::durable::stage(store, snapshots, manifest, dest).await
+                crate::durable::stage(store, snapshots, manifest, dest, logs_dir).await
             }
         }
     }
@@ -1937,6 +2015,7 @@ impl SandboxManager {
             {
                 sandbox.absorb_cpu(vm);
             }
+            sandbox.ensure_feed();
         }
     }
 
@@ -2093,6 +2172,10 @@ impl SandboxManager {
                 usage: std::sync::Mutex::new(usage),
                 session: std::sync::Mutex::new(None),
                 durable: Default::default(),
+                logs: Arc::new(crate::cmdlogs::CommandLogs::new(
+                    &self.config.command_logs_dir(&row.id),
+                    self.config.command_log_rotation,
+                )),
                 workdir,
                 lease,
                 tap: row.tap.clone(),
@@ -2178,6 +2261,11 @@ impl SandboxManager {
                 known.iter().map(|id| jail.dir_for(id)).collect(),
             ));
         }
+        let logs_root = self.config.data_dir.join("command-logs");
+        roots.push((
+            logs_root.clone(),
+            known.iter().map(|id| logs_root.join(id)).collect(),
+        ));
 
         let mut removed = 0;
         for (root, live) in roots {
@@ -3899,6 +3987,10 @@ impl SandboxManager {
             usage: std::sync::Mutex::new(Usage::default()),
             session: std::sync::Mutex::new(None),
             durable: Default::default(),
+            logs: Arc::new(crate::cmdlogs::CommandLogs::new(
+                &self.config.command_logs_dir(&record.id),
+                self.config.command_log_rotation,
+            )),
             workdir,
             lease,
             tap: tap_name,
@@ -4344,7 +4436,13 @@ impl SandboxManager {
             tokio::fs::create_dir_all(&workdir)
                 .await
                 .map_err(|err| Status::internal(format!("creating the workdir: {err}")))?;
-            let (chain, arriving) = source.stage_into(&self.snapshots, &workdir).await?;
+            // A fork or a snapshot starts with no output; an adopted sandbox
+            // brings its own.
+            let logs_dir = self.config.command_logs_dir(&id);
+            let _ = tokio::fs::remove_dir_all(&logs_dir).await;
+            let (chain, arriving) = source
+                .stage_into(&self.snapshots, &workdir, &logs_dir)
+                .await?;
             // Linked in the same shape as a create's, so the guest sees the
             // same devices in the same order as the handshake describes.
             for (index, mount) in crate::volume::block_mounts(&policy.volumes) {
@@ -4538,6 +4636,10 @@ impl SandboxManager {
             usage: std::sync::Mutex::new(Usage::default()),
             session: std::sync::Mutex::new(None),
             durable: Default::default(),
+            logs: Arc::new(crate::cmdlogs::CommandLogs::new(
+                &self.config.command_logs_dir(&id),
+                self.config.command_log_rotation,
+            )),
             workdir,
             lease,
             tap: tap_name,
@@ -4720,6 +4822,7 @@ impl SandboxManager {
     /// map. What the object store holds is the caller's business.
     async fn tear_down(&self, sandbox: Arc<RunningSandbox>) -> Result<(), Status> {
         let id = &sandbox.id().to_string();
+        sandbox.logs.close();
         if let Some(hydrator) = sandbox.durable.arriving() {
             hydrator.detach(&sandbox.workdir.join(burrow_firecracker::SNAPSHOT_MEM_FILE));
         }
@@ -4774,6 +4877,7 @@ impl SandboxManager {
         if let Err(err) = tokio::fs::remove_dir_all(&workdir).await {
             tracing::warn!(sandbox = id, %err, "failed to remove sandbox directory");
         }
+        let _ = tokio::fs::remove_dir_all(self.config.command_logs_dir(id)).await;
         rendered
     }
 }
@@ -4883,7 +4987,14 @@ impl SandboxManager {
                 // The base of a chain that arrived from the store is read
                 // directly here, so it has to have arrived.
                 sandbox.durable.settle_memory().await;
-                crate::durable::upload(store, &sandbox.workdir, &chain, draft, previous.as_ref())
+                crate::durable::upload(
+                    store,
+                    &sandbox.workdir,
+                    sandbox.logs.dir(),
+                    &chain,
+                    draft,
+                    previous.as_ref(),
+                )
                     .await
             } => uploaded?,
         };
@@ -5638,6 +5749,7 @@ pub(crate) mod tests {
                 firecracker_bin: "/nonexistent/firecracker".into(),
                 extra_boot_args: String::new(),
                 agent_timeout: std::time::Duration::from_millis(1),
+                command_log_rotation: Default::default(),
                 cgroup_root: None,
                 is_resource_limits_required: false,
                 is_memory_lazy: false,
@@ -6059,6 +6171,10 @@ pub(crate) mod tests {
             usage: std::sync::Mutex::new(Usage::default()),
             session: std::sync::Mutex::new(None),
             durable: Default::default(),
+            logs: Arc::new(crate::cmdlogs::CommandLogs::new(
+                &workdir,
+                Default::default(),
+            )),
             workdir,
             tap: tap::tap_name(&lease),
             lease,
@@ -6196,6 +6312,10 @@ pub(crate) mod tests {
             usage: std::sync::Mutex::new(Usage::default()),
             session: std::sync::Mutex::new(None),
             durable: Default::default(),
+            logs: Arc::new(crate::cmdlogs::CommandLogs::new(
+                &workdir,
+                Default::default(),
+            )),
             workdir,
             tap: tap::tap_name(&lease),
             lease,

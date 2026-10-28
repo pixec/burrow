@@ -1393,19 +1393,39 @@ running, stdin still open. Only an explicit stdin EOF closes it.
 and signals, so a shell started by a process that has since gone takes input
 from the next one.
 
-Every byte of a command's output is kept, the way Docker keeps a container's
-log. The agent writes it to a log on the guest's own disk, under
-`/var/lib/burrow/commands`, readable by root alone, and keeps it for as long as
-the command is listed. Nothing is evicted by count or age: `PruneCommands`, or
-`burrow prune`, removes finished commands and their logs, as `docker container
-prune` does. A fresh boot clears them. An exec can bound its log instead, as
-Docker's `max-size` and `max-file` do: `log_max_bytes` per file, and
-`log_max_files` files kept, the oldest dropped first.
+Every byte of a command's output is kept, and kept where Docker keeps a
+container's log: on the host, out of the sandbox's reach. The guest cannot
+read, rewrite or fill it, and a sandbox's disk holds only what the sandbox
+wrote. The agent sends every frame over a `Feed` stream to the node, which
+writes one log per command under `<data-dir>/command-logs/<sandbox>/`, root
+only, and outside the jail the VMM runs in. The agent holds a frame until the
+node confirms writing it, up to 16 MiB, so output produced while the node is
+not reading, across a daemon restart say, is sent when it reconnects; past
+that the oldest output goes first, and readers are told how much. Exits are
+never dropped.
+
+Logs travel with the sandbox. Each suspend uploads them with the rest of its
+durable state, as chunked images, so a log that only grew uploads only its new
+chunks, and a move or an adoption brings them to the new node. A fork or a
+restore from a snapshot starts with none.
+
+Nothing is evicted by count or age: `PruneCommands`, or `burrow prune`, removes
+finished commands and their logs, as `docker container prune` does, and
+deleting the sandbox removes the rest. A cold boot clears them, since the
+guest's command ids start over. Rotation follows Docker's `max-size` and
+`max-file`: an exec can ask for `log_max_bytes` per file and `log_max_files`
+files kept, the oldest dropped first, and `burrowd serve --command-log-max-size`
+and `--command-log-max-files` set the node's default for execs that do not ask.
+Unset, logs are unbounded, as Docker's `json-file` driver is.
+
+A command that has finished replays from the node alone, so `burrow logs`
+works on a suspended sandbox. Following a running one, or one whose log has
+not yet caught up, needs the guest.
 
 Output is counted by offset, stdout and stderr bytes together from the
 command's start. An attacher passes the offset it got to and is sent exactly
-what followed, from the log and then live; one that falls behind the live feed
-catches up from the log rather than losing frames. Output it cannot have is
+what followed, from the node's log and then live as the node writes it; one
+that falls behind catches up from the log rather than losing frames. Output it cannot have is
 reported by how much, as `lost_bytes`: what a rotating log dropped before the
 requested offset, or what a failed write never recorded, a full disk being the
 likely cause. The log stops at that point and the command carries on.

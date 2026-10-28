@@ -29,6 +29,9 @@ use crate::{pty, reaper, systemd, users};
 /// memory; back-pressure propagates to the child through the pipe.
 const CHANNEL_CAPACITY: usize = 64;
 const READ_CHUNK: usize = 32 * 1024;
+/// How long an exited command's pipes may stay quiet before its exit is
+/// reported without waiting for them to close.
+const DRAIN_IDLE: std::time::Duration = std::time::Duration::from_millis(500);
 
 type OutputTx = mpsc::Sender<Result<guestpb::ExecOutput, Status>>;
 type OutputRx = mpsc::Receiver<Result<guestpb::ExecOutput, Status>>;
@@ -195,13 +198,24 @@ fn run_pipes(
     let (tx, rx) = mpsc::channel(CHANNEL_CAPACITY);
     announce(&tx, handle.id());
     tokio::spawn(control_pipes(feed(inbound, &handle), stdin, pid));
+    let mut pumps = Vec::new();
     if let Some(pipe) = stdout {
-        tokio::spawn(pump(pipe, tx.clone(), handle.clone(), Frame::Stdout));
+        pumps.push(tokio::spawn(pump(
+            pipe,
+            tx.clone(),
+            handle.clone(),
+            Frame::Stdout,
+        )));
     }
     if let Some(pipe) = stderr {
-        tokio::spawn(pump(pipe, tx.clone(), handle.clone(), Frame::Stderr));
+        pumps.push(tokio::spawn(pump(
+            pipe,
+            tx.clone(),
+            handle.clone(),
+            Frame::Stderr,
+        )));
     }
-    tokio::spawn(report_exit(exit, tx, handle));
+    tokio::spawn(report_exit(exit, pumps, tx, handle));
     Ok(rx)
 }
 
@@ -288,8 +302,13 @@ fn run_pty(
     let (tx, rx) = mpsc::channel(CHANNEL_CAPACITY);
     announce(&tx, handle.id());
     tokio::spawn(control_pty(feed(inbound, &handle), pty.writer, pid));
-    tokio::spawn(pump(pty.reader, tx.clone(), handle.clone(), Frame::Stdout));
-    tokio::spawn(report_exit(exit, tx, handle));
+    let pumps = vec![tokio::spawn(pump(
+        pty.reader,
+        tx.clone(),
+        handle.clone(),
+        Frame::Stdout,
+    ))];
+    tokio::spawn(report_exit(exit, pumps, tx, handle));
     Ok(rx)
 }
 
@@ -372,13 +391,31 @@ async fn control_pty(
     }
 }
 
+/// Reports the exit once the command's output is in, so it is the last thing
+/// recorded. A child the command left running can hold its pipes open, so
+/// the wait also ends once output stops arriving.
 async fn report_exit(
     exit: tokio::sync::oneshot::Receiver<reaper::Exit>,
+    pumps: Vec<tokio::task::JoinHandle<()>>,
     tx: OutputTx,
     handle: Handle,
 ) {
     let messages = match exit.await {
         Ok(exit) => {
+            let mut drained = futures::future::join_all(pumps);
+            loop {
+                let before = handle.produced();
+                tokio::select! {
+                    _ = &mut drained => break,
+                    // A full channel is a stream not yet read, behind which
+                    // a pump holds output it has yet to send.
+                    () = tokio::time::sleep(DRAIN_IDLE) => {
+                        if handle.produced() == before && tx.capacity() > 0 {
+                            break;
+                        }
+                    }
+                }
+            }
             handle.finish(exit.code, exit.signal);
             Frame::Exit {
                 code: exit.code,
@@ -419,12 +456,13 @@ where
             Ok(0) | Err(_) => break,
             Ok(n) => {
                 let frame = wrap(buf[..n].to_vec());
-                for output in frame.outputs() {
+                let outputs = frame.outputs();
+                handle.record(frame);
+                for output in outputs {
                     if streaming {
                         streaming = tx.send(chunk(output)).await.is_ok();
                     }
                 }
-                handle.record(frame);
             }
         }
     }

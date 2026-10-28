@@ -2,55 +2,45 @@
 //!
 //! A command used to live only on the Exec stream that started it: a client
 //! that went away took the only handle on it with it. Here every command gets
-//! an id, a log of everything it has printed and a broadcast of what it
-//! produces from now on, so another process can list it, follow it, feed it
-//! and signal it long after the stream that started it is gone.
+//! an id, an input any stream may feed and a broadcast of what it produces, so
+//! another process can list it, follow it, feed it and signal it long after
+//! the stream that started it is gone.
 //!
-//! Logs work the way Docker's do. They are on the guest's own disk, not in
-//! memory, and kept for as long as the command is: nothing is evicted by count
-//! or age, and a finished command and its log go when PruneCommands removes
-//! them or the VM boots afresh. By default a log is unbounded and holds every
-//! byte; a command started with a size limit rotates instead, as Docker's
-//! `max-size` and `max-file` do, dropping its oldest file.
+//! Output is kept on the host, the way Docker keeps a container's log outside
+//! the container: what the guest held, it could read, rewrite or fill its own
+//! disk with. Every frame goes on the feed, which the host drains with
+//! [`feed`] and acknowledges once it has written it; the guest keeps only what
+//! is not yet acknowledged, up to [`FEED_BYTES`], so a host that is away for a
+//! moment, across a resume say, is sent what it missed when it comes back.
+//! Past that the oldest is dropped, and the host sees the jump in offsets as a
+//! gap it tells readers about.
 //!
 //! Output is counted by offset, stdout and stderr bytes together from the
-//! command's start, so an attacher that comes back says where it got to and
-//! is sent exactly what followed. Output it cannot have is reported by how
-//! much rather than skipped in silence: what rotation dropped, and anything
-//! after a failed write, a full disk being the likely one, which stops the log
-//! while the command carries on.
-//!
-//! A command's input is a channel any stream may feed, so stdin does not die
-//! with the stream that started it.
+//! command's start, which is what lets a reader resume exactly.
 
 #![allow(clippy::result_large_err)]
 
 use std::collections::{HashMap, VecDeque};
-use std::io::Write as _;
-use std::os::unix::fs::FileExt as _;
-use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 
-use tokio::sync::{broadcast, mpsc};
-use tonic::Status;
+use tokio::sync::{Notify, broadcast, mpsc};
+use tokio_stream::StreamExt as _;
+use tonic::{Status, Streaming};
 
 use burrow_proto::guest::v1 as guestpb;
 use burrow_proto::guest::v1::exec_output::Output;
 
-/// Where command logs are kept. Root's alone: a command's output is no more
-/// every user's to read than its process is.
-const LOG_DIR: &str = "/var/lib/burrow/commands";
-/// Frames a live attacher may fall behind by before it catches up from the
-/// log instead.
+/// Output held for the host before the oldest is dropped.
+const FEED_BYTES: usize = 16 * 1024 * 1024;
+/// What an exit costs in the feed's budget, so a run of them is bounded too.
+const EXIT_BYTES: usize = 16;
+/// Frames a live attacher may fall behind by before it skips ahead.
 const LIVE_BACKLOG: usize = 256;
 const ATTACH_CAPACITY: usize = 64;
-/// How much of the log an attacher reads at a time while catching up.
-const REPLAY_CHUNK: usize = 256 * 1024;
-/// A record's header: its kind and its payload's length.
-const HEADER: u64 = 5;
+const FEED_CAPACITY: usize = 64;
 
-/// One piece of a command's output, logged and broadcast alike.
+/// One piece of a command's output.
 #[derive(Clone)]
 pub enum Frame {
     Stdout(Vec<u8>),
@@ -78,263 +68,122 @@ impl Frame {
             }
         }
     }
-
-    fn encode(&self) -> (u8, Vec<u8>) {
-        match self {
-            Frame::Stdout(bytes) => (0, bytes.clone()),
-            Frame::Stderr(bytes) => (1, bytes.clone()),
-            Frame::Exit { code, signal } => {
-                let mut payload = code.to_le_bytes().to_vec();
-                payload.extend_from_slice(&signal.to_le_bytes());
-                (2, payload)
-            }
-        }
-    }
-
-    fn decode(kind: u8, payload: Vec<u8>) -> Frame {
-        match kind {
-            0 => Frame::Stdout(payload),
-            1 => Frame::Stderr(payload),
-            _ => {
-                let word = |at: usize| {
-                    payload
-                        .get(at..at + 4)
-                        .and_then(|b| b.try_into().ok())
-                        .map(i32::from_le_bytes)
-                        .unwrap_or_default()
-                };
-                Frame::Exit {
-                    code: word(0),
-                    signal: word(4),
-                }
-            }
-        }
-    }
-}
-
-/// A frame and the offset its first byte sits at.
-type Placed = (u64, Frame);
-
-/// Where one record sits in a log.
-#[derive(Clone, Copy)]
-struct Record {
-    /// Output offset of its first byte.
-    at: u64,
-    /// Which of the log's files holds it.
-    generation: u32,
-    /// Position of its header in that file.
-    pos: u64,
-    kind: u8,
-    len: u32,
-}
-
-impl Record {
-    fn output_len(&self) -> u64 {
-        if self.kind == 2 {
-            0
-        } else {
-            u64::from(self.len)
-        }
-    }
 }
 
 /// How a command's log is bounded, as Docker's `max-size` and `max-file`.
+/// The host keeps the log; the guest only passes this on.
 #[derive(Clone, Copy, Default, serde::Serialize, serde::Deserialize)]
 pub struct Rotation {
-    /// Bytes per file before a new one is started; 0 never rotates.
     pub max_bytes: u64,
-    /// Files kept once rotating, at least 1.
     pub max_files: u32,
 }
 
-/// A command's output on disk, in numbered files, and an index of it.
-///
-/// Files are numbered rather than renamed on rotation, so a reader that has
-/// one open is never handed a different file under the same name.
-struct Log {
+/// A frame waiting for the host to confirm it.
+#[derive(Clone, serde::Serialize, serde::Deserialize)]
+struct Pending {
+    seq: u64,
     id: String,
-    rotation: Rotation,
-    /// Gone once a write has failed: the log stops there for good, so what it
-    /// holds is always one unbroken run.
-    file: Option<std::fs::File>,
-    /// The file being written, and the oldest still kept.
-    generation: u32,
-    oldest: u32,
-    written: u64,
-    records: VecDeque<Record>,
-    /// Output offset the log holds up to.
-    logged: u64,
+    at: u64,
+    /// 0 stdout, 1 stderr, 2 exit.
+    kind: u8,
+    data: Vec<u8>,
+    code: i32,
+    signal: i32,
+    /// Set on a command's first frame.
+    rotation: Option<Rotation>,
 }
 
-fn log_path(id: &str, generation: u32) -> PathBuf {
-    Path::new(LOG_DIR).join(format!("{id}.{generation}.log"))
-}
-
-impl Log {
-    fn create(id: &str, rotation: Rotation) -> Self {
-        let file = open_log(&log_path(id, 0));
-        if let Err(err) = &file {
-            tracing::warn!(%err, command = id, "command output will not be kept");
-        }
-        Self {
-            id: id.to_string(),
-            rotation,
-            file: file.ok(),
-            generation: 0,
-            oldest: 0,
-            written: 0,
-            records: VecDeque::new(),
-            logged: 0,
-        }
+impl Pending {
+    fn end(&self) -> u64 {
+        self.at
+            + if self.kind == 2 {
+                0
+            } else {
+                self.data.len() as u64
+            }
     }
 
-    /// Indexes a finished command's log already on disk, as an agent picking
-    /// up from the one it replaced does. `kept_from` is where the oldest file
-    /// starts in the output. A torn last record is cut off.
-    fn reopen(id: &str, rotation: Rotation, kept_from: u64) -> Self {
-        let mut log = Self {
-            id: id.to_string(),
-            rotation,
-            file: None,
-            generation: 0,
-            oldest: 0,
-            written: 0,
-            records: VecDeque::new(),
-            logged: kept_from,
-        };
-        let mut generations: Vec<u32> = std::fs::read_dir(LOG_DIR)
-            .into_iter()
-            .flatten()
-            .flatten()
-            .filter_map(|file| generation_of(&file.file_name().into_string().ok()?, id))
-            .collect();
-        generations.sort_unstable();
-        log.oldest = generations.first().copied().unwrap_or(0);
-        for generation in generations {
-            let Ok(file) = std::fs::File::open(log_path(id, generation)) else {
-                continue;
+    fn cost(&self) -> usize {
+        self.data.len().max(EXIT_BYTES)
+    }
+
+    fn to_wire(&self) -> guestpb::FeedFrame {
+        use guestpb::feed_frame::Output as Out;
+        guestpb::FeedFrame {
+            seq: self.seq,
+            command_id: self.id.clone(),
+            at: self.at,
+            output: Some(match self.kind {
+                0 => Out::Stdout(self.data.clone()),
+                1 => Out::Stderr(self.data.clone()),
+                _ => Out::Exit(guestpb::FeedExit {
+                    code: self.code,
+                    signal: self.signal,
+                }),
+            }),
+            log_max_bytes: self.rotation.map_or(0, |r| r.max_bytes),
+            log_max_files: self.rotation.map_or(0, |r| r.max_files),
+        }
+    }
+}
+
+/// Output the host has not yet confirmed writing.
+#[derive(Default)]
+struct FeedBuffer {
+    pending: VecDeque<Pending>,
+    bytes: usize,
+    next_seq: u64,
+}
+
+impl FeedBuffer {
+    fn push(&mut self, mut item: Pending) {
+        self.next_seq += 1;
+        item.seq = self.next_seq;
+        self.bytes += item.cost();
+        self.pending.push_back(item);
+        // Exits are kept: without one the host could not tell a reader the
+        // command is over.
+        while self.bytes > FEED_BYTES {
+            let Some(oldest) = self.pending.iter().position(|item| item.kind != 2) else {
+                break;
             };
-            let end = file.metadata().map(|m| m.len()).unwrap_or(0);
-            let mut pos = 0u64;
-            let mut header = [0u8; HEADER as usize];
-            while pos + HEADER <= end && file.read_exact_at(&mut header, pos).is_ok() {
-                let len = u32::from_le_bytes(header[1..].try_into().expect("4 bytes"));
-                if pos + HEADER + u64::from(len) > end {
-                    break;
-                }
-                let record = Record {
-                    at: log.logged,
-                    generation,
-                    pos,
-                    kind: header[0],
-                    len,
-                };
-                log.logged += record.output_len();
-                pos += HEADER + u64::from(len);
-                log.records.push_back(record);
-            }
-            log.generation = generation;
-        }
-        log
-    }
-
-    /// Where the oldest output still held starts.
-    fn kept_from(&self) -> u64 {
-        self.records.front().map_or(self.logged, |record| record.at)
-    }
-
-    fn bytes_on_disk(&self) -> u64 {
-        (self.oldest..=self.generation)
-            .filter_map(|generation| std::fs::metadata(log_path(&self.id, generation)).ok())
-            .map(|meta| meta.len())
-            .sum()
-    }
-
-    fn remove(&self) {
-        for generation in self.oldest..=self.generation {
-            let _ = std::fs::remove_file(log_path(&self.id, generation));
+            let dropped = self.pending.remove(oldest).expect("found");
+            self.bytes -= dropped.cost();
         }
     }
 
-    /// Starts the next file, and drops the oldest past `max_files`.
-    fn rotate(&mut self) -> std::io::Result<()> {
-        let next = self.generation + 1;
-        self.file = Some(open_log(&log_path(&self.id, next))?);
-        self.generation = next;
-        self.written = 0;
-        let keep = self.rotation.max_files.max(1);
-        while self.generation - self.oldest + 1 > keep {
-            let _ = std::fs::remove_file(log_path(&self.id, self.oldest));
-            while self
-                .records
-                .front()
-                .is_some_and(|record| record.generation == self.oldest)
-            {
-                self.records.pop_front();
-            }
-            self.oldest += 1;
+    /// Lets go of what the host has confirmed.
+    fn release(&mut self, upto: u64) {
+        while self.pending.front().is_some_and(|item| item.seq <= upto) {
+            let item = self.pending.pop_front().expect("checked");
+            self.bytes -= item.cost();
         }
-        Ok(())
     }
 
-    fn append(&mut self, at: u64, frame: &Frame) {
-        let (kind, payload) = frame.encode();
-        let size = HEADER + payload.len() as u64;
-        if self.file.is_some()
-            && self.rotation.max_bytes > 0
-            && self.written > 0
-            && self.written + size > self.rotation.max_bytes
-            && let Err(err) = self.rotate()
-        {
-            tracing::warn!(%err, command = self.id, "stopped keeping command output");
-            self.file = None;
-        }
-        let Some(file) = self.file.as_mut() else {
-            return;
-        };
-        let mut record = Vec::with_capacity(size as usize);
-        record.push(kind);
-        record.extend_from_slice(&(payload.len() as u32).to_le_bytes());
-        record.extend_from_slice(&payload);
-        if let Err(err) = file.write_all(&record) {
-            tracing::warn!(%err, command = self.id, "stopped keeping command output");
-            self.file = None;
-            return;
-        }
-        let record = Record {
-            at,
-            generation: self.generation,
-            pos: self.written,
-            kind,
-            len: payload.len() as u32,
-        };
-        self.written += size;
-        self.logged = at + record.output_len();
-        self.records.push_back(record);
+    /// Lets go of output the host already holds, by where its logs end. An
+    /// exit is kept: the host writes one only once, so resending it is safe,
+    /// and an offset cannot say whether it has it.
+    fn release_logged(&mut self, logged: &HashMap<String, u64>) {
+        self.pending.retain(|item| {
+            item.kind == 2 || logged.get(&item.id).is_none_or(|&end| item.end() > end)
+        });
+        self.bytes = self.pending.iter().map(Pending::cost).sum();
     }
 }
 
-/// The generation a log file named `name` holds for command `id`.
-fn generation_of(name: &str, id: &str) -> Option<u32> {
-    name.strip_prefix(id)?
-        .strip_prefix('.')?
-        .strip_suffix(".log")?
-        .parse()
-        .ok()
+fn feed_buffer() -> &'static Mutex<FeedBuffer> {
+    static FEED: OnceLock<Mutex<FeedBuffer>> = OnceLock::new();
+    FEED.get_or_init(Mutex::default)
 }
 
-fn open_log(path: &Path) -> std::io::Result<std::fs::File> {
-    use std::os::unix::fs::{DirBuilderExt as _, OpenOptionsExt as _};
-    std::fs::DirBuilder::new()
-        .recursive(true)
-        .mode(0o700)
-        .create(LOG_DIR)?;
-    std::fs::OpenOptions::new()
-        .append(true)
-        .create_new(true)
-        .mode(0o600)
-        .open(path)
+/// Wakes the feed when there is something new to send.
+fn feed_wake() -> &'static Notify {
+    static WAKE: OnceLock<Notify> = OnceLock::new();
+    WAKE.get_or_init(Notify::new)
 }
+
+/// Which feed is current. A new one replaces the last, which notices and ends.
+static FEED_EPOCH: AtomicU64 = AtomicU64::new(0);
 
 struct Entry {
     id: String,
@@ -345,36 +194,19 @@ struct Entry {
     ended_at_ms: i64,
     exit_code: Option<i32>,
     exit_signal: i32,
-    log: Log,
+    rotation: Rotation,
+    /// Whether the host has been sent this command's first frame, which
+    /// carries its rotation.
+    is_announced: bool,
     /// Output produced in all, which is where the next frame starts.
     produced: u64,
-    live: broadcast::Sender<Placed>,
+    live: broadcast::Sender<Frame>,
     /// Feeds the command's stdin, terminal and signals. Gone once it exits.
     input: Option<mpsc::Sender<guestpb::ExecInput>>,
 }
 
-/// What an attacher at some offset is owed, read under the entry's lock and
-/// then sent without it.
-struct CatchUp {
-    id: String,
-    /// Output from the offset on that rotation has already dropped.
-    rotated: u64,
-    /// Records holding output at or past the offset, the first possibly only
-    /// in part.
-    records: Vec<Record>,
-    offset: u64,
-    /// Output produced past both the offset and the log.
-    unrecorded: u64,
-    /// The exit, when the command has one the log does not.
-    exit: Option<Frame>,
-    live: broadcast::Receiver<Placed>,
-    /// Where the live feed picks up.
-    end: u64,
-    is_finished: bool,
-}
-
 impl Entry {
-    fn new(id: String, cmd: Vec<String>, user: String, pid: i32, log: Log) -> Self {
+    fn new(id: String, cmd: Vec<String>, user: String, pid: i32, rotation: Rotation) -> Self {
         Self {
             id,
             cmd,
@@ -384,8 +216,9 @@ impl Entry {
             ended_at_ms: 0,
             exit_code: None,
             exit_signal: 0,
-            produced: log.logged,
-            log,
+            rotation,
+            is_announced: false,
+            produced: 0,
             live: broadcast::channel(LIVE_BACKLOG).0,
             input: None,
         }
@@ -404,56 +237,44 @@ impl Entry {
             exit_code: self.exit_code.unwrap_or_default(),
             started_at_unix_ms: self.started_at_ms,
             ended_at_unix_ms: self.ended_at_ms,
-            buffered_bytes: self.log.logged - self.log.kept_from(),
+            // The host holds the output, and says how much.
+            buffered_bytes: 0,
             exit_signal: self.exit_signal,
             output_bytes: self.produced,
         }
     }
 
-    /// Logs a frame at the end of the output, returning where it starts.
-    fn push(&mut self, frame: &Frame) -> u64 {
+    /// Puts a frame on the feed and the live broadcast.
+    fn emit(&mut self, frame: Frame) {
         let at = self.produced;
         self.produced += frame.len() as u64;
-        self.log.append(at, frame);
-        at
-    }
-
-    /// Plans an attacher's catch-up from `offset`, subscribing to what comes
-    /// after under the same lock, so nothing produced in between is either
-    /// missed or sent twice.
-    fn catch_up(&self, offset: u64) -> CatchUp {
-        let records: Vec<Record> = self
-            .log
-            .records
-            .iter()
-            .skip_while(|record| record.at + record.output_len() <= offset && record.kind != 2)
-            .copied()
-            .collect();
-        let has_exit = records.iter().any(|record| record.kind == 2);
-        let kept_from = self.log.kept_from();
-        CatchUp {
+        let (kind, data, code, signal) = match &frame {
+            Frame::Stdout(bytes) => (0, bytes.clone(), 0, 0),
+            Frame::Stderr(bytes) => (1, bytes.clone(), 0, 0),
+            Frame::Exit { code, signal } => (2, Vec::new(), *code, *signal),
+        };
+        let rotation = (!self.is_announced).then_some(self.rotation);
+        self.is_announced = true;
+        feed_buffer().lock().unwrap().push(Pending {
+            seq: 0,
             id: self.id.clone(),
-            rotated: kept_from.min(self.log.logged).saturating_sub(offset),
-            records,
-            offset: offset.max(kept_from),
-            unrecorded: self.produced.saturating_sub(offset.max(self.log.logged)),
-            exit: match self.exit_code {
-                Some(code) if !has_exit => Some(Frame::Exit {
-                    code,
-                    signal: self.exit_signal,
-                }),
-                _ => None,
-            },
-            live: self.live.subscribe(),
-            end: self.produced,
-            is_finished: self.exit_code.is_some(),
-        }
+            at,
+            kind,
+            data,
+            code,
+            signal,
+            rotation,
+        });
+        feed_wake().notify_waiters();
+        // An error only means nobody is attached right now, which is the
+        // ordinary case: the host's log is what a later reader reads.
+        let _ = self.live.send(frame);
     }
 }
 
 #[derive(Default)]
 struct Registry {
-    /// Insertion order, which is the order finished commands are evicted in.
+    /// Insertion order, which is the order commands are listed in.
     order: VecDeque<String>,
     entries: HashMap<String, Arc<Mutex<Entry>>>,
 }
@@ -488,13 +309,14 @@ impl Handle {
         &self.id
     }
 
-    /// Logs a frame and hands it to whoever is attached.
+    /// Sends a frame on to the host and to whoever is attached.
     pub fn record(&self, frame: Frame) {
-        let mut entry = self.entry.lock().unwrap();
-        let at = entry.push(&frame);
-        // An error only means nobody is attached right now, which is the
-        // ordinary case: the log above is what a later attacher reads.
-        let _ = entry.live.send((at, frame));
+        self.entry.lock().unwrap().emit(frame);
+    }
+
+    /// Output produced so far.
+    pub fn produced(&self) -> u64 {
+        self.entry.lock().unwrap().produced
     }
 
     /// Where the command's input goes, for any stream that feeds it.
@@ -504,35 +326,27 @@ impl Handle {
 
     /// Records the exit status and marks the command finished.
     pub fn finish(&self, code: i32, signal: i32) {
-        {
-            let mut entry = self.entry.lock().unwrap();
-            entry.exit_code = Some(code);
-            entry.exit_signal = signal;
-            entry.ended_at_ms = now_ms();
-            entry.input = None;
-            let frame = Frame::Exit { code, signal };
-            let at = entry.push(&frame);
-            // Nothing more is written; the descriptor is not held for the
-            // rest of the command's stay in the registry.
-            entry.log.file = None;
-            let _ = entry.live.send((at, frame));
-        }
+        let mut entry = self.entry.lock().unwrap();
+        entry.exit_code = Some(code);
+        entry.exit_signal = signal;
+        entry.ended_at_ms = now_ms();
+        entry.input = None;
+        entry.emit(Frame::Exit { code, signal });
     }
 }
 
 /// Registers a command that has just been spawned.
 pub fn register(cmd: Vec<String>, user: String, pid: i32, rotation: Rotation) -> Handle {
     let id = next_id();
-    let log = Log::create(&id, rotation);
-    let entry = Arc::new(Mutex::new(Entry::new(id.clone(), cmd, user, pid, log)));
+    let entry = Arc::new(Mutex::new(Entry::new(id.clone(), cmd, user, pid, rotation)));
     let mut registry = registry().lock().unwrap();
     registry.order.push_back(id.clone());
     registry.entries.insert(id.clone(), Arc::clone(&entry));
     Handle { id, entry }
 }
 
-/// Removes every finished command and its log, returning how many there
-/// were and the bytes freed.
+/// Removes every finished command, returning which. The host removes their
+/// logs, which are its to free.
 pub fn prune() -> guestpb::PruneCommandsResponse {
     let mut registry = registry().lock().unwrap();
     let finished: Vec<String> = registry
@@ -541,19 +355,15 @@ pub fn prune() -> guestpb::PruneCommandsResponse {
         .filter(|id| registry.entries[*id].lock().unwrap().exit_code.is_some())
         .cloned()
         .collect();
-    let mut freed_bytes = 0;
     for id in &finished {
-        if let Some(entry) = registry.entries.remove(id) {
-            let entry = entry.lock().unwrap();
-            freed_bytes += entry.log.bytes_on_disk();
-            entry.log.remove();
-        }
+        registry.entries.remove(id);
     }
     let Registry { order, entries } = &mut *registry;
     order.retain(|id| entries.contains_key(id));
     guestpb::PruneCommandsResponse {
         removed: finished.len() as u32,
-        freed_bytes,
+        freed_bytes: 0,
+        command_ids: finished,
     }
 }
 
@@ -637,171 +447,113 @@ pub fn input(id: &str) -> Result<mpsc::Sender<guestpb::ExecInput>, Status> {
         .ok_or_else(|| Status::failed_precondition(format!("command {id} has exited")))
 }
 
-/// Sends what the log holds from `offset` on, then follows the command live.
-///
-/// An attacher that falls behind the live feed catches up from the log again
-/// rather than skipping what it missed. Output the log does not have is
-/// reported by how much. A command that has already exited replays to its exit
-/// status, and the stream then closes.
-pub fn attach(
-    id: &str,
-    offset: u64,
-) -> Result<mpsc::Receiver<Result<guestpb::ExecOutput, Status>>, Status> {
+/// Follows a command live from now on, ending at its exit. What it printed
+/// before is the host's to replay, from its log.
+pub fn attach(id: &str) -> Result<mpsc::Receiver<Result<guestpb::ExecOutput, Status>>, Status> {
     let entry = entry(id)?;
+    let (mut live, exit) = {
+        let held = entry.lock().unwrap();
+        (
+            held.live.subscribe(),
+            held.exit_code.map(|code| Frame::Exit {
+                code,
+                signal: held.exit_signal,
+            }),
+        )
+    };
     let (tx, rx) = mpsc::channel(ATTACH_CAPACITY);
     tokio::spawn(async move {
-        let mut offset = offset;
+        if let Some(exit) = exit {
+            for output in exit.outputs() {
+                let _ = tx.send(Ok(wrap(output))).await;
+            }
+            return;
+        }
         loop {
-            let held = Arc::clone(&entry);
-            let Ok(plan) =
-                tokio::task::spawn_blocking(move || held.lock().unwrap().catch_up(offset)).await
-            else {
-                return;
-            };
-            let CatchUp {
-                id,
-                rotated,
-                records,
-                offset: from,
-                unrecorded,
-                exit,
-                mut live,
-                end,
-                is_finished,
-            } = plan;
-            if rotated > 0 && tx.send(Ok(wrap(Output::LostBytes(rotated)))).await.is_err() {
-                return;
-            }
-            if send_logged(&tx, id, records, from).await.is_err() {
-                return;
-            }
-            if unrecorded > 0
-                && tx
-                    .send(Ok(wrap(Output::LostBytes(unrecorded))))
-                    .await
-                    .is_err()
-            {
-                return;
-            }
-            for output in exit.iter().flat_map(Frame::outputs) {
-                if tx.send(Ok(wrap(output))).await.is_err() {
-                    return;
-                }
-            }
-            if is_finished {
-                return;
-            }
-            offset = end;
-            loop {
-                match live.recv().await {
-                    Ok((at, frame)) => {
-                        let exited = matches!(frame, Frame::Exit { .. });
-                        offset = at + frame.len() as u64;
-                        for output in frame.outputs() {
-                            if tx.send(Ok(wrap(output))).await.is_err() {
-                                return;
-                            }
-                        }
-                        if exited {
+            match live.recv().await {
+                Ok(frame) => {
+                    let exited = matches!(frame, Frame::Exit { .. });
+                    for output in frame.outputs() {
+                        if tx.send(Ok(wrap(output))).await.is_err() {
                             return;
                         }
                     }
-                    // The attacher read slower than the command produced:
-                    // back to the log from where it had got to.
-                    Err(broadcast::error::RecvError::Lagged(_)) => break,
-                    Err(broadcast::error::RecvError::Closed) => return,
+                    if exited {
+                        return;
+                    }
                 }
+                // What was skipped is in the host's log.
+                Err(broadcast::error::RecvError::Lagged(_)) => continue,
+                Err(broadcast::error::RecvError::Closed) => return,
             }
         }
     });
     Ok(rx)
 }
 
-/// Streams logged records from `offset` on, a chunk at a time, so a long log
-/// is never read into memory whole.
-async fn send_logged(
-    tx: &mpsc::Sender<Result<guestpb::ExecOutput, Status>>,
-    id: String,
-    records: Vec<Record>,
-    offset: u64,
-) -> Result<(), ()> {
-    let id = Arc::new(id);
-    let mut batch: Vec<Record> = Vec::new();
-    let mut batch_bytes = 0usize;
-    for (n, record) in records.iter().enumerate() {
-        batch.push(*record);
-        batch_bytes += record.len as usize;
-        if batch_bytes < REPLAY_CHUNK && n + 1 < records.len() {
-            continue;
+/// Sends every command's output to the host as it is produced.
+///
+/// The first ack names where each of the host's logs ends, so nothing the
+/// host already holds is sent again. Then everything still pending goes out
+/// in order, and whatever follows as it comes; each later ack lets the guest
+/// drop what it confirms. A newer feed replaces this one.
+pub async fn feed(
+    mut acks: Streaming<guestpb::FeedAck>,
+) -> Result<mpsc::Receiver<Result<guestpb::FeedFrame, Status>>, Status> {
+    let first = acks.next().await.transpose()?.unwrap_or_default();
+    let logged: HashMap<String, u64> = first
+        .positions
+        .into_iter()
+        .map(|p| (p.command_id, p.logged))
+        .collect();
+    {
+        let mut buffer = feed_buffer().lock().unwrap();
+        buffer.release(first.seq);
+        buffer.release_logged(&logged);
+    }
+    let epoch = FEED_EPOCH.fetch_add(1, Ordering::SeqCst) + 1;
+    let current = move || FEED_EPOCH.load(Ordering::SeqCst) == epoch;
+
+    tokio::spawn(async move {
+        while let Some(Ok(ack)) = acks.next().await {
+            if !current() {
+                return;
+            }
+            feed_buffer().lock().unwrap().release(ack.seq);
         }
-        let reading = std::mem::take(&mut batch);
-        batch_bytes = 0;
-        let id = Arc::clone(&id);
-        let replayed = tokio::task::spawn_blocking(move || read_records(&id, &reading, offset))
-            .await
-            .map_err(|_| ())?;
-        for item in replayed {
-            let outputs = match item {
-                Replayed::Frame(frame) => frame.outputs(),
-                Replayed::Lost(bytes) => vec![Output::LostBytes(bytes)],
-                Replayed::Failed(err) => {
-                    let _ = tx
-                        .send(Err(Status::internal(format!("reading command log: {err}"))))
-                        .await;
-                    return Err(());
-                }
+    });
+
+    let (tx, rx) = mpsc::channel(FEED_CAPACITY);
+    tokio::spawn(async move {
+        let mut next = 0u64;
+        loop {
+            let wake = feed_wake().notified();
+            tokio::pin!(wake);
+            wake.as_mut().enable();
+            let due: Vec<guestpb::FeedFrame> = {
+                let buffer = feed_buffer().lock().unwrap();
+                buffer
+                    .pending
+                    .iter()
+                    .filter(|item| item.seq >= next)
+                    .map(Pending::to_wire)
+                    .collect()
             };
-            for output in outputs {
-                tx.send(Ok(wrap(output))).await.map_err(|_| ())?;
-            }
-        }
-    }
-    Ok(())
-}
-
-/// One step of a replay.
-enum Replayed {
-    Frame(Frame),
-    /// Output whose file rotation removed between planning and reading.
-    Lost(u64),
-    Failed(std::io::Error),
-}
-
-/// What `records` hold, the part of any before `offset` cut off.
-fn read_records(id: &str, records: &[Record], offset: u64) -> Vec<Replayed> {
-    let mut out = Vec::with_capacity(records.len());
-    let mut open: Option<(u32, std::fs::File)> = None;
-    for record in records {
-        let skip = offset.saturating_sub(record.at).min(u64::from(record.len)) as usize;
-        if open
-            .as_ref()
-            .is_none_or(|(generation, _)| *generation != record.generation)
-        {
-            match std::fs::File::open(log_path(id, record.generation)) {
-                Ok(file) => open = Some((record.generation, file)),
-                Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
-                    open = None;
-                    out.push(Replayed::Lost(record.output_len() - skip as u64));
-                    continue;
-                }
-                Err(err) => {
-                    out.push(Replayed::Failed(err));
-                    return out;
+            for frame in due {
+                next = frame.seq + 1;
+                if !current() || tx.send(Ok(frame)).await.is_err() {
+                    return;
                 }
             }
+            // Woken by new output; the timeout is what notices a feed that
+            // has been replaced while nothing was produced.
+            let _ = tokio::time::timeout(std::time::Duration::from_secs(1), wake).await;
+            if !current() || tx.is_closed() {
+                return;
+            }
         }
-        let Some((_, file)) = &open else { continue };
-        let mut payload = vec![0u8; record.len as usize];
-        if let Err(err) = file.read_exact_at(&mut payload, record.pos + HEADER) {
-            out.push(Replayed::Failed(err));
-            return out;
-        }
-        if record.kind != 2 {
-            payload.drain(..skip);
-        }
-        out.push(Replayed::Frame(Frame::decode(record.kind, payload)));
-    }
-    out
+    });
+    Ok(rx)
 }
 
 fn wrap(output: Output) -> guestpb::ExecOutput {
@@ -810,88 +562,166 @@ fn wrap(output: Output) -> guestpb::ExecOutput {
     }
 }
 
+/// A finished command as written to disk across an agent re-exec.
+///
+/// Only finished ones travel: a running command's pipes and pty belong to
+/// the old process, which is why an upgrade refuses while one runs.
+#[derive(serde::Serialize, serde::Deserialize)]
+struct SavedEntry {
+    id: String,
+    cmd: Vec<String>,
+    user: String,
+    pid: i32,
+    started_at_ms: i64,
+    ended_at_ms: i64,
+    exit_code: i32,
+    #[serde(default)]
+    exit_signal: i32,
+    #[serde(default)]
+    produced: u64,
+}
+
+#[derive(serde::Serialize, serde::Deserialize)]
+struct Saved {
+    next_id: u64,
+    entries: Vec<SavedEntry>,
+    /// Output the host had not yet confirmed, which the next agent sends.
+    #[serde(default)]
+    pending: Vec<Pending>,
+    #[serde(default)]
+    next_seq: u64,
+}
+
+/// Writes every finished command, and the output the host has not yet
+/// confirmed, to `path`, for the agent that replaces this one to read back.
+/// Ids keep counting from where they were, so an id a client holds stays
+/// unique.
+pub fn save(path: &str) -> std::io::Result<()> {
+    let registry = registry().lock().unwrap();
+    let entries = registry
+        .order
+        .iter()
+        .filter_map(|id| registry.entries.get(id))
+        .filter_map(|entry| {
+            let entry = entry.lock().unwrap();
+            let exit_code = entry.exit_code?;
+            Some(SavedEntry {
+                id: entry.id.clone(),
+                cmd: entry.cmd.clone(),
+                user: entry.user.clone(),
+                pid: entry.pid,
+                started_at_ms: entry.started_at_ms,
+                ended_at_ms: entry.ended_at_ms,
+                exit_code,
+                exit_signal: entry.exit_signal,
+                produced: entry.produced,
+            })
+        })
+        .collect();
+    let buffer = feed_buffer().lock().unwrap();
+    let saved = Saved {
+        next_id: COUNTER.load(Ordering::Relaxed),
+        entries,
+        pending: buffer.pending.iter().cloned().collect(),
+        next_seq: buffer.next_seq,
+    };
+    let bytes = serde_json::to_vec(&saved).map_err(std::io::Error::other)?;
+    std::fs::write(path, bytes)
+}
+
+/// Reads what [`save`] wrote and removes the file. Best effort: a table that
+/// cannot be read is an empty history, not a failed upgrade. An older agent's
+/// table, with each command's output inline rather than pending, still reads:
+/// the output it carries is not sent on, since that agent kept it in the guest.
+pub fn restore(path: &str) {
+    let saved = std::fs::read(path)
+        .ok()
+        .and_then(|bytes| serde_json::from_slice::<Saved>(&bytes).ok());
+    let _ = std::fs::remove_file(path);
+    let Some(saved) = saved else { return };
+    COUNTER.fetch_max(saved.next_id, Ordering::Relaxed);
+    let mut registry = registry().lock().unwrap();
+    for saved in saved.entries {
+        let mut entry = Entry::new(
+            saved.id.clone(),
+            saved.cmd,
+            saved.user,
+            saved.pid,
+            Rotation::default(),
+        );
+        entry.started_at_ms = saved.started_at_ms;
+        entry.ended_at_ms = saved.ended_at_ms;
+        entry.exit_code = Some(saved.exit_code);
+        entry.exit_signal = saved.exit_signal;
+        entry.produced = saved.produced;
+        entry.is_announced = true;
+        registry.order.push_back(saved.id.clone());
+        registry
+            .entries
+            .insert(saved.id, Arc::new(Mutex::new(entry)));
+    }
+    let mut buffer = feed_buffer().lock().unwrap();
+    buffer.next_seq = buffer.next_seq.max(saved.next_seq);
+    for item in saved.pending {
+        buffer.bytes += item.cost();
+        buffer.pending.push_back(item);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    /// Everything an attacher at `offset` would be sent, read synchronously.
-    fn replay(handle: &Handle, offset: u64) -> Vec<Output> {
-        let plan = handle.entry.lock().unwrap().catch_up(offset);
-        let mut out = Vec::new();
-        if plan.rotated > 0 {
-            out.push(Output::LostBytes(plan.rotated));
-        }
-        for item in read_records(&plan.id, &plan.records, plan.offset) {
-            match item {
-                Replayed::Frame(frame) => out.extend(frame.outputs()),
-                Replayed::Lost(bytes) => out.push(Output::LostBytes(bytes)),
-                Replayed::Failed(err) => panic!("{err}"),
-            }
-        }
-        if plan.unrecorded > 0 {
-            out.push(Output::LostBytes(plan.unrecorded));
-        }
-        out.extend(plan.exit.iter().flat_map(Frame::outputs));
-        out
-    }
-
-    fn stdout_of(outputs: &[Output]) -> Vec<u8> {
-        outputs
+    fn pending_for(id: &str) -> Vec<Pending> {
+        feed_buffer()
+            .lock()
+            .unwrap()
+            .pending
             .iter()
-            .filter_map(|output| match output {
-                Output::Stdout(bytes) => Some(bytes.clone()),
-                _ => None,
-            })
-            .flatten()
+            .filter(|item| item.id == id)
+            .cloned()
             .collect()
     }
 
-    /// All of it, not a tail: a command that printed far more than any memory
-    /// buffer would hold replays from its first byte.
+    /// What a command prints goes on the feed, offsets and all, its rotation
+    /// on the first frame only.
     #[test]
-    fn every_byte_a_command_prints_is_kept() {
-        let handle = register(vec!["yes".into()], String::new(), -1, Rotation::default());
-        for n in 0..64u8 {
-            handle.record(Frame::Stdout(vec![n; 64 * 1024]));
-        }
-        handle.finish(3, 0);
-        let outputs = replay(&handle, 0);
-        let bytes = stdout_of(&outputs);
-        assert_eq!(bytes.len(), 64 * 64 * 1024);
-        assert_eq!(bytes[0], 0);
-        assert_eq!(bytes[bytes.len() - 1], 63);
-        assert!(matches!(outputs.last(), Some(Output::ExitCode(3))));
-        let info = get(handle.id()).unwrap();
-        assert_eq!(info.state, "exited");
-        assert_eq!(info.output_bytes, 64 * 64 * 1024);
-        assert_eq!(info.buffered_bytes, info.output_bytes);
-    }
-
-    /// An attacher coming back says how far it got and is sent only what
-    /// followed, even from the middle of a frame.
-    #[test]
-    fn an_attach_resumes_from_its_offset() {
-        let handle = register(vec!["sh".into()], String::new(), -1, Rotation::default());
+    fn output_goes_on_the_feed_with_its_offsets() {
+        let rotation = Rotation {
+            max_bytes: 20 << 20,
+            max_files: 5,
+        };
+        let handle = register(vec!["sh".into()], String::new(), -1, rotation);
         handle.record(Frame::Stdout(b"hello ".to_vec()));
         handle.record(Frame::Stderr(b"world".to_vec()));
-        let outputs = replay(&handle, 8);
-        assert!(matches!(outputs.as_slice(), [Output::Stderr(b)] if b == b"rld"));
+        handle.finish(3, 0);
+        let pending = pending_for(handle.id());
+        assert_eq!(pending.len(), 3);
+        assert_eq!((pending[0].at, pending[1].at, pending[2].at), (0, 6, 11));
+        assert_eq!(pending[0].rotation.map(|r| r.max_files), Some(5));
+        assert!(pending[1].rotation.is_none());
+        assert_eq!(pending[2].kind, 2);
+        let info = get(handle.id()).unwrap();
+        assert_eq!(
+            (info.state.as_str(), info.exit_code, info.output_bytes),
+            ("exited", 3, 11)
+        );
     }
 
-    /// A log that stopped, the disk having filled, still accounts for every
-    /// byte: what it kept, then how much it did not.
+    /// What the host confirms, or already holds, the guest lets go of.
     #[test]
-    fn output_the_log_missed_is_reported_by_how_much() {
-        let handle = register(vec!["yes".into()], String::new(), -1, Rotation::default());
-        handle.record(Frame::Stdout(b"kept".to_vec()));
-        handle.entry.lock().unwrap().log.file = None;
-        handle.record(Frame::Stdout(b"missed".to_vec()));
-        handle.finish(0, 0);
-        let outputs = replay(&handle, 0);
-        assert!(matches!(
-            outputs.as_slice(),
-            [Output::Stdout(b), Output::LostBytes(6), Output::ExitCode(0)] if b == b"kept"
-        ));
+    fn confirmed_output_is_let_go() {
+        let handle = register(vec!["sh".into()], String::new(), -1, Rotation::default());
+        handle.record(Frame::Stdout(b"aaaa".to_vec()));
+        handle.record(Frame::Stdout(b"bbbb".to_vec()));
+        let logged = HashMap::from([(handle.id().to_string(), 4u64)]);
+        feed_buffer().lock().unwrap().release_logged(&logged);
+        let pending = pending_for(handle.id());
+        assert_eq!(pending.len(), 1);
+        assert_eq!(pending[0].at, 4);
+        let upto = pending[0].seq;
+        feed_buffer().lock().unwrap().release(upto);
+        assert!(pending_for(handle.id()).is_empty());
     }
 
     /// A command a signal ended reports the signal, then the shell-style code.
@@ -899,60 +729,22 @@ mod tests {
     fn a_signalled_exit_names_its_signal() {
         let handle = register(vec!["sleep".into()], String::new(), -1, Rotation::default());
         handle.finish(137, 9);
-        assert!(matches!(
-            replay(&handle, 0).as_slice(),
-            [Output::ExitSignal(9), Output::ExitCode(137)]
-        ));
+        let pending = pending_for(handle.id());
+        assert_eq!((pending[0].code, pending[0].signal), (137, 9));
         assert_eq!(get(handle.id()).unwrap().exit_signal, 9);
     }
 
-    /// The agent that replaces this one finds the log where it was and indexes
-    /// it the same way.
-    #[test]
-    fn a_log_reopens_to_the_same_index() {
-        let handle = register(vec!["sh".into()], String::new(), -1, Rotation::default());
-        handle.record(Frame::Stdout(b"one".to_vec()));
-        handle.record(Frame::Stderr(b"two".to_vec()));
-        handle.finish(1, 0);
-        let reopened = Log::reopen(handle.id(), Rotation::default(), 0);
-        assert_eq!(reopened.logged, 6);
-        assert_eq!(reopened.records.len(), 3);
-        assert_eq!(reopened.records[1].at, 3);
-    }
-
-    /// As Docker's `max-size` and `max-file`: the oldest file goes, and an
-    /// attach from the start is told exactly how much went with it.
-    #[test]
-    fn a_rotating_log_drops_its_oldest_file() {
-        let rotation = Rotation {
-            max_bytes: 16,
-            max_files: 2,
-        };
-        let handle = register(vec!["yes".into()], String::new(), -1, rotation);
-        for chunk in [b"aaaaaaaa", b"bbbbbbbb", b"cccccccc", b"dddddddd"] {
-            handle.record(Frame::Stdout(chunk.to_vec()));
-        }
-        let outputs = replay(&handle, 0);
-        assert!(matches!(outputs.first(), Some(Output::LostBytes(16))));
-        assert_eq!(stdout_of(&outputs), b"ccccccccdddddddd");
-        let info = get(handle.id()).unwrap();
-        assert_eq!(info.output_bytes, 32);
-        assert_eq!(info.buffered_bytes, 16);
-    }
-
-    /// Pruning removes what has finished, logs included, and leaves running
+    /// Pruning removes what has finished and says which, and leaves running
     /// commands alone.
     #[test]
-    fn pruning_removes_finished_commands_and_their_logs() {
+    fn pruning_names_the_finished_commands_it_removes() {
         let done = register(vec!["true".into()], String::new(), -1, Rotation::default());
-        done.record(Frame::Stdout(b"bye".to_vec()));
         done.finish(0, 0);
         let running = register(vec!["sleep".into()], String::new(), -1, Rotation::default());
         let pruned = prune();
-        assert!(pruned.removed >= 1);
-        assert!(pruned.freed_bytes > 0);
+        assert!(pruned.command_ids.contains(&done.id().to_string()));
+        assert!(!pruned.command_ids.contains(&running.id().to_string()));
         assert_eq!(get(done.id()).unwrap_err().code(), tonic::Code::NotFound);
-        assert!(!log_path(done.id(), 0).exists());
         assert_eq!(get(running.id()).unwrap().state, "running");
     }
 
@@ -975,146 +767,5 @@ mod tests {
             signal(handle.id(), 15).unwrap_err().code(),
             tonic::Code::FailedPrecondition
         );
-    }
-}
-
-/// A finished command as written to disk across an agent re-exec.
-///
-/// Only finished ones travel: a running command's pipes and pty belong to
-/// the old process, which is why an upgrade refuses while one runs.
-#[derive(serde::Serialize, serde::Deserialize)]
-struct SavedEntry {
-    id: String,
-    cmd: Vec<String>,
-    user: String,
-    pid: i32,
-    started_at_ms: i64,
-    ended_at_ms: i64,
-    exit_code: i32,
-    /// An agent that buffered output in memory wrote it here: (0 stdout,
-    /// 1 stderr, 2 exit) and the bytes or the code's LE bytes. Empty from one
-    /// that logs to disk.
-    #[serde(default)]
-    frames: Vec<(u8, Vec<u8>)>,
-    #[serde(default)]
-    exit_signal: i32,
-    /// Whether the command has a log on disk, from an agent that keeps one.
-    #[serde(default)]
-    is_logged: bool,
-    #[serde(default)]
-    rotation: Rotation,
-    /// Where the oldest kept log file starts in the output.
-    #[serde(default)]
-    kept_from: u64,
-    /// Output produced in all, which can be more than the log holds.
-    #[serde(default)]
-    produced: u64,
-}
-
-#[derive(serde::Serialize, serde::Deserialize)]
-struct Saved {
-    next_id: u64,
-    entries: Vec<SavedEntry>,
-}
-
-/// Writes every finished command to `path`, for the agent that replaces this
-/// one to read back. Ids keep counting from where they were, so an id a
-/// client holds stays unique. The logs stay where they are.
-pub fn save(path: &str) -> std::io::Result<()> {
-    let registry = registry().lock().unwrap();
-    let entries = registry
-        .order
-        .iter()
-        .filter_map(|id| registry.entries.get(id))
-        .filter_map(|entry| {
-            let entry = entry.lock().unwrap();
-            let exit_code = entry.exit_code?;
-            Some(SavedEntry {
-                id: entry.id.clone(),
-                cmd: entry.cmd.clone(),
-                user: entry.user.clone(),
-                pid: entry.pid,
-                started_at_ms: entry.started_at_ms,
-                ended_at_ms: entry.ended_at_ms,
-                exit_code,
-                frames: Vec::new(),
-                exit_signal: entry.exit_signal,
-                is_logged: true,
-                rotation: entry.log.rotation,
-                kept_from: entry.log.kept_from(),
-                produced: entry.produced,
-            })
-        })
-        .collect();
-    let saved = Saved {
-        next_id: COUNTER.load(Ordering::Relaxed),
-        entries,
-    };
-    let bytes = serde_json::to_vec(&saved).map_err(std::io::Error::other)?;
-    std::fs::write(path, bytes)
-}
-
-/// Reads what [`save`] wrote and removes the file. Best effort: a table that
-/// cannot be read is an empty history, not a failed upgrade.
-///
-/// Logs no restored command names are removed. On a fresh boot that is all
-/// of them: the commands they belonged to died with the VM.
-pub fn restore(path: &str) {
-    let saved = std::fs::read(path)
-        .ok()
-        .and_then(|bytes| serde_json::from_slice::<Saved>(&bytes).ok());
-    let _ = std::fs::remove_file(path);
-    let mut kept = std::collections::HashSet::new();
-    if let Some(saved) = saved {
-        COUNTER.fetch_max(saved.next_id, Ordering::Relaxed);
-        let mut registry = registry().lock().unwrap();
-        for saved in saved.entries {
-            let log = if saved.is_logged {
-                Log::reopen(&saved.id, saved.rotation, saved.kept_from)
-            } else {
-                // What an agent that buffered in memory handed over, written
-                // out as a log of its own.
-                {
-                    let mut log = Log::create(&saved.id, Rotation::default());
-                    let mut at = 0;
-                    for (kind, bytes) in saved.frames {
-                        let frame = match kind {
-                            2 => Frame::Exit {
-                                code: i32::from_le_bytes(bytes.try_into().unwrap_or_default()),
-                                signal: saved.exit_signal,
-                            },
-                            kind => Frame::decode(kind, bytes),
-                        };
-                        log.append(at, &frame);
-                        at += frame.len() as u64;
-                    }
-                    log.file = None;
-                    log
-                }
-            };
-            kept.insert(saved.id.clone());
-            let mut entry = Entry::new(saved.id.clone(), saved.cmd, saved.user, saved.pid, log);
-            entry.started_at_ms = saved.started_at_ms;
-            entry.ended_at_ms = saved.ended_at_ms;
-            entry.exit_code = Some(saved.exit_code);
-            entry.exit_signal = saved.exit_signal;
-            entry.produced = entry.produced.max(saved.produced);
-            registry.order.push_back(saved.id.clone());
-            registry
-                .entries
-                .insert(saved.id, Arc::new(Mutex::new(entry)));
-        }
-    }
-    if let Ok(dir) = std::fs::read_dir(LOG_DIR) {
-        for log in dir.flatten() {
-            let name = log.file_name();
-            let owner = name
-                .to_str()
-                .and_then(|name| name.split_once('.'))
-                .map(|(id, _)| id);
-            if !owner.is_some_and(|id| kept.contains(id)) {
-                let _ = std::fs::remove_file(log.path());
-            }
-        }
     }
 }

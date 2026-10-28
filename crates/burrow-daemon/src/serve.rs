@@ -65,6 +65,18 @@ pub struct ServeArgs {
     /// Seconds to wait for a new sandbox's agent to become reachable.
     #[arg(long, default_value_t = 30)]
     pub agent_timeout: u64,
+    /// Default size a command's output log rotates at, as Docker's
+    /// `max-size`; unset keeps every byte. An exec may ask for its own.
+    #[arg(long, value_parser = burrow_common::cmdlog::parse_size, env = "BURROW_COMMAND_LOG_MAX_SIZE")]
+    pub command_log_max_size: Option<u64>,
+    /// Log files kept once rotating, as Docker's `max-file`.
+    #[arg(
+        long,
+        default_value_t = 1,
+        requires = "command_log_max_size",
+        env = "BURROW_COMMAND_LOG_MAX_FILES"
+    )]
+    pub command_log_max_files: u32,
     /// Where the node's resolver listens. Must cover every sandbox's gateway
     /// address, which is why it binds all interfaces.
     #[arg(long, default_value = "0.0.0.0:53")]
@@ -1059,6 +1071,10 @@ pub async fn run(args: ServeArgs) -> anyhow::Result<()> {
             firecracker_bin: args.firecracker.clone(),
             extra_boot_args: args.guest_boot_args.clone(),
             agent_timeout: Duration::from_secs(args.agent_timeout),
+            command_log_rotation: burrow_common::cmdlog::Rotation {
+                max_bytes: args.command_log_max_size.unwrap_or(0),
+                max_files: args.command_log_max_files,
+            },
             cgroup_root: Some(args.cgroup_root.clone()),
             is_resource_limits_required: args.is_resource_limits_required,
             is_memory_lazy: args.is_memory_lazy,

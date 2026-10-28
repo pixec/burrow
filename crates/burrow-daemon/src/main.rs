@@ -1,6 +1,7 @@
 mod access;
 mod blobs;
 mod chunks;
+mod cmdlogs;
 mod devvm;
 mod durable;
 mod edge;

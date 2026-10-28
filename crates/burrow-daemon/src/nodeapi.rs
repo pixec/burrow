@@ -63,6 +63,20 @@ impl NodeApi {
         let command_id = check_command_id(&start.command_id)?;
         let sandbox = self.sandboxes.get(&start.sandbox_id).await?;
         check_exec(&sandbox.policy())?;
+
+        // A command whose whole log is on the node needs nothing from the
+        // guest, which may be suspended; anything else is asked about, both
+        // for whose it is and for whether it exists at all.
+        let is_logged_whole = sandbox.logs.exit_logged(&command_id) == Some(true);
+        if is_logged_whole && user.is_empty() {
+            return Ok(follow_log(
+                &sandbox,
+                command_id,
+                start.from_offset,
+                None,
+                None,
+            ));
+        }
         if !sandbox.agent_has(ATTACH_INPUT).await? {
             return Err(Status::failed_precondition(
                 "this sandbox's guest agent cannot attach with input; it is upgraded on the \
@@ -70,24 +84,44 @@ impl NodeApi {
             ));
         }
         let mut agent = sandbox.agent().await?;
-        if !user.is_empty() {
-            let info = agent
-                .get_command(guestpb::GetCommandRequest {
-                    command_id: command_id.clone(),
-                })
-                .await?
-                .into_inner();
-            if info.user != user {
-                return Err(Status::permission_denied(format!(
-                    "command {command_id} is not {user}'s"
-                )));
-            }
+        let info = agent
+            .get_command(guestpb::GetCommandRequest {
+                command_id: command_id.clone(),
+            })
+            .await?
+            .into_inner();
+        if !user.is_empty() && info.user != user {
+            return Err(Status::permission_denied(format!(
+                "command {command_id} is not {user}'s"
+            )));
+        }
+        let is_fed = sandbox.agent_has(crate::sandbox::OUTPUT_FEED).await?;
+        if is_fed {
+            sandbox.ensure_feed();
+        }
+        // An exit the guest reports and the node has not logged is on its
+        // way, or was never fed, as for a command run before the agent was.
+        let exit = (info.state == "exited").then_some(burrow_common::cmdlog::Frame::Exit {
+            code: info.exit_code,
+            signal: info.exit_signal,
+        });
+        if is_fed && (is_logged_whole || exit.is_some()) {
+            return Ok(follow_log(
+                &sandbox,
+                command_id,
+                start.from_offset,
+                None,
+                exit,
+            ));
         }
 
+        // An agent that keeps no output of its own is followed from the node's
+        // log, and only given the input.
+        let from_offset = if is_fed { u64::MAX } else { start.from_offset };
         let first = guestpb::AttachInput {
             input: Some(AgentInput::Start(guestpb::AttachStart {
-                command_id,
-                from_offset: start.from_offset,
+                command_id: command_id.clone(),
+                from_offset,
             })),
         };
         let outbound = async_stream::stream! {
@@ -106,12 +140,17 @@ impl NodeApi {
                 yield guestpb::AttachInput { input: Some(input) };
             }
         };
-        let stream = agent
-            .attach(outbound)
-            .await?
-            .into_inner()
-            .map(|res| res.map(translate_exec_output));
-        Ok(Box::pin(stream))
+        let guest = agent.attach(outbound).await?.into_inner();
+        if !is_fed {
+            return Ok(Box::pin(guest.map(|res| res.map(translate_exec_output))));
+        }
+        Ok(follow_log(
+            &sandbox,
+            command_id,
+            start.from_offset,
+            Some(guest),
+            None,
+        ))
     }
 
     /// Download, as `user` when one is given; see [`exec_stream`](Self::exec_stream).
@@ -232,6 +271,7 @@ impl NodeApi {
         // boundary this policy draws, so it cannot be the thing that holds it.
         check_exec(&sandbox.policy())?;
         let mut agent = sandbox.agent().await?;
+        sandbox.ensure_feed();
 
         // A sandbox from an OCI image should behave like that image: its `PATH`
         // is usually the only reason an interpreter installed at an unusual
@@ -1445,7 +1485,7 @@ impl NodeService for NodeApi {
                 .commands
                 .into_iter()
                 .take(MAX_REPORTED_COMMANDS)
-                .map(command_info)
+                .map(|info| logged_info(&sandbox, info))
                 .collect(),
         }))
     }
@@ -1464,7 +1504,7 @@ impl NodeService for NodeApi {
             .get_command(guestpb::GetCommandRequest { command_id })
             .await?
             .into_inner();
-        Ok(Response::new(command_info(info)))
+        Ok(Response::new(logged_info(&sandbox, info)))
     }
 
     /// Follows a command that is already running.
@@ -1502,9 +1542,10 @@ impl NodeService for NodeApi {
             .prune_commands(guestpb::PruneCommandsRequest {})
             .await?
             .into_inner();
+        let freed = sandbox.logs.remove(&pruned.command_ids);
         Ok(Response::new(api::PruneCommandsResponse {
             removed: pruned.removed,
-            freed_bytes: pruned.freed_bytes,
+            freed_bytes: pruned.freed_bytes + freed,
         }))
     }
 
@@ -1657,6 +1698,17 @@ fn bounded(mut value: String, max: usize) -> String {
 
 /// Maps a guest's report of one command onto the public shape, bounding every
 /// field the guest chose the size of.
+/// A command as the guest reports it, with the output the node holds for it.
+/// An agent that keeps its own output says how much; one that feeds it here
+/// says nothing.
+fn logged_info(sandbox: &RunningSandbox, info: guestpb::CommandInfo) -> api::CommandInfo {
+    let mut info = command_info(info);
+    if info.buffered_bytes == 0 {
+        info.buffered_bytes = sandbox.logs.held_bytes(&info.command_id);
+    }
+    info
+}
+
 fn command_info(info: guestpb::CommandInfo) -> api::CommandInfo {
     api::CommandInfo {
         command_id: bounded(info.command_id, MAX_COMMAND_ID),
@@ -2429,6 +2481,101 @@ fn translate_exec_input(msg: api::ExecInput) -> Option<guestpb::ExecInput> {
         ApiInput::Start(_) => return None,
     };
     Some(guestpb::ExecInput { input: Some(input) })
+}
+
+/// Replays command `id`'s log from `from` and follows it to the command's
+/// exit. `input`, the guest attach carrying the caller's input, is held open
+/// for as long as the caller follows; its output is the log's, read here.
+/// `exit`, for a command the guest says has exited, ends the follow once
+/// nothing more has arrived for a moment.
+fn follow_log(
+    sandbox: &RunningSandbox,
+    id: String,
+    from: u64,
+    input: Option<tonic::Streaming<guestpb::ExecOutput>>,
+    exit: Option<burrow_common::cmdlog::Frame>,
+) -> BoxStream<api::ExecOutput> {
+    use burrow_common::cmdlog::{Frame, Replayed};
+    use tokio::sync::broadcast::error::RecvError;
+
+    const REPLAY_BUDGET: usize = 256 << 10;
+    const EXIT_SETTLE: std::time::Duration = std::time::Duration::from_secs(2);
+    let logs = std::sync::Arc::clone(&sandbox.logs);
+    let wrap = |output| api::ExecOutput {
+        output: Some(output),
+    };
+    Box::pin(async_stream::try_stream! {
+        let _input = input;
+        let mut offset = from;
+        let mut follow = logs.follow(&id, offset);
+        loop {
+            if let Some(plan) = follow.plan.take() {
+                let (tx, mut rx) = tokio::sync::mpsc::channel(4);
+                let end = plan.end();
+                let reading = tokio::task::spawn_blocking(move || {
+                    plan.read(REPLAY_BUDGET, |batch| tx.blocking_send(batch).is_ok())
+                });
+                while let Some(batch) = rx.recv().await {
+                    for step in batch {
+                        match step {
+                            Replayed::Lost(lost) => {
+                                yield wrap(api::exec_output::Output::LostBytes(lost));
+                            }
+                            Replayed::Frame(frame) => {
+                                for output in crate::cmdlogs::outputs(frame) {
+                                    yield wrap(output);
+                                }
+                            }
+                        }
+                    }
+                }
+                reading
+                    .await
+                    .map_err(|err| Status::internal(format!("reading a command log: {err}")))?
+                    .map_err(|err| Status::internal(format!("reading a command log: {err}")))?;
+                if follow.has_exit {
+                    return;
+                }
+                offset = offset.max(end);
+            }
+            let next = match &exit {
+                Some(_) => tokio::time::timeout(EXIT_SETTLE, follow.live.recv()).await.ok(),
+                None => Some(follow.live.recv().await),
+            };
+            let Some(next) = next else {
+                for output in crate::cmdlogs::outputs(exit.clone().expect("timed out on one")) {
+                    yield wrap(output);
+                }
+                return;
+            };
+            match next {
+                Ok(live) if live.id == id => {
+                    if let Frame::Exit { .. } = live.frame {
+                        for output in crate::cmdlogs::outputs(live.frame) {
+                            yield wrap(output);
+                        }
+                        return;
+                    }
+                    let end = live.at + live.frame.len() as u64;
+                    if end <= offset {
+                        continue;
+                    }
+                    if live.at > offset {
+                        yield wrap(api::exec_output::Output::LostBytes(live.at - offset));
+                    }
+                    let frame = live.frame.tail(offset.saturating_sub(live.at) as usize);
+                    offset = end;
+                    for output in crate::cmdlogs::outputs(frame) {
+                        yield wrap(output);
+                    }
+                }
+                Ok(_) => {}
+                // Fell behind: what was skipped is in the log.
+                Err(RecvError::Lagged(_)) => follow = logs.follow(&id, offset),
+                Err(RecvError::Closed) => return,
+            }
+        }
+    })
 }
 
 fn translate_exec_output(msg: guestpb::ExecOutput) -> api::ExecOutput {

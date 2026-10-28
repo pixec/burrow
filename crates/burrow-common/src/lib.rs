@@ -1,5 +1,6 @@
 pub mod access;
 pub mod auth;
+pub mod cmdlog;
 pub mod edge;
 pub mod glob;
 pub mod tags;

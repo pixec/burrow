@@ -614,8 +614,10 @@ burrow logs sbx_2f0c
 # `burrow logs sbx_2f0c <COMMAND-ID>`. `burrow top sbx_2f0c` lists them
 ```
 
-Every byte a command prints is kept, in a log on the sandbox's own disk, until
-[`prune`](#prune) removes it, so `logs` replays from the very start. A command
+Every byte a command prints is kept, in a log on the node rather than in the
+sandbox, until [`prune`](#prune) removes it, so `logs` replays from the very
+start, and a finished command's output replays even while the sandbox is
+suspended. Logs go with the sandbox when it moves. A command
 run with `--log-max-size` keeps only its newest files; what rotation dropped is
 reported on stderr by how many bytes, as is anything a failed write never
 recorded. Attaching to a command that has already finished replays it and

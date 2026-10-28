@@ -20,6 +20,7 @@
 //! sandboxes/<id>/<generation>/snapshot.vmstate
 //! sandboxes/<id>/<generation>/snapshot.mem.index.json
 //! sandboxes/<id>/<generation>/scratch.ext4.index.json
+//! sandboxes/<id>/<generation>/command-logs.json
 //! chunks/<sha256>
 //! blobs/<digest>
 //! ```
@@ -44,6 +45,8 @@ const LOCAL: &str = "durable.json";
 const SCRATCH_IMAGE: &str = "scratch.ext4";
 const TEMPLATE_KERNEL: &str = "vmlinux";
 const TEMPLATE_ROOTFS: &str = "rootfs.ext4";
+/// The sandbox's command logs, by file name, as chunked images.
+const COMMAND_LOGS: &str = "command-logs.json";
 
 /// The guest-memory offsets a VM faulted on while it ran, recorded by the
 /// page-fault handler as it exits. Uploaded with the state, so a node adopting
@@ -140,6 +143,15 @@ pub struct LocalState {
     pub rootfs: Stamp,
     pub memory: ImageIndex,
     pub scratch_index: ImageIndex,
+    #[serde(default)]
+    pub logs: std::collections::BTreeMap<String, LogImage>,
+}
+
+/// One command log file as uploaded.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LogImage {
+    pub stamp: Stamp,
+    pub index: ImageIndex,
 }
 
 impl LocalState {
@@ -162,6 +174,7 @@ impl LocalState {
         self.memory
             .digests()
             .chain(self.scratch_index.digests())
+            .chain(self.logs.values().flat_map(|log| log.index.digests()))
             .map(str::to_string)
             .collect()
     }
@@ -264,6 +277,7 @@ impl Durability {
 pub async fn upload(
     store: &ObjectStore,
     workdir: &Path,
+    logs_dir: &Path,
     chain: &[String],
     draft: Manifest,
     previous: Option<&LocalState>,
@@ -323,6 +337,8 @@ pub async fn upload(
         }
     };
 
+    let logs = upload_logs(store, logs_dir, previous, &known).await?;
+
     let now_ms = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map_or(0, |d| d.as_millis() as u64);
@@ -354,6 +370,13 @@ pub async fn upload(
             .put_bytes(&index_key(&id, generation, file), json)
             .await?;
     }
+    let indexes: std::collections::BTreeMap<&String, &ImageIndex> =
+        logs.iter().map(|(name, log)| (name, &log.index)).collect();
+    let json = serde_json::to_vec(&indexes)
+        .map_err(|err| Status::internal(format!("encoding an index: {err}")))?;
+    store
+        .put_bytes(&generation_key(&id, generation, COMMAND_LOGS), json)
+        .await?;
 
     // The sandbox's files were read without holding them still. A resume
     // cancels the upload before it starts the guest, so a change here is a
@@ -381,6 +404,7 @@ pub async fn upload(
         rootfs,
         memory,
         scratch_index,
+        logs,
     };
     save_local(workdir, &local).await?;
     write_manifest(store, &local.manifest).await?;
@@ -469,6 +493,7 @@ pub async fn stage(
     snapshots: &crate::snapshot::SnapshotStore,
     manifest: &Manifest,
     dest: &Path,
+    logs_dir: &Path,
 ) -> Result<(Vec<String>, Option<Arc<Hydrator>>), Status> {
     let id = &manifest.id;
     let generation = manifest.generation;
@@ -529,6 +554,7 @@ pub async fn stage(
     }
     hydrator.start();
     let fetched_scratch = started.elapsed();
+    let logs = stage_logs(store, id, generation, logs_dir).await?;
 
     let io = |what: &str, err: std::io::Error| Status::internal(format!("{what}: {err}"));
     let stamp = |file: &str| Stamp::of(&dest.join(file)).map_err(|err| io(file, err));
@@ -542,6 +568,7 @@ pub async fn stage(
         rootfs: stamp(TEMPLATE_ROOTFS)?,
         memory,
         scratch_index,
+        logs,
     };
     save_local(dest, &local).await?;
     tracing::info!(
@@ -556,6 +583,83 @@ pub async fn stage(
 }
 
 const PAGE: u64 = 4096;
+
+/// Uploads the sandbox's command logs, each a chunked image so what an
+/// earlier upload put is not put again: a log only grows.
+async fn upload_logs(
+    store: &ObjectStore,
+    dir: &Path,
+    previous: Option<&LocalState>,
+    known: &HashSet<String>,
+) -> Result<std::collections::BTreeMap<String, LogImage>, Status> {
+    let mut names: Vec<String> = std::fs::read_dir(dir)
+        .into_iter()
+        .flatten()
+        .flatten()
+        .filter_map(|entry| entry.file_name().into_string().ok())
+        .filter(|name| name.ends_with(".log"))
+        .collect();
+    names.sort();
+    let mut logs = std::collections::BTreeMap::new();
+    for name in names {
+        let Ok(stamp) = Stamp::of(&dir.join(&name)) else {
+            continue;
+        };
+        let held = previous
+            .and_then(|p| p.logs.get(&name))
+            .filter(|log| log.stamp == stamp);
+        let index = match held {
+            Some(log) => log.index.clone(),
+            None => {
+                crate::chunks::put_image(store, dir, std::slice::from_ref(&name), None, known)
+                    .await?
+            }
+        };
+        logs.insert(name, LogImage { stamp, index });
+    }
+    Ok(logs)
+}
+
+/// Brings a stored sandbox's command logs into `dir`. A generation uploaded
+/// before logs were kept on the node has none.
+async fn stage_logs(
+    store: &ObjectStore,
+    id: &str,
+    generation: u64,
+    dir: &Path,
+) -> Result<std::collections::BTreeMap<String, LogImage>, Status> {
+    let key = generation_key(id, generation, COMMAND_LOGS);
+    let Some(bytes) = store.get_bytes(&key).await? else {
+        return Ok(Default::default());
+    };
+    let indexes: std::collections::BTreeMap<String, ImageIndex> = serde_json::from_slice(&bytes)
+        .map_err(|err| Status::data_loss(format!("index {key} is unreadable: {err}")))?;
+    {
+        use std::os::unix::fs::DirBuilderExt as _;
+        std::fs::DirBuilder::new()
+            .recursive(true)
+            .mode(0o700)
+            .create(dir)
+            .map_err(|err| Status::internal(format!("creating {}: {err}", dir.display())))?;
+    }
+    let mut logs = std::collections::BTreeMap::new();
+    for (name, index) in indexes {
+        if name.contains('/') || !name.ends_with(".log") {
+            continue;
+        }
+        let path = dir.join(&name);
+        crate::chunks::get_image(store, &index, &path).await?;
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))
+                .map_err(|err| Status::internal(format!("{}: {err}", path.display())))?;
+        }
+        let stamp = Stamp::of(&path)
+            .map_err(|err| Status::internal(format!("{}: {err}", path.display())))?;
+        logs.insert(name, LogImage { stamp, index });
+    }
+    Ok(logs)
+}
 
 /// A plan file's offsets: little-endian `u64`s, the page-fault handler's
 /// format. One that cannot be read is empty, since a plan only saves faults.
@@ -618,6 +722,22 @@ pub async fn collect_garbage(
             {
                 referenced.extend(index.digests().map(str::to_string));
             }
+        }
+        if let Some(bytes) = store
+            .get_bytes(&generation_key(id, manifest.generation, COMMAND_LOGS))
+            .await?
+        {
+            let logs: std::collections::BTreeMap<String, ImageIndex> =
+                serde_json::from_slice(&bytes).map_err(|err| {
+                    Status::data_loss(format!(
+                        "sandbox {id}'s command log index is unreadable: {err}"
+                    ))
+                })?;
+            referenced.extend(
+                logs.values()
+                    .flat_map(ImageIndex::digests)
+                    .map(str::to_string),
+            );
         }
         current.insert(id.to_string(), manifest.generation);
     }

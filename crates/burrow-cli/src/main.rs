@@ -376,8 +376,8 @@ enum Command {
     },
     /// Replay and follow a command's output.
     ///
-    /// The guest keeps the last 256 KiB of each command's output, so a chatty
-    /// command replays its tail rather than everything it has said.
+    /// Every byte is kept on the node until `burrow prune`, so this replays
+    /// from the start unless the command asked for its log to rotate.
     Logs {
         id: String,
         /// Command to follow, from `burrow top`. Required: burrow's logs belong

@@ -271,6 +271,7 @@ impl Guest for AgentService {
             features: vec![
                 files::FEATURE_FILES_AS_USER.to_string(),
                 "attach-input".to_string(),
+                "output-feed".to_string(),
             ],
         }))
     }
@@ -355,7 +356,7 @@ impl Guest for AgentService {
         &self,
         req: Request<guestpb::AttachCommandRequest>,
     ) -> Result<Response<Self::AttachCommandStream>, Status> {
-        let rx = commands::attach(&req.into_inner().command_id, 0)?;
+        let rx = commands::attach(&req.into_inner().command_id)?;
         Ok(Response::new(tokio_stream::wrappers::ReceiverStream::new(
             rx,
         )))
@@ -378,7 +379,7 @@ impl Guest for AgentService {
                 "first Attach message must be Start",
             ));
         };
-        let rx = commands::attach(&start.command_id, start.from_offset)?;
+        let rx = commands::attach(&start.command_id)?;
         // Looked up on the first input rather than now: following a command
         // that has finished is fine, and only feeding it is not.
         let id = start.command_id;
@@ -422,11 +423,19 @@ impl Guest for AgentService {
         &self,
         _req: Request<guestpb::PruneCommandsRequest>,
     ) -> Result<Response<guestpb::PruneCommandsResponse>, Status> {
-        Ok(Response::new(
-            tokio::task::spawn_blocking(commands::prune)
-                .await
-                .map_err(|err| Status::internal(format!("pruning did not run: {err}")))?,
-        ))
+        Ok(Response::new(commands::prune()))
+    }
+
+    type FeedStream = tokio_stream::wrappers::ReceiverStream<Result<guestpb::FeedFrame, Status>>;
+
+    async fn feed(
+        &self,
+        req: Request<tonic::Streaming<guestpb::FeedAck>>,
+    ) -> Result<Response<Self::FeedStream>, Status> {
+        let rx = commands::feed(req.into_inner()).await?;
+        Ok(Response::new(tokio_stream::wrappers::ReceiverStream::new(
+            rx,
+        )))
     }
 
     async fn signal_command(
