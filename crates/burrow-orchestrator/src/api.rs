@@ -2448,6 +2448,27 @@ impl Burrow for ApiService {
 
     type TailEventsStream = BoxStream<common::Event>;
 
+    async fn query_usage(
+        &self,
+        req: Request<api::QueryUsageRequest>,
+    ) -> Result<Response<api::QueryUsageResponse>, Status> {
+        let req = req.into_inner();
+        let store = self
+            .0
+            .store
+            .as_ref()
+            .ok_or_else(|| Status::unavailable("the usage ledger needs a store"))?;
+        let sandbox = if req.sandbox.is_empty() {
+            None
+        } else {
+            Some(self.resolve(&req.sandbox).await)
+        };
+        let resp = crate::ledger::query(store, &req, sandbox)
+            .await
+            .map_err(|err| Status::internal(format!("reading usage: {err}")))?;
+        Ok(Response::new(resp))
+    }
+
     /// Replays the fleet log after a position, then follows it. Subscribed
     /// before the replay so nothing between the two is missed, and live
     /// events at or below the last replayed position are dropped so nothing
@@ -2490,9 +2511,9 @@ impl Burrow for ApiService {
             if !req.is_follow {
                 return;
             }
-            // Only the leader copies node logs, so with several replicas the
-            // live broadcast is only fed on one of them; every replica can read
-            // the shared log, so followers poll it instead.
+            // Nodes push to whichever replica they reach, so with several the
+            // live broadcast here carries only some of the log; every replica
+            // can read the shared log, so they poll it instead.
             if state.events.is_shared() {
                 loop {
                     let batch = state

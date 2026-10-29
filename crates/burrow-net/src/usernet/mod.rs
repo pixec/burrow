@@ -83,6 +83,8 @@
 //!   proxy's table, plus the record's `allow_cidrs`, `allow_ports` and peers,
 //!   and `send_replace` it wherever the daemon re-syncs the firewall.
 //! - `ExposePort` is [`Handle::publish`] with a listener on the host port.
+//! - One [`Meter`] per sandbox, kept across its VMs, counts the bytes the
+//!   guest's NIC carries; read it into the sandbox's totals on every sample.
 //! - Drop the [`Handle`] when the VM stops. Nothing of the stack is saved in
 //!   a VM snapshot: attach a fresh one on restore. The guest keeps its lease,
 //!   since the address is the same, and its open connections are reset.
@@ -112,6 +114,7 @@ mod tests;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::os::fd::OwnedFd;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use burrow_proxy::directory::Directory;
 use burrow_proxy::inspect::Authority;
@@ -207,20 +210,58 @@ pub struct Node {
     pub dns_upstream: SocketAddr,
 }
 
+/// Bytes on the guest's link, counted as IP packets the way the Linux
+/// `burrow_meter` counters count them on the tap: every frame the guest sends
+/// is counted before the stack decides anything about it, so traffic the
+/// policy then drops still counts, and every frame written back to the guest
+/// is counted as it is delivered. ARP and other non-IP frames are not.
+#[derive(Debug, Default)]
+pub struct Meter {
+    rx: AtomicU64,
+    tx: AtomicU64,
+}
+
+impl Meter {
+    pub fn traffic(&self) -> crate::firewall::Traffic {
+        crate::firewall::Traffic {
+            rx_bytes: self.rx.load(Ordering::Relaxed),
+            tx_bytes: self.tx.load(Ordering::Relaxed),
+        }
+    }
+
+    pub(crate) fn sent(&self, frame: &[u8]) {
+        self.tx.fetch_add(ip_bytes(frame), Ordering::Relaxed);
+    }
+
+    pub(crate) fn delivered(&self, frame: &[u8]) {
+        self.rx.fetch_add(ip_bytes(frame), Ordering::Relaxed);
+    }
+}
+
+/// The IP packet an Ethernet frame carries, in bytes; 0 for anything else.
+fn ip_bytes(frame: &[u8]) -> u64 {
+    match frame.get(12..14) {
+        Some([0x08, 0x00]) | Some([0x86, 0xdd]) => (frame.len() - 14) as u64,
+        _ => 0,
+    }
+}
+
 /// The stack itself; see the module docs.
 pub struct UserNet;
 
 impl UserNet {
     /// Starts serving the guest on `fd`, the daemon's end of the socket pair
     /// whose other end is the guest's NIC. Must be called inside a tokio
-    /// runtime. Everything stops when the returned handle is dropped.
+    /// runtime. Everything stops when the returned handle is dropped; what
+    /// the link carried keeps adding up in `meter`.
     pub fn attach(
         fd: OwnedFd,
         net: SandboxNet,
         policy: watch::Receiver<Policy>,
         node: Arc<Node>,
+        meter: Arc<Meter>,
     ) -> std::io::Result<Handle> {
-        stack::attach(fd, net, policy, node)
+        stack::attach(fd, net, policy, node, meter)
     }
 }
 

@@ -9,6 +9,24 @@ import "api.proto";
 service NodeRegistry {
   rpc Register(RegisterRequest) returns (RegisterResponse);
   rpc Heartbeat(HeartbeatRequest) returns (HeartbeatResponse);
+  // Commits events from the node's log, in the node's order. A node does not
+  // let the lifecycle call that caused an event return until this has
+  // acknowledged it.
+  rpc PushEvents(PushEventsRequest) returns (PushEventsResponse);
+}
+
+message PushEventsRequest {
+  string node_id = 1;
+  // Ascending by `seq`, the node's own position, starting just after the
+  // last `committed_seq` the node was told. Empty asks only where the
+  // orchestrator's copy of this node's log ends.
+  repeated burrow.common.v1.Event events = 2;
+}
+
+message PushEventsResponse {
+  // The highest node position committed for this node, including what an
+  // earlier push already committed.
+  uint64 committed_seq = 1;
 }
 
 // Served by burrowd; called by the orchestrator to drive sandbox lifecycle.
@@ -59,7 +77,8 @@ service NodeService {
   // can place a create from a snapshot whose node is gone.
   rpc ListDurableSnapshots(NodeListSnapshotsRequest) returns (burrow.api.v1.ListSnapshotsResponse);
 
-  // This node's event log from a position, then live while `is_follow`.
+  // This node's own event log from a position, then live while `is_follow`,
+  // including what is still queued for the orchestrator.
   rpc TailEvents(NodeTailEventsRequest) returns (stream burrow.common.v1.Event);
 
   rpc CreateVolume(burrow.api.v1.CreateVolumeRequest) returns (burrow.common.v1.Volume);
@@ -347,6 +366,8 @@ message SandboxStateReport {
   // The node will not resume this durable sandbox until the orchestrator
   // confirms it still lives here: the node restarted, or lost its lease.
   bool is_fenced = 8;
+  // The record's `state_reason`.
+  string state_reason = 9;
 }
 
 message HeartbeatResponse {

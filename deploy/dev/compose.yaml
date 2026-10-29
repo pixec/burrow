@@ -142,6 +142,9 @@ services:
     # as root on the host, where none of this applies. Do not read it as the
     # deployment model.
     privileged: true
+    # A stop suspends every running sandbox before the daemon exits, one
+    # snapshot each; docker's default of 10s kills it part way through.
+    stop_grace_period: 2m
     devices:
       - /dev/kvm
       - /dev/net/tun
@@ -197,6 +200,7 @@ services:
     # as root on the host, where none of this applies. Do not read it as the
     # deployment model.
     privileged: true
+    stop_grace_period: 2m
     devices:
       - /dev/kvm
       - /dev/net/tun

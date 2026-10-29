@@ -32,6 +32,9 @@ spec:
       # and a sandbox's gateway address is a host address, not a pod one.
       hostNetwork: true
       dnsPolicy: ClusterFirstWithHostNet
+      # A stop suspends every running sandbox before burrowd exits. Killed
+      # part way through, the rest lose their memory and come back stopped.
+      terminationGracePeriodSeconds: 120
       containers:
         - name: burrowd
           # Pinned, not :latest. A DaemonSet rolls onto every KVM machine at

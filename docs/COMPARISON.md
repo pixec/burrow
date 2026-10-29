@@ -195,8 +195,8 @@ process on SQLite is still supported.
 - **Webhooks.** E2B delivers signed lifecycle webhooks. Burrow has a fleet-wide
   event log you can replay and follow from the last position you saw
   (`burrow events -f`, the `TailEvents` API), with each sandbox's cpu and
-  network totals on every event. It has no webhooks yet. See
-  [METERING.md](METERING.md).
+  network totals on every event, and a usage ledger built from it
+  (`burrow usage`). It has no webhooks yet. See [METERING.md](METERING.md).
 - **Tenancy and billing.** The managed services have accounts, quotas and
   invoices. Burrow meters usage and stops there. Tenancy is your own API in
   front of it.

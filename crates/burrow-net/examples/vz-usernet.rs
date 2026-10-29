@@ -115,7 +115,7 @@ mod macos {
             dns_upstream: SocketAddr::from(([1, 1, 1, 1], 53)),
         });
         let (policy_tx, policy_rx) = watch::channel(parse_policy("none")?);
-        let handle = UserNet::attach(host_end, net, policy_rx, node)?;
+        let handle = UserNet::attach(host_end, net, policy_rx, node, Arc::default())?;
         handle.publish(
             tokio::net::TcpListener::bind(("127.0.0.1", ssh_port)).await?,
             22,

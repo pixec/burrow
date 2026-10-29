@@ -778,6 +778,7 @@ dependencies = [
  "hex",
  "hyper-util",
  "libc",
+ "opentelemetry",
  "prost",
  "reqwest",
  "ruzstd",

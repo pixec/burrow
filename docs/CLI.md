@@ -120,7 +120,7 @@ Three deviate on purpose:
 
 No Docker counterpart at all: [`fork`](#fork), [`move`](#move),
 [`sessions`](#sessions), [`recreate`](#recreate), [`expose`](#expose),
-[`events`](#events), [`audit`](#audit), [`secret`](#secret), [`user`](#user),
+[`events`](#events), [`usage`](#usage), [`audit`](#audit), [`secret`](#secret), [`user`](#user),
 [`group`](#group) and [`config`](#config).
 
 ## Aliases
@@ -189,6 +189,7 @@ No Docker counterpart at all: [`fork`](#fork), [`move`](#move),
 | [`secret`](#secret) | Credentials Sandbox Kits ask for by service name |
 | [`token`](#token) | Issue and revoke tokens for calling a sandbox's node |
 | [`events`](#events) | Show and follow what happened to sandboxes |
+| [`usage`](#usage) | Show what sandboxes consumed, from the usage ledger |
 | [`audit`](#audit) | Show egress attempts and DNS lookups |
 | [`nodes`](#nodes) | Inspect and drain nodes |
 
@@ -1685,12 +1686,56 @@ burrow events --after 46 --sandbox sbx_397227c398ff43e6a206316be8d685a0
 | `--follow`, `-f` | Keep printing new events as they happen. |
 | `--limit <N>` | Rows to replay. Defaults to 100. |
 
-The events are `created`, `started`, `agent_ready`, `stopped`, `destroyed` and
-`snapshot_created`. `DETAIL` carries how a VM started (`boot`, `restore`,
-`resume`) or stopped (`suspended`, `deleted`, `stopped`, `failed`), what a
-sandbox was created from (`fork:<id>`, `snapshot:<id>`), or the snapshot a
-commit produced. Each event also carries the sandbox's cpu and network totals
-at that instant, which the SDKs expose.
+The events are `created`, `started`, `agent_ready`, `stopped`, `destroyed`,
+`snapshot_created`, and `recovered`, which a node logs for each sandbox it
+finds on restart. `DETAIL` carries how a VM started (`boot`, `restore`,
+`resume`) or stopped (`suspended`, `deleted`, `stopped`, `failed`, or `lost`
+for a VM a node found gone on restart), what a sandbox was created from
+(`fork:<id>`, `snapshot:<id>`), or the snapshot a commit produced. Each event also carries the sandbox's cpu and network totals
+and its shape at that instant, which the SDKs expose and [`usage`](#usage) is
+built from.
+
+## usage
+
+Show what sandboxes consumed: the intervals each spent in one state at one
+shape, or their sums. Read from the orchestrator's usage ledger, so sandboxes
+that no longer exist are included. See [METERING.md](METERING.md).
+
+```
+burrow usage [OPTIONS]
+```
+
+```sh
+burrow usage --sandbox sbx_44d9739f011c42439003b74ebd3ff059
+#     ID SANDBOX                  STATE      VCPU    MEM STARTED                  DURATION        CPU         RX         TX CLOSED
+#   1564 sbx_44d9739f011c4243900… running       2   1024 2026-10-29T07:00:17Z       7m 27s     101.1s   46.0 MiB  186.6 KiB stopped
+#   1565 sbx_44d9739f011c4243900… suspended     2   1024 2026-10-29T07:07:45Z        20.8s       0.0s      192 B        0 B started
+#   1566 sbx_44d9739f011c4243900… running       2   1024 2026-10-29T07:08:06Z        16.9s       6.5s      192 B        0 B destroyed
+
+burrow usage --from 2026-10-29 --group-by customer
+# GROUP                    STATE       ROWS     DURATION    VCPU-H     GIB-H        CPU         RX         TX
+# acme                     running        3       9m 33s     0.319     0.159     115.5s   46.0 MiB  186.8 KiB
+# acme                     suspended      2        20.8s     0.012     0.006       0.0s      192 B        0 B
+# globex                   running        1       2m 58s     0.050     0.025      21.8s      768 B      544 B
+```
+
+| Option | Description |
+| --- | --- |
+| `--from <DATE>` | Start of the window, UTC: `2026-10-01` or `2026-10-01T12:00:00Z`. An interval belongs to the window it started in. |
+| `--to <DATE>` | End of the window, exclusive, in the same form. |
+| `--sandbox <ID>` | Restrict to one sandbox, by id, or by name while it exists. |
+| `--tag <KEY=VALUE>` | Only sandboxes that carried this tag. Repeatable. |
+| `--group-by <KEY>` | Sum per group and state by `sandbox`, `template`, `node`, `state` or a tag key. Omitted lists the intervals. |
+| `--format <FORMAT>` | `table` (default) or `json`. |
+| `--closed` | Leave out the stretch since each open interval began. |
+| `--after <ID>` | Continue an export after this interval id, the previous page's `next_after`. |
+| `--limit <N>` | Intervals per page. Defaults to 1000; sums are never paged. |
+
+`CLOSED` is the event that ended an interval, `checkpoint` for the split of a
+state lasting past the hour, `write_off` for a node that went silent, or
+`vanished`, a backstop for a sandbox that disappeared without an event. A row marked
+`open` is the current stretch up to the last heartbeat. `VCPU-H` and `GIB-H`
+are duration weighted by the shape, the usual inputs to a rate card.
 
 ## audit
 

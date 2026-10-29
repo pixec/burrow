@@ -78,6 +78,7 @@ struct Guest {
     handle: Handle,
     policy: watch::Sender<Policy>,
     audit: Arc<Mutex<Vec<EgressEvent>>>,
+    meter: Arc<Meter>,
     ident: u16,
 }
 
@@ -99,12 +100,14 @@ impl Guest {
             dns_upstream: fake_upstream().await,
         });
         let (tx, rx) = watch::channel(policy);
-        let handle = UserNet::attach(theirs, net(), rx, node).unwrap();
+        let meter = Arc::new(Meter::default());
+        let handle = UserNet::attach(theirs, net(), rx, node, Arc::clone(&meter)).unwrap();
         Self {
             link,
             handle,
             policy: tx,
             audit,
+            meter,
             ident: 0,
         }
     }
@@ -591,6 +594,39 @@ async fn ping_reaches_the_gateway() {
     // Anywhere else, nothing: echo is not relayed.
     guest.send_ip(GUEST, REMOTE, IpProtocol::Icmp, &body).await;
     assert!(guest.recv(QUIET).await.is_none());
+}
+
+/// IP bytes are counted both ways, the guest's whether or not policy lets
+/// them anywhere, and frames that are not IP are not counted at all.
+#[tokio::test]
+async fn the_meter_counts_ip_bytes_ahead_of_policy() {
+    let mut guest = Guest::attach(policy(NetworkMode::None, &[], &[], &[])).await;
+    let echo = Icmpv4Repr::EchoRequest {
+        ident: 7,
+        seq_no: 1,
+        data: b"ping",
+    };
+    let mut body = vec![0u8; echo.buffer_len()];
+    echo.emit(
+        &mut Icmpv4Packet::new_unchecked(&mut body[..]),
+        &ChecksumCapabilities::default(),
+    );
+    let packet = (20 + body.len()) as u64;
+    guest.send_ip(GUEST, GATEWAY, IpProtocol::Icmp, &body).await;
+    guest
+        .recv_ip(IpProtocol::Icmp, WAIT)
+        .await
+        .expect("a reply");
+    // Denied in `none` mode, counted all the same.
+    guest
+        .send_udp((GUEST, 40000), (REMOTE, 9), b"dropped")
+        .await;
+    let arp = guest.frame(MAC, EthernetProtocol::Arp, &[0u8; 28]);
+    guest.link.send(&arp).await.unwrap();
+    assert!(guest.recv(QUIET).await.is_none());
+    let traffic = guest.meter.traffic();
+    assert_eq!(traffic.tx_bytes, packet + 20 + 8 + 7);
+    assert_eq!(traffic.rx_bytes, packet);
 }
 
 #[tokio::test]

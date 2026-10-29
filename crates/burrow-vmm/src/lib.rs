@@ -521,10 +521,9 @@ impl Vm {
         match self {
             Self::Firecracker(vm) => vm.pid(),
             Self::CloudHypervisor(vm) => vm.pid(),
-            // The machine runs in an XPC service the framework spawns, whose
-            // pid it does not expose.
+            // The XPC service the framework spawned for the machine.
             #[cfg(target_os = "macos")]
-            Self::Vz(_) => None,
+            Self::Vz(vm) => vm.pid(),
         }
     }
 
@@ -539,13 +538,13 @@ impl Vm {
     }
 
     /// Host CPU this VM has consumed, in microseconds; `None` without a
-    /// cgroup.
+    /// cgroup, or for a vz machine whose process could not be found.
     pub fn cpu_usage_usec(&self) -> Option<u64> {
         match self {
             Self::Firecracker(vm) => vm.cpu_usage_usec(),
             Self::CloudHypervisor(vm) => vm.cpu_usage_usec(),
             #[cfg(target_os = "macos")]
-            Self::Vz(_) => None,
+            Self::Vz(vm) => vm.cpu_usage_usec(),
         }
     }
 

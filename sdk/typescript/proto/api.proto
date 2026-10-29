@@ -130,6 +130,9 @@ service Burrow {
   // The fleet's lifecycle log: what happened to which sandbox, in order,
   // resumable from the last `seq` seen.
   rpc TailEvents(TailEventsRequest) returns (stream burrow.common.v1.Event);
+  // The usage ledger: intervals a sandbox spent in one state at one shape,
+  // or their sums by group. Outlives the sandboxes it describes.
+  rpc QueryUsage(QueryUsageRequest) returns (QueryUsageResponse);
 }
 
 // Exec and files for one sandbox, served by the node that holds it rather
@@ -223,6 +226,77 @@ message TailEventsRequest {
   bool is_follow = 3;
   // Cap on replayed events; 0 selects a server default.
   uint32 limit = 4;
+}
+
+message QueryUsageRequest {
+  // Intervals that start in [from, to), unix milliseconds. 0 leaves that end
+  // open.
+  int64 from_unix_ms = 1;
+  int64 to_unix_ms = 2;
+  // A sandbox id, or the name of one that still exists. Empty means every
+  // sandbox.
+  string sandbox = 3;
+  // Only intervals whose sandbox carried every one of these tags.
+  map<string, string> tags = 4;
+  // "sandbox", "template", "node", "state", or a tag key. Empty returns the
+  // intervals themselves; anything else returns their sums per group and
+  // state.
+  string group_by = 5;
+  // Intervals with a row id above this, for an export that resumes where it
+  // stopped. Open intervals have no id and are never returned with a cursor.
+  uint64 after_id = 6;
+  // Cap on returned intervals; 0 selects a server default. Sums are never
+  // capped.
+  uint32 limit = 7;
+  // Also count the stretch since each open interval began, up to the last
+  // heartbeat, as a row with `is_open` set.
+  bool is_open_included = 8;
+}
+
+message UsageInterval {
+  // Row id in the ledger, ascending in the order rows were written. 0 for an
+  // open interval.
+  uint64 id = 1;
+  string sandbox_id = 2;
+  string node_id = 3;
+  string template = 4;
+  map<string, string> metadata = 5;
+  // "running", "suspended" or "stopped".
+  string state = 6;
+  uint32 vcpus = 7;
+  uint32 mem_mib = 8;
+  int64 started_at_unix_ms = 9;
+  int64 ended_at_unix_ms = 10;
+  // Differences of the sandbox's totals between the interval's two bounds.
+  uint64 cpu_usage_usec = 11;
+  uint64 rx_bytes = 12;
+  uint64 tx_bytes = 13;
+  // What closed it: the event type that ended the state, "checkpoint" for the
+  // hourly split of a long interval, or "write_off" for a node that went
+  // silent.
+  string closed_by = 14;
+  bool is_open = 15;
+}
+
+message UsageSum {
+  // The group's value; empty for intervals without the tag grouped by.
+  string group = 1;
+  string state = 2;
+  uint64 intervals = 3;
+  uint64 duration_ms = 4;
+  // Duration weighted by shape, for vCPU-hours and GiB-hours.
+  uint64 vcpu_ms = 5;
+  uint64 mem_mib_ms = 6;
+  uint64 cpu_usage_usec = 7;
+  uint64 rx_bytes = 8;
+  uint64 tx_bytes = 9;
+}
+
+message QueryUsageResponse {
+  repeated UsageInterval intervals = 1;
+  repeated UsageSum sums = 2;
+  // The `after_id` that continues this page; 0 when there is nothing more.
+  uint64 next_after_id = 3;
 }
 
 message WatchRequest {

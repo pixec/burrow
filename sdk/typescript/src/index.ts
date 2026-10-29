@@ -81,4 +81,8 @@ export type {
   SessionStart,
   UpdateOptions,
   Usage,
+  UsageInterval,
+  UsageQuery,
+  UsageReport,
+  UsageSum,
 } from "./types.js";

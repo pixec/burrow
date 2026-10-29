@@ -327,6 +327,11 @@ class BurrowStub(object):
                 request_serializer=api__pb2.TailEventsRequest.SerializeToString,
                 response_deserializer=common__pb2.Event.FromString,
                 _registered_method=True)
+        self.QueryUsage = channel.unary_unary(
+                '/burrow.api.v1.Burrow/QueryUsage',
+                request_serializer=api__pb2.QueryUsageRequest.SerializeToString,
+                response_deserializer=api__pb2.QueryUsageResponse.FromString,
+                _registered_method=True)
 
 
 class BurrowServicer(object):
@@ -734,6 +739,14 @@ class BurrowServicer(object):
         context.set_details('Method not implemented!')
         raise NotImplementedError('Method not implemented!')
 
+    def QueryUsage(self, request, context):
+        """The usage ledger: intervals a sandbox spent in one state at one shape,
+        or their sums by group. Outlives the sandboxes it describes.
+        """
+        context.set_code(grpc.StatusCode.UNIMPLEMENTED)
+        context.set_details('Method not implemented!')
+        raise NotImplementedError('Method not implemented!')
+
 
 def add_BurrowServicer_to_server(servicer, server):
     rpc_method_handlers = {
@@ -1026,6 +1039,11 @@ def add_BurrowServicer_to_server(servicer, server):
                     servicer.TailEvents,
                     request_deserializer=api__pb2.TailEventsRequest.FromString,
                     response_serializer=common__pb2.Event.SerializeToString,
+            ),
+            'QueryUsage': grpc.unary_unary_rpc_method_handler(
+                    servicer.QueryUsage,
+                    request_deserializer=api__pb2.QueryUsageRequest.FromString,
+                    response_serializer=api__pb2.QueryUsageResponse.SerializeToString,
             ),
     }
     generic_handler = grpc.method_handlers_generic_handler(
@@ -2596,6 +2614,33 @@ class Burrow(object):
             '/burrow.api.v1.Burrow/TailEvents',
             api__pb2.TailEventsRequest.SerializeToString,
             common__pb2.Event.FromString,
+            options,
+            channel_credentials,
+            insecure,
+            call_credentials,
+            compression,
+            wait_for_ready,
+            timeout,
+            metadata,
+            _registered_method=True)
+
+    @staticmethod
+    def QueryUsage(request,
+            target,
+            options=(),
+            channel_credentials=None,
+            call_credentials=None,
+            insecure=False,
+            compression=None,
+            wait_for_ready=None,
+            timeout=None,
+            metadata=None):
+        return grpc.experimental.unary_unary(
+            request,
+            target,
+            '/burrow.api.v1.Burrow/QueryUsage',
+            api__pb2.QueryUsageRequest.SerializeToString,
+            api__pb2.QueryUsageResponse.FromString,
             options,
             channel_credentials,
             insecure,

@@ -41,6 +41,9 @@ from .types import (
     SandboxInfo,
     Session,
     Usage,
+    UsageInterval,
+    UsageReport,
+    UsageSum,
     WatchEvent,
 )
 
@@ -1273,6 +1276,87 @@ class Burrow:
                 vcpus=raw.vcpus,
                 memory_mib=raw.mem_mib,
             )
+
+    def usage(
+        self,
+        start: Optional[datetime] = None,
+        end: Optional[datetime] = None,
+        sandbox: str = "",
+        tags: Optional[Dict[str, str]] = None,
+        group_by: str = "",
+        after_id: int = 0,
+        limit: int = 0,
+        include_open: bool = True,
+    ) -> UsageReport:
+        """Reads the usage ledger: the intervals sandboxes spent in one state at
+        one shape, or with `group_by` their sums per group and state.
+
+        An interval belongs to the window `[start, end)` it started in. The
+        ledger outlives the sandboxes and nodes it describes. `group_by` is
+        "sandbox", "template", "node", "state" or a tag key. Pass a report's
+        `next_after_id` as `after_id` to continue an export.
+
+        ```python
+        report = burrow.usage(
+            start=datetime(2026, 10, 1, tzinfo=timezone.utc),
+            end=datetime(2026, 11, 1, tzinfo=timezone.utc),
+            group_by="customer",
+        )
+        ```
+        """
+        def ms(at: Optional[datetime]) -> int:
+            return int(at.timestamp() * 1000) if at else 0
+
+        res = self._transport.unary(
+            "QueryUsage",
+            api_pb2.QueryUsageRequest(
+                from_unix_ms=ms(start),
+                to_unix_ms=ms(end),
+                sandbox=sandbox,
+                tags=tags or {},
+                group_by=group_by,
+                after_id=after_id,
+                limit=limit,
+                is_open_included=include_open,
+            ),
+        )
+        return UsageReport(
+            intervals=[
+                UsageInterval(
+                    id=raw.id,
+                    sandbox_id=raw.sandbox_id,
+                    node_id=raw.node_id,
+                    template=raw.template,
+                    metadata=dict(raw.metadata),
+                    state=raw.state,
+                    vcpus=raw.vcpus,
+                    memory_mib=raw.mem_mib,
+                    started_at_unix_ms=raw.started_at_unix_ms,
+                    ended_at_unix_ms=raw.ended_at_unix_ms,
+                    cpu_usage_usec=raw.cpu_usage_usec,
+                    rx_bytes=raw.rx_bytes,
+                    tx_bytes=raw.tx_bytes,
+                    closed_by=raw.closed_by,
+                    open=raw.is_open,
+                )
+                for raw in res.intervals
+            ],
+            sums=[
+                UsageSum(
+                    group=raw.group,
+                    state=raw.state,
+                    intervals=raw.intervals,
+                    duration_ms=raw.duration_ms,
+                    vcpu_ms=raw.vcpu_ms,
+                    memory_mib_ms=raw.mem_mib_ms,
+                    cpu_usage_usec=raw.cpu_usage_usec,
+                    rx_bytes=raw.rx_bytes,
+                    tx_bytes=raw.tx_bytes,
+                )
+                for raw in res.sums
+            ],
+            next_after_id=res.next_after_id,
+        )
 
     def drain_node(
         self, node_id: str, drain: bool = True, suspend_sandboxes: bool = False

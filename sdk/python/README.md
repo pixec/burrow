@@ -201,7 +201,7 @@ stdin. `lost_bytes` counts output a rotating log dropped.
   policy as a dict: `mode`, `allow_domains`, `allow_cidrs`, `allow_ports`,
   `deny_cidrs`, `inspect_tls` and `rules`. A key burrow does not know is
   refused rather than dropped, on the policy and on each rule.
-- `Burrow`: the fleet: `health`, `audit`, `events`, `nodes`, `drain_node`, and the secrets Sandbox Kits ask
+- `Burrow`: the fleet: `health`, `audit`, `events`, `usage`, `nodes`, `drain_node`, and the secrets Sandbox Kits ask
   for by service name: `set_secret`, `list_secrets`, `delete_secret`.
   `events` reads the fleet's lifecycle log, oldest first, and with
   `follow=True` keeps yielding new events as they happen:
@@ -212,6 +212,22 @@ stdin. `lost_bytes` counts output a rotating log dropped.
   ```
 
   Pass the last `seq` seen as `after=` to resume after a disconnect.
+  `usage` reads the usage ledger, the intervals each sandbox spent in one
+  state at one shape, which outlives the sandboxes it describes; with
+  `group_by` it returns their sums per group and state:
+
+  ```python
+  report = burrow.usage(
+      start=datetime(2026, 10, 1, tzinfo=timezone.utc),
+      end=datetime(2026, 11, 1, tzinfo=timezone.utc),
+      group_by="customer",
+  )
+  for total in report.sums:
+      print(total.group, total.state, total.vcpu_ms / 3_600_000, total.tx_bytes)
+  ```
+
+  Without `group_by`, pass `report.next_after_id` as `after_id=` to page
+  through an export.
 - `Snapshot`, `Volume`: saved state and persistent storage, addressable on
   their own. A snapshot reports `is_durable` once a copy is in the fleet's
   object store, and the `arch` and `firecracker_version` a node needs to

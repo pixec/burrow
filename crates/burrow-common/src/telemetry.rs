@@ -1,7 +1,7 @@
 //! Log and trace initialisation, shared by both daemons.
 //!
-//! Logs always go to stderr. Traces are exported over OTLP only when an
-//! endpoint is configured: a host with nowhere to send spans should not pay to
+//! Logs always go to stderr. Traces, and metrics for a daemon that records
+//! any, are exported over OTLP only when an endpoint is configured: a host with nowhere to send spans should not pay to
 //! build them, and a collector that is down must never stall the daemon
 //! talking to it.
 //!
@@ -20,18 +20,67 @@ use tracing_subscriber::util::SubscriberInitExt;
 /// Batched spans live in memory until the exporter ships them, so dropping
 /// this without shutting down loses the last batch.
 pub struct Telemetry {
+    service_name: &'static str,
+    endpoint: Option<String>,
     provider: Option<opentelemetry_sdk::trace::TracerProvider>,
+    meters: Option<opentelemetry_sdk::metrics::SdkMeterProvider>,
 }
 
 impl Telemetry {
-    /// Flushes pending spans. Worth awaiting on a clean shutdown path.
+    /// Exports what is recorded through the global meter to the trace
+    /// collector, read every `interval`. A no-op without an endpoint, which
+    /// leaves the global meter recording nothing.
+    pub fn export_metrics(&mut self, interval: std::time::Duration) {
+        let Some(endpoint) = self.endpoint.as_deref() else {
+            return;
+        };
+        let exporter = match opentelemetry_otlp::MetricExporter::builder()
+            .with_tonic()
+            .with_endpoint(endpoint)
+            .build()
+        {
+            Ok(exporter) => exporter,
+            Err(err) => {
+                tracing::error!(endpoint, %err, "otlp metric exporter unavailable");
+                return;
+            }
+        };
+        let reader = opentelemetry_sdk::metrics::PeriodicReader::builder(
+            exporter,
+            opentelemetry_sdk::runtime::Tokio,
+        )
+        .with_interval(interval)
+        .build();
+        let meters = opentelemetry_sdk::metrics::SdkMeterProvider::builder()
+            .with_reader(reader)
+            .with_resource(resource(self.service_name))
+            .build();
+        opentelemetry::global::set_meter_provider(meters.clone());
+        tracing::info!(endpoint, ?interval, "exporting metrics over otlp");
+        self.meters = Some(meters);
+    }
+
+    /// Flushes pending spans and metrics. Worth awaiting on a clean shutdown
+    /// path.
     pub fn shutdown(self) {
         if let Some(provider) = self.provider
             && let Err(err) = provider.shutdown()
         {
             tracing::warn!(%err, "otlp exporter did not flush cleanly");
         }
+        if let Some(meters) = self.meters
+            && let Err(err) = meters.shutdown()
+        {
+            tracing::warn!(%err, "otlp metric exporter did not flush cleanly");
+        }
     }
+}
+
+fn resource(service_name: &'static str) -> Resource {
+    Resource::new([
+        KeyValue::new("service.name", service_name),
+        KeyValue::new("service.version", env!("CARGO_PKG_VERSION")),
+    ])
 }
 
 /// Installs the global subscriber.
@@ -48,7 +97,12 @@ pub fn init(service_name: &'static str, otlp_endpoint: Option<&str>) -> Telemetr
             .with(filter)
             .with(logs)
             .init();
-        return Telemetry { provider: None };
+        return Telemetry {
+            service_name,
+            endpoint: None,
+            provider: None,
+            meters: None,
+        };
     };
 
     // Both ends must agree on the header format before either can join a
@@ -66,7 +120,10 @@ pub fn init(service_name: &'static str, otlp_endpoint: Option<&str>) -> Telemetr
                 .init();
             tracing::info!(endpoint, service_name, "exporting traces over otlp");
             Telemetry {
+                service_name,
+                endpoint: Some(endpoint.to_string()),
                 provider: Some(provider),
+                meters: None,
             }
         }
         Err(err) => {
@@ -78,7 +135,12 @@ pub fn init(service_name: &'static str, otlp_endpoint: Option<&str>) -> Telemetr
                 .with(logs)
                 .init();
             tracing::error!(endpoint, %err, "otlp exporter unavailable; traces are not being exported");
-            Telemetry { provider: None }
+            Telemetry {
+                service_name,
+                endpoint: Some(endpoint.to_string()),
+                provider: None,
+                meters: None,
+            }
         }
     }
 }
@@ -96,10 +158,7 @@ fn build_provider(
         // Batched, so an unreachable collector backs up in a bounded queue
         // instead of blocking whatever emitted the span.
         .with_batch_exporter(exporter, opentelemetry_sdk::runtime::Tokio)
-        .with_resource(Resource::new([
-            KeyValue::new("service.name", service_name),
-            KeyValue::new("service.version", env!("CARGO_PKG_VERSION")),
-        ]))
+        .with_resource(resource(service_name))
         .build())
 }
 

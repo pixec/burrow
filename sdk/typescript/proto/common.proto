@@ -388,6 +388,10 @@ message Sandbox {
   string hypervisor = 24;
   // "linux" or "windows", from its template.
   string guest_os = 25;
+  // Why the sandbox is in its state when nobody asked for it: set when a
+  // node's recovery could not bring it back as it was, and cleared when it
+  // next runs.
+  string state_reason = 26;
 }
 
 // One VM boot inside a sandbox's life.
@@ -530,11 +534,12 @@ message Event {
   int64 at_unix_ms = 4;
   string sandbox_id = 5;
   // "created", "started", "agent_ready", "stopped", "destroyed",
-  // "snapshot_created".
+  // "snapshot_created", or "recovered" for each sandbox a node found on
+  // restart.
   string type = 6;
   SandboxState state = 7;
   // Why or from what: a session's started_by or ended_by, a snapshot id, a
-  // fork's source.
+  // fork's source, or "lost" for a VM a node found gone on restart.
   string detail = 8;
   string template = 9;
   map<string, string> metadata = 10;

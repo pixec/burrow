@@ -1172,12 +1172,18 @@ init again on them, which for a Kit template means its startup hooks and
 entrypoint run again. Both keep the sandbox's id, name, address and ports.
 
 A restart is a pause and a resume. On `SIGTERM` the node snapshots every running
-sandbox. On startup it reattaches, reserving address leases before anything else
-can allocate, recreating taps, re-rendering the firewall, then garbage
-collecting directories with no record, a template rootfs an import was still
-writing when the daemon died, and staged layer trees nobody has used for a week.
-A sandbox that was running when the daemon *died* has no snapshot and is
-unrecoverable, so its resources are released rather than leaked.
+sandbox, recording each one suspended before it reports the event, so a stop
+cut short by its deadline still leaves it resumable. On startup it reattaches,
+reserving address leases before anything else can allocate, recreating taps,
+re-rendering the firewall, then garbage collecting directories with no record,
+a template rootfs an import was still writing when the daemon died, and staged
+layer trees nobody has used for a week. A sandbox that was running when the
+daemon *died* has no snapshot of that VM, so it comes back `stopped` on its
+disk with the reason in `state_reason`, and `burrow boot` starts it again. One whose address
+or tap cannot be set up again, or whose record cannot be read, keeps its row
+and files and is listed as `failed` with the reason until it is removed or a
+later restart brings it back; the sweep never touches its directory. Only a
+sandbox with nothing left on disk is dropped, with a `destroyed` event.
 
 `idle_suspend_secs`, `max_lifetime_secs` and `suspended_ttl_secs` are enforced
 on the node by a sweep every ten seconds. The two outcomes are deliberately
@@ -1755,8 +1761,10 @@ when the policy refuses the connection.
 
 Both daemons export OpenTelemetry traces when given `--otlp-endpoint`, and the
 trace context crosses the orchestrator to node hop, so a create is one trace
-spanning both processes rather than two unrelated ones. Without the flag,
-tracing stays local and nothing is exported.
+spanning both processes rather than two unrelated ones. Nodes export
+per-sandbox usage metrics on the same exporter; see
+[METERING.md](METERING.md#samples-and-charts). Without the flag, tracing stays
+local and nothing is exported.
 
 ### The event log
 
@@ -1764,23 +1772,38 @@ Every node appends to an `events` table in its own store as it acts: a
 sandbox is created, its VM starts and its agent answers, it stops and starts
 again across suspends, a snapshot is taken of it, it is destroyed. The row is
 written before anyone is told about it, and carries the position the store
-gave it, so a tail that replays the table and then follows a live broadcast
-sees each event once. Each row also carries the sandbox's cpu and network
-totals at that instant, which is what a bill can be built from later: the
-interval between two events is time spent in one state at one shape.
+gave it. Each row also carries the sandbox's cpu and network totals and its
+shape at that instant, which is what the [usage ledger](METERING.md) is built
+from: the interval between two events is time spent in one state at one
+shape.
 
-The orchestrator tails every node's log into one of its own. Each copied row
-keeps its origin, the node id and the node's position, and the pair is unique
-in the table, so a tail that reconnects and replays from the last position it
-copied cannot store anything twice. That one log is what `burrow events` and
-the API's `TailEvents` read, resumable by its own `seq`, and it is where
-webhooks will be delivered from. An event therefore outlives the node that
-recorded it, which the node's own log does not.
+The node pushes its log to the orchestrator, `PushEvents` on the registry
+service, in its own order and from wherever the orchestrator's copy ends,
+which the first push on every connection asks. The orchestrator commits each
+row with its origin, the node id and the node's position, and the pair is
+unique in the table, so a push retried after a lost answer cannot store
+anything twice. The lifecycle call that caused an event waits for that commit
+before it returns, at most ten seconds. While the orchestrator is unreachable
+events queue in the node's store, calls return without waiting (or are
+refused, under `burrowd serve --event-delivery fail`), and the queue is
+pushed oldest first once it answers. A connection is probed every five
+seconds when idle, so a control plane that went away is noticed before a call
+waits on it.
+
+That one log is what `burrow events` and the API's `TailEvents` read,
+resumable by its own `seq`. A node pushes to whichever replica it reaches, so
+replicas on a shared PostgreSQL serve tails by polling the table rather than
+from their own broadcast. An event therefore outlives the node that recorded
+it, which the node's own log does not.
 
 ### Usage metering
 
 Every sandbox record carries `cpu_usage_usec`, `rx_bytes` and `tx_bytes`,
 visible through `burrow inspect`, `burrow stats` and `sandbox.usage` in the SDK.
+The same totals ride on every event, and the orchestrator turns them into the
+usage ledger that `burrow usage` reads; see [METERING.md](METERING.md). This
+section is how a node reads them. A Mac node reads them differently, from the
+VM's own process and its userspace network stack, as METERING.md describes.
 
 **CPU** comes from the cgroup that already caps the sandbox. The same `cpu`
 controller that enforces `cpu.max` accounts for it in `cpu.stat`, so the figure
@@ -1810,17 +1833,20 @@ Both counters restart from zero underneath a sandbox that has not: a resume
 builds a fresh cgroup, and any re-render flushes the counter table. So the node
 carries totals on the record and folds each reading into them, treating a
 reading below the last one as a replaced counter rather than a rewound one.
-Readings are taken on the reaper's tick, before any ruleset is applied, and once
-more before a VM is killed, since the cgroup goes with it. The totals are
+Readings are taken on the reaper's tick, before any ruleset is applied, once
+more before a VM is killed, since the cgroup goes with it, and as each VM's
+session closes, so the `stopped` and `destroyed` events carry final figures. The totals are
 persisted with the sandbox, so they survive a suspend, a resume and a restart of
 the daemon, and they reach the orchestrator on the heartbeat, which is what
 makes a read answered from its registry current.
 
-Be aware of what this is not. The figures are as fresh as the last sample, which
-is at most a reaper tick old. A sandbox that never ran reports zeroes. A forked
-child starts from zero, because a restore copies state, not the bill for
-producing it. And nothing is metered on the orchestrator, so a fleet total is a
-sum of node reports rather than an independently kept number.
+Be aware of what this is not. The figures on a read are as fresh as the last
+sample and heartbeat, up to fifteen seconds old. A sandbox that never ran
+reports zeroes. A forked child starts from zero, because a restore copies
+state, not the bill for producing it. Work a node does to restore a suspended
+VM is counted before its `started` event, so it lands in the suspended
+interval it ends. And nothing is metered on the orchestrator, so a fleet total
+is a sum of node reports rather than an independently kept number.
 
 ## On disk
 

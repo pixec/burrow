@@ -178,10 +178,16 @@ pub struct ServeArgs {
     /// plan.
     #[arg(long = "lazy-memory", default_value_t = false, action = clap::ArgAction::Set)]
     pub is_memory_lazy: bool,
-    /// OTLP collector to export traces to, e.g. `http://collector:4317`.
-    /// Unset leaves tracing local to this node's logs.
+    /// OTLP collector to export traces and sandbox metrics to, e.g.
+    /// `http://collector:4317`. Unset leaves tracing local to this node's logs.
     #[arg(long, env = "OTEL_EXPORTER_OTLP_ENDPOINT")]
     pub otlp_endpoint: Option<String>,
+    /// What lifecycle calls do while the orchestrator cannot acknowledge this
+    /// node's events. Either way the events queue in the node's store and are
+    /// delivered in order once it answers; `proceed` lets calls return
+    /// meanwhile, `fail` refuses them.
+    #[arg(long, value_enum, default_value_t = crate::delivery::Policy::Proceed, env = "BURROW_EVENT_DELIVERY")]
+    pub event_delivery: crate::delivery::Policy,
     /// Run each firecracker under the jailer, chrooted into its own sandbox
     /// directory and dropped to `--jail-uid`. Turns on Cloud Hypervisor's
     /// confinement too, which burrowd builds itself, to the same uid.
@@ -502,7 +508,7 @@ fn local_node_info(args: &ServeArgs) -> anyhow::Result<NodeInfo> {
 ///
 /// Both are expressed in seconds but neither is a deadline anyone measures
 /// precisely, so a coarse sweep costs nothing and keeps the node quiet.
-const REAP_INTERVAL_SECS: u64 = 10;
+pub(crate) const REAP_INTERVAL_SECS: u64 = 10;
 
 async fn current_status(sandboxes: &SandboxManager, data_dir: &std::path::Path) -> NodeStatus {
     let mut sys = sysinfo::System::new();
@@ -990,7 +996,7 @@ fn endpoint_host(endpoint: &str) -> &str {
 }
 
 /// Dials the orchestrator with the cluster token attached.
-async fn connect_orchestrator(
+pub(crate) async fn connect_orchestrator(
     endpoint: &str,
     token: Option<String>,
 ) -> Result<
@@ -1239,6 +1245,7 @@ pub async fn run(args: ServeArgs) -> anyhow::Result<()> {
             firecracker_version,
             cloud_hypervisor_version,
             guest_upgrade,
+            event_delivery: args.event_delivery,
         },
         Arc::clone(&proxy_policies),
         Arc::clone(&resolutions),
@@ -1422,6 +1429,14 @@ pub async fn run(args: ServeArgs) -> anyhow::Result<()> {
     // One token for the whole node-facing hop, so what this node accepts is
     // also what it presents when registering and when dialling a peer.
     let registration_token = cluster_token.clone();
+    sandboxes.metrics().register(Arc::clone(&node_id));
+    tokio::spawn(crate::delivery::run(
+        sandboxes.delivery(),
+        Arc::clone(&store),
+        args.orchestrator.clone(),
+        registration_token.clone(),
+        Arc::clone(&node_id),
+    ));
 
     // Accepts traffic forwarded for sandboxes on this node, behind the cluster
     // token's prelude. Guests cannot reach it: the `tohost` chain admits only
@@ -1522,6 +1537,7 @@ pub async fn run(args: ServeArgs) -> anyhow::Result<()> {
         // Snapshotting them turns a restart into a pause and a resume.
         signal = shutdown_signal() => {
             tracing::info!(signal, "shutting down; suspending sandboxes");
+            sandboxes.delivery().close();
             sandboxes.suspend_all().await;
         }
     }

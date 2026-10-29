@@ -42,6 +42,8 @@ import type {
   SessionStart,
   UpdateOptions,
   Usage,
+  UsageQuery,
+  UsageReport,
 } from "./types.js";
 
 function toSandboxInfo(raw: any): SandboxInfo {
@@ -1455,6 +1457,64 @@ export class Burrow {
         memoryMib: Number(raw.memMib ?? 0),
       };
     }
+  }
+
+  /**
+   * Reads the usage ledger: the intervals sandboxes spent in one state at one
+   * shape, or their sums by group. The ledger outlives the sandboxes and
+   * nodes it describes.
+   *
+   * ```ts
+   * const { sums } = await burrow.usage({
+   *   from: new Date("2026-10-01"),
+   *   to: new Date("2026-11-01"),
+   *   groupBy: "customer",
+   * });
+   * ```
+   */
+  async usage(query: UsageQuery = {}): Promise<UsageReport> {
+    const ms = (at?: Date | number) => (at instanceof Date ? at.getTime() : (at ?? 0));
+    const res = await this.transport.unary<any, any>("QueryUsage", {
+      fromUnixMs: ms(query.from),
+      toUnixMs: ms(query.to),
+      sandbox: query.sandbox ?? "",
+      tags: query.tags ?? {},
+      groupBy: query.groupBy ?? "",
+      afterId: query.afterId ?? 0,
+      limit: query.limit ?? 0,
+      isOpenIncluded: query.includeOpen ?? true,
+    });
+    return {
+      intervals: (res.intervals ?? []).map((raw: any) => ({
+        id: Number(raw.id ?? 0),
+        sandboxId: raw.sandboxId ?? "",
+        nodeId: raw.nodeId ?? "",
+        template: raw.template ?? "",
+        metadata: raw.metadata ?? {},
+        state: raw.state ?? "",
+        vcpus: Number(raw.vcpus ?? 0),
+        memoryMib: Number(raw.memMib ?? 0),
+        startedAtUnixMs: Number(raw.startedAtUnixMs ?? 0),
+        endedAtUnixMs: Number(raw.endedAtUnixMs ?? 0),
+        cpuUsageUsec: Number(raw.cpuUsageUsec ?? 0),
+        rxBytes: Number(raw.rxBytes ?? 0),
+        txBytes: Number(raw.txBytes ?? 0),
+        closedBy: raw.closedBy ?? "",
+        open: Boolean(raw.isOpen),
+      })),
+      sums: (res.sums ?? []).map((raw: any) => ({
+        group: raw.group ?? "",
+        state: raw.state ?? "",
+        intervals: Number(raw.intervals ?? 0),
+        durationMs: Number(raw.durationMs ?? 0),
+        vcpuMs: Number(raw.vcpuMs ?? 0),
+        memoryMibMs: Number(raw.memMibMs ?? 0),
+        cpuUsageUsec: Number(raw.cpuUsageUsec ?? 0),
+        rxBytes: Number(raw.rxBytes ?? 0),
+        txBytes: Number(raw.txBytes ?? 0),
+      })),
+      nextAfterId: Number(res.nextAfterId ?? 0),
+    };
   }
 
   /** Stops (or resumes) placing new sandboxes on a node. */

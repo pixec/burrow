@@ -29,6 +29,16 @@ pub fn is_macos(guest_os: GuestOs) -> bool {
     }
 }
 
+/// The writable disk of a macOS guest, which has no scratch image.
+pub fn disk_file(guest_os: GuestOs) -> Option<&'static str> {
+    #[cfg(target_os = "macos")]
+    if guest_os == GuestOs::MacOs {
+        return Some(burrow_vmm::vz::DISK_FILE);
+    }
+    let _ = guest_os;
+    None
+}
+
 /// Makes `workdir` a new machine cloned from the template in `template_dir`.
 pub async fn prepare(template_dir: &Path, workdir: &Path) -> std::io::Result<()> {
     #[cfg(target_os = "macos")]
@@ -495,6 +505,9 @@ struct UserNetsInner {
     node: Option<std::sync::Arc<burrow_net::usernet::Node>>,
     links: std::collections::HashMap<String, Link>,
     policies: std::collections::HashMap<String, burrow_net::usernet::Policy>,
+    /// What each sandbox's links have carried, kept across its VMs like the
+    /// policy so the reading only goes up.
+    meters: std::collections::HashMap<String, std::sync::Arc<burrow_net::usernet::Meter>>,
 }
 
 #[cfg(target_os = "macos")]
@@ -568,11 +581,14 @@ impl UserNets {
                 .cloned()
                 .unwrap_or_else(|| none_policy(sandbox_id));
             let (policy, watched) = tokio::sync::watch::channel(policy);
+            let meter =
+                std::sync::Arc::clone(inner.meters.entry(sandbox_id.to_string()).or_default());
             let handle = burrow_net::usernet::UserNet::attach(
                 host,
                 burrow_net::usernet::SandboxNet::from_lease(lease),
                 watched,
                 node,
+                meter,
             )
             .map_err(|err| Status::internal(format!("network stack: {err}")))?;
             config.network = burrow_vmm::vz::Network::Datagram(std::sync::Arc::new(guest));
@@ -655,10 +671,29 @@ impl UserNets {
             inner.links.remove(sandbox_id);
             if forget {
                 inner.policies.remove(sandbox_id);
+                inner.meters.remove(sandbox_id);
             }
         }
         #[cfg(not(target_os = "macos"))]
         let _ = (sandbox_id, forget);
+    }
+
+    /// The bytes a sandbox's links have carried while this daemon has run,
+    /// or `None` for a sandbox with no userspace stack.
+    pub fn traffic(&self, sandbox_id: &str) -> Option<burrow_net::firewall::Traffic> {
+        #[cfg(target_os = "macos")]
+        return self
+            .inner
+            .lock()
+            .unwrap()
+            .meters
+            .get(sandbox_id)
+            .map(|meter| meter.traffic());
+        #[cfg(not(target_os = "macos"))]
+        {
+            let _ = sandbox_id;
+            None
+        }
     }
 }
 

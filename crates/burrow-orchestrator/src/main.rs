@@ -2,6 +2,7 @@ mod api;
 mod cluster;
 mod events;
 mod leader;
+mod ledger;
 mod persist;
 mod registry;
 mod sandboxes;
@@ -112,7 +113,7 @@ pub struct OrchestratorState {
     /// Every live replica's address, as last read from the store, for nodes
     /// to deny to their sandboxes.
     pub control_plane_hosts: std::sync::Mutex<Vec<String>>,
-    /// Every node's lifecycle events, copied here as they happen.
+    /// Every node's lifecycle events, pushed here as they happen.
     pub events: events::EventLog,
     /// Credentials Kits ask for by service name, encrypted at rest. `None`
     /// without a durable store, in which case no secret can be bound.
@@ -294,6 +295,24 @@ impl NodeRegistry for NodeRegistryService {
             if !in_store {
                 self.0.nodes.remove_node(&req.node_id);
             }
+            let totals: Vec<_> = req
+                .sandboxes
+                .iter()
+                .map(|s| {
+                    (
+                        s.sandbox_id.clone(),
+                        s.cpu_usage_usec,
+                        s.rx_bytes,
+                        s.tx_bytes,
+                    )
+                })
+                .collect();
+            if let Err(err) = store
+                .observe_usage(&req.node_id, registry::unix_ms(), &totals)
+                .await
+            {
+                tracing::warn!(node_id = req.node_id, %err, "could not record usage from a heartbeat");
+            }
         }
         let known = self.0.nodes.heartbeat(&req.node_id, status, req.info);
         let mut applied = sandboxes::Applied::default();
@@ -367,6 +386,23 @@ impl NodeRegistry for NodeRegistryService {
             access_keys: access_keys(&self.0),
         }))
     }
+
+    async fn push_events(
+        &self,
+        req: Request<nodepb::PushEventsRequest>,
+    ) -> Result<Response<nodepb::PushEventsResponse>, Status> {
+        let req = req.into_inner();
+        if req.node_id.is_empty() {
+            return Err(Status::invalid_argument("node_id is required"));
+        }
+        let committed_seq = self
+            .0
+            .events
+            .push(&req.node_id, req.events)
+            .await
+            .map_err(|err| Status::unavailable(format!("recording events: {err}")))?;
+        Ok(Response::new(nodepb::PushEventsResponse { committed_seq }))
+    }
 }
 
 fn access_keys(state: &OrchestratorState) -> Vec<nodepb::AccessKey> {
@@ -385,9 +421,6 @@ fn access_keys(state: &OrchestratorState) -> Vec<nodepb::AccessKey> {
 
 /// Rebuilds the orchestrator's view of one node from that node's own listing.
 async fn reconcile_node(state: Arc<OrchestratorState>, node_id: String) {
-    // The node's log is followed from here on, resuming after whatever an
-    // earlier tail copied; a node that re-registers does not start a second.
-    events::ensure_tailing(Arc::clone(&state), node_id.clone());
     let Some(endpoint) = state.nodes.endpoint(&node_id) else {
         return;
     };
@@ -590,7 +623,8 @@ const CLAIM_ORPHAN_SECS: i64 = 600;
 /// because nobody asked for these sandboxes to be destroyed; if the node comes
 /// back, reconcile re-adopts its own inventory. A suspended sandbox whose
 /// state is in the object store is kept, unplaced, for the next start to put
-/// on another node.
+/// on another node. Its open usage intervals are closed at its last heartbeat,
+/// so none of the silence is attributed to its sandboxes.
 ///
 /// Ageing out tombstones rides on the same tick, and happens even when reaping
 /// is switched off: they are bounded by their own TTL either way.
@@ -605,6 +639,7 @@ async fn reap_dead_nodes(state: Arc<OrchestratorState>, expiry: Option<std::time
             continue;
         }
         for node_id in expiry.map(|e| state.nodes.expired(e)).unwrap_or_default() {
+            ledger::write_off_node(&state, &node_id).await;
             let info = state.nodes.info(&node_id).unwrap_or_default();
             let (dropped, unplaced) = state.sandboxes.forget_node(&node_id, &info);
             if let Some(store) = &state.store
@@ -811,22 +846,7 @@ async fn run(args: Args) -> anyhow::Result<()> {
         ),
     }
     tokio::spawn(advertise_replica(Arc::clone(&state), advertise));
-    // A node's log is followed from the moment it registers, but only by the
-    // leader, and a replica that becomes leader later has seen no
-    // registrations. Every known node is made sure of a tail while this
-    // replica leads; a node already tailed is left alone.
-    tokio::spawn({
-        let state = Arc::clone(&state);
-        async move {
-            loop {
-                state.leader.wait().await;
-                for node_id in state.nodes.healthy_ids() {
-                    events::ensure_tailing(Arc::clone(&state), node_id);
-                }
-                tokio::time::sleep(std::time::Duration::from_secs(5)).await;
-            }
-        }
-    });
+    tokio::spawn(ledger::run(Arc::clone(&state)));
     // Several replicas share a Postgres; each catches up with the others'
     // writes. One replica on SQLite has nobody to catch up with.
     if let Some(store) = &store

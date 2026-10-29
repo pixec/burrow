@@ -51,7 +51,7 @@ impl Leader {
     }
 
     async fn contend(&self, pool: sqlx::PgPool) {
-        loop {
+        'session: loop {
             // Detached from the pool: the lock belongs to this session, and a
             // pooled connection could be handed to someone else and reset.
             let mut conn = match pool.acquire().await {
@@ -70,9 +70,13 @@ impl Leader {
                 match held {
                     Ok((true,)) => break,
                     Ok((false,)) => tokio::time::sleep(PERIOD).await,
+                    // Not a lock this session holds: a ping that then
+                    // succeeded would make it a leader without one.
                     Err(err) => {
                         tracing::warn!(%err, "leader election: lost the database connection");
-                        break;
+                        let _ = conn.close().await;
+                        tokio::time::sleep(PERIOD).await;
+                        continue 'session;
                     }
                 }
             }

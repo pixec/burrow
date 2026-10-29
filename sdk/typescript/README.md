@@ -1255,8 +1255,9 @@ the proxy refused.
 ## Follow lifecycle events
 
 The orchestrator keeps one ordered log of what happened to every sandbox:
-`created`, `started`, `agent_ready`, `stopped`, `destroyed` and
-`snapshot_created`. `burrow.events()` replays it oldest first and, with
+`created`, `started`, `agent_ready`, `stopped`, `destroyed`,
+`snapshot_created`, and `recovered` for each sandbox a node finds on restart.
+`burrow.events()` replays it oldest first and, with
 `follow`, keeps yielding new events as they happen.
 
 ```ts
@@ -1275,6 +1276,28 @@ also carries the sandbox's `cpuUsageUsec`, `rxBytes`, `txBytes`, `vcpus` and
 replay; `limit` caps how many events are replayed. Break out of the loop or pass
 a `signal` to stop following. See
 [The event log](../../docs/ARCHITECTURE.md#the-event-log).
+
+## Read usage
+
+The usage ledger holds the intervals each sandbox spent in one state at one
+shape, built from those events, and outlives the sandboxes it describes.
+`burrow.usage()` returns the intervals, or with `groupBy` (`sandbox`,
+`template`, `node`, `state` or a tag key) their sums per group and state.
+
+```ts
+const { sums } = await burrow.usage({
+  from: new Date("2026-10-01"),
+  to: new Date("2026-11-01"),
+  groupBy: "customer",
+});
+for (const sum of sums) {
+  console.log(sum.group, sum.state, sum.vcpuMs / 3_600_000, sum.txBytes);
+}
+```
+
+An interval belongs to the window it started in. Without `groupBy`, pass
+`nextAfterId` back as `afterId` to page through an export. See
+[METERING.md](../../docs/METERING.md).
 
 ## Cancel calls
 

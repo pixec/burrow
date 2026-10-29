@@ -258,13 +258,15 @@ class LifecycleEvent:
     node_seq: int
     at_unix_ms: int
     sandbox_id: str
-    # "created", "started", "agent_ready", "stopped", "destroyed" or
-    # "snapshot_created".
+    # "created", "started", "agent_ready", "stopped", "destroyed",
+    # "snapshot_created", or "recovered" for each sandbox a node found on
+    # restart.
     type: str
     state: str
     # How a VM started ("boot", "restore", "resume") or stopped ("suspended",
-    # "deleted", "stopped", "failed"), what a sandbox was created from
-    # ("fork:<id>", "snapshot:<id>"), or the snapshot a commit produced.
+    # "deleted", "stopped", "failed", or "lost" for a VM a node found gone on
+    # restart), what a sandbox was created from ("fork:<id>",
+    # "snapshot:<id>"), or the snapshot a commit produced.
     detail: str
     template: str
     metadata: Dict[str, str]
@@ -286,3 +288,55 @@ class TemplateInfo:
     kit: bool = False
     # Sandboxes from it run systemd under the agent.
     systemd: bool = False
+
+
+@dataclass
+class UsageInterval:
+    """One stretch a sandbox spent in one state at one shape, from the usage
+    ledger. The usage is the difference of the sandbox's totals at the two
+    bounds, so it survives the sandbox and its node."""
+
+    # Ledger row id, ascending in write order. 0 for an open interval.
+    id: int
+    sandbox_id: str
+    node_id: str
+    template: str
+    metadata: Dict[str, str]
+    # "running", "suspended" or "stopped".
+    state: str
+    vcpus: int
+    memory_mib: int
+    started_at_unix_ms: int
+    ended_at_unix_ms: int
+    cpu_usage_usec: int
+    rx_bytes: int
+    tx_bytes: int
+    # The event type that ended the state, "checkpoint" for the hourly split,
+    # or "write_off" for a node that went silent. Empty while open.
+    closed_by: str
+    open: bool
+
+
+@dataclass
+class UsageSum:
+    """Intervals summed for one group in one state."""
+
+    group: str
+    state: str
+    intervals: int
+    duration_ms: int
+    # Duration weighted by vCPUs, for vCPU-hours.
+    vcpu_ms: int
+    # Duration weighted by memory, for GiB-hours.
+    memory_mib_ms: int
+    cpu_usage_usec: int
+    rx_bytes: int
+    tx_bytes: int
+
+
+@dataclass
+class UsageReport:
+    intervals: List[UsageInterval] = field(default_factory=list)
+    sums: List[UsageSum] = field(default_factory=list)
+    # Pass as `after_id` for the next page; 0 when there is none.
+    next_after_id: int = 0

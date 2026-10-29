@@ -889,9 +889,13 @@ impl SandboxRegistry {
             let is_confirmation_changed =
                 sandbox.is_agent_unconfirmed != report.is_agent_unconfirmed;
             sandbox.is_agent_unconfirmed = report.is_agent_unconfirmed;
-            if sandbox.state != report.state || sandbox.is_durable != report.is_durable {
+            if sandbox.state != report.state
+                || sandbox.is_durable != report.is_durable
+                || sandbox.state_reason != report.state_reason
+            {
                 sandbox.state = report.state;
                 sandbox.is_durable = report.is_durable;
+                sandbox.state_reason = report.state_reason.clone();
                 restated += 1;
                 changed.push(sandbox.clone());
             } else if is_confirmation_changed {

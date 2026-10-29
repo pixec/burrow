@@ -21,6 +21,7 @@
 //! object store.
 
 mod install;
+mod process;
 
 use std::cell::Cell;
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
@@ -315,11 +316,15 @@ pub struct VzVm {
     boot_latency: Duration,
     /// Serves the guest's vsock ports at [`VSOCK_UDS`]; stopped with the VM.
     bridge: Option<JoinHandle<()>>,
+    /// The service process the machine runs in, when it could be told apart.
+    process: Option<process::Process>,
 }
 
 impl VzVm {
     pub(crate) async fn boot(spec: VmSpec, config: VzConfig) -> Result<Self> {
         let started = Instant::now();
+        let starting = process::STARTS.lock().await;
+        let before = process::services();
         let mut vm = Self::create(&spec, &config).await?;
         let options = OnQueue(start_options(config.provisioning.as_ref())?);
         vm.machine
@@ -327,6 +332,8 @@ impl VzVm {
                 vm.startWithOptions_completionHandler(options.get(), &done)
             })
             .await?;
+        vm.process = process::Process::appeared(&before, &spec.vm_id);
+        drop(starting);
         vm.boot_latency = started.elapsed();
         tracing::info!(
             vm_id = spec.vm_id,
@@ -341,6 +348,8 @@ impl VzVm {
     /// shape, and whose disk must be as it was when the state was saved.
     pub(crate) async fn restore(spec: VmSpec, config: VzConfig, resume: bool) -> Result<Self> {
         let started = Instant::now();
+        let restoring = process::STARTS.lock().await;
+        let before = process::services();
         let mut vm = Self::create(&spec, &config).await?;
         let url = OnQueue(file_url(&spec.workdir.join(SAVE_FILE)));
         vm.machine
@@ -349,6 +358,8 @@ impl VzVm {
             })
             .await
             .map_err(|err| Error::Snapshot(err.to_string()))?;
+        vm.process = process::Process::appeared(&before, &spec.vm_id);
+        drop(restoring);
         if resume {
             vm.resume().await?;
         }
@@ -389,6 +400,7 @@ impl VzVm {
             workdir: spec.workdir.clone(),
             boot_latency: Duration::ZERO,
             bridge,
+            process: None,
         })
     }
 
@@ -398,6 +410,15 @@ impl VzVm {
 
     pub fn boot_latency(&self) -> Duration {
         self.boot_latency
+    }
+
+    pub fn pid(&self) -> Option<u32> {
+        self.process.map(|process| process.pid as u32)
+    }
+
+    /// Host CPU the machine's service process has spent, in microseconds.
+    pub fn cpu_usage_usec(&self) -> Option<u64> {
+        self.process.as_ref()?.cpu_usage_usec()
     }
 
     pub async fn pause(&self) -> Result<Duration> {

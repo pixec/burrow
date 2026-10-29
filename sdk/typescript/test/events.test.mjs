@@ -94,3 +94,75 @@ test("a snapshot surfaces where it can be restored", () => {
   assert.equal(snapshot.firecrackerVersion, "1.13.1");
   assert.equal(snapshot.nodeId, "");
 });
+
+test("usage maps the query and the report", async () => {
+  const calls = [];
+  const burrow = new Burrow({ endpoint: "localhost:1" });
+  burrow.close();
+  burrow.transport = {
+    async unary(method, request) {
+      calls.push({ method, request });
+      return {
+        intervals: [
+          {
+            id: 9,
+            sandboxId: "sbx_a",
+            nodeId: "node-1",
+            template: "python",
+            metadata: { customer: "acme" },
+            state: "running",
+            vcpus: 2,
+            memMib: 2048,
+            startedAtUnixMs: 1_000,
+            endedAtUnixMs: 61_000,
+            cpuUsageUsec: 5_000_000,
+            rxBytes: 10,
+            txBytes: 20,
+            closedBy: "stopped",
+          },
+        ],
+        nextAfterId: 9,
+      };
+    },
+  };
+  const report = await burrow.usage({
+    from: new Date(Date.UTC(2026, 9, 1)),
+    to: 1_793_491_200_000,
+    tags: { customer: "acme" },
+    limit: 1,
+  });
+  assert.deepEqual(calls, [
+    {
+      method: "QueryUsage",
+      request: {
+        fromUnixMs: 1_790_812_800_000,
+        toUnixMs: 1_793_491_200_000,
+        sandbox: "",
+        tags: { customer: "acme" },
+        groupBy: "",
+        afterId: 0,
+        limit: 1,
+        isOpenIncluded: true,
+      },
+    },
+  ]);
+  assert.equal(report.nextAfterId, 9);
+  assert.deepEqual(report.sums, []);
+  assert.deepEqual(report.intervals[0], {
+    id: 9,
+    sandboxId: "sbx_a",
+    nodeId: "node-1",
+    template: "python",
+    metadata: { customer: "acme" },
+    state: "running",
+    vcpus: 2,
+    memoryMib: 2048,
+    startedAtUnixMs: 1_000,
+    endedAtUnixMs: 61_000,
+    cpuUsageUsec: 5_000_000,
+    rxBytes: 10,
+    txBytes: 20,
+    closedBy: "stopped",
+    open: false,
+  });
+});

@@ -777,15 +777,17 @@ export interface LifecycleEvent {
   atUnixMs: number;
   sandboxId: string;
   /**
-   * `created`, `started`, `agent_ready`, `stopped`, `destroyed` or
-   * `snapshot_created`.
+   * `created`, `started`, `agent_ready`, `stopped`, `destroyed`,
+   * `snapshot_created`, or `recovered` for each sandbox a node found on
+   * restart.
    */
   type: string;
   state: SandboxState;
   /**
    * How a VM started (`boot`, `restore`, `resume`) or stopped (`suspended`,
-   * `deleted`, `stopped`, `failed`), what a sandbox was created from
-   * (`fork:<id>`, `snapshot:<id>`), or the snapshot a commit produced.
+   * `deleted`, `stopped`, `failed`, or `lost` for a VM a node found gone on
+   * restart), what a sandbox was created from (`fork:<id>`,
+   * `snapshot:<id>`), or the snapshot a commit produced.
    */
   detail: string;
   template: string;
@@ -808,4 +810,81 @@ export interface EventsOptions {
   /** Cap on replayed events. Omitted lets the server choose. */
   limit?: number;
   signal?: AbortSignal;
+}
+
+/** Options for {@link Burrow.usage}. */
+export interface UsageQuery {
+  /** Intervals that start at or after this. Omitted leaves the window open. */
+  from?: Date | number;
+  /** Intervals that start before this. */
+  to?: Date | number;
+  /** One sandbox, by id or by the name of one that still exists. */
+  sandbox?: string;
+  /** Only sandboxes that carried every one of these tags. */
+  tags?: Record<string, string>;
+  /**
+   * `sandbox`, `template`, `node`, `state` or a tag key. Given, the report
+   * holds sums per group and state instead of intervals.
+   */
+  groupBy?: string;
+  /** Continue an export after this interval id, from `nextAfterId`. */
+  afterId?: number;
+  /** Intervals per page. Omitted lets the server choose; sums are never paged. */
+  limit?: number;
+  /**
+   * Count the stretch since each open interval began, up to the last
+   * heartbeat. Defaults to true; never applies with `afterId`.
+   */
+  includeOpen?: boolean;
+}
+
+/**
+ * One stretch a sandbox spent in one state at one shape, from the usage
+ * ledger. The usage is the difference of the sandbox's totals at the two
+ * bounds, so it survives the sandbox and its node.
+ */
+export interface UsageInterval {
+  /** Ledger row id, ascending in write order. 0 for an open interval. */
+  id: number;
+  sandboxId: string;
+  nodeId: string;
+  template: string;
+  metadata: Record<string, string>;
+  /** `running`, `suspended` or `stopped`. */
+  state: string;
+  vcpus: number;
+  memoryMib: number;
+  startedAtUnixMs: number;
+  endedAtUnixMs: number;
+  cpuUsageUsec: number;
+  rxBytes: number;
+  txBytes: number;
+  /**
+   * The event type that ended the state, `checkpoint` for the hourly split,
+   * or `write_off` for a node that went silent. Empty while open.
+   */
+  closedBy: string;
+  open: boolean;
+}
+
+/** Intervals summed for one group in one state. */
+export interface UsageSum {
+  group: string;
+  state: string;
+  intervals: number;
+  durationMs: number;
+  /** Duration weighted by vCPUs, for vCPU-hours. */
+  vcpuMs: number;
+  /** Duration weighted by memory, for GiB-hours. */
+  memoryMibMs: number;
+  cpuUsageUsec: number;
+  rxBytes: number;
+  txBytes: number;
+}
+
+export interface UsageReport {
+  intervals: UsageInterval[];
+  sums: UsageSum[];
+  /** Pass as `afterId` for the next page; 0 when there is none. */
+  nextAfterId: number;
 }

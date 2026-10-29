@@ -82,3 +82,59 @@ def test_a_snapshot_surfaces_where_it_can_be_restored():
     assert snapshot.arch == "aarch64"
     assert snapshot.firecracker_version == "1.13.1"
     assert snapshot.node_id == ""
+
+
+class _Unary:
+    def __init__(self, response):
+        self.response = response
+        self.calls = []
+
+    def unary(self, method, request):
+        self.calls.append((method, request))
+        return self.response
+
+    def close(self):
+        pass
+
+
+def test_usage_maps_the_query_and_the_report():
+    from datetime import datetime, timezone
+
+    burrow = Burrow(endpoint="localhost:1")
+    burrow.close()
+    burrow._transport = _Unary(
+        api_pb2.QueryUsageResponse(
+            sums=[
+                api_pb2.UsageSum(
+                    group="acme",
+                    state="running",
+                    intervals=2,
+                    duration_ms=2_400_000,
+                    vcpu_ms=4_800_000,
+                    mem_mib_ms=4_915_200_000,
+                    cpu_usage_usec=1_092_000_000,
+                    tx_bytes=1_395_864_371,
+                )
+            ]
+        )
+    )
+    report = burrow.usage(
+        start=datetime(2026, 10, 1, tzinfo=timezone.utc),
+        end=datetime(2026, 11, 1, tzinfo=timezone.utc),
+        group_by="customer",
+        tags={"plan": "team"},
+    )
+    method, request = burrow._transport.calls[0]
+    assert method == "QueryUsage"
+    assert request == api_pb2.QueryUsageRequest(
+        from_unix_ms=1_790_812_800_000,
+        to_unix_ms=1_793_491_200_000,
+        group_by="customer",
+        tags={"plan": "team"},
+        is_open_included=True,
+    )
+    assert report.intervals == []
+    [total] = report.sums
+    assert (total.group, total.state, total.intervals) == ("acme", "running", 2)
+    assert total.memory_mib_ms == 4_915_200_000
+    assert report.next_after_id == 0

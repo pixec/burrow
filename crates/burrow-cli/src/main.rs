@@ -559,6 +559,39 @@ enum Command {
         #[arg(long, default_value_t = 100)]
         limit: u32,
     },
+    /// Show what sandboxes consumed, from the usage ledger, including
+    /// sandboxes that no longer exist.
+    Usage {
+        /// Start of the window, UTC: `2026-10-01` or `2026-10-01T12:00:00Z`.
+        /// An interval belongs to the window it started in.
+        #[arg(long)]
+        from: Option<String>,
+        /// End of the window, exclusive, in the same form.
+        #[arg(long)]
+        to: Option<String>,
+        /// Restrict to one sandbox, by id or by the name of one that exists.
+        #[arg(long)]
+        sandbox: Option<String>,
+        /// Only sandboxes that carried this key=value tag. Repeatable.
+        #[arg(long = "tag", value_name = "KEY=VALUE")]
+        tags: Vec<String>,
+        /// Sum by `sandbox`, `template`, `node`, `state` or a tag key, per
+        /// state. Omitted lists the intervals themselves.
+        #[arg(long)]
+        group_by: Option<String>,
+        #[arg(long, value_enum, default_value_t = UsageFormat::Table)]
+        format: UsageFormat,
+        /// Leave out the stretch since each open interval began.
+        #[arg(long = "closed")]
+        is_closed_only: bool,
+        /// Continue an export after this interval id, from a previous
+        /// page's `next_after`. Open intervals are never included with one.
+        #[arg(long, default_value_t = 0)]
+        after: u64,
+        /// Intervals per page; sums are never paged.
+        #[arg(long, default_value_t = 1000)]
+        limit: u32,
+    },
     /// Show recorded egress attempts and DNS lookups.
     Audit {
         /// Restrict to one sandbox.
@@ -573,6 +606,12 @@ enum Command {
         #[arg(long, default_value_t = 50)]
         limit: u32,
     },
+}
+
+#[derive(Clone, Copy, clap::ValueEnum)]
+enum UsageFormat {
+    Table,
+    Json,
 }
 
 #[derive(Subcommand)]
@@ -2065,6 +2104,128 @@ async fn main() -> anyhow::Result<()> {
                 }
             }
         }
+        Command::Usage {
+            from,
+            to,
+            sandbox,
+            tags,
+            group_by,
+            format,
+            is_closed_only,
+            after,
+            limit,
+        } => {
+            let bound = |value: Option<String>, flag: &str| -> anyhow::Result<i64> {
+                match value {
+                    None => Ok(0),
+                    Some(text) => unix_ms_from_utc(&text).ok_or_else(|| {
+                        anyhow::anyhow!(
+                            "--{flag} {text:?} is not a UTC date like 2026-10-01 or 2026-10-01T12:00:00Z"
+                        )
+                    }),
+                }
+            };
+            let tags = tags
+                .iter()
+                .map(|tag| {
+                    tag.split_once('=')
+                        .map(|(k, v)| (k.to_string(), v.to_string()))
+                        .ok_or_else(|| anyhow::anyhow!("--tag {tag:?} is not KEY=VALUE"))
+                })
+                .collect::<anyhow::Result<_>>()?;
+            let resp = client
+                .query_usage(api::QueryUsageRequest {
+                    from_unix_ms: bound(from, "from")?,
+                    to_unix_ms: bound(to, "to")?,
+                    sandbox: sandbox.unwrap_or_default(),
+                    tags,
+                    group_by: group_by.clone().unwrap_or_default(),
+                    after_id: after,
+                    limit,
+                    is_open_included: !is_closed_only,
+                })
+                .await?
+                .into_inner();
+            match (format, group_by.is_some()) {
+                (UsageFormat::Json, true) => {
+                    let sums = resp.sums.iter().map(usage_sum_json).collect();
+                    let mut out = String::new();
+                    Json::Obj(vec![("sums", Json::Arr(sums))]).write(&mut out, 0);
+                    println!("{out}");
+                }
+                (UsageFormat::Json, false) => {
+                    let intervals = resp.intervals.iter().map(usage_interval_json).collect();
+                    let mut out = String::new();
+                    Json::Obj(vec![
+                        ("intervals", Json::Arr(intervals)),
+                        ("next_after", Json::Num(resp.next_after_id)),
+                    ])
+                    .write(&mut out, 0);
+                    println!("{out}");
+                }
+                (UsageFormat::Table, true) => {
+                    println!(
+                        "{:<24} {:<10} {:>5} {:>12} {:>9} {:>9} {:>10} {:>10} {:>10}",
+                        "GROUP", "STATE", "ROWS", "DURATION", "VCPU-H", "GIB-H", "CPU", "RX", "TX"
+                    );
+                    for sum in &resp.sums {
+                        println!(
+                            "{:<24} {:<10} {:>5} {:>12} {:>9.3} {:>9.3} {:>10} {:>10} {:>10}",
+                            truncate(&sanitize(&sum.group), 24),
+                            sanitize(&sum.state),
+                            sum.intervals,
+                            duration_ms(sum.duration_ms),
+                            sum.vcpu_ms as f64 / 3_600_000.0,
+                            sum.mem_mib_ms as f64 / 1024.0 / 3_600_000.0,
+                            cpu_secs(sum.cpu_usage_usec),
+                            bytes(sum.rx_bytes),
+                            bytes(sum.tx_bytes),
+                        );
+                    }
+                }
+                (UsageFormat::Table, false) => {
+                    println!(
+                        "{:>6} {:<24} {:<10} {:>4} {:>6} {:<20} {:>12} {:>10} {:>10} {:>10} CLOSED",
+                        "ID",
+                        "SANDBOX",
+                        "STATE",
+                        "VCPU",
+                        "MEM",
+                        "STARTED",
+                        "DURATION",
+                        "CPU",
+                        "RX",
+                        "TX"
+                    );
+                    for interval in &resp.intervals {
+                        println!(
+                            "{:>6} {:<24} {:<10} {:>4} {:>6} {:<20} {:>12} {:>10} {:>10} {:>10} {}",
+                            if interval.is_open {
+                                "open".to_string()
+                            } else {
+                                interval.id.to_string()
+                            },
+                            truncate(&sanitize(&interval.sandbox_id), 24),
+                            sanitize(&interval.state),
+                            interval.vcpus,
+                            interval.mem_mib,
+                            rfc3339_from_unix_ms(interval.started_at_unix_ms),
+                            duration_ms(
+                                (interval.ended_at_unix_ms - interval.started_at_unix_ms).max(0)
+                                    as u64
+                            ),
+                            cpu_secs(interval.cpu_usage_usec),
+                            bytes(interval.rx_bytes),
+                            bytes(interval.tx_bytes),
+                            sanitize(&interval.closed_by),
+                        );
+                    }
+                    if resp.next_after_id != 0 {
+                        eprintln!("more intervals follow: --after {}", resp.next_after_id);
+                    }
+                }
+            }
+        }
         Command::Audit {
             sandbox,
             is_denied_only: denied,
@@ -3140,6 +3301,9 @@ fn print_config(sandbox: &common::Sandbox) {
     let field = |name: &str, value: &str| println!("{name:<16}{value}");
     field("sandbox", &sandbox.id);
     field("state", display_state(sandbox));
+    if !sandbox.state_reason.is_empty() {
+        field("reason", &sandbox.state_reason);
+    }
     field("node", &display_node(sandbox));
     if sandbox.is_unreachable {
         field(
@@ -4063,6 +4227,7 @@ fn sandbox_json(sandbox: &common::Sandbox) -> String {
         ("id", Json::str(&sandbox.id)),
         ("name", Json::str(&sandbox.name)),
         ("state", Json::str(display_state(sandbox))),
+        ("state_reason", Json::str(&sandbox.state_reason)),
         ("unreachable", Json::Bool(sandbox.is_unreachable)),
         ("durable", Json::Bool(sandbox.is_durable)),
         (
@@ -4219,6 +4384,109 @@ fn is_transient(status: &tonic::Status) -> bool {
         || status.message().contains("h2 protocol"))
 }
 
+fn usage_interval_json(interval: &api::UsageInterval) -> Json {
+    Json::Obj(vec![
+        ("id", Json::Num(interval.id)),
+        ("sandbox_id", Json::str(&interval.sandbox_id)),
+        ("node_id", Json::str(&interval.node_id)),
+        ("template", Json::str(&interval.template)),
+        ("metadata", map_json(&interval.metadata)),
+        ("state", Json::str(&interval.state)),
+        ("vcpus", Json::Num(interval.vcpus.into())),
+        ("mem_mib", Json::Num(interval.mem_mib.into())),
+        (
+            "started_at_unix_ms",
+            Json::Num(interval.started_at_unix_ms.max(0) as u64),
+        ),
+        (
+            "ended_at_unix_ms",
+            Json::Num(interval.ended_at_unix_ms.max(0) as u64),
+        ),
+        ("cpu_usage_usec", Json::Num(interval.cpu_usage_usec)),
+        ("rx_bytes", Json::Num(interval.rx_bytes)),
+        ("tx_bytes", Json::Num(interval.tx_bytes)),
+        ("closed_by", Json::str(&interval.closed_by)),
+        ("is_open", Json::Bool(interval.is_open)),
+    ])
+}
+
+fn usage_sum_json(sum: &api::UsageSum) -> Json {
+    Json::Obj(vec![
+        ("group", Json::str(&sum.group)),
+        ("state", Json::str(&sum.state)),
+        ("intervals", Json::Num(sum.intervals)),
+        ("duration_ms", Json::Num(sum.duration_ms)),
+        ("vcpu_ms", Json::Num(sum.vcpu_ms)),
+        ("mem_mib_ms", Json::Num(sum.mem_mib_ms)),
+        ("cpu_usage_usec", Json::Num(sum.cpu_usage_usec)),
+        ("rx_bytes", Json::Num(sum.rx_bytes)),
+        ("tx_bytes", Json::Num(sum.tx_bytes)),
+    ])
+}
+
+/// A string map as a JSON object, keys sorted.
+fn map_json(map: &std::collections::HashMap<String, String>) -> Json {
+    let mut pairs: Vec<_> = map.iter().collect();
+    pairs.sort();
+    let mut out = String::from("{");
+    for (i, (key, value)) in pairs.into_iter().enumerate() {
+        if i > 0 {
+            out.push_str(", ");
+        }
+        escape(key, &mut out);
+        out.push_str(": ");
+        escape(value, &mut out);
+    }
+    out.push('}');
+    Json::Raw(out)
+}
+
+fn cpu_secs(usec: u64) -> String {
+    format!("{:.1}s", usec as f64 / 1e6)
+}
+
+fn duration_ms(ms: u64) -> String {
+    let secs = ms / 1000;
+    match secs {
+        0..60 => format!("{:.1}s", ms as f64 / 1000.0),
+        60..3600 => format!("{}m {}s", secs / 60, secs % 60),
+        _ => format!("{}h {}m", secs / 3600, (secs % 3600) / 60),
+    }
+}
+
+/// `2026-10-01` or `2026-10-01T12:00:00Z` as unix milliseconds.
+fn unix_ms_from_utc(text: &str) -> Option<i64> {
+    let (date, time) = match text.split_once('T') {
+        Some((date, time)) => (date, Some(time.strip_suffix('Z')?)),
+        None => (text, None),
+    };
+    let mut date = date.split('-').map(|part| part.parse::<i64>().ok());
+    let (y, m, d) = (date.next()??, date.next()??, date.next()??);
+    if date.next().is_some() || !(1..=12).contains(&m) || !(1..=31).contains(&d) {
+        return None;
+    }
+    let (h, min, s) = match time {
+        None => (0, 0, 0),
+        Some(time) => {
+            let mut time = time.split(':').map(|part| part.parse::<i64>().ok());
+            let parts = (time.next()??, time.next()??, time.next()??);
+            if time.next().is_some() || parts.0 > 23 || parts.1 > 59 || parts.2 > 60 {
+                return None;
+            }
+            parts
+        }
+    };
+    // Days from the civil date, the inverse of `rfc3339_from_unix_ms`.
+    let y = if m <= 2 { y - 1 } else { y };
+    let era = y.div_euclid(400);
+    let yoe = y.rem_euclid(400);
+    let mp = if m > 2 { m - 3 } else { m + 9 };
+    let doy = (153 * mp + 2) / 5 + d - 1;
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    let days = era * 146_097 + doe - 719_468;
+    Some(((days * 86_400) + h * 3600 + min * 60 + s) * 1000)
+}
+
 /// Unix milliseconds as RFC 3339 to the second, without pulling in a date
 /// crate for one column.
 fn rfc3339_from_unix_ms(ms: i64) -> String {
@@ -4241,6 +4509,20 @@ fn rfc3339_from_unix_ms(ms: i64) -> String {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn usage_bounds_parse_as_utc() {
+        assert_eq!(super::unix_ms_from_utc("1970-01-01"), Some(0));
+        assert_eq!(
+            super::unix_ms_from_utc("2026-10-01"),
+            Some(1_790_812_800_000)
+        );
+        let at = super::unix_ms_from_utc("2026-10-27T03:35:27Z").unwrap();
+        assert_eq!(super::rfc3339_from_unix_ms(at), "2026-10-27T03:35:27Z");
+        assert_eq!(super::unix_ms_from_utc("2026-13-01"), None);
+        assert_eq!(super::unix_ms_from_utc("2026-10-01T12:00:00"), None);
+        assert_eq!(super::unix_ms_from_utc("yesterday"), None);
+    }
+
     /// The names, paths and command lines shown here are written by tenants
     /// and by whoever is inside the sandbox; a byte slice through a multi-byte
     /// character aborts the whole command over a filename.

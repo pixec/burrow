@@ -644,6 +644,7 @@ impl NodeService for NodeApi {
         &self,
         req: Request<nodepb::NodeCreateRequest>,
     ) -> Result<Response<common::Sandbox>, Status> {
+        self.sandboxes.admit()?;
         // Joins the orchestrator's trace rather than starting a new one, so the
         // node's share of a create is visible against the request that caused it.
         burrow_common::telemetry::propagation::adopt(req.metadata());
@@ -717,6 +718,7 @@ impl NodeService for NodeApi {
         &self,
         req: Request<nodepb::NodeCreateSnapshotRequest>,
     ) -> Result<Response<common::Snapshot>, Status> {
+        self.sandboxes.admit()?;
         burrow_common::telemetry::propagation::adopt(req.metadata());
         let req = req.into_inner();
         if req.snapshot_id.is_empty() {
@@ -869,8 +871,11 @@ impl NodeService for NodeApi {
         &self,
         req: Request<nodepb::NodeSandboxRef>,
     ) -> Result<Response<common::Sandbox>, Status> {
-        let sandbox = self.sandboxes.get(&req.into_inner().sandbox_id).await?;
-        Ok(Response::new(redact_secrets(sandbox.record())))
+        let record = self
+            .sandboxes
+            .record_of(&req.into_inner().sandbox_id)
+            .await?;
+        Ok(Response::new(redact_secrets(record)))
     }
 
     async fn list_sandboxes(
@@ -892,8 +897,9 @@ impl NodeService for NodeApi {
         &self,
         req: Request<nodepb::NodeSandboxRef>,
     ) -> Result<Response<nodepb::NodeDeleteResponse>, Status> {
+        self.sandboxes.admit()?;
         let id = req.into_inner().sandbox_id;
-        let kit = self.sandboxes.get(&id).await?.record().kit.is_some();
+        let kit = self.sandboxes.record_of(&id).await?.kit.is_some();
         self.sandboxes.delete(&id).await?;
         // Removing the instance ends its storage, retained paths included.
         if kit {
@@ -906,6 +912,7 @@ impl NodeService for NodeApi {
         &self,
         req: Request<nodepb::NodeSandboxRef>,
     ) -> Result<Response<common::Sandbox>, Status> {
+        self.sandboxes.admit()?;
         let sandbox = self.sandboxes.stop(&req.into_inner().sandbox_id).await?;
         Ok(Response::new(redact_secrets(sandbox)))
     }
@@ -914,6 +921,7 @@ impl NodeService for NodeApi {
         &self,
         req: Request<nodepb::NodeSandboxRef>,
     ) -> Result<Response<common::Sandbox>, Status> {
+        self.sandboxes.admit()?;
         let id = req.into_inner().sandbox_id;
         let sandbox = self.sandboxes.start(&id).await?;
         if let Some(kit) = &sandbox.kit {
@@ -950,6 +958,7 @@ impl NodeService for NodeApi {
         &self,
         req: Request<nodepb::NodeRecreateRequest>,
     ) -> Result<Response<common::Sandbox>, Status> {
+        self.sandboxes.admit()?;
         let req = req.into_inner();
         let mut previous = self.sandboxes.get(&req.sandbox_id).await?.record();
         let mut policy = previous.policy.take().unwrap_or_default();
@@ -1007,6 +1016,7 @@ impl NodeService for NodeApi {
         &self,
         req: Request<nodepb::NodeSandboxRef>,
     ) -> Result<Response<common::Sandbox>, Status> {
+        self.sandboxes.admit()?;
         let sandbox = self.sandboxes.pause(&req.into_inner().sandbox_id).await?;
         Ok(Response::new(redact_secrets(sandbox)))
     }
@@ -1015,6 +1025,7 @@ impl NodeService for NodeApi {
         &self,
         req: Request<nodepb::NodeSandboxRef>,
     ) -> Result<Response<common::Sandbox>, Status> {
+        self.sandboxes.admit()?;
         let sandbox = self.sandboxes.resume(&req.into_inner().sandbox_id).await?;
         Ok(Response::new(redact_secrets(sandbox)))
     }
@@ -1023,6 +1034,7 @@ impl NodeService for NodeApi {
         &self,
         req: Request<nodepb::NodeAdoptRequest>,
     ) -> Result<Response<common::Sandbox>, Status> {
+        self.sandboxes.admit()?;
         let req = req.into_inner();
         let record = req
             .record
@@ -1035,6 +1047,7 @@ impl NodeService for NodeApi {
         &self,
         req: Request<nodepb::NodeSandboxRef>,
     ) -> Result<Response<common::Sandbox>, Status> {
+        self.sandboxes.admit()?;
         let sandbox = self.sandboxes.release(&req.into_inner().sandbox_id).await?;
         Ok(Response::new(redact_secrets(sandbox)))
     }
@@ -1092,6 +1105,7 @@ impl NodeService for NodeApi {
         &self,
         req: Request<nodepb::NodeForkRequest>,
     ) -> Result<Response<common::Sandbox>, Status> {
+        self.sandboxes.admit()?;
         burrow_common::telemetry::propagation::adopt(req.metadata());
         let req = req.into_inner();
         if req.sandbox_id.is_empty() {

@@ -1,5 +1,6 @@
 # Development-harness collector: accept OTLP over gRPC and print what arrives.
-# Enough to answer "are spans being exported and do the hops join up"; a real
+# Enough to answer "are spans and sandbox metrics being exported and do the
+# hops join up"; a real
 # deployment points these daemons at whatever collector it already runs.
 receivers:
   otlp:
@@ -14,5 +15,8 @@ exporters:
 service:
   pipelines:
     traces:
+      receivers: [otlp]
+      exporters: [debug]
+    metrics:
       receivers: [otlp]
       exporters: [debug]

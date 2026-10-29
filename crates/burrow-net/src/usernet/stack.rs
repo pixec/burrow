@@ -20,7 +20,7 @@ use tokio::sync::{Notify, watch};
 use tokio::task::{AbortHandle, JoinHandle};
 
 use super::conn::{self, GuestConn};
-use super::{Flow, Node, Policy, SandboxNet, Services, udp, wire};
+use super::{Flow, Meter, Node, Policy, SandboxNet, Services, udp, wire};
 use crate::policy::{self, NodeDenials, Transport, Verdict};
 
 /// Per direction. Large enough that one flow can fill a fast upstream: the
@@ -656,6 +656,7 @@ pub(super) fn attach(
     net: SandboxNet,
     policy: watch::Receiver<Policy>,
     node: Arc<Node>,
+    meter: Arc<Meter>,
 ) -> std::io::Result<Handle> {
     let socket = std::os::unix::net::UnixDatagram::from(fd);
     socket.set_nonblocking(true)?;
@@ -716,7 +717,7 @@ pub(super) fn attach(
         dial: Mutex::new(HashMap::new()),
     });
 
-    let driver = tokio::spawn(drive(Arc::clone(&shared), socket));
+    let driver = tokio::spawn(drive(Arc::clone(&shared), socket, meter));
     let watcher = tokio::spawn(watch_policy(
         Arc::clone(&shared),
         policy,
@@ -747,7 +748,7 @@ async fn watch_policy(
 
 /// Moves frames between the socket pair and the stack until either end
 /// goes away.
-async fn drive(shared: Arc<Shared>, socket: UnixDatagram) {
+async fn drive(shared: Arc<Shared>, socket: UnixDatagram, meter: Arc<Meter>) {
     let mut buf = vec![0u8; 65536];
     loop {
         {
@@ -759,7 +760,10 @@ async fn drive(shared: Arc<Shared>, socket: UnixDatagram) {
                 match socket.try_recv(&mut buf) {
                     // The guest's end closed: the machine is gone.
                     Ok(0) => return,
-                    Ok(n) => shared.ingest(&mut inner, &buf[..n]),
+                    Ok(n) => {
+                        meter.sent(&buf[..n]);
+                        shared.ingest(&mut inner, &buf[..n]);
+                    }
                     Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => break,
                     Err(err) => {
                         tracing::warn!(%err, "guest link failed");
@@ -770,8 +774,10 @@ async fn drive(shared: Arc<Shared>, socket: UnixDatagram) {
         }
         let (out, delay) = shared.poll();
         for frame in out {
-            if send(&socket, &frame).await.is_err() {
-                return;
+            match send(&socket, &frame).await {
+                Ok(true) => meter.delivered(&frame),
+                Ok(false) => {}
+                Err(_) => return,
             }
         }
         // Never zero: a socket whose SYN-ACK is held back asks to be polled
@@ -793,11 +799,11 @@ async fn drive(shared: Arc<Shared>, socket: UnixDatagram) {
 /// A datagram socket reports a full buffer as `ENOBUFS` on macOS rather than
 /// as would-block, and readiness says nothing about it, so the wait is a
 /// short sleep. A frame that still does not fit is dropped, which TCP
-/// recovers from and UDP is allowed to suffer.
-async fn send(socket: &UnixDatagram, frame: &[u8]) -> std::io::Result<()> {
+/// recovers from and UDP is allowed to suffer. Says whether it was sent.
+async fn send(socket: &UnixDatagram, frame: &[u8]) -> std::io::Result<bool> {
     for _ in 0..64 {
         match socket.try_send(frame) {
-            Ok(_) => return Ok(()),
+            Ok(_) => return Ok(true),
             Err(err)
                 if err.kind() == std::io::ErrorKind::WouldBlock
                     || err.raw_os_error() == Some(libc::ENOBUFS) =>
@@ -807,5 +813,5 @@ async fn send(socket: &UnixDatagram, frame: &[u8]) -> std::io::Result<()> {
             Err(err) => return Err(err),
         }
     }
-    Ok(())
+    Ok(false)
 }

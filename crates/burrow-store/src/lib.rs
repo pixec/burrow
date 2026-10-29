@@ -254,6 +254,47 @@ fn split_json<T: serde::de::DeserializeOwned + Default>(text: &str) -> T {
     serde_json::from_str(text).unwrap_or_default()
 }
 
+type EventRaw = (
+    i64,
+    String,
+    i64,
+    i64,
+    String,
+    String,
+    i64,
+    String,
+    String,
+    String,
+    i64,
+    i64,
+    i64,
+    i64,
+    i64,
+);
+
+const EVENT_COLUMNS: &str = "seq, node_id, node_seq, at, sandbox_id, kind, state, detail,
+    template, metadata_json, cpu_usage_usec, rx_bytes, tx_bytes, vcpus, mem_mib";
+
+fn event_row(r: EventRaw) -> EventRow {
+    EventRow {
+        seq: r.0 as u64,
+        node_id: r.1,
+        node_seq: r.2 as u64,
+        at_unix_ms: r.3,
+        sandbox_id: r.4,
+        kind: r.5,
+        state: r.6 as i32,
+        detail: r.7,
+        template: r.8,
+        metadata_json: r.9,
+        cpu_usage_usec: r.10 as u64,
+        rx_bytes: r.11 as u64,
+        tx_bytes: r.12 as u64,
+        vcpus: r.13 as u32,
+        mem_mib: r.14 as u32,
+    }
+}
+
 impl Store {
     /// Opens (creating if needed) a SQLite database and applies the schema.
     pub async fn open(path: &Path) -> Result<Self> {
@@ -571,62 +612,65 @@ impl Store {
         sandbox_id: Option<&str>,
         limit: usize,
     ) -> Result<Vec<EventRow>> {
-        type Raw = (
-            i64,
-            String,
-            i64,
-            i64,
-            String,
-            String,
-            i64,
-            String,
-            String,
-            String,
-            i64,
-            i64,
-            i64,
-            i64,
-            i64,
-        );
         // The optional filter is spelled into the SQL rather than written as
         // `$2 IS NULL OR ...`: Postgres cannot infer the type of a parameter
         // compared only with NULL.
-        let mut sql = String::from(
-            "SELECT seq, node_id, node_seq, at, sandbox_id, kind, state, detail, template,
-                    metadata_json, cpu_usage_usec, rx_bytes, tx_bytes, vcpus, mem_mib
-             FROM events WHERE seq > $1",
-        );
+        let mut sql = format!("SELECT {EVENT_COLUMNS} FROM events WHERE seq > $1");
         if sandbox_id.is_some() {
             sql.push_str(" AND sandbox_id = $3");
         }
         sql.push_str(" ORDER BY seq LIMIT $2");
-        let rows: Vec<Raw> = on_pool!(self, pool => {
+        let rows: Vec<EventRaw> = on_pool!(self, pool => {
             let mut query = sqlx::query_as(&sql).bind(after_seq as i64).bind(limit as i64);
             if let Some(id) = sandbox_id {
                 query = query.bind(id);
             }
             query.fetch_all(pool).await
         })?;
-        Ok(rows
-            .into_iter()
-            .map(|r| EventRow {
-                seq: r.0 as u64,
-                node_id: r.1,
-                node_seq: r.2 as u64,
-                at_unix_ms: r.3,
-                sandbox_id: r.4,
-                kind: r.5,
-                state: r.6 as i32,
-                detail: r.7,
-                template: r.8,
-                metadata_json: r.9,
-                cpu_usage_usec: r.10 as u64,
-                rx_bytes: r.11 as u64,
-                tx_bytes: r.12 as u64,
-                vcpus: r.13 as u32,
-                mem_mib: r.14 as u32,
-            })
-            .collect())
+        Ok(rows.into_iter().map(event_row).collect())
+    }
+
+    /// One node's events after `after_node_seq`, in the node's order.
+    pub async fn list_node_events(
+        &self,
+        node_id: &str,
+        after_node_seq: u64,
+        limit: usize,
+    ) -> Result<Vec<EventRow>> {
+        let sql = format!(
+            "SELECT {EVENT_COLUMNS} FROM events WHERE node_id=$1 AND node_seq > $2
+             ORDER BY node_seq LIMIT $3"
+        );
+        let rows: Vec<EventRaw> = on_pool!(self, pool => sqlx::query_as(&sql)
+            .bind(node_id)
+            .bind(after_node_seq as i64)
+            .bind(limit as i64)
+            .fetch_all(pool)
+            .await)?;
+        Ok(rows.into_iter().map(event_row).collect())
+    }
+
+    /// The latest event recorded for a sandbox.
+    pub async fn last_event_of(&self, sandbox_id: &str) -> Result<Option<EventRow>> {
+        let sql = format!(
+            "SELECT {EVENT_COLUMNS} FROM events WHERE sandbox_id=$1 ORDER BY seq DESC LIMIT 1"
+        );
+        let row: Option<EventRaw> = on_pool!(self, pool => sqlx::query_as(&sql)
+            .bind(sandbox_id)
+            .fetch_optional(pool)
+            .await)?;
+        Ok(row.map(event_row))
+    }
+
+    /// The position of a node's first event that carries a shape.
+    pub async fn first_shaped_event(&self, node_id: &str) -> Result<Option<u64>> {
+        let first: (Option<i64>,) = on_pool!(self, pool => sqlx::query_as(
+            "SELECT MIN(node_seq) FROM events WHERE node_id=$1 AND vcpus > 0",
+        )
+        .bind(node_id)
+        .fetch_one(pool)
+        .await)?;
+        Ok(first.0.map(|seq| seq as u64))
     }
 
     /// The highest `node_seq` copied from a node, so a tail resumes where the
@@ -1215,6 +1259,410 @@ impl Store {
         .fetch_all(pool)
         .await)?;
         Ok(rows.into_iter().map(|(address,)| address).collect())
+    }
+}
+
+/// One closed stretch a sandbox spent in one state at one shape. Appended,
+/// never updated: the usage inside it is the difference of the sandbox's
+/// totals at its two bounds.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct UsageRow {
+    /// Ledger position; 0 until written.
+    pub id: u64,
+    pub sandbox_id: String,
+    pub node_id: String,
+    pub template: String,
+    pub metadata_json: String,
+    pub state: String,
+    pub vcpus: u32,
+    pub mem_mib: u32,
+    pub started_at_ms: i64,
+    pub ended_at_ms: i64,
+    pub cpu_usage_usec: u64,
+    pub rx_bytes: u64,
+    pub tx_bytes: u64,
+    pub closed_by: String,
+}
+
+/// A sandbox's interval that has not closed yet: the totals it began with,
+/// and the latest totals a heartbeat reported for it.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct OpenUsageRow {
+    pub sandbox_id: String,
+    pub node_id: String,
+    pub template: String,
+    pub metadata_json: String,
+    pub state: String,
+    pub vcpus: u32,
+    pub mem_mib: u32,
+    pub started_at_ms: i64,
+    pub cpu_usage_usec: u64,
+    pub rx_bytes: u64,
+    pub tx_bytes: u64,
+    pub seen_at_ms: i64,
+    pub seen_cpu_usage_usec: u64,
+    pub seen_rx_bytes: u64,
+    pub seen_tx_bytes: u64,
+}
+
+/// A change to one sandbox's open interval, applied only if the interval is
+/// still the one it was computed from: `expected` is the `started_at_ms` read,
+/// `None` for no open interval at all.
+#[derive(Debug, Clone)]
+pub struct OpenUsageChange {
+    pub sandbox_id: String,
+    pub expected: Option<i64>,
+    pub next: Option<OpenUsageRow>,
+}
+
+/// What the ledger writer commits at once: closed rows, open-interval changes,
+/// and optionally how far one node's events have now been consumed, moving
+/// from `from` to `to`.
+#[derive(Debug, Clone, Default)]
+pub struct UsageCommit {
+    pub cursor: Option<(String, u64, u64)>,
+    pub rows: Vec<UsageRow>,
+    pub changes: Vec<OpenUsageChange>,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct UsageFilter {
+    pub from_ms: Option<i64>,
+    pub to_ms: Option<i64>,
+    pub sandbox_id: Option<String>,
+    pub after_id: u64,
+    pub limit: u32,
+}
+
+type UsageRaw = (
+    i64,
+    String,
+    String,
+    String,
+    String,
+    String,
+    i64,
+    i64,
+    i64,
+    i64,
+    i64,
+    i64,
+    i64,
+    String,
+);
+
+type OpenUsageRaw = (
+    String,
+    String,
+    String,
+    String,
+    String,
+    i64,
+    i64,
+    i64,
+    i64,
+    i64,
+    i64,
+    i64,
+    i64,
+    i64,
+    i64,
+);
+
+const OPEN_USAGE_COLUMNS: &str = "sandbox_id, node_id, template, metadata_json, state, vcpus,
+    mem_mib, started_at, cpu_usage_usec, rx_bytes, tx_bytes, seen_at, seen_cpu_usage_usec,
+    seen_rx_bytes, seen_tx_bytes";
+
+fn open_usage_row(r: OpenUsageRaw) -> OpenUsageRow {
+    OpenUsageRow {
+        sandbox_id: r.0,
+        node_id: r.1,
+        template: r.2,
+        metadata_json: r.3,
+        state: r.4,
+        vcpus: r.5 as u32,
+        mem_mib: r.6 as u32,
+        started_at_ms: r.7,
+        cpu_usage_usec: r.8 as u64,
+        rx_bytes: r.9 as u64,
+        tx_bytes: r.10 as u64,
+        seen_at_ms: r.11,
+        seen_cpu_usage_usec: r.12 as u64,
+        seen_rx_bytes: r.13 as u64,
+        seen_tx_bytes: r.14 as u64,
+    }
+}
+
+/// The ledger's transaction lock: "ledger" in ASCII.
+const LEDGER_LOCK: i64 = 0x6c65_6467_6572;
+
+/// Binds an open interval to `$2..=$15`, after the sandbox id in `$1`.
+macro_rules! bind_open {
+    ($query:expr, $row:expr) => {
+        $query
+            .bind(&$row.node_id)
+            .bind(&$row.template)
+            .bind(&$row.metadata_json)
+            .bind(&$row.state)
+            .bind($row.vcpus as i64)
+            .bind($row.mem_mib as i64)
+            .bind($row.started_at_ms)
+            .bind($row.cpu_usage_usec as i64)
+            .bind($row.rx_bytes as i64)
+            .bind($row.tx_bytes as i64)
+            .bind($row.seen_at_ms)
+            .bind($row.seen_cpu_usage_usec as i64)
+            .bind($row.seen_rx_bytes as i64)
+            .bind($row.seen_tx_bytes as i64)
+    };
+}
+
+impl Store {
+    /// How far the ledger has consumed each node's log.
+    pub async fn usage_cursors(&self) -> Result<Vec<(String, u64)>> {
+        let rows: Vec<(String, i64)> = on_pool!(self, pool => sqlx::query_as(
+            "SELECT node_id, node_seq FROM usage_cursors ORDER BY node_id",
+        )
+        .fetch_all(pool)
+        .await)?;
+        Ok(rows.into_iter().map(|(id, seq)| (id, seq as u64)).collect())
+    }
+
+    pub async fn open_usage(&self, sandbox_id: &str) -> Result<Option<OpenUsageRow>> {
+        let sql = format!("SELECT {OPEN_USAGE_COLUMNS} FROM usage_open WHERE sandbox_id=$1");
+        let row: Option<OpenUsageRaw> = on_pool!(self, pool => sqlx::query_as(&sql)
+            .bind(sandbox_id)
+            .fetch_optional(pool)
+            .await)?;
+        Ok(row.map(open_usage_row))
+    }
+
+    /// Every open interval, or those on one node.
+    pub async fn list_open_usage(&self, node_id: Option<&str>) -> Result<Vec<OpenUsageRow>> {
+        let mut sql = format!("SELECT {OPEN_USAGE_COLUMNS} FROM usage_open");
+        if node_id.is_some() {
+            sql.push_str(" WHERE node_id=$1");
+        }
+        sql.push_str(" ORDER BY sandbox_id");
+        let rows: Vec<OpenUsageRaw> = on_pool!(self, pool => {
+            let mut query = sqlx::query_as(&sql);
+            if let Some(node_id) = node_id {
+                query = query.bind(node_id);
+            }
+            query.fetch_all(pool).await
+        })?;
+        Ok(rows.into_iter().map(open_usage_row).collect())
+    }
+
+    /// Records the totals a heartbeat carried against each open interval on
+    /// the node, as `(sandbox_id, cpu_usage_usec, rx_bytes, tx_bytes)`.
+    ///
+    /// Only ever moves a reading forward, and never onto an interval that
+    /// began after it, so a heartbeat racing the event that reopened an
+    /// interval cannot pull it back.
+    pub async fn observe_usage(
+        &self,
+        node_id: &str,
+        at_ms: i64,
+        totals: &[(String, u64, u64, u64)],
+    ) -> Result<()> {
+        if totals.is_empty() {
+            return Ok(());
+        }
+        on_pool!(self, pool => {
+            let mut tx = pool.begin().await?;
+            for (sandbox_id, cpu, rx, tx_bytes) in totals {
+                sqlx::query(
+                    "UPDATE usage_open SET seen_at=$3, seen_cpu_usage_usec=$4,
+                       seen_rx_bytes=$5, seen_tx_bytes=$6
+                     WHERE sandbox_id=$1 AND node_id=$2 AND seen_at < $3 AND started_at <= $3",
+                )
+                .bind(sandbox_id)
+                .bind(node_id)
+                .bind(at_ms)
+                .bind(*cpu as i64)
+                .bind(*rx as i64)
+                .bind(*tx_bytes as i64)
+                .execute(&mut *tx)
+                .await?;
+            }
+            tx.commit().await?;
+        });
+        Ok(())
+    }
+
+    /// Applies a ledger step atomically. Returns false, changing nothing, when
+    /// another writer got there first: the cursor or an open interval is no
+    /// longer what the step was computed from.
+    pub async fn commit_usage(&self, commit: &UsageCommit) -> Result<bool> {
+        on_pool!(self, pool => {
+            let mut tx = pool.begin().await?;
+            // One commit at a time, so ids are handed out in the order rows
+            // become visible and a reader paging by id never passes one that
+            // commits later. SQLite has a single writer already.
+            if self.is_postgres() {
+                sqlx::query("SELECT pg_advisory_xact_lock($1)")
+                    .bind(LEDGER_LOCK)
+                    .execute(&mut *tx)
+                    .await?;
+            }
+            if let Some((node_id, from, to)) = &commit.cursor {
+                let moved = if *from == 0 {
+                    sqlx::query(
+                        "INSERT INTO usage_cursors (node_id, node_seq) VALUES ($1, $2)
+                         ON CONFLICT DO NOTHING",
+                    )
+                    .bind(node_id)
+                    .bind(*to as i64)
+                    .execute(&mut *tx)
+                    .await?
+                    .rows_affected()
+                } else {
+                    sqlx::query("UPDATE usage_cursors SET node_seq=$3 WHERE node_id=$1 AND node_seq=$2")
+                        .bind(node_id)
+                        .bind(*from as i64)
+                        .bind(*to as i64)
+                        .execute(&mut *tx)
+                        .await?
+                        .rows_affected()
+                };
+                if moved != 1 {
+                    tx.rollback().await?;
+                    return Ok(false);
+                }
+            }
+            for change in &commit.changes {
+                let applied = match (&change.expected, &change.next) {
+                    (None, None) => 1,
+                    (Some(started), None) => sqlx::query(
+                        "DELETE FROM usage_open WHERE sandbox_id=$1 AND started_at=$2",
+                    )
+                    .bind(&change.sandbox_id)
+                    .bind(*started)
+                    .execute(&mut *tx)
+                    .await?
+                    .rows_affected(),
+                    (None, Some(next)) => {
+                        let query = sqlx::query(
+                            "INSERT INTO usage_open (sandbox_id, node_id, template, metadata_json,
+                               state, vcpus, mem_mib, started_at, cpu_usage_usec, rx_bytes,
+                               tx_bytes, seen_at, seen_cpu_usage_usec, seen_rx_bytes, seen_tx_bytes)
+                             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15)
+                             ON CONFLICT DO NOTHING",
+                        )
+                        .bind(&change.sandbox_id);
+                        bind_open!(query, next).execute(&mut *tx).await?.rows_affected()
+                    }
+                    // A heartbeat may have read further than the step did; the
+                    // later reading is kept.
+                    (Some(started), Some(next)) => {
+                        let query = sqlx::query(
+                            "UPDATE usage_open SET node_id=$2, template=$3, metadata_json=$4,
+                               state=$5, vcpus=$6, mem_mib=$7, started_at=$8, cpu_usage_usec=$9,
+                               rx_bytes=$10, tx_bytes=$11,
+                               seen_at=CASE WHEN $12 >= seen_at THEN $12 ELSE seen_at END,
+                               seen_cpu_usage_usec=CASE WHEN $12 >= seen_at THEN $13 ELSE seen_cpu_usage_usec END,
+                               seen_rx_bytes=CASE WHEN $12 >= seen_at THEN $14 ELSE seen_rx_bytes END,
+                               seen_tx_bytes=CASE WHEN $12 >= seen_at THEN $15 ELSE seen_tx_bytes END
+                             WHERE sandbox_id=$1 AND started_at=$16",
+                        )
+                        .bind(&change.sandbox_id);
+                        bind_open!(query, next)
+                            .bind(*started)
+                            .execute(&mut *tx)
+                            .await?
+                            .rows_affected()
+                    }
+                };
+                if applied != 1 {
+                    tx.rollback().await?;
+                    return Ok(false);
+                }
+            }
+            for row in &commit.rows {
+                sqlx::query(
+                    "INSERT INTO usage_intervals (sandbox_id, node_id, template, metadata_json,
+                       state, vcpus, mem_mib, started_at, ended_at, cpu_usage_usec, rx_bytes,
+                       tx_bytes, closed_by)
+                     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)",
+                )
+                .bind(&row.sandbox_id)
+                .bind(&row.node_id)
+                .bind(&row.template)
+                .bind(&row.metadata_json)
+                .bind(&row.state)
+                .bind(row.vcpus as i64)
+                .bind(row.mem_mib as i64)
+                .bind(row.started_at_ms)
+                .bind(row.ended_at_ms)
+                .bind(row.cpu_usage_usec as i64)
+                .bind(row.rx_bytes as i64)
+                .bind(row.tx_bytes as i64)
+                .bind(&row.closed_by)
+                .execute(&mut *tx)
+                .await?;
+            }
+            tx.commit().await?;
+        });
+        Ok(true)
+    }
+
+    /// Ledger rows by id, ascending, that start inside the filter's window.
+    pub async fn list_usage(&self, filter: &UsageFilter) -> Result<Vec<UsageRow>> {
+        let mut sql = String::from(
+            "SELECT id, sandbox_id, node_id, template, metadata_json, state, vcpus, mem_mib,
+                    started_at, ended_at, cpu_usage_usec, rx_bytes, tx_bytes, closed_by
+             FROM usage_intervals WHERE id > $1",
+        );
+        let mut next = 3;
+        let mut clause = |sql: &mut String, text: &str| {
+            sql.push_str(&text.replace('?', &format!("${next}")));
+            next += 1;
+        };
+        if filter.from_ms.is_some() {
+            clause(&mut sql, " AND started_at >= ?");
+        }
+        if filter.to_ms.is_some() {
+            clause(&mut sql, " AND started_at < ?");
+        }
+        if filter.sandbox_id.is_some() {
+            clause(&mut sql, " AND sandbox_id = ?");
+        }
+        sql.push_str(" ORDER BY id LIMIT $2");
+        let rows: Vec<UsageRaw> = on_pool!(self, pool => {
+            let mut query = sqlx::query_as(&sql)
+                .bind(filter.after_id as i64)
+                .bind(filter.limit as i64);
+            if let Some(from) = filter.from_ms {
+                query = query.bind(from);
+            }
+            if let Some(to) = filter.to_ms {
+                query = query.bind(to);
+            }
+            if let Some(id) = &filter.sandbox_id {
+                query = query.bind(id);
+            }
+            query.fetch_all(pool).await
+        })?;
+        Ok(rows
+            .into_iter()
+            .map(|r| UsageRow {
+                id: r.0 as u64,
+                sandbox_id: r.1,
+                node_id: r.2,
+                template: r.3,
+                metadata_json: r.4,
+                state: r.5,
+                vcpus: r.6 as u32,
+                mem_mib: r.7 as u32,
+                started_at_ms: r.8,
+                ended_at_ms: r.9,
+                cpu_usage_usec: r.10 as u64,
+                rx_bytes: r.11 as u64,
+                tx_bytes: r.12 as u64,
+                closed_by: r.13,
+            })
+            .collect())
     }
 }
 

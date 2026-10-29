@@ -2,12 +2,14 @@ mod access;
 mod blobs;
 mod chunks;
 mod cmdlogs;
+mod delivery;
 mod devvm;
 mod durable;
 mod edge;
 mod guestconn;
 mod kit;
 mod macnode;
+mod metrics;
 mod nodeapi;
 mod objstore;
 mod oci;
@@ -75,13 +77,15 @@ fn main() -> anyhow::Result<()> {
 
 async fn daemon() -> anyhow::Result<()> {
     let args = Args::parse();
-    let telemetry = burrow_common::telemetry::init(
+    let mut telemetry = burrow_common::telemetry::init(
         "burrowd",
         match &args.command {
             Command::Serve(serve) => serve.otlp_endpoint.as_deref(),
             _ => None,
         },
     );
+    // Read on the reaper's period, which is how often the totals move.
+    telemetry.export_metrics(std::time::Duration::from_secs(serve::REAP_INTERVAL_SECS));
 
     let result = run(args).await;
     // Spans from the shutdown path are the ones worth not losing.
