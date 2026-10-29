@@ -17,33 +17,17 @@ use std::fmt::Write as _;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 
 use crate::error::{NetError, Result};
+#[cfg(test)]
+use crate::policy::parse_cidr;
+use crate::policy::{Cidr, METADATA_CIDR, SANDBOX_POOL};
 
 /// The address range every sandbox lease comes from.
 pub const SANDBOX_CIDR: &str = "10.99.0.0/16";
 /// The v6 pool, as [`SANDBOX_CIDR`] is for v4: the range a rule names when it
 /// means any sandbox anywhere rather than one on this node.
 pub const POOL6: &str = "fd99:b070::/48";
-/// The renderer's validated form of [`SANDBOX_CIDR`]. Nothing reaches the nft
-/// script that was not parsed first, a constant included, so this is built from
-/// [`crate::ipam`]'s numbers rather than from the string above.
-const SANDBOX_POOL: Cidr = Cidr {
-    addr: crate::ipam::POOL_ADDRESS,
-    prefix: crate::ipam::POOL_PREFIX,
-};
 /// Prefix shared by every burrow tap, used for interface wildcard matches.
 pub const TAP_PREFIX: &str = "bt";
-
-/// Link-local space, home to `169.254.169.254`: on EC2, GCP, Azure and most
-/// other clouds, the instance's own credentials are an unauthenticated HTTP
-/// GET away at that address. Denied to every sandbox regardless of egress
-/// mode, the same way `crate::proxy`'s `is_forbidden_destination` denies it
-/// on the allowlist path. Open mode has no proxy in front of it to do that,
-/// so without this the metadata service is reachable from any open-mode
-/// sandbox on a cloud host.
-const METADATA_CIDR: Cidr = Cidr {
-    addr: Ipv4Addr::new(169, 254, 0, 0),
-    prefix: 16,
-};
 
 /// Mesh interface, mirrored from [`crate::mesh`] so rules can name it.
 pub const MESH_INTERFACE: &str = crate::mesh::MESH_INTERFACE;
@@ -128,114 +112,18 @@ pub struct SandboxRules {
 pub const PROXY_PORT: u16 = 3128;
 pub const DNS_PORT: u16 = 53;
 
-/// A validated `allow_cidrs` entry.
-///
-/// `nft -f -` reads a script, one command per line, so a caller's string
-/// reaching it verbatim is rule injection: a newline inside a "CIDR" would
-/// append rules of the attacker's choosing to burrow's own tables. Only the
-/// parsed address and prefix are rendered.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct Cidr {
-    addr: Ipv4Addr,
-    prefix: u8,
-}
-
-impl std::fmt::Display for Cidr {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "{}/{}", self.addr, self.prefix)
-    }
-}
-
-/// Parses `a.b.c.d[/len]`, rejecting anything else.
-///
-/// A bare address is a /32, which is what an operator writing one means.
-/// Whitespace, a second slash, `+32` and a prefix over 32 are refused rather
-/// than interpreted.
-fn parse_cidr(value: &str) -> Option<Cidr> {
-    let (addr, prefix) = match value.split_once('/') {
-        Some((addr, len)) => {
-            // `str::parse` for integers accepts a leading `+`; a prefix length
-            // is digits and nothing else.
-            if len.is_empty() || !len.bytes().all(|b| b.is_ascii_digit()) {
-                return None;
-            }
-            let prefix: u8 = len.parse().ok()?;
-            if prefix > 32 {
-                return None;
-            }
-            (addr, prefix)
-        }
-        None => (value, 32),
-    };
-    Some(Cidr {
-        addr: addr.parse::<Ipv4Addr>().ok()?,
-        prefix,
-    })
-}
-
-/// The validated form of a sandbox's L3 allowance, or `None` when any part of
-/// it is malformed.
-///
-/// All-or-nothing per sandbox, failing to no allowance at all rather than to
-/// the subset that happened to parse. Letting one bad record abort the render
-/// would freeze the whole node's ruleset, since every sandbox is re-rendered
-/// into one transactional `nft -f -` script.
+/// [`crate::policy::validated_allowance`] for one sandbox's record.
 fn validated_allowance(sandbox: &SandboxRules) -> Option<(Vec<Cidr>, Vec<u16>)> {
-    let mut cidrs = Vec::with_capacity(sandbox.allow_cidrs.len());
-    for entry in &sandbox.allow_cidrs {
-        match parse_cidr(entry) {
-            Some(cidr) => cidrs.push(cidr),
-            None => {
-                tracing::error!(
-                    sandbox = sandbox.sandbox_id,
-                    "rejecting a malformed allow_cidrs entry; this sandbox gets no \
-                     address allowance"
-                );
-                return None;
-            }
-        }
-    }
-
-    let mut ports = Vec::with_capacity(sandbox.allow_ports.len());
-    for port in &sandbox.allow_ports {
-        match u16::try_from(*port) {
-            Ok(port) => ports.push(port),
-            Err(_) => {
-                tracing::error!(
-                    sandbox = sandbox.sandbox_id,
-                    port,
-                    "rejecting an out-of-range allow_ports entry; this sandbox gets no \
-                     address allowance"
-                );
-                return None;
-            }
-        }
-    }
-    Some((cidrs, ports))
+    crate::policy::validated_allowance(
+        &sandbox.sandbox_id,
+        &sandbox.allow_cidrs,
+        &sandbox.allow_ports,
+    )
 }
 
-/// The validated form of a sandbox's denied ranges, or `None` when any entry
-/// is malformed.
-///
-/// Fails the opposite way from [`validated_allowance`]: dropping an unparseable
-/// denial would grant exactly the access the operator asked to withhold, so the
-/// caller turns `None` into a blanket drop for the sandbox.
+/// [`crate::policy::validated_denials`] for one sandbox's record.
 fn validated_denials(sandbox: &SandboxRules) -> Option<Vec<Cidr>> {
-    let mut cidrs = Vec::with_capacity(sandbox.deny_cidrs.len());
-    for entry in &sandbox.deny_cidrs {
-        match parse_cidr(entry) {
-            Some(cidr) => cidrs.push(cidr),
-            None => {
-                tracing::error!(
-                    sandbox = sandbox.sandbox_id,
-                    "rejecting a malformed deny_cidrs entry; this sandbox gets no egress \
-                     at all"
-                );
-                return None;
-            }
-        }
-    }
-    Some(cidrs)
+    crate::policy::validated_denials(&sandbox.sandbox_id, &sandbox.deny_cidrs)
 }
 
 /// Renders the complete ruleset for the given sandboxes.

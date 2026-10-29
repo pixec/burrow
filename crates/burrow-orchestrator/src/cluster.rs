@@ -44,13 +44,7 @@ async fn sync_once(
     inventoried: &mut HashMap<String, Instant>,
 ) -> burrow_store::Result<()> {
     reload_nodes(state, store).await?;
-
-    if let Some(writer) = state.sandboxes.writer() {
-        let mark = writer.flush().await;
-        let placements = store.list_placements().await?;
-        let tombstones = store.list_tombstones().await?;
-        state.sandboxes.reload(mark, placements, tombstones);
-    }
+    state.sandboxes.reload_since(Instant::now()).await?;
 
     let known: HashSet<String> = state.nodes.healthy_ids();
     inventoried.retain(|id, _| known.contains(id));

@@ -136,7 +136,7 @@ from their last position.
 | --- | --- |
 | `burrow-proto` | `api` (client to orchestrator), `node` (orchestrator to burrowd), `guest` (burrowd to guest) and `common` protos |
 | `burrow-common` | Shared by both daemons: auth, edge wire format, policy globs, tags, telemetry, secrets vault |
-| `burrow-firecracker` | Firecracker process supervision, API client, snapshots, cgroups |
+| `burrow-vmm` | The hypervisor-neutral VM interface and its backends: Firecracker and Cloud Hypervisor process supervision, API clients, snapshots, lazy guest memory, cgroups |
 | `burrow-net` | Address allocation, tap devices, nftables policy, mesh |
 | `burrow-proxy` | Transparent egress proxy, domain allowlisting, DNS, egress audit |
 | `burrow-store` | Persistence: SQLite on nodes, SQLite or PostgreSQL for the orchestrator |
@@ -146,7 +146,7 @@ from their last position.
 | `burrow-daemon` | `burrowd` node binary |
 | `burrow-cli` | `burrow` CLI |
 
-`burrow-proto` is used by everything. `burrow-firecracker` and `burrow-proxy`
+`burrow-proto` is used by everything. `burrow-vmm` and `burrow-proxy`
 are used only by `burrowd`; `burrow-net` and `burrow-store` by both daemons.
 
 `burrow-guest` is Linux only: vsock, mount syscalls, netlink. It is excluded
@@ -167,11 +167,10 @@ sequenceDiagram
     Note over S: placement: labels? template<br/>present? peers? warm?
     S->>N: CreateSandbox(id, template, policy)
     Note over N: stage workdir<br/>(hard link kernel+rootfs,<br/>sparse copy scratch)
-    N->>N: allocate /30 lease, create tap
-    N->>F: spawn + configure (or restore a snapshot)
-    N->>N: apply cgroup limits
+    N->>N: allocate /30 lease, create tap, make cgroup
+    N->>F: spawn into the cgroup + configure (or restore a snapshot)
     N->>F: InstanceStart (or resume)
-    N->>N: register, then render and apply nftables
+    N->>N: render and apply nftables with it, then register
     N-->>S: Sandbox{id, node, guest_ip}
     S-->>C: Sandbox
     par behind the response, on a warm restore
@@ -183,16 +182,23 @@ sequenceDiagram
 
 Three orderings in there are load bearing.
 
-**Limits are applied between spawn and start.** The cgroup is written after the
-VMM process exists and before `InstanceStart`, so a guest never runs even
-briefly uncapped. A host where the cgroup cannot be written logs and continues
+**Limits are in place before the VMM runs.** The cgroup is made before the VMM
+is spawned and the child joins it before it execs, so neither the VMM nor a
+guest ever runs even briefly uncapped or uncounted. A host where the cgroup cannot be written logs and continues
 uncapped, because the stack has to run where cgroups are unavailable;
 `--require-resource-limits` turns that into a refusal to start, and is worth
 setting wherever sandboxes share a host with anything that matters.
 
-**The firewall is rendered after the sandbox is registered**, because the
-ruleset is a function of the whole set of running sandboxes on the node, not of
-the one being created.
+**The firewall is rendered with the sandbox before it is registered**, because
+the ruleset is a function of the whole set of running sandboxes on the node,
+not of the one being created. The render takes the map plus the new sandbox,
+and the sandbox goes into the map only once the ruleset applied, under the one
+lock every render holds, so no other render lands in between and leaves it
+out. A ruleset that will not apply registers nothing: the sandbox is torn down
+(an adopt also hands its claim back) and the error returned is true, where it
+used to be returned for a sandbox left running. The guest may already be up by
+then, but a tap the ruleset does not name has every packet dropped by the
+anti-spoofing chain, so it has no network until its rules are in.
 
 **The handshake runs behind the response.** A warm create returns once the VM
 is restored and the firewall is up, not once the guest answered. The task that
@@ -308,8 +314,198 @@ Two details are not obvious:
   socket is a direct path into a sandbox's guest memory.
 
 Cgroups stay Burrow's own: the jailer gets `--cgroup-version 2` and no
-`--cgroup` arguments, which makes it touch no cgroup at all, leaving the limits
-Burrow applies by pid intact.
+`--cgroup` arguments, which makes it touch no cgroup at all. Burrow makes the
+sandbox's cgroup before it spawns either VMM, and the child joins it between
+fork and exec (one `write(2)` of `0` to `cgroup.procs`, from a descriptor
+opened beforehand), so the VMM is counted and capped from its first
+instruction rather than moved in by pid once it already runs. The jailer execs
+Firecracker in place, so what joined is Firecracker itself.
+
+#### Cloud Hypervisor's jail
+
+Cloud Hypervisor has no jailer, so `--jailer` has burrowd build one for it. The
+sandbox's directory is the same chroot path Firecracker's would be. burrowd
+runs itself again as a short helper (`/proc/self/exe
+__cloud-hypervisor-jail <plan>`, dispatched before the async runtime starts,
+since a threaded process cannot unshare its mount namespace), which:
+
+- unshares mount, IPC, PID and network namespaces and forks; the VMM is PID 1
+  of its namespace and sees no other process, and has no network of its own;
+- mounts a 1 MiB tmpfs over the sandbox directory as the new root, binds the
+  directory back in at `/work` (nosuid, nodev), `mknod`s `/dev/kvm` (owned by
+  the jail uid, `0600`) and `/dev/urandom`, binds read-only at their own paths
+  any host files the VM config names absolutely (a `--cloud-hypervisor-kernel`,
+  the UEFI firmware), `pivot_root`s into it, and remounts it read-only;
+- drops every capability, the bounding set included, takes `--jail-uid` and
+  `--jail-gid` with no supplementary groups, sets `no_new_privs` and a
+  parent-death signal, and execs the VMM by descriptor with an empty
+  environment (burrowd's carries the object store's credentials);
+- stays as the namespace's parent, reaping the VMM and exiting with its
+  status. burrowd stops a jailed VMM with SIGTERM to the helper, which kills
+  and reaps it: killing the helper outright would leave the VMM for whatever
+  adopts orphans to reap, which in a container is burrowd, and it never would.
+
+Inside, Cloud Hypervisor's seccomp filter is on (its default) and its Landlock
+is enabled through `landlock_enable` and `landlock_rules` in the VM config:
+`/work` read-write, plus the rules Cloud Hypervisor derives from the config
+itself. The directory is allowed whole because a snapshot is written into it
+and a hotplugged volume opened from it, neither of which exists when the
+ruleset is made. What the VMM can reach is therefore that sandbox's own files,
+`/dev/kvm`, `/dev/urandom`, the descriptors it was handed, and its API and
+vsock sockets in `/work`. Verified in the harness: `Uid 65534`, `CapEff` and
+`CapBnd` zero, `NoNewPrivs 1`, `Seccomp 2`, `NSpid <n> 1`, and its root holds
+`dev` and `work` and nothing else.
+
+A jailed VMM cannot open a tap (attaching needs `CAP_NET_ADMIN`), so burrowd
+opens it and hands the descriptor over the API socket in the request's
+`SCM_RIGHTS`: a boot creates the VM without its NIC and adds it with
+`vm.add-net` before `vm.boot`; a restore goes through `vm.restore` with
+`net_fds` instead of `--restore` on the command line, with the unpacked
+config's NIC marked descriptor-backed, as Cloud Hypervisor only applies
+`net_fds` to one. A snapshot or restore names its directory from inside the
+jail (`file:///work/snapshot.ch`). Cloud Hypervisor writes its memory file
+`0600`, so a restore hands the file to the jail uid first, which every jailed
+VMM runs as anyway. Snapshots move freely between jailed and unjailed VMMs: a
+restore sets Landlock and the NIC's addressing for the VMM doing it, not the
+one that took the snapshot, and a node with `--jailer` moves a sandbox
+directory left outside the jail into it on recovery.
+
+`--unjailed-cloud-hypervisor` runs Cloud Hypervisor unconfined even with
+`--jailer`, for a dev box whose kernel cannot build the jail. Without it a
+node with `--jailer` never runs one VMM confined and the other not. Two costs
+of the empty namespaces, both only warnings: Cloud Hypervisor cannot read the
+host's cache topology from `/sys`, and cannot query the tap's MTU by name, so
+it does not advertise `VIRTIO_NET_F_MTU` and the guest keeps its default 1500.
+
+## Hypervisor backends
+
+A template records the hypervisor its sandboxes run under, chosen once when it
+is built or pulled (`burrow pull --hypervisor cloud-hypervisor`, or
+`BuildTemplateRequest.hypervisor`) and written into its `image.json`, so it
+travels with the template when nodes copy it between them. Empty is the
+guest's default: Firecracker for Linux. Every sandbox made from the template
+runs under that hypervisor for its whole life, the warm pool included, and
+`Sandbox.hypervisor`, `Snapshot.hypervisor` and the stored manifest record it,
+because state restores only under the hypervisor that wrote it. A snapshot,
+fork, move or adoption therefore stays within one, and a node asked to restore
+state under a hypervisor it does not offer refuses by name. The same image can
+be pulled twice under two names to have it under both.
+
+`crates/burrow-vmm` is the one interface the daemon drives:
+
+```text
+burrow-vmm/src/
+  lib.rs                 Hypervisor, GuestOs, Capabilities, Layout, Backend, VmSpec, Vm
+  error.rs  cgroup.rs    shared by both backends
+  http.rs   guest.rs     the API-socket HTTP client, and hybrid vsock
+  firecracker/           mod, api, model, process, uffd, vsock
+  cloud_hypervisor/      mod (process and API), config (the VmConfig), jail
+```
+
+`Vm` is an enum over the backends rather than a trait object. The set is
+closed and in-tree, every operation is async (which a `dyn` trait can only
+express by boxing each future), and a `match` makes a new backend answer for
+every operation at compile time rather than inheriting a default.
+
+The daemon never branches on a backend's name. It asks its `Capabilities`:
+
+| Capability | Firecracker | Cloud Hypervisor | What the daemon does without it |
+| --- | --- | --- | --- |
+| diff snapshots | yes | no | every suspend writes a full snapshot; the chain is always one layer |
+| lazy memory (burrow's page-fault handler) | yes | no | no prefetch plans, and memory arriving from the object store is waited for in full before the restore |
+| drive hotplug | yes | yes | a create with volumes boots cold instead of restoring the warm snapshot, and a fork or snapshot restore with volumes is refused |
+| jailable | yes (its jailer) | yes (burrowd's jail) | the sandbox's files live in `sandboxes/<id>`, not a chroot |
+| guest OSes | Linux | Linux | a template for another guest is refused |
+| VMM memory headroom | 128 MiB | 128 MiB | added to the cgroup's ceiling |
+
+Snapshot files are the backend's too. Firecracker's are `snapshot.vmstate` and
+`snapshot.mem`; Cloud Hypervisor's are `snapshot.ch-state` and
+`snapshot.ch-memory`. Everything that copies, links, uploads or sweeps a
+snapshot (forks, the snapshot store, durable state, warm pools, recovery) reads
+the names from the sandbox's `Layout`.
+
+### Cloud Hypervisor
+
+Driven the way Firecracker is. `cloud-hypervisor --api-socket path=ch.sock` is
+started in the sandbox's directory and its cgroup, jailed under `--jailer` (see
+[Cloud Hypervisor's jail](#cloud-hypervisors-jail)), and the machine is created
+and booted over the REST API:
+
+```text
+PUT /api/v1/vm.create   {cpus: {boot_vcpus, max_vcpus}, memory: {size},
+                         payload: {kernel: "vmlinux", cmdline},
+                         disks: [{id: "rootfs", path: "rootfs.ext4", readonly: true, image_type: "Raw"},
+                                 {id: "scratch", path: "scratch.ext4", ...}, volumes...],
+                         net: [{id: "net0", tap: "bt<n>", mac}],
+                         vsock: {id: "vsock", cid: 3, socket: "vsock.sock"},
+                         serial / console: one of them to console.log}
+PUT /api/v1/vm.boot
+PUT /api/v1/vm.pause, vm.resume
+PUT /api/v1/vm.snapshot  {destination_url: "file://<workdir>/snapshot.ch"}
+PUT /api/v1/vm.add-disk  {id, path, readonly, image_type: "Raw"}
+```
+
+It is the same machine Firecracker builds from a template: the template's
+kernel and ext4 rootfs, virtio-blk disks in Firecracker's order (the guest
+finds them by position), the sandbox's own tap, so every nftables rule applies
+unchanged, and hybrid vsock behind the same `vsock.sock` with the same
+`CONNECT <port>` handshake, so the agent path and the guest are untouched and
+no host-global CIDs are needed. Every path is relative and the VMM's cwd is the
+sandbox directory, because Cloud Hypervisor writes the config into each
+snapshot verbatim and restores from it: relative paths are what let a warm
+snapshot taken in one directory restore in another.
+
+A snapshot is Cloud Hypervisor's own `config.json`, `state.json` and
+`memory-ranges`, packed into the two files of the layout. A restore unpacks
+them into `restore.ch/`, points the recorded NIC at this sandbox's tap, refuses
+a different vcpu or memory size by name, and starts a fresh VMM with
+`--restore source_url=file://...,memory_restore_mode=copyonwrite` (jailed,
+`vm.restore` with the same, as above), then resumes it. `copyonwrite` maps the memory file privately,
+as Firecracker's `File` backend does: a restore costs a mapping rather than a
+copy, and sandboxes restored from one warm snapshot share its page cache.
+Measured in the harness on 512 MiB guests: `copy` 2004 ms, `copyonwrite`
+15 ms, `ondemand` (userfaultfd) 10 ms. `ondemand` is not used, because it
+serves pages from Cloud Hypervisor's own handler, which burrow cannot point at
+a chain or at memory still arriving, so it would buy nothing over
+`copyonwrite` and is still reported as no lazy-memory capability.
+
+The guest console is `hvc0` (virtio-console) on aarch64, because the VMM's
+UART there is a PL011 and the Firecracker CI kernel has no driver for it, and
+the 16550 `ttyS0` on x86_64. `burrowd serve --cloud-hypervisor-kernel <path>`
+boots another kernel for every Cloud Hypervisor sandbox, for templates whose
+own kernel lacks virtio-pci; the harness kernel (Firecracker CI 6.1.141,
+aarch64) has `VIRTIO_PCI`, `PCI_HOST_GENERIC`, `VIRTIO_VSOCKETS` and
+`VIRTIO_CONSOLE` and boots unchanged. On x86_64 Cloud Hypervisor enters a
+vmlinux through its PVH note, so the kernel needs `CONFIG_PVH`; that is
+unverified here, the harness being aarch64.
+
+What it does not do: diff snapshots, prefetch plans, and console input. Its memory image is dense
+on disk, 512 MiB for a 512 MiB guest, where Firecracker's is sparse.
+
+### Node flags
+
+| Flag | Default | |
+| --- | --- | --- |
+| `--hypervisors <LIST>` | `firecracker` | Comma-separated. A hypervisor whose binary is missing is left out of what the node advertises (`NodeInfo.hypervisors`), with a warning. |
+| `--firecracker <PATH>` | `/usr/local/bin/firecracker` | |
+| `--cloud-hypervisor <PATH>` | `/usr/local/bin/cloud-hypervisor` | |
+| `--cloud-hypervisor-kernel <PATH>` | unset | Kernel every Cloud Hypervisor sandbox boots instead of its template's. |
+| `--unjailed-cloud-hypervisor` | off | Run Cloud Hypervisor unconfined even with `--jailer`. For dev boxes only. |
+
+Placement takes only nodes offering the template's hypervisor. The
+orchestrator learns it from the template's recorded config on a node holding
+it, and skips that round trip when every healthy node offers the same set. A
+node that reports none predates the field and runs Firecracker.
+
+### Windows, next
+
+The seams a Windows guest goes through: `GuestOs::Windows`, whose default
+hypervisor is already Cloud Hypervisor; `payload.firmware` in place of the
+kernel (the node image ships `CLOUDHV.fd` / `CLOUDHV_EFI.fd` from Cloud
+Hypervisor's edk2 fork under `/usr/local/share/cloud-hypervisor`) with a disk
+image as the root drive; `tpm: {socket}` backed by `swtpm`, also in the image;
+a guest agent of its own; and the template's `guest_os` in `image.json`. Each
+builder refuses a Windows spec by name today rather than booting it wrong.
 
 ## Networking
 
@@ -898,7 +1094,24 @@ The manifest also says whether the sandbox is running. A node writes `running`
 before it resumes a sandbox with a stored copy, and refuses to resume when the
 store cannot be reached; a node asked to adopt one the manifest says is
 running refuses, because what the store holds is from before the guest moved
-on. That closes the case of a node that resumed a sandbox and then died. The
+on. That closes the case of a node that resumed a sandbox and then died.
+
+Every manifest write that hands the sandbox to a node is a lease taken by
+compare-and-swap. An adopt writes its claim with `If-Match` on the ETag of the
+manifest it read and decided on; the first upload writes with `If-None-Match:
+*`; a resume, an upload after a suspend and a failed adopt's hand-back read
+the manifest, check it still names this node, and write with `If-Match` on
+that read. Only a node writes its own name in, and a hand-back restores
+exactly what was read, so while the manifest names a node no other runs the
+sandbox. Two nodes adopting at once (a move racing a start, a hand-back racing
+a slow target, two orchestrator replicas) both read it suspended, and one
+claim lands; the other gets `Aborted`, naming the holder, before it has staged
+or started anything. A node the sandbox moved off cannot write over the one
+holding it now. At startup burrowd probes the store with two conditional
+writes that must fail and refuses to start if either lands, unless
+`--allow-unconditional-object-store` accepts the race; versitygw 1.0.14
+ignores both headers, 1.10 honours them, and of 16 concurrent `If-Match`
+writes of one ETag exactly one lands. The
 case of a node that is alive but cut off is closed by a lease: every heartbeat
 renews one three intervals shorter than `--node-expiry-secs`, and once it
 lapses the node fences its stored sandboxes and resumes none of them until the
@@ -930,8 +1143,9 @@ current manifest already references.
 The store is spoken to through the AWS S3 SDK, built on the rustls and ring
 the node already uses so the musl cross build carries one TLS stack.
 Credentials come from `AWS_ACCESS_KEY_ID` and `AWS_SECRET_ACCESS_KEY`, the
-endpoint is addressed path-style, any S3-compatible store works, and the node
-creates its bucket if it is missing.
+endpoint is addressed path-style, any S3-compatible store that honours
+conditional writes works (see above; `--allow-unconditional-object-store`
+accepts one that does not), and the node creates its bucket if it is missing.
 
 ## Lifecycle and reclamation
 

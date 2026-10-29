@@ -270,6 +270,10 @@ message BuildTemplateRequest {
   // alone. Recorded with the template, so everything built on it or restored
   // from it keeps the mode. The image has to ship systemd.
   bool is_systemd = 9;
+  // "firecracker" or "qemu": chosen here, once, for every sandbox the
+  // template makes. Empty is Firecracker for a Linux image and QEMU for a
+  // Windows one, which Firecracker cannot run.
+  string hypervisor = 10;
 }
 
 message BuildDone {
@@ -298,6 +302,10 @@ message TemplateInfo {
   bool is_kit = 4;
   // Sandboxes from it run systemd under the agent.
   bool is_systemd = 5;
+  // "linux" or "windows".
+  string guest_os = 6;
+  // The hypervisor every sandbox from this template runs under.
+  string hypervisor = 7;
 }
 
 message ListTemplatesResponse {

@@ -1081,7 +1081,12 @@ volumes cannot move, since its volumes stay where they are. Published ports, a
 share and the session history are this node's and do not come along, and an
 edge hostname names the node, so it changes with the move. If the destination
 fails to restore it, the sandbox is left in the object store and a later
-`start` places it again.
+`start` places it again. A move racing another start or move of the same sandbox
+loses cleanly: one node takes it, and the other refuses with `Aborted`, naming
+the node that holds it, without starting anything. That takes an object store
+that honours conditional writes, which `burrowd serve` checks at startup and
+refuses to run without unless given `--allow-unconditional-object-store`
+([PERSISTENCE.md](PERSISTENCE.md#one-sandbox-one-node)).
 
 ## remove
 
@@ -1470,9 +1475,9 @@ burrow unshare sbx_2f0c
 
 ## images
 
-List templates, with their size, whether a warm snapshot is ready, and
-whether they boot systemd under the agent. Same as
-[`templates ls`](#templates-ls).
+List templates, with their size, whether a warm snapshot is ready, whether
+they boot systemd under the agent, and the hypervisor their sandboxes run
+under. Same as [`templates ls`](#templates-ls).
 
 ```
 burrow images
@@ -1480,9 +1485,9 @@ burrow images
 
 ```sh
 burrow images
-# TEMPLATE                       SIZE  WARM  INIT
-# default                         64M  yes   agent
-# python                         398M  no    agent
+# TEMPLATE                       SIZE  WARM  INIT     HYPERVISOR
+# default                         64M  yes   agent    firecracker
+# python                         398M  no    agent    cloud-hypervisor
 ```
 
 A template is the rootfs a sandbox boots, held on the nodes. There is no local
@@ -1495,7 +1500,7 @@ Import an OCI image as a template. Build progress streams as it runs. Same as
 [`templates import`](#templates-import).
 
 ```
-burrow pull [--name <NAME>] [--systemd] <IMAGE>
+burrow pull [--name <NAME>] [--systemd] [--hypervisor <NAME>] <IMAGE>
 ```
 
 ```sh
@@ -1513,6 +1518,7 @@ burrow create --template python-3.12-slim
 | --- | --- |
 | `--name <NAME>` | Template name. Defaults to the repository plus the tag, so `ghcr.io/org/tool:v1` becomes `tool-v1` and `alpine:latest` becomes `alpine`. A digest reference keeps the bare repository name. See [TEMPLATES.md](TEMPLATES.md#how-an-import-is-named). |
 | `--systemd` | Boot the image's own systemd under the agent. See [TEMPLATES.md](TEMPLATES.md#systemd-templates). |
+| `--hypervisor <NAME>` | Hypervisor every sandbox from the template runs under: `firecracker` (the default) or `cloud-hypervisor`. Chosen here once; its snapshots, warm pool and moves stay within it, and it is placed only on nodes offering it. Pull the same image twice under two names to have it under both. See [ARCHITECTURE.md](ARCHITECTURE.md#hypervisor-backends). |
 
 This is a conversion, not a download into a cache. The image's layers are
 flattened into a rootfs on a node and kept as a template, and its `ENV`,
@@ -1529,9 +1535,9 @@ burrow templates <SUBCOMMAND>
 
 ### templates ls
 
-List templates, with their size, whether a warm snapshot is ready, and
-whether they boot systemd under the agent. Same as
-[`images`](#images).
+List templates, with their size, whether a warm snapshot is ready, whether
+they boot systemd under the agent, and the hypervisor their sandboxes run
+under. Same as [`images`](#images).
 
 ```
 burrow templates ls
@@ -1539,9 +1545,9 @@ burrow templates ls
 
 ```sh
 burrow templates ls
-# TEMPLATE                       SIZE  WARM  INIT
-# default                         64M  yes   agent
-# python                         398M  no    agent
+# TEMPLATE                       SIZE  WARM  INIT     HYPERVISOR
+# default                         64M  yes   agent    firecracker
+# python                         398M  no    agent    cloud-hypervisor
 ```
 
 ### templates import
@@ -1549,7 +1555,7 @@ burrow templates ls
 Import an OCI image as a template. Same as [`pull`](#pull).
 
 ```
-burrow templates import [--name <NAME>] [--systemd] <IMAGE>
+burrow templates import [--name <NAME>] [--systemd] [--hypervisor <NAME>] <IMAGE>
 ```
 
 ```sh
@@ -1565,6 +1571,7 @@ burrow templates import python:3.12-slim
 | --- | --- |
 | `--name <NAME>` | Template name. Defaults to the repository plus the tag, as [`pull`](#pull) does. |
 | `--systemd` | Boot the image's own systemd under the agent. See [TEMPLATES.md](TEMPLATES.md#systemd-templates). |
+| `--hypervisor <NAME>` | Hypervisor every sandbox from the template runs under: `firecracker` (the default) or `cloud-hypervisor`. Chosen here once; its snapshots, warm pool and moves stay within it, and it is placed only on nodes offering it. Pull the same image twice under two names to have it under both. See [ARCHITECTURE.md](ARCHITECTURE.md#hypervisor-backends). |
 
 ### templates rm
 

@@ -305,6 +305,10 @@ enum Command {
         /// ship systemd.
         #[arg(long)]
         systemd: bool,
+        /// Hypervisor every sandbox from the template runs under:
+        /// `firecracker` or `cloud-hypervisor`. Defaults to Firecracker.
+        #[arg(long)]
+        hypervisor: Option<String>,
     },
     /// Save a sandbox's state as a snapshot. The sandbox keeps running.
     Commit {
@@ -1140,6 +1144,10 @@ enum TemplatesCommand {
         /// ship systemd.
         #[arg(long)]
         systemd: bool,
+        /// Hypervisor every sandbox from the template runs under:
+        /// `firecracker` or `cloud-hypervisor`. Defaults to Firecracker.
+        #[arg(long)]
+        hypervisor: Option<String>,
     },
     /// Remove a template.
     Rm { name: String },
@@ -1348,7 +1356,8 @@ async fn main() -> anyhow::Result<()> {
             images,
             name,
             systemd,
-        } => import_template(&mut client, images, name, systemd).await?,
+            hypervisor,
+        } => import_template(&mut client, images, name, systemd, hypervisor).await?,
         Command::Commit {
             sandbox,
             expiration_secs,
@@ -1834,7 +1843,8 @@ async fn main() -> anyhow::Result<()> {
             images,
             name,
             systemd,
-        }) => import_template(&mut client, images, name, systemd).await?,
+            hypervisor,
+        }) => import_template(&mut client, images, name, systemd, hypervisor).await?,
         Command::Templates(TemplatesCommand::Rm { name }) => {
             client
                 .delete_template(api::DeleteTemplateRequest { name: name.clone() })
@@ -2963,10 +2973,13 @@ async fn list_templates(client: &mut Client) -> anyhow::Result<()> {
         println!("no templates");
         return Ok(());
     }
-    println!("{:<24} {:>10}  WARM  INIT", "TEMPLATE", "SIZE");
+    println!(
+        "{:<24} {:>10}  WARM  {:<7}  HYPERVISOR",
+        "TEMPLATE", "SIZE", "INIT"
+    );
     for template in resp.templates {
         println!(
-            "{:<24} {:>9}M  {:<4}  {}",
+            "{:<24} {:>9}M  {:<4}  {:<7}  {}",
             template.name,
             template.size_bytes / (1024 * 1024),
             if template.is_warm { "yes" } else { "no" },
@@ -2975,6 +2988,7 @@ async fn list_templates(client: &mut Client) -> anyhow::Result<()> {
             } else {
                 "agent"
             },
+            template.hypervisor,
         );
     }
     Ok(())
@@ -3015,7 +3029,9 @@ async fn import_template(
     images: Vec<String>,
     name: Option<String>,
     is_systemd: bool,
+    hypervisor: Option<String>,
 ) -> anyhow::Result<()> {
+    let hypervisor = hypervisor.unwrap_or_default();
     // One image converts as it is; several are a kit set, which the node
     // names after its digests unless told otherwise.
     let image = images.join(" + ");
@@ -3024,12 +3040,14 @@ async fn import_template(
             name: name.unwrap_or_else(|| template_name_for(&from_image)),
             from_image,
             is_systemd,
+            hypervisor,
             ..Default::default()
         },
         Err(kits) => api::BuildTemplateRequest {
             name: name.unwrap_or_default(),
             kits,
             is_systemd,
+            hypervisor,
             ..Default::default()
         },
     };

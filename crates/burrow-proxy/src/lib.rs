@@ -170,19 +170,56 @@ impl Proxy {
         }
     }
 
-    async fn handle(&self, mut client: TcpStream, peer: SocketAddr) -> std::io::Result<()> {
+    async fn handle(&self, client: TcpStream, peer: SocketAddr) -> std::io::Result<()> {
         let original = original_dst(&client)?;
-        // Both families reach here now. A source is looked up as itself, and
-        // an IPv4-mapped one as the v4 address it is, so a sandbox is the same
-        // sandbox whichever shape its address arrives in.
-        let source_ip = policy::unmap(peer.ip());
-
         // Read (without consuming) enough to identify the destination. A
         // client that says nothing, or too little, gets no route: we cannot
         // police what we cannot classify.
         let mut buf = vec![0u8; PEEK_LIMIT];
         let n = peek_head(&client, &mut buf, original.port()).await;
-        let head = &buf[..n];
+        self.relay(client, peer, original, &buf[..n]).await
+    }
+
+    /// Serves one connection that a userspace network stack terminated, whose
+    /// destination it already knows.
+    ///
+    /// The same decision and relay as a redirected socket gets. There is no
+    /// `peek` on an arbitrary stream, so the head is read off it and replayed
+    /// ahead of the rest, which leaves the relay seeing the bytes a peek would
+    /// have left in place. `peer` is the guest's address, which is how the
+    /// sandbox is looked up in [`Self::policies`].
+    pub async fn serve_stream<C>(
+        &self,
+        mut client: C,
+        peer: SocketAddr,
+        original: SocketAddr,
+    ) -> std::io::Result<()>
+    where
+        C: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
+    {
+        let head = read_head(&mut client, original.port()).await;
+        let client = Rewound {
+            head: head.clone(),
+            at: 0,
+            inner: client,
+        };
+        self.relay(client, peer, original, &head).await
+    }
+
+    async fn relay<C>(
+        &self,
+        mut client: C,
+        peer: SocketAddr,
+        original: SocketAddr,
+        head: &[u8],
+    ) -> std::io::Result<()>
+    where
+        C: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
+    {
+        // Both families reach here now. A source is looked up as itself, and
+        // an IPv4-mapped one as the v4 address it is, so a sandbox is the same
+        // sandbox whichever shape its address arrives in.
+        let source_ip = policy::unmap(peer.ip());
 
         // ECH hides the real destination behind a cover name. Reading that
         // cover name and checking it against the allowlist is worse than
@@ -627,12 +664,15 @@ impl Proxy {
     /// Terminates the sandbox's TLS, checks the inner host, and relays.
     ///
     /// Returns the bytes moved, or the reason the request was refused.
-    async fn inspect_tls(
+    async fn inspect_tls<C>(
         &self,
-        client: TcpStream,
+        client: C,
         upstream: TcpStream,
         session: Inspection<'_>,
-    ) -> Result<Relayed, String> {
+    ) -> Result<Relayed, String>
+    where
+        C: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
+    {
         let Inspection {
             sni,
             policy,
@@ -1090,6 +1130,76 @@ async fn peek_head(client: &TcpStream, buf: &mut [u8], port: u16) -> usize {
     }
 }
 
+/// [`peek_head`] for a stream that cannot be peeked: reads until there is
+/// enough to classify, or [`PEEK_TIMEOUT`] runs out, and returns what it read.
+async fn read_head<C>(client: &mut C, port: u16) -> Vec<u8>
+where
+    C: tokio::io::AsyncRead + Unpin,
+{
+    use tokio::io::AsyncReadExt;
+
+    let deadline = tokio::time::Instant::now() + PEEK_TIMEOUT;
+    let mut head = Vec::with_capacity(PEEK_LIMIT);
+    let mut chunk = [0u8; 2048];
+    // Nothing read is not a verdict, whatever the parser makes of no bytes.
+    while head.len() < PEEK_LIMIT && (head.is_empty() || !is_classifiable(port, &head)) {
+        let room = (PEEK_LIMIT - head.len()).min(chunk.len());
+        match tokio::time::timeout_at(deadline, client.read(&mut chunk[..room])).await {
+            Ok(Ok(n)) if n > 0 => head.extend_from_slice(&chunk[..n]),
+            _ => break,
+        }
+    }
+    head
+}
+
+/// A stream with bytes already read off it put back in front.
+struct Rewound<C> {
+    head: Vec<u8>,
+    at: usize,
+    inner: C,
+}
+
+impl<C: tokio::io::AsyncRead + Unpin> tokio::io::AsyncRead for Rewound<C> {
+    fn poll_read(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &mut tokio::io::ReadBuf<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        if self.at < self.head.len() {
+            let n = (self.head.len() - self.at).min(buf.remaining());
+            let at = self.at;
+            buf.put_slice(&self.head[at..at + n]);
+            self.at += n;
+            return std::task::Poll::Ready(Ok(()));
+        }
+        std::pin::Pin::new(&mut self.inner).poll_read(cx, buf)
+    }
+}
+
+impl<C: tokio::io::AsyncWrite + Unpin> tokio::io::AsyncWrite for Rewound<C> {
+    fn poll_write(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        data: &[u8],
+    ) -> std::task::Poll<std::io::Result<usize>> {
+        std::pin::Pin::new(&mut self.inner).poll_write(cx, data)
+    }
+
+    fn poll_flush(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        std::pin::Pin::new(&mut self.inner).poll_flush(cx)
+    }
+
+    fn poll_shutdown(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        std::pin::Pin::new(&mut self.inner).poll_shutdown(cx)
+    }
+}
+
 /// Whether `head` holds enough for the parser on this port to reach a verdict.
 fn is_classifiable(port: u16, head: &[u8]) -> bool {
     match port {
@@ -1199,7 +1309,7 @@ fn original_dst_v6(stream: &TcpStream) -> std::io::Result<SocketAddr> {
     )))
 }
 
-pub(crate) fn now_rfc3339() -> String {
+pub fn now_rfc3339() -> String {
     // Kept local rather than pulling a date crate in for one format; the
     // node's clock is the reference for all audit timestamps.
     let secs = std::time::SystemTime::now()

@@ -54,6 +54,20 @@ impl ObjectStore {
         if access_key.is_empty() || secret_key.is_empty() {
             anyhow::bail!("--object-store needs AWS_ACCESS_KEY_ID and AWS_SECRET_ACCESS_KEY");
         }
+        Ok(Self::with_credentials(
+            options,
+            bucket,
+            prefix,
+            Credentials::new(access_key, secret_key, None, None, "burrow-flags"),
+        ))
+    }
+
+    fn with_credentials(
+        options: &Options,
+        bucket: &str,
+        prefix: &str,
+        credentials: Credentials,
+    ) -> Self {
         let http = aws_smithy_http_client::Builder::new()
             .tls_provider(tls::Provider::Rustls(
                 tls::rustls_provider::CryptoMode::Ring,
@@ -63,13 +77,7 @@ impl ObjectStore {
             .behavior_version(BehaviorVersion::latest())
             .region(Region::new(options.region.clone()))
             .endpoint_url(options.endpoint.trim_end_matches('/'))
-            .credentials_provider(Credentials::new(
-                access_key,
-                secret_key,
-                None,
-                None,
-                "burrow-flags",
-            ))
+            .credentials_provider(credentials)
             .force_path_style(true)
             // No trailing checksum on puts: a memory image is streamed with a
             // known length, and the self-hosted stores this targets either
@@ -85,7 +93,7 @@ impl ObjectStore {
                 aws_smithy_async::rt::sleep::TokioSleep::new(),
             ))
             .build();
-        Ok(Self {
+        Self {
             client: Client::from_conf(config),
             endpoint: options.endpoint.trim_end_matches('/').to_string(),
             bucket: bucket.to_string(),
@@ -94,7 +102,7 @@ impl ObjectStore {
             } else {
                 format!("{prefix}/")
             },
-        })
+        }
     }
 
     /// Creates the bucket if the store does not have it. Self-hosted stores
@@ -157,7 +165,66 @@ impl ObjectStore {
             .map_err(|err| unavailable("put", key, err))
     }
 
+    /// Writes an object only if the store holds the version `expect` names,
+    /// `None` meaning no object at all. `Ok(None)` when it holds another; the
+    /// new version's ETag otherwise.
+    ///
+    /// The check and the write are one request, so of two writers that read
+    /// the same version only one lands. A store that ignores the headers
+    /// would land both, which [`Self::probe_conditional_writes`] catches.
+    pub async fn put_bytes_if(
+        &self,
+        key: &str,
+        bytes: Vec<u8>,
+        expect: Option<&str>,
+    ) -> Result<Option<String>, Status> {
+        let put = self
+            .client
+            .put_object()
+            .bucket(&self.bucket)
+            .key(self.key(key))
+            .body(ByteStream::from(bytes));
+        let put = match expect {
+            Some(etag) => put.if_match(etag),
+            None => put.if_none_match("*"),
+        };
+        match put.send().await {
+            Ok(out) => out
+                .e_tag()
+                .map(|etag| Some(etag.to_string()))
+                .ok_or_else(|| Status::unavailable(format!("object store put {key}: no ETag"))),
+            // 412 is the precondition failing, 404 an `If-Match` on an object
+            // that is gone, and 409 S3 refusing one of two conditional writes
+            // racing each other: all mean another version is there.
+            Err(SdkError::ServiceError(err))
+                if matches!(err.raw().status().as_u16(), 404 | 409 | 412) =>
+            {
+                Ok(None)
+            }
+            Err(err) => Err(unavailable("put", key, err)),
+        }
+    }
+
+    /// Whether the store refuses a conditional write it should. Some
+    /// self-hosted ones ignore `If-Match` and `If-None-Match` and write
+    /// anyway, which would turn every lease built on them into a race.
+    pub async fn probe_conditional_writes(&self) -> Result<bool, Status> {
+        let key = format!("probes/conditional-{}", uuid::Uuid::new_v4().simple());
+        self.delete(&key).await?;
+        let created = self.put_bytes_if(&key, b"1".to_vec(), None).await?;
+        let recreated = self.put_bytes_if(&key, b"2".to_vec(), None).await?;
+        let mismatched = self
+            .put_bytes_if(&key, b"3".to_vec(), Some("\"burrow-probe\""))
+            .await?;
+        self.delete(&key).await?;
+        Ok(created.is_some() && recreated.is_none() && mismatched.is_none())
+    }
+
     async fn get(&self, key: &str) -> Result<Option<ByteStream>, Status> {
+        Ok(self.get_versioned(key).await?.map(|(body, _)| body))
+    }
+
+    async fn get_versioned(&self, key: &str) -> Result<Option<(ByteStream, String)>, Status> {
         match self
             .client
             .get_object()
@@ -166,7 +233,10 @@ impl ObjectStore {
             .send()
             .await
         {
-            Ok(resp) => Ok(Some(resp.body)),
+            Ok(resp) => {
+                let etag = resp.e_tag().unwrap_or_default().to_string();
+                Ok(Some((resp.body, etag)))
+            }
             Err(SdkError::ServiceError(err))
                 if matches!(err.err(), GetObjectError::NoSuchKey(_)) =>
             {
@@ -199,6 +269,21 @@ impl ObjectStore {
             .await
             .map(|data| Some(data.into_bytes().to_vec()))
             .map_err(|err| Status::unavailable(format!("object store read {key}: {err}")))
+    }
+
+    /// An object with the ETag it was read at, for a write conditional on it.
+    pub async fn get_bytes_versioned(
+        &self,
+        key: &str,
+    ) -> Result<Option<(Vec<u8>, String)>, Status> {
+        let Some((body, etag)) = self.get_versioned(key).await? else {
+            return Ok(None);
+        };
+        let data = body
+            .collect()
+            .await
+            .map_err(|err| Status::unavailable(format!("object store read {key}: {err}")))?;
+        Ok(Some((data.into_bytes().to_vec(), etag)))
     }
 
     pub async fn exists(&self, key: &str) -> Result<bool, Status> {
@@ -360,5 +445,157 @@ impl ObjectStore {
         }
         file.flush().await.map_err(write_err)?;
         Ok(Some(()))
+    }
+}
+
+#[cfg(test)]
+pub(crate) mod fake {
+    //! An S3 server of objects in a map, enough of one for the SDK: get,
+    //! head, put (conditional or not) and delete, over HTTP/1.1.
+
+    use std::collections::HashMap;
+    use std::sync::{Arc, Mutex};
+
+    use tokio::io::{AsyncBufReadExt as _, AsyncReadExt as _, AsyncWriteExt as _, BufReader};
+
+    use super::{ObjectStore, Options};
+
+    #[derive(Default)]
+    struct Objects {
+        by_key: HashMap<String, (Vec<u8>, String)>,
+        versions: u64,
+    }
+
+    /// A store on a loopback port. `honours_conditions` false is a store that
+    /// ignores `If-Match` and `If-None-Match`, as versitygw 1.0.14 does.
+    pub async fn store(honours_conditions: bool) -> ObjectStore {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let endpoint = format!("http://{}", listener.local_addr().unwrap());
+        let objects = Arc::new(Mutex::new(Objects::default()));
+        tokio::spawn(async move {
+            loop {
+                let (stream, _) = listener.accept().await.unwrap();
+                let objects = Arc::clone(&objects);
+                tokio::spawn(serve(stream, objects, honours_conditions));
+            }
+        });
+        let options = Options {
+            url: "s3://test".into(),
+            endpoint,
+            region: "us-east-1".into(),
+        };
+        ObjectStore::with_credentials(
+            &options,
+            "test",
+            "",
+            aws_sdk_s3::config::Credentials::new("test", "test", None, None, "test"),
+        )
+    }
+
+    async fn serve(
+        stream: tokio::net::TcpStream,
+        objects: Arc<Mutex<Objects>>,
+        honours_conditions: bool,
+    ) {
+        let (read, mut write) = stream.into_split();
+        let mut read = BufReader::new(read);
+        loop {
+            let mut line = String::new();
+            if read.read_line(&mut line).await.unwrap_or(0) == 0 {
+                return;
+            }
+            let mut parts = line.split_whitespace();
+            let method = parts.next().unwrap_or_default().to_string();
+            let target = parts.next().unwrap_or_default();
+            let key = target.split('?').next().unwrap_or_default().to_string();
+            let mut headers = HashMap::new();
+            loop {
+                let mut header = String::new();
+                read.read_line(&mut header).await.unwrap();
+                let header = header.trim_end();
+                if header.is_empty() {
+                    break;
+                }
+                if let Some((name, value)) = header.split_once(':') {
+                    headers.insert(name.to_ascii_lowercase(), value.trim().to_string());
+                }
+            }
+            let length = headers
+                .get("content-length")
+                .and_then(|n| n.parse().ok())
+                .unwrap_or(0);
+            let mut body = vec![0; length];
+            read.read_exact(&mut body).await.unwrap();
+
+            let (status, etag, payload) = {
+                let mut objects = objects.lock().unwrap();
+                let current = objects.by_key.get(&key).map(|(_, etag)| etag.clone());
+                match method.as_str() {
+                    "GET" | "HEAD" => match objects.by_key.get(&key) {
+                        Some((bytes, etag)) => (200, Some(etag.clone()), bytes.clone()),
+                        None => (404, None, error("NoSuchKey")),
+                    },
+                    "DELETE" => {
+                        objects.by_key.remove(&key);
+                        (204, None, Vec::new())
+                    }
+                    "PUT" => {
+                        let refused = honours_conditions
+                            && (headers.contains_key("if-none-match") && current.is_some()
+                                || headers
+                                    .get("if-match")
+                                    .is_some_and(|want| current.as_ref() != Some(want)));
+                        if refused {
+                            (412, None, error("PreconditionFailed"))
+                        } else {
+                            objects.versions += 1;
+                            let etag = format!("\"{}\"", objects.versions);
+                            objects.by_key.insert(key, (body, etag.clone()));
+                            (200, Some(etag), Vec::new())
+                        }
+                    }
+                    _ => (405, None, error("MethodNotAllowed")),
+                }
+            };
+            let mut response = format!("HTTP/1.1 {status} X\r\n");
+            if let Some(etag) = etag {
+                response.push_str(&format!("ETag: {etag}\r\n"));
+            }
+            let sent = if method == "HEAD" { 0 } else { payload.len() };
+            response.push_str(&format!("Content-Length: {}\r\n\r\n", payload.len()));
+            let mut bytes = response.into_bytes();
+            bytes.extend_from_slice(&payload[..sent]);
+            if write.write_all(&bytes).await.is_err() {
+                return;
+            }
+        }
+    }
+
+    fn error(code: &str) -> Vec<u8> {
+        format!(
+            "<?xml version=\"1.0\"?><Error><Code>{code}</Code><Message>{code}</Message></Error>"
+        )
+        .into_bytes()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    #[tokio::test]
+    async fn a_store_that_ignores_conditional_writes_is_found_out() {
+        assert!(
+            super::fake::store(true)
+                .await
+                .probe_conditional_writes()
+                .await
+                .unwrap()
+        );
+        assert!(
+            !super::fake::store(false)
+                .await
+                .probe_conditional_writes()
+                .await
+                .unwrap()
+        );
     }
 }

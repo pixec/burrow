@@ -19,6 +19,11 @@ use tokio::sync::{mpsc, oneshot};
 pub enum Op {
     PutPlacement(burrow_store::PlacementRow),
     DeletePlacement(String),
+    /// `DeletePlacement`, kept if the row no longer names the node.
+    DeletePlacementOn {
+        sandbox_id: String,
+        node_id: String,
+    },
     DeletePlacementsForNode(String),
     PutTombstone(burrow_store::TombstoneRow),
     DeleteTombstone(String),
@@ -111,6 +116,10 @@ async fn apply(store: &burrow_store::Store, op: &Op) -> burrow_store::Result<()>
     match op {
         Op::PutPlacement(row) => store.put_placement(row).await,
         Op::DeletePlacement(id) => store.delete_placement(id).await,
+        Op::DeletePlacementOn {
+            sandbox_id,
+            node_id,
+        } => store.delete_placement_on(sandbox_id, node_id).await,
         Op::DeletePlacementsForNode(node_id) => {
             store.delete_placements_for_node(node_id).await.map(drop)
         }
@@ -133,7 +142,7 @@ async fn apply(store: &burrow_store::Store, op: &Op) -> burrow_store::Result<()>
 fn describe(op: &Op) -> &'static str {
     match op {
         Op::PutPlacement(_) => "persist a placement",
-        Op::DeletePlacement(_) => "remove a stored placement",
+        Op::DeletePlacement(_) | Op::DeletePlacementOn { .. } => "remove a stored placement",
         Op::DeletePlacementsForNode(_) => "clear stored placements for a node",
         Op::PutTombstone(_) => "persist a tombstone",
         Op::DeleteTombstone(_) => "remove a stored tombstone",

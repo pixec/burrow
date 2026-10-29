@@ -1,15 +1,18 @@
 //! `burrowd vm`: a development harness for the VMM layer.
 //!
-//! Boots microVMs from local images, times how long they take to reach
-//! userspace, and tears them down. The real lifecycle, driven by the
-//! orchestrator over the node API, reuses `burrow_firecracker` the same way.
+//! Boots VMs from local images under any hypervisor burrow-vmm drives, times
+//! how long they take to reach userspace, and tears them down. The real
+//! lifecycle, driven by the orchestrator over the node API, goes through the
+//! same `burrow_vmm::Vm`.
 
 use std::path::PathBuf;
 use std::time::Duration;
 
 use clap::Args;
 
-use burrow_firecracker::{DriveSpec, MicroVm, MicroVmSpec, SnapshotType};
+use burrow_vmm::{
+    Backend, CloudHypervisorConfig, DriveSpec, FirecrackerConfig, Hypervisor, Vm, VmSpec,
+};
 
 #[derive(Args, Clone)]
 pub struct VmBootArgs {
@@ -22,8 +25,21 @@ pub struct VmBootArgs {
     /// Root filesystem image, relative to --workdir.
     #[arg(long, default_value = "rootfs.squashfs")]
     pub rootfs: String,
+    /// `firecracker` or `cloud-hypervisor`.
+    #[arg(long, default_value = "firecracker")]
+    pub hypervisor: Hypervisor,
     #[arg(long, default_value = "/usr/local/bin/firecracker")]
     pub firecracker: PathBuf,
+    #[arg(long, default_value = "/usr/local/bin/cloud-hypervisor")]
+    pub cloud_hypervisor: PathBuf,
+    /// Kernel Cloud Hypervisor boots instead of --kernel, for a kernel that
+    /// lacks what a PCI machine needs.
+    #[arg(long)]
+    pub cloud_hypervisor_kernel: Option<PathBuf>,
+    /// Run Cloud Hypervisor in burrowd's jail as this uid and gid, as
+    /// `serve --jailer` does. The working directory becomes the jail's.
+    #[arg(long)]
+    pub jail_uid: Option<u32>,
     #[arg(long, default_value_t = 1)]
     pub vcpus: u32,
     #[arg(long, default_value_t = 512)]
@@ -43,20 +59,48 @@ pub struct VmBootArgs {
 }
 
 impl VmBootArgs {
-    fn spec(&self, vm_id: impl Into<String>) -> MicroVmSpec {
-        let mut spec = MicroVmSpec::new(vm_id, &self.workdir);
-        spec.firecracker_bin = self.firecracker.clone();
-        spec.kernel = self.kernel.clone();
+    fn spec(&self, vm_id: impl Into<String>) -> VmSpec {
+        let backend = match self.hypervisor {
+            Hypervisor::Firecracker => Backend::Firecracker(FirecrackerConfig {
+                bin: self.firecracker.clone(),
+                jail: None,
+            }),
+            Hypervisor::CloudHypervisor => Backend::CloudHypervisor(CloudHypervisorConfig {
+                bin: self.cloud_hypervisor.clone(),
+                kernel: self.cloud_hypervisor_kernel.clone(),
+                jail: self.jail_uid.map(|uid| burrow_vmm::ChJail {
+                    helper: "/proc/self/exe".into(),
+                    uid,
+                    gid: uid,
+                }),
+            }),
+            // Boots nothing these commands build: the vz backend refuses a
+            // kernel boot by name.
+            #[cfg(target_os = "macos")]
+            Hypervisor::Vz => Backend::Vz(burrow_vmm::VzConfig::default()),
+        };
+        let mut spec = VmSpec::new(vm_id, &self.workdir, backend);
+        // A dev box often has no delegated cgroup, and these runs are not
+        // what limits are for.
+        spec.cgroup_root = None;
         spec.vcpus = self.vcpus;
         spec.mem_mib = self.mem_mib;
         spec.drives = vec![DriveSpec::root_ro(&self.rootfs)];
         // Squashfs and ext4 roots both come up on /dev/vda as the first drive.
-        spec.boot_args = format!(
+        spec.boot = self.boot(format!(
             "{} root=/dev/vda ro {}",
-            burrow_firecracker::DEFAULT_BOOT_ARGS,
+            burrow_vmm::DEFAULT_BOOT_ARGS,
             self.extra_boot_args
-        );
+        ));
         spec
+    }
+
+    /// The dev kernel with `cmdline`.
+    fn boot(&self, cmdline: String) -> burrow_vmm::Boot {
+        burrow_vmm::Boot::Kernel {
+            kernel: self.kernel.clone(),
+            cmdline,
+        }
     }
 }
 
@@ -70,17 +114,54 @@ fn kernel_handoff_secs(console: &str) -> Option<f64> {
     ts.trim().parse().ok()
 }
 
+/// Types `input` on the guest's serial console. `floor` and `snapshot` drive a
+/// shell this way, so a hypervisor whose console takes no input cannot run them.
+async fn type_on_console(vm: &mut Vm, input: &str) -> anyhow::Result<()> {
+    use anyhow::Context as _;
+    let hypervisor = vm.hypervisor();
+    vm.console_write(input).await.with_context(|| {
+        format!(
+            "this command drives a shell over the serial console, which {hypervisor} \
+             takes no input on here; use `agent`, `exec` or `clones`"
+        )
+    })
+}
+
+/// Waits for `marker` to appear on the console, returning how long it took
+/// from `since`.
+async fn wait_for_console(
+    vm: &Vm,
+    marker: &str,
+    since: std::time::Instant,
+    timeout: Duration,
+) -> anyhow::Result<Duration> {
+    let deadline = std::time::Instant::now() + timeout;
+    loop {
+        if vm.console_tail(usize::MAX).await.contains(marker) {
+            return Ok(since.elapsed());
+        }
+        if std::time::Instant::now() >= deadline {
+            anyhow::bail!("{marker:?} did not appear on the console within {timeout:?}");
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+}
+
 pub async fn run(args: VmBootArgs) -> anyhow::Result<()> {
     let mut boot_ms = Vec::new();
     let mut ready_ms = Vec::new();
 
     for iteration in 1..=args.repeat {
-        let vm = MicroVm::boot(args.spec(format!("devvm-{iteration}"))).await?;
-        let info = vm.instance_info().await?;
+        let started = std::time::Instant::now();
+        let vm = Vm::boot(args.spec(format!("devvm-{iteration}"))).await?;
 
-        match vm
-            .wait_for_console(&args.ready_marker, Duration::from_secs(args.timeout))
-            .await
+        match wait_for_console(
+            &vm,
+            &args.ready_marker,
+            started,
+            Duration::from_secs(args.timeout),
+        )
+        .await
         {
             Ok(elapsed) => {
                 boot_ms.push(vm.boot_latency().as_millis() as u64);
@@ -89,13 +170,12 @@ pub async fn run(args: VmBootArgs) -> anyhow::Result<()> {
                     .map(|s| format!(" kernel->init={:.0}ms", s * 1000.0))
                     .unwrap_or_default();
                 println!(
-                    "boot {iteration}/{}: vmm={} start={}ms ready={}ms{} (fc {})",
+                    "boot {iteration}/{} ({}): start={}ms ready={}ms{}",
                     args.repeat,
-                    info.state,
+                    vm.hypervisor(),
                     vm.boot_latency().as_millis(),
                     elapsed.as_millis(),
                     handoff,
-                    info.vmm_version,
                 );
             }
             Err(err) => {
@@ -133,14 +213,14 @@ pub async fn agent_boot(args: VmBootArgs) -> anyhow::Result<()> {
     let mut spec = args.spec("agenttest");
     spec.drives = vec![DriveSpec::root_ro(&args.rootfs)];
     spec.is_vsock_enabled = true;
-    spec.boot_args = format!(
+    spec.boot = args.boot(format!(
         "{} root=/dev/vda ro init=/usr/bin/burrow-guest {}",
-        burrow_firecracker::DEFAULT_BOOT_ARGS,
+        burrow_vmm::DEFAULT_BOOT_ARGS,
         args.extra_boot_args
-    );
+    ));
 
     let start = std::time::Instant::now();
-    let vm = MicroVm::boot(spec).await?;
+    let vm = Vm::boot(spec).await?;
 
     let ready = match vm
         .wait_for_vsock(
@@ -159,7 +239,7 @@ pub async fn agent_boot(args: VmBootArgs) -> anyhow::Result<()> {
     };
 
     let mut client =
-        crate::guestconn::connect(vm.vsock_uds_path(), Duration::from_secs(args.timeout)).await?;
+        crate::guestconn::connect(vm.guest(), Duration::from_secs(args.timeout)).await?;
     let handshake = client
         .handshake(crate::guestconn::handshake_request(false))
         .await?
@@ -184,7 +264,7 @@ pub async fn agent_boot(args: VmBootArgs) -> anyhow::Result<()> {
 pub async fn agent_exec(args: VmBootArgs, cmd: Vec<String>) -> anyhow::Result<()> {
     let vm = boot_agent_vm(&args, "exectest").await?;
     let mut client =
-        crate::guestconn::connect(vm.vsock_uds_path(), Duration::from_secs(args.timeout)).await?;
+        crate::guestconn::connect(vm.guest(), Duration::from_secs(args.timeout)).await?;
     client
         .handshake(crate::guestconn::handshake_request(false))
         .await?;
@@ -198,15 +278,15 @@ pub async fn agent_exec(args: VmBootArgs, cmd: Vec<String>) -> anyhow::Result<()
 }
 
 /// Boots a VM running the agent rootfs and waits for the agent to accept.
-async fn boot_agent_vm(args: &VmBootArgs, id: &str) -> anyhow::Result<MicroVm> {
+async fn boot_agent_vm(args: &VmBootArgs, id: &str) -> anyhow::Result<Vm> {
     let mut spec = args.spec(id);
     spec.is_vsock_enabled = true;
-    spec.boot_args = format!(
+    spec.boot = args.boot(format!(
         "{} root=/dev/vda ro init=/usr/bin/burrow-guest {}",
-        burrow_firecracker::DEFAULT_BOOT_ARGS,
+        burrow_vmm::DEFAULT_BOOT_ARGS,
         args.extra_boot_args
-    );
-    let vm = MicroVm::boot(spec).await?;
+    ));
+    let vm = Vm::boot(spec).await?;
     if let Err(err) = vm
         .wait_for_vsock(
             crate::guestconn::AGENT_PORT,
@@ -282,18 +362,22 @@ const RNG_PROBE: &str = "head -c 16 /dev/urandom | od -An -tx1 | tr -d ' \\n'";
 pub async fn clone_divergence(args: VmBootArgs) -> anyhow::Result<()> {
     let base = boot_agent_vm(&args, "clonebase").await?;
     let mut client =
-        crate::guestconn::connect(base.vsock_uds_path(), Duration::from_secs(args.timeout)).await?;
+        crate::guestconn::connect(base.guest(), Duration::from_secs(args.timeout)).await?;
     client
         .handshake(crate::guestconn::handshake_request(false))
         .await?;
     base.pause().await?;
-    base.snapshot(SnapshotType::Full).await?;
+    base.snapshot().await?;
     base.kill().await?;
     println!("snapshot taken from a running agent sandbox\n");
 
     // Warm snapshots are restored by many sandboxes from one memory file, so
     // the file must come back unmodified after being restored from.
-    let mem_path = args.workdir.join(burrow_firecracker::SNAPSHOT_MEM_FILE);
+    let layout = args.hypervisor.layout();
+    let memory = layout
+        .memory
+        .ok_or_else(|| anyhow::anyhow!("this hypervisor keeps no memory file to compare"))?;
+    let mem_path = args.workdir.join(memory);
     let mem_before = file_digest(&mem_path).await?;
 
     let mut before = Vec::new();
@@ -301,12 +385,12 @@ pub async fn clone_divergence(args: VmBootArgs) -> anyhow::Result<()> {
 
     for name in ["clone-a", "clone-b"] {
         let dir = args.workdir.join(name);
-        link_clone(&args.workdir, &dir, &args.rootfs).await?;
+        link_clone(&args.workdir, &dir, &[layout.state, memory, &args.rootfs]).await?;
 
         let mut spec = args.spec(name);
         spec.workdir = dir;
         spec.is_vsock_enabled = true;
-        let vm = MicroVm::restore(spec, true).await?;
+        let vm = Vm::restore(spec, true).await?;
         vm.wait_for_vsock(
             crate::guestconn::AGENT_PORT,
             Duration::from_secs(args.timeout),
@@ -314,8 +398,7 @@ pub async fn clone_divergence(args: VmBootArgs) -> anyhow::Result<()> {
         .await?;
 
         let mut client =
-            crate::guestconn::connect(vm.vsock_uds_path(), Duration::from_secs(args.timeout))
-                .await?;
+            crate::guestconn::connect(vm.guest(), Duration::from_secs(args.timeout)).await?;
 
         // Before the handshake the clone still carries the snapshot's RNG.
         let mut pre = String::new();
@@ -392,23 +475,19 @@ fn sh(script: &str) -> Vec<String> {
 /// Builds a clone workdir that hard-links the base snapshot and rootfs.
 ///
 /// Hard links (rather than copies) are what warm restores need: many sandboxes
-/// restoring from one memory file. Firecracker maps the memory file
-/// `MAP_PRIVATE`, so guest writes stay per-process and the shared file is not
+/// restoring from one memory file. Both hypervisors map the memory file
+/// privately, so guest writes stay per-process and the shared file is not
 /// modified.
 async fn link_clone(
     base: &std::path::Path,
     clone: &std::path::Path,
-    rootfs: &str,
+    files: &[&str],
 ) -> anyhow::Result<()> {
     if tokio::fs::try_exists(clone).await.unwrap_or(false) {
         tokio::fs::remove_dir_all(clone).await?;
     }
     tokio::fs::create_dir_all(clone).await?;
-    for file in [
-        burrow_firecracker::SNAPSHOT_FILE,
-        burrow_firecracker::SNAPSHOT_MEM_FILE,
-        rootfs,
-    ] {
+    for file in files {
         tokio::fs::hard_link(base.join(file), clone.join(file)).await?;
     }
     Ok(())
@@ -420,14 +499,14 @@ async fn link_clone(
 /// hypervisor cost.
 pub async fn boot_floor(args: VmBootArgs) -> anyhow::Result<()> {
     let mut spec = args.spec("floortest");
-    spec.boot_args = format!(
+    spec.boot = args.boot(format!(
         "{} root=/dev/vda ro init=/bin/sh {}",
-        burrow_firecracker::DEFAULT_BOOT_ARGS,
+        burrow_vmm::DEFAULT_BOOT_ARGS,
         args.extra_boot_args
-    );
+    ));
 
     let start = std::time::Instant::now();
-    let mut vm = MicroVm::boot(spec).await?;
+    let mut vm = Vm::boot(spec).await?;
     let vmm_ms = vm.boot_latency().as_millis();
 
     // PID 1 shell prints no prompt, so probe it: poke the serial line until it
@@ -435,10 +514,9 @@ pub async fn boot_floor(args: VmBootArgs) -> anyhow::Result<()> {
     let deadline = std::time::Instant::now() + Duration::from_secs(args.timeout);
     let mut responded = None;
     while std::time::Instant::now() < deadline {
-        vm.console_write("echo BURROW_READY\n").await?;
+        type_on_console(&mut vm, "echo BURROW_READY\n").await?;
         // Poll finely: at ~1s totals, coarse polling dominates the result.
-        if vm
-            .wait_for_console("BURROW_READY", Duration::from_millis(25))
+        if wait_for_console(&vm, "BURROW_READY", start, Duration::from_millis(25))
             .await
             .is_ok()
         {
@@ -470,10 +548,15 @@ pub async fn boot_floor(args: VmBootArgs) -> anyhow::Result<()> {
 /// another command. Proves the restored guest continues with live state,
 /// which is the property the whole pause/resume design rests on.
 pub async fn snapshot_roundtrip(args: VmBootArgs) -> anyhow::Result<()> {
-    let mut vm = MicroVm::boot(args.spec("snaptest")).await?;
-    let ready = vm
-        .wait_for_console(&args.ready_marker, Duration::from_secs(args.timeout))
-        .await?;
+    let started = std::time::Instant::now();
+    let mut vm = Vm::boot(args.spec("snaptest")).await?;
+    let ready = wait_for_console(
+        &vm,
+        &args.ready_marker,
+        started,
+        Duration::from_secs(args.timeout),
+    )
+    .await?;
     println!(
         "booted in {}ms (guest reached {:?})",
         ready.as_millis(),
@@ -482,27 +565,25 @@ pub async fn snapshot_roundtrip(args: VmBootArgs) -> anyhow::Result<()> {
 
     // Leave a value in the shell's memory; if the restore is real, the
     // restored guest still has it.
-    vm.console_write("SECRET=burrow-$$-alive\n").await?;
-    vm.console_write("echo PRE:$SECRET\n").await?;
-    vm.wait_for_console("PRE:burrow-", Duration::from_secs(10))
-        .await?;
+    type_on_console(&mut vm, "SECRET=burrow-$$-alive\n").await?;
+    type_on_console(&mut vm, "echo PRE:$SECRET\n").await?;
+    wait_for_console(&vm, "PRE:burrow-", started, Duration::from_secs(10)).await?;
     let pre = extract_marker(&vm.console_tail(60).await, "PRE:").unwrap_or_default();
     println!("pre-snapshot guest state: {pre}");
 
     vm.pause().await?;
     let snap_start = std::time::Instant::now();
-    vm.snapshot(SnapshotType::Full).await?;
+    vm.snapshot().await?;
     println!("snapshot written in {}ms", snap_start.elapsed().as_millis());
     vm.kill().await?;
 
     let restore_start = std::time::Instant::now();
-    let mut vm = MicroVm::restore(args.spec("snaptest"), true).await?;
+    let mut vm = Vm::restore(args.spec("snaptest"), true).await?;
     println!("restored in {}ms", restore_start.elapsed().as_millis());
 
     // The restored shell should still hold $SECRET from before the snapshot.
-    vm.console_write("echo POST:$SECRET\n").await?;
-    vm.wait_for_console("POST:burrow-", Duration::from_secs(10))
-        .await?;
+    type_on_console(&mut vm, "echo POST:$SECRET\n").await?;
+    wait_for_console(&vm, "POST:burrow-", restore_start, Duration::from_secs(10)).await?;
     let post = extract_marker(&vm.console_tail(60).await, "POST:").unwrap_or_default();
     println!("post-restore guest state: {post}");
     vm.kill().await?;

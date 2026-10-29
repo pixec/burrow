@@ -578,3 +578,46 @@ burrow unexpose <id> <host-port>
 Published ports are reachable only from external traffic, never from
 other sandboxes or mesh peers. Host ports come from the fixed range 20000 to
 29999.
+
+## macOS nodes
+
+A macOS sandbox runs under Virtualization.framework, and a Mac has no
+nftables. Its one NIC is attached to a datagram socket pair whose other end is
+a userspace network stack in burrowd (`burrow_net::usernet`, built on
+smoltcp), so every frame the guest sends arrives there and nowhere else. The
+link has one guest on it, which makes anti-spoofing a property of the
+attachment, and the node itself is unreachable unless the stack dials a
+connection on the guest's behalf.
+
+The policy is the same one, decided by the same code. `burrow_net::policy`
+holds the decision the Linux ruleset encodes, and a test renders the ruleset
+and checks it against that decision for every mode, allowed and denied CIDRs,
+port restrictions, peers, the node's own address and the control plane, so the
+two cannot drift. Per new flow:
+
+| Linux | macOS |
+| --- | --- |
+| Allowlist TCP 80/443 redirected to the egress proxy | The terminated connection is handed to the same proxy, which checks SNI or `Host`, the DNS pin, `deny_cidrs`, inspection and request rules |
+| Forward chain accept (open mode, `allow_cidrs`/`allow_ports`, peers), masquerade | A host socket dialled to the destination and spliced to the guest |
+| `tohost` accept for the resolver | Queries answered by the same resolver with the same allowlist, pinning and audit |
+| Chain drop | TCP reset, UDP dropped, either way audited |
+
+Two differences follow from the stack dialling from the node rather than
+routing through it. The node's own addresses and loopback are denied as
+destinations, which on Linux the host input chain does. And a TCP SYN is held
+unanswered until the destination is decided and, for a direct flow, until the
+upstream connection is up, so a refused or unreachable destination gets a
+reset rather than a timeout.
+
+Every flow the stack decides itself is audited, allowed or not, with bytes in
+each direction: direct connections, UDP flows and refusals. On Linux nftables
+decides those silently, so a macOS node's log has records a Linux node's does
+not. Proxied connections and DNS write the same records on both.
+
+Live updates apply to the next flow, and a direct connection the new policy
+denies is reset at once and recorded as such, which is what the conntrack
+flush after a re-render does on Linux.
+
+Not yet on macOS: IPv6 (the guest is not offered a router, so it has
+link-local addresses only), private networks between sandboxes, and ICMP
+beyond pinging the gateway.

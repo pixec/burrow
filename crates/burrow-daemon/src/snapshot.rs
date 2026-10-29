@@ -100,7 +100,13 @@ pub struct Manifest {
     pub is_evicted: bool,
     /// What the snapshot was taken on, which bounds where it can be restored.
     pub arch: String,
+    /// The version of `hypervisor` that wrote it, which is the only one its
+    /// state is known to restore under. Named for the one backend there was.
     pub firecracker_version: String,
+    /// The hypervisor that took it, and so the one it restores under. Empty in
+    /// a manifest from before there was a choice, which was Firecracker.
+    #[serde(default)]
+    pub hypervisor: String,
     /// Set once every object is in the store and the remote manifest is
     /// written, so a half-finished upload never reads as restorable.
     pub is_durable: bool,
@@ -117,6 +123,19 @@ pub struct Manifest {
 }
 
 impl Manifest {
+    pub fn hypervisor(&self) -> Result<burrow_vmm::Hypervisor, Status> {
+        burrow_vmm::Hypervisor::from_record(&self.hypervisor).ok_or_else(|| {
+            Status::failed_precondition(format!(
+                "snapshot {} was taken under {:?}, which this build does not know",
+                self.id, self.hypervisor
+            ))
+        })
+    }
+
+    fn layout(&self) -> Result<burrow_vmm::Layout, Status> {
+        self.hypervisor().map(burrow_vmm::Hypervisor::layout)
+    }
+
     fn to_proto(&self) -> common::Snapshot {
         common::Snapshot {
             id: self.id.clone(),
@@ -136,11 +155,25 @@ impl Manifest {
             is_durable: self.is_durable,
             arch: self.arch.clone(),
             firecracker_version: self.firecracker_version.clone(),
+            hypervisor: self
+                .hypervisor()
+                .map_or_else(|_| self.hypervisor.clone(), |h| h.to_string()),
         }
     }
 }
 
 /// Object keys of a snapshot's files in the store.
+/// The memory image a snapshot is made of. A backend whose memory lives
+/// inside a host-bound state file has none to chunk, share or serve, so it
+/// cannot take or restore named snapshots.
+fn memory_file(layout: burrow_vmm::Layout) -> Result<&'static str, Status> {
+    layout.memory.ok_or_else(|| {
+        Status::failed_precondition(
+            "this hypervisor keeps guest memory inside its saved state; it cannot snapshot",
+        )
+    })
+}
+
 fn remote_key(id: &str, file: &str) -> String {
     format!("snapshots/{id}/{file}")
 }
@@ -176,7 +209,9 @@ pub struct SnapshotStore {
     root: PathBuf,
     blobs: std::sync::Arc<crate::blobs::BlobStore>,
     remote: Option<crate::objstore::ObjectStore>,
-    firecracker_version: String,
+    /// What each hypervisor this node runs reports, recorded on the snapshots
+    /// it takes.
+    versions: std::sync::Arc<HashMap<burrow_vmm::Hypervisor, String>>,
     /// Memory images of fetched snapshots still arriving, by snapshot id.
     hydrators: std::sync::Arc<std::sync::Mutex<HashMap<String, Arc<Hydrator>>>>,
     /// Held across a fetch, so two creates from one remote snapshot fetch it
@@ -192,6 +227,7 @@ pub struct Staged {
     pub vcpus: u32,
     pub mem_mib: u32,
     pub scratch_disk_mib: u32,
+    pub hypervisor: burrow_vmm::Hypervisor,
     /// Memory files in the staging directory, oldest first.
     pub chain: Vec<String>,
 }
@@ -200,13 +236,13 @@ impl SnapshotStore {
     pub fn new(
         data_dir: &Path,
         remote: Option<crate::objstore::ObjectStore>,
-        firecracker_version: String,
+        versions: HashMap<burrow_vmm::Hypervisor, String>,
     ) -> Self {
         Self {
             root: data_dir.join("snapshots"),
             blobs: std::sync::Arc::new(crate::blobs::BlobStore::new(data_dir)),
             remote,
-            firecracker_version,
+            versions: std::sync::Arc::new(versions),
             hydrators: Default::default(),
             fetching: Default::default(),
         }
@@ -259,7 +295,7 @@ impl SnapshotStore {
         expiration_secs: u64,
     ) -> Result<common::Snapshot, Status> {
         let dir = self.staging(id);
-        flatten(&dir, &staged.chain).await?;
+        flatten(&dir, &staged.chain, staged.hypervisor.layout()).await?;
 
         let size_bytes = directory_size(&dir).await;
         let now = burrow_common::unix_now();
@@ -281,7 +317,12 @@ impl SnapshotStore {
             expiration_secs,
             is_evicted: false,
             arch: std::env::consts::ARCH.to_string(),
-            firecracker_version: self.firecracker_version.clone(),
+            firecracker_version: self
+                .versions
+                .get(&staged.hypervisor)
+                .cloned()
+                .unwrap_or_default(),
+            hypervisor: staged.hypervisor.to_string(),
             is_durable: false,
             kernel_digest: String::new(),
             rootfs_digest: String::new(),
@@ -322,6 +363,7 @@ impl SnapshotStore {
         };
         let dir = self.dir(id);
         let mut manifest = self.manifest(id).await?;
+        let layout = manifest.layout()?;
         let started = std::time::Instant::now();
 
         let mut digests = Vec::new();
@@ -329,15 +371,12 @@ impl SnapshotStore {
             digests.push(put_blob(remote, &dir.join(file)).await?);
         }
         remote
-            .put_file(
-                &remote_key(id, burrow_firecracker::SNAPSHOT_FILE),
-                &dir.join(burrow_firecracker::SNAPSHOT_FILE),
-            )
+            .put_file(&remote_key(id, layout.state), &dir.join(layout.state))
             .await?;
         // As chunks, so the memory image can be served page by page on a node
         // restoring it, and so what the snapshot shares with its sandbox's own
         // stored state is stored once.
-        for file in [burrow_firecracker::SNAPSHOT_MEM_FILE, SCRATCH_IMAGE] {
+        for file in [memory_file(layout)?, SCRATCH_IMAGE] {
             let index = crate::chunks::put_image(
                 remote,
                 &dir,
@@ -397,6 +436,7 @@ impl SnapshotStore {
                 "snapshot {id} in the object store was written by another build or is incomplete"
             )));
         }
+        let layout = manifest.layout()?;
         let started = std::time::Instant::now();
         let dir = self.begin(id).await?;
         let memory = match self.fetch_into(remote, &manifest, &dir).await {
@@ -416,7 +456,7 @@ impl SnapshotStore {
         // by path, for the links it hands out. Readers of a snapshot all
         // arrive through `fetching`, which this call still holds.
         if let Some(index) = memory {
-            let path = live.join(burrow_firecracker::SNAPSHOT_MEM_FILE);
+            let path = live.join(memory_file(layout)?);
             let hydrator = Hydrator::begin(remote.clone(), index, &path)
                 .map_err(|err| Status::internal(format!("preparing {}: {err}", path.display())))?;
             hydrator.start();
@@ -437,7 +477,7 @@ impl SnapshotStore {
 
     /// The memory image of a snapshot that is still arriving, picking up a
     /// fill a restart interrupted.
-    fn hydrator(&self, id: &str) -> Result<Option<Arc<Hydrator>>, Status> {
+    fn hydrator(&self, id: &str, memory: &str) -> Result<Option<Arc<Hydrator>>, Status> {
         let mut hydrators = self.hydrators.lock().unwrap();
         if let Some(hydrator) = hydrators.get(id) {
             if !hydrator.is_complete() {
@@ -449,7 +489,7 @@ impl SnapshotStore {
         let Some(remote) = &self.remote else {
             return Ok(None);
         };
-        let path = self.dir(id).join(burrow_firecracker::SNAPSHOT_MEM_FILE);
+        let path = self.dir(id).join(memory);
         match Hydrator::resume(remote.clone(), &path) {
             None => Ok(None),
             Some(Ok(hydrator)) => {
@@ -492,7 +532,8 @@ impl SnapshotStore {
                 "snapshot {id} is missing {file} in the object store"
             ))
         };
-        let file = burrow_firecracker::SNAPSHOT_FILE;
+        let layout = manifest.layout()?;
+        let file = layout.state;
         if remote
             .get_to_file(&remote_key(id, file), &dir.join(file))
             .await?
@@ -505,15 +546,13 @@ impl SnapshotStore {
                 .await?
                 .ok_or_else(|| missing(SCRATCH_IMAGE))?;
             crate::chunks::get_image(remote, &scratch, &dir.join(SCRATCH_IMAGE)).await?;
-            let memory = read_index(
-                remote,
-                &index_key(id, burrow_firecracker::SNAPSHOT_MEM_FILE),
-            )
-            .await?
-            .ok_or_else(|| missing(burrow_firecracker::SNAPSHOT_MEM_FILE))?;
+            let memory_file = memory_file(layout)?;
+            let memory = read_index(remote, &index_key(id, memory_file))
+                .await?
+                .ok_or_else(|| missing(memory_file))?;
             return Ok(Some(memory));
         }
-        for file in [burrow_firecracker::SNAPSHOT_MEM_FILE, SCRATCH_IMAGE] {
+        for file in [memory_file(layout)?, SCRATCH_IMAGE] {
             if remote
                 .get_sparse_file(&remote_key(id, file), &dir.join(file))
                 .await?
@@ -583,9 +622,15 @@ impl SnapshotStore {
     }
 
     /// Snapshots in the object store, whether or not this node holds them.
+    ///
+    /// A node without a store refuses rather than answering empty: the
+    /// orchestrator forgets durable snapshots a listing leaves out, and an
+    /// empty answer from here would read as a store that holds nothing.
     pub async fn list_remote(&self) -> Result<Vec<common::Snapshot>, Status> {
         let Some(remote) = &self.remote else {
-            return Ok(Vec::new());
+            return Err(Status::failed_precondition(
+                "this node has no object store configured",
+            ));
         };
         let mut out = Vec::new();
         for key in remote.list("snapshots/").await? {
@@ -699,18 +744,26 @@ impl SnapshotStore {
             is_remote = true;
             // Manifest first, so a fetch racing this sees nothing rather than
             // a manifest naming files that are going.
-            for file in [MANIFEST, burrow_firecracker::SNAPSHOT_FILE] {
-                remote.delete(&remote_key(id, file)).await?;
-            }
-            for file in [burrow_firecracker::SNAPSHOT_MEM_FILE, SCRATCH_IMAGE] {
-                remote
-                    .delete(&crate::objstore::sparse_key(&remote_key(id, file)))
-                    .await?;
-                remote.delete(&index_key(id, file)).await?;
+            // Every backend's names, since a snapshot whose local manifest
+            // is gone says nothing about which one took it. A delete of an
+            // object that is not there is not an error.
+            remote.delete(&remote_key(id, MANIFEST)).await?;
+            for layout in burrow_vmm::Hypervisor::ALL.map(burrow_vmm::Hypervisor::layout) {
+                remote.delete(&remote_key(id, layout.state)).await?;
+                for file in layout.memory.into_iter().chain([SCRATCH_IMAGE]) {
+                    remote
+                        .delete(&crate::objstore::sparse_key(&remote_key(id, file)))
+                        .await?;
+                    remote.delete(&index_key(id, file)).await?;
+                }
             }
         }
         if let Some(hydrator) = self.hydrators.lock().unwrap().remove(id) {
-            hydrator.detach(&dir.join(burrow_firecracker::SNAPSHOT_MEM_FILE));
+            for layout in burrow_vmm::Hypervisor::ALL.map(burrow_vmm::Hypervisor::layout) {
+                if let Some(memory) = layout.memory {
+                    hydrator.detach(&dir.join(memory));
+                }
+            }
         }
         if !is_local && !is_remote {
             return Err(Status::not_found(format!("no snapshot {id} on this node")));
@@ -743,6 +796,7 @@ impl SnapshotStore {
         validate_id(id)?;
         let dir = self.dir(id);
         self.ensure_local(id).await?;
+        let layout = self.manifest(id).await?.layout()?;
         let io = |what: &str, err: std::io::Error| {
             Status::internal(format!("staging snapshot {id} ({what}): {err}"))
         };
@@ -754,18 +808,15 @@ impl SnapshotStore {
         }
         // Copied, not linked: the sandbox writes its own over it on its first
         // suspend, and a shared inode would have that land in the snapshot.
-        tokio::fs::copy(
-            dir.join(burrow_firecracker::SNAPSHOT_FILE),
-            dest.join(burrow_firecracker::SNAPSHOT_FILE),
-        )
-        .await
-        .map_err(|err| io(burrow_firecracker::SNAPSHOT_FILE, err))?;
+        tokio::fs::copy(dir.join(layout.state), dest.join(layout.state))
+            .await
+            .map_err(|err| io(layout.state, err))?;
 
         crate::warm::copy_sparse(&dir.join(SCRATCH_IMAGE), &dest.join(SCRATCH_IMAGE))
             .await
             .map_err(|err| io(SCRATCH_IMAGE, err))?;
-        let memory = burrow_firecracker::SNAPSHOT_MEM_FILE;
-        let arriving = match self.hydrator(id)? {
+        let memory = memory_file(layout)?;
+        let arriving = match self.hydrator(id, memory)? {
             Some(hydrator) => hydrator
                 .link_to(&dest.join(memory))
                 .map_err(|err| io(memory, err))?
@@ -1000,13 +1051,13 @@ fn unix_now_ms() -> i64 {
 }
 
 /// Merges the staged memory chain down to the single image a snapshot holds.
-async fn flatten(dir: &Path, chain: &[String]) -> Result<(), Status> {
+async fn flatten(dir: &Path, chain: &[String], layout: burrow_vmm::Layout) -> Result<(), Status> {
     if chain.is_empty() {
         return Err(Status::failed_precondition(
             "sandbox has no state to snapshot",
         ));
     }
-    let target = dir.join(burrow_firecracker::SNAPSHOT_MEM_FILE);
+    let target = dir.join(memory_file(layout)?);
     if chain.len() > 1 {
         let paths: Vec<PathBuf> = chain.iter().map(|name| dir.join(name)).collect();
         let target = target.clone();
@@ -1029,7 +1080,7 @@ async fn flatten(dir: &Path, chain: &[String]) -> Result<(), Status> {
 
 #[cfg(target_os = "linux")]
 fn merge_chain(paths: &[PathBuf], target: &Path) -> std::io::Result<()> {
-    burrow_firecracker::merge_chain(paths, target)
+    burrow_vmm::merge_chain(paths, target)
 }
 
 #[cfg(not(target_os = "linux"))]
@@ -1126,6 +1177,7 @@ mod tests {
             is_evicted: false,
             arch: String::new(),
             firecracker_version: String::new(),
+            hypervisor: String::new(),
             is_durable: false,
             kernel_digest: String::new(),
             rootfs_digest: String::new(),
@@ -1139,7 +1191,7 @@ mod tests {
             std::process::id(),
             burrow_common::SnapshotId::generate()
         ));
-        (SnapshotStore::new(&dir, None, String::new()), dir)
+        (SnapshotStore::new(&dir, None, HashMap::new()), dir)
     }
 
     /// The shape is the one thing a restore cannot rediscover, so it has to

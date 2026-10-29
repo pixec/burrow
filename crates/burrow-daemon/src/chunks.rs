@@ -112,7 +112,7 @@ pub struct Reuse<'a> {
 
 #[cfg(target_os = "linux")]
 fn extents(file: &std::fs::File) -> std::io::Result<Vec<(u64, u64)>> {
-    burrow_firecracker::data_extents(file)
+    burrow_vmm::data_extents(file)
 }
 
 #[cfg(not(target_os = "linux"))]
@@ -676,7 +676,7 @@ impl Hydrator {
     }
 }
 
-impl burrow_firecracker::PageSource for Hydrator {
+impl burrow_vmm::PageSource for Hydrator {
     fn extents(&self) -> Vec<(u64, u64)> {
         let mut out: Vec<(u64, u64)> = Vec::new();
         for &n in self.index.chunks.keys() {

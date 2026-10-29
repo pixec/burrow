@@ -383,6 +383,11 @@ message Sandbox {
   // Unix seconds of the last RevokeAccess. Access tokens issued at or before
   // it are refused, wherever the sandbox has moved since.
   int64 access_revoked_at = 23;
+  // The hypervisor running it, its template's: "firecracker" or "qemu".
+  // Fixed for its life: snapshots, warm pools and moves stay within one.
+  string hypervisor = 24;
+  // "linux" or "windows", from its template.
+  string guest_os = 25;
 }
 
 // One VM boot inside a sandbox's life.
@@ -444,6 +449,8 @@ message Snapshot {
   // durable snapshot is limited to nodes that match.
   string arch = 12;
   string firecracker_version = 13;
+  // The hypervisor that took it, and the only one that can restore it.
+  string hypervisor = 14;
 }
 
 message NodeInfo {
@@ -477,6 +484,13 @@ message NodeInfo {
   // included, e.g. "https://node-a.example.com:7073". Empty when it serves
   // none, the default, and then exec and files go through the orchestrator.
   string access_endpoint = 12;
+  // Hypervisors this node can run, e.g. ["firecracker", "qemu"]. A sandbox
+  // is only placed on a node offering the one it asks for.
+  repeated string hypervisors = 13;
+  // Each offered hypervisor's version, e.g. {"firecracker": "v1.16.1",
+  // "cloud-hypervisor": "v54.0"}. Saved state restores only under the version
+  // that wrote it, so placement compares against the one the state needs.
+  map<string, string> hypervisor_versions = 14;
 }
 
 message NodeStatus {

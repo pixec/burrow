@@ -3,7 +3,7 @@ resolver = "3"
 members = [
     "crates/burrow-proto",
     "crates/burrow-common",
-    "crates/burrow-firecracker",
+    "crates/burrow-vmm",
     "crates/burrow-net",
     "crates/burrow-proxy",
     "crates/burrow-store",
@@ -20,7 +20,7 @@ members = [
 default-members = [
     "crates/burrow-proto",
     "crates/burrow-common",
-    "crates/burrow-firecracker",
+    "crates/burrow-vmm",
     "crates/burrow-net",
     "crates/burrow-proxy",
     "crates/burrow-store",
@@ -39,7 +39,7 @@ license = "AGPL-3.0-only"
 [workspace.dependencies]
 burrow-proto = { path = "crates/burrow-proto" }
 burrow-common = { path = "crates/burrow-common" }
-burrow-firecracker = { path = "crates/burrow-firecracker" }
+burrow-vmm = { path = "crates/burrow-vmm" }
 burrow-net = { path = "crates/burrow-net" }
 burrow-proxy = { path = "crates/burrow-proxy" }
 burrow-store = { path = "crates/burrow-store" }

@@ -11,7 +11,7 @@ path = "src/main.rs"
 [dependencies]
 burrow-proto = { workspace = true }
 burrow-common = { workspace = true }
-burrow-firecracker = { workspace = true }
+burrow-vmm = { workspace = true }
 burrow-net = { workspace = true }
 burrow-proxy = { workspace = true }
 burrow-store = { workspace = true }
@@ -45,3 +45,9 @@ uuid = { workspace = true }
 aws-sdk-s3 = { version = "1.155.0", default-features = false, features = ["rt-tokio"] }
 aws-smithy-http-client = { version = "1.5.1", default-features = false, features = ["rustls-ring"] }
 aws-smithy-async = { version = "1.3.1", features = ["rt-tokio"] }
+
+# Host memory as macOS counts it, for a Mac node's free memory.
+[target.'cfg(target_os = "macos")'.dependencies]
+libc = { workspace = true }
+# A macOS guest's NIC is a socket pair; this is what polices it.
+burrow-net = { workspace = true, features = ["usernet"] }

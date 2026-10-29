@@ -134,29 +134,82 @@ async fn link_kernel(target: &Path) -> Result<(), Status> {
         })
 }
 
+/// Every template on disk, for an operator to see.
 pub async fn list(data_dir: &Path) -> Vec<api::TemplateInfo> {
+    scan(data_dir)
+        .await
+        .into_iter()
+        .map(|(info, _)| info)
+        .collect()
+}
+
+/// The templates this build can start sandboxes from, for the node to
+/// advertise to placement.
+pub async fn bootable(data_dir: &Path) -> Vec<api::TemplateInfo> {
+    scan(data_dir)
+        .await
+        .into_iter()
+        .filter_map(|(info, is_bootable)| is_bootable.then_some(info))
+        .collect()
+}
+
+async fn scan(data_dir: &Path) -> Vec<(api::TemplateInfo, bool)> {
     let mut out = Vec::new();
     let Ok(mut entries) = tokio::fs::read_dir(templates_dir(data_dir)).await else {
         return out;
     };
     while let Ok(Some(entry)) = entries.next_entry().await {
         let name = entry.file_name().to_string_lossy().into_owned();
-        let rootfs = entry.path().join("rootfs.ext4");
-        let Ok(meta) = tokio::fs::metadata(&rootfs).await else {
-            // A directory without a rootfs is not a usable template.
+        // A macOS template being installed, under a name no template has.
+        if name.starts_with('.') {
             continue;
+        }
+        // A Linux template's root is its rootfs; a macOS one's, the disk the
+        // installer wrote.
+        let rootfs = entry.path().join("rootfs.ext4");
+        let disk = entry.path().join("disk.img");
+        let meta = match tokio::fs::metadata(&rootfs).await {
+            Ok(meta) => meta,
+            Err(_) => match tokio::fs::metadata(&disk).await {
+                Ok(meta) => meta,
+                // A directory without either is not a usable template.
+                Err(_) => continue,
+            },
         };
         let warm = crate::warm::is_warm(&templates_dir(data_dir), &name).await;
         let environment = crate::oci::image_environment(data_dir, &name).await;
-        out.push(api::TemplateInfo {
+        // Listed even when this build cannot read what it runs on, so an
+        // operator can see it and delete or rebuild it; the names it recorded
+        // are shown as they are.
+        let (hypervisor, guest_os, is_bootable) = match environment.machine() {
+            Ok((hypervisor, guest_os)) => {
+                (hypervisor.to_string(), guest_os.as_str().to_string(), true)
+            }
+            Err(err) => {
+                tracing::warn!(
+                    template = name,
+                    err = err.message(),
+                    "template runs on something this build does not know"
+                );
+                (
+                    format!("unknown ({})", environment.hypervisor),
+                    environment.guest_os.clone(),
+                    false,
+                )
+            }
+        };
+        let info = api::TemplateInfo {
             name,
             size_bytes: meta.len(),
             is_warm: warm,
             is_kit: environment.kit.is_some(),
             is_systemd: environment.systemd,
-        });
+            guest_os,
+            hypervisor,
+        };
+        out.push((info, is_bootable));
     }
-    out.sort_by(|a, b| a.name.cmp(&b.name));
+    out.sort_by(|a, b| a.0.name.cmp(&b.0.name));
     out
 }
 
@@ -175,6 +228,31 @@ pub async fn delete(data_dir: &Path, name: &str) -> Result<(), Status> {
         .await
         .map_err(|err| Status::internal(format!("removing template: {err}")))?;
     Ok(())
+}
+
+/// The hypervisor a template being built records: the one asked for, else the
+/// one its base records. Kept as given rather than resolved, so an empty one
+/// goes on meaning "the guest's default" wherever the template is pulled to.
+///
+/// Refused when this node cannot run it: a template is built by booting it,
+/// and one this node could not boot is one nothing here could use.
+fn chosen_hypervisor(
+    manager: &SandboxManager,
+    requested: &str,
+    inherited: &str,
+) -> Result<String, Status> {
+    let name = if requested.is_empty() {
+        inherited
+    } else {
+        requested
+    };
+    let environment = crate::oci::ImageEnvironment {
+        hypervisor: name.to_string(),
+        ..Default::default()
+    };
+    let (hypervisor, _) = environment.machine()?;
+    manager.require_hypervisor(hypervisor)?;
+    Ok(name.to_string())
 }
 
 /// Template names become directory names, so they must not be able to escape
@@ -254,12 +332,14 @@ async fn run_build(
                 "a kit import takes no steps and no base; the kits are the whole image",
             ));
         }
+        let hypervisor = chosen_hypervisor(manager, &request.hypervisor, "")?;
         return from_image::import_kit(
             manager,
             data_dir,
             &request.name,
             &request.kits,
             request.is_systemd,
+            &hypervisor,
             guest_binary,
             credentials,
             insecure,
@@ -273,7 +353,9 @@ async fn run_build(
     // run in it. With no steps that is the whole build; with steps, the
     // converted image becomes the base they run on.
     let from_owned;
+    let hypervisor;
     let from = if !request.from_image.is_empty() {
+        hypervisor = chosen_hypervisor(manager, &request.hypervisor, "")?;
         let base = if request.steps.is_empty() {
             request.name.clone()
         } else {
@@ -287,6 +369,7 @@ async fn run_build(
             &base,
             &request.from_image,
             request.is_systemd,
+            &hypervisor,
             guest_binary,
             credentials,
             insecure,
@@ -298,10 +381,18 @@ async fn run_build(
         }
         from_owned = base;
         &from_owned
-    } else if request.from.is_empty() {
-        "default"
     } else {
-        &request.from
+        let from = if request.from.is_empty() {
+            "default"
+        } else {
+            &request.from
+        };
+        validate_name(from)?;
+        let inherited = crate::oci::image_environment(data_dir, from)
+            .await
+            .hypervisor;
+        hypervisor = chosen_hypervisor(manager, &request.hypervisor, &inherited)?;
+        from
     };
     // The base names a directory under `images/` just as the target does, and
     // it is a caller's string on the `request.from` path: unvalidated, a `..`
@@ -402,6 +493,7 @@ async fn run_build(
         &commands,
         cached_steps,
         is_systemd,
+        &hypervisor,
     )
     .await;
     if let Err(err) = manager.delete(&build_id).await {
@@ -421,6 +513,7 @@ async fn build_in_sandbox(
     commands: &[String],
     cached_steps: usize,
     is_systemd: bool,
+    hypervisor: &str,
 ) -> Result<(), Status> {
     for (index, run) in commands.iter().enumerate() {
         // Steps the cache already covers are represented by the seeded scratch
@@ -498,6 +591,7 @@ async fn build_in_sandbox(
         &request.name,
         bytes,
         is_systemd,
+        hypervisor,
     )
     .await;
     let _ = tokio::fs::remove_dir_all(&staging).await;
@@ -513,6 +607,7 @@ async fn build_in_sandbox(
 }
 
 /// Unpacks the captured tar and turns it into a bootable image.
+#[allow(clippy::too_many_arguments)]
 async fn assemble_image(
     manager: &SandboxManager,
     data_dir: &Path,
@@ -521,6 +616,7 @@ async fn assemble_image(
     name: &str,
     tar_bytes: u64,
     is_systemd: bool,
+    hypervisor: &str,
 ) -> Result<u64, Status> {
     let rootdir = staging.join("root");
     tokio::fs::create_dir_all(&rootdir)
@@ -578,17 +674,7 @@ async fn assemble_image(
 
     link_kernel(&target).await?;
 
-    if is_systemd {
-        let config = crate::oci::ImageEnvironment {
-            systemd: true,
-            ..Default::default()
-        };
-        let config = serde_json::to_vec_pretty(&config)
-            .map_err(|err| Status::internal(format!("image config: {err}")))?;
-        tokio::fs::write(target.join("image.json"), config)
-            .await
-            .map_err(|err| Status::internal(format!("writing image config: {err}")))?;
-    }
+    write_build_config(&target, is_systemd, hypervisor).await?;
 
     let final_path = target.join("rootfs.ext4");
     tokio::fs::rename(&pending, &final_path)
@@ -604,6 +690,26 @@ async fn assemble_image(
         .map(|m| m.len())
         .unwrap_or(0);
     Ok(size)
+}
+
+/// Writes what a build records about its template, always: a rebuild over an
+/// existing template would otherwise go on reading the previous build's
+/// hypervisor and systemd from the file it left behind.
+async fn write_build_config(
+    target: &Path,
+    is_systemd: bool,
+    hypervisor: &str,
+) -> Result<(), Status> {
+    let config = crate::oci::ImageEnvironment {
+        systemd: is_systemd,
+        hypervisor: hypervisor.to_string(),
+        ..Default::default()
+    };
+    let config = serde_json::to_vec_pretty(&config)
+        .map_err(|err| Status::internal(format!("image config: {err}")))?;
+    tokio::fs::write(target.join("image.json"), config)
+        .await
+        .map_err(|err| Status::internal(format!("writing image config: {err}")))
 }
 
 fn path(p: &Path) -> String {
@@ -780,7 +886,27 @@ pub mod distribute {
             .await
             .unwrap_or(false)
         {
-            return Err(Status::not_found(format!("no template {name}")));
+            // An installed macOS machine: its config says what it runs on,
+            // but its 26 GB disk is not served to peers, which could not boot
+            // it unless they were Macs too.
+            if !tokio::fs::try_exists(dir.join("disk.img"))
+                .await
+                .unwrap_or(false)
+            {
+                return Err(Status::not_found(format!("no template {name}")));
+            }
+            if !config_only {
+                return Err(Status::failed_precondition(format!(
+                    "template {name} is an installed macOS machine, which stays on the Mac that installed it"
+                )));
+            }
+            return Ok(nodepb::TemplateManifest {
+                name: name.to_string(),
+                image_config: tokio::fs::read_to_string(dir.join(IMAGE_CONFIG))
+                    .await
+                    .unwrap_or_default(),
+                ..Default::default()
+            });
         }
         let store = BlobStore::new(data_dir);
 
@@ -1287,6 +1413,60 @@ pub mod layers {
 }
 
 #[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A rebuild without `--systemd` or a hypervisor used to leave the
+    /// previous build's image.json in place, so the template kept running
+    /// under what that build chose.
+    #[tokio::test]
+    async fn a_rebuild_replaces_the_previous_build_config() {
+        let dir = std::env::temp_dir().join(format!("burrow-build-config-{}", std::process::id()));
+        tokio::fs::create_dir_all(&dir).await.unwrap();
+        write_build_config(&dir, true, "cloud-hypervisor")
+            .await
+            .unwrap();
+        write_build_config(&dir, false, "").await.unwrap();
+        let config: crate::oci::ImageEnvironment =
+            serde_json::from_slice(&tokio::fs::read(dir.join("image.json")).await.unwrap())
+                .unwrap();
+        assert!(!config.systemd);
+        assert!(config.hypervisor.is_empty(), "{}", config.hypervisor);
+        let _ = tokio::fs::remove_dir_all(&dir).await;
+    }
+
+    /// A template recording a hypervisor this build does not know used to be
+    /// left out of the listing while it stayed on disk.
+    #[tokio::test]
+    async fn a_template_on_an_unknown_hypervisor_is_listed() {
+        let data_dir =
+            std::env::temp_dir().join(format!("burrow-list-unknown-{}", std::process::id()));
+        let dir = templates_dir(&data_dir).join("future");
+        tokio::fs::create_dir_all(&dir).await.unwrap();
+        tokio::fs::write(dir.join("rootfs.ext4"), b"")
+            .await
+            .unwrap();
+        tokio::fs::write(
+            dir.join("image.json"),
+            br#"{"env":[],"working_dir":"","hypervisor":"future-vmm"}"#,
+        )
+        .await
+        .unwrap();
+        let listed = list(&data_dir).await;
+        let advertised = bootable(&data_dir).await;
+        let _ = tokio::fs::remove_dir_all(&data_dir).await;
+        assert!(advertised.is_empty());
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].name, "future");
+        assert!(
+            listed[0].hypervisor.contains("future-vmm"),
+            "{}",
+            listed[0].hypervisor
+        );
+    }
+}
+
+#[cfg(test)]
 mod layer_tests {
     use super::layers;
     use crate::blobs::Digest;
@@ -1485,6 +1665,7 @@ pub mod from_image {
         name: &str,
         image: &str,
         is_systemd: bool,
+        hypervisor: &str,
         guest_binary: &Path,
         credentials: &crate::oci::auth::Store,
         insecure: &[String],
@@ -1510,6 +1691,7 @@ pub mod from_image {
                 Ok((template, layers)) => {
                     let mut environment = template.environment();
                     environment.systemd = is_systemd;
+                    environment.hypervisor = hypervisor.to_string();
                     return stage(
                         manager,
                         data_dir,
@@ -1528,6 +1710,7 @@ pub mod from_image {
         }
         let mut environment = pulled.environment;
         environment.systemd = is_systemd;
+        environment.hypervisor = hypervisor.to_string();
         stage(
             manager,
             data_dir,
@@ -1551,6 +1734,7 @@ pub mod from_image {
         name: &str,
         refs: &[String],
         is_systemd: bool,
+        hypervisor: &str,
         guest_binary: &Path,
         credentials: &crate::oci::auth::Store,
         insecure: &[String],
@@ -1570,6 +1754,7 @@ pub mod from_image {
         validate_name(&name)?;
         let mut environment = template.environment();
         environment.systemd = is_systemd;
+        environment.hypervisor = hypervisor.to_string();
         stage(
             manager,
             data_dir,

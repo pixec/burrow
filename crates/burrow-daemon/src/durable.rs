@@ -10,20 +10,29 @@
 //! A node marks it running *before* it resumes the guest, so a node adopting
 //! it after this one was written off reads `running` and refuses: the state in
 //! the store is from the last suspend, and the guest has moved on since.
-//! Together with the lease a node holds through its heartbeats, that is what
-//! keeps one sandbox from running in two places.
+//!
+//! Every write that hands the sandbox to a node is conditional on the version
+//! of the manifest it was decided on (`If-Match` on its ETag, `If-None-Match`
+//! for the first), so two nodes that both read it suspended cannot both take
+//! it: one write lands and the other is refused before anything starts. A
+//! node writing as the holder checks the manifest still names it, so one the
+//! sandbox moved off cannot write over the node running it now. Together with
+//! the lease a node holds through its heartbeats, that is what keeps one
+//! sandbox from running in two places.
 //!
 //! Layout, under the store's prefix:
 //!
 //! ```text
 //! sandboxes/<id>/manifest.json
-//! sandboxes/<id>/<generation>/snapshot.vmstate
-//! sandboxes/<id>/<generation>/snapshot.mem.index.json
+//! sandboxes/<id>/<generation>/<state>
+//! sandboxes/<id>/<generation>/<memory>.index.json
 //! sandboxes/<id>/<generation>/scratch.ext4.index.json
 //! sandboxes/<id>/<generation>/command-logs.json
 //! chunks/<sha256>
 //! blobs/<digest>
 //! ```
+//!
+//! `<state>` and `<memory>` are the sandbox's hypervisor's [`burrow_vmm::Layout`].
 
 #![allow(clippy::result_large_err)]
 
@@ -76,7 +85,12 @@ pub struct Manifest {
     pub scratch_disk_mib: u32,
     pub is_systemd: bool,
     pub arch: String,
+    /// The version of `hypervisor` that wrote the state.
     pub firecracker_version: String,
+    /// The sandbox's hypervisor, the only one its state restores under. Empty
+    /// in a manifest from before there was a choice, which was Firecracker.
+    #[serde(default)]
+    pub hypervisor: String,
     pub kernel_digest: String,
     pub rootfs_digest: String,
     pub cpu_usage_usec: u64,
@@ -88,6 +102,21 @@ pub struct Manifest {
     /// them back from.
     #[serde(default)]
     pub secrets: std::collections::BTreeMap<String, String>,
+}
+
+impl Manifest {
+    pub fn hypervisor(&self) -> Result<burrow_vmm::Hypervisor, Status> {
+        burrow_vmm::Hypervisor::from_record(&self.hypervisor).ok_or_else(|| {
+            Status::failed_precondition(format!(
+                "sandbox {} was stored under {:?}, which this build does not know",
+                self.id, self.hypervisor
+            ))
+        })
+    }
+
+    fn layout(&self) -> Result<burrow_vmm::Layout, Status> {
+        self.hypervisor().map(burrow_vmm::Hypervisor::layout)
+    }
 }
 
 fn sandbox_prefix(id: &str) -> String {
@@ -165,8 +194,9 @@ impl LocalState {
                 .iter()
                 .zip(chain)
                 .all(|(layer, name)| LayerId::of(workdir, name).is_ok_and(|now| now == *layer))
-            && Stamp::of(&workdir.join(burrow_firecracker::SNAPSHOT_FILE))
-                .is_ok_and(|now| now == self.vmstate)
+            && self.manifest.layout().is_ok_and(|layout| {
+                Stamp::of(&workdir.join(layout.state)).is_ok_and(|now| now == self.vmstate)
+            })
             && Stamp::of(&workdir.join(SCRATCH_IMAGE)).is_ok_and(|now| now == self.scratch)
     }
 
@@ -269,6 +299,17 @@ impl Durability {
     }
 }
 
+/// The memory image a stored sandbox is made of. A backend whose memory lives
+/// inside a host-bound state file has none to chunk or rehydrate elsewhere,
+/// so its state cannot be stored.
+fn memory_file(layout: burrow_vmm::Layout) -> Result<&'static str, Status> {
+    layout.memory.ok_or_else(|| {
+        Status::failed_precondition(
+            "this hypervisor keeps guest memory inside its saved state, which cannot be stored",
+        )
+    })
+}
+
 /// Uploads a suspended sandbox's state, returning what was stored.
 ///
 /// `draft` carries what the manifest says about the sandbox; the generation,
@@ -285,13 +326,15 @@ pub async fn upload(
     let io = |what: &str, err: std::io::Error| Status::internal(format!("{what}: {err}"));
     let started = std::time::Instant::now();
     let id = draft.id.clone();
+    let layout = draft.layout()?;
+    let memory_file = memory_file(layout)?;
     let layers = chain
         .iter()
         .map(|name| LayerId::of(workdir, name))
         .collect::<std::io::Result<Vec<_>>>()
         .map_err(|err| io("reading the memory chain", err))?;
     let stamp = |file: &str| Stamp::of(&workdir.join(file)).map_err(|err| io(file, err));
-    let vmstate = stamp(burrow_firecracker::SNAPSHOT_FILE)?;
+    let vmstate = stamp(layout.state)?;
     let scratch = stamp(SCRATCH_IMAGE)?;
     let kernel = stamp(TEMPLATE_KERNEL)?;
     let rootfs = stamp(TEMPLATE_ROOTFS)?;
@@ -345,8 +388,8 @@ pub async fn upload(
     let generation = now_ms.max(previous.map_or(0, |p| p.manifest.generation + 1));
     store
         .put_file(
-            &generation_key(&id, generation, burrow_firecracker::SNAPSHOT_FILE),
-            &workdir.join(burrow_firecracker::SNAPSHOT_FILE),
+            &generation_key(&id, generation, layout.state),
+            &workdir.join(layout.state),
         )
         .await?;
     if tokio::fs::try_exists(workdir.join(WORKING_SET))
@@ -360,10 +403,7 @@ pub async fn upload(
             )
             .await?;
     }
-    for (file, index) in [
-        (burrow_firecracker::SNAPSHOT_MEM_FILE, &memory),
-        (SCRATCH_IMAGE, &scratch_index),
-    ] {
+    for (file, index) in [(memory_file, &memory), (SCRATCH_IMAGE, &scratch_index)] {
         let json = serde_json::to_vec(index)
             .map_err(|err| Status::internal(format!("encoding an index: {err}")))?;
         store
@@ -381,7 +421,7 @@ pub async fn upload(
     // The sandbox's files were read without holding them still. A resume
     // cancels the upload before it starts the guest, so a change here is a
     // bug rather than a race, and is refused rather than published.
-    if stamp(burrow_firecracker::SNAPSHOT_FILE)? != vmstate || stamp(SCRATCH_IMAGE)? != scratch {
+    if stamp(layout.state)? != vmstate || stamp(SCRATCH_IMAGE)? != scratch {
         return Err(Status::aborted(
             "the sandbox changed while it was being uploaded",
         ));
@@ -407,7 +447,9 @@ pub async fn upload(
         logs,
     };
     save_local(workdir, &local).await?;
-    write_manifest(store, &local.manifest).await?;
+    // A previous upload that never heard back may or may not have landed.
+    let may_create = previous.is_none_or(|previous| !previous.is_published);
+    write_held(store, &local.manifest.node_id, &local.manifest, may_create).await?;
     local.is_published = true;
     save_local(workdir, &local).await?;
 
@@ -428,7 +470,8 @@ pub async fn upload(
 }
 
 /// Records in the store that the sandbox is about to run on `node_id`, which
-/// a node must do before it starts the guest.
+/// a node must do before it starts the guest. Refused when the store says
+/// another node holds it now.
 pub async fn mark_running(
     store: &ObjectStore,
     workdir: &Path,
@@ -438,13 +481,20 @@ pub async fn mark_running(
     let mut manifest = local.manifest.clone();
     manifest.state = STATE_RUNNING.to_string();
     manifest.node_id = node_id.to_string();
-    write_manifest(store, &manifest).await?;
+    write_held(store, node_id, &manifest, false).await?;
     local.manifest = manifest;
     save_local(workdir, local).await
 }
 
-pub async fn read_manifest(store: &ObjectStore, id: &str) -> Result<Option<Manifest>, Status> {
-    let Some(bytes) = store.get_bytes(&manifest_key(id)).await? else {
+/// A sandbox's manifest as the store holds it, with the ETag it was read at.
+#[derive(Debug)]
+pub struct Held {
+    pub manifest: Manifest,
+    etag: String,
+}
+
+pub async fn read_manifest(store: &ObjectStore, id: &str) -> Result<Option<Held>, Status> {
+    let Some((bytes, etag)) = store.get_bytes_versioned(&manifest_key(id)).await? else {
         return Ok(None);
     };
     let manifest: Manifest = serde_json::from_slice(&bytes)
@@ -454,13 +504,72 @@ pub async fn read_manifest(store: &ObjectStore, id: &str) -> Result<Option<Manif
             "sandbox {id} was stored by another build of burrowd"
         )));
     }
-    Ok(Some(manifest))
+    Ok(Some(Held { manifest, etag }))
 }
 
-pub async fn write_manifest(store: &ObjectStore, manifest: &Manifest) -> Result<(), Status> {
-    let json = serde_json::to_vec_pretty(manifest)
+/// Writes `next` over the manifest `held` was read as, or as the sandbox's
+/// first when `held` is `None`.
+///
+/// This is the lease. The write is conditional on the version read, so of
+/// two nodes that read the same manifest and both try to take the sandbox,
+/// one lands and the other is refused here, naming the holder, before it has
+/// started anything.
+pub async fn replace_manifest(
+    store: &ObjectStore,
+    held: Option<&Held>,
+    next: &Manifest,
+) -> Result<Held, Status> {
+    let json = serde_json::to_vec_pretty(next)
         .map_err(|err| Status::internal(format!("encoding the manifest: {err}")))?;
-    store.put_bytes(&manifest_key(&manifest.id), json).await
+    let key = manifest_key(&next.id);
+    match store
+        .put_bytes_if(&key, json, held.map(|held| held.etag.as_str()))
+        .await?
+    {
+        Some(etag) => Ok(Held {
+            manifest: next.clone(),
+            etag,
+        }),
+        None => {
+            let current = read_manifest(store, &next.id).await?;
+            Err(lost(&next.id, current.as_ref()))
+        }
+    }
+}
+
+/// Writes `next` for a sandbox the store must record as held by `holder`, or,
+/// when `may_create`, have nothing for yet.
+///
+/// Only a node writes its own name in, and a failed adopt hands back exactly
+/// what it read, so while the manifest names `holder` no other node runs the
+/// sandbox, whatever else changed.
+pub async fn write_held(
+    store: &ObjectStore,
+    holder: &str,
+    next: &Manifest,
+    may_create: bool,
+) -> Result<Held, Status> {
+    let current = read_manifest(store, &next.id).await?;
+    match &current {
+        Some(held) if held.manifest.node_id == holder => {
+            replace_manifest(store, Some(held), next).await
+        }
+        None if may_create => replace_manifest(store, None, next).await,
+        _ => Err(lost(&next.id, current.as_ref())),
+    }
+}
+
+fn lost(id: &str, current: Option<&Held>) -> Status {
+    match current {
+        Some(held) => Status::aborted(format!(
+            "sandbox {id} is held by node {} in the object store ({}, generation {}); this node \
+             lost it and does not run it",
+            held.manifest.node_id, held.manifest.state, held.manifest.generation
+        )),
+        None => Status::aborted(format!(
+            "sandbox {id} is no longer in the object store; this node does not run it"
+        )),
+    }
 }
 
 async fn delete_generation(store: &ObjectStore, id: &str, generation: u64) {
@@ -500,8 +609,9 @@ pub async fn stage(
     let missing =
         |file: &str| Status::not_found(format!("sandbox {id}'s stored state is missing {file}"));
     let started = std::time::Instant::now();
-    let vmstate = burrow_firecracker::SNAPSHOT_FILE;
-    let memory_file = burrow_firecracker::SNAPSHOT_MEM_FILE;
+    let layout = manifest.layout()?;
+    let vmstate = layout.state;
+    let memory_file = memory_file(layout)?;
     // Everything small at once: each is a round trip, and none depends on
     // another.
     let (kernel_path, rootfs_path) = (dest.join(TEMPLATE_KERNEL), dest.join(TEMPLATE_ROOTFS));
@@ -539,7 +649,7 @@ pub async fn stage(
     let warming = {
         let hydrator = Arc::clone(&hydrator);
         tokio::task::spawn_blocking(move || {
-            use burrow_firecracker::PageSource as _;
+            use burrow_vmm::PageSource as _;
             hydrator.ensure_all(&working_set, PAGE)
         })
     };
@@ -712,10 +822,13 @@ pub async fn collect_garbage(
         else {
             continue;
         };
-        let Ok(Some(manifest)) = read_manifest(store, id).await else {
+        let Ok(Some(Held { manifest, .. })) = read_manifest(store, id).await else {
             continue;
         };
-        for file in [burrow_firecracker::SNAPSHOT_MEM_FILE, SCRATCH_IMAGE] {
+        // Refused rather than skipped: skipping would leave this sandbox's
+        // chunks unreferenced, and the sweep below would take them.
+        let layout = manifest.layout()?;
+        for file in layout.memory.into_iter().chain([SCRATCH_IMAGE]) {
             if let Some(index) =
                 crate::snapshot::read_index(store, &index_key(id, manifest.generation, file))
                     .await?
@@ -774,4 +887,106 @@ pub async fn collect_garbage(
         );
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn manifest(node_id: &str, state: &str) -> Manifest {
+        Manifest {
+            format: FORMAT,
+            id: "sbx_1".into(),
+            generation: 1,
+            node_id: node_id.into(),
+            state: state.into(),
+            template: "alpine".into(),
+            vcpus: 1,
+            mem_mib: 512,
+            scratch_disk_mib: 1024,
+            is_systemd: false,
+            arch: "aarch64".into(),
+            firecracker_version: "1".into(),
+            hypervisor: "firecracker".into(),
+            kernel_digest: String::new(),
+            rootfs_digest: String::new(),
+            cpu_usage_usec: 0,
+            rx_bytes: 0,
+            tx_bytes: 0,
+            secrets: Default::default(),
+        }
+    }
+
+    /// A move racing a start, or two orchestrators placing one sandbox: both
+    /// nodes read it suspended and both claim it. Only one may run it.
+    #[tokio::test]
+    async fn of_two_nodes_claiming_one_sandbox_only_one_takes_it() {
+        let store = crate::objstore::fake::store(true).await;
+        replace_manifest(&store, None, &manifest("node-a", STATE_SUSPENDED))
+            .await
+            .unwrap();
+        let held = read_manifest(&store, "sbx_1").await.unwrap().unwrap();
+        let (claim_b, claim_c) = (
+            manifest("node-b", STATE_RUNNING),
+            manifest("node-c", STATE_RUNNING),
+        );
+        let (b, c) = tokio::join!(
+            replace_manifest(&store, Some(&held), &claim_b),
+            replace_manifest(&store, Some(&held), &claim_c),
+        );
+        let (winner, lost) = match (b, c) {
+            (Ok(_), Err(lost)) => ("node-b", lost),
+            (Err(lost), Ok(_)) => ("node-c", lost),
+            (b, c) => panic!(
+                "exactly one claim should land: {:?} {:?}",
+                b.is_ok(),
+                c.is_ok()
+            ),
+        };
+        assert_eq!(lost.code(), tonic::Code::Aborted);
+        assert!(lost.message().contains(winner), "{}", lost.message());
+        let now = read_manifest(&store, "sbx_1").await.unwrap().unwrap();
+        assert_eq!(now.manifest.node_id, winner);
+        assert_eq!(now.manifest.state, STATE_RUNNING);
+    }
+
+    /// The node the sandbox moved off still has its copy. Neither a resume
+    /// nor an upload from it may land over the node that runs it now.
+    #[tokio::test]
+    async fn a_node_that_lost_the_sandbox_cannot_write_over_its_holder() {
+        let store = crate::objstore::fake::store(true).await;
+        let suspended = manifest("node-a", STATE_SUSPENDED);
+        let held = replace_manifest(&store, None, &suspended).await.unwrap();
+        replace_manifest(&store, Some(&held), &manifest("node-b", STATE_RUNNING))
+            .await
+            .unwrap();
+
+        let stale = write_held(&store, "node-a", &manifest("node-a", STATE_RUNNING), true)
+            .await
+            .unwrap_err();
+        assert_eq!(stale.code(), tonic::Code::Aborted);
+        assert!(stale.message().contains("node-b"), "{}", stale.message());
+        let first = replace_manifest(&store, None, &suspended)
+            .await
+            .unwrap_err();
+        assert_eq!(first.code(), tonic::Code::Aborted);
+        assert_eq!(
+            read_manifest(&store, "sbx_1")
+                .await
+                .unwrap()
+                .unwrap()
+                .manifest
+                .node_id,
+            "node-b"
+        );
+
+        // A failed adopt hands back exactly what it read, after which the
+        // node it came from holds it again.
+        write_held(&store, "node-b", &suspended, false)
+            .await
+            .unwrap();
+        write_held(&store, "node-a", &manifest("node-a", STATE_RUNNING), false)
+            .await
+            .unwrap();
+    }
 }

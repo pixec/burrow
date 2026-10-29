@@ -12,11 +12,7 @@ path = "src/main.rs"
 burrow-proto = { workspace = true }
 tokio = { workspace = true }
 tokio-stream = { workspace = true }
-tokio-vsock = { workspace = true }
 tonic = { workspace = true }
-nix = { workspace = true }
-rtnetlink = { workspace = true }
-netlink-packet-route = { workspace = true }
 futures = { workspace = true }
 async-stream = { workspace = true }
 anyhow = { workspace = true }
@@ -25,3 +21,52 @@ serde_json = { workspace = true }
 serde = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
+
+[dev-dependencies]
+hyper-util = { workspace = true }
+tower = { workspace = true }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+tokio-vsock = { workspace = true }
+nix = { workspace = true }
+rtnetlink = { workspace = true }
+netlink-packet-route = { workspace = true }
+
+[target.'cfg(target_os = "macos")'.dependencies]
+nix = { workspace = true }
+
+[target.'cfg(windows)'.dependencies]
+base64 = { workspace = true }
+
+[target.'cfg(windows)'.dependencies.windows-sys]
+version = "0.61"
+features = [
+    "Wdk_Foundation",
+    "Wdk_Storage_FileSystem",
+    "Wdk_System_SystemServices",
+    "Win32_Foundation",
+    "Win32_NetworkManagement_IpHelper",
+    "Win32_NetworkManagement_NetManagement",
+    "Win32_NetworkManagement_Ndis",
+    "Win32_Networking_WinSock",
+    "Win32_Security",
+    "Win32_Security_Authentication_Identity",
+    "Win32_Security_Authorization",
+    "Win32_Security_Cryptography",
+    "Win32_Storage_FileSystem",
+    "Win32_System_Console",
+    "Win32_System_Environment",
+    "Win32_System_IO",
+    "Win32_System_Ioctl",
+    "Win32_System_JobObjects",
+    "Win32_System_Kernel",
+    "Win32_System_Memory",
+    "Win32_System_Pipes",
+    "Win32_System_Services",
+    "Win32_System_SystemInformation",
+    "Win32_System_SystemServices",
+    "Win32_System_Threading",
+    "Win32_System_Time",
+    "Win32_System_WindowsProgramming",
+    "Win32_UI_Shell",
+]

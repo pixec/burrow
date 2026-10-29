@@ -466,6 +466,38 @@ impl ApiService {
         Ok(())
     }
 
+    /// The hypervisor `template` runs under, from the config a node holding it
+    /// recorded when it was built.
+    ///
+    /// Empty, meaning any, when every healthy node offers the same ones: a
+    /// node only holds a template it can boot, so any holder will do and the
+    /// round trip is not worth paying on every create.
+    async fn template_hypervisor(&self, template: &str) -> Result<String, Status> {
+        if self.0.nodes.is_uniform_in_hypervisors() {
+            return Ok(String::new());
+        }
+        // Placement reports a template no node holds; nothing to ask here.
+        let Some((source_id, _)) = self.0.nodes.source_for_template(template) else {
+            return Ok(String::new());
+        };
+        let endpoint = self
+            .0
+            .nodes
+            .endpoint(&source_id)
+            .ok_or_else(|| Status::unavailable(format!("node {source_id} is unreachable")))?;
+        let mut client = connect_node(endpoint, self.0.node_token.as_deref())
+            .await
+            .map_err(|err| Status::unavailable(format!("node {source_id}: {err}")))?;
+        let manifest = client
+            .get_template_manifest(nodepb::TemplateManifestRequest {
+                name: template.to_string(),
+                is_config_only: true,
+            })
+            .await?
+            .into_inner();
+        Ok(configured_hypervisor(&manifest.image_config))
+    }
+
     /// The bound secrets for the credential services a Kit template's
     /// descriptors request, read through `client` on `node_id`; empty for any
     /// other template. An unbound service is left out: whether that refuses
@@ -529,17 +561,29 @@ impl ApiService {
         }
     }
 
-    /// The node holding `sandbox_id` now.
-    async fn placed_on(&self, sandbox_id: &str) -> Result<String, Status> {
+    /// Whether other orchestrator replicas share this one's store, so its
+    /// cache can be up to a reload behind their writes.
+    fn is_replicated(&self) -> bool {
+        self.0.control_plane_hosts.lock().unwrap().len() > 1
+    }
+
+    /// The node holding `sandbox_id` now, or empty for a sandbox no node
+    /// holds.
+    async fn holder(&self, sandbox_id: &str) -> Result<String, Status> {
         let mut node_id = self.node_of(sandbox_id)?;
         // Beside other replicas the cache can be a second behind a move made
         // through one of them, naming a node that has already let go.
-        let is_replicated = self.0.control_plane_hosts.lock().unwrap().len() > 1;
-        if (node_id.is_empty() || is_replicated)
+        if (node_id.is_empty() || self.is_replicated())
             && let Some(sandbox) = self.0.sandboxes.refresh(sandbox_id).await
         {
             node_id = sandbox.node_id;
         }
+        Ok(node_id)
+    }
+
+    /// The node holding `sandbox_id` now.
+    async fn placed_on(&self, sandbox_id: &str) -> Result<String, Status> {
+        let node_id = self.holder(sandbox_id).await?;
         if node_id.is_empty() {
             return Err(Status::failed_precondition(format!(
                 "sandbox {sandbox_id} is suspended with its state in the object store, \
@@ -563,6 +607,20 @@ impl ApiService {
     /// Asks a healthy node what the object store holds and records it,
     /// returning whether `id` turned out to be there.
     async fn refresh_durable(&self, id: &str) -> bool {
+        let Some((_, listed)) = self.store_node().await else {
+            return false;
+        };
+        let is_there = listed.iter().any(|snapshot| snapshot.id == id);
+        self.0.snapshots.reconcile_remote(listed);
+        if is_there {
+            self.0.snapshots.mark_durable(id);
+        }
+        is_there
+    }
+
+    /// A healthy node with the object store configured, and what the store
+    /// lists. A node without one refuses the listing, so it is skipped.
+    async fn store_node(&self) -> Option<(NodeClient, Vec<common::Snapshot>)> {
         for node_id in self.0.nodes.healthy_ids() {
             let Some(endpoint) = self.0.nodes.endpoint(&node_id) else {
                 continue;
@@ -583,15 +641,9 @@ impl ApiService {
             else {
                 continue;
             };
-            let listed = resp.into_inner().snapshots;
-            let is_there = listed.iter().any(|snapshot| snapshot.id == id);
-            self.0.snapshots.adopt_remote(listed);
-            if is_there {
-                self.0.snapshots.mark_durable(id);
-            }
-            return is_there;
+            return Some((client, resp.into_inner().snapshots));
         }
-        false
+        None
     }
 
     /// A snapshot this replica has not heard of, asked of every node.
@@ -705,6 +757,7 @@ impl ApiService {
                     template: String::new(),
                     arch: snapshot.arch.clone(),
                     firecracker_version: snapshot.firecracker_version.clone(),
+                    hypervisor: recorded_hypervisor(&snapshot.hypervisor),
                     ..want.clone()
                 };
                 self.place(&want).await.map_err(|err| match err {
@@ -797,6 +850,38 @@ impl ApiService {
     /// `node_id` names the destination outright; otherwise it is placed like
     /// a create, on hardware carrying `node_labels` and able to restore what
     /// the sandbox's state was written on.
+    /// Refuses a node that cannot restore what `want` was written by.
+    fn require_restorer(
+        &self,
+        node_id: &str,
+        sandbox_id: &str,
+        want: &crate::registry::Placement,
+    ) -> Result<(), Status> {
+        let info = self
+            .0
+            .nodes
+            .info(node_id)
+            .ok_or_else(|| Status::not_found(format!("no node {node_id}")))?;
+        if crate::registry::can_restore(
+            &info,
+            &want.arch,
+            &want.hypervisor,
+            &want.firecracker_version,
+        ) {
+            return Ok(());
+        }
+        Err(Status::failed_precondition(format!(
+            "node {node_id} cannot restore sandbox {sandbox_id}: its state needs {} and {} {}, \
+             and the node has {} with {} {}",
+            want.arch,
+            want.hypervisor,
+            want.firecracker_version,
+            info.arch,
+            want.hypervisor,
+            crate::registry::version_of(&info, &want.hypervisor),
+        )))
+    }
+
     async fn adopt(
         &self,
         sandbox: common::Sandbox,
@@ -815,21 +900,7 @@ impl ApiService {
             let placed = self.place_guard(&target, &want);
             (target, Some(placed))
         } else {
-            let info = self
-                .0
-                .nodes
-                .info(node_id)
-                .ok_or_else(|| Status::not_found(format!("no node {node_id}")))?;
-            if (!want.arch.is_empty() && info.arch != want.arch)
-                || (!want.firecracker_version.is_empty()
-                    && info.firecracker_version != want.firecracker_version)
-            {
-                return Err(Status::failed_precondition(format!(
-                    "node {node_id} cannot restore sandbox {}: its state needs {} and \
-                     Firecracker {}",
-                    sandbox.id, want.arch, want.firecracker_version
-                )));
-            }
+            self.require_restorer(node_id, &sandbox.id, &want)?;
             self.require_labels(node_id, &want.node_labels)?;
             (node_id.to_string(), None)
         };
@@ -855,17 +926,77 @@ impl ApiService {
             placed.keep();
         }
         self.0.sandboxes.insert(adopted.clone());
-        // Written through before the caller hears of it, so their next call
-        // finds the sandbox here whichever replica it reaches.
-        if let Some(writer) = self.0.sandboxes.writer() {
-            writer.flush().await;
-        }
+        self.write_through().await;
         tracing::info!(
             sandbox = adopted.id,
             node = target,
             "sandbox adopted from the object store"
         );
         Ok(adopted)
+    }
+
+    /// Gives a sandbox whose move failed at the target back to the node it
+    /// left, returning the error the caller hears either way.
+    ///
+    /// The source had it running a moment ago and can restore what it just
+    /// wrote, so without this a target that fails strands a running sandbox
+    /// as a suspended one nobody holds. Only when the target's answer says it
+    /// let go: see [`target_let_go`].
+    async fn hand_back(
+        &self,
+        released: common::Sandbox,
+        source: &str,
+        target: &str,
+        err: Status,
+    ) -> Status {
+        let id = released.id.clone();
+        let failed = format!(
+            "moving sandbox {id} to node {target} failed: {}",
+            err.message()
+        );
+        if !target_let_go(&err) {
+            return Status::new(
+                err.code(),
+                format!(
+                    "{failed}; node {target} may still be taking it up, so it is left in the \
+                     object store, and `burrow start` places it"
+                ),
+            );
+        }
+        // The failed attempt's claim on placing the sandbox is released by a
+        // queued write, which has to land before this attempt claims again.
+        self.write_through().await;
+        match self.adopt(released, source, HashMap::new()).await {
+            Ok(_) => {
+                tracing::warn!(
+                    sandbox = id,
+                    source,
+                    target,
+                    err = err.message(),
+                    "move failed at the target; the sandbox is back on its source"
+                );
+                Status::new(err.code(), format!("{failed}; it is back on node {source}"))
+            }
+            Err(back) => Status::new(
+                err.code(),
+                format!(
+                    "{failed}, and handing it back to node {source} failed too: {}; it is \
+                     suspended in the object store, and `burrow start` places it",
+                    back.message()
+                ),
+            ),
+        }
+    }
+
+    /// Waits for this replica's queued writes to reach the store.
+    ///
+    /// Called before answering a call that made a sandbox exist, go, or
+    /// change hands: the caller's next call may reach another replica, which
+    /// reads the store, and its claim on a name lands before the row does.
+    async fn write_through(&self) {
+        if let Some(writer) = self.0.sandboxes.writer() {
+            writer.flush().await;
+        }
     }
 
     /// What a node needs to take up `sandbox` from the object store.
@@ -900,6 +1031,7 @@ impl ApiService {
             node_labels,
             arch: sandbox.arch.clone(),
             firecracker_version: sandbox.firecracker_version.clone(),
+            hypervisor: recorded_hypervisor(&sandbox.hypervisor),
         }
     }
 
@@ -1098,6 +1230,7 @@ impl Burrow for ApiService {
                 .into_inner();
             self.0.sandboxes.insert(sandbox.clone());
             drop(reserved);
+            self.write_through().await;
             tracing::info!(
                 sandbox = sandbox.id,
                 snapshot = snapshot.id,
@@ -1150,6 +1283,8 @@ impl Burrow for ApiService {
             node_labels: req.node_labels,
             arch: String::new(),
             firecracker_version: String::new(),
+            // The template decides, and the node holding it can say which.
+            hypervisor: self.template_hypervisor(&template).await?,
         };
         // A mounted volume fixes the node, so placement is not a choice: it is
         // a check that the node holding the volumes can take the sandbox.
@@ -1170,6 +1305,19 @@ impl Burrow for ApiService {
             Some(node_id) => {
                 charged = false;
                 self.require_labels(&node_id, &want.node_labels)?;
+                if !want.hypervisor.is_empty()
+                    && !self
+                        .0
+                        .nodes
+                        .info(&node_id)
+                        .is_some_and(|info| crate::registry::offers(&info, &want.hypervisor))
+                {
+                    return Err(Status::failed_precondition(format!(
+                        "the requested volumes are on node {node_id}, which does not offer {}, \
+                         the hypervisor template {template} runs under",
+                        want.hypervisor
+                    )));
+                }
                 if self.0.nodes.endpoint(&node_id).is_none() {
                     return Err(Status::failed_precondition(format!(
                         "the requested volumes are on node {node_id}, which is unreachable; \
@@ -1196,7 +1344,8 @@ impl Burrow for ApiService {
                             Status::resource_exhausted(err.to_string())
                         }
                         crate::registry::PlacementError::PeersUnreachable(_)
-                        | crate::registry::PlacementError::NoNodeWithLabels(_) => {
+                        | crate::registry::PlacementError::NoNodeWithLabels(_)
+                        | crate::registry::PlacementError::NoNodeWithHypervisor(_) => {
                             Status::failed_precondition(err.to_string())
                         }
                         other => Status::not_found(other.to_string()),
@@ -1247,6 +1396,7 @@ impl Burrow for ApiService {
         // The registry now holds the sandbox, so the id no longer needs
         // holding open on its behalf.
         drop(reserved);
+        self.write_through().await;
         // The node's record is the truth rather than the request: it carries
         // the state and addresses the node actually assigned.
         tracing::info!(sandbox = sandbox.id, node = node_id, "sandbox placed");
@@ -1258,11 +1408,13 @@ impl Burrow for ApiService {
         req: Request<api::SandboxRef>,
     ) -> Result<Response<common::Sandbox>, Status> {
         let id = self.resolve(&req.into_inner().id).await;
-        let mut sandbox = self
-            .0
-            .sandboxes
-            .get(&id)
-            .ok_or_else(|| Status::not_found(format!("no sandbox {id}")))?;
+        // Read through beside other replicas: a caller reading back what it
+        // just did through one of them must not see the state from before.
+        let sandbox = match self.is_replicated() {
+            true => self.0.sandboxes.refresh(&id).await,
+            false => self.0.sandboxes.get(&id),
+        };
+        let mut sandbox = sandbox.ok_or_else(|| Status::not_found(format!("no sandbox {id}")))?;
         // The registry holds the last state the node reported, which is a stale
         // guess once that node stops heartbeating.
         sandbox.is_unreachable = !sandbox.node_id.is_empty() && self.is_node_dead(&sandbox.node_id);
@@ -1278,8 +1430,20 @@ impl Burrow for ApiService {
         &self,
         req: Request<api::ListSandboxesRequest>,
     ) -> Result<Response<api::ListSandboxesResponse>, Status> {
+        let arrived = std::time::Instant::now();
         let filter = req.into_inner().tag;
         let filter = burrow_common::tags::parse_filter(&filter)?;
+        // As for a single sandbox: the reload loop is up to a second behind
+        // the other replicas, and a listing right after a create or a delete
+        // through one of them would contradict it. A reload that started
+        // after this call arrived is as good as one of its own.
+        if self.is_replicated() {
+            self.0
+                .sandboxes
+                .reload_since(arrived)
+                .await
+                .map_err(|err| Status::unavailable(format!("reading placements: {err}")))?;
+        }
         let healthy = self.0.nodes.healthy_ids();
         let mut sandboxes = self.0.sandboxes.list_tagged(filter);
         for sandbox in &mut sandboxes {
@@ -1294,12 +1458,16 @@ impl Burrow for ApiService {
         req: Request<api::SandboxRef>,
     ) -> Result<Response<api::DeleteSandboxResponse>, Status> {
         let id = self.resolve(&req.into_inner().id).await;
-        let node_id = self.node_of(&id)?;
+        // Not the cached placement: a move through another replica that
+        // failed half way leaves this one naming the node that let go, and
+        // the delete would go there and be told no node holds the sandbox.
+        let node_id = self.holder(&id).await?;
         // Nothing on any node to destroy, so no tombstone either: the stored
         // state is all there is.
         if node_id.is_empty() {
             self.purge(&id).await?;
             self.0.sandboxes.remove(&id);
+            self.write_through().await;
             return Ok(Response::new(api::DeleteSandboxResponse {}));
         }
         let mut client = match self.node_for(&id).await {
@@ -1325,6 +1493,7 @@ impl Burrow for ApiService {
                     "node is unreachable; forgetting the sandbox and recording a \
                      tombstone. It will be destroyed if the node returns"
                 );
+                self.write_through().await;
                 return Ok(Response::new(api::DeleteSandboxResponse {}));
             }
             Err(err) => return Err(err),
@@ -1338,6 +1507,7 @@ impl Burrow for ApiService {
         if let Some(sandbox) = self.0.sandboxes.remove(&id) {
             self.release_charge(&sandbox);
         }
+        self.write_through().await;
         Ok(Response::new(api::DeleteSandboxResponse {}))
     }
 
@@ -1587,6 +1757,7 @@ impl Burrow for ApiService {
             .into_inner();
 
         self.0.sandboxes.insert(sandbox.clone());
+        self.write_through().await;
         tracing::info!(
             source = source_id,
             sandbox = child_id,
@@ -1641,8 +1812,9 @@ impl Burrow for ApiService {
         }
         if current.arch.is_empty() {
             let info = self.0.nodes.info(&source).unwrap_or_default();
+            current.firecracker_version =
+                crate::registry::version_of(&info, &current.hypervisor).to_string();
             current.arch = info.arch;
-            current.firecracker_version = info.firecracker_version;
         }
         // The destination is chosen before anything is suspended, so a move
         // that has nowhere to go leaves the sandbox running where it is.
@@ -1660,6 +1832,11 @@ impl Burrow for ApiService {
                 req.node_id
             )));
         } else {
+            // Checked here, before the source lets go: the adoption below
+            // would refuse the same node only once nothing held the sandbox.
+            let want = self.adoption_placement(&current, req.node_labels.clone());
+            self.require_restorer(&req.node_id, &id, &want)?;
+            self.require_labels(&req.node_id, &want.node_labels)?;
             None
         };
         let target = placed
@@ -1685,7 +1862,10 @@ impl Burrow for ApiService {
             released.firecracker_version = current.firecracker_version;
         }
         tracing::info!(sandbox = id, node = source, "sandbox released for a move");
-        let moved = self.adopt(released, &target, req.node_labels).await?;
+        let moved = match self.adopt(released.clone(), &target, req.node_labels).await {
+            Ok(moved) => moved,
+            Err(err) => return Err(self.hand_back(released, &source, &target, err).await),
+        };
         if let Some((_, guard)) = placed {
             guard.keep();
         }
@@ -1761,17 +1941,66 @@ impl Burrow for ApiService {
             .ok_or_else(|| Status::not_found(format!("no snapshot {id}")))
     }
 
+    /// Deletes through the node holding the snapshot or, with no holder
+    /// reachable, through any node that can reach the object store: deleting
+    /// stored data needs no particular host, unlike restoring it.
     async fn delete_snapshot(
         &self,
         req: Request<api::SnapshotRef>,
     ) -> Result<Response<api::DeleteSnapshotResponse>, Status> {
         let id = req.into_inner().id;
-        let (_, _, mut client) = self
-            .node_for_snapshot(&id, &crate::registry::Placement::default())
-            .await?;
-        client
+        // A replica that has not re-read the store since the snapshot lost its
+        // holder is asked to delete what it does not yet list.
+        if self.snapshot(&id).await.is_none() {
+            self.refresh_durable(&id).await;
+        }
+        let snapshot = self
+            .0
+            .snapshots
+            .get(&id)
+            .ok_or_else(|| Status::not_found(format!("no snapshot {id}")))?;
+        let holder = (!snapshot.node_id.is_empty())
+            .then(|| self.0.nodes.endpoint(&snapshot.node_id))
+            .flatten();
+        let mut client = match holder {
+            Some(endpoint) => self
+                .0
+                .channels
+                .get(&endpoint, self.0.node_token.as_deref())
+                .await
+                .map_err(|err| {
+                    Status::unavailable(format!("cannot reach node {}: {err}", snapshot.node_id))
+                })?,
+            None if snapshot.is_durable => {
+                let (client, listed) = self.store_node().await.ok_or_else(|| {
+                    Status::unavailable("no healthy node can reach the object store")
+                })?;
+                if !listed.iter().any(|stored| stored.id == id) {
+                    // Deleted already, through another replica: the record
+                    // this one kept is the only trace, and reconciling drops it.
+                    self.0.snapshots.reconcile_remote(listed);
+                    return Ok(Response::new(api::DeleteSnapshotResponse {}));
+                }
+                client
+            }
+            None => {
+                return Err(Status::failed_precondition(format!(
+                    "snapshot {id} lives on node {}, which is unreachable, and is not in the \
+                     object store",
+                    snapshot.node_id
+                )));
+            }
+        };
+        match client
             .delete_snapshot(api::SnapshotRef { id: id.clone() })
-            .await?;
+            .await
+        {
+            Ok(_) => {}
+            // The node holds no copy and the store none either, so the record
+            // outlived the snapshot and dropping it is the whole delete.
+            Err(status) if status.code() == tonic::Code::NotFound => {}
+            Err(status) => return Err(status),
+        }
         // Only after the node has actually removed it: a record dropped on a
         // failed delete would leave disk nothing ever reclaims.
         self.0.snapshots.remove(&id);
@@ -1807,6 +2036,7 @@ impl Burrow for ApiService {
             node_labels: req.node_labels.clone(),
             arch: String::new(),
             firecracker_version: String::new(),
+            hypervisor: String::new(),
         };
         let node_id = self.place(&want).await.map_err(|err| match err {
             crate::registry::PlacementError::NoHealthyNode
@@ -2550,9 +2780,7 @@ impl Burrow for ApiService {
             sandbox.access_revoked_at = burrow_common::unix_now();
             let revoked_at = sandbox.access_revoked_at;
             self.0.sandboxes.insert(sandbox);
-            if let Some(writer) = self.0.sandboxes.writer() {
-                writer.flush().await;
-            }
+            self.write_through().await;
             tracing::info!(sandbox = id, "access tokens revoked");
             return Ok(Response::new(api::RevokeAccessResponse {
                 revoked_at,
@@ -2679,10 +2907,31 @@ fn placement_status(err: crate::registry::PlacementError) -> Status {
         }
         crate::registry::PlacementError::PeersUnreachable(_)
         | crate::registry::PlacementError::NoNodeWithLabels(_)
+        | crate::registry::PlacementError::NoNodeWithHypervisor(_)
         | crate::registry::PlacementError::NoCompatibleNode { .. } => {
             Status::failed_precondition(err.to_string())
         }
         other => Status::not_found(other.to_string()),
+    }
+}
+
+/// A record's hypervisor, for placement. Empty is a record from before the
+/// field existed, which ran under Firecracker.
+fn recorded_hypervisor(name: &str) -> String {
+    match name {
+        "" => "firecracker".to_string(),
+        name => name.to_string(),
+    }
+}
+
+/// The hypervisor a template's `image.json` records: the one it was built
+/// for, or its guest's default where it names none.
+fn configured_hypervisor(image_config: &str) -> String {
+    let config: serde_json::Value = serde_json::from_str(image_config).unwrap_or_default();
+    match config["hypervisor"].as_str() {
+        Some(name) if !name.is_empty() => name.to_string(),
+        _ if config["guest_os"] == "windows" => "cloud-hypervisor".to_string(),
+        _ => "firecracker".to_string(),
     }
 }
 
@@ -2784,9 +3033,124 @@ fn validate_name(name: &str) -> Result<(), Status> {
     Ok(())
 }
 
+/// Whether a failed adopt left the target holding nothing.
+///
+/// A node that answered has either never claimed the stored state or handed
+/// the claim back before answering. A call that timed out, was cut off, or
+/// broke in transport may still be running on the target, and restoring the
+/// sandbox elsewhere as well would run it twice; tonic reports a connection
+/// dropped after the request went out as unavailable, so that code is no
+/// proof either. Already exists means the target holds the sandbox, or is
+/// taking it up for an earlier attempt. An abort is another start placing it.
+fn target_let_go(err: &Status) -> bool {
+    !matches!(
+        err.code(),
+        tonic::Code::Aborted
+            | tonic::Code::AlreadyExists
+            | tonic::Code::Cancelled
+            | tonic::Code::DeadlineExceeded
+            | tonic::Code::Unavailable
+            | tonic::Code::Unknown
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// What a template was built for decides placement, and a template
+    /// from before the choice existed is a Firecracker one.
+    #[test]
+    fn a_templates_hypervisor_is_read_from_its_config() {
+        assert_eq!(
+            configured_hypervisor(r#"{"env":[],"hypervisor":"cloud-hypervisor"}"#),
+            "cloud-hypervisor"
+        );
+        assert_eq!(configured_hypervisor(r#"{"env":[]}"#), "firecracker");
+        assert_eq!(configured_hypervisor(""), "firecracker");
+        assert_eq!(
+            configured_hypervisor(r#"{"guest_os":"windows"}"#),
+            "cloud-hypervisor"
+        );
+        assert_eq!(recorded_hypervisor(""), "firecracker");
+    }
+
+    fn replica(sandboxes: crate::sandboxes::SandboxRegistry) -> ApiService {
+        ApiService(Arc::new(OrchestratorState {
+            nodes: crate::registry::NodeRegistry::default(),
+            sandboxes,
+            store: None,
+            leader: crate::leader::Leader::spawn(None),
+            control_plane_hosts: std::sync::Mutex::new(vec!["a".into(), "b".into()]),
+            events: crate::events::EventLog::new(None),
+            secrets: None,
+            access: None,
+            access_trusted: Vec::new(),
+            snapshots: crate::snapshots::SnapshotRegistry::default(),
+            volumes: crate::volumes::VolumeRegistry::default(),
+            channels: NodeChannels::default(),
+            node_token: None,
+            sandbox_lease_secs: 0,
+        }))
+    }
+
+    /// A move that failed at its target leaves the sandbox unplaced in the
+    /// store, but a replica that did not run the move can still cache the
+    /// node that let go. Its delete went to that node, was told no node holds
+    /// the sandbox, and never purged the stored state.
+    #[tokio::test]
+    async fn a_delete_purges_a_sandbox_another_replica_left_unplaced() {
+        let store = Arc::new(burrow_store::Store::open_in_memory().await.unwrap());
+        let mover = crate::sandboxes::SandboxRegistry::with_store(Arc::clone(&store)).await;
+        let stale = crate::sandboxes::SandboxRegistry::with_store(Arc::clone(&store)).await;
+        let placed = common::Sandbox {
+            id: "sbx_a".into(),
+            node_id: "node1".into(),
+            state: common::SandboxState::Suspended as i32,
+            is_durable: true,
+            ..Default::default()
+        };
+        mover.insert(placed.clone());
+        mover.writer().unwrap().flush().await;
+        assert_eq!(stale.refresh("sbx_a").await.unwrap().node_id, "node1");
+        mover.unplace(placed);
+        mover.writer().unwrap().flush().await;
+
+        let err = replica(stale)
+            .delete_sandbox(Request::new(api::SandboxRef { id: "sbx_a".into() }))
+            .await
+            .expect_err("no node to purge through in a test");
+        // The purge is what fails here, for want of a node to reach the store
+        // through, rather than the routing to a node that has let go.
+        assert_eq!(err.code(), tonic::Code::Unavailable, "{err}");
+        assert!(err.message().contains("stored state"), "{err}");
+    }
+
+    /// A move whose target failed used to leave the sandbox suspended in the
+    /// object store with no node holding it, though its source had it running.
+    /// It goes back to the source when the target's answer says the target let
+    /// go, and is left alone when the target may still be taking it up.
+    #[test]
+    fn a_failed_move_is_handed_back_only_when_the_target_let_go() {
+        for code in [
+            tonic::Code::Internal,
+            tonic::Code::FailedPrecondition,
+            tonic::Code::NotFound,
+            tonic::Code::ResourceExhausted,
+        ] {
+            assert!(target_let_go(&Status::new(code, "")), "{code:?}");
+        }
+        for code in [
+            tonic::Code::Aborted,
+            tonic::Code::AlreadyExists,
+            tonic::Code::Unavailable,
+            tonic::Code::Cancelled,
+            tonic::Code::DeadlineExceeded,
+            tonic::Code::Unknown,
+        ] {
+            assert!(!target_let_go(&Status::new(code, "")), "{code:?}");
+        }
+    }
 
     #[test]
     fn secret_references_substitute_in_place() {

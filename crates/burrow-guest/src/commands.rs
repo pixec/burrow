@@ -17,6 +17,9 @@
 //!
 //! Output is counted by offset, stdout and stderr bytes together from the
 //! command's start, which is what lets a reader resume exactly.
+//!
+//! Nothing here is specific to an OS. How a command is signalled is: each
+//! platform registers a command with a [`Signaller`] for it.
 
 #![allow(clippy::result_large_err)]
 
@@ -182,6 +185,23 @@ fn feed_wake() -> &'static Notify {
     WAKE.get_or_init(Notify::new)
 }
 
+/// How a running command is signalled, by whatever the platform holds of it.
+pub trait Signaller: Send + Sync {
+    /// Delivers `signal`, a Linux signal number, to the command and what it
+    /// started.
+    fn signal(&self, signal: i32) -> Result<(), SignalError>;
+}
+
+pub enum SignalError {
+    /// A signal this platform cannot deliver: why.
+    Invalid(String),
+    /// The command has nothing of its own a signal could be sent to.
+    NoProcess,
+    /// Nothing of the command is left to signal: the platform's own error.
+    Gone(String),
+    Failed(String),
+}
+
 /// Which feed is current. A new one replaces the last, which notices and ends.
 static FEED_EPOCH: AtomicU64 = AtomicU64::new(0);
 
@@ -190,6 +210,9 @@ struct Entry {
     cmd: Vec<String>,
     user: String,
     pid: i32,
+    /// What signals the command; `None` when there is nothing of its own to
+    /// signal.
+    signaller: Option<Arc<dyn Signaller>>,
     started_at_ms: i64,
     ended_at_ms: i64,
     exit_code: Option<i32>,
@@ -206,12 +229,20 @@ struct Entry {
 }
 
 impl Entry {
-    fn new(id: String, cmd: Vec<String>, user: String, pid: i32, rotation: Rotation) -> Self {
+    fn new(
+        id: String,
+        cmd: Vec<String>,
+        user: String,
+        pid: i32,
+        signaller: Option<Arc<dyn Signaller>>,
+        rotation: Rotation,
+    ) -> Self {
         Self {
             id,
             cmd,
             user,
             pid,
+            signaller,
             started_at_ms: now_ms(),
             ended_at_ms: 0,
             exit_code: None,
@@ -336,9 +367,22 @@ impl Handle {
 }
 
 /// Registers a command that has just been spawned.
-pub fn register(cmd: Vec<String>, user: String, pid: i32, rotation: Rotation) -> Handle {
+pub fn register(
+    cmd: Vec<String>,
+    user: String,
+    pid: i32,
+    signaller: Option<Arc<dyn Signaller>>,
+    rotation: Rotation,
+) -> Handle {
     let id = next_id();
-    let entry = Arc::new(Mutex::new(Entry::new(id.clone(), cmd, user, pid, rotation)));
+    let entry = Arc::new(Mutex::new(Entry::new(
+        id.clone(),
+        cmd,
+        user,
+        pid,
+        signaller,
+        rotation,
+    )));
     let mut registry = registry().lock().unwrap();
     registry.order.push_back(id.clone());
     registry.entries.insert(id.clone(), Arc::clone(&entry));
@@ -377,8 +421,8 @@ fn entry(id: &str) -> Result<Arc<Mutex<Entry>>, Status> {
         .ok_or_else(|| Status::not_found(format!("no such command: {id}")))
 }
 
-/// Whether any command is still running. An upgrade re-executes the agent,
-/// and a running command's pipes and pty would not survive that.
+/// Whether any command is still running. An upgrade replaces the agent's
+/// process, and a running command's pipes and terminal would not survive that.
 pub fn has_running() -> bool {
     registry()
         .lock()
@@ -404,36 +448,33 @@ pub fn get(id: &str) -> Result<guestpb::CommandInfo, Status> {
     Ok(entry(id)?.lock().unwrap().info())
 }
 
-/// Signals a command's process group: the command and whatever it started.
+/// Signals a command and whatever it started, through its [`Signaller`].
 ///
-/// A command that has exited may have left children in its group, and they
-/// are signalled too. That is safe because a group's id cannot be handed to
-/// another process while anything is still in the group. With nothing left
-/// in it, the command is reported as already exited.
+/// A command that has exited may have left processes behind, and they are
+/// signalled too. With nothing left, the command is reported as already
+/// exited.
 pub fn signal(id: &str, signal: i32) -> Result<(), Status> {
     let entry = entry(id)?;
     let entry = entry.lock().unwrap();
     // 0 is the api's "whatever kills it": a caller who did not choose a signal
-    // wants the command gone, not a no-op probe.
-    let signal = if signal == 0 {
-        nix::sys::signal::Signal::SIGKILL
-    } else {
-        nix::sys::signal::Signal::try_from(signal)
-            .map_err(|_| Status::invalid_argument(format!("unknown signal {signal}")))?
+    // wants the command gone, not a no-op probe. SIGKILL's number.
+    let signal = if signal == 0 { 9 } else { signal };
+    let outcome = match &entry.signaller {
+        Some(signaller) => signaller.signal(signal),
+        None => Err(SignalError::NoProcess),
     };
-    // A pid of 1 or less names no group of the command's own: 1 is this
-    // agent, and the rest would reach far more than one command.
-    if entry.pid <= 1 {
-        return Err(Status::failed_precondition(format!(
-            "command {id} has no process to signal"
-        )));
-    }
-    match nix::sys::signal::killpg(nix::unistd::Pid::from_raw(entry.pid), Some(signal)) {
+    match outcome {
         Ok(()) => Ok(()),
-        Err(nix::errno::Errno::ESRCH) if entry.exit_code.is_some() => Err(
-            Status::failed_precondition(format!("command {id} has already exited")),
-        ),
-        Err(err) => Err(Status::internal(format!("signal {id}: {err}"))),
+        Err(SignalError::NoProcess) => Err(Status::failed_precondition(format!(
+            "command {id} has no process to signal"
+        ))),
+        Err(SignalError::Invalid(why)) => Err(Status::invalid_argument(why)),
+        Err(SignalError::Gone(_)) if entry.exit_code.is_some() => Err(Status::failed_precondition(
+            format!("command {id} has already exited"),
+        )),
+        Err(SignalError::Gone(err) | SignalError::Failed(err)) => {
+            Err(Status::internal(format!("signal {id}: {err}")))
+        }
     }
 }
 
@@ -633,7 +674,9 @@ pub fn save(path: &str) -> std::io::Result<()> {
 /// cannot be read is an empty history, not a failed upgrade. An older agent's
 /// table, with each command's output inline rather than pending, still reads:
 /// the output it carries is not sent on, since that agent kept it in the guest.
-pub fn restore(path: &str) {
+///
+/// `signaller` gives a restored command what signals it, from its pid.
+pub fn restore(path: &str, signaller: impl Fn(i32) -> Option<Arc<dyn Signaller>>) {
     let saved = std::fs::read(path)
         .ok()
         .and_then(|bytes| serde_json::from_slice::<Saved>(&bytes).ok());
@@ -647,6 +690,7 @@ pub fn restore(path: &str) {
             saved.cmd,
             saved.user,
             saved.pid,
+            signaller(saved.pid),
             Rotation::default(),
         );
         entry.started_at_ms = saved.started_at_ms;
@@ -672,6 +716,15 @@ pub fn restore(path: &str) {
 mod tests {
     use super::*;
 
+    /// Held by every test here. The registry and the feed are one for the
+    /// process: a prune removes every finished command, and an ack releases
+    /// by sequence number across every command, so tests running at once
+    /// would take each other's commands and frames.
+    fn serial() -> std::sync::MutexGuard<'static, ()> {
+        static LOCK: Mutex<()> = Mutex::new(());
+        LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
     fn pending_for(id: &str) -> Vec<Pending> {
         feed_buffer()
             .lock()
@@ -687,11 +740,12 @@ mod tests {
     /// on the first frame only.
     #[test]
     fn output_goes_on_the_feed_with_its_offsets() {
+        let _serial = serial();
         let rotation = Rotation {
             max_bytes: 20 << 20,
             max_files: 5,
         };
-        let handle = register(vec!["sh".into()], String::new(), -1, rotation);
+        let handle = register(vec!["sh".into()], String::new(), -1, None, rotation);
         handle.record(Frame::Stdout(b"hello ".to_vec()));
         handle.record(Frame::Stderr(b"world".to_vec()));
         handle.finish(3, 0);
@@ -711,7 +765,14 @@ mod tests {
     /// What the host confirms, or already holds, the guest lets go of.
     #[test]
     fn confirmed_output_is_let_go() {
-        let handle = register(vec!["sh".into()], String::new(), -1, Rotation::default());
+        let _serial = serial();
+        let handle = register(
+            vec!["sh".into()],
+            String::new(),
+            -1,
+            None,
+            Rotation::default(),
+        );
         handle.record(Frame::Stdout(b"aaaa".to_vec()));
         handle.record(Frame::Stdout(b"bbbb".to_vec()));
         let logged = HashMap::from([(handle.id().to_string(), 4u64)]);
@@ -727,7 +788,14 @@ mod tests {
     /// A command a signal ended reports the signal, then the shell-style code.
     #[test]
     fn a_signalled_exit_names_its_signal() {
-        let handle = register(vec!["sleep".into()], String::new(), -1, Rotation::default());
+        let _serial = serial();
+        let handle = register(
+            vec!["sleep".into()],
+            String::new(),
+            -1,
+            None,
+            Rotation::default(),
+        );
         handle.finish(137, 9);
         let pending = pending_for(handle.id());
         assert_eq!((pending[0].code, pending[0].signal), (137, 9));
@@ -738,9 +806,22 @@ mod tests {
     /// commands alone.
     #[test]
     fn pruning_names_the_finished_commands_it_removes() {
-        let done = register(vec!["true".into()], String::new(), -1, Rotation::default());
+        let _serial = serial();
+        let done = register(
+            vec!["true".into()],
+            String::new(),
+            -1,
+            None,
+            Rotation::default(),
+        );
         done.finish(0, 0);
-        let running = register(vec!["sleep".into()], String::new(), -1, Rotation::default());
+        let running = register(
+            vec!["sleep".into()],
+            String::new(),
+            -1,
+            None,
+            Rotation::default(),
+        );
         let pruned = prune();
         assert!(pruned.command_ids.contains(&done.id().to_string()));
         assert!(!pruned.command_ids.contains(&running.id().to_string()));
@@ -748,8 +829,55 @@ mod tests {
         assert_eq!(get(running.id()).unwrap().state, "running");
     }
 
+    struct Recorder(Mutex<Vec<i32>>);
+
+    impl Signaller for Recorder {
+        fn signal(&self, signal: i32) -> Result<(), SignalError> {
+            match signal {
+                10 => Err(SignalError::Invalid("no".into())),
+                15 => Err(SignalError::Gone("gone".into())),
+                _ => {
+                    self.0.lock().unwrap().push(signal);
+                    Ok(())
+                }
+            }
+        }
+    }
+
+    /// 0 means kill; what the platform cannot deliver is the caller's error,
+    /// and what it finds gone is only "exited" once the command has.
+    #[test]
+    fn signals_go_to_the_signaller() {
+        let _serial = serial();
+        let recorder = Arc::new(Recorder(Mutex::default()));
+        let handle = register(
+            vec!["x".into()],
+            String::new(),
+            -1,
+            Some(recorder.clone()),
+            Rotation::default(),
+        );
+        signal(handle.id(), 0).unwrap();
+        signal(handle.id(), 2).unwrap();
+        assert_eq!(*recorder.0.lock().unwrap(), [9, 2]);
+        assert_eq!(
+            signal(handle.id(), 10).unwrap_err().code(),
+            tonic::Code::InvalidArgument
+        );
+        assert_eq!(
+            signal(handle.id(), 15).unwrap_err().code(),
+            tonic::Code::Internal
+        );
+        handle.finish(0, 0);
+        assert_eq!(
+            signal(handle.id(), 15).unwrap_err().code(),
+            tonic::Code::FailedPrecondition
+        );
+    }
+
     #[test]
     fn an_unknown_command_is_not_found() {
+        let _serial = serial();
         assert_eq!(get("cmd_nope").unwrap_err().code(), tonic::Code::NotFound);
         assert_eq!(
             signal("cmd_nope", 15).unwrap_err().code(),
@@ -761,7 +889,14 @@ mod tests {
     /// whatever pid the kernel has since handed out.
     #[test]
     fn a_finished_command_is_not_signalled() {
-        let handle = register(vec!["true".into()], String::new(), -1, Rotation::default());
+        let _serial = serial();
+        let handle = register(
+            vec!["true".into()],
+            String::new(),
+            -1,
+            None,
+            Rotation::default(),
+        );
         handle.finish(0, 0);
         assert_eq!(
             signal(handle.id(), 15).unwrap_err().code(),

@@ -479,7 +479,7 @@ async fn inventory(state: &OrchestratorState, node_id: &str, client: &mut crate:
         Err(err) => tracing::warn!(node_id, %err, "node snapshot inventory unavailable"),
     }
     // What the object store holds, as this node sees it. Any node with the
-    // store configured answers the same, and one without answers nothing.
+    // store configured answers the same, and one without refuses.
     match client
         .list_durable_snapshots(nodepb::NodeListSnapshotsRequest {
             sandbox_id: String::new(),
@@ -487,11 +487,19 @@ async fn inventory(state: &OrchestratorState, node_id: &str, client: &mut crate:
         .await
     {
         Ok(resp) => {
-            let adopted = state.snapshots.adopt_remote(resp.into_inner().snapshots);
-            if adopted > 0 {
-                tracing::info!(node_id, adopted, "adopted snapshots from the object store");
+            let (adopted, forgotten) = state
+                .snapshots
+                .reconcile_remote(resp.into_inner().snapshots);
+            if adopted > 0 || forgotten > 0 {
+                tracing::info!(
+                    node_id,
+                    adopted,
+                    forgotten,
+                    "reconciled snapshots with the object store"
+                );
             }
         }
+        Err(err) if err.code() == tonic::Code::FailedPrecondition => {}
         Err(err) => tracing::warn!(node_id, %err, "object store snapshot inventory unavailable"),
     }
 
@@ -598,10 +606,7 @@ async fn reap_dead_nodes(state: Arc<OrchestratorState>, expiry: Option<std::time
         }
         for node_id in expiry.map(|e| state.nodes.expired(e)).unwrap_or_default() {
             let info = state.nodes.info(&node_id).unwrap_or_default();
-            let (dropped, unplaced) =
-                state
-                    .sandboxes
-                    .forget_node(&node_id, &info.arch, &info.firecracker_version);
+            let (dropped, unplaced) = state.sandboxes.forget_node(&node_id, &info);
             if let Some(store) = &state.store
                 && let Err(err) = store.delete_node(&node_id).await
             {

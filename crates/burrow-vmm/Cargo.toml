@@ -1,0 +1,35 @@
+[package]
+name = "burrow-vmm"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+tokio = { workspace = true }
+hyper = { workspace = true }
+hyper-util = { workspace = true }
+http-body-util = { workspace = true }
+bytes = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+nix = { workspace = true, features = ["sched", "user"] }
+libc = { workspace = true }
+
+# The page-fault handler is Linux-only; keeping it off the default target lets
+# `cargo build` still work on a macOS dev machine.
+[target.'cfg(target_os = "linux")'.dependencies]
+userfaultfd = { workspace = true }
+
+# Virtualization.framework, for macOS guests on a Mac node.
+[target.'cfg(target_os = "macos")'.dependencies]
+objc2 = "0.6"
+objc2-foundation = { version = "0.3", default-features = false, features = ["std", "NSError", "NSString", "NSURL", "NSArray", "NSData", "NSProgress", "NSFileHandle"] }
+objc2-virtualization = { version = "0.3", features = ["block2", "dispatch2"] }
+block2 = "0.6"
+dispatch2 = "0.3"
+
+[target.'cfg(target_os = "macos")'.dev-dependencies]
+objc2-app-kit = { version = "0.3", default-features = false, features = ["std", "NSApplication", "NSWindow", "NSView", "NSResponder", "NSGraphics", "NSRunningApplication"] }
+objc2-virtualization = { version = "0.3", features = ["block2", "dispatch2", "objc2-app-kit"] }

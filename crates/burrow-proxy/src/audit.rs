@@ -84,7 +84,12 @@ pub struct AuditLog {
     /// Records dropped since each sandbox's last successful one.
     dropped: Arc<Mutex<HashMap<String, u64>>>,
     waiters: Arc<tokio::sync::Semaphore>,
+    /// Shown every record as it is made, before the queue can drop it.
+    observer: Option<Observer>,
 }
+
+/// A callback shown every audit record.
+pub type Observer = Arc<dyn Fn(&EgressEvent) + Send + Sync>;
 
 impl AuditLog {
     /// Writes to a JSON-lines file, and to a store when one is given.
@@ -132,7 +137,17 @@ impl AuditLog {
             allowed,
             dropped: Arc::new(Mutex::new(HashMap::new())),
             waiters: Arc::new(tokio::sync::Semaphore::new(REFUSAL_WAITERS)),
+            observer: None,
         }
+    }
+
+    /// The same log, also showing every record to `observer` as it is made.
+    ///
+    /// For an embedder that reports flows somewhere of its own, and for tests
+    /// that need to see a decision without reading the file back.
+    pub fn observed(mut self, observer: Observer) -> Self {
+        self.observer = Some(observer);
+        self
     }
 
     pub fn record(&self, mut event: EgressEvent) {
@@ -149,6 +164,9 @@ impl AuditLog {
         // one, so the gap is visible to whoever reads the log. Taken before
         // the send, and put back if this record is itself dropped.
         event.dropped_records = self.take_dropped(&event.sandbox_id);
+        if let Some(observer) = &self.observer {
+            observer(&event);
+        }
 
         let queue = if event.is_allowed {
             &self.allowed
@@ -299,6 +317,7 @@ mod tests {
                 allowed,
                 dropped: Arc::new(Mutex::new(HashMap::new())),
                 waiters: Arc::new(tokio::sync::Semaphore::new(REFUSAL_WAITERS)),
+                observer: None,
             },
             refusal_rx,
             allowed_rx,

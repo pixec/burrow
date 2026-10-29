@@ -107,13 +107,16 @@ kernel between a sandbox and the host, and none between two sandboxes.
 Confinement goes one step further with `burrowd serve --jailer <path>`, which
 chroots each Firecracker process into that sandbox's own directory and drops it
 to `--jail-uid` (default `65534`). It then holds no root and sees no filesystem
-outside the one sandbox. The flag is off by default because it needs a uid to
+outside the one sandbox. Cloud Hypervisor, which has no jailer, gets the same
+from a jail burrowd builds for it under the same flag: its own namespaces, a
+root holding only that sandbox's directory and two device nodes, the jail uid
+with no capabilities, and its own Landlock and seccomp filter on. The flag is off by default because it needs a uid to
 drop to and a writable chroot base, and it is what should be on wherever
 sandboxes share a host with anything that matters.
 
 CPU and memory are capped with cgroup v2 (`cpu.max` and `memory.max`) under
-`--cgroup-root`, default `/sys/fs/cgroup`. Limits are applied by pid between
-spawn and start, so a guest never runs even briefly uncapped, and
+`--cgroup-root`, default `/sys/fs/cgroup`. The VMM joins its cgroup before it
+execs, so neither it nor a guest ever runs even briefly uncapped, and
 `--require-resource-limits` makes a sandbox whose limits cannot be applied fail
 to start rather than run without them. `vcpu_count` decides how many vCPU
 threads exist, not how much host CPU they consume, so `cpu.max` is what stops

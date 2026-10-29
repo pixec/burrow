@@ -311,12 +311,24 @@ burrowd serve ... --object-store s3://bucket/prefix \
 
 ### One sandbox, one node
 
-A sandbox must never run in two places, and two things make sure of it.
+A sandbox must never run in two places, and three things make sure of it.
 
 - **The store says where it runs.** A node records a sandbox as running in the
   store *before* it resumes the guest, and a node adopting a sandbox refuses
   one the store says is running. So a node that resumed a sandbox and then
   died leaves a copy nobody will resume in its place.
+- **Taking it is one conditional write.** Every write that hands the sandbox
+  to a node (an adopt, a resume, an upload after a suspend, a failed adopt
+  handing it back) is conditional on the version of the manifest it was
+  decided on: `If-Match` on its ETag, or `If-None-Match` for the first. Two
+  nodes that both read it suspended, a move racing a start say, cannot both
+  take it: one write lands, and the other is refused with `Aborted`, naming
+  the node that holds it, before anything has started. A node writing as the
+  holder also checks the manifest still names it, so a node the sandbox moved
+  off cannot write over the one running it now. The store has to honour
+  conditional writes, and burrowd checks at startup that it does: it refuses
+  to start on one that ignores them (versitygw 1.0.14 does; 1.10 and AWS S3
+  do not) unless `--allow-unconditional-object-store` accepts the race.
 - **A node that cannot reach the orchestrator stops resuming.** Every
   heartbeat renews a lease a little shorter than the expiry after which the
   orchestrator writes a node off. Once it lapses the node resumes none of its
@@ -325,8 +337,9 @@ A sandbox must never run in two places, and two things make sure of it.
   adopted one meanwhile, the orchestrator says so on the next heartbeat and
   the node drops its copy.
 
-A resume of a sandbox with a stored copy writes one small object to the store
-first, and fails rather than resuming if the store cannot be reached.
+A resume of a sandbox with a stored copy reads and writes one small object in
+the store first, and fails rather than resuming if the store cannot be reached
+or names another node.
 
 ## Warm template snapshots
 

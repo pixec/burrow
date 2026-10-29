@@ -112,6 +112,26 @@ impl Limits {
     }
 }
 
+/// What one set of sources may spend of the resolver: a query budget per
+/// source address, and a ceiling on forwards in flight.
+///
+/// [`Resolver::serve`] keeps one for every sandbox it serves. A caller of
+/// [`Resolver::answer`] keeps its own, which for a per-sandbox stack makes the
+/// in-flight ceiling per sandbox too.
+pub struct Budget {
+    limits: Limits,
+    forwards: Arc<tokio::sync::Semaphore>,
+}
+
+impl Default for Budget {
+    fn default() -> Self {
+        Self {
+            limits: Limits::default(),
+            forwards: Arc::new(tokio::sync::Semaphore::new(MAX_INFLIGHT_FORWARDS)),
+        }
+    }
+}
+
 pub struct Resolver {
     pub policies: Arc<PolicyTable>,
     pub audit: AuditLog,
@@ -132,8 +152,7 @@ impl Resolver {
         // seen to be oversized rather than silently cut down to something that
         // parses differently here than it would upstream.
         let mut buf = vec![0u8; MAX_ANSWER];
-        let limits = Arc::new(Limits::default());
-        let forwards = Arc::new(tokio::sync::Semaphore::new(MAX_INFLIGHT_FORWARDS));
+        let budget = Arc::new(Budget::default());
 
         loop {
             let (len, from) = match socket.recv_from(&mut buf).await {
@@ -151,34 +170,36 @@ impl Resolver {
             let query = buf[..len].to_vec();
             let resolver = Arc::clone(&self);
             let socket = Arc::clone(&socket);
-            let limits = Arc::clone(&limits);
-            let forwards = Arc::clone(&forwards);
+            let budget = Arc::clone(&budget);
             // Each query is independent; a slow upstream must not stall the
             // whole resolver.
             tokio::spawn(async move {
-                resolver
-                    .handle(query, from, socket, &limits, &forwards)
-                    .await;
+                if let Some(answer) = resolver.answer(&query, from.ip(), &budget).await
+                    && let Err(err) = socket.send_to(&answer, from).await
+                {
+                    tracing::debug!(%err, "dns reply failed");
+                }
             });
         }
     }
 
-    async fn handle(
-        &self,
-        query: Vec<u8>,
-        from: SocketAddr,
-        socket: Arc<UdpSocket>,
-        limits: &Limits,
-        forwards: &Arc<tokio::sync::Semaphore>,
-    ) {
-        let name = parse_question(&query);
+    /// Answers one query from `from`, or `None` when it gets no reply.
+    ///
+    /// What [`Self::serve`] does with each datagram, for a caller that carries
+    /// datagrams itself, such as a userspace network stack answering on a
+    /// sandbox's gateway. Rate limits are charged against `budget`.
+    pub async fn answer(&self, query: &[u8], from: IpAddr, budget: &Budget) -> Option<Vec<u8>> {
+        if query.len() > MAX_PACKET {
+            return None;
+        }
+        let name = parse_question(query);
         // A sandbox reaching the resolver over IPv6 is the same sandbox; an
         // IPv4-mapped source is looked up as the v4 address it is.
-        let source_ip = crate::policy::unmap(from.ip());
+        let source_ip = crate::policy::unmap(from);
         // Before anything is parsed, logged or recorded, so a flood costs this
         // one lookup and nothing downstream of it.
-        if !limits.allow(source_ip) {
-            return;
+        if !budget.limits.allow(source_ip) {
+            return None;
         }
         // `.internal` is burrow's zone, answered from the directory and never
         // forwarded: a name that leaked upstream would both fail and tell a
@@ -194,19 +215,19 @@ impl Resolver {
 
         let mut refusal = None;
         let answer = if internal {
-            Some(self.answer_internal(&query, source_ip, &name))
-        } else if decision.is_allowed() && is_aaaa_query(&query) {
+            Some(self.answer_internal(query, source_ip, &name))
+        } else if decision.is_allowed() && is_aaaa_query(query) {
             // Sandbox egress is v4: a v6 answer is one a dual-stack client
             // tries first and fails on, and NOERROR with no records is how
             // DNS says the name has no address of that kind.
-            Some(rcode_response(&query, RCODE_NOERROR))
+            Some(rcode_response(query, RCODE_NOERROR))
         } else if decision.is_allowed() {
-            self.forward(&query, forwards).await
+            self.forward(query, &budget.forwards).await
         } else {
             // REFUSED rather than a forged NXDOMAIN: the name may well exist,
             // and saying so is the honest answer to "you may not ask".
             refusal = Some(decision.reason());
-            Some(rcode_response(&query, RCODE_REFUSED))
+            Some(rcode_response(query, RCODE_REFUSED))
         };
 
         // Pin before replying: the client may connect the instant it has the
@@ -249,12 +270,7 @@ impl Resolver {
             bytes_received: answer.as_ref().map(|a| a.len() as u64).unwrap_or(0),
             dropped_records: 0,
         });
-
-        if let Some(answer) = answer
-            && let Err(err) = socket.send_to(&answer, from).await
-        {
-            tracing::debug!(%err, "dns reply failed");
-        }
+        answer
     }
 
     /// Builds the reply for a name in burrow's own zone.

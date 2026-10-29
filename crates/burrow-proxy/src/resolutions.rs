@@ -124,6 +124,11 @@ impl DeniedAddresses {
         *self.addresses.write().unwrap() = addresses.into_iter().collect();
     }
 
+    /// Every address in the set, for an enforcer that decides by list.
+    pub fn addresses(&self) -> Vec<IpAddr> {
+        self.addresses.read().unwrap().iter().copied().collect()
+    }
+
     /// Checked against the unmapped address, so a control plane cannot be
     /// reached by asking for it in the other family's notation.
     pub fn is_denied(&self, address: IpAddr) -> bool {

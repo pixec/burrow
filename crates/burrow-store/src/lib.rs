@@ -797,6 +797,19 @@ impl Store {
         Ok(())
     }
 
+    /// [`delete_placement`](Self::delete_placement), only while the row still
+    /// names `node_id`: a replica that has not caught up with a move would
+    /// otherwise delete the row the move just wrote.
+    pub async fn delete_placement_on(&self, id: &str, node_id: &str) -> Result<()> {
+        on_pool!(self, pool => sqlx::query("DELETE FROM placements WHERE id=$1 AND node_id=$2")
+            .bind(id)
+            .bind(node_id)
+            .execute(pool)
+            .await
+            .map(drop))?;
+        Ok(())
+    }
+
     /// Drops every placement on a node. Used when a node re-registers, since
     /// its sandboxes did not survive whatever restarted it.
     pub async fn delete_placements_for_node(&self, node_id: &str) -> Result<usize> {
@@ -1700,6 +1713,32 @@ mod tests {
             Some("moved")
         );
         assert_eq!(store.claim_holder("name:gone").await.unwrap(), None);
+    }
+
+    #[tokio::test]
+    async fn a_placement_is_deleted_only_from_the_node_it_names() {
+        let store = Store::open_in_memory().await.unwrap();
+        for (id, node) in [("moved", ""), ("gone", "n1")] {
+            store
+                .put_placement(&PlacementRow {
+                    id: id.into(),
+                    node_id: node.into(),
+                    record: Vec::new(),
+                })
+                .await
+                .unwrap();
+        }
+        for id in ["moved", "gone"] {
+            store.delete_placement_on(id, "n1").await.unwrap();
+        }
+        let left: Vec<String> = store
+            .list_placements()
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|row| row.id)
+            .collect();
+        assert_eq!(left, ["moved"]);
     }
 
     /// A delete accepted while the node was down has to outlive the process

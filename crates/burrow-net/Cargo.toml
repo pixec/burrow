@@ -16,3 +16,21 @@ libc = { workspace = true }
 # UDP sockets have to set IP_TRANSPARENT before bind; tokio's UdpSocket
 # does not expose that order.
 socket2 = "0.5"
+# A userspace stack for nodes with no nftables (macOS guests under
+# Virtualization.framework). Off by default: only such a node needs smoltcp
+# and the proxy linked into this crate.
+smoltcp = { version = "0.14", default-features = false, features = ["std", "medium-ip", "medium-ethernet", "proto-ipv4", "proto-dhcpv4", "socket-tcp", "socket-tcp-pause-synack", "async"], optional = true }
+burrow-proxy = { workspace = true, optional = true }
+
+[features]
+usernet = ["dep:smoltcp", "dep:burrow-proxy"]
+
+[dev-dependencies]
+serde_json = { workspace = true }
+
+[target.'cfg(target_os = "macos")'.dev-dependencies]
+burrow-vmm = { workspace = true }
+
+[[example]]
+name = "vz-usernet"
+required-features = ["usernet"]

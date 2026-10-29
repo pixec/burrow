@@ -12,7 +12,8 @@
 //! A durable snapshot, one copied to the object store, is the exception to
 //! "only where it was taken": it survives its node here with an empty
 //! `node_id`, and nodes list what the store holds on registration so a
-//! restarted orchestrator re-learns those too.
+//! restarted orchestrator re-learns those too. That listing is also the only
+//! word on a holderless one being deleted, so each listing replaces them.
 
 use std::collections::HashMap;
 use std::sync::Mutex;
@@ -46,12 +47,23 @@ impl SnapshotRegistry {
         }
     }
 
-    /// Records snapshots a node found in the object store, without a holder.
+    /// Makes the snapshots without a holder exactly those the object store
+    /// lists, returning how many were adopted and how many forgotten.
     ///
     /// A snapshot a node already lists keeps its node: the local copy is the
-    /// one a create should use.
-    pub fn adopt_remote(&self, reported: Vec<common::Snapshot>) -> usize {
+    /// one a create should use. One with no holder that the store no longer
+    /// lists was deleted, most likely through another replica, and nothing
+    /// else would ever drop it: no node reports it, so no heartbeat or node
+    /// inventory mentions it again.
+    pub fn reconcile_remote(&self, reported: Vec<common::Snapshot>) -> (usize, usize) {
         let mut snapshots = self.snapshots.lock().unwrap();
+        let listed: std::collections::HashSet<String> = reported
+            .iter()
+            .map(|snapshot| snapshot.id.clone())
+            .collect();
+        let before = snapshots.len();
+        snapshots.retain(|id, snapshot| !snapshot.node_id.is_empty() || listed.contains(id));
+        let forgotten = before - snapshots.len();
         let mut adopted = 0;
         for mut snapshot in reported {
             if snapshots.contains_key(&snapshot.id) {
@@ -62,7 +74,7 @@ impl SnapshotRegistry {
             snapshots.insert(snapshot.id.clone(), snapshot);
             adopted += 1;
         }
-        adopted
+        (adopted, forgotten)
     }
 
     pub fn remove(&self, id: &str) -> Option<common::Snapshot> {
@@ -211,7 +223,7 @@ mod tests {
             "node1",
             snapshot("snap_held", "sbx_a", "2026-09-01T00:00:00Z"),
         );
-        let adopted = registry.adopt_remote(vec![
+        let (adopted, _) = registry.reconcile_remote(vec![
             snapshot("snap_held", "sbx_a", "2026-09-01T00:00:00Z"),
             snapshot("snap_orphan", "sbx_b", "2026-09-01T00:00:00Z"),
         ]);
@@ -220,6 +232,37 @@ mod tests {
         let orphan = registry.get("snap_orphan").unwrap();
         assert!(orphan.is_durable);
         assert_eq!(orphan.node_id, "");
+    }
+
+    /// Deleted through another replica, a snapshot with no holder is reported
+    /// by no node, so the store's listing is the only thing that can say so.
+    /// Kept, it listed forever and every delete of it answered "no snapshot".
+    #[test]
+    fn a_holderless_snapshot_the_store_no_longer_lists_is_forgotten() {
+        let registry = SnapshotRegistry::default();
+        registry.insert(
+            "node1",
+            snapshot("snap_held", "sbx_a", "2026-09-01T00:00:00Z"),
+        );
+        registry.mark_durable("snap_held");
+        registry.reconcile_remote(vec![
+            snapshot("snap_held", "sbx_a", "2026-09-01T00:00:00Z"),
+            snapshot("snap_orphan", "sbx_b", "2026-09-01T00:00:00Z"),
+        ]);
+        assert_eq!(registry.get("snap_orphan").unwrap().node_id, "");
+
+        let (adopted, forgotten) = registry.reconcile_remote(Vec::new());
+        assert_eq!((adopted, forgotten), (0, 1));
+        assert!(registry.get("snap_orphan").is_none());
+        assert!(
+            registry.get("snap_held").is_some(),
+            "a held snapshot is its node's to report, not the store's"
+        );
+
+        // Once its holder goes, it is the store's again.
+        registry.forget_node("node1");
+        registry.reconcile_remote(Vec::new());
+        assert!(registry.get("snap_held").is_none());
     }
 
     #[test]

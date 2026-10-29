@@ -42,6 +42,10 @@ pub struct Placement {
     /// machine.
     pub arch: String,
     pub firecracker_version: String,
+    /// The hypervisor the sandbox runs under: its template's, or its state's
+    /// when it restores. Empty means any. Hard, because a node without it
+    /// can only refuse the create.
+    pub hypervisor: String,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -50,13 +54,17 @@ pub enum PlacementError {
     NoHealthyNode,
     #[error("could not reserve capacity: {0}")]
     Store(String),
-    #[error(
-        "no node can restore this snapshot: it needs {arch} and Firecracker {firecracker_version}"
-    )]
+    #[error("no node can restore this snapshot: it needs {arch} and {hypervisor} {version}")]
     NoCompatibleNode {
         arch: String,
-        firecracker_version: String,
+        hypervisor: String,
+        version: String,
     },
+    #[error(
+        "no healthy node offers {0}; start burrowd with --hypervisors including it on a node \
+         that has its binary"
+    )]
+    NoNodeWithHypervisor(String),
     #[error("no node has room for {vcpus} vcpu / {mem_mib} MiB")]
     NoCapacity { vcpus: u32, mem_mib: u64 },
     #[error(
@@ -88,6 +96,34 @@ pub enum RegisterError {
          the stored index is from a build with a different pool and has to be cleared"
     )]
     ClaimOutOfRange { index: u32, max: u32 },
+}
+
+/// The version of `hypervisor` a node runs. A node from before versions were
+/// reported per hypervisor ran only Firecracker, and said so on its own.
+pub fn version_of<'a>(info: &'a NodeInfo, hypervisor: &str) -> &'a str {
+    match info.hypervisor_versions.get(hypervisor) {
+        Some(version) => version,
+        None if hypervisor.is_empty() || hypervisor == "firecracker" => &info.firecracker_version,
+        None => "",
+    }
+}
+
+/// Whether a node can restore state written by `hypervisor` at `version` on
+/// `arch`. Empty wants accept anything.
+pub fn can_restore(info: &NodeInfo, arch: &str, hypervisor: &str, version: &str) -> bool {
+    (arch.is_empty() || info.arch == arch)
+        && (version.is_empty() || version_of(info, hypervisor) == version)
+        && offers(info, hypervisor)
+}
+
+/// Whether a node can run sandboxes under `hypervisor`. A node that reports
+/// none predates the choice, and runs Firecracker: a node that has the field
+/// refuses to start with nothing to offer.
+pub fn offers(info: &NodeInfo, hypervisor: &str) -> bool {
+    if info.hypervisors.is_empty() {
+        return hypervisor == "firecracker";
+    }
+    info.hypervisors.iter().any(|offered| offered == hypervisor)
 }
 
 /// Whether a node carries every label asked for.
@@ -597,16 +633,33 @@ impl NodeRegistry {
             .filter(|e| {
                 (want.arch.is_empty() || e.info.arch == want.arch)
                     && (want.firecracker_version.is_empty()
-                        || e.info.firecracker_version == want.firecracker_version)
+                        || version_of(&e.info, &want.hypervisor) == want.firecracker_version)
             })
             .collect();
         if compatible.is_empty() {
             return Err(PlacementError::NoCompatibleNode {
                 arch: want.arch.clone(),
-                firecracker_version: want.firecracker_version.clone(),
+                hypervisor: if want.hypervisor.is_empty() {
+                    "firecracker".into()
+                } else {
+                    want.hypervisor.clone()
+                },
+                version: want.firecracker_version.clone(),
             });
         }
         let live = compatible;
+
+        let offering: Vec<_> = live
+            .iter()
+            .copied()
+            .filter(|e| want.hypervisor.is_empty() || offers(&e.info, &want.hypervisor))
+            .collect();
+        if offering.is_empty() {
+            return Err(PlacementError::NoNodeWithHypervisor(
+                want.hypervisor.clone(),
+            ));
+        }
+        let live = offering;
 
         let with_template: Vec<_> = live
             .iter()
@@ -809,6 +862,21 @@ impl NodeRegistry {
         if let Some(entry) = self.nodes.lock().unwrap().get_mut(node_id) {
             entry.status.is_draining = draining;
         }
+    }
+
+    /// Whether every healthy node offers the same hypervisors, in which case
+    /// one holding a template can run it and placement need not ask which.
+    pub fn is_uniform_in_hypervisors(&self) -> bool {
+        let nodes = self.nodes.lock().unwrap();
+        let mut offered = nodes.values().filter(|e| e.is_healthy()).map(|e| {
+            let mut list = e.info.hypervisors.clone();
+            list.sort();
+            list
+        });
+        let Some(first) = offered.next() else {
+            return true;
+        };
+        offered.all(|list| list == first)
     }
 
     pub fn snapshot(&self) -> Vec<burrow_proto::api::v1::Node> {
@@ -1141,6 +1209,113 @@ mod tests {
             ..want
         });
         assert!(matches!(none, Err(PlacementError::NoCompatibleNode { .. })));
+    }
+
+    /// Cloud Hypervisor state names Cloud Hypervisor's version. Compared with
+    /// the node's Firecracker version instead, it matched nothing, and a move
+    /// to a node running the same Cloud Hypervisor was refused.
+    #[test]
+    fn state_is_matched_against_the_version_of_its_own_hypervisor() {
+        let registry = registry(&[("a", status(&[], &[], 9999))]);
+        registry.heartbeat(
+            "a",
+            status(&[], &[], 9999),
+            Some(NodeInfo {
+                id: "a".into(),
+                address: "a:7071".into(),
+                arch: "aarch64".into(),
+                firecracker_version: "v1.16.1".into(),
+                hypervisors: vec!["firecracker".into(), "cloud-hypervisor".into()],
+                hypervisor_versions: [
+                    ("firecracker".to_string(), "v1.16.1".to_string()),
+                    ("cloud-hypervisor".to_string(), "v54.0".to_string()),
+                ]
+                .into(),
+                ..Default::default()
+            }),
+        );
+        let want = Placement {
+            arch: "aarch64".into(),
+            hypervisor: "cloud-hypervisor".into(),
+            firecracker_version: "v54.0".into(),
+            vcpus: 1,
+            mem_mib: 1,
+            ..Default::default()
+        };
+        assert_eq!(registry.place_for(&want).unwrap(), "a");
+        let newer = registry.place_for(&Placement {
+            firecracker_version: "v55.0".into(),
+            ..want
+        });
+        assert!(matches!(
+            newer,
+            Err(PlacementError::NoCompatibleNode { .. })
+        ));
+    }
+
+    /// A node from before versions were reported per hypervisor reports only
+    /// its Firecracker's, and offers nothing else.
+    #[test]
+    fn an_older_node_s_version_is_its_firecracker_s() {
+        let info = NodeInfo {
+            arch: "aarch64".into(),
+            firecracker_version: "v1.16.1".into(),
+            ..Default::default()
+        };
+        assert_eq!(version_of(&info, "firecracker"), "v1.16.1");
+        assert_eq!(version_of(&info, ""), "v1.16.1");
+        assert_eq!(version_of(&info, "cloud-hypervisor"), "");
+        assert!(can_restore(&info, "aarch64", "firecracker", "v1.16.1"));
+        assert!(!can_restore(&info, "aarch64", "cloud-hypervisor", ""));
+        assert!(!can_restore(&info, "x86_64", "firecracker", "v1.16.1"));
+    }
+
+    fn offering(registry: &NodeRegistry, id: &str, hypervisors: &[&str]) {
+        registry.heartbeat(
+            id,
+            status(&["t"], &[], 9999),
+            Some(NodeInfo {
+                id: id.into(),
+                address: format!("{id}:7071"),
+                hypervisors: hypervisors.iter().map(|h| (*h).to_string()).collect(),
+                ..Default::default()
+            }),
+        );
+    }
+
+    /// A template's hypervisor is as hard a requirement as its presence: a
+    /// node without it could only refuse the create.
+    #[test]
+    fn a_sandbox_is_placed_only_where_its_hypervisor_is_offered() {
+        let registry = registry(&[
+            ("a", status(&["t"], &[], 9999)),
+            ("b", status(&["t"], &[], 1)),
+        ]);
+        offering(&registry, "a", &["firecracker"]);
+        offering(&registry, "b", &["firecracker", "cloud-hypervisor"]);
+        let want = Placement {
+            template: "t".into(),
+            hypervisor: "cloud-hypervisor".into(),
+            vcpus: 1,
+            mem_mib: 1,
+            ..Default::default()
+        };
+        assert_eq!(registry.place_for(&want).unwrap(), "b");
+        assert!(!registry.is_uniform_in_hypervisors());
+
+        let none = registry.place_for(&Placement {
+            hypervisor: "kvmtool".into(),
+            ..want
+        });
+        assert!(matches!(none, Err(PlacementError::NoNodeWithHypervisor(_))));
+    }
+
+    /// A node that predates the field runs Firecracker and nothing else.
+    #[test]
+    fn a_node_reporting_no_hypervisors_runs_firecracker() {
+        let old = NodeInfo::default();
+        assert!(offers(&old, "firecracker"));
+        assert!(!offers(&old, "cloud-hypervisor"));
     }
 
     #[test]

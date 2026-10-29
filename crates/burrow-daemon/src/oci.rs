@@ -223,9 +223,30 @@ pub struct ImageEnvironment {
     /// agent alone.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub systemd: bool,
+    /// The hypervisor every sandbox from this template runs under, chosen
+    /// when it was built. Empty takes the guest's default, which is what
+    /// every template from before the choice existed means.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub hypervisor: String,
+    /// "linux" or "windows"; empty is Linux.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub guest_os: String,
 }
 
 impl ImageEnvironment {
+    /// The hypervisor and guest this template's sandboxes run as.
+    #[allow(clippy::result_large_err)]
+    pub fn machine(&self) -> Result<(burrow_vmm::Hypervisor, burrow_vmm::GuestOs), tonic::Status> {
+        let guest_os = burrow_vmm::GuestOs::from_record(&self.guest_os).ok_or_else(|| {
+            tonic::Status::failed_precondition(format!("unknown guest os {:?}", self.guest_os))
+        })?;
+        let hypervisor = match self.hypervisor.as_str() {
+            "" => guest_os.default_hypervisor(),
+            name => name.parse().map_err(tonic::Status::failed_precondition)?,
+        };
+        Ok((hypervisor, guest_os))
+    }
+
     pub fn as_map(&self) -> HashMap<String, String> {
         self.env
             .iter()
@@ -748,6 +769,9 @@ pub async fn pull(
             user: envelope.config.user,
             kit: None,
             systemd: false,
+            // The build's choice, not the image's.
+            hypervisor: String::new(),
+            guest_os: String::new(),
         },
         digest,
         layer_digests,

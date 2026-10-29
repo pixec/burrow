@@ -10,10 +10,10 @@ use std::sync::Arc;
 use tokio::sync::Mutex;
 use tonic::{Status, transport::Channel};
 
-use burrow_firecracker::{DriveSpec, MicroVm, MicroVmSpec, NetSpec};
 use burrow_net::{Ipam, Lease, firewall, tap};
 use burrow_proto::common::v1 as common;
 use burrow_proto::guest::v1::guest_client::GuestClient;
+use burrow_vmm::{DriveSpec, GuestAddr, Hypervisor, Layout, NetSpec, Vm, VmSpec};
 
 use crate::guestconn;
 
@@ -40,10 +40,6 @@ const DEFAULT_SCRATCH_MIB: u32 = 1024;
 /// published ports cannot collide with the host's own connections.
 const HOST_PORT_RANGE: std::ops::Range<u16> = 20000..30000;
 
-/// Slack added to a sandbox's guest memory when sizing its cgroup, covering
-/// Firecracker's own allocations and page tables.
-pub(crate) const VMM_MEMORY_HEADROOM_MIB: u32 = 128;
-
 #[derive(Clone)]
 pub struct NodeConfig {
     pub data_dir: PathBuf,
@@ -60,9 +56,17 @@ pub struct NodeConfig {
     /// snapshot in. What a sandbox never touches then costs nothing, and
     /// sandboxes restored from one template share the backing page cache.
     pub is_memory_lazy: bool,
-    /// Confines each VMM to a chroot under an unprivileged uid. `None` runs
-    /// firecracker as root with the whole host visible.
-    pub jail: Option<burrow_firecracker::Jail>,
+    /// Confines each VMM to a chroot under an unprivileged uid, for the
+    /// hypervisors that can be jailed. `None` runs every VMM as root with the
+    /// whole host visible.
+    pub jail: Option<burrow_vmm::Jail>,
+    /// How Cloud Hypervisor runs here, whether or not it is enabled: a
+    /// sandbox recovered from a run that had it still needs a backend to
+    /// describe its VM with, even if all it can then do is fail to resume.
+    pub cloud_hypervisor: burrow_vmm::CloudHypervisorConfig,
+    /// The hypervisors this node offers, as it advertises them. A template or
+    /// sandbox needing another is refused.
+    pub hypervisors: Vec<Hypervisor>,
     /// How long a build layer and an unreferenced blob are kept.
     ///
     /// Neither has an owner that could delete it: a cached layer outlives the
@@ -89,6 +93,8 @@ pub struct NodeConfig {
     /// What `firecracker_bin` reports, recorded on every snapshot: guest state
     /// only restores under the Firecracker that wrote it.
     pub firecracker_version: String,
+    /// What the Cloud Hypervisor binary reports, for the same reason.
+    pub cloud_hypervisor_version: String,
     /// The agent this node ships. A guest found running another build on
     /// handshake is upgraded to it in place.
     pub guest_upgrade: Option<Arc<guestconn::GuestUpgrade>>,
@@ -99,13 +105,58 @@ impl NodeConfig {
         self.data_dir.join("images")
     }
 
+    /// How a VM under `hypervisor` is run here.
+    pub(crate) fn backend(&self, hypervisor: Hypervisor) -> burrow_vmm::Backend {
+        match hypervisor {
+            Hypervisor::Firecracker => {
+                burrow_vmm::Backend::Firecracker(burrow_vmm::FirecrackerConfig {
+                    bin: self.firecracker_bin.clone(),
+                    jail: self.jail_for(hypervisor).cloned(),
+                })
+            }
+            Hypervisor::CloudHypervisor => {
+                burrow_vmm::Backend::CloudHypervisor(self.cloud_hypervisor.clone())
+            }
+            // A template's machine was provisioned and given its agent when
+            // it was built, so a sandbox's clone boots straight to it.
+            #[cfg(target_os = "macos")]
+            Hypervisor::Vz => burrow_vmm::Backend::Vz(burrow_vmm::VzConfig::default()),
+        }
+    }
+
+    /// The jail a VM under `hypervisor` runs in, where it can run in one.
+    pub(crate) fn jail_for(&self, hypervisor: Hypervisor) -> Option<&burrow_vmm::Jail> {
+        // Cloud Hypervisor's own confinement is off only where the operator
+        // turned it off: see `--unjailed-cloud-hypervisor`.
+        let is_jailed = match hypervisor {
+            Hypervisor::Firecracker => true,
+            Hypervisor::CloudHypervisor => self.cloud_hypervisor.jail.is_some(),
+            #[cfg(target_os = "macos")]
+            Hypervisor::Vz => false,
+        };
+        self.jail
+            .as_ref()
+            .filter(|_| hypervisor.capabilities().is_jailable && is_jailed)
+    }
+
+    /// What `hypervisor` reports itself as, recorded on the state it writes.
+    pub(crate) fn version(&self, hypervisor: Hypervisor) -> &str {
+        match hypervisor {
+            Hypervisor::Firecracker => &self.firecracker_version,
+            Hypervisor::CloudHypervisor => &self.cloud_hypervisor_version,
+            // Never offered: serve refuses vz until a macOS node exists.
+            #[cfg(target_os = "macos")]
+            Hypervisor::Vz => "",
+        }
+    }
+
     /// Where a sandbox's files live.
     ///
     /// Under the jailer this *is* the chroot the VMM is pivoted into, because
     /// everything firecracker touches has to be inside it and every path
     /// burrow hands the API is already relative.
-    fn sandbox_dir(&self, id: &str) -> PathBuf {
-        match &self.jail {
+    fn sandbox_dir(&self, id: &str, hypervisor: Hypervisor) -> PathBuf {
+        match self.jail_for(hypervisor) {
             Some(jail) => jail.chroot_for(id),
             None => self.data_dir.join("sandboxes").join(id),
         }
@@ -146,26 +197,24 @@ const MAX_RESTORED_CHAIN: usize = 2;
 /// crash or a failed compaction in that window leaves a chain longer than the
 /// cap. Probing to the cap would silently truncate it here and restore the
 /// guest from a prefix of its own memory, which is worse than a long chain.
-async fn discover_memory_chain(workdir: &std::path::Path) -> Vec<String> {
-    if !tokio::fs::try_exists(workdir.join(burrow_firecracker::SNAPSHOT_MEM_FILE))
+async fn discover_memory_chain(workdir: &std::path::Path, layout: Layout) -> Vec<String> {
+    let Some(memory) = layout.memory else {
+        return Vec::new();
+    };
+    if !tokio::fs::try_exists(workdir.join(memory))
         .await
         .unwrap_or(false)
     {
         return Vec::new();
     }
-    let mut chain = vec![burrow_firecracker::SNAPSHOT_MEM_FILE.to_string()];
+    let mut chain = vec![memory.to_string()];
 
     let Ok(mut entries) = tokio::fs::read_dir(workdir).await else {
         return chain;
     };
     let mut diffs: Vec<usize> = Vec::new();
     while let Ok(Some(entry)) = entries.next_entry().await {
-        let name = entry.file_name().to_string_lossy().into_owned();
-        if let Some(index) = name
-            .strip_prefix("snapshot.diff")
-            .and_then(|rest| rest.strip_suffix(".mem"))
-            .and_then(|index| index.parse::<usize>().ok())
-        {
+        if let Some(index) = Layout::diff_index(&entry.file_name().to_string_lossy()) {
             diffs.push(index);
         }
     }
@@ -186,7 +235,7 @@ async fn discover_memory_chain(workdir: &std::path::Path) -> Vec<String> {
             );
             break;
         }
-        chain.push(format!("snapshot.diff{index}.mem"));
+        chain.push(Layout::diff(index));
     }
     chain
 }
@@ -334,7 +383,7 @@ struct Provisioning<'a> {
     /// `None` until the tap is up; taken back out once the sandbox owns it.
     tap: Option<String>,
     /// `None` until the VM boots or restores.
-    vm: Option<MicroVm>,
+    vm: Option<Vm>,
     is_kept: bool,
 }
 
@@ -352,7 +401,7 @@ impl<'a> Provisioning<'a> {
     }
 
     /// The VM this create started, which it has by the time anything asks.
-    fn vm(&self) -> &MicroVm {
+    fn vm(&self) -> &Vm {
         self.vm
             .as_ref()
             .expect("the vm is recorded before anything uses it")
@@ -378,7 +427,7 @@ impl<'a> Provisioning<'a> {
     }
 
     /// The create succeeded: the sandbox owns all of this now.
-    fn keep(mut self) -> Option<MicroVm> {
+    fn keep(mut self) -> Option<Vm> {
         self.is_kept = true;
         self.vm.take()
     }
@@ -437,7 +486,7 @@ fn spawn_handshake(
     timeout: std::time::Duration,
 ) {
     let id = sandbox.id.clone();
-    let uds = sandbox.workdir.join(burrow_firecracker::VSOCK_UDS);
+    let guest = GuestAddr::in_workdir(&sandbox.workdir);
     let signal = sandbox.handshake.clone();
     let manager = manager.clone();
     // Weak: a sandbox deleted while its guest is still waking must not be kept
@@ -446,17 +495,24 @@ fn spawn_handshake(
     tokio::spawn(async move {
         let began = std::time::Instant::now();
         let upgrade = manager.config.guest_upgrade.clone();
+        // Which step the deadline caught, so a guest that never came up says
+        // whether its vsock never accepted or its agent never answered.
+        let step = std::sync::Mutex::new("waiting for the guest's vsock to accept");
         let outcome = match tokio::time::timeout(timeout, async {
-            let (agent, _) = guestconn::connect_when_ready(uds.clone(), timeout).await?;
+            let (agent, _) = guestconn::connect_when_ready(guest.clone(), timeout).await?;
+            *step.lock().unwrap() = "waiting for the agent to answer the handshake";
             let (agent, _) =
-                guestconn::handshake_upgrading(agent, uds, request, upgrade.as_deref(), timeout)
+                guestconn::handshake_upgrading(agent, guest, request, upgrade.as_deref(), timeout)
                     .await?;
             Ok::<_, anyhow::Error>(agent)
         })
         .await
         {
             Ok(outcome) => outcome,
-            Err(_) => Err(anyhow::anyhow!("no answer within {timeout:?}")),
+            Err(_) => Err(anyhow::anyhow!(
+                "stalled {} after {timeout:?}",
+                step.lock().unwrap()
+            )),
         };
 
         let (state, agent) = match outcome {
@@ -568,6 +624,9 @@ pub struct RunningSandbox {
     /// record is rebuilt from policy while these two never change.
     id: String,
     template: String,
+    /// Its template's, and fixed for its life the same way: every VM it ever
+    /// runs, and every snapshot it leaves, is this hypervisor's.
+    hypervisor: Hypervisor,
     /// Everything else about the sandbox. Mutable because a pre-provisioned
     /// sandbox is stamped with the requesting caller's policy and metadata
     /// when it is handed out.
@@ -575,11 +634,11 @@ pub struct RunningSandbox {
     state: std::sync::atomic::AtomicI32,
     /// `None` while suspended: the VMM process is gone and the sandbox lives
     /// only as a snapshot on disk.
-    vm: Mutex<Option<MicroVm>>,
+    vm: Mutex<Option<Vm>>,
     /// Kept so a suspended sandbox can be restored with byte-identical
-    /// resource paths, which Firecracker requires. Replaced by a boot from a
+    /// resource paths, which a restore requires. Replaced by a boot from a
     /// stop, which describes the drives afresh.
-    spec: std::sync::Mutex<MicroVmSpec>,
+    spec: std::sync::Mutex<VmSpec>,
     /// A live channel to this sandbox's agent.
     ///
     /// Reused across calls: a vsock connect plus an HTTP/2 handshake into a
@@ -661,7 +720,7 @@ impl RunningSandbox {
     /// Called on every sample and once more before a VM is killed, because the
     /// cgroup is removed with it: whatever the guest did since the last sample
     /// is only readable while the VMM is still there.
-    fn absorb_cpu(&self, vm: &MicroVm) {
+    fn absorb_cpu(&self, vm: &Vm) {
         self.usage
             .lock()
             .unwrap()
@@ -699,6 +758,10 @@ impl RunningSandbox {
     /// The template this sandbox was created from.
     pub fn template(&self) -> &str {
         &self.template
+    }
+
+    fn layout(&self) -> Layout {
+        self.hypervisor.layout()
     }
 
     /// vCPUs this sandbox is promised, whether or not its VMM is running.
@@ -803,12 +866,11 @@ impl RunningSandbox {
             // again, which is the whole point.
             return Ok(client.clone());
         }
-        let client = guestconn::connect(
-            self.workdir.join(burrow_firecracker::VSOCK_UDS),
-            self.agent_timeout,
-        )
-        .await
-        .map_err(|err| Status::unavailable(format!("agent unreachable: {}", error_chain(&*err))))?;
+        let client = guestconn::connect(GuestAddr::in_workdir(&self.workdir), self.agent_timeout)
+            .await
+            .map_err(|err| {
+                Status::unavailable(format!("agent unreachable: {}", error_chain(&*err)))
+            })?;
         *cached = Some(client.clone());
         Ok(client)
     }
@@ -890,6 +952,12 @@ impl RunningSandbox {
     /// tap device, and disks, so resuming restores it exactly.
     #[tracing::instrument(skip_all, fields(sandbox = %self.id(), diff))]
     async fn suspend(&self) -> Result<(), Status> {
+        // A warm create or an adopt returns before its handshake lands. A
+        // snapshot taken under it captures a guest half reconfigured, and the
+        // task driving it outlives the VM, retrying the vsock path until its
+        // deadline: the next VM at that path, a resume or an adopt back onto
+        // this node, would be handshaken twice at once.
+        self.await_handshake().await?;
         self.forget_agent().await;
         let mut slot = self.vm.lock().await;
         let Some(vm) = slot.take() else {
@@ -898,19 +966,19 @@ impl RunningSandbox {
 
         // A diff records only the pages touched since the snapshot this VM was
         // restored from, which is nearly always a small fraction of the guest.
-        // It is only possible when there is something to diff *against*.
+        // It is only possible when there is something to diff *against*, and
+        // under a hypervisor that can take one.
         let chain = self.memory_chain.lock().await.clone();
-        let diff = !chain.is_empty();
+        let diff = !chain.is_empty() && vm.capabilities().is_diff_snapshot_supported;
         tracing::Span::current().record("diff", diff);
 
-        let next = format!("snapshot.diff{}.mem", chain.len());
+        let next = Layout::diff(chain.len());
         let result = async {
             vm.pause().await?;
             if diff {
-                vm.snapshot_to(burrow_firecracker::SnapshotType::Diff, &next)
-                    .await
+                vm.snapshot_diff(&next).await
             } else {
-                vm.snapshot(burrow_firecracker::SnapshotType::Full).await
+                vm.snapshot().await
             }
         }
         .await;
@@ -935,7 +1003,7 @@ impl RunningSandbox {
                 current.push(next);
             } else {
                 // A full snapshot supersedes everything before it.
-                *current = vec![burrow_firecracker::SNAPSHOT_MEM_FILE.to_string()];
+                *current = self.layout().memory.map(String::from).into_iter().collect();
                 Self::remove_stale_diffs(&self.workdir).await;
             }
             current.len() > MAX_MEMORY_CHAIN
@@ -968,7 +1036,12 @@ impl RunningSandbox {
         let mut chain = self.memory_chain.lock().await;
         let paths: Vec<std::path::PathBuf> =
             chain.iter().map(|name| self.workdir.join(name)).collect();
-        let target = self.workdir.join(burrow_firecracker::SNAPSHOT_MEM_FILE);
+        // A chain only grows over a memory file, so a layout without one
+        // never has anything to compact.
+        let Some(memory) = self.layout().memory else {
+            return;
+        };
+        let target = self.workdir.join(memory);
         let started = std::time::Instant::now();
 
         let merged = tokio::task::spawn_blocking({
@@ -980,7 +1053,7 @@ impl RunningSandbox {
 
         match merged {
             Ok(Ok(())) => {
-                *chain = vec![burrow_firecracker::SNAPSHOT_MEM_FILE.to_string()];
+                *chain = vec![memory.to_string()];
                 drop(chain);
                 Self::remove_stale_diffs(&self.workdir).await;
                 tracing::info!(
@@ -1003,7 +1076,7 @@ impl RunningSandbox {
 
     #[cfg(target_os = "linux")]
     fn merge_chain(paths: &[std::path::PathBuf], target: &Path) -> std::io::Result<()> {
-        burrow_firecracker::merge_chain(paths, target)
+        burrow_vmm::merge_chain(paths, target)
     }
 
     #[cfg(not(target_os = "linux"))]
@@ -1018,8 +1091,7 @@ impl RunningSandbox {
         };
         while let Ok(Some(entry)) = entries.next_entry().await {
             let name = entry.file_name();
-            let Some(name) = name.to_str() else { continue };
-            if name.starts_with("snapshot.diff") && name.ends_with(".mem") {
+            if Layout::diff_index(&name.to_string_lossy()).is_some() {
                 let _ = tokio::fs::remove_file(entry.path()).await;
             }
         }
@@ -1041,27 +1113,32 @@ impl RunningSandbox {
 
         let mut spec = self.spec.lock().unwrap().clone();
         spec.memory_chain = self.memory_chain.lock().await.clone();
-        spec.memory_source = self
-            .durable
-            .arriving()
-            .map(|h| burrow_firecracker::MemorySource(h));
+        // Without the page-fault handler a base still arriving cannot be
+        // served as the guest asks for it, so it has to be all here first.
+        if !self.hypervisor.capabilities().is_lazy_memory_supported {
+            self.durable.settle_memory().await;
+        }
+        spec.memory_source = self.durable.arriving().map(|h| burrow_vmm::MemorySource(h));
         record_working_set(&mut spec, is_stored);
-        let vm = MicroVm::restore(spec, true)
+        let vm = Vm::restore(spec, true)
             .await
             .map_err(|err| Status::internal(format!("restore failed: {err}")))?;
-        vm.wait_for_vsock(guestconn::AGENT_PORT, agent_timeout)
+        // Retried to the deadline, as a warm create's handshake is, and the
+        // connection that succeeds is the one kept. Probing first and then
+        // dialling again failed a resume outright whenever the second dial was
+        // cut off, which a guest still waking does now and then.
+        let guest = vm.guest();
+        let (agent, _) = guestconn::connect_when_ready(guest.clone(), agent_timeout)
             .await
-            .map_err(|err| Status::internal(format!("agent did not come back: {err}")))?;
+            .map_err(|err| {
+                Status::internal(format!("agent did not come back: {}", error_chain(&*err)))
+            })?;
 
         // `restored: true` is what tells the guest to reseed its RNG and reset
         // its clock, which it cannot know on its own.
-        let uds = self.workdir.join(burrow_firecracker::VSOCK_UDS);
-        let agent = guestconn::connect(uds.clone(), agent_timeout)
-            .await
-            .map_err(|err| Status::internal(format!("agent connect: {err}")))?;
         guestconn::handshake_upgrading(
             agent,
-            uds,
+            guest,
             guestconn::handshake_request(true),
             upgrade,
             agent_timeout,
@@ -1105,11 +1182,14 @@ impl RunningSandbox {
         // too, since a boot must not come back to a snapshot a later resume
         // would restore around.
         self.memory_chain.lock().await.clear();
-        let _ = tokio::fs::remove_file(self.workdir.join(burrow_firecracker::SNAPSHOT_FILE)).await;
-        let _ =
-            tokio::fs::remove_file(self.workdir.join(burrow_firecracker::SNAPSHOT_MEM_FILE)).await;
-        if let Some(hydrator) = self.durable.hydration.lock().unwrap().take() {
-            hydrator.detach(&self.workdir.join(burrow_firecracker::SNAPSHOT_MEM_FILE));
+        let layout = self.layout();
+        for file in layout.files() {
+            let _ = tokio::fs::remove_file(self.workdir.join(file)).await;
+        }
+        if let (Some(hydrator), Some(memory)) =
+            (self.durable.hydration.lock().unwrap().take(), layout.memory)
+        {
+            hydrator.detach(&self.workdir.join(memory));
         }
         Self::remove_stale_diffs(&self.workdir).await;
         self.suspended_at
@@ -1122,7 +1202,7 @@ impl RunningSandbox {
     #[tracing::instrument(skip_all, fields(sandbox = %self.id()))]
     async fn boot(
         &self,
-        spec: MicroVmSpec,
+        spec: VmSpec,
         request: burrow_proto::guest::v1::HandshakeRequest,
         agent_timeout: std::time::Duration,
         upgrade: Option<&guestconn::GuestUpgrade>,
@@ -1141,28 +1221,21 @@ impl RunningSandbox {
         }
         // The guest starts its command ids over.
         self.logs.clear();
-        let vm = MicroVm::boot(spec.clone())
+        let vm = Vm::boot(spec.clone())
             .await
             .map_err(|err| Status::internal(format!("boot failed: {err}")))?;
-        let (agent, _) =
-            match guestconn::connect_when_ready(vm.vsock_uds_path(), agent_timeout).await {
-                Ok(ready) => ready,
-                Err(err) => {
-                    let console = vm.console_tail(30).await;
-                    let _ = vm.kill().await;
-                    return Err(Status::internal(format!(
-                        "agent never became reachable: {err}\nconsole:\n{console}"
-                    )));
-                }
-            };
-        if let Err(err) = guestconn::handshake_upgrading(
-            agent,
-            vm.vsock_uds_path(),
-            request,
-            upgrade,
-            agent_timeout,
-        )
-        .await
+        let (agent, _) = match guestconn::connect_when_ready(vm.guest(), agent_timeout).await {
+            Ok(ready) => ready,
+            Err(err) => {
+                let console = vm.console_tail(30).await;
+                let _ = vm.kill().await;
+                return Err(Status::internal(format!(
+                    "agent never became reachable: {err}\nconsole:\n{console}"
+                )));
+            }
+        };
+        if let Err(err) =
+            guestconn::handshake_upgrading(agent, vm.guest(), request, upgrade, agent_timeout).await
         {
             let _ = vm.kill().await;
             return Err(err);
@@ -1194,6 +1267,8 @@ impl RunningSandbox {
     /// so it is suspended cleanly and `resume` brings it back.
     #[tracing::instrument(skip_all, fields(sandbox = %self.id(), diff))]
     async fn checkpoint(&self) -> Result<(), Status> {
+        // As in a suspend: a fork restores whatever the snapshot caught.
+        self.await_handshake().await?;
         let mut slot = self.vm.lock().await;
         let Some(vm) = slot.as_ref() else {
             return Err(Status::failed_precondition(
@@ -1202,17 +1277,16 @@ impl RunningSandbox {
         };
 
         let chain = self.memory_chain.lock().await.clone();
-        let diff = !chain.is_empty();
+        let diff = !chain.is_empty() && vm.capabilities().is_diff_snapshot_supported;
         tracing::Span::current().record("diff", diff);
-        let next = format!("snapshot.diff{}.mem", chain.len());
+        let next = Layout::diff(chain.len());
 
         let result = async {
             vm.pause().await?;
             if diff {
-                vm.snapshot_to(burrow_firecracker::SnapshotType::Diff, &next)
-                    .await
+                vm.snapshot_diff(&next).await
             } else {
-                vm.snapshot(burrow_firecracker::SnapshotType::Full).await
+                vm.snapshot().await
             }
         }
         .await;
@@ -1228,7 +1302,7 @@ impl RunningSandbox {
             if diff {
                 current.push(next);
             } else {
-                *current = vec![burrow_firecracker::SNAPSHOT_MEM_FILE.to_string()];
+                *current = self.layout().memory.map(String::from).into_iter().collect();
                 Self::remove_stale_diffs(&self.workdir).await;
             }
             current.len() > MAX_MEMORY_CHAIN
@@ -1294,12 +1368,10 @@ impl RunningSandbox {
                 .map_err(|err| io(file, err))?;
         }
         // Small, and the child writes its own over it on its first suspend.
-        tokio::fs::copy(
-            self.workdir.join(burrow_firecracker::SNAPSHOT_FILE),
-            dest.join(burrow_firecracker::SNAPSHOT_FILE),
-        )
-        .await
-        .map_err(|err| io(burrow_firecracker::SNAPSHOT_FILE, err))?;
+        let state = self.layout().state;
+        tokio::fs::copy(self.workdir.join(state), dest.join(state))
+            .await
+            .map_err(|err| io(state, err))?;
 
         // The chain is linked, not copied. A layer is never written again
         // once it exists: a suspend writes a new diff, and a flatten renames
@@ -1335,6 +1407,7 @@ impl RunningSandbox {
         Ok(crate::snapshot::Staged {
             sandbox_id: self.id.clone(),
             template: self.template.clone(),
+            hypervisor: self.hypervisor,
             vcpus,
             mem_mib,
             scratch_disk_mib: if resources.scratch_disk_mib == 0 {
@@ -1356,6 +1429,7 @@ enum RestoreSource<'a> {
     Snapshot {
         id: &'a str,
         template: String,
+        hypervisor: Hypervisor,
     },
     /// A sandbox's own state in the object store, being adopted here.
     Stored {
@@ -1389,6 +1463,17 @@ impl RestoreSource<'_> {
             Self::Stored { manifest, .. } => manifest.template.clone(),
         }
     }
+
+    /// The hypervisor the state was written by, which is the only one that
+    /// can restore it.
+    #[allow(clippy::result_large_err)]
+    fn hypervisor(&self) -> Result<Hypervisor, Status> {
+        match self {
+            Self::Sandbox(source) => Ok(source.hypervisor),
+            Self::Snapshot { hypervisor, .. } => Ok(*hypervisor),
+            Self::Stored { manifest, .. } => manifest.hypervisor(),
+        }
+    }
 }
 
 /// Flattens an error and its sources. tonic wraps connector failures in an
@@ -1418,6 +1503,9 @@ pub struct SandboxManager {
     ipam: Arc<Mutex<Arc<Ipam>>>,
     /// sandbox id -> published ports.
     ports: Arc<Mutex<HashMap<String, Vec<firewall::PortMap>>>>,
+    /// The userspace network stacks of sandboxes without a tap, which the
+    /// firewall sync drives instead of nftables.
+    usernets: crate::macnode::UserNets,
     /// Tailcat servers for the sandboxes shared here.
     shares: Arc<crate::share::Shares>,
     /// Source-address -> egress policy, consulted by the proxy.
@@ -1642,7 +1730,10 @@ impl SandboxManager {
             snapshots: Arc::new(crate::snapshot::SnapshotStore::new(
                 &config.data_dir,
                 config.object_store.clone(),
-                config.firecracker_version.clone(),
+                Hypervisor::ALL
+                    .into_iter()
+                    .map(|h| (h, config.version(h).to_string()))
+                    .collect(),
             )),
             volumes: Arc::new(crate::volume::VolumeStore::new(&config.data_dir)),
             events: tokio::sync::broadcast::channel(1024).0,
@@ -1660,6 +1751,7 @@ impl SandboxManager {
                 Ipam::for_node(0).expect("node 0 is always inside the address pool"),
             ))),
             ports: Arc::new(Mutex::new(HashMap::new())),
+            usernets: Default::default(),
             proxy_policies,
             resolutions,
             denied,
@@ -1757,6 +1849,38 @@ impl SandboxManager {
         self.ipam.lock().await.subnet()
     }
 
+    /// Moves a sandbox's files into its jail when they were left outside one:
+    /// a Cloud Hypervisor sandbox from before it could be jailed, or from a
+    /// run with `--jailer` off. Without this the sandbox would be found with
+    /// no snapshot and discarded.
+    async fn move_into_jail(&self, id: &str, hypervisor: Hypervisor, workdir: &Path) {
+        let Some(jail) = self.config.jail_for(hypervisor) else {
+            return;
+        };
+        let unjailed = self.config.data_dir.join("sandboxes").join(id);
+        if tokio::fs::try_exists(workdir).await.unwrap_or(true)
+            || !tokio::fs::try_exists(&unjailed).await.unwrap_or(false)
+        {
+            return;
+        }
+        let moved = async {
+            if let Some(parent) = workdir.parent() {
+                tokio::fs::create_dir_all(parent).await?;
+            }
+            tokio::fs::rename(&unjailed, workdir).await?;
+            let shared = [TEMPLATE_KERNEL.to_string(), TEMPLATE_ROOTFS.to_string()].into();
+            grant_to_jail(workdir, jail, &shared).await
+        };
+        match moved.await {
+            Ok(()) => {
+                tracing::info!(sandbox = id, %hypervisor, "moved the sandbox's files into its jail")
+            }
+            Err(err) => {
+                tracing::error!(sandbox = id, %err, "could not move the sandbox's files into its jail")
+            }
+        }
+    }
+
     /// Records which remote addresses share a private network with sandboxes
     /// here, then re-renders so mesh traffic is permitted.
     pub async fn set_remote_members(
@@ -1791,6 +1915,17 @@ impl SandboxManager {
             _ = tokio::time::sleep(interval) => {}
             _ = self.announce.notified() => {}
         }
+    }
+
+    /// Refuses work needing a hypervisor this node does not offer.
+    #[allow(clippy::result_large_err)]
+    pub fn require_hypervisor(&self, hypervisor: Hypervisor) -> Result<(), Status> {
+        if self.config.hypervisors.contains(&hypervisor) {
+            return Ok(());
+        }
+        Err(Status::failed_precondition(format!(
+            "this node does not run {hypervisor}; start burrowd with --hypervisors including it"
+        )))
     }
 
     pub fn is_draining(&self) -> bool {
@@ -2047,9 +2182,32 @@ impl SandboxManager {
         // Not returned early when there are no rows: a node that crashed
         // mid-create has nothing recorded and everything to clean up.
         let (mut restored, mut discarded) = (0, 0);
+        // Sandboxes left out of service whose files must survive the orphan
+        // sweep below.
+        let mut held = std::collections::HashSet::new();
         for row in rows {
-            let workdir = self.config.sandbox_dir(&row.id);
-            let snapshot = workdir.join(burrow_firecracker::SNAPSHOT_FILE);
+            // Read before anything else, because it decides where the
+            // sandbox's files are. Secrets are sealed field by field, so the
+            // record decodes without them.
+            let named = <common::Sandbox as prost::Message>::decode(&row.record[..])
+                .map(|record| record.hypervisor)
+                .unwrap_or_default();
+            // A hypervisor this build does not know (a newer build's, say)
+            // puts the files somewhere this one cannot look, and not finding
+            // a snapshot there is no reason to destroy the sandbox.
+            let Some(hypervisor) = Hypervisor::from_record(&named) else {
+                tracing::error!(
+                    sandbox = row.id,
+                    hypervisor = named,
+                    "sandbox runs under a hypervisor this build does not know; left out of \
+                     service with its state untouched"
+                );
+                held.insert(row.id.clone());
+                continue;
+            };
+            let workdir = self.config.sandbox_dir(&row.id, hypervisor);
+            self.move_into_jail(&row.id, hypervisor, &workdir).await;
+            let snapshot = workdir.join(hypervisor.layout().state);
             let resumable = row.state == common::SandboxState::Suspended as i32
                 && tokio::fs::try_exists(&snapshot).await.unwrap_or(false);
             // A stopped sandbox is its disks: nothing of the VM to find.
@@ -2095,7 +2253,9 @@ impl SandboxManager {
                 self.volumes.release_all(&row.id);
                 continue;
             };
-            if let Err(err) = tap::create(&lease).await {
+            if hypervisor.capabilities().is_tap_networked
+                && let Err(err) = tap::create(&lease).await
+            {
                 tracing::error!(sandbox = row.id, %err, "cannot recreate tap; skipping");
                 self.ipam.lock().await.release(&row.id);
                 self.volumes.release_all(&row.id);
@@ -2134,13 +2294,16 @@ impl SandboxManager {
                 ..Default::default()
             };
             let is_systemd = self.image_environment(&record.template).await.systemd;
+            let guest_os = burrow_vmm::GuestOs::from_record(&record.guest_os).unwrap_or_default();
             let spec = self.build_spec(
-                &row.id, &workdir, &resources, &lease, &row.tap, &volumes, is_systemd,
+                &row.id, &workdir, hypervisor, guest_os, &resources, &lease, &row.tap, &volumes,
+                is_systemd,
             );
 
             let sandbox = Arc::new(RunningSandbox {
                 id: record.id.clone(),
                 template: record.template.clone(),
+                hypervisor,
                 base_record: std::sync::Mutex::new(record),
                 state: std::sync::atomic::AtomicI32::new(row.state),
                 vm: Mutex::new(None),
@@ -2164,7 +2327,9 @@ impl SandboxManager {
                 // Rebuilt from disk rather than persisted: the files are the
                 // record, and a chain that disagreed with them would fail
                 // every restore.
-                memory_chain: Mutex::new(discover_memory_chain(&workdir).await),
+                memory_chain: Mutex::new(
+                    discover_memory_chain(&workdir, hypervisor.layout()).await,
+                ),
                 // Carried forward from the stored record: what the sandbox
                 // spent before the daemon restarted is still what it spent.
                 // The raw readings are not restored, because the counters they
@@ -2210,7 +2375,7 @@ impl SandboxManager {
             }
         }
 
-        self.collect_orphan_workdirs().await;
+        self.collect_orphan_workdirs(&held).await;
         tracing::info!(restored, discarded, "sandbox recovery complete");
         if let Err(err) = self.sync_firewall().await {
             tracing::error!(%err, "recovered sandboxes have no firewall rules");
@@ -2221,7 +2386,7 @@ impl SandboxManager {
     ///
     /// These accumulate from crashes. Each holds a scratch disk and possibly
     /// a memory snapshot, so left alone they quietly consume the node's disk.
-    async fn collect_orphan_workdirs(&self) {
+    async fn collect_orphan_workdirs(&self, held: &std::collections::HashSet<String>) {
         // An import stages under build/ and removes its directory when it is
         // done; one that died mid-unpack, out of disk say, left gigabytes
         // nothing will read.
@@ -2235,8 +2400,9 @@ impl SandboxManager {
         }
         crate::staged::Cache::new(&self.config.data_dir).prune();
         crate::template::sweep_pending(&self.config.data_dir).await;
-        let known: std::collections::HashSet<String> =
+        let mut known: std::collections::HashSet<String> =
             self.sandboxes.lock().await.keys().cloned().collect();
+        known.extend(held.iter().cloned());
 
         // Both roots are scanned, not one: with `--jail` a sandbox's workdir
         // is its chroot under the jailer's base, so scanning only
@@ -2533,16 +2699,63 @@ impl SandboxManager {
     /// rules never landed is a sandbox whose network policy is not being
     /// enforced, and whoever asked for it has to hear about that.
     async fn sync_firewall(&self) -> Result<(), Status> {
-        // Held for the whole of this function, snapshot through apply: see the
-        // field's own comment for what overlapping syncs would otherwise leave
-        // the node enforcing.
+        // Held snapshot through apply: see the field's own comment for what
+        // overlapping syncs would otherwise leave the node enforcing.
         let _ordered = self.firewall.lock().await;
+        self.render_firewall(None).await
+    }
 
+    /// Puts a provisioned sandbox in the map with its rules already in force.
+    ///
+    /// Rendered with the sandbox and applied before it is inserted, under the
+    /// one firewall lock, so no other render can land in between and leave it
+    /// out. A failure registers nothing: the caller still holds the only
+    /// handle and tears the sandbox down, so the error it returns is true.
+    /// The guest may be running already, but a tap the ruleset does not name
+    /// has every packet dropped by the anti-spoofing chain, so it has had no
+    /// network until now.
+    async fn register(&self, sandbox: &Arc<RunningSandbox>) -> Result<(), Status> {
+        let _ordered = self.firewall.lock().await;
+        self.render_firewall(Some(sandbox)).await?;
+        self.sandboxes
+            .lock()
+            .await
+            .insert(sandbox.id().to_string(), Arc::clone(sandbox));
+        Ok(())
+    }
+
+    /// [`Self::register`], tearing the sandbox down when it fails.
+    async fn register_or_discard(&self, sandbox: &Arc<RunningSandbox>) -> Result<(), Status> {
+        let Err(err) = self.register(sandbox).await else {
+            return Ok(());
+        };
+        if let Err(teardown) = self.tear_down(Arc::clone(sandbox)).await {
+            tracing::warn!(sandbox = sandbox.id(), err = %teardown, "could not release a sandbox whose rules did not apply");
+        }
+        Err(err)
+    }
+
+    /// Renders and applies the ruleset for every sandbox in the map, plus
+    /// `pending`. The caller holds the firewall lock.
+    async fn render_firewall(&self, pending: Option<&Arc<RunningSandbox>>) -> Result<(), Status> {
         // The render below flushes the counter table, so what it has counted
         // has to be banked before it is rebuilt.
         self.sample_usage().await;
 
         let sandboxes = self.sandboxes.lock().await;
+        let all: Vec<&Arc<RunningSandbox>> = sandboxes.values().chain(pending).collect();
+        // nftables is Linux's. A node elsewhere renders the same policies for
+        // its sandboxes' userspace stacks and needs no ruleset so long as none
+        // of them has a tap.
+        let is_ruleset_needed = cfg!(target_os = "linux")
+            || all
+                .iter()
+                .any(|sandbox| sandbox.hypervisor.capabilities().is_tap_networked);
+        let untapped: std::collections::HashSet<String> = all
+            .iter()
+            .filter(|sandbox| !sandbox.hypervisor.capabilities().is_tap_networked)
+            .map(|sandbox| sandbox.id().to_string())
+            .collect();
         let ports = self.ports.lock().await;
 
         // Private-network membership: sandboxes that share a named network may
@@ -2551,7 +2764,7 @@ impl SandboxManager {
         // Keyed by owned names: the record they come from is a snapshot taken
         // under a lock, not something to borrow from.
         let mut members: HashMap<String, Vec<std::net::Ipv4Addr>> = HashMap::new();
-        for sandbox in sandboxes.values() {
+        for sandbox in &all {
             for network in networks_of(&sandbox.record()) {
                 members
                     .entry(network.to_string())
@@ -2569,7 +2782,7 @@ impl SandboxManager {
             String,
             Vec<burrow_proxy::directory::Member>,
         > = std::collections::BTreeMap::new();
-        for sandbox in sandboxes.values() {
+        for sandbox in &all {
             let record = sandbox.record();
             for membership in record
                 .policy
@@ -2610,8 +2823,8 @@ impl SandboxManager {
             }
         }
         self.directory.replace(directory);
-        let rules: Vec<firewall::SandboxRules> = sandboxes
-            .values()
+        let rules: Vec<firewall::SandboxRules> = all
+            .iter()
             .map(|sandbox| {
                 let own_ip = sandbox.lease.guest_ip;
                 let record = sandbox.record();
@@ -2666,12 +2879,12 @@ impl SandboxManager {
         // refreshed from the same snapshot that produced the firewall rules;
         // otherwise a sandbox could be redirected to a proxy that does not yet
         // know its policy and would deny everything.
-        let sandbox_ip6: HashMap<std::net::Ipv4Addr, std::net::Ipv6Addr> = sandboxes
-            .values()
+        let sandbox_ip6: HashMap<std::net::Ipv4Addr, std::net::Ipv6Addr> = all
+            .iter()
             .map(|sandbox| (sandbox.lease.guest_ip, sandbox.lease.guest_ip6()))
             .collect();
-        let by_guest_ip: HashMap<std::net::Ipv4Addr, burrow_proxy::SandboxPolicy> = sandboxes
-            .values()
+        let by_guest_ip: HashMap<std::net::Ipv4Addr, burrow_proxy::SandboxPolicy> = all
+            .iter()
             .map(|sandbox| {
                 let record = sandbox.record();
                 let network = record.policy.as_ref().and_then(|p| p.network.as_ref());
@@ -2739,6 +2952,14 @@ impl SandboxManager {
         drop(ports);
         drop(sandboxes);
 
+        // A sandbox without a tap is held to the very policy the proxy table
+        // and the ruleset get, by its own stack.
+        for sandbox_rules in rules.iter().filter(|r| untapped.contains(&r.sandbox_id)) {
+            if let Some(proxy) = by_guest_ip.get(&sandbox_rules.guest_ip) {
+                self.usernets.update(proxy, sandbox_rules).await;
+            }
+        }
+
         // Both of a sandbox's addresses map to its one policy: it is the same
         // sandbox whichever it reaches the proxy from, and an entry missing
         // for one family would read as an unknown source and deny everything.
@@ -2768,6 +2989,9 @@ impl SandboxManager {
         // Both families: the proxy dials v6 now, so a control plane reachable
         // over it has to be refused there as well as in the ruleset.
         self.denied.replace(denied.iter().copied());
+        if !is_ruleset_needed {
+            return Ok(());
+        }
         firewall::apply(&firewall::render_with(&rules, &denied))
             .await
             .map_err(|err| {
@@ -2937,6 +3161,12 @@ impl SandboxManager {
     /// Records the authority sandboxes that opt in should trust.
     pub fn set_inspection_ca(&self, pem: String) {
         *self.inspection_ca.lock().unwrap() = Some(pem);
+    }
+
+    /// The node's egress pieces for its sandboxes' userspace network stacks.
+    #[cfg(target_os = "macos")]
+    pub fn set_usernet_node(&self, node: burrow_net::usernet::Node) {
+        self.usernets.set_node(node);
     }
 
     /// The CA to hand this sandbox, if its policy asked for inspection.
@@ -3352,23 +3582,25 @@ impl SandboxManager {
 
     /// Builds the VM description for a sandbox.
     ///
-    /// Shared by creation and recovery: Firecracker requires a restored VM to
-    /// be described with the same resources it was snapshotted with, so the
-    /// two paths must not be able to drift apart.
+    /// Shared by creation and recovery: a restored VM has to be described
+    /// with the same resources it was snapshotted with, so the two paths must
+    /// not be able to drift apart.
     #[allow(clippy::too_many_arguments)]
     fn build_spec(
         &self,
         id: &str,
         workdir: &Path,
+        hypervisor: Hypervisor,
+        guest_os: burrow_vmm::GuestOs,
         resources: &common::ResourcePolicy,
         lease: &Lease,
         tap_name: &str,
         volumes: &[common::VolumeMount],
         is_systemd: bool,
-    ) -> MicroVmSpec {
-        let mut spec = MicroVmSpec::new(id.to_string(), workdir);
-        spec.firecracker_bin = self.config.firecracker_bin.clone();
-        spec.kernel = TEMPLATE_KERNEL.into();
+    ) -> VmSpec {
+        let mut spec = VmSpec::new(id.to_string(), workdir, self.config.backend(hypervisor));
+        spec.guest_os = guest_os;
+        let capabilities = hypervisor.capabilities();
         spec.vcpus = resources.vcpus.max(1);
         spec.mem_mib = if resources.mem_mib == 0 {
             512
@@ -3379,18 +3611,17 @@ impl SandboxManager {
         // Firecracker bounds guest memory on its own, but nothing bounds host
         // CPU: a 1-vCPU guest spinning saturates a core. The cgroup is what
         // stops one sandbox starving its neighbours.
-        spec.limits = burrow_firecracker::Limits {
+        spec.limits = burrow_vmm::Limits {
             cpus: spec.vcpus,
             // Headroom over the guest allocation for the VMM's own footprint;
-            // too tight and Firecracker itself gets OOM-killed.
-            memory_mib: spec.mem_mib + VMM_MEMORY_HEADROOM_MIB,
+            // too tight and the VMM itself gets OOM-killed.
+            memory_mib: spec.mem_mib + capabilities.memory_headroom_mib,
             pids_max: 0,
         };
         spec.cgroup_root = self.config.cgroup_root.clone();
         spec.is_limits_required = self.config.is_resource_limits_required;
-        spec.jail = self.config.jail.clone();
         // Only consulted on restore; a cold boot has no memory file to serve.
-        spec.is_memory_lazy = self.config.is_memory_lazy;
+        spec.is_memory_lazy = self.config.is_memory_lazy && capabilities.is_lazy_memory_supported;
         // Required for diff snapshots, and only useful for them. It costs a
         // little guest write performance, which is a good trade against
         // writing the whole of memory on every suspend.
@@ -3420,17 +3651,31 @@ impl SandboxManager {
             tap: tap_name.to_string(),
             guest_mac: Some(lease.guest_mac()),
         });
-        spec.boot_args = format!(
-            "{} root=/dev/vda ro init=/usr/bin/burrow-guest {} burrow.dns={} burrow.ip6={}/{} burrow.ip6gw={} {} {}",
-            burrow_firecracker::DEFAULT_BOOT_ARGS,
-            lease.kernel_ip_arg(),
-            lease.host_ip,
-            lease.guest_ip6(),
-            lease.prefix_len6(),
-            lease.host_ip6(),
-            guest_mode_arg(is_systemd),
-            self.config.extra_boot_args
-        );
+        spec.boot = burrow_vmm::Boot::Kernel {
+            kernel: TEMPLATE_KERNEL.into(),
+            cmdline: format!(
+                "{} root=/dev/vda ro init=/usr/bin/burrow-guest {} burrow.dns={} burrow.ip6={}/{} burrow.ip6gw={} {} {}",
+                burrow_vmm::DEFAULT_BOOT_ARGS,
+                lease.kernel_ip_arg(),
+                lease.host_ip,
+                lease.guest_ip6(),
+                lease.prefix_len6(),
+                lease.host_ip6(),
+                guest_mode_arg(is_systemd),
+                self.config.extra_boot_args
+            ),
+        };
+        if crate::macnode::is_macos(guest_os)
+            && let Err(err) = crate::macnode::apply(&mut spec, resources)
+        {
+            // Booting the unchanged spec fails with the backend's own
+            // refusal; this says why it got there.
+            tracing::warn!(
+                sandbox = id,
+                err = err.message(),
+                "cannot describe the macOS machine"
+            );
+        }
         spec
     }
 
@@ -3454,8 +3699,16 @@ impl SandboxManager {
 
         let resources = policy.resources.unwrap_or_default();
         // A create of a shape with no warm snapshot is exactly the signal that
-        // one is worth building, so the next create of it restores.
-        self.warm_for_demand(&ShapeKey::of(&template, &resources));
+        // one is worth building, so the next create of it restores. Not for a
+        // backend whose restore loses to its boot.
+        let is_warmable = self
+            .image_environment(&template)
+            .await
+            .machine()
+            .is_ok_and(|(hypervisor, _)| hypervisor.capabilities().is_warm_pool_supported);
+        if is_warmable {
+            self.warm_for_demand(&ShapeKey::of(&template, &resources));
+        }
         self.create_seeded(id, template, policy, metadata, node_id, None, name)
             .await
     }
@@ -3508,11 +3761,14 @@ impl SandboxManager {
             stamped.metadata = metadata;
             stamped.name = name;
         }
-        self.sandboxes
-            .lock()
-            .await
-            .insert(sandbox.id().to_string(), sandbox.clone());
+        // Only now that the sandbox exists does its policy exist to render, so
+        // its rules land here, before anything can reach it. The window a
+        // recycled address block inheriting the previous holder's rules would
+        // open is closed at the source instead, by [`Self::delete`] returning
+        // the lease only after the render that stopped naming it.
+        let registered = self.register_or_discard(&sandbox).await;
         self.creating.lock().await.remove(&id);
+        registered?;
         // A create is a VM starting, whether it cold-booted or restored a warm
         // template snapshot: either way the guest begins at the image's state
         // rather than at one this sandbox left behind.
@@ -3521,23 +3777,9 @@ impl SandboxManager {
         let record = sandbox.record();
         let registered = std::time::Instant::now();
         self.persist(&sandbox).await;
-        let persist_ms = registered.elapsed();
-        // Only now that the sandbox is registered does its policy exist to
-        // render, so the firewall is applied after insertion, not before.
-        //
-        // Nothing is rendered earlier, even though the tap exists and the guest
-        // has booted by this point. A render before insertion would be a render
-        // *without* this sandbox, which is the ruleset that is already
-        // installed; there is nothing for it to correct. The window it might
-        // otherwise have closed, a recycled address block inheriting the
-        // previous holder's rules, is closed at the source instead, by
-        // [`Self::delete`] returning the lease only after the render that
-        // stopped naming it.
-        self.sync_firewall().await?;
         tracing::debug!(
             sandbox = id,
-            persist_ms = persist_ms.as_millis() as u64,
-            firewall_ms = (registered.elapsed() - persist_ms).as_millis() as u64,
+            persist_ms = registered.elapsed().as_millis() as u64,
             "create tail"
         );
         // The other half of the reclaim: a warm create's handshake may have
@@ -3562,7 +3804,30 @@ impl SandboxManager {
         // itself, so this is the one that cannot be routed around.
         crate::template::validate_name(&template)?;
         let templates_dir = self.config.templates_dir();
-        let workdir = self.config.sandbox_dir(&id);
+        // The template decides the hypervisor, for this sandbox and every VM
+        // it will ever run.
+        let environment = self.image_environment(&template).await;
+        let (hypervisor, guest_os) = environment.machine()?;
+        self.require_hypervisor(hypervisor)?;
+        let capabilities = hypervisor.capabilities();
+        if !capabilities.runs(guest_os) {
+            return Err(Status::failed_precondition(format!(
+                "template {template} is a {} guest, which {hypervisor} cannot run",
+                guest_os.as_str()
+            )));
+        }
+        if crate::macnode::is_macos(guest_os) {
+            let running = self
+                .sandboxes
+                .lock()
+                .await
+                .values()
+                .filter(|sandbox| sandbox.hypervisor == hypervisor && sandbox.is_running())
+                .count();
+            crate::macnode::check_running(running)?;
+        }
+        let layout = hypervisor.layout();
+        let workdir = self.config.sandbox_dir(&id, hypervisor);
         let resources = policy.resources.unwrap_or_default();
         let scratch_mib = if resources.scratch_disk_mib == 0 {
             DEFAULT_SCRATCH_MIB
@@ -3594,7 +3859,15 @@ impl SandboxManager {
         // every failure below answers through [`Provisioning::fail`].
         let mut guard = Provisioning::new(self, &id, &workdir);
 
+        // A warm snapshot was taken without volumes, so they can only reach a
+        // sandbox restored from one by being hotplugged; where they cannot
+        // be, it boots cold and takes them at boot.
         let from_warm = seed_scratch.is_none()
+            && capabilities.is_warm_pool_supported
+            && (capabilities.is_drive_hotplug_supported
+                || crate::volume::block_mounts(&policy.volumes)
+                    .next()
+                    .is_none())
             && crate::warm::is_warm_for(
                 &templates_dir,
                 &template,
@@ -3643,7 +3916,13 @@ impl SandboxManager {
                 );
                 warm = false;
             }
-            if !warm {
+            if crate::macnode::is_macos(guest_os) {
+                crate::macnode::prepare(&templates_dir.join(&template), &workdir)
+                    .await
+                    .map_err(|err| {
+                        Status::failed_precondition(format!("template {template:?}: {err}"))
+                    })?;
+            } else if !warm {
                 prepare_workdir(&templates_dir.join(&template), &workdir)
                     .await
                     .map_err(|err| {
@@ -3672,7 +3951,7 @@ impl SandboxManager {
             let files_ms = staging_began.elapsed();
             // Ownership is handed over inside the same task, because it has to
             // follow staging and nothing else waits on it.
-            if let Some(jail) = &self.config.jail {
+            if let Some(jail) = self.config.jail_for(hypervisor) {
                 // The template's own files are always hard links; a warm boot
                 // additionally hard-links the snapshot state and memory image
                 // (and, if one exists, the prefetch plan) instead of writing
@@ -3683,8 +3962,7 @@ impl SandboxManager {
                 let mut shared: std::collections::HashSet<String> =
                     [TEMPLATE_KERNEL.to_string(), TEMPLATE_ROOTFS.to_string()].into();
                 if warm {
-                    shared.insert(burrow_firecracker::SNAPSHOT_FILE.to_string());
-                    shared.insert(burrow_firecracker::SNAPSHOT_MEM_FILE.to_string());
+                    shared.extend(layout.files().map(String::from));
                     shared.insert(crate::warm::PREFETCH_PLAN.to_string());
                 }
                 for (index, mount) in crate::volume::block_mounts(&policy.volumes) {
@@ -3707,8 +3985,13 @@ impl SandboxManager {
             ))
         };
 
+        // A backend without a tap gets no interface at all, and an empty name
+        // that nothing tears down.
         let tap_timed = async {
             let began = std::time::Instant::now();
+            if !capabilities.is_tap_networked {
+                return (Ok(String::new()), began.elapsed());
+            }
             (tap::create(&lease).await, began.elapsed())
         };
         let staged_at = std::time::Instant::now();
@@ -3717,7 +4000,7 @@ impl SandboxManager {
         // Recorded before either half is inspected: the tap may well have come
         // up alongside a staging failure, and an interface belonging to a
         // sandbox that never existed must not be left behind.
-        guard.tap = tap.as_ref().ok().cloned();
+        guard.tap = tap.as_ref().ok().filter(|name| !name.is_empty()).cloned();
         let (from_warm, files_ms, jail_ms) = match staged {
             Ok(parts) => parts,
             Err(err) => return Err(guard.fail(err).await),
@@ -3737,10 +4020,12 @@ impl SandboxManager {
         // once it is running. A cold boot has no such constraint and takes them
         // at boot, which needs no rescan in the guest.
         let boot_volumes: &[common::VolumeMount] = if from_warm { &[] } else { &policy.volumes };
-        let is_systemd = self.image_environment(&template).await.systemd;
+        let is_systemd = environment.systemd;
         let mut spec = self.build_spec(
             &id,
             &workdir,
+            hypervisor,
+            guest_os,
             &resources,
             &lease,
             &tap_name,
@@ -3750,11 +4035,15 @@ impl SandboxManager {
         // Only meaningful on a restore, and only when the template was
         // profiled; a create that boots cold has no snapshot to prefetch from.
         if from_warm
+            && capabilities.is_lazy_memory_supported
             && tokio::fs::try_exists(workdir.join(crate::warm::PREFETCH_PLAN))
                 .await
                 .unwrap_or(false)
         {
             spec.prefetch = Some(crate::warm::PREFETCH_PLAN.to_string());
+        }
+        if let Err(err) = self.usernets.attach(&id, &lease, &mut spec) {
+            return Err(guard.fail(err).await);
         }
         let boot_spec = spec.clone();
         record_working_set(&mut spec, self.config.object_store.is_some());
@@ -3763,11 +4052,11 @@ impl SandboxManager {
         let started_vm = if from_warm {
             // The override points the snapshotted interface at this sandbox's
             // own tap; the address inside the guest is corrected on handshake.
-            MicroVm::restore(spec, true)
+            Vm::restore(spec, true)
                 .await
                 .map_err(|err| Status::internal(format!("warm restore failed: {err}")))
         } else {
-            MicroVm::boot(spec)
+            Vm::boot(spec)
                 .await
                 .map_err(|err| Status::internal(format!("boot failed: {err}")))
         };
@@ -3780,7 +4069,7 @@ impl SandboxManager {
         // its bus and mount them: firecracker cannot notify the guest itself.
         if from_warm {
             for (index, mount) in crate::volume::block_mounts(&policy.volumes) {
-                let drive = burrow_firecracker::DriveSpec {
+                let drive = DriveSpec {
                     id: format!("volume{index}"),
                     path: volume_image(index),
                     is_root: false,
@@ -3837,11 +4126,8 @@ impl SandboxManager {
             // down rather than leaving an unusable sandbox in the registry. The
             // first connection that succeeds is kept, rather than probing with
             // one and then dialling another.
-            let connected = guestconn::connect_when_ready(
-                guard.vm().vsock_uds_path(),
-                self.config.agent_timeout,
-            )
-            .await;
+            let connected =
+                guestconn::connect_when_ready(guard.vm().guest(), self.config.agent_timeout).await;
             let (agent, accepted_at) = match connected {
                 Ok(ready) => ready,
                 Err(err) => {
@@ -3864,7 +4150,7 @@ impl SandboxManager {
             // exhaust the node's taps and address blocks one create at a time.
             let guest_timing = match guestconn::handshake_upgrading(
                 agent,
-                guard.vm().vsock_uds_path(),
+                guard.vm().guest(),
                 request.clone(),
                 self.config.guest_upgrade.as_deref(),
                 self.config.agent_timeout,
@@ -3917,6 +4203,8 @@ impl SandboxManager {
             arch: String::new(),
             firecracker_version: String::new(),
             access_revoked_at: 0,
+            hypervisor: hypervisor.to_string(),
+            guest_os: guest_os.as_str().to_string(),
         };
 
         // The one-line summary, unchanged in shape: VM, guest wake, handshake,
@@ -3967,6 +4255,7 @@ impl SandboxManager {
         let sandbox = Arc::new(RunningSandbox {
             id: record.id.clone(),
             template: record.template.clone(),
+            hypervisor,
             base_record: std::sync::Mutex::new(record.clone()),
             state: std::sync::atomic::AtomicI32::new(common::SandboxState::Running as i32),
             vm: Mutex::new(Some(vm)),
@@ -3980,7 +4269,7 @@ impl SandboxManager {
             // A warm-created sandbox already restores from the template's
             // memory file, so its first suspend has a base to diff against.
             memory_chain: Mutex::new(if from_warm {
-                vec![burrow_firecracker::SNAPSHOT_MEM_FILE.to_string()]
+                layout.memory.map(String::from).into_iter().collect()
             } else {
                 Vec::new()
             }),
@@ -4007,6 +4296,7 @@ impl SandboxManager {
     pub async fn pause(&self, id: &str) -> Result<common::Sandbox, Status> {
         let sandbox = self.get(id).await?;
         sandbox.suspend().await?;
+        self.usernets.detach(id, false);
         // The VM is stopped, so nothing is touching the volumes; a suspended
         // sandbox holding them would make a volume unusable until deleted.
         self.volumes.release_all(id);
@@ -4183,6 +4473,7 @@ impl SandboxManager {
                 RestoreSource::Snapshot {
                     id: snapshot_id,
                     template: manifest.template.clone(),
+                    hypervisor: manifest.hypervisor()?,
                 },
                 id.clone(),
                 policy,
@@ -4191,19 +4482,19 @@ impl SandboxManager {
                 name,
             )
             .await;
+        let registered = match &provisioned {
+            Ok(sandbox) => self.register_or_discard(sandbox).await,
+            Err(_) => Ok(()),
+        };
         self.creating.lock().await.remove(&id);
         let sandbox = provisioned?;
+        registered?;
 
-        self.sandboxes
-            .lock()
-            .await
-            .insert(id.clone(), sandbox.clone());
         self.emit(&sandbox, EVENT_CREATED, &format!("snapshot:{snapshot_id}"))
             .await;
         self.open_session(&sandbox, STARTED_RESTORE).await;
         let record = sandbox.record();
         self.persist(&sandbox).await;
-        self.sync_firewall().await?;
         // The snapshot has just proved itself worth keeping.
         self.snapshots.touch(snapshot_id).await;
         self.compact_if_deep(&sandbox);
@@ -4245,21 +4536,21 @@ impl SandboxManager {
         let forked = self
             .fork_inner(&source, child_id.clone(), policy, node_id, name)
             .await;
+        // The child has its own address and its own policy, neither of which
+        // the ruleset knows about until now.
+        let registered = match &forked {
+            Ok(sandbox) => self.register_or_discard(sandbox).await,
+            Err(_) => Ok(()),
+        };
         self.creating.lock().await.remove(&child_id);
         let sandbox = forked?;
+        registered?;
 
-        self.sandboxes
-            .lock()
-            .await
-            .insert(child_id.clone(), sandbox.clone());
         self.emit(&sandbox, EVENT_CREATED, &format!("fork:{source_id}"))
             .await;
         self.open_session(&sandbox, STARTED_RESTORE).await;
         let record = sandbox.record();
         self.persist(&sandbox).await;
-        // The child has its own address and its own policy, neither of which
-        // the ruleset knows about until now.
-        self.sync_firewall().await?;
         self.compact_if_deep(&sandbox);
         tracing::info!(source = source_id, sandbox = child_id, "sandbox forked");
         Ok(record)
@@ -4391,8 +4682,25 @@ impl SandboxManager {
         node_id: String,
         name: String,
     ) -> Result<Arc<RunningSandbox>, Status> {
-        let workdir = self.config.sandbox_dir(&id);
+        // State restores only under the hypervisor that wrote it, so the
+        // source decides, whatever the template says now.
+        let hypervisor = source.hypervisor()?;
+        self.require_hypervisor(hypervisor)?;
+        let capabilities = hypervisor.capabilities();
+        let workdir = self.config.sandbox_dir(&id, hypervisor);
         let resources = policy.resources.unwrap_or_default();
+        // The state was captured without volumes, so they could only arrive by
+        // hotplug.
+        if !capabilities.is_drive_hotplug_supported
+            && crate::volume::block_mounts(&policy.volumes)
+                .next()
+                .is_some()
+        {
+            return Err(Status::failed_precondition(format!(
+                "{hypervisor} cannot attach a volume to a restored sandbox; create one from the \
+                 template with the volume instead"
+            )));
+        }
 
         // A restored sandbox mounts volumes exactly as a created one does. It
         // used to take them only as far as the spec and the handshake, which
@@ -4454,7 +4762,7 @@ impl SandboxManager {
                         Status::internal(format!("attaching volume {}: {err}", mount.volume))
                     })?;
             }
-            if let Some(jail) = &self.config.jail {
+            if let Some(jail) = self.config.jail_for(hypervisor) {
                 // Both a fork and a snapshot restore hard-link only the
                 // template's own kernel and rootfs; the snapshot state, the
                 // memory chain and the scratch disk are copies (or reflinks)
@@ -4485,10 +4793,17 @@ impl SandboxManager {
 
         let (staged, tap) = tokio::join!(stage, tap::create(&lease));
         guard.tap = tap.as_ref().ok().cloned();
-        let (chain, arriving) = match staged {
+        let (chain, mut arriving) = match staged {
             Ok(staged) => staged,
             Err(err) => return Err(guard.fail(err).await),
         };
+        // Without the page-fault handler the guest cannot take memory as it
+        // faults, so a base still arriving is waited for in full.
+        if !capabilities.is_lazy_memory_supported
+            && let Some(hydrator) = arriving.take()
+        {
+            hydrator.wait().await;
+        }
         let tap_name = match tap {
             Ok(name) => name,
             Err(err) => {
@@ -4507,9 +4822,21 @@ impl SandboxManager {
             RestoreSource::Stored { manifest, .. } => manifest.is_systemd,
             _ => self.image_environment(&source.template()).await.systemd,
         };
+        let guest_os = match &source {
+            RestoreSource::Sandbox(source) => {
+                burrow_vmm::GuestOs::from_record(&source.record().guest_os).unwrap_or_default()
+            }
+            _ => self
+                .image_environment(&source.template())
+                .await
+                .machine()
+                .map_or_else(|_| Default::default(), |(_, os)| os),
+        };
         let mut spec = self.build_spec(
             &id,
             &workdir,
+            hypervisor,
+            guest_os,
             &resources,
             &lease,
             &tap_name,
@@ -4522,23 +4849,23 @@ impl SandboxManager {
         // across a chain, since every layer is laid out as the base is. A
         // fork or a snapshot restore would otherwise take those pages one
         // stalled vCPU at a time.
-        let linked = self.link_prefetch_plan(&source.template(), &workdir).await;
-        let merged = matches!(source, RestoreSource::Stored { .. })
-            && crate::durable::merge_working_set(&workdir, crate::warm::PREFETCH_PLAN)
-                .await
-                .unwrap_or(false);
-        if linked || merged {
-            spec.prefetch = Some(crate::warm::PREFETCH_PLAN.to_string());
+        if capabilities.is_lazy_memory_supported {
+            let linked = self.link_prefetch_plan(&source.template(), &workdir).await;
+            let merged = matches!(source, RestoreSource::Stored { .. })
+                && crate::durable::merge_working_set(&workdir, crate::warm::PREFETCH_PLAN)
+                    .await
+                    .unwrap_or(false);
+            if linked || merged {
+                spec.prefetch = Some(crate::warm::PREFETCH_PLAN.to_string());
+            }
         }
         let boot_spec = spec.clone();
         spec.memory_chain = chain.clone();
-        spec.memory_source = arriving
-            .clone()
-            .map(|h| burrow_firecracker::MemorySource(h));
+        spec.memory_source = arriving.clone().map(|h| burrow_vmm::MemorySource(h));
         record_working_set(&mut spec, self.config.object_store.is_some());
 
         let started = std::time::Instant::now();
-        match MicroVm::restore(spec, true).await {
+        match Vm::restore(spec, true).await {
             Ok(vm) => guard.vm = Some(vm),
             Err(err) => {
                 return Err(guard
@@ -4548,7 +4875,7 @@ impl SandboxManager {
         }
 
         for (index, mount) in crate::volume::block_mounts(&policy.volumes) {
-            let drive = burrow_firecracker::DriveSpec {
+            let drive = DriveSpec {
                 id: format!("volume{index}"),
                 path: volume_image(index),
                 is_root: false,
@@ -4608,6 +4935,8 @@ impl SandboxManager {
             arch: String::new(),
             firecracker_version: String::new(),
             access_revoked_at: 0,
+            hypervisor: hypervisor.to_string(),
+            guest_os: guest_os.as_str().to_string(),
         };
         tracing::info!(
             sandbox = id,
@@ -4620,6 +4949,7 @@ impl SandboxManager {
         let sandbox = Arc::new(RunningSandbox {
             id: record.id.clone(),
             template: record.template.clone(),
+            hypervisor,
             base_record: std::sync::Mutex::new(record),
             state: std::sync::atomic::AtomicI32::new(common::SandboxState::Running as i32),
             vm: Mutex::new(Some(vm)),
@@ -4670,6 +5000,14 @@ impl SandboxManager {
             return Err(err);
         }
         sandbox.durable.invalidate();
+        {
+            let mut spec = sandbox.spec.lock().unwrap();
+            if let Err(err) = self.usernets.attach(id, &sandbox.lease, &mut spec) {
+                drop(spec);
+                self.volumes.release_all(id);
+                return Err(err);
+            }
+        }
         let resumed = sandbox
             .resume(
                 self.config.agent_timeout,
@@ -4684,6 +5022,17 @@ impl SandboxManager {
             // copy can be made current again.
             self.spawn_upload(&sandbox);
             return Err(err);
+        }
+        // A fresh stack knows nothing of the sandbox's published ports until
+        // a sync hands them over again.
+        if !sandbox.hypervisor.capabilities().is_tap_networked
+            && let Err(err) = self.sync_firewall().await
+        {
+            tracing::warn!(
+                sandbox = id,
+                err = err.message(),
+                "republishing ports after resume"
+            );
         }
         self.open_session(&sandbox, STARTED_RESUME).await;
         self.persist(&sandbox).await;
@@ -4726,7 +5075,7 @@ impl SandboxManager {
         self.volumes.claim(id, &policy.volumes)?;
         // A stop handed the volume images' ownership back with the claims, so
         // the jail has to be given them again before the VMM opens them.
-        if let Some(jail) = &self.config.jail {
+        if let Some(jail) = self.config.jail_for(sandbox.hypervisor) {
             let mut shared: std::collections::HashSet<String> =
                 [TEMPLATE_KERNEL.to_string(), TEMPLATE_ROOTFS.to_string()].into();
             for (index, mount) in crate::volume::block_mounts(&policy.volumes) {
@@ -4742,15 +5091,22 @@ impl SandboxManager {
         }
         let resources = policy.resources.unwrap_or_default();
         let is_systemd = self.image_environment(sandbox.template()).await.systemd;
-        let spec = self.build_spec(
+        let guest_os = burrow_vmm::GuestOs::from_record(&record.guest_os).unwrap_or_default();
+        let mut spec = self.build_spec(
             id,
             &sandbox.workdir,
+            sandbox.hypervisor,
+            guest_os,
             &resources,
             &sandbox.lease,
             &sandbox.tap,
             &policy.volumes,
             is_systemd,
         );
+        if let Err(err) = self.usernets.attach(id, &sandbox.lease, &mut spec) {
+            self.volumes.release_all(id);
+            return Err(err);
+        }
         let request = guestconn::handshake_full(
             false,
             None,
@@ -4769,6 +5125,15 @@ impl SandboxManager {
         {
             self.volumes.release_all(id);
             return Err(err);
+        }
+        if !sandbox.hypervisor.capabilities().is_tap_networked
+            && let Err(err) = self.sync_firewall().await
+        {
+            tracing::warn!(
+                sandbox = id,
+                err = err.message(),
+                "republishing ports after boot"
+            );
         }
         self.open_session(&sandbox, STARTED_BOOT).await;
         self.persist(&sandbox).await;
@@ -4822,9 +5187,12 @@ impl SandboxManager {
     /// map. What the object store holds is the caller's business.
     async fn tear_down(&self, sandbox: Arc<RunningSandbox>) -> Result<(), Status> {
         let id = &sandbox.id().to_string();
+        self.usernets.detach(id, true);
         sandbox.logs.close();
-        if let Some(hydrator) = sandbox.durable.arriving() {
-            hydrator.detach(&sandbox.workdir.join(burrow_firecracker::SNAPSHOT_MEM_FILE));
+        if let (Some(hydrator), Some(memory)) =
+            (sandbox.durable.arriving(), sandbox.layout().memory)
+        {
+            hydrator.detach(&sandbox.workdir.join(memory));
         }
         let tap_name = sandbox.tap.clone();
         // Taken from the sandbox rather than derived from its id: a sandbox
@@ -4973,7 +5341,8 @@ impl SandboxManager {
             },
             is_systemd,
             arch: std::env::consts::ARCH.to_string(),
-            firecracker_version: self.config.firecracker_version.clone(),
+            firecracker_version: self.config.version(sandbox.hypervisor).to_string(),
+            hypervisor: sandbox.hypervisor.to_string(),
             kernel_digest: String::new(),
             rootfs_digest: String::new(),
             cpu_usage_usec: record.cpu_usage_usec,
@@ -5074,7 +5443,9 @@ impl SandboxManager {
     /// Records in the store that a sandbox with stored state is about to run
     /// here. Refused rather than skipped when the store cannot be reached: a
     /// node that adopted the sandbox after this one was written off would
-    /// otherwise resume the same stored state alongside it.
+    /// otherwise resume the same stored state alongside it. Refused for good,
+    /// as `Aborted`, when the store names another node: that node took the
+    /// sandbox while this one was not looking.
     async fn mark_running(&self, sandbox: &Arc<RunningSandbox>) -> Result<(), Status> {
         let Some(store) = &self.config.object_store else {
             return Ok(());
@@ -5090,6 +5461,9 @@ impl SandboxManager {
         crate::durable::mark_running(store, &sandbox.workdir, &mut stored, &node_id)
             .await
             .map_err(|err| {
+                if err.code() == tonic::Code::Aborted {
+                    return err;
+                }
                 Status::unavailable(format!(
                     "sandbox {} is kept in the object store and cannot resume until the store \
                      records it as running here: {}",
@@ -5125,10 +5499,10 @@ impl SandboxManager {
             return;
         };
         let workdir = &sandbox.workdir;
-        match crate::chunks::Hydrator::resume(
-            store.clone(),
-            &workdir.join(burrow_firecracker::SNAPSHOT_MEM_FILE),
-        ) {
+        let Some(memory) = sandbox.layout().memory else {
+            return;
+        };
+        match crate::chunks::Hydrator::resume(store.clone(), &workdir.join(memory)) {
             Some(Ok(hydrator)) => {
                 hydrator.start();
                 *sandbox.durable.hydration.lock().unwrap() = Some(hydrator);
@@ -5337,11 +5711,12 @@ impl SandboxManager {
             drop(gate.lock().await);
         }
         let started = std::time::Instant::now();
-        let manifest = crate::durable::read_manifest(store, &id)
+        let held = crate::durable::read_manifest(store, &id)
             .await?
             .ok_or_else(|| {
                 Status::not_found(format!("sandbox {id} has no state in the object store"))
             })?;
+        let manifest = &held.manifest;
         if manifest.state != crate::durable::STATE_SUSPENDED {
             return Err(Status::failed_precondition(format!(
                 "sandbox {id} was running on {} when it was last heard of; what the object store \
@@ -5349,16 +5724,18 @@ impl SandboxManager {
                 manifest.node_id
             )));
         }
+        let hypervisor = manifest.hypervisor()?;
+        self.require_hypervisor(hypervisor)?;
         if manifest.arch != std::env::consts::ARCH
-            || manifest.firecracker_version != self.config.firecracker_version
+            || manifest.firecracker_version != self.config.version(hypervisor)
         {
             return Err(Status::failed_precondition(format!(
-                "sandbox {id} was stored on {} under Firecracker {} and cannot restore on this \
-                 node ({} under Firecracker {})",
+                "sandbox {id} was stored on {} under {hypervisor} {} and cannot restore on this \
+                 node ({} under {hypervisor} {})",
                 manifest.arch,
                 manifest.firecracker_version,
                 std::env::consts::ARCH,
-                self.config.firecracker_version
+                self.config.version(hypervisor)
             )));
         }
         let mut record = record;
@@ -5371,42 +5748,42 @@ impl SandboxManager {
             }
         }
         let read = started.elapsed();
-        let adopted = self.adopt_inner(store, &manifest, record, node_id).await;
-        self.creating.lock().await.remove(&id);
-        let (sandbox, from) = adopted?;
+        let adopted = self
+            .adopt_inner(store, &held, record, node_id.clone())
+            .await;
+        let (sandbox, from) = match adopted {
+            Ok(adopted) => adopted,
+            Err(err) => {
+                self.creating.lock().await.remove(&id);
+                return Err(err);
+            }
+        };
         let restored = started.elapsed();
         // Waited for here, unlike a create: a sandbox whose guest never
         // answers would otherwise be reclaimed as a failed create, and its
-        // stored state is the only copy there is. Failing the adopt hands
-        // that state back untouched for another attempt.
-        if let Err(err) = sandbox.await_handshake().await {
-            if let Some(vm) = sandbox.vm.lock().await.take() {
-                let _ = vm.kill().await;
-            }
+        // stored state is the only copy there is. Its rules are applied
+        // before it is registered, so a node that cannot apply them has not
+        // let the sandbox run either. Either failure stops the guest and
+        // hands the state back untouched for another attempt.
+        let registered = match sandbox.await_handshake().await {
+            Ok(()) => self.register(&sandbox).await,
+            Err(err) => Err(err),
+        };
+        self.creating.lock().await.remove(&id);
+        if let Err(err) = registered {
             if let Err(err) = self.tear_down(Arc::clone(&sandbox)).await {
                 tracing::warn!(sandbox = id, %err, "could not release a failed adopt");
             }
-            if let Err(err) = crate::durable::write_manifest(store, &manifest).await {
-                tracing::error!(
-                    sandbox = id,
-                    %err,
-                    "adopt failed and the store still says the sandbox runs here"
-                );
-            }
+            self.hand_back(store, &node_id, manifest).await;
             return Err(err);
         }
         let handshaken = started.elapsed();
 
-        self.sandboxes
-            .lock()
-            .await
-            .insert(id.clone(), sandbox.clone());
         self.emit(&sandbox, EVENT_STARTED, &format!("adopted:{from}"))
             .await;
         self.open_session(&sandbox, STARTED_RESUME).await;
         let record = sandbox.record();
         self.persist(&sandbox).await;
-        self.sync_firewall().await?;
         tracing::info!(
             from,
             manifest_ms = read.as_millis() as u64,
@@ -5421,10 +5798,11 @@ impl SandboxManager {
     async fn adopt_inner(
         &self,
         store: &crate::objstore::ObjectStore,
-        manifest: &crate::durable::Manifest,
+        held: &crate::durable::Held,
         record: common::Sandbox,
         node_id: String,
     ) -> Result<(Arc<RunningSandbox>, String), Status> {
+        let manifest = &held.manifest;
         let from = manifest.node_id.clone();
         let mut claimed = manifest.clone();
         claimed.state = crate::durable::STATE_RUNNING.to_string();
@@ -5438,8 +5816,10 @@ impl SandboxManager {
             ..wanted
         });
         // Claimed in the store before the guest starts, the rule a resume
-        // follows too, and handed back if it never does.
-        crate::durable::write_manifest(store, &claimed).await?;
+        // follows too, and handed back if it never does. Conditional on the
+        // manifest read above, so a node that lost the race to another stops
+        // here.
+        crate::durable::replace_manifest(store, Some(held), &claimed).await?;
         let provisioned = self
             .provision_restored(
                 RestoreSource::Stored {
@@ -5449,21 +5829,14 @@ impl SandboxManager {
                 record.id.clone(),
                 policy,
                 record.metadata.clone(),
-                node_id,
+                node_id.clone(),
                 record.name.clone(),
             )
             .await;
         let sandbox = match provisioned {
             Ok(sandbox) => sandbox,
             Err(err) => {
-                if let Err(err) = crate::durable::write_manifest(store, manifest).await {
-                    tracing::error!(
-                        sandbox = record.id,
-                        %err,
-                        "adopt failed and the store still says the sandbox runs here; it cannot \
-                         be adopted again until that is corrected"
-                    );
-                }
+                self.hand_back(store, &node_id, manifest).await;
                 return Err(err);
             }
         };
@@ -5485,6 +5858,25 @@ impl SandboxManager {
             ..Default::default()
         };
         Ok((sandbox, from))
+    }
+
+    /// Puts back the manifest a failed adopt claimed over, provided the store
+    /// still names this node: the guest never ran, or was stopped, so the
+    /// state is exactly as it was read.
+    async fn hand_back(
+        &self,
+        store: &crate::objstore::ObjectStore,
+        node_id: &str,
+        manifest: &crate::durable::Manifest,
+    ) {
+        if let Err(err) = crate::durable::write_held(store, node_id, manifest, false).await {
+            tracing::error!(
+                sandbox = manifest.id,
+                %err,
+                "adopt failed and the store still says the sandbox runs here; it cannot be \
+                 adopted again until that is corrected"
+            );
+        }
     }
 
     /// Collects stored state nothing references, every few hours, with
@@ -5511,7 +5903,7 @@ impl SandboxManager {
 /// whose state goes to the object store. Only where the handler serves memory
 /// anyway: asking for a recording turns it on, and for a single snapshot file
 /// the kernel serves memory more cheaply.
-fn record_working_set(spec: &mut burrow_firecracker::MicroVmSpec, is_stored: bool) {
+fn record_working_set(spec: &mut VmSpec, is_stored: bool) {
     let is_served = spec.is_memory_lazy
         || spec.memory_chain.len() > 1
         || spec.prefetch.is_some()
@@ -5690,7 +6082,7 @@ pub(crate) async fn create_scratch(path: &Path, size_mib: u32) -> std::io::Resul
 /// life of the volume.
 pub(crate) async fn grant_to_jail(
     workdir: &Path,
-    jail: &burrow_firecracker::Jail,
+    jail: &burrow_vmm::Jail,
     shared: &std::collections::HashSet<String>,
 ) -> std::io::Result<()> {
     let workdir = workdir.to_path_buf();
@@ -5754,6 +6146,12 @@ pub(crate) mod tests {
                 is_resource_limits_required: false,
                 is_memory_lazy: false,
                 jail: None,
+                cloud_hypervisor: burrow_vmm::CloudHypervisorConfig {
+                    bin: "/nonexistent/cloud-hypervisor".into(),
+                    kernel: None,
+                    jail: None,
+                },
+                hypervisors: vec![Hypervisor::Firecracker],
                 artifact_retention: std::time::Duration::from_secs(7 * 24 * 60 * 60),
                 control_plane: Vec::new(),
                 share: crate::share::ShareOptions {
@@ -5765,6 +6163,7 @@ pub(crate) mod tests {
                 object_store: None,
                 store_vault: None,
                 firecracker_version: String::new(),
+                cloud_hypervisor_version: String::new(),
                 guest_upgrade: None,
             },
             Arc::new(burrow_proxy::PolicyTable::default()),
@@ -5788,11 +6187,14 @@ pub(crate) mod tests {
         let _ = tokio::fs::remove_dir_all(&data_dir).await;
         let mut manager = manager().await;
         manager.config.data_dir = data_dir.clone();
-        let workdir = manager.config.sandbox_dir(id);
+        let workdir = manager.config.sandbox_dir(id, Hypervisor::Firecracker);
         tokio::fs::create_dir_all(&workdir).await.unwrap();
-        tokio::fs::write(workdir.join(burrow_firecracker::SNAPSHOT_FILE), b"snapshot")
-            .await
-            .unwrap();
+        tokio::fs::write(
+            workdir.join(Hypervisor::Firecracker.layout().state),
+            b"snapshot",
+        )
+        .await
+        .unwrap();
 
         let invalid_block = burrow_net::ipam::BLOCKS_PER_NODE;
         manager
@@ -5829,6 +6231,51 @@ pub(crate) mod tests {
         assert!(manager.store.list_sessions(id).await.unwrap().is_empty());
         assert!(manager.sandboxes.lock().await.is_empty());
         assert!(!workdir.exists());
+        let _ = tokio::fs::remove_dir_all(&data_dir).await;
+    }
+
+    /// A sandbox under a hypervisor this build does not know used to be read
+    /// as a Firecracker one, found without a snapshot, and deleted along with
+    /// its files. It stays recorded and on disk, out of service.
+    #[tokio::test]
+    async fn an_unknown_hypervisor_keeps_the_sandbox_on_recovery() {
+        let id = "ghost-unknown-hypervisor";
+        let data_dir =
+            std::env::temp_dir().join(format!("burrow-recovery-unknown-{}", std::process::id()));
+        let _ = tokio::fs::remove_dir_all(&data_dir).await;
+        let mut manager = manager().await;
+        manager.config.data_dir = data_dir.clone();
+        let workdir = data_dir.join("sandboxes").join(id);
+        tokio::fs::create_dir_all(&workdir).await.unwrap();
+        tokio::fs::write(workdir.join("snapshot.future"), b"snapshot")
+            .await
+            .unwrap();
+        let record = common::Sandbox {
+            id: id.into(),
+            hypervisor: "future-vmm".into(),
+            ..Default::default()
+        };
+        manager
+            .store
+            .put_sandbox(&burrow_store::SandboxRow {
+                id: id.into(),
+                template: "default".into(),
+                record: prost::Message::encode_to_vec(&record),
+                state: common::SandboxState::Suspended as i32,
+                lease_block: 0,
+                tap: "bt0".into(),
+                ports: Vec::new(),
+                share: None,
+                suspended_at: 1,
+            })
+            .await
+            .unwrap();
+
+        manager.recover().await;
+
+        assert_eq!(manager.store.list_sandboxes().await.unwrap().len(), 1);
+        assert!(manager.sandboxes.lock().await.is_empty());
+        assert!(workdir.join("snapshot.future").exists());
         let _ = tokio::fs::remove_dir_all(&data_dir).await;
     }
 
@@ -5946,9 +6393,12 @@ pub(crate) mod tests {
 
         let warm = crate::warm::warm_dir(&manager.config.templates_dir(), "app");
         tokio::fs::create_dir_all(&warm).await.unwrap();
-        tokio::fs::write(warm.join(burrow_firecracker::SNAPSHOT_MEM_FILE), b"stale")
-            .await
-            .unwrap();
+        tokio::fs::write(
+            warm.join(burrow_vmm::firecracker::SNAPSHOT_MEM_FILE),
+            b"stale",
+        )
+        .await
+        .unwrap();
 
         manager.invalidate_warm("app").await;
 
@@ -6031,9 +6481,17 @@ pub(crate) mod tests {
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         // Nothing at all until there is a base image to build a chain on.
-        assert!(discover_memory_chain(&dir).await.is_empty());
+        assert!(
+            discover_memory_chain(&dir, Hypervisor::Firecracker.layout())
+                .await
+                .is_empty()
+        );
 
-        std::fs::write(dir.join(burrow_firecracker::SNAPSHOT_MEM_FILE), b"base").unwrap();
+        std::fs::write(
+            dir.join(burrow_vmm::firecracker::SNAPSHOT_MEM_FILE),
+            b"base",
+        )
+        .unwrap();
         // Two past the cap, and written out of order so nothing can be reading
         // the directory's order as the chain's.
         for index in [3usize, 1, 6, 2, 5, 4] {
@@ -6045,9 +6503,9 @@ pub(crate) mod tests {
         std::fs::write(dir.join("scratch.ext4"), b"unrelated").unwrap();
 
         assert_eq!(
-            discover_memory_chain(&dir).await,
+            discover_memory_chain(&dir, Hypervisor::Firecracker.layout()).await,
             vec![
-                burrow_firecracker::SNAPSHOT_MEM_FILE.to_string(),
+                burrow_vmm::firecracker::SNAPSHOT_MEM_FILE.to_string(),
                 "snapshot.diff1.mem".to_string(),
                 "snapshot.diff2.mem".to_string(),
                 "snapshot.diff3.mem".to_string(),
@@ -6061,9 +6519,9 @@ pub(crate) mod tests {
         // memory that is no longer on disk.
         std::fs::remove_file(dir.join("snapshot.diff3.mem")).unwrap();
         assert_eq!(
-            discover_memory_chain(&dir).await,
+            discover_memory_chain(&dir, Hypervisor::Firecracker.layout()).await,
             vec![
-                burrow_firecracker::SNAPSHOT_MEM_FILE.to_string(),
+                burrow_vmm::firecracker::SNAPSHOT_MEM_FILE.to_string(),
                 "snapshot.diff1.mem".to_string(),
                 "snapshot.diff2.mem".to_string(),
             ]
@@ -6157,10 +6615,18 @@ pub(crate) mod tests {
         Arc::new(RunningSandbox {
             id: id.into(),
             template: "default".into(),
+            hypervisor: Hypervisor::Firecracker,
             base_record: std::sync::Mutex::new(common::Sandbox::default()),
             state: std::sync::atomic::AtomicI32::new(common::SandboxState::Running as i32),
             vm: Mutex::new(None),
-            spec: std::sync::Mutex::new(MicroVmSpec::new(id, &workdir)),
+            spec: std::sync::Mutex::new(VmSpec::new(
+                id,
+                &workdir,
+                burrow_vmm::Backend::Firecracker(burrow_vmm::FirecrackerConfig {
+                    bin: "/nonexistent/firecracker".into(),
+                    jail: None,
+                }),
+            )),
             agent_channel: Mutex::new(None),
             agent_features: Mutex::new(None),
             agent_timeout: std::time::Duration::from_millis(1),
@@ -6179,6 +6645,23 @@ pub(crate) mod tests {
             tap: tap::tap_name(&lease),
             lease,
         })
+    }
+
+    /// A create, fork or adopt whose rules would not apply used to leave the
+    /// sandbox registered and running while telling the caller it failed. It
+    /// is now never registered, and is torn down. macOS has no nftables, so
+    /// the apply always fails here.
+    #[cfg(target_os = "macos")]
+    #[tokio::test]
+    async fn a_sandbox_whose_rules_do_not_apply_is_not_left_running() {
+        let manager = manager().await;
+        let sandbox = running("sbx_unruled");
+        tokio::fs::create_dir_all(&sandbox.workdir).await.unwrap();
+
+        let err = manager.register_or_discard(&sandbox).await.unwrap_err();
+        assert!(err.message().contains("firewall"), "{}", err.message());
+        assert!(manager.sandboxes.lock().await.is_empty());
+        assert!(!sandbox.workdir.exists());
     }
 
     /// What a warm create gave up when it stopped waiting for the guest: a
@@ -6236,6 +6719,36 @@ pub(crate) mod tests {
             .expect("the waiter must not panic")
             .expect("a landed handshake releases the wait");
         assert!(!sandbox.record().is_agent_unconfirmed);
+    }
+
+    /// A move right after a warm create used to snapshot the guest while its
+    /// handshake was in flight. The task driving it outlived the VM, retrying
+    /// the vsock path, and handshook the sandbox's next VM on this node at the
+    /// same time as that VM's own handshake did: the guest's second address add
+    /// answered EEXIST and the move back failed.
+    #[tokio::test]
+    async fn a_suspend_waits_for_a_handshake_in_flight() {
+        let sandbox = running("sbx_waking");
+        sandbox.handshake.send_replace(Handshake::Pending);
+
+        let mut suspending = tokio::spawn({
+            let sandbox = sandbox.clone();
+            async move { sandbox.suspend().await }
+        });
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(50), &mut suspending)
+                .await
+                .is_err(),
+            "a guest still being handshaken must not be snapshotted"
+        );
+
+        sandbox.handshake.send_replace(Handshake::Done);
+        // The fixture has no VM, so the suspend gets as far as finding none.
+        let err = suspending
+            .await
+            .expect("the suspend must not panic")
+            .expect_err("there is no VM to snapshot");
+        assert_eq!(err.code(), tonic::Code::FailedPrecondition);
     }
 
     /// A warm create returns before its guest has answered, so the handshake
@@ -6298,10 +6811,18 @@ pub(crate) mod tests {
         RunningSandbox {
             id: "sbx_a".into(),
             template: "default".into(),
+            hypervisor: Hypervisor::Firecracker,
             base_record: std::sync::Mutex::new(common::Sandbox::default()),
             state: std::sync::atomic::AtomicI32::new(common::SandboxState::Running as i32),
             vm: Mutex::new(None),
-            spec: std::sync::Mutex::new(MicroVmSpec::new("sbx_a", &workdir)),
+            spec: std::sync::Mutex::new(VmSpec::new(
+                "sbx_a",
+                &workdir,
+                burrow_vmm::Backend::Firecracker(burrow_vmm::FirecrackerConfig {
+                    bin: "/nonexistent/firecracker".into(),
+                    jail: None,
+                }),
+            )),
             agent_channel: Mutex::new(None),
             agent_features: Mutex::new(None),
             agent_timeout: std::time::Duration::from_millis(1),

@@ -7,6 +7,7 @@ mod durable;
 mod edge;
 mod guestconn;
 mod kit;
+mod macnode;
 mod nodeapi;
 mod objstore;
 mod oci;
@@ -37,6 +38,9 @@ enum Command {
     /// Development commands for the microVM layer.
     #[command(subcommand)]
     Vm(VmCommand),
+    /// Build a macOS template from a restore image, on a Mac node.
+    #[cfg(target_os = "macos")]
+    VzTemplate(macnode::TemplateArgs),
 }
 
 #[derive(Subcommand)]
@@ -61,8 +65,15 @@ enum VmCommand {
     },
 }
 
-#[tokio::main]
-async fn main() -> anyhow::Result<()> {
+fn main() -> anyhow::Result<()> {
+    // Before the runtime starts a thread: the helper that jails Cloud
+    // Hypervisor unshares its mount namespace, which a threaded process
+    // cannot.
+    burrow_vmm::cloud_hypervisor::jail::run_if_helper();
+    tokio::runtime::Runtime::new()?.block_on(daemon())
+}
+
+async fn daemon() -> anyhow::Result<()> {
     let args = Args::parse();
     let telemetry = burrow_common::telemetry::init(
         "burrowd",
@@ -82,6 +93,8 @@ async fn run(args: Args) -> anyhow::Result<()> {
     match args.command {
         Command::Serve(args) => serve::run(args).await,
         Command::Vm(VmCommand::Boot(args)) => devvm::run(args).await,
+        #[cfg(target_os = "macos")]
+        Command::VzTemplate(args) => macnode::build_template(args).await,
         Command::Vm(VmCommand::Snapshot(args)) => devvm::snapshot_roundtrip(args).await,
         Command::Vm(VmCommand::Floor(args)) => devvm::boot_floor(args).await,
         Command::Vm(VmCommand::Agent(args)) => devvm::agent_boot(args).await,

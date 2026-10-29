@@ -37,6 +37,31 @@ pub struct ServeArgs {
     pub data_dir: PathBuf,
     #[arg(long, default_value = "/usr/local/bin/firecracker")]
     pub firecracker: PathBuf,
+    /// Hypervisors this node offers, comma-separated: `firecracker`,
+    /// `cloud-hypervisor`. A template records one when it is built, and its
+    /// sandboxes are only placed on nodes offering it. One whose binary is
+    /// missing is left out of what the node advertises, with a warning.
+    #[arg(
+        long,
+        value_delimiter = ',',
+        default_value = "firecracker",
+        env = "BURROWD_HYPERVISORS"
+    )]
+    pub hypervisors: Vec<burrow_vmm::Hypervisor>,
+    #[arg(long, default_value = "/usr/local/bin/cloud-hypervisor")]
+    pub cloud_hypervisor: PathBuf,
+    /// Kernel Cloud Hypervisor boots instead of each template's own, for
+    /// templates whose kernel lacks virtio-pci. Unset boots the template's.
+    #[arg(long)]
+    pub cloud_hypervisor_kernel: Option<PathBuf>,
+    /// Run Cloud Hypervisor unconfined even with `--jailer`: as root, in the
+    /// host's namespaces, with the host's filesystem in view. For a dev box
+    /// whose kernel cannot build the jail; nowhere a guest is untrusted.
+    #[arg(
+        long = "unjailed-cloud-hypervisor",
+        env = "BURROWD_UNJAILED_CLOUD_HYPERVISOR"
+    )]
+    pub is_cloud_hypervisor_unjailed: bool,
     /// Bucket snapshots are copied to so they outlive this node, as
     /// `s3://bucket[/prefix]`. Credentials come from AWS_ACCESS_KEY_ID and
     /// AWS_SECRET_ACCESS_KEY. Unset keeps snapshots node-local.
@@ -55,6 +80,15 @@ pub struct ServeArgs {
     /// for itself would seal what no other node can open.
     #[arg(long, env = "BURROW_OBJECT_STORE_KEY_FILE")]
     pub object_store_key_file: Option<PathBuf>,
+    /// Use an object store that ignores conditional writes (`If-Match`,
+    /// `If-None-Match`). A node takes a stored sandbox by a conditional write
+    /// on its manifest, so on such a store two nodes adopting one sandbox at
+    /// once can both run it. Without this flag a node refuses to start on one.
+    #[arg(
+        long = "allow-unconditional-object-store",
+        env = "BURROW_ALLOW_UNCONDITIONAL_OBJECT_STORE"
+    )]
+    pub is_unconditional_object_store_allowed: bool,
     /// Appended to every guest kernel command line.
     #[arg(
         long,
@@ -149,14 +183,15 @@ pub struct ServeArgs {
     #[arg(long, env = "OTEL_EXPORTER_OTLP_ENDPOINT")]
     pub otlp_endpoint: Option<String>,
     /// Run each firecracker under the jailer, chrooted into its own sandbox
-    /// directory and dropped to `--jail-uid`.
+    /// directory and dropped to `--jail-uid`. Turns on Cloud Hypervisor's
+    /// confinement too, which burrowd builds itself, to the same uid.
     ///
     /// Off by default only because it needs a uid to drop to and a writable
     /// chroot base; it is what should be on wherever sandboxes share a host
     /// with anything that matters.
     #[arg(long)]
     pub jailer: Option<PathBuf>,
-    /// Unprivileged uid firecracker runs as under the jailer.
+    /// Unprivileged uid both VMMs run as under `--jailer`.
     #[arg(long, default_value_t = 65534)]
     pub jail_uid: u32,
     #[arg(long, default_value_t = 65534)]
@@ -295,12 +330,31 @@ pub struct ServeArgs {
 
 impl ServeArgs {
     /// How firecracker should be confined, if at all.
-    fn jail(&self) -> Option<burrow_firecracker::Jail> {
-        self.jailer.as_ref().map(|jailer| burrow_firecracker::Jail {
+    fn jail(&self) -> Option<burrow_vmm::Jail> {
+        self.jailer.as_ref().map(|jailer| burrow_vmm::Jail {
             jailer: jailer.clone(),
             uid: self.jail_uid,
             gid: self.jail_gid,
             chroot_base: self.chroot_base.clone(),
+        })
+    }
+
+    /// How Cloud Hypervisor should be confined: whenever Firecracker is, so
+    /// `--jailer` never leaves one VMM running unconfined beside the other
+    /// unless `--unjailed-cloud-hypervisor` says so.
+    fn cloud_hypervisor_jail(&self) -> Option<burrow_vmm::ChJail> {
+        self.jailer.as_ref()?;
+        if self.is_cloud_hypervisor_unjailed {
+            tracing::warn!(
+                "--unjailed-cloud-hypervisor: Cloud Hypervisor runs as root with the host's \
+                 filesystem in view"
+            );
+            return None;
+        }
+        Some(burrow_vmm::ChJail {
+            helper: "/proc/self/exe".into(),
+            uid: self.jail_uid,
+            gid: self.jail_gid,
         })
     }
 
@@ -344,12 +398,13 @@ impl ServeArgs {
     }
 }
 
-/// What `firecracker --version` prints on its first line, e.g. `v1.16.1`.
+/// The last word of what `<vmm> --version` prints on its first line, e.g.
+/// `v1.16.1` from Firecracker and `v54.0` from Cloud Hypervisor.
 ///
 /// Recorded on snapshots and reported to the orchestrator, because a snapshot
-/// only restores under the Firecracker that wrote it, and placement of one
-/// fetched from the object store has to know that before it sends the create.
-async fn firecracker_version(bin: &std::path::Path) -> String {
+/// only restores under the VMM that wrote it, and placement of one fetched
+/// from the object store has to know that before it sends the create.
+async fn vmm_version(bin: &std::path::Path) -> String {
     let output = tokio::process::Command::new(bin)
         .arg("--version")
         .output()
@@ -363,6 +418,48 @@ async fn firecracker_version(bin: &std::path::Path) -> String {
         .and_then(|line| line.split_whitespace().last())
         .unwrap_or_default()
         .to_string()
+}
+
+/// The hypervisors asked for whose binaries are here. One that is missing is
+/// left out rather than advertised: placement would send this node sandboxes
+/// it could only fail to start. A node offering none is refused, since an
+/// empty list is how a node from before the choice says it runs Firecracker.
+fn offered_hypervisors(args: &ServeArgs) -> anyhow::Result<Vec<burrow_vmm::Hypervisor>> {
+    let mut offered = Vec::new();
+    for hypervisor in &args.hypervisors {
+        let bin = match hypervisor {
+            burrow_vmm::Hypervisor::Firecracker => &args.firecracker,
+            burrow_vmm::Hypervisor::CloudHypervisor => &args.cloud_hypervisor,
+            // Part of the OS rather than a binary; offered where the host
+            // supports it and this process carries the entitlement, which
+            // the first configuration checks.
+            #[cfg(target_os = "macos")]
+            burrow_vmm::Hypervisor::Vz => {
+                if !burrow_vmm::vz::is_supported() {
+                    tracing::warn!(%hypervisor, "Virtualization.framework unsupported here; not offering it");
+                } else if !offered.contains(hypervisor) {
+                    offered.push(*hypervisor);
+                }
+                continue;
+            }
+        };
+        if !bin.exists() {
+            tracing::warn!(%hypervisor, bin = %bin.display(), "hypervisor binary missing; not offering it");
+        } else if !offered.contains(hypervisor) {
+            offered.push(*hypervisor);
+        }
+    }
+    if offered.is_empty() {
+        anyhow::bail!(
+            "no hypervisor to offer: none of --hypervisors {} has its binary here",
+            args.hypervisors
+                .iter()
+                .map(|h| h.to_string())
+                .collect::<Vec<_>>()
+                .join(",")
+        );
+    }
+    Ok(offered)
 }
 
 fn local_node_info(args: &ServeArgs) -> anyhow::Result<NodeInfo> {
@@ -395,6 +492,9 @@ fn local_node_info(args: &ServeArgs) -> anyhow::Result<NodeInfo> {
         firecracker_version: String::new(),
         // Filled in once the Access listener is serving, like the edge.
         access_endpoint: String::new(),
+        // Filled in once the binaries have been looked for.
+        hypervisors: Vec::new(),
+        hypervisor_versions: Default::default(),
     })
 }
 
@@ -411,7 +511,7 @@ async fn current_status(sandboxes: &SandboxManager, data_dir: &std::path::Path) 
     let mut templates = Vec::new();
     let mut kit_templates = Vec::new();
     let mut warm_templates = std::collections::HashMap::new();
-    for template in crate::template::list(data_dir).await {
+    for template in crate::template::bootable(data_dir).await {
         if template.is_warm {
             warm_templates.insert(template.name.clone(), 1);
         }
@@ -420,7 +520,10 @@ async fn current_status(sandboxes: &SandboxManager, data_dir: &std::path::Path) 
         }
         templates.push(template.name);
     }
-    // available_memory is 0 on macOS (dev machines); fall back to free.
+    // sysinfo undercounts on macOS; see `macnode::available_memory`.
+    #[cfg(target_os = "macos")]
+    let avail = crate::macnode::available_memory().unwrap_or_else(|| sys.available_memory());
+    #[cfg(not(target_os = "macos"))]
     let avail = match sys.available_memory() {
         0 => sys.free_memory(),
         n => n,
@@ -1007,7 +1110,11 @@ pub async fn run(args: ServeArgs) -> anyhow::Result<()> {
             .map_err(|err| anyhow::anyhow!("cannot open node store: {err}"))?,
     );
 
-    let firecracker_version = firecracker_version(&args.firecracker).await;
+    let firecracker_version = vmm_version(&args.firecracker).await;
+    let cloud_hypervisor_version = vmm_version(&args.cloud_hypervisor).await;
+    let hypervisors = offered_hypervisors(&args)?;
+    #[cfg(target_os = "macos")]
+    let vz_version = burrow_vmm::vz::host_version();
     // Hashed once: every handshake compares the guest's agent against it, and
     // a guest running another build is upgraded in place.
     let guest_upgrade = Some(Arc::new(crate::guestconn::GuestUpgrade {
@@ -1020,6 +1127,19 @@ pub async fn run(args: ServeArgs) -> anyhow::Result<()> {
         path: args.guest_binary.clone(),
     }));
     node_info.firecracker_version = firecracker_version.clone();
+    node_info.hypervisors = hypervisors.iter().map(|h| h.to_string()).collect();
+    node_info.hypervisor_versions = hypervisors
+        .iter()
+        .map(|h| {
+            let version = match h {
+                burrow_vmm::Hypervisor::Firecracker => &firecracker_version,
+                burrow_vmm::Hypervisor::CloudHypervisor => &cloud_hypervisor_version,
+                #[cfg(target_os = "macos")]
+                burrow_vmm::Hypervisor::Vz => &vz_version,
+            };
+            (h.to_string(), version.clone())
+        })
+        .collect();
     let object_store = match (&args.object_store, &args.object_store_endpoint) {
         (Some(url), Some(endpoint)) => {
             let store = crate::objstore::ObjectStore::open(&crate::objstore::Options {
@@ -1031,6 +1151,25 @@ pub async fn run(args: ServeArgs) -> anyhow::Result<()> {
                 .ensure_bucket()
                 .await
                 .map_err(|err| anyhow::anyhow!("--object-store: {}", err.message()))?;
+            let is_conditional = store
+                .probe_conditional_writes()
+                .await
+                .map_err(|err| anyhow::anyhow!("--object-store: {}", err.message()))?;
+            match (is_conditional, args.is_unconditional_object_store_allowed) {
+                (true, _) => {}
+                (false, false) => anyhow::bail!(
+                    "--object-store {} ignores conditional writes, which the lease on a stored \
+                     sandbox depends on: two nodes could run one sandbox. Use a store that \
+                     honours If-Match and If-None-Match (AWS S3 does, as does versitygw 1.10; \
+                     1.0.14 does not), or pass --allow-unconditional-object-store to accept the race",
+                    store.describe()
+                ),
+                (false, true) => tracing::error!(
+                    store = store.describe(),
+                    "the object store ignores conditional writes; two nodes adopting one sandbox \
+                     at once can both run it"
+                ),
+            }
             tracing::info!(
                 store = store.describe(),
                 "snapshots are copied to the object store"
@@ -1079,6 +1218,12 @@ pub async fn run(args: ServeArgs) -> anyhow::Result<()> {
             is_resource_limits_required: args.is_resource_limits_required,
             is_memory_lazy: args.is_memory_lazy,
             jail: args.jail(),
+            cloud_hypervisor: burrow_vmm::CloudHypervisorConfig {
+                bin: args.cloud_hypervisor.clone(),
+                kernel: args.cloud_hypervisor_kernel.clone(),
+                jail: args.cloud_hypervisor_jail(),
+            },
+            hypervisors,
             artifact_retention: Duration::from_secs(
                 u64::from(args.artifact_retention_days) * 24 * 60 * 60,
             ),
@@ -1092,6 +1237,7 @@ pub async fn run(args: ServeArgs) -> anyhow::Result<()> {
             object_store,
             store_vault,
             firecracker_version,
+            cloud_hypervisor_version,
             guest_upgrade,
         },
         Arc::clone(&proxy_policies),
@@ -1168,6 +1314,17 @@ pub async fn run(args: ServeArgs) -> anyhow::Result<()> {
         ),
     }
     spawn_audit_pruner(Arc::clone(&store), args.audit_retention_days);
+    // A macOS guest's flows never reach the proxy or the resolver over a
+    // tap; its stack hands them over in process, with the same pieces.
+    #[cfg(target_os = "macos")]
+    sandboxes.set_usernet_node(burrow_net::usernet::Node {
+        audit: audit.clone(),
+        resolutions: Arc::clone(&resolutions),
+        denied: Arc::clone(&denied),
+        authority: Some(Arc::clone(&authority)),
+        directory: Arc::clone(&directory),
+        dns_upstream: args.dns_upstream,
+    });
 
     // Guests resolve through burrow so lookups are recorded; the firewall
     // permits this one host service, and the resolver forwards upstream.
@@ -1390,6 +1547,36 @@ mod tests {
         ] {
             assert_eq!(endpoint_host(endpoint), host, "{endpoint}");
         }
+    }
+
+    /// A node whose every hypervisor binary was missing advertised an empty
+    /// list, which placement reads as a node from before the choice, running
+    /// Firecracker. It refuses to start instead.
+    #[test]
+    fn a_node_with_no_hypervisor_binary_refuses_to_start() {
+        #[derive(clap::Parser)]
+        struct Cli {
+            #[command(flatten)]
+            serve: ServeArgs,
+        }
+        let serve = |bin: &str| {
+            <Cli as clap::Parser>::parse_from([
+                "burrowd",
+                "--hypervisors",
+                "firecracker,cloud-hypervisor",
+                "--firecracker",
+                bin,
+                "--cloud-hypervisor",
+                "/nonexistent/cloud-hypervisor",
+            ])
+            .serve
+        };
+        assert!(offered_hypervisors(&serve("/nonexistent/firecracker")).is_err());
+        let here = std::env::current_exe().unwrap();
+        assert_eq!(
+            offered_hypervisors(&serve(here.to_str().unwrap())).unwrap(),
+            vec![burrow_vmm::Hypervisor::Firecracker]
+        );
     }
 
     /// Guest memory and disk images are not for every local user to read,

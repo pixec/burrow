@@ -1288,6 +1288,15 @@ impl NodeService for NodeApi {
         let manifest = req
             .manifest
             .ok_or_else(|| Status::invalid_argument("manifest is required"))?;
+        // A template whose hypervisor this node does not run is one it could
+        // hold and never boot. Refused before a byte is copied.
+        let environment: crate::oci::ImageEnvironment = match manifest.image_config.as_str() {
+            "" => Default::default(),
+            config => serde_json::from_str(config)
+                .map_err(|err| Status::invalid_argument(format!("image config: {err}")))?,
+        };
+        let (hypervisor, _) = environment.machine()?;
+        self.sandboxes.require_hypervisor(hypervisor)?;
         let (bytes_transferred, blobs_reused) = crate::template::distribute::pull(
             &self.data_dir,
             &req.source_address,

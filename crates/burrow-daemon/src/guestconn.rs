@@ -1,10 +1,9 @@
 //! Connecting to a sandbox's guest agent.
 //!
 //! The agent speaks gRPC over vsock, so the tonic channel is built on a custom
-//! connector that performs Firecracker's hybrid-vsock handshake instead of
-//! dialing TCP. The URI is a required placeholder that nothing ever resolves.
-
-use std::path::PathBuf;
+//! connector that dials the guest's vsock, whichever transport its hypervisor
+//! gives it, instead of TCP. The URI is a required placeholder that nothing
+//! ever resolves.
 
 use hyper_util::rt::TokioIo;
 use tonic::transport::{Channel, Endpoint, Uri};
@@ -12,6 +11,7 @@ use tower::service_fn;
 
 use burrow_proto::guest::v1 as guestpb;
 use burrow_proto::guest::v1::guest_client::GuestClient;
+use burrow_vmm::GuestAddr;
 use tokio_stream::StreamExt;
 use tonic::Status;
 
@@ -20,7 +20,7 @@ use crate::sandbox::RunningSandbox;
 /// vsock port the agent listens on inside the guest.
 pub const AGENT_PORT: u32 = 1024;
 
-/// Builds an agent client for the VM whose vsock UDS is at `uds_path`.
+/// Builds an agent client for the guest at `guest`.
 ///
 /// Channels must not be held across a pause/resume: the underlying vsock
 /// connection dies with the snapshot. Reconnect after every resume.
@@ -30,10 +30,10 @@ pub const AGENT_PORT: u32 = 1024;
 /// that called it for the life of the node. See [`connect_timed`] for why it
 /// does not bound the streaming ones.
 pub async fn connect(
-    uds_path: PathBuf,
+    guest: GuestAddr,
     timeout: std::time::Duration,
 ) -> anyhow::Result<GuestClient<Channel>> {
-    connect_timed(uds_path, timeout)
+    connect_timed(guest, timeout)
         .await
         .map(|(client, _)| client)
 }
@@ -50,8 +50,15 @@ pub async fn connect(
 /// exec, a log watch or a download goes on streaming for as long as the caller
 /// wants it to. Streams need their own deadline where the daemon, rather than
 /// a caller, is waiting on one.
+///
+/// What a stream does get is a check that the guest is still there: HTTP/2
+/// pings while any call is open, failing the call when one goes unanswered for
+/// `timeout`. A vsock connection can die without either end hearing of it,
+/// when the VM under it is replaced or its VMM wedges, and an exec on one would
+/// otherwise wait for output that can never come. Idle channels are not
+/// pinged, so a guest nobody is using is not woken to answer.
 async fn connect_timed(
-    uds_path: PathBuf,
+    guest: GuestAddr,
     timeout: std::time::Duration,
 ) -> anyhow::Result<(GuestClient<Channel>, Option<std::time::Instant>)> {
     let accepted: std::sync::Arc<std::sync::Mutex<Option<std::time::Instant>>> =
@@ -59,13 +66,15 @@ async fn connect_timed(
     let recorder = accepted.clone();
     let channel = Endpoint::try_from("http://vsock.invalid")?
         .timeout(timeout)
+        .http2_keep_alive_interval(timeout)
+        .keep_alive_timeout(timeout)
         .connect_with_connector(service_fn(move |_: Uri| {
-            let uds_path = uds_path.clone();
+            let guest = guest.clone();
             let recorder = recorder.clone();
             async move {
-                let stream = burrow_firecracker::vsock::connect(&uds_path, AGENT_PORT).await?;
+                let stream = guest.connect(AGENT_PORT).await?;
                 *recorder.lock().unwrap() = Some(std::time::Instant::now());
-                Ok::<_, burrow_firecracker::VmmError>(TokioIo::new(stream))
+                Ok::<_, burrow_vmm::Error>(TokioIo::new(stream))
             }
         }))
         .await?;
@@ -79,12 +88,12 @@ async fn connect_timed(
 /// handshake rather than probing with a throwaway one first. The poll interval
 /// is short because a guest waking from a snapshot takes tens of milliseconds.
 pub async fn connect_when_ready(
-    uds_path: PathBuf,
+    guest: GuestAddr,
     timeout: std::time::Duration,
 ) -> anyhow::Result<(GuestClient<Channel>, Option<std::time::Instant>)> {
     let deadline = std::time::Instant::now() + timeout;
     loop {
-        match connect_timed(uds_path.clone(), timeout).await {
+        match connect_timed(guest.clone(), timeout).await {
             Ok(ready) => return Ok(ready),
             Err(err) if std::time::Instant::now() >= deadline => {
                 return Err(err.context(format!("agent did not accept within {timeout:?}")));
@@ -257,7 +266,7 @@ pub async fn upload(
 /// The agent binary this node ships, for upgrading guests that run another.
 #[derive(Debug, Clone)]
 pub struct GuestUpgrade {
-    pub path: PathBuf,
+    pub path: std::path::PathBuf,
     /// SHA-256 of `path`, lowercase hex.
     pub digest: String,
 }
@@ -272,7 +281,7 @@ pub struct GuestUpgrade {
 /// logged and left on the old agent until its next handshake.
 pub async fn handshake_upgrading(
     mut agent: GuestClient<Channel>,
-    uds_path: PathBuf,
+    guest: GuestAddr,
     request: guestpb::HandshakeRequest,
     upgrade: Option<&GuestUpgrade>,
     timeout: std::time::Duration,
@@ -342,7 +351,7 @@ pub async fn handshake_upgrading(
     loop {
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
         let attempt = async {
-            let (mut agent, _) = connect_when_ready(uds_path.clone(), timeout)
+            let (mut agent, _) = connect_when_ready(guest.clone(), timeout)
                 .await
                 .map_err(|err| tonic::Status::internal(format!("upgraded agent: {err}")))?;
             let response = agent.handshake(request.clone()).await?.into_inner();
