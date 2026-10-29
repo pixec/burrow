@@ -5,7 +5,6 @@
 
 import { BurrowError } from "./errors.js";
 import type {
-  DomainRule,
   ExecOptions,
   ExecPolicy,
   FsOptions,
@@ -16,7 +15,6 @@ import type {
   NetworkMode,
   NetworkPolicy,
   NetworkPolicyOptions,
-  NetworkPolicyShorthand,
   RequestMatch,
   RequestRule,
   ResourceOptions,
@@ -37,98 +35,30 @@ const MODE_FROM_WIRE: Record<string, NetworkMode> = {
   NETWORK_MODE_OPEN: "open",
 };
 
-/**
- * Normalises the two ways a network can be described.
- *
- * `network: "allowlist"` with sibling `allowDomains` is the original shape and
- * still works; `network: { mode, allowDomains, ... }` carries the fields the
- * shorthand has no room for.
- */
-export function resolveNetwork(
-  network: NetworkInput | undefined,
-  legacy: { allowDomains?: string[]; allowCidrs?: string[] } = {},
-): NetworkPolicyOptions {
-  if (typeof network === "string") {
-    const mode: NetworkMode =
-      network === "allow-all"
-        ? "open"
-        : network === "deny-all"
-          ? "none"
-          : network;
-    return {
-      mode,
-      allowDomains: legacy.allowDomains,
-      allowCidrs: legacy.allowCidrs,
-    };
-  }
-  if (network && isShorthand(network)) {
-    return withLegacy(fromShorthand(network), legacy);
-  }
-  if (network) {
-    return {
-      ...network,
-      allowDomains: network.allowDomains ?? legacy.allowDomains,
-      allowCidrs: network.allowCidrs ?? legacy.allowCidrs,
-    };
-  }
-  return { allowDomains: legacy.allowDomains, allowCidrs: legacy.allowCidrs };
+/** A bare mode stands for a policy with only that mode set. */
+export function resolveNetwork(network: NetworkInput | undefined): NetworkPolicyOptions {
+  if (typeof network === "string") return { mode: network };
+  return network ?? {};
 }
 
-function withLegacy(
-  base: NetworkPolicyOptions,
-  legacy: { allowDomains?: string[]; allowCidrs?: string[] },
-): NetworkPolicyOptions {
-  const out = { ...base };
-  if (legacy.allowDomains?.length) {
-    out.allowDomains = [...(out.allowDomains ?? []), ...legacy.allowDomains];
-  }
-  if (legacy.allowCidrs?.length) {
-    out.allowCidrs = [...(out.allowCidrs ?? []), ...legacy.allowCidrs];
-  }
-  return out;
-}
-
-/**
- * Tells the object shorthand from the full policy. They share no field names,
- * so one key decides; carrying neither is the full form, all defaulted.
- */
-function isShorthand(
-  network: NetworkPolicyOptions | Exclude<NetworkPolicyShorthand, string>,
-): network is Exclude<NetworkPolicyShorthand, string> {
-  return "allow" in network || "subnets" in network;
-}
-
-/** Everything burrow understands on a per-domain rule. */
-const RULE_KEYS = new Set([
-  "match",
-  "transform",
-  "forwardURL",
-  "forwardSecret",
-]);
+/** Everything burrow understands on a rule. */
+const RULE_KEYS = new Set(["domain", "match", "setHeaders", "forward"]);
 
 /** Every dimension a matcher may name. */
 const MATCH_KEYS = new Set(["path", "method", "queryString", "headers"]);
 
 /**
- * Refuses a rule key burrow does not implement, rather than dropping it.
+ * Refuses a key burrow does not implement, rather than dropping it.
  *
  * TypeScript rejects these at compile time, so this is for JavaScript callers.
- * It earns its place because dropping a `match` would widen a credential from
- * one path and method to every request to the domain.
+ * It earns its place because dropping a `match` dimension would widen a
+ * credential from one path and method to every request to the domain.
  */
-function checkRuleKeys(domain: string, rule: DomainRule | undefined): void {
-  if (!rule || typeof rule !== "object") return;
-  const where = `networkPolicy.allow[${JSON.stringify(domain)}]`;
+function checkKeys(where: string, rule: RequestRule): void {
   for (const key of Object.keys(rule)) {
     if (RULE_KEYS.has(key)) continue;
     throw new BurrowError(
-      `${where}: unknown key ${JSON.stringify(key)} in a rule for ${domain}`,
-      "invalid_argument",
-    );
-  }
-  if (rule.transform && rule.forwardURL) {
-    throw new BurrowError(
-      `${where}: a rule either rewrites a request or forwards it, not both`,
+      `${where}: unknown key ${JSON.stringify(key)} in a rule for ${rule.domain}`,
       "invalid_argument",
     );
   }
@@ -208,6 +138,7 @@ function toRequestMatch(where: string, match: RequestMatch | undefined): any {
 /** Builds one wire `RequestRule`. */
 function toRequestRule(rule: RequestRule): any {
   const where = `networkPolicy.rules[${JSON.stringify(rule.domain)}]`;
+  checkKeys(where, rule);
   if (rule.setHeaders && rule.forward) {
     throw new BurrowError(
       `${where}: a rule either sets headers or forwards, not both`,
@@ -225,6 +156,9 @@ function toRequestRule(rule: RequestRule): any {
       secret: rule.forward.secret ?? "",
     };
   } else if (rule.setHeaders) {
+    if (Object.keys(rule.setHeaders).length === 0) {
+      throw new BurrowError(`${where}: setHeaders names no header`, "invalid_argument");
+    }
     wire.setHeaders = {
       headers: Object.entries(rule.setHeaders).map(([name, value]) => {
         checkHeaderName(where, name);
@@ -313,74 +247,6 @@ function fromStringMatch(raw: any): StringMatch {
   return { [op]: raw?.value ?? "" } as StringMatch;
 }
 
-/**
- * Maps `{ allow, subnets }` onto a burrow policy. Naming any domain is an
- * allowlist, the only mode where the proxy sits in the path and can tell one
- * domain from another.
- */
-function fromShorthand(
-  shorthand: Exclude<NetworkPolicyShorthand, string>,
-): NetworkPolicyOptions {
-  const allow = shorthand.allow;
-  const domains = Array.isArray(allow)
-    ? allow
-    : allow
-      ? Object.keys(allow)
-      : [];
-  const perDomain: Record<string, DomainRule | DomainRule[]> =
-    allow && !Array.isArray(allow) ? allow : {};
-
-  const rules: RequestRule[] = [];
-  for (const [domain, written] of Object.entries(perDomain)) {
-    const where = `networkPolicy.allow[${JSON.stringify(domain)}]`;
-    for (const rule of Array.isArray(written) ? written : [written]) {
-      checkRuleKeys(domain, rule);
-      if (rule?.forwardURL) {
-        rules.push({
-          domain,
-          match: rule.match,
-          forward: { url: rule.forwardURL, secret: rule.forwardSecret },
-        });
-        continue;
-      }
-      for (const transform of rule?.transform ?? []) {
-        const headers = transform?.headers;
-        if (!headers || Object.keys(headers).length === 0) {
-          throw new BurrowError(
-            `${where}: a transform needs headers`,
-            "invalid_argument",
-          );
-        }
-        for (const name of Object.keys(headers)) checkHeaderName(where, name);
-        rules.push({ domain, match: rule.match, setHeaders: headers });
-      }
-      if (!rule?.transform?.length && rule?.match) {
-        throw new BurrowError(
-          `${where}: a match selects which requests a rule acts on, so the rule needs a transform or a forwardURL`,
-          "invalid_argument",
-        );
-      }
-    }
-  }
-
-  // A rule on a domain that is not inspected would be silently dropped.
-  if (rules.length > 0 && domains.length === 0) {
-    throw new BurrowError(
-      "networkPolicy: a rule needs its domain in `allow`, since rules only apply to inspected requests",
-      "invalid_argument",
-    );
-  }
-
-  return {
-    mode: domains.length > 0 || shorthand.subnets ? "allowlist" : "none",
-    allowDomains: domains,
-    allowCidrs: shorthand.subnets?.allow ?? [],
-    denyCidrs: shorthand.subnets?.deny ?? [],
-    inspectTls: rules.length > 0,
-    rules,
-  };
-}
-
 /** Builds the wire `NetworkPolicy`. Defaults to no egress at all. */
 export function toNetworkPolicy(options: NetworkPolicyOptions = {}): any {
   const mode = options.mode ?? "none";
@@ -392,6 +258,26 @@ export function toNetworkPolicy(options: NetworkPolicyOptions = {}): any {
       "invalid_argument",
     );
   }
+  // Rules first, then the injections: an injection carries no matcher, so it
+  // claims every request to its domain and would shadow anything after it.
+  const rules = [
+    ...(options.rules ?? []),
+    ...(options.injectHeaders ?? []).map(
+      (header): RequestRule => ({
+        domain: header.domain,
+        setHeaders: { [header.name]: header.value },
+      }),
+    ),
+  ];
+  // Rules apply only to requests the proxy inspects, and it inspects only
+  // traffic to allowed domains: with none, every rule would be dropped
+  // without a word.
+  if (rules.length > 0 && !options.allowDomains?.length) {
+    throw new BurrowError(
+      "networkPolicy: rules apply only to inspected requests, so their domains have to be in allowDomains",
+      "invalid_argument",
+    );
+  }
   return {
     mode: MODE_TO_WIRE[mode],
     allowDomains: options.allowDomains ?? [],
@@ -399,17 +285,7 @@ export function toNetworkPolicy(options: NetworkPolicyOptions = {}): any {
     allowPorts: options.allowPorts ?? [],
     denyCidrs: options.denyCidrs ?? [],
     isTlsInspected: options.inspectTls ?? false,
-    // Rules first, then the injections: an injection carries no matcher, so it
-    // claims every request to its domain and would shadow anything after it.
-    rules: [
-      ...(options.rules ?? []),
-      ...(options.injectHeaders ?? []).map(
-        (header): RequestRule => ({
-          domain: header.domain,
-          setHeaders: { [header.name]: header.value },
-        }),
-      ),
-    ].map(toRequestRule),
+    rules: rules.map(toRequestRule),
   };
 }
 

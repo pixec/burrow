@@ -2429,6 +2429,13 @@ impl Burrow for ApiService {
         Ok(Response::new(client.list_dir(req).await?.into_inner()))
     }
 
+    async fn fs(&self, req: Request<api::FsRequest>) -> Result<Response<api::FsResponse>, Status> {
+        let mut req = req.into_inner();
+        req.sandbox_id = self.resolve(&req.sandbox_id).await;
+        let mut client = self.node_for(&req.sandbox_id).await?;
+        Ok(Response::new(client.fs(req).await?.into_inner()))
+    }
+
     type AttachStream = BoxStream<api::ExecOutput>;
 
     async fn attach(

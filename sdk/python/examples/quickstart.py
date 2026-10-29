@@ -3,9 +3,11 @@
 #
 #   python examples/quickstart.py
 import os
+import shutil
 import tempfile
+import time
 
-from burrow import CommandFailedError, Sandbox
+from burrow import Sandbox
 
 # get_or_create keys on the sandbox's name, so running this twice reuses the
 # first one. No network unless asked for: this one needs pypi, and nothing else.
@@ -14,10 +16,10 @@ sandbox = Sandbox.get_or_create(
     # A create must name a template; burrow ships none of its own. Import this
     # one with: burrow pull python:3.12 --name python
     template="python",
-    # The shorthand policy shape. `subnets` maps to allowed and denied ranges.
     network_policy={
-        "allow": ["pypi.org", "*.pythonhosted.org"],
-        "subnets": {"deny": ["169.254.0.0/16"]},
+        "mode": "allowlist",
+        "allow_domains": ["pypi.org", "*.pythonhosted.org"],
+        "deny_cidrs": ["169.254.0.0/16"],
     },
     resources={"vcpus": 1, "memory_mib": 512, "idle_suspend_secs": 300, "suspended_ttl_secs": 3600},
     tags={"purpose": "quickstart", "owner": "sdk-example"},
@@ -26,63 +28,70 @@ sandbox = Sandbox.get_or_create(
     on_create=lambda s: print("created:", s.id),
     on_resume=lambda s: print("resumed:", s.name),
 )
-print("sandbox:", sandbox.name, sandbox.id, sandbox.status, f"{sandbox.vcpus} vcpu", f"{sandbox.memory} MiB")
+print("sandbox:", sandbox.name, sandbox.id, sandbox.state, f"{sandbox.vcpus} vcpu", f"{sandbox.memory_mib} MiB")
+
+# The sandbox's own `subprocess`, `os`, `shutil`, `open` and `Path`: the
+# stdlib's names and semantics, acting on the guest.
+sp = sandbox.subprocess
 
 try:
-    # run_command runs to completion.
-    hello = sandbox.run_command("echo", ["hello from the sandbox"])
-    print("run:", hello.exit_code, hello.stdout.strip())
+    # A list is passed to execve as it is.
+    hello = sp.run(["echo", "hello from the sandbox"], capture_output=True, text=True)
+    print("run:", hello.returncode, hello.stdout.strip())
 
-    # A bare string goes through a shell, so pipes and redirection work.
-    piped = sandbox.run_command("echo one two three | tr ' ' '\\n' | wc -l")
-    print("shell:", piped.stdout.strip())
+    # shell=True goes through /bin/sh, so pipes and redirection work.
+    piped = sp.check_output("echo one two three | tr ' ' '\\n' | wc -l", shell=True, text=True)
+    print("shell:", piped.strip())
 
-    # Keyword options carry cwd and env.
-    where = sandbox.run_command(
-        "sh", ["-c", "pwd; echo $QUICKSTART $STAGE"], cwd="/work", env={"STAGE": "tour"}
-    )
-    print("cwd and env:", " | ".join(where.stdout.strip().split("\n")))
+    # cwd and env as the stdlib takes them; env is laid over the guest's.
+    where = sp.check_output("pwd; echo $QUICKSTART $STAGE", shell=True, text=True, cwd="/work", env={"STAGE": "tour"})
+    print("cwd and env:", " | ".join(where.strip().split("\n")))
 
-    # Detached hands back a handle you can stream from, wait on, or kill.
-    job = sandbox.run_command("sh", ["-c", "for i in 1 2 3; do echo tick $i; done"], detached=True)
-    for chunk in job.logs():
-        if chunk.type == "stdout":
-            print(f"  {chunk.data}", end="")
+    # Popen streams; the command also has a cmd_id that get_command reattaches to.
+    with sp.Popen("for i in 1 2 3; do echo tick $i; done", shell=True, stdout=sp.PIPE, text=True) as job:
+        for line in job.stdout:
+            print(f"  {line}", end="")
 
-    sleeper = sandbox.run_command("sleep", ["60"], detached=True)
+    sleeper = sp.Popen(["sleep", "60"])
     sleeper.kill()
-    print("killed:", sleeper.wait().exit_code)
+    print("killed:", sleeper.wait())  # -9, as POSIX Popen reports a signal
 
-    # Write several files in one call.
-    sandbox.write_files([
-        {"path": "/work/hello.sh", "content": "echo written from the SDK\n"},
-        {"path": "/work/run.sh", "content": "sh /work/hello.sh\n", "mode": 0o755},
-    ])
-    script = sandbox.run_command("sh", ["/work/run.sh"])
-    print("file:", script.stdout.strip())
-    print("dir:", ", ".join(entry.name for entry in sandbox.list_dir("/work")))
+    # Files, the stdlib way.
+    sandbox.os.makedirs("/work", exist_ok=True)
+    with sandbox.open("/work/hello.sh", "w") as f:
+        f.write("echo written from the SDK\n")
+    run = sandbox.Path("/work/run.sh")
+    run.write_text("sh /work/hello.sh\n")
+    run.chmod(0o755)
+    print("file:", sp.check_output(["sh", "/work/run.sh"], text=True).strip())
+    print("dir:", ", ".join(sorted(sandbox.os.listdir("/work"))))
+    print("size:", sandbox.os.path.getsize("/work/hello.sh"))
 
     # Copy one back out to the local filesystem.
-    copied = sandbox.download_file(
-        "/work/hello.sh", f"{tempfile.gettempdir()}/burrow-quickstart/hello.sh"
-    )
-    print("downloaded to:", copied)
+    local = os.path.join(tempfile.gettempdir(), "burrow-quickstart", "hello.sh")
+    os.makedirs(os.path.dirname(local), exist_ok=True)
+    with sandbox.open("/work/hello.sh", "rb") as src, open(local, "wb") as dst:
+        shutil.copyfileobj(src, dst)
+    print("downloaded to:", local)
 
     # Denied hosts fail rather than silently succeeding.
-    blocked = sandbox.run_command("wget -qO- http://example.com/")
-    print("example.com reachable:", blocked.exit_code == 0)
+    blocked = sp.run("wget -qO- http://example.com/", shell=True, capture_output=True)
+    print("example.com reachable:", blocked.returncode == 0)
 
-    # Tighten the policy on a running sandbox. Tags and network in one call.
-    sandbox.update(
-        tags={"purpose": "quickstart", "stage": "locked-down"},
-        network_policy="deny-all",
-    )
+    # Tighten the policy on a running sandbox.
+    sandbox.update_tags({"purpose": "quickstart", "stage": "locked-down"})
+    sandbox.update_network_policy("none")
     print("tags now:", sandbox.tags)
 
     try:
-        sandbox.exec("exit 3", check=True)
-    except CommandFailedError as err:
-        print("caught exit:", err.exit_code)
+        sp.run("exit 3", shell=True, check=True)
+    except sp.CalledProcessError as err:
+        print("caught exit:", err.returncode)
+
+    try:
+        sandbox.os.stat("/work/missing")
+    except FileNotFoundError as err:
+        print("missing:", err.filename)
 
     # Fork clones the sandbox's current state into a new one; the source's
     # state is written first, so the child starts from what it looks like right
@@ -90,22 +99,20 @@ try:
     child = sandbox.fork(name=f"{sandbox.name}-fork")
     try:
         print("fork:", child.name, child.id)
-        print("fork sees the file:", child.read_file("/work/hello.sh").strip())
+        print("fork sees the file:", child.Path("/work/hello.sh").read_text().strip())
     finally:
         child.delete()
 
     # stop suspends; resume brings it back.
     sandbox.stop()
-    import time
-
     started = time.monotonic()
     sandbox.resume()
     print("resumed in:", f"{(time.monotonic() - started) * 1000:.0f}ms")
-    print("file survived:", sandbox.read_file("/work/hello.sh").strip())
+    print("file survived:", sandbox.Path("/work/hello.sh").read_text().strip())
 
     # Auto-resume: a call on a suspended sandbox resumes it and retries once.
     sandbox.stop()
-    revived = sandbox.run_command("cat", ["/work/hello.sh"])
-    print("auto-resumed:", revived.stdout.strip())
+    revived = sp.check_output(["cat", "/work/hello.sh"], text=True)
+    print("auto-resumed:", revived.strip())
 finally:
     sandbox.delete()

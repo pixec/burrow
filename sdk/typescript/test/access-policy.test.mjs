@@ -55,7 +55,7 @@ test("denying exec says nothing about files", async () => {
 
 test("both sections travel together when both are named", async () => {
   const { sandbox, sent } = recordingSandbox();
-  await sandbox.update({
+  await sandbox.updateAccessPolicy({
     exec: { allowExec: true },
     fs: { allowDownload: false },
   });
@@ -66,15 +66,6 @@ test("both sections travel together when both are named", async () => {
   // A present section is replaced whole, so the fields not restated take
   // their permissive defaults rather than being carried over.
   assert.equal(call.request.fs.isUploadAllowed, true);
-});
-
-test("update() without exec or fs sends no access call at all", async () => {
-  const { sandbox, sent } = recordingSandbox();
-  await sandbox.update({ tags: { owner: "ci" } });
-  assert.equal(
-    sent.some((c) => c.method === "UpdateAccessPolicy"),
-    false,
-  );
 });
 
 test("naming neither section is refused rather than sent", async () => {

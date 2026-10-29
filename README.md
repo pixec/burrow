@@ -13,15 +13,21 @@ restore from warm snapshots in about 30 ms, suspend and resume with their
 memory intact, and are driven from a gRPC API, a CLI, or the TypeScript and
 Python SDKs.
 
+Burrow is built for the developer writing against it and for the people their
+product serves. So the SDKs do not invent an API of their own: each mirrors its
+language's. In TypeScript, files are `node:fs/promises` and processes are
+`node:child_process`; in Python, they are `open()`, `os`, `shutil`, `pathlib`
+and `subprocess`.
+
 ```ts
 import { Sandbox } from "@pixec/burrow";
 
 await using sandbox = await Sandbox.create({
   template: "python-3.12-slim",
-  network: { mode: "allowlist", allowDomains: ["pypi.org", "*.pythonhosted.org"] },
+  networkPolicy: { mode: "allowlist", allowDomains: ["pypi.org", "*.pythonhosted.org"] },
 });
-const result = await sandbox.runCommand("python3", ["-c", "print(1 + 1)"]);
-console.log(result.stdout()); // "2\n"
+const { stdout } = await sandbox.childProcess.execFile("python3", ["-c", "print(1 + 1)"]);
+console.log(stdout); // "2\n"
 ```
 
 ## Features

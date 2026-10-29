@@ -217,6 +217,11 @@ class BurrowStub(object):
                 request_serializer=api__pb2.WatchRequest.SerializeToString,
                 response_deserializer=api__pb2.WatchEvent.FromString,
                 _registered_method=True)
+        self.Fs = channel.unary_unary(
+                '/burrow.api.v1.Burrow/Fs',
+                request_serializer=api__pb2.FsRequest.SerializeToString,
+                response_deserializer=api__pb2.FsResponse.FromString,
+                _registered_method=True)
         self.ListCommands = channel.unary_unary(
                 '/burrow.api.v1.Burrow/ListCommands',
                 request_serializer=api__pb2.ListCommandsRequest.SerializeToString,
@@ -576,6 +581,12 @@ class BurrowServicer(object):
         context.set_details('Method not implemented!')
         raise NotImplementedError('Method not implemented!')
 
+    def Fs(self, request, context):
+        """Missing associated documentation comment in .proto file."""
+        context.set_code(grpc.StatusCode.UNIMPLEMENTED)
+        context.set_details('Method not implemented!')
+        raise NotImplementedError('Method not implemented!')
+
     def ListCommands(self, request, context):
         """Commands: a command outlives the stream that started it, so it can be
         listed, followed and signalled from another process.
@@ -905,6 +916,11 @@ def add_BurrowServicer_to_server(servicer, server):
                     servicer.Watch,
                     request_deserializer=api__pb2.WatchRequest.FromString,
                     response_serializer=api__pb2.WatchEvent.SerializeToString,
+            ),
+            'Fs': grpc.unary_unary_rpc_method_handler(
+                    servicer.Fs,
+                    request_deserializer=api__pb2.FsRequest.FromString,
+                    response_serializer=api__pb2.FsResponse.SerializeToString,
             ),
             'ListCommands': grpc.unary_unary_rpc_method_handler(
                     servicer.ListCommands,
@@ -1997,6 +2013,33 @@ class Burrow(object):
             _registered_method=True)
 
     @staticmethod
+    def Fs(request,
+            target,
+            options=(),
+            channel_credentials=None,
+            call_credentials=None,
+            insecure=False,
+            compression=None,
+            wait_for_ready=None,
+            timeout=None,
+            metadata=None):
+        return grpc.experimental.unary_unary(
+            request,
+            target,
+            '/burrow.api.v1.Burrow/Fs',
+            api__pb2.FsRequest.SerializeToString,
+            api__pb2.FsResponse.FromString,
+            options,
+            channel_credentials,
+            insecure,
+            call_credentials,
+            compression,
+            wait_for_ready,
+            timeout,
+            metadata,
+            _registered_method=True)
+
+    @staticmethod
     def ListCommands(request,
             target,
             options=(),
@@ -2607,6 +2650,11 @@ class AccessStub(object):
                 request_serializer=api__pb2.WatchRequest.SerializeToString,
                 response_deserializer=api__pb2.WatchEvent.FromString,
                 _registered_method=True)
+        self.Fs = channel.unary_unary(
+                '/burrow.api.v1.Access/Fs',
+                request_serializer=api__pb2.FsRequest.SerializeToString,
+                response_deserializer=api__pb2.FsResponse.FromString,
+                _registered_method=True)
 
 
 class AccessServicer(object):
@@ -2656,6 +2704,12 @@ class AccessServicer(object):
         context.set_details('Method not implemented!')
         raise NotImplementedError('Method not implemented!')
 
+    def Fs(self, request, context):
+        """Missing associated documentation comment in .proto file."""
+        context.set_code(grpc.StatusCode.UNIMPLEMENTED)
+        context.set_details('Method not implemented!')
+        raise NotImplementedError('Method not implemented!')
+
 
 def add_AccessServicer_to_server(servicer, server):
     rpc_method_handlers = {
@@ -2688,6 +2742,11 @@ def add_AccessServicer_to_server(servicer, server):
                     servicer.Watch,
                     request_deserializer=api__pb2.WatchRequest.FromString,
                     response_serializer=api__pb2.WatchEvent.SerializeToString,
+            ),
+            'Fs': grpc.unary_unary_rpc_method_handler(
+                    servicer.Fs,
+                    request_deserializer=api__pb2.FsRequest.FromString,
+                    response_serializer=api__pb2.FsResponse.SerializeToString,
             ),
     }
     generic_handler = grpc.method_handlers_generic_handler(
@@ -2856,6 +2915,33 @@ class Access(object):
             '/burrow.api.v1.Access/Watch',
             api__pb2.WatchRequest.SerializeToString,
             api__pb2.WatchEvent.FromString,
+            options,
+            channel_credentials,
+            insecure,
+            call_credentials,
+            compression,
+            wait_for_ready,
+            timeout,
+            metadata,
+            _registered_method=True)
+
+    @staticmethod
+    def Fs(request,
+            target,
+            options=(),
+            channel_credentials=None,
+            call_credentials=None,
+            insecure=False,
+            compression=None,
+            wait_for_ready=None,
+            timeout=None,
+            metadata=None):
+        return grpc.experimental.unary_unary(
+            request,
+            target,
+            '/burrow.api.v1.Access/Fs',
+            api__pb2.FsRequest.SerializeToString,
+            api__pb2.FsResponse.FromString,
             options,
             channel_credentials,
             insecure,

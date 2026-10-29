@@ -1,4 +1,3 @@
-import type { Writable } from "node:stream";
 
 // Type-only, so it is erased rather than becoming an import cycle.
 import type { Sandbox } from "./sandbox.js";
@@ -16,19 +15,6 @@ export type SandboxState =
   | "destroyed"
   | "failed"
   | "unknown";
-
-/**
- * The coarse lifecycle a sandbox is in, a narrower view of
- * {@link SandboxState}. `suspended`, `paused` and `stopped` all read as
- * `stopped`: either way the sandbox must be resumed, or booted, before it will
- * run anything.
- */
-export type SandboxStatus =
-  | "pending"
-  | "running"
-  | "stopping"
-  | "stopped"
-  | "failed";
 
 /** A credential the host attaches to egressing requests on the sandbox's behalf. */
 export interface HeaderInjection {
@@ -108,7 +94,7 @@ export interface RequestRule {
   forward?: ForwardRequest;
 }
 
-/** Egress policy in full. The shorthand `network: "allowlist"` sets `mode`. */
+/** Egress policy in full. A bare mode, `networkPolicy: "open"`, sets only `mode`. */
 export interface NetworkPolicyOptions {
   /** Defaults to `"none"`: no egress at all. */
   mode?: NetworkMode;
@@ -145,66 +131,8 @@ export interface NetworkPolicyOptions {
   injectHeaders?: HeaderInjection[];
 }
 
-/**
- * A rewrite applied to inspected requests for one domain.
- *
- * The host sets these headers on the requests the rule selects, replacing
- * whatever the guest sent under the same name.
- */
-export interface DomainTransform {
-  headers: Record<string, string>;
-}
-
-/**
- * What a domain is allowed to do, in the object form of `networkPolicy`.
- *
- * Without a `match` the rule applies to every request to the domain, so it
- * shadows anything written after it for the same domain. Give a domain a list
- * of rules to have several, narrowest first.
- */
-export interface DomainRule {
-  /** Which requests this rule applies to. A matcher never blocks. */
-  match?: RequestMatch;
-  /** Rewrites applied to the requests this rule selects. Forces inspection. */
-  transform?: DomainTransform[];
-  /**
-   * Send the requests this rule selects to an endpoint you control instead of
-   * to the origin. An `http://` or `https://` URL with no query string.
-   * Forces inspection.
-   */
-  forwardURL?: string;
-  /**
-   * Shared secret sent to `forwardURL` as `burrow-forwarded-secret`. It
-   * authenticates the node, not the sandbox. Over `https://` it is protected
-   * in transit; over `http://` the endpoint must be reachable only by the
-   * node. Burrow's own, since it has no OIDC issuer to sign with.
-   */
-  forwardSecret?: string;
-}
-
-/**
- * The shorthand policy shapes, for code written against SDKs that use them.
- *
- * `"allow-all"` is `mode: "open"`, `"deny-all"` is `mode: "none"`, and the
- * object form is an allowlist: `allow` names domains, `subnets` names ranges.
- */
-export type NetworkPolicyShorthand =
-  | "allow-all"
-  | "deny-all"
-  | {
-      /**
-       * Domains reachable, as a list or as a map carrying per-domain rules.
-       * A domain may carry several rules, evaluated in the order written.
-       */
-      allow?: string[] | Record<string, DomainRule | DomainRule[]>;
-      subnets?: { allow?: string[]; deny?: string[] };
-    };
-
 /** Every accepted spelling of an egress policy. */
-export type NetworkInput =
-  | NetworkMode
-  | NetworkPolicyOptions
-  | NetworkPolicyShorthand;
+export type NetworkInput = NetworkMode | NetworkPolicyOptions;
 
 /** Egress policy as the server reports it. Injected values arrive redacted. */
 export interface NetworkPolicy {
@@ -308,7 +236,7 @@ export interface NetworkMembership {
  * without this option allows exec.
  */
 export interface ExecOptions {
-  /** Defaults to true. `false` refuses exec, terminals and `runCode`. */
+  /** Defaults to true. `false` refuses commands, terminals and signals. */
   allowExec?: boolean;
 }
 
@@ -414,9 +342,7 @@ export interface SandboxInfo {
   createdAt: string;
   /** Address the sandbox holds on the networks it joined. */
   guestIp: string;
-  /** Tags. `metadata` is the same map under its original name. */
   tags: Record<string, string>;
-  metadata: Record<string, string>;
   policy: SandboxPolicy;
   /**
    * Whether the node hosting the sandbox has missed its heartbeats. When true,
@@ -472,15 +398,11 @@ export interface CreateOptions {
   /**
    * Snapshot id to start from. The sandbox **restores** that state instead of
    * booting, so it arrives with the snapshot's processes and memory, and
-   * `template`, `vcpus` and `memoryMib` may not disagree with what the
+   * `template` and `resources` may not disagree with what the
    * snapshot holds. Placed on the node holding it: snapshots do not travel.
    */
   snapshot?: string;
-  /** The same thing under the name an image-shaped SDK uses. */
-  image?: string;
-  vcpus?: number;
-  memoryMib?: number;
-  /** Machine shape and lifetime. Wins over `vcpus` and `memoryMib`. */
+  /** Machine shape and lifetime. */
   resources?: ResourceOptions;
 
   /**
@@ -488,13 +410,7 @@ export interface CreateOptions {
    * Network access is opt-in, not opt-out. Pass a mode for the common case, or
    * an object for the full policy.
    */
-  network?: NetworkInput;
-  /** The same thing under its longer name. `network` wins if both are given. */
   networkPolicy?: NetworkInput;
-  /** Shorthand for `network.allowDomains`. */
-  allowDomains?: string[];
-  /** Shorthand for `network.allowCidrs`. */
-  allowCidrs?: string[];
   /**
    * Private networks to join. Sandboxes sharing a network name can address
    * each other regardless of their egress policy: a member is reachable at
@@ -540,8 +456,6 @@ export interface CreateOptions {
 
   /** Tags, at most 16. Keys are 1..64 bytes, values up to 256. */
   tags?: Record<string, string>;
-  /** The same map under its original name. `tags` wins if both are given. */
-  metadata?: Record<string, string>;
   /**
    * Environment for every command this handle runs, under whatever a single
    * command passes.
@@ -628,8 +542,6 @@ export interface UpdateOptions {
    * withdrawn, which is what makes "lock this sandbox down" one call.
    */
   networkPolicy?: NetworkInput;
-  /** The same thing under a shorter name. */
-  network?: NetworkInput;
   /**
    * Replaces the exec policy wholesale. Omitted leaves it exactly as it is.
    *
@@ -671,8 +583,6 @@ export interface ForkOptions {
    * which is the usual case: a fork is meant to be the same sandbox again.
    */
   networkPolicy?: NetworkInput;
-  /** The same thing under a shorter name. */
-  network?: NetworkInput;
   /** Private networks the child joins instead of the source's. */
   networks?: ReadonlyArray<string | NetworkMembership>;
   /** Replaces the source's exec policy on the child. Omitted inherits it. */
@@ -688,164 +598,18 @@ export interface ForkOptions {
   signal?: AbortSignal;
 }
 
-/** Options for the static {@link Sandbox.fork}. */
-export interface ForkSourceOptions extends ForkOptions {
-  /** The sandbox to fork, by id or by name. */
-  source: string;
-}
-
-export interface RunOptions {
-  env?: Record<string, string>;
-  cwd?: string;
-  /**
-   * Guest user to run as. Defaults to root, which is what every command ran
-   * as before this existed.
-   *
-   * The user has to exist already; {@link Sandbox.createUser} creates one.
-   * `HOME`, `USER`, `LOGNAME` and the working directory follow the user unless
-   * `env` or `cwd` say otherwise.
-   */
-  user?: string;
-  /** Allocate a pty, so programs behave as if attached to a terminal. */
-  pty?: boolean;
-  rows?: number;
-  cols?: number;
-  timeoutMs?: number;
-  /**
-   * Rotate the command's output log once a file reaches this many bytes, as
-   * Docker's `--log-opt max-size`. Unset keeps every byte the command prints.
-   */
-  logMaxBytes?: number;
-  /** Log files kept once rotating, as Docker's `--log-opt max-file`. */
-  logMaxFiles?: number;
-  /** Called with each chunk of stdout as it arrives. */
-  onStdout?: (chunk: string) => void;
-  /** Called with each chunk of stderr as it arrives. */
-  onStderr?: (chunk: string) => void;
-  /**
-   * Throw `CommandFailedError` on a non-zero exit instead of returning it.
-   * Defaults to false, matching how shells report failures.
-   */
-  check?: boolean;
-}
-
-export interface CommandResult {
-  stdout: string;
-  stderr: string;
-  exitCode: number;
-  /** True when `exitCode === 0`. */
-  success: boolean;
-  /** The signal that ended the command; 0 if it exited on its own. */
-  exitSignal: number;
-  /** The output exactly as written, for output that is not text. */
-  stdoutBytes: Uint8Array;
-  stderrBytes: Uint8Array;
-}
-
 /** Options accepted by every call, alongside whatever else it takes. */
 export interface CallOptions {
   /** Cancels the call. An aborted call rejects with code `"cancelled"`. */
   signal?: AbortSignal;
 }
 
-/** Options for {@link Sandbox.runCommand}. */
-export interface RunCommandOptions extends RunOptions {
-  /**
-   * Run through `/bin/sh -c`, so pipes and redirection work. Defaults to true
-   * when the command is a bare string, false once `args` are given.
-   */
-  shell?: boolean;
-  /** Set to false to skip the auto-resume retry for this call. */
-  autoResume?: boolean;
-  signal?: AbortSignal;
-}
-
-/** The object form of {@link Sandbox.runCommand}. */
-export interface RunCommandParams extends RunCommandOptions {
-  cmd: string;
-  args?: string[];
-  /** Return a handle immediately instead of waiting for the command to exit. */
-  detached?: boolean;
-  /** Stream the command's stdout here as it arrives, e.g. `process.stdout`. */
-  stdout?: Writable;
-  /** Stream the command's stderr here as it arrives. */
-  stderr?: Writable;
-}
-
-/**
- * A command that has run to completion.
- *
- * `stdout()` and `stderr()` are methods rather than fields, so the same code
- * reads a finished command and a detached one; both return the whole stream as
- * UTF-8 text.
- */
-export interface FinishedCommand {
-  exitCode: number;
-  /** True when `exitCode === 0`. */
-  success: boolean;
-  /** The signal that ended the command; 0 if it exited on its own. */
-  exitSignal: number;
-  stdout(): string;
-  stderr(): string;
-  /** The output exactly as written. */
-  stdoutBytes(): Uint8Array;
-  stderrBytes(): Uint8Array;
-}
-
-/**
- * A command still running, returned by `runCommand({ detached: true })` and by
- * {@link Sandbox.getCommand}.
- *
- * Read `logs()` as it goes, or `wait()` for the finished result.
- */
-export interface DetachedCommand {
-  sandboxId: string;
-  /**
-   * The command's id in the sandbox.
-   *
-   * Stable and addressable: hand it to {@link Sandbox.getCommand} from another
-   * process to follow, wait on or signal the same command.
-   */
-  cmdId: string;
-  /** Interleaved stdout and stderr, in the order they arrived. */
-  logs(): AsyncIterable<OutputChunk>;
-  /** Waits for the command to exit and returns what it produced. */
-  wait(): Promise<FinishedCommand>;
-  /**
-   * Signals the command, without waiting. Defaults to SIGKILL.
-   *
-   * Only one failure is swallowed: the command had already exited, which is
-   * the state the signal asked for. Everything else rejects, and with nothing
-   * awaiting it that surfaces as an unhandled rejection rather than as
-   * silence: `permission_denied` when the exec policy forbids commands,
-   * `failed_precondition` when the sandbox is suspended, `not_found` for a
-   * command the guest has evicted, and transport failures. Use {@link killed}
-   * to handle any of those.
-   */
-  kill(signal?: number): void;
-  /**
-   * The awaitable {@link kill}: resolves once the node has delivered the
-   * signal, and rejects on every failure above, including a command that had
-   * already exited.
-   */
-  killed(signal?: number): Promise<void>;
-  /**
-   * Writes to the command's stdin, or its terminal for a pty command. On a
-   * handle from {@link Sandbox.getCommand}, whichever process started the
-   * command: a shell whose original stream is long gone takes input here.
-   */
-  sendStdin?(data: string | Uint8Array): void;
-  /** Ends the command's stdin, which a pipe command reads as EOF. */
-  closeStdin?(): void;
-}
-
 /**
  * What the sandbox knows about a command it has run.
  *
- * The guest keeps the last 256 KiB of each command's output and the 64 most
- * recent finished commands. Past either bound the command is gone: its output
- * replays from where the buffer still reaches, and an evicted command is no
- * longer listed.
+ * Every byte a command prints is kept on the node until
+ * {@link Sandbox.pruneCommands} removes it, unless the command asked for its
+ * log to rotate.
  */
 export interface CommandInfo {
   cmdId: string;
@@ -859,7 +623,7 @@ export interface CommandInfo {
   startedAt: Date;
   /** `null` while the command is still running. */
   endedAt: Date | null;
-  /** Output held in the sandbox for a later `logs()`. */
+  /** Output held on the node for a later {@link Sandbox.getCommand} to replay. */
   bufferedBytes: number;
   /** The signal that ended the command; 0 if none did. */
   exitSignal: number;
@@ -888,58 +652,6 @@ export interface GuestGroup {
    * file created inside it stays readable by the rest of the group.
    */
   sharedDir: string;
-}
-
-/** Options for {@link Sandbox.downloadFile}. */
-export interface DownloadFileOptions {
-  /** Create the destination's parent directories. Defaults to true. */
-  mkdirRecursive?: boolean;
-  signal?: AbortSignal;
-}
-
-/** One file for {@link Sandbox.writeFiles}. */
-export interface FileWrite {
-  path: string;
-  /** Text or bytes. `contents` is accepted as a synonym. */
-  content?: string | Uint8Array;
-  contents?: string | Uint8Array;
-  /** Unix mode for a created file. 0 means 0644. */
-  mode?: number;
-}
-
-/** Names one file, for the object form of the read methods. */
-export interface FileRef {
-  path: string;
-  signal?: AbortSignal;
-}
-
-/** One chunk of a streaming command. */
-/**
- * One piece of a command's output.
- *
- * `data` is decoded across chunk boundaries, so a character split between two
- * chunks arrives whole; invalid UTF-8 becomes U+FFFD. `raw` is the bytes
- * exactly as the command wrote them. A `"lost"` chunk stands for output the
- * sandbox no longer holds or never recorded, by how many bytes.
- */
-export type OutputChunk =
-  | { type: "stdout"; data: string; raw: Uint8Array }
-  | { type: "stderr"; data: string; raw: Uint8Array }
-  | { type: "exit"; exitCode: number; exitSignal: number }
-  | { type: "lost"; lostBytes: number };
-
-export interface DirEntry {
-  name: string;
-  isDir: boolean;
-  size: number;
-  mode: number;
-}
-
-/** One file or directory, as {@link Sandbox.stat} reports it. */
-export interface FileInfo extends DirEntry {
-  /** The absolute path that was asked about. */
-  path: string;
-  type: "file" | "dir";
 }
 
 export interface PortMapping {
@@ -1022,30 +734,6 @@ export interface NodeInfo {
   arch: string;
   /** The Firecracker this node runs. Durable snapshots need an exact match. */
   firecrackerVersion: string;
-}
-
-/** A filesystem change reported by {@link Sandbox.watch}. */
-export interface WatchEvent {
-  type: "created" | "modified" | "deleted";
-  path: string;
-  isDir: boolean;
-}
-
-export interface WatchOptions {
-  /** Descend into subdirectories. */
-  recursive?: boolean;
-  /** How often the guest re-scans, in milliseconds. Defaults to 500. */
-  intervalMs?: number;
-  onEvent?: (event: WatchEvent) => void;
-  onError?: (err: Error) => void;
-}
-
-/** Handle returned by {@link Sandbox.watch}. */
-export interface Watcher {
-  /** Stops watching. */
-  stop(): void;
-  /** Async iteration over events, as an alternative to `onEvent`. */
-  [Symbol.asyncIterator](): AsyncIterator<WatchEvent>;
 }
 
 /** One recorded egress attempt or DNS lookup. */

@@ -42,7 +42,7 @@ fn open_no_symlinks(path: &str, flags: OFlag, mode: Mode) -> std::io::Result<std
 ///
 /// A thread working as a user has it opened already, as root: `/proc/<pid>/root`
 /// of a root process is not something that user may open.
-fn guest_root() -> std::io::Result<std::fs::File> {
+pub fn guest_root() -> std::io::Result<std::fs::File> {
     if let Some(root) = USER_ROOT.with(|root| root.borrow().as_ref().map(|file| file.try_clone())) {
         return root;
     }
@@ -58,7 +58,7 @@ fn guest_root() -> std::io::Result<std::fs::File> {
 /// take names straight from a directory listing: neither a link nor a `..`
 /// can lead anywhere outside `dir`, whatever the tree does between the listing
 /// and this open.
-fn openat_no_symlinks(
+pub fn openat_no_symlinks(
     dir: &std::fs::File,
     name: &std::ffi::OsStr,
     flags: OFlag,
@@ -82,7 +82,7 @@ fn open_dir_no_symlinks(path: &str) -> std::io::Result<std::fs::File> {
 /// resolves it to the inode the descriptor is already open on, whatever a
 /// caller renames or relinks underneath. The descriptor has to stay open
 /// across the read.
-fn proc_path(dir: &std::fs::File) -> std::path::PathBuf {
+pub fn proc_path(dir: &std::fs::File) -> std::path::PathBuf {
     use std::os::fd::AsRawFd as _;
     std::path::PathBuf::from(format!("/proc/self/fd/{}", dir.as_raw_fd()))
 }
@@ -220,7 +220,7 @@ fn become_user(user: &FsUser) -> std::io::Result<()> {
 /// A user's work gets a thread of its own that exits afterwards, never a pool
 /// thread: the identity stays with the thread, and the next task to land on a
 /// pooled one would inherit it.
-async fn blocking<T: Send + 'static>(
+pub async fn blocking<T: Send + 'static>(
     user: Option<std::sync::Arc<FsUser>>,
     work: impl FnOnce() -> std::io::Result<T> + Send + 'static,
 ) -> Result<std::io::Result<T>, Status> {

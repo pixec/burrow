@@ -20,6 +20,9 @@ service Guest {
   rpc DownloadFile(DownloadRequest) returns (stream FileChunk);
   rpc ListDir(ListDirRequest) returns (ListDirResponse);
   rpc Watch(WatchRequest) returns (stream WatchEvent);
+  // One POSIX file operation. An agent that serves it, scopes and cap
+  // included, lists "fs-scoped" in its health response.
+  rpc Fs(FsRequest) returns (FsResponse);
 
   // Commands the agent has run, addressable after the stream that started
   // them is gone.
@@ -445,4 +448,255 @@ message GuestHealthResponse {
   // "attach-input": Attach, exit_signal and lost_bytes.
   // "output-feed": Feed, and command output kept on the host.
   repeated string features = 1;
+}
+
+// One POSIX file operation, as the guest kernel performs it. What `fs` in
+// Node and `os`, `shutil` and `open()` in Python are built on: every path
+// call and every call on an open file goes through here, so each language's
+// own file API can be mirrored without an exec per call.
+message FsRequest {
+  reserved 1;
+  // Do it as this guest user rather than as root: the guest kernel checks
+  // the user may, and what is created is theirs. Empty is root.
+  string user = 2;
+  // Absolute path prefixes, matched on whole components, that every path the
+  // op touches must lie in once resolved; empty is the whole guest. The agent
+  // checks the object it is about to act on, through the descriptor it acts
+  // through, so a symlink swapped in between cannot lead outside. A path
+  // outside is EACCES.
+  repeated string path_scopes = 3;
+  // Ceiling on the size a write, truncate or copy may grow a file to; 0 is
+  // none. Past it is EFBIG.
+  uint64 max_write_bytes = 4;
+  oneof op {
+    FsStat stat = 10;
+    FsReadDir read_dir = 11;
+    FsMkdir mkdir = 12;
+    FsRemove remove = 13;
+    FsRename rename = 14;
+    FsCopy copy = 15;
+    FsChmod chmod = 16;
+    FsChown chown = 17;
+    FsUtimes utimes = 18;
+    FsTruncate truncate = 19;
+    FsSymlink symlink = 20;
+    FsLink link = 21;
+    FsReadlink readlink = 22;
+    FsRealpath realpath = 23;
+    FsAccess access = 24;
+    FsMkdtemp mkdtemp = 25;
+    FsOpen open = 40;
+    FsRead read = 41;
+    FsWrite write = 42;
+    FsHandle fstat = 43;
+    FsFtruncate ftruncate = 44;
+    FsFsync fsync = 45;
+    FsHandle close = 46;
+  }
+}
+
+message FsStat {
+  string path = 1;
+  // lstat: describe a symlink rather than what it points at.
+  bool is_nofollow = 2;
+}
+
+message FsReadDir {
+  string path = 1;
+}
+
+message FsMkdir {
+  string path = 1;
+  // 0 means 0777, before the umask.
+  uint32 mode = 2;
+  // Create missing parents, and succeed if the directory exists.
+  bool is_recursive = 3;
+}
+
+message FsRemove {
+  string path = 1;
+  // Remove a directory and everything under it.
+  bool is_recursive = 2;
+  // Succeed when nothing is there.
+  bool is_force = 3;
+  // rmdir: only an empty directory, and only a directory.
+  bool is_dir_only = 4;
+}
+
+message FsRename {
+  string src = 1;
+  string dst = 2;
+}
+
+message FsCopy {
+  string src = 1;
+  string dst = 2;
+  // Fail with EEXIST rather than replace what is at `dst`.
+  bool is_exclusive = 3;
+  // Copy a directory tree. Without it a directory is EISDIR.
+  bool is_recursive = 4;
+  // Carry mode and times over, as `cp -p` and shutil.copy2 do.
+  bool is_preserving = 5;
+}
+
+message FsChmod {
+  string path = 1;
+  uint32 mode = 2;
+}
+
+message FsChown {
+  string path = 1;
+  // -1 leaves that id as it is.
+  int64 uid = 2;
+  int64 gid = 3;
+  bool is_nofollow = 4;
+}
+
+message FsUtimes {
+  string path = 1;
+  int64 atime_ns = 2;
+  int64 mtime_ns = 3;
+  bool is_nofollow = 4;
+}
+
+message FsTruncate {
+  string path = 1;
+  uint64 length = 2;
+}
+
+message FsSymlink {
+  // What the link points at, stored as written.
+  string target = 1;
+  string path = 2;
+}
+
+message FsLink {
+  string existing = 1;
+  string path = 2;
+}
+
+message FsReadlink {
+  string path = 1;
+}
+
+message FsRealpath {
+  string path = 1;
+}
+
+message FsAccess {
+  string path = 1;
+  // F_OK 0, X_OK 1, W_OK 2, R_OK 4, or'd together.
+  uint32 mode = 2;
+}
+
+message FsMkdtemp {
+  // Six random characters are appended, as mkdtemp(3) does.
+  string prefix = 1;
+}
+
+message FsOpen {
+  string path = 1;
+  // open(2) flags in their Linux values: O_RDONLY 0, O_WRONLY 1, O_RDWR 2,
+  // O_CREAT 0o100, O_EXCL 0o200, O_TRUNC 0o1000, O_APPEND 0o2000. Anything
+  // else is refused.
+  uint32 flags = 2;
+  // For a created file; 0 means 0666, before the umask.
+  uint32 mode = 3;
+}
+
+message FsHandle {
+  uint64 handle = 1;
+}
+
+message FsRead {
+  uint64 handle = 1;
+  // Where to read from. Negative reads from the handle's own position and
+  // moves it, as read(2) does; otherwise pread(2), and the position stays.
+  int64 position = 2;
+  // At most 4 MiB. Fewer come back at end of file, and none past it.
+  uint32 length = 3;
+}
+
+message FsWrite {
+  uint64 handle = 1;
+  // As for FsRead. A handle opened with O_APPEND always writes at the end.
+  int64 position = 2;
+  // At most 4 MiB.
+  bytes data = 3;
+}
+
+message FsFtruncate {
+  uint64 handle = 1;
+  uint64 length = 2;
+}
+
+message FsFsync {
+  uint64 handle = 1;
+  // fdatasync rather than fsync.
+  bool is_data_only = 2;
+}
+
+message FsResponse {
+  oneof result {
+    // The call failed, in the guest kernel or against the sandbox's file
+    // policy, which reads as EACCES, or EFBIG past its write ceiling.
+    FsError error = 1;
+    // Completed with nothing to return.
+    bool is_done = 2;
+    FsStatResult stat = 3;
+    FsDirEntries entries = 4;
+    // readlink, realpath, mkdtemp; and mkdir with is_recursive, the first
+    // directory it created, empty if there was none.
+    string path = 5;
+    // open: what every later call on the file names. Closed by FsClose, and
+    // by the agent once unused for ten minutes.
+    uint64 handle = 6;
+    // read: empty at end of file.
+    bytes data = 7;
+    // write: bytes written.
+    uint64 written = 8;
+  }
+}
+
+message FsError {
+  // The errno name: "ENOENT", "EEXIST", "EACCES", ...
+  string code = 1;
+  // Its Linux number.
+  int32 errno = 2;
+  // The call that failed: "open", "stat", "rename", ...
+  string syscall = 3;
+  string path = 4;
+  // rename, copy, link and symlink name a second path.
+  string dest = 5;
+}
+
+// stat(2), field for field.
+message FsStatResult {
+  uint64 dev = 1;
+  uint64 ino = 2;
+  // File type and permission bits, st_mode.
+  uint32 mode = 3;
+  uint64 nlink = 4;
+  uint32 uid = 5;
+  uint32 gid = 6;
+  uint64 rdev = 7;
+  uint64 size = 8;
+  uint64 blksize = 9;
+  uint64 blocks = 10;
+  int64 atime_ns = 11;
+  int64 mtime_ns = 12;
+  int64 ctime_ns = 13;
+  // 0 where the filesystem does not record one.
+  int64 birthtime_ns = 14;
+}
+
+message FsDirEntries {
+  repeated FsDirEntry entries = 1;
+}
+
+message FsDirEntry {
+  string name = 1;
+  // d_type: "file", "dir", "symlink", "fifo", "socket", "char", "block", or
+  // "unknown".
+  string type = 2;
 }

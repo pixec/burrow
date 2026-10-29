@@ -62,13 +62,3 @@ class BurrowError(Exception):
         """
         return self.code == "failed_precondition" and not self.is_suspended
 
-
-class CommandFailedError(BurrowError):
-    """Raised when a command exits non-zero and ``check`` is set."""
-
-    def __init__(self, command: str, exit_code: int, stdout: str, stderr: str):
-        tail = f"\n{stderr.strip()}" if stderr.strip() else ""
-        super().__init__(f"command exited with {exit_code}: {command}{tail}", "internal")
-        self.exit_code = exit_code
-        self.stdout = stdout
-        self.stderr = stderr

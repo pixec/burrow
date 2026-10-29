@@ -9,6 +9,13 @@ npm install @pixec/burrow
 The SDK talks gRPC to a [burrow](../../) orchestrator. It needs Node 18 or newer
 and depends only on `@grpc/grpc-js` and `@grpc/proto-loader`.
 
+It mirrors Node rather than inventing an API: `sandbox.fs` is
+`node:fs/promises`, `FileHandle` included, and `sandbox.childProcess` is
+`node:child_process`, with the same signatures, return types and errors. Code
+written against Node works against a sandbox by changing which object it
+calls. What Node has no counterpart for, such as reattaching to a command
+another process started, is on `Sandbox`.
+
 ## Quickstart
 
 Create a sandbox, run a command, and destroy it.
@@ -18,8 +25,8 @@ import { Sandbox } from "@pixec/burrow";
 
 const sandbox = await Sandbox.create({ template: "python" });
 
-const result = await sandbox.runCommand("echo", ["hello"]);
-console.log(result.exitCode, result.stdout()); // 0 "hello\n"
+const { stdout } = await sandbox.childProcess.execFile("echo", ["hello"]);
+console.log(stdout); // "hello\n"
 
 await sandbox.delete();
 ```
@@ -29,7 +36,7 @@ your code throws.
 
 ```ts
 await using sandbox = await Sandbox.create({ template: "python" });
-await sandbox.runCommand("echo", ["hello"]);
+await sandbox.fs.writeFile("/work/hello.py", "print('hello')\n");
 ```
 
 Every `Sandbox.create` and `Sandbox.get` opens its own gRPC channel. `delete()`
@@ -54,7 +61,7 @@ const sandbox = await Sandbox.create({
     idleSuspendSecs: 300,
     suspendedTtlSecs: 86400,
   },
-  network: {
+  networkPolicy: {
     mode: "allowlist",
     allowDomains: ["pypi.org", "*.pythonhosted.org"],
   },
@@ -66,12 +73,12 @@ const sandbox = await Sandbox.create({
 | Option | Default | What it does |
 |---|---|---|
 | `name` | none | Name for the sandbox, the only identity you choose. Ids are generated |
-| `template` | none | Guest image to boot, as imported by `burrow pull`. Required unless `snapshot` is given. Also spelled `image` |
+| `template` | none | Guest image to boot, as imported by `burrow pull`. Required unless `snapshot` is given |
 | `snapshot` | none | Restore from a snapshot instead of booting a template |
-| `tags` | `{}` | Up to 16 key/value pairs, used for filtering later. Also spelled `metadata` |
+| `tags` | `{}` | Up to 16 key/value pairs, used for filtering later |
 | `nodeLabels` | `{}` | Labels the hosting node must carry, all of them. See [Choose where a sandbox runs](#choose-where-a-sandbox-runs) |
 | `resources` | 1 vCPU, 512 MiB | Machine shape, lifetime, and snapshot retention |
-| `network` | `"none"` | Egress policy, as a mode, a shorthand, or a full policy object. Also spelled `networkPolicy` |
+| `networkPolicy` | `"none"` | Egress policy, as a mode or a full policy object |
 | `env` | `{}` | Environment merged under every command this handle runs |
 | `networks` | `[]` | Private networks to join |
 | `alias` | sandbox id | Name this sandbox answers to on those networks |
@@ -81,9 +88,6 @@ const sandbox = await Sandbox.create({
 | `autoResume` | `true` | Resume and retry once when a call finds the sandbox stopped |
 | `timeoutMs` | `120000` | How long to wait for the boot |
 | `signal` | none | `AbortSignal` that cancels the call |
-
-`vcpus`, `memoryMib`, `allowDomains` and `allowCidrs` are also accepted at the
-top level, where they fill in the matching `resources` or `network` field.
 
 ### Resources
 
@@ -112,14 +116,14 @@ behaves exactly as it always has.
 
 | `exec` field | Default | What it does |
 |---|---|---|
-| `allowExec` | `true` | `false` refuses every exec, terminal and `runCode` on this sandbox |
+| `allowExec` | `true` | `false` refuses every command, terminal and signal on this sandbox |
 
 | `fs` field | Default | What it does |
 |---|---|---|
 | `allowUpload` | `true` | `false` refuses uploads |
 | `allowDownload` | `true` | `false` refuses downloads |
-| `pathScopes` | `[]` | Absolute paths uploads, downloads, listings and watches are confined to. At most 16; empty is the whole filesystem |
-| `maxUploadBytes` | `0` | Ceiling on a single upload. `0` is unlimited |
+| `pathScopes` | `[]` | Absolute paths `fs` calls, downloads and watches are confined to. At most 16; empty is the whole filesystem |
+| `maxUploadBytes` | `0` | Ceiling on a single upload or write. `0` is unlimited |
 
 ```ts
 const sandbox = await Sandbox.create({
@@ -129,7 +133,9 @@ const sandbox = await Sandbox.create({
 ```
 
 Scopes are matched on whole path components, so `/data` admits `/data/in.csv`
-and refuses `/database/dump.sql`. A path carrying `..` is refused outright.
+and refuses `/database/dump.sql`. A path carrying `..` is refused outright. A
+path outside the scopes fails the way the kernel would refuse it, `EACCES`, and
+a write past the ceiling `EFBIG`.
 Both sections can be tightened later, with different rules about what an omitted
 section means: see [Exec and file policy](#exec-and-file-policy).
 
@@ -166,7 +172,7 @@ fails with `unavailable`.
 const sandbox = await Sandbox.getOrCreate({
   name: "build-482",
   template: "python-tools",
-  onCreate: (s) => s.writeFiles([{ path: "/work/app.py", content: source }]),
+  onCreate: (s) => s.fs.writeFile("/work/app.py", source),
   onResume: (s) => console.log("resumed", s.name),
 });
 ```
@@ -203,85 +209,62 @@ finishes.
 
 ## Run commands
 
-`runCommand` runs a command to completion and returns its result. Pass the
-program and its arguments separately and the command goes straight to execve,
-with no shell involved.
+`sandbox.childProcess` is Node's `child_process`, run in the guest. `exec`,
+`execFile` and `spawn` take the arguments Node's do and behave the way Node's
+do, so code written against `child_process` moves over by swapping the import.
 
 ```ts
-const install = await sandbox.runCommand("pip", ["install", "cowsay"]);
+const { stdout } = await sandbox.childProcess.exec("cat /etc/hostname | tr a-z A-Z");
 
-install.exitCode; // 0
-install.success;  // true
-install.stdout(); // the whole stream, as text
-install.stderr();
+const { stdout: version } = await sandbox.childProcess.execFile("python3", ["--version"]);
 ```
 
-Pass a bare string and it runs through `/bin/sh -c`, so pipes and redirection
-work.
+These are the `util.promisify` forms: they resolve `{ stdout, stderr }` once
+the command exits 0, as strings, or as Buffers with `encoding: "buffer"`.
+`exec` runs its command through `/bin/sh -c`, so pipes and redirection work;
+`execFile` runs the program directly, so its arguments need no quoting. The
+returned promise carries the `ChildProcess` as `.child`.
 
-```ts
-await sandbox.runCommand("cat /etc/hostname | tr a-z A-Z");
-```
-
-A non-zero exit is returned rather than thrown. Set `check: true` to invert
-that.
+Any other ending rejects with Node's error: `message` is
+`Command failed: <cmd>\n<stderr>`, `code` is the exit code, and `signal`,
+`killed`, `cmd`, `stdout` and `stderr` are set beside it.
 
 ```ts
 try {
-  await sandbox.runCommand("exit 1", [], { check: true });
+  await sandbox.childProcess.exec("make all");
 } catch (err) {
-  err.exitCode; // 1
+  err.code;   // 2, or null when a signal ended it
+  err.signal; // null, or "SIGTERM"
+  err.stderr; // what it printed
 }
 ```
 
-`runCommand` also takes a single object, which is where `cwd`, `env`, and
-output streams live.
-
-```ts
-const build = await sandbox.runCommand({
-  cmd: "make",
-  args: ["-j4"],
-  cwd: "/work",
-  env: { CFLAGS: "-O2" },
-  stdout: process.stdout,
-  stderr: process.stderr,
-});
-```
-
-| Field | What it does |
+| Option | What it does |
 |---|---|
-| `cmd` | Program, or a whole shell line when `args` is omitted |
-| `args` | Arguments, passed to execve with no shell |
-| `shell` | Force the shell path. Defaults to on when `args` is empty |
-| `cwd` | Directory to run in. Defaults to the image's `WorkingDir` |
-| `env` | Environment for this command. Wins over the handle's `env` defaults |
-| `stdout`, `stderr` | Node `Writable`s that receive output as it arrives |
-| `onStdout`, `onStderr` | The same output as callbacks |
-| `check` | Throw `CommandFailedError` on a non-zero exit |
-| `detached` | Return a handle immediately instead of waiting |
-| `pty` | Allocate a pty, with `rows` and `cols` |
-| `user` | Guest user to run as. Defaults to root |
-| `timeoutMs` | Deadline for this command |
-| `autoResume` | Override the handle's auto-resume for this call |
-| `signal` | `AbortSignal` that cancels the command |
+| `cwd` | Directory to run in. Defaults to the image's `WorkingDir`, or the user's home |
+| `env` | Laid over the guest's environment and the handle's `env`. Nothing from this process leaks in |
+| `shell` | `exec` only takes a path; `execFile` and `spawn` take `true` for `/bin/sh` or a path |
+| `timeout`, `killSignal` | Kill with `killSignal`, SIGTERM by default, after this many milliseconds |
+| `maxBuffer` | Bytes of stdout or stderr `exec` keeps before it kills the command. 1 MiB |
+| `encoding` | `"utf8"` by default; `"buffer"` resolves Buffers |
+| `signal` | `AbortSignal`. Aborting kills the command and rejects with an `AbortError` |
+| `user` | Burrow only. Guest user to run as. Defaults to the handle's, which is root unless it came from `asUser` |
+| `pty`, `rows`, `cols` | Burrow only. Run under a pty, so the program sees a terminal |
+| `logMaxBytes`, `logMaxFiles` | Burrow only. Rotate the command's log on the node, as Docker's `max-size` and `max-file` |
 
-Two sharp edges. `check` is only honoured on the blocking path, so
-`{ detached: true, check: true }` ignores it and you inspect the exit code
-yourself. And `shell: true` together with `args` joins them with spaces and
-quotes nothing, so build the line yourself if any argument can contain a space.
-
-Commands run as root unless `user` names someone else. See
-[Users and groups](#users-and-groups).
+Signal names are Linux's, whatever the platform this runs on: `SIGUSR1` is 10
+in the guest even from a Mac, where Node's own number for it is 30.
 
 ### Environment defaults
 
 `env` on `create` or `getOrCreate` is merged under every command that handle
-runs, and a per-command `env` wins over it. `asUser` and `fork` carry it along;
-`terminal()` does not, so pass a terminal's environment to the terminal.
+runs, and a command's own `env` wins over it. `asUser` and `fork` carry it
+along; `terminal()` does not, so pass a terminal's environment to the
+terminal.
 
 ```ts
 const sandbox = await Sandbox.create({ env: { NODE_ENV: "test" } });
-await sandbox.runCommand("printenv NODE_ENV"); // test
+await sandbox.childProcess.exec("printenv NODE_ENV"); // stdout "test\n"
 ```
 
 This lives in the client, not in the sandbox. A handle from `Sandbox.get` in
@@ -290,51 +273,45 @@ Bake anything that has to survive into the template.
 
 ### Stream output
 
-Pass `detached: true` to get a handle back immediately. Read `logs()` as the
-command runs, or `wait()` for the finished result. Use one or the other: both
-drain the same stream, and the second call throws `failed_precondition` saying
-the output has already been consumed. `kill()` signals the command, SIGKILL by
-default; `killed()` is the same call, awaited. See
-[Signalling a command](#signalling-a-command).
+`spawn` returns a `ChildProcess` at once: an `EventEmitter` with `stdin`,
+`stdout` and `stderr` streams, as Node's is.
 
 ```ts
-const job = await sandbox.runCommand({
-  cmd: "npm",
-  args: ["install"],
-  detached: true,
-});
+const child = sandbox.childProcess.spawn("npm", ["install"], { cwd: "/work" });
 
-for await (const chunk of job.logs()) {
-  if (chunk.type === "stdout") process.stdout.write(chunk.data);
-  if (chunk.type === "exit") console.log("exit", chunk.exitCode);
-}
+child.stdout.pipe(process.stdout);
+child.stderr.pipe(process.stderr);
+child.on("close", (code, signal) => console.log("done", code, signal));
 ```
 
-`job.cmdId` is the command's id in the sandbox, not a local name. Keep it and
-another process can pick the same command up again. See
-[Reattach to a command](#reattach-to-a-command).
+Without `shell` the command is the program and no shell is involved. With
+`shell: true` the command and its arguments are joined with spaces and handed
+to `/bin/sh -c`, unquoted, exactly as Node does it.
 
-Callbacks work too, and so does a plain async iterator.
+Events are Node's, in Node's order: `spawn` once the guest has started the
+command, `exit` with `(code, signal)`, then `close` once stdout and stderr have
+ended, and `error` when it could not be started or a stream broke. A command a
+signal ended reports `exitCode` null and `signalCode` `"SIGTERM"`, as Node
+does. As with Node, output may still be arriving when `exit` fires, and output
+nobody reads is drained so that `close` still comes.
 
-```ts
-await sandbox.exec("make", {
-  onStdout: (chunk) => process.stdout.write(chunk),
-  onStderr: (chunk) => process.stderr.write(chunk),
-});
+Write to `stdin` and the bytes reach the command; `stdin.end()` sends EOF.
+Pass `stdio: "ignore"`, or `["ignore", "pipe", "pipe"]`, to start it with stdin
+already closed. `"inherit"` and file descriptors are not offered: there is no
+descriptor of this process the guest could share.
 
-for await (const chunk of sandbox.execStream("make")) {
-  if (chunk.type === "stdout") process.stdout.write(chunk.data);
-}
-```
+`child.cmdId` is the command's id in the sandbox, set by the time `spawn`
+fires. Keep it and another process can pick the same command up again. See
+[Reattach to a command](#reattach-to-a-command). `child.pid` is always
+`undefined`: the guest's process ids are not exposed.
 
 Pass `pty: true` for programs that behave differently on a terminal, such as
 anything with colour, progress bars, or a REPL.
 
 ### Interactive terminals
 
-`runCommand` runs to completion. When input arrives over time, from a browser
-terminal or an agent driving a REPL, open a terminal instead. It keeps stdin
-open and allocates a pty.
+When input arrives over time, from a browser terminal or an agent driving a
+REPL, open a terminal. It allocates a pty, keeps stdin open, and takes resizes.
 
 ```ts
 const term = sandbox.terminal({ cols: 120, rows: 40 });
@@ -371,97 +348,74 @@ A command belongs to the sandbox, not to the client that started it. Keep its
 after a crash.
 
 ```ts
-const job = await sandbox.runCommand({ cmd: "./train.sh", detached: true });
-await queue.put({ sandbox: sandbox.id, cmdId: job.cmdId });
+const child = sandbox.childProcess.spawn("./train.sh");
+child.on("spawn", () => queue.put({ sandbox: sandbox.id, cmdId: child.cmdId }));
 ```
+
+`getCommand` hands back a `ChildProcess` attached to it. Its output is replayed
+from the start and then followed live until the command exits; the node keeps
+every byte. Attaching to a command that has already finished replays it and
+then emits `exit` and `close`, so the same code covers both.
 
 ```ts
 // Somewhere else entirely.
 const sandbox = await Sandbox.get({ id: sandboxId });
-const job = await sandbox.getCommand(cmdId);
+const child = await sandbox.getCommand(cmdId);
 
-job.info.state;    // "running" or "exited"
-job.info.exitCode; // meaningful once it has exited
-job.info.user;     // who it runs as, empty for root
-
-for await (const chunk of job.logs()) process.stdout.write(chunk.data);
+child.stdout.pipe(process.stdout);
+child.on("exit", (code, signal) => console.log("exited", code, signal));
 ```
 
-`logs()` replays the command's output from the start and then follows it live
-until it exits; the sandbox keeps every byte. Attaching to a command that has
-already finished replays it and ends with its exit status, so the same code
-covers both. A reattached handle differs from a detached one here: each `logs()`
-and `wait()` opens its own attachment with no deadline, so any number of
-readers can attach at once and each gets its own stream.
-
-A reader that comes back after a disconnect passes the offset it got to, stdout
-and stderr bytes counted together, and is sent only what followed:
+A reader that comes back after a disconnect passes the offset it got to,
+stdout and stderr bytes counted together, and is sent only what followed:
 
 ```ts
 let seen = 0;
-const job = await sandbox.getCommand(cmdId, { fromOffset: seen });
-for await (const chunk of job.logs()) {
-  if (chunk.type === "stdout" || chunk.type === "stderr") seen += chunk.raw.length;
-  if (chunk.type === "lost") console.warn(`${chunk.lostBytes} bytes are gone`);
-}
+const child = await sandbox.getCommand(cmdId, { fromOffset: seen });
+child.stdout.on("data", (chunk) => (seen += chunk.length));
+child.stderr.on("data", (chunk) => (seen += chunk.length));
+child.on("lost", (bytes) => console.warn(`${bytes} bytes are gone`));
 ```
 
-A `"lost"` chunk stands for output the sandbox cannot send: what a rotating log
-dropped (see `logMaxBytes`), or what a failed write, most likely on a full
-disk, never recorded.
+`lost` is Burrow's own event. It stands for output the node cannot send: what
+a rotating log dropped (see `logMaxBytes`), or what a failed write, most likely
+on a full disk, never recorded.
 
-A reattached handle can also feed the command. A shell started by a process
-that has since gone keeps its stdin open, and takes input from the next one:
+An attached child can also feed the command. A shell started by a process that
+has since gone keeps its stdin open, and takes input from the next one:
 
 ```ts
 const shell = await sandbox.getCommand(shellId);
-shell.sendStdin("ls /work\n");
-for await (const chunk of shell.logs()) process.stdout.write(chunk.raw);
+shell.stdin.write("ls /work\n");
+shell.stdout.pipe(process.stdout);
 ```
 
-`closeStdin()` sends EOF. Only an explicit EOF closes a command's stdin: a
+`stdin.end()` sends EOF. Only an explicit EOF closes a command's stdin: a
 stream that breaks, a client restart, or the sandbox sleeping leaves it open.
-
-Every chunk carries `raw`, the bytes exactly as written, beside `data`, the
-text. `data` is decoded across chunk boundaries, so a character split between
-two chunks arrives whole; results carry `stdoutBytes` and `stderrBytes` too.
-An exit a signal caused names it: `exitSignal` is 15 and `exitCode` 143 for a
-command ended by SIGTERM, whoever sent it.
-
-`wait()` drains an attachment and returns the finished result.
+Any number of readers can attach to one command at once.
 
 #### Signalling a command
 
-`kill(signal)` signals the command and does not wait; it defaults to SIGKILL.
-`killed(signal)` is the same call as a promise.
+`kill(signal)` signals the command, SIGTERM by default, by name or number, and
+returns `true` unless the command has already exited. Delivery is
+asynchronous: a signal the sandbox refuses arrives as the child's `error`
+event, as a signal Node could not deliver does. A command that had exited by
+the time the signal got there is not an error, since that is what kill wanted.
 
 ```ts
-job.kill(15);
-const result = await job.wait();
-```
-
-`kill()` swallows the failure it was asking for, the command having already
-exited, and leaves everything else to reject. With nothing awaiting it that
-surfaces as an unhandled rejection rather than as silence. The test is a
-heuristic and not an exact one: any `failed_precondition` whose message does not
-mention suspension is treated as "already exited". Await `killed()` to handle
-these yourself:
-
-```ts
-try {
-  await job.killed(15);
-} catch (err) {
+child.on("error", (err) => {
   if (err.code === "permission_denied") console.warn("exec is disabled on this sandbox");
-}
+});
+child.kill("SIGINT");
 ```
 
 What can fail: `permission_denied` when the sandbox's exec policy forbids
 commands, since signals go through the same door as exec and a sandbox
-tightened with `update({ exec: { allowExec: false } })` refuses them too;
-`failed_precondition` when the sandbox is suspended, or when the command had
-already exited; `not_found` for a command since pruned; and transport failures
-when the node cannot be reached. A signal reaches the command's whole process
-group.
+tightened with `updateAccessPolicy({ exec: { allowExec: false } })` refuses
+them too; `failed_precondition` when the sandbox is suspended; `not_found` for
+a command since pruned; and transport failures when the node cannot be
+reached. A signal reaches the command's whole process group. `kill(0)` sends
+nothing and says whether the command is still running.
 
 `listCommands()` returns everything the sandbox has run, oldest first.
 
@@ -472,14 +426,12 @@ for (const command of await sandbox.listCommands()) {
 ```
 
 Output is kept the way Docker keeps a container's log: all of it, on the node
-rather than in the sandbox, for as long as the command is listed. A command that would
-print more than you want kept can rotate instead, as Docker's `max-size` and
-`max-file`:
+rather than in the sandbox, for as long as the command is listed. A command
+that would print more than you want kept can rotate instead, as Docker's
+`max-size` and `max-file`:
 
 ```ts
-await sandbox.runCommand({
-  cmd: "./serve.sh",
-  detached: true,
+sandbox.childProcess.spawn("./serve.sh", {
   logMaxBytes: 20 * 1024 * 1024,
   logMaxFiles: 5,
 });
@@ -504,7 +456,7 @@ alice.username; // "alice"
 alice.uid;      // 1000
 alice.home;     // "/home/alice", mode 0700
 
-await sandbox.runCommand({ cmd: "whoami", user: "alice" });
+await sandbox.childProcess.exec("whoami", { user: "alice" });
 ```
 
 A name is POSIX portable: `[a-z_][a-z0-9_-]*`, at most 32 characters. The home
@@ -521,30 +473,29 @@ await sandbox.addUserToGroup("bob", "team");
 
 team.sharedDir; // "/srv/team"
 
-await sandbox.runCommand({ cmd: `echo hi > ${team.sharedDir}/note`, user: "alice" });
-await sandbox.runCommand({ cmd: `cat ${team.sharedDir}/note`, user: "bob" });
+await sandbox.asUser("alice").fs.writeFile(`${team.sharedDir}/note`, "hi\n");
+await sandbox.asUser("bob").fs.readFile(`${team.sharedDir}/note`, "utf8");
 
 await sandbox.removeUserFromGroup("bob", "team");
 ```
 
-`asUser` returns a handle onto the same sandbox whose commands all run as one
-user, which saves passing `user` to every call.
+`asUser` returns a handle onto the same sandbox that acts as one user, which
+saves passing `user` to every call.
 
 ```ts
 const alice = sandbox.asUser("alice");
 
-await alice.runCommand("touch notes.txt"); // in /home/alice
-await alice.mkDir("/home/alice/work");
-await alice.writeFile("/home/alice/app.py", src);
+await alice.childProcess.exec("touch notes.txt"); // in /home/alice
+await alice.fs.mkdir("/home/alice/work");
+await alice.fs.writeFile("/home/alice/app.py", src);
 
 const term = alice.terminal(); // a shell as alice
 ```
 
-Commands, terminals, `mkDir` and `writeFile` run as the user. `writeFile` is
-the guest agent's upload followed by a `chown` exec, so it costs a second call
-and needs exec to be allowed. Reads do not work this way at all: `readFile`,
-`listDir` and `downloadFile` are served by the agent, which is root, so a user
-handle can still read a file its user could not.
+Commands and terminals run as the user, and every `fs` call is made as them:
+the guest kernel checks each one with the user's credentials, so a user handle
+cannot read a file its user could not, and what it creates is the user's.
+`fs.watch` is the one exception, since the guest scans as root.
 
 This is a boundary inside one sandbox, not a replacement for one. The users
 share a kernel and a VM, and root in the guest still reaches everything. Two
@@ -552,103 +503,87 @@ workloads that must not touch each other belong in two sandboxes.
 
 ## Work with files
 
-Write several files with one call. Parent directories are created for you.
+`sandbox.fs` is Node's `fs/promises`, performed by the guest kernel: the same
+functions, the same signatures and defaults, the same return types, and the
+same errors. Each call is one POSIX operation on the node's `Fs` call, so a
+`stat` costs a round trip and no exec.
 
 ```ts
-await sandbox.writeFiles([
-  { path: "/work/app.py", content: "print('hi')\n" },
-  { path: "/work/run.sh", content: "python3 /work/app.py\n", mode: 0o755 },
-  { path: "/work/data.bin", content: new Uint8Array([1, 2, 3]) },
-]);
-```
+await sandbox.fs.mkdir("/work/src", { recursive: true });
+await sandbox.fs.writeFile("/work/src/app.py", "print('hi')\n");
+await sandbox.fs.writeFile("/work/run.sh", "python3 /work/src/app.py\n", { mode: 0o755 });
 
-Contents are text or bytes, and `mode` sets the unix mode on a created file.
-Each file is its own upload, sent in order, so a failure part way through leaves
-the earlier ones written.
+const text = await sandbox.fs.readFile("/work/src/app.py", "utf8");
+const bytes = await sandbox.fs.readFile("/work/data.bin"); // Buffer
 
-Read a file back as text, as a stream, or as a `Buffer`.
-
-```ts
-const text = await sandbox.readFile("/work/app.py");        // string
-const stream = await sandbox.readFile({ path: "/work/app.py" }); // Readable | null
-const buffer = await sandbox.readFileToBuffer({ path: "/work/data.bin" }); // Buffer | null
-```
-
-The object forms return `null` when the file does not exist. The string form
-throws a `not_found` error instead.
-
-Copy a file out to the local filesystem with `downloadFile`. It returns the
-absolute path it wrote, or `null` when the sandbox has no such file, and creates
-the destination's parent directories unless you pass
-`mkdirRecursive: false`.
-
-```ts
-const path = await sandbox.downloadFile("/work/report.pdf", "./out/report.pdf");
-```
-
-List directories, create them, and move or remove what is in them.
-
-```ts
-for (const entry of await sandbox.listDir("/work")) {
-  console.log(entry.name, entry.isDir ? "dir" : entry.size);
+for (const entry of await sandbox.fs.readdir("/work", { withFileTypes: true })) {
+  console.log(entry.name, entry.isDirectory() ? "dir" : "file");
 }
 
-await sandbox.mkDir("/work/src/components");
-await sandbox.rename("/work/draft.md", "/work/final.md");
-await sandbox.remove("/work/tmp");
-```
+const stats = await sandbox.fs.stat("/work/run.sh");
+stats.size; stats.mode; stats.mtime; stats.isFile();
 
-`mkDir`, `rename` and `remove` run `mkdir -p`, `mv` and `rm -rf` in the
-sandbox, since there is no RPC for them, so each costs one exec and fails the
-way a command does.
-
-Ask about one path with `stat`, which returns `null` for a path that is not
-there, or `exists`. Both list the parent directory, so they respect the
-sandbox's file policy and cost no exec.
-
-```ts
-const info = await sandbox.stat("/work/app.py"); // { path, name, type, isDir, size, mode } | null
-await sandbox.exists("/work/app.py");           // true
-```
-
-`sandbox.fs` is the same thing under the `node:fs/promises` names and shapes,
-so code written against the real module reads the same here: `readFile`,
-`writeFile`, `readdir`, `mkdir`, `rm`, `rename` and `stat`. As in Node,
-`fs.stat` on a missing path throws `not_found`, and `fs.rm` refuses a directory
-without `{ recursive: true }` and a missing path without `{ force: true }`.
-Watching has no `fs/promises` counterpart, so it stays `sandbox.watch`.
-
-```ts
-await sandbox.fs.writeFile("/work/app.py", "print('hi')\n");
-const names = await sandbox.fs.readdir("/work");
+await sandbox.fs.rename("/work/draft.md", "/work/final.md");
 await sandbox.fs.rm("/work/tmp", { recursive: true, force: true });
+await sandbox.fs.cp("/work/src", "/work/src.bak", { recursive: true });
 ```
 
-Commands and terminals are grouped too: `sandbox.commands` has `run`, `stream`,
-`list`, `connect` and `kill`, and `sandbox.pty.create()` is `sandbox.terminal`.
+Methods are bound, so `const { readFile, writeFile } = sandbox.fs` works as the
+same line against `fs/promises` does.
 
-Messages are capped at 64 MiB in both directions, which is the ceiling on a
-single file transfer.
+Errors from the kernel are shaped exactly as Node's: an `Error` whose message
+reads `ENOENT: no such file or directory, open '/work/nope'`, with `code`,
+`errno` (negative, as Node reports it), `syscall`, `path`, and `dest` for the
+calls that take two paths. Code that branches on `err.code === "ENOENT"` keeps
+working. The file policy refuses the way the kernel would: a path outside its
+`pathScopes`, or uploads or downloads turned off, is `EACCES`, and a write past
+its ceiling is `EFBIG`.
+
+Flags are Node's strings, `"r"`, `"r+"`, `"w"`, `"w+"`, `"a"`, `"a+"` and the
+`x` forms, or numbers from `sandbox.fs.constants`, which carries Linux's values
+whatever this machine is. The synchronous `s` flags are refused.
+
+`open` returns a `FileHandle`, with positional `read` and `write`, `stat`,
+`truncate`, `sync`, `readFile`, `writeFile`, `readLines`, streams, and
+`await using` support.
+
+```ts
+await using handle = await sandbox.fs.open("/work/data.bin", "r+");
+const { bytesRead, buffer } = await handle.read(Buffer.alloc(16), 0, 16, 128);
+await handle.write("patched", 0);
+await pipeline(handle.createReadStream(), createWriteStream("./data.bin"));
+```
+
+A `position` of `null` reads or writes at the handle's own position and moves
+it; a number does not move it. A closed handle rejects with `EBADF`, as Node's
+does. The agent closes a handle left unused for ten minutes.
+
+A whole-file `readFile` with the default flag, as root, takes the
+`DownloadFile` stream, one call however large the file. Everything else opens
+the file and reads or writes it in pieces of up to 4 MiB a call, so a big
+`writeFile` costs a call per 4 MiB.
 
 ### Watch for changes
 
+`watch` is `fs/promises`' `watch`: an async iterable of `{ eventType, filename }`,
+`eventType` `"rename"` when a name appeared or went and `"change"` when a file
+changed in place, `filename` relative to the watched directory.
+
 ```ts
-const watcher = await sandbox.watch("/work/src", {
+const ac = new AbortController();
+for await (const { eventType, filename } of sandbox.fs.watch("/work/src", {
   recursive: true,
-  onEvent: (event) => console.log(event.type, event.path),
-});
-
-for await (const event of watcher) {
-  if (event.type === "modified") rebuild(event.path);
+  signal: ac.signal,
+})) {
+  if (eventType === "change") rebuild(filename);
 }
-
-watcher.stop();
 ```
 
-Events are `created`, `modified`, and `deleted`. The guest polls and reports
-differences every 500ms by default, which you change with `intervalMs`, floored
-at 50ms. A change is seen within about one interval, and a file created and
-deleted between two scans is not seen at all.
+The guest polls and reports differences every 500ms by default, which the
+Burrow-only `intervalMs` option changes, floored at 50ms. A change is seen
+within about one interval, and a file created and deleted between two scans is
+not seen at all. Only directories can be watched. Aborting `signal` ends the
+loop with an `AbortError`, as Node's does.
 
 ## Control the network
 
@@ -656,10 +591,12 @@ Sandboxes have no network by default. Access is opt-in.
 
 ```ts
 await Sandbox.create({ template: "python" });  // no egress at all
-await Sandbox.create({ network: "open" });    // unrestricted
+await Sandbox.create({ networkPolicy: "open" }); // unrestricted
 await Sandbox.create({
-  network: "allowlist",
-  allowDomains: ["api.github.com", "*.githubusercontent.com"],
+  networkPolicy: {
+    mode: "allowlist",
+    allowDomains: ["api.github.com", "*.githubusercontent.com"],
+  },
 });
 ```
 
@@ -667,145 +604,12 @@ A leading `*.` is the only wildcard, and it does not cover the apex:
 `*.example.com` matches `www.example.com` and `a.b.example.com` but not
 `example.com`.
 
-### Shorthands
-
-The shorthand shapes other sandbox SDKs use are accepted everywhere a policy is,
-which is `create`, `fork`, `update`, and `updateNetworkPolicy`.
-
-```ts
-await Sandbox.create({ networkPolicy: "allow-all" }); // mode "open"
-await Sandbox.create({ networkPolicy: "deny-all" }); // mode "none"
-
-await Sandbox.create({
-  networkPolicy: {
-    allow: ["api.github.com", "*.githubusercontent.com"],
-    subnets: { allow: ["10.0.0.0/8"], deny: ["169.254.0.0/16"] },
-  },
-});
-```
-
-`allow` as an object carries per-domain rules. A `transform` sets headers on the
-inspected requests the rule selects, which is header injection: the value stays
-on the node, and reading the policy back gives you `<redacted>`.
+A policy is a mode, `"none"`, `"allowlist"` or `"open"`, or an object carrying
+the whole policy.
 
 ```ts
 await Sandbox.create({
   networkPolicy: {
-    allow: {
-      "api.github.com": {
-        transform: [{ headers: { authorization: `Bearer ${token}` } }],
-      },
-    },
-  },
-});
-```
-
-A rule turns TLS inspection on, because the proxy has to terminate TLS to touch
-a request. The guest is handed the inspection CA during its first handshake, so
-this only works at create time: adding a rule to a sandbox created without
-inspection throws `failed_precondition` rather than silently doing nothing.
-
-#### Narrowing a rule with `match`
-
-Without a `match`, a rule applies to every request to its domain. Add one to
-narrow it to a path, a method, query entries or headers.
-
-```ts
-await Sandbox.create({
-  networkPolicy: {
-    allow: {
-      "api.github.com": [
-        {
-          match: { path: { startsWith: "/repos/" }, method: ["GET"] },
-          transform: [{ headers: { authorization: `Bearer ${token}` } }],
-        },
-      ],
-    },
-  },
-});
-```
-
-**A matcher never blocks.** It selects which requests the rule acts on. A
-request matching no rule is still allowed and still reaches the origin; it just
-goes out unmodified. To refuse a request, leave its domain out of `allow`, or
-forward the domain to an endpoint that refuses it.
-
-`path`, `queryString` values and `headers` values each take a bare string,
-which is an exact match, or one of `{ exact }`, `{ startsWith }` or
-`{ regex }`. Paths, methods and header values are compared case-sensitively;
-header names are not. Query and header entries are ANDed, and a repeated key
-matches if any of its values does.
-
-Give a domain a list of rules to have several. They are evaluated in order and
-the first match wins, so a rule with no `match` shadows everything after it for
-that domain: write the narrow ones first.
-
-Rules are validated before anything is sent, because a rule that was silently
-dropped would widen a credential from one path to a whole domain. All of these
-throw `invalid_argument`: an unknown key on a rule or a matcher, `transform` and
-`forwardURL` on the same rule, a `match` with neither action, a rule naming a
-domain that is not in `allow`, a header name that is not an RFC 9110 token, and
-a `forwardURL` that is not `http(s)://` or that carries a query string or a
-fragment.
-
-#### Forwarding with `forwardURL`
-
-A rule may instead send the requests it selects to an endpoint you control.
-
-```ts
-await Sandbox.create({
-  networkPolicy: {
-    allow: {
-      "api.github.com": {
-        forwardURL: "https://gate.example.com/inspect",
-        forwardSecret: process.env.GATE_SECRET,
-      },
-    },
-  },
-});
-```
-
-The forwarded request keeps its method, headers and body, and its target is the
-forward URL's path followed by the original path and query. The origin never
-sees it. A `forwardURL` with no `match` is how you restrict a domain to
-specific paths: everything goes through your endpoint, and your endpoint
-rejects what you do not want.
-
-Your endpoint is told where the request came from, in headers the guest cannot
-forge: `burrow-forwarded-host`, `-scheme`, `-port`, `-path` and `-sandbox`,
-plus `burrow-forwarded-secret` when you set `forwardSecret`.
-
-`forwardURL` takes an `http://` or an `https://` endpoint. With `https://`,
-burrow verifies the endpoint's certificate against the public roots, and there
-is no way to turn that off or to name your own authority. With `http://`, the
-request and the secret go out in the clear, which is reasonable only for an
-endpoint the node alone can reach.
-
-Read that secret for exactly what it is. Burrow has no OIDC issuer, so a
-forwarded request is not signed. The secret proves the request came from a node
-holding the rule; it authenticates the node, not the sandbox, and it is a
-bearer token rather than a signature over the request. `https://` keeps it off
-the wire in the clear, but an endpoint that leaks it is still compromised, and
-the endpoint must not be given authority that a node compromise should not also
-grant. See [FIREWALL.md](../../docs/FIREWALL.md) for the full statement and the
-limits.
-
-| Shorthand | Burrow policy |
-|---|---|
-| `"allow-all"` | `mode: "open"` |
-| `"deny-all"` | `mode: "none"` |
-| `allow: [...]` | `mode: "allowlist"`, `allowDomains` |
-| `allow: { domain: { transform } }` | `allowDomains` plus a `setHeaders` rule, `inspectTls: true` |
-| `allow: { domain: { match, transform } }` | The same rule, narrowed to the requests the matcher selects |
-| `allow: { domain: { forwardURL } }` | `allowDomains` plus a `forward` rule, `inspectTls: true` |
-| `subnets.allow` | `allowCidrs` |
-| `subnets.deny` | `denyCidrs` |
-
-Pass an object for the full policy.
-
-```ts
-await Sandbox.create({
-  network: {
     mode: "allowlist",
     allowDomains: ["api.github.com"],
     allowCidrs: ["10.0.0.0/8"],
@@ -833,12 +637,16 @@ await Sandbox.create({
 Deny beats every allowance. An allowed domain that resolves into a denied range
 is refused.
 
-`rules` is the full form of what `allow: { domain: { ... } }` builds, for code
-that would rather write the rules directly:
+### Request rules
+
+A rule acts on the inspected requests to one domain. `setHeaders` sets headers
+on them, which is header injection: the value stays on the node, and reading
+the policy back gives you `<redacted>`. `injectHeaders` is the same thing as a
+rule with no matcher.
 
 ```ts
 await Sandbox.create({
-  network: {
+  networkPolicy: {
     mode: "allowlist",
     allowDomains: ["api.github.com"],
     inspectTls: true,
@@ -858,11 +666,88 @@ await Sandbox.create({
 ```
 
 Rules need `inspectTls`, because the proxy has to terminate TLS to read a
-request at all. A secret never leaves the node: code in the guest uses the
-credential without ever holding it, and every read of the policy returns
+request at all, and the domain has to be in `allowDomains`, since only traffic
+to an allowed domain is inspected. The guest is handed the inspection CA
+during its first handshake, so inspection is a create-time choice: adding rules
+to a sandbox created without it throws `failed_precondition` rather than
+silently doing nothing. A secret never leaves the node: code in the guest uses
+the credential without ever holding it, and every read of the policy returns
 injected values and forward secrets redacted. Reading a policy back gives you
 `rules` in full; `injectHeaders` still reports the subset of them that is a
 matcher-less header injection.
+
+#### Narrowing a rule with `match`
+
+Without a `match`, a rule applies to every request to its domain. Add one to
+narrow it to a path, a method, query entries or headers.
+
+**A matcher never blocks.** It selects which requests the rule acts on. A
+request matching no rule is still allowed and still reaches the origin; it just
+goes out unmodified. To refuse a request, leave its domain out of
+`allowDomains`, or forward the domain to an endpoint that refuses it.
+
+`path`, `queryString` values and `headers` values each take a bare string,
+which is an exact match, or one of `{ exact }`, `{ startsWith }` or
+`{ regex }`. Paths, methods and header values are compared case-sensitively;
+header names are not. Query and header entries are ANDed, and a repeated key
+matches if any of its values does.
+
+Rules are evaluated in order and the first match wins, so a rule with no
+`match` shadows everything after it for that domain: write the narrow ones
+first.
+
+Rules are validated before anything is sent, because a rule that was silently
+dropped would widen a credential from one path to a whole domain. All of these
+throw `invalid_argument`: an unknown key on a rule or a matcher, `setHeaders`
+and `forward` on the same rule, a rule with neither, a `setHeaders` naming no
+header, rules with no `allowDomains`, a header name that is not an RFC 9110
+token, and a forward url that is not `http(s)://` or that carries a query
+string or a fragment.
+
+#### Forwarding with `forward`
+
+A rule may instead send the requests it selects to an endpoint you control.
+
+```ts
+await Sandbox.create({
+  networkPolicy: {
+    mode: "allowlist",
+    allowDomains: ["api.github.com"],
+    inspectTls: true,
+    rules: [
+      {
+        domain: "api.github.com",
+        forward: { url: "https://gate.example.com/inspect", secret: process.env.GATE_SECRET },
+      },
+    ],
+  },
+});
+```
+
+The forwarded request keeps its method, headers and body, and its target is the
+forward URL's path followed by the original path and query. The origin never
+sees it. A `forward` with no `match` is how you restrict a domain to specific
+paths: everything goes through your endpoint, and your endpoint rejects what
+you do not want.
+
+Your endpoint is told where the request came from, in headers the guest cannot
+forge: `burrow-forwarded-host`, `-scheme`, `-port`, `-path` and `-sandbox`,
+plus `burrow-forwarded-secret` when you set `secret`.
+
+`forward.url` takes an `http://` or an `https://` endpoint. With `https://`,
+burrow verifies the endpoint's certificate against the public roots, and there
+is no way to turn that off or to name your own authority. With `http://`, the
+request and the secret go out in the clear, which is reasonable only for an
+endpoint the node alone can reach.
+
+Read that secret for exactly what it is. Burrow has no OIDC issuer, so a
+forwarded request is not signed. The secret proves the request came from a node
+holding the rule; it authenticates the node, not the sandbox, and it is a
+bearer token rather than a signature over the request. `https://` keeps it off
+the wire in the clear, but an endpoint that leaks it is still compromised, and
+the endpoint must not be given authority that a node compromise should not also
+grant. See [FIREWALL.md](../../docs/FIREWALL.md) for the full statement and the
+limits.
 
 ### Private networks
 
@@ -874,7 +759,7 @@ because a lookup from outside the network answers `NXDOMAIN`.
 const api = await Sandbox.create({ networks: ["team"], alias: "api" });
 const worker = await Sandbox.create({ networks: ["team"], alias: "worker" });
 
-await worker.runCommand("curl -s http://api.team.internal:8080/health");
+await worker.childProcess.exec("curl -s http://api.team.internal:8080/health");
 ```
 
 Each member also answers to `<sandboxId>.<network>.internal` whether or not you
@@ -891,28 +776,17 @@ await Sandbox.create({
 
 ## Update a running sandbox
 
-`update` changes tags, the network policy, the exec and file policies, or any
-combination. Each section named is replaced wholesale rather than merged, so one
-call is enough to lock a sandbox down or to retag it.
+Tags, the network policy, and the exec and file policies each have their own
+call. Each replaces its section wholesale rather than merging into it.
 
 ```ts
-await sandbox.update({
-  tags: { owner: "ci", stage: "locked-down" },
-  networkPolicy: "none",
-  exec: { allowExec: false },
-});
+await sandbox.updateTags({ owner: "ci", stage: "locked-down" });
+await sandbox.updateNetworkPolicy({ mode: "allowlist", allowDomains: ["pypi.org"] });
+await sandbox.updateAccessPolicy({ fs: { allowUpload: false, pathScopes: ["/work"] } });
 ```
 
 Firewall rules, proxy allowlist, DNS filtering, and header injection all
 re-render at once, so the sandbox is never briefly half-governed.
-
-Call the pieces directly if you prefer.
-
-```ts
-await sandbox.updateTags({ owner: "ci" });
-await sandbox.updateNetworkPolicy({ mode: "allowlist", allowDomains: ["pypi.org"] });
-await sandbox.updateAccessPolicy({ fs: { allowUpload: false, pathScopes: ["/work"] } });
-```
 
 ### Exec and file policy
 
@@ -944,8 +818,7 @@ The clocks a sandbox is measured against move too, so work that turns out to
 need longer is not stuck with the budget it was created under.
 
 ```ts
-await sandbox.update({ maxLifetimeSecs: 7200, idleSuspendSecs: 900 });
-await sandbox.extendTimeout(60 * 60 * 1000); // the familiar spelling
+await sandbox.updateResources({ maxLifetimeSecs: 7200, idleSuspendSecs: 900 });
 ```
 
 A lifetime is a total measured from when the sandbox was created rather than an
@@ -962,7 +835,7 @@ sandbox from it, at the shape you want.
 ## Expose ports
 
 ```ts
-await sandbox.runCommand("sh", ["-c", "python3 -m http.server 8000 &"]);
+sandbox.childProcess.spawn("python3", ["-m", "http.server", "8000"]);
 
 const { url } = await sandbox.exposePort(8000);
 // -> http://<node>:20000
@@ -1000,9 +873,9 @@ await again.resume();
 
 You rarely need to call `resume` yourself. A call that needs a running VM
 resumes the sandbox and retries once. Set `autoResume: false` on
-`Sandbox.create`, `Sandbox.get`, or a single `runCommand` to turn that off, in
-which case the call fails with `failed_precondition` and `err.isSuspended` is
-true.
+`Sandbox.create` or `Sandbox.get`, or on the handle itself, to turn that off,
+in which case the call fails with `failed_precondition` and `err.isSuspended`
+is true.
 
 `fork` creates a new sandbox from another one's current state. The source keeps
 running, and its state is written first, so the child starts from the state as
@@ -1012,9 +885,6 @@ of the call.
 const child = await sandbox.fork();
 const locked = await sandbox.fork({ networkPolicy: "none" });
 const named = await sandbox.fork({ name: "api-canary" });
-
-// or, without a handle on the parent
-const other = await Sandbox.fork({ source: "api" });
 ```
 
 The child inherits the source's policy and tags unless you override them, lands
@@ -1313,20 +1183,16 @@ node when it needs to place a sandbox there. Warm snapshots do not travel, since
 one encodes host cpu features and the exact Firecracker version, so the
 receiving node warms the template again itself.
 
-## Manage many sandboxes
+## Manage the fleet
 
-`Sandbox.create` opens its own connection. Use `Burrow` to share one.
+`Burrow` is for what is not one sandbox's: health, nodes, audit, events and
+secrets. Sandboxes are reached through `Sandbox`.
 
 ```ts
 import { Burrow } from "@pixec/burrow";
 
 const burrow = new Burrow({ endpoint: "localhost:7070" });
-
-const sandbox = await burrow.create({ network: "open" });
-const running = await burrow.list({ tag: "owner=ci" });
-const existing = await burrow.get(running[0].id);
 const nodes = await burrow.nodes();
-
 burrow.close();
 ```
 
@@ -1356,7 +1222,7 @@ instead: operators label their machines, and you constrain placement to labels.
 const nodes = await burrow.nodes();
 // [{ id: "node_b", labels: { rack: "b7", tier: "dedicated" }, ... }]
 
-const sandbox = await burrow.create({ nodeLabels: { rack: "b7" } });
+const sandbox = await Sandbox.create({ nodeLabels: { rack: "b7" } });
 const child = await sandbox.fork({ nodeLabels: { rack: "b7" } });
 ```
 
@@ -1413,17 +1279,20 @@ a `signal` to stop following. See
 ## Cancel calls
 
 Most methods take an optional `signal`. The exceptions are the ones with no
-call of their own to cancel or no options object to hold it: `mkDir`, `watch`,
-`terminal`, `asUser`, and the string form of `readFile`.
+call of their own to cancel or no options object to hold it: `terminal`,
+`asUser`, and the `fs` functions whose Node signature has no options.
 
 ```ts
 const controller = new AbortController();
 setTimeout(() => controller.abort(), 5000);
 
-await sandbox.runCommand("sleep", ["60"], { signal: controller.signal });
+await sandbox.childProcess.exec("sleep 60", { signal: controller.signal });
+await sandbox.fs.readFile("/work/big.log", { signal: controller.signal });
 ```
 
-An aborted call rejects with a `BurrowError` whose code is `cancelled`.
+The `fs` and `childProcess` calls reject as Node's do, with an `AbortError`;
+an aborted `exec` also kills the command. Every other aborted call rejects
+with a `BurrowError` whose code is `cancelled`.
 
 ## Configure the client
 
@@ -1456,9 +1325,12 @@ Codes are `not_found`, `already_exists`, `invalid_argument`,
 `resource_exhausted`, `unavailable`, `unimplemented`, `deadline_exceeded`,
 `cancelled`, and `internal`.
 
-`CommandFailedError` extends `BurrowError` and carries `exitCode`, `stdout`, and
-`stderr`. It is thrown only when you pass `check: true`. Its `code` is
-`internal`, so test for it with `instanceof` rather than by code.
+`sandbox.fs` and `sandbox.childProcess` are the exception, as Node's own
+modules are: a kernel error is Node's `ENOENT`-style error, and a failed
+`exec` rejects with Node's `Command failed` error. See
+[Work with files](#work-with-files) and [Run commands](#run-commands). What
+the sandbox itself refuses, a policy denial or a suspended sandbox, is still a
+`BurrowError`.
 
 ## Read a sandbox's state
 
@@ -1469,14 +1341,13 @@ re-reads it.
 await sandbox.refresh();
 sandbox.id;            // "sbx_b4929ded..."
 sandbox.name;          // "build-482", or the id when it was never named
-sandbox.status;        // "pending" | "running" | "stopping" | "stopped" | "failed"
-sandbox.state;         // the full state, including "suspended", "paused" and "stopped"
-sandbox.template;      // also `image`
+sandbox.state;         // "running", "suspended", "stopped", ...
+sandbox.template;
 sandbox.tags;
 sandbox.vcpus;
-sandbox.memory;        // MiB; also `memoryMib`
+sandbox.memoryMib;
 sandbox.createdAt;     // RFC 3339
-sandbox.networkPolicy; // the policy in force, injected values redacted
+sandbox.policy;        // the policy in force, injected values redacted
 sandbox.nodeId;
 sandbox.unreachable;   // true when the hosting node has missed its heartbeats
 sandbox.usage;         // { cpuUsageUsec, rxBytes, txBytes }
@@ -1486,13 +1357,10 @@ sandbox.usage;         // { cpuUsageUsec, rxBytes, txBytes }
 |---|---|
 | `id` | Assigned by the orchestrator, `sbx_` and a uuid |
 | `name` | The name it was created with, falling back to `id` when it has none |
-| `status` | The five-state view. `suspended`, `paused`, `stopped` and `destroyed` all read as `stopped`, and a state this client does not recognise reads as `failed` |
-| `state` | Burrow's own state, when the difference matters |
-| `template`, `image` | The same string |
-| `tags`, `metadata` | The same map |
-| `vcpus`, `memory`, `memoryMib` | From the policy in force |
+| `state` | A state this client does not recognise reads as `unknown` |
+| `vcpus`, `memoryMib` | From the policy in force |
 | `createdAt` | There is no `updatedAt`: the record does not carry one |
-| `networkPolicy`, `policy` | Injected header values arrive `<redacted>` |
+| `policy` | Injected header values arrive `<redacted>` |
 | `unreachable` | The hosting node has missed its heartbeats, so `state` is the last reading it reported. Calls fail with `unavailable` until it returns, except `delete()` |
 | `usage` | What the sandbox has consumed, across every VM it has run. See [Usage](#usage) |
 
@@ -1510,35 +1378,33 @@ Everything else goes to the orchestrator.
 |---|---|
 | `Sandbox.create` | `CreateSandbox` |
 | `Sandbox.getOrCreate` | `GetSandbox`, then `CreateSandbox` |
-| `Sandbox.get`, `sandbox.refresh`, `getInfo`, `isRunning` | `GetSandbox` |
+| `Sandbox.get`, `sandbox.refresh` | `GetSandbox` |
 | `Sandbox.list` | `ListSandboxes` |
-| `Sandbox.fork`, `sandbox.fork` | `ForkSandbox` |
-| `sandbox.runCommand`, `exec`, `execStream`, `terminal`, `asUser` | `Exec` on the node |
+| `sandbox.fork` | `ForkSandbox` |
+| `childProcess.spawn`, `exec`, `execFile`, `sandbox.terminal` | `Exec` on the node |
 | `sandbox.listCommands` | `ListCommands` |
-| `sandbox.getCommand` | `GetCommand`, then `Attach` on the node per `logs()`, and one for `sendStdin` |
-| `command.kill`, `killed` | `SignalCommand` |
+| `sandbox.getCommand` | `GetCommand`, then one `Attach` on the node carrying output and stdin |
+| `child.kill` | `SignalCommand` |
 | `sandbox.pruneCommands` | `PruneCommands` |
 | `sandbox.createUser`, `createGroup` | `CreateUser`, `CreateGroup` |
 | `sandbox.addUserToGroup`, `removeUserFromGroup` | `AddUserToGroup`, `RemoveUserFromGroup` |
-| `sandbox.writeFile`, `writeFiles` | `UploadFile` on the node, one per file |
-| `sandbox.readFile`, `readFileToBuffer`, `readFileBytes`, `downloadFile` | `DownloadFile` on the node |
-| `sandbox.listDir` | `ListDir` on the node |
-| `sandbox.mkDir` | `Exec`, running `mkdir -p` |
-| `sandbox.remove`, `rename` | `Exec`, running `rm -rf` and `mv` |
-| `sandbox.stat`, `exists` | `ListDir` on the parent |
-| `sandbox.watch` | `Watch` on the node |
+| `fs.readFile`, as root with the default flag | `DownloadFile` on the node |
+| `fs.readFile` otherwise, `writeFile`, `appendFile` | `Fs` on the node: open, a read or write per 4 MiB, close |
+| `fs.stat`, `lstat`, `readdir`, `mkdir`, `mkdtemp`, `rm`, `rmdir`, `unlink`, `rename`, `copyFile`, `cp`, `chmod`, `chown`, `lchown`, `utimes`, `lutimes`, `truncate`, `symlink`, `link`, `readlink`, `realpath`, `access` | `Fs` on the node, one call each (`cp` without `force`, or with a `filter`, one per entry) |
+| `fs.open`, and every `FileHandle` method | `Fs` on the node, one call each |
+| `fs.watch` | `Watch` on the node |
 | `sandbox.exposePort`, `listPorts`, `closePort`, `domain` | `ExposePort`, `ListPorts`, `ClosePort` |
-| `sandbox.update`, `updateTags` | `UpdateTags` |
-| `sandbox.update`, `updateNetworkPolicy` | `UpdateNetworkPolicy` |
-| `sandbox.update`, `updateResources`, `extendTimeout`, `setTimeout` | `UpdateResources` |
-| `sandbox.update`, `updateAccessPolicy` | `UpdateAccessPolicy` |
+| `sandbox.updateTags` | `UpdateTags` |
+| `sandbox.updateNetworkPolicy` | `UpdateNetworkPolicy` |
+| `sandbox.updateResources` | `UpdateResources` |
+| `sandbox.updateAccessPolicy` | `UpdateAccessPolicy` |
 | `sandbox.listSessions`, `currentSession` | `ListSessions` |
-| `sandbox.stop`, `pause` | `PauseSandbox` |
+| `sandbox.stop` | `PauseSandbox` |
 | `sandbox.resume` | `ResumeSandbox` |
 | `sandbox.shutdown` | `StopSandbox` |
 | `sandbox.boot` | `StartSandbox` |
 | `sandbox.recreate` | `RecreateSandbox` |
-| `sandbox.delete`, `kill` | `DeleteSandbox` |
+| `sandbox.delete` | `DeleteSandbox` |
 | `sandbox.snapshot`, `Snapshot.list`, `get`, `delete` | `CreateSnapshot`, `ListSnapshots`, `GetSnapshot`, `DeleteSnapshot` |
 | `Template.build`, `list`, `delete` | `BuildTemplate`, `ListTemplates`, `DeleteTemplate` |
 | `burrow.audit` | `QueryAudit` |
@@ -1549,30 +1415,42 @@ Everything else goes to the orchestrator.
 
 ## Migrating from earlier versions
 
-`sandbox.files` is gone. It was a third spelling of the file methods, beside
-the top-level ones and `sandbox.fs`. Use the top-level methods, or `sandbox.fs`
-for the `node:fs/promises` names: `files.read` is `readFile`, `files.write` is
-`writeFile`, `files.list` is `listDir` or `fs.readdir`, `files.mkdir` is
-`mkDir`.
+Each operation now has one name. File and command calls are Node's own
+`fs/promises` and `child_process`, under `sandbox.fs` and
+`sandbox.childProcess`, and the network shorthands are gone in favour of the
+one policy object. What was removed, and what to use instead:
+
+| Gone | Use |
+|---|---|
+| `sandbox.exec(cmd)`, `sandbox.exec([file, ...args])` | `childProcess.exec(cmd)`, `childProcess.execFile(file, args)` |
+| `exec(..., { check: true })`, `CommandFailedError` | `exec` and `execFile` reject on any failure, with Node's error |
+| `sandbox.spawn`, `execStream`, `logs()`, `wait()` | `childProcess.spawn`, its `stdout`/`stderr` streams, and its `close` event |
+| `command.kill(9)`, `sendStdin`, `closeStdin` | `child.kill("SIGKILL")`, `child.stdin.write`, `child.stdin.end()` |
+| `getCommand(id).info`, `logs()` | `listCommands()` for the record; `getCommand(id)` is now a `ChildProcess` |
+| `onStdout`, `onStderr` | `child.stdout.on("data")`, `child.stderr.on("data")` |
+| `sandbox.readFile(path)`, `readFileBytes`, `openFile` | `fs.readFile(path, "utf8")`, `fs.readFile(path)`, `fs.open(path)` and `createReadStream` |
+| `sandbox.writeFile`, `writeFiles` | `fs.writeFile`, once per file; `fs.mkdir(dir, { recursive: true })` first, since parents are no longer made |
+| `sandbox.downloadFile(src, dst)` | `pipeline((await fs.open(src)).createReadStream(), createWriteStream(dst))` |
+| `sandbox.listDir`, `mkdir`, `remove`, `rename` | `fs.readdir(path, { withFileTypes: true })`, `fs.mkdir`, `fs.rm(path, { recursive: true, force: true })`, `fs.rename` |
+| `sandbox.stat(path)` returning `null`, `exists` | `fs.stat`, which throws `ENOENT`; `fs.access` |
+| `sandbox.watch(path, { onEvent })`, `watcher.stop()` | `for await (... of fs.watch(path, { signal }))`, and abort the signal |
+| `networkPolicy: "allow-all"`, `"deny-all"` | `"open"`, `"none"` |
+| `networkPolicy: { allow, subnets }` | `{ mode: "allowlist", allowDomains, allowCidrs, denyCidrs }` |
+| `allow: { domain: { transform, match } }`, `forwardURL`, `forwardSecret` | `rules: [{ domain, match, setHeaders }]`, `forward: { url, secret }`, with `inspectTls: true` |
+| `sandbox.commands`, `sandbox.pty` | `childProcess`, and `terminal()` |
+| `Sandbox.connect(id)`, `Sandbox.fork({ source })` | `Sandbox.get({ id })`, `(await Sandbox.get({ id })).fork()` |
+| `update({...})`, `extendTimeout`, `setTimeout` | `updateTags`, `updateNetworkPolicy`, `updateAccessPolicy`, `updateResources` |
+| `pause`, `kill` | `stop`, `delete` |
+| `getInfo`, `isRunning` | `refresh()`, then `state` |
+| `status`, `image`, `metadata`, `memory`, `sandboxId`, `networkPolicy` | `state`, `template`, `tags`, `memoryMib`, `id`, `policy.network` |
+| `burrow.create`, `get`, `list` | `Sandbox.create`, `get`, `list` |
+| `network`, `image`, `metadata` options | `networkPolicy`, `template`, `tags` |
 
 `sandbox.checkpoint()` is gone. Memory written without the disk is not a restore
 point, and the guest keeps writing to its disk the moment it resumes, so the two
 halves stop agreeing. Use `sandbox.snapshot()`, which copies both, or
 `sandbox.fork()`, which does the same into a new sandbox. Both still write the
 source's state without stopping it.
-
-Everything else changed meaning or gained a better spelling rather than going
-away.
-
-| Before | Now | Note |
-|---|---|---|
-| `sandbox.kill()` | `sandbox.delete()` | `kill` still works and still destroys |
-| `sandbox.pause()` | `sandbox.stop()` | Both suspend. `stop` does not destroy |
-| `sandbox.exec()` | `sandbox.runCommand()` | `exec` still returns `stdout` and `stderr` as strings |
-| `sandbox.mkdir()` | `sandbox.mkDir()` | Both work |
-| `sandbox.files` | `sandbox.fs` | Both work, with different names inside |
-| `Sandbox.connect(id)` | `Sandbox.get({ id })` | Both work |
-| `metadata` | `tags` | Both are accepted and both are readable |
 
 ## Development
 

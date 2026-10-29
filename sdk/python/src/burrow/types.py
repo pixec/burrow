@@ -117,10 +117,6 @@ class SandboxInfo:
     # node, and its next resume places it.
     durable: bool = False
 
-    @property
-    def metadata(self) -> Dict[str, str]:
-        return self.tags
-
 
 @dataclass
 class Session:
@@ -134,40 +130,6 @@ class Session:
     started_by: str
     # "suspended", "deleted", "failed", "unknown", or "" while open.
     ended_by: str
-
-
-@dataclass
-class OutputChunk:
-    """One piece of a running command's output."""
-
-    # "stdout", "stderr", "exit", or "lost" for output the sandbox no longer
-    # holds or never recorded.
-    type: str
-    # The text, decoded across chunk boundaries so a character split between
-    # two chunks arrives whole. Invalid UTF-8 becomes U+FFFD.
-    data: str = ""
-    exit_code: int = 0
-    # The bytes exactly as the command wrote them.
-    raw: bytes = b""
-    # The signal that ended the command, on an "exit" chunk; 0 if none did.
-    exit_signal: int = 0
-    # How many bytes are missing, on a "lost" chunk.
-    lost_bytes: int = 0
-
-
-@dataclass
-class CommandResult:
-    """A finished command's output and exit."""
-
-    stdout: str
-    stderr: str
-    exit_code: int
-    success: bool
-    # The signal that ended the command; 0 if it exited on its own.
-    exit_signal: int = 0
-    # The output exactly as written, for output that is not text.
-    stdout_bytes: bytes = b""
-    stderr_bytes: bytes = b""
 
 
 @dataclass
@@ -189,25 +151,6 @@ class CommandInfo:
     # Output produced in all, which is the offset an up-to-date reader
     # resumes from.
     output_bytes: int = 0
-
-
-@dataclass
-class DirEntry:
-    name: str
-    is_dir: bool
-    size: int
-    mode: int
-
-
-@dataclass
-class FileInfo(DirEntry):
-    """One file or directory, as `Sandbox.stat` reports it."""
-
-    path: str = ""
-
-    @property
-    def type(self) -> str:
-        return "dir" if self.is_dir else "file"
 
 
 @dataclass

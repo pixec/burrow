@@ -16,7 +16,7 @@ from .errors import BurrowError
 class Terminal:
     """A live shell in a sandbox.
 
-    Unlike `Sandbox.exec`, the input side stays open: the caller writes
+    Unlike `subprocess.run`, the input side stays open: the caller writes
     keystrokes and resizes as they happen. That is what makes this usable
     behind a WebSocket, where a browser terminal is on the other end.
 
@@ -52,6 +52,7 @@ class Terminal:
                     is_pty=True,
                     rows=options.get("rows") or 24,
                     cols=options.get("cols") or 80,
+                    user=options.get("user") or "",
                 )
             )
         )

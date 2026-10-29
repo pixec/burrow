@@ -246,6 +246,53 @@ impl NodeApi {
         })
     }
 
+    /// One file operation, as `user` when one is given.
+    pub(crate) async fn fs_as(
+        &self,
+        mut req: api::FsRequest,
+        user: String,
+    ) -> Result<api::FsResponse, Status> {
+        let op = req
+            .op
+            .as_ref()
+            .ok_or_else(|| Status::invalid_argument("FsRequest names no op"))?;
+        let user = fs_caller(user, std::mem::take(&mut req.user))?;
+        let sandbox = self.sandboxes.get(&req.sandbox_id).await?;
+        let policy = sandbox.policy();
+        let allowed = fs_paths(op)
+            .into_iter()
+            .try_for_each(|(path, need)| match need {
+                FsNeed::Look => check_read_path(&policy, path),
+                FsNeed::Read => check_download(&policy, path),
+                FsNeed::Write => check_upload(&policy, path).map(drop),
+            })
+            .and_then(|()| check_fs_handle(&policy, op));
+        if let Err(status) = allowed {
+            return fs_refused(&req, status);
+        }
+        // Required whatever the policy: an agent without it would not hold
+        // the scopes or the cap the request carries.
+        if !sandbox.agent_has(FS_SCOPED).await? {
+            return Err(Status::failed_precondition(
+                "this sandbox's guest agent has no Fs call; it is upgraded on the sandbox's \
+                 next resume",
+            ));
+        }
+        require_files_as_user(&sandbox, &user).await?;
+        let mut agent = sandbox.agent().await?;
+
+        req.user = user;
+        let mut guest_req: guestpb::FsRequest = transcode(&req)?;
+        // Held by the guest too, through the descriptor each call acts on:
+        // the string checks above cannot see where a symlink leads.
+        if let Some(fs) = policy.fs {
+            guest_req.path_scopes = fs.path_scopes;
+            guest_req.max_write_bytes = fs.max_upload_bytes;
+        }
+        let resp = agent.fs(guest_req).await?;
+        transcode(&resp.into_inner())
+    }
+
     /// Exec over any inbound stream, so the Access service can hand on one it
     /// has read the start of.
     pub(crate) async fn exec_stream<S>(
@@ -551,6 +598,9 @@ struct KitCreate {
 const FILES_AS_USER: &str = "files-as-user";
 /// What an agent lists when it serves Attach.
 const ATTACH_INPUT: &str = "attach-input";
+/// What an agent lists when it serves Fs, holding the path scopes and write
+/// cap the request carries.
+const FS_SCOPED: &str = "fs-scoped";
 
 /// Refuses to hand a user to an agent that would ignore the field and do the
 /// transfer as root.
@@ -1411,6 +1461,12 @@ impl NodeService for NodeApi {
             .map(Response::new)
     }
 
+    async fn fs(&self, req: Request<api::FsRequest>) -> Result<Response<api::FsResponse>, Status> {
+        self.fs_as(req.into_inner(), String::new())
+            .await
+            .map(Response::new)
+    }
+
     async fn revoke_access(
         &self,
         req: Request<nodepb::NodeSandboxRef>,
@@ -1837,6 +1893,142 @@ fn check_read_path(policy: &common::Policy, path: &str) -> Result<(), Status> {
         Some(fs) => within_scopes(&fs.path_scopes, path),
         None => Ok(()),
     }
+}
+
+/// What an Fs call needs of the policy at one path.
+#[derive(Clone, Copy)]
+enum FsNeed {
+    /// Its name or metadata, held to the scopes as a listing is.
+    Look,
+    /// Its contents, which leave the sandbox, as a download's do.
+    Read,
+    /// To change it, as an upload does.
+    Write,
+}
+
+/// O_WRONLY, O_RDWR, O_CREAT, O_TRUNC and O_APPEND, in the Linux values FsOpen
+/// carries: an open with any of them can change the file.
+const OPEN_WRITE_FLAGS: u32 = 0o1 | 0o2 | 0o100 | 0o1000 | 0o2000;
+
+/// Every path an Fs op names. A symlink's target is not among them: it is only
+/// stored, and whatever later follows the link is checked where it lands.
+fn fs_paths(op: &api::fs_request::Op) -> Vec<(&str, FsNeed)> {
+    use api::fs_request::Op;
+    match op {
+        Op::Stat(stat) => vec![(stat.path.as_str(), FsNeed::Look)],
+        Op::ReadDir(dir) => vec![(dir.path.as_str(), FsNeed::Look)],
+        Op::Mkdir(mkdir) => vec![(mkdir.path.as_str(), FsNeed::Write)],
+        Op::Remove(rm) => vec![(rm.path.as_str(), FsNeed::Write)],
+        Op::Rename(rename) => vec![
+            (rename.src.as_str(), FsNeed::Write),
+            (rename.dst.as_str(), FsNeed::Write),
+        ],
+        // A copy stays in the sandbox, so its source is held to the scopes
+        // without needing downloads.
+        Op::Copy(copy) => vec![
+            (copy.src.as_str(), FsNeed::Look),
+            (copy.dst.as_str(), FsNeed::Write),
+        ],
+        Op::Chmod(chmod) => vec![(chmod.path.as_str(), FsNeed::Write)],
+        Op::Chown(chown) => vec![(chown.path.as_str(), FsNeed::Write)],
+        Op::Utimes(utimes) => vec![(utimes.path.as_str(), FsNeed::Write)],
+        Op::Truncate(truncate) => vec![(truncate.path.as_str(), FsNeed::Write)],
+        Op::Symlink(symlink) => vec![(symlink.path.as_str(), FsNeed::Write)],
+        Op::Link(link) => vec![
+            (link.existing.as_str(), FsNeed::Write),
+            (link.path.as_str(), FsNeed::Write),
+        ],
+        Op::Readlink(readlink) => vec![(readlink.path.as_str(), FsNeed::Look)],
+        Op::Realpath(realpath) => vec![(realpath.path.as_str(), FsNeed::Look)],
+        Op::Access(access) => vec![(access.path.as_str(), FsNeed::Look)],
+        Op::Mkdtemp(mkdtemp) => vec![(mkdtemp.prefix.as_str(), FsNeed::Write)],
+        Op::Open(open) if open.flags & OPEN_WRITE_FLAGS != 0 => {
+            vec![(open.path.as_str(), FsNeed::Write)]
+        }
+        Op::Open(open) => vec![(open.path.as_str(), FsNeed::Read)],
+        Op::Read(_)
+        | Op::Write(_)
+        | Op::Fstat(_)
+        | Op::Ftruncate(_)
+        | Op::Fsync(_)
+        | Op::Close(_) => Vec::new(),
+    }
+}
+
+/// Whether an Fs call changes anything, which is what the Access service's
+/// `files:write` covers. A request with no op is refused further in.
+pub(crate) fn fs_is_write(req: &api::FsRequest) -> bool {
+    use api::fs_request::Op;
+    match &req.op {
+        Some(Op::Write(_) | Op::Ftruncate(_) | Op::Fsync(_)) => true,
+        Some(op) => fs_paths(op)
+            .iter()
+            .any(|(_, need)| matches!(need, FsNeed::Write)),
+        None => false,
+    }
+}
+
+/// Who an Fs call acts as. `token` is an Access token's user, which binds the
+/// caller to it; without one, the request names its own.
+fn fs_caller(token: String, requested: String) -> Result<String, Status> {
+    if token.is_empty() {
+        return Ok(requested);
+    }
+    if !requested.is_empty() && requested != token {
+        return Err(Status::permission_denied(format!(
+            "this token acts as {token}, not {requested}"
+        )));
+    }
+    Ok(token)
+}
+
+/// A policy refusal as the reply the guest gives for its own scope check, so a
+/// caller sees one EACCES whichever of the two said no. Anything else stays
+/// the call's error.
+fn fs_refused(req: &api::FsRequest, status: Status) -> Result<api::FsResponse, Status> {
+    if status.code() != tonic::Code::PermissionDenied {
+        return Err(status);
+    }
+    let guest_req: guestpb::FsRequest = transcode(req)?;
+    let (syscall, path, dest) = guest_req
+        .op
+        .as_ref()
+        .map_or(("", "", ""), |op| op.describe());
+    Ok(api::FsResponse {
+        result: Some(api::fs_response::Result::Error(api::FsError {
+            code: "EACCES".into(),
+            errno: 13,
+            syscall: syscall.into(),
+            path: path.into(),
+            dest: dest.into(),
+        })),
+    })
+}
+
+/// A call on an open handle names no path; its open was checked at its own.
+/// What is left is the policy's coarse permission, which may have changed
+/// since. fstat and close need nothing: neither reads nor changes the file.
+fn check_fs_handle(policy: &common::Policy, op: &api::fs_request::Op) -> Result<(), Status> {
+    use api::fs_request::Op;
+    let Some(fs) = &policy.fs else {
+        return Ok(());
+    };
+    match op {
+        Op::Read(_) if !fs.is_download_allowed => Err(Status::permission_denied(
+            "this sandbox's policy does not allow downloads",
+        )),
+        Op::Write(_) | Op::Ftruncate(_) | Op::Fsync(_) if !fs.is_upload_allowed => Err(
+            Status::permission_denied("this sandbox's policy does not allow uploads"),
+        ),
+        _ => Ok(()),
+    }
+}
+
+/// The guest's Fs messages are the API's field for field, less sandbox_id, so
+/// they are carried across by their encoding rather than a field at a time.
+fn transcode<A: prost::Message, B: prost::Message + Default>(from: &A) -> Result<B, Status> {
+    B::decode(from.encode_to_vec().as_slice())
+        .map_err(|err| Status::internal(format!("translating an Fs message: {err}")))
 }
 
 /// How long the node waits on its own cleanup inside a guest.
@@ -3218,5 +3410,144 @@ mod policy_tests {
 
         assert_eq!(scratch_mib(0).unwrap(), 1024);
         assert!(scratch_mib(u32::MAX).is_err());
+    }
+
+    fn fs_req(op: api::fs_request::Op) -> api::FsRequest {
+        api::FsRequest {
+            sandbox_id: "sbx".into(),
+            user: String::new(),
+            op: Some(op),
+        }
+    }
+
+    #[test]
+    fn an_fs_call_is_a_write_when_it_can_change_anything() {
+        use api::fs_request::Op;
+        let open = |flags| {
+            fs_req(Op::Open(api::FsOpen {
+                path: "/work/f".into(),
+                flags,
+                mode: 0,
+            }))
+        };
+        assert!(!fs_is_write(&open(0)));
+        // O_RDWR, O_CREAT, O_TRUNC, O_APPEND.
+        for flags in [0o2, 0o100, 0o1000, 0o2000] {
+            assert!(fs_is_write(&open(flags)), "flags {flags:o}");
+        }
+        assert!(!fs_is_write(&fs_req(Op::Stat(api::FsStat::default()))));
+        assert!(!fs_is_write(&fs_req(Op::Read(api::FsRead::default()))));
+        assert!(fs_is_write(&fs_req(Op::Write(api::FsWrite::default()))));
+        assert!(fs_is_write(&fs_req(Op::Fsync(api::FsFsync::default()))));
+        assert!(fs_is_write(&fs_req(Op::Rename(api::FsRename::default()))));
+        assert!(!fs_is_write(&api::FsRequest::default()));
+    }
+
+    #[test]
+    fn every_path_an_fs_call_names_is_checked() {
+        use api::fs_request::Op;
+        let rename = Op::Rename(api::FsRename {
+            src: "/work/a".into(),
+            dst: "/etc/a".into(),
+        });
+        let named: Vec<&str> = fs_paths(&rename).iter().map(|(path, _)| *path).collect();
+        assert_eq!(named, ["/work/a", "/etc/a"]);
+        let copy = Op::Copy(api::FsCopy {
+            src: "/work/a".into(),
+            dst: "/work/b".into(),
+            ..Default::default()
+        });
+        let needs: Vec<bool> = fs_paths(&copy)
+            .iter()
+            .map(|(_, need)| matches!(need, FsNeed::Write))
+            .collect();
+        assert_eq!(needs, [false, true]);
+    }
+
+    #[test]
+    fn a_handle_call_is_held_to_the_coarse_permission() {
+        use api::fs_request::Op;
+        let policy = common::Policy {
+            fs: Some(common::FsPolicy {
+                is_upload_allowed: false,
+                is_download_allowed: false,
+                path_scopes: Vec::new(),
+                max_upload_bytes: 0,
+            }),
+            ..Default::default()
+        };
+        assert!(check_fs_handle(&policy, &Op::Read(api::FsRead::default())).is_err());
+        assert!(check_fs_handle(&policy, &Op::Write(api::FsWrite::default())).is_err());
+        assert!(check_fs_handle(&policy, &Op::Close(api::FsHandle::default())).is_ok());
+        assert!(check_fs_handle(&policy, &Op::Fstat(api::FsHandle::default())).is_ok());
+        let open = common::Policy::default();
+        assert!(check_fs_handle(&open, &Op::Read(api::FsRead::default())).is_ok());
+    }
+
+    /// A relayed call carries no token, and must act as the user it names:
+    /// taking the relay's empty user ran every one of them as root.
+    #[test]
+    fn an_fs_call_acts_as_the_user_it_names_without_a_token() {
+        assert_eq!(fs_caller(String::new(), "alice".into()).unwrap(), "alice");
+        assert_eq!(fs_caller(String::new(), String::new()).unwrap(), "");
+    }
+
+    #[test]
+    fn a_token_s_user_binds_the_call() {
+        assert_eq!(fs_caller("alice".into(), String::new()).unwrap(), "alice");
+        assert_eq!(fs_caller("alice".into(), "alice".into()).unwrap(), "alice");
+        let refused = fs_caller("alice".into(), "root".into()).unwrap_err();
+        assert_eq!(refused.code(), tonic::Code::PermissionDenied);
+        // Empty is root, so a token for alice cannot ask for it either way.
+        assert_eq!(
+            fs_caller("alice".into(), "bob".into()).unwrap_err().code(),
+            tonic::Code::PermissionDenied
+        );
+    }
+
+    #[test]
+    fn a_policy_refusal_reads_as_the_kernel_s() {
+        use api::fs_request::Op;
+        let req = fs_req(Op::Rename(api::FsRename {
+            src: "/work/a".into(),
+            dst: "/etc/a".into(),
+        }));
+        let resp = fs_refused(&req, Status::permission_denied("outside the scopes")).unwrap();
+        let Some(api::fs_response::Result::Error(err)) = resp.result else {
+            panic!("a refusal is an FsError");
+        };
+        assert_eq!(
+            (err.code.as_str(), err.errno, err.syscall.as_str()),
+            ("EACCES", 13, "rename")
+        );
+        assert_eq!(
+            (err.path.as_str(), err.dest.as_str()),
+            ("/work/a", "/etc/a")
+        );
+        // Anything but a refusal stays the call's own error.
+        let failed = fs_refused(&req, Status::unavailable("node down")).unwrap_err();
+        assert_eq!(failed.code(), tonic::Code::Unavailable);
+    }
+
+    /// The guest's messages are the API's less sandbox_id, so a request
+    /// survives the trip intact.
+    #[test]
+    fn an_fs_request_transcodes_to_the_guest_s() {
+        let mut req = fs_req(api::fs_request::Op::Write(api::FsWrite {
+            handle: 9,
+            position: -1,
+            data: b"x".to_vec(),
+        }));
+        req.user = "alice".into();
+        let guest: guestpb::FsRequest = transcode(&req).unwrap();
+        assert_eq!(guest.user, "alice");
+        assert_eq!(
+            guest.op,
+            Some(guestpb::fs_request::Op::Write(guestpb::FsWrite {
+                handle: 9,
+                position: -1,
+                data: b"x".to_vec(),
+            }))
+        );
     }
 }

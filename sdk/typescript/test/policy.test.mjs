@@ -1,5 +1,5 @@
 // Rules a JavaScript caller can write that TypeScript would have refused, and
-// the shapes the SDK maps onto burrow's own.
+// what reaches the wire from the ones it would not.
 //
 // The SDK's own examples are .mjs, so excess-property checking is not the last
 // line of defence here: these keys have to be handled at runtime too.
@@ -13,41 +13,45 @@ import {
   toNetworkPolicy,
 } from "../dist/policy.js";
 
-/** The narrowest policy that carries a per-domain rule. */
+/** The narrowest policy that carries one rule, on the wire. */
 function withRule(rule) {
-  return resolveNetwork({
-    allow: { "api.github.com": rule },
+  return toNetworkPolicy({
+    mode: "allowlist",
+    allowDomains: ["api.github.com"],
     inspectTls: true,
+    rules: [{ domain: "api.github.com", ...rule }],
   });
 }
 
-test("a rule with only a transform is accepted", () => {
-  const policy = withRule({
-    transform: [{ headers: { Authorization: "Bearer t" } }],
-  });
-  assert.deepEqual(policy.rules, [
+test("a bare mode is a policy with only that mode", () => {
+  assert.deepEqual(resolveNetwork("open"), { mode: "open" });
+  assert.deepEqual(resolveNetwork(undefined), {});
+});
+
+test("a rule that sets headers is carried onto the wire", () => {
+  const wire = withRule({ setHeaders: { Authorization: "Bearer t" } });
+  assert.deepEqual(wire.rules, [
     {
       domain: "api.github.com",
       match: undefined,
-      setHeaders: { Authorization: "Bearer t" },
+      setHeaders: { headers: [{ name: "Authorization", value: "Bearer t" }] },
     },
   ]);
-  assert.equal(policy.inspectTls, true);
+  assert.equal(wire.isTlsInspected, true);
 });
 
 // A matcher selects which requests the rule acts on. It never blocks: a
 // request matching nothing is still allowed, it just goes unmodified.
 test("a request matcher is carried onto the wire", () => {
-  const policy = withRule({
+  const wire = withRule({
     match: {
       path: { startsWith: "/repos/" },
       method: "GET",
       queryString: { tenant: "acme" },
       headers: { "x-client": { regex: "^cli/" } },
     },
-    transform: [{ headers: { Authorization: "Bearer t" } }],
+    setHeaders: { Authorization: "Bearer t" },
   });
-  const wire = toNetworkPolicy(policy);
   assert.equal(wire.rules.length, 1);
   const match = wire.rules[0].match;
   assert.deepEqual(match.path, {
@@ -66,12 +70,10 @@ test("a request matcher is carried onto the wire", () => {
   });
 });
 
-test("forwardURL becomes a forward action", () => {
-  const policy = withRule({
-    forwardURL: "http://gate.internal:8080/inspect",
-    forwardSecret: "shared",
+test("a forward is carried onto the wire", () => {
+  const wire = withRule({
+    forward: { url: "http://gate.internal:8080/inspect", secret: "shared" },
   });
-  const wire = toNetworkPolicy(policy);
   assert.deepEqual(wire.rules[0].forward, {
     url: "http://gate.internal:8080/inspect",
     secret: "shared",
@@ -82,12 +84,9 @@ test("forwardURL becomes a forward action", () => {
 // The scheme is the caller's choice between protecting the secret in transit
 // and protecting it by where the endpoint sits, so both reach the wire.
 test("an https forward url is accepted", () => {
-  const wire = toNetworkPolicy(
-    withRule({
-      forwardURL: "https://gate.example.com/inspect",
-      forwardSecret: "shared",
-    }),
-  );
+  const wire = withRule({
+    forward: { url: "https://gate.example.com/inspect", secret: "shared" },
+  });
   assert.deepEqual(wire.rules[0].forward, {
     url: "https://gate.example.com/inspect",
     secret: "shared",
@@ -104,7 +103,7 @@ test("a forward url that burrow would refuse is refused here", () => {
     "http://gate.internal/x#frag",
   ]) {
     assert.throws(
-      () => toNetworkPolicy(withRule({ forwardURL: url })),
+      () => withRule({ forward: { url } }),
       /forward url/,
       `${url} should be refused`,
     );
@@ -113,24 +112,27 @@ test("a forward url that burrow would refuse is refused here", () => {
 
 // First match wins, so the order the caller wrote is the order that is sent.
 test("a domain may carry several rules, narrowest first", () => {
-  const policy = resolveNetwork({
-    allow: {
-      "api.github.com": [
-        {
-          match: { path: { startsWith: "/repos/" } },
-          transform: [{ headers: { Authorization: "Bearer narrow" } }],
-        },
-        { transform: [{ headers: { Authorization: "Bearer wide" } }] },
-      ],
-    },
+  const wire = toNetworkPolicy({
+    mode: "allowlist",
+    allowDomains: ["api.github.com"],
+    inspectTls: true,
+    rules: [
+      {
+        domain: "api.github.com",
+        match: { path: { startsWith: "/repos/" } },
+        setHeaders: { Authorization: "Bearer narrow" },
+      },
+      { domain: "api.github.com", setHeaders: { Authorization: "Bearer wide" } },
+    ],
   });
-  assert.equal(policy.rules.length, 2);
-  assert.ok(policy.rules[0].match);
-  assert.equal(policy.rules[1].match, undefined);
+  assert.equal(wire.rules.length, 2);
+  assert.ok(wire.rules[0].match);
+  assert.equal(wire.rules[1].match, undefined);
 });
 
 test("injectHeaders are appended after rules", () => {
   const wire = toNetworkPolicy({
+    allowDomains: ["api.github.com"],
     rules: [
       {
         domain: "api.github.com",
@@ -176,12 +178,12 @@ test("a policy read back reports rules, and injections among them", () => {
   ]);
 });
 
-test("a rule that rewrites and forwards at once is refused", () => {
+test("a rule that sets headers and forwards at once is refused", () => {
   assert.throws(
     () =>
       withRule({
-        forwardURL: "http://gate.internal/",
-        transform: [{ headers: { A: "b" } }],
+        forward: { url: "http://gate.internal/" },
+        setHeaders: { A: "b" },
       }),
     (err) => {
       assert.equal(err.code, "invalid_argument");
@@ -194,9 +196,13 @@ test("a rule that rewrites and forwards at once is refused", () => {
 test("a match with no action is refused rather than silently dropped", () => {
   assert.throws(() => withRule({ match: { path: "/v1" } }), (err) => {
     assert.equal(err.code, "invalid_argument");
-    assert.match(err.message, /transform or a forwardURL/);
+    assert.match(err.message, /setHeaders or forward/);
     return true;
   });
+});
+
+test("setHeaders naming no header is refused", () => {
+  assert.throws(() => withRule({ setHeaders: {} }), /names no header/);
 });
 
 test("an unrecognised match dimension is refused by name", () => {
@@ -204,7 +210,7 @@ test("an unrecognised match dimension is refused by name", () => {
     () =>
       withRule({
         match: { paht: "/v1" },
-        transform: [{ headers: { A: "b" } }],
+        setHeaders: { A: "b" },
       }),
     (err) => {
       assert.equal(err.code, "invalid_argument");
@@ -216,13 +222,27 @@ test("an unrecognised match dimension is refused by name", () => {
 
 test("any other unrecognised key is refused by name", () => {
   assert.throws(
-    () => withRule({ tranfsorm: [{ headers: { A: "b" } }] }),
+    () => withRule({ setHeader: { A: "b" } }),
     (err) => {
       assert.equal(err.code, "invalid_argument");
-      assert.match(err.message, /unknown key "tranfsorm"/);
+      assert.match(err.message, /unknown key "setHeader"/);
       assert.match(err.message, /api\.github\.com/);
       return true;
     },
+  );
+});
+
+// Rules act only on inspected requests, which means requests to an allowed
+// domain; without one, nothing would ever reach them.
+test("rules with no allowed domain are refused", () => {
+  assert.throws(
+    () =>
+      toNetworkPolicy({
+        mode: "allowlist",
+        inspectTls: true,
+        rules: [{ domain: "api.github.com", setHeaders: { A: "b" } }],
+      }),
+    /allowDomains/,
   );
 });
 
@@ -230,6 +250,7 @@ test("a comparator nobody defined is refused", () => {
   assert.throws(
     () =>
       toNetworkPolicy({
+        allowDomains: ["api.github.com"],
         rules: [
           {
             domain: "api.github.com",

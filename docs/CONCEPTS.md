@@ -6,6 +6,15 @@ with its own kernel, filesystem and network, cheap enough to create per task and
 disposable enough to throw away afterwards. Give every agent its own machine,
 or fork one prepared workspace into fifty.
 
+Burrow puts developer experience and the experience of the people a product
+serves first, and that is why its SDKs mirror their languages rather than
+defining an API of their own. In TypeScript a sandbox's files are
+`node:fs/promises` and its processes `node:child_process`; in Python they are
+`open()`, `os`, `shutil`, `pathlib` and `subprocess`. Names, signatures,
+return types and errors are the standard library's, errno and all, so nothing
+needs learning and existing code moves into a sandbox by changing which object
+it calls.
+
 ## How a sandbox runs
 
 You create a sandbox from a template: a prepared rootfs image, usually imported
@@ -239,12 +248,19 @@ sections draw and so cannot be the thing that holds them.
 - `is_exec_allowed: false` refuses `Exec`, and with it `burrow connect` and
   `burrow run`, with `PERMISSION_DENIED`.
 - `is_upload_allowed: false` and `is_download_allowed: false` refuse `UploadFile` and
-  `DownloadFile`.
-- `path_scopes` confines uploads, downloads, listings and watches to paths under
-  one of the given prefixes. Matching is on whole path components, so `/data`
-  admits `/data/in.csv` and refuses `/database/dump.sql`, and a path carrying
-  `..` or a relative path is refused rather than resolved.
-- `max_upload_bytes` caps a single upload. The stream is cut off at the chunk
+  `DownloadFile`, and the `Fs` calls that write or read a file's contents.
+- `path_scopes` confines uploads, downloads, listings, watches and `Fs` calls to
+  paths under one of the given prefixes. Matching is on whole path components,
+  so `/data` admits `/data/in.csv` and refuses `/database/dump.sql`, and a path
+  carrying `..` or a relative path is refused rather than resolved. `Fs`
+  follows symlinks, as POSIX does, so a path that passes as a string could
+  still lead out of the scope: the node passes the scopes down, and the agent
+  checks where each call actually lands through the descriptor it then acts
+  on, so a link swapped in between gains nothing. `Fs` refusals arrive as
+  `EACCES`, the way the kernel's own would. This guards against callers, not
+  the guest: code inside a sandbox already owns its filesystem.
+- `max_upload_bytes` caps a single upload, and the size an `Fs` write may grow a
+  file to, past which it fails with `EFBIG`. The stream is cut off at the chunk
   that crosses the cap with `RESOURCE_EXHAUSTED`, and the node makes a
   best-effort delete of what had already been written.
 
@@ -268,7 +284,7 @@ burrow config access sbx_2f0c --allow-exec
 ```
 
 ```ts
-await sandbox.update({ exec: { allowExec: false } });
+await sandbox.updateAccessPolicy({ exec: { allowExec: false } });
 ```
 
 What a section's presence means here is deliberately not what it means on

@@ -1,17 +1,14 @@
 """Python SDK for burrow: Firecracker microVM sandboxes for untrusted code."""
 
-from .errors import BurrowError, CommandFailedError
-from .sandbox import Burrow, DetachedCommand, Sandbox, Watcher
+from .errors import BurrowError
+from .sandbox import Burrow, Sandbox, Watcher
 from .snapshot import Snapshot
 from .template import Template, TemplateBuilder, default_build_logger
 from .terminal import Terminal
 from .types import (
     AuditEvent,
     CommandInfo,
-    CommandResult,
-    DirEntry,
     ExecPolicy,
-    FileInfo,
     FsPolicy,
     GuestGroup,
     GuestUser,
@@ -20,7 +17,6 @@ from .types import (
     NetworkMembership,
     NetworkPolicy,
     NodeInfo,
-    OutputChunk,
     PortMapping,
     RequestRule,
     Share,
@@ -39,13 +35,8 @@ __all__ = [
     "AuditEvent",
     "Burrow",
     "BurrowError",
-    "CommandFailedError",
     "CommandInfo",
-    "CommandResult",
-    "DetachedCommand",
-    "DirEntry",
     "ExecPolicy",
-    "FileInfo",
     "FsPolicy",
     "GuestGroup",
     "GuestUser",
@@ -54,7 +45,6 @@ __all__ = [
     "NetworkMembership",
     "NetworkPolicy",
     "NodeInfo",
-    "OutputChunk",
     "PortMapping",
     "RequestRule",
     "ResourcePolicy",

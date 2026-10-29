@@ -94,6 +94,7 @@ service NodeService {
   rpc DownloadFile(burrow.api.v1.DownloadRequest) returns (stream burrow.api.v1.FileChunk);
   rpc ListDir(burrow.api.v1.ListDirRequest) returns (burrow.api.v1.ListDirResponse);
   rpc Watch(burrow.api.v1.WatchRequest) returns (stream burrow.api.v1.WatchEvent);
+  rpc Fs(burrow.api.v1.FsRequest) returns (burrow.api.v1.FsResponse);
   // Refuses the sandbox's outstanding Access tokens and ends what they opened.
   rpc RevokeAccess(NodeSandboxRef) returns (burrow.api.v1.RevokeAccessResponse);
   rpc ListCommands(burrow.api.v1.ListCommandsRequest) returns (burrow.api.v1.ListCommandsResponse);

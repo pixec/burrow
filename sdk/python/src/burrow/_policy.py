@@ -33,81 +33,43 @@ _MODE_FROM_WIRE = {
 }
 
 
-def resolve_network(
-    network: Any,
-    allow_domains: Optional[List[str]] = None,
-    allow_cidrs: Optional[List[str]] = None,
-) -> Dict[str, Any]:
-    """Normalises the two ways a network can be described.
-
-    ``network="allowlist"`` with sibling ``allow_domains`` is the original
-    shape and still works; a dict carries the fields the shorthand has no room
-    for, and ``{"allow": ..., "subnets": ...}`` is the shorthand mapped onto a
-    full policy.
-    """
-    legacy = {"allow_domains": allow_domains, "allow_cidrs": allow_cidrs}
+def resolve_network(network: Any) -> Dict[str, Any]:
+    """Normalises a mode or a policy dict into a full policy."""
     if isinstance(network, str):
-        mode = {"allow-all": "open", "deny-all": "none"}.get(network, network)
-        return {"mode": mode, **legacy}
-    if network and _is_shorthand(network):
-        return _with_legacy(_from_shorthand(network), legacy)
-    if network:
-        out = dict(network)
-        if out.get("allow_domains") is None:
-            out["allow_domains"] = allow_domains
-        if out.get("allow_cidrs") is None:
-            out["allow_cidrs"] = allow_cidrs
-        return out
-    return legacy
+        return {"mode": network}
+    policy = dict(network or {})
+    _check_keys("network_policy", policy, _POLICY_KEYS)
+    return policy
 
 
-def _with_legacy(base: Dict[str, Any], legacy: Dict[str, Any]) -> Dict[str, Any]:
-    out = dict(base)
-    if legacy.get("allow_domains"):
-        out["allow_domains"] = (out.get("allow_domains") or []) + legacy["allow_domains"]
-    if legacy.get("allow_cidrs"):
-        out["allow_cidrs"] = (out.get("allow_cidrs") or []) + legacy["allow_cidrs"]
-    return out
-
-
-def _is_shorthand(network: Dict[str, Any]) -> bool:
-    # The shorthand and the full policy share no key names, so one key decides;
-    # carrying neither is the full form, all defaulted.
-    return "allow" in network or "subnets" in network
-
-
-# Everything burrow understands on a per-domain rule.
-_RULE_KEYS = {"match", "transform", "forward_url", "forward_secret"}
-
-# Every dimension a matcher may name.
+# Everything burrow understands in a network policy, on a rule, in a match and
+# in a forward.
+_POLICY_KEYS = {
+    "mode",
+    "allow_domains",
+    "allow_cidrs",
+    "allow_ports",
+    "deny_cidrs",
+    "inspect_tls",
+    "rules",
+    "inject_headers",
+}
+_RULE_KEYS = {"domain", "match", "set_headers", "forward"}
 _MATCH_KEYS = {"path", "method", "query_string", "headers"}
+_FORWARD_KEYS = {"url", "secret"}
 
 
-def _check_rule_keys(domain: str, rule: Any) -> None:
-    """Refuses a rule key burrow does not implement, rather than dropping it.
+def _check_keys(where: str, given: Dict[str, Any], known: set) -> None:
+    """Refuses a key burrow does not implement, rather than dropping it.
 
-    It earns its place because dropping a ``match`` would widen a credential
-    from one path and method to every request to the domain.
+    It earns its place because a dropped key changes what the policy means:
+    a misspelt ``match`` would widen a credential from one path and method to
+    every request to the domain.
     """
-    if not isinstance(rule, dict):
-        return
-    where = f"network_policy.allow[{domain!r}]"
-    for key in rule:
-        if key not in _RULE_KEYS:
+    for key in given:
+        if key not in known:
             raise BurrowError(
-                f"{where}: unknown key {key!r} in a rule for {domain}",
-                "invalid_argument",
-            )
-    if rule.get("transform") and rule.get("forward_url"):
-        raise BurrowError(
-            f"{where}: a rule either rewrites a request or forwards it, not both",
-            "invalid_argument",
-        )
-    for key in rule.get("match") or {}:
-        if key not in _MATCH_KEYS:
-            raise BurrowError(
-                f"{where}: unknown key {key!r} in a match. Burrow matches on "
-                f"path, method, query_string and headers.",
+                f"{where}: unknown key {key!r}; one of {', '.join(sorted(known))}",
                 "invalid_argument",
             )
 
@@ -174,6 +136,9 @@ def _to_request_rule(rule: Dict[str, Any]) -> common_pb2.RequestRule:
     """Builds one wire `RequestRule`."""
     domain = rule.get("domain", "")
     where = f"network_policy.rules[{domain!r}]"
+    _check_keys(where, rule, _RULE_KEYS)
+    _check_keys(f"{where}.match", rule.get("match") or {}, _MATCH_KEYS)
+    _check_keys(f"{where}.forward", rule.get("forward") or {}, _FORWARD_KEYS)
     if rule.get("set_headers") and rule.get("forward"):
         raise BurrowError(
             f"{where}: a rule either sets headers or forwards, not both",
@@ -257,70 +222,6 @@ def _from_request_match(raw: common_pb2.RequestMatch) -> Dict[str, Any]:
 
 def _from_string_match(raw: common_pb2.StringMatch) -> Dict[str, str]:
     return {_OP_FROM_WIRE.get(raw.op, "exact"): raw.value}
-
-
-def _from_shorthand(shorthand: Dict[str, Any]) -> Dict[str, Any]:
-    """Maps ``{allow, subnets}`` onto a burrow policy. Naming any domain is an
-    allowlist, the only mode where the proxy sits in the path and can tell one
-    domain from another."""
-    allow = shorthand.get("allow")
-    domains = allow if isinstance(allow, list) else list(allow) if allow else []
-    per_domain = allow if isinstance(allow, dict) else {}
-
-    rules: List[Dict[str, Any]] = []
-    for domain, written in per_domain.items():
-        where = f"network_policy.allow[{domain!r}]"
-        for rule in written if isinstance(written, list) else [written]:
-            _check_rule_keys(domain, rule)
-            if not isinstance(rule, dict):
-                continue
-            if rule.get("forward_url"):
-                rules.append(
-                    {
-                        "domain": domain,
-                        "match": rule.get("match"),
-                        "forward": {
-                            "url": rule["forward_url"],
-                            "secret": rule.get("forward_secret"),
-                        },
-                    }
-                )
-                continue
-            for transform in rule.get("transform") or []:
-                headers = (transform or {}).get("headers")
-                if not headers:
-                    raise BurrowError(
-                        f"{where}: a transform needs headers", "invalid_argument"
-                    )
-                for name in headers:
-                    _check_header_name(where, name)
-                rules.append(
-                    {"domain": domain, "match": rule.get("match"), "set_headers": headers}
-                )
-            if not rule.get("transform") and rule.get("match"):
-                raise BurrowError(
-                    f"{where}: a match selects which requests a rule acts on, "
-                    f"so the rule needs a transform or a forward_url",
-                    "invalid_argument",
-                )
-
-    # A rule on a domain that is not inspected would be silently dropped.
-    if rules and not domains:
-        raise BurrowError(
-            "network_policy: a rule needs its domain in `allow`, since rules "
-            "only apply to inspected requests",
-            "invalid_argument",
-        )
-
-    subnets = shorthand.get("subnets") or {}
-    return {
-        "mode": "allowlist" if domains or shorthand.get("subnets") else "none",
-        "allow_domains": domains,
-        "allow_cidrs": subnets.get("allow") or [],
-        "deny_cidrs": subnets.get("deny") or [],
-        "inspect_tls": bool(rules),
-        "rules": rules,
-    }
 
 
 def to_network_policy(options: Optional[Dict[str, Any]] = None) -> common_pb2.NetworkPolicy:

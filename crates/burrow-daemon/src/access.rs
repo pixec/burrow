@@ -365,6 +365,18 @@ impl Access for AccessApi {
             .map(Response::new)
     }
 
+    async fn fs(&self, req: Request<api::FsRequest>) -> Result<Response<api::FsResponse>, Status> {
+        let claims = self.claims(&req)?;
+        let req = req.into_inner();
+        let op = if crate::nodeapi::fs_is_write(&req) {
+            OP_FILES_WRITE
+        } else {
+            OP_FILES_READ
+        };
+        let _held = self.admit(&claims, &req.sandbox_id, op).await?;
+        self.api.fs_as(req, claims.user).await.map(Response::new)
+    }
+
     type WatchStream = BoxStream<api::WatchEvent>;
 
     async fn watch(

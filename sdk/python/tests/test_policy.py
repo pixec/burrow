@@ -1,6 +1,5 @@
 # Policy conversion runs entirely client-side, so it is checked without a
-# server: the shorthand and the flat options must land on the same wire shape
-# the daemons read.
+# server: the options must land on the same wire shape the daemons read.
 
 import pytest
 
@@ -9,41 +8,60 @@ from burrow._policy import from_network_policy, resolve_network, to_network_poli
 from burrow.errors import BurrowError
 
 
-def test_string_shorthands_map_to_modes():
+def test_a_string_is_a_mode():
     assert resolve_network("open")["mode"] == "open"
-    assert resolve_network("allow-all")["mode"] == "open"
-    assert resolve_network("deny-all")["mode"] == "none"
     assert resolve_network("allowlist")["mode"] == "allowlist"
 
 
-def test_naming_a_domain_makes_an_allowlist():
-    options = resolve_network({"allow": ["pypi.org", "*.pythonhosted.org"]})
-    wire = to_network_policy(options)
+def test_the_old_shorthand_strings_are_unknown_modes():
+    for gone in ("allow-all", "deny-all"):
+        with pytest.raises(BurrowError, match="unknown mode"):
+            to_network_policy(resolve_network(gone))
+
+
+def test_the_old_shorthand_dict_is_refused_not_read_as_no_network():
+    with pytest.raises(BurrowError, match="unknown key 'allow'"):
+        resolve_network({"allow": ["pypi.org"]})
+    with pytest.raises(BurrowError, match="unknown key 'subnets'"):
+        resolve_network({"subnets": {"deny": ["169.254.0.0/16"]}})
+
+
+def test_an_allowlist_carries_domains_and_denies():
+    wire = to_network_policy(
+        resolve_network(
+            {
+                "mode": "allowlist",
+                "allow_domains": ["pypi.org", "*.pythonhosted.org"],
+                "deny_cidrs": ["169.254.0.0/16"],
+            }
+        )
+    )
     assert wire.mode == common_pb2.NETWORK_MODE_ALLOWLIST
     assert list(wire.allow_domains) == ["pypi.org", "*.pythonhosted.org"]
+    assert list(wire.deny_cidrs) == ["169.254.0.0/16"]
     assert not wire.is_tls_inspected
 
 
-def test_subnets_shorthand_carries_denies():
-    options = resolve_network(
-        {"allow": ["pypi.org"], "subnets": {"deny": ["169.254.0.0/16"]}}
-    )
-    wire = to_network_policy(options)
-    assert list(wire.deny_cidrs) == ["169.254.0.0/16"]
+def rule_policy(rule):
+    return {
+        "mode": "allowlist",
+        "allow_domains": ["api.example.com"],
+        "inspect_tls": True,
+        "rules": [{"domain": "api.example.com", **rule}],
+    }
 
 
-def test_a_transform_becomes_an_inspected_rule():
-    options = resolve_network(
-        {
-            "allow": {
-                "api.example.com": {
+def test_a_rule_reaches_the_wire():
+    wire = to_network_policy(
+        resolve_network(
+            rule_policy(
+                {
                     "match": {"path": {"starts_with": "/v1/"}, "method": "POST"},
-                    "transform": [{"headers": {"Authorization": "Bearer t"}}],
+                    "set_headers": {"Authorization": "Bearer t"},
                 }
-            }
-        }
+            )
+        )
     )
-    wire = to_network_policy(options)
     assert wire.is_tls_inspected
     rule = wire.rules[0]
     assert rule.domain == "api.example.com"
@@ -53,35 +71,35 @@ def test_a_transform_becomes_an_inspected_rule():
 
 
 def test_an_unknown_rule_key_is_refused_not_dropped():
-    with pytest.raises(BurrowError, match="unknown key"):
-        resolve_network({"allow": {"api.example.com": {"forwardURL": "x"}}})
+    with pytest.raises(BurrowError, match="unknown key 'forward_url'"):
+        to_network_policy(rule_policy({"forward_url": "https://x", "set_headers": {"A": "b"}}))
 
 
-def test_a_match_without_an_action_is_refused():
-    with pytest.raises(BurrowError, match="needs a transform"):
-        resolve_network(
-            {"allow": {"api.example.com": {"match": {"path": "/v1/x"}}}}
+def test_an_unknown_match_key_is_refused_not_dropped():
+    # Dropped, it would widen the rule to every request to the domain.
+    with pytest.raises(BurrowError, match="unknown key 'paths'"):
+        to_network_policy(
+            rule_policy({"match": {"paths": "/v1/x"}, "set_headers": {"A": "b"}})
         )
 
 
-def test_legacy_allow_domains_still_compose_with_a_mode_string():
-    options = resolve_network("allowlist", allow_domains=["pypi.org"])
-    wire = to_network_policy(options)
-    assert list(wire.allow_domains) == ["pypi.org"]
+def test_an_unknown_forward_key_is_refused():
+    with pytest.raises(BurrowError, match="unknown key 'secrets'"):
+        to_network_policy(rule_policy({"forward": {"url": "https://x", "secrets": "s"}}))
+
+
+def test_a_rule_without_an_action_is_refused():
+    with pytest.raises(BurrowError, match="needs either set_headers or forward"):
+        to_network_policy(rule_policy({"match": {"path": "/v1/x"}}))
+
+
+def test_a_bad_header_name_is_refused():
+    with pytest.raises(BurrowError, match="not a valid header name"):
+        to_network_policy(rule_policy({"set_headers": {"Bad Header": "x"}}))
 
 
 def test_the_wire_policy_reads_back_as_it_was_written():
-    wire = to_network_policy(
-        resolve_network(
-            {
-                "allow": {
-                    "api.example.com": {
-                        "transform": [{"headers": {"X-Token": "secret"}}]
-                    }
-                }
-            }
-        )
-    )
+    wire = to_network_policy(resolve_network(rule_policy({"set_headers": {"X-Token": "secret"}})))
     back = from_network_policy(wire)
     assert back.mode == "allowlist"
     assert back.inspect_tls

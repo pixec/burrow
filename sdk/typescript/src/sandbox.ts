@@ -1,11 +1,7 @@
-import { Buffer } from "node:buffer";
-import { createWriteStream } from "node:fs";
-import { mkdir } from "node:fs/promises";
-import { dirname, resolve as resolvePath } from "node:path";
-import { Readable } from "node:stream";
-import { pipeline } from "node:stream/promises";
-
-import { BurrowError, CommandFailedError } from "./errors.js";
+import { attach, SandboxChildProcess, type ChildProcess } from "./child-process.js";
+import { BurrowError } from "./errors.js";
+import { SandboxFs } from "./fs.js";
+import type { GuestLink } from "./guest.js";
 import {
   fromPolicy,
   resolveNetwork,
@@ -23,18 +19,9 @@ import type {
   AuditEvent,
   AuditQuery,
   CommandInfo,
-  CommandResult,
   CreateOptions,
-  DetachedCommand,
-  DirEntry,
-  DownloadFileOptions,
   EventsOptions,
-  FileInfo,
-  FileRef,
-  FileWrite,
-  FinishedCommand,
   ForkOptions,
-  ForkSourceOptions,
   GetOptions,
   GetOrCreateOptions,
   GuestGroup,
@@ -44,29 +31,20 @@ import type {
   ListOptions,
   MoveOptions,
   NodeInfo,
-  OutputChunk,
   PortMapping,
   RecreateOptions,
   Share,
   ShareOptions,
-  RunCommandOptions,
-  RunCommandParams,
-  RunOptions,
   SandboxInfo,
   SandboxState,
-  SandboxStatus,
   Session,
   SessionEnd,
   SessionStart,
   UpdateOptions,
   Usage,
-  WatchEvent,
-  Watcher,
-  WatchOptions,
 } from "./types.js";
 
 function toSandboxInfo(raw: any): SandboxInfo {
-  const tags = raw.metadata ?? {};
   return {
     id: raw.id,
     name: raw.name ?? "",
@@ -75,8 +53,7 @@ function toSandboxInfo(raw: any): SandboxInfo {
     state: stateOf(raw.state),
     createdAt: raw.createdAt ?? "",
     guestIp: raw.guestIp ?? "",
-    tags,
-    metadata: tags,
+    tags: raw.metadata ?? {},
     policy: fromPolicy(raw.policy),
     unreachable: raw.isUnreachable ?? false,
     usage: {
@@ -124,19 +101,13 @@ function stateOf(state: string | number | undefined): SandboxState {
   return (known as string[]).includes(name) ? (name as SandboxState) : "unknown";
 }
 
-/** Builds a `CreateSandboxRequest` from the SDK's flatter options. */
+/** Builds a `CreateSandboxRequest`. */
 function toCreateRequest(options: CreateOptions): any {
-  const network = resolveNetwork(options.network ?? options.networkPolicy, {
-    allowDomains: options.allowDomains,
-    allowCidrs: options.allowCidrs,
-  });
-  const resources = options.resources ?? {
-    vcpus: options.vcpus,
-    memoryMib: options.memoryMib,
-  };
+  const network = resolveNetwork(options.networkPolicy);
+  const resources = options.resources ?? {};
   // A snapshot carries its own template, and one that disagrees is an error,
   // so nothing is sent as if the caller had asked for it.
-  const template = options.template ?? options.image ?? "";
+  const template = options.template ?? "";
   // Without a snapshot there is nothing to boot from, and a made-up "default"
   // would turn a missing argument into a not_found for a template nobody
   // named.
@@ -160,7 +131,7 @@ function toCreateRequest(options: CreateOptions): any {
       networks: toNetworks(options.networks, options.alias),
       volumes: toVolumeMounts(options.volumes),
     },
-    metadata: options.tags ?? options.metadata ?? {},
+    metadata: options.tags ?? {},
     nodeLabels: options.nodeLabels ?? {},
     kit: toKitSpec(options.kit),
   };
@@ -174,35 +145,6 @@ function toKitSpec(kit: KitOptions | undefined): any {
     rejectTypes: [...(kit?.rejectCapabilities ?? [])],
   };
 }
-
-/** The five-state view of a sandbox's lifecycle. */
-function statusOf(state: SandboxState): SandboxStatus {
-  switch (state) {
-    case "creating":
-      return "pending";
-    case "running":
-      return "running";
-    case "stopping":
-      return "stopping";
-    // All four are "not going to run anything until something is done".
-    case "paused":
-    case "suspended":
-    case "stopped":
-    case "destroyed":
-      return "stopped";
-    // `failed`, and any state a newer server reports that this client has no
-    // name for.
-    default:
-      return "failed";
-  }
-}
-
-/**
- * Bytes per uploaded chunk, matching HTTP/2's default flow-control window.
- * Larger chunks showed no measurable gain: a message bigger than the window
- * stalls for WINDOW_UPDATE round trips rather than pipelining.
- */
-const UPLOAD_CHUNK = 64 * 1024;
 
 /** Turns a guest's report of one command into the SDK's shape. */
 function toCommandInfo(raw: any): CommandInfo {
@@ -263,6 +205,15 @@ export class Sandbox {
   private onResume?: (sandbox: Sandbox) => void | Promise<void>;
   /** Set by {@link delete}: a destroyed sandbox has nothing left to call. */
   private destroyed = false;
+  /** What `fs` and `childProcess` reach the sandbox through, read live. */
+  private readonly link: GuestLink;
+  /**
+   * The sandbox's filesystem, as Node's `fs/promises`: the same functions,
+   * signatures and errors, performed by the guest kernel.
+   */
+  readonly fs: SandboxFs;
+  /** Commands in the sandbox, as Node's `child_process`: `spawn`, `exec`, `execFile`. */
+  readonly childProcess: SandboxChildProcess;
 
   private constructor(
     transport: Transport,
@@ -277,6 +228,31 @@ export class Sandbox {
     this.owned = owned;
     this.autoResume = autoResume;
     this.env = env;
+    const sandbox = this;
+    this.link = {
+      sandboxId: this.id,
+      get user() {
+        return sandbox.defaultUser;
+      },
+      get env() {
+        return sandbox.env;
+      },
+      get autoResume() {
+        return sandbox.autoResume;
+      },
+      node: () => {
+        this.assertLive();
+        return this.node();
+      },
+      run: (op) => {
+        this.assertLive();
+        return this.withResume(op);
+      },
+      resume: () => this.resume(),
+      signalCommand: (cmdId, signal) => this.killCommand(cmdId, signal),
+    };
+    this.fs = new SandboxFs(this.link);
+    this.childProcess = new SandboxChildProcess(this.link);
   }
 
   /**
@@ -324,7 +300,7 @@ export class Sandbox {
    * const sandbox = await Sandbox.getOrCreate({
    *   name: "build-482",
    *   template: "python-tools",
-   *   onCreate: (s) => s.writeFiles([{ path: "/work/app.py", content: src }]),
+   *   onCreate: (s) => s.fs.writeFile("/work/app.py", src),
    * });
    * ```
    *
@@ -354,7 +330,7 @@ export class Sandbox {
         const sandbox = await Sandbox.get({ ...options, id: key });
         sandbox.env = options.env ?? {};
         sandbox.onResume = options.onResume;
-        if (options.resume && sandbox.status === "stopped") {
+        if (options.resume && (sandbox.state === "paused" || sandbox.state === "suspended")) {
           await sandbox.resume();
         }
         return sandbox;
@@ -420,11 +396,6 @@ export class Sandbox {
     }
   }
 
-  /** Reattaches to an existing sandbox by id. Alias of {@link Sandbox.get}. */
-  static connect(id: string, options: TransportOptions = {}): Promise<Sandbox> {
-    return Sandbox.get({ ...options, id });
-  }
-
   /**
    * Lists sandboxes, newest state first, as an async iterable of handles.
    *
@@ -467,30 +438,6 @@ export class Sandbox {
     };
   }
 
-  /**
-   * Creates a sandbox from another's current state.
-   *
-   * The source keeps running; a running source's state is written first, so the
-   * child starts from its state as of the call.
-   */
-  static async fork(
-    options: ForkSourceOptions & TransportOptions,
-  ): Promise<Sandbox> {
-    const transport = new Transport(options);
-    try {
-      const raw = await transport.unary<any, any>(
-        "ForkSandbox",
-        toForkRequest(options.source, options),
-        options.timeoutMs ?? 120_000,
-        options.signal,
-      );
-      return new Sandbox(transport, toSandboxInfo(raw), true);
-    } catch (err) {
-      transport.close();
-      throw err;
-    }
-  }
-
   /** @internal: used by {@link Burrow} so clients share one connection. */
   static adopt(transport: Transport, raw: any): Sandbox {
     return new Sandbox(transport, toSandboxInfo(raw), false);
@@ -508,17 +455,7 @@ export class Sandbox {
     return this.info.state;
   }
 
-  /** The five-state view of {@link state}. Suspended reads as `stopped`. */
-  get status(): SandboxStatus {
-    return statusOf(this.info.state);
-  }
-
   get template(): string {
-    return this.info.template;
-  }
-
-  /** The template, under the name an image-shaped SDK uses. */
-  get image(): string {
     return this.info.template;
   }
 
@@ -542,16 +479,8 @@ export class Sandbox {
     return this.info.tags;
   }
 
-  get metadata(): Record<string, string> {
-    return this.info.metadata;
-  }
-
   get vcpus(): number {
     return this.info.policy.resources.vcpus;
-  }
-
-  get memory(): number {
-    return this.info.policy.resources.memoryMib;
   }
 
   /** The same number under its unit-bearing name. */
@@ -573,41 +502,12 @@ export class Sandbox {
     return this.info.createdAt;
   }
 
-  /** The egress policy in force, with injected header values redacted. */
-  get networkPolicy() {
-    return this.info.policy.network;
-  }
-
   /** The whole policy in force, with injected header values redacted. */
   get policy() {
     return this.info.policy;
   }
 
   /** Re-reads the sandbox's current state from the server. */
-  /** The id, under the name other sandbox SDKs give it. */
-  get sandboxId(): string {
-    return this.id;
-  }
-
-  /** Re-reads the record. Alias of {@link refresh}. */
-  getInfo(options: { signal?: AbortSignal } = {}): Promise<SandboxInfo> {
-    return this.refresh(options);
-  }
-
-  /** Whether the sandbox is running right now, after a fresh read. */
-  async isRunning(options: { signal?: AbortSignal } = {}): Promise<boolean> {
-    const info = await this.refresh(options);
-    return info.state === "running";
-  }
-
-  /**
-   * Sets the sandbox's total lifetime, in milliseconds from when it was
-   * created. Alias of {@link extendTimeout}, under the name other SDKs use.
-   */
-  setTimeout(ms: number, options: { signal?: AbortSignal } = {}): Promise<SandboxInfo> {
-    return this.extendTimeout(ms, options);
-  }
-
   async refresh(options: { signal?: AbortSignal } = {}): Promise<SandboxInfo> {
     this.assertLive();
     const raw = await this.transport.unary<any, any>(
@@ -641,249 +541,6 @@ export class Sandbox {
   }
 
   /**
-   * Runs a command and returns once it exits.
-   *
-   * ```ts
-   * const install = await sandbox.runCommand("pip", ["install", "cowsay"]);
-   * console.log(install.exitCode, install.stdout());
-   * ```
-   *
-   * A bare string goes through `/bin/sh -c`, so pipes and redirection work.
-   * Once `args` are given the command is passed to execve directly, with no
-   * shell involved.
-   */
-  async runCommand(
-    command: string,
-    args?: string[],
-    options?: RunCommandOptions,
-  ): Promise<FinishedCommand>;
-  async runCommand(
-    params: RunCommandParams & { detached: true },
-  ): Promise<DetachedCommand>;
-  async runCommand(params: RunCommandParams): Promise<FinishedCommand>;
-  async runCommand(
-    first: string | RunCommandParams,
-    args?: string[],
-    options: RunCommandOptions = {},
-  ): Promise<FinishedCommand | DetachedCommand> {
-    const params: RunCommandParams =
-      typeof first === "string"
-        ? { ...options, cmd: first, args }
-        : { ...first };
-
-    // `stdout`/`stderr` are Writables, and the callbacks are the same thing
-    // one chunk at a time, so one is expressed in terms of the other.
-    if (params.stdout) {
-      const sink = params.stdout;
-      const previous = params.onStdout;
-      params.onStdout = (chunk) => {
-        previous?.(chunk);
-        sink.write(chunk);
-      };
-    }
-    if (params.stderr) {
-      const sink = params.stderr;
-      const previous = params.onStderr;
-      params.onStderr = (chunk) => {
-        previous?.(chunk);
-        sink.write(chunk);
-      };
-    }
-
-    const argv = params.args ?? [];
-    const shell = params.shell ?? argv.length === 0;
-    const command = shell
-      ? argv.length
-        ? [params.cmd, ...argv].join(" ")
-        : params.cmd
-      : [params.cmd, ...argv];
-
-    if (params.detached) return this.spawn(command, params);
-
-    const result = await this.exec(command, params);
-    return toFinished(result);
-  }
-
-  /**
-   * Starts a command and returns a handle without waiting for it.
-   *
-   * Used by `runCommand({ detached: true })`. The stream is started eagerly, so
-   * output produced before you read `logs()` is buffered rather than lost.
-   */
-  private async spawn(
-    command: string | string[],
-    options: RunCommandOptions,
-  ): Promise<DetachedCommand> {
-    const { output, commandId } = this.startExec(command, options, true);
-    const sandboxId = this.id;
-    // Awaited: a handle whose `cmdId` did not yet name the command is one
-    // another process could not use.
-    const cmdId = await commandId;
-
-    const chunks = (async function* () {
-      for await (const chunk of output) {
-        if (chunk.type === "stdout") options.onStdout?.(chunk.data);
-        else if (chunk.type === "stderr") options.onStderr?.(chunk.data);
-        yield chunk;
-      }
-    })();
-
-    // `logs()` and `wait()` drain the same iterator, so only the first of them
-    // gets anything; the second is refused rather than left empty.
-    let taken = false;
-    const take = () => {
-      if (taken) {
-        throw new BurrowError(
-          "this command's output has already been consumed",
-          "failed_precondition",
-        );
-      }
-      taken = true;
-      return chunks;
-    };
-
-    return {
-      sandboxId,
-      cmdId,
-      logs: () => take(),
-      // The same RPC `getCommand(...).kill()` uses: the command lives in the
-      // sandbox, not on this stream.
-      kill: (signal = 9) => this.killCommand(cmdId, signal),
-      killed: (signal = 9) => this.signalCommand(cmdId, signal),
-      wait: () => collect(take()),
-    };
-  }
-
-  /**
-   * Runs a command and returns once it exits.
-   *
-   * A string is run through `/bin/sh -c`, so pipes and redirection work; an
-   * array is passed to execve directly, with no shell involved.
-   *
-   * ```ts
-   * await sandbox.exec("pip install cowsay");
-   * await sandbox.exec(["python3", "-c", "print(1 + 1)"]);
-   * ```
-   */
-  async exec(
-    command: string | string[],
-    options: RunCommandOptions = {},
-  ): Promise<CommandResult> {
-    const run = async (): Promise<CommandResult> => {
-      // Auto-resume is handled here rather than in `execStream`: a stream that
-      // has already yielded cannot be restarted without replaying output.
-      const chunks = (async function* (stream: AsyncGenerator<OutputChunk>) {
-        for await (const chunk of stream) {
-          if (chunk.type === "stdout") options.onStdout?.(chunk.data);
-          else if (chunk.type === "stderr") options.onStderr?.(chunk.data);
-          yield chunk;
-        }
-      })(this.execStream(command, { ...options, autoResume: false }));
-      return gather(chunks);
-    };
-
-    const result = await this.withResume(run, options.autoResume ?? this.autoResume);
-    if (options.check && !result.success) {
-      throw new CommandFailedError(
-        Array.isArray(command) ? command.join(" ") : command,
-        result.exitCode,
-        result.stdout,
-        result.stderr,
-      );
-    }
-    return result;
-  }
-
-  /**
-   * Runs a command, yielding output as it is produced.
-   *
-   * ```ts
-   * for await (const chunk of sandbox.execStream("npm install")) {
-   *   if (chunk.type === "stdout") process.stdout.write(chunk.data);
-   * }
-   * ```
-   */
-  async *execStream(
-    command: string | string[],
-    options: RunCommandOptions = {},
-  ): AsyncGenerator<OutputChunk> {
-    yield* this.startExec(command, options).output;
-  }
-
-  /** Starts a command, returning its output and the id the guest gave it. */
-  private startExec(
-    command: string | string[],
-    options: RunCommandOptions,
-    keepOpen = false,
-  ): {
-    output: AsyncGenerator<OutputChunk>;
-    /** The id the guest gave the command; empty if the stream never named it. */
-    commandId: Promise<string>;
-  } {
-    this.assertLive();
-    const cmd = Array.isArray(command) ? command : ["/bin/sh", "-c", command];
-
-    const start = {
-      start: {
-        sandboxId: this.id,
-        cmd,
-        // A per-command variable wins over the handle's defaults, so one call
-        // can override what every other call inherits.
-        env: { ...this.env, ...(options.env ?? {}) },
-        cwd: options.cwd ?? "",
-        isPty: options.pty ?? false,
-        rows: options.rows ?? 24,
-        cols: options.cols ?? 80,
-        user: options.user ?? this.defaultUser,
-        // As Docker's `--log-opt max-size` and `max-file`. Unset keeps every
-        // byte the command prints.
-        logMaxBytes: options.logMaxBytes ?? 0,
-        logMaxFiles: options.logMaxFiles ?? 0,
-      },
-    };
-
-    const { call, output } = this.node().openStream<any>(
-      "Exec",
-      start,
-      options.timeoutMs,
-      options.signal,
-    );
-    // Either way the command sees an empty stdin: `isStdinEof` closes the
-    // child's stdin without closing the request side, which a detached command
-    // keeps open.
-    if (keepOpen) call.write({ isStdinEof: true });
-    else call.end();
-
-    // The guest names the command before anything else. Pulled here rather
-    // than inside the generator below, which nothing iterates until the caller
-    // asks for output: a detached command's id has to exist before then.
-    const first = output.next();
-    const commandId = first.then((result) =>
-      !result.done && result.value?.output === "commandId"
-        ? String(result.value.commandId ?? "")
-        : // A stream that failed or ended before naming anything. The command
-          // may still have run; there is simply no id to come back to it with.
-          "",
-    );
-
-    const chunks = (async function* (): AsyncGenerator<OutputChunk> {
-      const chunker = new Chunker();
-      const opening = await first;
-      if (opening.done) return;
-      // An older agent starts straight in on output, with no id at all.
-      if (opening.value?.output !== "commandId") yield* chunker.feed(opening.value);
-      for await (const msg of output) {
-        // Only ever the first message, but an agent that repeated it must not
-        // put an empty chunk into the caller's stream.
-        if (msg.output === "commandId") continue;
-        yield* chunker.feed(msg);
-      }
-    })();
-
-    return { output: chunks, commandId };
-  }
-
-  /**
    * Lists the commands this sandbox has run, oldest first.
    *
    * ```ts
@@ -906,38 +563,36 @@ export class Sandbox {
   }
 
   /**
-   * Reattaches to a command by id, from anywhere.
+   * Reaches a command by id, from anywhere, as a {@link ChildProcess}.
    *
    * ```ts
-   * const command = await sandbox.getCommand(cmdId);
-   * for await (const chunk of command.logs()) process.stdout.write(chunk.data);
+   * const child = await sandbox.getCommand(cmdId);
+   * child.stdout.pipe(process.stdout);
+   * child.stdin.write("more input\n");
    * ```
    *
    * The command need not have been started by this process: it lives in the
-   * sandbox, and so does every byte it has printed. `logs()` replays from
-   * `fromOffset`, counting stdout and stderr bytes together from the command's
-   * start, and then follows the command live; a reader that saw N bytes
-   * passes N and gets only what came after. `sendStdin` feeds a running
-   * command, a shell whose original stream is long gone included. Several
-   * readers may follow one command at once. Throws `not_found` when the id
-   * names nothing, a pruned command included.
+   * sandbox, and so does every byte it has printed. Its output is replayed
+   * from `fromOffset`, counting stdout and stderr bytes together from the
+   * command's start, and then followed live; a reader that saw N bytes
+   * passes N and gets only what came after. `stdin` feeds the running
+   * command, a shell whose original stream is long gone included, and
+   * `kill()` signals it. Several readers may follow one command at once.
+   * Throws `not_found` when the id names nothing, a pruned command included.
    */
   async getCommand(
     cmdId: string,
     options: { signal?: AbortSignal; fromOffset?: number } = {},
-  ): Promise<DetachedCommand & { info: CommandInfo }> {
+  ): Promise<ChildProcess> {
     this.assertLive();
-    // Read first, so a bad id fails here rather than on the first `logs()`.
+    // Read first, so a bad id fails here rather than as an `error` event.
     const raw = await this.transport.unary<any, any>(
       "GetCommand",
       { sandboxId: this.id, commandId: cmdId },
       undefined,
       options.signal,
     );
-    return {
-      ...this.commandHandle(cmdId, options.fromOffset ?? 0),
-      info: toCommandInfo(raw),
-    };
+    return attach(this.link, cmdId, options.fromOffset ?? 0, toCommandInfo(raw).cmd);
   }
 
   /**
@@ -969,80 +624,24 @@ export class Sandbox {
   }
 
   /**
-   * A handle onto a command that already exists in the sandbox. Every method
-   * opens its own call, so `logs()` and `wait()` do not compete for one stream
-   * the way a locally started detached command's do.
-   */
-  private commandHandle(cmdId: string, fromOffset = 0): DetachedCommand {
-    const start = (offset: number) => ({
-      start: { sandboxId: this.id, commandId: cmdId, fromOffset: offset },
-    });
-    const attach = (): AsyncGenerator<OutputChunk> => {
-      // A command outlives any request deadline.
-      const { call, output } = this.node().openStream<any>("Attach", start(fromOffset), Infinity);
-      return (async function* () {
-        const chunker = new Chunker();
-        try {
-          for await (const msg of output) yield* chunker.feed(msg);
-        } finally {
-          call.cancel();
-        }
-      })();
-    };
-
-    // Input goes over a call of its own, opened on the first write. It asks
-    // for output from past anything the command could have printed, so
-    // nothing is replayed down it, and what follows live is dropped.
-    let feeder: any;
-    const feed = (message: unknown) => {
-      if (!feeder) {
-        feeder = this.node().duplex("Attach");
-        feeder.on("data", () => {});
-        feeder.on("error", () => {});
-        feeder.write(start(Number.MAX_SAFE_INTEGER));
-      }
-      feeder.write(message);
-    };
-
-    return {
-      sandboxId: this.id,
-      cmdId,
-      logs: attach,
-      kill: (signal = 9) => this.killCommand(cmdId, signal),
-      killed: (signal = 9) => this.signalCommand(cmdId, signal),
-      wait: () => collect(attach()),
-      sendStdin: (data) =>
-        feed({ stdin: typeof data === "string" ? Buffer.from(data, "utf8") : data }),
-      closeStdin: () => feed({ isStdinEof: true }),
-    };
-  }
-
-  /**
-   * Signals a command and resolves once the node has delivered it. The
-   * awaitable half of `kill()`: every refusal is visible here.
-   */
-  private async signalCommand(cmdId: string, signal: number): Promise<void> {
-    await this.transport.unary("SignalCommand", {
-      sandboxId: this.id,
-      commandId: cmdId,
-      signal,
-    });
-  }
-
-  /**
-   * Fire-and-forget signal, so `kill()` stays synchronous.
+   * Signals a command and resolves once the node has delivered it.
    *
-   * Only one outcome is swallowed: the command had already exited, which is
-   * what kill wanted anyway. Every other failure is left to reject, because a
-   * sandbox tightened to deny exec refuses signals too, and silently doing
-   * nothing there is indistinguishable from having killed it. Await
-   * `killed()` to handle those rather than take an unhandled rejection.
+   * Only one refusal is swallowed: the command had already exited, which is
+   * what kill wanted anyway. Every other failure rejects, because a sandbox
+   * tightened to deny exec refuses signals too, and silently doing nothing
+   * there is indistinguishable from having killed it.
    */
-  private killCommand(cmdId: string, signal: number): void {
-    void this.signalCommand(cmdId, signal).catch((err: unknown) => {
+  private async killCommand(cmdId: string, signal: number): Promise<void> {
+    try {
+      await this.transport.unary("SignalCommand", {
+        sandboxId: this.id,
+        commandId: cmdId,
+        signal,
+      });
+    } catch (err) {
       if (err instanceof BurrowError && err.isAlreadyExited) return;
       throw err;
-    });
+    }
   }
 
   /**
@@ -1050,7 +649,7 @@ export class Sandbox {
    *
    * ```ts
    * const alice = await sandbox.createUser("alice");
-   * await sandbox.runCommand({ cmd: "whoami", user: alice.username });
+   * await sandbox.childProcess.exec("whoami", { user: alice.username });
    * ```
    *
    * The home is 0700, so one agent's files are not readable by another's.
@@ -1139,17 +738,18 @@ export class Sandbox {
   }
 
   /**
-   * A handle onto the same sandbox whose commands run as `name`.
+   * A handle onto the same sandbox that acts as `name`.
    *
    * ```ts
    * const alice = sandbox.asUser("alice");
-   * await alice.runCommand("touch ~/notes.txt");
+   * await alice.childProcess.exec("touch ~/notes.txt");
+   * await alice.fs.writeFile("/home/alice/todo.txt", "ship it\n");
    * ```
    *
-   * Commands, terminals and `mkDir` run as the user, and `writeFile` hands
-   * what it wrote to them. Reads are not confined: `readFile` and `listDir`
-   * are served by the guest agent as root, so a user handle can still read a
-   * file its user could not. The user has to exist already.
+   * Commands and terminals run as the user, and every `fs` call is made as
+   * them, so the guest kernel refuses what the user could not do and what
+   * they create is theirs. `fs.watch` is the exception: the guest scans as
+   * root. The user has to exist already.
    */
   asUser(name: string): Sandbox {
     this.assertLive();
@@ -1167,414 +767,13 @@ export class Sandbox {
   }
 
   /**
-   * Command helpers grouped, for parity with SDKs that namespace them:
-   * `run`, `stream`, `list`, `connect` (reattach by id) and `kill`.
-   */
-  get commands() {
-    return {
-      run: this.exec.bind(this),
-      stream: this.execStream.bind(this),
-      list: this.listCommands.bind(this),
-      connect: this.getCommand.bind(this),
-      kill: async (cmdId: string, signal = 9): Promise<void> => {
-        const command = await this.getCommand(cmdId);
-        await command.killed(signal);
-      },
-    };
-  }
-
-  /** The terminal under the name other SDKs give it: `sandbox.pty.create()`. */
-  get pty() {
-    return { create: this.terminal.bind(this) };
-  }
-
-  /**
    * Opens an interactive shell with a pty, for when input arrives over time
    * (a browser terminal, an agent driving a REPL). For a command that runs to
-   * completion, use {@link runCommand}.
+   * completion, use `childProcess.exec`.
    */
   terminal(options: TerminalOptions = {}): Terminal {
     this.assertLive();
-    return new Terminal(this.node(), this.id, options);
-  }
-
-  /**
-   * Writes files, creating parent directories as needed.
-   *
-   * ```ts
-   * await sandbox.writeFiles([
-   *   { path: "/work/app.py", content: "print('hi')\n" },
-   *   { path: "/work/run.sh", content: "python3 app.py\n", mode: 0o755 },
-   * ]);
-   * ```
-   */
-  async writeFiles(
-    files: ReadonlyArray<FileWrite>,
-    options: { signal?: AbortSignal } = {},
-  ): Promise<void> {
-    for (const file of files) {
-      const content = file.content ?? file.contents ?? "";
-      await this.writeFile(file.path, content, {
-        mode: file.mode,
-        signal: options.signal,
-      });
-    }
-  }
-
-  /** Writes a single file, creating parent directories as needed. */
-  async writeFile(
-    path: string,
-    contents: string | Uint8Array,
-    options: { mode?: number; signal?: AbortSignal } = {},
-  ): Promise<number> {
-    this.assertLive();
-    const bytes =
-      typeof contents === "string" ? Buffer.from(contents, "utf8") : contents;
-
-    const chunks: any[] = [];
-    for (let offset = 0; offset < bytes.length || chunks.length === 0; ) {
-      const end = Math.min(offset + UPLOAD_CHUNK, bytes.length);
-      chunks.push({
-        // Only the first chunk names the destination.
-        sandboxId: chunks.length === 0 ? this.id : "",
-        path: chunks.length === 0 ? path : "",
-        mode: chunks.length === 0 ? (options.mode ?? 0) : 0,
-        data: bytes.subarray(offset, end),
-      });
-      offset = end;
-    }
-
-    const res = await this.withResume(() =>
-      this.node().pipeUnary<any, any>(
-        "UploadFile",
-        chunks,
-        undefined,
-        options.signal,
-      ),
-    );
-    // The agent writes as root, so a handle from `asUser` has to hand the
-    // file over or the user could not touch what it wrote.
-    if (this.defaultUser) {
-      // `user: ""` is root: the user being handed the file cannot be the one
-      // handing it over.
-      await this.exec(["/bin/chown", this.defaultUser, "--", path], {
-        user: "",
-      });
-    }
-    return Number(res.bytesWritten ?? 0);
-  }
-
-  /**
-   * Reads a file.
-   *
-   * `readFile("/work/out.txt")` returns the contents as a string.
-   * `readFile({ path })` returns a readable stream, or `null` when the file
-   * does not exist, which is the shape a large download wants.
-   */
-  async readFile(path: string): Promise<string>;
-  async readFile(params: FileRef): Promise<Readable | null>;
-  async readFile(target: string | FileRef): Promise<string | Readable | null> {
-    if (typeof target === "string") {
-      return Buffer.from(await this.readFileBytes(target)).toString("utf8");
-    }
-    const stream = await this.openFile(target);
-    return stream && Readable.from(stream);
-  }
-
-  /** Reads a file as a `Buffer`, or `null` when it does not exist. */
-  async readFileToBuffer(target: string | FileRef): Promise<Buffer | null> {
-    const params: FileRef =
-      typeof target === "string" ? { path: target } : target;
-    const stream = await this.openFile(params);
-    if (!stream) return null;
-    const parts: Buffer[] = [];
-    for await (const chunk of stream) parts.push(chunk);
-    return Buffer.concat(parts);
-  }
-
-  /**
-   * Copies a file out of the sandbox onto the local filesystem.
-   *
-   * Returns the absolute path it was written to, or `null` when the sandbox
-   * has no such file. Parent directories are created unless you say otherwise.
-   *
-   * ```ts
-   * const path = await sandbox.downloadFile("/work/out.txt", "./out.txt");
-   * ```
-   */
-  async downloadFile(
-    src: string,
-    dst: string,
-    options: DownloadFileOptions = {},
-  ): Promise<string | null> {
-    const stream = await this.openFile({ path: src, signal: options.signal });
-    if (!stream) return null;
-
-    const destination = resolvePath(dst);
-    if (options.mkdirRecursive !== false) {
-      await mkdir(dirname(destination), { recursive: true });
-    }
-    // Streamed rather than buffered: a download is exactly the case where the
-    // file is too big to want in memory.
-    await pipeline(Readable.from(stream), createWriteStream(destination));
-    return destination;
-  }
-
-  /** Reads a file as raw bytes. Throws when it does not exist. */
-  async readFileBytes(
-    path: string,
-    options: { signal?: AbortSignal } = {},
-  ): Promise<Uint8Array> {
-    this.assertLive();
-    const parts: Buffer[] = [];
-    await this.withResume(async () => {
-      parts.length = 0;
-      for await (const chunk of this.node().serverStream<any, any>(
-        "DownloadFile",
-        { sandboxId: this.id, path },
-        undefined,
-        options.signal,
-      )) {
-        if (chunk.data?.length) parts.push(Buffer.from(chunk.data));
-      }
-    });
-    return Buffer.concat(parts);
-  }
-
-  /**
-   * Starts a download, returning `null` if the file is missing.
-   *
-   * The first chunk is pulled eagerly because that is when the server reports
-   * a missing file, and a `null` return has to be decided up front.
-   */
-  private async openFile(
-    params: FileRef,
-  ): Promise<AsyncGenerator<Buffer> | null> {
-    this.assertLive();
-    const open = async () => {
-      const source = this.node().serverStream<any, any>(
-        "DownloadFile",
-        { sandboxId: this.id, path: params.path },
-        undefined,
-        params.signal,
-      );
-      const first = await source.next();
-      return { source, first };
-    };
-
-    let started: Awaited<ReturnType<typeof open>>;
-    try {
-      started = await this.withResume(open);
-    } catch (err) {
-      if (err instanceof BurrowError && err.code === "not_found") return null;
-      throw err;
-    }
-
-    const { source, first } = started;
-    return (async function* () {
-      if (!first.done && first.value?.data?.length) {
-        yield Buffer.from(first.value.data);
-      }
-      for await (const chunk of source) {
-        if (chunk.data?.length) yield Buffer.from(chunk.data);
-      }
-    })();
-  }
-
-  /** Lists a directory. */
-  async listDir(
-    path: string,
-    options: { signal?: AbortSignal } = {},
-  ): Promise<DirEntry[]> {
-    this.assertLive();
-    const res = await this.withResume(() =>
-      this.node().unary<any, any>(
-        "ListDir",
-        { sandboxId: this.id, path },
-        undefined,
-        options.signal,
-      ),
-    );
-    return (res.entries ?? []).map((e: any) => ({
-      name: e.name,
-      isDir: Boolean(e.isDir),
-      size: Number(e.size ?? 0),
-      mode: Number(e.mode ?? 0),
-    }));
-  }
-
-  /**
-   * Creates a directory.
-   *
-   * There is no mkdir RPC, so this runs `mkdir -p` in the sandbox: it costs
-   * one exec and fails the way a command does rather than the way an RPC does.
-   */
-  async mkDir(
-    path: string,
-    options: { recursive?: boolean } = {},
-  ): Promise<void> {
-    const flag = options.recursive === false ? "" : "-p ";
-    const res = await this.exec(`mkdir ${flag}${shellQuote(path)}`);
-    if (!res.success) {
-      throw new BurrowError(
-        `mkdir ${path} failed: ${res.stderr.trim()}`,
-        "internal",
-      );
-    }
-  }
-
-  /** Alias of {@link mkDir}, kept for callers written against it. */
-  mkdir(path: string, options: { recursive?: boolean } = {}): Promise<void> {
-    return this.mkDir(path, options);
-  }
-
-  /**
-   * Removes a file or directory tree. Like {@link mkDir} this runs a command
-   * (`rm -rf`) in the sandbox, since there is no remove RPC, and a missing
-   * path is not an error.
-   */
-  async remove(path: string): Promise<void> {
-    const res = await this.exec(`rm -rf ${shellQuote(path)}`);
-    if (!res.success) {
-      throw new BurrowError(`rm ${path} failed: ${res.stderr.trim()}`, "internal");
-    }
-  }
-
-  /** Renames or moves a file or directory, by running `mv` in the sandbox. */
-  async rename(from: string, to: string): Promise<void> {
-    const res = await this.exec(`mv ${shellQuote(from)} ${shellQuote(to)}`);
-    if (!res.success) {
-      throw new BurrowError(`mv ${from} ${to} failed: ${res.stderr.trim()}`, "internal");
-    }
-  }
-
-  /**
-   * Describes one path, or returns `null` when nothing is there. Lists the
-   * parent directory over the `ListDir` RPC, so it respects the sandbox's
-   * file policy and costs no exec.
-   */
-  async stat(path: string, options: { signal?: AbortSignal } = {}): Promise<FileInfo | null> {
-    const trimmed = path.replace(/\/+$/, "") || "/";
-    if (trimmed === "/") {
-      return { path: "/", name: "/", isDir: true, size: 0, mode: 0o755, type: "dir" };
-    }
-    const slash = trimmed.lastIndexOf("/");
-    const parent = slash <= 0 ? "/" : trimmed.slice(0, slash);
-    const name = trimmed.slice(slash + 1);
-    let entries: DirEntry[];
-    try {
-      entries = await this.listDir(parent, options);
-    } catch (err) {
-      if (err instanceof BurrowError && err.code === "not_found") return null;
-      throw err;
-    }
-    const entry = entries.find((e) => e.name === name);
-    if (!entry) return null;
-    return { ...entry, path: trimmed, type: entry.isDir ? "dir" : "file" };
-  }
-
-  /** Whether a path exists. See {@link stat}. */
-  async exists(path: string, options: { signal?: AbortSignal } = {}): Promise<boolean> {
-    return (await this.stat(path, options)) !== null;
-  }
-
-  /**
-   * The file methods under the `node:fs/promises` names and shapes, so code
-   * written against the real module reads the same here: `readFile`,
-   * `writeFile`, `readdir`, `mkdir`, `rm`, `rename` and `stat`. As in Node,
-   * `stat` on a missing path throws (`not_found`) and `rm` refuses a directory
-   * without `recursive` and a missing path without `force`.
-   */
-  get fs() {
-    return {
-      readFile: this.readFile.bind(this) as Sandbox["readFile"],
-      writeFile: this.writeFile.bind(this),
-      readdir: this.listDir.bind(this),
-      mkdir: this.mkDir.bind(this),
-      rm: async (
-        path: string,
-        options: { recursive?: boolean; force?: boolean } = {},
-      ): Promise<void> => {
-        const flags = `${options.recursive ? "r" : ""}${options.force ? "f" : ""}`;
-        const res = await this.exec(`rm ${flags ? `-${flags} ` : ""}${shellQuote(path)}`);
-        if (!res.success) {
-          throw new BurrowError(`rm ${path} failed: ${res.stderr.trim()}`, "internal");
-        }
-      },
-      rename: this.rename.bind(this),
-      stat: async (path: string, options: { signal?: AbortSignal } = {}): Promise<FileInfo> => {
-        const info = await this.stat(path, options);
-        if (!info) throw new BurrowError(`no such file or directory: ${path}`, "not_found");
-        return info;
-      },
-    };
-  }
-
-  /**
-   * Watches a directory for changes.
-   *
-   * The guest polls and reports differences, so an edit is seen within roughly
-   * `intervalMs` and a file created and removed between two scans is not seen
-   * at all.
-   *
-   * ```ts
-   * const watcher = await sandbox.watch("/work/src", {
-   *   recursive: true,
-   *   onEvent: (e) => console.log(e.type, e.path),
-   * });
-   * // ...later
-   * watcher.stop();
-   * ```
-   */
-  async watch(path: string, options: WatchOptions = {}): Promise<Watcher> {
-    this.assertLive();
-    const stream = this.node().serverStream<any, any>(
-      "Watch",
-      {
-        sandboxId: this.id,
-        path,
-        isRecursive: options.recursive ?? false,
-        intervalMs: options.intervalMs ?? 0,
-      },
-      // Watches outlive any request deadline.
-      Infinity,
-    );
-
-    let stopped = false;
-    const events: AsyncGenerator<WatchEvent> = (async function* () {
-      try {
-        for await (const raw of stream) {
-          if (stopped) return;
-          yield {
-            type: raw.type as WatchEvent["type"],
-            path: raw.path,
-            isDir: Boolean(raw.isDir),
-          };
-        }
-      } catch (err) {
-        if (!stopped) throw err;
-      }
-    })();
-
-    // Callback style drives the iterator in the background; iterator style
-    // hands it to the caller. Both stop the same way.
-    if (options.onEvent) {
-      void (async () => {
-        try {
-          for await (const event of events) options.onEvent!(event);
-        } catch (err) {
-          options.onError?.(err as Error);
-        }
-      })();
-    }
-
-    return {
-      stop() {
-        stopped = true;
-        void events.return(undefined as never);
-      },
-      [Symbol.asyncIterator]: () => events,
-    };
+    return new Terminal(this.node(), this.id, { user: this.defaultUser, ...options });
   }
 
   /**
@@ -1718,43 +917,6 @@ export class Sandbox {
   }
 
   /**
-   * Updates tags, the network policy, the access policy, or any combination.
-   *
-   * Each section named is replaced wholesale rather than merged, so one call
-   * is enough to lock a sandbox down or to retag it, and a section not named
-   * is left alone. The machine shape is not updatable: a restore takes it from
-   * the snapshot.
-   *
-   * ```ts
-   * await sandbox.update({
-   *   tags: { owner: "ci", run: "482" },
-   *   networkPolicy: { mode: "allowlist", allowDomains: ["api.github.com"] },
-   *   exec: { allowExec: false },
-   * });
-   * ```
-   */
-  async update(options: UpdateOptions): Promise<SandboxInfo> {
-    const network = options.networkPolicy ?? options.network;
-    if (options.tags) {
-      await this.updateTags(options.tags, { signal: options.signal });
-    }
-    if (network !== undefined) {
-      await this.updateNetworkPolicy(network, { signal: options.signal });
-    }
-    if (options.exec !== undefined || options.fs !== undefined) {
-      await this.updateAccessPolicy(options, { signal: options.signal });
-    }
-    if (
-      options.maxLifetimeSecs !== undefined ||
-      options.idleSuspendSecs !== undefined ||
-      options.suspendedTtlSecs !== undefined
-    ) {
-      await this.updateResources(options);
-    }
-    return this.info;
-  }
-
-  /**
    * Moves the clocks the sandbox is measured against.
    *
    * An omitted field is left where it is, which is what lets `0` keep meaning
@@ -1781,27 +943,6 @@ export class Sandbox {
     );
     this.info = toSandboxInfo(raw);
     return this.info;
-  }
-
-  /**
-   * Gives the sandbox `ms` more milliseconds of life, from when it was created.
-   *
-   * The familiar spelling of `update({ maxLifetimeSecs })`. Burrow measures a
-   * lifetime from creation rather than from now, so this sets a total rather
-   * than adding to what is left: pass the whole budget.
-   *
-   * ```ts
-   * await sandbox.extendTimeout(60 * 60 * 1000); // an hour from its creation
-   * ```
-   */
-  async extendTimeout(
-    ms: number,
-    options: { signal?: AbortSignal } = {},
-  ): Promise<SandboxInfo> {
-    return this.updateResources({
-      maxLifetimeSecs: Math.ceil(ms / 1000),
-      signal: options.signal,
-    });
   }
 
   /** Replaces the sandbox's tags. An empty map clears them. */
@@ -1911,11 +1052,6 @@ export class Sandbox {
     );
     this.info = toSandboxInfo(raw);
     return this.info;
-  }
-
-  /** The same thing under its original name. */
-  pause(options: { signal?: AbortSignal } = {}): Promise<SandboxInfo> {
-    return this.stop(options);
   }
 
   /**
@@ -2150,16 +1286,6 @@ export class Sandbox {
     }
   }
 
-  /**
-   * Destroys the sandbox.
-   *
-   * @deprecated Use {@link delete}. Note that {@link stop} suspends rather than
-   * destroys, so it is not the replacement.
-   */
-  kill(): Promise<void> {
-    return this.delete();
-  }
-
   /** Releases the connection without destroying the sandbox. */
   close(): void {
     if (this.owned) this.transport.close();
@@ -2179,7 +1305,7 @@ export class Sandbox {
 
 /** Builds a `ForkSandboxRequest`. An omitted policy inherits the source's. */
 function toForkRequest(source: string, options: ForkOptions): any {
-  const network = options.networkPolicy ?? options.network;
+  const network = options.networkPolicy;
   const stated =
     network !== undefined ||
     options.networks !== undefined ||
@@ -2206,95 +1332,6 @@ function toForkRequest(source: string, options: ForkOptions): any {
     name: options.name ?? "",
     policy,
     nodeLabels: options.nodeLabels ?? {},
-  };
-}
-
-/**
- * Turns one command's `ExecOutput` messages into the SDK's chunks.
- *
- * Shared by a running exec and a later attach. Each stream is decoded by a
- * decoder of its own that holds a partial character over to the next message,
- * so text split mid-character arrives whole; the bytes go along untouched. The
- * oneof tag is checked rather than the fields: proto defaults give every
- * message an `exitCode` of 0 and empty byte fields.
- */
-class Chunker {
-  private readonly decoders = {
-    stdout: new TextDecoder("utf-8"),
-    stderr: new TextDecoder("utf-8"),
-  };
-  private signal = 0;
-
-  *feed(msg: any): Generator<OutputChunk> {
-    if (msg.output === "stdout" || msg.output === "stderr") {
-      const type: "stdout" | "stderr" = msg.output;
-      const raw = new Uint8Array(msg[type] ?? []);
-      if (raw.length) {
-        yield { type, data: this.decoders[type].decode(raw, { stream: true }), raw };
-      }
-    } else if (msg.output === "exitSignal") {
-      this.signal = Number(msg.exitSignal ?? 0);
-    } else if (msg.output === "lostBytes") {
-      yield { type: "lost", lostBytes: Number(msg.lostBytes ?? 0) };
-    } else if (msg.output === "exitCode") {
-      // What a decoder still held was the start of a character that never
-      // finished; it is said as such, before the exit.
-      for (const type of ["stdout", "stderr"] as const) {
-        const rest = this.decoders[type].decode();
-        if (rest) yield { type, data: rest, raw: new Uint8Array() };
-      }
-      yield { type: "exit", exitCode: Number(msg.exitCode ?? 0), exitSignal: this.signal };
-    }
-  }
-}
-
-/** Drains a command's output into its result, text and bytes both. */
-async function gather(chunks: AsyncIterable<OutputChunk>): Promise<CommandResult> {
-  let stdout = "";
-  let stderr = "";
-  const stdoutBytes: Uint8Array[] = [];
-  const stderrBytes: Uint8Array[] = [];
-  let exitCode = 0;
-  let exitSignal = 0;
-  for await (const chunk of chunks) {
-    if (chunk.type === "stdout") {
-      stdout += chunk.data;
-      stdoutBytes.push(chunk.raw);
-    } else if (chunk.type === "stderr") {
-      stderr += chunk.data;
-      stderrBytes.push(chunk.raw);
-    } else if (chunk.type === "exit") {
-      exitCode = chunk.exitCode;
-      exitSignal = chunk.exitSignal;
-    }
-  }
-  return {
-    stdout,
-    stderr,
-    exitCode,
-    success: exitCode === 0,
-    exitSignal,
-    stdoutBytes: Buffer.concat(stdoutBytes),
-    stderrBytes: Buffer.concat(stderrBytes),
-  };
-}
-
-/** Drains a command's output into the result a finished command reports. */
-async function collect(
-  chunks: AsyncIterable<OutputChunk>,
-): Promise<FinishedCommand> {
-  return toFinished(await gather(chunks));
-}
-
-function toFinished(result: CommandResult): FinishedCommand {
-  return {
-    exitCode: result.exitCode,
-    success: result.success,
-    exitSignal: result.exitSignal,
-    stdout: () => result.stdout,
-    stderr: () => result.stderr,
-    stdoutBytes: () => result.stdoutBytes,
-    stderrBytes: () => result.stderrBytes,
   };
 }
 
@@ -2326,11 +1363,6 @@ function toPort(raw: any, fallbackHost: string): PortMapping {
   };
 }
 
-/** Quotes a path for `sh -c`. */
-function shellQuote(value: string): string {
-  return `'${value.replace(/'/g, `'\\''`)}'`;
-}
-
 /**
  * A connection to a burrow control plane, for listing or reattaching to
  * sandboxes over one channel. {@link Sandbox.create} is the shortcut when you
@@ -2346,32 +1378,6 @@ export class Burrow {
   async health(): Promise<{ version: string }> {
     const res = await this.transport.unary<any, any>("Health", {});
     return { version: res.version ?? "" };
-  }
-
-  async create(options: CreateOptions = {}): Promise<Sandbox> {
-    const raw = await this.transport.unary<any, any>(
-      "CreateSandbox",
-      toCreateRequest(options),
-      options.timeoutMs ?? 120_000,
-      options.signal,
-    );
-    return Sandbox.adopt(this.transport, raw);
-  }
-
-  /** Lists sandboxes, optionally filtered by one `"key=value"` tag. */
-  async list(options: ListOptions = {}): Promise<SandboxInfo[]> {
-    const res = await this.transport.unary<any, any>(
-      "ListSandboxes",
-      { tag: options.tag ?? "" },
-      undefined,
-      options.signal,
-    );
-    return (res.sandboxes ?? []).map(toSandboxInfo);
-  }
-
-  async get(id: string): Promise<Sandbox> {
-    const raw = await this.transport.unary<any, any>("GetSandbox", { id });
-    return Sandbox.adopt(this.transport, raw);
   }
 
   /**

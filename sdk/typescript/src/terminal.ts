@@ -10,12 +10,14 @@ export interface TerminalOptions {
   cwd?: string;
   rows?: number;
   cols?: number;
+  /** Guest user to run as. Defaults to the handle's: root, or the {@link Sandbox.asUser} one. */
+  user?: string;
 }
 
 /**
  * A live shell in a sandbox.
  *
- * Unlike {@link Sandbox.exec}, the input side stays open: the caller writes
+ * Unlike `childProcess.exec`, the input side stays open: the caller writes
  * keystrokes and resizes as they happen. That is what makes this usable behind
  * a WebSocket, where a browser terminal is on the other end.
  *
@@ -73,6 +75,7 @@ export class Terminal {
         isPty: true,
         rows: options.rows ?? 24,
         cols: options.cols ?? 80,
+        user: options.user ?? "",
       },
     });
   }

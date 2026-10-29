@@ -74,7 +74,9 @@ The same operations are available from the `burrow` CLI and the
 from burrow import Sandbox
 
 with Sandbox.create(template="python-3.12-slim") as sandbox:
-    result = sandbox.run_command("python3", ["-c", "print(1 + 1)"])
+    result = sandbox.subprocess.run(
+        ["python3", "-c", "print(1 + 1)"], capture_output=True, text=True
+    )
     print(result.stdout)  # "2\n"
 ```
 

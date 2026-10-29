@@ -72,23 +72,3 @@ export class BurrowError extends Error {
     return this.code === "failed_precondition" && !this.isSuspended;
   }
 }
-
-/** Thrown by `commands.run` when a command exits non-zero and `check` is set. */
-export class CommandFailedError extends BurrowError {
-  readonly exitCode: number;
-  readonly stdout: string;
-  readonly stderr: string;
-
-  constructor(command: string, exitCode: number, stdout: string, stderr: string) {
-    super(
-      `command exited with ${exitCode}: ${command}${
-        stderr.trim() ? `\n${stderr.trim()}` : ""
-      }`,
-      "internal",
-    );
-    this.name = "CommandFailedError";
-    this.exitCode = exitCode;
-    this.stdout = stdout;
-    this.stderr = stderr;
-  }
-}

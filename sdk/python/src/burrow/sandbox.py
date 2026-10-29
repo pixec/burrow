@@ -2,16 +2,16 @@
 
 from __future__ import annotations
 
-import codecs
-import os
-import queue
 import threading
 import time
 from datetime import datetime
-from typing import Any, Callable, Dict, Iterator, List, Optional, Sequence, Union
+from typing import Any, Callable, Dict, Iterator, List, Optional, Sequence
 
 import grpc
 
+from ._fileio import open_file
+from ._os import SandboxOs, os_error
+from ._pathlib import SandboxPath
 from ._pb import api_pb2, common_pb2
 from ._policy import (
     from_policy,
@@ -23,21 +23,19 @@ from ._policy import (
     to_resource_policy,
     to_volume_mounts,
 )
+from ._shutil import SandboxShutil
+from ._subprocess import SandboxSubprocess
 from ._transport import _DEFAULT, Transport, transport_options as _transport_options
-from .errors import BurrowError, CommandFailedError
+from .errors import BurrowError
 from .snapshot import Snapshot
 from .terminal import Terminal
 from .types import (
     AuditEvent,
     CommandInfo,
-    CommandResult,
-    DirEntry,
-    FileInfo,
     GuestGroup,
     GuestUser,
     LifecycleEvent,
     NodeInfo,
-    OutputChunk,
     PortMapping,
     Share,
     SandboxInfo,
@@ -64,20 +62,6 @@ def _state_of(state: int) -> str:
         "failed",
     )
     return name if name in known else "unknown"
-
-
-def _status_of(state: str) -> str:
-    """The five-state view of a sandbox's lifecycle."""
-    if state == "creating":
-        return "pending"
-    if state in ("running", "stopping"):
-        return state
-    # All four are "not going to run anything until something is done".
-    if state in ("paused", "suspended", "stopped", "destroyed"):
-        return "stopped"
-    # `failed`, and any state a newer server reports that this client has no
-    # name for.
-    return "failed"
 
 
 def _to_sandbox_info(raw: common_pb2.Sandbox) -> SandboxInfo:
@@ -136,22 +120,12 @@ def _to_command_info(raw: api_pb2.CommandInfo) -> CommandInfo:
 
 
 def _to_create_request(options: Dict[str, Any]) -> api_pb2.CreateSandboxRequest:
-    """Builds a `CreateSandboxRequest` from the SDK's flatter options."""
-    network = options.get("network")
-    if network is None:
-        network = options.get("network_policy")
-    network = resolve_network(
-        network,
-        allow_domains=options.get("allow_domains"),
-        allow_cidrs=options.get("allow_cidrs"),
-    )
-    resources = options.get("resources") or {
-        "vcpus": options.get("vcpus"),
-        "memory_mib": options.get("memory_mib"),
-    }
+    """Builds a `CreateSandboxRequest`."""
+    network = resolve_network(options.get("network_policy"))
+    resources = options.get("resources") or {}
     # A snapshot carries its own template, and one that disagrees is an error,
     # so nothing is sent as if the caller had asked for it.
-    template = options.get("template") or options.get("image") or ""
+    template = options.get("template") or ""
     # Without a snapshot there is nothing to boot from, and a made-up
     # "default" would turn a missing argument into a not_found for a template
     # nobody named.
@@ -165,7 +139,7 @@ def _to_create_request(options: Dict[str, Any]) -> api_pb2.CreateSandboxRequest:
         name=options.get("name") or "",
         snapshot=options.get("snapshot") or "",
         template=template,
-        metadata=options.get("tags") or options.get("metadata") or {},
+        metadata=options.get("tags") or {},
         node_labels=options.get("node_labels") or {},
     )
     request.policy.resources.CopyFrom(to_resource_policy(resources))
@@ -206,9 +180,7 @@ def _to_fork_request(source: str, options: Dict[str, Any]) -> api_pb2.ForkSandbo
         name=options.get("name") or "",
         node_labels=options.get("node_labels") or {},
     )
-    network = options.get("network")
-    if network is None:
-        network = options.get("network_policy")
+    network = options.get("network_policy")
     stated = (
         network is not None
         or options.get("networks") is not None
@@ -230,75 +202,6 @@ def _to_fork_request(source: str, options: Dict[str, Any]) -> api_pb2.ForkSandbo
         if fs_policy is not None:
             request.policy.fs.CopyFrom(fs_policy)
     return request
-
-
-class _Chunker:
-    """Turns one command's `ExecOutput` messages into the SDK's chunks.
-
-    Shared by a running exec and a later attach. Each stream is decoded with a
-    decoder of its own that carries a partial character over to the next
-    message, so text split mid-character arrives whole; the bytes go along
-    untouched. The oneof tag is checked rather than the fields: proto defaults
-    give every message an exit code of 0 and empty byte fields.
-    """
-
-    def __init__(self) -> None:
-        self._decoders = {
-            "stdout": codecs.getincrementaldecoder("utf-8")("replace"),
-            "stderr": codecs.getincrementaldecoder("utf-8")("replace"),
-        }
-        self._signal = 0
-
-    def feed(self, msg: api_pb2.ExecOutput) -> Iterator[OutputChunk]:
-        kind = msg.WhichOneof("output")
-        if kind in ("stdout", "stderr"):
-            raw = getattr(msg, kind)
-            if raw:
-                text = self._decoders[kind].decode(raw)
-                yield OutputChunk(type=kind, data=text, raw=raw)
-        elif kind == "exit_signal":
-            self._signal = msg.exit_signal
-        elif kind == "lost_bytes":
-            yield OutputChunk(type="lost", lost_bytes=msg.lost_bytes)
-        elif kind == "exit_code":
-            # What a decoder still held was the start of a character that never
-            # finished; it is said as such, before the exit.
-            for name, decoder in self._decoders.items():
-                rest = decoder.decode(b"", final=True)
-                if rest:
-                    yield OutputChunk(type=name, data=rest)
-            yield OutputChunk(
-                type="exit", exit_code=msg.exit_code, exit_signal=self._signal
-            )
-
-
-def _collect(chunks: Iterator[OutputChunk]) -> CommandResult:
-    """Drains a command's output into the result a finished command reports."""
-    stdout: List[str] = []
-    stderr: List[str] = []
-    stdout_bytes: List[bytes] = []
-    stderr_bytes: List[bytes] = []
-    exit_code = 0
-    exit_signal = 0
-    for chunk in chunks:
-        if chunk.type == "stdout":
-            stdout.append(chunk.data)
-            stdout_bytes.append(chunk.raw)
-        elif chunk.type == "stderr":
-            stderr.append(chunk.data)
-            stderr_bytes.append(chunk.raw)
-        elif chunk.type == "exit":
-            exit_code = chunk.exit_code
-            exit_signal = chunk.exit_signal
-    return CommandResult(
-        stdout="".join(stdout),
-        stderr="".join(stderr),
-        exit_code=exit_code,
-        success=exit_code == 0,
-        exit_signal=exit_signal,
-        stdout_bytes=b"".join(stdout_bytes),
-        stderr_bytes=b"".join(stderr_bytes),
-    )
 
 
 def _to_share(raw: api_pb2.Share) -> Share:
@@ -329,117 +232,9 @@ def _to_port(raw: api_pb2.PortMapping, fallback_host: str) -> PortMapping:
     )
 
 
-def _shell_quote(value: str) -> str:
-    """Quotes a path for `sh -c`."""
-    quoted = value.replace("'", "'\\''")
-    return f"'{quoted}'"
-
-
-# Bytes per uploaded chunk, matching HTTP/2's default flow-control window.
-# Larger chunks showed no measurable gain: a message bigger than the window
-# stalls for WINDOW_UPDATE round trips rather than pipelining.
-_UPLOAD_CHUNK = 64 * 1024
-
 # How many times `Sandbox.get_or_create` looks before giving up. Only a lost
 # race gets this far, waiting on another caller's create to finish.
 _GET_OR_CREATE_ATTEMPTS = 10
-
-
-class DetachedCommand:
-    """A command started without waiting for it, or reattached by id."""
-
-    def __init__(
-        self,
-        sandbox_id: str,
-        cmd_id: str,
-        logs: Callable[[], Iterator[OutputChunk]],
-        signal: Callable[[str, int], None],
-        info: Optional[CommandInfo] = None,
-        release: Optional[Callable[[], None]] = None,
-        close: Optional[Callable[[], None]] = None,
-        write: Optional[Callable[[Any], None]] = None,
-    ):
-        self.sandbox_id = sandbox_id
-        self.cmd_id = cmd_id
-        self._logs = logs
-        self._signal = signal
-        self.info = info
-        # A spawned command holds its request stream open (see `_start_exec`).
-        # `release` ends the request side and leaves the output readable;
-        # `close` also cancels the call. Neither exists on a handle from
-        # `get_command`, which owns no stream.
-        self._release = release
-        self._close = close
-        self._write = write
-
-    def logs(self) -> Iterator[OutputChunk]:
-        """The command's output, replayed from what the guest holds and then
-        followed live."""
-        return self._logs()
-
-    def send_stdin(self, data: Union[str, bytes]) -> None:
-        """Writes to the command's stdin, or its terminal for a pty command.
-
-        Works on a handle from `get_command`, whichever process started the
-        command: a shell started elsewhere, or by a process that has since
-        gone, takes input here just the same.
-        """
-        if self._write is None:
-            raise BurrowError(
-                "this handle cannot feed the command; reattach with get_command",
-                "failed_precondition",
-            )
-        self._write(api_pb2.AttachInput(stdin=data.encode() if isinstance(data, str) else data))
-
-    def close_stdin(self) -> None:
-        """Ends the command's stdin, which a pipe command reads as EOF."""
-        if self._write is None:
-            raise BurrowError(
-                "this handle cannot feed the command; reattach with get_command",
-                "failed_precondition",
-            )
-        self._write(api_pb2.AttachInput(is_stdin_eof=True))
-
-    def wait(self) -> CommandResult:
-        """Drains the output and returns the result."""
-        return _collect(self.logs())
-
-    def kill(self, signal: int = 9) -> None:
-        """Signals the command.
-
-        Only one refusal is swallowed: the command had already exited, which is
-        what kill wanted anyway. Every other failure raises, because a sandbox
-        tightened to deny exec refuses signals too, and silently doing nothing
-        there is indistinguishable from having killed it.
-
-        The request side is released either way: a killed command is never
-        going to read stdin again, and leaving it open strands the thread
-        blocked on it. The output stays readable.
-        """
-        try:
-            self._signal(self.cmd_id, signal)
-        except BurrowError as err:
-            if not err.is_already_exited:
-                raise
-        finally:
-            if self._release is not None:
-                self._release()
-
-    def close(self) -> None:
-        """Releases the call without waiting for the command.
-
-        The command keeps running in the sandbox; this drops the client's half
-        of it, which a spawned command that is never drained would otherwise
-        hold for the life of the process. Safe to call more than once.
-        """
-        if self._close is not None:
-            self._close()
-
-    def __enter__(self) -> "DetachedCommand":
-        return self
-
-    def __exit__(self, *exc: Any) -> None:
-        self.close()
 
 
 class Watcher:
@@ -495,6 +290,13 @@ class Sandbox:
         self._on_resume: Optional[Callable[["Sandbox"], Any]] = None
         # Set by `delete`: a destroyed sandbox has nothing left to call.
         self._destroyed = False
+        # The stdlib's file and process APIs, against this sandbox: someone
+        # who knows `os`, `shutil`, `pathlib` and `subprocess` already knows
+        # these. Each acts as this handle's user.
+        self.os = SandboxOs(self)
+        self.shutil = SandboxShutil(self)
+        self.subprocess = SandboxSubprocess(self)
+        self.Path = type("Path", (SandboxPath,), {"__slots__": (), "_sandbox": self})
 
     def _assert_live(self) -> None:
         """Refuses a call on a deleted sandbox. `delete` released the
@@ -539,7 +341,7 @@ class Sandbox:
         sandbox = Sandbox.get_or_create(
             name="build-482",
             template="python-tools",
-            on_create=lambda s: s.write_files([{"path": "/work/app.py", "content": src}]),
+            on_create=lambda s: s.Path("/work/app.py").write_text(src),
         )
         ```
 
@@ -565,7 +367,7 @@ class Sandbox:
                 sandbox = Sandbox.get(key, **options)
                 sandbox._env = options.get("env") or {}
                 sandbox._on_resume = options.get("on_resume")
-                if options.get("resume") and sandbox.status == "stopped":
+                if options.get("resume") and sandbox.state in ("paused", "suspended"):
                     sandbox.resume()
                 return sandbox
             except BurrowError as err:
@@ -617,11 +419,6 @@ class Sandbox:
             raise
 
     @staticmethod
-    def connect(ref: str, **options: Any) -> "Sandbox":
-        """Reattaches to an existing sandbox by id. Alias of `Sandbox.get`."""
-        return Sandbox.get(ref, **options)
-
-    @staticmethod
     def list(tag: str = "", **options: Any) -> List["Sandbox"]:
         """Lists sandboxes, newest state first.
 
@@ -645,30 +442,6 @@ class Sandbox:
         finally:
             transport.close()
 
-    @staticmethod
-    def fork_from(source: str, **options: Any) -> "Sandbox":
-        """Creates a sandbox from another's current state.
-
-        The source keeps running; a running source's state is written first, so
-        the child starts from its state as of the call.
-        """
-        transport = Transport(**_transport_options(options))
-        try:
-            raw = transport.unary(
-                "ForkSandbox",
-                _to_fork_request(source, options),
-                options.get("timeout", 120.0),
-            )
-            return Sandbox(transport, _to_sandbox_info(raw), True)
-        except BaseException:
-            transport.close()
-            raise
-
-    @staticmethod
-    def _adopt(transport: Transport, raw: common_pb2.Sandbox) -> "Sandbox":
-        """Used by `Burrow` so clients share one connection."""
-        return Sandbox(transport, _to_sandbox_info(raw), False)
-
     @property
     def name(self) -> str:
         """The name the sandbox was created with, falling back to its id when
@@ -681,17 +454,7 @@ class Sandbox:
         return self._info.state
 
     @property
-    def status(self) -> str:
-        """The five-state view of `state`. Suspended reads as `stopped`."""
-        return _status_of(self._info.state)
-
-    @property
     def template(self) -> str:
-        return self._info.template
-
-    @property
-    def image(self) -> str:
-        """The template, under the name an image-shaped SDK uses."""
         return self._info.template
 
     @property
@@ -703,7 +466,7 @@ class Sandbox:
     def unreachable(self) -> bool:
         """Whether the node hosting this sandbox has missed its heartbeats.
 
-        When true, `state` and `status` are stale readings and calls fail with
+        When true, `state` is a stale reading and calls fail with
         `unavailable` until it returns. `delete()` still works: the
         orchestrator drops the sandbox on its own word and destroys it if the
         node comes back.
@@ -716,16 +479,8 @@ class Sandbox:
         return self._info.tags
 
     @property
-    def metadata(self) -> Dict[str, str]:
-        return self._info.tags
-
-    @property
     def vcpus(self) -> int:
         return self._info.policy.resources.vcpus
-
-    @property
-    def memory(self) -> int:
-        return self._info.policy.resources.memory_mib
 
     @property
     def memory_mib(self) -> int:
@@ -745,52 +500,9 @@ class Sandbox:
         return self._info.created_at
 
     @property
-    def network_policy(self):
-        """The egress policy in force, with injected header values redacted."""
-        return self._info.policy.network
-
-    @property
     def policy(self):
         """The whole policy in force, with injected header values redacted."""
         return self._info.policy
-
-    @property
-    def sandbox_id(self) -> str:
-        """The id, under the name other sandbox SDKs give it."""
-        return self.id
-
-    def get_info(self) -> SandboxInfo:
-        """Re-reads the record. Alias of `refresh`."""
-        return self.refresh()
-
-    def is_running(self) -> bool:
-        """Whether the sandbox is running right now, after a fresh read."""
-        return self.refresh().state == "running"
-
-    def set_timeout(self, secs: int) -> SandboxInfo:
-        """Sets the sandbox's total lifetime, in seconds from when it was
-        created. Alias of `extend_timeout`, under the name other SDKs use."""
-        return self.extend_timeout(secs)
-
-    @property
-    def commands(self) -> "_Commands":
-        """Command helpers grouped, for parity with SDKs that namespace them:
-        `run`, `stream`, `list`, `connect` (reattach by id) and `kill`."""
-        return _Commands(self)
-
-    @property
-    def fs(self) -> "_Fs":
-        """The file methods under the names and shapes of `os` and `pathlib`:
-        `listdir`, `mkdir`, `makedirs`, `remove`, `rename`, `stat`, `exists`,
-        and `read_text`, `read_bytes`, `write_text`, `write_bytes`. As in
-        `os`, `stat` on a missing path raises (`not_found`) and `remove` does
-        not take directories; `rmtree` does."""
-        return _Fs(self)
-
-    @property
-    def pty(self) -> "_Pty":
-        """The terminal under the name other SDKs give it: `sandbox.pty.create()`."""
-        return _Pty(self)
 
     def refresh(self) -> SandboxInfo:
         """Re-reads the sandbox's current state from the server."""
@@ -817,244 +529,44 @@ class Sandbox:
         self.resume()
         return op()
 
-    def run_command(
-        self,
-        cmd: Union[str, Dict[str, Any]],
-        args: Optional[Sequence[str]] = None,
-        **options: Any,
-    ) -> Union[CommandResult, DetachedCommand]:
-        """Runs a command and returns once it exits.
+    def _fs(self, **op: Any) -> api_pb2.FsResponse:
+        """Makes one `Fs` call as this handle's user.
 
-        ```python
-        install = sandbox.run_command("pip", ["install", "cowsay"])
-        print(install.exit_code, install.stdout)
-        ```
-
-        A bare string goes through `/bin/sh -c`, so pipes and redirection work.
-        Once `args` are given the command is passed to execve directly, with no
-        shell involved. `detached=True` returns a `DetachedCommand` handle
-        without waiting.
+        A failure in the guest kernel is a reply, not the call's status, and is
+        raised here as the `OSError` the stdlib would raise for it. A policy
+        refusal comes back the same way, as EACCES.
         """
-        if isinstance(cmd, dict):
-            options = {**cmd, **options}
-            args = options.pop("args", None)
-            cmd = options.pop("cmd")
-
-        # `stdout`/`stderr` are writable files, and the callbacks are the same
-        # thing one chunk at a time, so one is expressed in terms of the other.
-        for sink_key, callback_key in (("stdout", "on_stdout"), ("stderr", "on_stderr")):
-            sink = options.pop(sink_key, None)
-            if sink is not None:
-                previous = options.get(callback_key)
-
-                def chained(chunk, sink=sink, previous=previous):
-                    if previous:
-                        previous(chunk)
-                    sink.write(chunk)
-
-                options[callback_key] = chained
-
-        argv = list(args or [])
-        shell = options.pop("shell", not argv)
-        command: Union[str, List[str]] = (
-            " ".join([cmd, *argv]) if shell and argv else cmd if shell else [cmd, *argv]
-        )
-
-        if options.pop("detached", False):
-            return self._spawn(command, options)
-        return self.exec(command, **options)
-
-    def exec(self, command: Union[str, Sequence[str]], **options: Any) -> CommandResult:
-        """Runs a command and returns once it exits.
-
-        A string is run through `/bin/sh -c`, so pipes and redirection work; a
-        list is passed to execve directly, with no shell involved.
-
-        ```python
-        sandbox.exec("pip install cowsay")
-        sandbox.exec(["python3", "-c", "print(1 + 1)"])
-        ```
-        """
-        on_stdout = options.get("on_stdout")
-        on_stderr = options.get("on_stderr")
-
-        def run() -> CommandResult:
-            stdout: List[str] = []
-            stderr: List[str] = []
-            exit_code = 0
-            # Auto-resume is handled here rather than around the stream: a
-            # stream that has already yielded cannot be restarted without
-            # replaying output.
-            for chunk in self._start_exec(command, options)[0]:
-                if chunk.type == "stdout":
-                    stdout.append(chunk.data)
-                    if on_stdout:
-                        on_stdout(chunk.data)
-                elif chunk.type == "stderr":
-                    stderr.append(chunk.data)
-                    if on_stderr:
-                        on_stderr(chunk.data)
-                else:
-                    exit_code = chunk.exit_code
-            return CommandResult(
-                stdout="".join(stdout),
-                stderr="".join(stderr),
-                exit_code=exit_code,
-                success=exit_code == 0,
-            )
-
-        result = self._with_resume(run, options.get("auto_resume"))
-        if options.get("check") and not result.success:
-            raise CommandFailedError(
-                command if isinstance(command, str) else " ".join(command),
-                result.exit_code,
-                result.stdout,
-                result.stderr,
-            )
-        return result
-
-    def exec_stream(
-        self, command: Union[str, Sequence[str]], **options: Any
-    ) -> Iterator[OutputChunk]:
-        """Runs a command, yielding output as it is produced.
-
-        ```python
-        for chunk in sandbox.exec_stream("npm install"):
-            if chunk.type == "stdout":
-                sys.stdout.write(chunk.data)
-        ```
-        """
-        return self._start_exec(command, options)[0]
-
-    def _start_exec(
-        self,
-        command: Union[str, Sequence[str]],
-        options: Dict[str, Any],
-        keep_open: bool = False,
-    ):
-        """Starts a command, returning its output, the id the guest gave it,
-        and the two ways of letting go of the call: `release` ends the request
-        side, `close` also cancels."""
         self._assert_live()
-        cmd = ["/bin/sh", "-c", command] if isinstance(command, str) else list(command)
-
-        start = api_pb2.ExecInput(
-            start=api_pb2.ExecStart(
-                sandbox_id=self.id,
-                cmd=cmd,
-                # A per-command variable wins over the handle's defaults, so
-                # one call can override what every other call inherits.
-                env={**self._env, **(options.get("env") or {})},
-                cwd=options.get("cwd") or "",
-                is_pty=options.get("pty") or False,
-                rows=options.get("rows") or 24,
-                cols=options.get("cols") or 80,
-                user=options.get("user", self._default_user),
-                # As Docker's `--log-opt max-size` and `max-file`. Unset keeps
-                # every byte the command prints.
-                log_max_bytes=options.get("log_max_bytes") or 0,
-                log_max_files=options.get("log_max_files") or 0,
-            )
+        request = api_pb2.FsRequest(sandbox_id=self.id, user=self._default_user, **op)
+        res = self._with_resume(
+            lambda: self._transport.route(self.id).unary("Fs", request)
         )
+        if res.WhichOneof("result") == "error":
+            raise os_error(res.error)
+        return res
 
-        done = threading.Event()
+    def open(
+        self,
+        file: Any,
+        mode: str = "r",
+        buffering: int = -1,
+        encoding: Optional[str] = None,
+        errors: Optional[str] = None,
+        newline: Optional[str] = None,
+    ) -> Any:
+        """Builtin `open()`, for a file in the sandbox.
 
-        def requests() -> Iterator[api_pb2.ExecInput]:
-            yield start
-            if keep_open:
-                # Closes the child's stdin without closing the request side,
-                # which a detached command keeps open until its stream ends.
-                yield api_pb2.ExecInput(is_stdin_eof=True)
-                done.wait()
+        ```python
+        with sandbox.open("/work/app.py", "w") as f:
+            f.write("print('hi')\\n")
+        ```
 
-        # A detached command outlives any request deadline.
-        timeout = options.get("timeout", None if keep_open else _DEFAULT)
-        call = self._transport.route(self.id).duplex("Exec", requests(), timeout)
-        output = iter(call)
-
-        # The guest names the command before anything else. Pulled here rather
-        # than in the generator below, which nothing iterates until the caller
-        # asks for output: a detached command's id has to exist before then.
-        try:
-            first = next(output, None)
-        except grpc.RpcError as err:
-            done.set()
-            raise BurrowError.from_grpc(err) from None
-        command_id = (
-            first.command_id
-            if first is not None and first.WhichOneof("output") == "command_id"
-            else ""
-        )
-
-        def chunks() -> Iterator[OutputChunk]:
-            chunker = _Chunker()
-            try:
-                # An older agent starts straight in on output, with no id at
-                # all.
-                if first is not None and first.WhichOneof("output") != "command_id":
-                    for chunk in chunker.feed(first):
-                        yield chunk
-                for msg in output:
-                    # Only ever the first message, but an agent that repeated
-                    # it must not put an empty chunk into the caller's stream.
-                    if msg.WhichOneof("output") == "command_id":
-                        continue
-                    for chunk in chunker.feed(msg):
-                        yield chunk
-            except grpc.RpcError as err:
-                raise BurrowError.from_grpc(err) from None
-            finally:
-                done.set()
-                call.cancel()
-
-        # Ends the request side, leaving the output stream readable.
-        def release() -> None:
-            done.set()
-
-        def close() -> None:
-            done.set()
-            call.cancel()
-
-        return chunks(), command_id, release, close
-
-    def _spawn(
-        self, command: Union[str, Sequence[str]], options: Dict[str, Any]
-    ) -> DetachedCommand:
-        """Starts a command and returns a handle without waiting for it."""
-        output, cmd_id, release, close = self._start_exec(
-            command, options, keep_open=True
-        )
-
-        on_stdout = options.get("on_stdout")
-        on_stderr = options.get("on_stderr")
-
-        def stream() -> Iterator[OutputChunk]:
-            for chunk in output:
-                if chunk.type == "stdout" and on_stdout:
-                    on_stdout(chunk.data)
-                elif chunk.type == "stderr" and on_stderr:
-                    on_stderr(chunk.data)
-                yield chunk
-
-        # `logs()` and `wait()` drain the same stream, so only the first of
-        # them gets anything; the second is refused rather than left empty.
-        taken = [False]
-        chunks = stream()
-
-        def take() -> Iterator[OutputChunk]:
-            if taken[0]:
-                raise BurrowError(
-                    "this command's output has already been consumed",
-                    "failed_precondition",
-                )
-            taken[0] = True
-            return chunks
-
-        # The same RPC `get_command(...).kill()` uses: the command lives in the
-        # sandbox, not on this stream.
-        return DetachedCommand(
-            self.id, cmd_id, take, self._signal_command, release=release, close=close
-        )
+        The modes, the objects returned and the errors raised are `open()`'s.
+        Text defaults to UTF-8 rather than this machine's locale encoding,
+        `buffering=-1` buffers 1 MiB since each refill is a round trip, and
+        `fileno()` raises: a sandbox file has no local descriptor.
+        """
+        return open_file(self, file, mode, buffering, encoding, errors, newline)
 
     def list_commands(self) -> List[CommandInfo]:
         """Lists the commands this sandbox has run, oldest first.
@@ -1070,89 +582,44 @@ class Sandbox:
         )
         return [_to_command_info(raw) for raw in res.commands]
 
-    def get_command(self, cmd_id: str, from_offset: int = 0) -> DetachedCommand:
+    def get_command(
+        self,
+        cmd_id: str,
+        from_offset: int = 0,
+        *,
+        text: Optional[bool] = None,
+        encoding: Optional[str] = None,
+        errors: Optional[str] = None,
+    ) -> Any:
         """Reattaches to a command by id, from anywhere.
 
         ```python
-        command = sandbox.get_command(cmd_id)
-        for chunk in command.logs():
-            sys.stdout.write(chunk.data)
+        server = sandbox.get_command(cmd_id)
+        for line in server.stdout:
+            print(line)
         ```
 
         The command need not have been started by this process: it lives in the
-        sandbox, and so does every byte it has printed. `logs()` replays from
-        `from_offset`, counting stdout and stderr bytes together from the
-        command's start, and then follows the command live; a reader that saw N
-        bytes passes N and gets only what came after. `send_stdin` feeds a
-        running command, a shell whose original stream is long gone included.
-        Several handles may follow one command at once. Raises `not_found` when
-        the id names nothing, a pruned command included.
+        sandbox, and so does every byte it has printed. What comes back is a
+        `sandbox.subprocess.Popen` whose `stdout` and `stderr` replay from
+        `from_offset`, counting both streams' bytes together from the
+        command's start, and then follow the command live; a reader that saw N
+        bytes passes N and gets only what came after. `stdin` feeds it, a
+        shell whose original stream is long gone included, and `kill()`,
+        `wait()` and `returncode` work as on any other. Leaving a `with` block
+        lets go of the command without ending it or its stdin. Several
+        handles may follow one command at once. `info` is the `CommandInfo`
+        read when it attached. Raises `not_found` when the id names nothing,
+        a pruned command included.
         """
         self._assert_live()
-        # Read first, so a bad id fails here rather than on the first `logs()`.
+        # Read first, so a bad id fails here rather than on the first read.
         raw = self._transport.unary(
             "GetCommand",
             api_pb2.GetCommandRequest(sandbox_id=self.id, command_id=cmd_id),
         )
-
-        # One Attach call per handle, opened by whichever of reading and
-        # writing comes first, and fed from this queue for as long as it lasts.
-        inputs: "queue.Queue[Optional[api_pb2.AttachInput]]" = queue.Queue()
-        inputs.put(
-            api_pb2.AttachInput(
-                start=api_pb2.AttachStart(
-                    sandbox_id=self.id, command_id=cmd_id, from_offset=from_offset
-                )
-            )
-        )
-        opened: Dict[str, Any] = {}
-        lock = threading.Lock()
-
-        def requests() -> Iterator[api_pb2.AttachInput]:
-            while True:
-                item = inputs.get()
-                if item is None:
-                    return
-                yield item
-
-        def call() -> Any:
-            with lock:
-                if "call" not in opened:
-                    # A command outlives any request deadline.
-                    opened["call"] = self._transport.route(self.id).duplex(
-                        "Attach", requests(), None
-                    )
-                return opened["call"]
-
-        def attach() -> Iterator[OutputChunk]:
-            chunker = _Chunker()
-            stream = call()
-            try:
-                for msg in stream:
-                    for chunk in chunker.feed(msg):
-                        yield chunk
-            except grpc.RpcError as err:
-                if not stream.cancelled():
-                    raise BurrowError.from_grpc(err) from None
-
-        def write(msg: api_pb2.AttachInput) -> None:
-            call()
-            inputs.put(msg)
-
-        def close() -> None:
-            inputs.put(None)
-            with lock:
-                if "call" in opened:
-                    opened["call"].cancel()
-
-        return DetachedCommand(
-            self.id,
-            cmd_id,
-            attach,
-            self._signal_command,
-            info=_to_command_info(raw),
-            close=close,
-            write=write,
+        return self.subprocess.Popen._attach(
+            _to_command_info(raw), from_offset, encoding, errors, text
         )
 
     def prune_commands(self) -> Dict[str, int]:
@@ -1179,7 +646,7 @@ class Sandbox:
 
         ```python
         alice = sandbox.create_user("alice")
-        sandbox.run_command("whoami", user=alice.username)
+        sandbox.subprocess.run(["whoami"], user=alice.username)
         ```
 
         The home is 0700, so one agent's files are not readable by another's.
@@ -1232,17 +699,18 @@ class Sandbox:
         )
 
     def as_user(self, name: str) -> "Sandbox":
-        """A handle onto the same sandbox whose commands run as `name`.
+        """A handle onto the same sandbox that acts as `name`.
 
         ```python
         alice = sandbox.as_user("alice")
-        alice.run_command("touch ~/notes.txt")
+        alice.subprocess.run("touch ~/notes.txt", shell=True)
+        alice.Path("/home/alice/notes.txt").exists()
         ```
 
-        Commands, terminals and `mkdir` run as the user, and `write_file` hands
-        what it wrote to them. Reads are not confined: `read_file` and
-        `list_dir` are served by the guest agent as root, so a user handle can
-        still read a file its user could not. The user has to exist already.
+        Its `open`, `os`, `shutil`, `Path`, `subprocess` and `terminal` all
+        act as the user: the guest kernel decides what the user may read and
+        write, and what they create is theirs. A per-command `user` still wins.
+        The user has to exist already.
         """
         self._assert_live()
         # Shares the connection but does not own it: closing a user handle must
@@ -1254,201 +722,11 @@ class Sandbox:
     def terminal(self, **options: Any) -> Terminal:
         """Opens an interactive shell with a pty, for when input arrives over
         time (a browser terminal, an agent driving a REPL). For a command that
-        runs to completion, use `run_command`."""
+        runs to completion, use `subprocess.run`."""
         self._assert_live()
-        return Terminal(self._transport.route(self.id), self.id, options)
-
-    def write_files(self, files: Sequence[Dict[str, Any]]) -> None:
-        """Writes files, creating parent directories as needed.
-
-        ```python
-        sandbox.write_files([
-            {"path": "/work/app.py", "content": "print('hi')\\n"},
-            {"path": "/work/run.sh", "content": "python3 app.py\\n", "mode": 0o755},
-        ])
-        ```
-        """
-        for file in files:
-            content = file.get("content", file.get("contents", ""))
-            self.write_file(file["path"], content, mode=file.get("mode", 0))
-
-    def write_file(
-        self, path: str, contents: Union[str, bytes], mode: int = 0
-    ) -> int:
-        """Writes a single file, creating parent directories as needed."""
-        self._assert_live()
-        data = contents.encode("utf-8") if isinstance(contents, str) else contents
-
-        def chunks() -> Iterator[api_pb2.FileChunk]:
-            offset = 0
-            first = True
-            while offset < len(data) or first:
-                end = min(offset + _UPLOAD_CHUNK, len(data))
-                yield api_pb2.FileChunk(
-                    # Only the first chunk names the destination.
-                    sandbox_id=self.id if first else "",
-                    path=path if first else "",
-                    mode=mode if first else 0,
-                    data=data[offset:end],
-                )
-                first = False
-                offset = end
-
-        res = self._with_resume(
-            lambda: self._transport.route(self.id).client_stream("UploadFile", chunks)
+        return Terminal(
+            self._transport.route(self.id), self.id, {"user": self._default_user, **options}
         )
-        # The agent writes as root, so a handle from `as_user` has to hand the
-        # file over or the user could not touch what it wrote.
-        if self._default_user:
-            # `user=""` is root: the user being handed the file cannot be the
-            # one handing it over.
-            self.exec(["/bin/chown", self._default_user, "--", path], user="")
-        return res.bytes_written
-
-    def read_file(self, path: str) -> str:
-        """Reads a file as a UTF-8 string. Raises when it does not exist.
-
-        Undecodable bytes become U+FFFD rather than raising, matching the
-        TypeScript SDK. Use `read_file_bytes` when the bytes themselves matter.
-        """
-        return self.read_file_bytes(path).decode("utf-8", errors="replace")
-
-    def read_file_bytes(self, path: str) -> bytes:
-        """Reads a file as raw bytes. Raises when it does not exist."""
-        self._assert_live()
-
-        def read() -> bytes:
-            parts = []
-            for chunk in self._transport.route(self.id).server_stream(
-                "DownloadFile", api_pb2.DownloadRequest(sandbox_id=self.id, path=path)
-            ):
-                if chunk.data:
-                    parts.append(chunk.data)
-            return b"".join(parts)
-
-        return self._with_resume(read)
-
-    def open_file(self, path: str) -> Optional[Iterator[bytes]]:
-        """Starts a download, returning `None` if the file is missing.
-
-        The first chunk is pulled eagerly because that is when the server
-        reports a missing file, and a `None` return has to be decided up front.
-        """
-        self._assert_live()
-
-        def opened():
-            source = self._transport.route(self.id).server_stream(
-                "DownloadFile", api_pb2.DownloadRequest(sandbox_id=self.id, path=path)
-            )
-            return source, next(source, None)
-
-        try:
-            source, first = self._with_resume(opened)
-        except BurrowError as err:
-            if err.code == "not_found":
-                return None
-            raise
-
-        def stream() -> Iterator[bytes]:
-            if first is not None and first.data:
-                yield first.data
-            for chunk in source:
-                if chunk.data:
-                    yield chunk.data
-
-        return stream()
-
-    def download_file(self, src: str, dst: str, mkdir: bool = True) -> Optional[str]:
-        """Copies a file out of the sandbox onto the local filesystem.
-
-        Returns the absolute path it was written to, or `None` when the sandbox
-        has no such file. Parent directories are created unless you say
-        otherwise.
-
-        ```python
-        path = sandbox.download_file("/work/out.txt", "./out.txt")
-        ```
-        """
-        stream = self.open_file(src)
-        if stream is None:
-            return None
-        destination = os.path.abspath(dst)
-        if mkdir:
-            os.makedirs(os.path.dirname(destination), exist_ok=True)
-        # Streamed rather than buffered: a download is exactly the case where
-        # the file is too big to want in memory.
-        with open(destination, "wb") as out:
-            for chunk in stream:
-                out.write(chunk)
-        return destination
-
-    def list_dir(self, path: str) -> List[DirEntry]:
-        """Lists a directory."""
-        self._assert_live()
-        res = self._with_resume(
-            lambda: self._transport.route(self.id).unary(
-                "ListDir", api_pb2.ListDirRequest(sandbox_id=self.id, path=path)
-            )
-        )
-        return [
-            DirEntry(name=e.name, is_dir=e.is_dir, size=e.size, mode=e.mode)
-            for e in res.entries
-        ]
-
-    def mkdir(self, path: str, recursive: bool = True) -> None:
-        """Creates a directory.
-
-        There is no mkdir RPC, so this runs `mkdir -p` in the sandbox: it costs
-        one exec and fails the way a command does rather than the way an RPC
-        does.
-        """
-        flag = "-p " if recursive else ""
-        res = self.exec(f"mkdir {flag}{_shell_quote(path)}")
-        if not res.success:
-            raise BurrowError(f"mkdir {path} failed: {res.stderr.strip()}", "internal")
-
-    def remove(self, path: str) -> None:
-        """Removes a file or directory tree. Like `mkdir` this runs a command
-        (`rm -rf`) in the sandbox, since there is no remove RPC, and a missing
-        path is not an error."""
-        res = self.exec(f"rm -rf {_shell_quote(path)}")
-        if not res.success:
-            raise BurrowError(f"rm {path} failed: {res.stderr.strip()}", "internal")
-
-    def rename(self, src: str, dst: str) -> None:
-        """Renames or moves a file or directory, by running `mv` in the sandbox."""
-        res = self.exec(f"mv {_shell_quote(src)} {_shell_quote(dst)}")
-        if not res.success:
-            raise BurrowError(f"mv {src} {dst} failed: {res.stderr.strip()}", "internal")
-
-    def stat(self, path: str) -> Optional[FileInfo]:
-        """Describes one path, or returns None when nothing is there. Lists the
-        parent directory over the `ListDir` RPC, so it respects the sandbox's
-        file policy and costs no exec."""
-        trimmed = path.rstrip("/") or "/"
-        if trimmed == "/":
-            return FileInfo(name="/", is_dir=True, size=0, mode=0o755, path="/")
-        parent, _, name = trimmed.rpartition("/")
-        try:
-            entries = self.list_dir(parent or "/")
-        except BurrowError as err:
-            if err.code == "not_found":
-                return None
-            raise
-        for entry in entries:
-            if entry.name == name:
-                return FileInfo(
-                    name=entry.name,
-                    is_dir=entry.is_dir,
-                    size=entry.size,
-                    mode=entry.mode,
-                    path=trimmed,
-                )
-        return None
-
-    def exists(self, path: str) -> bool:
-        """Whether a path exists. See `stat`."""
-        return self.stat(path) is not None
 
     def watch(
         self,
@@ -1604,43 +882,6 @@ class Sandbox:
         self._assert_live()
         self._transport.unary("UnshareSandbox", api_pb2.SandboxRef(id=self.id))
 
-    def update(self, **options: Any) -> SandboxInfo:
-        """Updates tags, the network policy, the access policy, or any
-        combination.
-
-        Each section named is replaced wholesale rather than merged, so one
-        call is enough to lock a sandbox down or to retag it, and a section not
-        named is left alone. The machine shape is not updatable: a restore
-        takes it from the snapshot.
-
-        ```python
-        sandbox.update(
-            tags={"owner": "ci", "run": "482"},
-            network_policy={"mode": "allowlist", "allow_domains": ["api.github.com"]},
-            exec={"allow_exec": False},
-        )
-        ```
-        """
-        network = options.get("network_policy")
-        if network is None:
-            network = options.get("network")
-        if options.get("tags") is not None:
-            self.update_tags(options["tags"])
-        if network is not None:
-            self.update_network_policy(network)
-        if options.get("exec") is not None or options.get("fs") is not None:
-            self.update_access_policy(exec=options.get("exec"), fs=options.get("fs"))
-        if any(
-            options.get(key) is not None
-            for key in ("max_lifetime_secs", "idle_suspend_secs", "suspended_ttl_secs")
-        ):
-            self.update_resources(
-                max_lifetime_secs=options.get("max_lifetime_secs"),
-                idle_suspend_secs=options.get("idle_suspend_secs"),
-                suspended_ttl_secs=options.get("suspended_ttl_secs"),
-            )
-        return self._info
-
     def update_resources(
         self,
         max_lifetime_secs: Optional[int] = None,
@@ -1664,16 +905,6 @@ class Sandbox:
         raw = self._transport.unary("UpdateResources", request)
         self._info = _to_sandbox_info(raw)
         return self._info
-
-    def extend_timeout(self, secs: int) -> SandboxInfo:
-        """Gives the sandbox `secs` more seconds of life, from when it was
-        created.
-
-        The familiar spelling of `update(max_lifetime_secs=...)`. Burrow
-        measures a lifetime from creation rather than from now, so this sets a
-        total rather than adding to what is left: pass the whole budget.
-        """
-        return self.update_resources(max_lifetime_secs=secs)
 
     def update_tags(self, tags: Dict[str, str]) -> SandboxInfo:
         """Replaces the sandbox's tags. An empty map clears them."""
@@ -1759,10 +990,6 @@ class Sandbox:
         raw = self._transport.unary("PauseSandbox", api_pb2.SandboxRef(id=self.id))
         self._info = _to_sandbox_info(raw)
         return self._info
-
-    def pause(self) -> SandboxInfo:
-        """The same thing under its original name."""
-        return self.stop()
 
     def resume(self) -> SandboxInfo:
         """Restores a stopped sandbox, typically in a few hundred milliseconds.
@@ -1932,14 +1159,6 @@ class Sandbox:
             if self._owned:
                 self._transport.close()
 
-    def kill(self) -> None:
-        """Destroys the sandbox.
-
-        Deprecated: use `delete`. Note that `stop` suspends rather than
-        destroys, so it is not the replacement.
-        """
-        self.delete()
-
     def close(self) -> None:
         """Releases the connection without destroying the sandbox."""
         if self._owned:
@@ -1961,68 +1180,10 @@ class Sandbox:
         self.delete()
 
 
-class _Commands:
-    """`sandbox.commands`: the command methods under grouped names."""
-
-    def __init__(self, sandbox: Sandbox):
-        self.run = sandbox.exec
-        self.stream = sandbox.exec_stream
-        self.list = sandbox.list_commands
-        self.connect = sandbox.get_command
-        self._sandbox = sandbox
-
-    def kill(self, cmd_id: str, signal: int = 9) -> None:
-        self._sandbox.get_command(cmd_id).kill(signal)
-
-
-class _Fs:
-    """`sandbox.fs`: the file methods under the `os` and `pathlib` names."""
-
-    def __init__(self, sandbox: Sandbox):
-        self._sandbox = sandbox
-        self.listdir = sandbox.list_dir
-        self.rename = sandbox.rename
-        self.exists = sandbox.exists
-        self.rmtree = sandbox.remove
-        self.read_text = sandbox.read_file
-        self.read_bytes = sandbox.read_file_bytes
-
-    def mkdir(self, path: str) -> None:
-        self._sandbox.mkdir(path, recursive=False)
-
-    def makedirs(self, path: str) -> None:
-        self._sandbox.mkdir(path, recursive=True)
-
-    def remove(self, path: str) -> None:
-        """Removes one file. A directory is refused, as `os.remove` refuses it."""
-        res = self._sandbox.exec(f"rm {_shell_quote(path)}")
-        if not res.success:
-            raise BurrowError(f"rm {path} failed: {res.stderr.strip()}", "internal")
-
-    def stat(self, path: str) -> FileInfo:
-        info = self._sandbox.stat(path)
-        if info is None:
-            raise BurrowError(f"no such file or directory: {path}", "not_found")
-        return info
-
-    def write_text(self, path: str, data: str, mode: int = 0) -> None:
-        self._sandbox.write_file(path, data, mode=mode)
-
-    def write_bytes(self, path: str, data: bytes, mode: int = 0) -> None:
-        self._sandbox.write_file(path, data, mode=mode)
-
-
-class _Pty:
-    """`sandbox.pty`: the terminal under the name other SDKs give it."""
-
-    def __init__(self, sandbox: Sandbox):
-        self.create = sandbox.terminal
-
-
 class Burrow:
-    """A connection to a burrow control plane, for listing or reattaching to
-    sandboxes over one channel. `Sandbox.create` is the shortcut when you only
-    need one."""
+    """A connection to a burrow control plane, for what is not one sandbox's:
+    health, audit, events, nodes and secrets. Sandboxes are reached through
+    `Sandbox`."""
 
     def __init__(self, **options: Any):
         self._transport = Transport(**_transport_options(options))
@@ -2030,23 +1191,6 @@ class Burrow:
     def health(self) -> Dict[str, str]:
         res = self._transport.unary("Health", api_pb2.HealthRequest())
         return {"version": res.version}
-
-    def create(self, **options: Any) -> Sandbox:
-        raw = self._transport.unary(
-            "CreateSandbox", _to_create_request(options), options.get("timeout", 120.0)
-        )
-        return Sandbox._adopt(self._transport, raw)
-
-    def list(self, tag: str = "") -> List[SandboxInfo]:
-        """Lists sandboxes, optionally filtered by one `"key=value"` tag."""
-        res = self._transport.unary(
-            "ListSandboxes", api_pb2.ListSandboxesRequest(tag=tag)
-        )
-        return [_to_sandbox_info(raw) for raw in res.sandboxes]
-
-    def get(self, ref: str) -> Sandbox:
-        raw = self._transport.unary("GetSandbox", api_pb2.SandboxRef(id=ref))
-        return Sandbox._adopt(self._transport, raw)
 
     def audit(
         self,

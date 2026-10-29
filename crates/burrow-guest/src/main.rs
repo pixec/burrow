@@ -7,6 +7,7 @@ mod asyncfd;
 mod commands;
 mod exec;
 mod files;
+mod fs;
 mod init;
 mod netconf;
 mod pty;
@@ -50,6 +51,8 @@ const REEXEC_MARK: &str = "BURROW_GUEST_REEXEC";
 const UPGRADE_PATH: &str = "/run/burrow-guest";
 /// Where the finished-command table is handed across the re-exec.
 const COMMANDS_STATE: &str = "/run/burrow-guest.commands";
+/// Where open file handles are handed across the re-exec.
+const FS_STATE: &str = "/run/burrow-guest.fs";
 /// How long a handshake waits for systemd to finish booting. Under the host's
 /// default 30s bound on the call, so a slow systemd delays the handshake
 /// rather than failing it.
@@ -255,6 +258,9 @@ impl Guest for AgentService {
                     std::env::set_var(systemd::PID_MARK, pid.to_string());
                 }
             };
+            if let Err(err) = fs::save(FS_STATE) {
+                tracing::warn!(%err, "open file handles will not survive the upgrade");
+            }
             let Err(err) = nix::unistd::execv(&path, &[path.as_c_str()]);
             tracing::error!(%err, "re-exec failed; the old agent keeps serving");
         });
@@ -272,6 +278,7 @@ impl Guest for AgentService {
                 files::FEATURE_FILES_AS_USER.to_string(),
                 "attach-input".to_string(),
                 "output-feed".to_string(),
+                fs::FEATURE_FS.to_string(),
             ],
         }))
     }
@@ -333,6 +340,13 @@ impl Guest for AgentService {
     ) -> Result<Response<guestpb::ListDirResponse>, Status> {
         let req = req.into_inner();
         Ok(Response::new(files::list_dir(&req.path, &req.user).await?))
+    }
+
+    async fn fs(
+        &self,
+        req: Request<guestpb::FsRequest>,
+    ) -> Result<Response<guestpb::FsResponse>, Status> {
+        Ok(Response::new(fs::handle(req.into_inner()).await?))
     }
 
     async fn list_commands(
@@ -585,6 +599,7 @@ async fn main() {
     netconf::prepare().await;
     if is_reexec {
         commands::restore(COMMANDS_STATE);
+        fs::restore(FS_STATE);
         tracing::warn!(
             version = VERSION,
             digest = self_digest(),
@@ -595,6 +610,7 @@ async fn main() {
         systemd::start();
     }
 
+    tokio::spawn(fs::close_idle());
     if let Err(err) = serve().await {
         tracing::error!(%err, "agent server exited");
     }
