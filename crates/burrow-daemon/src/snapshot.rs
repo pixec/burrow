@@ -186,6 +186,27 @@ fn index_key(id: &str, file: &str) -> String {
     remote_key(id, &format!("{file}.index.json"))
 }
 
+/// Removes a snapshot's objects from the store. Blobs are left, since other
+/// snapshots may share them.
+///
+/// Manifest first, so a fetch racing this sees nothing rather than a manifest
+/// naming files that are going. Every backend's names, since a snapshot whose
+/// local manifest is gone says nothing about which one took it. A delete of an
+/// object that is not there is not an error.
+async fn delete_remote(remote: &crate::objstore::ObjectStore, id: &str) -> Result<(), Status> {
+    remote.delete(&remote_key(id, MANIFEST)).await?;
+    for layout in burrow_vmm::Hypervisor::ALL.map(burrow_vmm::Hypervisor::layout) {
+        remote.delete(&remote_key(id, layout.state)).await?;
+        for file in layout.memory.into_iter().chain([SCRATCH_IMAGE]) {
+            remote
+                .delete(&crate::objstore::sparse_key(&remote_key(id, file)))
+                .await?;
+            remote.delete(&index_key(id, file)).await?;
+        }
+    }
+    Ok(())
+}
+
 /// Checks an id before it becomes a path.
 ///
 /// Only the orchestrator mints snapshot ids, so the accepted shape is exactly
@@ -217,6 +238,12 @@ pub struct SnapshotStore {
     /// Held across a fetch, so two creates from one remote snapshot fetch it
     /// once rather than racing to rename the same directory into place.
     fetching: std::sync::Arc<tokio::sync::Mutex<()>>,
+    /// Held by a delete, and by an upload while it publishes the remote
+    /// manifest. Without it a delete landing mid-upload found nothing in the
+    /// store, and the upload then wrote a manifest for a snapshot already
+    /// gone: listed from the store with no node holding it, and every later
+    /// delete of it answered that there was no such snapshot.
+    publishing: std::sync::Arc<tokio::sync::Mutex<()>>,
 }
 
 /// Everything a create needs from the sandbox it is snapshotting, gathered
@@ -245,6 +272,7 @@ impl SnapshotStore {
             versions: std::sync::Arc::new(versions),
             hydrators: Default::default(),
             fetching: Default::default(),
+            publishing: Default::default(),
         }
     }
 
@@ -395,12 +423,19 @@ impl SnapshotStore {
         manifest.is_durable = true;
         let json = serde_json::to_vec_pretty(&manifest)
             .map_err(|err| Status::internal(format!("encoding the manifest: {err}")))?;
-        remote.put_bytes(&remote_key(id, MANIFEST), json).await?;
-        // The snapshot may have been deleted while uploading; a manifest
-        // written then would resurrect a directory the delete removed.
-        if read_manifest(&dir).await.is_some() {
-            write_manifest(&dir, &manifest).await?;
+        let _publishing = self.publishing.lock().await;
+        // Deleted while uploading: what went up is dropped rather than
+        // published, since a manifest written now would resurrect it.
+        if read_manifest(&dir).await.is_none() {
+            delete_remote(remote, id).await?;
+            tracing::info!(
+                snapshot = id,
+                "snapshot deleted while uploading; not published"
+            );
+            return Ok(());
         }
+        remote.put_bytes(&remote_key(id, MANIFEST), json).await?;
+        write_manifest(&dir, &manifest).await?;
         tracing::info!(
             snapshot = id,
             size_bytes = manifest.size_bytes,
@@ -735,6 +770,7 @@ impl SnapshotStore {
     /// can still fetch. Blobs are left, since other snapshots may share them.
     pub async fn delete(&self, id: &str) -> Result<(), Status> {
         validate_id(id)?;
+        let _publishing = self.publishing.lock().await;
         let dir = self.dir(id);
         let is_local = read_manifest(&dir).await.is_some();
         let mut is_remote = false;
@@ -742,21 +778,7 @@ impl SnapshotStore {
             && remote.exists(&remote_key(id, MANIFEST)).await?
         {
             is_remote = true;
-            // Manifest first, so a fetch racing this sees nothing rather than
-            // a manifest naming files that are going.
-            // Every backend's names, since a snapshot whose local manifest
-            // is gone says nothing about which one took it. A delete of an
-            // object that is not there is not an error.
-            remote.delete(&remote_key(id, MANIFEST)).await?;
-            for layout in burrow_vmm::Hypervisor::ALL.map(burrow_vmm::Hypervisor::layout) {
-                remote.delete(&remote_key(id, layout.state)).await?;
-                for file in layout.memory.into_iter().chain([SCRATCH_IMAGE]) {
-                    remote
-                        .delete(&crate::objstore::sparse_key(&remote_key(id, file)))
-                        .await?;
-                    remote.delete(&index_key(id, file)).await?;
-                }
-            }
+            delete_remote(remote, id).await?;
         }
         if let Some(hydrator) = self.hydrators.lock().unwrap().remove(id) {
             for layout in burrow_vmm::Hypervisor::ALL.map(burrow_vmm::Hypervisor::layout) {
@@ -1366,6 +1388,55 @@ mod tests {
         store.touch("snap_ccc3").await;
         assert_eq!(store.manifest("snap_ccc3").await.unwrap().expires_at, 0);
 
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// A delete that lands while the snapshot is uploading finds no manifest
+    /// in the store yet. The upload used to write one anyway, publishing a
+    /// snapshot that was gone, which every replica then listed from the store.
+    #[tokio::test]
+    async fn a_snapshot_deleted_while_uploading_is_not_published() {
+        let remote = crate::objstore::fake::store(true).await;
+        let root = std::env::temp_dir().join(format!(
+            "burrow-snapshots-upload-{}",
+            burrow_common::SnapshotId::generate()
+        ));
+        let store = SnapshotStore::new(&root, Some(remote.clone()), HashMap::new());
+        let id = burrow_common::SnapshotId::generate().to_string();
+        let dir = store.dir(&id);
+        tokio::fs::create_dir_all(&dir).await.unwrap();
+        let written = manifest(&id, "sbx_a", "2026-09-02T10:00:00Z");
+        let layout = written.layout().unwrap();
+        for file in [
+            TEMPLATE_KERNEL,
+            TEMPLATE_ROOTFS,
+            layout.state,
+            layout.memory.unwrap(),
+            SCRATCH_IMAGE,
+        ] {
+            tokio::fs::write(dir.join(file), vec![7u8; 8192])
+                .await
+                .unwrap();
+        }
+        write_manifest(&dir, &written).await.unwrap();
+
+        // Held as a delete would hold it, so the upload stops just short of
+        // publishing, which is where the delete has to land to race it.
+        let held = store.publishing.lock().await;
+        let upload = tokio::spawn({
+            let store = store.clone();
+            let id = id.clone();
+            async move { store.upload(&id).await }
+        });
+        while !remote.exists(&index_key(&id, SCRATCH_IMAGE)).await.unwrap() {
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+        tokio::fs::remove_dir_all(&dir).await.unwrap();
+        drop(held);
+        upload.await.unwrap().unwrap();
+
+        assert!(!remote.exists(&remote_key(&id, MANIFEST)).await.unwrap());
+        assert!(!remote.exists(&remote_key(&id, layout.state)).await.unwrap());
         let _ = std::fs::remove_dir_all(&root);
     }
 }
