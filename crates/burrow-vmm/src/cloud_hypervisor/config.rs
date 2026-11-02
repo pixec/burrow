@@ -23,6 +23,30 @@ const TPM_SOCK: &str = "swtpm.sock";
 const WINDOWS_MIN_VCPUS: u32 = 2;
 const WINDOWS_MIN_MEM_MIB: u32 = 4096;
 
+/// One disk as Cloud Hypervisor is given it, at boot and on hotplug alike.
+///
+/// Flushes are not configured because there is nothing to configure: Cloud
+/// Hypervisor (checked against v54.0, `virtio-devices/src/block.rs` and
+/// `block/src/io/request.rs`) always offers `VIRTIO_BLK_F_FLUSH` and
+/// `VIRTIO_BLK_F_CONFIG_WCE`, starts every disk in writeback mode, and answers
+/// a guest flush with `fsync` on the backing file under each of its I/O
+/// engines (sync, AIO and io_uring). A guest `fsync` therefore reaches the
+/// host disk, as Firecracker's `Writeback` makes it. Nothing here may turn
+/// that off; the test below pins the keys sent.
+///
+/// `direct` is left at its default (off) for now: the host page cache still
+/// holds what the guest wrote until a flush pushes it out.
+pub(crate) fn disk(drive: &crate::DriveSpec) -> Value {
+    json!({
+        "id": drive.id,
+        "path": drive.path,
+        "readonly": drive.is_read_only,
+        "image_type": "Raw",
+        // What a Windows guest finds a volume's disk by.
+        "serial": drive.id,
+    })
+}
+
 /// Where the guest's console goes, per architecture.
 ///
 /// On aarch64 Cloud Hypervisor's UART is a PL011, which a kernel built for
@@ -90,20 +114,7 @@ pub(crate) fn vm_config(
             });
         }
     };
-    let disks: Vec<Value> = spec
-        .drives
-        .iter()
-        .map(|drive| {
-            json!({
-                "id": drive.id,
-                "path": drive.path,
-                "readonly": drive.is_read_only,
-                "image_type": "Raw",
-                // What a Windows guest finds a volume's disk by.
-                "serial": drive.id,
-            })
-        })
-        .collect();
+    let disks: Vec<Value> = spec.drives.iter().map(disk).collect();
     let mut vm = json!({
         "cpus": { "boot_vcpus": spec.vcpus, "max_vcpus": spec.vcpus },
         "memory": { "size": u64::from(spec.mem_mib) * 1024 * 1024 },
@@ -226,6 +237,28 @@ mod tests {
             vm["vsock"],
             json!({ "id": "vsock", "cid": 3, "socket": "vsock.sock" })
         );
+    }
+
+    /// A disk carries only these keys. Cloud Hypervisor advertises a write
+    /// cache and fsyncs on every guest flush by default, so the test is that
+    /// nothing is sent that could change it.
+    #[test]
+    fn a_disk_is_rendered_with_flushes_left_on() {
+        let vm = vm_config(&spec(), &config(), "aarch64").unwrap();
+        for disk in vm["disks"].as_array().unwrap() {
+            let mut keys: Vec<&str> = disk
+                .as_object()
+                .unwrap()
+                .keys()
+                .map(String::as_str)
+                .collect();
+            keys.sort_unstable();
+            assert_eq!(keys, ["id", "image_type", "path", "readonly", "serial"]);
+        }
+        let hotplugged = disk(&crate::DriveSpec::scratch_rw("volume1.ext4"));
+        assert_eq!(hotplugged["image_type"], "Raw");
+        assert_eq!(hotplugged["serial"], "scratch");
+        assert_eq!(hotplugged.as_object().unwrap().len(), 5);
     }
 
     /// A Linux guest finds its disks by order, so the order is the spec's; a

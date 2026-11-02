@@ -36,9 +36,10 @@ use objc2::runtime::{AnyClass, AnyObject};
 use objc2::{AllocAnyThread, Message, msg_send};
 use objc2_foundation::{NSArray, NSData, NSError, NSFileHandle, NSString, NSURL};
 use objc2_virtualization::{
-    VZDiskImageStorageDeviceAttachment, VZFileHandleNetworkDeviceAttachment, VZMACAddress,
-    VZMacAuxiliaryStorage, VZMacGraphicsDeviceConfiguration, VZMacGraphicsDisplayConfiguration,
-    VZMacHardwareModel, VZMacKeyboardConfiguration, VZMacMachineIdentifier, VZMacOSBootLoader,
+    VZDiskImageCachingMode, VZDiskImageStorageDeviceAttachment, VZDiskImageSynchronizationMode,
+    VZFileHandleNetworkDeviceAttachment, VZMACAddress, VZMacAuxiliaryStorage,
+    VZMacGraphicsDeviceConfiguration, VZMacGraphicsDisplayConfiguration, VZMacHardwareModel,
+    VZMacKeyboardConfiguration, VZMacMachineIdentifier, VZMacOSBootLoader,
     VZMacOSVirtualMachineStartOptions, VZMacPlatformConfiguration, VZMacTrackpadConfiguration,
     VZNATNetworkDeviceAttachment, VZVirtioBlockDeviceConfiguration,
     VZVirtioNetworkDeviceConfiguration, VZVirtioSocketConnection, VZVirtioSocketDevice,
@@ -57,6 +58,11 @@ pub use install::{InstallSpec, InstalledImage, install, root_drive};
 
 /// The disk macOS is installed on. Cloned, never copied.
 pub const DISK_FILE: &str = "disk.img";
+
+/// How every disk is attached: host caching left to the framework, and guest
+/// flushes synchronized all the way to permanent storage.
+const DISK_CACHING: VZDiskImageCachingMode = VZDiskImageCachingMode::Automatic;
+const DISK_SYNCHRONIZATION: VZDiskImageSynchronizationMode = VZDiskImageSynchronizationMode::Full;
 /// The boot firmware's NVRAM. Written by the guest, so cloned per sandbox.
 pub const AUX_FILE: &str = "aux.img";
 /// The hardware model the template was installed for, as the framework's
@@ -609,6 +615,35 @@ impl Machine {
     }
 }
 
+/// Attaches a raw disk image with the modes every Burrow disk uses.
+///
+/// `initWithURL:readOnly:` would give the same modes; they are named so the
+/// guarantee is in the code rather than in Apple's defaults. `Full` answers a
+/// guest flush with `F_FULLFSYNC`, the only mode under which a flushed write
+/// survives a power cut on a Mac, where plain `fsync` stops at the drive's own
+/// cache.
+fn disk_attachment(
+    path: &Path,
+    read_only: bool,
+) -> Result<Retained<VZDiskImageStorageDeviceAttachment>> {
+    let attachment = unsafe {
+        VZDiskImageStorageDeviceAttachment::initWithURL_readOnly_cachingMode_synchronizationMode_error(
+            VZDiskImageStorageDeviceAttachment::alloc(),
+            &file_url(path),
+            read_only,
+            DISK_CACHING,
+            DISK_SYNCHRONIZATION,
+        )
+    }
+    .map_err(|err| ns_error(&err))?;
+    if unsafe { attachment.synchronizationMode() } != DISK_SYNCHRONIZATION {
+        return Err(invalid(
+            "the disk attachment did not take full synchronization",
+        ));
+    }
+    Ok(attachment)
+}
+
 /// Builds the framework's configuration for `spec`, validated, including for
 /// save and restore. Public for a caller that drives a machine on the main
 /// queue itself, as a window must.
@@ -647,12 +682,7 @@ pub fn configuration(
 
         let mut disks = Vec::new();
         for drive in &spec.drives {
-            let attachment = VZDiskImageStorageDeviceAttachment::initWithURL_readOnly_error(
-                VZDiskImageStorageDeviceAttachment::alloc(),
-                &file_url(&dir.join(&drive.path)),
-                drive.is_read_only,
-            )
-            .map_err(|err| ns_error(&err))?;
+            let attachment = disk_attachment(&dir.join(&drive.path), drive.is_read_only)?;
             disks.push(
                 VZVirtioBlockDeviceConfiguration::initWithAttachment(
                     VZVirtioBlockDeviceConfiguration::alloc(),
@@ -821,4 +851,34 @@ fn dropped() -> Error {
     Error::Io(std::io::Error::other(
         "Virtualization.framework dropped a call without completing it",
     ))
+}
+
+#[cfg(test)]
+mod disk_tests {
+    use super::*;
+
+    /// A guest flush on a macOS disk has to reach permanent storage, so every
+    /// attachment is made with full synchronization, writable or not.
+    #[test]
+    fn disks_are_attached_with_full_synchronization() {
+        let dir = std::env::temp_dir().join(format!("burrow-vz-disk-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let image = dir.join("disk.img");
+        std::fs::File::create(&image)
+            .unwrap()
+            .set_len(1 << 20)
+            .unwrap();
+        for read_only in [false, true] {
+            let attachment = disk_attachment(&image, read_only).unwrap();
+            unsafe {
+                assert_eq!(
+                    attachment.synchronizationMode(),
+                    VZDiskImageSynchronizationMode::Full
+                );
+                assert_eq!(attachment.cachingMode(), VZDiskImageCachingMode::Automatic);
+                assert_eq!(attachment.isReadOnly(), read_only);
+            }
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }

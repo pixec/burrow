@@ -57,12 +57,18 @@ pub struct Claims {
     pub iat: u64,
     pub exp: u64,
     pub jti: String,
+    /// `iat` to the millisecond, so a token issued just after a revoke in
+    /// the same second is told apart from one issued just before it. Absent
+    /// from a token an older orchestrator signed.
+    #[serde(default)]
+    pub iat_ms: u64,
 }
 
 impl Claims {
     /// A grant for `sandbox` on `node`, from now for `ttl_secs`.
     pub fn new(node: &str, sandbox: &str, ops: Vec<String>, user: String, ttl_secs: u32) -> Self {
-        let now = crate::unix_now() as u64;
+        let now_ms = crate::unix_now_ms() as u64;
+        let now = now_ms / 1000;
         Self {
             iss: ISSUER.into(),
             aud: node.into(),
@@ -72,11 +78,32 @@ impl Claims {
             iat: now,
             exp: now + u64::from(ttl_secs),
             jti: uuid::Uuid::new_v4().simple().to_string(),
+            iat_ms: now_ms,
         }
     }
 
     pub fn allows(&self, op: &str) -> bool {
         self.ops.iter().any(|held| held == op)
+    }
+
+    /// Unix milliseconds the token was issued at; the start of its second for
+    /// a token that says only the second.
+    pub fn issued_ms(&self) -> i64 {
+        match self.iat_ms {
+            0 => self.iat as i64 * 1000,
+            ms => ms as i64,
+        }
+    }
+}
+
+/// The unix millisecond tokens issued at or before are refused, from a
+/// sandbox record's two stamps. A record with only the second revokes all of
+/// it, as it did before milliseconds were kept.
+pub fn revoked_before_ms(revoked_at: i64, revoked_at_ms: i64) -> i64 {
+    match (revoked_at_ms, revoked_at) {
+        (0, 0) => 0,
+        (0, secs) => secs * 1000 + 999,
+        (ms, _) => ms,
     }
 }
 
@@ -390,7 +417,40 @@ mod tests {
             iat: now,
             exp: (now as i64 + exp_in) as u64,
             jti: "j".into(),
+            iat_ms: now * 1000,
         }
+    }
+
+    /// A token reissued in the same second as a revoke is told apart by its
+    /// millisecond, and survives the trip through signing.
+    #[test]
+    fn a_token_issued_after_a_revoke_in_the_same_second_is_not_revoked() {
+        let signer = signer();
+        let revoked_ms = crate::unix_now_ms();
+        let mut reissued = claims("node_a", 300);
+        reissued.iat = (revoked_ms / 1000) as u64;
+        reissued.iat_ms = revoked_ms as u64 + 1;
+        let token = signer.sign(&reissued).unwrap();
+        let read = verifier(&signer).verify(&token, "node_a").unwrap();
+        let revoked = revoked_before_ms(revoked_ms / 1000, revoked_ms);
+        assert!(read.issued_ms() > revoked);
+        reissued.iat_ms = revoked_ms as u64;
+        assert!(reissued.issued_ms() <= revoked);
+    }
+
+    /// A token or a record from before milliseconds were kept errs toward
+    /// refusing: its whole second is revoked.
+    #[test]
+    fn second_stamps_revoke_their_whole_second() {
+        let mut old = claims("node_a", 300);
+        old.iat = 1_793_000_000;
+        old.iat_ms = 0;
+        assert_eq!(old.issued_ms(), 1_793_000_000_000);
+        assert_eq!(revoked_before_ms(1_793_000_000, 0), 1_793_000_000_999);
+        assert!(old.issued_ms() <= revoked_before_ms(1_793_000_000, 0));
+        assert_eq!(revoked_before_ms(0, 0), 0);
+        let issued = Claims::new("node_a", "sbx_a", vec![], String::new(), 300);
+        assert_eq!(issued.iat, issued.iat_ms / 1000);
     }
 
     fn verifier(signer: &Signer) -> Verifier {

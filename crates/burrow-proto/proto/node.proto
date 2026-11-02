@@ -115,7 +115,7 @@ service NodeService {
   rpc Watch(burrow.api.v1.WatchRequest) returns (stream burrow.api.v1.WatchEvent);
   rpc Fs(burrow.api.v1.FsRequest) returns (burrow.api.v1.FsResponse);
   // Refuses the sandbox's outstanding Access tokens and ends what they opened.
-  rpc RevokeAccess(NodeSandboxRef) returns (burrow.api.v1.RevokeAccessResponse);
+  rpc RevokeAccess(NodeRevokeAccessRequest) returns (burrow.api.v1.RevokeAccessResponse);
   rpc ListCommands(burrow.api.v1.ListCommandsRequest) returns (burrow.api.v1.ListCommandsResponse);
   rpc GetCommand(burrow.api.v1.GetCommandRequest) returns (burrow.api.v1.CommandInfo);
   rpc SignalCommand(burrow.api.v1.SignalCommandRequest) returns (burrow.api.v1.SignalCommandResponse);
@@ -224,6 +224,14 @@ message PullTemplateResponse {
 
 message NodeSandboxRef {
   string sandbox_id = 1;
+}
+
+// A NodeSandboxRef with the stamp the orchestrator took, by the clock it
+// issues tokens by. 0, from an orchestrator that sends none, is the node's
+// own clock.
+message NodeRevokeAccessRequest {
+  string sandbox_id = 1;
+  int64 revoked_at_ms = 2;
 }
 
 message NodeUpdateNetworkRequest {

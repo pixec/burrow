@@ -7,11 +7,13 @@
 //! hold either way. The node token never enters into it: an Access token
 //! reaches these five calls and nothing else the node serves.
 //!
-//! Revocation works like a lock: RevokeAccess stamps the sandbox, every token
-//! issued at or before the stamp is refused from then on, and the sessions
-//! such tokens opened here are ended on the spot. A node that has stopped
-//! hearing from the orchestrator cannot know whether a revoke is waiting for
-//! it, so it refuses every token until it hears again.
+//! Revocation works like a lock: RevokeAccess stamps the sandbox, to the
+//! millisecond, every token issued at or before the stamp is refused from then
+//! on, the sessions such tokens opened here are ended on the spot, and the
+//! commands they started or typed into are killed. A token issued after the
+//! stamp, within the same second included, is untouched. A node that has
+//! stopped hearing from the orchestrator cannot know whether a revoke is
+//! waiting for it, so it refuses every token until it hears again.
 
 #![allow(clippy::result_large_err)]
 
@@ -59,16 +61,21 @@ pub fn apply_keys(keys: &RwLock<Keys>, announced: &[burrow_proto::node::v1::Acce
     held.heard = Some(Instant::now());
 }
 
-/// Direct sessions open on this node, by sandbox, so a revoke can end them.
+/// Direct sessions open on this node, by sandbox, so a revoke can end them,
+/// and the commands tokens drove, so it can kill those too.
 #[derive(Default)]
 pub struct Sessions {
     open: Mutex<HashMap<String, Vec<Arc<Session>>>>,
+    /// Commands a token started, or typed into over Attach, with when the
+    /// earliest such token was issued. Kept past the session: a command
+    /// outlives the stream that started it.
+    commands: Mutex<HashMap<String, HashMap<String, i64>>>,
 }
 
 pub struct Session {
     ended: CancellationToken,
-    /// The command an exec session started, once the guest has named it.
-    command: Mutex<Option<String>>,
+    /// When the token that opened it was issued, in unix milliseconds.
+    issued_ms: i64,
 }
 
 /// Holds a session open for as long as the call it belongs to runs.
@@ -91,10 +98,10 @@ impl Drop for Held {
 }
 
 impl Sessions {
-    fn open(self: &Arc<Self>, sandbox: &str) -> Held {
+    fn open(self: &Arc<Self>, sandbox: &str, issued_ms: i64) -> Held {
         let session = Arc::new(Session {
             ended: CancellationToken::new(),
-            command: Mutex::new(None),
+            issued_ms,
         });
         self.open
             .lock()
@@ -109,18 +116,85 @@ impl Sessions {
         }
     }
 
-    /// Ends every session open on `sandbox`, returning how many there were.
-    pub fn end_all(&self, sandbox: &str) -> usize {
-        let ended = self
-            .open
-            .lock()
-            .unwrap()
-            .remove(sandbox)
-            .unwrap_or_default();
+    /// Ends every session on `sandbox` whose token was issued at or before
+    /// `revoked_ms`, returning how many there were.
+    pub fn end_revoked(&self, sandbox: &str, revoked_ms: i64) -> usize {
+        let mut open = self.open.lock().unwrap();
+        let Some(list) = open.get_mut(sandbox) else {
+            return 0;
+        };
+        let (ended, kept): (Vec<_>, Vec<_>) = list
+            .drain(..)
+            .partition(|session| session.issued_ms <= revoked_ms);
+        if kept.is_empty() {
+            open.remove(sandbox);
+        } else {
+            *list = kept;
+        }
         for session in &ended {
             session.ended.cancel();
         }
         ended.len()
+    }
+
+    /// Notes that `session`'s token drove `command`. Returns whether the
+    /// command is to be killed now: a revoke that ended the session before
+    /// this could be noted did not know of it.
+    fn own(&self, sandbox: &str, command: &str, session: &Session) -> bool {
+        let mut commands = self.commands.lock().unwrap();
+        let issued = commands
+            .entry(sandbox.to_string())
+            .or_default()
+            .entry(command.to_string())
+            .or_insert(session.issued_ms);
+        *issued = (*issued).min(session.issued_ms);
+        session.ended.is_cancelled()
+    }
+
+    /// Takes the commands on `sandbox` that a token issued at or before
+    /// `revoked_ms` drove.
+    pub fn take_revoked(&self, sandbox: &str, revoked_ms: i64) -> Vec<String> {
+        let mut commands = self.commands.lock().unwrap();
+        let Some(held) = commands.get_mut(sandbox) else {
+            return Vec::new();
+        };
+        let mut revoked: Vec<String> = held
+            .iter()
+            .filter(|(_, issued)| **issued <= revoked_ms)
+            .map(|(id, _)| id.clone())
+            .collect();
+        revoked.sort();
+        held.retain(|_, issued| *issued > revoked_ms);
+        if held.is_empty() {
+            commands.remove(sandbox);
+        }
+        revoked
+    }
+
+    /// Forgets a sandbox that has left this node.
+    pub fn forget(&self, sandbox: &str) {
+        self.commands.lock().unwrap().remove(sandbox);
+    }
+}
+
+/// Kills a command a revoked token drove, and everything in its process group.
+pub async fn kill(api: &NodeApi, sandbox_id: &str, command_id: &str) {
+    let req = Request::new(api::SignalCommandRequest {
+        sandbox_id: sandbox_id.to_string(),
+        command_id: command_id.to_string(),
+        signal: 0,
+    });
+    match NodeService::signal_command(api, req).await {
+        Ok(_) => {}
+        // Already over, or pruned.
+        Err(err)
+            if matches!(
+                err.code(),
+                tonic::Code::FailedPrecondition | tonic::Code::NotFound
+            ) => {}
+        Err(err) => {
+            tracing::warn!(command = command_id, %err, "could not kill a command started under a revoked token");
+        }
     }
 }
 
@@ -167,9 +241,13 @@ impl AccessApi {
     /// sees the stamp or is already registered to be ended.
     async fn admit(&self, claims: &Claims, sandbox_id: &str, op: &str) -> Result<Held, Status> {
         permit(claims, sandbox_id, op)?;
-        let held = self.sessions.open(sandbox_id);
-        let sandbox = self.api.sandboxes.get(sandbox_id).await?;
-        if claims.iat as i64 <= sandbox.record().access_revoked_at {
+        let held = self.sessions.open(sandbox_id, claims.issued_ms());
+        let record = self.api.sandboxes.get(sandbox_id).await?.record();
+        let revoked_ms = burrow_common::access::revoked_before_ms(
+            record.access_revoked_at,
+            record.access_revoked_at_ms,
+        );
+        if claims.issued_ms() <= revoked_ms {
             return Err(revoked());
         }
         tracing::info!(
@@ -180,6 +258,39 @@ impl AccessApi {
             "direct access"
         );
         Ok(held)
+    }
+}
+
+impl AccessApi {
+    async fn own(&self, sandbox_id: &str, command_id: &str, held: &Held) {
+        if self.sessions.own(sandbox_id, command_id, &held.session) {
+            kill(&self.api, sandbox_id, command_id).await;
+        }
+    }
+}
+
+/// What notes an attacher's command as typed into by its token.
+struct Typer {
+    sessions: Arc<Sessions>,
+    api: Arc<NodeApi>,
+    session: Arc<Session>,
+    sandbox_id: String,
+    command_id: String,
+}
+
+impl Typer {
+    fn own(&self) {
+        if self
+            .sessions
+            .own(&self.sandbox_id, &self.command_id, &self.session)
+        {
+            let (api, sandbox_id, command_id) = (
+                Arc::clone(&self.api),
+                self.sandbox_id.clone(),
+                self.command_id.clone(),
+            );
+            tokio::spawn(async move { kill(&api, &sandbox_id, &command_id).await });
+        }
     }
 }
 
@@ -254,38 +365,20 @@ impl Access for AccessApi {
         let sandbox_id = start.sandbox_id.clone();
         let held = self.admit(&claims, &sandbox_id, OP_EXEC).await?;
         let inbound = tokio_stream::once(Ok(first)).chain(inbound);
-        let output = self.api.exec_stream(Box::pin(inbound)).await?;
+        let mut output = self.api.exec_stream(Box::pin(inbound)).await?;
 
         // A command outlives the stream that started it, so ending the
         // session alone would leave whatever the revoked token ran still
-        // running. It is killed too.
-        let session = Arc::clone(&held.session);
-        let api = Arc::clone(&self.api);
-        let killer = held.session.ended.clone();
-        tokio::spawn(async move {
-            killer.cancelled().await;
-            let command = session.command.lock().unwrap().take();
-            if let Some(command_id) = command {
-                let req = Request::new(api::SignalCommandRequest {
-                    sandbox_id,
-                    command_id,
-                    signal: 0,
-                });
-                if let Err(err) = NodeService::signal_command(&*api, req).await {
-                    tracing::warn!(%err, "could not kill a command started under a revoked token");
-                }
-            }
-        });
-        let session = Arc::clone(&held.session);
-        let output = output.map(move |msg| {
-            if let Ok(api::ExecOutput {
-                output: Some(api::exec_output::Output::CommandId(id)),
-            }) = &msg
-            {
-                *session.command.lock().unwrap() = Some(id.clone());
-            }
-            msg
-        });
+        // running. Its id comes first, and is noted before the caller hears
+        // of it, so a revoke kills it however long ago its stream went.
+        let first = output.next().await;
+        if let Some(Ok(api::ExecOutput {
+            output: Some(api::exec_output::Output::CommandId(id)),
+        })) = &first
+        {
+            self.own(&sandbox_id, id, &held).await;
+        }
+        let output = tokio_stream::iter(first).chain(output);
         Ok(Response::new(Box::pin(until_ended(output, held))))
     }
 
@@ -307,8 +400,25 @@ impl Access for AccessApi {
                 "first Attach message must be Start",
             ));
         };
-        let sandbox_id = start.sandbox_id.clone();
+        let (sandbox_id, command_id) = (start.sandbox_id.clone(), start.command_id.clone());
         let held = self.admit(&claims, &sandbox_id, OP_EXEC).await?;
+        // Typing into a command is as good as starting one: a shell runs what
+        // it is told, so what the token typed is the token's to answer for.
+        let typer = Typer {
+            sessions: Arc::clone(&self.sessions),
+            api: Arc::clone(&self.api),
+            session: Arc::clone(&held.session),
+            sandbox_id,
+            command_id,
+        };
+        let mut noted = false;
+        let inbound = inbound.map(move |msg| {
+            if !noted && msg.as_ref().is_ok_and(|msg| msg.input.is_some()) {
+                noted = true;
+                typer.own();
+            }
+            msg
+        });
         let inbound = tokio_stream::once(Ok(first)).chain(inbound);
         let output = self
             .api
@@ -426,11 +536,11 @@ mod tests {
     #[tokio::test]
     async fn ending_a_sandbox_s_sessions_fails_their_streams() {
         let sessions = Arc::new(Sessions::default());
-        let held = sessions.open("sbx_a");
-        let other = sessions.open("sbx_b");
+        let held = sessions.open("sbx_a", 1_000);
+        let other = sessions.open("sbx_b", 1_000);
         let pending = tokio_stream::pending::<Result<u32, Status>>();
         let mut stream = Box::pin(until_ended(pending, held));
-        assert_eq!(sessions.end_all("sbx_a"), 1);
+        assert_eq!(sessions.end_revoked("sbx_a", 1_000), 1);
         let item = stream.next().await.unwrap();
         assert_eq!(item.unwrap_err().code(), tonic::Code::Unauthenticated);
         assert!(stream.next().await.is_none());
@@ -440,7 +550,51 @@ mod tests {
     #[tokio::test]
     async fn a_finished_session_leaves_the_registry() {
         let sessions = Arc::new(Sessions::default());
-        drop(sessions.open("sbx_a"));
-        assert_eq!(sessions.end_all("sbx_a"), 0);
+        drop(sessions.open("sbx_a", 1_000));
+        assert_eq!(sessions.end_revoked("sbx_a", 1_000), 0);
+    }
+
+    /// A token reissued a moment after a revoke, in the same second, keeps
+    /// its session.
+    #[tokio::test]
+    async fn a_session_from_a_token_issued_after_the_revoke_is_kept() {
+        let sessions = Arc::new(Sessions::default());
+        let before = sessions.open("sbx_a", 1_793_000_000_400);
+        let after = sessions.open("sbx_a", 1_793_000_000_600);
+        assert_eq!(sessions.end_revoked("sbx_a", 1_793_000_000_500), 1);
+        assert!(before.session.ended.is_cancelled());
+        assert!(!after.session.ended.is_cancelled());
+    }
+
+    /// A command a revoked token started or typed into is killed however long
+    /// ago its stream ended; one only a later token drove, or one on another
+    /// sandbox, is left alone.
+    #[tokio::test]
+    async fn a_revoke_takes_every_command_its_tokens_drove() {
+        let sessions = Arc::new(Sessions::default());
+        let old = sessions.open("sbx_a", 400);
+        let new = sessions.open("sbx_a", 600);
+        let elsewhere = sessions.open("sbx_b", 400);
+        assert!(!sessions.own("sbx_a", "cmd_1", &old.session));
+        assert!(!sessions.own("sbx_a", "cmd_2", &new.session));
+        assert!(!sessions.own("sbx_a", "cmd_3", &new.session));
+        assert!(!sessions.own("sbx_a", "cmd_3", &old.session));
+        assert!(!sessions.own("sbx_b", "cmd_1", &elsewhere.session));
+        drop((old, new, elsewhere));
+        assert_eq!(sessions.take_revoked("sbx_a", 500), ["cmd_1", "cmd_3"]);
+        assert!(sessions.take_revoked("sbx_a", 500).is_empty());
+        assert_eq!(sessions.take_revoked("sbx_a", 700), ["cmd_2"]);
+        assert_eq!(sessions.take_revoked("sbx_b", 500), ["cmd_1"]);
+    }
+
+    /// A command whose id arrives after a revoke has already ended its
+    /// session is killed on the spot rather than missed.
+    #[tokio::test]
+    async fn a_command_noted_after_its_session_was_ended_is_killed() {
+        let sessions = Arc::new(Sessions::default());
+        let held = sessions.open("sbx_a", 400);
+        sessions.end_revoked("sbx_a", 500);
+        assert!(sessions.take_revoked("sbx_a", 500).is_empty());
+        assert!(sessions.own("sbx_a", "cmd_1", &held.session));
     }
 }

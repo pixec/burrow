@@ -6,6 +6,7 @@ import pytest
 from burrow._pb import common_pb2
 from burrow._policy import from_network_policy, resolve_network, to_network_policy
 from burrow.errors import BurrowError
+from burrow.types import PortRule
 
 
 def test_a_string_is_a_mode():
@@ -106,3 +107,59 @@ def test_the_wire_policy_reads_back_as_it_was_written():
     # A rule with no matcher is also readable in the pre-rules shape.
     assert back.inject_headers[0].domain == "api.example.com"
     assert back.inject_headers[0].name == "X-Token"
+
+
+def test_denied_ports_and_ipv6_reach_the_wire_in_open_mode():
+    wire = to_network_policy(
+        resolve_network(
+            {
+                "mode": "open",
+                "deny_ports": [
+                    {"protocol": "tcp", "port": 25},
+                    {"protocol": "tcp", "port": 465, "port_end": 587},
+                    {"port": 5432, "cidrs": ["10.0.0.0/8", "2001:db8::/32"]},
+                    PortRule(port=53, protocol="udp"),
+                ],
+                "deny_ipv6": True,
+            }
+        )
+    )
+    assert wire.mode == common_pb2.NETWORK_MODE_OPEN
+    assert wire.is_ipv6_denied
+    assert [
+        (rule.protocol, rule.port, rule.port_end, list(rule.cidrs))
+        for rule in wire.deny_ports
+    ] == [
+        (common_pb2.PORT_PROTOCOL_TCP, 25, 0, []),
+        (common_pb2.PORT_PROTOCOL_TCP, 465, 587, []),
+        (common_pb2.PORT_PROTOCOL_UNSPECIFIED, 5432, 0, ["10.0.0.0/8", "2001:db8::/32"]),
+        (common_pb2.PORT_PROTOCOL_UDP, 53, 0, []),
+    ]
+
+    back = from_network_policy(wire)
+    assert back.deny_ipv6
+    assert back.deny_ports == [
+        PortRule(port=25, protocol="tcp"),
+        PortRule(port=465, protocol="tcp", port_end=587),
+        PortRule(port=5432, protocol="any", cidrs=["10.0.0.0/8", "2001:db8::/32"]),
+        PortRule(port=53, protocol="udp"),
+    ]
+
+
+def test_the_new_fields_default_to_the_old_behaviour():
+    wire = to_network_policy(resolve_network("open"))
+    assert not wire.is_ipv6_denied
+    assert list(wire.deny_ports) == []
+    back = from_network_policy(wire)
+    assert back.deny_ports == [] and not back.deny_ipv6
+
+
+def test_a_misspelt_port_rule_is_refused_not_widened():
+    for bad, message in [
+        ({"protocol": "tpc", "port": 25}, "unknown protocol"),
+        ({"port": 25, "cidr": ["10.0.0.0/8"]}, "unknown key 'cidr'"),
+        ({"protocol": "tcp"}, "port is an integer"),
+        ({"port": "25"}, "port is an integer"),
+    ]:
+        with pytest.raises(BurrowError, match=message):
+            to_network_policy({"mode": "open", "deny_ports": [bad]})

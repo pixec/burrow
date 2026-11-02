@@ -45,6 +45,9 @@ const MANIFEST: &str = "manifest.json";
 const SCRATCH_IMAGE: &str = "scratch.ext4";
 const TEMPLATE_KERNEL: &str = "vmlinux";
 const TEMPLATE_ROOTFS: &str = "rootfs.ext4";
+/// The source's command logs, as far as its guest had produced them: the
+/// restored guest remembers those commands and is asked about them.
+pub const COMMAND_LOGS: &str = "command-logs";
 
 /// Prefix of the directory a snapshot is assembled in before it is renamed.
 ///
@@ -191,6 +194,34 @@ fn index_key(id: &str, file: &str) -> String {
     remote_key(id, &format!("{file}.index.json"))
 }
 
+/// One command log's index, beside the images' so the chunk sweep finds it.
+fn log_index_key(id: &str, name: &str) -> String {
+    index_key(id, &format!("{COMMAND_LOGS}/{name}"))
+}
+
+/// The names of the command logs a stored snapshot carries.
+fn log_names_key(id: &str) -> String {
+    remote_key(id, &format!("{COMMAND_LOGS}.json"))
+}
+
+/// What [`log_names_key`] holds; none for a snapshot uploaded before logs
+/// went with it.
+async fn remote_log_names(
+    remote: &crate::objstore::ObjectStore,
+    id: &str,
+) -> Result<Vec<String>, Status> {
+    let key = log_names_key(id);
+    let Some(bytes) = remote.get_bytes(&key).await? else {
+        return Ok(Vec::new());
+    };
+    let names: Vec<String> = serde_json::from_slice(&bytes)
+        .map_err(|err| Status::data_loss(format!("{key} is unreadable: {err}")))?;
+    Ok(names
+        .into_iter()
+        .filter(|name| name.ends_with(".log") && !name.contains('/'))
+        .collect())
+}
+
 /// Removes a snapshot's objects from the store. Blobs are left, since other
 /// snapshots may share them.
 ///
@@ -200,6 +231,10 @@ fn index_key(id: &str, file: &str) -> String {
 /// object that is not there is not an error.
 async fn delete_remote(remote: &crate::objstore::ObjectStore, id: &str) -> Result<(), Status> {
     remote.delete(&remote_key(id, MANIFEST)).await?;
+    for name in remote_log_names(remote, id).await? {
+        remote.delete(&log_index_key(id, &name)).await?;
+    }
+    remote.delete(&log_names_key(id)).await?;
     for layout in burrow_vmm::Hypervisor::ALL.map(burrow_vmm::Hypervisor::layout) {
         remote.delete(&remote_key(id, layout.state)).await?;
         for file in layout.memory.into_iter().chain([SCRATCH_IMAGE]) {
@@ -365,6 +400,13 @@ impl SnapshotStore {
             inspection_root: staged.inspection_root,
         };
         write_manifest(&dir, &manifest).await?;
+        // Every file on the disk, then the directory, before the rename that
+        // makes it a snapshot: the memory image and the disk are copies and
+        // links made moments ago, and a snapshot reported taken must not be
+        // one a power cut can tear.
+        crate::fsync::tree(&dir)
+            .await
+            .map_err(|err| Status::internal(format!("syncing the snapshot to disk: {err}")))?;
 
         let live = self.dir(id);
         // An id is generated per create, so a collision means a retry of a
@@ -373,6 +415,10 @@ impl SnapshotStore {
         tokio::fs::rename(&dir, &live)
             .await
             .map_err(|err| Status::internal(format!("publishing the snapshot: {err}")))?;
+        // And the rename itself, which lives in the store's directory.
+        crate::fsync::dir(&self.root)
+            .await
+            .map_err(|err| Status::internal(format!("syncing the snapshot store: {err}")))?;
         // Behind the response: the caller has its snapshot the moment it is on
         // this node's disk, and the upload is what makes it outlive the node.
         if self.remote.is_some() {
@@ -425,6 +471,24 @@ impl SnapshotStore {
                 .map_err(|err| Status::internal(format!("encoding an index: {err}")))?;
             remote.put_bytes(&index_key(id, file), json).await?;
         }
+        let logs = dir.join(COMMAND_LOGS);
+        let names = log_names(&logs);
+        for name in &names {
+            let index = crate::chunks::put_image(
+                remote,
+                &logs,
+                std::slice::from_ref(name),
+                None,
+                &Default::default(),
+            )
+            .await?;
+            let json = serde_json::to_vec(&index)
+                .map_err(|err| Status::internal(format!("encoding an index: {err}")))?;
+            remote.put_bytes(&log_index_key(id, name), json).await?;
+        }
+        let json = serde_json::to_vec(&names)
+            .map_err(|err| Status::internal(format!("encoding log names: {err}")))?;
+        remote.put_bytes(&log_names_key(id), json).await?;
         manifest.kernel_digest = digests[0].clone();
         manifest.rootfs_digest = digests[1].clone();
         manifest.is_chunked = true;
@@ -583,6 +647,14 @@ impl SnapshotStore {
             .is_none()
         {
             return Err(missing(file));
+        }
+        for name in remote_log_names(remote, id).await? {
+            let index = read_index(remote, &log_index_key(id, &name))
+                .await?
+                .ok_or_else(|| missing(&name))?;
+            create_private_dir(&dir.join(COMMAND_LOGS))
+                .map_err(|err| Status::internal(format!("fetching snapshot {id}'s logs: {err}")))?;
+            crate::chunks::get_image(remote, &index, &dir.join(COMMAND_LOGS).join(&name)).await?;
         }
         if manifest.is_chunked {
             let scratch = read_index(remote, &index_key(id, SCRATCH_IMAGE))
@@ -822,6 +894,7 @@ impl SnapshotStore {
         &self,
         id: &str,
         dest: &Path,
+        logs: &Path,
     ) -> Result<(Vec<String>, Option<Arc<Hydrator>>), Status> {
         validate_id(id)?;
         let dir = self.dir(id);
@@ -845,6 +918,16 @@ impl SnapshotStore {
         crate::warm::copy_sparse(&dir.join(SCRATCH_IMAGE), &dest.join(SCRATCH_IMAGE))
             .await
             .map_err(|err| io(SCRATCH_IMAGE, err))?;
+        let held = dir.join(COMMAND_LOGS);
+        let names = log_names(&held);
+        if !names.is_empty() {
+            create_private_dir(logs).map_err(|err| io(COMMAND_LOGS, err))?;
+        }
+        for name in names {
+            tokio::fs::copy(held.join(&name), logs.join(&name))
+                .await
+                .map_err(|err| io(&name, err))?;
+        }
         let memory = memory_file(layout)?;
         let arriving = match self.hydrator(id, memory)? {
             Some(hydrator) => hydrator
@@ -1130,16 +1213,11 @@ async fn write_manifest(dir: &Path, manifest: &Manifest) -> Result<(), Status> {
     let json = serde_json::to_vec_pretty(manifest)
         .map_err(|err| Status::internal(format!("encoding the manifest: {err}")))?;
     let temp = dir.join(format!(".{MANIFEST}.{}.tmp", std::process::id()));
-    tokio::fs::write(&temp, json)
+    // Synced before and after the rename, so a power cut leaves the old
+    // manifest or the new one, never an empty file that reads as no snapshot.
+    crate::fsync::replace(&dir.join(MANIFEST), &temp, json)
         .await
-        .map_err(|err| Status::internal(format!("writing the manifest: {err}")))?;
-    match tokio::fs::rename(&temp, dir.join(MANIFEST)).await {
-        Ok(()) => Ok(()),
-        Err(err) => {
-            let _ = tokio::fs::remove_file(&temp).await;
-            Err(Status::internal(format!("publishing the manifest: {err}")))
-        }
-    }
+        .map_err(|err| Status::internal(format!("writing the manifest: {err}")))
 }
 
 /// Reads a snapshot's manifest, or `None` for anything that is not one.
@@ -1156,6 +1234,27 @@ async fn read_manifest(dir: &Path) -> Option<Manifest> {
 /// What the snapshot actually occupies, counting allocated blocks rather than
 /// apparent length: the memory image and the scratch disk are both sparse, and
 /// their apparent size is the guest's memory rather than the node's disk.
+/// The log files in `dir`, which may not exist.
+fn log_names(dir: &Path) -> Vec<String> {
+    let mut names: Vec<String> = std::fs::read_dir(dir)
+        .into_iter()
+        .flatten()
+        .flatten()
+        .filter_map(|entry| entry.file_name().into_string().ok())
+        .filter(|name| name.ends_with(".log"))
+        .collect();
+    names.sort();
+    names
+}
+
+fn create_private_dir(dir: &Path) -> std::io::Result<()> {
+    use std::os::unix::fs::DirBuilderExt as _;
+    std::fs::DirBuilder::new()
+        .recursive(true)
+        .mode(0o700)
+        .create(dir)
+}
+
 async fn directory_size(dir: &Path) -> u64 {
     let Ok(mut entries) = tokio::fs::read_dir(dir).await else {
         return 0;
@@ -1446,6 +1545,128 @@ mod tests {
 
         assert!(!remote.exists(&remote_key(&id, MANIFEST)).await.unwrap());
         assert!(!remote.exists(&remote_key(&id, layout.state)).await.unwrap());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// A sandbox restored from a snapshot on another node remembers the
+    /// commands its source ran, so their logs go through the store with it.
+    #[tokio::test]
+    async fn a_stored_snapshot_brings_its_command_logs() {
+        let remote = crate::objstore::fake::store(true).await;
+        let scratch = std::env::temp_dir().join(format!(
+            "burrow-snapshots-logs-{}",
+            burrow_common::SnapshotId::generate()
+        ));
+        let taken = SnapshotStore::new(&scratch.join("a"), Some(remote.clone()), HashMap::new());
+        let id = burrow_common::SnapshotId::generate().to_string();
+        let dir = taken.dir(&id);
+        tokio::fs::create_dir_all(dir.join(COMMAND_LOGS))
+            .await
+            .unwrap();
+        let written = manifest(&id, "sbx_a", "2026-09-02T10:00:00Z");
+        let layout = written.layout().unwrap();
+        for file in [
+            TEMPLATE_KERNEL,
+            TEMPLATE_ROOTFS,
+            layout.state,
+            layout.memory.unwrap(),
+            SCRATCH_IMAGE,
+        ] {
+            tokio::fs::write(dir.join(file), vec![7u8; 8192])
+                .await
+                .unwrap();
+        }
+        let log = b"a whole command log".to_vec();
+        tokio::fs::write(dir.join(COMMAND_LOGS).join("cmd_1.0.log"), &log)
+            .await
+            .unwrap();
+        write_manifest(&dir, &written).await.unwrap();
+        taken.upload(&id).await.unwrap();
+
+        let elsewhere =
+            SnapshotStore::new(&scratch.join("b"), Some(remote.clone()), HashMap::new());
+        let (dest, logs) = (scratch.join("sandbox"), scratch.join("logs"));
+        tokio::fs::create_dir_all(&dest).await.unwrap();
+        elsewhere.stage_into(&id, &dest, &logs).await.unwrap();
+        assert_eq!(
+            tokio::fs::read(logs.join("cmd_1.0.log")).await.unwrap(),
+            log
+        );
+
+        delete_remote(&remote, &id).await.unwrap();
+        assert!(
+            !remote
+                .exists(&log_index_key(&id, "cmd_1.0.log"))
+                .await
+                .unwrap()
+        );
+        assert!(!remote.exists(&log_names_key(&id)).await.unwrap());
+        let _ = std::fs::remove_dir_all(&scratch);
+    }
+
+    /// A snapshot is reported taken only once every file in it, the manifest
+    /// included, is on the disk, then its directory, then the store directory
+    /// the rename published it into.
+    #[tokio::test]
+    async fn a_published_snapshot_is_synced_file_by_file_then_by_directory() {
+        let (store, root) = store();
+        let id = burrow_common::SnapshotId::generate().to_string();
+        let dir = store.begin(&id).await.unwrap();
+        let layout = burrow_vmm::Hypervisor::Firecracker.layout();
+        let memory = layout.memory.unwrap();
+        for file in [
+            TEMPLATE_KERNEL,
+            TEMPLATE_ROOTFS,
+            layout.state,
+            memory,
+            SCRATCH_IMAGE,
+        ] {
+            tokio::fs::write(dir.join(file), b"bytes").await.unwrap();
+        }
+        let staged = Staged {
+            sandbox_id: "sbx_a".into(),
+            template: "default".into(),
+            vcpus: 1,
+            mem_mib: 512,
+            scratch_disk_mib: 1024,
+            hypervisor: burrow_vmm::Hypervisor::Firecracker,
+            chain: vec![memory.to_string()],
+            inspection_root: String::new(),
+        };
+        store.publish(&id, staged, 0).await.unwrap();
+
+        use crate::fsync::Synced;
+        let syncs = crate::fsync::record::under(&root);
+        let staged_dir = store.staging(&id);
+        let files: Vec<&Synced> = syncs
+            .iter()
+            .filter(
+                |s| matches!(s, Synced::File(path) if path.parent() == Some(staged_dir.as_path())),
+            )
+            .collect();
+        for name in [
+            TEMPLATE_KERNEL,
+            TEMPLATE_ROOTFS,
+            layout.state,
+            memory,
+            SCRATCH_IMAGE,
+            MANIFEST,
+        ] {
+            assert!(
+                files.contains(&&Synced::File(staged_dir.join(name))),
+                "{name} was not synced: {syncs:?}"
+            );
+        }
+        let position = |want: &Synced| syncs.iter().rposition(|s| s == want).unwrap();
+        let staged_sync = position(&Synced::Dir(staged_dir.clone()));
+        let root_sync = position(&Synced::Dir(store.root.clone()));
+        let last_file = syncs
+            .iter()
+            .rposition(|s| matches!(s, Synced::File(_)))
+            .unwrap();
+        assert!(last_file < staged_sync, "{syncs:?}");
+        assert!(staged_sync < root_sync, "{syncs:?}");
+        assert!(store.dir(&id).join(MANIFEST).exists());
         let _ = std::fs::remove_dir_all(&root);
     }
 }

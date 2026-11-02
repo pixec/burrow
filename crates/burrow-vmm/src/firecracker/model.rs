@@ -33,6 +33,36 @@ pub struct Drive {
     pub path_on_host: String,
     pub is_root_device: bool,
     pub is_read_only: bool,
+    /// Always sent. Firecracker's default, `Unsafe`, tells the guest the disk
+    /// has no write cache, so the guest never sends a flush and its `fsync`
+    /// stops in the host page cache: a power cut loses writes the guest was
+    /// told were durable.
+    pub cache_type: CacheType,
+}
+
+impl Drive {
+    /// The drive Firecracker is given for `spec`, the one place a drive is
+    /// rendered, so a boot and a hotplug cannot disagree on its cache mode.
+    pub fn from_spec(spec: &crate::DriveSpec) -> Self {
+        Self {
+            drive_id: spec.id.clone(),
+            path_on_host: spec.path.clone(),
+            is_root_device: spec.is_root,
+            is_read_only: spec.is_read_only,
+            cache_type: CacheType::Writeback,
+        }
+    }
+}
+
+/// How a drive's writes reach the host.
+///
+/// `Writeback` advertises a volatile write cache (`VIRTIO_BLK_F_FLUSH`): the
+/// guest sends a flush when it needs durability, and Firecracker answers it by
+/// `fsync`ing the backing file. Ordinary writes cost the same as under
+/// Firecracker's default, `Unsafe`, which Burrow never asks for.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+pub enum CacheType {
+    Writeback,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -127,6 +157,40 @@ impl VmState {
         match self {
             VmState::Paused => "Paused",
             VmState::Resumed => "Resumed",
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Every drive, the read-only root and a volume as much as the scratch
+    /// disk, goes to Firecracker with a write cache it flushes.
+    #[test]
+    fn every_drive_is_rendered_writeback() {
+        let volume = crate::DriveSpec {
+            id: "volume0".into(),
+            path: "volume0.ext4".into(),
+            is_root: false,
+            is_read_only: false,
+        };
+        let read_only_volume = crate::DriveSpec {
+            is_read_only: true,
+            ..volume.clone()
+        };
+        for spec in [
+            crate::DriveSpec::root_ro("rootfs.ext4"),
+            crate::DriveSpec::scratch_rw("scratch.ext4"),
+            volume,
+            read_only_volume,
+        ] {
+            let body = serde_json::to_value(Drive::from_spec(&spec)).unwrap();
+            assert_eq!(body["cache_type"], "Writeback", "{}", spec.id);
+            assert_eq!(body["drive_id"], spec.id.as_str());
+            assert_eq!(body["path_on_host"], spec.path.as_str());
+            assert_eq!(body["is_read_only"], spec.is_read_only);
+            assert_eq!(body["is_root_device"], spec.is_root);
         }
     }
 }

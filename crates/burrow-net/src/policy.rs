@@ -9,13 +9,13 @@
 
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 
-use crate::firewall::{DNS_PORT, Mode, PROXY_PORT};
+use crate::firewall::{DNS_PORT, Mode, PROXY_PORT, Protocol};
 
 /// The renderer's validated form of [`crate::firewall::SANDBOX_CIDR`]. Nothing
 /// reaches the nft script that was not parsed first, a constant included, so
 /// this is built from [`crate::ipam`]'s numbers rather than from the string.
 pub(crate) const SANDBOX_POOL: Cidr = Cidr {
-    addr: crate::ipam::POOL_ADDRESS,
+    addr: IpAddr::V4(crate::ipam::POOL_ADDRESS),
     prefix: crate::ipam::POOL_PREFIX,
 };
 
@@ -27,14 +27,20 @@ pub(crate) const SANDBOX_POOL: Cidr = Cidr {
 /// so without this the metadata service is reachable from any open-mode
 /// sandbox on a cloud host.
 pub(crate) const METADATA_CIDR: Cidr = Cidr {
-    addr: Ipv4Addr::new(169, 254, 0, 0),
+    addr: IpAddr::V4(Ipv4Addr::new(169, 254, 0, 0)),
     prefix: 16,
 };
 
 /// Ports allowlist mode hands to the egress proxy, which decides by name.
 pub const PROXIED_PORTS: [u16; 2] = [80, 443];
 
-/// A validated `allow_cidrs` entry.
+/// Most port denials one policy may carry. Each renders a handful of rules
+/// into the node's one ruleset, so the count is part of every packet's cost.
+pub const MAX_PORT_DENIALS: usize = 64;
+/// Most destination ranges one port denial may be narrowed to.
+pub const MAX_PORT_DENIAL_CIDRS: usize = 16;
+
+/// A validated CIDR, of either family.
 ///
 /// `nft -f -` reads a script, one command per line, so a caller's string
 /// reaching it verbatim is rule injection: a newline inside a "CIDR" would
@@ -42,18 +48,46 @@ pub const PROXIED_PORTS: [u16; 2] = [80, 443];
 /// parsed address and prefix are rendered.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct Cidr {
-    pub(crate) addr: Ipv4Addr,
+    pub(crate) addr: IpAddr,
     pub(crate) prefix: u8,
 }
 
 impl Cidr {
-    pub(crate) fn contains(self, address: Ipv4Addr) -> bool {
-        // A /0 covers everything, and shifting a u32 by 32 is undefined.
-        let mask = match self.prefix {
-            0 => 0,
-            bits => u32::MAX << (32 - bits),
-        };
-        u32::from(self.addr) & mask == u32::from(address) & mask
+    /// Whether `address` is inside this range. A range only ever covers its
+    /// own family, exactly as an `ip daddr` match never sees a v6 packet.
+    pub(crate) fn contains(self, address: IpAddr) -> bool {
+        match (self.addr, address) {
+            (IpAddr::V4(network), IpAddr::V4(address)) => {
+                // A /0 covers everything, and shifting by the width is
+                // undefined.
+                let mask = match self.prefix {
+                    0 => 0,
+                    bits => u32::MAX << (32 - bits),
+                };
+                u32::from(network) & mask == u32::from(address) & mask
+            }
+            (IpAddr::V6(network), IpAddr::V6(address)) => {
+                let mask = match self.prefix {
+                    0 => 0,
+                    bits => u128::MAX << (128 - bits),
+                };
+                u128::from(network) & mask == u128::from(address) & mask
+            }
+            _ => false,
+        }
+    }
+
+    pub(crate) fn is_v4(self) -> bool {
+        self.addr.is_ipv4()
+    }
+
+    /// The nftables destination match for this range's family.
+    pub(crate) fn daddr(self) -> &'static str {
+        if self.is_v4() {
+            "ip daddr"
+        } else {
+            "ip6 daddr"
+        }
     }
 }
 
@@ -63,31 +97,135 @@ impl std::fmt::Display for Cidr {
     }
 }
 
-/// Parses `a.b.c.d[/len]`, rejecting anything else.
+/// Parses `a.b.c.d[/len]` or `v6[/len]`, rejecting anything else.
 ///
-/// A bare address is a /32, which is what an operator writing one means.
-/// Whitespace, a second slash, `+32` and a prefix over 32 are refused rather
-/// than interpreted.
+/// A bare address is a host route, /32 or /128, which is what an operator
+/// writing one means. Whitespace, a second slash, `+32`, a zone id and a
+/// prefix longer than the family's are refused rather than interpreted.
 pub(crate) fn parse_cidr(value: &str) -> Option<Cidr> {
-    let (addr, prefix) = match value.split_once('/') {
+    let (addr, len) = match value.split_once('/') {
         Some((addr, len)) => {
             // `str::parse` for integers accepts a leading `+`; a prefix length
             // is digits and nothing else.
             if len.is_empty() || !len.bytes().all(|b| b.is_ascii_digit()) {
                 return None;
             }
-            let prefix: u8 = len.parse().ok()?;
-            if prefix > 32 {
-                return None;
-            }
-            (addr, prefix)
+            (addr, Some(len.parse::<u8>().ok()?))
         }
-        None => (value, 32),
+        None => (value, None),
     };
-    Some(Cidr {
-        addr: addr.parse::<Ipv4Addr>().ok()?,
-        prefix,
-    })
+    let addr: IpAddr = addr.parse().ok()?;
+    let width = if addr.is_ipv4() { 32 } else { 128 };
+    let prefix = len.unwrap_or(width);
+    if prefix > width {
+        return None;
+    }
+    Some(Cidr { addr, prefix })
+}
+
+/// One `deny_ports` entry as the caller wrote it, before validation.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct PortDenial {
+    /// The transport it applies to; `None` is both TCP and UDP.
+    pub protocol: Option<Protocol>,
+    /// First port of the range.
+    pub first: u32,
+    /// Last port of the range, inclusive. 0 means `first` alone.
+    pub last: u32,
+    /// Destination ranges it is narrowed to, of either family. Empty is every
+    /// destination.
+    pub cidrs: Vec<String>,
+}
+
+/// A validated [`PortDenial`]: only these numbers ever reach the ruleset.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct PortBlock {
+    pub(crate) protocol: Option<Protocol>,
+    pub(crate) first: u16,
+    pub(crate) last: u16,
+    pub(crate) cidrs: Vec<Cidr>,
+}
+
+impl PortBlock {
+    fn validate(denial: &PortDenial) -> Option<Self> {
+        let first = u16::try_from(denial.first).ok().filter(|p| *p != 0)?;
+        let last = match denial.last {
+            0 => first,
+            last => u16::try_from(last).ok().filter(|l| *l >= first)?,
+        };
+        if denial.cidrs.len() > MAX_PORT_DENIAL_CIDRS {
+            return None;
+        }
+        let cidrs = denial
+            .cidrs
+            .iter()
+            .map(|entry| parse_cidr(entry))
+            .collect::<Option<Vec<_>>>()?;
+        Some(Self {
+            protocol: denial.protocol,
+            first,
+            last,
+            cidrs,
+        })
+    }
+
+    /// The nftables keywords of the transports this covers.
+    pub(crate) fn protocols(&self) -> &'static [&'static str] {
+        match self.protocol {
+            None => &["tcp", "udp"],
+            Some(Protocol::Tcp) => &["tcp"],
+            Some(Protocol::Udp) => &["udp"],
+        }
+    }
+
+    /// The ports as an nftables value: `25`, or the range `465-587`.
+    pub(crate) fn ports(&self) -> String {
+        if self.first == self.last {
+            self.first.to_string()
+        } else {
+            format!("{}-{}", self.first, self.last)
+        }
+    }
+
+    fn matches(&self, destination: IpAddr, transport: Transport, port: u16) -> bool {
+        let protocol = match transport {
+            Transport::Tcp => Protocol::Tcp,
+            Transport::Udp => Protocol::Udp,
+            Transport::Icmp => return false,
+        };
+        self.protocol.is_none_or(|p| p == protocol)
+            && (self.first..=self.last).contains(&port)
+            && (self.cidrs.is_empty() || self.cidrs.iter().any(|c| c.contains(destination)))
+    }
+}
+
+/// A sandbox's validated denials: ranges and ports refused ahead of every
+/// allowance.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub(crate) struct Denials {
+    pub(crate) cidrs: Vec<Cidr>,
+    pub(crate) ports: Vec<PortBlock>,
+}
+
+impl Denials {
+    fn refusal(
+        &self,
+        destination: IpAddr,
+        transport: Transport,
+        port: u16,
+    ) -> Option<&'static str> {
+        if self.cidrs.iter().any(|cidr| cidr.contains(destination)) {
+            Some("destination is in a denied range")
+        } else if self
+            .ports
+            .iter()
+            .any(|block| block.matches(destination, transport, port))
+        {
+            Some("destination port is denied")
+        } else {
+            None
+        }
+    }
 }
 
 /// The validated form of a sandbox's L3 allowance, or `None` when any part of
@@ -104,7 +242,9 @@ pub(crate) fn validated_allowance(
 ) -> Option<(Vec<Cidr>, Vec<u16>)> {
     let mut cidrs = Vec::with_capacity(allow_cidrs.len());
     for entry in allow_cidrs {
-        match parse_cidr(entry) {
+        // IPv4 only: an allowance is forwarded at L3, and nothing but open
+        // mode forwards IPv6.
+        match parse_cidr(entry).filter(|cidr| cidr.is_v4()) {
             Some(cidr) => cidrs.push(cidr),
             None => {
                 tracing::error!(
@@ -135,13 +275,17 @@ pub(crate) fn validated_allowance(
     Some((cidrs, ports))
 }
 
-/// The validated form of a sandbox's denied ranges, or `None` when any entry
-/// is malformed.
+/// The validated form of a sandbox's denied ranges and ports, or `None` when
+/// any entry is malformed.
 ///
 /// Fails the opposite way from [`validated_allowance`]: dropping an unparseable
 /// denial would grant exactly the access the operator asked to withhold, so the
 /// caller turns `None` into a blanket drop for the sandbox.
-pub(crate) fn validated_denials(sandbox_id: &str, deny_cidrs: &[String]) -> Option<Vec<Cidr>> {
+pub(crate) fn validated_denials(
+    sandbox_id: &str,
+    deny_cidrs: &[String],
+    deny_ports: &[PortDenial],
+) -> Option<Denials> {
     let mut cidrs = Vec::with_capacity(deny_cidrs.len());
     for entry in deny_cidrs {
         match parse_cidr(entry) {
@@ -156,7 +300,39 @@ pub(crate) fn validated_denials(sandbox_id: &str, deny_cidrs: &[String]) -> Opti
             }
         }
     }
-    Some(cidrs)
+    if deny_ports.len() > MAX_PORT_DENIALS {
+        tracing::error!(
+            sandbox = sandbox_id,
+            count = deny_ports.len(),
+            "rejecting an oversized deny_ports list; this sandbox gets no egress at all"
+        );
+        return None;
+    }
+    let mut ports = Vec::with_capacity(deny_ports.len());
+    for denial in deny_ports {
+        match PortBlock::validate(denial) {
+            Some(block) => ports.push(block),
+            None => {
+                tracing::error!(
+                    sandbox = sandbox_id,
+                    "rejecting a malformed deny_ports entry; this sandbox gets no egress \
+                     at all"
+                );
+                return None;
+            }
+        }
+    }
+    Some(Denials { cidrs, ports })
+}
+
+/// What a sandbox's policy refuses ahead of every allowance, as the caller
+/// wrote it.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct Deny<'a> {
+    pub cidrs: &'a [String],
+    pub ports: &'a [PortDenial],
+    /// Refuse every IPv6 destination beyond the sandbox's own gateway.
+    pub is_ipv6_denied: bool,
 }
 
 /// One sandbox's L3 policy, validated once rather than per flow.
@@ -164,7 +340,8 @@ pub(crate) fn validated_denials(sandbox_id: &str, deny_cidrs: &[String]) -> Opti
 pub struct Rules {
     mode: Mode,
     allowance: Option<(Vec<Cidr>, Vec<u16>)>,
-    denials: Option<Vec<Cidr>>,
+    denials: Option<Denials>,
+    is_ipv6_denied: bool,
     peers: Vec<Ipv4Addr>,
 }
 
@@ -176,13 +353,14 @@ impl Rules {
         mode: Mode,
         allow_cidrs: &[String],
         allow_ports: &[u32],
-        deny_cidrs: &[String],
+        deny: Deny<'_>,
         peers: &[Ipv4Addr],
     ) -> Self {
         Self {
             mode,
             allowance: validated_allowance(sandbox_id, allow_cidrs, allow_ports),
-            denials: validated_denials(sandbox_id, deny_cidrs),
+            denials: validated_denials(sandbox_id, deny.cidrs, deny.ports),
+            is_ipv6_denied: deny.is_ipv6_denied,
             peers: peers.to_vec(),
         }
     }
@@ -246,10 +424,15 @@ pub fn decide(
     port: u16,
 ) -> Verdict {
     let is_peer = matches!(destination, IpAddr::V4(v4) if rules.peers.contains(&v4));
+    // A sandbox denied IPv6 gets no v6 redirect: the proxy is egress too.
+    let is_redirected_family = destination.is_ipv4() || !rules.is_ipv6_denied;
+    // Denied ports on 80 and 443 are not exempt from the redirect. The proxy
+    // refuses them, as it refuses a denied range, and records the refusal.
     if rules.mode == Mode::Allowlist
         && transport == Transport::Tcp
         && PROXIED_PORTS.contains(&port)
         && !is_peer
+        && is_redirected_family
     {
         return Verdict::Proxy;
     }
@@ -279,30 +462,33 @@ pub fn decide(
         return Verdict::Deny("destination is a control-plane address");
     }
 
-    let destination = match destination {
+    let v4 = match destination {
         IpAddr::V4(v4) => v4,
-        IpAddr::V6(v6) => return decide_v6(rules, v6),
+        IpAddr::V6(v6) => return decide_v6(rules, v6, transport, port),
     };
     if METADATA_CIDR.contains(destination) {
         return Verdict::Deny("destination is an internal or metadata address");
     }
     let Some(denials) = &rules.denials else {
-        return Verdict::Deny("policy has a malformed deny_cidrs entry");
+        return Verdict::Deny("policy has a malformed denial");
     };
-    if denials.iter().any(|cidr| cidr.contains(destination)) {
-        return Verdict::Deny("destination is in a denied range");
+    if let Some(reason) = denials.refusal(destination, transport, port) {
+        return Verdict::Deny(reason);
     }
+    let destination = v4;
     if is_peer {
         return Verdict::Direct;
     }
     if rules.mode == Mode::Open {
-        if SANDBOX_POOL.contains(destination) {
+        if SANDBOX_POOL.contains(IpAddr::V4(destination)) {
             return Verdict::Deny("destination is another sandbox");
         }
         return Verdict::Direct;
     }
     if let Some((cidrs, ports)) = &rules.allowance
-        && cidrs.iter().any(|cidr| cidr.contains(destination))
+        && cidrs
+            .iter()
+            .any(|cidr| cidr.contains(IpAddr::V4(destination)))
         && (ports.is_empty() || (transport != Transport::Icmp && ports.contains(&port)))
     {
         return Verdict::Direct;
@@ -346,11 +532,21 @@ pub fn decide_peer(sender: Option<Verdict>, receiver: Option<&Rules>, source: Ip
     }
 }
 
-/// The sandbox chain's v6 rules: link-local denied in every mode, and only
-/// open mode forwarding at all, never into the fleet's v6 pool.
-fn decide_v6(rules: &Rules, destination: Ipv6Addr) -> Verdict {
+/// The sandbox chain's v6 rules: link-local denied in every mode, then the
+/// policy's own denials, and only open mode forwarding at all, never into the
+/// fleet's v6 pool.
+fn decide_v6(rules: &Rules, destination: Ipv6Addr, transport: Transport, port: u16) -> Verdict {
     if (destination.segments()[0] & 0xffc0) == 0xfe80 {
         return Verdict::Deny("destination is an internal or metadata address");
+    }
+    if rules.is_ipv6_denied {
+        return Verdict::Deny("ipv6 egress is denied");
+    }
+    let Some(denials) = &rules.denials else {
+        return Verdict::Deny("policy has a malformed denial");
+    };
+    if let Some(reason) = denials.refusal(IpAddr::V6(destination), transport, port) {
+        return Verdict::Deny(reason);
     }
     if rules.mode != Mode::Open {
         return Verdict::Deny("ipv6 egress is open mode only");
@@ -382,6 +578,8 @@ mod tests {
             mode,
             allow_cidrs: vec![],
             deny_cidrs: vec![],
+            deny_ports: vec![],
+            is_ipv6_denied: false,
             allow_ports: vec![],
             peers: vec![],
             ports: vec![],
@@ -394,13 +592,18 @@ mod tests {
             sandbox.mode,
             &sandbox.allow_cidrs,
             &sandbox.allow_ports,
-            &sandbox.deny_cidrs,
+            Deny {
+                cidrs: &sandbox.deny_cidrs,
+                ports: &sandbox.deny_ports,
+                is_ipv6_denied: sandbox.is_ipv6_denied,
+            },
             &sandbox.peers,
         )
     }
 
-    /// The `<proto> dport <ports>` match of a rule, if it has one.
-    fn dport(rule: &str) -> Option<(&str, Vec<u16>)> {
+    /// The `<proto> dport <ports>` match of a rule, if it has one, as
+    /// inclusive ranges: a port is `25` or `465-587`.
+    fn dport(rule: &str) -> Option<(&str, Vec<(u16, u16)>)> {
         let (head, rest) = rule.split_once(" dport ")?;
         let proto = head.rsplit(' ').next()?;
         let list = match rest.strip_prefix("{ ") {
@@ -409,23 +612,25 @@ mod tests {
         };
         Some((
             proto,
-            list.split(", ").map(|p| p.parse().unwrap()).collect(),
+            list.split(", ")
+                .map(|p| match p.split_once('-') {
+                    Some((a, b)) => (a.parse().unwrap(), b.parse().unwrap()),
+                    None => (p.parse().unwrap(), p.parse().unwrap()),
+                })
+                .collect(),
         ))
     }
 
-    /// Whether a rule's `ip daddr` match, a CIDR or a `{ set }`, covers `to`.
+    /// Whether a rule's `ip daddr` match, a CIDR or a `{ set }` of them,
+    /// covers `to`.
     fn daddr(rule: &str, to: Ipv4Addr) -> bool {
         let Some((_, rest)) = rule.split_once("ip daddr ") else {
             return true;
         };
+        let covers = |entry: &str| parse_cidr(entry).is_some_and(|c| c.contains(IpAddr::V4(to)));
         match rest.strip_prefix("{ ") {
-            Some(set) => set
-                .split(" }")
-                .next()
-                .unwrap()
-                .split(", ")
-                .any(|a| a == to.to_string()),
-            None => parse_cidr(rest.split(' ').next().unwrap()).is_some_and(|c| c.contains(to)),
+            Some(set) => set.split(" }").next().unwrap().split(", ").any(covers),
+            None => covers(rest.split(' ').next().unwrap()),
         }
     }
 
@@ -442,7 +647,9 @@ mod tests {
         };
         let matches = |rule: &str, to: Ipv4Addr, port: u16| {
             daddr(rule, to)
-                && dport(rule).is_none_or(|(p, ports)| p == proto && ports.contains(&port))
+                && dport(rule).is_none_or(|(p, ports)| {
+                    p == proto && ports.iter().any(|(a, b)| (*a..=*b).contains(&port))
+                })
         };
         let chain = |name: &str| {
             let prefix = format!("add rule {name} ");
@@ -533,6 +740,44 @@ mod tests {
         broken.deny_cidrs = vec!["not a cidr".into()];
         let mut allow_with_peer = sandbox(Mode::Allowlist);
         allow_with_peer.peers = vec![peer];
+        // Port denials: everywhere, a range, one transport, and one scoped to
+        // a range, in both modes that have egress to deny.
+        let smtp = vec![
+            PortDenial {
+                protocol: Some(Protocol::Tcp),
+                first: 25,
+                ..Default::default()
+            },
+            PortDenial {
+                protocol: Some(Protocol::Tcp),
+                first: 465,
+                last: 587,
+                ..Default::default()
+            },
+            PortDenial {
+                protocol: None,
+                first: 5432,
+                cidrs: vec!["10.2.0.0/16".into(), "2001:db8::/32".into()],
+                ..Default::default()
+            },
+        ];
+        let mut open_ports = sandbox(Mode::Open);
+        open_ports.deny_ports = smtp.clone();
+        open_ports.peers = vec![peer];
+        let mut allow_ports_denied = sandbox(Mode::Allowlist);
+        allow_ports_denied.allow_cidrs = vec!["10.2.0.0/16".into()];
+        allow_ports_denied.deny_ports = smtp.clone();
+        allow_ports_denied.deny_ports.push(PortDenial {
+            protocol: Some(Protocol::Tcp),
+            first: 443,
+            ..Default::default()
+        });
+        let mut broken_ports = sandbox(Mode::Open);
+        broken_ports.deny_ports = vec![PortDenial {
+            first: 600,
+            last: 599,
+            ..Default::default()
+        }];
 
         let destinations = [
             public,
@@ -553,6 +798,9 @@ mod tests {
             (Transport::Udp, 53),
             (Transport::Udp, 5432),
             (Transport::Tcp, PROXY_PORT),
+            (Transport::Tcp, 25),
+            (Transport::Udp, 25),
+            (Transport::Tcp, 500),
             (Transport::Icmp, 0),
         ];
         let node_denials = NodeDenials {
@@ -569,6 +817,9 @@ mod tests {
             open,
             broken,
             allow_with_peer,
+            open_ports,
+            allow_ports_denied,
+            broken_ports,
         ] {
             let ruleset = render_with(std::slice::from_ref(&sandbox), &[CONTROL]);
             let rules = rules_of(&sandbox);
@@ -588,7 +839,7 @@ mod tests {
                 }
             }
         }
-        assert_eq!(checked, 8 * 9 * 8);
+        assert_eq!(checked, 11 * 9 * 11);
     }
 
     /// What the rendered ruleset does with the first packet of a new flow
@@ -613,7 +864,9 @@ mod tests {
             !rule.contains("iifname")
                 && source.is_none_or(|source| source == from.to_string())
                 && daddr(rule, to)
-                && dport(rule).is_none_or(|(p, ports)| p == proto && ports.contains(&port))
+                && dport(rule).is_none_or(|(p, ports)| {
+                    p == proto && ports.iter().any(|(a, b)| (*a..=*b).contains(&port))
+                })
         };
         let chain = |name: &str| {
             let prefix = format!("add rule {name} ");
@@ -671,14 +924,36 @@ mod tests {
         for sender_mode in [Mode::None, Mode::Allowlist, Mode::Open] {
             for receiver_mode in [Mode::None, Mode::Allowlist, Mode::Open] {
                 for is_member in [true, false] {
-                    for is_denied in [false, true] {
+                    // A denied range covering the peer, or denied ports
+                    // narrowed to nothing else: either is egress, and holds
+                    // between peers as it does towards the internet.
+                    for denial in [None, Some(false), Some(true)] {
+                        let is_denied = denial.is_some();
+                        let deny = |sandbox: &mut SandboxRules, cidr: &str| match denial {
+                            Some(false) => sandbox.deny_cidrs = vec![cidr.into()],
+                            Some(true) => {
+                                sandbox.deny_ports = vec![
+                                    PortDenial {
+                                        protocol: Some(Protocol::Tcp),
+                                        first: 22,
+                                        cidrs: vec![cidr.into()],
+                                        ..Default::default()
+                                    },
+                                    PortDenial {
+                                        protocol: None,
+                                        first: 5000,
+                                        last: 6000,
+                                        ..Default::default()
+                                    },
+                                ]
+                            }
+                            None => {}
+                        };
                         for (transport, port) in probes {
                             // Both on this node.
                             let mut sender =
                                 member(local, sender_mode, is_member.then_some(neighbour.1));
-                            if is_denied {
-                                sender.deny_cidrs = vec!["10.99.0.8/29".into()];
-                            }
+                            deny(&mut sender, "10.99.0.8/29");
                             let receiver =
                                 member(neighbour, receiver_mode, is_member.then_some(local.1));
                             let ruleset = render_with(&[sender.clone(), receiver.clone()], &[]);
@@ -705,9 +980,7 @@ mod tests {
                             // Leaving for a peer on another node.
                             let mut sender =
                                 member(local, sender_mode, is_member.then_some(remote));
-                            if is_denied {
-                                sender.deny_cidrs = vec!["10.99.4.0/24".into()];
-                            }
+                            deny(&mut sender, "10.99.4.0/24");
                             let ruleset = render_with(std::slice::from_ref(&sender), &[]);
                             let decided = decide_peer(
                                 Some(decide(
@@ -732,9 +1005,7 @@ mod tests {
                             // Arriving over the mesh from a peer on another node.
                             let mut receiver =
                                 member(neighbour, receiver_mode, is_member.then_some(remote));
-                            if is_denied {
-                                receiver.deny_cidrs = vec!["10.99.4.0/24".into()];
-                            }
+                            deny(&mut receiver, "10.99.4.0/24");
                             let ruleset = render_with(std::slice::from_ref(&receiver), &[]);
                             let decided = decide_peer(None, Some(&rules_of(&receiver)), remote);
                             let rendered =
@@ -750,7 +1021,7 @@ mod tests {
                 }
             }
         }
-        assert_eq!(checked, 3 * 3 * 2 * 2 * 5 * 3);
+        assert_eq!(checked, 3 * 3 * 2 * 3 * 5 * 3);
     }
 
     #[test]
@@ -760,7 +1031,10 @@ mod tests {
             Mode::Allowlist,
             &["10.2.0.0/16".into()],
             &[],
-            &["10.2.9.0/24".into()],
+            Deny {
+                cidrs: &["10.2.9.0/24".into()],
+                ..Default::default()
+            },
             &[],
         );
         let at = |a: [u8; 4]| {
@@ -782,7 +1056,7 @@ mod tests {
 
     #[test]
     fn loopback_is_the_node() {
-        let rules = Rules::new("sbx", Mode::Open, &[], &[], &[], &[]);
+        let rules = Rules::new("sbx", Mode::Open, &[], &[], Deny::default(), &[]);
         assert_eq!(
             decide(
                 &rules,
@@ -803,7 +1077,7 @@ mod tests {
             Mode::Allowlist,
             &["10.2.0.0/16".into()],
             &[5432],
-            &[],
+            Deny::default(),
             &[],
         );
         let to = IpAddr::from([10, 2, 3, 4]);
@@ -818,6 +1092,266 @@ mod tests {
         ));
         assert!(matches!(
             decide(&rules, HOST, &node, to, Transport::Icmp, 0),
+            Verdict::Deny(_)
+        ));
+    }
+
+    fn decide_v6(rules: &Rules, to: &str, transport: Transport, port: u16) -> Verdict {
+        decide(
+            rules,
+            HOST,
+            &NodeDenials::default(),
+            to.parse().unwrap(),
+            transport,
+            port,
+        )
+    }
+
+    #[test]
+    fn a_denied_port_beats_open_mode_and_peers_in_both_families() {
+        let peer = Ipv4Addr::new(10, 99, 4, 6);
+        let rules = Rules::new(
+            "sbx",
+            Mode::Open,
+            &[],
+            &[],
+            Deny {
+                ports: &[PortDenial {
+                    protocol: Some(Protocol::Tcp),
+                    first: 25,
+                    ..Default::default()
+                }],
+                ..Default::default()
+            },
+            &[peer],
+        );
+        let node = NodeDenials::default();
+        let at = |to: IpAddr, transport, port| decide(&rules, HOST, &node, to, transport, port);
+        let public = IpAddr::from([93, 184, 216, 34]);
+        assert_eq!(
+            at(public, Transport::Tcp, 25),
+            Verdict::Deny("destination port is denied")
+        );
+        assert_eq!(
+            at(IpAddr::V4(peer), Transport::Tcp, 25),
+            Verdict::Deny("destination port is denied")
+        );
+        // Only the transport and port named.
+        assert_eq!(at(public, Transport::Udp, 25), Verdict::Direct);
+        assert_eq!(at(public, Transport::Tcp, 26), Verdict::Direct);
+        assert_eq!(
+            decide_v6(&rules, "2001:db8::25", Transport::Tcp, 25),
+            Verdict::Deny("destination port is denied")
+        );
+        assert_eq!(
+            decide_v6(&rules, "2001:db8::25", Transport::Tcp, 443),
+            Verdict::Direct
+        );
+    }
+
+    #[test]
+    fn a_scoped_port_denial_applies_only_to_its_ranges_and_family() {
+        let rules = Rules::new(
+            "sbx",
+            Mode::Open,
+            &[],
+            &[],
+            Deny {
+                ports: &[PortDenial {
+                    protocol: None,
+                    first: 5000,
+                    last: 5999,
+                    cidrs: vec!["10.2.0.0/16".into()],
+                }],
+                ..Default::default()
+            },
+            &[],
+        );
+        let node = NodeDenials::default();
+        let at = |to: [u8; 4], transport, port| {
+            decide(&rules, HOST, &node, IpAddr::from(to), transport, port)
+        };
+        assert!(matches!(
+            at([10, 2, 3, 4], Transport::Udp, 5432),
+            Verdict::Deny(_)
+        ));
+        assert!(matches!(
+            at([10, 2, 3, 4], Transport::Tcp, 5999),
+            Verdict::Deny(_)
+        ));
+        assert_eq!(at([10, 3, 3, 4], Transport::Tcp, 5432), Verdict::Direct);
+        assert_eq!(at([10, 2, 3, 4], Transport::Tcp, 6000), Verdict::Direct);
+        // A v4-only scope says nothing about v6.
+        assert_eq!(
+            decide_v6(&rules, "2001:db8::1", Transport::Tcp, 5432),
+            Verdict::Direct
+        );
+    }
+
+    #[test]
+    fn allowlist_hands_a_denied_web_port_to_the_proxy_to_refuse() {
+        let rules = Rules::new(
+            "sbx",
+            Mode::Allowlist,
+            &["10.2.0.0/16".into()],
+            &[],
+            Deny {
+                ports: &[PortDenial {
+                    protocol: Some(Protocol::Tcp),
+                    first: 443,
+                    ..Default::default()
+                }],
+                ..Default::default()
+            },
+            &[],
+        );
+        let node = NodeDenials::default();
+        // The proxy refuses it, and records the refusal.
+        assert_eq!(
+            decide(
+                &rules,
+                HOST,
+                &node,
+                IpAddr::from([1, 2, 3, 4]),
+                Transport::Tcp,
+                443
+            ),
+            Verdict::Proxy
+        );
+        // Off the proxied ports, the firewall refuses it ahead of allow_cidrs.
+        let rules = Rules::new(
+            "sbx",
+            Mode::Allowlist,
+            &["10.2.0.0/16".into()],
+            &[],
+            Deny {
+                ports: &[PortDenial {
+                    protocol: Some(Protocol::Tcp),
+                    first: 5432,
+                    ..Default::default()
+                }],
+                ..Default::default()
+            },
+            &[],
+        );
+        assert_eq!(
+            decide(
+                &rules,
+                HOST,
+                &node,
+                IpAddr::from([10, 2, 3, 4]),
+                Transport::Tcp,
+                5432
+            ),
+            Verdict::Deny("destination port is denied")
+        );
+    }
+
+    #[test]
+    fn ipv6_follows_the_mode_unless_denied() {
+        let rules = |mode, is_ipv6_denied, cidrs: &[String]| {
+            Rules::new(
+                "sbx",
+                mode,
+                &[],
+                &[],
+                Deny {
+                    cidrs,
+                    is_ipv6_denied,
+                    ..Default::default()
+                },
+                &[],
+            )
+        };
+        let public = "2606:2800:220:1::1";
+        // The defaults, unchanged: open forwards, allowlist proxies the web
+        // ports, none forwards nothing.
+        assert_eq!(
+            decide_v6(&rules(Mode::Open, false, &[]), public, Transport::Tcp, 22),
+            Verdict::Direct
+        );
+        assert_eq!(
+            decide_v6(
+                &rules(Mode::Allowlist, false, &[]),
+                public,
+                Transport::Tcp,
+                443
+            ),
+            Verdict::Proxy
+        );
+        assert!(matches!(
+            decide_v6(&rules(Mode::None, false, &[]), public, Transport::Tcp, 443),
+            Verdict::Deny(_)
+        ));
+        // Denied: nothing, in any mode, the proxy included.
+        for mode in [Mode::Open, Mode::Allowlist, Mode::None] {
+            for (transport, port) in [
+                (Transport::Tcp, 443),
+                (Transport::Udp, 53),
+                (Transport::Icmp, 0),
+            ] {
+                assert!(
+                    matches!(
+                        decide_v6(&rules(mode, true, &[]), public, transport, port),
+                        Verdict::Deny(_)
+                    ),
+                    "{mode:?} {transport:?}/{port}"
+                );
+            }
+        }
+        // IPv4 is untouched by the v6 denial.
+        assert_eq!(
+            decide(
+                &rules(Mode::Open, true, &[]),
+                HOST,
+                &NodeDenials::default(),
+                IpAddr::from([93, 184, 216, 34]),
+                Transport::Tcp,
+                443
+            ),
+            Verdict::Direct
+        );
+        // A v6 range in deny_cidrs is a denial on the v6 path.
+        let ranged = rules(Mode::Open, false, &["2606:2800::/32".into()]);
+        assert_eq!(
+            decide_v6(&ranged, public, Transport::Tcp, 22),
+            Verdict::Deny("destination is in a denied range")
+        );
+        assert_eq!(
+            decide_v6(&ranged, "2001:db8::1", Transport::Tcp, 22),
+            Verdict::Direct
+        );
+    }
+
+    #[test]
+    fn a_malformed_port_denial_costs_the_sandbox_its_egress() {
+        let rules = Rules::new(
+            "sbx",
+            Mode::Open,
+            &[],
+            &[],
+            Deny {
+                ports: &[PortDenial {
+                    first: 0,
+                    ..Default::default()
+                }],
+                ..Default::default()
+            },
+            &[],
+        );
+        assert!(matches!(
+            decide(
+                &rules,
+                HOST,
+                &NodeDenials::default(),
+                IpAddr::from([93, 184, 216, 34]),
+                Transport::Tcp,
+                443
+            ),
+            Verdict::Deny(_)
+        ));
+        assert!(matches!(
+            decide_v6(&rules, "2001:db8::1", Transport::Tcp, 443),
             Verdict::Deny(_)
         ));
     }

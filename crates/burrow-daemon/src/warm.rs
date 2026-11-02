@@ -60,7 +60,17 @@ pub async fn hold_builds() -> tokio::sync::MutexGuard<'static, ()> {
 /// 2 added the node's inspection CA and the guest's note saying it installed
 /// it. Older snapshots are still correct, but their guests install the
 /// certificate on every create, so they are retired rather than kept.
-const WARM_FORMAT: &str = "3";
+///
+/// 4 is the first with drives that flush: Firecracker restores a drive's
+/// cache mode from the snapshot's device state, so a guest restored from a
+/// snapshot taken before drives were `Writeback` would go on dropping its
+/// flushes in the host page cache.
+const WARM_FORMAT: &str = "4";
+
+/// Whether a warm snapshot's `format` file names the format this build writes.
+fn is_current_format(text: &str) -> bool {
+    text.trim() == WARM_FORMAT
+}
 
 /// Pages a restore of this snapshot touches first, recorded once when the
 /// snapshot is built and replayed on every create from it.
@@ -184,7 +194,7 @@ pub async fn is_warm(templates_dir: &Path, template: &str) -> bool {
     // A snapshot in another format is rebuilt rather than restored.
     matches!(
         tokio::fs::read_to_string(dir.join("format")).await,
-        Ok(version) if version.trim() == WARM_FORMAT
+        Ok(version) if is_current_format(&version)
     )
 }
 
@@ -439,9 +449,18 @@ pub async fn build_warm_snapshot(
             tokio::fs::write(dir.join(HYPERVISOR_FILE), hypervisor.as_str())
                 .await
                 .map_err(|err| Status::internal(format!("recording warm hypervisor: {err}")))?;
+            // Everything on the disk before the marker, and the marker before
+            // the swap: every create restores from this snapshot, so one torn
+            // by a power cut would corrupt every guest made from it.
+            crate::fsync::tree(&dir)
+                .await
+                .map_err(|err| Status::internal(format!("syncing the warm snapshot: {err}")))?;
             tokio::fs::write(dir.join("format"), WARM_FORMAT)
                 .await
                 .map_err(|err| Status::internal(format!("marking warm snapshot: {err}")))?;
+            crate::fsync::files_then_dir(&dir, vec!["format".into()])
+                .await
+                .map_err(|err| Status::internal(format!("syncing the warm marker: {err}")))?;
             let size = match hypervisor.layout().memory {
                 Some(memory) => tokio::fs::metadata(dir.join(memory))
                     .await
@@ -457,6 +476,11 @@ pub async fn build_warm_snapshot(
             tokio::fs::rename(&dir, &live)
                 .await
                 .map_err(|err| Status::internal(format!("publishing the warm snapshot: {err}")))?;
+            if let Some(parent) = live.parent()
+                && let Err(err) = crate::fsync::dir(parent).await
+            {
+                tracing::warn!(template, %err, "could not sync the warm snapshot's rename");
+            }
 
             tracing::info!(template, size, "warm snapshot ready");
             Ok(size)
@@ -754,6 +778,18 @@ mod shape_tests {
         // correct, rather than restoring a snapshot of unknown size.
         for bad in ["", "2", "two 1024", "2 lots", "\n"] {
             assert_eq!(Shape::parse(bad), None, "{bad:?} should not parse");
+        }
+    }
+
+    /// Snapshots from before drives flushed carry `Unsafe` drives in their
+    /// device state, and are rebuilt rather than restored.
+    #[test]
+    fn only_the_current_format_is_warm() {
+        assert_eq!(WARM_FORMAT, "4");
+        assert!(is_current_format("4"));
+        assert!(is_current_format("4\n"));
+        for old in ["", "1", "2", "3", "5"] {
+            assert!(!is_current_format(old), "{old:?} should be rebuilt");
         }
     }
 

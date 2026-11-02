@@ -130,6 +130,8 @@ pub struct NodeConfig {
     /// What lifecycle calls do while the orchestrator cannot acknowledge
     /// events.
     pub event_delivery: crate::delivery::Policy,
+    /// How much disk this node promises its sandboxes, and what it keeps free.
+    pub disk: crate::diskcap::DiskPolicy,
 }
 
 impl NodeConfig {
@@ -239,6 +241,15 @@ const MAX_RESTORED_CHAIN: usize = 2;
 /// crash or a failed compaction in that window leaves a chain longer than the
 /// cap. Probing to the cap would silently truncate it here and restore the
 /// guest from a prefix of its own memory, which is worse than a long chain.
+/// What a suspend syncs, in order: the state, the memory it wrote (a diff, or
+/// the full image), then the writable disks. The directory follows them.
+fn suspend_sync_order(layout: Layout, memory: Option<&str>, drives: Vec<String>) -> Vec<String> {
+    std::iter::once(layout.state.to_string())
+        .chain(memory.map(str::to_string))
+        .chain(drives)
+        .collect()
+}
+
 async fn discover_memory_chain(workdir: &std::path::Path, layout: Layout) -> Vec<String> {
     let Some(memory) = layout.memory else {
         return Vec::new();
@@ -861,6 +872,46 @@ impl RunningSandbox {
         self.hypervisor.layout()
     }
 
+    /// The files a suspend has to get onto the disk before it is reported:
+    /// the state, the memory file it just wrote, and every disk the guest can
+    /// write. In that order, which is the order they are synced in.
+    fn snapshot_files(&self, memory: Option<&str>) -> Vec<String> {
+        let drives: Vec<String> = self
+            .spec
+            .lock()
+            .unwrap()
+            .drives
+            .iter()
+            .filter(|drive| !drive.is_read_only)
+            .map(|drive| drive.path.clone())
+            .collect();
+        suspend_sync_order(self.layout(), memory, drives)
+    }
+
+    /// The disk files this sandbox's guest writes, volumes aside: what it
+    /// was promised and can still grow into. A volume is the volume's, and
+    /// counted by nothing here.
+    fn disk_files(&self) -> Vec<PathBuf> {
+        self.spec
+            .lock()
+            .unwrap()
+            .drives
+            .iter()
+            .filter(|drive| !drive.is_read_only && !drive.id.starts_with("volume"))
+            .map(|drive| self.workdir.join(&drive.path))
+            .collect()
+    }
+
+    /// Syncs what a suspend wrote, then the working directory. A suspend is
+    /// not reported until this returns: without it the memory file, the
+    /// vmstate and the guest's disk may still be only in the host page cache,
+    /// and a power cut leaves a torn state that restores into a corrupt guest.
+    async fn sync_snapshot(&self, memory: Option<&str>) -> Result<(), Status> {
+        crate::fsync::files_then_dir(&self.workdir, self.snapshot_files(memory))
+            .await
+            .map_err(|err| Status::internal(format!("syncing the snapshot to disk: {err}")))
+    }
+
     /// vCPUs this sandbox is promised, whether or not its VMM is running.
     pub fn vcpus(&self) -> u32 {
         self.spec.lock().unwrap().vcpus
@@ -1027,6 +1078,7 @@ impl RunningSandbox {
     async fn forget_agent(&self) {
         *self.agent_channel.lock().await = None;
         *self.agent_features.lock().await = None;
+        self.logs.stop_feed();
     }
 
     /// Whether the agent says it supports `feature`. An agent that predates
@@ -1049,16 +1101,15 @@ impl RunningSandbox {
     /// Starts draining the guest's output feed into this sandbox's logs, if
     /// nothing is yet. Ends with the VM; the next call starts it again.
     pub fn ensure_feed(self: &Arc<Self>) {
-        if !self.is_running() || !self.logs.claim_feed() {
+        if !self.is_running() {
             return;
         }
         let weak = Arc::downgrade(self);
         let logs = Arc::clone(&self.logs);
-        tokio::spawn(async move {
+        self.logs.feed_with(|| async move {
             if let Err(err) = feed(weak, &logs).await {
                 tracing::debug!(%err, "command output feed ended");
             }
-            logs.release_feed();
         });
     }
 
@@ -1103,6 +1154,21 @@ impl RunningSandbox {
             let _ = vm.resume().await;
             *slot = Some(vm);
             return Err(Status::internal(format!("snapshot failed: {err}")));
+        }
+        self.logs.clear_checkpoint();
+
+        // On the disk before anything says suspended. The guest is still
+        // paused, so its disks are not moving under the sync, and a sync that
+        // fails leaves a VM that can simply carry on.
+        let written = if diff {
+            Some(next.as_str())
+        } else {
+            self.layout().memory
+        };
+        if let Err(err) = self.sync_snapshot(written).await {
+            let _ = vm.resume().await;
+            *slot = Some(vm);
+            return Err(err);
         }
 
         // Recorded only after the snapshot succeeded: a chain naming a file
@@ -1165,11 +1231,23 @@ impl RunningSandbox {
         })
         .await;
 
+        // The diffs go only once the merged base is on the disk: until then
+        // the base may hold a partial merge, which is harmless only while the
+        // diffs layered over it are still there to restore through.
+        let merged = match merged {
+            Ok(Ok(())) => Ok(crate::fsync::file(&target).await.map_err(|err| {
+                std::io::Error::new(err.kind(), format!("syncing the merged memory file: {err}"))
+            })),
+            other => other,
+        };
         match merged {
             Ok(Ok(())) => {
                 *chain = vec![memory.to_string()];
                 drop(chain);
                 Self::remove_stale_diffs(&self.workdir).await;
+                if let Err(err) = crate::fsync::dir(&self.workdir).await {
+                    tracing::warn!(sandbox = self.id(), %err, "could not sync the working directory after flattening");
+                }
                 tracing::info!(
                     sandbox = self.id(),
                     layers = paths.len(),
@@ -1407,6 +1485,9 @@ impl RunningSandbox {
             let _ = vm.resume().await;
             return Err(Status::internal(format!("snapshot failed: {err}")));
         }
+        // While the guest is still paused, so the mark holds no output the
+        // snapshot does not.
+        self.logs.mark_checkpoint();
 
         let flattened = {
             let mut current = self.memory_chain.lock().await;
@@ -1448,8 +1529,8 @@ impl RunningSandbox {
         Ok(())
     }
 
-    /// Copies everything a fork needs into `dest`, returning the child's
-    /// memory chain.
+    /// Copies everything a fork needs into `dest`, and the command logs into
+    /// `logs`, returning the child's memory chain.
     ///
     /// The VM slot is held throughout, so a suspend, resume or checkpoint
     /// cannot add a layer to the chain half way through copying it.
@@ -1458,7 +1539,7 @@ impl RunningSandbox {
     /// already reads a chain, being how every suspended sandbox comes back, and
     /// flattening here would put an extra full-image rewrite on the fork's
     /// critical path for a cost the child pays lazily anyway.
-    async fn stage_fork(&self, dest: &Path) -> Result<Vec<String>, Status> {
+    async fn stage_fork(&self, dest: &Path, logs: &Path) -> Result<Vec<String>, Status> {
         self.durable.settle_memory().await;
         let _slot = self.vm.lock().await;
         let chain = self.memory_chain.lock().await.clone();
@@ -1499,6 +1580,14 @@ impl RunningSandbox {
         crate::warm::copy_sparse(&self.workdir.join(SCRATCH_IMAGE), &dest.join(SCRATCH_IMAGE))
             .await
             .map_err(|err| io(SCRATCH_IMAGE, err))?;
+        // The child's guest holds the same command table, so it needs the
+        // output too: without it, a command that finished before the fork
+        // replays nothing.
+        let (source, logs) = (Arc::clone(&self.logs), logs.to_path_buf());
+        tokio::task::spawn_blocking(move || source.copy_to(&logs))
+            .await
+            .map_err(|err| Status::internal(format!("forking command logs: {err}")))?
+            .map_err(|err| io("command logs", err))?;
         Ok(chain)
     }
 
@@ -1509,7 +1598,9 @@ impl RunningSandbox {
     /// than from what a later caller asks for, and a snapshot that outlives its
     /// sandbox has nothing else left to read it from.
     async fn stage_snapshot(&self, dest: &Path) -> Result<crate::snapshot::Staged, Status> {
-        let chain = self.stage_fork(dest).await?;
+        let chain = self
+            .stage_fork(dest, &dest.join(crate::snapshot::COMMAND_LOGS))
+            .await?;
         let resources = self.resources();
         let (vcpus, mem_mib) = {
             let spec = self.spec.lock().unwrap();
@@ -1576,8 +1667,8 @@ impl RestoreSource<'_> {
         logs_dir: &Path,
     ) -> Result<(Vec<String>, Option<Arc<crate::chunks::Hydrator>>), Status> {
         match self {
-            Self::Sandbox(source) => Ok((source.stage_fork(dest).await?, None)),
-            Self::Snapshot { id, .. } => snapshots.stage_into(id, dest).await,
+            Self::Sandbox(source) => Ok((source.stage_fork(dest, logs_dir).await?, None)),
+            Self::Snapshot { id, .. } => snapshots.stage_into(id, dest, logs_dir).await,
             Self::Stored { store, manifest } => {
                 crate::durable::stage(store, snapshots, manifest, dest, logs_dir).await
             }
@@ -1624,6 +1715,9 @@ pub struct SandboxManager {
     vault: Arc<burrow_common::vault::Vault>,
     config: NodeConfig,
     sandboxes: Arc<Mutex<HashMap<String, Arc<RunningSandbox>>>>,
+    /// Disk promised to creates still building, and the lock that makes
+    /// measuring and promising one step.
+    disk_admissions: Arc<crate::diskcap::Admissions>,
     /// Ids claimed by a create that has not finished provisioning. Held so a
     /// duplicate create is refused during the seconds a VM takes to build,
     /// rather than only before and after.
@@ -1896,6 +1990,7 @@ impl SandboxManager {
             )),
             config,
             sandboxes: Arc::new(Mutex::new(HashMap::new())),
+            disk_admissions: Default::default(),
             creating: Arc::new(Mutex::new(std::collections::HashSet::new())),
             // Replaced once the orchestrator assigns this node its slice.
             // Node 0 is the first slice of the pool and always in range, so
@@ -3239,6 +3334,17 @@ impl SandboxManager {
                         .and_then(|p| p.network.as_ref())
                         .map(|n| n.allow_ports.clone())
                         .unwrap_or_default(),
+                    deny_ports: record
+                        .policy
+                        .as_ref()
+                        .and_then(|p| p.network.as_ref())
+                        .map(|n| n.deny_ports.iter().map(port_denial).collect())
+                        .unwrap_or_default(),
+                    is_ipv6_denied: record
+                        .policy
+                        .as_ref()
+                        .and_then(|p| p.network.as_ref())
+                        .is_some_and(|n| n.is_ipv6_denied),
                     peers,
                     ports: ports.get(sandbox.id()).cloned().unwrap_or_default(),
                 }
@@ -3277,6 +3383,10 @@ impl SandboxManager {
                         is_tls_inspected: network.is_some_and(|n| n.is_tls_inspected),
                         deny_cidrs: network.map(|n| n.deny_cidrs.clone()).unwrap_or_default(),
                         deny_domains: network.map(|n| n.deny_domains.clone()).unwrap_or_default(),
+                        deny_ports: network
+                            .map(|n| n.deny_ports.iter().filter_map(proxy_denied_ports).collect())
+                            .unwrap_or_default(),
+                        is_ipv6_denied: network.is_some_and(|n| n.is_ipv6_denied),
                         http_rules: std::sync::Arc::new(
                             network
                                 .map(|n| n.http_rules.iter().map(proxy_http_rule).collect())
@@ -3442,15 +3552,28 @@ impl SandboxManager {
         Ok(sandbox.record())
     }
 
-    /// Stamps every Access token issued for a sandbox so far as revoked,
-    /// returning the stamp. Persisted with the record, which is what carries
-    /// it to the next node when the sandbox moves.
-    pub async fn revoke_access(&self, sandbox_id: &str) -> Result<i64, Status> {
+    /// Stamps every Access token issued for a sandbox up to `at_ms`, or now
+    /// when that is 0, as revoked, returning the stamp in unix milliseconds.
+    /// A stamp never moves back. Persisted with the record, which is what
+    /// carries it to the next node when the sandbox moves.
+    pub async fn revoke_access(&self, sandbox_id: &str, at_ms: i64) -> Result<i64, Status> {
         let sandbox = self.get(sandbox_id).await?;
-        let now = burrow_common::unix_now();
-        sandbox.base_record.lock().unwrap().access_revoked_at = now;
+        let at_ms = match at_ms {
+            0 => burrow_common::unix_now_ms(),
+            at_ms => at_ms,
+        };
+        let stamp = {
+            let mut record = sandbox.base_record.lock().unwrap();
+            let stamp = at_ms.max(burrow_common::access::revoked_before_ms(
+                record.access_revoked_at,
+                record.access_revoked_at_ms,
+            ));
+            record.access_revoked_at = stamp / 1000;
+            record.access_revoked_at_ms = stamp;
+            stamp
+        };
         self.persist(&sandbox).await;
-        Ok(now)
+        Ok(stamp)
     }
 
     /// Replaces a sandbox's exec and file policies.
@@ -4039,6 +4162,61 @@ impl SandboxManager {
         live
     }
 
+    /// Every disk file the sandboxes here can still grow into.
+    async fn disk_files(&self) -> Vec<PathBuf> {
+        self.sandboxes
+            .lock()
+            .await
+            .values()
+            .flat_map(|sandbox| sandbox.disk_files())
+            .collect()
+    }
+
+    /// This node's disk as admission sees it, logging loudly while free disk
+    /// is under the reserve with sandboxes here. `None` when the data
+    /// directory cannot be measured.
+    pub async fn disk_status(&self) -> Option<(burrow_common::disk::DiskCapacity, bool)> {
+        let capacity = self
+            .disk_admissions
+            .capacity(
+                &self.config.data_dir,
+                self.config.disk,
+                self.disk_files().await,
+            )
+            .await?;
+        let running = self
+            .sandboxes
+            .lock()
+            .await
+            .values()
+            .filter(|sandbox| sandbox.is_running())
+            .count();
+        let is_low = self.disk_admissions.watch(&capacity, running);
+        Some((capacity, is_low))
+    }
+
+    /// Admits `request_bytes` more disk for `what`, or refuses with
+    /// `ResourceExhausted` naming `node` and the shortfall. Held until the
+    /// operation's disk exists.
+    async fn admit_disk(
+        &self,
+        node: &str,
+        what: &str,
+        request_bytes: u64,
+    ) -> Result<crate::diskcap::Admitted, Status> {
+        let node = if node.is_empty() { "this node" } else { node };
+        self.disk_admissions
+            .admit(
+                node,
+                what,
+                request_bytes,
+                &self.config.data_dir,
+                self.config.disk,
+                self.disk_files().await,
+            )
+            .await
+    }
+
     pub async fn get(&self, id: &str) -> Result<Arc<RunningSandbox>, Status> {
         if let Some(sandbox) = self.sandboxes.lock().await.get(id) {
             return Ok(Arc::clone(sandbox));
@@ -4396,6 +4574,20 @@ impl SandboxManager {
         } else {
             resources.scratch_disk_mib
         };
+        // The disk this sandbox is promised: its scratch disk, or a macOS
+        // guest's clone of its template's disk. Charged before anything is
+        // made, so a node that cannot hold it refuses without a tap or a
+        // directory to give back.
+        let disk_bytes = match crate::macnode::disk_file(guest_os) {
+            Some(disk) => tokio::fs::metadata(templates_dir.join(&template).join(disk))
+                .await
+                .map(|meta| meta.len())
+                .unwrap_or(0),
+            None => u64::from(scratch_mib) * burrow_common::disk::MIB,
+        };
+        let _disk = self
+            .admit_disk(&node_id, "create a sandbox", disk_bytes)
+            .await?;
 
         // A seeded scratch has to survive into the guest untouched, and the
         // warm path stages its own scratch, so it is not usable here. Nor is a
@@ -4767,6 +4959,7 @@ impl SandboxManager {
             arch: String::new(),
             firecracker_version: String::new(),
             access_revoked_at: 0,
+            access_revoked_at_ms: 0,
             hypervisor: hypervisor.to_string(),
             guest_os: guest_os.as_str().to_string(),
             state_reason: String::new(),
@@ -4888,6 +5081,9 @@ impl SandboxManager {
     /// still saying `Running` would have recovery discard it.
     async fn write_state(&self, sandbox: &Arc<RunningSandbox>) -> Result<(), Status> {
         let result = sandbox.checkpoint().await;
+        // The pause ended the feed along with every other connection, and a
+        // command still running has output to send.
+        sandbox.ensure_feed();
         // That failure mode leaves the sandbox suspended, which ends its
         // session as surely as a suspend does.
         if result.is_err() && !sandbox.is_running() {
@@ -5268,6 +5464,25 @@ impl SandboxManager {
         let capabilities = hypervisor.capabilities();
         let workdir = self.config.sandbox_dir(&id, hypervisor);
         let resources = policy.resources.unwrap_or_default();
+        // A restored sandbox gets a disk of its source's size, promised like
+        // a created one's. An adopt is charged here too, after its claim in
+        // the store, which a refusal hands back.
+        let scratch_mib = match resources.scratch_disk_mib {
+            0 => DEFAULT_SCRATCH_MIB,
+            mib => mib,
+        };
+        let what = match source {
+            RestoreSource::Sandbox(_) => "fork a sandbox",
+            RestoreSource::Snapshot { .. } => "create a sandbox from a snapshot",
+            RestoreSource::Stored { .. } => "adopt a sandbox",
+        };
+        let _disk = self
+            .admit_disk(
+                &node_id,
+                what,
+                u64::from(scratch_mib) * burrow_common::disk::MIB,
+            )
+            .await?;
         // The state was captured without volumes, so they could only arrive by
         // hotplug.
         if !capabilities.is_drive_hotplug_supported
@@ -5333,8 +5548,8 @@ impl SandboxManager {
             tokio::fs::create_dir_all(&workdir)
                 .await
                 .map_err(|err| Status::internal(format!("creating the workdir: {err}")))?;
-            // A fork or a snapshot starts with no output; an adopted sandbox
-            // brings its own.
+            // Every source brings the output of the commands its guest
+            // remembers.
             let logs_dir = self.config.command_logs_dir(&id);
             let _ = tokio::fs::remove_dir_all(&logs_dir).await;
             let (chain, arriving) = source
@@ -5515,6 +5730,7 @@ impl SandboxManager {
             arch: String::new(),
             firecracker_version: String::new(),
             access_revoked_at: 0,
+            access_revoked_at_ms: 0,
             hypervisor: hypervisor.to_string(),
             guest_os: guest_os.as_str().to_string(),
             state_reason: String::new(),
@@ -5578,6 +5794,12 @@ impl SandboxManager {
                 "sandbox {id} is kept in the object store, and this node is waiting for the \
                  orchestrator to confirm it still holds it; try again shortly"
             )));
+        }
+        // Its disk is already counted; what is checked is that the node is not
+        // already past its reserve, where a running guest's writes may fail.
+        if !sandbox.is_running() {
+            self.admit_disk(&sandbox.record().node_id, "resume a sandbox", 0)
+                .await?;
         }
         let record = sandbox.record();
         let guest_os = burrow_vmm::GuestOs::from_record(&record.guest_os).unwrap_or_default();
@@ -5742,6 +5964,11 @@ impl SandboxManager {
     pub async fn start(&self, id: &str) -> Result<common::Sandbox, Status> {
         let sandbox = self.get(id).await?;
         let record = sandbox.record();
+        // Refused for the reason a resume is: a node past its reserve.
+        if !sandbox.is_running() {
+            self.admit_disk(&record.node_id, "start a sandbox", 0)
+                .await?;
+        }
         let guest_os = burrow_vmm::GuestOs::from_record(&record.guest_os).unwrap_or_default();
         let _slot = self.reserve_mac_slot(id, guest_os).await?;
         let policy = record.policy.unwrap_or_default();
@@ -6560,6 +6787,7 @@ impl SandboxManager {
             base.kit_credentials = record.kit_credentials.clone();
             base.kit_selection = record.kit_selection.clone();
             base.access_revoked_at = record.access_revoked_at;
+            base.access_revoked_at_ms = record.access_revoked_at_ms;
         }
         *sandbox.usage.lock().unwrap() = Usage {
             cpu_usec: record.cpu_usage_usec.max(manifest.cpu_usage_usec),
@@ -6674,6 +6902,50 @@ fn map_secrets(
 }
 
 /// The proxy's form of a policy's HTTP rule.
+/// One `deny_ports` entry as the firewall reads it. Validation happens there,
+/// where a malformed entry costs the sandbox its egress rather than being
+/// skipped.
+fn port_denial(rule: &common::PortRule) -> burrow_net::policy::PortDenial {
+    burrow_net::policy::PortDenial {
+        protocol: match common::PortProtocol::try_from(rule.protocol) {
+            Ok(common::PortProtocol::Tcp) => Some(firewall::Protocol::Tcp),
+            Ok(common::PortProtocol::Udp) => Some(firewall::Protocol::Udp),
+            // An unknown value reads as both, the broader denial, for the
+            // reason a malformed entry fails closed.
+            _ => None,
+        },
+        first: rule.port,
+        last: rule.port_end,
+        cidrs: rule.cidrs.clone(),
+    }
+}
+
+/// The proxy's copy of one `deny_ports` entry: the TCP ones only, since UDP
+/// never reaches it.
+///
+/// A range that is not one, which the API door refuses, becomes every port
+/// rather than none: a denial read too broadly costs connections, one read too
+/// narrowly grants what was withheld.
+fn proxy_denied_ports(rule: &common::PortRule) -> Option<burrow_proxy::policy::DeniedPorts> {
+    if common::PortProtocol::try_from(rule.protocol) == Ok(common::PortProtocol::Udp) {
+        return None;
+    }
+    let first = u16::try_from(rule.port).ok().filter(|p| *p != 0);
+    let last = match rule.port_end {
+        0 => first,
+        end => u16::try_from(end).ok(),
+    };
+    let (first, last) = match (first, last) {
+        (Some(first), Some(last)) if first <= last => (first, last),
+        _ => (0, u16::MAX),
+    };
+    Some(burrow_proxy::policy::DeniedPorts {
+        first,
+        last,
+        cidrs: rule.cidrs.clone(),
+    })
+}
+
 fn proxy_http_rule(rule: &common::HttpRule) -> burrow_proxy::policy::HttpRule {
     burrow_proxy::policy::HttpRule {
         hosts: rule.hosts.clone(),
@@ -6842,6 +7114,42 @@ async fn prepare_workdir(template_dir: &Path, workdir: &Path) -> std::io::Result
 pub(crate) mod tests {
     use super::*;
 
+    #[test]
+    fn port_rules_reach_the_firewall_whole_and_the_proxy_as_tcp() {
+        let rule =
+            |protocol: common::PortProtocol, port, port_end, cidrs: &[&str]| common::PortRule {
+                protocol: protocol as i32,
+                port,
+                port_end,
+                cidrs: cidrs.iter().map(|c| (*c).to_string()).collect(),
+            };
+        let tcp = rule(common::PortProtocol::Tcp, 465, 587, &["10.0.0.0/8"]);
+        let both = rule(common::PortProtocol::Unspecified, 25, 0, &[]);
+        let udp = rule(common::PortProtocol::Udp, 53, 0, &[]);
+
+        let denial = port_denial(&tcp);
+        assert_eq!(denial.protocol, Some(firewall::Protocol::Tcp));
+        assert_eq!((denial.first, denial.last), (465, 587));
+        assert_eq!(denial.cidrs, vec!["10.0.0.0/8".to_string()]);
+        assert_eq!(port_denial(&both).protocol, None);
+        assert_eq!(port_denial(&udp).protocol, Some(firewall::Protocol::Udp));
+        // An unknown protocol is the broader reading, both.
+        let mut unknown = tcp.clone();
+        unknown.protocol = 9;
+        assert_eq!(port_denial(&unknown).protocol, None);
+
+        // UDP never reaches the proxy, so it is not handed one.
+        assert!(proxy_denied_ports(&udp).is_none());
+        let proxied = proxy_denied_ports(&both).unwrap();
+        assert_eq!((proxied.first, proxied.last), (25, 25));
+        let proxied = proxy_denied_ports(&tcp).unwrap();
+        assert_eq!((proxied.first, proxied.last), (465, 587));
+        // A range that is not one reads as every port.
+        let backwards = rule(common::PortProtocol::Tcp, 600, 599, &[]);
+        let proxied = proxy_denied_ports(&backwards).unwrap();
+        assert_eq!((proxied.first, proxied.last), (0, u16::MAX));
+    }
+
     /// A manager with no VMs behind it. Shared with the node edge's tests,
     /// which need a sandbox map to miss in.
     pub(crate) async fn manager() -> SandboxManager {
@@ -6876,6 +7184,7 @@ pub(crate) mod tests {
                 cloud_hypervisor_version: String::new(),
                 guest_upgrade: None,
                 event_delivery: Default::default(),
+                disk: Default::default(),
             },
             Arc::new(burrow_proxy::PolicyTable::default()),
             Arc::new(burrow_proxy::Resolutions::default()),
@@ -7707,8 +8016,11 @@ pub(crate) mod tests {
     }
 
     fn suspended_sandbox() -> RunningSandbox {
+        sandbox_in(std::path::PathBuf::from("/tmp/burrow-test"))
+    }
+
+    fn sandbox_in(workdir: std::path::PathBuf) -> RunningSandbox {
         let lease = Ipam::for_node(0).unwrap().allocate("sbx_a").unwrap();
-        let workdir = std::path::PathBuf::from("/tmp/burrow-test");
         RunningSandbox {
             id: "sbx_a".into(),
             template: "default".into(),
@@ -7742,6 +8054,98 @@ pub(crate) mod tests {
             tap: tap::tap_name(&lease),
             lease,
         }
+    }
+
+    /// A suspend syncs the state, then the memory it wrote, then every disk
+    /// the guest can write, then the directory, and only then reports. Disks
+    /// the guest cannot write are not synced: nothing of the guest's is in them.
+    #[tokio::test]
+    async fn a_suspend_syncs_state_memory_and_writable_disks_then_the_directory() {
+        let workdir = std::env::temp_dir().join(format!(
+            "burrow-suspend-sync-{}",
+            uuid::Uuid::new_v4().simple()
+        ));
+        std::fs::create_dir_all(&workdir).unwrap();
+        let sandbox = sandbox_in(workdir.clone());
+        sandbox.spec.lock().unwrap().drives = vec![
+            DriveSpec::root_ro(TEMPLATE_ROOTFS),
+            DriveSpec::scratch_rw(SCRATCH_IMAGE),
+            DriveSpec {
+                id: "volume0".into(),
+                path: volume_image(0),
+                is_root: false,
+                is_read_only: false,
+            },
+            DriveSpec {
+                id: "volume1".into(),
+                path: volume_image(1),
+                is_root: false,
+                is_read_only: true,
+            },
+        ];
+        let diff = Layout::diff(1);
+        for name in [
+            "snapshot.vmstate",
+            diff.as_str(),
+            TEMPLATE_ROOTFS,
+            SCRATCH_IMAGE,
+            &volume_image(0),
+            &volume_image(1),
+        ] {
+            std::fs::write(workdir.join(name), b"x").unwrap();
+        }
+
+        sandbox.sync_snapshot(Some(&diff)).await.unwrap();
+
+        use crate::fsync::Synced;
+        assert_eq!(
+            crate::fsync::record::under(&workdir),
+            vec![
+                Synced::File(workdir.join("snapshot.vmstate")),
+                Synced::File(workdir.join(&diff)),
+                Synced::File(workdir.join(SCRATCH_IMAGE)),
+                Synced::File(workdir.join(volume_image(0))),
+                Synced::Dir(workdir.clone()),
+            ]
+        );
+        let _ = std::fs::remove_dir_all(&workdir);
+    }
+
+    /// A suspend whose files cannot be synced fails rather than reporting a
+    /// state that may not be on the disk.
+    #[tokio::test]
+    async fn a_suspend_that_cannot_sync_fails() {
+        let workdir = std::env::temp_dir().join(format!(
+            "burrow-suspend-nosync-{}",
+            uuid::Uuid::new_v4().simple()
+        ));
+        std::fs::create_dir_all(&workdir).unwrap();
+        let sandbox = sandbox_in(workdir.clone());
+        sandbox.spec.lock().unwrap().drives = vec![DriveSpec::scratch_rw(SCRATCH_IMAGE)];
+        std::fs::write(workdir.join("snapshot.vmstate"), b"x").unwrap();
+        // No memory file: the snapshot did not land, so the suspend must not.
+        let err = sandbox
+            .sync_snapshot(Some("snapshot.mem"))
+            .await
+            .unwrap_err();
+        assert_eq!(err.code(), tonic::Code::Internal);
+        assert!(
+            !crate::fsync::record::under(&workdir)
+                .contains(&crate::fsync::Synced::Dir(workdir.clone()))
+        );
+        let _ = std::fs::remove_dir_all(&workdir);
+    }
+
+    #[test]
+    fn a_full_suspend_of_a_macos_style_layout_syncs_its_state_and_disk() {
+        let layout = Layout {
+            state: "save.vzvmsave",
+            memory: None,
+        };
+        assert_eq!(
+            suspend_sync_order(layout, layout.memory, vec!["disk.img".into()]),
+            ["save.vzvmsave", "disk.img"]
+        );
     }
 
     /// A resume builds a new cgroup and a firewall re-render rebuilds the byte

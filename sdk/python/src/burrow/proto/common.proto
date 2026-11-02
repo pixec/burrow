@@ -195,8 +195,10 @@ message NetworkPolicy {
   // checked too, not just the SNI. Closes domain fronting, at the cost of the
   // proxy being able to read the payload, which is why it is opt-in.
   bool is_tls_inspected = 5;
-  // IPv4 ranges this sandbox may never reach, in any mode. Deny beats every
-  // allowance: an allowed domain resolving into one of these is refused too.
+  // IPv4 or IPv6 ranges this sandbox may never reach, in any mode. Deny beats
+  // every allowance: an allowed domain resolving into one of these is refused
+  // too. A range applies to its own family only, so an IPv4 list says nothing
+  // about IPv6: name the v6 ranges too, or set `is_ipv6_denied`.
   repeated string deny_cidrs = 6;
   // What the host does to requests it inspects: broker a credential onto them,
   // or send them to an endpoint the operator controls. Requires inspect_tls,
@@ -216,6 +218,42 @@ message NetworkPolicy {
   // it carries the HTTP requests its rules admit and nothing else, and traffic
   // the proxy cannot inspect is refused. Requires inspect_tls.
   repeated HttpRule http_rules = 10;
+  // Ports refused in every mode, ahead of every allowance: a matching
+  // connection is dropped by the host firewall whatever `mode`, `allow_cidrs`,
+  // `allow_ports` or a peer membership would grant, and refused by the egress
+  // proxy on the ports it handles. Applies over IPv4 and IPv6. At most 64.
+  repeated PortRule deny_ports = 11;
+  // Refuse every IPv6 destination, in every mode. Off by default, which keeps
+  // each mode's own IPv6 behaviour: none forwards nothing, allowlist sends
+  // TCP 80 and 443 to the egress proxy, open forwards to the public internet.
+  // The link to the sandbox's own gateway is unaffected.
+  bool is_ipv6_denied = 12;
+}
+
+// Transport a port rule applies to.
+enum PortProtocol {
+  // Both TCP and UDP.
+  PORT_PROTOCOL_UNSPECIFIED = 0;
+  PORT_PROTOCOL_TCP = 1;
+  PORT_PROTOCOL_UDP = 2;
+}
+
+// Destination ports, optionally narrowed to destination ranges.
+//
+// Matches a packet leaving the sandbox when its transport is `protocol`, its
+// destination port is in `port`..=`port_end`, and its destination address is
+// in one of `cidrs` (empty is every destination).
+message PortRule {
+  PortProtocol protocol = 1;
+  // First port of the range, 1 to 65535.
+  uint32 port = 2;
+  // Last port of the range, inclusive. 0 means the range is `port` alone;
+  // otherwise it is at least `port` and at most 65535.
+  uint32 port_end = 3;
+  // IPv4 or IPv6 CIDRs, address and prefix, e.g. "10.0.0.0/8" or
+  // "2001:db8::/32". A rule naming only one family's ranges leaves the other
+  // family's traffic alone. At most 16.
+  repeated string cidrs = 4;
 }
 
 // One HTTP-level entry of a network policy.
@@ -380,8 +418,9 @@ message Sandbox {
   // What the saved state needs to be restored on, while it is durable.
   string arch = 21;
   string firecracker_version = 22;
-  // Unix seconds of the last RevokeAccess. Access tokens issued at or before
-  // it are refused, wherever the sandbox has moved since.
+  // Unix seconds of the last RevokeAccess, which `access_revoked_at_ms` says
+  // to the millisecond. Access tokens issued at or before it are refused,
+  // wherever the sandbox has moved since.
   int64 access_revoked_at = 23;
   // The hypervisor running it, its template's: "firecracker" or
   // "cloud-hypervisor".
@@ -397,6 +436,10 @@ message Sandbox {
   // trust, in hex; empty for a sandbox that is not inspected. It moves,
   // restores and is adopted only onto a node whose root is the same.
   string inspection_root_fingerprint = 27;
+  // Unix milliseconds of the last RevokeAccess, so a token reissued within
+  // the same second still works. 0 on a record from before it was kept, when
+  // the whole second `access_revoked_at` names counts as revoked.
+  int64 access_revoked_at_ms = 28;
 }
 
 // One VM boot inside a sandbox's life.
@@ -528,6 +571,24 @@ message NodeStatus {
   // Volumes on this node, including those a Kit's lifecycle created on it,
   // which the orchestrator never saw a request for.
   repeated Volume volumes = 8;
+  // The data directory's filesystem: what is free to the node and its size,
+  // reported like memory. A total of 0 is a node that does not report disk,
+  // and placement does not check it.
+  uint64 disk_free_bytes = 9;
+  uint64 disk_total_bytes = 10;
+  // What the node keeps free and promises to no sandbox (--disk-reserve-mib,
+  // 5% of the filesystem by default).
+  uint64 disk_reserve_bytes = 11;
+  // Disk promised to sandboxes here and not yet written: each sandbox's disk
+  // size less what its disk file already occupies. Disks are sparse, so this
+  // is what they can still grow by.
+  uint64 disk_unwritten_bytes = 12;
+  // How far promised disk may exceed free disk above the reserve
+  // (--disk-overcommit). 0, from a node that does not say, means 1.0: never.
+  double disk_overcommit = 13;
+  // Free disk is below the reserve while sandboxes run here. The node refuses
+  // creates, resumes and adopts until it is not.
+  bool is_disk_low = 14;
 }
 
 // One thing that happened to a sandbox, as the node that did it recorded it.

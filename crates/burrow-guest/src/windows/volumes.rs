@@ -82,10 +82,7 @@ pub fn target(volume: &guestpb::VolumeMount, system_drive: char) -> Result<Targe
 }
 
 /// What [`SCRIPT`] is told, as its environment.
-pub fn script_env(
-    volume: &guestpb::VolumeMount,
-    target: &Target,
-) -> Vec<(&'static str, String)> {
+pub fn script_env(volume: &guestpb::VolumeMount, target: &Target) -> Vec<(&'static str, String)> {
     let (letter, folder) = match target {
         Target::Letter(letter) => (letter.to_string(), String::new()),
         Target::Folder(folder) => (String::new(), folder.clone()),
@@ -244,7 +241,10 @@ mod tests {
             ("burrow-volume0", "data"),
             ("burrow-volume0", "//server/share"),
         ] {
-            assert!(target(&volume(device, path), 'C').is_err(), "{device} {path}");
+            assert!(
+                target(&volume(device, path), 'C').is_err(),
+                "{device} {path}"
+            );
         }
     }
 

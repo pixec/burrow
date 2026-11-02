@@ -65,6 +65,7 @@ export type {
   NetworkPolicyOptions,
   NodeInfo,
   PortMapping,
+  PortRule,
   RecreateOptions,
   RequestMatch,
   RequestRule,

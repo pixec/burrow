@@ -204,8 +204,13 @@ stdin. `lost_bytes` counts output a rotating log dropped.
   Sandbox Kit template.
 - `network_policy` is a mode (`"none"`, `"allowlist"`, `"open"`) or the full
   policy as a dict: `mode`, `allow_domains`, `allow_cidrs`, `allow_ports`,
-  `deny_cidrs`, `inspect_tls` and `rules`. A key burrow does not know is
-  refused rather than dropped, on the policy and on each rule.
+  `deny_cidrs`, `deny_ports`, `deny_ipv6`, `inspect_tls` and `rules`. A key
+  burrow does not know is refused rather than dropped, on the policy, on each
+  rule and on each port rule. `deny_ports` entries are dicts (or `PortRule`s)
+  with `port`, optional `protocol` (`"tcp"`, `"udp"`, `"any"` for both, the
+  default), `port_end` and `cidrs`, refused in every mode ahead of every
+  allowance: `{"mode": "open", "deny_ports": [{"protocol": "tcp", "port": 25}],
+  "deny_ipv6": True}` keeps open egress without outbound SMTP or IPv6.
 - `Burrow`: the fleet: `health`, `audit`, `events`, `usage`, `nodes`, `drain_node`, and the secrets Sandbox Kits ask
   for by service name: `set_secret`, `list_secrets`, `delete_secret`.
   `events` reads the fleet's lifecycle log, oldest first, and with

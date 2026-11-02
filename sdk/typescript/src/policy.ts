@@ -15,6 +15,7 @@ import type {
   NetworkMode,
   NetworkPolicy,
   NetworkPolicyOptions,
+  PortRule,
   RequestMatch,
   RequestRule,
   ResourceOptions,
@@ -247,6 +248,67 @@ function fromStringMatch(raw: any): StringMatch {
   return { [op]: raw?.value ?? "" } as StringMatch;
 }
 
+const PROTOCOL_TO_WIRE: Record<string, string> = {
+  tcp: "PORT_PROTOCOL_TCP",
+  udp: "PORT_PROTOCOL_UDP",
+};
+
+const PROTOCOL_FROM_WIRE: Record<string, "tcp" | "udp"> = {
+  PORT_PROTOCOL_TCP: "tcp",
+  PORT_PROTOCOL_UDP: "udp",
+};
+
+/** Everything burrow understands on a port rule. */
+const PORT_RULE_KEYS = new Set(["protocol", "port", "portEnd", "cidrs"]);
+
+/**
+ * Builds one wire `PortRule`.
+ *
+ * Ranges and CIDRs are the node's to check. What is checked here is what would
+ * otherwise be misread without a word: a misspelt protocol must not become
+ * "both", and a misspelt `cidrs` must not turn a denial meant for one range
+ * into one for every destination.
+ */
+function toPortRule(index: number, rule: PortRule): any {
+  const where = `networkPolicy.denyPorts[${index}]`;
+  for (const key of Object.keys(rule ?? {})) {
+    if (PORT_RULE_KEYS.has(key)) continue;
+    throw new BurrowError(
+      `${where}: unknown key ${JSON.stringify(key)}; one of protocol, port, portEnd, cidrs`,
+      "invalid_argument",
+    );
+  }
+  if (rule.protocol !== undefined && !(rule.protocol in PROTOCOL_TO_WIRE)) {
+    throw new BurrowError(
+      `${where}: unknown protocol ${JSON.stringify(rule.protocol)}; tcp, udp, or omitted for both`,
+      "invalid_argument",
+    );
+  }
+  if (!Number.isInteger(rule.port)) {
+    throw new BurrowError(`${where}: port is an integer`, "invalid_argument");
+  }
+  return {
+    protocol:
+      rule.protocol === undefined
+        ? "PORT_PROTOCOL_UNSPECIFIED"
+        : PROTOCOL_TO_WIRE[rule.protocol],
+    port: rule.port,
+    portEnd: rule.portEnd ?? 0,
+    cidrs: rule.cidrs ?? [],
+  };
+}
+
+/** Reads one wire `PortRule` back, leaving out what was left unset. */
+function fromPortRule(raw: any): PortRule {
+  const rule: PortRule = { port: Number(raw?.port ?? 0) };
+  const protocol = PROTOCOL_FROM_WIRE[String(raw?.protocol ?? "")];
+  if (protocol) rule.protocol = protocol;
+  const portEnd = Number(raw?.portEnd ?? 0);
+  if (portEnd) rule.portEnd = portEnd;
+  if (raw?.cidrs?.length) rule.cidrs = raw.cidrs;
+  return rule;
+}
+
 /** Builds the wire `NetworkPolicy`. Defaults to no egress at all. */
 export function toNetworkPolicy(options: NetworkPolicyOptions = {}): any {
   const mode = options.mode ?? "none";
@@ -284,6 +346,8 @@ export function toNetworkPolicy(options: NetworkPolicyOptions = {}): any {
     allowCidrs: options.allowCidrs ?? [],
     allowPorts: options.allowPorts ?? [],
     denyCidrs: options.denyCidrs ?? [],
+    denyPorts: (options.denyPorts ?? []).map((rule, index) => toPortRule(index, rule)),
+    isIpv6Denied: options.denyIpv6 ?? false,
     isTlsInspected: options.inspectTls ?? false,
     rules: rules.map(toRequestRule),
   };
@@ -298,6 +362,8 @@ export function fromNetworkPolicy(raw: any): NetworkPolicy {
     allowCidrs: raw?.allowCidrs ?? [],
     allowPorts: (raw?.allowPorts ?? []).map(Number),
     denyCidrs: raw?.denyCidrs ?? [],
+    denyPorts: (raw?.denyPorts ?? []).map(fromPortRule),
+    denyIpv6: Boolean(raw?.isIpv6Denied),
     inspectTls: Boolean(raw?.isTlsInspected),
     rules,
     // The rules that are exactly what `injectHeaders` used to describe, so

@@ -226,10 +226,8 @@ async fn save_local(workdir: &Path, local: &LocalState) -> Result<(), Status> {
     let json = serde_json::to_vec(local)
         .map_err(|err| Status::internal(format!("encoding the durable state: {err}")))?;
     let temp = workdir.join(format!(".{LOCAL}.tmp"));
-    tokio::fs::write(&temp, json)
-        .await
-        .map_err(|err| Status::internal(format!("writing the durable state: {err}")))?;
-    tokio::fs::rename(&temp, workdir.join(LOCAL))
+    // Beside the suspended state it describes, and synced like it.
+    crate::fsync::replace(&workdir.join(LOCAL), &temp, json)
         .await
         .map_err(|err| Status::internal(format!("writing the durable state: {err}")))
 }

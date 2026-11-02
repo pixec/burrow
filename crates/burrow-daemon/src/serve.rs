@@ -188,6 +188,25 @@ pub struct ServeArgs {
     /// plan.
     #[arg(long = "lazy-memory", default_value_t = false, action = clap::ArgAction::Set)]
     pub is_memory_lazy: bool,
+    /// How far the disk promised to sandboxes may exceed the free disk above
+    /// the reserve. Sandbox disks are sparse and grow as the guest writes, so
+    /// each is promised its full size: at 1.0, the default, every promised
+    /// byte has a free byte behind it. Above 1.0 the node takes more disk than
+    /// it has, and a full filesystem fails every guest on it at once.
+    #[arg(
+        long,
+        default_value_t = 1.0,
+        value_parser = crate::diskcap::parse_overcommit,
+        env = "BURROWD_DISK_OVERCOMMIT"
+    )]
+    pub disk_overcommit: f64,
+    /// Disk to keep free on the data directory's filesystem, in MiB. Creates,
+    /// resumes and adopts that would cross it are refused with
+    /// ResourceExhausted, and free disk below it while sandboxes run is logged
+    /// as an error and shown in `burrow node ls`. Unset keeps 5% of the
+    /// filesystem.
+    #[arg(long, env = "BURROWD_DISK_RESERVE_MIB")]
+    pub disk_reserve_mib: Option<u64>,
     /// OTLP collector to export traces and sandbox metrics to, e.g.
     /// `http://collector:4317`. Unset leaves tracing local to this node's logs.
     #[arg(long, env = "OTEL_EXPORTER_OTLP_ENDPOINT")]
@@ -578,6 +597,24 @@ async fn current_status(sandboxes: &SandboxManager, data_dir: &std::path::Path) 
         // snapshot, and resuming must not find the node oversubscribed.
         committed_vcpus: sandboxes.committed_vcpus().await,
         volumes: sandboxes.volumes().list().await,
+        ..disk_status(sandboxes.disk_status().await)
+    }
+}
+
+/// The heartbeat's disk fields. A node that cannot measure its data
+/// directory reports none, which placement reads as unchecked.
+fn disk_status(disk: Option<(burrow_common::disk::DiskCapacity, bool)>) -> NodeStatus {
+    let Some((capacity, is_low)) = disk else {
+        return NodeStatus::default();
+    };
+    NodeStatus {
+        disk_free_bytes: capacity.free_bytes,
+        disk_total_bytes: capacity.total_bytes,
+        disk_reserve_bytes: capacity.reserve_bytes,
+        disk_unwritten_bytes: capacity.unwritten_bytes,
+        disk_overcommit: capacity.overcommit,
+        is_disk_low: is_low,
+        ..Default::default()
     }
 }
 
@@ -1337,6 +1374,10 @@ pub async fn run(args: ServeArgs) -> anyhow::Result<()> {
             cloud_hypervisor_version,
             guest_upgrade,
             event_delivery: args.event_delivery,
+            disk: crate::diskcap::DiskPolicy {
+                overcommit: args.disk_overcommit,
+                reserve_mib: args.disk_reserve_mib,
+            },
         },
         Arc::clone(&proxy_policies),
         Arc::clone(&resolutions),
@@ -1686,6 +1727,57 @@ pub async fn run(args: ServeArgs) -> anyhow::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The heartbeat carries the data directory's free and total bytes, the
+    /// reserve, what is promised and unwritten, the overcommit, and whether
+    /// the node is short, as admission measured them.
+    #[test]
+    fn the_heartbeat_reports_disk_as_admission_sees_it() {
+        let capacity = burrow_common::disk::DiskCapacity {
+            free_bytes: 40 << 30,
+            total_bytes: 100 << 30,
+            reserve_bytes: 5 << 30,
+            unwritten_bytes: 12 << 30,
+            overcommit: 1.5,
+        };
+        let status = disk_status(Some((capacity, true)));
+        assert_eq!(status.disk_free_bytes, 40 << 30);
+        assert_eq!(status.disk_total_bytes, 100 << 30);
+        assert_eq!(status.disk_reserve_bytes, 5 << 30);
+        assert_eq!(status.disk_unwritten_bytes, 12 << 30);
+        assert_eq!(status.disk_overcommit, 1.5);
+        assert!(status.is_disk_low);
+
+        // Unmeasured is unreported, which placement does not check.
+        let none = disk_status(None);
+        assert_eq!(none.disk_total_bytes, 0);
+        assert!(!none.is_disk_low);
+    }
+
+    /// The flags' defaults: never overcommit, and the reserve left to 5%.
+    #[test]
+    fn disk_flags_default_to_no_overcommit_and_a_proportional_reserve() {
+        use clap::Parser as _;
+        #[derive(clap::Parser)]
+        struct Cli {
+            #[command(flatten)]
+            serve: ServeArgs,
+        }
+        let cli = Cli::try_parse_from(["burrowd"]).unwrap();
+        assert_eq!(cli.serve.disk_overcommit, 1.0);
+        assert_eq!(cli.serve.disk_reserve_mib, None);
+        let cli = Cli::try_parse_from([
+            "burrowd",
+            "--disk-overcommit",
+            "2",
+            "--disk-reserve-mib",
+            "10240",
+        ])
+        .unwrap();
+        assert_eq!(cli.serve.disk_overcommit, 2.0);
+        assert_eq!(cli.serve.disk_reserve_mib, Some(10240));
+        assert!(Cli::try_parse_from(["burrowd", "--disk-overcommit", "0"]).is_err());
+    }
 
     /// The orchestrator's address is what a sandbox is denied, so the host has
     /// to come out of the endpoint whatever shape the operator wrote it in.

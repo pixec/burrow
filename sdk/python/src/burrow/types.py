@@ -60,12 +60,30 @@ class HeaderInjection:
 
 
 @dataclass
+class PortRule:
+    """Destination ports a sandbox may never connect to, in any mode.
+
+    ``protocol`` is ``"tcp"``, ``"udp"`` or ``"any"`` (both). ``port_end`` is
+    the inclusive end of a range, 0 for ``port`` alone. ``cidrs`` narrows the
+    denial to destination ranges of either family; empty is every destination.
+    """
+
+    port: int
+    protocol: str = "any"
+    port_end: int = 0
+    cidrs: List[str] = field(default_factory=list)
+
+
+@dataclass
 class NetworkPolicy:
     mode: str = "none"
     allow_domains: List[str] = field(default_factory=list)
     allow_cidrs: List[str] = field(default_factory=list)
     allow_ports: List[int] = field(default_factory=list)
     deny_cidrs: List[str] = field(default_factory=list)
+    deny_ports: List[PortRule] = field(default_factory=list)
+    # Refuse every IPv6 destination, in every mode.
+    deny_ipv6: bool = False
     inspect_tls: bool = False
     rules: List[RequestRule] = field(default_factory=list)
     # The rules that are exactly what `inject_headers` used to describe, so

@@ -46,6 +46,20 @@ file once it grows past a small bound, so resume cost stays flat however many
 times a sandbox cycles. [ARCHITECTURE.md](ARCHITECTURE.md#suspending) has the
 mechanics.
 
+### What a power cut keeps
+
+A node that loses power and comes back keeps everything a guest flushed: its
+disks are configured with a write cache the guest flushes, and every flush is
+synced to the node's disk ([drives and
+flushes](ARCHITECTURE.md#drives-and-flushes)). A suspend is reported only once
+its memory image, device state and disks are synced, and a snapshot only once
+every file in it is, so neither can come back torn. What a guest wrote and had
+not flushed may be lost, as on any machine with a disk cache.
+
+State captured before nodes did this (a sandbox suspended, or a snapshot taken,
+on an older `burrowd`) restores with its old drive configuration, which drops
+flushes, until the sandbox is next booted cold.
+
 ## Why there is no checkpoint command
 
 Burrow can write a running guest's memory without stopping it. `fork` and

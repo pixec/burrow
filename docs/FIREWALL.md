@@ -25,9 +25,10 @@ queries either. Private-network peers and `.internal` names still work.
 
 ### `open`
 
-NAT'd egress to the public internet. DNS lookups are still audited and
-`deny_cidrs` still applies, but connections bypass the proxy, so nothing is
-enforced or audited per connection or per domain.
+NAT'd egress to the public internet, over IPv4 and IPv6. DNS lookups are still
+audited and `deny_cidrs`, `deny_ports` and `is_ipv6_denied` still apply, but
+connections bypass the proxy, so nothing is enforced or audited per connection
+or per domain.
 
 Open means off the fleet, not everywhere. Every sandbox address comes out of one
 pool (`10.99.0.0/16`), and an open-mode sandbox is denied that whole range, on
@@ -52,12 +53,17 @@ proxy, which checks every connection.
   ranges. Entries are strictly validated, address and prefix only.
 - **`allow_ports`** (`--allow-port`): narrow the `allow_cidrs` allowance to
   specific ports, 1 to 65535. Empty means every port.
-- **`deny_cidrs`** (`--deny-cidr`): block IPv4 ranges. Deny beats every
-  allowance in every mode. The rules are rendered before any accept, and the
-  proxy refuses a connection whose upstream address falls in a denied range, so
-  a denied range stays unreachable even if an allowed domain resolves into it or
-  `allow_cidrs` or `open` would otherwise grant it. An entry that does not parse
-  costs the sandbox its egress rather than being skipped.
+- **`deny_cidrs`** (`--deny-cidr`): block IPv4 or IPv6 ranges, such as
+  `169.254.169.254/32` or `2001:db8::/32`. Deny beats every allowance in every
+  mode. The rules are rendered before any accept, and the proxy refuses a
+  connection whose upstream address falls in a denied range, so a denied range
+  stays unreachable even if an allowed domain resolves into it or `allow_cidrs`
+  or `open` would otherwise grant it. A range covers its own family only: an
+  IPv4 list says nothing about IPv6, so name the v6 ranges as well, or deny
+  IPv6 outright (see [IPv6](#ipv6)). An entry that does not parse costs the
+  sandbox its egress rather than being skipped.
+- **`deny_ports`** (`--deny-port`): block destination ports in every mode. See
+  [Denied ports](#denied-ports).
 - **`deny_domains`** (`--deny-domain`): block by domain glob. Like `deny_cidrs`
   it beats every allowance in every mode, `open` included: a name matching one
   is not resolved, not connected to, and not requested inside an inspected
@@ -88,6 +94,91 @@ when the policy is set, and in `allow_domains` it is simply a dead entry, so an
 allowance you thought you had is one nothing can use. A port suffix on either
 side is ignored. A leading wildcard never covers the apex: add `example.com`
 alongside it when the sandbox needs both.
+
+## Denied ports
+
+`deny_ports` refuses connections by destination port, in every mode and ahead
+of every allowance: `open`, `allow_cidrs`, `allow_ports` and private-network
+peers included. It is how a sandbox keeps open egress but loses one protocol,
+outbound mail being the usual case:
+
+```sh
+burrow create --template base --net open \
+  --deny-port tcp/25 --deny-port tcp/465 --deny-port tcp/587
+```
+
+Each entry is a `PortRule`:
+
+| Field | Meaning |
+| --- | --- |
+| `protocol` | `tcp`, `udp`, or unspecified for both |
+| `port` | First port, 1 to 65535 |
+| `port_end` | Last port, inclusive; 0 means `port` alone |
+| `cidrs` | Destination ranges it is limited to, IPv4 or IPv6; empty is every destination |
+
+On the command line the same entry is `[tcp/|udp/]PORT[-END][@CIDR,...]`:
+`tcp/25`, `tcp/465-587`, `5432` (TCP and UDP), `udp/53@10.0.0.0/8`.
+
+A rule with no `cidrs` applies over IPv4 and IPv6 alike. One with `cidrs`
+applies to the families its ranges name: `5432@10.0.0.0/8` says nothing about
+IPv6 traffic to port 5432.
+
+How it is enforced:
+
+- **nftables** drops matching packets in the sandbox chain, beside the
+  `deny_cidrs` drops and ahead of the established accept, so a connection opened
+  under an earlier policy does not outlive the denial on its conntrack entry. A
+  rule matches the connection's original direction only, which keeps replies to
+  inbound traffic working when the remote side's ephemeral port happens to fall
+  in a denied range; packets conntrack has no direction for are dropped too.
+- **The egress proxy** refuses a connection to a denied TCP port and writes an
+  audit record with the reason `destination port is denied`. On Linux that is
+  the path for TCP 80 and 443 in allowlist mode, which are redirected to the
+  proxy before the sandbox chain sees them, so `--deny-port tcp/443` on an
+  allowlist sandbox is refused, and recorded, by the proxy.
+- **macOS nodes** decide every flow in userspace, so every refused port is
+  audited there, direct or proxied, and a flow to a private-network peer, on
+  the same Mac or across the mesh, meets the sender's denials in the router
+  exactly as it meets them in a Linux sandbox chain.
+
+As with `deny_cidrs`, a drop the Linux sandbox chain makes on its own is not
+written to the audit log: nftables decides those packets without consulting the
+daemon. The proxy, the resolver and macOS nodes record every refusal they make.
+
+Validation happens at the API door: at most 64 rules per policy and 16 ranges
+per rule, ports in range, `port_end` either 0 or between `port` and 65535, and
+every range a strict `address/prefix`. A rule a node cannot parse, which can
+only mean the stored policy is not the one that was validated, costs the
+sandbox its egress in both families rather than being skipped.
+
+## IPv6
+
+Every sandbox has an IPv6 address on its own link beside its IPv4 one, out of
+the fleet pool `fd99:b070::/48`. What it may reach over IPv6 depends on the
+mode, and `is_ipv6_denied` (`--deny-ipv6`) takes it all away:
+
+| Mode | IPv6 by default | With `is_ipv6_denied` |
+| --- | --- | --- |
+| `none` | Nothing | Nothing |
+| `allowlist` | TCP 80 and 443 to the egress proxy, held to the same allowlist, pinning and denials as IPv4; nothing else | Nothing: no redirect to the proxy, and the proxy refuses an IPv6 destination |
+| `open` | NAT'd egress to the public internet, except the fleet's v6 pool and link-local | Nothing |
+
+In every mode, with or without the denial, link-local destinations are dropped
+and the link to the sandbox's own gateway keeps working (neighbour discovery,
+ping to the gateway), since that is not egress. IPv4 is unaffected by the
+denial.
+
+The default is unchanged from before the field existed, so existing policies
+behave as they did. In practice the resolver never returns AAAA records, so
+IPv6 egress in open mode reaches only addresses a workload already knows. That
+is exactly the bypass to close when a policy relies on `deny_cidrs` or
+`deny_ports`: either deny IPv6 outright, or write the v6 ranges into
+`deny_cidrs` and leave `deny_ports` unscoped, so both apply on the IPv6 path.
+
+```sh
+burrow create --template base --net open --deny-ipv6 \
+  --deny-port tcp/25 --deny-port tcp/465 --deny-port tcp/587
+```
 
 ## How enforcement works
 
@@ -625,13 +716,18 @@ burrow config network-policy <sandbox-id> --net none
 
 The update replaces the policy wholesale rather than patching it: a field left
 out is an allowance withdrawn, which is what makes locking a sandbox down one
-call.
+call. It is also a denial withdrawn: an update that leaves out `deny_ports` or
+`is_ipv6_denied` lifts them, so a client changing one field sends the others
+again. Forks, snapshots and moves carry the whole policy, these fields
+included.
 
 Tightening mid-connection is enforced at the boundary. nftables rules apply to
 new packets immediately and the proxy re-checks per request on inspected
 sessions, while connections already established keep their conntrack entry. So a
 tightening bites new connections and, inside an inspected session, the next
-request, rather than cutting a transfer in flight.
+request, rather than cutting a transfer in flight. Denials are the exception:
+`deny_cidrs`, `deny_ports` and `is_ipv6_denied` are rendered ahead of the
+established accept, so a connection they now cover stops at its next packet.
 
 One transition is refused rather than applied: **`is_tls_inspected` can only be
 enabled at creation.** The guest trusts Burrow's CA because it was installed into
@@ -699,7 +795,7 @@ two cannot drift. Per new flow:
 
 | Linux | macOS |
 | --- | --- |
-| Allowlist TCP 80/443 redirected to the egress proxy | The terminated connection is handed to the same proxy, which checks SNI or `Host`, the DNS pin, `deny_cidrs`, inspection and request rules |
+| Allowlist TCP 80/443 redirected to the egress proxy | The terminated connection is handed to the same proxy, which checks SNI or `Host`, the DNS pin, `deny_cidrs`, `deny_ports`, inspection and request rules |
 | Forward chain accept (open mode, `allow_cidrs`/`allow_ports`, peers), masquerade | A host socket dialled to the destination and spliced to the guest |
 | `tohost` accept for the resolver | Queries answered by the same resolver with the same allowlist, pinning and audit |
 | Chain drop | TCP reset, UDP dropped, either way audited |
@@ -730,7 +826,8 @@ WireGuard with each peer's slice as its `AllowedIPs`, and keys and peers from
 the orchestrator under the same pinning. Each new flow is decided once with
 `burrow_net::policy::decide_peer`: the sender's own decision (so a peer is
 exempt from the allowlist redirect, as the `prerouting` accept makes it on
-Linux) and the receiver's membership, which is what a flow arriving over the
+Linux, though never from its `deny_cidrs`, `deny_ports` or IPv6 denial) and
+the receiver's membership, which is what a flow arriving over the
 mesh meets in a Linux sandbox chain; a test renders the ruleset for the same
 pairs, on one node and across the mesh, and checks they agree. Replies follow
 the tracked flow. A policy update re-decides every tracked flow and resets
@@ -746,5 +843,7 @@ is the address the orchestrator reports the port at, as Linux's DNAT serves
 whatever reaches the node from outside.
 
 Not yet on macOS: IPv6 (the guest is not offered a router, so it has
-link-local addresses only), UDP published ports, and ICMP beyond pinging the
+link-local addresses only, and `is_ipv6_denied` changes nothing a macOS guest
+can reach; v6 is never forwarded to a peer or over the mesh), UDP published
+ports, and ICMP beyond pinging the
 gateway and echo between peers.

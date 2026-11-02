@@ -324,14 +324,7 @@ impl MicroVm {
             .await?;
 
         for drive in &self.spec.drives {
-            self.api
-                .add_drive(&Drive {
-                    drive_id: drive.id.clone(),
-                    path_on_host: drive.path.clone(),
-                    is_root_device: drive.is_root,
-                    is_read_only: drive.is_read_only,
-                })
-                .await?;
+            self.api.add_drive(&Drive::from_spec(drive)).await?;
         }
 
         if let Some(net) = &self.spec.net {
@@ -462,14 +455,7 @@ impl MicroVm {
     /// volume reaches a sandbox restored from a warm snapshot, which was
     /// captured without it.
     pub async fn attach_drive(&self, drive: &DriveSpec) -> Result<()> {
-        self.api
-            .add_drive(&Drive {
-                drive_id: drive.id.clone(),
-                path_on_host: drive.path.clone(),
-                is_root_device: drive.is_root,
-                is_read_only: drive.is_read_only,
-            })
-            .await
+        self.api.add_drive(&Drive::from_spec(drive)).await
     }
 
     /// Starts a fresh VMM process and restores a snapshot from `workdir`

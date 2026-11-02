@@ -143,7 +143,7 @@ use tokio::sync::watch;
 
 use crate::firewall::Mode;
 use crate::ipam::Lease;
-use crate::policy::Rules;
+use crate::policy::{Deny, PortDenial, Rules};
 
 pub use conn::GuestConn;
 pub use router::{MESH_MSS, Router, Uplink};
@@ -186,16 +186,19 @@ pub struct Policy {
     /// What the proxy and the resolver decide by. Built the way the daemon
     /// builds it for the Linux proxy's table.
     pub proxy: burrow_proxy::SandboxPolicy,
-    /// The L3 half, validated: mode and `deny_cidrs` from `proxy`, with the
-    /// fields only nftables reads on Linux.
+    /// The L3 half, validated: mode, `deny_cidrs` and `is_ipv6_denied` from
+    /// `proxy`, with the fields only nftables reads on Linux.
     pub rules: Rules,
 }
 
 impl Policy {
+    /// `deny_ports` is the policy's full list, UDP included: the proxy's copy
+    /// holds only the TCP entries it can act on.
     pub fn new(
         proxy: burrow_proxy::SandboxPolicy,
         allow_cidrs: &[String],
         allow_ports: &[u32],
+        deny_ports: &[PortDenial],
         peers: &[Ipv4Addr],
     ) -> Self {
         let mode = match proxy.mode {
@@ -208,7 +211,11 @@ impl Policy {
             mode,
             allow_cidrs,
             allow_ports,
-            &proxy.deny_cidrs,
+            Deny {
+                cidrs: &proxy.deny_cidrs,
+                ports: deny_ports,
+                is_ipv6_denied: proxy.is_ipv6_denied,
+            },
             peers,
         );
         Self { proxy, rules }

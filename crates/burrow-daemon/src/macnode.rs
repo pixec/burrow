@@ -1658,6 +1658,7 @@ impl UserNets {
                 proxy.clone(),
                 &rules.allow_cidrs,
                 &rules.allow_ports,
+                &rules.deny_ports,
                 &rules.peers,
             );
             let (to_publish, address): (Vec<(u16, u16)>, _) = {
@@ -1749,6 +1750,7 @@ fn none_policy(sandbox_id: &str) -> burrow_net::usernet::Policy {
             mode: burrow_proxy::policy::NetworkMode::None,
             ..Default::default()
         },
+        &[],
         &[],
         &[],
         &[],

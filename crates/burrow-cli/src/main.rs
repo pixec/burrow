@@ -1042,6 +1042,16 @@ struct NetworkFlags {
     /// Repeatable.
     #[arg(long = "deny-domain")]
     deny_domains: Vec<String>,
+    /// Destination port the sandbox may never connect to, in every mode, as
+    /// [tcp/|udp/]PORT[-END][@CIDR,...]: tcp/25, tcp/465-587, 5432@10.0.0.0/8.
+    /// Without a protocol it covers both; without CIDRs every destination,
+    /// over IPv4 and IPv6. Beats every allowance. Repeatable.
+    #[arg(long = "deny-port")]
+    deny_ports: Vec<String>,
+    /// Refuse every IPv6 destination, in every mode. Without it each mode
+    /// keeps its own IPv6 behaviour; see docs/FIREWALL.md.
+    #[arg(long = "deny-ipv6")]
+    is_ipv6_denied: bool,
     /// Terminate this sandbox's TLS so the host named inside the session
     /// is checked, not just the SNI. Closes domain fronting, at the cost
     /// of the proxy being able to read the payload.
@@ -1076,9 +1086,77 @@ impl NetworkFlags {
             || !self.allow_ports.is_empty()
             || !self.deny_cidrs.is_empty()
             || !self.deny_domains.is_empty()
+            || !self.deny_ports.is_empty()
+            || self.is_ipv6_denied
             || !self.inject_headers.is_empty()
             || !self.rules.is_empty()
     }
+}
+
+/// Parses one `--deny-port`: `[tcp/|udp/]PORT[-END][@CIDR,...]`.
+///
+/// Only the shape is checked here. Ranges and CIDRs are validated by the node,
+/// which is the one place every client's policy passes through.
+fn parse_port_rule(spec: &str) -> anyhow::Result<common::PortRule> {
+    let usage = || {
+        anyhow::anyhow!(
+            "--deny-port {spec:?}: expected [tcp/|udp/]PORT[-END][@CIDR,...], e.g. tcp/25 or tcp/465-587"
+        )
+    };
+    let (ports, cidrs) = match spec.split_once('@') {
+        Some((ports, cidrs)) => (
+            ports,
+            cidrs
+                .split(',')
+                .map(|cidr| cidr.trim().to_string())
+                .collect::<Vec<_>>(),
+        ),
+        None => (spec, Vec::new()),
+    };
+    if cidrs.iter().any(String::is_empty) {
+        return Err(usage());
+    }
+    let (protocol, ports) = if let Some(rest) = ports.strip_prefix("tcp/") {
+        (common::PortProtocol::Tcp, rest)
+    } else if let Some(rest) = ports.strip_prefix("udp/") {
+        (common::PortProtocol::Udp, rest)
+    } else {
+        (common::PortProtocol::Unspecified, ports)
+    };
+    let number = |text: &str| -> anyhow::Result<u32> {
+        if text.is_empty() || !text.bytes().all(|b| b.is_ascii_digit()) {
+            return Err(usage());
+        }
+        text.parse::<u32>().map_err(|_| usage())
+    };
+    let (port, port_end) = match ports.split_once('-') {
+        Some((first, last)) => (number(first)?, number(last)?),
+        None => (number(ports)?, 0),
+    };
+    Ok(common::PortRule {
+        protocol: protocol as i32,
+        port,
+        port_end,
+        cidrs,
+    })
+}
+
+/// The `--deny-port` spelling of a port rule, for reading a policy back.
+fn describe_port_rule(rule: &common::PortRule) -> String {
+    let protocol = match common::PortProtocol::try_from(rule.protocol) {
+        Ok(common::PortProtocol::Tcp) => "tcp/",
+        Ok(common::PortProtocol::Udp) => "udp/",
+        _ => "",
+    };
+    let mut text = format!("{protocol}{}", rule.port);
+    if rule.port_end != 0 && rule.port_end != rule.port {
+        text.push_str(&format!("-{}", rule.port_end));
+    }
+    if !rule.cidrs.is_empty() {
+        text.push('@');
+        text.push_str(&rule.cidrs.join(","));
+    }
+    text
 }
 
 /// Parses repeated `--mount name:/path[:ro|rw]` and
@@ -1758,10 +1836,16 @@ async fn main() -> anyhow::Result<()> {
                 .revoke_access(api::SandboxRef { id: id.clone() })
                 .await?
                 .into_inner();
+            let revoked_ms = match revoked.revoked_at_ms {
+                0 => revoked.revoked_at * 1000,
+                ms => ms,
+            };
             println!(
-                "revoked every token for {id} issued by {}; ended {} open session(s)",
-                rfc3339_from_unix_ms(revoked.revoked_at * 1000),
-                revoked.ended_sessions
+                "revoked every token for {id} issued by {}; ended {} open session(s) and killed \
+                 {} command(s)",
+                rfc3339_from_unix_ms(revoked_ms),
+                revoked.ended_sessions,
+                revoked.killed_commands
             );
         }
         Command::Remove { ids } => {
@@ -2724,6 +2808,12 @@ fn network_policy(flags: NetworkFlags) -> anyhow::Result<common::NetworkPolicy> 
         allow_ports: flags.allow_ports.into_iter().map(|p| p as u32).collect(),
         deny_cidrs: flags.deny_cidrs,
         deny_domains: flags.deny_domains,
+        deny_ports: flags
+            .deny_ports
+            .iter()
+            .map(|spec| parse_port_rule(spec))
+            .collect::<anyhow::Result<Vec<_>>>()?,
+        is_ipv6_denied: flags.is_ipv6_denied,
         is_tls_inspected: flags.is_tls_inspected,
         // `--rule` first: an `--inject-header` rule carries no matcher, so it
         // claims every request to its domain and would shadow any narrower
@@ -3066,34 +3156,71 @@ async fn list_nodes(client: &mut Client) -> anyhow::Result<()> {
         println!("no nodes registered");
         return Ok(());
     }
-    println!(
-        "{:<38} {:<22} {:>5} {:>9} {:>9} {:>5} {:<9} {:<24} HOSTNAME",
-        "NODE", "ADDRESS", "CPUS", "MEM_MIB", "FREE_MIB", "SBX", "STATE", "LABELS"
+    print!("{}", node_table(&resp.nodes));
+    Ok(())
+}
+
+/// `node ls`'s table, one row per node.
+///
+/// DISK is free over total on the node's data directory. A node whose free
+/// disk has fallen below its reserve while it runs sandboxes says `LOW` there
+/// and `disk-low` in STATE: it refuses creates, resumes and adopts until disk
+/// is freed, and its guests' writes may start failing.
+fn node_table(nodes: &[api::Node]) -> String {
+    use std::fmt::Write as _;
+    let mut out = String::new();
+    let _ = writeln!(
+        out,
+        "{:<38} {:<22} {:>5} {:>9} {:>9} {:>16} {:>5} {:<9} {:<24} HOSTNAME",
+        "NODE", "ADDRESS", "CPUS", "MEM_MIB", "FREE_MIB", "DISK", "SBX", "STATE", "LABELS"
     );
-    for node in resp.nodes {
-        let info = node.info.unwrap_or_default();
-        let status = node.status.unwrap_or_default();
+    for node in nodes {
+        let info = node.info.clone().unwrap_or_default();
+        let status = node.status.clone().unwrap_or_default();
         let state = if !node.is_healthy {
             "stale"
         } else if status.is_draining {
             "draining"
+        } else if status.is_disk_low {
+            "disk-low"
         } else {
             "ready"
         };
-        println!(
-            "{:<38} {:<22} {:>5} {:>9} {:>9} {:>5} {:<9} {:<24} {}",
+        let _ = writeln!(
+            out,
+            "{:<38} {:<22} {:>5} {:>9} {:>9} {:>16} {:>5} {:<9} {:<24} {}",
             info.id,
             info.address,
             info.total_vcpus,
             info.total_mem_mib,
             status.free_mem_mib,
+            disk_column(&status),
             status.running_sandboxes,
             state,
             truncate(&format_tags(&info.labels), 24),
             info.hostname,
         );
     }
-    Ok(())
+    out
+}
+
+/// Free over total disk in GiB, `LOW` when under the reserve, `-` for a node
+/// that does not report disk.
+fn disk_column(status: &common::NodeStatus) -> String {
+    if status.disk_total_bytes == 0 {
+        return "-".into();
+    }
+    let gib = |bytes: u64| bytes as f64 / (1u64 << 30) as f64;
+    let column = format!(
+        "{:.1}/{:.0}G",
+        gib(status.disk_free_bytes),
+        gib(status.disk_total_bytes)
+    );
+    if status.is_disk_low {
+        format!("{column} LOW")
+    } else {
+        column
+    }
 }
 
 /// `ps`: the sandboxes there are, running ones unless --all.
@@ -3554,6 +3681,12 @@ fn print_config(sandbox: &common::Sandbox) {
     }
     for domain in &network.deny_domains {
         field("deny-domain", domain);
+    }
+    for rule in &network.deny_ports {
+        field("deny-port", &describe_port_rule(rule));
+    }
+    if network.is_ipv6_denied {
+        field("deny-ipv6", "yes");
     }
     if network.is_tls_inspected {
         field("inspect-tls", "yes");
@@ -4440,6 +4573,17 @@ fn sandbox_json(sandbox: &common::Sandbox) -> String {
                 ),
                 ("deny_cidrs", strings(&network.deny_cidrs)),
                 ("deny_domains", strings(&network.deny_domains)),
+                (
+                    "deny_ports",
+                    Json::Arr(
+                        network
+                            .deny_ports
+                            .iter()
+                            .map(|rule| Json::str(describe_port_rule(rule)))
+                            .collect(),
+                    ),
+                ),
+                ("deny_ipv6", Json::Bool(network.is_ipv6_denied)),
                 ("inspect_tls", Json::Bool(network.is_tls_inspected)),
                 (
                     "rules",
@@ -4652,6 +4796,57 @@ fn rfc3339_from_unix_ms(ms: i64) -> String {
 
 #[cfg(test)]
 mod tests {
+    fn node(id: &str, status: burrow_proto::common::v1::NodeStatus) -> api::Node {
+        api::Node {
+            info: Some(burrow_proto::common::v1::NodeInfo {
+                id: id.into(),
+                address: format!("{id}:7071"),
+                hostname: id.into(),
+                ..Default::default()
+            }),
+            status: Some(status),
+            is_healthy: true,
+            last_heartbeat_at: String::new(),
+        }
+    }
+
+    /// `node ls` shows each node's free and total disk, and a node under its
+    /// reserve says so twice: LOW beside the figure and disk-low as its state.
+    #[test]
+    fn node_ls_shows_disk_and_a_node_short_of_it() {
+        use burrow_proto::common::v1::NodeStatus;
+        let table = node_table(&[
+            node(
+                "node-a",
+                NodeStatus {
+                    disk_free_bytes: 40 << 30,
+                    disk_total_bytes: 100 << 30,
+                    ..Default::default()
+                },
+            ),
+            node(
+                "node-b",
+                NodeStatus {
+                    disk_free_bytes: 3 << 29,
+                    disk_total_bytes: 100 << 30,
+                    is_disk_low: true,
+                    running_sandboxes: 2,
+                    ..Default::default()
+                },
+            ),
+            node("node-c", NodeStatus::default()),
+        ]);
+        let lines: Vec<&str> = table.lines().collect();
+        assert!(lines[0].contains(" DISK "), "{table}");
+        assert!(lines[1].contains("40.0/100G"), "{table}");
+        assert!(lines[1].contains(" ready "), "{table}");
+        assert!(lines[2].contains("1.5/100G LOW"), "{table}");
+        assert!(lines[2].contains(" disk-low "), "{table}");
+        // A node that does not report disk shows a dash, not a full disk.
+        let unreported: Vec<&str> = lines[3].split_whitespace().collect();
+        assert_eq!(unreported[5], "-", "{table}");
+    }
+
     #[test]
     fn usage_bounds_parse_as_utc() {
         assert_eq!(super::unix_ms_from_utc("1970-01-01"), Some(0));
@@ -5069,9 +5264,71 @@ mod tests {
             allow_ports: vec![],
             deny_cidrs: vec!["10.0.0.0/8".into()],
             deny_domains: vec![],
+            deny_ports: vec![],
+            is_ipv6_denied: false,
             is_tls_inspected: inspect_tls,
             inject_headers: inject.iter().map(|s| (*s).to_string()).collect(),
             rules: vec![],
+        }
+    }
+
+    #[test]
+    fn deny_port_flags_become_port_rules() {
+        let mut open = flags("open", false, &[]);
+        open.deny_ports = vec![
+            "tcp/25".into(),
+            "tcp/465-587".into(),
+            "5432@10.0.0.0/8,2001:db8::/32".into(),
+            "udp/53@10.0.0.0/8".into(),
+        ];
+        open.is_ipv6_denied = true;
+        let policy = network_policy(open).unwrap();
+        assert!(policy.is_ipv6_denied);
+        let rule =
+            |protocol: common::PortProtocol, port, port_end, cidrs: &[&str]| common::PortRule {
+                protocol: protocol as i32,
+                port,
+                port_end,
+                cidrs: cidrs.iter().map(|c| (*c).to_string()).collect(),
+            };
+        assert_eq!(
+            policy.deny_ports,
+            vec![
+                rule(common::PortProtocol::Tcp, 25, 0, &[]),
+                rule(common::PortProtocol::Tcp, 465, 587, &[]),
+                rule(
+                    common::PortProtocol::Unspecified,
+                    5432,
+                    0,
+                    &["10.0.0.0/8", "2001:db8::/32"]
+                ),
+                rule(common::PortProtocol::Udp, 53, 0, &["10.0.0.0/8"]),
+            ]
+        );
+        // Read back in the spelling it was written in.
+        let spelled: Vec<String> = policy.deny_ports.iter().map(describe_port_rule).collect();
+        assert_eq!(
+            spelled,
+            [
+                "tcp/25",
+                "tcp/465-587",
+                "5432@10.0.0.0/8,2001:db8::/32",
+                "udp/53@10.0.0.0/8"
+            ]
+        );
+
+        for bad in [
+            "",
+            "tcp/",
+            "sctp/25",
+            "tcp/25-",
+            "-25",
+            "+25",
+            "25@",
+            "25@10.0.0.0/8,",
+            "tcp/a",
+        ] {
+            assert!(parse_port_rule(bad).is_err(), "{bad:?} should be refused");
         }
     }
 
@@ -5199,6 +5456,16 @@ mod tests {
         domains.deny_cidrs.clear();
         domains.allow_domains.push("pypi.org".into());
         assert!(domains.is_stated());
+
+        let mut ports = flags("none", false, &[]);
+        ports.deny_cidrs.clear();
+        ports.deny_ports.push("tcp/25".into());
+        assert!(ports.is_stated());
+
+        let mut ipv6 = flags("none", false, &[]);
+        ipv6.deny_cidrs.clear();
+        ipv6.is_ipv6_denied = true;
+        assert!(ipv6.is_stated());
     }
 
     #[test]
@@ -5271,6 +5538,8 @@ mod tests {
                     allow_ports: vec![],
                     deny_cidrs: vec![],
                     deny_domains: vec![],
+                    deny_ports: vec![],
+                    is_ipv6_denied: false,
                     is_tls_inspected: false,
                     inject_headers: vec![],
                     rules: vec![],

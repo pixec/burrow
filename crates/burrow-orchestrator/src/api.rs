@@ -151,6 +151,7 @@ struct PlacementGuard<'a> {
     node_id: String,
     vcpus: u32,
     mem_mib: u64,
+    disk_bytes: u64,
     is_kept: bool,
 }
 
@@ -163,7 +164,8 @@ impl PlacementGuard<'_> {
 impl Drop for PlacementGuard<'_> {
     fn drop(&mut self) {
         if !self.is_kept {
-            self.nodes.release(&self.node_id, self.vcpus, self.mem_mib);
+            self.nodes
+                .release(&self.node_id, self.vcpus, self.mem_mib, self.disk_bytes);
             release_in_store(self.store.clone(), &self.node_id, self.vcpus, self.mem_mib);
         }
     }
@@ -229,11 +231,15 @@ impl ApiService {
             {
                 Ok(true) => return Ok(node_id),
                 Ok(false) => {
-                    self.0.nodes.release(&node_id, want.vcpus, want.mem_mib);
+                    self.0
+                        .nodes
+                        .release(&node_id, want.vcpus, want.mem_mib, want.disk_bytes);
                     excluded.insert(node_id);
                 }
                 Err(err) => {
-                    self.0.nodes.release(&node_id, want.vcpus, want.mem_mib);
+                    self.0
+                        .nodes
+                        .release(&node_id, want.vcpus, want.mem_mib, want.disk_bytes);
                     return Err(crate::registry::PlacementError::Store(err.to_string()));
                 }
             }
@@ -247,6 +253,7 @@ impl ApiService {
             node_id: node_id.to_string(),
             vcpus: want.vcpus,
             mem_mib: want.mem_mib,
+            disk_bytes: want.disk_bytes,
             is_kept: false,
         }
     }
@@ -759,6 +766,10 @@ impl ApiService {
                     arch: snapshot.arch.clone(),
                     firecracker_version: snapshot.firecracker_version.clone(),
                     hypervisor: recorded_hypervisor(&snapshot.hypervisor),
+                    disk_bytes: crate::registry::disk_bytes(Some(&common::ResourcePolicy {
+                        scratch_disk_mib: snapshot.scratch_disk_mib,
+                        ..Default::default()
+                    })),
                     ..want.clone()
                 };
                 let root = match is_inspected {
@@ -1114,6 +1125,7 @@ impl ApiService {
                 0 => 512,
                 mem => mem as u64,
             },
+            disk_bytes: crate::registry::disk_bytes(Some(&resources)),
             // The kernel and rootfs travel with the state.
             is_template_transfer_allowed: true,
             node_labels,
@@ -1189,7 +1201,10 @@ impl ApiService {
             0 => 512,
             mem => mem as u64,
         };
-        self.0.nodes.release(&sandbox.node_id, vcpus, mem_mib);
+        let disk_bytes = crate::registry::disk_bytes(Some(&resources));
+        self.0
+            .nodes
+            .release(&sandbox.node_id, vcpus, mem_mib, disk_bytes);
         release_in_store(self.0.store.clone(), &sandbox.node_id, vcpus, mem_mib);
     }
 }
@@ -1369,6 +1384,7 @@ impl Burrow for ApiService {
                 0 => 512,
                 mem => mem as u64,
             },
+            disk_bytes: crate::registry::disk_bytes(resources.as_ref()),
             // First pass insists the template is already there; only if that
             // finds nothing do we consider copying it.
             is_template_transfer_allowed: false,
@@ -2131,6 +2147,9 @@ impl Burrow for ApiService {
             is_mesh_available: self.0.nodes.is_mesh_available(""),
             vcpus: 1,
             mem_mib: 0,
+            // A volume's image is the volume's, which disk admission does
+            // not count yet.
+            disk_bytes: 0,
             is_template_transfer_allowed: true,
             node_labels: req.node_labels.clone(),
             arch: String::new(),
@@ -2894,29 +2913,41 @@ impl Burrow for ApiService {
         req: Request<api::SandboxRef>,
     ) -> Result<Response<api::RevokeAccessResponse>, Status> {
         let id = self.resolve(&req.into_inner().id).await;
+        // By the clock tokens are issued by, so a token issued a moment after
+        // this, in the same second, is told apart from one issued before.
+        let revoked_at_ms = burrow_common::unix_now_ms();
         // A sandbox no node holds has no sessions to end, and its tokens are
         // refused by whichever node adopts it, which is handed this record.
         if let Some(mut sandbox) = self.unplaced(&id).await {
-            sandbox.access_revoked_at = burrow_common::unix_now();
-            let revoked_at = sandbox.access_revoked_at;
+            let revoked_at_ms = revoked_at_ms.max(burrow_common::access::revoked_before_ms(
+                sandbox.access_revoked_at,
+                sandbox.access_revoked_at_ms,
+            ));
+            sandbox.access_revoked_at = revoked_at_ms / 1000;
+            sandbox.access_revoked_at_ms = revoked_at_ms;
             self.0.sandboxes.insert(sandbox);
             self.write_through().await;
-            tracing::info!(sandbox = id, "access tokens revoked");
+            tracing::info!(sandbox = id, revoked_at_ms, "access tokens revoked");
             return Ok(Response::new(api::RevokeAccessResponse {
-                revoked_at,
+                revoked_at: revoked_at_ms / 1000,
                 ended_sessions: 0,
+                revoked_at_ms,
+                killed_commands: 0,
             }));
         }
         let mut client = self.node_for(&id).await?;
         let revoked = client
-            .revoke_access(nodepb::NodeSandboxRef {
+            .revoke_access(nodepb::NodeRevokeAccessRequest {
                 sandbox_id: id.clone(),
+                revoked_at_ms,
             })
             .await?
             .into_inner();
         tracing::info!(
             sandbox = id,
+            revoked_at_ms = revoked.revoked_at_ms,
             ended_sessions = revoked.ended_sessions,
+            killed_commands = revoked.killed_commands,
             "access tokens revoked"
         );
         Ok(Response::new(revoked))
@@ -3058,7 +3089,7 @@ fn build_placement(req: &api::BuildTemplateRequest) -> crate::registry::Placemen
     }
 }
 
-fn placement_status(err: crate::registry::PlacementError) -> Status {
+pub(crate) fn placement_status(err: crate::registry::PlacementError) -> Status {
     match err {
         crate::registry::PlacementError::NoHealthyNode
         | crate::registry::PlacementError::NoCapacity { .. } => {

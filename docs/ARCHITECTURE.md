@@ -434,6 +434,31 @@ Snapshot files are the backend's too. Firecracker's are `snapshot.vmstate` and
 snapshot (forks, the snapshot store, durable state, warm pools, recovery) reads
 the names from the sandbox's `Layout`.
 
+### Drives and flushes
+
+A guest's `fsync` has to reach the host's disk, or a power cut loses writes the
+guest was told were durable and can leave its journal inconsistent. Every
+backend gives the guest a disk with a write cache it flushes, and turns each
+flush into a sync of the backing file:
+
+| Backend | How | Where |
+| --- | --- | --- |
+| Firecracker | Every drive, boot and hotplug, root, scratch and volumes alike, is configured with `cache_type: "Writeback"`. Firecracker's default, `Unsafe`, tells the guest there is no cache to flush, so its `fsync` stops in the host page cache. | `firecracker/model.rs` (`Drive::from_spec`) |
+| Cloud Hypervisor | Nothing to set. v54.0 always offers `VIRTIO_BLK_F_FLUSH` and `VIRTIO_BLK_F_CONFIG_WCE`, starts in writeback, and `fsync`s on every flush under each I/O engine; a test pins the disk keys Burrow sends so none can turn it off. | `cloud_hypervisor/config.rs` (`disk`) |
+| Virtualization.framework | Disks are attached with caching `Automatic` and synchronization `Full` named explicitly (the same as `initWithURL:readOnly:`'s defaults), and the attachment is checked to have taken `Full`, which flushes with `F_FULLFSYNC`. | `vz/mod.rs` (`disk_attachment`) |
+
+Ordinary writes cost the same; only flushes wait for the disk. The disk image
+itself is still buffered in the host page cache until a flush.
+
+Firecracker restores a drive's cache mode from a snapshot's device state, so
+state captured before this keeps dropping flushes after a restore. Warm
+snapshots are format 4 from this change and older ones are rebuilt on demand.
+A sandbox suspended, or a snapshot taken, before it carries its old drives until
+the sandbox is next booted cold (`shutdown` then `boot`, or `recreate`).
+
+The check, per hypervisor, is a power cut on the harness; see
+[checking flushes survive a power cut](#checking-flushes-survive-a-power-cut).
+
 ### Cloud Hypervisor
 
 Driven the way Firecracker is. `cloud-hypervisor --api-socket path=ch.sock` is
@@ -504,6 +529,8 @@ on disk, 512 MiB for a 512 MiB guest, where Firecracker's is sparse.
 | `--cloud-hypervisor <PATH>` | `/usr/local/bin/cloud-hypervisor` | |
 | `--cloud-hypervisor-kernel <PATH>` | unset | Kernel every Cloud Hypervisor sandbox boots instead of its template's. |
 | `--unjailed-cloud-hypervisor` | off | Run Cloud Hypervisor unconfined even with `--jailer`. For dev boxes only. |
+| `--disk-overcommit <FACTOR>` | `1.0` | How far disk promised to sandboxes may exceed free disk above the reserve. 1.0 never overcommits. Reads `BURROWD_DISK_OVERCOMMIT`. See [disk](#disk). |
+| `--disk-reserve-mib <MIB>` | 5% of the filesystem | Disk kept free on the data directory's filesystem. Reads `BURROWD_DISK_RESERVE_MIB`. |
 
 Placement takes only nodes offering the template's hypervisor. The
 orchestrator learns it from the template's recorded config on a node holding
@@ -551,8 +578,9 @@ flowchart LR
 
 ### Firewall structure
 
-What the policy can express (modes, `deny_cidrs`, live updates, credential
-brokering) is in [FIREWALL.md](FIREWALL.md). This is how it is enforced.
+What the policy can express (modes, `deny_cidrs`, `deny_ports`, IPv6, live
+updates, credential brokering) is in [FIREWALL.md](FIREWALL.md). This is how it
+is enforced.
 
 Base chains use `policy accept` and jump sandbox traffic into burrow-owned
 chains that end in `drop`. A `policy drop` on a base hook would govern *all*
@@ -579,11 +607,11 @@ flowchart TB
     sel -->|"iifname/oifname bt*<br/>or iifname burrow-wg"| sb["chain sandbox"]
     sel -->|"iifname bt* (to host)"| th["chain tohost"]
 
-    sb --> sbrules["control plane denied · established<br/>peers (both ways) · mode rules<br/>published ports"] --> dropsb["drop"]
+    sb --> sbrules["control plane denied · policy denials<br/>(ranges, ports, ipv6) · established<br/>peers (both ways) · mode rules<br/>published ports"] --> dropsb["drop"]
     th --> thrules["established · icmp echo<br/>DNS always · proxy if allowlist"] --> dropth["drop"]
 ```
 
-Four details in that ruleset are easy to get wrong.
+Five details in that ruleset are easy to get wrong.
 
 **Peer rules are emitted in both directions.** A node only renders rules for the
 sandboxes it hosts, so an inbound connection from a peer on another node arrives
@@ -612,6 +640,16 @@ token guards. The orchestrator's address comes from the node's own
 `--orchestrator`; the other nodes' edges, addresses and Access endpoints arrive
 on the heartbeat, since no node can know from its own flags what its peers
 serve.
+
+**Policy denials come before the established accept.** `deny_cidrs`,
+`deny_ports` and `is_ipv6_denied` render as drops ahead of `ct state
+established,related accept`, in both families, so tightening a policy cuts the
+connections it now covers rather than leaving them to their conntrack entries.
+A port denial matches `ct direction original` (plus packets conntrack holds no
+direction for): it is about where the sandbox connects, and a reply to an
+inbound connection whose remote port happens to be denied is not that. A
+sandbox denied IPv6 also loses its `burrow_nat6` redirect and masquerade, so the
+proxy is not a way around the denial.
 
 **Mesh traffic skips antispoofing.** WireGuard's `AllowedIPs` already refuses
 packets sourced outside the sending node's own slice, which is a cryptographic
@@ -1019,6 +1057,14 @@ with the handler active it makes Firecracker read the entire guest back through
 this process, 6.4s against 44ms for a diff. So the layers are flattened on the
 host instead, sequential file work that never touches the guest, at about a
 second per flatten.
+
+A suspend is reported only once what it wrote is on the node's disk. With the
+guest still paused it syncs, in order, the vmstate, the memory file it just wrote
+(the diff, or the full image), and every disk the guest can write, volumes
+included, then the sandbox's directory. A sync that fails resumes the guest and
+fails the suspend, as a failed snapshot does. Flattening syncs the merged base
+before it unlinks the diffs, since until then the base may hold a partial merge
+that is harmless only while the diffs over it remain.
 
 One consequence to keep in mind: the base a diff layers over must survive being
 written alongside. Unlinking the whole snapshot before writing, which is what
@@ -1461,6 +1507,44 @@ inventory is given the benefit of the doubt, while a node that has reported an
 empty one is taken at its word. Collapsing the two sends sandboxes to nodes that
 cannot run them.
 
+### Disk
+
+Sandbox disks are sparse, and warm ones reflinked: a disk takes space only as
+its guest writes it, so a node can hold far more promised disk than it has, and
+when its filesystem fills every guest on it gets write errors at once. Disk is
+therefore admitted like memory, by one rule the node and the orchestrator both
+apply (`burrow_common::disk`):
+
+```
+unwritten + request <= overcommit * (free - reserve)
+```
+
+- `free` is what the data directory's filesystem has free now (`statvfs`,
+  `f_bavail`), which already counts everything written so far: sandbox disks,
+  memory images, snapshots, templates.
+- `unwritten` is what the node has promised and not yet seen written: each
+  sandbox's disk size less the blocks its disk file holds, plus disk admitted
+  to creates still building. A sandbox's disk is its scratch disk (1024 MiB
+  unless its policy names one), or a macOS guest's clone of its template's
+  disk. Volumes are not counted yet; their writes show up in `free`.
+- `reserve` is `--disk-reserve-mib`, 5% of the filesystem by default, and
+  `overcommit` is `--disk-overcommit`, 1.0 by default: every promised byte has
+  a free byte behind it.
+
+The heartbeat carries all of it (`NodeStatus.disk_*`). Placement counts each
+sandbox's disk against it, charges it to the node until the next heartbeat as
+it does vcpus and memory, and scores disk headroom with them. A node that does
+not report disk is not checked. The store's cross-replica reservation still
+covers vcpus and memory only, so for disk the node's own check is the gate.
+
+The node checks again, under one lock with the charge, before a create, fork,
+create from a snapshot or adopt (asking for the new disk) and before a resume
+or a cold boot (asking for nothing new, so refused only once it is already past
+its reserve). A refusal is `ResourceExhausted` naming the node and how much
+free disk it is short of. Free disk under the reserve while sandboxes run is
+logged at error level, on the way down and then once a minute, reported as
+`is_disk_low`, and shown in `burrow nodes ls`.
+
 ### Node labels, which is what Burrow has instead of regions
 
 Burrow is self-hosted, so there are no regions to pick from: there is the
@@ -1604,13 +1688,24 @@ that is refused the call rather than doing it as root.
 ### Revoking tokens
 
 `RevokeAccess`, or `burrow token revoke`, works the way a lock does in
-Teleport. It stamps the sandbox, and from then on the node refuses every
-token issued at or before the stamp, including any issued in the same second.
+Teleport. It stamps the sandbox, to the millisecond, and from then on the node
+refuses every token issued at or before the stamp, whatever its ops or user.
+A token carries the millisecond it was issued in `iat_ms` beside the usual
+`iat`, so one issued a moment after the revoke, in the same second, works.
+The orchestrator takes the stamp by the same clock it issues tokens by, so
+replicas need their clocks in step; a token or a record from before
+milliseconds were kept counts as revoked for its whole second.
+
 The direct sessions those tokens opened are ended on the spot: an exec stream,
-an attach, a transfer or a watch fails with `unauthenticated`, and the command
-an exec started is killed, along with everything in its process group. Tokens
-issued afterwards work as before. The stamp is part of the sandbox's record,
-so it follows the sandbox to whichever node holds it next.
+an attach, a transfer or a watch fails with `unauthenticated`. Every command
+they drove is killed, along with everything in its process group: a command a
+revoked token started, whether or not its stream is still open, and one it
+typed into over `Attach`, since a shell runs whatever it is told. The node
+keeps which tokens drove which commands until the sandbox is deleted, and
+loses it on a restart or a move. Commands started through the orchestrator, or
+driven only by tokens issued after the stamp, are left alone, as are tokens
+for other sandboxes. The stamp is part of the sandbox's record, so it follows
+the sandbox to whichever node holds it next.
 
 A node that has not heard from the orchestrator for 30 seconds refuses every
 token until it does: it cannot know whether a revoke is waiting for it.
@@ -1667,8 +1762,11 @@ never dropped.
 
 Logs travel with the sandbox. Each suspend uploads them with the rest of its
 durable state, as chunked images, so a log that only grew uploads only its new
-chunks, and a move or an adoption brings them to the new node. A fork or a
-restore from a snapshot starts with none.
+chunks, and a move or an adoption brings them to the new node. A fork, or a
+snapshot and every sandbox restored from it, gets a copy cut where the guest's
+memory was saved: the restored guest remembers those commands, and what the
+source printed after the cut, the restored guest prints again for itself. A
+named snapshot in the object store carries its logs the same way.
 
 Nothing is evicted by count or age: `PruneCommands`, or `burrow prune`, removes
 finished commands and their logs, as `docker container prune` does, and
@@ -1681,7 +1779,12 @@ Unset, logs are unbounded, as Docker's `json-file` driver is.
 
 A command that has finished replays from the node alone, so `burrow logs`
 works on a suspended sandbox. Following a running one, or one whose log has
-not yet caught up, needs the guest.
+not yet caught up, needs the guest. A pause for a fork or a snapshot severs the
+feed, which the node restarts as the guest resumes, and a follower that hears
+nothing for a while restarts it too. The guest's own word that the command has
+exited ends a follow a moment later even if the log never gets the exit, so an
+attach to a finished command returns rather than waiting on a log that will
+not grow.
 
 Output is counted by offset, stdout and stderr bytes together from the
 command's start. An attacher passes the offset it got to and is sent exactly
@@ -1918,7 +2021,13 @@ is a sum of node reports rather than an independently kept number.
 
 A snapshot is assembled in a `.staging-<id>` directory beside these and renamed
 into place, with the manifest written last, so a crash never leaves a
-half-copied snapshot that reads as complete. Its memory is flattened to a single
+half-copied snapshot that reads as complete. Before the rename every file in it,
+the manifest included, is synced and then the directory; after it, the
+`snapshots/` directory, so a power cut cannot keep the rename and lose the
+bytes. Manifests rewritten in place (a snapshot's, a suspended sandbox's
+`durable.json`) go through a synced temporary and a synced rename, and a warm
+snapshot is synced before its `format` marker is written and the marker before
+the swap. Its memory is flattened to a single
 image on the way in, so restoring costs the same however many times the source
 had been suspended.
 
@@ -2021,6 +2130,40 @@ name one:
 ```sh
 burrow pull alpine:latest
 ```
+
+### Checking flushes survive a power cut
+
+Pending: not yet run on the harness. The unit tests pin the drive configuration
+and the order of every sync; only a real power cut shows a flushed write
+survives. Per hypervisor (Firecracker, then Cloud Hypervisor; on a Mac node,
+Virtualization.framework with the macOS equivalents), on a fresh warm snapshot
+(format 4):
+
+1. Create a sandbox and confirm the guest sees a write cache:
+   `burrow exec <id> -- cat /sys/block/vda/queue/write_cache /sys/block/vdb/queue/write_cache`
+   must print `write back` for each. `write through` means the drive was
+   configured without a cache to flush and the change did not take.
+2. In the guest, write a file and `fsync` it, recording its checksum:
+   `burrow exec <id> -- sh -c 'head -c 64M /dev/urandom > /root/canary && sync /root/canary && sha256sum /root/canary'`
+   (`/` is the overlay whose upper layer is the scratch disk; `sync <file>` is
+   an `fsync`).
+3. On the node, kill the hypervisor with `SIGKILL`, so it gets no chance to
+   flush anything: `pkill -KILL -f 'firecracker.*<id>'` (or
+   `cloud-hypervisor`). Then lose the host page cache the way a power cut
+   does, without writing it back: hard-reset the machine the node runs on (on
+   the dev harness, force-stop its VM, `colima stop -f -p burrow`, and start
+   it again). `echo 3 > /proc/sys/vm/drop_caches` is not a substitute: it
+   drops only clean pages, and the kernel writes dirty ones back regardless.
+4. Bring the node back, `burrow boot <id>` (the VM is gone, so the sandbox
+   cold-boots its kept disk), and check the canary's checksum matches and that
+   the guest's filesystem mounted without journal errors in `console.log`.
+5. Repeat 2 to 4 with a suspend in place of the kill: `burrow stop <id>`, hard
+   reset as soon as it returns, then `burrow start <id>` must restore and the
+   canary must match. And with a snapshot: `burrow snapshot create <id>`, hard
+   reset, then `burrow create --snapshot <snap>` must restore.
+
+Before this change step 1 printed `write through` under Firecracker and step 4
+could lose the canary.
 
 ### Exercising the VMM layer and the agent
 

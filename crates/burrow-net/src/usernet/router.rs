@@ -213,7 +213,7 @@ impl Router {
     /// Whether the router, rather than the stack, handles a packet from a
     /// guest to `address`.
     pub(super) fn is_routed(address: Ipv4Addr) -> bool {
-        SANDBOX_POOL.contains(address)
+        SANDBOX_POOL.contains(std::net::IpAddr::V4(address))
     }
 
     pub(super) fn attach(self: &Arc<Self>, address: Ipv4Addr, link: Weak<Shared>) {

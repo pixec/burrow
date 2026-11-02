@@ -254,6 +254,13 @@ impl Proxy {
         if self.denied.is_denied(original.ip()) {
             decision = Decision::Deny("destination is a control-plane address");
         }
+        // The policy's own address-level denials, port and family, for the
+        // same reason: they hold whatever name the connection carries. The
+        // host firewall drops these everywhere it can; 80 and 443 in
+        // allowlist mode reach here instead, and are refused and recorded.
+        if let Some(reason) = policy.address_refusal(original) {
+            decision = Decision::Deny(reason);
+        }
         if hides_destination {
             // The visible name is a cover name, so there is nothing here an
             // allowlist can decide.

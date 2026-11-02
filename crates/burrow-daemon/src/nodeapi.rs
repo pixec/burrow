@@ -149,7 +149,7 @@ impl NodeApi {
             &sandbox,
             command_id,
             start.from_offset,
-            Some(guest),
+            Some(Box::pin(guest)),
             None,
         ))
     }
@@ -902,6 +902,7 @@ impl NodeService for NodeApi {
         let id = req.into_inner().sandbox_id;
         let kit = self.sandboxes.record_of(&id).await?.kit.is_some();
         self.sandboxes.delete(&id).await?;
+        self.access_sessions.forget(&id);
         // Removing the instance ends its storage, retained paths included.
         if kit {
             crate::kit::remove_volumes(&self.sandboxes, &id).await;
@@ -1493,17 +1494,34 @@ impl NodeService for NodeApi {
 
     async fn revoke_access(
         &self,
-        req: Request<nodepb::NodeSandboxRef>,
+        req: Request<nodepb::NodeRevokeAccessRequest>,
     ) -> Result<Response<api::RevokeAccessResponse>, Status> {
-        let sandbox_id = req.into_inner().sandbox_id;
+        let req = req.into_inner();
+        let sandbox_id = req.sandbox_id;
         // The stamp first: a direct call racing this one either reads it, or
-        // registered its session in time to be ended below.
-        let revoked_at = self.sandboxes.revoke_access(&sandbox_id).await?;
-        let ended = self.access_sessions.end_all(&sandbox_id);
-        tracing::info!(sandbox = sandbox_id, ended, "access tokens revoked");
+        // registered its session in time to be ended below. Sessions before
+        // commands: a command noted after its session ended is killed there.
+        let revoked_ms = self
+            .sandboxes
+            .revoke_access(&sandbox_id, req.revoked_at_ms)
+            .await?;
+        let ended = self.access_sessions.end_revoked(&sandbox_id, revoked_ms);
+        let commands = self.access_sessions.take_revoked(&sandbox_id, revoked_ms);
+        for command in &commands {
+            crate::access::kill(self, &sandbox_id, command).await;
+        }
+        tracing::info!(
+            sandbox = sandbox_id,
+            revoked_ms,
+            ended,
+            killed = commands.len(),
+            "access tokens revoked"
+        );
         Ok(Response::new(api::RevokeAccessResponse {
-            revoked_at,
+            revoked_at: revoked_ms / 1000,
             ended_sessions: ended as u32,
+            revoked_at_ms: revoked_ms,
+            killed_commands: commands.len() as u32,
         }))
     }
 
@@ -2404,12 +2422,24 @@ fn validate_network_policy(policy: &common::NetworkPolicy) -> Result<(), Status>
             )));
         }
     }
+    // Either family: a denial has to be able to say something about IPv6,
+    // which open mode forwards, or an IPv4 list is a list v6 walks around.
     for cidr in &policy.deny_cidrs {
-        if !is_ipv4_cidr(cidr) {
+        if !is_ip_cidr(cidr) {
             return Err(Status::invalid_argument(format!(
-                "deny_cidrs entry {cidr:?} is not an IPv4 CIDR"
+                "deny_cidrs entry {cidr:?} is not an IPv4 or IPv6 CIDR"
             )));
         }
+    }
+    if policy.deny_ports.len() > burrow_net::policy::MAX_PORT_DENIALS {
+        return Err(Status::invalid_argument(format!(
+            "at most {} deny_ports entries ({} given)",
+            burrow_net::policy::MAX_PORT_DENIALS,
+            policy.deny_ports.len()
+        )));
+    }
+    for rule in &policy.deny_ports {
+        validate_port_rule(rule).map_err(Status::invalid_argument)?;
     }
     for domain in &policy.deny_domains {
         if !is_host_glob(domain) {
@@ -2455,6 +2485,45 @@ fn validate_network_policy(policy: &common::NetworkPolicy) -> Result<(), Status>
     }
     for rule in &policy.http_rules {
         validate_http_rule(rule).map_err(Status::invalid_argument)?;
+    }
+    Ok(())
+}
+
+/// Checks one `deny_ports` entry. Everything here reaches the ruleset, so an
+/// entry nftables would reject is refused now rather than failing the node's
+/// next render.
+fn validate_port_rule(rule: &common::PortRule) -> Result<(), String> {
+    if common::PortProtocol::try_from(rule.protocol).is_err() {
+        return Err(format!(
+            "deny_ports protocol {} is not tcp, udp or unspecified (both)",
+            rule.protocol
+        ));
+    }
+    if !(1..=65535).contains(&rule.port) {
+        return Err(format!(
+            "deny_ports port {} out of range (1..=65535)",
+            rule.port
+        ));
+    }
+    if rule.port_end != 0 && !(rule.port..=65535).contains(&rule.port_end) {
+        return Err(format!(
+            "deny_ports port_end {} must be 0 or between port {} and 65535",
+            rule.port_end, rule.port
+        ));
+    }
+    if rule.cidrs.len() > burrow_net::policy::MAX_PORT_DENIAL_CIDRS {
+        return Err(format!(
+            "at most {} cidrs per deny_ports entry ({} given)",
+            burrow_net::policy::MAX_PORT_DENIAL_CIDRS,
+            rule.cidrs.len()
+        ));
+    }
+    for cidr in &rule.cidrs {
+        if !is_ip_cidr(cidr) {
+            return Err(format!(
+                "deny_ports cidr {cidr:?} is not an IPv4 or IPv6 CIDR"
+            ));
+        }
     }
     Ok(())
 }
@@ -2646,6 +2715,25 @@ fn is_ipv4_cidr(value: &str) -> bool {
     matches!(prefix.parse::<u8>(), Ok(bits) if bits <= 32)
 }
 
+/// Strictly `address/prefix` in either family, nothing else in the string.
+fn is_ip_cidr(value: &str) -> bool {
+    if is_ipv4_cidr(value) {
+        return true;
+    }
+    let Some((address, prefix)) = value.split_once('/') else {
+        return false;
+    };
+    // `Ipv6Addr::from_str` refuses whitespace and zone ids, so nothing but
+    // the address itself survives this.
+    if address.parse::<std::net::Ipv6Addr>().is_err() {
+        return false;
+    }
+    if prefix.is_empty() || !prefix.bytes().all(|b| b.is_ascii_digit()) {
+        return false;
+    }
+    matches!(prefix.parse::<u8>(), Ok(bits) if bits <= 128)
+}
+
 /// A hostname or a `*.`-prefixed glob, and nothing else.
 ///
 /// The same shape `allow_domains` entries have, because the two are matched by
@@ -2747,27 +2835,47 @@ fn translate_exec_input(msg: api::ExecInput) -> Option<guestpb::ExecInput> {
 
 /// Replays command `id`'s log from `from` and follows it to the command's
 /// exit. `input`, the guest attach carrying the caller's input, is held open
-/// for as long as the caller follows; its output is the log's, read here.
-/// `exit`, for a command the guest says has exited, ends the follow once
-/// nothing more has arrived for a moment.
+/// for as long as the caller follows; its output is the log's, read here, but
+/// the exit it reports is noted. `exit`, for a command the guest says has
+/// exited, ends the follow once nothing more has arrived for a moment, so a
+/// follow ends even when the exit never reaches the log.
 fn follow_log(
-    sandbox: &RunningSandbox,
+    sandbox: &std::sync::Arc<RunningSandbox>,
     id: String,
     from: u64,
-    input: Option<tonic::Streaming<guestpb::ExecOutput>>,
+    input: Option<BoxStream<guestpb::ExecOutput>>,
     exit: Option<burrow_common::cmdlog::Frame>,
+) -> BoxStream<api::ExecOutput> {
+    follow(
+        std::sync::Arc::downgrade(sandbox),
+        std::sync::Arc::clone(&sandbox.logs),
+        id,
+        from,
+        input,
+        exit,
+    )
+}
+
+/// [`follow_log`], with the feed restarted through `sandbox` whenever the
+/// log goes quiet, in case the one running has stalled.
+fn follow(
+    sandbox: std::sync::Weak<RunningSandbox>,
+    logs: std::sync::Arc<crate::cmdlogs::CommandLogs>,
+    id: String,
+    from: u64,
+    mut input: Option<BoxStream<guestpb::ExecOutput>>,
+    mut exit: Option<burrow_common::cmdlog::Frame>,
 ) -> BoxStream<api::ExecOutput> {
     use burrow_common::cmdlog::{Frame, Replayed};
     use tokio::sync::broadcast::error::RecvError;
 
     const REPLAY_BUDGET: usize = 256 << 10;
     const EXIT_SETTLE: std::time::Duration = std::time::Duration::from_secs(2);
-    let logs = std::sync::Arc::clone(&sandbox.logs);
+    const REFEED: std::time::Duration = std::time::Duration::from_secs(5);
     let wrap = |output| api::ExecOutput {
         output: Some(output),
     };
     Box::pin(async_stream::try_stream! {
-        let _input = input;
         let mut offset = from;
         let mut follow = logs.follow(&id, offset);
         loop {
@@ -2800,9 +2908,22 @@ fn follow_log(
                 }
                 offset = offset.max(end);
             }
-            let next = match &exit {
-                Some(_) => tokio::time::timeout(EXIT_SETTLE, follow.live.recv()).await.ok(),
-                None => Some(follow.live.recv().await),
+            let next = tokio::select! {
+                next = follow.live.recv() => Some(next),
+                () = tokio::time::sleep(EXIT_SETTLE), if exit.is_some() => None,
+                said = guest_exit(input.as_mut()), if exit.is_none() && input.is_some() => {
+                    match said {
+                        Some(said) => exit = Some(said),
+                        None => input = None,
+                    }
+                    continue;
+                }
+                () = tokio::time::sleep(REFEED), if exit.is_none() => {
+                    if let Some(sandbox) = sandbox.upgrade() {
+                        sandbox.ensure_feed();
+                    }
+                    continue;
+                }
             };
             let Some(next) = next else {
                 for output in crate::cmdlogs::outputs(exit.clone().expect("timed out on one")) {
@@ -2838,6 +2959,26 @@ fn follow_log(
             }
         }
     })
+}
+
+/// The exit the guest's attach reports, skipping the output before it.
+/// `None` once the stream ends without one.
+async fn guest_exit(
+    input: Option<&mut BoxStream<guestpb::ExecOutput>>,
+) -> Option<burrow_common::cmdlog::Frame> {
+    use guestpb::exec_output::Output;
+    let input = input?;
+    let mut signal = 0;
+    while let Some(Ok(msg)) = input.next().await {
+        match msg.output {
+            Some(Output::ExitSignal(said)) => signal = said,
+            Some(Output::ExitCode(code)) => {
+                return Some(burrow_common::cmdlog::Frame::Exit { code, signal });
+            }
+            _ => {}
+        }
+    }
+    None
 }
 
 fn translate_exec_output(msg: guestpb::ExecOutput) -> api::ExecOutput {
@@ -3014,17 +3155,97 @@ mod policy_tests {
         }
     }
 
+    fn port_rule(
+        protocol: common::PortProtocol,
+        port: u32,
+        end: u32,
+        cidrs: &[&str],
+    ) -> common::PortRule {
+        common::PortRule {
+            protocol: protocol as i32,
+            port,
+            port_end: end,
+            cidrs: cidrs.iter().map(|c| (*c).to_string()).collect(),
+        }
+    }
+
+    #[test]
+    fn port_denials_are_accepted_in_every_mode() {
+        for mode in [
+            common::NetworkMode::Open,
+            common::NetworkMode::Allowlist,
+            common::NetworkMode::None,
+        ] {
+            let mut ok = policy(&[], &[]);
+            ok.mode = mode as i32;
+            ok.is_ipv6_denied = true;
+            ok.deny_ports = vec![
+                port_rule(common::PortProtocol::Tcp, 25, 0, &[]),
+                port_rule(common::PortProtocol::Tcp, 465, 587, &[]),
+                port_rule(common::PortProtocol::Unspecified, 1, 65535, &["10.0.0.0/8"]),
+                port_rule(common::PortProtocol::Udp, 53, 53, &["2001:db8::/32"]),
+            ];
+            assert!(validate_network_policy(&ok).is_ok(), "{mode:?}");
+        }
+    }
+
+    #[test]
+    fn a_malformed_port_denial_is_refused() {
+        use common::PortProtocol::{Tcp, Udp};
+        let too_many_cidrs: Vec<String> = (0..=burrow_net::policy::MAX_PORT_DENIAL_CIDRS)
+            .map(|i| format!("10.0.{i}.0/24"))
+            .collect();
+        let too_many_cidrs: Vec<&str> = too_many_cidrs.iter().map(String::as_str).collect();
+        let mut unknown_protocol = port_rule(Tcp, 25, 0, &[]);
+        unknown_protocol.protocol = 9;
+        for bad in [
+            port_rule(Tcp, 0, 0, &[]),
+            port_rule(Tcp, 65536, 0, &[]),
+            port_rule(Udp, 600, 599, &[]),
+            port_rule(Tcp, 1, 65536, &[]),
+            port_rule(
+                Tcp,
+                25,
+                0,
+                &["10.0.0.0/8\nadd rule inet burrow sandbox accept"],
+            ),
+            port_rule(Tcp, 25, 0, &["10.0.0.0"]),
+            port_rule(Tcp, 25, 0, &too_many_cidrs),
+            unknown_protocol,
+        ] {
+            let mut policy = policy(&[], &[]);
+            policy.mode = common::NetworkMode::Open as i32;
+            policy.deny_ports = vec![bad.clone()];
+            assert!(
+                validate_network_policy(&policy).is_err(),
+                "{bad:?} should be refused"
+            );
+        }
+
+        let mut policy = policy(&[], &[]);
+        policy.deny_ports =
+            vec![port_rule(Tcp, 25, 0, &[]); burrow_net::policy::MAX_PORT_DENIALS + 1];
+        assert!(validate_network_policy(&policy).is_err());
+    }
+
     #[test]
     fn denied_ranges_are_held_to_the_same_strictness_as_allowed_ones() {
         let mut ok = policy(&[], &[]);
         ok.deny_cidrs = vec!["10.0.0.0/8".into(), "169.254.169.254/32".into()];
         assert!(validate_network_policy(&ok).is_ok());
 
+        // IPv6 ranges are denials too.
+        ok.deny_cidrs = vec!["2001:db8::/32".into(), "::/0".into()];
+        assert!(validate_network_policy(&ok).is_ok());
+
         for bad in [
             "10.0.0.0",
             "10.0.0.0/33",
             "10.0.0.0/8\nadd rule inet burrow sandbox accept",
-            "::/0",
+            "2001:db8::",
+            "2001:db8::/129",
+            "fe80::1%eth0/64",
+            "2001:db8::/32\nadd rule inet burrow sandbox accept",
             "",
         ] {
             let mut policy = policy(&[], &[]);
@@ -3619,5 +3840,93 @@ mod policy_tests {
                 data: b"x".to_vec(),
             }))
         );
+    }
+}
+
+#[cfg(test)]
+mod follow_tests {
+    use super::*;
+    use guestpb::feed_frame::Output as Fed;
+
+    fn logs(name: &str) -> std::sync::Arc<crate::cmdlogs::CommandLogs> {
+        let dir = std::env::temp_dir().join(format!("burrow-follow-{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::sync::Arc::new(crate::cmdlogs::CommandLogs::new(&dir, Default::default()))
+    }
+
+    fn fed(at: u64, output: Fed) -> guestpb::FeedFrame {
+        guestpb::FeedFrame {
+            seq: 0,
+            command_id: "cmd_1".into(),
+            at,
+            output: Some(output),
+            log_max_bytes: 0,
+            log_max_files: 0,
+        }
+    }
+
+    async fn collect(stream: BoxStream<api::ExecOutput>) -> Vec<api::exec_output::Output> {
+        tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            stream.map(|msg| msg.unwrap().output.unwrap()).collect(),
+        )
+        .await
+        .expect("the follow ended")
+    }
+
+    /// The feed stalled after a checkpoint, so the exit never reached the
+    /// log. The guest's own attach says the command is over, and the follow
+    /// ends on that rather than waiting for the log forever.
+    #[tokio::test]
+    async fn a_follow_ends_when_the_guest_reports_an_exit_the_log_never_gets() {
+        use api::exec_output::Output;
+        use guestpb::exec_output::Output as Guest;
+        let logs = logs("stalled");
+        logs.append(fed(0, Fed::Stdout(b"before".to_vec())));
+        let guest: BoxStream<guestpb::ExecOutput> = Box::pin(tokio_stream::iter(
+            [Guest::Stdout(b"after".to_vec()), Guest::ExitCode(3)].map(|output| {
+                Ok(guestpb::ExecOutput {
+                    output: Some(output),
+                })
+            }),
+        ));
+        let outputs = collect(follow(
+            std::sync::Weak::new(),
+            logs,
+            "cmd_1".into(),
+            0,
+            Some(guest),
+            None,
+        ))
+        .await;
+        assert_eq!(
+            outputs,
+            [Output::Stdout(b"before".to_vec()), Output::ExitCode(3)]
+        );
+    }
+
+    /// A restored sandbox's guest remembers a finished command; its log came
+    /// with it, so the attach replays the output and the exit at once.
+    #[tokio::test]
+    async fn a_finished_command_replays_from_its_log() {
+        use api::exec_output::Output;
+        let logs = logs("finished");
+        logs.append(fed(0, Fed::Stdout(b"done".to_vec())));
+        logs.append(fed(4, Fed::Exit(guestpb::FeedExit { code: 7, signal: 0 })));
+        let started = std::time::Instant::now();
+        let outputs = collect(follow(
+            std::sync::Weak::new(),
+            logs,
+            "cmd_1".into(),
+            0,
+            None,
+            None,
+        ))
+        .await;
+        assert_eq!(
+            outputs,
+            [Output::Stdout(b"done".to_vec()), Output::ExitCode(7)]
+        );
+        assert!(started.elapsed() < std::time::Duration::from_secs(1));
     }
 }

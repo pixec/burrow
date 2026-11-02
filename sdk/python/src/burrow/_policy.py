@@ -14,6 +14,7 @@ from .types import (
     HeaderInjection,
     NetworkMembership,
     NetworkPolicy,
+    PortRule,
     RequestRule,
     ResourcePolicy,
     SandboxPolicy,
@@ -50,11 +51,26 @@ _POLICY_KEYS = {
     "allow_cidrs",
     "allow_ports",
     "deny_cidrs",
+    "deny_ports",
+    "deny_ipv6",
     "inspect_tls",
     "rules",
     "inject_headers",
 }
 _RULE_KEYS = {"domain", "match", "set_headers", "forward"}
+_PORT_RULE_KEYS = {"protocol", "port", "port_end", "cidrs"}
+
+_PROTOCOL_TO_WIRE = {
+    None: common_pb2.PORT_PROTOCOL_UNSPECIFIED,
+    "any": common_pb2.PORT_PROTOCOL_UNSPECIFIED,
+    "tcp": common_pb2.PORT_PROTOCOL_TCP,
+    "udp": common_pb2.PORT_PROTOCOL_UDP,
+}
+
+_PROTOCOL_FROM_WIRE = {
+    common_pb2.PORT_PROTOCOL_TCP: "tcp",
+    common_pb2.PORT_PROTOCOL_UDP: "udp",
+}
 _MATCH_KEYS = {"path", "method", "query_string", "headers"}
 _FORWARD_KEYS = {"url", "secret"}
 
@@ -224,6 +240,42 @@ def _from_string_match(raw: common_pb2.StringMatch) -> Dict[str, str]:
     return {_OP_FROM_WIRE.get(raw.op, "exact"): raw.value}
 
 
+def _to_port_rule(index: int, rule: Any) -> common_pb2.PortRule:
+    """Builds one wire `PortRule` from a dict or a `PortRule`.
+
+    Ranges and CIDRs are checked by the node; here only what would otherwise be
+    silently misread: an unknown key or protocol. A misspelt protocol must not
+    become "both", and a misspelt ``cidrs`` must not widen a denial meant for
+    one range into every destination, or narrow one the other way.
+    """
+    where = f"network_policy.deny_ports[{index}]"
+    if isinstance(rule, PortRule):
+        rule = {
+            "protocol": rule.protocol,
+            "port": rule.port,
+            "port_end": rule.port_end,
+            "cidrs": rule.cidrs,
+        }
+    if not isinstance(rule, dict):
+        raise BurrowError(f"{where}: a port rule is a dict or a PortRule", "invalid_argument")
+    _check_keys(where, rule, _PORT_RULE_KEYS)
+    protocol = rule.get("protocol")
+    if protocol not in _PROTOCOL_TO_WIRE:
+        raise BurrowError(
+            f"{where}: unknown protocol {protocol!r}; one of tcp, udp, any",
+            "invalid_argument",
+        )
+    port = rule.get("port")
+    if not isinstance(port, int) or isinstance(port, bool):
+        raise BurrowError(f"{where}: port is an integer", "invalid_argument")
+    return common_pb2.PortRule(
+        protocol=_PROTOCOL_TO_WIRE[protocol],
+        port=port,
+        port_end=rule.get("port_end") or 0,
+        cidrs=rule.get("cidrs") or [],
+    )
+
+
 def to_network_policy(options: Optional[Dict[str, Any]] = None) -> common_pb2.NetworkPolicy:
     """Builds the wire `NetworkPolicy`. Defaults to no egress at all."""
     options = options or {}
@@ -249,6 +301,11 @@ def to_network_policy(options: Optional[Dict[str, Any]] = None) -> common_pb2.Ne
         allow_cidrs=options.get("allow_cidrs") or [],
         allow_ports=options.get("allow_ports") or [],
         deny_cidrs=options.get("deny_cidrs") or [],
+        deny_ports=[
+            _to_port_rule(index, rule)
+            for index, rule in enumerate(options.get("deny_ports") or [])
+        ],
+        is_ipv6_denied=options.get("deny_ipv6") or False,
         is_tls_inspected=options.get("inspect_tls") or False,
         rules=[_to_request_rule(rule) for rule in rules],
     )
@@ -263,6 +320,16 @@ def from_network_policy(raw: common_pb2.NetworkPolicy) -> NetworkPolicy:
         allow_cidrs=list(raw.allow_cidrs),
         allow_ports=list(raw.allow_ports),
         deny_cidrs=list(raw.deny_cidrs),
+        deny_ports=[
+            PortRule(
+                protocol=_PROTOCOL_FROM_WIRE.get(rule.protocol, "any"),
+                port=rule.port,
+                port_end=rule.port_end,
+                cidrs=list(rule.cidrs),
+            )
+            for rule in raw.deny_ports
+        ],
+        deny_ipv6=raw.is_ipv6_denied,
         inspect_tls=raw.is_tls_inspected,
         rules=rules,
         inject_headers=[

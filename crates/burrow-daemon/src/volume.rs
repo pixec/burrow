@@ -609,7 +609,8 @@ mod ondisk {
         let base = usize::try_from(entries).ok()?.checked_mul(512)?;
         (0..count).find_map(|index| {
             let entry = disk.get(base + index * size..base + index * size + 40)?;
-            (entry[..16] == HFS).then(|| u64::from_le_bytes(entry[32..40].try_into().unwrap()) * 512)
+            (entry[..16] == HFS)
+                .then(|| u64::from_le_bytes(entry[32..40].try_into().unwrap()) * 512)
         })
     }
 
@@ -1136,14 +1137,14 @@ mod tests {
         ]);
         disk[hfs + 32..hfs + 40].copy_from_slice(&409_640u64.to_le_bytes());
         assert_eq!(ondisk::hfs_partition_offset(&disk), Some(409_640 * 512));
-        assert_eq!(ondisk::hfs_partition_offset(&[0u8; ondisk::GPT_BYTES]), None);
+        assert_eq!(
+            ondisk::hfs_partition_offset(&[0u8; ondisk::GPT_BYTES]),
+            None
+        );
     }
 
     fn store_with(name: &str, image: &[u8]) -> (VolumeStore, PathBuf) {
-        let dir = std::env::temp_dir().join(format!(
-            "burrow-volume-{}-{name}",
-            std::process::id()
-        ));
+        let dir = std::env::temp_dir().join(format!("burrow-volume-{}-{name}", std::process::id()));
         let store = VolumeStore::new(&dir);
         std::fs::create_dir_all(store.dir(name)).unwrap();
         std::fs::write(store.image(name), image).unwrap();

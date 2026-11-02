@@ -2,7 +2,7 @@
 //! requests that are allowed through.
 
 use std::collections::HashMap;
-use std::net::IpAddr;
+use std::net::{IpAddr, SocketAddr};
 use std::sync::{Arc, RwLock};
 
 /// Rules one policy may carry.
@@ -389,6 +389,17 @@ impl HttpRule {
     }
 }
 
+/// A range of TCP ports a sandbox may not connect to, optionally narrowed to
+/// destination ranges.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct DeniedPorts {
+    pub first: u16,
+    /// Inclusive.
+    pub last: u16,
+    /// CIDRs of either family; empty is every destination.
+    pub cidrs: Vec<String>,
+}
+
 /// What the proxy knows about one sandbox.
 #[derive(Debug, Clone, Default)]
 pub struct SandboxPolicy {
@@ -401,10 +412,15 @@ pub struct SandboxPolicy {
     /// the session can be checked. Off unless the caller asked for it: it
     /// trades payload privacy for closing domain fronting.
     pub is_tls_inspected: bool,
-    /// IPv4 ranges this sandbox may never reach. Checked against the address
-    /// the proxy would dial, not against the name: an allowed domain that
-    /// resolves into a denied range is still denied.
+    /// Ranges this sandbox may never reach, of either family. Checked against
+    /// the address the proxy would dial, not against the name: an allowed
+    /// domain that resolves into a denied range is still denied.
     pub deny_cidrs: Vec<String>,
+    /// TCP destination ports this sandbox may never connect to. Only the
+    /// entries that cover TCP: UDP never reaches the proxy.
+    pub deny_ports: Vec<DeniedPorts>,
+    /// Whether every IPv6 destination is refused.
+    pub is_ipv6_denied: bool,
     /// Domain globs refused in every mode before any allowance is consulted:
     /// not resolved, not connected to, not requested inside a session.
     pub deny_domains: Vec<String>,
@@ -431,6 +447,30 @@ impl SandboxPolicy {
             Some((network, prefix)) => is_in_prefix(network, prefix, address),
             None => true,
         })
+    }
+
+    /// Why a connection to `destination` is refused on its port or its
+    /// family alone, whatever the name it carries, or `None`.
+    ///
+    /// A port entry whose range does not parse denies every destination, for
+    /// the reason [`Self::is_denied`] gives.
+    pub fn address_refusal(&self, destination: SocketAddr) -> Option<&'static str> {
+        let address = unmap(destination.ip());
+        if self.is_ipv6_denied && address.is_ipv6() {
+            return Some("ipv6 egress is denied");
+        }
+        let port = destination.port();
+        self.deny_ports
+            .iter()
+            .any(|denied| {
+                (denied.first..=denied.last).contains(&port)
+                    && (denied.cidrs.is_empty()
+                        || denied.cidrs.iter().any(|entry| match parse_cidr(entry) {
+                            Some((network, prefix)) => is_in_prefix(network, prefix, address),
+                            None => true,
+                        }))
+            })
+            .then_some("destination port is denied")
     }
 
     pub fn is_host_denied(&self, host: &str) -> bool {
@@ -773,6 +813,77 @@ mod tests {
             ..Default::default()
         };
         assert!(policy.is_denied(IpAddr::from([93, 184, 216, 34])));
+    }
+
+    #[test]
+    fn a_denied_port_is_refused_whatever_the_address_family() {
+        let policy = SandboxPolicy {
+            deny_ports: vec![
+                DeniedPorts {
+                    first: 25,
+                    last: 25,
+                    cidrs: vec![],
+                },
+                DeniedPorts {
+                    first: 8000,
+                    last: 8999,
+                    cidrs: vec!["10.0.0.0/8".into(), "2001:db8::/32".into()],
+                },
+            ],
+            ..Default::default()
+        };
+        let at = |address: &str| policy.address_refusal(address.parse().unwrap());
+        assert_eq!(at("93.184.216.34:25"), Some("destination port is denied"));
+        assert_eq!(at("[2001:db8::1]:25"), Some("destination port is denied"));
+        assert_eq!(at("93.184.216.34:443"), None);
+        // Scoped entries cover their own ranges, an IPv4-mapped address
+        // counting as the v4 address it is.
+        assert_eq!(at("10.1.2.3:8080"), Some("destination port is denied"));
+        assert_eq!(
+            at("[::ffff:10.1.2.3]:8080"),
+            Some("destination port is denied")
+        );
+        assert_eq!(at("[2001:db8::1]:8999"), Some("destination port is denied"));
+        assert_eq!(at("11.1.2.3:8080"), None);
+        assert_eq!(at("[2001:db9::1]:8080"), None);
+
+        let broken = SandboxPolicy {
+            deny_ports: vec![DeniedPorts {
+                first: 8000,
+                last: 8000,
+                cidrs: vec!["10.0.0.0/33".into()],
+            }],
+            ..Default::default()
+        };
+        assert!(
+            broken
+                .address_refusal("93.184.216.34:8000".parse().unwrap())
+                .is_some()
+        );
+    }
+
+    #[test]
+    fn ipv6_denied_refuses_v6_destinations_only() {
+        let policy = SandboxPolicy {
+            is_ipv6_denied: true,
+            ..Default::default()
+        };
+        assert_eq!(
+            policy.address_refusal("[2606:2800:220:1::1]:443".parse().unwrap()),
+            Some("ipv6 egress is denied")
+        );
+        assert_eq!(
+            policy.address_refusal("[::ffff:93.184.216.34]:443".parse().unwrap()),
+            None
+        );
+        assert_eq!(
+            policy.address_refusal("93.184.216.34:443".parse().unwrap()),
+            None
+        );
+        assert_eq!(
+            SandboxPolicy::default().address_refusal("[2606:2800:220:1::1]:443".parse().unwrap()),
+            None
+        );
     }
 
     fn set_headers(domain: &str, matcher: Option<RequestMatch>, name: &str) -> Rule {

@@ -5,7 +5,10 @@
 // line of defence here: these keys have to be handled at runtime too.
 
 import assert from "node:assert/strict";
+import { fileURLToPath } from "node:url";
 import { test } from "node:test";
+
+import protoLoader from "@grpc/proto-loader";
 
 import {
   fromNetworkPolicy,
@@ -288,4 +291,84 @@ test("the three defined modes still pass", () => {
   assert.equal(toNetworkPolicy({ mode: "open" }).mode, "NETWORK_MODE_OPEN");
   // Omitted is the documented default rather than an unknown mode.
   assert.equal(toNetworkPolicy().mode, "NETWORK_MODE_NONE");
+});
+
+test("denied ports and ipv6 reach the wire in open mode", () => {
+  const wire = toNetworkPolicy({
+    mode: "open",
+    denyPorts: [
+      { protocol: "tcp", port: 25 },
+      { protocol: "tcp", port: 465, portEnd: 587 },
+      { port: 5432, cidrs: ["10.0.0.0/8", "2001:db8::/32"] },
+    ],
+    denyIpv6: true,
+  });
+  assert.equal(wire.isIpv6Denied, true);
+  assert.deepEqual(wire.denyPorts, [
+    { protocol: "PORT_PROTOCOL_TCP", port: 25, portEnd: 0, cidrs: [] },
+    { protocol: "PORT_PROTOCOL_TCP", port: 465, portEnd: 587, cidrs: [] },
+    {
+      protocol: "PORT_PROTOCOL_UNSPECIFIED",
+      port: 5432,
+      portEnd: 0,
+      cidrs: ["10.0.0.0/8", "2001:db8::/32"],
+    },
+  ]);
+});
+
+test("the new fields default to what a policy meant before them", () => {
+  const wire = toNetworkPolicy({ mode: "open" });
+  assert.deepEqual(wire.denyPorts, []);
+  assert.equal(wire.isIpv6Denied, false);
+  const back = fromNetworkPolicy({ mode: "NETWORK_MODE_OPEN" });
+  assert.deepEqual(back.denyPorts, []);
+  assert.equal(back.denyIpv6, false);
+});
+
+test("a misspelt port rule is refused rather than widened", () => {
+  for (const [rule, message] of [
+    [{ protocol: "tpc", port: 25 }, /unknown protocol/],
+    [{ port: 25, cidr: ["10.0.0.0/8"] }, /unknown key "cidr"/],
+    [{ protocol: "tcp" }, /port is an integer/],
+    [{ port: "25" }, /port is an integer/],
+  ]) {
+    assert.throws(
+      () => toNetworkPolicy({ mode: "open", denyPorts: [rule] }),
+      message,
+    );
+  }
+});
+
+test("port rules and ipv6 survive the real wire encoding", () => {
+  // Through the generated codec, so a field name that does not exist in the
+  // proto would be dropped here rather than by a node.
+  const definition = protoLoader.loadSync("api.proto", {
+    includeDirs: [fileURLToPath(new URL("../proto", import.meta.url))],
+    keepCase: false,
+    longs: Number,
+    enums: String,
+    defaults: true,
+    oneofs: true,
+  });
+  const method = definition["burrow.api.v1.Burrow"].UpdateNetworkPolicy;
+  const network = toNetworkPolicy({
+    mode: "open",
+    denyPorts: [
+      { protocol: "tcp", port: 465, portEnd: 587 },
+      { protocol: "udp", port: 53, cidrs: ["2001:db8::/32"] },
+      { port: 25 },
+    ],
+    denyIpv6: true,
+  });
+  const decoded = method.requestDeserialize(
+    method.requestSerialize({ network }),
+  );
+  const back = fromNetworkPolicy(decoded.network);
+  assert.equal(back.mode, "open");
+  assert.equal(back.denyIpv6, true);
+  assert.deepEqual(back.denyPorts, [
+    { protocol: "tcp", port: 465, portEnd: 587 },
+    { protocol: "udp", port: 53, cidrs: ["2001:db8::/32"] },
+    { port: 25 },
+  ]);
 });

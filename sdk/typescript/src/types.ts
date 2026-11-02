@@ -94,6 +94,24 @@ export interface RequestRule {
   forward?: ForwardRequest;
 }
 
+/**
+ * Destination ports a sandbox may never connect to, optionally narrowed to
+ * destination ranges.
+ */
+export interface PortRule {
+  /** Omitted is both TCP and UDP. */
+  protocol?: "tcp" | "udp";
+  /** First port, 1 to 65535. */
+  port: number;
+  /** Inclusive end of a range. Omitted or 0 is `port` alone. */
+  portEnd?: number;
+  /**
+   * IPv4 or IPv6 CIDRs the denial is limited to. Omitted or empty is every
+   * destination. At most 16.
+   */
+  cidrs?: string[];
+}
+
 /** Egress policy in full. A bare mode, `networkPolicy: "open"`, sets only `mode`. */
 export interface NetworkPolicyOptions {
   /** Defaults to `"none"`: no egress at all. */
@@ -113,6 +131,17 @@ export interface NetworkPolicyOptions {
    * allowance: an allowed domain that resolves into one of these is refused.
    */
   denyCidrs?: string[];
+  /**
+   * Destination ports this sandbox may never connect to, in every mode,
+   * ahead of every allowance, e.g. `[{ protocol: "tcp", port: 25 }]`. At
+   * most 64.
+   */
+  denyPorts?: PortRule[];
+  /**
+   * Refuse every IPv6 destination, in every mode. Off by default, which keeps
+   * each mode's own IPv6 behaviour.
+   */
+  denyIpv6?: boolean;
   /**
    * Terminate the sandbox's TLS so the host named inside the session is
    * checked too, not just the SNI. Required by `rules` and `injectHeaders`.
@@ -141,6 +170,8 @@ export interface NetworkPolicy {
   allowCidrs: string[];
   allowPorts: number[];
   denyCidrs: string[];
+  denyPorts: PortRule[];
+  denyIpv6: boolean;
   inspectTls: boolean;
   /** What the host does to inspected requests, in order. Secrets are redacted. */
   rules: RequestRule[];

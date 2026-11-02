@@ -188,12 +188,17 @@ message AccessGrant {
 }
 
 message RevokeAccessResponse {
-  // Tokens issued at or before this unix second are refused, including any
-  // issued within the same second as the revoke.
+  // The unix second of the revoke; `revoked_at_ms` is the exact stamp.
   int64 revoked_at = 1;
-  // Direct sessions that were open and have been ended: execs, transfers and
-  // watches.
+  // Direct sessions that were open and have been ended: execs, attaches,
+  // transfers and watches.
   uint32 ended_sessions = 2;
+  // Tokens issued at or before this unix millisecond are refused. One issued
+  // after it, in the same second included, works.
+  int64 revoked_at_ms = 3;
+  // Commands the revoked tokens started, or typed into over Attach, that
+  // were killed.
+  uint32 killed_commands = 4;
 }
 
 message AuditQuery {

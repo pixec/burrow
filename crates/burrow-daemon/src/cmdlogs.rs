@@ -6,12 +6,12 @@
 //! command under `<data-dir>/command-logs/<sandbox>`, outside the jail the
 //! VMM is confined to. Attach replays from these logs
 //! and follows what arrives after, so history outlives the guest's memory,
-//! survives a suspend, and goes with the sandbox when it moves.
+//! survives a suspend, and goes with the sandbox when it moves, forks or is
+//! restored from a snapshot.
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
-use std::sync::atomic::{AtomicBool, Ordering};
 
 use burrow_common::cmdlog::{Frame, Log, Plan, Rotation};
 use burrow_proto::guest::v1 as guestpb;
@@ -33,9 +33,17 @@ pub struct CommandLogs {
     rotation: Rotation,
     state: Mutex<State>,
     live: broadcast::Sender<Live>,
-    /// Whether a task is draining the guest's feed into these logs.
-    pub feeding: AtomicBool,
+    /// The task draining the guest's feed into these logs, while one runs.
+    feed: Mutex<Option<tokio::task::AbortHandle>>,
+    /// How far the logs reached when the guest's memory was last saved while
+    /// it went on running. A copy for a fork or a snapshot stops there: what
+    /// came after, the restored guest produces again for itself. `None` once
+    /// the guest is suspended, when the logs stop growing.
+    checkpoint: Mutex<Option<Extent>>,
 }
+
+/// Each log file and how long it was, at one moment.
+pub type Extent = Vec<(String, u64)>;
 
 #[derive(Default)]
 struct State {
@@ -63,7 +71,8 @@ impl CommandLogs {
             rotation,
             state: Mutex::default(),
             live: broadcast::channel(LIVE_BACKLOG).0,
-            feeding: AtomicBool::new(false),
+            feed: Mutex::default(),
+            checkpoint: Mutex::default(),
         }
     }
 
@@ -210,13 +219,92 @@ impl CommandLogs {
         &self.dir
     }
 
-    pub fn claim_feed(&self) -> bool {
-        !self.feeding.swap(true, Ordering::AcqRel)
+    /// Starts `task` draining the feed, unless one already is.
+    pub fn feed_with<F>(&self, task: impl FnOnce() -> F)
+    where
+        F: Future<Output = ()> + Send + 'static,
+    {
+        let mut feed = self.feed.lock().unwrap();
+        if feed.as_ref().is_some_and(|held| !held.is_finished()) {
+            return;
+        }
+        *feed = Some(tokio::spawn(task()).abort_handle());
     }
 
-    pub fn release_feed(&self) {
-        self.feeding.store(false, Ordering::Release);
+    /// Ends the feed: the connection it reads from is gone. A pause severs
+    /// the guest's vsock without the host side hearing of it, and a feed left
+    /// waiting on it would keep any other from starting.
+    pub fn stop_feed(&self) {
+        if let Some(feed) = self.feed.lock().unwrap().take() {
+            feed.abort();
+        }
     }
+
+    /// Notes how far the logs reach now, as the guest's memory is saved.
+    pub fn mark_checkpoint(&self) {
+        let extent = self.extent();
+        *self.checkpoint.lock().unwrap() = Some(extent);
+    }
+
+    /// The guest is stopped, so the logs are whole as they stand.
+    pub fn clear_checkpoint(&self) {
+        *self.checkpoint.lock().unwrap() = None;
+    }
+
+    /// Each file's length, read under the lock appends are made under, so
+    /// every length ends on a whole record.
+    fn extent(&self) -> Extent {
+        let state = self.state();
+        state
+            .logs
+            .values()
+            .flat_map(Log::file_names)
+            .filter_map(|name| {
+                let len = std::fs::metadata(self.dir.join(&name)).ok()?.len();
+                Some((name, len))
+            })
+            .collect()
+    }
+
+    /// Copies the logs into `dest` as they stood at the last checkpoint, or as
+    /// they stand now when the guest is stopped, for a sandbox restored from
+    /// the same memory.
+    pub fn copy_to(&self, dest: &Path) -> std::io::Result<()> {
+        let extent = self
+            .checkpoint
+            .lock()
+            .unwrap()
+            .clone()
+            .unwrap_or_else(|| self.extent());
+        copy_extent(&self.dir, &extent, dest)
+    }
+}
+
+/// Copies each file in `extent` from `src` into `dest`, up to its length.
+fn copy_extent(src: &Path, extent: &Extent, dest: &Path) -> std::io::Result<()> {
+    use std::io::Read as _;
+    use std::os::unix::fs::{DirBuilderExt as _, OpenOptionsExt as _};
+
+    std::fs::DirBuilder::new()
+        .recursive(true)
+        .mode(0o700)
+        .create(dest)?;
+    for (name, len) in extent {
+        let file = match std::fs::File::open(src.join(name)) {
+            Ok(file) => file,
+            // Rotated away since.
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(err) => return Err(err),
+        };
+        let mut out = std::fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .mode(0o600)
+            .open(dest.join(name))?;
+        std::io::copy(&mut file.take(*len), &mut out)?;
+    }
+    Ok(())
 }
 
 fn is_command_id(id: &str) -> bool {
@@ -295,6 +383,67 @@ mod tests {
         logs.close();
         logs.append(frame("cmd_1", 0, Output::Stdout(b"x".to_vec())));
         assert!(!dir.as_path().join("gone").exists());
+    }
+
+    /// A fork's guest remembers every command its source ran, so its logs
+    /// come along, cut where the source's memory was saved: what the source
+    /// printed after that, the child prints again for itself.
+    #[test]
+    fn a_fork_gets_the_logs_as_they_stood_at_the_checkpoint() {
+        use guestpb::feed_frame::Output;
+        let exit = |code| Output::Exit(guestpb::FeedExit { code, signal: 0 });
+        let dir = scratch("fork-source");
+        let child = scratch("fork-child");
+        let logs = CommandLogs::new(dir.as_path(), Rotation::default());
+        logs.append(frame("cmd_1", 0, Output::Stdout(b"done".to_vec())));
+        logs.append(frame("cmd_1", 4, exit(7)));
+        logs.append(frame("cmd_2", 0, Output::Stdout(b"before".to_vec())));
+        logs.mark_checkpoint();
+        logs.append(frame("cmd_2", 6, Output::Stdout(b"source".to_vec())));
+        logs.append(frame("cmd_2", 12, exit(0)));
+        logs.copy_to(&child).unwrap();
+
+        let forked = CommandLogs::new(&child, Rotation::default());
+        assert_eq!(forked.exit_logged("cmd_1"), Some(true));
+        assert_eq!(forked.held_bytes("cmd_1"), 4);
+        assert_eq!(forked.exit_logged("cmd_2"), Some(false));
+        assert_eq!(forked.held_bytes("cmd_2"), 6);
+        // The child's guest resends what it had not seen confirmed.
+        forked.append(frame("cmd_2", 0, Output::Stdout(b"before child".to_vec())));
+        forked.append(frame("cmd_2", 12, exit(3)));
+        assert_eq!(forked.held_bytes("cmd_2"), 12);
+        assert_eq!(forked.exit_logged("cmd_2"), Some(true));
+
+        // Once the source is stopped its logs are whole.
+        logs.clear_checkpoint();
+        let whole = scratch("fork-whole");
+        logs.copy_to(&whole).unwrap();
+        let copied = CommandLogs::new(&whole, Rotation::default());
+        assert_eq!(copied.held_bytes("cmd_2"), 12);
+        assert_eq!(copied.exit_logged("cmd_2"), Some(true));
+    }
+
+    /// A pause severs the feed's connection without the host hearing of it.
+    /// The feed waiting on it is ended, or no other could start.
+    #[tokio::test]
+    async fn a_stopped_feed_makes_way_for_the_next() {
+        let logs = CommandLogs::new(&scratch("feed"), Rotation::default());
+        let started = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0));
+        let start = || {
+            let started = std::sync::Arc::clone(&started);
+            move || async move {
+                started.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                std::future::pending::<()>().await;
+            }
+        };
+        logs.feed_with(start());
+        logs.feed_with(start());
+        tokio::task::yield_now().await;
+        assert_eq!(started.load(std::sync::atomic::Ordering::SeqCst), 1);
+        logs.stop_feed();
+        logs.feed_with(start());
+        tokio::task::yield_now().await;
+        assert_eq!(started.load(std::sync::atomic::Ordering::SeqCst), 2);
     }
 
     #[test]

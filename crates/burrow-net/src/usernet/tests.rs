@@ -52,6 +52,7 @@ fn policy(mode: NetworkMode, domains: &[&str], allow_cidrs: &[&str], ports: &[u3
             .collect::<Vec<_>>(),
         ports,
         &[],
+        &[],
     )
 }
 
@@ -693,7 +694,7 @@ async fn an_allowed_connection_is_spliced_and_audited() {
 async fn a_denied_connection_is_reset_and_audited() {
     let mut open = policy(NetworkMode::Open, &[], &[], &[]);
     open.proxy.deny_cidrs = vec!["198.51.100.0/24".into()];
-    let open = Policy::new(open.proxy, &[], &[], &[]);
+    let open = Policy::new(open.proxy, &[], &[], &[], &[]);
     let mut guest = Guest::attach(open).await;
     guest.route(remote(7), echo_server().await);
 
@@ -705,6 +706,63 @@ async fn a_denied_connection_is_reset_and_audited() {
     let event = guest.audited(|e| !e.is_allowed).await;
     assert_eq!(event.reason, "destination is in a denied range");
     assert_eq!(event.port, 7);
+}
+
+#[tokio::test]
+async fn a_denied_port_is_reset_and_audited_in_open_mode() {
+    let open = policy(NetworkMode::Open, &[], &[], &[]);
+    let open = Policy::new(
+        open.proxy,
+        &[],
+        &[],
+        &[crate::policy::PortDenial {
+            protocol: Some(crate::firewall::Protocol::Tcp),
+            first: 7,
+            ..Default::default()
+        }],
+        &[],
+    );
+    let mut guest = Guest::attach(open).await;
+    guest.route(remote(7), echo_server().await);
+
+    guest
+        .send_tcp(GUEST, remote(7), Segment::syn(40004, 5))
+        .await;
+    let reply = guest.recv_tcp(WAIT).await.expect("a reset");
+    assert!(reply.rst && !reply.syn, "expected a reset, got {reply:?}");
+    let event = guest.audited(|e| !e.is_allowed).await;
+    assert_eq!(event.reason, "destination port is denied");
+    assert_eq!(event.port, 7);
+}
+
+#[tokio::test]
+async fn a_denied_web_port_is_refused_by_the_proxy_in_allowlist_mode() {
+    let mut allow = policy(NetworkMode::Allowlist, &["allowed.test"], &[], &[]);
+    allow.proxy.deny_ports = vec![burrow_proxy::policy::DeniedPorts {
+        first: 443,
+        last: 443,
+        cidrs: vec![],
+    }];
+    let allow = Policy::new(
+        allow.proxy,
+        &[],
+        &[],
+        &[crate::policy::PortDenial {
+            protocol: Some(crate::firewall::Protocol::Tcp),
+            first: 443,
+            ..Default::default()
+        }],
+        &[],
+    );
+    let mut guest = Guest::attach(allow).await;
+
+    let mut tcp = guest.connect(40012, remote(443)).await;
+    guest.write(&mut tcp, &client_hello("allowed.test")).await;
+    let event = guest
+        .audited(|e| e.host.as_deref() == Some("allowed.test"))
+        .await;
+    assert!(!event.is_allowed);
+    assert_eq!(event.reason, "destination port is denied");
 }
 
 #[tokio::test]
@@ -867,7 +925,7 @@ async fn a_policy_change_resets_flows_it_now_denies() {
     locked.proxy.deny_cidrs = vec!["198.51.100.10/32".into()];
     guest
         .policy
-        .send_replace(Policy::new(locked.proxy, &[], &[], &[]));
+        .send_replace(Policy::new(locked.proxy, &[], &[], &[], &[]));
     let reset = loop {
         let segment = guest.recv_tcp(WAIT).await.expect("a reset");
         if segment.rst {
@@ -976,6 +1034,7 @@ fn member(id: &str, mode: NetworkMode, peers: &[Ipv4Addr]) -> Policy {
             mode,
             ..Default::default()
         },
+        &[],
         &[],
         &[],
         peers,
@@ -1136,6 +1195,62 @@ async fn allowlist_traffic_to_a_peer_skips_the_proxy() {
     let syn = beta.recv_tcp(WAIT).await.expect("the syn, not the proxy");
     assert!(syn.syn && syn.seq == 7);
     assert!(alpha.recv(QUIET).await.is_none());
+}
+
+/// A denied port is egress like any other, so the router holds a sandbox
+/// to its own `deny_ports` towards a peer, as the Linux sandbox chain does.
+#[tokio::test]
+async fn a_denied_port_holds_towards_a_peer() {
+    let (node, audit) = test_node().await;
+    let (a, b) = (net_at(6), net_at(10));
+    let denied = member("sbx_a", NetworkMode::Open, &[b.guest_ip]);
+    let denied = Policy::new(
+        denied.proxy,
+        &[],
+        &[],
+        &[crate::policy::PortDenial {
+            protocol: Some(crate::firewall::Protocol::Tcp),
+            first: 8080,
+            ..Default::default()
+        }],
+        &[b.guest_ip],
+    );
+    let mut alpha = Guest::attach_to(&node, Arc::clone(&audit), a, denied);
+    let mut beta = Guest::attach_to(
+        &node,
+        audit,
+        b,
+        member("sbx_b", NetworkMode::Open, &[a.guest_ip]),
+    );
+
+    alpha
+        .send_tcp(
+            a.guest_ip,
+            SocketAddr::from((b.guest_ip, 8080)),
+            Segment::syn(40140, 1),
+        )
+        .await;
+    assert!(
+        beta.recv(QUIET).await.is_none(),
+        "a denied port is never delivered"
+    );
+    let event = alpha
+        .audited(|e| e.reason == "destination port is denied" && !e.is_allowed)
+        .await;
+    assert_eq!((event.sandbox_id.as_str(), event.port), ("sbx_a", 8080));
+
+    alpha
+        .send_tcp(
+            a.guest_ip,
+            SocketAddr::from((b.guest_ip, 8081)),
+            Segment::syn(40141, 1),
+        )
+        .await;
+    let syn = beta
+        .recv_tcp(WAIT)
+        .await
+        .expect("another port still reaches the peer");
+    assert!(syn.syn && syn.port == 8081);
 }
 
 #[tokio::test]

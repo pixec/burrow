@@ -25,6 +25,10 @@ pub struct Placement {
     /// honour.
     pub vcpus: u32,
     pub mem_mib: u64,
+    /// The disk it is promised, in bytes: its scratch disk. Checked against
+    /// what the node reports with the node's own rule
+    /// ([`burrow_common::disk`]), so a node is not chosen only to refuse.
+    pub disk_bytes: u64,
     /// Consider nodes that do not hold the template yet, because the caller
     /// intends to copy it there first.
     pub is_template_transfer_allowed: bool,
@@ -65,8 +69,17 @@ pub enum PlacementError {
          that has its binary"
     )]
     NoNodeWithHypervisor(String),
-    #[error("no node has room for {vcpus} vcpu / {mem_mib} MiB")]
-    NoCapacity { vcpus: u32, mem_mib: u64 },
+    #[error(
+        "no node has room for {vcpus} vcpu / {mem_mib} MiB / {disk_mib} MiB of disk{disk_note}"
+    )]
+    NoCapacity {
+        vcpus: u32,
+        mem_mib: u64,
+        disk_mib: u64,
+        /// Which node came closest on disk and what it lacked, when disk is
+        /// what ruled the nodes out.
+        disk_note: String,
+    },
     #[error(
         "no node has template {0:?}; templates are node-local, so build or warm it on a node that can run it"
     )]
@@ -195,11 +208,25 @@ pub struct NodeRegistry {
     pending: Mutex<HashMap<String, Reserved>>,
 }
 
+/// The scratch disk a sandbox gets when its policy names none. Mirrors the
+/// node's, so placement charges what the node will actually promise.
+pub const DEFAULT_SCRATCH_MIB: u64 = 1024;
+
+/// The disk a sandbox with these resources is promised, in bytes.
+pub fn disk_bytes(resources: Option<&burrow_proto::common::v1::ResourcePolicy>) -> u64 {
+    let mib = match resources.map(|r| r.scratch_disk_mib).unwrap_or(0) {
+        0 => DEFAULT_SCRATCH_MIB,
+        mib => u64::from(mib),
+    };
+    mib * burrow_common::disk::MIB
+}
+
 /// Capacity promised to sandboxes a node has not yet reported.
 #[derive(Debug, Default, Clone, Copy)]
 struct Reserved {
     vcpus: u32,
     mem_mib: u64,
+    disk_bytes: u64,
 }
 
 /// What is promised on a node beyond its last report: this replica's own
@@ -212,7 +239,31 @@ fn held(entry: &NodeEntry, pending: &HashMap<String, Reserved>) -> Reserved {
     Reserved {
         vcpus: local.vcpus.max(entry.reserved_vcpus),
         mem_mib: local.mem_mib.max(entry.reserved_mem_mib),
+        // The store does not carry disk reservations; the node's own
+        // admission is the gate, and this only keeps a burst from piling on.
+        disk_bytes: local.disk_bytes,
     }
+}
+
+/// A node's disk as its last heartbeat reported it.
+pub fn disk_capacity(status: &NodeStatus) -> burrow_common::disk::DiskCapacity {
+    burrow_common::disk::DiskCapacity {
+        free_bytes: status.disk_free_bytes,
+        total_bytes: status.disk_total_bytes,
+        reserve_bytes: status.disk_reserve_bytes,
+        unwritten_bytes: status.disk_unwritten_bytes,
+        overcommit: status.disk_overcommit,
+    }
+}
+
+/// Whether the node has room for the disk, with what is already placed on it
+/// since its report. A node that does not report disk is not checked.
+fn disk_fit(
+    entry: &NodeEntry,
+    held: Reserved,
+    want: &Placement,
+) -> Result<(), burrow_common::disk::Shortfall> {
+    disk_capacity(&entry.status).admit(held.disk_bytes.saturating_add(want.disk_bytes))
 }
 
 /// Whether a node can take this sandbox without oversubscribing itself.
@@ -224,7 +275,7 @@ fn is_fit(entry: &NodeEntry, pending: &HashMap<String, Reserved>, want: &Placeme
     let cpu_ok = entry.info.total_vcpus == 0 || committed <= entry.info.total_vcpus as u64;
     let free = entry.status.free_mem_mib.saturating_sub(held.mem_mib);
     let mem_ok = free >= want.mem_mib;
-    cpu_ok && mem_ok
+    cpu_ok && mem_ok && disk_fit(entry, held, want).is_ok()
 }
 
 /// Reported free memory, less anything placed since that report.
@@ -251,7 +302,43 @@ fn headroom(entry: &NodeEntry, pending: &HashMap<String, Reserved>) -> f64 {
     } else {
         (free_mem(entry, pending) as f64 / entry.info.total_mem_mib as f64).clamp(0.0, 1.0)
     };
-    cpu_free.min(mem_free)
+    let disk_free = burrow_common::disk::DiskCapacity {
+        unwritten_bytes: entry
+            .status
+            .disk_unwritten_bytes
+            .saturating_add(held.disk_bytes),
+        ..disk_capacity(&entry.status)
+    }
+    .headroom();
+    cpu_free.min(mem_free).min(disk_free)
+}
+
+/// When disk is what kept every candidate out: the one closest to fitting,
+/// and how much free disk it lacked. Empty when some node had the disk.
+fn disk_note(
+    candidates: &[&NodeEntry],
+    pending: &HashMap<String, Reserved>,
+    want: &Placement,
+) -> String {
+    let mut closest: Option<(&NodeEntry, burrow_common::disk::Shortfall)> = None;
+    for entry in candidates {
+        match disk_fit(entry, held(entry, pending), want) {
+            Ok(()) => return String::new(),
+            Err(short) => {
+                if closest.is_none_or(|(_, best)| short.bytes < best.bytes) {
+                    closest = Some((entry, short));
+                }
+            }
+        }
+    }
+    match closest {
+        Some((entry, short)) => format!(
+            "; node {} is the closest on disk, short by {} MiB of free disk above its reserve",
+            entry.info.id,
+            short.mib()
+        ),
+        None => String::new(),
+    }
 }
 
 impl NodeRegistry {
@@ -690,6 +777,7 @@ impl NodeRegistry {
         }
 
         let pending = self.pending.lock().unwrap();
+        let candidates: Vec<&NodeEntry> = with_template.iter().map(|e| **e).collect();
         let with_room: Vec<_> = with_template
             .into_iter()
             .filter(|e| is_fit(e, &pending, want))
@@ -698,6 +786,8 @@ impl NodeRegistry {
             return Err(PlacementError::NoCapacity {
                 vcpus: want.vcpus,
                 mem_mib: want.mem_mib,
+                disk_mib: want.disk_bytes.div_ceil(burrow_common::disk::MIB),
+                disk_note: disk_note(&candidates, &pending, want),
             });
         }
 
@@ -735,6 +825,7 @@ impl NodeRegistry {
         let entry = pending.entry(node_id.to_string()).or_default();
         entry.vcpus += want.vcpus;
         entry.mem_mib += want.mem_mib;
+        entry.disk_bytes += want.disk_bytes;
     }
 
     /// Gives back capacity reserved for a placement that no longer exists.
@@ -743,14 +834,15 @@ impl NodeRegistry {
     /// reporting it. If the sandbox is destroyed inside that window the charge
     /// has to be returned, or a burst of create-then-destroy exhausts a node
     /// that is in fact empty.
-    pub fn release(&self, node_id: &str, vcpus: u32, mem_mib: u64) {
+    pub fn release(&self, node_id: &str, vcpus: u32, mem_mib: u64, disk_bytes: u64) {
         let mut pending = self.pending.lock().unwrap();
         let Some(entry) = pending.get_mut(node_id) else {
             return;
         };
         entry.vcpus = entry.vcpus.saturating_sub(vcpus);
         entry.mem_mib = entry.mem_mib.saturating_sub(mem_mib);
-        if entry.vcpus == 0 && entry.mem_mib == 0 {
+        entry.disk_bytes = entry.disk_bytes.saturating_sub(disk_bytes);
+        if entry.vcpus == 0 && entry.mem_mib == 0 && entry.disk_bytes == 0 {
             pending.remove(node_id);
         }
     }
@@ -1864,7 +1956,7 @@ mod tests {
         registry.place_for(&want).unwrap();
         assert!(registry.place_for(&want).is_err());
 
-        registry.release("only", want.vcpus, want.mem_mib);
+        registry.release("only", want.vcpus, want.mem_mib, want.disk_bytes);
         registry
             .place_for(&want)
             .expect("releasing one placement should make room for another");
@@ -1880,8 +1972,8 @@ mod tests {
             },
         )]);
         set_capacity(&registry, "only", 8, 8_000);
-        registry.release("only", 99, 99_999);
-        registry.release("only", 1, 1);
+        registry.release("only", 99, 99_999, u64::MAX);
+        registry.release("only", 1, 1, 1);
         registry
             .place_for(&Placement {
                 vcpus: 1,
@@ -1889,5 +1981,134 @@ mod tests {
                 ..Default::default()
             })
             .expect("an unknown release must not corrupt the ledger");
+    }
+
+    const GIB: u64 = 1 << 30;
+
+    fn disk(free_gib: u64, unwritten_gib: u64, overcommit: f64) -> NodeStatus {
+        NodeStatus {
+            free_mem_mib: 64_000,
+            disk_free_bytes: free_gib * GIB,
+            disk_total_bytes: 100 * GIB,
+            disk_reserve_bytes: 5 * GIB,
+            disk_unwritten_bytes: unwritten_gib * GIB,
+            disk_overcommit: overcommit,
+            ..Default::default()
+        }
+    }
+
+    /// A disk that fits above a node's reserve is placed there.
+    #[test]
+    fn a_disk_that_fits_is_placed() {
+        let registry = registry(&[("a", disk(50, 20, 1.0))]);
+        let want = Placement {
+            disk_bytes: 25 * GIB,
+            ..Default::default()
+        };
+        assert_eq!(registry.place_for(&want).unwrap(), "a");
+    }
+
+    /// One that would cross every node's reserve is refused as a capacity
+    /// problem, naming the node that came closest and what it lacked.
+    #[test]
+    fn a_disk_that_fits_nowhere_is_refused_with_the_shortfall() {
+        let registry = registry(&[("a", disk(50, 20, 1.0)), ("b", disk(40, 20, 1.0))]);
+        let err = registry
+            .place_for(&Placement {
+                disk_bytes: 26 * GIB,
+                ..Default::default()
+            })
+            .unwrap_err();
+        assert!(matches!(err, PlacementError::NoCapacity { .. }), "{err}");
+        let message = err.to_string();
+        assert!(message.contains("26624 MiB of disk"), "{message}");
+        assert!(
+            message.contains("node a is the closest on disk"),
+            "{message}"
+        );
+        assert!(message.contains("short by 1024 MiB"), "{message}");
+        // As the API answers it.
+        assert_eq!(
+            crate::api::placement_status(err).code(),
+            tonic::Code::ResourceExhausted
+        );
+    }
+
+    /// The node's overcommit is honoured, as the node itself applies it.
+    #[test]
+    fn a_nodes_disk_overcommit_lets_it_take_more() {
+        let want = Placement {
+            disk_bytes: 60 * GIB,
+            ..Default::default()
+        };
+        assert!(
+            registry(&[("a", disk(50, 20, 1.0))])
+                .place_for(&want)
+                .is_err()
+        );
+        assert_eq!(
+            registry(&[("a", disk(50, 20, 2.0))])
+                .place_for(&want)
+                .unwrap(),
+            "a"
+        );
+    }
+
+    /// Placements since the last heartbeat count against the disk too, or a
+    /// burst of creates all fits into the same free space.
+    #[test]
+    fn disk_placed_since_the_last_heartbeat_is_counted() {
+        let registry = registry(&[("a", disk(30, 0, 1.0))]);
+        let want = Placement {
+            disk_bytes: 10 * GIB,
+            ..Default::default()
+        };
+        registry.place_for(&want).unwrap();
+        registry.place_for(&want).unwrap();
+        assert!(registry.place_for(&want).is_err());
+        registry.release("a", want.vcpus, want.mem_mib, want.disk_bytes);
+        assert_eq!(registry.place_for(&want).unwrap(), "a");
+    }
+
+    /// A node with more disk headroom wins when everything else is equal.
+    #[test]
+    fn the_node_with_more_free_disk_is_preferred() {
+        let registry = registry(&[("full", disk(10, 0, 1.0)), ("empty", disk(90, 0, 1.0))]);
+        assert_eq!(
+            registry
+                .place_for(&Placement {
+                    disk_bytes: GIB,
+                    ..Default::default()
+                })
+                .unwrap(),
+            "empty"
+        );
+    }
+
+    /// A node that does not report disk (an older one) is not checked.
+    #[test]
+    fn a_node_that_does_not_report_disk_is_trusted() {
+        let registry = registry(&[("old", status(&[], &[], 64_000))]);
+        assert_eq!(
+            registry
+                .place_for(&Placement {
+                    disk_bytes: 1 << 50,
+                    ..Default::default()
+                })
+                .unwrap(),
+            "old"
+        );
+    }
+
+    #[test]
+    fn a_sandbox_without_a_disk_size_is_charged_the_default() {
+        assert_eq!(disk_bytes(None), 1024 * burrow_common::disk::MIB);
+        assert_eq!(
+            disk_bytes(Some(&burrow_proto::common::v1::ResourcePolicy {
+                scratch_disk_mib: 4096,
+                ..Default::default()
+            })),
+            4096 * burrow_common::disk::MIB
+        );
     }
 }

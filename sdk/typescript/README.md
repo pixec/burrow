@@ -641,13 +641,29 @@ await Sandbox.create({
 | `allowDomains` | Domain globs reachable in allowlist mode |
 | `allowCidrs` | Extra destinations permitted at the IP layer |
 | `allowPorts` | Destination ports permitted |
-| `denyCidrs` | Ranges the sandbox may never reach, in any mode |
+| `denyCidrs` | Ranges the sandbox may never reach, in any mode, IPv4 or IPv6 |
+| `denyPorts` | Destination ports refused in any mode: `{ protocol?: "tcp" \| "udp", port, portEnd?, cidrs? }`, no protocol meaning both |
+| `denyIpv6` | Refuse every IPv6 destination, in any mode |
 | `inspectTls` | Terminate the sandbox's TLS so the host inside the session is checked as well as the SNI |
 | `rules` | What the host does to the requests it inspects, in order |
 | `injectHeaders` | Credentials the host attaches on the sandbox's behalf, appended after `rules` |
 
 Deny beats every allowance. An allowed domain that resolves into a denied range
-is refused.
+is refused, and a denied port stays denied in open mode:
+
+```ts
+await Sandbox.create({
+  networkPolicy: {
+    mode: "open",
+    denyPorts: [
+      { protocol: "tcp", port: 25 },
+      { protocol: "tcp", port: 465 },
+      { protocol: "tcp", port: 587 },
+    ],
+    denyIpv6: true,
+  },
+});
+```
 
 ### Request rules
 

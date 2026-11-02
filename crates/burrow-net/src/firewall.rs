@@ -19,7 +19,7 @@ use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use crate::error::{NetError, Result};
 #[cfg(test)]
 use crate::policy::parse_cidr;
-use crate::policy::{Cidr, METADATA_CIDR, SANDBOX_POOL};
+use crate::policy::{Cidr, Denials, METADATA_CIDR, PortDenial, SANDBOX_POOL};
 
 /// The address range every sandbox lease comes from.
 pub const SANDBOX_CIDR: &str = "10.99.0.0/16";
@@ -94,10 +94,14 @@ pub struct SandboxRules {
     pub mode: Mode,
     /// Extra destinations permitted at L3 regardless of mode.
     pub allow_cidrs: Vec<String>,
-    /// Destinations this sandbox may never reach, whatever the mode says.
-    /// Rendered before every allowance, so a denied range stays unreachable
-    /// even when `allow_cidrs` or `open` would grant it.
+    /// Destinations this sandbox may never reach, whatever the mode says, of
+    /// either family. Rendered before every allowance, so a denied range stays
+    /// unreachable even when `allow_cidrs` or `open` would grant it.
     pub deny_cidrs: Vec<String>,
+    /// Destination ports refused the same way, ahead of every allowance.
+    pub deny_ports: Vec<PortDenial>,
+    /// Refuse every v6 destination beyond the gateway, whatever the mode.
+    pub is_ipv6_denied: bool,
     /// Ports the CIDR allowance is limited to. Empty means every port.
     pub allow_ports: Vec<u32>,
     /// Guest addresses of peers sharing a private network with this sandbox,
@@ -122,8 +126,12 @@ fn validated_allowance(sandbox: &SandboxRules) -> Option<(Vec<Cidr>, Vec<u16>)> 
 }
 
 /// [`crate::policy::validated_denials`] for one sandbox's record.
-fn validated_denials(sandbox: &SandboxRules) -> Option<Vec<Cidr>> {
-    crate::policy::validated_denials(&sandbox.sandbox_id, &sandbox.deny_cidrs)
+fn validated_denials(sandbox: &SandboxRules) -> Option<Denials> {
+    crate::policy::validated_denials(
+        &sandbox.sandbox_id,
+        &sandbox.deny_cidrs,
+        &sandbox.deny_ports,
+    )
 }
 
 /// Renders the complete ruleset for the given sandboxes.
@@ -491,11 +499,14 @@ fn render_host_input(out: &mut String, sandboxes: &[SandboxRules]) {
                 out,
                 "add rule inet {FILTER_TABLE} tohost ip saddr {guest} ip daddr {host} tcp dport {PROXY_PORT} accept"
             );
-            let _ = writeln!(
-                out,
-                "add rule inet {FILTER_TABLE} tohost ip6 saddr {} ip6 daddr {} tcp dport {PROXY_PORT} accept",
-                sandbox.guest_ip6, sandbox.host_ip6
-            );
+            // Not for a sandbox denied v6, which gets no v6 redirect.
+            if !sandbox.is_ipv6_denied {
+                let _ = writeln!(
+                    out,
+                    "add rule inet {FILTER_TABLE} tohost ip6 saddr {} ip6 daddr {} tcp dport {PROXY_PORT} accept",
+                    sandbox.guest_ip6, sandbox.host_ip6
+                );
+            }
         }
     }
 
@@ -556,22 +567,127 @@ fn render_sandbox_denials(out: &mut String, sandbox: &SandboxRules) {
         "add rule inet {FILTER_TABLE} sandbox ip saddr {guest} ip daddr {METADATA_CIDR} drop"
     );
 
+    let guest6 = sandbox.guest_ip6;
+    // Every v6 destination, when the policy says so. Nothing but the forward
+    // path is affected: the gateway's own services are on the input hook.
+    if sandbox.is_ipv6_denied {
+        let _ = writeln!(
+            out,
+            "add rule inet {FILTER_TABLE} sandbox ip6 saddr {guest6} drop"
+        );
+    }
+
     match validated_denials(sandbox) {
         Some(denied) => {
-            for cidr in &denied {
+            for cidr in &denied.cidrs {
+                let source = source_match(sandbox, cidr.is_v4());
                 let _ = writeln!(
                     out,
-                    "add rule inet {FILTER_TABLE} sandbox ip saddr {guest} ip daddr {cidr} drop"
+                    "add rule inet {FILTER_TABLE} sandbox {source} {} {cidr} drop",
+                    cidr.daddr()
                 );
             }
+            render_port_denials(out, sandbox, &denied);
         }
         None => {
             // An unparseable denial is not ignorable: rather than render the
-            // allowances it was meant to override, this sandbox gets nothing.
+            // allowances it was meant to override, this sandbox gets nothing,
+            // in either family.
             let _ = writeln!(
                 out,
                 "add rule inet {FILTER_TABLE} sandbox ip saddr {guest} drop"
             );
+            let _ = writeln!(
+                out,
+                "add rule inet {FILTER_TABLE} sandbox ip6 saddr {guest6} drop"
+            );
+        }
+    }
+}
+
+/// `cidrs` without the ranges another one already covers, duplicates
+/// included.
+///
+/// An anonymous nftables set is an interval set, and some nft releases refuse
+/// one whose elements overlap rather than merging them. One refused set fails
+/// the whole node's transactional render, so the overlap is removed here. Two
+/// prefixes either nest or are disjoint, so what is left never overlaps.
+fn disjoint(cidrs: &[Cidr]) -> Vec<Cidr> {
+    let covers = |outer: &Cidr, inner: &Cidr| {
+        outer.prefix <= inner.prefix && outer.contains(inner.addr) && outer.is_v4() == inner.is_v4()
+    };
+    cidrs
+        .iter()
+        .enumerate()
+        .filter(|(i, cidr)| {
+            !cidrs.iter().enumerate().any(|(j, other)| {
+                j != *i
+                    && covers(other, cidr)
+                    // Of two ranges covering each other, the same range
+                    // written twice, the first is kept.
+                    && (!covers(cidr, other) || j < *i)
+            })
+        })
+        .map(|(_, cidr)| *cidr)
+        .collect()
+}
+
+/// The source match for a sandbox's own traffic in one family.
+fn source_match(sandbox: &SandboxRules, is_v4: bool) -> String {
+    if is_v4 {
+        format!("ip saddr {}", sandbox.guest_ip)
+    } else {
+        format!("ip6 saddr {}", sandbox.guest_ip6)
+    }
+}
+
+/// A sandbox's denied ports, in both families unless a rule names ranges of
+/// only one.
+///
+/// Matched on the connection's original direction only. A port denial is
+/// about where the sandbox connects, and without the direction a reply to an
+/// inbound connection, to a published port or from a peer, would be dropped
+/// whenever the remote side's ephemeral port fell in a denied range. Packets
+/// conntrack holds no direction for, invalid or untracked ones, are dropped by
+/// a second rule rather than let through to the accepts below.
+fn render_port_denials(out: &mut String, sandbox: &SandboxRules, denials: &Denials) {
+    for block in &denials.ports {
+        let mut targets: Vec<(bool, Option<String>)> = Vec::new();
+        if block.cidrs.is_empty() {
+            targets.push((true, None));
+            targets.push((false, None));
+        } else {
+            for is_v4 in [true, false] {
+                let family: Vec<Cidr> = block
+                    .cidrs
+                    .iter()
+                    .copied()
+                    .filter(|cidr| cidr.is_v4() == is_v4)
+                    .collect();
+                let set: Vec<String> = disjoint(&family).iter().map(Cidr::to_string).collect();
+                if set.is_empty() {
+                    continue;
+                }
+                let keyword = if is_v4 { "ip daddr" } else { "ip6 daddr" };
+                targets.push((is_v4, Some(format!("{keyword} {{ {} }}", set.join(", ")))));
+            }
+        }
+        let ports = block.ports();
+        for (is_v4, destination) in &targets {
+            let source = source_match(sandbox, *is_v4);
+            let destination = destination
+                .as_deref()
+                .map(|d| format!(" {d}"))
+                .unwrap_or_default();
+            for protocol in block.protocols() {
+                for state in ["ct direction original", "ct state invalid,untracked"] {
+                    let _ = writeln!(
+                        out,
+                        "add rule inet {FILTER_TABLE} sandbox {source}{destination} {state} \
+                         {protocol} dport {ports} drop"
+                    );
+                }
+            }
         }
     }
 }
@@ -717,6 +833,11 @@ fn render_nat6(out: &mut String, sandboxes: &[SandboxRules]) {
 
     for sandbox in sandboxes {
         let guest = sandbox.guest_ip6;
+        // A sandbox denied v6 is neither redirected nor translated: its v6
+        // packets meet the drop in the sandbox chain and nothing else.
+        if sandbox.is_ipv6_denied {
+            continue;
+        }
         if sandbox.mode == Mode::Allowlist {
             let _ = writeln!(
                 out,
@@ -890,6 +1011,8 @@ mod tests {
             mode,
             allow_cidrs: vec![],
             deny_cidrs: vec![],
+            deny_ports: vec![],
+            is_ipv6_denied: false,
             allow_ports: vec![],
             peers: vec![],
             ports: vec![],
@@ -1508,17 +1631,29 @@ mod tests {
             "10.77.0.0/16/8",
             "not-an-address",
             "10.77.0.0/16 accept",
-            "::1/128",
+            "::1/129",
+            "fe80::1%eth0/64",
+            "2001:db8::/32\nadd rule inet burrow sandbox accept",
         ] {
             assert!(parse_cidr(bad).is_none(), "{bad:?} must not parse");
         }
         assert_eq!(
             parse_cidr("10.77.0.0/16"),
             Some(Cidr {
-                addr: Ipv4Addr::new(10, 77, 0, 0),
+                addr: IpAddr::V4(Ipv4Addr::new(10, 77, 0, 0)),
                 prefix: 16
             })
         );
+        // Either family: a denial may name v6 ranges, and a bare v6 address
+        // is a /128.
+        assert_eq!(
+            parse_cidr("2001:db8::/32"),
+            Some(Cidr {
+                addr: "2001:db8::".parse().unwrap(),
+                prefix: 32
+            })
+        );
+        assert_eq!(parse_cidr("2001:db8::1").map(|c| c.prefix), Some(128));
         // A bare address is the /32 the operator meant.
         assert_eq!(parse_cidr("10.77.0.1").map(|c| c.prefix), Some(32));
 
@@ -1868,5 +2003,184 @@ mod tests {
             sandbox_chain.trim_end().ends_with("drop"),
             "the sandbox chain must end in a drop:\n{sandbox_chain}"
         );
+    }
+
+    fn smtp() -> Vec<PortDenial> {
+        vec![
+            PortDenial {
+                protocol: Some(Protocol::Tcp),
+                first: 25,
+                ..Default::default()
+            },
+            PortDenial {
+                protocol: Some(Protocol::Tcp),
+                first: 465,
+                last: 587,
+                ..Default::default()
+            },
+        ]
+    }
+
+    /// Where each line sits relative to the chain's established accept.
+    fn before_established(ruleset: &str, needle: &str) -> bool {
+        let established = ruleset
+            .find("sandbox ct state established,related accept")
+            .unwrap();
+        ruleset.find(needle).is_some_and(|at| at < established)
+    }
+
+    #[test]
+    fn denied_ports_are_dropped_ahead_of_every_accept_in_open_mode() {
+        let mut s = sandbox(Mode::Open);
+        s.deny_ports = smtp();
+        let ruleset = render(&[s]);
+        for line in [
+            "add rule inet burrow sandbox ip saddr 10.99.0.6 ct direction original tcp dport 25 drop",
+            "add rule inet burrow sandbox ip saddr 10.99.0.6 ct state invalid,untracked tcp dport 25 drop",
+            "add rule inet burrow sandbox ip6 saddr fd99:b070:0:1::2 ct direction original tcp dport 25 drop",
+            "add rule inet burrow sandbox ip saddr 10.99.0.6 ct direction original tcp dport 465-587 drop",
+            "add rule inet burrow sandbox ip6 saddr fd99:b070:0:1::2 ct direction original tcp dport 465-587 drop",
+        ] {
+            assert!(ruleset.contains(line), "missing {line}:\n{ruleset}");
+            // Ahead of the established accept, so a connection opened before
+            // the denial does not ride its conntrack entry past it.
+            assert!(before_established(&ruleset, line), "{line}");
+        }
+        // TCP only: nothing was said about UDP.
+        assert!(!ruleset.contains("udp dport 25"));
+        // And the rest of open mode is as it was.
+        assert!(ruleset.contains("sandbox ip saddr 10.99.0.6 accept"));
+        assert!(ruleset.contains("sandbox ip6 saddr fd99:b070:0:1::2 accept"));
+    }
+
+    #[test]
+    fn denied_ports_are_dropped_in_allowlist_mode_too() {
+        let mut s = sandbox(Mode::Allowlist);
+        s.allow_cidrs = vec!["10.2.0.0/16".into()];
+        s.deny_ports = vec![PortDenial {
+            protocol: None,
+            first: 5432,
+            cidrs: vec!["10.2.0.0/16".into(), "2001:db8::/32".into()],
+            ..Default::default()
+        }];
+        let ruleset = render(&[s]);
+        for line in [
+            "sandbox ip saddr 10.99.0.6 ip daddr { 10.2.0.0/16 } ct direction original tcp dport 5432 drop",
+            "sandbox ip saddr 10.99.0.6 ip daddr { 10.2.0.0/16 } ct direction original udp dport 5432 drop",
+            "sandbox ip6 saddr fd99:b070:0:1::2 ip6 daddr { 2001:db8::/32 } ct direction original tcp dport 5432 drop",
+            "sandbox ip6 saddr fd99:b070:0:1::2 ip6 daddr { 2001:db8::/32 } ct state invalid,untracked udp dport 5432 drop",
+        ] {
+            assert!(ruleset.contains(line), "missing {line}:\n{ruleset}");
+            assert!(before_established(&ruleset, line), "{line}");
+        }
+        // The denial is rendered before the allowance it carves out of.
+        assert!(
+            ruleset
+                .find("ct direction original tcp dport 5432 drop")
+                .unwrap()
+                < ruleset.find("ip daddr 10.2.0.0/16 accept").unwrap()
+        );
+    }
+
+    #[test]
+    fn a_port_denial_scoped_to_one_family_leaves_the_other_alone() {
+        let mut s = sandbox(Mode::Open);
+        s.deny_ports = vec![PortDenial {
+            protocol: Some(Protocol::Udp),
+            first: 53,
+            cidrs: vec!["10.0.0.0/8".into()],
+            ..Default::default()
+        }];
+        let ruleset = render(&[s]);
+        assert!(
+            ruleset.contains("ip daddr { 10.0.0.0/8 } ct direction original udp dport 53 drop")
+        );
+        assert!(!ruleset.contains("ip6 saddr fd99:b070:0:1::2 ct direction original udp dport 53"));
+    }
+
+    #[test]
+    fn a_malformed_port_denial_drops_the_sandbox_in_both_families() {
+        let mut s = sandbox(Mode::Open);
+        s.deny_ports = vec![PortDenial {
+            first: 70000,
+            ..Default::default()
+        }];
+        let ruleset = render(&[s]);
+        assert!(ruleset.contains("add rule inet burrow sandbox ip saddr 10.99.0.6 drop"));
+        assert!(ruleset.contains("add rule inet burrow sandbox ip6 saddr fd99:b070:0:1::2 drop"));
+        assert!(!ruleset.contains("70000"));
+        assert!(!ruleset.contains("sandbox ip saddr 10.99.0.6 accept"));
+    }
+
+    #[test]
+    fn v6_denied_ranges_are_rendered_in_their_own_family() {
+        let mut s = sandbox(Mode::Open);
+        s.deny_cidrs = vec!["10.2.9.0/24".into(), "2001:db8::/32".into()];
+        let ruleset = render(&[s]);
+        let v4 = "sandbox ip saddr 10.99.0.6 ip daddr 10.2.9.0/24 drop";
+        let v6 = "sandbox ip6 saddr fd99:b070:0:1::2 ip6 daddr 2001:db8::/32 drop";
+        assert!(ruleset.contains(v4) && before_established(&ruleset, v4));
+        assert!(ruleset.contains(v6) && before_established(&ruleset, v6));
+        assert!(!ruleset.contains("ip daddr 2001:db8"));
+    }
+
+    #[test]
+    fn ipv6_denied_removes_every_v6_path_in_every_mode() {
+        for mode in [Mode::Open, Mode::Allowlist, Mode::None] {
+            let mut s = sandbox(mode);
+            s.is_ipv6_denied = true;
+            let ruleset = render(&[s]);
+            let drop = "add rule inet burrow sandbox ip6 saddr fd99:b070:0:1::2 drop";
+            assert!(ruleset.contains(drop), "{mode:?}");
+            assert!(before_established(&ruleset, drop), "{mode:?}");
+            // No translation either way: not to the proxy, not off the node.
+            assert!(
+                !ruleset
+                    .lines()
+                    .any(|l| l.starts_with("add rule ip6 burrow_nat6")
+                        && l.contains("fd99:b070:0:1::2")),
+                "{mode:?}:\n{ruleset}"
+            );
+            assert!(!ruleset.contains("tohost ip6 saddr fd99:b070:0:1::2"));
+            // The gateway link stays up: neighbour discovery and its antispoof
+            // return are rendered as before.
+            assert!(ruleset.contains("ip6 saddr fd99:b070:0:1::2 return"));
+            assert!(ruleset.contains("nd-neighbor-solicit"));
+            // And v4 is untouched.
+            if mode == Mode::Open {
+                assert!(ruleset.contains("sandbox ip saddr 10.99.0.6 accept"));
+                assert!(ruleset.contains("ip saddr 10.99.0.6 ip daddr != 10.99.0.0/16 masquerade"));
+            }
+        }
+    }
+
+    #[test]
+    fn ipv6_is_rendered_as_before_when_not_denied() {
+        let open = render(&[sandbox(Mode::Open)]);
+        assert!(open.contains("sandbox ip6 saddr fd99:b070:0:1::2 accept"));
+        assert!(open.contains("ip6 saddr fd99:b070:0:1::2 ip6 daddr != fd99:b070::/48 masquerade"));
+        assert!(!open.contains("sandbox ip6 saddr fd99:b070:0:1::2 drop"));
+        let allow = render(&[sandbox(Mode::Allowlist)]);
+        assert!(
+            allow.contains("prerouting ip6 saddr fd99:b070:0:1::2 tcp dport { 80, 443 } redirect")
+        );
+        assert!(allow.contains("tohost ip6 saddr fd99:b070:0:1::2"));
+    }
+
+    #[test]
+    fn a_port_denial_set_never_overlaps() {
+        let cidrs: Vec<Cidr> = [
+            "2001:db8::/32",
+            "2001:db8:1::5/128",
+            "10.0.0.0/8",
+            "10.0.0.0/8",
+            "10.1.0.0/16",
+            "192.168.0.0/24",
+        ]
+        .iter()
+        .map(|c| parse_cidr(c).unwrap())
+        .collect();
+        let kept: Vec<String> = disjoint(&cidrs).iter().map(Cidr::to_string).collect();
+        assert_eq!(kept, ["2001:db8::/32", "10.0.0.0/8", "192.168.0.0/24"]);
     }
 }

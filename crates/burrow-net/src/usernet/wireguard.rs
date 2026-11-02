@@ -202,7 +202,7 @@ impl Mesh {
                 }
                 TunnResult::WriteToTunnelV4(packet, source) => {
                     peer.endpoint = Some(from);
-                    if peer.subnet.contains(source) {
+                    if peer.subnet.contains(std::net::IpAddr::V4(source)) {
                         packets.push(packet.to_vec());
                     } else {
                         tracing::debug!(node = peer.node_id, %source, "dropping a mesh packet from outside the peer's slice");
@@ -253,7 +253,7 @@ impl Uplink for Mesh {
             .unwrap()
             .list
             .iter()
-            .any(|peer| peer.subnet.contains(address))
+            .any(|peer| peer.subnet.contains(std::net::IpAddr::V4(address)))
     }
 
     fn send(&self, packet: &[u8]) {
@@ -265,7 +265,7 @@ impl Uplink for Mesh {
         let Some(peer) = peers
             .list
             .iter_mut()
-            .find(|peer| peer.subnet.contains(destination))
+            .find(|peer| peer.subnet.contains(std::net::IpAddr::V4(destination)))
         else {
             return;
         };

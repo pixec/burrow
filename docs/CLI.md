@@ -252,7 +252,9 @@ burrow create --template python --name api
 | `--deny-domain <DOMAIN>` | Domain the sandbox may never reach, such as `*.internal.example`. Beats every allowance in every mode: not resolved, not connected to. Repeatable. |
 | `--allow-cidr <CIDR>` | Destination permitted at L3, bypassing the egress proxy. Repeatable. |
 | `--allow-port <PORT>` | Port the `--allow-cidr` allowance is limited to. Repeatable. |
-| `--deny-cidr <CIDR>` | Range the sandbox may never reach, in any mode. Repeatable. |
+| `--deny-cidr <CIDR>` | IPv4 or IPv6 range the sandbox may never reach, in any mode. Repeatable. |
+| `--deny-port <SPEC>` | Destination port the sandbox may never connect to, in any mode, as `[tcp/\|udp/]PORT[-END][@CIDR,...]`: `tcp/25`, `tcp/465-587`, `5432@10.0.0.0/8`. No protocol means both; no CIDR means every destination, over IPv4 and IPv6. Repeatable. See [Denied ports](FIREWALL.md#denied-ports). |
+| `--deny-ipv6` | Refuse every IPv6 destination, in any mode. Without it each mode keeps its own [IPv6 behaviour](FIREWALL.md#ipv6). |
 | `--inspect-tls` | Terminate the sandbox's TLS so the host inside the session is checked. Requires `--net allowlist`. |
 | `--inject-header <DOMAIN:NAME=VALUE>` | Credential the host adds to every request for a domain. Requires `--inspect-tls`. Repeatable. |
 | `--rule <JSON>` | Rule for inspected requests: a domain, an optional `match`, and either `setHeaders` or `forward`. Requires `--inspect-tls`. Evaluated in order, and before every `--inject-header`. Repeatable. |
@@ -287,6 +289,13 @@ nothing satisfies, never a placement somewhere else.
 ```sh
 burrow create --node-label rack=b7 --node-label tier=dedicated
 ```
+
+Each sandbox is promised its whole scratch disk (1 GiB unless its policy says
+otherwise), even though the disk takes space only as the guest writes it. A
+create that no node has room for is refused with `ResourceExhausted`, naming the
+node closest to fitting and how much free disk it lacked; a node refusing it
+itself names the node and the shortfall the same way. See
+[placement](ARCHITECTURE.md#disk).
 
 The network options are the same group [`config
 network-policy`](#config-network-policy) takes, so a policy means the same thing
@@ -887,6 +896,10 @@ This is not `docker stop`. Nothing inside the guest is signalled and no process
 exits: the VM's memory is written to disk and the machine is frozen, so a
 process mid-write is still mid-write when you start it again.
 
+A sandbox is reported suspended only once its memory image, its device state
+and its disks are synced to the node's disk, so a power cut after `stop`
+returns does not lose or tear what it wrote.
+
 Each id is attempted. A failure is reported and the rest still run, and the CLI
 exits nonzero if any of them failed.
 
@@ -1045,6 +1058,9 @@ burrow snapshot rm snap_c53d56f0c90c44979070dd02e95801df
 | `snapshot create <ID>` | Save the sandbox's state. The sandbox keeps running. Same as [`commit`](#commit). |
 | `snapshot ls [<ID>]` | List snapshots, newest first. Naming a sandbox lists only its own. |
 | `snapshot rm <SNAPSHOT>...` | Delete snapshots, freeing their disk on the node holding them. |
+
+A snapshot is reported taken only once every file in it, its manifest included,
+is synced to the node's disk.
 
 A sandbox created with `--snapshot` restores rather than boots, and takes its
 template and machine shape from the snapshot, so `--template`, `--vcpus` and
@@ -1729,10 +1745,16 @@ burrow token issue --op files:read --ttl 600 sbx_2f0c
 ### token revoke
 
 Refuse every token issued for a sandbox so far, end the sessions they opened,
-and kill the commands those started.
+and kill the commands they started or typed into. A token issued after the
+revoke works, even within the same second.
 
 ```
 burrow token revoke <ID>
+```
+
+```sh
+burrow token revoke sbx_2f0c
+# revoked every token for sbx_2f0c issued by 2026-10-28T09:15:00Z; ended 2 open session(s) and killed 3 command(s)
 ```
 
 ## secret
@@ -1886,13 +1908,20 @@ burrow nodes ls
 
 ```sh
 burrow nodes ls
-# NODE     ADDRESS     CPUS  MEM_MIB  FREE_MIB  SBX  STATE  LABELS                  HOSTNAME
-# node_a   node:7071      4     7922      7375    1  ready  rack=a1,tier=general    4f09e04420c7
-# node_b   node2:7071     4     7922      7139    4  ready  rack=b7,tier=dedicated  b427c731a9e9
+# NODE     ADDRESS     CPUS  MEM_MIB  FREE_MIB              DISK  SBX  STATE     LABELS                  HOSTNAME
+# node_a   node:7071      4     7922      7375         61.3/98G    1  ready     rack=a1,tier=general    4f09e04420c7
+# node_b   node2:7071     4     7922      7139       3.9/98G LOW    4  disk-low  rack=b7,tier=dedicated  b427c731a9e9
 ```
 
 A node the orchestrator has not heard from recently shows as `stale`, and one you
 have drained shows as `draining`.
+
+`DISK` is free over total GiB on the node's data directory, or `-` for a node
+that does not report it. A node whose free disk has fallen below its reserve
+(`burrowd serve --disk-reserve-mib`, 5% of the filesystem by default) while it
+runs sandboxes shows `LOW` there and `disk-low` as its state. It refuses
+creates, resumes and adopts until disk is freed, and its guests' writes may
+start failing; delete snapshots or sandboxes on it, or move sandboxes off it.
 
 `LABELS` is what the operator started that node with, as
 `burrowd serve --label rack=b7` or `BURROW_NODE_LABELS=rack=b7,tier=dedicated`.

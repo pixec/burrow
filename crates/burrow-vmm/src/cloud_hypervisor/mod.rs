@@ -490,13 +490,7 @@ impl ChVm {
             .call(
                 Method::PUT,
                 "/api/v1/vm.add-disk",
-                Some(&json!({
-                    "id": drive.id,
-                    "path": drive.path,
-                    "readonly": drive.is_read_only,
-                    "image_type": "Raw",
-                    "serial": drive.id,
-                })),
+                Some(&config::disk(drive)),
             )
             .await
             .map(|_| ())

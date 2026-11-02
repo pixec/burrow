@@ -1,6 +1,7 @@
 pub mod access;
 pub mod auth;
 pub mod cmdlog;
+pub mod disk;
 pub mod edge;
 pub mod glob;
 pub mod tags;
@@ -115,6 +116,14 @@ pub fn unix_now() -> i64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs() as i64)
+        .unwrap_or(0)
+}
+
+/// Milliseconds since the epoch, now.
+pub fn unix_now_ms() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as i64)
         .unwrap_or(0)
 }
 
