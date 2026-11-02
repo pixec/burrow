@@ -61,14 +61,19 @@ pub async fn run(mut inbound: Streaming<guestpb::ExecInput>) -> Result<OutputRx,
 
     // Resolved before anything is spawned: a command asked to run as a user
     // who does not exist must fail as a request, not as a broken child.
-    let credentials = if start.user.is_empty() {
+    #[cfg_attr(not(target_os = "macos"), allow(unused_mut))]
+    let mut credentials = if start.user.is_empty() {
         None
     } else {
         Some(users::credentials(&start.user)?)
     };
+    #[cfg(target_os = "macos")]
+    if let Some(creds) = &mut credentials {
+        creds.gui_session = crate::macos::session::gui_session(creds.uid);
+    }
 
-    let mut command = std::process::Command::new(&start.cmd[0]);
-    command.args(&start.cmd[1..]);
+    let mut command = new_command(&start, credentials.as_ref())
+        .map_err(|err| spawn_failed(&start.cmd[0], err))?;
     if start.is_env_cleared {
         command.env_clear();
     }
@@ -111,6 +116,23 @@ pub async fn run(mut inbound: Streaming<guestpb::ExecInput>) -> Result<OutputRx,
     }
 }
 
+/// The program `start` names, with its arguments. On macOS a user logged in
+/// at the console gets it through `launchctl asuser`; see
+/// [`crate::macos::session`].
+fn new_command(
+    start: &guestpb::ExecStart,
+    credentials: Option<&users::Credentials>,
+) -> std::io::Result<std::process::Command> {
+    #[cfg(target_os = "macos")]
+    if let Some(creds) = credentials.filter(|creds| creds.gui_session.is_some()) {
+        return crate::macos::session::command(start, creds.uid);
+    }
+    let _ = credentials;
+    let mut command = std::process::Command::new(&start.cmd[0]);
+    command.args(&start.cmd[1..]);
+    Ok(command)
+}
+
 /// Makes the child run as `credentials`.
 ///
 /// Done in a `pre_exec` rather than through `CommandExt::uid`/`gid`, because
@@ -118,15 +140,29 @@ pub async fn run(mut inbound: Streaming<guestpb::ExecInput>) -> Result<OutputRx,
 /// *after* it has already dropped to the target uid, by which point
 /// `setgroups` is no longer permitted. Order matters for the same reason:
 /// groups, then gid, then uid, each while there is still privilege to do it.
+///
+/// On macOS the groups go in through initgroups(2), so a user in more than
+/// the 16 a credential holds keeps the rest, and a user logged in at the
+/// console joins their login's audit session first, while still root.
 fn drop_privileges(command: &mut std::process::Command, credentials: &users::Credentials) {
     use std::os::unix::process::CommandExt;
 
     let groups = credentials.groups.clone();
     let (uid, gid) = (credentials.uid, credentials.gid);
+    #[cfg(target_os = "macos")]
+    let session = credentials.gui_session;
     // SAFETY: runs between fork and exec, so only async-signal-safe calls.
     // These are all bare syscalls.
     unsafe {
         command.pre_exec(move || {
+            #[cfg(target_os = "macos")]
+            {
+                if let Some(asid) = session {
+                    crate::macos::session::join(asid)?;
+                }
+                crate::unix::darwin::initgroups(&groups, uid)?;
+            }
+            #[cfg(target_os = "linux")]
             if nix::libc::setgroups(groups.len() as _, groups.as_ptr()) < 0 {
                 return Err(std::io::Error::last_os_error());
             }

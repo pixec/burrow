@@ -39,7 +39,8 @@
 //! | Verdict | Here | On Linux |
 //! | --- | --- | --- |
 //! | `Proxy` (allowlist, TCP 80/443) | [`Proxy::serve_stream`]: SNI/Host allowlist, pinning, TLS inspection, request rules, credentials | nftables redirect to the same proxy |
-//! | `Direct` (open mode, `allow_cidrs`/`allow_ports`, peers) | a host socket dialled to the destination, spliced | forward chain accept, masquerade |
+//! | `Direct` (open mode, `allow_cidrs`/`allow_ports`) | a host socket dialled to the destination, spliced | forward chain accept, masquerade |
+//! | `Direct` to a peer | [`Router`]: the packet itself, to the peer's stack or over the [`Mesh`] | forward chain accept, routed to the peer's tap or `burrow-wg` |
 //! | `Host` (the resolver, gateway ping) | answered in the stack | `tohost` accept |
 //! | `Deny` | reset (TCP) or dropped (UDP), audited | chain drop |
 //!
@@ -51,6 +52,21 @@
 //! The policy is a [`watch`] channel; a new value applies to the next flow,
 //! and a direct flow the new policy denies is reset there and then, the way
 //! the Linux path flushes conntrack after re-rendering.
+//!
+//! # Private networks
+//!
+//! A packet for another sandbox's address goes to the node's [`Router`]
+//! rather than into smoltcp: unterminated, its TTL spent, to the stack
+//! serving that address or, for an address in another node's slice, through
+//! the userspace WireGuard [`Mesh`] that speaks to the Linux nodes' kernel
+//! one. A new flow is decided by [`crate::policy::decide_peer`], the sender's
+//! own [`crate::policy::decide`] (so in allowlist mode a peer is decided
+//! ahead of the 80/443 proxy redirect) and the receiver's
+//! [`crate::policy::decide_ingress`], and then tracked both ways as conntrack
+//! would. A policy change re-decides every tracked flow and resets the TCP
+//! ends of any it now denies. Nothing outside the sandbox pool is ever routed.
+//! `.internal` names are answered by the resolver from the same directory
+//! the node builds the peers from.
 //!
 //! # Audit
 //!
@@ -83,6 +99,9 @@
 //!   proxy's table, plus the record's `allow_cidrs`, `allow_ports` and peers,
 //!   and `send_replace` it wherever the daemon re-syncs the firewall.
 //! - `ExposePort` is [`Handle::publish`] with a listener on the host port.
+//! - One [`Router`] per node, in its [`Node`]; [`Mesh::start`] joins it to
+//!   the node mesh with the node's WireGuard key, and [`Mesh::configure`]
+//!   takes the same peer list a Linux node's `burrow-wg` is given.
 //! - One [`Meter`] per sandbox, kept across its VMs, counts the bytes the
 //!   guest's NIC carries; read it into the sandbox's totals on every sample.
 //! - Drop the [`Handle`] when the VM stops. Nothing of the stack is saved in
@@ -95,8 +114,6 @@
 //! # Not supported yet
 //!
 //! - IPv6 of any kind beyond dropping it, so open-mode v6 egress is missing.
-//! - Private networks between sandboxes: each stack is its own island, so
-//!   `peers` can only reach addresses the node itself routes to.
 //! - ICMP beyond echo to the gateway, and IP fragments from the guest.
 //! - TCP to the resolver: Linux does not admit it either.
 //! - Link-local destinations (the metadata address among them) never reach
@@ -104,9 +121,11 @@
 //!   unanswered. Denied either way, but unaudited.
 
 mod conn;
+mod router;
 mod stack;
 mod udp;
 mod wire;
+pub mod wireguard;
 
 #[cfg(test)]
 mod tests;
@@ -127,8 +146,10 @@ use crate::ipam::Lease;
 use crate::policy::Rules;
 
 pub use conn::GuestConn;
+pub use router::{MESH_MSS, Router, Uplink};
 pub use stack::Handle;
 pub use wire::GATEWAY_MAC;
+pub use wireguard::Mesh;
 
 /// The guest's side of its link.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -208,6 +229,9 @@ pub struct Node {
     pub directory: Arc<Directory>,
     /// Where allowed queries are forwarded.
     pub dns_upstream: SocketAddr,
+    /// Carries private-network traffic between this node's sandboxes, and
+    /// onto the mesh.
+    pub router: Arc<Router>,
 }
 
 /// Bytes on the guest's link, counted as IP packets the way the Linux

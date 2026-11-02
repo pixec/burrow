@@ -69,11 +69,24 @@ class TemplateBuilder:
     def __init__(self) -> None:
         self._base = "default"
         self._image = ""
+        self._ipsw = ""
         self._steps: List[str] = []
 
     def from_template(self, name: str) -> "TemplateBuilder":
         """Sets the burrow template to start from. Defaults to `"default"`."""
         self._base = name
+        self._image = ""
+        self._ipsw = ""
+        return self
+
+    def from_ipsw(self, source: str) -> "TemplateBuilder":
+        """Installs macOS from a restore image on a Mac node: a path on that
+        node, or `"latest"`, which the node downloads from Apple and keeps.
+
+        The template runs under `vz` and takes no steps; build on it with
+        `from_template` to add some.
+        """
+        self._ipsw = source
         self._image = ""
         return self
 
@@ -87,6 +100,7 @@ class TemplateBuilder:
         handling) does.
         """
         self._image = reference
+        self._ipsw = ""
         return self
 
     def run_cmd(self, *commands: str) -> "TemplateBuilder":
@@ -157,11 +171,18 @@ class TemplateBuilder:
             name=name,
             # An OCI base takes the place of a template base; sending both
             # would leave the node to guess which was meant.
-            **{"from": "" if self._image else self._base},
+            **{"from": "" if self._image or self._ipsw else self._base},
             from_image=self._image,
+            from_ipsw=self._ipsw,
             steps=[api_pb2.BuildStep(run=step) for step in self._steps],
-            vcpus=options.get("cpu_count") or 1,
-            mem_mib=options.get("memory_mib") or 1024,
+            # Zero is the node's default for the guest being built: 1 vCPU
+            # and 1024 MiB for Linux, the restore image's minimum for macOS.
+            vcpus=options.get("cpu_count") or 0,
+            mem_mib=options.get("memory_mib") or 0,
+            # "firecracker", "cloud-hypervisor" or "vz"; empty is the base's.
+            hypervisor=options.get("hypervisor") or "",
+            # The installed macOS disk for `from_ipsw`, in MiB.
+            disk_mib=options.get("disk_mib") or 0,
             # Omitted means unrestricted, because a build that installs
             # packages needs the network by definition.
             allow_domains=options.get("allow_domains") or [],

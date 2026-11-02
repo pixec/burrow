@@ -405,6 +405,11 @@ pub struct VmSpec {
     /// cgroup2 mount point; `None` disables limit enforcement.
     pub cgroup_root: Option<PathBuf>,
     pub is_limits_required: bool,
+    /// Puts a Cloud Hypervisor guest's console on a socket the caller holds,
+    /// so it takes input the way Firecracker's does on its stdin. For the dev
+    /// harness: output reaches the console log only while the VM's handle is
+    /// alive to copy it there.
+    pub is_console_interactive: bool,
 }
 
 impl VmSpec {
@@ -430,6 +435,7 @@ impl VmSpec {
             limits: Limits::default(),
             cgroup_root: Some(PathBuf::from("/sys/fs/cgroup")),
             is_limits_required: false,
+            is_console_interactive: false,
         }
     }
 
@@ -562,8 +568,7 @@ impl Vm {
     pub async fn console_write(&mut self, input: &str) -> Result<()> {
         match self {
             Self::Firecracker(vm) => Ok(vm.console_write(input).await?),
-            // Its console goes to a file, with no input side to write to.
-            Self::CloudHypervisor(_) => Err(Error::ConsoleUnavailable),
+            Self::CloudHypervisor(vm) => vm.console_write(input).await,
             #[cfg(target_os = "macos")]
             Self::Vz(_) => Err(Error::ConsoleUnavailable),
         }

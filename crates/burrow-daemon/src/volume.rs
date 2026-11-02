@@ -17,6 +17,11 @@
 //! holders and the next sandbox can take it. Claims live in memory, which is
 //! what makes a node restart release them, and is correct because nothing is
 //! touching the image while no VM is running.
+//!
+//! A writer that goes without unmounting, deleted, stopped, crashed or killed
+//! with the node, leaves its last writes in the journal. A reader cannot
+//! replay that, since its disk is read-only, so the node does before the
+//! reader attaches: see [`VolumeStore::prepare`].
 
 #![allow(clippy::result_large_err)]
 
@@ -40,7 +45,15 @@ pub const MIN_SIZE_MIB: u64 = 1;
 pub const FIRST_DEVICE: u8 = b'c';
 pub const MAX_MOUNTS: usize = 8;
 
+#[cfg(not(target_os = "macos"))]
 const IMAGE: &str = "volume.ext4";
+/// On a Mac a volume is a raw image the size of the volume, sparse until
+/// written, which the macOS guest formats journaled HFS+ on its first mount:
+/// macOS mounts no ext4. Not a shared directory over virtio-fs, which a
+/// guest presents as a network volume and TCC keeps the agent out of without
+/// an MDM grant.
+#[cfg(target_os = "macos")]
+const IMAGE: &str = "volume.img";
 const META: &str = "volume.json";
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -51,6 +64,11 @@ pub struct Meta {
     pub created_at: String,
     #[serde(default)]
     pub labels: HashMap<String, String>,
+    /// The guest OS whose filesystem the image holds, from the first
+    /// writable mount: ext4 from a Linux guest, NTFS from a Windows one,
+    /// HFS+ from a macOS one. Empty until then.
+    #[serde(default)]
+    pub guest_os: String,
 }
 
 /// Who currently holds one volume.
@@ -70,6 +88,11 @@ struct Claim {
     /// is put back the moment the claim goes, which makes the grant last
     /// exactly as long as the mount: see [`VolumeStore::remember_owner`].
     restore_owner: Option<(u32, u32)>,
+    /// Readers attached over a journal nobody could replay, because a
+    /// suspended writer still has the filesystem mounted. Replaying under
+    /// them would move the disk beneath their caches, so it waits for them to
+    /// go.
+    is_stale: bool,
 }
 
 impl Claim {
@@ -90,6 +113,10 @@ impl Claim {
 pub struct VolumeStore {
     root: PathBuf,
     claims: Arc<Mutex<HashMap<String, Claim>>>,
+    /// Held across [`Self::prepare`], so a reader whose claim arrived while
+    /// another was replaying the journal waits for the replay, and finds the
+    /// image clean.
+    preparing: Arc<tokio::sync::Mutex<()>>,
 }
 
 impl VolumeStore {
@@ -97,6 +124,7 @@ impl VolumeStore {
         Self {
             root: data_dir.join("volumes"),
             claims: Arc::new(Mutex::new(HashMap::new())),
+            preparing: Arc::default(),
         }
     }
 
@@ -131,8 +159,16 @@ impl VolumeStore {
 
         // Built beside the destination and renamed, so a failed mkfs never
         // leaves a half-written image where a mountable one is expected.
-        let pending = dir.join("volume.ext4.building");
+        let pending = dir.join(format!("{IMAGE}.building"));
         let _ = tokio::fs::remove_file(&pending).await;
+        #[cfg(target_os = "macos")]
+        tokio::fs::File::create(&pending)
+            .await
+            .map_err(|err| Status::internal(format!("volume image: {err}")))?
+            .set_len(size_mib << 20)
+            .await
+            .map_err(|err| Status::internal(format!("volume image: {err}")))?;
+        #[cfg(not(target_os = "macos"))]
         crate::template::run(
             "mkfs.ext4",
             &[
@@ -153,17 +189,22 @@ impl VolumeStore {
             size_mib,
             created_at: burrow_common::now_rfc3339(),
             labels,
+            guest_os: String::new(),
         };
-        let json = serde_json::to_vec_pretty(&meta)
-            .map_err(|err| Status::internal(format!("volume metadata: {err}")))?;
-        tokio::fs::write(dir.join(META), json)
-            .await
-            .map_err(|err| Status::internal(format!("writing volume metadata: {err}")))?;
+        self.write_meta(&meta).await?;
         tokio::fs::rename(&pending, dir.join(IMAGE))
             .await
             .map_err(|err| Status::internal(format!("publishing volume: {err}")))?;
 
         Ok(self.to_proto(&meta))
+    }
+
+    async fn write_meta(&self, meta: &Meta) -> Result<(), Status> {
+        let json = serde_json::to_vec_pretty(meta)
+            .map_err(|err| Status::internal(format!("volume metadata: {err}")))?;
+        tokio::fs::write(self.dir(&meta.name).join(META), json)
+            .await
+            .map_err(|err| Status::internal(format!("writing volume metadata: {err}")))
     }
 
     pub async fn meta(&self, name: &str) -> Result<Meta, Status> {
@@ -284,6 +325,73 @@ impl VolumeStore {
         Ok(())
     }
 
+    /// Readies the images a claim was just taken on, before anything attaches
+    /// them: holds each volume to one guest OS, and replays the journal a
+    /// departed writer left in one about to be read.
+    ///
+    /// Done here rather than when the writer goes, because a writer can go
+    /// without anyone being told: a VMM killed with the node, or one that
+    /// crashed, leaves a journal exactly as a delete does. So the image says
+    /// whether it needs it, and nothing has to have been recorded. A writer
+    /// that unmounted cleanly left nothing, and costs a read of one block.
+    ///
+    /// `dormant` names the volumes a suspended sandbox has mounted writable.
+    /// Its guest still has the filesystem mounted and will resume onto it,
+    /// so the journal is its own: a reader of one of those sees what that
+    /// writer had written back to the filesystem, and nothing it had only
+    /// journaled.
+    ///
+    /// The claim is already held, so no writer can take the volume while
+    /// this runs; on an error the caller gives the claims back.
+    pub async fn prepare(
+        &self,
+        mounts: &[common::VolumeMount],
+        guest_os: &str,
+        dormant: &std::collections::HashSet<String>,
+    ) -> Result<(), Status> {
+        let _held = self.preparing.lock().await;
+        for (_, mount) in block_mounts(mounts) {
+            let name = &mount.volume;
+            let mut meta = self.meta(name).await?;
+            let image = self.image(name);
+            if meta.guest_os.is_empty()
+                && let Some(made_by) = ondisk::made_by(&image).await
+            {
+                meta.guest_os = made_by.to_string();
+            }
+            if !meta.guest_os.is_empty() && meta.guest_os != guest_os {
+                return Err(Status::failed_precondition(format!(
+                    "volume {name} holds the filesystem a {} guest made ({}), which a {guest_os} \
+                     guest cannot mount",
+                    meta.guest_os,
+                    filesystem(&meta.guest_os)
+                )));
+            }
+            if !mount.is_read_only {
+                meta.guest_os = guest_os.to_string();
+                self.write_meta(&meta).await?;
+                continue;
+            }
+            if !ondisk::is_needed(&image, &meta.guest_os).await {
+                continue;
+            }
+            if let Some(claim) = self.claims.lock().unwrap().get_mut(name)
+                && (claim.is_stale || dormant.contains(name))
+            {
+                claim.is_stale = true;
+                continue;
+            }
+            tracing::info!(volume = name, "replaying the journal a writer left");
+            ondisk::run(&image).await.map_err(|err| {
+                Status::failed_precondition(format!(
+                    "volume {name} has a journal its last writer left, and replaying it \
+                     failed ({err}); mount it writable once to let the guest recover it"
+                ))
+            })?;
+        }
+        Ok(())
+    }
+
     /// Records who owns a volume's image before a jailed sandbox writes to it.
     ///
     /// Called with the claim already taken, so the owner recorded is the one
@@ -385,6 +493,216 @@ impl VolumeStore {
             attached_to: self.holder(&meta.name).unwrap_or_default(),
             labels: meta.labels.clone(),
         }
+    }
+}
+
+/// What a guest OS formats a volume with, for messages.
+fn filesystem(guest_os: &str) -> &'static str {
+    match guest_os {
+        "windows" => "NTFS",
+        "macos" => "HFS+",
+        _ => "ext4",
+    }
+}
+
+/// What a guest left on an image, read by the node, and journals replayed
+/// with the filesystem's own userland checker rather than by mounting the
+/// image in the node's kernel: the image is whatever a guest wrote, and a
+/// crafted one is a parser bug away from the host.
+mod ondisk {
+    use std::path::Path;
+
+    use tokio::io::{AsyncReadExt as _, AsyncSeekExt as _};
+
+    async fn read_at(path: &Path, offset: u64, len: usize) -> Option<Vec<u8>> {
+        let mut file = tokio::fs::File::open(path).await.ok()?;
+        file.seek(std::io::SeekFrom::Start(offset)).await.ok()?;
+        let mut buf = vec![0; len];
+        file.read_exact(&mut buf).await.ok()?;
+        Some(buf)
+    }
+
+    /// Whether the image holds a journal a reader would have to replay.
+    ///
+    /// NTFS is never replayed here: no tool replays its log outside
+    /// Windows, so a Windows reader relies on the writer's guest having
+    /// flushed it.
+    /// A volume with no OS recorded predates the record, and is the node's
+    /// own kind.
+    pub async fn is_needed(image: &Path, guest_os: &str) -> bool {
+        let is_hfs = match guest_os {
+            "windows" => return false,
+            "macos" => true,
+            "linux" => false,
+            _ => cfg!(target_os = "macos"),
+        };
+        if !is_hfs {
+            return read_at(image, 1024, 1024)
+                .await
+                .is_some_and(|superblock| is_ext4_dirty(&superblock));
+        }
+        let Some(start) = read_at(image, 0, GPT_BYTES)
+            .await
+            .and_then(|gpt| hfs_partition_offset(&gpt))
+        else {
+            return false;
+        };
+        read_at(image, start + 1024, 512)
+            .await
+            .is_some_and(|header| is_hfs_dirty(&header))
+    }
+
+    /// The guest OS whose filesystem an image holds, for a volume that
+    /// predates the record of it: an ext4 that has been mounted, or HFS+.
+    /// What a node makes at create is an ext4 nobody has mounted, which any
+    /// guest may take.
+    pub async fn made_by(image: &Path) -> Option<&'static str> {
+        if read_at(image, 1024, 1024)
+            .await
+            .is_some_and(|superblock| is_used_ext4(&superblock))
+        {
+            return Some("linux");
+        }
+        let start = hfs_partition_offset(&read_at(image, 0, GPT_BYTES).await?)?;
+        let header = read_at(image, start + 1024, 2).await?;
+        matches!(&header[..], b"H+" | b"HX").then_some("macos")
+    }
+
+    fn is_ext4(superblock: &[u8]) -> bool {
+        superblock.len() >= 0x64
+            && u16::from_le_bytes([superblock[0x38], superblock[0x39]]) == 0xef53
+    }
+
+    /// An ext4 with a last-mount time.
+    pub fn is_used_ext4(superblock: &[u8]) -> bool {
+        is_ext4(superblock) && superblock[0x2c..0x30] != [0; 4]
+    }
+
+    /// ext4 sets `needs_recovery` in its superblock while mounted and clears
+    /// it on a clean unmount.
+    pub fn is_ext4_dirty(superblock: &[u8]) -> bool {
+        const INCOMPAT_RECOVER: u32 = 0x4;
+        is_ext4(superblock)
+            && u32::from_le_bytes(superblock[0x60..0x64].try_into().unwrap()) & INCOMPAT_RECOVER
+                != 0
+    }
+
+    /// The protective MBR, the GPT header and the first 128 entries.
+    pub const GPT_BYTES: usize = 512 * 34;
+
+    /// Where the HFS+ partition starts in a disk the macOS guest formatted
+    /// (`diskutil eraseDisk JHFS+ ... GPT`), which puts an EFI partition
+    /// before it on a large disk and none on a small one.
+    pub fn hfs_partition_offset(disk: &[u8]) -> Option<u64> {
+        // 48465300-0000-11AA-AA11-00306543ECAC, as GPT stores it.
+        const HFS: [u8; 16] = [
+            0x00, 0x53, 0x46, 0x48, 0x00, 0x00, 0xaa, 0x11, 0xaa, 0x11, 0x00, 0x30, 0x65, 0x43,
+            0xec, 0xac,
+        ];
+        let header = disk.get(512..512 + 92)?;
+        if &header[..8] != b"EFI PART" {
+            return None;
+        }
+        let entries = u64::from_le_bytes(header[72..80].try_into().ok()?);
+        let count = u32::from_le_bytes(header[80..84].try_into().ok()?) as usize;
+        let size = u32::from_le_bytes(header[84..88].try_into().ok()?) as usize;
+        let base = usize::try_from(entries).ok()?.checked_mul(512)?;
+        (0..count).find_map(|index| {
+            let entry = disk.get(base + index * size..base + index * size + 40)?;
+            (entry[..16] == HFS).then(|| u64::from_le_bytes(entry[32..40].try_into().unwrap()) * 512)
+        })
+    }
+
+    /// HFS+ clears `kHFSVolumeUnmountedBit` in its volume header while
+    /// mounted and sets it again on a clean unmount.
+    pub fn is_hfs_dirty(header: &[u8]) -> bool {
+        const UNMOUNTED: u32 = 1 << 8;
+        header.len() >= 8
+            && matches!(&header[..2], b"H+" | b"HX")
+            && u32::from_be_bytes(header[4..8].try_into().unwrap()) & UNMOUNTED == 0
+    }
+
+    /// `e2fsck -E journal_only`: replays the journal and checks nothing
+    /// else. Exit 1 is "corrected", which a replay is.
+    #[cfg(not(target_os = "macos"))]
+    pub async fn run(image: &Path) -> Result<(), String> {
+        let output = tokio::process::Command::new("e2fsck")
+            .args(["-p", "-E", "journal_only"])
+            .arg(image)
+            .output()
+            .await
+            .map_err(|err| format!("e2fsck: {err}"))?;
+        match output.status.code() {
+            Some(0 | 1) => Ok(()),
+            _ => Err(format!(
+                "e2fsck {}: {}",
+                output.status,
+                String::from_utf8_lossy(&output.stderr).trim()
+            )),
+        }
+    }
+
+    /// `fsck_hfs -p`, which on a journaled volume replays the journal and
+    /// checks nothing else, on the image attached without mounting it.
+    #[cfg(target_os = "macos")]
+    pub async fn run(image: &Path) -> Result<(), String> {
+        let output = tokio::process::Command::new("/usr/bin/hdiutil")
+            .args([
+                "attach",
+                "-imagekey",
+                "diskimage-class=CRawDiskImage",
+                "-nomount",
+                "-noverify",
+            ])
+            .arg(image)
+            .output()
+            .await
+            .map_err(|err| format!("hdiutil: {err}"))?;
+        if !output.status.success() {
+            return Err(format!(
+                "hdiutil attach {}: {}",
+                output.status,
+                String::from_utf8_lossy(&output.stderr).trim()
+            ));
+        }
+        let listing = String::from_utf8_lossy(&output.stdout);
+        let Some(disk) = listing.split_whitespace().next().map(str::to_string) else {
+            return Err("hdiutil attach named no disk".into());
+        };
+        let checked = match attached_hfs(&listing) {
+            Some(partition) => {
+                let raw = partition.replacen("/dev/disk", "/dev/rdisk", 1);
+                let output = tokio::process::Command::new("/sbin/fsck_hfs")
+                    .args(["-p", &raw])
+                    .output()
+                    .await
+                    .map_err(|err| format!("fsck_hfs: {err}"))?;
+                match output.status.success() {
+                    true => Ok(()),
+                    false => Err(format!(
+                        "fsck_hfs {}: {}",
+                        output.status,
+                        String::from_utf8_lossy(&output.stdout).trim()
+                    )),
+                }
+            }
+            None => Err(format!("{disk} has no HFS+ partition")),
+        };
+        let _ = tokio::process::Command::new("/usr/bin/hdiutil")
+            .args(["detach", &disk])
+            .output()
+            .await;
+        checked
+    }
+
+    /// The HFS+ partition in what `hdiutil attach` printed.
+    #[cfg(target_os = "macos")]
+    fn attached_hfs(listing: &str) -> Option<String> {
+        listing
+            .lines()
+            .find(|line| line.contains("Apple_HFS") || line.contains("48465300-0000-11AA"))
+            .and_then(|line| line.split_whitespace().next())
+            .map(str::to_string)
     }
 }
 
@@ -528,12 +846,33 @@ pub fn block_mounts(
     mounts.iter().filter(|mount| !mount.is_tmpfs).enumerate()
 }
 
+/// The drive id of a macOS or Windows guest's volume, which becomes its
+/// disk's identifier on a Mac (`burrow_vmm::vz::VOLUME_DISK_PREFIX`) and its
+/// virtio serial number under Cloud Hypervisor.
+pub fn disk_id(index: usize) -> String {
+    format!("burrow-volume{index}")
+}
+
+/// The drive id a volume is attached under. A Linux guest finds its volumes
+/// by device name, so its drives keep the ids its snapshots were taken with.
+pub fn drive_id(index: usize, guest_os: burrow_vmm::GuestOs) -> String {
+    match guest_os {
+        burrow_vmm::GuestOs::Linux => format!("volume{index}"),
+        _ => disk_id(index),
+    }
+}
+
 /// What the guest is told: devices rather than volume names, since the name is
-/// a host-side handle and the guest only has the block device.
+/// a host-side handle and the guest only has the block device. A macOS or
+/// Windows guest is told the disk's identifier instead, since it names disks
+/// in the order it finds them.
 ///
 /// The order here must be the order the drives were attached, which is why
 /// both come from the same slice.
-pub fn agent_mounts(mounts: &[common::VolumeMount]) -> Vec<burrow_proto::guest::v1::VolumeMount> {
+pub fn agent_mounts(
+    mounts: &[common::VolumeMount],
+    guest_os: burrow_vmm::GuestOs,
+) -> Vec<burrow_proto::guest::v1::VolumeMount> {
     let mut block = 0;
     mounts
         .iter()
@@ -542,7 +881,10 @@ pub fn agent_mounts(mounts: &[common::VolumeMount]) -> Vec<burrow_proto::guest::
                 String::new()
             } else {
                 block += 1;
-                device_for(block - 1)
+                match guest_os {
+                    burrow_vmm::GuestOs::Linux => device_for(block - 1),
+                    _ => disk_id(block - 1),
+                }
             };
             burrow_proto::guest::v1::VolumeMount {
                 device,
@@ -650,6 +992,21 @@ mod tests {
         assert!(validate_mounts(&[sized]).is_err());
     }
 
+    /// A Mac's volume is an image as large as asked for that takes no disk
+    /// until the guest writes to it.
+    #[cfg(target_os = "macos")]
+    #[tokio::test]
+    async fn a_mac_volume_is_a_sparse_image_of_its_size() {
+        use std::os::unix::fs::MetadataExt as _;
+        let dir = std::env::temp_dir().join(format!("burrow-volume-{}", std::process::id()));
+        let store = VolumeStore::new(&dir);
+        store.create("v", 64, HashMap::new()).await.unwrap();
+        let meta = std::fs::metadata(store.image("v")).unwrap();
+        assert_eq!(meta.len(), 64 << 20);
+        assert!(meta.blocks() * 512 < 1 << 20);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
     /// A tmpfs takes no drive, so the volumes around it keep the devices they
     /// would have had without it.
     #[test]
@@ -659,7 +1016,7 @@ mod tests {
             tmpfs("/scratch", 256, "1777"),
             mount("b", "/b", true),
         ];
-        let agent = agent_mounts(&mounts);
+        let agent = agent_mounts(&mounts, burrow_vmm::GuestOs::Linux);
         assert_eq!(agent[0].device, "/dev/vdc");
         assert_eq!(agent[1].device, "");
         assert!(agent[1].is_tmpfs);
@@ -667,6 +1024,13 @@ mod tests {
         assert_eq!(agent[1].mode, "1777");
         assert_eq!(agent[2].device, "/dev/vdd");
         assert!(agent[2].is_read_only);
+
+        // A Windows or macOS guest is told which of the disks after its own
+        // it is.
+        let mac = agent_mounts(&mounts, burrow_vmm::GuestOs::Windows);
+        assert_eq!(mac[0].device, disk_id(0));
+        assert_eq!(mac[1].device, "");
+        assert_eq!(mac[2].device, "burrow-volume1");
 
         let block: Vec<(usize, &str)> = block_mounts(&mounts)
             .map(|(index, mount)| (index, mount.volume.as_str()))
@@ -725,5 +1089,126 @@ mod tests {
                 .claim("sbx_d", &[mount("taken", "/t", false)])
                 .is_err()
         );
+    }
+
+    #[test]
+    fn a_mounted_ext4_or_hfs_is_seen_to_need_its_journal_replayed() {
+        let mut superblock = vec![0u8; 1024];
+        superblock[0x38..0x3a].copy_from_slice(&0xef53u16.to_le_bytes());
+        superblock[0x60..0x64].copy_from_slice(&0x2c2u32.to_le_bytes());
+        assert!(!ondisk::is_ext4_dirty(&superblock));
+        superblock[0x60..0x64].copy_from_slice(&0x2c6u32.to_le_bytes());
+        assert!(ondisk::is_ext4_dirty(&superblock));
+        // A blank image is not a filesystem with a journal.
+        assert!(!ondisk::is_ext4_dirty(&[0u8; 1024]));
+        // Made by the node, and never mounted: anyone's to take.
+        assert!(!ondisk::is_used_ext4(&superblock));
+        superblock[0x2c..0x30].copy_from_slice(&1_700_000_000u32.to_le_bytes());
+        assert!(ondisk::is_used_ext4(&superblock));
+
+        // Attributes as read off a volume while mounted and after unmounting.
+        let mut header = vec![0u8; 512];
+        header[..2].copy_from_slice(b"H+");
+        header[4..8].copy_from_slice(&0x8000_2000u32.to_be_bytes());
+        assert!(ondisk::is_hfs_dirty(&header));
+        header[4..8].copy_from_slice(&0x8000_2100u32.to_be_bytes());
+        assert!(!ondisk::is_hfs_dirty(&header));
+        assert!(!ondisk::is_hfs_dirty(&[0u8; 512]));
+    }
+
+    /// As `diskutil eraseDisk JHFS+ burrow-volume GPT` lays out a large disk:
+    /// an EFI partition, then HFS+.
+    #[test]
+    fn the_hfs_partition_is_found_in_the_gpt() {
+        let mut disk = vec![0u8; ondisk::GPT_BYTES];
+        disk[512..520].copy_from_slice(b"EFI PART");
+        disk[512 + 72..512 + 80].copy_from_slice(&2u64.to_le_bytes());
+        disk[512 + 80..512 + 84].copy_from_slice(&128u32.to_le_bytes());
+        disk[512 + 84..512 + 88].copy_from_slice(&128u32.to_le_bytes());
+        let efi = 1024;
+        disk[efi..efi + 4].copy_from_slice(&[0x28, 0x73, 0x2a, 0xc1]);
+        disk[efi + 32..efi + 40].copy_from_slice(&40u64.to_le_bytes());
+        assert_eq!(ondisk::hfs_partition_offset(&disk), None);
+        let hfs = efi + 128;
+        disk[hfs..hfs + 16].copy_from_slice(&[
+            0x00, 0x53, 0x46, 0x48, 0x00, 0x00, 0xaa, 0x11, 0xaa, 0x11, 0x00, 0x30, 0x65, 0x43,
+            0xec, 0xac,
+        ]);
+        disk[hfs + 32..hfs + 40].copy_from_slice(&409_640u64.to_le_bytes());
+        assert_eq!(ondisk::hfs_partition_offset(&disk), Some(409_640 * 512));
+        assert_eq!(ondisk::hfs_partition_offset(&[0u8; ondisk::GPT_BYTES]), None);
+    }
+
+    fn store_with(name: &str, image: &[u8]) -> (VolumeStore, PathBuf) {
+        let dir = std::env::temp_dir().join(format!(
+            "burrow-volume-{}-{name}",
+            std::process::id()
+        ));
+        let store = VolumeStore::new(&dir);
+        std::fs::create_dir_all(store.dir(name)).unwrap();
+        std::fs::write(store.image(name), image).unwrap();
+        let meta = Meta {
+            name: name.into(),
+            size_mib: 1,
+            created_at: String::new(),
+            labels: HashMap::new(),
+            guest_os: String::new(),
+        };
+        std::fs::write(
+            store.dir(name).join(META),
+            serde_json::to_vec(&meta).unwrap(),
+        )
+        .unwrap();
+        (store, dir)
+    }
+
+    /// The first writer decides what filesystem the volume holds, and a guest
+    /// that cannot mount it is refused before it boots.
+    #[tokio::test]
+    async fn a_volume_belongs_to_the_os_that_first_wrote_it() {
+        let (store, dir) = store_with("shared", &[0u8; 4096]);
+        let none = std::collections::HashSet::new();
+        let reader = [mount("shared", "/data", true)];
+        let writer = [mount("shared", "/data", false)];
+        // Reading binds nothing: a blank volume read by the wrong guest is
+        // refused in the guest, and stays usable by the right one.
+        store.prepare(&reader, "windows", &none).await.unwrap();
+        assert_eq!(store.meta("shared").await.unwrap().guest_os, "");
+        store.prepare(&writer, "linux", &none).await.unwrap();
+        assert_eq!(store.meta("shared").await.unwrap().guest_os, "linux");
+        store.prepare(&reader, "linux", &none).await.unwrap();
+        let err = store.prepare(&writer, "windows", &none).await.unwrap_err();
+        assert_eq!(err.code(), tonic::Code::FailedPrecondition);
+        assert!(err.message().contains("ext4"), "{}", err.message());
+        assert!(store.prepare(&reader, "windows", &none).await.is_err());
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// A suspended writer still has the filesystem mounted, so its journal is
+    /// left alone, and so is it for every reader that joins one already
+    /// reading past it.
+    #[tokio::test]
+    async fn a_journal_a_suspended_writer_holds_is_not_replayed() {
+        let mut image = vec![0u8; 4096];
+        image[1024 + 0x38..1024 + 0x3a].copy_from_slice(&0xef53u16.to_le_bytes());
+        image[1024 + 0x60..1024 + 0x64].copy_from_slice(&0x2c6u32.to_le_bytes());
+        let (store, dir) = store_with("held", &image);
+        let mut meta = store.meta("held").await.unwrap();
+        meta.guest_os = "linux".into();
+        store.write_meta(&meta).await.unwrap();
+        let reader = [mount("held", "/data", true)];
+        let dormant: std::collections::HashSet<String> = ["held".to_string()].into();
+
+        store.claim("sbx_a", &reader).unwrap();
+        store.prepare(&reader, "linux", &dormant).await.unwrap();
+        // The writer has gone since, but a reader is attached past its
+        // journal; the next one joins it rather than moving the disk.
+        store.claim("sbx_b", &reader).unwrap();
+        store
+            .prepare(&reader, "linux", &std::collections::HashSet::new())
+            .await
+            .unwrap();
+        assert!(ondisk::is_needed(&store.image("held"), "linux").await);
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 }

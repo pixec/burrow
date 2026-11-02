@@ -147,8 +147,9 @@ itself cannot see inside the session.
 
 Two answers, depending on your threat model. Prefer narrow, single-purpose
 hostnames whose infrastructure hosts nothing else. Or turn on `is_tls_inspected`: the
-proxy then terminates TLS for that sandbox using a per-node CA installed into the
-guest's trust store at handshake, parses every request inside the session, and
+proxy then terminates TLS for that sandbox with a certificate it signs on the
+node, chained to a root installed into the guest's trust store at handshake (see
+[The inspection root](#the-inspection-root)), parses every request inside the session, and
 requires the inner `Host` to be allowlisted *and* to match the name the session
 was opened for.
 
@@ -212,10 +213,109 @@ counts DATA payload only, header bytes excluded, whereas an HTTP/1.1 record
 counts the literal bytes of the head it relayed. Treat HTTP/2 byte counts as
 traffic rather than as wire cost.
 
+### The inspection root
+
+A guest is told to trust one certificate, the inspection root, and the proxy
+presents leaves that chain to it. Processes load their trust store once, when
+they start, so a guest that wakes on a node whose leaves chain to another root
+fails every inspected connection its running processes make. Where that root
+comes from decides whether inspected sandboxes can move.
+
+**Fleet root (recommended).** One root for the fleet, made once on an operator
+machine, and an intermediate per node signed by it. The node keeps its
+intermediate's key and sends the intermediate behind every leaf; guests hold only
+the root, so a move, an adopt after a node failure, a restore or a fork changes
+nothing inside the guest. `burrowd ca` makes both as files, with no openssl:
+
+```sh
+burrowd ca init --out-dir ./fleet-ca                  # root.pem, root.key (10 years)
+burrowd ca issue --node node-a --out-dir ./fleet-ca \
+  --root-cert ./fleet-ca/root.pem --root-key ./fleet-ca/root.key   # node-a.pem, node-a.key (1 year)
+```
+
+Copy `root.pem` and the node's own pair to each node and start it with all
+three:
+
+```sh
+burrowd serve ... --inspect-ca-cert /etc/burrow/node-a.pem \
+  --inspect-ca-key /etc/burrow/node-a.key --inspect-root-cert /etc/burrow/root.pem
+```
+
+`root.key` never goes on a node: it signs intermediates and nothing else, and
+`burrowd ca issue` refuses to overwrite files that exist. Each intermediate is
+constrained to `pathlen:0`, so a node's key can sign leaves and never another
+authority. At startup the node refuses to run when its certificate is not a CA,
+has expired, does not match its key or does not chain to the root, because each
+of those would hand every inspected sandbox a proxy it rejects. It warns at
+startup and hourly from its heartbeat once the intermediate has 30 days left;
+renew with `burrowd ca issue` and restart, and guests notice nothing, since the
+root is unchanged. Leaves last 30 days, are re-minted at half their life and
+never outlive the intermediate.
+
+**Per-node root (the default).** A node given none of the three flags generates
+its own authority in `--data-dir` (`inspect-ca.pem`, `inspect-ca.key`) and is its
+own root. That is fine for one node, but no other node can serve its guests, so
+an inspected sandbox created there cannot leave it.
+
+**Placement.** Every node reports its root's SHA-256 fingerprint
+(`NodeInfo.inspection_root_fingerprint`), and every inspected sandbox and
+snapshot records the fingerprint its guest was given, on its record and in the
+durable manifest. The orchestrator moves, adopts and restores an inspected
+sandbox, and places an inspected create from a durable snapshot, only on a node
+with the same root, and refuses otherwise before the source lets go:
+
+```
+FailedPrecondition: sandbox sbx_0fc3...'s guest trusts the TLS inspection root
+8d75e0..., and node node-b's inspection root is 344458...; inspected sandboxes
+move only between nodes under one fleet root (`burrowd ca`)
+```
+
+The node checks again before it restores a guest, so a node whose root changed
+since its last heartbeat refuses as well. Moving a node from a per-node root to
+a fleet root leaves the sandboxes already there trusting the old one; each is
+handed the new root on its next resume, but processes already running keep the
+old one until they restart.
+
+**Inside the guest.** The agent writes the root into each trust bundle between
+`# BEGIN burrow inspection ca` and `# END burrow inspection ca`, replacing
+whatever a previous handshake wrote there, so a bundle holds exactly one Burrow
+certificate however often the sandbox moves; everything the image trusted on its
+own is left alone. Windows puts it in the machine Root store under the friendly
+name `Burrow inspection CA` and removes any earlier certificate carrying that
+name. On macOS, see below.
+
+### macOS guests and Apple's TLS stack
+
+A macOS guest gets the root in `/etc/ssl/cert.pem`, which curl, LibreSSL and most
+tools built on OpenSSL read, in any bundle the image names, and in the System
+keychain. URLSession, Safari, Swift and Go on darwin verify through the Security
+framework instead, which takes a root as an anchor only from the admin trust
+settings. A running guest cannot change those without a person: trustd
+authorizes each change again in its own process and wants an administrator in a
+dialog, even with `com.apple.trust-settings.admin` rewritten to `allow` in the
+rights database, and its settings under `/private/var/protected/trustd` are
+closed to root, Full Disk Access or not.
+
+So the Mac node writes them while nothing runs from the disk: before every cold
+boot of a macOS sandbox it attaches the disk image, mounts the Data volume
+(unencrypted; `nobrowse`), and makes the node's inspection root the one entry in
+trustd's `Admin.plist` marked as Burrow's, as `security add-trusted-cert -d -r
+trustRoot` would have. A new root (a moved sandbox, a rotated fleet root)
+replaces the last one, a sandbox no longer inspected keeps none, and whatever
+else the image trusted stays. It takes about a second. A restore never does
+this, since the saved kernel would not know its disk changed; a sandbox told a
+new root while running gets it in the bundles at once and in the Security
+framework at its next cold boot. No MDM, profile or administrator is involved.
+
+The agent reports `inspection-root-trusted` in Health when the Security framework
+takes the installed root as an anchor, and the node warns at create when an
+inspected macOS sandbox's agent does not, which means writing it onto the disk
+failed (the node logs why).
+
 ### When a guest does not trust the inspection CA
 
-At handshake the agent appends the node's inspection CA to the guest's system
-trust bundles, such as `/etc/ssl/certs/ca-certificates.crt`. Some images never
+At handshake the agent writes the inspection root into the guest's system trust
+bundles, such as `/etc/ssl/certs/ca-certificates.crt`. Some images never
 read those: they ship a bundle of their own and point their tooling at it with an
 environment variable, and inspected requests from such an image fail to verify
 even though the CA is installed correctly.
@@ -537,7 +637,9 @@ One transition is refused rather than applied: **`is_tls_inspected` can only be
 enabled at creation.** The guest trusts Burrow's CA because it was installed into
 its trust store during the agent handshake, so turning inspection on later would
 break every TLS connection the sandbox makes instead of inspecting them. Turning
-it off, and every other change, is live.
+it off, and every other change, is live. For the same reason an inspected
+sandbox moves only between nodes under one root; see
+[The inspection root](#the-inspection-root).
 
 ## Private networks
 
@@ -618,6 +720,31 @@ Live updates apply to the next flow, and a direct connection the new policy
 denies is reset at once and recorded as such, which is what the conntrack
 flush after a re-render does on Linux.
 
+Private networks work as on Linux, decided by the same code. A Mac node
+claims an address slice at registration like any node, and a packet a guest
+sends to another sandbox's address is not terminated: an in-process router
+hands it, a hop on, to the stack of the sandbox holding that address, or over
+the mesh to the node holding it. The Mac's end of the mesh is a userspace
+WireGuard endpoint on one UDP socket, speaking to the Linux nodes' kernel
+WireGuard with each peer's slice as its `AllowedIPs`, and keys and peers from
+the orchestrator under the same pinning. Each new flow is decided once with
+`burrow_net::policy::decide_peer`: the sender's own decision (so a peer is
+exempt from the allowlist redirect, as the `prerouting` accept makes it on
+Linux) and the receiver's membership, which is what a flow arriving over the
+mesh meets in a Linux sandbox chain; a test renders the ruleset for the same
+pairs, on one node and across the mesh, and checks they agree. Replies follow
+the tracked flow. A policy update re-decides every tracked flow and resets
+both TCP ends of one it now denies. Only addresses in the sandbox pool are
+ever forwarded, and `.internal` names are answered from the same directory,
+`NXDOMAIN` for a non-member. TCP SYNs crossing the mesh have their MSS clamped
+to 1380, what a 1420-byte WireGuard MTU carries whole.
+
+Published ports listen on one address, never on every interface unless asked:
+`--publish-address`, by default the address the node is advertised at when
+that is one of the Mac's own, and otherwise the address `--listen` binds. That
+is the address the orchestrator reports the port at, as Linux's DNAT serves
+whatever reaches the node from outside.
+
 Not yet on macOS: IPv6 (the guest is not offered a router, so it has
-link-local addresses only), private networks between sandboxes, and ICMP
-beyond pinging the gateway.
+link-local addresses only), UDP published ports, and ICMP beyond pinging the
+gateway and echo between peers.

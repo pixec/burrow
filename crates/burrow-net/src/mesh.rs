@@ -55,7 +55,7 @@ impl Identity {
             }
         }
 
-        let private_key = run(&["wg", "genkey"], None).await?;
+        let private_key = generate_key().await?;
         if let Some(parent) = path.parent() {
             let _ = tokio::fs::create_dir_all(parent).await;
         }
@@ -80,8 +80,34 @@ async fn restrict(path: &Path) {
     }
 }
 
+#[cfg(not(feature = "usernet"))]
+async fn generate_key() -> Result<String> {
+    run(&["wg", "genkey"], None).await
+}
+
+#[cfg(not(feature = "usernet"))]
 async fn derive_public_key(private_key: &str) -> Result<String> {
     run(&["wg", "pubkey"], Some(private_key)).await
+}
+
+/// The same keys `wg genkey` makes, for a node with no `wg` to ask.
+#[cfg(feature = "usernet")]
+async fn generate_key() -> Result<String> {
+    use base64::Engine as _;
+    let secret = x25519_dalek::StaticSecret::random();
+    Ok(base64::engine::general_purpose::STANDARD.encode(secret.to_bytes()))
+}
+
+#[cfg(feature = "usernet")]
+async fn derive_public_key(private_key: &str) -> Result<String> {
+    use base64::Engine as _;
+    let secret = crate::usernet::wireguard::secret(private_key).ok_or_else(|| {
+        NetError::Io(std::io::Error::other(
+            "the mesh key is not 32 bytes of base64",
+        ))
+    })?;
+    Ok(base64::engine::general_purpose::STANDARD
+        .encode(x25519_dalek::PublicKey::from(&secret).as_bytes()))
 }
 
 /// Brings up the mesh interface and replaces its peer set.
@@ -136,7 +162,7 @@ pub async fn configure(
 ///
 /// A peer failing any check is dropped rather than corrected: a malformed
 /// record says nothing reliable about which node it describes.
-fn is_valid_peer(peer: &Peer) -> bool {
+pub(crate) fn is_valid_peer(peer: &Peer) -> bool {
     let reason = if !is_valid_subnet(&peer.subnet) {
         "subnet is not a CIDR inside the sandbox pool, or claims more than one node's slice"
     } else if !is_valid_public_key(&peer.public_key) {

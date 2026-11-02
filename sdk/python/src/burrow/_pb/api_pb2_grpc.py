@@ -262,6 +262,16 @@ class BurrowStub(object):
                 request_serializer=api__pb2.GroupMembershipRequest.SerializeToString,
                 response_deserializer=api__pb2.GroupMembershipResponse.FromString,
                 _registered_method=True)
+        self.DeleteUser = channel.unary_unary(
+                '/burrow.api.v1.Burrow/DeleteUser',
+                request_serializer=api__pb2.DeleteUserRequest.SerializeToString,
+                response_deserializer=api__pb2.DeleteUserResponse.FromString,
+                _registered_method=True)
+        self.DeleteGroup = channel.unary_unary(
+                '/burrow.api.v1.Burrow/DeleteGroup',
+                request_serializer=api__pb2.DeleteGroupRequest.SerializeToString,
+                response_deserializer=api__pb2.DeleteGroupResponse.FromString,
+                _registered_method=True)
         self.BuildTemplate = channel.unary_stream(
                 '/burrow.api.v1.Burrow/BuildTemplate',
                 request_serializer=api__pb2.BuildTemplateRequest.SerializeToString,
@@ -391,7 +401,9 @@ class BurrowServicer(object):
         raise NotImplementedError('Method not implemented!')
 
     def ResumeSandbox(self, request, context):
-        """Missing associated documentation comment in .proto file."""
+        """FAILED_PRECONDITION for a sandbox that was shut down, which has no memory
+        to resume: StartSandbox boots it.
+        """
         context.set_code(grpc.StatusCode.UNIMPLEMENTED)
         context.set_details('Method not implemented!')
         raise NotImplementedError('Method not implemented!')
@@ -623,7 +635,7 @@ class BurrowServicer(object):
 
     def CreateUser(self, request, context):
         """Users and groups inside the guest. Each runs a command in the sandbox, so
-        all four are held to the sandbox's exec policy.
+        all of them are held to the sandbox's exec policy.
         """
         context.set_code(grpc.StatusCode.UNIMPLEMENTED)
         context.set_details('Method not implemented!')
@@ -642,6 +654,21 @@ class BurrowServicer(object):
         raise NotImplementedError('Method not implemented!')
 
     def RemoveUserFromGroup(self, request, context):
+        """Missing associated documentation comment in .proto file."""
+        context.set_code(grpc.StatusCode.UNIMPLEMENTED)
+        context.set_details('Method not implemented!')
+        raise NotImplementedError('Method not implemented!')
+
+    def DeleteUser(self, request, context):
+        """Deletes only what CreateUser or CreateGroup could have made: root,
+        system and built-in accounts, administrators and the accounts the agent
+        relies on are refused.
+        """
+        context.set_code(grpc.StatusCode.UNIMPLEMENTED)
+        context.set_details('Method not implemented!')
+        raise NotImplementedError('Method not implemented!')
+
+    def DeleteGroup(self, request, context):
         """Missing associated documentation comment in .proto file."""
         context.set_code(grpc.StatusCode.UNIMPLEMENTED)
         context.set_details('Method not implemented!')
@@ -974,6 +1001,16 @@ def add_BurrowServicer_to_server(servicer, server):
                     servicer.RemoveUserFromGroup,
                     request_deserializer=api__pb2.GroupMembershipRequest.FromString,
                     response_serializer=api__pb2.GroupMembershipResponse.SerializeToString,
+            ),
+            'DeleteUser': grpc.unary_unary_rpc_method_handler(
+                    servicer.DeleteUser,
+                    request_deserializer=api__pb2.DeleteUserRequest.FromString,
+                    response_serializer=api__pb2.DeleteUserResponse.SerializeToString,
+            ),
+            'DeleteGroup': grpc.unary_unary_rpc_method_handler(
+                    servicer.DeleteGroup,
+                    request_deserializer=api__pb2.DeleteGroupRequest.FromString,
+                    response_serializer=api__pb2.DeleteGroupResponse.SerializeToString,
             ),
             'BuildTemplate': grpc.unary_stream_rpc_method_handler(
                     servicer.BuildTemplate,
@@ -2263,6 +2300,60 @@ class Burrow(object):
             '/burrow.api.v1.Burrow/RemoveUserFromGroup',
             api__pb2.GroupMembershipRequest.SerializeToString,
             api__pb2.GroupMembershipResponse.FromString,
+            options,
+            channel_credentials,
+            insecure,
+            call_credentials,
+            compression,
+            wait_for_ready,
+            timeout,
+            metadata,
+            _registered_method=True)
+
+    @staticmethod
+    def DeleteUser(request,
+            target,
+            options=(),
+            channel_credentials=None,
+            call_credentials=None,
+            insecure=False,
+            compression=None,
+            wait_for_ready=None,
+            timeout=None,
+            metadata=None):
+        return grpc.experimental.unary_unary(
+            request,
+            target,
+            '/burrow.api.v1.Burrow/DeleteUser',
+            api__pb2.DeleteUserRequest.SerializeToString,
+            api__pb2.DeleteUserResponse.FromString,
+            options,
+            channel_credentials,
+            insecure,
+            call_credentials,
+            compression,
+            wait_for_ready,
+            timeout,
+            metadata,
+            _registered_method=True)
+
+    @staticmethod
+    def DeleteGroup(request,
+            target,
+            options=(),
+            channel_credentials=None,
+            call_credentials=None,
+            insecure=False,
+            compression=None,
+            wait_for_ready=None,
+            timeout=None,
+            metadata=None):
+        return grpc.experimental.unary_unary(
+            request,
+            target,
+            '/burrow.api.v1.Burrow/DeleteGroup',
+            api__pb2.DeleteGroupRequest.SerializeToString,
+            api__pb2.DeleteGroupResponse.FromString,
             options,
             channel_credentials,
             insecure,

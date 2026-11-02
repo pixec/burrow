@@ -72,8 +72,9 @@ pub enum PlacementError {
     )]
     TemplateNotOnAnyNode(String),
     #[error(
-        "the private network's other members are on node {0}, which cannot take this sandbox; \
-         cross-node private networks are not supported yet"
+        "the private network's other members are on node {0}, which cannot take this sandbox, \
+         and no node mesh is configured to reach them from another node; start the nodes with \
+         --mesh-endpoint"
     )]
     PeersUnreachable(String),
     #[error(

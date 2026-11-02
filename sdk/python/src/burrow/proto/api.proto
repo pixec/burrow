@@ -20,6 +20,8 @@ service Burrow {
   rpc ListSandboxes(ListSandboxesRequest) returns (ListSandboxesResponse);
   rpc DeleteSandbox(SandboxRef) returns (DeleteSandboxResponse);
   rpc PauseSandbox(SandboxRef) returns (burrow.common.v1.Sandbox);
+  // FAILED_PRECONDITION for a sandbox that was shut down, which has no memory
+  // to resume: StartSandbox boots it.
   rpc ResumeSandbox(SandboxRef) returns (burrow.common.v1.Sandbox);
   // Shut the VM down, keeping the writable disk and volumes, and boot it
   // again. Unlike pause and resume, the guest's processes do not survive and
@@ -93,11 +95,16 @@ service Burrow {
   rpc PruneCommands(PruneCommandsRequest) returns (PruneCommandsResponse);
 
   // Users and groups inside the guest. Each runs a command in the sandbox, so
-  // all four are held to the sandbox's exec policy.
+  // all of them are held to the sandbox's exec policy.
   rpc CreateUser(CreateUserRequest) returns (CreateUserResponse);
   rpc CreateGroup(CreateGroupRequest) returns (CreateGroupResponse);
   rpc AddUserToGroup(GroupMembershipRequest) returns (GroupMembershipResponse);
   rpc RemoveUserFromGroup(GroupMembershipRequest) returns (GroupMembershipResponse);
+  // Deletes only what CreateUser or CreateGroup could have made: root,
+  // system and built-in accounts, administrators and the accounts the agent
+  // relies on are refused.
+  rpc DeleteUser(DeleteUserRequest) returns (DeleteUserResponse);
+  rpc DeleteGroup(DeleteGroupRequest) returns (DeleteGroupResponse);
 
   // Templates: build a reusable guest image by running steps in a sandbox.
   rpc BuildTemplate(BuildTemplateRequest) returns (stream BuildLog);
@@ -326,6 +333,8 @@ message BuildTemplateRequest {
   // on, and choosing one would boot something the caller did not ask for.
   string from = 2;
   repeated BuildStep steps = 3;
+  // The machine the build runs in. Zero is 1 vCPU and 1024 MiB for a Linux
+  // build, and the restore image's minimum for a macOS one.
   uint32 vcpus = 4;
   uint32 mem_mib = 5;
   // Domains the build sandbox may reach. Empty means unrestricted, since a
@@ -344,10 +353,20 @@ message BuildTemplateRequest {
   // alone. Recorded with the template, so everything built on it or restored
   // from it keeps the mode. The image has to ship systemd.
   bool is_systemd = 9;
-  // "firecracker" or "qemu": chosen here, once, for every sandbox the
-  // template makes. Empty is Firecracker for a Linux image and QEMU for a
-  // Windows one, which Firecracker cannot run.
+  // "firecracker", "cloud-hypervisor" or "vz": chosen here, once, for every
+  // sandbox the template makes. Empty is the base template's, else
+  // Firecracker for a Linux image and Cloud Hypervisor for a Windows one,
+  // which Firecracker cannot run. "vz" is macOS on a Mac node, built from
+  // `from_ipsw` or on another vz template named by `from`.
   string hypervisor = 10;
+  // macOS restore image to install as a vz template: a path on the Mac node,
+  // or "latest", which the node resolves from Apple's catalogue, downloads
+  // into its data directory and keeps for the next build. Takes the place of
+  // `from`, `from_image` and `kits`; `steps` must be empty.
+  string from_ipsw = 11;
+  // The installed macOS disk, for a `from_ipsw` build. Zero is 64 GiB; macOS
+  // needs about 28 GiB to install.
+  uint32 disk_mib = 12;
 }
 
 message BuildDone {
@@ -376,7 +395,7 @@ message TemplateInfo {
   bool is_kit = 4;
   // Sandboxes from it run systemd under the agent.
   bool is_systemd = 5;
-  // "linux" or "windows".
+  // "linux", "windows" or "macos".
   string guest_os = 6;
   // The hypervisor every sandbox from this template runs under.
   string hypervisor = 7;
@@ -935,6 +954,34 @@ message CreateGroupResponse {
   // A directory the group's members share: group-owned and 2770 setgid, so
   // files created inside it stay readable by the rest of the group.
   string shared_dir = 3;
+}
+
+message DeleteUserRequest {
+  string sandbox_id = 1;
+  string name = 2;
+  // Removes the user's home as well. Otherwise it is kept: on Linux and
+  // macOS handed to root, so an account that later reuses the uid does not
+  // inherit it.
+  bool is_home_removed = 3;
+}
+
+message DeleteUserResponse {
+  string home = 1;
+  bool is_home_removed = 2;
+}
+
+message DeleteGroupRequest {
+  string sandbox_id = 1;
+  string name = 2;
+  // Removes the group's shared directory as well. Otherwise it is kept, as a
+  // home is.
+  bool is_shared_dir_removed = 3;
+}
+
+message DeleteGroupResponse {
+  // Empty when the group had no shared directory.
+  string shared_dir = 1;
+  bool is_shared_dir_removed = 2;
 }
 
 message GroupMembershipRequest {

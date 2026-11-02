@@ -83,6 +83,8 @@ impl VmBootArgs {
         // A dev box often has no delegated cgroup, and these runs are not
         // what limits are for.
         spec.cgroup_root = None;
+        // `floor` and `snapshot` type into the guest's shell.
+        spec.is_console_interactive = true;
         spec.vcpus = self.vcpus;
         spec.mem_mib = self.mem_mib;
         spec.drives = vec![DriveSpec::root_ro(&self.rootfs)];

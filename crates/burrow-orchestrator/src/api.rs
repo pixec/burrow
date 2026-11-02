@@ -731,6 +731,7 @@ impl ApiService {
         &self,
         id: &str,
         want: &crate::registry::Placement,
+        is_inspected: bool,
     ) -> Result<(common::Snapshot, String, NodeClient), Status> {
         let mut snapshot = self
             .snapshot(id)
@@ -760,13 +761,20 @@ impl ApiService {
                     hypervisor: recorded_hypervisor(&snapshot.hypervisor),
                     ..want.clone()
                 };
-                self.place(&want).await.map_err(|err| match err {
-                    crate::registry::PlacementError::NoHealthyNode
-                    | crate::registry::PlacementError::NoCapacity { .. } => {
-                        Status::resource_exhausted(err.to_string())
-                    }
-                    other => Status::failed_precondition(other.to_string()),
-                })?
+                let root = match is_inspected {
+                    true => snapshot.inspection_root_fingerprint.as_str(),
+                    false => "",
+                };
+                let excluded = self.other_roots(&format!("snapshot {id}"), root, None)?;
+                self.place_avoiding(&want, excluded)
+                    .await
+                    .map_err(|err| match err {
+                        crate::registry::PlacementError::NoHealthyNode
+                        | crate::registry::PlacementError::NoCapacity { .. } => {
+                            Status::resource_exhausted(err.to_string())
+                        }
+                        other => Status::failed_precondition(other.to_string()),
+                    })?
             }
             None => {
                 return Err(Status::failed_precondition(format!(
@@ -882,6 +890,79 @@ impl ApiService {
         )))
     }
 
+    /// Refuses `node_id` when its TLS inspection root is not `root`, the one
+    /// `subject`'s guest was told to trust. An empty root asks for nothing.
+    ///
+    /// A guest's processes load their trust store once, so restoring one
+    /// under leaves from another root fails every inspected connection it
+    /// holds, and every one it opens.
+    fn require_inspection_root(
+        &self,
+        node_id: &str,
+        subject: &str,
+        root: &str,
+    ) -> Result<(), Status> {
+        let theirs = self
+            .0
+            .nodes
+            .info(node_id)
+            .map(|info| info.inspection_root_fingerprint)
+            .unwrap_or_default();
+        if root.is_empty() || theirs == root {
+            return Ok(());
+        }
+        Err(Status::failed_precondition(format!(
+            "{subject}'s guest trusts the TLS inspection root {root}, and node {node_id}'s \
+             inspection root is {}; inspected sandboxes move only between nodes under one fleet \
+             root (`burrowd ca`)",
+            if theirs.is_empty() {
+                "unknown"
+            } else {
+                &theirs
+            }
+        )))
+    }
+
+    /// Healthy nodes whose TLS inspection root is not `root`, for placement
+    /// to pass over, refusing when no other node (`except` aside) has it.
+    fn other_roots(
+        &self,
+        subject: &str,
+        root: &str,
+        except: Option<&str>,
+    ) -> Result<std::collections::HashSet<String>, Status> {
+        let mut excluded = std::collections::HashSet::new();
+        if root.is_empty() {
+            return Ok(excluded);
+        }
+        let mut others = Vec::new();
+        let mut is_trusted = false;
+        for id in self.0.nodes.healthy_ids() {
+            let theirs = self
+                .0
+                .nodes
+                .info(&id)
+                .map(|info| info.inspection_root_fingerprint)
+                .unwrap_or_default();
+            if theirs == root {
+                is_trusted |= except != Some(id.as_str());
+                continue;
+            }
+            others.push(format!("{id}: {theirs}"));
+            excluded.insert(id);
+        }
+        if is_trusted {
+            return Ok(excluded);
+        }
+        others.sort();
+        Err(Status::failed_precondition(format!(
+            "{subject}'s guest trusts the TLS inspection root {root}, and no other healthy node \
+             has it ({}); inspected sandboxes move only between nodes under one fleet root \
+             (`burrowd ca`)",
+            others.join(", ")
+        )))
+    }
+
     async fn adopt(
         &self,
         sandbox: common::Sandbox,
@@ -895,13 +976,20 @@ impl ApiService {
             .await
             .map_err(Status::aborted)?;
         let want = self.adoption_placement(&sandbox, node_labels);
+        let subject = format!("sandbox {}", sandbox.id);
+        let root = sandbox.inspection_root_fingerprint.clone();
         let (target, placed) = if node_id.is_empty() {
-            let target = self.place(&want).await.map_err(placement_status)?;
+            let excluded = self.other_roots(&subject, &root, None)?;
+            let target = self
+                .place_avoiding(&want, excluded)
+                .await
+                .map_err(placement_status)?;
             let placed = self.place_guard(&target, &want);
             (target, Some(placed))
         } else {
             self.require_restorer(node_id, &sandbox.id, &want)?;
             self.require_labels(node_id, &want.node_labels)?;
+            self.require_inspection_root(node_id, &subject, &root)?;
             (node_id.to_string(), None)
         };
         let endpoint = self
@@ -1192,8 +1280,14 @@ impl Burrow for ApiService {
                 node_labels: req.node_labels.clone(),
                 ..Default::default()
             };
-            let (snapshot, node_id, mut client) =
-                self.node_for_snapshot(&req.snapshot, &placement).await?;
+            let is_inspected = req
+                .policy
+                .as_ref()
+                .and_then(|p| p.network.as_ref())
+                .is_some_and(|n| n.is_tls_inspected);
+            let (snapshot, node_id, mut client) = self
+                .node_for_snapshot(&req.snapshot, &placement, is_inspected)
+                .await?;
             let mounts = req
                 .policy
                 .as_ref()
@@ -1818,10 +1912,14 @@ impl Burrow for ApiService {
         }
         // The destination is chosen before anything is suspended, so a move
         // that has nowhere to go leaves the sandbox running where it is.
+        let subject = format!("sandbox {id}");
+        let root = current.inspection_root_fingerprint.clone();
         let placed = if req.node_id.is_empty() {
             let want = self.adoption_placement(&current, req.node_labels.clone());
+            let mut excluded = self.other_roots(&subject, &root, Some(&source))?;
+            excluded.insert(source.clone());
             let target = self
-                .place_avoiding(&want, std::collections::HashSet::from([source.clone()]))
+                .place_avoiding(&want, excluded)
                 .await
                 .map_err(placement_status)?;
             let guard = self.place_guard(&target, &want);
@@ -1837,6 +1935,7 @@ impl Burrow for ApiService {
             let want = self.adoption_placement(&current, req.node_labels.clone());
             self.require_restorer(&req.node_id, &id, &want)?;
             self.require_labels(&req.node_id, &want.node_labels)?;
+            self.require_inspection_root(&req.node_id, &subject, &root)?;
             None
         };
         let target = placed
@@ -2218,8 +2317,8 @@ impl Burrow for ApiService {
         let node_id = self
             .0
             .nodes
-            .place()
-            .ok_or_else(|| Status::resource_exhausted("no healthy node available"))?;
+            .place_for(&build_placement(req.get_ref()))
+            .map_err(placement_status)?;
         let endpoint = self
             .0
             .nodes
@@ -2910,6 +3009,26 @@ impl Burrow for ApiService {
             client.remove_user_from_group(req).await?.into_inner(),
         ))
     }
+
+    async fn delete_user(
+        &self,
+        req: Request<api::DeleteUserRequest>,
+    ) -> Result<Response<api::DeleteUserResponse>, Status> {
+        let mut req = req.into_inner();
+        req.sandbox_id = self.resolve(&req.sandbox_id).await;
+        let mut client = self.node_for(&req.sandbox_id).await?;
+        Ok(Response::new(client.delete_user(req).await?.into_inner()))
+    }
+
+    async fn delete_group(
+        &self,
+        req: Request<api::DeleteGroupRequest>,
+    ) -> Result<Response<api::DeleteGroupResponse>, Status> {
+        let mut req = req.into_inner();
+        req.sandbox_id = self.resolve(&req.sandbox_id).await;
+        let mut client = self.node_for(&req.sandbox_id).await?;
+        Ok(Response::new(client.delete_group(req).await?.into_inner()))
+    }
 }
 
 /// Checks an id the caller chose for a new sandbox.
@@ -2920,6 +3039,25 @@ impl Burrow for ApiService {
 /// the same rules, which keeps chosen and generated ids interchangeable
 /// everywhere downstream.
 /// The status a caller is given for a placement that found nowhere to go.
+/// Where a build can run: on a node holding the template it starts from,
+/// offering the hypervisor it asks for. A restore image is installed only
+/// on a Mac, which is a node offering vz.
+fn build_placement(req: &api::BuildTemplateRequest) -> crate::registry::Placement {
+    let hypervisor = match (req.hypervisor.as_str(), req.from_ipsw.is_empty()) {
+        ("", false) => "vz",
+        (hypervisor, _) => hypervisor,
+    };
+    let is_on_base = req.from_image.is_empty() && req.kits.is_empty() && req.from_ipsw.is_empty();
+    crate::registry::Placement {
+        template: match is_on_base {
+            true => req.from.clone(),
+            false => String::new(),
+        },
+        hypervisor: hypervisor.to_string(),
+        ..Default::default()
+    }
+}
+
 fn placement_status(err: crate::registry::PlacementError) -> Status {
     match err {
         crate::registry::PlacementError::NoHealthyNode
@@ -3113,6 +3251,175 @@ mod tests {
             node_token: None,
             sandbox_lease_secs: 0,
         }))
+    }
+
+    fn offering(nodes: &[(&str, &[&str])]) -> ApiService {
+        let api = replica(crate::sandboxes::SandboxRegistry::default());
+        for (id, hypervisors) in nodes {
+            let info = burrow_proto::common::v1::NodeInfo {
+                id: id.to_string(),
+                address: format!("{id}:7071"),
+                hypervisors: hypervisors.iter().map(|h| h.to_string()).collect(),
+                ..Default::default()
+            };
+            api.0
+                .nodes
+                .register(info, String::new(), String::new(), None)
+                .unwrap();
+        }
+        api
+    }
+
+    /// A restore image is installed only on a node offering vz, and a fleet
+    /// without one says so rather than sending it to a node that cannot.
+    #[test]
+    fn a_build_is_placed_where_it_can_run() {
+        let ipsw = api::BuildTemplateRequest {
+            name: "macos-27".into(),
+            from_ipsw: "latest".into(),
+            ..Default::default()
+        };
+        let on_mac = api::BuildTemplateRequest {
+            name: "macos-dev".into(),
+            from: "macos-27".into(),
+            hypervisor: "vz".into(),
+            ..Default::default()
+        };
+        let linux = api::BuildTemplateRequest {
+            name: "tools".into(),
+            from: "alpine".into(),
+            hypervisor: "firecracker".into(),
+            ..Default::default()
+        };
+        let fleet = offering(&[("linux", &["firecracker"]), ("mac", &["vz"])]);
+        for (request, node) in [(&ipsw, "mac"), (&on_mac, "mac"), (&linux, "linux")] {
+            assert_eq!(
+                fleet.0.nodes.place_for(&build_placement(request)).unwrap(),
+                node
+            );
+        }
+        assert_eq!(build_placement(&on_mac).template, "macos-27");
+        assert_eq!(build_placement(&ipsw).template, "");
+
+        let linux_only = offering(&[("linux", &["firecracker", "cloud-hypervisor"])]);
+        let refused = placement_status(
+            linux_only
+                .0
+                .nodes
+                .place_for(&build_placement(&ipsw))
+                .unwrap_err(),
+        );
+        assert_eq!(refused.code(), tonic::Code::FailedPrecondition);
+        assert!(refused.message().contains("vz"), "{}", refused.message());
+    }
+
+    /// A fleet of nodes, each under the inspection root named beside it.
+    fn under_roots(nodes: &[(&str, &str)]) -> ApiService {
+        let api = replica(crate::sandboxes::SandboxRegistry::default());
+        for (id, root) in nodes {
+            let info = burrow_proto::common::v1::NodeInfo {
+                id: id.to_string(),
+                address: format!("{id}:7071"),
+                inspection_root_fingerprint: root.to_string(),
+                ..Default::default()
+            };
+            api.0
+                .nodes
+                .register(info, String::new(), String::new(), None)
+                .unwrap();
+        }
+        api
+    }
+
+    fn inspected(id: &str, node: &str, root: &str) -> common::Sandbox {
+        common::Sandbox {
+            id: id.into(),
+            node_id: node.into(),
+            state: common::SandboxState::Running as i32,
+            inspection_root_fingerprint: root.into(),
+            ..Default::default()
+        }
+    }
+
+    /// A guest holds its inspection root in memory, so a move to a node under
+    /// another root is refused before the source lets go, naming both.
+    #[tokio::test]
+    async fn an_inspected_sandbox_moves_only_to_a_node_under_its_root() {
+        let api = under_roots(&[("node1", "aaaa"), ("node2", "bbbb"), ("node3", "aaaa")]);
+        api.0.sandboxes.insert(inspected("sbx_a", "node1", "aaaa"));
+
+        let err = api
+            .move_sandbox(Request::new(api::MoveSandboxRequest {
+                r#ref: Some(api::SandboxRef { id: "sbx_a".into() }),
+                node_id: "node2".into(),
+                ..Default::default()
+            }))
+            .await
+            .unwrap_err();
+        assert_eq!(err.code(), tonic::Code::FailedPrecondition, "{err}");
+        assert!(err.message().contains("aaaa"), "{err}");
+        assert!(
+            err.message().contains("node2's inspection root is bbbb"),
+            "{err}"
+        );
+
+        // Under the same root the checks pass, and the move goes on to the
+        // source, which a test has no way to reach.
+        let err = api
+            .move_sandbox(Request::new(api::MoveSandboxRequest {
+                r#ref: Some(api::SandboxRef { id: "sbx_a".into() }),
+                node_id: "node3".into(),
+                ..Default::default()
+            }))
+            .await
+            .unwrap_err();
+        assert_ne!(err.code(), tonic::Code::FailedPrecondition, "{err}");
+    }
+
+    /// A node's own authority is a root no other node has: an automatic move
+    /// finds nowhere to go and says so, rather than failing every connection
+    /// the guest holds once it lands.
+    #[tokio::test]
+    async fn a_sandbox_under_a_per_node_root_has_nowhere_to_move() {
+        let api = under_roots(&[("node1", "aaaa"), ("node2", "bbbb")]);
+        api.0.sandboxes.insert(inspected("sbx_a", "node1", "aaaa"));
+        let err = api
+            .move_sandbox(Request::new(api::MoveSandboxRequest {
+                r#ref: Some(api::SandboxRef { id: "sbx_a".into() }),
+                ..Default::default()
+            }))
+            .await
+            .unwrap_err();
+        assert_eq!(err.code(), tonic::Code::FailedPrecondition, "{err}");
+        assert!(
+            err.message()
+                .contains("trusts the TLS inspection root aaaa"),
+            "{err}"
+        );
+        assert!(err.message().contains("node2: bbbb"), "{err}");
+    }
+
+    #[test]
+    fn placement_passes_over_nodes_under_another_root() {
+        let api = under_roots(&[("node1", "aaaa"), ("node2", "bbbb"), ("node3", "aaaa")]);
+        let excluded = api
+            .other_roots("sandbox sbx_a", "aaaa", Some("node1"))
+            .unwrap();
+        assert_eq!(
+            excluded,
+            std::collections::HashSet::from(["node2".to_string()])
+        );
+        // A sandbox that is not inspected trusts nothing of the node's.
+        assert!(
+            api.other_roots("sandbox sbx_b", "", None)
+                .unwrap()
+                .is_empty()
+        );
+        assert!(
+            api.require_inspection_root("node2", "sandbox sbx_b", "")
+                .is_ok()
+        );
+        assert!(api.other_roots("sandbox sbx_a", "cccc", None).is_err());
     }
 
     /// A move that failed at its target leaves the sandbox unplaced in the

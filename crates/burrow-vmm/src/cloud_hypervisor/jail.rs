@@ -417,7 +417,7 @@ mod tests {
     #[test]
     fn the_helper_is_handed_the_whole_plan() {
         let plan = Plan {
-            workdir: "/var/lib/burrow/jail/firecracker/sbx-1/root".into(),
+            workdir: "/var/lib/burrow/jail/cloud-hypervisor/sbx-1/root".into(),
             uid: 65534,
             gid: 65534,
             read_only: vec!["/usr/local/share/cloud-hypervisor/CLOUDHV_EFI.fd".into()],
@@ -485,7 +485,7 @@ mod tests {
 
     #[test]
     fn a_jailed_vmm_addresses_its_workdir_from_inside() {
-        let workdir = Path::new("/var/lib/burrow/jail/firecracker/sbx-1/root");
+        let workdir = Path::new("/var/lib/burrow/jail/cloud-hypervisor/sbx-1/root");
         assert_eq!(
             vmm_workdir(workdir, Some(&jail())).unwrap(),
             Path::new("/work")

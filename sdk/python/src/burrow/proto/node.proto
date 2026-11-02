@@ -124,6 +124,8 @@ service NodeService {
   rpc CreateGroup(burrow.api.v1.CreateGroupRequest) returns (burrow.api.v1.CreateGroupResponse);
   rpc AddUserToGroup(burrow.api.v1.GroupMembershipRequest) returns (burrow.api.v1.GroupMembershipResponse);
   rpc RemoveUserFromGroup(burrow.api.v1.GroupMembershipRequest) returns (burrow.api.v1.GroupMembershipResponse);
+  rpc DeleteUser(burrow.api.v1.DeleteUserRequest) returns (burrow.api.v1.DeleteUserResponse);
+  rpc DeleteGroup(burrow.api.v1.DeleteGroupRequest) returns (burrow.api.v1.DeleteGroupResponse);
   rpc QueryAudit(burrow.api.v1.AuditQuery) returns (burrow.api.v1.AuditPage);  // collected, not streamed: the orchestrator merges pages from every node
 }
 

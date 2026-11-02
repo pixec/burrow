@@ -1,5 +1,6 @@
 mod access;
 mod blobs;
+mod ca;
 mod chunks;
 mod cmdlogs;
 mod delivery;
@@ -7,6 +8,7 @@ mod devvm;
 mod durable;
 mod edge;
 mod guestconn;
+mod ipsw;
 mod kit;
 mod macnode;
 mod metrics;
@@ -37,12 +39,12 @@ struct Args {
 enum Command {
     /// Run the node daemon: serve the node API and register with the orchestrator.
     Serve(serve::ServeArgs),
+    /// Make the fleet's TLS inspection root and node CAs, offline.
+    #[command(subcommand)]
+    Ca(ca::CaCommand),
     /// Development commands for the microVM layer.
     #[command(subcommand)]
     Vm(VmCommand),
-    /// Build a macOS template from a restore image, on a Mac node.
-    #[cfg(target_os = "macos")]
-    VzTemplate(macnode::TemplateArgs),
 }
 
 #[derive(Subcommand)]
@@ -96,9 +98,8 @@ async fn daemon() -> anyhow::Result<()> {
 async fn run(args: Args) -> anyhow::Result<()> {
     match args.command {
         Command::Serve(args) => serve::run(args).await,
+        Command::Ca(command) => ca::run(command),
         Command::Vm(VmCommand::Boot(args)) => devvm::run(args).await,
-        #[cfg(target_os = "macos")]
-        Command::VzTemplate(args) => macnode::build_template(args).await,
         Command::Vm(VmCommand::Snapshot(args)) => devvm::snapshot_roundtrip(args).await,
         Command::Vm(VmCommand::Floor(args)) => devvm::boot_floor(args).await,
         Command::Vm(VmCommand::Agent(args)) => devvm::agent_boot(args).await,

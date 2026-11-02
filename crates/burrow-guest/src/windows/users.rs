@@ -18,8 +18,9 @@ use tonic::Status;
 use windows_sys::Win32::Foundation::HANDLE;
 use windows_sys::Win32::NetworkManagement::NetManagement::{
     LOCALGROUP_INFO_1, LOCALGROUP_MEMBERS_INFO_3, NetApiBufferFree, NetLocalGroupAdd,
-    NetLocalGroupAddMembers, NetLocalGroupDelMembers, NetLocalGroupGetInfo, NetUserAdd,
-    NetUserGetInfo, UF_DONT_EXPIRE_PASSWD, UF_SCRIPT, USER_INFO_1, USER_PRIV_USER,
+    NetLocalGroupAddMembers, NetLocalGroupDel, NetLocalGroupDelMembers, NetLocalGroupGetInfo,
+    NetUserAdd, NetUserDel, NetUserGetInfo, UF_DONT_EXPIRE_PASSWD, UF_SCRIPT, USER_INFO_1,
+    USER_PRIV_ADMIN, USER_PRIV_USER,
 };
 
 use crate::windows::win;
@@ -427,4 +428,192 @@ pub async fn remove_from_group(user: &str, group: &str) -> Result<(), Status> {
     tokio::task::spawn_blocking(move || membership(&user, &group, false))
         .await
         .map_err(|err| Status::internal(format!("remove from group did not run: {err}")))?
+}
+
+/// The RID of a machine-local account create could have made: a SID under
+/// the machine's own authority (S-1-5-21-...) with a RID from 1000 up.
+/// Built-in groups (S-1-5-32-...), service and system SIDs, and the
+/// well-known accounts below 1000 (Administrator 500, Guest 501,
+/// DefaultAccount 503, WDAGUtilityAccount 504) are not.
+fn created_rid(sid: &[u8]) -> Option<u32> {
+    let machine = sid.get(1).is_some_and(|count| *count >= 2)
+        && sid.get(2..12) == Some(&[0, 0, 0, 0, 0, 5, 21, 0, 0, 0]);
+    machine.then(|| rid(sid)).filter(|rid| *rid >= 1000)
+}
+
+fn check_deletable(kind: &str, name: &str) -> Result<Vec<u8>, Status> {
+    let sid = sid(name)?;
+    if is_agent(name) || created_rid(&sid).is_none() {
+        return Err(Status::permission_denied(format!(
+            "{kind} {name} is not one burrow could have created"
+        )));
+    }
+    Ok(sid)
+}
+
+/// Deletes a user create could have made, never an administrator. Commands
+/// the agent runs as them refuse it (see the agent); other processes are not
+/// looked for, and keep the token they hold. The profile is kept unless
+/// `remove_home`; a SID is never reused, so nobody later inherits it.
+pub async fn delete_user(
+    name: &str,
+    remove_home: bool,
+) -> Result<burrow_proto::guest::v1::DeleteUserResponse, Status> {
+    validate_existing(name)?;
+    let name = name.to_string();
+    tokio::task::spawn_blocking(move || delete_user_blocking(&name, remove_home))
+        .await
+        .map_err(|err| Status::internal(format!("delete user did not run: {err}")))?
+}
+
+fn delete_user_blocking(
+    name: &str,
+    remove_home: bool,
+) -> Result<burrow_proto::guest::v1::DeleteUserResponse, Status> {
+    use windows_sys::Win32::UI::Shell::DeleteProfileW;
+
+    lookup_user(name)?;
+    let sid = check_deletable("user", name)?;
+    let name_w = win::wide(name);
+    let mut buf = std::ptr::null_mut();
+    // SAFETY: `name_w` is NUL-terminated; the buffer is freed below.
+    let rc = unsafe { NetUserGetInfo(std::ptr::null(), name_w.as_ptr(), 1, &mut buf) };
+    if rc != NERR_SUCCESS {
+        return Err(net_error(&format!("looking up {name}"), rc));
+    }
+    // SAFETY: level 1 fills a USER_INFO_1, freed once read.
+    let privilege = unsafe { (*buf.cast::<USER_INFO_1>()).usri1_priv };
+    // SAFETY: allocated by the call for us to free.
+    unsafe { NetApiBufferFree(buf.cast()) };
+    if privilege == USER_PRIV_ADMIN {
+        return Err(Status::permission_denied(format!(
+            "user {name} is an administrator"
+        )));
+    }
+
+    let sid_text = sid_string(&sid)?;
+    let home = profile_path(&sid_text).unwrap_or_default();
+    let mut is_home_removed = false;
+    if remove_home && !home.is_empty() {
+        let sid_w = win::wide(&sid_text);
+        // SAFETY: `sid_w` is NUL-terminated; the path and computer default.
+        win::check(unsafe { DeleteProfileW(sid_w.as_ptr(), std::ptr::null(), std::ptr::null()) })
+            .map_err(|err| {
+            Status::failed_precondition(format!("removing {name}'s profile {home}: {err}"))
+        })?;
+        is_home_removed = true;
+    }
+
+    // SAFETY: `name_w` is NUL-terminated.
+    match unsafe { NetUserDel(std::ptr::null(), name_w.as_ptr()) } {
+        NERR_SUCCESS => {}
+        NERR_USER_NOT_FOUND => {
+            return Err(Status::not_found(format!(
+                "no such user in the guest: {name}"
+            )));
+        }
+        code => return Err(net_error(&format!("deleting {name}"), code)),
+    }
+    Ok(burrow_proto::guest::v1::DeleteUserResponse {
+        home,
+        is_home_removed,
+    })
+}
+
+/// Where Windows keeps the profile of the account `sid` names, if it has one.
+fn profile_path(sid: &str) -> Option<String> {
+    use windows_sys::Win32::System::Registry::{HKEY_LOCAL_MACHINE, RRF_RT_REG_SZ, RegGetValueW};
+    let key = win::wide(&format!(
+        "SOFTWARE\\Microsoft\\Windows NT\\CurrentVersion\\ProfileList\\{sid}"
+    ));
+    let value = win::wide("ProfileImagePath");
+    let mut path = vec![0u16; 512];
+    let mut size = (path.len() * 2) as u32;
+    // SAFETY: `path` holds `size` bytes; REG_EXPAND_SZ comes back expanded.
+    let rc = unsafe {
+        RegGetValueW(
+            HKEY_LOCAL_MACHINE,
+            key.as_ptr(),
+            value.as_ptr(),
+            RRF_RT_REG_SZ,
+            std::ptr::null_mut(),
+            path.as_mut_ptr().cast(),
+            &mut size,
+        )
+    };
+    (rc == 0).then(|| win::from_wide(&path))
+}
+
+/// Deletes a local group create could have made; built-in groups are
+/// refused. Members simply lose it. Its shared directory is kept unless
+/// `remove_shared_dir`.
+pub async fn delete_group(
+    name: &str,
+    remove_shared_dir: bool,
+) -> Result<burrow_proto::guest::v1::DeleteGroupResponse, Status> {
+    validate_existing(name)?;
+    let name = name.to_string();
+    tokio::task::spawn_blocking(move || delete_group_blocking(&name, remove_shared_dir))
+        .await
+        .map_err(|err| Status::internal(format!("delete group did not run: {err}")))?
+}
+
+fn delete_group_blocking(
+    name: &str,
+    remove_shared_dir: bool,
+) -> Result<burrow_proto::guest::v1::DeleteGroupResponse, Status> {
+    lookup_group(name)?;
+    check_deletable("group", name)?;
+    let name_w = win::wide(name);
+    // SAFETY: `name_w` is NUL-terminated.
+    match unsafe { NetLocalGroupDel(std::ptr::null(), name_w.as_ptr()) } {
+        NERR_SUCCESS => {}
+        ERROR_NO_SUCH_ALIAS | NERR_GROUP_NOT_FOUND => {
+            return Err(Status::not_found(format!(
+                "no such group in the guest: {name}"
+            )));
+        }
+        code => return Err(net_error(&format!("deleting group {name}"), code)),
+    }
+    let shared = format!("{}:\\{SHARED_ROOT}\\{name}", win::system_drive());
+    // A junction or symlink there is not the directory create made.
+    if !std::fs::symlink_metadata(&shared).is_ok_and(|meta| meta.is_dir()) {
+        return Ok(burrow_proto::guest::v1::DeleteGroupResponse::default());
+    }
+    if remove_shared_dir {
+        std::fs::remove_dir_all(&shared)
+            .map_err(|err| Status::internal(format!("remove {shared}: {err}")))?;
+    }
+    Ok(burrow_proto::guest::v1::DeleteGroupResponse {
+        shared_dir: shared,
+        is_shared_dir_removed: remove_shared_dir,
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::created_rid;
+
+    fn sid(authority: u8, subs: &[u32]) -> Vec<u8> {
+        let mut sid = vec![1, subs.len() as u8, 0, 0, 0, 0, 0, authority];
+        for sub in subs {
+            sid.extend_from_slice(&sub.to_le_bytes());
+        }
+        sid
+    }
+
+    #[test]
+    fn only_a_machine_account_from_1000_up_may_be_deleted() {
+        let machine = [21, 1, 2, 3];
+        let with = |rid| [&machine[..], &[rid]].concat();
+        assert_eq!(created_rid(&sid(5, &with(1001))), Some(1001));
+        for rid in [500, 501, 503, 504, 513, 999] {
+            assert_eq!(created_rid(&sid(5, &with(rid))), None, "{rid}");
+        }
+        // Administrators, Users, LocalSystem, Everyone.
+        assert_eq!(created_rid(&sid(5, &[32, 544])), None);
+        assert_eq!(created_rid(&sid(5, &[32, 545])), None);
+        assert_eq!(created_rid(&sid(5, &[18])), None);
+        assert_eq!(created_rid(&sid(1, &[0])), None);
+    }
 }

@@ -451,7 +451,8 @@ impl ObjectStore {
 #[cfg(test)]
 pub(crate) mod fake {
     //! An S3 server of objects in a map, enough of one for the SDK: get,
-    //! head, put (conditional or not) and delete, over HTTP/1.1.
+    //! head, put (conditional or not), delete and a one-page listing, over
+    //! HTTP/1.1.
 
     use std::collections::HashMap;
     use std::sync::{Arc, Mutex};
@@ -507,7 +508,15 @@ pub(crate) mod fake {
             let mut parts = line.split_whitespace();
             let method = parts.next().unwrap_or_default().to_string();
             let target = parts.next().unwrap_or_default();
-            let key = target.split('?').next().unwrap_or_default().to_string();
+            let (key, query) = target.split_once('?').unwrap_or((target, ""));
+            let key = key.to_string();
+            let listing = query.split('&').any(|pair| pair == "list-type=2").then(|| {
+                let prefix = query
+                    .split('&')
+                    .find_map(|pair| pair.strip_prefix("prefix="))
+                    .unwrap_or_default();
+                format!("{key}/{}", decode(prefix))
+            });
             let mut headers = HashMap::new();
             loop {
                 let mut header = String::new();
@@ -531,6 +540,25 @@ pub(crate) mod fake {
                 let mut objects = objects.lock().unwrap();
                 let current = objects.by_key.get(&key).map(|(_, etag)| etag.clone());
                 match method.as_str() {
+                    "GET" if listing.is_some() => {
+                        let prefix = listing.unwrap();
+                        let bucket = format!("{key}/");
+                        let contents: String = objects
+                            .by_key
+                            .keys()
+                            .filter(|stored| stored.starts_with(&prefix))
+                            .map(|stored| {
+                                format!(
+                                    "<Contents><Key>{}</Key></Contents>",
+                                    &stored[bucket.len()..]
+                                )
+                            })
+                            .collect();
+                        let body = format!(
+                            "<?xml version=\"1.0\"?><ListBucketResult><IsTruncated>false</IsTruncated>{contents}</ListBucketResult>"
+                        );
+                        (200, None, body.into_bytes())
+                    }
                     "GET" | "HEAD" => match objects.by_key.get(&key) {
                         Some((bytes, etag)) => (200, Some(etag.clone()), bytes.clone()),
                         None => (404, None, error("NoSuchKey")),
@@ -569,6 +597,25 @@ pub(crate) mod fake {
                 return;
             }
         }
+    }
+
+    fn decode(escaped: &str) -> String {
+        let mut out = Vec::new();
+        let mut rest = escaped.as_bytes();
+        while let Some((&byte, tail)) = rest.split_first() {
+            let hex = std::str::from_utf8(tail.get(..2).unwrap_or_default()).unwrap_or_default();
+            match u8::from_str_radix(hex, 16) {
+                Ok(decoded) if byte == b'%' => {
+                    out.push(decoded);
+                    rest = &tail[2..];
+                }
+                _ => {
+                    out.push(byte);
+                    rest = tail;
+                }
+            }
+        }
+        String::from_utf8_lossy(&out).into_owned()
     }
 
     fn error(code: &str) -> Vec<u8> {

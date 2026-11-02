@@ -479,6 +479,18 @@ await sandbox.asUser("bob").fs.readFile(`${team.sharedDir}/note`, "utf8");
 await sandbox.removeUserFromGroup("bob", "team");
 ```
 
+Deleting undoes either. Only an account `createUser` or `createGroup` could have
+made can go: root, system and built-in accounts, administrators and the
+accounts the agent relies on are refused, and so is a user with a running
+process. A user's home is kept, handed to root on Linux and macOS, unless asked
+otherwise; their own group goes with them. A group that is a user's primary
+group is refused.
+
+```ts
+await sandbox.deleteGroup("team");          // { sharedDir: "/srv/team", sharedDirRemoved: false }
+await sandbox.deleteUser("bob", { removeHome: true }); // { home: "/home/bob", homeRemoved: true }
+```
+
 `asUser` returns a handle onto the same sandbox that acts as one user, which
 saves passing `user` to every call.
 
@@ -1130,8 +1142,8 @@ const sandbox = await Sandbox.create({ template: "python-tools" });
 
 Steps run in a real sandbox and the filesystem they leave behind becomes the
 image. There is no separate build language. A step that exits non-zero fails the
-build, so a broken step never gets baked in. Builds default to 1 vCPU, 1024 MiB,
-a 30 minute timeout, and unrestricted egress, because installing packages needs
+build, so a broken step never gets baked in. Linux builds default to 1 vCPU,
+1024 MiB, a 30 minute timeout, and unrestricted egress, because installing packages needs
 it; pass `allowDomains` to narrow the egress.
 
 `Template.list()` and `Template.delete(name)` manage what exists. Inspect a plan
@@ -1166,6 +1178,27 @@ await Template.build(Template().fromImage("registry.example/ubuntu-systemd:24.04
   systemd: true,
 });
 ```
+
+### macOS templates
+
+On a Mac node, `fromIpsw` installs macOS from a restore image (a path on the
+node, or `"latest"`, which the node downloads from Apple and keeps) and the
+template runs under `vz`. Steps go in a second build on top of it, which boots
+a clone of it as a new Mac and runs them through the agent as root:
+
+```ts
+await Template.build(Template().fromIpsw("latest"), "macos-27", {
+  cpuCount: 4,
+  memoryMB: 8192,
+});
+await Template.build(
+  Template().fromTemplate("macos-27").runCmd("touch /Users/Shared/built"),
+  "macos-dev",
+);
+```
+
+A macOS build defaults to the restore image's minimum machine, and an install
+to a 64 GiB disk (`diskMib`). See [TEMPLATES.md](../../docs/TEMPLATES.md#macos-templates).
 
 ### Warm templates
 
@@ -1410,6 +1443,7 @@ Everything else goes to the orchestrator.
 | `child.kill` | `SignalCommand` |
 | `sandbox.pruneCommands` | `PruneCommands` |
 | `sandbox.createUser`, `createGroup` | `CreateUser`, `CreateGroup` |
+| `sandbox.deleteUser`, `deleteGroup` | `DeleteUser`, `DeleteGroup` |
 | `sandbox.addUserToGroup`, `removeUserFromGroup` | `AddUserToGroup`, `RemoveUserFromGroup` |
 | `fs.readFile`, as root with the default flag | `DownloadFile` on the node |
 | `fs.readFile` otherwise, `writeFile`, `appendFile` | `Fs` on the node: open, a read or write per 4 MiB, close |

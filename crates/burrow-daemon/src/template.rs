@@ -9,6 +9,9 @@
 //! The tar is unpacked on the node and turned into a fresh ext4 with
 //! `mkfs.ext4 -d`, which populates an image from a directory without mounting
 //! it. The build sandbox is destroyed either way.
+//!
+//! A macOS template is a whole installed machine instead, built in
+//! [`crate::macnode`].
 
 #![allow(clippy::result_large_err)]
 
@@ -57,9 +60,9 @@ const MAX_EXPORT_BYTES: u64 = 8 * 1024 * 1024 * 1024;
 /// filesystem has room for metadata and for whatever the sandbox writes later.
 const IMAGE_SLACK_MIB: u64 = 256;
 
-type LogTx = mpsc::Sender<Result<api::BuildLog, Status>>;
+pub(crate) type LogTx = mpsc::Sender<Result<api::BuildLog, Status>>;
 
-fn event(event: api::build_log::Event) -> Result<api::BuildLog, Status> {
+pub(crate) fn event(event: api::build_log::Event) -> Result<api::BuildLog, Status> {
     Ok(api::BuildLog { event: Some(event) })
 }
 
@@ -288,6 +291,24 @@ pub async fn build(
     insecure: Vec<String>,
     tx: LogTx,
 ) {
+    // A macOS template is a whole installed machine, not a rootfs, and is
+    // neither captured nor warmed like one.
+    match crate::macnode::plan(&data_dir, &request).await {
+        Ok(None) => {}
+        Ok(Some(plan)) => {
+            let built =
+                crate::macnode::build(&manager, &data_dir, &node_id, plan, &guest_binary, &tx)
+                    .await;
+            if let Err(status) = built {
+                let _ = tx.send(Err(status)).await;
+            }
+            return;
+        }
+        Err(status) => {
+            let _ = tx.send(Err(status)).await;
+            return;
+        }
+    }
     let result = run_build(
         &manager,
         &data_dir,
@@ -405,21 +426,7 @@ async fn run_build(
         return Err(Status::not_found(format!("no base template {from}")));
     }
 
-    // Builds fetch packages, so they need egress. An explicit domain list
-    // narrows that; an empty one means the caller accepts unrestricted access
-    // for the duration of the build.
-    let network = if request.allow_domains.is_empty() {
-        common::NetworkPolicy {
-            mode: common::NetworkMode::Open as i32,
-            ..Default::default()
-        }
-    } else {
-        common::NetworkPolicy {
-            mode: common::NetworkMode::Allowlist as i32,
-            allow_domains: request.allow_domains.clone(),
-            ..Default::default()
-        }
-    };
+    let network = build_network(&request.allow_domains);
 
     // The base's rootfs digest is half the layer key: the same steps on a
     // different base produce a different image.
@@ -500,6 +507,24 @@ async fn run_build(
         tracing::warn!(build = build_id, %err, "could not remove build sandbox");
     }
     outcome.map(|()| request.name.clone())
+}
+
+/// A build sandbox's egress. Builds fetch packages, so they need it. An
+/// explicit domain list narrows it; an empty one means the caller accepts
+/// unrestricted access for the duration of the build.
+pub(crate) fn build_network(allow_domains: &[String]) -> common::NetworkPolicy {
+    if allow_domains.is_empty() {
+        common::NetworkPolicy {
+            mode: common::NetworkMode::Open as i32,
+            ..Default::default()
+        }
+    } else {
+        common::NetworkPolicy {
+            mode: common::NetworkMode::Allowlist as i32,
+            allow_domains: allow_domains.to_vec(),
+            ..Default::default()
+        }
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -733,7 +758,7 @@ pub async fn run(program: &str, args: &[&str]) -> Result<(), Status> {
 }
 
 /// Runs one command in the build sandbox, forwarding its output to the caller.
-async fn exec_streaming(
+pub(crate) async fn exec_streaming(
     manager: &SandboxManager,
     sandbox_id: &str,
     command: &str,

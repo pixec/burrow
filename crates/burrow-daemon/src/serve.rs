@@ -133,6 +133,16 @@ pub struct ServeArgs {
     /// Port the mesh listens on.
     #[arg(long, default_value_t = burrow_net::mesh::DEFAULT_PORT)]
     pub mesh_port: u16,
+    /// Address the userspace mesh binds on a node without kernel WireGuard
+    /// (macOS). A Linux node's `burrow-wg` listens on every address.
+    #[arg(long, default_value = "0.0.0.0")]
+    pub mesh_listen_address: std::net::IpAddr,
+    /// Address a macOS node's published ports listen on. Defaults to the
+    /// address the node is advertised at when it is one of this host's, and
+    /// otherwise to --listen's: the address callers already reach the node
+    /// by, never every interface unless that is what --listen names.
+    #[arg(long)]
+    pub publish_address: Option<std::net::IpAddr>,
     /// Days of egress audit to keep. 0 disables pruning, which lets audit
     /// rows grow without bound.
     #[arg(long, default_value_t = 7)]
@@ -202,7 +212,8 @@ pub struct ServeArgs {
     pub jail_uid: u32,
     #[arg(long, default_value_t = 65534)]
     pub jail_gid: u32,
-    /// Base directory the jailer builds chroots under.
+    /// Base directory jailed VMs run under, each in
+    /// `<base>/<hypervisor>/<id>/root`.
     #[arg(long, default_value = "/var/lib/burrow/jail")]
     pub chroot_base: PathBuf,
     /// Docker-format credentials file for registries that need authentication.
@@ -299,6 +310,25 @@ pub struct ServeArgs {
     pub access_tls_cert: Option<PathBuf>,
     #[arg(long, env = "BURROWD_ACCESS_TLS_KEY")]
     pub access_tls_key: Option<PathBuf>,
+    /// This node's TLS inspection CA, PEM, issued under --inspect-root-cert
+    /// (`burrowd ca issue`). With --inspect-ca-key and --inspect-root-cert,
+    /// guests are told to trust the fleet root, and an inspected sandbox
+    /// moves between nodes under the same root. Without them the node
+    /// generates its own authority in --data-dir, and its inspected
+    /// sandboxes cannot move to another node.
+    #[arg(
+        long,
+        env = "BURROWD_INSPECT_CA_CERT",
+        requires_all = ["inspect_ca_key", "inspect_root_cert"]
+    )]
+    pub inspect_ca_cert: Option<PathBuf>,
+    /// The private key of --inspect-ca-cert.
+    #[arg(long, env = "BURROWD_INSPECT_CA_KEY", requires = "inspect_ca_cert")]
+    pub inspect_ca_key: Option<PathBuf>,
+    /// The fleet's inspection root, PEM (`burrowd ca init`). Only its
+    /// certificate: its key stays off the nodes.
+    #[arg(long, env = "BURROWD_INSPECT_ROOT_CERT", requires = "inspect_ca_cert")]
+    pub inspect_root_cert: Option<PathBuf>,
     /// Fact about this node, as key=value, e.g. `--label rack=b7`. Repeatable,
     /// and comma-separated in BURROW_NODE_LABELS.
     ///
@@ -501,6 +531,9 @@ fn local_node_info(args: &ServeArgs) -> anyhow::Result<NodeInfo> {
         // Filled in once the binaries have been looked for.
         hypervisors: Vec::new(),
         hypervisor_versions: Default::default(),
+        // Filled in once the inspection authority is loaded.
+        inspection_root_fingerprint: String::new(),
+        inspection_ca_expires_at: 0,
     })
 }
 
@@ -596,6 +629,28 @@ fn serve_access(
     Ok(builder.add_service(AccessServer::new(access)).serve(listen))
 }
 
+/// How long before the inspection CA expires the node starts saying so.
+const CA_EXPIRY_WARNING: Duration = Duration::from_secs(30 * 24 * 3600);
+
+/// Warns when the inspection CA expires within [`CA_EXPIRY_WARNING`], and
+/// says whether it did. Once it has, every inspected connection fails.
+fn warn_if_ca_expiring(expires_at: i64) -> bool {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_secs() as i64);
+    let left = expires_at - now;
+    if left > CA_EXPIRY_WARNING.as_secs() as i64 {
+        return false;
+    }
+    tracing::warn!(
+        days_left = left / 86400,
+        expires_at,
+        "the TLS inspection CA expires soon, and inspected sandboxes will then reject every \
+         connection; issue a new one with `burrowd ca issue` and restart with it"
+    );
+    true
+}
+
 /// Registers with the orchestrator and heartbeats forever, reconnecting and
 /// re-registering as needed (e.g. across orchestrator restarts).
 async fn registration_loop(
@@ -664,8 +719,14 @@ async fn registration_loop(
             "registered with orchestrator"
         );
 
+        let mut ca_warned: Option<std::time::Instant> = None;
         loop {
             sandboxes.wait_to_report(interval).await;
+            if ca_warned.is_none_or(|at| at.elapsed() >= Duration::from_secs(3600))
+                && warn_if_ca_expiring(info.inspection_ca_expires_at)
+            {
+                ca_warned = Some(std::time::Instant::now());
+            }
             match client
                 .heartbeat(nodepb::HeartbeatRequest {
                     node_id: info.id.clone(),
@@ -720,6 +781,31 @@ async fn registration_loop(
             }
         }
     }
+}
+
+/// Where a macOS node's published ports listen; see
+/// [`ServeArgs::publish_address`].
+#[cfg(target_os = "macos")]
+async fn publish_address(args: &ServeArgs) -> std::net::IpAddr {
+    if let Some(address) = args.publish_address {
+        return address;
+    }
+    if let Some(advertised) = &args.advertise {
+        let host = endpoint_host(advertised)
+            .trim_start_matches('[')
+            .trim_end_matches(']');
+        let resolved =
+            tokio::time::timeout(Duration::from_secs(2), tokio::net::lookup_host((host, 0))).await;
+        if let Ok(Ok(addresses)) = resolved {
+            for address in addresses {
+                // Bindable is what makes it one of this host's.
+                if std::net::UdpSocket::bind((address.ip(), 0)).is_ok() {
+                    return address.ip();
+                }
+            }
+        }
+    }
+    args.listen.ip()
 }
 
 /// The address slice this node used last time it ran, if any.
@@ -875,9 +961,14 @@ async fn apply_mesh(
     if peers == *applied_peers {
         return;
     }
-    match burrow_net::mesh::configure(identity, args.mesh_port, &sandboxes.subnet().await, &peers)
-        .await
-    {
+    let configured = if cfg!(target_os = "macos") {
+        sandboxes.configure_usernet_mesh(&peers).await;
+        Ok(())
+    } else {
+        burrow_net::mesh::configure(identity, args.mesh_port, &sandboxes.subnet().await, &peers)
+            .await
+    };
+    match configured {
         Ok(()) => *applied_peers = peers,
         Err(err) => {
             tracing::error!(%err, "could not configure the mesh; cross-node traffic will not flow")
@@ -1279,27 +1370,59 @@ pub async fn run(args: ServeArgs) -> anyhow::Result<()> {
         args.data_dir.join("logs/egress.jsonl"),
         Some(Arc::clone(&store)),
     );
-    // Generated once and kept, because guests are told to trust it: a new
-    // authority each boot would break every sandbox that survived a restart.
-    //
     // Fatal when it cannot be loaded. A node that carried on without one would
     // accept sandboxes asking for inspection and hand them an unchecked,
     // SNI-only session instead, silently downgrading the control they asked
     // for; refusing to start is the only answer that fails closed.
     let authority = Arc::new(
-        burrow_proxy::inspect::Authority::load_or_create(&args.data_dir).map_err(|err| {
-            anyhow::anyhow!(
-                "cannot load the TLS inspection authority from {}: {err}. \
+        match (
+            &args.inspect_ca_cert,
+            &args.inspect_ca_key,
+            &args.inspect_root_cert,
+        ) {
+            (Some(cert), Some(key), Some(root)) => burrow_proxy::inspect::Authority::load(
+                cert, key, root,
+            )
+            .map_err(|err| {
+                anyhow::anyhow!(
+                    "cannot use the TLS inspection CA: {err}. Inspection must not fail open, so \
+                     burrowd will not start"
+                )
+            })?,
+            // Generated once and kept, because guests are told to trust it: a new
+            // authority each boot would break every sandbox that survived a
+            // restart.
+            _ => {
+                burrow_proxy::inspect::Authority::load_or_create(&args.data_dir).map_err(|err| {
+                    anyhow::anyhow!(
+                        "cannot load the TLS inspection authority from {}: {err}. \
                  Inspection must not fail open, so burrowd will not start; fix the \
                  directory's permissions, or remove the broken CA files to have a \
                  new authority generated",
-                args.data_dir.display()
-            )
-        })?,
+                        args.data_dir.display()
+                    )
+                })?
+            }
+        },
     );
+    tracing::info!(
+        root = authority.root_fingerprint(),
+        is_fleet_root = args.inspect_root_cert.is_some(),
+        "TLS inspection authority loaded"
+    );
+    let ca_expires_at = authority
+        .expires_at()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_secs() as i64);
+    warn_if_ca_expiring(ca_expires_at);
+    node_info.inspection_root_fingerprint = authority.root_fingerprint().to_string();
+    node_info.inspection_ca_expires_at = ca_expires_at;
     // Handed to guests that opt in, so they trust the certificates the proxy
     // presents for the hosts they asked for.
-    sandboxes.set_inspection_ca(authority.certificate_pem().to_string());
+    sandboxes.set_inspection_ca(
+        authority.certificate_pem().to_string(),
+        authority.root_fingerprint().to_string(),
+    );
 
     let proxy = Arc::new(burrow_proxy::Proxy {
         policies: Arc::clone(&proxy_policies),
@@ -1324,14 +1447,18 @@ pub async fn run(args: ServeArgs) -> anyhow::Result<()> {
     // A macOS guest's flows never reach the proxy or the resolver over a
     // tap; its stack hands them over in process, with the same pieces.
     #[cfg(target_os = "macos")]
-    sandboxes.set_usernet_node(burrow_net::usernet::Node {
-        audit: audit.clone(),
-        resolutions: Arc::clone(&resolutions),
-        denied: Arc::clone(&denied),
-        authority: Some(Arc::clone(&authority)),
-        directory: Arc::clone(&directory),
-        dns_upstream: args.dns_upstream,
-    });
+    sandboxes.set_usernet_node(
+        burrow_net::usernet::Node {
+            audit: audit.clone(),
+            resolutions: Arc::clone(&resolutions),
+            denied: Arc::clone(&denied),
+            authority: Some(Arc::clone(&authority)),
+            directory: Arc::clone(&directory),
+            dns_upstream: args.dns_upstream,
+            router: Arc::default(),
+        },
+        publish_address(&args).await,
+    );
 
     // Guests resolve through burrow so lookups are recorded; the firewall
     // permits this one host service, and the resolver forwards upstream.
@@ -1368,6 +1495,18 @@ pub async fn run(args: ServeArgs) -> anyhow::Result<()> {
     };
     if let Some(identity) = &identity {
         tracing::info!(public_key = identity.public_key, "mesh identity ready");
+        // A Mac has no kernel WireGuard: its sandboxes' stacks reach other
+        // nodes through one socket here instead.
+        #[cfg(target_os = "macos")]
+        if let Err(err) = sandboxes
+            .start_usernet_mesh(
+                std::net::SocketAddr::new(args.mesh_listen_address, args.mesh_port),
+                &identity.private_key,
+            )
+            .await
+        {
+            tracing::error!(%err, "the mesh failed to bind; cross-node private networks unavailable");
+        }
     }
 
     // Before recovery, so recovered sandboxes reload into the range they were

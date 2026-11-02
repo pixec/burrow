@@ -9,10 +9,26 @@ export interface BuildStep {
 }
 
 export interface BuildOptions extends TransportOptions {
-  /** vCPUs given to the build sandbox. */
+  /**
+   * vCPUs given to the build sandbox. Defaults to 1 for Linux and the restore
+   * image's minimum for macOS.
+   */
   cpuCount?: number;
-  /** Memory given to the build sandbox, in MiB. */
+  /**
+   * Memory given to the build sandbox, in MiB. Defaults to 1024 for Linux and
+   * the restore image's minimum for macOS.
+   */
   memoryMB?: number;
+  /**
+   * Hypervisor every sandbox from the template runs under: `"firecracker"`,
+   * `"cloud-hypervisor"` or `"vz"`. Defaults to the base template's.
+   */
+  hypervisor?: string;
+  /**
+   * The installed macOS disk for {@link TemplateBuilder.fromIpsw}, in MiB.
+   * Defaults to 65536; macOS needs 28672 to install.
+   */
+  diskMib?: number;
   /**
    * Domains the build may reach. Omitted means unrestricted, because a build
    * that installs packages needs the network by definition.
@@ -90,11 +106,25 @@ export function defaultBuildLogger(
 export class TemplateBuilder {
   private base = "default";
   private image = "";
+  private ipsw = "";
   private readonly steps: BuildStep[] = [];
 
   /** Sets the burrow template to start from. Defaults to `"default"`. */
   fromTemplate(name: string): this {
     this.base = name;
+    this.image = "";
+    this.ipsw = "";
+    return this;
+  }
+
+  /**
+   * Installs macOS from a restore image on a Mac node: a path on that node,
+   * or `"latest"`, which the node downloads from Apple and keeps. The
+   * template runs under `vz` and takes no steps; build on it with
+   * {@link fromTemplate} to add some.
+   */
+  fromIpsw(source: string): this {
+    this.ipsw = source;
     this.image = "";
     return this;
   }
@@ -110,6 +140,7 @@ export class TemplateBuilder {
    */
   fromImage(reference: string): this {
     this.image = reference;
+    this.ipsw = "";
     return this;
   }
 
@@ -180,13 +211,17 @@ export class TemplateBuilder {
       name,
       // An OCI base takes the place of a template base; sending both would
       // leave the node to guess which was meant.
-      from: this.image ? "" : this.base,
+      from: this.image || this.ipsw ? "" : this.base,
       fromImage: this.image,
+      fromIpsw: this.ipsw,
       steps: this.steps,
-      vcpus: options.cpuCount ?? 1,
-      memMib: options.memoryMB ?? 1024,
+      // Zero is the node's default for the guest being built.
+      vcpus: options.cpuCount ?? 0,
+      memMib: options.memoryMB ?? 0,
       allowDomains: options.allowDomains ?? [],
       isSystemd: options.systemd ?? false,
+      hypervisor: options.hypervisor ?? "",
+      diskMib: options.diskMib ?? 0,
     };
   }
 

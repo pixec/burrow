@@ -537,7 +537,7 @@ enum Command {
     /// List a directory inside a sandbox.
     Dir { id: String, path: String },
     /// Template operations.
-    #[command(subcommand)]
+    #[command(subcommand, visible_alias = "template")]
     Templates(TemplatesCommand),
     /// Snapshot operations.
     #[command(subcommand, visible_alias = "snapshots")]
@@ -618,6 +618,14 @@ enum UsageFormat {
 enum UserCommand {
     /// Create a user with a private home directory.
     Create { id: String, name: String },
+    /// Delete a user that `user create` could have made. The home is kept,
+    /// handed to root, unless --remove-home.
+    Delete {
+        id: String,
+        name: String,
+        #[arg(long = "remove-home")]
+        is_home_removed: bool,
+    },
 }
 
 #[derive(Subcommand)]
@@ -635,6 +643,14 @@ enum GroupCommand {
         id: String,
         user: String,
         group: String,
+    },
+    /// Delete a group that `group create` could have made. Its shared
+    /// directory is kept, handed to root, unless --remove-shared-dir.
+    Delete {
+        id: String,
+        name: String,
+        #[arg(long = "remove-shared-dir")]
+        is_shared_dir_removed: bool,
     },
 }
 
@@ -1188,6 +1204,42 @@ enum TemplatesCommand {
         #[arg(long)]
         hypervisor: Option<String>,
     },
+    /// Build a template: steps run on another template, or macOS installed
+    /// from a restore image on a Mac node.
+    Build {
+        /// Template name.
+        name: String,
+        /// Template to start from.
+        #[arg(long, conflicts_with = "from_ipsw")]
+        from: Option<String>,
+        /// macOS restore image to install, as a path on the Mac node or
+        /// `latest`, which the node downloads from Apple and keeps.
+        #[arg(long)]
+        from_ipsw: Option<String>,
+        /// Shell command to run in the build, in order. Repeatable.
+        #[arg(long = "step", conflicts_with = "from_ipsw")]
+        steps: Vec<String>,
+        /// Hypervisor every sandbox from the template runs under:
+        /// `firecracker`, `cloud-hypervisor` or `vz`. Defaults to the base
+        /// template's, and to `vz` for --from-ipsw.
+        #[arg(long)]
+        hypervisor: Option<String>,
+        /// vCPUs of the build machine. Defaults to 1 for Linux and the
+        /// restore image's minimum for macOS.
+        #[arg(long, default_value_t = 0)]
+        vcpus: u32,
+        /// Memory of the build machine, in MiB. Defaults to 1024 for Linux
+        /// and the restore image's minimum for macOS.
+        #[arg(long = "mem", default_value_t = 0)]
+        mem_mib: u32,
+        /// Size of the installed macOS disk, in MiB, for --from-ipsw.
+        /// Defaults to 65536; macOS needs 28672 to install.
+        #[arg(long, default_value_t = 0, requires = "from_ipsw")]
+        disk_mib: u32,
+        /// Domain the build may reach. Repeatable; none means any.
+        #[arg(long = "allow-domain")]
+        allow_domains: Vec<String>,
+    },
     /// Remove a template.
     Rm { name: String },
 }
@@ -1531,6 +1583,25 @@ async fn main() -> anyhow::Result<()> {
                 resp.username, resp.uid, resp.gid, resp.home
             );
         }
+        Command::User(UserCommand::Delete {
+            id,
+            name,
+            is_home_removed,
+        }) => {
+            let resp = client
+                .delete_user(api::DeleteUserRequest {
+                    sandbox_id: id,
+                    name: name.clone(),
+                    is_home_removed,
+                })
+                .await?
+                .into_inner();
+            match (resp.home.as_str(), resp.is_home_removed) {
+                ("", _) => println!("deleted {name}"),
+                (home, true) => println!("deleted {name}, removed {home}"),
+                (home, false) => println!("deleted {name}, kept {home}"),
+            }
+        }
         Command::Group(GroupCommand::Create { id, name }) => {
             let resp = client
                 .create_group(api::CreateGroupRequest {
@@ -1563,6 +1634,25 @@ async fn main() -> anyhow::Result<()> {
                 })
                 .await?;
             println!("{user} left {group}");
+        }
+        Command::Group(GroupCommand::Delete {
+            id,
+            name,
+            is_shared_dir_removed,
+        }) => {
+            let resp = client
+                .delete_group(api::DeleteGroupRequest {
+                    sandbox_id: id,
+                    name: name.clone(),
+                    is_shared_dir_removed,
+                })
+                .await?
+                .into_inner();
+            match (resp.shared_dir.as_str(), resp.is_shared_dir_removed) {
+                ("", _) => println!("deleted {name}"),
+                (dir, true) => println!("deleted {name}, removed {dir}"),
+                (dir, false) => println!("deleted {name}, kept {dir}"),
+            }
         }
         Command::Run {
             create,
@@ -1884,6 +1974,34 @@ async fn main() -> anyhow::Result<()> {
             systemd,
             hypervisor,
         }) => import_template(&mut client, images, name, systemd, hypervisor).await?,
+        Command::Templates(TemplatesCommand::Build {
+            name,
+            from,
+            from_ipsw,
+            steps,
+            hypervisor,
+            vcpus,
+            mem_mib,
+            disk_mib,
+            allow_domains,
+        }) => {
+            let request = api::BuildTemplateRequest {
+                name,
+                from: from.unwrap_or_default(),
+                from_ipsw: from_ipsw.unwrap_or_default(),
+                steps: steps
+                    .into_iter()
+                    .map(|run| api::BuildStep { run })
+                    .collect(),
+                hypervisor: hypervisor.unwrap_or_default(),
+                vcpus,
+                mem_mib,
+                disk_mib,
+                allow_domains,
+                ..Default::default()
+            };
+            build_template(&mut client, request).await?
+        }
         Command::Templates(TemplatesCommand::Rm { name }) => {
             client
                 .delete_template(api::DeleteTemplateRequest { name: name.clone() })
@@ -3224,6 +3342,31 @@ async fn import_template(
                 "imported {image} as template {} ({}MiB)",
                 done.template,
                 done.size_bytes / (1024 * 1024)
+            ),
+            None => {}
+        }
+    }
+    Ok(())
+}
+
+async fn build_template(
+    client: &mut Client,
+    request: api::BuildTemplateRequest,
+) -> anyhow::Result<()> {
+    let started = std::time::Instant::now();
+    let mut stream = client.build_template(request).await?.into_inner();
+    while let Some(log) = stream.message().await? {
+        match log.event {
+            Some(api::build_log::Event::Step(step)) => println!("==> {step}"),
+            Some(api::build_log::Event::Stdout(bytes))
+            | Some(api::build_log::Event::Stderr(bytes)) => {
+                print!("{}", String::from_utf8_lossy(&bytes));
+            }
+            Some(api::build_log::Event::Done(done)) => println!(
+                "built template {} ({}MiB) in {}s",
+                done.template,
+                done.size_bytes / (1024 * 1024),
+                started.elapsed().as_secs()
             ),
             None => {}
         }

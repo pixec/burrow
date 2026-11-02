@@ -408,7 +408,11 @@ mod probe {
             &term,
         );
 
-        // The feed: everything so far is on it, unacknowledged.
+        // The feed. A node attached to this guest holds a feed of its own and
+        // confirms output as it logs it, after which the guest lets go of it,
+        // so what ran before this one opened may never be on it. Opening a
+        // feed replaces the node's, and a command run after that is on this
+        // one, attached or not.
         let (ack_tx, ack_rx) = tokio::sync::mpsc::channel(4);
         ack_tx
             .send(pb::FeedAck {
@@ -420,10 +424,13 @@ mod probe {
             .feed(tokio_stream::wrappers::ReceiverStream::new(ack_rx))
             .await?
             .into_inner();
+        let fed_sw = exec(&mut client, argv(&["sw_vers"]), vec![]).await;
         let mut fed: HashMap<String, (String, Option<i32>)> = HashMap::new();
         let mut last = 0;
+        let until = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
         while let Ok(Some(Ok(frame))) =
             tokio::time::timeout(std::time::Duration::from_millis(500), feed.next()).await
+            && tokio::time::Instant::now() < until
         {
             last = frame.seq;
             let entry = fed.entry(frame.command_id).or_default();
@@ -437,9 +444,9 @@ mod probe {
         }
         c.check(
             "the feed carries sw_vers' output and exit",
-            fed.get(&sw.id)
+            fed.get(&fed_sw.id)
                 .is_some_and(|(out, code)| out.contains("ProductVersion") && *code == Some(0)),
-            fed.get(&sw.id),
+            fed.get(&fed_sw.id),
         );
         let _ = ack_tx
             .send(pb::FeedAck {

@@ -55,6 +55,25 @@ fn policy(mode: NetworkMode, domains: &[&str], allow_cidrs: &[&str], ports: &[u3
     )
 }
 
+/// A node for tests, and every audit record it writes.
+async fn test_node() -> (Arc<Node>, Arc<Mutex<Vec<EgressEvent>>>) {
+    let audit = Arc::new(Mutex::new(Vec::new()));
+    let seen = Arc::clone(&audit);
+    let dir = std::env::temp_dir().join(format!("burrow-usernet-{}", std::process::id()));
+    let node = Arc::new(Node {
+        audit: AuditLog::new(dir.join("egress.jsonl"), None).observed(Arc::new(
+            move |event: &EgressEvent| seen.lock().unwrap().push(event.clone()),
+        )),
+        resolutions: Arc::default(),
+        denied: Arc::default(),
+        authority: None,
+        directory: Arc::default(),
+        dns_upstream: fake_upstream().await,
+        router: Arc::default(),
+    });
+    (node, audit)
+}
+
 /// An upstream resolver that answers every A query with `REMOTE`.
 async fn fake_upstream() -> SocketAddr {
     let socket = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
@@ -74,6 +93,7 @@ async fn fake_upstream() -> SocketAddr {
 }
 
 struct Guest {
+    net: SandboxNet,
     link: UnixDatagram,
     handle: Handle,
     policy: watch::Sender<Policy>,
@@ -84,25 +104,25 @@ struct Guest {
 
 impl Guest {
     async fn attach(policy: Policy) -> Self {
+        let (node, audit) = test_node().await;
+        Self::attach_to(&node, audit, net(), policy)
+    }
+
+    /// A guest on `node`, alongside whatever else is attached to it.
+    fn attach_to(
+        node: &Arc<Node>,
+        audit: Arc<Mutex<Vec<EgressEvent>>>,
+        net: SandboxNet,
+        policy: Policy,
+    ) -> Self {
         let (link, theirs) = UnixDatagram::pair().unwrap();
         let theirs = OwnedFd::from(theirs.into_std().unwrap());
-        let audit = Arc::new(Mutex::new(Vec::new()));
-        let seen = Arc::clone(&audit);
-        let dir = std::env::temp_dir().join(format!("burrow-usernet-{}", std::process::id()));
-        let node = Arc::new(Node {
-            audit: AuditLog::new(dir.join("egress.jsonl"), None).observed(Arc::new(
-                move |event: &EgressEvent| seen.lock().unwrap().push(event.clone()),
-            )),
-            resolutions: Arc::default(),
-            denied: Arc::default(),
-            authority: None,
-            directory: Arc::default(),
-            dns_upstream: fake_upstream().await,
-        });
         let (tx, rx) = watch::channel(policy);
         let meter = Arc::new(Meter::default());
-        let handle = UserNet::attach(theirs, net(), rx, node, Arc::clone(&meter)).unwrap();
+        let handle =
+            UserNet::attach(theirs, net, rx, Arc::clone(node), Arc::clone(&meter)).unwrap();
         Self {
+            net,
             link,
             handle,
             policy: tx,
@@ -133,7 +153,8 @@ impl Guest {
     }
 
     async fn send_ip(&mut self, src: Ipv4Addr, dst: Ipv4Addr, protocol: IpProtocol, body: &[u8]) {
-        self.send_ip_as(MAC, src, dst, protocol, body).await;
+        self.send_ip_as(self.net.mac, src, dst, protocol, body)
+            .await;
     }
 
     async fn send_ip_as(
@@ -224,7 +245,7 @@ impl Guest {
             let frame = self.recv(left).await?;
             let eth = EthernetFrame::new_checked(&frame[..]).unwrap();
             assert_eq!(eth.src_addr().0, GATEWAY_MAC);
-            assert_eq!(eth.dst_addr().0, MAC);
+            assert_eq!(eth.dst_addr().0, self.net.mac);
             if eth.ethertype() != EthernetProtocol::Ipv4 {
                 continue;
             }
@@ -264,7 +285,8 @@ impl Guest {
 
     /// Opens a connection to `dst` and completes the handshake.
     async fn connect(&mut self, port: u16, dst: SocketAddr) -> Tcp {
-        self.send_tcp(GUEST, dst, Segment::syn(port, 1000)).await;
+        let guest = self.net.guest_ip;
+        self.send_tcp(guest, dst, Segment::syn(port, 1000)).await;
         let reply = loop {
             let reply = self.recv_tcp(WAIT).await.expect("a syn-ack");
             if reply.port == port {
@@ -278,7 +300,7 @@ impl Guest {
             seq: 1001,
             ack: reply.seq.wrapping_add(1),
         };
-        self.send_tcp(GUEST, dst, tcp.segment(TcpControl::None, &[]))
+        self.send_tcp(guest, dst, tcp.segment(TcpControl::None, &[]))
             .await;
         tcp.seq = 1001;
         tcp
@@ -296,7 +318,8 @@ impl Guest {
             }
             tcp.ack = segment.seq.wrapping_add(segment.payload.len() as u32);
             data.extend_from_slice(&segment.payload);
-            self.send_tcp(GUEST, tcp.dst, tcp.segment(TcpControl::None, &[]))
+            let guest = self.net.guest_ip;
+            self.send_tcp(guest, tcp.dst, tcp.segment(TcpControl::None, &[]))
                 .await;
         }
         data
@@ -304,7 +327,8 @@ impl Guest {
 
     async fn write(&mut self, tcp: &mut Tcp, data: &[u8]) {
         let segment = tcp.segment(TcpControl::Psh, data);
-        self.send_tcp(GUEST, tcp.dst, segment).await;
+        let guest = self.net.guest_ip;
+        self.send_tcp(guest, tcp.dst, segment).await;
         tcp.seq = tcp.seq.wrapping_add(data.len() as u32);
     }
 
@@ -931,4 +955,498 @@ async fn a_published_port_reaches_the_guest() {
         &tokio::time::timeout(WAIT, client).await.unwrap().unwrap(),
         b"ok"
     );
+}
+
+/// Another guest's link, at `.{guest}` with its gateway one below.
+fn net_at(guest: u8) -> SandboxNet {
+    SandboxNet {
+        mac: [0x02, 0x00, 10, 99, 0, guest],
+        guest_ip: Ipv4Addr::new(10, 99, 0, guest),
+        gateway_ip: Ipv4Addr::new(10, 99, 0, guest - 1),
+        prefix: 30,
+        dns_ip: Ipv4Addr::new(10, 99, 0, guest - 1),
+        mtu: 1500,
+    }
+}
+
+fn member(id: &str, mode: NetworkMode, peers: &[Ipv4Addr]) -> Policy {
+    Policy::new(
+        SandboxPolicy {
+            sandbox_id: id.into(),
+            mode,
+            ..Default::default()
+        },
+        &[],
+        &[],
+        peers,
+    )
+}
+
+/// Two members of one network on one node, and a third sandbox on no
+/// network at all.
+async fn trio(mode: NetworkMode) -> (Guest, Guest, Guest, Arc<Node>) {
+    let (node, audit) = test_node().await;
+    let (a, b, c) = (net_at(6), net_at(10), net_at(14));
+    let alpha = Guest::attach_to(
+        &node,
+        Arc::clone(&audit),
+        a,
+        member("sbx_a", mode, &[b.guest_ip]),
+    );
+    let beta = Guest::attach_to(
+        &node,
+        Arc::clone(&audit),
+        b,
+        member("sbx_b", mode, &[a.guest_ip]),
+    );
+    let outsider = Guest::attach_to(&node, audit, c, member("sbx_c", NetworkMode::Open, &[]));
+    (alpha, beta, outsider, node)
+}
+
+/// The TCP header of a packet, and the packet's TTL.
+fn tcp_of(packet: &[u8]) -> (Received, u8, Option<u16>) {
+    let ip = Ipv4Packet::new_checked(packet).unwrap();
+    let tcp = TcpPacket::new_checked(ip.payload()).unwrap();
+    let repr = TcpRepr::parse(
+        &tcp,
+        &ip.src_addr().into(),
+        &ip.dst_addr().into(),
+        &ChecksumCapabilities::default(),
+    )
+    .expect("a valid segment");
+    (
+        Received {
+            from: SocketAddr::new(IpAddr::V4(ip.src_addr()), tcp.src_port()),
+            port: tcp.dst_port(),
+            syn: tcp.syn(),
+            ack: tcp.ack(),
+            fin: tcp.fin(),
+            rst: tcp.rst(),
+            seq: tcp.seq_number().0 as u32,
+            payload: tcp.payload().to_vec(),
+        },
+        ip.hop_limit(),
+        repr.max_seg_size,
+    )
+}
+
+#[tokio::test]
+async fn peers_reach_each_other_unterminated() {
+    let (mut alpha, mut beta, _outsider, node) = trio(NetworkMode::None).await;
+    let (a, b) = (alpha.net.guest_ip, beta.net.guest_ip);
+    let to_b = SocketAddr::from((b, 8080));
+
+    alpha.send_tcp(a, to_b, Segment::syn(40100, 1000)).await;
+    let syn = beta.recv_ip(IpProtocol::Tcp, WAIT).await.expect("the syn");
+    let (syn, ttl, mss) = tcp_of(&syn);
+    // The guest's own segment, a hop on: nothing in between answered it.
+    assert!(syn.syn && !syn.ack);
+    assert_eq!(
+        (syn.from, syn.port, syn.seq),
+        (SocketAddr::from((a, 40100)), 8080, 1000)
+    );
+    assert_eq!(ttl, 63);
+    assert_eq!(mss, Some(1460), "a flow on one node keeps its MSS");
+    assert!(
+        alpha.recv(QUIET).await.is_none(),
+        "the sender is not answered for"
+    );
+
+    let synack = Segment {
+        port: 8080,
+        control: TcpControl::Syn,
+        seq: 5000,
+        ack: Some(1001),
+        payload: &[],
+    };
+    beta.send_tcp(b, SocketAddr::from((a, 40100)), synack).await;
+    let reply = alpha.recv_tcp(WAIT).await.expect("the syn-ack");
+    assert!(reply.syn && reply.ack);
+    assert_eq!((reply.from, reply.seq), (to_b, 5000));
+
+    let mut tcp = Tcp {
+        port: 40100,
+        dst: to_b,
+        seq: 1001,
+        ack: 5001,
+    };
+    alpha.write(&mut tcp, b"hello").await;
+    let data = beta.recv_tcp(WAIT).await.expect("data");
+    assert_eq!(data.payload, b"hello");
+    assert_eq!(node.router.tracked(), 1);
+}
+
+#[tokio::test]
+async fn a_non_member_is_refused_and_never_delivered() {
+    let (_alpha, mut beta, mut outsider, node) = trio(NetworkMode::Open).await;
+    let (b, c) = (beta.net.guest_ip, outsider.net.guest_ip);
+
+    outsider
+        .send_tcp(c, SocketAddr::from((b, 8080)), Segment::syn(40110, 1))
+        .await;
+    let refused = outsider.recv_tcp(WAIT).await.expect("a reset");
+    assert!(refused.rst);
+    outsider
+        .audited(|e| e.reason == "destination is another sandbox" && !e.is_allowed)
+        .await;
+    outsider.send_udp((c, 5000), (b, 5000), b"hi").await;
+    assert!(beta.recv(QUIET).await.is_none());
+    assert_eq!(node.router.tracked(), 0);
+
+    // Nor can a member reach out to it.
+    beta.send_tcp(b, SocketAddr::from((c, 22)), Segment::syn(40111, 1))
+        .await;
+    assert!(beta.recv_tcp(WAIT).await.unwrap().rst);
+    assert!(outsider.recv(QUIET).await.is_none());
+}
+
+#[tokio::test]
+async fn the_receiver_has_to_admit_the_sender() {
+    let (node, audit) = test_node().await;
+    let (a, b) = (net_at(6), net_at(10));
+    let mut alpha = Guest::attach_to(
+        &node,
+        Arc::clone(&audit),
+        a,
+        member("sbx_a", NetworkMode::None, &[b.guest_ip]),
+    );
+    let beta = Guest::attach_to(&node, audit, b, member("sbx_b", NetworkMode::None, &[]));
+
+    alpha
+        .send_tcp(
+            a.guest_ip,
+            SocketAddr::from((b.guest_ip, 8080)),
+            Segment::syn(40120, 1),
+        )
+        .await;
+    assert!(beta.recv(QUIET).await.is_none());
+    let event = alpha
+        .audited(|e| e.reason == "source shares no private network with this sandbox")
+        .await;
+    assert_eq!(event.sandbox_id, "sbx_a");
+}
+
+#[tokio::test]
+async fn allowlist_traffic_to_a_peer_skips_the_proxy() {
+    let (mut alpha, beta, _outsider, _node) = trio(NetworkMode::Allowlist).await;
+    let (a, b) = (alpha.net.guest_ip, beta.net.guest_ip);
+    alpha
+        .send_tcp(a, SocketAddr::from((b, 443)), Segment::syn(40130, 7))
+        .await;
+    let syn = beta.recv_tcp(WAIT).await.expect("the syn, not the proxy");
+    assert!(syn.syn && syn.seq == 7);
+    assert!(alpha.recv(QUIET).await.is_none());
+}
+
+#[tokio::test]
+async fn a_policy_change_cuts_flows_between_peers() {
+    let (mut alpha, mut beta, _outsider, node) = trio(NetworkMode::Open).await;
+    let (a, b) = (alpha.net.guest_ip, beta.net.guest_ip);
+    let to_b = SocketAddr::from((b, 8080));
+    alpha.send_tcp(a, to_b, Segment::syn(40140, 1000)).await;
+    beta.recv_tcp(WAIT).await.expect("the syn");
+    let synack = Segment {
+        port: 8080,
+        control: TcpControl::Syn,
+        seq: 5000,
+        ack: Some(1001),
+        payload: &[],
+    };
+    beta.send_tcp(b, SocketAddr::from((a, 40140)), synack).await;
+    alpha.recv_tcp(WAIT).await.expect("the syn-ack");
+    let mut tcp = Tcp {
+        port: 40140,
+        dst: to_b,
+        seq: 1001,
+        ack: 5001,
+    };
+    alpha.write(&mut tcp, b"x").await;
+    beta.recv_tcp(WAIT).await.expect("data");
+
+    // The network is left.
+    alpha
+        .policy
+        .send_replace(member("sbx_a", NetworkMode::Open, &[]));
+    let to_alpha = alpha.recv_tcp(WAIT).await.expect("a reset for the sender");
+    assert!(to_alpha.rst);
+    assert_eq!((to_alpha.from, to_alpha.seq), (to_b, 5001));
+    let to_beta = beta.recv_tcp(WAIT).await.expect("a reset for the receiver");
+    assert!(to_beta.rst);
+    assert_eq!(to_beta.from, SocketAddr::from((a, 40140)));
+    assert_eq!(node.router.tracked(), 0);
+    alpha
+        .audited(|e| e.reason == "connection reset: the policy now denies this peer")
+        .await;
+
+    // And nothing more of it gets through.
+    alpha.write(&mut tcp, b"y").await;
+    assert!(beta.recv(QUIET).await.is_none());
+}
+
+#[tokio::test]
+async fn icmp_and_udp_reach_a_peer() {
+    let (mut alpha, mut beta, _outsider, _node) = trio(NetworkMode::None).await;
+    let (a, b) = (alpha.net.guest_ip, beta.net.guest_ip);
+    alpha.send_udp((a, 6000), (b, 7000), b"ping").await;
+    let (from, port, data) = beta.recv_udp(WAIT).await.expect("the datagram");
+    assert_eq!(
+        (from, port, data.as_slice()),
+        (SocketAddr::from((a, 6000)), 7000, &b"ping"[..])
+    );
+    beta.send_udp((b, 7000), (a, 6000), b"pong").await;
+    let (_, _, data) = alpha.recv_udp(WAIT).await.expect("the reply");
+    assert_eq!(data, b"pong");
+
+    let echo = Icmpv4Repr::EchoRequest {
+        ident: 9,
+        seq_no: 1,
+        data: b"abc",
+    };
+    let mut body = vec![0u8; echo.buffer_len()];
+    echo.emit(
+        &mut Icmpv4Packet::new_unchecked(&mut body),
+        &ChecksumCapabilities::default(),
+    );
+    alpha.send_ip(a, b, IpProtocol::Icmp, &body).await;
+    let request = beta
+        .recv_ip(IpProtocol::Icmp, WAIT)
+        .await
+        .expect("the echo request");
+    let ip = Ipv4Packet::new_checked(&request[..]).unwrap();
+    assert_eq!(ip.src_addr(), a);
+}
+
+/// Stands in for the WireGuard mesh: the node at 10.99.4.0/22.
+#[derive(Default)]
+struct FakeMesh {
+    sent: Mutex<Vec<Vec<u8>>>,
+}
+
+impl Uplink for FakeMesh {
+    fn routes(&self, address: Ipv4Addr) -> bool {
+        address.octets()[..2] == [10, 99] && (4..8).contains(&address.octets()[2])
+    }
+
+    fn send(&self, packet: &[u8]) {
+        self.sent.lock().unwrap().push(packet.to_vec());
+    }
+}
+
+#[tokio::test]
+async fn the_mesh_carries_peers_on_other_nodes_and_nothing_else() {
+    let remote_peer = Ipv4Addr::new(10, 99, 4, 6);
+    let (node, audit) = test_node().await;
+    let mesh = Arc::new(FakeMesh::default());
+    let uplink: Arc<dyn Uplink> = mesh.clone();
+    node.router.set_uplink(Arc::downgrade(&uplink));
+    let a = net_at(6);
+    let mut alpha = Guest::attach_to(
+        &node,
+        audit,
+        a,
+        member("sbx_a", NetworkMode::Open, &[remote_peer]),
+    );
+
+    alpha
+        .send_tcp(
+            a.guest_ip,
+            SocketAddr::from((remote_peer, 5432)),
+            Segment::syn(40150, 1),
+        )
+        .await;
+    let sent = tokio::time::timeout(WAIT, async {
+        loop {
+            if let Some(packet) = mesh.sent.lock().unwrap().first().cloned() {
+                return packet;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("the syn on the mesh");
+    let (syn, ttl, mss) = tcp_of(&sent);
+    assert!(syn.syn && ttl == 63);
+    assert_eq!(mss, Some(MESH_MSS), "clamped to what the mesh carries");
+
+    // The peer's syn-ack comes back over the mesh.
+    let reply = {
+        let repr = TcpRepr {
+            src_port: 5432,
+            dst_port: 40150,
+            control: TcpControl::Syn,
+            seq_number: TcpSeqNumber(900),
+            ack_number: Some(TcpSeqNumber(2)),
+            window_len: 65535,
+            window_scale: None,
+            max_seg_size: Some(1460),
+            sack_permitted: false,
+            sack_ranges: [None; 3],
+            timestamp: None,
+            payload: &[],
+        };
+        let ip = Ipv4Repr {
+            src_addr: remote_peer,
+            dst_addr: a.guest_ip,
+            next_header: IpProtocol::Tcp,
+            payload_len: repr.buffer_len(),
+            hop_limit: 64,
+        };
+        let mut packet = vec![0u8; 20 + repr.buffer_len()];
+        let mut header = Ipv4Packet::new_unchecked(&mut packet[..]);
+        ip.emit(&mut header, &ChecksumCapabilities::default());
+        repr.emit(
+            &mut TcpPacket::new_unchecked(header.payload_mut()),
+            &remote_peer.into(),
+            &a.guest_ip.into(),
+            &ChecksumCapabilities::default(),
+        );
+        packet
+    };
+    node.router.from_mesh(&reply);
+    let got = alpha
+        .recv_ip(IpProtocol::Tcp, WAIT)
+        .await
+        .expect("the syn-ack");
+    let (synack, _, mss) = tcp_of(&got);
+    assert!(synack.syn && synack.ack && synack.seq == 900);
+    assert_eq!(mss, Some(MESH_MSS));
+
+    // An unsolicited packet from a node's sandbox that is no member is not
+    // delivered, and neither is one claiming a source outside the pool.
+    let mut stranger = reply.clone();
+    Ipv4Packet::new_unchecked(&mut stranger[..]).set_src_addr(Ipv4Addr::new(10, 99, 4, 7));
+    node.router.from_mesh(&stranger);
+    let mut outside = reply;
+    Ipv4Packet::new_unchecked(&mut outside[..]).set_src_addr(REMOTE);
+    node.router.from_mesh(&outside);
+    assert!(alpha.recv(QUIET).await.is_none());
+
+    // Open-mode egress outside the pool never touches the mesh.
+    let before = mesh.sent.lock().unwrap().len();
+    alpha.route(remote(7), echo_server().await);
+    alpha.connect(40151, remote(7)).await;
+    assert_eq!(mesh.sent.lock().unwrap().len(), before);
+}
+
+#[tokio::test]
+async fn internal_names_resolve_for_members_only() {
+    use burrow_proxy::directory::Member;
+    let (alpha, mut beta, mut outsider, node) = trio(NetworkMode::Allowlist).await;
+    let (a, b, c) = (alpha.net.guest_ip, beta.net.guest_ip, outsider.net.guest_ip);
+    node.directory.replace(
+        [(
+            "team".to_string(),
+            vec![
+                Member {
+                    sandbox_id: "sbx_a".into(),
+                    alias: "api".into(),
+                    address: a,
+                },
+                Member {
+                    sandbox_id: "sbx_b".into(),
+                    alias: "worker".into(),
+                    address: b,
+                },
+            ],
+        )]
+        .into(),
+    );
+    let resolver = beta.net.dns_ip;
+    beta.send_udp((b, 5353), (resolver, 53), &dns_query("api.team.internal"))
+        .await;
+    let (_, _, answer) = beta.recv_udp(WAIT).await.expect("an answer");
+    assert_eq!(answer[3] & 0x0f, 0, "NOERROR");
+    assert_eq!(&answer[answer.len() - 4..], &a.octets());
+
+    let resolver = outsider.net.dns_ip;
+    outsider
+        .send_udp((c, 5353), (resolver, 53), &dns_query("api.team.internal"))
+        .await;
+    let (_, _, answer) = outsider.recv_udp(WAIT).await.expect("an answer");
+    assert_eq!(answer[3] & 0x0f, 3, "NXDOMAIN");
+}
+
+fn mesh_key() -> (String, String) {
+    use base64::Engine as _;
+    let secret = x25519_dalek::StaticSecret::random();
+    let public = x25519_dalek::PublicKey::from(&secret);
+    let encode = |bytes: &[u8]| base64::engine::general_purpose::STANDARD.encode(bytes);
+    (encode(&secret.to_bytes()), encode(public.as_bytes()))
+}
+
+/// Two nodes' userspace meshes over loopback. The second is told no
+/// endpoint for the first, as a Mac is not for a Linux node whose name only
+/// its own network resolves, and answers wherever the first is heard from.
+#[tokio::test]
+async fn sandboxes_on_two_nodes_reach_each_other_over_the_mesh() {
+    let (here, here_audit) = test_node().await;
+    let (there, there_audit) = test_node().await;
+    let (here_private, here_public) = mesh_key();
+    let (there_private, there_public) = mesh_key();
+    let loopback = SocketAddr::from((Ipv4Addr::LOCALHOST, 0));
+    let here_mesh = Mesh::start(loopback, &here_private, Arc::clone(&here.router))
+        .await
+        .unwrap();
+    let there_mesh = Mesh::start(loopback, &there_private, Arc::clone(&there.router))
+        .await
+        .unwrap();
+    here_mesh
+        .configure(&[crate::mesh::Peer {
+            node_id: "there".into(),
+            public_key: there_public,
+            endpoint: there_mesh.local_addr().unwrap().to_string(),
+            subnet: "10.99.4.0/22".into(),
+        }])
+        .await;
+    there_mesh
+        .configure(&[crate::mesh::Peer {
+            node_id: "here".into(),
+            public_key: here_public,
+            endpoint: "node-here.invalid:51820".into(),
+            subnet: "10.99.0.0/22".into(),
+        }])
+        .await;
+
+    let a = net_at(6);
+    let b = SandboxNet {
+        mac: [0x02, 0x00, 10, 99, 4, 6],
+        guest_ip: Ipv4Addr::new(10, 99, 4, 6),
+        gateway_ip: Ipv4Addr::new(10, 99, 4, 5),
+        prefix: 30,
+        dns_ip: Ipv4Addr::new(10, 99, 4, 5),
+        mtu: 1500,
+    };
+    let mut alpha = Guest::attach_to(
+        &here,
+        here_audit,
+        a,
+        member("sbx_a", NetworkMode::None, &[b.guest_ip]),
+    );
+    let mut beta = Guest::attach_to(
+        &there,
+        there_audit,
+        b,
+        member("sbx_b", NetworkMode::None, &[a.guest_ip]),
+    );
+
+    alpha
+        .send_udp((a.guest_ip, 6000), (b.guest_ip, 7000), b"across")
+        .await;
+    let (from, port, data) = beta.recv_udp(WAIT).await.expect("the datagram, decrypted");
+    assert_eq!((from, port), (SocketAddr::from((a.guest_ip, 6000)), 7000));
+    assert_eq!(data, b"across");
+    beta.send_udp((b.guest_ip, 7000), (a.guest_ip, 6000), b"back")
+        .await;
+    let (_, _, data) = alpha.recv_udp(WAIT).await.expect("the reply");
+    assert_eq!(data, b"back");
+
+    // And a flow opened from the far side, which knows the way now.
+    beta.send_tcp(
+        b.guest_ip,
+        SocketAddr::from((a.guest_ip, 22)),
+        Segment::syn(40160, 3),
+    )
+    .await;
+    let syn = alpha.recv_tcp(WAIT).await.expect("the syn");
+    assert!(syn.syn && syn.seq == 3);
 }

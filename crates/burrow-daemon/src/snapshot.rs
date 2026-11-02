@@ -120,6 +120,10 @@ pub struct Manifest {
     /// fetched whole.
     #[serde(default)]
     pub is_chunked: bool,
+    /// The inspection root its guest trusted, when it was inspected; see
+    /// [`crate::durable::Manifest::inspection_root`].
+    #[serde(default)]
+    pub inspection_root: String,
 }
 
 impl Manifest {
@@ -158,6 +162,7 @@ impl Manifest {
             hypervisor: self
                 .hypervisor()
                 .map_or_else(|_| self.hypervisor.clone(), |h| h.to_string()),
+            inspection_root_fingerprint: self.inspection_root.clone(),
         }
     }
 }
@@ -257,6 +262,8 @@ pub struct Staged {
     pub hypervisor: burrow_vmm::Hypervisor,
     /// Memory files in the staging directory, oldest first.
     pub chain: Vec<String>,
+    /// The inspection root the source's guest trusted, if it was inspected.
+    pub inspection_root: String,
 }
 
 impl SnapshotStore {
@@ -355,6 +362,7 @@ impl SnapshotStore {
             kernel_digest: String::new(),
             rootfs_digest: String::new(),
             is_chunked: false,
+            inspection_root: staged.inspection_root,
         };
         write_manifest(&dir, &manifest).await?;
 
@@ -1204,6 +1212,7 @@ mod tests {
             kernel_digest: String::new(),
             rootfs_digest: String::new(),
             is_chunked: false,
+            inspection_root: String::new(),
         }
     }
 

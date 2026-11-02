@@ -50,6 +50,10 @@ service Guest {
   rpc CreateGroup(CreateGroupRequest) returns (CreateGroupResponse);
   rpc AddUserToGroup(GroupMembership) returns (GroupMembershipResponse);
   rpc RemoveUserFromGroup(GroupMembership) returns (GroupMembershipResponse);
+  // Only accounts CreateUser or CreateGroup could have made: never root, a
+  // system or built-in account, an administrator or one the agent relies on.
+  rpc DeleteUser(DeleteUserRequest) returns (DeleteUserResponse);
+  rpc DeleteGroup(DeleteGroupRequest) returns (DeleteGroupResponse);
 }
 
 message CreateUserRequest {
@@ -73,6 +77,31 @@ message CreateGroupResponse {
   uint32 gid = 2;
   // Group-owned, 2770 setgid, so files created inside stay group-readable.
   string shared_dir = 3;
+}
+
+message DeleteUserRequest {
+  string name = 1;
+  // Removes the home as well. Otherwise it is kept, handed to root on POSIX
+  // guests so an account that later reuses the id does not inherit it.
+  bool is_home_removed = 2;
+}
+
+message DeleteUserResponse {
+  string home = 1;
+  bool is_home_removed = 2;
+}
+
+message DeleteGroupRequest {
+  string name = 1;
+  // Removes the group's shared directory as well. Otherwise it is kept, as a
+  // home is.
+  bool is_shared_dir_removed = 2;
+}
+
+message DeleteGroupResponse {
+  // Empty when the group had no shared directory.
+  string shared_dir = 1;
+  bool is_shared_dir_removed = 2;
 }
 
 message GroupMembership {

@@ -273,4 +273,38 @@ impl Guest for AgentService {
         os::users::remove_from_group(&req.user, &req.group).await?;
         Ok(Response::new(guestpb::GroupMembershipResponse {}))
     }
+
+    async fn delete_user(
+        &self,
+        req: Request<guestpb::DeleteUserRequest>,
+    ) -> Result<Response<guestpb::DeleteUserResponse>, Status> {
+        let req = req.into_inner();
+        let running = commands::list().commands.into_iter().any(|command| {
+            command.state == "running"
+                && command
+                    .user
+                    .split(':')
+                    .next()
+                    .is_some_and(|user| user.eq_ignore_ascii_case(&req.name))
+        });
+        if running {
+            return Err(Status::failed_precondition(format!(
+                "user {} has running commands; end them first",
+                req.name
+            )));
+        }
+        Ok(Response::new(
+            os::users::delete_user(&req.name, req.is_home_removed).await?,
+        ))
+    }
+
+    async fn delete_group(
+        &self,
+        req: Request<guestpb::DeleteGroupRequest>,
+    ) -> Result<Response<guestpb::DeleteGroupResponse>, Status> {
+        let req = req.into_inner();
+        Ok(Response::new(
+            os::users::delete_group(&req.name, req.is_shared_dir_removed).await?,
+        ))
+    }
 }

@@ -15,7 +15,8 @@ that mounts it.
 ## What a volume actually is
 
 An ext4 image on one node, attached to the guest as a virtio block device, and
-mounted by the agent at the path you named. That is not an implementation
+mounted by the agent at the path you named. (A Windows guest formats it NTFS
+and a macOS one HFS+; see below.) That is not an implementation
 detail you can ignore, because it decides the three rules below.
 
 Firecracker offers no shared filesystem. There is no virtio-fs and no 9p, so
@@ -65,6 +66,34 @@ a live writer sees its own cached metadata go stale as the disk moves under it.
 
 So the pattern for seeding is sequential: fill the volume from one sandbox, let
 that sandbox go, then fan out as many readers as you like.
+
+### A reader sees everything the last writer wrote
+
+A reader cannot replay a journal: its disk is read-only, so the guest mounts
+ext4 `norecovery` and takes the filesystem as it stands. A writer that went
+without unmounting (deleted, stopped, crashed, or killed with its node) can
+have left its last writes in the journal and nowhere else, and a reader would
+not see them. So the node replays it first: when a read-only mount is
+claimed, the node reads the image's superblock, and if a writer left it
+mounted, runs `e2fsck -E journal_only` on it before anything attaches. The
+claim is taken before the replay, so no writer can arrive during it, and a
+second reader arriving meanwhile waits for it and finds the image clean.
+Nothing has to have been recorded when the writer went, so a writer the node
+never saw go, one that crashed or died with a node restart, is covered the
+same way as a delete. A writer that unmounted cleanly left nothing to do, and
+costs one block read.
+
+What a writer had in memory and never wrote out is lost, as it would be on a
+power cut. A delete or a stop asks a writer's guest to `sync` first, so what a
+program had written by then reaches the journal and the reader sees it. A
+crash keeps only what the guest had already committed, ext4's five seconds by
+default.
+
+The exception is a writer that is only suspended. Its guest still has the
+filesystem mounted and resumes onto it, so the journal is its own: a reader
+mounted past it sees what that writer had written back to the filesystem and
+nothing it had only journaled. The node leaves the journal alone until the
+suspended writer goes and no reader is mounted past it.
 
 ### A volume never moves
 
@@ -161,6 +190,99 @@ Mount paths must be absolute, and:
 
 At most 8 volumes per sandbox, which is what the `/dev/vdc` onwards naming
 allows.
+
+## A volume belongs to one guest OS
+
+The filesystem is the guest's: ext4 from a Linux guest, NTFS from a Windows
+one, HFS+ from a macOS one, and no guest mounts the others' kind. So the first
+writable mount decides which a volume is, and the node records it beside the
+image (`guest_os` in `volume.json`). After that a sandbox of another OS is
+refused before it boots, reader or writer:
+
+```text
+volume build-cache holds the filesystem a linux guest made (ext4), which a windows guest cannot mount
+```
+
+A read-only mount decides nothing: on a volume nothing has written, the guest
+finds no filesystem and the create fails there, and the volume stays free for
+a writer of either kind. A volume from before the record is judged by what is
+on it: an ext4 that has ever been mounted is Linux's, HFS+ is macOS's, and the
+untouched ext4 a Linux node makes at create is anyone's.
+
+## Volumes on a Windows guest
+
+A Windows sandbox runs under Cloud Hypervisor, and its volumes are attached
+the same way as a Linux one's: the image is a virtio disk, read-only at the
+hypervisor for a read-only mount. Windows numbers disks in no order the node
+controls, so each volume's disk carries its identifier (`burrow-volume0`
+onwards) as its virtio serial number, and the agent finds it by that.
+
+The first writable mount initializes the blank disk GPT and formats one NTFS
+partition, labelled `burrow-volume`; the ext4 a Linux node made at create is
+not a partition table, so Windows sees it as blank. A mount then gives the
+partition the path asked for:
+
+- `/data` is the folder mount point `C:\data`, made if missing. It must be
+  empty, as any NTFS mount point must be. `/e/data` is `E:\data`, on a drive
+  that has to exist already.
+- A path that is just a drive letter, `/d`, mounts the volume as `D:`. The
+  system drive is refused.
+
+A drive letter Windows hands out on its own is taken away again, so the volume
+is reachable only where it was asked for. A read-only mount marks the disk
+read-only before bringing it online, so NTFS mounts it read-only rather than
+failing its first write.
+
+Ownership: a fresh volume's root gives Administrators and SYSTEM full control,
+as Windows formats it, and every signed-in user modify, which covers the
+accounts `CreateUser` makes. `:mode=` is not applied, since Windows has no
+mode bits, and there is no tmpfs: a `tmpfs:` mount fails the create.
+
+No node can replay an NTFS log: nothing outside Windows does that properly.
+A delete or a stop asks the guest to flush its NTFS volumes
+(`Write-VolumeCache`) instead, which leaves a reader nothing to recover. A
+Windows writer that crashed leaves its log to whichever guest mounts the
+volume next; a writable mount replays it, and whether Windows mounts it
+read-only cleanly without one is untested.
+
+The Windows side has run nowhere yet: no Windows guest boots on the dev
+harness (see `deploy/windows/README.md`). It is unit tested and lint clean for
+Windows targets.
+
+## Volumes on a macOS node
+
+A Mac node has no ext4. There a volume is a raw image of the size asked for,
+sparse until written, under the node's data directory (`volumes/<name>/`), made
+by `burrow volume create` with `--node-label os=macos` (or any label only Mac
+nodes carry). It is attached to the macOS guest as a virtio disk when the VM
+starts, after the guest's own disk, and the agent formats it journaled HFS+ the
+first time it is mounted writable. The rules above are unchanged: one writer,
+readers exclusive with a writer, claims released on suspend and taken again on
+resume, and a volume never moves off its Mac.
+
+What differs:
+
+- A mount point has to be on the guest's data volume, such as
+  `/Users/Shared/cache`, `/opt/data` or `/Volumes/work`. The root of a macOS
+  guest is the sealed system volume, so `--mount cache:/cache` fails the
+  create.
+- A create that mounts a volume boots cold, as everywhere; macOS guests have no
+  warm pool to skip anyway. Suspend and resume keep the mount: the disk is part
+  of the machine that was saved.
+- A read-only mount ignores the journal (`mount_hfs -j`), as Linux mounts
+  ext4 `norecovery`, and the node replays it first in the same way: HFS+
+  clears a bit in its volume header while mounted, and when a reader is
+  claimed on one a writer left mounted, the node attaches the image without
+  mounting it and runs `fsck_hfs -p`, which replays the journal and checks
+  nothing else.
+- The size is the image's, so it is enforced; `ls -s` on the node shows what it
+  really takes.
+
+Not a shared directory over virtio-fs, which Virtualization.framework offers:
+the guest presents one as a network volume, and macOS's privacy controls keep
+the agent out of network volumes unless an MDM profile grants it. Not APFS
+either: on a virtio disk the guest formats APFS with encryption keyed to that
+one machine, so no other sandbox could mount it.
 
 ## Volumes, snapshots and scratch disks
 

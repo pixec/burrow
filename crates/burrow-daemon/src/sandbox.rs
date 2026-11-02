@@ -31,8 +31,37 @@ const SCRATCH_IMAGE: &str = "scratch.ext4";
 /// The link shares the inode, so the volume's bytes are not copied and
 /// removing the sandbox's directory does not remove the volume.
 fn volume_image(index: usize) -> String {
-    format!("volume{index}.ext4")
+    match cfg!(target_os = "macos") {
+        true => format!("volume{index}.img"),
+        false => format!("volume{index}.ext4"),
+    }
 }
+
+/// Has the guest write what it holds in memory back to its disks, so a VMM
+/// killed next leaves them as the guest last saw them. Best effort: a guest
+/// that has stopped answering is stopped all the same.
+async fn flush_guest(sandbox: &RunningSandbox) {
+    let cmd: &[&str] = match burrow_vmm::GuestOs::from_record(&sandbox.record().guest_os) {
+        Some(burrow_vmm::GuestOs::Windows) => &[
+            "powershell.exe",
+            "-NoProfile",
+            "-NonInteractive",
+            "-Command",
+            "Get-Volume | Where-Object FileSystem -eq NTFS | Write-VolumeCache -ErrorAction SilentlyContinue",
+        ],
+        _ => &["sync"],
+    };
+    let start = burrow_proto::guest::v1::ExecStart {
+        cmd: cmd.iter().map(|arg| arg.to_string()).collect(),
+        ..Default::default()
+    };
+    let _ = tokio::time::timeout(
+        std::time::Duration::from_secs(15),
+        guestconn::run_to_completion(sandbox, start),
+    )
+    .await;
+}
+
 const DEFAULT_SCRATCH_MIB: u32 = 1024;
 
 /// Range the node draws from when a caller does not request a specific host
@@ -160,9 +189,19 @@ impl NodeConfig {
     /// burrow hands the API is already relative.
     fn sandbox_dir(&self, id: &str, hypervisor: Hypervisor) -> PathBuf {
         match self.jail_for(hypervisor) {
-            Some(jail) => jail.chroot_for(id),
+            Some(jail) => jail.chroot_for(hypervisor, id),
             None => self.data_dir.join("sandboxes").join(id),
         }
+    }
+
+    /// Removes a VM's working directory, and under the jail the directory
+    /// the chroot sits in.
+    pub(crate) async fn remove_workdir(&self, workdir: &Path) -> std::io::Result<()> {
+        let tree = match &self.jail {
+            Some(jail) => jail.tree_of(workdir),
+            None => workdir,
+        };
+        tokio::fs::remove_dir_all(tree).await
     }
 
     /// Where a sandbox's command output is kept: beside its directory rather
@@ -457,7 +496,7 @@ impl<'a> Provisioning<'a> {
         }
         self.manager.release_lease(&self.id).await;
         self.manager.volumes.release_all(&self.id);
-        let _ = tokio::fs::remove_dir_all(&self.workdir).await;
+        let _ = self.manager.config.remove_workdir(&self.workdir).await;
         let _ = tokio::fs::remove_dir_all(self.manager.config.command_logs_dir(&self.id)).await;
         self.is_kept = true;
         err
@@ -500,7 +539,7 @@ impl Drop for Provisioning<'_> {
                 }
                 manager.release_lease(&id).await;
                 manager.volumes.release_all(&id);
-                let _ = tokio::fs::remove_dir_all(&workdir).await;
+                let _ = manager.config.remove_workdir(&workdir).await;
             });
         }
     }
@@ -535,7 +574,9 @@ fn spawn_handshake(
         // Which step the deadline caught, so a guest that never came up says
         // whether its vsock never accepted or its agent never answered.
         let step = std::sync::Mutex::new("waiting for the guest's vsock to accept");
-        let outcome = match tokio::time::timeout(timeout, async {
+        // An upgrade has its own bound on top, for the new agent's first
+        // launch.
+        let outcome = match tokio::time::timeout(timeout + guestconn::UPGRADE_TIMEOUT, async {
             let (agent, _) = guestconn::connect_when_ready(guest.clone(), timeout).await?;
             *step.lock().unwrap() = "waiting for the agent to answer the handshake";
             let (agent, _) =
@@ -1174,6 +1215,7 @@ impl RunningSandbox {
     #[tracing::instrument(skip_all, fields(sandbox = %self.id()))]
     async fn resume(
         &self,
+        request: burrow_proto::guest::v1::HandshakeRequest,
         agent_timeout: std::time::Duration,
         upgrade: Option<&guestconn::GuestUpgrade>,
         is_stored: bool,
@@ -1209,14 +1251,7 @@ impl RunningSandbox {
 
         // `restored: true` is what tells the guest to reseed its RNG and reset
         // its clock, which it cannot know on its own.
-        guestconn::handshake_upgrading(
-            agent,
-            guest,
-            guestconn::handshake_request(true),
-            upgrade,
-            agent_timeout,
-        )
-        .await?;
+        guestconn::handshake_upgrading(agent, guest, request, upgrade, agent_timeout).await?;
         // This VM handshook synchronously, whatever the last one did. A failure
         // recorded there was a verdict on a VM that no longer exists.
         self.handshake.send_replace(Handshake::Done);
@@ -1294,6 +1329,9 @@ impl RunningSandbox {
         }
         // The guest starts its command ids over.
         self.logs.clear();
+        if crate::macnode::is_macos(spec.guest_os) {
+            crate::macnode::seed(&spec.workdir, &request.inspection_ca_pem).await;
+        }
         let vm = Vm::boot(spec.clone())
             .await
             .map_err(|err| Status::internal(format!("boot failed: {err}")))?;
@@ -1489,6 +1527,12 @@ impl RunningSandbox {
                 resources.scratch_disk_mib
             },
             chain,
+            inspection_root: self
+                .base_record
+                .lock()
+                .unwrap()
+                .inspection_root_fingerprint
+                .clone(),
         })
     }
 }
@@ -1497,6 +1541,17 @@ impl RunningSandbox {
 ///
 /// A live sandbox and a snapshot object hold the same files under the same
 /// names, which is what makes both restorable, so they differ only in the copy.
+/// What a macOS agent reports in Health when its Security framework trusts
+/// the inspection root it was given.
+const FEATURE_ROOT_TRUSTED: &str = "inspection-root-trusted";
+
+/// The certificate inspected guests trust and its fingerprint.
+#[derive(Clone)]
+struct InspectionRoot {
+    pem: String,
+    fingerprint: String,
+}
+
 enum RestoreSource<'a> {
     Sandbox(&'a Arc<RunningSandbox>),
     Snapshot {
@@ -1579,6 +1634,8 @@ pub struct SandboxManager {
     /// The userspace network stacks of sandboxes without a tap, which the
     /// firewall sync drives instead of nftables.
     usernets: crate::macnode::UserNets,
+    /// The macOS guests starting on this Mac, held against Apple's limit.
+    mac_slots: crate::macnode::Slots,
     /// Tailcat servers for the sandboxes shared here.
     shares: Arc<crate::share::Shares>,
     /// Source-address -> egress policy, consulted by the proxy.
@@ -1631,9 +1688,9 @@ pub struct SandboxManager {
     /// A create otherwise spends its whole time restoring a VM, waiting for its
     /// agent to accept and handshaking. Doing it in advance turns a create into
     /// bookkeeping.
-    /// PEM handed to sandboxes that opted in to TLS inspection. Set once at
-    /// startup, read on every create.
-    inspection_ca: Arc<std::sync::Mutex<Option<String>>>,
+    /// The root handed to sandboxes that opted in to TLS inspection. Set once
+    /// at startup, read on every create.
+    inspection_ca: Arc<std::sync::Mutex<Option<InspectionRoot>>>,
     /// Serialises the whole of [`SandboxManager::sync_firewall`].
     ///
     /// The render is taken from a snapshot of the sandbox map, but applying it
@@ -1848,6 +1905,7 @@ impl SandboxManager {
             ))),
             ports: Arc::new(Mutex::new(HashMap::new())),
             usernets: Default::default(),
+            mac_slots: Default::default(),
             proxy_policies,
             resolutions,
             denied,
@@ -1946,25 +2004,39 @@ impl SandboxManager {
         self.ipam.lock().await.subnet()
     }
 
-    /// Moves a sandbox's files into its jail when they were left outside one:
+    /// Moves a sandbox's files into its jail when they were left elsewhere:
     /// a Cloud Hypervisor sandbox from before it could be jailed, or from a
-    /// run with `--jailer` off. Without this the sandbox would be found with
-    /// no snapshot and discarded.
+    /// run with `--jailer` off, or from when every jail was under
+    /// `<base>/firecracker`. Without this the sandbox would be found with no
+    /// snapshot and discarded.
     async fn move_into_jail(&self, id: &str, hypervisor: Hypervisor, workdir: &Path) {
         let Some(jail) = self.config.jail_for(hypervisor) else {
             return;
         };
-        let unjailed = self.config.data_dir.join("sandboxes").join(id);
-        if tokio::fs::try_exists(workdir).await.unwrap_or(true)
-            || !tokio::fs::try_exists(&unjailed).await.unwrap_or(false)
-        {
+        if tokio::fs::try_exists(workdir).await.unwrap_or(true) {
             return;
         }
+        let mut found = None;
+        for dir in [
+            jail.chroot_for(Hypervisor::Firecracker, id),
+            self.config.data_dir.join("sandboxes").join(id),
+        ] {
+            if dir != workdir && tokio::fs::try_exists(&dir).await.unwrap_or(false) {
+                found = Some(dir);
+                break;
+            }
+        }
+        let Some(found) = found else {
+            return;
+        };
         let moved = async {
             if let Some(parent) = workdir.parent() {
                 tokio::fs::create_dir_all(parent).await?;
             }
-            tokio::fs::rename(&unjailed, workdir).await?;
+            tokio::fs::rename(&found, workdir).await?;
+            if jail.tree_of(&found) != found {
+                let _ = tokio::fs::remove_dir(jail.tree_of(&found)).await;
+            }
             let shared = [TEMPLATE_KERNEL.to_string(), TEMPLATE_ROOTFS.to_string()].into();
             grant_to_jail(workdir, jail, &shared).await
         };
@@ -2403,6 +2475,15 @@ impl SandboxManager {
             );
             return self.hold(&row, stored, None, false, reason).await;
         };
+        // Recorded before roots were: whatever this sandbox trusts, it was
+        // given on this node, by this node's root.
+        if stored.inspection_root_fingerprint.is_empty()
+            && !self
+                .inspection_ca_for(&stored.policy.clone().unwrap_or_default())
+                .is_empty()
+        {
+            stored.inspection_root_fingerprint = self.inspection_root();
+        }
         let workdir = self.config.sandbox_dir(&row.id, hypervisor);
         self.move_into_jail(&row.id, hypervisor, &workdir).await;
         let layout = hypervisor.layout();
@@ -2424,7 +2505,7 @@ impl SandboxManager {
             self.log_recorded(&stored, EVENT_DESTROYED, DETAIL_LOST)
                 .await;
             tap::delete(&row.tap).await;
-            let _ = tokio::fs::remove_dir_all(&workdir).await;
+            let _ = self.config.remove_workdir(&workdir).await;
             let _ = tokio::fs::remove_dir_all(self.config.command_logs_dir(&row.id)).await;
             let _ = self.store.delete_sandbox(&row.id).await;
             // Sessions describe a sandbox's VMs and have no owner once it is
@@ -2651,7 +2732,7 @@ impl SandboxManager {
             self.release_lease(&id).await;
         }
         if let Some(workdir) = &held.workdir
-            && let Err(err) = tokio::fs::remove_dir_all(workdir).await
+            && let Err(err) = self.config.remove_workdir(workdir).await
         {
             tracing::warn!(sandbox = id, %err, "failed to remove sandbox directory");
         }
@@ -2702,10 +2783,15 @@ impl SandboxManager {
                 .collect::<std::collections::HashSet<_>>(),
         )];
         if let Some(jail) = &self.config.jail {
-            roots.push((
-                jail.chroot_base.join("firecracker"),
-                known.iter().map(|id| jail.dir_for(id)).collect(),
-            ));
+            for hypervisor in Hypervisor::ALL {
+                roots.push((
+                    jail.hypervisor_dir(hypervisor),
+                    known
+                        .iter()
+                        .map(|id| jail.dir_for(hypervisor, id))
+                        .collect(),
+                ));
+            }
         }
         let logs_root = self.config.data_dir.join("command-logs");
         roots.push((
@@ -3442,15 +3528,59 @@ impl SandboxManager {
         self.sandboxes.lock().await.len()
     }
 
-    /// Records the authority sandboxes that opt in should trust.
-    pub fn set_inspection_ca(&self, pem: String) {
-        *self.inspection_ca.lock().unwrap() = Some(pem);
+    /// Records the root sandboxes that opt in should trust, and its
+    /// fingerprint.
+    pub fn set_inspection_ca(&self, pem: String, fingerprint: String) {
+        *self.inspection_ca.lock().unwrap() = Some(InspectionRoot { pem, fingerprint });
     }
 
-    /// The node's egress pieces for its sandboxes' userspace network stacks.
+    /// Holds one of the Mac's macOS guest slots for `id` while its VM starts,
+    /// or nothing for any other guest.
+    pub(crate) async fn reserve_mac_slot(
+        &self,
+        id: &str,
+        guest_os: burrow_vmm::GuestOs,
+    ) -> Result<Option<crate::macnode::Slot>, Status> {
+        if !crate::macnode::is_macos(guest_os) {
+            return Ok(None);
+        }
+        let sandboxes = self.sandboxes.lock().await;
+        let running = sandboxes
+            .values()
+            .filter(|sandbox| {
+                sandbox.is_running()
+                    && burrow_vmm::GuestOs::from_record(
+                        &sandbox.base_record.lock().unwrap().guest_os,
+                    ) == Some(guest_os)
+            })
+            .map(|sandbox| sandbox.id().to_string());
+        self.mac_slots.reserve(id, running).map(Some)
+    }
+
+    /// The node's egress pieces for its sandboxes' userspace network
+    /// stacks, and the address their published ports listen on.
     #[cfg(target_os = "macos")]
-    pub fn set_usernet_node(&self, node: burrow_net::usernet::Node) {
-        self.usernets.set_node(node);
+    pub fn set_usernet_node(
+        &self,
+        node: burrow_net::usernet::Node,
+        publish_address: std::net::IpAddr,
+    ) {
+        self.usernets.set_node(node, publish_address);
+    }
+
+    /// Joins the userspace stacks to the node mesh on one UDP socket.
+    #[cfg(target_os = "macos")]
+    pub async fn start_usernet_mesh(
+        &self,
+        listen: std::net::SocketAddr,
+        private_key: &str,
+    ) -> std::io::Result<()> {
+        self.usernets.start_mesh(listen, private_key).await
+    }
+
+    /// Replaces the userspace mesh's peers, where there is one.
+    pub async fn configure_usernet_mesh(&self, peers: &[burrow_net::Peer]) {
+        self.usernets.configure_mesh(peers).await;
     }
 
     /// The CA to hand this sandbox, if its policy asked for inspection.
@@ -3465,8 +3595,44 @@ impl SandboxManager {
         self.inspection_ca
             .lock()
             .unwrap()
-            .clone()
+            .as_ref()
+            .map(|root| root.pem.clone())
             .unwrap_or_default()
+    }
+
+    /// The fingerprint of the root this node's inspected sandboxes trust.
+    fn inspection_root(&self) -> String {
+        self.inspection_ca
+            .lock()
+            .unwrap()
+            .as_ref()
+            .map(|root| root.fingerprint.clone())
+            .unwrap_or_default()
+    }
+
+    /// The fingerprint to record for a sandbox given `request`: the node's
+    /// root when the handshake carries it, nothing otherwise.
+    fn inspection_root_of(&self, request: &burrow_proto::guest::v1::HandshakeRequest) -> String {
+        if request.inspection_ca_pem.is_empty() {
+            return String::new();
+        }
+        self.inspection_root()
+    }
+
+    /// Refuses to restore a guest that trusts `wanted` here, when this node's
+    /// leaves chain to another root: every inspected connection it holds
+    /// would fail, and the processes holding them never reread a trust store.
+    #[allow(clippy::result_large_err)]
+    fn require_inspection_root(&self, id: &str, wanted: &str) -> Result<(), Status> {
+        let own = self.inspection_root();
+        if wanted.is_empty() || wanted == own {
+            return Ok(());
+        }
+        Err(Status::failed_precondition(format!(
+            "sandbox {id}'s guest trusts the TLS inspection root {wanted}, and this node's \
+             inspection root is {own}; inspected sandboxes move only between nodes under one \
+             fleet root (`burrowd ca`)"
+        )))
     }
 
     /// Bundles this template's image names in its own environment, which the
@@ -3502,7 +3668,8 @@ impl SandboxManager {
             .inspection_ca
             .lock()
             .unwrap()
-            .clone()
+            .as_ref()
+            .map(|root| root.pem.clone())
             .unwrap_or_default();
         if ca.is_empty() {
             return crate::warm::Trust::default();
@@ -3972,7 +4139,7 @@ impl SandboxManager {
         // onwards and match what the handshake tells the agent to mount.
         for (index, mount) in crate::volume::block_mounts(volumes) {
             spec.drives.push(DriveSpec {
-                id: format!("volume{index}"),
+                id: crate::volume::drive_id(index, guest_os),
                 path: volume_image(index),
                 is_root: false,
                 is_read_only: mount.is_read_only,
@@ -4041,8 +4208,38 @@ impl SandboxManager {
         if is_warmable {
             self.warm_for_demand(&ShapeKey::of(&template, &resources));
         }
-        self.create_seeded(id, template, policy, metadata, node_id, None, name)
-            .await
+        let record = self
+            .create_seeded(id, template, policy, metadata, node_id, None, name)
+            .await?;
+        self.warn_if_root_untrusted(&record);
+        Ok(record)
+    }
+
+    /// Warns when an inspected macOS guest's Security framework does not
+    /// trust the inspection root: curl and OpenSSL tools there verify the
+    /// proxy, while URLSession, Safari, Swift and Go reject it.
+    fn warn_if_root_untrusted(&self, record: &common::Sandbox) {
+        let is_macos = burrow_vmm::GuestOs::from_record(&record.guest_os)
+            .is_some_and(crate::macnode::is_macos);
+        if !is_macos || record.inspection_root_fingerprint.is_empty() {
+            return;
+        }
+        let manager = self.clone();
+        let (id, template) = (record.id.clone(), record.template.clone());
+        tokio::spawn(async move {
+            let Ok(sandbox) = manager.get(&id).await else {
+                return;
+            };
+            if let Ok(false) = sandbox.agent_has(FEATURE_ROOT_TRUSTED).await {
+                tracing::warn!(
+                    sandbox = id,
+                    template,
+                    "this macOS guest's admin trust settings do not trust the TLS inspection \
+                     root, so apps on Apple's TLS stack reject inspected connections; writing \
+                     it onto the disk before boot failed (logged above)"
+                );
+            }
+        });
     }
 
     /// Creates a sandbox whose scratch disk starts from an existing image.
@@ -4074,6 +4271,19 @@ impl SandboxManager {
                 return Err(Status::already_exists(format!("sandbox {id} exists")));
             }
         }
+        // Held until the sandbox is registered running, so a create racing
+        // this one sees it either starting or running.
+        let slot = match self.image_environment(&template).await.machine() {
+            Ok((_, guest_os)) => self.reserve_mac_slot(&id, guest_os).await,
+            Err(_) => Ok(None),
+        };
+        let _slot = match slot {
+            Ok(slot) => slot,
+            Err(err) => {
+                self.creating.lock().await.remove(&id);
+                return Err(err);
+            }
+        };
 
         let provisioned = self
             .provision_with(id.clone(), template, policy, seed_scratch, node_id)
@@ -4121,6 +4331,36 @@ impl SandboxManager {
         Ok(record)
     }
 
+    /// Takes one sandbox's volume claims and readies the images under them,
+    /// all before anything attaches one; see [`crate::volume::VolumeStore::prepare`].
+    async fn claim_volumes(
+        &self,
+        id: &str,
+        volumes: &[common::VolumeMount],
+        guest_os: burrow_vmm::GuestOs,
+    ) -> Result<(), Status> {
+        self.volumes.claim(id, volumes)?;
+        let dormant: std::collections::HashSet<String> = self
+            .sandboxes
+            .lock()
+            .await
+            .values()
+            .filter(|sandbox| sandbox.id() != id && sandbox.is_suspended())
+            .flat_map(|sandbox| sandbox.record().policy.unwrap_or_default().volumes)
+            .filter(|mount| !mount.is_tmpfs && !mount.is_read_only)
+            .map(|mount| mount.volume)
+            .collect();
+        if let Err(err) = self
+            .volumes
+            .prepare(volumes, guest_os.as_str(), &dormant)
+            .await
+        {
+            self.volumes.release_all(id);
+            return Err(err);
+        }
+        Ok(())
+    }
+
     async fn provision_with(
         &self,
         id: String,
@@ -4147,16 +4387,6 @@ impl SandboxManager {
                 "template {template} is a {} guest, which {hypervisor} cannot run",
                 guest_os.as_str()
             )));
-        }
-        if crate::macnode::is_macos(guest_os) {
-            let running = self
-                .sandboxes
-                .lock()
-                .await
-                .values()
-                .filter(|sandbox| sandbox.hypervisor == hypervisor && sandbox.is_running())
-                .count();
-            crate::macnode::check_running(running)?;
         }
         let layout = hypervisor.layout();
         let workdir = self.config.sandbox_dir(&id, hypervisor);
@@ -4185,7 +4415,7 @@ impl SandboxManager {
                 )));
             }
         }
-        self.volumes.claim(&id, &policy.volumes)?;
+        self.claim_volumes(&id, &policy.volumes, guest_os).await?;
         // The claims above are the first thing this create holds, so the guard
         // starts here: everything taken from now on is given back by it, and
         // every failure below answers through [`Provisioning::fail`].
@@ -4249,7 +4479,8 @@ impl SandboxManager {
                 warm = false;
             }
             if crate::macnode::is_macos(guest_os) {
-                crate::macnode::prepare(&templates_dir.join(&template), &workdir)
+                let root = self.inspection_ca_for(&policy);
+                crate::macnode::prepare(&templates_dir.join(&template), &workdir, &root)
                     .await
                     .map_err(|err| {
                         Status::failed_precondition(format!("template {template:?}: {err}"))
@@ -4402,7 +4633,7 @@ impl SandboxManager {
         if from_warm {
             for (index, mount) in crate::volume::block_mounts(&policy.volumes) {
                 let drive = DriveSpec {
-                    id: format!("volume{index}"),
+                    id: crate::volume::drive_id(index, guest_os),
                     path: volume_image(index),
                     is_root: false,
                     is_read_only: mount.is_read_only,
@@ -4430,9 +4661,10 @@ impl SandboxManager {
             }),
             self.inspection_ca_for(&policy),
             self.trust_bundles_for(&template, &policy).await,
-            crate::volume::agent_mounts(&policy.volumes),
+            crate::volume::agent_mounts(&policy.volumes, guest_os),
         );
         let inspected = !request.inspection_ca_pem.is_empty();
+        let inspection_root = self.inspection_root_of(&request);
 
         // A warm create does not wait for the guest to answer. The round trip
         // is most of what it costs, and all of it benefits code running
@@ -4538,6 +4770,7 @@ impl SandboxManager {
             hypervisor: hypervisor.to_string(),
             guest_os: guest_os.as_str().to_string(),
             state_reason: String::new(),
+            inspection_root_fingerprint: inspection_root,
         };
 
         // The one-line summary, unchanged in shape: VM, guest wake, handshake,
@@ -4802,6 +5035,9 @@ impl SandboxManager {
                 return Err(Status::already_exists(format!("sandbox {id} exists")));
             }
         }
+        if !self.inspection_ca_for(&policy).is_empty() {
+            self.require_inspection_root(&id, &manifest.inspection_root)?;
+        }
         let provisioned = self
             .provision_restored(
                 RestoreSource::Snapshot {
@@ -4958,6 +5194,15 @@ impl SandboxManager {
                 over
             }
         };
+        if !self.inspection_ca_for(&policy).is_empty() {
+            let parent = source
+                .base_record
+                .lock()
+                .unwrap()
+                .inspection_root_fingerprint
+                .clone();
+            self.require_inspection_root(&child_id, &parent)?;
+        }
         self.provision_restored(
             RestoreSource::Sandbox(source),
             child_id,
@@ -5054,7 +5299,17 @@ impl SandboxManager {
                 )));
             }
         }
-        self.volumes.claim(&id, &policy.volumes)?;
+        let guest_os = match &source {
+            RestoreSource::Sandbox(source) => {
+                burrow_vmm::GuestOs::from_record(&source.record().guest_os).unwrap_or_default()
+            }
+            _ => self
+                .image_environment(&source.template())
+                .await
+                .machine()
+                .map_or_else(|_| Default::default(), |(_, os)| os),
+        };
+        self.claim_volumes(&id, &policy.volumes, guest_os).await?;
         let mut guard = Provisioning::new(self, &id, &workdir);
 
         let allocated = self.ipam.lock().await.allocate(&id);
@@ -5156,16 +5411,6 @@ impl SandboxManager {
             RestoreSource::Stored { manifest, .. } => manifest.is_systemd,
             _ => self.image_environment(&source.template()).await.systemd,
         };
-        let guest_os = match &source {
-            RestoreSource::Sandbox(source) => {
-                burrow_vmm::GuestOs::from_record(&source.record().guest_os).unwrap_or_default()
-            }
-            _ => self
-                .image_environment(&source.template())
-                .await
-                .machine()
-                .map_or_else(|_| Default::default(), |(_, os)| os),
-        };
         let mut spec = self.build_spec(
             &id,
             &workdir,
@@ -5210,7 +5455,7 @@ impl SandboxManager {
 
         for (index, mount) in crate::volume::block_mounts(&policy.volumes) {
             let drive = DriveSpec {
-                id: format!("volume{index}"),
+                id: crate::volume::drive_id(index, guest_os),
                 path: volume_image(index),
                 is_root: false,
                 is_read_only: mount.is_read_only,
@@ -5239,8 +5484,9 @@ impl SandboxManager {
             }),
             self.inspection_ca_for(&policy),
             self.trust_bundles_for(&source.template(), &policy).await,
-            crate::volume::agent_mounts(&policy.volumes),
+            crate::volume::agent_mounts(&policy.volumes, guest_os),
         );
+        let inspection_root = self.inspection_root_of(&request);
         // Nothing below can fail, so the sandbox takes over here.
         let vm = guard.keep().expect("a restore that reaches here has a vm");
 
@@ -5272,6 +5518,7 @@ impl SandboxManager {
             hypervisor: hypervisor.to_string(),
             guest_os: guest_os.as_str().to_string(),
             state_reason: String::new(),
+            inspection_root_fingerprint: inspection_root,
         };
         tracing::info!(
             sandbox = id,
@@ -5317,6 +5564,14 @@ impl SandboxManager {
     /// Restores a suspended sandbox from its snapshot.
     pub async fn resume(&self, id: &str) -> Result<common::Sandbox, Status> {
         let sandbox = self.get(id).await?;
+        if sandbox.state.load(std::sync::atomic::Ordering::Relaxed)
+            == common::SandboxState::Stopped as i32
+        {
+            return Err(Status::failed_precondition(format!(
+                "sandbox {id} is stopped, with no memory image to resume; boot it on its disk \
+                 instead (`burrow boot {id}`, StartSandbox)"
+            )));
+        }
         self.fence_if_lapsed().await;
         if sandbox.durable.is_fenced() {
             return Err(Status::unavailable(format!(
@@ -5324,11 +5579,23 @@ impl SandboxManager {
                  orchestrator to confirm it still holds it; try again shortly"
             )));
         }
+        let record = sandbox.record();
+        let guest_os = burrow_vmm::GuestOs::from_record(&record.guest_os).unwrap_or_default();
+        let _slot = self.reserve_mac_slot(id, guest_os).await?;
+        // Sent again, so a guest given another root before this node's
+        // changed has the one its leaves now chain to. A guest that already
+        // holds it has nothing to do.
+        let policy = record.policy.clone().unwrap_or_default();
+        let mut request = guestconn::handshake_request(true);
+        request.inspection_ca_pem = self.inspection_ca_for(&policy);
+        request.extra_trust_bundles = self.trust_bundles_for(sandbox.template(), &policy).await;
+        let inspection_root = self.inspection_root_of(&request);
         // Suspending gave the volumes back, so another sandbox may hold them
         // now. Taken before the VM starts, so a sandbox that cannot have them
         // stays suspended rather than resuming without its data.
-        let volumes = sandbox.record().policy.unwrap_or_default().volumes;
-        self.volumes.claim(id, &volumes)?;
+        let volumes = record.policy.unwrap_or_default().volumes;
+        self.claim_volumes(id, &volumes, guest_os).await?;
+        self.regrant_volumes(&sandbox, &volumes).await?;
         let uploading = sandbox.durable.stop_uploading().await;
         if let Err(err) = self.mark_running(&sandbox).await {
             self.volumes.release_all(id);
@@ -5346,6 +5613,7 @@ impl SandboxManager {
         }
         let resumed = sandbox
             .resume(
+                request,
                 self.config.agent_timeout,
                 self.config.guest_upgrade.as_deref(),
                 self.config.object_store.is_some(),
@@ -5359,6 +5627,11 @@ impl SandboxManager {
             self.spawn_upload(&sandbox);
             return Err(err);
         }
+        sandbox
+            .base_record
+            .lock()
+            .unwrap()
+            .inspection_root_fingerprint = inspection_root;
         // A fresh stack knows nothing of the sandbox's published ports until
         // a sync hands them over again.
         if !sandbox.hypervisor.capabilities().is_tap_networked
@@ -5382,17 +5655,8 @@ impl SandboxManager {
         let sandbox = self.get(id).await?;
         // The VMM is killed, not powered off, so the guest's page cache
         // would otherwise die with it and the disk a boot comes back to
-        // would miss what was last written. Best effort: a guest that has
-        // stopped answering is stopped all the same.
-        let sync = burrow_proto::guest::v1::ExecStart {
-            cmd: vec!["sync".to_string()],
-            ..Default::default()
-        };
-        let _ = tokio::time::timeout(
-            std::time::Duration::from_secs(15),
-            guestconn::run_to_completion(&sandbox, sync),
-        )
-        .await;
+        // would miss what was last written.
+        flush_guest(&sandbox).await;
         sandbox.shutdown().await?;
         // Its memory is gone, so what the store holds is a guest that no
         // longer exists.
@@ -5405,12 +5669,83 @@ impl SandboxManager {
         Ok(sandbox.record())
     }
 
+    /// Shuts a macOS sandbox's guest down from inside, so its disk is as
+    /// macOS left it, and returns the directory holding the stopped machine.
+    #[cfg(target_os = "macos")]
+    pub async fn shut_down_from_inside(
+        &self,
+        id: &str,
+        timeout: std::time::Duration,
+    ) -> Result<PathBuf, Status> {
+        let sandbox = self.get(id).await?;
+        let halt = burrow_proto::guest::v1::ExecStart {
+            cmd: vec!["/sbin/shutdown".into(), "-h".into(), "now".into()],
+            ..Default::default()
+        };
+        // The agent goes down with the guest, so the command may never report
+        // back.
+        let _ = tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            guestconn::run_to_completion(&sandbox, halt),
+        )
+        .await;
+        let deadline = std::time::Instant::now() + timeout;
+        loop {
+            {
+                let vm = sandbox.vm.lock().await;
+                let Some(Vm::Vz(vz)) = vm.as_ref() else {
+                    return Err(Status::failed_precondition(format!(
+                        "sandbox {id} is not a running macOS guest"
+                    )));
+                };
+                if vz.wait_stopped(std::time::Duration::ZERO).await.is_ok() {
+                    break;
+                }
+            }
+            if std::time::Instant::now() >= deadline {
+                return Err(Status::deadline_exceeded(format!(
+                    "the guest did not shut down within {timeout:?}"
+                )));
+            }
+            tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+        }
+        Ok(sandbox.workdir.clone())
+    }
+
+    /// Hands the jail its writable volume images again after a suspend,
+    /// which gave their ownership back with the claims. Only those: the rest
+    /// of the directory is the jail's already, or links to a template's warm
+    /// files that must stay the template's.
+    async fn regrant_volumes(
+        &self,
+        sandbox: &RunningSandbox,
+        volumes: &[common::VolumeMount],
+    ) -> Result<(), Status> {
+        let Some(jail) = self.config.jail_for(sandbox.hypervisor) else {
+            return Ok(());
+        };
+        self.remember_volume_owners(volumes).await;
+        for (index, mount) in crate::volume::block_mounts(volumes) {
+            if mount.is_read_only {
+                continue;
+            }
+            let image = sandbox.workdir.join(volume_image(index));
+            if let Err(err) = std::os::unix::fs::chown(&image, Some(jail.uid), Some(jail.gid)) {
+                self.volumes.release_all(sandbox.id());
+                return Err(Status::internal(format!("preparing the jail: {err}")));
+            }
+        }
+        Ok(())
+    }
+
     /// Boots a stopped sandbox on its existing disks.
     pub async fn start(&self, id: &str) -> Result<common::Sandbox, Status> {
         let sandbox = self.get(id).await?;
         let record = sandbox.record();
+        let guest_os = burrow_vmm::GuestOs::from_record(&record.guest_os).unwrap_or_default();
+        let _slot = self.reserve_mac_slot(id, guest_os).await?;
         let policy = record.policy.unwrap_or_default();
-        self.volumes.claim(id, &policy.volumes)?;
+        self.claim_volumes(id, &policy.volumes, guest_os).await?;
         // A stop handed the volume images' ownership back with the claims, so
         // the jail has to be given them again before the VMM opens them.
         if let Some(jail) = self.config.jail_for(sandbox.hypervisor) {
@@ -5429,7 +5764,6 @@ impl SandboxManager {
         }
         let resources = policy.resources.unwrap_or_default();
         let is_systemd = self.image_environment(sandbox.template()).await.systemd;
-        let guest_os = burrow_vmm::GuestOs::from_record(&record.guest_os).unwrap_or_default();
         let mut spec = self.build_spec(
             id,
             &sandbox.workdir,
@@ -5451,7 +5785,7 @@ impl SandboxManager {
             None,
             self.inspection_ca_for(&policy),
             self.trust_bundles_for(sandbox.template(), &policy).await,
-            crate::volume::agent_mounts(&policy.volumes),
+            crate::volume::agent_mounts(&policy.volumes, guest_os),
         );
         if let Err(err) = sandbox
             .boot(
@@ -5517,6 +5851,15 @@ impl SandboxManager {
             .await
             .remove(id)
             .ok_or_else(|| Status::not_found(format!("no sandbox {id} on this node")))?;
+        // A writable volume outlives the sandbox, and what the guest had not
+        // written back would otherwise die with its page cache. Committed to
+        // the journal, it is replayed for the next reader.
+        let policy = sandbox.record().policy.unwrap_or_default();
+        if sandbox.is_running()
+            && crate::volume::block_mounts(&policy.volumes).any(|(_, mount)| !mount.is_read_only)
+        {
+            flush_guest(&sandbox).await;
+        }
         self.forget_stored(&sandbox).await;
         // Closed before the rows go, so the same one function ends every
         // session and the store is never left holding an open one.
@@ -5586,7 +5929,7 @@ impl SandboxManager {
         // the part someone can act on.
         self.release_lease(id).await;
 
-        if let Err(err) = tokio::fs::remove_dir_all(&workdir).await {
+        if let Err(err) = self.config.remove_workdir(&workdir).await {
             tracing::warn!(sandbox = id, %err, "failed to remove sandbox directory");
         }
         let _ = tokio::fs::remove_dir_all(self.config.command_logs_dir(id)).await;
@@ -5693,6 +6036,7 @@ impl SandboxManager {
             rx_bytes: record.rx_bytes,
             tx_bytes: record.tx_bytes,
             secrets,
+            inspection_root: record.inspection_root_fingerprint.clone(),
         };
         let uploaded = tokio::select! {
             () = token.cancelled() => return Ok(false),
@@ -5830,7 +6174,8 @@ impl SandboxManager {
             return;
         }
         crate::durable::remove_local(&sandbox.workdir).await;
-        if let Err(err) = crate::durable::purge(store, sandbox.id()).await {
+        let holder = sandbox.record().node_id;
+        if let Err(err) = crate::durable::purge(store, sandbox.id(), Some(&holder)).await {
             tracing::warn!(sandbox = sandbox.id(), %err, "could not remove the sandbox's stored state");
         }
     }
@@ -6028,7 +6373,7 @@ impl SandboxManager {
             .object_store
             .as_ref()
             .ok_or_else(|| Status::failed_precondition("this node has no object store"))?;
-        crate::durable::purge(store, id).await
+        crate::durable::purge(store, id, None).await
     }
 
     /// Takes over a sandbox from the object store and resumes it here.
@@ -6081,6 +6426,18 @@ impl SandboxManager {
                 std::env::consts::ARCH,
                 self.config.version(hypervisor)
             )));
+        }
+        // An older manifest has no root, and the record the orchestrator
+        // holds says the same thing.
+        let root = match manifest.inspection_root.as_str() {
+            "" => &record.inspection_root_fingerprint,
+            root => root,
+        };
+        if !self
+            .inspection_ca_for(&record.policy.clone().unwrap_or_default())
+            .is_empty()
+        {
+            self.require_inspection_root(&id, root)?;
         }
         let mut record = record;
         self.unseal_from_store(&mut record, &manifest.secrets)?;
@@ -6685,6 +7042,61 @@ pub(crate) mod tests {
         let _ = tokio::fs::remove_dir_all(&data_dir).await;
     }
 
+    /// Every jail used to be under `<base>/firecracker`, Cloud Hypervisor's
+    /// included. A suspended one from then is moved to its own hypervisor's
+    /// directory on recovery and keeps its snapshot, and a delete takes the
+    /// whole per-VM directory rather than leaving it empty.
+    #[tokio::test]
+    async fn a_jail_from_before_the_rename_is_moved_and_removed_whole() {
+        let id = "sbx_legacy-jail";
+        let (mut manager, data_dir) = recovering("legacy-jail").await;
+        tokio::fs::create_dir_all(&data_dir).await.unwrap();
+        let owner = std::fs::metadata(&data_dir).unwrap();
+        let jail = burrow_vmm::Jail {
+            jailer: "/nonexistent/jailer".into(),
+            uid: std::os::unix::fs::MetadataExt::uid(&owner),
+            gid: std::os::unix::fs::MetadataExt::gid(&owner),
+            chroot_base: data_dir.join("jail"),
+        };
+        manager.config.jail = Some(jail.clone());
+        manager.config.cloud_hypervisor.jail = Some(burrow_vmm::ChJail {
+            helper: "/proc/self/exe".into(),
+            uid: jail.uid,
+            gid: jail.gid,
+        });
+        manager.config.hypervisors.push(Hypervisor::CloudHypervisor);
+        let hypervisor = Hypervisor::CloudHypervisor;
+        let legacy = jail.chroot_for(Hypervisor::Firecracker, id);
+        tokio::fs::create_dir_all(&legacy).await.unwrap();
+        let layout = hypervisor.layout();
+        for file in [layout.state, SCRATCH_IMAGE] {
+            tokio::fs::write(legacy.join(file), b"kept").await.unwrap();
+        }
+        let mut row = row(id, common::SandboxState::Suspended, 5);
+        row.record = prost::Message::encode_to_vec(&common::Sandbox {
+            id: id.into(),
+            template: "default".into(),
+            hypervisor: hypervisor.as_str().into(),
+            ..Default::default()
+        });
+        manager.store.put_sandbox(&row).await.unwrap();
+
+        manager.recover().await;
+
+        let workdir = jail.chroot_for(hypervisor, id);
+        assert!(workdir.join(layout.state).exists());
+        assert!(!jail.dir_for(Hypervisor::Firecracker, id).exists());
+        assert_eq!(
+            manager.store.list_sandboxes().await.unwrap()[0].state,
+            common::SandboxState::Suspended as i32
+        );
+
+        manager.delete(id).await.unwrap();
+        assert!(!jail.dir_for(hypervisor, id).exists());
+        assert!(jail.hypervisor_dir(hypervisor).exists());
+        let _ = tokio::fs::remove_dir_all(&data_dir).await;
+    }
+
     /// A sandbox with neither memory nor disk left is the one thing recovery
     /// drops, and it says so with the last figures the node had.
     #[tokio::test]
@@ -7064,7 +7476,7 @@ pub(crate) mod tests {
             r#"{"env":["PATH=/usr/bin","CURL_CA_BUNDLE=/cacert.pem"],"working_dir":"/"}"#,
         )
         .await;
-        manager.set_inspection_ca("-----BEGIN CERTIFICATE-----\n".into());
+        manager.set_inspection_ca("-----BEGIN CERTIFICATE-----\n".into(), "ab".into());
 
         let bundles = manager.trust_bundles_for("curl-image", &inspected()).await;
         assert_eq!(bundles.len(), 1, "the image's bundle was lost: {bundles:?}");
@@ -7086,7 +7498,7 @@ pub(crate) mod tests {
             r#"{"env":["CURL_CA_BUNDLE=/cacert.pem"],"working_dir":"/"}"#,
         )
         .await;
-        manager.set_inspection_ca("-----BEGIN CERTIFICATE-----\n".into());
+        manager.set_inspection_ca("-----BEGIN CERTIFICATE-----\n".into(), "ab".into());
 
         assert!(
             manager

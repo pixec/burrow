@@ -21,9 +21,13 @@ socket2 = "0.5"
 # and the proxy linked into this crate.
 smoltcp = { version = "0.14", default-features = false, features = ["std", "medium-ip", "medium-ethernet", "proto-ipv4", "proto-dhcpv4", "socket-tcp", "socket-tcp-pause-synack", "async"], optional = true }
 burrow-proxy = { workspace = true, optional = true }
+# The same node's WireGuard mesh in userspace, for a node with no kernel
+# WireGuard: boringtun's protocol alone, the version tailcat-rs already uses.
+boringtun = { version = "0.7", default-features = false, optional = true }
+x25519-dalek = { version = "2", features = ["static_secrets", "getrandom"], optional = true }
 
 [features]
-usernet = ["dep:smoltcp", "dep:burrow-proxy"]
+usernet = ["dep:smoltcp", "dep:burrow-proxy", "dep:boringtun", "dep:x25519-dalek"]
 
 [dev-dependencies]
 serde_json = { workspace = true }

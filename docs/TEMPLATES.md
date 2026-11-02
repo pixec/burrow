@@ -3,7 +3,8 @@
 Sandboxes boot from templates: prepared rootfs images living on each node under
 `<data-dir>/images/<name>/`, alongside the kernel they boot. A template comes
 from one of two places, an OCI image imported from a registry, or a build driven
-by `BuildTemplate` steps.
+by `BuildTemplate` steps. A macOS template is an installed machine instead; see
+[macOS templates](#macos-templates).
 
 Burrow ships no template of its own, so a node holds only what has been imported
 onto it, and a create must name one. It also needs a kernel: an OCI image
@@ -290,6 +291,54 @@ Build steps are untrusted, so the export is size-capped at 8 GiB and the
 resulting image is sized from its actual contents. The TypeScript SDK exposes
 this as `Template.build`; see
 [sdk/typescript/README.md](../sdk/typescript/README.md).
+
+`burrow templates build` drives it from the CLI:
+
+```sh
+burrow templates build tools --from alpine-3.20 --step 'apk add git' --step 'git --version'
+```
+
+## macOS templates
+
+A Mac node (`burrowd serve --hypervisors vz`) builds macOS templates itself,
+through the same `BuildTemplate` call. A restore image is the base:
+
+```sh
+burrow template build macos-27 --hypervisor vz --from-ipsw latest --vcpus 4 --mem 8192
+burrow template build macos-dev --from macos-27 --step 'touch /Users/Shared/built'
+```
+
+`--from-ipsw` takes a path on the Mac node, or `latest`, which the node
+resolves from Apple's catalogue
+(`https://mesu.apple.com/assets/macos/com_apple_macOSIPSW/com_apple_macOSIPSW.xml`),
+downloads into `<data-dir>/ipsw/`, resuming an interrupted download and
+checking its size and SHA-1 before keeping it, and reuses for the next build.
+The image never crosses the API. The build installs macOS onto a disk of
+`--disk-mib` (64 GiB by default; under 28 GiB is refused, which is about what
+macOS needs to install), boots it once with macOS's own first-boot
+provisioning (an admin account `burrow`, automatic login, Remote Login on),
+copies in the node's own guest agent (`serve --guest-binary`) over SSH and
+installs it as a LaunchDaemon, checks the agent answers on vsock, turns
+Remote Login off and shuts the guest down from inside. The inspection root is
+not part of the template: the node writes it onto each sandbox's disk before it
+boots ([FIREWALL.md](FIREWALL.md#macos-guests-and-apples-tls-stack)). It takes
+no steps.
+
+A build `--from` a macOS template clones it as a new Mac (a fresh machine
+identity), cold-boots it on the node's network stack like any sandbox, runs
+the steps through the agent as root, as a Linux build does, shuts it down from
+inside and keeps its disk. It inherits the base's account; only an install is
+provisioned. A failing step streams its output and fails the build. Steps are
+not cached.
+
+Either kind is built beside its final name and renamed into place, so nothing
+is published until it succeeded and a rebuild replaces the old template only
+then. `--vcpus` and `--mem` size the build machine and default to the restore
+image's minimum. A build runs a macOS guest, so it takes one of the Mac's two
+slots (Apple's licence) and is refused while two guests run. The orchestrator
+sends a vz build only to a node offering vz; any other node refuses
+`--from-ipsw`. The template records `vz` and `macos`, is never warmed, and
+does not travel to other nodes.
 
 ## Warm templates
 

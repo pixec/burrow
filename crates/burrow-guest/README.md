@@ -15,7 +15,8 @@ src/
   unix/          POSIX, Linux and macOS: Fs ops, file transfer as a user, exec,
                  pty, reaper, signal numbers, async fds
   linux/         PID 1, init, netlink, systemd mode, resume, users, vsock
-  macos/         LaunchDaemon and install, handshake, Open Directory users, vsock
+  macos/         LaunchDaemon and install, handshake, Open Directory users,
+                 GUI sessions, volumes, vsock
   windows/       service, ConPTY, job objects, viosock, S4U, NetApi, Windows Fs
 examples/
   guest_probe.rs drives an agent end to end through a vsock UDS
@@ -43,12 +44,13 @@ A LaunchDaemon in a macOS guest under Virtualization.framework (see
 
 | RPC | Status |
 | --- | --- |
-| Handshake | clock, entropy, inspection CA (below); network accepted and logged; volumes refused with `UNIMPLEMENTED`. Verified |
-| Health | `files-as-user`, `attach-input`, `output-feed`, `fs-scoped`. Verified |
-| Exec, Attach, AttachCommand, ListCommands, GetCommand, SignalCommand, PruneCommands, Feed | `unix/exec.rs`, the Linux code: pipes or a pty from openpty(3), a process group or session per command, the user's groups, gid and uid set before exec. Exec, pty, resize, stdin, signals, list and feed verified |
+| Handshake | clock, entropy, inspection CA (below); network accepted and logged; volumes and tmpfs mounted (below). Verified |
+| Health | `files-as-user`, `attach-input`, `output-feed`, `fs-scoped`, `gui-session`, `inspection-root-trusted` (below). Verified |
+| Exec, Attach, AttachCommand, ListCommands, GetCommand, SignalCommand, PruneCommands, Feed | `unix/exec.rs`, the Linux code: pipes or a pty from openpty(3), a process group or session per command, the user's groups (initgroups(2)), gid and uid set before exec, in the user's GUI session when they have one (below). Exec, pty, resize, stdin, signals, list and feed verified |
 | UploadFile, DownloadFile, ListDir, Watch | `unix/files.rs`, a link anywhere on the path refused. Verified but Watch, which is unit tested |
 | Fs | every op, scopes and the write cap enforced (below). Verified |
 | CreateUser, CreateGroup, AddUserToGroup, RemoveUserFromGroup | `dscl` and `dseditgroup` on the local node. Verified |
+| DeleteUser, DeleteGroup | `dscl . -delete` (below), with the Full Disk Access the node grants. Verified |
 | Upgrade | replaces `/usr/local/libexec/burrow-guest` and execs it in place; open `Fs` handles and the command table carry over. Verified |
 
 ### Install
@@ -66,19 +68,82 @@ first boot; `deploy/macos/README.md` has the steps.
 - vsock: `AF_VSOCK` (40) from `libc`, bound on `VMADDR_CID_ANY:1024` and
   driven through tokio's `AsyncFd`; only cid 2, the host, is served. A process
   in the guest dialling its own cid 3 is dropped.
-- Running as a user: commands get the user's groups (getgrouplist(3), at most
-  16, setgroups(2)'s limit here), gid and uid before exec. File work runs on a
-  thread of its own given the user's credentials by `pthread_setugid_np`
-  followed by setgroups(2), which on a thread with assumed credentials sets
-  that thread's groups alone; the process stays root's. A thread started from
-  it inherits them, and none is.
-- Accounts: Open Directory through getpwnam_r(3), getgrouplist(3) and
-  `dscl . -create`. A user gets a group of its own with the same id (from 501,
+- Running as a user: commands get the user's groups, gid and uid before exec.
+  The groups go in through initgroups(2) (syscall 243, what initgroups(3)
+  ends in) with the user as the credential's membership uid: the credential
+  holds the first 16 from getgrouplist(3), and the kernel asks opendirectoryd
+  about any other group on each check, so a user in 20 groups reads a file
+  only the 20th may (verified; setgroups(2) with the same 16 is refused).
+  File work runs on a thread of its own given the user's credentials by
+  `pthread_setugid_np` followed by the same initgroups(2), which on a thread
+  with assumed credentials sets that thread's groups alone; the process stays
+  root's. A thread started from it inherits them, and none is.
+- GUI session: a command as a user logged in at the console (the template's
+  auto-login user) runs in that login, as `launchctl asuser` runs one. The
+  agent finds the login's audit session among the user's processes
+  (`auditon(A_GETPINFO_ADDR)`, the session with graphic access); the child
+  joins it while still root, drops to the user, and execs `/bin/launchctl
+  asuser <uid> <program> <args>`, which as the user in their session takes
+  the bootstrap port of their Aqua domain (launchd hands it out through a
+  private interface) and execs the program in place: same pid, no shell. The
+  program is resolved on `PATH` first, so a missing one fails the request as
+  for anyone else. Automatic rather than an exec option: it changes nothing
+  for a user with no console login, and for the one user who has one it is
+  what running as them means on a Mac, with nothing in Exec or either SDK to
+  learn. Verified as the auto-login user: `launchctl managername` says
+  `Aqua`, `security list-keychains` lists their login keychain, `osascript
+  -e 'tell app "Finder" to get name'` answers; a user with no console login
+  stays in `System` as before.
+- Accounts: Open Directory, read by querying it on the search node
+  (`macos/directory.rs`, the OpenDirectory framework) rather than through
+  getpwnam_r(3), whose answers come from libinfo's cache in the agent's
+  process; memberships through getgrouplist(3); written with
+  `dscl . -create`. An account created or deleted outside the agent is seen
+  as it is on the next call (verified with records made and removed with
+  `dscl` in the guest). A user gets a group of its own with the same id (from 501,
   the first free for both) rather than `staff`, home `/Users/NAME` 0700,
   password `*` and `IsHidden`. `CreateGroup` shares `/Users/Shared/NAME`
   (root:group 2770), since `/srv` is on the sealed system volume. macOS gives a
   new file its directory's group, not its creator's, so what a user creates in
   `/tmp` is group `wheel`.
+- Deleting accounts: the same safety rules as Linux's (only ids create could
+  have made, 501 to 59999; not root, nobody, daemon, wheel, admin or staff
+  by name; not the agent's own; not a member of `admin`; not the auto-login
+  user, whose desktop session would go with it), refused while any process
+  runs as the user, nothing killed. The user record goes first, so a refusal
+  leaves the account whole; then their memberships, and their own group
+  unless another account uses it. The home is kept, handed to root 0700,
+  unless asked to be removed. macOS 27's opendirectoryd deletes a user record
+  only for a caller with Full Disk Access ("disallowed by sandbox" otherwise,
+  `sysadminctl -deleteUser` included). TCC's database is under SIP in a
+  running guest, so the node grants it on the disk before every cold boot:
+  a row for the agent's path (root-only, so it survives upgrades) in
+  `/Library/Application Support/com.apple.TCC/TCC.db`. Commands the agent
+  runs inherit it as their responsible process. A guest that booted without
+  it (the node logs why) gets `FAILED_PRECONDITION` saying so. Verified:
+  users created and deleted, with and without their homes.
+- Volumes: a macOS node keeps a volume as a raw image, sparse until written,
+  attached as a virtio disk after the system disk in mount order. The guest
+  shows no disk identifier, so the agent finds each by position among the
+  block devices that are not the root one, formats a blank one journaled HFS+
+  on its first writable mount, and mounts it with mount_hfs(8) at the path,
+  `nobrowse`, ownership honoured. A read-only mount is read-only at the
+  hypervisor too, and ignores the journal (`-j`), as Linux mounts ext4
+  `norecovery`; the node replays a journal a departed writer left
+  (`fsck_hfs -p` on the image) before a reader attaches, and a delete or stop
+  runs `sync` in a writer first, so a reader sees the writer's last writes
+  (docs/VOLUMES.md). Not APFS: on a virtio disk the guest formats APFS with inline
+  encryption keyed to that machine ("can not find key for volume" in any
+  other), so no second sandbox could mount it. Not virtio-fs: a shared
+  directory shows up as a network volume, which TCC keeps the agent out of
+  (`kTCCServiceSystemPolicyNetworkVolumes`) without an MDM grant. Mounted by
+  the kernel, not Disk Arbitration, which defers external disks until a
+  console login and then mounts them under /Volumes with ownership ignored.
+  A mount point must be on the data volume (`/Users`, `/opt`, `/usr/local`,
+  `/Volumes`, `/private/var`); the root is the sealed system volume. tmpfs is
+  mount_tmpfs(8). Verified: a volume written in one sandbox (as root and as a
+  user), kept across suspend and resume, read back read-only in another,
+  where a write fails with `EROFS`.
 - Numbers on the wire are Linux's. Signals are translated both ways (SIGUSR1
   is 10 on the wire and 30 here; an exit by it reports 10 and 138), FsOpen
   flags are read as Linux's and mapped, and an `FsError` names macOS's errno
@@ -90,17 +155,34 @@ first boot; `deploy/macos/README.md` has the steps.
   also reseeds itself from interrupt timing. A restored clone's generator
   diverges from the next reseed on.
 - Clock: settimeofday(2).
-- Inspection CA: written to `/private/etc/ssl/certs/burrow-inspection-ca.pem`,
-  appended to `/etc/ssl/cert.pem` and to any bundle the image named. The
-  system curl (LibreSSL) verifies through it; verified against a server in the
-  guest. Not the keychain: adding trust settings needs the
-  `com.apple.trust-settings.admin` right, which is an entitlement or an
-  administrator in a dialog, and `security add-trusted-cert` and
-  `security authorizationdb write` both fail without one; macOS 27 keeps
-  trustd's settings where root cannot write them. So the Security framework
-  (URLSession, Safari, Swift, Go's crypto/x509 on darwin) does not trust the
-  CA. A template meant for inspection has to carry it already, from a
-  configuration profile installed with a person present or by MDM.
+- Inspection root: written to `/private/etc/ssl/certs/burrow-inspection-ca.pem`,
+  and into `/etc/ssl/cert.pem` and any bundle the image named between
+  `# BEGIN burrow inspection ca` and `# END burrow inspection ca`, replacing
+  what an earlier handshake wrote there. The system curl (LibreSSL) verifies
+  through it; verified against a server in the guest. Also added to the
+  System keychain, where trustd finds a root a server's chain leaves out (the
+  proxy sends a node CA, not the fleet root), in place of the one the last
+  handshake added. Whether the Security framework (URLSession, Safari, Swift,
+  Go's crypto/x509 on darwin) takes it as an anchor is the admin trust
+  settings, which nothing in a running guest can change unattended (tried as
+  root): `security add-trusted-cert -d` fails with "no user interaction was
+  possible"; root may rewrite `com.apple.trust-settings.admin` (and even
+  `authenticate-admin`) to `allow` in `/var/db/auth.db`, which the client
+  side then passes, but trustd authorizes again in its own process and authd
+  still answers "session has no ui access" (-60007), or puts up a dialog in
+  the console user's session; `security authorizationdb write` is denied
+  (-60005); trustd's store under `/private/var/protected/trustd/private` is
+  closed to root even with Full Disk Access; a restricted entitlement on an
+  ad hoc signed binary is killed by AMFI; `profiles install` no longer
+  installs. So the node writes them before every cold boot, with the guest's
+  Data volume mounted on the host: the root as the one Burrow-marked entry of
+  trustd's `Admin.plist`, replacing a root an earlier boot wrote, removed
+  when the sandbox is not inspected. Health reports `inspection-root-trusted`
+  when the Security framework takes the installed root as an anchor, and the
+  node warns at create when it does not. Verified: `security verify-cert`,
+  curl, `nscurl` and a URLSession client through the inspecting proxy; after
+  the node's root changed and the sandbox was shut down and booted, the new
+  root trusted, the old one not, and only the new one in the keychain.
 - Network: the guest DHCPs on its one NIC from whatever the host puts behind
   it; nothing to apply.
 - Upgrade: the new binary is renamed over the installed one and exec'd, so
@@ -151,14 +233,8 @@ fails closed.
 
 ### Not done
 
-- Volume mounts.
-- Trusting the inspection CA in the keychain (above).
-- GUI sessions: a command as a user runs in the system bootstrap context, not
-  the user's Aqua session (no login keychain, no window server). `launchctl
-  asuser` would be the route.
-- Accounts deleted outside the agent stay found for a while: libinfo caches
-  lookups in the agent's process. Nothing in the API deletes one.
-- More than 16 groups per user (setgroups(2)'s limit on macOS).
+- A root changed while a guest runs reaches the Security framework only at
+  its next cold boot (above).
 
 ## Windows
 
@@ -171,18 +247,62 @@ that calls Windows has run nowhere yet.
 
 | RPC | Status |
 | --- | --- |
-| Handshake | clock, inspection CA, network; entropy accepted and not used (below); volumes refused with `UNIMPLEMENTED` |
+| Handshake | clock, inspection CA, network, volumes (below); entropy accepted and not used (below) |
 | Health | `files-as-user`, `attach-input`, `output-feed`, `fs-scoped` |
 | Exec, Attach, AttachCommand, ListCommands, GetCommand, SignalCommand, PruneCommands, Feed | as on Linux: the same registry and feed code |
 | UploadFile, DownloadFile, ListDir | as on Linux, a link anywhere on the path refused |
 | Watch | `ReadDirectoryChangesW`; `interval_ms` is ignored |
 | Fs | every op; chown is accepted and changes nothing, as in Node on Windows |
 | CreateUser, CreateGroup, AddUserToGroup, RemoveUserFromGroup | NetApi local accounts and groups |
+| DeleteUser, DeleteGroup | `NetUserDel`, `NetLocalGroupDel`; only accounts with a machine SID and a RID from 1000, never an administrator; the profile kept unless asked to go (`DeleteProfileW`) |
 | Upgrade | replaces the binary and restarts the service |
 
-Not implemented: volume mounts, and open `Fs` handles surviving an upgrade
-(they read as EBADF after one; a new process cannot take over the old one's
-handles).
+Not implemented: tmpfs mounts, which Windows has no equivalent of, and open
+`Fs` handles surviving an upgrade (they read as EBADF after one; a new process
+cannot take over the old one's handles).
+
+### Volumes
+
+`windows/volumes.rs`. The host gives each volume's virtio disk the identifier
+the handshake names (`burrow-volumeN`) as its serial number, and the agent
+finds the disk by it: Windows numbers disks in no order the host controls. The
+work is the Storage module's cmdlets, in one PowerShell script run as an
+encoded command with the values in its environment: the disk is marked
+read-only or writable to match the mount and brought online; a blank one
+(`PartitionStyle` RAW, which includes the untouched ext4 a Linux node makes)
+is initialized GPT and formatted NTFS on its first writable mount, and refused
+on a read-only one; the partition is then given the path, `/data` as the
+folder mount point `C:\data\`, `/d` as drive `D:`, and any letter Windows
+assigned on its own is removed. A fresh volume's root also grants
+Authenticated Users modify, so accounts `CreateUser` made can write; `mode` is
+not applied. The path rules and the environment are unit tested; the script
+has run nowhere.
+
+### Inspection root
+
+The handshake adds the root to the machine's Trusted Root store
+(`LocalMachine\Root`), which Schannel and everything built on it (.NET,
+PowerShell, Edge, Chrome) verify against, and names it
+`Burrow inspection CA`. Every certificate in the store carrying that friendly
+name that is not the root just given is deleted first, so a sandbox told
+another root stops trusting the last one; a certificate the store already held
+is the image's and is neither named nor removed. The PEM goes to
+`inspection-ca.pem` in the agent's state directory and into each bundle the
+image named, between the same markers as on Linux.
+
+Firefox keeps its own certificate store and ignores the machine's unless told
+to read it. A template that runs Firefox under inspection turns that on with
+an enterprise policy, in `distribution\policies.json` beside `firefox.exe`:
+
+```json
+{ "policies": { "Certificates": { "ImportEnterpriseRoots": true } } }
+```
+
+or the `HKLM\Software\Policies\Mozilla\Firefox\Certificates\ImportEnterpriseRoots`
+DWORD set to 1. Firefox then trusts what is in `LocalMachine\Root`, the
+inspection root included. Java has its own `cacerts` too, which the image has to
+import the root into (`keytool -importcert -cacerts`) or point at with
+`-Djavax.net.ssl.trustStoreType=Windows-ROOT`.
 
 ### vsock: what it relies on
 
@@ -201,8 +321,8 @@ sockets are not guaranteed to support.
 
 1. Install the virtio-win drivers: at least `viostor`/`vioscsi` for the disk,
    `NetKVM` for the network, `viosock` for vsock, with its Winsock provider
-   registered (`viosocklib`). QEMU needs `-device vhost-vsock-pci,guest-cid=N`.
-   For RNG reseeding on restore, add `-device vmgenid,guid=auto`.
+   registered (`viosocklib`). Burrow gives the VM its vsock device under
+   Cloud Hypervisor.
 2. Copy `burrow-guest.exe` somewhere permanent, e.g.
    `C:\Program Files\Burrow\burrow-guest.exe`, and from there run
    `burrow-guest.exe install --start`. That registers the `burrow-guest`
@@ -290,8 +410,10 @@ NTSTATUS such as -1073741819.
 
 Windows has no call that credits outside entropy to the kernel RNG, as Linux's
 `RNDADDENTROPY` does. The handshake's entropy is accepted and not used. What
-reseeds a restored Windows guest is the VM Generation ID: give QEMU
-`-device vmgenid,guid=auto` and Windows reseeds when the identifier changes.
+reseeds a restored Windows guest is the VM Generation ID, which Windows
+reseeds on when the identifier changes. Burrow's Cloud Hypervisor VM config
+adds no vmgenid device, so restored clones of one Windows snapshot share RNG
+state until the guest reseeds on its own.
 
 ### Stat
 

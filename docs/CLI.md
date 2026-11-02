@@ -100,6 +100,7 @@ underscore.
 | `docker commit` | [`commit`](#commit) | Saves live VM state, memory included. |
 | `docker images` | [`images`](#images) | Templates, on the nodes. |
 | `docker pull` | [`pull`](#pull) | Converts an OCI image into a template. There is no local image cache. |
+| `docker build` | [`templates build`](#templates-build) | Steps given as `--step`, run in a sandbox. |
 | `docker rmi` | [`templates rm`](#templates-rm) | |
 | `docker cp` | [`copy`](#copy) | |
 | `docker port` | [`port`](#port) | |
@@ -161,8 +162,8 @@ No Docker counterpart at all: [`fork`](#fork), [`move`](#move),
 | [`logs`](#logs) | Replay and follow a command's output |
 | [`kill`](#kill) | Signal a running command |
 | [`prune`](#prune) | Remove finished commands and their output |
-| [`user`](#user) | Create guest users |
-| [`group`](#group) | Create guest groups and manage membership |
+| [`user`](#user) | Create and delete guest users |
+| [`group`](#group) | Create and delete guest groups and manage membership |
 | [`copy`](#copy) | Copy a file in or out |
 | [`dir`](#dir) | List a directory inside a sandbox |
 | [`stop`](#stop) | Suspend a sandbox: snapshot it and stop its VM |
@@ -192,6 +193,9 @@ No Docker counterpart at all: [`fork`](#fork), [`move`](#move),
 | [`usage`](#usage) | Show what sandboxes consumed, from the usage ledger |
 | [`audit`](#audit) | Show egress attempts and DNS lookups |
 | [`nodes`](#nodes) | Inspect and drain nodes |
+
+On a node, [`burrowd ca`](#burrowd-ca) makes the fleet's TLS inspection root and
+node CAs, and [`burrowd serve`](#burrowd-serve-inspection-flags) takes them.
 
 ## health
 
@@ -680,7 +684,7 @@ else by now.
 
 ## user
 
-Create users inside the guest, so commands need not all run as root. See
+Create and delete users inside the guest, so commands need not all run as root. See
 [CONCEPTS.md](CONCEPTS.md#running-as-separate-users) for what that separation
 does and does not protect.
 
@@ -705,6 +709,40 @@ burrow exec sbx_2f0c --user alice -- whoami
 The home directory is created 0700, so no other user in the sandbox can read it.
 Commands run with `--user` start there and get `HOME`, `USER` and `LOGNAME` to
 match.
+
+### user delete
+
+```
+burrow user delete <ID> <NAME> [--remove-home]
+```
+
+```sh
+burrow user delete sbx_2f0c alice
+# deleted alice, kept /home/alice
+burrow user delete sbx_2f0c bob --remove-home
+# deleted bob, removed /home/bob
+```
+
+| Argument | Description |
+| --- | --- |
+| `<ID>` | Sandbox to delete the user from. |
+| `<NAME>` | User to delete. |
+| `--remove-home` | Remove the home directory too. Off by default. |
+
+Only an account `user create` could have made can be deleted. Refused are root,
+system accounts (uids below 1000 on Linux, below 501 on macOS, and `nobody`),
+administrators and built-in accounts, the account the agent runs as, and on
+macOS the auto-login user. A user that still has a running process or command
+is refused rather than killed: end those first. The user leaves every group,
+and their own same-named group is deleted with them unless another account
+still uses it.
+
+A kept home is handed to root with mode 0700 on Linux and macOS, so an account
+created later that reuses the uid does not inherit it. `--remove-home` removes
+it only when it is the user's own directory directly under `/home` (`/Users`
+on macOS) and no other account's home is or lies inside it; otherwise nothing
+is deleted. On Windows the profile is kept or, with `--remove-home`, removed
+by Windows itself.
 
 ## group
 
@@ -755,6 +793,29 @@ burrow group remove sbx_2f0c bob team
 
 A user removed from a group loses access to its shared directory on their next
 command.
+
+### group delete
+
+```
+burrow group delete <ID> <NAME> [--remove-shared-dir]
+```
+
+```sh
+burrow group delete sbx_2f0c team
+# deleted team, kept /srv/team
+```
+
+| Argument | Description |
+| --- | --- |
+| `<ID>` | Sandbox to delete the group from. |
+| `<NAME>` | Group to delete. |
+| `--remove-shared-dir` | Remove the group's shared directory too. Off by default. |
+
+The same accounts are refused as for [`user delete`](#user-delete), built-in
+groups included. A group that is some user's primary group is refused: delete
+the user, which takes their own group with them. Members simply lose the
+group. A kept shared directory is handed to root with mode 0700 on Linux and
+macOS.
 
 ## copy
 
@@ -846,6 +907,10 @@ burrow start sbx_2f0c
 | Argument | Description |
 | --- | --- |
 | `<ID>` | Sandbox to start. |
+
+A sandbox that was [`shutdown`](#shutdown), or that came back `stopped` because
+its VM did not survive its node, has no memory image to restore. `start` refuses
+it and says so; [`boot`](#boot) it instead.
 
 ## shutdown
 
@@ -1088,6 +1153,13 @@ the node that holds it, without starting anything. That takes an object store
 that honours conditional writes, which `burrowd serve` checks at startup and
 refuses to run without unless given `--allow-unconditional-object-store`
 ([PERSISTENCE.md](PERSISTENCE.md#one-sandbox-one-node)).
+
+A sandbox created with `--inspect-tls` moves only to a node under the same TLS
+inspection root, since its running processes trust the root they started with.
+Nodes on their own per-node authority each have a different one, so the move is
+refused with `FailedPrecondition` naming both fingerprints; give the nodes one
+fleet root with [`burrowd ca`](#burrowd-ca)
+([FIREWALL.md](FIREWALL.md#the-inspection-root)).
 
 ## remove
 
@@ -1574,6 +1646,43 @@ burrow templates import python:3.12-slim
 | `--systemd` | Boot the image's own systemd under the agent. See [TEMPLATES.md](TEMPLATES.md#systemd-templates). |
 | `--hypervisor <NAME>` | Hypervisor every sandbox from the template runs under: `firecracker` (the default) or `cloud-hypervisor`. Chosen here once; its snapshots, warm pool and moves stay within it, and it is placed only on nodes offering it. Pull the same image twice under two names to have it under both. See [ARCHITECTURE.md](ARCHITECTURE.md#hypervisor-backends). |
 
+### templates build
+
+Build a template: steps run in a sandbox from another template, or, on a Mac
+node, macOS installed from a restore image. `burrow template build` is the
+same command. See [TEMPLATES.md](TEMPLATES.md#built-templates).
+
+```
+burrow templates build <NAME> [--from <TEMPLATE>] [--step <CMD>]... [--hypervisor <NAME>]
+                              [--vcpus <N>] [--mem <MIB>] [--allow-domain <DOMAIN>]...
+burrow templates build <NAME> --from-ipsw <PATH|latest> [--hypervisor vz] [--disk-mib <MIB>]
+                              [--vcpus <N>] [--mem <MIB>]
+```
+
+```sh
+burrow templates build tools --from alpine-3.20 --step 'apk add git'
+burrow template build macos-27 --hypervisor vz --from-ipsw latest --vcpus 4 --mem 8192
+burrow template build macos-dev --from macos-27 --step 'touch /Users/Shared/built'
+# ==> booting a new Mac cloned from macos-27
+# ==> touch /Users/Shared/built
+# ==> shutting down
+# built template macos-dev (26364MiB) in 52s
+```
+
+| Argument | Description |
+| --- | --- |
+| `<NAME>` | Template to publish. A build replaces a template of the same name only once it succeeded. |
+
+| Option | Description |
+| --- | --- |
+| `--from <TEMPLATE>` | Template to start from, on the node holding it. A macOS one makes a macOS build: a clone of it booted as a new Mac. |
+| `--step <CMD>` | Shell command run as root in the build, in order. Repeatable. A step that exits non-zero fails the build with its output shown. |
+| `--from-ipsw <PATH\|latest>` | Install macOS from a restore image on a Mac node: a path on that node, or `latest`, which the node downloads from Apple's catalogue, verifies and keeps. Takes no `--from` or `--step`. See [TEMPLATES.md](TEMPLATES.md#macos-templates). |
+| `--hypervisor <NAME>` | `firecracker`, `cloud-hypervisor` or `vz`. Defaults to the base template's, and to `vz` for `--from-ipsw`. The build is placed on a node offering it. |
+| `--vcpus <N>`, `--mem <MIB>` | The build machine. Default 1 vCPU and 1024 MiB for Linux, the restore image's minimum for macOS. |
+| `--disk-mib <MIB>` | The installed macOS disk, for `--from-ipsw`. Default 65536; under 28672 is refused. |
+| `--allow-domain <DOMAIN>` | Domain the build may reach. Repeatable; none means any. |
+
 ### templates rm
 
 Remove a template. Sandboxes already running from it are unaffected.
@@ -1826,3 +1935,51 @@ burrow nodes undrain node_a
 | Argument | Description |
 | --- | --- |
 | `<NODE_ID>` | Node to accept sandboxes again. |
+
+## burrowd ca
+
+Make the fleet's TLS inspection root and each node's CA under it, as files, on
+an operator machine. Both are offline: nothing talks to a node or the
+orchestrator, and neither replaces a file that exists.
+
+```
+burrowd ca init [--out-dir <DIR>] [--name <NAME>] [--days <DAYS>]
+burrowd ca issue --node <ID> [--root-cert <PEM>] [--root-key <KEY>] [--out-dir <DIR>] [--days <DAYS>]
+```
+
+```sh
+burrowd ca init --out-dir fleet-ca
+# fleet root b5633a50...7c217 in fleet-ca/root.pem
+burrowd ca issue --node node_a --root-cert fleet-ca/root.pem --root-key fleet-ca/root.key --out-dir fleet-ca
+# node CA for node_a in fleet-ca/node_a.pem, valid 365 days, under root b5633a50...7c217
+```
+
+| Subcommand | Option | Description |
+| --- | --- | --- |
+| `init` | `--out-dir <DIR>` | Where `root.pem` and `root.key` are written. Default `.`. |
+| `init` | `--name <NAME>` | The root's common name. Default `burrow fleet inspection root`. |
+| `init` | `--days <DAYS>` | Lifetime. Default 3650. |
+| `issue` | `--node <ID>` | The node it is for, as given to `burrowd serve --node-id`. Writes `<ID>.pem` and `<ID>.key`. |
+| `issue` | `--root-cert <PEM>`, `--root-key <KEY>` | The root to sign with. Default `root.pem` and `root.key`. |
+| `issue` | `--out-dir <DIR>` | Where the pair is written. Default `.`. |
+| `issue` | `--days <DAYS>` | Lifetime. Default 365. |
+
+Keys are written `0600`. Keep `root.key` off the nodes.
+
+## burrowd serve inspection flags
+
+| Option | Description |
+| --- | --- |
+| `--inspect-ca-cert <PEM>` | This node's inspection CA, from `burrowd ca issue`. `BURROWD_INSPECT_CA_CERT`. |
+| `--inspect-ca-key <KEY>` | Its private key. `BURROWD_INSPECT_CA_KEY`. |
+| `--inspect-root-cert <PEM>` | The fleet root, certificate only. `BURROWD_INSPECT_ROOT_CERT`. |
+
+All three or none. With them, guests trust the root and inspected sandboxes move
+between nodes under it; the node refuses to start when the CA is not a CA, has
+expired, does not match its key or does not chain to the root, and warns once it
+has 30 days left. Without them the node generates its own authority in
+`--data-dir`, and its inspected sandboxes cannot move.
+
+On a Mac node, the root is written into each macOS sandbox's admin trust
+settings on its disk before it boots
+([FIREWALL.md](FIREWALL.md#macos-guests-and-apples-tls-stack)).

@@ -113,6 +113,7 @@ mod macos {
             authority: None,
             directory: Arc::default(),
             dns_upstream: SocketAddr::from(([1, 1, 1, 1], 53)),
+            router: Arc::default(),
         });
         let (policy_tx, policy_rx) = watch::channel(parse_policy("none")?);
         let handle = UserNet::attach(host_end, net, policy_rx, node, Arc::default())?;

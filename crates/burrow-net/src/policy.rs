@@ -313,6 +313,39 @@ pub fn decide(
     })
 }
 
+/// Decides a new flow arriving for the sandbox with `rules` from `source`,
+/// another sandbox's address: the `ip saddr {peer} ip daddr {guest} accept`
+/// its sandbox chain renders, which is all a flow arriving over the mesh meets
+/// on Linux.
+pub fn decide_ingress(rules: &Rules, source: Ipv4Addr) -> Verdict {
+    if rules.peers.contains(&source) {
+        Verdict::Direct
+    } else {
+        Verdict::Deny("source shares no private network with this sandbox")
+    }
+}
+
+/// Decides a new flow from one sandbox to another sandbox's address, on a
+/// node that forwards between them itself.
+///
+/// `sender` is the sending sandbox's own [`decide`] when it is on this node,
+/// and `None` when the flow arrived over the mesh, already admitted by the
+/// sender's node. `receiver` is the receiving sandbox's rules when it is on
+/// this node, and `None` when the flow leaves over the mesh for the
+/// receiver's node to admit. Anything but `Direct` from the sender stands, so
+/// allowlist web traffic to a non-member still goes to the proxy.
+pub fn decide_peer(sender: Option<Verdict>, receiver: Option<&Rules>, source: Ipv4Addr) -> Verdict {
+    if let Some(verdict) = sender
+        && verdict != Verdict::Direct
+    {
+        return verdict;
+    }
+    match receiver {
+        Some(rules) => decide_ingress(rules, source),
+        None => Verdict::Direct,
+    }
+}
+
 /// The sandbox chain's v6 rules: link-local denied in every mode, and only
 /// open mode forwarding at all, never into the fleet's v6 pool.
 fn decide_v6(rules: &Rules, destination: Ipv6Addr) -> Verdict {
@@ -556,6 +589,168 @@ mod tests {
             }
         }
         assert_eq!(checked, 8 * 9 * 8);
+    }
+
+    /// What the rendered ruleset does with the first packet of a new flow
+    /// from one sandbox address to another, whichever of them the ruleset
+    /// names: the NAT redirect for a local sender, then the sandbox chain.
+    fn evaluate_between(
+        ruleset: &str,
+        from: Ipv4Addr,
+        to: Ipv4Addr,
+        transport: Transport,
+        port: u16,
+    ) -> Verdict {
+        let proto = match transport {
+            Transport::Tcp => "tcp",
+            Transport::Udp => "udp",
+            Transport::Icmp => "icmp",
+        };
+        let applies = |rule: &str| {
+            let source = rule
+                .strip_prefix("ip saddr ")
+                .map(|rest| rest.split(' ').next().unwrap());
+            !rule.contains("iifname")
+                && source.is_none_or(|source| source == from.to_string())
+                && daddr(rule, to)
+                && dport(rule).is_none_or(|(p, ports)| p == proto && ports.contains(&port))
+        };
+        let chain = |name: &str| {
+            let prefix = format!("add rule {name} ");
+            ruleset
+                .lines()
+                .filter_map(move |line| line.strip_prefix(prefix.as_str()).map(str::to_string))
+                .collect::<Vec<_>>()
+        };
+        let redirected = chain("ip burrow_nat prerouting")
+            .iter()
+            .find(|rule| rule.starts_with(&format!("ip saddr {from} ")) && applies(rule))
+            .is_some_and(|rule| rule.contains("redirect to"));
+        if redirected {
+            return Verdict::Proxy;
+        }
+        for rule in chain("inet burrow sandbox") {
+            if rule.starts_with("ct state") || rule.contains("ip6 ") {
+                continue;
+            }
+            if rule == "drop" || applies(&rule) {
+                return match rule.rsplit(' ').next() {
+                    Some("drop") => Verdict::Deny(""),
+                    _ => Verdict::Direct,
+                };
+            }
+        }
+        unreachable!("the sandbox chain ends in a drop");
+    }
+
+    /// A node with no ruleset forwards between sandboxes itself, deciding
+    /// each new flow with [`decide_peer`]. Rendered for the same pair, the
+    /// ruleset must agree, both for two sandboxes on one node and for either
+    /// half of a flow crossing the mesh.
+    #[test]
+    fn the_ruleset_and_the_peer_decision_agree() {
+        let local = (Ipv4Addr::new(10, 99, 0, 5), Ipv4Addr::new(10, 99, 0, 6));
+        let neighbour = (Ipv4Addr::new(10, 99, 0, 9), Ipv4Addr::new(10, 99, 0, 10));
+        let remote = Ipv4Addr::new(10, 99, 4, 6);
+        let member = |(host, guest): (Ipv4Addr, Ipv4Addr), mode, peer: Option<Ipv4Addr>| {
+            let mut s = sandbox(mode);
+            s.sandbox_id = format!("sbx_{guest}");
+            s.host_ip = host;
+            s.guest_ip = guest;
+            s.peers = peer.into_iter().collect();
+            s
+        };
+        let probes = [
+            (Transport::Tcp, 80),
+            (Transport::Tcp, 443),
+            (Transport::Tcp, 22),
+            (Transport::Udp, 5432),
+            (Transport::Icmp, 0),
+        ];
+        let mut checked = 0;
+        for sender_mode in [Mode::None, Mode::Allowlist, Mode::Open] {
+            for receiver_mode in [Mode::None, Mode::Allowlist, Mode::Open] {
+                for is_member in [true, false] {
+                    for is_denied in [false, true] {
+                        for (transport, port) in probes {
+                            // Both on this node.
+                            let mut sender =
+                                member(local, sender_mode, is_member.then_some(neighbour.1));
+                            if is_denied {
+                                sender.deny_cidrs = vec!["10.99.0.8/29".into()];
+                            }
+                            let receiver =
+                                member(neighbour, receiver_mode, is_member.then_some(local.1));
+                            let ruleset = render_with(&[sender.clone(), receiver.clone()], &[]);
+                            let decided = decide_peer(
+                                Some(decide(
+                                    &rules_of(&sender),
+                                    local.0,
+                                    &NodeDenials::default(),
+                                    IpAddr::V4(neighbour.1),
+                                    transport,
+                                    port,
+                                )),
+                                Some(&rules_of(&receiver)),
+                                local.1,
+                            );
+                            let rendered =
+                                evaluate_between(&ruleset, local.1, neighbour.1, transport, port);
+                            assert!(
+                                same_kind(decided, rendered),
+                                "local {sender_mode:?} -> {receiver_mode:?} member={is_member} \
+                                 denied={is_denied} {transport:?}/{port}: {decided:?} vs {rendered:?}"
+                            );
+
+                            // Leaving for a peer on another node.
+                            let mut sender =
+                                member(local, sender_mode, is_member.then_some(remote));
+                            if is_denied {
+                                sender.deny_cidrs = vec!["10.99.4.0/24".into()];
+                            }
+                            let ruleset = render_with(std::slice::from_ref(&sender), &[]);
+                            let decided = decide_peer(
+                                Some(decide(
+                                    &rules_of(&sender),
+                                    local.0,
+                                    &NodeDenials::default(),
+                                    IpAddr::V4(remote),
+                                    transport,
+                                    port,
+                                )),
+                                None,
+                                local.1,
+                            );
+                            let rendered =
+                                evaluate_between(&ruleset, local.1, remote, transport, port);
+                            assert!(
+                                same_kind(decided, rendered),
+                                "outbound {sender_mode:?} member={is_member} denied={is_denied} \
+                                 {transport:?}/{port}: {decided:?} vs {rendered:?}"
+                            );
+
+                            // Arriving over the mesh from a peer on another node.
+                            let mut receiver =
+                                member(neighbour, receiver_mode, is_member.then_some(remote));
+                            if is_denied {
+                                receiver.deny_cidrs = vec!["10.99.4.0/24".into()];
+                            }
+                            let ruleset = render_with(std::slice::from_ref(&receiver), &[]);
+                            let decided = decide_peer(None, Some(&rules_of(&receiver)), remote);
+                            let rendered =
+                                evaluate_between(&ruleset, remote, neighbour.1, transport, port);
+                            assert!(
+                                same_kind(decided, rendered),
+                                "inbound {receiver_mode:?} member={is_member} denied={is_denied} \
+                                 {transport:?}/{port}: {decided:?} vs {rendered:?}"
+                            );
+                            checked += 3;
+                        }
+                    }
+                }
+            }
+        }
+        assert_eq!(checked, 3 * 3 * 2 * 2 * 5 * 3);
     }
 
     #[test]

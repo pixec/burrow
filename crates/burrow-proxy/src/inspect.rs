@@ -11,9 +11,13 @@
 //! opt-in per sandbox: the default remains that burrow sees hostnames and never
 //! payloads. Turning it on trades that privacy for checking the inner host.
 //!
-//! The certificate authority is generated on the node, kept there, and
-//! installed into guests that opt in. It signs only for sandboxes that asked
-//! for inspection, and never leaves the node.
+//! Leaves are signed by a certificate authority on the node, whose key never
+//! leaves it, and are presented only to sandboxes that asked for inspection.
+//! What a guest is told to trust is the root that authority chains to. In a
+//! fleet, that is one operator-made root over a per-node intermediate, so a
+//! sandbox that moves keeps trusting the node it lands on. A node given no
+//! root generates its own authority and is its own root, and a sandbox
+//! inspected there cannot move to a node with another.
 
 use std::collections::HashMap;
 use std::path::Path;
@@ -97,12 +101,13 @@ impl Protocol {
 /// Both are built from a single signed leaf: which protocol a connection ends
 /// up on is not known until the origin has answered, and minting a second
 /// certificate for the same name would cost a keypair per protocol. Leaves live
-/// in memory only and are re-minted on every start, so their validity window is
-/// left at rcgen's default.
+/// in memory only and are re-minted on every start and once they are half way
+/// through their life.
 #[derive(Clone)]
 struct Leaf {
     http11: Arc<rustls::ServerConfig>,
     h2: Arc<rustls::ServerConfig>,
+    minted: std::time::Instant,
 }
 
 impl Leaf {
@@ -112,20 +117,184 @@ impl Leaf {
             Protocol::H2 => Arc::clone(&self.h2),
         }
     }
+
+    fn is_fresh(&self) -> bool {
+        self.minted.elapsed() < LEAF_LIFETIME / 2
+    }
 }
+
+/// How long a leaf is valid for.
+///
+/// Apple's TLS stack refuses a server certificate valid for more than 825
+/// days whatever root it chains to, and a short life is also what bounds a
+/// leaf outliving the authority that signed it.
+const LEAF_LIFETIME: std::time::Duration = std::time::Duration::from_secs(30 * 24 * 3600);
+
+/// How long a node intermediate issued by `burrowd ca issue` lasts unless
+/// told otherwise.
+pub const NODE_CA_LIFETIME: std::time::Duration = std::time::Duration::from_secs(365 * 24 * 3600);
+
+/// How long a fleet root made by `burrowd ca init` lasts unless told
+/// otherwise.
+pub const ROOT_LIFETIME: std::time::Duration = std::time::Duration::from_secs(10 * 365 * 24 * 3600);
+
+/// The name the chain is checked against at startup. Never resolvable, so
+/// the leaf minted for the check is no use to anything else.
+const CHAIN_CHECK_HOST: &str = "chain-check.burrow.invalid";
 
 /// A certificate authority for inspected connections.
 pub struct Authority {
+    /// The signing certificate as rcgen needs it: the node CA's name and key
+    /// identifier, re-signed by its own key. Never presented to anyone.
     ca: rcgen::Certificate,
     key: rcgen::KeyPair,
-    cert_pem: String,
+    /// The node CA exactly as it was issued, sent behind every leaf.
+    ca_der: CertificateDer<'static>,
+    /// What guests trust, in PEM: the fleet root, or the node CA itself when
+    /// it is its own root.
+    root_pem: String,
+    root_fingerprint: String,
+    /// When the node CA stops being valid, and with it every leaf it signs.
+    expires_at: std::time::SystemTime,
     /// Leaves already minted, by hostname. Signing is not free and a sandbox
     /// talks to the same handful of hosts over and over.
     leaves: RwLock<HashMap<String, Leaf>>,
 }
 
+/// The hex SHA-256 of a certificate's DER, which is how nodes and sandboxes
+/// name the root they trust.
+pub fn fingerprint(der: &[u8]) -> String {
+    use sha2::Digest as _;
+    hex::encode(sha2::Sha256::digest(der))
+}
+
+/// [`fingerprint`] of the first certificate in `pem`, or empty when it holds
+/// none.
+pub fn pem_fingerprint(pem: &str) -> String {
+    rustls_pemfile::certs(&mut pem.as_bytes())
+        .next()
+        .and_then(Result::ok)
+        .map(|der| fingerprint(&der))
+        .unwrap_or_default()
+}
+
+/// The certificates in a PEM file, as DER.
+fn read_certificates(path: &Path) -> Result<Vec<CertificateDer<'static>>, String> {
+    let pem = std::fs::read(path).map_err(|err| format!("reading {}: {err}", path.display()))?;
+    let certificates = rustls_pemfile::certs(&mut pem.as_slice())
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|err| format!("parsing {}: {err}", path.display()))?;
+    if certificates.is_empty() {
+        return Err(format!("{} holds no certificate", path.display()));
+    }
+    Ok(certificates)
+}
+
+fn pem_of(der: &[u8]) -> String {
+    use base64::Engine as _;
+    let body = base64::engine::general_purpose::STANDARD.encode(der);
+    let mut pem = String::from("-----BEGIN CERTIFICATE-----\n");
+    for line in body.as_bytes().chunks(64) {
+        pem.push_str(std::str::from_utf8(line).expect("base64 is ascii"));
+        pem.push('\n');
+    }
+    pem.push_str("-----END CERTIFICATE-----\n");
+    pem
+}
+
+/// A CA certificate's parameters, refusing one that is not a CA.
+fn ca_params(der: &CertificateDer<'_>, what: &str) -> Result<rcgen::CertificateParams, String> {
+    let params = rcgen::CertificateParams::from_ca_cert_der(der)
+        .map_err(|err| format!("parsing the {what}: {err}"))?;
+    if !matches!(params.is_ca, rcgen::IsCa::Ca(_)) {
+        return Err(format!(
+            "the {what} is not a CA certificate (its basic constraints do not say CA:TRUE); \
+             issue one with `burrowd ca issue`"
+        ));
+    }
+    Ok(params)
+}
+
+/// Parameters for a CA certificate valid from now for `lifetime`.
+fn new_ca_params(
+    common_name: &str,
+    lifetime: std::time::Duration,
+    path_len: rcgen::BasicConstraints,
+) -> Result<rcgen::CertificateParams, String> {
+    let mut params =
+        rcgen::CertificateParams::new(Vec::new()).map_err(|err| format!("ca params: {err}"))?;
+    params.is_ca = rcgen::IsCa::Ca(path_len);
+    params
+        .distinguished_name
+        .push(rcgen::DnType::CommonName, common_name);
+    params
+        .distinguished_name
+        .push(rcgen::DnType::OrganizationName, "burrow");
+    params.key_usages = vec![
+        rcgen::KeyUsagePurpose::KeyCertSign,
+        rcgen::KeyUsagePurpose::CrlSign,
+        rcgen::KeyUsagePurpose::DigitalSignature,
+    ];
+    let now = time::OffsetDateTime::now_utc();
+    params.not_before = now - std::time::Duration::from_secs(3600);
+    params.not_after = now + lifetime;
+    Ok(params)
+}
+
+/// Makes a fleet root: its certificate and private key, in PEM.
+pub fn create_root(
+    common_name: &str,
+    lifetime: std::time::Duration,
+) -> Result<(String, String), String> {
+    let key = rcgen::KeyPair::generate().map_err(|err| format!("root key: {err}"))?;
+    let root = new_ca_params(
+        common_name,
+        lifetime,
+        rcgen::BasicConstraints::Constrained(1),
+    )?
+    .self_signed(&key)
+    .map_err(|err| format!("root certificate: {err}"))?;
+    Ok((root.pem(), key.serialize_pem()))
+}
+
+/// Issues the intermediate a node signs leaves with, under a fleet root: its
+/// certificate and private key, in PEM.
+///
+/// Constrained to signing leaves, so a node's key can mint certificates for
+/// hosts and never another authority.
+pub fn issue_node_ca(
+    root_pem: &str,
+    root_key_pem: &str,
+    node_id: &str,
+    lifetime: std::time::Duration,
+) -> Result<(String, String), String> {
+    let root_key =
+        rcgen::KeyPair::from_pem(root_key_pem).map_err(|err| format!("root key: {err}"))?;
+    let root_der = rustls_pemfile::certs(&mut root_pem.as_bytes())
+        .next()
+        .ok_or("the root file holds no certificate")?
+        .map_err(|err| format!("root certificate: {err}"))?;
+    let root = ca_params(&root_der, "root certificate")?
+        .self_signed(&root_key)
+        .map_err(|err| format!("root certificate: {err}"))?;
+    let key = rcgen::KeyPair::generate().map_err(|err| format!("node key: {err}"))?;
+    let mut params = new_ca_params(
+        &format!("burrow inspection {node_id}"),
+        lifetime,
+        rcgen::BasicConstraints::Constrained(0),
+    )?;
+    params.use_authority_key_identifier_extension = true;
+    let node = params
+        .signed_by(&key, &root, &root_key)
+        .map_err(|err| format!("signing the node certificate: {err}"))?;
+    let key_pem = key.serialize_pem();
+    Authority::with_root(node.der(), &key_pem, &root_der)?;
+    Ok((node.pem(), key_pem))
+}
+
 impl Authority {
-    /// Loads the node's authority, generating one the first time.
+    /// Loads the node's own authority, generating one the first time: what a
+    /// node runs with when it is given no fleet root, and its own root then.
     ///
     /// Persisted rather than regenerated per start, because the certificate is
     /// installed inside guests: a new one each boot would break every sandbox
@@ -155,82 +324,169 @@ impl Authority {
             ));
         }
 
-        let authority = Self::generate()?;
+        let (cert_pem, key_pem) = Self::generate()?;
         std::fs::create_dir_all(dir).map_err(|err| format!("creating {}: {err}", dir.display()))?;
-        std::fs::write(&cert_path, &authority.cert_pem)
+        std::fs::write(&cert_path, &cert_pem)
             .map_err(|err| format!("writing the ca certificate: {err}"))?;
         // The private key signs certificates guests are told to trust, so it
         // is created readable only by the daemon that uses it. Creating it open
         // and narrowing afterwards leaves a window to copy it in.
-        Self::write_private(&key_path, &authority.key.serialize_pem())
-            .map_err(|err| format!("writing the ca key: {err}"))?;
+        write_private(&key_path, &key_pem).map_err(|err| format!("writing the ca key: {err}"))?;
         tracing::info!(path = %cert_path.display(), "generated a TLS inspection authority");
+        Self::from_pem(&cert_pem, &key_pem)
+    }
+
+    /// Loads a node intermediate and the fleet root it must chain to.
+    ///
+    /// Refuses one that is not a CA, has expired, does not match its key, or
+    /// does not chain to the root: each would start a node whose inspected
+    /// sandboxes reject every connection, which is worse than not starting.
+    pub fn load(cert: &Path, key: &Path, root: &Path) -> Result<Self, String> {
+        let node = read_certificates(cert)?.remove(0);
+        let mut roots = read_certificates(root)?;
+        if roots.len() > 1 {
+            return Err(format!(
+                "{} holds {} certificates; give the fleet root on its own",
+                root.display(),
+                roots.len()
+            ));
+        }
+        let key_pem = std::fs::read_to_string(key)
+            .map_err(|err| format!("reading {}: {err}", key.display()))?;
+        Self::with_root(&node, &key_pem, &roots.remove(0))
+            .map_err(|err| format!("{}: {err}", cert.display()))
+    }
+
+    /// An authority signing with `node`, checked to chain to `root`.
+    fn with_root(
+        node: &CertificateDer<'static>,
+        key_pem: &str,
+        root: &CertificateDer<'static>,
+    ) -> Result<Self, String> {
+        ca_params(root, "root certificate")?;
+        let authority = Self::from_der(node, key_pem, root)?;
+        authority.check_chain(root)?;
         Ok(authority)
     }
 
-    /// Writes a file only the owner can read, from the moment it exists.
-    fn write_private(path: &Path, contents: &str) -> std::io::Result<()> {
-        use std::io::Write;
-
-        let mut options = std::fs::OpenOptions::new();
-        options.write(true).create_new(true);
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::OpenOptionsExt;
-            options.mode(0o600);
-        }
-        let mut file = options.open(path)?;
-        file.write_all(contents.as_bytes())?;
-        file.sync_all()
-    }
-
-    fn generate() -> Result<Self, String> {
+    fn generate() -> Result<(String, String), String> {
         let key = rcgen::KeyPair::generate().map_err(|err| format!("ca key: {err}"))?;
-        let mut params =
-            rcgen::CertificateParams::new(Vec::new()).map_err(|err| format!("ca params: {err}"))?;
-        params.is_ca = rcgen::IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
-        params
-            .distinguished_name
-            .push(rcgen::DnType::CommonName, "burrow sandbox inspection");
-        params
-            .distinguished_name
-            .push(rcgen::DnType::OrganizationName, "burrow");
-        params.key_usages = vec![
-            rcgen::KeyUsagePurpose::KeyCertSign,
-            rcgen::KeyUsagePurpose::CrlSign,
-            rcgen::KeyUsagePurpose::DigitalSignature,
-        ];
-
-        let ca = params
-            .self_signed(&key)
-            .map_err(|err| format!("ca certificate: {err}"))?;
-        let cert_pem = ca.pem();
-        Ok(Self {
-            ca,
-            key,
-            cert_pem,
-            leaves: RwLock::new(HashMap::new()),
-        })
+        let ca = new_ca_params(
+            "burrow sandbox inspection",
+            ROOT_LIFETIME,
+            rcgen::BasicConstraints::Unconstrained,
+        )?
+        .self_signed(&key)
+        .map_err(|err| format!("ca certificate: {err}"))?;
+        Ok((ca.pem(), key.serialize_pem()))
     }
 
     fn from_pem(cert_pem: &str, key_pem: &str) -> Result<Self, String> {
-        let key = rcgen::KeyPair::from_pem(key_pem).map_err(|err| format!("ca key: {err}"))?;
-        let params = rcgen::CertificateParams::from_ca_cert_pem(cert_pem)
+        let der = rustls_pemfile::certs(&mut cert_pem.as_bytes())
+            .next()
+            .ok_or("no certificate in the ca file")?
             .map_err(|err| format!("ca certificate: {err}"))?;
+        Self::from_der(&der, key_pem, &der)
+    }
+
+    fn from_der(
+        der: &CertificateDer<'static>,
+        key_pem: &str,
+        root: &CertificateDer<'static>,
+    ) -> Result<Self, String> {
+        let key = rcgen::KeyPair::from_pem(key_pem).map_err(|err| format!("ca key: {err}"))?;
+        let params = ca_params(der, "node CA certificate")?;
+        let expires_at = std::time::SystemTime::from(params.not_after);
+        if expires_at <= std::time::SystemTime::now() {
+            return Err(format!(
+                "the node CA certificate expired at {}; issue a new one with `burrowd ca issue`",
+                params.not_after
+            ));
+        }
         let ca = params
             .self_signed(&key)
             .map_err(|err| format!("ca certificate: {err}"))?;
         Ok(Self {
             ca,
             key,
-            cert_pem: cert_pem.to_string(),
+            ca_der: der.clone(),
+            root_pem: pem_of(root),
+            root_fingerprint: fingerprint(root),
+            expires_at,
             leaves: RwLock::new(HashMap::new()),
         })
     }
 
-    /// The certificate guests must trust, in PEM.
+    /// Mints a leaf and verifies it the way a client trusting only `root`
+    /// would, which settles at once that the node CA is a CA, is current,
+    /// matches its key and chains to the root.
+    fn check_chain(&self, root: &CertificateDer<'static>) -> Result<(), String> {
+        let mut anchors = rustls::RootCertStore::empty();
+        anchors
+            .add(root.clone())
+            .map_err(|err| format!("the root certificate is unusable: {err}"))?;
+        use rustls::client::danger::ServerCertVerifier as _;
+        let verifier = rustls::client::WebPkiServerVerifier::builder_with_provider(
+            Arc::new(anchors),
+            Arc::new(rustls::crypto::ring::default_provider()),
+        )
+        .build()
+        .map_err(|err| format!("building a verifier: {err}"))?;
+        let (leaf, _) = self.mint(CHAIN_CHECK_HOST)?;
+        let host = rustls::pki_types::ServerName::try_from(CHAIN_CHECK_HOST)
+            .expect("a valid name")
+            .to_owned();
+        verifier
+            .verify_server_cert(
+                &leaf,
+                std::slice::from_ref(&self.ca_der),
+                &host,
+                &[],
+                rustls::pki_types::UnixTime::now(),
+            )
+            .map_err(|err| {
+                format!(
+                    "the node CA does not chain to the root {} ({err}); it must be issued by \
+                     that root, with the key given beside it",
+                    self.root_fingerprint
+                )
+            })?;
+        Ok(())
+    }
+
+    /// The certificate guests must trust, in PEM: the fleet root.
     pub fn certificate_pem(&self) -> &str {
-        &self.cert_pem
+        &self.root_pem
+    }
+
+    /// The SHA-256 of the root guests trust, in hex.
+    pub fn root_fingerprint(&self) -> &str {
+        &self.root_fingerprint
+    }
+
+    /// When the node's CA expires.
+    pub fn expires_at(&self) -> std::time::SystemTime {
+        self.expires_at
+    }
+
+    /// Signs a leaf for `host`, returning it and its key.
+    fn mint(&self, host: &str) -> Result<(CertificateDer<'static>, rcgen::KeyPair), String> {
+        let key = rcgen::KeyPair::generate().map_err(|err| format!("leaf key: {err}"))?;
+        let mut params = rcgen::CertificateParams::new(vec![host.to_string()])
+            .map_err(|err| format!("leaf params: {err}"))?;
+        params
+            .distinguished_name
+            .push(rcgen::DnType::CommonName, host);
+        params.use_authority_key_identifier_extension = true;
+        // Apple's TLS stack refuses a server certificate without this.
+        params.extended_key_usages = vec![rcgen::ExtendedKeyUsagePurpose::ServerAuth];
+        let now = time::OffsetDateTime::now_utc();
+        params.not_before = now - std::time::Duration::from_secs(3600);
+        params.not_after = (now + LEAF_LIFETIME).min(time::OffsetDateTime::from(self.expires_at));
+        let leaf = params
+            .signed_by(&key, &self.ca, &self.key)
+            .map_err(|err| format!("signing a leaf for {host}: {err}"))?;
+        Ok((CertificateDer::from(leaf.der().to_vec()), key))
     }
 
     /// A TLS server configuration presenting a certificate for `host` and
@@ -244,26 +500,14 @@ impl Authority {
         host: &str,
         protocol: Protocol,
     ) -> Result<Arc<rustls::ServerConfig>, String> {
-        if let Some(leaf) = self.leaves.read().unwrap().get(host) {
+        if let Some(leaf) = self.leaves.read().unwrap().get(host)
+            && leaf.is_fresh()
+        {
             return Ok(leaf.select(protocol));
         }
 
-        let key = rcgen::KeyPair::generate().map_err(|err| format!("leaf key: {err}"))?;
-        let mut params = rcgen::CertificateParams::new(vec![host.to_string()])
-            .map_err(|err| format!("leaf params: {err}"))?;
-        params
-            .distinguished_name
-            .push(rcgen::DnType::CommonName, host);
-        params.use_authority_key_identifier_extension = true;
-
-        let leaf = params
-            .signed_by(&key, &self.ca, &self.key)
-            .map_err(|err| format!("signing a leaf for {host}: {err}"))?;
-
-        let chain = vec![
-            CertificateDer::from(leaf.der().to_vec()),
-            CertificateDer::from(self.ca.der().to_vec()),
-        ];
+        let (leaf, key) = self.mint(host)?;
+        let chain = vec![leaf, self.ca_der.clone()];
         let private = PrivateKeyDer::try_from(key.serialize_der())
             .map_err(|err| format!("leaf key: {err}"))?;
 
@@ -278,13 +522,16 @@ impl Authority {
         let leaf = Leaf {
             http11: configure(Protocol::Http11)?,
             h2: configure(Protocol::H2)?,
+            minted: std::time::Instant::now(),
         };
 
         let mut leaves = self.leaves.write().unwrap();
         // Two connections for the same new host race here; whichever arrives
         // second uses the leaf the first cached rather than adding its own, so
         // one host never occupies two entries.
-        if let Some(existing) = leaves.get(host) {
+        if let Some(existing) = leaves.get(host)
+            && existing.is_fresh()
+        {
             return Ok(existing.select(protocol));
         }
         // The key is a name the sandbox chose. Bounded, and cleared wholesale
@@ -298,6 +545,23 @@ impl Authority {
         leaves.insert(host.to_string(), leaf);
         Ok(selected)
     }
+}
+
+/// Writes a file only the owner can read, from the moment it exists, and
+/// refuses to replace one that is there.
+pub fn write_private(path: &Path, contents: &str) -> std::io::Result<()> {
+    use std::io::Write;
+
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    let mut file = options.open(path)?;
+    file.write_all(contents.as_bytes())?;
+    file.sync_all()
 }
 
 /// Checks a request's host against the allowlist.
@@ -393,6 +657,178 @@ mod tests {
             pem,
             "the existing certificate must survive"
         );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A fleet root and one node intermediate under it, written to `dir`.
+    fn fleet(dir: &Path, node: &str) -> (PathBuf, PathBuf, PathBuf) {
+        let root_cert = dir.join("root.pem");
+        let root_key = dir.join("root.key");
+        if !root_cert.exists() {
+            let (cert, key) = create_root("test fleet", ROOT_LIFETIME).unwrap();
+            std::fs::write(&root_cert, cert).unwrap();
+            std::fs::write(&root_key, key).unwrap();
+        }
+        let (cert, key) = issue_node_ca(
+            &std::fs::read_to_string(&root_cert).unwrap(),
+            &std::fs::read_to_string(&root_key).unwrap(),
+            node,
+            NODE_CA_LIFETIME,
+        )
+        .unwrap();
+        let (node_cert, node_key) = (
+            dir.join(format!("{node}.pem")),
+            dir.join(format!("{node}.key")),
+        );
+        std::fs::write(&node_cert, cert).unwrap();
+        std::fs::write(&node_key, key).unwrap();
+        (node_cert, node_key, root_cert)
+    }
+
+    /// Completes a handshake against `authority`'s leaf for `host` as a client
+    /// that trusts only `root_pem`.
+    async fn handshake(authority: &Authority, root_pem: &str, host: &str) -> Result<(), String> {
+        let mut roots = rustls::RootCertStore::empty();
+        for der in rustls_pemfile::certs(&mut root_pem.as_bytes()) {
+            roots.add(der.unwrap()).unwrap();
+        }
+        let client = rustls::ClientConfig::builder()
+            .with_root_certificates(roots)
+            .with_no_client_auth();
+        let server = authority.server_config(host, Protocol::Http11).unwrap();
+        let (a, b) = tokio::io::duplex(64 * 1024);
+        let accept =
+            tokio::spawn(async move { tokio_rustls::TlsAcceptor::from(server).accept(b).await });
+        let name = rustls::pki_types::ServerName::try_from(host.to_string()).unwrap();
+        let connected = tokio_rustls::TlsConnector::from(Arc::new(client))
+            .connect(name, a)
+            .await
+            .map(|_| ())
+            .map_err(|err| err.to_string());
+        let _ = accept.await;
+        connected
+    }
+
+    /// The point of a fleet root: a guest told to trust it once verifies the
+    /// leaves of every node, so moving between them changes nothing inside.
+    #[tokio::test]
+    async fn every_node_under_one_root_is_trusted_through_it() {
+        let dir = scratch("fleet");
+        let (a_cert, a_key, root) = fleet(&dir, "node-a");
+        let (b_cert, b_key, _) = fleet(&dir, "node-b");
+        let a = Authority::load(&a_cert, &a_key, &root).unwrap();
+        let b = Authority::load(&b_cert, &b_key, &root).unwrap();
+
+        let root_pem = std::fs::read_to_string(&root).unwrap();
+        assert_eq!(a.certificate_pem().trim(), root_pem.trim());
+        assert_eq!(a.root_fingerprint(), b.root_fingerprint());
+        let root_der = rustls_pemfile::certs(&mut root_pem.as_bytes())
+            .next()
+            .unwrap()
+            .unwrap();
+        assert_eq!(a.root_fingerprint(), fingerprint(&root_der));
+
+        // The intermediate travels in the chain; the guest holds only the root.
+        handshake(&a, &root_pem, "example.com").await.unwrap();
+        handshake(&b, &root_pem, "example.com").await.unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn a_node_authority_is_trusted_through_itself() {
+        let dir = scratch("legacy-trust");
+        let ca = Authority::load_or_create(&dir).unwrap();
+        let pem = std::fs::read_to_string(dir.join(CA_CERT)).unwrap();
+        assert_eq!(ca.certificate_pem().trim(), pem.trim());
+        handshake(&ca, &pem, "example.com").await.unwrap();
+
+        // Another node's authority is another root.
+        let other = scratch("legacy-other");
+        let other = Authority::load_or_create(&other).unwrap();
+        assert_ne!(ca.root_fingerprint(), other.root_fingerprint());
+        assert!(handshake(&other, &pem, "example.com").await.is_err());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_node_ca_from_another_root_is_refused() {
+        let dir = scratch("wrong-root");
+        let (cert, key, _) = fleet(&dir, "node-a");
+        let other = scratch("wrong-root-other");
+        let (_, _, other_root) = fleet(&other, "node-b");
+        let err = Authority::load(&cert, &key, &other_root).err().unwrap();
+        assert!(err.contains("does not chain to the root"), "{err}");
+        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_dir_all(&other);
+    }
+
+    #[test]
+    fn a_node_ca_with_another_nodes_key_is_refused() {
+        let dir = scratch("wrong-key");
+        let (a_cert, _, root) = fleet(&dir, "node-a");
+        let (_, b_key, _) = fleet(&dir, "node-b");
+        let err = Authority::load(&a_cert, &b_key, &root).err().unwrap();
+        assert!(err.contains("does not chain to the root"), "{err}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_certificate_that_is_not_a_ca_is_refused() {
+        let dir = scratch("not-ca");
+        let (_, _, root) = fleet(&dir, "node-a");
+        let root_pem = std::fs::read_to_string(&root).unwrap();
+        let root_key =
+            rcgen::KeyPair::from_pem(&std::fs::read_to_string(dir.join("root.key")).unwrap())
+                .unwrap();
+        let issuer = rcgen::CertificateParams::from_ca_cert_pem(&root_pem)
+            .unwrap()
+            .self_signed(&root_key)
+            .unwrap();
+        let key = rcgen::KeyPair::generate().unwrap();
+        let leaf = rcgen::CertificateParams::new(vec!["node.example".into()])
+            .unwrap()
+            .signed_by(&key, &issuer, &root_key)
+            .unwrap();
+        std::fs::write(dir.join("leaf.pem"), leaf.pem()).unwrap();
+        std::fs::write(dir.join("leaf.key"), key.serialize_pem()).unwrap();
+        let err = Authority::load(&dir.join("leaf.pem"), &dir.join("leaf.key"), &root)
+            .err()
+            .unwrap();
+        assert!(err.contains("not a CA certificate"), "{err}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn an_expired_node_ca_is_refused() {
+        let dir = scratch("expired");
+        let (_, _, root) = fleet(&dir, "node-a");
+        let err = issue_node_ca(
+            &std::fs::read_to_string(&root).unwrap(),
+            &std::fs::read_to_string(dir.join("root.key")).unwrap(),
+            "node-a",
+            std::time::Duration::ZERO,
+        )
+        .err()
+        .unwrap();
+        assert!(err.contains("expired"), "{err}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Apple's TLS stack rejects a server certificate without serverAuth or
+    /// valid for longer than 825 days, whatever root it chains to.
+    #[test]
+    fn a_leaf_is_short_lived_and_for_servers() {
+        let dir = scratch("leaf-shape");
+        let (cert, key, root) = fleet(&dir, "node-a");
+        let ca = Authority::load(&cert, &key, &root).unwrap();
+        let (leaf, _) = ca.mint("example.com").unwrap();
+        let params = rcgen::CertificateParams::from_ca_cert_der(&leaf).unwrap();
+        assert_eq!(
+            params.extended_key_usages,
+            vec![rcgen::ExtendedKeyUsagePurpose::ServerAuth]
+        );
+        assert!(params.not_after - params.not_before < time::Duration::days(825));
+        assert!(std::time::SystemTime::from(params.not_after) <= ca.expires_at());
         let _ = std::fs::remove_dir_all(&dir);
     }
 

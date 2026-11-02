@@ -34,6 +34,7 @@ netlink-packet-route = { workspace = true }
 
 [target.'cfg(target_os = "macos")'.dependencies]
 nix = { workspace = true }
+base64 = { workspace = true }
 
 [target.'cfg(windows)'.dependencies]
 base64 = { workspace = true }
@@ -62,6 +63,7 @@ features = [
     "Win32_System_Kernel",
     "Win32_System_Memory",
     "Win32_System_Pipes",
+    "Win32_System_Registry",
     "Win32_System_Services",
     "Win32_System_SystemInformation",
     "Win32_System_SystemServices",

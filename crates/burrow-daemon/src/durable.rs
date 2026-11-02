@@ -64,6 +64,8 @@ pub const WORKING_SET: &str = "workingset.bin";
 
 pub const STATE_SUSPENDED: &str = "suspended";
 pub const STATE_RUNNING: &str = "running";
+/// Being purged: no node may adopt or resume it.
+pub const STATE_DELETING: &str = "deleting";
 
 /// How old an object must be before the collector may take it. Far longer than
 /// any upload, which puts its chunks before the manifest that names them.
@@ -102,6 +104,11 @@ pub struct Manifest {
     /// them back from.
     #[serde(default)]
     pub secrets: std::collections::BTreeMap<String, String>,
+    /// SHA-256 of the TLS inspection root the guest was told to trust, when
+    /// it is inspected. Its processes hold that root in memory, so the state
+    /// restores only on a node whose leaves chain to the same one.
+    #[serde(default)]
+    pub inspection_root: String,
 }
 
 impl Manifest {
@@ -584,10 +591,33 @@ async fn delete_generation(store: &ObjectStore, id: &str, generation: u64) {
     }
 }
 
-/// Removes everything stored for a sandbox. The manifest goes first, so a node
-/// reading it mid-purge finds nothing rather than a generation half deleted.
-/// Chunks are left to the collector, since other images may share them.
-pub async fn purge(store: &ObjectStore, id: &str) -> Result<(), Status> {
+/// Removes everything stored for a sandbox, as `holder` or, with `None`, for
+/// a sandbox the store says no node runs.
+///
+/// Conditional the way every other write is: the manifest is first marked
+/// deleting under the version it was read at, so a node that took the
+/// sandbox in between keeps it and the purge is refused naming that node,
+/// and one reading it afterwards finds nothing to adopt. Then the manifest
+/// goes, so a node reading it mid-purge finds nothing rather than a
+/// generation half deleted. Chunks are left to the collector, since other
+/// images may share them.
+pub async fn purge(store: &ObjectStore, id: &str, holder: Option<&str>) -> Result<(), Status> {
+    if let Some(held) = read_manifest(store, id).await? {
+        let is_ours = match holder {
+            Some(holder) => held.manifest.node_id == holder,
+            None => held.manifest.state != STATE_RUNNING,
+        };
+        if !is_ours {
+            return Err(Status::aborted(format!(
+                "sandbox {id} is held by node {} in the object store ({}, generation {}); its \
+                 stored state is not deleted from here",
+                held.manifest.node_id, held.manifest.state, held.manifest.generation
+            )));
+        }
+        let mut deleting = held.manifest.clone();
+        deleting.state = STATE_DELETING.to_string();
+        replace_manifest(store, Some(&held), &deleting).await?;
+    }
     store.delete(&manifest_key(id)).await?;
     for key in store.list(&sandbox_prefix(id)).await? {
         store.delete(&key).await?;
@@ -914,6 +944,7 @@ mod tests {
             rx_bytes: 0,
             tx_bytes: 0,
             secrets: Default::default(),
+            inspection_root: String::new(),
         }
     }
 
@@ -988,5 +1019,42 @@ mod tests {
         write_held(&store, "node-a", &manifest("node-a", STATE_RUNNING), false)
             .await
             .unwrap();
+    }
+
+    /// A delete reaching the node the sandbox moved off, or the orchestrator
+    /// purging one it thinks no node holds, used to delete the state the
+    /// node running it now depends on.
+    #[tokio::test]
+    async fn a_purge_cannot_take_state_from_the_node_holding_it() {
+        let store = crate::objstore::fake::store(true).await;
+        let running = manifest("node-b", STATE_RUNNING);
+        replace_manifest(&store, None, &running).await.unwrap();
+        let generation = generation_key("sbx_1", 1, "snapshot");
+        store
+            .put_bytes(&generation, b"state".to_vec())
+            .await
+            .unwrap();
+
+        for holder in [Some("node-a"), None] {
+            let refused = purge(&store, "sbx_1", holder).await.unwrap_err();
+            assert_eq!(refused.code(), tonic::Code::Aborted);
+            assert!(
+                refused.message().contains("node-b"),
+                "{}",
+                refused.message()
+            );
+        }
+        assert!(read_manifest(&store, "sbx_1").await.unwrap().is_some());
+        assert!(store.exists(&generation).await.unwrap());
+
+        purge(&store, "sbx_1", Some("node-b")).await.unwrap();
+        assert!(read_manifest(&store, "sbx_1").await.unwrap().is_none());
+
+        // Suspended, nobody runs it, so the orchestrator's purge goes through.
+        replace_manifest(&store, None, &manifest("node-b", STATE_SUSPENDED))
+            .await
+            .unwrap();
+        purge(&store, "sbx_1", None).await.unwrap();
+        assert!(read_manifest(&store, "sbx_1").await.unwrap().is_none());
     }
 }

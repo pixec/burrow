@@ -99,6 +99,8 @@ pub(crate) fn vm_config(
                 "path": drive.path,
                 "readonly": drive.is_read_only,
                 "image_type": "Raw",
+                // What a Windows guest finds a volume's disk by.
+                "serial": drive.id,
             })
         })
         .collect();
@@ -112,6 +114,15 @@ pub(crate) fn vm_config(
         "serial": serial,
         "console": console,
     });
+    if spec.is_console_interactive {
+        let socket = super::jail::vmm_workdir(&spec.workdir, config.jail.as_ref())?
+            .join(super::CONSOLE_SOCK);
+        for device in ["serial", "console"] {
+            if vm[device]["mode"] == "File" {
+                vm[device] = json!({ "mode": "Socket", "socket": socket });
+            }
+        }
+    }
     if spec.guest_os == GuestOs::Windows {
         vm["tpm"] = json!({ "socket": TPM_SOCK });
         if arch == "x86_64" {
@@ -217,7 +228,8 @@ mod tests {
         );
     }
 
-    /// The guest finds its disks by order, so the order is the spec's.
+    /// A Linux guest finds its disks by order, so the order is the spec's; a
+    /// Windows guest has no stable order, and finds them by serial.
     #[test]
     fn disks_keep_the_order_given() {
         let vm = vm_config(&spec(), &config(), "aarch64").unwrap();
@@ -227,6 +239,7 @@ mod tests {
         assert_eq!(disks[0]["readonly"], true);
         assert_eq!(disks[1]["readonly"], false);
         assert_eq!(disks[1]["path"], "scratch.ext4");
+        assert_eq!(disks[2]["serial"], "volume0");
     }
 
     #[test]
@@ -245,6 +258,29 @@ mod tests {
         assert_eq!(x86["serial"]["file"], "console.log");
         assert_eq!(x86["console"]["mode"], "Off");
         assert_eq!(x86["payload"]["cmdline"], "console=ttyS0 root=/dev/vda ro");
+    }
+
+    /// The dev harness types into the console, which a file cannot take.
+    /// The socket is named as the VMM sees it, inside the jail or not.
+    #[test]
+    fn an_interactive_console_listens_where_the_vmm_can_bind() {
+        let mut spec = spec();
+        spec.is_console_interactive = true;
+        let arm = vm_config(&spec, &config(), "aarch64").unwrap();
+        assert_eq!(arm["serial"]["mode"], "Off");
+        assert_eq!(
+            arm["console"],
+            json!({ "mode": "Socket", "socket": "/var/lib/burrow/sandboxes/sbx_1/console.sock" })
+        );
+        let mut jailed = config();
+        jailed.jail = Some(crate::ChJail {
+            helper: "/proc/self/exe".into(),
+            uid: 65534,
+            gid: 65534,
+        });
+        let x86 = vm_config(&spec, &jailed, "x86_64").unwrap();
+        assert_eq!(x86["serial"]["socket"], "/work/console.sock");
+        assert_eq!(x86["console"]["mode"], "Off");
     }
 
     #[test]

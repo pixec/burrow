@@ -11,15 +11,23 @@ root=$(cd "$here/../.." && pwd)
 data=${BURROW_DATA_DIR:-$HOME/.burrow}
 cargo build --manifest-path "$root/Cargo.toml" -p burrow-daemon
 # The macOS agent: a node hands its own build to any guest running another at
-# handshake, and `vz-template` installs it.
+# handshake, and a template build from a restore image installs it.
 cargo build --manifest-path "$root/Cargo.toml" -p burrow-guest --release
 mkdir -p "$root/target/vz-signed" "$data"
 bin="$root/target/vz-signed/burrowd"
 cp "$root/target/debug/burrowd" "$bin"
 codesign --force --sign - --entitlements "$here/vz.entitlements" "$bin"
+# The agent a guest is upgraded to is signed the same way before the node
+# hands it out: a guest assesses a binary on its first launch, and the
+# upgrade waits on that.
+guest="$root/target/vz-signed/burrow-guest"
+cp "${BURROW_GUEST_BINARY:-$root/target/release/burrow-guest}" "$guest"
+codesign --force --sign - "$guest"
 # The harness orchestrator is published on the Mac's loopback, and reaches
 # this node from inside colima as host.lima.internal, which lands on the
-# Mac's loopback too.
+# Mac's loopback too. So do the harness nodes' WireGuard packets, over UDP.
+# Published ports listen on --listen's address, 127.0.0.1, since the
+# advertised name does not resolve on the Mac.
 exec env RUST_LOG="${RUST_LOG:-info}" "$bin" serve \
   --orchestrator http://127.0.0.1:7070 \
   --listen 127.0.0.1:7171 --advertise host.lima.internal:7171 \
@@ -27,7 +35,8 @@ exec env RUST_LOG="${RUST_LOG:-info}" "$bin" serve \
   --sandbox-proxy-listen 127.0.0.1:7172 \
   --node-id node_mac --label os=macos \
   --api-key dev-token --node-token dev-node-token \
-  --guest-binary "${BURROW_GUEST_BINARY:-$root/target/release/burrow-guest}" \
+  --guest-binary "$guest" \
+  --mesh-endpoint host.lima.internal:51820 --mesh-listen-address 127.0.0.1 \
   --data-dir "$data" --hypervisors vz \
   --dns-listen 127.0.0.1:5354 --proxy-listen 127.0.0.1:3129 \
   --no-tailcat "$@"

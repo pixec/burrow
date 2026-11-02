@@ -291,11 +291,11 @@ fn become_user(user: &FsUser) -> std::io::Result<()> {
 /// Takes on `user`'s identity for the calling thread alone.
 ///
 /// macOS has no filesystem ids, but it has per-thread credentials: after
-/// `pthread_setugid_np` the thread's uid, gid and, from the setgroups that
+/// `pthread_setugid_np` the thread's uid, gid and, from the initgroups that
 /// follows, groups are the user's, the process's stay root's, and every
-/// check the kernel makes on this thread is made as the user. Until the
-/// setgroups the thread's only group is `gid`, so at no point does it hold
-/// more than the user would.
+/// check the kernel makes on this thread is made as the user, groups beyond
+/// the credential's 16 included. Until the initgroups the thread's only
+/// group is `gid`, so at no point does it hold more than the user would.
 #[cfg(target_os = "macos")]
 fn become_user(user: &FsUser) -> std::io::Result<()> {
     use nix::libc;
@@ -305,9 +305,7 @@ fn become_user(user: &FsUser) -> std::io::Result<()> {
         if crate::unix::darwin::pthread_setugid_np(user.uid, user.gid) != 0 {
             return Err(std::io::Error::last_os_error());
         }
-        if libc::setgroups(user.groups.len() as libc::c_int, user.groups.as_ptr()) != 0 {
-            return Err(std::io::Error::last_os_error());
-        }
+        crate::unix::darwin::initgroups(&user.groups, user.uid)?;
         if libc::geteuid() != user.uid || libc::getegid() != user.gid {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::PermissionDenied,

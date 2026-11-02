@@ -383,7 +383,8 @@ message Sandbox {
   // Unix seconds of the last RevokeAccess. Access tokens issued at or before
   // it are refused, wherever the sandbox has moved since.
   int64 access_revoked_at = 23;
-  // The hypervisor running it, its template's: "firecracker" or "qemu".
+  // The hypervisor running it, its template's: "firecracker" or
+  // "cloud-hypervisor".
   // Fixed for its life: snapshots, warm pools and moves stay within one.
   string hypervisor = 24;
   // "linux" or "windows", from its template.
@@ -392,6 +393,10 @@ message Sandbox {
   // node's recovery could not bring it back as it was, and cleared when it
   // next runs.
   string state_reason = 26;
+  // SHA-256 of the TLS inspection root this sandbox's guest was told to
+  // trust, in hex; empty for a sandbox that is not inspected. It moves,
+  // restores and is adopted only onto a node whose root is the same.
+  string inspection_root_fingerprint = 27;
 }
 
 // One VM boot inside a sandbox's life.
@@ -455,6 +460,9 @@ message Snapshot {
   string firecracker_version = 13;
   // The hypervisor that took it, and the only one that can restore it.
   string hypervisor = 14;
+  // The inspection root its guest trusted, when it was inspected. An
+  // inspected create from it is placed only on a node with the same root.
+  string inspection_root_fingerprint = 15;
 }
 
 message NodeInfo {
@@ -488,13 +496,18 @@ message NodeInfo {
   // included, e.g. "https://node-a.example.com:7073". Empty when it serves
   // none, the default, and then exec and files go through the orchestrator.
   string access_endpoint = 12;
-  // Hypervisors this node can run, e.g. ["firecracker", "qemu"]. A sandbox
-  // is only placed on a node offering the one it asks for.
+  // Hypervisors this node can run, e.g. ["firecracker", "cloud-hypervisor"].
+  // A sandbox is only placed on a node offering the one it asks for.
   repeated string hypervisors = 13;
   // Each offered hypervisor's version, e.g. {"firecracker": "v1.16.1",
   // "cloud-hypervisor": "v54.0"}. Saved state restores only under the version
   // that wrote it, so placement compares against the one the state needs.
   map<string, string> hypervisor_versions = 14;
+  // SHA-256 of the root this node's TLS inspection leaves chain to, in hex:
+  // the fleet root, or the node's own authority when it has none.
+  string inspection_root_fingerprint = 15;
+  // Unix seconds when the node's inspection CA expires.
+  int64 inspection_ca_expires_at = 16;
 }
 
 message NodeStatus {

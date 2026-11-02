@@ -271,6 +271,15 @@ pub struct GuestUpgrade {
     pub digest: String,
 }
 
+/// How long an upgraded agent gets to come back, apart from the agent
+/// timeout: a macOS guest assesses a binary it has not run before on its
+/// first launch, which on its own can take most of that.
+pub const UPGRADE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(120);
+/// How long one reconnect to an upgrading agent may take. A connection the
+/// old process accepts as it goes is never answered, and waiting it out to the
+/// agent timeout is most of what an upgrade used to cost.
+const RECONNECT_ATTEMPT: std::time::Duration = std::time::Duration::from_secs(3);
+
 /// Handshakes, and brings the guest's agent up to this node's if it differs.
 ///
 /// A guest reports the digest of the agent it runs. One that matches, or that
@@ -279,6 +288,7 @@ pub struct GuestUpgrade {
 /// reconnects and handshakes the new agent, which is the client handed back.
 /// A guest that cannot upgrade right now, because a command is running, is
 /// logged and left on the old agent until its next handshake.
+#[allow(clippy::result_large_err)]
 pub async fn handshake_upgrading(
     mut agent: GuestClient<Channel>,
     guest: GuestAddr,
@@ -286,9 +296,28 @@ pub async fn handshake_upgrading(
     upgrade: Option<&GuestUpgrade>,
     timeout: std::time::Duration,
 ) -> Result<(GuestClient<Channel>, guestpb::HandshakeResponse), tonic::Status> {
-    let response = agent.handshake(request.clone()).await?.into_inner();
     let Some(upgrade) = upgrade else {
+        let response = agent.handshake(request.clone()).await?.into_inner();
         return Ok((agent, response));
+    };
+    // An agent older than something the request asks of it (volumes, on a
+    // macOS agent from before it mounted them) refuses the handshake whole.
+    // It is handshaken again without them, so it can be upgraded and the new
+    // agent given all of it; if it is not replaced, the refusal stands.
+    let bare = guestpb::HandshakeRequest {
+        volumes: Vec::new(),
+        ..request.clone()
+    };
+    let (response, refused) = match agent.handshake(request.clone()).await {
+        Ok(response) => (response.into_inner(), None),
+        Err(err) if err.code() == tonic::Code::Unimplemented && !request.volumes.is_empty() => {
+            (agent.handshake(bare.clone()).await?.into_inner(), Some(err))
+        }
+        Err(err) => return Err(err),
+    };
+    let unchanged = |agent, response| match refused.clone() {
+        Some(err) => Err(err),
+        None => Ok((agent, response)),
     };
     // An agent that reports no digest was built before in-place upgrades and
     // cannot be upgraded; the template it came from has to be imported again.
@@ -300,7 +329,7 @@ pub async fn handshake_upgrading(
         )));
     }
     if response.agent_digest == upgrade.digest {
-        return Ok((agent, response));
+        return unchanged(agent, response);
     }
     // The digest sent is of the bytes read now, not the one hashed at
     // startup: the binary on disk may have been replaced since, and the guest
@@ -313,7 +342,7 @@ pub async fn handshake_upgrading(
         hex::encode(sha2::Sha256::digest(&bytes))
     };
     if digest == response.agent_digest {
-        return Ok((agent, response));
+        return unchanged(agent, response);
     }
     tracing::info!(
         from = response.agent_version,
@@ -334,12 +363,12 @@ pub async fn handshake_upgrading(
         Ok(resp) => resp.into_inner().is_restarting,
         Err(err) if err.code() == tonic::Code::FailedPrecondition => {
             tracing::warn!(%err, "guest agent busy; upgrading it on its next handshake");
-            return Ok((agent, response));
+            return unchanged(agent, response);
         }
         Err(err) => return Err(err),
     };
     if !restarting {
-        return Ok((agent, response));
+        return unchanged(agent, response);
     }
     drop(agent);
     // The old agent answers and then re-executes, and how long that takes
@@ -347,18 +376,30 @@ pub async fn handshake_upgrading(
     // process and be cut off as it is replaced. The new agent is the one
     // reporting the digest it was sent, so connecting and handshaking is
     // repeated until that is who answers.
-    let deadline = std::time::Instant::now() + timeout;
+    let deadline = std::time::Instant::now() + UPGRADE_TIMEOUT;
     loop {
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
         let attempt = async {
             let (mut agent, _) = connect_when_ready(guest.clone(), timeout)
                 .await
                 .map_err(|err| tonic::Status::internal(format!("upgraded agent: {err}")))?;
-            let response = agent.handshake(request.clone()).await?.into_inner();
+            let response = agent.handshake(bare.clone()).await?.into_inner();
             Ok::<_, tonic::Status>((agent, response))
         };
-        match attempt.await {
-            Ok((agent, response)) if response.agent_digest == digest => {
+        let attempt = match tokio::time::timeout(RECONNECT_ATTEMPT, attempt).await {
+            Ok(attempt) => attempt,
+            Err(_) => Err(tonic::Status::deadline_exceeded(
+                "the upgraded agent did not answer",
+            )),
+        };
+        match attempt {
+            Ok((mut agent, response)) if response.agent_digest == digest => {
+                // Mounting volumes can take longer than an attempt may, so
+                // they wait for the new agent to be the one answering.
+                let response = match request.volumes.is_empty() {
+                    true => response,
+                    false => agent.handshake(request.clone()).await?.into_inner(),
+                };
                 tracing::info!(
                     version = response.agent_version,
                     took_ms = started.elapsed().as_millis() as u64,

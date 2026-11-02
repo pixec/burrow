@@ -1,9 +1,9 @@
 //! Guest users and groups on macOS.
 //!
 //! Accounts live in Open Directory, not in `/etc/passwd`, so they are read
-//! through libc's `getpwnam_r` and `getgrouplist`, which ask
-//! opendirectoryd, and written with `dscl` and `dseditgroup` against the
-//! local node, as root may without anyone's password. `sysadminctl` is not
+//! by querying it (see `directory`: libinfo's in-process cache would keep a
+//! deleted account found), memberships through `getgrouplist`, and written
+//! with `dscl` and `dseditgroup` against the local node, as root may without anyone's password. `sysadminctl` is not
 //! used: it wants an administrator's credentials for a secure token, which a
 //! sandbox account has no use for.
 //!
@@ -12,7 +12,7 @@
 
 #![allow(clippy::result_large_err)]
 
-use std::ffi::{CStr, CString};
+use std::ffi::CString;
 use std::os::unix::fs::PermissionsExt as _;
 use std::path::Path;
 use std::process::Stdio;
@@ -23,6 +23,7 @@ use tonic::Status;
 
 use burrow_proto::guest::v1 as guestpb;
 
+use super::directory;
 use crate::unix::asyncfd::AsyncPipe;
 use crate::unix::reaper;
 
@@ -32,7 +33,7 @@ const SHARED_ROOT: &str = "/Users/Shared";
 /// Where macOS starts ordinary accounts' ids.
 const FIRST_ID: u32 = 501;
 const LAST_ID: u32 = 60_000;
-/// The most groups setgroups(2) takes on macOS.
+/// The most groups a macOS credential holds; see `supplementary_groups`.
 const MAX_GROUPS: usize = 16;
 
 /// The same rule as Linux's: `[a-z_][a-z0-9_-]*`, at most 32. Open Directory
@@ -52,14 +53,8 @@ pub fn validate_name(name: &str) -> Result<(), Status> {
     Ok(())
 }
 
-/// One account, as `getpwnam` reports it.
-pub struct Passwd {
-    pub name: String,
-    pub uid: u32,
-    pub gid: u32,
-    pub home: String,
-    pub shell: String,
-}
+/// One account, as Open Directory has it now.
+pub use super::directory::User as Passwd;
 
 /// What a command needs in order to run as somebody.
 pub struct Credentials {
@@ -69,91 +64,34 @@ pub struct Credentials {
     pub home: String,
     pub name: String,
     pub shell: String,
-}
-
-fn text(field: *const libc::c_char) -> String {
-    if field.is_null() {
-        return String::new();
-    }
-    // SAFETY: a NUL-terminated field of the passwd entry, live while its
-    // buffer is.
-    unsafe { CStr::from_ptr(field) }
-        .to_string_lossy()
-        .into_owned()
-}
-
-/// getpwnam_r or getpwuid_r, whichever `call` makes, into a buffer of our
-/// own: the plain calls share one static entry across threads.
-fn passwd_with(
-    call: impl Fn(*mut libc::passwd, *mut libc::c_char, usize, *mut *mut libc::passwd) -> i32,
-) -> Option<Passwd> {
-    let mut buf = vec![0 as libc::c_char; 4096];
-    // SAFETY: all zeroes is a valid passwd.
-    let mut entry: libc::passwd = unsafe { std::mem::zeroed() };
-    let mut found = std::ptr::null_mut();
-    if call(&mut entry, buf.as_mut_ptr(), buf.len(), &mut found) != 0 || found.is_null() {
-        return None;
-    }
-    Some(Passwd {
-        name: text(entry.pw_name),
-        uid: entry.pw_uid,
-        gid: entry.pw_gid,
-        home: text(entry.pw_dir),
-        shell: text(entry.pw_shell),
-    })
+    /// The audit session of the user's console login, for a command that is
+    /// to run in it; see [`super::session`].
+    pub gui_session: Option<i32>,
 }
 
 pub fn lookup_user(name: &str) -> Result<Passwd, Status> {
-    let missing = || Status::not_found(format!("no such user in the guest: {name}"));
-    let c_name = CString::new(name).map_err(|_| missing())?;
-    // SAFETY: every pointer is to a live local of the size passed.
-    passwd_with(|entry, buf, len, found| unsafe {
-        libc::getpwnam_r(c_name.as_ptr(), entry, buf, len, found)
-    })
-    .ok_or_else(missing)
+    directory::user_named(name)
+        .ok_or_else(|| Status::not_found(format!("no such user in the guest: {name}")))
 }
 
 fn lookup_uid(uid: u32) -> Option<Passwd> {
-    // SAFETY: as in `lookup_user`.
-    passwd_with(|entry, buf, len, found| unsafe { libc::getpwuid_r(uid, entry, buf, len, found) })
+    directory::user_with_id(uid)
 }
 
 fn group_exists(gid: u32) -> bool {
-    let mut buf = vec![0 as libc::c_char; 4096];
-    // SAFETY: all zeroes is a valid group.
-    let mut entry: libc::group = unsafe { std::mem::zeroed() };
-    let mut found = std::ptr::null_mut();
-    // SAFETY: every pointer is to a live local of the size passed.
-    let rc = unsafe { libc::getgrgid_r(gid, &mut entry, buf.as_mut_ptr(), buf.len(), &mut found) };
-    rc == 0 && !found.is_null()
+    directory::group_with_id(gid)
 }
 
 fn lookup_group(name: &str) -> Result<u32, Status> {
-    let missing = || Status::not_found(format!("no such group in the guest: {name}"));
-    let c_name = CString::new(name).map_err(|_| missing())?;
-    let mut buf = vec![0 as libc::c_char; 4096];
-    // SAFETY: all zeroes is a valid group.
-    let mut entry: libc::group = unsafe { std::mem::zeroed() };
-    let mut found = std::ptr::null_mut();
-    // SAFETY: every pointer is to a live local of the size passed.
-    let rc = unsafe {
-        libc::getgrnam_r(
-            c_name.as_ptr(),
-            &mut entry,
-            buf.as_mut_ptr(),
-            buf.len(),
-            &mut found,
-        )
-    };
-    if rc != 0 || found.is_null() {
-        return Err(missing());
-    }
-    Ok(entry.gr_gid)
+    directory::group_named(name)
+        .ok_or_else(|| Status::not_found(format!("no such group in the guest: {name}")))
 }
 
 /// `primary` and every group Open Directory says `name` is in, at most as
-/// many as setgroups(2) takes; macOS resolves the rest through opendirectoryd
-/// on each check, which a credential set by hand opts out of.
+/// many as the kernel holds in a credential (16). A user in more is not cut
+/// off from the rest: the command or thread takes these through
+/// initgroups(2) with the user as its membership uid, and the kernel asks
+/// opendirectoryd about any group not in the list on each check.
 fn supplementary_groups(name: &str, primary: u32) -> Vec<u32> {
     let mut gids = vec![primary];
     let Ok(c_name) = CString::new(name) else {
@@ -215,6 +153,7 @@ pub fn credentials(name: &str) -> Result<Credentials, Status> {
         home: passwd.home,
         name: passwd.name,
         shell: passwd.shell,
+        gui_session: None,
     })
 }
 
@@ -233,7 +172,7 @@ async fn drain(pipe: Option<impl Into<std::os::fd::OwnedFd>>) -> String {
 
 /// Runs one of the system's tools to completion, through the reaper like
 /// every other child of the agent, and returns what it printed.
-async fn run_tool(tool: &str, args: &[&str]) -> Result<String, Status> {
+pub(super) async fn run_tool(tool: &str, args: &[&str]) -> Result<String, Status> {
     let mut command = std::process::Command::new(tool);
     command
         .args(args)
@@ -393,6 +332,215 @@ pub async fn add_to_group(user: &str, group: &str) -> Result<(), Status> {
 
 pub async fn remove_from_group(user: &str, group: &str) -> Result<(), Status> {
     set_membership(user, group, "-d").await
+}
+
+/// Deletes a user create could have made, never an administrator or the
+/// auto-login user the desktop session runs as. Refused while any process
+/// runs as them: nothing is killed on the caller's behalf. They leave every
+/// group first, so a later account of the same name inherits none; their own
+/// group goes with them unless another account still uses it; their home is
+/// kept, handed to root, unless `remove_home`.
+pub async fn delete_user(
+    name: &str,
+    remove_home: bool,
+) -> Result<guestpb::DeleteUserResponse, Status> {
+    use crate::unix::accounts;
+    use std::os::unix::fs::MetadataExt as _;
+
+    validate_name(name)?;
+    let passwd = lookup_user(name)?;
+    // SAFETY: geteuid has no preconditions.
+    accounts::check_deletable("user", name, passwd.uid, FIRST_ID..LAST_ID, unsafe {
+        libc::geteuid()
+    })?;
+    if auto_login_user().await.as_deref() == Some(name) {
+        return Err(Status::permission_denied(format!(
+            "user {name} is the auto-login user the guest's desktop session runs as"
+        )));
+    }
+    let admin = run_tool(
+        "/usr/bin/dsmemberutil",
+        &["checkmembership", "-U", name, "-G", "admin"],
+    )
+    .await?;
+    if admin.trim() == "user is a member of the group" {
+        return Err(Status::permission_denied(format!(
+            "user {name} is an administrator"
+        )));
+    }
+    if has_processes(passwd.uid) {
+        return Err(Status::failed_precondition(format!(
+            "user {name} has running processes; end them first"
+        )));
+    }
+    let homes: Vec<String> = records("/Users", "NFSHomeDirectory")
+        .await?
+        .into_iter()
+        .filter(|(user, _)| user != name)
+        .map(|(_, home)| home.join(" "))
+        .collect();
+    let owned = |meta: &std::fs::Metadata| meta.uid() == passwd.uid;
+    let own_home = match accounts::check_removable(&passwd.home, "/Users", &homes, owned) {
+        Ok(()) => true,
+        Err(err) if remove_home => return Err(err),
+        Err(_) => false,
+    };
+
+    let groups = records("/Groups", "GroupMembership").await?;
+    let uuid = run_tool(
+        "/usr/bin/dscl",
+        &[".", "-read", &format!("/Users/{name}"), "GeneratedUID"],
+    )
+    .await?;
+    let uuid = uuid
+        .trim()
+        .trim_start_matches("GeneratedUID:")
+        .trim()
+        .to_string();
+    // First, so a refusal leaves the account as it was. macOS 27's
+    // opendirectoryd deletes a user record only for a caller with Full Disk
+    // Access, which the node grants the agent on the disk before a cold boot.
+    dscl(&["-delete", &format!("/Users/{name}")])
+        .await
+        .map_err(|err| match err.message().contains("eDSPermissionError") {
+            true => Status::failed_precondition(format!(
+                "macOS refused to delete user {name}: deleting a user takes Full Disk Access, \
+                 which the node grants the agent before the guest boots and this boot did not \
+                 get (see the node's log)"
+            )),
+            false => err,
+        })?;
+    flush_cache().await;
+    for (group, _) in groups
+        .iter()
+        .filter(|(_, members)| members.iter().any(|m| m == name))
+    {
+        // By name and by UUID, as dseditgroup would, which needs the user to
+        // still exist.
+        let path = format!("/Groups/{group}");
+        dscl(&["-delete", &path, "GroupMembership", name]).await?;
+        if !uuid.is_empty() {
+            let _ = dscl(&["-delete", &path, "GroupMembers", &uuid]).await;
+        }
+    }
+
+    let others_in_own = groups
+        .iter()
+        .any(|(group, members)| group == name && members.iter().any(|m| m != name));
+    if lookup_group(name).ok() == Some(passwd.gid)
+        && !others_in_own
+        && primary_of(passwd.gid).await?.is_none()
+    {
+        dscl(&["-delete", &format!("/Groups/{name}")]).await?;
+        flush_cache().await;
+    }
+
+    let removed = if own_home {
+        accounts::dispose(&passwd.home, owned, remove_home)?
+    } else {
+        None
+    };
+    Ok(guestpb::DeleteUserResponse {
+        home: passwd.home,
+        is_home_removed: removed == Some(true),
+    })
+}
+
+/// Deletes a group create could have made. Refused while it is any user's
+/// primary group; members simply lose it. Its shared directory is kept,
+/// handed to root, unless `remove_shared_dir`.
+pub async fn delete_group(
+    name: &str,
+    remove_shared_dir: bool,
+) -> Result<guestpb::DeleteGroupResponse, Status> {
+    use crate::unix::accounts;
+    use std::os::unix::fs::MetadataExt as _;
+
+    validate_name(name)?;
+    let gid = lookup_group(name)?;
+    // SAFETY: getegid has no preconditions.
+    accounts::check_deletable("group", name, gid, FIRST_ID..LAST_ID, unsafe {
+        libc::getegid()
+    })?;
+    if let Some(user) = primary_of(gid).await? {
+        return Err(Status::failed_precondition(format!(
+            "group {name} is the primary group of user {user}; delete the user instead"
+        )));
+    }
+    let shared = format!("{SHARED_ROOT}/{name}");
+    let owned = |meta: &std::fs::Metadata| meta.gid() == gid;
+    if remove_shared_dir {
+        let homes: Vec<String> = records("/Users", "NFSHomeDirectory")
+            .await?
+            .into_iter()
+            .map(|(_, home)| home.join(" "))
+            .collect();
+        accounts::check_removable(&shared, SHARED_ROOT, &homes, owned)?;
+    }
+    dscl(&["-delete", &format!("/Groups/{name}")]).await?;
+    flush_cache().await;
+    let removed = accounts::dispose(&shared, owned, remove_shared_dir)?;
+    Ok(guestpb::DeleteGroupResponse {
+        shared_dir: if removed.is_some() {
+            shared
+        } else {
+            String::new()
+        },
+        is_shared_dir_removed: removed == Some(true),
+    })
+}
+
+/// `dscl . -list PATH KEY`: each record's name and that key's values.
+async fn records(path: &str, key: &str) -> Result<Vec<(String, Vec<String>)>, Status> {
+    let out = run_tool("/usr/bin/dscl", &[".", "-list", path, key]).await?;
+    Ok(out
+        .lines()
+        .filter_map(|line| {
+            let mut fields = line.split_whitespace();
+            Some((
+                fields.next()?.to_string(),
+                fields.map(String::from).collect(),
+            ))
+        })
+        .collect())
+}
+
+/// The first user whose primary group is `gid`.
+async fn primary_of(gid: u32) -> Result<Option<String>, Status> {
+    let gid = gid.to_string();
+    Ok(records("/Users", "PrimaryGroupID")
+        .await?
+        .into_iter()
+        .find(|(_, ids)| ids.contains(&gid))
+        .map(|(user, _)| user))
+}
+
+/// Who loginwindow logs in at boot, if anyone.
+async fn auto_login_user() -> Option<String> {
+    run_tool(
+        "/usr/bin/defaults",
+        &[
+            "read",
+            "/Library/Preferences/com.apple.loginwindow",
+            "autoLoginUser",
+        ],
+    )
+    .await
+    .ok()
+    .map(|user| user.trim().to_string())
+    .filter(|user| !user.is_empty())
+}
+
+/// Whether any process runs with `uid` as its effective uid.
+fn has_processes(uid: u32) -> bool {
+    /// `PROC_UID_ONLY` from `<sys/proc_info.h>`, which `libc` does not bind.
+    const PROC_UID_ONLY: u32 = 4;
+    let mut pids = vec![0 as libc::c_int; 8192];
+    let size = std::mem::size_of_val(pids.as_slice()) as libc::c_int;
+    // SAFETY: `pids` holds `size` bytes.
+    let bytes = unsafe { libc::proc_listpids(PROC_UID_ONLY, uid, pids.as_mut_ptr().cast(), size) };
+    let count = bytes.max(0) as usize / std::mem::size_of::<libc::c_int>();
+    pids.iter().take(count).any(|pid| *pid > 0)
 }
 
 fn chown(path: impl AsRef<Path>, uid: u32, gid: u32) -> Result<(), Status> {

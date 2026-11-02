@@ -784,6 +784,7 @@ dependencies = [
  "ruzstd",
  "serde",
  "serde_json",
+ "sha1 0.10.7",
  "sha2 0.10.9",
  "sysinfo",
  "tailcat-rs",
@@ -796,6 +797,7 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "uuid",
+ "x509-parser",
 ]
 
 [[package]]
@@ -841,6 +843,7 @@ name = "burrow-net"
 version = "0.1.0"
 dependencies = [
  "base64",
+ "boringtun",
  "burrow-proxy",
  "burrow-vmm",
  "libc",
@@ -850,6 +853,7 @@ dependencies = [
  "thiserror 2.0.20",
  "tokio",
  "tracing",
+ "x25519-dalek",
 ]
 
 [[package]]
@@ -889,10 +893,12 @@ dependencies = [
 name = "burrow-proxy"
 version = "0.1.0"
 dependencies = [
+ "base64",
  "burrow-common",
  "burrow-store",
  "bytes",
  "h2",
+ "hex",
  "http",
  "http-body-util",
  "hyper",
@@ -904,7 +910,9 @@ dependencies = [
  "rustls-pemfile",
  "serde",
  "serde_json",
+ "sha2 0.10.9",
  "thiserror 2.0.20",
+ "time",
  "tokio",
  "tokio-rustls",
  "tracing",

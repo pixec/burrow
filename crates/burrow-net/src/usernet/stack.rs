@@ -20,7 +20,7 @@ use tokio::sync::{Notify, watch};
 use tokio::task::{AbortHandle, JoinHandle};
 
 use super::conn::{self, GuestConn};
-use super::{Flow, Meter, Node, Policy, SandboxNet, Services, udp, wire};
+use super::{Flow, Meter, Node, Policy, Router, SandboxNet, Services, udp, wire};
 use crate::policy::{self, NodeDenials, Transport, Verdict};
 
 /// Per direction. Large enough that one flow can fill a fast upstream: the
@@ -39,6 +39,9 @@ const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 const RX_BATCH: usize = 256;
 /// Ephemeral ports on the gateway for connections into the guest.
 const INBOUND_PORTS: std::ops::RangeInclusive<u16> = 49152..=65535;
+/// Packets from other sandboxes queued for the guest. Past it they are
+/// dropped, as a full NIC queue would.
+const ROUTED_BACKLOG: usize = 1024;
 
 /// Guest source port and destination.
 pub(super) type FlowKey = (u16, SocketAddr);
@@ -134,6 +137,9 @@ pub(crate) struct Shared {
     pub(super) services: Services,
     pub(super) budget: burrow_proxy::dns::Budget,
     pub(super) policy: watch::Receiver<Policy>,
+    /// Frames the router delivered from other sandboxes, waiting to be sent.
+    /// A lock of its own, so delivering never waits on another stack.
+    routed: Mutex<Vec<Vec<u8>>>,
     epoch: Instant,
     /// Where tests really dial a destination the guest names, since nothing
     /// a test can listen on is reachable through the policy: every address
@@ -217,6 +223,17 @@ impl Shared {
         .record(&self.node.audit);
     }
 
+    /// Queues a packet another sandbox sent this guest.
+    pub(super) fn route_in(&self, packet: &[u8]) {
+        let mut routed = self.routed.lock().unwrap();
+        if routed.len() >= ROUTED_BACKLOG {
+            return;
+        }
+        routed.push(wire::ethernet(&self.net, EthernetProtocol::Ipv4, packet));
+        drop(routed);
+        self.wake.notify_one();
+    }
+
     /// Queues frames for the guest and wakes the driver to send them.
     pub(super) fn send_frames(&self, frames: Vec<Vec<u8>>) {
         let mut inner = self.lock();
@@ -281,6 +298,13 @@ impl Shared {
             }
         }
         if src != self.net.guest_ip {
+            return;
+        }
+        if Router::is_routed(dst)
+            && dst != self.net.gateway_ip
+            && dst != self.net.dns_ip
+            && self.node.router.forward(self, packet)
+        {
             return;
         }
 
@@ -398,6 +422,7 @@ impl Shared {
         udp::expire(inner, Instant::now());
 
         let mut out = std::mem::take(&mut inner.frames);
+        out.append(&mut self.routed.lock().unwrap());
         for packet in inner.device.tx.drain(..) {
             out.push(wire::ethernet(&self.net, EthernetProtocol::Ipv4, &packet));
         }
@@ -577,6 +602,7 @@ impl Shared {
     }
 
     fn close(&self) {
+        self.node.router.detach(self.net.guest_ip, self);
         let mut inner = self.lock();
         inner.is_closed = true;
         // Every socket in the set is TCP; UDP never enters smoltcp. Matched
@@ -712,11 +738,16 @@ pub(super) fn attach(
         node,
         budget: burrow_proxy::dns::Budget::default(),
         policy: policy.clone(),
+        routed: Mutex::new(Vec::new()),
         epoch,
         #[cfg(test)]
         dial: Mutex::new(HashMap::new()),
     });
 
+    shared
+        .node
+        .router
+        .attach(net.guest_ip, Arc::downgrade(&shared));
     let driver = tokio::spawn(drive(Arc::clone(&shared), socket, meter));
     let watcher = tokio::spawn(watch_policy(
         Arc::clone(&shared),
@@ -743,6 +774,7 @@ async fn watch_policy(
             current.proxy.clone(),
         )]));
         shared.reapply(&current);
+        shared.node.router.reapply();
     }
 }
 

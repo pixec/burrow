@@ -9,9 +9,12 @@
 //! `burrow-guest install` installs it (see [`install`]); with no argument it
 //! serves, as launchd runs it.
 
+mod directory;
 mod handshake;
 mod install;
+pub mod session;
 pub mod users;
+mod volumes;
 mod vsock;
 
 pub use crate::unix::{exec, files, fs};
@@ -29,12 +32,17 @@ use crate::unix::reaper;
 
 /// What this agent does beyond the original protocol, for the health response.
 pub fn features() -> Vec<String> {
-    vec![
+    let mut features = vec![
         files::FEATURE_FILES_AS_USER.to_string(),
         "attach-input".to_string(),
         "output-feed".to_string(),
         fs::FEATURE_FS.to_string(),
-    ]
+        session::FEATURE_GUI_SESSION.to_string(),
+    ];
+    if handshake::is_root_trusted() {
+        features.push(handshake::FEATURE_ROOT_TRUSTED.to_string());
+    }
+    features
 }
 
 /// vsock port the node daemon dials. Free in a macOS guest: Apple's

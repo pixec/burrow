@@ -302,6 +302,16 @@ resource handed to the Firecracker API is relative to the working directory,
 precisely so that directory can *become* the chroot, so the sandbox directory
 and the jail root are the same path and nothing else changes.
 
+Every jailed sandbox lives at `<chroot-base>/<hypervisor>/<id>/root`
+(`--chroot-base`, default `/var/lib/burrow/jail`), where `<id>` is the sandbox
+id with anything but letters and digits made `-`. For Firecracker that is the
+directory its jailer builds from `--exec-file`, so the binary must be named
+`firecracker`; Cloud Hypervisor's is laid out the same way under
+`cloud-hypervisor`. A teardown removes the whole `<id>` directory, never
+following a link. Before this layout every jail, Cloud Hypervisor's included,
+was under `<chroot-base>/firecracker`; a node moves a Cloud Hypervisor
+sandbox it finds there to its own directory on recovery.
+
 Two details are not obvious:
 
 - **Device nodes are recreated on every spawn.** The jailer `mknod`s `/dev/kvm`
@@ -323,8 +333,8 @@ Firecracker in place, so what joined is Firecracker itself.
 
 #### Cloud Hypervisor's jail
 
-Cloud Hypervisor has no jailer, so `--jailer` has burrowd build one for it. The
-sandbox's directory is the same chroot path Firecracker's would be. burrowd
+Cloud Hypervisor has no jailer, so `--jailer` has burrowd build one for it,
+with the sandbox's directory at `<chroot-base>/cloud-hypervisor/<id>/root`. burrowd
 runs itself again as a short helper (`/proc/self/exe
 __cloud-hypervisor-jail <plan>`, dispatched before the async runtime starts,
 since a threaded process cannot unshare its mount namespace), which:
@@ -479,7 +489,10 @@ aarch64) has `VIRTIO_PCI`, `PCI_HOST_GENERIC`, `VIRTIO_VSOCKETS` and
 vmlinux through its PVH note, so the kernel needs `CONFIG_PVH`; that is
 unverified here, the harness being aarch64.
 
-What it does not do: diff snapshots, prefetch plans, and console input. Its memory image is dense
+What it does not do: diff snapshots and prefetch plans. Its console goes to
+`console.log` and takes no input, except under `burrowd vm`, which puts it on a
+socket (`console.sock`, `"mode": "Socket"`) and copies it to the log itself so
+`floor` and `snapshot` can type into the guest's shell. Its memory image is dense
 on disk, 512 MiB for a 512 MiB guest, where Firecracker's is sparse.
 
 ### Node flags
@@ -731,7 +744,7 @@ permitted.
 Seeing the inner request means terminating the session, so it is opt-in per
 sandbox and the default stays hostnames, never payloads. When it is on, the
 proxy serves the guest a certificate for the requested name signed by the node's
-own authority, opens a real verified session to the origin, and then applies two
+inspection CA, opens a real verified session to the origin, and then applies two
 checks to the inner request rather than one: the inner host must be allowlisted,
 *and* it must equal the name the session was opened for. Otherwise fronting
 between two names that are both allowed would still succeed, and per-name
@@ -739,12 +752,29 @@ reasoning about where a sandbox talks would mean nothing.
 
 The upstream half is verified normally against the public roots: inspecting must
 never become a way to accept a certificate the sandbox itself would have
-rejected. The authority is generated once per node and persisted, because the
-certificate is installed inside guests and a new one each boot would break every
-sandbox that survived a restart. Its key is `0600` and never leaves the node,
-and the certificate is given only to sandboxes that opted in. Installing it more
-widely would let the proxy impersonate any host to a sandbox that never agreed
-to it. A guest that carries its own CA bundle will not see that certificate at
+rejected. What the guest is given is the root that CA chains to, never the CA
+itself. In a fleet that is one operator-made root over a per-node intermediate
+(`burrowd serve --inspect-ca-cert/--inspect-ca-key/--inspect-root-cert`, made
+with `burrowd ca`), and the intermediate travels behind every leaf, so every node
+under the root serves a guest the same trust. A node given no root generates an
+authority once and persists it, because it is installed inside guests and a new
+one each boot would break every sandbox that survived a restart; it is then its
+own root. Either way the CA's key is `0600` and never leaves the node, and the
+root is given only to sandboxes that opted in. Installing it more widely would
+let the proxy impersonate any host to a sandbox that never agreed to it.
+
+A guest's processes hold the root they started with, so the root is a
+placement constraint. Nodes report its fingerprint, inspected sandboxes and
+snapshots record the one their guest was given (on the record and in the
+durable manifest), and the orchestrator moves, adopts and restores them only
+onto a node with the same root, refusing with `FailedPrecondition` otherwise; the
+node checks again before restoring. A per-node root therefore pins its inspected
+sandboxes to their node. The agent writes the root between markers in each
+trust bundle, and under a friendly name in the Windows Root store, replacing what
+an earlier handshake wrote, so a guest never accumulates roots. See
+[FIREWALL.md](FIREWALL.md#the-inspection-root).
+
+A guest that carries its own CA bundle will not see that certificate at
 all; see [FIREWALL.md](FIREWALL.md#when-a-guest-does-not-trust-the-inspection-ca).
 
 HTTP/2 is inspected too, per stream, under the same two checks. The proxy offers
@@ -821,6 +851,17 @@ slice is applied before recovery, so recovered sandboxes reload into the range
 they were created in. `AllowedIPs` doubles as the authorisation rule, since a
 node may only send traffic sourced from the slice it owns, which is what lets
 mesh traffic skip the antispoof chain.
+
+A macOS node has no kernel WireGuard and no tap to route through. Its end of
+the mesh is userspace: one UDP socket in burrowd and a boringtun tunnel per
+peer, the same protocol as `burrow-wg`, configured from the same peer list
+after the same pinning. Packets between its sandboxes and to its peers are
+forwarded by an in-process router between the sandboxes' network stacks,
+which decides each new flow with the same `burrow_net::policy` code the
+ruleset is tested against (see [FIREWALL.md](FIREWALL.md#macos-nodes)). A
+peer's advertised endpoint is used when it resolves on the Mac; otherwise
+the Mac answers wherever the peer's last authenticated packet came from, so a
+Linux node that can reach the Mac brings the tunnel up from its side.
 
 #### Peer key pinning
 

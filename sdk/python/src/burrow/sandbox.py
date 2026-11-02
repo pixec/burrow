@@ -681,6 +681,50 @@ class Sandbox:
             groupname=res.groupname or name, gid=res.gid, shared_dir=res.shared_dir
         )
 
+    def delete_user(self, name: str, *, remove_home: bool = False) -> dict:
+        """Deletes a guest user that `create_user` could have made.
+
+        Root, system and built-in accounts, administrators and the accounts
+        the agent relies on are refused, as is a user with a running process:
+        end it first. The user's own group goes with them. Their home is kept,
+        handed to root on Linux and macOS, unless `remove_home`. Returns the
+        home and whether it was removed.
+        """
+        self._assert_live()
+        res = self._with_resume(
+            lambda: self._transport.unary(
+                "DeleteUser",
+                api_pb2.DeleteUserRequest(
+                    sandbox_id=self.id, name=name, is_home_removed=remove_home
+                ),
+            )
+        )
+        return {"home": res.home, "home_removed": res.is_home_removed}
+
+    def delete_group(self, name: str, *, remove_shared_dir: bool = False) -> dict:
+        """Deletes a guest group that `create_group` could have made.
+
+        A group that is some user's primary group is refused; delete the user.
+        Members simply lose it. Its shared directory is kept, handed to root on
+        Linux and macOS, unless `remove_shared_dir`. Returns the directory and
+        whether it was removed.
+        """
+        self._assert_live()
+        res = self._with_resume(
+            lambda: self._transport.unary(
+                "DeleteGroup",
+                api_pb2.DeleteGroupRequest(
+                    sandbox_id=self.id,
+                    name=name,
+                    is_shared_dir_removed=remove_shared_dir,
+                ),
+            )
+        )
+        return {
+            "shared_dir": res.shared_dir,
+            "shared_dir_removed": res.is_shared_dir_removed,
+        }
+
     def add_user_to_group(self, user: str, group: str) -> None:
         """Adds a user to a group, so the group's shared directory opens to
         them."""
@@ -995,7 +1039,9 @@ class Sandbox:
         return self._info
 
     def resume(self) -> SandboxInfo:
-        """Restores a stopped sandbox, typically in a few hundred milliseconds.
+        """Restores a suspended sandbox, typically in a few hundred milliseconds.
+        One that was shut down has no memory to restore and is refused with
+        FAILED_PRECONDITION; `boot` it instead.
 
         Every resume this handle performs goes through here, auto-resume
         included, so this is the one place `on_resume` has to fire.

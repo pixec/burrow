@@ -26,6 +26,7 @@ pub struct NodeApi {
     pub cluster_token: Option<String>,
     /// Guest agent binary, installed into images imported from OCI. Those
     /// images have no init of their own, and a VM booted without one panics.
+    /// A macOS template build installs it too.
     pub guest_binary: std::path::PathBuf,
     /// Credentials for registries that need them. Empty means anonymous pulls
     /// only, which covers public images.
@@ -1696,6 +1697,52 @@ impl NodeService for NodeApi {
             .remove_user_from_group(guestpb::GroupMembership { user, group })
             .await?;
         Ok(Response::new(api::GroupMembershipResponse {}))
+    }
+
+    async fn delete_user(
+        &self,
+        req: Request<api::DeleteUserRequest>,
+    ) -> Result<Response<api::DeleteUserResponse>, Status> {
+        let req = req.into_inner();
+        check_user_name(&req.name)?;
+        let sandbox = self.sandboxes.get(&req.sandbox_id).await?;
+        check_exec(&sandbox.policy())?;
+        let mut agent = sandbox.agent().await?;
+
+        let resp = agent
+            .delete_user(guestpb::DeleteUserRequest {
+                name: req.name,
+                is_home_removed: req.is_home_removed,
+            })
+            .await?
+            .into_inner();
+        Ok(Response::new(api::DeleteUserResponse {
+            home: bounded(resp.home, MAX_PATH),
+            is_home_removed: resp.is_home_removed,
+        }))
+    }
+
+    async fn delete_group(
+        &self,
+        req: Request<api::DeleteGroupRequest>,
+    ) -> Result<Response<api::DeleteGroupResponse>, Status> {
+        let req = req.into_inner();
+        check_user_name(&req.name)?;
+        let sandbox = self.sandboxes.get(&req.sandbox_id).await?;
+        check_exec(&sandbox.policy())?;
+        let mut agent = sandbox.agent().await?;
+
+        let resp = agent
+            .delete_group(guestpb::DeleteGroupRequest {
+                name: req.name,
+                is_shared_dir_removed: req.is_shared_dir_removed,
+            })
+            .await?
+            .into_inner();
+        Ok(Response::new(api::DeleteGroupResponse {
+            shared_dir: bounded(resp.shared_dir, MAX_PATH),
+            is_shared_dir_removed: resp.is_shared_dir_removed,
+        }))
     }
 }
 

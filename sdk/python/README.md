@@ -192,7 +192,12 @@ stdin. `lost_bytes` counts output a rotating log dropped.
   `domain`, `share`); updates (`update_tags`, `update_network_policy`,
   `update_access_policy`, `update_resources`); lifecycle (`stop`, `resume`,
   `shutdown`, `boot`, `recreate`, `move`, `snapshot`, `delete`); guest users
-  (`create_user`, `create_group`, `as_user`). `as_user(name)` returns a handle
+  (`create_user`, `create_group`, `delete_user`, `delete_group`, `as_user`).
+  `delete_user(name, remove_home=False)` keeps the home, handed to root on
+  Linux and macOS, unless asked; `delete_group(name, remove_shared_dir=False)`
+  likewise. Only accounts `create_*` could have made can be deleted, a user
+  with a running process is refused, and so is a group that is some user's
+  primary group. `as_user(name)` returns a handle
   whose `open`, `os`, `shutil`, `Path`, `subprocess` and `terminal` act as
   that user, with the guest kernel deciding what they may touch. A `kit=`
   argument to `create` carries `args`, `env` and `reject_capabilities` for a
@@ -242,7 +247,10 @@ stdin. `lost_bytes` counts output a rotating log dropped.
   ```
 
   `systemd=True` boots the image's own systemd under the agent;
-  `Template.list()` reports it as `systemd`.
+  `Template.list()` reports it as `systemd`. On a Mac node,
+  `Template().from_ipsw("latest")` installs macOS as a `vz` template, and a
+  build `from_template` it runs steps in a clone; see
+  [TEMPLATES.md](../../docs/TEMPLATES.md#macos-templates).
 
 - `Terminal`: a live pty for interactive use, callback-driven:
 

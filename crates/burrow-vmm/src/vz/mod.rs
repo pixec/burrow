@@ -76,6 +76,11 @@ pub const SAVE_FILE: &str = "snapshot.vzsave";
 /// set, and WindowServer wants a display to lay the login session out on.
 const DISPLAY: (isize, isize, isize) = (1920, 1200, 80);
 
+/// What a volume's drive id starts with. Volumes are attached after the
+/// system disk, in order, which is how the guest agent tells them apart: a
+/// macOS guest shows no disk identifier.
+pub const VOLUME_DISK_PREFIX: &str = "burrow-volume";
+
 /// Apple's licence allows two macOS guests running at once on one Mac.
 pub const MAX_RUNNING: usize = 2;
 

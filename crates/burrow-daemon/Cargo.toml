@@ -32,6 +32,7 @@ serde_json = { workspace = true }
 tracing = { workspace = true }
 opentelemetry = { workspace = true }
 sha2 = { workspace = true }
+sha1 = { workspace = true }
 hex = { workspace = true }
 base64 = { workspace = true }
 ruzstd = { workspace = true }
@@ -52,3 +53,5 @@ aws-smithy-async = { version = "1.3.1", features = ["rt-tokio"] }
 libc = { workspace = true }
 # A macOS guest's NIC is a socket pair; this is what polices it.
 burrow-net = { workspace = true, features = ["usernet"] }
+# The issuer and serial trustd files a trusted root under.
+x509-parser = "0.16"

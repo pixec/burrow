@@ -63,9 +63,10 @@ pub fn set_clock(unix_nanos: i64) -> anyhow::Result<()> {
 
 /// Trust stores a Linux userland might read, in the order they are tried.
 ///
-/// Appended to rather than replaced: an image ships a bundle its own tools
+/// Added to rather than replaced: an image ships a bundle its own tools
 /// depend on, and overwriting it would break verification of everything the
-/// sandbox was already able to reach.
+/// sandbox was already able to reach. Only the block a handshake wrote is
+/// rewritten; see [`crate::trust`].
 const TRUST_BUNDLES: [&str; 4] = [
     "/etc/ssl/certs/ca-certificates.crt",
     "/etc/ssl/cert.pem",
@@ -161,7 +162,7 @@ pub fn install_inspection_ca(
             continue;
         }
         let began = std::time::Instant::now();
-        let outcome = append_ca(&target, pem, create, &mut timing);
+        let outcome = replace_ca(&target, pem, create, &mut timing);
         tracing::debug!(
             bundle = %target.display(),
             ?outcome,
@@ -259,12 +260,13 @@ fn is_usable_bundle_path(path: &str) -> bool {
             .any(|component| component == std::path::Component::ParentDir)
 }
 
-/// Adds the certificate to one bundle, leaving what is already there intact.
+/// Puts the certificate in one bundle in place of any a handshake put there
+/// before, leaving what the image holds intact.
 ///
 /// `create` is for a file of *additional* CAs only. A full bundle that is not
 /// there is an image pointing at something absent, and replacing it with a
 /// file holding one certificate would drop every root the tool needs.
-fn append_ca(path: &std::path::Path, pem: &str, create: bool, timing: &mut TrustTiming) -> Bundle {
+fn replace_ca(path: &std::path::Path, pem: &str, create: bool, timing: &mut TrustTiming) -> Bundle {
     let bundle = path.display().to_string();
     let began = std::time::Instant::now();
     let read = std::fs::read(path);
@@ -287,20 +289,14 @@ fn append_ca(path: &std::path::Path, pem: &str, create: bool, timing: &mut Trust
         }
     };
     // Read-modify-write rather than append, so a re-handshake after a
-    // resume does not add the certificate a second time.
+    // resume does not add the certificate a second time, and one after a
+    // move to another root drops the old one.
     let began = std::time::Instant::now();
-    let already = is_carrying(&existing, pem.trim().as_bytes());
+    let merged = crate::trust::with_ca(&existing, pem);
     timing.scan += began.elapsed();
-    if already {
+    if merged == existing {
         return Bundle::Installed;
     }
-    let mut merged = existing;
-    // A bundle whose last line has no newline would otherwise be glued to the
-    // BEGIN line of the certificate, and neither block would parse.
-    if !merged.is_empty() && !merged.ends_with(b"\n") {
-        merged.push(b'\n');
-    }
-    merged.extend_from_slice(pem.as_bytes());
     if let Some(parent) = path.parent()
         && let Err(err) = std::fs::create_dir_all(parent)
     {
@@ -323,6 +319,7 @@ fn append_ca(path: &std::path::Path, pem: &str, create: bool, timing: &mut Trust
 }
 
 /// Whether `haystack` already carries `needle`.
+#[cfg(test)]
 fn is_carrying(haystack: &[u8], needle: &[u8]) -> bool {
     !needle.is_empty()
         && haystack
@@ -500,14 +497,14 @@ mod trust_bundle_tests {
         std::fs::write(&bundle, b"-----END CERTIFICATE-----").unwrap();
 
         assert_eq!(
-            append_ca(&bundle, PEM, false, &mut TrustTiming::default()),
+            replace_ca(&bundle, PEM, false, &mut TrustTiming::default()),
             Bundle::Installed
         );
 
         let after = std::fs::read(&bundle).unwrap();
         assert!(is_carrying(
             &after,
-            b"-----END CERTIFICATE-----\n-----BEGIN"
+            b"-----END CERTIFICATE-----\n# BEGIN burrow"
         ));
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -519,7 +516,7 @@ mod trust_bundle_tests {
         std::fs::write(&bundle, b"-----END CERTIFICATE-----\n").unwrap();
 
         assert_eq!(
-            append_ca(&bundle, PEM, false, &mut TrustTiming::default()),
+            replace_ca(&bundle, PEM, false, &mut TrustTiming::default()),
             Bundle::Installed
         );
 
@@ -534,17 +531,20 @@ mod trust_bundle_tests {
         let absent = dir.join("cacert.pem");
 
         assert_eq!(
-            append_ca(&absent, PEM, false, &mut TrustTiming::default()),
+            replace_ca(&absent, PEM, false, &mut TrustTiming::default()),
             Bundle::Absent
         );
         assert!(!absent.exists(), "a full bundle is not invented");
 
         let extra = dir.join("node/extra.pem");
         assert_eq!(
-            append_ca(&extra, PEM, true, &mut TrustTiming::default()),
+            replace_ca(&extra, PEM, true, &mut TrustTiming::default()),
             Bundle::Installed
         );
-        assert_eq!(std::fs::read(&extra).unwrap(), PEM.as_bytes());
+        assert_eq!(
+            std::fs::read(&extra).unwrap(),
+            crate::trust::with_ca(b"", PEM)
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -555,15 +555,36 @@ mod trust_bundle_tests {
         std::fs::write(&bundle, b"-----EXISTING-----\n").unwrap();
 
         assert_eq!(
-            append_ca(&bundle, PEM, false, &mut TrustTiming::default()),
+            replace_ca(&bundle, PEM, false, &mut TrustTiming::default()),
             Bundle::Installed
         );
         let once = std::fs::read(&bundle).unwrap();
         assert_eq!(
-            append_ca(&bundle, PEM, false, &mut TrustTiming::default()),
+            replace_ca(&bundle, PEM, false, &mut TrustTiming::default()),
             Bundle::Installed
         );
         assert_eq!(std::fs::read(&bundle).unwrap(), once);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// After a move to a node under another root, the bundle holds the new
+    /// root and not the old one, however many moves there were.
+    #[test]
+    fn a_new_root_replaces_the_last_one_in_the_bundle() {
+        let dir = scratch("replace");
+        let bundle = dir.join("cacert.pem");
+        std::fs::write(&bundle, b"-----EXISTING-----\n").unwrap();
+        for i in 0..4 {
+            let pem = format!("-----BEGIN CERTIFICATE-----\nroot{i}\n-----END CERTIFICATE-----\n");
+            assert_eq!(
+                replace_ca(&bundle, &pem, false, &mut TrustTiming::default()),
+                Bundle::Installed
+            );
+        }
+        let after = String::from_utf8(std::fs::read(&bundle).unwrap()).unwrap();
+        assert!(after.starts_with("-----EXISTING-----\n"));
+        assert_eq!(after.matches("BEGIN CERTIFICATE").count(), 1);
+        assert!(after.contains("root3"));
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -597,7 +618,7 @@ mod trust_bundle_tests {
             "both names have to resolve to one file for the dedup to fire"
         );
         assert_eq!(
-            append_ca(
+            replace_ca(
                 &std::fs::canonicalize(&link).unwrap(),
                 PEM,
                 false,
@@ -631,7 +652,7 @@ mod trust_bundle_tests {
         std::fs::create_dir(&bundle).unwrap();
 
         assert_eq!(
-            append_ca(&bundle, PEM, false, &mut TrustTiming::default()),
+            replace_ca(&bundle, PEM, false, &mut TrustTiming::default()),
             Bundle::Failed
         );
 
@@ -639,7 +660,7 @@ mod trust_bundle_tests {
         // image that points at a bundle it does not ship is not a failure.
         let missing = dir.join("nowhere.pem");
         assert_eq!(
-            append_ca(&missing, PEM, false, &mut TrustTiming::default()),
+            replace_ca(&missing, PEM, false, &mut TrustTiming::default()),
             Bundle::Absent
         );
         let _ = std::fs::remove_dir_all(&dir);

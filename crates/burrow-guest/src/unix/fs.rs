@@ -1870,8 +1870,8 @@ mod tests {
     }
 
     /// A call as a user is checked by the kernel as that user, and what it
-    /// creates is theirs. Run where the host has a `nobody`, as the node
-    /// image does; skipped elsewhere.
+    /// creates is theirs. Run as root where the host has a `nobody`, as the
+    /// node image does; skipped elsewhere, since only root can become anyone.
     #[cfg(target_os = "linux")]
     #[tokio::test]
     async fn a_call_as_a_user_is_the_user_s() {
@@ -1879,6 +1879,9 @@ mod tests {
         let Ok(nobody) = crate::linux::users::credentials("nobody") else {
             return;
         };
+        if unsafe { libc::geteuid() } != 0 {
+            return;
+        }
         let tmp = Tmp::new("as-user");
         std::fs::set_permissions(&tmp.0, std::fs::Permissions::from_mode(0o777)).unwrap();
         std::fs::write(tmp.path("roots"), b"root only").unwrap();

@@ -1,6 +1,6 @@
 //! The Windows agent.
 //!
-//! Runs as a Windows service, as LocalSystem, under QEMU with virtio-win's
+//! Runs as a Windows service, as LocalSystem, under Cloud Hypervisor with virtio-win's
 //! drivers, and serves the node daemon over viosock. See the crate's
 //! README for what maps onto what.
 
@@ -26,6 +26,7 @@ mod service;
 mod token;
 #[cfg(windows)]
 pub mod users;
+pub mod volumes;
 #[cfg(windows)]
 mod vsock;
 #[cfg(windows)]

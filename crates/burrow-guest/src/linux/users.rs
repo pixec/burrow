@@ -9,7 +9,7 @@
 
 #![allow(clippy::result_large_err)]
 
-use std::os::unix::fs::PermissionsExt;
+use std::os::unix::fs::{MetadataExt as _, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 
@@ -18,12 +18,17 @@ use tonic::Status;
 
 use burrow_proto::guest::v1 as guestpb;
 
+use crate::unix::accounts;
 use crate::unix::asyncfd::AsyncPipe;
 use crate::unix::reaper;
 
 /// Where a group's members share files. Group-owned and setgid, so a file
 /// created inside it belongs to the group rather than its author's own.
 const SHARED_ROOT: &str = "/srv";
+/// Where created accounts' ids come from, by `next_id` and by the distros'
+/// own tools alike. Nothing outside it may be deleted.
+const FIRST_ID: u32 = 1000;
+const LAST_ID: u32 = 60_000;
 
 /// POSIX portable user and group names: `[a-z_][a-z0-9_-]*`, at most 32.
 ///
@@ -384,6 +389,214 @@ pub async fn remove_from_group(user: &str, group: &str) -> Result<(), Status> {
     }
 }
 
+/// Deletes a user create could have made. Refused while any process runs as
+/// them: nothing is killed on the caller's behalf. Their own group goes with
+/// them unless another account still uses it, and their home is kept, handed
+/// to root, unless `remove_home`.
+pub async fn delete_user(
+    name: &str,
+    remove_home: bool,
+) -> Result<guestpb::DeleteUserResponse, Status> {
+    validate_name(name)?;
+    let passwd = lookup_user(name)?;
+    // SAFETY: geteuid has no preconditions.
+    accounts::check_deletable("user", name, passwd.uid, FIRST_ID..LAST_ID, unsafe {
+        nix::libc::geteuid()
+    })?;
+    if has_processes(passwd.uid) {
+        return Err(Status::failed_precondition(format!(
+            "user {name} has running processes; end them first"
+        )));
+    }
+    let owned = |meta: &std::fs::Metadata| meta.uid() == passwd.uid;
+    let own_home = match accounts::check_removable(&passwd.home, "/home", &homes(name), owned) {
+        Ok(()) => true,
+        Err(err) if remove_home => return Err(err),
+        Err(_) => false,
+    };
+
+    match run_first(&[("userdel", &[name]), ("deluser", &[name])]).await {
+        // busybox's `deluser` also tries the same-named group and fails when
+        // there is none, after the account itself is gone.
+        Some(Err(err)) if lookup_user(name).is_ok() => return Err(err),
+        Some(_) => {}
+        None => {
+            remove_entry("/etc/passwd", name)?;
+            remove_entry("/etc/shadow", name)?;
+        }
+    }
+    rewrite("/etc/group", |fields| {
+        let members: Vec<&str> = fields[3]
+            .split(',')
+            .filter(|m| !m.is_empty() && *m != name)
+            .collect();
+        Some(format!(
+            "{}:{}:{}:{}",
+            fields[0],
+            fields[1],
+            fields[2],
+            members.join(",")
+        ))
+    })?;
+    let unused = group_members(name).is_some_and(|members| members.is_empty())
+        && primary_of(passwd.gid).is_none();
+    if lookup_group(name).ok() == Some(passwd.gid) && unused {
+        remove_group(name).await?;
+    }
+
+    let removed = if own_home {
+        accounts::dispose(&passwd.home, owned, remove_home)?
+    } else {
+        None
+    };
+    Ok(guestpb::DeleteUserResponse {
+        home: passwd.home,
+        is_home_removed: removed == Some(true),
+    })
+}
+
+/// Deletes a group create could have made. Refused while it is any user's
+/// primary group; members simply lose it. Its shared directory is kept,
+/// handed to root, unless `remove_shared_dir`.
+pub async fn delete_group(
+    name: &str,
+    remove_shared_dir: bool,
+) -> Result<guestpb::DeleteGroupResponse, Status> {
+    validate_name(name)?;
+    let gid = lookup_group(name)?;
+    // SAFETY: getegid has no preconditions.
+    accounts::check_deletable("group", name, gid, FIRST_ID..LAST_ID, unsafe {
+        nix::libc::getegid()
+    })?;
+    if let Some(user) = primary_of(gid) {
+        return Err(Status::failed_precondition(format!(
+            "group {name} is the primary group of user {user}; delete the user instead"
+        )));
+    }
+    let shared = format!("{SHARED_ROOT}/{name}");
+    let owned = |meta: &std::fs::Metadata| meta.gid() == gid;
+    if remove_shared_dir {
+        accounts::check_removable(&shared, SHARED_ROOT, &homes(""), owned)?;
+    }
+    remove_group(name).await?;
+    let removed = accounts::dispose(&shared, owned, remove_shared_dir)?;
+    Ok(guestpb::DeleteGroupResponse {
+        shared_dir: if removed.is_some() {
+            shared
+        } else {
+            String::new()
+        },
+        is_shared_dir_removed: removed == Some(true),
+    })
+}
+
+async fn remove_group(name: &str) -> Result<(), Status> {
+    match run_first(&[("groupdel", &[name]), ("delgroup", &[name])]).await {
+        Some(result) => result,
+        None => {
+            remove_entry("/etc/group", name)?;
+            remove_entry("/etc/gshadow", name)
+        }
+    }
+}
+
+/// Whether any process runs as `uid`, by any of its real, effective, saved
+/// or filesystem ids.
+fn has_processes(uid: u32) -> bool {
+    let Ok(entries) = std::fs::read_dir("/proc") else {
+        return false;
+    };
+    entries
+        .flatten()
+        .filter(|entry| {
+            entry
+                .file_name()
+                .to_string_lossy()
+                .bytes()
+                .all(|b| b.is_ascii_digit())
+        })
+        .filter_map(|entry| std::fs::read_to_string(entry.path().join("status")).ok())
+        .any(|status| {
+            status
+                .lines()
+                .find_map(|line| line.strip_prefix("Uid:"))
+                .is_some_and(|ids| ids.split_whitespace().any(|id| id.parse() == Ok(uid)))
+        })
+}
+
+/// The homes of every account but `name`.
+fn homes(name: &str) -> Vec<String> {
+    let text = std::fs::read_to_string("/etc/passwd").unwrap_or_default();
+    text.lines()
+        .map(|line| line.split(':').collect::<Vec<_>>())
+        .filter(|fields| fields.len() >= 7 && fields[0] != name)
+        .map(|fields| fields[5].to_string())
+        .collect()
+}
+
+/// The first user whose primary group is `gid`.
+fn primary_of(gid: u32) -> Option<String> {
+    let text = std::fs::read_to_string("/etc/passwd").ok()?;
+    text.lines().find_map(|line| {
+        let fields: Vec<&str> = line.split(':').collect();
+        (fields.len() >= 7 && fields[3].parse() == Ok(gid)).then(|| fields[0].to_string())
+    })
+}
+
+fn group_members(name: &str) -> Option<Vec<String>> {
+    let text = std::fs::read_to_string("/etc/group").ok()?;
+    text.lines().find_map(|line| {
+        let fields: Vec<&str> = line.split(':').collect();
+        (fields.len() >= 4 && fields[0] == name).then(|| {
+            fields[3]
+                .split(',')
+                .filter(|m| !m.is_empty())
+                .map(String::from)
+                .collect()
+        })
+    })
+}
+
+fn remove_entry(path: &str, name: &str) -> Result<(), Status> {
+    rewrite(path, |fields| (fields[0] != name).then(|| fields.join(":")))
+}
+
+/// Rewrites each four-field-or-longer line of an account file through
+/// `edit`, which drops a line by returning `None`, keeping the file's owner
+/// and mode. Replaced by a rename, as `set_membership` does. A missing file
+/// is left missing.
+fn rewrite(path: &str, mut edit: impl FnMut(&[&str]) -> Option<String>) -> Result<(), Status> {
+    let Ok(text) = std::fs::read_to_string(path) else {
+        return Ok(());
+    };
+    let mut out = String::with_capacity(text.len());
+    for line in text.lines() {
+        let fields: Vec<&str> = line.split(':').collect();
+        let edited = if fields.len() >= 4 {
+            edit(&fields)
+        } else {
+            Some(line.to_string())
+        };
+        if let Some(edited) = edited {
+            out.push_str(&edited);
+            out.push('\n');
+        }
+    }
+    if out == text {
+        return Ok(());
+    }
+    let meta =
+        std::fs::metadata(path).map_err(|err| Status::internal(format!("stat {path}: {err}")))?;
+    let temporary = format!("{path}.burrow");
+    std::fs::write(&temporary, &out)
+        .map_err(|err| Status::internal(format!("write {temporary}: {err}")))?;
+    chown(&temporary, meta.uid(), meta.gid())?;
+    std::fs::set_permissions(&temporary, meta.permissions())
+        .map_err(|err| Status::internal(format!("chmod {temporary}: {err}")))?;
+    std::fs::rename(&temporary, path)
+        .map_err(|err| Status::internal(format!("replace {path}: {err}")))
+}
+
 /// Writes an account straight into `/etc/passwd`, `/etc/group` and, where the
 /// image has one, `/etc/shadow`.
 ///
@@ -429,19 +642,16 @@ fn ensure_primary_group(name: &str, gid: u32) -> Result<(), Status> {
 /// 1000 is where every distro starts ordinary accounts, and staying above it
 /// keeps a created user clear of whatever the image reserved for itself.
 fn next_id(path: &str) -> Result<u32, Status> {
-    const FIRST: u32 = 1000;
-    const LAST: u32 = 60_000;
-
     // A missing account file is an image with no accounts, not a failure.
     let text = std::fs::read_to_string(path).unwrap_or_default();
     let highest = text
         .lines()
         .filter_map(|line| line.split(':').nth(2)?.parse::<u32>().ok())
-        .filter(|id| (FIRST..LAST).contains(id))
+        .filter(|id| (FIRST_ID..LAST_ID).contains(id))
         .max();
     match highest {
         Some(id) => Ok(id + 1),
-        None => Ok(FIRST),
+        None => Ok(FIRST_ID),
     }
 }
 

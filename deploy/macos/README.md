@@ -153,6 +153,12 @@ and without scopes, upload and download, and accounts (it creates a user and a
 group; use a scratch clone). What the agent does on macOS and how its path
 checks compare with Linux's is in `crates/burrow-guest/README.md`.
 
+It also runs against a live sandbox's `~/.burrow/sandboxes/<id>/vsock.sock`.
+There the node holds the agent's output feed and confirms output as it logs
+it, after which the agent lets it go, so the probe opens its own feed (which
+replaces the node's until the node's next exec) before running the command it
+expects on it.
+
 ## Egress capture
 
 `$VZ run <dir> --capture` gives the guest a `SOCK_DGRAM` socket pair instead
@@ -168,33 +174,34 @@ harness orchestrator (127.0.0.1:7070 from the Mac; the orchestrator dials the
 node back at `host.lima.internal:7171`). The node advertises `vz` with the
 host's macOS version.
 
-Templates are built on the node, not pulled:
+Templates are built on the node, through the orchestrator like any build,
+not pulled:
 
 ```sh
-cargo build -p burrow-guest --release            # the macOS agent
-target/vz-signed/burrowd vz-template --data-dir ~/.burrow \
-  --ipsw "$M/restore.ipsw" --name macos-27 --disk-gib 64 \
-  --guest-binary target/release/burrow-guest
-# or, for a template installed earlier and never booted:
-target/vz-signed/burrowd vz-template --data-dir ~/.burrow --existing \
-  --name macos-27 --guest-binary target/release/burrow-guest
+burrow template build macos-27 --hypervisor vz --from-ipsw latest --vcpus 4 --mem 8192
+burrow template build macos-dev --from macos-27 --step 'touch /Users/Shared/built'
 ```
 
-That installs the restore image (or clones the existing template), boots it
-once with provisioning and NAT, copies the agent in over SSH as the
-provisioned admin, runs `burrow-guest install`, waits for the agent on
-vsock, turns Remote Login off and shuts the guest down from inside; the
-result replaces `~/.burrow/images/<name>` with an `image.json` naming
-`vz`/`macos`. SSH rather than writing the disk offline: the agent's files
-must be root-owned on the guest's Data volume, which the host can write only
-as root, and a booted guest proves the agent answers before the template is
-published. The `--existing` upgrade of the 26 GB template took 65 s.
+`--from-ipsw` is a path on the Mac or `latest`, which the node resolves from
+Apple's catalogue and downloads into `~/.burrow/ipsw/` once. The build
+installs the restore image, boots it once with provisioning and NAT, copies
+the node's `--guest-binary` in over SSH as the provisioned admin, runs
+`burrow-guest install`, waits for the agent on vsock, turns Remote Login off
+and shuts the guest down from inside; the result replaces
+`~/.burrow/images/<name>` with an `image.json` naming `vz`/`macos`. SSH
+rather than writing the disk offline: the agent's files must be root-owned on
+the guest's Data volume, which the host can write only as root, and a booted
+guest proves the agent answers before the template is published. A build
+`--from` a macOS template boots a clone of it as a build sandbox and runs the
+steps through the agent instead. Both hold one of the two macOS guest slots
+while they run. See [TEMPLATES.md](../../docs/TEMPLATES.md#macos-templates).
 
 `burrow create --template macos-27 --vcpus 4 --mem-mib 4096` is placed on the
 Mac node, which clones the template's disk and aux storage into the sandbox
 directory with a fresh machine identity and boots it cold; about 15 s from
-create to the first exec. A third running macOS guest is refused (Apple's
-licence). Exec, files, users, suspend/resume (the save file, on this Mac
+create to the first exec. A third macOS guest is refused (Apple's licence), counting guests
+still being created, booted or resumed, so two creates racing for the last slot
+cannot both start. Exec, files, users, suspend/resume (the save file, on this Mac
 only), recovery across a node restart and the agent upgrade at handshake work
 as on Linux.
 
@@ -202,10 +209,38 @@ The guest's NIC is a datagram socket pair served by `burrow_net::usernet` in
 burrowd, which is handed the same policy the Linux firewall renders: DHCP
 gives the guest its lease, DNS goes through burrow's resolver, allowlist mode
 goes through the egress proxy, policy updates apply to the next flow, and
-`burrow expose` publishes through the stack on every host address. There is
-no warm pool (a restore is slower than a cold boot), and a macOS sandbox
+`burrow expose` publishes through the stack on one address: `--publish-address`,
+by default the advertised address when it is one of the Mac's, otherwise
+`--listen`'s (127.0.0.1 under `node.sh`, where colima's `host.lima.internal`
+lands). There is no warm pool (a restore is slower than a cold boot), and a macOS sandbox
 cannot be stored, moved or snapshotted by name (its memory lives in a
 host-bound save file).
+
+Private networks work as on Linux. The node claims an address slice at
+registration (index 2, `10.99.8.0/22`, on the harness), its guests' stacks are
+joined by an in-process router, and a userspace WireGuard endpoint in burrowd
+carries the slice to the Linux nodes' `burrow-wg`. `node.sh` binds it to
+`127.0.0.1:51820` and advertises `host.lima.internal:51820`, which the colima
+nodes reach over UDP; their own endpoints (`node:51820`) do not resolve on the
+Mac, so it answers them where their keepalives come from. With two macOS
+sandboxes and a Linux one on `--network team`:
+
+```sh
+burrow exec mac-b -- nc -w 5 api.team.internal 8080 </dev/null   # mac to mac
+burrow exec lin -- nc -w 5 api.team.internal 8080 </dev/null     # linux to mac
+burrow exec mac-b -- dig @10.99.8.5 api.team.internal            # NXDOMAIN off the network
+```
+
+DNS needs a mode with egress (`--net allowlist`), as on Linux, where `none`
+mode cannot reach the resolver.
+
+The agent `node.sh` hands out is an ad hoc signed copy,
+`target/vz-signed/burrow-guest`, and the same file is what a template build
+installs, so a new template needs no upgrade. A guest whose agent differs
+is upgraded at handshake, under a bound of its own (two minutes) on top of the
+agent timeout; reconnects to the replaced agent give up after 3 s each rather
+than waiting on a connection the old process accepted as it exited. Upgrades
+at create took 7 s here, down from 30 s, and the create 22 s.
 
 Use `--route orchestrator` (or `BURROW_ROUTE=orchestrator`) for exec and file
 calls from the Mac: the node advertises its Access service as

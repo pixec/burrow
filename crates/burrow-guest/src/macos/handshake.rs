@@ -1,4 +1,4 @@
-//! The host's handshake, on macOS: entropy, clock, trust, network.
+//! The host's handshake, on macOS: entropy, clock, trust, network, volumes.
 //!
 //! Entropy: XNU has no call that credits outside entropy the way Linux's
 //! `RNDADDENTROPY` does. What it has is `/dev/random` taking writes from
@@ -6,19 +6,22 @@
 //! itself continuously from interrupt timing). The host's bytes are written
 //! there; it is the strongest a guest can do, and it is mixing, not credit.
 //!
-//! Trust: the system keychain's trust settings cannot be changed without a
-//! person. `security add-trusted-cert` and the Security framework under it
-//! need the `com.apple.trust-settings.admin` right, which is "entitled or an
-//! administrator authenticating in a dialog", and macOS 27 keeps trustd's
-//! settings where root cannot write them. So the CA goes where it can: a file
-//! of its own, the system's PEM bundle (`/etc/ssl/cert.pem`, which LibreSSL,
-//! curl and most of what is built on OpenSSL read) and any bundle the image
-//! named. What verifies through the Security framework (URLSession, Safari,
-//! Go's crypto/x509, Swift) does not see it; the README says so.
+//! Trust: the CA goes in a file of its own, the system's PEM bundle
+//! (`/etc/ssl/cert.pem`, which LibreSSL, curl and most of what is built on
+//! OpenSSL read), any bundle the image named, and the System keychain. What
+//! verifies through the Security framework (URLSession, Safari, Go's
+//! crypto/x509, Swift) also needs the root in the admin trust settings, which
+//! nothing in a running guest can change without a person: trustd authorizes
+//! each change again in its own process and wants an administrator in a
+//! dialog, even with `com.apple.trust-settings.admin` set to `allow`. The
+//! node writes them onto the disk before a cold boot instead, and Health
+//! says whether they took.
 //!
 //! Network: the guest takes its address by DHCP from whatever stack the host
 //! puts behind its NIC, so there is nothing to apply; what the host sent is
 //! logged.
+//!
+//! Volumes: see `volumes`.
 
 #![allow(clippy::result_large_err)]
 
@@ -44,13 +47,6 @@ pub async fn handshake(
     req: guestpb::HandshakeRequest,
 ) -> Result<guestpb::HandshakeResponse, Status> {
     tracing::debug!(restored = req.is_restored, "handshake from host");
-    // Refused before anything changes, as on Windows: a caller that gets a
-    // successful handshake is entitled to find its volumes mounted.
-    if !req.volumes.is_empty() {
-        return Err(Status::unimplemented(
-            "volumes are not supported on macOS guests",
-        ));
-    }
     let started = std::time::Instant::now();
     if let Err(err) = reseed(&req.entropy) {
         tracing::error!(%err, "failed to reseed rng");
@@ -81,6 +77,10 @@ pub async fn handshake(
             "network from host; the guest has it by DHCP"
         );
     }
+
+    // Fatal, as on Linux: a sandbox whose volume is missing would write to
+    // the directory beneath instead.
+    crate::macos::volumes::mount(&req.volumes).await?;
 
     let total = started.elapsed();
     let timing = guestpb::GuestResumeTiming {
@@ -157,7 +157,9 @@ fn install_inspection_ca(pem: &str, extra: &[guestpb::TrustBundle]) -> anyhow::R
     if let Some(parent) = Path::new(CA_PATH).parent() {
         std::fs::create_dir_all(parent)?;
     }
+    let previous = std::fs::read_to_string(CA_PATH).ok();
     write_atomically(Path::new(CA_PATH), pem.as_bytes())?;
+    add_to_keychain(previous.as_deref(), pem);
 
     let mut targets = vec![(PathBuf::from(SYSTEM_BUNDLE), false)];
     for bundle in extra {
@@ -183,28 +185,20 @@ fn install_inspection_ca(pem: &str, extra: &[guestpb::TrustBundle]) -> anyhow::R
         if done.contains(&target) {
             continue;
         }
-        let existing = match std::fs::read_to_string(&target) {
-            Ok(existing) => Some(existing),
-            Err(err) if err.kind() == std::io::ErrorKind::NotFound => None,
+        let existing = match std::fs::read(&target) {
+            Ok(existing) => existing,
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound && create => Vec::new(),
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => continue,
             Err(err) => anyhow::bail!("reading {}: {err}", target.display()),
         };
-        let contents = match existing {
-            Some(existing) if existing.contains(pem.trim()) => {
-                done.push(target);
-                continue;
-            }
-            Some(mut existing) => {
-                if !existing.is_empty() && !existing.ends_with('\n') {
-                    existing.push('\n');
-                }
-                existing.push_str(pem.trim());
-                existing.push('\n');
-                existing
-            }
-            None if create => format!("{}\n", pem.trim()),
-            None => continue,
-        };
-        write_atomically(&target, contents.as_bytes()).map_err(|err| {
+        // In place of whatever an earlier handshake installed, so a sandbox
+        // given another root does not go on trusting the last one.
+        let contents = crate::trust::with_ca(&existing, pem);
+        if contents == existing {
+            done.push(target);
+            continue;
+        }
+        write_atomically(&target, &contents).map_err(|err| {
             anyhow::anyhow!("could not add the ca to {}: {err}", target.display())
         })?;
         done.push(target);
@@ -212,6 +206,127 @@ fn install_inspection_ca(pem: &str, extra: &[guestpb::TrustBundle]) -> anyhow::R
     *held = Some((pem.to_string(), extra.to_vec()));
     tracing::debug!(bundles = done.len(), "installed the inspection ca");
     Ok(())
+}
+
+/// The System keychain, where trustd finds a root that a server's chain
+/// leaves out: the proxy sends a node's CA but not the fleet root above it.
+const SYSTEM_KEYCHAIN: &str = "/Library/Keychains/System.keychain";
+
+/// Puts the root in the System keychain in place of the one an earlier
+/// handshake put there. Only so it is found: whether it is trusted is up to
+/// the admin trust settings the node writes. Logged rather than fatal, since
+/// the bundles have it for everything else.
+fn add_to_keychain(previous: Option<&str>, pem: &str) {
+    use sha2::Digest as _;
+    let security = |args: &[&str]| {
+        std::process::Command::new("/usr/bin/security")
+            .args(args)
+            .output()
+    };
+    if let Some(old) = previous
+        .filter(|old| old.trim() != pem.trim())
+        .and_then(first_certificate)
+    {
+        let digest: String = sha2::Sha256::digest(&old)
+            .iter()
+            .map(|byte| format!("{byte:02X}"))
+            .collect();
+        let _ = security(&["delete-certificate", "-Z", &digest, SYSTEM_KEYCHAIN]);
+    }
+    match security(&["add-certificates", "-k", SYSTEM_KEYCHAIN, CA_PATH]) {
+        Ok(out)
+            if out.status.success()
+                || String::from_utf8_lossy(&out.stderr).contains("already in") => {}
+        Ok(out) => tracing::warn!(
+            stderr = %String::from_utf8_lossy(&out.stderr).trim(),
+            "could not add the inspection ca to the System keychain"
+        ),
+        Err(err) => tracing::warn!(%err, "could not run security"),
+    }
+}
+
+/// Reported in Health when the Security framework trusts the inspection root
+/// the last handshake installed: when the node wrote it into the admin trust
+/// settings before the guest booted.
+pub const FEATURE_ROOT_TRUSTED: &str = "inspection-root-trusted";
+
+/// Whether the Security framework, which URLSession, Safari, Swift and Go
+/// verify through, takes the installed root as an anchor on its own.
+pub fn is_root_trusted() -> bool {
+    let Some(der) = INSTALLED
+        .lock()
+        .unwrap()
+        .as_ref()
+        .and_then(|(pem, _)| first_certificate(pem))
+    else {
+        return false;
+    };
+    security::is_anchor(&der)
+}
+
+fn first_certificate(pem: &str) -> Option<Vec<u8>> {
+    use base64::Engine as _;
+    let body: String = pem
+        .lines()
+        .skip_while(|line| line.trim() != "-----BEGIN CERTIFICATE-----")
+        .skip(1)
+        .take_while(|line| line.trim() != "-----END CERTIFICATE-----")
+        .collect();
+    base64::engine::general_purpose::STANDARD.decode(body).ok()
+}
+
+mod security {
+    use std::ffi::c_void;
+
+    type CFTypeRef = *const c_void;
+
+    #[link(name = "CoreFoundation", kind = "framework")]
+    unsafe extern "C" {
+        fn CFDataCreate(allocator: CFTypeRef, bytes: *const u8, length: isize) -> CFTypeRef;
+        fn CFRelease(object: CFTypeRef);
+    }
+
+    #[link(name = "Security", kind = "framework")]
+    unsafe extern "C" {
+        fn SecCertificateCreateWithData(allocator: CFTypeRef, data: CFTypeRef) -> CFTypeRef;
+        fn SecPolicyCreateBasicX509() -> CFTypeRef;
+        fn SecTrustCreateWithCertificates(
+            certificates: CFTypeRef,
+            policies: CFTypeRef,
+            trust: *mut CFTypeRef,
+        ) -> i32;
+        fn SecTrustEvaluateWithError(trust: CFTypeRef, error: *mut CFTypeRef) -> bool;
+    }
+
+    /// Whether `der`, evaluated alone, is trusted: true only for a root the
+    /// system or an administrator has made an anchor.
+    pub fn is_anchor(der: &[u8]) -> bool {
+        // SAFETY: every object created here is released before returning, and
+        // each is null-checked before it is passed on.
+        unsafe {
+            let data = CFDataCreate(std::ptr::null(), der.as_ptr(), der.len() as isize);
+            if data.is_null() {
+                return false;
+            }
+            let certificate = SecCertificateCreateWithData(std::ptr::null(), data);
+            CFRelease(data);
+            if certificate.is_null() {
+                return false;
+            }
+            let policy = SecPolicyCreateBasicX509();
+            let mut trust: CFTypeRef = std::ptr::null();
+            let created = SecTrustCreateWithCertificates(certificate, policy, &mut trust);
+            let mut error: CFTypeRef = std::ptr::null();
+            let trusted =
+                created == 0 && !trust.is_null() && SecTrustEvaluateWithError(trust, &mut error);
+            for object in [error, trust, policy, certificate] {
+                if !object.is_null() {
+                    CFRelease(object);
+                }
+            }
+            trusted
+        }
+    }
 }
 
 /// Writes `path` through a sibling and a rename, keeping an existing file's
@@ -232,6 +347,20 @@ fn write_atomically(path: &Path, contents: &[u8]) -> std::io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A root nobody made an anchor is not trusted however well it parses;
+    /// one the system ships is.
+    #[test]
+    fn only_an_anchor_is_trusted_on_its_own() {
+        let system = std::fs::read_to_string("/etc/ssl/cert.pem").unwrap();
+        let isrg = system
+            .split("-----END CERTIFICATE-----")
+            .map(|block| format!("{block}-----END CERTIFICATE-----\n"))
+            .filter_map(|pem| first_certificate(&pem))
+            .any(|der| security::is_anchor(&der));
+        assert!(isrg, "some system root is an anchor");
+        assert!(!security::is_anchor(b"not a certificate"));
+    }
 
     #[test]
     fn a_bundle_is_rewritten_whole_and_keeps_its_mode() {

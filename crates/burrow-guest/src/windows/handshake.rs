@@ -1,12 +1,12 @@
-//! The host's handshake, on Windows: clock, trust, network.
+//! The host's handshake, on Windows: clock, trust, network, volumes.
 //!
 //! Entropy: Windows has no call that credits outside entropy to the kernel's
 //! RNG the way Linux's `RNDADDENTROPY` does; `BCryptGenRandom` takes no seed.
 //! What reseeds a restored Windows guest is the VM Generation ID: Windows'
 //! vmgenid driver sees the identifier change and reseeds the kernel RNG,
-//! and QEMU's `-device vmgenid,guid=auto` gives each QEMU process a new one,
-//! so a snapshot restored into a new process gets one. The host's bytes are
-//! therefore accepted and not used, and `reseed_us` reports zero. A host that
+//! which needs a VMM that gives each restored process a new identifier;
+//! Burrow's Cloud Hypervisor config adds no vmgenid device. The host's bytes
+//! are accepted and not used, and `reseed_us` reports zero. A host that
 //! restores without vmgenid leaves clones sharing RNG state, and that is the
 //! host's to provide, not something the agent can repair.
 
@@ -27,14 +27,6 @@ pub async fn handshake(
     req: guestpb::HandshakeRequest,
 ) -> Result<guestpb::HandshakeResponse, Status> {
     tracing::debug!(restored = req.is_restored, "handshake from host");
-    // Refused before anything changes: a caller that gets a successful
-    // handshake is entitled to find its volumes mounted, and this agent
-    // cannot mount any yet.
-    if !req.volumes.is_empty() {
-        return Err(Status::unimplemented(
-            "volumes are not supported on Windows guests",
-        ));
-    }
     let started = std::time::Instant::now();
     let reseeded = started.elapsed();
     if let Err(err) = set_clock(req.host_time_unix_nanos) {
@@ -67,6 +59,10 @@ pub async fn handshake(
                 Status::internal(format!("applying network: {err}"))
             })?;
     }
+
+    // Fatal, as on Linux: a sandbox whose volume is missing would write to
+    // the directory beneath instead.
+    crate::windows::volumes::mount(&req.volumes).await?;
 
     let total = started.elapsed();
     let timing = guestpb::GuestResumeTiming {
@@ -142,15 +138,12 @@ fn installed() -> &'static Mutex<Option<(String, Vec<guestpb::TrustBundle>)>> {
 /// Installs the CA a sandbox was told to trust: into the machine's Trusted
 /// Root store, which Windows' own TLS stack (Schannel) and everything built
 /// on it verify against; as a PEM file under the agent's state directory for
-/// tools that take a path; and appended to each extra bundle the image named,
-/// for toolchains that carry their own (Python's certifi, Node's
-/// `NODE_EXTRA_CA_CERTS`). An empty PEM leaves every store as it is.
+/// tools that take a path; and into each extra bundle the image named, for
+/// toolchains that carry their own (Python's certifi, Node's
+/// `NODE_EXTRA_CA_CERTS`). Whatever an earlier handshake installed is
+/// replaced, in the store and in the bundles. An empty PEM leaves every store
+/// as it is.
 fn install_inspection_ca(pem: &str, extra: &[guestpb::TrustBundle]) -> anyhow::Result<()> {
-    use windows_sys::Win32::Security::Cryptography::{
-        CERT_STORE_ADD_USE_EXISTING, CERT_STORE_PROV_SYSTEM_W, CERT_SYSTEM_STORE_LOCAL_MACHINE,
-        CertAddEncodedCertificateToStore, CertCloseStore, CertOpenStore, PKCS_7_ASN_ENCODING,
-        X509_ASN_ENCODING,
-    };
     if pem.trim().is_empty() {
         return Ok(());
     }
@@ -161,6 +154,51 @@ fn install_inspection_ca(pem: &str, extra: &[guestpb::TrustBundle]) -> anyhow::R
     {
         return Ok(());
     }
+    replace_in_root_store(&pem_certificates(pem)?)?;
+
+    let dir = win::state_dir();
+    std::fs::create_dir_all(&dir)?;
+    std::fs::write(dir.join("inspection-ca.pem"), pem)?;
+    for bundle in extra {
+        let path = win::map_path(&bundle.path)
+            .map_err(|_| anyhow::anyhow!("trust bundle {:?} is not a local path", bundle.path))?;
+        let existing = match std::fs::read(&path) {
+            Ok(bytes) => bytes,
+            Err(err)
+                if err.kind() == std::io::ErrorKind::NotFound && bundle.is_created_if_missing =>
+            {
+                Vec::new()
+            }
+            Err(err) => return Err(anyhow::anyhow!("reading {path}: {err}")),
+        };
+        let text = crate::trust::with_ca(&existing, pem);
+        if text == existing {
+            continue;
+        }
+        // Renamed into place, so nothing reads a half-written bundle.
+        let temp = format!("{path}.burrow-new");
+        std::fs::write(&temp, text)?;
+        std::fs::rename(&temp, &path)?;
+    }
+    *held = Some((pem.to_string(), extra.to_vec()));
+    Ok(())
+}
+
+/// Makes `wanted` the certificates of Burrow's in the machine Root store.
+///
+/// What this adds is tagged with [`crate::trust::FRIENDLY_NAME`], and every
+/// tagged certificate that is not wanted is deleted, so a sandbox told
+/// another root stops trusting the last one. A certificate the store already
+/// held is the image's and is left untagged and alone.
+fn replace_in_root_store(wanted: &[Vec<u8>]) -> anyhow::Result<()> {
+    use windows_sys::Win32::Security::Cryptography::{
+        CERT_CONTEXT, CERT_FRIENDLY_NAME_PROP_ID, CERT_STORE_ADD_NEW, CERT_STORE_PROV_SYSTEM_W,
+        CERT_SYSTEM_STORE_LOCAL_MACHINE, CRYPT_INTEGER_BLOB, CertAddEncodedCertificateToStore,
+        CertCloseStore, CertDeleteCertificateFromStore, CertDuplicateCertificateContext,
+        CertEnumCertificatesInStore, CertFreeCertificateContext, CertGetCertificateContextProperty,
+        CertOpenStore, CertSetCertificateContextProperty, PKCS_7_ASN_ENCODING, X509_ASN_ENCODING,
+    };
+    const CRYPT_E_EXISTS: u32 = 0x8009_2005;
     let root = win::wide("ROOT");
     // SAFETY: `root` is NUL-terminated; the store is closed below.
     let store = unsafe {
@@ -177,62 +215,105 @@ fn install_inspection_ca(pem: &str, extra: &[guestpb::TrustBundle]) -> anyhow::R
         "opening the machine root store: {}",
         win::last_io_error()
     );
-    let mut result = Ok(());
-    for der in pem_certificates(pem)? {
-        // SAFETY: `der` is the certificate's bytes, of the length passed.
-        let ok = unsafe {
-            CertAddEncodedCertificateToStore(
-                store,
-                X509_ASN_ENCODING | PKCS_7_ASN_ENCODING,
-                der.as_ptr(),
-                der.len() as u32,
-                CERT_STORE_ADD_USE_EXISTING,
-                std::ptr::null_mut(),
-            )
-        };
-        if ok == 0 {
-            result = Err(anyhow::anyhow!(
-                "adding to the machine root store: {}",
-                win::last_io_error()
-            ));
-            break;
+    let tag = win::wide(crate::trust::FRIENDLY_NAME);
+    let result = (|| {
+        // Collected first: deleting while enumerating invalidates the walk.
+        let mut tagged: Vec<(Vec<u8>, *const CERT_CONTEXT)> = Vec::new();
+        let mut at: *const CERT_CONTEXT = std::ptr::null();
+        loop {
+            // SAFETY: `at` is null or the context the last call returned,
+            // which this call frees.
+            at = unsafe { CertEnumCertificatesInStore(store, at) };
+            if at.is_null() {
+                break;
+            }
+            let mut name = vec![0u16; tag.len() + 1];
+            let mut size = (name.len() * 2) as u32;
+            // SAFETY: `name` holds `size` bytes.
+            let ok = unsafe {
+                CertGetCertificateContextProperty(
+                    at,
+                    CERT_FRIENDLY_NAME_PROP_ID,
+                    name.as_mut_ptr().cast(),
+                    &mut size,
+                )
+            };
+            if ok != 0 && name[..(size as usize / 2)] == tag[..] {
+                // SAFETY: a live context from the enumeration.
+                let der = unsafe {
+                    std::slice::from_raw_parts((*at).pbCertEncoded, (*at).cbCertEncoded as usize)
+                }
+                .to_vec();
+                // SAFETY: as above; the duplicate outlives the walk.
+                tagged.push((der, unsafe { CertDuplicateCertificateContext(at) }));
+            }
         }
-    }
+        let ders: Vec<&[u8]> = tagged.iter().map(|(der, _)| der.as_slice()).collect();
+        let stale = crate::trust::stale(&ders, wanted);
+        let mut failed = None;
+        for (der, context) in &tagged {
+            if stale.contains(&der.as_slice()) {
+                // SAFETY: deleting frees the duplicate it is given.
+                if unsafe { CertDeleteCertificateFromStore(*context) } == 0 {
+                    failed.get_or_insert_with(win::last_io_error);
+                }
+            } else {
+                // SAFETY: the duplicate taken above.
+                unsafe { CertFreeCertificateContext(*context) };
+            }
+        }
+        if let Some(err) = failed {
+            anyhow::bail!("removing an earlier root from the machine root store: {err}");
+        }
+        for der in wanted {
+            if tagged.iter().any(|(held, _)| held == der) {
+                continue;
+            }
+            let mut added: *mut CERT_CONTEXT = std::ptr::null_mut();
+            // SAFETY: `der` is the certificate's bytes, of the length passed.
+            let ok = unsafe {
+                CertAddEncodedCertificateToStore(
+                    store,
+                    X509_ASN_ENCODING | PKCS_7_ASN_ENCODING,
+                    der.as_ptr(),
+                    der.len() as u32,
+                    CERT_STORE_ADD_NEW,
+                    &mut added,
+                )
+            };
+            if ok == 0 {
+                let err = std::io::Error::last_os_error();
+                if err.raw_os_error() == Some(CRYPT_E_EXISTS as i32) {
+                    continue;
+                }
+                anyhow::bail!("adding to the machine root store: {err}");
+            }
+            let blob = CRYPT_INTEGER_BLOB {
+                cbData: (tag.len() * 2) as u32,
+                pbData: tag.as_ptr().cast_mut().cast(),
+            };
+            // SAFETY: `added` is the context just added; `blob` outlives the call.
+            let ok = unsafe {
+                CertSetCertificateContextProperty(
+                    added,
+                    CERT_FRIENDLY_NAME_PROP_ID,
+                    0,
+                    (&raw const blob).cast(),
+                )
+            };
+            // SAFETY: returned by the add.
+            unsafe { CertFreeCertificateContext(added) };
+            anyhow::ensure!(
+                ok != 0,
+                "naming the root in the machine root store: {}",
+                win::last_io_error()
+            );
+        }
+        Ok(())
+    })();
     // SAFETY: opened above.
     unsafe { CertCloseStore(store, 0) };
-    result?;
-
-    let dir = win::state_dir();
-    std::fs::create_dir_all(&dir)?;
-    std::fs::write(dir.join("inspection-ca.pem"), pem)?;
-    for bundle in extra {
-        let path = win::map_path(&bundle.path)
-            .map_err(|_| anyhow::anyhow!("trust bundle {:?} is not a local path", bundle.path))?;
-        let existing = match std::fs::read_to_string(&path) {
-            Ok(text) => text,
-            Err(err)
-                if err.kind() == std::io::ErrorKind::NotFound && bundle.is_created_if_missing =>
-            {
-                String::new()
-            }
-            Err(err) => return Err(anyhow::anyhow!("reading {path}: {err}")),
-        };
-        if existing.contains(pem.trim()) {
-            continue;
-        }
-        let mut text = existing;
-        if !text.is_empty() && !text.ends_with('\n') {
-            text.push('\n');
-        }
-        text.push_str(pem.trim());
-        text.push('\n');
-        // Renamed into place, so nothing reads a half-written bundle.
-        let temp = format!("{path}.burrow-new");
-        std::fs::write(&temp, text)?;
-        std::fs::rename(&temp, &path)?;
-    }
-    *held = Some((pem.to_string(), extra.to_vec()));
-    Ok(())
+    result
 }
 
 /// The adapter the host's network is on, and the global IPv6 addresses it

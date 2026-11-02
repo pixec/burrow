@@ -334,7 +334,7 @@ pub async fn build_warm_snapshot(
     // are the same place and nothing moves.
     let vm_id = format!("warm-{template}");
     let run_dir = match config.jail_for(hypervisor) {
-        Some(jail) => jail.chroot_for(&vm_id),
+        Some(jail) => jail.chroot_for(hypervisor, &vm_id),
         None => dir.clone(),
     };
     if run_dir != dir {
@@ -416,11 +416,15 @@ pub async fn build_warm_snapshot(
             {
                 tracing::warn!(template, %err, "could not record a prefetch plan");
             }
-            if run_dir != dir
-                && let Err(err) = collect_products(&run_dir, &dir, hypervisor).await
-            {
-                let _ = tokio::fs::remove_dir_all(&dir).await;
-                return Err(err);
+            if run_dir != dir {
+                let collected = collect_products(&run_dir, &dir, hypervisor).await;
+                // The chroot itself is the jailer's; what was worth keeping is
+                // out of it.
+                let _ = config.remove_workdir(&run_dir).await;
+                if let Err(err) = collected {
+                    let _ = tokio::fs::remove_dir_all(&dir).await;
+                    return Err(err);
+                }
             }
             // Shape first, format last: `format` is the commit marker that
             // makes a snapshot warm, and one that is warm without a shape can
@@ -462,7 +466,7 @@ pub async fn build_warm_snapshot(
             // The live one is left alone: it is still usable.
             let _ = tokio::fs::remove_dir_all(&dir).await;
             if run_dir != dir {
-                let _ = tokio::fs::remove_dir_all(&run_dir).await;
+                let _ = config.remove_workdir(&run_dir).await;
             }
             Err(err)
         }
@@ -530,11 +534,7 @@ async fn collect_products(
     })
     .await
     .map_err(|err| Status::internal(format!("chown did not run: {err}")))?
-    .map_err(|err| Status::internal(format!("reclaiming the warm snapshot: {err}")))?;
-
-    // The chroot itself is the jailer's; what was worth keeping is out of it.
-    let _ = tokio::fs::remove_dir_all(run_dir).await;
-    Ok(())
+    .map_err(|err| Status::internal(format!("reclaiming the warm snapshot: {err}")))
 }
 
 /// Drives the agent through the paths a clone will take on create.

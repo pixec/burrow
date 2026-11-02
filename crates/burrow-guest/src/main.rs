@@ -27,6 +27,8 @@ mod errno;
 #[cfg(any(target_os = "linux", target_os = "macos", windows, test))]
 mod paths;
 
+#[cfg(any(target_os = "linux", target_os = "macos", windows, test))]
+mod trust;
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 mod unix;
 

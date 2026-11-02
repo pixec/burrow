@@ -43,6 +43,8 @@ pub const STATE_FILE: &str = "snapshot.ch-state";
 pub const MEMORY_FILE: &str = "snapshot.ch-memory";
 const API_SOCK: &str = "ch.sock";
 const CONSOLE_LOG: &str = "console.log";
+/// Where an interactive console listens, in the working directory.
+const CONSOLE_SOCK: &str = "console.sock";
 /// The VMM's own log. Kept apart from the console, which the VMM opens and
 /// writes itself.
 const VMM_LOG: &str = "vmm.log";
@@ -96,6 +98,8 @@ pub struct ChVm {
     boot_latency: Duration,
     /// Held for the VM's lifetime; removed once the process is reaped.
     cgroup: Option<Cgroup>,
+    /// The input side of an interactive console.
+    console_in: Option<tokio::net::unix::OwnedWriteHalf>,
 }
 
 impl ChVm {
@@ -122,7 +126,11 @@ impl ChVm {
             for nic in nics {
                 vm.add_net(nic).await?;
             }
-            vm.api.put_empty("/api/v1/vm.boot").await
+            vm.api.put_empty("/api/v1/vm.boot").await?;
+            if spec.is_console_interactive {
+                vm.attach_console().await?;
+            }
+            Ok(())
         }
         .await;
         if let Err(err) = booted {
@@ -171,6 +179,9 @@ impl ChVm {
                 vm.restore_jailed(&source_url, &vm_config).await?;
             }
             vm.wait_until_loaded().await?;
+            if spec.is_console_interactive {
+                vm.attach_console().await?;
+            }
             if resume {
                 vm.resume().await?;
             }
@@ -209,6 +220,7 @@ impl ChVm {
         }
         tokio::fs::create_dir_all(&spec.workdir).await?;
         crate::guest::clear_stale_sockets(&spec.workdir).await?;
+        remove_if_present(&spec.workdir.join(CONSOLE_SOCK)).await?;
         let socket = spec.workdir.join(API_SOCK);
         remove_if_present(&socket).await?;
 
@@ -275,6 +287,7 @@ impl ChVm {
             jail: config.jail.clone(),
             boot_latency: Duration::ZERO,
             cgroup,
+            console_in: None,
         };
         if let Err(err) = wait_for_socket(&mut vm.child, &socket, &spec.workdir).await {
             vm.stop().await;
@@ -402,6 +415,33 @@ impl ChVm {
         tail(&self.workdir.join(CONSOLE_LOG), lines).await
     }
 
+    /// Connects to an interactive console once the VMM listens on it, and
+    /// copies what the guest writes there to the console log.
+    async fn attach_console(&mut self) -> Result<()> {
+        let path = self.workdir.join(CONSOLE_SOCK);
+        let deadline = Instant::now() + SOCKET_TIMEOUT;
+        let stream = loop {
+            match tokio::net::UnixStream::connect(&path).await {
+                Ok(stream) => break stream,
+                Err(_) if Instant::now() < deadline => tokio::time::sleep(POLL).await,
+                Err(err) => return Err(err.into()),
+            }
+        };
+        let (mut output, input) = stream.into_split();
+        let mut log = tokio::fs::File::create(self.workdir.join(CONSOLE_LOG)).await?;
+        tokio::spawn(async move {
+            let _ = tokio::io::copy(&mut output, &mut log).await;
+        });
+        self.console_in = Some(input);
+        Ok(())
+    }
+
+    pub async fn console_write(&mut self, input: &str) -> Result<()> {
+        use tokio::io::AsyncWriteExt as _;
+        let console = self.console_in.as_mut().ok_or(Error::ConsoleUnavailable)?;
+        Ok(console.write_all(input.as_bytes()).await?)
+    }
+
     pub async fn pause(&self) -> Result<()> {
         self.api.put_empty("/api/v1/vm.pause").await
     }
@@ -455,6 +495,7 @@ impl ChVm {
                     "path": drive.path,
                     "readonly": drive.is_read_only,
                     "image_type": "Raw",
+                    "serial": drive.id,
                 })),
             )
             .await

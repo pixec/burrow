@@ -704,6 +704,64 @@ export class Sandbox {
     };
   }
 
+  /**
+   * Deletes a guest user that {@link createUser} could have made.
+   *
+   * Root, system and built-in accounts, administrators and the accounts the
+   * agent relies on are refused, as is a user with a running process: end it
+   * first. The user's own group goes with them. Their home is kept, handed to
+   * root on Linux and macOS, unless `removeHome` is set.
+   */
+  async deleteUser(
+    name: string,
+    options: { removeHome?: boolean; signal?: AbortSignal } = {},
+  ): Promise<{ home: string; homeRemoved: boolean }> {
+    this.assertLive();
+    const res = await this.withResume(() =>
+      this.transport.unary<any, any>(
+        "DeleteUser",
+        {
+          sandboxId: this.id,
+          name,
+          isHomeRemoved: options.removeHome ?? false,
+        },
+        undefined,
+        options.signal,
+      ),
+    );
+    return { home: res.home ?? "", homeRemoved: res.isHomeRemoved ?? false };
+  }
+
+  /**
+   * Deletes a guest group that {@link createGroup} could have made.
+   *
+   * A group that is some user's primary group is refused; delete the user.
+   * Members simply lose it. Its shared directory is kept, handed to root on
+   * Linux and macOS, unless `removeSharedDir` is set.
+   */
+  async deleteGroup(
+    name: string,
+    options: { removeSharedDir?: boolean; signal?: AbortSignal } = {},
+  ): Promise<{ sharedDir: string; sharedDirRemoved: boolean }> {
+    this.assertLive();
+    const res = await this.withResume(() =>
+      this.transport.unary<any, any>(
+        "DeleteGroup",
+        {
+          sandboxId: this.id,
+          name,
+          isSharedDirRemoved: options.removeSharedDir ?? false,
+        },
+        undefined,
+        options.signal,
+      ),
+    );
+    return {
+      sharedDir: res.sharedDir ?? "",
+      sharedDirRemoved: res.isSharedDirRemoved ?? false,
+    };
+  }
+
   /** Adds a user to a group, so the group's shared directory opens to them. */
   async addUserToGroup(
     user: string,
@@ -1057,7 +1115,9 @@ export class Sandbox {
   }
 
   /**
-   * Restores a stopped sandbox, typically in a few hundred milliseconds.
+   * Restores a suspended sandbox, typically in a few hundred milliseconds.
+   * One that was shut down has no memory to restore and is refused with
+   * FAILED_PRECONDITION; {@link boot} it instead.
    *
    * Every resume this handle performs goes through here, auto-resume included,
    * so this is the one place `onResume` has to fire.
