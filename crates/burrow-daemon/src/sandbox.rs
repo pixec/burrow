@@ -3149,10 +3149,10 @@ impl SandboxManager {
             let ipam = self.ipam.lock().await;
             let lease = ipam.get(id);
             ipam.release(id);
-            lease.map(|lease| lease.guest_ip)
+            lease.map(|lease| (lease.guest_ip, lease.guest_ip6()))
         };
-        if let Some(guest_ip) = guest_ip {
-            firewall::flush_conntrack(guest_ip).await;
+        if let Some((guest_ip, guest_ip6)) = guest_ip {
+            firewall::flush_conntrack(guest_ip, guest_ip6).await;
         }
     }
 
@@ -3531,7 +3531,7 @@ impl SandboxManager {
         }
         // The new rules govern new packets; connections opened under the old
         // policy would otherwise ride their conntrack entries past it.
-        firewall::flush_conntrack(sandbox.lease.guest_ip).await;
+        firewall::flush_conntrack(sandbox.lease.guest_ip, sandbox.lease.guest_ip6()).await;
         tracing::info!(sandbox = sandbox_id, "network policy updated");
         Ok(sandbox.record())
     }

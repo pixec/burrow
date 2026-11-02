@@ -944,25 +944,29 @@ fn render_nat(out: &mut String, sandboxes: &[SandboxRules]) {
 /// for deleting selected entries; `nft` can match on conntrack state but
 /// cannot delete. Its absence is logged rather than fatal, because a node
 /// missing it still applies its rules to every *new* connection.
-pub async fn flush_conntrack(guest_ip: Ipv4Addr) {
-    let address = guest_ip.to_string();
+pub async fn flush_conntrack(guest_ip: Ipv4Addr, guest_ip6: Ipv6Addr) {
     // One call per direction: `conntrack -D` ANDs its selectors, so a single
     // call naming both would only match entries that are from *and* to the
     // guest. It exits non-zero when it matched nothing, which is the ordinary
     // case, so only a failure to run it at all is worth reporting.
-    for selector in ["--src", "--dst"] {
-        let run = tokio::process::Command::new("conntrack")
-            .args(["-D", selector, &address])
-            .output()
-            .await;
-        if let Err(err) = run {
-            tracing::warn!(
-                guest = %address,
-                %err,
-                "could not flush conntrack entries; connections opened under a \
-                 previous policy may outlive it until they idle out"
-            );
-            return;
+    for (family, address) in [
+        ("ipv4", guest_ip.to_string()),
+        ("ipv6", guest_ip6.to_string()),
+    ] {
+        for selector in ["--src", "--dst"] {
+            let run = tokio::process::Command::new("conntrack")
+                .args(["-D", "-f", family, selector, &address])
+                .output()
+                .await;
+            if let Err(err) = run {
+                tracing::warn!(
+                    guest = %address,
+                    %err,
+                    "could not flush conntrack entries; connections opened under a \
+                     previous policy may outlive it until they idle out"
+                );
+                return;
+            }
         }
     }
 }

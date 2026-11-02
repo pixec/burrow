@@ -278,7 +278,7 @@ function toPortRule(index: number, rule: PortRule): any {
       "invalid_argument",
     );
   }
-  if (rule.protocol !== undefined && !(rule.protocol in PROTOCOL_TO_WIRE)) {
+  if (rule.protocol !== undefined && !Object.hasOwn(PROTOCOL_TO_WIRE, rule.protocol)) {
     throw new BurrowError(
       `${where}: unknown protocol ${JSON.stringify(rule.protocol)}; tcp, udp, or omitted for both`,
       "invalid_argument",

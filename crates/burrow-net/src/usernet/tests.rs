@@ -1216,7 +1216,7 @@ async fn a_denied_port_holds_towards_a_peer() {
         &[b.guest_ip],
     );
     let mut alpha = Guest::attach_to(&node, Arc::clone(&audit), a, denied);
-    let mut beta = Guest::attach_to(
+    let beta = Guest::attach_to(
         &node,
         audit,
         b,
