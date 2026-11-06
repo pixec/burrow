@@ -28,7 +28,9 @@ queries either. Private-network peers and `.internal` names still work.
 NAT'd egress to the public internet, over IPv4 and IPv6. DNS lookups are still
 audited and `deny_cidrs`, `deny_ports` and `is_ipv6_denied` still apply, but
 connections bypass the proxy, so nothing is enforced or audited per connection
-or per domain.
+or per domain. The one exception is opt-in: with `is_tls_inspected`, HTTPS to
+the hosts named by request rules goes through the proxy so a credential can be
+brokered onto it. See [Selective inspection in open mode](#selective-inspection-in-open-mode).
 
 Open means off the fleet, not everywhere. Every sandbox address comes out of one
 pool (`10.99.0.0/16`), and an open-mode sandbox is denied that whole range, on
@@ -250,8 +252,11 @@ burrow create --template base --net allowlist \
 ```
 
 What inspection costs is that the proxy can read payloads, which is why it is
-opt-in. `--inspect-tls` requires `--net allowlist`, and `allow_cidrs`
-destinations bypass it because they never reach the proxy.
+opt-in. In allowlist mode it covers every HTTPS connection; in open mode only
+the hosts that request rules name (see
+[Selective inspection in open mode](#selective-inspection-in-open-mode)).
+`--inspect-tls` is refused with `--net none`, and `allow_cidrs` destinations
+bypass it because they never reach the proxy.
 
 Inside an inspected session the proxy is strict. It refuses requests carrying
 smuggling ambiguities, meaning folded header lines, malformed or conflicting
@@ -447,6 +452,8 @@ All of this needs `is_tls_inspected`. Acting on a request means reading it, and
 outside an inspected session there is no request to read, so a policy carrying
 rules without inspection is refused at the API door rather than half-applied.
 
+A rule may carry `expires_at_unix_ms`; see [Rule expiry](#rule-expiry).
+
 ### Credentials brokering
 
 Untrusted code often has to authenticate to an external service without being
@@ -475,7 +482,8 @@ burrow create --template base --net allowlist \
 ```
 
 A reference to a secret that is not stored refuses the create rather than
-sending the literal text.
+sending the literal text. A secret can be limited to the sandboxes that may use
+it; see [Scoped secrets](#scoped-secrets).
 
 - Brokering only applies to domains the policy already allows. A rule never
   widens access, it only decides what a permitted request carries.
@@ -659,6 +667,156 @@ to evaluate is bounded:
 A request head is already capped at 16 KiB on both protocols, so the work one
 request can cost is the product of two bounded numbers.
 
+### Selective inspection in open mode
+
+An open-mode sandbox can have a credential brokered onto its requests to a few
+named HTTPS hosts while the rest of its traffic stays exactly as open mode
+leaves it: not proxied, not inspected, not pinned.
+
+```sh
+burrow create --template base --net open --inspect-tls
+burrow secret set api-token --value "$TOKEN" --allow-sandbox <sandbox-id>
+burrow config network-policy <sandbox-id> --net open --inspect-tls \
+  --rule '{"domain":"api.example.com","match":{"method":["GET","POST"]},
+           "setHeaders":{"authorization":"Bearer ${secret:api-token}"},
+           "expiresIn":"1h"}'
+```
+
+In open mode `is_tls_inspected` means two things. At creation the guest is
+given the inspection root, as in allowlist mode: with a fleet root it keeps
+trusting the proxy across moves, adopts, forks and restores, and it moves only
+between nodes under that root (see [The inspection root](#the-inspection-root)).
+And the hosts named by the
+policy's live request rules, and only those, are inspected. Each such rule's
+`domain` must be an exact host name: a glob would have the node inspect hosts
+nobody wrote down, so it is refused at the API door. `http_rules` are refused in
+open mode, since bounding what a host may carry is an allowlist notion.
+
+How a connection is chosen for inspection:
+
+1. **The resolver decides which addresses.** When an open-mode sandbox looks up
+   a name some live rule names, the resolver pins the answer as it does for
+   every lookup and, before replying, adds each (sandbox, address) pair to an
+   nftables set, `inspected` in the `burrow_nat` table, with a timeout equal to
+   the pin's lifetime (60 seconds to one hour). One prerouting rule redirects
+   TCP 443 from a pair in that set to the egress proxy. Nothing else from the
+   sandbox is redirected: other ports, other addresses and plain HTTP leave
+   through open mode's ordinary accept and masquerade. Private, link-local and
+   fleet addresses are never added.
+2. **The proxy decides by name.** A redirected connection whose SNI names a host
+   with a live rule is terminated and inspected, exactly as in allowlist mode:
+   the inner `Host` must match the SNI, the destination must be pinned to that
+   name for this sandbox, smuggling ambiguities are refused, and rules apply per
+   request over HTTP/1.1 and HTTP/2. A redirected connection naming some other
+   host, which happens when an inspected host shares an address with others or
+   when its rule expired after the lookup, is relayed untouched, as open mode's
+   ordinary egress, after the denials open mode always has (`deny_cidrs`,
+   `deny_domains`, `deny_ports`, internal and metadata addresses).
+3. **What cannot be named fails closed.** A redirected connection with no SNI,
+   or with an encrypted ClientHello (ECH), is refused and audited, since it was
+   redirected because its address belongs to an inspected host. An inspected
+   connection to an address the resolver did not give this sandbox for that
+   name is refused rather than relayed without its credential.
+
+Properties worth knowing:
+
+- **A credential only reaches the real origin.** The proxy verifies the
+  origin's certificate against the public roots for the inspected name, and the
+  destination must be pinned, so a guest cannot steer a brokered request to an
+  address of its choosing.
+- **Bypassing inspection only loses the credential.** A guest that resolves the
+  host elsewhere (DNS over HTTPS, a hard-coded address, IPv6, whose answers the
+  resolver never gives) reaches it directly, without the credential. Nothing
+  leaks; the brokering simply does not happen.
+- **IPv6.** The resolver returns no AAAA records, so inspected hosts are reached
+  over IPv4 and redirected there. `is_ipv6_denied` and `deny_ports` apply as in
+  any open-mode sandbox; a denied port 443 is refused by the proxy for
+  redirected connections.
+- **The guest must trust the root.** It is installed at creation, by the agent
+  at handshake on Linux and Windows and onto the disk before boot on macOS; see
+  [When a guest does not trust the inspection CA](#when-a-guest-does-not-trust-the-inspection-ca)
+  for images that read their own bundle. A client that pins certificates for
+  the inspected host will refuse the proxy's.
+- **Live.** Adding a rule takes effect at once for every address the resolver
+  has given the sandbox for that host and not yet forgotten, since the update
+  re-renders the set from the pins, and at the next lookup otherwise. An
+  address the guest learned some other way goes direct, without the
+  credential. Removing or expiring a rule takes effect at the next request, including the next request on an already open session,
+  because a session reads its rules from the node's current policy on every
+  request. Its redirect lapses when the policy is re-rendered, which happens on
+  the update itself and, for an expiry, within the reaper's ten-second tick;
+  until then a redirected connection to the host is relayed untouched.
+- **macOS nodes** make the same decision in the userspace stack: HTTPS to an
+  address pinned for a live inspected host is handed to the proxy, everything
+  else is dialled directly. There is no nftables set; each new flow reads the
+  pins and the live rules, so an expired rule stops a new flow being proxied at
+  once.
+- **Mixed-version fleets.** A node names the policy fields it enforces
+  (`NodeInfo.policy_features`: `deny_ports`, `ipv6_denied`, `rule_expiry`,
+  `rule_binding`, `open_inspection`). A node predating a field would decode a
+  policy carrying it and drop it silently, so the orchestrator places, forks,
+  moves and updates a policy using one only on a node that names it, and
+  refuses otherwise. A create from a snapshot that keeps the snapshot's own
+  policy, which the orchestrator does not see, is placed away from its holder
+  only on a node naming all of them.
+
+### Rule expiry
+
+`expires_at_unix_ms` on a request rule is the unix time in milliseconds at which
+it stops applying; 0, the default, never expires. From the CLI a `--rule` takes
+`"expiresIn"` (seconds, or a number with `s`, `m`, `h` or `d`) or
+`"expiresAtUnixMs"`.
+
+- The proxy compares every request against the node's clock, so an expired rule
+  stops applying without a call: it sets nothing and forwards nothing, the next
+  matching rule applies instead, and in open mode its host stops being
+  inspected.
+- The rule stays in the policy until an update removes it. Every policy a node
+  returns reports it with `is_expired` set.
+- Both ends are audited. A connection's record names the rules that set headers
+  on its requests (`headers set by rule 0 (api.example.com) on 3 of 4
+  requests`; per stream on HTTP/2), and when a rule expires the node writes a
+  record with destination `policy` and the reason `request rule N for <domain>
+  expired`, filed with the refusals so `burrow audit --denied` shows it.
+- Expiry is measured on the node's clock, so nodes need synchronised time.
+
+### Scoped secrets
+
+A stored secret is usable by every sandbox unless it is scoped. `SetSecret`
+takes `allowed_sandboxes` (sandbox ids or names) and `allowed_tags`
+(`key=value`), on the CLI `--allow-sandbox` and `--allow-tag`. A scoped secret
+resolves only for a sandbox named by id or name, or carrying one of the tags;
+anywhere else the create, fork or update that references it is refused with
+`PERMISSION_DENIED`. The same scope applies to a Kit credential of that name,
+which a sandbox outside the scope does not receive. Leaving both lists empty
+keeps today's behaviour, and setting a secret replaces its scope with its value.
+
+```sh
+burrow secret set api-token --value "$TOKEN" --allow-sandbox sbx_abc123
+burrow secret set ci-token --allow-tag team=ci < token.txt
+burrow secret ls
+# api-token   sandbox=sbx_abc123
+# ci-token    tag:team=ci
+```
+
+- **Enforced where `${secret:...}` is resolved,** in the orchestrator, against
+  the sandbox the policy is for: its id (already assigned on a create), its
+  name and its tags.
+- **A grant does not travel.** A rule that took a value from a scoped secret is
+  stamped with `bound_sandbox_id`. If its policy is copied to another sandbox, by
+  a fork or a create from a snapshot, the rule refuses the requests it would
+  have claimed there (`403`) instead of brokering a credential its scope does
+  not cover or sending those requests without it.
+- **Resolution is a moment.** Re-scoping or deleting a secret does not reach
+  policies that already hold its value; remove the rule, or let it expire, to
+  revoke a grant.
+- **Tags are as strong as whoever sets them.** Anyone who can update a
+  sandbox's tags can bring it into a tag scope; scope by id when that matters.
+- **Integrity.** The scope is stored beside the sealed value and bound into its
+  sealing context, so rewriting the scope in the store leaves a value that no
+  longer unseals rather than one more sandboxes may use. Values are never
+  returned or logged; `ListSecrets` returns names and scopes.
+
 ## Denied domains and HTTP rules
 
 Two more fields narrow a policy below the host. Both come from the Sandbox Kit
@@ -735,7 +893,18 @@ its trust store during the agent handshake, so turning inspection on later would
 break every TLS connection the sandbox makes instead of inspecting them. Turning
 it off, and every other change, is live. For the same reason an inspected
 sandbox moves only between nodes under one root; see
-[The inspection root](#the-inspection-root).
+[The inspection root](#the-inspection-root). A sandbox that may need a credential
+brokered later is therefore created with `--net open --inspect-tls` and no
+rules, which inspects nothing until a rule is added.
+
+Brokered values come back from every read as `<redacted>`, so a client that
+reads a policy, adds or removes one rule and sends it back would otherwise send
+the placeholder as the credential. Instead, a `<redacted>` header value is
+replaced with the value of the same header on a rule for the same domain in the
+policy being replaced, and a `<redacted>` forward secret with the secret of the
+rule with the same domain and URL; a placeholder with nothing to stand for is
+refused. Read-modify-write is therefore safe, and so is sending a whole policy
+with `${secret:...}` references each time.
 
 ## Private networks
 

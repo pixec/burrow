@@ -18,6 +18,7 @@ use tokio::net::UnixDatagram;
 use tokio::sync::watch;
 
 use super::*;
+use crate::policy::{Transport, Verdict};
 
 const MAC: [u8; 6] = [0x02, 0x00, 0x0a, 0x63, 0x00, 0x06];
 const GUEST: Ipv4Addr = Ipv4Addr::new(10, 99, 0, 6);
@@ -763,6 +764,51 @@ async fn a_denied_web_port_is_refused_by_the_proxy_in_allowlist_mode() {
         .await;
     assert!(!event.is_allowed);
     assert_eq!(event.reason, "destination port is denied");
+}
+
+/// Open mode with inspection sends the proxy only HTTPS to an address the
+/// resolver gave this sandbox for a host a live rule names, as the Linux
+/// redirect does; every other flow, and the same one once its rule expires,
+/// goes straight out.
+#[tokio::test]
+async fn open_mode_proxies_only_https_to_inspected_hosts() {
+    let rule = |expires_at_unix_ms| burrow_proxy::policy::Rule {
+        domain: "inspected.test".into(),
+        expires_at_unix_ms,
+        matcher: None,
+        action: burrow_proxy::policy::Action::SetHeaders(vec![(
+            "Authorization".into(),
+            "Bearer t".into(),
+        )]),
+    };
+    let mut open = policy(NetworkMode::Open, &[], &[], &[]);
+    open.proxy.is_tls_inspected = true;
+    open.proxy.rules = Arc::new(vec![rule(0)]);
+    let guest = Guest::attach(open.clone()).await;
+    let shared = &guest.handle.shared;
+    let at = IpAddr::V4(REMOTE);
+
+    assert_eq!(shared.decide(at, Transport::Tcp, 443), Verdict::Direct);
+    shared.node.resolutions.record(
+        "sbx_test",
+        "inspected.test",
+        vec![at],
+        Duration::from_secs(300),
+    );
+    assert_eq!(shared.decide(at, Transport::Tcp, 443), Verdict::Proxy);
+    assert_eq!(shared.decide(at, Transport::Tcp, 80), Verdict::Direct);
+    assert_eq!(
+        shared.decide(
+            IpAddr::V4(Ipv4Addr::new(198, 51, 100, 11)),
+            Transport::Tcp,
+            443
+        ),
+        Verdict::Direct
+    );
+
+    open.proxy.rules = Arc::new(vec![rule(1)]);
+    guest.policy.send_replace(open);
+    assert_eq!(shared.decide(at, Transport::Tcp, 443), Verdict::Direct);
 }
 
 #[tokio::test]

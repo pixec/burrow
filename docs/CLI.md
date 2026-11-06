@@ -255,9 +255,9 @@ burrow create --template python --name api
 | `--deny-cidr <CIDR>` | IPv4 or IPv6 range the sandbox may never reach, in any mode. Repeatable. |
 | `--deny-port <SPEC>` | Destination port the sandbox may never connect to, in any mode, as `[tcp/\|udp/]PORT[-END][@CIDR,...]`: `tcp/25`, `tcp/465-587`, `5432@10.0.0.0/8`. No protocol means both; no CIDR means every destination, over IPv4 and IPv6. Repeatable. See [Denied ports](FIREWALL.md#denied-ports). |
 | `--deny-ipv6` | Refuse every IPv6 destination, in any mode. Without it each mode keeps its own [IPv6 behaviour](FIREWALL.md#ipv6). |
-| `--inspect-tls` | Terminate the sandbox's TLS so the host inside the session is checked. Requires `--net allowlist`. |
+| `--inspect-tls` | Terminate the sandbox's TLS so the host inside the session is checked. With `--net allowlist`, every HTTPS connection; with `--net open`, only the hosts named by `--rule` and `--inject-header`. Refused with `--net none`. Only at creation, since it installs the inspection root in the guest; rules can change later. |
 | `--inject-header <DOMAIN:NAME=VALUE>` | Credential the host adds to every request for a domain. Requires `--inspect-tls`. Repeatable. |
-| `--rule <JSON>` | Rule for inspected requests: a domain, an optional `match`, and either `setHeaders` or `forward`. Requires `--inspect-tls`. Evaluated in order, and before every `--inject-header`. Repeatable. |
+| `--rule <JSON>` | Rule for inspected requests: a domain, an optional `match`, and either `setHeaders` or `forward`, plus optionally `expiresIn` (seconds, or `90s`, `15m`, `1h`, `2d`) or `expiresAtUnixMs`. Requires `--inspect-tls`; in open mode the domain is an exact host. Evaluated in order, and before every `--inject-header`. Repeatable. |
 | `--no-exec` | Refuse `exec`, `run` and `connect` against this sandbox. |
 | `--no-upload` | Refuse uploads into this sandbox. |
 | `--no-download` | Refuse downloads out of this sandbox. |
@@ -1765,7 +1765,7 @@ egress proxy, so the guest never holds it. See
 [FIREWALL.md](FIREWALL.md#credentials-brokering).
 
 ```
-burrow secret set <NAME> [--value <VALUE>]
+burrow secret set <NAME> [--value <VALUE>] [--allow-sandbox <ID|NAME>]... [--allow-tag <KEY=VALUE>]...
 burrow secret ls
 burrow secret rm <NAME>
 ```
@@ -1773,14 +1773,18 @@ burrow secret rm <NAME>
 ```sh
 burrow secret set github --value ghp_...
 printf '%s' "$TOKEN" | burrow secret set github
+burrow secret set api-token --value tok_... --allow-sandbox sbx_abc123
 burrow secret ls
+# api-token   sandbox=sbx_abc123
 # github
 ```
 
 | Command | Description |
 | --- | --- |
 | `secret set <NAME>` | Store a secret. `<NAME>` is lowercase kebab-case, the `service` a Kit credential names. The value comes from `--value`, else from stdin with the trailing newline removed. |
-| `secret ls` | List secret names. Values are never shown. Aliased as `list`. |
+| `--allow-sandbox <ID\|NAME>` | Only this sandbox may use the secret. Repeatable. With no `--allow-sandbox` or `--allow-tag`, every sandbox may. See [FIREWALL.md](FIREWALL.md#scoped-secrets). |
+| `--allow-tag <KEY=VALUE>` | Only sandboxes carrying this tag may use the secret. Repeatable. |
+| `secret ls` | List secret names, with the scope of each scoped one. Values are never shown. Aliased as `list`. |
 | `secret rm <NAME>` | Delete a secret. Aliased as `remove`. |
 
 Prefer stdin on a shared machine: a value on the command line is visible in `ps`

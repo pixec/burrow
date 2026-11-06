@@ -193,6 +193,28 @@ impl Shared {
             IpAddr::V4(v4) if v4 == self.net.dns_ip => IpAddr::V4(self.net.gateway_ip),
             other => other,
         };
+        // Open mode's selective inspection, ahead of everything else as the
+        // NAT redirect is on Linux: HTTPS to an address this sandbox was told
+        // an inspected host resolves to goes to the proxy, which terminates it
+        // if the session names that host and relays it untouched otherwise.
+        if transport == Transport::Tcp
+            && port == 443
+            && destination.is_ipv4()
+            && policy.rules.mode() == crate::firewall::Mode::Open
+        {
+            let hosts = policy
+                .proxy
+                .selectively_inspected_hosts(burrow_proxy::policy::now_unix_ms());
+            if !hosts.is_empty()
+                && self.node.resolutions.is_pinned_to_any(
+                    &policy.proxy.sandbox_id,
+                    &hosts,
+                    destination,
+                )
+            {
+                return Verdict::Proxy;
+            }
+        }
         policy::decide(
             &policy.rules,
             self.net.gateway_ip,

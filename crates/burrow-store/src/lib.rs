@@ -931,13 +931,20 @@ impl Store {
         Ok(done as usize)
     }
 
+    /// Stores an unscoped secret, clearing any scope the name had.
     pub async fn put_secret(&self, name: &str, value: &str) -> Result<()> {
+        self.put_secret_scoped(name, value, "").await
+    }
+
+    /// Stores a secret with its scope, both replacing whatever the name held.
+    pub async fn put_secret_scoped(&self, name: &str, value: &str, scope: &str) -> Result<()> {
         on_pool!(self, pool => sqlx::query(
-            "INSERT INTO secrets (name, value) VALUES ($1, $2)
-             ON CONFLICT (name) DO UPDATE SET value=excluded.value",
+            "INSERT INTO secrets (name, value, scope) VALUES ($1, $2, $3)
+             ON CONFLICT (name) DO UPDATE SET value=excluded.value, scope=excluded.scope",
         )
         .bind(name)
         .bind(value)
+        .bind(scope)
         .execute(pool)
         .await
         .map(drop))?;
@@ -945,22 +952,37 @@ impl Store {
     }
 
     pub async fn get_secret(&self, name: &str) -> Result<Option<String>> {
-        let row: Option<(String,)> = on_pool!(self, pool => sqlx::query_as(
-            "SELECT value FROM secrets WHERE name=$1",
+        Ok(self.get_secret_scoped(name).await?.map(|(value, _)| value))
+    }
+
+    /// A secret's sealed value and its scope, empty when it has none.
+    pub async fn get_secret_scoped(&self, name: &str) -> Result<Option<(String, String)>> {
+        let row: Option<(String, String)> = on_pool!(self, pool => sqlx::query_as(
+            "SELECT value, scope FROM secrets WHERE name=$1",
         )
         .bind(name)
         .fetch_optional(pool)
         .await)?;
-        Ok(row.map(|(value,)| value))
+        Ok(row)
     }
 
     pub async fn list_secret_names(&self) -> Result<Vec<String>> {
-        let rows: Vec<(String,)> = on_pool!(self, pool => sqlx::query_as(
-            "SELECT name FROM secrets ORDER BY name",
+        Ok(self
+            .list_secret_scopes()
+            .await?
+            .into_iter()
+            .map(|(name, _)| name)
+            .collect())
+    }
+
+    /// Every secret's name and scope, by name. Never a value.
+    pub async fn list_secret_scopes(&self) -> Result<Vec<(String, String)>> {
+        let rows: Vec<(String, String)> = on_pool!(self, pool => sqlx::query_as(
+            "SELECT name, scope FROM secrets ORDER BY name",
         )
         .fetch_all(pool)
         .await)?;
-        Ok(rows.into_iter().map(|(name,)| name).collect())
+        Ok(rows)
     }
 
     pub async fn delete_secret(&self, name: &str) -> Result<bool> {

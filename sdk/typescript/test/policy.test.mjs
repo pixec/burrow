@@ -372,3 +372,49 @@ test("port rules and ipv6 survive the real wire encoding", () => {
     { port: 25 },
   ]);
 });
+
+test("an expiring rule in open mode is carried onto the wire and read back", () => {
+  const expiresAtUnixMs = Date.now() + 3_600_000;
+  const wire = toNetworkPolicy({
+    mode: "open",
+    inspectTls: true,
+    rules: [
+      {
+        domain: "api.example.com",
+        match: { method: ["GET", "POST"] },
+        setHeaders: { authorization: "Bearer ${secret:api}" },
+        expiresAtUnixMs,
+      },
+    ],
+  });
+  assert.equal(wire.mode, "NETWORK_MODE_OPEN");
+  assert.equal(wire.isTlsInspected, true);
+  assert.equal(wire.rules[0].expiresAtUnixMs, expiresAtUnixMs);
+  assert.equal(wire.rules[0].boundSandboxId, undefined);
+
+  // What a node sends back: the rule expired, bound to one sandbox.
+  const read = fromNetworkPolicy({
+    ...wire,
+    rules: [
+      {
+        ...wire.rules[0],
+        expiresAtUnixMs: String(expiresAtUnixMs),
+        isExpired: true,
+        boundSandboxId: "sbx_a",
+      },
+    ],
+  });
+  assert.equal(read.rules[0].expiresAtUnixMs, expiresAtUnixMs);
+  assert.equal(read.rules[0].expired, true);
+  assert.equal(read.rules[0].boundSandboxId, "sbx_a");
+});
+
+test("an expiry that is not unix milliseconds is refused", () => {
+  for (const expiresAtUnixMs of [-1, 1.5, "soon"]) {
+    assert.throws(
+      () =>
+        withRule({ setHeaders: { Authorization: "Bearer t" }, expiresAtUnixMs }),
+      /expiresAtUnixMs/,
+    );
+  }
+});

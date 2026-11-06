@@ -132,6 +132,23 @@ impl Default for Budget {
     }
 }
 
+/// Sends a sandbox's connections to some addresses through the proxy.
+///
+/// Open mode routes nothing through the proxy, except the HTTPS connections
+/// to hosts whose TLS it inspects. Which addresses those are is known only
+/// once the resolver has answered, so the resolver tells the node, and waits
+/// for it: the client may connect the instant it has the answer.
+pub trait Redirect: Send + Sync {
+    /// Redirects TCP 443 from the sandbox at `source` to each of `addresses`
+    /// for `lifetime`, which is how long the resolver keeps them pinned.
+    fn redirect<'a>(
+        &'a self,
+        source: IpAddr,
+        addresses: &'a [IpAddr],
+        lifetime: std::time::Duration,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send + 'a>>;
+}
+
 pub struct Resolver {
     pub policies: Arc<PolicyTable>,
     pub audit: AuditLog,
@@ -142,6 +159,10 @@ pub struct Resolver {
     pub resolutions: Arc<crate::Resolutions>,
     /// Private-network names, answered here rather than forwarded.
     pub directory: Arc<crate::directory::Directory>,
+    /// Told the addresses of every host an open-mode sandbox has inspected,
+    /// before the answer is sent. `None` where nothing needs telling, as on a
+    /// userspace stack that consults the pins itself.
+    pub redirect: Option<Arc<dyn Redirect>>,
 }
 
 impl Resolver {
@@ -211,6 +232,9 @@ impl Resolver {
         // every sandbox, one with no network included, a channel out through
         // the question name itself.
         let (policy, decision) = self.policies.may_resolve(source_ip, &name);
+        let is_inspected = policy.as_ref().is_some_and(|policy| {
+            policy.is_selectively_inspected(&name, crate::policy::now_unix_ms())
+        });
         let sandbox_id = policy.map(|p| p.sandbox_id).unwrap_or_default();
 
         let mut refusal = None;
@@ -237,7 +261,26 @@ impl Resolver {
             && !name.is_empty()
         {
             let (addresses, ttl) = crate::resolutions::parse_answers(answer);
+            // Never into the fleet or the metadata service, which the proxy
+            // would refuse anyway.
+            let outward: Vec<IpAddr> = addresses
+                .iter()
+                .copied()
+                .filter(|address| !crate::resolutions::is_forbidden_destination(*address))
+                .collect();
             self.resolutions.record(&sandbox_id, &name, addresses, ttl);
+            // Redirected before the reply for the same reason the pin is
+            // recorded first, and after the pin, which is what a render of the
+            // node's ruleset refills its redirects from: a render that lands
+            // between the two still redirects this answer.
+            if is_inspected
+                && !outward.is_empty()
+                && let Some(redirect) = &self.redirect
+            {
+                redirect
+                    .redirect(source_ip, &outward, crate::resolutions::pin_lifetime(ttl))
+                    .await;
+            }
         }
 
         self.audit.record(EgressEvent {

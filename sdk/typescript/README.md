@@ -694,8 +694,11 @@ await Sandbox.create({
 ```
 
 Rules need `inspectTls`, because the proxy has to terminate TLS to read a
-request at all, and the domain has to be in `allowDomains`, since only traffic
-to an allowed domain is inspected. The guest is handed the inspection CA
+request at all. In allowlist mode the domain has to be in `allowDomains`,
+since only traffic to an allowed domain is inspected; in open mode the rule's
+domain, an exact host, is itself what is inspected, and nothing else is. A rule
+may carry `expiresAtUnixMs`, after which it stops applying on its own; a policy
+read back marks it `expired`. The guest is handed the inspection root
 during its first handshake, so inspection is a create-time choice: adding rules
 to a sandbox created without it throws `failed_precondition` rather than
 silently doing nothing. A secret never leaves the node: code in the guest uses
@@ -1258,6 +1261,9 @@ proxy, so a guest never holds it. See
 ```ts
 await burrow.setSecret("github", process.env.GITHUB_TOKEN);
 await burrow.listSecrets(); // ["github"], values are never returned
+// Usable only by the sandboxes named, by id or name, or carrying a tag:
+await burrow.setSecret("api-token", token, { sandboxes: [sandbox.id], tags: ["team=ml"] });
+await burrow.listSecretScopes(); // [{ name, scope: { sandboxes, tags } }]
 await burrow.deleteSecret("github");
 ```
 
@@ -1483,7 +1489,7 @@ Everything else goes to the orchestrator.
 | `burrow.audit` | `QueryAudit` |
 | `burrow.events` | `TailEvents` |
 | `burrow.nodes`, `drainNode` | `ListNodes`, `DrainNode` |
-| `burrow.setSecret`, `listSecrets`, `deleteSecret` | `SetSecret`, `ListSecrets`, `DeleteSecret` |
+| `burrow.setSecret`, `listSecrets`, `listSecretScopes`, `deleteSecret` | `SetSecret`, `ListSecrets`, `DeleteSecret` |
 | `burrow.health` | `Health` |
 
 ## Migrating from earlier versions

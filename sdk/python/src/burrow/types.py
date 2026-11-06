@@ -44,12 +44,33 @@ class FsPolicy:
 
 @dataclass
 class RequestRule:
-    """A rule the proxy applies to inspected requests to one domain."""
+    """A rule the proxy applies to inspected requests to one domain.
+
+    In open mode ``domain`` is an exact host name, since it also names the one
+    host whose TLS is inspected. ``expires_at_unix_ms`` is when the rule stops
+    applying, 0 for never; ``expired`` says it has, and is read only.
+    ``bound_sandbox_id`` is set by the server on a rule whose value came from
+    a scoped secret: a copy of the policy anywhere else refuses the requests
+    the rule would have claimed.
+    """
 
     domain: str
     match: Optional[dict] = None
     set_headers: Optional[Dict[str, str]] = None
     forward: Optional[dict] = None
+    expires_at_unix_ms: int = 0
+    expired: bool = False
+    bound_sandbox_id: str = ""
+
+
+@dataclass
+class SecretInfo:
+    """A stored secret's name and who may use it: sandbox ids or names, and
+    tags as ``key=value``. Both empty is every sandbox. Never a value."""
+
+    name: str
+    allowed_sandboxes: List[str] = field(default_factory=list)
+    allowed_tags: List[str] = field(default_factory=list)
 
 
 @dataclass

@@ -86,12 +86,42 @@ export interface ForwardRequest {
  * domain.
  */
 export interface RequestRule {
-  /** Domain glob, matched exactly like `allowDomains`. */
+  /**
+   * Domain glob, matched exactly like `allowDomains`. In open mode an exact
+   * host name, since it also names the one host whose TLS is inspected.
+   */
   domain: string;
   match?: RequestMatch;
   /** Headers set on the request, replacing whatever the guest sent. */
   setHeaders?: Record<string, string>;
   forward?: ForwardRequest;
+  /**
+   * Unix milliseconds at which the rule stops applying, with no further call.
+   * Omitted or 0 never expires.
+   */
+  expiresAtUnixMs?: number;
+  /** Read only: the rule has passed `expiresAtUnixMs`. Ignored when sent. */
+  expired?: boolean;
+  /**
+   * The one sandbox the rule applies in, set by the server on a rule whose
+   * value came from a scoped secret. A copy of the policy elsewhere, a fork
+   * for instance, refuses the requests the rule would have claimed.
+   */
+  boundSandboxId?: string;
+}
+
+/** Who may use a secret. Both empty, the default, is every sandbox. */
+export interface SecretScope {
+  /** Sandbox ids or names. */
+  sandboxes?: string[];
+  /** Tags as `key=value`. */
+  tags?: string[];
+}
+
+/** A stored secret's name and scope. The value is never returned. */
+export interface SecretInfo {
+  name: string;
+  scope: SecretScope;
 }
 
 /**

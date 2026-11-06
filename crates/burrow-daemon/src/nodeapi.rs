@@ -2449,13 +2449,35 @@ fn validate_network_policy(policy: &common::NetworkPolicy) -> Result<(), Status>
         }
     }
 
-    // Inspection happens in the egress proxy, and only allowlist mode
-    // redirects traffic there. Anywhere else it is a promise the boundary
-    // cannot keep, which is worse than refusing it.
-    if policy.is_tls_inspected && policy.mode != common::NetworkMode::Allowlist as i32 {
+    // Inspection happens in the egress proxy. Allowlist mode redirects all of
+    // its web traffic there, open mode the HTTPS to the hosts its rules name,
+    // and none mode has nothing to inspect: there it is a promise the
+    // boundary cannot keep, which is worse than refusing it.
+    let is_open = policy.mode == common::NetworkMode::Open as i32;
+    if policy.is_tls_inspected && policy.mode != common::NetworkMode::Allowlist as i32 && !is_open {
         return Err(Status::invalid_argument(
-            "inspect_tls requires the allowlist network mode",
+            "inspect_tls requires the allowlist or open network mode",
         ));
+    }
+    // In open mode a rule's domain is also the set of hosts redirected to the
+    // proxy, matched against the name each lookup asks for. A glob there would
+    // have the node inspect hosts nobody wrote down, so it names one host.
+    if is_open {
+        for rule in &policy.rules {
+            if !is_exact_host(&rule.domain) {
+                return Err(Status::invalid_argument(format!(
+                    "in open mode a rule's domain names the one host whose TLS is inspected, \
+                     so it must be an exact host name, not {:?}",
+                    rule.domain
+                )));
+            }
+        }
+        if !policy.http_rules.is_empty() {
+            return Err(Status::invalid_argument(
+                "http_rules are not supported in open mode: they bound what a host may carry, \
+                 and open mode bounds nothing",
+            ));
+        }
     }
     if !policy.rules.is_empty() && !policy.is_tls_inspected {
         return Err(Status::invalid_argument(
@@ -2571,6 +2593,43 @@ fn is_host_glob(value: &str) -> bool {
     value == "*" || value == "**" || is_domain_glob(value)
 }
 
+/// A host name with no wildcard: what an open-mode rule may name.
+fn is_exact_host(value: &str) -> bool {
+    !value.contains('*') && is_domain_glob(value)
+}
+
+/// The rule the proxy holds for `rule` in the sandbox `sandbox_id`.
+///
+/// A rule bound to another sandbox, which is what a policy copied by a fork
+/// or a snapshot carries when its credential came from a scoped secret,
+/// refuses the requests it would have claimed rather than set a credential
+/// the secret was never scoped to, or let those requests go without it. So
+/// does a rule that will not compile: validated at the API door, one arriving
+/// here means the policy in force is not the one that was written.
+pub(crate) fn load_rule(rule: &common::RequestRule, sandbox_id: &str) -> proxypolicy::Rule {
+    let refusal = |reason: String| proxypolicy::Rule {
+        domain: rule.domain.clone(),
+        matcher: None,
+        action: proxypolicy::Action::Refuse(reason),
+        expires_at_unix_ms: rule.expires_at_unix_ms,
+    };
+    match compile_rule(rule) {
+        Ok(compiled)
+            if !rule.bound_sandbox_id.is_empty() && rule.bound_sandbox_id != sandbox_id =>
+        {
+            proxypolicy::Rule {
+                action: proxypolicy::Action::Refuse(format!(
+                    "the rule for {} is bound to another sandbox",
+                    rule.domain
+                )),
+                ..compiled
+            }
+        }
+        Ok(compiled) => compiled,
+        Err(err) => refusal(format!("unusable policy rule: {err}")),
+    }
+}
+
 /// Turns one wire rule into the compiled rule the proxy evaluates.
 ///
 /// The same function validates and loads, so a rule the API door accepted is a
@@ -2636,6 +2695,7 @@ pub(crate) fn compile_rule(rule: &common::RequestRule) -> Result<proxypolicy::Ru
         domain: rule.domain.clone(),
         matcher,
         action,
+        expires_at_unix_ms: rule.expires_at_unix_ms,
     })
 }
 
@@ -2787,7 +2847,11 @@ fn redact_secrets(mut sandbox: common::Sandbox) -> common::Sandbox {
         .as_mut()
         .and_then(|policy| policy.network.as_mut())
     {
+        let now_ms = proxypolicy::now_unix_ms();
         for rule in &mut network.rules {
+            // Reported rather than removed: the caller wrote the rule, and a
+            // rule that silently vanished would read as never having existed.
+            rule.is_expired = rule.expires_at_unix_ms != 0 && rule.expires_at_unix_ms <= now_ms;
             match rule.action.as_mut() {
                 Some(common::request_rule::Action::SetHeaders(set)) => {
                     for header in &mut set.headers {
@@ -2813,6 +2877,78 @@ fn redact_secrets(mut sandbox: common::Sandbox) -> common::Sandbox {
 }
 
 const REDACTED: &str = "<redacted>";
+
+/// Puts back the values a caller sent as `<redacted>`, from the policy they
+/// replace.
+///
+/// Every policy a node returns has its brokered values redacted, so a caller
+/// adding or removing one rule by reading the policy, changing it and sending
+/// it back sends the placeholder for every other value. Kept literally, that
+/// would set `<redacted>` as the credential. Instead each placeholder takes the
+/// value of the rule in `previous` with the same domain and the same header
+/// name, or the same forward URL; a placeholder with no such rule to take a
+/// value from is refused, since there is no value it could stand for.
+///
+/// Output-only fields are cleared on the way in, so a policy read back and
+/// sent again does not carry them as though they were requests.
+pub(crate) fn restore_redacted(
+    network: &mut common::NetworkPolicy,
+    previous: Option<&common::NetworkPolicy>,
+) -> Result<(), Status> {
+    let previous_rules = previous.map(|p| p.rules.as_slice()).unwrap_or_default();
+    for rule in &mut network.rules {
+        rule.is_expired = false;
+        let domain = rule.domain.clone();
+        match rule.action.as_mut() {
+            Some(common::request_rule::Action::SetHeaders(set)) => {
+                for header in &mut set.headers {
+                    if header.value != REDACTED {
+                        continue;
+                    }
+                    header.value = previous_rules
+                        .iter()
+                        .filter(|old| old.domain == domain)
+                        .find_map(|old| match old.action.as_ref() {
+                            Some(common::request_rule::Action::SetHeaders(old)) => old
+                                .headers
+                                .iter()
+                                .find(|h| h.name.eq_ignore_ascii_case(&header.name))
+                                .map(|h| h.value.clone()),
+                            _ => None,
+                        })
+                        .ok_or_else(|| {
+                            Status::invalid_argument(format!(
+                                "the {} header for {domain} is {REDACTED}, and the policy it \
+                                 replaces has no value for it to keep",
+                                header.name
+                            ))
+                        })?;
+                }
+            }
+            Some(common::request_rule::Action::Forward(forward)) if forward.secret == REDACTED => {
+                forward.secret = previous_rules
+                    .iter()
+                    .filter(|old| old.domain == domain)
+                    .find_map(|old| match old.action.as_ref() {
+                        Some(common::request_rule::Action::Forward(old))
+                            if old.url == forward.url =>
+                        {
+                            Some(old.secret.clone())
+                        }
+                        _ => None,
+                    })
+                    .ok_or_else(|| {
+                        Status::invalid_argument(format!(
+                            "the forward secret for {domain} is {REDACTED}, and the policy it \
+                             replaces has no value for it to keep"
+                        ))
+                    })?;
+            }
+            _ => {}
+        }
+    }
+    Ok(())
+}
 
 /// Maps a public Exec message onto the agent protocol. A second `Start` is
 /// dropped: the stream already has one, and the agent rejects duplicates.
@@ -3132,6 +3268,7 @@ mod policy_tests {
                     }],
                 },
             )),
+            ..Default::default()
         }
     }
 
@@ -3152,6 +3289,7 @@ mod policy_tests {
                     secret: "shared".into(),
                 },
             )),
+            ..Default::default()
         }
     }
 
@@ -3273,10 +3411,10 @@ mod policy_tests {
         uninspected.is_tls_inspected = false;
         assert!(validate_network_policy(&uninspected).is_err());
 
-        // And inspection itself only means something in allowlist mode.
-        let mut open = inspected(vec![]);
-        open.mode = common::NetworkMode::Open as i32;
-        assert!(validate_network_policy(&open).is_err());
+        // And inspection itself means nothing without egress.
+        let mut none = inspected(vec![]);
+        none.mode = common::NetworkMode::None as i32;
+        assert!(validate_network_policy(&none).is_err());
     }
 
     /// A name or value carrying CRLF would forge header lines in every request
@@ -3446,6 +3584,7 @@ mod policy_tests {
             domain: "api.example.com".into(),
             r#match: None,
             action: None,
+            ..Default::default()
         };
         assert!(validate_network_policy(&inspected(vec![empty])).is_err());
 
@@ -3840,6 +3979,182 @@ mod policy_tests {
                 data: b"x".to_vec(),
             }))
         );
+    }
+
+    fn open_inspected(rules: Vec<common::RequestRule>) -> common::NetworkPolicy {
+        common::NetworkPolicy {
+            mode: common::NetworkMode::Open as i32,
+            is_tls_inspected: true,
+            rules,
+            ..Default::default()
+        }
+    }
+
+    /// Open mode may inspect, but only hosts it names exactly, and none mode
+    /// has nothing to inspect.
+    #[test]
+    fn open_mode_inspection_names_exact_hosts() {
+        assert!(validate_network_policy(&open_inspected(Vec::new())).is_ok());
+        assert!(
+            validate_network_policy(&open_inspected(vec![header(
+                "api.example.com",
+                "Authorization",
+                "Bearer t"
+            )]))
+            .is_ok()
+        );
+        for glob in ["*.example.com", "*"] {
+            assert!(
+                validate_network_policy(&open_inspected(vec![header(
+                    glob,
+                    "Authorization",
+                    "Bearer t"
+                )]))
+                .is_err(),
+                "{glob} names hosts nobody wrote down"
+            );
+        }
+        // The same glob is still a rule domain in allowlist mode.
+        assert!(
+            validate_network_policy(&inspected(vec![header(
+                "*.example.com",
+                "Authorization",
+                "Bearer t"
+            )]))
+            .is_ok()
+        );
+
+        let mut bounded = open_inspected(Vec::new());
+        bounded.http_rules = vec![common::HttpRule {
+            hosts: vec!["api.example.com".into()],
+            ..Default::default()
+        }];
+        assert!(validate_network_policy(&bounded).is_err());
+
+        let none = common::NetworkPolicy {
+            mode: common::NetworkMode::None as i32,
+            is_tls_inspected: true,
+            ..Default::default()
+        };
+        assert!(validate_network_policy(&none).is_err());
+
+        // Rules still need the opt-in in open mode, which is what gave the
+        // guest the CA.
+        let mut uninspected = open_inspected(vec![header("api.example.com", "X-K", "v")]);
+        uninspected.is_tls_inspected = false;
+        assert!(validate_network_policy(&uninspected).is_err());
+    }
+
+    /// An expired rule is reported as such on the way out, alongside its
+    /// redacted value; one still live is not.
+    #[test]
+    fn a_returned_policy_reports_which_rules_have_expired() {
+        let now = proxypolicy::now_unix_ms();
+        let sandbox = common::Sandbox {
+            policy: Some(common::Policy {
+                network: Some(open_inspected(vec![
+                    common::RequestRule {
+                        expires_at_unix_ms: now - 1,
+                        ..header("old.example.com", "Authorization", "Bearer old")
+                    },
+                    common::RequestRule {
+                        expires_at_unix_ms: now + 60_000,
+                        ..header("api.example.com", "Authorization", "Bearer new")
+                    },
+                    header("forever.example.com", "Authorization", "Bearer f"),
+                ])),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let rules = redact_secrets(sandbox)
+            .policy
+            .unwrap()
+            .network
+            .unwrap()
+            .rules;
+        assert!(rules[0].is_expired);
+        assert!(!rules[1].is_expired);
+        assert!(!rules[2].is_expired);
+        for rule in &rules {
+            let Some(common::request_rule::Action::SetHeaders(set)) = &rule.action else {
+                panic!("set_headers expected");
+            };
+            assert_eq!(set.headers[0].value, REDACTED);
+        }
+    }
+
+    /// Reading a policy, adding a rule and sending it back keeps the values
+    /// the read redacted, instead of setting `<redacted>` as a credential.
+    #[test]
+    fn a_redacted_value_sent_back_keeps_the_value_it_stands_for() {
+        let previous = open_inspected(vec![
+            header("api.example.com", "Authorization", "Bearer real"),
+            forwarding("gate.example.com", "https://gate.example.com/x"),
+        ]);
+        let mut sent = open_inspected(vec![
+            common::RequestRule {
+                is_expired: true,
+                ..header("api.example.com", "authorization", REDACTED)
+            },
+            common::RequestRule {
+                r#match: None,
+                action: Some(common::request_rule::Action::Forward(
+                    common::ForwardRequest {
+                        url: "https://gate.example.com/x".into(),
+                        secret: REDACTED.into(),
+                    },
+                )),
+                ..header("gate.example.com", "-", "-")
+            },
+            header("new.example.com", "Authorization", "Bearer added"),
+        ]);
+        restore_redacted(&mut sent, Some(&previous)).unwrap();
+        let values: Vec<String> = sent
+            .rules
+            .iter()
+            .map(|rule| match rule.action.as_ref().unwrap() {
+                common::request_rule::Action::SetHeaders(set) => set.headers[0].value.clone(),
+                common::request_rule::Action::Forward(forward) => forward.secret.clone(),
+            })
+            .collect();
+        assert_eq!(values, vec!["Bearer real", "shared", "Bearer added"]);
+        // Output only, so not carried in as a request.
+        assert!(!sent.rules[0].is_expired);
+
+        // A placeholder with nothing behind it is not a value.
+        let mut orphan =
+            open_inspected(vec![header("other.example.com", "Authorization", REDACTED)]);
+        assert!(restore_redacted(&mut orphan, Some(&previous)).is_err());
+        assert!(restore_redacted(&mut orphan, None).is_err());
+    }
+
+    /// A rule bound to one sandbox refuses, rather than brokers, anywhere
+    /// else its policy is copied to.
+    #[test]
+    fn a_bound_rule_refuses_outside_its_sandbox() {
+        let rule = common::RequestRule {
+            bound_sandbox_id: "sbx_a".into(),
+            expires_at_unix_ms: 42,
+            ..header("api.example.com", "Authorization", "Bearer t")
+        };
+        let home = load_rule(&rule, "sbx_a");
+        assert!(matches!(home.action, proxypolicy::Action::SetHeaders(_)));
+        assert_eq!(home.expires_at_unix_ms, 42);
+
+        let fork = load_rule(&rule, "sbx_b");
+        assert!(matches!(fork.action, proxypolicy::Action::Refuse(_)));
+        assert_eq!(fork.domain, "api.example.com");
+        assert_eq!(fork.expires_at_unix_ms, 42);
+
+        let unbound = common::RequestRule {
+            bound_sandbox_id: String::new(),
+            ..rule
+        };
+        assert!(matches!(
+            load_rule(&unbound, "sbx_b").action,
+            proxypolicy::Action::SetHeaders(_)
+        ));
     }
 }
 

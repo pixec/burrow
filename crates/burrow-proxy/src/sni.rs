@@ -258,7 +258,7 @@ pub fn parse_http_host(buf: &[u8]) -> Option<String> {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
 
     fn parse_sni(buf: &[u8]) -> Option<String> {
@@ -266,7 +266,7 @@ mod tests {
     }
 
     /// Builds a minimal but structurally valid ClientHello for `host`.
-    fn client_hello(host: &str) -> Vec<u8> {
+    pub(crate) fn client_hello(host: &str) -> Vec<u8> {
         let host = host.as_bytes();
         let mut sni = Vec::new();
         sni.extend_from_slice(&((host.len() + 3) as u16).to_be_bytes()); // list len
@@ -443,7 +443,7 @@ mod tests {
         assert!(parsed.is_hello_encrypted);
     }
 
-    fn server_name_extension(name: &str) -> Vec<u8> {
+    pub(crate) fn server_name_extension(name: &str) -> Vec<u8> {
         let mut entry = vec![0u8];
         entry.extend_from_slice(&(name.len() as u16).to_be_bytes());
         entry.extend_from_slice(name.as_bytes());
@@ -453,7 +453,7 @@ mod tests {
     }
 
     /// Builds a ClientHello carrying the given extensions verbatim.
-    fn client_hello_with(extensions: &[(u16, Vec<u8>)]) -> Vec<u8> {
+    pub(crate) fn client_hello_with(extensions: &[(u16, Vec<u8>)]) -> Vec<u8> {
         let mut ext_block = Vec::new();
         for (kind, body) in extensions {
             ext_block.extend_from_slice(&kind.to_be_bytes());

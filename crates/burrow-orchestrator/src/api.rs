@@ -418,6 +418,28 @@ impl ApiService {
         )))
     }
 
+    /// Refuses to hand `network` to `node_id` when the node does not enforce
+    /// a field it uses, which it would otherwise drop without a word.
+    fn require_policy_features(
+        &self,
+        node_id: &str,
+        network: Option<&common::NetworkPolicy>,
+    ) -> Result<(), Status> {
+        let wanted = crate::registry::policy_features(network);
+        if wanted.is_empty() {
+            return Ok(());
+        }
+        let info = self.0.nodes.info(node_id).unwrap_or_default();
+        let missing = crate::registry::missing_features(&info, &wanted);
+        if missing.is_empty() {
+            return Ok(());
+        }
+        Err(Status::failed_precondition(format!(
+            "node {node_id} does not enforce {}, which this policy uses; upgrade burrowd there",
+            missing.join(", ")
+        )))
+    }
+
     fn secrets(&self) -> Result<&crate::secrets::Secrets, Status> {
         self.0
             .secrets
@@ -429,48 +451,38 @@ impl ApiService {
     /// the stored secret, so a header can name a credential without the
     /// value ever being on a command line or in a request. The node only ever
     /// sees the resolved policy, which it seals at rest like any other.
-    async fn resolve_secret_refs(&self, network: &mut common::NetworkPolicy) -> Result<(), Status> {
-        let mut values: Vec<&mut String> = Vec::new();
-        for rule in &mut network.rules {
-            match rule.action.as_mut() {
-                Some(common::request_rule::Action::SetHeaders(set)) => {
-                    values.extend(set.headers.iter_mut().map(|h| &mut h.value));
-                }
-                Some(common::request_rule::Action::Forward(forward)) => {
-                    values.push(&mut forward.secret)
-                }
-                None => {}
-            }
-        }
+    ///
+    /// Resolved for `subject`, the sandbox the policy is for: a scoped secret
+    /// it is not allowed refuses the whole call, and a rule that took a value
+    /// from a scoped secret is bound to that sandbox, so a copy of the policy
+    /// made by a fork or a snapshot cannot carry the credential anywhere the
+    /// scope does not reach.
+    async fn resolve_secret_refs(
+        &self,
+        network: &mut common::NetworkPolicy,
+        subject: crate::secrets::Subject<'_>,
+    ) -> Result<(), Status> {
         // Names first, then the store, then the substitution: the store is
         // async and the substitution is not.
         let mut names = Vec::new();
-        for value in values.iter().filter(|v| v.contains(SECRET_REF)) {
-            substitute_secret_refs(value, |name| {
-                names.push(name.to_string());
-                Ok(String::new())
-            })?;
-        }
-        let mut resolved = HashMap::new();
-        for name in names {
-            if resolved.contains_key(&name) {
-                continue;
-            }
-            let value = self.secrets()?.get(&name).await.map_err(internal)?;
-            resolved.insert(name, value);
-        }
-        for value in values {
+        for value in brokered_values(network) {
             if value.contains(SECRET_REF) {
-                *value = substitute_secret_refs(value, |name| {
-                    resolved.get(name).cloned().flatten().ok_or_else(|| {
-                        Status::failed_precondition(format!(
-                            "no secret {name:?}; store one with `burrow secret set`"
-                        ))
-                    })
+                substitute_secret_refs(value, |name| {
+                    names.push(name.to_string());
+                    Ok(String::new())
                 })?;
             }
         }
-        Ok(())
+        let mut stored = HashMap::new();
+        for name in names {
+            if stored.contains_key(&name) {
+                continue;
+            }
+            if let Some(secret) = self.secrets()?.get_scoped(&name).await.map_err(internal)? {
+                stored.insert(name, secret);
+            }
+        }
+        apply_secrets(network, subject, &stored)
     }
 
     /// The hypervisor `template` runs under, from the config a node holding it
@@ -509,11 +521,15 @@ impl ApiService {
     /// descriptors request, read through `client` on `node_id`; empty for any
     /// other template. An unbound service is left out: whether that refuses
     /// or skips is the descriptor's `optional` to say, and the node judges it.
+    ///
+    /// A secret scoped away from `subject` is treated as unbound, as though it
+    /// had not been stored: the descriptor's `optional` then decides.
     async fn kit_credentials(
         &self,
         client: &mut NodeClient,
         node_id: &str,
         template: &str,
+        subject: crate::secrets::Subject<'_>,
     ) -> Result<HashMap<String, String>, Status> {
         let mut out = HashMap::new();
         if !self.0.nodes.is_kit_template(node_id, template) {
@@ -530,8 +546,10 @@ impl ApiService {
             return Ok(out);
         };
         for service in burrow_kit::credential_services(&manifest.image_config) {
-            if let Some(value) = secrets.get(&service).await.map_err(internal)? {
-                out.insert(service, value);
+            if let Some(secret) = secrets.get_scoped(&service).await.map_err(internal)?
+                && secret.scope.admits(&subject)
+            {
+                out.insert(service, secret.value);
             }
         }
         Ok(out)
@@ -739,6 +757,7 @@ impl ApiService {
         id: &str,
         want: &crate::registry::Placement,
         is_inspected: bool,
+        inherits_policy: bool,
     ) -> Result<(common::Snapshot, String, NodeClient), Status> {
         let mut snapshot = self
             .snapshot(id)
@@ -756,6 +775,19 @@ impl ApiService {
         let node_id = match holder {
             Some(node_id) => {
                 self.require_labels(&node_id, &want.node_labels)?;
+                let missing = self
+                    .0
+                    .nodes
+                    .info(&node_id)
+                    .map(|info| crate::registry::missing_features(&info, &want.policy_features))
+                    .unwrap_or_default();
+                if !missing.is_empty() {
+                    return Err(Status::failed_precondition(format!(
+                        "node {node_id} holds snapshot {id} and does not enforce {}; upgrade \
+                         burrowd there",
+                        missing.join(", ")
+                    )));
+                }
                 node_id
             }
             None if snapshot.is_durable => {
@@ -770,6 +802,13 @@ impl ApiService {
                         scratch_disk_mib: snapshot.scratch_disk_mib,
                         ..Default::default()
                     })),
+                    // A sandbox taking the snapshot's own policy carries
+                    // fields the orchestrator never sees, so the node
+                    // restoring it elsewhere has to enforce all of them.
+                    policy_features: match inherits_policy {
+                        true => burrow_common::features::ALL.to_vec(),
+                        false => want.policy_features.clone(),
+                    },
                     ..want.clone()
                 };
                 let root = match is_inspected {
@@ -1001,6 +1040,10 @@ impl ApiService {
             self.require_restorer(node_id, &sandbox.id, &want)?;
             self.require_labels(node_id, &want.node_labels)?;
             self.require_inspection_root(node_id, &subject, &root)?;
+            self.require_policy_features(
+                node_id,
+                sandbox.policy.as_ref().and_then(|p| p.network.as_ref()),
+            )?;
             (node_id.to_string(), None)
         };
         let endpoint = self
@@ -1132,6 +1175,9 @@ impl ApiService {
             arch: sandbox.arch.clone(),
             firecracker_version: sandbox.firecracker_version.clone(),
             hypervisor: recorded_hypervisor(&sandbox.hypervisor),
+            policy_features: crate::registry::policy_features(
+                sandbox.policy.as_ref().and_then(|p| p.network.as_ref()),
+            ),
         }
     }
 
@@ -1262,9 +1308,6 @@ impl Burrow for ApiService {
         // that should be spent on a request the node will reject anyway.
         burrow_common::tags::validate(&req.metadata)?;
         burrow_common::tags::validate_labels(&req.node_labels)?;
-        if let Some(network) = req.policy.as_mut().and_then(|p| p.network.as_mut()) {
-            self.resolve_secret_refs(network).await?;
-        }
         // A name has to be settled before placement: refusing a duplicate
         // afterwards would mean charging a node for a sandbox that was never
         // going to be built.
@@ -1274,6 +1317,15 @@ impl Burrow for ApiService {
         // The orchestrator owns the id namespace outright: a caller names a
         // sandbox, and the server says what it is called.
         let sandbox_id = burrow_common::SandboxId::generate().to_string();
+        // After the id, which a secret's scope may name.
+        if let Some(network) = req.policy.as_mut().and_then(|p| p.network.as_mut()) {
+            let subject = crate::secrets::Subject {
+                id: &sandbox_id,
+                name: &req.name,
+                tags: &req.metadata,
+            };
+            self.resolve_secret_refs(network, subject).await?;
+        }
         // Held until the record is in the registry: an id and a name are both
         // claims on a namespace, and a create that is still building has to
         // hold them or a second create makes a duplicate.
@@ -1293,6 +1345,9 @@ impl Burrow for ApiService {
                 vcpus: 1,
                 mem_mib: 512,
                 node_labels: req.node_labels.clone(),
+                policy_features: crate::registry::policy_features(
+                    req.policy.as_ref().and_then(|p| p.network.as_ref()),
+                ),
                 ..Default::default()
             };
             let is_inspected = req
@@ -1301,7 +1356,12 @@ impl Burrow for ApiService {
                 .and_then(|p| p.network.as_ref())
                 .is_some_and(|n| n.is_tls_inspected);
             let (snapshot, node_id, mut client) = self
-                .node_for_snapshot(&req.snapshot, &placement, is_inspected)
+                .node_for_snapshot(
+                    &req.snapshot,
+                    &placement,
+                    is_inspected,
+                    req.policy.is_none(),
+                )
                 .await?;
             let mounts = req
                 .policy
@@ -1395,6 +1455,9 @@ impl Burrow for ApiService {
             firecracker_version: String::new(),
             // The template decides, and the node holding it can say which.
             hypervisor: self.template_hypervisor(&template).await?,
+            policy_features: crate::registry::policy_features(
+                req.policy.as_ref().and_then(|p| p.network.as_ref()),
+            ),
         };
         // A mounted volume fixes the node, so placement is not a choice: it is
         // a check that the node holding the volumes can take the sandbox.
@@ -1415,6 +1478,10 @@ impl Burrow for ApiService {
             Some(node_id) => {
                 charged = false;
                 self.require_labels(&node_id, &want.node_labels)?;
+                self.require_policy_features(
+                    &node_id,
+                    req.policy.as_ref().and_then(|p| p.network.as_ref()),
+                )?;
                 if !want.hypervisor.is_empty()
                     && !self
                         .0
@@ -1455,7 +1522,8 @@ impl Burrow for ApiService {
                         }
                         crate::registry::PlacementError::PeersUnreachable(_)
                         | crate::registry::PlacementError::NoNodeWithLabels(_)
-                        | crate::registry::PlacementError::NoNodeWithHypervisor(_) => {
+                        | crate::registry::PlacementError::NoNodeWithHypervisor(_)
+                        | crate::registry::PlacementError::NoNodeWithPolicyFeatures(_) => {
                             Status::failed_precondition(err.to_string())
                         }
                         other => Status::not_found(other.to_string()),
@@ -1479,8 +1547,13 @@ impl Burrow for ApiService {
         let mut client = connect_node(endpoint, self.0.node_token.as_deref())
             .await
             .map_err(|err| Status::unavailable(format!("cannot reach node {node_id}: {err}")))?;
+        let subject = crate::secrets::Subject {
+            id: &sandbox_id,
+            name: &req.name,
+            tags: &req.metadata,
+        };
         let credentials = self
-            .kit_credentials(&mut client, &node_id, &template)
+            .kit_credentials(&mut client, &node_id, &template, subject)
             .await?;
 
         let sandbox = client
@@ -1528,6 +1601,7 @@ impl Burrow for ApiService {
         // The registry holds the last state the node reported, which is a stale
         // guess once that node stops heartbeating.
         sandbox.is_unreachable = !sandbox.node_id.is_empty() && self.is_node_dead(&sandbox.node_id);
+        mark_expired_rules(&mut sandbox);
         Ok(Response::new(sandbox))
     }
 
@@ -1559,6 +1633,7 @@ impl Burrow for ApiService {
         for sandbox in &mut sandboxes {
             sandbox.is_unreachable =
                 !sandbox.node_id.is_empty() && !healthy.contains(&sandbox.node_id);
+            mark_expired_rules(sandbox);
         }
         Ok(Response::new(api::ListSandboxesResponse { sandboxes }))
     }
@@ -1711,7 +1786,14 @@ impl Burrow for ApiService {
         } else {
             &req.template
         };
-        let credentials = self.kit_credentials(&mut client, &node_id, judged).await?;
+        let subject = crate::secrets::Subject {
+            id: &id,
+            name: &current.name,
+            tags: &current.metadata,
+        };
+        let credentials = self
+            .kit_credentials(&mut client, &node_id, judged, subject)
+            .await?;
         let sandbox = client
             .recreate_sandbox(nodepb::NodeRecreateRequest {
                 sandbox_id: id,
@@ -1734,8 +1816,9 @@ impl Burrow for ApiService {
         if req.value.is_empty() {
             return Err(Status::invalid_argument("a secret needs a value"));
         }
+        let scope = validate_secret_scope(req.allowed_sandboxes, req.allowed_tags)?;
         self.secrets()?
-            .set(&req.name, &req.value)
+            .set_scoped(&req.name, &req.value, &scope)
             .await
             .map_err(internal)?;
         Ok(Response::new(api::SetSecretResponse {}))
@@ -1745,8 +1828,18 @@ impl Burrow for ApiService {
         &self,
         _req: Request<api::ListSecretsRequest>,
     ) -> Result<Response<api::ListSecretsResponse>, Status> {
-        let names = self.secrets()?.list().await.map_err(internal)?;
-        Ok(Response::new(api::ListSecretsResponse { names }))
+        let scoped = self.secrets()?.list_scoped().await.map_err(internal)?;
+        Ok(Response::new(api::ListSecretsResponse {
+            names: scoped.iter().map(|(name, _)| name.clone()).collect(),
+            secrets: scoped
+                .into_iter()
+                .map(|(name, scope)| api::SecretInfo {
+                    name,
+                    allowed_sandboxes: scope.sandboxes,
+                    allowed_tags: scope.tags,
+                })
+                .collect(),
+        }))
     }
 
     async fn delete_secret(
@@ -1824,9 +1917,6 @@ impl Burrow for ApiService {
         req: Request<api::ForkSandboxRequest>,
     ) -> Result<Response<common::Sandbox>, Status> {
         let mut req = req.into_inner();
-        if let Some(network) = req.policy.as_mut().and_then(|p| p.network.as_mut()) {
-            self.resolve_secret_refs(network).await?;
-        }
         let source_id = self
             .resolve(
                 &req.r#ref
@@ -1846,6 +1936,22 @@ impl Burrow for ApiService {
             validate_sandbox_id(&req.sandbox_id)?;
             req.sandbox_id
         };
+        // Resolved for the child, which carries its source's tags: a scope
+        // naming the source does not reach a fork of it.
+        if let Some(network) = req.policy.as_mut().and_then(|p| p.network.as_mut()) {
+            let tags = self
+                .0
+                .sandboxes
+                .get(&source_id)
+                .map(|source| source.metadata)
+                .unwrap_or_default();
+            let subject = crate::secrets::Subject {
+                id: &child_id,
+                name: &req.name,
+                tags: &tags,
+            };
+            self.resolve_secret_refs(network, subject).await?;
+        }
         // Held until the child is in the registry, so two forks naming the
         // same child cannot both be built.
         let _reserved = self
@@ -1855,6 +1961,10 @@ impl Burrow for ApiService {
             .await
             .map_err(Status::already_exists)?;
 
+        self.require_policy_features(
+            &node_id,
+            req.policy.as_ref().and_then(|p| p.network.as_ref()),
+        )?;
         let mut client = self.node_for(&source_id).await?;
         let sandbox = client
             .fork_sandbox(nodepb::NodeForkRequest {
@@ -2155,6 +2265,7 @@ impl Burrow for ApiService {
             arch: String::new(),
             firecracker_version: String::new(),
             hypervisor: String::new(),
+            policy_features: Vec::new(),
         };
         let node_id = self.place(&want).await.map_err(|err| match err {
             crate::registry::PlacementError::NoHealthyNode
@@ -2309,7 +2420,14 @@ impl Burrow for ApiService {
         let mut network = req
             .network
             .ok_or_else(|| Status::invalid_argument("network is required"))?;
-        self.resolve_secret_refs(&mut network).await?;
+        let current = self.0.sandboxes.get(&id).unwrap_or_default();
+        let subject = crate::secrets::Subject {
+            id: &id,
+            name: &current.name,
+            tags: &current.metadata,
+        };
+        self.resolve_secret_refs(&mut network, subject).await?;
+        self.require_policy_features(&current.node_id, Some(&network))?;
         let mut client = self.node_for(&id).await?;
         let sandbox = client
             .update_network_policy(nodepb::NodeUpdateNetworkRequest {
@@ -3098,6 +3216,7 @@ pub(crate) fn placement_status(err: crate::registry::PlacementError) -> Status {
         crate::registry::PlacementError::PeersUnreachable(_)
         | crate::registry::PlacementError::NoNodeWithLabels(_)
         | crate::registry::PlacementError::NoNodeWithHypervisor(_)
+        | crate::registry::PlacementError::NoNodeWithPolicyFeatures(_)
         | crate::registry::PlacementError::NoCompatibleNode { .. } => {
             Status::failed_precondition(err.to_string())
         }
@@ -3144,6 +3263,79 @@ fn validate_sandbox_id(id: &str) -> Result<(), Status> {
 }
 
 const SECRET_REF: &str = "${secret:";
+
+/// Every brokered value in a policy: header values and forward secrets.
+fn brokered_values(network: &mut common::NetworkPolicy) -> Vec<&mut String> {
+    network.rules.iter_mut().flat_map(rule_values).collect()
+}
+
+/// One rule's brokered values.
+fn rule_values(rule: &mut common::RequestRule) -> Vec<&mut String> {
+    match rule.action.as_mut() {
+        Some(common::request_rule::Action::SetHeaders(set)) => {
+            set.headers.iter_mut().map(|h| &mut h.value).collect()
+        }
+        Some(common::request_rule::Action::Forward(forward)) => vec![&mut forward.secret],
+        None => Vec::new(),
+    }
+}
+
+/// Substitutes the `stored` secrets into `network` for `subject`.
+///
+/// A reference to a secret that is not stored, or one scoped away from
+/// `subject`, refuses the whole policy rather than sending the literal text
+/// or a partial grant. A rule that took any value from a scoped secret is
+/// bound to `subject`.
+fn apply_secrets(
+    network: &mut common::NetworkPolicy,
+    subject: crate::secrets::Subject<'_>,
+    stored: &HashMap<String, crate::secrets::Secret>,
+) -> Result<(), Status> {
+    for rule in &mut network.rules {
+        let mut is_scoped = false;
+        for value in rule_values(rule) {
+            if !value.contains(SECRET_REF) {
+                continue;
+            }
+            *value = substitute_secret_refs(value, |name| {
+                let secret = stored.get(name).ok_or_else(|| {
+                    Status::failed_precondition(format!(
+                        "no secret {name:?}; store one with `burrow secret set`"
+                    ))
+                })?;
+                if !secret.scope.admits(&subject) {
+                    return Err(Status::permission_denied(format!(
+                        "secret {name:?} is not scoped to sandbox {}",
+                        subject.id
+                    )));
+                }
+                is_scoped |= !secret.scope.is_unscoped();
+                Ok(secret.value.clone())
+            })?;
+        }
+        if is_scoped {
+            rule.bound_sandbox_id = subject.id.to_string();
+        }
+    }
+    Ok(())
+}
+
+/// Marks the rules past their expiry now. The registry holds the policy as
+/// the node last returned it, so a rule that expired since then would read
+/// as live.
+fn mark_expired_rules(sandbox: &mut common::Sandbox) {
+    let now_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_millis() as u64);
+    let rules = sandbox
+        .policy
+        .iter_mut()
+        .flat_map(|p| p.network.iter_mut())
+        .flat_map(|n| n.rules.iter_mut());
+    for rule in rules {
+        rule.is_expired = rule.expires_at_unix_ms != 0 && rule.expires_at_unix_ms <= now_ms;
+    }
+}
 
 fn internal(err: anyhow::Error) -> Status {
     Status::internal(format!("{err:#}"))
@@ -3195,6 +3387,49 @@ fn is_kebab(name: &str, max: usize) -> bool {
             .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-')
         && !name.starts_with('-')
         && !name.ends_with('-')
+}
+
+/// Checks a secret's scope and puts it in canonical order.
+///
+/// Sandbox entries are ids or names, so they are held to what either may be;
+/// tags are `key=value` with a key, since a bare key would read as a grant to
+/// every value of it.
+fn validate_secret_scope(
+    sandboxes: Vec<String>,
+    tags: Vec<String>,
+) -> Result<crate::secrets::Scope, Status> {
+    let max = crate::secrets::MAX_SCOPE_ENTRIES;
+    if sandboxes.len() > max || tags.len() > max {
+        return Err(Status::invalid_argument(format!(
+            "a secret's scope names at most {max} sandboxes and {max} tags"
+        )));
+    }
+    for entry in &sandboxes {
+        if entry.is_empty() {
+            return Err(Status::invalid_argument(
+                "an allowed_sandboxes entry may not be empty",
+            ));
+        }
+        validate_sandbox_id(entry).map_err(|_| {
+            Status::invalid_argument(format!(
+                "allowed_sandboxes entry {entry:?} is not a sandbox id or name"
+            ))
+        })?;
+    }
+    for entry in &tags {
+        let usable = entry.split_once('=').is_some_and(|(key, value)| {
+            !key.is_empty()
+                && entry.len() <= 512
+                && !entry.bytes().any(|b| b.is_ascii_control())
+                && !value.is_empty()
+        });
+        if !usable {
+            return Err(Status::invalid_argument(format!(
+                "allowed_tags entry {entry:?} is not key=value"
+            )));
+        }
+    }
+    Ok(crate::secrets::Scope::new(sandboxes, tags))
 }
 
 fn validate_secret_name(name: &str) -> Result<(), Status> {
@@ -3529,6 +3764,149 @@ mod tests {
         assert!(substitute_secret_refs("${secret:missing}", lookup).is_err());
         assert!(substitute_secret_refs("${secret:github", lookup).is_err());
         assert!(substitute_secret_refs("${secret:Bad Name}", lookup).is_err());
+    }
+
+    fn brokering(domain: &str, value: &str) -> common::RequestRule {
+        common::RequestRule {
+            domain: domain.into(),
+            action: Some(common::request_rule::Action::SetHeaders(
+                common::SetHeaders {
+                    headers: vec![common::HeaderValue {
+                        name: "Authorization".into(),
+                        value: value.into(),
+                    }],
+                },
+            )),
+            ..Default::default()
+        }
+    }
+
+    fn header_value(rule: &common::RequestRule) -> &str {
+        match rule.action.as_ref() {
+            Some(common::request_rule::Action::SetHeaders(set)) => &set.headers[0].value,
+            _ => panic!("set_headers expected"),
+        }
+    }
+
+    /// A scoped secret resolves only for the sandboxes its scope names, and
+    /// the rule it went into is bound to the one it was resolved for. An
+    /// unscoped one behaves as secrets always have.
+    #[test]
+    fn a_scoped_secret_resolves_only_where_it_is_scoped_and_binds_its_rule() {
+        use crate::secrets::{Scope, Secret, Subject};
+        let stored: HashMap<String, Secret> = [
+            (
+                "api".to_string(),
+                Secret {
+                    value: "scoped-token".into(),
+                    scope: Scope::new(vec!["sbx_a".into()], vec!["team=ml".into()]),
+                },
+            ),
+            (
+                "shared".to_string(),
+                Secret {
+                    value: "shared-token".into(),
+                    scope: Scope::default(),
+                },
+            ),
+        ]
+        .into();
+        let none = HashMap::new();
+        let policy = || common::NetworkPolicy {
+            rules: vec![
+                brokering("api.example.com", "Bearer ${secret:api}"),
+                brokering("other.example.com", "Bearer ${secret:shared}"),
+            ],
+            ..Default::default()
+        };
+
+        let mut granted = policy();
+        let subject = Subject {
+            id: "sbx_a",
+            name: "",
+            tags: &none,
+        };
+        apply_secrets(&mut granted, subject, &stored).unwrap();
+        assert_eq!(header_value(&granted.rules[0]), "Bearer scoped-token");
+        assert_eq!(granted.rules[0].bound_sandbox_id, "sbx_a");
+        assert_eq!(header_value(&granted.rules[1]), "Bearer shared-token");
+        assert!(granted.rules[1].bound_sandbox_id.is_empty());
+
+        let ml = [("team".to_string(), "ml".to_string())].into();
+        let mut tagged = policy();
+        let by_tag = Subject {
+            id: "sbx_b",
+            name: "",
+            tags: &ml,
+        };
+        apply_secrets(&mut tagged, by_tag, &stored).unwrap();
+        assert_eq!(tagged.rules[0].bound_sandbox_id, "sbx_b");
+
+        let mut refused = policy();
+        let outsider = Subject {
+            id: "sbx_c",
+            name: "",
+            tags: &none,
+        };
+        let err = apply_secrets(&mut refused, outsider, &stored).unwrap_err();
+        assert_eq!(err.code(), tonic::Code::PermissionDenied);
+        // Refused whole: nothing of the scoped value reached the policy.
+        assert!(!format!("{refused:?}").contains("scoped-token"));
+
+        let mut missing = common::NetworkPolicy {
+            rules: vec![brokering("api.example.com", "${secret:gone}")],
+            ..Default::default()
+        };
+        assert_eq!(
+            apply_secrets(&mut missing, subject, &stored)
+                .unwrap_err()
+                .code(),
+            tonic::Code::FailedPrecondition
+        );
+    }
+
+    #[test]
+    fn a_rule_past_its_expiry_reads_as_expired() {
+        let rule = |expires_at_unix_ms| common::RequestRule {
+            expires_at_unix_ms,
+            ..brokering("api.example.com", "Bearer t")
+        };
+        let mut sandbox = common::Sandbox {
+            policy: Some(common::Policy {
+                network: Some(common::NetworkPolicy {
+                    rules: vec![rule(1), rule(u64::MAX), rule(0)],
+                    ..Default::default()
+                }),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        mark_expired_rules(&mut sandbox);
+        let rules = &sandbox.policy.unwrap().network.unwrap().rules;
+        let expired: Vec<bool> = rules.iter().map(|r| r.is_expired).collect();
+        assert_eq!(expired, vec![true, false, false]);
+    }
+
+    #[test]
+    fn a_secret_scope_is_held_to_ids_names_and_key_value_tags() {
+        let scope = validate_secret_scope(
+            vec!["builder".into(), "sbx_a".into(), "builder".into()],
+            vec!["team=ml".into()],
+        )
+        .unwrap();
+        assert_eq!(scope.sandboxes, vec!["builder", "sbx_a"]);
+        for bad in ["", "has space", ".hidden"] {
+            assert!(
+                validate_secret_scope(vec![bad.into()], vec![]).is_err(),
+                "{bad:?}"
+            );
+        }
+        for bad in ["team", "=ml", "team=", "a=b\n"] {
+            assert!(
+                validate_secret_scope(vec![], vec![bad.into()]).is_err(),
+                "{bad:?}"
+            );
+        }
     }
 
     #[test]

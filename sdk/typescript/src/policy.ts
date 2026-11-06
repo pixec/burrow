@@ -43,7 +43,15 @@ export function resolveNetwork(network: NetworkInput | undefined): NetworkPolicy
 }
 
 /** Everything burrow understands on a rule. */
-const RULE_KEYS = new Set(["domain", "match", "setHeaders", "forward"]);
+const RULE_KEYS = new Set([
+  "domain",
+  "match",
+  "setHeaders",
+  "forward",
+  "expiresAtUnixMs",
+  "expired",
+  "boundSandboxId",
+]);
 
 /** Every dimension a matcher may name. */
 const MATCH_KEYS = new Set(["path", "method", "queryString", "headers"]);
@@ -146,10 +154,20 @@ function toRequestRule(rule: RequestRule): any {
       "invalid_argument",
     );
   }
+  const expiresAt = rule.expiresAtUnixMs ?? 0;
+  if (!Number.isSafeInteger(expiresAt) || expiresAt < 0) {
+    throw new BurrowError(
+      `${where}: expiresAtUnixMs is unix milliseconds, or 0 for never`,
+      "invalid_argument",
+    );
+  }
   const wire: any = {
     domain: rule.domain,
     match: toRequestMatch(where, rule.match),
   };
+  // Left off when unset, which the wire reads as never and unbound.
+  if (expiresAt) wire.expiresAtUnixMs = expiresAt;
+  if (rule.boundSandboxId) wire.boundSandboxId = rule.boundSandboxId;
   if (rule.forward) {
     checkForwardURL(where, rule.forward.url);
     wire.forward = {
@@ -211,6 +229,12 @@ function fromRequestRule(raw: any): RequestRule {
   const rule: RequestRule = { domain: raw?.domain ?? "" };
   const match = fromRequestMatch(raw?.match);
   if (match) rule.match = match;
+  const expiresAt = Number(raw?.expiresAtUnixMs ?? 0);
+  if (expiresAt) {
+    rule.expiresAtUnixMs = expiresAt;
+    rule.expired = Boolean(raw?.isExpired);
+  }
+  if (raw?.boundSandboxId) rule.boundSandboxId = raw.boundSandboxId;
   if (raw?.forward) {
     rule.forward = {
       url: raw.forward.url ?? "",
@@ -331,10 +355,10 @@ export function toNetworkPolicy(options: NetworkPolicyOptions = {}): any {
       }),
     ),
   ];
-  // Rules apply only to requests the proxy inspects, and it inspects only
-  // traffic to allowed domains: with none, every rule would be dropped
-  // without a word.
-  if (rules.length > 0 && !options.allowDomains?.length) {
+  // Rules apply only to requests the proxy inspects. In allowlist mode it
+  // inspects only traffic to allowed domains: with none, every rule would be
+  // dropped without a word. Open mode inspects the hosts the rules name.
+  if (rules.length > 0 && mode !== "open" && !options.allowDomains?.length) {
     throw new BurrowError(
       "networkPolicy: rules apply only to inspected requests, so their domains have to be in allowDomains",
       "invalid_argument",

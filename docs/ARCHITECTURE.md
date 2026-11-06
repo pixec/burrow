@@ -662,7 +662,7 @@ anyway.
 | --- | --- |
 | `none` (default) | No egress. Public names are refused by the resolver and each query is audited, so an attempt is visible; `.internal` names still resolve. |
 | `allowlist` | Web traffic is redirected to the proxy, which reads the TLS SNI or HTTP `Host` header and permits only the named domains. |
-| `open` | NAT'd egress to anywhere. |
+| `open` | NAT'd egress to anywhere. With `is_tls_inspected`, HTTPS to addresses the resolver gave for a host a request rule names is redirected to the proxy through the `inspected` set in `burrow_nat` (sandbox . address pairs with timeouts, added by the resolver before it answers); see [FIREWALL.md](FIREWALL.md#selective-inspection-in-open-mode). |
 
 By default the proxy never terminates TLS: Burrow sees hostnames, never
 payloads. That keeps sandbox traffic private and avoids distributing a CA into

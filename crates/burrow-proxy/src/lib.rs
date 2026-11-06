@@ -206,21 +206,13 @@ impl Proxy {
         self.relay(client, peer, original, &head).await
     }
 
-    async fn relay<C>(
-        &self,
-        mut client: C,
-        peer: SocketAddr,
-        original: SocketAddr,
-        head: &[u8],
-    ) -> std::io::Result<()>
-    where
-        C: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
-    {
-        // Both families reach here now. A source is looked up as itself, and
-        // an IPv4-mapped one as the v4 address it is, so a sandbox is the same
-        // sandbox whichever shape its address arrives in.
-        let source_ip = policy::unmap(peer.ip());
-
+    /// Decides one connection from `source_ip` to `original`, whose first
+    /// bytes are `head`, before anything is dialled.
+    ///
+    /// Everything the proxy knows before the upstream connection exists is
+    /// decided here: who the sandbox is, which host the connection names,
+    /// whether it may go there at all, and whether its TLS is terminated.
+    fn admit(&self, source_ip: std::net::IpAddr, original: SocketAddr, head: &[u8]) -> Admission {
         // ECH hides the real destination behind a cover name. Reading that
         // cover name and checking it against the allowlist is worse than
         // reading nothing, so it is tracked separately and refused below.
@@ -269,8 +261,19 @@ impl Proxy {
         // The outer name is checked and the address pinned, but neither sees
         // the host named *inside* the session. A sandbox that asked for
         // inspection has its TLS terminated here so that host is checked too.
-        let inspecting =
-            original.port() == 443 && policy.is_tls_inspected && self.authority.is_some();
+        //
+        // In open mode only the hosts its live rules name are inspected. The
+        // node redirects nothing else here, but an address can serve more than
+        // one name, and a rule can expire or be removed between the lookup
+        // that set up the redirect and this connection: either way the
+        // connection is open mode's ordinary egress, relayed without being
+        // terminated.
+        let is_open = policy.mode == NetworkMode::Open;
+        let inspecting = original.port() == 443
+            && self.authority.is_some()
+            && host
+                .as_deref()
+                .is_some_and(|host| policy.is_inspected(host));
         // A bounded host is reachable only for the requests its rules admit,
         // and a connection nothing here will read carries requests nothing
         // here can judge. Refused rather than passed through blind.
@@ -282,13 +285,19 @@ impl Proxy {
         {
             decision = Decision::Deny("bounded host requires inspection");
         }
-        let sandbox_id = policy.sandbox_id.clone();
 
         // A hostname is what the client says; the address is where it is
         // actually going. Allowing on the former while connecting to the
         // latter is what turns a domain allowlist into no restriction at all.
+        //
+        // Open mode pins only the sessions it inspects, which carry a
+        // credential: those must go to an address the resolver gave this
+        // sandbox for that name. A connection it merely relays is held to the
+        // denials open mode always has and nothing more, as it would have been
+        // had it never been redirected.
         if decision.is_allowed()
             && let Some(host) = host.as_deref()
+            && (!is_open || inspecting)
         {
             let destination = policy::unmap(original.ip());
             // Deny beats every allowance, and it is checked against the address
@@ -301,11 +310,53 @@ impl Proxy {
                 decision = Decision::Deny("destination is an internal or metadata address");
             } else if !self
                 .resolutions
-                .is_pinned(sandbox_id.as_str(), host, destination)
+                .is_pinned(policy.sandbox_id.as_str(), host, destination)
             {
                 decision = Decision::Deny("destination address is not pinned to this name");
             }
         }
+        if decision.is_allowed() && is_open && !inspecting {
+            let destination = policy::unmap(original.ip());
+            if policy.is_denied(destination) {
+                decision = Decision::Deny("destination is in a denied range");
+            } else if resolutions::is_forbidden_destination(destination) {
+                decision = Decision::Deny("destination is an internal or metadata address");
+            }
+        }
+
+        Admission {
+            policy,
+            decision,
+            host,
+            offered,
+            inspecting,
+            is_open,
+        }
+    }
+
+    async fn relay<C>(
+        &self,
+        mut client: C,
+        peer: SocketAddr,
+        original: SocketAddr,
+        head: &[u8],
+    ) -> std::io::Result<()>
+    where
+        C: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
+    {
+        // Both families reach here now. A source is looked up as itself, and
+        // an IPv4-mapped one as the v4 address it is, so a sandbox is the same
+        // sandbox whichever shape its address arrives in.
+        let source_ip = policy::unmap(peer.ip());
+        let Admission {
+            policy,
+            decision,
+            host,
+            offered,
+            inspecting,
+            is_open,
+        } = self.admit(source_ip, original, head);
+        let sandbox_id = policy.sandbox_id.clone();
 
         if !decision.is_allowed() {
             self.audit.record(EgressEvent {
@@ -439,7 +490,7 @@ impl Proxy {
                     host.as_deref(),
                     &policy,
                     false,
-                    &[],
+                    false,
                 )
                 .await;
             self.audit.record(EgressEvent {
@@ -470,7 +521,11 @@ impl Proxy {
             host,
             port: original.port(),
             is_allowed: true,
-            reason: "allowed".into(),
+            reason: if is_open {
+                "allowed (not inspected: no live rule names this host)".into()
+            } else {
+                "allowed".into()
+            },
             bytes_sent: sent,
             bytes_received: received,
             dropped_records: 0,
@@ -491,9 +546,11 @@ impl Proxy {
     /// connection was opened for, which is what an inspected TLS session
     /// needs: two allowed names behind one address are still two names.
     ///
-    /// `rules` say what happens to a request that passed those checks. They are
-    /// applied afterwards, so a rule can only change what a permitted request
-    /// carries; it can never widen what is permitted.
+    /// `is_ruled` applies the policy's rules to a request that passed those
+    /// checks. They are applied afterwards, so a rule can only change what a
+    /// permitted request carries; it can never widen what is permitted. They
+    /// are read afresh for every request, so a rule removed or expired while
+    /// the connection is open stops applying at the next request on it.
     ///
     /// Only rules that leave the request pointed at the origin are relayable
     /// here. A session where any rule could divert one is served by
@@ -507,7 +564,7 @@ impl Proxy {
         opened_for: Option<&str>,
         policy: &policy::SandboxPolicy,
         require_match: bool,
-        rules: &[policy::Rule],
+        is_ruled: bool,
     ) -> Relayed
     where
         C: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
@@ -526,6 +583,14 @@ impl Proxy {
         let mut sent = 0u64;
         let mut received = 0u64;
         let mut refusal: Option<String> = None;
+        let applied = std::sync::Mutex::new(Applied::default());
+        let rules_now = || {
+            if is_ruled {
+                policy.current_rules()
+            } else {
+                Arc::new(Vec::new())
+            }
+        };
 
         // The first request is handled before anything copies the response
         // direction. An upgrade is only real once the server answers `101`, and
@@ -536,7 +601,7 @@ impl Proxy {
                 return Ok(First::Closed);
             };
             let parsed = check_request(&head, policy, opened_for, require_match)?;
-            let head = apply_rules(head, &parsed, rules)?;
+            let head = apply_rules(head, &parsed, &rules_now(), &applied)?;
             upstream_write
                 .write_all(&head)
                 .await
@@ -615,7 +680,7 @@ impl Proxy {
                                 "an upgrade after the first request is not relayed".to_string()
                             );
                         }
-                        let head = match apply_rules(head, &parsed, rules) {
+                        let head = match apply_rules(head, &parsed, &rules_now(), &applied) {
                             Ok(head) => head,
                             Err(reason) => break Err(reason),
                         };
@@ -664,7 +729,7 @@ impl Proxy {
             sent,
             received,
             refusal,
-            note: None,
+            note: applied.into_inner().unwrap().note(),
         }
     }
 
@@ -689,8 +754,9 @@ impl Proxy {
         } = session;
         // Rules go only down the inspected path: acting on a request means
         // reading it, and outside an inspected session there is no request to
-        // read.
-        let rules = policy.rules.as_slice();
+        // read. Read here only to choose the relay; each request reads them
+        // again.
+        let rules = policy.current_rules();
         let authority = self
             .authority
             .as_ref()
@@ -765,7 +831,7 @@ impl Proxy {
                 .relay_diverted(&mut inner, &mut outer, sni, policy, sandbox_id)
                 .await),
             inspect::Protocol::Http11 => Ok(self
-                .relay_http(&mut inner, &mut outer, Some(sni), policy, true, rules)
+                .relay_http(&mut inner, &mut outer, Some(sni), policy, true, true)
                 .await),
             inspect::Protocol::H2 => {
                 http2::relay(inner, outer, sni, policy, sandbox_id, audit_stream).await
@@ -794,7 +860,8 @@ impl Proxy {
     {
         use tokio::io::AsyncWriteExt;
 
-        let rules = policy.rules.as_slice();
+        let rules = policy.current_rules();
+        let applied = std::sync::Mutex::new(Applied::default());
 
         let (client_read, mut client_write) = tokio::io::split(client);
         let (upstream_read, mut upstream_write) = tokio::io::split(upstream);
@@ -819,7 +886,7 @@ impl Proxy {
             let host = parsed.host.clone().unwrap_or_default();
             let facts = parsed.facts();
 
-            match select_rule(rules, &host, &facts) {
+            match select_rule(&rules, &host, &facts) {
                 Some(policy::Action::Refuse(reason)) => return Err(reason.clone()),
                 Some(policy::Action::Forward(forward)) => {
                     let body = client_read
@@ -850,7 +917,7 @@ impl Proxy {
 
             // Not diverted, so it goes to the origin, with the connection
             // closed after it so the blind copy of the response can end.
-            let head = apply_rules(head, &parsed, rules)?;
+            let head = apply_rules(head, &parsed, &rules, &applied)?;
             let head =
                 http::inject_headers(&head, &[("Connection", "close")]).map_err(str::to_string)?;
             upstream_write
@@ -878,7 +945,7 @@ impl Proxy {
             sent,
             received,
             refusal: outcome.err(),
-            note,
+            note: note.or_else(|| applied.into_inner().unwrap().note()),
         }
     }
 }
@@ -969,6 +1036,21 @@ struct Inspection<'a> {
     audit_stream: Arc<dyn Fn(http2::StreamOutcome) + Send + Sync>,
 }
 
+/// What [`Proxy::admit`] decided about a connection.
+struct Admission {
+    policy: policy::SandboxPolicy,
+    decision: Decision,
+    /// The name the connection carries: the SNI on 443, `Host` on 80.
+    host: Option<String>,
+    /// The ALPN list the sandbox put in its ClientHello.
+    offered: Vec<String>,
+    /// Whether its TLS is terminated and its requests read.
+    inspecting: bool,
+    /// Whether the sandbox is in open mode, where a connection the proxy does
+    /// not inspect is relayed as plain egress.
+    is_open: bool,
+}
+
 /// What a relayed connection moved, and why it stopped if it was refused.
 ///
 /// Byte counts are reported whether or not the connection ended in a refusal:
@@ -1046,6 +1128,7 @@ fn apply_rules(
     head: Vec<u8>,
     parsed: &http::RequestHead,
     rules: &[policy::Rule],
+    applied: &std::sync::Mutex<Applied>,
 ) -> Result<Vec<u8>, String> {
     // The target's authority was checked against Host in `check_request`, but
     // an upstream that honours absolute-form still routes on it, not on
@@ -1061,7 +1144,9 @@ fn apply_rules(
     }
     let host = parsed.host.as_deref().unwrap_or_default();
     let facts = parsed.facts();
-    match select_rule(rules, host, &facts) {
+    let selected = select_rule_at(rules, host, &facts, policy::now_unix_ms());
+    applied.lock().unwrap().request(selected);
+    match selected.map(|(_, rule)| &rule.action) {
         // Matching nothing is not a refusal. The request goes as it was
         // written (origin-form normalization above aside), which is the
         // whole difference between a matcher and a filter.
@@ -1091,16 +1176,75 @@ pub(crate) fn select_rule<'a>(
     host: &str,
     facts: &policy::Request<'_>,
 ) -> Option<&'a policy::Action> {
-    rules
-        .iter()
-        .find(|rule| {
-            burrow_common::glob::is_host_match(&rule.domain, host)
-                && rule
-                    .matcher
-                    .as_ref()
-                    .is_none_or(|matcher| matcher.is_match(facts))
-        })
-        .map(|rule| &rule.action)
+    select_rule_at(rules, host, facts, policy::now_unix_ms()).map(|(_, rule)| &rule.action)
+}
+
+/// The rule that claims one request at `now_ms`, with its position in the
+/// policy. An expired rule claims nothing, so the next one that matches does.
+pub(crate) fn select_rule_at<'a>(
+    rules: &'a [policy::Rule],
+    host: &str,
+    facts: &policy::Request<'_>,
+    now_ms: u64,
+) -> Option<(usize, &'a policy::Rule)> {
+    rules.iter().enumerate().find(|(_, rule)| {
+        rule.is_live_at(now_ms)
+            && burrow_common::glob::is_host_match(&rule.domain, host)
+            && rule
+                .matcher
+                .as_ref()
+                .is_none_or(|matcher| matcher.is_match(facts))
+    })
+}
+
+/// Which rules set headers on how many of a connection's requests, for its
+/// audit record. A brokered credential is the one thing the proxy adds to
+/// traffic, so where it went has to be visible afterwards.
+#[derive(Default)]
+struct Applied {
+    requests: u64,
+    /// Rule position, its domain, and how many requests it set headers on.
+    by_rule: Vec<(usize, String, u64)>,
+}
+
+impl Applied {
+    fn request(&mut self, selected: Option<(usize, &policy::Rule)>) {
+        self.requests += 1;
+        let Some((index, rule)) = selected else {
+            return;
+        };
+        if !matches!(rule.action, policy::Action::SetHeaders(_)) {
+            return;
+        }
+        match self.by_rule.iter_mut().find(|(at, _, _)| *at == index) {
+            Some((_, _, count)) => *count += 1,
+            None => self.by_rule.push((index, rule.domain.clone(), 1)),
+        }
+    }
+
+    fn note(&self) -> Option<String> {
+        if self.by_rule.is_empty() {
+            return None;
+        }
+        let rules: Vec<String> = self
+            .by_rule
+            .iter()
+            .map(|(index, domain, count)| format!("rule {index} ({domain}) on {count}"))
+            .collect();
+        Some(format!(
+            "allowed (inspected); headers set by {} of {} requests",
+            rules.join(", "),
+            self.requests
+        ))
+    }
+}
+
+/// The audit note for one HTTP/2 stream a rule set headers on.
+pub(crate) fn applied_note(index: usize, rule: &policy::Rule) -> String {
+    format!(
+        "allowed (inspected); headers set by rule {index} ({})",
+        rule.domain
+    )
 }
 
 /// Peeks until there is enough to classify the connection, or [`PEEK_TIMEOUT`]
@@ -1366,7 +1510,10 @@ mod tests {
         sandbox.shutdown().await.unwrap();
 
         let mut client = client;
-        let allowed = policy::SandboxPolicy::allowing(&["api.example.com", "other.example"]);
+        let allowed = policy::SandboxPolicy {
+            rules: Arc::new(rules),
+            ..policy::SandboxPolicy::allowing(&["api.example.com", "other.example"])
+        };
         let relay = tokio::spawn(async move {
             let proxy = proxy();
             proxy
@@ -1376,7 +1523,7 @@ mod tests {
                     Some("api.example.com"),
                     &allowed,
                     false,
-                    &rules,
+                    true,
                 )
                 .await
         });
@@ -1392,6 +1539,7 @@ mod tests {
     fn rule(domain: &str, name: &str, value: &str) -> policy::Rule {
         policy::Rule {
             domain: domain.into(),
+            expires_at_unix_ms: 0,
             matcher: None,
             action: policy::Action::SetHeaders(vec![(name.to_string(), value.to_string())]),
         }
@@ -1406,6 +1554,7 @@ mod tests {
     ) -> policy::Rule {
         policy::Rule {
             domain: domain.into(),
+            expires_at_unix_ms: 0,
             matcher: Some(matcher),
             action: policy::Action::SetHeaders(vec![(name.to_string(), value.to_string())]),
         }
@@ -1542,6 +1691,7 @@ mod tests {
         let url = format!("http://127.0.0.1:{}/gate", address.port());
         let forward = policy::Rule {
             domain: "api.example.com".into(),
+            expires_at_unix_ms: 0,
             matcher: None,
             action: policy::Action::Forward(policy::Forward {
                 target: policy::ForwardTarget::parse(&url).unwrap(),
@@ -1658,7 +1808,7 @@ mod tests {
                     Some("api.example.com"),
                     &policy,
                     true,
-                    &[],
+                    false,
                 )
                 .await
         });
@@ -1763,5 +1913,287 @@ mod tests {
         }
         // Something that is not TLS at all needs no waiting.
         assert!(is_classifiable(443, b"GET / HTTP/1.1\r\n\r\n"));
+    }
+
+    /// A rule past its expiry claims nothing: the request leaves as the guest
+    /// wrote it, and an unexpired rule after it is the one that applies.
+    #[tokio::test]
+    async fn an_expired_rule_sets_nothing() {
+        let request = b"GET /v1 HTTP/1.1\r\nHost: api.example.com\r\n\r\n";
+        let expired = policy::Rule {
+            expires_at_unix_ms: 1,
+            ..rule("api.example.com", "Authorization", "Bearer old")
+        };
+        let seen = relayed(request, vec![expired.clone()]).await;
+        assert!(!seen.contains("Authorization"), "{seen}");
+
+        let later = policy::Rule {
+            expires_at_unix_ms: policy::now_unix_ms() + 60_000,
+            ..rule("api.example.com", "Authorization", "Bearer new")
+        };
+        let seen = relayed(request, vec![expired, later]).await;
+        assert!(seen.contains("Authorization: Bearer new\r\n"), "{seen}");
+    }
+
+    /// Where a credential went is in the connection's audit record.
+    #[tokio::test]
+    async fn a_connection_records_which_rule_set_headers_on_how_many_requests() {
+        let (mut sandbox, mut client) = tokio::io::duplex(8 * 1024);
+        let (mut server, mut upstream) = tokio::io::duplex(8 * 1024);
+        sandbox
+            .write_all(
+                b"GET /a HTTP/1.1\r\nHost: api.example.com\r\n\r\n\
+                  GET /b HTTP/1.1\r\nHost: api.example.com\r\n\r\n",
+            )
+            .await
+            .unwrap();
+        sandbox.shutdown().await.unwrap();
+        let policy = policy::SandboxPolicy {
+            rules: Arc::new(vec![matched(
+                "api.example.com",
+                "Authorization",
+                "Bearer t",
+                policy::RequestMatch {
+                    path: Some(policy::Match::Exact("/a".into())),
+                    ..Default::default()
+                },
+            )]),
+            ..policy::SandboxPolicy::allowing(&["api.example.com"])
+        };
+        let relay = tokio::spawn(async move {
+            proxy()
+                .relay_http(
+                    &mut client,
+                    &mut upstream,
+                    Some("api.example.com"),
+                    &policy,
+                    true,
+                    true,
+                )
+                .await
+        });
+        let mut received = Vec::new();
+        server.read_to_end(&mut received).await.unwrap();
+        drop(server);
+        let outcome = relay.await.unwrap();
+        assert_eq!(
+            outcome.note.as_deref(),
+            Some("allowed (inspected); headers set by rule 0 (api.example.com) on 1 of 2 requests")
+        );
+    }
+
+    /// Revoking a credential reaches a session that is already open: the next
+    /// request on it goes without, rather than the credential lasting as long
+    /// as the client keeps its connection alive.
+    #[tokio::test]
+    async fn a_rule_removed_while_a_session_is_open_stops_at_its_next_request() {
+        let table = PolicyTable::default();
+        let source = IpAddr::from([10, 99, 0, 6]);
+        let granted = policy::SandboxPolicy {
+            sandbox_id: "sbx".into(),
+            rules: Arc::new(vec![rule("api.example.com", "Authorization", "Bearer t")]),
+            ..policy::SandboxPolicy::allowing(&["api.example.com"])
+        };
+        table.replace([(source, granted.clone())].into());
+        let session = table.get(source).unwrap();
+
+        let (mut sandbox, mut client) = tokio::io::duplex(8 * 1024);
+        let (mut server, mut upstream) = tokio::io::duplex(8 * 1024);
+        let relay = tokio::spawn(async move {
+            proxy()
+                .relay_http(
+                    &mut client,
+                    &mut upstream,
+                    Some("api.example.com"),
+                    &session,
+                    true,
+                    true,
+                )
+                .await
+        });
+
+        sandbox
+            .write_all(b"GET /1 HTTP/1.1\r\nHost: api.example.com\r\n\r\n")
+            .await
+            .unwrap();
+        let mut first = vec![0u8; 4096];
+        let n = server.read(&mut first).await.unwrap();
+        let first = String::from_utf8_lossy(&first[..n]).into_owned();
+        assert!(first.contains("Authorization: Bearer t\r\n"), "{first}");
+
+        table.replace(
+            [(
+                source,
+                policy::SandboxPolicy {
+                    rules: Arc::new(Vec::new()),
+                    ..granted
+                },
+            )]
+            .into(),
+        );
+        sandbox
+            .write_all(b"GET /2 HTTP/1.1\r\nHost: api.example.com\r\n\r\n")
+            .await
+            .unwrap();
+        sandbox.shutdown().await.unwrap();
+        let mut rest = Vec::new();
+        server.read_to_end(&mut rest).await.unwrap();
+        drop(server);
+        let rest = String::from_utf8(rest).unwrap();
+        assert!(rest.starts_with("GET /2 "), "{rest}");
+        assert!(!rest.contains("Authorization"), "{rest}");
+        relay.await.unwrap();
+    }
+
+    fn open_policy(rules: Vec<policy::Rule>) -> policy::SandboxPolicy {
+        policy::SandboxPolicy {
+            sandbox_id: "sbx".into(),
+            mode: NetworkMode::Open,
+            is_tls_inspected: true,
+            rules: Arc::new(rules),
+            ..Default::default()
+        }
+    }
+
+    /// A proxy that can inspect, holding `policy` for one sandbox.
+    fn inspecting_proxy(policy: policy::SandboxPolicy) -> (Proxy, IpAddr) {
+        // One directory per call: tests run in parallel, and two creating
+        // an authority in the same place race on its files.
+        static NEXT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+        let dir = std::env::temp_dir().join(format!(
+            "burrow-open-inspection-{}-{}",
+            std::process::id(),
+            NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut proxy = proxy();
+        proxy.authority = Some(Arc::new(inspect::Authority::load_or_create(&dir).unwrap()));
+        let source = IpAddr::from([10, 99, 0, 6]);
+        proxy.policies.replace([(source, policy)].into());
+        (proxy, source)
+    }
+
+    const ORIGIN: &str = "93.184.216.34:443";
+
+    /// Open mode inspects exactly the hosts its live rules name. A connection
+    /// for any other name, which reaches the proxy only because it shares an
+    /// address with an inspected host, is relayed as open mode's ordinary
+    /// egress: allowed, unpinned, untouched.
+    #[tokio::test]
+    async fn open_mode_inspects_only_the_hosts_its_rules_name() {
+        let (proxy, source) = inspecting_proxy(open_policy(vec![rule(
+            "api.example.com",
+            "Authorization",
+            "Bearer t",
+        )]));
+        let origin: SocketAddr = ORIGIN.parse().unwrap();
+        proxy.resolutions.record(
+            "sbx",
+            "api.example.com",
+            vec![origin.ip()],
+            std::time::Duration::from_secs(300),
+        );
+
+        let inspected = proxy.admit(source, origin, &sni::tests::client_hello("api.example.com"));
+        assert!(inspected.decision.is_allowed(), "{:?}", inspected.decision);
+        assert!(inspected.inspecting);
+
+        let other = proxy.admit(source, origin, &sni::tests::client_hello("www.example.com"));
+        assert!(other.decision.is_allowed(), "{:?}", other.decision);
+        assert!(!other.inspecting, "a host no rule names is not terminated");
+    }
+
+    /// The credential only ever goes to an address the resolver gave this
+    /// sandbox for that name. Unpinned, the inspected connection is refused,
+    /// not relayed without its credential.
+    #[tokio::test]
+    async fn an_inspected_open_mode_host_must_be_pinned() {
+        let (proxy, source) = inspecting_proxy(open_policy(vec![rule(
+            "api.example.com",
+            "Authorization",
+            "Bearer t",
+        )]));
+        let admitted = proxy.admit(
+            source,
+            ORIGIN.parse().unwrap(),
+            &sni::tests::client_hello("api.example.com"),
+        );
+        assert_eq!(
+            admitted.decision,
+            Decision::Deny("destination address is not pinned to this name")
+        );
+    }
+
+    /// What cannot be identified is refused, as in allowlist mode: no SNI,
+    /// or an encrypted ClientHello whose visible name is a cover.
+    #[tokio::test]
+    async fn open_mode_inspection_fails_closed_on_what_it_cannot_name() {
+        let (proxy, source) = inspecting_proxy(open_policy(vec![rule(
+            "api.example.com",
+            "Authorization",
+            "Bearer t",
+        )]));
+        let origin: SocketAddr = ORIGIN.parse().unwrap();
+        proxy.resolutions.record(
+            "sbx",
+            "api.example.com",
+            vec![origin.ip()],
+            std::time::Duration::from_secs(300),
+        );
+
+        let nameless = proxy.admit(source, origin, b"\x16\x03\x01\x00\x05hello");
+        assert!(!nameless.decision.is_allowed());
+
+        let ech = sni::tests::client_hello_with(&[
+            (0x0000, sni::tests::server_name_extension("api.example.com")),
+            (0xfe0d, vec![0x01]),
+        ]);
+        let hidden = proxy.admit(source, origin, &ech);
+        assert_eq!(
+            hidden.decision,
+            Decision::Deny("client hello encrypts its destination (ECH)")
+        );
+    }
+
+    /// Open mode's denials still hold on a connection the proxy merely relays,
+    /// since the redirect took it out of the path the ruleset enforces them on.
+    #[tokio::test]
+    async fn a_relayed_open_mode_connection_keeps_its_denials() {
+        let (proxy, source) = inspecting_proxy(policy::SandboxPolicy {
+            deny_cidrs: vec!["93.184.216.0/24".into()],
+            deny_domains: vec!["blocked.example".into()],
+            ..open_policy(vec![rule("api.example.com", "Authorization", "Bearer t")])
+        });
+        let origin: SocketAddr = ORIGIN.parse().unwrap();
+        let denied_range =
+            proxy.admit(source, origin, &sni::tests::client_hello("www.example.com"));
+        assert_eq!(
+            denied_range.decision,
+            Decision::Deny("destination is in a denied range")
+        );
+        let denied_name = proxy.admit(
+            source,
+            "93.184.217.1:443".parse().unwrap(),
+            &sni::tests::client_hello("blocked.example"),
+        );
+        assert!(!denied_name.decision.is_allowed());
+    }
+
+    /// An expired rule takes its host out of inspection with it.
+    #[tokio::test]
+    async fn an_expired_open_mode_rule_stops_its_host_being_inspected() {
+        let expired = policy::Rule {
+            expires_at_unix_ms: 1,
+            ..rule("api.example.com", "Authorization", "Bearer t")
+        };
+        let (proxy, source) = inspecting_proxy(open_policy(vec![expired]));
+        let admitted = proxy.admit(
+            source,
+            ORIGIN.parse().unwrap(),
+            &sni::tests::client_hello("api.example.com"),
+        );
+        assert!(admitted.decision.is_allowed());
+        assert!(!admitted.inspecting);
     }
 }

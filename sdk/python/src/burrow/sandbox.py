@@ -39,6 +39,7 @@ from .types import (
     PortMapping,
     Share,
     SandboxInfo,
+    SecretInfo,
     Session,
     Usage,
     UsageInterval,
@@ -1417,17 +1418,49 @@ class Burrow:
         )
         return res.suspended
 
-    def set_secret(self, name: str, value: str) -> None:
+    def set_secret(
+        self,
+        name: str,
+        value: str,
+        *,
+        allowed_sandboxes: Optional[List[str]] = None,
+        allowed_tags: Optional[List[str]] = None,
+    ) -> None:
         """Stores a credential that Sandbox Kits ask for by service name. The
         value stays on the node and is injected into matching requests by the
         egress proxy, so a guest never holds it. `name` is lowercase
-        kebab-case, the `service` a Kit credential names."""
-        self._transport.unary("SetSecret", api_pb2.SetSecretRequest(name=name, value=value))
+        kebab-case, the `service` a Kit credential names.
+
+        `allowed_sandboxes` (ids or names) and `allowed_tags` (`key=value`)
+        scope the secret: a reference to it from any other sandbox is refused.
+        Neither given, every sandbox may use it. Setting a secret replaces its
+        scope along with its value."""
+        self._transport.unary(
+            "SetSecret",
+            api_pb2.SetSecretRequest(
+                name=name,
+                value=value,
+                allowed_sandboxes=list(allowed_sandboxes or []),
+                allowed_tags=list(allowed_tags or []),
+            ),
+        )
 
     def list_secrets(self) -> List[str]:
         """Names of the stored secrets. Values are never returned."""
         res = self._transport.unary("ListSecrets", api_pb2.ListSecretsRequest())
         return list(res.names)
+
+    def list_secret_scopes(self) -> List[SecretInfo]:
+        """The stored secrets with their scopes. Values are never returned."""
+        res = self._transport.unary("ListSecrets", api_pb2.ListSecretsRequest())
+        return [
+            SecretInfo(
+                name=secret.name,
+                allowed_sandboxes=list(secret.allowed_sandboxes),
+                allowed_tags=list(secret.allowed_tags),
+            )
+            for secret in res.secrets
+        ]
 
     def delete_secret(self, name: str) -> None:
         self._transport.unary("DeleteSecret", api_pb2.DeleteSecretRequest(name=name))

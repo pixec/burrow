@@ -163,3 +163,85 @@ def test_a_misspelt_port_rule_is_refused_not_widened():
     ]:
         with pytest.raises(BurrowError, match=message):
             to_network_policy({"mode": "open", "deny_ports": [bad]})
+
+
+def test_an_expiring_rule_in_open_mode_reaches_the_wire_and_reads_back():
+    wire = to_network_policy(
+        {
+            "mode": "open",
+            "inspect_tls": True,
+            "rules": [
+                {
+                    "domain": "api.example.com",
+                    "match": {"method": ["GET", "POST"]},
+                    "set_headers": {"authorization": "Bearer ${secret:api}"},
+                    "expires_at_unix_ms": 1_800_000_000_000,
+                }
+            ],
+        }
+    )
+    assert wire.mode == common_pb2.NETWORK_MODE_OPEN
+    assert wire.is_tls_inspected
+    assert wire.rules[0].expires_at_unix_ms == 1_800_000_000_000
+    assert wire.rules[0].bound_sandbox_id == ""
+
+    # What a node sends back: expired, and bound to the sandbox it was
+    # resolved for.
+    wire.rules[0].is_expired = True
+    wire.rules[0].bound_sandbox_id = "sbx_a"
+    back = from_network_policy(wire)
+    assert back.rules[0].expires_at_unix_ms == 1_800_000_000_000
+    assert back.rules[0].expired
+    assert back.rules[0].bound_sandbox_id == "sbx_a"
+
+
+def test_an_expiry_that_is_not_unix_milliseconds_is_refused():
+    for bad in (-1, 1.5, "soon", True):
+        with pytest.raises(BurrowError, match="expires_at_unix_ms"):
+            to_network_policy(
+                {
+                    "mode": "open",
+                    "inspect_tls": True,
+                    "rules": [
+                        {
+                            "domain": "api.example.com",
+                            "set_headers": {"authorization": "Bearer t"},
+                            "expires_at_unix_ms": bad,
+                        }
+                    ],
+                }
+            )
+
+
+def test_a_secret_scope_is_carried_onto_the_wire():
+    from burrow._pb import api_pb2
+    from burrow.sandbox import Burrow
+
+    sent = []
+
+    class Recording:
+        def unary(self, method, request):
+            sent.append((method, request))
+            if method == "ListSecrets":
+                return api_pb2.ListSecretsResponse(
+                    names=["api"],
+                    secrets=[
+                        api_pb2.SecretInfo(
+                            name="api", allowed_sandboxes=["sbx_a"], allowed_tags=["team=ml"]
+                        )
+                    ],
+                )
+            return None
+
+    client = Burrow.__new__(Burrow)
+    client._transport = Recording()
+    client.set_secret("api", "token", allowed_sandboxes=["sbx_a"], allowed_tags=["team=ml"])
+    method, request = sent[0]
+    assert method == "SetSecret"
+    assert list(request.allowed_sandboxes) == ["sbx_a"]
+    assert list(request.allowed_tags) == ["team=ml"]
+
+    scopes = client.list_secret_scopes()
+    assert scopes[0].name == "api"
+    assert scopes[0].allowed_sandboxes == ["sbx_a"]
+    assert scopes[0].allowed_tags == ["team=ml"]

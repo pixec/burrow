@@ -400,8 +400,15 @@ async fn serve_stream(
         headers: &headers,
     };
     // Matching nothing is not a refusal: the stream is forwarded exactly as it
-    // was written.
-    let action = crate::select_rule(&session.policy.rules, &checked.host, &request).cloned();
+    // was written. The rules are read afresh per stream, so one removed or
+    // expired while the connection is open stops applying to the next stream.
+    let rules = session.policy.current_rules();
+    let selected = crate::select_rule_at(&rules, &checked.host, &request, policy::now_unix_ms());
+    let note = selected.and_then(|(index, rule)| {
+        matches!(rule.action, policy::Action::SetHeaders(_))
+            .then(|| crate::applied_note(index, rule))
+    });
+    let action = selected.map(|(_, rule)| rule.action.clone());
 
     if let Some(policy::Action::Refuse(reason)) = &action {
         refuse(&mut respond);
@@ -514,7 +521,9 @@ async fn serve_stream(
     StreamOutcome {
         host: Some(checked.host),
         is_allowed: refusal.is_none(),
-        reason: refusal.unwrap_or_else(|| "allowed (inspected)".to_string()),
+        reason: refusal
+            .or(note)
+            .unwrap_or_else(|| "allowed (inspected)".to_string()),
         sent: sent.unwrap_or(0),
         received: received.unwrap_or(0),
     }
@@ -997,6 +1006,7 @@ mod tests {
     fn rule(domain: &str, name: &str, value: &str) -> policy::Rule {
         policy::Rule {
             domain: domain.into(),
+            expires_at_unix_ms: 0,
             matcher: None,
             action: policy::Action::SetHeaders(vec![(name.to_string(), value.to_string())]),
         }
@@ -1011,6 +1021,7 @@ mod tests {
     ) -> policy::Rule {
         policy::Rule {
             domain: domain.into(),
+            expires_at_unix_ms: 0,
             matcher: Some(matcher),
             action: policy::Action::SetHeaders(vec![(name.to_string(), value.to_string())]),
         }
@@ -1201,6 +1212,7 @@ mod tests {
         let url = format!("http://127.0.0.1:{port}/gate");
         let (client, mut seen, mut audited) = harness(vec![policy::Rule {
             domain: "api.example.com".into(),
+            expires_at_unix_ms: 0,
             matcher: None,
             action: policy::Action::Forward(policy::Forward {
                 target: policy::ForwardTarget::parse(&url).unwrap(),

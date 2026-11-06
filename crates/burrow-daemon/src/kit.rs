@@ -491,6 +491,7 @@ fn inject_rule(inject: &burrow_kit::Inject, secret: &str) -> Option<common::Requ
                 headers: vec![common::HeaderValue { name, value }],
             },
         )),
+        ..Default::default()
     })
 }
 

@@ -183,6 +183,23 @@ message RequestRule {
     SetHeaders set_headers = 3;
     ForwardRequest forward = 4;
   }
+  // Unix time in milliseconds at which the rule stops applying, or 0 for a
+  // rule that never expires. Checked by the proxy on every request against the
+  // node's clock, so an expired rule stops applying without a call: no header
+  // is set and nothing is forwarded by it, and in open mode its host stops
+  // being inspected. The rule stays in the policy, reported with `is_expired`,
+  // until a later update removes it.
+  uint64 expires_at_unix_ms = 5;
+  // Output only: true on a policy a node returns once `expires_at_unix_ms` has
+  // passed. Ignored on input.
+  bool is_expired = 6;
+  // When set, the rule applies only in the sandbox with this id. A copy of the
+  // policy anywhere else, such as a fork or a sandbox created from a
+  // snapshot, refuses every request the rule would have claimed rather than
+  // send it without its credential. The orchestrator sets it on any rule whose
+  // value came from a scoped secret, so a grant cannot travel with a policy to
+  // a sandbox the secret was not scoped to.
+  string bound_sandbox_id = 7;
 }
 
 message NetworkPolicy {
@@ -194,6 +211,14 @@ message NetworkPolicy {
   // Terminate this sandbox's TLS so the host named *inside* the session is
   // checked too, not just the SNI. Closes domain fronting, at the cost of the
   // proxy being able to read the payload, which is why it is opt-in.
+  //
+  // In allowlist mode every HTTPS connection is inspected. In open mode only
+  // connections to the hosts named by `rules` are: they alone are redirected
+  // to the proxy and terminated there, and everything else leaves the node
+  // exactly as open mode always has, neither proxied nor inspected. Either
+  // way the guest is given the fleet's inspection root at creation, which is
+  // why this can be turned on only when a sandbox is created; rules can then be
+  // added and removed live.
   bool is_tls_inspected = 5;
   // IPv4 or IPv6 ranges this sandbox may never reach, in any mode. Deny beats
   // every allowance: an allowed domain resolving into one of these is refused
@@ -203,6 +228,8 @@ message NetworkPolicy {
   // What the host does to requests it inspects: broker a credential onto them,
   // or send them to an endpoint the operator controls. Requires inspect_tls,
   // since the proxy has to terminate TLS to touch a request at all. At most 32.
+  // In open mode each rule's domain must be an exact host name, since it also
+  // names a host whose TLS is inspected.
   //
   // Field 7 was `repeated HeaderInjection inject_headers`, which is the special
   // case of a rule with no matcher and a set_headers action.
@@ -551,6 +578,11 @@ message NodeInfo {
   string inspection_root_fingerprint = 15;
   // Unix seconds when the node's inspection CA expires.
   int64 inspection_ca_expires_at = 16;
+  // Policy fields this node enforces beyond the original set, e.g.
+  // "deny_ports", "ipv6_denied", "rule_expiry", "rule_binding",
+  // "open_inspection". A node that predates a field would drop it silently,
+  // so the orchestrator refuses a policy using one on a node not naming it.
+  repeated string policy_features = 17;
 }
 
 message NodeStatus {

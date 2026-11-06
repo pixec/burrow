@@ -177,6 +177,9 @@ A sandbox created without `--net` has no egress at all. The three modes are
 - Inspection is opt-in. With `--inspect-tls` the proxy terminates TLS for that
   sandbox and checks the host inside the session, which is the only way to catch
   domain fronting. Without it, Burrow sees hostnames and never payloads.
+  In open mode it is selective: only the HTTPS hosts named by request rules
+  are redirected to the proxy and inspected, and everything else stays
+  unproxied.
 
 What the network boundary does not claim: `allow_cidrs` is a deliberate hole at
 the IP layer that bypasses the proxy entirely, and without `allow_ports` it
@@ -238,8 +241,10 @@ Credentials brokering injects a header on the host side, so untrusted code can
 call an authenticated service without holding the credential. Every response
 that carries a policy back out of a node replaces each injected value with
 `<redacted>`, keeping the domain and header name visible. The orchestrator
-mirrors what the node returns, so it never holds the real value either. See
-[FIREWALL.md](FIREWALL.md#credentials-brokering).
+mirrors what the node returns, so it never holds the real value either. A
+stored secret can be scoped to named sandboxes or tags, a rule carrying a
+scoped value is bound to the sandbox it was resolved for, and a rule can expire
+on its own. See [FIREWALL.md](FIREWALL.md#credentials-brokering).
 
 ### Exec and file policy
 

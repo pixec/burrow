@@ -37,6 +37,8 @@ import type {
   ShareOptions,
   SandboxInfo,
   SandboxState,
+  SecretInfo,
+  SecretScope,
   Session,
   SessionEnd,
   SessionStart,
@@ -1595,15 +1597,36 @@ export class Burrow {
    * stays on the node and is injected into matching requests by the egress
    * proxy, so a guest never holds it. `name` is lowercase kebab-case, the
    * `service` a Kit credential names.
+   *
+   * `scope` limits which sandboxes may use it, by id or name or by tag; a
+   * reference from any other sandbox is refused. Omitted, every sandbox may.
+   * Setting a secret replaces its scope along with its value.
    */
-  async setSecret(name: string, value: string): Promise<void> {
-    await this.transport.unary<any, any>("SetSecret", { name, value });
+  async setSecret(name: string, value: string, scope: SecretScope = {}): Promise<void> {
+    await this.transport.unary<any, any>("SetSecret", {
+      name,
+      value,
+      allowedSandboxes: scope.sandboxes ?? [],
+      allowedTags: scope.tags ?? [],
+    });
   }
 
   /** Names of the stored secrets. Values are never returned. */
   async listSecrets(): Promise<string[]> {
     const res = await this.transport.unary<any, any>("ListSecrets", {});
     return [...(res.names ?? [])];
+  }
+
+  /** The stored secrets with their scopes. Values are never returned. */
+  async listSecretScopes(): Promise<SecretInfo[]> {
+    const res = await this.transport.unary<any, any>("ListSecrets", {});
+    return (res.secrets ?? []).map((secret: any) => ({
+      name: secret.name ?? "",
+      scope: {
+        sandboxes: [...(secret.allowedSandboxes ?? [])],
+        tags: [...(secret.allowedTags ?? [])],
+      },
+    }));
   }
 
   async deleteSecret(name: string): Promise<void> {

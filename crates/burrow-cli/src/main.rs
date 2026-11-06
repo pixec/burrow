@@ -1054,7 +1054,11 @@ struct NetworkFlags {
     is_ipv6_denied: bool,
     /// Terminate this sandbox's TLS so the host named inside the session
     /// is checked, not just the SNI. Closes domain fronting, at the cost
-    /// of the proxy being able to read the payload.
+    /// of the proxy being able to read the payload. With --net open, only the
+    /// hosts named by --rule and --inject-header are inspected; the rest of
+    /// the sandbox's traffic is untouched. Only settable at creation, since
+    /// it is what gives the guest the fleet inspection root; rules can change
+    /// later.
     #[arg(long = "inspect-tls")]
     is_tls_inspected: bool,
     /// Credential the host adds to requests for a domain, as
@@ -1063,11 +1067,14 @@ struct NetworkFlags {
     #[arg(long = "inject-header")]
     inject_headers: Vec<String>,
     /// Rule for inspected requests, as a JSON object: a domain, an optional
-    /// match, and either setHeaders or forward. Evaluated in order, and
-    /// before every --inject-header. Requires --inspect-tls. Repeatable.
+    /// match, and either setHeaders or forward, plus optionally expiresIn
+    /// (seconds, or a number with s, m, h or d) or expiresAtUnixMs. Evaluated
+    /// in order, and before every --inject-header. Requires --inspect-tls.
+    /// Repeatable.
     ///
     /// {"domain":"api.example.com","match":{"path":{"startsWith":"/v1/"},
-    /// "method":["GET"]},"setHeaders":{"Authorization":"Bearer t"}}
+    /// "method":["GET"]},"setHeaders":{"Authorization":"Bearer t"},
+    /// "expiresIn":"1h"}
     #[arg(long = "rule")]
     rules: Vec<String>,
 }
@@ -1410,8 +1417,16 @@ enum SecretCommand {
         name: String,
         #[arg(long)]
         value: Option<String>,
+        /// Only this sandbox, by id or name, may use the secret. Repeatable;
+        /// with no --allow-sandbox or --allow-tag, every sandbox may.
+        #[arg(long = "allow-sandbox")]
+        allowed_sandboxes: Vec<String>,
+        /// Only sandboxes carrying this tag, as key=value, may use the secret.
+        /// Repeatable.
+        #[arg(long = "allow-tag")]
+        allowed_tags: Vec<String>,
     },
-    /// List secret names. Values are never shown.
+    /// List secret names and their scopes. Values are never shown.
     #[command(visible_alias = "list")]
     Ls,
     /// Delete a secret.
@@ -1779,7 +1794,12 @@ async fn main() -> anyhow::Result<()> {
                 .into_inner();
             println!("{} {}", sandbox.id, state_name(sandbox.state));
         }
-        Command::Secret(SecretCommand::Set { name, value }) => {
+        Command::Secret(SecretCommand::Set {
+            name,
+            value,
+            allowed_sandboxes,
+            allowed_tags,
+        }) => {
             let value = match value {
                 Some(value) => value,
                 None => {
@@ -1792,18 +1812,40 @@ async fn main() -> anyhow::Result<()> {
                 .set_secret(api::SetSecretRequest {
                     name: name.clone(),
                     value,
+                    allowed_sandboxes,
+                    allowed_tags,
                 })
                 .await?;
             println!("stored {name}");
         }
         Command::Secret(SecretCommand::Ls) => {
-            let names = client
+            let listed = client
                 .list_secrets(api::ListSecretsRequest {})
                 .await?
-                .into_inner()
-                .names;
-            for name in names {
-                println!("{name}");
+                .into_inner();
+            // An orchestrator from before scopes sends names only.
+            if listed.secrets.is_empty() {
+                for name in listed.names {
+                    println!("{name}");
+                }
+            }
+            for secret in listed.secrets {
+                let scope: Vec<String> = secret
+                    .allowed_sandboxes
+                    .iter()
+                    .map(|entry| format!("sandbox={entry}"))
+                    .chain(
+                        secret
+                            .allowed_tags
+                            .iter()
+                            .map(|entry| format!("tag:{entry}")),
+                    )
+                    .collect();
+                if scope.is_empty() {
+                    println!("{}", secret.name);
+                } else {
+                    println!("{}\t{}", secret.name, scope.join(","));
+                }
             }
         }
         Command::Secret(SecretCommand::Rm { name }) => {
@@ -2781,11 +2823,11 @@ fn network_policy(flags: NetworkFlags) -> anyhow::Result<common::NetworkPolicy> 
         "allowlist" => common::NetworkMode::Allowlist,
         _ => common::NetworkMode::None,
     };
-    // Inspection happens in the egress proxy, and only allowlist mode
-    // redirects traffic there. Asking for it in any other mode gets a
+    // Inspection happens in the egress proxy: everything in allowlist mode,
+    // the hosts rules name in open mode. Asking for it with no egress gets a
     // sandbox that believes it is inspected and is not.
-    if flags.is_tls_inspected && mode != common::NetworkMode::Allowlist {
-        anyhow::bail!("--inspect-tls requires --net allowlist");
+    if flags.is_tls_inspected && mode == common::NetworkMode::None {
+        anyhow::bail!("--inspect-tls requires --net allowlist or --net open");
     }
     if !flags.inject_headers.is_empty() && !flags.is_tls_inspected {
         anyhow::bail!("--inject-header requires --inspect-tls");
@@ -2859,6 +2901,7 @@ fn parse_injection(spec: &str) -> anyhow::Result<common::RequestRule> {
                 }],
             },
         )),
+        ..Default::default()
     })
 }
 
@@ -2874,10 +2917,34 @@ fn parse_rule(spec: &str) -> anyhow::Result<common::RequestRule> {
         .as_object()
         .ok_or_else(|| anyhow::anyhow!("--rule {spec:?} is not a JSON object"))?;
     for key in object.keys() {
-        if !matches!(key.as_str(), "domain" | "match" | "setHeaders" | "forward") {
+        if !matches!(
+            key.as_str(),
+            "domain" | "match" | "setHeaders" | "forward" | "expiresIn" | "expiresAtUnixMs"
+        ) {
             anyhow::bail!("--rule: unknown key {key:?}");
         }
     }
+    let expires_at_unix_ms = match (object.get("expiresIn"), object.get("expiresAtUnixMs")) {
+        (Some(_), Some(_)) => {
+            anyhow::bail!("--rule: give expiresIn or expiresAtUnixMs, not both")
+        }
+        (Some(within), None) => {
+            let secs = match within {
+                serde_json::Value::Number(n) => n.as_u64(),
+                serde_json::Value::String(text) => parse_duration_secs(text),
+                _ => None,
+            }
+            .filter(|secs| *secs > 0)
+            .ok_or_else(|| {
+                anyhow::anyhow!("--rule: expiresIn is seconds, or a number with s, m, h or d")
+            })?;
+            unix_ms_now().saturating_add(secs.saturating_mul(1000))
+        }
+        (None, Some(at)) => at
+            .as_u64()
+            .ok_or_else(|| anyhow::anyhow!("--rule: expiresAtUnixMs is unix milliseconds"))?,
+        (None, None) => 0,
+    };
 
     let domain = object
         .get("domain")
@@ -2936,7 +3003,32 @@ fn parse_rule(spec: &str) -> anyhow::Result<common::RequestRule> {
         domain: domain.to_string(),
         r#match: matcher,
         action: Some(action),
+        expires_at_unix_ms,
+        ..Default::default()
     })
+}
+
+/// Seconds in `120`, `90s`, `15m`, `1h` or `2d`.
+fn parse_duration_secs(text: &str) -> Option<u64> {
+    let (number, unit) = match text.find(|c: char| !c.is_ascii_digit()) {
+        Some(at) => text.split_at(at),
+        None => (text, "s"),
+    };
+    let scale = match unit {
+        "s" => 1,
+        "m" => 60,
+        "h" => 3600,
+        "d" => 86_400,
+        _ => return None,
+    };
+    number.parse::<u64>().ok()?.checked_mul(scale)
+}
+
+fn unix_ms_now() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|elapsed| elapsed.as_millis() as u64)
+        .unwrap_or(0)
 }
 
 fn parse_match(value: &serde_json::Value) -> anyhow::Result<common::RequestMatch> {
@@ -3032,10 +3124,9 @@ fn describe_rule(rule: &common::RequestRule) -> (&'static str, String) {
         && let Some(Action::SetHeaders(set)) = &rule.action
         && let [header] = set.headers.as_slice()
     {
-        return (
-            "inject-header",
-            format!("{}:{}={}", rule.domain, header.name, header.value),
-        );
+        let mut text = format!("{}:{}={}", rule.domain, header.name, header.value);
+        describe_rule_lifetime(rule, &mut text);
+        return ("inject-header", text);
     }
 
     let mut text = rule.domain.clone();
@@ -3070,7 +3161,26 @@ fn describe_rule(rule: &common::RequestRule) -> (&'static str, String) {
         }
         None => text.push_str(" -> nothing"),
     }
+    describe_rule_lifetime(rule, &mut text);
     ("rule", text)
+}
+
+/// The expiry and binding a rule carries, appended to its description.
+fn describe_rule_lifetime(rule: &common::RequestRule, text: &mut String) {
+    if rule.expires_at_unix_ms != 0 {
+        let state = if rule.is_expired {
+            "expired"
+        } else {
+            "expires"
+        };
+        text.push_str(&format!(
+            " ({state} at unix ms {})",
+            rule.expires_at_unix_ms
+        ));
+    }
+    if !rule.bound_sandbox_id.is_empty() {
+        text.push_str(&format!(" (bound to {})", rule.bound_sandbox_id));
+    }
 }
 
 fn describe_field(entry: &common::FieldMatch) -> String {
@@ -4597,6 +4707,9 @@ fn sandbox_json(sandbox: &common::Sandbox) -> String {
                                     ("domain", Json::str(&rule.domain)),
                                     ("kind", Json::str(kind)),
                                     ("rule", Json::str(&text)),
+                                    ("expires_at_unix_ms", Json::Num(rule.expires_at_unix_ms)),
+                                    ("expired", Json::Bool(rule.is_expired)),
+                                    ("bound_sandbox_id", Json::str(&rule.bound_sandbox_id)),
                                 ])
                             })
                             .collect(),
@@ -5423,7 +5536,7 @@ mod tests {
     }
 
     #[test]
-    fn brokering_needs_an_inspected_allowlist() {
+    fn brokering_needs_inspection_and_some_egress() {
         let policy = network_policy(flags(
             "allowlist",
             true,
@@ -5434,7 +5547,51 @@ mod tests {
         assert_eq!(policy.deny_cidrs, vec!["10.0.0.0/8".to_string()]);
 
         assert!(network_policy(flags("allowlist", false, &["a.example:X=1"])).is_err());
-        assert!(network_policy(flags("open", true, &[])).is_err());
+        assert!(network_policy(flags("none", true, &[])).is_err());
+        // Open mode inspects the hosts its rules name.
+        let open = network_policy(flags(
+            "open",
+            true,
+            &["api.example.com:Authorization=Bearer t"],
+        ))
+        .unwrap();
+        assert!(open.is_tls_inspected);
+        assert_eq!(open.rules.len(), 1);
+    }
+
+    #[test]
+    fn a_rule_can_expire() {
+        let before = unix_ms_now();
+        let rule = parse_rule(
+            r#"{"domain":"api.example.com","setHeaders":{"Authorization":"Bearer t"},"expiresIn":"1h"}"#,
+        )
+        .unwrap();
+        assert!(rule.expires_at_unix_ms >= before + 3_600_000);
+        assert!(rule.expires_at_unix_ms <= unix_ms_now() + 3_600_000);
+
+        let at = parse_rule(
+            r#"{"domain":"api.example.com","setHeaders":{"A":"b"},"expiresAtUnixMs":1800000000000}"#,
+        )
+        .unwrap();
+        assert_eq!(at.expires_at_unix_ms, 1_800_000_000_000);
+        assert_eq!(
+            parse_rule(r#"{"domain":"a.example","setHeaders":{"A":"b"}}"#)
+                .unwrap()
+                .expires_at_unix_ms,
+            0
+        );
+
+        for bad in [
+            r#"{"domain":"a.example","setHeaders":{"A":"b"},"expiresIn":"1w"}"#,
+            r#"{"domain":"a.example","setHeaders":{"A":"b"},"expiresIn":0}"#,
+            r#"{"domain":"a.example","setHeaders":{"A":"b"},"expiresIn":"1h","expiresAtUnixMs":1}"#,
+        ] {
+            assert!(parse_rule(bad).is_err(), "{bad}");
+        }
+        assert_eq!(parse_duration_secs("90"), Some(90));
+        assert_eq!(parse_duration_secs("15m"), Some(900));
+        assert_eq!(parse_duration_secs("2d"), Some(172_800));
+        assert_eq!(parse_duration_secs("h"), None);
     }
 
     /// `--net` defaults to `none`, so "no flags" and "deny everything" look

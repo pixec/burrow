@@ -583,6 +583,7 @@ mod tests {
             allow_ports: vec![],
             peers: vec![],
             ports: vec![],
+            inspected: None,
         }
     }
 

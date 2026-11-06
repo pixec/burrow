@@ -32,6 +32,11 @@ struct Pin {
     expires: Instant,
 }
 
+/// How long an answer with `ttl` stays pinned.
+pub fn pin_lifetime(ttl: Duration) -> Duration {
+    ttl.clamp(MIN_PIN, MAX_PIN)
+}
+
 /// Per-sandbox record of what the resolver answered.
 #[derive(Default)]
 pub struct Resolutions {
@@ -51,7 +56,7 @@ impl Resolutions {
             return;
         }
         let host = host.trim_end_matches('.').to_ascii_lowercase();
-        let lifetime = ttl.clamp(MIN_PIN, MAX_PIN);
+        let lifetime = pin_lifetime(ttl);
         let mut table = self.by_sandbox.write().unwrap();
         let names = table.entry(sandbox_id.to_string()).or_default();
 
@@ -82,6 +87,33 @@ impl Resolutions {
             .get(sandbox_id)
             .and_then(|names| names.get(&host))
             .is_some_and(|pin| pin.expires > Instant::now() && pin.addresses.contains(&address))
+    }
+
+    /// The addresses `sandbox_id` was told `host` resolves to and has not yet
+    /// forgotten, each with how long its pin has left.
+    pub fn live_addresses(&self, sandbox_id: &str, host: &str) -> Vec<(IpAddr, Duration)> {
+        let host = host.trim_end_matches('.').to_ascii_lowercase();
+        let now = Instant::now();
+        let table = self.by_sandbox.read().unwrap();
+        table
+            .get(sandbox_id)
+            .and_then(|names| names.get(&host))
+            .filter(|pin| pin.expires > now)
+            .map(|pin| {
+                let left = pin.expires - now;
+                pin.addresses
+                    .iter()
+                    .map(|address| (*address, left))
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    /// Whether `address` is pinned for `sandbox_id` under any of `hosts`.
+    pub fn is_pinned_to_any(&self, sandbox_id: &str, hosts: &[String], address: IpAddr) -> bool {
+        hosts
+            .iter()
+            .any(|host| self.is_pinned(sandbox_id, host, address))
     }
 
     /// Drops pins for every sandbox that no longer exists.

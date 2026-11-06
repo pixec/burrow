@@ -109,7 +109,20 @@ pub struct SandboxRules {
     /// tap, but the policy is the same.
     pub peers: Vec<Ipv4Addr>,
     pub ports: Vec<PortMap>,
+    /// Open mode's selective TLS inspection, `None` for every other sandbox.
+    ///
+    /// `Some` for an open sandbox whose policy inspects some hosts: TCP 443 to
+    /// each address listed is redirected to the egress proxy for the seconds
+    /// given, and nothing else of its traffic is. The addresses are the ones
+    /// the resolver gave this sandbox for an inspected host and the seconds
+    /// what is left of that pin, so a redirect never outlives the answer that
+    /// justified it. The resolver adds more as it answers; see
+    /// [`redirect_inspected`].
+    pub inspected: Option<Vec<(Ipv4Addr, u64)>>,
 }
+
+/// The set of (sandbox, destination) pairs open mode redirects to the proxy.
+const INSPECTED_SET: &str = "inspected";
 
 /// Ports on the host that sandboxes may always reach: the egress proxy and the
 /// logging DNS resolver. Both are burrow's own services.
@@ -494,6 +507,14 @@ fn render_host_input(out: &mut String, sandboxes: &[SandboxRules]) {
         // deliver every allowlisted v6 connection straight into the closing
         // drop, which looks like the proxy being down rather than a missing
         // rule.
+        if is_selectively_inspected(sandbox) {
+            // IPv4 only: the resolver hands out no AAAA records, so there is
+            // no v6 address an inspected host could have been redirected at.
+            let _ = writeln!(
+                out,
+                "add rule inet {FILTER_TABLE} tohost ip saddr {guest} ip daddr {host} tcp dport {PROXY_PORT} accept"
+            );
+        }
         if sandbox.mode == Mode::Allowlist {
             let _ = writeln!(
                 out,
@@ -863,6 +884,45 @@ fn render_nat(out: &mut String, sandboxes: &[SandboxRules]) {
         "add chain ip {NAT_TABLE} prerouting {{ type nat hook prerouting priority -100; policy accept; }}"
     );
 
+    // Open mode's selective inspection: one set of (sandbox, destination)
+    // pairs, each with a timeout, and one rule sending HTTPS for a pair in it
+    // to the proxy. Rendered only when some sandbox uses it, so a node that
+    // inspects nothing in open mode renders exactly what it always did.
+    //
+    // Flushed and refilled on every render from the pins the daemon holds,
+    // since the resolver adds elements between renders and a render must
+    // neither lose the live ones nor keep any for a sandbox no longer
+    // inspecting.
+    let inspecting: Vec<&SandboxRules> = sandboxes
+        .iter()
+        .filter(|sandbox| is_selectively_inspected(sandbox))
+        .collect();
+    if !inspecting.is_empty() {
+        let _ = writeln!(
+            out,
+            "add set ip {NAT_TABLE} {INSPECTED_SET} {{ type ipv4_addr . ipv4_addr; flags timeout; }}"
+        );
+        let _ = writeln!(out, "flush set ip {NAT_TABLE} {INSPECTED_SET}");
+        let _ = writeln!(
+            out,
+            "add rule ip {NAT_TABLE} prerouting ip saddr . ip daddr @{INSPECTED_SET} tcp dport 443 redirect to :{PROXY_PORT}"
+        );
+        for sandbox in inspecting {
+            let mut seen = std::collections::HashSet::new();
+            for (address, secs) in sandbox.inspected.iter().flatten() {
+                if !is_redirectable(*address) || !seen.insert(*address) {
+                    continue;
+                }
+                let _ = writeln!(
+                    out,
+                    "add element ip {NAT_TABLE} {INSPECTED_SET} {{ {} . {address} timeout {}s }}",
+                    sandbox.guest_ip,
+                    (*secs).max(1)
+                );
+            }
+        }
+    }
+
     for sandbox in sandboxes {
         // Allowlist mode never routes outward on its own: its web traffic is
         // redirected to the proxy, which reads the requested hostname and
@@ -926,6 +986,56 @@ fn render_nat(out: &mut String, sandboxes: &[SandboxRules]) {
             );
         }
     }
+}
+
+/// Whether `sandbox` has open mode's selective inspection.
+fn is_selectively_inspected(sandbox: &SandboxRules) -> bool {
+    sandbox.mode == Mode::Open && sandbox.inspected.is_some()
+}
+
+/// Whether an inspected host's address may be redirected to the proxy at all.
+///
+/// The proxy refuses an inspected session to a private, loopback or
+/// link-local address, and the fleet's own pool is how sandboxes reach their
+/// private-network peers, which must never be swept into the proxy.
+fn is_redirectable(address: Ipv4Addr) -> bool {
+    !(address.is_private()
+        || address.is_loopback()
+        || address.is_link_local()
+        || address.is_unspecified()
+        || address.is_broadcast()
+        || address.is_multicast())
+}
+
+/// The commands that redirect HTTPS from `guest` to each of `addresses` for
+/// `secs`, as one transaction for [`apply`].
+///
+/// An element already in the set keeps the timeout it was added with, so it is
+/// deleted and added again to restart it; the first `add` is what makes the
+/// delete safe for one that is not there. Empty when nothing is redirectable.
+pub fn redirect_inspected(guest: Ipv4Addr, addresses: &[Ipv4Addr], secs: u64) -> String {
+    let mut out = String::new();
+    let mut seen = std::collections::HashSet::new();
+    for address in addresses {
+        if !is_redirectable(*address) || !seen.insert(*address) {
+            continue;
+        }
+        let element = format!("{guest} . {address}");
+        let _ = writeln!(
+            out,
+            "add element ip {NAT_TABLE} {INSPECTED_SET} {{ {element} }}"
+        );
+        let _ = writeln!(
+            out,
+            "delete element ip {NAT_TABLE} {INSPECTED_SET} {{ {element} }}"
+        );
+        let _ = writeln!(
+            out,
+            "add element ip {NAT_TABLE} {INSPECTED_SET} {{ {element} timeout {}s }}",
+            secs.max(1)
+        );
+    }
+    out
 }
 
 /// Deletes every conntrack entry with `guest_ip` on either side.
@@ -1020,6 +1130,7 @@ mod tests {
             allow_ports: vec![],
             peers: vec![],
             ports: vec![],
+            inspected: None,
         }
     }
 
@@ -2186,5 +2297,85 @@ mod tests {
         .collect();
         let kept: Vec<String> = disjoint(&cidrs).iter().map(Cidr::to_string).collect();
         assert_eq!(kept, ["2001:db8::/32", "10.0.0.0/8", "192.168.0.0/24"]);
+    }
+
+    /// Open mode's selective inspection sends HTTPS for the pinned addresses
+    /// of inspected hosts to the proxy, and nothing else of the sandbox's
+    /// traffic. A node with no such sandbox renders exactly what it did.
+    #[test]
+    fn open_mode_redirects_only_inspected_addresses_to_the_proxy() {
+        let plain = render(&[sandbox(Mode::Open)]);
+        assert!(!plain.contains(INSPECTED_SET));
+        assert!(!plain.contains("redirect to"));
+
+        let mut open = sandbox(Mode::Open);
+        open.inspected = Some(vec![
+            (Ipv4Addr::new(93, 184, 216, 34), 300),
+            (Ipv4Addr::new(93, 184, 216, 34), 300),
+            // Never into the fleet or a private range.
+            (Ipv4Addr::new(10, 99, 0, 9), 300),
+            (Ipv4Addr::new(169, 254, 169, 254), 300),
+        ]);
+        let ruleset = render(&[open.clone()]);
+        assert!(ruleset.contains(&format!(
+            "add set ip {NAT_TABLE} {INSPECTED_SET} {{ type ipv4_addr . ipv4_addr; flags timeout; }}"
+        )));
+        assert!(ruleset.contains(&format!("flush set ip {NAT_TABLE} {INSPECTED_SET}")));
+        assert!(ruleset.contains(&format!(
+            "add rule ip {NAT_TABLE} prerouting ip saddr . ip daddr @{INSPECTED_SET} tcp dport 443 redirect to :{PROXY_PORT}"
+        )));
+        let element = format!(
+            "add element ip {NAT_TABLE} {INSPECTED_SET} {{ 10.99.0.6 . 93.184.216.34 timeout 300s }}"
+        );
+        assert_eq!(ruleset.matches(&element).count(), 1, "{ruleset}");
+        assert!(!ruleset.contains("10.99.0.6 . 10.99.0.9"));
+        assert!(!ruleset.contains("169.254.169.254 timeout"));
+        // The redirected connections are delivered to the proxy on the host.
+        assert!(ruleset.contains(&format!(
+            "tohost ip saddr 10.99.0.6 ip daddr 10.99.0.5 tcp dport {PROXY_PORT} accept"
+        )));
+        // Everything else is still open mode's blanket accept and masquerade,
+        // with no blanket redirect of 80 or 443.
+        assert!(ruleset.contains("sandbox ip saddr 10.99.0.6 accept"));
+        assert!(!ruleset.contains("tcp dport { 80, 443 } redirect"));
+
+        // Selective inspection is an open-mode notion: an allowlist sandbox
+        // already sends all its web traffic to the proxy.
+        let mut allowlist = sandbox(Mode::Allowlist);
+        allowlist.inspected = Some(vec![(Ipv4Addr::new(93, 184, 216, 34), 300)]);
+        assert!(!render(&[allowlist]).contains(INSPECTED_SET));
+
+        // An open sandbox inspecting hosts nobody has resolved yet still gets
+        // the set and the rule, for the resolver to add to.
+        open.inspected = Some(Vec::new());
+        let empty = render(&[open]);
+        assert!(empty.contains(&format!("@{INSPECTED_SET}")));
+        assert!(!empty.contains("add element"));
+    }
+
+    /// What the resolver applies when it answers for an inspected host: each
+    /// address once, its timeout restarted, nothing private.
+    #[test]
+    fn a_redirect_restarts_each_elements_timeout() {
+        let guest = Ipv4Addr::new(10, 99, 0, 6);
+        let commands = redirect_inspected(
+            guest,
+            &[
+                Ipv4Addr::new(93, 184, 216, 34),
+                Ipv4Addr::new(93, 184, 216, 34),
+                Ipv4Addr::new(192, 168, 1, 1),
+            ],
+            120,
+        );
+        let lines: Vec<&str> = commands.lines().collect();
+        assert_eq!(
+            lines,
+            vec![
+                "add element ip burrow_nat inspected { 10.99.0.6 . 93.184.216.34 }",
+                "delete element ip burrow_nat inspected { 10.99.0.6 . 93.184.216.34 }",
+                "add element ip burrow_nat inspected { 10.99.0.6 . 93.184.216.34 timeout 120s }",
+            ]
+        );
+        assert!(redirect_inspected(guest, &[Ipv4Addr::new(10, 0, 0, 1)], 60).is_empty());
     }
 }

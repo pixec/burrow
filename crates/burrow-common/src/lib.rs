@@ -3,6 +3,7 @@ pub mod auth;
 pub mod cmdlog;
 pub mod disk;
 pub mod edge;
+pub mod features;
 pub mod glob;
 pub mod tags;
 pub mod telemetry;

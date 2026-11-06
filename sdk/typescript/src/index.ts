@@ -74,6 +74,8 @@ export type {
   SandboxInfo,
   SandboxPolicy,
   SandboxState,
+  SecretInfo,
+  SecretScope,
   StringMatch,
   Session,
   SessionEnd,

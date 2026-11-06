@@ -1785,6 +1785,12 @@ pub struct SandboxManager {
     /// The root handed to sandboxes that opted in to TLS inspection. Set once
     /// at startup, read on every create.
     inspection_ca: Arc<std::sync::Mutex<Option<InspectionRoot>>>,
+    /// Where node-side policy events, a request rule expiring among them, are
+    /// recorded beside the proxy's. Set once at startup.
+    audit: Arc<std::sync::Mutex<Option<burrow_proxy::AuditLog>>>,
+    /// Request rules already seen to have expired, by sandbox, position,
+    /// domain and expiry, so each expiry is recorded and re-rendered once.
+    expired_rules: Arc<std::sync::Mutex<std::collections::HashSet<ExpiredRule>>>,
     /// Serialises the whole of [`SandboxManager::sync_firewall`].
     ///
     /// The render is taken from a snapshot of the sandbox map, but applying it
@@ -1970,6 +1976,8 @@ impl SandboxManager {
         Self {
             vault: Arc::new(vault),
             inspection_ca: Arc::new(std::sync::Mutex::new(None)),
+            audit: Arc::new(std::sync::Mutex::new(None)),
+            expired_rules: Arc::new(std::sync::Mutex::new(std::collections::HashSet::new())),
             warm_shapes: Arc::new(std::sync::Mutex::new(HashMap::new())),
             firewall: Arc::new(tokio::sync::Mutex::new(())),
             snapshots: Arc::new(crate::snapshot::SnapshotStore::new(
@@ -3288,7 +3296,7 @@ impl SandboxManager {
             }
         }
         self.directory.replace(directory);
-        let rules: Vec<firewall::SandboxRules> = all
+        let mut rules: Vec<firewall::SandboxRules> = all
             .iter()
             .map(|sandbox| {
                 let own_ip = sandbox.lease.guest_ip;
@@ -3347,6 +3355,8 @@ impl SandboxManager {
                         .is_some_and(|n| n.is_ipv6_denied),
                     peers,
                     ports: ports.get(sandbox.id()).cloned().unwrap_or_default(),
+                    // Filled in below, from the proxy's view of the policy.
+                    inspected: None,
                 }
             })
             .collect();
@@ -3408,25 +3418,43 @@ impl SandboxManager {
                                 .map(|n| {
                                     n.rules
                                         .iter()
-                                        .map(|rule| {
-                                            crate::nodeapi::compile_rule(rule).unwrap_or_else(
-                                                |err| burrow_proxy::policy::Rule {
-                                                    domain: rule.domain.clone(),
-                                                    matcher: None,
-                                                    action: burrow_proxy::policy::Action::Refuse(
-                                                        format!("unusable policy rule: {err}"),
-                                                    ),
-                                                },
-                                            )
-                                        })
+                                        .map(|rule| crate::nodeapi::load_rule(rule, sandbox.id()))
                                         .collect()
                                 })
                                 .unwrap_or_default(),
                         ),
+                        // Filled in by the table, which keeps one per sandbox.
+                        live_rules: None,
                     },
                 )
             })
             .collect();
+
+        // Open mode's selective inspection, decided from the same compiled
+        // rules the proxy will hold, expiry and binding included, so the
+        // redirect and the proxy cannot disagree about which hosts it covers.
+        // The addresses are the live pins for those hosts: everything the
+        // resolver has redirected so far that is still owed a redirect.
+        let now_ms = burrow_proxy::policy::now_unix_ms();
+        for sandbox_rules in rules.iter_mut() {
+            let Some(policy) = by_guest_ip.get(&sandbox_rules.guest_ip) else {
+                continue;
+            };
+            let hosts = policy.selectively_inspected_hosts(now_ms);
+            if hosts.is_empty() {
+                continue;
+            }
+            sandbox_rules.inspected = Some(
+                hosts
+                    .iter()
+                    .flat_map(|host| self.resolutions.live_addresses(&policy.sandbox_id, host))
+                    .filter_map(|(address, left)| match address {
+                        std::net::IpAddr::V4(v4) => Some((v4, left.as_secs().max(1))),
+                        std::net::IpAddr::V6(_) => None,
+                    })
+                    .collect(),
+            );
+        }
 
         drop(remote);
         drop(ports);
@@ -3509,6 +3537,11 @@ impl SandboxManager {
                     "inspect_tls can only be enabled at creation: the guest is given the \
                      inspection CA at handshake",
                 ));
+            }
+            let mut network = network;
+            if let Err(err) = crate::nodeapi::restore_redacted(&mut network, previous.as_ref()) {
+                policy.network = previous;
+                return Err(err);
             }
             policy.network = Some(network);
             previous
@@ -3678,6 +3711,81 @@ impl SandboxManager {
             })
             .map(|sandbox| sandbox.id().to_string());
         self.mac_slots.reserve(id, running).map(Some)
+    }
+
+    /// The audit log node-side policy events are written to.
+    pub fn set_audit(&self, audit: burrow_proxy::AuditLog) {
+        *self.audit.lock().unwrap() = Some(audit);
+    }
+
+    /// What the resolver tells when it answers for a host an open-mode
+    /// sandbox inspects: the node's half of selective inspection.
+    pub fn inspection_redirect(&self) -> Arc<dyn burrow_proxy::dns::Redirect> {
+        Arc::new(InspectionRedirect {
+            firewall: Arc::clone(&self.firewall),
+            policies: Arc::clone(&self.proxy_policies),
+        })
+    }
+
+    /// Records each request rule that has expired since the last pass and
+    /// re-renders the boundary once if any has.
+    ///
+    /// The proxy needs neither: it compares every request against the rule's
+    /// expiry itself, so an expired rule has already stopped applying by the
+    /// time this runs. What this adds is the record that it did, and, for an
+    /// open-mode sandbox, the end of the redirect that sent its host's traffic
+    /// to the proxy, so that traffic goes back to leaving the node directly.
+    pub async fn sweep_expired_rules(&self) {
+        let now_ms = burrow_proxy::policy::now_unix_ms();
+        let candidates: Vec<_> = self.sandboxes.lock().await.values().cloned().collect();
+        let mut newly = Vec::new();
+        {
+            let mut noted = self.expired_rules.lock().unwrap();
+            let mut current = std::collections::HashSet::new();
+            for sandbox in &candidates {
+                let record = sandbox.record();
+                let Some(network) = record.policy.as_ref().and_then(|p| p.network.as_ref()) else {
+                    continue;
+                };
+                for (index, rule) in network.rules.iter().enumerate() {
+                    if rule.expires_at_unix_ms == 0 || rule.expires_at_unix_ms > now_ms {
+                        continue;
+                    }
+                    let key = ExpiredRule {
+                        sandbox_id: sandbox.id().to_string(),
+                        index,
+                        domain: rule.domain.clone(),
+                        expires_at_unix_ms: rule.expires_at_unix_ms,
+                    };
+                    if noted.insert(key.clone()) {
+                        newly.push((sandbox.lease.guest_ip, key.clone()));
+                    }
+                    current.insert(key);
+                }
+            }
+            // Forgotten once the rule is gone, so the set is bounded by the
+            // rules that exist.
+            noted.retain(|key| current.contains(key));
+        }
+        if newly.is_empty() {
+            return;
+        }
+        let audit = self.audit.lock().unwrap().clone();
+        for (guest_ip, expired) in newly {
+            tracing::info!(
+                sandbox = expired.sandbox_id,
+                rule = expired.index,
+                domain = expired.domain,
+                expires_at_unix_ms = expired.expires_at_unix_ms,
+                "request rule expired"
+            );
+            if let Some(audit) = &audit {
+                audit.record(expired.event(guest_ip));
+            }
+        }
+        if let Err(err) = self.sync_firewall().await {
+            tracing::warn!(%err, "could not re-render after a request rule expired");
+        }
     }
 
     /// The node's egress pieces for its sandboxes' userspace network
@@ -4018,6 +4126,8 @@ impl SandboxManager {
                 })
                 .collect(),
         );
+
+        self.sweep_expired_rules().await;
 
         let mut acted = Vec::new();
         // Snapshots outlive the sandboxes they were taken from, so they are
@@ -7110,6 +7220,93 @@ async fn prepare_workdir(template_dir: &Path, workdir: &Path) -> std::io::Result
     Ok(())
 }
 
+/// A request rule seen to have expired.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct ExpiredRule {
+    sandbox_id: String,
+    /// Position in the policy, which is how the proxy's audit records name a
+    /// rule too.
+    index: usize,
+    domain: String,
+    expires_at_unix_ms: u64,
+}
+
+impl ExpiredRule {
+    /// The audit record saying the rule stopped applying.
+    ///
+    /// Filed with the refusals: it is a grant withdrawn, and the refusal
+    /// queue is the one the audit log does not shed under load.
+    fn event(&self, guest_ip: std::net::Ipv4Addr) -> burrow_proxy::EgressEvent {
+        burrow_proxy::EgressEvent {
+            at: burrow_proxy::now_rfc3339(),
+            sandbox_id: self.sandbox_id.clone(),
+            source_ip: guest_ip.to_string(),
+            destination: "policy".into(),
+            host: Some(self.domain.clone()),
+            port: 0,
+            is_allowed: false,
+            reason: format!(
+                "request rule {} for {} expired at unix ms {}; it no longer applies",
+                self.index, self.domain, self.expires_at_unix_ms
+            ),
+            bytes_sent: 0,
+            bytes_received: 0,
+            dropped_records: 0,
+        }
+    }
+}
+
+/// Redirects an open-mode sandbox's HTTPS to an inspected host's addresses,
+/// as the resolver hands them out. See [`burrow_proxy::dns::Redirect`].
+struct InspectionRedirect {
+    /// The same lock every render holds, so an element added here is never
+    /// added in the middle of a render that would flush it.
+    firewall: Arc<tokio::sync::Mutex<()>>,
+    policies: Arc<burrow_proxy::PolicyTable>,
+}
+
+impl burrow_proxy::dns::Redirect for InspectionRedirect {
+    fn redirect<'a>(
+        &'a self,
+        source: std::net::IpAddr,
+        addresses: &'a [std::net::IpAddr],
+        lifetime: std::time::Duration,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send + 'a>> {
+        Box::pin(async move {
+            // The ruleset names sandboxes by their v4 address; a query that
+            // arrived over v6 is the same sandbox.
+            let guest = match burrow_proxy::policy::unmap(source) {
+                std::net::IpAddr::V4(v4) => Some(v4),
+                std::net::IpAddr::V6(_) => self
+                    .policies
+                    .get(source)
+                    .and_then(|policy| self.policies.ipv4_of(&policy.sandbox_id)),
+            };
+            let Some(guest) = guest else {
+                return;
+            };
+            let v4: Vec<std::net::Ipv4Addr> = addresses
+                .iter()
+                .filter_map(|address| match burrow_proxy::policy::unmap(*address) {
+                    std::net::IpAddr::V4(v4) => Some(v4),
+                    std::net::IpAddr::V6(_) => None,
+                })
+                .collect();
+            let commands = firewall::redirect_inspected(guest, &v4, lifetime.as_secs());
+            if commands.is_empty() {
+                return;
+            }
+            let _ordered = self.firewall.lock().await;
+            // Failing here costs the brokering, never the secret: the
+            // connection leaves the node directly, as open mode's always
+            // does, with no credential set on it.
+            if let Err(err) = firewall::apply(&commands).await {
+                tracing::warn!(%guest, %err, "could not redirect an inspected host's addresses");
+            }
+        })
+    }
+}
+
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
@@ -7507,6 +7704,7 @@ pub(crate) mod tests {
                                 }],
                             },
                         )),
+                        ..Default::default()
                     }],
                     ..Default::default()
                 }),

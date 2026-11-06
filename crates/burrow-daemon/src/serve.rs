@@ -553,6 +553,10 @@ fn local_node_info(args: &ServeArgs) -> anyhow::Result<NodeInfo> {
         // Filled in once the inspection authority is loaded.
         inspection_root_fingerprint: String::new(),
         inspection_ca_expires_at: 0,
+        policy_features: burrow_common::features::ALL
+            .iter()
+            .map(|feature| feature.to_string())
+            .collect(),
     })
 }
 
@@ -1464,6 +1468,7 @@ pub async fn run(args: ServeArgs) -> anyhow::Result<()> {
         authority.certificate_pem().to_string(),
         authority.root_fingerprint().to_string(),
     );
+    sandboxes.set_audit(audit.clone());
 
     let proxy = Arc::new(burrow_proxy::Proxy {
         policies: Arc::clone(&proxy_policies),
@@ -1509,6 +1514,9 @@ pub async fn run(args: ServeArgs) -> anyhow::Result<()> {
         upstream: args.dns_upstream,
         resolutions,
         directory: Arc::clone(&directory),
+        // nftables is what the redirect is written into; a node without it
+        // inspects open-mode traffic through its userspace stacks instead.
+        redirect: cfg!(target_os = "linux").then(|| sandboxes.inspection_redirect()),
     });
     match tokio::net::UdpSocket::bind(args.dns_listen).await {
         Ok(socket) => {

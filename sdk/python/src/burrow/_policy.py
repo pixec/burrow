@@ -57,7 +57,15 @@ _POLICY_KEYS = {
     "rules",
     "inject_headers",
 }
-_RULE_KEYS = {"domain", "match", "set_headers", "forward"}
+_RULE_KEYS = {
+    "domain",
+    "match",
+    "set_headers",
+    "forward",
+    "expires_at_unix_ms",
+    "expired",
+    "bound_sandbox_id",
+}
 _PORT_RULE_KEYS = {"protocol", "port", "port_end", "cidrs"}
 
 _PROTOCOL_TO_WIRE = {
@@ -160,7 +168,17 @@ def _to_request_rule(rule: Dict[str, Any]) -> common_pb2.RequestRule:
             f"{where}: a rule either sets headers or forwards, not both",
             "invalid_argument",
         )
-    wire = common_pb2.RequestRule(domain=domain)
+    expires_at = rule.get("expires_at_unix_ms") or 0
+    if not isinstance(expires_at, int) or isinstance(expires_at, bool) or expires_at < 0:
+        raise BurrowError(
+            f"{where}: expires_at_unix_ms is unix milliseconds, or 0 for never",
+            "invalid_argument",
+        )
+    wire = common_pb2.RequestRule(
+        domain=domain,
+        expires_at_unix_ms=expires_at,
+        bound_sandbox_id=rule.get("bound_sandbox_id") or "",
+    )
     match = _to_request_match(where, rule.get("match"))
     if match is not None:
         wire.match.CopyFrom(match)
@@ -209,7 +227,12 @@ def _check_header_name(where: str, name: str) -> None:
 
 def _from_request_rule(raw: common_pb2.RequestRule) -> RequestRule:
     """Reads one wire `RequestRule` back. Secrets arrive redacted."""
-    rule = RequestRule(domain=raw.domain)
+    rule = RequestRule(
+        domain=raw.domain,
+        expires_at_unix_ms=raw.expires_at_unix_ms,
+        expired=raw.is_expired,
+        bound_sandbox_id=raw.bound_sandbox_id,
+    )
     if raw.HasField("match"):
         rule.match = _from_request_match(raw.match)
     if raw.HasField("forward"):

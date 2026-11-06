@@ -3,7 +3,7 @@ use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
 use burrow_common::NodeId;
-use burrow_proto::common::v1::{NodeInfo, NodeStatus};
+use burrow_proto::common::v1::{self as common, NodeInfo, NodeStatus};
 
 pub const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(5);
 /// A node missing this many intervals is reported unhealthy.
@@ -50,6 +50,9 @@ pub struct Placement {
     /// when it restores. Empty means any. Hard, because a node without it
     /// can only refuse the create.
     pub hypervisor: String,
+    /// Policy features the node must enforce ([`policy_features`]). Hard,
+    /// because a node without one drops that part of the policy silently.
+    pub policy_features: Vec<&'static str>,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -90,6 +93,8 @@ pub enum PlacementError {
          --mesh-endpoint"
     )]
     PeersUnreachable(String),
+    #[error("no healthy node enforces {0}; upgrade burrowd on the nodes")]
+    NoNodeWithPolicyFeatures(String),
     #[error(
         "no healthy node carries {0}; label nodes with `burrowd serve --label` and check \
          `burrow nodes ls`"
@@ -138,6 +143,49 @@ pub fn offers(info: &NodeInfo, hypervisor: &str) -> bool {
         return hypervisor == "firecracker";
     }
     info.hypervisors.iter().any(|offered| offered == hypervisor)
+}
+
+/// The policy features `network` uses, which a node has to name in
+/// `NodeInfo.policy_features` to be given it.
+pub fn policy_features(network: Option<&common::NetworkPolicy>) -> Vec<&'static str> {
+    use burrow_common::features;
+    let Some(network) = network else {
+        return Vec::new();
+    };
+    let mut used = Vec::new();
+    if !network.deny_ports.is_empty() {
+        used.push(features::DENY_PORTS);
+    }
+    if network.is_ipv6_denied {
+        used.push(features::IPV6_DENIED);
+    }
+    if network
+        .rules
+        .iter()
+        .any(|rule| rule.expires_at_unix_ms != 0)
+    {
+        used.push(features::RULE_EXPIRY);
+    }
+    if network
+        .rules
+        .iter()
+        .any(|rule| !rule.bound_sandbox_id.is_empty())
+    {
+        used.push(features::RULE_BINDING);
+    }
+    if network.is_tls_inspected && network.mode == common::NetworkMode::Open as i32 {
+        used.push(features::OPEN_INSPECTION);
+    }
+    used
+}
+
+/// The features in `wanted` a node does not enforce.
+pub fn missing_features(info: &NodeInfo, wanted: &[&'static str]) -> Vec<&'static str> {
+    wanted
+        .iter()
+        .copied()
+        .filter(|feature| !info.policy_features.iter().any(|f| f == feature))
+        .collect()
 }
 
 /// Whether a node carries every label asked for.
@@ -748,6 +796,18 @@ impl NodeRegistry {
             ));
         }
         let live = offering;
+
+        let enforcing: Vec<_> = live
+            .iter()
+            .copied()
+            .filter(|e| missing_features(&e.info, &want.policy_features).is_empty())
+            .collect();
+        if enforcing.is_empty() {
+            return Err(PlacementError::NoNodeWithPolicyFeatures(
+                want.policy_features.join(", "),
+            ));
+        }
+        let live = enforcing;
 
         let with_template: Vec<_> = live
             .iter()
@@ -1401,6 +1461,77 @@ mod tests {
             ..want
         });
         assert!(matches!(none, Err(PlacementError::NoNodeWithHypervisor(_))));
+    }
+
+    /// A policy using a field an old node would drop is placed only on a node
+    /// that names it, and one using none of them anywhere.
+    #[test]
+    fn a_policy_is_placed_only_where_its_fields_are_enforced() {
+        use burrow_common::features;
+        let registry = registry(&[
+            ("old", status(&["t"], &[], 9999)),
+            ("new", status(&["t"], &[], 1)),
+        ]);
+        registry.heartbeat(
+            "new",
+            status(&["t"], &[], 1),
+            Some(NodeInfo {
+                id: "new".into(),
+                address: "new:7071".into(),
+                policy_features: features::ALL.iter().map(|f| f.to_string()).collect(),
+                ..Default::default()
+            }),
+        );
+        let network = common::NetworkPolicy {
+            mode: common::NetworkMode::Open as i32,
+            is_tls_inspected: true,
+            rules: vec![common::RequestRule {
+                domain: "api.example.com".into(),
+                expires_at_unix_ms: 1,
+                bound_sandbox_id: "sbx_a".into(),
+                ..Default::default()
+            }],
+            deny_ports: vec![common::PortRule {
+                port: 25,
+                ..Default::default()
+            }],
+            is_ipv6_denied: true,
+            ..Default::default()
+        };
+        let used = policy_features(Some(&network));
+        assert_eq!(used, features::ALL);
+        let want = Placement {
+            template: "t".into(),
+            vcpus: 1,
+            mem_mib: 1,
+            policy_features: used,
+            ..Default::default()
+        };
+        assert_eq!(registry.place_for(&want).unwrap(), "new");
+        assert_eq!(
+            registry
+                .place_for(&Placement {
+                    policy_features: Vec::new(),
+                    ..want.clone()
+                })
+                .unwrap(),
+            "old"
+        );
+
+        registry.heartbeat(
+            "new",
+            status(&["t"], &[], 1),
+            Some(NodeInfo {
+                id: "new".into(),
+                address: "new:7071".into(),
+                ..Default::default()
+            }),
+        );
+        assert!(matches!(
+            registry.place_for(&want),
+            Err(PlacementError::NoNodeWithPolicyFeatures(_))
+        ));
+        assert!(policy_features(Some(&common::NetworkPolicy::default())).is_empty());
     }
 
     /// A node that predates the field runs Firecracker and nothing else.

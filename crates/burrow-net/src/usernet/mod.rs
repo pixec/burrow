@@ -322,6 +322,9 @@ impl Services {
                 upstream: node.dns_upstream,
                 resolutions: Arc::clone(&node.resolutions),
                 directory: Arc::clone(&node.directory),
+                // This stack decides each flow itself and reads the pins
+                // directly; see `Stack::decide_with`.
+                redirect: None,
             },
         }
     }

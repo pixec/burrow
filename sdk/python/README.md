@@ -210,9 +210,13 @@ stdin. `lost_bytes` counts output a rotating log dropped.
   with `port`, optional `protocol` (`"tcp"`, `"udp"`, `"any"` for both, the
   default), `port_end` and `cidrs`, refused in every mode ahead of every
   allowance: `{"mode": "open", "deny_ports": [{"protocol": "tcp", "port": 25}],
-  "deny_ipv6": True}` keeps open egress without outbound SMTP or IPv6.
+  "deny_ipv6": True}` keeps open egress without outbound SMTP or IPv6. A rule
+  may carry `expires_at_unix_ms`, after which it stops applying on its own. In
+  open mode with `inspect_tls`, only the exact hosts rules name are inspected.
 - `Burrow`: the fleet: `health`, `audit`, `events`, `usage`, `nodes`, `drain_node`, and the secrets Sandbox Kits ask
-  for by service name: `set_secret`, `list_secrets`, `delete_secret`.
+  for by service name: `set_secret` (optionally scoped with
+  `allowed_sandboxes=` and `allowed_tags=`), `list_secrets`,
+  `list_secret_scopes`, `delete_secret`.
   `events` reads the fleet's lifecycle log, oldest first, and with
   `follow=True` keeps yielding new events as they happen:
 

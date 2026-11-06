@@ -344,9 +344,18 @@ pub struct Rule {
     /// rule after it for that domain.
     pub matcher: Option<RequestMatch>,
     pub action: Action,
+    /// Unix milliseconds from which the rule no longer applies; 0 never
+    /// expires. Compared per request, so an expired rule stops applying the
+    /// moment it expires rather than when something re-renders the policy.
+    pub expires_at_unix_ms: u64,
 }
 
 impl Rule {
+    /// Whether the rule still applies at `now_ms`.
+    pub fn is_live_at(&self, now_ms: u64) -> bool {
+        self.expires_at_unix_ms == 0 || now_ms < self.expires_at_unix_ms
+    }
+
     /// Whether a request this rule claims stops going to the origin.
     ///
     /// A refusal counts, because the request does not reach the origin either
@@ -433,6 +442,38 @@ pub struct SandboxPolicy {
     /// compiled patterns: a rule is compiled when the policy is loaded, never
     /// on a guest's schedule.
     pub rules: Arc<Vec<Rule>>,
+    /// The rules as they are *now*, shared with every session this sandbox
+    /// has open.
+    ///
+    /// A session copies its policy when it opens, which is right for what the
+    /// connection may reach, but a rule is a grant that has to be revocable
+    /// within a session too: removing a credential must stop it being set on
+    /// the next request, not on the next connection. [`PolicyTable::replace`]
+    /// fills this in and updates it in place; `None`, as in a policy built by
+    /// hand, means `rules` is all there is.
+    pub live_rules: Option<Arc<LiveRules>>,
+}
+
+/// One sandbox's current rules, updated in place across policy replacements.
+#[derive(Debug, Default)]
+pub struct LiveRules(RwLock<Arc<Vec<Rule>>>);
+
+impl LiveRules {
+    pub fn get(&self) -> Arc<Vec<Rule>> {
+        Arc::clone(&self.0.read().unwrap())
+    }
+
+    fn set(&self, rules: Arc<Vec<Rule>>) {
+        *self.0.write().unwrap() = rules;
+    }
+}
+
+/// Now, as the unix milliseconds rule expiry is written in.
+pub fn now_unix_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|elapsed| elapsed.as_millis() as u64)
+        .unwrap_or(0)
 }
 
 impl SandboxPolicy {
@@ -479,10 +520,70 @@ impl SandboxPolicy {
             .any(|pattern| burrow_common::glob::is_host_match(pattern, host))
     }
 
+    /// Open mode grants every host its denials leave; allowlist mode grants
+    /// what `allow_domains` names. Only consulted for a connection the proxy
+    /// actually sees, which in open mode is one to an inspected host.
     fn is_granted(&self, host: &str) -> bool {
-        self.allow_domains
+        self.mode == NetworkMode::Open
+            || self
+                .allow_domains
+                .iter()
+                .any(|p| burrow_common::glob::is_host_match(p, host))
+    }
+
+    /// The rules in force now: the live set when this policy came out of a
+    /// [`PolicyTable`], its own copy otherwise.
+    pub fn current_rules(&self) -> Arc<Vec<Rule>> {
+        match &self.live_rules {
+            Some(live) => live.get(),
+            None => Arc::clone(&self.rules),
+        }
+    }
+
+    /// Whether a TLS connection to `host` on 443 is terminated and inspected.
+    ///
+    /// Allowlist mode inspects everything once a sandbox opted in. Open mode
+    /// inspects only the hosts its live rules name, exactly: everything else
+    /// is open mode's ordinary unproxied egress, and a host whose rules have
+    /// all expired or been removed goes back to being that.
+    pub fn is_inspected(&self, host: &str) -> bool {
+        if !self.is_tls_inspected {
+            return false;
+        }
+        match self.mode {
+            NetworkMode::Allowlist => true,
+            NetworkMode::Open => self.is_selectively_inspected(host, now_unix_ms()),
+            NetworkMode::None => false,
+        }
+    }
+
+    /// Whether open mode's selective inspection covers `host` at `now_ms`.
+    pub fn is_selectively_inspected(&self, host: &str, now_ms: u64) -> bool {
+        let host = host.trim_end_matches('.');
+        self.mode == NetworkMode::Open
+            && self.is_tls_inspected
+            && !host.is_empty()
+            && self
+                .current_rules()
+                .iter()
+                .any(|rule| rule.is_live_at(now_ms) && rule.domain.eq_ignore_ascii_case(host))
+    }
+
+    /// The hosts open mode's selective inspection covers at `now_ms`, which is
+    /// what the node redirects to the proxy. Empty in any other mode.
+    pub fn selectively_inspected_hosts(&self, now_ms: u64) -> Vec<String> {
+        if self.mode != NetworkMode::Open || !self.is_tls_inspected {
+            return Vec::new();
+        }
+        let mut hosts: Vec<String> = self
+            .current_rules()
             .iter()
-            .any(|p| burrow_common::glob::is_host_match(p, host))
+            .filter(|rule| rule.is_live_at(now_ms))
+            .map(|rule| rule.domain.to_ascii_lowercase())
+            .collect();
+        hosts.sort();
+        hosts.dedup();
+        hosts
     }
 
     fn is_named_by_allow_rule(&self, host: &str) -> bool {
@@ -656,15 +757,50 @@ impl Decision {
 #[derive(Default)]
 pub struct PolicyTable {
     by_ip: RwLock<HashMap<IpAddr, SandboxPolicy>>,
+    /// Each sandbox's [`LiveRules`], by sandbox id, kept across replacements
+    /// so a session opened under the previous policy sees the new rules.
+    live: std::sync::Mutex<HashMap<String, Arc<LiveRules>>>,
 }
 
 impl PolicyTable {
-    pub fn replace(&self, entries: HashMap<IpAddr, SandboxPolicy>) {
+    pub fn replace(&self, mut entries: HashMap<IpAddr, SandboxPolicy>) {
+        let mut live = self.live.lock().unwrap();
+        let mut kept: HashMap<String, Arc<LiveRules>> = HashMap::new();
+        for policy in entries.values_mut() {
+            if policy.sandbox_id.is_empty() {
+                continue;
+            }
+            let slot = kept
+                .entry(policy.sandbox_id.clone())
+                .or_insert_with(|| {
+                    let slot = live.get(&policy.sandbox_id).cloned().unwrap_or_default();
+                    slot.set(Arc::clone(&policy.rules));
+                    slot
+                })
+                .clone();
+            policy.live_rules = Some(slot);
+        }
+        // A sandbox that is gone has no sessions worth updating, and an entry
+        // per recycled id would grow without bound.
+        *live = kept;
         *self.by_ip.write().unwrap() = entries;
     }
 
     pub fn get(&self, ip: IpAddr) -> Option<SandboxPolicy> {
         self.by_ip.read().unwrap().get(&ip).cloned()
+    }
+
+    /// The IPv4 address `sandbox_id` is known by, for an enforcer whose rules
+    /// are written in IPv4.
+    pub fn ipv4_of(&self, sandbox_id: &str) -> Option<std::net::Ipv4Addr> {
+        self.by_ip
+            .read()
+            .unwrap()
+            .iter()
+            .find_map(|(ip, policy)| match ip {
+                IpAddr::V4(v4) if policy.sandbox_id == sandbox_id => Some(*v4),
+                _ => None,
+            })
     }
 
     /// Decides whether `ip` may reach `host`.
@@ -889,6 +1025,7 @@ mod tests {
     fn set_headers(domain: &str, matcher: Option<RequestMatch>, name: &str) -> Rule {
         Rule {
             domain: domain.into(),
+            expires_at_unix_ms: 0,
             matcher,
             action: Action::SetHeaders(vec![(name.to_string(), "v".to_string())]),
         }
@@ -1153,6 +1290,7 @@ mod tests {
     fn only_forwarding_and_refusing_rules_divert() {
         let forwarding = Rule {
             domain: "api.example.com".into(),
+            expires_at_unix_ms: 0,
             matcher: None,
             action: Action::Forward(Forward {
                 target: ForwardTarget::parse("http://gate.internal/").unwrap(),
@@ -1164,6 +1302,7 @@ mod tests {
 
         let refusing = Rule {
             domain: "api.example.com".into(),
+            expires_at_unix_ms: 0,
             matcher: None,
             action: Action::Refuse("unreadable".into()),
         };
@@ -1311,5 +1450,94 @@ mod tests {
         assert!(admitted("a.example", "PATCH", "/anything/at/all"));
         assert!(admitted("b.example", "PUT", "/x/y"));
         assert!(!admitted("b.example", "PUT", "/x/y/z"));
+    }
+
+    fn open_inspecting(rules: Vec<Rule>) -> SandboxPolicy {
+        SandboxPolicy {
+            sandbox_id: "sbx".into(),
+            mode: NetworkMode::Open,
+            is_tls_inspected: true,
+            rules: Arc::new(rules),
+            ..Default::default()
+        }
+    }
+
+    /// Allowlist inspection is all or nothing; open mode's is per host, and
+    /// only for the exact hosts live rules name.
+    #[test]
+    fn open_mode_inspects_exactly_the_hosts_live_rules_name() {
+        let now = now_unix_ms();
+        let policy = open_inspecting(vec![
+            set_headers("api.example.com", None, "Authorization"),
+            Rule {
+                expires_at_unix_ms: now - 1,
+                ..set_headers("old.example.com", None, "Authorization")
+            },
+            Rule {
+                expires_at_unix_ms: now + 60_000,
+                ..set_headers("soon.example.com", None, "Authorization")
+            },
+        ]);
+        assert!(policy.is_inspected("api.example.com"));
+        assert!(policy.is_inspected("API.example.com."));
+        assert!(policy.is_inspected("soon.example.com"));
+        assert!(!policy.is_inspected("old.example.com"));
+        assert!(!policy.is_inspected("www.example.com"));
+        assert!(!policy.is_inspected("v2.api.example.com"));
+        assert_eq!(
+            policy.selectively_inspected_hosts(now),
+            vec![
+                "api.example.com".to_string(),
+                "soon.example.com".to_string()
+            ]
+        );
+        // The same rules without the opt-in inspect nothing at all.
+        let uninspected = SandboxPolicy {
+            is_tls_inspected: false,
+            ..policy.clone()
+        };
+        assert!(!uninspected.is_inspected("api.example.com"));
+        assert!(uninspected.selectively_inspected_hosts(now).is_empty());
+
+        let allowlist = SandboxPolicy {
+            mode: NetworkMode::Allowlist,
+            ..policy
+        };
+        assert!(allowlist.is_inspected("anything.example"));
+        assert!(allowlist.selectively_inspected_hosts(now).is_empty());
+    }
+
+    /// Inside an inspected open-mode session the host is held to the name the
+    /// session was opened for, but not to an allowlist open mode does not have.
+    #[test]
+    fn open_mode_admits_every_host_its_denials_leave() {
+        let policy = SandboxPolicy {
+            deny_domains: strings(&["blocked.example"]),
+            ..open_inspecting(Vec::new())
+        };
+        assert!(policy.admits("api.example.com").is_allowed());
+        assert!(policy.check_request("api.example.com", "GET", "/").is_ok());
+        assert!(!policy.admits("blocked.example").is_allowed());
+    }
+
+    /// A session keeps the policy it opened with, but reads its rules from the
+    /// table, so replacing the policy reaches it.
+    #[test]
+    fn a_replaced_policy_reaches_the_rules_of_a_copy_taken_before() {
+        let (table, ip) = table_holding(open_inspecting(vec![set_headers(
+            "api.example.com",
+            None,
+            "Authorization",
+        )]));
+        let session = table.get(ip).unwrap();
+        assert_eq!(session.current_rules().len(), 1);
+
+        table.replace(HashMap::from([(ip, open_inspecting(Vec::new()))]));
+        assert!(session.current_rules().is_empty());
+        assert!(!session.is_inspected("api.example.com"));
+
+        // A sandbox that is gone takes its live rules with it.
+        table.replace(HashMap::new());
+        assert!(table.live.lock().unwrap().is_empty());
     }
 }
