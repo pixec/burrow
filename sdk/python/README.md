@@ -4,20 +4,27 @@ Python SDK for [burrow](../../README.md): run untrusted code in Firecracker
 microVM sandboxes.
 
 ```python
-from burrow import Sandbox
+from burrow import Burrow
 
-sandbox = Sandbox.create(template="python")
-result = sandbox.subprocess.run(
-    ["python3", "-c", "print(1 + 1)"], capture_output=True, text=True
-)
-print(result.stdout)  # "2\n"
-sandbox.delete()
+with Burrow() as burrow:
+    sandbox = burrow.sandboxes.create(template="python")
+    result = sandbox.subprocess.run(
+        ["python3", "-c", "print(1 + 1)"], capture_output=True, text=True
+    )
+    print(result.stdout)  # "2\n"
+    sandbox.delete()
 ```
 
-Or scoped, so the sandbox is destroyed when the block ends:
+`Burrow` is one connection; `burrow.sandboxes`, `burrow.snapshots`,
+`burrow.volumes` and `burrow.templates` share it. `Sandbox.create(...)`,
+`Sandbox.get(...)`, `Snapshot.list(...)` and the like are shortcuts that open
+a connection of their own for one call. A handle keeps its share of the
+connection, so leaving a `with Burrow()` block does not pull it from under the
+sandboxes made inside. `with sandbox:` releases the handle when the block
+ends; `with sandbox.deleting():` destroys the sandbox instead:
 
 ```python
-with Sandbox.create(template="python") as sandbox:
+with Sandbox.create(template="python").deleting() as sandbox:
     sandbox.subprocess.run("pip install cowsay", shell=True, check=True)
 ```
 
@@ -39,6 +46,7 @@ pip install pixec-burrow
 Configuration comes from arguments or the environment:
 
 ```python
+Burrow(endpoint="https://burrow.example.com", api_key="...")
 Sandbox.create(template="python", endpoint="https://burrow.example.com", api_key="...")
 # or BURROW_ENDPOINT / BURROW_API_KEY
 ```
@@ -190,8 +198,10 @@ stdin. `lost_bytes` counts output a rotating log dropped.
 - `Sandbox`: `create`, `get`, `get_or_create`, `list`, `fork`; `watch` for a
   directory's changes; `terminal()` for a live pty; ports (`expose_port`,
   `domain`, `share`); updates (`update_tags`, `update_network_policy`,
-  `update_access_policy`, `update_resources`); lifecycle (`stop`, `resume`,
-  `shutdown`, `boot`, `recreate`, `move`, `snapshot`, `delete`); guest users
+  `update_access_policy`, `update_lifetime`); lifecycle (`pause`, `resume`,
+  `stop`, `start`, `recreate`, `move`, `snapshot`, `delete`), named as the
+  states are: a paused sandbox keeps its memory and resumes in milliseconds,
+  a stopped one keeps only its disk and starts with a cold boot; guest users
   (`create_user`, `create_group`, `delete_user`, `delete_group`, `as_user`).
   `delete_user(name, remove_home=False)` keeps the home, handed to root on
   Linux and macOS, unless asked; `delete_group(name, remove_shared_dir=False)`
@@ -202,27 +212,35 @@ stdin. `lost_bytes` counts output a rotating log dropped.
   that user, with the guest kernel deciding what they may touch. A `kit=`
   argument to `create` carries `args`, `env` and `reject_capabilities` for a
   Sandbox Kit template.
-- `network_policy` is a mode (`"none"`, `"allowlist"`, `"open"`) or the full
-  policy as a dict: `mode`, `allow_domains`, `allow_cidrs`, `allow_ports`,
-  `deny_cidrs`, `deny_ports`, `deny_ipv6`, `inspect_tls` and `rules`. A key
-  burrow does not know is refused rather than dropped, on the policy, on each
-  rule and on each port rule. `deny_ports` entries are dicts (or `PortRule`s)
+- Every policy section takes its dataclass or a dict of the same fields:
+  `resources` (`ResourcePolicy`: `vcpus`, `memory_mib`, `disk_mib`),
+  `lifetime` (`LifetimePolicy`: `max_lifetime_secs`, `idle_suspend_secs`,
+  `suspended_ttl_secs`), `snapshots` (`SnapshotPolicy`), `exec_policy`, `fs`,
+  `volumes` and `network_policy`, which also takes a bare mode (`"none"`,
+  `"allowlist"`, `"open"`). What a sandbox reports back in `sandbox.policy`
+  is the same dataclasses, so `sandbox.policy.network` can be edited and
+  passed straight to `update_network_policy`. A `NetworkPolicy` carries
+  `mode`, `allow_domains`, `allow_cidrs`, `allow_ports`, `deny_cidrs`,
+  `deny_ports`, `deny_ipv6`, `inspect_tls` and `rules`. A key burrow does not
+  know is refused rather than dropped, on the policy, on each rule and on each
+  port rule. `deny_ports` entries are dicts (or `PortRule`s)
   with `port`, optional `protocol` (`"tcp"`, `"udp"`, `"any"` for both, the
   default), `port_end` and `cidrs`, refused in every mode ahead of every
   allowance: `{"mode": "open", "deny_ports": [{"protocol": "tcp", "port": 25}],
   "deny_ipv6": True}` keeps open egress without outbound SMTP or IPv6. A rule
   may carry `expires_at_unix_ms`, after which it stops applying on its own. In
   open mode with `inspect_tls`, only the exact hosts rules name are inspected.
-- `Burrow`: the fleet: `health`, `audit`, `events`, `usage`, `nodes`, `drain_node`, and the secrets Sandbox Kits ask
-  for by service name: `set_secret` (optionally scoped with
-  `allowed_sandboxes=` and `allowed_tags=`), `list_secrets`,
-  `list_secret_scopes`, `delete_secret`.
+- `Burrow`: the fleet: `health`, `audit`, `events`, `usage`, `nodes`,
+  `drain_node`, and the secrets Sandbox Kits ask for by service name:
+  `set_secret` (optionally scoped with `allowed_sandboxes=` and
+  `allowed_tags=`), `list_secrets`, `delete_secret`. Every timestamp the SDK
+  returns is a timezone-aware UTC `datetime`.
   `events` reads the fleet's lifecycle log, oldest first, and with
   `follow=True` keeps yielding new events as they happen:
 
   ```python
-  for event in burrow.events(sandbox="build-482", follow=True):
-      print(event.seq, event.type, event.state, event.detail)
+  for event in burrow.events(sandbox_id="build-482", follow=True):
+      print(event.seq, event.kind, event.state, event.detail)
   ```
 
   Pass the last `seq` seen as `after=` to resume after a disconnect.
@@ -234,7 +252,7 @@ stdin. `lost_bytes` counts output a rotating log dropped.
   report = burrow.usage(
       start=datetime(2026, 10, 1, tzinfo=timezone.utc),
       end=datetime(2026, 11, 1, tzinfo=timezone.utc),
-      group_by="customer",
+      group_by="tag:customer",
   )
   for total in report.sums:
       print(total.group, total.state, total.vcpu_ms / 3_600_000, total.tx_bytes)
@@ -243,17 +261,20 @@ stdin. `lost_bytes` counts output a rotating log dropped.
   Without `group_by`, pass `report.next_after_id` as `after_id=` to page
   through an export.
 - `Snapshot`, `Volume`: saved state and persistent storage, addressable on
-  their own. A snapshot reports `is_durable` once a copy is in the fleet's
-  object store, and the `arch` and `firecracker_version` a node needs to
-  restore it.
+  their own. A snapshot reports `durable` once a copy is in the fleet's
+  object store, and the `arch`, `hypervisor` and `hypervisor_version` a node
+  needs to restore it.
 - `Template`: build guest images by running steps in a sandbox:
 
   ```python
   from burrow import Template, default_build_logger
 
   template = Template().from_image("python:3.12-slim").pip_install(["requests"])
-  Template.build(template, "python-tools", on_build_logs=default_build_logger())
+  built = template.build("python-tools", on_build_logs=default_build_logger())
   ```
+
+  `build` reports the published name and size; on a `Burrow` it is
+  `burrow.templates.build(template, name)`.
 
   `systemd=True` boots the image's own systemd under the agent;
   `Template.list()` reports it as `systemd`. On a Mac node,

@@ -497,6 +497,11 @@ fn offered_hypervisors(args: &ServeArgs) -> anyhow::Result<Vec<burrow_vmm::Hyper
                 }
                 continue;
             }
+            #[cfg(not(target_os = "macos"))]
+            burrow_vmm::Hypervisor::Vz => {
+                tracing::warn!(%hypervisor, "Virtualization.framework is macOS only; not offering it");
+                continue;
+            }
         };
         if !bin.exists() {
             tracing::warn!(%hypervisor, bin = %bin.display(), "hypervisor binary missing; not offering it");
@@ -524,7 +529,7 @@ fn local_node_info(args: &ServeArgs) -> anyhow::Result<NodeInfo> {
     // then quietly registered without the labels it was given would be placed
     // on by nobody, and the operator would have no line saying why.
     let labels = burrow_common::tags::parse_labels(&args.labels)
-        .map_err(|err| anyhow::anyhow!("--label: {}", err.message()))?;
+        .map_err(|err| anyhow::anyhow!("--label: {err}"))?;
     Ok(NodeInfo {
         id: args.node_id.clone(),
         address: args
@@ -543,8 +548,6 @@ fn local_node_info(args: &ServeArgs) -> anyhow::Result<NodeInfo> {
         edge_domain: String::new(),
         edge_port: 0,
         arch: std::env::consts::ARCH.to_string(),
-        // Filled in once the binary has been asked.
-        firecracker_version: String::new(),
         // Filled in once the Access listener is serving, like the edge.
         access_endpoint: String::new(),
         // Filled in once the binaries have been looked for.
@@ -552,7 +555,7 @@ fn local_node_info(args: &ServeArgs) -> anyhow::Result<NodeInfo> {
         hypervisor_versions: Default::default(),
         // Filled in once the inspection authority is loaded.
         inspection_root_fingerprint: String::new(),
-        inspection_ca_expires_at: 0,
+        inspection_ca_expires_at_unix_ms: 0,
         policy_features: burrow_common::features::ALL
             .iter()
             .map(|feature| feature.to_string())
@@ -612,11 +615,13 @@ fn disk_status(disk: Option<(burrow_common::disk::DiskCapacity, bool)>) -> NodeS
         return NodeStatus::default();
     };
     NodeStatus {
-        disk_free_bytes: capacity.free_bytes,
-        disk_total_bytes: capacity.total_bytes,
-        disk_reserve_bytes: capacity.reserve_bytes,
-        disk_unwritten_bytes: capacity.unwritten_bytes,
-        disk_overcommit: capacity.overcommit,
+        disk: Some(burrow_proto::common::v1::DiskCapacity {
+            free_bytes: capacity.free_bytes,
+            total_bytes: capacity.total_bytes,
+            reserve_bytes: capacity.reserve_bytes,
+            unwritten_bytes: capacity.unwritten_bytes,
+            overcommit: capacity.overcommit,
+        }),
         is_disk_low: is_low,
         ..Default::default()
     }
@@ -675,17 +680,14 @@ const CA_EXPIRY_WARNING: Duration = Duration::from_secs(30 * 24 * 3600);
 
 /// Warns when the inspection CA expires within [`CA_EXPIRY_WARNING`], and
 /// says whether it did. Once it has, every inspected connection fails.
-fn warn_if_ca_expiring(expires_at: i64) -> bool {
-    let now = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map_or(0, |d| d.as_secs() as i64);
-    let left = expires_at - now;
+fn warn_if_ca_expiring(expires_at_ms: i64) -> bool {
+    let left = (expires_at_ms - burrow_common::unix_now_ms()) / 1000;
     if left > CA_EXPIRY_WARNING.as_secs() as i64 {
         return false;
     }
     tracing::warn!(
         days_left = left / 86400,
-        expires_at,
+        expires_at_ms,
         "the TLS inspection CA expires soon, and inspected sandboxes will then reject every \
          connection; issue a new one with `burrowd ca issue` and restart with it"
     );
@@ -764,7 +766,7 @@ async fn registration_loop(
         loop {
             sandboxes.wait_to_report(interval).await;
             if ca_warned.is_none_or(|at| at.elapsed() >= Duration::from_secs(3600))
-                && warn_if_ca_expiring(info.inspection_ca_expires_at)
+                && warn_if_ca_expiring(info.inspection_ca_expires_at_unix_ms)
             {
                 ca_warned = Some(std::time::Instant::now());
             }
@@ -1034,10 +1036,10 @@ fn spawn_audit_pruner(store: Arc<burrow_store::Store>, retention_days: u32) {
         let mut ticker = tokio::time::interval(Duration::from_secs(3600));
         loop {
             ticker.tick().await;
-            let cutoff = burrow_common::rfc3339_days_ago(retention_days as u64);
-            match store.prune_egress(&cutoff).await {
+            let cutoff_ms = burrow_common::unix_now_ms() - retention_days as i64 * 86_400_000;
+            match store.prune_egress(cutoff_ms).await {
                 Ok(0) => {}
-                Ok(removed) => tracing::info!(removed, %cutoff, "pruned audit records"),
+                Ok(removed) => tracing::info!(removed, cutoff_ms, "pruned audit records"),
                 Err(err) => tracing::error!(%err, "audit pruning failed"),
             }
         }
@@ -1264,7 +1266,6 @@ pub async fn run(args: ServeArgs) -> anyhow::Result<()> {
             .to_string(),
         path: args.guest_binary.clone(),
     }));
-    node_info.firecracker_version = firecracker_version.clone();
     node_info.hypervisors = hypervisors.iter().map(|h| h.to_string()).collect();
     node_info.hypervisor_versions = hypervisors
         .iter()
@@ -1274,6 +1275,8 @@ pub async fn run(args: ServeArgs) -> anyhow::Result<()> {
                 burrow_vmm::Hypervisor::CloudHypervisor => &cloud_hypervisor_version,
                 #[cfg(target_os = "macos")]
                 burrow_vmm::Hypervisor::Vz => &vz_version,
+                #[cfg(not(target_os = "macos"))]
+                burrow_vmm::Hypervisor::Vz => unreachable!("vz is offered on macOS only"),
             };
             (h.to_string(), version.clone())
         })
@@ -1455,13 +1458,13 @@ pub async fn run(args: ServeArgs) -> anyhow::Result<()> {
         is_fleet_root = args.inspect_root_cert.is_some(),
         "TLS inspection authority loaded"
     );
-    let ca_expires_at = authority
+    let ca_expires_at_ms = authority
         .expires_at()
         .duration_since(std::time::UNIX_EPOCH)
-        .map_or(0, |d| d.as_secs() as i64);
-    warn_if_ca_expiring(ca_expires_at);
+        .map_or(0, |d| d.as_millis() as i64);
+    warn_if_ca_expiring(ca_expires_at_ms);
     node_info.inspection_root_fingerprint = authority.root_fingerprint().to_string();
-    node_info.inspection_ca_expires_at = ca_expires_at;
+    node_info.inspection_ca_expires_at_unix_ms = ca_expires_at_ms;
     // Handed to guests that opt in, so they trust the certificates the proxy
     // presents for the hosts they asked for.
     sandboxes.set_inspection_ca(
@@ -1749,16 +1752,17 @@ mod tests {
             overcommit: 1.5,
         };
         let status = disk_status(Some((capacity, true)));
-        assert_eq!(status.disk_free_bytes, 40 << 30);
-        assert_eq!(status.disk_total_bytes, 100 << 30);
-        assert_eq!(status.disk_reserve_bytes, 5 << 30);
-        assert_eq!(status.disk_unwritten_bytes, 12 << 30);
-        assert_eq!(status.disk_overcommit, 1.5);
+        let disk = status.disk.unwrap();
+        assert_eq!(disk.free_bytes, 40 << 30);
+        assert_eq!(disk.total_bytes, 100 << 30);
+        assert_eq!(disk.reserve_bytes, 5 << 30);
+        assert_eq!(disk.unwritten_bytes, 12 << 30);
+        assert_eq!(disk.overcommit, 1.5);
         assert!(status.is_disk_low);
 
         // Unmeasured is unreported, which placement does not check.
         let none = disk_status(None);
-        assert_eq!(none.disk_total_bytes, 0);
+        assert!(none.disk.is_none());
         assert!(!none.is_disk_low);
     }
 

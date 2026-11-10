@@ -8,11 +8,18 @@
 //! Node labels are the same shape under a different name, so they share the
 //! limits rather than growing a second nearly-identical set.
 
-#![allow(clippy::result_large_err)]
-
 use std::collections::HashMap;
 
-use tonic::Status;
+/// A tag, label or filter the limits refuse, with the reason.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+#[error("{0}")]
+pub struct TagError(String);
+
+impl From<TagError> for tonic::Status {
+    fn from(err: TagError) -> Self {
+        tonic::Status::invalid_argument(err.0)
+    }
+}
 
 pub const MAX_TAGS: usize = 16;
 pub const MAX_KEY_BYTES: usize = 64;
@@ -23,7 +30,7 @@ pub const MAX_VALUE_BYTES: usize = 256;
 /// Tags are rendered into operator output (CLI tables, logs, audit lines),
 /// where an embedded newline or escape sequence forges lines the operator
 /// reads as the system's own.
-pub fn validate(tags: &HashMap<String, String>) -> Result<(), Status> {
+pub fn validate(tags: &HashMap<String, String>) -> Result<(), TagError> {
     validate_pairs("tag", tags)
 }
 
@@ -31,36 +38,36 @@ pub fn validate(tags: &HashMap<String, String>) -> Result<(), Status> {
 ///
 /// Labels reach `burrow nodes ls` and placement errors, the same exposure a
 /// tag has.
-pub fn validate_labels(labels: &HashMap<String, String>) -> Result<(), Status> {
+pub fn validate_labels(labels: &HashMap<String, String>) -> Result<(), TagError> {
     validate_pairs("label", labels)
 }
 
-fn validate_pairs(kind: &str, pairs: &HashMap<String, String>) -> Result<(), Status> {
+fn validate_pairs(kind: &str, pairs: &HashMap<String, String>) -> Result<(), TagError> {
     if pairs.len() > MAX_TAGS {
-        return Err(Status::invalid_argument(format!(
+        return Err(TagError(format!(
             "at most {MAX_TAGS} {kind}s, got {}",
             pairs.len()
         )));
     }
     for (key, value) in pairs {
         if key.is_empty() || key.len() > MAX_KEY_BYTES {
-            return Err(Status::invalid_argument(format!(
+            return Err(TagError(format!(
                 "{kind} key {key:?} must be 1..={MAX_KEY_BYTES} bytes"
             )));
         }
         if value.len() > MAX_VALUE_BYTES {
-            return Err(Status::invalid_argument(format!(
+            return Err(TagError(format!(
                 "{kind} {key:?} value is {} bytes (max {MAX_VALUE_BYTES})",
                 value.len()
             )));
         }
         if has_control(key) {
-            return Err(Status::invalid_argument(format!(
+            return Err(TagError(format!(
                 "{kind} key {key:?} contains a control character"
             )));
         }
         if has_control(value) {
-            return Err(Status::invalid_argument(format!(
+            return Err(TagError(format!(
                 "{kind} {key:?} value contains a control character"
             )));
         }
@@ -72,14 +79,12 @@ fn validate_pairs(kind: &str, pairs: &HashMap<String, String>) -> Result<(), Sta
 ///
 /// A pair with no `=` is refused rather than read as a key with an empty
 /// value: a node must not silently carry a label it was not given.
-pub fn parse_labels<S: AsRef<str>>(pairs: &[S]) -> Result<HashMap<String, String>, Status> {
+pub fn parse_labels<S: AsRef<str>>(pairs: &[S]) -> Result<HashMap<String, String>, TagError> {
     let mut labels = HashMap::new();
     for pair in pairs {
         let pair = pair.as_ref();
         let Some((key, value)) = pair.split_once('=') else {
-            return Err(Status::invalid_argument(format!(
-                "label {pair:?} is not key=value"
-            )));
+            return Err(TagError(format!("label {pair:?} is not key=value")));
         };
         labels.insert(key.to_string(), value.to_string());
     }
@@ -96,18 +101,14 @@ fn has_control(value: &str) -> bool {
 /// `None` for an empty filter, which means "every sandbox". A key with no `=`
 /// is refused rather than read as a key-only match, which would list
 /// sandboxes the caller did not ask about.
-pub fn parse_filter(filter: &str) -> Result<Option<(&str, &str)>, Status> {
+pub fn parse_filter(filter: &str) -> Result<Option<(&str, &str)>, TagError> {
     if filter.is_empty() {
         return Ok(None);
     }
     match filter.split_once('=') {
-        Some(("", _)) => Err(Status::invalid_argument(
-            "tag filter needs a key before the '='",
-        )),
+        Some(("", _)) => Err(TagError("tag filter needs a key before the '='".into())),
         Some((key, value)) => Ok(Some((key, value))),
-        None => Err(Status::invalid_argument(format!(
-            "tag filter {filter:?} is not key=value"
-        ))),
+        None => Err(TagError(format!("tag filter {filter:?} is not key=value"))),
     }
 }
 
@@ -165,7 +166,7 @@ mod tests {
     fn labels_are_held_to_the_tag_limits_under_their_own_name() {
         assert!(validate_labels(&tags(&[("rack", "b7")])).is_ok());
         let err = validate_labels(&tags(&[("rack", "b\n7")])).unwrap_err();
-        assert!(err.message().contains("label"), "{}", err.message());
+        assert!(err.to_string().contains("label"), "{err}");
         assert!(validate_labels(&tags(&[("", "b7")])).is_err());
 
         let too_many: HashMap<String, String> = (0..=MAX_TAGS)

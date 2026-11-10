@@ -5,7 +5,7 @@ from __future__ import annotations
 import codecs
 import queue
 import threading
-from typing import Any, Callable, Dict, Iterator, List, Optional, Union
+from typing import Any, Callable, Dict, Iterator, List, Optional, Sequence, Union
 
 import grpc
 
@@ -30,8 +30,18 @@ class Terminal:
     Output callbacks are delivered from a background reader thread.
     """
 
-    def __init__(self, transport: Any, sandbox_id: str, options: Dict[str, Any]):
-        command = options.get("command") or "/bin/sh"
+    def __init__(
+        self,
+        transport: Any,
+        sandbox_id: str,
+        *,
+        command: Union[str, Sequence[str]] = "/bin/sh",
+        cols: int = 80,
+        rows: int = 24,
+        env: Optional[Dict[str, str]] = None,
+        cwd: str = "",
+        user: str = "",
+    ):
         cmd = [command] if isinstance(command, str) else list(command)
 
         self._exited = threading.Event()
@@ -47,12 +57,12 @@ class Terminal:
                 start=api_pb2.ExecStart(
                     sandbox_id=sandbox_id,
                     cmd=cmd,
-                    env=options.get("env") or {},
-                    cwd=options.get("cwd") or "",
+                    env=env or {},
+                    cwd=cwd,
                     is_pty=True,
-                    rows=options.get("rows") or 24,
-                    cols=options.get("cols") or 80,
-                    user=options.get("user") or "",
+                    rows=rows,
+                    cols=cols,
+                    user=user,
                 )
             )
         )

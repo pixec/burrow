@@ -844,6 +844,7 @@ version = "0.1.0"
 dependencies = [
  "base64",
  "boringtun",
+ "burrow-proto",
  "burrow-proxy",
  "burrow-vmm",
  "libc",
@@ -896,6 +897,7 @@ version = "0.1.0"
 dependencies = [
  "base64",
  "burrow-common",
+ "burrow-proto",
  "burrow-store",
  "bytes",
  "h2",
@@ -924,6 +926,7 @@ dependencies = [
 name = "burrow-store"
 version = "0.1.0"
 dependencies = [
+ "burrow-proto",
  "futures",
  "serde",
  "serde_json",
@@ -938,6 +941,7 @@ name = "burrow-vmm"
 version = "0.1.0"
 dependencies = [
  "block2",
+ "burrow-common",
  "bytes",
  "dispatch2",
  "http-body-util",

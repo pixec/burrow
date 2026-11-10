@@ -771,8 +771,8 @@ it stops applying; 0, the default, never expires. From the CLI a `--rule` takes
   stops applying without a call: it sets nothing and forwards nothing, the next
   matching rule applies instead, and in open mode its host stops being
   inspected.
-- The rule stays in the policy until an update removes it. Every policy a node
-  returns reports it with `is_expired` set.
+- The rule stays in the policy until an update removes it; compare
+  `expires_at_unix_ms` with the clock to see that it has.
 - Both ends are audited. A connection's record names the rules that set headers
   on its requests (`headers set by rule 0 (api.example.com) on 3 of 4
   requests`; per stream on HTTP/2), and when a rule expires the node writes a

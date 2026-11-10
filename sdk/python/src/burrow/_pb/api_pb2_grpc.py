@@ -102,9 +102,9 @@ class BurrowStub(object):
                 request_serializer=api__pb2.SandboxRef.SerializeToString,
                 response_deserializer=api__pb2.ListSessionsResponse.FromString,
                 _registered_method=True)
-        self.UpdateResources = channel.unary_unary(
-                '/burrow.api.v1.Burrow/UpdateResources',
-                request_serializer=api__pb2.UpdateResourcesRequest.SerializeToString,
+        self.UpdateLifetime = channel.unary_unary(
+                '/burrow.api.v1.Burrow/UpdateLifetime',
+                request_serializer=api__pb2.UpdateLifetimeRequest.SerializeToString,
                 response_deserializer=common__pb2.Sandbox.FromString,
                 _registered_method=True)
         self.ForkSandbox = channel.unary_unary(
@@ -196,21 +196,6 @@ class BurrowStub(object):
                 '/burrow.api.v1.Burrow/Attach',
                 request_serializer=api__pb2.AttachInput.SerializeToString,
                 response_deserializer=api__pb2.ExecOutput.FromString,
-                _registered_method=True)
-        self.UploadFile = channel.stream_unary(
-                '/burrow.api.v1.Burrow/UploadFile',
-                request_serializer=api__pb2.FileChunk.SerializeToString,
-                response_deserializer=api__pb2.UploadResult.FromString,
-                _registered_method=True)
-        self.DownloadFile = channel.unary_stream(
-                '/burrow.api.v1.Burrow/DownloadFile',
-                request_serializer=api__pb2.DownloadRequest.SerializeToString,
-                response_deserializer=api__pb2.FileChunk.FromString,
-                _registered_method=True)
-        self.ListDir = channel.unary_unary(
-                '/burrow.api.v1.Burrow/ListDir',
-                request_serializer=api__pb2.ListDirRequest.SerializeToString,
-                response_deserializer=api__pb2.ListDirResponse.FromString,
                 _registered_method=True)
         self.Watch = channel.unary_stream(
                 '/burrow.api.v1.Burrow/Watch',
@@ -439,7 +424,7 @@ class BurrowServicer(object):
         context.set_details('Method not implemented!')
         raise NotImplementedError('Method not implemented!')
 
-    def UpdateResources(self, request, context):
+    def UpdateLifetime(self, request, context):
         """Move the clocks a running sandbox is measured against: lifetime, idle
         suspension and suspended retention. The machine shape is not movable.
         """
@@ -569,24 +554,6 @@ class BurrowServicer(object):
         raise NotImplementedError('Method not implemented!')
 
     def Attach(self, request_iterator, context):
-        """Missing associated documentation comment in .proto file."""
-        context.set_code(grpc.StatusCode.UNIMPLEMENTED)
-        context.set_details('Method not implemented!')
-        raise NotImplementedError('Method not implemented!')
-
-    def UploadFile(self, request_iterator, context):
-        """Missing associated documentation comment in .proto file."""
-        context.set_code(grpc.StatusCode.UNIMPLEMENTED)
-        context.set_details('Method not implemented!')
-        raise NotImplementedError('Method not implemented!')
-
-    def DownloadFile(self, request, context):
-        """Missing associated documentation comment in .proto file."""
-        context.set_code(grpc.StatusCode.UNIMPLEMENTED)
-        context.set_details('Method not implemented!')
-        raise NotImplementedError('Method not implemented!')
-
-    def ListDir(self, request, context):
         """Missing associated documentation comment in .proto file."""
         context.set_code(grpc.StatusCode.UNIMPLEMENTED)
         context.set_details('Method not implemented!')
@@ -842,9 +809,9 @@ def add_BurrowServicer_to_server(servicer, server):
                     request_deserializer=api__pb2.SandboxRef.FromString,
                     response_serializer=api__pb2.ListSessionsResponse.SerializeToString,
             ),
-            'UpdateResources': grpc.unary_unary_rpc_method_handler(
-                    servicer.UpdateResources,
-                    request_deserializer=api__pb2.UpdateResourcesRequest.FromString,
+            'UpdateLifetime': grpc.unary_unary_rpc_method_handler(
+                    servicer.UpdateLifetime,
+                    request_deserializer=api__pb2.UpdateLifetimeRequest.FromString,
                     response_serializer=common__pb2.Sandbox.SerializeToString,
             ),
             'ForkSandbox': grpc.unary_unary_rpc_method_handler(
@@ -936,21 +903,6 @@ def add_BurrowServicer_to_server(servicer, server):
                     servicer.Attach,
                     request_deserializer=api__pb2.AttachInput.FromString,
                     response_serializer=api__pb2.ExecOutput.SerializeToString,
-            ),
-            'UploadFile': grpc.stream_unary_rpc_method_handler(
-                    servicer.UploadFile,
-                    request_deserializer=api__pb2.FileChunk.FromString,
-                    response_serializer=api__pb2.UploadResult.SerializeToString,
-            ),
-            'DownloadFile': grpc.unary_stream_rpc_method_handler(
-                    servicer.DownloadFile,
-                    request_deserializer=api__pb2.DownloadRequest.FromString,
-                    response_serializer=api__pb2.FileChunk.SerializeToString,
-            ),
-            'ListDir': grpc.unary_unary_rpc_method_handler(
-                    servicer.ListDir,
-                    request_deserializer=api__pb2.ListDirRequest.FromString,
-                    response_serializer=api__pb2.ListDirResponse.SerializeToString,
             ),
             'Watch': grpc.unary_stream_rpc_method_handler(
                     servicer.Watch,
@@ -1447,7 +1399,7 @@ class Burrow(object):
             _registered_method=True)
 
     @staticmethod
-    def UpdateResources(request,
+    def UpdateLifetime(request,
             target,
             options=(),
             channel_credentials=None,
@@ -1460,8 +1412,8 @@ class Burrow(object):
         return grpc.experimental.unary_unary(
             request,
             target,
-            '/burrow.api.v1.Burrow/UpdateResources',
-            api__pb2.UpdateResourcesRequest.SerializeToString,
+            '/burrow.api.v1.Burrow/UpdateLifetime',
+            api__pb2.UpdateLifetimeRequest.SerializeToString,
             common__pb2.Sandbox.FromString,
             options,
             channel_credentials,
@@ -1949,87 +1901,6 @@ class Burrow(object):
             '/burrow.api.v1.Burrow/Attach',
             api__pb2.AttachInput.SerializeToString,
             api__pb2.ExecOutput.FromString,
-            options,
-            channel_credentials,
-            insecure,
-            call_credentials,
-            compression,
-            wait_for_ready,
-            timeout,
-            metadata,
-            _registered_method=True)
-
-    @staticmethod
-    def UploadFile(request_iterator,
-            target,
-            options=(),
-            channel_credentials=None,
-            call_credentials=None,
-            insecure=False,
-            compression=None,
-            wait_for_ready=None,
-            timeout=None,
-            metadata=None):
-        return grpc.experimental.stream_unary(
-            request_iterator,
-            target,
-            '/burrow.api.v1.Burrow/UploadFile',
-            api__pb2.FileChunk.SerializeToString,
-            api__pb2.UploadResult.FromString,
-            options,
-            channel_credentials,
-            insecure,
-            call_credentials,
-            compression,
-            wait_for_ready,
-            timeout,
-            metadata,
-            _registered_method=True)
-
-    @staticmethod
-    def DownloadFile(request,
-            target,
-            options=(),
-            channel_credentials=None,
-            call_credentials=None,
-            insecure=False,
-            compression=None,
-            wait_for_ready=None,
-            timeout=None,
-            metadata=None):
-        return grpc.experimental.unary_stream(
-            request,
-            target,
-            '/burrow.api.v1.Burrow/DownloadFile',
-            api__pb2.DownloadRequest.SerializeToString,
-            api__pb2.FileChunk.FromString,
-            options,
-            channel_credentials,
-            insecure,
-            call_credentials,
-            compression,
-            wait_for_ready,
-            timeout,
-            metadata,
-            _registered_method=True)
-
-    @staticmethod
-    def ListDir(request,
-            target,
-            options=(),
-            channel_credentials=None,
-            call_credentials=None,
-            insecure=False,
-            compression=None,
-            wait_for_ready=None,
-            timeout=None,
-            metadata=None):
-        return grpc.experimental.unary_unary(
-            request,
-            target,
-            '/burrow.api.v1.Burrow/ListDir',
-            api__pb2.ListDirRequest.SerializeToString,
-            api__pb2.ListDirResponse.FromString,
             options,
             channel_credentials,
             insecure,
@@ -2766,21 +2637,6 @@ class AccessStub(object):
                 request_serializer=api__pb2.AttachInput.SerializeToString,
                 response_deserializer=api__pb2.ExecOutput.FromString,
                 _registered_method=True)
-        self.UploadFile = channel.stream_unary(
-                '/burrow.api.v1.Access/UploadFile',
-                request_serializer=api__pb2.FileChunk.SerializeToString,
-                response_deserializer=api__pb2.UploadResult.FromString,
-                _registered_method=True)
-        self.DownloadFile = channel.unary_stream(
-                '/burrow.api.v1.Access/DownloadFile',
-                request_serializer=api__pb2.DownloadRequest.SerializeToString,
-                response_deserializer=api__pb2.FileChunk.FromString,
-                _registered_method=True)
-        self.ListDir = channel.unary_unary(
-                '/burrow.api.v1.Access/ListDir',
-                request_serializer=api__pb2.ListDirRequest.SerializeToString,
-                response_deserializer=api__pb2.ListDirResponse.FromString,
-                _registered_method=True)
         self.Watch = channel.unary_stream(
                 '/burrow.api.v1.Access/Watch',
                 request_serializer=api__pb2.WatchRequest.SerializeToString,
@@ -2816,24 +2672,6 @@ class AccessServicer(object):
         context.set_details('Method not implemented!')
         raise NotImplementedError('Method not implemented!')
 
-    def UploadFile(self, request_iterator, context):
-        """Missing associated documentation comment in .proto file."""
-        context.set_code(grpc.StatusCode.UNIMPLEMENTED)
-        context.set_details('Method not implemented!')
-        raise NotImplementedError('Method not implemented!')
-
-    def DownloadFile(self, request, context):
-        """Missing associated documentation comment in .proto file."""
-        context.set_code(grpc.StatusCode.UNIMPLEMENTED)
-        context.set_details('Method not implemented!')
-        raise NotImplementedError('Method not implemented!')
-
-    def ListDir(self, request, context):
-        """Missing associated documentation comment in .proto file."""
-        context.set_code(grpc.StatusCode.UNIMPLEMENTED)
-        context.set_details('Method not implemented!')
-        raise NotImplementedError('Method not implemented!')
-
     def Watch(self, request, context):
         """Missing associated documentation comment in .proto file."""
         context.set_code(grpc.StatusCode.UNIMPLEMENTED)
@@ -2858,21 +2696,6 @@ def add_AccessServicer_to_server(servicer, server):
                     servicer.Attach,
                     request_deserializer=api__pb2.AttachInput.FromString,
                     response_serializer=api__pb2.ExecOutput.SerializeToString,
-            ),
-            'UploadFile': grpc.stream_unary_rpc_method_handler(
-                    servicer.UploadFile,
-                    request_deserializer=api__pb2.FileChunk.FromString,
-                    response_serializer=api__pb2.UploadResult.SerializeToString,
-            ),
-            'DownloadFile': grpc.unary_stream_rpc_method_handler(
-                    servicer.DownloadFile,
-                    request_deserializer=api__pb2.DownloadRequest.FromString,
-                    response_serializer=api__pb2.FileChunk.SerializeToString,
-            ),
-            'ListDir': grpc.unary_unary_rpc_method_handler(
-                    servicer.ListDir,
-                    request_deserializer=api__pb2.ListDirRequest.FromString,
-                    response_serializer=api__pb2.ListDirResponse.SerializeToString,
             ),
             'Watch': grpc.unary_stream_rpc_method_handler(
                     servicer.Watch,
@@ -2943,87 +2766,6 @@ class Access(object):
             '/burrow.api.v1.Access/Attach',
             api__pb2.AttachInput.SerializeToString,
             api__pb2.ExecOutput.FromString,
-            options,
-            channel_credentials,
-            insecure,
-            call_credentials,
-            compression,
-            wait_for_ready,
-            timeout,
-            metadata,
-            _registered_method=True)
-
-    @staticmethod
-    def UploadFile(request_iterator,
-            target,
-            options=(),
-            channel_credentials=None,
-            call_credentials=None,
-            insecure=False,
-            compression=None,
-            wait_for_ready=None,
-            timeout=None,
-            metadata=None):
-        return grpc.experimental.stream_unary(
-            request_iterator,
-            target,
-            '/burrow.api.v1.Access/UploadFile',
-            api__pb2.FileChunk.SerializeToString,
-            api__pb2.UploadResult.FromString,
-            options,
-            channel_credentials,
-            insecure,
-            call_credentials,
-            compression,
-            wait_for_ready,
-            timeout,
-            metadata,
-            _registered_method=True)
-
-    @staticmethod
-    def DownloadFile(request,
-            target,
-            options=(),
-            channel_credentials=None,
-            call_credentials=None,
-            insecure=False,
-            compression=None,
-            wait_for_ready=None,
-            timeout=None,
-            metadata=None):
-        return grpc.experimental.unary_stream(
-            request,
-            target,
-            '/burrow.api.v1.Access/DownloadFile',
-            api__pb2.DownloadRequest.SerializeToString,
-            api__pb2.FileChunk.FromString,
-            options,
-            channel_credentials,
-            insecure,
-            call_credentials,
-            compression,
-            wait_for_ready,
-            timeout,
-            metadata,
-            _registered_method=True)
-
-    @staticmethod
-    def ListDir(request,
-            target,
-            options=(),
-            channel_credentials=None,
-            call_credentials=None,
-            insecure=False,
-            compression=None,
-            wait_for_ready=None,
-            timeout=None,
-            metadata=None):
-        return grpc.experimental.unary_unary(
-            request,
-            target,
-            '/burrow.api.v1.Access/ListDir',
-            api__pb2.ListDirRequest.SerializeToString,
-            api__pb2.ListDirResponse.FromString,
             options,
             channel_credentials,
             insecure,

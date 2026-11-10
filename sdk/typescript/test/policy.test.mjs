@@ -133,27 +133,7 @@ test("a domain may carry several rules, narrowest first", () => {
   assert.equal(wire.rules[1].match, undefined);
 });
 
-test("injectHeaders are appended after rules", () => {
-  const wire = toNetworkPolicy({
-    allowDomains: ["api.github.com"],
-    rules: [
-      {
-        domain: "api.github.com",
-        match: { path: "/v1" },
-        setHeaders: { "X-Narrow": "n" },
-      },
-    ],
-    injectHeaders: [
-      { domain: "api.github.com", name: "X-Wide", value: "w" },
-    ],
-  });
-  assert.deepEqual(
-    wire.rules.map((rule) => rule.setHeaders.headers[0].name),
-    ["X-Narrow", "X-Wide"],
-  );
-});
-
-test("a policy read back reports rules, and injections among them", () => {
+test("a policy read back reports its rules", () => {
   const wire = toNetworkPolicy({
     mode: "allowlist",
     allowDomains: ["api.github.com"],
@@ -169,16 +149,11 @@ test("a policy read back reports rules, and injections among them", () => {
         forward: { url: "http://gate.internal/", secret: "<redacted>" },
       },
     ],
-    injectHeaders: [{ domain: "api.github.com", name: "X-Key", value: "k" }],
   });
   const read = fromNetworkPolicy(wire);
-  assert.equal(read.rules.length, 3);
+  assert.equal(read.rules.length, 2);
   assert.deepEqual(read.rules[0].match.path, { startsWith: "/repos/" });
   assert.equal(read.rules[1].forward.url, "http://gate.internal/");
-  // Only the matcher-less header rules read back as injections.
-  assert.deepEqual(read.injectHeaders, [
-    { domain: "api.github.com", name: "X-Key", value: "k" },
-  ]);
 });
 
 test("a rule that sets headers and forwards at once is refused", () => {
@@ -374,7 +349,7 @@ test("port rules and ipv6 survive the real wire encoding", () => {
 });
 
 test("an expiring rule in open mode is carried onto the wire and read back", () => {
-  const expiresAtUnixMs = Date.now() + 3_600_000;
+  const expiresAt = new Date(Date.now() + 3_600_000);
   const wire = toNetworkPolicy({
     mode: "open",
     inspectTls: true,
@@ -383,38 +358,35 @@ test("an expiring rule in open mode is carried onto the wire and read back", () 
         domain: "api.example.com",
         match: { method: ["GET", "POST"] },
         setHeaders: { authorization: "Bearer ${secret:api}" },
-        expiresAtUnixMs,
+        expiresAt,
       },
     ],
   });
   assert.equal(wire.mode, "NETWORK_MODE_OPEN");
   assert.equal(wire.isTlsInspected, true);
-  assert.equal(wire.rules[0].expiresAtUnixMs, expiresAtUnixMs);
+  assert.equal(wire.rules[0].expiresAtUnixMs, expiresAt.getTime());
   assert.equal(wire.rules[0].boundSandboxId, undefined);
 
-  // What a node sends back: the rule expired, bound to one sandbox.
+  // What a node sends back: the rule bound to one sandbox.
   const read = fromNetworkPolicy({
     ...wire,
     rules: [
       {
         ...wire.rules[0],
-        expiresAtUnixMs: String(expiresAtUnixMs),
-        isExpired: true,
+        expiresAtUnixMs: String(expiresAt.getTime()),
         boundSandboxId: "sbx_a",
       },
     ],
   });
-  assert.equal(read.rules[0].expiresAtUnixMs, expiresAtUnixMs);
-  assert.equal(read.rules[0].expired, true);
+  assert.equal(read.rules[0].expiresAt.getTime(), expiresAt.getTime());
   assert.equal(read.rules[0].boundSandboxId, "sbx_a");
 });
 
-test("an expiry that is not unix milliseconds is refused", () => {
-  for (const expiresAtUnixMs of [-1, 1.5, "soon"]) {
+test("an expiry that is not a valid date is refused", () => {
+  for (const expiresAt of [new Date(NaN), new Date(-1)]) {
     assert.throws(
-      () =>
-        withRule({ setHeaders: { Authorization: "Bearer t" }, expiresAtUnixMs }),
-      /expiresAtUnixMs/,
+      () => withRule({ setHeaders: { Authorization: "Bearer t" }, expiresAt }),
+      /expiresAt/,
     );
   }
 });

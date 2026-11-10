@@ -29,34 +29,40 @@ enum NetworkMode {
   NETWORK_MODE_OPEN = 3;
 }
 
+// The machine a sandbox runs on. Fixed for its life: a restore takes its
+// configuration from the snapshot, so none of these can move.
 message ResourcePolicy {
   uint32 vcpus = 1;
   uint32 mem_mib = 2;
   uint32 scratch_disk_mib = 3;
+}
+
+// How long a sandbox stays paid for. All three are read by the same reaper on
+// the same pass, and all three can move while the sandbox runs.
+message LifetimePolicy {
   // Seconds; 0 = unlimited.
-  uint64 max_lifetime_secs = 4;
+  uint64 max_lifetime_secs = 1;
   // Auto-suspend after this many idle seconds; 0 = never.
-  uint64 idle_suspend_secs = 5;
+  uint64 idle_suspend_secs = 2;
   // A sandbox left suspended this long is deleted by the node's reaper,
   // releasing its disk and its address lease; 0 = keep suspended sandboxes
   // forever. Measured from the moment it entered SUSPENDED, so it composes
   // with idle_suspend_secs: idle parks a sandbox, and this is how long the
   // parked state is worth paying for.
-  uint64 suspended_ttl_secs = 6;
+  uint64 suspended_ttl_secs = 3;
+}
+
+// How long the snapshots taken of a sandbox stay paid for.
+message SnapshotPolicy {
   // Default lifetime of a snapshot taken of this sandbox, in seconds; 0 =
   // never expires. Measured from last use and refreshed whenever a sandbox is
   // created from the snapshot, so an environment people keep starting from
   // stays, and one nobody has touched since it was taken does not.
-  uint64 snapshot_expiration_secs = 7;
+  uint64 expiration_secs = 1;
   // Keep only the N most recent snapshots of this sandbox, oldest evicted
   // first as a new one is taken. 1..=10; 0 = unlimited.
-  //
-  // Here rather than in a section of its own because every field beside it
-  // answers the same question, how long the disk this sandbox holds stays paid
-  // for, and a separate section would be empty for every sandbox that never
-  // takes a snapshot.
-  uint32 keep_last_snapshots = 8;
-  // Let a snapshot evicted by keep_last_snapshots live out its expiration
+  uint32 keep_last = 2;
+  // Let a snapshot evicted by keep_last live out its expiration
   // instead of being deleted at once. Only meaningful with both of the fields
   // above set, and refused without them: with no expiry an evicted snapshot
   // would be kept forever by a policy whose whole purpose is to bound what is
@@ -64,7 +70,7 @@ message ResourcePolicy {
   //
   // Spelled as "keep" rather than "delete evicted" so the proto3 default, and
   // therefore every caller that says nothing, gets the bounded behaviour.
-  bool is_evicted_snapshot_kept = 9;
+  bool is_evicted_kept = 3;
 }
 
 // Whether callers may run commands in the sandbox.
@@ -187,12 +193,11 @@ message RequestRule {
   // rule that never expires. Checked by the proxy on every request against the
   // node's clock, so an expired rule stops applying without a call: no header
   // is set and nothing is forwarded by it, and in open mode its host stops
-  // being inspected. The rule stays in the policy, reported with `is_expired`,
-  // until a later update removes it.
+  // being inspected. The rule stays in the policy until a later update
+  // removes it.
   uint64 expires_at_unix_ms = 5;
-  // Output only: true on a policy a node returns once `expires_at_unix_ms` has
-  // passed. Ignored on input.
-  bool is_expired = 6;
+  reserved 6;
+  reserved "is_expired";
   // When set, the rule applies only in the sandbox with this id. A copy of the
   // policy anywhere else, such as a fork or a sandbox created from a
   // snapshot, refuses every request the rule would have claimed rather than
@@ -318,6 +323,8 @@ message Policy {
   repeated NetworkMembership networks = 5;
   // Volumes to attach, in the order the guest should mount them.
   repeated VolumeMount volumes = 6;
+  LifetimePolicy lifetime = 7;
+  SnapshotPolicy snapshots = 8;
 }
 
 // A volume attached to one sandbox at one path.
@@ -368,8 +375,8 @@ message Volume {
   string name = 1;
   string node_id = 2;
   uint64 size_mib = 3;
-  // RFC 3339.
-  string created_at = 4;
+  reserved 4;
+  reserved "created_at";
   // Sandbox currently holding the writable claim, empty when free. Read-only
   // mounts are not tracked here: they do not exclude anything.
   string attached_to = 5;
@@ -377,6 +384,7 @@ message Volume {
   // sandbox it belongs to and the path it mounts at, which is how storage
   // for a path no longer declared stays findable.
   map<string, string> labels = 6;
+  int64 created_at_unix_ms = 7;
 }
 
 message Sandbox {
@@ -388,9 +396,11 @@ message Sandbox {
   string template = 3;
   SandboxState state = 4;
   Policy policy = 5;
-  // RFC 3339.
-  string created_at = 6;
-  map<string, string> metadata = 7;
+  reserved 6;
+  reserved "created_at";
+  // Tags, at most 16. Keys are 1..=64 bytes and values up to 256, neither
+  // carrying control characters.
+  map<string, string> tags = 7;
   // Caller-chosen name, unique across the fleet and fixed for the sandbox's
   // life. Empty when the caller did not ask for one: a name is a convenience,
   // not a second identity, and nothing generates one. Anywhere the API takes a
@@ -442,15 +452,14 @@ message Sandbox {
   // Whether this suspended sandbox's state is in the object store as of its
   // latest suspend, which is what lets it resume on another node.
   bool is_durable = 20;
-  // What the saved state needs to be restored on, while it is durable.
+  // What the saved state needs to be restored on, while it is durable: its
+  // cpu architecture and the version of `hypervisor` that wrote it.
   string arch = 21;
-  string firecracker_version = 22;
-  // Unix seconds of the last RevokeAccess, which `access_revoked_at_ms` says
-  // to the millisecond. Access tokens issued at or before it are refused,
-  // wherever the sandbox has moved since.
-  int64 access_revoked_at = 23;
-  // The hypervisor running it, its template's: "firecracker" or
-  // "cloud-hypervisor".
+  reserved 22, 23;
+  reserved "firecracker_version", "access_revoked_at";
+  string hypervisor_version = 29;
+  // The hypervisor running it, its template's: "firecracker",
+  // "cloud-hypervisor" or "vz".
   // Fixed for its life: snapshots, warm pools and moves stay within one.
   string hypervisor = 24;
   // "linux" or "windows", from its template.
@@ -463,10 +472,10 @@ message Sandbox {
   // trust, in hex; empty for a sandbox that is not inspected. It moves,
   // restores and is adopted only onto a node whose root is the same.
   string inspection_root_fingerprint = 27;
-  // Unix milliseconds of the last RevokeAccess, so a token reissued within
-  // the same second still works. 0 on a record from before it was kept, when
-  // the whole second `access_revoked_at` names counts as revoked.
+  // Unix milliseconds of the last RevokeAccess. Access tokens issued at or
+  // before it are refused, wherever the sandbox has moved since.
   int64 access_revoked_at_ms = 28;
+  int64 created_at_unix_ms = 30;
 }
 
 // One VM boot inside a sandbox's life.
@@ -480,17 +489,37 @@ message Sandbox {
 message Session {
   string id = 1;
   string sandbox_id = 2;
-  // RFC 3339.
-  string started_at = 3;
-  // RFC 3339. Empty while the session is open, and empty for a session the
-  // node died during: nothing recorded when that VM actually stopped.
-  string ended_at = 4;
-  // How the VM started: "boot" from a template, "restore" from a fork or a
-  // snapshot, "resume" from the sandbox's own suspend state.
-  string started_by = 5;
-  // How it stopped: "suspended", "deleted", "failed", or "unknown" for a
-  // session that was still open when the node died. Empty while it is open.
-  string ended_by = 6;
+  reserved 3, 4;
+  reserved "started_at", "ended_at";
+  SessionStart started_by = 5;
+  // Unspecified while the session is open.
+  SessionEnd ended_by = 6;
+  int64 started_at_unix_ms = 7;
+  // 0 while the session is open, and for a session the node died during:
+  // nothing recorded when that VM actually stopped.
+  int64 ended_at_unix_ms = 8;
+}
+
+// How a session's VM started.
+enum SessionStart {
+  SESSION_START_UNSPECIFIED = 0;
+  // From a template.
+  SESSION_START_BOOT = 1;
+  // From a fork or a snapshot.
+  SESSION_START_RESTORE = 2;
+  // From the sandbox's own suspend state.
+  SESSION_START_RESUME = 3;
+}
+
+// How a session's VM stopped.
+enum SessionEnd {
+  SESSION_END_UNSPECIFIED = 0;
+  SESSION_END_SUSPENDED = 1;
+  SESSION_END_DELETED = 2;
+  SESSION_END_FAILED = 3;
+  // The session was still open when the node died.
+  SESSION_END_UNKNOWN = 4;
+  SESSION_END_STOPPED = 5;
 }
 
 // A sandbox's saved state, addressable on its own.
@@ -507,32 +536,32 @@ message Snapshot {
   // Filled in by the orchestrator from its own view of the fleet; a node knows
   // its snapshots are its own and does not set it.
   string node_id = 4;
-  // The machine the snapshot was taken on. A restore takes its configuration
-  // from the snapshot, so a create from it cannot ask for a different shape.
-  uint32 vcpus = 5;
-  uint32 mem_mib = 6;
-  uint32 scratch_disk_mib = 7;
-  // RFC 3339.
-  string created_at = 8;
+  reserved 5, 6, 7, 8, 10, 13;
+  reserved "vcpus", "mem_mib", "scratch_disk_mib", "created_at", "expires_at",
+      "firecracker_version";
   // Everything the snapshot occupies on the node: memory image, vmstate and
   // scratch disk.
   uint64 size_bytes = 9;
-  // RFC 3339; empty means the snapshot does not expire.
-  string expires_at = 10;
   // A copy of the snapshot is in the fleet's object store, so a create from
   // it can be placed on any compatible node, including when the node that
   // took it is gone. `node_id` is empty when no node holds it locally.
   bool is_durable = 11;
   // What the snapshot was taken on. Guest state only restores on a node of
-  // the same architecture running the same Firecracker, so placement of a
-  // durable snapshot is limited to nodes that match.
+  // the same architecture running the same hypervisor version, so placement
+  // of a durable snapshot is limited to nodes that match.
   string arch = 12;
-  string firecracker_version = 13;
   // The hypervisor that took it, and the only one that can restore it.
   string hypervisor = 14;
   // The inspection root its guest trusted, when it was inspected. An
   // inspected create from it is placed only on a node with the same root.
   string inspection_root_fingerprint = 15;
+  string hypervisor_version = 16;
+  // The machine the snapshot was taken on. A restore takes its configuration
+  // from the snapshot, so a create from it cannot ask for a different shape.
+  ResourcePolicy resources = 17;
+  int64 created_at_unix_ms = 18;
+  // 0 means the snapshot does not expire.
+  int64 expires_at_unix_ms = 19;
 }
 
 message NodeInfo {
@@ -558,10 +587,12 @@ message NodeInfo {
   // life.
   string edge_domain = 8;
   uint32 edge_port = 9;
-  // What this node can restore: its cpu architecture and the Firecracker it
-  // runs. A snapshot taken elsewhere is only placed here when both match.
+  // What this node can restore: its cpu architecture, with `hypervisors` and
+  // `hypervisor_versions`. A snapshot taken elsewhere is only placed here
+  // when all match.
   string arch = 10;
-  string firecracker_version = 11;
+  reserved 11;
+  reserved "firecracker_version";
   // Where clients reach this node's Access service directly, scheme
   // included, e.g. "https://node-a.example.com:7073". Empty when it serves
   // none, the default, and then exec and files go through the orchestrator.
@@ -576,13 +607,15 @@ message NodeInfo {
   // SHA-256 of the root this node's TLS inspection leaves chain to, in hex:
   // the fleet root, or the node's own authority when it has none.
   string inspection_root_fingerprint = 15;
-  // Unix seconds when the node's inspection CA expires.
-  int64 inspection_ca_expires_at = 16;
+  reserved 16;
+  reserved "inspection_ca_expires_at";
   // Policy fields this node enforces beyond the original set, e.g.
   // "deny_ports", "ipv6_denied", "rule_expiry", "rule_binding",
   // "open_inspection". A node that predates a field would drop it silently,
   // so the orchestrator refuses a policy using one on a node not naming it.
   repeated string policy_features = 17;
+  // Unix milliseconds when the node's inspection CA expires.
+  int64 inspection_ca_expires_at_unix_ms = 18;
 }
 
 message NodeStatus {
@@ -603,24 +636,44 @@ message NodeStatus {
   // Volumes on this node, including those a Kit's lifecycle created on it,
   // which the orchestrator never saw a request for.
   repeated Volume volumes = 8;
-  // The data directory's filesystem: what is free to the node and its size,
-  // reported like memory. A total of 0 is a node that does not report disk,
-  // and placement does not check it.
-  uint64 disk_free_bytes = 9;
-  uint64 disk_total_bytes = 10;
-  // What the node keeps free and promises to no sandbox (--disk-reserve-mib,
-  // 5% of the filesystem by default).
-  uint64 disk_reserve_bytes = 11;
-  // Disk promised to sandboxes here and not yet written: each sandbox's disk
-  // size less what its disk file already occupies. Disks are sparse, so this
-  // is what they can still grow by.
-  uint64 disk_unwritten_bytes = 12;
-  // How far promised disk may exceed free disk above the reserve
-  // (--disk-overcommit). 0, from a node that does not say, means 1.0: never.
-  double disk_overcommit = 13;
+  reserved 9, 10, 11, 12, 13;
+  reserved "disk_free_bytes", "disk_total_bytes", "disk_reserve_bytes",
+      "disk_unwritten_bytes", "disk_overcommit";
   // Free disk is below the reserve while sandboxes run here. The node refuses
   // creates, resumes and adopts until it is not.
   bool is_disk_low = 14;
+  DiskCapacity disk = 15;
+}
+
+// The data directory's filesystem, reported like memory. A total of 0 is a
+// node that does not report disk, and placement does not check it.
+message DiskCapacity {
+  // Free on the filesystem, to the node.
+  uint64 free_bytes = 1;
+  uint64 total_bytes = 2;
+  // What the node keeps free and promises to no sandbox (--disk-reserve-mib,
+  // 5% of the filesystem by default).
+  uint64 reserve_bytes = 3;
+  // Disk promised to sandboxes here and not yet written: each sandbox's disk
+  // size less what its disk file already occupies. Disks are sparse, so this
+  // is what they can still grow by.
+  uint64 unwritten_bytes = 4;
+  // How far promised disk may exceed free disk above the reserve
+  // (--disk-overcommit). 0, from a node that does not say, means 1.0: never.
+  double overcommit = 5;
+}
+
+// What happened to a sandbox.
+enum EventKind {
+  EVENT_KIND_UNSPECIFIED = 0;
+  EVENT_KIND_CREATED = 1;
+  EVENT_KIND_STARTED = 2;
+  EVENT_KIND_AGENT_READY = 3;
+  EVENT_KIND_STOPPED = 4;
+  EVENT_KIND_DESTROYED = 5;
+  EVENT_KIND_SNAPSHOT_CREATED = 6;
+  // A sandbox a node found on restart.
+  EVENT_KIND_RECOVERED = 7;
 }
 
 // One thing that happened to a sandbox, as the node that did it recorded it.
@@ -639,16 +692,13 @@ message Event {
   uint64 node_seq = 3;
   int64 at_unix_ms = 4;
   string sandbox_id = 5;
-  // "created", "started", "agent_ready", "stopped", "destroyed",
-  // "snapshot_created", or "recovered" for each sandbox a node found on
-  // restart.
-  string type = 6;
+  EventKind kind = 6;
   SandboxState state = 7;
   // Why or from what: a session's started_by or ended_by, a snapshot id, a
   // fork's source, or "lost" for a VM a node found gone on restart.
   string detail = 8;
   string template = 9;
-  map<string, string> metadata = 10;
+  map<string, string> tags = 10;
   uint64 cpu_usage_usec = 11;
   uint64 rx_bytes = 12;
   uint64 tx_bytes = 13;

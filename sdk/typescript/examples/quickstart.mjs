@@ -22,7 +22,8 @@ const sandbox = await Sandbox.getOrCreate({
     allowDomains: ["pypi.org", "*.pythonhosted.org"],
     denyCidrs: ["169.254.0.0/16"],
   },
-  resources: { vcpus: 1, memoryMib: 512, idleSuspendSecs: 300, suspendedTtlSecs: 3600 },
+  resources: { vcpus: 1, memoryMib: 512 },
+  lifetime: { idleSuspendSecs: 300, suspendedTtlSecs: 3600 },
   tags: { purpose: "quickstart", owner: "sdk-example" },
   // Merged under every command this handle runs.
   env: { QUICKSTART: "1" },
@@ -118,15 +119,15 @@ try {
     await child.delete();
   }
 
-  // stop suspends; resume brings it back.
-  await sandbox.stop();
+  // pause suspends; resume brings it back.
+  await sandbox.pause();
   const started = Date.now();
   await sandbox.resume();
   console.log("resumed in:", `${Date.now() - started}ms`);
   console.log("file survived:", (await fs.readFile("/work/hello.sh", "utf8")).trim());
 
   // Auto-resume: a call on a suspended sandbox resumes it and retries once.
-  await sandbox.stop();
+  await sandbox.pause();
   const revived = await execFile("cat", ["/work/hello.sh"]);
   console.log("auto-resumed:", revived.stdout.trim());
 } finally {

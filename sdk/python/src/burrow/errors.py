@@ -21,6 +21,11 @@ _CODES = {
     grpc.StatusCode.CANCELLED: "cancelled",
 }
 
+# What the node says when a call needs a live guest and the sandbox has none.
+_SUSPENDED = "sandbox is suspended; resume it first"
+# What the guest says when a signal arrives after the command ended.
+_EXITED = ("has already exited", "has exited")
+
 
 class BurrowError(Exception):
     """An error from burrow.
@@ -47,18 +52,13 @@ class BurrowError(Exception):
     @property
     def is_suspended(self) -> bool:
         """True when the sandbox is suspended and must be resumed first."""
-        return self.code == "failed_precondition" and bool(
-            re.search("suspend", self.message, re.IGNORECASE)
-        )
+        return self.code == "failed_precondition" and _SUSPENDED in self.message
 
     @property
     def is_already_exited(self) -> bool:
-        """True when a signal was refused because the command had already exited.
-
-        The one refusal a ``kill()`` can ignore, since it asked for a state the
-        command is already in. Narrower than the code alone: a suspended sandbox
-        refuses a signal with ``failed_precondition`` too, and that one is a
-        real failure to deliver.
-        """
-        return self.code == "failed_precondition" and not self.is_suspended
-
+        """True when a signal was refused because the command had already
+        exited: the one refusal a ``kill()`` can ignore, since it asked for a
+        state the command is already in."""
+        return self.code == "failed_precondition" and any(
+            text in self.message for text in _EXITED
+        )

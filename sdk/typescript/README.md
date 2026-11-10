@@ -42,7 +42,8 @@ await sandbox.fs.writeFile("/work/hello.py", "print('hello')\n");
 Every `Sandbox.create` and `Sandbox.get` opens its own gRPC channel. `delete()`
 and `await using` release it; if you want to keep the sandbox and drop the
 connection, call `sandbox.close()`. To share one channel across many sandboxes,
-use [`Burrow`](#manage-many-sandboxes).
+use a [`Burrow`](#manage-the-fleet) client: `burrow.sandboxes.create(...)` takes
+the same options.
 
 ## Create a sandbox
 
@@ -53,14 +54,8 @@ optional.
 const sandbox = await Sandbox.create({
   template: "python-tools",
   tags: { owner: "ci", run: "482" },
-  resources: {
-    vcpus: 2,
-    memoryMib: 2048,
-    diskMib: 4096,
-    maxLifetimeSecs: 3600,
-    idleSuspendSecs: 300,
-    suspendedTtlSecs: 86400,
-  },
+  resources: { vcpus: 2, memoryMib: 2048, scratchDiskMib: 4096 },
+  lifetime: { maxLifetimeSecs: 3600, idleSuspendSecs: 300, suspendedTtlSecs: 86400 },
   networkPolicy: {
     mode: "allowlist",
     allowDomains: ["pypi.org", "*.pythonhosted.org"],
@@ -77,7 +72,9 @@ const sandbox = await Sandbox.create({
 | `snapshot` | none | Restore from a snapshot instead of booting a template |
 | `tags` | `{}` | Up to 16 key/value pairs, used for filtering later |
 | `nodeLabels` | `{}` | Labels the hosting node must carry, all of them. See [Choose where a sandbox runs](#choose-where-a-sandbox-runs) |
-| `resources` | 1 vCPU, 512 MiB | Machine shape, lifetime, and snapshot retention |
+| `resources` | 1 vCPU, 512 MiB | Machine shape |
+| `lifetime` | unlimited | The clocks the sandbox is measured against |
+| `snapshots` | unlimited | Retention of the snapshots taken of it |
 | `networkPolicy` | `"none"` | Egress policy, as a mode or a full policy object |
 | `env` | `{}` | Environment merged under every command this handle runs |
 | `networks` | `[]` | Private networks to join |
@@ -85,22 +82,26 @@ const sandbox = await Sandbox.create({
 | `exec` | everything allowed | Whether callers may run commands in the sandbox |
 | `fs` | everything allowed | What callers may do to the sandbox's filesystem |
 | `kit` | none | Inputs for a template pulled from a [Sandbox Kit](../../docs/TEMPLATES.md#sandbox-kits): `args`, `env` and `rejectCapabilities`. Ignored on any other template |
-| `autoResume` | `true` | Resume and retry once when a call finds the sandbox stopped |
+| `autoResume` | `true` | Resume and retry once when a call finds the sandbox suspended |
+| `onResume` | none | Called whenever this handle resumes the sandbox |
 | `timeoutMs` | `120000` | How long to wait for the boot |
 | `signal` | none | `AbortSignal` that cancels the call |
 
-### Resources
+### Resources and lifetime
 
-| Field | Default | What it does |
+| `resources` field | Default | What it does |
 |---|---|---|
 | `vcpus` | `1` | vCPUs given to the guest |
 | `memoryMib` | `512` | Guest memory |
-| `diskMib` | node default | Writable scratch disk |
+| `scratchDiskMib` | node default | Writable scratch disk |
+
+| `lifetime` field | Default | What it does |
+|---|---|---|
 | `maxLifetimeSecs` | `0` | Hard cap on the sandbox's life. `0` is unlimited |
 | `idleSuspendSecs` | `0` | Suspend after this long with no activity. `0` never suspends |
 | `suspendedTtlSecs` | `0` | Delete a sandbox suspended this long, releasing its disk and address. `0` keeps it forever |
-| `snapshotExpirationSecs` | `0` | Sweep a snapshot this long after it was last used. `0` keeps it indefinitely |
-| `keepLastSnapshots` | `0` | Keep only this many snapshots of the sandbox. `0` is unlimited, otherwise 1 to 10 |
+
+Snapshot retention has its own section, `snapshots`: see [Snapshots](#snapshots).
 
 `idleSuspendSecs` and `suspendedTtlSecs` compose. Idle parks a sandbox, and the
 TTL decides how long the parked state is worth paying for.
@@ -144,7 +145,7 @@ section means: see [Exec and file policy](#exec-and-file-policy).
 Reattach to a sandbox you created earlier.
 
 ```ts
-const sandbox = await Sandbox.get({ id: "sbx_..." });
+const sandbox = await Sandbox.get("sbx_...");
 ```
 
 Sandboxes can carry a name, and every method that takes an identifier takes a
@@ -153,7 +154,7 @@ second, and the two cannot collide.
 
 ```ts
 const api = await Sandbox.create({ name: "api" });
-const same = await Sandbox.get({ name: "api" });
+const same = await Sandbox.get("api");
 ```
 
 A name is 1 to 63 characters of lowercase letters, digits and `-`, not starting
@@ -182,7 +183,7 @@ const sandbox = await Sandbox.getOrCreate({
 | `name` | The name to get or create. Required: ids are generated, so there is none to ask for |
 | `onCreate` | Awaited when this call is the one that created the sandbox |
 | `onResume` | Called whenever this handle resumes the sandbox, auto-resume included |
-| `resume` | Resume a stopped sandbox up front. Defaults to false |
+| `resume` | Resume a suspended sandbox up front. Defaults to false |
 | create options | Everything `create` takes, applied only when the sandbox has to be made |
 
 Create options are ignored when the sandbox already exists. It is handed back as
@@ -570,10 +571,8 @@ A `position` of `null` reads or writes at the handle's own position and moves
 it; a number does not move it. A closed handle rejects with `EBADF`, as Node's
 does. The agent closes a handle left unused for ten minutes.
 
-A whole-file `readFile` with the default flag, as root, takes the
-`DownloadFile` stream, one call however large the file. Everything else opens
-the file and reads or writes it in pieces of up to 4 MiB a call, so a big
-`writeFile` costs a call per 4 MiB.
+`readFile` and `writeFile` open the file and read or write it in pieces of up
+to 4 MiB a call, so a big file costs a call per 4 MiB.
 
 ### Watch for changes
 
@@ -628,9 +627,7 @@ await Sandbox.create({
     allowPorts: [443],
     denyCidrs: ["169.254.0.0/16"],
     inspectTls: true,
-    injectHeaders: [
-      { domain: "api.github.com", name: "authorization", value: `Bearer ${token}` },
-    ],
+    rules: [{ domain: "api.github.com", setHeaders: { authorization: `Bearer ${token}` } }],
   },
 });
 ```
@@ -642,11 +639,11 @@ await Sandbox.create({
 | `allowCidrs` | Extra destinations permitted at the IP layer |
 | `allowPorts` | Destination ports permitted |
 | `denyCidrs` | Ranges the sandbox may never reach, in any mode, IPv4 or IPv6 |
+| `denyDomains` | Domain globs refused in every mode, before any allowance |
 | `denyPorts` | Destination ports refused in any mode: `{ protocol?: "tcp" \| "udp", port, portEnd?, cidrs? }`, no protocol meaning both |
 | `denyIpv6` | Refuse every IPv6 destination, in any mode |
 | `inspectTls` | Terminate the sandbox's TLS so the host inside the session is checked as well as the SNI |
 | `rules` | What the host does to the requests it inspects, in order |
-| `injectHeaders` | Credentials the host attaches on the sandbox's behalf, appended after `rules` |
 
 Deny beats every allowance. An allowed domain that resolves into a denied range
 is refused, and a denied port stays denied in open mode:
@@ -669,8 +666,8 @@ await Sandbox.create({
 
 A rule acts on the inspected requests to one domain. `setHeaders` sets headers
 on them, which is header injection: the value stays on the node, and reading
-the policy back gives you `<redacted>`. `injectHeaders` is the same thing as a
-rule with no matcher.
+the policy back gives you `<redacted>`. A rule with no `match` applies to every
+request to its domain, which is what brokering one credential looks like.
 
 ```ts
 await Sandbox.create({
@@ -697,15 +694,14 @@ Rules need `inspectTls`, because the proxy has to terminate TLS to read a
 request at all. In allowlist mode the domain has to be in `allowDomains`,
 since only traffic to an allowed domain is inspected; in open mode the rule's
 domain, an exact host, is itself what is inspected, and nothing else is. A rule
-may carry `expiresAtUnixMs`, after which it stops applying on its own; a policy
-read back marks it `expired`. The guest is handed the inspection root
-during its first handshake, so inspection is a create-time choice: adding rules
-to a sandbox created without it throws `failed_precondition` rather than
-silently doing nothing. A secret never leaves the node: code in the guest uses
-the credential without ever holding it, and every read of the policy returns
-injected values and forward secrets redacted. Reading a policy back gives you
-`rules` in full; `injectHeaders` still reports the subset of them that is a
-matcher-less header injection.
+may carry `expiresAt`, a `Date` after which it stops applying on its own. The
+guest is handed the inspection root during its first handshake, so inspection
+is a create-time choice: adding rules to a sandbox created without it is
+refused with `failed_precondition` rather than silently doing nothing. A secret
+never leaves the node: code in the guest uses the credential without ever
+holding it, and every read of the policy returns injected values and forward
+secrets redacted. A rule whose value came from a scoped secret reads back with
+`boundSandboxId`, the one sandbox it applies in.
 
 #### Narrowing a rule with `match`
 
@@ -849,7 +845,7 @@ The clocks a sandbox is measured against move too, so work that turns out to
 need longer is not stuck with the budget it was created under.
 
 ```ts
-await sandbox.updateResources({ maxLifetimeSecs: 7200, idleSuspendSecs: 900 });
+await sandbox.updateLifetime({ maxLifetimeSecs: 7200, idleSuspendSecs: 900 });
 ```
 
 A lifetime is a total measured from when the sandbox was created rather than an
@@ -858,9 +854,9 @@ An omitted field is left where it is, which is what lets `0` keep meaning
 "unlimited" here as it does on create. The reaper reads the policy on its next
 pass, so an extension takes effect without restarting anything.
 
-The machine shape is not updatable at all: `vcpus`, memory and disk are not
-fields on an update, because a running VM's configuration is fixed and a restore
-takes its shape from the snapshot. Create a new sandbox, or a snapshot and a
+The machine shape is not updatable at all: `resources` has no update call,
+because a running VM's configuration is fixed and a restore takes its shape
+from the snapshot. Create a new sandbox, or a snapshot and a
 sandbox from it, at the shape you want.
 
 ## Expose ports
@@ -870,6 +866,7 @@ sandbox.childProcess.spawn("python3", ["-m", "http.server", "8000"]);
 
 const { url } = await sandbox.exposePort(8000);
 // -> http://<node>:20000
+await sandbox.exposePort(5353, { udp: true });
 
 await sandbox.listPorts();
 await sandbox.closePort(20000);
@@ -884,21 +881,22 @@ The edge router is a per-node thing, turned on with `burrowd serve
 --edge-domain`. When the node holding the sandbox runs one, every mapping
 carries an `edgeUrl` alongside `url`, a per-sandbox hostname of the form
 `http://<port>-<sandbox-id>.<edge-domain>/`, and traffic arriving on it wakes a
-stopped sandbox, which is what makes `idleSuspendSecs` safe to turn on behind a
+suspended sandbox, which is what makes `idleSuspendSecs` safe to turn on behind a
 published port. Only that node can answer the hostname, so a sandbox that ends
 up on a node without an edge has no `edgeUrl` at all and `domain` falls back to
 the bare `host:port` of the node.
 
-## Stop, resume, shut down, and fork
+## Pause, resume, stop, and fork
 
-`stop` snapshots the sandbox, memory and processes and filesystem, and shuts its
-VM down. `resume` restores it from that snapshot rather than booting, and
+The method names are the states they lead to. `pause` snapshots the sandbox,
+memory and processes and filesystem, and shuts its VM down, leaving it
+`suspended`. `resume` restores it from that snapshot rather than booting, and
 running processes carry on where they left off.
 
 ```ts
-await sandbox.stop();
+await sandbox.pause();
 // minutes or days later, possibly from a different process
-const again = await Sandbox.get({ id: sandbox.id });
+const again = await Sandbox.get(sandbox.id);
 await again.resume();
 ```
 
@@ -924,15 +922,15 @@ the source's name, because a name belongs to one sandbox. It cannot be reshaped
 either: a restored VM takes its vcpus and memory from the snapshot, so a fork
 asking for a different shape is refused.
 
-`shutdown` is what `docker stop` does. The VM stops and nothing in memory
-survives, but the writable disk and volumes stay, and `boot` runs the image's
+`stop` is what `docker stop` does. The VM stops and nothing in memory
+survives, but the writable disk and volumes stay, and `start` runs the image's
 init again on them. For a sandbox created from a Sandbox Kit that is the stop
-and start the Kit spec describes, and its startup hooks run again. A boot takes
+and start the Kit spec describes, and its startup hooks run again. A start takes
 as long as a create, since there is no memory to restore.
 
 ```ts
-await sandbox.shutdown();
-await sandbox.boot();
+await sandbox.stop();
+await sandbox.start();
 ```
 
 `recreate` replaces the root disk, discarding everything written to it, while
@@ -947,8 +945,8 @@ await sandbox.recreate({ template: "kit-9a8b7c6d5e4f3a2b", kit: { args: { team: 
 | Method | What happens to the VM | Can you resume it |
 |---|---|---|
 | `snapshot()` | Briefly paused, then keeps running | Already running |
-| `stop()` / `pause()` | Snapshotted, then shut down | Yes, with `resume()`, memory intact |
-| `shutdown()` | Shut down, disks kept | Yes, with `boot()`, which runs init again |
+| `pause()` | Snapshotted, then shut down | Yes, with `resume()`, memory intact |
+| `stop()` | Shut down, disks kept | Yes, with `start()`, which runs init again |
 | `recreate()` | Replaced by a fresh one on a new root disk | Already running |
 | `delete()` | Destroyed, disk released | No |
 
@@ -958,8 +956,8 @@ restore point: the guest keeps writing to its disk, so the pair stops agreeing
 the moment it resumes. Take a `snapshot()` when you want a point to come back
 to, which copies the disk alongside the memory.
 
-`stop` returns the sandbox record as it stands afterwards, carrying the cpu and
-bytes the sandbox has used. See [Usage](#usage).
+`pause` returns the sandbox record as it stands afterwards, carrying the cpu
+and bytes the sandbox has used. See [Usage](#usage).
 
 A deleted handle is inert. Every later call throws `failed_precondition`
 immediately rather than failing somewhere deeper against an id that is gone.
@@ -967,30 +965,31 @@ immediately rather than failing somewhere deeper against an id that is gone.
 ## Sessions
 
 A session is one VM boot inside a sandbox's life. A sandbox outlives its VMs:
-`stop` ends one and `resume` starts the next, and a fork or a create from a
+`pause` ends one and `resume` starts the next, and a fork or a create from a
 snapshot starts one from state written elsewhere.
 
 ```ts
 const sessions = await sandbox.listSessions();
-// [{ id, sandboxId, startedBy: "resume", endedBy: "", startedAt, endedAt: "" }, ...]
+// [{ id, sandboxId, startedBy: "resume", endedBy: null, startedAt, endedAt: null }, ...]
 
 const [newest] = sessions;                     // newest first
 const restarts = sessions.length - 1;
 
 const current = await sandbox.currentSession();
-// the open session, or undefined once the sandbox is stopped
+// the open session, or undefined once the sandbox has no VM
 ```
 
-`currentSession` is the session with no `endedAt`. It is a filter over the list,
+`currentSession` is the session with no `endedBy`. It is a filter over the list,
 with its own name because that is how the question gets asked: how long has this
 one been up, not which of every VM this sandbox has run is still going.
 
 `startedBy` is `boot` from a template, `restore` from a fork or a snapshot, or
-`resume` from the sandbox's own stop state, and `unknown` for anything a newer
-server reports that this client does not recognise. `endedBy` is `""` while the
-VM is running, then `suspended`, `deleted`, `failed`, or `unknown` for a session
-that was open when its node died. An `unknown` session has an empty `endedAt`,
-because nothing recorded when its VM stopped.
+`resume` from the sandbox's own suspend state, and `unknown` for anything a
+newer server reports that this client does not recognise. `endedBy` is `null`
+while the VM is running, then `suspended`, `stopped`, `deleted`, `failed`, or
+`unknown` for a session that was open when its node died. An `unknown` session
+has a `null` `endedAt`, because nothing recorded when its VM stopped.
+`startedAt` and `endedAt` are `Date`s.
 
 Each node keeps the 64 most recent sessions of a sandbox and evicts the oldest,
 so a long-lived sandbox does not grow the list without bound. The list belongs
@@ -999,7 +998,7 @@ to the sandbox and goes when you delete it.
 ## Usage
 
 Every sandbox record carries what it has actually consumed, totalled across
-every VM it has run, so a stop and a resume do not reset it.
+every VM it has run, so a pause and a resume do not reset it.
 
 ```ts
 await sandbox.refresh();
@@ -1059,7 +1058,7 @@ most 8 per sandbox.
 
 ```ts
 await Volume.list();                       // every volume
-await Volume.list({ node: "node-a" });     // one node's
+await Volume.list({ nodeId: "node-a" });   // one node's
 const v = await Volume.get("build-cache"); // v.attachedTo is read from the node
 await v.delete();                          // refused while a sandbox holds it
 ```
@@ -1084,7 +1083,7 @@ import { Sandbox, Snapshot } from "@pixec/burrow";
 const snapshot = await sandbox.snapshot();          // the sandbox keeps running
 const restored = await Sandbox.create({ snapshot: snapshot.id });
 
-await Snapshot.list({ sandbox: sandbox.id });
+await Snapshot.list({ sandboxId: sandbox.id });
 await Snapshot.get(snapshot.id);
 await snapshot.delete();
 ```
@@ -1094,41 +1093,36 @@ the processes and memory the source had. It takes its template and machine shape
 from the snapshot, so passing a `template` or `resources` that disagree is
 refused rather than silently ignored.
 
-A snapshot encodes the host's cpu architecture and the exact Firecracker
+A snapshot encodes the host's cpu architecture and the exact hypervisor
 version. A create from one is placed on the node holding it. When the nodes run
 with an object store (`burrowd serve --object-store`), every snapshot is also
-uploaded there, and `snapshot.isDurable` turns true once the upload finishes. A
+uploaded there, and `snapshot.durable` turns true once the upload finishes. A
 create from a durable snapshot can then be placed on any node with the same
-`snapshot.arch` and `snapshot.firecrackerVersion`, including when the node that
-took it is gone. `snapshot.nodeId` is empty when only the store holds it. See
+`snapshot.arch`, `snapshot.hypervisor` and `snapshot.hypervisorVersion`,
+including when the node that took it is gone. `snapshot.resources` is the
+machine it was taken on, and `snapshot.createdAt` and `snapshot.expiresAt`
+are `Date`s, the latter `null` for one that never expires. `snapshot.nodeId` is empty when only the store holds it. See
 [PERSISTENCE.md](../../docs/PERSISTENCE.md#snapshots).
 
-Bound how much disk they hold with three `resources` fields, set when the
+Bound how much disk they hold with the `snapshots` section, set when the
 sandbox is created:
 
 | Field | Effect | Default |
 |---|---|---|
-| `snapshotExpirationSecs` | Sweep a snapshot this long after it was last used | `0`, keep indefinitely |
-| `keepLastSnapshots` | Keep only this many snapshots of the sandbox | `0`, unlimited; 1 to 10 otherwise |
-| `keepEvictedSnapshots` | Let an evicted snapshot expire on its own instead of being deleted at once | `false`, evictions delete |
+| `expirationSecs` | Sweep a snapshot this long after it was last used | `0`, keep indefinitely |
+| `keepLast` | Keep only this many snapshots of the sandbox | `0`, unlimited; 1 to 10 otherwise |
+| `keepEvicted` | Let an evicted snapshot expire on its own instead of being deleted at once | `false`, evictions delete |
 
 ```ts
 const sbx = await Sandbox.create({
   name: "build-env",
-  resources: {
-    keepLastSnapshots: 2,
-    snapshotExpirationSecs: 7 * 24 * 60 * 60,
-    keepEvictedSnapshots: true,
-  },
+  snapshots: { keepLast: 2, expirationSecs: 7 * 24 * 60 * 60, keepEvicted: true },
 });
-await sbx.snapshot({ expiration: 3600 }); // wins over the sandbox default
+await sbx.snapshot({ expirationSecs: 3600 }); // wins over the sandbox default
 ```
 
-All three live under `resources`, not at the top level, so a create that sets
-them anywhere else silently keeps the defaults.
-
-`keepEvictedSnapshots` releases an evicted snapshot rather than deleting it: it
-stops counting toward `keepLastSnapshots` and stays restorable until its own
+`keepEvicted` releases an evicted snapshot rather than deleting it: it
+stops counting toward `keepLast` and stays restorable until its own
 expiration sweeps it. It requires the other two fields, and a create that sets
 it without them is refused, because with no cap nothing is evicted and with no
 expiry a released snapshot is never reclaimed.
@@ -1150,9 +1144,9 @@ const template = Template()
   .pipInstall(["cowsay", "requests"])
   .writeFile("/etc/motd", "built by burrow\n");
 
-await Template.build(template, "python-tools", {
-  cpuCount: 2,
-  memoryMB: 2048,
+const { sizeBytes } = await Template.build(template, "python-tools", {
+  vcpus: 2,
+  memoryMib: 2048,
   onBuildLogs: defaultBuildLogger(),
 });
 
@@ -1165,11 +1159,11 @@ build, so a broken step never gets baked in. Linux builds default to 1 vCPU,
 1024 MiB, a 30 minute timeout, and unrestricted egress, because installing packages needs
 it; pass `allowDomains` to narrow the egress.
 
+`Template.build` returns what the node reports: the template's name and size.
 `Template.list()` and `Template.delete(name)` manage what exists. Inspect a plan
 before building it with `template.plan`. Also available: `runCmd`, `apkInstall`,
-`npmInstall`, `mkdir`, and `workdir`, which despite the name only creates the
-directory. Steps do not inherit a working directory, so `cd` inside the step
-that needs one.
+`npmInstall` and `mkdir`. Steps do not inherit a working directory, so `cd`
+inside the step that needs one.
 
 ### Start from an OCI image
 
@@ -1207,8 +1201,8 @@ a clone of it as a new Mac and runs them through the agent as root:
 
 ```ts
 await Template.build(Template().fromIpsw("latest"), "macos-27", {
-  cpuCount: 4,
-  memoryMB: 8192,
+  vcpus: 4,
+  memoryMib: 8192,
 });
 await Template.build(
   Template().fromTemplate("macos-27").runCmd("touch /Users/Shared/built"),
@@ -1237,19 +1231,28 @@ receiving node warms the template again itself.
 
 ## Manage the fleet
 
-`Burrow` is for what is not one sandbox's: health, nodes, audit, events and
-secrets. Sandboxes are reached through `Sandbox`.
+`Burrow` is the client: one connection that every handle made through it
+shares. `burrow.sandboxes`, `burrow.snapshots`, `burrow.volumes` and
+`burrow.templates` take the same options as the `Sandbox`, `Snapshot`,
+`Volume` and `Template` statics, which open a client of their own for the one
+call. Fleet-wide calls, health, nodes, audit, events, usage and secrets, are on
+the client itself.
 
 ```ts
 import { Burrow } from "@pixec/burrow";
 
 const burrow = new Burrow({ endpoint: "localhost:7070" });
+const sandbox = await burrow.sandboxes.create({ template: "python" });
 const nodes = await burrow.nodes();
+// [{ id, labels, arch, hypervisorVersions, disk, lastHeartbeatAt, ... }]
+await burrow.drainNode(nodes[0].id, { suspend: true });
+await burrow.undrainNode(nodes[0].id);
 burrow.close();
 ```
 
 `burrow.health()` checks the orchestrator is answering, and a `Burrow` also
-works with `using` for scope-bound cleanup.
+works with `using` for scope-bound cleanup. Every method takes `signal` and
+`timeoutMs`.
 
 ### Secrets
 
@@ -1260,10 +1263,9 @@ proxy, so a guest never holds it. See
 
 ```ts
 await burrow.setSecret("github", process.env.GITHUB_TOKEN);
-await burrow.listSecrets(); // ["github"], values are never returned
 // Usable only by the sandboxes named, by id or name, or carrying a tag:
 await burrow.setSecret("api-token", token, { sandboxes: [sandbox.id], tags: ["team=ml"] });
-await burrow.listSecretScopes(); // [{ name, scope: { sandboxes, tags } }]
+await burrow.listSecrets(); // [{ name, scope: { sandboxes, tags } }], values are never returned
 await burrow.deleteSecret("github");
 ```
 
@@ -1297,8 +1299,7 @@ source's node.
 Every connection attempt and DNS lookup a sandbox makes is recorded.
 
 ```ts
-const denied = await burrow.audit({ deniedOnly: true, limit: 20 });
-for (const event of denied) {
+for await (const event of burrow.audit({ deniedOnly: true, since: new Date("2026-10-01"), limit: 20 })) {
   console.log(event.at, event.sandboxId, event.host, event.reason);
 }
 ```
@@ -1317,8 +1318,8 @@ The orchestrator keeps one ordered log of what happened to every sandbox:
 
 ```ts
 let after = 0;
-for await (const event of burrow.events({ after, sandbox: "build-482", follow: true })) {
-  console.log(event.seq, event.type, event.state, event.detail);
+for await (const event of burrow.events({ after, sandboxId: "build-482", follow: true })) {
+  console.log(event.seq, event.kind, event.state, event.detail);
   after = event.seq; // resume from here after a disconnect
 }
 ```
@@ -1327,7 +1328,7 @@ for await (const event of burrow.events({ after, sandbox: "build-482", follow: t
 (`suspended`, `deleted`, `stopped`, `failed`), what a sandbox was created from
 (`fork:<id>`, `snapshot:<id>`), or the snapshot a commit produced. Each event
 also carries the sandbox's `cpuUsageUsec`, `rxBytes`, `txBytes`, `vcpus` and
-`memoryMib` at that instant. Without `follow` the iterator ends after the
+`memoryMib` at that instant, and `at` as a `Date`. Without `follow` the iterator ends after the
 replay; `limit` caps how many events are replayed. Break out of the loop or pass
 a `signal` to stop following. See
 [The event log](../../docs/ARCHITECTURE.md#the-event-log).
@@ -1337,13 +1338,13 @@ a `signal` to stop following. See
 The usage ledger holds the intervals each sandbox spent in one state at one
 shape, built from those events, and outlives the sandboxes it describes.
 `burrow.usage()` returns the intervals, or with `groupBy` (`sandbox`,
-`template`, `node`, `state` or a tag key) their sums per group and state.
+`template`, `node`, `state` or `tag:<key>`) their sums per group and state.
 
 ```ts
 const { sums } = await burrow.usage({
   from: new Date("2026-10-01"),
   to: new Date("2026-11-01"),
-  groupBy: "customer",
+  groupBy: "tag:customer",
 });
 for (const sum of sums) {
   console.log(sum.group, sum.state, sum.vcpuMs / 3_600_000, sum.txBytes);
@@ -1356,9 +1357,10 @@ An interval belongs to the window it started in. Without `groupBy`, pass
 
 ## Cancel calls
 
-Most methods take an optional `signal`. The exceptions are the ones with no
-call of their own to cancel or no options object to hold it: `terminal`,
-`asUser`, and the `fs` functions whose Node signature has no options.
+Every method takes an optional `signal`, and a `timeoutMs` for its deadline.
+The exceptions are the ones with no call of their own to cancel or no options
+object to hold it: `terminal`, `asUser`, and the `fs` functions whose Node
+signature has no options.
 
 ```ts
 const controller = new AbortController();
@@ -1390,7 +1392,7 @@ knowing the transport.
 import { BurrowError } from "@pixec/burrow";
 
 try {
-  await Sandbox.get({ id: "sbx_missing" });
+  await Sandbox.get("sbx_missing");
 } catch (err) {
   if (err instanceof BurrowError && err.code === "not_found") {
     // ...
@@ -1424,10 +1426,12 @@ sandbox.template;
 sandbox.tags;
 sandbox.vcpus;
 sandbox.memoryMib;
-sandbox.createdAt;     // RFC 3339
+sandbox.createdAt;     // Date
 sandbox.policy;        // the policy in force, injected values redacted
 sandbox.nodeId;
 sandbox.unreachable;   // true when the hosting node has missed its heartbeats
+sandbox.durable;       // suspended with its state in the object store
+sandbox.guestIp;
 sandbox.usage;         // { cpuUsageUsec, rxBytes, txBytes }
 ```
 
@@ -1454,10 +1458,10 @@ Everything else goes to the orchestrator.
 
 | Method | RPC |
 |---|---|
-| `Sandbox.create` | `CreateSandbox` |
-| `Sandbox.getOrCreate` | `GetSandbox`, then `CreateSandbox` |
-| `Sandbox.get`, `sandbox.refresh` | `GetSandbox` |
-| `Sandbox.list` | `ListSandboxes` |
+| `Sandbox.create`, `burrow.sandboxes.create` | `CreateSandbox` |
+| `Sandbox.getOrCreate`, `burrow.sandboxes.getOrCreate` | `GetSandbox`, then `CreateSandbox` |
+| `Sandbox.get`, `burrow.sandboxes.get`, `sandbox.refresh` | `GetSandbox` |
+| `Sandbox.list`, `burrow.sandboxes.list` | `ListSandboxes` |
 | `sandbox.fork` | `ForkSandbox` |
 | `childProcess.spawn`, `exec`, `execFile`, `sandbox.terminal` | `Exec` on the node |
 | `sandbox.listCommands` | `ListCommands` |
@@ -1467,29 +1471,30 @@ Everything else goes to the orchestrator.
 | `sandbox.createUser`, `createGroup` | `CreateUser`, `CreateGroup` |
 | `sandbox.deleteUser`, `deleteGroup` | `DeleteUser`, `DeleteGroup` |
 | `sandbox.addUserToGroup`, `removeUserFromGroup` | `AddUserToGroup`, `RemoveUserFromGroup` |
-| `fs.readFile`, as root with the default flag | `DownloadFile` on the node |
-| `fs.readFile` otherwise, `writeFile`, `appendFile` | `Fs` on the node: open, a read or write per 4 MiB, close |
+| `fs.readFile`, `writeFile`, `appendFile` | `Fs` on the node: open, a read or write per 4 MiB, close |
 | `fs.stat`, `lstat`, `readdir`, `mkdir`, `mkdtemp`, `rm`, `rmdir`, `unlink`, `rename`, `copyFile`, `cp`, `chmod`, `chown`, `lchown`, `utimes`, `lutimes`, `truncate`, `symlink`, `link`, `readlink`, `realpath`, `access` | `Fs` on the node, one call each (`cp` without `force`, or with a `filter`, one per entry) |
 | `fs.open`, and every `FileHandle` method | `Fs` on the node, one call each |
 | `fs.watch` | `Watch` on the node |
 | `sandbox.exposePort`, `listPorts`, `closePort`, `domain` | `ExposePort`, `ListPorts`, `ClosePort` |
 | `sandbox.updateTags` | `UpdateTags` |
 | `sandbox.updateNetworkPolicy` | `UpdateNetworkPolicy` |
-| `sandbox.updateResources` | `UpdateResources` |
+| `sandbox.updateLifetime` | `UpdateLifetime` |
 | `sandbox.updateAccessPolicy` | `UpdateAccessPolicy` |
 | `sandbox.listSessions`, `currentSession` | `ListSessions` |
-| `sandbox.stop` | `PauseSandbox` |
+| `sandbox.pause` | `PauseSandbox` |
 | `sandbox.resume` | `ResumeSandbox` |
-| `sandbox.shutdown` | `StopSandbox` |
-| `sandbox.boot` | `StartSandbox` |
+| `sandbox.stop` | `StopSandbox` |
+| `sandbox.start` | `StartSandbox` |
 | `sandbox.recreate` | `RecreateSandbox` |
 | `sandbox.delete` | `DeleteSandbox` |
 | `sandbox.snapshot`, `Snapshot.list`, `get`, `delete` | `CreateSnapshot`, `ListSnapshots`, `GetSnapshot`, `DeleteSnapshot` |
+| `Volume.create`, `list`, `get`, `delete` | `CreateVolume`, `ListVolumes`, `GetVolume`, `DeleteVolume` |
 | `Template.build`, `list`, `delete` | `BuildTemplate`, `ListTemplates`, `DeleteTemplate` |
+| `burrow.usage` | `QueryUsage` |
 | `burrow.audit` | `QueryAudit` |
 | `burrow.events` | `TailEvents` |
-| `burrow.nodes`, `drainNode` | `ListNodes`, `DrainNode` |
-| `burrow.setSecret`, `listSecrets`, `listSecretScopes`, `deleteSecret` | `SetSecret`, `ListSecrets`, `DeleteSecret` |
+| `burrow.nodes`, `drainNode`, `undrainNode` | `ListNodes`, `DrainNode` |
+| `burrow.setSecret`, `listSecrets`, `deleteSecret` | `SetSecret`, `ListSecrets`, `DeleteSecret` |
 | `burrow.health` | `Health` |
 
 ## Migrating from earlier versions
@@ -1517,13 +1522,35 @@ one policy object. What was removed, and what to use instead:
 | `networkPolicy: { allow, subnets }` | `{ mode: "allowlist", allowDomains, allowCidrs, denyCidrs }` |
 | `allow: { domain: { transform, match } }`, `forwardURL`, `forwardSecret` | `rules: [{ domain, match, setHeaders }]`, `forward: { url, secret }`, with `inspectTls: true` |
 | `sandbox.commands`, `sandbox.pty` | `childProcess`, and `terminal()` |
-| `Sandbox.connect(id)`, `Sandbox.fork({ source })` | `Sandbox.get({ id })`, `(await Sandbox.get({ id })).fork()` |
-| `update({...})`, `extendTimeout`, `setTimeout` | `updateTags`, `updateNetworkPolicy`, `updateAccessPolicy`, `updateResources` |
-| `pause`, `kill` | `stop`, `delete` |
+| `Sandbox.connect(id)`, `Sandbox.fork({ source })` | `Sandbox.get(id)`, `(await Sandbox.get(id)).fork()` |
+| `update({...})`, `extendTimeout`, `setTimeout` | `updateTags`, `updateNetworkPolicy`, `updateAccessPolicy`, `updateLifetime` |
+| `kill` | `delete` |
 | `getInfo`, `isRunning` | `refresh()`, then `state` |
 | `status`, `image`, `metadata`, `memory`, `sandboxId`, `networkPolicy` | `state`, `template`, `tags`, `memoryMib`, `id`, `policy.network` |
-| `burrow.create`, `get`, `list` | `Sandbox.create`, `get`, `list` |
 | `network`, `image`, `metadata` options | `networkPolicy`, `template`, `tags` |
+| `stop()`, `shutdown()`, `boot()` | `pause()`, `stop()`, `start()`, named for the states they lead to |
+| `updateResources` | `updateLifetime` |
+| `resources.maxLifetimeSecs`, `idleSuspendSecs`, `suspendedTtlSecs` | the `lifetime` section |
+| `resources.snapshotExpirationSecs`, `keepLastSnapshots`, `keepEvictedSnapshots` | `snapshots.expirationSecs`, `keepLast`, `keepEvicted` |
+| `resources.diskMib` | `resources.scratchDiskMib` |
+| `Sandbox.get({ sandboxId })`, `get({ name })` | `Sandbox.get(idOrName)` or `get({ id })` |
+| `fork({ sandboxId })` | gone: ids are generated |
+| `injectHeaders` | a `rules` entry with `setHeaders` and no `match` |
+| `rule.expiresAtUnixMs`, `rule.expired` | `rule.expiresAt`, a `Date`; expiry is read off it |
+| `snapshot({ expiration })` | `snapshot({ expirationSecs })` |
+| `isDurable`, `firecrackerVersion` | `durable`, `hypervisorVersion` |
+| `EventsOptions.sandbox`, `UsageQuery.sandbox`, `ListSnapshotsOptions.sandbox`, `ListVolumesOptions.node` | `sandboxId`, `sandboxId`, `sandboxId`, `nodeId` |
+| `event.type`, `event.atUnixMs`, `event.metadata` | `event.kind`, `event.at`, `event.tags` |
+| `interval.metadata`, `startedAtUnixMs`, `endedAtUnixMs` | `interval.tags`, `startedAt`, `endedAt` |
+| `usage({ groupBy: "<tag key>" })` | `usage({ groupBy: "tag:<key>" })` |
+| `audit()` returning an array | an async iterable; `since` is a `Date` |
+| `share({ noTransparentIp: true })` | `share({ transparentIp: false })` |
+| `exposePort(guest, hostPort)` | `exposePort(guest, { hostPort, udp })` |
+| `Template.build` options `cpuCount`, `memoryMB` | `vcpus`, `memoryMib`; it returns `{ template, sizeBytes }` |
+| `listSecretScopes()` | `listSecrets()`, which returns names and scopes |
+| `drainNode(id, { drain: false })` | `undrainNode(id)` |
+| RFC 3339 strings (`createdAt`, `startedAt`, `expiresAt`, `audit.at`) | `Date`s, `null` where nothing has happened yet |
+| `constants` from the package | `sandbox.fs.constants` |
 
 `sandbox.checkpoint()` is gone. Memory written without the disk is not a restore
 point, and the guest keeps writing to its disk the moment it resumes, so the two

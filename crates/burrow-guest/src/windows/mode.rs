@@ -53,13 +53,13 @@ pub fn mode(attributes: u32, reparse_tag: u32, name: &str) -> u32 {
 }
 
 /// The `d_type` name a directory entry is listed with.
-pub fn entry_type(attributes: u32, reparse_tag: u32) -> &'static str {
+pub fn entry_type(attributes: u32, reparse_tag: u32) -> burrow_proto::guest::v1::FileType {
     if is_link(attributes, reparse_tag) {
-        "symlink"
+        burrow_proto::guest::v1::FileType::Symlink
     } else if attributes & FILE_ATTRIBUTE_DIRECTORY != 0 {
-        "dir"
+        burrow_proto::guest::v1::FileType::Dir
     } else {
-        "file"
+        burrow_proto::guest::v1::FileType::File
     }
 }
 
@@ -106,10 +106,19 @@ mod tests {
         let link = FILE_ATTRIBUTE_REPARSE_POINT;
         assert_eq!(mode(link, IO_REPARSE_TAG_SYMLINK, "l"), S_IFLNK | 0o777);
         let junction = FILE_ATTRIBUTE_REPARSE_POINT | FILE_ATTRIBUTE_DIRECTORY;
-        assert_eq!(entry_type(junction, IO_REPARSE_TAG_MOUNT_POINT), "symlink");
+        assert_eq!(
+            entry_type(junction, IO_REPARSE_TAG_MOUNT_POINT),
+            burrow_proto::guest::v1::FileType::Symlink
+        );
         // A deduplicated file is still a file.
-        assert_eq!(entry_type(link, 0x8000_0013), "file");
-        assert_eq!(entry_type(FILE_ATTRIBUTE_DIRECTORY, 0), "dir");
+        assert_eq!(
+            entry_type(link, 0x8000_0013),
+            burrow_proto::guest::v1::FileType::File
+        );
+        assert_eq!(
+            entry_type(FILE_ATTRIBUTE_DIRECTORY, 0),
+            burrow_proto::guest::v1::FileType::Dir
+        );
     }
 
     #[test]

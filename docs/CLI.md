@@ -1847,7 +1847,7 @@ burrow usage --sandbox sbx_44d9739f011c42439003b74ebd3ff059
 #   1565 sbx_44d9739f011c4243900… suspended     2   1024 2026-10-29T07:07:45Z        20.8s       0.0s      192 B        0 B started
 #   1566 sbx_44d9739f011c4243900… running       2   1024 2026-10-29T07:08:06Z        16.9s       6.5s      192 B        0 B destroyed
 
-burrow usage --from 2026-10-29 --group-by customer
+burrow usage --from 2026-10-29 --group-by tag:customer
 # GROUP                    STATE       ROWS     DURATION    VCPU-H     GIB-H        CPU         RX         TX
 # acme                     running        3       9m 33s     0.319     0.159     115.5s   46.0 MiB  186.8 KiB
 # acme                     suspended      2        20.8s     0.012     0.006       0.0s      192 B        0 B
@@ -1860,7 +1860,7 @@ burrow usage --from 2026-10-29 --group-by customer
 | `--to <DATE>` | End of the window, exclusive, in the same form. |
 | `--sandbox <ID>` | Restrict to one sandbox, by id, or by name while it exists. |
 | `--tag <KEY=VALUE>` | Only sandboxes that carried this tag. Repeatable. |
-| `--group-by <KEY>` | Sum per group and state by `sandbox`, `template`, `node`, `state` or a tag key. Omitted lists the intervals. |
+| `--group-by <GROUP>` | Sum per group and state by `sandbox`, `template`, `node`, `state` or `tag:<key>`. Omitted lists the intervals. |
 | `--format <FORMAT>` | `table` (default) or `json`. |
 | `--closed` | Leave out the stretch since each open interval began. |
 | `--after <ID>` | Continue an export after this interval id, the previous page's `next_after`. |
@@ -1891,7 +1891,7 @@ burrow audit --denied --limit 20
 | --- | --- |
 | `--sandbox <ID>` | Restrict to one sandbox. |
 | `--denied` | Only attempts the proxy refused. |
-| `--since <RFC3339>` | Lower bound, for example `2026-08-27T00:00:00Z`. |
+| `--since <UTC>` | Lower bound, for example `2026-08-27` or `2026-08-27T00:00:00Z`. |
 | `--limit <N>` | Rows to return. Defaults to 50. |
 
 ## nodes

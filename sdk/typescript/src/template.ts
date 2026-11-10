@@ -1,24 +1,25 @@
 import { Buffer } from "node:buffer";
 
-import { BurrowError } from "./errors.js";
-import { Transport, type TransportOptions } from "./transport.js";
+import { withClient } from "./client.js";
+import type { TransportOptions } from "./transport.js";
+import type { CallOptions } from "./types.js";
 
 /** One step of a template build. */
 export interface BuildStep {
   run: string;
 }
 
-export interface BuildOptions extends TransportOptions {
+export interface BuildOptions extends CallOptions {
   /**
    * vCPUs given to the build sandbox. Defaults to 1 for Linux and the restore
    * image's minimum for macOS.
    */
-  cpuCount?: number;
+  vcpus?: number;
   /**
    * Memory given to the build sandbox, in MiB. Defaults to 1024 for Linux and
    * the restore image's minimum for macOS.
    */
-  memoryMB?: number;
+  memoryMib?: number;
   /**
    * Hypervisor every sandbox from the template runs under: `"firecracker"`,
    * `"cloud-hypervisor"` or `"vz"`. Defaults to the base template's.
@@ -42,8 +43,6 @@ export interface BuildOptions extends TransportOptions {
   systemd?: boolean;
   /** Called for every build log line. */
   onBuildLogs?: (log: BuildLogEvent) => void;
-  /** Milliseconds before the build is abandoned. */
-  timeoutMs?: number;
 }
 
 export type BuildLogEvent =
@@ -51,6 +50,12 @@ export type BuildLogEvent =
   | { type: "stdout"; data: string }
   | { type: "stderr"; data: string }
   | { type: "done"; template: string; sizeBytes: number };
+
+/** What a finished build reports. */
+export interface BuildResult {
+  template: string;
+  sizeBytes: number;
+}
 
 export interface TemplateInfo {
   name: string;
@@ -61,6 +66,10 @@ export interface TemplateInfo {
   kit: boolean;
   /** Sandboxes from it run systemd under the agent. */
   systemd: boolean;
+  /** `linux`, `windows` or `macos`. */
+  guestOs: string;
+  /** The hypervisor every sandbox from this template runs under. */
+  hypervisor: string;
 }
 
 /** Prints build logs the way a build tool would. */
@@ -77,9 +86,7 @@ export function defaultBuildLogger(
         write(log.data);
         break;
       case "done":
-        write(
-          `\n✓ built ${log.template} (${(log.sizeBytes / 1e6).toFixed(1)} MB)\n`,
-        );
+        write(`\n✓ built ${log.template} (${(log.sizeBytes / 1e6).toFixed(1)} MB)\n`);
         break;
     }
   };
@@ -155,9 +162,7 @@ export class TemplateBuilder {
   /** Installs Python packages with pip. */
   pipInstall(packages: string[] | string): this {
     const list = toList(packages);
-    return list.length
-      ? this.runCmd(`pip install --no-cache-dir ${list.join(" ")}`)
-      : this;
+    return list.length ? this.runCmd(`pip install --no-cache-dir ${list.join(" ")}`) : this;
   }
 
   /** Installs Node packages globally, so they are on `PATH` for sandboxes. */
@@ -178,9 +183,7 @@ export class TemplateBuilder {
   /** Installs system packages with apk (Alpine). */
   apkInstall(packages: string[] | string): this {
     const list = toList(packages);
-    return list.length
-      ? this.runCmd(`apk add --no-cache ${list.join(" ")}`)
-      : this;
+    return list.length ? this.runCmd(`apk add --no-cache ${list.join(" ")}`) : this;
   }
 
   /** Writes a file into the image. */
@@ -197,15 +200,12 @@ export class TemplateBuilder {
     return this.runCmd(`mkdir -p ${quote(path)}`);
   }
 
-  /**
-   * Creates the directory later steps are meant to work in. Steps do not
-   * inherit a working directory, so `cd` inside the step that needs it.
-   */
-  workdir(path: string): this {
-    return this.runCmd(`mkdir -p ${quote(path)}`);
+  /** The steps this template will run, in order. */
+  get plan(): ReadonlyArray<BuildStep> {
+    return this.steps;
   }
 
-  /** @internal */
+  /** @internal The `BuildTemplateRequest` this builder describes. */
   toRequest(name: string, options: BuildOptions) {
     return {
       name,
@@ -216,113 +216,18 @@ export class TemplateBuilder {
       fromIpsw: this.ipsw,
       steps: this.steps,
       // Zero is the node's default for the guest being built.
-      vcpus: options.cpuCount ?? 0,
-      memMib: options.memoryMB ?? 0,
+      vcpus: options.vcpus ?? 0,
+      memMib: options.memoryMib ?? 0,
       allowDomains: options.allowDomains ?? [],
       isSystemd: options.systemd ?? false,
       hypervisor: options.hypervisor ?? "",
       diskMib: options.diskMib ?? 0,
     };
   }
-
-  /** The steps this template will run, in order. */
-  get plan(): ReadonlyArray<BuildStep> {
-    return this.steps;
-  }
 }
 
-function toList(packages: string[] | string): string[] {
-  return (Array.isArray(packages) ? packages : [packages]).filter(Boolean);
-}
-
-function quote(value: string): string {
-  return `'${value.replace(/'/g, `'\\''`)}'`;
-}
-
-interface TemplateFactory {
-  (): TemplateBuilder;
-  /** Builds a template and publishes it under `name`. */
-  build(
-    template: TemplateBuilder,
-    name: string,
-    options?: BuildOptions,
-  ): Promise<TemplateInfo>;
-  /** Lists the templates available across the fleet. */
-  list(options?: TransportOptions): Promise<TemplateInfo[]>;
-  /** Deletes a template. */
-  delete(name: string, options?: TransportOptions): Promise<void>;
-}
-
-const factory = (() => new TemplateBuilder()) as TemplateFactory;
-
-factory.build = async function build(
-  template: TemplateBuilder,
-  name: string,
-  options: BuildOptions = {},
-): Promise<TemplateInfo> {
-  const transport = new Transport(options);
-  try {
-    let result: TemplateInfo | undefined;
-    for await (const raw of transport.serverStream<any, any>(
-      "BuildTemplate",
-      template.toRequest(name, options),
-      // Builds install packages; minutes, not seconds.
-      options.timeoutMs ?? 30 * 60_000,
-    )) {
-      const event = toEvent(raw);
-      if (!event) continue;
-      options.onBuildLogs?.(event);
-      if (event.type === "done") {
-        result = {
-          name: event.template,
-          sizeBytes: event.sizeBytes,
-          // A freshly built template has no snapshot until the node warms it.
-          warm: false,
-          kit: false,
-          systemd: options.systemd ?? false,
-        };
-      }
-    }
-    if (!result) {
-      throw new BurrowError("build ended without producing an image", "internal");
-    }
-    return result;
-  } finally {
-    transport.close();
-  }
-};
-
-factory.list = async function list(
-  options: TransportOptions = {},
-): Promise<TemplateInfo[]> {
-  const transport = new Transport(options);
-  try {
-    const res = await transport.unary<any, any>("ListTemplates", {});
-    return (res.templates ?? []).map((t: any) => ({
-      name: t.name,
-      sizeBytes: Number(t.sizeBytes ?? 0),
-      warm: Boolean(t.isWarm),
-      kit: Boolean(t.isKit),
-      systemd: Boolean(t.isSystemd),
-    }));
-  } finally {
-    transport.close();
-  }
-};
-
-factory.delete = async function remove(
-  name: string,
-  options: TransportOptions = {},
-): Promise<void> {
-  const transport = new Transport(options);
-  try {
-    await transport.unary("DeleteTemplate", { name });
-  } finally {
-    transport.close();
-  }
-};
-
-function toEvent(raw: any): BuildLogEvent | undefined {
+/** @internal One `BuildLog` message as a {@link BuildLogEvent}. */
+export function toBuildEvent(raw: any): BuildLogEvent | undefined {
   if (raw.step) return { type: "step", command: raw.step };
   if (raw.stdout?.length) {
     return { type: "stdout", data: Buffer.from(raw.stdout).toString("utf8") };
@@ -339,5 +244,51 @@ function toEvent(raw: any): BuildLogEvent | undefined {
   }
   return undefined;
 }
+
+/** @internal One `TemplateInfo` message. */
+export function toTemplateInfo(raw: any): TemplateInfo {
+  return {
+    name: raw.name,
+    sizeBytes: Number(raw.sizeBytes ?? 0),
+    warm: Boolean(raw.isWarm),
+    kit: Boolean(raw.isKit),
+    systemd: Boolean(raw.isSystemd),
+    guestOs: raw.guestOs ?? "",
+    hypervisor: raw.hypervisor ?? "",
+  };
+}
+
+function toList(packages: string[] | string): string[] {
+  return (Array.isArray(packages) ? packages : [packages]).filter(Boolean);
+}
+
+function quote(value: string): string {
+  return `'${value.replace(/'/g, `'\\''`)}'`;
+}
+
+interface TemplateFactory {
+  (): TemplateBuilder;
+  /** Builds a template and publishes it under `name`. */
+  build(
+    template: TemplateBuilder,
+    name: string,
+    options?: BuildOptions & TransportOptions,
+  ): Promise<BuildResult>;
+  /** Lists the templates available across the fleet. */
+  list(options?: TransportOptions & CallOptions): Promise<TemplateInfo[]>;
+  /** Deletes a template. */
+  delete(name: string, options?: TransportOptions & CallOptions): Promise<void>;
+}
+
+const factory = (() => new TemplateBuilder()) as TemplateFactory;
+
+factory.build = (template, name, options = {}) =>
+  withClient(options, (burrow) => burrow.templates.build(template, name, options));
+
+factory.list = (options = {}) =>
+  withClient(options, (burrow) => burrow.templates.list(options));
+
+factory.delete = (name, options = {}) =>
+  withClient(options, (burrow) => burrow.templates.delete(name, options));
 
 export const Template = factory;

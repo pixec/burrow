@@ -255,8 +255,8 @@ sections draw and so cannot be the thing that holds them.
 
 - `is_exec_allowed: false` refuses `Exec`, and with it `burrow connect` and
   `burrow run`, with `PERMISSION_DENIED`.
-- `is_upload_allowed: false` and `is_download_allowed: false` refuse `UploadFile` and
-  `DownloadFile`, and the `Fs` calls that write or read a file's contents.
+- `is_upload_allowed: false` and `is_download_allowed: false` refuse the `Fs`
+  calls that write or read a file's contents.
 - `path_scopes` confines uploads, downloads, listings, watches and `Fs` calls to
   paths under one of the given prefixes. Matching is on whole path components,
   so `/data` admits `/data/in.csv` and refuses `/database/dump.sql`, and a path

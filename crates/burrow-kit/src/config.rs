@@ -119,9 +119,10 @@ impl<'de> Deserialize<'de> for HostEntry {
     }
 }
 
-#[derive(Debug, Clone, Default, Deserialize)]
+/// One phase's allow and deny lists, as declared and as composed.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub struct PhaseLists {
+pub struct NetworkPhase {
     #[serde(default)]
     pub allow: Vec<HostEntry>,
     #[serde(default)]
@@ -132,9 +133,9 @@ pub struct PhaseLists {
 #[serde(deny_unknown_fields)]
 pub struct NetworkPolicyConfig {
     #[serde(default)]
-    pub install: PhaseLists,
+    pub install: NetworkPhase,
     #[serde(default)]
-    pub runtime: PhaseLists,
+    pub runtime: NetworkPhase,
 }
 
 impl NetworkPolicyConfig {
@@ -472,14 +473,15 @@ struct RawResources {
     gpu: Option<String>,
 }
 
-#[derive(Debug, Clone, Default)]
-pub struct ResourcesConfig {
+/// What a Kit asks of the machine, as declared and as composed.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct Resources {
     pub cpu: Option<f64>,
-    pub memory: Option<ByteSize>,
+    pub memory_mib: Option<u64>,
     pub gpu: Option<String>,
 }
 
-impl ResourcesConfig {
+impl Resources {
     pub fn decode(entry: &Entry) -> Result<Self> {
         let raw: RawResources = decode(entry)?;
         if raw.cpu.is_some_and(|c| c < 0.0 || !c.is_finite()) {
@@ -488,7 +490,7 @@ impl ResourcesConfig {
         let memory = raw.memory.map(|m| ByteSize::parse(&m.0)).transpose()?;
         Ok(Self {
             cpu: raw.cpu,
-            memory,
+            memory_mib: memory.map(ByteSize::mib_ceil),
             gpu: raw.gpu,
         })
     }
@@ -503,14 +505,15 @@ struct RawPort {
     transport: String,
 }
 
-#[derive(Debug, Clone)]
-pub struct PortConfig {
+/// A port a Kit publishes, as declared and as composed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PortRequest {
     pub name: Option<String>,
     pub container: u16,
     pub transport: String,
 }
 
-impl PortConfig {
+impl PortRequest {
     pub fn decode(entry: &Entry) -> Result<Self> {
         let raw: RawPort = decode(entry)?;
         let container = u16::try_from(raw.container)

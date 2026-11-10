@@ -102,10 +102,12 @@ impl NodeApi {
         }
         // An exit the guest reports and the node has not logged is on its
         // way, or was never fed, as for a command run before the agent was.
-        let exit = (info.state == "exited").then_some(burrow_common::cmdlog::Frame::Exit {
-            code: info.exit_code,
-            signal: info.exit_signal,
-        });
+        let exit = (info.state == guestpb::CommandState::Exited as i32).then_some(
+            burrow_common::cmdlog::Frame::Exit {
+                code: info.exit_code,
+                signal: info.exit_signal,
+            },
+        );
         if is_fed && (is_logged_whole || exit.is_some()) {
             return Ok(follow_log(
                 &sandbox,
@@ -154,35 +156,6 @@ impl NodeApi {
         ))
     }
 
-    /// Download, as `user` when one is given; see [`exec_stream`](Self::exec_stream).
-    pub(crate) async fn download_as(
-        &self,
-        req: api::DownloadRequest,
-        user: String,
-    ) -> Result<BoxStream<api::FileChunk>, Status> {
-        let sandbox = self.sandboxes.get(&req.sandbox_id).await?;
-        check_download(&sandbox.policy(), &req.path)?;
-        require_files_as_user(&sandbox, &user).await?;
-        let mut agent = sandbox.agent().await?;
-
-        let stream = agent
-            .download_file(guestpb::DownloadRequest {
-                path: req.path,
-                user,
-            })
-            .await?
-            .into_inner()
-            .map(|res| {
-                res.map(|chunk| api::FileChunk {
-                    sandbox_id: String::new(),
-                    path: String::new(),
-                    mode: 0,
-                    data: chunk.data,
-                })
-            });
-        Ok(Box::pin(stream))
-    }
-
     /// Watch, as `user` when one is given.
     pub(crate) async fn watch_as(
         &self,
@@ -207,44 +180,12 @@ impl NodeApi {
             .into_inner()
             .map(|res| {
                 res.map(|e| api::WatchEvent {
-                    r#type: e.r#type,
+                    kind: e.kind,
                     path: e.path,
                     is_dir: e.is_dir,
                 })
             });
         Ok(Box::pin(stream))
-    }
-
-    /// List, as `user` when one is given.
-    pub(crate) async fn list_dir_as(
-        &self,
-        req: api::ListDirRequest,
-        user: String,
-    ) -> Result<api::ListDirResponse, Status> {
-        let sandbox = self.sandboxes.get(&req.sandbox_id).await?;
-        check_read_path(&sandbox.policy(), &req.path)?;
-        require_files_as_user(&sandbox, &user).await?;
-        let mut agent = sandbox.agent().await?;
-
-        let resp = agent
-            .list_dir(guestpb::ListDirRequest {
-                path: req.path,
-                user,
-            })
-            .await?
-            .into_inner();
-        Ok(api::ListDirResponse {
-            entries: resp
-                .entries
-                .into_iter()
-                .map(|e| api::DirEntry {
-                    name: e.name,
-                    is_dir: e.is_dir,
-                    size: e.size,
-                    mode: e.mode,
-                })
-                .collect(),
-        })
     }
 
     /// One file operation, as `user` when one is given.
@@ -384,111 +325,6 @@ impl NodeApi {
         Ok(Box::pin(mapped))
     }
 
-    /// Upload over any inbound stream, for the same reason as
-    /// [`exec_stream`](Self::exec_stream).
-    pub(crate) async fn upload_stream<S>(
-        &self,
-        mut inbound: S,
-        user: String,
-    ) -> Result<api::UploadResult, Status>
-    where
-        S: Stream<Item = Result<api::FileChunk, Status>> + Send + Unpin + 'static,
-    {
-        let first = inbound
-            .next()
-            .await
-            .transpose()?
-            .ok_or_else(|| Status::invalid_argument("upload stream was empty"))?;
-
-        let sandbox = self.sandboxes.get(&first.sandbox_id).await?;
-        // The destination arrives in this first chunk, so this is the only
-        // point where it can be refused before the agent has been handed a
-        // byte of it.
-        let max_bytes = check_upload(&sandbox.policy(), &first.path)?;
-        require_files_as_user(&sandbox, &user).await?;
-        let mut agent = sandbox.agent().await?;
-
-        let path = first.path.clone();
-        let agent_first = guestpb::FileChunk {
-            path: first.path,
-            mode: first.mode,
-            data: first.data,
-            owner: String::new(),
-            is_existing_skipped: false,
-            user,
-        };
-        // A cap can only be checked as the bytes go past, so the stream stops
-        // at the chunk that crosses it and says so here. Two flags rather than
-        // one: an upload refused before its first chunk never opened the file,
-        // and must not have an existing file at that path cleaned up under it.
-        let exceeded = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
-        let wrote = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
-        // The caller's stream breaking is the third way this ends, and it is
-        // reported the same way the cap is. Ending the outbound stream on an
-        // inbound error would otherwise look to the agent exactly like a
-        // complete upload, and the truncated file would be reported written.
-        let broken: std::sync::Arc<std::sync::Mutex<Option<Status>>> = Default::default();
-        let (tripped, started, failed) = (exceeded.clone(), wrote.clone(), broken.clone());
-        let outbound = async_stream::stream! {
-            use std::sync::atomic::Ordering::Relaxed;
-
-            let mut sent = agent_first.data.len() as u64;
-            if is_over_cap(max_bytes, sent) {
-                tripped.store(true, Relaxed);
-                return;
-            }
-            started.store(true, Relaxed);
-            yield agent_first;
-            loop {
-                let chunk = match inbound.next().await {
-                    Some(Ok(chunk)) => chunk,
-                    Some(Err(err)) => {
-                        *failed.lock().unwrap() = Some(err);
-                        return;
-                    }
-                    None => break,
-                };
-                sent += chunk.data.len() as u64;
-                if is_over_cap(max_bytes, sent) {
-                    tripped.store(true, Relaxed);
-                    return;
-                }
-                yield guestpb::FileChunk {
-                    data: chunk.data,
-                    ..Default::default()
-                };
-            }
-        };
-
-        let result = agent.upload_file(outbound).await;
-        // Read before the agent's own result: an upload cut short may well
-        // have failed on its side too, and the cap is the truer reason.
-        if exceeded.load(std::sync::atomic::Ordering::Relaxed) {
-            if wrote.load(std::sync::atomic::Ordering::Relaxed) {
-                remove_partial_upload(&sandbox, &path).await;
-            }
-            return Err(Status::resource_exhausted(format!(
-                "upload exceeds this sandbox's max_upload_bytes ({max_bytes})"
-            )));
-        }
-        // Same order and the same reason: what the caller's stream did is a
-        // truer account of the failure than whatever the agent made of it.
-        let broken = broken.lock().unwrap().take();
-        if let Some(err) = broken {
-            if wrote.load(std::sync::atomic::Ordering::Relaxed) {
-                remove_partial_upload(&sandbox, &path).await;
-            }
-            return Err(Status::new(
-                err.code(),
-                format!("upload stream ended early: {}", err.message()),
-            ));
-        }
-        let result = result?.into_inner();
-        Ok(api::UploadResult {
-            bytes_written: result.bytes_written,
-        })
-    }
-
     /// Checks a membership change and opens the agent that will make it.
     ///
     /// Both memberships RPCs are the same call with a different verb, so the
@@ -535,7 +371,7 @@ impl NodeApi {
             kit,
             credentials,
             mut policy,
-            metadata,
+            tags,
             name,
         } = request;
         let plan = crate::kit::plan(
@@ -556,7 +392,7 @@ impl NodeApi {
 
         let outcome = async {
             self.sandboxes
-                .create(id.clone(), template, policy, metadata, self.node_id(), name)
+                .create(id.clone(), template, policy, tags, self.node_id(), name)
                 .await?;
             let provisioned = async {
                 let env = plan.env.clone().into_iter().collect();
@@ -590,7 +426,7 @@ struct KitCreate {
     kit: common::KitSpec,
     credentials: HashMap<String, String>,
     policy: common::Policy,
-    metadata: HashMap<String, String>,
+    tags: HashMap<String, String>,
     name: String,
 }
 
@@ -635,7 +471,7 @@ impl NodeService for NodeApi {
         let req = req.into_inner();
         let suspended = self
             .sandboxes
-            .set_drain(req.is_draining, req.suspend_sandboxes)
+            .set_drain(req.is_draining, req.is_suspending)
             .await;
         Ok(Response::new(api::DrainNodeResponse { suspended }))
     }
@@ -660,7 +496,7 @@ impl NodeService for NodeApi {
         }
         let policy = req.policy.unwrap_or_default();
         validate_policy(&policy)?;
-        burrow_common::tags::validate(&req.metadata)?;
+        burrow_common::tags::validate(&req.tags)?;
         // A template imported from Kits is provisioned through their
         // lifecycle whether or not the caller passed inputs.
         if req.snapshot.is_empty()
@@ -673,7 +509,7 @@ impl NodeService for NodeApi {
                 kit: req.kit.unwrap_or_default(),
                 credentials: req.credentials,
                 policy,
-                metadata: req.metadata,
+                tags: req.tags,
                 name: req.name,
             };
             let sandbox = self
@@ -694,7 +530,7 @@ impl NodeService for NodeApi {
                     req.sandbox_id,
                     req.template,
                     policy,
-                    req.metadata,
+                    req.tags,
                     self.node_id(),
                     req.name,
                 )
@@ -705,7 +541,7 @@ impl NodeService for NodeApi {
                     req.sandbox_id,
                     &req.snapshot,
                     policy,
-                    req.metadata,
+                    req.tags,
                     self.node_id(),
                     req.name,
                 )
@@ -787,7 +623,7 @@ impl NodeService for NodeApi {
                 }
                 for row in rows {
                     last = row.seq;
-                    yield crate::sandbox::event_to_proto(row);
+                    yield common::Event::from(row);
                 }
             }
             if !req.is_follow {
@@ -808,7 +644,7 @@ impl NodeService for NodeApi {
                             .map_err(|err| Status::internal(format!("reading events: {err}")))?;
                         for row in rows {
                             last = row.seq;
-                            yield crate::sandbox::event_to_proto(row);
+                            yield common::Event::from(row);
                         }
                     }
                     Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
@@ -979,7 +815,7 @@ impl NodeService for NodeApi {
                     req.sandbox_id,
                     template,
                     policy,
-                    previous.metadata,
+                    previous.tags,
                     self.node_id(),
                     previous.name,
                 )
@@ -1005,7 +841,7 @@ impl NodeService for NodeApi {
             kit,
             credentials,
             policy,
-            metadata: previous.metadata,
+            tags: previous.tags,
             name: previous.name,
         };
         let sandbox = self
@@ -1073,22 +909,17 @@ impl NodeService for NodeApi {
         Ok(Response::new(api::ListSessionsResponse { sessions }))
     }
 
-    /// Moves a sandbox's lifetime clocks.
-    ///
-    /// The machine shape is refused rather than ignored: a running VM's
-    /// configuration is fixed and a restore takes it from the snapshot, so a
-    /// caller who asked for four vCPUs has to hear that they did not get them.
-    /// The result is held to the same ceilings a create is, since it is the
-    /// same record and the same reaper reads it.
-    async fn update_resources(
+    /// Moves a sandbox's lifetime clocks. The result is held to the same
+    /// ceilings a create is, since it is the same record and the same reaper
+    /// reads it.
+    async fn update_lifetime(
         &self,
-        req: Request<nodepb::NodeUpdateResourcesRequest>,
+        req: Request<nodepb::NodeUpdateLifetimeRequest>,
     ) -> Result<Response<common::Sandbox>, Status> {
         let req = req.into_inner();
-        check_shape_unchanged(req.vcpus, req.mem_mib, req.scratch_disk_mib)?;
         let sandbox = self
             .sandboxes
-            .update_resources(
+            .update_lifetime(
                 &req.sandbox_id,
                 req.max_lifetime_secs,
                 req.idle_suspend_secs,
@@ -1399,7 +1230,7 @@ impl NodeService for NodeApi {
                     allowed_clients: req.allowed_clients,
                     udp_ports,
                     is_all_udp_shared: req.is_all_udp,
-                    is_ip_transparent: !req.is_transparent_ip_disabled,
+                    is_ip_transparent: req.is_transparent_ip.unwrap_or(true),
                 },
                 req.is_rotating,
             )
@@ -1442,35 +1273,6 @@ impl NodeService for NodeApi {
         req: Request<tonic::Streaming<api::AttachInput>>,
     ) -> Result<Response<Self::AttachStream>, Status> {
         self.attach_stream(req.into_inner(), String::new())
-            .await
-            .map(Response::new)
-    }
-
-    async fn upload_file(
-        &self,
-        req: Request<tonic::Streaming<api::FileChunk>>,
-    ) -> Result<Response<api::UploadResult>, Status> {
-        self.upload_stream(req.into_inner(), String::new())
-            .await
-            .map(Response::new)
-    }
-
-    type DownloadFileStream = BoxStream<api::FileChunk>;
-
-    async fn download_file(
-        &self,
-        req: Request<api::DownloadRequest>,
-    ) -> Result<Response<Self::DownloadFileStream>, Status> {
-        self.download_as(req.into_inner(), String::new())
-            .await
-            .map(Response::new)
-    }
-
-    async fn list_dir(
-        &self,
-        req: Request<api::ListDirRequest>,
-    ) -> Result<Response<api::ListDirResponse>, Status> {
-        self.list_dir_as(req.into_inner(), String::new())
             .await
             .map(Response::new)
     }
@@ -1518,7 +1320,6 @@ impl NodeService for NodeApi {
             "access tokens revoked"
         );
         Ok(Response::new(api::RevokeAccessResponse {
-            revoked_at: revoked_ms / 1000,
             ended_sessions: ended as u32,
             revoked_at_ms: revoked_ms,
             killed_commands: commands.len() as u32,
@@ -1528,7 +1329,7 @@ impl NodeService for NodeApi {
     async fn query_audit(
         &self,
         req: Request<api::AuditQuery>,
-    ) -> Result<Response<api::AuditPage>, Status> {
+    ) -> Result<Response<nodepb::AuditPage>, Status> {
         let req = req.into_inner();
         let node_id = self.node_id();
         let rows = self
@@ -1536,17 +1337,17 @@ impl NodeService for NodeApi {
             .query_egress(&burrow_store::EgressFilter {
                 sandbox_id: (!req.sandbox_id.is_empty()).then(|| req.sandbox_id.clone()),
                 is_denied_only: req.is_denied_only,
-                since: (!req.since.is_empty()).then(|| req.since.clone()),
+                since_ms: (req.since_unix_ms != 0).then_some(req.since_unix_ms),
                 limit: req.limit,
             })
             .await
             .map_err(|err| Status::internal(format!("reading audit: {err}")))?;
 
-        Ok(Response::new(api::AuditPage {
+        Ok(Response::new(nodepb::AuditPage {
             events: rows
                 .into_iter()
                 .map(|r| api::AuditEvent {
-                    at: r.at,
+                    at_unix_ms: r.at_ms,
                     sandbox_id: r.sandbox_id,
                     source_ip: r.source_ip,
                     destination: r.destination,
@@ -1863,13 +1664,11 @@ fn command_info(info: guestpb::CommandInfo) -> api::CommandInfo {
             .map(|arg| bounded(arg, MAX_ARG))
             .collect(),
         user: bounded(info.user, MAX_NAME),
-        // A state this daemon has no name for is reported as such rather than
-        // passed through: a client branches on this string.
-        state: match info.state.as_str() {
-            "running" => "running".into(),
-            "exited" => "exited".into(),
-            _ => "unknown".into(),
-        },
+        state: match guestpb::CommandState::try_from(info.state).unwrap_or_default() {
+            guestpb::CommandState::Running => api::CommandState::Running,
+            guestpb::CommandState::Exited => api::CommandState::Exited,
+            guestpb::CommandState::Unspecified => api::CommandState::Unspecified,
+        } as i32,
         exit_code: info.exit_code,
         started_at_unix_ms: info.started_at_unix_ms,
         ended_at_unix_ms: info.ended_at_unix_ms,
@@ -1884,11 +1683,6 @@ fn command_info(info: guestpb::CommandInfo) -> api::CommandInfo {
 /// Every scope is walked on every file call, and a caller with an unbounded
 /// list would be writing the node's own per-request cost.
 const MAX_PATH_SCOPES: usize = 16;
-
-/// Whether an upload of `sent` bytes has passed `max`. 0 is unlimited.
-fn is_over_cap(max: u64, sent: u64) -> bool {
-    max != 0 && sent > max
-}
 
 /// Splits a guest path into the components a scope is matched on.
 ///
@@ -1973,7 +1767,7 @@ fn check_download(policy: &common::Policy, path: &str) -> Result<(), Status> {
     within_scopes(&fs.path_scopes, path)
 }
 
-/// Calls that read a path without carrying its contents out: list_dir, watch.
+/// Calls that read a path without carrying its contents out: a listing, a watch.
 ///
 /// The scopes apply, but `is_download_allowed` does not: a listing is not the file.
 fn check_read_path(policy: &common::Policy, path: &str) -> Result<(), Status> {
@@ -1986,7 +1780,7 @@ fn check_read_path(policy: &common::Policy, path: &str) -> Result<(), Status> {
 /// What an Fs call needs of the policy at one path.
 #[derive(Clone, Copy)]
 enum FsNeed {
-    /// Its name or metadata, held to the scopes as a listing is.
+    /// Its name or tags, held to the scopes as a listing is.
     Look,
     /// Its contents, which leave the sandbox, as a download's do.
     Read,
@@ -2119,61 +1913,6 @@ fn transcode<A: prost::Message, B: prost::Message + Default>(from: &A) -> Result
         .map_err(|err| Status::internal(format!("translating an Fs message: {err}")))
 }
 
-/// How long the node waits on its own cleanup inside a guest.
-///
-/// The exec below is a stream, and a stream is not covered by the per-call
-/// deadline the agent channel carries, so a guest that accepts the command and
-/// then never finishes it would hold this task open forever.
-const CLEANUP_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
-
-/// Best-effort removal of what a refused upload had already written.
-///
-/// A cap that trips mid-stream leaves a truncated file behind. Nothing rests on
-/// this working: the guest may not have `rm` at all, and the refusal stands
-/// either way. Issued straight at the agent so a sandbox that forbids exec is
-/// still cleaned up, this being the node's own housekeeping rather than a
-/// caller's command.
-async fn remove_partial_upload(sandbox: &RunningSandbox, path: &str) {
-    if tokio::time::timeout(CLEANUP_TIMEOUT, remove_partial_upload_inner(sandbox, path))
-        .await
-        .is_err()
-    {
-        tracing::warn!(
-            sandbox = sandbox.id(),
-            path,
-            "gave up cleaning up a refused upload; the guest did not finish the removal"
-        );
-    }
-}
-
-async fn remove_partial_upload_inner(sandbox: &RunningSandbox, path: &str) {
-    let Ok(mut agent) = sandbox.agent().await else {
-        return;
-    };
-    let start = guestpb::ExecInput {
-        input: Some(guestpb::exec_input::Input::Start(guestpb::ExecStart {
-            // argv, not a shell line: the path is a caller's string.
-            cmd: vec!["/bin/rm".into(), "-f".into(), "--".into(), path.to_string()],
-            env: Default::default(),
-            cwd: String::new(),
-            is_pty: false,
-            rows: 0,
-            cols: 0,
-            // The node's own housekeeping, which is root's.
-            user: String::new(),
-            is_env_cleared: false,
-            log_max_bytes: 0,
-            log_max_files: 0,
-        })),
-    };
-    if let Ok(response) = agent.exec(tokio_stream::iter(vec![start])).await {
-        // Drained rather than dropped: dropping the response stream would
-        // cancel the command that is doing the cleaning.
-        let mut stream = response.into_inner();
-        while let Some(Ok(_)) = stream.next().await {}
-    }
-}
-
 fn port_proto(sandbox_id: String, port: &burrow_net::PortMap) -> api::PortMapping {
     api::PortMapping {
         sandbox_id,
@@ -2202,7 +1941,7 @@ fn share_proto(sandbox_id: String, info: crate::share::ShareInfo) -> api::Share 
         address: info.address,
         ports: info.spec.ports.iter().map(|p| u32::from(*p)).collect(),
         allowed_clients: info.spec.allowed_clients,
-        created_at: burrow_common::rfc3339_from_unix_secs(info.spec.created_at),
+        created_at_unix_ms: info.spec.created_at_ms,
         udp_ports: info.spec.udp_ports.iter().map(|p| u32::from(*p)).collect(),
         is_all_udp: info.spec.is_all_udp_shared,
         is_transparent_ip: info.is_ip_transparent,
@@ -2270,33 +2009,6 @@ pub(crate) fn warm_request(
     ))
 }
 
-/// Refuses an update that tries to reshape the machine.
-///
-/// Firecracker fixes a VM's configuration when it starts and takes a restored
-/// one's from the snapshot, so burrow could never honour this, and a request
-/// silently dropped would leave the caller believing their sandbox grew.
-/// Recreating it, or creating one from a snapshot at the shape they want, is
-/// what actually works.
-fn check_shape_unchanged(vcpus: u32, mem_mib: u32, scratch_disk_mib: u32) -> Result<(), Status> {
-    let named = [
-        ("vcpus", vcpus),
-        ("mem_mib", mem_mib),
-        ("scratch_disk_mib", scratch_disk_mib),
-    ]
-    .into_iter()
-    .filter(|(_, value)| *value != 0)
-    .map(|(name, _)| name)
-    .collect::<Vec<_>>();
-    if named.is_empty() {
-        return Ok(());
-    }
-    Err(Status::invalid_argument(format!(
-        "a running sandbox's machine shape is fixed and cannot be updated ({} given); \
-         create a new sandbox, or a snapshot and a sandbox from it, at the shape you want",
-        named.join(", ")
-    )))
-}
-
 /// Checks an id that is about to become a sandbox's workdir name, cgroup name
 /// and jail chroot directory, before anything is created under it.
 ///
@@ -2342,28 +2054,30 @@ fn validate_policy(policy: &common::Policy) -> Result<(), Status> {
         vcpus(resources.vcpus)?;
         mem_mib(resources.mem_mib)?;
         scratch_mib(resources.scratch_disk_mib)?;
+    }
+    if let Some(snapshots) = &policy.snapshots {
         // Every retained snapshot is a memory image plus a scratch disk on this
         // node, so how deep a caller may ask to keep is bounded here rather
         // than discovered when the disk fills.
-        if resources.keep_last_snapshots > crate::snapshot::MAX_KEEP_LAST {
+        if snapshots.keep_last > crate::snapshot::MAX_KEEP_LAST {
             return Err(Status::invalid_argument(format!(
-                "keep_last_snapshots {} out of range (1..={}; 0 is unlimited)",
-                resources.keep_last_snapshots,
+                "snapshots.keep_last {} out of range (1..={}; 0 is unlimited)",
+                snapshots.keep_last,
                 crate::snapshot::MAX_KEEP_LAST
             )));
         }
         // Keeping what retention evicted only bounds anything if the evicted
         // snapshot expires on its own. Refused rather than accepted as a policy
         // that says "bound this" and then keeps every snapshot forever.
-        if resources.is_evicted_snapshot_kept {
-            if resources.keep_last_snapshots == 0 {
+        if snapshots.is_evicted_kept {
+            if snapshots.keep_last == 0 {
                 return Err(Status::invalid_argument(
-                    "keep_evicted_snapshots needs keep_last_snapshots: nothing is evicted without it",
+                    "snapshots.is_evicted_kept needs keep_last: nothing is evicted without it",
                 ));
             }
-            if resources.snapshot_expiration_secs == 0 {
+            if snapshots.expiration_secs == 0 {
                 return Err(Status::invalid_argument(
-                    "keep_evicted_snapshots needs snapshot_expiration_secs: an evicted snapshot with no expiry is never reclaimed",
+                    "snapshots.is_evicted_kept needs expiration_secs: an evicted snapshot with no expiry is never reclaimed",
                 ));
             }
         }
@@ -2847,11 +2561,7 @@ fn redact_secrets(mut sandbox: common::Sandbox) -> common::Sandbox {
         .as_mut()
         .and_then(|policy| policy.network.as_mut())
     {
-        let now_ms = proxypolicy::now_unix_ms();
         for rule in &mut network.rules {
-            // Reported rather than removed: the caller wrote the rule, and a
-            // rule that silently vanished would read as never having existed.
-            rule.is_expired = rule.expires_at_unix_ms != 0 && rule.expires_at_unix_ms <= now_ms;
             match rule.action.as_mut() {
                 Some(common::request_rule::Action::SetHeaders(set)) => {
                     for header in &mut set.headers {
@@ -2897,7 +2607,6 @@ pub(crate) fn restore_redacted(
 ) -> Result<(), Status> {
     let previous_rules = previous.map(|p| p.rules.as_slice()).unwrap_or_default();
     for rule in &mut network.rules {
-        rule.is_expired = false;
         let domain = rule.domain.clone();
         match rule.action.as_mut() {
             Some(common::request_rule::Action::SetHeaders(set)) => {
@@ -3181,11 +2890,10 @@ mod policy_tests {
     #[test]
     fn keeping_evicted_snapshots_needs_a_cap_and_an_expiry() {
         let resources = |keep_last, expiry| common::Policy {
-            resources: Some(common::ResourcePolicy {
-                is_evicted_snapshot_kept: true,
-                keep_last_snapshots: keep_last,
-                snapshot_expiration_secs: expiry,
-                ..Default::default()
+            snapshots: Some(common::SnapshotPolicy {
+                is_evicted_kept: true,
+                keep_last,
+                expiration_secs: expiry,
             }),
             ..Default::default()
         };
@@ -3198,8 +2906,8 @@ mod policy_tests {
         // And the flag is not required: the default deletes, as it always did.
         assert!(
             validate_policy(&common::Policy {
-                resources: Some(common::ResourcePolicy {
-                    keep_last_snapshots: 3,
+                snapshots: Some(common::SnapshotPolicy {
+                    keep_last: 3,
                     ..Default::default()
                 }),
                 ..Default::default()
@@ -3754,13 +3462,6 @@ mod policy_tests {
         assert!(check_download(&open, "/anywhere").is_ok());
     }
 
-    #[test]
-    fn an_upload_cap_counts_the_whole_stream() {
-        assert!(!is_over_cap(0, u64::MAX));
-        assert!(!is_over_cap(1024, 1024));
-        assert!(is_over_cap(1024, 1025));
-    }
-
     /// A scope the matcher would refuse on sight is a confinement the caller
     /// believes is in force and is not, so it is refused at create instead.
     #[test]
@@ -3782,32 +3483,6 @@ mod policy_tests {
         assert!(validate_policy(&with(&too_many)).is_err());
     }
 
-    /// The lifetime clocks move; the machine does not. A shape silently
-    /// dropped would leave a caller believing their sandbox grew.
-    #[test]
-    fn an_update_may_move_the_clocks_but_not_the_machine() {
-        assert!(check_shape_unchanged(0, 0, 0).is_ok());
-
-        for (vcpus, mem, scratch) in [(4, 0, 0), (0, 2048, 0), (0, 0, 4096), (4, 2048, 4096)] {
-            let err = check_shape_unchanged(vcpus, mem, scratch).unwrap_err();
-            assert_eq!(err.code(), tonic::Code::InvalidArgument);
-            // Says which field it refused, so a caller who sent one of three
-            // is not left guessing.
-            for (name, value) in [
-                ("vcpus", vcpus),
-                ("mem_mib", mem),
-                ("scratch_disk_mib", scratch),
-            ] {
-                assert_eq!(
-                    err.message().contains(name),
-                    value != 0,
-                    "{name} in {:?}",
-                    err.message()
-                );
-            }
-        }
-    }
-
     /// The clocks a caller may move are exactly the ones a create sets and the
     /// reaper reads, and 0 keeps meaning "unlimited" rather than "unchanged":
     /// the request's optional fields carry that distinction instead.
@@ -3817,10 +3492,12 @@ mod policy_tests {
             resources: Some(common::ResourcePolicy {
                 vcpus: 2,
                 mem_mib: 1024,
+                ..Default::default()
+            }),
+            lifetime: Some(common::LifetimePolicy {
                 max_lifetime_secs: 0,
                 idle_suspend_secs: 86_400,
                 suspended_ttl_secs: u64::MAX,
-                ..Default::default()
             }),
             ..Default::default()
         };
@@ -4073,9 +3750,6 @@ mod policy_tests {
             .network
             .unwrap()
             .rules;
-        assert!(rules[0].is_expired);
-        assert!(!rules[1].is_expired);
-        assert!(!rules[2].is_expired);
         for rule in &rules {
             let Some(common::request_rule::Action::SetHeaders(set)) = &rule.action else {
                 panic!("set_headers expected");
@@ -4093,10 +3767,7 @@ mod policy_tests {
             forwarding("gate.example.com", "https://gate.example.com/x"),
         ]);
         let mut sent = open_inspected(vec![
-            common::RequestRule {
-                is_expired: true,
-                ..header("api.example.com", "authorization", REDACTED)
-            },
+            header("api.example.com", "authorization", REDACTED),
             common::RequestRule {
                 r#match: None,
                 action: Some(common::request_rule::Action::Forward(
@@ -4119,8 +3790,6 @@ mod policy_tests {
             })
             .collect();
         assert_eq!(values, vec!["Bearer real", "shared", "Bearer added"]);
-        // Output only, so not carried in as a request.
-        assert!(!sent.rules[0].is_expired);
 
         // A placeholder with nothing behind it is not a value.
         let mut orphan =

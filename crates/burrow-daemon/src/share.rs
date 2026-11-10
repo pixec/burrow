@@ -146,7 +146,7 @@ impl Shares {
             preshared_key: PresharedKey::generate().to_string(),
             ports: shape.ports,
             allowed_clients: shape.allowed_clients,
-            created_at: burrow_common::unix_now(),
+            created_at_ms: burrow_common::unix_now_ms(),
             udp_ports: shape.udp_ports,
             is_all_udp_shared: shape.is_all_udp_shared,
             is_ip_transparent: shape.is_ip_transparent,

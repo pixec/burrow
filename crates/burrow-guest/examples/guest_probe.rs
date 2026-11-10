@@ -375,7 +375,10 @@ mod probe {
         let running = listed
             .commands
             .iter()
-            .find(|cmd| cmd.state == "running" && cmd.cmd.iter().any(|arg| arg.contains("usr1")))
+            .find(|cmd| {
+                cmd.state == pb::CommandState::Running as i32
+                    && cmd.cmd.iter().any(|arg| arg.contains("usr1"))
+            })
             .map(|cmd| cmd.command_id.clone());
         c.check(
             "list_commands shows the running command",
@@ -644,7 +647,16 @@ mod probe {
                 let mut names: Vec<_> = entries
                     .entries
                     .iter()
-                    .map(|e| format!("{}:{}", e.name, e.r#type))
+                    .map(|e| {
+                        let kind = pb::FileType::try_from(e.r#type).unwrap_or_default();
+                        format!(
+                            "{}:{}",
+                            e.name,
+                            kind.as_str_name()
+                                .trim_start_matches("FILE_TYPE_")
+                                .to_lowercase()
+                        )
+                    })
                     .collect();
                 names.sort();
                 names

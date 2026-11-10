@@ -45,7 +45,7 @@ pub struct Placement {
     /// does not fail cleanly; it boots a guest whose memory lies about the
     /// machine.
     pub arch: String,
-    pub firecracker_version: String,
+    pub hypervisor_version: String,
     /// The hypervisor the sandbox runs under: its template's, or its state's
     /// when it restores. Empty means any. Hard, because a node without it
     /// can only refuse the create.
@@ -117,14 +117,17 @@ pub enum RegisterError {
     ClaimOutOfRange { index: u32, max: u32 },
 }
 
-/// The version of `hypervisor` a node runs. A node from before versions were
-/// reported per hypervisor ran only Firecracker, and said so on its own.
+/// The version of `hypervisor` a node runs. Empty names Firecracker, which
+/// every record from before there was a choice ran under.
 pub fn version_of<'a>(info: &'a NodeInfo, hypervisor: &str) -> &'a str {
-    match info.hypervisor_versions.get(hypervisor) {
-        Some(version) => version,
-        None if hypervisor.is_empty() || hypervisor == "firecracker" => &info.firecracker_version,
-        None => "",
-    }
+    let hypervisor = if hypervisor.is_empty() {
+        burrow_common::hypervisor::Hypervisor::Firecracker.as_str()
+    } else {
+        hypervisor
+    };
+    info.hypervisor_versions
+        .get(hypervisor)
+        .map_or("", String::as_str)
 }
 
 /// Whether a node can restore state written by `hypervisor` at `version` on
@@ -140,7 +143,7 @@ pub fn can_restore(info: &NodeInfo, arch: &str, hypervisor: &str, version: &str)
 /// refuses to start with nothing to offer.
 pub fn offers(info: &NodeInfo, hypervisor: &str) -> bool {
     if info.hypervisors.is_empty() {
-        return hypervisor == "firecracker";
+        return hypervisor == burrow_common::hypervisor::Hypervisor::Firecracker.as_str();
     }
     info.hypervisors.iter().any(|offered| offered == hypervisor)
 }
@@ -223,7 +226,7 @@ pub struct NodeEntry {
     pub info: NodeInfo,
     pub status: NodeStatus,
     pub last_heartbeat: Instant,
-    pub last_heartbeat_at: String,
+    pub last_heartbeat_at_ms: i64,
     /// Slice of the sandbox address pool this node owns.
     pub index: u32,
     pub wireguard_public_key: String,
@@ -295,12 +298,13 @@ fn held(entry: &NodeEntry, pending: &HashMap<String, Reserved>) -> Reserved {
 
 /// A node's disk as its last heartbeat reported it.
 pub fn disk_capacity(status: &NodeStatus) -> burrow_common::disk::DiskCapacity {
+    let disk = status.disk.unwrap_or_default();
     burrow_common::disk::DiskCapacity {
-        free_bytes: status.disk_free_bytes,
-        total_bytes: status.disk_total_bytes,
-        reserve_bytes: status.disk_reserve_bytes,
-        unwritten_bytes: status.disk_unwritten_bytes,
-        overcommit: status.disk_overcommit,
+        free_bytes: disk.free_bytes,
+        total_bytes: disk.total_bytes,
+        reserve_bytes: disk.reserve_bytes,
+        unwritten_bytes: disk.unwritten_bytes,
+        overcommit: disk.overcommit,
     }
 }
 
@@ -350,12 +354,10 @@ fn headroom(entry: &NodeEntry, pending: &HashMap<String, Reserved>) -> f64 {
     } else {
         (free_mem(entry, pending) as f64 / entry.info.total_mem_mib as f64).clamp(0.0, 1.0)
     };
+    let capacity = disk_capacity(&entry.status);
     let disk_free = burrow_common::disk::DiskCapacity {
-        unwritten_bytes: entry
-            .status
-            .disk_unwritten_bytes
-            .saturating_add(held.disk_bytes),
-        ..disk_capacity(&entry.status)
+        unwritten_bytes: capacity.unwritten_bytes.saturating_add(held.disk_bytes),
+        ..capacity
     }
     .headroom();
     cpu_free.min(mem_free).min(disk_free)
@@ -457,7 +459,7 @@ impl NodeRegistry {
                 info,
                 status: NodeStatus::default(),
                 last_heartbeat: Instant::now(),
-                last_heartbeat_at: burrow_common::now_rfc3339(),
+                last_heartbeat_at_ms: burrow_common::unix_now_ms(),
                 index,
                 wireguard_public_key,
                 wireguard_endpoint,
@@ -491,7 +493,7 @@ impl NodeRegistry {
                 info,
                 status: NodeStatus::default(),
                 last_heartbeat: Instant::now(),
-                last_heartbeat_at: burrow_common::now_rfc3339(),
+                last_heartbeat_at_ms: burrow_common::unix_now_ms(),
                 index,
                 wireguard_public_key,
                 wireguard_endpoint,
@@ -511,7 +513,7 @@ impl NodeRegistry {
     /// says keeps the newer one. A node whose heartbeat moved on has its local
     /// reservations dropped, as a heartbeat arriving here would.
     pub fn reload(&self, rows: Vec<(NodeInfo, NodeStatus, burrow_store::NodeRow)>) {
-        let now_ms = unix_ms();
+        let now_ms = burrow_common::unix_now_ms();
         let mut nodes = self.nodes.lock().unwrap();
         let mut pending = self.pending.lock().unwrap();
         let mut fresh = HashMap::new();
@@ -539,9 +541,7 @@ impl NodeRegistry {
                     info,
                     status,
                     last_heartbeat,
-                    last_heartbeat_at: burrow_common::rfc3339_from_unix_secs(
-                        row.last_heartbeat_ms / 1000,
-                    ),
+                    last_heartbeat_at_ms: row.last_heartbeat_ms,
                     index: row.index,
                     wireguard_public_key: row.wireguard_public_key,
                     wireguard_endpoint: row.wireguard_endpoint,
@@ -611,7 +611,7 @@ impl NodeRegistry {
                 entry.status = status;
                 entry.is_reported = true;
                 entry.last_heartbeat = Instant::now();
-                entry.last_heartbeat_at = burrow_common::now_rfc3339();
+                entry.last_heartbeat_at_ms = burrow_common::unix_now_ms();
                 drop(nodes);
                 self.clear_pending(node_id);
                 true
@@ -768,19 +768,16 @@ impl NodeRegistry {
             .copied()
             .filter(|e| {
                 (want.arch.is_empty() || e.info.arch == want.arch)
-                    && (want.firecracker_version.is_empty()
-                        || version_of(&e.info, &want.hypervisor) == want.firecracker_version)
+                    && (want.hypervisor_version.is_empty()
+                        || version_of(&e.info, &want.hypervisor) == want.hypervisor_version)
             })
             .collect();
         if compatible.is_empty() {
             return Err(PlacementError::NoCompatibleNode {
                 arch: want.arch.clone(),
-                hypervisor: if want.hypervisor.is_empty() {
-                    "firecracker".into()
-                } else {
-                    want.hypervisor.clone()
-                },
-                version: want.firecracker_version.clone(),
+                hypervisor: burrow_common::hypervisor::Hypervisor::from_record(&want.hypervisor)
+                    .map_or_else(|| want.hypervisor.clone(), |h| h.to_string()),
+                version: want.hypervisor_version.clone(),
             });
         }
         let live = compatible;
@@ -1040,7 +1037,7 @@ impl NodeRegistry {
                 info: Some(e.info.clone()),
                 status: Some(e.status.clone()),
                 is_healthy: e.is_healthy(),
-                last_heartbeat_at: e.last_heartbeat_at.clone(),
+                last_heartbeat_at_unix_ms: e.last_heartbeat_at_ms,
             })
             .collect();
         out.sort_by(|a, b| {
@@ -1051,13 +1048,6 @@ impl NodeRegistry {
         });
         out
     }
-}
-
-pub fn unix_ms() -> i64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_millis() as i64)
-        .unwrap_or(0)
 }
 
 #[cfg(test)]
@@ -1344,21 +1334,21 @@ mod tests {
                     id: id.into(),
                     address: format!("{id}:7071"),
                     arch: "aarch64".into(),
-                    firecracker_version: version.into(),
+                    hypervisor_versions: [("firecracker".to_string(), version.to_string())].into(),
                     ..Default::default()
                 }),
             );
         }
         let want = Placement {
             arch: "aarch64".into(),
-            firecracker_version: "v1.16.1".into(),
+            hypervisor_version: "v1.16.1".into(),
             vcpus: 1,
             mem_mib: 1,
             ..Default::default()
         };
         assert_eq!(registry.place_for(&want).unwrap(), "b");
         let none = registry.place_for(&Placement {
-            firecracker_version: "v2.0.0".into(),
+            hypervisor_version: "v2.0.0".into(),
             ..want
         });
         assert!(matches!(none, Err(PlacementError::NoCompatibleNode { .. })));
@@ -1377,7 +1367,6 @@ mod tests {
                 id: "a".into(),
                 address: "a:7071".into(),
                 arch: "aarch64".into(),
-                firecracker_version: "v1.16.1".into(),
                 hypervisors: vec!["firecracker".into(), "cloud-hypervisor".into()],
                 hypervisor_versions: [
                     ("firecracker".to_string(), "v1.16.1".to_string()),
@@ -1390,37 +1379,20 @@ mod tests {
         let want = Placement {
             arch: "aarch64".into(),
             hypervisor: "cloud-hypervisor".into(),
-            firecracker_version: "v54.0".into(),
+            hypervisor_version: "v54.0".into(),
             vcpus: 1,
             mem_mib: 1,
             ..Default::default()
         };
         assert_eq!(registry.place_for(&want).unwrap(), "a");
         let newer = registry.place_for(&Placement {
-            firecracker_version: "v55.0".into(),
+            hypervisor_version: "v55.0".into(),
             ..want
         });
         assert!(matches!(
             newer,
             Err(PlacementError::NoCompatibleNode { .. })
         ));
-    }
-
-    /// A node from before versions were reported per hypervisor reports only
-    /// its Firecracker's, and offers nothing else.
-    #[test]
-    fn an_older_node_s_version_is_its_firecracker_s() {
-        let info = NodeInfo {
-            arch: "aarch64".into(),
-            firecracker_version: "v1.16.1".into(),
-            ..Default::default()
-        };
-        assert_eq!(version_of(&info, "firecracker"), "v1.16.1");
-        assert_eq!(version_of(&info, ""), "v1.16.1");
-        assert_eq!(version_of(&info, "cloud-hypervisor"), "");
-        assert!(can_restore(&info, "aarch64", "firecracker", "v1.16.1"));
-        assert!(!can_restore(&info, "aarch64", "cloud-hypervisor", ""));
-        assert!(!can_restore(&info, "x86_64", "firecracker", "v1.16.1"));
     }
 
     fn offering(registry: &NodeRegistry, id: &str, hypervisors: &[&str]) {
@@ -2119,11 +2091,13 @@ mod tests {
     fn disk(free_gib: u64, unwritten_gib: u64, overcommit: f64) -> NodeStatus {
         NodeStatus {
             free_mem_mib: 64_000,
-            disk_free_bytes: free_gib * GIB,
-            disk_total_bytes: 100 * GIB,
-            disk_reserve_bytes: 5 * GIB,
-            disk_unwritten_bytes: unwritten_gib * GIB,
-            disk_overcommit: overcommit,
+            disk: Some(burrow_proto::common::v1::DiskCapacity {
+                free_bytes: free_gib * GIB,
+                total_bytes: 100 * GIB,
+                reserve_bytes: 5 * GIB,
+                unwritten_bytes: unwritten_gib * GIB,
+                overcommit,
+            }),
             ..Default::default()
         }
     }

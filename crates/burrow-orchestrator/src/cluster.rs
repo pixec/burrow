@@ -94,7 +94,7 @@ pub fn node_row(
         status: status.encode_to_vec(),
         wireguard_public_key: wireguard_public_key.to_string(),
         wireguard_endpoint: wireguard_endpoint.to_string(),
-        last_heartbeat_ms: crate::registry::unix_ms(),
+        last_heartbeat_ms: burrow_common::unix_now_ms(),
         is_reported: false,
         total_vcpus: info.total_vcpus,
         committed_vcpus: status.committed_vcpus,

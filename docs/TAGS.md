@@ -1,7 +1,7 @@
 # Tags
 
 Sandboxes carry key-value tags for categorization: environment, team, task,
-whatever your scheme needs. Tags are the `metadata` map on the sandbox record.
+whatever your scheme needs. Tags are the `tags` map on the sandbox record.
 You set them at creation, replace them at any time, and filter on them when
 listing.
 

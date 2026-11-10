@@ -11,7 +11,8 @@ use std::time::Duration;
 use clap::Args;
 
 use burrow_vmm::{
-    Backend, CloudHypervisorConfig, DriveSpec, FirecrackerConfig, Hypervisor, Vm, VmSpec,
+    Backend, CloudHypervisorConfig, DriveSpec, FirecrackerConfig, Hypervisor, HypervisorExt, Vm,
+    VmSpec,
 };
 
 #[derive(Args, Clone)]
@@ -78,6 +79,8 @@ impl VmBootArgs {
             // kernel boot by name.
             #[cfg(target_os = "macos")]
             Hypervisor::Vz => Backend::Vz(burrow_vmm::VzConfig::default()),
+            #[cfg(not(target_os = "macos"))]
+            Hypervisor::Vz => unreachable!("vz runs on macOS only"),
         };
         let mut spec = VmSpec::new(vm_id, &self.workdir, backend);
         // A dev box often has no delegated cgroup, and these runs are not

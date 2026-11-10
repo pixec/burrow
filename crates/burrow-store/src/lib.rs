@@ -82,8 +82,8 @@ pub struct ShareRow {
     pub ports: Vec<u16>,
     /// `nodekey:<hex>` of each admitted client; empty admits any.
     pub allowed_clients: Vec<String>,
-    /// Unix seconds the current keys were issued.
-    pub created_at: i64,
+    /// Unix milliseconds the current keys were issued.
+    pub created_at_ms: i64,
     /// Guest UDP ports admitted; `is_all_udp_shared` admits every one.
     pub udp_ports: Vec<u16>,
     pub is_all_udp_shared: bool,
@@ -93,18 +93,19 @@ pub struct ShareRow {
 
 /// One VM boot inside a sandbox's life.
 ///
-/// Timestamps are unix seconds; `ended_at` is 0 while the session is open, and
-/// stays 0 for one the node died during, because nothing observed when that VM
-/// actually stopped, and inventing a time would be worse than saying so.
+/// `ended_at_ms` is 0 while the session is open, and stays 0 for one the node
+/// died during, because nothing observed when that VM actually stopped, and
+/// inventing a time would be worse than saying so. `started_by` and `ended_by`
+/// are `burrow.common.v1.SessionStart` and `SessionEnd`; `ended_by` is 0
+/// while the session is open.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SessionRow {
     pub id: String,
     pub sandbox_id: String,
-    pub started_at: i64,
-    pub ended_at: i64,
-    pub started_by: String,
-    /// Empty while the session is open.
-    pub ended_by: String,
+    pub started_at_ms: i64,
+    pub ended_at_ms: i64,
+    pub started_by: i32,
+    pub ended_by: i32,
 }
 
 /// One lifecycle event, as a node recorded it or as the orchestrator copied
@@ -120,7 +121,8 @@ pub struct EventRow {
     pub node_seq: u64,
     pub at_unix_ms: i64,
     pub sandbox_id: String,
-    pub kind: String,
+    /// A `burrow.common.v1.EventKind`.
+    pub kind: i32,
     pub state: i32,
     pub detail: String,
     pub template: String,
@@ -132,10 +134,32 @@ pub struct EventRow {
     pub mem_mib: u32,
 }
 
+impl From<EventRow> for burrow_proto::common::v1::Event {
+    fn from(row: EventRow) -> Self {
+        Self {
+            seq: row.seq,
+            node_id: row.node_id,
+            node_seq: row.node_seq,
+            at_unix_ms: row.at_unix_ms,
+            sandbox_id: row.sandbox_id,
+            kind: row.kind,
+            state: row.state,
+            detail: row.detail,
+            template: row.template,
+            tags: serde_json::from_str(&row.metadata_json).unwrap_or_default(),
+            cpu_usage_usec: row.cpu_usage_usec,
+            rx_bytes: row.rx_bytes,
+            tx_bytes: row.tx_bytes,
+            vcpus: row.vcpus,
+            mem_mib: row.mem_mib,
+        }
+    }
+}
+
 /// One recorded egress attempt.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct EgressRow {
-    pub at: String,
+    pub at_ms: i64,
     pub sandbox_id: String,
     pub source_ip: String,
     pub destination: String,
@@ -152,8 +176,8 @@ pub struct EgressFilter {
     pub sandbox_id: Option<String>,
     /// Only records the proxy refused.
     pub is_denied_only: bool,
-    /// RFC 3339 lower bound, compared lexically (the format sorts correctly).
-    pub since: Option<String>,
+    /// Unix milliseconds lower bound.
+    pub since_ms: Option<i64>,
     pub limit: u32,
 }
 
@@ -260,7 +284,7 @@ type EventRaw = (
     i64,
     i64,
     String,
-    String,
+    i64,
     i64,
     String,
     String,
@@ -282,7 +306,7 @@ fn event_row(r: EventRaw) -> EventRow {
         node_seq: r.2 as u64,
         at_unix_ms: r.3,
         sandbox_id: r.4,
-        kind: r.5,
+        kind: r.5 as i32,
         state: r.6 as i32,
         detail: r.7,
         template: r.8,
@@ -462,32 +486,32 @@ impl Store {
 
     pub async fn put_session(&self, row: &SessionRow) -> Result<()> {
         on_pool!(self, pool => sqlx::query(
-            "INSERT INTO sessions (id, sandbox_id, started_at, ended_at, started_by, ended_by)
+            "INSERT INTO sessions (id, sandbox_id, started_at_ms, ended_at_ms, started_by, ended_by)
              VALUES ($1, $2, $3, $4, $5, $6)
              ON CONFLICT (id) DO UPDATE SET
-                ended_at=excluded.ended_at, ended_by=excluded.ended_by",
+                ended_at_ms=excluded.ended_at_ms, ended_by=excluded.ended_by",
         )
         .bind(&row.id)
         .bind(&row.sandbox_id)
-        .bind(row.started_at)
-        .bind(row.ended_at)
-        .bind(&row.started_by)
-        .bind(&row.ended_by)
+        .bind(row.started_at_ms)
+        .bind(row.ended_at_ms)
+        .bind(row.started_by as i64)
+        .bind(row.ended_by as i64)
         .execute(pool)
         .await
         .map(drop))?;
         Ok(())
     }
 
-    /// Marks one session closed. `ended_at` of 0 records that the session
+    /// Marks one session closed. `ended_at_ms` of 0 records that the session
     /// ended without anything observing when.
-    pub async fn end_session(&self, id: &str, ended_at: i64, ended_by: &str) -> Result<()> {
+    pub async fn end_session(&self, id: &str, ended_at_ms: i64, ended_by: i32) -> Result<()> {
         on_pool!(self, pool => sqlx::query(
-            "UPDATE sessions SET ended_at=$2, ended_by=$3 WHERE id=$1 AND ended_by=''",
+            "UPDATE sessions SET ended_at_ms=$2, ended_by=$3 WHERE id=$1 AND ended_by=0",
         )
         .bind(id)
-        .bind(ended_at)
-        .bind(ended_by)
+        .bind(ended_at_ms)
+        .bind(ended_by as i64)
         .execute(pool)
         .await
         .map(drop))?;
@@ -497,11 +521,11 @@ impl Store {
     /// Closes every session left open by a previous run of this daemon.
     ///
     /// A VMM does not survive its parent, so a session still open at startup
-    /// belongs to a VM that is already gone. `ended_at` stays unset because
+    /// belongs to a VM that is already gone. `ended_at_ms` stays unset because
     /// nothing recorded when that happened.
-    pub async fn close_open_sessions(&self, ended_by: &str) -> Result<usize> {
-        let done = on_pool!(self, pool => sqlx::query("UPDATE sessions SET ended_by=$1 WHERE ended_by=''")
-            .bind(ended_by)
+    pub async fn close_open_sessions(&self, ended_by: i32) -> Result<usize> {
+        let done = on_pool!(self, pool => sqlx::query("UPDATE sessions SET ended_by=$1 WHERE ended_by=0")
+            .bind(ended_by as i64)
             .execute(pool)
             .await
             .map(|done| done.rows_affected()))?;
@@ -517,22 +541,22 @@ impl Store {
     /// A sandbox's sessions, newest first.
     pub async fn list_sessions(&self, sandbox_id: &str) -> Result<Vec<SessionRow>> {
         let sql = format!(
-            "SELECT id, sandbox_id, started_at, ended_at, started_by, ended_by
-             FROM sessions WHERE sandbox_id=$1 ORDER BY started_at DESC, {} DESC",
+            "SELECT id, sandbox_id, started_at_ms, ended_at_ms, started_by, ended_by
+             FROM sessions WHERE sandbox_id=$1 ORDER BY started_at_ms DESC, {} DESC",
             self.session_order()
         );
-        let rows: Vec<(String, String, i64, i64, String, String)> =
+        let rows: Vec<(String, String, i64, i64, i64, i64)> =
             on_pool!(self, pool => sqlx::query_as(&sql).bind(sandbox_id).fetch_all(pool).await)?;
         Ok(rows
             .into_iter()
             .map(
-                |(id, sandbox_id, started_at, ended_at, started_by, ended_by)| SessionRow {
+                |(id, sandbox_id, started_at_ms, ended_at_ms, started_by, ended_by)| SessionRow {
                     id,
                     sandbox_id,
-                    started_at,
-                    ended_at,
-                    started_by,
-                    ended_by,
+                    started_at_ms,
+                    ended_at_ms,
+                    started_by: started_by as i32,
+                    ended_by: ended_by as i32,
                 },
             )
             .collect())
@@ -551,7 +575,7 @@ impl Store {
         let sql = format!(
             "DELETE FROM sessions WHERE sandbox_id=$1 AND id NOT IN (
                 SELECT id FROM sessions WHERE sandbox_id=$1
-                ORDER BY started_at DESC, {} DESC LIMIT $2
+                ORDER BY started_at_ms DESC, {} DESC LIMIT $2
              )",
             self.session_order()
         );
@@ -590,7 +614,7 @@ impl Store {
         .bind(row.node_seq as i64)
         .bind(row.at_unix_ms)
         .bind(&row.sandbox_id)
-        .bind(&row.kind)
+        .bind(row.kind as i64)
         .bind(row.state as i64)
         .bind(&row.detail)
         .bind(&row.template)
@@ -698,11 +722,11 @@ impl Store {
     pub async fn insert_egress(&self, row: &EgressRow) -> Result<()> {
         on_pool!(self, pool => sqlx::query(
             "INSERT INTO audit_egress
-               (at, sandbox_id, source_ip, destination, host, port, allowed, reason,
+               (at_ms, sandbox_id, source_ip, destination, host, port, allowed, reason,
                 bytes_sent, bytes_received)
              VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)",
         )
-        .bind(&row.at)
+        .bind(row.at_ms)
         .bind(&row.sandbox_id)
         .bind(&row.source_ip)
         .bind(&row.destination)
@@ -723,7 +747,7 @@ impl Store {
         // Predicates are fixed strings with bound parameters; the filter never
         // reaches the SQL text.
         let mut sql = String::from(
-            "SELECT at, sandbox_id, source_ip, destination, host, port, allowed, reason,
+            "SELECT at_ms, sandbox_id, source_ip, destination, host, port, allowed, reason,
                     bytes_sent, bytes_received
              FROM audit_egress WHERE 1=1",
         );
@@ -735,14 +759,14 @@ impl Store {
         if filter.is_denied_only {
             sql.push_str(" AND allowed = 0");
         }
-        if filter.since.is_some() {
-            sql.push_str(&format!(" AND at >= ${next}"));
+        if filter.since_ms.is_some() {
+            sql.push_str(&format!(" AND at_ms >= ${next}"));
         }
         sql.push_str(" ORDER BY id DESC LIMIT $1");
         let limit = if filter.limit == 0 { 100 } else { filter.limit } as i64;
 
         type Raw = (
-            String,
+            i64,
             String,
             String,
             String,
@@ -758,7 +782,7 @@ impl Store {
             if let Some(id) = &filter.sandbox_id {
                 query = query.bind(id);
             }
-            if let Some(since) = &filter.since {
+            if let Some(since) = filter.since_ms {
                 query = query.bind(since);
             }
             query.fetch_all(pool).await
@@ -766,7 +790,7 @@ impl Store {
         Ok(rows
             .into_iter()
             .map(|r| EgressRow {
-                at: r.0,
+                at_ms: r.0,
                 sandbox_id: r.1,
                 source_ip: r.2,
                 destination: r.3,
@@ -784,9 +808,9 @@ impl Store {
     ///
     /// Audit volume is unbounded otherwise: a busy sandbox can generate
     /// thousands of records a minute and nothing else would ever remove them.
-    pub async fn prune_egress(&self, cutoff: &str) -> Result<usize> {
-        let done = on_pool!(self, pool => sqlx::query("DELETE FROM audit_egress WHERE at < $1")
-            .bind(cutoff)
+    pub async fn prune_egress(&self, cutoff_ms: i64) -> Result<usize> {
+        let done = on_pool!(self, pool => sqlx::query("DELETE FROM audit_egress WHERE at_ms < $1")
+            .bind(cutoff_ms)
             .execute(pool)
             .await
             .map(|done| done.rows_affected()))?;
@@ -1295,7 +1319,8 @@ pub struct UsageRow {
     pub node_id: String,
     pub template: String,
     pub metadata_json: String,
-    pub state: String,
+    /// A `burrow.api.v1.UsageState`.
+    pub state: i32,
     pub vcpus: u32,
     pub mem_mib: u32,
     pub started_at_ms: i64,
@@ -1314,7 +1339,7 @@ pub struct OpenUsageRow {
     pub node_id: String,
     pub template: String,
     pub metadata_json: String,
-    pub state: String,
+    pub state: i32,
     pub vcpus: u32,
     pub mem_mib: u32,
     pub started_at_ms: i64,
@@ -1362,7 +1387,7 @@ type UsageRaw = (
     String,
     String,
     String,
-    String,
+    i64,
     i64,
     i64,
     i64,
@@ -1378,7 +1403,7 @@ type OpenUsageRaw = (
     String,
     String,
     String,
-    String,
+    i64,
     i64,
     i64,
     i64,
@@ -1401,7 +1426,7 @@ fn open_usage_row(r: OpenUsageRaw) -> OpenUsageRow {
         node_id: r.1,
         template: r.2,
         metadata_json: r.3,
-        state: r.4,
+        state: r.4 as i32,
         vcpus: r.5 as u32,
         mem_mib: r.6 as u32,
         started_at_ms: r.7,
@@ -1425,7 +1450,7 @@ macro_rules! bind_open {
             .bind(&$row.node_id)
             .bind(&$row.template)
             .bind(&$row.metadata_json)
-            .bind(&$row.state)
+            .bind($row.state as i64)
             .bind($row.vcpus as i64)
             .bind($row.mem_mib as i64)
             .bind($row.started_at_ms)
@@ -1612,7 +1637,7 @@ impl Store {
                 .bind(&row.node_id)
                 .bind(&row.template)
                 .bind(&row.metadata_json)
-                .bind(&row.state)
+                .bind(row.state as i64)
                 .bind(row.vcpus as i64)
                 .bind(row.mem_mib as i64)
                 .bind(row.started_at_ms)
@@ -1674,7 +1699,7 @@ impl Store {
                 node_id: r.2,
                 template: r.3,
                 metadata_json: r.4,
-                state: r.5,
+                state: r.5 as i32,
                 vcpus: r.6 as u32,
                 mem_mib: r.7 as u32,
                 started_at_ms: r.8,
@@ -1746,21 +1771,21 @@ mod tests {
     #[tokio::test]
     async fn events_append_in_order_and_an_origin_is_recorded_once() {
         let store = Store::open_in_memory().await.unwrap();
-        let row = |node_seq: u64, kind: &str| EventRow {
+        let row = |node_seq: u64, kind: i32| EventRow {
             node_id: "node1".into(),
             node_seq,
             at_unix_ms: 1_000 + node_seq as i64,
             sandbox_id: "sbx_a".into(),
-            kind: kind.into(),
+            kind,
             ..Default::default()
         };
-        assert_eq!(store.append_event(&row(1, "created")).await.unwrap(), 1);
-        assert_eq!(store.append_event(&row(2, "started")).await.unwrap(), 2);
+        assert_eq!(store.append_event(&row(1, 1)).await.unwrap(), 1);
+        assert_eq!(store.append_event(&row(2, 2)).await.unwrap(), 2);
         // A reconnecting tail replays what was already copied.
-        assert_eq!(store.append_event(&row(2, "started")).await.unwrap(), 0);
+        assert_eq!(store.append_event(&row(2, 2)).await.unwrap(), 0);
         let listed = store.list_events(1, Some("sbx_a"), 10).await.unwrap();
         assert_eq!(listed.len(), 1);
-        assert_eq!(listed[0].kind, "started");
+        assert_eq!(listed[0].kind, 2);
         assert_eq!(store.last_event_seq_for_node("node1").await.unwrap(), 2);
         assert_eq!(store.last_event_seq_for_node("node2").await.unwrap(), 0);
         assert_eq!(store.prune_events(1_002).await.unwrap(), 1);
@@ -1794,7 +1819,7 @@ mod tests {
             preshared_key: "psk:00".into(),
             ports: vec![22, 8080],
             allowed_clients: vec!["nodekey:11".into()],
-            created_at: 1_800_000_000,
+            created_at_ms: 1_800_000_000_000,
             udp_ports: vec![53],
             is_all_udp_shared: false,
             is_ip_transparent: true,
@@ -1872,14 +1897,14 @@ mod tests {
         assert!(store.list_sandboxes().await.unwrap().is_empty());
     }
 
-    fn session(id: &str, sandbox: &str, started_at: i64) -> SessionRow {
+    fn session(id: &str, sandbox: &str, started_at_ms: i64) -> SessionRow {
         SessionRow {
             id: id.into(),
             sandbox_id: sandbox.into(),
-            started_at,
-            ended_at: 0,
-            started_by: "boot".into(),
-            ended_by: String::new(),
+            started_at_ms,
+            ended_at_ms: 0,
+            started_by: 1,
+            ended_by: 0,
         }
     }
 
@@ -1967,19 +1992,19 @@ mod tests {
             .await
             .unwrap();
         let mut closed = session("s2", "sbx_a", 200);
-        closed.ended_at = 250;
-        closed.ended_by = "suspended".into();
+        closed.ended_at_ms = 250;
+        closed.ended_by = 1;
         store.put_session(&closed).await.unwrap();
 
-        assert_eq!(store.close_open_sessions("unknown").await.unwrap(), 1);
+        assert_eq!(store.close_open_sessions(4).await.unwrap(), 1);
         let listed = store.list_sessions("sbx_a").await.unwrap();
         let open = listed.iter().find(|s| s.id == "s1").unwrap();
-        assert_eq!(open.ended_by, "unknown");
-        assert_eq!(open.ended_at, 0);
+        assert_eq!(open.ended_by, 4);
+        assert_eq!(open.ended_at_ms, 0);
         // An already-closed session keeps the reason it was closed with.
         let done = listed.iter().find(|s| s.id == "s2").unwrap();
-        assert_eq!(done.ended_by, "suspended");
-        assert_eq!(done.ended_at, 250);
+        assert_eq!(done.ended_by, 1);
+        assert_eq!(done.ended_at_ms, 250);
     }
 
     #[tokio::test]
@@ -1989,11 +2014,11 @@ mod tests {
             .put_session(&session("s1", "sbx_a", 100))
             .await
             .unwrap();
-        store.end_session("s1", 150, "suspended").await.unwrap();
-        store.end_session("s1", 999, "deleted").await.unwrap();
+        store.end_session("s1", 150, 1).await.unwrap();
+        store.end_session("s1", 999, 2).await.unwrap();
         let row = &store.list_sessions("sbx_a").await.unwrap()[0];
-        assert_eq!(row.ended_by, "suspended");
-        assert_eq!(row.ended_at, 150);
+        assert_eq!(row.ended_by, 1);
+        assert_eq!(row.ended_at_ms, 150);
     }
 
     #[tokio::test]
@@ -2012,9 +2037,9 @@ mod tests {
         assert_eq!(store.list_sessions("sbx_b").await.unwrap().len(), 1);
     }
 
-    fn egress(sandbox: &str, allowed: bool, at: &str) -> EgressRow {
+    fn egress(sandbox: &str, allowed: bool, at_ms: i64) -> EgressRow {
         EgressRow {
-            at: at.into(),
+            at_ms,
             sandbox_id: sandbox.into(),
             source_ip: "10.99.0.6".into(),
             destination: "1.2.3.4:443".into(),
@@ -2036,27 +2061,27 @@ mod tests {
     async fn egress_records_come_back_newest_first() {
         let store = Store::open_in_memory().await.unwrap();
         store
-            .insert_egress(&egress("a", true, "2026-01-01T00:00:00Z"))
+            .insert_egress(&egress("a", true, 1_000))
             .await
             .unwrap();
         store
-            .insert_egress(&egress("a", false, "2026-01-02T00:00:00Z"))
+            .insert_egress(&egress("a", false, 2_000))
             .await
             .unwrap();
         let rows = store.query_egress(&EgressFilter::default()).await.unwrap();
         assert_eq!(rows.len(), 2);
-        assert_eq!(rows[0].at, "2026-01-02T00:00:00Z");
+        assert_eq!(rows[0].at_ms, 2_000);
     }
 
     #[tokio::test]
     async fn egress_can_be_filtered() {
         let store = Store::open_in_memory().await.unwrap();
         store
-            .insert_egress(&egress("a", true, "2026-01-01T00:00:00Z"))
+            .insert_egress(&egress("a", true, 1_000))
             .await
             .unwrap();
         store
-            .insert_egress(&egress("b", false, "2026-01-02T00:00:00Z"))
+            .insert_egress(&egress("b", false, 2_000))
             .await
             .unwrap();
 
@@ -2081,7 +2106,7 @@ mod tests {
 
         let since = store
             .query_egress(&EgressFilter {
-                since: Some("2026-01-02T00:00:00Z".into()),
+                since_ms: Some(2_000),
                 ..Default::default()
             })
             .await
@@ -2093,14 +2118,14 @@ mod tests {
     async fn pruning_removes_only_old_records() {
         let store = Store::open_in_memory().await.unwrap();
         store
-            .insert_egress(&egress("a", true, "2026-01-01T00:00:00Z"))
+            .insert_egress(&egress("a", true, 1_000))
             .await
             .unwrap();
         store
-            .insert_egress(&egress("a", true, "2026-06-01T00:00:00Z"))
+            .insert_egress(&egress("a", true, 6_000))
             .await
             .unwrap();
-        assert_eq!(store.prune_egress("2026-03-01T00:00:00Z").await.unwrap(), 1);
+        assert_eq!(store.prune_egress(3_000).await.unwrap(), 1);
         assert_eq!(
             store
                 .query_egress(&EgressFilter::default())

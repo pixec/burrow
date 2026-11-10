@@ -60,8 +60,7 @@ const META: &str = "volume.json";
 pub struct Meta {
     pub name: String,
     pub size_mib: u64,
-    /// RFC 3339.
-    pub created_at: String,
+    pub created_at_ms: i64,
     #[serde(default)]
     pub labels: HashMap<String, String>,
     /// The guest OS whose filesystem the image holds, from the first
@@ -187,7 +186,7 @@ impl VolumeStore {
         let meta = Meta {
             name: name.to_string(),
             size_mib,
-            created_at: burrow_common::now_rfc3339(),
+            created_at_ms: burrow_common::unix_now_ms(),
             labels,
             guest_os: String::new(),
         };
@@ -489,7 +488,7 @@ impl VolumeStore {
             // a snapshot's.
             node_id: String::new(),
             size_mib: meta.size_mib,
-            created_at: meta.created_at.clone(),
+            created_at_unix_ms: meta.created_at_ms,
             attached_to: self.holder(&meta.name).unwrap_or_default(),
             labels: meta.labels.clone(),
         }
@@ -1151,7 +1150,7 @@ mod tests {
         let meta = Meta {
             name: name.into(),
             size_mib: 1,
-            created_at: String::new(),
+            created_at_ms: 0,
             labels: HashMap::new(),
             guest_os: String::new(),
         };

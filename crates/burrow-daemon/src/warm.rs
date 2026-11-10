@@ -27,7 +27,7 @@ use std::path::{Path, PathBuf};
 
 use tonic::Status;
 
-use burrow_vmm::{DriveSpec, Hypervisor, NetSpec, Vm, VmSpec};
+use burrow_vmm::{DriveSpec, Hypervisor, HypervisorExt, NetSpec, Vm, VmSpec};
 
 use crate::sandbox::NodeConfig;
 

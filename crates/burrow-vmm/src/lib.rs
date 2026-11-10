@@ -81,48 +81,23 @@ pub struct NetSpec {
     pub guest_mac: Option<String>,
 }
 
-/// A hypervisor burrow can run a guest under.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash, PartialOrd, Ord)]
-pub enum Hypervisor {
-    /// What a sandbox gets when nothing says otherwise, and what every record
-    /// written before there was a choice ran under.
-    #[default]
-    Firecracker,
-    CloudHypervisor,
-    /// Apple's Virtualization.framework, for macOS guests on a Mac node.
-    #[cfg(target_os = "macos")]
-    Vz,
+pub use burrow_common::hypervisor::{GuestOs, Hypervisor};
+
+/// The framework's save file, device state and memory in one: both halves of
+/// the vz backend's [`Layout`]. Named here so every build knows the layout
+/// of state a Mac node wrote.
+pub const VZ_SAVE_FILE: &str = "snapshot.vzsave";
+
+/// What this crate knows about each hypervisor: what its backend can do and
+/// the files its snapshots are made of.
+pub trait HypervisorExt {
+    fn capabilities(self) -> Capabilities;
+    /// The files a snapshot of this hypervisor's VM is made of.
+    fn layout(self) -> Layout;
 }
 
-impl Hypervisor {
-    #[cfg(not(target_os = "macos"))]
-    pub const ALL: [Hypervisor; 2] = [Hypervisor::Firecracker, Hypervisor::CloudHypervisor];
-    #[cfg(target_os = "macos")]
-    pub const ALL: [Hypervisor; 3] = [
-        Hypervisor::Firecracker,
-        Hypervisor::CloudHypervisor,
-        Hypervisor::Vz,
-    ];
-
-    pub fn as_str(self) -> &'static str {
-        match self {
-            Self::Firecracker => "firecracker",
-            Self::CloudHypervisor => "cloud-hypervisor",
-            #[cfg(target_os = "macos")]
-            Self::Vz => "vz",
-        }
-    }
-
-    /// The name a record carries. Empty is a record from before the field
-    /// existed, which can only have been Firecracker.
-    pub fn from_record(name: &str) -> Option<Self> {
-        match name {
-            "" => Some(Self::Firecracker),
-            name => name.parse().ok(),
-        }
-    }
-
-    pub fn capabilities(self) -> Capabilities {
+impl HypervisorExt for Hypervisor {
+    fn capabilities(self) -> Capabilities {
         match self {
             Self::Firecracker => Capabilities {
                 is_diff_snapshot_supported: true,
@@ -151,7 +126,6 @@ impl Hypervisor {
             // The framework saves a machine as one opaque file, reads it back
             // itself and attaches storage only at configuration time. There
             // is no cgroup on macOS for the headroom to size.
-            #[cfg(target_os = "macos")]
             Self::Vz => Capabilities {
                 is_diff_snapshot_supported: false,
                 is_lazy_memory_supported: false,
@@ -167,8 +141,7 @@ impl Hypervisor {
         }
     }
 
-    /// The files a snapshot of this hypervisor's VM is made of.
-    pub fn layout(self) -> Layout {
+    fn layout(self) -> Layout {
         match self {
             Self::Firecracker => Layout {
                 state: firecracker::SNAPSHOT_FILE,
@@ -178,76 +151,10 @@ impl Hypervisor {
                 state: cloud_hypervisor::STATE_FILE,
                 memory: Some(cloud_hypervisor::MEMORY_FILE),
             },
-            #[cfg(target_os = "macos")]
             Self::Vz => Layout {
-                state: vz::SAVE_FILE,
+                state: VZ_SAVE_FILE,
                 memory: None,
             },
-        }
-    }
-}
-
-impl std::fmt::Display for Hypervisor {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str(self.as_str())
-    }
-}
-
-impl std::str::FromStr for Hypervisor {
-    type Err = String;
-
-    fn from_str(name: &str) -> std::result::Result<Self, String> {
-        Self::ALL
-            .into_iter()
-            .find(|h| h.as_str() == name)
-            .ok_or_else(|| {
-                let names: Vec<_> = Self::ALL.iter().map(|h| h.as_str()).collect();
-                format!(
-                    "unknown hypervisor {name:?}: expected one of {}",
-                    names.join(", ")
-                )
-            })
-    }
-}
-
-/// The operating system a guest runs.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash)]
-pub enum GuestOs {
-    #[default]
-    Linux,
-    Windows,
-    #[cfg(target_os = "macos")]
-    MacOs,
-}
-
-impl GuestOs {
-    pub fn as_str(self) -> &'static str {
-        match self {
-            Self::Linux => "linux",
-            Self::Windows => "windows",
-            #[cfg(target_os = "macos")]
-            Self::MacOs => "macos",
-        }
-    }
-
-    /// Empty is every template imported before the field existed, all Linux.
-    pub fn from_record(name: &str) -> Option<Self> {
-        match name {
-            "" | "linux" => Some(Self::Linux),
-            "windows" => Some(Self::Windows),
-            #[cfg(target_os = "macos")]
-            "macos" => Some(Self::MacOs),
-            _ => None,
-        }
-    }
-
-    /// The hypervisor a template of this OS gets when its build names none.
-    pub fn default_hypervisor(self) -> Hypervisor {
-        match self {
-            Self::Linux => Hypervisor::Firecracker,
-            Self::Windows => Hypervisor::CloudHypervisor,
-            #[cfg(target_os = "macos")]
-            Self::MacOs => Hypervisor::Vz,
         }
     }
 }

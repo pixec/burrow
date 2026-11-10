@@ -13,7 +13,7 @@ use tonic::{Status, transport::Channel};
 use burrow_net::{Ipam, Lease, firewall, tap};
 use burrow_proto::common::v1 as common;
 use burrow_proto::guest::v1::guest_client::GuestClient;
-use burrow_vmm::{DriveSpec, GuestAddr, Hypervisor, Layout, NetSpec, Vm, VmSpec};
+use burrow_vmm::{DriveSpec, GuestAddr, Hypervisor, HypervisorExt, Layout, NetSpec, Vm, VmSpec};
 
 use crate::guestconn;
 
@@ -155,6 +155,9 @@ impl NodeConfig {
             // it was built, so a sandbox's clone boots straight to it.
             #[cfg(target_os = "macos")]
             Hypervisor::Vz => burrow_vmm::Backend::Vz(burrow_vmm::VzConfig::default()),
+            // Never offered here, so never asked for: serve refuses vz off a Mac.
+            #[cfg(not(target_os = "macos"))]
+            Hypervisor::Vz => unreachable!("vz is offered on macOS only"),
         }
     }
 
@@ -165,7 +168,6 @@ impl NodeConfig {
         let is_jailed = match hypervisor {
             Hypervisor::Firecracker => true,
             Hypervisor::CloudHypervisor => self.cloud_hypervisor.jail.is_some(),
-            #[cfg(target_os = "macos")]
             Hypervisor::Vz => false,
         };
         self.jail
@@ -179,7 +181,6 @@ impl NodeConfig {
             Hypervisor::Firecracker => &self.firecracker_version,
             Hypervisor::CloudHypervisor => &self.cloud_hypervisor_version,
             // Never offered: serve refuses vz until a macOS node exists.
-            #[cfg(target_os = "macos")]
             Hypervisor::Vz => "",
         }
     }
@@ -301,31 +302,31 @@ async fn discover_memory_chain(workdir: &std::path::Path, layout: Layout) -> Vec
 const MAX_SESSIONS: usize = 64;
 
 /// How a VM started, as recorded on the session it opens.
-const STARTED_BOOT: &str = "boot";
-const STARTED_RESTORE: &str = "restore";
-const STARTED_RESUME: &str = "resume";
+const STARTED_BOOT: common::SessionStart = common::SessionStart::Boot;
+const STARTED_RESTORE: common::SessionStart = common::SessionStart::Restore;
+const STARTED_RESUME: common::SessionStart = common::SessionStart::Resume;
 /// How one stopped.
-const ENDED_SUSPENDED: &str = "suspended";
-const ENDED_DELETED: &str = "deleted";
-const ENDED_FAILED: &str = "failed";
-const ENDED_STOPPED: &str = "stopped";
+const ENDED_SUSPENDED: common::SessionEnd = common::SessionEnd::Suspended;
+const ENDED_DELETED: common::SessionEnd = common::SessionEnd::Deleted;
+const ENDED_FAILED: common::SessionEnd = common::SessionEnd::Failed;
+const ENDED_STOPPED: common::SessionEnd = common::SessionEnd::Stopped;
 /// A session that was still open when the node died. Nothing observed when its
 /// VM stopped, so its end time stays unset rather than being invented.
-const ENDED_UNKNOWN: &str = "unknown";
+const ENDED_UNKNOWN: common::SessionEnd = common::SessionEnd::Unknown;
 
 /// Event kinds, as the log records them. A sandbox's life reads
 /// created, started, agent_ready, then stopped and started per suspend and
 /// resume, then destroyed; snapshot_created sits wherever a commit happened,
 /// and recovered wherever the node restarted.
-const EVENT_CREATED: &str = "created";
-const EVENT_STARTED: &str = "started";
-const EVENT_AGENT_READY: &str = "agent_ready";
-const EVENT_STOPPED: &str = "stopped";
-const EVENT_DESTROYED: &str = "destroyed";
-const EVENT_SNAPSHOT_CREATED: &str = "snapshot_created";
+const EVENT_CREATED: common::EventKind = common::EventKind::Created;
+const EVENT_STARTED: common::EventKind = common::EventKind::Started;
+const EVENT_AGENT_READY: common::EventKind = common::EventKind::AgentReady;
+const EVENT_STOPPED: common::EventKind = common::EventKind::Stopped;
+const EVENT_DESTROYED: common::EventKind = common::EventKind::Destroyed;
+const EVENT_SNAPSHOT_CREATED: common::EventKind = common::EventKind::SnapshotCreated;
 /// Logged on a node's start for each sandbox it holds, in the state it found
 /// it in.
-const EVENT_RECOVERED: &str = "recovered";
+const EVENT_RECOVERED: common::EventKind = common::EventKind::Recovered;
 /// The detail of an event recovery logs for a VM that was gone when it
 /// looked: its figures are the last the node recorded, not a reading.
 const DETAIL_LOST: &str = "lost";
@@ -348,33 +349,6 @@ fn with_totals(mut record: common::Sandbox, usage: Option<Usage>) -> common::San
         record.tx_bytes = usage.tx_bytes;
     }
     record
-}
-
-fn unix_now_ms() -> i64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_millis() as i64)
-        .unwrap_or(0)
-}
-
-pub fn event_to_proto(row: burrow_store::EventRow) -> common::Event {
-    common::Event {
-        seq: row.seq,
-        node_id: row.node_id,
-        node_seq: row.node_seq,
-        at_unix_ms: row.at_unix_ms,
-        sandbox_id: row.sandbox_id,
-        r#type: row.kind,
-        state: row.state,
-        detail: row.detail,
-        template: row.template,
-        metadata: serde_json::from_str(&row.metadata_json).unwrap_or_default(),
-        cpu_usage_usec: row.cpu_usage_usec,
-        rx_bytes: row.rx_bytes,
-        tx_bytes: row.tx_bytes,
-        vcpus: row.vcpus,
-        mem_mib: row.mem_mib,
-    }
 }
 
 /// What a sandbox has consumed, and the raw readings the totals came from.
@@ -717,7 +691,7 @@ pub struct RunningSandbox {
     /// runs, and every snapshot it leaves, is this hypervisor's.
     hypervisor: Hypervisor,
     /// Everything else about the sandbox. Mutable because a pre-provisioned
-    /// sandbox is stamped with the requesting caller's policy and metadata
+    /// sandbox is stamped with the requesting caller's policy and tags
     /// when it is handed out.
     base_record: std::sync::Mutex<common::Sandbox>,
     state: std::sync::atomic::AtomicI32,
@@ -799,7 +773,7 @@ impl RunningSandbox {
             && let Some(stored) = self.durable.stored.lock().unwrap().as_ref()
         {
             record.arch = stored.manifest.arch.clone();
-            record.firecracker_version = stored.manifest.firecracker_version.clone();
+            record.hypervisor_version = stored.manifest.hypervisor_version.clone();
         }
         record
     }
@@ -948,13 +922,30 @@ impl RunningSandbox {
             .unwrap_or_default()
     }
 
-    /// Seconds since creation, or 0 if the record's timestamp is unreadable.
-    /// 0 reads as "brand new", so an unparseable timestamp never causes a
-    /// deletion.
+    fn lifetime(&self) -> common::LifetimePolicy {
+        self.base_record
+            .lock()
+            .unwrap()
+            .policy
+            .as_ref()
+            .and_then(|policy| policy.lifetime)
+            .unwrap_or_default()
+    }
+
+    fn snapshot_policy(&self) -> common::SnapshotPolicy {
+        self.base_record
+            .lock()
+            .unwrap()
+            .policy
+            .as_ref()
+            .and_then(|policy| policy.snapshots)
+            .unwrap_or_default()
+    }
+
+    /// Seconds since creation.
     fn age_secs(&self) -> i64 {
-        burrow_common::unix_from_rfc3339(&self.base_record.lock().unwrap().created_at)
-            .map(|created| burrow_common::unix_now() - created)
-            .unwrap_or(0)
+        let created = self.base_record.lock().unwrap().created_at_unix_ms;
+        (burrow_common::unix_now_ms() - created) / 1000
     }
 
     fn set_state(&self, state: common::SandboxState) {
@@ -1576,7 +1567,7 @@ impl RunningSandbox {
                 .map_err(|err| io(file, err))?;
         }
         // The one file both sides write: a copy, reflinked where the
-        // filesystem supports it, which makes it metadata-only.
+        // filesystem supports it, which makes it tags-only.
         crate::warm::copy_sparse(&self.workdir.join(SCRATCH_IMAGE), &dest.join(SCRATCH_IMAGE))
             .await
             .map_err(|err| io(SCRATCH_IMAGE, err))?;
@@ -2284,7 +2275,7 @@ impl SandboxManager {
     /// Written before it is broadcast, and with the position the store gave
     /// it, so a tail that replays and then follows sees every event exactly
     /// once. The usage figures are the sandbox's totals at this instant.
-    async fn emit(&self, sandbox: &RunningSandbox, kind: &str, detail: &str) {
+    async fn emit(&self, sandbox: &RunningSandbox, kind: common::EventKind, detail: &str) {
         let shape = (sandbox.vcpus(), sandbox.mem_mib());
         self.log_event(&sandbox.record(), shape, kind, detail).await;
     }
@@ -2294,20 +2285,20 @@ impl SandboxManager {
         &self,
         record: &common::Sandbox,
         (vcpus, mem_mib): (u32, u32),
-        kind: &str,
+        kind: common::EventKind,
         detail: &str,
     ) {
         let row = burrow_store::EventRow {
             seq: 0,
             node_id: String::new(),
             node_seq: 0,
-            at_unix_ms: unix_now_ms(),
+            at_unix_ms: burrow_common::unix_now_ms(),
             sandbox_id: record.id.clone(),
-            kind: kind.to_string(),
+            kind: kind as i32,
             state: record.state,
             detail: detail.to_string(),
             template: record.template.clone(),
-            metadata_json: serde_json::to_string(&record.metadata).unwrap_or_else(|_| "{}".into()),
+            metadata_json: serde_json::to_string(&record.tags).unwrap_or_else(|_| "{}".into()),
             cpu_usage_usec: record.cpu_usage_usec,
             rx_bytes: record.rx_bytes,
             tx_bytes: record.tx_bytes,
@@ -2317,13 +2308,13 @@ impl SandboxManager {
         let seq = match self.store.append_event(&row).await {
             Ok(seq) => seq,
             Err(err) => {
-                tracing::error!(sandbox = record.id, kind, %err, "could not record an event");
+                tracing::error!(sandbox = record.id, kind = kind.label(), %err, "could not record an event");
                 return;
             }
         };
         let _ = self
             .events
-            .send(event_to_proto(burrow_store::EventRow { seq, ..row }));
+            .send(common::Event::from(burrow_store::EventRow { seq, ..row }));
         self.delivery.wait(seq).await;
     }
 
@@ -2358,16 +2349,16 @@ impl SandboxManager {
     async fn open_session(
         &self,
         sandbox: &RunningSandbox,
-        started_by: &'static str,
+        started_by: common::SessionStart,
         from: Option<Usage>,
     ) {
         let row = burrow_store::SessionRow {
             id: burrow_common::SessionId::generate().to_string(),
             sandbox_id: sandbox.id().to_string(),
-            started_at: burrow_common::unix_now(),
-            ended_at: 0,
-            started_by: started_by.to_string(),
-            ended_by: String::new(),
+            started_at_ms: burrow_common::unix_now_ms(),
+            ended_at_ms: 0,
+            started_by: started_by as i32,
+            ended_by: 0,
         };
         if let Err(err) = self.store.put_session(&row).await {
             tracing::error!(sandbox = sandbox.id(), %err, "could not record a session");
@@ -2376,7 +2367,7 @@ impl SandboxManager {
         *sandbox.session.lock().unwrap() = Some(row.id);
         let record = with_totals(sandbox.record(), from);
         let shape = (sandbox.vcpus(), sandbox.mem_mib());
-        self.log_event(&record, shape, EVENT_STARTED, started_by)
+        self.log_event(&record, shape, EVENT_STARTED, started_by.label())
             .await;
         // Applied as a session lands, which is the one moment the count grows.
         if let Err(err) = self
@@ -2389,19 +2380,19 @@ impl SandboxManager {
     }
 
     /// Records that this sandbox's VM has stopped. A no-op when none is open.
-    async fn close_session(&self, sandbox: &RunningSandbox, ended_by: &'static str) {
+    async fn close_session(&self, sandbox: &RunningSandbox, ended_by: common::SessionEnd) {
         let Some(id) = sandbox.session.lock().unwrap().take() else {
             return;
         };
         self.sample_last(sandbox).await;
         if let Err(err) = self
             .store
-            .end_session(&id, burrow_common::unix_now(), ended_by)
+            .end_session(&id, burrow_common::unix_now_ms(), ended_by as i32)
             .await
         {
             tracing::error!(sandbox = sandbox.id(), %err, "could not close a session");
         }
-        self.emit(sandbox, EVENT_STOPPED, ended_by).await;
+        self.emit(sandbox, EVENT_STOPPED, ended_by.label()).await;
     }
 
     /// Every VM a sandbox has run, newest first.
@@ -2419,13 +2410,8 @@ impl SandboxManager {
             .map(|row| common::Session {
                 id: row.id,
                 sandbox_id: row.sandbox_id,
-                started_at: burrow_common::rfc3339_from_unix_secs(row.started_at),
-                // 0 means nothing observed when it ended, which is exactly what
-                // an empty timestamp says.
-                ended_at: match row.ended_at {
-                    0 => String::new(),
-                    at => burrow_common::rfc3339_from_unix_secs(at),
-                },
+                started_at_unix_ms: row.started_at_ms,
+                ended_at_unix_ms: row.ended_at_ms,
                 started_by: row.started_by,
                 ended_by: row.ended_by,
             })
@@ -2529,7 +2515,7 @@ impl SandboxManager {
         // belongs to a VM that is already gone. Closed here rather than left
         // open forever, and without an end time: nothing observed when those
         // VMs stopped.
-        match self.store.close_open_sessions(ENDED_UNKNOWN).await {
+        match self.store.close_open_sessions(ENDED_UNKNOWN as i32).await {
             Ok(0) => {}
             Ok(closed) => tracing::info!(closed, "closed sessions left open by the previous run"),
             Err(err) => tracing::error!(%err, "could not close open sessions"),
@@ -2796,7 +2782,7 @@ impl SandboxManager {
     /// record is written on lifecycle calls only, so the figures of the last
     /// event the sandbox logged are taken where they are further on, and its
     /// shape with them.
-    async fn log_recorded(&self, record: &common::Sandbox, kind: &str, detail: &str) {
+    async fn log_recorded(&self, record: &common::Sandbox, kind: common::EventKind, detail: &str) {
         let mut record = record.clone();
         let resources = record
             .policy
@@ -3346,7 +3332,12 @@ impl SandboxManager {
                         .policy
                         .as_ref()
                         .and_then(|p| p.network.as_ref())
-                        .map(|n| n.deny_ports.iter().map(port_denial).collect())
+                        .map(|n| {
+                            n.deny_ports
+                                .iter()
+                                .map(burrow_net::policy::PortDenial::from)
+                                .collect()
+                        })
                         .unwrap_or_default(),
                     is_ipv6_denied: record
                         .policy
@@ -3374,57 +3365,31 @@ impl SandboxManager {
             .map(|sandbox| {
                 let record = sandbox.record();
                 let network = record.policy.as_ref().and_then(|p| p.network.as_ref());
+                // The stored record keeps the real values, redaction
+                // happening on the way out to callers, so the proxy goes on
+                // brokering across a restart and a recover.
+                //
+                // Patterns are compiled here, once per sync, rather than per
+                // request: a policy must never make a request cost work a
+                // guest can schedule. A rule that will not compile was refused
+                // at the API door, so one arriving here means the policy in
+                // force is not the one that was written; it becomes a refusal
+                // rather than an allowance.
+                let rules = std::sync::Arc::new(
+                    network
+                        .map(|n| {
+                            n.rules
+                                .iter()
+                                .map(|rule| crate::nodeapi::load_rule(rule, sandbox.id()))
+                                .collect()
+                        })
+                        .unwrap_or_default(),
+                );
                 (
                     sandbox.lease.guest_ip,
                     burrow_proxy::SandboxPolicy {
-                        sandbox_id: sandbox.id().to_string(),
-                        // The same mode the firewall renders, from the same
-                        // snapshot: the proxy and the ruleset disagreeing
-                        // about a sandbox's egress is how a policy gets half
-                        // applied.
-                        mode: match policy_mode(&record) {
-                            firewall::Mode::Open => burrow_proxy::policy::NetworkMode::Open,
-                            firewall::Mode::Allowlist => {
-                                burrow_proxy::policy::NetworkMode::Allowlist
-                            }
-                            firewall::Mode::None => burrow_proxy::policy::NetworkMode::None,
-                        },
-                        allow_domains: network.map(|n| n.allow_domains.clone()).unwrap_or_default(),
-                        is_tls_inspected: network.is_some_and(|n| n.is_tls_inspected),
-                        deny_cidrs: network.map(|n| n.deny_cidrs.clone()).unwrap_or_default(),
-                        deny_domains: network.map(|n| n.deny_domains.clone()).unwrap_or_default(),
-                        deny_ports: network
-                            .map(|n| n.deny_ports.iter().filter_map(proxy_denied_ports).collect())
-                            .unwrap_or_default(),
-                        is_ipv6_denied: network.is_some_and(|n| n.is_ipv6_denied),
-                        http_rules: std::sync::Arc::new(
-                            network
-                                .map(|n| n.http_rules.iter().map(proxy_http_rule).collect())
-                                .unwrap_or_default(),
-                        ),
-                        // The stored record keeps the real values, redaction
-                        // happening on the way out to callers, so the proxy
-                        // goes on brokering across a restart and a recover.
-                        //
-                        // Patterns are compiled here, once per sync, rather
-                        // than per request: a policy must never make a request
-                        // cost work a guest can schedule. A rule that will not
-                        // compile was refused at the API door, so one arriving
-                        // here means the policy in force is not the one that
-                        // was written; it becomes a refusal rather than an
-                        // allowance.
-                        rules: std::sync::Arc::new(
-                            network
-                                .map(|n| {
-                                    n.rules
-                                        .iter()
-                                        .map(|rule| crate::nodeapi::load_rule(rule, sandbox.id()))
-                                        .collect()
-                                })
-                                .unwrap_or_default(),
-                        ),
-                        // Filled in by the table, which keeps one per sandbox.
-                        live_rules: None,
+                        rules,
+                        ..burrow_proxy::SandboxPolicy::from_record(sandbox.id(), network)
                     },
                 )
             })
@@ -3580,7 +3545,7 @@ impl SandboxManager {
         tags: HashMap<String, String>,
     ) -> Result<common::Sandbox, Status> {
         let sandbox = self.get(sandbox_id).await?;
-        sandbox.base_record.lock().unwrap().metadata = tags;
+        sandbox.base_record.lock().unwrap().tags = tags;
         self.persist(&sandbox).await;
         Ok(sandbox.record())
     }
@@ -3597,11 +3562,7 @@ impl SandboxManager {
         };
         let stamp = {
             let mut record = sandbox.base_record.lock().unwrap();
-            let stamp = at_ms.max(burrow_common::access::revoked_before_ms(
-                record.access_revoked_at,
-                record.access_revoked_at_ms,
-            ));
-            record.access_revoked_at = stamp / 1000;
+            let stamp = at_ms.max(record.access_revoked_at_ms);
             record.access_revoked_at_ms = stamp;
             stamp
         };
@@ -3653,7 +3614,7 @@ impl SandboxManager {
     /// configuration being fixed and a restore taking it from the snapshot, so
     /// a caller who asks for one is told rather than quietly given the old
     /// shape back. See [`crate::nodeapi`] for where that is refused.
-    pub async fn update_resources(
+    pub async fn update_lifetime(
         &self,
         sandbox_id: &str,
         max_lifetime_secs: Option<u64>,
@@ -3664,19 +3625,19 @@ impl SandboxManager {
         {
             let mut record = sandbox.base_record.lock().unwrap();
             let policy = record.policy.get_or_insert_with(Default::default);
-            let resources = policy.resources.get_or_insert_with(Default::default);
+            let lifetime = policy.lifetime.get_or_insert_with(Default::default);
             if let Some(secs) = max_lifetime_secs {
-                resources.max_lifetime_secs = secs;
+                lifetime.max_lifetime_secs = secs;
             }
             if let Some(secs) = idle_suspend_secs {
-                resources.idle_suspend_secs = secs;
+                lifetime.idle_suspend_secs = secs;
             }
             if let Some(secs) = suspended_ttl_secs {
-                resources.suspended_ttl_secs = secs;
+                lifetime.suspended_ttl_secs = secs;
             }
         }
         self.persist(&sandbox).await;
-        tracing::info!(sandbox = sandbox_id, "resource policy updated");
+        tracing::info!(sandbox = sandbox_id, "lifetime policy updated");
         Ok(sandbox.record())
     }
 
@@ -3936,7 +3897,6 @@ impl SandboxManager {
                 vcpus: key.vcpus,
                 mem_mib: key.mem_mib,
                 scratch_disk_mib: key.scratch_disk_mib,
-                ..Default::default()
             },
         );
     }
@@ -4118,7 +4078,7 @@ impl SandboxManager {
                         },
                         sandbox_id: record.id,
                         template: record.template,
-                        metadata: record.metadata,
+                        tags: record.tags,
                         cpu_usage_usec: record.cpu_usage_usec,
                         rx_bytes: record.rx_bytes,
                         tx_bytes: record.tx_bytes,
@@ -4139,31 +4099,31 @@ impl SandboxManager {
         self.snapshots.collect_orphans().await;
         self.collect_artifacts().await;
         for sandbox in candidates {
-            let resources = sandbox.resources();
+            let lifetime = sandbox.lifetime();
             let id = sandbox.id().to_string();
             tracing::debug!(
                 sandbox = id,
                 idle_secs = sandbox.idle_secs(),
                 age_secs = sandbox.age_secs(),
-                idle_suspend_secs = resources.idle_suspend_secs,
-                max_lifetime_secs = resources.max_lifetime_secs,
+                idle_suspend_secs = lifetime.idle_suspend_secs,
+                max_lifetime_secs = lifetime.max_lifetime_secs,
                 suspended_secs = sandbox.suspended_secs(),
-                suspended_ttl_secs = resources.suspended_ttl_secs,
+                suspended_ttl_secs = lifetime.suspended_ttl_secs,
                 "reap check"
             );
 
             // Checked before the lifetime cap only in the sense that both
             // destroy: whichever comes due first wins, and neither is
             // reversible.
-            if resources.suspended_ttl_secs > 0
+            if lifetime.suspended_ttl_secs > 0
                 && !sandbox.is_running()
-                && sandbox.suspended_secs() >= resources.suspended_ttl_secs as i64
+                && sandbox.suspended_secs() >= lifetime.suspended_ttl_secs as i64
             {
                 match self.delete(&id).await {
                     Ok(()) => {
                         tracing::info!(
                             sandbox = id,
-                            suspended_ttl_secs = resources.suspended_ttl_secs,
+                            suspended_ttl_secs = lifetime.suspended_ttl_secs,
                             "sandbox was suspended past its retention and was destroyed"
                         );
                         acted.push((id, "retention-expired"));
@@ -4175,14 +4135,14 @@ impl SandboxManager {
                 continue;
             }
 
-            if resources.max_lifetime_secs > 0
-                && sandbox.age_secs() >= resources.max_lifetime_secs as i64
+            if lifetime.max_lifetime_secs > 0
+                && sandbox.age_secs() >= lifetime.max_lifetime_secs as i64
             {
                 match self.delete(&id).await {
                     Ok(()) => {
                         tracing::info!(
                             sandbox = id,
-                            max_lifetime_secs = resources.max_lifetime_secs,
+                            max_lifetime_secs = lifetime.max_lifetime_secs,
                             "sandbox reached its maximum lifetime and was destroyed"
                         );
                         acted.push((id, "expired"));
@@ -4197,9 +4157,9 @@ impl SandboxManager {
             // A suspended sandbox is already idle; only a running one has
             // anything to reclaim, and one with a shared connection open is
             // in use however long ago it was last asked for anything.
-            if resources.idle_suspend_secs > 0
+            if lifetime.idle_suspend_secs > 0
                 && sandbox.is_running()
-                && sandbox.idle_secs() >= resources.idle_suspend_secs as i64
+                && sandbox.idle_secs() >= lifetime.idle_suspend_secs as i64
                 && self.shares.open_connections(&id).await == 0
             {
                 match self.pause(&id).await {
@@ -4475,7 +4435,7 @@ impl SandboxManager {
         id: String,
         template: String,
         policy: common::Policy,
-        metadata: HashMap<String, String>,
+        tags: HashMap<String, String>,
         node_id: String,
         name: String,
     ) -> Result<common::Sandbox, Status> {
@@ -4497,7 +4457,7 @@ impl SandboxManager {
             self.warm_for_demand(&ShapeKey::of(&template, &resources));
         }
         let record = self
-            .create_seeded(id, template, policy, metadata, node_id, None, name)
+            .create_seeded(id, template, policy, tags, node_id, None, name)
             .await?;
         self.warn_if_root_untrusted(&record);
         Ok(record)
@@ -4542,7 +4502,7 @@ impl SandboxManager {
         id: String,
         template: String,
         policy: common::Policy,
-        metadata: HashMap<String, String>,
+        tags: HashMap<String, String>,
         node_id: String,
         seed_scratch: Option<&Path>,
         name: String,
@@ -4585,10 +4545,10 @@ impl SandboxManager {
         };
 
         // Stamped before the record is taken, or the caller and the store are
-        // handed a sandbox with none of the metadata they asked for.
+        // handed a sandbox with none of the tags they asked for.
         {
             let mut stamped = sandbox.base_record.lock().unwrap();
-            stamped.metadata = metadata;
+            stamped.tags = tags;
             stamped.name = name;
         }
         // Only now that the sandbox exists does its policy exist to render, so
@@ -5045,35 +5005,15 @@ impl SandboxManager {
             template,
             state: common::SandboxState::Running as i32,
             policy: Some(policy),
-            created_at: burrow_common::now_rfc3339(),
-            // Both are stamped a moment later by the caller's create.
-            metadata: HashMap::new(),
-            name: String::new(),
+            created_at_unix_ms: burrow_common::unix_now_ms(),
             guest_ip: lease.guest_ip.to_string(),
-            // Describes the node's reachability, which is the orchestrator's
-            // to judge on a read. A node cannot report itself unreachable.
-            is_unreachable: false,
-            // Filled in from the sandbox's own totals on every read; a record
-            // built here has none yet.
-            cpu_usage_usec: 0,
-            rx_bytes: 0,
-            tx_bytes: 0,
-            // Filled in from the live handshake on every read; this is only its
-            // starting value.
-            is_agent_unconfirmed: false,
-            env: HashMap::new(),
-            kit: None,
-            kit_credentials: HashMap::new(),
-            kit_selection: String::new(),
-            is_durable: false,
-            arch: String::new(),
-            firecracker_version: String::new(),
-            access_revoked_at: 0,
-            access_revoked_at_ms: 0,
             hypervisor: hypervisor.to_string(),
             guest_os: guest_os.as_str().to_string(),
-            state_reason: String::new(),
             inspection_root_fingerprint: inspection_root,
+            // Tags and name are stamped a moment later by the caller's
+            // create; usage, reachability and the handshake are filled in
+            // from the live sandbox on every read.
+            ..Default::default()
         };
 
         // The one-line summary, unchanged in shape: VM, guest wake, handshake,
@@ -5236,11 +5176,11 @@ impl SandboxManager {
             ));
         }
 
-        let resources = sandbox.resources();
+        let snapshots = sandbox.snapshot_policy();
         // The request wins over the sandbox's default, and 0 in both means the
         // snapshot is kept until something deletes it.
         let expiration_secs = match expiration_secs {
-            0 => resources.snapshot_expiration_secs,
+            0 => snapshots.expiration_secs,
             secs => secs,
         };
 
@@ -5268,11 +5208,7 @@ impl SandboxManager {
         // Applied as the snapshot lands rather than on a timer: this is the
         // one moment the count grows, so it is the moment to bound it.
         self.snapshots
-            .retain_newest(
-                sandbox_id,
-                resources.keep_last_snapshots,
-                resources.is_evicted_snapshot_kept,
-            )
+            .retain_newest(sandbox_id, snapshots.keep_last, snapshots.is_evicted_kept)
             .await;
         self.emit(&sandbox, EVENT_SNAPSHOT_CREATED, &snapshot.id)
             .await;
@@ -5296,7 +5232,7 @@ impl SandboxManager {
         id: String,
         snapshot_id: &str,
         policy: common::Policy,
-        metadata: HashMap<String, String>,
+        tags: HashMap<String, String>,
         node_id: String,
         name: String,
     ) -> Result<common::Sandbox, Status> {
@@ -5331,7 +5267,6 @@ impl SandboxManager {
             vcpus: manifest.vcpus,
             mem_mib: manifest.mem_mib,
             scratch_disk_mib: manifest.scratch_disk_mib,
-            ..wanted
         });
 
         {
@@ -5353,7 +5288,7 @@ impl SandboxManager {
                 },
                 id.clone(),
                 policy,
-                metadata,
+                tags,
                 node_id,
                 name,
             )
@@ -5454,11 +5389,11 @@ impl SandboxManager {
             ));
         }
 
-        let (mut inherited, metadata) = {
+        let (mut inherited, tags) = {
             let record = source.base_record.lock().unwrap();
             (
                 record.policy.clone().unwrap_or_default(),
-                record.metadata.clone(),
+                record.tags.clone(),
             )
         };
         // A fork copies the source's own disk and memory. A volume is separate
@@ -5513,7 +5448,7 @@ impl SandboxManager {
             RestoreSource::Sandbox(source),
             child_id,
             policy,
-            metadata,
+            tags,
             node_id,
             name,
         )
@@ -5563,7 +5498,7 @@ impl SandboxManager {
         source: RestoreSource<'_>,
         id: String,
         policy: common::Policy,
-        metadata: HashMap<String, String>,
+        tags: HashMap<String, String>,
         node_id: String,
         name: String,
     ) -> Result<Arc<RunningSandbox>, Status> {
@@ -5821,30 +5756,17 @@ impl SandboxManager {
             template: source.template(),
             state: common::SandboxState::Running as i32,
             policy: Some(policy),
-            created_at: burrow_common::now_rfc3339(),
-            metadata,
+            created_at_unix_ms: burrow_common::unix_now_ms(),
+            tags,
             // A restore does not inherit a name: names are unique, so the new
             // sandbox is named by the caller or not at all.
             name,
             guest_ip: lease.guest_ip.to_string(),
-            is_unreachable: false,
-            cpu_usage_usec: 0,
-            rx_bytes: 0,
-            tx_bytes: 0,
             is_agent_unconfirmed: true,
-            env: HashMap::new(),
-            kit: None,
-            kit_credentials: HashMap::new(),
-            kit_selection: String::new(),
-            is_durable: false,
-            arch: String::new(),
-            firecracker_version: String::new(),
-            access_revoked_at: 0,
-            access_revoked_at_ms: 0,
             hypervisor: hypervisor.to_string(),
             guest_os: guest_os.as_str().to_string(),
-            state_reason: String::new(),
             inspection_root_fingerprint: inspection_root,
+            ..Default::default()
         };
         tracing::info!(
             sandbox = id,
@@ -6365,7 +6287,7 @@ impl SandboxManager {
             },
             is_systemd,
             arch: std::env::consts::ARCH.to_string(),
-            firecracker_version: self.config.version(sandbox.hypervisor).to_string(),
+            hypervisor_version: self.config.version(sandbox.hypervisor).to_string(),
             hypervisor: sandbox.hypervisor.to_string(),
             kernel_digest: String::new(),
             rootfs_digest: String::new(),
@@ -6715,7 +6637,7 @@ impl SandboxManager {
 
     /// Takes over a sandbox from the object store and resumes it here.
     ///
-    /// `record` is the orchestrator's: its id, name, policy, metadata and
+    /// `record` is the orchestrator's: its id, name, policy, tags and
     /// tags are the sandbox's, and only its secrets come from the store.
     #[tracing::instrument(skip_all, fields(sandbox = %record.id))]
     pub async fn adopt(
@@ -6753,13 +6675,13 @@ impl SandboxManager {
         let hypervisor = manifest.hypervisor()?;
         self.require_hypervisor(hypervisor)?;
         if manifest.arch != std::env::consts::ARCH
-            || manifest.firecracker_version != self.config.version(hypervisor)
+            || manifest.hypervisor_version != self.config.version(hypervisor)
         {
             return Err(Status::failed_precondition(format!(
                 "sandbox {id} was stored on {} under {hypervisor} {} and cannot restore on this \
                  node ({} under {hypervisor} {})",
                 manifest.arch,
-                manifest.firecracker_version,
+                manifest.hypervisor_version,
                 std::env::consts::ARCH,
                 self.config.version(hypervisor)
             )));
@@ -6855,12 +6777,10 @@ impl SandboxManager {
         claimed.state = crate::durable::STATE_RUNNING.to_string();
         claimed.node_id = node_id.clone();
         let mut policy = record.policy.clone().unwrap_or_default();
-        let wanted = policy.resources.unwrap_or_default();
         policy.resources = Some(common::ResourcePolicy {
             vcpus: manifest.vcpus,
             mem_mib: manifest.mem_mib,
             scratch_disk_mib: manifest.scratch_disk_mib,
-            ..wanted
         });
         // Claimed in the store before the guest starts, the rule a resume
         // follows too, and handed back if it never does. Conditional on the
@@ -6875,7 +6795,7 @@ impl SandboxManager {
                 },
                 record.id.clone(),
                 policy,
-                record.metadata.clone(),
+                record.tags.clone(),
                 node_id.clone(),
                 record.name.clone(),
             )
@@ -6891,12 +6811,11 @@ impl SandboxManager {
             crate::durable::load_local(&sandbox.workdir).await;
         {
             let mut base = sandbox.base_record.lock().unwrap();
-            base.created_at = record.created_at.clone();
+            base.created_at_unix_ms = record.created_at_unix_ms;
             base.env = record.env.clone();
             base.kit = record.kit.clone();
             base.kit_credentials = record.kit_credentials.clone();
             base.kit_selection = record.kit_selection.clone();
-            base.access_revoked_at = record.access_revoked_at;
             base.access_revoked_at_ms = record.access_revoked_at_ms;
         }
         *sandbox.usage.lock().unwrap() = Usage {
@@ -7011,60 +6930,6 @@ fn map_secrets(
     Ok(())
 }
 
-/// The proxy's form of a policy's HTTP rule.
-/// One `deny_ports` entry as the firewall reads it. Validation happens there,
-/// where a malformed entry costs the sandbox its egress rather than being
-/// skipped.
-fn port_denial(rule: &common::PortRule) -> burrow_net::policy::PortDenial {
-    burrow_net::policy::PortDenial {
-        protocol: match common::PortProtocol::try_from(rule.protocol) {
-            Ok(common::PortProtocol::Tcp) => Some(firewall::Protocol::Tcp),
-            Ok(common::PortProtocol::Udp) => Some(firewall::Protocol::Udp),
-            // An unknown value reads as both, the broader denial, for the
-            // reason a malformed entry fails closed.
-            _ => None,
-        },
-        first: rule.port,
-        last: rule.port_end,
-        cidrs: rule.cidrs.clone(),
-    }
-}
-
-/// The proxy's copy of one `deny_ports` entry: the TCP ones only, since UDP
-/// never reaches it.
-///
-/// A range that is not one, which the API door refuses, becomes every port
-/// rather than none: a denial read too broadly costs connections, one read too
-/// narrowly grants what was withheld.
-fn proxy_denied_ports(rule: &common::PortRule) -> Option<burrow_proxy::policy::DeniedPorts> {
-    if common::PortProtocol::try_from(rule.protocol) == Ok(common::PortProtocol::Udp) {
-        return None;
-    }
-    let first = u16::try_from(rule.port).ok().filter(|p| *p != 0);
-    let last = match rule.port_end {
-        0 => first,
-        end => u16::try_from(end).ok(),
-    };
-    let (first, last) = match (first, last) {
-        (Some(first), Some(last)) if first <= last => (first, last),
-        _ => (0, u16::MAX),
-    };
-    Some(burrow_proxy::policy::DeniedPorts {
-        first,
-        last,
-        cidrs: rule.cidrs.clone(),
-    })
-}
-
-fn proxy_http_rule(rule: &common::HttpRule) -> burrow_proxy::policy::HttpRule {
-    burrow_proxy::policy::HttpRule {
-        hosts: rule.hosts.clone(),
-        methods: rule.methods.clone(),
-        paths: rule.paths.clone(),
-        is_denying: rule.is_denied,
-    }
-}
-
 /// Writes the sections a caller named onto a sandbox's policy.
 ///
 /// Present replaces, absent leaves. Written out rather than assigned from a
@@ -7094,23 +6959,16 @@ fn networks_of(record: &common::Sandbox) -> impl Iterator<Item = &str> {
         .filter(|name| !name.is_empty())
 }
 
-/// Maps a sandbox's declared network policy onto a firewall mode.
-///
-/// An unset policy means no egress: a sandbox that never stated what it needs
-/// gets nothing, rather than inheriting whatever the default happens to be.
+/// A sandbox's declared egress mode. An unset policy means no egress: a
+/// sandbox that never stated what it needs gets nothing, rather than
+/// inheriting whatever the default happens to be.
 fn policy_mode(record: &common::Sandbox) -> firewall::Mode {
-    let mode = record
+    record
         .policy
         .as_ref()
         .and_then(|p| p.network.as_ref())
-        .map(|n| n.mode)
-        .unwrap_or(common::NetworkMode::Unspecified as i32);
-
-    match common::NetworkMode::try_from(mode) {
-        Ok(common::NetworkMode::Open) => firewall::Mode::Open,
-        Ok(common::NetworkMode::Allowlist) => firewall::Mode::Allowlist,
-        _ => firewall::Mode::None,
-    }
+        .and_then(|n| firewall::Mode::try_from(n.mode).ok())
+        .unwrap_or_default()
 }
 
 /// Tells the agent to run the template's systemd under it.
@@ -7238,7 +7096,7 @@ impl ExpiredRule {
     /// queue is the one the audit log does not shed under load.
     fn event(&self, guest_ip: std::net::Ipv4Addr) -> burrow_proxy::EgressEvent {
         burrow_proxy::EgressEvent {
-            at: burrow_proxy::now_rfc3339(),
+            at_ms: burrow_proxy::unix_now_ms(),
             sandbox_id: self.sandbox_id.clone(),
             source_ip: guest_ip.to_string(),
             destination: "policy".into(),
@@ -7324,26 +7182,32 @@ pub(crate) mod tests {
         let both = rule(common::PortProtocol::Unspecified, 25, 0, &[]);
         let udp = rule(common::PortProtocol::Udp, 53, 0, &[]);
 
-        let denial = port_denial(&tcp);
+        let denial = burrow_net::policy::PortDenial::from(&tcp);
         assert_eq!(denial.protocol, Some(firewall::Protocol::Tcp));
         assert_eq!((denial.first, denial.last), (465, 587));
         assert_eq!(denial.cidrs, vec!["10.0.0.0/8".to_string()]);
-        assert_eq!(port_denial(&both).protocol, None);
-        assert_eq!(port_denial(&udp).protocol, Some(firewall::Protocol::Udp));
+        assert_eq!(burrow_net::policy::PortDenial::from(&both).protocol, None);
+        assert_eq!(
+            burrow_net::policy::PortDenial::from(&udp).protocol,
+            Some(firewall::Protocol::Udp)
+        );
         // An unknown protocol is the broader reading, both.
         let mut unknown = tcp.clone();
         unknown.protocol = 9;
-        assert_eq!(port_denial(&unknown).protocol, None);
+        assert_eq!(
+            burrow_net::policy::PortDenial::from(&unknown).protocol,
+            None
+        );
 
         // UDP never reaches the proxy, so it is not handed one.
-        assert!(proxy_denied_ports(&udp).is_none());
-        let proxied = proxy_denied_ports(&both).unwrap();
+        assert!(burrow_proxy::policy::DeniedPorts::from_rule(&udp).is_none());
+        let proxied = burrow_proxy::policy::DeniedPorts::from_rule(&both).unwrap();
         assert_eq!((proxied.first, proxied.last), (25, 25));
-        let proxied = proxy_denied_ports(&tcp).unwrap();
+        let proxied = burrow_proxy::policy::DeniedPorts::from_rule(&tcp).unwrap();
         assert_eq!((proxied.first, proxied.last), (465, 587));
         // A range that is not one reads as every port.
         let backwards = rule(common::PortProtocol::Tcp, 600, 599, &[]);
-        let proxied = proxy_denied_ports(&backwards).unwrap();
+        let proxied = burrow_proxy::policy::DeniedPorts::from_rule(&backwards).unwrap();
         assert_eq!((proxied.first, proxied.last), (0, u16::MAX));
     }
 
@@ -7478,14 +7342,14 @@ pub(crate) mod tests {
             .into_iter()
             .map(|event| event.kind)
             .collect();
-        assert_eq!(kinds, [EVENT_RECOVERED]);
+        assert_eq!(kinds, [EVENT_RECOVERED as i32]);
 
         manager.delete(id).await.unwrap();
         assert!(manager.store.list_sandboxes().await.unwrap().is_empty());
         assert!(manager.list().await.is_empty());
         assert!(!workdir.exists());
         let last = events_of(&manager, id).await.pop().unwrap();
-        assert_eq!(last.kind, EVENT_DESTROYED);
+        assert_eq!(last.kind, EVENT_DESTROYED as i32);
         let _ = tokio::fs::remove_dir_all(&data_dir).await;
     }
 
@@ -7533,15 +7397,15 @@ pub(crate) mod tests {
         let events = events_of(&manager, id).await;
         let stopped = &events[1];
         assert_eq!(
-            (stopped.kind.as_str(), stopped.detail.as_str()),
-            (EVENT_STOPPED, DETAIL_LOST)
+            (stopped.kind, stopped.detail.as_str()),
+            (EVENT_STOPPED as i32, DETAIL_LOST)
         );
         assert_eq!(stopped.state, common::SandboxState::Stopped as i32);
         assert_eq!(
             (stopped.cpu_usage_usec, stopped.vcpus, stopped.mem_mib),
             (7_000, 2, 1024)
         );
-        assert_eq!(events.last().unwrap().kind, EVENT_RECOVERED);
+        assert_eq!(events.last().unwrap().kind, EVENT_RECOVERED as i32);
         // Here the tap cannot be made, so it is held rather than restored;
         // either way it is listed.
         assert_eq!(manager.list().await.len(), 1);
@@ -7634,8 +7498,8 @@ pub(crate) mod tests {
         assert!(manager.list().await.is_empty());
         let last = events_of(&manager, id).await.pop().unwrap();
         assert_eq!(
-            (last.kind.as_str(), last.detail.as_str()),
-            (EVENT_DESTROYED, DETAIL_LOST)
+            (last.kind, last.detail.as_str()),
+            (EVENT_DESTROYED as i32, DETAIL_LOST)
         );
         assert_eq!((last.cpu_usage_usec, last.rx_bytes), (9_000, 40));
         let _ = tokio::fs::remove_dir_all(&data_dir).await;
@@ -8416,7 +8280,7 @@ pub(crate) mod tests {
             .open_session(&sandbox, STARTED_RESUME, Some(before))
             .await;
         let started = events_of(&manager, "sbx_resumed").await.pop().unwrap();
-        assert_eq!(started.kind, EVENT_STARTED);
+        assert_eq!(started.kind, EVENT_STARTED as i32);
         assert_eq!(started.cpu_usage_usec, 1_000);
         assert_eq!(sandbox.record().cpu_usage_usec, 5_301_000);
     }

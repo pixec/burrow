@@ -26,16 +26,8 @@ _GRANT_MARGIN_SECS = 30
 # or for a sandbox that has moved to another node.
 _STALE_GRANT = (grpc.StatusCode.UNAUTHENTICATED, grpc.StatusCode.NOT_FOUND)
 
-# The connection options every public entry point accepts alongside its own.
-_TRANSPORT_KEYS = ("endpoint", "api_key", "tls", "timeout", "route")
-
 # Where exec, attach and file traffic goes: the node, or the orchestrator.
 _ROUTES = ("direct", "orchestrator")
-
-
-def transport_options(options: dict) -> dict:
-    """The transport's share of a mixed option bag."""
-    return {key: options[key] for key in _TRANSPORT_KEYS if key in options}
 
 
 def _is_loopback_host(host: str) -> bool:
@@ -242,13 +234,11 @@ class Direct:
             if (
                 renew
                 or grant is None
-                or grant.expires_at - time.time() < _GRANT_MARGIN_SECS
+                or grant.expires_at_unix_ms / 1000 - time.time() < _GRANT_MARGIN_SECS
             ):
                 grant = self._transport.unary(
                     "IssueAccess",
-                    api_pb2.IssueAccessRequest(
-                        ref=api_pb2.SandboxRef(id=self.sandbox_id)
-                    ),
+                    api_pb2.IssueAccessRequest(sandbox_id=self.sandbox_id),
                 )
                 self._grant = grant
             return grant

@@ -179,7 +179,7 @@ async fn deliver(
         }
         let events = rows
             .into_iter()
-            .map(crate::sandbox::event_to_proto)
+            .map(burrow_proto::common::v1::Event::from)
             .collect();
         delivery.acknowledge(push(events).await?);
     }
@@ -258,11 +258,11 @@ mod tests {
         }
     }
 
-    async fn append(store: &burrow_store::Store, kind: &str) -> u64 {
+    async fn append(store: &burrow_store::Store, kind: burrow_proto::common::v1::EventKind) -> u64 {
         store
             .append_event(&burrow_store::EventRow {
                 sandbox_id: "sbx_1".into(),
-                kind: kind.into(),
+                kind: kind as i32,
                 ..Default::default()
             })
             .await
@@ -284,7 +284,11 @@ mod tests {
             None,
             Arc::new(std::sync::Mutex::new("node_a".into())),
         ));
-        for kind in ["created", "started", "stopped"] {
+        for kind in [
+            burrow_proto::common::v1::EventKind::Created,
+            burrow_proto::common::v1::EventKind::Started,
+            burrow_proto::common::v1::EventKind::Stopped,
+        ] {
             let seq = append(&store, kind).await;
             tokio::time::timeout(Duration::from_millis(500), delivery.wait(seq))
                 .await
@@ -307,7 +311,7 @@ mod tests {
             .unwrap();
         assert!(delivery.is_reachable());
 
-        let seq = append(&store, "destroyed").await;
+        let seq = append(&store, burrow_proto::common::v1::EventKind::Destroyed).await;
         tokio::time::timeout(Duration::from_secs(5), delivery.wait(seq))
             .await
             .unwrap();

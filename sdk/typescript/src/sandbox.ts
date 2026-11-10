@@ -1,4 +1,5 @@
 import { attach, SandboxChildProcess, type ChildProcess } from "./child-process.js";
+import { withClient } from "./client.js";
 import { BurrowError } from "./errors.js";
 import { SandboxFs } from "./fs.js";
 import type { GuestLink } from "./guest.js";
@@ -7,57 +8,73 @@ import {
   resolveNetwork,
   toExecPolicy,
   toFsPolicy,
+  toKitSpec,
+  toLifetimePolicy,
   toNetworkPolicy,
   toNetworks,
-  toVolumeMounts,
   toResourcePolicy,
+  toSnapshotPolicy,
+  toVolumeMounts,
 } from "./policy.js";
 import { Snapshot, type SnapshotOptions } from "./snapshot.js";
 import { Terminal, type TerminalOptions } from "./terminal.js";
-import { Transport, type TransportOptions } from "./transport.js";
+import type { Transport, TransportOptions } from "./transport.js";
 import type {
-  AuditEvent,
-  AuditQuery,
+  CallOptions,
   CommandInfo,
+  CommandState,
   CreateOptions,
-  EventsOptions,
+  ExposePortOptions,
   ForkOptions,
+  GetCommandOptions,
   GetOptions,
   GetOrCreateOptions,
   GuestGroup,
   GuestUser,
-  KitOptions,
-  LifecycleEvent,
+  HandleOptions,
   ListOptions,
   MoveOptions,
-  NodeInfo,
+  NetworkInput,
   PortMapping,
   RecreateOptions,
-  Share,
-  ShareOptions,
   SandboxInfo,
   SandboxState,
-  SecretInfo,
-  SecretScope,
   Session,
   SessionEnd,
   SessionStart,
-  UpdateOptions,
+  Share,
+  ShareOptions,
+  UpdateAccessOptions,
+  UpdateLifetimeOptions,
   Usage,
-  UsageQuery,
-  UsageReport,
 } from "./types.js";
+import { dateOf, dateOrNull, enumOf } from "./wire.js";
 
-function toSandboxInfo(raw: any): SandboxInfo {
+const STATES: readonly SandboxState[] = [
+  "creating",
+  "running",
+  "paused",
+  "suspended",
+  "stopped",
+  "stopping",
+  "destroyed",
+  "failed",
+];
+const SESSION_STARTS: readonly SessionStart[] = ["boot", "restore", "resume"];
+const SESSION_ENDS: readonly SessionEnd[] = ["suspended", "deleted", "failed", "stopped"];
+const COMMAND_STATES: readonly CommandState[] = ["running", "exited"];
+
+/** @internal One `Sandbox` record as the SDK reports it. */
+export function toSandboxInfo(raw: any): SandboxInfo {
   return {
     id: raw.id,
     name: raw.name ?? "",
     nodeId: raw.nodeId ?? "",
     template: raw.template ?? "",
-    state: stateOf(raw.state),
-    createdAt: raw.createdAt ?? "",
+    state: Sandbox.stateOf(raw.state),
+    createdAt: dateOf(raw.createdAtUnixMs),
     guestIp: raw.guestIp ?? "",
-    tags: raw.metadata ?? {},
+    tags: raw.tags ?? {},
     policy: fromPolicy(raw.policy),
     unreachable: raw.isUnreachable ?? false,
     usage: {
@@ -68,122 +85,78 @@ function toSandboxInfo(raw: any): SandboxInfo {
       txBytes: Number(raw.txBytes ?? 0),
     },
     durable: raw.isDurable ?? false,
+    hypervisor: raw.hypervisor ?? "",
+    hypervisorVersion: raw.hypervisorVersion ?? "",
+    guestOs: raw.guestOs ?? "",
   };
 }
 
 function toSession(raw: any): Session {
+  const endedBy = enumOf(raw.endedBy, "SESSION_END_", SESSION_ENDS);
   return {
     id: raw.id ?? "",
     sandboxId: raw.sandboxId ?? "",
-    startedAt: raw.startedAt ?? "",
-    endedAt: raw.endedAt ?? "",
-    // A reason this client has no name for reads as "unknown" rather than
-    // passing a string through that callers branch on.
-    startedBy: (["boot", "restore", "resume"] as string[]).includes(raw.startedBy)
-      ? (raw.startedBy as SessionStart)
-      : "unknown",
-    endedBy: (["suspended", "deleted", "failed", "unknown", ""] as string[]).includes(
-      raw.endedBy ?? "",
-    )
-      ? ((raw.endedBy ?? "") as SessionEnd | "")
-      : "unknown",
-  };
-}
-
-function stateOf(state: string | number | undefined): SandboxState {
-  const name = String(state ?? "").replace("SANDBOX_STATE_", "").toLowerCase();
-  const known: SandboxState[] = [
-    "creating",
-    "running",
-    "paused",
-    "suspended",
-    "stopped",
-    "stopping",
-    "destroyed",
-    "failed",
-  ];
-  return (known as string[]).includes(name) ? (name as SandboxState) : "unknown";
-}
-
-/** Builds a `CreateSandboxRequest`. */
-function toCreateRequest(options: CreateOptions): any {
-  const network = resolveNetwork(options.networkPolicy);
-  const resources = options.resources ?? {};
-  // A snapshot carries its own template, and one that disagrees is an error,
-  // so nothing is sent as if the caller had asked for it.
-  const template = options.template ?? "";
-  // Without a snapshot there is nothing to boot from, and a made-up "default"
-  // would turn a missing argument into a not_found for a template nobody
-  // named.
-  if (!template && !options.snapshot) {
-    throw new BurrowError(
-      "a template is required: pass `template` (or `snapshot` to restore one)",
-      "invalid_argument",
-    );
-  }
-  return {
-    name: options.name ?? "",
-    snapshot: options.snapshot ?? "",
-    template,
-    policy: {
-      resources: toResourcePolicy(resources),
-      // Left off the request entirely unless the caller asked for a limit:
-      // absent is what the node reads as "allowed".
-      exec: toExecPolicy(options.exec),
-      fs: toFsPolicy(options.fs),
-      network: toNetworkPolicy(network),
-      networks: toNetworks(options.networks, options.alias),
-      volumes: toVolumeMounts(options.volumes),
-    },
-    metadata: options.tags ?? {},
-    nodeLabels: options.nodeLabels ?? {},
-    kit: toKitSpec(options.kit),
-  };
-}
-
-/** Builds a `KitSpec`. Absent inputs are sent empty, which the node reads as none. */
-function toKitSpec(kit: KitOptions | undefined): any {
-  return {
-    args: kit?.args ?? {},
-    env: kit?.env ?? {},
-    rejectTypes: [...(kit?.rejectCapabilities ?? [])],
+    startedAt: dateOf(raw.startedAtUnixMs),
+    endedAt: dateOrNull(raw.endedAtUnixMs),
+    startedBy: enumOf(raw.startedBy, "SESSION_START_", SESSION_STARTS),
+    endedBy:
+      // Unspecified is an open session; the node's own "unknown" is a session
+      // it lost track of, which reads as such.
+      String(raw.endedBy ?? "SESSION_END_UNSPECIFIED") === "SESSION_END_UNSPECIFIED"
+        ? null
+        : endedBy,
   };
 }
 
 /** Turns a guest's report of one command into the SDK's shape. */
 function toCommandInfo(raw: any): CommandInfo {
-  const ended = Number(raw.endedAtUnixMs ?? 0);
-  const state = String(raw.state ?? "");
   return {
     cmdId: raw.commandId ?? "",
     cmd: raw.cmd ?? [],
     user: raw.user ?? "",
-    state:
-      state === "running" || state === "exited"
-        ? (state as CommandInfo["state"])
-        : "unknown",
+    state: enumOf(raw.state, "COMMAND_STATE_", COMMAND_STATES),
     exitCode: Number(raw.exitCode ?? 0),
-    startedAt: new Date(Number(raw.startedAtUnixMs ?? 0)),
-    endedAt: ended > 0 ? new Date(ended) : null,
+    startedAt: dateOf(raw.startedAtUnixMs),
+    endedAt: dateOrNull(raw.endedAtUnixMs),
     bufferedBytes: Number(raw.bufferedBytes ?? 0),
     exitSignal: Number(raw.exitSignal ?? 0),
     outputBytes: Number(raw.outputBytes ?? 0),
   };
 }
 
-/**
- * How many times {@link Sandbox.getOrCreate} looks before giving up. Only a
- * lost race gets this far, waiting on another caller's create to finish.
- */
-const GET_OR_CREATE_ATTEMPTS = 10;
+function toShare(raw: any): Share {
+  return {
+    address: raw.address ?? "",
+    ports: (raw.ports ?? []).map((p: any) => Number(p)),
+    allowedClients: raw.allowedClients ?? [],
+    createdAt: dateOf(raw.createdAtUnixMs),
+    udpPorts: (raw.udpPorts ?? []).map((p: any) => Number(p)),
+    allUdp: Boolean(raw.isAllUdp),
+    transparentIp: Boolean(raw.isTransparentIp),
+  };
+}
 
-const delay = (ms: number) => new Promise((r) => setTimeout(r, ms));
+function toPort(raw: any, fallbackHost: string): PortMapping {
+  const hostPort = Number(raw.hostPort ?? 0);
+  // The node advertises where it accepts traffic; when it has not, the control
+  // plane's own host is the best guess, and the right one for a single node.
+  const address = raw.hostAddress || `${fallbackHost}:${hostPort}`;
+  return {
+    guestPort: Number(raw.guestPort ?? 0),
+    hostPort,
+    udp: Boolean(raw.isUdp),
+    url: `http://${address}`,
+    // Empty unless the holding node's edge is serving, rather than a name
+    // that resolves nowhere.
+    edgeUrl: raw.edgeUrl || undefined,
+  };
+}
 
 /**
  * A sandbox.
  *
- * Obtained from {@link Sandbox.create}, {@link Sandbox.get} or
- * {@link Sandbox.fork}; not constructed directly.
+ * Obtained from {@link Sandbox.create}, {@link Sandbox.get}, a {@link Burrow}
+ * client's `sandboxes`, or {@link Sandbox.fork}; not constructed directly.
  */
 export class Sandbox {
   readonly id: string;
@@ -198,7 +171,7 @@ export class Sandbox {
    * Client-side, because the server has nowhere to keep it: a handle obtained
    * elsewhere does not have these, and the sandbox itself never learns them.
    */
-  private env: Record<string, string>;
+  readonly env: Record<string, string>;
   /**
    * Guest user every command from this handle runs as. Empty is root.
    *
@@ -206,7 +179,7 @@ export class Sandbox {
    */
   private defaultUser = "";
   /** Called after this handle resumes the sandbox, including auto-resume. */
-  private onResume?: (sandbox: Sandbox) => void | Promise<void>;
+  private readonly onResume?: (sandbox: Sandbox) => void | Promise<void>;
   /** Set by {@link delete}: a destroyed sandbox has nothing left to call. */
   private destroyed = false;
   /** What `fs` and `childProcess` reach the sandbox through, read live. */
@@ -219,19 +192,19 @@ export class Sandbox {
   /** Commands in the sandbox, as Node's `child_process`: `spawn`, `exec`, `execFile`. */
   readonly childProcess: SandboxChildProcess;
 
-  private constructor(
-    transport: Transport,
-    info: SandboxInfo,
-    owned: boolean,
-    autoResume = true,
-    env: Record<string, string> = {},
-  ) {
+  /**
+   * @internal A handle on `transport`. An owned handle holds one share of
+   * the connection and releases it on `close`; one from {@link asUser} rides
+   * on its parent's.
+   */
+  constructor(transport: Transport, info: SandboxInfo, options: HandleOptions = {}, owned = true) {
     this.transport = transport;
     this.info = info;
     this.id = info.id;
     this.owned = owned;
-    this.autoResume = autoResume;
-    this.env = env;
+    this.autoResume = options.autoResume ?? true;
+    this.env = options.env ?? {};
+    this.onResume = options.onResume;
     const sandbox = this;
     this.link = {
       sandboxId: this.id,
@@ -259,42 +232,55 @@ export class Sandbox {
     this.childProcess = new SandboxChildProcess(this.link);
   }
 
-  /**
-   * Refuses a call on a deleted sandbox. `delete` released the connection, so
-   * the alternative is an obscure transport failure some calls later.
-   */
-  private assertLive(): void {
-    if (this.destroyed) {
-      throw new BurrowError(
-        `sandbox ${this.id} was deleted`,
-        "failed_precondition",
-      );
-    }
+  /** @internal The SDK's name for a wire `SandboxState`. */
+  static stateOf(state: unknown): SandboxState {
+    return enumOf(state, "SANDBOX_STATE_", STATES);
   }
 
-  /** Creates a sandbox and waits for it to be ready to accept commands. */
-  static async create(
-    options: CreateOptions & TransportOptions = {},
-  ): Promise<Sandbox> {
-    const transport = new Transport(options);
-    try {
-      const raw = await transport.unary<any, any>(
-        "CreateSandbox",
-        toCreateRequest(options),
-        options.timeoutMs ?? 120_000,
-        options.signal,
+  /** @internal Builds a `CreateSandboxRequest`. */
+  static createRequest(options: CreateOptions): any {
+    // A snapshot carries its own template, and one that disagrees is an error,
+    // so nothing is sent as if the caller had asked for it.
+    const template = options.template ?? "";
+    // Without a snapshot there is nothing to boot from, and a made-up "default"
+    // would turn a missing argument into a not_found for a template nobody
+    // named.
+    if (!template && !options.snapshot) {
+      throw new BurrowError(
+        "a template is required: pass `template` (or `snapshot` to restore one)",
+        "invalid_argument",
       );
-      return new Sandbox(
-        transport,
-        toSandboxInfo(raw),
-        true,
-        options.autoResume ?? true,
-        options.env ?? {},
-      );
-    } catch (err) {
-      transport.close();
-      throw err;
     }
+    return {
+      name: options.name ?? "",
+      snapshot: options.snapshot ?? "",
+      template,
+      policy: {
+        resources: toResourcePolicy(options.resources),
+        lifetime: toLifetimePolicy(options.lifetime),
+        snapshots: toSnapshotPolicy(options.snapshots),
+        // Left off the request entirely unless the caller asked for a limit:
+        // absent is what the node reads as "allowed".
+        exec: toExecPolicy(options.exec),
+        fs: toFsPolicy(options.fs),
+        network: toNetworkPolicy(resolveNetwork(options.networkPolicy)),
+        networks: toNetworks(options.networks, options.alias),
+        volumes: toVolumeMounts(options.volumes),
+      },
+      tags: options.tags ?? {},
+      nodeLabels: options.nodeLabels ?? {},
+      kit: toKitSpec(options.kit),
+    };
+  }
+
+  /**
+   * Creates a sandbox and waits for it to be ready to accept commands.
+   *
+   * Opens a connection for this one sandbox; a {@link Burrow} client shares
+   * one across many.
+   */
+  static create(options: CreateOptions & TransportOptions = {}): Promise<Sandbox> {
+    return withClient(options, (burrow) => burrow.sandboxes.create(options));
   }
 
   /**
@@ -307,97 +293,21 @@ export class Sandbox {
    *   onCreate: (s) => s.fs.writeFile("/work/app.py", src),
    * });
    * ```
-   *
-   * A `name` is the only key: ids are generated by the server, so there is no
-   * id to ask for before the sandbox exists. The create options apply only
-   * when it turns out not to exist, so the same call is safe from every
-   * worker; an existing sandbox is handed back as it is. A stopped one stays
-   * stopped unless `resume` is set, though the first call that needs a running
-   * VM resumes it anyway.
    */
-  static async getOrCreate(
-    options: GetOrCreateOptions & TransportOptions = {},
-  ): Promise<Sandbox> {
-    const key = options.name;
-    if (!key) {
-      throw new BurrowError(
-        "getOrCreate needs a name: without one there is nothing to get",
-        "invalid_argument",
-      );
-    }
-
-    // Two processes racing on the same name both find nothing and both create.
-    // The loser is told ALREADY_EXISTS while the winner's sandbox is still
-    // booting, so the get is retried rather than made once.
-    for (let attempt = 0; attempt < GET_OR_CREATE_ATTEMPTS; attempt++) {
-      try {
-        const sandbox = await Sandbox.get({ ...options, id: key });
-        sandbox.env = options.env ?? {};
-        sandbox.onResume = options.onResume;
-        if (options.resume && (sandbox.state === "paused" || sandbox.state === "suspended")) {
-          await sandbox.resume();
-        }
-        return sandbox;
-      } catch (err) {
-        if (!(err instanceof BurrowError) || err.code !== "not_found") throw err;
-      }
-
-      try {
-        const sandbox = await Sandbox.create(options);
-        sandbox.onResume = options.onResume;
-        await options.onCreate?.(sandbox);
-        return sandbox;
-      } catch (err) {
-        const lost =
-          err instanceof BurrowError && err.code === "already_exists";
-        if (!lost) throw err;
-        // The winner's record appears once the node has built the sandbox.
-        await delay(Math.min(200 * 2 ** attempt, 1_000));
-      }
-    }
-    throw new BurrowError(
-      `sandbox ${key} is being created elsewhere and did not become available`,
-      "unavailable",
-    );
+  static getOrCreate(options: GetOrCreateOptions & TransportOptions = {}): Promise<Sandbox> {
+    return withClient(options, (burrow) => burrow.sandboxes.getOrCreate(options));
   }
 
   /**
-   * Returns a handle for a sandbox that already exists.
+   * Returns a handle for a sandbox that already exists, by id or name.
    *
    * ```ts
-   * const sandbox = await Sandbox.get({ sandboxId: "sbx_..." });
+   * const sandbox = await Sandbox.get("build-482");
    * ```
    */
-  static async get(
-    options: (GetOptions | string) & TransportOptions,
-  ): Promise<Sandbox> {
-    const params: GetOptions & TransportOptions =
-      typeof options === "string" ? { id: options } : options;
-    // Ids and names share one lookup: the server resolves a reference as an
-    // id first and as a name second, and the two cannot collide.
-    const id = params.sandboxId ?? params.id ?? params.name;
-    if (!id) {
-      throw new BurrowError("an id or a name is required", "invalid_argument");
-    }
-
-    const transport = new Transport(params);
-    try {
-      const raw = await transport.unary<any, any>(
-        "GetSandbox",
-        { id },
-        params.timeoutMs,
-        params.signal,
-      );
-      return new Sandbox(
-        transport,
-        toSandboxInfo(raw),
-        true,
-        params.autoResume ?? true,
-      );
-    } catch (err) {
-      transport.close();
-      throw err;
-    }
+  static get(options: (GetOptions & TransportOptions) | string): Promise<Sandbox> {
+    const params = typeof options === "string" ? { id: options } : options;
+    return withClient(params, (burrow) => burrow.sandboxes.get(params));
   }
 
   /**
@@ -405,33 +315,20 @@ export class Sandbox {
    *
    * ```ts
    * for await (const sandbox of Sandbox.list({ tag: "owner=ci" })) {
-   *   await sandbox.stop();
+   *   await sandbox.pause();
    * }
    * ```
-   *
-   * The handles share one connection, released once the last of them is closed
-   * and the iteration has finished.
    */
   static list(
     options: ListOptions & TransportOptions = {},
   ): AsyncIterable<Sandbox> & { toArray(): Promise<Sandbox[]> } {
     const iterate = async function* (): AsyncGenerator<Sandbox> {
-      const transport = new Transport(options);
-      try {
-        const res = await transport.unary<any, any>(
-          "ListSandboxes",
-          { tag: options.tag ?? "" },
-          options.timeoutMs,
-          options.signal,
-        );
-        for (const raw of res.sandboxes ?? []) {
-          yield new Sandbox(transport.retain(), toSandboxInfo(raw), true);
-        }
-      } finally {
-        transport.close();
-      }
+      yield* await withClient(options, async (burrow) => {
+        const handles: Sandbox[] = [];
+        for await (const sandbox of burrow.sandboxes.list(options)) handles.push(sandbox);
+        return handles;
+      });
     };
-
     return {
       [Symbol.asyncIterator]: iterate,
       async toArray() {
@@ -442,9 +339,14 @@ export class Sandbox {
     };
   }
 
-  /** @internal: used by {@link Burrow} so clients share one connection. */
-  static adopt(transport: Transport, raw: any): Sandbox {
-    return new Sandbox(transport, toSandboxInfo(raw), false);
+  /**
+   * Refuses a call on a deleted sandbox. `delete` released the connection, so
+   * the alternative is an obscure transport failure some calls later.
+   */
+  private assertLive(): void {
+    if (this.destroyed) {
+      throw new BurrowError(`sandbox ${this.id} was deleted`, "failed_precondition");
+    }
   }
 
   /**
@@ -468,14 +370,27 @@ export class Sandbox {
     return this.info.nodeId;
   }
 
+  /** Address the sandbox holds on the networks it joined. */
+  get guestIp(): string {
+    return this.info.guestIp;
+  }
+
   /**
    * Whether the node hosting this sandbox has missed its heartbeats. When
-   * true, `state` and `status` are stale readings and calls fail with
-   * `unavailable` until it returns. `delete()` still works: the orchestrator
-   * drops the sandbox on its own word and destroys it if the node comes back.
+   * true, `state` is a stale reading and calls fail with `unavailable` until
+   * it returns. `delete()` still works: the orchestrator drops the sandbox on
+   * its own word and destroys it if the node comes back.
    */
   get unreachable(): boolean {
     return this.info.unreachable;
+  }
+
+  /**
+   * Suspended with its latest suspend in the object store, so it can resume
+   * on another node.
+   */
+  get durable(): boolean {
+    return this.info.durable;
   }
 
   /** Tags, as of the last call that returned the sandbox record. */
@@ -487,7 +402,6 @@ export class Sandbox {
     return this.info.policy.resources.vcpus;
   }
 
-  /** The same number under its unit-bearing name. */
   get memoryMib(): number {
     return this.info.policy.resources.memoryMib;
   }
@@ -495,33 +409,52 @@ export class Sandbox {
   /**
    * What the sandbox has consumed, as of the last call that returned its
    * record; {@link refresh} for a current reading. Accumulated across every VM
-   * it has run, so a stop and a resume do not reset it.
+   * it has run, so a pause and a resume do not reset it.
    */
   get usage(): Usage {
     return this.info.usage;
   }
 
-  /** RFC 3339. There is no `updatedAt`: the record does not carry one. */
-  get createdAt(): string {
+  /** There is no `updatedAt`: the record does not carry one. */
+  get createdAt(): Date {
     return this.info.createdAt;
   }
 
   /** The whole policy in force, with injected header values redacted. */
-  get policy() {
+  get policy(): SandboxInfo["policy"] {
     return this.info.policy;
   }
 
   /** Re-reads the sandbox's current state from the server. */
-  async refresh(options: { signal?: AbortSignal } = {}): Promise<SandboxInfo> {
+  refresh(options: CallOptions = {}): Promise<SandboxInfo> {
+    return this.mutate("GetSandbox", { sandboxId: this.id }, options);
+  }
+
+  /**
+   * One call that returns the sandbox's record: the record replaces what the
+   * handle holds, so every getter reads what the server last said.
+   */
+  private async mutate(
+    method: string,
+    request: object,
+    options: CallOptions,
+    timeoutMs?: number,
+  ): Promise<SandboxInfo> {
     this.assertLive();
     const raw = await this.transport.unary<any, any>(
-      "GetSandbox",
-      { id: this.id },
-      undefined,
+      method,
+      request,
+      options.timeoutMs ?? timeoutMs,
       options.signal,
     );
     this.info = toSandboxInfo(raw);
     return this.info;
+  }
+
+  /** A unary call to the control plane about this sandbox. */
+  private call<Res>(method: string, request: object, options: CallOptions): Promise<Res> {
+    this.assertLive();
+    return this.transport.unary<any, Res>(method, request, options.timeoutMs, options.signal);
   }
 
   /**
@@ -531,10 +464,7 @@ export class Sandbox {
    * `FAILED_PRECONDITION: sandbox is suspended; resume it first`, and nothing
    * else in the API reports that, so it is specific enough to act on.
    */
-  private async withResume<T>(
-    op: () => Promise<T>,
-    enabled = this.autoResume,
-  ): Promise<T> {
+  private async withResume<T>(op: () => Promise<T>, enabled = this.autoResume): Promise<T> {
     try {
       return await op();
     } catch (err) {
@@ -553,16 +483,8 @@ export class Sandbox {
    * }
    * ```
    */
-  async listCommands(
-    options: { signal?: AbortSignal } = {},
-  ): Promise<CommandInfo[]> {
-    this.assertLive();
-    const res = await this.transport.unary<any, any>(
-      "ListCommands",
-      { sandboxId: this.id },
-      undefined,
-      options.signal,
-    );
+  async listCommands(options: CallOptions = {}): Promise<CommandInfo[]> {
+    const res = await this.call<any>("ListCommands", { sandboxId: this.id }, options);
     return (res.commands ?? []).map(toCommandInfo);
   }
 
@@ -584,17 +506,12 @@ export class Sandbox {
    * `kill()` signals it. Several readers may follow one command at once.
    * Throws `not_found` when the id names nothing, a pruned command included.
    */
-  async getCommand(
-    cmdId: string,
-    options: { signal?: AbortSignal; fromOffset?: number } = {},
-  ): Promise<ChildProcess> {
-    this.assertLive();
+  async getCommand(cmdId: string, options: GetCommandOptions = {}): Promise<ChildProcess> {
     // Read first, so a bad id fails here rather than as an `error` event.
-    const raw = await this.transport.unary<any, any>(
+    const raw = await this.call<any>(
       "GetCommand",
       { sandboxId: this.id, commandId: cmdId },
-      undefined,
-      options.signal,
+      options,
     );
     return attach(this.link, cmdId, options.fromOffset ?? 0, toCommandInfo(raw).cmd);
   }
@@ -603,16 +520,8 @@ export class Sandbox {
    * Removes finished commands and their output, as `docker container prune`
    * does. Running commands are left alone.
    */
-  async pruneCommands(
-    options: { signal?: AbortSignal } = {},
-  ): Promise<{ removed: number; freedBytes: number }> {
-    this.assertLive();
-    const res = await this.transport.unary<any, any>(
-      "PruneCommands",
-      { sandboxId: this.id },
-      undefined,
-      options.signal,
-    );
+  async pruneCommands(options: CallOptions = {}): Promise<{ removed: number; freedBytes: number }> {
+    const res = await this.call<any>("PruneCommands", { sandboxId: this.id }, options);
     return {
       removed: Number(res.removed ?? 0),
       freedBytes: Number(res.freedBytes ?? 0),
@@ -659,18 +568,9 @@ export class Sandbox {
    * The home is 0700, so one agent's files are not readable by another's.
    * Names are `[a-z_][a-z0-9_-]*`, at most 32 characters.
    */
-  async createUser(
-    name: string,
-    options: { signal?: AbortSignal } = {},
-  ): Promise<GuestUser> {
-    this.assertLive();
+  async createUser(name: string, options: CallOptions = {}): Promise<GuestUser> {
     const res = await this.withResume(() =>
-      this.transport.unary<any, any>(
-        "CreateUser",
-        { sandboxId: this.id, name },
-        undefined,
-        options.signal,
-      ),
+      this.call<any>("CreateUser", { sandboxId: this.id, name }, options),
     );
     return {
       username: res.username ?? name,
@@ -686,18 +586,9 @@ export class Sandbox {
    * The directory is group-owned and setgid, so a file one member creates in
    * it stays readable by the others.
    */
-  async createGroup(
-    name: string,
-    options: { signal?: AbortSignal } = {},
-  ): Promise<GuestGroup> {
-    this.assertLive();
+  async createGroup(name: string, options: CallOptions = {}): Promise<GuestGroup> {
     const res = await this.withResume(() =>
-      this.transport.unary<any, any>(
-        "CreateGroup",
-        { sandboxId: this.id, name },
-        undefined,
-        options.signal,
-      ),
+      this.call<any>("CreateGroup", { sandboxId: this.id, name }, options),
     );
     return {
       groupname: res.groupname ?? name,
@@ -716,19 +607,13 @@ export class Sandbox {
    */
   async deleteUser(
     name: string,
-    options: { removeHome?: boolean; signal?: AbortSignal } = {},
+    options: { removeHome?: boolean } & CallOptions = {},
   ): Promise<{ home: string; homeRemoved: boolean }> {
-    this.assertLive();
     const res = await this.withResume(() =>
-      this.transport.unary<any, any>(
+      this.call<any>(
         "DeleteUser",
-        {
-          sandboxId: this.id,
-          name,
-          isHomeRemoved: options.removeHome ?? false,
-        },
-        undefined,
-        options.signal,
+        { sandboxId: this.id, name, isHomeRemoved: options.removeHome ?? false },
+        options,
       ),
     );
     return { home: res.home ?? "", homeRemoved: res.isHomeRemoved ?? false };
@@ -743,19 +628,13 @@ export class Sandbox {
    */
   async deleteGroup(
     name: string,
-    options: { removeSharedDir?: boolean; signal?: AbortSignal } = {},
+    options: { removeSharedDir?: boolean } & CallOptions = {},
   ): Promise<{ sharedDir: string; sharedDirRemoved: boolean }> {
-    this.assertLive();
     const res = await this.withResume(() =>
-      this.transport.unary<any, any>(
+      this.call<any>(
         "DeleteGroup",
-        {
-          sandboxId: this.id,
-          name,
-          isSharedDirRemoved: options.removeSharedDir ?? false,
-        },
-        undefined,
-        options.signal,
+        { sandboxId: this.id, name, isSharedDirRemoved: options.removeSharedDir ?? false },
+        options,
       ),
     );
     return {
@@ -765,37 +644,16 @@ export class Sandbox {
   }
 
   /** Adds a user to a group, so the group's shared directory opens to them. */
-  async addUserToGroup(
-    user: string,
-    group: string,
-    options: { signal?: AbortSignal } = {},
-  ): Promise<void> {
-    await this.membership("AddUserToGroup", user, group, options.signal);
+  async addUserToGroup(user: string, group: string, options: CallOptions = {}): Promise<void> {
+    await this.withResume(() =>
+      this.call("AddUserToGroup", { sandboxId: this.id, user, group }, options),
+    );
   }
 
   /** Removes a user from a group, closing the shared directory to them. */
-  async removeUserFromGroup(
-    user: string,
-    group: string,
-    options: { signal?: AbortSignal } = {},
-  ): Promise<void> {
-    await this.membership("RemoveUserFromGroup", user, group, options.signal);
-  }
-
-  private async membership(
-    method: string,
-    user: string,
-    group: string,
-    signal?: AbortSignal,
-  ): Promise<void> {
-    this.assertLive();
+  async removeUserFromGroup(user: string, group: string, options: CallOptions = {}): Promise<void> {
     await this.withResume(() =>
-      this.transport.unary(
-        method,
-        { sandboxId: this.id, user, group },
-        undefined,
-        signal,
-      ),
+      this.call("RemoveUserFromGroup", { sandboxId: this.id, user, group }, options),
     );
   }
 
@@ -817,15 +675,13 @@ export class Sandbox {
     this.assertLive();
     // Shares the connection but does not own it: closing a user handle must
     // not close the sandbox's.
-    const handle = new Sandbox(
-      this.transport,
-      this.info,
-      false,
-      this.autoResume,
-      this.env,
-    );
+    const handle = new Sandbox(this.transport, this.info, this.handleOptions(), false);
     handle.defaultUser = name;
     return handle;
+  }
+
+  private handleOptions(): HandleOptions {
+    return { env: this.env, autoResume: this.autoResume, onResume: this.onResume };
   }
 
   /**
@@ -846,14 +702,8 @@ export class Sandbox {
    * const { url } = await sandbox.exposePort(8000);
    * ```
    */
-  async exposePort(
-    guestPort: number,
-    hostPort?: number | { hostPort?: number; udp?: boolean; signal?: AbortSignal },
-  ): Promise<PortMapping> {
-    this.assertLive();
-    const options =
-      typeof hostPort === "number" ? { hostPort } : (hostPort ?? {});
-    const res = await this.transport.unary<any, any>(
+  async exposePort(guestPort: number, options: ExposePortOptions = {}): Promise<PortMapping> {
+    const res = await this.call<any>(
       "ExposePort",
       {
         sandboxId: this.id,
@@ -861,20 +711,13 @@ export class Sandbox {
         hostPort: options.hostPort ?? 0,
         isUdp: options.udp ?? false,
       },
-      undefined,
-      options.signal,
+      options,
     );
     return toPort(res, this.transport.host);
   }
 
-  async listPorts(options: { signal?: AbortSignal } = {}): Promise<PortMapping[]> {
-    this.assertLive();
-    const res = await this.transport.unary<any, any>(
-      "ListPorts",
-      { id: this.id },
-      undefined,
-      options.signal,
-    );
+  async listPorts(options: CallOptions = {}): Promise<PortMapping[]> {
+    const res = await this.call<any>("ListPorts", { sandboxId: this.id }, options);
     return (res.ports ?? []).map((port: any) => toPort(port, this.transport.host));
   }
 
@@ -888,14 +731,11 @@ export class Sandbox {
    *
    * When the node holding the sandbox runs an edge, this is a full URL on a
    * per-sandbox hostname, `http://<port>-<sandbox-id>.<edge-domain>/`, and
-   * traffic arriving on it wakes a stopped sandbox. When that node runs no
+   * traffic arriving on it wakes a suspended sandbox. When that node runs no
    * edge there is no hostname routing, and this is a bare `host:port` on the
    * node's own address. Throws when the port is not published.
    */
-  async domain(
-    guestPort: number,
-    options: { signal?: AbortSignal } = {},
-  ): Promise<string> {
+  async domain(guestPort: number, options: CallOptions = {}): Promise<string> {
     const ports = await this.listPorts(options);
     const mapping = ports.find((port) => port.guestPort === guestPort);
     if (!mapping) {
@@ -907,17 +747,8 @@ export class Sandbox {
     return mapping.edgeUrl ?? mapping.url.replace(/^https?:\/\//, "");
   }
 
-  async closePort(
-    hostPort: number,
-    options: { signal?: AbortSignal } = {},
-  ): Promise<void> {
-    this.assertLive();
-    await this.transport.unary(
-      "ClosePort",
-      { sandboxId: this.id, hostPort },
-      undefined,
-      options.signal,
-    );
+  async closePort(hostPort: number, options: CallOptions = {}): Promise<void> {
+    await this.call("ClosePort", { sandboxId: this.id, hostPort }, options);
   }
 
   /**
@@ -929,7 +760,7 @@ export class Sandbox {
    * its address; `rotate` issues new keys and so a new address. TCP is shared
    * on every port unless `ports` narrows it; UDP only on `udpPorts`, or
    * everywhere with `allUdp`. The guest sees each client's own public IPv4
-   * as the packet source; `noTransparentIp` sources from the gateway.
+   * as the packet source unless `transparentIp` is `false`.
    *
    * ```ts
    * const share = await sandbox.share({ ports: [22] });
@@ -937,8 +768,7 @@ export class Sandbox {
    * ```
    */
   async share(options: ShareOptions = {}): Promise<Share> {
-    this.assertLive();
-    const res = await this.transport.unary<any, any>(
+    const res = await this.call<any>(
       "ShareSandbox",
       {
         sandboxId: this.id,
@@ -947,35 +777,21 @@ export class Sandbox {
         isRotating: options.rotate ?? false,
         udpPorts: options.udpPorts ?? [],
         isAllUdp: options.allUdp ?? false,
-        isTransparentIpDisabled: options.noTransparentIp ?? false,
+        isTransparentIp: options.transparentIp,
       },
-      undefined,
-      options.signal,
+      options,
     );
     return toShare(res);
   }
 
   /** The sandbox's share. Throws `not_found` when it has none. */
-  async getShare(options: { signal?: AbortSignal } = {}): Promise<Share> {
-    this.assertLive();
-    const res = await this.transport.unary<any, any>(
-      "GetShare",
-      { id: this.id },
-      undefined,
-      options.signal,
-    );
-    return toShare(res);
+  async getShare(options: CallOptions = {}): Promise<Share> {
+    return toShare(await this.call<any>("GetShare", { sandboxId: this.id }, options));
   }
 
   /** Revokes the share; its address stops working at once. */
-  async unshare(options: { signal?: AbortSignal } = {}): Promise<void> {
-    this.assertLive();
-    await this.transport.unary(
-      "UnshareSandbox",
-      { id: this.id },
-      undefined,
-      options.signal,
-    );
+  async unshare(options: CallOptions = {}): Promise<void> {
+    await this.call("UnshareSandbox", { sandboxId: this.id }, options);
   }
 
   /**
@@ -985,42 +801,22 @@ export class Sandbox {
    * "unlimited" here as it does on create. The machine shape is not among
    * them: a running VM's configuration is fixed.
    */
-  async updateResources(
-    options: Pick<
-      UpdateOptions,
-      "maxLifetimeSecs" | "idleSuspendSecs" | "suspendedTtlSecs" | "signal"
-    >,
-  ): Promise<SandboxInfo> {
-    this.assertLive();
-    const raw = await this.transport.unary<any, any>(
-      "UpdateResources",
+  updateLifetime(options: UpdateLifetimeOptions): Promise<SandboxInfo> {
+    return this.mutate(
+      "UpdateLifetime",
       {
-        ref: { id: this.id },
+        sandboxId: this.id,
         maxLifetimeSecs: options.maxLifetimeSecs,
         idleSuspendSecs: options.idleSuspendSecs,
         suspendedTtlSecs: options.suspendedTtlSecs,
       },
-      undefined,
-      options.signal,
+      options,
     );
-    this.info = toSandboxInfo(raw);
-    return this.info;
   }
 
   /** Replaces the sandbox's tags. An empty map clears them. */
-  async updateTags(
-    tags: Record<string, string>,
-    options: { signal?: AbortSignal } = {},
-  ): Promise<SandboxInfo> {
-    this.assertLive();
-    const raw = await this.transport.unary<any, any>(
-      "UpdateTags",
-      { ref: { id: this.id }, tags },
-      undefined,
-      options.signal,
-    );
-    this.info = toSandboxInfo(raw);
-    return this.info;
+  updateTags(tags: Record<string, string>, options: CallOptions = {}): Promise<SandboxInfo> {
+    return this.mutate("UpdateTags", { sandboxId: this.id, tags }, options);
   }
 
   /**
@@ -1029,32 +825,13 @@ export class Sandbox {
    * Firewall rules, proxy allowlist, DNS filtering and header injection all
    * re-render at once, so the sandbox is never briefly half-governed.
    */
-  async updateNetworkPolicy(
-    policy: UpdateOptions["networkPolicy"],
-    options: { signal?: AbortSignal } = {},
-  ): Promise<SandboxInfo> {
-    this.assertLive();
+  updateNetworkPolicy(policy: NetworkInput, options: CallOptions = {}): Promise<SandboxInfo> {
     const wanted = resolveNetwork(policy);
-    // The guest is handed the inspection CA during its first handshake, so a
-    // sandbox that did not start with TLS inspection cannot gain it. That
-    // makes this the one policy change refused here rather than sent.
-    if (wanted.inspectTls && !this.info.policy.network.inspectTls) {
-      throw new BurrowError(
-        `sandbox ${this.id} was created without TLS inspection, so headers cannot be injected into its traffic; create it with inspectTls: true`,
-        "failed_precondition",
-      );
-    }
-    const raw = await this.transport.unary<any, any>(
+    return this.mutate(
       "UpdateNetworkPolicy",
-      {
-        ref: { id: this.id },
-        network: toNetworkPolicy(wanted),
-      },
-      undefined,
-      options.signal,
+      { sandboxId: this.id, network: toNetworkPolicy(wanted) },
+      options,
     );
-    this.info = toSandboxInfo(raw);
-    return this.info;
   }
 
   /**
@@ -1072,31 +849,24 @@ export class Sandbox {
    * await sandbox.updateAccessPolicy({ exec: { allowExec: false } });
    * ```
    */
-  async updateAccessPolicy(
-    policy: Pick<UpdateOptions, "exec" | "fs">,
-    options: { signal?: AbortSignal } = {},
-  ): Promise<SandboxInfo> {
-    this.assertLive();
-    if (policy.exec === undefined && policy.fs === undefined) {
+  async updateAccessPolicy(options: UpdateAccessOptions): Promise<SandboxInfo> {
+    if (options.exec === undefined && options.fs === undefined) {
       throw new BurrowError(
         "updateAccessPolicy needs exec, fs or both: a call with neither would change nothing",
         "invalid_argument",
       );
     }
-    const raw = await this.transport.unary<any, any>(
+    return this.mutate(
       "UpdateAccessPolicy",
       {
-        ref: { id: this.id },
+        sandboxId: this.id,
         // Absent stays absent on the wire: presence is what carries "leave
         // this section alone" to the node.
-        exec: toExecPolicy(policy.exec),
-        fs: toFsPolicy(policy.fs),
+        exec: toExecPolicy(options.exec),
+        fs: toFsPolicy(options.fs),
       },
-      undefined,
-      options.signal,
+      options,
     );
-    this.info = toSandboxInfo(raw);
-    return this.info;
   }
 
   /**
@@ -1104,74 +874,44 @@ export class Sandbox {
    * its address and its memory, and rejects commands until it is resumed;
    * {@link delete} destroys one instead.
    */
-  async stop(options: { signal?: AbortSignal } = {}): Promise<SandboxInfo> {
-    this.assertLive();
-    const raw = await this.transport.unary<any, any>(
-      "PauseSandbox",
-      { id: this.id },
-      undefined,
-      options.signal,
-    );
-    this.info = toSandboxInfo(raw);
-    return this.info;
+  pause(options: CallOptions = {}): Promise<SandboxInfo> {
+    return this.mutate("PauseSandbox", { sandboxId: this.id }, options);
   }
 
   /**
    * Restores a suspended sandbox, typically in a few hundred milliseconds.
-   * One that was shut down has no memory to restore and is refused with
-   * FAILED_PRECONDITION; {@link boot} it instead.
+   * One that was stopped has no memory to restore and is refused with
+   * `failed_precondition`; {@link start} it instead.
    *
    * Every resume this handle performs goes through here, auto-resume included,
    * so this is the one place `onResume` has to fire.
    */
-  async resume(options: { signal?: AbortSignal } = {}): Promise<SandboxInfo> {
-    this.assertLive();
-    const raw = await this.transport.unary<any, any>(
-      "ResumeSandbox",
-      { id: this.id },
-      undefined,
-      options.signal,
-    );
-    this.info = toSandboxInfo(raw);
+  async resume(options: CallOptions = {}): Promise<SandboxInfo> {
+    const info = await this.mutate("ResumeSandbox", { sandboxId: this.id }, options);
     await this.onResume?.(this);
-    return this.info;
+    return info;
   }
 
   /**
    * Shuts the VM down, keeping the writable disk and volumes. Unlike
-   * {@link stop}, nothing in memory survives: processes end, and {@link boot}
+   * {@link pause}, nothing in memory survives: processes end, and {@link start}
    * runs the image's init again on the same disk. For a Sandbox Kit template
    * that is the stop and start its spec describes, and the Kit's startup hooks
    * run again on the way up.
    */
-  async shutdown(options: { signal?: AbortSignal } = {}): Promise<SandboxInfo> {
-    this.assertLive();
-    const raw = await this.transport.unary<any, any>(
-      "StopSandbox",
-      { id: this.id },
-      undefined,
-      options.signal,
-    );
-    this.info = toSandboxInfo(raw);
-    return this.info;
+  stop(options: CallOptions = {}): Promise<SandboxInfo> {
+    return this.mutate("StopSandbox", { sandboxId: this.id }, options);
   }
 
   /**
-   * Cold-boots a shut-down sandbox on its existing disks. It takes as long as a
+   * Cold-boots a stopped sandbox on its existing disks. It takes as long as a
    * create, since there is no memory image to restore, and the sandbox keeps
    * its id, name, address and published ports.
    */
-  async boot(options: { signal?: AbortSignal } = {}): Promise<SandboxInfo> {
-    this.assertLive();
-    const raw = await this.transport.unary<any, any>(
-      "StartSandbox",
-      { id: this.id },
-      undefined,
-      options.signal,
-    );
-    this.info = toSandboxInfo(raw);
+  async start(options: CallOptions = {}): Promise<SandboxInfo> {
+    const info = await this.mutate("StartSandbox", { sandboxId: this.id }, options);
     await this.onResume?.(this);
-    return this.info;
+    return info;
   }
 
   /**
@@ -1181,26 +921,19 @@ export class Sandbox {
    * new disk with the recorded inputs, as changed by `kit`.
    */
   async recreate(options: RecreateOptions = {}): Promise<SandboxInfo> {
-    this.assertLive();
-    const raw = await this.transport.unary<any, any>(
+    const info = await this.mutate(
       "RecreateSandbox",
-      {
-        sandboxId: this.id,
-        template: options.template ?? "",
-        kit: toKitSpec(options.kit),
-      },
-      undefined,
-      options.signal,
+      { sandboxId: this.id, template: options.template ?? "", kit: toKitSpec(options.kit) },
+      options,
     );
-    this.info = toSandboxInfo(raw);
     await this.onResume?.(this);
-    return this.info;
+    return info;
   }
 
   /**
    * Every VM this sandbox has run, newest first.
    *
-   * A sandbox outlives its VMs: {@link stop} ends one and {@link resume}
+   * A sandbox outlives its VMs: {@link pause} ends one and {@link resume}
    * starts the next. The node keeps only the most recent sessions of each
    * sandbox, and drops them all when the sandbox is deleted.
    *
@@ -1209,33 +942,20 @@ export class Sandbox {
    * console.log(current.startedBy, current.startedAt);
    * ```
    */
-  async listSessions(options: { signal?: AbortSignal } = {}): Promise<Session[]> {
-    this.assertLive();
-    const res = await this.transport.unary<any, any>(
-      "ListSessions",
-      { id: this.id },
-      undefined,
-      options.signal,
-    );
+  async listSessions(options: CallOptions = {}): Promise<Session[]> {
+    const res = await this.call<any>("ListSessions", { sandboxId: this.id }, options);
     return (res.sessions ?? []).map(toSession);
   }
 
   /**
-   * The VM the sandbox is running now, or `undefined` when it is stopped.
+   * The VM the sandbox is running now, or `undefined` when it has none.
    *
    * The open session is the one {@link listSessions} reports with no
-   * `endedAt`.
-   *
-   * ```ts
-   * const session = await sandbox.currentSession();
-   * if (session) console.log(session.startedBy, session.startedAt);
-   * ```
+   * `endedBy`.
    */
-  async currentSession(
-    options: { signal?: AbortSignal } = {},
-  ): Promise<Session | undefined> {
+  async currentSession(options: CallOptions = {}): Promise<Session | undefined> {
     const sessions = await this.listSessions(options);
-    return sessions.find((session) => !session.endedAt);
+    return sessions.find((session) => session.endedBy === null);
   }
 
   /**
@@ -1251,24 +971,45 @@ export class Sandbox {
    * ```
    */
   async fork(options: ForkOptions = {}): Promise<Sandbox> {
-    this.assertLive();
     const raw = await this.transport.unary<any, any>(
       "ForkSandbox",
-      toForkRequest(this.id, options),
-      120_000,
+      this.forkRequest(options),
+      options.timeoutMs ?? 120_000,
       options.signal,
     );
-    // A fork shares its parent's connection, released once both are done.
-    const transport = this.owned ? this.transport.retain() : this.transport;
-    return new Sandbox(
-      transport,
-      toSandboxInfo(raw),
-      this.owned,
-      this.autoResume,
-      // A fork is the same sandbox again, so it runs commands with the same
-      // environment this handle applies.
-      this.env,
-    );
+    // A fork is the same sandbox again, so it runs commands with the same
+    // environment this handle applies, and holds its own share of the
+    // connection.
+    return new Sandbox(this.transport.retain(), toSandboxInfo(raw), this.handleOptions());
+  }
+
+  /** Builds a `ForkSandboxRequest`. An omitted policy inherits the source's. */
+  private forkRequest(options: ForkOptions): any {
+    this.assertLive();
+    const network = options.networkPolicy;
+    const stated =
+      network !== undefined ||
+      options.networks !== undefined ||
+      options.exec !== undefined ||
+      options.fs !== undefined;
+    const policy = !stated
+      ? undefined
+      : {
+          // Resources are absent deliberately: a restore takes its machine
+          // configuration from the snapshot, and the node refuses an override.
+          network: network === undefined ? undefined : toNetworkPolicy(resolveNetwork(network)),
+          networks: toNetworks(options.networks, options.alias),
+          // Each section is inherited on its own, so overriding one does not
+          // strip the others off the child.
+          exec: toExecPolicy(options.exec),
+          fs: toFsPolicy(options.fs),
+        };
+    return {
+      sandboxId: this.id,
+      name: options.name ?? "",
+      policy,
+      nodeLabels: options.nodeLabels ?? {},
+    };
   }
 
   /**
@@ -1281,31 +1022,24 @@ export class Sandbox {
    * await sandbox.move({ nodeLabels: { tier: "dedicated" } });
    * ```
    */
-  async move(options: MoveOptions = {}): Promise<SandboxInfo> {
-    this.assertLive();
-    const raw = await this.transport.unary<any, any>(
+  move(options: MoveOptions = {}): Promise<SandboxInfo> {
+    return this.mutate(
       "MoveSandbox",
-      {
-        ref: { id: this.id },
-        nodeId: options.nodeId ?? "",
-        nodeLabels: options.nodeLabels ?? {},
-      },
+      { sandboxId: this.id, nodeId: options.nodeId ?? "", nodeLabels: options.nodeLabels ?? {} },
+      options,
       300_000,
-      options.signal,
     );
-    this.info = toSandboxInfo(raw);
-    return this.info;
   }
 
   /**
    * Saves the sandbox's state as a snapshot object and keeps running.
    *
    * The guest is paused only long enough to write its state. Unlike the
-   * sandbox's own stop state, which dies with it, a snapshot outlives its
+   * sandbox's own suspend state, which dies with it, a snapshot outlives its
    * source and can start any number of new sandboxes:
    *
    * ```ts
-   * const snapshot = await prepared.snapshot({ expiration: 86_400 });
+   * const snapshot = await prepared.snapshot({ expirationSecs: 86_400 });
    * const worker = await Sandbox.create({ snapshot: snapshot.id });
    * ```
    */
@@ -1313,21 +1047,13 @@ export class Sandbox {
     this.assertLive();
     const raw = await this.transport.unary<any, any>(
       "CreateSnapshot",
-      {
-        ref: { id: this.id },
-        expirationSecs: options.expiration ?? 0,
-      },
+      { sandboxId: this.id, expirationSecs: options.expirationSecs ?? 0 },
       // Writing a memory image and copying a scratch disk; seconds, not
       // milliseconds, on a large guest.
-      120_000,
+      options.timeoutMs ?? 120_000,
       options.signal,
     );
-    // The snapshot shares this handle's connection, released once both are
-    // done.
-    return Snapshot.adopt(
-      this.owned ? this.transport.retain() : this.transport,
-      raw,
-    );
+    return new Snapshot(this.transport.retain(), raw);
   }
 
   /**
@@ -1335,15 +1061,9 @@ export class Sandbox {
    * afterwards: every later call throws rather than failing obscurely against
    * an id that is no longer anywhere.
    */
-  async delete(options: { signal?: AbortSignal } = {}): Promise<void> {
-    this.assertLive();
+  async delete(options: CallOptions = {}): Promise<void> {
     try {
-      await this.transport.unary(
-        "DeleteSandbox",
-        { id: this.id },
-        undefined,
-        options.signal,
-      );
+      await this.call("DeleteSandbox", { sandboxId: this.id }, options);
     } finally {
       this.destroyed = true;
       if (this.owned) this.transport.close();
@@ -1364,298 +1084,5 @@ export class Sandbox {
    */
   async [Symbol.asyncDispose](): Promise<void> {
     await this.delete();
-  }
-}
-
-/** Builds a `ForkSandboxRequest`. An omitted policy inherits the source's. */
-function toForkRequest(source: string, options: ForkOptions): any {
-  const network = options.networkPolicy;
-  const stated =
-    network !== undefined ||
-    options.networks !== undefined ||
-    options.exec !== undefined ||
-    options.fs !== undefined;
-  const policy = !stated
-    ? undefined
-    : {
-        // Resources are absent deliberately: a restore takes its machine
-        // configuration from the snapshot, and the node refuses an override.
-        network:
-          network === undefined
-            ? undefined
-            : toNetworkPolicy(resolveNetwork(network)),
-        networks: toNetworks(options.networks),
-        // Each section is inherited on its own, so overriding one does not
-        // strip the others off the child.
-        exec: toExecPolicy(options.exec),
-        fs: toFsPolicy(options.fs),
-      };
-  return {
-    ref: { id: source },
-    sandboxId: options.sandboxId ?? options.id ?? "",
-    name: options.name ?? "",
-    policy,
-    nodeLabels: options.nodeLabels ?? {},
-  };
-}
-
-function toShare(raw: any): Share {
-  return {
-    address: raw.address ?? "",
-    ports: (raw.ports ?? []).map((p: any) => Number(p)),
-    allowedClients: raw.allowedClients ?? [],
-    createdAt: raw.createdAt ?? "",
-    udpPorts: (raw.udpPorts ?? []).map((p: any) => Number(p)),
-    allUdp: Boolean(raw.isAllUdp),
-    transparentIp: Boolean(raw.isTransparentIp),
-  };
-}
-
-function toPort(raw: any, fallbackHost: string): PortMapping {
-  const hostPort = Number(raw.hostPort ?? 0);
-  // The node advertises where it accepts traffic; when it has not, the control
-  // plane's own host is the best guess, and the right one for a single node.
-  const address = raw.hostAddress || `${fallbackHost}:${hostPort}`;
-  return {
-    guestPort: Number(raw.guestPort ?? 0),
-    hostPort,
-    udp: Boolean(raw.isUdp),
-    url: `http://${address}`,
-    // Empty unless the holding node's edge is serving, rather than a name
-    // that resolves nowhere.
-    edgeUrl: raw.edgeUrl || undefined,
-  };
-}
-
-/**
- * A connection to a burrow control plane, for listing or reattaching to
- * sandboxes over one channel. {@link Sandbox.create} is the shortcut when you
- * only need one.
- */
-export class Burrow {
-  private readonly transport: Transport;
-
-  constructor(options: TransportOptions = {}) {
-    this.transport = new Transport(options);
-  }
-
-  async health(): Promise<{ version: string }> {
-    const res = await this.transport.unary<any, any>("Health", {});
-    return { version: res.version ?? "" };
-  }
-
-  /**
-   * Reads the egress audit trail, newest first.
-   *
-   * Records cover both connection attempts and DNS lookups, so an attempt is
-   * visible even when the policy blocked it.
-   */
-  async audit(query: AuditQuery = {}): Promise<AuditEvent[]> {
-    const events: AuditEvent[] = [];
-    for await (const raw of this.transport.serverStream<any, any>("QueryAudit", {
-      sandboxId: query.sandboxId ?? "",
-      isDeniedOnly: query.deniedOnly ?? false,
-      since: query.since ?? "",
-      limit: query.limit ?? 0,
-    })) {
-      events.push({
-        at: raw.at,
-        sandboxId: raw.sandboxId,
-        sourceIp: raw.sourceIp,
-        destination: raw.destination,
-        host: raw.host ?? "",
-        port: Number(raw.port ?? 0),
-        allowed: Boolean(raw.isAllowed),
-        reason: raw.reason ?? "",
-        bytesSent: Number(raw.bytesSent ?? 0),
-        bytesReceived: Number(raw.bytesReceived ?? 0),
-        nodeId: raw.nodeId ?? "",
-      });
-    }
-    return events;
-  }
-
-  /**
-   * Reads the fleet's lifecycle log, oldest first.
-   *
-   * Without `follow` the iterator ends after the replay. With it, the stream
-   * stays open and yields events as they happen until `signal` aborts or the
-   * loop breaks. Keep the last `seq` seen to resume after a disconnect.
-   *
-   * ```ts
-   * for await (const event of burrow.events({ sandbox: "build-482", follow: true })) {
-   *   console.log(event.seq, event.type, event.detail);
-   * }
-   * ```
-   */
-  async *events(options: EventsOptions = {}): AsyncGenerator<LifecycleEvent> {
-    for await (const raw of this.transport.serverStream<any, any>(
-      "TailEvents",
-      {
-        afterSeq: options.after ?? 0,
-        sandbox: options.sandbox ?? "",
-        isFollow: options.follow ?? false,
-        limit: options.limit ?? 0,
-      },
-      // A follow outlives any request deadline.
-      options.follow ? Infinity : undefined,
-      options.signal,
-    )) {
-      yield {
-        seq: Number(raw.seq ?? 0),
-        nodeId: raw.nodeId ?? "",
-        nodeSeq: Number(raw.nodeSeq ?? 0),
-        atUnixMs: Number(raw.atUnixMs ?? 0),
-        sandboxId: raw.sandboxId ?? "",
-        type: raw.type ?? "",
-        state: stateOf(raw.state),
-        detail: raw.detail ?? "",
-        template: raw.template ?? "",
-        metadata: raw.metadata ?? {},
-        cpuUsageUsec: Number(raw.cpuUsageUsec ?? 0),
-        rxBytes: Number(raw.rxBytes ?? 0),
-        txBytes: Number(raw.txBytes ?? 0),
-        vcpus: Number(raw.vcpus ?? 0),
-        memoryMib: Number(raw.memMib ?? 0),
-      };
-    }
-  }
-
-  /**
-   * Reads the usage ledger: the intervals sandboxes spent in one state at one
-   * shape, or their sums by group. The ledger outlives the sandboxes and
-   * nodes it describes.
-   *
-   * ```ts
-   * const { sums } = await burrow.usage({
-   *   from: new Date("2026-10-01"),
-   *   to: new Date("2026-11-01"),
-   *   groupBy: "customer",
-   * });
-   * ```
-   */
-  async usage(query: UsageQuery = {}): Promise<UsageReport> {
-    const ms = (at?: Date | number) => (at instanceof Date ? at.getTime() : (at ?? 0));
-    const res = await this.transport.unary<any, any>("QueryUsage", {
-      fromUnixMs: ms(query.from),
-      toUnixMs: ms(query.to),
-      sandbox: query.sandbox ?? "",
-      tags: query.tags ?? {},
-      groupBy: query.groupBy ?? "",
-      afterId: query.afterId ?? 0,
-      limit: query.limit ?? 0,
-      isOpenIncluded: query.includeOpen ?? true,
-    });
-    return {
-      intervals: (res.intervals ?? []).map((raw: any) => ({
-        id: Number(raw.id ?? 0),
-        sandboxId: raw.sandboxId ?? "",
-        nodeId: raw.nodeId ?? "",
-        template: raw.template ?? "",
-        metadata: raw.metadata ?? {},
-        state: raw.state ?? "",
-        vcpus: Number(raw.vcpus ?? 0),
-        memoryMib: Number(raw.memMib ?? 0),
-        startedAtUnixMs: Number(raw.startedAtUnixMs ?? 0),
-        endedAtUnixMs: Number(raw.endedAtUnixMs ?? 0),
-        cpuUsageUsec: Number(raw.cpuUsageUsec ?? 0),
-        rxBytes: Number(raw.rxBytes ?? 0),
-        txBytes: Number(raw.txBytes ?? 0),
-        closedBy: raw.closedBy ?? "",
-        open: Boolean(raw.isOpen),
-      })),
-      sums: (res.sums ?? []).map((raw: any) => ({
-        group: raw.group ?? "",
-        state: raw.state ?? "",
-        intervals: Number(raw.intervals ?? 0),
-        durationMs: Number(raw.durationMs ?? 0),
-        vcpuMs: Number(raw.vcpuMs ?? 0),
-        memoryMibMs: Number(raw.memMibMs ?? 0),
-        cpuUsageUsec: Number(raw.cpuUsageUsec ?? 0),
-        rxBytes: Number(raw.rxBytes ?? 0),
-        txBytes: Number(raw.txBytes ?? 0),
-      })),
-      nextAfterId: Number(res.nextAfterId ?? 0),
-    };
-  }
-
-  /** Stops (or resumes) placing new sandboxes on a node. */
-  async drainNode(
-    nodeId: string,
-    options: { drain?: boolean; suspendSandboxes?: boolean } = {},
-  ): Promise<{ suspended: number }> {
-    const res = await this.transport.unary<any, any>("DrainNode", {
-      nodeId,
-      isDraining: options.drain ?? true,
-      suspendSandboxes: options.suspendSandboxes ?? false,
-    });
-    return { suspended: Number(res.suspended ?? 0) };
-  }
-
-  /**
-   * Stores a credential that Sandbox Kits ask for by service name. The value
-   * stays on the node and is injected into matching requests by the egress
-   * proxy, so a guest never holds it. `name` is lowercase kebab-case, the
-   * `service` a Kit credential names.
-   *
-   * `scope` limits which sandboxes may use it, by id or name or by tag; a
-   * reference from any other sandbox is refused. Omitted, every sandbox may.
-   * Setting a secret replaces its scope along with its value.
-   */
-  async setSecret(name: string, value: string, scope: SecretScope = {}): Promise<void> {
-    await this.transport.unary<any, any>("SetSecret", {
-      name,
-      value,
-      allowedSandboxes: scope.sandboxes ?? [],
-      allowedTags: scope.tags ?? [],
-    });
-  }
-
-  /** Names of the stored secrets. Values are never returned. */
-  async listSecrets(): Promise<string[]> {
-    const res = await this.transport.unary<any, any>("ListSecrets", {});
-    return [...(res.names ?? [])];
-  }
-
-  /** The stored secrets with their scopes. Values are never returned. */
-  async listSecretScopes(): Promise<SecretInfo[]> {
-    const res = await this.transport.unary<any, any>("ListSecrets", {});
-    return (res.secrets ?? []).map((secret: any) => ({
-      name: secret.name ?? "",
-      scope: {
-        sandboxes: [...(secret.allowedSandboxes ?? [])],
-        tags: [...(secret.allowedTags ?? [])],
-      },
-    }));
-  }
-
-  async deleteSecret(name: string): Promise<void> {
-    await this.transport.unary<any, any>("DeleteSecret", { name });
-  }
-
-  async nodes(): Promise<NodeInfo[]> {
-    const res = await this.transport.unary<any, any>("ListNodes", {});
-    return (res.nodes ?? []).map((n: any) => ({
-      id: n.info?.id ?? "",
-      address: n.info?.address ?? "",
-      hostname: n.info?.hostname ?? "",
-      totalVcpus: Number(n.info?.totalVcpus ?? 0),
-      totalMemoryMib: Number(n.info?.totalMemMib ?? 0),
-      freeMemoryMib: Number(n.status?.freeMemMib ?? 0),
-      runningSandboxes: Number(n.status?.runningSandboxes ?? 0),
-      healthy: Boolean(n.isHealthy),
-      draining: Boolean(n.status?.isDraining),
-      labels: n.info?.labels ?? {},
-      arch: n.info?.arch ?? "",
-      firecrackerVersion: n.info?.firecrackerVersion ?? "",
-    }));
-  }
-
-  close(): void {
-    this.transport.close();
-  }
-
-  [Symbol.dispose](): void {
-    this.close();
   }
 }

@@ -59,11 +59,11 @@ impl EventLog {
             node_seq: event.seq,
             at_unix_ms: event.at_unix_ms,
             sandbox_id: event.sandbox_id.clone(),
-            kind: event.r#type.clone(),
+            kind: event.kind,
             state: event.state,
             detail: event.detail.clone(),
             template: event.template.clone(),
-            metadata_json: serde_json::to_string(&event.metadata).unwrap_or_else(|_| "{}".into()),
+            metadata_json: serde_json::to_string(&event.tags).unwrap_or_else(|_| "{}".into()),
             cpu_usage_usec: event.cpu_usage_usec,
             rx_bytes: event.rx_bytes,
             tx_bytes: event.tx_bytes,
@@ -93,32 +93,12 @@ impl EventLog {
             return Ok(Vec::new());
         };
         let rows = store.list_events(after_seq, sandbox_id, limit).await?;
-        Ok(rows.into_iter().map(to_proto).collect())
+        Ok(rows.into_iter().map(common::Event::from).collect())
     }
 
     /// Whether events written by another replica can be read back from the
     /// store, which is what a follower serves its tails from.
     pub fn is_shared(&self) -> bool {
         self.store.as_ref().is_some_and(|store| store.is_postgres())
-    }
-}
-
-pub fn to_proto(row: burrow_store::EventRow) -> common::Event {
-    common::Event {
-        seq: row.seq,
-        node_id: row.node_id,
-        node_seq: row.node_seq,
-        at_unix_ms: row.at_unix_ms,
-        sandbox_id: row.sandbox_id,
-        r#type: row.kind,
-        state: row.state,
-        detail: row.detail,
-        template: row.template,
-        metadata: serde_json::from_str(&row.metadata_json).unwrap_or_default(),
-        cpu_usage_usec: row.cpu_usage_usec,
-        rx_bytes: row.rx_bytes,
-        tx_bytes: row.tx_bytes,
-        vcpus: row.vcpus,
-        mem_mib: row.mem_mib,
     }
 }

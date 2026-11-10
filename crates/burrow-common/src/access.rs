@@ -96,17 +96,6 @@ impl Claims {
     }
 }
 
-/// The unix millisecond tokens issued at or before are refused, from a
-/// sandbox record's two stamps. A record with only the second revokes all of
-/// it, as it did before milliseconds were kept.
-pub fn revoked_before_ms(revoked_at: i64, revoked_at_ms: i64) -> i64 {
-    match (revoked_at_ms, revoked_at) {
-        (0, 0) => 0,
-        (0, secs) => secs * 1000 + 999,
-        (ms, _) => ms,
-    }
-}
-
 /// The orchestrator's half: a private key and the id tokens name it by.
 pub struct Signer {
     key: EncodingKey,
@@ -432,25 +421,9 @@ mod tests {
         reissued.iat_ms = revoked_ms as u64 + 1;
         let token = signer.sign(&reissued).unwrap();
         let read = verifier(&signer).verify(&token, "node_a").unwrap();
-        let revoked = revoked_before_ms(revoked_ms / 1000, revoked_ms);
-        assert!(read.issued_ms() > revoked);
+        assert!(read.issued_ms() > revoked_ms);
         reissued.iat_ms = revoked_ms as u64;
-        assert!(reissued.issued_ms() <= revoked);
-    }
-
-    /// A token or a record from before milliseconds were kept errs toward
-    /// refusing: its whole second is revoked.
-    #[test]
-    fn second_stamps_revoke_their_whole_second() {
-        let mut old = claims("node_a", 300);
-        old.iat = 1_793_000_000;
-        old.iat_ms = 0;
-        assert_eq!(old.issued_ms(), 1_793_000_000_000);
-        assert_eq!(revoked_before_ms(1_793_000_000, 0), 1_793_000_000_999);
-        assert!(old.issued_ms() <= revoked_before_ms(1_793_000_000, 0));
-        assert_eq!(revoked_before_ms(0, 0), 0);
-        let issued = Claims::new("node_a", "sbx_a", vec![], String::new(), 300);
-        assert_eq!(issued.iat, issued.iat_ms / 1000);
+        assert!(reissued.issued_ms() <= revoked_ms);
     }
 
     fn verifier(signer: &Signer) -> Verifier {

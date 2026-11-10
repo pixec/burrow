@@ -6,7 +6,7 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
 
-import { Sandbox } from "../dist/index.js";
+import { fakeSandbox } from "./helpers.mjs";
 
 function recordingSandbox() {
   const sent = [];
@@ -16,10 +16,7 @@ function recordingSandbox() {
       return { id: "sbx_test", state: "SANDBOX_STATE_RUNNING" };
     },
   };
-  const sandbox = Sandbox.adopt(transport, {
-    id: "sbx_test",
-    state: "SANDBOX_STATE_RUNNING",
-  });
+  const sandbox = fakeSandbox(transport);
   return { sandbox, sent };
 }
 

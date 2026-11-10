@@ -81,11 +81,11 @@ class LocalFs:
         with os.scandir(self.host(op.path)) as it:
             for e in sorted(it, key=lambda e: e.name):
                 kind = (
-                    "symlink"
+                    api_pb2.FILE_TYPE_SYMLINK
                     if e.is_symlink()
-                    else "dir"
+                    else api_pb2.FILE_TYPE_DIR
                     if e.is_dir(follow_symlinks=False)
-                    else "file"
+                    else api_pb2.FILE_TYPE_FILE
                 )
                 entries.append(api_pb2.FsDirEntry(name=e.name, type=kind))
         return api_pb2.FsResponse(entries=api_pb2.FsDirEntries(entries=entries))
@@ -298,7 +298,9 @@ class FakeTransport:
             return api_pb2.SignalCommandResponse()
         if method == "GetCommand":
             return api_pb2.CommandInfo(
-                command_id=request.command_id, cmd=["/bin/sh"], state="running"
+                command_id=request.command_id,
+                cmd=["/bin/sh"],
+                state=api_pb2.COMMAND_STATE_RUNNING,
             )
         raise AssertionError(f"unexpected {method}")
 

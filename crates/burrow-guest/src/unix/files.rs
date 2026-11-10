@@ -596,14 +596,14 @@ pub async fn watch(
             let current = scan(&path, recursive, user.clone()).await;
 
             for (entry, meta) in &current {
-                let event = match previous.get(entry) {
-                    None => "created",
-                    Some(before) if before != meta => "modified",
+                let kind = match previous.get(entry) {
+                    None => guestpb::WatchEventKind::Created,
+                    Some(before) if before != meta => guestpb::WatchEventKind::Modified,
                     Some(_) => continue,
                 };
                 if tx
                     .send(Ok(guestpb::WatchEvent {
-                        r#type: event.into(),
+                        kind: kind as i32,
                         path: entry.clone(),
                         is_dir: meta.is_dir,
                     }))
@@ -617,7 +617,7 @@ pub async fn watch(
                 if !current.contains_key(entry)
                     && tx
                         .send(Ok(guestpb::WatchEvent {
-                            r#type: "deleted".into(),
+                            kind: guestpb::WatchEventKind::Deleted as i32,
                             path: entry.clone(),
                             is_dir: meta.is_dir,
                         }))

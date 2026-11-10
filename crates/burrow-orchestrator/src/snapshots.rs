@@ -91,7 +91,11 @@ impl SnapshotRegistry {
             .filter(|snapshot| sandbox_id.is_none_or(|id| snapshot.sandbox_id == id))
             .cloned()
             .collect();
-        out.sort_by(|a, b| b.created_at.cmp(&a.created_at).then(b.id.cmp(&a.id)));
+        out.sort_by(|a, b| {
+            b.created_at_unix_ms
+                .cmp(&a.created_at_unix_ms)
+                .then(b.id.cmp(&a.id))
+        });
         out
     }
 
@@ -182,7 +186,7 @@ mod tests {
             id: id.into(),
             sandbox_id: sandbox.into(),
             template: "default".into(),
-            created_at: created_at.into(),
+            created_at_unix_ms: burrow_common::unix_from_rfc3339(created_at).unwrap() * 1000,
             ..Default::default()
         }
     }

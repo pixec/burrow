@@ -9,7 +9,8 @@ import assert from "node:assert/strict";
 import { once } from "node:events";
 import { test } from "node:test";
 
-import { BurrowError, Sandbox } from "../dist/index.js";
+import { BurrowError } from "../dist/index.js";
+import { fakeSandbox } from "./helpers.mjs";
 
 /**
  * A sandbox whose command `cmd_1` is running and stays that way, and whose
@@ -44,7 +45,7 @@ function sandboxSignalling(outcome) {
       throw new Error(`unexpected call to ${method}`);
     },
   };
-  const sandbox = Sandbox.adopt(transport, { id: "sbx_test", state: "SANDBOX_STATE_RUNNING" });
+  const sandbox = fakeSandbox(transport);
   return { sandbox, signals };
 }
 

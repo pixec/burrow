@@ -30,6 +30,15 @@ const CODES: Record<number, BurrowErrorCode> = {
 };
 
 /**
+ * What the node says about a call that needs a live guest when the sandbox
+ * has none, and what the guest says about a signal for a command that has
+ * finished. Nothing else in the API uses either phrase, and both are matched
+ * only under `failed_precondition`.
+ */
+const SUSPENDED = "is suspended";
+const EXITED = /^command \S+ has (already )?exited$/;
+
+/**
  * An error from burrow.
  *
  * gRPC status codes are mapped to stable string codes so callers can branch on
@@ -57,18 +66,15 @@ export class BurrowError extends Error {
 
   /** True when the sandbox is suspended and must be resumed first. */
   get isSuspended(): boolean {
-    return this.code === "failed_precondition" && /suspend/i.test(this.message);
+    return this.code === "failed_precondition" && this.message.includes(SUSPENDED);
   }
 
   /**
-   * True when a signal was refused because the command had already exited.
-   *
-   * The one refusal a `kill()` can ignore, since it asked for a state the
-   * command is already in. Narrower than the code alone: a suspended sandbox
-   * refuses a signal with `failed_precondition` too, and that one is a real
-   * failure to deliver.
+   * True when a signal was refused because the command had already exited:
+   * the one refusal a `kill()` can ignore, since it asked for a state the
+   * command is already in.
    */
   get isAlreadyExited(): boolean {
-    return this.code === "failed_precondition" && !this.isSuspended;
+    return this.code === "failed_precondition" && EXITED.test(this.message);
   }
 }

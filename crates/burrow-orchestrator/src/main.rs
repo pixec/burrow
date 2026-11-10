@@ -308,7 +308,7 @@ impl NodeRegistry for NodeRegistryService {
                 })
                 .collect();
             if let Err(err) = store
-                .observe_usage(&req.node_id, registry::unix_ms(), &totals)
+                .observe_usage(&req.node_id, burrow_common::unix_now_ms(), &totals)
                 .await
             {
                 tracing::warn!(node_id = req.node_id, %err, "could not record usage from a heartbeat");
@@ -561,7 +561,7 @@ async fn advertise_replica(state: Arc<OrchestratorState>, address: Option<String
     let mut ticker = tokio::time::interval(std::time::Duration::from_secs(5));
     loop {
         ticker.tick().await;
-        let now = registry::unix_ms();
+        let now = burrow_common::unix_now_ms();
         let mut hosts = match &state.store {
             Some(store) => {
                 if let Some(address) = &address

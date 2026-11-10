@@ -35,7 +35,7 @@ hooks with it. A suspend keeps the processes. Choose shutdown when the guest
 should start clean on the data it has written, and suspend when it should carry
 on where it was.
 
-Two suspends happen without you asking. `idle_suspend_secs` in `ResourcePolicy`
+Two suspends happen without you asking. `idle_suspend_secs` in `LifetimePolicy`
 (`--idle-suspend-secs`, `0` to disable) parks a sandbox after that many idle
 seconds. And a stopping `burrowd` suspends every running sandbox it holds, then
 re-registers them from disk on start, ready to resume.
@@ -236,9 +236,9 @@ set when the sandbox is created:
 
 | Field | Flag | Effect | Default |
 | --- | --- | --- | --- |
-| `snapshot_expiration_secs` | `--snapshot-expiration-secs` | Sweep a snapshot this long after it was last used | `0`, keep indefinitely |
-| `keep_last_snapshots` | `--keep-last-snapshots` | Keep only this many snapshots of the sandbox, evicting the oldest | `0`, unlimited; 1 to 10 otherwise |
-| `is_evicted_snapshot_kept` | `--keep-evicted-snapshots` | Let an evicted snapshot expire on its own instead of being deleted at once | off, evictions delete |
+| `snapshots.expiration_secs` | `--snapshot-expiration-secs` | Sweep a snapshot this long after it was last used | `0`, keep indefinitely |
+| `snapshots.keep_last` | `--keep-last-snapshots` | Keep only this many snapshots of the sandbox, evicting the oldest | `0`, unlimited; 1 to 10 otherwise |
+| `snapshots.is_evicted_kept` | `--keep-evicted-snapshots` | Let an evicted snapshot expire on its own instead of being deleted at once | off, evictions delete |
 
 ```sh
 burrow create --template python --name build-env --keep-last-snapshots 2 --snapshot-expiration-secs 604800

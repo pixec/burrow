@@ -66,7 +66,7 @@ async fn the_control_tables_round_trip_on_postgres() {
         node_seq,
         at_unix_ms: 1,
         sandbox_id: a.clone(),
-        kind: "created".into(),
+        kind: 1,
         ..Default::default()
     };
     let first = store.append_event(&event(1)).await.unwrap();
@@ -88,10 +88,10 @@ async fn the_control_tables_round_trip_on_postgres() {
             .put_session(&SessionRow {
                 id: format!("{run}_{id}"),
                 sandbox_id: a.clone(),
-                started_at: at,
-                ended_at: 0,
-                started_by: "boot".into(),
-                ended_by: String::new(),
+                started_at_ms: at,
+                ended_at_ms: 0,
+                started_by: 1,
+                ended_by: 0,
             })
             .await
             .unwrap();
@@ -204,7 +204,7 @@ async fn the_usage_ledger_commits_once_and_in_id_order_on_postgres() {
         node_seq,
         at_unix_ms: node_seq as i64,
         sandbox_id: sandbox.clone(),
-        kind: "started".into(),
+        kind: 2,
         vcpus,
         mem_mib: vcpus * 512,
         ..Default::default()
@@ -226,7 +226,7 @@ async fn the_usage_ledger_commits_once_and_in_id_order_on_postgres() {
     let open = OpenUsageRow {
         sandbox_id: sandbox.clone(),
         node_id: node.clone(),
-        state: "running".into(),
+        state: 1,
         vcpus: 2,
         mem_mib: 1024,
         started_at_ms: 1_000,
@@ -256,7 +256,7 @@ async fn the_usage_ledger_commits_once_and_in_id_order_on_postgres() {
         sandbox_id: sandbox.clone(),
         node_id: node.clone(),
         metadata_json: "{}".into(),
-        state: "running".into(),
+        state: 1,
         started_at_ms: i,
         ended_at_ms: i + 1,
         closed_by: "checkpoint".into(),

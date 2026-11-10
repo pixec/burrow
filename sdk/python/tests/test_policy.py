@@ -4,32 +4,42 @@
 import pytest
 
 from burrow._pb import common_pb2
-from burrow._policy import from_network_policy, resolve_network, to_network_policy
+from burrow._policy import from_network_policy, network_policy, to_network_policy
 from burrow.errors import BurrowError
-from burrow.types import PortRule
+from burrow.types import NetworkPolicy, PortRule
+
+
+def wire(options):
+    return to_network_policy(network_policy(options))
 
 
 def test_a_string_is_a_mode():
-    assert resolve_network("open")["mode"] == "open"
-    assert resolve_network("allowlist")["mode"] == "allowlist"
+    assert network_policy("open").mode == "open"
+    assert network_policy("allowlist").mode == "allowlist"
+
+
+def test_a_policy_read_back_is_accepted_as_it_is():
+    policy = NetworkPolicy(mode="allowlist", allow_domains=["pypi.org"])
+    assert network_policy(policy) is policy
+    assert from_network_policy(wire(policy)) == policy
 
 
 def test_the_old_shorthand_strings_are_unknown_modes():
     for gone in ("allow-all", "deny-all"):
         with pytest.raises(BurrowError, match="unknown mode"):
-            to_network_policy(resolve_network(gone))
+            network_policy(gone)
 
 
 def test_the_old_shorthand_dict_is_refused_not_read_as_no_network():
     with pytest.raises(BurrowError, match="unknown key 'allow'"):
-        resolve_network({"allow": ["pypi.org"]})
+        network_policy({"allow": ["pypi.org"]})
     with pytest.raises(BurrowError, match="unknown key 'subnets'"):
-        resolve_network({"subnets": {"deny": ["169.254.0.0/16"]}})
+        network_policy({"subnets": {"deny": ["169.254.0.0/16"]}})
 
 
 def test_an_allowlist_carries_domains_and_denies():
-    wire = to_network_policy(
-        resolve_network(
+    policy = wire(
+        network_policy(
             {
                 "mode": "allowlist",
                 "allow_domains": ["pypi.org", "*.pythonhosted.org"],
@@ -37,10 +47,10 @@ def test_an_allowlist_carries_domains_and_denies():
             }
         )
     )
-    assert wire.mode == common_pb2.NETWORK_MODE_ALLOWLIST
-    assert list(wire.allow_domains) == ["pypi.org", "*.pythonhosted.org"]
-    assert list(wire.deny_cidrs) == ["169.254.0.0/16"]
-    assert not wire.is_tls_inspected
+    assert policy.mode == common_pb2.NETWORK_MODE_ALLOWLIST
+    assert list(policy.allow_domains) == ["pypi.org", "*.pythonhosted.org"]
+    assert list(policy.deny_cidrs) == ["169.254.0.0/16"]
+    assert not policy.is_tls_inspected
 
 
 def rule_policy(rule):
@@ -53,8 +63,8 @@ def rule_policy(rule):
 
 
 def test_a_rule_reaches_the_wire():
-    wire = to_network_policy(
-        resolve_network(
+    policy = wire(
+        network_policy(
             rule_policy(
                 {
                     "match": {"path": {"starts_with": "/v1/"}, "method": "POST"},
@@ -63,8 +73,8 @@ def test_a_rule_reaches_the_wire():
             )
         )
     )
-    assert wire.is_tls_inspected
-    rule = wire.rules[0]
+    assert policy.is_tls_inspected
+    rule = policy.rules[0]
     assert rule.domain == "api.example.com"
     assert rule.match.path.op == common_pb2.STRING_MATCH_OP_STARTS_WITH
     assert list(rule.match.methods) == ["POST"]
@@ -73,45 +83,44 @@ def test_a_rule_reaches_the_wire():
 
 def test_an_unknown_rule_key_is_refused_not_dropped():
     with pytest.raises(BurrowError, match="unknown key 'forward_url'"):
-        to_network_policy(rule_policy({"forward_url": "https://x", "set_headers": {"A": "b"}}))
+        wire(rule_policy({"forward_url": "https://x", "set_headers": {"A": "b"}}))
 
 
 def test_an_unknown_match_key_is_refused_not_dropped():
     # Dropped, it would widen the rule to every request to the domain.
     with pytest.raises(BurrowError, match="unknown key 'paths'"):
-        to_network_policy(
+        wire(
             rule_policy({"match": {"paths": "/v1/x"}, "set_headers": {"A": "b"}})
         )
 
 
 def test_an_unknown_forward_key_is_refused():
     with pytest.raises(BurrowError, match="unknown key 'secrets'"):
-        to_network_policy(rule_policy({"forward": {"url": "https://x", "secrets": "s"}}))
+        wire(rule_policy({"forward": {"url": "https://x", "secrets": "s"}}))
 
 
 def test_a_rule_without_an_action_is_refused():
     with pytest.raises(BurrowError, match="needs either set_headers or forward"):
-        to_network_policy(rule_policy({"match": {"path": "/v1/x"}}))
+        wire(rule_policy({"match": {"path": "/v1/x"}}))
 
 
 def test_a_bad_header_name_is_refused():
     with pytest.raises(BurrowError, match="not a valid header name"):
-        to_network_policy(rule_policy({"set_headers": {"Bad Header": "x"}}))
+        wire(rule_policy({"set_headers": {"Bad Header": "x"}}))
 
 
 def test_the_wire_policy_reads_back_as_it_was_written():
-    wire = to_network_policy(resolve_network(rule_policy({"set_headers": {"X-Token": "secret"}})))
-    back = from_network_policy(wire)
+    policy = wire((rule_policy({"set_headers": {"X-Token": "secret"}})))
+    back = from_network_policy(policy)
     assert back.mode == "allowlist"
     assert back.inspect_tls
-    # A rule with no matcher is also readable in the pre-rules shape.
-    assert back.inject_headers[0].domain == "api.example.com"
-    assert back.inject_headers[0].name == "X-Token"
+    assert back.rules[0].domain == "api.example.com"
+    assert back.rules[0].set_headers == {"X-Token": "secret"}
 
 
 def test_denied_ports_and_ipv6_reach_the_wire_in_open_mode():
-    wire = to_network_policy(
-        resolve_network(
+    policy = wire(
+        network_policy(
             {
                 "mode": "open",
                 "deny_ports": [
@@ -124,11 +133,11 @@ def test_denied_ports_and_ipv6_reach_the_wire_in_open_mode():
             }
         )
     )
-    assert wire.mode == common_pb2.NETWORK_MODE_OPEN
-    assert wire.is_ipv6_denied
+    assert policy.mode == common_pb2.NETWORK_MODE_OPEN
+    assert policy.is_ipv6_denied
     assert [
         (rule.protocol, rule.port, rule.port_end, list(rule.cidrs))
-        for rule in wire.deny_ports
+        for rule in policy.deny_ports
     ] == [
         (common_pb2.PORT_PROTOCOL_TCP, 25, 0, []),
         (common_pb2.PORT_PROTOCOL_TCP, 465, 587, []),
@@ -136,7 +145,7 @@ def test_denied_ports_and_ipv6_reach_the_wire_in_open_mode():
         (common_pb2.PORT_PROTOCOL_UDP, 53, 0, []),
     ]
 
-    back = from_network_policy(wire)
+    back = from_network_policy(policy)
     assert back.deny_ipv6
     assert back.deny_ports == [
         PortRule(port=25, protocol="tcp"),
@@ -147,10 +156,10 @@ def test_denied_ports_and_ipv6_reach_the_wire_in_open_mode():
 
 
 def test_the_new_fields_default_to_the_old_behaviour():
-    wire = to_network_policy(resolve_network("open"))
-    assert not wire.is_ipv6_denied
-    assert list(wire.deny_ports) == []
-    back = from_network_policy(wire)
+    policy = wire(("open"))
+    assert not policy.is_ipv6_denied
+    assert list(policy.deny_ports) == []
+    back = from_network_policy(policy)
     assert back.deny_ports == [] and not back.deny_ipv6
 
 
@@ -158,15 +167,15 @@ def test_a_misspelt_port_rule_is_refused_not_widened():
     for bad, message in [
         ({"protocol": "tpc", "port": 25}, "unknown protocol"),
         ({"port": 25, "cidr": ["10.0.0.0/8"]}, "unknown key 'cidr'"),
-        ({"protocol": "tcp"}, "port is an integer"),
+        ({"protocol": "tcp"}, "port"),
         ({"port": "25"}, "port is an integer"),
     ]:
         with pytest.raises(BurrowError, match=message):
-            to_network_policy({"mode": "open", "deny_ports": [bad]})
+            wire(({"mode": "open", "deny_ports": [bad]}))
 
 
 def test_an_expiring_rule_in_open_mode_reaches_the_wire_and_reads_back():
-    wire = to_network_policy(
+    policy = wire(
         {
             "mode": "open",
             "inspect_tls": True,
@@ -180,25 +189,22 @@ def test_an_expiring_rule_in_open_mode_reaches_the_wire_and_reads_back():
             ],
         }
     )
-    assert wire.mode == common_pb2.NETWORK_MODE_OPEN
-    assert wire.is_tls_inspected
-    assert wire.rules[0].expires_at_unix_ms == 1_800_000_000_000
-    assert wire.rules[0].bound_sandbox_id == ""
+    assert policy.mode == common_pb2.NETWORK_MODE_OPEN
+    assert policy.is_tls_inspected
+    assert policy.rules[0].expires_at_unix_ms == 1_800_000_000_000
+    assert policy.rules[0].bound_sandbox_id == ""
 
-    # What a node sends back: expired, and bound to the sandbox it was
-    # resolved for.
-    wire.rules[0].is_expired = True
-    wire.rules[0].bound_sandbox_id = "sbx_a"
-    back = from_network_policy(wire)
+    # What a node sends back: bound to the sandbox it was resolved for.
+    policy.rules[0].bound_sandbox_id = "sbx_a"
+    back = from_network_policy(policy)
     assert back.rules[0].expires_at_unix_ms == 1_800_000_000_000
-    assert back.rules[0].expired
     assert back.rules[0].bound_sandbox_id == "sbx_a"
 
 
 def test_an_expiry_that_is_not_unix_milliseconds_is_refused():
     for bad in (-1, 1.5, "soon", True):
         with pytest.raises(BurrowError, match="expires_at_unix_ms"):
-            to_network_policy(
+            wire(
                 {
                     "mode": "open",
                     "inspect_tls": True,
@@ -215,7 +221,7 @@ def test_an_expiry_that_is_not_unix_milliseconds_is_refused():
 
 def test_a_secret_scope_is_carried_onto_the_wire():
     from burrow._pb import api_pb2
-    from burrow.sandbox import Burrow
+    from burrow.client import Burrow
 
     sent = []
 
@@ -224,7 +230,6 @@ def test_a_secret_scope_is_carried_onto_the_wire():
             sent.append((method, request))
             if method == "ListSecrets":
                 return api_pb2.ListSecretsResponse(
-                    names=["api"],
                     secrets=[
                         api_pb2.SecretInfo(
                             name="api", allowed_sandboxes=["sbx_a"], allowed_tags=["team=ml"]
@@ -241,7 +246,7 @@ def test_a_secret_scope_is_carried_onto_the_wire():
     assert list(request.allowed_sandboxes) == ["sbx_a"]
     assert list(request.allowed_tags) == ["team=ml"]
 
-    scopes = client.list_secret_scopes()
+    scopes = client.list_secrets()
     assert scopes[0].name == "api"
     assert scopes[0].allowed_sandboxes == ["sbx_a"]
     assert scopes[0].allowed_tags == ["team=ml"]

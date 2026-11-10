@@ -9,6 +9,7 @@ use std::sync::Arc;
 use tokio_stream::{Stream, StreamExt};
 use tonic::{Request, Response, Status};
 
+use burrow_common::hypervisor::{GuestOs, Hypervisor};
 use burrow_proto::api::v1 as api;
 use burrow_proto::api::v1::burrow_server::Burrow;
 use burrow_proto::common::v1 as common;
@@ -796,12 +797,9 @@ impl ApiService {
                     // template need not be on the node.
                     template: String::new(),
                     arch: snapshot.arch.clone(),
-                    firecracker_version: snapshot.firecracker_version.clone(),
+                    hypervisor_version: snapshot.hypervisor_version.clone(),
                     hypervisor: recorded_hypervisor(&snapshot.hypervisor),
-                    disk_bytes: crate::registry::disk_bytes(Some(&common::ResourcePolicy {
-                        scratch_disk_mib: snapshot.scratch_disk_mib,
-                        ..Default::default()
-                    })),
+                    disk_bytes: crate::registry::disk_bytes(snapshot.resources.as_ref()),
                     // A sandbox taking the snapshot's own policy carries
                     // fields the orchestrator never sees, so the node
                     // restoring it elsewhere has to enforce all of them.
@@ -924,7 +922,7 @@ impl ApiService {
             &info,
             &want.arch,
             &want.hypervisor,
-            &want.firecracker_version,
+            &want.hypervisor_version,
         ) {
             return Ok(());
         }
@@ -933,7 +931,7 @@ impl ApiService {
              and the node has {} with {} {}",
             want.arch,
             want.hypervisor,
-            want.firecracker_version,
+            want.hypervisor_version,
             info.arch,
             want.hypervisor,
             crate::registry::version_of(&info, &want.hypervisor),
@@ -1173,7 +1171,7 @@ impl ApiService {
             is_template_transfer_allowed: true,
             node_labels,
             arch: sandbox.arch.clone(),
-            firecracker_version: sandbox.firecracker_version.clone(),
+            hypervisor_version: sandbox.hypervisor_version.clone(),
             hypervisor: recorded_hypervisor(&sandbox.hypervisor),
             policy_features: crate::registry::policy_features(
                 sandbox.policy.as_ref().and_then(|p| p.network.as_ref()),
@@ -1306,7 +1304,7 @@ impl Burrow for ApiService {
         // Refused here as well as on the node: placement charges a node and
         // may replicate a template before the create is ever sent, and none of
         // that should be spent on a request the node will reject anyway.
-        burrow_common::tags::validate(&req.metadata)?;
+        burrow_common::tags::validate(&req.tags)?;
         burrow_common::tags::validate_labels(&req.node_labels)?;
         // A name has to be settled before placement: refusing a duplicate
         // afterwards would mean charging a node for a sandbox that was never
@@ -1322,7 +1320,7 @@ impl Burrow for ApiService {
             let subject = crate::secrets::Subject {
                 id: &sandbox_id,
                 name: &req.name,
-                tags: &req.metadata,
+                tags: &req.tags,
             };
             self.resolve_secret_refs(network, subject).await?;
         }
@@ -1389,7 +1387,7 @@ impl Burrow for ApiService {
                     sandbox_id,
                     template: snapshot.template.clone(),
                     policy: req.policy,
-                    metadata: req.metadata,
+                    tags: req.tags,
                     name: req.name,
                     snapshot: snapshot.id.clone(),
                     kit: None,
@@ -1452,7 +1450,7 @@ impl Burrow for ApiService {
             // widens placement past the hardware the caller asked for.
             node_labels: req.node_labels,
             arch: String::new(),
-            firecracker_version: String::new(),
+            hypervisor_version: String::new(),
             // The template decides, and the node holding it can say which.
             hypervisor: self.template_hypervisor(&template).await?,
             policy_features: crate::registry::policy_features(
@@ -1550,7 +1548,7 @@ impl Burrow for ApiService {
         let subject = crate::secrets::Subject {
             id: &sandbox_id,
             name: &req.name,
-            tags: &req.metadata,
+            tags: &req.tags,
         };
         let credentials = self
             .kit_credentials(&mut client, &node_id, &template, subject)
@@ -1561,7 +1559,7 @@ impl Burrow for ApiService {
                 sandbox_id,
                 template,
                 policy: req.policy,
-                metadata: req.metadata,
+                tags: req.tags,
                 name: req.name,
                 snapshot: String::new(),
                 kit: req.kit,
@@ -1590,7 +1588,7 @@ impl Burrow for ApiService {
         &self,
         req: Request<api::SandboxRef>,
     ) -> Result<Response<common::Sandbox>, Status> {
-        let id = self.resolve(&req.into_inner().id).await;
+        let id = self.resolve(&req.into_inner().sandbox_id).await;
         // Read through beside other replicas: a caller reading back what it
         // just did through one of them must not see the state from before.
         let sandbox = match self.is_replicated() {
@@ -1601,7 +1599,6 @@ impl Burrow for ApiService {
         // The registry holds the last state the node reported, which is a stale
         // guess once that node stops heartbeating.
         sandbox.is_unreachable = !sandbox.node_id.is_empty() && self.is_node_dead(&sandbox.node_id);
-        mark_expired_rules(&mut sandbox);
         Ok(Response::new(sandbox))
     }
 
@@ -1633,7 +1630,6 @@ impl Burrow for ApiService {
         for sandbox in &mut sandboxes {
             sandbox.is_unreachable =
                 !sandbox.node_id.is_empty() && !healthy.contains(&sandbox.node_id);
-            mark_expired_rules(sandbox);
         }
         Ok(Response::new(api::ListSandboxesResponse { sandboxes }))
     }
@@ -1642,7 +1638,7 @@ impl Burrow for ApiService {
         &self,
         req: Request<api::SandboxRef>,
     ) -> Result<Response<api::DeleteSandboxResponse>, Status> {
-        let id = self.resolve(&req.into_inner().id).await;
+        let id = self.resolve(&req.into_inner().sandbox_id).await;
         // Not the cached placement: a move through another replica that
         // failed half way leaves this one naming the node that let go, and
         // the delete would go there and be told no node holds the sandbox.
@@ -1700,7 +1696,7 @@ impl Burrow for ApiService {
         &self,
         req: Request<api::SandboxRef>,
     ) -> Result<Response<common::Sandbox>, Status> {
-        let id = self.resolve(&req.into_inner().id).await;
+        let id = self.resolve(&req.into_inner().sandbox_id).await;
         let mut client = self.node_for(&id).await?;
         let sandbox = client
             .pause_sandbox(nodepb::NodeSandboxRef { sandbox_id: id })
@@ -1715,7 +1711,7 @@ impl Burrow for ApiService {
         &self,
         req: Request<api::SandboxRef>,
     ) -> Result<Response<common::Sandbox>, Status> {
-        let id = self.resolve(&req.into_inner().id).await;
+        let id = self.resolve(&req.into_inner().sandbox_id).await;
         if let Some(sandbox) = self.unplaced(&id).await {
             return Ok(Response::new(
                 self.adopt(sandbox, "", HashMap::new()).await?,
@@ -1734,7 +1730,7 @@ impl Burrow for ApiService {
         &self,
         req: Request<api::SandboxRef>,
     ) -> Result<Response<common::Sandbox>, Status> {
-        let id = self.resolve(&req.into_inner().id).await;
+        let id = self.resolve(&req.into_inner().sandbox_id).await;
         let mut client = self.node_for(&id).await?;
         let sandbox = client
             .stop_sandbox(nodepb::NodeSandboxRef { sandbox_id: id })
@@ -1748,7 +1744,7 @@ impl Burrow for ApiService {
         &self,
         req: Request<api::SandboxRef>,
     ) -> Result<Response<common::Sandbox>, Status> {
-        let id = self.resolve(&req.into_inner().id).await;
+        let id = self.resolve(&req.into_inner().sandbox_id).await;
         if let Some(sandbox) = self.unplaced(&id).await {
             return Ok(Response::new(
                 self.adopt(sandbox, "", HashMap::new()).await?,
@@ -1789,7 +1785,7 @@ impl Burrow for ApiService {
         let subject = crate::secrets::Subject {
             id: &id,
             name: &current.name,
-            tags: &current.metadata,
+            tags: &current.tags,
         };
         let credentials = self
             .kit_credentials(&mut client, &node_id, judged, subject)
@@ -1830,7 +1826,6 @@ impl Burrow for ApiService {
     ) -> Result<Response<api::ListSecretsResponse>, Status> {
         let scoped = self.secrets()?.list_scoped().await.map_err(internal)?;
         Ok(Response::new(api::ListSecretsResponse {
-            names: scoped.iter().map(|(name, _)| name.clone()).collect(),
             secrets: scoped
                 .into_iter()
                 .map(|(name, scope)| api::SecretInfo {
@@ -1863,7 +1858,7 @@ impl Burrow for ApiService {
         &self,
         req: Request<api::SandboxRef>,
     ) -> Result<Response<api::ListSessionsResponse>, Status> {
-        let id = self.resolve(&req.into_inner().id).await;
+        let id = self.resolve(&req.into_inner().sandbox_id).await;
         let mut client = self.node_for(&id).await?;
         let sessions = client
             .list_sessions(nodepb::NodeSandboxRef { sandbox_id: id })
@@ -1877,28 +1872,19 @@ impl Burrow for ApiService {
     /// The node holds the durable record and the reaper that reads it, so the
     /// registry mirror is updated from what the node returns rather than from
     /// the request.
-    async fn update_resources(
+    async fn update_lifetime(
         &self,
-        req: Request<api::UpdateResourcesRequest>,
+        req: Request<api::UpdateLifetimeRequest>,
     ) -> Result<Response<common::Sandbox>, Status> {
         let req = req.into_inner();
-        let id = self
-            .resolve(
-                &req.r#ref
-                    .map(|r| r.id)
-                    .ok_or_else(|| Status::invalid_argument("ref is required"))?,
-            )
-            .await;
+        let id = self.resolve(&req.sandbox_id).await;
         let mut client = self.node_for(&id).await?;
         let sandbox = client
-            .update_resources(nodepb::NodeUpdateResourcesRequest {
+            .update_lifetime(nodepb::NodeUpdateLifetimeRequest {
                 sandbox_id: id,
                 max_lifetime_secs: req.max_lifetime_secs,
                 idle_suspend_secs: req.idle_suspend_secs,
                 suspended_ttl_secs: req.suspended_ttl_secs,
-                vcpus: req.vcpus,
-                mem_mib: req.mem_mib,
-                scratch_disk_mib: req.scratch_disk_mib,
             })
             .await?
             .into_inner();
@@ -1917,13 +1903,7 @@ impl Burrow for ApiService {
         req: Request<api::ForkSandboxRequest>,
     ) -> Result<Response<common::Sandbox>, Status> {
         let mut req = req.into_inner();
-        let source_id = self
-            .resolve(
-                &req.r#ref
-                    .map(|r| r.id)
-                    .ok_or_else(|| Status::invalid_argument("ref is required"))?,
-            )
-            .await;
+        let source_id = self.resolve(&req.sandbox_id).await;
         let node_id = self.node_of(&source_id)?;
         // A fork has no placement decision to constrain: the child is built
         // where its source's state is, so labels are checked against that node
@@ -1943,7 +1923,7 @@ impl Burrow for ApiService {
                 .0
                 .sandboxes
                 .get(&source_id)
-                .map(|source| source.metadata)
+                .map(|source| source.tags)
                 .unwrap_or_default();
             let subject = crate::secrets::Subject {
                 id: &child_id,
@@ -1997,9 +1977,7 @@ impl Burrow for ApiService {
     ) -> Result<Response<common::Sandbox>, Status> {
         let req = req.into_inner();
         burrow_common::tags::validate_labels(&req.node_labels)?;
-        let id = self
-            .resolve(&req.r#ref.map(|r| r.id).unwrap_or_default())
-            .await;
+        let id = self.resolve(&req.sandbox_id).await;
         // Read from the store rather than the cache: the sandbox may have
         // moved through another replica in the last second.
         let mut current = self
@@ -2032,7 +2010,7 @@ impl Burrow for ApiService {
         }
         if current.arch.is_empty() {
             let info = self.0.nodes.info(&source).unwrap_or_default();
-            current.firecracker_version =
+            current.hypervisor_version =
                 crate::registry::version_of(&info, &current.hypervisor).to_string();
             current.arch = info.arch;
         }
@@ -2084,7 +2062,7 @@ impl Burrow for ApiService {
         });
         if released.arch.is_empty() {
             released.arch = current.arch;
-            released.firecracker_version = current.firecracker_version;
+            released.hypervisor_version = current.hypervisor_version;
         }
         tracing::info!(sandbox = id, node = source, "sandbox released for a move");
         let moved = match self.adopt(released.clone(), &target, req.node_labels).await {
@@ -2102,13 +2080,7 @@ impl Burrow for ApiService {
         req: Request<api::CreateSnapshotRequest>,
     ) -> Result<Response<common::Snapshot>, Status> {
         let req = req.into_inner();
-        let sandbox_id = self
-            .resolve(
-                &req.r#ref
-                    .map(|r| r.id)
-                    .ok_or_else(|| Status::invalid_argument("ref is required"))?,
-            )
-            .await;
+        let sandbox_id = self.resolve(&req.sandbox_id).await;
         let node_id = self.node_of(&sandbox_id)?;
         // The orchestrator owns the id namespace, here as everywhere else.
         let snapshot_id = burrow_common::SnapshotId::generate().to_string();
@@ -2144,7 +2116,7 @@ impl Burrow for ApiService {
         &self,
         req: Request<api::ListSnapshotsRequest>,
     ) -> Result<Response<api::ListSnapshotsResponse>, Status> {
-        let sandbox = req.into_inner().sandbox;
+        let sandbox = req.into_inner().sandbox_id;
         let sandbox = if sandbox.is_empty() {
             None
         } else {
@@ -2263,7 +2235,7 @@ impl Burrow for ApiService {
             is_template_transfer_allowed: true,
             node_labels: req.node_labels.clone(),
             arch: String::new(),
-            firecracker_version: String::new(),
+            hypervisor_version: String::new(),
             hypervisor: String::new(),
             policy_features: Vec::new(),
         };
@@ -2350,13 +2322,7 @@ impl Burrow for ApiService {
         req: Request<api::UpdateTagsRequest>,
     ) -> Result<Response<common::Sandbox>, Status> {
         let req = req.into_inner();
-        let id = self
-            .resolve(
-                &req.r#ref
-                    .map(|r| r.id)
-                    .ok_or_else(|| Status::invalid_argument("ref is required"))?,
-            )
-            .await;
+        let id = self.resolve(&req.sandbox_id).await;
         burrow_common::tags::validate(&req.tags)?;
         let mut client = self.node_for(&id).await?;
         let sandbox = client
@@ -2380,13 +2346,7 @@ impl Burrow for ApiService {
         req: Request<api::UpdateAccessPolicyRequest>,
     ) -> Result<Response<common::Sandbox>, Status> {
         let req = req.into_inner();
-        let id = self
-            .resolve(
-                &req.r#ref
-                    .map(|r| r.id)
-                    .ok_or_else(|| Status::invalid_argument("ref is required"))?,
-            )
-            .await;
+        let id = self.resolve(&req.sandbox_id).await;
         let mut client = self.node_for(&id).await?;
         let sandbox = client
             .update_access_policy(nodepb::NodeUpdateAccessRequest {
@@ -2410,13 +2370,7 @@ impl Burrow for ApiService {
         req: Request<api::UpdateNetworkPolicyRequest>,
     ) -> Result<Response<common::Sandbox>, Status> {
         let req = req.into_inner();
-        let id = self
-            .resolve(
-                &req.r#ref
-                    .map(|r| r.id)
-                    .ok_or_else(|| Status::invalid_argument("ref is required"))?,
-            )
-            .await;
+        let id = self.resolve(&req.sandbox_id).await;
         let mut network = req
             .network
             .ok_or_else(|| Status::invalid_argument("network is required"))?;
@@ -2424,7 +2378,7 @@ impl Burrow for ApiService {
         let subject = crate::secrets::Subject {
             id: &id,
             name: &current.name,
-            tags: &current.metadata,
+            tags: &current.tags,
         };
         self.resolve_secret_refs(&mut network, subject).await?;
         self.require_policy_features(&current.node_id, Some(&network))?;
@@ -2572,7 +2526,7 @@ impl Burrow for ApiService {
         &self,
         req: Request<api::SandboxRef>,
     ) -> Result<Response<api::ListPortsResponse>, Status> {
-        let id = self.resolve(&req.into_inner().id).await;
+        let id = self.resolve(&req.into_inner().sandbox_id).await;
         let node_id = self.node_of(&id)?;
         let mut client = self.node_for(&id).await?;
         let mut resp = client
@@ -2617,7 +2571,7 @@ impl Burrow for ApiService {
         &self,
         req: Request<api::SandboxRef>,
     ) -> Result<Response<api::Share>, Status> {
-        let id = self.resolve(&req.into_inner().id).await;
+        let id = self.resolve(&req.into_inner().sandbox_id).await;
         let mut client = self.node_for(&id).await?;
         Ok(Response::new(
             client
@@ -2631,7 +2585,7 @@ impl Burrow for ApiService {
         &self,
         req: Request<api::SandboxRef>,
     ) -> Result<Response<api::UnshareResponse>, Status> {
-        let id = self.resolve(&req.into_inner().id).await;
+        let id = self.resolve(&req.into_inner().sandbox_id).await;
         let mut client = self.node_for(&id).await?;
         Ok(Response::new(
             client
@@ -2673,8 +2627,7 @@ impl Burrow for ApiService {
             events.extend(page.into_inner().events);
         }
 
-        // Timestamps are RFC 3339, which sorts lexically.
-        events.sort_by(|a, b| b.at.cmp(&a.at));
+        events.sort_by_key(|event| std::cmp::Reverse(event.at_unix_ms));
         events.truncate(limit);
 
         Ok(Response::new(Box::pin(tokio_stream::iter(
@@ -2694,10 +2647,10 @@ impl Burrow for ApiService {
             .store
             .as_ref()
             .ok_or_else(|| Status::unavailable("the usage ledger needs a store"))?;
-        let sandbox = if req.sandbox.is_empty() {
+        let sandbox = if req.sandbox_id.is_empty() {
             None
         } else {
-            Some(self.resolve(&req.sandbox).await)
+            Some(self.resolve(&req.sandbox_id).await)
         };
         let resp = crate::ledger::query(store, &req, sandbox)
             .await
@@ -2714,10 +2667,10 @@ impl Burrow for ApiService {
         req: Request<api::TailEventsRequest>,
     ) -> Result<Response<Self::TailEventsStream>, Status> {
         let req = req.into_inner();
-        let sandbox = if req.sandbox.is_empty() {
+        let sandbox = if req.sandbox_id.is_empty() {
             None
         } else {
-            Some(self.resolve(&req.sandbox).await)
+            Some(self.resolve(&req.sandbox_id).await)
         };
         let limit = if req.limit == 0 {
             1000
@@ -2830,67 +2783,6 @@ impl Burrow for ApiService {
         Ok(Response::new(Box::pin(responses)))
     }
 
-    async fn upload_file(
-        &self,
-        req: Request<tonic::Streaming<api::FileChunk>>,
-    ) -> Result<Response<api::UploadResult>, Status> {
-        let mut inbound = req.into_inner();
-        let first = inbound
-            .next()
-            .await
-            .transpose()?
-            .ok_or_else(|| Status::invalid_argument("upload stream was empty"))?;
-
-        // Only the first chunk names the sandbox, so this is the one place the
-        // reference can be turned into the id the node expects.
-        let mut first = first;
-        first.sandbox_id = self.resolve(&first.sandbox_id).await;
-        let mut client = self.node_for(&first.sandbox_id).await?;
-
-        // tonic's client streaming takes messages, not results, so a failed
-        // read from the caller cannot be forwarded down the stream, and ending
-        // it quietly is what the node reads as a complete upload. The error is
-        // parked here instead and becomes this RPC's own failure.
-        let failed: Arc<std::sync::Mutex<Option<Status>>> = Arc::default();
-        let sink = Arc::clone(&failed);
-        let outbound = async_stream::stream! {
-            yield first;
-            while let Some(chunk) = inbound.next().await {
-                match chunk {
-                    Ok(chunk) => yield chunk,
-                    Err(err) => {
-                        *sink.lock().unwrap() = Some(err);
-                        break;
-                    }
-                }
-            }
-        };
-        let result = client.upload_file(outbound).await;
-        if let Some(err) = failed.lock().unwrap().take() {
-            return Err(Status::new(
-                err.code(),
-                format!(
-                    "the upload was cut short, leaving a partial file: {}",
-                    err.message()
-                ),
-            ));
-        }
-        Ok(Response::new(result?.into_inner()))
-    }
-
-    type DownloadFileStream = BoxStream<api::FileChunk>;
-
-    async fn download_file(
-        &self,
-        req: Request<api::DownloadRequest>,
-    ) -> Result<Response<Self::DownloadFileStream>, Status> {
-        let mut req = req.into_inner();
-        req.sandbox_id = self.resolve(&req.sandbox_id).await;
-        let mut client = self.node_for(&req.sandbox_id).await?;
-        let stream = client.download_file(req).await?.into_inner();
-        Ok(Response::new(Box::pin(stream)))
-    }
-
     type WatchStream = BoxStream<api::WatchEvent>;
 
     async fn watch(
@@ -2904,16 +2796,6 @@ impl Burrow for ApiService {
         // the client ends it by dropping the stream.
         let stream = client.watch(req).await?.into_inner();
         Ok(Response::new(Box::pin(stream)))
-    }
-
-    async fn list_dir(
-        &self,
-        req: Request<api::ListDirRequest>,
-    ) -> Result<Response<api::ListDirResponse>, Status> {
-        let mut req = req.into_inner();
-        req.sandbox_id = self.resolve(&req.sandbox_id).await;
-        let mut client = self.node_for(&req.sandbox_id).await?;
-        Ok(Response::new(client.list_dir(req).await?.into_inner()))
     }
 
     async fn fs(&self, req: Request<api::FsRequest>) -> Result<Response<api::FsResponse>, Status> {
@@ -2963,9 +2845,7 @@ impl Burrow for ApiService {
         let signer = self.0.access.as_ref().ok_or_else(|| {
             Status::failed_precondition("this orchestrator has no key to sign access tokens with")
         })?;
-        let id = self
-            .resolve(&req.r#ref.map(|r| r.id).unwrap_or_default())
-            .await;
+        let id = self.resolve(&req.sandbox_id).await;
         let node_id = self.placed_on(&id).await?;
         let endpoint = self
             .0
@@ -3020,9 +2900,9 @@ impl Burrow for ApiService {
         Ok(Response::new(api::AccessGrant {
             endpoint,
             token,
-            expires_at: claims.exp as i64,
             node_id,
             sandbox_id: claims.sub,
+            expires_at_unix_ms: claims.exp as i64 * 1000,
         }))
     }
 
@@ -3030,24 +2910,19 @@ impl Burrow for ApiService {
         &self,
         req: Request<api::SandboxRef>,
     ) -> Result<Response<api::RevokeAccessResponse>, Status> {
-        let id = self.resolve(&req.into_inner().id).await;
+        let id = self.resolve(&req.into_inner().sandbox_id).await;
         // By the clock tokens are issued by, so a token issued a moment after
         // this, in the same second, is told apart from one issued before.
         let revoked_at_ms = burrow_common::unix_now_ms();
         // A sandbox no node holds has no sessions to end, and its tokens are
         // refused by whichever node adopts it, which is handed this record.
         if let Some(mut sandbox) = self.unplaced(&id).await {
-            let revoked_at_ms = revoked_at_ms.max(burrow_common::access::revoked_before_ms(
-                sandbox.access_revoked_at,
-                sandbox.access_revoked_at_ms,
-            ));
-            sandbox.access_revoked_at = revoked_at_ms / 1000;
+            let revoked_at_ms = revoked_at_ms.max(sandbox.access_revoked_at_ms);
             sandbox.access_revoked_at_ms = revoked_at_ms;
             self.0.sandboxes.insert(sandbox);
             self.write_through().await;
             tracing::info!(sandbox = id, revoked_at_ms, "access tokens revoked");
             return Ok(Response::new(api::RevokeAccessResponse {
-                revoked_at: revoked_at_ms / 1000,
                 ended_sessions: 0,
                 revoked_at_ms,
                 killed_commands: 0,
@@ -3193,7 +3068,7 @@ impl Burrow for ApiService {
 /// on a Mac, which is a node offering vz.
 fn build_placement(req: &api::BuildTemplateRequest) -> crate::registry::Placement {
     let hypervisor = match (req.hypervisor.as_str(), req.from_ipsw.is_empty()) {
-        ("", false) => "vz",
+        ("", false) => Hypervisor::Vz.as_str(),
         (hypervisor, _) => hypervisor,
     };
     let is_on_base = req.from_image.is_empty() && req.kits.is_empty() && req.from_ipsw.is_empty();
@@ -3227,10 +3102,7 @@ pub(crate) fn placement_status(err: crate::registry::PlacementError) -> Status {
 /// A record's hypervisor, for placement. Empty is a record from before the
 /// field existed, which ran under Firecracker.
 fn recorded_hypervisor(name: &str) -> String {
-    match name {
-        "" => "firecracker".to_string(),
-        name => name.to_string(),
-    }
+    Hypervisor::from_record(name).map_or_else(|| name.to_string(), |h| h.to_string())
 }
 
 /// The hypervisor a template's `image.json` records: the one it was built
@@ -3239,8 +3111,10 @@ fn configured_hypervisor(image_config: &str) -> String {
     let config: serde_json::Value = serde_json::from_str(image_config).unwrap_or_default();
     match config["hypervisor"].as_str() {
         Some(name) if !name.is_empty() => name.to_string(),
-        _ if config["guest_os"] == "windows" => "cloud-hypervisor".to_string(),
-        _ => "firecracker".to_string(),
+        _ => GuestOs::from_record(config["guest_os"].as_str().unwrap_or_default())
+            .unwrap_or_default()
+            .default_hypervisor()
+            .to_string(),
     }
 }
 
@@ -3318,23 +3192,6 @@ fn apply_secrets(
         }
     }
     Ok(())
-}
-
-/// Marks the rules past their expiry now. The registry holds the policy as
-/// the node last returned it, so a rule that expired since then would read
-/// as live.
-fn mark_expired_rules(sandbox: &mut common::Sandbox) {
-    let now_ms = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map_or(0, |d| d.as_millis() as u64);
-    let rules = sandbox
-        .policy
-        .iter_mut()
-        .flat_map(|p| p.network.iter_mut())
-        .flat_map(|n| n.rules.iter_mut());
-    for rule in rules {
-        rule.is_expired = rule.expires_at_unix_ms != 0 && rule.expires_at_unix_ms <= now_ms;
-    }
 }
 
 fn internal(err: anyhow::Error) -> Status {
@@ -3616,7 +3473,7 @@ mod tests {
 
         let err = api
             .move_sandbox(Request::new(api::MoveSandboxRequest {
-                r#ref: Some(api::SandboxRef { id: "sbx_a".into() }),
+                sandbox_id: "sbx_a".into(),
                 node_id: "node2".into(),
                 ..Default::default()
             }))
@@ -3633,7 +3490,7 @@ mod tests {
         // source, which a test has no way to reach.
         let err = api
             .move_sandbox(Request::new(api::MoveSandboxRequest {
-                r#ref: Some(api::SandboxRef { id: "sbx_a".into() }),
+                sandbox_id: "sbx_a".into(),
                 node_id: "node3".into(),
                 ..Default::default()
             }))
@@ -3651,7 +3508,7 @@ mod tests {
         api.0.sandboxes.insert(inspected("sbx_a", "node1", "aaaa"));
         let err = api
             .move_sandbox(Request::new(api::MoveSandboxRequest {
-                r#ref: Some(api::SandboxRef { id: "sbx_a".into() }),
+                sandbox_id: "sbx_a".into(),
                 ..Default::default()
             }))
             .await
@@ -3711,7 +3568,9 @@ mod tests {
         mover.writer().unwrap().flush().await;
 
         let err = replica(stale)
-            .delete_sandbox(Request::new(api::SandboxRef { id: "sbx_a".into() }))
+            .delete_sandbox(Request::new(api::SandboxRef {
+                sandbox_id: "sbx_a".into(),
+            }))
             .await
             .expect_err("no node to purge through in a test");
         // The purge is what fails here, for want of a node to reach the store
@@ -3863,28 +3722,6 @@ mod tests {
                 .code(),
             tonic::Code::FailedPrecondition
         );
-    }
-
-    #[test]
-    fn a_rule_past_its_expiry_reads_as_expired() {
-        let rule = |expires_at_unix_ms| common::RequestRule {
-            expires_at_unix_ms,
-            ..brokering("api.example.com", "Bearer t")
-        };
-        let mut sandbox = common::Sandbox {
-            policy: Some(common::Policy {
-                network: Some(common::NetworkPolicy {
-                    rules: vec![rule(1), rule(u64::MAX), rule(0)],
-                    ..Default::default()
-                }),
-                ..Default::default()
-            }),
-            ..Default::default()
-        };
-        mark_expired_rules(&mut sandbox);
-        let rules = &sandbox.policy.unwrap().network.unwrap().rules;
-        let expired: Vec<bool> = rules.iter().map(|r| r.is_expired).collect();
-        assert_eq!(expired, vec![true, false, false]);
     }
 
     #[test]

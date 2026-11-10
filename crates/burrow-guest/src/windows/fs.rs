@@ -137,7 +137,7 @@ fn run(op: Op, user: String, limits: &Limits) -> R<Outcome> {
                     .map_err(io)?
                     .into_iter()
                     .map(|entry| guestpb::FsDirEntry {
-                        r#type: mode::entry_type(entry.attributes, entry.reparse_tag).into(),
+                        r#type: mode::entry_type(entry.attributes, entry.reparse_tag) as i32,
                         name: entry.name,
                     })
                     .collect(),

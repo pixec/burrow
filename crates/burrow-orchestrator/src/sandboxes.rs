@@ -633,7 +633,7 @@ impl SandboxRegistry {
                 sandbox.node_id.clear();
                 if sandbox.arch.is_empty() {
                     sandbox.arch = info.arch.clone();
-                    sandbox.firecracker_version =
+                    sandbox.hypervisor_version =
                         crate::registry::version_of(info, &sandbox.hypervisor).to_string();
                 }
                 unplaced.push(sandbox.clone());
@@ -1033,7 +1033,7 @@ impl SandboxRegistry {
             .unwrap()
             .values()
             .filter(|sandbox| match tag {
-                Some((key, value)) => sandbox.metadata.get(key).is_some_and(|held| held == value),
+                Some((key, value)) => sandbox.tags.get(key).is_some_and(|held| held == value),
                 None => true,
             })
             .cloned()
@@ -1417,7 +1417,7 @@ mod tests {
         common::Sandbox {
             id: id.into(),
             node_id: "node1".into(),
-            metadata: pairs
+            tags: pairs
                 .iter()
                 .map(|(k, v)| ((*k).to_string(), (*v).to_string()))
                 .collect(),
@@ -1587,7 +1587,7 @@ mod tests {
             "node1",
             &common::NodeInfo {
                 arch: "x86_64".into(),
-                firecracker_version: "1.16.1".into(),
+                hypervisor_versions: [("firecracker".to_string(), "1.16.1".to_string())].into(),
                 ..Default::default()
             },
         );
@@ -1596,7 +1596,7 @@ mod tests {
         let kept = registry.get("a").expect("kept unplaced");
         assert_eq!(kept.node_id, "");
         assert_eq!(
-            (kept.arch.as_str(), kept.firecracker_version.as_str()),
+            (kept.arch.as_str(), kept.hypervisor_version.as_str()),
             ("x86_64", "1.16.1")
         );
         assert!(registry.reserve("", "web").is_err(), "the name stays held");

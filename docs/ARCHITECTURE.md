@@ -1289,7 +1289,7 @@ exec, file transfer and watch, and not from the guest's own activity, because a
 background job nobody is watching is exactly what the policy exists to reclaim.
 The orchestrator's own bookkeeping deliberately does not count.
 
-All three are movable on a running sandbox through `UpdateResources`. One RPC
+All three are movable on a running sandbox through `UpdateLifetime`. One RPC
 rather than an `ExtendLifetime` taking a single number, because all three answer
 the same question, how long the sandbox stays paid for, and are read by the same
 reaper on the same pass. Each arrives as an optional field so that `0` keeps
@@ -1652,8 +1652,7 @@ burrowd serve ... --access-advertise https://node-a.example.com:7073 \
 
 A client calls `IssueAccess` on the orchestrator and gets back the node's
 endpoint, the sandbox's id and a token, then calls the node's `Access` service:
-`Exec`, `Attach`, `UploadFile`, `DownloadFile`, `ListDir` and `Watch`, the same
-calls the orchestrator relays. Nothing else the node serves accepts the token,
+`Exec`, `Attach`, `Fs` and `Watch`, the same calls the orchestrator relays. Nothing else the node serves accepts the token,
 and the node API keeps requiring the node token. The SDKs reuse a token until it
 nears expiry. The endpoint `--access-advertise` names has to be routable from
 wherever direct clients run.

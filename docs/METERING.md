@@ -88,7 +88,7 @@ PostgreSQL, one row per stretch a sandbox spent in one state at one shape:
 | Column | Meaning |
 | --- | --- |
 | `id` | Row id, ascending in the order rows were written |
-| `sandbox_id`, `node_id`, `template`, `metadata` | What was running, where, and its tags, copied so a grouping survives the sandbox |
+| `sandbox_id`, `node_id`, `template`, `tags` | What was running, where, and its tags, copied so a grouping survives the sandbox |
 | `state`, `vcpus`, `mem_mib` | What was being consumed: `running`, `suspended` or `stopped`, at that shape |
 | `started_at`, `ended_at` | The interval, unix milliseconds |
 | `cpu_usage_usec`, `rx_bytes`, `tx_bytes` | Usage inside the interval, as the difference of the totals at its two bounds |
@@ -111,7 +111,7 @@ read.
 
 Usage is grouped by whatever the sandbox was tagged with. Metadata set on
 create, `team=search` or `job=nightly-build`, is copied onto every event and
-every ledger row, so `burrow usage --group-by team` works for sandboxes that
+every ledger row, so `burrow usage --group-by tag:team` works for sandboxes that
 no longer exist and a tag changed later never rewrites history. Nothing else
 identifies a sandbox's owner; the tags are the attribution.
 
@@ -184,7 +184,7 @@ intervals or their sums per group and state. `burrow usage` is the CLI over
 it, and the SDKs have `usage()`:
 
 ```sh
-burrow usage --from 2026-10-01 --to 2026-11-01 --group-by team
+burrow usage --from 2026-10-01 --to 2026-11-01 --group-by tag:team
 burrow usage --sandbox build-env
 ```
 
@@ -240,7 +240,7 @@ they read:
 At month end the provider pulls everything for the customer:
 
 ```sh
-burrow usage --from 2026-10-01 --to 2026-11-01 --group-by customer --format json
+burrow usage --from 2026-10-01 --to 2026-11-01 --group-by tag:customer --format json
 ```
 
 and applies its own rate card to the sums, for example:
@@ -279,7 +279,7 @@ are `burrow.sandbox.cpu_usec`, `burrow.sandbox.rx_bytes` and
 ledger is built from, and `burrow.sandbox.mem_mib`, a gauge of the memory a
 running VM holds, 0 while it is suspended or stopped. There is one point per
 sandbox per reaper tick, ten seconds, each carrying `sandbox_id`, `template`,
-`node_id` and every metadata tag as attributes; a tag of one of those three
+`node_id` and every tag as attributes; a tag of one of those three
 names does not replace it.
 
 A collector that keeps them in Prometheus:

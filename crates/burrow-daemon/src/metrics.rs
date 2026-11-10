@@ -16,7 +16,7 @@ use opentelemetry::KeyValue;
 pub struct Reading {
     pub sandbox_id: String,
     pub template: String,
-    pub metadata: HashMap<String, String>,
+    pub tags: HashMap<String, String>,
     pub cpu_usage_usec: u64,
     pub rx_bytes: u64,
     pub tx_bytes: u64,
@@ -29,7 +29,7 @@ impl Reading {
     /// then the fixed ones, which a tag of the same name does not replace.
     fn attributes(&self, node_id: &str) -> Vec<KeyValue> {
         let mut attributes: Vec<KeyValue> = self
-            .metadata
+            .tags
             .iter()
             .filter(|(key, _)| !matches!(key.as_str(), "sandbox_id" | "template" | "node_id"))
             .map(|(key, value)| KeyValue::new(key.clone(), value.clone()))
@@ -97,7 +97,7 @@ mod tests {
         let reading = Reading {
             sandbox_id: "sbx_1".into(),
             template: "alpine".into(),
-            metadata: HashMap::from([
+            tags: HashMap::from([
                 ("customer".into(), "acme".into()),
                 ("template".into(), "spoofed".into()),
             ]),

@@ -1,31 +1,46 @@
 """Python SDK for burrow: Firecracker microVM sandboxes for untrusted code."""
 
+from subprocess import CompletedProcess
+
+from ._fileio import FileIO
+from ._os import DirEntry
+from ._pathlib import SandboxPath
+from ._subprocess import Popen
+from .client import Burrow
 from .errors import BurrowError
-from .sandbox import Burrow, Sandbox, Watcher
+from .sandbox import Sandbox, Watcher
 from .snapshot import Snapshot
-from .template import Template, TemplateBuilder, default_build_logger
+from .template import BuildLogEvent, Template, TemplateBuilder, default_build_logger
 from .terminal import Terminal
 from .types import (
     AuditEvent,
+    BuiltTemplate,
     CommandInfo,
+    DeletedGroup,
+    DeletedUser,
+    DiskCapacity,
+    DrainResult,
     ExecPolicy,
     FsPolicy,
     GuestGroup,
     GuestUser,
-    HeaderInjection,
+    Health,
     LifecycleEvent,
+    LifetimePolicy,
     NetworkMembership,
     NetworkPolicy,
     NodeInfo,
     PortMapping,
     PortRule,
+    PrunedCommands,
     RequestRule,
-    SecretInfo,
-    Share,
     ResourcePolicy,
     SandboxInfo,
     SandboxPolicy,
+    SecretInfo,
     Session,
+    Share,
+    SnapshotPolicy,
     TemplateInfo,
     Usage,
     UsageInterval,
@@ -38,29 +53,43 @@ from .volume import Volume
 
 __all__ = [
     "AuditEvent",
+    "BuildLogEvent",
+    "BuiltTemplate",
     "Burrow",
     "BurrowError",
     "CommandInfo",
+    "CompletedProcess",
+    "DeletedGroup",
+    "DeletedUser",
+    "DirEntry",
+    "DiskCapacity",
+    "DrainResult",
     "ExecPolicy",
+    "FileIO",
     "FsPolicy",
     "GuestGroup",
     "GuestUser",
-    "HeaderInjection",
+    "Health",
     "LifecycleEvent",
+    "LifetimePolicy",
     "NetworkMembership",
     "NetworkPolicy",
     "NodeInfo",
+    "Popen",
     "PortMapping",
     "PortRule",
+    "PrunedCommands",
     "RequestRule",
-    "SecretInfo",
     "ResourcePolicy",
     "Sandbox",
     "SandboxInfo",
+    "SandboxPath",
     "SandboxPolicy",
+    "SecretInfo",
     "Session",
     "Share",
     "Snapshot",
+    "SnapshotPolicy",
     "Template",
     "TemplateBuilder",
     "TemplateInfo",

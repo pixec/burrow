@@ -547,13 +547,17 @@ fn watch_blocking(
             };
             let path = crate::paths::windows::join(root, &String::from_utf16_lossy(name));
             let kind = match record.Action {
-                FILE_ACTION_ADDED | FILE_ACTION_RENAMED_NEW_NAME => "created",
-                FILE_ACTION_REMOVED | FILE_ACTION_RENAMED_OLD_NAME => "deleted",
-                FILE_ACTION_MODIFIED => "modified",
-                _ => "",
+                FILE_ACTION_ADDED | FILE_ACTION_RENAMED_NEW_NAME => {
+                    guestpb::WatchEventKind::Created
+                }
+                FILE_ACTION_REMOVED | FILE_ACTION_RENAMED_OLD_NAME => {
+                    guestpb::WatchEventKind::Deleted
+                }
+                FILE_ACTION_MODIFIED => guestpb::WatchEventKind::Modified,
+                _ => guestpb::WatchEventKind::Unspecified,
             };
-            if !kind.is_empty() {
-                let is_dir = if kind == "deleted" {
+            if kind != guestpb::WatchEventKind::Unspecified {
+                let is_dir = if kind == guestpb::WatchEventKind::Deleted {
                     dirs.remove(&path.to_lowercase())
                 } else {
                     let is_dir = std::path::Path::new(&crate::paths::windows::long(&path)).is_dir();
@@ -565,7 +569,7 @@ fn watch_blocking(
                 // A directory's own write time changes with every entry made
                 // in it; Linux's poll reports that as a modification too.
                 let event = guestpb::WatchEvent {
-                    r#type: kind.into(),
+                    kind: kind as i32,
                     path,
                     is_dir,
                 };

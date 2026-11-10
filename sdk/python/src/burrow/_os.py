@@ -17,6 +17,7 @@ import time
 from typing import TYPE_CHECKING, Any, Dict, Iterator, List, Optional
 
 from ._pb import api_pb2
+from ._wire import label
 
 if TYPE_CHECKING:
     from .sandbox import Sandbox
@@ -90,6 +91,10 @@ def to_stat_result(raw: api_pb2.FsStatResult) -> os.stat_result:
 def _to_ns(seconds: float) -> int:
     whole = math.floor(seconds)
     return int(whole) * 10**9 + math.floor((seconds - whole) * 1e9)
+
+
+def _kind(file_type: int) -> str:
+    return label(api_pb2.FileType, file_type, "FILE_TYPE_") or "unknown"
 
 
 class DirEntry:
@@ -303,7 +308,7 @@ class SandboxOs:
         top = fspath(path)
         res = self._fs(read_dir=api_pb2.FsReadDir(path=top))
         return _ScandirIterator(
-            DirEntry(self, top, entry.name, entry.type) for entry in res.entries.entries
+            DirEntry(self, top, entry.name, _kind(entry.type)) for entry in res.entries.entries
         )
 
     def walk(

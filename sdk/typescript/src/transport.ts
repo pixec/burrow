@@ -372,8 +372,7 @@ export class Transport {
 interface Grant {
   endpoint: string;
   token: string;
-  /** Unix seconds. */
-  expiresAt: number;
+  expiresAtUnixMs: number;
   sandboxId: string;
 }
 
@@ -400,11 +399,11 @@ export class Direct {
     const held = this.grant;
     if (!renew && held) {
       return held.then((grant) =>
-        grant.expiresAt * 1000 - Date.now() < GRANT_MARGIN_MS ? this.current(true) : grant,
+        grant.expiresAtUnixMs - Date.now() < GRANT_MARGIN_MS ? this.current(true) : grant,
       );
     }
     const issued = this.transport
-      .unary<any, Grant>("IssueAccess", { ref: { id: this.sandboxId } })
+      .unary<any, Grant>("IssueAccess", { sandboxId: this.sandboxId })
       .catch((err) => {
         // A failed issue is not kept, so the next call asks again.
         if (this.grant === issued) this.grant = undefined;

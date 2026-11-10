@@ -5,14 +5,15 @@ import assert from "node:assert/strict";
 import { open as hostOpen } from "node:fs/promises";
 import { test } from "node:test";
 
-import { BurrowError, Sandbox } from "../dist/index.js";
+import { BurrowError } from "../dist/index.js";
+import { fakeSandbox } from "./helpers.mjs";
 
 /**
  * A sandbox whose node answers every `Fs` call with `answer(op, body)`, and
  * records what was asked. `answer` returns the response's oneof as
  * `{ [tag]: value }`, the way proto-loader decodes it.
  */
-function fsSandbox(answer, { download } = {}) {
+function fsSandbox(answer) {
   const calls = [];
   const node = {
     async unary(method, request) {
@@ -22,16 +23,8 @@ function fsSandbox(answer, { download } = {}) {
       const [result, value] = Object.entries(await answer(op, request[op]))[0];
       return { result, [result]: value };
     },
-    async *serverStream(method, request) {
-      assert.equal(method, "DownloadFile");
-      calls.push({ op: "download", body: request });
-      yield* download(request.path);
-    },
   };
-  const sandbox = Sandbox.adopt(
-    { route: () => node },
-    { id: "sbx_test", state: "SANDBOX_STATE_RUNNING" },
-  );
+  const sandbox = fakeSandbox({ route: () => node });
   return { sandbox, calls };
 }
 
@@ -204,10 +197,10 @@ test("readdir with file types returns Dirents, and stats what d_type left unknow
       return {
         entries: {
           entries: [
-            { name: "a.txt", type: "file" },
-            { name: "src", type: "dir" },
-            { name: "link", type: "symlink" },
-            { name: "pipe", type: "unknown" },
+            { name: "a.txt", type: "FILE_TYPE_FILE" },
+            { name: "src", type: "FILE_TYPE_DIR" },
+            { name: "link", type: "FILE_TYPE_SYMLINK" },
+            { name: "pipe", type: "FILE_TYPE_UNSPECIFIED" },
           ],
         },
       };
@@ -235,8 +228,8 @@ test("readdir with file types returns Dirents, and stats what d_type left unknow
 
 test("a recursive readdir names entries by their path below the root", async () => {
   const tree = {
-    "/w": [{ name: "a", type: "dir" }, { name: "f", type: "file" }],
-    "/w/a": [{ name: "g", type: "file" }],
+    "/w": [{ name: "a", type: "FILE_TYPE_DIR" }, { name: "f", type: "FILE_TYPE_FILE" }],
+    "/w/a": [{ name: "g", type: "FILE_TYPE_FILE" }],
   };
   const { sandbox } = fsSandbox((_op, body) => ({ entries: { entries: tree[body.path] } }));
   assert.deepEqual(await sandbox.fs.readdir("/w", { recursive: true }), ["a", "f", "a/g"]);
@@ -295,27 +288,3 @@ test("utimes takes Dates, seconds and numeric strings", async () => {
   });
 });
 
-test("readFile streams the whole file in one call", async () => {
-  const { sandbox, calls } = fsSandbox(() => assert.fail("no Fs call expected"), {
-    async *download() {
-      yield { data: Buffer.from("hello ") };
-      yield { data: Buffer.from("world") };
-    },
-  });
-  assert.equal(await sandbox.fs.readFile("/f", "utf8"), "hello world");
-  assert.deepEqual(await sandbox.fs.readFile("/f"), Buffer.from("hello world"));
-  assert.deepEqual(calls.map((call) => call.op), ["download", "download"]);
-});
-
-// The download stream has no errno to give, so a failure is asked again the
-// long way, which comes back as the kernel's error.
-test("a download that fails is read the long way, for the kernel's error", async () => {
-  const { sandbox } = fsSandbox(() => ({ error: ENOENT }), {
-    // A generator that fails on its first pull, as a stream refused up front does.
-    async *download() {
-      yield* [];
-      throw new BurrowError("no such file", "not_found");
-    },
-  });
-  await assert.rejects(sandbox.fs.readFile("/x"), { code: "ENOENT", syscall: "open" });
-});

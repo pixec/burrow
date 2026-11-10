@@ -21,13 +21,7 @@ use tonic::Status;
 
 /// Whether `guest_os` is a macOS guest, which only a Mac build can name.
 pub fn is_macos(guest_os: GuestOs) -> bool {
-    #[cfg(target_os = "macos")]
-    return guest_os == GuestOs::MacOs;
-    #[cfg(not(target_os = "macos"))]
-    {
-        let _ = guest_os;
-        false
-    }
+    guest_os == GuestOs::MacOs
 }
 
 /// The writable disk of a macOS guest, which has no scratch image.
@@ -1480,7 +1474,6 @@ mod tests {
     fn only_a_mac_build_names_a_macos_guest() {
         assert!(!is_macos(GuestOs::Linux));
         assert!(!is_macos(GuestOs::Windows));
-        #[cfg(target_os = "macos")]
         assert!(is_macos(GuestOs::MacOs));
     }
 }

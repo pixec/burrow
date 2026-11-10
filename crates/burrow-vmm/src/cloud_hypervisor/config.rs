@@ -107,7 +107,13 @@ pub(crate) fn vm_config(
             json!({ "firmware": firmware(&spec.boot) })
         }
         #[cfg(target_os = "macos")]
-        (Boot::MacOs(_), _) | (_, GuestOs::MacOs) => {
+        (Boot::MacOs(_), _) => {
+            return Err(Error::Unsupported {
+                hypervisor: Hypervisor::CloudHypervisor,
+                what: "boot macos",
+            });
+        }
+        (_, GuestOs::MacOs) => {
             return Err(Error::Unsupported {
                 hypervisor: Hypervisor::CloudHypervisor,
                 what: "boot macos",

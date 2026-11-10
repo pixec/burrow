@@ -137,6 +137,25 @@ pub struct PortDenial {
     pub cidrs: Vec<String>,
 }
 
+impl From<&burrow_proto::common::v1::PortRule> for PortDenial {
+    /// Validation happens at the ruleset, where a malformed entry costs the
+    /// sandbox its egress rather than being skipped. An unknown protocol reads
+    /// as both, the broader denial, for the same reason.
+    fn from(rule: &burrow_proto::common::v1::PortRule) -> Self {
+        use burrow_proto::common::v1::PortProtocol;
+        Self {
+            protocol: match PortProtocol::try_from(rule.protocol) {
+                Ok(PortProtocol::Tcp) => Some(Protocol::Tcp),
+                Ok(PortProtocol::Udp) => Some(Protocol::Udp),
+                _ => None,
+            },
+            first: rule.port,
+            last: rule.port_end,
+            cidrs: rule.cidrs.clone(),
+        }
+    }
+}
+
 /// A validated [`PortDenial`]: only these numbers ever reach the ruleset.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct PortBlock {
@@ -443,7 +462,7 @@ pub fn decide(
             Transport::Udp
                 if destination == IpAddr::V4(host)
                     && port == DNS_PORT
-                    && rules.mode != Mode::None =>
+                    && !matches!(rules.mode, Mode::None | Mode::Unspecified) =>
             {
                 Verdict::Host
             }
@@ -494,7 +513,7 @@ pub fn decide(
         return Verdict::Direct;
     }
     Verdict::Deny(match rules.mode {
-        Mode::None => "sandbox has no egress",
+        Mode::None | Mode::Unspecified => "sandbox has no egress",
         _ => "destination not in allowlist",
     })
 }

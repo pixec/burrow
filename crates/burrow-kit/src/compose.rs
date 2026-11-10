@@ -8,8 +8,8 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use crate::config::{
-    CredentialConfig, HostEntry, LifecycleConfig, NetworkPolicyConfig, PortConfig, ResourcesConfig,
-    VolumeConfig, require_no_config,
+    CredentialConfig, HostEntry, LifecycleConfig, NetworkPhase, NetworkPolicyConfig, PortRequest,
+    Resources, VolumeConfig, require_no_config,
 };
 use crate::descriptor::{CapType, Descriptor, Entry, Item};
 use crate::expand::{ContainerEnv, expand_args, expand_env, resolve_args};
@@ -23,12 +23,6 @@ use burrow_common::glob::is_host_match;
 pub enum Phase {
     Install,
     Runtime,
-}
-
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub struct NetworkPhase {
-    pub allow: Vec<HostEntry>,
-    pub deny: Vec<HostEntry>,
 }
 
 impl NetworkPhase {
@@ -154,20 +148,6 @@ pub struct FileEntry {
     pub mode: Option<String>,
     pub is_overwriting: bool,
     pub kit: String,
-}
-
-#[derive(Debug, Clone, Default, PartialEq)]
-pub struct Resources {
-    pub cpu: Option<f64>,
-    pub memory_mib: Option<u64>,
-    pub gpu: Option<String>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct PortRequest {
-    pub name: Option<String>,
-    pub container: u16,
-    pub transport: String,
 }
 
 /// Where a declaration came from: the Kit's consumption reference and its
@@ -550,8 +530,8 @@ fn validate_entry(entry: &Entry) -> Result<()> {
         ("credential", 1) => CredentialConfig::decode(entry).map(drop),
         ("volume", 1) => VolumeConfig::decode(entry).map(drop),
         ("lifecycle", 1) => LifecycleConfig::decode(entry).map(drop),
-        ("resources", 1) => ResourcesConfig::decode(entry).map(drop),
-        ("port", 1) => PortConfig::decode(entry).map(drop),
+        ("resources", 1) => Resources::decode(entry).map(drop),
+        ("port", 1) => PortRequest::decode(entry).map(drop),
         ("long-running" | "sbx" | "privileged" | "kit-registry" | "git-identity", 1) => {
             require_no_config(entry)
         }
@@ -627,10 +607,8 @@ impl<'s> Merge<'s> {
                 }
                 ("volume", 1) => self.volume(label, VolumeConfig::decode(entry)?)?,
                 ("lifecycle", 1) => self.lifecycle(out, label, entry)?,
-                ("resources", 1) => {
-                    merge_resources(&mut out.resources, ResourcesConfig::decode(entry)?)
-                }
-                ("port", 1) => merge_port(&mut out.ports, PortConfig::decode(entry)?),
+                ("resources", 1) => merge_resources(&mut out.resources, Resources::decode(entry)?),
+                ("port", 1) => merge_port(&mut out.ports, PortRequest::decode(entry)?),
                 ("long-running", 1) => out.is_long_running = true,
                 ("sbx", 1) => out.is_sbx_requested = true,
                 _ => {}
@@ -741,12 +719,11 @@ impl<'s> Merge<'s> {
     }
 }
 
-fn merge_resources(resources: &mut Resources, cfg: ResourcesConfig) {
+fn merge_resources(resources: &mut Resources, cfg: Resources) {
     if let Some(cpu) = cfg.cpu {
         resources.cpu = Some(resources.cpu.map_or(cpu, |c| c.max(cpu)));
     }
-    if let Some(memory) = cfg.memory {
-        let mib = memory.mib_ceil();
+    if let Some(mib) = cfg.memory_mib {
         resources.memory_mib = Some(resources.memory_mib.map_or(mib, |m| m.max(mib)));
     }
     if cfg.gpu.is_some() {
@@ -754,7 +731,7 @@ fn merge_resources(resources: &mut Resources, cfg: ResourcesConfig) {
     }
 }
 
-fn merge_port(ports: &mut Vec<PortRequest>, cfg: PortConfig) {
+fn merge_port(ports: &mut Vec<PortRequest>, cfg: PortRequest) {
     match ports
         .iter_mut()
         .find(|p| p.container == cfg.container && p.transport == cfg.transport)
@@ -764,11 +741,7 @@ fn merge_port(ports: &mut Vec<PortRequest>, cfg: PortConfig) {
                 existing.name = cfg.name;
             }
         }
-        None => ports.push(PortRequest {
-            name: cfg.name,
-            container: cfg.container,
-            transport: cfg.transport,
-        }),
+        None => ports.push(cfg),
     }
 }
 

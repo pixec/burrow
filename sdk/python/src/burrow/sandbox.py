@@ -2,10 +2,10 @@
 
 from __future__ import annotations
 
+import contextlib
 import threading
-import time
 from datetime import datetime
-from typing import Any, Callable, Dict, Iterator, List, Optional, Sequence
+from typing import Any, Callable, Dict, Iterator, List, Optional, Sequence, Union
 
 import grpc
 
@@ -15,57 +15,39 @@ from ._pathlib import SandboxPath
 from ._pb import api_pb2, common_pb2
 from ._policy import (
     from_policy,
-    resolve_network,
+    network_policy,
     to_exec_policy,
     to_fs_policy,
     to_network_policy,
-    to_networks,
-    to_resource_policy,
-    to_volume_mounts,
+    to_policy,
 )
 from ._shutil import SandboxShutil
 from ._subprocess import SandboxSubprocess
-from ._transport import _DEFAULT, Transport, transport_options as _transport_options
+from ._transport import _DEFAULT, Transport
+from ._wire import at, at_or_none, label
 from .errors import BurrowError
 from .snapshot import Snapshot
 from .terminal import Terminal
 from .types import (
-    AuditEvent,
     CommandInfo,
+    DeletedGroup,
+    DeletedUser,
     GuestGroup,
     GuestUser,
-    LifecycleEvent,
-    NodeInfo,
+    NetworkPolicy,
     PortMapping,
-    Share,
+    PrunedCommands,
     SandboxInfo,
-    SecretInfo,
+    SandboxPolicy,
     Session,
+    Share,
     Usage,
-    UsageInterval,
-    UsageReport,
-    UsageSum,
     WatchEvent,
 )
 
 
 def _state_of(state: int) -> str:
-    try:
-        name = common_pb2.SandboxState.Name(state)
-    except ValueError:
-        return "unknown"
-    name = name.replace("SANDBOX_STATE_", "").lower()
-    known = (
-        "creating",
-        "running",
-        "paused",
-        "suspended",
-        "stopped",
-        "stopping",
-        "destroyed",
-        "failed",
-    )
-    return name if name in known else "unknown"
+    return label(common_pb2.SandboxState, state, "SANDBOX_STATE_") or "unknown"
 
 
 def _to_sandbox_info(raw: common_pb2.Sandbox) -> SandboxInfo:
@@ -75,9 +57,9 @@ def _to_sandbox_info(raw: common_pb2.Sandbox) -> SandboxInfo:
         node_id=raw.node_id,
         template=raw.template,
         state=_state_of(raw.state),
-        created_at=raw.created_at,
+        created_at=at(raw.created_at_unix_ms),
         guest_ip=raw.guest_ip,
-        tags=dict(raw.metadata),
+        tags=dict(raw.tags),
         policy=from_policy(raw.policy),
         unreachable=raw.is_unreachable,
         usage=Usage(
@@ -86,6 +68,10 @@ def _to_sandbox_info(raw: common_pb2.Sandbox) -> SandboxInfo:
             tx_bytes=raw.tx_bytes,
         ),
         durable=raw.is_durable,
+        hypervisor=raw.hypervisor,
+        hypervisor_version=raw.hypervisor_version,
+        arch=raw.arch,
+        guest_os=raw.guest_os,
     )
 
 
@@ -93,16 +79,10 @@ def _to_session(raw: common_pb2.Session) -> Session:
     return Session(
         id=raw.id,
         sandbox_id=raw.sandbox_id,
-        started_at=raw.started_at,
-        ended_at=raw.ended_at,
-        # A reason this client has no name for reads as "unknown" rather than
-        # passing a string through that callers branch on.
-        started_by=raw.started_by
-        if raw.started_by in ("boot", "restore", "resume")
-        else "unknown",
-        ended_by=raw.ended_by
-        if raw.ended_by in ("suspended", "deleted", "failed", "unknown", "")
-        else "unknown",
+        started_at=at(raw.started_at_unix_ms),
+        ended_at=at_or_none(raw.ended_at_unix_ms),
+        started_by=label(common_pb2.SessionStart, raw.started_by, "SESSION_START_"),
+        ended_by=label(common_pb2.SessionEnd, raw.ended_by, "SESSION_END_"),
     )
 
 
@@ -111,57 +91,14 @@ def _to_command_info(raw: api_pb2.CommandInfo) -> CommandInfo:
         cmd_id=raw.command_id,
         cmd=list(raw.cmd),
         user=raw.user,
-        state=raw.state if raw.state in ("running", "exited") else "unknown",
+        state=label(api_pb2.CommandState, raw.state, "COMMAND_STATE_") or "unknown",
         exit_code=raw.exit_code,
-        started_at=datetime.fromtimestamp(raw.started_at_unix_ms / 1000),
-        ended_at=datetime.fromtimestamp(raw.ended_at_unix_ms / 1000)
-        if raw.ended_at_unix_ms > 0
-        else None,
+        started_at=at(raw.started_at_unix_ms),
+        ended_at=at_or_none(raw.ended_at_unix_ms),
         buffered_bytes=raw.buffered_bytes,
         exit_signal=raw.exit_signal,
         output_bytes=raw.output_bytes,
     )
-
-
-def _to_create_request(options: Dict[str, Any]) -> api_pb2.CreateSandboxRequest:
-    """Builds a `CreateSandboxRequest`."""
-    network = resolve_network(options.get("network_policy"))
-    resources = options.get("resources") or {}
-    # A snapshot carries its own template, and one that disagrees is an error,
-    # so nothing is sent as if the caller had asked for it.
-    template = options.get("template") or ""
-    # Without a snapshot there is nothing to boot from, and a made-up
-    # "default" would turn a missing argument into a not_found for a template
-    # nobody named.
-    if not template and not options.get("snapshot"):
-        raise BurrowError(
-            "a template is required: pass template=... (or snapshot=... to "
-            "restore one)",
-            "invalid_argument",
-        )
-    request = api_pb2.CreateSandboxRequest(
-        name=options.get("name") or "",
-        snapshot=options.get("snapshot") or "",
-        template=template,
-        metadata=options.get("tags") or {},
-        node_labels=options.get("node_labels") or {},
-    )
-    request.policy.resources.CopyFrom(to_resource_policy(resources))
-    request.policy.network.CopyFrom(to_network_policy(network))
-    # Left off the request entirely unless the caller asked for a limit:
-    # absent is what the node reads as "allowed".
-    exec_policy = to_exec_policy(options.get("exec"))
-    if exec_policy is not None:
-        request.policy.exec.CopyFrom(exec_policy)
-    fs_policy = to_fs_policy(options.get("fs"))
-    if fs_policy is not None:
-        request.policy.fs.CopyFrom(fs_policy)
-    request.policy.networks.extend(
-        to_networks(options.get("networks"), options.get("alias"))
-    )
-    request.policy.volumes.extend(to_volume_mounts(options.get("volumes")))
-    request.kit.CopyFrom(_to_kit_spec(options.get("kit")))
-    return request
 
 
 def _to_kit_spec(kit: Optional[Dict[str, Any]]) -> common_pb2.KitSpec:
@@ -176,44 +113,12 @@ def _to_kit_spec(kit: Optional[Dict[str, Any]]) -> common_pb2.KitSpec:
     return spec
 
 
-def _to_fork_request(source: str, options: Dict[str, Any]) -> api_pb2.ForkSandboxRequest:
-    """Builds a `ForkSandboxRequest`. An omitted policy inherits the source's."""
-    request = api_pb2.ForkSandboxRequest(
-        ref=api_pb2.SandboxRef(id=source),
-        sandbox_id=options.get("sandbox_id") or options.get("id") or "",
-        name=options.get("name") or "",
-        node_labels=options.get("node_labels") or {},
-    )
-    network = options.get("network_policy")
-    stated = (
-        network is not None
-        or options.get("networks") is not None
-        or options.get("exec") is not None
-        or options.get("fs") is not None
-    )
-    if stated:
-        # Resources are absent deliberately: a restore takes its machine
-        # configuration from the snapshot, and the node refuses an override.
-        if network is not None:
-            request.policy.network.CopyFrom(to_network_policy(resolve_network(network)))
-        request.policy.networks.extend(to_networks(options.get("networks")))
-        # Each section is inherited on its own, so overriding one does not
-        # strip the others off the child.
-        exec_policy = to_exec_policy(options.get("exec"))
-        if exec_policy is not None:
-            request.policy.exec.CopyFrom(exec_policy)
-        fs_policy = to_fs_policy(options.get("fs"))
-        if fs_policy is not None:
-            request.policy.fs.CopyFrom(fs_policy)
-    return request
-
-
 def _to_share(raw: api_pb2.Share) -> Share:
     return Share(
         address=raw.address,
         ports=list(raw.ports),
         allowed_clients=list(raw.allowed_clients),
-        created_at=raw.created_at,
+        created_at=at(raw.created_at_unix_ms),
         udp_ports=list(raw.udp_ports),
         all_udp=raw.is_all_udp,
         transparent_ip=raw.is_transparent_ip,
@@ -236,11 +141,6 @@ def _to_port(raw: api_pb2.PortMapping, fallback_host: str) -> PortMapping:
     )
 
 
-# How many times `Sandbox.get_or_create` looks before giving up. Only a lost
-# race gets this far, waiting on another caller's create to finish.
-_GET_OR_CREATE_ATTEMPTS = 10
-
-
 class Watcher:
     """A running directory watch. Iterate it for events, `stop()` to end it."""
 
@@ -250,7 +150,11 @@ class Watcher:
     def __iter__(self) -> Iterator[WatchEvent]:
         try:
             for raw in self._call:
-                yield WatchEvent(type=raw.type, path=raw.path, is_dir=raw.is_dir)
+                yield WatchEvent(
+                    kind=label(api_pb2.WatchEventKind, raw.kind, "WATCH_EVENT_KIND_"),
+                    path=raw.path,
+                    is_dir=raw.is_dir,
+                )
         except grpc.RpcError as err:
             # A cancelled call is a stopped watch, not a failure.
             if not self._call.cancelled():
@@ -259,25 +163,30 @@ class Watcher:
     def stop(self) -> None:
         self._call.cancel()
 
+    def __enter__(self) -> "Watcher":
+        return self
+
+    def __exit__(self, *exc: Any) -> None:
+        self.stop()
+
 
 class Sandbox:
     """A sandbox.
 
-    Obtained from `Sandbox.create`, `Sandbox.get` or `Sandbox.fork`; not
-    constructed directly.
+    Obtained from `Burrow.sandboxes`, the `Sandbox.create`/`get`/`list`
+    shortcuts or `Sandbox.fork`; not constructed directly.
     """
 
     def __init__(
         self,
         transport: Transport,
         info: SandboxInfo,
-        owned: bool,
+        owned: bool = True,
         auto_resume: bool = True,
         env: Optional[Dict[str, str]] = None,
     ):
         self._transport = transport
         self._info = info
-        self.id = info.id
         self._owned = owned
         # Resume a suspended sandbox and retry once, rather than failing the
         # call.
@@ -294,6 +203,7 @@ class Sandbox:
         self._on_resume: Optional[Callable[["Sandbox"], Any]] = None
         # Set by `delete`: a destroyed sandbox has nothing left to call.
         self._destroyed = False
+        self._closed = False
         # The stdlib's file and process APIs, against this sandbox: someone
         # who knows `os`, `shutil`, `pathlib` and `subprocess` already knows
         # these. Each acts as this handle's user.
@@ -310,148 +220,99 @@ class Sandbox:
             raise BurrowError(f"sandbox {self.id} was deleted", "failed_precondition")
 
     @staticmethod
-    def create(**options: Any) -> "Sandbox":
-        """Creates a sandbox and waits for it to be ready to accept commands.
+    def create(
+        *,
+        endpoint: Optional[str] = None,
+        api_key: Optional[str] = None,
+        tls: Optional[bool] = None,
+        timeout: Optional[float] = 60.0,
+        route: Optional[str] = None,
+        **options: Any,
+    ) -> "Sandbox":
+        """`Burrow(...).sandboxes.create(...)` on a connection of its own.
 
         ```python
         sandbox = Sandbox.create(template="python")
         ```
         """
-        transport = Transport(**_transport_options(options))
-        try:
-            raw = transport.unary(
-                "CreateSandbox",
-                _to_create_request(options),
-                options.get("timeout", 120.0),
-            )
-            sandbox = Sandbox(
-                transport,
-                _to_sandbox_info(raw),
-                True,
-                options.get("auto_resume", True),
-                options.get("env") or {},
-            )
-            sandbox._on_resume = options.get("on_resume")
-            return sandbox
-        except BaseException:
-            transport.close()
-            raise
+        from .client import Burrow
+
+        with Burrow(endpoint=endpoint, api_key=api_key, tls=tls, timeout=timeout, route=route) as burrow:
+            return burrow.sandboxes.create(**options)
 
     @staticmethod
-    def get_or_create(**options: Any) -> "Sandbox":
-        """Returns the sandbox with this name, creating it if it is not there.
+    def get_or_create(
+        *,
+        endpoint: Optional[str] = None,
+        api_key: Optional[str] = None,
+        tls: Optional[bool] = None,
+        timeout: Optional[float] = 60.0,
+        route: Optional[str] = None,
+        **options: Any,
+    ) -> "Sandbox":
+        """`Burrow(...).sandboxes.get_or_create(...)` on a connection of its own."""
+        from .client import Burrow
 
-        ```python
-        sandbox = Sandbox.get_or_create(
-            name="build-482",
-            template="python-tools",
-            on_create=lambda s: s.Path("/work/app.py").write_text(src),
-        )
-        ```
-
-        A `name` is the only key: ids are generated by the server, so there is
-        no id to ask for before the sandbox exists. The create options apply
-        only when it turns out not to exist, so the same call is safe from
-        every worker; an existing sandbox is handed back as it is. A stopped
-        one stays stopped unless `resume` is set, though the first call that
-        needs a running VM resumes it anyway.
-        """
-        key = options.get("name")
-        if not key:
-            raise BurrowError(
-                "get_or_create needs a name: without one there is nothing to get",
-                "invalid_argument",
-            )
-
-        # Two processes racing on the same name both find nothing and both
-        # create. The loser is told ALREADY_EXISTS while the winner's sandbox
-        # is still booting, so the get is retried rather than made once.
-        for attempt in range(_GET_OR_CREATE_ATTEMPTS):
-            try:
-                sandbox = Sandbox.get(key, **options)
-                sandbox._env = options.get("env") or {}
-                sandbox._on_resume = options.get("on_resume")
-                if options.get("resume") and sandbox.state in ("paused", "suspended"):
-                    sandbox.resume()
-                return sandbox
-            except BurrowError as err:
-                if err.code != "not_found":
-                    raise
-
-            try:
-                sandbox = Sandbox.create(**options)
-                on_create = options.get("on_create")
-                if on_create:
-                    on_create(sandbox)
-                return sandbox
-            except BurrowError as err:
-                if err.code != "already_exists":
-                    raise
-                # The winner's record appears once the node has built the
-                # sandbox.
-                time.sleep(min(0.2 * 2**attempt, 1.0))
-        raise BurrowError(
-            f"sandbox {key} is being created elsewhere and did not become available",
-            "unavailable",
-        )
+        with Burrow(endpoint=endpoint, api_key=api_key, tls=tls, timeout=timeout, route=route) as burrow:
+            return burrow.sandboxes.get_or_create(**options)
 
     @staticmethod
-    def get(ref: Optional[str] = None, **options: Any) -> "Sandbox":
-        """Returns a handle for a sandbox that already exists.
+    def get(
+        sandbox: str,
+        *,
+        endpoint: Optional[str] = None,
+        api_key: Optional[str] = None,
+        tls: Optional[bool] = None,
+        timeout: Optional[float] = 60.0,
+        route: Optional[str] = None,
+        auto_resume: bool = True,
+    ) -> "Sandbox":
+        """Returns a handle for a sandbox that already exists, by id or name.
 
         ```python
         sandbox = Sandbox.get("sbx_...")
         ```
         """
-        # Ids and names share one lookup: the server resolves a reference as an
-        # id first and as a name second, and the two cannot collide.
-        target = ref or options.get("sandbox_id") or options.get("id") or options.get("name")
-        if not target:
-            raise BurrowError("an id or a name is required", "invalid_argument")
+        from .client import Burrow
 
-        transport = Transport(**_transport_options(options))
-        try:
-            raw = transport.unary("GetSandbox", api_pb2.SandboxRef(id=target))
-            return Sandbox(
-                transport,
-                _to_sandbox_info(raw),
-                True,
-                options.get("auto_resume", True),
-            )
-        except BaseException:
-            transport.close()
-            raise
+        with Burrow(endpoint=endpoint, api_key=api_key, tls=tls, timeout=timeout, route=route) as burrow:
+            return burrow.sandboxes.get(sandbox, auto_resume=auto_resume)
 
     @staticmethod
-    def list(tag: str = "", **options: Any) -> List["Sandbox"]:
+    def list(
+        *,
+        tag: str = "",
+        endpoint: Optional[str] = None,
+        api_key: Optional[str] = None,
+        tls: Optional[bool] = None,
+        timeout: Optional[float] = 60.0,
+        route: Optional[str] = None,
+    ) -> List["Sandbox"]:
         """Lists sandboxes, newest state first.
 
         ```python
         for sandbox in Sandbox.list(tag="owner=ci"):
-            sandbox.stop()
+            sandbox.pause()
         ```
 
         The handles share one connection, released once the last of them is
         closed.
         """
-        transport = Transport(**_transport_options(options))
-        try:
-            res = transport.unary(
-                "ListSandboxes", api_pb2.ListSandboxesRequest(tag=tag)
-            )
-            return [
-                Sandbox(transport.retain(), _to_sandbox_info(raw), True)
-                for raw in res.sandboxes
-            ]
-        finally:
-            transport.close()
+        from .client import Burrow
+
+        with Burrow(endpoint=endpoint, api_key=api_key, tls=tls, timeout=timeout, route=route) as burrow:
+            return burrow.sandboxes.list(tag=tag)
+
+    @property
+    def id(self) -> str:
+        return self._info.id
 
     @property
     def name(self) -> str:
         """The name the sandbox was created with, falling back to its id when
         it was created without one. Both work anywhere the API takes a
         sandbox."""
-        return self._info.name or self.id
+        return self._info.name or self._info.id
 
     @property
     def state(self) -> str:
@@ -467,6 +328,10 @@ class Sandbox:
         return self._info.node_id
 
     @property
+    def guest_ip(self) -> str:
+        return self._info.guest_ip
+
+    @property
     def unreachable(self) -> bool:
         """Whether the node hosting this sandbox has missed its heartbeats.
 
@@ -476,6 +341,12 @@ class Sandbox:
         node comes back.
         """
         return self._info.unreachable
+
+    @property
+    def durable(self) -> bool:
+        """Suspended with its latest suspend in the object store, so it can
+        resume on another node."""
+        return self._info.durable
 
     @property
     def tags(self) -> Dict[str, str]:
@@ -488,30 +359,33 @@ class Sandbox:
 
     @property
     def memory_mib(self) -> int:
-        """The same number under its unit-bearing name."""
         return self._info.policy.resources.memory_mib
 
     @property
     def usage(self) -> Usage:
         """What the sandbox has consumed, as of the last call that returned its
         record; `refresh` for a current reading. Accumulated across every VM it
-        has run, so a stop and a resume do not reset it."""
+        has run, so a pause and a resume do not reset it."""
         return self._info.usage
 
     @property
-    def created_at(self) -> str:
-        """RFC 3339. There is no `updated_at`: the record does not carry one."""
+    def created_at(self) -> datetime:
+        """There is no `updated_at`: the record does not carry one."""
         return self._info.created_at
 
     @property
-    def policy(self):
+    def policy(self) -> SandboxPolicy:
         """The whole policy in force, with injected header values redacted."""
         return self._info.policy
 
     def refresh(self) -> SandboxInfo:
         """Re-reads the sandbox's current state from the server."""
+        return self._apply("GetSandbox", api_pb2.SandboxRef(sandbox_id=self.id))
+
+    def _apply(self, method: str, request: Any, timeout: Any = _DEFAULT) -> SandboxInfo:
+        """Makes a call that returns the sandbox record, and keeps it."""
         self._assert_live()
-        raw = self._transport.unary("GetSandbox", api_pb2.SandboxRef(id=self.id))
+        raw = self._transport.unary(method, request, timeout)
         self._info = _to_sandbox_info(raw)
         return self._info
 
@@ -626,7 +500,7 @@ class Sandbox:
             _to_command_info(raw), from_offset, encoding, errors, text
         )
 
-    def prune_commands(self) -> Dict[str, int]:
+    def prune_commands(self) -> PrunedCommands:
         """Removes finished commands and their output, as `docker container
         prune` does. Running commands are left alone. Returns how many were
         removed and the log bytes freed on the node.
@@ -635,7 +509,7 @@ class Sandbox:
         res = self._transport.unary(
             "PruneCommands", api_pb2.PruneCommandsRequest(sandbox_id=self.id)
         )
-        return {"removed": res.removed, "freed_bytes": res.freed_bytes}
+        return PrunedCommands(removed=res.removed, freed_bytes=res.freed_bytes)
 
     def _signal_command(self, cmd_id: str, signal: int) -> None:
         self._transport.unary(
@@ -682,14 +556,13 @@ class Sandbox:
             groupname=res.groupname or name, gid=res.gid, shared_dir=res.shared_dir
         )
 
-    def delete_user(self, name: str, *, remove_home: bool = False) -> dict:
+    def delete_user(self, name: str, *, remove_home: bool = False) -> DeletedUser:
         """Deletes a guest user that `create_user` could have made.
 
         Root, system and built-in accounts, administrators and the accounts
         the agent relies on are refused, as is a user with a running process:
         end it first. The user's own group goes with them. Their home is kept,
-        handed to root on Linux and macOS, unless `remove_home`. Returns the
-        home and whether it was removed.
+        handed to root on Linux and macOS, unless `remove_home`.
         """
         self._assert_live()
         res = self._with_resume(
@@ -700,15 +573,14 @@ class Sandbox:
                 ),
             )
         )
-        return {"home": res.home, "home_removed": res.is_home_removed}
+        return DeletedUser(home=res.home, home_removed=res.is_home_removed)
 
-    def delete_group(self, name: str, *, remove_shared_dir: bool = False) -> dict:
+    def delete_group(self, name: str, *, remove_shared_dir: bool = False) -> DeletedGroup:
         """Deletes a guest group that `create_group` could have made.
 
         A group that is some user's primary group is refused; delete the user.
         Members simply lose it. Its shared directory is kept, handed to root on
-        Linux and macOS, unless `remove_shared_dir`. Returns the directory and
-        whether it was removed.
+        Linux and macOS, unless `remove_shared_dir`.
         """
         self._assert_live()
         res = self._with_resume(
@@ -721,10 +593,9 @@ class Sandbox:
                 ),
             )
         )
-        return {
-            "shared_dir": res.shared_dir,
-            "shared_dir_removed": res.is_shared_dir_removed,
-        }
+        return DeletedGroup(
+            shared_dir=res.shared_dir, shared_dir_removed=res.is_shared_dir_removed
+        )
 
     def add_user_to_group(self, user: str, group: str) -> None:
         """Adds a user to a group, so the group's shared directory opens to
@@ -767,18 +638,35 @@ class Sandbox:
         handle._default_user = name
         return handle
 
-    def terminal(self, **options: Any) -> Terminal:
+    def terminal(
+        self,
+        *,
+        command: Union[str, Sequence[str]] = "/bin/sh",
+        cols: int = 80,
+        rows: int = 24,
+        env: Optional[Dict[str, str]] = None,
+        cwd: str = "",
+        user: Optional[str] = None,
+    ) -> Terminal:
         """Opens an interactive shell with a pty, for when input arrives over
         time (a browser terminal, an agent driving a REPL). For a command that
         runs to completion, use `subprocess.run`."""
         self._assert_live()
         return Terminal(
-            self._transport.route(self.id), self.id, {"user": self._default_user, **options}
+            self._transport.route(self.id),
+            self.id,
+            command=command,
+            cols=cols,
+            rows=rows,
+            env={**self._env, **(env or {})},
+            cwd=cwd,
+            user=self._default_user if user is None else user,
         )
 
     def watch(
         self,
         path: str,
+        *,
         recursive: bool = False,
         interval: float = 0,
         on_event: Optional[Callable[[WatchEvent], Any]] = None,
@@ -792,7 +680,7 @@ class Sandbox:
 
         ```python
         watcher = sandbox.watch("/work/src", recursive=True,
-                                on_event=lambda e: print(e.type, e.path))
+                                on_event=lambda e: print(e.kind, e.path))
         # ...later
         watcher.stop()
         ```
@@ -822,13 +710,15 @@ class Sandbox:
                 except Exception as err:  # noqa: BLE001 - handed to the caller
                     if on_error:
                         on_error(err)
+                    else:
+                        raise
 
             threading.Thread(target=pump, daemon=True).start()
 
         return watcher
 
     def expose_port(
-        self, guest_port: int, host_port: int = 0, udp: bool = False
+        self, guest_port: int, *, host_port: int = 0, udp: bool = False
     ) -> PortMapping:
         """Publishes a port from inside the sandbox on its node's address.
 
@@ -854,7 +744,7 @@ class Sandbox:
 
     def list_ports(self) -> List[PortMapping]:
         self._assert_live()
-        res = self._transport.unary("ListPorts", api_pb2.SandboxRef(id=self.id))
+        res = self._transport.unary("ListPorts", api_pb2.SandboxRef(sandbox_id=self.id))
         return [_to_port(port, self._transport.host) for port in res.ports]
 
     def domain(self, guest_port: int) -> str:
@@ -862,8 +752,8 @@ class Sandbox:
 
         When the node holding the sandbox runs an edge, this is a full URL on a
         per-sandbox hostname, `http://<port>-<sandbox-id>.<edge-domain>/`, and
-        traffic arriving on it wakes a stopped sandbox. When that node runs no
-        edge there is no hostname routing, and this is a bare `host:port` on
+        traffic arriving on it wakes a suspended sandbox. When that node runs
+        no edge there is no hostname routing, and this is a bare `host:port` on
         the node's own address. Raises when the port is not published.
         """
         for mapping in self.list_ports():
@@ -882,12 +772,13 @@ class Sandbox:
 
     def share(
         self,
+        *,
         ports: Optional[Sequence[int]] = None,
         allowed_clients: Optional[Sequence[str]] = None,
         rotate: bool = False,
         udp_ports: Optional[Sequence[int]] = None,
         all_udp: bool = False,
-        no_transparent_ip: bool = False,
+        transparent_ip: Optional[bool] = None,
     ) -> Share:
         """Shares the sandbox through a tailcat address.
 
@@ -897,8 +788,8 @@ class Sandbox:
         keeps its address; `rotate=True` issues new keys and so a new address.
         TCP is shared on every port unless `ports` narrows it; UDP only on
         `udp_ports`, or everywhere with `all_udp=True`. The guest sees each
-        client's own public IPv4 as the packet source; `no_transparent_ip`
-        sources from the gateway instead.
+        client's own public IPv4 as the packet source unless
+        `transparent_ip=False` sources from the gateway instead.
 
         ```python
         share = sandbox.share(ports=[22])
@@ -906,32 +797,33 @@ class Sandbox:
         ```
         """
         self._assert_live()
-        res = self._transport.unary(
-            "ShareSandbox",
-            api_pb2.ShareRequest(
-                sandbox_id=self.id,
-                ports=list(ports or []),
-                allowed_clients=list(allowed_clients or []),
-                is_rotating=rotate,
-                udp_ports=list(udp_ports or []),
-                is_all_udp=all_udp,
-                is_transparent_ip_disabled=no_transparent_ip,
-            ),
+        request = api_pb2.ShareRequest(
+            sandbox_id=self.id,
+            ports=list(ports or []),
+            allowed_clients=list(allowed_clients or []),
+            is_rotating=rotate,
+            udp_ports=list(udp_ports or []),
+            is_all_udp=all_udp,
         )
-        return _to_share(res)
+        if transparent_ip is not None:
+            request.is_transparent_ip = transparent_ip
+        return _to_share(self._transport.unary("ShareSandbox", request))
 
     def get_share(self) -> Share:
         """The sandbox's share. Raises `not_found` when it has none."""
         self._assert_live()
-        return _to_share(self._transport.unary("GetShare", api_pb2.SandboxRef(id=self.id)))
+        return _to_share(
+            self._transport.unary("GetShare", api_pb2.SandboxRef(sandbox_id=self.id))
+        )
 
     def unshare(self) -> None:
         """Revokes the share; its address stops working at once."""
         self._assert_live()
-        self._transport.unary("UnshareSandbox", api_pb2.SandboxRef(id=self.id))
+        self._transport.unary("UnshareSandbox", api_pb2.SandboxRef(sandbox_id=self.id))
 
-    def update_resources(
+    def update_lifetime(
         self,
+        *,
         max_lifetime_secs: Optional[int] = None,
         idle_suspend_secs: Optional[int] = None,
         suspended_ttl_secs: Optional[int] = None,
@@ -942,59 +834,51 @@ class Sandbox:
         meaning "unlimited" here as it does on create. The machine shape is not
         among them: a running VM's configuration is fixed.
         """
-        self._assert_live()
-        request = api_pb2.UpdateResourcesRequest(ref=api_pb2.SandboxRef(id=self.id))
+        request = api_pb2.UpdateLifetimeRequest(sandbox_id=self.id)
         if max_lifetime_secs is not None:
             request.max_lifetime_secs = max_lifetime_secs
         if idle_suspend_secs is not None:
             request.idle_suspend_secs = idle_suspend_secs
         if suspended_ttl_secs is not None:
             request.suspended_ttl_secs = suspended_ttl_secs
-        raw = self._transport.unary("UpdateResources", request)
-        self._info = _to_sandbox_info(raw)
-        return self._info
+        return self._apply("UpdateLifetime", request)
 
     def update_tags(self, tags: Dict[str, str]) -> SandboxInfo:
         """Replaces the sandbox's tags. An empty map clears them."""
-        self._assert_live()
-        raw = self._transport.unary(
-            "UpdateTags",
-            api_pb2.UpdateTagsRequest(ref=api_pb2.SandboxRef(id=self.id), tags=tags),
+        return self._apply(
+            "UpdateTags", api_pb2.UpdateTagsRequest(sandbox_id=self.id, tags=tags)
         )
-        self._info = _to_sandbox_info(raw)
-        return self._info
 
-    def update_network_policy(self, policy: Any) -> SandboxInfo:
+    def update_network_policy(
+        self, policy: Union[str, Dict[str, Any], NetworkPolicy]
+    ) -> SandboxInfo:
         """Replaces the sandbox's egress policy.
 
         Firewall rules, proxy allowlist, DNS filtering and header injection all
-        re-render at once, so the sandbox is never briefly half-governed.
+        re-render at once, so the sandbox is never briefly half-governed. Takes
+        a mode, a dict or the `NetworkPolicy` read back from `policy.network`.
         """
         self._assert_live()
-        wanted = resolve_network(policy)
+        wanted = network_policy(policy)
         # The guest is handed the inspection CA during its first handshake, so
         # a sandbox that did not start with TLS inspection cannot gain it. That
         # makes this the one policy change refused here rather than sent.
-        if wanted.get("inspect_tls") and not self._info.policy.network.inspect_tls:
+        if wanted.inspect_tls and not self._info.policy.network.inspect_tls:
             raise BurrowError(
                 f"sandbox {self.id} was created without TLS inspection, so "
                 f"headers cannot be injected into its traffic; create it with "
                 f"inspect_tls set",
                 "failed_precondition",
             )
-        raw = self._transport.unary(
+        return self._apply(
             "UpdateNetworkPolicy",
             api_pb2.UpdateNetworkPolicyRequest(
-                ref=api_pb2.SandboxRef(id=self.id), network=to_network_policy(wanted)
+                sandbox_id=self.id, network=to_network_policy(wanted)
             ),
         )
-        self._info = _to_sandbox_info(raw)
-        return self._info
 
     def update_access_policy(
-        self,
-        exec: Optional[Dict[str, Any]] = None,
-        fs: Optional[Dict[str, Any]] = None,
+        self, *, exec_policy: Any = None, fs: Any = None
     ) -> SandboxInfo:
         """Replaces the sandbox's exec policy, its file policy, or both.
 
@@ -1007,77 +891,64 @@ class Sandbox:
 
         ```python
         # Deny exec. The file policy, whatever it is, is untouched.
-        sandbox.update_access_policy(exec={"allow_exec": False})
+        sandbox.update_access_policy(exec_policy={"allow_exec": False})
         ```
         """
-        self._assert_live()
-        if exec is None and fs is None:
+        if exec_policy is None and fs is None:
             raise BurrowError(
-                "update_access_policy needs exec, fs or both: a call with "
+                "update_access_policy needs exec_policy, fs or both: a call with "
                 "neither would change nothing",
                 "invalid_argument",
             )
-        request = api_pb2.UpdateAccessPolicyRequest(ref=api_pb2.SandboxRef(id=self.id))
+        request = api_pb2.UpdateAccessPolicyRequest(sandbox_id=self.id)
         # Absent stays absent on the wire: presence is what carries "leave this
         # section alone" to the node.
-        exec_policy = to_exec_policy(exec)
-        if exec_policy is not None:
-            request.exec.CopyFrom(exec_policy)
-        fs_policy = to_fs_policy(fs)
-        if fs_policy is not None:
-            request.fs.CopyFrom(fs_policy)
-        raw = self._transport.unary("UpdateAccessPolicy", request)
-        self._info = _to_sandbox_info(raw)
-        return self._info
+        exec_wire = to_exec_policy(exec_policy)
+        if exec_wire is not None:
+            request.exec.CopyFrom(exec_wire)
+        fs_wire = to_fs_policy(fs)
+        if fs_wire is not None:
+            request.fs.CopyFrom(fs_wire)
+        return self._apply("UpdateAccessPolicy", request)
 
-    def stop(self) -> SandboxInfo:
+    def pause(self) -> SandboxInfo:
         """Snapshots the sandbox to disk and stops its VM. It keeps its
         filesystem, its address and its memory, and rejects commands until it
         is resumed; `delete` destroys one instead."""
-        self._assert_live()
-        raw = self._transport.unary("PauseSandbox", api_pb2.SandboxRef(id=self.id))
-        self._info = _to_sandbox_info(raw)
-        return self._info
+        return self._apply("PauseSandbox", api_pb2.SandboxRef(sandbox_id=self.id))
 
     def resume(self) -> SandboxInfo:
-        """Restores a suspended sandbox, typically in a few hundred milliseconds.
-        One that was shut down has no memory to restore and is refused with
-        FAILED_PRECONDITION; `boot` it instead.
+        """Restores a paused sandbox, typically in a few hundred milliseconds.
+        One that was stopped has no memory to restore and is refused with
+        FAILED_PRECONDITION; `start` it instead.
 
         Every resume this handle performs goes through here, auto-resume
         included, so this is the one place `on_resume` has to fire.
         """
-        self._assert_live()
-        raw = self._transport.unary("ResumeSandbox", api_pb2.SandboxRef(id=self.id))
-        self._info = _to_sandbox_info(raw)
+        info = self._apply("ResumeSandbox", api_pb2.SandboxRef(sandbox_id=self.id))
         if self._on_resume:
             self._on_resume(self)
-        return self._info
+        return info
 
-    def shutdown(self) -> SandboxInfo:
+    def stop(self) -> SandboxInfo:
         """Shuts the VM down, keeping the writable disk and volumes. Unlike
-        `stop`, nothing in memory survives: processes end, and `boot` runs the
-        image's init again on the same disk. For a Sandbox Kit template that
-        is the stop and start its spec describes, and the Kit's startup hooks
-        run again on the way up."""
-        self._assert_live()
-        raw = self._transport.unary("StopSandbox", api_pb2.SandboxRef(id=self.id))
-        self._info = _to_sandbox_info(raw)
-        return self._info
+        `pause`, nothing in memory survives: processes end, and `start` runs
+        the image's init again on the same disk. For a Sandbox Kit template
+        that is the stop and start its spec describes, and the Kit's startup
+        hooks run again on the way up."""
+        return self._apply("StopSandbox", api_pb2.SandboxRef(sandbox_id=self.id))
 
-    def boot(self) -> SandboxInfo:
-        """Cold-boots a shut-down sandbox on its existing disks. It takes as
-        long as a create, since there is no memory image to restore, and the
+    def start(self) -> SandboxInfo:
+        """Cold-boots a stopped sandbox on its existing disks. It takes as long
+        as a create, since there is no memory image to restore, and the
         sandbox keeps its id, name, address and published ports."""
-        self._assert_live()
-        raw = self._transport.unary("StartSandbox", api_pb2.SandboxRef(id=self.id))
-        self._info = _to_sandbox_info(raw)
+        info = self._apply("StartSandbox", api_pb2.SandboxRef(sandbox_id=self.id))
         if self._on_resume:
             self._on_resume(self)
-        return self._info
+        return info
 
     def recreate(
-        self, template: Optional[str] = None, kit: Optional[Dict[str, Any]] = None
+        self, *, template: Optional[str] = None, kit: Optional[Dict[str, Any]] = None
     ) -> SandboxInfo:
         """Replaces the root disk, discarding everything written to it, while
         keeping the sandbox's id, name, address and volumes. With `template`
@@ -1085,45 +956,58 @@ class Sandbox:
         the new disk with the recorded inputs, as changed by `kit`: `args` and
         `env` replace by name, `reject_capabilities` wholesale, so an empty
         list clears it."""
-        self._assert_live()
-        raw = self._transport.unary(
+        info = self._apply(
             "RecreateSandbox",
             api_pb2.RecreateSandboxRequest(
                 sandbox_id=self.id, template=template or "", kit=_to_kit_spec(kit)
             ),
         )
-        self._info = _to_sandbox_info(raw)
         if self._on_resume:
             self._on_resume(self)
-        return self._info
+        return info
 
     def list_sessions(self) -> List[Session]:
         """Every VM this sandbox has run, newest first.
 
-        A sandbox outlives its VMs: `stop` ends one and `resume` starts the
+        A sandbox outlives its VMs: `pause` ends one and `resume` starts the
         next. The node keeps only the most recent sessions of each sandbox, and
         drops them all when the sandbox is deleted.
         """
         self._assert_live()
-        res = self._transport.unary("ListSessions", api_pb2.SandboxRef(id=self.id))
+        res = self._transport.unary("ListSessions", api_pb2.SandboxRef(sandbox_id=self.id))
         return [_to_session(raw) for raw in res.sessions]
 
     def current_session(self) -> Optional[Session]:
-        """The VM the sandbox is running now, or `None` when it is stopped.
+        """The VM the sandbox is running now, or `None` when it has none.
 
-        The open session is the one `list_sessions` reports with no `ended_at`.
+        The open session is the one `list_sessions` reports with no `ended_by`.
         """
         for session in self.list_sessions():
-            if not session.ended_at:
+            if not session.ended_by:
                 return session
         return None
 
-    def fork(self, **options: Any) -> "Sandbox":
+    def fork(
+        self,
+        *,
+        name: str = "",
+        node_labels: Optional[Dict[str, str]] = None,
+        tags: Optional[Dict[str, str]] = None,
+        network_policy: Any = None,
+        networks: Any = None,
+        alias: str = "",
+        exec_policy: Any = None,
+        fs: Any = None,
+        volumes: Any = None,
+    ) -> "Sandbox":
         """Creates a sandbox from this one's current state.
 
         This sandbox keeps running; a running source's state is written first,
         so the child starts from its state as of the call. The child lands on
         the same node, because a snapshot and its disks are node-local files.
+        The policy options are `create`'s; a child with none stated inherits
+        its source's whole policy. The machine shape cannot change: a restore
+        takes it from the state.
 
         ```python
         child = sandbox.fork()
@@ -1131,71 +1015,84 @@ class Sandbox:
         ```
         """
         self._assert_live()
-        raw = self._transport.unary(
-            "ForkSandbox", _to_fork_request(self.id, options), 120.0
+        request = api_pb2.ForkSandboxRequest(
+            sandbox_id=self.id, name=name, node_labels=node_labels or {}
         )
+        sections = (network_policy, networks, exec_policy, fs, volumes)
+        if any(section is not None for section in sections):
+            policy = to_policy(
+                network_policy=network_policy,
+                networks=networks,
+                alias=alias,
+                exec_policy=exec_policy,
+                fs=fs,
+                volumes=volumes,
+            )
+            # Each inherited section stays off the wire, so overriding one does
+            # not strip the others off the child. Resources are never sent:
+            # the node refuses a shape other than the state's.
+            policy.ClearField("resources")
+            policy.ClearField("lifetime")
+            policy.ClearField("snapshots")
+            if network_policy is None:
+                policy.ClearField("network")
+            request.policy.CopyFrom(policy)
+        raw = self._transport.unary("ForkSandbox", request, 120.0)
         # A fork shares its parent's connection, released once both are done.
-        transport = self._transport.retain() if self._owned else self._transport
-        return Sandbox(
-            transport,
+        child = Sandbox(
+            self._transport.retain(),
             _to_sandbox_info(raw),
-            self._owned,
+            True,
             self.auto_resume,
             # A fork is the same sandbox again, so it runs commands with the
             # same environment this handle applies.
-            self._env,
+            dict(self._env),
         )
+        if tags is not None:
+            child.update_tags(tags)
+        return child
 
     def move(
-        self, node_id: str = "", node_labels: Optional[Dict[str, str]] = None
+        self, *, node_id: str = "", node_labels: Optional[Dict[str, str]] = None
     ) -> SandboxInfo:
         """Moves the sandbox to another node through the object store.
 
-        A running sandbox is suspended, carried over and resumed. It keeps its
+        A running sandbox is paused, carried over and resumed. It keeps its
         id, name and policy and gets an address on the new node. `node_id`
         names the destination; otherwise it is placed like a create, on a node
         carrying `node_labels`. Volumes do not move.
         """
-        self._assert_live()
-        raw = self._transport.unary(
+        return self._apply(
             "MoveSandbox",
             api_pb2.MoveSandboxRequest(
-                ref=api_pb2.SandboxRef(id=self.id),
-                node_id=node_id,
-                node_labels=node_labels or {},
+                sandbox_id=self.id, node_id=node_id, node_labels=node_labels or {}
             ),
             300.0,
         )
-        self._info = _to_sandbox_info(raw)
-        return self._info
 
-    def snapshot(self, expiration: int = 0) -> Snapshot:
+    def snapshot(self, *, expiration_secs: int = 0) -> Snapshot:
         """Saves the sandbox's state as a snapshot object and keeps running.
 
         The guest is paused only long enough to write its state. Unlike the
-        sandbox's own stop state, which dies with it, a snapshot outlives its
+        sandbox's own pause state, which dies with it, a snapshot outlives its
         source and can start any number of new sandboxes:
 
         ```python
-        snapshot = prepared.snapshot(expiration=86_400)
+        snapshot = prepared.snapshot(expiration_secs=86_400)
         worker = Sandbox.create(snapshot=snapshot.id)
         ```
         """
         self._assert_live()
         raw = self._transport.unary(
             "CreateSnapshot",
-            api_pb2.CreateSnapshotRequest(
-                ref=api_pb2.SandboxRef(id=self.id), expiration_secs=expiration
-            ),
+            api_pb2.CreateSnapshotRequest(sandbox_id=self.id, expiration_secs=expiration_secs),
             # Writing a memory image and copying a scratch disk; seconds, not
             # milliseconds, on a large guest.
             120.0,
         )
         # The snapshot shares this handle's connection, released once both are
         # done.
-        return Snapshot._adopt(
-            self._transport.retain() if self._owned else self._transport, raw
-        )
+        return Snapshot(self._transport.retain(), raw)
 
     def delete(self) -> None:
         """Destroys the sandbox and everything in it. The handle is inert
@@ -1203,293 +1100,36 @@ class Sandbox:
         against an id that is no longer anywhere."""
         self._assert_live()
         try:
-            self._transport.unary("DeleteSandbox", api_pb2.SandboxRef(id=self.id))
+            self._transport.unary("DeleteSandbox", api_pb2.SandboxRef(sandbox_id=self.id))
         finally:
             self._destroyed = True
-            if self._owned:
-                self._transport.close()
+            self.close()
 
     def close(self) -> None:
-        """Releases the connection without destroying the sandbox."""
-        if self._owned:
+        """Releases this handle's share of the connection without destroying
+        the sandbox. Closing twice does nothing more."""
+        if self._owned and not self._closed:
+            self._closed = True
             self._transport.close()
+
+    @contextlib.contextmanager
+    def deleting(self) -> Iterator["Sandbox"]:
+        """Destroys the sandbox when the block ends.
+
+        ```python
+        with Sandbox.create(template="python").deleting() as sandbox:
+            ...
+        ```
+        """
+        try:
+            yield self
+        finally:
+            self.delete()
 
     def __enter__(self) -> "Sandbox":
         return self
 
     def __exit__(self, *exc: Any) -> None:
-        """Destroys the sandbox when the `with` block ends.
-
-        ```python
-        with Sandbox.create(template="python") as sandbox:
-            ...
-        ```
-
-        Use `close()` instead when the sandbox should outlive the block.
-        """
-        self.delete()
-
-
-class Burrow:
-    """A connection to a burrow control plane, for what is not one sandbox's:
-    health, audit, events, nodes and secrets. Sandboxes are reached through
-    `Sandbox`."""
-
-    def __init__(self, **options: Any):
-        self._transport = Transport(**_transport_options(options))
-
-    def health(self) -> Dict[str, str]:
-        res = self._transport.unary("Health", api_pb2.HealthRequest())
-        return {"version": res.version}
-
-    def audit(
-        self,
-        sandbox_id: str = "",
-        denied_only: bool = False,
-        since: str = "",
-        limit: int = 0,
-    ) -> List[AuditEvent]:
-        """Reads the egress audit trail, newest first.
-
-        Records cover both connection attempts and DNS lookups, so an attempt
-        is visible even when the policy blocked it.
-        """
-        return [
-            AuditEvent(
-                at=raw.at,
-                sandbox_id=raw.sandbox_id,
-                source_ip=raw.source_ip,
-                destination=raw.destination,
-                host=raw.host,
-                port=raw.port,
-                allowed=raw.is_allowed,
-                reason=raw.reason,
-                bytes_sent=raw.bytes_sent,
-                bytes_received=raw.bytes_received,
-                node_id=raw.node_id,
-            )
-            for raw in self._transport.server_stream(
-                "QueryAudit",
-                api_pb2.AuditQuery(
-                    sandbox_id=sandbox_id,
-                    is_denied_only=denied_only,
-                    since=since,
-                    limit=limit,
-                ),
-            )
-        ]
-
-    def events(
-        self,
-        after: int = 0,
-        sandbox: str = "",
-        follow: bool = False,
-        limit: int = 0,
-    ) -> Iterator[LifecycleEvent]:
-        """Reads the fleet's lifecycle log, oldest first.
-
-        Without `follow` the iterator ends after the replay. With it, the
-        stream stays open and yields events as they happen until the loop
-        breaks. `sandbox` takes an id or name. Keep the last `seq` seen and
-        pass it as `after` to resume after a disconnect.
-
-        ```python
-        for event in burrow.events(sandbox="build-482", follow=True):
-            print(event.seq, event.type, event.detail)
-        ```
-        """
-        for raw in self._transport.server_stream(
-            "TailEvents",
-            api_pb2.TailEventsRequest(
-                after_seq=after, sandbox=sandbox, is_follow=follow, limit=limit
-            ),
-            # A follow outlives any request deadline.
-            None if follow else _DEFAULT,
-        ):
-            yield LifecycleEvent(
-                seq=raw.seq,
-                node_id=raw.node_id,
-                node_seq=raw.node_seq,
-                at_unix_ms=raw.at_unix_ms,
-                sandbox_id=raw.sandbox_id,
-                type=raw.type,
-                state=_state_of(raw.state),
-                detail=raw.detail,
-                template=raw.template,
-                metadata=dict(raw.metadata),
-                cpu_usage_usec=raw.cpu_usage_usec,
-                rx_bytes=raw.rx_bytes,
-                tx_bytes=raw.tx_bytes,
-                vcpus=raw.vcpus,
-                memory_mib=raw.mem_mib,
-            )
-
-    def usage(
-        self,
-        start: Optional[datetime] = None,
-        end: Optional[datetime] = None,
-        sandbox: str = "",
-        tags: Optional[Dict[str, str]] = None,
-        group_by: str = "",
-        after_id: int = 0,
-        limit: int = 0,
-        include_open: bool = True,
-    ) -> UsageReport:
-        """Reads the usage ledger: the intervals sandboxes spent in one state at
-        one shape, or with `group_by` their sums per group and state.
-
-        An interval belongs to the window `[start, end)` it started in. The
-        ledger outlives the sandboxes and nodes it describes. `group_by` is
-        "sandbox", "template", "node", "state" or a tag key. Pass a report's
-        `next_after_id` as `after_id` to continue an export.
-
-        ```python
-        report = burrow.usage(
-            start=datetime(2026, 10, 1, tzinfo=timezone.utc),
-            end=datetime(2026, 11, 1, tzinfo=timezone.utc),
-            group_by="customer",
-        )
-        ```
-        """
-        def ms(at: Optional[datetime]) -> int:
-            return int(at.timestamp() * 1000) if at else 0
-
-        res = self._transport.unary(
-            "QueryUsage",
-            api_pb2.QueryUsageRequest(
-                from_unix_ms=ms(start),
-                to_unix_ms=ms(end),
-                sandbox=sandbox,
-                tags=tags or {},
-                group_by=group_by,
-                after_id=after_id,
-                limit=limit,
-                is_open_included=include_open,
-            ),
-        )
-        return UsageReport(
-            intervals=[
-                UsageInterval(
-                    id=raw.id,
-                    sandbox_id=raw.sandbox_id,
-                    node_id=raw.node_id,
-                    template=raw.template,
-                    metadata=dict(raw.metadata),
-                    state=raw.state,
-                    vcpus=raw.vcpus,
-                    memory_mib=raw.mem_mib,
-                    started_at_unix_ms=raw.started_at_unix_ms,
-                    ended_at_unix_ms=raw.ended_at_unix_ms,
-                    cpu_usage_usec=raw.cpu_usage_usec,
-                    rx_bytes=raw.rx_bytes,
-                    tx_bytes=raw.tx_bytes,
-                    closed_by=raw.closed_by,
-                    open=raw.is_open,
-                )
-                for raw in res.intervals
-            ],
-            sums=[
-                UsageSum(
-                    group=raw.group,
-                    state=raw.state,
-                    intervals=raw.intervals,
-                    duration_ms=raw.duration_ms,
-                    vcpu_ms=raw.vcpu_ms,
-                    memory_mib_ms=raw.mem_mib_ms,
-                    cpu_usage_usec=raw.cpu_usage_usec,
-                    rx_bytes=raw.rx_bytes,
-                    tx_bytes=raw.tx_bytes,
-                )
-                for raw in res.sums
-            ],
-            next_after_id=res.next_after_id,
-        )
-
-    def drain_node(
-        self, node_id: str, drain: bool = True, suspend_sandboxes: bool = False
-    ) -> int:
-        """Stops (or resumes) placing new sandboxes on a node. Returns how many
-        sandboxes were suspended."""
-        res = self._transport.unary(
-            "DrainNode",
-            api_pb2.DrainNodeRequest(
-                node_id=node_id, is_draining=drain, suspend_sandboxes=suspend_sandboxes
-            ),
-        )
-        return res.suspended
-
-    def set_secret(
-        self,
-        name: str,
-        value: str,
-        *,
-        allowed_sandboxes: Optional[List[str]] = None,
-        allowed_tags: Optional[List[str]] = None,
-    ) -> None:
-        """Stores a credential that Sandbox Kits ask for by service name. The
-        value stays on the node and is injected into matching requests by the
-        egress proxy, so a guest never holds it. `name` is lowercase
-        kebab-case, the `service` a Kit credential names.
-
-        `allowed_sandboxes` (ids or names) and `allowed_tags` (`key=value`)
-        scope the secret: a reference to it from any other sandbox is refused.
-        Neither given, every sandbox may use it. Setting a secret replaces its
-        scope along with its value."""
-        self._transport.unary(
-            "SetSecret",
-            api_pb2.SetSecretRequest(
-                name=name,
-                value=value,
-                allowed_sandboxes=list(allowed_sandboxes or []),
-                allowed_tags=list(allowed_tags or []),
-            ),
-        )
-
-    def list_secrets(self) -> List[str]:
-        """Names of the stored secrets. Values are never returned."""
-        res = self._transport.unary("ListSecrets", api_pb2.ListSecretsRequest())
-        return list(res.names)
-
-    def list_secret_scopes(self) -> List[SecretInfo]:
-        """The stored secrets with their scopes. Values are never returned."""
-        res = self._transport.unary("ListSecrets", api_pb2.ListSecretsRequest())
-        return [
-            SecretInfo(
-                name=secret.name,
-                allowed_sandboxes=list(secret.allowed_sandboxes),
-                allowed_tags=list(secret.allowed_tags),
-            )
-            for secret in res.secrets
-        ]
-
-    def delete_secret(self, name: str) -> None:
-        self._transport.unary("DeleteSecret", api_pb2.DeleteSecretRequest(name=name))
-
-    def nodes(self) -> List[NodeInfo]:
-        res = self._transport.unary("ListNodes", api_pb2.ListNodesRequest())
-        return [
-            NodeInfo(
-                id=n.info.id,
-                address=n.info.address,
-                hostname=n.info.hostname,
-                total_vcpus=n.info.total_vcpus,
-                total_memory_mib=n.info.total_mem_mib,
-                free_memory_mib=n.status.free_mem_mib,
-                running_sandboxes=n.status.running_sandboxes,
-                healthy=n.is_healthy,
-                draining=n.status.is_draining,
-                labels=dict(n.info.labels),
-                arch=n.info.arch,
-                firecracker_version=n.info.firecracker_version,
-            )
-            for n in res.nodes
-        ]
-
-    def close(self) -> None:
-        self._transport.close()
-
-    def __enter__(self) -> "Burrow":
-        return self
-
-    def __exit__(self, *exc: Any) -> None:
+        """Releases the connection when the `with` block ends; the sandbox
+        goes on. `deleting()` is the block that destroys it."""
         self.close()

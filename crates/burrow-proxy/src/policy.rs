@@ -28,21 +28,11 @@ pub const MAX_PATTERN: usize = 256;
 /// keeps a policy from costing memory instead of time.
 const MAX_REGEX_BYTES: usize = 64 * 1024;
 
-/// How much egress a sandbox has at all.
-///
-/// The proxy needs this and not only `allow_domains`, because the resolver is
-/// reachable from every mode, including one with no egress, and a resolver that
-/// answers anything is a tunnel out. Defaults to the closed end.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-pub enum NetworkMode {
-    /// No egress at all.
-    #[default]
-    None,
-    /// Egress through the proxy, restricted to `allow_domains`.
-    Allowlist,
-    /// NAT'd egress, audited but not filtered.
-    Open,
-}
+/// How much egress a sandbox has at all, as the policy names it. Unspecified
+/// is the closed end: the proxy needs this and not only `allow_domains`,
+/// because the resolver is reachable from every mode, including one with no
+/// egress, and a resolver that answers anything is a tunnel out.
+pub use burrow_proto::common::v1::NetworkMode;
 
 /// How one string is compared against the part of a request it names.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -409,6 +399,46 @@ pub struct DeniedPorts {
     pub cidrs: Vec<String>,
 }
 
+impl DeniedPorts {
+    /// The proxy's copy of one `deny_ports` entry: the TCP ones only, since
+    /// UDP never reaches it.
+    ///
+    /// A range that is not one, which the API door refuses, becomes every port
+    /// rather than none: a denial read too broadly costs connections, one read
+    /// too narrowly grants what was withheld.
+    pub fn from_rule(rule: &burrow_proto::common::v1::PortRule) -> Option<Self> {
+        use burrow_proto::common::v1::PortProtocol;
+        if PortProtocol::try_from(rule.protocol) == Ok(PortProtocol::Udp) {
+            return None;
+        }
+        let first = u16::try_from(rule.port).ok().filter(|p| *p != 0);
+        let last = match rule.port_end {
+            0 => first,
+            end => u16::try_from(end).ok(),
+        };
+        let (first, last) = match (first, last) {
+            (Some(first), Some(last)) if first <= last => (first, last),
+            _ => (0, u16::MAX),
+        };
+        Some(Self {
+            first,
+            last,
+            cidrs: rule.cidrs.clone(),
+        })
+    }
+}
+
+impl From<&burrow_proto::common::v1::HttpRule> for HttpRule {
+    fn from(rule: &burrow_proto::common::v1::HttpRule) -> Self {
+        Self {
+            hosts: rule.hosts.clone(),
+            methods: rule.methods.clone(),
+            paths: rule.paths.clone(),
+            is_denying: rule.is_denied,
+        }
+    }
+}
+
 /// What the proxy knows about one sandbox.
 #[derive(Debug, Clone, Default)]
 pub struct SandboxPolicy {
@@ -452,6 +482,43 @@ pub struct SandboxPolicy {
     /// fills this in and updates it in place; `None`, as in a policy built by
     /// hand, means `rules` is all there is.
     pub live_rules: Option<Arc<LiveRules>>,
+}
+
+impl SandboxPolicy {
+    /// A sandbox's policy as its record states it, with no rules compiled
+    /// yet: those need the pattern engine and the sandbox they bind to, so
+    /// the caller sets `rules`. An absent policy is no egress.
+    pub fn from_record(
+        sandbox_id: &str,
+        network: Option<&burrow_proto::common::v1::NetworkPolicy>,
+    ) -> Self {
+        Self {
+            sandbox_id: sandbox_id.to_string(),
+            mode: network
+                .and_then(|n| NetworkMode::try_from(n.mode).ok())
+                .unwrap_or_default(),
+            allow_domains: network.map(|n| n.allow_domains.clone()).unwrap_or_default(),
+            is_tls_inspected: network.is_some_and(|n| n.is_tls_inspected),
+            deny_cidrs: network.map(|n| n.deny_cidrs.clone()).unwrap_or_default(),
+            deny_domains: network.map(|n| n.deny_domains.clone()).unwrap_or_default(),
+            deny_ports: network
+                .map(|n| {
+                    n.deny_ports
+                        .iter()
+                        .filter_map(DeniedPorts::from_rule)
+                        .collect()
+                })
+                .unwrap_or_default(),
+            is_ipv6_denied: network.is_some_and(|n| n.is_ipv6_denied),
+            http_rules: Arc::new(
+                network
+                    .map(|n| n.http_rules.iter().map(HttpRule::from).collect())
+                    .unwrap_or_default(),
+            ),
+            rules: Arc::new(Vec::new()),
+            live_rules: None,
+        }
+    }
 }
 
 /// One sandbox's current rules, updated in place across policy replacements.
@@ -553,7 +620,7 @@ impl SandboxPolicy {
         match self.mode {
             NetworkMode::Allowlist => true,
             NetworkMode::Open => self.is_selectively_inspected(host, now_unix_ms()),
-            NetworkMode::None => false,
+            NetworkMode::None | NetworkMode::Unspecified => false,
         }
     }
 
@@ -841,7 +908,7 @@ impl PolicyTable {
             // Open egress is otherwise unfiltered by definition; filtering its
             // DNS would stop nothing it cannot do directly.
             NetworkMode::Open => Decision::Allow,
-            NetworkMode::None => Decision::Deny("sandbox has no egress"),
+            NetworkMode::None | NetworkMode::Unspecified => Decision::Deny("sandbox has no egress"),
             NetworkMode::Allowlist => {
                 if name.is_empty() {
                     Decision::Deny("query names no host")

@@ -284,7 +284,7 @@ impl Resolver {
         }
 
         self.audit.record(EgressEvent {
-            at: crate::now_rfc3339(),
+            at_ms: burrow_common::unix_now_ms(),
             sandbox_id,
             source_ip: source_ip.to_string(),
             destination: if internal {

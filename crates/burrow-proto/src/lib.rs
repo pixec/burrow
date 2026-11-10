@@ -22,6 +22,67 @@ pub mod guest {
     }
 }
 
+impl common::v1::EventKind {
+    /// The name the event log and the CLI show.
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Unspecified => "",
+            Self::Created => "created",
+            Self::Started => "started",
+            Self::AgentReady => "agent_ready",
+            Self::Stopped => "stopped",
+            Self::Destroyed => "destroyed",
+            Self::SnapshotCreated => "snapshot_created",
+            Self::Recovered => "recovered",
+        }
+    }
+}
+
+impl common::v1::SessionStart {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Unspecified => "",
+            Self::Boot => "boot",
+            Self::Restore => "restore",
+            Self::Resume => "resume",
+        }
+    }
+}
+
+impl common::v1::SessionEnd {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Unspecified => "",
+            Self::Suspended => "suspended",
+            Self::Deleted => "deleted",
+            Self::Failed => "failed",
+            Self::Unknown => "unknown",
+            Self::Stopped => "stopped",
+        }
+    }
+}
+
+impl api::v1::UsageState {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Unspecified => "",
+            Self::Running => "running",
+            Self::Suspended => "suspended",
+            Self::Stopped => "stopped",
+        }
+    }
+}
+
+impl api::v1::CommandState {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Unspecified => "unknown",
+            Self::Running => "running",
+            Self::Exited => "exited",
+        }
+    }
+}
+
 impl guest::v1::fs_request::Op {
     /// The syscall an error names, and the paths it reports, as Node's do.
     pub fn describe(&self) -> (&'static str, &str, &str) {

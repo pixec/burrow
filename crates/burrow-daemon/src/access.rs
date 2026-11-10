@@ -243,11 +243,7 @@ impl AccessApi {
         permit(claims, sandbox_id, op)?;
         let held = self.sessions.open(sandbox_id, claims.issued_ms());
         let record = self.api.sandboxes.get(sandbox_id).await?.record();
-        let revoked_ms = burrow_common::access::revoked_before_ms(
-            record.access_revoked_at,
-            record.access_revoked_at_ms,
-        );
-        if claims.issued_ms() <= revoked_ms {
+        if claims.issued_ms() <= record.access_revoked_at_ms {
             return Err(revoked());
         }
         tracing::info!(
@@ -425,54 +421,6 @@ impl Access for AccessApi {
             .attach_stream(Box::pin(inbound), claims.user)
             .await?;
         Ok(Response::new(Box::pin(until_ended(output, held))))
-    }
-
-    async fn upload_file(
-        &self,
-        req: Request<tonic::Streaming<api::FileChunk>>,
-    ) -> Result<Response<api::UploadResult>, Status> {
-        let claims = self.claims(&req)?;
-        let mut inbound = req.into_inner();
-        let first = inbound
-            .next()
-            .await
-            .transpose()?
-            .ok_or_else(|| Status::invalid_argument("upload stream was empty"))?;
-        let sandbox_id = first.sandbox_id.clone();
-        let held = self.admit(&claims, &sandbox_id, OP_FILES_WRITE).await?;
-        // Failing the inbound stream is what makes the upload end as cut
-        // short, with the partial file removed, rather than as complete.
-        let inbound = until_ended(tokio_stream::once(Ok(first)).chain(inbound), held);
-        self.api
-            .upload_stream(Box::pin(inbound), claims.user)
-            .await
-            .map(Response::new)
-    }
-
-    type DownloadFileStream = BoxStream<api::FileChunk>;
-
-    async fn download_file(
-        &self,
-        req: Request<api::DownloadRequest>,
-    ) -> Result<Response<Self::DownloadFileStream>, Status> {
-        let claims = self.claims(&req)?;
-        let req = req.into_inner();
-        let held = self.admit(&claims, &req.sandbox_id, OP_FILES_READ).await?;
-        let stream = self.api.download_as(req, claims.user).await?;
-        Ok(Response::new(Box::pin(until_ended(stream, held))))
-    }
-
-    async fn list_dir(
-        &self,
-        req: Request<api::ListDirRequest>,
-    ) -> Result<Response<api::ListDirResponse>, Status> {
-        let claims = self.claims(&req)?;
-        let req = req.into_inner();
-        let _held = self.admit(&claims, &req.sandbox_id, OP_FILES_READ).await?;
-        self.api
-            .list_dir_as(req, claims.user)
-            .await
-            .map(Response::new)
     }
 
     async fn fs(&self, req: Request<api::FsRequest>) -> Result<Response<api::FsResponse>, Status> {

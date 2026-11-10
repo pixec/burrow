@@ -21,7 +21,8 @@ sandbox = Sandbox.get_or_create(
         "allow_domains": ["pypi.org", "*.pythonhosted.org"],
         "deny_cidrs": ["169.254.0.0/16"],
     },
-    resources={"vcpus": 1, "memory_mib": 512, "idle_suspend_secs": 300, "suspended_ttl_secs": 3600},
+    resources={"vcpus": 1, "memory_mib": 512},
+    lifetime={"idle_suspend_secs": 300, "suspended_ttl_secs": 3600},
     tags={"purpose": "quickstart", "owner": "sdk-example"},
     # Merged under every command this handle runs.
     env={"QUICKSTART": "1"},
@@ -103,15 +104,15 @@ try:
     finally:
         child.delete()
 
-    # stop suspends; resume brings it back.
-    sandbox.stop()
+    # pause suspends; resume brings it back.
+    sandbox.pause()
     started = time.monotonic()
     sandbox.resume()
     print("resumed in:", f"{(time.monotonic() - started) * 1000:.0f}ms")
     print("file survived:", sandbox.Path("/work/hello.sh").read_text().strip())
 
-    # Auto-resume: a call on a suspended sandbox resumes it and retries once.
-    sandbox.stop()
+    # Auto-resume: a call on a paused sandbox resumes it and retries once.
+    sandbox.pause()
     revived = sp.check_output(["cat", "/work/hello.sh"], text=True)
     print("auto-resumed:", revived.strip())
 finally:

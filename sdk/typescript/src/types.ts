@@ -1,4 +1,3 @@
-
 // Type-only, so it is erased rather than becoming an import cycle.
 import type { Sandbox } from "./sandbox.js";
 
@@ -16,17 +15,12 @@ export type SandboxState =
   | "failed"
   | "unknown";
 
-/** A credential the host attaches to egressing requests on the sandbox's behalf. */
-export interface HeaderInjection {
-  /** Domain glob, matched exactly like `allowDomains`. */
-  domain: string;
-  /** Header name, an RFC 9110 token. */
-  name: string;
-  /**
-   * Secret value. It never leaves the node: every read of a policy returns it
-   * redacted, so code in the guest can use the credential without holding it.
-   */
-  value: string;
+/** Options accepted by every call, alongside whatever else it takes. */
+export interface CallOptions {
+  /** Cancels the call. An aborted call rejects with code `"cancelled"`. */
+  signal?: AbortSignal;
+  /** Deadline for this call, over the client's default. */
+  timeoutMs?: number;
 }
 
 /**
@@ -96,12 +90,14 @@ export interface RequestRule {
   setHeaders?: Record<string, string>;
   forward?: ForwardRequest;
   /**
-   * Unix milliseconds at which the rule stops applying, with no further call.
-   * Omitted or 0 never expires.
+   * When the rule stops applying, with no further call. Omitted never
+   * expires.
    */
-  expiresAtUnixMs?: number;
-  /** Read only: the rule has passed `expiresAtUnixMs`. Ignored when sent. */
-  expired?: boolean;
+  expiresAt?: Date;
+}
+
+/** A rule as the server reports it. Secrets arrive redacted. */
+export interface AppliedRule extends RequestRule {
   /**
    * The one sandbox the rule applies in, set by the server on a rule whose
    * value came from a scoped secret. A copy of the policy elsewhere, a fork
@@ -161,6 +157,8 @@ export interface NetworkPolicyOptions {
    * allowance: an allowed domain that resolves into one of these is refused.
    */
   denyCidrs?: string[];
+  /** Domain globs refused in every mode, before any allowance is consulted. */
+  denyDomains?: string[];
   /**
    * Destination ports this sandbox may never connect to, in every mode,
    * ahead of every allowance, e.g. `[{ protocol: "tcp", port: 25 }]`. At
@@ -174,7 +172,7 @@ export interface NetworkPolicyOptions {
   denyIpv6?: boolean;
   /**
    * Terminate the sandbox's TLS so the host named inside the session is
-   * checked too, not just the SNI. Required by `rules` and `injectHeaders`.
+   * checked too, not just the SNI. Required by `rules`.
    */
   inspectTls?: boolean;
   /**
@@ -182,41 +180,28 @@ export interface NetworkPolicyOptions {
    * `inspectTls`. At most 32.
    */
   rules?: RequestRule[];
-  /**
-   * Credentials brokered on the host side, the shorthand for a rule with no
-   * matcher that sets one header. They are appended after `rules`, since a
-   * rule with no matcher claims every request to its domain.
-   */
-  injectHeaders?: HeaderInjection[];
 }
 
 /** Every accepted spelling of an egress policy. */
 export type NetworkInput = NetworkMode | NetworkPolicyOptions;
 
 /** Egress policy as the server reports it. Injected values arrive redacted. */
-export interface NetworkPolicy {
-  mode: NetworkMode;
-  allowDomains: string[];
-  allowCidrs: string[];
-  allowPorts: number[];
-  denyCidrs: string[];
-  denyPorts: PortRule[];
-  denyIpv6: boolean;
-  inspectTls: boolean;
+export type NetworkPolicy = Required<Omit<NetworkPolicyOptions, "rules">> & {
   /** What the host does to inspected requests, in order. Secrets are redacted. */
-  rules: RequestRule[];
-  /**
-   * The subset of `rules` that is a matcher-less header injection, kept for
-   * code written before rules existed. Values arrive redacted.
-   */
-  injectHeaders: HeaderInjection[];
-}
+  rules: AppliedRule[];
+};
 
-/** Machine shape and lifetime. Every `0` means "the server's default". */
+/** Machine shape. Every `0` means "the server's default". */
 export interface ResourceOptions {
   vcpus?: number;
   memoryMib?: number;
-  diskMib?: number;
+  scratchDiskMib?: number;
+}
+
+export type ResourcePolicy = Required<ResourceOptions>;
+
+/** How long the sandbox stays paid for. Every `0` means "unlimited". */
+export interface LifetimeOptions {
   /** Hard cap on how long the sandbox may live. 0 is unlimited. */
   maxLifetimeSecs?: number;
   /** Suspend after this many idle seconds. 0 never suspends. */
@@ -227,37 +212,33 @@ export interface ResourceOptions {
    * `suspended`, so it composes with `idleSuspendSecs`.
    */
   suspendedTtlSecs?: number;
+}
+
+export type LifetimePolicy = Required<LifetimeOptions>;
+
+/** How long snapshots taken of the sandbox stay paid for. */
+export interface SnapshotPolicyOptions {
   /**
    * Sweep snapshots of this sandbox this many seconds after they were last
    * used, where a use is a sandbox created from one. 0 keeps them until
    * something deletes them.
    */
-  snapshotExpirationSecs?: number;
+  expirationSecs?: number;
   /**
    * Keep only this many snapshots of the sandbox, evicting the oldest as a new
    * one is taken. 1 to 10; 0 is unlimited.
    */
-  keepLastSnapshots?: number;
+  keepLast?: number;
   /**
-   * Let a snapshot that `keepLastSnapshots` evicts live out its expiration
-   * instead of being deleted at once. Needs both `keepLastSnapshots` and
-   * `snapshotExpirationSecs`; without an expiry the server refuses it, since
-   * nothing would ever reclaim what was kept.
+   * Let a snapshot that `keepLast` evicts live out its expiration instead of
+   * being deleted at once. Needs both `keepLast` and `expirationSecs`;
+   * without an expiry the server refuses it, since nothing would ever reclaim
+   * what was kept.
    */
-  keepEvictedSnapshots?: boolean;
+  keepEvicted?: boolean;
 }
 
-export interface ResourcePolicy {
-  vcpus: number;
-  memoryMib: number;
-  diskMib: number;
-  maxLifetimeSecs: number;
-  idleSuspendSecs: number;
-  suspendedTtlSecs: number;
-  snapshotExpirationSecs: number;
-  keepLastSnapshots: number;
-  keepEvictedSnapshots: boolean;
-}
+export type SnapshotPolicy = Required<SnapshotPolicyOptions>;
 
 /** One volume attached to one sandbox at one path. */
 export interface VolumeMount {
@@ -322,39 +303,34 @@ export interface FsOptions {
   maxUploadBytes?: number;
 }
 
-export interface ExecPolicy {
-  allowExec: boolean;
-}
+export type ExecPolicy = Required<ExecOptions>;
 
-export interface FsPolicy {
-  allowUpload: boolean;
-  allowDownload: boolean;
-  pathScopes: string[];
-  maxUploadBytes: number;
-}
+export type FsPolicy = Required<FsOptions>;
 
 export interface SandboxPolicy {
   resources: ResourcePolicy;
+  lifetime: LifetimePolicy;
+  snapshots: SnapshotPolicy;
   /** Absent when the sandbox places no limit on exec. */
   exec?: ExecPolicy;
   /** Absent when the sandbox places no limit on file access. */
   fs?: FsPolicy;
   network: NetworkPolicy;
-  networks: NetworkMembership[];
+  networks: Required<NetworkMembership>[];
   /** Volumes the sandbox has mounted. */
-  volumes: VolumeMount[];
+  volumes: Required<VolumeMount>[];
 }
 
 /**
  * What a sandbox has actually consumed.
  *
- * Accumulated across every VM it has run, so a suspend and a resume do not
+ * Accumulated across every VM it has run, so a pause and a resume do not
  * reset it. A sandbox that has not run anything reports zeroes.
  */
 export interface Usage {
   /**
    * Host CPU in microseconds, read from the sandbox's cgroup. That covers the
-   * whole VMM: the guest's vCPU threads and Firecracker's own work for them.
+   * whole VMM: the guest's vCPU threads and the hypervisor's own work for them.
    */
   cpuUsageUsec: number;
   /** Bytes delivered to the guest, counted at its tap. */
@@ -366,32 +342,32 @@ export interface Usage {
 /**
  * One VM boot inside a sandbox's life.
  *
- * A sandbox outlives its VMs: a stop ends one and a resume starts the next, and
- * a fork or a create from a snapshot starts one from state written elsewhere.
+ * A sandbox outlives its VMs: a pause ends one and a resume starts the next,
+ * and a fork or a create from a snapshot starts one from state written
+ * elsewhere.
  */
 export interface Session {
   id: string;
   sandboxId: string;
-  /** RFC 3339. */
-  startedAt: string;
+  startedAt: Date;
   /**
-   * RFC 3339. Empty while the session is open, and empty for one the node died
-   * during: nothing recorded when that VM stopped.
+   * `null` while the session is open, and for one the node died during:
+   * nothing recorded when that VM stopped.
    */
-  endedAt: string;
+  endedAt: Date | null;
   startedBy: SessionStart;
-  /** Empty while the session is open. */
-  endedBy: SessionEnd | "";
+  /** `null` while the session is open. */
+  endedBy: SessionEnd | null;
 }
 
 /**
  * How a VM started. `boot` is from a template, `restore` from a fork or a
- * snapshot, `resume` from the sandbox's own stop state.
+ * snapshot, `resume` from the sandbox's own suspend state.
  */
 export type SessionStart = "boot" | "restore" | "resume" | "unknown";
 
 /** How a VM stopped. `unknown` is a session that was open when the node died. */
-export type SessionEnd = "suspended" | "deleted" | "failed" | "unknown";
+export type SessionEnd = "suspended" | "deleted" | "failed" | "stopped" | "unknown";
 
 export interface SandboxInfo {
   id: string;
@@ -400,7 +376,7 @@ export interface SandboxInfo {
   nodeId: string;
   template: string;
   state: SandboxState;
-  createdAt: string;
+  createdAt: Date;
   /** Address the sandbox holds on the networks it joined. */
   guestIp: string;
   tags: Record<string, string>;
@@ -418,6 +394,11 @@ export interface SandboxInfo {
    * node, and its next resume places it.
    */
   durable: boolean;
+  /** The hypervisor it runs under, and the version its saved state needs. */
+  hypervisor: string;
+  hypervisorVersion: string;
+  /** `linux`, `windows` or `macos`, from its template. */
+  guestOs: string;
 }
 
 /** Inputs for a template pulled from a Sandbox Kit. */
@@ -430,7 +411,7 @@ export interface KitOptions {
    * Capability types to decline, by full name. A Kit requiring one is refused;
    * one asking optionally does without.
    */
-  rejectCapabilities?: ReadonlyArray<string>;
+  rejectCapabilities?: string[];
 }
 
 /** Options for {@link Sandbox.recreate}. */
@@ -444,7 +425,27 @@ export interface RecreateOptions extends CallOptions {
   kit?: KitOptions;
 }
 
-export interface CreateOptions {
+/** What a handle keeps for itself, beside what the server holds. */
+export interface HandleOptions {
+  /**
+   * Environment for every command this handle runs, under whatever a single
+   * command passes.
+   *
+   * Held by the handle, not by the sandbox: there is nowhere on the server to
+   * put it, so a handle obtained in another process does not have it. Bake
+   * anything that has to survive into the template.
+   */
+  env?: Record<string, string>;
+  /**
+   * Resume a suspended sandbox and retry once when a call needs it running.
+   * Defaults to true.
+   */
+  autoResume?: boolean;
+  /** Called with the sandbox whenever this handle resumes it. */
+  onResume?: (sandbox: Sandbox) => void | Promise<void>;
+}
+
+export interface CreateOptions extends CallOptions, HandleOptions {
   /**
    * Name for the sandbox, usable anywhere its id is, and the only identity a
    * caller chooses: ids are generated by the server. 1 to 63 characters of
@@ -454,18 +455,21 @@ export interface CreateOptions {
    * `already_exists`, and fixed once the sandbox exists.
    */
   name?: string;
-  /** Guest image to boot. Defaults to `"default"`. */
+  /** Guest image to boot. */
   template?: string;
   /**
    * Snapshot id to start from. The sandbox **restores** that state instead of
    * booting, so it arrives with the snapshot's processes and memory, and
-   * `template` and `resources` may not disagree with what the
-   * snapshot holds. Placed on the node holding it: snapshots do not travel.
+   * `template` and `resources` may not disagree with what the snapshot
+   * holds. Placed on the node holding it: snapshots do not travel.
    */
   snapshot?: string;
-  /** Machine shape and lifetime. */
+  /** Machine shape. */
   resources?: ResourceOptions;
-
+  /** The clocks the sandbox is measured against. */
+  lifetime?: LifetimeOptions;
+  /** Retention of the snapshots taken of it. */
+  snapshots?: SnapshotPolicyOptions;
   /**
    * Egress policy. Defaults to `"none"`: a sandbox with no network at all.
    * Network access is opt-in, not opt-out. Pass a mode for the common case, or
@@ -503,7 +507,6 @@ export interface CreateOptions {
    * `failed_precondition` rather than landing somewhere else.
    */
   nodeLabels?: Record<string, string>;
-
   /**
    * Whether callers may run commands in this sandbox. Omitted allows exec,
    * which is the default for every sandbox.
@@ -514,39 +517,14 @@ export interface CreateOptions {
    * everything; passing it at all is what turns the limits on.
    */
   fs?: FsOptions;
-
   /** Tags, at most 16. Keys are 1..64 bytes, values up to 256. */
   tags?: Record<string, string>;
-  /**
-   * Environment for every command this handle runs, under whatever a single
-   * command passes.
-   *
-   * Held by the handle, not by the sandbox: there is nowhere on the server to
-   * put it, so a handle from {@link Sandbox.get} in another process does not
-   * have it. Bake anything that has to survive into the template.
-   */
-  env?: Record<string, string>;
-  /**
-   * Resume a suspended sandbox and retry once when a call needs it running.
-   * Defaults to true.
-   */
-  autoResume?: boolean;
-  /** Milliseconds to wait for the sandbox to boot. */
-  timeoutMs?: number;
-  signal?: AbortSignal;
 }
 
 /** Options for {@link Sandbox.get}. */
-export interface GetOptions {
+export interface GetOptions extends CallOptions, HandleOptions {
   /** Id or name. Every reference the API takes accepts either. */
-  sandboxId?: string;
-  /** The same thing under a shorter name. */
-  id?: string;
-  /** The sandbox's name, when that is what you have. */
-  name?: string;
-  /** Resume a suspended sandbox on demand. Defaults to true. */
-  autoResume?: boolean;
-  signal?: AbortSignal;
+  id: string;
 }
 
 /**
@@ -559,50 +537,28 @@ export interface GetOptions {
 export interface GetOrCreateOptions extends CreateOptions {
   /** Called with the sandbox when this call is the one that created it. */
   onCreate?: (sandbox: Sandbox) => void | Promise<void>;
-  /** Called with the sandbox whenever this handle resumes it. */
-  onResume?: (sandbox: Sandbox) => void | Promise<void>;
   /**
-   * Resume the sandbox if it is stopped. Defaults to false: a stopped sandbox
-   * is handed back stopped, and the first call that needs a running VM resumes
-   * it anyway unless `autoResume` is off.
+   * Resume the sandbox if it is suspended. Defaults to false: a suspended
+   * sandbox is handed back as it is, and the first call that needs a running
+   * VM resumes it anyway unless `autoResume` is off.
    */
   resume?: boolean;
 }
 
 /** Options for {@link Sandbox.list}. */
-export interface ListOptions {
+export interface ListOptions extends CallOptions, HandleOptions {
   /** One tag as `"key=value"`, matched exactly. Omitted lists everything. */
   tag?: string;
-  signal?: AbortSignal;
 }
 
 /**
- * Options for {@link Sandbox.update}.
- *
- * Only what the control plane can change on a live sandbox is here. The machine
- * shape is not: a running VM's configuration is fixed, and a restore takes it
- * from the snapshot. The clocks the sandbox is measured against do move.
+ * Options for {@link Sandbox.updateLifetime}. An omitted field is left where
+ * it is, so `0` keeps meaning "unlimited" here as it does on create.
  */
-export interface UpdateOptions {
-  /**
-   * Hard cap on how long the sandbox may live, in seconds from its creation.
-   * 0 is unlimited. Omitted leaves it where it is.
-   */
-  maxLifetimeSecs?: number;
-  /** Suspend after this many idle seconds. 0 never suspends. */
-  idleSuspendSecs?: number;
-  /** Delete a sandbox that has been suspended this long. 0 keeps it. */
-  suspendedTtlSecs?: number;
-  /**
-   * Replaces the tag set wholesale: an omitted tag is a tag removed, and `{}`
-   * clears them.
-   */
-  tags?: Record<string, string>;
-  /**
-   * Replaces the egress policy wholesale: an omitted field is an allowance
-   * withdrawn, which is what makes "lock this sandbox down" one call.
-   */
-  networkPolicy?: NetworkInput;
+export interface UpdateLifetimeOptions extends CallOptions, LifetimeOptions {}
+
+/** Options for {@link Sandbox.updateAccessPolicy}. */
+export interface UpdateAccessOptions extends CallOptions {
   /**
    * Replaces the exec policy wholesale. Omitted leaves it exactly as it is.
    *
@@ -616,24 +572,18 @@ export interface UpdateOptions {
    * restate the ones you want kept. Omitted leaves the policy as it is.
    */
   fs?: FsOptions;
-  signal?: AbortSignal;
 }
 
 /** Options for {@link Sandbox.move}. */
-export interface MoveOptions {
+export interface MoveOptions extends CallOptions {
   /** The node to move to. Omitted places it like a create. */
   nodeId?: string;
   /** Labels the destination must carry, when no node is named. */
   nodeLabels?: Record<string, string>;
-  signal?: AbortSignal;
 }
 
 /** Options for {@link Sandbox.fork}. */
-export interface ForkOptions {
-  /** Id for the child. Omitted has one generated. */
-  sandboxId?: string;
-  /** The same thing under a shorter name. */
-  id?: string;
+export interface ForkOptions extends CallOptions {
   /**
    * Name for the child. A fork never inherits its source's name, because a
    * name belongs to one sandbox.
@@ -646,6 +596,8 @@ export interface ForkOptions {
   networkPolicy?: NetworkInput;
   /** Private networks the child joins instead of the source's. */
   networks?: ReadonlyArray<string | NetworkMembership>;
+  /** Name the child answers to on those networks. */
+  alias?: string;
   /** Replaces the source's exec policy on the child. Omitted inherits it. */
   exec?: ExecOptions;
   /** Replaces the source's fs policy on the child. Omitted inherits it. */
@@ -656,13 +608,20 @@ export interface ForkOptions {
    * a source on a node without them fails with `failed_precondition`.
    */
   nodeLabels?: Record<string, string>;
-  signal?: AbortSignal;
 }
 
-/** Options accepted by every call, alongside whatever else it takes. */
-export interface CallOptions {
-  /** Cancels the call. An aborted call rejects with code `"cancelled"`. */
-  signal?: AbortSignal;
+/** Options for {@link Sandbox.getCommand}. */
+export interface GetCommandOptions extends CallOptions {
+  /** Output offset to replay from, stdout and stderr counted together. */
+  fromOffset?: number;
+}
+
+/** Options for {@link Sandbox.exposePort}. */
+export interface ExposePortOptions extends CallOptions {
+  /** Host port to publish on. Omitted lets the node pick one. */
+  hostPort?: number;
+  /** Forward UDP rather than TCP. */
+  udp?: boolean;
 }
 
 /**
@@ -678,7 +637,7 @@ export interface CommandInfo {
   cmd: string[];
   /** The user it ran as. Empty means root. */
   user: string;
-  state: "running" | "exited" | "unknown";
+  state: CommandState;
   /** Meaningful only once `state` is `"exited"`. */
   exitCode: number;
   startedAt: Date;
@@ -694,6 +653,8 @@ export interface CommandInfo {
    */
   outputBytes: number;
 }
+
+export type CommandState = "running" | "exited" | "unknown";
 
 /** A user created inside the guest. */
 export interface GuestUser {
@@ -725,7 +686,7 @@ export interface PortMapping {
   /**
    * Stable per-sandbox URL through the edge router on the node holding the
    * sandbox, `http://<port>-<sandbox-id>.<edge-domain>/`. Traffic arriving on it
-   * for a stopped sandbox wakes it. Absent when that node runs no edge, which
+   * for a suspended sandbox wakes it. Absent when that node runs no edge, which
    * means it has no hostname routing and {@link url} is the whole answer, and
    * always absent for a UDP mapping, which the edge cannot route.
    */
@@ -744,8 +705,8 @@ export interface Share {
   ports: number[];
   /** `nodekey:<hex>` of each admitted client; empty admits anyone. */
   allowedClients: string[];
-  /** RFC 3339; when the current keys were issued. */
-  createdAt: string;
+  /** When the current keys were issued. */
+  createdAt: Date;
   /** Guest UDP ports reachable through the share; none unless listed or `allUdp`. */
   udpPorts: number[];
   allUdp: boolean;
@@ -757,7 +718,7 @@ export interface Share {
   transparentIp: boolean;
 }
 
-export interface ShareOptions {
+export interface ShareOptions extends CallOptions {
   /** Guest TCP ports reachable through the share. Omitted shares every port. */
   ports?: number[];
   /** Client node keys admitted, as `nodekey:<hex>`. Omitted admits anyone. */
@@ -769,11 +730,22 @@ export interface ShareOptions {
   /** Share every UDP port. */
   allUdp?: boolean;
   /**
-   * Source connections from the gateway instead of from the client's own
-   * public IPv4, which is what the guest sees by default.
+   * Source connections from the client's own public IPv4, which is what the
+   * guest sees by default. `false` sources them from the gateway.
    */
-  noTransparentIp?: boolean;
-  signal?: AbortSignal;
+  transparentIp?: boolean;
+}
+
+/** A node's disk, as its last heartbeat reported it. */
+export interface DiskCapacity {
+  freeBytes: number;
+  totalBytes: number;
+  /** What the node keeps free and promises to no sandbox. */
+  reserveBytes: number;
+  /** Disk promised to sandboxes and not yet written. */
+  unwrittenBytes: number;
+  /** How far promises may exceed free space; 1 means never. */
+  overcommit: number;
 }
 
 export interface NodeInfo {
@@ -786,6 +758,7 @@ export interface NodeInfo {
   runningSandboxes: number;
   healthy: boolean;
   draining: boolean;
+  lastHeartbeatAt: Date;
   /**
    * What the operator labelled this node with. Constrain a create to hardware
    * carrying particular labels with {@link CreateOptions.nodeLabels}.
@@ -793,13 +766,23 @@ export interface NodeInfo {
   labels: Record<string, string>;
   /** Cpu architecture. Durable snapshots only restore on a matching node. */
   arch: string;
-  /** The Firecracker this node runs. Durable snapshots need an exact match. */
-  firecrackerVersion: string;
+  /** Each offered hypervisor's version. Saved state needs an exact match. */
+  hypervisorVersions: Record<string, string>;
+  /** Absent for a node that does not report disk. */
+  disk?: DiskCapacity;
+  /** Free disk is below the reserve; the node refuses creates until it is not. */
+  diskLow: boolean;
+}
+
+/** Options for {@link Burrow.drainNode}. */
+export interface DrainOptions extends CallOptions {
+  /** Also suspend every sandbox the node runs, so the drain leaves nothing live. */
+  suspend?: boolean;
 }
 
 /** One recorded egress attempt or DNS lookup. */
 export interface AuditEvent {
-  at: string;
+  at: Date;
   sandboxId: string;
   sourceIp: string;
   destination: string;
@@ -813,14 +796,25 @@ export interface AuditEvent {
   nodeId: string;
 }
 
-export interface AuditQuery {
+export interface AuditQuery extends CallOptions {
   sandboxId?: string;
   /** Only attempts that were refused. */
   deniedOnly?: boolean;
-  /** RFC 3339 lower bound. */
-  since?: string;
+  /** Lower bound. */
+  since?: Date | number;
   limit?: number;
 }
+
+/** What happened to a sandbox. `recovered` is one a node found on restart. */
+export type EventKind =
+  | "created"
+  | "started"
+  | "agent_ready"
+  | "stopped"
+  | "destroyed"
+  | "snapshot_created"
+  | "recovered"
+  | "unknown";
 
 /**
  * One thing that happened to a sandbox, from the fleet's lifecycle log.
@@ -834,15 +828,9 @@ export interface LifecycleEvent {
   nodeId: string;
   /** Position in the recording node's own log. */
   nodeSeq: number;
-  /** Milliseconds since the Unix epoch. */
-  atUnixMs: number;
+  at: Date;
   sandboxId: string;
-  /**
-   * `created`, `started`, `agent_ready`, `stopped`, `destroyed`,
-   * `snapshot_created`, or `recovered` for each sandbox a node found on
-   * restart.
-   */
-  type: string;
+  kind: EventKind;
   state: SandboxState;
   /**
    * How a VM started (`boot`, `restore`, `resume`) or stopped (`suspended`,
@@ -852,7 +840,7 @@ export interface LifecycleEvent {
    */
   detail: string;
   template: string;
-  metadata: Record<string, string>;
+  tags: Record<string, string>;
   cpuUsageUsec: number;
   rxBytes: number;
   txBytes: number;
@@ -861,33 +849,39 @@ export interface LifecycleEvent {
 }
 
 /** Options for {@link Burrow.events}. */
-export interface EventsOptions {
+export interface EventsOptions extends CallOptions {
   /** Start after this `seq`. Omitted replays from the oldest event kept. */
   after?: number;
   /** Only events for this sandbox, by id or name. */
-  sandbox?: string;
+  sandboxId?: string;
   /** Keep yielding new events after the replay instead of ending. */
   follow?: boolean;
   /** Cap on replayed events. Omitted lets the server choose. */
   limit?: number;
-  signal?: AbortSignal;
 }
 
+/**
+ * What a sandbox was doing over an interval. Coarser than its state: paused
+ * and suspended both hold memory and no cpu, failed and stopped both hold a
+ * disk and nothing else.
+ */
+export type UsageState = "running" | "suspended" | "stopped" | "unknown";
+
+/** What {@link Burrow.usage} sums by. `tag:<key>` groups by that tag's value. */
+export type UsageGroup = "sandbox" | "template" | "node" | "state" | `tag:${string}`;
+
 /** Options for {@link Burrow.usage}. */
-export interface UsageQuery {
+export interface UsageQuery extends CallOptions {
   /** Intervals that start at or after this. Omitted leaves the window open. */
   from?: Date | number;
   /** Intervals that start before this. */
   to?: Date | number;
   /** One sandbox, by id or by the name of one that still exists. */
-  sandbox?: string;
+  sandboxId?: string;
   /** Only sandboxes that carried every one of these tags. */
   tags?: Record<string, string>;
-  /**
-   * `sandbox`, `template`, `node`, `state` or a tag key. Given, the report
-   * holds sums per group and state instead of intervals.
-   */
-  groupBy?: string;
+  /** Given, the report holds sums per group and state instead of intervals. */
+  groupBy?: UsageGroup;
   /** Continue an export after this interval id, from `nextAfterId`. */
   afterId?: number;
   /** Intervals per page. Omitted lets the server choose; sums are never paged. */
@@ -910,18 +904,18 @@ export interface UsageInterval {
   sandboxId: string;
   nodeId: string;
   template: string;
-  metadata: Record<string, string>;
-  /** `running`, `suspended` or `stopped`. */
-  state: string;
+  tags: Record<string, string>;
+  state: UsageState;
   vcpus: number;
   memoryMib: number;
-  startedAtUnixMs: number;
-  endedAtUnixMs: number;
+  startedAt: Date;
+  /** `null` while the interval is open. */
+  endedAt: Date | null;
   cpuUsageUsec: number;
   rxBytes: number;
   txBytes: number;
   /**
-   * The event type that ended the state, `checkpoint` for the hourly split,
+   * The event kind that ended the state, `checkpoint` for the hourly split,
    * or `write_off` for a node that went silent. Empty while open.
    */
   closedBy: string;
@@ -931,7 +925,7 @@ export interface UsageInterval {
 /** Intervals summed for one group in one state. */
 export interface UsageSum {
   group: string;
-  state: string;
+  state: UsageState;
   intervals: number;
   durationMs: number;
   /** Duration weighted by vCPUs, for vCPU-hours. */

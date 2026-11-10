@@ -4,18 +4,16 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
 
-import { Burrow, Snapshot } from "../dist/index.js";
+import { Snapshot } from "../dist/index.js";
+import { fakeBurrow } from "./helpers.mjs";
 
 function burrowStreaming(rows, calls) {
-  const burrow = new Burrow({ endpoint: "localhost:1" });
-  burrow.close();
-  burrow.transport = {
+  return fakeBurrow({
     async *serverStream(method, request, timeoutMs) {
       calls.push({ method, request, timeoutMs });
       yield* rows;
     },
-  };
-  return burrow;
+  });
 }
 
 test("events maps the request and each row", async () => {
@@ -28,11 +26,11 @@ test("events maps the request and each row", async () => {
         nodeSeq: 7,
         atUnixMs: 1_790_000_000_000,
         sandboxId: "sbx_a",
-        type: "started",
+        kind: "EVENT_KIND_STARTED",
         state: "SANDBOX_STATE_RUNNING",
         detail: "boot",
         template: "python",
-        metadata: { team: "ml" },
+        tags: { team: "ml" },
         cpuUsageUsec: 1200,
         rxBytes: 10,
         txBytes: 20,
@@ -43,13 +41,13 @@ test("events maps the request and each row", async () => {
     calls,
   );
   const events = [];
-  for await (const event of burrow.events({ after: 47, sandbox: "build-482", limit: 5 })) {
+  for await (const event of burrow.events({ after: 47, sandboxId: "build-482", limit: 5 })) {
     events.push(event);
   }
   assert.deepEqual(calls, [
     {
       method: "TailEvents",
-      request: { afterSeq: 47, sandbox: "build-482", isFollow: false, limit: 5 },
+      request: { afterSeq: 47, sandboxId: "build-482", isFollow: false, limit: 5 },
       timeoutMs: undefined,
     },
   ]);
@@ -58,13 +56,13 @@ test("events maps the request and each row", async () => {
       seq: 48,
       nodeId: "node-1",
       nodeSeq: 7,
-      atUnixMs: 1_790_000_000_000,
+      at: new Date(1_790_000_000_000),
       sandboxId: "sbx_a",
-      type: "started",
+      kind: "started",
       state: "running",
       detail: "boot",
       template: "python",
-      metadata: { team: "ml" },
+      tags: { team: "ml" },
       cpuUsageUsec: 1200,
       rxBytes: 10,
       txBytes: 20,
@@ -85,21 +83,30 @@ test("a follow has no deadline", async () => {
 });
 
 test("a snapshot surfaces where it can be restored", () => {
-  const snapshot = Snapshot.adopt(
+  const snapshot = new Snapshot(
     { close() {} },
-    { id: "snap_a", isDurable: true, arch: "aarch64", firecrackerVersion: "1.13.1" },
+    {
+      id: "snap_a",
+      isDurable: true,
+      arch: "aarch64",
+      hypervisor: "firecracker",
+      hypervisorVersion: "1.13.1",
+      resources: { vcpus: 2, memMib: 1024, scratchDiskMib: 2048 },
+      createdAtUnixMs: 1_790_000_000_000,
+    },
   );
-  assert.equal(snapshot.isDurable, true);
+  assert.equal(snapshot.durable, true);
   assert.equal(snapshot.arch, "aarch64");
-  assert.equal(snapshot.firecrackerVersion, "1.13.1");
+  assert.equal(snapshot.hypervisorVersion, "1.13.1");
+  assert.deepEqual(snapshot.resources, { vcpus: 2, memoryMib: 1024, scratchDiskMib: 2048 });
+  assert.equal(snapshot.createdAt.getTime(), 1_790_000_000_000);
+  assert.equal(snapshot.expiresAt, null);
   assert.equal(snapshot.nodeId, "");
 });
 
 test("usage maps the query and the report", async () => {
   const calls = [];
-  const burrow = new Burrow({ endpoint: "localhost:1" });
-  burrow.close();
-  burrow.transport = {
+  const burrow = fakeBurrow({
     async unary(method, request) {
       calls.push({ method, request });
       return {
@@ -109,8 +116,8 @@ test("usage maps the query and the report", async () => {
             sandboxId: "sbx_a",
             nodeId: "node-1",
             template: "python",
-            metadata: { customer: "acme" },
-            state: "running",
+            tags: { customer: "acme" },
+            state: "USAGE_STATE_RUNNING",
             vcpus: 2,
             memMib: 2048,
             startedAtUnixMs: 1_000,
@@ -124,11 +131,12 @@ test("usage maps the query and the report", async () => {
         nextAfterId: 9,
       };
     },
-  };
+  });
   const report = await burrow.usage({
     from: new Date(Date.UTC(2026, 9, 1)),
     to: 1_793_491_200_000,
     tags: { customer: "acme" },
+    groupBy: "tag:customer",
     limit: 1,
   });
   assert.deepEqual(calls, [
@@ -137,9 +145,10 @@ test("usage maps the query and the report", async () => {
       request: {
         fromUnixMs: 1_790_812_800_000,
         toUnixMs: 1_793_491_200_000,
-        sandbox: "",
+        sandboxId: "",
         tags: { customer: "acme" },
-        groupBy: "",
+        groupBy: "USAGE_GROUP_TAG",
+        groupByTag: "customer",
         afterId: 0,
         limit: 1,
         isOpenIncluded: true,
@@ -153,12 +162,12 @@ test("usage maps the query and the report", async () => {
     sandboxId: "sbx_a",
     nodeId: "node-1",
     template: "python",
-    metadata: { customer: "acme" },
+    tags: { customer: "acme" },
     state: "running",
     vcpus: 2,
     memoryMib: 2048,
-    startedAtUnixMs: 1_000,
-    endedAtUnixMs: 61_000,
+    startedAt: new Date(1_000),
+    endedAt: new Date(61_000),
     cpuUsageUsec: 5_000_000,
     rxBytes: 10,
     txBytes: 20,

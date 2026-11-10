@@ -261,10 +261,10 @@ impl Entry {
             cmd: self.cmd.clone(),
             user: self.user.clone(),
             state: if self.exit_code.is_some() {
-                "exited".into()
+                guestpb::CommandState::Exited
             } else {
-                "running".into()
-            },
+                guestpb::CommandState::Running
+            } as i32,
             exit_code: self.exit_code.unwrap_or_default(),
             started_at_unix_ms: self.started_at_ms,
             ended_at_unix_ms: self.ended_at_ms,
@@ -757,8 +757,8 @@ mod tests {
         assert_eq!(pending[2].kind, 2);
         let info = get(handle.id()).unwrap();
         assert_eq!(
-            (info.state.as_str(), info.exit_code, info.output_bytes),
-            ("exited", 3, 11)
+            (info.state, info.exit_code, info.output_bytes),
+            (guestpb::CommandState::Exited as i32, 3, 11)
         );
     }
 
@@ -826,7 +826,10 @@ mod tests {
         assert!(pruned.command_ids.contains(&done.id().to_string()));
         assert!(!pruned.command_ids.contains(&running.id().to_string()));
         assert_eq!(get(done.id()).unwrap_err().code(), tonic::Code::NotFound);
-        assert_eq!(get(running.id()).unwrap().state, "running");
+        assert_eq!(
+            get(running.id()).unwrap().state,
+            guestpb::CommandState::Running as i32
+        );
     }
 
     struct Recorder(Mutex<Vec<i32>>);

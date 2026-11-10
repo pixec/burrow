@@ -36,7 +36,7 @@ service Burrow {
   rpc ListSessions(SandboxRef) returns (ListSessionsResponse);
   // Move the clocks a running sandbox is measured against: lifetime, idle
   // suspension and suspended retention. The machine shape is not movable.
-  rpc UpdateResources(UpdateResourcesRequest) returns (burrow.common.v1.Sandbox);
+  rpc UpdateLifetime(UpdateLifetimeRequest) returns (burrow.common.v1.Sandbox);
   // Create a sandbox from another's current state, on the source's node.
   rpc ForkSandbox(ForkSandboxRequest) returns (burrow.common.v1.Sandbox);
   // Move a sandbox to another node through the object store. A running one
@@ -78,9 +78,6 @@ service Burrow {
   // Exec is bidirectional and PTY-capable.
   rpc Exec(stream ExecInput) returns (stream ExecOutput);
   rpc Attach(stream AttachInput) returns (stream ExecOutput);
-  rpc UploadFile(stream FileChunk) returns (UploadResult);
-  rpc DownloadFile(DownloadRequest) returns (stream FileChunk);
-  rpc ListDir(ListDirRequest) returns (ListDirResponse);
   rpc Watch(WatchRequest) returns (stream WatchEvent);
   rpc Fs(FsRequest) returns (FsResponse);
 
@@ -153,15 +150,12 @@ service Access {
   // Follows a running or finished command from any stream, resuming from an
   // output offset, and feeds its stdin, terminal size and signals.
   rpc Attach(stream AttachInput) returns (stream ExecOutput);
-  rpc UploadFile(stream FileChunk) returns (UploadResult);
-  rpc DownloadFile(DownloadRequest) returns (stream FileChunk);
-  rpc ListDir(ListDirRequest) returns (ListDirResponse);
   rpc Watch(WatchRequest) returns (stream WatchEvent);
   rpc Fs(FsRequest) returns (FsResponse);
 }
 
 message IssueAccessRequest {
-  SandboxRef ref = 1;
+  string sandbox_id = 1;
   // What the token may do: "exec", "files:read" (download, list, watch) and
   // "files:write" (upload). Empty grants all three.
   repeated string ops = 2;
@@ -179,22 +173,23 @@ message AccessGrant {
   string endpoint = 1;
   // Bearer token for that endpoint, a JWT signed by the orchestrator.
   string token = 2;
-  // Unix seconds after which the node refuses the token.
-  int64 expires_at = 3;
+  reserved 3;
+  reserved "expires_at";
   string node_id = 4;
   // The sandbox's id, which requests to the endpoint have to carry: the node
   // matches it against the token and does not resolve names.
   string sandbox_id = 5;
+  // Unix milliseconds after which the node refuses the token.
+  int64 expires_at_unix_ms = 6;
 }
 
 message RevokeAccessResponse {
-  // The unix second of the revoke; `revoked_at_ms` is the exact stamp.
-  int64 revoked_at = 1;
+  reserved 1;
+  reserved "revoked_at";
   // Direct sessions that were open and have been ended: execs, attaches,
   // transfers and watches.
   uint32 ended_sessions = 2;
-  // Tokens issued at or before this unix millisecond are refused. One issued
-  // after it, in the same second included, works.
+  // Tokens issued at or before this unix millisecond are refused.
   int64 revoked_at_ms = 3;
   // Commands the revoked tokens started, or typed into over Attach, that
   // were killed.
@@ -205,14 +200,17 @@ message AuditQuery {
   // Empty means every sandbox.
   string sandbox_id = 1;
   bool is_denied_only = 2;
-  // RFC 3339 lower bound.
-  string since = 3;
+  reserved 3;
+  reserved "since";
   // 0 selects a server default.
   uint32 limit = 4;
+  // Unix milliseconds lower bound.
+  int64 since_unix_ms = 5;
 }
 
 message AuditEvent {
-  string at = 1;
+  reserved 1;
+  reserved "at";
   string sandbox_id = 2;
   string source_ip = 3;
   string destination = 4;
@@ -223,17 +221,15 @@ message AuditEvent {
   uint64 bytes_sent = 9;
   uint64 bytes_received = 10;
   string node_id = 11;
-}
-
-message AuditPage {
-  repeated AuditEvent events = 1;
+  int64 at_unix_ms = 12;
 }
 
 message TailEventsRequest {
   // Replay starts after this `seq`; 0 from the beginning of what is kept.
   uint64 after_seq = 1;
-  // Empty means every sandbox.
-  string sandbox = 2;
+  // A sandbox id, or the name of one that still exists. Empty means every
+  // sandbox.
+  string sandbox_id = 2;
   // Keep streaming new events after the replay instead of ending.
   bool is_follow = 3;
   // Cap on replayed events; 0 selects a server default.
@@ -247,13 +243,12 @@ message QueryUsageRequest {
   int64 to_unix_ms = 2;
   // A sandbox id, or the name of one that still exists. Empty means every
   // sandbox.
-  string sandbox = 3;
+  string sandbox_id = 3;
   // Only intervals whose sandbox carried every one of these tags.
   map<string, string> tags = 4;
-  // "sandbox", "template", "node", "state", or a tag key. Empty returns the
-  // intervals themselves; anything else returns their sums per group and
-  // state.
-  string group_by = 5;
+  // Unspecified returns the intervals themselves; anything else returns
+  // their sums per group and state.
+  UsageGroup group_by = 5;
   // Intervals with a row id above this, for an export that resumes where it
   // stopped. Open intervals have no id and are never returned with a cursor.
   uint64 after_id = 6;
@@ -263,6 +258,28 @@ message QueryUsageRequest {
   // Also count the stretch since each open interval began, up to the last
   // heartbeat, as a row with `is_open` set.
   bool is_open_included = 8;
+  // The tag key to group by, with USAGE_GROUP_TAG.
+  string group_by_tag = 9;
+}
+
+enum UsageGroup {
+  USAGE_GROUP_UNSPECIFIED = 0;
+  USAGE_GROUP_SANDBOX = 1;
+  USAGE_GROUP_TEMPLATE = 2;
+  USAGE_GROUP_NODE = 3;
+  USAGE_GROUP_STATE = 4;
+  // By the value of the tag `group_by_tag` names.
+  USAGE_GROUP_TAG = 5;
+}
+
+// What a sandbox was doing over an interval. Coarser than SandboxState: paused
+// and suspended both hold memory and no cpu, failed and stopped both hold a
+// disk and nothing else.
+enum UsageState {
+  USAGE_STATE_UNSPECIFIED = 0;
+  USAGE_STATE_RUNNING = 1;
+  USAGE_STATE_SUSPENDED = 2;
+  USAGE_STATE_STOPPED = 3;
 }
 
 message UsageInterval {
@@ -272,9 +289,8 @@ message UsageInterval {
   string sandbox_id = 2;
   string node_id = 3;
   string template = 4;
-  map<string, string> metadata = 5;
-  // "running", "suspended" or "stopped".
-  string state = 6;
+  map<string, string> tags = 5;
+  UsageState state = 6;
   uint32 vcpus = 7;
   uint32 mem_mib = 8;
   int64 started_at_unix_ms = 9;
@@ -293,7 +309,7 @@ message UsageInterval {
 message UsageSum {
   // The group's value; empty for intervals without the tag grouped by.
   string group = 1;
-  string state = 2;
+  UsageState state = 2;
   uint64 intervals = 3;
   uint64 duration_ms = 4;
   // Duration weighted by shape, for vCPU-hours and GiB-hours.
@@ -319,9 +335,16 @@ message WatchRequest {
 }
 
 message WatchEvent {
-  string type = 1;
+  WatchEventKind kind = 1;
   string path = 2;
   bool is_dir = 3;
+}
+
+enum WatchEventKind {
+  WATCH_EVENT_KIND_UNSPECIFIED = 0;
+  WATCH_EVENT_KIND_CREATED = 1;
+  WATCH_EVENT_KIND_MODIFIED = 2;
+  WATCH_EVENT_KIND_DELETED = 3;
 }
 
 message BuildStep {
@@ -470,10 +493,12 @@ message ShareRequest {
   bool is_all_udp = 7;
   reserved 8;
   reserved "transparent_ip";
-  // Source connections from the gateway rather than from the client's own
-  // address. On by default: a guest that can see who is calling can log,
+  reserved 9;
+  reserved "is_transparent_ip_disabled";
+  // Source connections from the client's own address rather than from the
+  // gateway. Unset is on: a guest that can see who is calling can log,
   // rate-limit and authorise on it with no idea a tunnel is involved.
-  bool is_transparent_ip_disabled = 9;
+  optional bool is_transparent_ip = 10;
 }
 
 message Share {
@@ -484,10 +509,8 @@ message Share {
   // Empty means every port.
   repeated uint32 ports = 3;
   repeated string allowed_clients = 4;
-  reserved 5;
-  reserved "proxy_protocol";
-  // RFC 3339; the moment the current keys were issued.
-  string created_at = 6;
+  reserved 5, 6;
+  reserved "proxy_protocol", "created_at";
   repeated uint32 udp_ports = 7;
   bool is_all_udp = 8;
   // What the share is actually doing, which is not always what was asked
@@ -496,43 +519,11 @@ message Share {
   bool is_transparent_ip = 9;
   reserved 10, 11;
   reserved "client_range", "client_source_ips";
+  // The moment the current keys were issued.
+  int64 created_at_unix_ms = 12;
 }
 
 message UnshareResponse {}
-
-message FileChunk {
-  // Both set on the first message of an upload only.
-  string sandbox_id = 1;
-  string path = 2;
-  // Unix mode for a created file; 0 means 0644.
-  uint32 mode = 3;
-  bytes data = 4;
-}
-
-message UploadResult {
-  uint64 bytes_written = 1;
-}
-
-message DownloadRequest {
-  string sandbox_id = 1;
-  string path = 2;
-}
-
-message ListDirRequest {
-  string sandbox_id = 1;
-  string path = 2;
-}
-
-message DirEntry {
-  string name = 1;
-  bool is_dir = 2;
-  uint64 size = 3;
-  uint32 mode = 4;
-}
-
-message ListDirResponse {
-  repeated DirEntry entries = 1;
-}
 
 message HealthRequest {}
 message HealthResponse {
@@ -548,8 +539,9 @@ message Node {
   burrow.common.v1.NodeInfo info = 1;
   burrow.common.v1.NodeStatus status = 2;
   bool is_healthy = 3;
-  // RFC 3339 time of last heartbeat.
-  string last_heartbeat_at = 4;
+  reserved 4;
+  reserved "last_heartbeat_at";
+  int64 last_heartbeat_at_unix_ms = 5;
 }
 
 message DrainNodeRequest {
@@ -558,7 +550,7 @@ message DrainNodeRequest {
   bool is_draining = 2;
   // Also suspend every sandbox the node is running, so the drain leaves
   // nothing live on it.
-  bool suspend_sandboxes = 3;
+  bool is_suspending = 3;
 }
 
 message DrainNodeResponse {
@@ -567,13 +559,14 @@ message DrainNodeResponse {
 
 // Names a sandbox, by its id or by the name it was created with. The id is
 // tried first; ids carry a "sbx_" prefix that a name may not, so the two
-// namespaces cannot collide.
+// namespaces cannot collide. Every `sandbox_id` field on a request accepts
+// the same.
 message SandboxRef {
-  string id = 1;
+  string sandbox_id = 1;
 }
 
 message UpdateNetworkPolicyRequest {
-  SandboxRef ref = 1;
+  string sandbox_id = 1;
   // The whole policy, not a patch: an omitted field is an allowance withdrawn,
   // which is what makes "lock this sandbox down" a single call.
   burrow.common.v1.NetworkPolicy network = 2;
@@ -591,7 +584,7 @@ message UpdateNetworkPolicyRequest {
 // silent re-opening of `exec`, which is the opposite of what the caller asked
 // for.
 message UpdateAccessPolicyRequest {
-  SandboxRef ref = 1;
+  string sandbox_id = 1;
   optional burrow.common.v1.ExecPolicy exec = 2;
   optional burrow.common.v1.FsPolicy fs = 3;
 }
@@ -609,33 +602,25 @@ message ListSessionsResponse {
 // three fields answer the same question, how long this sandbox stays paid for,
 // and are read by the same reaper on the same pass. Each is optional so that
 // 0 keeps its meaning of "unlimited" instead of colliding with "leave it".
-//
-// The machine shape is here only so a caller who sends one is told why it was
-// refused: a running VM's configuration is fixed, and a restore takes it from
-// the snapshot, so vcpus, memory and scratch disk cannot move.
-message UpdateResourcesRequest {
-  SandboxRef ref = 1;
+message UpdateLifetimeRequest {
+  string sandbox_id = 1;
   optional uint64 max_lifetime_secs = 2;
   optional uint64 idle_suspend_secs = 3;
   optional uint64 suspended_ttl_secs = 4;
-  uint32 vcpus = 5;
-  uint32 mem_mib = 6;
-  uint32 scratch_disk_mib = 7;
 }
 
 // Replaces a sandbox's whole tag set: an omitted tag is a tag removed, and an
 // empty map clears them, which is what makes "retag this sandbox" one call.
 message UpdateTagsRequest {
-  SandboxRef ref = 1;
+  string sandbox_id = 1;
   map<string, string> tags = 2;
 }
 
 message ForkSandboxRequest {
   // The sandbox to fork. It keeps running; a running source's state is written
   // first so the child starts from its state as of the call.
-  SandboxRef ref = 1;
-  // Id for the child; empty has one generated.
-  string sandbox_id = 2;
+  string sandbox_id = 1;
+  reserved 2;
   // Replaces the source's policy on the child. Empty inherits it, which is the
   // usual case: a fork is meant to be the same sandbox again. `resources` is
   // the exception: a restore takes its machine configuration from the
@@ -654,7 +639,7 @@ message ForkSandboxRequest {
 }
 
 message MoveSandboxRequest {
-  SandboxRef ref = 1;
+  string sandbox_id = 1;
   // The node to move to. Empty lets the orchestrator place it.
   string node_id = 2;
   // Labels the destination must carry, when no node is named.
@@ -666,17 +651,16 @@ message MoveSandboxRequest {
 // The sandbox goes on running: the guest is paused only long enough to write
 // its state. Stopping a sandbox is what PauseSandbox is for.
 message CreateSnapshotRequest {
-  SandboxRef ref = 1;
+  string sandbox_id = 1;
   // Seconds from last use before the snapshot is swept, refreshed whenever a
-  // sandbox is created from it. 0 falls back to the sandbox's
-  // `snapshot_expiration_secs`, and no expiry at all when that is 0 too.
+  // sandbox is created from it. 0 falls back to the sandbox's snapshot
+  // policy, and no expiry at all when that says 0 too.
   uint64 expiration_secs = 2;
 }
 
 message ListSnapshotsRequest {
   // Only snapshots taken of this sandbox; empty lists every one in the fleet.
-  // A reference, so a sandbox's name works here too.
-  string sandbox = 1;
+  string sandbox_id = 1;
 }
 
 message ListSnapshotsResponse {
@@ -721,7 +705,7 @@ message CreateSandboxRequest {
   burrow.common.v1.Policy policy = 2;
   // Tags, at most 16. Keys are 1..=64 bytes and values up to 256, neither
   // carrying control characters.
-  map<string, string> metadata = 3;
+  map<string, string> tags = 3;
   reserved 4;
   // Name for the new sandbox, and the only identity a caller gets to choose:
   // ids are always generated by the server. 1-63 characters of [a-z0-9-], not
@@ -786,8 +770,9 @@ message SetSecretRequest {
 message SetSecretResponse {}
 message ListSecretsRequest {}
 message ListSecretsResponse {
-  repeated string names = 1;
-  // The same secrets with their scopes, in the same order. Never values.
+  reserved 1;
+  reserved "names";
+  // Names and scopes. Never values.
   repeated SecretInfo secrets = 2;
 }
 message SecretInfo {
@@ -933,9 +918,8 @@ message CommandInfo {
   repeated string cmd = 2;
   // Empty means the command ran as root.
   string user = 3;
-  // "running" or "exited".
-  string state = 4;
-  // Meaningful only once `state` is "exited".
+  CommandState state = 4;
+  // Meaningful only once `state` is exited.
   int32 exit_code = 5;
   int64 started_at_unix_ms = 6;
   // 0 while the command is still running.
@@ -948,6 +932,12 @@ message CommandInfo {
   // Bytes of output the command has produced in all, stdout and stderr
   // together, which is the offset an attach that is up to date resumes from.
   uint64 output_bytes = 10;
+}
+
+enum CommandState {
+  COMMAND_STATE_UNSPECIFIED = 0;
+  COMMAND_STATE_RUNNING = 1;
+  COMMAND_STATE_EXITED = 2;
 }
 
 message CreateUserRequest {
@@ -1250,7 +1240,17 @@ message FsDirEntries {
 
 message FsDirEntry {
   string name = 1;
-  // d_type: "file", "dir", "symlink", "fifo", "socket", "char", "block", or
-  // "unknown".
-  string type = 2;
+  FileType type = 2;
+}
+
+// d_type of a directory entry.
+enum FileType {
+  FILE_TYPE_UNSPECIFIED = 0;
+  FILE_TYPE_FILE = 1;
+  FILE_TYPE_DIR = 2;
+  FILE_TYPE_SYMLINK = 3;
+  FILE_TYPE_FIFO = 4;
+  FILE_TYPE_SOCKET = 5;
+  FILE_TYPE_CHAR = 6;
+  FILE_TYPE_BLOCK = 7;
 }

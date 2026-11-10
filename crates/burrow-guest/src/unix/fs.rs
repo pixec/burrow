@@ -779,28 +779,30 @@ fn read_dir(dir: &File) -> nix::Result<guestpb::FsDirEntries> {
     let mut entries = Vec::new();
     for entry in files::read_dir(dir).map_err(errno)? {
         let entry = entry.map_err(errno)?;
-        let kind = entry.file_type().map_or("unknown", |kind| {
-            if kind.is_file() {
-                "file"
-            } else if kind.is_dir() {
-                "dir"
-            } else if kind.is_symlink() {
-                "symlink"
-            } else if kind.is_fifo() {
-                "fifo"
-            } else if kind.is_socket() {
-                "socket"
-            } else if kind.is_char_device() {
-                "char"
-            } else if kind.is_block_device() {
-                "block"
-            } else {
-                "unknown"
-            }
-        });
+        let kind = entry
+            .file_type()
+            .map_or(guestpb::FileType::Unspecified, |kind| {
+                if kind.is_file() {
+                    guestpb::FileType::File
+                } else if kind.is_dir() {
+                    guestpb::FileType::Dir
+                } else if kind.is_symlink() {
+                    guestpb::FileType::Symlink
+                } else if kind.is_fifo() {
+                    guestpb::FileType::Fifo
+                } else if kind.is_socket() {
+                    guestpb::FileType::Socket
+                } else if kind.is_char_device() {
+                    guestpb::FileType::Char
+                } else if kind.is_block_device() {
+                    guestpb::FileType::Block
+                } else {
+                    guestpb::FileType::Unspecified
+                }
+            });
         entries.push(guestpb::FsDirEntry {
             name: entry.file_name().to_string_lossy().into_owned(),
-            r#type: kind.into(),
+            r#type: kind as i32,
         });
     }
     Ok(guestpb::FsDirEntries { entries })

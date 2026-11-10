@@ -26,10 +26,10 @@ use serde_json::Value;
 
 pub use compose::{
     Composition, Credential, CredentialPhase, Decision, FileEntry, Hook, HookPhase, Host,
-    HttpEntry, Inject, Inputs, NetworkPhase, NetworkPolicy, Phase, PortRequest, Resources,
-    Selection, SelectionRecord, Skipped, Source, VolumeRequest, compose,
+    HttpEntry, Inject, Inputs, NetworkPolicy, Phase, Selection, SelectionRecord, Skipped, Source,
+    VolumeRequest, compose,
 };
-pub use config::{ByteSize, HostEntry, VolumeConfig};
+pub use config::{ByteSize, HostEntry, NetworkPhase, PortRequest, Resources, VolumeConfig};
 pub use descriptor::{ArgDecl, CapType, Descriptor, Entry, Group, Item, Kind};
 pub use expand::{ContainerEnv, expand_args, expand_env, resolve_args};
 pub use image::{ImageConfig, merge_image_configs};

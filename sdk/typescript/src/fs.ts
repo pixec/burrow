@@ -142,7 +142,7 @@ function fsError(raw: any): SystemError {
   return err;
 }
 
-/** Node's `AbortError`, which an aborted `fs` call rejects with. */
+/** @internal Node's `AbortError`, which an aborted `fs` call rejects with. */
 export function abortError(signal: AbortSignal): Error {
   return Object.assign(new Error("The operation was aborted", { cause: signal.reason }), {
     name: "AbortError",
@@ -150,6 +150,7 @@ export function abortError(signal: AbortSignal): Error {
   });
 }
 
+/** @internal */
 export function invalidArgValue(name: string, value: unknown): TypeError {
   return Object.assign(
     new TypeError(`The argument '${name}' is invalid. Received ${inspect(value)}`),
@@ -170,7 +171,7 @@ function toMode(mode: Mode | null | undefined, fallback: number): number {
   return typeof mode === "string" ? parseInt(mode, 8) : mode;
 }
 
-/** A guest path. A `file:` URL is its pathname, as Node reads one. */
+/** @internal A guest path. A `file:` URL is its pathname, as Node reads one. */
 export function toPath(path: PathLike): string {
   if (typeof path === "string") return path;
   if (path instanceof URL) {
@@ -211,7 +212,7 @@ function toNanos(time: TimeLike): string {
   ).toString();
 }
 
-type Encoding = BufferEncoding | "buffer" | null | undefined;
+export type Encoding = BufferEncoding | "buffer" | null | undefined;
 
 /** Options as Node takes them: an encoding name stands for `{ encoding }`. */
 function optionsOf<T extends object>(
@@ -378,15 +379,15 @@ function typeOf(stats: Stats): string {
   return "unknown";
 }
 
-type WriteData =
+export type WriteData =
   | string
   | NodeJS.ArrayBufferView
   | Iterable<string | NodeJS.ArrayBufferView>
   | AsyncIterable<string | NodeJS.ArrayBufferView>;
 
-type ReadFileOptions = ObjectEncodingOptions & Abortable & { flag?: OpenMode };
+export type ReadFileOptions = ObjectEncodingOptions & Abortable & { flag?: OpenMode };
 
-type WriteFileOptions = ObjectEncodingOptions &
+export type WriteFileOptions = ObjectEncodingOptions &
   Abortable & { mode?: Mode; flag?: OpenMode; flush?: boolean };
 
 /** {@link SandboxFs.watch}'s options: Node's, plus the guest's poll interval. */
@@ -786,7 +787,6 @@ export class FileHandle {
  * no way to name. The file is then read the long way, which reports the error
  * as `fs` would. Every other code, a policy refusal above all, is the answer.
  */
-const DOWNLOAD_RETRIED = new Set(["not_found", "invalid_argument", "failed_precondition", "internal"]);
 
 /**
  * The sandbox's filesystem, as `fs/promises`.
@@ -1043,8 +1043,8 @@ export class SandboxFs {
       const dir = below ? posix.join(root, below) : root;
       const { entries } = await this.request("readDir", { path: dir });
       for (const entry of entries as Array<{ name: string; type: string }>) {
-        let type = entry.type;
-        if (type === "unknown") type = typeOf(await this.lstat(posix.join(dir, entry.name)));
+        let type = entry.type.replace("FILE_TYPE_", "").toLowerCase();
+        if (type === "unspecified") type = typeOf(await this.lstat(posix.join(dir, entry.name)));
         const relative = below ? posix.join(below, entry.name) : entry.name;
         if (recursive && type === "dir") queue.push(relative);
         out.push(
@@ -1057,11 +1057,7 @@ export class SandboxFs {
     return out;
   }
 
-  /**
-   * Reads a whole file. A plain read as root takes the `DownloadFile` stream,
-   * one call however big the file; one with a `flag`, or as a user, opens
-   * and reads, so the guest kernel checks the user may.
-   */
+  /** Reads a whole file: an open, a read per 4 MiB, a close. */
   readFile(
     path: PathLike | FileHandle,
     options?: ({ encoding?: null; flag?: OpenMode } & Abortable) | null,
@@ -1081,38 +1077,12 @@ export class SandboxFs {
     if (path instanceof FileHandle) return path.readFile(options);
     const { encoding, flag, signal } = optionsOf(options);
     const flags = toFlags(flag, "r");
-    const resolved = toPath(path);
-    if (flags === O_RDONLY && !this.guest.user) {
-      try {
-        const bytes = await this.download(resolved, signal);
-        return encoding ? bytes.toString(encoding) : bytes;
-      } catch (err) {
-        if (signal?.aborted) throw abortError(signal);
-        if (!(err instanceof BurrowError) || !DOWNLOAD_RETRIED.has(err.code)) throw err;
-      }
-    }
-    const handle = await this.open(resolved, flags);
+    const handle = await this.open(toPath(path), flags);
     try {
       return await handle.readFile({ encoding: encoding ?? null, signal });
     } finally {
       await handle.close();
     }
-  }
-
-  private async download(path: string, signal?: AbortSignal): Promise<Buffer> {
-    const parts: Buffer[] = [];
-    await this.guest.run(async () => {
-      parts.length = 0;
-      for await (const chunk of this.guest.node().serverStream<any, any>(
-        "DownloadFile",
-        { sandboxId: this.guest.sandboxId, path },
-        undefined,
-        signal,
-      )) {
-        if (chunk.data?.length) parts.push(Buffer.from(chunk.data));
-      }
-    });
-    return Buffer.concat(parts);
   }
 
   readlink(path: PathLike, options?: EncodingOption): Promise<string>;
@@ -1231,7 +1201,7 @@ export class SandboxFs {
       )) {
         yield {
           // Node's two kinds: a name that appeared or went, and a change in place.
-          eventType: raw.type === "modified" ? "change" : "rename",
+          eventType: raw.kind === "WATCH_EVENT_KIND_MODIFIED" ? "change" : "rename",
           filename: encoded(posix.relative(root, raw.path), encoding),
         };
       }

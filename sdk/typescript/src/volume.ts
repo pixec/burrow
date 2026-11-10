@@ -1,8 +1,11 @@
+import { withClient } from "./client.js";
 import { BurrowError } from "./errors.js";
-import { Transport, type TransportOptions } from "./transport.js";
+import type { Transport, TransportOptions } from "./transport.js";
+import type { CallOptions } from "./types.js";
+import { dateOf } from "./wire.js";
 
 /** Options for {@link Volume.create}. */
-export interface CreateVolumeOptions {
+export interface CreateVolumeOptions extends CallOptions {
   /** Size of the image in MiB, 1 to 1048576. Defaults to 1024. */
   sizeMib?: number;
   /**
@@ -12,13 +15,14 @@ export interface CreateVolumeOptions {
    * lands, and where every sandbox that mounts it will therefore run.
    */
   nodeLabels?: Record<string, string>;
-  signal?: AbortSignal;
+  /** Free-form key/value pairs recorded on the volume. */
+  labels?: Record<string, string>;
 }
 
 /** Options for {@link Volume.list}. */
-export interface ListVolumesOptions {
+export interface ListVolumesOptions extends CallOptions {
   /** Only volumes on this node. */
-  node?: string;
+  nodeId?: string;
 }
 
 /**
@@ -48,14 +52,15 @@ export class Volume {
   /** The node holding it, and the only node it can be attached on. */
   readonly nodeId: string;
   readonly sizeMib: number;
-  /** RFC 3339. */
-  readonly createdAt: string;
+  readonly createdAt: Date;
   /** Sandbox holding the writable claim, or `""` when free. */
   readonly attachedTo: string;
+  readonly labels: Record<string, string>;
 
   private readonly transport: Transport;
 
-  private constructor(transport: Transport, raw: any) {
+  /** @internal */
+  constructor(transport: Transport, raw: any) {
     if (!raw.name) {
       throw new BurrowError("server returned a volume with no name", "internal");
     }
@@ -63,32 +68,17 @@ export class Volume {
     this.name = String(raw.name);
     this.nodeId = String(raw.nodeId ?? "");
     this.sizeMib = Number(raw.sizeMib ?? 0);
-    this.createdAt = String(raw.createdAt ?? "");
+    this.createdAt = dateOf(raw.createdAtUnixMs);
     this.attachedTo = String(raw.attachedTo ?? "");
+    this.labels = raw.labels ?? {};
   }
 
   /** Creates a volume, placing it on a node that satisfies `nodeLabels`. */
-  static async create(
+  static create(
     name: string,
     options: CreateVolumeOptions & TransportOptions = {},
   ): Promise<Volume> {
-    const transport = new Transport(options);
-    try {
-      const raw = await transport.unary<any, any>(
-        "CreateVolume",
-        {
-          name,
-          sizeMib: options.sizeMib ?? 1024,
-          nodeLabels: options.nodeLabels ?? {},
-        },
-        options.timeoutMs,
-        options.signal,
-      );
-      return new Volume(transport, raw);
-    } catch (err) {
-      transport.close();
-      throw err;
-    }
+    return withClient(options, (burrow) => burrow.volumes.create(name, options));
   }
 
   /**
@@ -97,45 +87,13 @@ export class Volume {
    * Read from the node holding it, so {@link attachedTo} is current rather
    * than whatever the orchestrator last cached.
    */
-  static async get(
-    name: string,
-    options: TransportOptions & { signal?: AbortSignal } = {},
-  ): Promise<Volume> {
-    const transport = new Transport(options);
-    try {
-      const raw = await transport.unary<any, any>(
-        "GetVolume",
-        { name },
-        options.timeoutMs,
-        options.signal,
-      );
-      return new Volume(transport, raw);
-    } catch (err) {
-      transport.close();
-      throw err;
-    }
+  static get(name: string, options: TransportOptions & CallOptions = {}): Promise<Volume> {
+    return withClient(options, (burrow) => burrow.volumes.get(name, options));
   }
 
   /** Lists volumes by name. */
-  static async list(
-    options: ListVolumesOptions & TransportOptions & { signal?: AbortSignal } = {},
-  ): Promise<Volume[]> {
-    const transport = new Transport(options);
-    try {
-      const res = await transport.unary<any, any>(
-        "ListVolumes",
-        { nodeId: options.node ?? "" },
-        options.timeoutMs,
-        options.signal,
-      );
-      // Retained per handle, so releasing one does not close the channel the
-      // others still hold.
-      return (res.volumes ?? []).map((raw: any) =>
-        new Volume(transport.retain(), raw),
-      );
-    } finally {
-      transport.close();
-    }
+  static list(options: ListVolumesOptions & TransportOptions = {}): Promise<Volume[]> {
+    return withClient(options, (burrow) => burrow.volumes.list(options));
   }
 
   /**
@@ -143,17 +101,14 @@ export class Volume {
    *
    * Refused while a sandbox holds it writable; stop that sandbox first.
    */
-  async delete(options: { signal?: AbortSignal } = {}): Promise<void> {
-    try {
-      await this.transport.unary(
-        "DeleteVolume",
-        { name: this.name },
-        this.transport.timeoutMs,
-        options.signal,
-      );
-    } finally {
-      this.transport.close();
-    }
+  async delete(options: CallOptions = {}): Promise<void> {
+    await this.transport.unary(
+      "DeleteVolume",
+      { name: this.name },
+      options.timeoutMs,
+      options.signal,
+    );
+    this.transport.close();
   }
 
   /** Releases this handle's share of the connection. */

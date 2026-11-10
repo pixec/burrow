@@ -46,33 +46,13 @@ impl Passage {
         }
     }
 
-    async fn upload_file(
+    async fn fs(
         &mut self,
-        chunks: impl tonic::IntoStreamingRequest<Message = api::FileChunk>,
-    ) -> Result<tonic::Response<api::UploadResult>, tonic::Status> {
+        req: api::FsRequest,
+    ) -> Result<tonic::Response<api::FsResponse>, tonic::Status> {
         match self {
-            Self::Direct(client) => client.upload_file(chunks).await,
-            Self::Relay(client) => client.upload_file(chunks).await,
-        }
-    }
-
-    async fn download_file(
-        &mut self,
-        req: api::DownloadRequest,
-    ) -> Result<tonic::Response<tonic::Streaming<api::FileChunk>>, tonic::Status> {
-        match self {
-            Self::Direct(client) => client.download_file(req).await,
-            Self::Relay(client) => client.download_file(req).await,
-        }
-    }
-
-    async fn list_dir(
-        &mut self,
-        req: api::ListDirRequest,
-    ) -> Result<tonic::Response<api::ListDirResponse>, tonic::Status> {
-        match self {
-            Self::Direct(client) => client.list_dir(req).await,
-            Self::Relay(client) => client.list_dir(req).await,
+            Self::Direct(client) => client.fs(req).await,
+            Self::Relay(client) => client.fs(req).await,
         }
     }
 }
@@ -101,9 +81,7 @@ async fn route(client: &Client, sandbox: &str) -> anyhow::Result<Route> {
     let grant = client
         .clone()
         .issue_access(api::IssueAccessRequest {
-            r#ref: Some(api::SandboxRef {
-                id: sandbox.to_string(),
-            }),
+            sandbox_id: sandbox.to_string(),
             ..Default::default()
         })
         .await?
@@ -324,9 +302,6 @@ enum Command {
     Fork {
         /// Sandbox to fork. It keeps running.
         id: String,
-        /// Id for the child; omitted has one generated.
-        #[arg(long = "id")]
-        child_id: Option<String>,
         /// Name for the child, usable in place of its id from then on. A fork
         /// never inherits its source's name: names are unique.
         #[arg(long)]
@@ -575,7 +550,7 @@ enum Command {
         /// Only sandboxes that carried this key=value tag. Repeatable.
         #[arg(long = "tag", value_name = "KEY=VALUE")]
         tags: Vec<String>,
-        /// Sum by `sandbox`, `template`, `node`, `state` or a tag key, per
+        /// Sum by `sandbox`, `template`, `node`, `state` or `tag:<key>`, per
         /// state. Omitted lists the intervals themselves.
         #[arg(long)]
         group_by: Option<String>,
@@ -600,7 +575,7 @@ enum Command {
         /// Only attempts the proxy refused.
         #[arg(long = "denied")]
         is_denied_only: bool,
-        /// RFC 3339 lower bound, e.g. 2026-08-27T00:00:00Z.
+        /// UTC lower bound, e.g. 2026-08-27 or 2026-08-27T00:00:00Z.
         #[arg(long)]
         since: Option<String>,
         #[arg(long, default_value_t = 50)]
@@ -1469,7 +1444,7 @@ async fn main() -> anyhow::Result<()> {
                 .drain_node(api::DrainNodeRequest {
                     node_id: node_id.clone(),
                     is_draining: true,
-                    suspend_sandboxes: suspend,
+                    is_suspending: suspend,
                 })
                 .await?
                 .into_inner();
@@ -1480,7 +1455,7 @@ async fn main() -> anyhow::Result<()> {
                 .drain_node(api::DrainNodeRequest {
                     node_id: node_id.clone(),
                     is_draining: false,
-                    suspend_sandboxes: false,
+                    is_suspending: false,
                 })
                 .await?;
             println!("{node_id} accepting sandboxes again");
@@ -1522,7 +1497,7 @@ async fn main() -> anyhow::Result<()> {
             is_json_requested: json,
         } => {
             let sandbox = client
-                .get_sandbox(api::SandboxRef { id })
+                .get_sandbox(api::SandboxRef { sandbox_id: id })
                 .await?
                 .into_inner();
             if json {
@@ -1548,7 +1523,6 @@ async fn main() -> anyhow::Result<()> {
         } => create_snapshot(&mut client, sandbox, expiration_secs).await?,
         Command::Fork {
             id,
-            child_id,
             name,
             network,
             access,
@@ -1569,8 +1543,7 @@ async fn main() -> anyhow::Result<()> {
             let started = std::time::Instant::now();
             let sandbox = client
                 .fork_sandbox(api::ForkSandboxRequest {
-                    r#ref: Some(api::SandboxRef { id }),
-                    sandbox_id: child_id.unwrap_or_default(),
+                    sandbox_id: id,
                     name: name.unwrap_or_default(),
                     policy,
                     node_labels: parse_pairs("--node-label", &node_labels)?,
@@ -1587,7 +1560,7 @@ async fn main() -> anyhow::Result<()> {
             let started = std::time::Instant::now();
             let sandbox = client
                 .move_sandbox(api::MoveSandboxRequest {
-                    r#ref: Some(api::SandboxRef { id }),
+                    sandbox_id: id,
                     node_id: node.unwrap_or_default(),
                     node_labels: parse_pairs("--node-label", &node_labels)?,
                 })
@@ -1823,12 +1796,6 @@ async fn main() -> anyhow::Result<()> {
                 .list_secrets(api::ListSecretsRequest {})
                 .await?
                 .into_inner();
-            // An orchestrator from before scopes sends names only.
-            if listed.secrets.is_empty() {
-                for name in listed.names {
-                    println!("{name}");
-                }
-            }
             for secret in listed.secrets {
                 let scope: Vec<String> = secret
                     .allowed_sandboxes
@@ -1858,7 +1825,7 @@ async fn main() -> anyhow::Result<()> {
         Command::Token(TokenCommand::Issue { id, ops, user, ttl }) => {
             let grant = client
                 .issue_access(api::IssueAccessRequest {
-                    r#ref: Some(api::SandboxRef { id }),
+                    sandbox_id: id,
                     ops,
                     user: user.unwrap_or_default(),
                     ttl_secs: ttl,
@@ -1869,19 +1836,18 @@ async fn main() -> anyhow::Result<()> {
             println!("sandbox   {}", sanitize(&grant.sandbox_id));
             println!(
                 "expires   {}",
-                rfc3339_from_unix_ms(grant.expires_at * 1000)
+                rfc3339_from_unix_ms(grant.expires_at_unix_ms)
             );
             println!("token     {}", sanitize(&grant.token));
         }
         Command::Token(TokenCommand::Revoke { id }) => {
             let revoked = client
-                .revoke_access(api::SandboxRef { id: id.clone() })
+                .revoke_access(api::SandboxRef {
+                    sandbox_id: id.clone(),
+                })
                 .await?
                 .into_inner();
-            let revoked_ms = match revoked.revoked_at_ms {
-                0 => revoked.revoked_at * 1000,
-                ms => ms,
-            };
+            let revoked_ms = revoked.revoked_at_ms;
             println!(
                 "revoked every token for {id} issued by {}; ended {} open session(s) and killed \
                  {} command(s)",
@@ -1894,7 +1860,9 @@ async fn main() -> anyhow::Result<()> {
             let mut failed = false;
             for id in ids {
                 match client
-                    .delete_sandbox(api::SandboxRef { id: id.clone() })
+                    .delete_sandbox(api::SandboxRef {
+                        sandbox_id: id.clone(),
+                    })
                     .await
                 {
                     Ok(_) => println!("deleted {id}"),
@@ -1913,7 +1881,7 @@ async fn main() -> anyhow::Result<()> {
             is_json_requested: json,
         }) => {
             let sandbox = client
-                .get_sandbox(api::SandboxRef { id })
+                .get_sandbox(api::SandboxRef { sandbox_id: id })
                 .await?
                 .into_inner();
             if json {
@@ -1925,7 +1893,7 @@ async fn main() -> anyhow::Result<()> {
         Command::Config(ConfigCommand::NetworkPolicy { id, network }) => {
             let sandbox = client
                 .update_network_policy(api::UpdateNetworkPolicyRequest {
-                    r#ref: Some(api::SandboxRef { id }),
+                    sandbox_id: id,
                     network: Some(network_policy(network)?),
                 })
                 .await?
@@ -1939,28 +1907,23 @@ async fn main() -> anyhow::Result<()> {
             suspended_ttl_secs,
         }) => {
             let sandbox = client
-                .update_resources(api::UpdateResourcesRequest {
-                    r#ref: Some(api::SandboxRef { id }),
+                .update_lifetime(api::UpdateLifetimeRequest {
+                    sandbox_id: id,
                     max_lifetime_secs: Some(secs),
                     idle_suspend_secs,
                     suspended_ttl_secs,
-                    // Named here only so the server can refuse them; the CLI
-                    // offers no way to ask.
-                    vcpus: 0,
-                    mem_mib: 0,
-                    scratch_disk_mib: 0,
                 })
                 .await?
                 .into_inner();
-            let resources = sandbox
+            let lifetime = sandbox
                 .policy
                 .unwrap_or_default()
-                .resources
+                .lifetime
                 .unwrap_or_default();
             println!(
                 "{} max-lifetime {}",
                 sandbox.id,
-                match resources.max_lifetime_secs {
+                match lifetime.max_lifetime_secs {
                     0 => "unlimited".to_string(),
                     secs => format!("{secs}s"),
                 }
@@ -1977,7 +1940,7 @@ async fn main() -> anyhow::Result<()> {
             }
             let sandbox = client
                 .update_access_policy(api::UpdateAccessPolicyRequest {
-                    r#ref: Some(api::SandboxRef { id }),
+                    sandbox_id: id,
                     exec,
                     fs,
                 })
@@ -2005,12 +1968,12 @@ async fn main() -> anyhow::Result<()> {
         Command::Config(ConfigCommand::Tags { id, tags }) => {
             let sandbox = client
                 .update_tags(api::UpdateTagsRequest {
-                    r#ref: Some(api::SandboxRef { id }),
+                    sandbox_id: id,
                     tags: parse_pairs("--tag", &tags)?,
                 })
                 .await?
                 .into_inner();
-            println!("{} now has {} tags", sandbox.id, sandbox.metadata.len());
+            println!("{} now has {} tags", sandbox.id, sandbox.tags.len());
         }
         Command::Config(ConfigCommand::Ports { id, ports }) => {
             set_ports(&mut client, &id, &ports).await?
@@ -2034,7 +1997,7 @@ async fn main() -> anyhow::Result<()> {
         }
         Command::Port { id } => {
             let resp = client
-                .list_ports(api::SandboxRef { id })
+                .list_ports(api::SandboxRef { sandbox_id: id })
                 .await?
                 .into_inner();
             if resp.ports.is_empty() {
@@ -2063,7 +2026,10 @@ async fn main() -> anyhow::Result<()> {
             is_showing,
         } => {
             let share = if is_showing {
-                client.get_share(api::SandboxRef { id }).await?.into_inner()
+                client
+                    .get_share(api::SandboxRef { sandbox_id: id })
+                    .await?
+                    .into_inner()
             } else {
                 let all_udp = udp_ports.iter().any(|p| p == "all");
                 let udp_ports = udp_ports
@@ -2082,7 +2048,7 @@ async fn main() -> anyhow::Result<()> {
                         is_rotating,
                         udp_ports,
                         is_all_udp: all_udp,
-                        is_transparent_ip_disabled,
+                        is_transparent_ip: is_transparent_ip_disabled.then_some(false),
                     })
                     .await?
                     .into_inner()
@@ -2090,7 +2056,9 @@ async fn main() -> anyhow::Result<()> {
             print_share(&share);
         }
         Command::Unshare { id } => {
-            client.unshare_sandbox(api::SandboxRef { id }).await?;
+            client
+                .unshare_sandbox(api::SandboxRef { sandbox_id: id })
+                .await?;
             println!("share revoked");
         }
         Command::Templates(TemplatesCommand::Ls) => list_templates(&mut client).await?,
@@ -2178,7 +2146,7 @@ async fn main() -> anyhow::Result<()> {
                         truncate(&volume.name, 24),
                         truncate(&volume.node_id, 16),
                         volume.size_mib,
-                        volume.created_at,
+                        rfc3339_from_unix_ms(volume.created_at_unix_ms),
                         if volume.attached_to.is_empty() {
                             "-"
                         } else {
@@ -2196,7 +2164,10 @@ async fn main() -> anyhow::Result<()> {
             println!("name        {}", volume.name);
             println!("node        {}", volume.node_id);
             println!("size        {}MiB", volume.size_mib);
-            println!("created     {}", volume.created_at);
+            println!(
+                "created     {}",
+                rfc3339_from_unix_ms(volume.created_at_unix_ms)
+            );
             println!(
                 "attached to {}",
                 if volume.attached_to.is_empty() {
@@ -2231,7 +2202,7 @@ async fn main() -> anyhow::Result<()> {
         Command::Snapshot(SnapshotCommand::Ls { sandbox }) => {
             let resp = client
                 .list_snapshots(api::ListSnapshotsRequest {
-                    sandbox: sandbox.unwrap_or_default(),
+                    sandbox_id: sandbox.unwrap_or_default(),
                 })
                 .await?
                 .into_inner();
@@ -2254,12 +2225,11 @@ async fn main() -> anyhow::Result<()> {
                         truncate(&snapshot.sandbox_id, 24),
                         truncate(&snapshot.template, 16),
                         snapshot.size_bytes / (1024 * 1024),
-                        snapshot.created_at,
+                        rfc3339_from_unix_ms(snapshot.created_at_unix_ms),
                         truncate(&location, 21),
-                        if snapshot.expires_at.is_empty() {
-                            "never"
-                        } else {
-                            &snapshot.expires_at
+                        match snapshot.expires_at_unix_ms {
+                            0 => "never".to_string(),
+                            at => rfc3339_from_unix_ms(at),
                         },
                     );
                 }
@@ -2301,7 +2271,7 @@ async fn main() -> anyhow::Result<()> {
                 let opened = client
                     .tail_events(api::TailEventsRequest {
                         after_seq: last,
-                        sandbox: sandbox.clone().unwrap_or_default(),
+                        sandbox_id: sandbox.clone().unwrap_or_default(),
                         is_follow: follow,
                         limit,
                     })
@@ -2330,7 +2300,9 @@ async fn main() -> anyhow::Result<()> {
                                 event.seq,
                                 rfc3339_from_unix_ms(event.at_unix_ms),
                                 truncate(&sanitize(&event.sandbox_id), 24),
-                                sanitize(&event.r#type),
+                                common::EventKind::try_from(event.kind)
+                                    .unwrap_or_default()
+                                    .label(),
                                 state,
                                 sanitize(&event.detail),
                             );
@@ -2377,13 +2349,27 @@ async fn main() -> anyhow::Result<()> {
                         .ok_or_else(|| anyhow::anyhow!("--tag {tag:?} is not KEY=VALUE"))
                 })
                 .collect::<anyhow::Result<_>>()?;
+            let (group, group_by_tag) = match group_by.as_deref() {
+                None => (api::UsageGroup::Unspecified, String::new()),
+                Some("sandbox") => (api::UsageGroup::Sandbox, String::new()),
+                Some("template") => (api::UsageGroup::Template, String::new()),
+                Some("node") => (api::UsageGroup::Node, String::new()),
+                Some("state") => (api::UsageGroup::State, String::new()),
+                Some(other) => match other.strip_prefix("tag:") {
+                    Some(key) => (api::UsageGroup::Tag, key.to_string()),
+                    None => anyhow::bail!(
+                        "--group-by {other:?} is not sandbox, template, node, state or tag:<key>"
+                    ),
+                },
+            };
             let resp = client
                 .query_usage(api::QueryUsageRequest {
                     from_unix_ms: bound(from, "from")?,
                     to_unix_ms: bound(to, "to")?,
-                    sandbox: sandbox.unwrap_or_default(),
+                    sandbox_id: sandbox.unwrap_or_default(),
                     tags,
-                    group_by: group_by.clone().unwrap_or_default(),
+                    group_by: group as i32,
+                    group_by_tag,
                     after_id: after,
                     limit,
                     is_open_included: !is_closed_only,
@@ -2392,20 +2378,24 @@ async fn main() -> anyhow::Result<()> {
                 .into_inner();
             match (format, group_by.is_some()) {
                 (UsageFormat::Json, true) => {
-                    let sums = resp.sums.iter().map(usage_sum_json).collect();
-                    let mut out = String::new();
-                    Json::Obj(vec![("sums", Json::Arr(sums))]).write(&mut out, 0);
-                    println!("{out}");
+                    let sums: Vec<_> = resp.sums.iter().map(usage_sum_json).collect();
+                    println!(
+                        "{}",
+                        serde_json::to_string_pretty(&serde_json::json!({ "sums": sums }))
+                            .expect("a value renders")
+                    );
                 }
                 (UsageFormat::Json, false) => {
-                    let intervals = resp.intervals.iter().map(usage_interval_json).collect();
-                    let mut out = String::new();
-                    Json::Obj(vec![
-                        ("intervals", Json::Arr(intervals)),
-                        ("next_after", Json::Num(resp.next_after_id)),
-                    ])
-                    .write(&mut out, 0);
-                    println!("{out}");
+                    let intervals: Vec<_> =
+                        resp.intervals.iter().map(usage_interval_json).collect();
+                    println!(
+                        "{}",
+                        serde_json::to_string_pretty(&serde_json::json!({
+                            "intervals": intervals,
+                            "next_after": resp.next_after_id,
+                        }))
+                        .expect("a value renders")
+                    );
                 }
                 (UsageFormat::Table, true) => {
                     println!(
@@ -2416,7 +2406,7 @@ async fn main() -> anyhow::Result<()> {
                         println!(
                             "{:<24} {:<10} {:>5} {:>12} {:>9.3} {:>9.3} {:>10} {:>10} {:>10}",
                             truncate(&sanitize(&sum.group), 24),
-                            sanitize(&sum.state),
+                            usage_state(sum.state),
                             sum.intervals,
                             duration_ms(sum.duration_ms),
                             sum.vcpu_ms as f64 / 3_600_000.0,
@@ -2450,7 +2440,7 @@ async fn main() -> anyhow::Result<()> {
                                 interval.id.to_string()
                             },
                             truncate(&sanitize(&interval.sandbox_id), 24),
-                            sanitize(&interval.state),
+                            usage_state(interval.state),
                             interval.vcpus,
                             interval.mem_mib,
                             rfc3339_from_unix_ms(interval.started_at_unix_ms),
@@ -2480,7 +2470,14 @@ async fn main() -> anyhow::Result<()> {
                 .query_audit(api::AuditQuery {
                     sandbox_id: sandbox.unwrap_or_default(),
                     is_denied_only: denied,
-                    since: since.unwrap_or_default(),
+                    since_unix_ms: match since {
+                        None => 0,
+                        Some(text) => unix_ms_from_utc(&text).ok_or_else(|| {
+                            anyhow::anyhow!(
+                                "--since {text:?} is not a UTC date like 2026-10-01 or 2026-10-01T12:00:00Z"
+                            )
+                        })?,
+                    },
                     limit,
                 })
                 .await?
@@ -2493,7 +2490,7 @@ async fn main() -> anyhow::Result<()> {
                 let event = event?;
                 println!(
                     "{:<21} {:<24} {:<7} {:<28} {}",
-                    sanitize(&event.at),
+                    rfc3339_from_unix_ms(event.at_unix_ms),
                     truncate(&sanitize(&event.sandbox_id), 24),
                     if event.is_allowed { "yes" } else { "no" },
                     truncate(
@@ -2511,21 +2508,38 @@ async fn main() -> anyhow::Result<()> {
         Command::Dir { id, path } => {
             let mut node = route(&client, &id).await?;
             let id = node.sandbox_id;
-            let resp = node
-                .client
-                .list_dir(api::ListDirRequest {
-                    sandbox_id: id,
-                    path,
-                })
+            let FsResult::Entries(listed) = fs_call(
+                &mut node.client,
+                &id,
+                FsOp::ReadDir(api::FsReadDir { path: path.clone() }),
+            )
+            .await?
+            else {
+                anyhow::bail!("the node answered a listing with something else");
+            };
+            for entry in listed.entries {
+                let FsResult::Stat(stat) = fs_call(
+                    &mut node.client,
+                    &id,
+                    FsOp::Stat(api::FsStat {
+                        path: format!("{}/{}", path.trim_end_matches('/'), entry.name),
+                        is_nofollow: true,
+                    }),
+                )
                 .await?
-                .into_inner();
-            for entry in resp.entries {
+                else {
+                    anyhow::bail!("the node answered a stat with something else");
+                };
                 println!(
                     "{:>10}  {:o}  {}{}",
-                    entry.size,
-                    entry.mode & 0o7777,
+                    stat.size,
+                    stat.mode & 0o7777,
                     sanitize(&entry.name),
-                    if entry.is_dir { "/" } else { "" }
+                    if entry.r#type == api::FileType::Dir as i32 {
+                        "/"
+                    } else {
+                        ""
+                    }
                 );
             }
         }
@@ -2561,7 +2575,7 @@ fn create_request(flags: CreateFlags) -> anyhow::Result<api::CreateSandboxReques
         networks,
         alias,
     } = flags;
-    let metadata = parse_pairs("--tag", &tags)?;
+    let tags = parse_pairs("--tag", &tags)?;
     // A snapshot carries its own template, so nothing is sent unless the
     // caller named one, in which case disagreeing with the snapshot is an
     // error the server raises rather than a default silently overriding it.
@@ -2576,13 +2590,17 @@ fn create_request(flags: CreateFlags) -> anyhow::Result<api::CreateSandboxReques
                 // from a snapshot inherit the shape it was taken with.
                 vcpus: vcpus.unwrap_or(0),
                 mem_mib: mem_mib.unwrap_or(0),
+                scratch_disk_mib: 0,
+            }),
+            lifetime: Some(common::LifetimePolicy {
                 max_lifetime_secs,
                 idle_suspend_secs,
                 suspended_ttl_secs,
-                snapshot_expiration_secs,
-                keep_last_snapshots,
-                is_evicted_snapshot_kept: keep_evicted_snapshots,
-                ..Default::default()
+            }),
+            snapshots: Some(common::SnapshotPolicy {
+                expiration_secs: snapshot_expiration_secs,
+                keep_last: keep_last_snapshots,
+                is_evicted_kept: keep_evicted_snapshots,
             }),
             network: Some(network_policy(network)?),
             exec: access.exec_policy(),
@@ -2599,7 +2617,7 @@ fn create_request(flags: CreateFlags) -> anyhow::Result<api::CreateSandboxReques
                 })
                 .collect(),
         }),
-        metadata,
+        tags,
         node_labels: parse_pairs("--node-label", &node_labels)?,
         kit: if kit_args.is_empty() && kit_env.is_empty() && reject_capabilities.is_empty() {
             None
@@ -2632,7 +2650,7 @@ enum Transition {
 
 impl Transition {
     async fn call(self, client: &mut Client, id: String) -> Result<common::Sandbox, tonic::Status> {
-        let id = api::SandboxRef { id };
+        let id = api::SandboxRef { sandbox_id: id };
         let resp = match self {
             Transition::Pause => client.pause_sandbox(id).await,
             Transition::Resume => client.resume_sandbox(id).await,
@@ -2693,7 +2711,9 @@ async fn run_in_sandbox(
         // outside the server ever chooses one.
         Some(name) => {
             match client
-                .get_sandbox(api::SandboxRef { id: name.clone() })
+                .get_sandbox(api::SandboxRef {
+                    sandbox_id: name.clone(),
+                })
                 .await
             {
                 Ok(existing) => {
@@ -2712,7 +2732,7 @@ async fn run_in_sandbox(
                     ) {
                         client
                             .resume_sandbox(api::SandboxRef {
-                                id: sandbox.id.clone(),
+                                sandbox_id: sandbox.id.clone(),
                             })
                             .await?;
                     }
@@ -2763,7 +2783,9 @@ async fn run_in_sandbox(
 
     if stop {
         match client
-            .pause_sandbox(api::SandboxRef { id: id.clone() })
+            .pause_sandbox(api::SandboxRef {
+                sandbox_id: id.clone(),
+            })
             .await
         {
             Ok(_) => eprintln!("stopped {id}"),
@@ -2773,7 +2795,9 @@ async fn run_in_sandbox(
         }
     } else if rm {
         match client
-            .delete_sandbox(api::SandboxRef { id: id.clone() })
+            .delete_sandbox(api::SandboxRef {
+                sandbox_id: id.clone(),
+            })
             .await
         {
             Ok(_) => eprintln!("deleted {id}"),
@@ -3168,14 +3192,9 @@ fn describe_rule(rule: &common::RequestRule) -> (&'static str, String) {
 /// The expiry and binding a rule carries, appended to its description.
 fn describe_rule_lifetime(rule: &common::RequestRule, text: &mut String) {
     if rule.expires_at_unix_ms != 0 {
-        let state = if rule.is_expired {
-            "expired"
-        } else {
-            "expires"
-        };
         text.push_str(&format!(
-            " ({state} at unix ms {})",
-            rule.expires_at_unix_ms
+            " (expires at {})",
+            rfc3339_from_unix_ms(rule.expires_at_unix_ms as i64)
         ));
     }
     if !rule.bound_sandbox_id.is_empty() {
@@ -3317,15 +3336,11 @@ fn node_table(nodes: &[api::Node]) -> String {
 /// Free over total disk in GiB, `LOW` when under the reserve, `-` for a node
 /// that does not report disk.
 fn disk_column(status: &common::NodeStatus) -> String {
-    if status.disk_total_bytes == 0 {
+    let Some(disk) = status.disk.filter(|disk| disk.total_bytes != 0) else {
         return "-".into();
-    }
+    };
     let gib = |bytes: u64| bytes as f64 / (1u64 << 30) as f64;
-    let column = format!(
-        "{:.1}/{:.0}G",
-        gib(status.disk_free_bytes),
-        gib(status.disk_total_bytes)
-    );
+    let column = format!("{:.1}/{:.0}G", gib(disk.free_bytes), gib(disk.total_bytes));
     if status.is_disk_low {
         format!("{column} LOW")
     } else {
@@ -3381,8 +3396,8 @@ async fn list_sandboxes(client: &mut Client, tag: String, all: bool) -> anyhow::
             display_state(&sandbox),
             display_node(&sandbox),
             sandbox.template,
-            truncate(&format_tags(&sandbox.metadata), 24),
-            sandbox.created_at,
+            truncate(&format_tags(&sandbox.tags), 24),
+            rfc3339_from_unix_ms(sandbox.created_at_unix_ms),
         );
     }
     Ok(())
@@ -3411,7 +3426,7 @@ async fn show_stats(client: &mut Client, id: Option<String>, all: bool) -> anyho
     let sandboxes = match id {
         Some(id) => vec![
             client
-                .get_sandbox(api::SandboxRef { id })
+                .get_sandbox(api::SandboxRef { sandbox_id: id })
                 .await?
                 .into_inner(),
         ],
@@ -3619,7 +3634,7 @@ async fn create_snapshot(
     let started = std::time::Instant::now();
     let snapshot = client
         .create_snapshot(api::CreateSnapshotRequest {
-            r#ref: Some(api::SandboxRef { id: sandbox }),
+            sandbox_id: sandbox,
             expiration_secs,
         })
         .await?
@@ -3636,7 +3651,7 @@ async fn create_snapshot(
 /// Every VM a sandbox has run, newest first.
 async fn list_sessions(client: &mut Client, id: String) -> anyhow::Result<()> {
     let resp = client
-        .list_sessions(api::SandboxRef { id })
+        .list_sessions(api::SandboxRef { sandbox_id: id })
         .await?
         .into_inner();
     if resp.sessions.is_empty() {
@@ -3651,21 +3666,21 @@ async fn list_sessions(client: &mut Client, id: String) -> anyhow::Result<()> {
         println!(
             "{:<40} {:<9} {:<11} {:<22} {}",
             session.id,
-            session.started_by,
+            common::SessionStart::try_from(session.started_by)
+                .unwrap_or_default()
+                .label(),
             // An open session is the running VM, which is a state worth its
             // own word rather than a blank column.
-            if session.ended_by.is_empty() {
-                "open"
-            } else {
-                &session.ended_by
+            match common::SessionEnd::try_from(session.ended_by).unwrap_or_default() {
+                common::SessionEnd::Unspecified => "open",
+                ended => ended.label(),
             },
-            session.started_at,
-            // Empty for a session the node died during: nothing recorded when
+            rfc3339_from_unix_ms(session.started_at_unix_ms),
+            // 0 for a session the node died during: nothing recorded when
             // that VM actually stopped, and a guess would read as a fact.
-            if session.ended_at.is_empty() {
-                "-"
-            } else {
-                &session.ended_at
+            match session.ended_at_unix_ms {
+                0 => "-".to_string(),
+                at => rfc3339_from_unix_ms(at),
             },
         );
     }
@@ -3696,7 +3711,7 @@ fn print_config(sandbox: &common::Sandbox) {
         );
     }
     field("template", &sandbox.template);
-    field("created", &sandbox.created_at);
+    field("created", &rfc3339_from_unix_ms(sandbox.created_at_unix_ms));
     if !sandbox.guest_ip.is_empty() {
         field("address", &sandbox.guest_ip);
     }
@@ -3717,16 +3732,18 @@ fn print_config(sandbox: &common::Sandbox) {
         // raw tells a reader nothing about the machine they actually have.
         field("vcpus", &shape_value(resources.vcpus as u64, 1));
         field("mem-mib", &shape_value(resources.mem_mib as u64, 512));
-        if resources.max_lifetime_secs > 0 {
-            field("max-lifetime", &format!("{}s", resources.max_lifetime_secs));
+    }
+    if let Some(lifetime) = &policy.lifetime {
+        if lifetime.max_lifetime_secs > 0 {
+            field("max-lifetime", &format!("{}s", lifetime.max_lifetime_secs));
         }
-        if resources.idle_suspend_secs > 0 {
-            field("idle-suspend", &format!("{}s", resources.idle_suspend_secs));
+        if lifetime.idle_suspend_secs > 0 {
+            field("idle-suspend", &format!("{}s", lifetime.idle_suspend_secs));
         }
-        if resources.suspended_ttl_secs > 0 {
+        if lifetime.suspended_ttl_secs > 0 {
             field(
                 "suspended-ttl",
-                &format!("{}s", resources.suspended_ttl_secs),
+                &format!("{}s", lifetime.suspended_ttl_secs),
             );
         }
     }
@@ -3819,7 +3836,7 @@ fn print_config(sandbox: &common::Sandbox) {
             ),
         );
     }
-    let tags = format_tags(&sandbox.metadata);
+    let tags = format_tags(&sandbox.tags);
     if !tags.is_empty() {
         field("tags", &tags);
     }
@@ -3833,7 +3850,9 @@ fn print_config(sandbox: &common::Sandbox) {
 /// ports the caller asked to withdraw.
 async fn set_ports(client: &mut Client, id: &str, ports: &[u32]) -> anyhow::Result<()> {
     let current = client
-        .list_ports(api::SandboxRef { id: id.to_string() })
+        .list_ports(api::SandboxRef {
+            sandbox_id: id.to_string(),
+        })
         .await?
         .into_inner()
         .ports;
@@ -4168,7 +4187,7 @@ async fn list_commands(client: &mut Client, id: &str) -> anyhow::Result<()> {
         "COMMAND", "USER", "STATE", "CODE"
     );
     for command in resp.commands {
-        let code = if command.state == "exited" {
+        let code = if command.state == api::CommandState::Exited as i32 {
             command.exit_code.to_string()
         } else {
             "-".to_string()
@@ -4181,7 +4200,9 @@ async fn list_commands(client: &mut Client, id: &str) -> anyhow::Result<()> {
             } else {
                 &command.user
             }),
-            sanitize(&command.state),
+            api::CommandState::try_from(command.state)
+                .unwrap_or_default()
+                .label(),
             code,
             truncate(&sanitize(&command.cmd.join(" ")), 60)
         );
@@ -4354,6 +4375,53 @@ async fn copy(client: &Client, src: &str, dst: &str) -> anyhow::Result<()> {
     }
 }
 
+use api::fs_request::Op as FsOp;
+use api::fs_response::Result as FsResult;
+
+/// Pieces a transfer moves per call: HTTP/2's default flow-control window,
+/// as the SDKs and the guest use.
+const FS_CHUNK: usize = 64 * 1024;
+
+/// One Fs call as root, with the guest's error turned into this command's.
+async fn fs_call(client: &mut Passage, sandbox_id: &str, op: FsOp) -> anyhow::Result<FsResult> {
+    let resp = client
+        .fs(api::FsRequest {
+            sandbox_id: sandbox_id.to_string(),
+            user: String::new(),
+            op: Some(op),
+        })
+        .await?
+        .into_inner();
+    match resp.result {
+        Some(FsResult::Error(err)) => anyhow::bail!("{} {}: {}", err.syscall, err.path, err.code),
+        Some(result) => Ok(result),
+        None => anyhow::bail!("the node answered an fs call with nothing"),
+    }
+}
+
+async fn fs_open(
+    client: &mut Passage,
+    sandbox_id: &str,
+    path: &str,
+    flags: u32,
+    mode: u32,
+) -> anyhow::Result<u64> {
+    match fs_call(
+        client,
+        sandbox_id,
+        FsOp::Open(api::FsOpen {
+            path: path.to_string(),
+            flags,
+            mode,
+        }),
+    )
+    .await?
+    {
+        FsResult::Handle(handle) => Ok(handle),
+        _ => anyhow::bail!("the node answered an open with something else"),
+    }
+}
+
 async fn push(
     client: &mut Passage,
     sandbox_id: &str,
@@ -4363,62 +4431,53 @@ async fn push(
     use std::os::unix::fs::PermissionsExt;
     use tokio::io::AsyncReadExt;
 
+    const O_WRONLY: u32 = 1;
+    const O_CREAT: u32 = 0o100;
+    const O_TRUNC: u32 = 0o1000;
+
     let mut file = tokio::fs::File::open(local).await?;
     let mode = file
         .metadata()
         .await
-        .map(|m| m.permissions().mode())
+        .map(|m| m.permissions().mode() & 0o7777)
         .unwrap_or(0o644);
-
-    // Chunked so a large file has to fit neither in one gRPC message nor in
-    // memory. Matches the SDK and the guest: HTTP/2's default flow-control
-    // window.
-    const CHUNK: usize = 64 * 1024;
-
-    // Shallow, so the reader stays roughly a chunk ahead of the wire rather
-    // than racing to buffer the whole file behind a slow link.
-    let (tx, rx) = tokio::sync::mpsc::channel(4);
-    let sandbox_id = sandbox_id.to_string();
-    let remote = remote.to_string();
-    let reader = tokio::spawn(async move {
-        let mut buf = vec![0u8; CHUNK];
-        let mut first = true;
+    let handle = fs_open(
+        client,
+        sandbox_id,
+        remote,
+        O_WRONLY | O_CREAT | O_TRUNC,
+        mode,
+    )
+    .await?;
+    let mut buf = vec![0u8; FS_CHUNK];
+    let mut total = 0u64;
+    let written = async {
         loop {
             let n = file.read(&mut buf).await?;
-            // An empty file still sends one chunk: the first chunk is what
-            // carries the path and the mode, so skipping it would upload
-            // nothing at all.
-            if n == 0 && !first {
+            if n == 0 {
                 break;
             }
-            let chunk = api::FileChunk {
-                sandbox_id: if first {
-                    sandbox_id.clone()
-                } else {
-                    String::new()
-                },
-                path: if first { remote.clone() } else { String::new() },
-                mode: if first { mode } else { 0 },
-                data: buf[..n].to_vec(),
-            };
-            first = false;
-            // The receiver is gone when the RPC has already failed; its error
-            // is the one worth reporting, so this one is dropped.
-            if tx.send(chunk).await.is_err() || n == 0 {
-                break;
+            match fs_call(
+                client,
+                sandbox_id,
+                FsOp::Write(api::FsWrite {
+                    handle,
+                    position: -1,
+                    data: buf[..n].to_vec(),
+                }),
+            )
+            .await?
+            {
+                FsResult::Written(n) => total += n,
+                _ => anyhow::bail!("the node answered a write with something else"),
             }
         }
-        Ok::<(), std::io::Error>(())
-    });
-
-    let result = client
-        .upload_file(ReceiverStream::new(rx))
-        .await?
-        .into_inner();
-    // A read that failed part way leaves a truncated file in the sandbox, and
-    // the RPC would report that as a successful upload of fewer bytes.
-    reader.await??;
-    Ok(result.bytes_written)
+        Ok::<(), anyhow::Error>(())
+    }
+    .await;
+    fs_call(client, sandbox_id, FsOp::Close(api::FsHandle { handle })).await?;
+    written?;
+    Ok(total)
 }
 
 async fn pull(
@@ -4427,13 +4486,7 @@ async fn pull(
     remote: &str,
     local: Option<std::path::PathBuf>,
 ) -> anyhow::Result<()> {
-    let mut stream = client
-        .download_file(api::DownloadRequest {
-            sandbox_id: sandbox_id.to_string(),
-            path: remote.to_string(),
-        })
-        .await?
-        .into_inner();
+    let handle = fs_open(client, sandbox_id, remote, 0, 0).await?;
 
     // 0600: a file copied out of a sandbox can hold anything that sandbox
     // held, and the guest's own mode is not a permission grant to every other
@@ -4453,11 +4506,32 @@ async fn pull(
         None => Box::new(std::io::stdout()),
     };
     let mut total = 0u64;
-    while let Some(chunk) = stream.next().await {
-        let chunk = chunk?;
-        out.write_all(&chunk.data)?;
-        total += chunk.data.len() as u64;
+    let read = async {
+        loop {
+            match fs_call(
+                client,
+                sandbox_id,
+                FsOp::Read(api::FsRead {
+                    handle,
+                    position: -1,
+                    length: FS_CHUNK as u32,
+                }),
+            )
+            .await?
+            {
+                FsResult::Data(data) if data.is_empty() => break,
+                FsResult::Data(data) => {
+                    out.write_all(&data)?;
+                    total += data.len() as u64;
+                }
+                _ => anyhow::bail!("the node answered a read with something else"),
+            }
+        }
+        Ok::<(), anyhow::Error>(())
     }
+    .await;
+    fs_call(client, sandbox_id, FsOp::Close(api::FsHandle { handle })).await?;
+    read?;
     out.flush()?;
     if let Some(path) = local {
         println!("wrote {total} bytes to {}", path.display());
@@ -4465,110 +4539,31 @@ async fn pull(
     Ok(())
 }
 
-/// The smallest JSON document model that covers a sandbox record.
-///
-/// Hand-rolled because the CLI has no serializer and one record does not earn
-/// a dependency. Nothing here is parsed back, so it only has to be correct on
-/// the way out.
-enum Json {
-    Bool(bool),
-    Num(u64),
-    Str(String),
-    Arr(Vec<Json>),
-    Obj(Vec<(&'static str, Json)>),
-    /// Already-encoded JSON, written as it is.
-    Raw(String),
-}
-
-impl Json {
-    fn str(value: impl Into<String>) -> Json {
-        Json::Str(value.into())
-    }
-
-    fn write(&self, out: &mut String, indent: usize) {
-        let pad = |out: &mut String, depth: usize| out.push_str(&"  ".repeat(depth));
-        match self {
-            Json::Bool(value) => out.push_str(if *value { "true" } else { "false" }),
-            Json::Num(value) => out.push_str(&value.to_string()),
-            Json::Str(value) => escape(value, out),
-            Json::Raw(value) => out.push_str(value),
-            Json::Arr(items) if items.is_empty() => out.push_str("[]"),
-            Json::Arr(items) => {
-                out.push_str("[\n");
-                for (i, item) in items.iter().enumerate() {
-                    pad(out, indent + 1);
-                    item.write(out, indent + 1);
-                    out.push_str(if i + 1 == items.len() { "\n" } else { ",\n" });
-                }
-                pad(out, indent);
-                out.push(']');
-            }
-            Json::Obj(fields) if fields.is_empty() => out.push_str("{}"),
-            Json::Obj(fields) => {
-                out.push_str("{\n");
-                for (i, (key, value)) in fields.iter().enumerate() {
-                    pad(out, indent + 1);
-                    escape(key, out);
-                    out.push_str(": ");
-                    value.write(out, indent + 1);
-                    out.push_str(if i + 1 == fields.len() { "\n" } else { ",\n" });
-                }
-                pad(out, indent);
-                out.push('}');
-            }
-        }
-    }
-}
-
-/// A JSON string literal, quotes included.
-///
-/// Control characters are escaped by code point rather than dropped: a tag
-/// value the guest chose must not be able to end the string early.
-fn escape(value: &str, out: &mut String) {
-    out.push('"');
-    for ch in value.chars() {
-        match ch {
-            '"' => out.push_str("\\\""),
-            '\\' => out.push_str("\\\\"),
-            '\n' => out.push_str("\\n"),
-            '\r' => out.push_str("\\r"),
-            '\t' => out.push_str("\\t"),
-            ch if (ch as u32) < 0x20 => out.push_str(&format!("\\u{:04x}", ch as u32)),
-            ch => out.push(ch),
-        }
-    }
-    out.push('"');
-}
-
 /// `k=v` strings, ordered so two renderings of the same map agree.
-fn pairs_json(pairs: &std::collections::HashMap<String, String>) -> Json {
+fn pairs_json(pairs: &std::collections::HashMap<String, String>) -> serde_json::Value {
     let mut pairs: Vec<_> = pairs.iter().collect();
     pairs.sort();
-    Json::Arr(
-        pairs
-            .into_iter()
-            .map(|(key, value)| Json::str(format!("{key}={value}")))
-            .collect(),
-    )
+    pairs
+        .into_iter()
+        .map(|(key, value)| format!("{key}={value}"))
+        .collect()
 }
 
 fn volumes_json(volumes: &[common::Volume]) -> String {
-    let items = volumes
+    let items: Vec<_> = volumes
         .iter()
         .map(|volume| {
-            Json::Obj(vec![
-                ("name", Json::str(&volume.name)),
-                ("node", Json::str(&volume.node_id)),
-                ("size_mib", Json::Num(volume.size_mib)),
-                ("created_at", Json::str(&volume.created_at)),
-                ("attached_to", Json::str(&volume.attached_to)),
-                ("labels", pairs_json(&volume.labels)),
-            ])
+            serde_json::json!({
+                "name": volume.name,
+                "node": volume.node_id,
+                "size_mib": volume.size_mib,
+                "created_at": rfc3339_from_unix_ms(volume.created_at_unix_ms),
+                "attached_to": volume.attached_to,
+                "labels": pairs_json(&volume.labels),
+            })
         })
         .collect();
-    let mut out = String::new();
-    Json::Arr(items).write(&mut out, 0);
-    out
+    serde_json::to_string_pretty(&items).expect("a value renders")
 }
 
 /// One sandbox's record as JSON, for `inspect --json`.
@@ -4578,198 +4573,130 @@ fn volumes_json(volumes: &[common::Volume]) -> String {
 fn sandbox_json(sandbox: &common::Sandbox) -> String {
     let policy = sandbox.policy.clone().unwrap_or_default();
     let resources = policy.resources.unwrap_or_default();
+    let lifetime = policy.lifetime.unwrap_or_default();
+    let snapshots = policy.snapshots.unwrap_or_default();
     let network = policy.network.unwrap_or_default();
-    let strings = |values: &[String]| Json::Arr(values.iter().map(Json::str).collect());
 
-    let mut tags: Vec<_> = sandbox.metadata.iter().collect();
+    let mut tags: Vec<_> = sandbox.tags.iter().collect();
     tags.sort();
 
+    let mut doc = serde_json::json!({
+        "id": sandbox.id,
+        "name": sandbox.name,
+        "state": display_state(sandbox),
+        "state_reason": sandbox.state_reason,
+        "unreachable": sandbox.is_unreachable,
+        "durable": sandbox.is_durable,
+        "agent_unconfirmed": sandbox.is_agent_unconfirmed,
+        "node": sandbox.node_id,
+        "template": sandbox.template,
+        "created_at": rfc3339_from_unix_ms(sandbox.created_at_unix_ms),
+        "address": sandbox.guest_ip,
+        "usage": {
+            "cpu_usage_usec": sandbox.cpu_usage_usec,
+            "rx_bytes": sandbox.rx_bytes,
+            "tx_bytes": sandbox.tx_bytes,
+        },
+        "resources": {
+            "vcpus": resources.vcpus,
+            "mem_mib": resources.mem_mib,
+        },
+        "lifetime": {
+            "max_lifetime_secs": lifetime.max_lifetime_secs,
+            "idle_suspend_secs": lifetime.idle_suspend_secs,
+            "suspended_ttl_secs": lifetime.suspended_ttl_secs,
+        },
+        "snapshots": {
+            "expiration_secs": snapshots.expiration_secs,
+            "keep_last": snapshots.keep_last,
+            "is_evicted_kept": snapshots.is_evicted_kept,
+        },
+        "network": {
+            "mode": match common::NetworkMode::try_from(network.mode) {
+                Ok(common::NetworkMode::Open) => "open",
+                Ok(common::NetworkMode::Allowlist) => "allowlist",
+                Ok(common::NetworkMode::None) => "none",
+                _ => "unspecified",
+            },
+            "allow_domains": network.allow_domains,
+            "allow_cidrs": network.allow_cidrs,
+            "allow_ports": network.allow_ports,
+            "deny_cidrs": network.deny_cidrs,
+            "deny_domains": network.deny_domains,
+            "deny_ports": network.deny_ports.iter().map(describe_port_rule).collect::<Vec<_>>(),
+            "deny_ipv6": network.is_ipv6_denied,
+            "inspect_tls": network.is_tls_inspected,
+            "rules": network
+                .rules
+                .iter()
+                .map(|rule| {
+                    let (kind, text) = describe_rule(rule);
+                    serde_json::json!({
+                        "domain": rule.domain,
+                        "kind": kind,
+                        "rule": text,
+                        "expires_at_unix_ms": rule.expires_at_unix_ms,
+                        "bound_sandbox_id": rule.bound_sandbox_id,
+                    })
+                })
+                .collect::<Vec<_>>(),
+        },
+        "networks": policy
+            .networks
+            .iter()
+            .map(|membership| {
+                serde_json::json!({
+                    "network": membership.network,
+                    "alias": if membership.alias.is_empty() {
+                        &sandbox.id
+                    } else {
+                        &membership.alias
+                    },
+                })
+            })
+            .collect::<Vec<_>>(),
+        "tags": tags
+            .into_iter()
+            .map(|(key, value)| serde_json::json!({ "key": key, "value": value }))
+            .collect::<Vec<_>>(),
+    });
+    let fields = doc.as_object_mut().expect("an object");
     // Present only when the sandbox restricts something, exactly as the
     // readable form shows them: an absent section is no restriction, and
     // rendering a permissive one would make the two indistinguishable.
-    let access: Vec<(&'static str, Json)> = policy
-        .exec
-        .iter()
-        .map(|exec| {
-            (
-                "exec",
-                Json::Obj(vec![("allow_exec", Json::Bool(exec.is_exec_allowed))]),
-            )
-        })
-        .chain(policy.fs.iter().map(|fs| {
-            (
-                "fs",
-                Json::Obj(vec![
-                    ("allow_upload", Json::Bool(fs.is_upload_allowed)),
-                    ("allow_download", Json::Bool(fs.is_download_allowed)),
-                    ("path_scopes", strings(&fs.path_scopes)),
-                    ("max_upload_bytes", Json::Num(fs.max_upload_bytes)),
-                ]),
-            )
-        }))
-        .collect();
-
-    let mut fields = vec![
-        ("id", Json::str(&sandbox.id)),
-        ("name", Json::str(&sandbox.name)),
-        ("state", Json::str(display_state(sandbox))),
-        ("state_reason", Json::str(&sandbox.state_reason)),
-        ("unreachable", Json::Bool(sandbox.is_unreachable)),
-        ("durable", Json::Bool(sandbox.is_durable)),
-        (
-            "agent_unconfirmed",
-            Json::Bool(sandbox.is_agent_unconfirmed),
-        ),
-        ("node", Json::str(&sandbox.node_id)),
-        ("template", Json::str(&sandbox.template)),
-        ("created_at", Json::str(&sandbox.created_at)),
-        ("address", Json::str(&sandbox.guest_ip)),
-        (
-            "usage",
-            Json::Obj(vec![
-                ("cpu_usage_usec", Json::Num(sandbox.cpu_usage_usec)),
-                ("rx_bytes", Json::Num(sandbox.rx_bytes)),
-                ("tx_bytes", Json::Num(sandbox.tx_bytes)),
-            ]),
-        ),
-        (
-            "resources",
-            Json::Obj(vec![
-                ("vcpus", Json::Num(resources.vcpus as u64)),
-                ("mem_mib", Json::Num(resources.mem_mib as u64)),
-                ("max_lifetime_secs", Json::Num(resources.max_lifetime_secs)),
-                ("idle_suspend_secs", Json::Num(resources.idle_suspend_secs)),
-                (
-                    "suspended_ttl_secs",
-                    Json::Num(resources.suspended_ttl_secs),
-                ),
-                (
-                    "snapshot_expiration_secs",
-                    Json::Num(resources.snapshot_expiration_secs),
-                ),
-                (
-                    "keep_last_snapshots",
-                    Json::Num(resources.keep_last_snapshots as u64),
-                ),
-                (
-                    "keep_evicted_snapshots",
-                    Json::Bool(resources.is_evicted_snapshot_kept),
-                ),
-            ]),
-        ),
-        (
-            "network",
-            Json::Obj(vec![
-                (
-                    "mode",
-                    Json::str(match common::NetworkMode::try_from(network.mode) {
-                        Ok(common::NetworkMode::Open) => "open",
-                        Ok(common::NetworkMode::Allowlist) => "allowlist",
-                        Ok(common::NetworkMode::None) => "none",
-                        _ => "unspecified",
-                    }),
-                ),
-                ("allow_domains", strings(&network.allow_domains)),
-                ("allow_cidrs", strings(&network.allow_cidrs)),
-                (
-                    "allow_ports",
-                    Json::Arr(
-                        network
-                            .allow_ports
-                            .iter()
-                            .map(|port| Json::Num(*port as u64))
-                            .collect(),
-                    ),
-                ),
-                ("deny_cidrs", strings(&network.deny_cidrs)),
-                ("deny_domains", strings(&network.deny_domains)),
-                (
-                    "deny_ports",
-                    Json::Arr(
-                        network
-                            .deny_ports
-                            .iter()
-                            .map(|rule| Json::str(describe_port_rule(rule)))
-                            .collect(),
-                    ),
-                ),
-                ("deny_ipv6", Json::Bool(network.is_ipv6_denied)),
-                ("inspect_tls", Json::Bool(network.is_tls_inspected)),
-                (
-                    "rules",
-                    Json::Arr(
-                        network
-                            .rules
-                            .iter()
-                            .map(|rule| {
-                                let (kind, text) = describe_rule(rule);
-                                Json::Obj(vec![
-                                    ("domain", Json::str(&rule.domain)),
-                                    ("kind", Json::str(kind)),
-                                    ("rule", Json::str(&text)),
-                                    ("expires_at_unix_ms", Json::Num(rule.expires_at_unix_ms)),
-                                    ("expired", Json::Bool(rule.is_expired)),
-                                    ("bound_sandbox_id", Json::str(&rule.bound_sandbox_id)),
-                                ])
-                            })
-                            .collect(),
-                    ),
-                ),
-            ]),
-        ),
-        (
-            "networks",
-            Json::Arr(
-                policy
-                    .networks
-                    .iter()
-                    .map(|membership| {
-                        Json::Obj(vec![
-                            ("network", Json::str(&membership.network)),
-                            (
-                                "alias",
-                                Json::str(if membership.alias.is_empty() {
-                                    &sandbox.id
-                                } else {
-                                    &membership.alias
-                                }),
-                            ),
-                        ])
-                    })
-                    .collect(),
-            ),
-        ),
-        (
-            "tags",
-            Json::Arr(
-                tags.into_iter()
-                    .map(|(key, value)| {
-                        Json::Obj(vec![("key", Json::str(key)), ("value", Json::str(value))])
-                    })
-                    .collect(),
-            ),
-        ),
-    ];
-    fields.extend(access);
+    if let Some(exec) = &policy.exec {
+        fields.insert(
+            "exec".into(),
+            serde_json::json!({ "allow_exec": exec.is_exec_allowed }),
+        );
+    }
+    if let Some(fs) = &policy.fs {
+        fields.insert(
+            "fs".into(),
+            serde_json::json!({
+                "allow_upload": fs.is_upload_allowed,
+                "allow_download": fs.is_download_allowed,
+                "path_scopes": fs.path_scopes,
+                "max_upload_bytes": fs.max_upload_bytes,
+            }),
+        );
+    }
     if !sandbox.env.is_empty() {
-        fields.push(("env", pairs_json(&sandbox.env)));
+        fields.insert("env".into(), pairs_json(&sandbox.env));
     }
     if let Some(kit) = &sandbox.kit {
-        fields.push((
-            "kit",
-            Json::Obj(vec![
-                ("args", pairs_json(&kit.args)),
-                ("reject_types", strings(&kit.reject_types)),
-            ]),
-        ));
+        fields.insert(
+            "kit".into(),
+            serde_json::json!({
+                "args": pairs_json(&kit.args),
+                "reject_types": kit.reject_types,
+            }),
+        );
     }
-    if !sandbox.kit_selection.is_empty() {
-        fields.push(("selection", Json::Raw(sandbox.kit_selection.clone())));
+    if let Ok(selection) = serde_json::from_str::<serde_json::Value>(&sandbox.kit_selection) {
+        fields.insert("selection".into(), selection);
     }
-    let doc = Json::Obj(fields);
-    let mut out = String::new();
-    doc.write(&mut out, 0);
-    out
+    serde_json::to_string_pretty(&doc).expect("a value renders")
 }
 
 /// Whether a failed call is worth repeating: the server went away or the
@@ -4784,61 +4711,38 @@ fn is_transient(status: &tonic::Status) -> bool {
         || status.message().contains("h2 protocol"))
 }
 
-fn usage_interval_json(interval: &api::UsageInterval) -> Json {
-    Json::Obj(vec![
-        ("id", Json::Num(interval.id)),
-        ("sandbox_id", Json::str(&interval.sandbox_id)),
-        ("node_id", Json::str(&interval.node_id)),
-        ("template", Json::str(&interval.template)),
-        ("metadata", map_json(&interval.metadata)),
-        ("state", Json::str(&interval.state)),
-        ("vcpus", Json::Num(interval.vcpus.into())),
-        ("mem_mib", Json::Num(interval.mem_mib.into())),
-        (
-            "started_at_unix_ms",
-            Json::Num(interval.started_at_unix_ms.max(0) as u64),
-        ),
-        (
-            "ended_at_unix_ms",
-            Json::Num(interval.ended_at_unix_ms.max(0) as u64),
-        ),
-        ("cpu_usage_usec", Json::Num(interval.cpu_usage_usec)),
-        ("rx_bytes", Json::Num(interval.rx_bytes)),
-        ("tx_bytes", Json::Num(interval.tx_bytes)),
-        ("closed_by", Json::str(&interval.closed_by)),
-        ("is_open", Json::Bool(interval.is_open)),
-    ])
+fn usage_interval_json(interval: &api::UsageInterval) -> serde_json::Value {
+    serde_json::json!({
+        "id": interval.id,
+        "sandbox_id": interval.sandbox_id,
+        "node_id": interval.node_id,
+        "template": interval.template,
+        "tags": interval.tags,
+        "state": usage_state(interval.state),
+        "vcpus": interval.vcpus,
+        "mem_mib": interval.mem_mib,
+        "started_at_unix_ms": interval.started_at_unix_ms.max(0),
+        "ended_at_unix_ms": interval.ended_at_unix_ms.max(0),
+        "cpu_usage_usec": interval.cpu_usage_usec,
+        "rx_bytes": interval.rx_bytes,
+        "tx_bytes": interval.tx_bytes,
+        "closed_by": interval.closed_by,
+        "is_open": interval.is_open,
+    })
 }
 
-fn usage_sum_json(sum: &api::UsageSum) -> Json {
-    Json::Obj(vec![
-        ("group", Json::str(&sum.group)),
-        ("state", Json::str(&sum.state)),
-        ("intervals", Json::Num(sum.intervals)),
-        ("duration_ms", Json::Num(sum.duration_ms)),
-        ("vcpu_ms", Json::Num(sum.vcpu_ms)),
-        ("mem_mib_ms", Json::Num(sum.mem_mib_ms)),
-        ("cpu_usage_usec", Json::Num(sum.cpu_usage_usec)),
-        ("rx_bytes", Json::Num(sum.rx_bytes)),
-        ("tx_bytes", Json::Num(sum.tx_bytes)),
-    ])
-}
-
-/// A string map as a JSON object, keys sorted.
-fn map_json(map: &std::collections::HashMap<String, String>) -> Json {
-    let mut pairs: Vec<_> = map.iter().collect();
-    pairs.sort();
-    let mut out = String::from("{");
-    for (i, (key, value)) in pairs.into_iter().enumerate() {
-        if i > 0 {
-            out.push_str(", ");
-        }
-        escape(key, &mut out);
-        out.push_str(": ");
-        escape(value, &mut out);
-    }
-    out.push('}');
-    Json::Raw(out)
+fn usage_sum_json(sum: &api::UsageSum) -> serde_json::Value {
+    serde_json::json!({
+        "group": sum.group,
+        "state": usage_state(sum.state),
+        "intervals": sum.intervals,
+        "duration_ms": sum.duration_ms,
+        "vcpu_ms": sum.vcpu_ms,
+        "mem_mib_ms": sum.mem_mib_ms,
+        "cpu_usage_usec": sum.cpu_usage_usec,
+        "rx_bytes": sum.rx_bytes,
+        "tx_bytes": sum.tx_bytes,
+    })
 }
 
 fn cpu_secs(usec: u64) -> String {
@@ -4889,6 +4793,10 @@ fn unix_ms_from_utc(text: &str) -> Option<i64> {
 
 /// Unix milliseconds as RFC 3339 to the second, without pulling in a date
 /// crate for one column.
+fn usage_state(state: i32) -> &'static str {
+    api::UsageState::try_from(state).unwrap_or_default().label()
+}
+
 fn rfc3339_from_unix_ms(ms: i64) -> String {
     let secs = ms.div_euclid(1000);
     let days = secs.div_euclid(86_400);
@@ -4919,7 +4827,7 @@ mod tests {
             }),
             status: Some(status),
             is_healthy: true,
-            last_heartbeat_at: String::new(),
+            last_heartbeat_at_unix_ms: 0,
         }
     }
 
@@ -4932,16 +4840,22 @@ mod tests {
             node(
                 "node-a",
                 NodeStatus {
-                    disk_free_bytes: 40 << 30,
-                    disk_total_bytes: 100 << 30,
+                    disk: Some(burrow_proto::common::v1::DiskCapacity {
+                        free_bytes: 40 << 30,
+                        total_bytes: 100 << 30,
+                        ..Default::default()
+                    }),
                     ..Default::default()
                 },
             ),
             node(
                 "node-b",
                 NodeStatus {
-                    disk_free_bytes: 3 << 29,
-                    disk_total_bytes: 100 << 30,
+                    disk: Some(burrow_proto::common::v1::DiskCapacity {
+                        free_bytes: 3 << 29,
+                        total_bytes: 100 << 30,
+                        ..Default::default()
+                    }),
                     is_disk_low: true,
                     running_sandboxes: 2,
                     ..Default::default()
@@ -5299,20 +5213,13 @@ mod tests {
     }
 
     #[test]
-    fn json_strings_survive_what_a_tag_may_contain() {
-        let mut out = String::new();
-        escape("a\"b\\c\nd\te\u{1}", &mut out);
-        assert_eq!(out, r#""a\"b\\c\nd\te\u0001""#);
-    }
-
-    #[test]
     fn a_record_renders_as_json() {
         let sandbox = common::Sandbox {
             id: "sbx_1".into(),
             name: "api".into(),
             state: common::SandboxState::Running as i32,
             cpu_usage_usec: 1500,
-            metadata: [("env".to_string(), "ci\"1".to_string())]
+            tags: [("env".to_string(), "ci\"1".to_string())]
                 .into_iter()
                 .collect(),
             policy: Some(common::Policy {

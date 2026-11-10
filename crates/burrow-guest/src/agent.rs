@@ -280,7 +280,7 @@ impl Guest for AgentService {
     ) -> Result<Response<guestpb::DeleteUserResponse>, Status> {
         let req = req.into_inner();
         let running = commands::list().commands.into_iter().any(|command| {
-            command.state == "running"
+            command.state == guestpb::CommandState::Running as i32
                 && command
                     .user
                     .split(':')

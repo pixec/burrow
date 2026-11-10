@@ -27,5 +27,6 @@ tokio-rustls = { workspace = true }
 rustls = { workspace = true }
 rustls-pemfile = { workspace = true }
 webpki-roots = { workspace = true }
+burrow-proto = { workspace = true }
 burrow-store = { workspace = true }
 burrow-common = { workspace = true }

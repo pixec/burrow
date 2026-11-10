@@ -35,6 +35,8 @@ use std::sync::Arc;
 use serde::{Deserialize, Serialize};
 use tonic::Status;
 
+use burrow_vmm::HypervisorExt;
+
 use crate::chunks::Hydrator;
 
 use burrow_proto::common::v1 as common;
@@ -83,16 +85,13 @@ pub struct Manifest {
     pub vcpus: u32,
     pub mem_mib: u32,
     pub scratch_disk_mib: u32,
-    /// RFC 3339, for reporting.
-    pub created_at: String,
-    /// The same instant in milliseconds, for ordering.
-    ///
-    /// Retention evicts the oldest first, and two snapshots taken inside one
-    /// second would otherwise be ordered arbitrarily, by their random ids.
+    /// Unix milliseconds. Retention evicts the oldest first, and two
+    /// snapshots taken inside one second would otherwise be ordered
+    /// arbitrarily, by their random ids.
     pub created_unix_ms: i64,
     pub size_bytes: u64,
-    /// Unix seconds; 0 means the snapshot never expires.
-    pub expires_at: i64,
+    /// Unix milliseconds; 0 means the snapshot never expires.
+    pub expires_at_ms: i64,
     /// Seconds the TTL is re-armed for on every use. 0 means no expiry, which
     /// is why it is kept beside `expires_at` rather than recomputed from it.
     pub expiration_secs: u64,
@@ -104,8 +103,8 @@ pub struct Manifest {
     /// What the snapshot was taken on, which bounds where it can be restored.
     pub arch: String,
     /// The version of `hypervisor` that wrote it, which is the only one its
-    /// state is known to restore under. Named for the one backend there was.
-    pub firecracker_version: String,
+    /// state is known to restore under.
+    pub hypervisor_version: String,
     /// The hypervisor that took it, and so the one it restores under. Empty in
     /// a manifest from before there was a choice, which was Firecracker.
     #[serde(default)]
@@ -150,18 +149,17 @@ impl Manifest {
             template: self.template.clone(),
             // The orchestrator stamps this from its own view of the fleet.
             node_id: String::new(),
-            vcpus: self.vcpus,
-            mem_mib: self.mem_mib,
-            scratch_disk_mib: self.scratch_disk_mib,
-            created_at: self.created_at.clone(),
+            resources: Some(common::ResourcePolicy {
+                vcpus: self.vcpus,
+                mem_mib: self.mem_mib,
+                scratch_disk_mib: self.scratch_disk_mib,
+            }),
+            created_at_unix_ms: self.created_unix_ms,
             size_bytes: self.size_bytes,
-            expires_at: match self.expires_at {
-                0 => String::new(),
-                at => burrow_common::rfc3339_from_unix_secs(at),
-            },
+            expires_at_unix_ms: self.expires_at_ms,
             is_durable: self.is_durable,
             arch: self.arch.clone(),
-            firecracker_version: self.firecracker_version.clone(),
+            hypervisor_version: self.hypervisor_version.clone(),
             hypervisor: self
                 .hypervisor()
                 .map_or_else(|_| self.hypervisor.clone(), |h| h.to_string()),
@@ -368,7 +366,6 @@ impl SnapshotStore {
         flatten(&dir, &staged.chain, staged.hypervisor.layout()).await?;
 
         let size_bytes = directory_size(&dir).await;
-        let now = burrow_common::unix_now();
         let manifest = Manifest {
             format: MANIFEST_FORMAT,
             id: id.to_string(),
@@ -377,17 +374,16 @@ impl SnapshotStore {
             vcpus: staged.vcpus,
             mem_mib: staged.mem_mib,
             scratch_disk_mib: staged.scratch_disk_mib,
-            created_at: burrow_common::now_rfc3339(),
-            created_unix_ms: unix_now_ms(),
+            created_unix_ms: burrow_common::unix_now_ms(),
             size_bytes,
-            expires_at: match expiration_secs {
+            expires_at_ms: match expiration_secs {
                 0 => 0,
-                secs => now + secs as i64,
+                secs => burrow_common::unix_now_ms() + secs as i64 * 1000,
             },
             expiration_secs,
             is_evicted: false,
             arch: std::env::consts::ARCH.to_string(),
-            firecracker_version: self
+            hypervisor_version: self
                 .versions
                 .get(&staged.hypervisor)
                 .cloned()
@@ -959,7 +955,8 @@ impl SnapshotStore {
         if manifest.expiration_secs == 0 {
             return;
         }
-        manifest.expires_at = burrow_common::unix_now() + manifest.expiration_secs as i64;
+        manifest.expires_at_ms =
+            burrow_common::unix_now_ms() + manifest.expiration_secs as i64 * 1000;
         if let Err(err) = write_manifest(&self.dir(id), &manifest).await {
             tracing::warn!(snapshot = id, %err, "could not refresh a snapshot's expiry");
         }
@@ -1014,13 +1011,13 @@ impl SnapshotStore {
 
     /// Deletes snapshots whose TTL has run out, returning their ids.
     pub async fn sweep_expired(&self) -> Vec<String> {
-        let now = burrow_common::unix_now();
+        let now_ms = burrow_common::unix_now_ms();
         let mut swept = Vec::new();
         for snapshot in self.list(None).await {
             let Ok(manifest) = self.manifest(&snapshot.id).await else {
                 continue;
             };
-            if manifest.expires_at == 0 || manifest.expires_at > now {
+            if manifest.expires_at_ms == 0 || manifest.expires_at_ms > now_ms {
                 continue;
             }
             match self.delete(&snapshot.id).await {
@@ -1153,14 +1150,6 @@ async fn is_older_than(path: &Path, age: std::time::Duration) -> bool {
         .ok()
         .and_then(|at| at.elapsed().ok())
         .is_some_and(|elapsed| elapsed > age)
-}
-
-/// Milliseconds since the epoch, for ordering snapshots taken close together.
-fn unix_now_ms() -> i64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_millis() as i64)
-        .unwrap_or(0)
 }
 
 /// Merges the staged memory chain down to the single image a snapshot holds.
@@ -1298,14 +1287,13 @@ mod tests {
             vcpus: 2,
             mem_mib: 1024,
             scratch_disk_mib: 2048,
-            created_at: created_at.into(),
             created_unix_ms: burrow_common::unix_from_rfc3339(created_at).unwrap_or(0) * 1_000,
             size_bytes: 12_345,
-            expires_at: 0,
+            expires_at_ms: 0,
             expiration_secs: 0,
             is_evicted: false,
             arch: String::new(),
-            firecracker_version: String::new(),
+            hypervisor_version: String::new(),
             hypervisor: String::new(),
             is_durable: false,
             kernel_digest: String::new(),
@@ -1331,7 +1319,7 @@ mod tests {
         let (store, root) = store();
         let dir = store.begin("snap_abc123").await.unwrap();
         let mut written = manifest("snap_abc123", "sbx_a", "2026-09-02T10:00:00Z");
-        written.expires_at = 1_800_000_000;
+        written.expires_at_ms = 1_800_000_000_000;
         written.expiration_secs = 3_600;
         write_manifest(&dir, &written).await.unwrap();
 
@@ -1342,11 +1330,11 @@ mod tests {
             (read.vcpus, read.mem_mib, read.scratch_disk_mib),
             (2, 1024, 2048)
         );
-        assert_eq!(read.expires_at, 1_800_000_000);
+        assert_eq!(read.expires_at_ms, 1_800_000_000_000);
         assert_eq!(read.expiration_secs, 3_600);
 
         let proto = read.to_proto();
-        assert_eq!(proto.expires_at, "2027-01-15T08:00:00Z");
+        assert_eq!(proto.expires_at_unix_ms, 1_800_000_000_000);
         assert_eq!(proto.template, "default");
         // The node cannot know its own id here; the orchestrator stamps it.
         assert!(proto.node_id.is_empty());
@@ -1465,7 +1453,7 @@ mod tests {
     #[tokio::test]
     async fn only_snapshots_past_their_expiry_are_swept() {
         let (store, root) = store();
-        let now = burrow_common::unix_now();
+        let now_ms = burrow_common::unix_now_ms();
         seed(
             &store,
             &[
@@ -1476,9 +1464,9 @@ mod tests {
         )
         .await;
         // Expired, still live, and never expires.
-        for (id, expires_at) in [("snap_ccc1", now - 1), ("snap_ccc2", now + 3_600)] {
+        for (id, expires_at_ms) in [("snap_ccc1", now_ms - 1), ("snap_ccc2", now_ms + 3_600_000)] {
             let mut manifest = store.manifest(id).await.unwrap();
-            manifest.expires_at = expires_at;
+            manifest.expires_at_ms = expires_at_ms;
             manifest.expiration_secs = 3_600;
             write_manifest(&store.dir(id), &manifest).await.unwrap();
         }
@@ -1491,10 +1479,10 @@ mod tests {
         // A use re-arms the TTL, which is what makes expiry "since last use".
         store.touch("snap_ccc2").await;
         let refreshed = store.manifest("snap_ccc2").await.unwrap();
-        assert!(refreshed.expires_at >= now + 3_600);
+        assert!(refreshed.expires_at_ms >= now_ms + 3_600_000);
         // A snapshot with no TTL is not given one by being used.
         store.touch("snap_ccc3").await;
-        assert_eq!(store.manifest("snap_ccc3").await.unwrap().expires_at, 0);
+        assert_eq!(store.manifest("snap_ccc3").await.unwrap().expires_at_ms, 0);
 
         let _ = std::fs::remove_dir_all(&root);
     }

@@ -14,7 +14,7 @@ use tokio::sync::mpsc;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct EgressEvent {
-    pub at: String,
+    pub at_ms: i64,
     pub sandbox_id: String,
     pub source_ip: String,
     /// Where the sandbox was trying to go, as it addressed it.
@@ -257,7 +257,7 @@ async fn write(
     if let Some(store) = store
         && let Err(err) = store
             .insert_egress(&burrow_store::EgressRow {
-                at: event.at.clone(),
+                at_ms: event.at_ms,
                 sandbox_id: event.sandbox_id.clone(),
                 source_ip: event.source_ip.clone(),
                 destination: event.destination.clone(),
@@ -288,7 +288,7 @@ mod tests {
 
     fn event(sandbox: &str, allowed: bool) -> EgressEvent {
         EgressEvent {
-            at: "1970-01-01T00:00:00Z".into(),
+            at_ms: 0,
             sandbox_id: sandbox.into(),
             source_ip: "10.99.0.6".into(),
             destination: "93.184.216.34:443".into(),
@@ -426,7 +426,7 @@ mod tests {
         assert!(line.contains("\"dropped_records\":7"), "{line}");
 
         // A record with no drops omits the field, and reads back as zero.
-        let old = r#"{"at":"t","sandbox_id":"s","source_ip":"1.2.3.4",
+        let old = r#"{"at_ms":0,"sandbox_id":"s","source_ip":"1.2.3.4",
             "destination":"d","host":null,"port":443,"is_allowed":true,
             "reason":"allowed","bytes_sent":0,"bytes_received":0}"#;
         let parsed: EgressEvent = serde_json::from_str(old).unwrap();

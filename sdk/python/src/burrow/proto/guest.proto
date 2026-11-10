@@ -207,9 +207,8 @@ message CommandInfo {
   repeated string cmd = 2;
   // Empty means the command runs as root.
   string user = 3;
-  // "running" or "exited".
-  string state = 4;
-  // Meaningful only once `state` is "exited".
+  CommandState state = 4;
+  // Meaningful only once `state` is exited.
   int32 exit_code = 5;
   // Unix milliseconds; `ended_at_unix_ms` is 0 while the command runs.
   int64 started_at_unix_ms = 6;
@@ -236,10 +235,22 @@ message WatchRequest {
 }
 
 message WatchEvent {
-  // "created", "modified", or "deleted".
-  string type = 1;
+  WatchEventKind kind = 1;
   string path = 2;
   bool is_dir = 3;
+}
+
+enum WatchEventKind {
+  WATCH_EVENT_KIND_UNSPECIFIED = 0;
+  WATCH_EVENT_KIND_CREATED = 1;
+  WATCH_EVENT_KIND_MODIFIED = 2;
+  WATCH_EVENT_KIND_DELETED = 3;
+}
+
+enum CommandState {
+  COMMAND_STATE_UNSPECIFIED = 0;
+  COMMAND_STATE_RUNNING = 1;
+  COMMAND_STATE_EXITED = 2;
 }
 
 message FileChunk {
@@ -725,7 +736,17 @@ message FsDirEntries {
 
 message FsDirEntry {
   string name = 1;
-  // d_type: "file", "dir", "symlink", "fifo", "socket", "char", "block", or
-  // "unknown".
-  string type = 2;
+  FileType type = 2;
+}
+
+// d_type of a directory entry.
+enum FileType {
+  FILE_TYPE_UNSPECIFIED = 0;
+  FILE_TYPE_FILE = 1;
+  FILE_TYPE_DIR = 2;
+  FILE_TYPE_SYMLINK = 3;
+  FILE_TYPE_FIFO = 4;
+  FILE_TYPE_SOCKET = 5;
+  FILE_TYPE_CHAR = 6;
+  FILE_TYPE_BLOCK = 7;
 }

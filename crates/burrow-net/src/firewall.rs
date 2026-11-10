@@ -39,15 +39,11 @@ const NAT6_TABLE: &str = "burrow_nat6";
 /// reading usage never has to walk the policy rules.
 const METER_TABLE: &str = "burrow_meter";
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Mode {
-    /// No traffic in or out.
-    None,
-    /// Egress only to the host services (proxy, DNS); everything else denied.
-    Allowlist,
-    /// Full NAT'd egress.
-    Open,
-}
+/// A sandbox's egress mode, as the policy names it. None and Unspecified are
+/// the same thing here: no traffic in or out. Allowlist is egress only to the
+/// host services (proxy, DNS), everything else denied. Open is full NAT'd
+/// egress.
+pub use burrow_proto::common::v1::NetworkMode as Mode;
 
 /// Transport a published port forwards. A mapping is one or the other, and a
 /// host port belongs to one mapping whichever it is, so `tcp/20000` and
@@ -748,7 +744,7 @@ fn render_sandbox_allowances(out: &mut String, sandbox: &SandboxRules) {
     }
 
     match sandbox.mode {
-        Mode::None => {}
+        Mode::None | Mode::Unspecified => {}
         // Allowlist web traffic never traverses the forward hook: it is
         // redirected to the proxy, which opens its own connection outward, and
         // name resolution is answered by burrow's resolver on the host rather

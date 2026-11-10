@@ -137,11 +137,9 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use burrow_proxy::directory::Directory;
 use burrow_proxy::inspect::Authority;
-use burrow_proxy::policy::NetworkMode;
 use burrow_proxy::{AuditLog, DeniedAddresses, EgressEvent, Proxy, Resolutions, Resolver};
 use tokio::sync::watch;
 
-use crate::firewall::Mode;
 use crate::ipam::Lease;
 use crate::policy::{Deny, PortDenial, Rules};
 
@@ -201,14 +199,9 @@ impl Policy {
         deny_ports: &[PortDenial],
         peers: &[Ipv4Addr],
     ) -> Self {
-        let mode = match proxy.mode {
-            NetworkMode::None => Mode::None,
-            NetworkMode::Allowlist => Mode::Allowlist,
-            NetworkMode::Open => Mode::Open,
-        };
         let rules = Rules::new(
             &proxy.sandbox_id,
-            mode,
+            proxy.mode,
             allow_cidrs,
             allow_ports,
             Deny {
@@ -344,7 +337,7 @@ pub(crate) struct Flow<'a> {
 impl Flow<'_> {
     pub fn record(self, audit: &AuditLog) {
         audit.record(EgressEvent {
-            at: burrow_proxy::now_rfc3339(),
+            at_ms: burrow_proxy::unix_now_ms(),
             sandbox_id: self.sandbox_id.to_string(),
             source_ip: self.source.to_string(),
             destination: self.destination.to_string(),

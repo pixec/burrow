@@ -1,4 +1,4 @@
-"""The SDK's data shapes: what calls return, read back from the wire."""
+"""The SDK's data shapes: what calls take and return."""
 
 from __future__ import annotations
 
@@ -18,15 +18,33 @@ class Usage:
 
 @dataclass
 class ResourcePolicy:
+    """The machine a sandbox runs on. Fixed for its life; 0 is the server's
+    default, which is what lets a create from a snapshot inherit its shape."""
+
     vcpus: int = 0
     memory_mib: int = 0
     disk_mib: int = 0
+
+
+@dataclass
+class LifetimePolicy:
+    """How long a sandbox stays paid for. Seconds; 0 is unlimited or never."""
+
     max_lifetime_secs: int = 0
     idle_suspend_secs: int = 0
     suspended_ttl_secs: int = 0
-    snapshot_expiration_secs: int = 0
-    keep_last_snapshots: int = 0
-    keep_evicted_snapshots: bool = False
+
+
+@dataclass
+class SnapshotPolicy:
+    """How long the snapshots taken of a sandbox stay paid for."""
+
+    # Seconds from last use; 0 never expires.
+    expiration_secs: int = 0
+    # Keep the N most recent, 1..=10; 0 is unlimited.
+    keep_last: int = 0
+    # Let an evicted snapshot live out its expiration instead of deleting it.
+    evicted_kept: bool = False
 
 
 @dataclass
@@ -48,10 +66,9 @@ class RequestRule:
 
     In open mode ``domain`` is an exact host name, since it also names the one
     host whose TLS is inspected. ``expires_at_unix_ms`` is when the rule stops
-    applying, 0 for never; ``expired`` says it has, and is read only.
-    ``bound_sandbox_id`` is set by the server on a rule whose value came from
-    a scoped secret: a copy of the policy anywhere else refuses the requests
-    the rule would have claimed.
+    applying, 0 for never. ``bound_sandbox_id`` is set by the server on a rule
+    whose value came from a scoped secret: a copy of the policy anywhere else
+    refuses the requests the rule would have claimed.
     """
 
     domain: str
@@ -59,7 +76,6 @@ class RequestRule:
     set_headers: Optional[Dict[str, str]] = None
     forward: Optional[dict] = None
     expires_at_unix_ms: int = 0
-    expired: bool = False
     bound_sandbox_id: str = ""
 
 
@@ -71,13 +87,6 @@ class SecretInfo:
     name: str
     allowed_sandboxes: List[str] = field(default_factory=list)
     allowed_tags: List[str] = field(default_factory=list)
-
-
-@dataclass
-class HeaderInjection:
-    domain: str
-    name: str
-    value: str
 
 
 @dataclass
@@ -107,9 +116,6 @@ class NetworkPolicy:
     deny_ipv6: bool = False
     inspect_tls: bool = False
     rules: List[RequestRule] = field(default_factory=list)
-    # The rules that are exactly what `inject_headers` used to describe, so
-    # code written before rules existed still reads what it wrote.
-    inject_headers: List[HeaderInjection] = field(default_factory=list)
 
 
 @dataclass
@@ -131,7 +137,9 @@ class VolumeMount:
 @dataclass
 class SandboxPolicy:
     resources: ResourcePolicy = field(default_factory=ResourcePolicy)
-    exec: Optional[ExecPolicy] = None
+    lifetime: LifetimePolicy = field(default_factory=LifetimePolicy)
+    snapshots: SnapshotPolicy = field(default_factory=SnapshotPolicy)
+    exec_policy: Optional[ExecPolicy] = None
     fs: Optional[FsPolicy] = None
     network: NetworkPolicy = field(default_factory=NetworkPolicy)
     networks: List[NetworkMembership] = field(default_factory=list)
@@ -145,7 +153,7 @@ class SandboxInfo:
     node_id: str
     template: str
     state: str
-    created_at: str
+    created_at: datetime
     guest_ip: str
     tags: Dict[str, str]
     policy: SandboxPolicy
@@ -155,6 +163,10 @@ class SandboxInfo:
     # on another node. A durable sandbox with an empty `node_id` is held by no
     # node, and its next resume places it.
     durable: bool = False
+    hypervisor: str = ""
+    hypervisor_version: str = ""
+    arch: str = ""
+    guest_os: str = ""
 
 
 @dataclass
@@ -163,11 +175,12 @@ class Session:
 
     id: str
     sandbox_id: str
-    started_at: str
-    ended_at: str
-    # "boot", "restore", "resume", or "unknown".
+    started_at: datetime
+    # None while the session is open, and for one the node died during.
+    ended_at: Optional[datetime]
+    # "boot", "restore" or "resume".
     started_by: str
-    # "suspended", "deleted", "failed", "unknown", or "" while open.
+    # "suspended", "deleted", "stopped", "failed", "unknown", or "" while open.
     ended_by: str
 
 
@@ -194,7 +207,8 @@ class CommandInfo:
 
 @dataclass
 class WatchEvent:
-    type: str
+    # "created", "modified" or "deleted".
+    kind: str
     path: str
     is_dir: bool
 
@@ -223,14 +237,14 @@ class Share:
     ports: List[int]
     # `nodekey:<hex>` of each admitted client; empty admits anyone.
     allowed_clients: List[str]
-    # RFC 3339; when the current keys were issued.
-    created_at: str
+    # When the current keys were issued.
+    created_at: datetime
     # Guest UDP ports reachable through the share; none unless listed or all_udp.
     udp_ports: List[int] = field(default_factory=list)
     all_udp: bool = False
-    # Packet source is the last disco-pong-verified public IPv4.
-    # What the share is doing: a node that cannot carry the reply path
-    # serves from the gateway whatever was asked for.
+    # What the share is doing: connections sourced from each client's own
+    # public IPv4, or from the gateway when the node cannot carry the reply
+    # path whatever was asked for.
     transparent_ip: bool = True
 
 
@@ -250,6 +264,36 @@ class GuestGroup:
 
 
 @dataclass
+class DeletedUser:
+    home: str
+    home_removed: bool
+
+
+@dataclass
+class DeletedGroup:
+    shared_dir: str
+    shared_dir_removed: bool
+
+
+@dataclass
+class PrunedCommands:
+    removed: int
+    freed_bytes: int
+
+
+@dataclass
+class DiskCapacity:
+    """A node's data filesystem, as its last heartbeat reported it. A total of
+    0 is a node that does not report disk."""
+
+    free_bytes: int = 0
+    total_bytes: int = 0
+    reserve_bytes: int = 0
+    unwritten_bytes: int = 0
+    overcommit: float = 0.0
+
+
+@dataclass
 class NodeInfo:
     id: str
     address: str
@@ -261,15 +305,28 @@ class NodeInfo:
     healthy: bool
     draining: bool
     labels: Dict[str, str]
-    # Cpu architecture and Firecracker version. A durable snapshot only
-    # restores on a node where both match.
+    # Cpu architecture and each offered hypervisor's version. A durable
+    # snapshot only restores on a node where both match what took it.
     arch: str = ""
-    firecracker_version: str = ""
+    hypervisor_versions: Dict[str, str] = field(default_factory=dict)
+    disk: DiskCapacity = field(default_factory=DiskCapacity)
+    disk_low: bool = False
+    last_heartbeat_at: Optional[datetime] = None
+
+
+@dataclass
+class DrainResult:
+    suspended: int
+
+
+@dataclass
+class Health:
+    version: str
 
 
 @dataclass
 class AuditEvent:
-    at: str
+    at: datetime
     sandbox_id: str
     source_ip: str
     destination: str
@@ -295,12 +352,12 @@ class LifecycleEvent:
     node_id: str
     # Position in the recording node's own log.
     node_seq: int
-    at_unix_ms: int
+    at: datetime
     sandbox_id: str
     # "created", "started", "agent_ready", "stopped", "destroyed",
     # "snapshot_created", or "recovered" for each sandbox a node found on
     # restart.
-    type: str
+    kind: str
     state: str
     # How a VM started ("boot", "restore", "resume") or stopped ("suspended",
     # "deleted", "stopped", "failed", or "lost" for a VM a node found gone on
@@ -308,7 +365,7 @@ class LifecycleEvent:
     # "snapshot:<id>"), or the snapshot a commit produced.
     detail: str
     template: str
-    metadata: Dict[str, str]
+    tags: Dict[str, str]
     cpu_usage_usec: int
     rx_bytes: int
     tx_bytes: int
@@ -327,6 +384,17 @@ class TemplateInfo:
     kit: bool = False
     # Sandboxes from it run systemd under the agent.
     systemd: bool = False
+    # "linux", "windows" or "macos".
+    guest_os: str = ""
+    hypervisor: str = ""
+
+
+@dataclass
+class BuiltTemplate:
+    """What a build reports when it finishes."""
+
+    name: str
+    size_bytes: int
 
 
 @dataclass
@@ -340,17 +408,17 @@ class UsageInterval:
     sandbox_id: str
     node_id: str
     template: str
-    metadata: Dict[str, str]
+    tags: Dict[str, str]
     # "running", "suspended" or "stopped".
     state: str
     vcpus: int
     memory_mib: int
-    started_at_unix_ms: int
-    ended_at_unix_ms: int
+    started_at: datetime
+    ended_at: datetime
     cpu_usage_usec: int
     rx_bytes: int
     tx_bytes: int
-    # The event type that ended the state, "checkpoint" for the hourly split,
+    # The event kind that ended the state, "checkpoint" for the hourly split,
     # or "write_off" for a node that went silent. Empty while open.
     closed_by: str
     open: bool

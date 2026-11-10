@@ -17,14 +17,14 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use burrow_proto::api::v1 as api;
-use burrow_proto::common::v1::SandboxState;
+use burrow_proto::common::v1::{EventKind, SandboxState};
 use burrow_store::{EventRow, OpenUsageChange, OpenUsageRow, Store, UsageCommit, UsageRow};
 
 use crate::OrchestratorState;
 
-pub const RUNNING: &str = "running";
-pub const SUSPENDED: &str = "suspended";
-pub const STOPPED: &str = "stopped";
+pub const RUNNING: i32 = api::UsageState::Running as i32;
+pub const SUSPENDED: i32 = api::UsageState::Suspended as i32;
+pub const STOPPED: i32 = api::UsageState::Stopped as i32;
 
 pub const CLOSED_BY_CHECKPOINT: &str = "checkpoint";
 pub const CLOSED_BY_WRITE_OFF: &str = "write_off";
@@ -46,12 +46,12 @@ const BATCH: usize = 500;
 
 /// What an event does to the state a sandbox is counted in.
 enum Effect {
-    Enter(&'static str),
+    Enter(i32),
     End,
     Keep,
 }
 
-fn counted(state: i32) -> Option<&'static str> {
+fn counted(state: i32) -> Option<i32> {
     match SandboxState::try_from(state).unwrap_or_default() {
         SandboxState::Creating | SandboxState::Running => Some(RUNNING),
         SandboxState::Paused | SandboxState::Suspended => Some(SUSPENDED),
@@ -61,19 +61,23 @@ fn counted(state: i32) -> Option<&'static str> {
     }
 }
 
+fn kind(event: &EventRow) -> EventKind {
+    EventKind::try_from(event.kind).unwrap_or_default()
+}
+
 fn effect(event: &EventRow) -> Effect {
-    match event.kind.as_str() {
-        "created" | "started" | "agent_ready" => Effect::Enter(RUNNING),
+    match kind(event) {
+        EventKind::Created | EventKind::Started | EventKind::AgentReady => Effect::Enter(RUNNING),
         // The VM of a sandbox being deleted; `destroyed` follows at once.
-        "stopped" if event.detail == "deleted" => Effect::Keep,
-        "stopped" => Effect::Enter(match counted(event.state) {
+        EventKind::Stopped if event.detail == "deleted" => Effect::Keep,
+        EventKind::Stopped => Effect::Enter(match counted(event.state) {
             Some(SUSPENDED) => SUSPENDED,
             _ => STOPPED,
         }),
-        "destroyed" => Effect::End,
+        EventKind::Destroyed => Effect::End,
         // A node's restart reporting each sandbox it holds, in the state it
         // found it.
-        "recovered" => counted(event.state).map_or(Effect::Keep, Effect::Enter),
+        EventKind::Recovered => counted(event.state).map_or(Effect::Keep, Effect::Enter),
         _ => Effect::Keep,
     }
 }
@@ -81,16 +85,19 @@ fn effect(event: &EventRow) -> Effect {
 /// Only an event that puts a sandbox on a node can move it there: a node that
 /// lets go of a sandbox another node adopted reports that after the adoption.
 fn places(event: &EventRow) -> bool {
-    matches!(event.kind.as_str(), "created" | "started" | "agent_ready")
+    matches!(
+        kind(event),
+        EventKind::Created | EventKind::Started | EventKind::AgentReady
+    )
 }
 
-fn open_at(event: &EventRow, state: &str) -> OpenUsageRow {
+fn open_at(event: &EventRow, state: i32) -> OpenUsageRow {
     OpenUsageRow {
         sandbox_id: event.sandbox_id.clone(),
         node_id: event.node_id.clone(),
         template: event.template.clone(),
         metadata_json: event.metadata_json.clone(),
-        state: state.to_string(),
+        state,
         vcpus: event.vcpus,
         mem_mib: event.mem_mib,
         started_at_ms: event.at_unix_ms,
@@ -112,7 +119,7 @@ fn close(open: &OpenUsageRow, at: i64, totals: (u64, u64, u64), closed_by: &str)
         node_id: open.node_id.clone(),
         template: open.template.clone(),
         metadata_json: open.metadata_json.clone(),
-        state: open.state.clone(),
+        state: open.state,
         vcpus: open.vcpus,
         mem_mib: open.mem_mib,
         started_at_ms: open.started_at_ms,
@@ -154,10 +161,10 @@ pub fn advance(
     }
     let next_state = match effect {
         Effect::Enter(state) => Some(state),
-        Effect::Keep => Some(open.state.as_str()),
+        Effect::Keep => Some(open.state),
         Effect::End => None,
     };
-    let unchanged = next_state == Some(open.state.as_str())
+    let unchanged = next_state == Some(open.state)
         && event.node_id == open.node_id
         && event.vcpus == open.vcpus
         && event.mem_mib == open.mem_mib;
@@ -187,7 +194,7 @@ pub fn advance(
             (event.cpu_usage_usec, event.rx_bytes, event.tx_bytes),
         )
     };
-    let row = close(open, at, totals, &event.kind);
+    let row = close(open, at, totals, kind(event).label());
     (Some(row), next_state.map(|state| open_at(event, state)))
 }
 
@@ -307,7 +314,7 @@ async fn sweep_open(
     store: &Store,
 ) -> burrow_store::Result<(usize, usize)> {
     let (mut split, mut vanished) = (0, 0);
-    let now = crate::registry::unix_ms();
+    let now = burrow_common::unix_now_ms();
     for open in store.list_open_usage(None).await? {
         let (row, next) = if let Some((row, next)) = checkpoint(&open) {
             (row, Some(next))
@@ -428,7 +435,7 @@ fn so_far(open: &OpenUsageRow) -> UsageRow {
 fn to_proto(row: UsageRow, is_open: bool) -> api::UsageInterval {
     api::UsageInterval {
         id: row.id,
-        metadata: tags(&row.metadata_json),
+        tags: tags(&row.metadata_json),
         sandbox_id: row.sandbox_id,
         node_id: row.node_id,
         template: row.template,
@@ -445,13 +452,21 @@ fn to_proto(row: UsageRow, is_open: bool) -> api::UsageInterval {
     }
 }
 
-fn group_of(interval: &api::UsageInterval, group_by: &str) -> String {
-    match group_by {
-        "sandbox" => interval.sandbox_id.clone(),
-        "template" => interval.template.clone(),
-        "node" => interval.node_id.clone(),
-        "state" => interval.state.clone(),
-        tag => interval.metadata.get(tag).cloned().unwrap_or_default(),
+fn group_of(interval: &api::UsageInterval, req: &api::QueryUsageRequest) -> String {
+    match api::UsageGroup::try_from(req.group_by).unwrap_or_default() {
+        api::UsageGroup::Sandbox => interval.sandbox_id.clone(),
+        api::UsageGroup::Template => interval.template.clone(),
+        api::UsageGroup::Node => interval.node_id.clone(),
+        api::UsageGroup::State => api::UsageState::try_from(interval.state)
+            .unwrap_or_default()
+            .label()
+            .to_string(),
+        api::UsageGroup::Tag => interval
+            .tags
+            .get(&req.group_by_tag)
+            .cloned()
+            .unwrap_or_default(),
+        api::UsageGroup::Unspecified => String::new(),
     }
 }
 
@@ -465,7 +480,7 @@ pub async fn query(
         (req.from_unix_ms == 0 || at >= req.from_unix_ms)
             && (req.to_unix_ms == 0 || at < req.to_unix_ms)
     };
-    let tagged = |metadata: &Tags| req.tags.iter().all(|(k, v)| metadata.get(k) == Some(v));
+    let tagged = |tags: &Tags| req.tags.iter().all(|(k, v)| tags.get(k) == Some(v));
     let mut filter = burrow_store::UsageFilter {
         from_ms: (req.from_unix_ms != 0).then_some(req.from_unix_ms),
         to_ms: (req.to_unix_ms != 0).then_some(req.to_unix_ms),
@@ -476,14 +491,14 @@ pub async fn query(
             limit => limit.min(PAGE),
         },
     };
-    let is_summed = !req.group_by.is_empty();
+    let is_summed = req.group_by != api::UsageGroup::Unspecified as i32;
     if is_summed {
         filter.limit = PAGE;
     }
     // Summed page by page, so a month of a fleet is never held at once.
-    let mut sums: std::collections::BTreeMap<(String, String), api::UsageSum> = Default::default();
+    let mut sums: std::collections::BTreeMap<(String, i32), api::UsageSum> = Default::default();
     let mut add = |interval: &api::UsageInterval| {
-        let key = (group_of(interval, &req.group_by), interval.state.clone());
+        let key = (group_of(interval, req), interval.state);
         let sum = sums.entry(key.clone()).or_insert_with(|| api::UsageSum {
             group: key.0,
             state: key.1,
@@ -505,7 +520,7 @@ pub async fn query(
         let full = page.len() == filter.limit as usize;
         let last = page.last().map(|row| row.id);
         for interval in page.into_iter().map(|row| to_proto(row, false)) {
-            if !tagged(&interval.metadata) {
+            if !tagged(&interval.tags) {
                 continue;
             }
             if is_summed {
@@ -531,7 +546,7 @@ pub async fn query(
                 continue;
             }
             let interval = to_proto(so_far(&open), true);
-            if !tagged(&interval.metadata) {
+            if !tagged(&interval.tags) {
                 continue;
             }
             if is_summed {
@@ -552,12 +567,12 @@ pub async fn query(
 mod tests {
     use super::*;
 
-    fn event(kind: &str, state: SandboxState, at: i64, cpu: u64, rx: u64) -> EventRow {
+    fn event(kind: EventKind, state: SandboxState, at: i64, cpu: u64, rx: u64) -> EventRow {
         EventRow {
             node_id: "node_a".into(),
             at_unix_ms: at,
             sandbox_id: "sbx_1".into(),
-            kind: kind.into(),
+            kind: kind as i32,
             state: state as i32,
             template: "alpine".into(),
             metadata_json: r#"{"team":"search"}"#.into(),
@@ -585,16 +600,16 @@ mod tests {
     fn life() -> Vec<EventRow> {
         use SandboxState::*;
         vec![
-            event("created", Running, 1_000, 0, 0),
-            event("started", Running, 1_010, 10, 0),
-            event("agent_ready", Running, 1_200, 50, 100),
-            event("stopped", Suspended, 60_000, 30_000_000, 5_000),
-            event("started", Running, 120_000, 30_000_000, 5_000),
+            event(EventKind::Created, Running, 1_000, 0, 0),
+            event(EventKind::Started, Running, 1_010, 10, 0),
+            event(EventKind::AgentReady, Running, 1_200, 50, 100),
+            event(EventKind::Stopped, Suspended, 60_000, 30_000_000, 5_000),
+            event(EventKind::Started, Running, 120_000, 30_000_000, 5_000),
             EventRow {
                 detail: "deleted".into(),
-                ..event("stopped", Running, 150_000, 40_000_000, 9_000)
+                ..event(EventKind::Stopped, Running, 150_000, 40_000_000, 9_000)
             },
-            event("destroyed", Running, 150_005, 40_000_000, 9_000),
+            event(EventKind::Destroyed, Running, 150_005, 40_000_000, 9_000),
         ]
     }
 
@@ -613,7 +628,7 @@ mod tests {
     fn a_life_becomes_one_row_per_state() {
         let (rows, open) = replay(&life());
         assert!(open.is_none());
-        let states: Vec<_> = rows.iter().map(|row| row.state.as_str()).collect();
+        let states: Vec<_> = rows.iter().map(|row| row.state).collect();
         assert_eq!(states, [RUNNING, SUSPENDED, RUNNING]);
         assert_eq!(rows[0].started_at_ms, 1_000);
         assert_eq!(rows[0].ended_at_ms, 60_000);
@@ -654,27 +669,30 @@ mod tests {
     #[test]
     fn a_late_report_from_a_node_the_sandbox_left_moves_nothing() {
         use SandboxState::*;
-        let mut adopted = event("started", Running, 2_000, 500, 0);
+        let mut adopted = event(EventKind::Started, Running, 2_000, 500, 0);
         adopted.node_id = "node_b".into();
-        let released = event("stopped", Suspended, 3_000, 400, 0);
+        let released = event(EventKind::Stopped, Suspended, 3_000, 400, 0);
         let (rows, open) = replay(&[
-            event("stopped", Suspended, 1_000, 400, 0),
+            event(EventKind::Stopped, Suspended, 1_000, 400, 0),
             adopted,
             released,
         ]);
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].state, SUSPENDED);
         let open = open.unwrap();
-        assert_eq!(
-            (open.node_id.as_str(), open.state.as_str()),
-            ("node_b", RUNNING)
-        );
+        assert_eq!((open.node_id.as_str(), open.state), ("node_b", RUNNING));
     }
 
     #[test]
     fn a_checkpoint_splits_at_the_heartbeat_without_changing_the_sum() {
         let start = 10 * HOUR_MS + 1_000;
-        let (_, open) = replay(&[event("started", SandboxState::Running, start, 100, 10)]);
+        let (_, open) = replay(&[event(
+            EventKind::Started,
+            SandboxState::Running,
+            start,
+            100,
+            10,
+        )]);
         let mut open = open.unwrap();
         open.seen_at_ms = start + 1_000;
         open.seen_cpu_usage_usec = 900;
@@ -692,7 +710,13 @@ mod tests {
         assert_eq!(next.started_at_ms, row.ended_at_ms);
         let (closed, _) = advance(
             Some(&next),
-            &event("destroyed", SandboxState::Running, 12 * HOUR_MS, 8_000, 100),
+            &event(
+                EventKind::Destroyed,
+                SandboxState::Running,
+                12 * HOUR_MS,
+                8_000,
+                100,
+            ),
         );
         let closed = closed.unwrap();
         assert_eq!((closed.cpu_usage_usec, closed.rx_bytes), (3_000, 30));
@@ -701,7 +725,13 @@ mod tests {
 
     #[test]
     fn a_write_off_closes_at_the_last_heartbeat() {
-        let (_, open) = replay(&[event("started", SandboxState::Running, 1_000, 0, 0)]);
+        let (_, open) = replay(&[event(
+            EventKind::Started,
+            SandboxState::Running,
+            1_000,
+            0,
+            0,
+        )]);
         let mut open = open.unwrap();
         open.seen_at_ms = 41_000;
         open.seen_cpu_usage_usec = 7_000_000;
@@ -753,28 +783,31 @@ mod tests {
     /// wrote down, which heartbeats had passed, and long after it died.
     #[test]
     fn a_lost_vm_closes_at_its_last_heartbeat_with_what_that_heartbeat_saw() {
-        let (_, open) = replay(&[event("started", SandboxState::Running, 1_000, 100, 0)]);
+        let (_, open) = replay(&[event(
+            EventKind::Started,
+            SandboxState::Running,
+            1_000,
+            100,
+            0,
+        )]);
         let mut open = open.unwrap();
         open.seen_at_ms = 50_000;
         open.seen_cpu_usage_usec = 9_000;
         open.seen_rx_bytes = 70;
         let lost = EventRow {
             detail: DETAIL_LOST.into(),
-            ..event("stopped", SandboxState::Stopped, 900_000, 100, 0)
+            ..event(EventKind::Stopped, SandboxState::Stopped, 900_000, 100, 0)
         };
         let (row, next) = advance(Some(&open), &lost);
         let row = row.unwrap();
         assert_eq!((row.started_at_ms, row.ended_at_ms), (1_000, 50_000));
         assert_eq!((row.cpu_usage_usec, row.rx_bytes), (8_900, 70));
         let next = next.unwrap();
-        assert_eq!(
-            (next.state.as_str(), next.started_at_ms),
-            (STOPPED, 900_000)
-        );
+        assert_eq!((next.state, next.started_at_ms), (STOPPED, 900_000));
         // The node's totals go on from what it wrote down.
         let (row, _) = advance(
             Some(&next),
-            &event("started", SandboxState::Running, 950_000, 100, 0),
+            &event(EventKind::Started, SandboxState::Running, 950_000, 100, 0),
         );
         assert_eq!(row.unwrap().cpu_usage_usec, 0);
     }
@@ -783,19 +816,19 @@ mod tests {
     /// until it was next used; a node's restart now reports it.
     #[test]
     fn a_recovered_event_opens_what_the_ledger_did_not_know_and_keeps_what_it_did() {
-        let recovered = |state| event("recovered", state, 5_000, 300, 10);
+        let recovered = |state| event(EventKind::Recovered, state, 5_000, 300, 10);
         let (rows, open) = replay(&[recovered(SandboxState::Suspended)]);
         assert!(rows.is_empty());
         assert_eq!(open.unwrap().state, SUSPENDED);
         let (rows, open) = replay(&[
-            event("stopped", SandboxState::Suspended, 1_000, 300, 10),
+            event(EventKind::Stopped, SandboxState::Suspended, 1_000, 300, 10),
             recovered(SandboxState::Suspended),
         ]);
         assert!(rows.is_empty());
         assert_eq!(open.unwrap().started_at_ms, 1_000);
         // A failed sandbox holds its disk, as a stopped one does.
         let (rows, open) = replay(&[
-            event("stopped", SandboxState::Suspended, 1_000, 300, 10),
+            event(EventKind::Stopped, SandboxState::Suspended, 1_000, 300, 10),
             recovered(SandboxState::Failed),
         ]);
         assert_eq!(rows[0].state, SUSPENDED);
@@ -815,9 +848,9 @@ mod tests {
             ..event(kind, SandboxState::Running, at, 0, 0)
         };
         for row in [
-            shapeless(1, "created", 1_000),
-            shapeless(2, "stopped", 2_000),
-            shapeless(3, "started", 3_000),
+            shapeless(1, EventKind::Created, 1_000),
+            shapeless(2, EventKind::Stopped, 2_000),
+            shapeless(3, EventKind::Started, 3_000),
         ] {
             store.append_event(&row).await.unwrap();
         }
@@ -826,8 +859,8 @@ mod tests {
         assert!(store.open_usage("sbx_1").await.unwrap().is_none());
 
         for (seq, kind, state, at) in [
-            (4, "recovered", SandboxState::Suspended, 4_000),
-            (5, "started", SandboxState::Running, 5_000),
+            (4, EventKind::Recovered, SandboxState::Suspended, 4_000),
+            (5, EventKind::Started, SandboxState::Running, 5_000),
         ] {
             store
                 .append_event(&EventRow {
@@ -847,7 +880,7 @@ mod tests {
             .unwrap();
         assert_eq!(rows.len(), 1);
         assert_eq!(
-            (rows[0].state.as_str(), rows[0].started_at_ms, rows[0].vcpus),
+            (rows[0].state, rows[0].started_at_ms, rows[0].vcpus),
             (SUSPENDED, 4_000, 2)
         );
         assert_eq!(
@@ -870,7 +903,8 @@ mod tests {
         }
         drain(&store, "node_a").await.unwrap();
         let query = |is_open_included, tags: &[(&str, &str)]| api::QueryUsageRequest {
-            group_by: "team".into(),
+            group_by: api::UsageGroup::Tag as i32,
+            group_by_tag: "team".into(),
             is_open_included,
             tags: tags
                 .iter()
@@ -910,7 +944,7 @@ mod tests {
         let store = Store::open_in_memory().await.unwrap();
         let started = EventRow {
             node_seq: 1,
-            ..event("started", SandboxState::Running, 1_000, 100, 0)
+            ..event(EventKind::Started, SandboxState::Running, 1_000, 100, 0)
         };
         store.append_event(&started).await.unwrap();
         drain(&store, "node_a").await.unwrap();

@@ -6,7 +6,7 @@ import assert from "node:assert/strict";
 import { once } from "node:events";
 import { test } from "node:test";
 
-import { Sandbox } from "../dist/index.js";
+import { fakeSandbox } from "./helpers.mjs";
 
 /** A stream of `ExecOutput` messages the test feeds as it goes. */
 function feed() {
@@ -62,7 +62,7 @@ function execSandbox(script = () => {}) {
       return {};
     },
   };
-  const sandbox = Sandbox.adopt(transport, { id: "sbx_test", state: "SANDBOX_STATE_RUNNING" });
+  const sandbox = fakeSandbox(transport);
   return { sandbox, execs, unary };
 }
 

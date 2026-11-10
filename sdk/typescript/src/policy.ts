@@ -5,11 +5,14 @@
 
 import { BurrowError } from "./errors.js";
 import type {
+  AppliedRule,
   ExecOptions,
   ExecPolicy,
   FsOptions,
   FsPolicy,
-  HeaderInjection,
+  KitOptions,
+  LifetimeOptions,
+  LifetimePolicy,
   NetworkInput,
   NetworkMembership,
   NetworkMode,
@@ -21,20 +24,15 @@ import type {
   ResourceOptions,
   ResourcePolicy,
   SandboxPolicy,
+  SnapshotPolicy,
+  SnapshotPolicyOptions,
   StringMatch,
+  VolumeMount,
 } from "./types.js";
+import { enumOf, enumTo } from "./wire.js";
 
-const MODE_TO_WIRE: Record<NetworkMode, string> = {
-  none: "NETWORK_MODE_NONE",
-  allowlist: "NETWORK_MODE_ALLOWLIST",
-  open: "NETWORK_MODE_OPEN",
-};
-
-const MODE_FROM_WIRE: Record<string, NetworkMode> = {
-  NETWORK_MODE_NONE: "none",
-  NETWORK_MODE_ALLOWLIST: "allowlist",
-  NETWORK_MODE_OPEN: "open",
-};
+const MODES: readonly NetworkMode[] = ["none", "allowlist", "open"];
+const MODE_PREFIX = "NETWORK_MODE_";
 
 /** A bare mode stands for a policy with only that mode set. */
 export function resolveNetwork(network: NetworkInput | undefined): NetworkPolicyOptions {
@@ -43,15 +41,7 @@ export function resolveNetwork(network: NetworkInput | undefined): NetworkPolicy
 }
 
 /** Everything burrow understands on a rule. */
-const RULE_KEYS = new Set([
-  "domain",
-  "match",
-  "setHeaders",
-  "forward",
-  "expiresAtUnixMs",
-  "expired",
-  "boundSandboxId",
-]);
+const RULE_KEYS = new Set(["domain", "match", "setHeaders", "forward", "expiresAt"]);
 
 /** Every dimension a matcher may name. */
 const MATCH_KEYS = new Set(["path", "method", "queryString", "headers"]);
@@ -80,13 +70,13 @@ function checkKeys(where: string, rule: RequestRule): void {
   }
 }
 
+const OPS = ["exact", "startsWith", "regex"] as const;
 const OP_TO_WIRE: Record<string, string> = {
   exact: "STRING_MATCH_OP_EXACT",
   startsWith: "STRING_MATCH_OP_STARTS_WITH",
   regex: "STRING_MATCH_OP_REGEX",
 };
-
-const OP_FROM_WIRE: Record<string, "exact" | "startsWith" | "regex"> = {
+const OP_FROM_WIRE: Record<string, (typeof OPS)[number]> = {
   STRING_MATCH_OP_EXACT: "exact",
   STRING_MATCH_OP_STARTS_WITH: "startsWith",
   STRING_MATCH_OP_REGEX: "regex",
@@ -114,10 +104,7 @@ function toStringMatch(where: string, value: StringMatch): any {
   const op = named[0]!;
   const pattern = (value as Record<string, unknown>)[op];
   if (typeof pattern !== "string") {
-    throw new BurrowError(
-      `${where}: a match pattern is a string`,
-      "invalid_argument",
-    );
+    throw new BurrowError(`${where}: a match pattern is a string`, "invalid_argument");
   }
   return { op: OP_TO_WIRE[op], value: pattern };
 }
@@ -137,8 +124,7 @@ function toRequestMatch(where: string, match: RequestMatch | undefined): any {
   const method = match.method;
   return {
     path: match.path === undefined ? undefined : toStringMatch(`${where}.path`, match.path),
-    methods:
-      method === undefined ? [] : Array.isArray(method) ? method : [method],
+    methods: method === undefined ? [] : Array.isArray(method) ? method : [method],
     query: toFieldMatches(`${where}.queryString`, match.queryString),
     headers: toFieldMatches(`${where}.headers`, match.headers),
   };
@@ -154,20 +140,16 @@ function toRequestRule(rule: RequestRule): any {
       "invalid_argument",
     );
   }
-  const expiresAt = rule.expiresAtUnixMs ?? 0;
+  const expiresAt = rule.expiresAt === undefined ? 0 : rule.expiresAt.getTime();
   if (!Number.isSafeInteger(expiresAt) || expiresAt < 0) {
-    throw new BurrowError(
-      `${where}: expiresAtUnixMs is unix milliseconds, or 0 for never`,
-      "invalid_argument",
-    );
+    throw new BurrowError(`${where}: expiresAt is a valid Date`, "invalid_argument");
   }
   const wire: any = {
     domain: rule.domain,
     match: toRequestMatch(where, rule.match),
   };
-  // Left off when unset, which the wire reads as never and unbound.
+  // Left off when unset, which the wire reads as never.
   if (expiresAt) wire.expiresAtUnixMs = expiresAt;
-  if (rule.boundSandboxId) wire.boundSandboxId = rule.boundSandboxId;
   if (rule.forward) {
     checkForwardURL(where, rule.forward.url);
     wire.forward = {
@@ -225,15 +207,12 @@ function checkHeaderName(where: string, name: string): void {
 }
 
 /** Reads one wire `RequestRule` back. Secrets arrive redacted. */
-function fromRequestRule(raw: any): RequestRule {
-  const rule: RequestRule = { domain: raw?.domain ?? "" };
+function fromRequestRule(raw: any): AppliedRule {
+  const rule: AppliedRule = { domain: raw?.domain ?? "" };
   const match = fromRequestMatch(raw?.match);
   if (match) rule.match = match;
   const expiresAt = Number(raw?.expiresAtUnixMs ?? 0);
-  if (expiresAt) {
-    rule.expiresAtUnixMs = expiresAt;
-    rule.expired = Boolean(raw?.isExpired);
-  }
+  if (expiresAt) rule.expiresAt = new Date(expiresAt);
   if (raw?.boundSandboxId) rule.boundSandboxId = raw.boundSandboxId;
   if (raw?.forward) {
     rule.forward = {
@@ -272,15 +251,8 @@ function fromStringMatch(raw: any): StringMatch {
   return { [op]: raw?.value ?? "" } as StringMatch;
 }
 
-const PROTOCOL_TO_WIRE: Record<string, string> = {
-  tcp: "PORT_PROTOCOL_TCP",
-  udp: "PORT_PROTOCOL_UDP",
-};
-
-const PROTOCOL_FROM_WIRE: Record<string, "tcp" | "udp"> = {
-  PORT_PROTOCOL_TCP: "tcp",
-  PORT_PROTOCOL_UDP: "udp",
-};
+const PROTOCOLS = ["tcp", "udp"] as const;
+const PROTOCOL_PREFIX = "PORT_PROTOCOL_";
 
 /** Everything burrow understands on a port rule. */
 const PORT_RULE_KEYS = new Set(["protocol", "port", "portEnd", "cidrs"]);
@@ -302,7 +274,7 @@ function toPortRule(index: number, rule: PortRule): any {
       "invalid_argument",
     );
   }
-  if (rule.protocol !== undefined && !Object.hasOwn(PROTOCOL_TO_WIRE, rule.protocol)) {
+  if (rule.protocol !== undefined && !(PROTOCOLS as readonly string[]).includes(rule.protocol)) {
     throw new BurrowError(
       `${where}: unknown protocol ${JSON.stringify(rule.protocol)}; tcp, udp, or omitted for both`,
       "invalid_argument",
@@ -315,7 +287,7 @@ function toPortRule(index: number, rule: PortRule): any {
     protocol:
       rule.protocol === undefined
         ? "PORT_PROTOCOL_UNSPECIFIED"
-        : PROTOCOL_TO_WIRE[rule.protocol],
+        : enumTo(PROTOCOL_PREFIX, rule.protocol),
     port: rule.port,
     portEnd: rule.portEnd ?? 0,
     cidrs: rule.cidrs ?? [],
@@ -325,8 +297,8 @@ function toPortRule(index: number, rule: PortRule): any {
 /** Reads one wire `PortRule` back, leaving out what was left unset. */
 function fromPortRule(raw: any): PortRule {
   const rule: PortRule = { port: Number(raw?.port ?? 0) };
-  const protocol = PROTOCOL_FROM_WIRE[String(raw?.protocol ?? "")];
-  if (protocol) rule.protocol = protocol;
+  const protocol = enumOf(raw?.protocol, PROTOCOL_PREFIX, PROTOCOLS);
+  if (protocol !== "unknown") rule.protocol = protocol;
   const portEnd = Number(raw?.portEnd ?? 0);
   if (portEnd) rule.portEnd = portEnd;
   if (raw?.cidrs?.length) rule.cidrs = raw.cidrs;
@@ -338,23 +310,13 @@ export function toNetworkPolicy(options: NetworkPolicyOptions = {}): any {
   const mode = options.mode ?? "none";
   // A mode with no wire name would otherwise go out as `undefined` and be
   // decoded as NETWORK_MODE_NONE, a typo costing the sandbox all its egress.
-  if (!(mode in MODE_TO_WIRE)) {
+  if (!MODES.includes(mode)) {
     throw new BurrowError(
       `networkPolicy: unknown mode ${JSON.stringify(mode)}; one of none, allowlist, open`,
       "invalid_argument",
     );
   }
-  // Rules first, then the injections: an injection carries no matcher, so it
-  // claims every request to its domain and would shadow anything after it.
-  const rules = [
-    ...(options.rules ?? []),
-    ...(options.injectHeaders ?? []).map(
-      (header): RequestRule => ({
-        domain: header.domain,
-        setHeaders: { [header.name]: header.value },
-      }),
-    ),
-  ];
+  const rules = options.rules ?? [];
   // Rules apply only to requests the proxy inspects. In allowlist mode it
   // inspects only traffic to allowed domains: with none, every rule would be
   // dropped without a word. Open mode inspects the hosts the rules name.
@@ -365,11 +327,12 @@ export function toNetworkPolicy(options: NetworkPolicyOptions = {}): any {
     );
   }
   return {
-    mode: MODE_TO_WIRE[mode],
+    mode: enumTo(MODE_PREFIX, mode),
     allowDomains: options.allowDomains ?? [],
     allowCidrs: options.allowCidrs ?? [],
     allowPorts: options.allowPorts ?? [],
     denyCidrs: options.denyCidrs ?? [],
+    denyDomains: options.denyDomains ?? [],
     denyPorts: (options.denyPorts ?? []).map((rule, index) => toPortRule(index, rule)),
     isIpv6Denied: options.denyIpv6 ?? false,
     isTlsInspected: options.inspectTls ?? false,
@@ -379,28 +342,18 @@ export function toNetworkPolicy(options: NetworkPolicyOptions = {}): any {
 
 /** Reads a `NetworkPolicy` back. Secrets arrive redacted. */
 export function fromNetworkPolicy(raw: any): NetworkPolicy {
-  const rules: RequestRule[] = (raw?.rules ?? []).map(fromRequestRule);
+  const mode = enumOf(raw?.mode, MODE_PREFIX, MODES);
   return {
-    mode: MODE_FROM_WIRE[String(raw?.mode ?? "")] ?? "none",
+    mode: mode === "unknown" ? "none" : mode,
     allowDomains: raw?.allowDomains ?? [],
     allowCidrs: raw?.allowCidrs ?? [],
     allowPorts: (raw?.allowPorts ?? []).map(Number),
     denyCidrs: raw?.denyCidrs ?? [],
+    denyDomains: raw?.denyDomains ?? [],
     denyPorts: (raw?.denyPorts ?? []).map(fromPortRule),
     denyIpv6: Boolean(raw?.isIpv6Denied),
     inspectTls: Boolean(raw?.isTlsInspected),
-    rules,
-    // The rules that are exactly what `injectHeaders` used to describe, so
-    // code written before rules existed still reads what it wrote.
-    injectHeaders: rules.flatMap((rule): HeaderInjection[] =>
-      rule.match || !rule.setHeaders
-        ? []
-        : Object.entries(rule.setHeaders).map(([name, value]) => ({
-            domain: rule.domain,
-            name,
-            value,
-          })),
-    ),
+    rules: (raw?.rules ?? []).map(fromRequestRule),
   };
 }
 
@@ -411,13 +364,7 @@ export function toResourcePolicy(options: ResourceOptions = {}): any {
     // asked makes a create from a snapshot look like a shape change.
     vcpus: options.vcpus ?? 0,
     memMib: options.memoryMib ?? 0,
-    scratchDiskMib: options.diskMib ?? 0,
-    maxLifetimeSecs: options.maxLifetimeSecs ?? 0,
-    idleSuspendSecs: options.idleSuspendSecs ?? 0,
-    suspendedTtlSecs: options.suspendedTtlSecs ?? 0,
-    snapshotExpirationSecs: options.snapshotExpirationSecs ?? 0,
-    keepLastSnapshots: options.keepLastSnapshots ?? 0,
-    isEvictedSnapshotKept: options.keepEvictedSnapshots ?? false,
+    scratchDiskMib: options.scratchDiskMib ?? 0,
   };
 }
 
@@ -425,13 +372,39 @@ export function fromResourcePolicy(raw: any): ResourcePolicy {
   return {
     vcpus: Number(raw?.vcpus ?? 0),
     memoryMib: Number(raw?.memMib ?? 0),
-    diskMib: Number(raw?.scratchDiskMib ?? 0),
+    scratchDiskMib: Number(raw?.scratchDiskMib ?? 0),
+  };
+}
+
+export function toLifetimePolicy(options: LifetimeOptions = {}): any {
+  return {
+    maxLifetimeSecs: options.maxLifetimeSecs ?? 0,
+    idleSuspendSecs: options.idleSuspendSecs ?? 0,
+    suspendedTtlSecs: options.suspendedTtlSecs ?? 0,
+  };
+}
+
+export function fromLifetimePolicy(raw: any): LifetimePolicy {
+  return {
     maxLifetimeSecs: Number(raw?.maxLifetimeSecs ?? 0),
     idleSuspendSecs: Number(raw?.idleSuspendSecs ?? 0),
     suspendedTtlSecs: Number(raw?.suspendedTtlSecs ?? 0),
-    snapshotExpirationSecs: Number(raw?.snapshotExpirationSecs ?? 0),
-    keepLastSnapshots: Number(raw?.keepLastSnapshots ?? 0),
-    keepEvictedSnapshots: Boolean(raw?.isEvictedSnapshotKept ?? false),
+  };
+}
+
+export function toSnapshotPolicy(options: SnapshotPolicyOptions = {}): any {
+  return {
+    expirationSecs: options.expirationSecs ?? 0,
+    keepLast: options.keepLast ?? 0,
+    isEvictedKept: options.keepEvicted ?? false,
+  };
+}
+
+export function fromSnapshotPolicy(raw: any): SnapshotPolicy {
+  return {
+    expirationSecs: Number(raw?.expirationSecs ?? 0),
+    keepLast: Number(raw?.keepLast ?? 0),
+    keepEvicted: Boolean(raw?.isEvictedKept),
   };
 }
 
@@ -458,7 +431,7 @@ export function toNetworks(
   });
 }
 
-export function fromNetworks(raw: any): NetworkMembership[] {
+export function fromNetworks(raw: any): Required<NetworkMembership>[] {
   return (raw ?? []).map((entry: any) => ({
     network: entry.network ?? "",
     ingressPorts: (entry.ingressPorts ?? []).map(Number),
@@ -505,9 +478,7 @@ export function fromFsPolicy(raw: any): FsPolicy | undefined {
   };
 }
 
-export function toVolumeMounts(
-  mounts: ReadonlyArray<import("./types.js").VolumeMount> | undefined,
-): any[] {
+export function toVolumeMounts(mounts: ReadonlyArray<VolumeMount> | undefined): any[] {
   return (mounts ?? []).map((mount) => ({
     volume: mount.volume,
     path: mount.path,
@@ -515,7 +486,7 @@ export function toVolumeMounts(
   }));
 }
 
-export function fromVolumeMounts(raw: any): import("./types.js").VolumeMount[] {
+export function fromVolumeMounts(raw: any): Required<VolumeMount>[] {
   return (raw ?? []).map((mount: any) => ({
     volume: String(mount?.volume ?? ""),
     path: String(mount?.path ?? ""),
@@ -523,9 +494,20 @@ export function fromVolumeMounts(raw: any): import("./types.js").VolumeMount[] {
   }));
 }
 
+/** Builds a `KitSpec`. Absent inputs are sent empty, which the node reads as none. */
+export function toKitSpec(kit: KitOptions | undefined): any {
+  return {
+    args: kit?.args ?? {},
+    env: kit?.env ?? {},
+    rejectTypes: [...(kit?.rejectCapabilities ?? [])],
+  };
+}
+
 export function fromPolicy(raw: any): SandboxPolicy {
   return {
     resources: fromResourcePolicy(raw?.resources),
+    lifetime: fromLifetimePolicy(raw?.lifetime),
+    snapshots: fromSnapshotPolicy(raw?.snapshots),
     exec: fromExecPolicy(raw?.exec),
     fs: fromFsPolicy(raw?.fs),
     network: fromNetworkPolicy(raw?.network),

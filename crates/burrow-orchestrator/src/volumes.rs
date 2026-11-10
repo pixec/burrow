@@ -83,7 +83,7 @@ mod tests {
         common::Volume {
             name: name.into(),
             size_mib: 1024,
-            created_at: "2026-09-01T00:00:00Z".into(),
+            created_at_unix_ms: 1_787_000_000_000,
             ..Default::default()
         }
     }

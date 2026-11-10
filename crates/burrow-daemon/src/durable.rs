@@ -44,6 +44,8 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use serde::{Deserialize, Serialize};
 use tonic::Status;
 
+use burrow_vmm::HypervisorExt;
+
 use crate::chunks::{Hydrator, ImageIndex, LayerId, Reuse};
 use crate::objstore::ObjectStore;
 
@@ -88,7 +90,7 @@ pub struct Manifest {
     pub is_systemd: bool,
     pub arch: String,
     /// The version of `hypervisor` that wrote the state.
-    pub firecracker_version: String,
+    pub hypervisor_version: String,
     /// The sandbox's hypervisor, the only one its state restores under. Empty
     /// in a manifest from before there was a choice, which was Firecracker.
     #[serde(default)]
@@ -934,7 +936,7 @@ mod tests {
             scratch_disk_mib: 1024,
             is_systemd: false,
             arch: "aarch64".into(),
-            firecracker_version: "1".into(),
+            hypervisor_version: "1".into(),
             hypervisor: "firecracker".into(),
             kernel_digest: String::new(),
             rootfs_digest: String::new(),

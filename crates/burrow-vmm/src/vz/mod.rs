@@ -73,9 +73,7 @@ pub const HARDWARE_MODEL_FILE: &str = "hardware-model";
 pub const MACHINE_ID_FILE: &str = "machine-id";
 /// The [`Requirements`] the template was installed with.
 pub const REQUIREMENTS_FILE: &str = "requirements.json";
-/// The framework's save file, device state and memory in one: both halves of
-/// this backend's [`crate::Layout`].
-pub const SAVE_FILE: &str = "snapshot.vzsave";
+pub use crate::VZ_SAVE_FILE as SAVE_FILE;
 
 /// The display a guest is given. Headless or not, a macOS guest gets the same
 /// one, Apple's sample's: a saved state only restores into an identical device

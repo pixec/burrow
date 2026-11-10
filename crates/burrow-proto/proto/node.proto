@@ -50,7 +50,7 @@ service NodeService {
   // Sessions are recorded by the node that started the VMs, so they are read
   // from it like any other per-sandbox fact.
   rpc ListSessions(NodeSandboxRef) returns (burrow.api.v1.ListSessionsResponse);
-  rpc UpdateResources(NodeUpdateResourcesRequest) returns (burrow.common.v1.Sandbox);
+  rpc UpdateLifetime(NodeUpdateLifetimeRequest) returns (burrow.common.v1.Sandbox);
   // Forks on this node only: a sandbox's snapshot and disks are node-local, so
   // the child is built where the source already is.
   rpc ForkSandbox(NodeForkRequest) returns (burrow.common.v1.Sandbox);
@@ -109,9 +109,6 @@ service NodeService {
   // Access service itself.
   rpc Exec(stream burrow.api.v1.ExecInput) returns (stream burrow.api.v1.ExecOutput);
   rpc Attach(stream burrow.api.v1.AttachInput) returns (stream burrow.api.v1.ExecOutput);
-  rpc UploadFile(stream burrow.api.v1.FileChunk) returns (burrow.api.v1.UploadResult);
-  rpc DownloadFile(burrow.api.v1.DownloadRequest) returns (stream burrow.api.v1.FileChunk);
-  rpc ListDir(burrow.api.v1.ListDirRequest) returns (burrow.api.v1.ListDirResponse);
   rpc Watch(burrow.api.v1.WatchRequest) returns (stream burrow.api.v1.WatchEvent);
   rpc Fs(burrow.api.v1.FsRequest) returns (burrow.api.v1.FsResponse);
   // Refuses the sandbox's outstanding Access tokens and ends what they opened.
@@ -126,7 +123,11 @@ service NodeService {
   rpc RemoveUserFromGroup(burrow.api.v1.GroupMembershipRequest) returns (burrow.api.v1.GroupMembershipResponse);
   rpc DeleteUser(burrow.api.v1.DeleteUserRequest) returns (burrow.api.v1.DeleteUserResponse);
   rpc DeleteGroup(burrow.api.v1.DeleteGroupRequest) returns (burrow.api.v1.DeleteGroupResponse);
-  rpc QueryAudit(burrow.api.v1.AuditQuery) returns (burrow.api.v1.AuditPage);  // collected, not streamed: the orchestrator merges pages from every node
+  rpc QueryAudit(burrow.api.v1.AuditQuery) returns (AuditPage);  // collected, not streamed: the orchestrator merges pages from every node
+}
+
+message AuditPage {
+  repeated burrow.api.v1.AuditEvent events = 1;
 }
 
 message NodeCreateRequest {
@@ -134,7 +135,7 @@ message NodeCreateRequest {
   string sandbox_id = 1;
   string template = 2;
   burrow.common.v1.Policy policy = 3;
-  map<string, string> metadata = 4;
+  map<string, string> tags = 4;
   reserved 5;
   // Recorded on the sandbox so it survives a restart and comes back in the
   // node's inventory. The orchestrator owns name uniqueness; the node just
@@ -258,14 +259,11 @@ message NodeUpdateAccessRequest {
 // The lifetime clocks, as the orchestrator forwards them. Absent leaves a field
 // as it is; the machine shape is carried only so the node can refuse it with
 // the same message a create would.
-message NodeUpdateResourcesRequest {
+message NodeUpdateLifetimeRequest {
   string sandbox_id = 1;
   optional uint64 max_lifetime_secs = 2;
   optional uint64 idle_suspend_secs = 3;
   optional uint64 suspended_ttl_secs = 4;
-  uint32 vcpus = 5;
-  uint32 mem_mib = 6;
-  uint32 scratch_disk_mib = 7;
 }
 
 message NodeForkRequest {

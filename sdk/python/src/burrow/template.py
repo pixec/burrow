@@ -7,9 +7,9 @@ import sys
 from typing import Any, Callable, Dict, List, Optional, Union
 
 from ._pb import api_pb2
-from ._transport import Transport, transport_options
+from ._transport import Transport
 from .errors import BurrowError
-from .types import TemplateInfo
+from .types import BuiltTemplate, TemplateInfo
 
 # One build log event, as a dict: {"type": "step", "command": ...},
 # {"type": "stdout"/"stderr", "data": ...} or
@@ -47,6 +47,98 @@ def _to_list(packages: Union[str, List[str]]) -> List[str]:
     return [p for p in ([packages] if isinstance(packages, str) else packages) if p]
 
 
+def to_template_info(raw: api_pb2.TemplateInfo) -> TemplateInfo:
+    return TemplateInfo(
+        name=raw.name,
+        size_bytes=raw.size_bytes,
+        warm=raw.is_warm,
+        kit=raw.is_kit,
+        systemd=raw.is_systemd,
+        guest_os=raw.guest_os,
+        hypervisor=raw.hypervisor,
+    )
+
+
+def build_template(
+    transport: Transport,
+    template: "TemplateBuilder",
+    name: str,
+    *,
+    vcpus: int = 0,
+    memory_mib: int = 0,
+    disk_mib: int = 0,
+    hypervisor: str = "",
+    allow_domains: Optional[List[str]] = None,
+    systemd: bool = False,
+    on_build_logs: Optional[Callable[[BuildLogEvent], Any]] = None,
+    timeout: float = 30 * 60.0,
+) -> BuiltTemplate:
+    """Runs a build over `transport` and reports what the server published."""
+    request = api_pb2.BuildTemplateRequest(
+        name=name,
+        # An OCI base takes the place of a template base; sending both
+        # would leave the node to guess which was meant.
+        **{"from": "" if template._image or template._ipsw else template._base},
+        from_image=template._image,
+        from_ipsw=template._ipsw,
+        steps=[api_pb2.BuildStep(run=step) for step in template._steps],
+        # Zero is the node's default for the guest being built: 1 vCPU and
+        # 1024 MiB for Linux, the restore image's minimum for macOS.
+        vcpus=vcpus,
+        mem_mib=memory_mib,
+        # "firecracker", "cloud-hypervisor" or "vz"; empty is the base's.
+        hypervisor=hypervisor,
+        # The installed macOS disk for `from_ipsw`, in MiB.
+        disk_mib=disk_mib,
+        # Omitted means unrestricted, because a build that installs packages
+        # needs the network by definition.
+        allow_domains=allow_domains or [],
+        # Boot the image's own systemd under the agent. The image has to ship
+        # systemd.
+        is_systemd=systemd,
+    )
+    result: Optional[BuiltTemplate] = None
+    # Builds install packages; minutes, not seconds.
+    for raw in transport.server_stream("BuildTemplate", request, timeout):
+        event = _to_event(raw)
+        if event is None:
+            continue
+        if on_build_logs:
+            on_build_logs(event)
+        if event["type"] == "done":
+            result = BuiltTemplate(name=event["template"], size_bytes=event["size_bytes"])
+    if result is None:
+        raise BurrowError("build ended without producing an image", "internal")
+    return result
+
+
+class _Build:
+    """`build` both ways: `template.build(name)` on a builder, and
+    `Template.build(template, name)` on the class."""
+
+    def __get__(self, builder: Optional["TemplateBuilder"], owner: Any) -> Callable[..., BuiltTemplate]:
+        if builder is None:
+            return _build_with_connection
+        return lambda name, **options: _build_with_connection(builder, name, **options)
+
+
+def _build_with_connection(
+    template: "TemplateBuilder",
+    name: str,
+    *,
+    endpoint: Optional[str] = None,
+    api_key: Optional[str] = None,
+    tls: Optional[bool] = None,
+    timeout: Optional[float] = 60.0,
+    route: Optional[str] = None,
+    **options: Any,
+) -> BuiltTemplate:
+    from .client import Burrow
+
+    with Burrow(endpoint=endpoint, api_key=api_key, tls=tls, timeout=timeout, route=route) as burrow:
+        return burrow.templates.build(template, name, **options)
+
+
 class TemplateBuilder:
     """Describes a guest image as a base plus a list of steps.
 
@@ -55,16 +147,17 @@ class TemplateBuilder:
     language to learn.
 
     ```python
-    template = (
+    built = (
         Template()
         .from_template("python")
         .run_cmd("apk add --no-cache python3 py3-pip")
         .pip_install(["cowsay", "requests"])
+        .build("python-tools", on_build_logs=default_build_logger())
     )
-
-    Template.build(template, "python-tools", on_build_logs=default_build_logger())
     ```
     """
+
+    build = _Build()
 
     def __init__(self) -> None:
         self._base = "default"
@@ -153,12 +246,8 @@ class TemplateBuilder:
         )
 
     def mkdir(self, path: str) -> "TemplateBuilder":
-        """Creates a directory in the image."""
-        return self.run_cmd(f"mkdir -p {_quote(path)}")
-
-    def workdir(self, path: str) -> "TemplateBuilder":
-        """Creates the directory later steps are meant to work in. Steps do not
-        inherit a working directory, so `cd` inside the step that needs it."""
+        """Creates a directory in the image. Steps do not inherit a working
+        directory, so `cd` inside the step that needs one."""
         return self.run_cmd(f"mkdir -p {_quote(path)}")
 
     @property
@@ -166,95 +255,41 @@ class TemplateBuilder:
         """The steps this template will run, in order."""
         return list(self._steps)
 
-    def _to_request(self, name: str, options: Dict[str, Any]) -> api_pb2.BuildTemplateRequest:
-        return api_pb2.BuildTemplateRequest(
-            name=name,
-            # An OCI base takes the place of a template base; sending both
-            # would leave the node to guess which was meant.
-            **{"from": "" if self._image or self._ipsw else self._base},
-            from_image=self._image,
-            from_ipsw=self._ipsw,
-            steps=[api_pb2.BuildStep(run=step) for step in self._steps],
-            # Zero is the node's default for the guest being built: 1 vCPU
-            # and 1024 MiB for Linux, the restore image's minimum for macOS.
-            vcpus=options.get("cpu_count") or 0,
-            mem_mib=options.get("memory_mib") or 0,
-            # "firecracker", "cloud-hypervisor" or "vz"; empty is the base's.
-            hypervisor=options.get("hypervisor") or "",
-            # The installed macOS disk for `from_ipsw`, in MiB.
-            disk_mib=options.get("disk_mib") or 0,
-            # Omitted means unrestricted, because a build that installs
-            # packages needs the network by definition.
-            allow_domains=options.get("allow_domains") or [],
-            # Boot the image's own systemd under the agent. The image has to
-            # ship systemd.
-            is_systemd=bool(options.get("systemd")),
-        )
-
 
 class Template(TemplateBuilder):
-    """`Template()` starts a builder; the static methods talk to the fleet."""
+    """`Template()` starts a builder; `Template.list` and `Template.delete`
+    talk to the fleet on a connection of their own."""
 
     @staticmethod
-    def build(template: TemplateBuilder, name: str, **options: Any) -> TemplateInfo:
-        """Builds a template and publishes it under `name`."""
-        transport = Transport(**transport_options(options))
-        on_build_logs = options.get("on_build_logs")
-        try:
-            result: Optional[TemplateInfo] = None
-            for raw in transport.server_stream(
-                "BuildTemplate",
-                template._to_request(name, options),
-                # Builds install packages; minutes, not seconds.
-                options.get("timeout", 30 * 60.0),
-            ):
-                event = _to_event(raw)
-                if event is None:
-                    continue
-                if on_build_logs:
-                    on_build_logs(event)
-                if event["type"] == "done":
-                    result = TemplateInfo(
-                        name=event["template"],
-                        size_bytes=event["size_bytes"],
-                        # A freshly built template has no snapshot until the
-                        # node warms it.
-                        warm=False,
-                        systemd=bool(options.get("systemd")),
-                    )
-            if result is None:
-                raise BurrowError("build ended without producing an image", "internal")
-            return result
-        finally:
-            transport.close()
-
-    @staticmethod
-    def list(**options: Any) -> List[TemplateInfo]:
+    def list(
+        *,
+        endpoint: Optional[str] = None,
+        api_key: Optional[str] = None,
+        tls: Optional[bool] = None,
+        timeout: Optional[float] = 60.0,
+        route: Optional[str] = None,
+    ) -> List[TemplateInfo]:
         """Lists the templates available across the fleet."""
-        transport = Transport(**transport_options(options))
-        try:
-            res = transport.unary("ListTemplates", api_pb2.ListTemplatesRequest())
-            return [
-                TemplateInfo(
-                    name=t.name,
-                    size_bytes=t.size_bytes,
-                    warm=t.is_warm,
-                    kit=t.is_kit,
-                    systemd=t.is_systemd,
-                )
-                for t in res.templates
-            ]
-        finally:
-            transport.close()
+        from .client import Burrow
+
+        with Burrow(endpoint=endpoint, api_key=api_key, tls=tls, timeout=timeout, route=route) as burrow:
+            return burrow.templates.list()
 
     @staticmethod
-    def delete(name: str, **options: Any) -> None:
+    def delete(
+        name: str,
+        *,
+        endpoint: Optional[str] = None,
+        api_key: Optional[str] = None,
+        tls: Optional[bool] = None,
+        timeout: Optional[float] = 60.0,
+        route: Optional[str] = None,
+    ) -> None:
         """Deletes a template."""
-        transport = Transport(**transport_options(options))
-        try:
-            transport.unary("DeleteTemplate", api_pb2.DeleteTemplateRequest(name=name))
-        finally:
-            transport.close()
+        from .client import Burrow
+
+        with Burrow(endpoint=endpoint, api_key=api_key, tls=tls, timeout=timeout, route=route) as burrow:
+            burrow.templates.delete(name)
 
 
 def _to_event(raw: api_pb2.BuildLog) -> Optional[BuildLogEvent]:
