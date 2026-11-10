@@ -1,7 +1,7 @@
 //! Docker Sandbox Kits: OCI images whose manifest annotation carries a
 //! descriptor saying what the image needs from the runtime that composes it.
 //!
-//! This crate is the part of that contract with no I/O in it. A node reads
+//! This module is the part of that contract with no I/O in it. A node reads
 //! descriptors out of the manifests it pulls and hands them here to be
 //! judged ([`resolve`]), expanded with the installer's inputs ([`expand`])
 //! and merged into one [`Composition`] it then provisions. Everything the
@@ -45,7 +45,7 @@ pub const SCHEMA_VERSION_ANNOTATION: &str = "vnd.docker.sandbox.kit.schema-versi
 /// The namespace of the capability types the spec itself defines.
 pub const NAMESPACE: &str = "com.docker.sandbox";
 
-/// The capability types this crate knows how to compose. A runtime claims a
+/// The capability types this module knows how to compose. A runtime claims a
 /// subset of these; anything else a Kit requires is refused by name.
 pub const KNOWN_TYPES: &[&str] = &[
     "com.docker.sandbox/network-policy@1",

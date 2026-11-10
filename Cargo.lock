@@ -743,9 +743,11 @@ dependencies = [
  "opentelemetry",
  "opentelemetry-otlp",
  "opentelemetry_sdk",
+ "regex",
  "ring",
  "serde",
  "serde_json",
+ "sha2 0.10.9",
  "thiserror 2.0.20",
  "tokio",
  "tonic 0.13.1",
@@ -766,7 +768,6 @@ dependencies = [
  "aws-smithy-http-client",
  "base64",
  "burrow-common",
- "burrow-kit",
  "burrow-net",
  "burrow-proto",
  "burrow-proxy",
@@ -827,18 +828,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "burrow-kit"
-version = "0.1.0"
-dependencies = [
- "burrow-common",
- "regex",
- "serde",
- "serde_json",
- "sha2 0.10.9",
- "thiserror 2.0.20",
-]
-
-[[package]]
 name = "burrow-net"
 version = "0.1.0"
 dependencies = [
@@ -864,7 +853,6 @@ dependencies = [
  "anyhow",
  "async-stream",
  "burrow-common",
- "burrow-kit",
  "burrow-net",
  "burrow-proto",
  "burrow-store",

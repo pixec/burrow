@@ -6,6 +6,7 @@ pub mod edge;
 pub mod features;
 pub mod glob;
 pub mod hypervisor;
+pub mod kit;
 pub mod tags;
 pub mod telemetry;
 pub mod vault;

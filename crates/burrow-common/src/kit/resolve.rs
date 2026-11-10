@@ -5,10 +5,10 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use sha2::{Digest, Sha256};
 
-use crate::descriptor::{Descriptor, Kind};
-use crate::image::{ImageConfig, merge_image_configs};
-use crate::names::{CapName, Constraint, Provide, Version};
-use crate::{Result, refused};
+use crate::kit::descriptor::{Descriptor, Kind};
+use crate::kit::image::{ImageConfig, merge_image_configs};
+use crate::kit::names::{CapName, Constraint, Provide, Version};
+use crate::kit::{Result, refused};
 
 /// A Kit as the node loaded it: the reference it was consumed by, what the
 /// registry said it is, and what its manifest carried.
@@ -278,7 +278,7 @@ mod tests {
         );
         assert!(matches!(
             resolve(vec![a.clone(), b]),
-            Err(crate::Error::Refused(_))
+            Err(crate::kit::Error::Refused(_))
         ));
         let c = kit(
             "c",

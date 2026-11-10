@@ -13,7 +13,6 @@ burrow-proto = { workspace = true }
 burrow-common = { workspace = true }
 burrow-net = { workspace = true }
 burrow-store = { workspace = true }
-burrow-kit = { workspace = true }
 prost = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }

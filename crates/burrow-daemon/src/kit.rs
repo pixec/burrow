@@ -1,7 +1,7 @@
 //! Docker Sandbox Kits on a node: importing a set as one template and
 //! provisioning a sandbox the way its descriptors ask.
 //!
-//! The grammar and the merge rules live in `burrow-kit`; this module is the
+//! The grammar and the merge rules live in `burrow_common::kit`; this module is the
 //! I/O around them. An import pulls every Kit, reads the descriptor out of
 //! each manifest, judges the set and records the result in the template's
 //! `image.json`, so a create needs no registry. A create then expands those
@@ -15,7 +15,7 @@ use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::fmt;
 use std::path::{Path, PathBuf};
 
-use burrow_kit::{HookPhase, Phase};
+use burrow_common::kit::{HookPhase, Phase};
 use burrow_proto::common::v1 as common;
 use burrow_proto::guest::v1 as guestpb;
 use serde::{Deserialize, Serialize};
@@ -25,7 +25,7 @@ use crate::oci::{ImageEnvironment, PulledImage};
 use crate::sandbox::{RunningSandbox, SandboxManager};
 
 /// The capability types this node answers.
-pub const CLAIMED: &[&str] = burrow_kit::KNOWN_TYPES;
+pub const CLAIMED: &[&str] = burrow_common::kit::KNOWN_TYPES;
 
 /// Label on a Kit volume naming the sandbox it belongs to.
 pub const LABEL_SANDBOX: &str = "burrow.kit/sandbox";
@@ -46,8 +46,8 @@ const HOOK_OUTPUT_TAIL: usize = 2000;
 /// into the status code the adapter contract expects.
 #[derive(Debug)]
 pub enum Error {
-    /// The set or an input, as `burrow-kit` judged it.
-    Kit(burrow_kit::Error),
+    /// The set or an input, as `burrow_common::kit` judged it.
+    Kit(burrow_common::kit::Error),
     /// A pulled image that cannot be read as a Kit at all.
     NotAKit(String),
 }
@@ -55,15 +55,15 @@ pub enum Error {
 impl fmt::Display for Error {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::Kit(burrow_kit::Error::Refused(m)) => write!(f, "kit refused: {m}"),
-            Self::Kit(burrow_kit::Error::Invalid(m)) => write!(f, "kit: {m}"),
+            Self::Kit(burrow_common::kit::Error::Refused(m)) => write!(f, "kit refused: {m}"),
+            Self::Kit(burrow_common::kit::Error::Invalid(m)) => write!(f, "kit: {m}"),
             Self::NotAKit(m) => f.write_str(m),
         }
     }
 }
 
-impl From<burrow_kit::Error> for Error {
-    fn from(err: burrow_kit::Error) -> Self {
+impl From<burrow_common::kit::Error> for Error {
+    fn from(err: burrow_common::kit::Error) -> Self {
         Self::Kit(err)
     }
 }
@@ -74,8 +74,10 @@ impl From<Error> for Status {
     fn from(err: Error) -> Self {
         let message = err.to_string();
         match err {
-            Error::Kit(burrow_kit::Error::Refused(_)) => Status::failed_precondition(message),
-            Error::Kit(burrow_kit::Error::Invalid(_)) | Error::NotAKit(_) => {
+            Error::Kit(burrow_common::kit::Error::Refused(_)) => {
+                Status::failed_precondition(message)
+            }
+            Error::Kit(burrow_common::kit::Error::Invalid(_)) | Error::NotAKit(_) => {
                 Status::invalid_argument(message)
             }
         }
@@ -89,12 +91,12 @@ pub struct KitImage {
     pub digest: String,
     /// The published descriptor, as the manifest annotation carried it.
     pub descriptor: serde_json::Value,
-    pub config: burrow_kit::ImageConfig,
+    pub config: burrow_common::kit::ImageConfig,
     pub layers: Vec<String>,
 }
 
-impl From<burrow_kit::Loaded> for KitImage {
-    fn from(kit: burrow_kit::Loaded) -> Self {
+impl From<burrow_common::kit::Loaded> for KitImage {
+    fn from(kit: burrow_common::kit::Loaded) -> Self {
         Self {
             reference: kit.reference,
             digest: kit.digest,
@@ -106,18 +108,18 @@ impl From<burrow_kit::Loaded> for KitImage {
 }
 
 impl KitImage {
-    fn to_loaded(&self) -> burrow_kit::Result<burrow_kit::Loaded> {
-        Ok(burrow_kit::Loaded {
+    fn to_loaded(&self) -> burrow_common::kit::Result<burrow_common::kit::Loaded> {
+        Ok(burrow_common::kit::Loaded {
             reference: self.reference.clone(),
             digest: self.digest.clone(),
-            descriptor: burrow_kit::Descriptor::from_value(self.descriptor.clone())?,
+            descriptor: burrow_common::kit::Descriptor::from_value(self.descriptor.clone())?,
             image_config: self.config.clone(),
             layers: self.layers.clone(),
         })
     }
 }
 
-impl From<&ImageEnvironment> for burrow_kit::ImageConfig {
+impl From<&ImageEnvironment> for burrow_common::kit::ImageConfig {
     fn from(env: &ImageEnvironment) -> Self {
         Self {
             entrypoint: env.entrypoint.clone(),
@@ -142,27 +144,27 @@ impl KitTemplate {
         template_name(&self.lock)
     }
 
-    fn resolved(&self) -> burrow_kit::Result<burrow_kit::Resolved> {
+    fn resolved(&self) -> burrow_common::kit::Result<burrow_common::kit::Resolved> {
         let kits = self
             .kits
             .iter()
             .map(KitImage::to_loaded)
-            .collect::<burrow_kit::Result<Vec<_>>>()?;
-        burrow_kit::resolve(kits)
+            .collect::<burrow_common::kit::Result<Vec<_>>>()?;
+        burrow_common::kit::resolve(kits)
     }
 
     /// The `image.json` a Kit template carries: the merged config, with the
     /// composition recorded beside it.
     pub fn environment(&self) -> ImageEnvironment {
         let workload = &self.kits[self.workload].config;
-        let mixins: Vec<&burrow_kit::ImageConfig> = self
+        let mixins: Vec<&burrow_common::kit::ImageConfig> = self
             .kits
             .iter()
             .enumerate()
             .filter(|(i, _)| *i != self.workload)
             .map(|(_, k)| &k.config)
             .collect();
-        let merged = burrow_kit::merge_image_configs(workload, &mixins);
+        let merged = burrow_common::kit::merge_image_configs(workload, &mixins);
         ImageEnvironment {
             env: merged.env,
             working_dir: merged.working_dir,
@@ -186,20 +188,23 @@ fn template_name(lock: &str) -> String {
 pub fn is_kit(pulled: &PulledImage) -> bool {
     pulled
         .annotations
-        .contains_key(burrow_kit::DESCRIPTOR_ANNOTATION)
+        .contains_key(burrow_common::kit::DESCRIPTOR_ANNOTATION)
 }
 
 /// Reads a pulled Kit's descriptor and runtime contract.
-pub fn load(reference: &str, pulled: &PulledImage) -> Result<burrow_kit::Loaded, Error> {
-    let Some(text) = pulled.annotations.get(burrow_kit::DESCRIPTOR_ANNOTATION) else {
+pub fn load(reference: &str, pulled: &PulledImage) -> Result<burrow_common::kit::Loaded, Error> {
+    let Some(text) = pulled
+        .annotations
+        .get(burrow_common::kit::DESCRIPTOR_ANNOTATION)
+    else {
         return Err(Error::NotAKit(format!(
             "{reference} is not a sandbox kit: its manifest carries no {} annotation",
-            burrow_kit::DESCRIPTOR_ANNOTATION
+            burrow_common::kit::DESCRIPTOR_ANNOTATION
         )));
     };
-    let descriptor = burrow_kit::Descriptor::parse(text)
+    let descriptor = burrow_common::kit::Descriptor::parse(text)
         .map_err(|e| Error::NotAKit(format!("{reference}: {e}")))?;
-    Ok(burrow_kit::Loaded {
+    Ok(burrow_common::kit::Loaded {
         reference: reference.to_string(),
         digest: pulled.digest.clone(),
         descriptor,
@@ -235,12 +240,12 @@ pub async fn load_set(
 
 /// Judges a loaded set and lays its layers out in composition order.
 pub fn assemble(
-    loaded: Vec<burrow_kit::Loaded>,
+    loaded: Vec<burrow_common::kit::Loaded>,
     blobs: HashMap<String, Vec<PathBuf>>,
     progress: &mut impl FnMut(String),
 ) -> Result<(KitTemplate, Vec<PathBuf>), Error> {
-    let resolved = burrow_kit::resolve(loaded)?;
-    let lock = burrow_kit::lock_digest(&resolved);
+    let resolved = burrow_common::kit::resolve(loaded)?;
+    let lock = burrow_common::kit::lock_digest(&resolved);
     let references: Vec<&str> = resolved.kits.iter().map(|k| k.reference.as_str()).collect();
     progress(format!(
         "composing {} as {}",
@@ -263,7 +268,7 @@ pub fn assemble(
 /// Everything a create has to do for a Kit sandbox, worked out before any
 /// resource is taken.
 pub struct Plan {
-    pub composition: burrow_kit::Composition,
+    pub composition: burrow_common::kit::Composition,
     /// What every process in the sandbox gets on top of the image's env,
     /// sentinels included.
     pub env: BTreeMap<String, String>,
@@ -286,17 +291,17 @@ pub fn plan(
     requested: &common::ResourcePolicy,
 ) -> Result<Plan, Error> {
     let resolved = template.resolved()?;
-    let inputs = burrow_kit::Inputs {
+    let inputs = burrow_common::kit::Inputs {
         args: spec.args.clone().into_iter().collect(),
         env: spec.env.clone().into_iter().collect(),
     };
     let bound: BTreeSet<String> = credentials.keys().cloned().collect();
-    let host = burrow_kit::Host {
+    let host = burrow_common::kit::Host {
         claimed: CLAIMED,
         bound_services: &bound,
         rejected: &spec.reject_types,
     };
-    let composition = burrow_kit::compose(&resolved, &inputs, &host)?;
+    let composition = burrow_common::kit::compose(&resolved, &inputs, &host)?;
 
     let (install_sentinels, runtime_sentinels) = sentinels(&composition, credentials);
     let mut env = composition.env.clone();
@@ -326,7 +331,7 @@ impl Plan {
     /// sentinel.
     fn hook_env(
         &self,
-        hook: &burrow_kit::Hook,
+        hook: &burrow_common::kit::Hook,
         baseline: &BTreeMap<String, String>,
     ) -> HashMap<String, String> {
         let mut env: HashMap<String, String> = baseline.clone().into_iter().collect();
@@ -346,7 +351,7 @@ impl Plan {
         env
     }
 
-    fn hooks(&self, phase: HookPhase) -> impl Iterator<Item = &burrow_kit::Hook> {
+    fn hooks(&self, phase: HookPhase) -> impl Iterator<Item = &burrow_common::kit::Hook> {
         self.composition
             .hooks
             .iter()
@@ -358,7 +363,7 @@ impl Plan {
 /// proxy swaps for the secret when the proxy manages it, the secret itself
 /// otherwise.
 fn sentinels(
-    composition: &burrow_kit::Composition,
+    composition: &burrow_common::kit::Composition,
     credentials: &HashMap<String, String>,
 ) -> (BTreeMap<String, String>, BTreeMap<String, String>) {
     let mut install = BTreeMap::new();
@@ -383,7 +388,7 @@ fn sentinels(
 /// Raises the caller's resources to what the composition asks for.
 fn fit_resources(
     mut resources: common::ResourcePolicy,
-    wanted: &burrow_kit::Resources,
+    wanted: &burrow_common::kit::Resources,
 ) -> common::ResourcePolicy {
     if let Some(cpu) = wanted.cpu {
         let vcpus = cpu.ceil() as u32;
@@ -397,7 +402,7 @@ fn fit_resources(
     resources
 }
 
-fn selection_record(composition: &burrow_kit::Composition) -> String {
+fn selection_record(composition: &burrow_common::kit::Composition) -> String {
     serde_json::json!({
         "selection": {
             "capabilities": [],
@@ -414,7 +419,7 @@ fn selection_record(composition: &burrow_kit::Composition) -> String {
 /// the phase's credentials to header injections. Inspection is on whenever
 /// a request has to be read.
 fn render_network(
-    composition: &burrow_kit::Composition,
+    composition: &burrow_common::kit::Composition,
     phase: Phase,
     credentials: &HashMap<String, String>,
 ) -> common::NetworkPolicy {
@@ -463,7 +468,7 @@ fn render_network(
 
 /// The header rule one injection asks for: a formatted header, or Basic
 /// auth when it names a scheme instead.
-fn inject_rule(inject: &burrow_kit::Inject, secret: &str) -> Option<common::RequestRule> {
+fn inject_rule(inject: &burrow_common::kit::Inject, secret: &str) -> Option<common::RequestRule> {
     let value = match (&inject.header, &inject.scheme) {
         (Some(_), _) => inject
             .format
@@ -690,7 +695,7 @@ async fn run_hooks(
 
 async fn run_hook(
     sandbox: &RunningSandbox,
-    hook: &burrow_kit::Hook,
+    hook: &burrow_common::kit::Hook,
     env: HashMap<String, String>,
     working_dir: &str,
 ) -> Result<(), Status> {
@@ -732,7 +737,7 @@ fn tail(text: &str, chars: usize) -> &str {
 
 async fn write_files(
     sandbox: &RunningSandbox,
-    files: &[burrow_kit::FileEntry],
+    files: &[burrow_common::kit::FileEntry],
     owner: &str,
 ) -> Result<(), Status> {
     for file in files {

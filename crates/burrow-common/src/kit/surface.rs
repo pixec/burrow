@@ -6,9 +6,9 @@
 use serde::Serialize;
 use sha2::{Digest, Sha256};
 
-use crate::compose::{Composition, Phase};
-use crate::config::HostEntry;
-use crate::descriptor::Entry;
+use crate::kit::compose::{Composition, Phase};
+use crate::kit::config::HostEntry;
+use crate::kit::descriptor::Entry;
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -61,7 +61,7 @@ pub struct Surface {
 /// Types that run on the entrypoint's trust plane and grant nothing.
 fn is_inert(entry: &Entry) -> bool {
     let t = &entry.type_;
-    t.namespace == crate::NAMESPACE
+    t.namespace == crate::kit::NAMESPACE
         && matches!(
             (t.name.as_str(), t.version),
             ("network-policy", 1 | 2)

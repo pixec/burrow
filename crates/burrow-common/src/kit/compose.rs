@@ -7,17 +7,17 @@ use std::collections::{BTreeMap, BTreeSet};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-use crate::config::{
+use crate::glob::is_host_match;
+use crate::kit::config::{
     CredentialConfig, HostEntry, LifecycleConfig, NetworkPhase, NetworkPolicyConfig, PortRequest,
     Resources, VolumeConfig, require_no_config,
 };
-use crate::descriptor::{CapType, Descriptor, Entry, Item};
-use crate::expand::{ContainerEnv, expand_args, expand_env, resolve_args};
-use crate::image::ImageConfig;
-use crate::resolve::{Loaded, Resolved};
-use crate::surface::{Surface, service_entry};
-use crate::{Result, invalid, refused};
-use burrow_common::glob::is_host_match;
+use crate::kit::descriptor::{CapType, Descriptor, Entry, Item};
+use crate::kit::expand::{ContainerEnv, expand_args, expand_env, resolve_args};
+use crate::kit::image::ImageConfig;
+use crate::kit::resolve::{Loaded, Resolved};
+use crate::kit::surface::{Surface, service_entry};
+use crate::kit::{Result, invalid, refused};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum Phase {
@@ -465,7 +465,7 @@ fn select<'a>(
 }
 
 fn is_singleton(t: &CapType) -> bool {
-    t.namespace == crate::NAMESPACE
+    t.namespace == crate::kit::NAMESPACE
         && matches!(
             t.name.as_str(),
             "network-policy"
@@ -522,7 +522,7 @@ fn validate_block(block: &[&Entry]) -> Result<()> {
 
 fn validate_entry(entry: &Entry) -> Result<()> {
     let t = &entry.type_;
-    if t.namespace != crate::NAMESPACE {
+    if t.namespace != crate::kit::NAMESPACE {
         return Ok(());
     }
     match (t.name.as_str(), t.version) {
@@ -584,7 +584,7 @@ impl<'s> Merge<'s> {
     fn run(mut self, out: &mut Composition, selected: &[(&'s str, &'s Entry)]) -> Result<()> {
         for &(label, entry) in selected {
             let t = &entry.type_;
-            if t.namespace != crate::NAMESPACE {
+            if t.namespace != crate::kit::NAMESPACE {
                 continue;
             }
             match (t.name.as_str(), t.version) {
@@ -795,7 +795,7 @@ fn union_phase(phase: &mut NetworkPhase, allow: Vec<HostEntry>, deny: Vec<HostEn
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::resolve::{Loaded, resolve};
+    use crate::kit::resolve::{Loaded, resolve};
 
     fn kit(reference: &str, kind: &str, body: &str) -> Loaded {
         let json = format!(r#"{{"schemaVersion":"3","kind":"{kind}",{body}}}"#);
@@ -841,7 +841,7 @@ mod tests {
         let c = compose(
             &resolved,
             &Inputs::default(),
-            &host(crate::KNOWN_TYPES, &bound),
+            &host(crate::kit::KNOWN_TYPES, &bound),
         )
         .unwrap();
         assert_eq!(c.allowed_hosts(Phase::Install), vec!["example.net"]);
@@ -869,15 +869,15 @@ mod tests {
         let err = compose(
             &resolved,
             &Inputs::default(),
-            &host(crate::KNOWN_TYPES, &bound),
+            &host(crate::kit::KNOWN_TYPES, &bound),
         )
         .unwrap_err();
-        assert!(matches!(err, crate::Error::Refused(m) if m.contains("com.example/thing@1")));
+        assert!(matches!(err, crate::kit::Error::Refused(m) if m.contains("com.example/thing@1")));
         let resolved = resolve(vec![w]).unwrap();
         let c = compose(
             &resolved,
             &Inputs::default(),
-            &host(crate::KNOWN_TYPES, &bound),
+            &host(crate::kit::KNOWN_TYPES, &bound),
         )
         .unwrap();
         assert_eq!(c.skipped.len(), 1);
@@ -898,7 +898,7 @@ mod tests {
         let c = compose(
             &resolved,
             &Inputs::default(),
-            &host(crate::KNOWN_TYPES, &bound),
+            &host(crate::kit::KNOWN_TYPES, &bound),
         )
         .unwrap();
         assert_eq!(c.hooks.len(), 2);
@@ -918,12 +918,14 @@ mod tests {
 
         let rejected = ["com.docker.sandbox/lifecycle@1".to_string()];
         let host = Host {
-            claimed: crate::KNOWN_TYPES,
+            claimed: crate::kit::KNOWN_TYPES,
             bound_services: &bound,
             rejected: &rejected,
         };
         let err = compose(&resolved, &Inputs::default(), &host).unwrap_err();
-        assert!(matches!(err, crate::Error::Refused(m) if m.contains("rejected by host policy")));
+        assert!(
+            matches!(err, crate::kit::Error::Refused(m) if m.contains("rejected by host policy"))
+        );
     }
 
     #[test]
@@ -937,17 +939,17 @@ mod tests {
         let resolved = resolve(vec![w]).unwrap();
         let mut inputs = Inputs::default();
         inputs.args.insert("greeting".into(), "hello".into());
-        let c = compose(&resolved, &inputs, &host(crate::KNOWN_TYPES, &bound)).unwrap();
+        let c = compose(&resolved, &inputs, &host(crate::kit::KNOWN_TYPES, &bound)).unwrap();
         assert_eq!(c.files[0].content, "hello");
         assert_eq!(c.files[1].path, "/home/agent/.config/env-written");
         assert_eq!(c.files[1].content, "hello");
         assert_eq!(c.env.get("KIT_GREETING").unwrap(), "hello");
         inputs.env.insert("KIT_GREETING".into(), "".into());
-        let c = compose(&resolved, &inputs, &host(crate::KNOWN_TYPES, &bound)).unwrap();
+        let c = compose(&resolved, &inputs, &host(crate::kit::KNOWN_TYPES, &bound)).unwrap();
         assert_eq!(c.files[1].content, "");
         let mut bad = Inputs::default();
         bad.args.insert("nope".into(), "1".into());
-        assert!(compose(&resolved, &bad, &host(crate::KNOWN_TYPES, &bound)).is_err());
+        assert!(compose(&resolved, &bad, &host(crate::kit::KNOWN_TYPES, &bound)).is_err());
     }
 
     #[test]
@@ -965,7 +967,7 @@ mod tests {
             compose(
                 &resolved,
                 &Inputs::default(),
-                &host(crate::KNOWN_TYPES, &none)
+                &host(crate::kit::KNOWN_TYPES, &none)
             )
             .is_err()
         );
@@ -973,7 +975,7 @@ mod tests {
         let c = compose(
             &resolved,
             &Inputs::default(),
-            &host(crate::KNOWN_TYPES, &bound),
+            &host(crate::kit::KNOWN_TYPES, &bound),
         )
         .unwrap();
         assert_eq!(c.credentials[0].variable.as_deref(), Some("KIT_TCK_TOKEN"));
@@ -992,7 +994,7 @@ mod tests {
             compose(
                 &resolved,
                 &Inputs::default(),
-                &host(crate::KNOWN_TYPES, &bound)
+                &host(crate::kit::KNOWN_TYPES, &bound)
             )
             .is_err()
         );
@@ -1019,7 +1021,7 @@ mod tests {
         let c = compose(
             &resolve(vec![w.clone(), same]).unwrap(),
             &Inputs::default(),
-            &host(crate::KNOWN_TYPES, &bound),
+            &host(crate::kit::KNOWN_TYPES, &bound),
         )
         .unwrap();
         assert_eq!(c.volumes.len(), 1);
@@ -1027,7 +1029,7 @@ mod tests {
             compose(
                 &resolve(vec![w, diff]).unwrap(),
                 &Inputs::default(),
-                &host(crate::KNOWN_TYPES, &bound)
+                &host(crate::kit::KNOWN_TYPES, &bound)
             )
             .is_err()
         );

@@ -8,7 +8,6 @@ members = [
     "crates/burrow-proxy",
     "crates/burrow-store",
     "crates/tailcat-rs",
-    "crates/burrow-kit",
     "crates/burrow-guest",
     "crates/burrow-orchestrator",
     "crates/burrow-daemon",
@@ -25,7 +24,6 @@ default-members = [
     "crates/burrow-proxy",
     "crates/burrow-store",
     "crates/tailcat-rs",
-    "crates/burrow-kit",
     "crates/burrow-orchestrator",
     "crates/burrow-daemon",
     "crates/burrow-cli",
@@ -44,7 +42,6 @@ burrow-net = { path = "crates/burrow-net" }
 burrow-proxy = { path = "crates/burrow-proxy" }
 burrow-store = { path = "crates/burrow-store" }
 tailcat-rs = { path = "crates/tailcat-rs" }
-burrow-kit = { path = "crates/burrow-kit" }
 
 tokio = { version = "1", features = ["full"] }
 tokio-stream = "0.1"

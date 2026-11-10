@@ -5,10 +5,10 @@ use serde::Deserialize;
 use serde::de::DeserializeOwned;
 use serde_json::{Map, Value};
 
-use crate::compose::{CredentialPhase, Inject};
-use crate::descriptor::Entry;
-use crate::names::is_kebab;
-use crate::{Result, invalid};
+use crate::kit::compose::{CredentialPhase, Inject};
+use crate::kit::descriptor::Entry;
+use crate::kit::names::is_kebab;
+use crate::kit::{Result, invalid};
 
 fn decode<T: DeserializeOwned>(entry: &Entry) -> Result<T> {
     let decoded = if entry.config.is_null() {

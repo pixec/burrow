@@ -4,7 +4,7 @@
 //! Decoding is strict: an unknown key anywhere in the grammar is an error,
 //! because a permission silently dropped is indistinguishable from one never
 //! requested. Capability configs are kept as values here; the typed decode
-//! happens in [`crate::config`] after arg expansion, since a parameterized
+//! happens in [`crate::kit::config`] after arg expansion, since a parameterized
 //! config is only judged once its placeholders are gone.
 
 use std::collections::{BTreeMap, BTreeSet};
@@ -13,8 +13,8 @@ use std::fmt;
 use serde::Deserialize;
 use serde_json::Value;
 
-use crate::names::{CapName, Constraint, Provide, is_kebab};
-use crate::{Result, invalid};
+use crate::kit::names::{CapName, Constraint, Provide, is_kebab};
+use crate::kit::{Result, invalid};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Kind {
@@ -57,7 +57,7 @@ impl CapType {
     }
 
     pub fn is(&self, name: &str, version: u32) -> bool {
-        self.namespace == crate::NAMESPACE && self.name == name && self.version == version
+        self.namespace == crate::kit::NAMESPACE && self.name == name && self.version == version
     }
 }
 

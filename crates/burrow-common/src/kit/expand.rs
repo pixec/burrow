@@ -11,8 +11,8 @@ use std::sync::LazyLock;
 use regex::Regex;
 use serde_json::{Map, Value};
 
-use crate::descriptor::{ArgDecl, Descriptor};
-use crate::{Result, invalid};
+use crate::kit::descriptor::{ArgDecl, Descriptor};
+use crate::kit::{Result, invalid};
 
 static PLACEHOLDER: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(r"\$\{\{\s*kit\.(args|env)\.([A-Za-z_][A-Za-z0-9_]*)\s*\}\}")

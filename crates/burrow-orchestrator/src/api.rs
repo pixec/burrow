@@ -546,7 +546,7 @@ impl ApiService {
         let Some(secrets) = &self.0.secrets else {
             return Ok(out);
         };
-        for service in burrow_kit::credential_services(&manifest.image_config) {
+        for service in burrow_common::kit::credential_services(&manifest.image_config) {
             if let Some(secret) = secrets.get_scoped(&service).await.map_err(internal)?
                 && secret.scope.admits(&subject)
             {

@@ -3,7 +3,7 @@
 use std::cmp::Ordering;
 use std::fmt;
 
-use crate::{Result, invalid};
+use crate::kit::{Result, invalid};
 
 const DEFAULT_NAMESPACE: &str = "com.docker.kit";
 

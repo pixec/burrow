@@ -16,7 +16,6 @@ burrow-net = { workspace = true }
 burrow-proxy = { workspace = true }
 burrow-store = { workspace = true }
 tailcat-rs = { workspace = true }
-burrow-kit = { workspace = true }
 tokio = { workspace = true }
 tokio-stream = { workspace = true }
 tokio-util = { workspace = true }
