@@ -153,11 +153,10 @@ burrow nodes ls
   holds and 404s the rest, so each machine needs its own wildcard record
   (`*.<node-name>.sandbox.example.com`) pointing at that machine. A node with no
   edge still works; its published ports are reachable at the node address alone.
-  See [EDGE.md](../../docs/EDGE.md).
 - **Node identity is the machine.** `--node-id` is the Kubernetes node name, so
   a restarted pod re-registers as itself and keeps its sandboxes. Draining a
   machine in Kubernetes does not drain it in burrow: use
-  [`burrow nodes drain`](../../docs/CLI.md#nodes-drain) first, or the sandboxes
+  `burrow nodes drain` first, or the sandboxes
   on it are lost rather than suspended.
 - **`hostPath` state.** `/var/lib/burrow` follows the machine, not the pod.
   Snapshots are node-local and sandboxes do not move, so this is correct, but
@@ -166,4 +165,4 @@ burrow nodes ls
   machine's labels, so `--label` is set in the manifest. For pools that differ,
   run one DaemonSet per pool with its own `nodeSelector` and `--label` flags,
   and constrain creates with
-  [`burrow create --node-label`](../../docs/CLI.md#create).
+  `burrow create --node-label`.

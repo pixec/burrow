@@ -77,7 +77,7 @@
 //! those and records nothing, so these are extra rather than different.
 //! [`AuditLog::observed`] shows every record to a callback too.
 //!
-//! Two consequences of following the ruleset rather than FIREWALL.md's prose,
+//! Two consequences of following the ruleset rather than the egress docs' prose,
 //! both of which the Linux path has too: in `none` mode the resolver is not
 //! reachable at all, `.internal` names included, because `tohost` admits
 //! UDP/53 only for modes with egress; and in allowlist mode TCP 80/443 goes to

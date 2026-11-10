@@ -81,7 +81,7 @@ const sandbox = await Sandbox.create({
 | `alias` | sandbox id | Name this sandbox answers to on those networks |
 | `exec` | everything allowed | Whether callers may run commands in the sandbox |
 | `fs` | everything allowed | What callers may do to the sandbox's filesystem |
-| `kit` | none | Inputs for a template pulled from a [Sandbox Kit](../../docs/TEMPLATES.md#sandbox-kits): `args`, `env` and `rejectCapabilities`. Ignored on any other template |
+| `kit` | none | Inputs for a template pulled from a Sandbox Kit: `args`, `env` and `rejectCapabilities`. Ignored on any other template |
 | `autoResume` | `true` | Resume and retry once when a call finds the sandbox suspended |
 | `onResume` | none | Called whenever this handle resumes the sandbox |
 | `timeoutMs` | `120000` | How long to wait for the boot |
@@ -773,8 +773,7 @@ holding the rule; it authenticates the node, not the sandbox, and it is a
 bearer token rather than a signature over the request. `https://` keeps it off
 the wire in the clear, but an endpoint that leaks it is still compromised, and
 the endpoint must not be given authority that a node compromise should not also
-grant. See [FIREWALL.md](../../docs/FIREWALL.md) for the full statement and the
-limits.
+grant.
 
 ### Private networks
 
@@ -1070,8 +1069,6 @@ chance to say where it lives:
 await Volume.create("fast-cache", { nodeLabels: { disk: "nvme" } });
 ```
 
-See [VOLUMES.md](../../docs/VOLUMES.md).
-
 ## Snapshots
 
 A snapshot keeps a sandbox's state as an object of its own. Start any number of
@@ -1101,8 +1098,7 @@ create from a durable snapshot can then be placed on any node with the same
 `snapshot.arch`, `snapshot.hypervisor` and `snapshot.hypervisorVersion`,
 including when the node that took it is gone. `snapshot.resources` is the
 machine it was taken on, and `snapshot.createdAt` and `snapshot.expiresAt`
-are `Date`s, the latter `null` for one that never expires. `snapshot.nodeId` is empty when only the store holds it. See
-[PERSISTENCE.md](../../docs/PERSISTENCE.md#snapshots).
+are `Date`s, the latter `null` for one that never expires. `snapshot.nodeId` is empty when only the store holds it.
 
 Bound how much disk they hold with the `snapshots` section, set when the
 sandbox is created:
@@ -1183,8 +1179,7 @@ PID 1 is burrow's agent rather than a container running the image's process.
 
 An image that expects systemd can boot it under the agent. Pass
 `systemd: true` and every sandbox from the template keeps the mode.
-`Template.list` reports it as `systemd`. The image has to ship systemd; see
-[Systemd templates](../../docs/TEMPLATES.md#systemd-templates).
+`Template.list` reports it as `systemd`. The image has to ship systemd.
 
 ```ts
 await Template.build(Template().fromImage("registry.example/ubuntu-systemd:24.04"), "ubuntu-systemd", {
@@ -1211,7 +1206,7 @@ await Template.build(
 ```
 
 A macOS build defaults to the restore image's minimum machine, and an install
-to a 64 GiB disk (`diskMib`). See [TEMPLATES.md](../../docs/TEMPLATES.md#macos-templates).
+to a 64 GiB disk (`diskMib`).
 
 ### Warm templates
 
@@ -1258,8 +1253,7 @@ works with `using` for scope-bound cleanup. Every method takes `signal` and
 
 Sandbox Kits ask for credentials by service name. A `Burrow` stores them. The
 value stays on the node and is injected into matching requests by the egress
-proxy, so a guest never holds it. See
-[Credentials brokering](../../docs/FIREWALL.md#credentials-brokering).
+proxy, so a guest never holds it.
 
 ```ts
 await burrow.setSecret("github", process.env.GITHUB_TOKEN);
@@ -1330,8 +1324,7 @@ for await (const event of burrow.events({ after, sandboxId: "build-482", follow:
 also carries the sandbox's `cpuUsageUsec`, `rxBytes`, `txBytes`, `vcpus` and
 `memoryMib` at that instant, and `at` as a `Date`. Without `follow` the iterator ends after the
 replay; `limit` caps how many events are replayed. Break out of the loop or pass
-a `signal` to stop following. See
-[The event log](../../docs/ARCHITECTURE.md#the-event-log).
+a `signal` to stop following.
 
 ## Read usage
 
@@ -1352,8 +1345,7 @@ for (const sum of sums) {
 ```
 
 An interval belongs to the window it started in. Without `groupBy`, pass
-`nextAfterId` back as `afterId` to page through an export. See
-[METERING.md](../../docs/METERING.md).
+`nextAfterId` back as `afterId` to page through an export.
 
 ## Cancel calls
 

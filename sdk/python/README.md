@@ -279,8 +279,7 @@ stdin. `lost_bytes` counts output a rotating log dropped.
   `systemd=True` boots the image's own systemd under the agent;
   `Template.list()` reports it as `systemd`. On a Mac node,
   `Template().from_ipsw("latest")` installs macOS as a `vz` template, and a
-  build `from_template` it runs steps in a clone; see
-  [TEMPLATES.md](../../docs/TEMPLATES.md#macos-templates).
+  build `from_template` it runs steps in a clone.
 
 - `Terminal`: a live pty for interactive use, callback-driven:
 

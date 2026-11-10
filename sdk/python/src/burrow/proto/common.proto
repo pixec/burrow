@@ -351,7 +351,7 @@ message VolumeMount {
 // The create-phase inputs a Docker Sandbox Kit template is expanded with.
 // The Kits themselves are the template: importing a set records their
 // descriptors beside the rootfs, and a create from such a template is
-// provisioned the way they ask. See docs/TEMPLATES.md.
+// provisioned the way they ask.
 message KitSpec {
   reserved 1;
   reserved "refs";

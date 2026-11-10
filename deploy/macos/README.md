@@ -194,7 +194,7 @@ the guest's Data volume, which the host can write only as root, and a booted
 guest proves the agent answers before the template is published. A build
 `--from` a macOS template boots a clone of it as a build sandbox and runs the
 steps through the agent instead. Both hold one of the two macOS guest slots
-while they run. See [TEMPLATES.md](../../docs/TEMPLATES.md#macos-templates).
+while they run.
 
 `burrow create --template macos-27 --vcpus 4 --mem-mib 4096` is placed on the
 Mac node, which clones the template's disk and aux storage into the sandbox

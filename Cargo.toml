@@ -15,7 +15,7 @@ members = [
 ]
 # burrow-guest is a Linux-only guest binary (vsock, mount syscalls). Excluding
 # it here keeps a bare `cargo build`/`cargo clippy` working on macOS; the
-# zigbuild invocation in docs/GETTING-STARTED.md builds it for the Linux target.
+# zigbuild invocation in the development harness docs builds it for the Linux target.
 default-members = [
     "crates/burrow-proto",
     "crates/burrow-common",

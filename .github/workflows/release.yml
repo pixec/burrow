@@ -92,7 +92,7 @@ jobs:
           sed -i "0,/^version = \"[^\"]*\"/s//version = \"$v\"/" Cargo.toml
           grep -m1 '^version' Cargo.toml
 
-      # Same invocation as docs/GETTING-STARTED.md, minus `rustup target add`,
+      # Same invocation as the development harness docs, minus `rustup target add`,
       # which the step above already did.
       # burrow-guest is the guest init rather than a host binary, but the node
       # copies it into every template it builds, so it is built too.

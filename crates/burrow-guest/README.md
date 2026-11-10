@@ -131,8 +131,8 @@ first boot; `deploy/macos/README.md` has the steps.
   hypervisor too, and ignores the journal (`-j`), as Linux mounts ext4
   `norecovery`; the node replays a journal a departed writer left
   (`fsck_hfs -p` on the image) before a reader attaches, and a delete or stop
-  runs `sync` in a writer first, so a reader sees the writer's last writes
-  (docs/VOLUMES.md). Not APFS: on a virtio disk the guest formats APFS with inline
+  runs `sync` in a writer first, so a reader sees the writer's last writes.
+  Not APFS: on a virtio disk the guest formats APFS with inline
   encryption keyed to that machine ("can not find key for volume" in any
   other), so no second sandbox could mount it. Not virtio-fs: a shared
   directory shows up as a network volume, which TCC keeps the agent out of

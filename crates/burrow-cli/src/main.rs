@@ -699,8 +699,7 @@ struct CreateFlags {
     name: Option<String>,
     /// Template to boot, as imported by `burrow pull`. Required unless
     /// `--snapshot` is given, which carries its own. A template pulled from
-    /// Docker Sandbox Kits is provisioned the way their descriptors ask; see
-    /// docs/TEMPLATES.md.
+    /// Docker Sandbox Kits is provisioned the way their descriptors ask.
     #[arg(long)]
     template: Option<String>,
     /// Create-phase value for a kit template's arg, as name=value.
@@ -755,8 +754,9 @@ struct CreateFlags {
     is_evicted_snapshots_kept: bool,
     /// Mount a volume, as `name:/path` or `name:/path:ro`, or a tmpfs as
     /// `tmpfs:/path[:size=512m][:mode=1777]`. Repeatable. A sandbox that
-    /// mounts a volume is placed on the node holding it, and boots cold
-    /// rather than restoring a warm snapshot.
+    /// mounts a volume is placed on the node holding it. Volumes are
+    /// hotplugged onto a warm restore, or the sandbox boots cold where the
+    /// hypervisor cannot hotplug drives.
     #[arg(long = "mount")]
     mounts: Vec<String>,
     /// Tag as key=value. Repeatable; at most 16.
@@ -1024,7 +1024,7 @@ struct NetworkFlags {
     #[arg(long = "deny-port")]
     deny_ports: Vec<String>,
     /// Refuse every IPv6 destination, in every mode. Without it each mode
-    /// keeps its own IPv6 behaviour; see docs/FIREWALL.md.
+    /// keeps its own IPv6 behaviour.
     #[arg(long = "deny-ipv6")]
     is_ipv6_denied: bool,
     /// Terminate this sandbox's TLS so the host named inside the session
