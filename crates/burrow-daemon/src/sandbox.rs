@@ -350,6 +350,17 @@ const REASON_LOST: &str = "the node stopped without suspending its VM, so its me
 /// Guest memory when the policy names none.
 const DEFAULT_MEM_MIB: u32 = 512;
 
+/// How long a macOS guest gets to resize its APFS container, which takes
+/// minutes on a busy Mac; the sandbox's own client gives up after the agent
+/// timeout.
+const CONTAINER_RESIZE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30 * 60);
+
+async fn container_agent(guest: GuestAddr) -> Result<GuestClient<Channel>, Status> {
+    guestconn::connect(guest, CONTAINER_RESIZE_TIMEOUT)
+        .await
+        .map_err(|err| Status::internal(format!("reaching the agent: {err}")))
+}
+
 /// The file a sandbox's writable disk is, which is all a stopped sandbox is.
 fn disk_file(guest_os: burrow_vmm::GuestOs, layout: DiskLayout) -> &'static str {
     crate::macnode::disk_file(guest_os).unwrap_or(layout.disk())
@@ -357,9 +368,8 @@ fn disk_file(guest_os: burrow_vmm::GuestOs, layout: DiskLayout) -> &'static str 
 
 /// A disk's size in MiB, as a record states it.
 fn size_mib(path: &Path) -> u32 {
-    std::fs::metadata(path).map_or(0, |meta| {
-        u32::try_from(meta.len().div_ceil(burrow_common::disk::MIB)).unwrap_or(u32::MAX)
-    })
+    u32::try_from(crate::rootdisk::provisioned_bytes(path).div_ceil(burrow_common::disk::MIB))
+        .unwrap_or(u32::MAX)
 }
 
 /// The clocks an `UpdateLifetime` moves; `None` leaves one as it is.
@@ -909,10 +919,34 @@ impl RunningSandbox {
         DiskLayout::from_proto(self.base_record.lock().unwrap().disk_layout)
     }
 
-    /// The disk this sandbox's guest writes: its root disk, or on the
-    /// overlay layout its scratch disk.
+    /// The disk this sandbox's guest writes: its root disk, on the overlay
+    /// layout its scratch disk, or a macOS guest's disk image.
     pub fn disk_path(&self) -> PathBuf {
-        self.workdir.join(self.disk_layout().disk())
+        self.workdir
+            .join(disk_file(self.guest_os(), self.disk_layout()))
+    }
+
+    fn guest_os(&self) -> burrow_vmm::GuestOs {
+        burrow_vmm::GuestOs::from_record(&self.base_record.lock().unwrap().guest_os)
+            .unwrap_or_default()
+    }
+
+    /// The size of this sandbox's disk in MiB. A macOS guest's is the size
+    /// recorded for it, which a shrink records before its next boot cuts the
+    /// image to it.
+    fn disk_mib(&self) -> u32 {
+        let recorded = self
+            .base_record
+            .lock()
+            .unwrap()
+            .policy
+            .as_ref()
+            .and_then(|policy| policy.resources.as_ref())
+            .map_or(0, |resources| resources.disk_mib);
+        match crate::macnode::is_macos(self.guest_os()) && recorded != 0 {
+            true => recorded,
+            false => size_mib(&self.disk_path()),
+        }
     }
 
     /// The template this sandbox was created from.
@@ -1467,7 +1501,9 @@ impl RunningSandbox {
         }
         // The guest starts its command ids over.
         self.logs.clear();
-        if crate::macnode::is_macos(spec.guest_os) {
+        let is_macos = crate::macnode::is_macos(spec.guest_os);
+        if is_macos {
+            self.cut_mac_disk().await;
             crate::macnode::seed(&spec.workdir, &request.inspection_ca_pem).await;
         }
         let vm = Vm::boot(spec.clone())
@@ -1503,7 +1539,71 @@ impl RunningSandbox {
         *slot = Some(vm);
         *self.spec.lock().unwrap() = spec;
         self.set_state(common::SandboxState::Running);
+        let guest = slot.as_ref().map(Vm::guest);
+        drop(slot);
+        if let Some(guest) = guest.filter(|_| is_macos) {
+            self.fill_mac_disk(guest).await;
+        }
         Ok(())
+    }
+
+    /// Cuts a macOS guest's disk image to the size a shrink recorded, its
+    /// container having been shrunk while it ran. A failure leaves the disk
+    /// as big as it was, which the guest boots on as before.
+    async fn cut_mac_disk(&self) {
+        let (recorded, actual) = (self.disk_mib(), size_mib(&self.disk_path()));
+        if recorded >= actual {
+            return;
+        }
+        match crate::macnode::resize_disk(&self.workdir, recorded).await {
+            Ok(()) => tracing::info!(
+                sandbox = self.id(),
+                from_mib = actual,
+                disk_mib = recorded,
+                "cut a macOS sandbox's disk to its shrunk container"
+            ),
+            Err(err) => tracing::warn!(
+                sandbox = self.id(),
+                err = err.message(),
+                "could not cut a macOS sandbox's disk; it boots at {actual} MiB"
+            ),
+        }
+    }
+
+    /// Has the guest's container take the space a grow added while it was
+    /// shut down, on the first boot after the grow and on no other. The
+    /// request stays until the guest has done it.
+    async fn fill_mac_disk(&self, guest: GuestAddr) {
+        if !crate::macnode::is_fill_requested(&self.workdir).await {
+            return;
+        }
+        let filled = async {
+            container_agent(guest)
+                .await?
+                .root_disk(burrow_proto::guest::v1::RootDiskRequest {
+                    op: burrow_proto::guest::v1::root_disk_request::Op::Grow as i32,
+                    ..Default::default()
+                })
+                .await
+                .map(tonic::Response::into_inner)
+        }
+        .await;
+        match filled {
+            Ok(filled) => {
+                crate::macnode::clear_fill(&self.workdir).await;
+                tracing::info!(
+                    sandbox = self.id(),
+                    container_mib = filled.size_bytes / burrow_common::disk::MIB,
+                    "a macOS guest's container took its grown disk"
+                );
+            }
+            Err(err) => tracing::warn!(
+                sandbox = self.id(),
+                err = err.message(),
+                "a macOS guest's container did not take its grown disk; it tries again on its \
+                 next boot"
+            ),
+        }
     }
 
     /// Writes the same snapshot a suspend would and leaves the guest running.
@@ -4215,11 +4315,14 @@ impl SandboxManager {
         let sandbox = self.get(id).await?;
         let mut updated = ResourcesUpdated::default();
         if let Some(mib) = disk_mib {
-            let current = size_mib(&sandbox.disk_path());
+            let current = sandbox.disk_mib();
             updated.disk_mib = Some(match self.resize_disk(&sandbox, mib).await {
-                Ok((change, filesystem_bytes)) => {
+                Ok((change, filesystem_bytes, reason)) => {
                     updated.filesystem_bytes = filesystem_bytes;
-                    outcome(change, current, mib)
+                    ResourceOutcome {
+                        reason,
+                        ..outcome(change, current, mib)
+                    }
                 }
                 Err(err) => refused(err, current)?,
             });
@@ -4240,29 +4343,21 @@ impl SandboxManager {
     /// grows on the host, and its guest fills it on its next boot. Shrinking:
     /// only a stopped sandbox, through a helper VM ([`crate::resizer`]). A
     /// suspended guest holds its disk's size in memory, so its disk is not
-    /// touched either way.
+    /// touched either way. A macOS guest's disk is resized in two halves; see
+    /// [`Self::resize_mac_disk`].
     async fn resize_disk(
         &self,
         sandbox: &Arc<RunningSandbox>,
         mib: u32,
-    ) -> Result<(ResourceChange, u64), Status> {
+    ) -> Result<(ResourceChange, u64, String), Status> {
         let id = sandbox.id();
         let record = sandbox.record();
-        match burrow_vmm::GuestOs::from_record(&record.guest_os).unwrap_or_default() {
-            burrow_vmm::GuestOs::Linux => {}
-            burrow_vmm::GuestOs::Windows => {
-                return Err(Status::failed_precondition(
-                    "a Windows guest's disk is not resized: its agent does not grow or shrink \
-                     NTFS from inside",
-                ));
-            }
-            burrow_vmm::GuestOs::MacOs => {
-                return Err(Status::failed_precondition(
-                    "a macOS guest's disk is not resized: its recovery container sits after the \
-                     system container at the end of the disk, so APFS cannot grow into space \
-                     added there, and APFS is not shrunk from outside",
-                ));
-            }
+        let guest_os = burrow_vmm::GuestOs::from_record(&record.guest_os).unwrap_or_default();
+        if guest_os == burrow_vmm::GuestOs::Windows {
+            return Err(Status::failed_precondition(
+                "a Windows guest's disk is not resized: its agent does not grow or shrink NTFS \
+                 from inside",
+            ));
         }
         if sandbox.disk_layout() != DiskLayout::Root {
             return Err(Status::failed_precondition(format!(
@@ -4270,9 +4365,9 @@ impl SandboxManager {
                  overlay, which is not resized"
             )));
         }
-        let current = size_mib(&sandbox.disk_path());
+        let current = sandbox.disk_mib();
         if mib == current {
-            return Ok((ResourceChange::Unchanged, 0));
+            return Ok((ResourceChange::Unchanged, 0, String::new()));
         }
         let slot = sandbox.vm.lock().await;
         let is_stopped = slot.is_none()
@@ -4283,6 +4378,11 @@ impl SandboxManager {
                 "sandbox {id} is suspended, and its guest holds its disk's size in memory; \
                  resume it or shut it down first"
             )));
+        }
+        if guest_os == burrow_vmm::GuestOs::MacOs {
+            return self
+                .resize_mac_disk(sandbox, slot, current, mib, &record.node_id)
+                .await;
         }
         let uploading = match is_stopped {
             true => Some(sandbox.durable.stop_uploading().await),
@@ -4307,7 +4407,91 @@ impl SandboxManager {
             filesystem_mib = filesystem_bytes / burrow_common::disk::MIB,
             "resized a sandbox's disk"
         );
-        Ok((change, filesystem_bytes))
+        Ok((change, filesystem_bytes, String::new()))
+    }
+
+    /// Resizes a macOS guest's disk. Virtualization.framework changes a disk
+    /// only under a stopped machine and APFS resizes the guest's container
+    /// only from inside, so each direction takes a boot. A grow lengthens the
+    /// shut-down sandbox's image and the guest's container takes the space on
+    /// its next boot; a shrink shrinks the running guest's container, and the
+    /// image is cut to the size recorded on its next boot. The recovery
+    /// container stays last on the disk throughout, `diskutil` moving it as
+    /// the image changes size, so the guest keeps recoveryOS.
+    async fn resize_mac_disk(
+        &self,
+        sandbox: &Arc<RunningSandbox>,
+        slot: tokio::sync::MutexGuard<'_, Option<Vm>>,
+        current: u32,
+        mib: u32,
+        node_id: &str,
+    ) -> Result<(ResourceChange, u64, String), Status> {
+        let id = sandbox.id();
+        let bytes = u64::from(mib) * burrow_common::disk::MIB;
+        let applied = if mib > current {
+            if slot.is_some() {
+                return Err(Status::failed_precondition(format!(
+                    "Virtualization.framework cannot resize a running guest's disk; shut {id} \
+                     down (`burrow shutdown {id}`), resize it, and boot it"
+                )));
+            }
+            let _grown = self
+                .admit_disk(
+                    node_id,
+                    "grow a disk",
+                    u64::from(mib - current) * burrow_common::disk::MIB,
+                )
+                .await?;
+            crate::macnode::resize_disk(&sandbox.workdir, mib).await?;
+            crate::macnode::request_fill(&sandbox.workdir).await?;
+            (ResourceChange::Offline, 0, String::new())
+        } else {
+            let Some(vm) = slot.as_ref() else {
+                return Err(Status::failed_precondition(format!(
+                    "a macOS guest's APFS container shrinks only while it runs; boot {id}, \
+                     resize it, and its disk is cut on the boot after"
+                )));
+            };
+            let shrunk = container_agent(vm.guest())
+                .await?
+                .root_disk(burrow_proto::guest::v1::RootDiskRequest {
+                    op: burrow_proto::guest::v1::root_disk_request::Op::Shrink as i32,
+                    size_bytes: bytes,
+                })
+                .await?
+                .into_inner();
+            if shrunk.minimum_bytes > bytes {
+                return Err(Status::failed_precondition(format!(
+                    "sandbox {id}'s disk needs at least {} MiB; {mib} MiB was asked for",
+                    shrunk.minimum_bytes.div_ceil(burrow_common::disk::MIB)
+                )));
+            }
+            (
+                ResourceChange::NextBoot,
+                shrunk.size_bytes,
+                "the guest's APFS container is shrunk now; the disk is cut on its next boot"
+                    .to_string(),
+            )
+        };
+        drop(slot);
+        sandbox
+            .base_record
+            .lock()
+            .unwrap()
+            .policy
+            .get_or_insert_with(Default::default)
+            .resources
+            .get_or_insert_with(Default::default)
+            .disk_mib = mib;
+        self.persist(sandbox).await;
+        tracing::info!(
+            sandbox = id,
+            from_mib = current,
+            disk_mib = mib,
+            change = applied.0.as_str_name(),
+            "resized a macOS sandbox's disk"
+        );
+        Ok(applied)
     }
 
     /// The resize itself, on a sandbox that is running or stopped, with its
@@ -5595,10 +5779,13 @@ impl SandboxManager {
         // before anything is made, so a node that cannot hold it refuses
         // without a tap or a directory to give back.
         let disk_bytes = match crate::macnode::disk_file(guest_os) {
-            Some(disk) => tokio::fs::metadata(templates_dir.join(&template).join(disk))
-                .await
-                .map(|meta| meta.len())
-                .unwrap_or(0),
+            Some(disk) => {
+                let bytes =
+                    crate::rootdisk::provisioned_bytes(&templates_dir.join(&template).join(disk));
+                resources.disk_mib =
+                    u32::try_from(bytes.div_ceil(burrow_common::disk::MIB)).unwrap_or(u32::MAX);
+                bytes
+            }
             None => {
                 let image =
                     tokio::fs::metadata(templates_dir.join(&template).join(TEMPLATE_ROOTFS))

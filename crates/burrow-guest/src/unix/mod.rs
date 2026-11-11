@@ -11,6 +11,7 @@ pub mod files;
 pub mod fs;
 pub mod pty;
 pub mod reaper;
+pub mod rootdisk;
 pub mod signals;
 
 /// What the macOS SDK declares and `libc` does not bind yet.

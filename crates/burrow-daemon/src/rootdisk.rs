@@ -296,6 +296,30 @@ fn sparse_copy(source: &Path, dest: &Path) -> std::io::Result<()> {
     to.sync_all()
 }
 
+/// The magic an Apple sparse image (ASIF), a macOS guest's disk, starts with.
+const ASIF_MAGIC: &[u8; 4] = b"shdw";
+/// Where an ASIF header holds the disk's size, in 512-byte sectors, big-endian.
+const ASIF_SECTORS_AT: u64 = 0x30;
+
+/// The size a disk presents to its guest: an ASIF image's from its header,
+/// since its length is only the space it has allocated, and any other disk's
+/// its length.
+pub fn provisioned_bytes(path: &Path) -> u64 {
+    let Ok(file) = std::fs::File::open(path) else {
+        return 0;
+    };
+    let len = file.metadata().map_or(0, |meta| meta.len());
+    let mut magic = [0u8; 4];
+    let mut sectors = [0u8; 8];
+    match file.read_exact_at(&mut magic, 0).is_ok()
+        && &magic == ASIF_MAGIC
+        && file.read_exact_at(&mut sectors, ASIF_SECTORS_AT).is_ok()
+    {
+        true => u64::from_be_bytes(sectors).saturating_mul(512),
+        false => len,
+    }
+}
+
 /// Grows a disk file to `mib`. Disks only grow: a smaller size is refused,
 /// since the filesystem on it already reaches past it.
 pub async fn grow(path: &Path, mib: u32) -> Result<bool, Status> {
@@ -880,6 +904,23 @@ mod tests {
         let drives = DiskLayout::Root.drives();
         assert_eq!(drives.len(), 1);
         assert!(drives[0].is_root && !drives[0].is_read_only);
+    }
+
+    #[test]
+    fn an_asif_image_is_its_header_size_and_a_raw_disk_its_length() {
+        let dir = scratch("asif");
+        let raw = dir.join("raw");
+        std::fs::write(&raw, vec![0u8; 4096]).unwrap();
+        assert_eq!(provisioned_bytes(&raw), 4096);
+        // The header of a 64 GiB image as `diskutil image create` wrote it.
+        let mut header = vec![0u8; 512];
+        header[..8].copy_from_slice(b"shdw\0\0\0\x01");
+        header[0x30..0x38].copy_from_slice(&0x0800_0000u64.to_be_bytes());
+        let asif = dir.join("disk.img");
+        std::fs::write(&asif, &header).unwrap();
+        assert_eq!(provisioned_bytes(&asif), 64 << 30);
+        assert_eq!(provisioned_bytes(&dir.join("missing")), 0);
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]

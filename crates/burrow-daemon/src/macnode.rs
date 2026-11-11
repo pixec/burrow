@@ -767,6 +767,80 @@ pub async fn seed(workdir: &Path, pem: &str) {
     let _ = (workdir, pem);
 }
 
+/// Resizes a stopped machine's disk image to `mib`, through `diskutil image
+/// resize --image-only`: the image and its backup GPT change and nothing in
+/// a partition does, except that the recovery container, which macOS keeps
+/// last on its disk, is moved to the new end. A size that would cut into a
+/// partition is refused with the least the disk can be.
+#[allow(clippy::result_large_err)]
+pub async fn resize_disk(workdir: &Path, mib: u32) -> Result<(), Status> {
+    #[cfg(target_os = "macos")]
+    {
+        let disk = workdir.join(burrow_vmm::vz::DISK_FILE);
+        let disk = disk.to_string_lossy();
+        let bytes = u64::from(mib) * burrow_common::disk::MIB;
+        let limits = plist(&["image", "resize", "--image-only", "--plist", &disk])
+            .await
+            .map_err(|err| Status::internal(format!("reading the disk's limits: {err:#}")))?;
+        let (Some(current), Some(minimum)) = (limits["current"].as_u64(), limits["min"].as_u64())
+        else {
+            return Err(Status::internal(format!(
+                "diskutil reported no limits for {disk}: {limits}"
+            )));
+        };
+        if bytes == current {
+            return Ok(());
+        }
+        if bytes < minimum {
+            return Err(Status::failed_precondition(format!(
+                "the disk's partitions need at least {} MiB; {mib} MiB was asked for",
+                minimum.div_ceil(burrow_common::disk::MIB)
+            )));
+        }
+        run(
+            "diskutil",
+            &[
+                "image",
+                "resize",
+                "--image-only",
+                "--size",
+                &bytes.to_string(),
+                &disk,
+            ],
+        )
+        .await
+        .map_err(|err| Status::internal(format!("resizing the disk: {err:#}")))
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = (workdir, mib);
+        Err(Status::failed_precondition(
+            "macOS guests need a macOS node",
+        ))
+    }
+}
+
+/// Marks a machine whose disk grew, so its next boot has the guest's
+/// container take the space.
+const FILL_MARK: &str = "disk.fill";
+
+#[allow(clippy::result_large_err)]
+pub async fn request_fill(workdir: &Path) -> Result<(), Status> {
+    tokio::fs::write(workdir.join(FILL_MARK), b"")
+        .await
+        .map_err(|err| Status::internal(format!("marking the disk grown: {err}")))
+}
+
+pub async fn is_fill_requested(workdir: &Path) -> bool {
+    tokio::fs::try_exists(workdir.join(FILL_MARK))
+        .await
+        .unwrap_or(false)
+}
+
+pub async fn clear_fill(workdir: &Path) {
+    let _ = tokio::fs::remove_file(workdir.join(FILL_MARK)).await;
+}
+
 /// Where the agent is installed, as TCC names it.
 #[cfg(target_os = "macos")]
 const AGENT_PATH: &str = "/usr/local/libexec/burrow-guest";

@@ -216,6 +216,14 @@ lands). There is no warm pool (a restore is slower than a cold boot), and a macO
 cannot be stored, moved or snapshotted by name (its memory lives in a
 host-bound save file).
 
+`burrow config resources <id> --disk-mib <size>` resizes a macOS sandbox's
+disk in two halves. A grow is refused while it runs; shut down, it lengthens
+`disk.img` with `diskutil image resize --image-only`, and the agent grows the
+APFS container into the space on the next boot. A shrink is refused while it
+is shut down; running, the agent shrinks the container live, and the node cuts
+the image on the next boot. `diskutil` moves the recovery container to the new
+end of the disk each time, so recoveryOS stays.
+
 Private networks work as on Linux. The node claims an address slice at
 registration (index 2, `10.99.8.0/22`, on the harness), its guests' stacks are
 joined by an in-process router, and a userspace WireGuard endpoint in burrowd

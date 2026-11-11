@@ -679,9 +679,10 @@ enum ConfigCommand {
     /// Hypervisor on x86_64. A shut-down one (`burrow shutdown`) takes everything: vCPUs
     /// and memory on its next `boot`, and its disk at once, shrunk by a helper
     /// VM that checks the filesystem first and refuses a size below what it
-    /// needs. A suspended sandbox takes none of it. Each change is reported as
-    /// live, next boot, offline or refused with the reason; any refusal exits
-    /// non-zero.
+    /// needs. A suspended sandbox takes none of it. A macOS sandbox's disk
+    /// grows while it is shut down and shrinks while it runs, and its guest
+    /// finishes either on its next boot. Each change is reported as live, next
+    /// boot, offline or refused with the reason; any refusal exits non-zero.
     Resources {
         id: String,
         #[arg(long)]
@@ -1410,14 +1411,20 @@ fn describe_update(updated: &api::UpdateResourcesResponse) -> Vec<String> {
                 ("disk", bytes) if bytes > 0 => format!(", filesystem {} MiB", bytes >> 20),
                 _ => String::new(),
             };
+            let change = api::ResourceChange::try_from(outcome.change).unwrap_or_default();
+            let note = match change {
+                api::ResourceChange::Refused => String::new(),
+                _ if outcome.reason.is_empty() => String::new(),
+                _ => format!("; {}", outcome.reason),
+            };
             Some(
-                match api::ResourceChange::try_from(outcome.change).unwrap_or_default() {
+                match change {
                     api::ResourceChange::Unchanged => format!("{name} already {to}{unit}"),
                     api::ResourceChange::Live => {
                         format!("{name} {from} -> {to}{unit} live{filesystem}")
                     }
                     api::ResourceChange::NextBoot => {
-                        format!("{name} {from} -> {to}{unit} on its next boot")
+                        format!("{name} {from} -> {to}{unit} on its next boot{filesystem}")
                     }
                     api::ResourceChange::Offline if to > from => format!(
                         "{name} {from} -> {to}{unit} while shut down; the guest fills it on its \
@@ -1427,7 +1434,7 @@ fn describe_update(updated: &api::UpdateResourcesResponse) -> Vec<String> {
                         format!("{name} {from} -> {to}{unit} offline{filesystem}")
                     }
                     _ => format!("{name} refused: {}", outcome.reason),
-                },
+                } + &note,
             )
         })
         .collect()
@@ -5538,6 +5545,15 @@ mod tests {
             ..Default::default()
         });
         assert!(grown[0].contains("next boot"), "{grown:?}");
+        let shrunk = super::describe_update(&api::UpdateResourcesResponse {
+            disk_mib: field(api::ResourceChange::NextBoot, 65536, 40960, "cut on boot"),
+            filesystem_bytes: 39000 << 20,
+            ..Default::default()
+        });
+        assert_eq!(
+            shrunk,
+            ["disk 65536 -> 40960 MiB on its next boot, filesystem 39000 MiB; cut on boot"]
+        );
     }
 
     /// `node ls` shows each node's free and total disk, and a node under its

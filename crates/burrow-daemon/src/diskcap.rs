@@ -83,10 +83,10 @@ pub fn filesystem_space(dir: &Path) -> std::io::Result<(u64, u64)> {
     ))
 }
 
-/// A disk at its provisioned size, which is its length: a sparse or cloned
-/// file takes less, and is charged all of it anyway.
+/// A disk at its provisioned size, the size its guest sees: a sparse or
+/// cloned file takes less, and is charged all of it anyway.
 fn provisioned_size(path: &Path) -> u64 {
-    std::fs::metadata(path).map_or(0, |meta| meta.len())
+    crate::rootdisk::provisioned_bytes(path)
 }
 
 impl Admissions {

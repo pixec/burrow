@@ -12,6 +12,7 @@
 mod directory;
 mod handshake;
 mod install;
+mod rootdisk;
 pub mod session;
 pub mod users;
 mod volumes;
@@ -99,12 +100,27 @@ fn hex_lower(bytes: &[u8]) -> String {
     bytes.iter().map(|b| format!("{b:02x}")).collect()
 }
 
+/// Grows or shrinks the boot disk's APFS container; see [`rootdisk`].
 pub async fn root_disk(
-    _req: guestpb::RootDiskRequest,
+    req: guestpb::RootDiskRequest,
 ) -> Result<guestpb::RootDiskResponse, tonic::Status> {
-    Err(tonic::Status::unimplemented(
-        "a macOS guest's disk is not resized or captured from inside",
-    ))
+    use guestpb::root_disk_request::Op;
+    match Op::try_from(req.op).unwrap_or(Op::Unspecified) {
+        Op::Grow => Ok(guestpb::RootDiskResponse {
+            size_bytes: rootdisk::grow().await?,
+            ..Default::default()
+        }),
+        Op::Shrink => {
+            let (size_bytes, minimum_bytes) = rootdisk::shrink(req.size_bytes).await?;
+            Ok(guestpb::RootDiskResponse {
+                size_bytes,
+                minimum_bytes,
+            })
+        }
+        _ => Err(tonic::Status::unimplemented(
+            "a macOS guest's disk is not flushed, trimmed or frozen from inside",
+        )),
+    }
 }
 
 /// Replaces this agent with the binary streamed in.

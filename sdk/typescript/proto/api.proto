@@ -632,7 +632,7 @@ message UpdateLifetimeRequest {
   optional bool is_evicted_snapshot_kept = 7;
 }
 
-// Changes a Linux sandbox's machine. An absent field is left as it is.
+// Changes a sandbox's machine. An absent field is left as it is.
 //
 // A running sandbox takes what its hypervisor can hotplug: a bigger root disk
 // under Firecracker and Cloud Hypervisor, whose guest grows its filesystem at
@@ -643,6 +643,13 @@ message UpdateLifetimeRequest {
 // host or shrunk by a helper VM that checks and shrinks the filesystem first.
 // A suspended sandbox takes none of it: a restore needs the machine its
 // snapshot was taken of.
+//
+// A macOS sandbox's disk is resized in two halves, since
+// Virtualization.framework changes a disk only under a stopped machine and
+// APFS resizes the guest's container only from inside: a grow is applied to a
+// shut-down sandbox's image (OFFLINE) and its container takes the space on its
+// next boot; a shrink shrinks a running sandbox's container (NEXT_BOOT) and
+// its image is cut on its next boot. The recovery container is kept.
 message UpdateResourcesRequest {
   string sandbox_id = 1;
   optional uint32 vcpus = 2;

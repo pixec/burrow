@@ -138,7 +138,6 @@ const HELPER_DISK: &str = "/dev/vdb";
 /// Where the node puts the e2fsprogs tools in a resize helper's root.
 const E2FSCK: &str = "/usr/sbin/e2fsck";
 const RESIZE2FS: &str = "/usr/sbin/resize2fs";
-const MIB: u64 = 1 << 20;
 
 /// Whether the host booted this agent as a resize helper rather than a
 /// sandbox's guest.
@@ -148,12 +147,6 @@ pub fn is_helper() -> bool {
             .split_whitespace()
             .any(|arg| arg == "burrow.mode=resize-disk")
     })
-}
-
-/// What the least a filesystem needing `estimate` bytes may shrink to: a
-/// tenth more, at least 128 MiB more, so it is not full the moment it boots.
-fn minimum(estimate: u64) -> u64 {
-    (estimate + (estimate / 10).max(128 * MIB)).div_ceil(MIB) * MIB
 }
 
 /// The block size and the filesystem's size in bytes, from an ext4
@@ -212,7 +205,7 @@ pub async fn shrink(target: u64) -> Result<(u64, u64), tonic::Status> {
         )));
     };
     let (block, size) = helper_size().map_err(internal)?;
-    let minimum = minimum(estimate * block);
+    let minimum = crate::unix::rootdisk::minimum(estimate * block);
     if target < minimum || target >= size {
         return Ok((size, minimum));
     }
@@ -239,13 +232,6 @@ pub async fn shrink(target: u64) -> Result<(u64, u64), tonic::Status> {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn the_minimum_leaves_room_and_lands_on_a_mib() {
-        assert_eq!(minimum(100 * MIB), 228 * MIB);
-        assert_eq!(minimum(10_000 * MIB), 11_000 * MIB);
-        assert_eq!(minimum(10_000 * MIB + 1) % MIB, 0);
-    }
 
     #[test]
     fn a_superblock_gives_the_filesystem_size() {
