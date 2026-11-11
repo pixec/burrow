@@ -132,7 +132,8 @@ pub struct MicroVmSpec {
     pub net: Option<NetSpec>,
     /// Enable virtio-vsock, the transport the guest agent speaks.
     pub is_vsock_enabled: bool,
-    /// Needed for diff snapshots.
+    /// Needed for diff snapshots. Firecracker only turns on KVM's dirty log
+    /// for a restore that maps the memory file directly.
     pub is_dirty_pages_tracked: bool,
     /// Confines firecracker to a chroot under an unprivileged uid. `None`
     /// runs it as root with the host filesystem visible.
@@ -311,7 +312,10 @@ impl MicroVm {
                 vcpu_count: self.spec.vcpus,
                 mem_size_mib: self.spec.mem_mib,
                 smt: None,
-                is_dirty_pages_tracked: self.spec.is_dirty_pages_tracked,
+                // A booted guest's memory is anonymous, so firecracker finds
+                // its dirty pages with mincore. KVM's dirty log would instead
+                // trap the first write to every page.
+                is_dirty_pages_tracked: false,
             })
             .await?;
 
@@ -511,7 +515,10 @@ impl MicroVm {
         let req = LoadSnapshot {
             snapshot_path: SNAPSHOT_FILE.into(),
             mem_backend,
-            is_diff_snapshots_enabled: vm.spec.is_dirty_pages_tracked,
+            // Pages the handler serves are what mincore reports, so only a
+            // restore mapping the memory file itself needs KVM's dirty log.
+            is_diff_snapshots_enabled: vm.spec.is_dirty_pages_tracked
+                && !vm.is_lazy_memory_active(),
             is_vm_resumed: resume,
             // Point the snapshotted interface at this sandbox's own tap.
             network_overrides: vm

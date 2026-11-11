@@ -6956,17 +6956,24 @@ impl SandboxManager {
     /// Links the template's prefetch plan into a restore's working directory,
     /// returning whether there is one to use. A plan is an optimisation, so a
     /// missing or unlinkable one costs faults rather than the restore.
-    async fn link_prefetch_plan(&self, template: &str, workdir: &Path) -> bool {
+    async fn link_prefetch_plan(
+        &self,
+        template: &str,
+        hypervisor: Hypervisor,
+        resources: &common::ResourcePolicy,
+        workdir: &Path,
+    ) -> bool {
         let dest = workdir.join(crate::warm::PREFETCH_PLAN);
         if tokio::fs::try_exists(&dest).await.unwrap_or(false) {
             return true;
         }
-        let plan = self
-            .config
-            .templates_dir()
-            .join(template)
-            .join("warm")
-            .join(crate::warm::PREFETCH_PLAN);
+        let shape = crate::warm::Shape::wanted(resources);
+        let Some(warm) =
+            crate::warm::find(&self.config.templates_dir(), template, hypervisor, shape).await
+        else {
+            return false;
+        };
+        let plan = warm.dir.join(crate::warm::PREFETCH_PLAN);
         tokio::fs::hard_link(&plan, &dest).await.is_ok()
             || tokio::fs::copy(&plan, &dest).await.is_ok()
     }
@@ -7182,7 +7189,9 @@ impl SandboxManager {
         // fork or a snapshot restore would otherwise take those pages one
         // stalled vCPU at a time.
         if capabilities.is_lazy_memory_supported {
-            let linked = self.link_prefetch_plan(&source.template(), &workdir).await;
+            let linked = self
+                .link_prefetch_plan(&source.template(), hypervisor, &resources, &workdir)
+                .await;
             let merged = matches!(source, RestoreSource::Stored { .. })
                 && crate::durable::merge_working_set(&workdir, crate::warm::PREFETCH_PLAN)
                     .await

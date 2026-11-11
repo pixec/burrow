@@ -835,6 +835,18 @@ async fn exercise_agent(
     agent
         .health(burrow_proto::guest::v1::GuestHealthRequest {})
         .await?;
+    // A clone's first exec otherwise faults in the agent's spawn path, the
+    // kernel's fork and exec, and the shell, one page at a time.
+    let start = burrow_proto::guest::v1::ExecInput {
+        input: Some(burrow_proto::guest::v1::exec_input::Input::Start(
+            burrow_proto::guest::v1::ExecStart {
+                cmd: vec!["sh".into(), "-c".into(), "true".into()],
+                ..Default::default()
+            },
+        )),
+    };
+    let mut output = agent.exec(tokio_stream::once(start)).await?.into_inner();
+    while output.message().await?.is_some() {}
     Ok(())
 }
 
