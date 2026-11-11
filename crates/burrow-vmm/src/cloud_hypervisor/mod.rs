@@ -33,7 +33,7 @@ use tokio::process::{Child, Command};
 use crate::cgroup::Cgroup;
 use crate::error::{Error, Result};
 use crate::http::UnixHttp;
-use crate::{DriveSpec, VmSpec};
+use crate::{DriveSpec, VSOCK_UDS, VmSpec};
 
 pub use jail::ChJail;
 
@@ -67,7 +67,14 @@ const RESTORE_TIMEOUT: Duration = Duration::from_secs(30);
 /// the guest spinning. Copied, guest memory is never reclaimed under it.
 const MEMORY_RESTORE_MODE: &str = "copy";
 /// The same, as the API's `vm.restore` spells it.
+#[cfg(target_os = "linux")]
 const MEMORY_RESTORE_MODE_API: &str = "Copy";
+/// The host port Cloud Hypervisor gives the first host-initiated vsock
+/// connection, and the next one each after it. A fresh VMM starts here again.
+const FIRST_HOST_PORT: u32 = 1 << 30;
+/// How many of those first ports a restore skips when the snapshot held them.
+const STALE_PORT_WINDOW: u32 = 64;
+const STALE_PORT_TIMEOUT: Duration = Duration::from_secs(2);
 
 /// How this node runs Cloud Hypervisor.
 #[derive(Debug, Clone)]
@@ -163,7 +170,7 @@ impl ChVm {
                 what: "restore from a memory chain or from memory still arriving",
             });
         }
-        let (restore_dir, vm_config) = unpack(&spec, config.jail.as_ref()).await?;
+        let (restore_dir, vm_config, stale) = unpack(&spec, config.jail.as_ref()).await?;
         let read_only = jail::absolute_paths(&vm_config);
         let source = jail::vmm_workdir(&spec.workdir, config.jail.as_ref())?.join(RESTORE_DIR);
         let source_url = format!("file://{}", source.display());
@@ -185,6 +192,7 @@ impl ChVm {
             }
             if resume {
                 vm.resume().await?;
+                skip_stale_ports(&spec.workdir.join(VSOCK_UDS), &stale).await;
             }
             Ok::<_, Error>(())
         }
@@ -531,11 +539,12 @@ impl ChVm {
 }
 
 /// Lays a packed snapshot out the way a restore reads one, addressed to this
-/// sandbox, and returns the directory and the config as written there.
+/// sandbox, and returns the directory, the config as written there and the
+/// vsock connections the snapshot held open.
 ///
 /// Landlock follows this VMM rather than the one snapshotted: its rules name
 /// the jail's paths, which a VMM run unjailed does not have.
-async fn unpack(spec: &VmSpec, jail: Option<&ChJail>) -> Result<(PathBuf, Value)> {
+async fn unpack(spec: &VmSpec, jail: Option<&ChJail>) -> Result<(PathBuf, Value, Vec<(u32, u32)>)> {
     let packed: Packed =
         serde_json::from_slice(&tokio::fs::read(spec.workdir.join(STATE_FILE)).await?)?;
     let mut vm_config = packed.config;
@@ -559,7 +568,38 @@ async fn unpack(spec: &VmSpec, jail: Option<&ChJail>) -> Result<(PathBuf, Value)
     if let Some(jail) = jail {
         std::os::unix::fs::chown(&memory, Some(jail.uid), Some(jail.gid))?;
     }
-    Ok((dir, vm_config))
+    Ok((dir, vm_config, vsock_connections(&packed.state)))
+}
+
+/// The (host port, guest port) of each vsock connection open when the state
+/// was taken.
+fn vsock_connections(state: &Value) -> Vec<(u32, u32)> {
+    state["snapshots"]["device-manager"]["snapshots"]["vsock"]["snapshot_data"]["state"]
+        .as_str()
+        .and_then(|vsock| serde_json::from_str::<Value>(vsock).ok())
+        .and_then(|vsock| serde_json::from_value(vsock["connections"].clone()).ok())
+        .unwrap_or_default()
+}
+
+/// Uses up the host ports the snapshot's vsock connections held. The restored
+/// guest keeps those connections until its agent sees them reset, and what it
+/// sends on one meanwhile lands on the new connection given the same port. A
+/// fresh VMM hands out its first ports again, so a warm sandbox snapshotted
+/// right after its create lost its handshake to its old connection's shutdown.
+async fn skip_stale_ports(uds: &Path, stale: &[(u32, u32)]) {
+    let Some(&(last, port)) = stale
+        .iter()
+        .filter(|(host, _)| (FIRST_HOST_PORT..FIRST_HOST_PORT + STALE_PORT_WINDOW).contains(host))
+        .max()
+    else {
+        return;
+    };
+    let skipped = async {
+        for _ in FIRST_HOST_PORT..=last {
+            let _ = crate::firecracker::vsock::connect(uds, port).await;
+        }
+    };
+    let _ = tokio::time::timeout(STALE_PORT_TIMEOUT, skipped).await;
 }
 
 /// Each NIC's id and the tap it names.
@@ -666,7 +706,44 @@ mod tests {
     #[test]
     fn a_restore_copies_guest_memory_in() {
         assert_eq!(MEMORY_RESTORE_MODE, "copy");
+        #[cfg(target_os = "linux")]
         assert_eq!(MEMORY_RESTORE_MODE_API, "Copy");
+    }
+
+    #[test]
+    fn the_connections_a_snapshot_held_are_read_from_its_vsock_state() {
+        let vsock = json!({ "connections": [[FIRST_HOST_PORT, 1024]] }).to_string();
+        let state = json!({ "snapshots": { "device-manager": { "snapshots": {
+            "vsock": { "snapshot_data": { "state": vsock } }
+        } } } });
+        assert_eq!(vsock_connections(&state), [(FIRST_HOST_PORT, 1024)]);
+        assert!(vsock_connections(&json!({})).is_empty());
+    }
+
+    /// A warm sandbox suspended right after its create held the first host
+    /// port, and the first connection after its restore was given it again.
+    #[tokio::test]
+    async fn a_restore_skips_the_first_host_ports_the_snapshot_held() {
+        let dir = std::env::temp_dir().join(format!("burrow-ch-ports-{}", std::process::id()));
+        tokio::fs::create_dir_all(&dir).await.unwrap();
+        let uds = dir.join(VSOCK_UDS);
+        let _ = tokio::fs::remove_file(&uds).await;
+        let listener = tokio::net::UnixListener::bind(&uds).unwrap();
+        let accepted = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0));
+        let counter = accepted.clone();
+        let _serving = tokio::spawn(async move {
+            use tokio::io::AsyncWriteExt as _;
+            while let Ok((mut stream, _)) = listener.accept().await {
+                let port =
+                    FIRST_HOST_PORT + counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                let _ = stream.write_all(format!("OK {port}\n").as_bytes()).await;
+            }
+        });
+        skip_stale_ports(&uds, &[(FIRST_HOST_PORT + 2, 1024)]).await;
+        assert_eq!(accepted.load(std::sync::atomic::Ordering::SeqCst), 3);
+        skip_stale_ports(&uds, &[(FIRST_HOST_PORT + STALE_PORT_WINDOW, 1024)]).await;
+        assert_eq!(accepted.load(std::sync::atomic::Ordering::SeqCst), 3);
+        let _ = tokio::fs::remove_dir_all(&dir).await;
     }
 
     /// A restore whose VMM never reports the state loaded used to be polled
