@@ -19,7 +19,7 @@ mod volumes;
 mod vsock;
 
 pub use crate::unix::{exec, files, fs};
-pub use handshake::handshake;
+pub use handshake::{handshake, is_clock_disciplined, set_clock};
 pub use vsock::Arrival;
 
 use std::os::unix::fs::PermissionsExt as _;

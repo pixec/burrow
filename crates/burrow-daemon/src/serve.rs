@@ -1515,6 +1515,10 @@ pub async fn run(args: ServeArgs) -> anyhow::Result<()> {
         let sandboxes = sandboxes.clone();
         tokio::spawn(async move { sandboxes.collect_stored_garbage().await });
     }
+    {
+        let sandboxes = sandboxes.clone();
+        tokio::spawn(async move { sandboxes.keep_clocks().await });
+    }
 
     let audit = burrow_proxy::AuditLog::new(
         args.data_dir.join("logs/egress.jsonl"),

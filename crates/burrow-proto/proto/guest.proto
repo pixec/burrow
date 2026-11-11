@@ -18,6 +18,11 @@ service Guest {
   // booted as a resize helper shrinks the disk it was given instead. A macOS
   // guest grows or shrinks its boot APFS container, live.
   rpc RootDisk(RootDiskRequest) returns (RootDiskResponse);
+  // Steps the guest's wall clock to the host's once they are far enough
+  // apart. A handshake sets it, but a guest outlives what its clock does not:
+  // the host or the VM under it sleeping, a nested hypervisor pausing it, a
+  // paravirtual clock that does not catch up. The host calls it on a timer.
+  rpc SyncClock(SyncClockRequest) returns (SyncClockResponse);
   // Mirrors the public Exec RPC. Deliberately a separate message set from
   // burrow.api.v1 so the guest protocol can version independently of the
   // public API (guests outlive deploys: a paused sandbox resumes with the
@@ -537,6 +542,19 @@ message GuestResumeTiming {
   uint64 trust_read_us = 8;
   uint64 trust_scan_us = 9;
   uint64 trust_write_us = 10;
+}
+
+message SyncClockRequest {
+  int64 host_time_unix_nanos = 1;
+}
+
+message SyncClockResponse {
+  // Guest minus host as the request arrived, before any step.
+  int64 offset_nanos = 1;
+  bool is_stepped = 2;
+  // Whether a time daemon in the guest had the clock synchronised, which
+  // leaves it the smaller corrections.
+  bool is_disciplined = 3;
 }
 
 message GuestHealthRequest {}

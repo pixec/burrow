@@ -117,7 +117,7 @@ fn reseed(entropy: &[u8]) -> std::io::Result<()> {
 
 /// settimeofday(2), which root may call; `timed` disciplines the clock from
 /// there if the template keeps network time on.
-fn set_clock(unix_nanos: i64) -> std::io::Result<()> {
+pub fn set_clock(unix_nanos: i64) -> std::io::Result<()> {
     if unix_nanos <= 0 {
         return Ok(());
     }
@@ -131,6 +131,15 @@ fn set_clock(unix_nanos: i64) -> std::io::Result<()> {
     }
     tracing::debug!(unix_nanos, "guest clock synced to host");
     Ok(())
+}
+
+/// Whether `timed` has the kernel clock synchronised.
+pub fn is_clock_disciplined() -> bool {
+    // SAFETY: a zeroed `timex` is valid, and with `modes` 0 the call only
+    // reads the clock's state into it.
+    let mut timex: nix::libc::timex = unsafe { std::mem::zeroed() };
+    let state = unsafe { nix::libc::ntp_adjtime(&mut timex) };
+    state >= 0 && timex.status & nix::libc::STA_UNSYNC == 0
 }
 
 /// What this process has already installed, so a repeated handshake has

@@ -87,7 +87,7 @@ pub async fn handshake(
 
 /// Sets the system clock from the host's. Needs SeSystemtimePrivilege,
 /// which LocalSystem holds and the agent enables at start.
-fn set_clock(unix_nanos: i64) -> std::io::Result<()> {
+pub fn set_clock(unix_nanos: i64) -> std::io::Result<()> {
     use windows_sys::Win32::Foundation::{FILETIME, SYSTEMTIME};
     use windows_sys::Win32::System::SystemInformation::SetSystemTime;
     use windows_sys::Win32::System::Time::FileTimeToSystemTime;
@@ -106,6 +106,17 @@ fn set_clock(unix_nanos: i64) -> std::io::Result<()> {
     win::check(unsafe { SetSystemTime(&system) })?;
     tracing::debug!(unix_nanos, "guest clock synced to host");
     Ok(())
+}
+
+/// Whether the time service is adjusting the clock, which it turns on once it
+/// has a source and off when it loses one.
+pub fn is_clock_disciplined() -> bool {
+    use windows_sys::Win32::System::SystemInformation::GetSystemTimeAdjustment;
+    let (mut adjustment, mut increment, mut is_disabled) = (0, 0, 1);
+    // SAFETY: the three outputs are live locals.
+    let read =
+        unsafe { GetSystemTimeAdjustment(&mut adjustment, &mut increment, &mut is_disabled) };
+    read != 0 && is_disabled == 0
 }
 
 /// The certificates in a PEM bundle, as DER.

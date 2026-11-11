@@ -497,6 +497,28 @@ enum Handshake {
     Failed(String),
 }
 
+const CLOCK_SYNC_INTERVAL: std::time::Duration = std::time::Duration::from_secs(60);
+const CLOCK_CHECK_INTERVAL: std::time::Duration = std::time::Duration::from_secs(5);
+/// How far the node's wall clock may move against its monotonic one between
+/// checks before guests are synced at once.
+const CLOCK_JUMP: std::time::Duration = std::time::Duration::from_secs(1);
+
+/// Whether guest clocks are due a sync, given the node's monotonic and wall
+/// clocks at the last one and now.
+fn clocks_due(
+    last: (std::time::Instant, std::time::SystemTime),
+    now: (std::time::Instant, std::time::SystemTime),
+) -> bool {
+    let steady = now.0.duration_since(last.0);
+    if steady >= CLOCK_SYNC_INTERVAL {
+        return true;
+    }
+    match now.1.duration_since(last.1) {
+        Ok(wall) => wall.abs_diff(steady) > CLOCK_JUMP,
+        Err(_) => true,
+    }
+}
+
 /// A handshake that has already happened, for every path that waits for one.
 fn settled() -> Arc<tokio::sync::watch::Sender<Handshake>> {
     Arc::new(tokio::sync::watch::channel(Handshake::Done).0)
@@ -1202,6 +1224,29 @@ impl RunningSandbox {
         Ok(features
             .as_ref()
             .is_some_and(|held| held.iter().any(|f| f == feature)))
+    }
+
+    /// Steps the guest's clock to the node's if the two have drifted apart.
+    /// Not use. A guest still handshaking is left to its handshake, which
+    /// sets the clock itself.
+    async fn sync_clock(&self) -> Result<(), Status> {
+        if *self.handshake.borrow() != Handshake::Done {
+            return Ok(());
+        }
+        let mut agent = self.reach_agent().await?;
+        let synced = agent
+            .sync_clock(guestconn::clock_request())
+            .await?
+            .into_inner();
+        if synced.is_stepped {
+            tracing::info!(
+                sandbox = self.id(),
+                offset_ms = synced.offset_nanos / 1_000_000,
+                is_disciplined = synced.is_disciplined,
+                "guest clock had drifted from the node's; stepped it"
+            );
+        }
+        Ok(())
     }
 
     /// Starts draining the guest's output feed into this sandbox's logs, if
@@ -5372,6 +5417,40 @@ impl SandboxManager {
         }
     }
 
+    /// Keeps every running guest's clock on the node's, which a handshake sets
+    /// but nothing else would: a guest drifts when the host or the VM under it
+    /// sleeps, or its paravirtual clock does not catch up. Synced every
+    /// [`CLOCK_SYNC_INTERVAL`], and as soon as the node's own wall clock jumps
+    /// against its monotonic one, which is what the node's host waking from
+    /// sleep or having its clock stepped looks like.
+    pub async fn keep_clocks(&self) {
+        let mut ticker = tokio::time::interval(CLOCK_CHECK_INTERVAL);
+        ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        let mut last = None;
+        loop {
+            ticker.tick().await;
+            let now = (std::time::Instant::now(), std::time::SystemTime::now());
+            if last.is_some_and(|last| !clocks_due(last, now)) {
+                continue;
+            }
+            let running: Vec<_> = self
+                .sandboxes
+                .lock()
+                .await
+                .values()
+                .filter(|sandbox| sandbox.is_running())
+                .cloned()
+                .collect();
+            futures::future::join_all(running.iter().map(|sandbox| async move {
+                if let Err(err) = sandbox.sync_clock().await {
+                    tracing::debug!(sandbox = sandbox.id(), %err, "guest clock not synced");
+                }
+            }))
+            .await;
+            last = Some(now);
+        }
+    }
+
     /// Applies `idle_suspend_secs` and `max_lifetime_secs`, returning what it
     /// did.
     ///
@@ -8589,6 +8668,25 @@ impl burrow_proxy::dns::Redirect for InspectionRedirect {
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
+
+    #[test]
+    fn guest_clocks_sync_on_the_interval_or_a_node_clock_jump() {
+        use std::time::{Duration, Instant, SystemTime};
+        let at = (Instant::now(), SystemTime::now());
+        let after = |steady: u64, wall: Duration| (at.0 + Duration::from_secs(steady), at.1 + wall);
+        assert!(!clocks_due(at, after(5, Duration::from_secs(5))));
+        assert!(!clocks_due(at, after(5, Duration::from_millis(5_900))));
+        assert!(clocks_due(at, after(60, Duration::from_secs(60))));
+        // The node's host slept for three days.
+        assert!(clocks_due(at, after(5, Duration::from_secs(3 * 86_400))));
+        assert!(clocks_due(
+            at,
+            (
+                at.0 + Duration::from_secs(5),
+                at.1 - Duration::from_secs(10)
+            )
+        ));
+    }
 
     #[test]
     fn port_rules_reach_the_firewall_whole_and_the_proxy_as_tcp() {

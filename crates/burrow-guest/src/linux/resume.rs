@@ -61,6 +61,16 @@ pub fn set_clock(unix_nanos: i64) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Whether a time daemon in the guest has the kernel clock synchronised, as
+/// `timedatectl` reads it.
+pub fn is_clock_disciplined() -> bool {
+    // SAFETY: a zeroed `timex` is valid, and with `modes` 0 the call only
+    // reads the clock's state into it.
+    let mut timex: nix::libc::timex = unsafe { std::mem::zeroed() };
+    let state = unsafe { nix::libc::adjtimex(&mut timex) };
+    state >= 0 && timex.status & nix::libc::STA_UNSYNC == 0
+}
+
 /// Trust stores a Linux userland might read, in the order they are tried.
 ///
 /// Added to rather than replaced: an image ships a bundle its own tools

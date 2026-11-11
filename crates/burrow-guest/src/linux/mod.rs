@@ -12,6 +12,7 @@ pub mod users;
 pub mod vsock;
 
 pub use crate::unix::{exec, files, fs, reaper};
+pub use resume::{is_clock_disciplined, set_clock};
 pub use systemd::Namespaces;
 pub use vsock::Arrival;
 
@@ -143,7 +144,7 @@ pub async fn handshake(
         tracing::error!(%err, "failed to reseed rng");
     }
     let reseeded = started.elapsed();
-    if let Err(err) = resume::set_clock(req.host_time_unix_nanos) {
+    if let Err(err) = set_clock(req.host_time_unix_nanos) {
         tracing::error!(%err, "failed to set guest clock");
     }
     let clocked = started.elapsed();

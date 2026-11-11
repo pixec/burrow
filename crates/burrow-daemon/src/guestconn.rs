@@ -138,14 +138,25 @@ pub fn handshake_full(
         inspection_ca_pem,
         extra_trust_bundles,
         entropy: fresh_entropy(),
-        host_time_unix_nanos: std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_nanos() as i64)
-            .unwrap_or(0),
+        host_time_unix_nanos: unix_nanos_now(),
         is_restored: restored,
         network,
         volumes,
     }
+}
+
+/// The host clock, for the guest to step to if it has drifted from it.
+pub fn clock_request() -> guestpb::SyncClockRequest {
+    guestpb::SyncClockRequest {
+        host_time_unix_nanos: unix_nanos_now(),
+    }
+}
+
+fn unix_nanos_now() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos() as i64)
+        .unwrap_or(0)
 }
 
 /// 32 bytes from the host CSPRNG. Every restored clone must get a *different*

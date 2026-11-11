@@ -73,6 +73,13 @@ impl Guest for AgentService {
         Ok(Response::new(os::root_disk(req.into_inner()).await?))
     }
 
+    async fn sync_clock(
+        &self,
+        req: Request<guestpb::SyncClockRequest>,
+    ) -> Result<Response<guestpb::SyncClockResponse>, Status> {
+        Ok(Response::new(crate::clock::sync(req.into_inner())?))
+    }
+
     type ExecStream = tokio_stream::wrappers::ReceiverStream<Result<guestpb::ExecOutput, Status>>;
 
     async fn exec(

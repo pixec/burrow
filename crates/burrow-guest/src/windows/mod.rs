@@ -33,7 +33,7 @@ mod vsock;
 mod win;
 
 #[cfg(windows)]
-pub use handshake::{handshake, root_disk, set_public_addresses};
+pub use handshake::{handshake, is_clock_disciplined, root_disk, set_clock, set_public_addresses};
 #[cfg(windows)]
 pub use service::{main, upgrade};
 #[cfg(windows)]

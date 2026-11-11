@@ -3,8 +3,9 @@
 //! One binary per guest OS, serving the same `Guest` service over vsock:
 //!
 //! - the OS-neutral core at the top: the service wiring ([`agent`]), the
-//!   command registry and output feed ([`commands`]), path scopes and
-//!   mapping ([`paths`]) and the errno names ([`errno`]);
+//!   command registry and output feed ([`commands`]), clock resync
+//!   ([`clock`]), path scopes and mapping ([`paths`]) and the errno names
+//!   ([`errno`]);
 //! - `unix`: what POSIX systems share, the `Fs` operations, file transfer as
 //!   a user, exec, terminals and the reaper;
 //! - `linux`: the microVM's PID 1, its network, systemd mode and vsock;
@@ -15,6 +16,8 @@
 
 #[cfg(any(target_os = "linux", target_os = "macos", windows))]
 mod agent;
+#[cfg(any(target_os = "linux", target_os = "macos", windows))]
+mod clock;
 #[cfg(any(target_os = "linux", target_os = "macos", windows, test))]
 // Elsewhere only its tests are built, which leave the service half unused.
 #[cfg_attr(
