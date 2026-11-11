@@ -486,8 +486,8 @@ class LifecycleEvent:
 class TemplateInfo:
     name: str
     size_bytes: int
-    # True when creates from this template restore a snapshot instead of
-    # booting.
+    # True when it has a warm snapshot at some shape: creates asking for that
+    # vCPU and memory size restore it instead of booting.
     warm: bool
     # Imported from Sandbox Kits: creates run their lifecycle.
     kit: bool = False

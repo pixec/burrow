@@ -341,6 +341,22 @@ fn free_mem(entry: &NodeEntry, pending: &HashMap<String, Reserved>) -> u64 {
     entry.status.free_mem_mib.saturating_sub(held.mem_mib)
 }
 
+/// Whether `entry` holds a warm snapshot of the template and machine `want`
+/// asks for. A snapshot of another shape is no use to it: a restore cannot
+/// change a guest's vCPUs or memory.
+fn holds_warm(entry: &NodeEntry, want: &Placement) -> bool {
+    let mem_mib = match want.mem_mib {
+        0 => 512,
+        mem => mem,
+    };
+    entry.status.warm_shapes.iter().any(|shape| {
+        shape.template == want.template
+            && shape.resources.is_some_and(|resources| {
+                resources.vcpus == want.vcpus.max(1) && u64::from(resources.mem_mib) == mem_mib
+            })
+    })
+}
+
 /// Free fraction of whichever resource this node is tightest on, 0.0 to 1.0.
 ///
 /// Scoring on the minimum rather than on memory alone is the point: it is what
@@ -734,7 +750,8 @@ impl NodeRegistry {
     ///   per node, so two members placed on different nodes would silently
     ///   fail to reach each other rather than erroring.
     ///
-    /// Among eligible nodes, one already holding a warm snapshot wins (a ~300ms
+    /// Among eligible nodes, one already holding a warm snapshot of the
+    /// template at the shape asked for wins (a ~300ms
     /// create against a ~1.5s one), and the least-loaded node breaks the
     /// remaining ties. "Least loaded" means the node whose *tightest* dimension
     /// has the most headroom: a memory-rich but cpu-saturated node would
@@ -866,7 +883,7 @@ impl NodeRegistry {
                 (
                     // Same node as the peers: no encryption, no extra hop.
                     want.prefer_node.as_deref() == Some(e.info.id.as_str()),
-                    e.status.warm_templates.contains_key(&want.template),
+                    holds_warm(e, want),
                     // Headroom on the tightest dimension, in thousandths so it
                     // orders as an integer.
                     (headroom(e, &pending) * 1000.0) as i64,
@@ -1155,7 +1172,18 @@ mod tests {
     fn status(templates: &[&str], warm: &[&str], free_mem_mib: u64) -> NodeStatus {
         NodeStatus {
             templates: templates.iter().map(|t| (*t).to_string()).collect(),
-            warm_templates: warm.iter().map(|t| ((*t).to_string(), 1)).collect(),
+            warm_shapes: warm
+                .iter()
+                .map(|t| burrow_proto::common::v1::WarmShape {
+                    template: (*t).to_string(),
+                    resources: Some(burrow_proto::common::v1::ResourcePolicy {
+                        vcpus: 1,
+                        mem_mib: 512,
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                })
+                .collect(),
             free_mem_mib,
             ..Default::default()
         }
@@ -1589,6 +1617,25 @@ mod tests {
             })
             .unwrap();
         assert_eq!(placed, "warm");
+    }
+
+    /// A snapshot of the template at another shape cannot be restored for
+    /// this create, so it is no reason to prefer the node.
+    #[test]
+    fn a_node_warm_at_another_shape_does_not_win() {
+        let registry = registry(&[
+            ("cold", status(&["t"], &[], 9999)),
+            ("warm", status(&["t"], &["t"], 1)),
+        ]);
+        let placed = registry
+            .place_for(&Placement {
+                template: "t".into(),
+                vcpus: 2,
+                mem_mib: 2048,
+                ..Default::default()
+            })
+            .unwrap();
+        assert_eq!(placed, "cold");
     }
 
     #[test]

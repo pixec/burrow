@@ -781,8 +781,8 @@ message NodeInfo {
 message NodeStatus {
   uint32 running_sandboxes = 1;
   uint64 free_mem_mib = 2;
-  // Warm snapshots ready, per template.
-  map<string, uint32> warm_templates = 3;
+  reserved 3;
+  reserved "warm_templates";
   bool is_draining = 4;
   // Templates this node holds. Images are node-local, so placement has to
   // know where they are rather than assuming every node is interchangeable.
@@ -803,6 +803,27 @@ message NodeStatus {
   // creates, resumes and adopts until it is not.
   bool is_disk_low = 14;
   DiskCapacity disk = 15;
+  // Warm snapshots ready here, one per template and machine shape. Placement
+  // prefers a node holding the shape a create asks for.
+  repeated WarmShape warm_shapes = 16;
+}
+
+// A warm snapshot of one template at one machine shape. A create of that
+// template asking for these vCPUs and this memory restores it instead of
+// booting.
+message WarmShape {
+  string template = 1;
+  // The shape it was taken at. A create asking for a bigger root disk than
+  // `disk_mib` restores it and grows the disk; one asking for less boots.
+  ResourcePolicy resources = 2;
+  // Disk its files take on the node.
+  uint64 size_bytes = 3;
+  // The last create restored from it, or its build.
+  int64 last_used_at_unix_ms = 4;
+  // Never evicted: the default shape and those the node pre-warms.
+  bool is_pinned = 5;
+  // The node holding it, filled in by the orchestrator.
+  string node_id = 6;
 }
 
 // The data directory's filesystem, reported like memory. A total of 0 is a
@@ -821,7 +842,7 @@ message DiskCapacity {
   double overcommit = 5;
   // Disk provisioned to sandboxes here: every sandbox's disk at its full size
   // and every volume at its size, however many blocks they share with images
-  // or each other.
+  // or each other, and the blocks the node's warm snapshots take.
   uint64 provisioned_bytes = 6;
 }
 

@@ -248,6 +248,33 @@ pub struct ServeArgs {
     /// meanwhile, `fail` refuses them.
     #[arg(long, value_enum, default_value_t = crate::delivery::Policy::Proceed, env = "BURROW_EVENT_DELIVERY")]
     pub event_delivery: crate::delivery::Policy,
+    /// Shapes, as `VCPUSxMEM_MIB`, every template here keeps warm whatever is
+    /// asked for, e.g. `2x2048,4x4096`. Built as each template lands and at
+    /// startup, and never evicted. The default shape, 1x512, always is.
+    #[arg(long, value_delimiter = ',', value_parser = crate::warm::parse_shape, env = "BURROWD_WARM_SHAPES")]
+    pub warm_shapes: Vec<crate::warm::Shape>,
+    /// Creates of a shape with no warm snapshot before the node builds one
+    /// for it, in the background. 1 warms every shape on its first use.
+    #[arg(long, default_value_t = 1, value_parser = clap::value_parser!(u32).range(1..), env = "BURROWD_WARM_DEMAND")]
+    pub warm_demand: u32,
+    /// Warm snapshots one template keeps, pinned shapes included. Past it the
+    /// least recently restored unpinned one is evicted.
+    #[arg(long, default_value_t = 4, env = "BURROWD_WARM_SHAPES_PER_TEMPLATE")]
+    pub warm_shapes_per_template: usize,
+    /// Warm snapshots the node keeps across every template.
+    #[arg(long, default_value_t = 16, env = "BURROWD_WARM_SHAPES_PER_NODE")]
+    pub warm_shapes_per_node: usize,
+    /// Disk one template's warm snapshots may take, in MiB.
+    #[arg(
+        long,
+        default_value_t = 8192,
+        env = "BURROWD_WARM_DISK_PER_TEMPLATE_MIB"
+    )]
+    pub warm_disk_per_template_mib: u64,
+    /// Disk every warm snapshot on the node may take, in MiB. It counts
+    /// against disk admission like a sandbox's disk.
+    #[arg(long, default_value_t = 32768, env = "BURROWD_WARM_DISK_PER_NODE_MIB")]
+    pub warm_disk_per_node_mib: u64,
     /// Run each firecracker under the jailer, chrooted into its own sandbox
     /// directory and dropped to `--jail-uid`. Turns on Cloud Hypervisor's
     /// confinement too, which burrowd builds itself, to the same uid.
@@ -629,17 +656,30 @@ fn local_node_info(args: &ServeArgs) -> anyhow::Result<NodeInfo> {
 /// precisely, so a coarse sweep costs nothing and keeps the node quiet.
 pub(crate) const REAP_INTERVAL_SECS: u64 = 10;
 
+fn warm_policy(args: &ServeArgs) -> crate::warm::WarmPolicy {
+    let mut policy = crate::warm::WarmPolicy {
+        per_template: args.warm_shapes_per_template,
+        per_node: args.warm_shapes_per_node,
+        per_template_bytes: args.warm_disk_per_template_mib * burrow_common::disk::MIB,
+        per_node_bytes: args.warm_disk_per_node_mib * burrow_common::disk::MIB,
+        demand: args.warm_demand,
+        ..Default::default()
+    };
+    for shape in &args.warm_shapes {
+        if !policy.is_pinned(*shape) {
+            policy.pinned.push(*shape);
+        }
+    }
+    policy
+}
+
 async fn current_status(sandboxes: &SandboxManager, data_dir: &std::path::Path) -> NodeStatus {
     let mut sys = sysinfo::System::new();
     sys.refresh_memory();
 
     let mut templates = Vec::new();
     let mut kit_templates = Vec::new();
-    let mut warm_templates = std::collections::HashMap::new();
     for template in crate::template::bootable(data_dir).await {
-        if template.is_warm {
-            warm_templates.insert(template.name.clone(), 1);
-        }
         if template.is_kit {
             kit_templates.push(template.name.clone());
         }
@@ -656,7 +696,7 @@ async fn current_status(sandboxes: &SandboxManager, data_dir: &std::path::Path) 
     NodeStatus {
         running_sandboxes: sandboxes.count().await as u32,
         free_mem_mib: avail / (1024 * 1024),
-        warm_templates,
+        warm_shapes: sandboxes.warm_shapes().await,
         templates,
         kit_templates,
         is_draining: sandboxes.is_draining(),
@@ -1446,6 +1486,7 @@ pub async fn run(args: ServeArgs) -> anyhow::Result<()> {
                 reserve_mib: args.disk_reserve_mib,
             },
             public: public_config(&args)?,
+            warm: warm_policy(&args),
         },
         Arc::clone(&proxy_policies),
         Arc::clone(&resolutions),
@@ -1632,6 +1673,10 @@ pub async fn run(args: ServeArgs) -> anyhow::Result<()> {
     // Pick up anything the previous run left behind before serving, so a
     // client never sees a window where recovered sandboxes appear missing.
     sandboxes.recover().await;
+    {
+        let sandboxes = sandboxes.clone();
+        tokio::spawn(async move { sandboxes.sweep_warm().await });
+    }
 
     // A node has no client-facing surface: everything on it is reached over the
     // node-facing hop, from the orchestrator or from a peer node. So one secret

@@ -436,7 +436,8 @@ message ListTemplatesRequest {}
 message TemplateInfo {
   string name = 1;
   uint64 size_bytes = 2;
-  // Whether creates from this template restore a snapshot instead of booting.
+  // Whether it has a warm snapshot at any shape. Only a create asking for a
+  // shape in `warm_shapes` restores instead of booting.
   bool is_warm = 3;
   // Imported from Kits: creates run their lifecycle.
   bool is_kit = 4;
@@ -446,6 +447,8 @@ message TemplateInfo {
   string guest_os = 6;
   // The hypervisor every sandbox from this template runs under.
   string hypervisor = 7;
+  // Its warm snapshots, by shape and, through the orchestrator, by node.
+  repeated burrow.common.v1.WarmShape warm_shapes = 8;
 }
 
 message ListTemplatesResponse {

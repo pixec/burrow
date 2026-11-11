@@ -57,11 +57,13 @@ impl Drop for Admitted {
 }
 
 /// What admission adds up: the disks of the sandboxes registered here, each
-/// at its size, and the node's volumes, each at its size.
+/// at its size, the node's volumes, each at its size, and the blocks its warm
+/// snapshots take.
 #[derive(Debug, Default, Clone)]
 pub struct Provisioned {
     pub disks: Vec<PathBuf>,
     pub volume_bytes: u64,
+    pub warm_bytes: u64,
 }
 
 /// Free and total bytes of the filesystem holding `dir`.
@@ -106,7 +108,13 @@ impl Admissions {
                 .iter()
                 .map(|path| provisioned_size(path))
                 .sum();
-            space.map(|(free, total)| (free, total, disks + provisioned.volume_bytes))
+            space.map(|(free, total)| {
+                (
+                    free,
+                    total,
+                    disks + provisioned.volume_bytes + provisioned.warm_bytes,
+                )
+            })
         })
         .await;
         let (free_bytes, total_bytes, provisioned_bytes) = match measured {
@@ -227,8 +235,9 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// A sparse disk takes almost nothing and is charged its whole size, and
-    /// a volume its size, whether or not any sandbox mounts it.
+    /// A sparse disk takes almost nothing and is charged its whole size, a
+    /// volume its size, whether or not any sandbox mounts it, and warm
+    /// snapshots what they take.
     #[tokio::test]
     async fn disks_and_volumes_count_at_their_sizes() {
         let dir = temp("sizes");
@@ -245,11 +254,12 @@ mod tests {
                 Provisioned {
                     disks: vec![disk, dir.join("gone.ext4")],
                     volume_bytes: 16 * MIB,
+                    warm_bytes: 8 * MIB,
                 },
             )
             .await
             .unwrap();
-        assert_eq!(capacity.provisioned_bytes, 80 * MIB);
+        assert_eq!(capacity.provisioned_bytes, 88 * MIB);
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -292,6 +302,7 @@ mod tests {
         let full = Provisioned {
             disks: Vec::new(),
             volume_bytes: total,
+            warm_bytes: 0,
         };
         let refused = admissions
             .admit(

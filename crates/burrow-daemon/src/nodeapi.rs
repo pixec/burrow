@@ -1191,9 +1191,16 @@ impl NodeService for NodeApi {
         &self,
         _req: Request<api::ListTemplatesRequest>,
     ) -> Result<Response<api::ListTemplatesResponse>, Status> {
-        Ok(Response::new(api::ListTemplatesResponse {
-            templates: crate::template::list(&self.data_dir).await,
-        }))
+        let mut templates = crate::template::list(&self.data_dir).await;
+        let warm = self.sandboxes.warm_shapes().await;
+        for template in &mut templates {
+            template.warm_shapes = warm
+                .iter()
+                .filter(|shape| shape.template == template.name)
+                .cloned()
+                .collect();
+        }
+        Ok(Response::new(api::ListTemplatesResponse { templates }))
     }
 
     async fn delete_template(
@@ -1277,8 +1284,7 @@ impl NodeService for NodeApi {
         // that received a template warms it itself. Never blocks the pull.
         // Anything already here was captured on the rootfs this pull replaced.
         self.sandboxes.invalidate_warm(&manifest.name).await;
-        self.sandboxes
-            .warm_in_background(manifest.name.clone(), common::ResourcePolicy::default());
+        self.sandboxes.warm_template(&manifest.name);
         Ok(Response::new(nodepb::PullTemplateResponse {
             bytes_transferred,
             blobs_reused,

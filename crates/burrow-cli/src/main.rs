@@ -1475,8 +1475,12 @@ fn parse_pairs(
 
 #[derive(Subcommand)]
 enum TemplatesCommand {
-    /// List templates.
-    Ls,
+    /// List templates, with the shapes (VCPUSxMEM_MIB) each is warm at.
+    Ls {
+        /// One row per warm snapshot instead: node, shape, disk and last use.
+        #[arg(long)]
+        warm: bool,
+    },
     /// Import an OCI image as a template, e.g. `python:3.12-slim`.
     Import {
         /// Image references: [registry/]repository[:tag|@digest]. Several
@@ -2505,7 +2509,12 @@ async fn main() -> anyhow::Result<()> {
                 .await?;
             println!("share revoked");
         }
-        Command::Templates(TemplatesCommand::Ls) => list_templates(&mut client).await?,
+        Command::Templates(TemplatesCommand::Ls { warm: false }) => {
+            list_templates(&mut client).await?
+        }
+        Command::Templates(TemplatesCommand::Ls { warm: true }) => {
+            list_warm_shapes(&mut client).await?
+        }
         Command::Templates(TemplatesCommand::Import {
             images,
             name,
@@ -4139,21 +4148,80 @@ async fn list_templates(client: &mut Client) -> anyhow::Result<()> {
         return Ok(());
     }
     println!(
-        "{:<24} {:>10}  WARM  {:<7}  HYPERVISOR",
-        "TEMPLATE", "SIZE", "INIT"
+        "{:<24} {:>10}  {:<7}  {:<16}  WARM",
+        "TEMPLATE", "SIZE", "INIT", "HYPERVISOR"
     );
     for template in resp.templates {
+        let mut shapes: Vec<(u32, u32)> = template
+            .warm_shapes
+            .iter()
+            .filter_map(|shape| shape.resources)
+            .map(|resources| (resources.vcpus, resources.mem_mib))
+            .collect();
+        shapes.sort_unstable();
+        shapes.dedup();
+        let warm = match shapes.is_empty() {
+            true => "-".to_string(),
+            false => shapes
+                .iter()
+                .map(|(vcpus, mem_mib)| format!("{vcpus}x{mem_mib}"))
+                .collect::<Vec<_>>()
+                .join(","),
+        };
         println!(
-            "{:<24} {:>9}M  {:<4}  {:<7}  {}",
+            "{:<24} {:>9}M  {:<7}  {:<16}  {}",
             template.name,
             template.size_bytes / (1024 * 1024),
-            if template.is_warm { "yes" } else { "no" },
             if template.is_systemd {
                 "systemd"
             } else {
                 "agent"
             },
             template.hypervisor,
+            warm,
+        );
+    }
+    Ok(())
+}
+
+async fn list_warm_shapes(client: &mut Client) -> anyhow::Result<()> {
+    let resp = client
+        .list_templates(api::ListTemplatesRequest {})
+        .await?
+        .into_inner();
+    let mut shapes: Vec<_> = resp
+        .templates
+        .into_iter()
+        .flat_map(|template| template.warm_shapes)
+        .collect();
+    if shapes.is_empty() {
+        println!("no warm snapshots");
+        return Ok(());
+    }
+    shapes.sort_by_key(|shape| {
+        let resources = shape.resources.unwrap_or_default();
+        (
+            shape.template.clone(),
+            shape.node_id.clone(),
+            resources.vcpus,
+            resources.mem_mib,
+        )
+    });
+    println!(
+        "{:<24} {:<16} {:<10} {:>8} {:>8}  {:<24}  PINNED",
+        "TEMPLATE", "NODE", "SHAPE", "DISK", "SIZE", "LAST USED"
+    );
+    for shape in shapes {
+        let resources = shape.resources.unwrap_or_default();
+        println!(
+            "{:<24} {:<16} {:<10} {:>7}M {:>7}M  {:<24}  {}",
+            shape.template,
+            shape.node_id,
+            format!("{}x{}", resources.vcpus, resources.mem_mib),
+            resources.disk_mib,
+            shape.size_bytes / (1024 * 1024),
+            rfc3339_from_unix_ms(shape.last_used_at_unix_ms),
+            if shape.is_pinned { "yes" } else { "no" },
         );
     }
     Ok(())

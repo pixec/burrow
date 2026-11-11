@@ -2644,19 +2644,23 @@ impl Burrow for ApiService {
         // Dialled together rather than one after another: sequentially, this
         // costs the sum of the fleet's round trips.
         let polled = futures::future::join_all(reachable_nodes(&self.0).into_iter().map(
-            |(_, endpoint)| async move {
+            |(node_id, endpoint)| async move {
                 let mut client = connect_node_unary(endpoint, self.0.node_token.as_deref())
                     .await
                     .ok()?;
-                client
+                let resp = client
                     .list_templates(api::ListTemplatesRequest {})
                     .await
-                    .ok()
+                    .ok()?;
+                Some((node_id, resp))
             },
         ))
         .await;
-        for resp in polled.into_iter().flatten() {
-            for template in resp.into_inner().templates {
+        for (node_id, resp) in polled.into_iter().flatten() {
+            for mut template in resp.into_inner().templates {
+                for shape in &mut template.warm_shapes {
+                    shape.node_id = node_id.clone();
+                }
                 match seen.get_mut(&template.name) {
                     // Merged rather than overwritten. A warm snapshot is
                     // node-local, so one node holding the template cold says
@@ -2667,6 +2671,7 @@ impl Burrow for ApiService {
                     // since placement prefers a node that has one.
                     Some(existing) => {
                         existing.is_warm |= template.is_warm;
+                        existing.warm_shapes.extend(template.warm_shapes);
                         existing.size_bytes = existing.size_bytes.max(template.size_bytes);
                     }
                     None => {

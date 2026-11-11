@@ -134,6 +134,8 @@ pub struct NodeConfig {
     pub disk: crate::diskcap::DiskPolicy,
     /// Public addresses: the routed IPv6 prefix, ingress limits, providers.
     pub public: crate::publicip::PublicConfig,
+    /// Which shapes are warmed, and how many snapshots are kept.
+    pub warm: crate::warm::WarmPolicy,
 }
 
 impl NodeConfig {
@@ -619,10 +621,14 @@ impl Drop for Provisioning<'_> {
 /// Bounded as a whole, because the watch this settles is what everything else
 /// waits on: a guest that hangs half way through a handshake must become an
 /// error on the next call rather than a call that never returns.
+///
+/// `grow_to` is the size of a root disk grown under the guest before it
+/// handshook, whose filesystem it grows to fill before the sandbox is ready.
 fn spawn_handshake(
     manager: &SandboxManager,
     sandbox: &Arc<RunningSandbox>,
     request: burrow_proto::guest::v1::HandshakeRequest,
+    grow_to: Option<u64>,
     timeout: std::time::Duration,
 ) {
     let id = sandbox.id.clone();
@@ -643,9 +649,18 @@ fn spawn_handshake(
         let outcome = match tokio::time::timeout(timeout + guestconn::UPGRADE_TIMEOUT, async {
             let (agent, _) = guestconn::connect_when_ready(guest.clone(), timeout).await?;
             *step.lock().unwrap() = "waiting for the agent to answer the handshake";
-            let (agent, _) =
+            let (mut agent, _) =
                 guestconn::handshake_upgrading(agent, guest, request, upgrade.as_deref(), timeout)
                     .await?;
+            if let Some(size_bytes) = grow_to {
+                *step.lock().unwrap() = "waiting for the guest to grow its filesystem";
+                agent
+                    .root_disk(burrow_proto::guest::v1::RootDiskRequest {
+                        op: burrow_proto::guest::v1::root_disk_request::Op::Grow as i32,
+                        size_bytes,
+                    })
+                    .await?;
+            }
             Ok::<_, anyhow::Error>(agent)
         })
         .await
@@ -2034,6 +2049,10 @@ pub struct SandboxManager {
     /// build, costing a boot, a snapshot and the node's one warm build lock,
     /// for every novel one.
     warm_shapes: Arc<std::sync::Mutex<HashMap<String, WarmShapes>>>,
+    /// Held by an automatic warm build from its admission checks to its
+    /// finish, so they run one after another with the checks made against
+    /// the node as it is when each starts.
+    warm_queue: Arc<tokio::sync::Mutex<()>>,
     /// How long this node may go on resuming durable sandboxes without
     /// hearing from the orchestrator.
     lease: Arc<std::sync::Mutex<NodeLease>>,
@@ -2080,53 +2099,48 @@ struct NodeLease {
     length: std::time::Duration,
 }
 
-/// Shapes one template will build a warm snapshot for before it stops.
-///
-/// A snapshot is disk and a build is a boot, so the node warms a handful of
-/// shapes per template rather than every shape anyone has ever asked for. The
-/// oldest attempt is forgotten past this, which lets a template whose traffic
-/// has moved to a new shape eventually warm it.
-const MAX_WARM_SHAPES: usize = 4;
-
-/// Distinct shapes of one template whose demand is counted.
+/// Distinct shapes of one template whose demand is counted, and whose build
+/// attempts are remembered.
 ///
 /// Only a tally, so it is cheap, but it is keyed by numbers a caller chooses
 /// and therefore has to be bounded like everything else. The least-requested
 /// entry makes way, which keeps the shapes that recur and drops the one-offs.
 const MAX_TRACKED_SHAPES: usize = 16;
 
-/// Creates of one shape before an automatic warm build is worth its cost.
-///
-/// A template's default shape is exempt: it is what a create with no resource
-/// policy asks for, so it is warmed on the first sight of it. Anything else has
-/// to recur, because a snapshot built for a shape that is never asked for again
-/// is a boot and a memory image spent on nothing.
-const WARM_DEMAND_THRESHOLD: u32 = 3;
+/// How long an automatic warm build waits for the node to have no create in
+/// flight before giving the slot up.
+const WARM_IDLE_WAIT: std::time::Duration = std::time::Duration::from_secs(120);
+
+/// The pause after an automatic warm build before the next may start, so a
+/// burst of new shapes does not keep the node booting warm VMs back to back.
+const WARM_BUILD_GAP: std::time::Duration = std::time::Duration::from_secs(2);
 
 /// One template's warm bookkeeping.
 #[derive(Default)]
 struct WarmShapes {
     /// Creates seen per shape, capped at [`MAX_TRACKED_SHAPES`].
     demand: Vec<(ShapeKey, u32)>,
-    /// Shapes a build has already been started for, oldest first.
+    /// Shapes a build has been started for, oldest first, capped at
+    /// [`MAX_TRACKED_SHAPES`].
     ///
     /// One attempt per shape while it is remembered: a build holds the node's
     /// warm build lock, and one that failed usually fails again for the same
-    /// reason.
+    /// reason. A shape is forgotten when its snapshot is evicted, so asking
+    /// for it again builds it again.
     attempted: Vec<ShapeKey>,
 }
 
 impl WarmShapes {
     /// Counts one create of `key` and says whether it now deserves a snapshot.
-    fn record_demand(&mut self, key: &ShapeKey) -> bool {
-        // The shape a create with no resource policy asks for, which is the one
-        // an explicit warm builds too: warmed on sight rather than on repetition.
-        if key.is_default() {
+    fn record_demand(&mut self, key: &ShapeKey, policy: &crate::warm::WarmPolicy) -> bool {
+        // Pinned shapes, the one a create with no resource policy asks for
+        // among them, are warmed on sight rather than on repetition.
+        if policy.is_pinned(key.shape()) {
             return true;
         }
         if let Some(entry) = self.demand.iter_mut().find(|(shape, _)| shape == key) {
             entry.1 = entry.1.saturating_add(1);
-            return entry.1 >= WARM_DEMAND_THRESHOLD;
+            return entry.1 >= policy.demand;
         }
         if self.demand.len() >= MAX_TRACKED_SHAPES {
             // The least-requested entry, which is the one a burst of novel
@@ -2141,7 +2155,7 @@ impl WarmShapes {
             self.demand.swap_remove(weakest);
         }
         self.demand.push((key.clone(), 1));
-        WARM_DEMAND_THRESHOLD <= 1
+        policy.demand <= 1
     }
 
     /// Claims the one attempt this shape gets, or says it is already taken.
@@ -2151,48 +2165,49 @@ impl WarmShapes {
         }
         self.attempted.push(key.clone());
         // Oldest first, so the cap forgets the shape that has gone longest
-        // without being asked for rather than refusing the new one: an explicit
-        // warm must never be turned away because of what a create asked for.
-        if self.attempted.len() > MAX_WARM_SHAPES {
+        // without being asked for rather than refusing the new one.
+        if self.attempted.len() > MAX_TRACKED_SHAPES {
             self.attempted.remove(0);
         }
         true
     }
+
+    /// Gives an attempt back, for a build the node declined to start or a
+    /// snapshot it evicted.
+    fn forget(&mut self, key: &ShapeKey) {
+        self.attempted.retain(|shape| shape != key);
+    }
 }
 
-/// The machine a warm snapshot was taken as.
+/// The machine a warm snapshot is taken as, which is what a create has to
+/// match to restore it.
 ///
-/// All of these are fixed when the VM is built and cannot be changed on a
-/// running guest, so a create only restores from a snapshot that agrees on
-/// every one of them. The disk is included because the snapshot's guest has
-/// its filesystem grown to it: a caller asking for a larger one must not
-/// silently get the size the snapshot was taken with. 0 is the template's
-/// default, which the build resolves.
+/// Both are fixed when the VM is built and cannot be changed by a restore.
+/// The disk is not part of it: a create asking for more than the snapshot's
+/// restores it and grows the disk, and every snapshot is built at its
+/// template's default disk.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 struct ShapeKey {
     template: String,
     vcpus: u32,
     mem_mib: u32,
-    disk_mib: u32,
 }
 
 impl ShapeKey {
-    /// The shape a create that named no resources asks for, which is also the
-    /// one an explicit warm builds.
-    fn is_default(&self) -> bool {
-        *self == Self::of(&self.template, &common::ResourcePolicy::default())
-    }
-
     fn of(template: &str, resources: &common::ResourcePolicy) -> Self {
+        let shape = crate::warm::Shape::wanted(resources);
         Self {
             template: template.to_string(),
-            vcpus: resources.vcpus.max(1),
-            mem_mib: if resources.mem_mib == 0 {
-                512
-            } else {
-                resources.mem_mib
-            },
-            disk_mib: resources.disk_mib,
+            vcpus: shape.vcpus,
+            mem_mib: shape.mem_mib,
+        }
+    }
+
+    fn shape(&self) -> crate::warm::Shape {
+        crate::warm::Shape {
+            vcpus: self.vcpus,
+            mem_mib: self.mem_mib,
+            disk_mib: 0,
         }
     }
 }
@@ -2213,6 +2228,7 @@ impl SandboxManager {
             audit: Arc::new(std::sync::Mutex::new(None)),
             expired_rules: Arc::new(std::sync::Mutex::new(std::collections::HashSet::new())),
             warm_shapes: Arc::new(std::sync::Mutex::new(HashMap::new())),
+            warm_queue: Arc::new(tokio::sync::Mutex::new(())),
             firewall: Arc::new(tokio::sync::Mutex::new(())),
             snapshots: Arc::new(crate::snapshot::SnapshotStore::new(
                 &config.data_dir,
@@ -5005,7 +5021,7 @@ impl SandboxManager {
             .unwrap()
             .entry(key.template.clone())
             .or_default()
-            .record_demand(key);
+            .record_demand(key, &self.config.warm);
         if !wanted {
             return;
         }
@@ -5014,35 +5030,58 @@ impl SandboxManager {
             common::ResourcePolicy {
                 vcpus: key.vcpus,
                 mem_mib: key.mem_mib,
-                disk_mib: key.disk_mib,
+                ..Default::default()
             },
         );
     }
 
-    /// Discards `template`'s warm snapshot and lets it be built again.
+    /// Warms every pinned shape of a template that has just landed here.
+    pub fn warm_template(&self, template: &str) {
+        for shape in &self.config.warm.pinned {
+            self.warm_in_background(
+                template.to_string(),
+                common::ResourcePolicy {
+                    vcpus: shape.vcpus,
+                    mem_mib: shape.mem_mib,
+                    ..Default::default()
+                },
+            );
+        }
+    }
+
+    /// Discards every warm snapshot of `template` and lets them be built again.
     ///
     /// A snapshot's memory image is only valid over the rootfs it was captured
     /// on, and `stage_from_warm` links whichever `rootfs.ext4` is there now.
     /// Republishing a template without this leaves the two mismatched, which
-    /// restores a guest onto a disk it never saw. Clearing `warm_attempted` too
-    /// is what lets the replacement be built, since the key is only ever
-    /// inserted.
+    /// restores a guest onto a disk it never saw. Clearing the attempts too is
+    /// what lets the replacements be built.
+    ///
+    /// Taken under the warm build lock, so a build of the old rootfs already
+    /// running finishes, and is discarded, before this returns rather than
+    /// publishing after it.
     pub async fn invalidate_warm(&self, template: &str) {
+        let _no_builds = crate::warm::hold_builds().await;
         self.warm_shapes.lock().unwrap().remove(template);
         let warm = crate::warm::warm_dir(&self.config.templates_dir(), template);
         if let Err(err) = tokio::fs::remove_dir_all(&warm).await
             && err.kind() != std::io::ErrorKind::NotFound
         {
-            tracing::warn!(template, %err, "could not discard the warm snapshot");
+            tracing::warn!(template, %err, "could not discard the warm snapshots");
         }
     }
 
     /// Builds a warm snapshot of `template` at `resources`, off this task.
     ///
-    /// Every trigger comes through here: a template landing on the node, and a
-    /// create that found no snapshot of its shape. Both take the same path,
-    /// with the same validation, lock and staged swap, so nothing about the
-    /// resulting snapshot depends on which of the two asked for it.
+    /// Every trigger comes through here: a template landing on the node, a
+    /// pinned shape, and a create that found no snapshot of its shape. All
+    /// take the same path, with the same validation, lock and staged swap, so
+    /// nothing about the resulting snapshot depends on which asked for it.
+    ///
+    /// A build boots a VM, so it waits its turn behind other automatic builds
+    /// and for the node to have no create in flight, and is given up when the
+    /// node could not admit a sandbox of its shape. A shape given up on is
+    /// tried again the next time a create asks for it.
     pub fn warm_in_background(&self, template: String, resources: common::ResourcePolicy) {
         let shape = match crate::nodeapi::warm_request(&resources) {
             Ok(request) => request,
@@ -5055,7 +5094,6 @@ impl SandboxManager {
             template: template.clone(),
             vcpus: shape.vcpus,
             mem_mib: shape.mem_mib,
-            disk_mib: shape.disk_mib,
         };
         // Claimed before the task is spawned, so a burst of creates of one
         // shape queues one build rather than one each.
@@ -5072,34 +5110,200 @@ impl SandboxManager {
 
         let manager = self.clone();
         tokio::spawn(async move {
-            let templates_dir = manager.config.templates_dir();
-            // It may already be warm: a template that was warmed explicitly,
-            // or one create's build finishing while another was queued.
-            if let Ok(resolved) = crate::warm::resolve_disk(&templates_dir, &template, shape).await
-                && crate::warm::is_warm_for(&templates_dir, &template, resolved).await
-            {
-                return;
-            }
-            let trust = manager.warm_trust(&template).await;
-            match crate::warm::build_warm_snapshot(&manager.config, &template, shape, &trust).await
-            {
-                Ok(snapshot_bytes) => {
+            let _queued = manager.warm_queue.lock().await;
+            match manager.build_warm(&template, shape).await {
+                Ok(Some(warm)) => {
                     tracing::info!(
                         template,
                         vcpus = shape.vcpus,
                         mem_mib = shape.mem_mib,
-                        snapshot_bytes,
+                        bytes = warm.bytes,
                         "warmed a template automatically"
                     );
+                    manager.enforce_warm_limits(None).await;
                     // Placement prefers a node that holds the snapshot, and it
                     // only knows about one it has been told about.
                     manager.announce_now();
+                    tokio::time::sleep(WARM_BUILD_GAP).await;
                 }
-                // Not fatal to anything: creates of this template keep working,
-                // they just keep cold-booting.
-                Err(err) => tracing::warn!(template, %err, "could not warm a template"),
+                Ok(None) => {}
+                Err(err) => {
+                    // Not fatal to anything: creates of this shape keep
+                    // working, they just keep cold-booting.
+                    tracing::warn!(template, %err, "could not warm a template");
+                    if err.code() == tonic::Code::ResourceExhausted {
+                        manager.forget_warm(&key);
+                    }
+                }
             }
         });
+    }
+
+    /// One automatic build, once the node can spare it. `None` when the shape
+    /// turned out to be warm already.
+    async fn build_warm(
+        &self,
+        template: &str,
+        shape: crate::warm::Shape,
+    ) -> Result<Option<crate::warm::Warm>, Status> {
+        let templates_dir = self.config.templates_dir();
+        let (hypervisor, _) = self.image_environment(template).await.machine()?;
+        // It may already be warm: a pinned shape kept across a restart, or one
+        // create's build finishing while another was queued.
+        if crate::warm::find(&templates_dir, template, hypervisor, shape)
+            .await
+            .is_some()
+        {
+            return Ok(None);
+        }
+        let shape = crate::warm::resolve_disk(&templates_dir, template, shape).await?;
+        let policy = &self.config.warm;
+        let image_bytes = tokio::fs::metadata(templates_dir.join(template).join(TEMPLATE_ROOTFS))
+            .await
+            .map_or(0, |meta| meta.len());
+        let estimate = u64::from(shape.mem_mib) * burrow_common::disk::MIB + image_bytes;
+        if estimate > policy.per_template_bytes || estimate > policy.per_node_bytes {
+            return Err(Status::failed_precondition(format!(
+                "a {}x{} snapshot takes about {} MiB, more than the warm disk caps allow",
+                shape.vcpus,
+                shape.mem_mib,
+                estimate / burrow_common::disk::MIB
+            )));
+        }
+
+        let deadline = std::time::Instant::now() + WARM_IDLE_WAIT;
+        while !self.creating.lock().await.is_empty() {
+            if std::time::Instant::now() >= deadline {
+                return Err(Status::resource_exhausted(
+                    "creates kept the node busy; the warm build gave up its turn",
+                ));
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+        }
+        self.admit_vcpus(0, shape.vcpus).await?;
+        let available_mib = {
+            let mut sys = sysinfo::System::new();
+            sys.refresh_memory();
+            sys.available_memory() / burrow_common::disk::MIB
+        };
+        let needed_mib = u64::from(shape.mem_mib + hypervisor.capabilities().memory_headroom_mib);
+        if available_mib < needed_mib {
+            return Err(Status::resource_exhausted(format!(
+                "a {}x{} warm build needs {needed_mib} MiB and the node has {available_mib} MiB \
+                 available",
+                shape.vcpus, shape.mem_mib
+            )));
+        }
+        // What the caps would evict once this snapshot is in goes first, so
+        // the disk it frees counts towards admitting the build.
+        self.enforce_warm_limits(Some((template, hypervisor, shape, estimate)))
+            .await;
+        let _charged = self.admit_disk("", "warm a template", estimate).await?;
+        let trust = self.warm_trust(template).await;
+        crate::warm::build_warm_snapshot(&self.config, template, shape, &trust)
+            .await
+            .map(Some)
+    }
+
+    fn forget_warm(&self, key: &ShapeKey) {
+        if let Some(shapes) = self.warm_shapes.lock().unwrap().get_mut(&key.template) {
+            shapes.forget(key);
+        }
+    }
+
+    /// Evicts the least recently used warm snapshots past the node's caps,
+    /// counting `incoming`, a snapshot about to be built, as the newest.
+    async fn enforce_warm_limits(
+        &self,
+        incoming: Option<(&str, Hypervisor, crate::warm::Shape, u64)>,
+    ) {
+        let mut entries = crate::warm::list_all(&self.config.templates_dir()).await;
+        if let Some((template, hypervisor, shape, bytes)) = incoming {
+            entries.push((
+                template.to_string(),
+                crate::warm::Warm {
+                    dir: PathBuf::new(),
+                    hypervisor,
+                    shape,
+                    bytes,
+                    used_at: i64::MAX,
+                },
+            ));
+        }
+        for index in self.config.warm.evictions(&entries) {
+            let (template, warm) = &entries[index];
+            if warm.dir.as_os_str().is_empty() {
+                continue;
+            }
+            let _no_builds = crate::warm::hold_builds().await;
+            if let Err(err) = tokio::fs::remove_dir_all(&warm.dir).await {
+                tracing::warn!(template, %err, "could not evict a warm snapshot");
+                continue;
+            }
+            self.forget_warm(&ShapeKey {
+                template: template.clone(),
+                vcpus: warm.shape.vcpus,
+                mem_mib: warm.shape.mem_mib,
+            });
+            tracing::info!(
+                template,
+                vcpus = warm.shape.vcpus,
+                mem_mib = warm.shape.mem_mib,
+                bytes = warm.bytes,
+                used_at = warm.used_at,
+                "evicted a warm snapshot"
+            );
+        }
+    }
+
+    /// At startup: discards warm snapshots this build cannot restore and
+    /// rebuilds them at their shapes, warms the pinned shapes of every
+    /// template, and applies the caps, which may have changed.
+    pub async fn sweep_warm(&self) {
+        let templates_dir = self.config.templates_dir();
+        for template in crate::template::bootable(&self.config.data_dir).await {
+            let is_warmable = self
+                .image_environment(&template.name)
+                .await
+                .machine()
+                .is_ok_and(|(hypervisor, _)| hypervisor.capabilities().is_warm_pool_supported);
+            if !is_warmable {
+                continue;
+            }
+            for (dir, shape) in crate::warm::stale(&templates_dir, &template.name).await {
+                if let Err(err) = tokio::fs::remove_dir_all(&dir).await {
+                    tracing::warn!(template = template.name, %err, "could not discard a stale warm snapshot");
+                    continue;
+                }
+                if let Some(shape) = shape {
+                    tracing::info!(
+                        template = template.name,
+                        vcpus = shape.vcpus,
+                        mem_mib = shape.mem_mib,
+                        "rebuilding a warm snapshot in the current format"
+                    );
+                    self.warm_in_background(
+                        template.name.clone(),
+                        common::ResourcePolicy {
+                            vcpus: shape.vcpus,
+                            mem_mib: shape.mem_mib,
+                            ..Default::default()
+                        },
+                    );
+                }
+            }
+            self.warm_template(&template.name);
+        }
+        self.enforce_warm_limits(None).await;
+    }
+
+    /// Every warm snapshot here, as the node reports them.
+    pub async fn warm_shapes(&self) -> Vec<common::WarmShape> {
+        crate::warm::list_all(&self.config.templates_dir())
+            .await
+            .iter()
+            .map(|(template, warm)| warm.to_proto(template, &self.config.warm))
+            .collect()
     }
 
     /// Retires build layers and the blobs nothing refers to any more.
@@ -5346,7 +5550,7 @@ impl SandboxManager {
     }
 
     /// What this node has provisioned: every sandbox's disks and every
-    /// volume, at their sizes.
+    /// volume, at their sizes, and the disk its warm snapshots take.
     async fn provisioned(&self) -> crate::diskcap::Provisioned {
         let disks = self
             .sandboxes
@@ -5362,9 +5566,15 @@ impl SandboxManager {
             .iter()
             .map(|volume| volume.size_mib.saturating_mul(burrow_common::disk::MIB))
             .sum();
+        let warm_bytes = crate::warm::list_all(&self.config.templates_dir())
+            .await
+            .iter()
+            .map(|(_, warm)| warm.bytes)
+            .sum();
         crate::diskcap::Provisioned {
             disks,
             volume_bytes,
+            warm_bytes,
         }
     }
 
@@ -5831,18 +6041,29 @@ impl SandboxManager {
         // A warm snapshot was taken without volumes, so they can only reach a
         // sandbox restored from one by being hotplugged; where they cannot
         // be, it boots cold and takes them at boot.
-        let from_warm = seed_disk.is_none()
+        //
+        // A snapshot with a smaller disk than asked for is restored and its
+        // disk grown, where the guest's disk can grow live; one with a larger
+        // disk cannot be shrunk under the guest, so that create boots.
+        let wanted = crate::warm::Shape::wanted(&resources);
+        let warm = if seed_disk.is_none()
             && capabilities.is_warm_pool_supported
             && (capabilities.is_drive_hotplug_supported
                 || crate::volume::block_mounts(&policy.volumes)
                     .next()
                     .is_none())
-            && crate::warm::is_warm_for(
-                &templates_dir,
-                &template,
-                crate::warm::Shape::wanted(&resources),
-            )
-            .await;
+        {
+            crate::warm::find(&templates_dir, &template, hypervisor, wanted)
+                .await
+                .filter(|warm| {
+                    warm.shape.disk_mib == wanted.disk_mib
+                        || (warm.shape.disk_mib < wanted.disk_mib
+                            && capabilities.is_live_disk_growth_supported)
+                })
+        } else {
+            None
+        };
+        let from_warm = warm.is_some();
         let warm_check_ms = began.elapsed();
 
         // Networking: a private /30 on a dedicated tap. The guest configures
@@ -5871,10 +6092,11 @@ impl SandboxManager {
             // a create landing in that window finds pieces of it missing. A
             // cold boot is slower, not wrong, and is a far better answer than
             // failing a create because of a race with a rebuild.
-            let mut warm = from_warm;
-            if warm
+            let mut is_warm = from_warm;
+            if let Some(snapshot) = &warm
                 && let Err(err) =
-                    crate::warm::stage_from_warm(&templates_dir, &template, &workdir).await
+                    crate::warm::stage_from_warm(&templates_dir, &template, snapshot, &workdir)
+                        .await
             {
                 if err.kind() != std::io::ErrorKind::NotFound {
                     return Err(Status::internal(format!("staging warm snapshot: {err}")));
@@ -5883,7 +6105,7 @@ impl SandboxManager {
                     template = %template, %err,
                     "warm snapshot is not there to stage; booting cold"
                 );
-                warm = false;
+                is_warm = false;
             }
             if crate::macnode::is_macos(guest_os) {
                 let root = self.inspection_ca_for(&policy);
@@ -5892,7 +6114,7 @@ impl SandboxManager {
                     .map_err(|err| {
                         Status::failed_precondition(format!("template {template:?}: {err}"))
                     })?;
-            } else if !warm {
+            } else if !is_warm {
                 prepare_workdir(&templates_dir.join(&template), &workdir)
                     .await
                     .map_err(|err| {
@@ -5930,7 +6152,7 @@ impl SandboxManager {
                 // else keeping a reader from writing back if this doesn't.
                 let mut shared: std::collections::HashSet<String> =
                     [TEMPLATE_KERNEL.to_string(), TEMPLATE_ROOTFS.to_string()].into();
-                if warm {
+                if is_warm {
                     shared.extend(layout.files().map(String::from));
                     shared.insert(crate::warm::PREFETCH_PLAN.to_string());
                 }
@@ -5948,7 +6170,7 @@ impl SandboxManager {
                     .map_err(|err| Status::internal(format!("preparing the jail: {err}")))?;
             }
             Ok::<(bool, std::time::Duration, std::time::Duration), Status>((
-                warm,
+                is_warm,
                 files_ms,
                 staging_began.elapsed() - files_ms,
             ))
@@ -6037,6 +6259,27 @@ impl SandboxManager {
         match started_vm {
             Ok(vm) => guard.vm = Some(vm),
             Err(err) => return Err(guard.fail(err).await),
+        }
+
+        // A snapshot taken on a smaller disk than this sandbox asked for: the
+        // disk grows under the running guest, as a live resize would, and the
+        // guest grows its filesystem once it has handshaken.
+        let grow_to = warm
+            .filter(|warm| from_warm && warm.shape.disk_mib < wanted.disk_mib)
+            .map(|_| u64::from(wanted.disk_mib) * burrow_common::disk::MIB);
+        if let Some(bytes) = grow_to {
+            let grown = async {
+                crate::rootdisk::grow(&workdir.join(disk_layout.disk()), wanted.disk_mib).await?;
+                guard
+                    .vm()
+                    .resize_disk("rootfs", bytes)
+                    .await
+                    .map_err(|err| Status::internal(format!("growing the warm disk: {err}")))
+            }
+            .await;
+            if let Err(err) = grown {
+                return Err(guard.fail(err).await);
+            }
         }
 
         // Attached before the handshake, which is what tells the guest to rescan
@@ -6237,7 +6480,7 @@ impl SandboxManager {
         // Started only once the sandbox exists, so the task can hand the
         // channel it handshook on to whoever needs the guest next.
         if from_warm {
-            spawn_handshake(self, &sandbox, request, self.config.agent_timeout);
+            spawn_handshake(self, &sandbox, request, grow_to, self.config.agent_timeout);
         }
         Ok((sandbox, disk))
     }
@@ -6960,7 +7203,7 @@ impl SandboxManager {
             tap: tap_name,
         });
         *sandbox.durable.hydration.lock().unwrap() = arriving;
-        spawn_handshake(self, &sandbox, request, self.config.agent_timeout);
+        spawn_handshake(self, &sandbox, request, None, self.config.agent_timeout);
         Ok((sandbox, disk))
     }
 
@@ -8425,6 +8668,7 @@ pub(crate) mod tests {
                 event_delivery: Default::default(),
                 disk: Default::default(),
                 public: Default::default(),
+                warm: Default::default(),
             },
             Arc::new(burrow_proxy::PolicyTable::default()),
             Arc::new(burrow_proxy::Resolutions::default()),
@@ -8821,10 +9065,18 @@ pub(crate) mod tests {
         assert_eq!(attempted(&manager).len(), 1);
 
         // A different shape is a different snapshot, so it gets its own
-        // attempt; the same shape spelled as defaults does not.
+        // attempt; the same shape spelled as defaults does not, and neither
+        // does the same machine with another disk.
         manager.warm_in_background("app".into(), shape(4, 1024));
         manager.warm_in_background("app".into(), common::ResourcePolicy::default());
         manager.warm_in_background("app".into(), shape(1, 512));
+        manager.warm_in_background(
+            "app".into(),
+            common::ResourcePolicy {
+                disk_mib: 4096,
+                ..shape(4, 1024)
+            },
+        );
         assert_eq!(attempted(&manager).len(), 3);
 
         // And a template of its own, however alike its shape.
@@ -8832,24 +9084,27 @@ pub(crate) mod tests {
         assert_eq!(attempted(&manager).len(), 4);
     }
 
-    /// A republished template's old snapshot restores a guest onto a rootfs it
-    /// never saw, so invalidating must both discard it and let the replacement
-    /// be built: `warm_attempted` is otherwise insert-only for the node's life.
+    /// A republished template's old snapshots restore a guest onto a rootfs
+    /// it never saw, so invalidating must both discard every shape and let
+    /// the replacements be built.
     #[tokio::test]
-    async fn republishing_a_template_discards_its_warm_snapshot() {
+    async fn republishing_a_template_discards_its_warm_snapshots() {
         let manager = manager().await;
         manager.warm_in_background("app".into(), shape(2, 1024));
         manager.warm_in_background("app".into(), shape(4, 2048));
         manager.warm_in_background("other".into(), shape(2, 1024));
 
         let warm = crate::warm::warm_dir(&manager.config.templates_dir(), "app");
-        tokio::fs::create_dir_all(&warm).await.unwrap();
-        tokio::fs::write(
-            warm.join(burrow_vmm::firecracker::SNAPSHOT_MEM_FILE),
-            b"stale",
-        )
-        .await
-        .unwrap();
+        for name in ["firecracker-2x1024", "firecracker-4x2048"] {
+            tokio::fs::create_dir_all(warm.join(name)).await.unwrap();
+            tokio::fs::write(
+                warm.join(name)
+                    .join(burrow_vmm::firecracker::SNAPSHOT_MEM_FILE),
+                b"stale",
+            )
+            .await
+            .unwrap();
+        }
 
         manager.invalidate_warm("app").await;
 
@@ -8861,42 +9116,38 @@ pub(crate) mod tests {
     }
 
     /// The shapes come from create requests, so a caller naming a fresh one
-    /// every time must not be able to grow this for the life of the node, nor
-    /// to queue a boot and a memory image for each.
+    /// every time must not be able to grow this for the life of the node.
     #[tokio::test]
-    async fn a_novel_shape_does_not_buy_itself_a_warm_build() {
+    async fn demand_and_attempts_stay_bounded() {
         let manager = manager().await;
-        manager.warm_for_demand(&ShapeKey::of("app", &shape(7, 3333)));
-        assert!(attempted(&manager).is_empty());
-
-        // The shape a create with no resource policy asks for is the exception:
-        // it is what an explicit warm builds, and it is warmed on sight.
-        manager.warm_for_demand(&ShapeKey::of("app", &common::ResourcePolicy::default()));
-        assert_eq!(attempted(&manager).len(), 1);
-
-        // A thousand one-off shapes leave the tally bounded and add no builds.
         for mem in 0..1000u32 {
             manager.warm_for_demand(&ShapeKey::of("app", &shape(2, 1000 + mem)));
         }
         let shapes = manager.warm_shapes.lock().unwrap();
         assert!(shapes["app"].demand.len() <= MAX_TRACKED_SHAPES);
-        drop(shapes);
-        assert_eq!(attempted(&manager).len(), 1);
+        assert_eq!(shapes["app"].attempted.len(), MAX_TRACKED_SHAPES);
+        // Oldest first: the earliest shapes are the ones forgotten.
+        assert_eq!(shapes["app"].attempted[0].mem_mib, 1984);
     }
 
-    /// A build is a boot and a snapshot is disk, so one template warms a
-    /// handful of shapes rather than every shape ever asked for. The oldest
-    /// makes way, so an explicit warm is never refused.
-    #[tokio::test]
-    async fn attempts_are_capped_per_template() {
-        let manager = manager().await;
-        for vcpus in 1..=(MAX_WARM_SHAPES as u32 + 3) {
-            manager.warm_in_background("app".into(), shape(vcpus, 1024));
-        }
-        let shapes = manager.warm_shapes.lock().unwrap();
-        assert_eq!(shapes["app"].attempted.len(), MAX_WARM_SHAPES);
-        // Oldest first: the earliest shapes are the ones forgotten.
-        assert_eq!(shapes["app"].attempted[0].vcpus, 4);
+    /// Past one create, a shape has to recur `--warm-demand` times before it
+    /// is worth a boot; pinned shapes are warmed on sight whatever it is.
+    #[test]
+    fn demand_is_counted_against_the_threshold() {
+        let policy = crate::warm::WarmPolicy {
+            demand: 3,
+            ..Default::default()
+        };
+        let mut shapes = WarmShapes::default();
+        let key = ShapeKey::of("app", &shape(4, 2048));
+        assert!(!shapes.record_demand(&key, &policy));
+        assert!(!shapes.record_demand(&key, &policy));
+        assert!(shapes.record_demand(&key, &policy));
+        let default = ShapeKey::of("app", &common::ResourcePolicy::default());
+        assert!(shapes.record_demand(&default, &policy));
+        // The default, 1, warms a shape on its first use.
+        let mut shapes = WarmShapes::default();
+        assert!(shapes.record_demand(&key, &Default::default()));
     }
 
     /// A shape firecracker would refuse is not worth an attempt, and must not
@@ -8913,14 +9164,24 @@ pub(crate) mod tests {
     #[tokio::test]
     async fn demand_warms_the_shape_that_was_asked_for() {
         let manager = manager().await;
-        // Once is not demand; a shape has to recur before it is worth a boot.
-        for _ in 0..WARM_DEMAND_THRESHOLD {
-            manager.warm_for_demand(&ShapeKey::of("app", &shape(4, 2048)));
-        }
+        manager.warm_for_demand(&ShapeKey::of("app", &shape(4, 2048)));
         let attempts = attempted(&manager);
         let key = attempts.first().expect("an attempt was recorded");
         assert_eq!((key.vcpus, key.mem_mib), (4, 2048));
         assert_eq!(key.template, "app");
+    }
+
+    /// An evicted shape, and one the node declined to build, are given back
+    /// so the next create asking for them builds them again.
+    #[tokio::test]
+    async fn a_forgotten_shape_can_be_warmed_again() {
+        let manager = manager().await;
+        manager.warm_in_background("app".into(), shape(2, 2048));
+        let key = ShapeKey::of("app", &shape(2, 2048));
+        manager.forget_warm(&key);
+        assert!(attempted(&manager).is_empty());
+        manager.warm_in_background("app".into(), shape(2, 2048));
+        assert_eq!(attempted(&manager), vec![key]);
     }
 
     /// A chain longer than the cap is what a failed compaction leaves behind,
@@ -9232,6 +9493,7 @@ pub(crate) mod tests {
             &manager,
             &sandbox,
             burrow_proto::guest::v1::HandshakeRequest::default(),
+            None,
             std::time::Duration::from_millis(1),
         );
         // The registry's reference is the one that matters; a test holding

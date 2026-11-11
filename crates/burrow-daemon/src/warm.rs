@@ -21,22 +21,30 @@
 //! guest never sees the image, the kernel is read-only, and restoring has been
 //! verified not to modify the memory file.
 //!
-//! A template has one hypervisor, so its warm snapshot is taken under that one
-//! and named by it, and every sandbox restored from it runs under it too.
+//! A restore cannot change a guest's vCPUs or memory, so a template keeps one
+//! snapshot per machine shape, each in a directory of its own named by the
+//! hypervisor it was taken under and its vCPUs and memory. A create restores
+//! the one matching what it asked for, and a shape with none boots cold and
+//! has one built behind it. The node bounds how many it keeps and evicts the
+//! least recently restored past that; see [`WarmPolicy`].
 
 use std::path::{Path, PathBuf};
 
 use tonic::Status;
 
+use burrow_proto::common::v1 as common;
 use burrow_vmm::{Hypervisor, HypervisorExt, NetSpec, Vm, VmSpec};
 
 use crate::rootdisk::{DiskLayout, IMAGE, ROOT_DISK};
 use crate::sandbox::NodeConfig;
 
-/// Files that make up a template's warm snapshot.
+/// A template's warm snapshots, one directory per shape.
 const WARM_DIR: &str = "warm";
-/// Where a rebuild is assembled before it is swapped in.
+/// Where a build is assembled before it is swapped in. One at a time on the
+/// whole node, under [`WARM_BUILD_LOCK`].
 const WARM_STAGING_DIR: &str = "warm.tmp";
+/// Unix seconds of the last restore from a snapshot, which eviction orders by.
+const USED_FILE: &str = "used";
 const WARM_TAP: &str = "btwarm";
 
 /// Serialises warm builds across the whole node.
@@ -70,7 +78,11 @@ pub async fn hold_builds() -> tokio::sync::MutexGuard<'static, ()> {
 ///
 /// 5 boots on a root disk, without the overlay: an older snapshot's guest has
 /// the overlay mounted in its memory and a scratch drive in its device state.
-const WARM_FORMAT: &str = "5";
+///
+/// 6 keeps a snapshot per shape in a directory of its own. A 5 is the one
+/// snapshot directly under `warm/`, and is rebuilt at its shape in the new
+/// layout.
+const WARM_FORMAT: &str = "6";
 
 /// Whether a warm snapshot's `format` file names the format this build writes.
 fn is_current_format(text: &str) -> bool {
@@ -91,7 +103,6 @@ pub const PREFETCH_PLAN: &str = "prefetch.bin";
 const SHAPE_FILE: &str = "shape";
 
 /// Which hypervisor took the snapshot, and so which files it is made of.
-/// Absent in one built before there was a choice, which was Firecracker.
 const HYPERVISOR_FILE: &str = "hypervisor";
 
 /// The trust material a warm snapshot is built with already installed.
@@ -137,6 +148,17 @@ impl Shape {
         }
     }
 
+    /// The directory a snapshot of this machine under `hypervisor` is kept
+    /// in. The disk is left out: a create asking for a larger one restores
+    /// the snapshot and grows it.
+    fn dir_name(self, hypervisor: Hypervisor) -> String {
+        format!("{hypervisor}-{}x{}", self.vcpus, self.mem_mib)
+    }
+
+    fn is_machine(self, other: Shape) -> bool {
+        (self.vcpus, self.mem_mib) == (other.vcpus, other.mem_mib)
+    }
+
     fn parse(text: &str) -> Option<Self> {
         // Split on runs of whitespace rather than the first one, so padding
         // does not leave the second field unparseable.
@@ -167,28 +189,181 @@ pub async fn resolve_disk(
     })
 }
 
-/// The shape a template's warm snapshot was taken with, if it has one.
-pub async fn warm_shape(templates_dir: &Path, template: &str) -> Option<Shape> {
-    let text = tokio::fs::read_to_string(warm_dir(templates_dir, template).join(SHAPE_FILE))
-        .await
-        .ok()?;
-    Shape::parse(&text)
+/// `--warm-shapes`: `VCPUSxMEM_MIB`, e.g. `2x2048`.
+pub fn parse_shape(text: &str) -> Result<Shape, String> {
+    let (vcpus, mem_mib) = text
+        .split_once('x')
+        .ok_or_else(|| format!("{text:?} is not VCPUSxMEM_MIB, e.g. 2x2048"))?;
+    Ok(Shape {
+        vcpus: vcpus
+            .parse()
+            .map_err(|_| format!("{text:?}: {vcpus:?} is not a vCPU count"))?,
+        mem_mib: mem_mib
+            .parse()
+            .map_err(|_| format!("{text:?}: {mem_mib:?} is not MiB of memory"))?,
+        disk_mib: 0,
+    })
 }
 
-/// The hypervisor a warm snapshot in `dir` was taken under.
-async fn warm_hypervisor(dir: &Path) -> Option<Hypervisor> {
-    match tokio::fs::read_to_string(dir.join(HYPERVISOR_FILE)).await {
-        Ok(name) => name.trim().parse().ok(),
-        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Some(Hypervisor::Firecracker),
-        Err(_) => None,
+/// How many warm snapshots this node keeps, and how much disk they may take,
+/// from the `--warm-*` flags.
+#[derive(Debug, Clone)]
+pub struct WarmPolicy {
+    pub per_template: usize,
+    pub per_node: usize,
+    pub per_template_bytes: u64,
+    pub per_node_bytes: u64,
+    /// Built for every template as it lands, and never evicted. The default
+    /// shape, what a create naming no resources asks for, is always among
+    /// them.
+    pub pinned: Vec<Shape>,
+    /// Creates of a shape with no snapshot before one is built for it.
+    pub demand: u32,
+}
+
+impl Default for WarmPolicy {
+    fn default() -> Self {
+        Self {
+            per_template: 4,
+            per_node: 16,
+            per_template_bytes: 8 << 30,
+            per_node_bytes: 32 << 30,
+            pinned: vec![Shape::wanted(&Default::default())],
+            demand: 1,
+        }
     }
+}
+
+impl WarmPolicy {
+    pub fn is_pinned(&self, shape: Shape) -> bool {
+        self.pinned.iter().any(|pinned| pinned.is_machine(shape))
+    }
+
+    /// Which of `entries` to evict, least recently used first, so that every
+    /// template and then the node fit their caps. Pinned shapes count against
+    /// the caps and are never chosen.
+    pub fn evictions(&self, entries: &[(String, Warm)]) -> Vec<usize> {
+        let mut order: Vec<usize> = (0..entries.len())
+            .filter(|&index| !self.is_pinned(entries[index].1.shape))
+            .collect();
+        order.sort_by_key(|&index| entries[index].1.used_at);
+        let mut evicted = std::collections::HashSet::new();
+
+        let mut templates: Vec<&str> = entries.iter().map(|(name, _)| name.as_str()).collect();
+        templates.sort_unstable();
+        templates.dedup();
+        for template in templates {
+            let kept = |evicted: &std::collections::HashSet<usize>| {
+                entries
+                    .iter()
+                    .enumerate()
+                    .filter(|(index, (name, _))| name == template && !evicted.contains(index))
+                    .fold((0, 0u64), |(count, bytes), (_, (_, warm))| {
+                        (count + 1, bytes + warm.bytes)
+                    })
+            };
+            for &index in order.iter().filter(|&&index| entries[index].0 == template) {
+                let (count, bytes) = kept(&evicted);
+                if count <= self.per_template && bytes <= self.per_template_bytes {
+                    break;
+                }
+                evicted.insert(index);
+            }
+        }
+
+        for &index in &order {
+            let (count, bytes) = entries
+                .iter()
+                .enumerate()
+                .filter(|(index, _)| !evicted.contains(index))
+                .fold((0, 0u64), |(count, bytes), (_, (_, warm))| {
+                    (count + 1, bytes + warm.bytes)
+                });
+            if count <= self.per_node && bytes <= self.per_node_bytes {
+                break;
+            }
+            evicted.insert(index);
+        }
+
+        let mut evicted: Vec<usize> = evicted.into_iter().collect();
+        evicted.sort_unstable();
+        evicted
+    }
+}
+
+/// One warm snapshot of a template, as found on disk.
+#[derive(Debug, Clone)]
+pub struct Warm {
+    pub dir: PathBuf,
+    pub hypervisor: Hypervisor,
+    pub shape: Shape,
+    /// Disk its files take, counting blocks a clone shares with the image.
+    pub bytes: u64,
+    /// Unix seconds of the last restore from it, or of its build.
+    pub used_at: i64,
+}
+
+impl Warm {
+    pub fn to_proto(&self, template: &str, policy: &WarmPolicy) -> common::WarmShape {
+        common::WarmShape {
+            template: template.to_string(),
+            resources: Some(common::ResourcePolicy {
+                vcpus: self.shape.vcpus,
+                mem_mib: self.shape.mem_mib,
+                disk_mib: self.shape.disk_mib,
+            }),
+            size_bytes: self.bytes,
+            last_used_at_unix_ms: self.used_at.saturating_mul(1000),
+            is_pinned: policy.is_pinned(self.shape),
+            node_id: String::new(),
+        }
+    }
+}
+
+/// The snapshot in `dir`, if it is complete and in the current format.
+async fn read_warm(dir: &Path) -> Option<Warm> {
+    use std::os::unix::fs::MetadataExt as _;
+
+    let hypervisor: Hypervisor = tokio::fs::read_to_string(dir.join(HYPERVISOR_FILE))
+        .await
+        .ok()?
+        .trim()
+        .parse()
+        .ok()?;
+    let format = tokio::fs::read_to_string(dir.join("format")).await.ok()?;
+    if !is_current_format(&format) {
+        return None;
+    }
+    let shape = Shape::parse(&tokio::fs::read_to_string(dir.join(SHAPE_FILE)).await.ok()?)?;
+    let mut bytes = 0;
+    for file in hypervisor.layout().files().chain([ROOT_DISK]) {
+        bytes += tokio::fs::metadata(dir.join(file)).await.ok()?.blocks() * 512;
+    }
+    if let Ok(plan) = tokio::fs::metadata(dir.join(PREFETCH_PLAN)).await {
+        bytes += plan.blocks() * 512;
+    }
+    let used_at = match tokio::fs::read_to_string(dir.join(USED_FILE)).await {
+        Ok(text) => text.trim().parse().ok(),
+        Err(_) => None,
+    };
+    let used_at = match used_at {
+        Some(at) => at,
+        None => tokio::fs::metadata(dir.join("format")).await.ok()?.mtime(),
+    };
+    Some(Warm {
+        dir: dir.to_path_buf(),
+        hypervisor,
+        shape,
+        bytes,
+        used_at,
+    })
 }
 
 pub fn warm_dir(templates_dir: &Path, template: &str) -> PathBuf {
     templates_dir.join(template).join(WARM_DIR)
 }
 
-/// Where a new snapshot is assembled before it replaces the live one.
+/// Where a new snapshot is assembled before it is published.
 ///
 /// Building in place would pull the snapshot out from under creates that
 /// already decided to restore from it and are about to link its files.
@@ -196,32 +371,90 @@ fn warm_staging_dir(templates_dir: &Path, template: &str) -> PathBuf {
     templates_dir.join(template).join(WARM_STAGING_DIR)
 }
 
-/// Whether `template` has a warm snapshot usable for `wanted`.
+/// The snapshot of `template` under `hypervisor` with `wanted`'s vCPUs and
+/// memory, whatever its disk.
 ///
-/// A snapshot of the wrong shape is *not* usable: restoring it would hand the
-/// caller a guest with different cpu and memory than they asked for.
-pub async fn is_warm_for(templates_dir: &Path, template: &str, wanted: Shape) -> bool {
-    is_warm(templates_dir, template).await
-        && warm_shape(templates_dir, template).await == Some(wanted)
+/// One of another machine is *not* usable: restoring it would hand the caller
+/// a guest with different cpu and memory than they asked for.
+pub async fn find(
+    templates_dir: &Path,
+    template: &str,
+    hypervisor: Hypervisor,
+    wanted: Shape,
+) -> Option<Warm> {
+    let dir = warm_dir(templates_dir, template).join(wanted.dir_name(hypervisor));
+    read_warm(&dir)
+        .await
+        .filter(|warm| warm.hypervisor == hypervisor && warm.shape.is_machine(wanted))
+}
+
+/// Every usable warm snapshot of `template`.
+pub async fn list(templates_dir: &Path, template: &str) -> Vec<Warm> {
+    let mut out = Vec::new();
+    let Ok(mut entries) = tokio::fs::read_dir(warm_dir(templates_dir, template)).await else {
+        return out;
+    };
+    while let Ok(Some(entry)) = entries.next_entry().await {
+        if let Some(warm) = read_warm(&entry.path()).await {
+            out.push(warm);
+        }
+    }
+    out.sort_by_key(|warm| (warm.shape.vcpus, warm.shape.mem_mib));
+    out
+}
+
+/// Every usable warm snapshot on the node, by template.
+pub async fn list_all(templates_dir: &Path) -> Vec<(String, Warm)> {
+    let mut out = Vec::new();
+    let Ok(mut templates) = tokio::fs::read_dir(templates_dir).await else {
+        return out;
+    };
+    while let Ok(Some(entry)) = templates.next_entry().await {
+        let name = entry.file_name().to_string_lossy().into_owned();
+        if name.starts_with('.') {
+            continue;
+        }
+        for warm in list(templates_dir, &name).await {
+            out.push((name.clone(), warm));
+        }
+    }
+    out
+}
+
+/// What under `template`'s warm directory cannot be restored: snapshots in an
+/// older format, the single snapshot of the layout before shapes, and pieces
+/// of either. Each comes with the shape it recorded, if it did, so it can be
+/// rebuilt in the current format.
+pub async fn stale(templates_dir: &Path, template: &str) -> Vec<(PathBuf, Option<Shape>)> {
+    let root = warm_dir(templates_dir, template);
+    if tokio::fs::try_exists(root.join("format"))
+        .await
+        .unwrap_or(false)
+    {
+        let shape = recorded_shape(&root).await;
+        return vec![(root, shape)];
+    }
+    let mut out = Vec::new();
+    let Ok(mut entries) = tokio::fs::read_dir(&root).await else {
+        return out;
+    };
+    while let Ok(Some(entry)) = entries.next_entry().await {
+        let path = entry.path();
+        if read_warm(&path).await.is_none() {
+            let shape = recorded_shape(&path).await;
+            out.push((path, shape));
+        }
+    }
+    out
+}
+
+async fn recorded_shape(dir: &Path) -> Option<Shape> {
+    Shape::parse(&tokio::fs::read_to_string(dir.join(SHAPE_FILE)).await.ok()?)
 }
 
 /// Whether `template` has a usable warm snapshot at all, whatever its shape.
 pub async fn is_warm(templates_dir: &Path, template: &str) -> bool {
-    let dir = warm_dir(templates_dir, template);
-    let Some(hypervisor) = warm_hypervisor(&dir).await else {
-        return false;
-    };
-    let layout = hypervisor.layout();
-    for file in layout.files().chain([ROOT_DISK]) {
-        if !tokio::fs::try_exists(dir.join(file)).await.unwrap_or(false) {
-            return false;
-        }
-    }
-    // A snapshot in another format is rebuilt rather than restored.
-    matches!(
-        tokio::fs::read_to_string(dir.join("format")).await,
-        Ok(version) if is_current_format(&version)
-    )
+    !list(templates_dir, template).await.is_empty()
 }
 
 /// Files a sandbox needs in its working directory to restore from warm.
@@ -231,15 +464,13 @@ pub async fn is_warm(templates_dir: &Path, template: &str) -> bool {
 pub async fn stage_from_warm(
     templates_dir: &Path,
     template: &str,
+    snapshot: &Warm,
     workdir: &Path,
 ) -> std::io::Result<()> {
     let began = std::time::Instant::now();
-    let warm = warm_dir(templates_dir, template);
+    let warm = &snapshot.dir;
     let template_dir = templates_dir.join(template);
-    let layout = warm_hypervisor(&warm)
-        .await
-        .ok_or_else(|| std::io::Error::other("the warm snapshot names no known hypervisor"))?
-        .layout();
+    let layout = snapshot.hypervisor.layout();
 
     tokio::fs::create_dir_all(workdir).await?;
     let linked = [
@@ -268,6 +499,9 @@ pub async fn stage_from_warm(
     // The one file that must not be shared.
     let before_disk = std::time::Instant::now();
     crate::rootdisk::clone(&warm.join(ROOT_DISK), &workdir.join(ROOT_DISK)).await?;
+    // Best effort: a snapshot whose use went unrecorded is only evicted a
+    // little sooner than it should be.
+    let _ = tokio::fs::write(warm.join(USED_FILE), burrow_common::unix_now().to_string()).await;
     tracing::debug!(
         template,
         link_ms = (linked - began).as_millis() as u64,
@@ -293,7 +527,7 @@ pub async fn build_warm_snapshot(
     template: &str,
     shape: Shape,
     trust: &Trust,
-) -> Result<u64, Status> {
+) -> Result<Warm, Status> {
     let templates_dir = config.templates_dir();
     let agent_timeout = config.agent_timeout;
     // Defence in depth: the name becomes a directory under `templates_dir` and
@@ -327,7 +561,7 @@ pub async fn build_warm_snapshot(
     // Assembled beside the live snapshot and swapped in at the end. Rebuilding
     // in place would delete the files out from under a create that has already
     // decided to restore from them.
-    let live = warm_dir(&templates_dir, template);
+    let live = warm_dir(&templates_dir, template).join(shape.dir_name(hypervisor));
     let dir = warm_staging_dir(&templates_dir, template);
     let _ = tokio::fs::remove_dir_all(&dir).await;
     tokio::fs::create_dir_all(&dir)
@@ -445,6 +679,9 @@ pub async fn build_warm_snapshot(
             tokio::fs::write(dir.join(HYPERVISOR_FILE), hypervisor.as_str())
                 .await
                 .map_err(|err| Status::internal(format!("recording warm hypervisor: {err}")))?;
+            tokio::fs::write(dir.join(USED_FILE), burrow_common::unix_now().to_string())
+                .await
+                .map_err(|err| Status::internal(format!("recording warm use: {err}")))?;
             // Everything on the disk before the marker, and the marker before
             // the swap: every create restores from this snapshot, so one torn
             // by a power cut would corrupt every guest made from it.
@@ -457,29 +694,33 @@ pub async fn build_warm_snapshot(
             crate::fsync::files_then_dir(&dir, vec!["format".into()])
                 .await
                 .map_err(|err| Status::internal(format!("syncing the warm marker: {err}")))?;
-            let size = match hypervisor.layout().memory {
-                Some(memory) => tokio::fs::metadata(dir.join(memory))
-                    .await
-                    .map(|m| m.len())
-                    .unwrap_or(0),
-                None => 0,
-            };
-
             // The swap. Creates staging from the old snapshot hold open file
             // handles or link its inodes; the window where neither directory
             // is in place is a rename apart, rather than a whole build long.
+            let parent = warm_dir(&templates_dir, template);
+            tokio::fs::create_dir_all(&parent)
+                .await
+                .map_err(|err| Status::internal(format!("warm dir: {err}")))?;
             let _ = tokio::fs::remove_dir_all(&live).await;
             tokio::fs::rename(&dir, &live)
                 .await
                 .map_err(|err| Status::internal(format!("publishing the warm snapshot: {err}")))?;
-            if let Some(parent) = live.parent()
-                && let Err(err) = crate::fsync::dir(parent).await
-            {
+            if let Err(err) = crate::fsync::dir(&parent).await {
                 tracing::warn!(template, %err, "could not sync the warm snapshot's rename");
             }
 
-            tracing::info!(template, size, "warm snapshot ready");
-            Ok(size)
+            let warm = read_warm(&live).await.ok_or_else(|| {
+                Status::internal("the published warm snapshot does not read back")
+            })?;
+            tracing::info!(
+                template,
+                vcpus = shape.vcpus,
+                mem_mib = shape.mem_mib,
+                disk_mib = shape.disk_mib,
+                bytes = warm.bytes,
+                "warm snapshot ready"
+            );
+            Ok(warm)
         }
         Err(err) => {
             // A partial warm snapshot would be picked up by the next create.
@@ -785,16 +1026,226 @@ mod shape_tests {
         }
     }
 
-    /// Snapshots from before root disks hold an overlay in their guest's
-    /// memory, and are rebuilt rather than restored.
+    /// Snapshots from before shapes had directories of their own are
+    /// rebuilt in the new layout rather than restored.
     #[test]
     fn only_the_current_format_is_warm() {
-        assert_eq!(WARM_FORMAT, "5");
-        assert!(is_current_format("5"));
-        assert!(is_current_format("5\n"));
-        for old in ["", "1", "2", "3", "4", "6"] {
+        assert_eq!(WARM_FORMAT, "6");
+        assert!(is_current_format("6"));
+        assert!(is_current_format("6\n"));
+        for old in ["", "1", "2", "3", "4", "5", "7"] {
             assert!(!is_current_format(old), "{old:?} should be rebuilt");
         }
+    }
+
+    #[test]
+    fn a_pre_warmed_shape_parses_from_its_flag() {
+        assert_eq!(
+            parse_shape("2x2048"),
+            Ok(Shape {
+                vcpus: 2,
+                mem_mib: 2048,
+                disk_mib: 0,
+            })
+        );
+        for bad in ["", "2", "2x", "x2048", "2x2048x1", "twox2048", "2*2048"] {
+            assert!(parse_shape(bad).is_err(), "{bad:?} should not parse");
+        }
+    }
+
+    /// Two shapes of one template live side by side, and the disk is not
+    /// part of where either is kept.
+    #[test]
+    fn each_shape_has_a_directory_of_its_own() {
+        let shape = |vcpus, mem_mib, disk_mib| Shape {
+            vcpus,
+            mem_mib,
+            disk_mib,
+        };
+        assert_eq!(
+            shape(2, 2048, 1324).dir_name(Hypervisor::Firecracker),
+            "firecracker-2x2048"
+        );
+        assert_eq!(
+            shape(2, 2048, 4096).dir_name(Hypervisor::Firecracker),
+            shape(2, 2048, 1324).dir_name(Hypervisor::Firecracker)
+        );
+        assert_ne!(
+            shape(2, 2048, 0).dir_name(Hypervisor::CloudHypervisor),
+            shape(2, 2048, 0).dir_name(Hypervisor::Firecracker)
+        );
+        assert_ne!(
+            shape(4, 2048, 0).dir_name(Hypervisor::Firecracker),
+            shape(2, 2048, 0).dir_name(Hypervisor::Firecracker)
+        );
+    }
+
+    fn entry(template: &str, vcpus: u32, mem_mib: u32, bytes: u64, used_at: i64) -> (String, Warm) {
+        (
+            template.to_string(),
+            Warm {
+                dir: PathBuf::new(),
+                hypervisor: Hypervisor::Firecracker,
+                shape: Shape {
+                    vcpus,
+                    mem_mib,
+                    disk_mib: 1324,
+                },
+                bytes,
+                used_at,
+            },
+        )
+    }
+
+    fn policy(per_template: usize, per_node: usize) -> WarmPolicy {
+        WarmPolicy {
+            per_template,
+            per_node,
+            per_template_bytes: u64::MAX,
+            per_node_bytes: u64::MAX,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn the_least_recently_used_shape_is_evicted_first() {
+        let entries = [
+            entry("app", 2, 1024, 1, 300),
+            entry("app", 2, 2048, 1, 100),
+            entry("app", 4, 4096, 1, 200),
+        ];
+        assert_eq!(policy(2, 16).evictions(&entries), vec![1]);
+        assert_eq!(policy(1, 16).evictions(&entries), vec![1, 2]);
+        assert!(policy(3, 16).evictions(&entries).is_empty());
+    }
+
+    /// The default shape is what a create naming nothing asks for, so it
+    /// stays however long ago it was last restored.
+    #[test]
+    fn a_pinned_shape_is_never_evicted() {
+        let entries = [
+            entry("app", 1, 512, 1, 0),
+            entry("app", 2, 2048, 1, 100),
+            entry("app", 4, 4096, 1, 200),
+        ];
+        assert_eq!(policy(2, 16).evictions(&entries), vec![1]);
+        // Even past a cap only pinned shapes would meet.
+        let mut pinned = policy(0, 16);
+        pinned.pinned.push(parse_shape("4x4096").unwrap());
+        assert_eq!(pinned.evictions(&entries), vec![1]);
+    }
+
+    #[test]
+    fn the_node_cap_evicts_across_templates() {
+        let entries = [
+            entry("app", 2, 1024, 1, 100),
+            entry("db", 2, 1024, 1, 50),
+            entry("db", 4, 1024, 1, 400),
+            entry("web", 2, 1024, 1, 300),
+        ];
+        assert_eq!(policy(4, 2).evictions(&entries), vec![0, 1]);
+    }
+
+    #[test]
+    fn the_disk_caps_evict_until_the_rest_fits() {
+        let entries = [
+            entry("app", 2, 1024, 600, 100),
+            entry("app", 2, 2048, 600, 200),
+            entry("db", 2, 1024, 600, 300),
+        ];
+        let mut by_template = policy(16, 16);
+        by_template.per_template_bytes = 1000;
+        assert_eq!(by_template.evictions(&entries), vec![0]);
+        let mut by_node = policy(16, 16);
+        by_node.per_node_bytes = 1000;
+        assert_eq!(by_node.evictions(&entries), vec![0, 1]);
+    }
+
+    fn temp(name: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "burrow-warm-{name}-{}",
+            uuid::Uuid::new_v4().simple()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    fn write_snapshot(dir: &Path, format: &str, shape: &str) {
+        std::fs::create_dir_all(dir).unwrap();
+        for file in Hypervisor::Firecracker.layout().files().chain([ROOT_DISK]) {
+            std::fs::write(dir.join(file), b"x").unwrap();
+        }
+        std::fs::write(dir.join(HYPERVISOR_FILE), "firecracker").unwrap();
+        std::fs::write(dir.join(SHAPE_FILE), shape).unwrap();
+        std::fs::write(dir.join("format"), format).unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_create_finds_only_its_own_machine() {
+        let templates = temp("find");
+        let warm = warm_dir(&templates, "app");
+        write_snapshot(&warm.join("firecracker-2x2048"), WARM_FORMAT, "2 2048 1324");
+        write_snapshot(&warm.join("firecracker-1x512"), WARM_FORMAT, "1 512 1324");
+        std::fs::write(warm.join("firecracker-2x2048").join(USED_FILE), "1234").unwrap();
+
+        let wanted = |vcpus, mem_mib| Shape {
+            vcpus,
+            mem_mib,
+            disk_mib: 4096,
+        };
+        let found = find(&templates, "app", Hypervisor::Firecracker, wanted(2, 2048))
+            .await
+            .unwrap();
+        assert_eq!(found.shape.disk_mib, 1324);
+        assert_eq!(found.used_at, 1234);
+        assert!(
+            find(&templates, "app", Hypervisor::Firecracker, wanted(4, 2048))
+                .await
+                .is_none()
+        );
+        assert!(
+            find(
+                &templates,
+                "app",
+                Hypervisor::CloudHypervisor,
+                wanted(2, 2048)
+            )
+            .await
+            .is_none()
+        );
+        assert_eq!(list(&templates, "app").await.len(), 2);
+        assert!(stale(&templates, "app").await.is_empty());
+        let _ = std::fs::remove_dir_all(&templates);
+    }
+
+    /// A snapshot of the layout before shapes, and one of an older format,
+    /// are discarded with the shapes they recorded so they can be rebuilt.
+    #[tokio::test]
+    async fn older_snapshots_are_stale_with_their_shapes() {
+        let templates = temp("stale");
+        let warm = warm_dir(&templates, "flat");
+        write_snapshot(&warm, "5", "2 1024 1324");
+        assert_eq!(
+            stale(&templates, "flat").await,
+            vec![(
+                warm.clone(),
+                Some(Shape {
+                    vcpus: 2,
+                    mem_mib: 1024,
+                    disk_mib: 1324,
+                })
+            )]
+        );
+        assert!(list(&templates, "flat").await.is_empty());
+
+        let warm = warm_dir(&templates, "app");
+        write_snapshot(&warm.join("firecracker-1x512"), WARM_FORMAT, "1 512 1324");
+        write_snapshot(&warm.join("firecracker-4x4096"), "5", "4 4096 1324");
+        let found = stale(&templates, "app").await;
+        assert_eq!(found.len(), 1);
+        assert_eq!(found[0].0, warm.join("firecracker-4x4096"));
+        assert_eq!(found[0].1.map(|shape| shape.vcpus), Some(4));
+        let _ = std::fs::remove_dir_all(&templates);
     }
 
     /// The bug this exists to prevent: a caller asking for more memory than
@@ -810,6 +1261,6 @@ mod shape_tests {
             mem_mib: 2048,
             ..Default::default()
         });
-        assert_ne!(snapshot, asked);
+        assert!(!snapshot.is_machine(asked));
     }
 }

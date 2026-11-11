@@ -61,7 +61,7 @@ export interface BuildResult {
 export interface TemplateInfo {
   name: string;
   sizeBytes: number;
-  /** True when creates from this template restore a snapshot instead of booting. */
+  /** True when it has a warm snapshot at some shape: creates asking for that vCPU and memory size restore it instead of booting. */
   warm: boolean;
   /** Imported from Sandbox Kits: creates run their lifecycle. */
   kit: boolean;

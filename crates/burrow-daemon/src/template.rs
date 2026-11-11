@@ -176,6 +176,7 @@ async fn scan(data_dir: &Path) -> Vec<(api::TemplateInfo, bool)> {
             name,
             size_bytes: meta.len(),
             is_warm: warm,
+            warm_shapes: Vec::new(),
             is_kit: environment.kit.is_some(),
             is_systemd: environment.systemd,
             guest_os,
@@ -304,7 +305,7 @@ pub async fn build(
     //
     // Whoever just built a template is about to create from it, and a template
     // with no snapshot cold-boots.
-    manager.warm_in_background(published, Default::default());
+    manager.warm_template(&published);
 }
 
 #[allow(clippy::too_many_arguments)]
