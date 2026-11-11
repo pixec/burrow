@@ -2001,12 +2001,7 @@ impl Burrow for ApiService {
         // before anything is built.
         burrow_common::tags::validate_labels(&req.node_labels)?;
         self.require_labels(&node_id, &req.node_labels)?;
-        let child_id = if req.sandbox_id.is_empty() {
-            burrow_common::SandboxId::generate().to_string()
-        } else {
-            validate_sandbox_id(&req.sandbox_id)?;
-            req.sandbox_id
-        };
+        let child_id = burrow_common::SandboxId::generate().to_string();
         // Resolved for the child, which carries its source's tags: a scope
         // naming the source does not reach a fork of it.
         if let Some(network) = req.policy.as_mut().and_then(|p| p.network.as_mut()) {
@@ -3768,6 +3763,32 @@ mod tests {
                 .is_ok()
         );
         assert!(api.other_roots("sandbox sbx_a", "cccc", None).is_err());
+    }
+
+    /// The request names the source, never the child: a fork of `sbx_a`, by
+    /// id or by name, is not refused as a second `sbx_a` and goes on to the
+    /// source's node, which a test has no way to reach.
+    #[tokio::test]
+    async fn a_fork_names_its_source_not_its_child() {
+        let api = offering(&[("node1", &["firecracker"])]);
+        api.0.sandboxes.insert(common::Sandbox {
+            id: "sbx_a".into(),
+            name: "web".into(),
+            node_id: "node1".into(),
+            state: common::SandboxState::Running as i32,
+            ..Default::default()
+        });
+        for source in ["sbx_a", "web"] {
+            let err = api
+                .fork_sandbox(Request::new(api::ForkSandboxRequest {
+                    sandbox_id: source.into(),
+                    ..Default::default()
+                }))
+                .await
+                .unwrap_err();
+            assert_ne!(err.code(), tonic::Code::AlreadyExists, "{source}: {err}");
+            assert_ne!(err.code(), tonic::Code::InvalidArgument, "{source}: {err}");
+        }
     }
 
     /// A move that failed at its target leaves the sandbox unplaced in the
