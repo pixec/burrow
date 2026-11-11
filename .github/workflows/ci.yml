@@ -54,7 +54,8 @@ jobs:
   # so there are two ways to drift: the copies, checked above, and the
   # generated modules, checked here.
   python-sdk:
-    runs-on: ubuntu-latest
+    # ubuntu-latest is 26.04, which has no Python 3.9 build.
+    runs-on: ubuntu-24.04
     defaults:
       run:
         working-directory: sdk/python
