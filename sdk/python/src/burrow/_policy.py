@@ -21,6 +21,7 @@ from .errors import BurrowError
 from .types import (
     ExecPolicy,
     FsPolicy,
+    IngressRule,
     LifetimePolicy,
     NetworkMembership,
     NetworkPolicy,
@@ -36,6 +37,7 @@ T = TypeVar("T")
 
 _MODES = ("none", "allowlist", "open")
 _PROTOCOLS = {"any": "UNSPECIFIED", "tcp": "TCP", "udp": "UDP"}
+_INGRESS_PROTOCOLS = {"any": "UNSPECIFIED", "tcp": "TCP", "udp": "UDP", "icmp": "ICMP"}
 _MATCH_KEYS = {"path", "method", "query_string", "headers"}
 _FORWARD_KEYS = {"url", "secret"}
 
@@ -78,6 +80,9 @@ def network_policy(network: Any) -> NetworkPolicy:
     policy.deny_ports = [
         _port_rule(index, rule) for index, rule in enumerate(policy.deny_ports)
     ]
+    policy.ingress = [
+        _ingress_rule(index, rule) for index, rule in enumerate(policy.ingress)
+    ]
     policy.rules = [_request_rule(rule) for rule in policy.rules]
     return policy
 
@@ -93,6 +98,36 @@ def _port_rule(index: int, rule: Any) -> PortRule:
     if not isinstance(rule.port, int) or isinstance(rule.port, bool):
         raise BurrowError(f"{where}: port is an integer", "invalid_argument")
     return rule
+
+
+def _ingress_rule(index: int, rule: Any) -> IngressRule:
+    where = f"network_policy.ingress[{index}]"
+    rule = as_section(IngressRule, where, rule)
+    if rule.protocol not in _INGRESS_PROTOCOLS:
+        raise BurrowError(
+            f"{where}: unknown protocol {rule.protocol!r}; one of tcp, udp, icmp, any",
+            "invalid_argument",
+        )
+    for entry in rule.ports:
+        if isinstance(entry, bool) or not re.fullmatch(r"(\d+)(?:-(\d+))?", str(entry)):
+            raise BurrowError(f"{where}: port {entry!r} is not N or N-M", "invalid_argument")
+    return rule
+
+
+def _to_port_range(entry: Union[int, str]) -> common_pb2.PortRange:
+    first, _, last = str(entry).partition("-")
+    return common_pb2.PortRange(port=int(first), port_end=int(last) if last else 0)
+
+
+def _from_ingress_rule(raw: common_pb2.IngressRule) -> IngressRule:
+    return IngressRule(
+        protocol=label(common_pb2.IngressProtocol, raw.protocol, "INGRESS_PROTOCOL_") or "any",
+        ports=[
+            f"{entry.port}-{entry.port_end}" if entry.port_end else entry.port
+            for entry in raw.ports
+        ],
+        sources=list(raw.sources),
+    )
 
 
 def _request_rule(rule: Any) -> RequestRule:
@@ -263,6 +298,16 @@ def to_network_policy(policy: NetworkPolicy) -> common_pb2.NetworkPolicy:
             for rule in policy.deny_ports
         ],
         is_ipv6_denied=policy.deny_ipv6,
+        ingress=[
+            common_pb2.IngressRule(
+                protocol=getattr(
+                    common_pb2, f"INGRESS_PROTOCOL_{_INGRESS_PROTOCOLS[rule.protocol]}"
+                ),
+                ports=[_to_port_range(entry) for entry in rule.ports],
+                sources=rule.sources,
+            )
+            for rule in policy.ingress
+        ],
         is_tls_inspected=policy.inspect_tls,
         rules=[_to_request_rule(rule) for rule in policy.rules],
     )
@@ -286,6 +331,7 @@ def from_network_policy(raw: common_pb2.NetworkPolicy) -> NetworkPolicy:
             for rule in raw.deny_ports
         ],
         deny_ipv6=raw.is_ipv6_denied,
+        ingress=[_from_ingress_rule(rule) for rule in raw.ingress],
         inspect_tls=raw.is_tls_inspected,
         rules=[_from_request_rule(rule) for rule in raw.rules],
     )

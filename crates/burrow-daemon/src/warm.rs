@@ -586,6 +586,7 @@ async fn exercise_agent(
                 ip6: lease.guest_ip6().to_string(),
                 prefix_len6: lease.prefix_len6() as u32,
                 gateway6: lease.host_ip6().to_string(),
+                public_addresses: Vec::new(),
             }),
             trust.ca.clone(),
             trust.bundles.clone(),

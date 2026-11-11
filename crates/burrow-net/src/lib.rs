@@ -10,12 +10,13 @@ pub mod ipam;
 pub mod mesh;
 pub mod pinning;
 pub mod policy;
+pub mod public;
 pub mod tap;
 pub mod transparent;
 #[cfg(feature = "usernet")]
 pub mod usernet;
 
 pub use error::{NetError, Result};
-pub use firewall::{Mode, PortMap, Protocol, SandboxRules};
+pub use firewall::{IngressState, Mode, PortMap, Protocol, Public, SandboxRules};
 pub use ipam::{Ipam, Lease};
 pub use mesh::{MESH_INTERFACE, Peer};

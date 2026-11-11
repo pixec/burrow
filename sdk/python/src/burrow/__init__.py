@@ -8,6 +8,7 @@ from ._pathlib import SandboxPath
 from ._subprocess import Popen
 from .client import Burrow
 from .errors import BurrowError
+from .ip import Ips
 from .sandbox import Sandbox, Watcher
 from .snapshot import Snapshot
 from .template import BuildLogEvent, Template, TemplateBuilder, default_build_logger
@@ -25,6 +26,8 @@ from .types import (
     GuestGroup,
     GuestUser,
     Health,
+    IngressRule,
+    IpPool,
     LifecycleEvent,
     LifetimePolicy,
     NetworkMembership,
@@ -33,6 +36,7 @@ from .types import (
     PortMapping,
     PortRule,
     PrunedCommands,
+    PublicIp,
     RequestRule,
     ResourcePolicy,
     SandboxInfo,
@@ -70,6 +74,9 @@ __all__ = [
     "GuestGroup",
     "GuestUser",
     "Health",
+    "IngressRule",
+    "IpPool",
+    "Ips",
     "LifecycleEvent",
     "LifetimePolicy",
     "NetworkMembership",
@@ -79,6 +86,7 @@ __all__ = [
     "PortMapping",
     "PortRule",
     "PrunedCommands",
+    "PublicIp",
     "RequestRule",
     "ResourcePolicy",
     "Sandbox",

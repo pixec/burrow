@@ -482,6 +482,10 @@ pub struct SandboxPolicy {
     /// fills this in and updates it in place; `None`, as in a policy built by
     /// hand, means `rules` is all there is.
     pub live_rules: Option<Arc<LiveRules>>,
+    /// Put on this sandbox's upstream sockets so the node translates them to
+    /// its public address and routes them out of that address's uplink. 0
+    /// for a sandbox with none, which leaves from the node's own.
+    pub egress_mark: u32,
 }
 
 impl SandboxPolicy {
@@ -517,6 +521,7 @@ impl SandboxPolicy {
             ),
             rules: Arc::new(Vec::new()),
             live_rules: None,
+            egress_mark: 0,
         }
     }
 }

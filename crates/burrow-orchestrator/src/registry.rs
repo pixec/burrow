@@ -179,6 +179,9 @@ pub fn policy_features(network: Option<&common::NetworkPolicy>) -> Vec<&'static 
     if network.is_tls_inspected && network.mode == common::NetworkMode::Open as i32 {
         used.push(features::OPEN_INSPECTION);
     }
+    if !network.ingress.is_empty() {
+        used.push(features::INGRESS);
+    }
     used
 }
 
@@ -1468,10 +1471,18 @@ mod tests {
                 ..Default::default()
             }],
             is_ipv6_denied: true,
+            ingress: vec![common::IngressRule::default()],
             ..Default::default()
         };
         let used = policy_features(Some(&network));
-        assert_eq!(used, features::ALL);
+        assert_eq!(
+            used,
+            features::ALL
+                .iter()
+                .copied()
+                .filter(|f| *f != features::PUBLIC_IPS)
+                .collect::<Vec<_>>()
+        );
         let want = Placement {
             template: "t".into(),
             vcpus: 1,

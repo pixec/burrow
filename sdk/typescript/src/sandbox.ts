@@ -3,6 +3,7 @@ import { withClient } from "./client.js";
 import { BurrowError } from "./errors.js";
 import { SandboxFs } from "./fs.js";
 import type { GuestLink } from "./guest.js";
+import { toPublicIp } from "./ip.js";
 import {
   fromPolicy,
   resolveNetwork,
@@ -36,6 +37,7 @@ import type {
   MoveOptions,
   NetworkInput,
   PortMapping,
+  PublicIp,
   RecreateOptions,
   SandboxInfo,
   SandboxState,
@@ -88,6 +90,8 @@ export function toSandboxInfo(raw: any): SandboxInfo {
     hypervisor: raw.hypervisor ?? "",
     hypervisorVersion: raw.hypervisorVersion ?? "",
     guestOs: raw.guestOs ?? "",
+    publicIps: (raw.publicIps ?? []).map(toPublicIp),
+    ipv6Address: raw.ipv6Address ?? "",
   };
 }
 
@@ -270,6 +274,7 @@ export class Sandbox {
       tags: options.tags ?? {},
       nodeLabels: options.nodeLabels ?? {},
       kit: toKitSpec(options.kit),
+      publicIps: options.publicIps ?? [],
     };
   }
 
@@ -817,6 +822,22 @@ export class Sandbox {
   /** Replaces the sandbox's tags. An empty map clears them. */
   updateTags(tags: Record<string, string>, options: CallOptions = {}): Promise<SandboxInfo> {
     return this.mutate("UpdateTags", { sandboxId: this.id, tags }, options);
+  }
+
+  /** Routes an allocated public IP to this sandbox. */
+  async attachIp(address: string, options: CallOptions = {}): Promise<PublicIp> {
+    const ip = toPublicIp(
+      await this.call<any>("AttachIp", { address, sandboxId: this.id }, options),
+    );
+    await this.refresh(options);
+    return ip;
+  }
+
+  /** Takes a public IP off this sandbox, keeping it allocated. */
+  async detachIp(address: string, options: CallOptions = {}): Promise<PublicIp> {
+    const ip = toPublicIp(await this.call<any>("DetachIp", { address }, options));
+    await this.refresh(options);
+    return ip;
   }
 
   /**

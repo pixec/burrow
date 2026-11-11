@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from datetime import datetime
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Union
 
 
 @dataclass
@@ -105,6 +105,21 @@ class PortRule:
 
 
 @dataclass
+class IngressRule:
+    """One door into a sandbox's public addresses: its dedicated IPs and its
+    global IPv6 address. Nothing is admitted without a rule.
+
+    ``protocol`` is ``"tcp"``, ``"udp"``, ``"icmp"`` (echo, no ports) or
+    ``"any"`` (TCP and UDP). ``ports`` holds ports and ``"N-M"`` ranges; empty
+    is every port. ``sources`` are CIDRs of either family; empty is anyone.
+    """
+
+    protocol: str = "any"
+    ports: List[Union[int, str]] = field(default_factory=list)
+    sources: List[str] = field(default_factory=list)
+
+
+@dataclass
 class NetworkPolicy:
     mode: str = "none"
     allow_domains: List[str] = field(default_factory=list)
@@ -114,6 +129,7 @@ class NetworkPolicy:
     deny_ports: List[PortRule] = field(default_factory=list)
     # Refuse every IPv6 destination, in every mode.
     deny_ipv6: bool = False
+    ingress: List[IngressRule] = field(default_factory=list)
     inspect_tls: bool = False
     rules: List[RequestRule] = field(default_factory=list)
 
@@ -167,6 +183,70 @@ class SandboxInfo:
     hypervisor_version: str = ""
     arch: str = ""
     guest_os: str = ""
+    # Dedicated public addresses attached to it.
+    public_ips: List["PublicIp"] = field(default_factory=list)
+    # Its own global IPv6 address from its node's routed prefix; "" for none.
+    ipv6_address: str = ""
+
+
+@dataclass
+class PublicIp:
+    """A dedicated public address, as the orchestrator records it."""
+
+    address: str
+    # 4 or 6.
+    family: int
+    # The prefix routed to the sandbox: 32, or 128 or a subnet for IPv6.
+    prefix_len: int
+    pool: str
+    # "static", "ovh", "hetzner" or "bgp".
+    provider: str
+    # Whether it can follow its sandbox to another node.
+    movable: bool
+    # "allocated", or "quarantined" while a released address sits out.
+    state: str
+    # "" while detached.
+    sandbox_id: str
+    node_id: str
+    rdns: str
+    allocated_at: datetime
+    # None while detached.
+    attached_at: Optional[datetime]
+    # Set while a released address sits out its quarantine.
+    quarantined_until: Optional[datetime]
+
+
+@dataclass
+class IpPool:
+    """Where public addresses come from. Operator configuration.
+
+    One node (``node_id``) or every node carrying all of ``node_labels``.
+    IPv4 ``ranges`` as ``"first-last"`` and single ``addresses`` with their
+    ``gateway`` and its network's ``prefix_len``; or an IPv6 ``prefix6`` and
+    the share each sandbox gets, ``per_sandbox``. ``total`` and
+    ``allocated`` are read only.
+    """
+
+    name: str
+    node_id: str = ""
+    node_labels: Dict[str, str] = field(default_factory=dict)
+    provider: str = "static"
+    ranges: List[str] = field(default_factory=list)
+    addresses: List[str] = field(default_factory=list)
+    gateway: str = ""
+    prefix_len: int = 0
+    nameservers: List[str] = field(default_factory=list)
+    prefix6: str = ""
+    per_sandbox: int = 0
+    # The provider looks addresses up on the uplink, so the node answers for
+    # them there.
+    on_link: bool = False
+    allow_smtp: bool = False
+    wake_on_traffic: bool = False
+    # 0 is the orchestrator's default.
+    quarantine_secs: int = 0
+    total: int = 0
+    allocated: int = 0
 
 
 @dataclass
@@ -355,8 +435,8 @@ class LifecycleEvent:
     at: datetime
     sandbox_id: str
     # "created", "started", "agent_ready", "stopped", "destroyed",
-    # "snapshot_created", or "recovered" for each sandbox a node found on
-    # restart.
+    # "snapshot_created", "recovered" for each sandbox a node found on
+    # restart, or "ip_attached" and "ip_detached" with the address as detail.
     kind: str
     state: str
     # How a VM started ("boot", "restore", "resume") or stopped ("suspended",

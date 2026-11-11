@@ -38,6 +38,23 @@ pub struct NodeApi {
 }
 
 impl NodeApi {
+    /// The provider `ip` comes from, when this node holds its credentials.
+    fn provider(
+        &self,
+        ip: &common::PublicIp,
+    ) -> Result<std::sync::Arc<dyn crate::providers::Provider>, Status> {
+        self.sandboxes
+            .providers()
+            .get(ip.provider())
+            .ok_or_else(|| {
+                Status::failed_precondition(format!(
+                    "this node holds no credentials for the {} provider; give it \
+                     --ip-providers-file",
+                    ip.provider().label()
+                ))
+            })
+    }
+
     pub(crate) fn node_id(&self) -> String {
         self.node_id.lock().unwrap().clone()
     }
@@ -962,6 +979,67 @@ impl NodeService for NodeApi {
             )
             .await?;
         Ok(Response::new(redact_secrets(sandbox)))
+    }
+
+    async fn attach_public_ip(
+        &self,
+        req: Request<nodepb::NodeAttachIpRequest>,
+    ) -> Result<Response<common::Sandbox>, Status> {
+        let req = req.into_inner();
+        let ip = req
+            .ip
+            .ok_or_else(|| Status::invalid_argument("no address to attach"))?;
+        let sandbox = self.sandboxes.attach_public_ip(&req.sandbox_id, ip).await?;
+        Ok(Response::new(redact_secrets(sandbox)))
+    }
+
+    async fn detach_public_ip(
+        &self,
+        req: Request<nodepb::NodeDetachIpRequest>,
+    ) -> Result<Response<common::Sandbox>, Status> {
+        let req = req.into_inner();
+        let sandbox = self
+            .sandboxes
+            .detach_public_ip(&req.sandbox_id, &req.address)
+            .await?;
+        Ok(Response::new(redact_secrets(sandbox)))
+    }
+
+    async fn route_public_ip(
+        &self,
+        req: Request<nodepb::NodeProviderRequest>,
+    ) -> Result<Response<nodepb::NodeProviderResponse>, Status> {
+        let ip = req.into_inner().ip.unwrap_or_default();
+        let provider = self.provider(&ip)?;
+        provider.route_here(&ip.address).await.map_err(|err| {
+            Status::unavailable(format!(
+                "{} could not route {}: {err}",
+                provider.name(),
+                ip.address
+            ))
+        })?;
+        tracing::info!(
+            address = ip.address,
+            provider = provider.name(),
+            "provider routed an address here"
+        );
+        Ok(Response::new(nodepb::NodeProviderResponse {}))
+    }
+
+    async fn set_public_ip_rdns(
+        &self,
+        req: Request<nodepb::NodeProviderRequest>,
+    ) -> Result<Response<nodepb::NodeProviderResponse>, Status> {
+        let req = req.into_inner();
+        let ip = req.ip.unwrap_or_default();
+        let provider = self.provider(&ip)?;
+        provider
+            .set_rdns(&ip.address, &req.rdns)
+            .await
+            .map_err(|err| {
+                Status::failed_precondition(format!("reverse DNS for {}: {err}", ip.address))
+            })?;
+        Ok(Response::new(nodepb::NodeProviderResponse {}))
     }
 
     /// Replaces a sandbox's tags.
@@ -2155,6 +2233,16 @@ fn validate_network_policy(policy: &common::NetworkPolicy) -> Result<(), Status>
     for rule in &policy.deny_ports {
         validate_port_rule(rule).map_err(Status::invalid_argument)?;
     }
+    if policy.ingress.len() > burrow_net::policy::MAX_INGRESS_RULES {
+        return Err(Status::invalid_argument(format!(
+            "at most {} ingress rules ({} given)",
+            burrow_net::policy::MAX_INGRESS_RULES,
+            policy.ingress.len()
+        )));
+    }
+    for rule in &policy.ingress {
+        validate_ingress_rule(rule).map_err(Status::invalid_argument)?;
+    }
     for domain in &policy.deny_domains {
         if !is_host_glob(domain) {
             return Err(Status::invalid_argument(format!(
@@ -2258,6 +2346,47 @@ fn validate_port_rule(rule: &common::PortRule) -> Result<(), String> {
         if !is_ip_cidr(cidr) {
             return Err(format!(
                 "deny_ports cidr {cidr:?} is not an IPv4 or IPv6 CIDR"
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// Checks one ingress rule, for the same reason as [`validate_port_rule`].
+fn validate_ingress_rule(rule: &common::IngressRule) -> Result<(), String> {
+    let protocol = common::IngressProtocol::try_from(rule.protocol).map_err(|_| {
+        format!(
+            "ingress protocol {} is not tcp, udp, icmp or unspecified",
+            rule.protocol
+        )
+    })?;
+    let limit = burrow_net::policy::MAX_INGRESS_ENTRIES;
+    if rule.ports.len() > limit || rule.sources.len() > limit {
+        return Err(format!(
+            "at most {limit} ports and {limit} sources per ingress rule"
+        ));
+    }
+    if protocol == common::IngressProtocol::Icmp && !rule.ports.is_empty() {
+        return Err("an icmp ingress rule takes no ports".into());
+    }
+    for range in &rule.ports {
+        if !(1..=65535).contains(&range.port) {
+            return Err(format!(
+                "ingress port {} out of range (1..=65535)",
+                range.port
+            ));
+        }
+        if range.port_end != 0 && !(range.port..=65535).contains(&range.port_end) {
+            return Err(format!(
+                "ingress port_end {} must be 0 or between port {} and 65535",
+                range.port_end, range.port
+            ));
+        }
+    }
+    for source in &rule.sources {
+        if !is_ip_cidr(source) {
+            return Err(format!(
+                "ingress source {source:?} is not an IPv4 or IPv6 CIDR"
             ));
         }
     }

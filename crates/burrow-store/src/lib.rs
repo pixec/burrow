@@ -229,6 +229,20 @@ pub struct TombstoneRow {
     pub at: i64,
 }
 
+/// One allocated or quarantined public address.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct IpRow {
+    pub address: String,
+    pub pool: String,
+    pub owner: String,
+    /// A `burrow.common.v1.PublicIpState`.
+    pub state: i32,
+    /// Unix milliseconds a quarantined address may be taken again.
+    pub available_at_ms: i64,
+    /// Encoded `burrow.common.v1.PublicIp`.
+    pub record: Vec<u8>,
+}
+
 #[derive(Clone)]
 enum Db {
     Sqlite(SqlitePool),
@@ -1020,6 +1034,126 @@ impl Store {
 }
 
 impl Store {
+    pub async fn put_ip_pool(&self, name: &str, record: &[u8]) -> Result<()> {
+        on_pool!(self, pool => sqlx::query(
+            "INSERT INTO ip_pools (name, record) VALUES ($1, $2)
+             ON CONFLICT (name) DO UPDATE SET record=excluded.record",
+        )
+        .bind(name)
+        .bind(record)
+        .execute(pool)
+        .await
+        .map(drop))?;
+        Ok(())
+    }
+
+    pub async fn list_ip_pools(&self) -> Result<Vec<(String, Vec<u8>)>> {
+        let rows: Vec<(String, Vec<u8>)> = on_pool!(self, pool => sqlx::query_as(
+            "SELECT name, record FROM ip_pools ORDER BY name",
+        )
+        .fetch_all(pool)
+        .await)?;
+        Ok(rows)
+    }
+
+    pub async fn delete_ip_pool(&self, name: &str) -> Result<bool> {
+        let done = on_pool!(self, pool => sqlx::query("DELETE FROM ip_pools WHERE name=$1")
+            .bind(name)
+            .execute(pool)
+            .await
+            .map(|done| done.rows_affected()))?;
+        Ok(done > 0)
+    }
+
+    /// Takes `row.address` for its owner. False when another allocation, or a
+    /// quarantine still running at `now_ms`, holds it; a quarantine that has
+    /// run out is cleared first, in the same statement's race.
+    pub async fn claim_ip(&self, row: &IpRow, now_ms: i64) -> Result<bool> {
+        on_pool!(self, pool => sqlx::query(
+            "DELETE FROM public_ips WHERE address=$1 AND state=$2 AND available_at_ms <= $3",
+        )
+        .bind(&row.address)
+        .bind(burrow_proto::common::v1::PublicIpState::Quarantined as i64)
+        .bind(now_ms)
+        .execute(pool)
+        .await
+        .map(drop))?;
+        let done = on_pool!(self, pool => sqlx::query(
+            "INSERT INTO public_ips (address, pool, owner, state, available_at_ms, record)
+             VALUES ($1, $2, $3, $4, $5, $6) ON CONFLICT (address) DO NOTHING",
+        )
+        .bind(&row.address)
+        .bind(&row.pool)
+        .bind(&row.owner)
+        .bind(row.state as i64)
+        .bind(row.available_at_ms)
+        .bind(&row.record)
+        .execute(pool)
+        .await
+        .map(|done| done.rows_affected()))?;
+        Ok(done > 0)
+    }
+
+    /// Replaces an address's row.
+    pub async fn put_ip(&self, row: &IpRow) -> Result<()> {
+        on_pool!(self, pool => sqlx::query(
+            "INSERT INTO public_ips (address, pool, owner, state, available_at_ms, record)
+             VALUES ($1, $2, $3, $4, $5, $6)
+             ON CONFLICT (address) DO UPDATE SET pool=excluded.pool, owner=excluded.owner,
+             state=excluded.state, available_at_ms=excluded.available_at_ms, record=excluded.record",
+        )
+        .bind(&row.address)
+        .bind(&row.pool)
+        .bind(&row.owner)
+        .bind(row.state as i64)
+        .bind(row.available_at_ms)
+        .bind(&row.record)
+        .execute(pool)
+        .await
+        .map(drop))?;
+        Ok(())
+    }
+
+    pub async fn get_ip(&self, address: &str) -> Result<Option<IpRow>> {
+        Ok(self
+            .list_ips()
+            .await?
+            .into_iter()
+            .find(|row| row.address == address))
+    }
+
+    pub async fn list_ips(&self) -> Result<Vec<IpRow>> {
+        let rows: Vec<(String, String, String, i64, i64, Vec<u8>)> = on_pool!(self, pool => sqlx::query_as(
+            "SELECT address, pool, owner, state, available_at_ms, record FROM public_ips ORDER BY address",
+        )
+        .fetch_all(pool)
+        .await)?;
+        Ok(rows
+            .into_iter()
+            .map(
+                |(address, pool, owner, state, available_at_ms, record)| IpRow {
+                    address,
+                    pool,
+                    owner,
+                    state: state as i32,
+                    available_at_ms,
+                    record,
+                },
+            )
+            .collect())
+    }
+
+    pub async fn delete_ip(&self, address: &str) -> Result<()> {
+        on_pool!(self, pool => sqlx::query("DELETE FROM public_ips WHERE address=$1")
+            .bind(address)
+            .execute(pool)
+            .await
+            .map(drop))?;
+        Ok(())
+    }
+}
+
+impl Store {
     /// Records a node registering, choosing its address slice, and returns
     /// the slice.
     ///
@@ -1724,6 +1858,47 @@ static POSTGRES_MIGRATIONS: sqlx::migrate::Migrator = sqlx::migrate!("./migratio
 
 #[cfg(test)]
 mod tests {
+    fn ip(address: &str, owner: &str) -> IpRow {
+        IpRow {
+            address: address.into(),
+            pool: "rack-a".into(),
+            owner: owner.into(),
+            state: burrow_proto::common::v1::PublicIpState::Allocated as i32,
+            available_at_ms: 0,
+            record: vec![1, 2],
+        }
+    }
+
+    #[tokio::test]
+    async fn an_address_has_one_holder_and_waits_out_its_quarantine() {
+        let store = Store::open_in_memory().await.unwrap();
+        assert!(store.claim_ip(&ip("203.0.113.17", "a"), 0).await.unwrap());
+        assert!(!store.claim_ip(&ip("203.0.113.17", "b"), 0).await.unwrap());
+
+        let quarantined = IpRow {
+            state: burrow_proto::common::v1::PublicIpState::Quarantined as i32,
+            available_at_ms: 1_000,
+            ..ip("203.0.113.17", "a")
+        };
+        store.put_ip(&quarantined).await.unwrap();
+        assert!(!store.claim_ip(&ip("203.0.113.17", "b"), 999).await.unwrap());
+        assert!(
+            store
+                .claim_ip(&ip("203.0.113.17", "b"), 1_000)
+                .await
+                .unwrap()
+        );
+        assert_eq!(
+            store.get_ip("203.0.113.17").await.unwrap().unwrap().owner,
+            "b"
+        );
+
+        store.put_ip_pool("rack-a", b"pool").await.unwrap();
+        assert_eq!(store.list_ip_pools().await.unwrap().len(), 1);
+        assert!(store.delete_ip_pool("rack-a").await.unwrap());
+        store.delete_ip("203.0.113.17").await.unwrap();
+        assert!(store.list_ips().await.unwrap().is_empty());
+    }
 
     /// A database from before migrations is refused, not adopted: the
     /// baseline creates every table outright, so it fails on one that exists.

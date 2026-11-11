@@ -66,6 +66,29 @@ pub fn steps(
         ],
     ));
 
+    // Beside the private address and never chosen as a source on its own,
+    // so the gateway's resolver and private-network peers keep seeing the
+    // lease. Egress through the default route is translated to the first
+    // public address by the node.
+    for public in &config.public_addresses {
+        if let Ok(address) = public.address.parse::<Ipv4Addr>() {
+            let address = format!("address={address}");
+            out.push(step(
+                true,
+                &[
+                    "interface",
+                    "ipv4",
+                    "add",
+                    "address",
+                    &name,
+                    &address,
+                    "mask=255.255.255.255",
+                    "skipassource=true",
+                ],
+            ));
+        }
+    }
+
     let dns = if config.dns.is_empty() {
         "address=none".to_string()
     } else {
@@ -112,6 +135,15 @@ pub fn steps(
             true,
             &["interface", "ipv6", "add", "address", &iface, &address],
         ));
+        for public in &config.public_addresses {
+            if let Ok(address) = public.address.parse::<Ipv6Addr>() {
+                let address = format!("address={address}/128");
+                out.push(step(
+                    true,
+                    &["interface", "ipv6", "add", "address", &iface, &address],
+                ));
+            }
+        }
         if !config.gateway6.is_empty() {
             let nexthop = format!("nexthop={}", config.gateway6.parse::<Ipv6Addr>()?);
             out.push(step(
@@ -190,6 +222,38 @@ mod tests {
             lines.contains(
                 &"interface ipv6 add route prefix=::/0 interface=3 nexthop=fd00::1".into()
             )
+        );
+    }
+
+    #[test]
+    fn public_addresses_are_added_beside_the_private_ones() {
+        let config = NetworkConfig {
+            ip6: "fd00::2".into(),
+            prefix_len6: 64,
+            public_addresses: vec![
+                burrow_proto::guest::v1::PublicAddress {
+                    address: "203.0.113.17".into(),
+                    prefix_len: 32,
+                },
+                burrow_proto::guest::v1::PublicAddress {
+                    address: "2001:db8::1".into(),
+                    prefix_len: 128,
+                },
+            ],
+            ..config()
+        };
+        let lines: Vec<String> = steps(4, &config, &[])
+            .unwrap()
+            .iter()
+            .map(|step| step.args.join(" "))
+            .collect();
+        assert!(lines.contains(
+            &"interface ipv4 add address name=4 address=203.0.113.17 mask=255.255.255.255 skipassource=true"
+                .into()
+        ));
+        assert!(
+            lines
+                .contains(&"interface ipv6 add address interface=4 address=2001:db8::1/128".into())
         );
     }
 

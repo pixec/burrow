@@ -40,6 +40,19 @@ struct Args {
     /// tokens let a key be rotated without downtime.
     #[arg(long, env = "BURROW_API_KEY_FILE")]
     api_key_file: Option<std::path::PathBuf>,
+    /// File of operator tokens, one per line. Only these may create, change
+    /// and remove public IP pools, and they are accepted as API keys too.
+    /// Unset, every API key is an operator's.
+    #[arg(long, env = "BURROW_OPERATOR_KEY_FILE")]
+    operator_key_file: Option<std::path::PathBuf>,
+    /// Public IPs one credential may hold at once. Operators are not limited.
+    #[arg(long, default_value_t = 4, env = "BURROW_IP_QUOTA")]
+    ip_quota: u32,
+    /// Seconds a released public IP waits before it is allocated again, so it
+    /// does not inherit its last holder's blocklist entries at once. A pool
+    /// may set its own.
+    #[arg(long, default_value_t = 86_400, env = "BURROW_IP_QUARANTINE_SECS")]
+    ip_quarantine_secs: i64,
     /// The node-facing secret, shared with every node's --node-token.
     ///
     /// Used in both directions: nodes present it to register and heartbeat,
@@ -139,6 +152,8 @@ pub struct OrchestratorState {
     /// How long a node may go unheard before it must stop resuming durable
     /// sandboxes on its own say. 0 when nodes are never written off.
     pub sandbox_lease_secs: u32,
+    /// Who may manage address pools, and the limits on everyone else.
+    pub ips: api::ips::IpConfig,
 }
 
 #[derive(Clone)]
@@ -694,8 +709,10 @@ async fn main() -> anyhow::Result<()> {
 }
 
 async fn run(args: Args) -> anyhow::Result<()> {
-    let tokens =
+    let operator_tokens = burrow_common::auth::load_tokens(None, args.operator_key_file.as_deref());
+    let mut tokens =
         burrow_common::auth::load_tokens(args.api_key.as_deref(), args.api_key_file.as_deref());
+    tokens.extend(operator_tokens.iter().cloned());
     let auth = burrow_common::auth::TokenAuth::new(tokens.clone());
     if !auth.is_enabled() {
         tracing::warn!(
@@ -810,6 +827,11 @@ async fn run(args: Args) -> anyhow::Result<()> {
         channels: api::NodeChannels::default(),
         node_token: outbound_node_token,
         sandbox_lease_secs,
+        ips: api::ips::IpConfig {
+            operator_tokens,
+            quota: args.ip_quota,
+            quarantine_secs: args.ip_quarantine_secs.max(0),
+        },
     });
 
     tracing::info!(

@@ -207,6 +207,35 @@ pub struct ServeArgs {
     /// filesystem.
     #[arg(long, env = "BURROWD_DISK_RESERVE_MIB")]
     pub disk_reserve_mib: Option<u64>,
+    /// A routed IPv6 prefix, e.g. `2001:db8:100::/56`, from which every
+    /// sandbox here gets a global address of its own. Ingress to it is denied
+    /// unless the sandbox's policy admits it. Linux only.
+    #[arg(long, env = "BURROWD_IPV6_PREFIX")]
+    pub ipv6_prefix: Option<String>,
+    /// The prefix each sandbox is routed out of `--ipv6-prefix`: 64 or 128.
+    #[arg(long, default_value_t = 64, env = "BURROWD_IPV6_PER_SANDBOX")]
+    pub ipv6_per_sandbox: u8,
+    /// Answer NDP on the uplink for each sandbox's IPv6 prefix, for a
+    /// provider that looks addresses up there rather than routing the prefix
+    /// to this node.
+    #[arg(long = "ipv6-on-link", env = "BURROWD_IPV6_ON_LINK")]
+    pub is_ipv6_on_link: bool,
+    /// The interface public addresses arrive on. Unset uses the interface the
+    /// node reaches each pool's gateway through.
+    #[arg(long, env = "BURROWD_PUBLIC_INTERFACE")]
+    pub public_interface: Option<String>,
+    /// New inbound connections per second one sandbox's public addresses
+    /// accept before the rest are dropped; 0 is unlimited.
+    #[arg(long, default_value_t = 200, env = "BURROWD_INGRESS_NEW_PER_SEC")]
+    pub ingress_new_per_sec: u32,
+    /// Inbound kilobytes per second to one sandbox's public addresses before
+    /// packets are dropped; 0 is unlimited.
+    #[arg(long, default_value_t = 12_500, env = "BURROWD_INGRESS_KBYTES_PER_SEC")]
+    pub ingress_kbytes_per_sec: u32,
+    /// JSON credentials for address providers (`ovh`, `hetzner`), read at
+    /// startup and never sent to the orchestrator.
+    #[arg(long, env = "BURROWD_IP_PROVIDERS_FILE")]
+    pub ip_providers_file: Option<std::path::PathBuf>,
     /// OTLP collector to export traces and sandbox metrics to, e.g.
     /// `http://collector:4317`. Unset leaves tracing local to this node's logs.
     #[arg(long, env = "OTEL_EXPORTER_OTLP_ENDPOINT")]
@@ -522,6 +551,28 @@ fn offered_hypervisors(args: &ServeArgs) -> anyhow::Result<Vec<burrow_vmm::Hyper
     Ok(offered)
 }
 
+fn public_config(args: &ServeArgs) -> anyhow::Result<crate::publicip::PublicConfig> {
+    let mut config = crate::publicip::PublicConfig {
+        interface: args.public_interface.clone(),
+        new_per_sec: args.ingress_new_per_sec,
+        kbytes_per_sec: args.ingress_kbytes_per_sec,
+        providers: std::sync::Arc::new(crate::providers::Providers::load(
+            args.ip_providers_file.as_deref(),
+        )?),
+        ..Default::default()
+    };
+    if let Some(prefix) = &args.ipv6_prefix {
+        if !cfg!(target_os = "linux") {
+            anyhow::bail!(
+                "--ipv6-prefix needs a Linux node: a macOS node's userspace network has no \
+                 route a public address could arrive on"
+            );
+        }
+        config = config.with_ipv6(prefix, args.ipv6_per_sandbox, args.is_ipv6_on_link)?;
+    }
+    Ok(config)
+}
+
 fn local_node_info(args: &ServeArgs) -> anyhow::Result<NodeInfo> {
     let mut sys = sysinfo::System::new();
     sys.refresh_memory();
@@ -556,10 +607,17 @@ fn local_node_info(args: &ServeArgs) -> anyhow::Result<NodeInfo> {
         // Filled in once the inspection authority is loaded.
         inspection_root_fingerprint: String::new(),
         inspection_ca_expires_at_unix_ms: 0,
-        policy_features: burrow_common::features::ALL
+        policy_features: burrow_common::features::enforced()
             .iter()
             .map(|feature| feature.to_string())
             .collect(),
+        ipv6_prefix: args.ipv6_prefix.clone().unwrap_or_default(),
+        ipv6_per_sandbox: args
+            .ipv6_prefix
+            .as_ref()
+            .map_or(0, |_| u32::from(args.ipv6_per_sandbox)),
+        ip_providers: crate::providers::Providers::load(args.ip_providers_file.as_deref())?
+            .registered(),
     })
 }
 
@@ -1385,6 +1443,7 @@ pub async fn run(args: ServeArgs) -> anyhow::Result<()> {
                 overcommit: args.disk_overcommit,
                 reserve_mib: args.disk_reserve_mib,
             },
+            public: public_config(&args)?,
         },
         Arc::clone(&proxy_policies),
         Arc::clone(&resolutions),
@@ -1472,6 +1531,7 @@ pub async fn run(args: ServeArgs) -> anyhow::Result<()> {
         authority.root_fingerprint().to_string(),
     );
     sandboxes.set_audit(audit.clone());
+    sandboxes.start_public().await;
 
     let proxy = Arc::new(burrow_proxy::Proxy {
         policies: Arc::clone(&proxy_policies),

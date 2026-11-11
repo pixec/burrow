@@ -520,6 +520,9 @@ enum Command {
     /// Volume operations.
     #[command(subcommand, visible_alias = "volumes")]
     Volume(VolumeCommand),
+    /// Dedicated public IPs: allocate, attach, release, reverse DNS, pools.
+    #[command(subcommand, visible_alias = "ips")]
+    Ip(IpCommand),
     /// Show what happened to sandboxes, in order, and optionally follow it.
     Events {
         /// Restrict to one sandbox.
@@ -692,6 +695,11 @@ enum ConfigCommand {
 /// is configured by the same flags.
 #[derive(ClapArgs)]
 struct CreateFlags {
+    /// An allocated public IP to attach once the sandbox is up, from
+    /// `burrow ip allocate`. A static address places the sandbox on its node.
+    /// Repeatable.
+    #[arg(long = "ip")]
+    ips: Vec<String>,
     /// Name for the sandbox, usable anywhere its id is. 1-63 characters of
     /// lowercase letters, digits and '-'. Unique across the fleet, and fixed
     /// once the sandbox exists.
@@ -1027,6 +1035,12 @@ struct NetworkFlags {
     /// keeps its own IPv6 behaviour.
     #[arg(long = "deny-ipv6")]
     is_ipv6_denied: bool,
+    /// What may reach the sandbox's public addresses (its dedicated IPs and
+    /// its global IPv6 address), as PROTO[/PORTS][@SOURCES]: tcp/22,
+    /// tcp/25,587, udp/27000-27015, tcp/22@203.0.113.0/24, icmp. Nothing is
+    /// admitted without one. Repeatable.
+    #[arg(long = "ingress")]
+    ingress: Vec<String>,
     /// Terminate this sandbox's TLS so the host named inside the session
     /// is checked, not just the SNI. Closes domain fronting, at the cost
     /// of the proxy being able to read the payload. With --net open, only the
@@ -1070,6 +1084,7 @@ impl NetworkFlags {
             || !self.deny_domains.is_empty()
             || !self.deny_ports.is_empty()
             || self.is_ipv6_denied
+            || !self.ingress.is_empty()
             || !self.inject_headers.is_empty()
             || !self.rules.is_empty()
     }
@@ -1121,6 +1136,99 @@ fn parse_port_rule(spec: &str) -> anyhow::Result<common::PortRule> {
         port_end,
         cidrs,
     })
+}
+
+/// Parses one `--ingress`: `PROTO[/PORTS][@SOURCES]`, where PROTO is tcp,
+/// udp, icmp or any, and PORTS a comma list of ports and ranges.
+fn parse_ingress_rule(spec: &str) -> anyhow::Result<common::IngressRule> {
+    let usage = || {
+        anyhow::anyhow!(
+            "--ingress {spec:?}: expected PROTO[/PORTS][@SOURCES], e.g. tcp/22, tcp/25,587, \
+             udp/27000-27015, tcp/22@203.0.113.0/24 or icmp"
+        )
+    };
+    let (head, sources) = match spec.split_once('@') {
+        Some((head, sources)) => (
+            head,
+            sources
+                .split(',')
+                .map(|source| source.trim().to_string())
+                .collect::<Vec<_>>(),
+        ),
+        None => (spec, Vec::new()),
+    };
+    if sources.iter().any(String::is_empty) {
+        return Err(usage());
+    }
+    let (protocol, ports) = match head.split_once('/') {
+        Some((protocol, ports)) => (protocol, Some(ports)),
+        None => (head, None),
+    };
+    let protocol = match protocol {
+        "tcp" => common::IngressProtocol::Tcp,
+        "udp" => common::IngressProtocol::Udp,
+        "icmp" => common::IngressProtocol::Icmp,
+        "any" => common::IngressProtocol::Unspecified,
+        _ => return Err(usage()),
+    };
+    let number = |text: &str| -> anyhow::Result<u32> {
+        if text.is_empty() || !text.bytes().all(|b| b.is_ascii_digit()) {
+            return Err(usage());
+        }
+        text.parse::<u32>().map_err(|_| usage())
+    };
+    let ports = match ports {
+        None => Vec::new(),
+        Some(ports) => ports
+            .split(',')
+            .map(|range| match range.split_once('-') {
+                Some((first, last)) => Ok(common::PortRange {
+                    port: number(first)?,
+                    port_end: number(last)?,
+                }),
+                None => Ok(common::PortRange {
+                    port: number(range)?,
+                    port_end: 0,
+                }),
+            })
+            .collect::<anyhow::Result<Vec<_>>>()?,
+    };
+    if protocol == common::IngressProtocol::Icmp && !ports.is_empty() {
+        anyhow::bail!("--ingress {spec:?}: icmp takes no ports");
+    }
+    Ok(common::IngressRule {
+        protocol: protocol as i32,
+        ports,
+        sources,
+    })
+}
+
+/// The `--ingress` spelling of a rule.
+fn describe_ingress_rule(rule: &common::IngressRule) -> String {
+    let mut text = match common::IngressProtocol::try_from(rule.protocol) {
+        Ok(common::IngressProtocol::Tcp) => "tcp",
+        Ok(common::IngressProtocol::Udp) => "udp",
+        Ok(common::IngressProtocol::Icmp) => "icmp",
+        _ => "any",
+    }
+    .to_string();
+    if !rule.ports.is_empty() {
+        let ports: Vec<String> = rule
+            .ports
+            .iter()
+            .map(|range| match range.port_end {
+                0 => range.port.to_string(),
+                end => format!("{}-{end}", range.port),
+            })
+            .collect();
+        text.push('/');
+        text.push_str(&ports.join(","));
+    }
+    if !rule.sources.is_empty() {
+        text.push('@');
+        text.push_str(&rule.sources.join(","));
+    }
+    text
 }
 
 /// The `--deny-port` spelling of a port rule, for reading a policy back.
@@ -1361,6 +1469,196 @@ enum VolumeCommand {
         #[arg(required = true)]
         names: Vec<String>,
     },
+}
+
+#[derive(Subcommand)]
+enum IpCommand {
+    /// Take an address from a pool, within this credential's quota.
+    Allocate {
+        /// The pool to take from; the first that can serve when left out.
+        #[arg(long)]
+        pool: Option<String>,
+        /// An IPv6 subnet rather than an IPv4 address.
+        #[arg(long = "v6")]
+        is_v6: bool,
+        /// Take one that reaches this sandbox's node, and attach it there.
+        #[arg(long = "for")]
+        sandbox: Option<String>,
+    },
+    /// Give an address back. It is quarantined before anyone gets it again.
+    Release { address: String },
+    /// Route an address to a sandbox.
+    Attach { address: String, sandbox: String },
+    /// Take an address off its sandbox, keeping it allocated.
+    Detach { address: String },
+    /// Set an address's reverse DNS name, through its provider.
+    Rdns {
+        address: String,
+        /// A host name; empty clears it.
+        name: String,
+    },
+    /// List the addresses this credential holds.
+    #[command(alias = "list")]
+    Ls {
+        #[arg(long)]
+        pool: Option<String>,
+        /// Only those attached to this sandbox.
+        #[arg(long)]
+        sandbox: Option<String>,
+        /// Quarantined addresses too (operators only).
+        #[arg(long = "quarantined")]
+        is_quarantine_included: bool,
+        #[arg(long = "json")]
+        is_json_requested: bool,
+    },
+    /// Address pools, operator credentials only.
+    #[command(subcommand)]
+    Pool(IpPoolCommand),
+}
+
+#[derive(Subcommand)]
+enum IpPoolCommand {
+    /// Define a pool on one node or on the nodes carrying a set of labels.
+    Create(IpPoolFlags),
+    /// Replace a pool's definition; its allocated addresses must stay in it.
+    Update(IpPoolFlags),
+    /// List pools with how much of each is allocated.
+    #[command(alias = "list")]
+    Ls {
+        #[arg(long = "json")]
+        is_json_requested: bool,
+    },
+    /// Remove a pool with nothing allocated from it.
+    #[command(alias = "delete")]
+    Rm { name: String },
+}
+
+#[derive(ClapArgs)]
+struct IpPoolFlags {
+    name: String,
+    /// The one node the pool's addresses reach.
+    #[arg(long)]
+    node: Option<String>,
+    /// Labels every node the pool covers carries, as key=value. Repeatable.
+    #[arg(long = "node-label")]
+    node_labels: Vec<String>,
+    /// static (default), ovh, hetzner or bgp.
+    #[arg(long, default_value = "static")]
+    provider: String,
+    /// IPv4 addresses, as first-last. Repeatable.
+    #[arg(long = "range")]
+    ranges: Vec<String>,
+    /// Single IPv4 addresses. Repeatable.
+    #[arg(long = "address")]
+    addresses: Vec<String>,
+    /// The uplink gateway these addresses route through.
+    #[arg(long)]
+    gateway: Option<String>,
+    /// The prefix of the gateway's network, e.g. 24.
+    #[arg(long, default_value_t = 0)]
+    prefix: u32,
+    /// Resolvers to hand out with the addresses. Repeatable.
+    #[arg(long = "nameserver")]
+    nameservers: Vec<String>,
+    /// An IPv6 prefix to carve per-sandbox subnets from, e.g. 2001:db8::/48.
+    #[arg(long)]
+    prefix6: Option<String>,
+    /// The size of each sandbox's IPv6 share, e.g. 64 or 128.
+    #[arg(long, default_value_t = 64)]
+    per_sandbox: u32,
+    /// The provider looks addresses up on the uplink (ARP, NDP), so the node
+    /// answers for them there.
+    #[arg(long = "on-link")]
+    is_on_link: bool,
+    /// Allow outbound TCP 25 from these addresses.
+    #[arg(long = "allow-smtp")]
+    is_smtp_allowed: bool,
+    /// Resume a suspended holder on its first admitted packet.
+    #[arg(long = "wake-on-traffic")]
+    is_wake_on_traffic: bool,
+    /// Seconds a released address waits; the orchestrator's default when 0.
+    #[arg(long, default_value_t = 0)]
+    quarantine_secs: i64,
+}
+
+impl IpPoolFlags {
+    fn pool(self) -> anyhow::Result<common::IpPool> {
+        Ok(common::IpPool {
+            name: self.name,
+            node_id: self.node.unwrap_or_default(),
+            node_labels: parse_pairs("--node-label", &self.node_labels)?,
+            provider: common::IpProvider::from_label(&self.provider).ok_or_else(|| {
+                anyhow::anyhow!(
+                    "--provider {:?}: expected static, ovh, hetzner or bgp",
+                    self.provider
+                )
+            })? as i32,
+            ranges: self.ranges,
+            addresses: self.addresses,
+            gateway: self.gateway.unwrap_or_default(),
+            prefix_len: self.prefix,
+            nameservers: self.nameservers,
+            prefix6: self.prefix6.clone().unwrap_or_default(),
+            per_sandbox: if self.prefix6.is_some() {
+                self.per_sandbox
+            } else {
+                0
+            },
+            is_on_link: self.is_on_link,
+            is_smtp_allowed: self.is_smtp_allowed,
+            is_wake_on_traffic: self.is_wake_on_traffic,
+            quarantine_secs: self.quarantine_secs,
+            ..Default::default()
+        })
+    }
+}
+
+/// One address as `ip ls` prints it.
+fn ip_line(ip: &common::PublicIp) -> String {
+    let address = match ip.family {
+        6 => format!("{}/{}", ip.address, ip.prefix_len),
+        _ => ip.address.clone(),
+    };
+    let state = if ip.state() == common::PublicIpState::Quarantined {
+        "quarantined"
+    } else if ip.sandbox_id.is_empty() {
+        "detached"
+    } else {
+        "attached"
+    };
+    format!(
+        "{:<40} {:<14} {:<9} {:<12} {:<20} {:<16} {}",
+        truncate(&address, 40),
+        truncate(&ip.pool, 14),
+        ip.provider().label(),
+        state,
+        if ip.sandbox_id.is_empty() {
+            "-"
+        } else {
+            &ip.sandbox_id
+        },
+        if ip.node_id.is_empty() {
+            "-"
+        } else {
+            &ip.node_id
+        },
+        if ip.rdns.is_empty() { "-" } else { &ip.rdns },
+    )
+}
+
+fn ip_json(ip: &common::PublicIp) -> serde_json::Value {
+    serde_json::json!({
+        "address": ip.address,
+        "family": ip.family,
+        "prefix_len": ip.prefix_len,
+        "pool": ip.pool,
+        "provider": ip.provider().label(),
+        "is_movable": ip.is_movable,
+        "sandbox": ip.sandbox_id,
+        "node": ip.node_id,
+        "rdns": ip.rdns,
+        "quarantined_until_unix_ms": ip.quarantined_until_unix_ms,
+    })
 }
 
 #[derive(Subcommand)]
@@ -2156,6 +2454,7 @@ async fn main() -> anyhow::Result<()> {
                 }
             }
         }
+        Command::Ip(command) => run_ip(&mut client, command).await?,
         Command::Volume(VolumeCommand::Inspect { name }) => {
             let volume = client
                 .get_volume(api::VolumeRef { name })
@@ -2547,9 +2846,191 @@ async fn main() -> anyhow::Result<()> {
     Ok(())
 }
 
+async fn run_ip(client: &mut Client, command: IpCommand) -> anyhow::Result<()> {
+    const HEADER: &str = "ADDRESS                                  POOL           PROVIDER  STATE        SANDBOX              NODE             RDNS";
+    match command {
+        IpCommand::Allocate {
+            pool,
+            is_v6,
+            sandbox,
+        } => {
+            let ip = client
+                .allocate_ip(api::AllocateIpRequest {
+                    pool: pool.unwrap_or_default(),
+                    family: if is_v6 { 6 } else { 4 },
+                    sandbox_id: sandbox.unwrap_or_default(),
+                })
+                .await?
+                .into_inner();
+            match ip.sandbox_id.is_empty() {
+                true => println!("{}", ip.address),
+                false => println!("{} attached to {}", ip.address, ip.sandbox_id),
+            }
+        }
+        IpCommand::Release { address } => {
+            client
+                .release_ip(api::IpRef {
+                    address: address.clone(),
+                })
+                .await?;
+            println!("released {address}; quarantined before it is handed out again");
+        }
+        IpCommand::Attach { address, sandbox } => {
+            let ip = client
+                .attach_ip(api::AttachIpRequest {
+                    address,
+                    sandbox_id: sandbox,
+                })
+                .await?
+                .into_inner();
+            println!(
+                "{} attached to {} on {}",
+                ip.address, ip.sandbox_id, ip.node_id
+            );
+        }
+        IpCommand::Detach { address } => {
+            let ip = client.detach_ip(api::IpRef { address }).await?.into_inner();
+            println!("{} detached", ip.address);
+        }
+        IpCommand::Rdns { address, name } => {
+            let ip = client
+                .set_ip_rdns(api::SetIpRdnsRequest { address, name })
+                .await?
+                .into_inner();
+            println!(
+                "{} -> {}",
+                ip.address,
+                if ip.rdns.is_empty() { "-" } else { &ip.rdns }
+            );
+        }
+        IpCommand::Ls {
+            pool,
+            sandbox,
+            is_quarantine_included,
+            is_json_requested,
+        } => {
+            let ips = client
+                .list_ips(api::ListIpsRequest {
+                    pool: pool.unwrap_or_default(),
+                    sandbox_id: sandbox.unwrap_or_default(),
+                    is_quarantine_included,
+                })
+                .await?
+                .into_inner()
+                .ips;
+            if is_json_requested {
+                let items: Vec<_> = ips.iter().map(ip_json).collect();
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&items).expect("a value renders")
+                );
+            } else if ips.is_empty() {
+                println!("no public ips");
+            } else {
+                println!("{HEADER}");
+                for ip in &ips {
+                    println!("{}", ip_line(ip));
+                }
+            }
+        }
+        IpCommand::Pool(IpPoolCommand::Create(flags)) => {
+            let pool = client.create_ip_pool(flags.pool()?).await?.into_inner();
+            println!(
+                "{} ({} addresses, {})",
+                pool.name,
+                pool.total,
+                pool.provider().label()
+            );
+        }
+        IpCommand::Pool(IpPoolCommand::Update(flags)) => {
+            let pool = client.update_ip_pool(flags.pool()?).await?.into_inner();
+            println!(
+                "{} ({} addresses, {})",
+                pool.name,
+                pool.total,
+                pool.provider().label()
+            );
+        }
+        IpCommand::Pool(IpPoolCommand::Rm { name }) => {
+            client
+                .delete_ip_pool(api::IpPoolRef { name: name.clone() })
+                .await?;
+            println!("removed {name}");
+        }
+        IpCommand::Pool(IpPoolCommand::Ls { is_json_requested }) => {
+            let pools = client
+                .list_ip_pools(api::ListIpPoolsRequest {})
+                .await?
+                .into_inner()
+                .pools;
+            if is_json_requested {
+                let items: Vec<_> = pools
+                    .iter()
+                    .map(|pool| {
+                        serde_json::json!({
+                            "name": pool.name,
+                            "node": pool.node_id,
+                            "node_labels": pairs_json(&pool.node_labels),
+                            "provider": pool.provider().label(),
+                            "total": pool.total,
+                            "allocated": pool.allocated,
+                        })
+                    })
+                    .collect();
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&items).expect("a value renders")
+                );
+            } else if pools.is_empty() {
+                println!("no ip pools");
+            } else {
+                println!(
+                    "{:<16} {:<24} {:<9} {:>9}  ADDRESSES",
+                    "POOL", "SCOPE", "PROVIDER", "ALLOCATED"
+                );
+                for pool in &pools {
+                    let scope = match pool.node_id.is_empty() {
+                        false => pool.node_id.clone(),
+                        true => {
+                            let mut labels: Vec<String> = pool
+                                .node_labels
+                                .iter()
+                                .map(|(k, v)| format!("{k}={v}"))
+                                .collect();
+                            labels.sort();
+                            labels.join(",")
+                        }
+                    };
+                    let addresses = match pool.prefix6.is_empty() {
+                        false => format!("{} per /{}", pool.prefix6, pool.per_sandbox),
+                        true => pool
+                            .ranges
+                            .iter()
+                            .chain(&pool.addresses)
+                            .cloned()
+                            .collect::<Vec<_>>()
+                            .join(","),
+                    };
+                    println!(
+                        "{:<16} {:<24} {:<9} {:>4}/{:<4}  {}",
+                        truncate(&pool.name, 16),
+                        truncate(&scope, 24),
+                        pool.provider().label(),
+                        pool.allocated,
+                        pool.total,
+                        addresses
+                    );
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
 /// Builds the create call from the shared flag group.
 fn create_request(flags: CreateFlags) -> anyhow::Result<api::CreateSandboxRequest> {
     let CreateFlags {
+        ips,
         name,
         template,
         kit_args,
@@ -2581,6 +3062,7 @@ fn create_request(flags: CreateFlags) -> anyhow::Result<api::CreateSandboxReques
     // error the server raises rather than a default silently overriding it.
     let template = template.unwrap_or_default();
     Ok(api::CreateSandboxRequest {
+        public_ips: ips,
         name: name.unwrap_or_default(),
         template,
         snapshot: snapshot.unwrap_or_default(),
@@ -2880,6 +3362,11 @@ fn network_policy(flags: NetworkFlags) -> anyhow::Result<common::NetworkPolicy> 
             .map(|spec| parse_port_rule(spec))
             .collect::<anyhow::Result<Vec<_>>>()?,
         is_ipv6_denied: flags.is_ipv6_denied,
+        ingress: flags
+            .ingress
+            .iter()
+            .map(|spec| parse_ingress_rule(spec))
+            .collect::<anyhow::Result<Vec<_>>>()?,
         is_tls_inspected: flags.is_tls_inspected,
         // `--rule` first: an `--inject-header` rule carries no matcher, so it
         // claims every request to its domain and would shadow any narrower
@@ -3715,6 +4202,21 @@ fn print_config(sandbox: &common::Sandbox) {
     if !sandbox.guest_ip.is_empty() {
         field("address", &sandbox.guest_ip);
     }
+    if !sandbox.ipv6_address.is_empty() {
+        field(
+            "ipv6",
+            &format!(
+                "{} (/{} routed)",
+                sandbox.ipv6_address, sandbox.ipv6_prefix_len
+            ),
+        );
+    }
+    for ip in &sandbox.public_ips {
+        field(
+            "public ip",
+            &format!("{} ({}, {})", ip.address, ip.pool, ip.provider().label()),
+        );
+    }
     // Always shown, zeroes included: a sandbox that has spent nothing is a
     // fact, and a missing line reads as "not measured".
     field("cpu", &format!("{}ms", sandbox.cpu_usage_usec / 1000));
@@ -3814,6 +4316,9 @@ fn print_config(sandbox: &common::Sandbox) {
     }
     if network.is_ipv6_denied {
         field("deny-ipv6", "yes");
+    }
+    for rule in &network.ingress {
+        field("ingress", &describe_ingress_rule(rule));
     }
     if network.is_tls_inspected {
         field("inspect-tls", "yes");
@@ -4625,6 +5130,7 @@ fn sandbox_json(sandbox: &common::Sandbox) -> String {
             "deny_domains": network.deny_domains,
             "deny_ports": network.deny_ports.iter().map(describe_port_rule).collect::<Vec<_>>(),
             "deny_ipv6": network.is_ipv6_denied,
+            "ingress": network.ingress.iter().map(describe_ingress_rule).collect::<Vec<_>>(),
             "inspect_tls": network.is_tls_inspected,
             "rules": network
                 .rules
@@ -5244,6 +5750,32 @@ mod tests {
     }
 
     #[test]
+    fn ingress_flags_become_rules_and_read_back() {
+        for spec in [
+            "tcp/22",
+            "tcp/25,587",
+            "udp/27000-27015",
+            "tcp/22@203.0.113.0/24",
+            "icmp",
+            "any/53",
+        ] {
+            let rule = parse_ingress_rule(spec).unwrap();
+            assert_eq!(describe_ingress_rule(&rule), spec);
+        }
+        let rule = parse_ingress_rule("tcp/22,8000-8010@10.0.0.0/8,2001:db8::/32").unwrap();
+        assert_eq!(rule.protocol, common::IngressProtocol::Tcp as i32);
+        assert_eq!(rule.ports.len(), 2);
+        assert_eq!(rule.ports[1].port_end, 8010);
+        assert_eq!(rule.sources, vec!["10.0.0.0/8", "2001:db8::/32"]);
+        for bad in ["", "sctp/1", "tcp/", "tcp/x", "icmp/1", "tcp/22@", "tcp/+1"] {
+            assert!(
+                parse_ingress_rule(bad).is_err(),
+                "{bad:?} should be refused"
+            );
+        }
+    }
+
+    #[test]
     fn an_injection_splits_on_the_first_colon_and_equals() {
         let rule = parse_injection("api.example.com:Authorization=Bearer a=b:c").unwrap();
         assert_eq!(rule.domain, "api.example.com");
@@ -5286,6 +5818,7 @@ mod tests {
             deny_domains: vec![],
             deny_ports: vec![],
             is_ipv6_denied: false,
+            ingress: vec![],
             is_tls_inspected: inspect_tls,
             inject_headers: inject.iter().map(|s| (*s).to_string()).collect(),
             rules: vec![],
@@ -5590,6 +6123,7 @@ mod tests {
                 keep_last_snapshots: 0,
                 is_evicted_snapshots_kept: false,
                 mounts: vec![],
+                ips: vec![],
                 max_lifetime_secs: 0,
                 idle_suspend_secs: 0,
                 suspended_ttl_secs: 0,
@@ -5604,6 +6138,7 @@ mod tests {
                     deny_domains: vec![],
                     deny_ports: vec![],
                     is_ipv6_denied: false,
+                    ingress: vec![],
                     is_tls_inspected: false,
                     inject_headers: vec![],
                     rules: vec![],

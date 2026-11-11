@@ -73,6 +73,21 @@ service Burrow {
   rpc GetVolume(VolumeRef) returns (burrow.common.v1.Volume);
   rpc DeleteVolume(VolumeRef) returns (DeleteVolumeResponse);
 
+  // Dedicated public IPs: allocated from a pool within the caller's quota,
+  // attached to a sandbox, kept until released, then quarantined.
+  rpc AllocateIp(AllocateIpRequest) returns (burrow.common.v1.PublicIp);
+  rpc ReleaseIp(IpRef) returns (ReleaseIpResponse);
+  rpc AttachIp(AttachIpRequest) returns (burrow.common.v1.PublicIp);
+  rpc DetachIp(IpRef) returns (burrow.common.v1.PublicIp);
+  rpc ListIps(ListIpsRequest) returns (ListIpsResponse);
+  // Through the address's provider; refused where it offers none.
+  rpc SetIpRdns(SetIpRdnsRequest) returns (burrow.common.v1.PublicIp);
+  // Pools, operator credentials only.
+  rpc CreateIpPool(burrow.common.v1.IpPool) returns (burrow.common.v1.IpPool);
+  rpc UpdateIpPool(burrow.common.v1.IpPool) returns (burrow.common.v1.IpPool);
+  rpc DeleteIpPool(IpPoolRef) returns (DeleteIpPoolResponse);
+  rpc ListIpPools(ListIpPoolsRequest) returns (ListIpPoolsResponse);
+
   // Exec, attach and files, relayed to the node holding the sandbox. The same
   // calls the node's Access service serves directly; a client picks either.
   // Exec is bidirectional and PTY-capable.
@@ -694,6 +709,59 @@ message VolumeRef {
 
 message DeleteVolumeResponse {}
 
+message AllocateIpRequest {
+  // Empty takes the first pool that can serve: one covering `sandbox_id`'s
+  // node when that is set.
+  string pool = 1;
+  // 4 (the default) or 6.
+  uint32 family = 2;
+  // Take an address that can reach this sandbox's node, and attach it there.
+  // Id or name.
+  string sandbox_id = 3;
+}
+
+message IpRef {
+  string address = 1;
+}
+
+message ReleaseIpResponse {}
+
+message AttachIpRequest {
+  string address = 1;
+  // Id or name.
+  string sandbox_id = 2;
+}
+
+message ListIpsRequest {
+  string pool = 1;
+  // Only addresses attached to this sandbox, by id or name.
+  string sandbox_id = 2;
+  // Quarantined addresses too, which belong to nobody.
+  bool is_quarantine_included = 3;
+}
+
+message ListIpsResponse {
+  repeated burrow.common.v1.PublicIp ips = 1;
+}
+
+message SetIpRdnsRequest {
+  string address = 1;
+  // A host name; empty clears it.
+  string name = 2;
+}
+
+message IpPoolRef {
+  string name = 1;
+}
+
+message DeleteIpPoolResponse {}
+
+message ListIpPoolsRequest {}
+
+message ListIpPoolsResponse {
+  repeated burrow.common.v1.IpPool pools = 1;
+}
+
 message SnapshotRef {
   string id = 1;
 }
@@ -740,6 +808,9 @@ message CreateSandboxRequest {
   // install-phase network policy, the runtime policy, startup hooks and the
   // workload's entrypoint.
   burrow.common.v1.KitSpec kit = 8;
+  // Allocated public IPs to attach once it is up. A static address places the
+  // sandbox on its node, as a volume does.
+  repeated string public_ips = 9;
 }
 
 message RecreateSandboxRequest {

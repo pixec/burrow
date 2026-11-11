@@ -106,6 +106,13 @@ fn hex_lower(bytes: &[u8]) -> String {
 /// it neither restarts the daemon nor throttles it, and open `Fs` handles and
 /// the command table carry over. The caller has refused it while a command is
 /// running.
+/// A macOS node never routes a public address to its guests.
+pub async fn set_public_addresses(_network: guestpb::NetworkConfig) -> Result<(), tonic::Status> {
+    Err(tonic::Status::unimplemented(
+        "a macOS guest sits behind its node's userspace network and takes no public address",
+    ))
+}
+
 pub async fn upgrade(
     mut stream: tonic::Streaming<guestpb::UpgradeChunk>,
 ) -> Result<guestpb::UpgradeResponse, Status> {

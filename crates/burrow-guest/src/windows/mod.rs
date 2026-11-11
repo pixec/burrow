@@ -33,7 +33,7 @@ mod vsock;
 mod win;
 
 #[cfg(windows)]
-pub use handshake::handshake;
+pub use handshake::{handshake, set_public_addresses};
 #[cfg(windows)]
 pub use service::{main, upgrade};
 #[cfg(windows)]
@@ -47,5 +47,6 @@ pub fn features() -> Vec<String> {
         "attach-input".to_string(),
         "output-feed".to_string(),
         fs::FEATURE_FS.to_string(),
+        "public-addresses".to_string(),
     ]
 }

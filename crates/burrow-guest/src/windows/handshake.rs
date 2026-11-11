@@ -387,6 +387,15 @@ fn applied() -> &'static Mutex<Option<guestpb::NetworkConfig>> {
     &APPLIED
 }
 
+/// Applies a live attach or detach: the whole configuration again, since
+/// the private half is unchanged and costs nothing to repeat.
+pub async fn set_public_addresses(network: guestpb::NetworkConfig) -> Result<(), Status> {
+    tokio::task::spawn_blocking(move || apply_network(&network))
+        .await
+        .map_err(|err| Status::internal(format!("network did not run: {err}")))?
+        .map_err(|err| Status::internal(format!("applying public addresses: {err}")))
+}
+
 fn apply_network(config: &guestpb::NetworkConfig) -> anyhow::Result<()> {
     use std::os::windows::process::CommandExt as _;
     use windows_sys::Win32::System::Threading::CREATE_NO_WINDOW;

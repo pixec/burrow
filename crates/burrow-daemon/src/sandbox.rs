@@ -132,6 +132,8 @@ pub struct NodeConfig {
     pub event_delivery: crate::delivery::Policy,
     /// How much disk this node promises its sandboxes, and what it keeps free.
     pub disk: crate::diskcap::DiskPolicy,
+    /// Public addresses: the routed IPv6 prefix, ingress limits, providers.
+    pub public: crate::publicip::PublicConfig,
 }
 
 impl NodeConfig {
@@ -327,6 +329,8 @@ const EVENT_SNAPSHOT_CREATED: common::EventKind = common::EventKind::SnapshotCre
 /// Logged on a node's start for each sandbox it holds, in the state it found
 /// it in.
 const EVENT_RECOVERED: common::EventKind = common::EventKind::Recovered;
+const EVENT_IP_ATTACHED: common::EventKind = common::EventKind::IpAttached;
+const EVENT_IP_DETACHED: common::EventKind = common::EventKind::IpDetached;
 /// The detail of an event recovery logs for a VM that was gone when it
 /// looked: its figures are the last the node recorded, not a reading.
 const DETAIL_LOST: &str = "lost";
@@ -638,6 +642,9 @@ fn spawn_handshake(
         }
     });
 }
+
+/// What a guest agent able to take public addresses names among its features.
+const PUBLIC_ADDRESSES: &str = "public-addresses";
 
 /// What the guest calls the feed of command output it keeps for the host.
 pub const OUTPUT_FEED: &str = "output-feed";
@@ -1809,6 +1816,18 @@ pub struct SandboxManager {
     releasing: Arc<std::sync::Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>>,
     /// Sandboxes recovery kept but could not put back in service.
     held: Arc<std::sync::Mutex<HashMap<String, Held>>>,
+    /// The routes bringing public addresses to their taps, synced with every
+    /// ruleset.
+    host_routes: Arc<burrow_net::public::HostRoutes>,
+    /// Which sandbox holds each public address, for waking and auditing.
+    public_index: Arc<crate::publicip::PublicIndex>,
+}
+
+/// The public addresses one tapped sandbox holds, taken with the ruleset.
+struct Publics {
+    sandbox_id: String,
+    ips: Vec<common::PublicIp>,
+    ipv6: Option<(std::net::Ipv6Addr, u8)>,
 }
 
 /// A sandbox recovery found on disk and could not bring back: its record,
@@ -2012,6 +2031,8 @@ impl SandboxManager {
             lease: Default::default(),
             releasing: Default::default(),
             held: Default::default(),
+            host_routes: Default::default(),
+            public_index: Default::default(),
         }
     }
 
@@ -2216,6 +2237,7 @@ impl SandboxManager {
             }
             match sandbox.suspend().await {
                 Ok(()) => {
+                    self.resync_public(&sandbox).await;
                     self.volumes.release_all(sandbox.id());
                     self.sample_last(&sandbox).await;
                     self.persist(&sandbox).await;
@@ -3282,6 +3304,9 @@ impl SandboxManager {
             }
         }
         self.directory.replace(directory);
+        for sandbox in &all {
+            self.stamp_ipv6(sandbox);
+        }
         let mut rules: Vec<firewall::SandboxRules> = all
             .iter()
             .map(|sandbox| {
@@ -3348,6 +3373,7 @@ impl SandboxManager {
                     ports: ports.get(sandbox.id()).cloned().unwrap_or_default(),
                     // Filled in below, from the proxy's view of the policy.
                     inspected: None,
+                    public: self.public_rules(sandbox, &record),
                 }
             })
             .collect();
@@ -3365,6 +3391,10 @@ impl SandboxManager {
             .map(|sandbox| {
                 let record = sandbox.record();
                 let network = record.policy.as_ref().and_then(|p| p.network.as_ref());
+                let egress_mark = rules
+                    .iter()
+                    .find(|r| r.sandbox_id == sandbox.id())
+                    .map_or(0, |r| r.public.mark);
                 // The stored record keeps the real values, redaction
                 // happening on the way out to callers, so the proxy goes on
                 // brokering across a restart and a recover.
@@ -3389,6 +3419,7 @@ impl SandboxManager {
                     sandbox.lease.guest_ip,
                     burrow_proxy::SandboxPolicy {
                         rules,
+                        egress_mark,
                         ..burrow_proxy::SandboxPolicy::from_record(sandbox.id(), network)
                     },
                 )
@@ -3421,6 +3452,16 @@ impl SandboxManager {
             );
         }
 
+        let publics: Vec<Publics> = all
+            .iter()
+            .filter(|sandbox| sandbox.hypervisor.capabilities().is_tap_networked)
+            .map(|sandbox| Publics {
+                sandbox_id: sandbox.id().to_string(),
+                ips: sandbox.base_record.lock().unwrap().public_ips.clone(),
+                ipv6: self.config.public.ipv6_for(sandbox.lease.block),
+            })
+            .collect();
+
         drop(remote);
         drop(ports);
         drop(sandboxes);
@@ -3436,12 +3477,38 @@ impl SandboxManager {
         // Both of a sandbox's addresses map to its one policy: it is the same
         // sandbox whichever it reaches the proxy from, and an entry missing
         // for one family would read as an unknown source and deny everything.
+        // So are its public addresses, which a guest sources from by default.
+        let public_sources: HashMap<std::net::Ipv4Addr, Vec<std::net::IpAddr>> = rules
+            .iter()
+            .map(|r| {
+                let mut sources: Vec<std::net::IpAddr> = r
+                    .public
+                    .v4
+                    .iter()
+                    .copied()
+                    .map(std::net::IpAddr::V4)
+                    .collect();
+                sources.extend(
+                    r.public
+                        .v6
+                        .iter()
+                        .map(|(address, _)| std::net::IpAddr::V6(*address)),
+                );
+                (r.guest_ip, sources)
+            })
+            .collect();
         let proxy_table: HashMap<std::net::IpAddr, burrow_proxy::SandboxPolicy> = by_guest_ip
             .into_iter()
             .flat_map(|(guest_ip, policy)| {
                 let guest_ip6 = sandbox_ip6.get(&guest_ip).copied();
+                let public = public_sources.get(&guest_ip).cloned().unwrap_or_default();
                 std::iter::once((std::net::IpAddr::V4(guest_ip), policy.clone()))
-                    .chain(guest_ip6.map(|ip6| (std::net::IpAddr::V6(ip6), policy)))
+                    .chain(guest_ip6.map(|ip6| (std::net::IpAddr::V6(ip6), policy.clone())))
+                    .chain(
+                        public
+                            .into_iter()
+                            .map(move |address| (address, policy.clone())),
+                    )
             })
             .collect();
 
@@ -3470,7 +3537,350 @@ impl SandboxManager {
             .map_err(|err| {
                 tracing::error!(%err, "failed to apply firewall ruleset");
                 Status::internal(format!("applying the firewall ruleset: {err}"))
+            })?;
+        self.sync_public_routes(&rules, &publics).await;
+        Ok(())
+    }
+
+    /// Re-renders once a sandbox with public addresses starts or stops, so
+    /// what arrives for them is delivered, held to wake it, or dropped.
+    async fn resync_public(&self, sandbox: &RunningSandbox) {
+        let is_public = sandbox.hypervisor.capabilities().is_tap_networked
+            && (self.config.public.ipv6_prefix.is_some()
+                || !sandbox.base_record.lock().unwrap().public_ips.is_empty());
+        if is_public && let Err(err) = self.sync_firewall().await {
+            tracing::warn!(
+                sandbox = sandbox.id(),
+                err = err.message(),
+                "re-rendering public ingress"
+            );
+        }
+    }
+
+    /// Clears the routing rules a previous run left, then starts waking
+    /// suspended holders on traffic and auditing public connections.
+    pub async fn start_public(&self) {
+        if !cfg!(target_os = "linux") {
+            return;
+        }
+        self.host_routes.reset().await;
+        #[cfg(target_os = "linux")]
+        {
+            crate::publicip::spawn_wake(self.clone());
+            crate::publicip::spawn_audit(self.clone());
+        }
+    }
+
+    pub fn providers(&self) -> &crate::providers::Providers {
+        &self.config.public.providers
+    }
+
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+    pub fn public_index(&self) -> &crate::publicip::PublicIndex {
+        &self.public_index
+    }
+
+    /// Records a connection on a public address beside the proxy's records.
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+    pub fn audit_public(&self, event: burrow_proxy::EgressEvent) {
+        if let Some(audit) = self.audit.lock().unwrap().as_ref() {
+            audit.record(event);
+        }
+    }
+
+    /// Routes `ip` to a sandbox here and has its guest take it up.
+    ///
+    /// Refused for a sandbox without a tap, which has no route for a public
+    /// address to arrive on, and for an address another sandbox here holds.
+    /// Undone whole when any step fails, so the record never names an address
+    /// that does not reach the guest.
+    pub async fn attach_public_ip(
+        &self,
+        sandbox_id: &str,
+        ip: common::PublicIp,
+    ) -> Result<common::Sandbox, Status> {
+        let sandbox = self.get(sandbox_id).await?;
+        if !sandbox.hypervisor.capabilities().is_tap_networked {
+            return Err(Status::failed_precondition(
+                "this sandbox has no tap: a macOS node's userspace network cannot receive a \
+                 routed public address",
+            ));
+        }
+        let address: std::net::IpAddr = ip
+            .address
+            .parse()
+            .map_err(|_| Status::invalid_argument(format!("{:?} is not an address", ip.address)))?;
+        for other in self.sandboxes.lock().await.values() {
+            if other.id() != sandbox_id
+                && other
+                    .base_record
+                    .lock()
+                    .unwrap()
+                    .public_ips
+                    .iter()
+                    .any(|held| held.address == ip.address)
+            {
+                return Err(Status::already_exists(format!(
+                    "{address} is attached to sandbox {} here",
+                    other.id()
+                )));
+            }
+        }
+        let previous = {
+            let mut record = sandbox.base_record.lock().unwrap();
+            let previous = record.public_ips.clone();
+            record.public_ips.retain(|held| held.address != ip.address);
+            record.public_ips.push(ip);
+            previous
+        };
+        let applied = async {
+            self.sync_firewall().await?;
+            if !self.host_routes.is_applied(address).await {
+                return Err(Status::internal(format!(
+                    "{address} could not be routed to the sandbox; see the node's log"
+                )));
+            }
+            if sandbox.is_running() {
+                self.push_public_addresses(&sandbox).await?;
+            }
+            Ok(())
+        }
+        .await;
+        if let Err(err) = applied {
+            sandbox.base_record.lock().unwrap().public_ips = previous;
+            let _ = self.sync_firewall().await;
+            return Err(err);
+        }
+        self.persist(&sandbox).await;
+        self.emit(&sandbox, EVENT_IP_ATTACHED, &address.to_string())
+            .await;
+        Ok(sandbox.record())
+    }
+
+    pub async fn detach_public_ip(
+        &self,
+        sandbox_id: &str,
+        address: &str,
+    ) -> Result<common::Sandbox, Status> {
+        let sandbox = self.get(sandbox_id).await?;
+        let is_held = {
+            let mut record = sandbox.base_record.lock().unwrap();
+            let before = record.public_ips.len();
+            record.public_ips.retain(|held| held.address != address);
+            record.public_ips.len() != before
+        };
+        if !is_held {
+            return Ok(sandbox.record());
+        }
+        self.persist(&sandbox).await;
+        self.sync_firewall().await?;
+        if sandbox.is_running()
+            && let Err(err) = self.push_public_addresses(&sandbox).await
+        {
+            tracing::warn!(
+                sandbox = sandbox_id,
+                err = err.message(),
+                "guest kept a detached address"
+            );
+        }
+        if let Ok(parsed) = address.parse::<std::net::IpAddr>() {
+            firewall::flush_conntrack_address(parsed).await;
+        }
+        self.emit(&sandbox, EVENT_IP_DETACHED, address).await;
+        Ok(sandbox.record())
+    }
+
+    /// Tells a running guest the public addresses its record holds.
+    async fn push_public_addresses(&self, sandbox: &RunningSandbox) -> Result<(), Status> {
+        let network = self
+            .guest_network(
+                &sandbox.lease,
+                &sandbox.record().public_ips,
+                sandbox.hypervisor.capabilities().is_tap_networked,
+                true,
+            )
+            .expect("always given");
+        if !sandbox.agent_has(PUBLIC_ADDRESSES).await? {
+            return Err(Status::failed_precondition(
+                "this sandbox's guest agent cannot take a public address; recreate it on a \
+                 current template",
+            ));
+        }
+        sandbox.agent().await?.set_public_addresses(network).await?;
+        Ok(())
+    }
+
+    /// What the guest is told about its addresses: everything on a restore,
+    /// and otherwise only when it has public ones to configure, which the
+    /// guest applies on any handshake.
+    fn guest_network(
+        &self,
+        lease: &Lease,
+        ips: &[common::PublicIp],
+        is_tapped: bool,
+        is_always: bool,
+    ) -> Option<burrow_proto::guest::v1::NetworkConfig> {
+        let public_addresses = match is_tapped {
+            true => crate::publicip::guest_addresses(ips, self.config.public.ipv6_for(lease.block)),
+            false => Vec::new(),
+        };
+        (is_always || !public_addresses.is_empty()).then(|| {
+            burrow_proto::guest::v1::NetworkConfig {
+                ip: lease.guest_ip.to_string(),
+                prefix_len: lease.prefix_len as u32,
+                gateway: lease.host_ip.to_string(),
+                dns: lease.host_ip.to_string(),
+                ip6: lease.guest_ip6().to_string(),
+                prefix_len6: lease.prefix_len6() as u32,
+                gateway6: lease.host_ip6().to_string(),
+                public_addresses,
+            }
+        })
+    }
+
+    /// Stamps the global IPv6 address a tapped sandbox gets from this node's
+    /// prefix on its record.
+    fn stamp_ipv6(&self, sandbox: &RunningSandbox) {
+        let ipv6 = sandbox
+            .hypervisor
+            .capabilities()
+            .is_tap_networked
+            .then(|| self.config.public.ipv6_for(sandbox.lease.block))
+            .flatten();
+        let mut record = sandbox.base_record.lock().unwrap();
+        let (address, prefix) = ipv6
+            .map(|(address, prefix)| (address.to_string(), u32::from(prefix)))
+            .unwrap_or_default();
+        record.ipv6_address = address;
+        record.ipv6_prefix_len = prefix;
+    }
+
+    /// The sandbox's public side as the ruleset renders it.
+    fn public_rules(&self, sandbox: &RunningSandbox, record: &common::Sandbox) -> firewall::Public {
+        if !sandbox.hypervisor.capabilities().is_tap_networked {
+            return firewall::Public::default();
+        }
+        let public = &self.config.public;
+        let mut out = firewall::Public {
+            new_per_sec: public.new_per_sec,
+            kbytes_per_sec: public.kbytes_per_sec,
+            ..Default::default()
+        };
+        let (mut smtp4, mut smtp6) = (true, true);
+        for ip in &record.public_ips {
+            match ip.address.parse::<std::net::IpAddr>() {
+                Ok(std::net::IpAddr::V4(v4)) => {
+                    out.v4.push(v4);
+                    smtp4 &= ip.is_smtp_allowed;
+                }
+                Ok(std::net::IpAddr::V6(v6)) => {
+                    out.v6.push((v6, ip.prefix_len.clamp(1, 128) as u8));
+                    smtp6 &= ip.is_smtp_allowed;
+                }
+                Err(_) => {}
+            }
+        }
+        if let Some(own) = public.ipv6_for(sandbox.lease.block) {
+            out.v6.push(own);
+            smtp6 = false;
+        }
+        out.is_smtp4_allowed = smtp4 && !out.v4.is_empty();
+        out.is_smtp6_allowed = smtp6 && !out.v6.is_empty();
+        out.ingress = record
+            .policy
+            .as_ref()
+            .and_then(|p| p.network.as_ref())
+            .map(|n| {
+                n.ingress
+                    .iter()
+                    .map(burrow_net::policy::IngressRule::from)
+                    .collect()
             })
+            .unwrap_or_default();
+        out.state = if sandbox.is_running() {
+            firewall::IngressState::Admit
+        } else if sandbox.is_suspended() && record.public_ips.iter().any(|ip| ip.is_wake_on_traffic)
+        {
+            firewall::IngressState::Wake
+        } else {
+            firewall::IngressState::Closed
+        };
+        if !out.v4.is_empty() || !out.v6.is_empty() {
+            out.mark = firewall::egress_mark(sandbox.lease.block);
+        }
+        out
+    }
+
+    /// Brings every public address in `rules` to its tap, and records who
+    /// holds what for waking and auditing.
+    async fn sync_public_routes(&self, rules: &[firewall::SandboxRules], publics: &[Publics]) {
+        let public = &self.config.public;
+        let mut routes = Vec::new();
+        let mut holders = Vec::new();
+        for held in publics {
+            let Some(rule) = rules.iter().find(|r| r.sandbox_id == held.sandbox_id) else {
+                continue;
+            };
+            let is_waking = rule.public.state == firewall::IngressState::Wake;
+            for ip in &held.ips {
+                let Ok(address) = ip.address.parse::<std::net::IpAddr>() else {
+                    continue;
+                };
+                let prefix = match address {
+                    std::net::IpAddr::V4(_) => 32,
+                    std::net::IpAddr::V6(_) => ip.prefix_len.clamp(1, 128) as u8,
+                };
+                let gateway = ip.gateway.parse::<std::net::IpAddr>().ok();
+                let uplink = match gateway {
+                    Some(gateway) => public.uplink(gateway).await,
+                    None => public.interface.clone(),
+                };
+                routes.push(burrow_net::public::Route {
+                    tap: rule.tap.clone(),
+                    address,
+                    prefix,
+                    on_link: uplink.clone().filter(|_| ip.is_on_link),
+                    egress: gateway
+                        .zip(uplink)
+                        .map(|(gateway, dev)| burrow_net::public::Egress {
+                            gateway,
+                            prefix: ip.gateway_prefix_len.clamp(1, 128) as u8,
+                            dev,
+                        }),
+                    mark: rule.public.mark,
+                });
+                holders.push(crate::publicip::Holder {
+                    address,
+                    prefix,
+                    sandbox_id: rule.sandbox_id.clone(),
+                    is_waking,
+                });
+            }
+            if let Some((address, prefix)) = held.ipv6 {
+                let on_link = match public.is_ipv6_on_link {
+                    true => public.uplink(std::net::IpAddr::V6(address)).await,
+                    false => None,
+                };
+                routes.push(burrow_net::public::Route {
+                    tap: rule.tap.clone(),
+                    address: std::net::IpAddr::V6(address),
+                    prefix,
+                    on_link,
+                    egress: None,
+                    mark: 0,
+                });
+                holders.push(crate::publicip::Holder {
+                    address: std::net::IpAddr::V6(address),
+                    prefix,
+                    sandbox_id: rule.sandbox_id.clone(),
+                    is_waking,
+                });
+            }
+        }
+        self.public_index.replace(holders);
+        if let Err(err) = self.host_routes.sync(&routes).await {
+            tracing::error!(%err, "could not route every public address");
+        }
     }
 
     /// Replaces a sandbox's network policy and re-renders the boundary.
@@ -4912,15 +5322,12 @@ impl SandboxManager {
         // work and charging it to the guest would hide what the guest costs.
         let request = guestconn::handshake_full(
             from_warm,
-            from_warm.then(|| burrow_proto::guest::v1::NetworkConfig {
-                ip: lease.guest_ip.to_string(),
-                prefix_len: lease.prefix_len as u32,
-                gateway: lease.host_ip.to_string(),
-                dns: lease.host_ip.to_string(),
-                ip6: lease.guest_ip6().to_string(),
-                prefix_len6: lease.prefix_len6() as u32,
-                gateway6: lease.host_ip6().to_string(),
-            }),
+            self.guest_network(
+                &lease,
+                &[],
+                hypervisor.capabilities().is_tap_networked,
+                from_warm,
+            ),
             self.inspection_ca_for(&policy),
             self.trust_bundles_for(&template, &policy).await,
             crate::volume::agent_mounts(&policy.volumes, guest_os),
@@ -5105,6 +5512,7 @@ impl SandboxManager {
     pub async fn pause(&self, id: &str) -> Result<common::Sandbox, Status> {
         let sandbox = self.get(id).await?;
         sandbox.suspend().await?;
+        self.resync_public(&sandbox).await;
         self.usernets.detach(id, false);
         // The VM is stopped, so nothing is touching the volumes; a suspended
         // sandbox holding them would make a volume unusable until deleted.
@@ -5733,15 +6141,7 @@ impl SandboxManager {
         // the guest waits for the handshake to settle.
         let request = guestconn::handshake_full(
             true,
-            Some(burrow_proto::guest::v1::NetworkConfig {
-                ip: lease.guest_ip.to_string(),
-                prefix_len: lease.prefix_len as u32,
-                gateway: lease.host_ip.to_string(),
-                dns: lease.host_ip.to_string(),
-                ip6: lease.guest_ip6().to_string(),
-                prefix_len6: lease.prefix_len6() as u32,
-                gateway6: lease.host_ip6().to_string(),
-            }),
+            self.guest_network(&lease, &[], capabilities.is_tap_networked, true),
             self.inspection_ca_for(&policy),
             self.trust_bundles_for(&source.template(), &policy).await,
             crate::volume::agent_mounts(&policy.volumes, guest_os),
@@ -5841,6 +6241,12 @@ impl SandboxManager {
         // holds it has nothing to do.
         let policy = record.policy.clone().unwrap_or_default();
         let mut request = guestconn::handshake_request(true);
+        request.network = self.guest_network(
+            &sandbox.lease,
+            &record.public_ips,
+            sandbox.hypervisor.capabilities().is_tap_networked,
+            false,
+        );
         request.inspection_ca_pem = self.inspection_ca_for(&policy);
         request.extra_trust_bundles = self.trust_bundles_for(sandbox.template(), &policy).await;
         let inspection_root = self.inspection_root_of(&request);
@@ -5897,6 +6303,7 @@ impl SandboxManager {
                 "republishing ports after resume"
             );
         }
+        self.resync_public(&sandbox).await;
         self.open_session(&sandbox, STARTED_RESUME, Some(from))
             .await;
         self.persist(&sandbox).await;
@@ -5912,6 +6319,7 @@ impl SandboxManager {
         // would miss what was last written.
         flush_guest(&sandbox).await;
         sandbox.shutdown().await?;
+        self.resync_public(&sandbox).await;
         // Its memory is gone, so what the store holds is a guest that no
         // longer exists.
         self.forget_stored(&sandbox).await;
@@ -6041,7 +6449,12 @@ impl SandboxManager {
         }
         let request = guestconn::handshake_full(
             false,
-            None,
+            self.guest_network(
+                &sandbox.lease,
+                &sandbox.record().public_ips,
+                sandbox.hypervisor.capabilities().is_tap_networked,
+                false,
+            ),
             self.inspection_ca_for(&policy),
             self.trust_bundles_for(sandbox.template(), &policy).await,
             crate::volume::agent_mounts(&policy.volumes, guest_os),
@@ -6817,6 +7230,7 @@ impl SandboxManager {
             base.kit_credentials = record.kit_credentials.clone();
             base.kit_selection = record.kit_selection.clone();
             base.access_revoked_at_ms = record.access_revoked_at_ms;
+            base.public_ips = record.public_ips.clone();
         }
         *sandbox.usage.lock().unwrap() = Usage {
             cpu_usec: record.cpu_usage_usec.max(manifest.cpu_usage_usec),
@@ -7246,6 +7660,7 @@ pub(crate) mod tests {
                 guest_upgrade: None,
                 event_delivery: Default::default(),
                 disk: Default::default(),
+                public: Default::default(),
             },
             Arc::new(burrow_proxy::PolicyTable::default()),
             Arc::new(burrow_proxy::Resolutions::default()),

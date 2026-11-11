@@ -403,6 +403,34 @@ pub async fn apply_network(config: &burrow_proto::guest::v1::NetworkConfig) -> a
     Ok(())
 }
 
+/// Applies the public addresses a handshake or a live attach names.
+pub async fn apply_public(config: &burrow_proto::guest::v1::NetworkConfig) -> anyhow::Result<()> {
+    if config.ip.is_empty() {
+        return Ok(());
+    }
+    let parse6 = |value: &str| -> anyhow::Result<Option<std::net::Ipv6Addr>> {
+        Ok((!value.is_empty()).then(|| value.parse()).transpose()?)
+    };
+    let private = crate::linux::netconf::Private {
+        ip: config.ip.parse()?,
+        gateway: (!config.gateway.is_empty())
+            .then(|| config.gateway.parse())
+            .transpose()?,
+        ip6: parse6(&config.ip6)?,
+        gateway6: parse6(&config.gateway6)?,
+    };
+    let public = config
+        .public_addresses
+        .iter()
+        .map(|address| {
+            let parsed: std::net::IpAddr = address.address.parse()?;
+            let width = if parsed.is_ipv4() { 32 } else { 128 };
+            Ok((parsed, address.prefix_len.clamp(1, width) as u8))
+        })
+        .collect::<anyhow::Result<Vec<_>>>()?;
+    crate::linux::netconf::apply_public(private, &public).await
+}
+
 #[cfg(test)]
 mod trust_bundle_tests {
     use super::*;

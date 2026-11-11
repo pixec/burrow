@@ -205,6 +205,145 @@ async fn configure(
     Ok(())
 }
 
+/// The private addresses and gateways the public ones sit beside.
+pub struct Private {
+    pub ip: Ipv4Addr,
+    pub gateway: Option<Ipv4Addr>,
+    pub ip6: Option<Ipv6Addr>,
+    pub gateway6: Option<Ipv6Addr>,
+}
+
+/// The fleet's sandbox pools, kept on the private addresses: a peer or the
+/// node knows this sandbox by its lease, not by a public address.
+const POOL: (Ipv4Addr, u8) = (Ipv4Addr::new(10, 99, 0, 0), 16);
+const POOL6: (Ipv6Addr, u8) = (Ipv6Addr::new(0xfd99, 0xb070, 0, 0, 0, 0, 0, 0), 48);
+
+/// Makes the interface hold exactly `public` beside the private addresses,
+/// and the first public address of each family the source of its default
+/// route.
+pub async fn apply_public(
+    private: Private,
+    public: &[(std::net::IpAddr, u8)],
+) -> anyhow::Result<()> {
+    match NETLINK.get() {
+        Some(netlink) => configure_public(&netlink.handle, netlink.index, &private, public).await,
+        None => {
+            let (connection, handle, _) = rtnetlink::new_connection()?;
+            let connection = tokio::spawn(connection);
+            let index = link_index(&handle).await?;
+            let result = configure_public(&handle, index, &private, public).await;
+            drop(handle);
+            connection.abort();
+            result
+        }
+    }
+}
+
+async fn configure_public(
+    handle: &Handle,
+    index: u32,
+    private: &Private,
+    public: &[(std::net::IpAddr, u8)],
+) -> anyhow::Result<()> {
+    use netlink_packet_route::address::AddressAttribute;
+    use std::net::IpAddr;
+
+    let _applying = APPLYING.lock().await;
+    let held: Vec<_> = handle
+        .address()
+        .get()
+        .set_link_index_filter(index)
+        .execute()
+        .try_collect()
+        .await?;
+    for message in held {
+        let address = message.attributes.iter().find_map(|attr| match attr {
+            AddressAttribute::Address(address) => Some(*address),
+            _ => None,
+        });
+        let Some(address) = address else {
+            continue;
+        };
+        let is_kept = match address {
+            IpAddr::V4(v4) => v4 == private.ip,
+            IpAddr::V6(v6) => Some(v6) == private.ip6 || v6.is_unicast_link_local(),
+        } || public.iter().any(|(held, _)| *held == address);
+        if !is_kept && let Err(err) = handle.address().del(message).execute().await {
+            tracing::warn!(%address, %err, "could not remove a public address");
+        }
+    }
+    for (address, prefix) in public {
+        let mut add = handle.address().add(index, *address, *prefix).replace();
+        // No duplicate detection: the host routes this address to this link
+        // alone, and a tentative address cannot be the source of a route.
+        if address.is_ipv6() {
+            use netlink_packet_route::address::{AddressFlags, AddressHeaderFlags};
+            let message = add.message_mut();
+            message.header.flags |= AddressHeaderFlags::Nodad;
+            message
+                .attributes
+                .push(AddressAttribute::Flags(AddressFlags::Nodad));
+        }
+        add.execute().await?;
+    }
+
+    let source4 = public.iter().find_map(|(address, _)| match address {
+        IpAddr::V4(v4) => Some(*v4),
+        IpAddr::V6(_) => None,
+    });
+    if let Some(gateway) = private.gateway {
+        remove_default_routes(handle).await;
+        let mut route = RouteMessageBuilder::<Ipv4Addr>::new()
+            .gateway(gateway)
+            .output_interface(index);
+        if let Some(source) = source4 {
+            route = route.pref_source(source);
+        }
+        handle
+            .route()
+            .add(route.build())
+            .replace()
+            .execute()
+            .await?;
+        let pool = RouteMessageBuilder::<Ipv4Addr>::new()
+            .destination_prefix(POOL.0, POOL.1)
+            .gateway(gateway)
+            .pref_source(private.ip)
+            .output_interface(index)
+            .build();
+        handle.route().add(pool).replace().execute().await?;
+    }
+
+    let source6 = public.iter().find_map(|(address, _)| match address {
+        IpAddr::V6(v6) => Some(*v6),
+        IpAddr::V4(_) => None,
+    });
+    if let Some(gateway6) = private.gateway6 {
+        remove_default_routes6(handle).await;
+        let mut route = RouteMessageBuilder::<Ipv6Addr>::new()
+            .gateway(gateway6)
+            .output_interface(index);
+        if let Some(source) = source6 {
+            route = route.pref_source(source);
+        }
+        if let Err(err) = handle.route().add(route.build()).replace().execute().await {
+            tracing::warn!(%err, "could not set the guest's IPv6 default route");
+        }
+        // Source selection prefers the lease's ULA for the pool by itself.
+        if private.ip6.is_some() {
+            let pool = RouteMessageBuilder::<Ipv6Addr>::new()
+                .destination_prefix(POOL6.0, POOL6.1)
+                .gateway(gateway6)
+                .output_interface(index)
+                .build();
+            if let Err(err) = handle.route().add(pool).replace().execute().await {
+                tracing::warn!(%err, "could not route the sandbox pool over the private IPv6 address");
+            }
+        }
+    }
+    Ok(())
+}
+
 async fn link_index(handle: &Handle) -> anyhow::Result<u32> {
     let mut links = handle
         .link()

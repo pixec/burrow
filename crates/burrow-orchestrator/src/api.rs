@@ -18,6 +18,9 @@ use burrow_proto::node::v1::node_service_client::NodeServiceClient;
 
 use crate::OrchestratorState;
 
+#[path = "ips.rs"]
+pub mod ips;
+
 type BoxStream<T> = Pin<Box<dyn Stream<Item = Result<T, Status>> + Send>>;
 pub type NodeClient = NodeServiceClient<
     tonic::service::interceptor::InterceptedService<tonic::transport::Channel, NodeAuth>,
@@ -1300,7 +1303,16 @@ impl Burrow for ApiService {
         &self,
         req: Request<api::CreateSandboxRequest>,
     ) -> Result<Response<common::Sandbox>, Status> {
+        let metadata = req.metadata().clone();
         let mut req = req.into_inner();
+        let (public_ips, ip_node, ip_labels) =
+            self.ips_for_create(&metadata, &req.public_ips).await?;
+        if !public_ips.is_empty() && !req.snapshot.is_empty() {
+            return Err(Status::invalid_argument(
+                "attach public IPs to a sandbox created from a snapshot once it exists",
+            ));
+        }
+        req.node_labels.extend(ip_labels);
         // Refused here as well as on the node: placement charges a node and
         // may replicate a template before the create is ever sent, and none of
         // that should be spent on a request the node will reject anyway.
@@ -1467,6 +1479,15 @@ impl Burrow for ApiService {
                     .unwrap_or_default(),
             )
             .await?;
+        let pinned = match (pinned, ip_node) {
+            (Some(volumes), Some(ips)) if volumes != ips => {
+                return Err(Status::failed_precondition(format!(
+                    "the requested volumes are on node {volumes} and the requested static IPs \
+                     reach only node {ips}"
+                )));
+            }
+            (volumes, ips) => volumes.or(ips),
+        };
         // Whether `place_for` charged the node for this sandbox. A
         // volume-pinned create never goes through placement, so nothing was
         // reserved for it, and a guard over it would refund a charge it never
@@ -1578,6 +1599,13 @@ impl Burrow for ApiService {
         // holding open on its behalf.
         drop(reserved);
         self.write_through().await;
+        let sandbox = match public_ips.is_empty() {
+            true => sandbox,
+            false => {
+                self.attach_for_create(&sandbox.id, public_ips).await?;
+                self.0.sandboxes.get(&sandbox.id).unwrap_or(sandbox)
+            }
+        };
         // The node's record is the truth rather than the request: it carries
         // the state and addresses the node actually assigned.
         tracing::info!(sandbox = sandbox.id, node = node_id, "sandbox placed");
@@ -1648,6 +1676,7 @@ impl Burrow for ApiService {
         if node_id.is_empty() {
             self.purge(&id).await?;
             self.0.sandboxes.remove(&id);
+            self.forget_attachments(&id).await;
             self.write_through().await;
             return Ok(Response::new(api::DeleteSandboxResponse {}));
         }
@@ -1674,6 +1703,7 @@ impl Burrow for ApiService {
                     "node is unreachable; forgetting the sandbox and recording a \
                      tombstone. It will be destroyed if the node returns"
                 );
+                self.forget_attachments(&id).await;
                 self.write_through().await;
                 return Ok(Response::new(api::DeleteSandboxResponse {}));
             }
@@ -1688,6 +1718,7 @@ impl Burrow for ApiService {
         if let Some(sandbox) = self.0.sandboxes.remove(&id) {
             self.release_charge(&sandbox);
         }
+        self.forget_attachments(&id).await;
         self.write_through().await;
         Ok(Response::new(api::DeleteSandboxResponse {}))
     }
@@ -2008,6 +2039,11 @@ impl Burrow for ApiService {
                 "sandbox {id} mounts volumes, which are node-local and do not move"
             )));
         }
+        self.require_movable(
+            &id,
+            (!req.node_id.is_empty()).then_some(req.node_id.as_str()),
+        )
+        .await?;
         if current.arch.is_empty() {
             let info = self.0.nodes.info(&source).unwrap_or_default();
             current.hypervisor_version =
@@ -2065,9 +2101,18 @@ impl Burrow for ApiService {
             released.hypervisor_version = current.hypervisor_version;
         }
         tracing::info!(sandbox = id, node = source, "sandbox released for a move");
+        // The source has let go of its addresses; the provider delivers them
+        // to the target before it restores the sandbox and brings them up.
+        if let Err(err) = self.route_to(&id, &target).await {
+            let _ = self.route_to(&id, &source).await;
+            return Err(self.hand_back(released, &source, &target, err).await);
+        }
         let moved = match self.adopt(released.clone(), &target, req.node_labels).await {
             Ok(moved) => moved,
-            Err(err) => return Err(self.hand_back(released, &source, &target, err).await),
+            Err(err) => {
+                let _ = self.route_to(&id, &source).await;
+                return Err(self.hand_back(released, &source, &target, err).await);
+            }
         };
         if let Some((_, guard)) = placed {
             guard.keep();
@@ -2311,6 +2356,111 @@ impl Burrow for ApiService {
         // would leave disk nothing ever reclaims.
         self.0.volumes.remove(&name);
         Ok(Response::new(api::DeleteVolumeResponse {}))
+    }
+
+    async fn allocate_ip(
+        &self,
+        req: Request<api::AllocateIpRequest>,
+    ) -> Result<Response<common::PublicIp>, Status> {
+        let metadata = req.metadata().clone();
+        Ok(Response::new(
+            self.allocate_ip_inner(&metadata, req.into_inner()).await?,
+        ))
+    }
+
+    async fn release_ip(
+        &self,
+        req: Request<api::IpRef>,
+    ) -> Result<Response<api::ReleaseIpResponse>, Status> {
+        let metadata = req.metadata().clone();
+        self.release_ip_inner(&metadata, &req.into_inner().address)
+            .await?;
+        Ok(Response::new(api::ReleaseIpResponse {}))
+    }
+
+    async fn attach_ip(
+        &self,
+        req: Request<api::AttachIpRequest>,
+    ) -> Result<Response<common::PublicIp>, Status> {
+        let metadata = req.metadata().clone();
+        let req = req.into_inner();
+        Ok(Response::new(
+            self.attach_ip_inner(&metadata, &req.address, &req.sandbox_id)
+                .await?,
+        ))
+    }
+
+    async fn detach_ip(
+        &self,
+        req: Request<api::IpRef>,
+    ) -> Result<Response<common::PublicIp>, Status> {
+        let metadata = req.metadata().clone();
+        Ok(Response::new(
+            self.detach_ip_inner(&metadata, &req.into_inner().address)
+                .await?,
+        ))
+    }
+
+    async fn list_ips(
+        &self,
+        req: Request<api::ListIpsRequest>,
+    ) -> Result<Response<api::ListIpsResponse>, Status> {
+        let metadata = req.metadata().clone();
+        let ips = self.list_ips_inner(&metadata, req.into_inner()).await?;
+        Ok(Response::new(api::ListIpsResponse { ips }))
+    }
+
+    async fn set_ip_rdns(
+        &self,
+        req: Request<api::SetIpRdnsRequest>,
+    ) -> Result<Response<common::PublicIp>, Status> {
+        let metadata = req.metadata().clone();
+        let req = req.into_inner();
+        Ok(Response::new(
+            self.set_ip_rdns_inner(&metadata, &req.address, &req.name)
+                .await?,
+        ))
+    }
+
+    async fn create_ip_pool(
+        &self,
+        req: Request<common::IpPool>,
+    ) -> Result<Response<common::IpPool>, Status> {
+        let metadata = req.metadata().clone();
+        Ok(Response::new(
+            self.create_ip_pool_inner(&metadata, req.into_inner(), false)
+                .await?,
+        ))
+    }
+
+    async fn update_ip_pool(
+        &self,
+        req: Request<common::IpPool>,
+    ) -> Result<Response<common::IpPool>, Status> {
+        let metadata = req.metadata().clone();
+        Ok(Response::new(
+            self.create_ip_pool_inner(&metadata, req.into_inner(), true)
+                .await?,
+        ))
+    }
+
+    async fn delete_ip_pool(
+        &self,
+        req: Request<api::IpPoolRef>,
+    ) -> Result<Response<api::DeleteIpPoolResponse>, Status> {
+        let metadata = req.metadata().clone();
+        self.delete_ip_pool_inner(&metadata, &req.into_inner().name)
+            .await?;
+        Ok(Response::new(api::DeleteIpPoolResponse {}))
+    }
+
+    async fn list_ip_pools(
+        &self,
+        _req: Request<api::ListIpPoolsRequest>,
+    ) -> Result<Response<api::ListIpPoolsResponse>, Status> {
+        Ok(Response::new(api::ListIpPoolsResponse {
+            pools: self.list_ip_pools_inner().await?,
+        }))
     }
 
     /// Replaces a sandbox's tags on the owning node.
@@ -3373,6 +3523,7 @@ mod tests {
             channels: NodeChannels::default(),
             node_token: None,
             sandbox_lease_secs: 0,
+            ips: Default::default(),
         }))
     }
 

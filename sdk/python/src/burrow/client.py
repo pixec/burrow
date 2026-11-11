@@ -11,6 +11,7 @@ from ._policy import to_policy
 from ._transport import _DEFAULT, Transport
 from ._wire import at, at_or_none, label, unix_ms, value
 from .errors import BurrowError
+from .ip import Ips
 from .sandbox import Sandbox, _state_of, _to_kit_spec, _to_sandbox_info
 from .snapshot import Snapshot
 from .template import BuildLogEvent, TemplateBuilder, build_template, to_template_info
@@ -49,6 +50,7 @@ class Sandboxes:
         name: str = "",
         tags: Optional[Dict[str, str]] = None,
         node_labels: Optional[Dict[str, str]] = None,
+        public_ips: Optional[List[str]] = None,
         resources: Any = None,
         lifetime: Any = None,
         snapshots: Any = None,
@@ -73,8 +75,10 @@ class Sandboxes:
         Policy sections take their dataclass (`ResourcePolicy`,
         `LifetimePolicy`, `SnapshotPolicy`, `NetworkPolicy`, `ExecPolicy`,
         `FsPolicy`) or a dict of the same fields; `network_policy` also takes
-        a bare mode. `env` is merged under every command this handle runs and
-        lives on the handle alone.
+        a bare mode. `public_ips` are allocated addresses attached once it is
+        up; a static one places the sandbox on the node it reaches. `env` is
+        merged under every command this handle runs and lives on the handle
+        alone.
         """
         # A snapshot carries its own template, and one that disagrees is an
         # error, so nothing is sent as if the caller had asked for it. Without
@@ -105,6 +109,7 @@ class Sandboxes:
                 volumes=volumes,
             ),
             kit=_to_kit_spec(kit),
+            public_ips=public_ips or [],
         )
         raw = self._transport.unary("CreateSandbox", request, timeout)
         sandbox = Sandbox(self._transport.retain(), _to_sandbox_info(raw), True, auto_resume, env)
@@ -306,8 +311,8 @@ class Templates:
 class Burrow:
     """A connection to a burrow control plane.
 
-    Sandboxes, snapshots, volumes and templates hang off it and share its
-    channel; the rest is the fleet's: health, audit, events, usage, nodes and
+    Sandboxes, snapshots, volumes, templates and public IPs hang off it and
+    share its channel; the rest is the fleet's: health, audit, events, usage, nodes and
     secrets.
 
     ```python
@@ -335,6 +340,7 @@ class Burrow:
         self.snapshots = Snapshots(self._transport)
         self.volumes = Volumes(self._transport)
         self.templates = Templates(self._transport)
+        self.ips = Ips(self._transport)
 
     def health(self) -> Health:
         res = self._transport.unary("Health", api_pb2.HealthRequest())

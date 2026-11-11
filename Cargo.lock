@@ -779,6 +779,7 @@ dependencies = [
  "hex",
  "hyper-util",
  "libc",
+ "nfq",
  "opentelemetry",
  "prost",
  "reqwest",
@@ -858,9 +859,11 @@ dependencies = [
  "burrow-store",
  "clap",
  "futures",
+ "hex",
  "prost",
  "serde",
  "serde_json",
+ "sha2 0.10.9",
  "thiserror 2.0.20",
  "tokio",
  "tokio-stream",
@@ -2450,6 +2453,18 @@ dependencies = [
  "libc",
  "log",
  "tokio",
+]
+
+[[package]]
+name = "nfq"
+version = "0.2.6"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "b36d0d229b49eb06057d61a09d7bcba023e31920530ddd00031d6ce6d256ccfe"
+dependencies = [
+ "bytes",
+ "libc",
+ "rustix",
+ "zerocopy",
 ]
 
 [[package]]

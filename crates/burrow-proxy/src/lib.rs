@@ -379,14 +379,17 @@ impl Proxy {
         // are held for as long as this takes: a destination that accepts SYNs
         // and never completes would otherwise hold both until the kernel gave
         // up, minutes later.
-        let connected = tokio::time::timeout(CONNECT_TIMEOUT, TcpStream::connect(original))
-            .await
-            .unwrap_or_else(|_| {
-                Err(std::io::Error::new(
-                    std::io::ErrorKind::TimedOut,
-                    "upstream did not answer in time",
-                ))
-            });
+        let connected = tokio::time::timeout(
+            CONNECT_TIMEOUT,
+            connect_marked(original, policy.egress_mark),
+        )
+        .await
+        .unwrap_or_else(|_| {
+            Err(std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                "upstream did not answer in time",
+            ))
+        });
         let mut upstream = match connected {
             Ok(stream) => stream,
             Err(err) => {
@@ -1458,6 +1461,23 @@ fn original_dst_v6(stream: &TcpStream) -> std::io::Result<SocketAddr> {
         std::net::Ipv6Addr::from(addr.sin6_addr.s6_addr),
         u16::from_be(addr.sin6_port),
     )))
+}
+
+/// Dials `address`, marking the socket first when `mark` is set: a sandbox
+/// with a public address has its upstream connections translated to it by
+/// the node, which knows them by the mark.
+async fn connect_marked(address: SocketAddr, mark: u32) -> std::io::Result<TcpStream> {
+    if mark == 0 {
+        return TcpStream::connect(address).await;
+    }
+    let socket = match address {
+        SocketAddr::V4(_) => tokio::net::TcpSocket::new_v4()?,
+        SocketAddr::V6(_) => tokio::net::TcpSocket::new_v6()?,
+    };
+    #[cfg(target_os = "linux")]
+    nix::sys::socket::setsockopt(&socket, nix::sys::socket::sockopt::Mark, &mark)
+        .map_err(std::io::Error::from)?;
+    socket.connect(address).await
 }
 
 pub fn unix_now_ms() -> i64 {

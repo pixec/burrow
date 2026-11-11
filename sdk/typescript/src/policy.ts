@@ -10,6 +10,7 @@ import type {
   ExecPolicy,
   FsOptions,
   FsPolicy,
+  IngressRule,
   KitOptions,
   LifetimeOptions,
   LifetimePolicy,
@@ -305,6 +306,63 @@ function fromPortRule(raw: any): PortRule {
   return rule;
 }
 
+const INGRESS_PREFIX = "INGRESS_PROTOCOL_";
+const INGRESS_PROTOCOLS = ["tcp", "udp", "icmp"] as const;
+const INGRESS_KEYS = new Set(["protocol", "ports", "sources"]);
+
+/** Builds one wire `IngressRule`, refusing what would otherwise be misread. */
+function toIngressRule(index: number, rule: IngressRule): any {
+  const where = `networkPolicy.ingress[${index}]`;
+  for (const key of Object.keys(rule ?? {})) {
+    if (INGRESS_KEYS.has(key)) continue;
+    throw new BurrowError(
+      `${where}: unknown key ${JSON.stringify(key)}; one of protocol, ports, sources`,
+      "invalid_argument",
+    );
+  }
+  if (
+    rule.protocol !== undefined &&
+    !(INGRESS_PROTOCOLS as readonly string[]).includes(rule.protocol)
+  ) {
+    throw new BurrowError(
+      `${where}: unknown protocol ${JSON.stringify(rule.protocol)}; tcp, udp, icmp, or omitted for both`,
+      "invalid_argument",
+    );
+  }
+  const ports = (rule.ports ?? []).map((entry) => {
+    const match = /^(\d+)(?:-(\d+))?$/.exec(String(entry));
+    if (!match) {
+      throw new BurrowError(
+        `${where}: port ${JSON.stringify(entry)} is not N or N-M`,
+        "invalid_argument",
+      );
+    }
+    return { port: Number(match[1]), portEnd: match[2] ? Number(match[2]) : 0 };
+  });
+  return {
+    protocol:
+      rule.protocol === undefined
+        ? "INGRESS_PROTOCOL_UNSPECIFIED"
+        : enumTo(INGRESS_PREFIX, rule.protocol),
+    ports,
+    sources: rule.sources ?? [],
+  };
+}
+
+/** Reads one wire `IngressRule` back, ports as numbers or `"N-M"` ranges. */
+function fromIngressRule(raw: any): IngressRule {
+  const rule: IngressRule = {};
+  const protocol = enumOf(raw?.protocol, INGRESS_PREFIX, INGRESS_PROTOCOLS);
+  if (protocol !== "unknown") rule.protocol = protocol;
+  if (raw?.ports?.length) {
+    rule.ports = raw.ports.map((range: any) =>
+      Number(range?.portEnd ?? 0) ? `${range.port}-${range.portEnd}` : Number(range?.port ?? 0),
+    );
+  }
+  if (raw?.sources?.length) rule.sources = raw.sources;
+  return rule;
+}
+
 /** Builds the wire `NetworkPolicy`. Defaults to no egress at all. */
 export function toNetworkPolicy(options: NetworkPolicyOptions = {}): any {
   const mode = options.mode ?? "none";
@@ -335,6 +393,7 @@ export function toNetworkPolicy(options: NetworkPolicyOptions = {}): any {
     denyDomains: options.denyDomains ?? [],
     denyPorts: (options.denyPorts ?? []).map((rule, index) => toPortRule(index, rule)),
     isIpv6Denied: options.denyIpv6 ?? false,
+    ingress: (options.ingress ?? []).map((rule, index) => toIngressRule(index, rule)),
     isTlsInspected: options.inspectTls ?? false,
     rules: rules.map(toRequestRule),
   };
@@ -352,6 +411,7 @@ export function fromNetworkPolicy(raw: any): NetworkPolicy {
     denyDomains: raw?.denyDomains ?? [],
     denyPorts: (raw?.denyPorts ?? []).map(fromPortRule),
     denyIpv6: Boolean(raw?.isIpv6Denied),
+    ingress: (raw?.ingress ?? []).map(fromIngressRule),
     inspectTls: Boolean(raw?.isTlsInspected),
     rules: (raw?.rules ?? []).map(fromRequestRule),
   };

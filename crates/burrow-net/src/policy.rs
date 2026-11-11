@@ -344,6 +344,162 @@ pub(crate) fn validated_denials(
     Some(Denials { cidrs, ports })
 }
 
+/// Most ingress rules one policy may carry, and most ports or sources one rule
+/// may name.
+pub const MAX_INGRESS_RULES: usize = 64;
+pub const MAX_INGRESS_ENTRIES: usize = 16;
+
+/// What an ingress rule admits.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum IngressProtocol {
+    /// TCP and UDP.
+    #[default]
+    Both,
+    Tcp,
+    Udp,
+    /// Echo requests, in the family each source names.
+    Icmp,
+}
+
+/// One `NetworkPolicy.ingress` entry as the caller wrote it.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct IngressRule {
+    pub protocol: IngressProtocol,
+    /// `(first, last)`, with 0 as `last` meaning `first` alone. Empty is every
+    /// port.
+    pub ports: Vec<(u32, u32)>,
+    /// Source ranges of either family. Empty is anyone.
+    pub sources: Vec<String>,
+}
+
+impl From<&burrow_proto::common::v1::IngressRule> for IngressRule {
+    fn from(rule: &burrow_proto::common::v1::IngressRule) -> Self {
+        use burrow_proto::common::v1::IngressProtocol as Proto;
+        Self {
+            protocol: match Proto::try_from(rule.protocol) {
+                Ok(Proto::Tcp) => IngressProtocol::Tcp,
+                Ok(Proto::Udp) => IngressProtocol::Udp,
+                Ok(Proto::Icmp) => IngressProtocol::Icmp,
+                _ => IngressProtocol::Both,
+            },
+            ports: rule.ports.iter().map(|r| (r.port, r.port_end)).collect(),
+            sources: rule.sources.clone(),
+        }
+    }
+}
+
+/// A validated [`IngressRule`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct Door {
+    pub(crate) protocol: IngressProtocol,
+    pub(crate) ports: Vec<(u16, u16)>,
+    pub(crate) sources: Vec<Cidr>,
+}
+
+impl Door {
+    fn validate(rule: &IngressRule) -> Option<Self> {
+        if rule.ports.len() > MAX_INGRESS_ENTRIES || rule.sources.len() > MAX_INGRESS_ENTRIES {
+            return None;
+        }
+        if rule.protocol == IngressProtocol::Icmp && !rule.ports.is_empty() {
+            return None;
+        }
+        let ports = rule
+            .ports
+            .iter()
+            .map(|(first, last)| {
+                let first = u16::try_from(*first).ok().filter(|p| *p != 0)?;
+                let last = match last {
+                    0 => first,
+                    last => u16::try_from(*last).ok().filter(|l| *l >= first)?,
+                };
+                Some((first, last))
+            })
+            .collect::<Option<Vec<_>>>()?;
+        let sources = rule
+            .sources
+            .iter()
+            .map(|entry| parse_cidr(entry))
+            .collect::<Option<Vec<_>>>()?;
+        Some(Self {
+            protocol: rule.protocol,
+            ports,
+            sources,
+        })
+    }
+
+    /// The ports as an nftables value, `{ 25, 465-587 }`, or `None` for every
+    /// port.
+    pub(crate) fn port_set(&self) -> Option<String> {
+        if self.ports.is_empty() {
+            return None;
+        }
+        let ports: Vec<String> = self
+            .ports
+            .iter()
+            .map(|(first, last)| match first == last {
+                true => first.to_string(),
+                false => format!("{first}-{last}"),
+            })
+            .collect();
+        Some(format!("{{ {} }}", ports.join(", ")))
+    }
+
+    /// The sources of one family, `None` when the rule admits anyone and an
+    /// empty list when it names only the other family's.
+    pub(crate) fn sources_of(&self, is_v4: bool) -> Option<Vec<Cidr>> {
+        if self.sources.is_empty() {
+            return None;
+        }
+        Some(
+            self.sources
+                .iter()
+                .copied()
+                .filter(|cidr| cidr.is_v4() == is_v4)
+                .collect(),
+        )
+    }
+
+    /// Whether this admits `transport` from `source` on `port`.
+    #[cfg(test)]
+    pub(crate) fn admits(&self, source: IpAddr, transport: Transport, port: u16) -> bool {
+        let is_protocol = matches!(
+            (self.protocol, transport),
+            (IngressProtocol::Both, Transport::Tcp | Transport::Udp)
+                | (IngressProtocol::Tcp, Transport::Tcp)
+                | (IngressProtocol::Udp, Transport::Udp)
+                | (IngressProtocol::Icmp, Transport::Icmp)
+        );
+        is_protocol
+            && (self.ports.is_empty()
+                || self
+                    .ports
+                    .iter()
+                    .any(|(first, last)| (*first..=*last).contains(&port)))
+            && (self.sources.is_empty() || self.sources.iter().any(|cidr| cidr.contains(source)))
+    }
+}
+
+/// A sandbox's validated ingress, or `None` when any rule is malformed, which
+/// admits nothing at all rather than the rules that happened to parse.
+pub(crate) fn validated_ingress(sandbox_id: &str, rules: &[IngressRule]) -> Option<Vec<Door>> {
+    if rules.len() > MAX_INGRESS_RULES {
+        tracing::error!(
+            sandbox = sandbox_id,
+            "rejecting an oversized ingress list; nothing is admitted"
+        );
+        return None;
+    }
+    let doors = rules.iter().map(Door::validate).collect::<Option<Vec<_>>>();
+    if doors.is_none() {
+        tracing::error!(
+            sandbox = sandbox_id,
+            "rejecting a malformed ingress rule; nothing is admitted"
+        );
+    }
+    doors
+}
+
 /// What a sandbox's policy refuses ahead of every allowance, as the caller
 /// wrote it.
 #[derive(Debug, Clone, Copy, Default)]
@@ -603,6 +759,7 @@ mod tests {
             peers: vec![],
             ports: vec![],
             inspected: None,
+            public: Default::default(),
         }
     }
 

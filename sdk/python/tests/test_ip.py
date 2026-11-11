@@ -1,0 +1,88 @@
+"""Ingress rules and public IPs, as they reach and come back from the wire."""
+
+import pytest
+
+from burrow import BurrowError, IngressRule, IpPool
+from burrow._pb import common_pb2
+from burrow._policy import from_network_policy, network_policy, to_network_policy
+from burrow.ip import from_pool, to_pool, to_public_ip
+
+
+def test_ingress_rules_reach_the_wire_and_read_back():
+    wire = to_network_policy(
+        network_policy(
+            {
+                "mode": "open",
+                "ingress": [
+                    {"protocol": "tcp", "ports": [25, 587]},
+                    {"protocol": "tcp", "ports": [22], "sources": ["203.0.113.0/24"]},
+                    {"protocol": "udp", "ports": ["27000-27015"]},
+                    IngressRule(protocol="icmp"),
+                    {},
+                ],
+            }
+        )
+    )
+    assert wire.ingress[0].protocol == common_pb2.INGRESS_PROTOCOL_TCP
+    assert [p.port for p in wire.ingress[0].ports] == [25, 587]
+    assert wire.ingress[2].ports[0].port_end == 27015
+    assert wire.ingress[4].protocol == common_pb2.INGRESS_PROTOCOL_UNSPECIFIED
+    back = from_network_policy(wire).ingress
+    assert back[1] == IngressRule(protocol="tcp", ports=[22], sources=["203.0.113.0/24"])
+    assert back[2].ports == ["27000-27015"]
+    assert back[3] == IngressRule(protocol="icmp")
+    assert back[4] == IngressRule()
+
+
+@pytest.mark.parametrize(
+    "rule",
+    [{"protocol": "sctp"}, {"port": 22}, {"ports": ["22-"]}, {"ports": [True]}],
+)
+def test_a_misspelt_ingress_rule_is_refused(rule):
+    with pytest.raises(BurrowError):
+        network_policy({"ingress": [rule]})
+
+
+def test_a_pool_maps_its_friendly_keys():
+    pool = to_pool(
+        {
+            "name": "rack-a",
+            "node_id": "node-a",
+            "ranges": ["203.0.113.16-203.0.113.30"],
+            "on_link": True,
+            "node_labels": {"rack": "b7"},
+            "provider": "ovh",
+        }
+    )
+    assert pool.is_on_link and pool.ranges == ["203.0.113.16-203.0.113.30"]
+    assert dict(pool.node_labels) == {"rack": "b7"}
+    assert pool.provider == common_pb2.IP_PROVIDER_OVH
+    assert from_pool(pool) == IpPool(
+        name="rack-a",
+        node_id="node-a",
+        node_labels={"rack": "b7"},
+        provider="ovh",
+        ranges=["203.0.113.16-203.0.113.30"],
+        on_link=True,
+    )
+    with pytest.raises(BurrowError):
+        to_pool({"name": "rack-a", "mode": "nat"})
+    with pytest.raises(BurrowError):
+        to_pool({"name": "rack-a", "provider": "aws"})
+
+
+def test_a_public_ip_reads_back():
+    ip = to_public_ip(
+        common_pb2.PublicIp(
+            address="203.0.113.17",
+            family=4,
+            sandbox_id="sbx_a",
+            provider=common_pb2.IP_PROVIDER_STATIC,
+            state=common_pb2.PUBLIC_IP_STATE_ALLOCATED,
+            allocated_at_unix_ms=1_700_000_000_000,
+        )
+    )
+    assert ip.address == "203.0.113.17" and ip.sandbox_id == "sbx_a" and not ip.movable
+    assert ip.provider == "static" and ip.state == "allocated"
+    assert int(ip.allocated_at.timestamp()) == 1_700_000_000
+    assert ip.attached_at is None

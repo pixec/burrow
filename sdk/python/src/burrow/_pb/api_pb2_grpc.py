@@ -187,6 +187,56 @@ class BurrowStub(object):
                 request_serializer=api__pb2.VolumeRef.SerializeToString,
                 response_deserializer=api__pb2.DeleteVolumeResponse.FromString,
                 _registered_method=True)
+        self.AllocateIp = channel.unary_unary(
+                '/burrow.api.v1.Burrow/AllocateIp',
+                request_serializer=api__pb2.AllocateIpRequest.SerializeToString,
+                response_deserializer=common__pb2.PublicIp.FromString,
+                _registered_method=True)
+        self.ReleaseIp = channel.unary_unary(
+                '/burrow.api.v1.Burrow/ReleaseIp',
+                request_serializer=api__pb2.IpRef.SerializeToString,
+                response_deserializer=api__pb2.ReleaseIpResponse.FromString,
+                _registered_method=True)
+        self.AttachIp = channel.unary_unary(
+                '/burrow.api.v1.Burrow/AttachIp',
+                request_serializer=api__pb2.AttachIpRequest.SerializeToString,
+                response_deserializer=common__pb2.PublicIp.FromString,
+                _registered_method=True)
+        self.DetachIp = channel.unary_unary(
+                '/burrow.api.v1.Burrow/DetachIp',
+                request_serializer=api__pb2.IpRef.SerializeToString,
+                response_deserializer=common__pb2.PublicIp.FromString,
+                _registered_method=True)
+        self.ListIps = channel.unary_unary(
+                '/burrow.api.v1.Burrow/ListIps',
+                request_serializer=api__pb2.ListIpsRequest.SerializeToString,
+                response_deserializer=api__pb2.ListIpsResponse.FromString,
+                _registered_method=True)
+        self.SetIpRdns = channel.unary_unary(
+                '/burrow.api.v1.Burrow/SetIpRdns',
+                request_serializer=api__pb2.SetIpRdnsRequest.SerializeToString,
+                response_deserializer=common__pb2.PublicIp.FromString,
+                _registered_method=True)
+        self.CreateIpPool = channel.unary_unary(
+                '/burrow.api.v1.Burrow/CreateIpPool',
+                request_serializer=common__pb2.IpPool.SerializeToString,
+                response_deserializer=common__pb2.IpPool.FromString,
+                _registered_method=True)
+        self.UpdateIpPool = channel.unary_unary(
+                '/burrow.api.v1.Burrow/UpdateIpPool',
+                request_serializer=common__pb2.IpPool.SerializeToString,
+                response_deserializer=common__pb2.IpPool.FromString,
+                _registered_method=True)
+        self.DeleteIpPool = channel.unary_unary(
+                '/burrow.api.v1.Burrow/DeleteIpPool',
+                request_serializer=api__pb2.IpPoolRef.SerializeToString,
+                response_deserializer=api__pb2.DeleteIpPoolResponse.FromString,
+                _registered_method=True)
+        self.ListIpPools = channel.unary_unary(
+                '/burrow.api.v1.Burrow/ListIpPools',
+                request_serializer=api__pb2.ListIpPoolsRequest.SerializeToString,
+                response_deserializer=api__pb2.ListIpPoolsResponse.FromString,
+                _registered_method=True)
         self.Exec = channel.stream_stream(
                 '/burrow.api.v1.Burrow/Exec',
                 request_serializer=api__pb2.ExecInput.SerializeToString,
@@ -544,6 +594,70 @@ class BurrowServicer(object):
         context.set_details('Method not implemented!')
         raise NotImplementedError('Method not implemented!')
 
+    def AllocateIp(self, request, context):
+        """Dedicated public IPs: allocated from a pool within the caller's quota,
+        attached to a sandbox, kept until released, then quarantined.
+        """
+        context.set_code(grpc.StatusCode.UNIMPLEMENTED)
+        context.set_details('Method not implemented!')
+        raise NotImplementedError('Method not implemented!')
+
+    def ReleaseIp(self, request, context):
+        """Missing associated documentation comment in .proto file."""
+        context.set_code(grpc.StatusCode.UNIMPLEMENTED)
+        context.set_details('Method not implemented!')
+        raise NotImplementedError('Method not implemented!')
+
+    def AttachIp(self, request, context):
+        """Missing associated documentation comment in .proto file."""
+        context.set_code(grpc.StatusCode.UNIMPLEMENTED)
+        context.set_details('Method not implemented!')
+        raise NotImplementedError('Method not implemented!')
+
+    def DetachIp(self, request, context):
+        """Missing associated documentation comment in .proto file."""
+        context.set_code(grpc.StatusCode.UNIMPLEMENTED)
+        context.set_details('Method not implemented!')
+        raise NotImplementedError('Method not implemented!')
+
+    def ListIps(self, request, context):
+        """Missing associated documentation comment in .proto file."""
+        context.set_code(grpc.StatusCode.UNIMPLEMENTED)
+        context.set_details('Method not implemented!')
+        raise NotImplementedError('Method not implemented!')
+
+    def SetIpRdns(self, request, context):
+        """Through the address's provider; refused where it offers none.
+        """
+        context.set_code(grpc.StatusCode.UNIMPLEMENTED)
+        context.set_details('Method not implemented!')
+        raise NotImplementedError('Method not implemented!')
+
+    def CreateIpPool(self, request, context):
+        """Pools, operator credentials only.
+        """
+        context.set_code(grpc.StatusCode.UNIMPLEMENTED)
+        context.set_details('Method not implemented!')
+        raise NotImplementedError('Method not implemented!')
+
+    def UpdateIpPool(self, request, context):
+        """Missing associated documentation comment in .proto file."""
+        context.set_code(grpc.StatusCode.UNIMPLEMENTED)
+        context.set_details('Method not implemented!')
+        raise NotImplementedError('Method not implemented!')
+
+    def DeleteIpPool(self, request, context):
+        """Missing associated documentation comment in .proto file."""
+        context.set_code(grpc.StatusCode.UNIMPLEMENTED)
+        context.set_details('Method not implemented!')
+        raise NotImplementedError('Method not implemented!')
+
+    def ListIpPools(self, request, context):
+        """Missing associated documentation comment in .proto file."""
+        context.set_code(grpc.StatusCode.UNIMPLEMENTED)
+        context.set_details('Method not implemented!')
+        raise NotImplementedError('Method not implemented!')
+
     def Exec(self, request_iterator, context):
         """Exec, attach and files, relayed to the node holding the sandbox. The same
         calls the node's Access service serves directly; a client picks either.
@@ -893,6 +1007,56 @@ def add_BurrowServicer_to_server(servicer, server):
                     servicer.DeleteVolume,
                     request_deserializer=api__pb2.VolumeRef.FromString,
                     response_serializer=api__pb2.DeleteVolumeResponse.SerializeToString,
+            ),
+            'AllocateIp': grpc.unary_unary_rpc_method_handler(
+                    servicer.AllocateIp,
+                    request_deserializer=api__pb2.AllocateIpRequest.FromString,
+                    response_serializer=common__pb2.PublicIp.SerializeToString,
+            ),
+            'ReleaseIp': grpc.unary_unary_rpc_method_handler(
+                    servicer.ReleaseIp,
+                    request_deserializer=api__pb2.IpRef.FromString,
+                    response_serializer=api__pb2.ReleaseIpResponse.SerializeToString,
+            ),
+            'AttachIp': grpc.unary_unary_rpc_method_handler(
+                    servicer.AttachIp,
+                    request_deserializer=api__pb2.AttachIpRequest.FromString,
+                    response_serializer=common__pb2.PublicIp.SerializeToString,
+            ),
+            'DetachIp': grpc.unary_unary_rpc_method_handler(
+                    servicer.DetachIp,
+                    request_deserializer=api__pb2.IpRef.FromString,
+                    response_serializer=common__pb2.PublicIp.SerializeToString,
+            ),
+            'ListIps': grpc.unary_unary_rpc_method_handler(
+                    servicer.ListIps,
+                    request_deserializer=api__pb2.ListIpsRequest.FromString,
+                    response_serializer=api__pb2.ListIpsResponse.SerializeToString,
+            ),
+            'SetIpRdns': grpc.unary_unary_rpc_method_handler(
+                    servicer.SetIpRdns,
+                    request_deserializer=api__pb2.SetIpRdnsRequest.FromString,
+                    response_serializer=common__pb2.PublicIp.SerializeToString,
+            ),
+            'CreateIpPool': grpc.unary_unary_rpc_method_handler(
+                    servicer.CreateIpPool,
+                    request_deserializer=common__pb2.IpPool.FromString,
+                    response_serializer=common__pb2.IpPool.SerializeToString,
+            ),
+            'UpdateIpPool': grpc.unary_unary_rpc_method_handler(
+                    servicer.UpdateIpPool,
+                    request_deserializer=common__pb2.IpPool.FromString,
+                    response_serializer=common__pb2.IpPool.SerializeToString,
+            ),
+            'DeleteIpPool': grpc.unary_unary_rpc_method_handler(
+                    servicer.DeleteIpPool,
+                    request_deserializer=api__pb2.IpPoolRef.FromString,
+                    response_serializer=api__pb2.DeleteIpPoolResponse.SerializeToString,
+            ),
+            'ListIpPools': grpc.unary_unary_rpc_method_handler(
+                    servicer.ListIpPools,
+                    request_deserializer=api__pb2.ListIpPoolsRequest.FromString,
+                    response_serializer=api__pb2.ListIpPoolsResponse.SerializeToString,
             ),
             'Exec': grpc.stream_stream_rpc_method_handler(
                     servicer.Exec,
@@ -1847,6 +2011,276 @@ class Burrow(object):
             '/burrow.api.v1.Burrow/DeleteVolume',
             api__pb2.VolumeRef.SerializeToString,
             api__pb2.DeleteVolumeResponse.FromString,
+            options,
+            channel_credentials,
+            insecure,
+            call_credentials,
+            compression,
+            wait_for_ready,
+            timeout,
+            metadata,
+            _registered_method=True)
+
+    @staticmethod
+    def AllocateIp(request,
+            target,
+            options=(),
+            channel_credentials=None,
+            call_credentials=None,
+            insecure=False,
+            compression=None,
+            wait_for_ready=None,
+            timeout=None,
+            metadata=None):
+        return grpc.experimental.unary_unary(
+            request,
+            target,
+            '/burrow.api.v1.Burrow/AllocateIp',
+            api__pb2.AllocateIpRequest.SerializeToString,
+            common__pb2.PublicIp.FromString,
+            options,
+            channel_credentials,
+            insecure,
+            call_credentials,
+            compression,
+            wait_for_ready,
+            timeout,
+            metadata,
+            _registered_method=True)
+
+    @staticmethod
+    def ReleaseIp(request,
+            target,
+            options=(),
+            channel_credentials=None,
+            call_credentials=None,
+            insecure=False,
+            compression=None,
+            wait_for_ready=None,
+            timeout=None,
+            metadata=None):
+        return grpc.experimental.unary_unary(
+            request,
+            target,
+            '/burrow.api.v1.Burrow/ReleaseIp',
+            api__pb2.IpRef.SerializeToString,
+            api__pb2.ReleaseIpResponse.FromString,
+            options,
+            channel_credentials,
+            insecure,
+            call_credentials,
+            compression,
+            wait_for_ready,
+            timeout,
+            metadata,
+            _registered_method=True)
+
+    @staticmethod
+    def AttachIp(request,
+            target,
+            options=(),
+            channel_credentials=None,
+            call_credentials=None,
+            insecure=False,
+            compression=None,
+            wait_for_ready=None,
+            timeout=None,
+            metadata=None):
+        return grpc.experimental.unary_unary(
+            request,
+            target,
+            '/burrow.api.v1.Burrow/AttachIp',
+            api__pb2.AttachIpRequest.SerializeToString,
+            common__pb2.PublicIp.FromString,
+            options,
+            channel_credentials,
+            insecure,
+            call_credentials,
+            compression,
+            wait_for_ready,
+            timeout,
+            metadata,
+            _registered_method=True)
+
+    @staticmethod
+    def DetachIp(request,
+            target,
+            options=(),
+            channel_credentials=None,
+            call_credentials=None,
+            insecure=False,
+            compression=None,
+            wait_for_ready=None,
+            timeout=None,
+            metadata=None):
+        return grpc.experimental.unary_unary(
+            request,
+            target,
+            '/burrow.api.v1.Burrow/DetachIp',
+            api__pb2.IpRef.SerializeToString,
+            common__pb2.PublicIp.FromString,
+            options,
+            channel_credentials,
+            insecure,
+            call_credentials,
+            compression,
+            wait_for_ready,
+            timeout,
+            metadata,
+            _registered_method=True)
+
+    @staticmethod
+    def ListIps(request,
+            target,
+            options=(),
+            channel_credentials=None,
+            call_credentials=None,
+            insecure=False,
+            compression=None,
+            wait_for_ready=None,
+            timeout=None,
+            metadata=None):
+        return grpc.experimental.unary_unary(
+            request,
+            target,
+            '/burrow.api.v1.Burrow/ListIps',
+            api__pb2.ListIpsRequest.SerializeToString,
+            api__pb2.ListIpsResponse.FromString,
+            options,
+            channel_credentials,
+            insecure,
+            call_credentials,
+            compression,
+            wait_for_ready,
+            timeout,
+            metadata,
+            _registered_method=True)
+
+    @staticmethod
+    def SetIpRdns(request,
+            target,
+            options=(),
+            channel_credentials=None,
+            call_credentials=None,
+            insecure=False,
+            compression=None,
+            wait_for_ready=None,
+            timeout=None,
+            metadata=None):
+        return grpc.experimental.unary_unary(
+            request,
+            target,
+            '/burrow.api.v1.Burrow/SetIpRdns',
+            api__pb2.SetIpRdnsRequest.SerializeToString,
+            common__pb2.PublicIp.FromString,
+            options,
+            channel_credentials,
+            insecure,
+            call_credentials,
+            compression,
+            wait_for_ready,
+            timeout,
+            metadata,
+            _registered_method=True)
+
+    @staticmethod
+    def CreateIpPool(request,
+            target,
+            options=(),
+            channel_credentials=None,
+            call_credentials=None,
+            insecure=False,
+            compression=None,
+            wait_for_ready=None,
+            timeout=None,
+            metadata=None):
+        return grpc.experimental.unary_unary(
+            request,
+            target,
+            '/burrow.api.v1.Burrow/CreateIpPool',
+            common__pb2.IpPool.SerializeToString,
+            common__pb2.IpPool.FromString,
+            options,
+            channel_credentials,
+            insecure,
+            call_credentials,
+            compression,
+            wait_for_ready,
+            timeout,
+            metadata,
+            _registered_method=True)
+
+    @staticmethod
+    def UpdateIpPool(request,
+            target,
+            options=(),
+            channel_credentials=None,
+            call_credentials=None,
+            insecure=False,
+            compression=None,
+            wait_for_ready=None,
+            timeout=None,
+            metadata=None):
+        return grpc.experimental.unary_unary(
+            request,
+            target,
+            '/burrow.api.v1.Burrow/UpdateIpPool',
+            common__pb2.IpPool.SerializeToString,
+            common__pb2.IpPool.FromString,
+            options,
+            channel_credentials,
+            insecure,
+            call_credentials,
+            compression,
+            wait_for_ready,
+            timeout,
+            metadata,
+            _registered_method=True)
+
+    @staticmethod
+    def DeleteIpPool(request,
+            target,
+            options=(),
+            channel_credentials=None,
+            call_credentials=None,
+            insecure=False,
+            compression=None,
+            wait_for_ready=None,
+            timeout=None,
+            metadata=None):
+        return grpc.experimental.unary_unary(
+            request,
+            target,
+            '/burrow.api.v1.Burrow/DeleteIpPool',
+            api__pb2.IpPoolRef.SerializeToString,
+            api__pb2.DeleteIpPoolResponse.FromString,
+            options,
+            channel_credentials,
+            insecure,
+            call_credentials,
+            compression,
+            wait_for_ready,
+            timeout,
+            metadata,
+            _registered_method=True)
+
+    @staticmethod
+    def ListIpPools(request,
+            target,
+            options=(),
+            channel_credentials=None,
+            call_credentials=None,
+            insecure=False,
+            compression=None,
+            wait_for_ready=None,
+            timeout=None,
+            metadata=None):
+        return grpc.experimental.unary_unary(
+            request,
+            target,
+            '/burrow.api.v1.Burrow/ListIpPools',
+            api__pb2.ListIpPoolsRequest.SerializeToString,
+            api__pb2.ListIpPoolsResponse.FromString,
             options,
             channel_credentials,
             insecure,

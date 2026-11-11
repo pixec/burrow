@@ -34,6 +34,8 @@ impl common::v1::EventKind {
             Self::Destroyed => "destroyed",
             Self::SnapshotCreated => "snapshot_created",
             Self::Recovered => "recovered",
+            Self::IpAttached => "ip_attached",
+            Self::IpDetached => "ip_detached",
         }
     }
 }
@@ -80,6 +82,34 @@ impl api::v1::CommandState {
             Self::Running => "running",
             Self::Exited => "exited",
         }
+    }
+}
+
+impl common::v1::IpProvider {
+    /// The name the CLI and the providers file use. Unspecified reads as
+    /// static, a pool's default.
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Unspecified | Self::Static => "static",
+            Self::Ovh => "ovh",
+            Self::Hetzner => "hetzner",
+            Self::Bgp => "bgp",
+        }
+    }
+
+    pub fn from_label(label: &str) -> Option<Self> {
+        match label {
+            "static" => Some(Self::Static),
+            "ovh" => Some(Self::Ovh),
+            "hetzner" => Some(Self::Hetzner),
+            "bgp" => Some(Self::Bgp),
+            _ => None,
+        }
+    }
+
+    /// Whether an address from it can follow its sandbox to another node.
+    pub fn is_movable(self) -> bool {
+        !matches!(self, Self::Unspecified | Self::Static)
     }
 }
 

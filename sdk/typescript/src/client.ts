@@ -1,4 +1,5 @@
 import { BurrowError } from "./errors.js";
+import { Ips } from "./ip.js";
 import { Sandbox, toSandboxInfo } from "./sandbox.js";
 import { Snapshot, type ListSnapshotsOptions } from "./snapshot.js";
 import {
@@ -319,6 +320,8 @@ const EVENT_KINDS: readonly EventKind[] = [
   "destroyed",
   "snapshot_created",
   "recovered",
+  "ip_attached",
+  "ip_detached",
 ];
 
 const USAGE_STATES: readonly UsageState[] = ["running", "suspended", "stopped"];
@@ -346,6 +349,8 @@ export class Burrow {
   readonly snapshots: Snapshots;
   readonly volumes: Volumes;
   readonly templates: Templates;
+  /** Dedicated public IPs and their pools. */
+  readonly ips: Ips;
 
   constructor(options: TransportOptions = {}) {
     this.transport = new Transport(options);
@@ -353,6 +358,7 @@ export class Burrow {
     this.snapshots = new Snapshots(this.transport);
     this.volumes = new Volumes(this.transport);
     this.templates = new Templates(this.transport);
+    this.ips = new Ips(this.transport);
   }
 
   async health(options: CallOptions = {}): Promise<{ version: string }> {

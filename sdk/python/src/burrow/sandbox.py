@@ -26,6 +26,7 @@ from ._subprocess import SandboxSubprocess
 from ._transport import _DEFAULT, Transport
 from ._wire import at, at_or_none, label
 from .errors import BurrowError
+from .ip import to_public_ip
 from .snapshot import Snapshot
 from .terminal import Terminal
 from .types import (
@@ -37,6 +38,7 @@ from .types import (
     NetworkPolicy,
     PortMapping,
     PrunedCommands,
+    PublicIp,
     SandboxInfo,
     SandboxPolicy,
     Session,
@@ -72,6 +74,8 @@ def _to_sandbox_info(raw: common_pb2.Sandbox) -> SandboxInfo:
         hypervisor_version=raw.hypervisor_version,
         arch=raw.arch,
         guest_os=raw.guest_os,
+        public_ips=[to_public_ip(ip) for ip in raw.public_ips],
+        ipv6_address=raw.ipv6_address,
     )
 
 
@@ -842,6 +846,24 @@ class Sandbox:
         if suspended_ttl_secs is not None:
             request.suspended_ttl_secs = suspended_ttl_secs
         return self._apply("UpdateLifetime", request)
+
+    def attach_ip(self, address: str) -> PublicIp:
+        """Routes an allocated public IP to this sandbox."""
+        self._assert_live()
+        ip = to_public_ip(
+            self._transport.unary(
+                "AttachIp", api_pb2.AttachIpRequest(address=address, sandbox_id=self.id)
+            )
+        )
+        self.refresh()
+        return ip
+
+    def detach_ip(self, address: str) -> PublicIp:
+        """Takes a public IP off this sandbox, keeping it allocated."""
+        self._assert_live()
+        ip = to_public_ip(self._transport.unary("DetachIp", api_pb2.IpRef(address=address)))
+        self.refresh()
+        return ip
 
     def update_tags(self, tags: Dict[str, str]) -> SandboxInfo:
         """Replaces the sandbox's tags. An empty map clears them."""

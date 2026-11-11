@@ -260,6 +260,39 @@ message NetworkPolicy {
   // TCP 80 and 443 to the egress proxy, open forwards to the public internet.
   // The link to the sandbox's own gateway is unaffected.
   bool is_ipv6_denied = 12;
+  // What may reach the sandbox's public addresses from outside: its dedicated
+  // IPs and its global IPv6 address. Nothing is admitted unless a rule says
+  // so; replies to connections the sandbox opened always are. Published
+  // ports, the edge and shares are separate doors and ignore this. At most 64.
+  repeated IngressRule ingress = 13;
+}
+
+// Transport an ingress rule admits.
+enum IngressProtocol {
+  // Both TCP and UDP.
+  INGRESS_PROTOCOL_UNSPECIFIED = 0;
+  INGRESS_PROTOCOL_TCP = 1;
+  INGRESS_PROTOCOL_UDP = 2;
+  // ICMP echo, and ICMPv6 echo over IPv6. Takes no ports.
+  INGRESS_PROTOCOL_ICMP = 3;
+}
+
+// A port, or an inclusive range of them.
+message PortRange {
+  // 1 to 65535.
+  uint32 port = 1;
+  // Last port, inclusive. 0 means `port` alone.
+  uint32 port_end = 2;
+}
+
+// One door into a sandbox's public addresses.
+message IngressRule {
+  IngressProtocol protocol = 1;
+  // Destination ports; empty is every port. At most 16.
+  repeated PortRange ports = 2;
+  // Source CIDRs, IPv4 or IPv6; empty is anyone. A rule naming sources of one
+  // family only admits nothing over the other. At most 16.
+  repeated string sources = 3;
 }
 
 // Transport a port rule applies to.
@@ -476,6 +509,104 @@ message Sandbox {
   // before it are refused, wherever the sandbox has moved since.
   int64 access_revoked_at_ms = 28;
   int64 created_at_unix_ms = 30;
+  // Dedicated public addresses attached to this sandbox, routed to its tap.
+  // Read-only: change them with AttachIp and DetachIp.
+  repeated PublicIp public_ips = 31;
+  // The sandbox's own global IPv6 address, from its node's routed prefix.
+  // Empty on a node given none. Ingress to it follows `NetworkPolicy.ingress`.
+  string ipv6_address = 32;
+  // The prefix routed to the sandbox around `ipv6_address`, e.g. 64.
+  uint32 ipv6_prefix_len = 33;
+}
+
+// Who delivers a public address to the node holding it.
+enum IpProvider {
+  IP_PROVIDER_UNSPECIFIED = 0;
+  // A routed subnet or a list of addresses only one node receives.
+  IP_PROVIDER_STATIC = 1;
+  // OVH Additional IPs.
+  IP_PROVIDER_OVH = 2;
+  // Hetzner Cloud Floating IPs.
+  IP_PROVIDER_HETZNER = 3;
+  // Burrow's own prefix announced by the holding node. Not built.
+  IP_PROVIDER_BGP = 4;
+}
+
+enum PublicIpState {
+  PUBLIC_IP_STATE_UNSPECIFIED = 0;
+  // Held by the credential that allocated it.
+  PUBLIC_IP_STATE_ALLOCATED = 1;
+  // Released and sitting out its quarantine; belongs to nobody.
+  PUBLIC_IP_STATE_QUARANTINED = 2;
+}
+
+// A dedicated public address: allocated from a pool, attached to at most one
+// sandbox, and kept until released. Routed to the sandbox's tap, so the guest
+// holds it on its own interface.
+message PublicIp {
+  string address = 1;
+  // 4 or 6.
+  uint32 family = 2;
+  // Prefix routed to the sandbox: 32 for an IPv4 address, 128 or a subnet such
+  // as 64 for IPv6.
+  uint32 prefix_len = 3;
+  string pool = 4;
+  IpProvider provider = 5;
+  bool is_movable = 6;
+  // Empty while detached.
+  string sandbox_id = 7;
+  // The node the address reaches. A static address keeps it once set.
+  string node_id = 8;
+  string rdns = 9;
+  int64 allocated_at_unix_ms = 10;
+  int64 attached_at_unix_ms = 11;
+  // Who allocated it: a digest of the caller's credential.
+  string owner = 12;
+  // The pool's gateway for this address, its prefix on the uplink, and
+  // whether the node answers ARP or NDP for it there.
+  string gateway = 13;
+  uint32 gateway_prefix_len = 14;
+  bool is_on_link = 15;
+  bool is_smtp_allowed = 16;
+  bool is_wake_on_traffic = 17;
+  repeated string nameservers = 18;
+  // Set while the address sits out its quarantine after a release.
+  int64 released_at_unix_ms = 19;
+  int64 quarantined_until_unix_ms = 20;
+  PublicIpState state = 21;
+}
+
+// Where public addresses come from. Operator configuration.
+message IpPool {
+  string name = 1;
+  // One node, or every node carrying all of `node_labels`.
+  string node_id = 2;
+  map<string, string> node_labels = 3;
+  // Unspecified is static.
+  IpProvider provider = 4;
+  // IPv4: a range "first-last" and/or explicit addresses.
+  repeated string ranges = 5;
+  repeated string addresses = 6;
+  string gateway = 7;
+  // The prefix of the network the gateway is on, e.g. 24.
+  uint32 prefix_len = 8;
+  repeated string nameservers = 9;
+  // IPv6: a prefix and the size each sandbox gets from it.
+  string prefix6 = 10;
+  uint32 per_sandbox = 11;
+  // Whether the provider looks addresses up on the uplink (ARP or NDP), so
+  // the node has to answer for them, or routes them to the node.
+  bool is_on_link = 12;
+  // Outbound TCP 25 from these addresses, blocked unless set.
+  bool is_smtp_allowed = 13;
+  // Hold the first admitted packet to a suspended holder and resume it.
+  bool is_wake_on_traffic = 14;
+  // Seconds a released address waits before it is handed out again; 0 is the
+  // orchestrator's default.
+  int64 quarantine_secs = 15;
+  // Read-only counts.
+  uint32 total = 16;
+  uint32 allocated = 17;
 }
 
 // One VM boot inside a sandbox's life.
@@ -616,6 +747,12 @@ message NodeInfo {
   repeated string policy_features = 17;
   // Unix milliseconds when the node's inspection CA expires.
   int64 inspection_ca_expires_at_unix_ms = 18;
+  // The routed IPv6 prefix this node gives each sandbox an address from, and
+  // the size of each one's share. Empty when it has none.
+  string ipv6_prefix = 19;
+  uint32 ipv6_per_sandbox = 20;
+  // Address providers this node holds credentials for.
+  repeated IpProvider ip_providers = 21;
 }
 
 message NodeStatus {
@@ -674,6 +811,10 @@ enum EventKind {
   EVENT_KIND_SNAPSHOT_CREATED = 6;
   // A sandbox a node found on restart.
   EVENT_KIND_RECOVERED = 7;
+  // A public IP was routed to the sandbox; the detail is the address.
+  EVENT_KIND_IP_ATTACHED = 8;
+  // A public IP was taken off the sandbox; the detail is the address.
+  EVENT_KIND_IP_DETACHED = 9;
 }
 
 // One thing that happened to a sandbox, as the node that did it recorded it.

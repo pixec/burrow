@@ -138,6 +138,19 @@ export interface PortRule {
   cidrs?: string[];
 }
 
+/**
+ * One door into a sandbox's public addresses: its dedicated IPs and its global
+ * IPv6 address. Nothing is admitted without a rule.
+ */
+export interface IngressRule {
+  /** Omitted is both TCP and UDP. `icmp` admits echo and takes no ports. */
+  protocol?: "tcp" | "udp" | "icmp";
+  /** Ports and ranges, e.g. `[25, 587]` or `["27000-27015"]`. Omitted is every port. */
+  ports?: (number | string)[];
+  /** Source CIDRs of either family. Omitted is anyone. */
+  sources?: string[];
+}
+
 /** Egress policy in full. A bare mode, `networkPolicy: "open"`, sets only `mode`. */
 export interface NetworkPolicyOptions {
   /** Defaults to `"none"`: no egress at all. */
@@ -170,6 +183,11 @@ export interface NetworkPolicyOptions {
    * each mode's own IPv6 behaviour.
    */
   denyIpv6?: boolean;
+  /**
+   * What may reach the sandbox's public addresses from outside. Default deny;
+   * replies to connections the sandbox opened are always admitted. At most 64.
+   */
+  ingress?: IngressRule[];
   /**
    * Terminate the sandbox's TLS so the host named inside the session is
    * checked too, not just the SNI. Required by `rules`.
@@ -399,6 +417,83 @@ export interface SandboxInfo {
   hypervisorVersion: string;
   /** `linux`, `windows` or `macos`, from its template. */
   guestOs: string;
+  /** Dedicated public addresses attached to it. */
+  publicIps: PublicIp[];
+  /** Its own global IPv6 address, from its node's routed prefix; `""` for none. */
+  ipv6Address: string;
+}
+
+/** Who delivers a public address to the node holding it. */
+export type IpProvider = "static" | "ovh" | "hetzner" | "bgp";
+
+/** A dedicated public address, as the orchestrator records it. */
+export interface PublicIp {
+  address: string;
+  /** 4 or 6. */
+  family: number;
+  /** The prefix routed to the sandbox: 32, or 128 or a subnet for IPv6. */
+  prefixLen: number;
+  pool: string;
+  provider: IpProvider | "unknown";
+  /** Whether it can follow its sandbox to another node. */
+  movable: boolean;
+  /** `allocated`, or `quarantined` while a released address sits out. */
+  state: "allocated" | "quarantined" | "unknown";
+  /** `""` while detached. */
+  sandboxId: string;
+  nodeId: string;
+  rdns: string;
+  allocatedAt: Date;
+  /** `null` while detached. */
+  attachedAt: Date | null;
+  /** Set while a released address sits out its quarantine. */
+  quarantinedUntil: Date | null;
+}
+
+/** Where public addresses come from. Operator configuration. */
+export interface IpPool {
+  name: string;
+  /** One node, or every node carrying all of `nodeLabels`. */
+  nodeId?: string;
+  nodeLabels?: Record<string, string>;
+  /** Defaults to `static`. */
+  provider?: IpProvider;
+  /** IPv4 ranges as `"first-last"`, and single addresses. */
+  ranges?: string[];
+  addresses?: string[];
+  gateway?: string;
+  /** The prefix of the gateway's network, e.g. 24. */
+  prefixLen?: number;
+  nameservers?: string[];
+  /** An IPv6 prefix, and the size each sandbox gets from it. */
+  prefix6?: string;
+  perSandbox?: number;
+  /** The provider looks addresses up on the uplink, so the node answers for them. */
+  onLink?: boolean;
+  allowSmtp?: boolean;
+  wakeOnTraffic?: boolean;
+  quarantineSecs?: number;
+  /** Read only. */
+  total?: number;
+  allocated?: number;
+}
+
+/** Options for {@link Ips.allocate}. */
+export interface AllocateIpOptions extends CallOptions {
+  pool?: string;
+  /** 4 (the default) or 6. */
+  family?: 4 | 6;
+  /** Take one reaching this sandbox's node and attach it there, by id or name. */
+  sandboxId?: string;
+}
+
+/** Options for {@link Ips.list}. */
+export interface ListIpsOptions extends CallOptions {
+  pool?: string;
+  /** Only those attached to this sandbox, by id or name. */
+  sandboxId?: string;
+  /** Quarantined addresses too. Operators only. */
+  quarantined?: boolean;
 }
 
 /** Inputs for a template pulled from a Sandbox Kit. */
@@ -507,6 +602,11 @@ export interface CreateOptions extends CallOptions, HandleOptions {
    * `failed_precondition` rather than landing somewhere else.
    */
   nodeLabels?: Record<string, string>;
+  /**
+   * Allocated public IPs to attach once it is up. A static address places the
+   * sandbox on the node it reaches.
+   */
+  publicIps?: string[];
   /**
    * Whether callers may run commands in this sandbox. Omitted allows exec,
    * which is the default for every sandbox.
@@ -805,7 +905,10 @@ export interface AuditQuery extends CallOptions {
   limit?: number;
 }
 
-/** What happened to a sandbox. `recovered` is one a node found on restart. */
+/**
+ * What happened to a sandbox. `recovered` is one a node found on restart;
+ * `ip_attached` and `ip_detached` carry the address as their detail.
+ */
 export type EventKind =
   | "created"
   | "started"
@@ -814,6 +917,8 @@ export type EventKind =
   | "destroyed"
   | "snapshot_created"
   | "recovered"
+  | "ip_attached"
+  | "ip_detached"
   | "unknown";
 
 /**

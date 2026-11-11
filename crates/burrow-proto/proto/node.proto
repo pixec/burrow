@@ -124,11 +124,37 @@ service NodeService {
   rpc DeleteUser(burrow.api.v1.DeleteUserRequest) returns (burrow.api.v1.DeleteUserResponse);
   rpc DeleteGroup(burrow.api.v1.DeleteGroupRequest) returns (burrow.api.v1.DeleteGroupResponse);
   rpc QueryAudit(burrow.api.v1.AuditQuery) returns (AuditPage);  // collected, not streamed: the orchestrator merges pages from every node
+
+  // Routes a public address to a sandbox here, or takes it away.
+  rpc AttachPublicIp(NodeAttachIpRequest) returns (burrow.common.v1.Sandbox);
+  rpc DetachPublicIp(NodeDetachIpRequest) returns (burrow.common.v1.Sandbox);
+  // Asks the address's provider to deliver it to this node, with the
+  // credentials this node holds.
+  rpc RoutePublicIp(NodeProviderRequest) returns (NodeProviderResponse);
+  rpc SetPublicIpRdns(NodeProviderRequest) returns (NodeProviderResponse);
 }
 
 message AuditPage {
   repeated burrow.api.v1.AuditEvent events = 1;
 }
+
+message NodeAttachIpRequest {
+  string sandbox_id = 1;
+  burrow.common.v1.PublicIp ip = 2;
+}
+
+message NodeDetachIpRequest {
+  string sandbox_id = 1;
+  string address = 2;
+}
+
+message NodeProviderRequest {
+  burrow.common.v1.PublicIp ip = 1;
+  // The reverse DNS name, for SetPublicIpRdns.
+  string rdns = 2;
+}
+
+message NodeProviderResponse {}
 
 message NodeCreateRequest {
   // The orchestrator owns the id namespace and assigns it.

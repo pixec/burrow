@@ -28,6 +28,7 @@ pub fn features() -> Vec<String> {
         "attach-input".to_string(),
         "output-feed".to_string(),
         fs::FEATURE_FS.to_string(),
+        "public-addresses".to_string(),
     ]
 }
 
@@ -81,6 +82,12 @@ fn hex_lower(bytes: &[u8]) -> String {
     bytes.iter().map(|b| format!("{b:02x}")).collect()
 }
 
+pub async fn set_public_addresses(network: guestpb::NetworkConfig) -> Result<(), Status> {
+    resume::apply_public(&network)
+        .await
+        .map_err(|err| Status::internal(format!("applying public addresses: {err}")))
+}
+
 pub async fn handshake(
     arrival: Option<vsock::Arrival>,
     req: guestpb::HandshakeRequest,
@@ -132,6 +139,16 @@ pub async fn handshake(
         tracing::error!(%err, "failed to reapply network after restore");
         return Err(Status::internal(format!(
             "reapplying network after restore: {err}"
+        )));
+    }
+    // Public addresses on every handshake, a cold boot's included: the kernel
+    // command line knows only the private one.
+    if let Some(network) = &req.network
+        && let Err(err) = resume::apply_public(network).await
+    {
+        tracing::error!(%err, "failed to apply public addresses");
+        return Err(Status::internal(format!(
+            "applying public addresses: {err}"
         )));
     }
     // After the network, because a mount is local work and nothing above

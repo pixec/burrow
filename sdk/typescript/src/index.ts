@@ -6,6 +6,7 @@ export {
   type SnapshotOptions,
 } from "./snapshot.js";
 export { Terminal, type TerminalOptions } from "./terminal.js";
+export { Ips } from "./ip.js";
 export {
   Volume,
   type CreateVolumeOptions,
@@ -45,6 +46,7 @@ export {
 export { BurrowError, type BurrowErrorCode } from "./errors.js";
 export type { TransportOptions } from "./transport.js";
 export type {
+  AllocateIpOptions,
   AppliedRule,
   AuditEvent,
   AuditQuery,
@@ -69,10 +71,14 @@ export type {
   GuestGroup,
   GuestUser,
   HandleOptions,
+  IngressRule,
+  IpPool,
+  IpProvider,
   KitOptions,
   LifecycleEvent,
   LifetimeOptions,
   LifetimePolicy,
+  ListIpsOptions,
   ListOptions,
   MoveOptions,
   NetworkInput,
@@ -83,6 +89,7 @@ export type {
   NodeInfo,
   PortMapping,
   PortRule,
+  PublicIp,
   RecreateOptions,
   RequestMatch,
   RequestRule,

@@ -58,6 +58,14 @@ impl Guest for AgentService {
         }))
     }
 
+    async fn set_public_addresses(
+        &self,
+        req: Request<guestpb::NetworkConfig>,
+    ) -> Result<Response<guestpb::SetPublicAddressesResponse>, Status> {
+        os::set_public_addresses(req.into_inner()).await?;
+        Ok(Response::new(guestpb::SetPublicAddressesResponse {}))
+    }
+
     type ExecStream = tokio_stream::wrappers::ReceiverStream<Result<guestpb::ExecOutput, Status>>;
 
     async fn exec(

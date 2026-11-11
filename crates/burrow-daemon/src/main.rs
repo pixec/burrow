@@ -17,6 +17,8 @@ mod metrics;
 mod nodeapi;
 mod objstore;
 mod oci;
+mod providers;
+mod publicip;
 mod sandbox;
 mod sandboxproxy;
 mod serve;

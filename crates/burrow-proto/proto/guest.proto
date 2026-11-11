@@ -10,6 +10,8 @@ service Guest {
   // host reconnects and handshakes again. Refused while a command runs.
   rpc Upgrade(stream UpgradeChunk) returns (UpgradeResponse);
   rpc Health(GuestHealthRequest) returns (GuestHealthResponse);
+  // Replaces the public addresses on the guest's interface while it runs.
+  rpc SetPublicAddresses(NetworkConfig) returns (SetPublicAddressesResponse);
   // Mirrors the public Exec RPC. Deliberately a separate message set from
   // burrow.api.v1 so the guest protocol can version independently of the
   // public API (guests outlive deploys: a paused sandbox resumes with the
@@ -422,7 +424,18 @@ message NetworkConfig {
   uint32 prefix_len6 = 6;
   // The v6 gateway, empty when the sandbox has no v6 link.
   string gateway6 = 7;
+  // Public addresses routed to this sandbox, held beside the private ones and
+  // used as the source of the default routes. Applied on every handshake.
+  repeated PublicAddress public_addresses = 8;
 }
+
+message PublicAddress {
+  string address = 1;
+  // As held on the interface: 32 or 128.
+  uint32 prefix_len = 2;
+}
+
+message SetPublicAddressesResponse {}
 
 message HandshakeResponse {
   string agent_version = 1;
