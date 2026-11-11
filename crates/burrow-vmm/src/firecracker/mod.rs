@@ -458,6 +458,18 @@ impl MicroVm {
         self.api.add_drive(&Drive::from_spec(drive)).await
     }
 
+    /// Tells the running guest that a drive's file changed size, which the
+    /// caller has already changed.
+    pub async fn resize_drive(&self, id: &str) -> Result<()> {
+        let drive = self
+            .spec
+            .drives
+            .iter()
+            .find(|drive| drive.id == id)
+            .ok_or_else(|| crate::Error::NoDrive(id.to_string()))?;
+        self.api.update_drive(id, &drive.path).await
+    }
+
     /// Starts a fresh VMM process and restores a snapshot from `workdir`
     /// instead of cold-booting. `spec` must describe the same resources
     /// (tap name, drive paths) as the snapshotted VM.

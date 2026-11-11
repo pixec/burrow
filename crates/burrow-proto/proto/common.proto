@@ -29,12 +29,18 @@ enum NetworkMode {
   NETWORK_MODE_OPEN = 3;
 }
 
-// The machine a sandbox runs on. Fixed for its life: a restore takes its
-// configuration from the snapshot, so none of these can move.
+// The machine a sandbox runs on. UpdateResources changes it: live where the
+// hypervisor can hotplug, otherwise while the sandbox is shut down. A
+// suspended sandbox keeps the shape its snapshot was taken of, and so does a
+// restore.
 message ResourcePolicy {
   uint32 vcpus = 1;
   uint32 mem_mib = 2;
-  uint32 scratch_disk_mib = 3;
+  // The sandbox's own disk, in MiB. On the root layout this is the whole root
+  // disk as the guest sees it, at least its template's image; 0 is the image
+  // plus 1 GiB. On the overlay layout of older sandboxes it is the scratch
+  // disk under the overlay; 0 is 1 GiB.
+  uint32 disk_mib = 3;
 }
 
 // How long a sandbox stays paid for. All three are read by the same reaper on
@@ -517,6 +523,20 @@ message Sandbox {
   string ipv6_address = 32;
   // The prefix routed to the sandbox around `ipv6_address`, e.g. 64.
   uint32 ipv6_prefix_len = 33;
+  // How the guest's filesystem sits on its disks. Fixed for the sandbox's
+  // life and carried by its snapshots.
+  DiskLayout disk_layout = 34;
+}
+
+// How a guest's filesystem sits on its disks.
+enum DiskLayout {
+  // A record from before the field, which is the overlay layout.
+  DISK_LAYOUT_UNSPECIFIED = 0;
+  // The template's image read-only under an overlay on a scratch disk, as
+  // sandboxes from before root disks keep for life.
+  DISK_LAYOUT_OVERLAY = 1;
+  // One writable root disk, cloned from the template's image, mounted as /.
+  DISK_LAYOUT_ROOT = 2;
 }
 
 // Who delivers a public address to the node holding it.
@@ -671,7 +691,7 @@ message Snapshot {
   reserved "vcpus", "mem_mib", "scratch_disk_mib", "created_at", "expires_at",
       "firecracker_version";
   // Everything the snapshot occupies on the node: memory image, vmstate and
-  // scratch disk.
+  // disk.
   uint64 size_bytes = 9;
   // A copy of the snapshot is in the fleet's object store, so a create from
   // it can be placed on any compatible node, including when the node that
@@ -693,6 +713,9 @@ message Snapshot {
   int64 created_at_unix_ms = 18;
   // 0 means the snapshot does not expire.
   int64 expires_at_unix_ms = 19;
+  // How its guest's filesystem sits on its disks. A root-layout snapshot
+  // restores only on a node naming "root_disk".
+  DiskLayout disk_layout = 20;
 }
 
 message NodeInfo {
@@ -791,13 +814,15 @@ message DiskCapacity {
   // What the node keeps free and promises to no sandbox (--disk-reserve-mib,
   // 5% of the filesystem by default).
   uint64 reserve_bytes = 3;
-  // Disk promised to sandboxes here and not yet written: each sandbox's disk
-  // size less what its disk file already occupies. Disks are sparse, so this
-  // is what they can still grow by.
-  uint64 unwritten_bytes = 4;
-  // How far promised disk may exceed free disk above the reserve
+  reserved 4;
+  reserved "unwritten_bytes";
+  // How far provisioned disk may exceed the filesystem less its reserve
   // (--disk-overcommit). 0, from a node that does not say, means 1.0: never.
   double overcommit = 5;
+  // Disk provisioned to sandboxes here: every sandbox's disk at its full size
+  // and every volume at its size, however many blocks they share with images
+  // or each other.
+  uint64 provisioned_bytes = 6;
 }
 
 // What happened to a sandbox.

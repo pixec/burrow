@@ -107,6 +107,11 @@ class BurrowStub(object):
                 request_serializer=api__pb2.UpdateLifetimeRequest.SerializeToString,
                 response_deserializer=common__pb2.Sandbox.FromString,
                 _registered_method=True)
+        self.UpdateResources = channel.unary_unary(
+                '/burrow.api.v1.Burrow/UpdateResources',
+                request_serializer=api__pb2.UpdateResourcesRequest.SerializeToString,
+                response_deserializer=api__pb2.UpdateResourcesResponse.FromString,
+                _registered_method=True)
         self.ForkSandbox = channel.unary_unary(
                 '/burrow.api.v1.Burrow/ForkSandbox',
                 request_serializer=api__pb2.ForkSandboxRequest.SerializeToString,
@@ -475,8 +480,17 @@ class BurrowServicer(object):
         raise NotImplementedError('Method not implemented!')
 
     def UpdateLifetime(self, request, context):
-        """Move the clocks a running sandbox is measured against: lifetime, idle
-        suspension and suspended retention. The machine shape is not movable.
+        """Move the clocks a sandbox is measured against: lifetime, idle
+        suspension, suspended retention and snapshot retention.
+        """
+        context.set_code(grpc.StatusCode.UNIMPLEMENTED)
+        context.set_details('Method not implemented!')
+        raise NotImplementedError('Method not implemented!')
+
+    def UpdateResources(self, request, context):
+        """Change a sandbox's vCPUs, memory and root disk: live where its hypervisor
+        allows, while it is shut down otherwise, and refused field by field with
+        the reason where neither can be done.
         """
         context.set_code(grpc.StatusCode.UNIMPLEMENTED)
         context.set_details('Method not implemented!')
@@ -927,6 +941,11 @@ def add_BurrowServicer_to_server(servicer, server):
                     servicer.UpdateLifetime,
                     request_deserializer=api__pb2.UpdateLifetimeRequest.FromString,
                     response_serializer=common__pb2.Sandbox.SerializeToString,
+            ),
+            'UpdateResources': grpc.unary_unary_rpc_method_handler(
+                    servicer.UpdateResources,
+                    request_deserializer=api__pb2.UpdateResourcesRequest.FromString,
+                    response_serializer=api__pb2.UpdateResourcesResponse.SerializeToString,
             ),
             'ForkSandbox': grpc.unary_unary_rpc_method_handler(
                     servicer.ForkSandbox,
@@ -1579,6 +1598,33 @@ class Burrow(object):
             '/burrow.api.v1.Burrow/UpdateLifetime',
             api__pb2.UpdateLifetimeRequest.SerializeToString,
             common__pb2.Sandbox.FromString,
+            options,
+            channel_credentials,
+            insecure,
+            call_credentials,
+            compression,
+            wait_for_ready,
+            timeout,
+            metadata,
+            _registered_method=True)
+
+    @staticmethod
+    def UpdateResources(request,
+            target,
+            options=(),
+            channel_credentials=None,
+            call_credentials=None,
+            insecure=False,
+            compression=None,
+            wait_for_ready=None,
+            timeout=None,
+            metadata=None):
+        return grpc.experimental.unary_unary(
+            request,
+            target,
+            '/burrow.api.v1.Burrow/UpdateResources',
+            api__pb2.UpdateResourcesRequest.SerializeToString,
+            api__pb2.UpdateResourcesResponse.FromString,
             options,
             channel_credentials,
             insecure,

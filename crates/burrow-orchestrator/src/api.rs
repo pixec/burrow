@@ -176,6 +176,30 @@ impl Drop for PlacementGuard<'_> {
 }
 
 impl ApiService {
+    /// Refuses a reshape or a lifetimes update on a node that predates them,
+    /// rather than leaving it to answer unimplemented.
+    fn require_update_resources(&self, id: &str) -> Result<(), Status> {
+        let node_id = self.0.sandboxes.get(id).unwrap_or_default().node_id;
+        let missing = self
+            .0
+            .nodes
+            .info(&node_id)
+            .map(|info| {
+                crate::registry::missing_features(
+                    &info,
+                    &[burrow_common::features::UPDATE_RESOURCES],
+                )
+            })
+            .unwrap_or_default();
+        match missing.is_empty() {
+            true => Ok(()),
+            false => Err(Status::failed_precondition(format!(
+                "node {node_id} cannot update a sandbox's resources or lifetimes; upgrade \
+                 burrowd there"
+            ))),
+        }
+    }
+
     /// Turns a caller's reference into the id it names.
     ///
     /// The public API takes a sandbox by id or by name; nodes are only ever
@@ -805,10 +829,13 @@ impl ApiService {
                     disk_bytes: crate::registry::disk_bytes(snapshot.resources.as_ref()),
                     // A sandbox taking the snapshot's own policy carries
                     // fields the orchestrator never sees, so the node
-                    // restoring it elsewhere has to enforce all of them.
+                    // restoring it elsewhere has to enforce all of them; and
+                    // a root disk restores only where root disks are.
                     policy_features: match inherits_policy {
                         true => burrow_common::features::ALL.to_vec(),
-                        false => want.policy_features.clone(),
+                        false => {
+                            with_disk_layout(want.policy_features.clone(), snapshot.disk_layout)
+                        }
                     },
                     ..want.clone()
                 };
@@ -1176,8 +1203,11 @@ impl ApiService {
             arch: sandbox.arch.clone(),
             hypervisor_version: sandbox.hypervisor_version.clone(),
             hypervisor: recorded_hypervisor(&sandbox.hypervisor),
-            policy_features: crate::registry::policy_features(
-                sandbox.policy.as_ref().and_then(|p| p.network.as_ref()),
+            policy_features: with_disk_layout(
+                crate::registry::policy_features(
+                    sandbox.policy.as_ref().and_then(|p| p.network.as_ref()),
+                ),
+                sandbox.disk_layout,
             ),
         }
     }
@@ -1909,6 +1939,7 @@ impl Burrow for ApiService {
     ) -> Result<Response<common::Sandbox>, Status> {
         let req = req.into_inner();
         let id = self.resolve(&req.sandbox_id).await;
+        self.require_update_resources(&id)?;
         let mut client = self.node_for(&id).await?;
         let sandbox = client
             .update_lifetime(nodepb::NodeUpdateLifetimeRequest {
@@ -1916,11 +1947,40 @@ impl Burrow for ApiService {
                 max_lifetime_secs: req.max_lifetime_secs,
                 idle_suspend_secs: req.idle_suspend_secs,
                 suspended_ttl_secs: req.suspended_ttl_secs,
+                snapshot_expiration_secs: req.snapshot_expiration_secs,
+                snapshot_keep_last: req.snapshot_keep_last,
+                is_evicted_snapshot_kept: req.is_evicted_snapshot_kept,
             })
             .await?
             .into_inner();
         self.0.sandboxes.insert(sandbox.clone());
         Ok(Response::new(sandbox))
+    }
+
+    /// Reshapes a sandbox on the owning node, which alone can see its VM and
+    /// disk and admits what it grows by. The registry mirror takes the record
+    /// it returns, and the node's next report carries its new commitments.
+    async fn update_resources(
+        &self,
+        req: Request<api::UpdateResourcesRequest>,
+    ) -> Result<Response<api::UpdateResourcesResponse>, Status> {
+        let req = req.into_inner();
+        let id = self.resolve(&req.sandbox_id).await;
+        self.require_update_resources(&id)?;
+        let mut client = self.node_for(&id).await?;
+        let updated = client
+            .update_resources(nodepb::NodeUpdateResourcesRequest {
+                sandbox_id: id,
+                vcpus: req.vcpus,
+                mem_mib: req.mem_mib,
+                disk_mib: req.disk_mib,
+            })
+            .await?
+            .into_inner();
+        if let Some(sandbox) = &updated.sandbox {
+            self.0.sandboxes.insert(sandbox.clone());
+        }
+        Ok(Response::new(updated))
     }
 
     /// Forks onto the source's own node.
@@ -3253,6 +3313,15 @@ pub(crate) fn placement_status(err: crate::registry::PlacementError) -> Status {
 /// field existed, which ran under Firecracker.
 fn recorded_hypervisor(name: &str) -> String {
     Hypervisor::from_record(name).map_or_else(|| name.to_string(), |h| h.to_string())
+}
+
+/// `features` and, for state written on a root disk, the feature a node
+/// needs to restore one.
+fn with_disk_layout(mut features: Vec<&'static str>, disk_layout: i32) -> Vec<&'static str> {
+    if disk_layout == common::DiskLayout::Root as i32 {
+        features.push(burrow_common::features::ROOT_DISK);
+    }
+    features
 }
 
 /// The hypervisor a template's `image.json` records: the one it was built

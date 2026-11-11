@@ -51,6 +51,7 @@ service NodeService {
   // from it like any other per-sandbox fact.
   rpc ListSessions(NodeSandboxRef) returns (burrow.api.v1.ListSessionsResponse);
   rpc UpdateLifetime(NodeUpdateLifetimeRequest) returns (burrow.common.v1.Sandbox);
+  rpc UpdateResources(NodeUpdateResourcesRequest) returns (burrow.api.v1.UpdateResourcesResponse);
   // Forks on this node only: a sandbox's snapshot and disks are node-local, so
   // the child is built where the source already is.
   rpc ForkSandbox(NodeForkRequest) returns (burrow.common.v1.Sandbox);
@@ -282,14 +283,23 @@ message NodeUpdateAccessRequest {
   optional burrow.common.v1.FsPolicy fs = 3;
 }
 
-// The lifetime clocks, as the orchestrator forwards them. Absent leaves a field
-// as it is; the machine shape is carried only so the node can refuse it with
-// the same message a create would.
+// The lifetime clocks, as the orchestrator forwards them. Absent leaves a
+// field as it is.
 message NodeUpdateLifetimeRequest {
   string sandbox_id = 1;
   optional uint64 max_lifetime_secs = 2;
   optional uint64 idle_suspend_secs = 3;
   optional uint64 suspended_ttl_secs = 4;
+  optional uint64 snapshot_expiration_secs = 5;
+  optional uint32 snapshot_keep_last = 6;
+  optional bool is_evicted_snapshot_kept = 7;
+}
+
+message NodeUpdateResourcesRequest {
+  string sandbox_id = 1;
+  optional uint32 vcpus = 2;
+  optional uint32 mem_mib = 3;
+  optional uint32 disk_mib = 4;
 }
 
 message NodeForkRequest {

@@ -34,9 +34,13 @@ service Burrow {
   rpc RecreateSandbox(RecreateSandboxRequest) returns (burrow.common.v1.Sandbox);
   // Every VM this sandbox has run, newest first.
   rpc ListSessions(SandboxRef) returns (ListSessionsResponse);
-  // Move the clocks a running sandbox is measured against: lifetime, idle
-  // suspension and suspended retention. The machine shape is not movable.
+  // Move the clocks a sandbox is measured against: lifetime, idle
+  // suspension, suspended retention and snapshot retention.
   rpc UpdateLifetime(UpdateLifetimeRequest) returns (burrow.common.v1.Sandbox);
+  // Change a sandbox's vCPUs, memory and root disk: live where its hypervisor
+  // allows, while it is shut down otherwise, and refused field by field with
+  // the reason where neither can be done.
+  rpc UpdateResources(UpdateResourcesRequest) returns (UpdateResourcesResponse);
   // Create a sandbox from another's current state, on the source's node.
   rpc ForkSandbox(ForkSandboxRequest) returns (burrow.common.v1.Sandbox);
   // Move a sandbox to another node through the object store. A running one
@@ -613,15 +617,73 @@ message ListSessionsResponse {
 
 // Moves the clocks a sandbox is measured against.
 //
-// One call rather than an ExtendLifetime taking a single number, because all
-// three fields answer the same question, how long this sandbox stays paid for,
-// and are read by the same reaper on the same pass. Each is optional so that
-// 0 keeps its meaning of "unlimited" instead of colliding with "leave it".
+// One call rather than an ExtendLifetime taking a single number, because the
+// fields answer the same question, how long this sandbox and what it saved
+// stay paid for, and are read by the same reapers. Each is optional so that 0
+// keeps its meaning of "unlimited" instead of colliding with "leave it". The
+// result is held to the same rules a create's policy is.
 message UpdateLifetimeRequest {
   string sandbox_id = 1;
   optional uint64 max_lifetime_secs = 2;
   optional uint64 idle_suspend_secs = 3;
   optional uint64 suspended_ttl_secs = 4;
+  optional uint64 snapshot_expiration_secs = 5;
+  optional uint32 snapshot_keep_last = 6;
+  optional bool is_evicted_snapshot_kept = 7;
+}
+
+// Changes a Linux sandbox's machine. An absent field is left as it is.
+//
+// A running sandbox takes what its hypervisor can hotplug: a bigger root disk
+// under Firecracker and Cloud Hypervisor, whose guest grows its filesystem at
+// once, and vCPUs under Cloud Hypervisor on x86_64, which boots each guest
+// able to take up to the node's CPU count (arm64 KVM cannot add a vCPU to a
+// VM that has run). Anything else is refused. A shut-down sandbox takes all of
+// it: vCPUs and memory on its next boot, and its disk at once, grown on the
+// host or shrunk by a helper VM that checks and shrinks the filesystem first.
+// A suspended sandbox takes none of it: a restore needs the machine its
+// snapshot was taken of.
+message UpdateResourcesRequest {
+  string sandbox_id = 1;
+  optional uint32 vcpus = 2;
+  optional uint32 mem_mib = 3;
+  optional uint32 disk_mib = 4;
+}
+
+enum ResourceChange {
+  RESOURCE_CHANGE_UNSPECIFIED = 0;
+  // Already at that value.
+  RESOURCE_CHANGE_UNCHANGED = 1;
+  // Applied to the running guest.
+  RESOURCE_CHANGE_LIVE = 2;
+  // Recorded on a shut-down sandbox, for its next boot.
+  RESOURCE_CHANGE_NEXT_BOOT = 3;
+  // Applied to a shut-down sandbox's disk now.
+  RESOURCE_CHANGE_OFFLINE = 4;
+  // Not applied; `reason` says why.
+  RESOURCE_CHANGE_REFUSED = 5;
+}
+
+// What became of one field of an UpdateResourcesRequest.
+message ResourceOutcome {
+  ResourceChange change = 1;
+  uint32 previous = 2;
+  // The value the sandbox has now: the one asked for, or `previous` when
+  // refused.
+  uint32 value = 3;
+  string reason = 4;
+}
+
+// One outcome per field asked for; absent for a field that was not.
+message UpdateResourcesResponse {
+  burrow.common.v1.Sandbox sandbox = 1;
+  ResourceOutcome vcpus = 2;
+  ResourceOutcome mem_mib = 3;
+  ResourceOutcome disk_mib = 4;
+  // The root filesystem's size after a disk change, as the guest reports it.
+  // 0 when no guest has seen the disk yet: a shut-down sandbox grown, whose
+  // guest fills it on its next boot.
+  uint64 filesystem_bytes = 5;
 }
 
 // Replaces a sandbox's whole tag set: an omitted tag is a tag removed, and an
@@ -639,7 +701,7 @@ message ForkSandboxRequest {
   // Replaces the source's policy on the child. Empty inherits it, which is the
   // usual case: a fork is meant to be the same sandbox again. `resources` is
   // the exception: a restore takes its machine configuration from the
-  // snapshot, so an override naming different vcpus, memory or scratch disk is
+  // snapshot, so an override naming different vcpus, memory or disk is
   // refused rather than silently ignored.
   burrow.common.v1.Policy policy = 3;
   // Name for the child, under the same rules as on a create. A fork does not

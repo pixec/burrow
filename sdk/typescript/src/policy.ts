@@ -424,7 +424,7 @@ export function toResourcePolicy(options: ResourceOptions = {}): any {
     // asked makes a create from a snapshot look like a shape change.
     vcpus: options.vcpus ?? 0,
     memMib: options.memoryMib ?? 0,
-    scratchDiskMib: options.scratchDiskMib ?? 0,
+    diskMib: options.diskMib ?? 0,
   };
 }
 
@@ -432,7 +432,7 @@ export function fromResourcePolicy(raw: any): ResourcePolicy {
   return {
     vcpus: Number(raw?.vcpus ?? 0),
     memoryMib: Number(raw?.memMib ?? 0),
-    scratchDiskMib: Number(raw?.scratchDiskMib ?? 0),
+    diskMib: Number(raw?.diskMib ?? 0),
   };
 }
 

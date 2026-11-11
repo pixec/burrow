@@ -39,6 +39,10 @@ import type {
   PortMapping,
   PublicIp,
   RecreateOptions,
+  ResourceChange,
+  ResourceOutcome,
+  ResourcesUpdate,
+  ResourceUpdateOptions,
   SandboxInfo,
   SandboxState,
   Session,
@@ -65,6 +69,13 @@ const STATES: readonly SandboxState[] = [
 const SESSION_STARTS: readonly SessionStart[] = ["boot", "restore", "resume"];
 const SESSION_ENDS: readonly SessionEnd[] = ["suspended", "deleted", "failed", "stopped"];
 const COMMAND_STATES: readonly CommandState[] = ["running", "exited"];
+const RESOURCE_CHANGES: readonly ResourceChange[] = [
+  "unchanged",
+  "live",
+  "next_boot",
+  "offline",
+  "refused",
+];
 
 /** @internal One `Sandbox` record as the SDK reports it. */
 export function toSandboxInfo(raw: any): SandboxInfo {
@@ -93,6 +104,31 @@ export function toSandboxInfo(raw: any): SandboxInfo {
     publicIps: (raw.publicIps ?? []).map(toPublicIp),
     ipv6Address: raw.ipv6Address ?? "",
   };
+}
+
+function toResourceOutcome(raw: any): ResourceOutcome | undefined {
+  if (!raw) return undefined;
+  return {
+    change: enumOf(raw.change, "RESOURCE_CHANGE_", RESOURCE_CHANGES),
+    previous: raw.previous ?? 0,
+    value: raw.value ?? 0,
+    reason: raw.reason ?? "",
+  };
+}
+
+/** @internal What an `UpdateResources` answer says, field by field. */
+export function toResourcesUpdate(raw: any): ResourcesUpdate {
+  const update: ResourcesUpdate = { filesystemBytes: Number(raw.filesystemBytes ?? 0) };
+  const fields = [
+    ["vcpus", raw.vcpus],
+    ["memoryMib", raw.memMib],
+    ["diskMib", raw.diskMib],
+  ] as const;
+  for (const [name, field] of fields) {
+    const outcome = toResourceOutcome(field);
+    if (outcome) update[name] = outcome;
+  }
+  return update;
 }
 
 function toSession(raw: any): Session {
@@ -800,11 +836,15 @@ export class Sandbox {
   }
 
   /**
-   * Moves the clocks the sandbox is measured against.
+   * Moves the clocks the sandbox is measured against, and how long its
+   * snapshots are kept.
    *
    * An omitted field is left where it is, which is what lets `0` keep meaning
-   * "unlimited" here as it does on create. The machine shape is not among
-   * them: a running VM's configuration is fixed.
+   * "unlimited" here as it does on create.
+   *
+   * ```ts
+   * await sandbox.updateLifetime({ maxLifetimeSecs: 7200, snapshots: { keepLast: 3 } });
+   * ```
    */
   updateLifetime(options: UpdateLifetimeOptions): Promise<SandboxInfo> {
     return this.mutate(
@@ -814,9 +854,55 @@ export class Sandbox {
         maxLifetimeSecs: options.maxLifetimeSecs,
         idleSuspendSecs: options.idleSuspendSecs,
         suspendedTtlSecs: options.suspendedTtlSecs,
+        snapshotExpirationSecs: options.snapshots?.expirationSecs,
+        snapshotKeepLast: options.snapshots?.keepLast,
+        isEvictedSnapshotKept: options.snapshots?.keepEvicted,
       },
       options,
     );
+  }
+
+  /**
+   * Changes the sandbox's vCPUs, memory and root disk. An omitted field is
+   * left as it is.
+   *
+   * A running sandbox takes what its hypervisor can hotplug: a bigger disk
+   * under Firecracker and Cloud Hypervisor, whose guest grows its filesystem
+   * at once, and vCPUs under Cloud Hypervisor on x86_64. A shut-down one
+   * ({@link stop}) takes everything: vCPUs and memory on its next boot,
+   * and its disk at once, shrunk by a helper VM that checks the filesystem
+   * first. A suspended sandbox takes none of it. What cannot be applied is
+   * reported as `refused` with the reason rather than thrown, so check each
+   * field you asked for.
+   *
+   * ```ts
+   * const { vcpus, diskMib } = await sandbox.updateResources({ vcpus: 2, diskMib: 20 * 1024 });
+   * if (vcpus?.change === "refused") console.log(vcpus.reason);
+   * ```
+   */
+  async updateResources(options: ResourceUpdateOptions): Promise<ResourcesUpdate> {
+    for (const [name, value] of [
+      ["vcpus", options.vcpus],
+      ["memoryMib", options.memoryMib],
+      ["diskMib", options.diskMib],
+    ] as const) {
+      if (value !== undefined && (!Number.isInteger(value) || value <= 0)) {
+        throw new BurrowError(`${name} ${value} is not a positive integer`, "invalid_argument");
+      }
+    }
+    const raw = await this.call<any>(
+      "UpdateResources",
+      {
+        sandboxId: this.id,
+        vcpus: options.vcpus,
+        memMib: options.memoryMib,
+        diskMib: options.diskMib,
+      },
+      // A shrink boots a helper VM that checks the filesystem first.
+      { ...options, timeoutMs: options.timeoutMs ?? 600_000 },
+    );
+    if (raw.sandbox) this.info = toSandboxInfo(raw.sandbox);
+    return toResourcesUpdate(raw);
   }
 
   /** Replaces the sandbox's tags. An empty map clears them. */
@@ -1069,7 +1155,7 @@ export class Sandbox {
     const raw = await this.transport.unary<any, any>(
       "CreateSnapshot",
       { sandboxId: this.id, expirationSecs: options.expirationSecs ?? 0 },
-      // Writing a memory image and copying a scratch disk; seconds, not
+      // Writing a memory image and cloning a disk; seconds, not
       // milliseconds, on a large guest.
       options.timeoutMs ?? 120_000,
       options.signal,

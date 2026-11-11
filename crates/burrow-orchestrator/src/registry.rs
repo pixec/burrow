@@ -262,14 +262,16 @@ pub struct NodeRegistry {
     pending: Mutex<HashMap<String, Reserved>>,
 }
 
-/// The scratch disk a sandbox gets when its policy names none. Mirrors the
-/// node's, so placement charges what the node will actually promise.
-pub const DEFAULT_SCRATCH_MIB: u64 = 1024;
+/// What placement charges a sandbox whose policy names no disk. The node
+/// gives it the template's image plus 1 GiB, and the image's size is the
+/// node's to know, so placement charges the 1 GiB; the node's own admission,
+/// which charges the whole disk, is the gate.
+pub const DEFAULT_DISK_MIB: u64 = 1024;
 
-/// The disk a sandbox with these resources is promised, in bytes.
+/// The disk a sandbox with these resources is provisioned, in bytes.
 pub fn disk_bytes(resources: Option<&burrow_proto::common::v1::ResourcePolicy>) -> u64 {
-    let mib = match resources.map(|r| r.scratch_disk_mib).unwrap_or(0) {
-        0 => DEFAULT_SCRATCH_MIB,
+    let mib = match resources.map(|r| r.disk_mib).unwrap_or(0) {
+        0 => DEFAULT_DISK_MIB,
         mib => u64::from(mib),
     };
     mib * burrow_common::disk::MIB
@@ -306,7 +308,7 @@ pub fn disk_capacity(status: &NodeStatus) -> burrow_common::disk::DiskCapacity {
         free_bytes: disk.free_bytes,
         total_bytes: disk.total_bytes,
         reserve_bytes: disk.reserve_bytes,
-        unwritten_bytes: disk.unwritten_bytes,
+        provisioned_bytes: disk.provisioned_bytes,
         overcommit: disk.overcommit,
     }
 }
@@ -359,7 +361,7 @@ fn headroom(entry: &NodeEntry, pending: &HashMap<String, Reserved>) -> f64 {
     };
     let capacity = disk_capacity(&entry.status);
     let disk_free = burrow_common::disk::DiskCapacity {
-        unwritten_bytes: capacity.unwritten_bytes.saturating_add(held.disk_bytes),
+        provisioned_bytes: capacity.provisioned_bytes.saturating_add(held.disk_bytes),
         ..capacity
     }
     .headroom();
@@ -367,7 +369,7 @@ fn headroom(entry: &NodeEntry, pending: &HashMap<String, Reserved>) -> f64 {
 }
 
 /// When disk is what kept every candidate out: the one closest to fitting,
-/// and how much free disk it lacked. Empty when some node had the disk.
+/// and what it ran into. Empty when some node had the disk.
 fn disk_note(
     candidates: &[&NodeEntry],
     pending: &HashMap<String, Reserved>,
@@ -385,11 +387,18 @@ fn disk_note(
         }
     }
     match closest {
-        Some((entry, short)) => format!(
-            "; node {} is the closest on disk, short by {} MiB of free disk above its reserve",
-            entry.info.id,
-            short.mib()
-        ),
+        Some((entry, short)) => match short.limit {
+            burrow_common::disk::Limit::Capacity => format!(
+                "; node {} is the closest on disk, short by {} MiB of what it may provision",
+                entry.info.id,
+                short.mib()
+            ),
+            burrow_common::disk::Limit::Reserve => format!(
+                "; node {} is the closest on disk, {} MiB below its free-disk reserve",
+                entry.info.id,
+                short.mib()
+            ),
+        },
         None => String::new(),
     }
 }
@@ -1480,7 +1489,12 @@ mod tests {
             features::ALL
                 .iter()
                 .copied()
-                .filter(|f| *f != features::PUBLIC_IPS)
+                .filter(|f| {
+                    !matches!(
+                        *f,
+                        features::PUBLIC_IPS | features::ROOT_DISK | features::UPDATE_RESOURCES
+                    )
+                })
                 .collect::<Vec<_>>()
         );
         let want = Placement {
@@ -2099,21 +2113,21 @@ mod tests {
 
     const GIB: u64 = 1 << 30;
 
-    fn disk(free_gib: u64, unwritten_gib: u64, overcommit: f64) -> NodeStatus {
+    fn disk(free_gib: u64, provisioned_gib: u64, overcommit: f64) -> NodeStatus {
         NodeStatus {
             free_mem_mib: 64_000,
             disk: Some(burrow_proto::common::v1::DiskCapacity {
                 free_bytes: free_gib * GIB,
                 total_bytes: 100 * GIB,
                 reserve_bytes: 5 * GIB,
-                unwritten_bytes: unwritten_gib * GIB,
+                provisioned_bytes: provisioned_gib * GIB,
                 overcommit,
             }),
             ..Default::default()
         }
     }
 
-    /// A disk that fits above a node's reserve is placed there.
+    /// A disk within what a node may provision is placed there.
     #[test]
     fn a_disk_that_fits_is_placed() {
         let registry = registry(&[("a", disk(50, 20, 1.0))]);
@@ -2124,11 +2138,11 @@ mod tests {
         assert_eq!(registry.place_for(&want).unwrap(), "a");
     }
 
-    /// One that would cross every node's reserve is refused as a capacity
+    /// One past what every node may provision is refused as a capacity
     /// problem, naming the node that came closest and what it lacked.
     #[test]
     fn a_disk_that_fits_nowhere_is_refused_with_the_shortfall() {
-        let registry = registry(&[("a", disk(50, 20, 1.0)), ("b", disk(40, 20, 1.0))]);
+        let registry = registry(&[("a", disk(50, 70, 1.0)), ("b", disk(90, 71, 1.0))]);
         let err = registry
             .place_for(&Placement {
                 disk_bytes: 26 * GIB,
@@ -2143,6 +2157,15 @@ mod tests {
             "{message}"
         );
         assert!(message.contains("short by 1024 MiB"), "{message}");
+        // A node under its reserve says that instead.
+        let low = self::registry(&[("c", disk(4, 0, 1.0))])
+            .place_for(&Placement {
+                disk_bytes: GIB,
+                ..Default::default()
+            })
+            .unwrap_err()
+            .to_string();
+        assert!(low.contains("below its free-disk reserve"), "{low}");
         // As the API answers it.
         assert_eq!(
             crate::api::placement_status(err).code(),
@@ -2158,12 +2181,12 @@ mod tests {
             ..Default::default()
         };
         assert!(
-            registry(&[("a", disk(50, 20, 1.0))])
+            registry(&[("a", disk(50, 40, 1.0))])
                 .place_for(&want)
                 .is_err()
         );
         assert_eq!(
-            registry(&[("a", disk(50, 20, 2.0))])
+            registry(&[("a", disk(50, 40, 2.0))])
                 .place_for(&want)
                 .unwrap(),
             "a"
@@ -2171,10 +2194,10 @@ mod tests {
     }
 
     /// Placements since the last heartbeat count against the disk too, or a
-    /// burst of creates all fits into the same free space.
+    /// burst of creates all fits into the same room.
     #[test]
     fn disk_placed_since_the_last_heartbeat_is_counted() {
-        let registry = registry(&[("a", disk(30, 0, 1.0))]);
+        let registry = registry(&[("a", disk(30, 66, 1.0))]);
         let want = Placement {
             disk_bytes: 10 * GIB,
             ..Default::default()
@@ -2188,8 +2211,8 @@ mod tests {
 
     /// A node with more disk headroom wins when everything else is equal.
     #[test]
-    fn the_node_with_more_free_disk_is_preferred() {
-        let registry = registry(&[("full", disk(10, 0, 1.0)), ("empty", disk(90, 0, 1.0))]);
+    fn the_node_with_less_provisioned_disk_is_preferred() {
+        let registry = registry(&[("full", disk(90, 80, 1.0)), ("empty", disk(90, 0, 1.0))]);
         assert_eq!(
             registry
                 .place_for(&Placement {
@@ -2221,7 +2244,7 @@ mod tests {
         assert_eq!(disk_bytes(None), 1024 * burrow_common::disk::MIB);
         assert_eq!(
             disk_bytes(Some(&burrow_proto::common::v1::ResourcePolicy {
-                scratch_disk_mib: 4096,
+                disk_mib: 4096,
                 ..Default::default()
             })),
             4096 * burrow_common::disk::MIB

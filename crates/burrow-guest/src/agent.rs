@@ -66,6 +66,13 @@ impl Guest for AgentService {
         Ok(Response::new(guestpb::SetPublicAddressesResponse {}))
     }
 
+    async fn root_disk(
+        &self,
+        req: Request<guestpb::RootDiskRequest>,
+    ) -> Result<Response<guestpb::RootDiskResponse>, Status> {
+        Ok(Response::new(os::root_disk(req.into_inner()).await?))
+    }
+
     type ExecStream = tokio_stream::wrappers::ReceiverStream<Result<guestpb::ExecOutput, Status>>;
 
     async fn exec(

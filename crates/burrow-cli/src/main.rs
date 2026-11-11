@@ -648,21 +648,57 @@ enum ConfigCommand {
         #[command(flatten)]
         network: NetworkFlags,
     },
-    /// Move a running sandbox's lifetime clocks.
-    ///
-    /// The machine shape is not movable: a running VM's configuration is
-    /// fixed, and a restore takes it from the snapshot.
+    /// Move a sandbox's lifetime clocks and snapshot retention. A flag you
+    /// leave out is left as it is; 0 is unlimited, as on a create.
+    #[command(alias = "lifetimes")]
     Lifetime {
         id: String,
         /// Destroy the sandbox this many seconds after it was created.
-        /// 0 lets it live until something deletes it.
-        secs: u64,
-        /// Also replace the idle-suspend timeout.
-        #[arg(long)]
+        #[arg(long, alias = "max-lifetime")]
+        max_lifetime_secs: Option<u64>,
+        /// Suspend it after this many idle seconds.
+        #[arg(long, alias = "idle-suspend")]
         idle_suspend_secs: Option<u64>,
-        /// Also replace how long a suspended sandbox is kept.
-        #[arg(long)]
+        /// Delete it once it has been suspended this long.
+        #[arg(long, alias = "suspended-ttl")]
         suspended_ttl_secs: Option<u64>,
+        /// Sweep a snapshot this long after it was last used.
+        #[arg(long)]
+        snapshot_expiration_secs: Option<u64>,
+        /// Keep only this many snapshots, evicting the oldest.
+        #[arg(long)]
+        keep_last_snapshots: Option<u32>,
+        /// Let an evicted snapshot expire on its own instead of being deleted.
+        #[arg(long)]
+        keep_evicted_snapshots: Option<bool>,
+    },
+    /// Change a sandbox's vCPUs, memory and root disk.
+    ///
+    /// A running sandbox takes what its hypervisor can hotplug: a bigger disk
+    /// under Firecracker and Cloud Hypervisor, and vCPUs under Cloud
+    /// Hypervisor on x86_64. A shut-down one (`burrow shutdown`) takes everything: vCPUs
+    /// and memory on its next `boot`, and its disk at once, shrunk by a helper
+    /// VM that checks the filesystem first and refuses a size below what it
+    /// needs. A suspended sandbox takes none of it. Each change is reported as
+    /// live, next boot, offline or refused with the reason; any refusal exits
+    /// non-zero.
+    Resources {
+        id: String,
+        #[arg(long)]
+        vcpus: Option<u32>,
+        /// Memory in MiB, or a number with m or g.
+        #[arg(long = "mem-mib", alias = "mem", value_parser = parse_size_mib)]
+        mem_mib: Option<u32>,
+        /// Root disk: MiB, or a number with m or g, e.g. 20g.
+        #[arg(long = "disk-mib", alias = "disk", value_parser = parse_size_mib)]
+        disk_mib: Option<u32>,
+    },
+    /// Grow or shrink a sandbox's root disk: `config resources --disk-mib`.
+    Disk {
+        id: String,
+        /// The disk's new size: MiB, or a number with m or g, e.g. 20g.
+        #[arg(value_parser = parse_size_mib)]
+        mib: u32,
     },
     /// Replace a running sandbox's exec and file policies.
     ///
@@ -734,6 +770,11 @@ struct CreateFlags {
     /// Guest memory in MiB. Defaults to 512.
     #[arg(long)]
     mem_mib: Option<u32>,
+    /// Root disk in MiB, as the guest sees it: at least the template's image.
+    /// Defaults to the image plus 1024. Resized later with `burrow config
+    /// resources --disk-mib`.
+    #[arg(long = "disk-mib")]
+    disk_mib: Option<u32>,
     /// Destroy the sandbox this many seconds after it is created.
     /// 0 (default) lets it live until something deletes it.
     #[arg(long, default_value_t = 0)]
@@ -805,6 +846,7 @@ impl CreateFlags {
             || self.snapshot.is_some()
             || self.vcpus.is_some()
             || self.mem_mib.is_some()
+            || self.disk_mib.is_some()
             || self.max_lifetime_secs != 0
             || self.idle_suspend_secs != 0
             || self.suspended_ttl_secs != 0
@@ -1316,6 +1358,81 @@ fn parse_tmpfs_mount(raw: &str, mut rest: &str) -> anyhow::Result<common::Volume
     })
 }
 
+/// A size in MiB for `config resources`, as [`parse_mib`] reads one.
+fn parse_size_mib(size: &str) -> Result<u32, String> {
+    parse_mib(size)
+        .and_then(|mib| u32::try_from(mib).ok())
+        .ok_or_else(|| format!("{size:?} is not a size like 20g, 512m or 4096"))
+}
+
+/// Sends a resources update and prints what became of each field, failing
+/// when any was refused.
+async fn update_resources(
+    client: &mut Client,
+    id: String,
+    vcpus: Option<u32>,
+    mem_mib: Option<u32>,
+    disk_mib: Option<u32>,
+) -> anyhow::Result<()> {
+    let updated = client
+        .update_resources(api::UpdateResourcesRequest {
+            sandbox_id: id,
+            vcpus,
+            mem_mib,
+            disk_mib,
+        })
+        .await?
+        .into_inner();
+    let id = updated.sandbox.as_ref().map_or("", |s| &s.id);
+    let lines = describe_update(&updated);
+    for line in &lines {
+        println!("{id} {line}");
+    }
+    if lines.iter().any(|line| line.contains(" refused: ")) {
+        anyhow::bail!("not every change was applied");
+    }
+    Ok(())
+}
+
+/// What a resources update did, a line per field asked for.
+fn describe_update(updated: &api::UpdateResourcesResponse) -> Vec<String> {
+    let fields = [
+        ("vcpus", "", &updated.vcpus),
+        ("memory", " MiB", &updated.mem_mib),
+        ("disk", " MiB", &updated.disk_mib),
+    ];
+    fields
+        .into_iter()
+        .filter_map(|(name, unit, outcome)| {
+            let outcome = outcome.as_ref()?;
+            let (from, to) = (outcome.previous, outcome.value);
+            let filesystem = match (name, updated.filesystem_bytes) {
+                ("disk", bytes) if bytes > 0 => format!(", filesystem {} MiB", bytes >> 20),
+                _ => String::new(),
+            };
+            Some(
+                match api::ResourceChange::try_from(outcome.change).unwrap_or_default() {
+                    api::ResourceChange::Unchanged => format!("{name} already {to}{unit}"),
+                    api::ResourceChange::Live => {
+                        format!("{name} {from} -> {to}{unit} live{filesystem}")
+                    }
+                    api::ResourceChange::NextBoot => {
+                        format!("{name} {from} -> {to}{unit} on its next boot")
+                    }
+                    api::ResourceChange::Offline if to > from => format!(
+                        "{name} {from} -> {to}{unit} while shut down; the guest fills it on its \
+                         next boot"
+                    ),
+                    api::ResourceChange::Offline => {
+                        format!("{name} {from} -> {to}{unit} offline{filesystem}")
+                    }
+                    _ => format!("{name} refused: {}", outcome.reason),
+                },
+            )
+        })
+        .collect()
+}
+
 /// `512m`, `2g` or a bare number of MiB.
 fn parse_mib(size: &str) -> Option<u64> {
     let (digits, scale) = match size.as_bytes().last()? {
@@ -1400,9 +1517,11 @@ enum TemplatesCommand {
         /// and the restore image's minimum for macOS.
         #[arg(long = "mem", default_value_t = 0)]
         mem_mib: u32,
-        /// Size of the installed macOS disk, in MiB, for --from-ipsw.
-        /// Defaults to 65536; macOS needs 28672 to install.
-        #[arg(long, default_value_t = 0, requires = "from_ipsw")]
+        /// Size of the build's root disk in MiB, which is the size of the image
+        /// it makes. Defaults to the base image plus 1024. With --from-ipsw,
+        /// the installed macOS disk: 65536 by default, and macOS needs 28672
+        /// to install.
+        #[arg(long, default_value_t = 0)]
         disk_mib: u32,
         /// Domain the build may reach. Repeatable; none means any.
         #[arg(long = "allow-domain")]
@@ -2198,18 +2317,35 @@ async fn main() -> anyhow::Result<()> {
                 .into_inner();
             println!("{} network policy updated", sandbox.id);
         }
+        Command::Config(ConfigCommand::Disk { id, mib }) => {
+            update_resources(&mut client, id, None, None, Some(mib)).await?;
+        }
+        Command::Config(ConfigCommand::Resources {
+            id,
+            vcpus,
+            mem_mib,
+            disk_mib,
+        }) => {
+            update_resources(&mut client, id, vcpus, mem_mib, disk_mib).await?;
+        }
         Command::Config(ConfigCommand::Lifetime {
             id,
-            secs,
+            max_lifetime_secs,
             idle_suspend_secs,
             suspended_ttl_secs,
+            snapshot_expiration_secs,
+            keep_last_snapshots,
+            keep_evicted_snapshots,
         }) => {
             let sandbox = client
                 .update_lifetime(api::UpdateLifetimeRequest {
                     sandbox_id: id,
-                    max_lifetime_secs: Some(secs),
+                    max_lifetime_secs,
                     idle_suspend_secs,
                     suspended_ttl_secs,
+                    snapshot_expiration_secs,
+                    snapshot_keep_last: keep_last_snapshots,
+                    is_evicted_snapshot_kept: keep_evicted_snapshots,
                 })
                 .await?
                 .into_inner();
@@ -2218,13 +2354,16 @@ async fn main() -> anyhow::Result<()> {
                 .unwrap_or_default()
                 .lifetime
                 .unwrap_or_default();
+            let clock = |secs: u64| match secs {
+                0 => "unlimited".to_string(),
+                secs => format!("{secs}s"),
+            };
             println!(
-                "{} max-lifetime {}",
+                "{} max-lifetime {}, idle-suspend {}, suspended-ttl {}",
                 sandbox.id,
-                match lifetime.max_lifetime_secs {
-                    0 => "unlimited".to_string(),
-                    secs => format!("{secs}s"),
-                }
+                clock(lifetime.max_lifetime_secs),
+                clock(lifetime.idle_suspend_secs),
+                clock(lifetime.suspended_ttl_secs)
             );
         }
         Command::Config(ConfigCommand::Access { id, access }) => {
@@ -3039,6 +3178,7 @@ fn create_request(flags: CreateFlags) -> anyhow::Result<api::CreateSandboxReques
         snapshot,
         vcpus,
         mem_mib,
+        disk_mib,
         max_lifetime_secs,
         idle_suspend_secs,
         suspended_ttl_secs,
@@ -3072,7 +3212,7 @@ fn create_request(flags: CreateFlags) -> anyhow::Result<api::CreateSandboxReques
                 // from a snapshot inherit the shape it was taken with.
                 vcpus: vcpus.unwrap_or(0),
                 mem_mib: mem_mib.unwrap_or(0),
-                scratch_disk_mib: 0,
+                disk_mib: disk_mib.unwrap_or(0),
             }),
             lifetime: Some(common::LifetimePolicy {
                 max_lifetime_secs,
@@ -4234,6 +4374,13 @@ fn print_config(sandbox: &common::Sandbox) {
         // raw tells a reader nothing about the machine they actually have.
         field("vcpus", &shape_value(resources.vcpus as u64, 1));
         field("mem-mib", &shape_value(resources.mem_mib as u64, 512));
+        if resources.disk_mib > 0 {
+            let layout = match common::DiskLayout::try_from(sandbox.disk_layout) {
+                Ok(common::DiskLayout::Root) => "root disk",
+                _ => "overlay scratch disk",
+            };
+            field("disk", &format!("{} MiB {layout}", resources.disk_mib));
+        }
     }
     if let Some(lifetime) = &policy.lifetime {
         if lifetime.max_lifetime_secs > 0 {
@@ -5095,6 +5242,10 @@ fn sandbox_json(sandbox: &common::Sandbox) -> String {
         "agent_unconfirmed": sandbox.is_agent_unconfirmed,
         "node": sandbox.node_id,
         "template": sandbox.template,
+        "disk_layout": match common::DiskLayout::try_from(sandbox.disk_layout) {
+            Ok(common::DiskLayout::Root) => "root",
+            _ => "overlay",
+        },
         "created_at": rfc3339_from_unix_ms(sandbox.created_at_unix_ms),
         "address": sandbox.guest_ip,
         "usage": {
@@ -5105,6 +5256,7 @@ fn sandbox_json(sandbox: &common::Sandbox) -> String {
         "resources": {
             "vcpus": resources.vcpus,
             "mem_mib": resources.mem_mib,
+            "disk_mib": resources.disk_mib,
         },
         "lifetime": {
             "max_lifetime_secs": lifetime.max_lifetime_secs,
@@ -5335,6 +5487,57 @@ mod tests {
             is_healthy: true,
             last_heartbeat_at_unix_ms: 0,
         }
+    }
+
+    #[test]
+    fn config_resources_reads_sizes_and_says_what_it_did() {
+        assert_eq!(super::parse_size_mib("20g").unwrap(), 20 * 1024);
+        assert_eq!(super::parse_size_mib("20G").unwrap(), 20 * 1024);
+        assert_eq!(super::parse_size_mib("512m").unwrap(), 512);
+        assert_eq!(super::parse_size_mib("4096").unwrap(), 4096);
+        assert!(super::parse_size_mib("0").is_err());
+        assert!(super::parse_size_mib("5000000g").is_err());
+        let field = |change: api::ResourceChange, previous, value, reason: &str| {
+            Some(api::ResourceOutcome {
+                change: change as i32,
+                previous,
+                value,
+                reason: reason.into(),
+            })
+        };
+        let lines = super::describe_update(&api::UpdateResourcesResponse {
+            vcpus: field(api::ResourceChange::Live, 1, 2, ""),
+            mem_mib: field(api::ResourceChange::Refused, 512, 512, "cannot"),
+            disk_mib: field(api::ResourceChange::Live, 1024, 2048, ""),
+            filesystem_bytes: 2040 << 20,
+            ..Default::default()
+        });
+        assert_eq!(
+            lines,
+            [
+                "vcpus 1 -> 2 live",
+                "memory refused: cannot",
+                "disk 1024 -> 2048 MiB live, filesystem 2040 MiB",
+            ]
+        );
+        let lines = super::describe_update(&api::UpdateResourcesResponse {
+            mem_mib: field(api::ResourceChange::NextBoot, 512, 1024, ""),
+            disk_mib: field(api::ResourceChange::Offline, 2048, 1024, ""),
+            filesystem_bytes: 1024 << 20,
+            ..Default::default()
+        });
+        assert_eq!(
+            lines,
+            [
+                "memory 512 -> 1024 MiB on its next boot",
+                "disk 2048 -> 1024 MiB offline, filesystem 1024 MiB",
+            ]
+        );
+        let grown = super::describe_update(&api::UpdateResourcesResponse {
+            disk_mib: field(api::ResourceChange::Offline, 1024, 2048, ""),
+            ..Default::default()
+        });
+        assert!(grown[0].contains("next boot"), "{grown:?}");
     }
 
     /// `node ls` shows each node's free and total disk, and a node under its
@@ -6119,6 +6322,7 @@ mod tests {
                 snapshot: None,
                 vcpus: None,
                 mem_mib: None,
+                disk_mib: None,
                 snapshot_expiration_secs: 0,
                 keep_last_snapshots: 0,
                 is_evicted_snapshots_kept: false,

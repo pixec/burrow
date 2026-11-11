@@ -198,7 +198,9 @@ stdin. `lost_bytes` counts output a rotating log dropped.
 - `Sandbox`: `create`, `get`, `get_or_create`, `list`, `fork`; `watch` for a
   directory's changes; `terminal()` for a live pty; ports (`expose_port`,
   `domain`, `share`); updates (`update_tags`, `update_network_policy`,
-  `update_access_policy`, `update_lifetime`); lifecycle (`pause`, `resume`,
+  `update_access_policy`, `update_lifetime`, and `update_resources` for
+  vCPUs, memory and the root disk, reported per field as live, next boot,
+  offline or refused); lifecycle (`pause`, `resume`,
   `stop`, `start`, `recreate`, `move`, `snapshot`, `delete`), named as the
   states are: a paused sandbox keeps its memory and resumes in milliseconds,
   a stopped one keeps only its disk and starts with a cold boot; guest users

@@ -54,7 +54,7 @@ export class Snapshot {
   /** The machine the snapshot was taken on, and the only one it restores as. */
   readonly resources: ResourcePolicy;
   readonly createdAt: Date;
-  /** Memory image, vmstate and scratch disk, as the node's disk sees them. */
+  /** Memory image, vmstate and disk, as the node's disk sees them. */
   readonly sizeBytes: number;
   /** `null` when the snapshot does not expire. */
   readonly expiresAt: Date | null;

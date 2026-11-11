@@ -1,10 +1,14 @@
 //! Suspended sandboxes kept in the object store, so they outlive their node.
 //!
 //! After every suspend a node uploads the sandbox's state: its memory chain
-//! flattened into one chunked image, its scratch disk, its vmstate, and its
-//! kernel and rootfs as blobs. A manifest written last names the generation
-//! that is complete. Another node can then adopt the sandbox: fetch the small
-//! parts, start the VM, and take memory as the guest faults on it.
+//! flattened into one chunked image, its disk, its vmstate, and its kernel as
+//! a blob. A root disk is stored as a chunk index naming its image, whose own
+//! chunks are stored once for every disk cloned from it: only the chunks the
+//! guest changed are sent, and a node adopting the sandbox clones its own copy
+//! of the image and fetches only those. An overlay sandbox's rootfs goes as a
+//! blob and its scratch disk as chunks. A manifest written last names the
+//! generation that is complete. Another node can then adopt the sandbox: fetch
+//! the small parts, start the VM, and take memory as the guest faults on it.
 //!
 //! The manifest also carries who holds the sandbox and whether it is running.
 //! A node marks it running *before* it resumes the guest, so a node adopting
@@ -26,13 +30,15 @@
 //! sandboxes/<id>/manifest.json
 //! sandboxes/<id>/<generation>/<state>
 //! sandboxes/<id>/<generation>/<memory>.index.json
-//! sandboxes/<id>/<generation>/scratch.ext4.index.json
+//! sandboxes/<id>/<generation>/<disk>.index.json
 //! sandboxes/<id>/<generation>/command-logs.json
+//! images/<digest>.index.json
 //! chunks/<sha256>
 //! blobs/<digest>
 //! ```
 //!
-//! `<state>` and `<memory>` are the sandbox's hypervisor's [`burrow_vmm::Layout`].
+//! `<state>` and `<memory>` are the sandbox's hypervisor's [`burrow_vmm::Layout`],
+//! and `<disk>` is `root.ext4` or, on the overlay layout, `scratch.ext4`.
 
 #![allow(clippy::result_large_err)]
 
@@ -53,9 +59,8 @@ const FORMAT: u32 = 1;
 const MANIFEST: &str = "manifest.json";
 /// The last upload, as this node made or adopted it, in the working directory.
 const LOCAL: &str = "durable.json";
-const SCRATCH_IMAGE: &str = "scratch.ext4";
 const TEMPLATE_KERNEL: &str = "vmlinux";
-const TEMPLATE_ROOTFS: &str = "rootfs.ext4";
+const TEMPLATE_ROOTFS: &str = crate::rootdisk::IMAGE;
 /// The sandbox's command logs, by file name, as chunked images.
 const COMMAND_LOGS: &str = "command-logs.json";
 
@@ -86,7 +91,12 @@ pub struct Manifest {
     pub template: String,
     pub vcpus: u32,
     pub mem_mib: u32,
-    pub scratch_disk_mib: u32,
+    #[serde(alias = "scratch_disk_mib")]
+    pub disk_mib: u32,
+    /// [`crate::rootdisk::DiskLayout`]; empty in a manifest from before root
+    /// disks, which was the overlay.
+    #[serde(default)]
+    pub disk_layout: String,
     pub is_systemd: bool,
     pub arch: String,
     /// The version of `hypervisor` that wrote the state.
@@ -96,6 +106,8 @@ pub struct Manifest {
     #[serde(default)]
     pub hypervisor: String,
     pub kernel_digest: String,
+    /// The template's image. On the root layout the disk's index is a diff
+    /// against it, by chunk, and it is in the store under `images/`.
     pub rootfs_digest: String,
     pub cpu_usage_usec: u64,
     pub rx_bytes: u64,
@@ -125,6 +137,10 @@ impl Manifest {
 
     fn layout(&self) -> Result<burrow_vmm::Layout, Status> {
         self.hypervisor().map(burrow_vmm::Hypervisor::layout)
+    }
+
+    fn disk_layout(&self) -> crate::rootdisk::DiskLayout {
+        crate::rootdisk::DiskLayout::from_record(&self.disk_layout)
     }
 }
 
@@ -176,11 +192,13 @@ pub struct LocalState {
     pub is_published: bool,
     pub layers: Vec<LayerId>,
     pub vmstate: Stamp,
-    pub scratch: Stamp,
+    #[serde(alias = "scratch")]
+    pub disk: Stamp,
     pub kernel: Stamp,
     pub rootfs: Stamp,
     pub memory: ImageIndex,
-    pub scratch_index: ImageIndex,
+    #[serde(alias = "scratch_index")]
+    pub disk_index: ImageIndex,
     #[serde(default)]
     pub logs: std::collections::BTreeMap<String, LogImage>,
 }
@@ -206,13 +224,14 @@ impl LocalState {
             && self.manifest.layout().is_ok_and(|layout| {
                 Stamp::of(&workdir.join(layout.state)).is_ok_and(|now| now == self.vmstate)
             })
-            && Stamp::of(&workdir.join(SCRATCH_IMAGE)).is_ok_and(|now| now == self.scratch)
+            && Stamp::of(&workdir.join(self.manifest.disk_layout().disk()))
+                .is_ok_and(|now| now == self.disk)
     }
 
     fn digests(&self) -> HashSet<String> {
         self.memory
             .digests()
-            .chain(self.scratch_index.digests())
+            .chain(self.disk_index.digests())
             .chain(self.logs.values().flat_map(|log| log.index.digests()))
             .map(str::to_string)
             .collect()
@@ -322,8 +341,10 @@ fn memory_file(layout: burrow_vmm::Layout) -> Result<&'static str, Status> {
 /// `draft` carries what the manifest says about the sandbox; the generation,
 /// digests and state are filled in here. `previous` is the last upload, whose
 /// chunks are reused where the layers they came from are unchanged.
+#[allow(clippy::too_many_arguments)]
 pub async fn upload(
     store: &ObjectStore,
+    blobs: &crate::blobs::BlobStore,
     workdir: &Path,
     logs_dir: &Path,
     chain: &[String],
@@ -341,8 +362,10 @@ pub async fn upload(
         .collect::<std::io::Result<Vec<_>>>()
         .map_err(|err| io("reading the memory chain", err))?;
     let stamp = |file: &str| Stamp::of(&workdir.join(file)).map_err(|err| io(file, err));
+    let disk_layout = draft.disk_layout();
+    let disk_file = disk_layout.disk();
     let vmstate = stamp(layout.state)?;
-    let scratch = stamp(SCRATCH_IMAGE)?;
+    let disk = stamp(disk_file)?;
     let kernel = stamp(TEMPLATE_KERNEL)?;
     let rootfs = stamp(TEMPLATE_ROOTFS)?;
     let known = previous.map(LocalState::digests).unwrap_or_default();
@@ -365,12 +388,27 @@ pub async fn upload(
         previous.map(|p| (&p.kernel, &p.manifest.kernel_digest)),
     )
     .await?;
-    let rootfs_digest = blob(
-        TEMPLATE_ROOTFS,
-        &rootfs,
-        previous.map(|p| (&p.rootfs, &p.manifest.rootfs_digest)),
-    )
-    .await?;
+    // A root disk's image goes to the store once, as chunks every disk
+    // cloned from it shares; an overlay's rootfs goes as a blob.
+    let image = match disk_layout {
+        crate::rootdisk::DiskLayout::Root => {
+            let image = crate::rootdisk::image_of(blobs, &workdir.join(TEMPLATE_ROOTFS)).await?;
+            crate::rootdisk::upload_image(store, &image).await?;
+            Some(image)
+        }
+        crate::rootdisk::DiskLayout::Overlay => None,
+    };
+    let rootfs_digest = match &image {
+        Some(image) => image.digest.clone(),
+        None => {
+            blob(
+                TEMPLATE_ROOTFS,
+                &rootfs,
+                previous.map(|p| (&p.rootfs, &p.manifest.rootfs_digest)),
+            )
+            .await?
+        }
+    };
 
     let reuse = previous
         .filter(|p| layers.starts_with(&p.layers))
@@ -379,11 +417,10 @@ pub async fn upload(
             covered: p.layers.len(),
         });
     let memory = crate::chunks::put_image(store, workdir, chain, reuse, &known).await?;
-    let scratch_index = match previous.filter(|p| p.scratch == scratch) {
-        Some(previous) => previous.scratch_index.clone(),
+    let disk_index = match previous.filter(|p| p.disk == disk) {
+        Some(previous) => previous.disk_index.clone(),
         None => {
-            crate::chunks::put_image(store, workdir, &[SCRATCH_IMAGE.to_string()], None, &known)
-                .await?
+            crate::chunks::put_disk(store, &workdir.join(disk_file), image.as_ref(), &known).await?
         }
     };
 
@@ -410,7 +447,7 @@ pub async fn upload(
             )
             .await?;
     }
-    for (file, index) in [(memory_file, &memory), (SCRATCH_IMAGE, &scratch_index)] {
+    for (file, index) in [(memory_file, &memory), (disk_file, &disk_index)] {
         let json = serde_json::to_vec(index)
             .map_err(|err| Status::internal(format!("encoding an index: {err}")))?;
         store
@@ -428,7 +465,7 @@ pub async fn upload(
     // The sandbox's files were read without holding them still. A resume
     // cancels the upload before it starts the guest, so a change here is a
     // bug rather than a race, and is refused rather than published.
-    if stamp(layout.state)? != vmstate || stamp(SCRATCH_IMAGE)? != scratch {
+    if stamp(layout.state)? != vmstate || stamp(disk_file)? != disk {
         return Err(Status::aborted(
             "the sandbox changed while it was being uploaded",
         ));
@@ -446,11 +483,11 @@ pub async fn upload(
         is_published: false,
         layers,
         vmstate,
-        scratch,
+        disk,
         kernel,
         rootfs,
         memory,
-        scratch_index,
+        disk_index,
         logs,
     };
     save_local(workdir, &local).await?;
@@ -469,7 +506,7 @@ pub async fn upload(
         sandbox = id,
         generation,
         memory_bytes = local.memory.stored_bytes(),
-        scratch_bytes = local.scratch_index.stored_bytes(),
+        disk_bytes = local.disk_index.stored_bytes(),
         took_ms = started.elapsed().as_millis() as u64,
         "sandbox state is in the object store"
     );
@@ -642,26 +679,50 @@ pub async fn stage(
     let layout = manifest.layout()?;
     let vmstate = layout.state;
     let memory_file = memory_file(layout)?;
+    let disk_layout = manifest.disk_layout();
+    let disk_file = disk_layout.disk();
     // Everything small at once: each is a round trip, and none depends on
-    // another.
+    // another. A root disk's image comes from this node's own copy, or once
+    // from the store when it has none.
     let (kernel_path, rootfs_path) = (dest.join(TEMPLATE_KERNEL), dest.join(TEMPLATE_ROOTFS));
     let (vmstate_path, working_set_path) = (dest.join(vmstate), dest.join(WORKING_SET));
     let vmstate_key = generation_key(id, generation, vmstate);
     let working_set_key = generation_key(id, generation, WORKING_SET);
-    let scratch_key = index_key(id, generation, SCRATCH_IMAGE);
+    let disk_key = index_key(id, generation, disk_file);
     let memory_key = index_key(id, generation, memory_file);
-    let (kernel, rootfs, vmstate_fetched, working_set, scratch_index, memory) = tokio::join!(
+    let rootfs = async {
+        match disk_layout {
+            crate::rootdisk::DiskLayout::Root => {
+                let image = crate::rootdisk::fetch_image(
+                    store,
+                    snapshots.blobs(),
+                    &snapshots.templates_dir(),
+                    &manifest.rootfs_digest,
+                )
+                .await?;
+                tokio::fs::hard_link(&image.path, &rootfs_path)
+                    .await
+                    .map_err(|err| Status::internal(format!("linking the image: {err}")))?;
+                Ok(Some(image))
+            }
+            crate::rootdisk::DiskLayout::Overlay => snapshots
+                .fetch_blob(store, &manifest.rootfs_digest, &rootfs_path)
+                .await
+                .map(|()| None),
+        }
+    };
+    let (kernel, image, vmstate_fetched, working_set, disk_index, memory) = tokio::join!(
         snapshots.fetch_blob(store, &manifest.kernel_digest, &kernel_path),
-        snapshots.fetch_blob(store, &manifest.rootfs_digest, &rootfs_path),
+        rootfs,
         store.get_to_file(&vmstate_key, &vmstate_path),
         store.get_to_file(&working_set_key, &working_set_path),
-        crate::snapshot::read_index(store, &scratch_key),
+        crate::snapshot::read_index(store, &disk_key),
         crate::snapshot::read_index(store, &memory_key),
     );
     kernel?;
-    rootfs?;
+    let image = image?;
     vmstate_fetched?.ok_or_else(|| missing(vmstate))?;
-    let scratch_index = scratch_index?.ok_or_else(|| missing(SCRATCH_IMAGE))?;
+    let disk_index = disk_index?.ok_or_else(|| missing(disk_file))?;
     let memory = memory?.ok_or_else(|| missing(memory_file))?;
     let working_set = match working_set? {
         Some(()) => read_offsets(&working_set_path).await,
@@ -671,8 +732,8 @@ pub async fn stage(
 
     let hydrator = Hydrator::begin(store.clone(), memory.clone(), &dest.join(memory_file))
         .map_err(|err| Status::internal(format!("preparing guest memory: {err}")))?;
-    // The pages the guest was using, fetched alongside the scratch disk
-    // rather than one fault at a time once it runs. A failure here costs
+    // The pages the guest was using, fetched alongside the disk rather than
+    // one fault at a time once it runs. A failure here costs
     // only faults later, which fetch for themselves. The rest of the image
     // waits until both are in: it is what the guest does not need yet, and
     // fetching it alongside them only makes the restore wait longer.
@@ -683,17 +744,22 @@ pub async fn stage(
             hydrator.ensure_all(&working_set, PAGE)
         })
     };
-    let scratch_path = dest.join(SCRATCH_IMAGE);
-    let (scratch, warmed) = tokio::join!(
-        crate::chunks::get_image(store, &scratch_index, &scratch_path),
+    let disk_path = dest.join(disk_file);
+    let (fetched_disk, warmed) = tokio::join!(
+        crate::rootdisk::materialise(store, &disk_index, image.as_ref(), &disk_path),
         warming
     );
-    scratch?;
+    let disk_fetched_bytes = fetched_disk?;
     if let Ok(Err(err)) = warmed {
         tracing::warn!(sandbox = %id, %err, "could not fetch the working set ahead of the guest");
     }
     hydrator.start();
     let fetched_scratch = started.elapsed();
+    // On the disk before the guest runs on it: a manifest marked running with
+    // a disk still in the page cache is a disk a power cut takes back.
+    crate::fsync::tree(dest)
+        .await
+        .map_err(|err| Status::internal(format!("syncing the adopted state: {err}")))?;
     let logs = stage_logs(store, id, generation, logs_dir).await?;
 
     let io = |what: &str, err: std::io::Error| Status::internal(format!("{what}: {err}"));
@@ -703,19 +769,20 @@ pub async fn stage(
         is_published: true,
         layers: vec![LayerId::of(dest, memory_file).map_err(|err| io(memory_file, err))?],
         vmstate: stamp(vmstate)?,
-        scratch: stamp(SCRATCH_IMAGE)?,
+        disk: stamp(disk_file)?,
         kernel: stamp(TEMPLATE_KERNEL)?,
         rootfs: stamp(TEMPLATE_ROOTFS)?,
         memory,
-        scratch_index,
+        disk_index,
         logs,
     };
     save_local(dest, &local).await?;
     tracing::info!(
         sandbox = %id,
         small_ms = fetched_small.as_millis() as u64,
-        scratch_and_working_set_ms = (fetched_scratch - fetched_small).as_millis() as u64,
-        scratch_bytes = local.scratch_index.stored_bytes(),
+        disk_and_working_set_ms = (fetched_scratch - fetched_small).as_millis() as u64,
+        disk_bytes = local.disk_index.stored_bytes(),
+        disk_fetched_bytes,
         rest_ms = (started.elapsed() - fetched_scratch).as_millis() as u64,
         "staged stored state"
     );
@@ -841,7 +908,10 @@ pub async fn collect_garbage(
     snapshots: &crate::snapshot::SnapshotStore,
 ) -> Result<(), Status> {
     let mut referenced = HashSet::new();
-    snapshots.remote_chunk_refs(&mut referenced).await?;
+    let mut images = HashSet::new();
+    snapshots
+        .remote_chunk_refs(&mut referenced, &mut images)
+        .await?;
 
     let objects = store.list_aged("sandboxes/").await?;
     let mut current: HashMap<String, u64> = HashMap::new();
@@ -858,7 +928,14 @@ pub async fn collect_garbage(
         // Refused rather than skipped: skipping would leave this sandbox's
         // chunks unreferenced, and the sweep below would take them.
         let layout = manifest.layout()?;
-        for file in layout.memory.into_iter().chain([SCRATCH_IMAGE]) {
+        if manifest.disk_layout() == crate::rootdisk::DiskLayout::Root {
+            images.insert(manifest.rootfs_digest.clone());
+        }
+        for file in layout
+            .memory
+            .into_iter()
+            .chain([manifest.disk_layout().disk()])
+        {
             if let Some(index) =
                 crate::snapshot::read_index(store, &index_key(id, manifest.generation, file))
                     .await?
@@ -908,11 +985,14 @@ pub async fn collect_garbage(
         }
     }
 
+    let images =
+        crate::rootdisk::remote_image_refs(store, &images, GARBAGE_GRACE, &mut referenced).await?;
     let removed = crate::chunks::collect_garbage(store, &referenced, GARBAGE_GRACE).await?;
-    if removed > 0 || stale > 0 {
+    if removed > 0 || stale > 0 || images > 0 {
         tracing::info!(
             chunks = removed,
             objects = stale,
+            images,
             "collected unreferenced stored state"
         );
     }
@@ -933,7 +1013,8 @@ mod tests {
             template: "alpine".into(),
             vcpus: 1,
             mem_mib: 512,
-            scratch_disk_mib: 1024,
+            disk_mib: 1024,
+            disk_layout: String::new(),
             is_systemd: false,
             arch: "aarch64".into(),
             hypervisor_version: "1".into(),

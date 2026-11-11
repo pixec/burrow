@@ -37,12 +37,10 @@ use tonic::Status;
 pub const MAX_SIZE_MIB: u64 = 1024 * 1024;
 pub const MIN_SIZE_MIB: u64 = 1;
 
-/// Guest devices volumes are attached as.
-///
-/// `/dev/vda` is the template rootfs and `/dev/vdb` the scratch disk, so
-/// volumes start at `/dev/vdc`. The cap keeps the naming to one letter, which
-/// is all the kernel's own scheme gives without a second character.
-pub const FIRST_DEVICE: u8 = b'c';
+/// Volumes a sandbox mounts at most. They follow the sandbox's own disks
+/// (`/dev/vda` its root, and `/dev/vdb` an overlay sandbox's scratch disk),
+/// and the cap keeps their names to one letter, which is all the kernel's own
+/// scheme gives without a second character.
 pub const MAX_MOUNTS: usize = 8;
 
 #[cfg(not(target_os = "macos"))]
@@ -831,8 +829,11 @@ fn validate_path(path: &str) -> Result<(), Status> {
 }
 
 /// Guest device a mount lands on, in the order the drives were attached.
-pub fn device_for(index: usize) -> String {
-    format!("/dev/vd{}", (FIRST_DEVICE + index as u8) as char)
+pub fn device_for(index: usize, layout: crate::rootdisk::DiskLayout) -> String {
+    format!(
+        "/dev/vd{}",
+        (layout.first_volume_device() + index as u8) as char
+    )
 }
 
 /// The mounts that are block devices, each with its drive index.
@@ -851,6 +852,11 @@ pub fn block_mounts(
 /// virtio serial number under Cloud Hypervisor.
 pub fn disk_id(index: usize) -> String {
     format!("burrow-volume{index}")
+}
+
+/// Whether a drive is a volume's rather than the sandbox's own disk.
+pub fn is_volume_drive(id: &str) -> bool {
+    id.starts_with("volume") || id.starts_with("burrow-volume")
 }
 
 /// The drive id a volume is attached under. A Linux guest finds its volumes
@@ -872,6 +878,7 @@ pub fn drive_id(index: usize, guest_os: burrow_vmm::GuestOs) -> String {
 pub fn agent_mounts(
     mounts: &[common::VolumeMount],
     guest_os: burrow_vmm::GuestOs,
+    layout: crate::rootdisk::DiskLayout,
 ) -> Vec<burrow_proto::guest::v1::VolumeMount> {
     let mut block = 0;
     mounts
@@ -882,7 +889,7 @@ pub fn agent_mounts(
             } else {
                 block += 1;
                 match guest_os {
-                    burrow_vmm::GuestOs::Linux => device_for(block - 1),
+                    burrow_vmm::GuestOs::Linux => device_for(block - 1, layout),
                     _ => disk_id(block - 1),
                 }
             };
@@ -901,6 +908,7 @@ pub fn agent_mounts(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::rootdisk::DiskLayout;
 
     fn mount(volume: &str, path: &str, read_only: bool) -> common::VolumeMount {
         common::VolumeMount {
@@ -1016,18 +1024,22 @@ mod tests {
             tmpfs("/scratch", 256, "1777"),
             mount("b", "/b", true),
         ];
-        let agent = agent_mounts(&mounts, burrow_vmm::GuestOs::Linux);
-        assert_eq!(agent[0].device, "/dev/vdc");
+        let agent = agent_mounts(&mounts, burrow_vmm::GuestOs::Linux, DiskLayout::Root);
+        assert_eq!(agent[0].device, "/dev/vdb");
         assert_eq!(agent[1].device, "");
         assert!(agent[1].is_tmpfs);
         assert_eq!(agent[1].size_mib, 256);
         assert_eq!(agent[1].mode, "1777");
-        assert_eq!(agent[2].device, "/dev/vdd");
+        assert_eq!(agent[2].device, "/dev/vdc");
         assert!(agent[2].is_read_only);
+        // An overlay sandbox's scratch disk is the second drive.
+        let overlay = agent_mounts(&mounts, burrow_vmm::GuestOs::Linux, DiskLayout::Overlay);
+        assert_eq!(overlay[0].device, "/dev/vdc");
+        assert_eq!(overlay[2].device, "/dev/vdd");
 
         // A Windows or macOS guest is told which of the disks after its own
         // it is.
-        let mac = agent_mounts(&mounts, burrow_vmm::GuestOs::Windows);
+        let mac = agent_mounts(&mounts, burrow_vmm::GuestOs::Windows, DiskLayout::Root);
         assert_eq!(mac[0].device, disk_id(0));
         assert_eq!(mac[1].device, "");
         assert_eq!(mac[2].device, "burrow-volume1");

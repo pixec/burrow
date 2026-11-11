@@ -250,6 +250,35 @@ class IpPool:
 
 
 @dataclass
+class ResourceOutcome:
+    """What became of one field of `Sandbox.update_resources`."""
+
+    # "live": applied to the running guest. "next_boot": recorded on a
+    # shut-down sandbox for its next boot. "offline": a shut-down sandbox's
+    # disk resized now. "refused": not applied, and `reason` says why.
+    # "unchanged": it already had that value.
+    change: str
+    previous: int
+    # What the sandbox has now: the value asked for, or `previous` when
+    # refused.
+    value: int
+    reason: str = ""
+
+
+@dataclass
+class ResourcesUpdate:
+    """What `Sandbox.update_resources` did, a field per one asked for."""
+
+    vcpus: Optional[ResourceOutcome] = None
+    memory_mib: Optional[ResourceOutcome] = None
+    disk_mib: Optional[ResourceOutcome] = None
+    # The root filesystem's size after a disk change, in bytes. 0 when no
+    # guest has seen the disk yet: a shut-down sandbox grown, whose guest fills
+    # it on its next boot.
+    filesystem_bytes: int = 0
+
+
+@dataclass
 class Session:
     """One VM boot inside a sandbox's life."""
 

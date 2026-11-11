@@ -75,12 +75,29 @@ async fn drain(pipe: Option<impl Into<std::os::fd::OwnedFd>>) -> String {
     String::from_utf8_lossy(&buf).into_owned()
 }
 
-/// Runs one of the guest's own tools to completion, capturing its diagnostics.
+/// Runs one of the guest's own tools to completion, failing with its
+/// diagnostics when it exits non-zero.
+async fn run_tool(tool: &Path, args: &[&str]) -> Result<(), Status> {
+    let (code, diagnostics) = run(tool, args).await?;
+    if code != 0 {
+        let detail = diagnostics.trim();
+        return Err(Status::internal(format!(
+            "{} exited {code}{}{}",
+            tool.display(),
+            if detail.is_empty() { "" } else { ": " },
+            detail
+        )));
+    }
+    Ok(())
+}
+
+/// Runs a tool to completion, returning its exit code and everything it
+/// printed.
 ///
 /// Spawned through `std::process` and awaited through the reaper for the same
 /// reason exec is: the agent is PID 1 and a second `waitpid` caller would race
 /// it for the exit status. See [`crate::unix::reaper`].
-async fn run_tool(tool: &Path, args: &[&str]) -> Result<(), Status> {
+pub(crate) async fn run(tool: &Path, args: &[&str]) -> Result<(i32, String), Status> {
     let mut command = std::process::Command::new(tool);
     command
         .args(args)
@@ -107,16 +124,7 @@ async fn run_tool(tool: &Path, args: &[&str]) -> Result<(), Status> {
         .await
         .map_err(|_| Status::internal("lost track of the child process"))?
         .code;
-    if code != 0 {
-        let detail = diagnostics.trim();
-        return Err(Status::internal(format!(
-            "{} exited {code}{}{}",
-            tool.display(),
-            if detail.is_empty() { "" } else { ": " },
-            detail
-        )));
-    }
-    Ok(())
+    Ok((code, diagnostics))
 }
 
 /// Runs the first of `candidates` the guest actually has.

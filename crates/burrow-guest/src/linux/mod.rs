@@ -6,6 +6,7 @@
 mod init;
 mod netconf;
 mod resume;
+mod rootdisk;
 pub mod systemd;
 pub mod users;
 pub mod vsock;
@@ -29,6 +30,7 @@ pub fn features() -> Vec<String> {
         "output-feed".to_string(),
         fs::FEATURE_FS.to_string(),
         "public-addresses".to_string(),
+        "root-disk".to_string(),
     ]
 }
 
@@ -86,6 +88,46 @@ pub async fn set_public_addresses(network: guestpb::NetworkConfig) -> Result<(),
     resume::apply_public(&network)
         .await
         .map_err(|err| Status::internal(format!("applying public addresses: {err}")))
+}
+
+pub async fn root_disk(req: guestpb::RootDiskRequest) -> Result<guestpb::RootDiskResponse, Status> {
+    use guestpb::root_disk_request::Op;
+    let op = Op::try_from(req.op).unwrap_or(Op::Unspecified);
+    let is_helper = rootdisk::is_helper();
+    if op == Op::Shrink || is_helper {
+        if op != Op::Shrink || !is_helper {
+            return Err(Status::failed_precondition(
+                "a filesystem shrinks only offline, in a resize helper, and a resize helper only \
+                 shrinks",
+            ));
+        }
+        let (size_bytes, minimum_bytes) = rootdisk::shrink(req.size_bytes).await?;
+        return Ok(guestpb::RootDiskResponse {
+            size_bytes,
+            minimum_bytes,
+        });
+    }
+    let expected = req.size_bytes;
+    let result = tokio::task::spawn_blocking(move || match op {
+        Op::Sync => {
+            rootdisk::sync();
+            Ok(())
+        }
+        Op::Trim => rootdisk::trim(),
+        Op::Freeze => rootdisk::freeze(),
+        Op::Thaw => rootdisk::thaw(),
+        Op::Grow => rootdisk::grow(expected),
+        Op::Unspecified | Op::Shrink => Err(std::io::Error::other("no operation named")),
+    })
+    .await
+    .map_err(|err| Status::internal(format!("root disk: {err}")))?;
+    result.map_err(|err| Status::internal(format!("root disk {}: {err}", op.as_str_name())))?;
+    let size_bytes =
+        rootdisk::size_bytes().map_err(|err| Status::internal(format!("root disk size: {err}")))?;
+    Ok(guestpb::RootDiskResponse {
+        size_bytes,
+        ..Default::default()
+    })
 }
 
 pub async fn handshake(
@@ -150,6 +192,11 @@ pub async fn handshake(
         return Err(Status::internal(format!(
             "applying public addresses: {err}"
         )));
+    }
+    // A root disk the host grew while the guest was down is filled here,
+    // online, on the boot that first sees it.
+    if let Err(err) = rootdisk::grow(0) {
+        tracing::warn!(%err, "could not grow the root filesystem");
     }
     // After the network, because a mount is local work and nothing above
     // depends on it, and before the response, because a caller that gets a
@@ -349,6 +396,18 @@ pub async fn main() {
         )
         .init();
 
+    if is_init && rootdisk::is_helper() {
+        // A resize helper boots read-only from the node's own small image and
+        // serves the one call that shrinks the disk it was given.
+        if let Err(err) = init::mount_essentials() {
+            tracing::error!(%err, "failed to mount essential filesystems");
+        }
+        reaper::spawn();
+        if let Err(err) = serve().await {
+            tracing::error!(%err, "agent server exited");
+        }
+        std::future::pending::<()>().await;
+    }
     if is_init && !is_reexec {
         // Pivot into the writable overlay before mounting anything else, so
         // the pseudo-filesystems land inside the final root.

@@ -13,12 +13,13 @@
 //! - **The guest's address.** It lives in guest memory, so every clone wakes
 //!   holding the warm snapshot's address. The agent is told its real one on
 //!   handshake and reapplies it.
-//! - **The scratch disk.** The guest's in-memory filesystem state refers to
-//!   the disk as it was at snapshot time, so each clone gets its *own copy* of
-//!   the warm scratch. Sharing it would corrupt every clone at once.
+//! - **The root disk.** The guest's in-memory filesystem state refers to the
+//!   disk as it was at snapshot time, so each clone gets its *own clone* of
+//!   the warm disk. Sharing it would corrupt every clone at once.
 //!
-//! The kernel, rootfs, and memory file are shared by hard link: the first two
-//! are read-only, and restoring has been verified not to modify the third.
+//! The kernel, the image and the memory file are shared by hard link: the
+//! guest never sees the image, the kernel is read-only, and restoring has been
+//! verified not to modify the memory file.
 //!
 //! A template has one hypervisor, so its warm snapshot is taken under that one
 //! and named by it, and every sandbox restored from it runs under it too.
@@ -27,8 +28,9 @@ use std::path::{Path, PathBuf};
 
 use tonic::Status;
 
-use burrow_vmm::{DriveSpec, Hypervisor, HypervisorExt, NetSpec, Vm, VmSpec};
+use burrow_vmm::{Hypervisor, HypervisorExt, NetSpec, Vm, VmSpec};
 
+use crate::rootdisk::{DiskLayout, IMAGE, ROOT_DISK};
 use crate::sandbox::NodeConfig;
 
 /// Files that make up a template's warm snapshot.
@@ -65,7 +67,10 @@ pub async fn hold_builds() -> tokio::sync::MutexGuard<'static, ()> {
 /// cache mode from the snapshot's device state, so a guest restored from a
 /// snapshot taken before drives were `Writeback` would go on dropping its
 /// flushes in the host page cache.
-const WARM_FORMAT: &str = "4";
+///
+/// 5 boots on a root disk, without the overlay: an older snapshot's guest has
+/// the overlay mounted in its memory and a scratch drive in its device state.
+const WARM_FORMAT: &str = "5";
 
 /// Whether a warm snapshot's `format` file names the format this build writes.
 fn is_current_format(text: &str) -> bool {
@@ -76,12 +81,13 @@ fn is_current_format(text: &str) -> bool {
 /// snapshot is built and replayed on every create from it.
 pub const PREFETCH_PLAN: &str = "prefetch.bin";
 
-/// The cpu and memory the snapshot was taken with.
+/// The cpu, memory and disk the snapshot was taken with.
 ///
 /// Firecracker restores machine configuration *from the snapshot*, so a
 /// restored guest has the memory the snapshot had, not the memory the caller
 /// asked for. Without recording this, a sandbox created with `--mem-mib 2048`
-/// from a 512 MiB snapshot silently gets 512 MiB and no error.
+/// from a 512 MiB snapshot silently gets 512 MiB and no error. The disk is
+/// the same: the guest's filesystem fills the disk it was snapshotted on.
 const SHAPE_FILE: &str = "shape";
 
 /// Which hypervisor took the snapshot, and so which files it is made of.
@@ -107,11 +113,14 @@ pub struct Trust {
     pub bundles: Vec<burrow_proto::guest::v1::TrustBundle>,
 }
 
-/// vcpus and memory a warm snapshot was built with.
+/// vcpus, memory and root disk a warm snapshot was built with.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Shape {
     pub vcpus: u32,
     pub mem_mib: u32,
+    /// MiB. 0 in a request is the template's image plus headroom, which
+    /// [`resolve_disk`] turns into a size; a built snapshot records the size.
+    pub disk_mib: u32,
 }
 
 impl Shape {
@@ -124,6 +133,7 @@ impl Shape {
             } else {
                 resources.mem_mib
             },
+            disk_mib: resources.disk_mib,
         }
     }
 
@@ -134,11 +144,27 @@ impl Shape {
         let shape = Self {
             vcpus: fields.next()?.parse().ok()?,
             mem_mib: fields.next()?.parse().ok()?,
+            disk_mib: fields.next()?.parse().ok()?,
         };
         // A third field means a format this build does not understand; cold
         // booting is the safe answer.
         fields.next().is_none().then_some(shape)
     }
+}
+
+/// `shape` with its disk the size a create of `template` would get.
+pub async fn resolve_disk(
+    templates_dir: &Path,
+    template: &str,
+    shape: Shape,
+) -> Result<Shape, Status> {
+    let image = tokio::fs::metadata(templates_dir.join(template).join(IMAGE))
+        .await
+        .map_err(|err| Status::not_found(format!("template {template}: {err}")))?;
+    Ok(Shape {
+        disk_mib: crate::rootdisk::disk_mib(shape.disk_mib, image.len())?,
+        ..shape
+    })
 }
 
 /// The shape a template's warm snapshot was taken with, if it has one.
@@ -186,7 +212,7 @@ pub async fn is_warm(templates_dir: &Path, template: &str) -> bool {
         return false;
     };
     let layout = hypervisor.layout();
-    for file in layout.files().chain(["scratch.ext4"]) {
+    for file in layout.files().chain([ROOT_DISK]) {
         if !tokio::fs::try_exists(dir.join(file)).await.unwrap_or(false) {
             return false;
         }
@@ -200,7 +226,7 @@ pub async fn is_warm(templates_dir: &Path, template: &str) -> bool {
 
 /// Files a sandbox needs in its working directory to restore from warm.
 ///
-/// The scratch disk is copied because the guest will write to it; everything
+/// The root disk is cloned because the guest will write to it; everything
 /// else is hard-linked because it is read-only or verified immutable.
 pub async fn stage_from_warm(
     templates_dir: &Path,
@@ -218,7 +244,7 @@ pub async fn stage_from_warm(
     tokio::fs::create_dir_all(workdir).await?;
     let linked = [
         (template_dir.join("vmlinux"), "vmlinux"),
-        (template_dir.join("rootfs.ext4"), "rootfs.ext4"),
+        (template_dir.join(IMAGE), IMAGE),
     ]
     .into_iter()
     .chain(layout.files().map(|name| (warm.join(name), name)));
@@ -240,44 +266,15 @@ pub async fn stage_from_warm(
     }
 
     // The one file that must not be shared.
-    let scratch = workdir.join("scratch.ext4");
-    let _ = tokio::fs::remove_file(&scratch).await;
-    let before_scratch = std::time::Instant::now();
-    copy_sparse(&warm.join("scratch.ext4"), &scratch).await?;
+    let before_disk = std::time::Instant::now();
+    crate::rootdisk::clone(&warm.join(ROOT_DISK), &workdir.join(ROOT_DISK)).await?;
     tracing::debug!(
         template,
         link_ms = (linked - began).as_millis() as u64,
-        scratch_ms = before_scratch.elapsed().as_millis() as u64,
+        disk_ms = before_disk.elapsed().as_millis() as u64,
         "staged a warm snapshot"
     );
     Ok(())
-}
-
-/// Copies a disk image while preserving its holes.
-///
-/// A freshly formatted scratch disk is almost entirely holes: a 1 GiB image
-/// occupies well under a megabyte. `fs::copy` expands those holes into real
-/// zeroes, turning a create into a gigabyte of writes, which costs more than
-/// the boot the warm pool exists to avoid. `cp --sparse=always` copies only the
-/// data, and `--reflink=auto` makes it metadata-only on copy-on-write
-/// filesystems.
-pub async fn copy_sparse(source: &Path, dest: &Path) -> std::io::Result<()> {
-    let output = tokio::process::Command::new("cp")
-        .args(["--sparse=always", "--reflink=auto"])
-        .arg(source)
-        .arg(dest)
-        .output()
-        .await?;
-
-    if output.status.success() {
-        return Ok(());
-    }
-    // Fall back rather than fail: a slow create beats no create.
-    tracing::warn!(
-        stderr = %String::from_utf8_lossy(&output.stderr).trim(),
-        "sparse copy failed; falling back to a full copy"
-    );
-    tokio::fs::copy(source, dest).await.map(|_| ())
 }
 
 /// Boots a template, waits for its agent, and snapshots the running VM.
@@ -294,7 +291,6 @@ pub async fn copy_sparse(source: &Path, dest: &Path) -> std::io::Result<()> {
 pub async fn build_warm_snapshot(
     config: &NodeConfig,
     template: &str,
-    scratch_mib: u32,
     shape: Shape,
     trust: &Trust,
 ) -> Result<u64, Status> {
@@ -310,12 +306,13 @@ pub async fn build_warm_snapshot(
     let _serialised = WARM_BUILD_LOCK.lock().await;
 
     let template_dir = templates_dir.join(template);
-    if !tokio::fs::try_exists(template_dir.join("rootfs.ext4"))
+    if !tokio::fs::try_exists(template_dir.join(IMAGE))
         .await
         .unwrap_or(false)
     {
         return Err(Status::not_found(format!("no template {template}")));
     }
+    let shape = resolve_disk(&templates_dir, template, shape).await?;
     let environment = crate::oci::image_environment(&config.data_dir, template).await;
     let is_systemd = environment.systemd;
     let (hypervisor, guest_os) = environment.machine()?;
@@ -354,20 +351,21 @@ pub async fn build_warm_snapshot(
             .map_err(|err| Status::internal(format!("warm chroot: {err}")))?;
     }
 
-    for name in ["vmlinux", "rootfs.ext4"] {
+    for name in ["vmlinux", IMAGE] {
         tokio::fs::hard_link(template_dir.join(name), run_dir.join(name))
             .await
             .map_err(|err| Status::internal(format!("staging {name}: {err}")))?;
     }
-    crate::sandbox::create_scratch(&run_dir.join("scratch.ext4"), scratch_mib)
+    crate::rootdisk::clone(&run_dir.join(IMAGE), &run_dir.join(ROOT_DISK))
         .await
-        .map_err(|err| Status::internal(format!("warm scratch: {err}")))?;
+        .map_err(|err| Status::internal(format!("warm root disk: {err}")))?;
+    crate::rootdisk::grow(&run_dir.join(ROOT_DISK), shape.disk_mib).await?;
     if let Some(jail) = config.jail_for(hypervisor) {
-        // The kernel and rootfs are hard links into the template's own
+        // The kernel and image are hard links into the template's own
         // directory and are left alone for the reason
-        // [`crate::sandbox::grant_to_jail`] gives; the scratch disk is this
+        // [`crate::sandbox::grant_to_jail`] gives; the root disk is this
         // build's own and has to be writable by the uid the VMM drops to.
-        let shared = ["vmlinux".to_string(), "rootfs.ext4".to_string()].into();
+        let shared = ["vmlinux".to_string(), IMAGE.to_string()].into();
         crate::sandbox::grant_to_jail(&run_dir, jail, &shared)
             .await
             .map_err(|err| Status::internal(format!("preparing the warm jail: {err}")))?;
@@ -390,10 +388,7 @@ pub async fn build_warm_snapshot(
     // here, not from what a later caller asks for.
     spec.vcpus = shape.vcpus;
     spec.mem_mib = shape.mem_mib;
-    spec.drives = vec![
-        DriveSpec::root_ro("rootfs.ext4"),
-        DriveSpec::scratch_rw("scratch.ext4"),
-    ];
+    spec.drives = DiskLayout::Root.drives();
     spec.is_vsock_enabled = true;
     spec.net = Some(NetSpec {
         tap: tap.clone(),
@@ -402,8 +397,9 @@ pub async fn build_warm_snapshot(
     spec.boot = burrow_vmm::Boot::Kernel {
         kernel: "vmlinux".into(),
         cmdline: format!(
-            "{} root=/dev/vda ro init=/usr/bin/burrow-guest {} {} {}",
+            "{} {} init=/usr/bin/burrow-guest {} {} {}",
             burrow_vmm::DEFAULT_BOOT_ARGS,
+            DiskLayout::Root.boot_args(),
             lease.kernel_ip_arg(),
             crate::sandbox::guest_mode_arg(is_systemd),
             config.extra_boot_args
@@ -442,7 +438,7 @@ pub async fn build_warm_snapshot(
             // placement and every create cold-boots.
             tokio::fs::write(
                 dir.join(SHAPE_FILE),
-                format!("{} {}", shape.vcpus, shape.mem_mib),
+                format!("{} {} {}", shape.vcpus, shape.mem_mib, shape.disk_mib),
             )
             .await
             .map_err(|err| Status::internal(format!("recording warm shape: {err}")))?;
@@ -538,7 +534,7 @@ async fn collect_products(
     let (uid, gid) = (owner.uid(), owner.gid());
 
     let layout = hypervisor.layout();
-    for name in layout.files().chain(["scratch.ext4"]) {
+    for name in layout.files().chain([ROOT_DISK]) {
         tokio::fs::rename(run_dir.join(name), dir.join(name))
             .await
             .map_err(|err| Status::internal(format!("collecting {name}: {err}")))?;
@@ -627,10 +623,7 @@ async fn profile_restore(
     // one the build already filled.
     let mut spec = VmSpec::new(vm_id.to_string(), dir, backend.clone());
     spec.is_pci_enabled = true;
-    spec.drives = vec![
-        DriveSpec::root_ro("rootfs.ext4"),
-        DriveSpec::scratch_rw("scratch.ext4"),
-    ];
+    spec.drives = DiskLayout::Root.drives();
     spec.is_vsock_enabled = true;
     spec.net = Some(NetSpec {
         tap: tap.clone(),
@@ -641,16 +634,15 @@ async fn profile_restore(
     spec.record_prefetch = Some(PREFETCH_PLAN.to_string());
     apply_confinement(&mut spec, config, shape);
 
-    // The profiling guest writes to the scratch disk *after* the snapshot was
-    // taken, so a clone restoring that snapshot would find a disk that had
-    // moved under its in-memory filesystem state. Put back exactly as the
-    // snapshot expects it.
-    let scratch = dir.join("scratch.ext4");
-    let pristine = dir.join("scratch.ext4.pristine");
-    let _ = tokio::fs::remove_file(&pristine).await;
-    copy_sparse(&scratch, &pristine)
+    // The profiling guest writes to the disk *after* the snapshot was taken,
+    // so a clone restoring that snapshot would find a disk that had moved
+    // under its in-memory filesystem state. Put back exactly as the snapshot
+    // expects it.
+    let disk = dir.join(ROOT_DISK);
+    let pristine = dir.join("root.ext4.pristine");
+    crate::rootdisk::clone(&disk, &pristine)
         .await
-        .map_err(|err| Status::internal(format!("preserving the warm scratch: {err}")))?;
+        .map_err(|err| Status::internal(format!("preserving the warm disk: {err}")))?;
 
     let outcome = async {
         let vm = Vm::restore(spec, true)
@@ -672,12 +664,12 @@ async fn profile_restore(
 
     burrow_net::tap::delete(WARM_TAP).await;
 
-    let _ = tokio::fs::remove_file(&scratch).await;
-    if let Err(err) = tokio::fs::rename(&pristine, &scratch).await {
+    let _ = tokio::fs::remove_file(&disk).await;
+    if let Err(err) = tokio::fs::rename(&pristine, &disk).await {
         // Without the original disk the snapshot is not safely restorable, so
         // this is fatal rather than a lost optimisation.
         return Err(Status::internal(format!(
-            "could not restore the warm scratch disk: {err}"
+            "could not restore the warm root disk: {err}"
         )));
     }
     outcome
@@ -741,7 +733,8 @@ mod shape_tests {
             wanted,
             Shape {
                 vcpus: 1,
-                mem_mib: 512
+                mem_mib: 512,
+                disk_mib: 0,
             }
         );
     }
@@ -751,13 +744,14 @@ mod shape_tests {
         let wanted = Shape::wanted(&common::ResourcePolicy {
             vcpus: 4,
             mem_mib: 2048,
-            ..Default::default()
+            disk_mib: 4096,
         });
         assert_eq!(
             wanted,
             Shape {
                 vcpus: 4,
-                mem_mib: 2048
+                mem_mib: 2048,
+                disk_mib: 4096,
             }
         );
     }
@@ -767,29 +761,38 @@ mod shape_tests {
         let shape = Shape {
             vcpus: 2,
             mem_mib: 1024,
+            disk_mib: 1324,
         };
-        let text = format!("{} {}", shape.vcpus, shape.mem_mib);
+        let text = format!("{} {} {}", shape.vcpus, shape.mem_mib, shape.disk_mib);
         assert_eq!(Shape::parse(&text), Some(shape));
-        assert_eq!(Shape::parse("  2   1024  \n"), Some(shape));
+        assert_eq!(Shape::parse("  2   1024 1324 \n"), Some(shape));
     }
 
     #[test]
     fn a_malformed_shape_file_reads_as_absent() {
         // Absent is the safe answer: it means "cold boot", which is slower and
         // correct, rather than restoring a snapshot of unknown size.
-        for bad in ["", "2", "two 1024", "2 lots", "\n"] {
+        for bad in [
+            "",
+            "2",
+            "2 1024",
+            "two 1024 1",
+            "2 lots 1",
+            "2 1024 1 1",
+            "\n",
+        ] {
             assert_eq!(Shape::parse(bad), None, "{bad:?} should not parse");
         }
     }
 
-    /// Snapshots from before drives flushed carry `Unsafe` drives in their
-    /// device state, and are rebuilt rather than restored.
+    /// Snapshots from before root disks hold an overlay in their guest's
+    /// memory, and are rebuilt rather than restored.
     #[test]
     fn only_the_current_format_is_warm() {
-        assert_eq!(WARM_FORMAT, "4");
-        assert!(is_current_format("4"));
-        assert!(is_current_format("4\n"));
-        for old in ["", "1", "2", "3", "5"] {
+        assert_eq!(WARM_FORMAT, "5");
+        assert!(is_current_format("5"));
+        assert!(is_current_format("5\n"));
+        for old in ["", "1", "2", "3", "4", "6"] {
             assert!(!is_current_format(old), "{old:?} should be rebuilt");
         }
     }
@@ -801,6 +804,7 @@ mod shape_tests {
         let snapshot = Shape {
             vcpus: 1,
             mem_mib: 512,
+            disk_mib: 0,
         };
         let asked = Shape::wanted(&common::ResourcePolicy {
             mem_mib: 2048,

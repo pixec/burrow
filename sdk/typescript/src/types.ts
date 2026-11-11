@@ -213,7 +213,8 @@ export type NetworkPolicy = Required<Omit<NetworkPolicyOptions, "rules">> & {
 export interface ResourceOptions {
   vcpus?: number;
   memoryMib?: number;
-  scratchDiskMib?: number;
+  /** Root disk, at least the template's image. 0 is the image plus 1024. */
+  diskMib?: number;
 }
 
 export type ResourcePolicy = Required<ResourceOptions>;
@@ -355,6 +356,43 @@ export interface Usage {
   rxBytes: number;
   /** Bytes the guest sent, counted at the same place. */
   txBytes: number;
+}
+
+/** The machine {@link Sandbox.updateResources} changes. */
+export interface ResourceUpdateOptions extends CallOptions {
+  vcpus?: number;
+  memoryMib?: number;
+  diskMib?: number;
+}
+
+/**
+ * What became of one field. `live`: applied to the running guest.
+ * `next_boot`: recorded on a shut-down sandbox for its next boot. `offline`:
+ * a shut-down sandbox's disk resized now. `refused`: not applied, and
+ * `reason` says why. `unchanged`: it already had that value.
+ */
+export type ResourceChange = "unchanged" | "live" | "next_boot" | "offline" | "refused" | "unknown";
+
+/** What became of one field of {@link Sandbox.updateResources}. */
+export interface ResourceOutcome {
+  change: ResourceChange;
+  previous: number;
+  /** What the sandbox has now: the value asked for, or `previous` when refused. */
+  value: number;
+  reason: string;
+}
+
+/** What {@link Sandbox.updateResources} did, a field per one asked for. */
+export interface ResourcesUpdate {
+  vcpus?: ResourceOutcome;
+  memoryMib?: ResourceOutcome;
+  diskMib?: ResourceOutcome;
+  /**
+   * The root filesystem's size after a disk change, in bytes. 0 when no guest
+   * has seen the disk yet: a shut-down sandbox grown, whose guest fills it on
+   * its next boot.
+   */
+  filesystemBytes: number;
 }
 
 /**
@@ -655,7 +693,10 @@ export interface ListOptions extends CallOptions, HandleOptions {
  * Options for {@link Sandbox.updateLifetime}. An omitted field is left where
  * it is, so `0` keeps meaning "unlimited" here as it does on create.
  */
-export interface UpdateLifetimeOptions extends CallOptions, LifetimeOptions {}
+export interface UpdateLifetimeOptions extends CallOptions, LifetimeOptions {
+  /** How long the sandbox's snapshots are kept, held to a create's rules. */
+  snapshots?: SnapshotPolicyOptions;
+}
 
 /** Options for {@link Sandbox.updateAccessPolicy}. */
 export interface UpdateAccessOptions extends CallOptions {

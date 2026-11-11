@@ -12,6 +12,11 @@ service Guest {
   rpc Health(GuestHealthRequest) returns (GuestHealthResponse);
   // Replaces the public addresses on the guest's interface while it runs.
   rpc SetPublicAddresses(NetworkConfig) returns (SetPublicAddressesResponse);
+  // Acts on the root filesystem the guest booted from: flushes it, trims it,
+  // freezes or thaws it for a disk-only capture, or grows it to fill a disk
+  // the host made bigger. Linux guests on the root layout only. An agent
+  // booted as a resize helper shrinks the disk it was given instead.
+  rpc RootDisk(RootDiskRequest) returns (RootDiskResponse);
   // Mirrors the public Exec RPC. Deliberately a separate message set from
   // burrow.api.v1 so the guest protocol can version independently of the
   // public API (guests outlive deploys: a paused sandbox resumes with the
@@ -436,6 +441,42 @@ message PublicAddress {
 }
 
 message SetPublicAddressesResponse {}
+
+message RootDiskRequest {
+  enum Op {
+    OP_UNSPECIFIED = 0;
+    // sync(2), so what the guest has cached reaches the disk.
+    OP_SYNC = 1;
+    // FITRIM on /, so blocks the filesystem freed read back as holes on the
+    // host and are not uploaded.
+    OP_TRIM = 2;
+    // sync, then FIFREEZE on /: the filesystem is clean and stays still until
+    // a thaw. The host captures the disk in between.
+    OP_FREEZE = 3;
+    OP_THAW = 4;
+    // Grows the mounted root filesystem to its device, which the host made
+    // bigger. Nothing to do is not an error.
+    OP_GROW = 5;
+    // Checks the unmounted filesystem on the helper's disk, shrinks it to
+    // `size_bytes` and checks it again. Only an agent booted with
+    // `burrow.mode=resize-disk` does it; below `minimum_bytes` it changes
+    // nothing.
+    OP_SHRINK = 6;
+  }
+  Op op = 1;
+  // OP_GROW: the device size the host set, which the guest waits to see
+  // before it grows; 0 grows to whatever it sees. OP_SHRINK: the size to
+  // shrink to.
+  uint64 size_bytes = 2;
+}
+
+message RootDiskResponse {
+  // The filesystem's size after the operation, in bytes.
+  uint64 size_bytes = 1;
+  // OP_SHRINK: the least the filesystem can be shrunk to, its own estimate of
+  // the blocks it needs plus a margin, rounded up to a MiB.
+  uint64 minimum_bytes = 2;
+}
 
 message HandshakeResponse {
   string agent_version = 1;

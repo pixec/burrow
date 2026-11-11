@@ -188,11 +188,12 @@ pub struct ServeArgs {
     /// plan.
     #[arg(long = "lazy-memory", default_value_t = false, action = clap::ArgAction::Set)]
     pub is_memory_lazy: bool,
-    /// How far the disk promised to sandboxes may exceed the free disk above
-    /// the reserve. Sandbox disks are sparse and grow as the guest writes, so
-    /// each is promised its full size: at 1.0, the default, every promised
-    /// byte has a free byte behind it. Above 1.0 the node takes more disk than
-    /// it has, and a full filesystem fails every guest on it at once.
+    /// How far the disk provisioned to sandboxes may exceed the filesystem
+    /// their disks are on, less its reserve. Each sandbox is charged its whole
+    /// disk and each volume its size, however many blocks they share with
+    /// images or each other: at 1.0, the default, every provisioned byte has a
+    /// byte of the filesystem behind it. Above 1.0 the node provisions more
+    /// disk than it has, and a full filesystem fails every guest on it at once.
     #[arg(
         long,
         default_value_t = 1.0,
@@ -200,11 +201,12 @@ pub struct ServeArgs {
         env = "BURROWD_DISK_OVERCOMMIT"
     )]
     pub disk_overcommit: f64,
-    /// Disk to keep free on the data directory's filesystem, in MiB. Creates,
-    /// resumes and adopts that would cross it are refused with
-    /// ResourceExhausted, and free disk below it while sandboxes run is logged
-    /// as an error and shown in `burrow node ls`. Unset keeps 5% of the
-    /// filesystem.
+    /// Disk to keep free on the filesystem sandboxes' disks are on (the
+    /// jailer's chroot base under `--jailer`, else the data directory), in
+    /// MiB. It is left out of what may be provisioned, and while free disk is
+    /// below it creates, resumes and adopts are refused with ResourceExhausted
+    /// and the node says so in its log and in `burrow node ls`. Unset keeps 5%
+    /// of the filesystem.
     #[arg(long, env = "BURROWD_DISK_RESERVE_MIB")]
     pub disk_reserve_mib: Option<u64>,
     /// A routed IPv6 prefix, e.g. `2001:db8:100::/56`, from which every
@@ -677,7 +679,7 @@ fn disk_status(disk: Option<(burrow_common::disk::DiskCapacity, bool)>) -> NodeS
             free_bytes: capacity.free_bytes,
             total_bytes: capacity.total_bytes,
             reserve_bytes: capacity.reserve_bytes,
-            unwritten_bytes: capacity.unwritten_bytes,
+            provisioned_bytes: capacity.provisioned_bytes,
             overcommit: capacity.overcommit,
         }),
         is_disk_low: is_low,
@@ -1799,16 +1801,16 @@ pub async fn run(args: ServeArgs) -> anyhow::Result<()> {
 mod tests {
     use super::*;
 
-    /// The heartbeat carries the data directory's free and total bytes, the
-    /// reserve, what is promised and unwritten, the overcommit, and whether
-    /// the node is short, as admission measured them.
+    /// The heartbeat carries the disk filesystem's free and total bytes, the
+    /// reserve, what is provisioned, the overcommit, and whether the node is
+    /// short, as admission measured them.
     #[test]
     fn the_heartbeat_reports_disk_as_admission_sees_it() {
         let capacity = burrow_common::disk::DiskCapacity {
             free_bytes: 40 << 30,
             total_bytes: 100 << 30,
             reserve_bytes: 5 << 30,
-            unwritten_bytes: 12 << 30,
+            provisioned_bytes: 12 << 30,
             overcommit: 1.5,
         };
         let status = disk_status(Some((capacity, true)));
@@ -1816,7 +1818,7 @@ mod tests {
         assert_eq!(disk.free_bytes, 40 << 30);
         assert_eq!(disk.total_bytes, 100 << 30);
         assert_eq!(disk.reserve_bytes, 5 << 30);
-        assert_eq!(disk.unwritten_bytes, 12 << 30);
+        assert_eq!(disk.provisioned_bytes, 12 << 30);
         assert_eq!(disk.overcommit, 1.5);
         assert!(status.is_disk_low);
 

@@ -1,14 +1,16 @@
 //! Building guest images.
 //!
 //! A template is built by running the requested steps inside a throwaway
-//! sandbox and then capturing the filesystem it ended up with. The guest
-//! already presents a merged view of the read-only base plus its own writable
-//! overlay, so the capture is a tar of `/` taken from inside, with no loop
-//! mounts and no reaching into overlay internals from the host.
+//! sandbox and keeping the root disk it ended up with as the new image. The
+//! build sandbox's disk is a clone of its base's image, so the new image
+//! shares every block the steps left alone with it. Before the disk is taken
+//! the guest trims it, flushes it and freezes it, so the image is a clean
+//! filesystem with nothing of it left in the guest's memory; nothing on the
+//! host reads or rewrites it.
 //!
-//! The tar is unpacked on the node and turned into a fresh ext4 with
-//! `mkfs.ext4 -d`, which populates an image from a directory without mounting
-//! it. The build sandbox is destroyed either way.
+//! An image imported from an OCI image is written with `mkfs.ext4 -d`, which
+//! populates one from a directory without mounting it; see [`from_image`].
+//! The build sandbox is destroyed either way.
 //!
 //! A macOS template is a whole installed machine instead, built in
 //! [`crate::macnode`].
@@ -24,37 +26,6 @@ use burrow_proto::api::v1 as api;
 use burrow_proto::common::v1 as common;
 
 use crate::sandbox::SandboxManager;
-
-/// Written inside the guest, then excluded from its own tar.
-const EXPORT_PATH: &str = "/.burrow-export.tar";
-
-/// Top-level entries kept out of a built image: kernel-populated
-/// pseudo-filesystems, per-boot scratch space, and the archive itself.
-/// `/scratch` in particular holds the overlay's own upper and work
-/// directories, so including it would nest a copy of the filesystem inside
-/// itself.
-///
-/// Applied as an include-list at capture time rather than passed to
-/// `tar --exclude`: busybox is frequently built without exclude support, and
-/// deciding what goes *in* fails safe if a future image grows a mount point
-/// nobody remembered to exclude.
-const SKIP_TOPLEVEL: [&str; 7] = [
-    "proc",
-    "sys",
-    "dev",
-    "run",
-    "tmp",
-    "scratch",
-    ".burrow-export.tar",
-];
-
-/// Ceiling on the archive a build sandbox may stream back to the node.
-///
-/// The guest chooses how many bytes it sends, and nothing else stops it: a
-/// build step that writes forever fills the node's data directory and takes
-/// every other sandbox on the host down with it. Eight gibibytes is far above
-/// any real image and far below a disk.
-const MAX_EXPORT_BYTES: u64 = 8 * 1024 * 1024 * 1024;
 
 /// Slack added to the measured content size when sizing the new image, so the
 /// filesystem has room for metadata and for whatever the sandbox writes later.
@@ -464,7 +435,9 @@ async fn run_build(
             } else {
                 request.mem_mib
             },
-            ..Default::default()
+            // The build's disk is the image it makes: its base's plus room
+            // for the steps, unless the build names a size.
+            disk_mib: request.disk_mib,
         }),
         network: Some(network),
         ..Default::default()
@@ -541,8 +514,8 @@ async fn build_in_sandbox(
     hypervisor: &str,
 ) -> Result<(), Status> {
     for (index, run) in commands.iter().enumerate() {
-        // Steps the cache already covers are represented by the seeded scratch
-        // disk; re-running them would produce the same filesystem more slowly.
+        // Steps the cache already covers are represented by the seeded disk;
+        // re-running them would produce the same filesystem more slowly.
         if index < cached_steps {
             continue;
         }
@@ -561,7 +534,6 @@ async fn build_in_sandbox(
             manager,
             data_dir,
             build_id,
-            tx,
             base_rootfs,
             &commands[..=index],
         )
@@ -575,53 +547,39 @@ async fn build_in_sandbox(
 
     let _ = tx
         .send(event(api::build_log::Event::Step(
-            "exporting filesystem".into(),
+            "capturing the root disk".into(),
         )))
         .await;
 
-    // Capture from inside the guest, where the overlay is already merged.
-    // Written as POSIX sh so it does not depend on which busybox applets the
-    // base image happens to have been built with.
-    let skip = SKIP_TOPLEVEL.join("|");
-    let tar_cmd = format!(
-        r#"cd / && set -e && include="" && for entry in $(ls -A /); do
-             case "$entry" in
-               {skip}) ;;
-               *) include="$include $entry" ;;
-             esac
-           done && tar -cf {EXPORT_PATH} $include"#
-    );
-    let exit = exec_streaming(manager, build_id, &tar_cmd, tx).await?;
-    if exit != 0 {
-        return Err(Status::internal(format!(
-            "could not archive the build filesystem (tar exited {exit})"
-        )));
-    }
-
-    let staging = data_dir.join("build").join(build_id);
-    let _ = tokio::fs::remove_dir_all(&staging).await;
-    tokio::fs::create_dir_all(&staging)
+    let target = templates_dir(data_dir).join(&request.name);
+    tokio::fs::create_dir_all(&target)
         .await
-        .map_err(|err| Status::internal(format!("staging dir: {err}")))?;
+        .map_err(|err| Status::internal(format!("template dir: {err}")))?;
+    // Built beside the destination and renamed, so a failed build never
+    // leaves a half-written image where a usable one is expected.
+    let pending = target.join(PENDING_ROOTFS);
+    // Trimmed first, so what the steps deleted is holes in the image rather
+    // than blocks every disk cloned from it carries.
+    if let Err(err) = root_disk(manager, build_id, RootDiskOp::Trim).await {
+        tracing::debug!(build = build_id, %err, "could not trim the build disk");
+    }
+    capture_disk(manager, build_id, &pending).await?;
 
-    let tar_path = staging.join("rootfs.tar");
-    let bytes = download_to(manager, build_id, EXPORT_PATH, &tar_path).await?;
-    tracing::info!(build = build_id, bytes, "captured build filesystem");
+    link_kernel(&target).await?;
+    write_build_config(&target, is_systemd, hypervisor).await?;
+    let final_path = target.join("rootfs.ext4");
+    tokio::fs::rename(&pending, &final_path)
+        .await
+        .map_err(|err| Status::internal(format!("publishing image: {err}")))?;
+    // Paired with the rename, for the reason in [`from_image::import`]: the
+    // old snapshot's memory image is only valid over the rootfs it was
+    // captured on, and that rootfs is gone as of the line above.
+    manager.invalidate_warm(&request.name).await;
 
-    let result = assemble_image(
-        manager,
-        data_dir,
-        &staging,
-        &tar_path,
-        &request.name,
-        bytes,
-        is_systemd,
-        hypervisor,
-    )
-    .await;
-    let _ = tokio::fs::remove_dir_all(&staging).await;
-    let size_bytes = result?;
-
+    let size_bytes = tokio::fs::metadata(&final_path)
+        .await
+        .map(|m| m.len())
+        .unwrap_or(0);
     let _ = tx
         .send(event(api::build_log::Event::Done(api::BuildDone {
             template: request.name.clone(),
@@ -631,90 +589,34 @@ async fn build_in_sandbox(
     Ok(())
 }
 
-/// Unpacks the captured tar and turns it into a bootable image.
-#[allow(clippy::too_many_arguments)]
-async fn assemble_image(
-    manager: &SandboxManager,
-    data_dir: &Path,
-    staging: &Path,
-    tar_path: &Path,
-    name: &str,
-    tar_bytes: u64,
-    is_systemd: bool,
-    hypervisor: &str,
-) -> Result<u64, Status> {
-    let rootdir = staging.join("root");
-    tokio::fs::create_dir_all(&rootdir)
+use burrow_proto::guest::v1::root_disk_request::Op as RootDiskOp;
+
+/// Asks the build sandbox's agent to act on its root filesystem.
+async fn root_disk(manager: &SandboxManager, build_id: &str, op: RootDiskOp) -> Result<(), Status> {
+    let sandbox = manager.get(build_id).await?;
+    let mut agent = sandbox.agent().await?;
+    agent
+        .root_disk(burrow_proto::guest::v1::RootDiskRequest {
+            op: op as i32,
+            ..Default::default()
+        })
+        .await?;
+    Ok(())
+}
+
+/// Clones the build sandbox's root disk to `dest` with the guest's
+/// filesystem frozen: flushed, clean and still, as a disk used without the
+/// guest's memory has to be. The guest is thawed whatever happens.
+async fn capture_disk(manager: &SandboxManager, build_id: &str, dest: &Path) -> Result<(), Status> {
+    let disk = manager.get(build_id).await?.disk_path();
+    root_disk(manager, build_id, RootDiskOp::Freeze).await?;
+    let cloned = crate::rootdisk::clone(&disk, dest).await;
+    let thawed = root_disk(manager, build_id, RootDiskOp::Thaw).await;
+    cloned.map_err(|err| Status::internal(format!("capturing the build disk: {err}")))?;
+    thawed?;
+    crate::fsync::file(dest)
         .await
-        .map_err(|err| Status::internal(format!("staging root: {err}")))?;
-
-    // This tar comes out of the build sandbox, produced by whatever tar the
-    // (possibly hostile) base image shipped: arbitrary bytes, extracted as
-    // root. A symlink member followed by an entry under it (`x -> /etc`, then
-    // `x/passwd`) is a root write to the host under any extractor that
-    // follows links, so it goes through the same in-process unpacker the OCI
-    // layer path already trusts for equally hostile bytes, entry-count and
-    // expansion budgets included.
-    let unpack_into = rootdir.clone();
-    let archive = tar_path.to_path_buf();
-    tokio::task::spawn_blocking(move || crate::oci::unpack_layers(&[archive], &unpack_into))
-        .await
-        .map_err(|err| Status::internal(format!("unpack did not run: {err}")))?
-        .map_err(|err| Status::internal(format!("unpacking build filesystem: {err}")))?;
-
-    // Pseudo-filesystem mount points are excluded from the tar but must exist
-    // in the image: the agent cannot create them on a read-only root.
-    for dir in ["proc", "sys", "dev", "tmp", "run", "scratch"] {
-        let _ = tokio::fs::create_dir_all(rootdir.join(dir)).await;
-    }
-
-    // Bounded by MAX_EXPORT_BYTES: without that cap a guest could pick the
-    // size of the filesystem the node then builds for it.
-    let size_mib = (tar_bytes / (1024 * 1024)) * 2 + IMAGE_SLACK_MIB;
-    let target = templates_dir(data_dir).join(name);
-    tokio::fs::create_dir_all(&target)
-        .await
-        .map_err(|err| Status::internal(format!("template dir: {err}")))?;
-
-    // Built beside the destination and renamed, so a failed build never
-    // leaves a half-written image where a usable one is expected.
-    let pending = target.join(PENDING_ROOTFS);
-    let _ = tokio::fs::remove_file(&pending).await;
-    run(
-        "mkfs.ext4",
-        &[
-            "-q",
-            "-F",
-            "-L",
-            "burrow-root",
-            "-b",
-            "4096",
-            "-d",
-            &path(&rootdir),
-            &path(&pending),
-            &format!("{size_mib}M"),
-        ],
-    )
-    .await?;
-
-    link_kernel(&target).await?;
-
-    write_build_config(&target, is_systemd, hypervisor).await?;
-
-    let final_path = target.join("rootfs.ext4");
-    tokio::fs::rename(&pending, &final_path)
-        .await
-        .map_err(|err| Status::internal(format!("publishing image: {err}")))?;
-    // Paired with the rename, for the reason in [`from_image::import`]: the
-    // old snapshot's memory image is only valid over the rootfs it was
-    // captured on, and that rootfs is gone as of the line above.
-    manager.invalidate_warm(name).await;
-
-    let size = tokio::fs::metadata(&final_path)
-        .await
-        .map(|m| m.len())
-        .unwrap_or(0);
-    Ok(size)
+        .map_err(|err| Status::internal(format!("syncing the captured disk: {err}")))
 }
 
 /// Writes what a build records about its template, always: a rebuild over an
@@ -810,56 +712,6 @@ pub(crate) async fn exec_streaming(
         }
     }
     Ok(exit)
-}
-
-/// Streams a file out of the build sandbox onto the node's disk.
-async fn download_to(
-    manager: &SandboxManager,
-    sandbox_id: &str,
-    guest_path: &str,
-    dest: &Path,
-) -> Result<u64, Status> {
-    use burrow_proto::guest::v1 as guestpb;
-    use tokio::io::AsyncWriteExt;
-    use tokio_stream::StreamExt;
-
-    let sandbox = manager.get(sandbox_id).await?;
-    let mut agent = sandbox.agent().await?;
-
-    let mut stream = agent
-        .download_file(guestpb::DownloadRequest {
-            path: guest_path.to_string(),
-            user: String::new(),
-        })
-        .await?
-        .into_inner();
-
-    let mut file = tokio::fs::File::create(dest)
-        .await
-        .map_err(|err| Status::internal(format!("creating {}: {err}", dest.display())))?;
-
-    let mut total = 0u64;
-    while let Some(chunk) = stream.next().await {
-        let chunk = chunk?;
-        total += chunk.data.len() as u64;
-        // Checked before the write, and the partial file removed: the guest
-        // decides how much it sends, so an unbounded stream is a way to fill
-        // the node's disk from inside a sandbox.
-        if total > MAX_EXPORT_BYTES {
-            drop(file);
-            let _ = tokio::fs::remove_file(dest).await;
-            return Err(Status::resource_exhausted(format!(
-                "exported filesystem exceeds {MAX_EXPORT_BYTES} bytes"
-            )));
-        }
-        file.write_all(&chunk.data)
-            .await
-            .map_err(|err| Status::internal(format!("writing archive: {err}")))?;
-    }
-    file.flush()
-        .await
-        .map_err(|err| Status::internal(format!("flushing archive: {err}")))?;
-    Ok(total)
 }
 
 /// Template distribution: naming a template's artifacts by content, serving
@@ -1273,35 +1125,38 @@ pub mod distribute {
 
 /// Snapshots the build sandbox's scratch disk as the layer for `steps`.
 ///
-/// The guest is told to `sync` first: its writes reach the scratch file
-/// through virtio, and copying a disk with dirty guest page cache behind it
-/// would cache a filesystem that never existed.
+/// The disk is captured frozen, as the finished image is: a seed has to be a
+/// filesystem a guest can boot on its own, not one that needed the build's
+/// page cache to make sense.
 async fn cache_layer(
     manager: &SandboxManager,
     data_dir: &Path,
     build_id: &str,
-    tx: &LogTx,
     base_rootfs: &crate::blobs::Digest,
     steps: &[String],
 ) -> Result<(), Status> {
-    let exit = exec_streaming(manager, build_id, "sync", tx).await?;
-    if exit != 0 {
-        return Err(Status::internal(format!("sync exited {exit}")));
-    }
-
-    let scratch = manager.get(build_id).await?.scratch_path();
-    let key = layers::key(base_rootfs, steps);
-    layers::record(data_dir, &key, &scratch)
+    let staging = data_dir.join("build").join(build_id);
+    tokio::fs::create_dir_all(&staging)
         .await
-        .map_err(|err| Status::internal(format!("recording layer: {err}")))
+        .map_err(|err| Status::internal(format!("staging dir: {err}")))?;
+    let layer = staging.join("layer.ext4");
+    let recorded = async {
+        capture_disk(manager, build_id, &layer).await?;
+        let key = layers::key(base_rootfs, steps);
+        layers::record(data_dir, &key, &layer)
+            .await
+            .map_err(|err| Status::internal(format!("recording layer: {err}")))
+    }
+    .await;
+    let _ = tokio::fs::remove_dir_all(&staging).await;
+    recorded
 }
 
 /// Caching build steps, so a rebuild only re-runs what changed.
 ///
-/// A build's writes land in an overlay scratch disk, and that disk *is* the
-/// layer: it holds exactly what the steps changed. So caching a layer is
-/// copying one file, rather than exporting and rebuilding an image per step,
-/// which would cost more than the steps it saves.
+/// A build's root disk after a step *is* the layer, so caching one is cloning
+/// one file, rather than exporting and rebuilding an image per step, which
+/// would cost more than the steps it saves.
 ///
 /// A layer is keyed by everything that could change its contents: the base
 /// template's rootfs digest, and every step command up to and including it.
@@ -1317,7 +1172,8 @@ pub mod layers {
     /// Bumped when the meaning of a key changes: a cached layer from an older
     /// scheme is unrelated rather than wrong, and reusing it would produce an
     /// image nobody asked for.
-    const KEY_VERSION: &str = "burrow-layer-v1";
+    /// 2 is a whole root disk where 1 was an overlay's scratch disk.
+    const KEY_VERSION: &str = "burrow-layer-v2";
 
     fn index_dir(data_dir: &Path) -> PathBuf {
         data_dir.join("layers")
@@ -1340,7 +1196,7 @@ pub mod layers {
             .collect()
     }
 
-    /// The cached scratch disk for `key`, if this node has one.
+    /// The cached disk for `key`, if this node has one.
     pub async fn lookup(data_dir: &Path, key: &str) -> Option<PathBuf> {
         let recorded = tokio::fs::read_to_string(index_dir(data_dir).join(key))
             .await
@@ -1352,13 +1208,14 @@ pub mod layers {
         store.has(&digest).await.then(|| store.path(&digest))
     }
 
-    /// Records the scratch disk at `scratch` as the layer for `key`.
+    /// Records the disk at `disk`, which the caller gives up, as the layer
+    /// for `key`.
     ///
     /// Stored content-addressed, so two builds whose steps differ but whose
     /// filesystems end up identical share one copy.
-    pub async fn record(data_dir: &Path, key: &str, scratch: &Path) -> std::io::Result<()> {
+    pub async fn record(data_dir: &Path, key: &str, disk: &Path) -> std::io::Result<()> {
         let store = BlobStore::new(data_dir);
-        let digest = store.insert(scratch).await?;
+        let digest = store.insert(disk).await?;
         let index = index_dir(data_dir);
         tokio::fs::create_dir_all(&index).await?;
         // Written via a temporary and renamed: a half-written index entry

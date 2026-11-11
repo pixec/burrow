@@ -19,6 +19,8 @@ mod objstore;
 mod oci;
 mod providers;
 mod publicip;
+mod resizer;
+mod rootdisk;
 mod sandbox;
 mod sandboxproxy;
 mod serve;

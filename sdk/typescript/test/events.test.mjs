@@ -91,14 +91,14 @@ test("a snapshot surfaces where it can be restored", () => {
       arch: "aarch64",
       hypervisor: "firecracker",
       hypervisorVersion: "1.13.1",
-      resources: { vcpus: 2, memMib: 1024, scratchDiskMib: 2048 },
+      resources: { vcpus: 2, memMib: 1024, diskMib: 2048 },
       createdAtUnixMs: 1_790_000_000_000,
     },
   );
   assert.equal(snapshot.durable, true);
   assert.equal(snapshot.arch, "aarch64");
   assert.equal(snapshot.hypervisorVersion, "1.13.1");
-  assert.deepEqual(snapshot.resources, { vcpus: 2, memoryMib: 1024, scratchDiskMib: 2048 });
+  assert.deepEqual(snapshot.resources, { vcpus: 2, memoryMib: 1024, diskMib: 2048 });
   assert.equal(snapshot.createdAt.getTime(), 1_790_000_000_000);
   assert.equal(snapshot.expiresAt, null);
   assert.equal(snapshot.nodeId, "");

@@ -926,9 +926,9 @@ impl NodeService for NodeApi {
         Ok(Response::new(api::ListSessionsResponse { sessions }))
     }
 
-    /// Moves a sandbox's lifetime clocks. The result is held to the same
-    /// ceilings a create is, since it is the same record and the same reaper
-    /// reads it.
+    /// Moves a sandbox's lifetime clocks and snapshot retention, held to the
+    /// same rules a create is, since it is the same record and the same
+    /// reapers read it.
     async fn update_lifetime(
         &self,
         req: Request<nodepb::NodeUpdateLifetimeRequest>,
@@ -938,12 +938,54 @@ impl NodeService for NodeApi {
             .sandboxes
             .update_lifetime(
                 &req.sandbox_id,
-                req.max_lifetime_secs,
-                req.idle_suspend_secs,
-                req.suspended_ttl_secs,
+                crate::sandbox::Lifetimes {
+                    max_lifetime_secs: req.max_lifetime_secs,
+                    idle_suspend_secs: req.idle_suspend_secs,
+                    suspended_ttl_secs: req.suspended_ttl_secs,
+                    snapshot_expiration_secs: req.snapshot_expiration_secs,
+                    snapshot_keep_last: req.snapshot_keep_last,
+                    is_evicted_snapshot_kept: req.is_evicted_snapshot_kept,
+                },
+                validate_retention,
             )
             .await?;
         Ok(Response::new(redact_secrets(sandbox)))
+    }
+
+    /// Reshapes a sandbox. Out-of-range values are refused outright, before
+    /// anything changes; what the sandbox's state or hypervisor rules out is
+    /// reported per field.
+    async fn update_resources(
+        &self,
+        req: Request<nodepb::NodeUpdateResourcesRequest>,
+    ) -> Result<Response<api::UpdateResourcesResponse>, Status> {
+        let req = req.into_inner();
+        if req.vcpus.is_none() && req.mem_mib.is_none() && req.disk_mib.is_none() {
+            return Err(Status::invalid_argument(
+                "name at least one of vcpus, mem_mib and disk_mib",
+            ));
+        }
+        let nonzero = |name: &str, value: Option<u32>| match value {
+            Some(0) => Err(Status::invalid_argument(format!("{name} must be above 0"))),
+            _ => Ok(()),
+        };
+        nonzero("vcpus", req.vcpus)?;
+        nonzero("mem_mib", req.mem_mib)?;
+        nonzero("disk_mib", req.disk_mib)?;
+        req.vcpus.map(vcpus).transpose()?;
+        req.mem_mib.map(mem_mib).transpose()?;
+        req.disk_mib.map(disk_mib).transpose()?;
+        let (sandbox, updated) = self
+            .sandboxes
+            .update_machine(&req.sandbox_id, req.vcpus, req.mem_mib, req.disk_mib)
+            .await?;
+        Ok(Response::new(api::UpdateResourcesResponse {
+            sandbox: Some(redact_secrets(sandbox)),
+            vcpus: updated.vcpus,
+            mem_mib: updated.mem_mib,
+            disk_mib: updated.disk_mib,
+            filesystem_bytes: updated.filesystem_bytes,
+        }))
     }
 
     /// Builds a sandbox from another's state.
@@ -2035,10 +2077,10 @@ fn port_u16(value: u32) -> Result<u16, Status> {
 /// Firecracker is handed these verbatim, and each distinct memory size becomes
 /// its own disk-resident snapshot, so an unbounded `mem_mib` is both a
 /// four-terabyte allocation request and a way to fill the node's disk.
-const MAX_VCPUS: u32 = 64;
+pub(crate) const MAX_VCPUS: u32 = 64;
 const MAX_MEM_MIB: u32 = 262_144;
 const MIN_MEM_MIB: u32 = 128;
-const MAX_SCRATCH_MIB: u32 = 262_144;
+const MAX_DISK_MIB: u32 = 4_194_304;
 
 fn vcpus(requested: u32) -> Result<u32, Status> {
     match requested {
@@ -2060,31 +2102,30 @@ fn mem_mib(requested: u32) -> Result<u32, Status> {
     }
 }
 
-fn scratch_mib(requested: u32) -> Result<u32, Status> {
+/// A disk size as asked for, 0 being the template's image plus headroom,
+/// which only the template can say.
+fn disk_mib(requested: u32) -> Result<u32, Status> {
     match requested {
-        0 => Ok(1024),
-        n if n <= MAX_SCRATCH_MIB => Ok(n),
+        n if n <= MAX_DISK_MIB => Ok(n),
         n => Err(Status::invalid_argument(format!(
-            "scratch_disk_mib {n} out of range (1..={MAX_SCRATCH_MIB})"
+            "disk_mib {n} out of range (1..={MAX_DISK_MIB})"
         ))),
     }
 }
 
-/// The shape and scratch size a warm build for `resources` uses.
+/// The shape and disk size a warm build for `resources` uses.
 ///
 /// One place every automatic build goes through, so a template warmed as it
 /// lands and one warmed for a shape a create asked for agree on what an unset
 /// value means.
 pub(crate) fn warm_request(
     resources: &common::ResourcePolicy,
-) -> Result<(crate::warm::Shape, u32), Status> {
-    Ok((
-        crate::warm::Shape {
-            vcpus: vcpus(resources.vcpus)?,
-            mem_mib: mem_mib(resources.mem_mib)?,
-        },
-        scratch_mib(resources.scratch_disk_mib)?,
-    ))
+) -> Result<crate::warm::Shape, Status> {
+    Ok(crate::warm::Shape {
+        vcpus: vcpus(resources.vcpus)?,
+        mem_mib: mem_mib(resources.mem_mib)?,
+        disk_mib: disk_mib(resources.disk_mib)?,
+    })
 }
 
 /// Checks an id that is about to become a sandbox's workdir name, cgroup name
@@ -2131,37 +2172,44 @@ fn validate_policy(policy: &common::Policy) -> Result<(), Status> {
     if let Some(resources) = &policy.resources {
         vcpus(resources.vcpus)?;
         mem_mib(resources.mem_mib)?;
-        scratch_mib(resources.scratch_disk_mib)?;
+        disk_mib(resources.disk_mib)?;
     }
     if let Some(snapshots) = &policy.snapshots {
-        // Every retained snapshot is a memory image plus a scratch disk on this
-        // node, so how deep a caller may ask to keep is bounded here rather
-        // than discovered when the disk fills.
-        if snapshots.keep_last > crate::snapshot::MAX_KEEP_LAST {
-            return Err(Status::invalid_argument(format!(
-                "snapshots.keep_last {} out of range (1..={}; 0 is unlimited)",
-                snapshots.keep_last,
-                crate::snapshot::MAX_KEEP_LAST
-            )));
-        }
-        // Keeping what retention evicted only bounds anything if the evicted
-        // snapshot expires on its own. Refused rather than accepted as a policy
-        // that says "bound this" and then keeps every snapshot forever.
-        if snapshots.is_evicted_kept {
-            if snapshots.keep_last == 0 {
-                return Err(Status::invalid_argument(
-                    "snapshots.is_evicted_kept needs keep_last: nothing is evicted without it",
-                ));
-            }
-            if snapshots.expiration_secs == 0 {
-                return Err(Status::invalid_argument(
-                    "snapshots.is_evicted_kept needs expiration_secs: an evicted snapshot with no expiry is never reclaimed",
-                ));
-            }
-        }
+        validate_retention(snapshots)?;
     }
     if let Some(fs) = &policy.fs {
         validate_fs_policy(fs)?;
+    }
+    Ok(())
+}
+
+/// The snapshot retention a policy asks for, on a create and on a lifetimes
+/// update alike.
+fn validate_retention(snapshots: &common::SnapshotPolicy) -> Result<(), Status> {
+    // Every retained snapshot is a memory image plus a disk on this node, so
+    // how deep a caller may ask to keep is bounded here rather than discovered
+    // when the disk fills.
+    if snapshots.keep_last > crate::snapshot::MAX_KEEP_LAST {
+        return Err(Status::invalid_argument(format!(
+            "snapshots.keep_last {} out of range (1..={}; 0 is unlimited)",
+            snapshots.keep_last,
+            crate::snapshot::MAX_KEEP_LAST
+        )));
+    }
+    // Keeping what retention evicted only bounds anything if the evicted
+    // snapshot expires on its own. Refused rather than accepted as a policy
+    // that says "bound this" and then keeps every snapshot forever.
+    if snapshots.is_evicted_kept {
+        if snapshots.keep_last == 0 {
+            return Err(Status::invalid_argument(
+                "snapshots.is_evicted_kept needs keep_last: nothing is evicted without it",
+            ));
+        }
+        if snapshots.expiration_secs == 0 {
+            return Err(Status::invalid_argument(
+                "snapshots.is_evicted_kept needs expiration_secs: an evicted snapshot with no expiry is never reclaimed",
+            ));
+        }
     }
     Ok(())
 }
@@ -3644,8 +3692,8 @@ mod policy_tests {
         assert!(mem_mib(u32::MAX).is_err());
         assert_eq!(mem_mib(2048).unwrap(), 2048);
 
-        assert_eq!(scratch_mib(0).unwrap(), 1024);
-        assert!(scratch_mib(u32::MAX).is_err());
+        assert_eq!(disk_mib(0).unwrap(), 0);
+        assert!(disk_mib(u32::MAX).is_err());
     }
 
     fn fs_req(op: api::fs_request::Op) -> api::FsRequest {

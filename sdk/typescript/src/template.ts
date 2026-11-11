@@ -26,8 +26,9 @@ export interface BuildOptions extends CallOptions {
    */
   hypervisor?: string;
   /**
-   * The installed macOS disk for {@link TemplateBuilder.fromIpsw}, in MiB.
-   * Defaults to 65536; macOS needs 28672 to install.
+   * The build's root disk in MiB, which is the size of the image it makes:
+   * the base image plus 1024 by default. For {@link TemplateBuilder.fromIpsw},
+   * the installed macOS disk: 65536 by default, and macOS needs 28672.
    */
   diskMib?: number;
   /**

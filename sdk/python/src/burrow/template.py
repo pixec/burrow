@@ -88,7 +88,8 @@ def build_template(
         mem_mib=memory_mib,
         # "firecracker", "cloud-hypervisor" or "vz"; empty is the base's.
         hypervisor=hypervisor,
-        # The installed macOS disk for `from_ipsw`, in MiB.
+        # The build's root disk in MiB, which is the image it makes; for
+        # `from_ipsw` the installed macOS disk.
         disk_mib=disk_mib,
         # Omitted means unrestricted, because a build that installs packages
         # needs the network by definition.

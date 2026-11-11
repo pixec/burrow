@@ -387,6 +387,14 @@ fn applied() -> &'static Mutex<Option<guestpb::NetworkConfig>> {
     &APPLIED
 }
 
+pub async fn root_disk(
+    _req: guestpb::RootDiskRequest,
+) -> Result<guestpb::RootDiskResponse, Status> {
+    Err(Status::unimplemented(
+        "a Windows guest's disk is not resized or captured from inside",
+    ))
+}
+
 /// Applies a live attach or detach: the whole configuration again, since
 /// the private half is unchanged and costs nothing to repeat.
 pub async fn set_public_addresses(network: guestpb::NetworkConfig) -> Result<(), Status> {

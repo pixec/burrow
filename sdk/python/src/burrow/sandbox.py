@@ -39,6 +39,8 @@ from .types import (
     PortMapping,
     PrunedCommands,
     PublicIp,
+    ResourceOutcome,
+    ResourcesUpdate,
     SandboxInfo,
     SandboxPolicy,
     Session,
@@ -50,6 +52,27 @@ from .types import (
 
 def _state_of(state: int) -> str:
     return label(common_pb2.SandboxState, state, "SANDBOX_STATE_") or "unknown"
+
+
+def _to_resource_outcome(raw: api_pb2.ResourceOutcome) -> ResourceOutcome:
+    return ResourceOutcome(
+        change=label(api_pb2.ResourceChange, raw.change, "RESOURCE_CHANGE_"),
+        previous=raw.previous,
+        value=raw.value,
+        reason=raw.reason,
+    )
+
+
+def _to_resources_update(raw: api_pb2.UpdateResourcesResponse) -> ResourcesUpdate:
+    def field(name: str) -> Optional[ResourceOutcome]:
+        return _to_resource_outcome(getattr(raw, name)) if raw.HasField(name) else None
+
+    return ResourcesUpdate(
+        vcpus=field("vcpus"),
+        memory_mib=field("mem_mib"),
+        disk_mib=field("disk_mib"),
+        filesystem_bytes=raw.filesystem_bytes,
+    )
 
 
 def _to_sandbox_info(raw: common_pb2.Sandbox) -> SandboxInfo:
@@ -364,6 +387,12 @@ class Sandbox:
     @property
     def memory_mib(self) -> int:
         return self._info.policy.resources.memory_mib
+
+    @property
+    def disk_mib(self) -> int:
+        """The root disk's size, as of the last call that returned the sandbox
+        record."""
+        return self._info.policy.resources.disk_mib
 
     @property
     def usage(self) -> Usage:
@@ -831,21 +860,78 @@ class Sandbox:
         max_lifetime_secs: Optional[int] = None,
         idle_suspend_secs: Optional[int] = None,
         suspended_ttl_secs: Optional[int] = None,
+        snapshot_expiration_secs: Optional[int] = None,
+        snapshot_keep_last: Optional[int] = None,
+        snapshot_evicted_kept: Optional[bool] = None,
     ) -> SandboxInfo:
-        """Moves the clocks the sandbox is measured against.
+        """Moves the clocks the sandbox is measured against, and how long its
+        snapshots are kept.
 
         An omitted field is left where it is, which is what lets `0` keep
-        meaning "unlimited" here as it does on create. The machine shape is not
-        among them: a running VM's configuration is fixed.
+        meaning "unlimited" here as it does on create. The snapshot fields are
+        held to the rules a create's `snapshots` section is.
         """
-        request = api_pb2.UpdateLifetimeRequest(sandbox_id=self.id)
-        if max_lifetime_secs is not None:
-            request.max_lifetime_secs = max_lifetime_secs
-        if idle_suspend_secs is not None:
-            request.idle_suspend_secs = idle_suspend_secs
-        if suspended_ttl_secs is not None:
-            request.suspended_ttl_secs = suspended_ttl_secs
-        return self._apply("UpdateLifetime", request)
+        return self._apply(
+            "UpdateLifetime",
+            api_pb2.UpdateLifetimeRequest(
+                sandbox_id=self.id,
+                max_lifetime_secs=max_lifetime_secs,
+                idle_suspend_secs=idle_suspend_secs,
+                suspended_ttl_secs=suspended_ttl_secs,
+                snapshot_expiration_secs=snapshot_expiration_secs,
+                snapshot_keep_last=snapshot_keep_last,
+                is_evicted_snapshot_kept=snapshot_evicted_kept,
+            ),
+        )
+
+    def update_resources(
+        self,
+        *,
+        vcpus: Optional[int] = None,
+        memory_mib: Optional[int] = None,
+        disk_mib: Optional[int] = None,
+    ) -> ResourcesUpdate:
+        """Changes the sandbox's vCPUs, memory and root disk. An omitted field
+        is left as it is.
+
+        A running sandbox takes what its hypervisor can hotplug: a bigger disk
+        under Firecracker and Cloud Hypervisor, whose guest grows its
+        filesystem at once, and vCPUs under Cloud Hypervisor on x86_64. A
+        stopped one (`stop`) takes everything: vCPUs and memory on its next
+        start, and its disk at once, shrunk by a helper VM that checks the
+        filesystem first. A suspended sandbox takes none of it. What cannot be applied is
+        reported as "refused" with the reason rather than raised, so check
+        each field you asked for.
+
+        ```python
+        updated = sandbox.update_resources(vcpus=2, disk_mib=20 * 1024)
+        if updated.vcpus.change == "refused":
+            print(updated.vcpus.reason)
+        ```
+        """
+        for name, field, value in (
+            ("vcpus", "vcpus", vcpus),
+            ("memory_mib", "mem_mib", memory_mib),
+            ("disk_mib", "disk_mib", disk_mib),
+        ):
+            if value is None:
+                continue
+            if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
+                raise BurrowError(
+                    f"{name} {value!r} is not a positive integer", "invalid_argument"
+                )
+        self._assert_live()
+        raw = self._transport.unary(
+            "UpdateResources",
+            api_pb2.UpdateResourcesRequest(
+                sandbox_id=self.id, vcpus=vcpus, mem_mib=memory_mib, disk_mib=disk_mib
+            ),
+            # A shrink boots a helper VM that checks the filesystem first.
+            600.0,
+        )
+        if raw.HasField("sandbox"):
+            self._info = _to_sandbox_info(raw.sandbox)
+        return _to_resources_update(raw)
 
     def attach_ip(self, address: str) -> PublicIp:
         """Routes an allocated public IP to this sandbox."""
@@ -1108,7 +1194,7 @@ class Sandbox:
         raw = self._transport.unary(
             "CreateSnapshot",
             api_pb2.CreateSnapshotRequest(sandbox_id=self.id, expiration_secs=expiration_secs),
-            # Writing a memory image and copying a scratch disk; seconds, not
+            # Writing a memory image and cloning a disk; seconds, not
             # milliseconds, on a large guest.
             120.0,
         )

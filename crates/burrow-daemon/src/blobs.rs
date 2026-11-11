@@ -106,6 +106,44 @@ impl BlobStore {
         }
     }
 
+    /// Adopts a file whose digest is already known, by a hard link, unless
+    /// the store has it.
+    pub async fn adopt(&self, source: &Path, digest: &Digest) -> io::Result<()> {
+        let dest = self.path(digest);
+        if tokio::fs::try_exists(&dest).await.unwrap_or(false) {
+            return Ok(());
+        }
+        tokio::fs::create_dir_all(&self.root).await?;
+        if tokio::fs::hard_link(source, &dest).await.is_err() {
+            let temp = self.incoming_path(digest);
+            tokio::fs::copy(source, &temp).await?;
+            tokio::fs::rename(&temp, &dest).await?;
+        }
+        Ok(())
+    }
+
+    /// A temporary in the store for a blob about to arrive, which the
+    /// collector removes on age if nothing renames it into place.
+    pub fn incoming_path(&self, digest: &Digest) -> PathBuf {
+        let _ = std::fs::create_dir_all(&self.root);
+        let serial = TRANSFER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        self.root.join(format!(
+            ".incoming-{digest}.{}.{serial}",
+            std::process::id()
+        ))
+    }
+
+    /// The chunk index of an image blob, beside it.
+    pub fn index_path(&self, digest: &Digest) -> PathBuf {
+        self.root.join(format!("{digest}.index.json"))
+    }
+
+    /// Where what is known about one inode's digest is kept, so an image is
+    /// read once.
+    pub fn inode_record(&self, dev: u64, ino: u64) -> PathBuf {
+        self.root.join("inodes").join(format!("{dev}-{ino}"))
+    }
+
     /// Places a stored blob where a template expects to find it.
     pub async fn materialise(&self, digest: &Digest, dest: &Path) -> io::Result<()> {
         let source = self.path(digest);
@@ -149,6 +187,13 @@ impl BlobStore {
         let (mut removed, mut freed) = (0usize, 0u64);
         while let Ok(Some(entry)) = entries.next_entry().await {
             let name = entry.file_name().to_string_lossy().into_owned();
+            // An image's index goes with its blob.
+            if let Some(digest) = name.strip_suffix(".index.json").and_then(Digest::parse) {
+                if !self.has(&digest).await {
+                    let _ = tokio::fs::remove_file(entry.path()).await;
+                }
+                continue;
+            }
             // A transfer in progress owns its temporary and removes it itself;
             // one left by a process that died is collected on age alone, since
             // no digest ever names it.

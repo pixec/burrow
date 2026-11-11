@@ -122,7 +122,7 @@ pub(crate) fn vm_config(
     };
     let disks: Vec<Value> = spec.drives.iter().map(disk).collect();
     let mut vm = json!({
-        "cpus": { "boot_vcpus": spec.vcpus, "max_vcpus": spec.vcpus },
+        "cpus": { "boot_vcpus": spec.vcpus, "max_vcpus": spec.max_vcpus.max(spec.vcpus) },
         "memory": { "size": u64::from(spec.mem_mib) * 1024 * 1024 },
         "payload": payload,
         // In the order given, which is the order the guest probes and names

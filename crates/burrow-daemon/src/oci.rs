@@ -976,6 +976,7 @@ const MAX_LAYER_ENTRIES: usize = 1_000_000;
 /// the layers below it by adding a `.wh.<name>` entry, and an image that
 /// removes a setuid binary or a credential in a later layer would otherwise
 /// have it silently restored.
+#[cfg(test)]
 pub fn unpack_layers(layers: &[PathBuf], dest: &Path) -> std::io::Result<()> {
     for layer in layers {
         unpack_layer(layer, dest)?;

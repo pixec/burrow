@@ -63,6 +63,16 @@ impl DriveSpec {
         }
     }
 
+    /// The sandbox's own root disk, which the guest mounts read-write as `/`.
+    pub fn root_rw(path: impl Into<String>) -> Self {
+        Self {
+            id: "rootfs".into(),
+            path: path.into(),
+            is_root: true,
+            is_read_only: false,
+        }
+    }
+
     pub fn scratch_rw(path: impl Into<String>) -> Self {
         Self {
             id: "scratch".into(),
@@ -108,6 +118,8 @@ impl HypervisorExt for Hypervisor {
                 memory_headroom_mib: 128,
                 is_warm_pool_supported: true,
                 is_tap_networked: true,
+                is_live_disk_growth_supported: true,
+                is_vcpu_hotplug_supported: false,
             },
             // Cloud Hypervisor restores memory copy-on-write from its own
             // mapping, which is lazy in effect, but it cannot be pointed at
@@ -122,6 +134,10 @@ impl HypervisorExt for Hypervisor {
                 memory_headroom_mib: 128,
                 is_warm_pool_supported: true,
                 is_tap_networked: true,
+                is_live_disk_growth_supported: true,
+                // arm64 KVM creates every vCPU before the VM first runs, and
+                // refuses one created after with EBUSY.
+                is_vcpu_hotplug_supported: cfg!(target_arch = "x86_64"),
             },
             // The framework saves a machine as one opaque file, reads it back
             // itself and attaches storage only at configuration time. There
@@ -137,6 +153,8 @@ impl HypervisorExt for Hypervisor {
                 // restores into only one running machine at a time.
                 is_warm_pool_supported: false,
                 is_tap_networked: false,
+                is_live_disk_growth_supported: false,
+                is_vcpu_hotplug_supported: false,
             },
         }
     }
@@ -189,6 +207,15 @@ pub struct Capabilities {
     /// The guest's NIC is a host tap, which the node's firewall polices. A
     /// backend without one has no network until it is given its own.
     pub is_tap_networked: bool,
+    /// A running guest can be told its disk grew ([`Vm::resize_disk`]), and
+    /// grow the filesystem on it. Without it a disk grows only while its
+    /// sandbox is shut down.
+    pub is_live_disk_growth_supported: bool,
+    /// A running guest can be given vCPUs up to [`VmSpec::max_vcpus`] and
+    /// have them taken away again ([`Vm::resize_vcpus`]). No backend adds
+    /// memory to a running guest: that takes virtio-mem in the guest kernel,
+    /// or ACPI memory hotplug, which Cloud Hypervisor has only on x86_64.
+    pub is_vcpu_hotplug_supported: bool,
 }
 
 impl Capabilities {
@@ -293,6 +320,9 @@ pub struct VmSpec {
     /// Hypervisor is always PCI. See [`firecracker::MicroVmSpec::is_pci_enabled`].
     pub is_pci_enabled: bool,
     pub vcpus: u32,
+    /// vCPUs the guest is booted able to take, where
+    /// [`Capabilities::is_vcpu_hotplug_supported`]; never below `vcpus`.
+    pub max_vcpus: u32,
     pub mem_mib: u32,
     pub net: Option<NetSpec>,
     /// Enable virtio-vsock, the transport the guest agent speaks.
@@ -330,6 +360,7 @@ impl VmSpec {
             drives: Vec::new(),
             is_pci_enabled: false,
             vcpus: 1,
+            max_vcpus: 0,
             mem_mib: 512,
             net: None,
             is_vsock_enabled: false,
@@ -539,6 +570,40 @@ impl Vm {
             Self::Vz(_) => Err(Error::Unsupported {
                 hypervisor: Hypervisor::Vz,
                 what: "attach a drive to a running guest",
+            }),
+        }
+    }
+
+    /// Tells the running guest that the drive `id` is now `bytes` long.
+    /// Cloud Hypervisor sets the length itself; Firecracker reopens a file the
+    /// caller has grown already. Only where
+    /// [`Capabilities::is_live_disk_growth_supported`].
+    pub async fn resize_disk(&self, id: &str, bytes: u64) -> Result<()> {
+        match self {
+            Self::CloudHypervisor(vm) => vm.resize_disk(id, bytes).await,
+            Self::Firecracker(vm) => Ok(vm.resize_drive(id).await?),
+            #[cfg(target_os = "macos")]
+            Self::Vz(_) => Err(Error::Unsupported {
+                hypervisor: Hypervisor::Vz,
+                what: "grow a disk the guest has mounted",
+            }),
+        }
+    }
+
+    /// Sets the running guest's vCPUs to `vcpus`, within the
+    /// [`VmSpec::max_vcpus`] it was booted with, and its CPU cap with them.
+    /// Only where [`Capabilities::is_vcpu_hotplug_supported`].
+    pub async fn resize_vcpus(&self, vcpus: u32) -> Result<()> {
+        match self {
+            Self::CloudHypervisor(vm) => vm.resize_vcpus(vcpus).await,
+            Self::Firecracker(_) => Err(Error::Unsupported {
+                hypervisor: Hypervisor::Firecracker,
+                what: "change a running guest's vcpus",
+            }),
+            #[cfg(target_os = "macos")]
+            Self::Vz(_) => Err(Error::Unsupported {
+                hypervisor: Hypervisor::Vz,
+                what: "change a running guest's vcpus",
             }),
         }
     }

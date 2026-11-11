@@ -47,6 +47,9 @@ pub enum Error {
     #[error("resource limits cannot be enforced: {reason}")]
     CgroupUnavailable { reason: String },
 
+    #[error("the vm has no drive {0}")]
+    NoDrive(String),
+
     #[error("vsock connect to guest port {port} rejected: {response}")]
     VsockRejected { port: u32, response: String },
 

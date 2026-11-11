@@ -49,7 +49,7 @@ class Snapshot:
         # as.
         self.resources = from_resources(raw.resources)
         self.created_at = at(raw.created_at_unix_ms)
-        # Memory image, vmstate and scratch disk, as the node's disk sees them.
+        # Memory image, vmstate and disk, as the node's disk sees them.
         self.size_bytes = raw.size_bytes
         # None when the snapshot does not expire.
         self.expires_at = at_or_none(raw.expires_at_unix_ms)

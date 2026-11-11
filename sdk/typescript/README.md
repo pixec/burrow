@@ -54,7 +54,7 @@ optional.
 const sandbox = await Sandbox.create({
   template: "python-tools",
   tags: { owner: "ci", run: "482" },
-  resources: { vcpus: 2, memoryMib: 2048, scratchDiskMib: 4096 },
+  resources: { vcpus: 2, memoryMib: 2048, diskMib: 4096 },
   lifetime: { maxLifetimeSecs: 3600, idleSuspendSecs: 300, suspendedTtlSecs: 86400 },
   networkPolicy: {
     mode: "allowlist",
@@ -93,7 +93,7 @@ const sandbox = await Sandbox.create({
 |---|---|---|
 | `vcpus` | `1` | vCPUs given to the guest |
 | `memoryMib` | `512` | Guest memory |
-| `scratchDiskMib` | node default | Writable scratch disk |
+| `diskMib` | image + 1024 | Root disk, as the guest sees it; at least the template's image |
 
 | `lifetime` field | Default | What it does |
 |---|---|---|
@@ -853,10 +853,24 @@ An omitted field is left where it is, which is what lets `0` keep meaning
 "unlimited" here as it does on create. The reaper reads the policy on its next
 pass, so an extension takes effect without restarting anything.
 
-The machine shape is not updatable at all: `resources` has no update call,
-because a running VM's configuration is fixed and a restore takes its shape
-from the snapshot. Create a new sandbox, or a snapshot and a
-sandbox from it, at the shape you want.
+How long its snapshots are kept moves with the same call, held to the rules a
+create's `snapshots` section is:
+
+```ts
+await sandbox.updateLifetime({ snapshots: { keepLast: 3, expirationSecs: 86400 } });
+```
+
+The machine changes as far as the sandbox's state and hypervisor allow, and
+each field says what was done: `live`, `next_boot` (shut down, applied when it
+boots), `offline` (a shut-down sandbox's disk, resized now) or `refused` with
+the reason. A running sandbox grows its disk live, and under Cloud Hypervisor
+on x86_64 changes its vCPUs live; shrinking a disk, and memory, need it
+stopped. A suspended sandbox takes none of it.
+
+```ts
+const { diskMib } = await sandbox.updateResources({ diskMib: 20 * 1024 });
+if (diskMib?.change === "refused") console.log(diskMib.reason);
+```
 
 ## Expose ports
 
@@ -1471,6 +1485,7 @@ Everything else goes to the orchestrator.
 | `sandbox.updateTags` | `UpdateTags` |
 | `sandbox.updateNetworkPolicy` | `UpdateNetworkPolicy` |
 | `sandbox.updateLifetime` | `UpdateLifetime` |
+| `sandbox.updateResources` | `UpdateResources` |
 | `sandbox.updateAccessPolicy` | `UpdateAccessPolicy` |
 | `sandbox.listSessions`, `currentSession` | `ListSessions` |
 | `sandbox.pause` | `PauseSandbox` |
@@ -1521,10 +1536,9 @@ one policy object. What was removed, and what to use instead:
 | `status`, `image`, `metadata`, `memory`, `sandboxId`, `networkPolicy` | `state`, `template`, `tags`, `memoryMib`, `id`, `policy.network` |
 | `network`, `image`, `metadata` options | `networkPolicy`, `template`, `tags` |
 | `stop()`, `shutdown()`, `boot()` | `pause()`, `stop()`, `start()`, named for the states they lead to |
-| `updateResources` | `updateLifetime` |
+| `updateResources` for the clocks | `updateLifetime`; `updateResources` changes the machine |
 | `resources.maxLifetimeSecs`, `idleSuspendSecs`, `suspendedTtlSecs` | the `lifetime` section |
 | `resources.snapshotExpirationSecs`, `keepLastSnapshots`, `keepEvictedSnapshots` | `snapshots.expirationSecs`, `keepLast`, `keepEvicted` |
-| `resources.diskMib` | `resources.scratchDiskMib` |
 | `Sandbox.get({ sandboxId })`, `get({ name })` | `Sandbox.get(idOrName)` or `get({ id })` |
 | `fork({ sandboxId })` | gone: ids are generated |
 | `injectHeaders` | a `rules` entry with `setHeaders` and no `match` |

@@ -1,6 +1,6 @@
-//! This node's side of disk admission: measuring the data directory, counting
-//! what its sandboxes have been promised, and refusing a create, resume or
-//! adopt that would cross the reserve. The rule itself is
+//! This node's side of disk admission: measuring the filesystem its sandboxes'
+//! disks are on, adding up what it has provisioned, and refusing a create,
+//! fork, restore, resume or adopt that does not fit. The rule itself is
 //! [`burrow_common::disk`], which the orchestrator applies too.
 
 use std::path::{Path, PathBuf};
@@ -34,17 +34,17 @@ const LOW_DISK_REPEAT_SECS: i64 = 60;
 #[derive(Default)]
 pub struct Admissions {
     /// Held across measuring and charging, so two creates cannot both fit
-    /// into the same free space.
+    /// into the same room.
     gate: tokio::sync::Mutex<()>,
-    /// Disk admitted to creates still building: their disk files do not exist
-    /// yet, so the measurement cannot see them.
+    /// Disk admitted to operations whose sandbox is not registered yet, so
+    /// the sum over registered sandboxes cannot see it.
     pending: Arc<AtomicU64>,
     /// When free disk under the reserve was last logged, 0 for not short.
     low_logged_at: AtomicI64,
 }
 
-/// Disk charged to an admitted operation until it is dropped, by which time
-/// its disk file exists and is counted on its own.
+/// Disk charged to an admitted operation until it is dropped, which its
+/// caller does once the sandbox is registered and counted on its own.
 pub struct Admitted {
     pending: Arc<AtomicU64>,
     bytes: u64,
@@ -56,11 +56,19 @@ impl Drop for Admitted {
     }
 }
 
+/// What admission adds up: the disks of the sandboxes registered here, each
+/// at its size, and the node's volumes, each at its size.
+#[derive(Debug, Default, Clone)]
+pub struct Provisioned {
+    pub disks: Vec<PathBuf>,
+    pub volume_bytes: u64,
+}
+
 /// Free and total bytes of the filesystem holding `dir`.
 pub fn filesystem_space(dir: &Path) -> std::io::Result<(u64, u64)> {
     use std::os::unix::ffi::OsStrExt as _;
     let path = std::ffi::CString::new(dir.as_os_str().as_bytes())
-        .map_err(|_| std::io::Error::other("the data directory's path holds a NUL"))?;
+        .map_err(|_| std::io::Error::other("the disk directory's path holds a NUL"))?;
     let mut stat: libc::statvfs = unsafe { std::mem::zeroed() };
     // SAFETY: `path` is NUL-terminated and `stat` is a valid out-pointer.
     if unsafe { libc::statvfs(path.as_ptr(), &mut stat) } != 0 {
@@ -75,35 +83,36 @@ pub fn filesystem_space(dir: &Path) -> std::io::Result<(u64, u64)> {
     ))
 }
 
-/// What a disk file can still grow by: its size less the blocks it holds.
-fn unwritten(path: &Path) -> u64 {
-    use std::os::unix::fs::MetadataExt as _;
-    match std::fs::metadata(path) {
-        Ok(meta) => meta.len().saturating_sub(meta.blocks().saturating_mul(512)),
-        Err(_) => 0,
-    }
+/// A disk at its provisioned size, which is its length: a sparse or cloned
+/// file takes less, and is charged all of it anyway.
+fn provisioned_size(path: &Path) -> u64 {
+    std::fs::metadata(path).map_or(0, |meta| meta.len())
 }
 
 impl Admissions {
-    /// This node's disk as admission sees it, or `None` when the data
-    /// directory cannot be measured, in which case nothing is refused.
+    /// This node's disk as admission sees it, or `None` when `disk_dir` cannot
+    /// be measured, in which case nothing is refused.
     pub async fn capacity(
         &self,
-        data_dir: &Path,
+        disk_dir: &Path,
         policy: DiskPolicy,
-        disks: Vec<PathBuf>,
+        provisioned: Provisioned,
     ) -> Option<DiskCapacity> {
-        let dir = data_dir.to_path_buf();
+        let dir = disk_dir.to_path_buf();
         let measured = tokio::task::spawn_blocking(move || {
             let space = filesystem_space(&dir);
-            let unwritten: u64 = disks.iter().map(|path| unwritten(path)).sum();
-            space.map(|(free, total)| (free, total, unwritten))
+            let disks: u64 = provisioned
+                .disks
+                .iter()
+                .map(|path| provisioned_size(path))
+                .sum();
+            space.map(|(free, total)| (free, total, disks + provisioned.volume_bytes))
         })
         .await;
-        let (free_bytes, total_bytes, unwritten_bytes) = match measured {
+        let (free_bytes, total_bytes, provisioned_bytes) = match measured {
             Ok(Ok(measured)) => measured,
             Ok(Err(err)) => {
-                tracing::warn!(dir = %data_dir.display(), %err, "could not measure the data directory's filesystem");
+                tracing::warn!(dir = %disk_dir.display(), %err, "could not measure the filesystem sandboxes' disks are on");
                 return None;
             }
             Err(err) => {
@@ -115,31 +124,33 @@ impl Admissions {
             free_bytes,
             total_bytes,
             reserve_bytes: burrow_common::disk::reserve_bytes(policy.reserve_mib, total_bytes),
-            unwritten_bytes: unwritten_bytes.saturating_add(self.pending.load(Ordering::Relaxed)),
+            provisioned_bytes: provisioned_bytes
+                .saturating_add(self.pending.load(Ordering::Relaxed)),
             overcommit: burrow_common::disk::effective_overcommit(policy.overcommit),
         })
     }
 
-    /// Admits `request_bytes` more disk on `node`, or refuses with
-    /// `ResourceExhausted` naming the node and the shortfall. The charge is
-    /// held by what is returned.
+    /// Admits `request_bytes` more provisioned disk on `node`, or refuses with
+    /// `ResourceExhausted` naming the node and what it ran into. The charge
+    /// is held by what is returned.
     pub async fn admit(
         &self,
         node: &str,
         what: &str,
         request_bytes: u64,
-        data_dir: &Path,
+        disk_dir: &Path,
         policy: DiskPolicy,
-        disks: Vec<PathBuf>,
+        provisioned: Provisioned,
     ) -> Result<Admitted, Status> {
         let _gate = self.gate.lock().await;
-        if let Some(capacity) = self.capacity(data_dir, policy, disks).await {
+        if let Some(capacity) = self.capacity(disk_dir, policy, provisioned).await {
             capacity.admit(request_bytes).map_err(|short| {
                 let message = burrow_common::disk::refusal(node, what, request_bytes, short);
                 tracing::warn!(
                     free_mib = capacity.free_bytes / MIB,
                     reserve_mib = capacity.reserve_bytes / MIB,
-                    unwritten_mib = capacity.unwritten_bytes / MIB,
+                    provisioned_mib = capacity.provisioned_bytes / MIB,
+                    capacity_mib = (capacity.capacity_bytes() / MIB as f64) as u64,
                     "{message}"
                 );
                 Status::resource_exhausted(message)
@@ -208,7 +219,7 @@ mod tests {
     }
 
     #[test]
-    fn the_data_directory_is_measured() {
+    fn the_disk_directory_is_measured() {
         let dir = temp("space");
         let (free, total) = filesystem_space(&dir).unwrap();
         assert!(total > 0);
@@ -216,11 +227,12 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// A sparse disk counts at its size less what it already holds.
+    /// A sparse disk takes almost nothing and is charged its whole size, and
+    /// a volume its size, whether or not any sandbox mounts it.
     #[tokio::test]
-    async fn a_sparse_disk_is_counted_as_unwritten() {
-        let dir = temp("sparse");
-        let disk = dir.join("scratch.ext4");
+    async fn disks_and_volumes_count_at_their_sizes() {
+        let dir = temp("sizes");
+        let disk = dir.join("root.ext4");
         std::fs::File::create(&disk)
             .unwrap()
             .set_len(64 * MIB)
@@ -230,13 +242,14 @@ mod tests {
             .capacity(
                 &dir,
                 DiskPolicy::default(),
-                vec![disk.clone(), dir.join("gone.ext4")],
+                Provisioned {
+                    disks: vec![disk, dir.join("gone.ext4")],
+                    volume_bytes: 16 * MIB,
+                },
             )
             .await
             .unwrap();
-        // Nearly all of it: a sparse file holds a block or none.
-        assert!(capacity.unwritten_bytes > 63 * MIB, "{capacity:?}");
-        assert!(capacity.unwritten_bytes <= 64 * MIB);
+        assert_eq!(capacity.provisioned_bytes, 80 * MIB);
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -248,32 +261,47 @@ mod tests {
             overcommit: 1.0,
             reserve_mib: Some(0),
         };
-        let before = admissions.capacity(&dir, policy, vec![]).await.unwrap();
+        let none = Provisioned::default;
+        let before = admissions.capacity(&dir, policy, none()).await.unwrap();
         let admitted = admissions
-            .admit("node-a", "create a sandbox", 10 * MIB, &dir, policy, vec![])
+            .admit("node-a", "create a sandbox", 10 * MIB, &dir, policy, none())
             .await
             .unwrap();
-        let during = admissions.capacity(&dir, policy, vec![]).await.unwrap();
-        assert_eq!(during.unwritten_bytes, before.unwritten_bytes + 10 * MIB);
+        let during = admissions.capacity(&dir, policy, none()).await.unwrap();
+        assert_eq!(
+            during.provisioned_bytes,
+            before.provisioned_bytes + 10 * MIB
+        );
         drop(admitted);
-        let after = admissions.capacity(&dir, policy, vec![]).await.unwrap();
-        assert_eq!(after.unwritten_bytes, before.unwritten_bytes);
+        let after = admissions.capacity(&dir, policy, none()).await.unwrap();
+        assert_eq!(after.provisioned_bytes, before.provisioned_bytes);
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// A reserve bigger than the filesystem can never be met, so every
-    /// create is refused, with the node named and what it is short of.
+    /// A create past what the node may provision is refused with the node
+    /// named, and a resume, asking for nothing new, still goes through.
     #[tokio::test]
-    async fn a_create_that_would_cross_the_reserve_is_refused() {
+    async fn a_create_past_capacity_is_refused_and_a_resume_is_not() {
         let dir = temp("refuse");
-        let (free, _) = filesystem_space(&dir).unwrap();
+        let (_, total) = filesystem_space(&dir).unwrap();
         let policy = DiskPolicy {
             overcommit: 1.0,
-            reserve_mib: Some(free / MIB + 1024),
+            reserve_mib: Some(0),
         };
         let admissions = Admissions::default();
+        let full = Provisioned {
+            disks: Vec::new(),
+            volume_bytes: total,
+        };
         let refused = admissions
-            .admit("node-a", "create a sandbox", MIB, &dir, policy, vec![])
+            .admit(
+                "node-a",
+                "create a sandbox",
+                MIB,
+                &dir,
+                policy,
+                full.clone(),
+            )
             .await
             .err()
             .expect("refused");
@@ -283,20 +311,47 @@ mod tests {
             "{}",
             refused.message()
         );
-        assert!(
-            refused.message().contains("short by"),
-            "{}",
-            refused.message()
-        );
         // Nothing was charged for the refusal.
-        let capacity = admissions.capacity(&dir, policy, vec![]).await.unwrap();
-        assert_eq!(capacity.unwritten_bytes, 0);
-        // And a resume, asking for nothing new, is refused as well.
+        let capacity = admissions
+            .capacity(&dir, policy, Provisioned::default())
+            .await
+            .unwrap();
+        assert_eq!(capacity.provisioned_bytes, 0);
         assert!(
             admissions
-                .admit("node-a", "resume a sandbox", 0, &dir, policy, vec![])
+                .admit("node-a", "resume a sandbox", 0, &dir, policy, full)
                 .await
-                .is_err()
+                .is_ok()
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A reserve bigger than the filesystem can never be met, so even a
+    /// resume is refused.
+    #[tokio::test]
+    async fn a_node_under_its_reserve_refuses_a_resume() {
+        let dir = temp("low");
+        let (free, _) = filesystem_space(&dir).unwrap();
+        let policy = DiskPolicy {
+            overcommit: 1.0,
+            reserve_mib: Some(free / MIB + 1024),
+        };
+        let refused = Admissions::default()
+            .admit(
+                "node-a",
+                "resume a sandbox",
+                0,
+                &dir,
+                policy,
+                Provisioned::default(),
+            )
+            .await
+            .err()
+            .expect("refused");
+        assert!(
+            refused.message().contains("below its reserve"),
+            "{}",
+            refused.message()
         );
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -308,7 +363,7 @@ mod tests {
             free_bytes: MIB,
             total_bytes: 100 * MIB,
             reserve_bytes: 5 * MIB,
-            unwritten_bytes: 0,
+            provisioned_bytes: 0,
             overcommit: 1.0,
         };
         assert!(!admissions.watch(&low, 0));

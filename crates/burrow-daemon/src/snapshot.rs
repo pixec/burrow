@@ -6,9 +6,11 @@
 //!
 //! Three properties the layout exists to guarantee:
 //!
-//! - **Self-contained.** The kernel and rootfs are hard-linked in beside the
-//!   state, so deleting the source sandbox or the template leaves the snapshot
-//!   restorable. Links cost nothing and share the template's pages.
+//! - **Self-contained.** The kernel and the template's image are hard-linked
+//!   in beside the state, so deleting the source sandbox or the template
+//!   leaves the snapshot restorable. Links cost nothing and share the
+//!   template's pages. The sandbox's own disk is a clone, taken while its
+//!   guest was paused for the memory beside it.
 //! - **One memory image.** The source's chain of a base plus diffs is flattened
 //!   on create, so restoring costs the same however many times the sandbox had
 //!   been suspended before the snapshot was taken.
@@ -21,9 +23,12 @@
 //! configured a published snapshot is also uploaded, behind the create, and a
 //! node that lacks one fetches it on the first create that asks; the
 //! orchestrator only sends such a create to a node of the same architecture
-//! running the same Firecracker. The fetch takes everything but the memory
-//! image up front; memory arrives behind the restored guest, served page by
-//! page as it faults, see [`crate::chunks`].
+//! running the same Firecracker. A root disk is stored as the chunks it
+//! changed from its image, and the image once for every disk made from it:
+//! the image is never uploaded per snapshot, and a fetching node clones its
+//! own copy of it and fetches only the changed chunks. The fetch takes
+//! everything but the memory image up front; memory arrives behind the
+//! restored guest, served page by page as it faults, see [`crate::chunks`].
 
 #![allow(clippy::result_large_err)]
 
@@ -43,10 +48,8 @@ use burrow_proto::common::v1 as common;
 
 /// Written last, and the only thing that makes a directory a snapshot.
 const MANIFEST: &str = "manifest.json";
-/// The one memory image a snapshot holds, flattened on create.
-const SCRATCH_IMAGE: &str = "scratch.ext4";
 const TEMPLATE_KERNEL: &str = "vmlinux";
-const TEMPLATE_ROOTFS: &str = "rootfs.ext4";
+const TEMPLATE_ROOTFS: &str = crate::rootdisk::IMAGE;
 /// The source's command logs, as far as its guest had produced them: the
 /// restored guest remembers those commands and is asked about them.
 pub const COMMAND_LOGS: &str = "command-logs";
@@ -67,8 +70,8 @@ const STAGING_ORPHAN_AFTER: std::time::Duration = std::time::Duration::from_secs
 
 /// Ceiling on `keep_last_snapshots`.
 ///
-/// Every retained snapshot is a full memory image plus a scratch disk on the
-/// node's disk, so the depth a caller may ask to keep is bounded.
+/// Every retained snapshot is a full memory image plus a disk on the node's
+/// disk, so the depth a caller may ask to keep is bounded.
 pub const MAX_KEEP_LAST: u32 = 10;
 
 /// What a snapshot is, on disk.
@@ -84,7 +87,12 @@ pub struct Manifest {
     pub template: String,
     pub vcpus: u32,
     pub mem_mib: u32,
-    pub scratch_disk_mib: u32,
+    #[serde(alias = "scratch_disk_mib")]
+    pub disk_mib: u32,
+    /// [`crate::rootdisk::DiskLayout`]; empty in a manifest from before root
+    /// disks, which was the overlay.
+    #[serde(default)]
+    pub disk_layout: String,
     /// Unix milliseconds. Retention evicts the oldest first, and two
     /// snapshots taken inside one second would otherwise be ordered
     /// arbitrarily, by their random ids.
@@ -112,14 +120,15 @@ pub struct Manifest {
     /// Set once every object is in the store and the remote manifest is
     /// written, so a half-finished upload never reads as restorable.
     pub is_durable: bool,
-    /// The kernel and rootfs by content, filled in when uploaded. They go to
-    /// the store as blobs under their digest, so snapshots of one template
-    /// share them and a fetching node can verify what it received.
+    /// The kernel and the template's image by content, filled in when
+    /// uploaded. The kernel goes to the store as a blob under its digest; the
+    /// image as a blob on the overlay layout, and on the root layout as
+    /// chunks under `images/`, which the disk's index is a diff against.
     pub kernel_digest: String,
     pub rootfs_digest: String,
-    /// Memory and scratch disk are stored as chunk indexes rather than as
-    /// whole sparse objects. Written before chunking existed, a snapshot is
-    /// fetched whole.
+    /// Memory and disk are stored as chunk indexes rather than as whole
+    /// sparse objects. Written before chunking existed, a snapshot is fetched
+    /// whole.
     #[serde(default)]
     pub is_chunked: bool,
     /// The inspection root its guest trusted, when it was inspected; see
@@ -142,6 +151,10 @@ impl Manifest {
         self.hypervisor().map(burrow_vmm::Hypervisor::layout)
     }
 
+    pub fn disk_layout(&self) -> crate::rootdisk::DiskLayout {
+        crate::rootdisk::DiskLayout::from_record(&self.disk_layout)
+    }
+
     fn to_proto(&self) -> common::Snapshot {
         common::Snapshot {
             id: self.id.clone(),
@@ -152,7 +165,7 @@ impl Manifest {
             resources: Some(common::ResourcePolicy {
                 vcpus: self.vcpus,
                 mem_mib: self.mem_mib,
-                scratch_disk_mib: self.scratch_disk_mib,
+                disk_mib: self.disk_mib,
             }),
             created_at_unix_ms: self.created_unix_ms,
             size_bytes: self.size_bytes,
@@ -164,6 +177,7 @@ impl Manifest {
                 .hypervisor()
                 .map_or_else(|_| self.hypervisor.clone(), |h| h.to_string()),
             inspection_root_fingerprint: self.inspection_root.clone(),
+            disk_layout: self.disk_layout().to_proto() as i32,
         }
     }
 }
@@ -235,7 +249,11 @@ async fn delete_remote(remote: &crate::objstore::ObjectStore, id: &str) -> Resul
     remote.delete(&log_names_key(id)).await?;
     for layout in burrow_vmm::Hypervisor::ALL.map(burrow_vmm::Hypervisor::layout) {
         remote.delete(&remote_key(id, layout.state)).await?;
-        for file in layout.memory.into_iter().chain([SCRATCH_IMAGE]) {
+        for file in layout
+            .memory
+            .into_iter()
+            .chain([crate::rootdisk::SCRATCH_DISK, crate::rootdisk::ROOT_DISK])
+        {
             remote
                 .delete(&crate::objstore::sparse_key(&remote_key(id, file)))
                 .await?;
@@ -291,7 +309,8 @@ pub struct Staged {
     pub template: String,
     pub vcpus: u32,
     pub mem_mib: u32,
-    pub scratch_disk_mib: u32,
+    pub disk_mib: u32,
+    pub disk_layout: crate::rootdisk::DiskLayout,
     pub hypervisor: burrow_vmm::Hypervisor,
     /// Memory files in the staging directory, oldest first.
     pub chain: Vec<String>,
@@ -373,7 +392,8 @@ impl SnapshotStore {
             template: staged.template,
             vcpus: staged.vcpus,
             mem_mib: staged.mem_mib,
-            scratch_disk_mib: staged.scratch_disk_mib,
+            disk_mib: staged.disk_mib,
+            disk_layout: staged.disk_layout.as_str().to_string(),
             created_unix_ms: burrow_common::unix_now_ms(),
             size_bytes,
             expires_at_ms: match expiration_secs {
@@ -444,29 +464,48 @@ impl SnapshotStore {
         let layout = manifest.layout()?;
         let started = std::time::Instant::now();
 
-        let mut digests = Vec::new();
-        for file in [TEMPLATE_KERNEL, TEMPLATE_ROOTFS] {
-            digests.push(put_blob(remote, &dir.join(file)).await?);
-        }
+        let kernel_digest = put_blob(remote, &dir.join(TEMPLATE_KERNEL)).await?;
+        // A root disk's image goes once for every snapshot of it; an
+        // overlay's rootfs goes as a blob.
+        let disk_layout = manifest.disk_layout();
+        let image = match disk_layout {
+            crate::rootdisk::DiskLayout::Root => {
+                let image =
+                    crate::rootdisk::image_of(&self.blobs, &dir.join(TEMPLATE_ROOTFS)).await?;
+                crate::rootdisk::upload_image(remote, &image).await?;
+                Some(image)
+            }
+            crate::rootdisk::DiskLayout::Overlay => None,
+        };
+        let rootfs_digest = match &image {
+            Some(image) => image.digest.clone(),
+            None => put_blob(remote, &dir.join(TEMPLATE_ROOTFS)).await?,
+        };
         remote
             .put_file(&remote_key(id, layout.state), &dir.join(layout.state))
             .await?;
         // As chunks, so the memory image can be served page by page on a node
         // restoring it, and so what the snapshot shares with its sandbox's own
-        // stored state is stored once.
-        for file in [memory_file(layout)?, SCRATCH_IMAGE] {
-            let index = crate::chunks::put_image(
-                remote,
-                &dir,
-                &[file.to_string()],
-                None,
-                &Default::default(),
-            )
-            .await?;
-            let json = serde_json::to_vec(&index)
-                .map_err(|err| Status::internal(format!("encoding an index: {err}")))?;
-            remote.put_bytes(&index_key(id, file), json).await?;
-        }
+        // stored state, and its disk with its image, is stored once.
+        let memory = memory_file(layout)?;
+        let index = crate::chunks::put_image(
+            remote,
+            &dir,
+            &[memory.to_string()],
+            None,
+            &Default::default(),
+        )
+        .await?;
+        let json = serde_json::to_vec(&index)
+            .map_err(|err| Status::internal(format!("encoding an index: {err}")))?;
+        remote.put_bytes(&index_key(id, memory), json).await?;
+        let disk = disk_layout.disk();
+        let index =
+            crate::chunks::put_disk(remote, &dir.join(disk), image.as_ref(), &Default::default())
+                .await?;
+        let json = serde_json::to_vec(&index)
+            .map_err(|err| Status::internal(format!("encoding an index: {err}")))?;
+        remote.put_bytes(&index_key(id, disk), json).await?;
         let logs = dir.join(COMMAND_LOGS);
         let names = log_names(&logs);
         for name in &names {
@@ -485,8 +524,8 @@ impl SnapshotStore {
         let json = serde_json::to_vec(&names)
             .map_err(|err| Status::internal(format!("encoding log names: {err}")))?;
         remote.put_bytes(&log_names_key(id), json).await?;
-        manifest.kernel_digest = digests[0].clone();
-        manifest.rootfs_digest = digests[1].clone();
+        manifest.kernel_digest = kernel_digest;
+        manifest.rootfs_digest = rootfs_digest;
         manifest.is_chunked = true;
         manifest.is_durable = true;
         let json = serde_json::to_vec_pretty(&manifest)
@@ -517,9 +556,10 @@ impl SnapshotStore {
     ///
     /// Staged and renamed like a create, so a failed fetch leaves a directory
     /// the orphan sweep removes rather than a snapshot that lists but does not
-    /// restore. Kernel and rootfs are verified against the digests the manifest
+    /// restore. Kernel and image are verified against the digests the manifest
     /// carries and adopted into the blob store, so a second snapshot of the
-    /// same template costs the state alone.
+    /// same template costs the state alone, and a root disk costs only the
+    /// chunks it changed from its image.
     async fn fetch(&self, id: &str) -> Result<(), Status> {
         let Some(remote) = &self.remote else {
             return Err(Status::not_found(format!("no snapshot {id} on this node")));
@@ -549,12 +589,21 @@ impl SnapshotStore {
                 return Err(err);
             }
         };
+        // Synced as a published snapshot is, before the manifest that makes
+        // it one: a fetch is a write like any other, and a power cut must not
+        // leave a manifest naming files still in the page cache.
+        crate::fsync::tree(&dir)
+            .await
+            .map_err(|err| Status::internal(format!("syncing the fetched snapshot: {err}")))?;
         write_manifest(&dir, &manifest).await?;
         let live = self.dir(id);
         let _ = tokio::fs::remove_dir_all(&live).await;
         tokio::fs::rename(&dir, &live)
             .await
             .map_err(|err| Status::internal(format!("publishing the fetched snapshot: {err}")))?;
+        crate::fsync::dir(&self.root)
+            .await
+            .map_err(|err| Status::internal(format!("syncing the snapshot store: {err}")))?;
         // Begun at the path it will be served from: a hydrator names its file
         // by path, for the links it hands out. Readers of a snapshot all
         // arrive through `fetching`, which this call still holds.
@@ -624,12 +673,29 @@ impl SnapshotStore {
         dir: &Path,
     ) -> Result<Option<crate::chunks::ImageIndex>, Status> {
         let id = &manifest.id;
-        for (file, digest) in [
-            (TEMPLATE_KERNEL, &manifest.kernel_digest),
-            (TEMPLATE_ROOTFS, &manifest.rootfs_digest),
-        ] {
-            self.fetch_blob(remote, digest, &dir.join(file)).await?;
-        }
+        let disk_layout = manifest.disk_layout();
+        self.fetch_blob(remote, &manifest.kernel_digest, &dir.join(TEMPLATE_KERNEL))
+            .await?;
+        let image = match disk_layout {
+            crate::rootdisk::DiskLayout::Root => {
+                let image = crate::rootdisk::fetch_image(
+                    remote,
+                    &self.blobs,
+                    &self.templates_dir(),
+                    &manifest.rootfs_digest,
+                )
+                .await?;
+                tokio::fs::hard_link(&image.path, dir.join(TEMPLATE_ROOTFS))
+                    .await
+                    .map_err(|err| Status::internal(format!("linking the image: {err}")))?;
+                Some(image)
+            }
+            crate::rootdisk::DiskLayout::Overlay => {
+                self.fetch_blob(remote, &manifest.rootfs_digest, &dir.join(TEMPLATE_ROOTFS))
+                    .await?;
+                None
+            }
+        };
         let missing = |file: &str| {
             Status::not_found(format!(
                 "snapshot {id} is missing {file} in the object store"
@@ -652,18 +718,19 @@ impl SnapshotStore {
                 .map_err(|err| Status::internal(format!("fetching snapshot {id}'s logs: {err}")))?;
             crate::chunks::get_image(remote, &index, &dir.join(COMMAND_LOGS).join(&name)).await?;
         }
+        let disk = disk_layout.disk();
         if manifest.is_chunked {
-            let scratch = read_index(remote, &index_key(id, SCRATCH_IMAGE))
+            let index = read_index(remote, &index_key(id, disk))
                 .await?
-                .ok_or_else(|| missing(SCRATCH_IMAGE))?;
-            crate::chunks::get_image(remote, &scratch, &dir.join(SCRATCH_IMAGE)).await?;
+                .ok_or_else(|| missing(disk))?;
+            crate::rootdisk::materialise(remote, &index, image.as_ref(), &dir.join(disk)).await?;
             let memory_file = memory_file(layout)?;
             let memory = read_index(remote, &index_key(id, memory_file))
                 .await?
                 .ok_or_else(|| missing(memory_file))?;
             return Ok(Some(memory));
         }
-        for file in [memory_file(layout)?, SCRATCH_IMAGE] {
+        for file in [memory_file(layout)?, disk] {
             if remote
                 .get_sparse_file(&remote_key(id, file), &dir.join(file))
                 .await?
@@ -713,15 +780,26 @@ impl SnapshotStore {
         Ok(())
     }
 
-    /// Every chunk digest the stored snapshots' indexes reference.
+    /// Every chunk digest the stored snapshots' indexes reference, and into
+    /// `images` the images their root disks were cloned from.
     pub async fn remote_chunk_refs(
         &self,
         out: &mut std::collections::HashSet<String>,
+        images: &mut std::collections::HashSet<String>,
     ) -> Result<(), Status> {
         let Some(remote) = &self.remote else {
             return Ok(());
         };
         for key in remote.list("snapshots/").await? {
+            if key.ends_with(&format!("/{MANIFEST}")) {
+                if let Some(bytes) = remote.get_bytes(&key).await?
+                    && let Ok(manifest) = serde_json::from_slice::<Manifest>(&bytes)
+                    && manifest.disk_layout() == crate::rootdisk::DiskLayout::Root
+                {
+                    images.insert(manifest.rootfs_digest);
+                }
+                continue;
+            }
             if !key.ends_with(".index.json") {
                 continue;
             }
@@ -730,6 +808,18 @@ impl SnapshotStore {
             }
         }
         Ok(())
+    }
+
+    /// The node's blob store, which holds the images root disks are cloned
+    /// from.
+    pub fn blobs(&self) -> &crate::blobs::BlobStore {
+        &self.blobs
+    }
+
+    /// Where the node's templates are, whose images a root disk may have
+    /// been cloned from.
+    pub fn templates_dir(&self) -> PathBuf {
+        self.root.with_file_name("images")
     }
 
     /// Snapshots in the object store, whether or not this node holds them.
@@ -895,7 +985,8 @@ impl SnapshotStore {
         validate_id(id)?;
         let dir = self.dir(id);
         self.ensure_local(id).await?;
-        let layout = self.manifest(id).await?.layout()?;
+        let manifest = self.manifest(id).await?;
+        let layout = manifest.layout()?;
         let io = |what: &str, err: std::io::Error| {
             Status::internal(format!("staging snapshot {id} ({what}): {err}"))
         };
@@ -911,9 +1002,10 @@ impl SnapshotStore {
             .await
             .map_err(|err| io(layout.state, err))?;
 
-        crate::warm::copy_sparse(&dir.join(SCRATCH_IMAGE), &dest.join(SCRATCH_IMAGE))
+        let disk = manifest.disk_layout().disk();
+        crate::rootdisk::clone(&dir.join(disk), &dest.join(disk))
             .await
-            .map_err(|err| io(SCRATCH_IMAGE, err))?;
+            .map_err(|err| io(disk, err))?;
         let held = dir.join(COMMAND_LOGS);
         let names = log_names(&held);
         if !names.is_empty() {
@@ -937,8 +1029,9 @@ impl SnapshotStore {
                 .await
                 .unwrap_or(false)
         {
-            crate::warm::copy_sparse(&dir.join(memory), &dest.join(memory))
+            crate::rootdisk::clone(&dir.join(memory), &dest.join(memory))
                 .await
+                .map(drop)
                 .map_err(|err| io(memory, err))?;
         }
         Ok((vec![memory.to_string()], arriving))
@@ -1286,7 +1379,8 @@ mod tests {
             template: "default".into(),
             vcpus: 2,
             mem_mib: 1024,
-            scratch_disk_mib: 2048,
+            disk_mib: 2048,
+            disk_layout: String::new(),
             created_unix_ms: burrow_common::unix_from_rfc3339(created_at).unwrap_or(0) * 1_000,
             size_bytes: 12_345,
             expires_at_ms: 0,
@@ -1326,10 +1420,7 @@ mod tests {
         let read = read_manifest(&dir).await.expect("a manifest");
         assert_eq!(read.id, "snap_abc123");
         assert_eq!(read.sandbox_id, "sbx_a");
-        assert_eq!(
-            (read.vcpus, read.mem_mib, read.scratch_disk_mib),
-            (2, 1024, 2048)
-        );
+        assert_eq!((read.vcpus, read.mem_mib, read.disk_mib), (2, 1024, 2048));
         assert_eq!(read.expires_at_ms, 1_800_000_000_000);
         assert_eq!(read.expiration_secs, 3_600);
 
@@ -1508,7 +1599,7 @@ mod tests {
             TEMPLATE_ROOTFS,
             layout.state,
             layout.memory.unwrap(),
-            SCRATCH_IMAGE,
+            crate::rootdisk::SCRATCH_DISK,
         ] {
             tokio::fs::write(dir.join(file), vec![7u8; 8192])
                 .await
@@ -1524,7 +1615,11 @@ mod tests {
             let id = id.clone();
             async move { store.upload(&id).await }
         });
-        while !remote.exists(&index_key(&id, SCRATCH_IMAGE)).await.unwrap() {
+        while !remote
+            .exists(&index_key(&id, crate::rootdisk::SCRATCH_DISK))
+            .await
+            .unwrap()
+        {
             tokio::time::sleep(std::time::Duration::from_millis(5)).await;
         }
         tokio::fs::remove_dir_all(&dir).await.unwrap();
@@ -1558,7 +1653,7 @@ mod tests {
             TEMPLATE_ROOTFS,
             layout.state,
             layout.memory.unwrap(),
-            SCRATCH_IMAGE,
+            crate::rootdisk::SCRATCH_DISK,
         ] {
             tokio::fs::write(dir.join(file), vec![7u8; 8192])
                 .await
@@ -1607,7 +1702,7 @@ mod tests {
             TEMPLATE_ROOTFS,
             layout.state,
             memory,
-            SCRATCH_IMAGE,
+            crate::rootdisk::SCRATCH_DISK,
         ] {
             tokio::fs::write(dir.join(file), b"bytes").await.unwrap();
         }
@@ -1616,7 +1711,8 @@ mod tests {
             template: "default".into(),
             vcpus: 1,
             mem_mib: 512,
-            scratch_disk_mib: 1024,
+            disk_mib: 1024,
+            disk_layout: crate::rootdisk::DiskLayout::Overlay,
             hypervisor: burrow_vmm::Hypervisor::Firecracker,
             chain: vec![memory.to_string()],
             inspection_root: String::new(),
@@ -1637,7 +1733,7 @@ mod tests {
             TEMPLATE_ROOTFS,
             layout.state,
             memory,
-            SCRATCH_IMAGE,
+            crate::rootdisk::SCRATCH_DISK,
             MANIFEST,
         ] {
             assert!(

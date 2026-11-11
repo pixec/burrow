@@ -99,6 +99,14 @@ fn hex_lower(bytes: &[u8]) -> String {
     bytes.iter().map(|b| format!("{b:02x}")).collect()
 }
 
+pub async fn root_disk(
+    _req: guestpb::RootDiskRequest,
+) -> Result<guestpb::RootDiskResponse, tonic::Status> {
+    Err(tonic::Status::unimplemented(
+        "a macOS guest's disk is not resized or captured from inside",
+    ))
+}
+
 /// Replaces this agent with the binary streamed in.
 ///
 /// Verified against the digest, renamed over the installed binary and

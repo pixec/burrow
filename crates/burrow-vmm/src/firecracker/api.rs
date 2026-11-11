@@ -41,6 +41,22 @@ impl FcApi {
             .await
     }
 
+    /// Points a drive at its file again after boot. Firecracker reopens it,
+    /// takes its size afresh and tells the guest with a config change.
+    pub async fn update_drive(&self, drive_id: &str, path_on_host: &str) -> Result<()> {
+        self.http
+            .call(
+                Method::PATCH,
+                &format!("/drives/{drive_id}"),
+                Some(&serde_json::json!({
+                    "drive_id": drive_id,
+                    "path_on_host": path_on_host,
+                })),
+            )
+            .await
+            .map(|_| ())
+    }
+
     pub async fn add_network_interface(&self, iface: &NetworkInterface) -> Result<()> {
         self.http
             .put(&format!("/network-interfaces/{}", iface.iface_id), iface)

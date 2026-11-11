@@ -496,6 +496,28 @@ impl ChVm {
             .map(|_| ())
     }
 
+    /// Resizes a disk under the running guest, which Cloud Hypervisor tells
+    /// it of with a config change.
+    pub async fn resize_disk(&self, id: &str, bytes: u64) -> Result<()> {
+        self.api
+            .put(
+                "/api/v1/vm.resize-disk",
+                &json!({ "id": id, "desired_size": bytes }),
+            )
+            .await
+    }
+
+    /// Hotplugs or unplugs vCPUs, then moves the cgroup's CPU cap to match.
+    pub async fn resize_vcpus(&self, vcpus: u32) -> Result<()> {
+        self.api
+            .put("/api/v1/vm.resize", &json!({ "desired_vcpus": vcpus }))
+            .await?;
+        if let Some(cgroup) = &self.cgroup {
+            cgroup.set_cpus(vcpus)?;
+        }
+        Ok(())
+    }
+
     pub async fn kill(mut self) -> Result<()> {
         self.stop().await;
         let _ = tokio::fs::remove_file(self.workdir.join(API_SOCK)).await;

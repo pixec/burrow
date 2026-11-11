@@ -2,8 +2,13 @@
 //!
 //! The agent runs as init inside the guest: no udev, no getty, and no systemd
 //! unless the template asks for one under it (see [`crate::linux::systemd`]).
-//! This module brings up the filesystems: the writable overlay root and the
-//! pseudo-filesystems. Reaping, init's other duty, lives in [`crate::unix::reaper`].
+//! This module brings up the filesystems: the root, and the pseudo-filesystems.
+//! Reaping, init's other duty, lives in [`crate::unix::reaper`].
+//!
+//! The root is the sandbox's own disk, which the kernel mounts read-write, on
+//! every sandbox but those made before root disks: the host boots those with
+//! `burrow.layout=overlay`, and they get the read-only image under an overlay
+//! on a scratch disk, as they always have.
 
 use std::path::Path;
 
@@ -13,17 +18,19 @@ use nix::mount::{MntFlags, MsFlags, mount, umount2};
 const SCRATCH_DEV: &str = "/dev/vdb";
 const SCRATCH_MNT: &str = "/scratch";
 
-/// Turns the read-only template rootfs into a writable filesystem by union
-/// mounting a per-sandbox scratch disk over it, then pivoting into the union.
+/// On the overlay layout, turns the read-only template rootfs into a writable
+/// filesystem by union mounting a per-sandbox scratch disk over it, then
+/// pivoting into the union. On the root layout the root is writable already.
 ///
-/// Without this the sandbox can only write to tmpfs, which is RAM-backed and
-/// far too small for package installs. Failure is not fatal: the sandbox still
-/// boots read-only, which is degraded but usable and much easier to debug than
-/// a boot loop.
+/// Failure is not fatal: the sandbox still boots read-only, which is degraded
+/// but usable and much easier to debug than a boot loop.
 pub fn setup_writable_root() -> bool {
     // /dev must exist before the scratch device node is visible.
     mount_one("devtmpfs", "/dev", "devtmpfs", MsFlags::MS_NOSUID, None);
 
+    if !is_overlay_layout() {
+        return true;
+    }
     if !Path::new(SCRATCH_DEV).exists() {
         tracing::debug!("no scratch disk attached; root stays read-only");
         return false;
@@ -38,6 +45,16 @@ pub fn setup_writable_root() -> bool {
             false
         }
     }
+}
+
+/// Whether the host booted this guest on the overlay layout. Only then is a
+/// second disk the scratch disk: on the root layout it is a volume.
+fn is_overlay_layout() -> bool {
+    std::fs::read_to_string("/proc/cmdline").is_ok_and(|cmdline| {
+        cmdline
+            .split_whitespace()
+            .any(|arg| arg == "burrow.layout=overlay")
+    })
 }
 
 fn try_pivot_to_overlay() -> anyhow::Result<()> {
@@ -148,7 +165,7 @@ pub fn mount_essentials() -> anyhow::Result<()> {
 /// working IP connectivity and no working name resolution, which looks like a
 /// network failure to anything running inside it.
 ///
-/// Requires a writable root, so it runs after the overlay pivot.
+/// Requires a writable root, so it runs after any overlay pivot.
 pub fn write_resolv_conf() {
     let Ok(cmdline) = std::fs::read_to_string("/proc/cmdline") else {
         return;

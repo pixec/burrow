@@ -1,22 +1,23 @@
-//! Disk admission: whether a node has room to promise another sandbox a disk.
+//! Disk admission: whether a node has room to provision another sandbox a
+//! disk.
 //!
-//! Sandbox disks are sparse (and, warm, reflinked): a disk takes space only as
-//! the guest writes it. Nothing stopped a node promising more disk than it
-//! had, and when its filesystem filled every guest on it got write errors at
-//! once. The rule here is the one both sides apply, the node when it admits a
-//! create, resume or adopt and the orchestrator when it places one:
+//! Each sandbox is charged its whole disk at its provisioned size, and each
+//! volume its size, whatever blocks they share with an image, a snapshot or
+//! each other. Sharing is how disks are made cheaply, not a promise that they
+//! stay small: a guest that rewrites its disk unshares every block of it. The
+//! rule is the same on every node and is the one both sides apply, the node
+//! when it admits a create, fork, restore, resume or adopt and the
+//! orchestrator when it places one:
 //!
 //! ```text
-//! unwritten + request <= overcommit * (free - reserve)
+//! provisioned + request <= overcommit * (total - reserve)
 //! ```
 //!
-//! `free` is what the data directory's filesystem has free now, which already
-//! counts everything written so far by sandboxes, snapshots, templates and
-//! anything else. `unwritten` is what the node has promised and not yet
-//! seen written: each sandbox's disk size less what its disk file occupies.
-//! With `overcommit` 1.0, the default, every promised byte has a free byte
-//! behind it and the reserve is never crossed; above 1.0 an operator accepts
-//! that it might be.
+//! With `overcommit` 1.0, the default, every provisioned byte has a byte of
+//! the filesystem behind it. Above 1.0 an operator accepts that guests might
+//! fill it. Separately, and for every admission including a resume that asks
+//! for nothing new, a node whose free disk is already under its reserve
+//! refuses: its running guests' writes are what is at risk.
 
 /// Bytes in a MiB.
 pub const MIB: u64 = 1 << 20;
@@ -27,23 +28,33 @@ pub const DEFAULT_RESERVE_PERCENT: u64 = 5;
 /// A node's disk as admission sees it.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct DiskCapacity {
-    /// Free on the data directory's filesystem, to the node.
+    /// Free on the filesystem holding the sandboxes' disks, to the node.
     pub free_bytes: u64,
     /// The filesystem's size. Zero means not reported, and nothing is checked.
     pub total_bytes: u64,
-    /// What the node keeps free and promises to no sandbox.
+    /// What the node keeps free and provisions to no sandbox.
     pub reserve_bytes: u64,
-    /// Disk promised to sandboxes and not yet written.
-    pub unwritten_bytes: u64,
-    /// How far promises may exceed free space; at least 1.0 means never.
+    /// Every sandbox's disk and every volume, at their full sizes.
+    pub provisioned_bytes: u64,
+    /// How far provisioned disk may exceed the filesystem less its reserve;
+    /// 1.0 means never.
     pub overcommit: f64,
 }
 
-/// What a refused admission was short of: the free disk it would have needed
-/// beyond what the node has.
+/// Which limit a refused admission ran into.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Limit {
+    /// Free disk is already under the reserve.
+    Reserve,
+    /// The disks provisioned here would exceed what the node may provision.
+    Capacity,
+}
+
+/// What a refused admission was short of.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Shortfall {
     pub bytes: u64,
+    pub limit: Limit,
 }
 
 impl Shortfall {
@@ -81,52 +92,68 @@ impl DiskCapacity {
         self.is_reported() && self.free_bytes < self.reserve_bytes
     }
 
-    /// Admits a promise of `request_bytes` more disk, or says how much free
-    /// disk it is short of.
+    /// What the node may provision in all: the filesystem less its reserve,
+    /// times the overcommit.
+    pub fn capacity_bytes(&self) -> f64 {
+        self.total_bytes.saturating_sub(self.reserve_bytes) as f64
+            * effective_overcommit(self.overcommit)
+    }
+
+    /// Admits `request_bytes` more provisioned disk, or says what it is short
+    /// of. A request of nothing, a resume's, checks only the reserve.
     pub fn admit(&self, request_bytes: u64) -> Result<(), Shortfall> {
         if !self.is_reported() {
             return Ok(());
         }
-        let overcommit = effective_overcommit(self.overcommit);
-        let promised = self.unwritten_bytes.saturating_add(request_bytes) as f64;
-        // Free disk the promises need behind them, against what is free above
-        // the reserve. Signed: a node already under its reserve has less than
-        // nothing to offer.
-        let needed = promised / overcommit;
-        let available = self.free_bytes as f64 - self.reserve_bytes as f64;
-        if needed <= available {
+        if self.is_below_reserve() {
+            return Err(Shortfall {
+                bytes: self.reserve_bytes - self.free_bytes,
+                limit: Limit::Reserve,
+            });
+        }
+        if request_bytes == 0 {
+            return Ok(());
+        }
+        let wanted = self.provisioned_bytes.saturating_add(request_bytes) as f64;
+        let capacity = self.capacity_bytes();
+        if wanted <= capacity {
             return Ok(());
         }
         Err(Shortfall {
-            bytes: (needed - available).ceil().max(1.0) as u64,
+            bytes: (wanted - capacity).ceil().max(1.0) as u64,
+            limit: Limit::Capacity,
         })
     }
 
-    /// The fraction of what could be promised that is still unpromised, 0.0
-    /// to 1.0, for ranking nodes. 1.0 for a node that has not reported.
+    /// The fraction of what could be provisioned that is not yet, 0.0 to 1.0,
+    /// for ranking nodes. 1.0 for a node that has not reported.
     pub fn headroom(&self) -> f64 {
         if !self.is_reported() {
             return 1.0;
         }
-        let overcommit = effective_overcommit(self.overcommit);
-        let promisable = (self.free_bytes as f64 - self.reserve_bytes as f64) * overcommit;
-        let capacity = (self.total_bytes as f64 - self.reserve_bytes as f64) * overcommit;
-        if capacity <= 0.0 {
+        let capacity = self.capacity_bytes();
+        if capacity <= 0.0 || self.is_below_reserve() {
             return 0.0;
         }
-        ((promisable - self.unwritten_bytes as f64) / capacity).clamp(0.0, 1.0)
+        ((capacity - self.provisioned_bytes as f64) / capacity).clamp(0.0, 1.0)
     }
 }
 
 /// The refusal a node gives, and the orchestrator repeats, when a disk does
-/// not fit: which node, how much was asked, and how much free disk it lacked.
+/// not fit: which node, how much was asked, and what it ran into.
 pub fn refusal(node: &str, what: &str, request_bytes: u64, short: Shortfall) -> String {
-    format!(
-        "node {node} has no room to {what} with a {} MiB disk: short by {} MiB of free disk \
-         above its reserve",
-        request_bytes.div_ceil(MIB),
-        short.mib(),
-    )
+    match short.limit {
+        Limit::Reserve => format!(
+            "node {node} has no room to {what}: its free disk is {} MiB below its reserve",
+            short.mib()
+        ),
+        Limit::Capacity => format!(
+            "node {node} has no room to {what} with a {} MiB disk: it would provision {} MiB more \
+             disk than it may",
+            request_bytes.div_ceil(MIB),
+            short.mib(),
+        ),
+    }
 }
 
 #[cfg(test)]
@@ -135,41 +162,55 @@ mod tests {
 
     const GIB: u64 = 1024 * MIB;
 
-    fn node(free_gib: u64, unwritten_gib: u64, overcommit: f64) -> DiskCapacity {
+    fn node(free_gib: u64, provisioned_gib: u64, overcommit: f64) -> DiskCapacity {
         DiskCapacity {
             free_bytes: free_gib * GIB,
             total_bytes: 100 * GIB,
             reserve_bytes: 5 * GIB,
-            unwritten_bytes: unwritten_gib * GIB,
+            provisioned_bytes: provisioned_gib * GIB,
             overcommit,
         }
     }
 
     #[test]
-    fn a_disk_that_fits_above_the_reserve_is_admitted() {
-        // 50 free, 5 reserved, 20 promised: 25 left.
-        assert_eq!(node(50, 20, 1.0).admit(25 * GIB), Ok(()));
+    fn a_disk_within_capacity_is_admitted() {
+        // 95 may be provisioned, 70 is.
+        assert_eq!(node(50, 70, 1.0).admit(25 * GIB), Ok(()));
     }
 
+    /// Free space does not enter into it: reflinked disks share their blocks,
+    /// and each is charged at its size all the same.
     #[test]
-    fn a_disk_that_would_cross_the_reserve_is_refused_with_the_shortfall() {
-        let refused = node(50, 20, 1.0).admit(26 * GIB).unwrap_err();
+    fn a_disk_past_capacity_is_refused_however_much_is_free() {
+        let refused = node(90, 70, 1.0).admit(26 * GIB).unwrap_err();
+        assert_eq!(refused.limit, Limit::Capacity);
         assert_eq!(refused.mib(), 1024);
     }
 
     #[test]
-    fn overcommit_lets_promises_exceed_free_space_by_its_factor() {
-        // 45 above the reserve, twice over is 90, 20 of it promised.
-        assert_eq!(node(50, 20, 2.0).admit(70 * GIB), Ok(()));
-        let refused = node(50, 20, 2.0).admit(72 * GIB).unwrap_err();
+    fn overcommit_scales_what_may_be_provisioned() {
+        // 95 twice over is 190.
+        assert_eq!(node(50, 70, 2.0).admit(120 * GIB), Ok(()));
+        let refused = node(50, 70, 2.0).admit(121 * GIB).unwrap_err();
         assert_eq!(refused.mib(), 1024);
     }
 
     #[test]
-    fn a_node_already_under_its_reserve_refuses_even_a_resume() {
+    fn a_node_under_its_reserve_refuses_even_a_resume() {
         let low = node(4, 0, 1.0);
         assert!(low.is_below_reserve());
-        assert_eq!(low.admit(0).unwrap_err().mib(), 1024);
+        let refused = low.admit(0).unwrap_err();
+        assert_eq!(refused.limit, Limit::Reserve);
+        assert_eq!(refused.mib(), 1024);
+    }
+
+    /// A resume asks for nothing new, so a node that is fully provisioned,
+    /// and over it after an operator lowered the overcommit, still resumes
+    /// what it holds while its disk has room.
+    #[test]
+    fn a_resume_checks_only_the_reserve() {
+        assert_eq!(node(50, 200, 1.0).admit(0), Ok(()));
+        assert!(node(50, 200, 1.0).admit(MIB).is_err());
     }
 
     #[test]
@@ -178,7 +219,7 @@ mod tests {
             free_bytes: 0,
             total_bytes: 0,
             reserve_bytes: 0,
-            unwritten_bytes: 0,
+            provisioned_bytes: 0,
             overcommit: 0.0,
         };
         assert_eq!(unknown.admit(u64::MAX), Ok(()));
@@ -198,29 +239,34 @@ mod tests {
         assert_eq!(effective_overcommit(0.0), 1.0);
         assert_eq!(effective_overcommit(f64::NAN), 1.0);
         assert_eq!(effective_overcommit(1.5), 1.5);
-        // Reported as 0 by an older node: the same answer as 1.0.
         assert_eq!(
-            node(50, 20, 0.0).admit(26 * GIB),
-            node(50, 20, 1.0).admit(26 * GIB)
+            node(50, 70, 0.0).admit(26 * GIB),
+            node(50, 70, 1.0).admit(26 * GIB)
         );
     }
 
     #[test]
-    fn the_refusal_names_the_node_and_the_shortfall() {
-        let short = node(50, 20, 1.0).admit(26 * GIB).unwrap_err();
-        let message = refusal("node-a", "create a sandbox", 26 * GIB, short);
+    fn the_refusal_names_the_node_and_what_it_ran_into() {
+        let short = node(50, 70, 1.0).admit(26 * GIB).unwrap_err();
         assert_eq!(
-            message,
-            "node node-a has no room to create a sandbox with a 26624 MiB disk: short by 1024 MiB \
-             of free disk above its reserve"
+            refusal("node-a", "create a sandbox", 26 * GIB, short),
+            "node node-a has no room to create a sandbox with a 26624 MiB disk: it would \
+             provision 1024 MiB more disk than it may"
+        );
+        let low = node(4, 0, 1.0).admit(0).unwrap_err();
+        assert_eq!(
+            refusal("node-a", "resume a sandbox", 0, low),
+            "node node-a has no room to resume a sandbox: its free disk is 1024 MiB below its \
+             reserve"
         );
     }
 
     #[test]
-    fn headroom_falls_as_disk_is_promised() {
+    fn headroom_falls_as_disk_is_provisioned() {
         let empty = node(95, 0, 1.0);
         let half = node(95, 45, 1.0);
         assert!(empty.headroom() > half.headroom());
-        assert_eq!(node(5, 0, 1.0).headroom(), 0.0);
+        assert_eq!(node(95, 95, 1.0).headroom(), 0.0);
+        assert_eq!(node(4, 0, 1.0).headroom(), 0.0);
     }
 }

@@ -110,6 +110,15 @@ impl Cgroup {
         Ok(())
     }
 
+    /// Moves the CPU cap, for a guest given vCPUs or relieved of them.
+    pub fn set_cpus(&self, cpus: u32) -> Result<()> {
+        let quota = CPU_PERIOD_US * u64::from(cpus);
+        write(
+            &self.path.join("cpu.max"),
+            &format!("{quota} {CPU_PERIOD_US}"),
+        )
+    }
+
     pub fn path(&self) -> &Path {
         &self.path
     }

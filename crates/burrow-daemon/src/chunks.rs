@@ -276,6 +276,163 @@ pub async fn put_image(
     Ok(index)
 }
 
+/// Uploads a root disk as a chunk index. Chunks the disk still shares with
+/// `image`, by the device blocks under them, take the image's digests without
+/// being read; only the rest are read, hashed and, where the store lacks them,
+/// put. The image's own chunks are in the store already
+/// ([`crate::rootdisk::upload_image`]).
+pub async fn put_disk(
+    store: &ObjectStore,
+    path: &Path,
+    image: Option<&crate::rootdisk::Image>,
+    known: &HashSet<String>,
+) -> Result<ImageIndex, Status> {
+    let io = |err: std::io::Error| Status::internal(format!("reading a disk to upload: {err}"));
+    let (layer, size, unchanged) = {
+        let path = path.to_path_buf();
+        let image_path = image.map(|image| image.path.clone());
+        tokio::task::spawn_blocking(move || {
+            let file = std::fs::File::open(&path)?;
+            let size = file.metadata()?.len();
+            let unchanged = match image_path {
+                Some(image) => {
+                    crate::rootdisk::unchanged_chunks(&file, &std::fs::File::open(image)?)
+                }
+                None => None,
+            };
+            let extents = crate::rootdisk::data_extents(&file)?;
+            Ok::<_, std::io::Error>((OpenLayer { file, extents }, size, unchanged))
+        })
+        .await
+        .map_err(|err| Status::internal(format!("opening a disk: {err}")))?
+        .map_err(io)?
+    };
+    let mut index = ImageIndex {
+        size,
+        chunk_size: CHUNK_SIZE,
+        chunks: BTreeMap::new(),
+    };
+    let mut known = known.clone();
+    let unchanged = unchanged.unwrap_or_default();
+    if let Some(image) = image {
+        known.extend(image.index.digests().map(str::to_string));
+        for n in &unchanged {
+            if let Some(digest) = image.index.chunks.get(n) {
+                index.chunks.insert(*n, digest.clone());
+            }
+        }
+    }
+    let candidates: std::collections::BTreeSet<u64> = layer
+        .chunks(CHUNK_SIZE)
+        .filter(|n| !unchanged.contains(n))
+        .collect();
+    let layers = Arc::new(vec![layer]);
+    let known = Arc::new(known);
+    let read = candidates.len();
+    let mut sent = 0usize;
+    let mut results = futures::stream::iter(candidates)
+        .map(|n| {
+            let layers = Arc::clone(&layers);
+            let known = Arc::clone(&known);
+            let store = store.clone();
+            let start = n * CHUNK_SIZE;
+            let end = (start + CHUNK_SIZE).min(size);
+            async move {
+                let bytes = tokio::task::spawn_blocking(move || read_merged(&layers, start, end))
+                    .await
+                    .map_err(|err| Status::internal(format!("reading a chunk: {err}")))?
+                    .map_err(io)?;
+                if bytes.iter().all(|&b| b == 0) {
+                    return Ok::<_, Status>((n, None, false));
+                }
+                let digest = digest_of(&bytes);
+                if known.contains(&digest) {
+                    return Ok((n, Some(digest), false));
+                }
+                store.put_bytes(&chunk_key(&digest), bytes).await?;
+                Ok((n, Some(digest), true))
+            }
+        })
+        .buffer_unordered(PARALLELISM);
+    while let Some(result) = results.next().await {
+        let (n, digest, put) = result?;
+        sent += put as usize;
+        if let Some(digest) = digest {
+            index.chunks.insert(n, digest);
+        }
+    }
+    tracing::info!(
+        disk = %path.display(),
+        chunks = index.chunks.len(),
+        shared = unchanged.len(),
+        read,
+        sent,
+        "disk uploaded"
+    );
+    Ok(index)
+}
+
+/// Writes the chunks a disk differs from its image by into `path`, a clone of
+/// that image: `Some` digests are fetched and written whole, `None` are
+/// zeroed. Returns the bytes fetched.
+pub async fn patch(
+    store: &ObjectStore,
+    path: &Path,
+    size: u64,
+    chunk_size: u64,
+    differing: HashMap<u64, Option<String>>,
+) -> Result<u64, Status> {
+    let file = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(path)
+        .and_then(|file| file.set_len(size).map(|()| file))
+        .map_err(|err| Status::internal(format!("opening {}: {err}", path.display())))?;
+    let file = Arc::new(file);
+    let fetched = std::sync::atomic::AtomicU64::new(0);
+    let count = differing.len();
+    let mut results = futures::stream::iter(differing)
+        .map(|(n, digest)| {
+            let file = Arc::clone(&file);
+            let store = store.clone();
+            let fetched = &fetched;
+            let start = n * chunk_size;
+            let end = (start + chunk_size).min(size);
+            async move {
+                if start >= size {
+                    return Ok(());
+                }
+                let bytes = match digest {
+                    Some(digest) => {
+                        let bytes = fetch_chunk(&store, &digest).await?;
+                        fetched.fetch_add(bytes.len() as u64, std::sync::atomic::Ordering::Relaxed);
+                        bytes
+                    }
+                    None => vec![0u8; (end - start) as usize],
+                };
+                tokio::task::spawn_blocking(move || file.write_all_at(&bytes, start))
+                    .await
+                    .map_err(|err| Status::internal(format!("writing a chunk: {err}")))?
+                    .map_err(|err| Status::internal(format!("writing a chunk: {err}")))
+            }
+        })
+        .buffer_unordered(PARALLELISM);
+    while let Some(result) = results.next().await {
+        result?;
+    }
+    drop(results);
+    file.sync_all()
+        .map_err(|err| Status::internal(format!("flushing {}: {err}", path.display())))?;
+    let fetched = fetched.into_inner();
+    tracing::info!(
+        disk = %path.display(),
+        chunks = count,
+        fetched_bytes = fetched,
+        "disk rebuilt from its image and the chunks that differ"
+    );
+    Ok(fetched)
+}
+
 /// Fetches one chunk and checks it is what its digest says.
 async fn fetch_chunk(store: &ObjectStore, digest: &str) -> Result<Vec<u8>, Status> {
     let mut delay = std::time::Duration::from_millis(100);

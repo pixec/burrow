@@ -16,12 +16,11 @@ use burrow_proto::guest::v1::guest_client::GuestClient;
 use burrow_vmm::{DriveSpec, GuestAddr, Hypervisor, HypervisorExt, Layout, NetSpec, Vm, VmSpec};
 
 use crate::guestconn;
+use crate::rootdisk::{DiskLayout, IMAGE as TEMPLATE_ROOTFS};
+use burrow_proto::api::v1::{ResourceChange, ResourceOutcome};
 
 /// Conventional filenames inside a template directory.
 const TEMPLATE_KERNEL: &str = "vmlinux";
-const TEMPLATE_ROOTFS: &str = "rootfs.ext4";
-/// Per-sandbox writable disk, union-mounted over the rootfs by the agent.
-const SCRATCH_IMAGE: &str = "scratch.ext4";
 
 /// A volume's image, hard-linked into the sandbox's working directory.
 ///
@@ -62,6 +61,7 @@ async fn flush_guest(sandbox: &RunningSandbox) {
     .await;
 }
 
+/// An overlay sandbox's scratch disk when its policy named none.
 const DEFAULT_SCRATCH_MIB: u32 = 1024;
 
 /// Range the node draws from when a caller does not request a specific host
@@ -209,6 +209,16 @@ impl NodeConfig {
         tokio::fs::remove_dir_all(tree).await
     }
 
+    /// The directory whose filesystem holds sandboxes' disks, which is the
+    /// one disk admission measures: the jail's base when there is a jail, the
+    /// data directory otherwise.
+    pub(crate) fn disk_dir(&self) -> PathBuf {
+        match &self.jail {
+            Some(jail) if jail.chroot_base.exists() => jail.chroot_base.clone(),
+            _ => self.data_dir.clone(),
+        }
+    }
+
     /// Where a sandbox's command output is kept: beside its directory rather
     /// than in it, since under the jailer that is the VMM's own root.
     fn command_logs_dir(&self, id: &str) -> PathBuf {
@@ -341,8 +351,63 @@ const REASON_LOST: &str = "the node stopped without suspending its VM, so its me
 const DEFAULT_MEM_MIB: u32 = 512;
 
 /// The file a sandbox's writable disk is, which is all a stopped sandbox is.
-fn disk_file(guest_os: burrow_vmm::GuestOs) -> &'static str {
-    crate::macnode::disk_file(guest_os).unwrap_or(SCRATCH_IMAGE)
+fn disk_file(guest_os: burrow_vmm::GuestOs, layout: DiskLayout) -> &'static str {
+    crate::macnode::disk_file(guest_os).unwrap_or(layout.disk())
+}
+
+/// A disk's size in MiB, as a record states it.
+fn size_mib(path: &Path) -> u32 {
+    std::fs::metadata(path).map_or(0, |meta| {
+        u32::try_from(meta.len().div_ceil(burrow_common::disk::MIB)).unwrap_or(u32::MAX)
+    })
+}
+
+/// The clocks an `UpdateLifetime` moves; `None` leaves one as it is.
+#[derive(Default)]
+pub struct Lifetimes {
+    pub max_lifetime_secs: Option<u64>,
+    pub idle_suspend_secs: Option<u64>,
+    pub suspended_ttl_secs: Option<u64>,
+    pub snapshot_expiration_secs: Option<u64>,
+    pub snapshot_keep_last: Option<u32>,
+    pub is_evicted_snapshot_kept: Option<bool>,
+}
+
+/// What became of each field of a resources update, `None` for a field not
+/// asked for.
+#[derive(Default)]
+pub struct ResourcesUpdated {
+    pub vcpus: Option<ResourceOutcome>,
+    pub mem_mib: Option<ResourceOutcome>,
+    pub disk_mib: Option<ResourceOutcome>,
+    /// The root filesystem's size as the guest reported it after a disk
+    /// change, or 0 when no guest has seen the disk yet.
+    pub filesystem_bytes: u64,
+}
+
+fn outcome(change: ResourceChange, previous: u32, value: u32) -> ResourceOutcome {
+    ResourceOutcome {
+        change: change as i32,
+        previous,
+        value,
+        reason: String::new(),
+    }
+}
+
+/// A field that could not be applied, reported rather than failing the call:
+/// what the sandbox's state or hypervisor rules out, or what the node has no
+/// room for. Anything else is an error.
+#[allow(clippy::result_large_err)]
+fn refused(err: Status, previous: u32) -> Result<ResourceOutcome, Status> {
+    match err.code() {
+        tonic::Code::FailedPrecondition | tonic::Code::ResourceExhausted => Ok(ResourceOutcome {
+            change: ResourceChange::Refused as i32,
+            previous,
+            value: previous,
+            reason: err.message().to_string(),
+        }),
+        _ => Err(err),
+    }
 }
 
 /// `record` with its totals replaced by `usage`, if given.
@@ -839,9 +904,15 @@ impl RunningSandbox {
             .unwrap_or_default()
     }
 
-    /// The overlay scratch disk backing this sandbox's writable filesystem.
-    pub fn scratch_path(&self) -> PathBuf {
-        self.workdir.join(SCRATCH_IMAGE)
+    /// How this sandbox's filesystem sits on its disks.
+    pub fn disk_layout(&self) -> DiskLayout {
+        DiskLayout::from_proto(self.base_record.lock().unwrap().disk_layout)
+    }
+
+    /// The disk this sandbox's guest writes: its root disk, or on the
+    /// overlay layout its scratch disk.
+    pub fn disk_path(&self) -> PathBuf {
+        self.workdir.join(self.disk_layout().disk())
     }
 
     /// The template this sandbox was created from.
@@ -857,28 +928,26 @@ impl RunningSandbox {
     /// the state, the memory file it just wrote, and every disk the guest can
     /// write. In that order, which is the order they are synced in.
     fn snapshot_files(&self, memory: Option<&str>) -> Vec<String> {
-        let drives: Vec<String> = self
-            .spec
-            .lock()
-            .unwrap()
+        let spec = self.spec.lock().unwrap();
+        let drives: Vec<String> = spec
             .drives
             .iter()
             .filter(|drive| !drive.is_read_only)
             .map(|drive| drive.path.clone())
+            .chain(aux_storage(&spec.boot))
             .collect();
         suspend_sync_order(self.layout(), memory, drives)
     }
 
-    /// The disk files this sandbox's guest writes, volumes aside: what it
-    /// was promised and can still grow into. A volume is the volume's, and
-    /// counted by nothing here.
+    /// The disk files this sandbox's guest writes, volumes aside, which
+    /// admission charges at their size. A volume is counted as the volume.
     fn disk_files(&self) -> Vec<PathBuf> {
         self.spec
             .lock()
             .unwrap()
             .drives
             .iter()
-            .filter(|drive| !drive.is_read_only && !drive.id.starts_with("volume"))
+            .filter(|drive| !drive.is_read_only && !crate::volume::is_volume_drive(&drive.id))
             .map(|drive| self.workdir.join(&drive.path))
             .collect()
     }
@@ -917,16 +986,6 @@ impl RunningSandbox {
             - self
                 .last_activity
                 .load(std::sync::atomic::Ordering::Relaxed)
-    }
-
-    fn resources(&self) -> common::ResourcePolicy {
-        self.base_record
-            .lock()
-            .unwrap()
-            .policy
-            .as_ref()
-            .and_then(|policy| policy.resources)
-            .unwrap_or_default()
     }
 
     fn lifetime(&self) -> common::LifetimePolicy {
@@ -1383,6 +1442,8 @@ impl RunningSandbox {
     }
 
     /// Cold-boots a stopped sandbox on its existing disks and handshakes.
+    /// `hotplugged` are volumes attached once the agent is up rather than at
+    /// boot, as a create on a root disk attaches them.
     #[tracing::instrument(skip_all, fields(sandbox = %self.id()))]
     async fn boot(
         &self,
@@ -1390,6 +1451,7 @@ impl RunningSandbox {
         request: burrow_proto::guest::v1::HandshakeRequest,
         agent_timeout: std::time::Duration,
         upgrade: Option<&guestconn::GuestUpgrade>,
+        hotplugged: &[common::VolumeMount],
     ) -> Result<(), Status> {
         self.forget_agent().await;
         let mut slot = self.vm.lock().await;
@@ -1421,6 +1483,10 @@ impl RunningSandbox {
                 )));
             }
         };
+        if let Err(err) = attach_volumes(&vm, hotplugged, spec.guest_os).await {
+            let _ = vm.kill().await;
+            return Err(err);
+        }
         if let Err(err) =
             guestconn::handshake_upgrading(agent, vm.guest(), request, upgrade, agent_timeout).await
         {
@@ -1452,8 +1518,12 @@ impl RunningSandbox {
     /// wrote nothing and the guest goes back to running; a resume that fails
     /// after a snapshot that succeeded leaves a sandbox that *is* its snapshot,
     /// so it is suspended cleanly and `resume` brings it back.
+    ///
+    /// `capture`, when given, is where the guest's disk is cloned to while it
+    /// is paused, so the disk a fork or a snapshot takes is the one the memory
+    /// just written describes rather than one the guest has written to since.
     #[tracing::instrument(skip_all, fields(sandbox = %self.id(), diff))]
-    async fn checkpoint(&self) -> Result<(), Status> {
+    async fn checkpoint(&self, capture: Option<&Path>) -> Result<(), Status> {
         // As in a suspend: a fork restores whatever the snapshot caught.
         self.await_handshake().await?;
         let mut slot = self.vm.lock().await;
@@ -1482,6 +1552,12 @@ impl RunningSandbox {
             // Nothing usable was written; the VM is only paused.
             let _ = vm.resume().await;
             return Err(Status::internal(format!("snapshot failed: {err}")));
+        }
+        if let Some(capture) = capture
+            && let Err(err) = crate::rootdisk::clone(&self.disk_path(), capture).await
+        {
+            let _ = vm.resume().await;
+            return Err(Status::internal(format!("capturing the disk: {err}")));
         }
         // While the guest is still paused, so the mark holds no output the
         // snapshot does not.
@@ -1528,7 +1604,9 @@ impl RunningSandbox {
     }
 
     /// Copies everything a fork needs into `dest`, and the command logs into
-    /// `logs`, returning the child's memory chain.
+    /// `logs`, returning the child's memory chain. `capture` is the disk a
+    /// checkpoint cloned while the guest was paused, moved in as the child's;
+    /// without one the source is not running and its disk is cloned as is.
     ///
     /// The VM slot is held throughout, so a suspend, resume or checkpoint
     /// cannot add a layer to the chain half way through copying it.
@@ -1537,7 +1615,12 @@ impl RunningSandbox {
     /// already reads a chain, being how every suspended sandbox comes back, and
     /// flattening here would put an extra full-image rewrite on the fork's
     /// critical path for a cost the child pays lazily anyway.
-    async fn stage_fork(&self, dest: &Path, logs: &Path) -> Result<Vec<String>, Status> {
+    async fn stage_fork(
+        &self,
+        dest: &Path,
+        logs: &Path,
+        capture: Option<&Path>,
+    ) -> Result<Vec<String>, Status> {
         self.durable.settle_memory().await;
         let _slot = self.vm.lock().await;
         let chain = self.memory_chain.lock().await.clone();
@@ -1573,11 +1656,24 @@ impl RunningSandbox {
                 .await
                 .map_err(|err| io(file, err))?;
         }
-        // The one file both sides write: a copy, reflinked where the
-        // filesystem supports it, which makes it tags-only.
-        crate::warm::copy_sparse(&self.workdir.join(SCRATCH_IMAGE), &dest.join(SCRATCH_IMAGE))
-            .await
-            .map_err(|err| io(SCRATCH_IMAGE, err))?;
+        // The one file both sides write: a clone, which shares its blocks
+        // where the filesystem can.
+        let disk = self.disk_layout().disk();
+        match capture {
+            Some(capture) => {
+                if tokio::fs::rename(capture, dest.join(disk)).await.is_err() {
+                    crate::rootdisk::clone(capture, &dest.join(disk))
+                        .await
+                        .map_err(|err| io(disk, err))?;
+                    let _ = tokio::fs::remove_file(capture).await;
+                }
+            }
+            None => {
+                crate::rootdisk::clone(&self.workdir.join(disk), &dest.join(disk))
+                    .await
+                    .map_err(|err| io(disk, err))?;
+            }
+        }
         // The child's guest holds the same command table, so it needs the
         // output too: without it, a command that finished before the fork
         // replays nothing.
@@ -1595,26 +1691,27 @@ impl RunningSandbox {
     /// Firecracker restores a machine configuration from the snapshot rather
     /// than from what a later caller asks for, and a snapshot that outlives its
     /// sandbox has nothing else left to read it from.
-    async fn stage_snapshot(&self, dest: &Path) -> Result<crate::snapshot::Staged, Status> {
+    async fn stage_snapshot(
+        &self,
+        dest: &Path,
+        capture: Option<&Path>,
+    ) -> Result<crate::snapshot::Staged, Status> {
         let chain = self
-            .stage_fork(dest, &dest.join(crate::snapshot::COMMAND_LOGS))
+            .stage_fork(dest, &dest.join(crate::snapshot::COMMAND_LOGS), capture)
             .await?;
-        let resources = self.resources();
         let (vcpus, mem_mib) = {
             let spec = self.spec.lock().unwrap();
             (spec.vcpus, spec.mem_mib)
         };
+        let layout = self.disk_layout();
         Ok(crate::snapshot::Staged {
             sandbox_id: self.id.clone(),
             template: self.template.clone(),
             hypervisor: self.hypervisor,
             vcpus,
             mem_mib,
-            scratch_disk_mib: if resources.scratch_disk_mib == 0 {
-                DEFAULT_SCRATCH_MIB
-            } else {
-                resources.scratch_disk_mib
-            },
+            disk_mib: size_mib(&dest.join(layout.disk())),
+            disk_layout: layout,
             chain,
             inspection_root: self
                 .base_record
@@ -1642,11 +1739,14 @@ struct InspectionRoot {
 }
 
 enum RestoreSource<'a> {
-    Sandbox(&'a Arc<RunningSandbox>),
+    /// A live sandbox, and the disk a checkpoint captured of it if it runs.
+    Sandbox(&'a Arc<RunningSandbox>, Option<PathBuf>),
     Snapshot {
         id: &'a str,
         template: String,
         hypervisor: Hypervisor,
+        disk_layout: DiskLayout,
+        disk_mib: u32,
     },
     /// A sandbox's own state in the object store, being adopted here.
     Stored {
@@ -1665,7 +1765,12 @@ impl RestoreSource<'_> {
         logs_dir: &Path,
     ) -> Result<(Vec<String>, Option<Arc<crate::chunks::Hydrator>>), Status> {
         match self {
-            Self::Sandbox(source) => Ok((source.stage_fork(dest, logs_dir).await?, None)),
+            Self::Sandbox(source, capture) => Ok((
+                source
+                    .stage_fork(dest, logs_dir, capture.as_deref())
+                    .await?,
+                None,
+            )),
             Self::Snapshot { id, .. } => snapshots.stage_into(id, dest, logs_dir).await,
             Self::Stored { store, manifest } => {
                 crate::durable::stage(store, snapshots, manifest, dest, logs_dir).await
@@ -1675,7 +1780,7 @@ impl RestoreSource<'_> {
 
     fn template(&self) -> String {
         match self {
-            Self::Sandbox(source) => source.template().to_string(),
+            Self::Sandbox(source, _) => source.template().to_string(),
             Self::Snapshot { template, .. } => template.clone(),
             Self::Stored { manifest, .. } => manifest.template.clone(),
         }
@@ -1686,9 +1791,28 @@ impl RestoreSource<'_> {
     #[allow(clippy::result_large_err)]
     fn hypervisor(&self) -> Result<Hypervisor, Status> {
         match self {
-            Self::Sandbox(source) => Ok(source.hypervisor),
+            Self::Sandbox(source, _) => Ok(source.hypervisor),
             Self::Snapshot { hypervisor, .. } => Ok(*hypervisor),
             Self::Stored { manifest, .. } => manifest.hypervisor(),
+        }
+    }
+
+    /// The disk layout the state was written on, which the restored guest
+    /// keeps: its memory holds the mounts of that layout.
+    fn disk_layout(&self) -> DiskLayout {
+        match self {
+            Self::Sandbox(source, _) => source.disk_layout(),
+            Self::Snapshot { disk_layout, .. } => *disk_layout,
+            Self::Stored { manifest, .. } => DiskLayout::from_record(&manifest.disk_layout),
+        }
+    }
+
+    /// The size of the disk the restored sandbox gets, in MiB.
+    fn disk_mib(&self) -> u32 {
+        match self {
+            Self::Sandbox(source, _) => size_mib(&source.disk_path()),
+            Self::Snapshot { disk_mib, .. } => *disk_mib,
+            Self::Stored { manifest, .. } => manifest.disk_mib,
         }
     }
 }
@@ -1716,6 +1840,9 @@ pub struct SandboxManager {
     /// Disk promised to creates still building, and the lock that makes
     /// measuring and promising one step.
     disk_admissions: Arc<crate::diskcap::Admissions>,
+    /// Root disks made ahead of creates, where the filesystem cannot clone.
+    spares: crate::rootdisk::Spares,
+    resizer: Arc<crate::resizer::Resizer>,
     /// Ids claimed by a create that has not finished provisioning. Held so a
     /// duplicate create is refused during the seconds a VM takes to build,
     /// rather than only before and after.
@@ -1937,15 +2064,16 @@ impl WarmShapes {
 ///
 /// All of these are fixed when the VM is built and cannot be changed on a
 /// running guest, so a create only restores from a snapshot that agrees on
-/// every one of them. The scratch disk is included because it is formatted at
-/// build time: a caller asking for a larger one must not silently get the
-/// size the snapshot was taken with.
+/// every one of them. The disk is included because the snapshot's guest has
+/// its filesystem grown to it: a caller asking for a larger one must not
+/// silently get the size the snapshot was taken with. 0 is the template's
+/// default, which the build resolves.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 struct ShapeKey {
     template: String,
     vcpus: u32,
     mem_mib: u32,
-    scratch_disk_mib: u32,
+    disk_mib: u32,
 }
 
 impl ShapeKey {
@@ -1964,11 +2092,7 @@ impl ShapeKey {
             } else {
                 resources.mem_mib
             },
-            scratch_disk_mib: if resources.scratch_disk_mib == 0 {
-                DEFAULT_SCRATCH_MIB
-            } else {
-                resources.scratch_disk_mib
-            },
+            disk_mib: resources.disk_mib,
         }
     }
 }
@@ -2006,6 +2130,8 @@ impl SandboxManager {
                 config.share.clone(),
                 &config.data_dir,
             )),
+            spares: crate::rootdisk::Spares::new(config.data_dir.join("spares")),
+            resizer: Default::default(),
             config,
             sandboxes: Arc::new(Mutex::new(HashMap::new())),
             disk_admissions: Default::default(),
@@ -2556,6 +2682,13 @@ impl SandboxManager {
 
         self.collect_orphan_workdirs().await;
         tracing::info!(restored, held, discarded, "sandbox recovery complete");
+        if self.config.object_store.is_some() {
+            let (blobs, templates) = (
+                crate::blobs::BlobStore::new(&self.config.data_dir),
+                self.config.templates_dir(),
+            );
+            tokio::spawn(async move { crate::rootdisk::index_templates(&blobs, &templates).await });
+        }
         if let Err(err) = self.sync_firewall().await {
             tracing::error!(%err, "recovered sandboxes have no firewall rules");
         }
@@ -2607,7 +2740,8 @@ impl SandboxManager {
         let is_resumable =
             row.state == common::SandboxState::Suspended as i32 && exists(layout.state).await;
 
-        if !exists(disk_file(guest_os)).await {
+        let disk_layout = DiskLayout::from_proto(stored.disk_layout);
+        if !exists(disk_file(guest_os, disk_layout)).await {
             tracing::warn!(
                 sandbox = row.id,
                 "nothing of the sandbox is left on disk; recording it destroyed"
@@ -2690,8 +2824,16 @@ impl SandboxManager {
         };
         let is_systemd = self.image_environment(&record.template).await.systemd;
         let spec = self.build_spec(
-            &row.id, &workdir, hypervisor, guest_os, &resources, &lease, &row.tap, &volumes,
+            &row.id,
+            &workdir,
+            hypervisor,
+            guest_os,
+            &resources,
+            &lease,
+            &row.tap,
+            &volumes,
             is_systemd,
+            disk_layout,
         );
 
         let sandbox = Arc::new(RunningSandbox {
@@ -4018,37 +4160,419 @@ impl SandboxManager {
     ///
     /// Only the record changes. Nothing has to be told: the reaper reads the
     /// policy off the sandbox on every pass, so a lifetime extended here is in
-    /// force at the next tick without a timer to cancel or reschedule.
-    ///
-    /// The machine shape deliberately has no path in, a running VM's
-    /// configuration being fixed and a restore taking it from the snapshot, so
-    /// a caller who asks for one is told rather than quietly given the old
-    /// shape back. See [`crate::nodeapi`] for where that is refused.
+    /// force at the next tick without a timer to cancel or reschedule; the
+    /// snapshot retention is read when a snapshot is taken. `check` holds the
+    /// result to what a create's policy is held to before it is kept.
     pub async fn update_lifetime(
         &self,
         sandbox_id: &str,
-        max_lifetime_secs: Option<u64>,
-        idle_suspend_secs: Option<u64>,
-        suspended_ttl_secs: Option<u64>,
+        lifetimes: Lifetimes,
+        check: impl FnOnce(&common::SnapshotPolicy) -> Result<(), Status>,
     ) -> Result<common::Sandbox, Status> {
         let sandbox = self.get(sandbox_id).await?;
         {
             let mut record = sandbox.base_record.lock().unwrap();
             let policy = record.policy.get_or_insert_with(Default::default);
+            let mut snapshots = policy.snapshots.unwrap_or_default();
+            if let Some(secs) = lifetimes.snapshot_expiration_secs {
+                snapshots.expiration_secs = secs;
+            }
+            if let Some(n) = lifetimes.snapshot_keep_last {
+                snapshots.keep_last = n;
+            }
+            if let Some(kept) = lifetimes.is_evicted_snapshot_kept {
+                snapshots.is_evicted_kept = kept;
+            }
+            check(&snapshots)?;
+            policy.snapshots = Some(snapshots);
             let lifetime = policy.lifetime.get_or_insert_with(Default::default);
-            if let Some(secs) = max_lifetime_secs {
+            if let Some(secs) = lifetimes.max_lifetime_secs {
                 lifetime.max_lifetime_secs = secs;
             }
-            if let Some(secs) = idle_suspend_secs {
+            if let Some(secs) = lifetimes.idle_suspend_secs {
                 lifetime.idle_suspend_secs = secs;
             }
-            if let Some(secs) = suspended_ttl_secs {
+            if let Some(secs) = lifetimes.suspended_ttl_secs {
                 lifetime.suspended_ttl_secs = secs;
             }
         }
         self.persist(&sandbox).await;
         tracing::info!(sandbox = sandbox_id, "lifetime policy updated");
         Ok(sandbox.record())
+    }
+
+    /// Changes a sandbox's vCPUs, memory and root disk, each as far as its
+    /// state and hypervisor allow, and says per field what was done. The disk
+    /// goes first: a shrink is the one change that can be refused for what
+    /// the guest wrote.
+    pub async fn update_machine(
+        &self,
+        id: &str,
+        vcpus: Option<u32>,
+        mem_mib: Option<u32>,
+        disk_mib: Option<u32>,
+    ) -> Result<(common::Sandbox, ResourcesUpdated), Status> {
+        let sandbox = self.get(id).await?;
+        let mut updated = ResourcesUpdated::default();
+        if let Some(mib) = disk_mib {
+            let current = size_mib(&sandbox.disk_path());
+            updated.disk_mib = Some(match self.resize_disk(&sandbox, mib).await {
+                Ok((change, filesystem_bytes)) => {
+                    updated.filesystem_bytes = filesystem_bytes;
+                    outcome(change, current, mib)
+                }
+                Err(err) => refused(err, current)?,
+            });
+        }
+        if vcpus.is_some() || mem_mib.is_some() {
+            let (vcpus, mem_mib) = self.reshape(&sandbox, vcpus, mem_mib).await?;
+            updated.vcpus = vcpus;
+            updated.mem_mib = mem_mib;
+        }
+        Ok((sandbox.record(), updated))
+    }
+
+    /// Resizes a sandbox's root disk to `mib`, returning what was done and
+    /// the filesystem's size where a guest reported it.
+    ///
+    /// Growing: under a hypervisor that can announce it, a running guest is
+    /// told at once and grows its filesystem online; a stopped sandbox's disk
+    /// grows on the host, and its guest fills it on its next boot. Shrinking:
+    /// only a stopped sandbox, through a helper VM ([`crate::resizer`]). A
+    /// suspended guest holds its disk's size in memory, so its disk is not
+    /// touched either way.
+    async fn resize_disk(
+        &self,
+        sandbox: &Arc<RunningSandbox>,
+        mib: u32,
+    ) -> Result<(ResourceChange, u64), Status> {
+        let id = sandbox.id();
+        let record = sandbox.record();
+        match burrow_vmm::GuestOs::from_record(&record.guest_os).unwrap_or_default() {
+            burrow_vmm::GuestOs::Linux => {}
+            burrow_vmm::GuestOs::Windows => {
+                return Err(Status::failed_precondition(
+                    "a Windows guest's disk is not resized: its agent does not grow or shrink \
+                     NTFS from inside",
+                ));
+            }
+            burrow_vmm::GuestOs::MacOs => {
+                return Err(Status::failed_precondition(
+                    "a macOS guest's disk is not resized: its recovery container sits after the \
+                     system container at the end of the disk, so APFS cannot grow into space \
+                     added there, and APFS is not shrunk from outside",
+                ));
+            }
+        }
+        if sandbox.disk_layout() != DiskLayout::Root {
+            return Err(Status::failed_precondition(format!(
+                "sandbox {id} predates root disks: its writable disk is a scratch disk under an \
+                 overlay, which is not resized"
+            )));
+        }
+        let current = size_mib(&sandbox.disk_path());
+        if mib == current {
+            return Ok((ResourceChange::Unchanged, 0));
+        }
+        let slot = sandbox.vm.lock().await;
+        let is_stopped = slot.is_none()
+            && sandbox.state.load(std::sync::atomic::Ordering::Relaxed)
+                == common::SandboxState::Stopped as i32;
+        if slot.is_none() && !is_stopped {
+            return Err(Status::failed_precondition(format!(
+                "sandbox {id} is suspended, and its guest holds its disk's size in memory; \
+                 resume it or shut it down first"
+            )));
+        }
+        let uploading = match is_stopped {
+            true => Some(sandbox.durable.stop_uploading().await),
+            false => None,
+        };
+        let applied = self
+            .apply_resize(sandbox, slot, current, mib, &record.node_id)
+            .await;
+        if let Some(uploading) = uploading {
+            if applied.is_ok() {
+                sandbox.durable.invalidate();
+            }
+            drop(uploading);
+            self.spawn_upload(sandbox);
+        }
+        let (change, filesystem_bytes) = applied?;
+        tracing::info!(
+            sandbox = id,
+            from_mib = current,
+            disk_mib = mib,
+            change = change.as_str_name(),
+            filesystem_mib = filesystem_bytes / burrow_common::disk::MIB,
+            "resized a sandbox's disk"
+        );
+        Ok((change, filesystem_bytes))
+    }
+
+    /// The resize itself, on a sandbox that is running or stopped, with its
+    /// VM slot held so it cannot start or stop underneath. Records the new
+    /// size once the disk has it.
+    async fn apply_resize(
+        &self,
+        sandbox: &Arc<RunningSandbox>,
+        slot: tokio::sync::MutexGuard<'_, Option<Vm>>,
+        current: u32,
+        mib: u32,
+        node_id: &str,
+    ) -> Result<(ResourceChange, u64), Status> {
+        let id = sandbox.id();
+        let path = sandbox.disk_path();
+        let bytes = u64::from(mib) * burrow_common::disk::MIB;
+        let applied = if mib > current {
+            let _grown = self
+                .admit_disk(
+                    node_id,
+                    "grow a disk",
+                    u64::from(mib - current) * burrow_common::disk::MIB,
+                )
+                .await?;
+            match slot.as_ref() {
+                Some(vm) => {
+                    if !sandbox
+                        .hypervisor
+                        .capabilities()
+                        .is_live_disk_growth_supported
+                    {
+                        return Err(Status::failed_precondition(format!(
+                            "{} grows a disk only while its sandbox is shut down; shut {id} \
+                             down, resize it, and boot it",
+                            sandbox.hypervisor
+                        )));
+                    }
+                    crate::rootdisk::grow(&path, mib).await?;
+                    vm.resize_disk("rootfs", bytes)
+                        .await
+                        .map_err(|err| Status::internal(format!("resizing the disk: {err}")))?;
+                    drop(slot);
+                    let grown = sandbox
+                        .agent()
+                        .await?
+                        .root_disk(burrow_proto::guest::v1::RootDiskRequest {
+                            op: burrow_proto::guest::v1::root_disk_request::Op::Grow as i32,
+                            size_bytes: bytes,
+                        })
+                        .await?
+                        .into_inner();
+                    (ResourceChange::Live, grown.size_bytes)
+                }
+                None => {
+                    crate::rootdisk::grow(&path, mib).await?;
+                    (ResourceChange::Offline, 0)
+                }
+            }
+        } else {
+            if slot.is_some() {
+                return Err(Status::failed_precondition(format!(
+                    "sandbox {id} is running, and its filesystem shrinks only unmounted; shut it \
+                     down (`burrow shutdown {id}`), resize it, and boot it"
+                )));
+            }
+            let Some(upgrade) = self.config.guest_upgrade.as_ref() else {
+                return Err(Status::failed_precondition(
+                    "this node has no guest agent to boot a resize helper with",
+                ));
+            };
+            let spec = sandbox.spec.lock().unwrap().clone();
+            let shrunk = self
+                .resizer
+                .shrink(
+                    &self.config.data_dir,
+                    &upgrade.path,
+                    spec,
+                    DiskLayout::Root.disk(),
+                    bytes,
+                    self.config.agent_timeout,
+                )
+                .await?;
+            if shrunk.size_bytes > bytes {
+                return Err(Status::failed_precondition(format!(
+                    "sandbox {id}'s filesystem needs at least {} MiB; {mib} MiB was asked for",
+                    shrunk.minimum_bytes.div_ceil(burrow_common::disk::MIB)
+                )));
+            }
+            crate::rootdisk::cut(&path, mib).await?;
+            drop(slot);
+            (ResourceChange::Offline, shrunk.size_bytes)
+        };
+        sandbox
+            .base_record
+            .lock()
+            .unwrap()
+            .policy
+            .get_or_insert_with(Default::default)
+            .resources
+            .get_or_insert_with(Default::default)
+            .disk_mib = mib;
+        self.persist(sandbox).await;
+        Ok(applied)
+    }
+
+    /// Changes a sandbox's vCPUs and memory: live where the hypervisor can
+    /// hotplug them, on a shut-down sandbox for its next boot, and refused on
+    /// a suspended one, whose restore needs the machine its snapshot was
+    /// taken of.
+    async fn reshape(
+        &self,
+        sandbox: &Arc<RunningSandbox>,
+        vcpus: Option<u32>,
+        mem_mib: Option<u32>,
+    ) -> Result<(Option<ResourceOutcome>, Option<ResourceOutcome>), Status> {
+        let id = sandbox.id();
+        let (current_vcpus, current_mem) = (sandbox.vcpus(), sandbox.mem_mib());
+        let guest_os =
+            burrow_vmm::GuestOs::from_record(&sandbox.record().guest_os).unwrap_or_default();
+        let slot = sandbox.vm.lock().await;
+        let is_stopped = slot.is_none()
+            && sandbox.state.load(std::sync::atomic::Ordering::Relaxed)
+                == common::SandboxState::Stopped as i32;
+        let blocked = if guest_os == burrow_vmm::GuestOs::Windows {
+            Some(
+                "a Windows guest's machine is not reshaped: its agent cannot bring vCPUs or \
+                 memory online"
+                    .to_string(),
+            )
+        } else if slot.is_none() && !is_stopped {
+            Some(format!(
+                "sandbox {id} is suspended, and its restore needs the machine its snapshot was \
+                 taken of; resume it or shut it down first"
+            ))
+        } else {
+            None
+        };
+        let refuse = |reason: &str, previous| ResourceOutcome {
+            change: ResourceChange::Refused as i32,
+            previous,
+            value: previous,
+            reason: reason.to_string(),
+        };
+        let vcpus = match vcpus {
+            None => None,
+            Some(want) if want == current_vcpus => {
+                Some(outcome(ResourceChange::Unchanged, current_vcpus, want))
+            }
+            Some(_) if let Some(reason) = &blocked => Some(refuse(reason, current_vcpus)),
+            Some(want) => Some(match self.admit_vcpus(current_vcpus, want).await {
+                Err(err) => refused(err, current_vcpus)?,
+                Ok(()) => match slot.as_ref() {
+                    None => outcome(ResourceChange::NextBoot, current_vcpus, want),
+                    Some(vm) => {
+                        let max_vcpus = sandbox.spec.lock().unwrap().max_vcpus;
+                        if !sandbox.hypervisor.capabilities().is_vcpu_hotplug_supported {
+                            refuse(
+                                &format!(
+                                    "{} cannot change a running guest's vCPUs; shut {id} \
+                                     down, update it, and boot it",
+                                    sandbox.hypervisor
+                                ),
+                                current_vcpus,
+                            )
+                        } else if want > max_vcpus {
+                            refuse(
+                                &format!(
+                                    "sandbox {id} was booted able to take up to {max_vcpus} \
+                                     vCPUs; shut it down, update it, and boot it for more"
+                                ),
+                                current_vcpus,
+                            )
+                        } else {
+                            match vm.resize_vcpus(want).await {
+                                Ok(()) => outcome(ResourceChange::Live, current_vcpus, want),
+                                Err(err) => refuse(
+                                    &format!("{} refused the change: {err}", sandbox.hypervisor),
+                                    current_vcpus,
+                                ),
+                            }
+                        }
+                    }
+                },
+            }),
+        };
+        let mem_mib = match mem_mib {
+            None => None,
+            Some(want) if want == current_mem => {
+                Some(outcome(ResourceChange::Unchanged, current_mem, want))
+            }
+            Some(_) if let Some(reason) = &blocked => Some(refuse(reason, current_mem)),
+            Some(want) => Some(match slot.as_ref() {
+                None => outcome(ResourceChange::NextBoot, current_mem, want),
+                Some(_) => refuse(
+                    &format!(
+                        "{} cannot change a running guest's memory; shut {id} down, update it, \
+                         and boot it",
+                        sandbox.hypervisor
+                    ),
+                    current_mem,
+                ),
+            }),
+        };
+        let applied = |outcome: &Option<ResourceOutcome>| {
+            outcome.as_ref().and_then(|o| {
+                matches!(
+                    ResourceChange::try_from(o.change),
+                    Ok(ResourceChange::Live | ResourceChange::NextBoot)
+                )
+                .then_some(o.value)
+            })
+        };
+        let (new_vcpus, new_mem) = (applied(&vcpus), applied(&mem_mib));
+        if new_vcpus.is_some() || new_mem.is_some() {
+            {
+                let mut spec = sandbox.spec.lock().unwrap();
+                if let Some(n) = new_vcpus {
+                    spec.vcpus = n;
+                    spec.limits.cpus = n;
+                }
+                if let Some(mib) = new_mem {
+                    spec.limits.memory_mib = spec.limits.memory_mib - spec.mem_mib + mib;
+                    spec.mem_mib = mib;
+                }
+            }
+            {
+                let mut record = sandbox.base_record.lock().unwrap();
+                let resources = record
+                    .policy
+                    .get_or_insert_with(Default::default)
+                    .resources
+                    .get_or_insert_with(Default::default);
+                if let Some(n) = new_vcpus {
+                    resources.vcpus = n;
+                }
+                if let Some(mib) = new_mem {
+                    resources.mem_mib = mib;
+                }
+            }
+            drop(slot);
+            self.persist(sandbox).await;
+            tracing::info!(
+                sandbox = id,
+                vcpus = new_vcpus,
+                mem_mib = new_mem,
+                "reshaped a sandbox"
+            );
+        }
+        Ok((vcpus, mem_mib))
+    }
+
+    /// Refuses more vCPUs than the node has uncommitted.
+    async fn admit_vcpus(&self, current: u32, want: u32) -> Result<(), Status> {
+        if want <= current {
+            return Ok(());
+        }
+        let total = std::thread::available_parallelism().map_or(0, |n| n.get() as u32);
+        let committed = self.committed_vcpus().await;
+        if committed + (want - current) > total {
+            return Err(Status::resource_exhausted(format!(
+                "this node has {total} vCPUs and {committed} committed; {} more do not fit",
+                want - current
+            )));
+        }
+        Ok(())
     }
 
     pub async fn count(&self) -> usize {
@@ -4306,7 +4830,7 @@ impl SandboxManager {
             common::ResourcePolicy {
                 vcpus: key.vcpus,
                 mem_mib: key.mem_mib,
-                scratch_disk_mib: key.scratch_disk_mib,
+                disk_mib: key.disk_mib,
             },
         );
     }
@@ -4336,7 +4860,7 @@ impl SandboxManager {
     /// with the same validation, lock and staged swap, so nothing about the
     /// resulting snapshot depends on which of the two asked for it.
     pub fn warm_in_background(&self, template: String, resources: common::ResourcePolicy) {
-        let (shape, scratch_disk_mib) = match crate::nodeapi::warm_request(&resources) {
+        let shape = match crate::nodeapi::warm_request(&resources) {
             Ok(request) => request,
             Err(err) => {
                 tracing::warn!(template, %err, "not warming this shape");
@@ -4347,7 +4871,7 @@ impl SandboxManager {
             template: template.clone(),
             vcpus: shape.vcpus,
             mem_mib: shape.mem_mib,
-            scratch_disk_mib,
+            disk_mib: shape.disk_mib,
         };
         // Claimed before the task is spawned, so a burst of creates of one
         // shape queues one build rather than one each.
@@ -4367,18 +4891,13 @@ impl SandboxManager {
             let templates_dir = manager.config.templates_dir();
             // It may already be warm: a template that was warmed explicitly,
             // or one create's build finishing while another was queued.
-            if crate::warm::is_warm_for(&templates_dir, &template, shape).await {
+            if let Ok(resolved) = crate::warm::resolve_disk(&templates_dir, &template, shape).await
+                && crate::warm::is_warm_for(&templates_dir, &template, resolved).await
+            {
                 return;
             }
             let trust = manager.warm_trust(&template).await;
-            match crate::warm::build_warm_snapshot(
-                &manager.config,
-                &template,
-                scratch_disk_mib,
-                shape,
-                &trust,
-            )
-            .await
+            match crate::warm::build_warm_snapshot(&manager.config, &template, shape, &trust).await
             {
                 Ok(snapshot_bytes) => {
                     tracing::info!(
@@ -4642,14 +5161,27 @@ impl SandboxManager {
         live
     }
 
-    /// Every disk file the sandboxes here can still grow into.
-    async fn disk_files(&self) -> Vec<PathBuf> {
-        self.sandboxes
+    /// What this node has provisioned: every sandbox's disks and every
+    /// volume, at their sizes.
+    async fn provisioned(&self) -> crate::diskcap::Provisioned {
+        let disks = self
+            .sandboxes
             .lock()
             .await
             .values()
             .flat_map(|sandbox| sandbox.disk_files())
-            .collect()
+            .collect();
+        let volume_bytes = self
+            .volumes
+            .list()
+            .await
+            .iter()
+            .map(|volume| volume.size_mib.saturating_mul(burrow_common::disk::MIB))
+            .sum();
+        crate::diskcap::Provisioned {
+            disks,
+            volume_bytes,
+        }
     }
 
     /// This node's disk as admission sees it, logging loudly while free disk
@@ -4659,9 +5191,9 @@ impl SandboxManager {
         let capacity = self
             .disk_admissions
             .capacity(
-                &self.config.data_dir,
+                &self.config.disk_dir(),
                 self.config.disk,
-                self.disk_files().await,
+                self.provisioned().await,
             )
             .await?;
         let running = self
@@ -4677,7 +5209,7 @@ impl SandboxManager {
 
     /// Admits `request_bytes` more disk for `what`, or refuses with
     /// `ResourceExhausted` naming `node` and the shortfall. Held until the
-    /// operation's disk exists.
+    /// sandbox is registered, and counted with the rest from then on.
     async fn admit_disk(
         &self,
         node: &str,
@@ -4690,9 +5222,9 @@ impl SandboxManager {
                 node,
                 what,
                 request_bytes,
-                &self.config.data_dir,
+                &self.config.disk_dir(),
                 self.config.disk,
-                self.disk_files().await,
+                self.provisioned().await,
             )
             .await
     }
@@ -4754,11 +5286,20 @@ impl SandboxManager {
         tap_name: &str,
         volumes: &[common::VolumeMount],
         is_systemd: bool,
+        layout: DiskLayout,
     ) -> VmSpec {
         let mut spec = VmSpec::new(id.to_string(), workdir, self.config.backend(hypervisor));
         spec.guest_os = guest_os;
         let capabilities = hypervisor.capabilities();
         spec.vcpus = resources.vcpus.max(1);
+        // Room to hotplug up to the node's CPU count. It costs the guest a
+        // few per-CPU areas for each possible vCPU and the VMM nothing until
+        // one is plugged.
+        if capabilities.is_vcpu_hotplug_supported {
+            spec.max_vcpus = std::thread::available_parallelism()
+                .map_or(spec.vcpus, |n| n.get() as u32)
+                .clamp(spec.vcpus, crate::nodeapi::MAX_VCPUS);
+        }
         spec.mem_mib = if resources.mem_mib == 0 {
             DEFAULT_MEM_MIB
         } else {
@@ -4789,12 +5330,9 @@ impl SandboxManager {
         // transport than it was taken with, and warm snapshots are shared.
         spec.is_pci_enabled = true;
 
-        spec.drives = vec![
-            DriveSpec::root_ro(TEMPLATE_ROOTFS),
-            DriveSpec::scratch_rw(SCRATCH_IMAGE),
-        ];
-        // After the two fixed drives, so the guest devices are /dev/vdc
-        // onwards and match what the handshake tells the agent to mount.
+        spec.drives = layout.drives();
+        // After the sandbox's own disks, so the guest devices follow them and
+        // match what the handshake tells the agent to mount.
         for (index, mount) in crate::volume::block_mounts(volumes) {
             spec.drives.push(DriveSpec {
                 id: crate::volume::drive_id(index, guest_os),
@@ -4811,8 +5349,9 @@ impl SandboxManager {
         spec.boot = burrow_vmm::Boot::Kernel {
             kernel: TEMPLATE_KERNEL.into(),
             cmdline: format!(
-                "{} root=/dev/vda ro init=/usr/bin/burrow-guest {} burrow.dns={} burrow.ip6={}/{} burrow.ip6gw={} {} {}",
+                "{} {} init=/usr/bin/burrow-guest {} burrow.dns={} burrow.ip6={}/{} burrow.ip6gw={} {} {}",
                 burrow_vmm::DEFAULT_BOOT_ARGS,
+                layout.boot_args(),
                 lease.kernel_ip_arg(),
                 lease.host_ip,
                 lease.guest_ip6(),
@@ -4900,12 +5439,12 @@ impl SandboxManager {
         });
     }
 
-    /// Creates a sandbox whose scratch disk starts from an existing image.
+    /// Creates a sandbox whose root disk starts from an existing disk rather
+    /// than its template's image.
     ///
-    /// Only the template builder uses this. A build's scratch *is* the layer,
-    /// the overlay's upper directory holding exactly what the steps changed, so
-    /// seeding it is how a rebuild resumes from a cached step instead of
-    /// replaying the ones before it.
+    /// Only the template builder uses this: a build's disk after a step *is*
+    /// the layer, so seeding it is how a rebuild resumes from a cached step
+    /// instead of replaying the ones before it.
     #[allow(clippy::too_many_arguments)]
     pub async fn create_seeded(
         &self,
@@ -4914,7 +5453,7 @@ impl SandboxManager {
         policy: common::Policy,
         tags: HashMap<String, String>,
         node_id: String,
-        seed_scratch: Option<&Path>,
+        seed_disk: Option<&Path>,
         name: String,
     ) -> Result<common::Sandbox, Status> {
         // Claimed before provisioning, not merely checked: provisioning takes
@@ -4944,10 +5483,10 @@ impl SandboxManager {
         };
 
         let provisioned = self
-            .provision_with(id.clone(), template, policy, seed_scratch, node_id)
+            .provision_with(id.clone(), template, policy, seed_disk, node_id)
             .await;
-        let sandbox = match provisioned {
-            Ok(sandbox) => sandbox,
+        let (sandbox, _disk) = match provisioned {
+            Ok(provisioned) => provisioned,
             Err(err) => {
                 self.creating.lock().await.remove(&id);
                 return Err(err);
@@ -5023,10 +5562,10 @@ impl SandboxManager {
         &self,
         id: String,
         template: String,
-        policy: common::Policy,
-        seed_scratch: Option<&Path>,
+        mut policy: common::Policy,
+        seed_disk: Option<&Path>,
         node_id: String,
-    ) -> Result<Arc<RunningSandbox>, Status> {
+    ) -> Result<(Arc<RunningSandbox>, crate::diskcap::Admitted), Status> {
         let began = std::time::Instant::now();
         // The last place it can be checked before it is joined onto the
         // templates directory. The API checks it too, but every create on this
@@ -5047,32 +5586,41 @@ impl SandboxManager {
             )));
         }
         let layout = hypervisor.layout();
+        // Every new sandbox owns its root disk.
+        let disk_layout = DiskLayout::Root;
         let workdir = self.config.sandbox_dir(&id, hypervisor);
-        let resources = policy.resources.unwrap_or_default();
-        let scratch_mib = if resources.scratch_disk_mib == 0 {
-            DEFAULT_SCRATCH_MIB
-        } else {
-            resources.scratch_disk_mib
-        };
-        // The disk this sandbox is promised: its scratch disk, or a macOS
-        // guest's clone of its template's disk. Charged before anything is
-        // made, so a node that cannot hold it refuses without a tap or a
-        // directory to give back.
+        let mut resources = policy.resources.unwrap_or_default();
+        // The disk this sandbox is provisioned: its root disk at the size
+        // asked for, or a macOS guest's clone of its template's disk. Charged
+        // before anything is made, so a node that cannot hold it refuses
+        // without a tap or a directory to give back.
         let disk_bytes = match crate::macnode::disk_file(guest_os) {
             Some(disk) => tokio::fs::metadata(templates_dir.join(&template).join(disk))
                 .await
                 .map(|meta| meta.len())
                 .unwrap_or(0),
-            None => u64::from(scratch_mib) * burrow_common::disk::MIB,
+            None => {
+                let image =
+                    tokio::fs::metadata(templates_dir.join(&template).join(TEMPLATE_ROOTFS))
+                        .await
+                        .map_err(|err| {
+                            Status::failed_precondition(format!("template {template:?}: {err}"))
+                        })?;
+                resources.disk_mib = crate::rootdisk::disk_mib(resources.disk_mib, image.len())?;
+                u64::from(resources.disk_mib) * burrow_common::disk::MIB
+            }
         };
-        let _disk = self
+        // The record says the size the disk is, not the size it defaulted to.
+        policy.resources = Some(resources);
+        let disk = self
             .admit_disk(&node_id, "create a sandbox", disk_bytes)
             .await?;
 
-        // A seeded scratch has to survive into the guest untouched, and the
-        // warm path stages its own scratch, so it is not usable here. Nor is a
-        // warm snapshot of the wrong shape: restoring it would give the caller
-        // different cpu and memory than they asked for, with no error to say so.
+        // A seeded disk has to survive into the guest untouched, and the warm
+        // path stages its own disk, so it is not usable here. Nor is a warm
+        // snapshot of the wrong shape: restoring it would give the caller
+        // different cpu, memory or disk than they asked for, with no error to
+        // say so.
         // Taken before any resource is, so a volume conflict fails the create
         // without a tap, an address or a directory to give back.
         crate::volume::validate_mounts(&policy.volumes)?;
@@ -5096,7 +5644,7 @@ impl SandboxManager {
         // A warm snapshot was taken without volumes, so they can only reach a
         // sandbox restored from one by being hotplugged; where they cannot
         // be, it boots cold and takes them at boot.
-        let from_warm = seed_scratch.is_none()
+        let from_warm = seed_disk.is_none()
             && capabilities.is_warm_pool_supported
             && (capabilities.is_drive_hotplug_supported
                 || crate::volume::block_mounts(&policy.volumes)
@@ -5163,14 +5711,13 @@ impl SandboxManager {
                     .map_err(|err| {
                         Status::failed_precondition(format!("template {template:?}: {err}"))
                     })?;
-                match seed_scratch {
-                    Some(seed) => crate::warm::copy_sparse(seed, &workdir.join(SCRATCH_IMAGE))
-                        .await
-                        .map_err(|err| Status::internal(format!("seeding scratch disk: {err}")))?,
-                    None => create_scratch(&workdir.join(SCRATCH_IMAGE), scratch_mib)
-                        .await
-                        .map_err(|err| Status::internal(format!("scratch disk: {err}")))?,
+                let disk = workdir.join(disk_layout.disk());
+                match seed_disk {
+                    Some(seed) => crate::rootdisk::clone(seed, &disk).await.map(drop),
+                    None => self.spares.take(&templates_dir, &template, &disk).await,
                 }
+                .map_err(|err| Status::internal(format!("making the root disk: {err}")))?;
+                crate::rootdisk::grow(&disk, resources.disk_mib).await?;
             }
             // Hard-linked in after the template's own files, so a cold boot
             // that rebuilt the directory does not clear them again.
@@ -5250,11 +5797,15 @@ impl SandboxManager {
             }
         };
 
-        // A warm snapshot was captured with the rootfs and scratch drives alone,
-        // so a restore must describe exactly those; the volumes are hotplugged
-        // once it is running. A cold boot has no such constraint and takes them
-        // at boot, which needs no rescan in the guest.
-        let boot_volumes: &[common::VolumeMount] = if from_warm { &[] } else { &policy.volumes };
+        // A warm snapshot was captured with the sandbox's own disk alone, so a
+        // restore must describe exactly that; the volumes are hotplugged once
+        // it is running. A cold boot on a root disk hotplugs them too, once its
+        // agent is up: an agent from before root disks takes a second disk at
+        // boot for an overlay's scratch disk, and would build one on a volume.
+        let is_hotplugged = from_warm
+            || (capabilities.is_drive_hotplug_supported && !crate::macnode::is_macos(guest_os));
+        let boot_volumes: &[common::VolumeMount] =
+            if is_hotplugged { &[] } else { &policy.volumes };
         let is_systemd = environment.systemd;
         let mut spec = self.build_spec(
             &id,
@@ -5266,6 +5817,7 @@ impl SandboxManager {
             &tap_name,
             boot_volumes,
             is_systemd,
+            disk_layout,
         );
         // Only meaningful on a restore, and only when the template was
         // profiled; a create that boots cold has no snapshot to prefetch from.
@@ -5302,19 +5854,8 @@ impl SandboxManager {
 
         // Attached before the handshake, which is what tells the guest to rescan
         // its bus and mount them: firecracker cannot notify the guest itself.
-        if from_warm {
-            for (index, mount) in crate::volume::block_mounts(&policy.volumes) {
-                let drive = DriveSpec {
-                    id: crate::volume::drive_id(index, guest_os),
-                    path: volume_image(index),
-                    is_root: false,
-                    is_read_only: mount.is_read_only,
-                };
-                if let Err(err) = guard.vm().attach_drive(&drive).await {
-                    let message = format!("attaching volume {}: {err}", mount.volume);
-                    return Err(guard.fail(Status::internal(message)).await);
-                }
-            }
+        if from_warm && let Err(err) = attach_volumes(guard.vm(), &policy.volumes, guest_os).await {
+            return Err(guard.fail(err).await);
         }
 
         // What a guest still has to be told. Assembled before any clock starts,
@@ -5330,7 +5871,7 @@ impl SandboxManager {
             ),
             self.inspection_ca_for(&policy),
             self.trust_bundles_for(&template, &policy).await,
-            crate::volume::agent_mounts(&policy.volumes, guest_os),
+            crate::volume::agent_mounts(&policy.volumes, guest_os, disk_layout),
         );
         let inspected = !request.inspection_ca_pem.is_empty();
         let inspection_root = self.inspection_root_of(&request);
@@ -5373,6 +5914,11 @@ impl SandboxManager {
                 }
             };
             let agent_up = vmm_ready.elapsed();
+            if is_hotplugged
+                && let Err(err) = attach_volumes(guard.vm(), &policy.volumes, guest_os).await
+            {
+                return Err(guard.fail(err).await);
+            }
             // Guest wake proper: the VM resuming far enough for the agent's
             // vsock listener to accept. What is left of `agent_up` is the
             // HTTP/2 handshake the guest's gRPC server does on top of it.
@@ -5417,6 +5963,7 @@ impl SandboxManager {
             hypervisor: hypervisor.to_string(),
             guest_os: guest_os.as_str().to_string(),
             inspection_root_fingerprint: inspection_root,
+            disk_layout: disk_layout.to_proto() as i32,
             // Tags and name are stamped a moment later by the caller's
             // create; usage, reachability and the handshake are filled in
             // from the live sandbox on every read.
@@ -5505,7 +6052,7 @@ impl SandboxManager {
         if from_warm {
             spawn_handshake(self, &sandbox, request, self.config.agent_timeout);
         }
-        Ok(sandbox)
+        Ok((sandbox, disk))
     }
 
     /// Snapshots a sandbox to disk and stops its VMM.
@@ -5537,8 +6084,12 @@ impl SandboxManager {
     /// The record is persisted whichever way it ends, because a write that
     /// could not resume its guest leaves the sandbox suspended and a store
     /// still saying `Running` would have recovery discard it.
-    async fn write_state(&self, sandbox: &Arc<RunningSandbox>) -> Result<(), Status> {
-        let result = sandbox.checkpoint().await;
+    async fn write_state(
+        &self,
+        sandbox: &Arc<RunningSandbox>,
+        capture: Option<&Path>,
+    ) -> Result<(), Status> {
+        let result = sandbox.checkpoint(capture).await;
         // The pause ended the feed along with every other connection, and a
         // command still running has output to send.
         sandbox.ensure_feed();
@@ -5574,8 +6125,10 @@ impl SandboxManager {
     ) -> Result<common::Snapshot, Status> {
         crate::snapshot::validate_id(&snapshot_id)?;
         let sandbox = self.get(sandbox_id).await?;
-        if sandbox.is_running() {
-            self.write_state(&sandbox).await?;
+        let capture = sandbox.workdir.join(format!(".capture-{snapshot_id}"));
+        let is_captured = sandbox.is_running();
+        if is_captured {
+            self.write_state(&sandbox, Some(&capture)).await?;
         } else if sandbox.state.load(std::sync::atomic::Ordering::Relaxed)
             != common::SandboxState::Suspended as i32
         {
@@ -5593,8 +6146,16 @@ impl SandboxManager {
         };
 
         let started = std::time::Instant::now();
-        let dir = self.snapshots.begin(&snapshot_id).await?;
-        let staged = match sandbox.stage_snapshot(&dir).await {
+        let staged = match self.snapshots.begin(&snapshot_id).await {
+            Ok(dir) => {
+                sandbox
+                    .stage_snapshot(&dir, is_captured.then_some(capture.as_path()))
+                    .await
+            }
+            Err(err) => Err(err),
+        };
+        let _ = tokio::fs::remove_file(&capture).await;
+        let staged = match staged {
             Ok(staged) => staged,
             Err(err) => {
                 self.snapshots.abandon(&snapshot_id).await;
@@ -5656,17 +6217,17 @@ impl SandboxManager {
                 0 => manifest.mem_mib,
                 n => n,
             },
-            match wanted.scratch_disk_mib {
-                0 => manifest.scratch_disk_mib,
+            match wanted.disk_mib {
+                0 => manifest.disk_mib,
                 n => n,
             },
         );
-        if shape != (manifest.vcpus, manifest.mem_mib, manifest.scratch_disk_mib) {
+        if shape != (manifest.vcpus, manifest.mem_mib, manifest.disk_mib) {
             return Err(Status::invalid_argument(format!(
                 "a sandbox created from snapshot {snapshot_id} restores its state and cannot \
-                 change its vcpus, memory or scratch disk: the snapshot was taken with \
-                 {} vcpu / {} MiB / {} MiB scratch",
-                manifest.vcpus, manifest.mem_mib, manifest.scratch_disk_mib
+                 change its vcpus, memory or disk: the snapshot was taken with \
+                 {} vcpu / {} MiB / {} MiB disk; grow the disk once it runs",
+                manifest.vcpus, manifest.mem_mib, manifest.disk_mib
             )));
         }
         // Written back so the record, the cgroup and any later restore all
@@ -5674,7 +6235,7 @@ impl SandboxManager {
         policy.resources = Some(common::ResourcePolicy {
             vcpus: manifest.vcpus,
             mem_mib: manifest.mem_mib,
-            scratch_disk_mib: manifest.scratch_disk_mib,
+            disk_mib: manifest.disk_mib,
         });
 
         {
@@ -5693,6 +6254,8 @@ impl SandboxManager {
                     id: snapshot_id,
                     template: manifest.template.clone(),
                     hypervisor: manifest.hypervisor()?,
+                    disk_layout: manifest.disk_layout(),
+                    disk_mib: manifest.disk_mib,
                 },
                 id.clone(),
                 policy,
@@ -5702,11 +6265,11 @@ impl SandboxManager {
             )
             .await;
         let registered = match &provisioned {
-            Ok(sandbox) => self.register_or_discard(sandbox).await,
+            Ok((sandbox, _)) => self.register_or_discard(sandbox).await,
             Err(_) => Ok(()),
         };
         self.creating.lock().await.remove(&id);
-        let sandbox = provisioned?;
+        let (sandbox, _disk) = provisioned?;
         registered?;
 
         self.emit(&sandbox, EVENT_CREATED, &format!("snapshot:{snapshot_id}"))
@@ -5758,11 +6321,11 @@ impl SandboxManager {
         // The child has its own address and its own policy, neither of which
         // the ruleset knows about until now.
         let registered = match &forked {
-            Ok(sandbox) => self.register_or_discard(sandbox).await,
+            Ok((sandbox, _)) => self.register_or_discard(sandbox).await,
             Err(_) => Ok(()),
         };
         self.creating.lock().await.remove(&child_id);
-        let sandbox = forked?;
+        let (sandbox, _disk) = forked?;
         registered?;
 
         self.emit(&sandbox, EVENT_CREATED, &format!("fork:{source_id}"))
@@ -5783,12 +6346,14 @@ impl SandboxManager {
         policy: Option<common::Policy>,
         node_id: String,
         name: String,
-    ) -> Result<Arc<RunningSandbox>, Status> {
+    ) -> Result<(Arc<RunningSandbox>, crate::diskcap::Admitted), Status> {
         // A running source has state in memory that its snapshot does not
         // hold; capturing it is the whole difference between forking a sandbox
         // and cloning its last suspend.
-        if source.is_running() {
-            self.write_state(source).await?;
+        let capture = source.workdir.join(format!(".capture-{child_id}"));
+        let is_captured = source.is_running();
+        if is_captured {
+            self.write_state(source, Some(&capture)).await?;
         } else if source.state.load(std::sync::atomic::Ordering::Relaxed)
             != common::SandboxState::Suspended as i32
         {
@@ -5821,12 +6386,13 @@ impl SandboxManager {
                 // the snapshot, and the child's scratch disk is a copy of the
                 // source's. A shape the fork cannot honour is refused rather
                 // than accepted and quietly ignored.
-                if (wanted.vcpus, wanted.mem_mib, wanted.scratch_disk_mib)
-                    != (shape.vcpus, shape.mem_mib, shape.scratch_disk_mib)
+                if (wanted.vcpus, wanted.mem_mib, wanted.disk_mib)
+                    != (shape.vcpus, shape.mem_mib, shape.disk_mib)
                 {
+                    let _ = tokio::fs::remove_file(&capture).await;
                     return Err(Status::invalid_argument(
                         "a fork restores the source's snapshot and cannot change its \
-                         vcpus, memory or scratch disk",
+                         vcpus, memory or disk",
                     ));
                 }
                 over.resources = Some(wanted);
@@ -5850,17 +6416,23 @@ impl SandboxManager {
                 .unwrap()
                 .inspection_root_fingerprint
                 .clone();
-            self.require_inspection_root(&child_id, &parent)?;
+            if let Err(err) = self.require_inspection_root(&child_id, &parent) {
+                let _ = tokio::fs::remove_file(&capture).await;
+                return Err(err);
+            }
         }
-        self.provision_restored(
-            RestoreSource::Sandbox(source),
-            child_id,
-            policy,
-            tags,
-            node_id,
-            name,
-        )
-        .await
+        let restored = self
+            .provision_restored(
+                RestoreSource::Sandbox(source, is_captured.then(|| capture.clone())),
+                child_id,
+                policy,
+                tags,
+                node_id,
+                name,
+            )
+            .await;
+        let _ = tokio::fs::remove_file(&capture).await;
+        restored
     }
 
     /// Builds a VM that starts by restoring state rather than booting: its own
@@ -5905,35 +6477,38 @@ impl SandboxManager {
         &self,
         source: RestoreSource<'_>,
         id: String,
-        policy: common::Policy,
+        mut policy: common::Policy,
         tags: HashMap<String, String>,
         node_id: String,
         name: String,
-    ) -> Result<Arc<RunningSandbox>, Status> {
+    ) -> Result<(Arc<RunningSandbox>, crate::diskcap::Admitted), Status> {
         // State restores only under the hypervisor that wrote it, so the
         // source decides, whatever the template says now.
         let hypervisor = source.hypervisor()?;
         self.require_hypervisor(hypervisor)?;
         let capabilities = hypervisor.capabilities();
         let workdir = self.config.sandbox_dir(&id, hypervisor);
-        let resources = policy.resources.unwrap_or_default();
-        // A restored sandbox gets a disk of its source's size, promised like
-        // a created one's. An adopt is charged here too, after its claim in
-        // the store, which a refusal hands back.
-        let scratch_mib = match resources.scratch_disk_mib {
-            0 => DEFAULT_SCRATCH_MIB,
+        // And on the disk layout it was written on.
+        let disk_layout = source.disk_layout();
+        let mut resources = policy.resources.unwrap_or_default();
+        // A restored sandbox gets a disk of its source's size, provisioned
+        // like a created one's. An adopt is charged here too, after its claim
+        // in the store, which a refusal hands back.
+        resources.disk_mib = match source.disk_mib() {
+            0 if disk_layout == DiskLayout::Overlay => DEFAULT_SCRATCH_MIB,
             mib => mib,
         };
+        policy.resources = Some(resources);
         let what = match source {
-            RestoreSource::Sandbox(_) => "fork a sandbox",
+            RestoreSource::Sandbox(..) => "fork a sandbox",
             RestoreSource::Snapshot { .. } => "create a sandbox from a snapshot",
             RestoreSource::Stored { .. } => "adopt a sandbox",
         };
-        let _disk = self
+        let disk = self
             .admit_disk(
                 &node_id,
                 what,
-                u64::from(scratch_mib) * burrow_common::disk::MIB,
+                u64::from(resources.disk_mib) * burrow_common::disk::MIB,
             )
             .await?;
         // The state was captured without volumes, so they could only arrive by
@@ -5968,7 +6543,7 @@ impl SandboxManager {
             }
         }
         let guest_os = match &source {
-            RestoreSource::Sandbox(source) => {
+            RestoreSource::Sandbox(source, _) => {
                 burrow_vmm::GuestOs::from_record(&source.record().guest_os).unwrap_or_default()
             }
             _ => self
@@ -6032,7 +6607,7 @@ impl SandboxManager {
                 // it, and those inodes are the source's, already readable by
                 // the jail's uid; a snapshot restore copies its chain and
                 // the copies are this sandbox's to own.
-                if matches!(source, RestoreSource::Sandbox(_)) {
+                if matches!(source, RestoreSource::Sandbox(..)) {
                     shared.extend(chain.iter().cloned());
                 }
                 for (index, mount) in crate::volume::block_mounts(&policy.volumes) {
@@ -6089,6 +6664,7 @@ impl SandboxManager {
             &tap_name,
             &[],
             is_systemd,
+            disk_layout,
         );
         // The template's plan names the pages its agent touches on the way to
         // a usable handshake, which is the same code whether the guest was
@@ -6121,17 +6697,8 @@ impl SandboxManager {
             }
         }
 
-        for (index, mount) in crate::volume::block_mounts(&policy.volumes) {
-            let drive = DriveSpec {
-                id: crate::volume::drive_id(index, guest_os),
-                path: volume_image(index),
-                is_root: false,
-                is_read_only: mount.is_read_only,
-            };
-            if let Err(err) = guard.vm().attach_drive(&drive).await {
-                let message = format!("attaching volume {}: {err}", mount.volume);
-                return Err(guard.fail(Status::internal(message)).await);
-            }
+        if let Err(err) = attach_volumes(guard.vm(), &policy.volumes, guest_os).await {
+            return Err(guard.fail(err).await);
         }
 
         // The guest wakes holding the address baked into the snapshot, which
@@ -6144,7 +6711,7 @@ impl SandboxManager {
             self.guest_network(&lease, &[], capabilities.is_tap_networked, true),
             self.inspection_ca_for(&policy),
             self.trust_bundles_for(&source.template(), &policy).await,
-            crate::volume::agent_mounts(&policy.volumes, guest_os),
+            crate::volume::agent_mounts(&policy.volumes, guest_os, disk_layout),
         );
         let inspection_root = self.inspection_root_of(&request);
         // Nothing below can fail, so the sandbox takes over here.
@@ -6166,6 +6733,7 @@ impl SandboxManager {
             hypervisor: hypervisor.to_string(),
             guest_os: guest_os.as_str().to_string(),
             inspection_root_fingerprint: inspection_root,
+            disk_layout: disk_layout.to_proto() as i32,
             ..Default::default()
         };
         tracing::info!(
@@ -6206,7 +6774,7 @@ impl SandboxManager {
         });
         *sandbox.durable.hydration.lock().unwrap() = arriving;
         spawn_handshake(self, &sandbox, request, self.config.agent_timeout);
-        Ok(sandbox)
+        Ok((sandbox, disk))
     }
 
     /// Restores a suspended sandbox from its snapshot.
@@ -6431,6 +6999,16 @@ impl SandboxManager {
         }
         let resources = policy.resources.unwrap_or_default();
         let is_systemd = self.image_environment(sandbox.template()).await.systemd;
+        let disk_layout = sandbox.disk_layout();
+        // On a root disk, hotplugged once the agent is up, as a create does.
+        let is_hotplugged = disk_layout == DiskLayout::Root
+            && sandbox.hypervisor.capabilities().is_drive_hotplug_supported
+            && !crate::macnode::is_macos(guest_os);
+        let (boot_volumes, hotplugged): (&[common::VolumeMount], &[common::VolumeMount]) =
+            match is_hotplugged {
+                true => (&[], &policy.volumes),
+                false => (&policy.volumes, &[]),
+            };
         let mut spec = self.build_spec(
             id,
             &sandbox.workdir,
@@ -6439,8 +7017,9 @@ impl SandboxManager {
             &resources,
             &sandbox.lease,
             &sandbox.tap,
-            &policy.volumes,
+            boot_volumes,
             is_systemd,
+            disk_layout,
         );
         let from = self.boundary(&sandbox).await;
         if let Err(err) = self.usernets.attach(id, &sandbox.lease, &mut spec) {
@@ -6457,7 +7036,7 @@ impl SandboxManager {
             ),
             self.inspection_ca_for(&policy),
             self.trust_bundles_for(sandbox.template(), &policy).await,
-            crate::volume::agent_mounts(&policy.volumes, guest_os),
+            crate::volume::agent_mounts(&policy.volumes, guest_os, disk_layout),
         );
         if let Err(err) = sandbox
             .boot(
@@ -6465,6 +7044,7 @@ impl SandboxManager {
                 request,
                 self.config.agent_timeout,
                 self.config.guest_upgrade.as_deref(),
+                hotplugged,
             )
             .await
         {
@@ -6676,7 +7256,6 @@ impl SandboxManager {
             );
             return Ok(false);
         };
-        let resources = sandbox.resources();
         let (vcpus, mem_mib) = {
             let spec = sandbox.spec.lock().unwrap();
             (spec.vcpus, spec.mem_mib)
@@ -6694,10 +7273,8 @@ impl SandboxManager {
             template: sandbox.template().to_string(),
             vcpus,
             mem_mib,
-            scratch_disk_mib: match resources.scratch_disk_mib {
-                0 => DEFAULT_SCRATCH_MIB,
-                mib => mib,
-            },
+            disk_mib: size_mib(&sandbox.disk_path()),
+            disk_layout: sandbox.disk_layout().as_str().to_string(),
             is_systemd,
             arch: std::env::consts::ARCH.to_string(),
             hypervisor_version: self.config.version(sandbox.hypervisor).to_string(),
@@ -6718,6 +7295,7 @@ impl SandboxManager {
                 sandbox.durable.settle_memory().await;
                 crate::durable::upload(
                     store,
+                    &crate::blobs::BlobStore::new(&self.config.data_dir),
                     &sandbox.workdir,
                     sandbox.logs.dir(),
                     &chain,
@@ -7124,7 +7702,7 @@ impl SandboxManager {
         let adopted = self
             .adopt_inner(store, &held, record, node_id.clone())
             .await;
-        let (sandbox, from) = match adopted {
+        let (sandbox, from, _disk) = match adopted {
             Ok(adopted) => adopted,
             Err(err) => {
                 self.creating.lock().await.remove(&id);
@@ -7183,7 +7761,7 @@ impl SandboxManager {
         held: &crate::durable::Held,
         record: common::Sandbox,
         node_id: String,
-    ) -> Result<(Arc<RunningSandbox>, String), Status> {
+    ) -> Result<(Arc<RunningSandbox>, String, crate::diskcap::Admitted), Status> {
         let manifest = &held.manifest;
         let from = manifest.node_id.clone();
         let mut claimed = manifest.clone();
@@ -7193,7 +7771,7 @@ impl SandboxManager {
         policy.resources = Some(common::ResourcePolicy {
             vcpus: manifest.vcpus,
             mem_mib: manifest.mem_mib,
-            scratch_disk_mib: manifest.scratch_disk_mib,
+            disk_mib: manifest.disk_mib,
         });
         // Claimed in the store before the guest starts, the rule a resume
         // follows too, and handed back if it never does. Conditional on the
@@ -7213,8 +7791,8 @@ impl SandboxManager {
                 record.name.clone(),
             )
             .await;
-        let sandbox = match provisioned {
-            Ok(sandbox) => sandbox,
+        let (sandbox, disk) = match provisioned {
+            Ok(provisioned) => provisioned,
             Err(err) => {
                 self.hand_back(store, &node_id, manifest).await;
                 return Err(err);
@@ -7238,7 +7816,7 @@ impl SandboxManager {
             tx_bytes: record.tx_bytes.max(manifest.tx_bytes),
             ..Default::default()
         };
-        Ok((sandbox, from))
+        Ok((sandbox, from, disk))
     }
 
     /// Puts back the manifest a failed adopt claimed over, provided the store
@@ -7385,41 +7963,40 @@ fn policy_mode(record: &common::Sandbox) -> firewall::Mode {
         .unwrap_or_default()
 }
 
+/// A Mac's auxiliary storage, which its machine writes like a disk and its
+/// restore reads back as the save left it.
+fn aux_storage(boot: &burrow_vmm::Boot) -> Option<String> {
+    match boot {
+        #[cfg(target_os = "macos")]
+        burrow_vmm::Boot::MacOs(boot) => Some(boot.aux.clone()),
+        _ => None,
+    }
+}
+
+/// Hotplugs a sandbox's volumes onto its running VM, in the order the
+/// handshake names their devices.
+async fn attach_volumes(
+    vm: &Vm,
+    mounts: &[common::VolumeMount],
+    guest_os: burrow_vmm::GuestOs,
+) -> Result<(), Status> {
+    for (index, mount) in crate::volume::block_mounts(mounts) {
+        let drive = DriveSpec {
+            id: crate::volume::drive_id(index, guest_os),
+            path: volume_image(index),
+            is_root: false,
+            is_read_only: mount.is_read_only,
+        };
+        vm.attach_drive(&drive)
+            .await
+            .map_err(|err| Status::internal(format!("attaching volume {}: {err}", mount.volume)))?;
+    }
+    Ok(())
+}
+
 /// Tells the agent to run the template's systemd under it.
 pub(crate) fn guest_mode_arg(is_systemd: bool) -> &'static str {
     if is_systemd { "burrow.systemd=1" } else { "" }
-}
-
-/// Formats a sparse ext4 image for the sandbox's writable layer.
-///
-/// The file is sparse, so a 1 GiB disk costs only what the guest actually
-/// writes. `lazy_itable_init` and `lazy_journal_init` keep formatting off the
-/// sandbox-creation critical path; the kernel finishes the work in the guest.
-pub(crate) async fn create_scratch(path: &Path, size_mib: u32) -> std::io::Result<()> {
-    let output = tokio::process::Command::new("mkfs.ext4")
-        .args([
-            "-q",
-            "-F",
-            "-L",
-            "burrow-scratch",
-            "-b",
-            "4096",
-            "-E",
-            "lazy_itable_init=1,lazy_journal_init=1",
-        ])
-        .arg(path)
-        .arg(format!("{size_mib}M"))
-        .output()
-        .await?;
-
-    if !output.status.success() {
-        return Err(std::io::Error::other(format!(
-            "mkfs.ext4 failed ({}): {}",
-            output.status,
-            String::from_utf8_lossy(&output.stderr).trim()
-        )));
-    }
-    Ok(())
 }
 
 /// Hands a sandbox's staged files to the uid firecracker will drop to.
@@ -7471,9 +8048,9 @@ pub(crate) async fn grant_to_jail(
     .map_err(|err| std::io::Error::other(format!("chown did not run: {err}")))?
 }
 
-/// Creates a sandbox working directory backed by the template's kernel and
-/// rootfs. Hard links keep creation cheap and let many sandboxes share one
-/// read-only base image; the guest mounts it read-only so nothing writes back.
+/// Creates a sandbox working directory with the template's kernel and image
+/// linked in. Hard links keep creation cheap; the root disk cloned from the
+/// image is the sandbox's own, and the guest never sees the image itself.
 async fn prepare_workdir(template_dir: &Path, workdir: &Path) -> std::io::Result<()> {
     if tokio::fs::try_exists(workdir).await.unwrap_or(false) {
         tokio::fs::remove_dir_all(workdir).await?;
@@ -7719,7 +8296,7 @@ pub(crate) mod tests {
         let workdir = manager.config.sandbox_dir(id, Hypervisor::Firecracker);
         tokio::fs::create_dir_all(&workdir).await.unwrap();
         let layout = Hypervisor::Firecracker.layout();
-        for file in [layout.state, SCRATCH_IMAGE] {
+        for file in [layout.state, crate::rootdisk::SCRATCH_DISK] {
             tokio::fs::write(workdir.join(file), b"kept").await.unwrap();
         }
         let orphan = data_dir.join("sandboxes").join("nobody");
@@ -7780,7 +8357,7 @@ pub(crate) mod tests {
         tokio::fs::create_dir_all(&workdir).await.unwrap();
         let layout = Hypervisor::Firecracker.layout();
         // A snapshot from an earlier suspend, older than the disk.
-        for file in [layout.state, SCRATCH_IMAGE] {
+        for file in [layout.state, crate::rootdisk::SCRATCH_DISK] {
             tokio::fs::write(workdir.join(file), b"old").await.unwrap();
         }
         manager
@@ -7807,7 +8384,7 @@ pub(crate) mod tests {
         assert_eq!(rows[0].state, common::SandboxState::Stopped as i32);
         let stored: common::Sandbox = prost::Message::decode(&rows[0].record[..]).unwrap();
         assert_eq!(stored.state_reason, REASON_LOST);
-        assert!(workdir.join(SCRATCH_IMAGE).exists());
+        assert!(workdir.join(crate::rootdisk::SCRATCH_DISK).exists());
         assert!(!workdir.join(layout.state).exists());
         let events = events_of(&manager, id).await;
         let stopped = &events[1];
@@ -7854,7 +8431,7 @@ pub(crate) mod tests {
         let legacy = jail.chroot_for(Hypervisor::Firecracker, id);
         tokio::fs::create_dir_all(&legacy).await.unwrap();
         let layout = hypervisor.layout();
-        for file in [layout.state, SCRATCH_IMAGE] {
+        for file in [layout.state, crate::rootdisk::SCRATCH_DISK] {
             tokio::fs::write(legacy.join(file), b"kept").await.unwrap();
         }
         let mut row = row(id, common::SandboxState::Suspended, 5);
@@ -8546,7 +9123,7 @@ pub(crate) mod tests {
         let sandbox = sandbox_in(workdir.clone());
         sandbox.spec.lock().unwrap().drives = vec![
             DriveSpec::root_ro(TEMPLATE_ROOTFS),
-            DriveSpec::scratch_rw(SCRATCH_IMAGE),
+            DriveSpec::scratch_rw(crate::rootdisk::SCRATCH_DISK),
             DriveSpec {
                 id: "volume0".into(),
                 path: volume_image(0),
@@ -8565,7 +9142,7 @@ pub(crate) mod tests {
             "snapshot.vmstate",
             diff.as_str(),
             TEMPLATE_ROOTFS,
-            SCRATCH_IMAGE,
+            crate::rootdisk::SCRATCH_DISK,
             &volume_image(0),
             &volume_image(1),
         ] {
@@ -8580,7 +9157,7 @@ pub(crate) mod tests {
             vec![
                 Synced::File(workdir.join("snapshot.vmstate")),
                 Synced::File(workdir.join(&diff)),
-                Synced::File(workdir.join(SCRATCH_IMAGE)),
+                Synced::File(workdir.join(crate::rootdisk::SCRATCH_DISK)),
                 Synced::File(workdir.join(volume_image(0))),
                 Synced::Dir(workdir.clone()),
             ]
@@ -8598,7 +9175,8 @@ pub(crate) mod tests {
         ));
         std::fs::create_dir_all(&workdir).unwrap();
         let sandbox = sandbox_in(workdir.clone());
-        sandbox.spec.lock().unwrap().drives = vec![DriveSpec::scratch_rw(SCRATCH_IMAGE)];
+        sandbox.spec.lock().unwrap().drives =
+            vec![DriveSpec::scratch_rw(crate::rootdisk::SCRATCH_DISK)];
         std::fs::write(workdir.join("snapshot.vmstate"), b"x").unwrap();
         // No memory file: the snapshot did not land, so the suspend must not.
         let err = sandbox
@@ -8614,14 +9192,18 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn a_full_suspend_of_a_macos_style_layout_syncs_its_state_and_disk() {
+    fn a_full_suspend_of_a_macos_style_layout_syncs_its_state_disk_and_aux() {
         let layout = Layout {
             state: "save.vzvmsave",
             memory: None,
         };
         assert_eq!(
-            suspend_sync_order(layout, layout.memory, vec!["disk.img".into()]),
-            ["save.vzvmsave", "disk.img"]
+            suspend_sync_order(
+                layout,
+                layout.memory,
+                vec!["disk.img".into(), "aux.img".into()]
+            ),
+            ["save.vzvmsave", "disk.img", "aux.img"]
         );
     }
 
