@@ -121,10 +121,10 @@ impl HypervisorExt for Hypervisor {
                 is_live_disk_growth_supported: true,
                 is_vcpu_hotplug_supported: false,
             },
-            // Cloud Hypervisor restores memory copy-on-write from its own
-            // mapping, which is lazy in effect, but it cannot be pointed at
-            // burrow's page-fault handler: no chains, no prefetch plans, no
-            // memory still arriving from the object store.
+            // Cloud Hypervisor copies guest memory in at restore, and its
+            // own on-demand mode cannot be pointed at burrow's page-fault
+            // handler: no chains, no prefetch plans, no memory still arriving
+            // from the object store.
             Self::CloudHypervisor => Capabilities {
                 is_diff_snapshot_supported: false,
                 is_lazy_memory_supported: false,

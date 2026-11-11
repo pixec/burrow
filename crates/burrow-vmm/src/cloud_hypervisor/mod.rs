@@ -12,7 +12,7 @@
 //! config and device state together as the state half, guest memory as the
 //! other. A restore unpacks them into a directory of their own, points the
 //! config at this sandbox's tap and starts a fresh VMM with `--restore`, which
-//! maps the memory file copy-on-write rather than reading it in.
+//! copies guest memory in from the memory file.
 //!
 //! With a [`ChJail`] the VMM runs confined, as [`jail`] describes: it is
 //! handed its tap as a descriptor rather than opening it by name, and a
@@ -56,17 +56,18 @@ const RESTORE_DIR: &str = "restore.ch";
 /// How long the VMM gets to open its API socket.
 const SOCKET_TIMEOUT: Duration = Duration::from_secs(5);
 const POLL: Duration = Duration::from_millis(2);
-/// How long a `--restore` gets to load the VM's state. Memory is mapped
-/// rather than read, so this is device state and the mapping, which take well
-/// under a second when nothing is wrong.
+/// How long a `--restore` gets to load the VM's state: device state and a
+/// copy of guest memory, about a second for 512 MiB.
 const RESTORE_TIMEOUT: Duration = Duration::from_secs(30);
-/// Maps the memory file privately, the way Firecracker's `File` backend does:
-/// a restore costs a mapping rather than a copy of the guest, and sandboxes
-/// restored from one warm snapshot share its page cache. Cloud Hypervisor
-/// falls back to copying where the memory is not plain private RAM.
-const MEMORY_RESTORE_MODE: &str = "copyonwrite";
+/// Reads guest memory into anonymous RAM rather than mapping the memory file
+/// copy-on-write. Mapped, every page the guest has not written since the
+/// restore is reclaimable page cache of the snapshot file, and a guest doing a
+/// few hundred MiB of I/O after a resume ended up reading corrupt memory: a
+/// soft lockup in the slab allocator freeing a vsock buffer, the agent gone,
+/// the guest spinning. Copied, guest memory is never reclaimed under it.
+const MEMORY_RESTORE_MODE: &str = "copy";
 /// The same, as the API's `vm.restore` spells it.
-const MEMORY_RESTORE_MODE_API: &str = "CopyOnWrite";
+const MEMORY_RESTORE_MODE_API: &str = "Copy";
 
 /// How this node runs Cloud Hypervisor.
 #[derive(Debug, Clone)]
@@ -188,8 +189,8 @@ impl ChVm {
             Ok::<_, Error>(())
         }
         .await;
-        // The mapping holds the memory file's inode, and the config and state
-        // were read at startup, so nothing here is needed any longer.
+        // Memory, config and state were all read in at startup, so nothing
+        // here is needed any longer.
         let _ = tokio::fs::remove_dir_all(&restore_dir).await;
         if let Err(err) = loaded {
             vm.stop().await;
@@ -547,8 +548,8 @@ async fn unpack(spec: &VmSpec, jail: Option<&ChJail>) -> Result<(PathBuf, Value)
     tokio::fs::create_dir_all(&dir).await?;
     tokio::fs::write(dir.join("config.json"), serde_json::to_vec(&written)?).await?;
     tokio::fs::write(dir.join("state.json"), serde_json::to_vec(&packed.state)?).await?;
-    // Linked: the VMM maps it copy-on-write and never writes back, which is
-    // what lets every sandbox of a warm template share the one file.
+    // Linked: the VMM only reads it, so every sandbox of a warm template
+    // restores from the one file.
     let memory = spec.workdir.join(MEMORY_FILE);
     tokio::fs::hard_link(&memory, dir.join("memory-ranges")).await?;
     // Cloud Hypervisor writes it 0600, so one written by a VMM running as
@@ -658,6 +659,15 @@ async fn tail(path: &Path, n: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A guest restored over a copy-on-write mapping of its memory file read
+    /// corrupt memory after a resume and heavy I/O. Both ways of restoring
+    /// copy it in.
+    #[test]
+    fn a_restore_copies_guest_memory_in() {
+        assert_eq!(MEMORY_RESTORE_MODE, "copy");
+        assert_eq!(MEMORY_RESTORE_MODE_API, "Copy");
+    }
 
     /// A restore whose VMM never reports the state loaded used to be polled
     /// forever. It gives up at the deadline and says what the VMM last said.
