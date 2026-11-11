@@ -30,6 +30,9 @@ const READ_CHUNK: usize = 32 * 1024;
 /// How long an exited command's pipes may stay quiet before its exit is
 /// reported without waiting for them to close, as on Linux.
 const DRAIN_IDLE: std::time::Duration = std::time::Duration::from_millis(500);
+/// How long after the exit output from what the command left running is still
+/// waited for, however steadily it arrives.
+const DRAIN_MAX: std::time::Duration = std::time::Duration::from_secs(5);
 
 /// The variables a process cannot do without on Windows, kept even for a
 /// command that asked for an empty environment: without `SystemRoot`,
@@ -429,7 +432,9 @@ async fn control(
 
 /// Reports the exit once the command's output is in, so it is the last thing
 /// recorded; a process the command left running can hold its pipes open, so
-/// the wait also ends once output stops arriving.
+/// the wait also ends once output stops arriving, or [`DRAIN_MAX`] after the
+/// exit while it keeps arriving. The stream ends with the exit, as the pumps
+/// let go of it then; see [`pump`].
 async fn report_exit(
     code: i32,
     signal: i32,
@@ -438,12 +443,15 @@ async fn report_exit(
     handle: Handle,
 ) {
     let mut drained = futures::future::join_all(pumps);
+    let deadline = tokio::time::Instant::now() + DRAIN_MAX;
     loop {
         let before = handle.produced();
         tokio::select! {
             _ = &mut drained => break,
             () = tokio::time::sleep(DRAIN_IDLE) => {
-                if handle.produced() == before && tx.capacity() > 0 {
+                let is_quiet = handle.produced() == before
+                    || tokio::time::Instant::now() >= deadline;
+                if is_quiet && tx.capacity() > 0 {
                     break;
                 }
             }
@@ -460,20 +468,35 @@ async fn report_exit(
 /// Child output to the registry, and to the stream that started it while it
 /// lasts. Reading goes on regardless, or the child would block on a pipe
 /// nobody is draining.
+///
+/// The stream is let go of once the exit is recorded, so it ends with the
+/// exit even while a process the command left running holds the pipe open.
+/// What that process writes afterwards is drained and dropped.
 async fn pump(
     mut chunks: mpsc::Receiver<Vec<u8>>,
     tx: OutputTx,
     handle: Handle,
     wrap: fn(Vec<u8>) -> Frame,
 ) {
-    let mut streaming = true;
-    while let Some(bytes) = chunks.recv().await {
+    let mut stream = Some(tx);
+    loop {
+        let bytes = tokio::select! {
+            bytes = chunks.recv() => bytes,
+            () = handle.exited(), if stream.is_some() => {
+                stream = None;
+                continue;
+            }
+        };
+        let Some(bytes) = bytes else { break };
         let frame = wrap(bytes);
         let outputs = frame.outputs();
-        handle.record(frame);
+        if !handle.record(frame) {
+            stream = None;
+        }
         for output in outputs {
-            if streaming {
-                streaming = tx.send(chunk(output)).await.is_ok();
+            let Some(tx) = &stream else { break };
+            if tx.send(chunk(output)).await.is_err() {
+                stream = None;
             }
         }
     }

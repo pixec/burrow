@@ -27,7 +27,7 @@ use std::collections::{HashMap, VecDeque};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 
-use tokio::sync::{Notify, broadcast, mpsc};
+use tokio::sync::{Notify, broadcast, mpsc, watch};
 use tokio_stream::StreamExt as _;
 use tonic::{Status, Streaming};
 
@@ -224,6 +224,8 @@ struct Entry {
     /// Output produced in all, which is where the next frame starts.
     produced: u64,
     live: broadcast::Sender<Frame>,
+    /// Set once the exit is recorded, for the tasks still reading its output.
+    exited: watch::Sender<bool>,
     /// Feeds the command's stdin, terminal and signals. Gone once it exits.
     input: Option<mpsc::Sender<guestpb::ExecInput>>,
 }
@@ -251,6 +253,7 @@ impl Entry {
             is_announced: false,
             produced: 0,
             live: broadcast::channel(LIVE_BACKLOG).0,
+            exited: watch::Sender::new(false),
             input: None,
         }
     }
@@ -340,9 +343,23 @@ impl Handle {
         &self.id
     }
 
-    /// Sends a frame on to the host and to whoever is attached.
-    pub fn record(&self, frame: Frame) {
-        self.entry.lock().unwrap().emit(frame);
+    /// Sends a frame on to the host and to whoever is attached, saying
+    /// whether it was. Output that arrives after the exit, from a child the
+    /// command left holding its pipes, is dropped: the exit is the last thing
+    /// a command records.
+    pub fn record(&self, frame: Frame) -> bool {
+        let mut entry = self.entry.lock().unwrap();
+        let is_running = entry.exit_code.is_none();
+        if is_running {
+            entry.emit(frame);
+        }
+        is_running
+    }
+
+    /// Resolves once the exit is recorded.
+    pub async fn exited(&self) {
+        let mut exited = self.entry.lock().unwrap().exited.subscribe();
+        let _ = exited.wait_for(|&exited| exited).await;
     }
 
     /// Output produced so far.
@@ -363,6 +380,7 @@ impl Handle {
         entry.ended_at_ms = now_ms();
         entry.input = None;
         entry.emit(Frame::Exit { code, signal });
+        entry.exited.send_replace(true);
     }
 }
 
@@ -783,6 +801,29 @@ mod tests {
         let upto = pending[0].seq;
         feed_buffer().lock().unwrap().release(upto);
         assert!(pending_for(handle.id()).is_empty());
+    }
+
+    /// The exit is the last frame a command records, and wakes whoever waits
+    /// for it.
+    #[tokio::test]
+    async fn output_after_the_exit_is_dropped() {
+        let handle = register(
+            vec!["sh".into()],
+            String::new(),
+            -1,
+            None,
+            Rotation::default(),
+        );
+        assert!(handle.record(Frame::Stdout(b"before".to_vec())));
+        let exited = tokio::spawn({
+            let handle = handle.clone();
+            async move { handle.exited().await }
+        });
+        handle.finish(0, 0);
+        exited.await.unwrap();
+        assert!(!handle.record(Frame::Stdout(b"after".to_vec())));
+        handle.exited().await;
+        assert_eq!(handle.produced(), 6);
     }
 
     /// A command a signal ended reports the signal, then the shell-style code.

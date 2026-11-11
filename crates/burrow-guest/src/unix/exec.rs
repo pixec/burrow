@@ -33,6 +33,9 @@ const READ_CHUNK: usize = 32 * 1024;
 /// How long an exited command's pipes may stay quiet before its exit is
 /// reported without waiting for them to close.
 const DRAIN_IDLE: std::time::Duration = std::time::Duration::from_millis(500);
+/// How long after the exit output from what the command left running is still
+/// waited for, however steadily it arrives.
+const DRAIN_MAX: std::time::Duration = std::time::Duration::from_secs(5);
 
 type OutputTx = mpsc::Sender<Result<guestpb::ExecOutput, Status>>;
 type OutputRx = mpsc::Receiver<Result<guestpb::ExecOutput, Status>>;
@@ -442,7 +445,9 @@ async fn control_pty(
 
 /// Reports the exit once the command's output is in, so it is the last thing
 /// recorded. A child the command left running can hold its pipes open, so
-/// the wait also ends once output stops arriving.
+/// the wait also ends once output stops arriving, or [`DRAIN_MAX`] after the
+/// exit while it keeps arriving. The stream ends with the exit, as the pumps
+/// let go of it then; see [`pump`].
 async fn report_exit(
     exit: tokio::sync::oneshot::Receiver<reaper::Exit>,
     pumps: Vec<tokio::task::JoinHandle<()>>,
@@ -452,6 +457,7 @@ async fn report_exit(
     let messages = match exit.await {
         Ok(exit) => {
             let mut drained = futures::future::join_all(pumps);
+            let deadline = tokio::time::Instant::now() + DRAIN_MAX;
             loop {
                 let before = handle.produced();
                 tokio::select! {
@@ -459,7 +465,9 @@ async fn report_exit(
                     // A full channel is a stream not yet read, behind which
                     // a pump holds output it has yet to send.
                     () = tokio::time::sleep(DRAIN_IDLE) => {
-                        if handle.produced() == before && tx.capacity() > 0 {
+                        let is_quiet = handle.produced() == before
+                            || tokio::time::Instant::now() >= deadline;
+                        if is_quiet && tx.capacity() > 0 {
                             break;
                         }
                     }
@@ -494,22 +502,36 @@ async fn report_exit(
 /// client that started it, and what it produces after that is what a later
 /// attach replays. Reading also has to continue regardless, or the child would
 /// block on a pipe nobody is draining.
+///
+/// The stream is let go of once the exit is recorded, so it ends with the
+/// exit even while a child the command left running, a daemon say, holds the
+/// pipe open. What that child writes afterwards is drained and dropped.
 async fn pump<R>(mut pipe: R, tx: OutputTx, handle: Handle, wrap: fn(Vec<u8>) -> Frame)
 where
     R: tokio::io::AsyncRead + Unpin,
 {
     let mut buf = vec![0u8; READ_CHUNK];
-    let mut streaming = true;
+    let mut stream = Some(tx);
     loop {
-        match pipe.read(&mut buf).await {
+        let read = tokio::select! {
+            read = pipe.read(&mut buf) => read,
+            () = handle.exited(), if stream.is_some() => {
+                stream = None;
+                continue;
+            }
+        };
+        match read {
             Ok(0) | Err(_) => break,
             Ok(n) => {
                 let frame = wrap(buf[..n].to_vec());
                 let outputs = frame.outputs();
-                handle.record(frame);
+                if !handle.record(frame) {
+                    stream = None;
+                }
                 for output in outputs {
-                    if streaming {
-                        streaming = tx.send(chunk(output)).await.is_ok();
+                    let Some(tx) = &stream else { break };
+                    if tx.send(chunk(output)).await.is_err() {
+                        stream = None;
                     }
                 }
             }
@@ -553,5 +575,119 @@ fn send_signal(pid: i32, signal: i32) {
     };
     if let Err(err) = nix::sys::signal::killpg(nix::unistd::Pid::from_raw(pid), Some(signal)) {
         tracing::warn!(pid, %err, "failed to signal child");
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::os::unix::process::CommandExt;
+    use std::time::{Duration, Instant};
+
+    use super::*;
+
+    /// Runs `script` under `sh` the way [`run_pipes`] does, with a thread
+    /// standing in for the reaper, and returns what its stream carried and
+    /// how long the stream took to end.
+    async fn exec(script: &str) -> (Vec<Output>, Duration) {
+        let mut child = std::process::Command::new("sh")
+            .args(["-c", script])
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .process_group(0)
+            .spawn()
+            .unwrap();
+        let pid = child.id() as i32;
+        let handle = commands::register(
+            vec!["sh".into()],
+            String::new(),
+            pid,
+            None,
+            commands::Rotation::default(),
+        );
+        let stdout = pipe(child.stdout.take().unwrap()).unwrap();
+        let stderr = pipe(child.stderr.take().unwrap()).unwrap();
+        let (exit_tx, exit) = tokio::sync::oneshot::channel();
+        std::thread::spawn(move || {
+            let status = child.wait().unwrap();
+            let _ = exit_tx.send(reaper::Exit {
+                code: status.code().unwrap(),
+                signal: 0,
+            });
+        });
+
+        let started = Instant::now();
+        let (tx, mut rx) = mpsc::channel(CHANNEL_CAPACITY);
+        let pumps = vec![
+            tokio::spawn(pump(stdout, tx.clone(), handle.clone(), Frame::Stdout)),
+            tokio::spawn(pump(stderr, tx.clone(), handle.clone(), Frame::Stderr)),
+        ];
+        tokio::spawn(report_exit(exit, pumps, tx, handle));
+        let mut outputs = Vec::new();
+        let ended = tokio::time::timeout(Duration::from_secs(20), async {
+            while let Some(msg) = rx.recv().await {
+                outputs.push(msg.unwrap().output.unwrap());
+            }
+        })
+        .await;
+        // Whatever the command left running goes with it.
+        let _ = nix::sys::signal::killpg(
+            nix::unistd::Pid::from_raw(pid),
+            nix::sys::signal::Signal::SIGKILL,
+        );
+        assert!(ended.is_ok(), "the stream never ended: {outputs:?}");
+        (outputs, started.elapsed())
+    }
+
+    #[tokio::test]
+    async fn a_command_ends_with_its_output_and_exit() {
+        let (outputs, _) = exec("echo out; echo err >&2; exit 3").await;
+        assert!(outputs.contains(&Output::Stdout(b"out\n".to_vec())));
+        assert!(outputs.contains(&Output::Stderr(b"err\n".to_vec())));
+        assert_eq!(outputs.last(), Some(&Output::ExitCode(3)));
+    }
+
+    /// A child left running with the command's pipes does not keep the
+    /// stream open past the exit.
+    #[tokio::test]
+    async fn a_background_child_does_not_hold_the_stream() {
+        let (outputs, took) = exec("sleep 30 & echo hi; exit 4").await;
+        assert_eq!(
+            outputs,
+            [Output::Stdout(b"hi\n".to_vec()), Output::ExitCode(4)]
+        );
+        assert!(took < Duration::from_secs(5), "took {took:?}");
+    }
+
+    /// What a child prints soon after the command exits is still its output.
+    #[tokio::test]
+    async fn output_just_after_the_exit_is_kept() {
+        let (outputs, _) = exec("(sleep 0.2; echo late) & echo early").await;
+        assert_eq!(
+            outputs,
+            [
+                Output::Stdout(b"early\n".to_vec()),
+                Output::Stdout(b"late\n".to_vec()),
+                Output::ExitCode(0),
+            ]
+        );
+    }
+
+    /// A child that never stops printing holds the exit back only so long.
+    #[tokio::test]
+    async fn a_chatty_child_holds_the_exit_only_so_long() {
+        let (outputs, took) = exec("(while :; do echo tick; sleep 0.1; done) & echo started").await;
+        let stdout: Vec<u8> = outputs
+            .iter()
+            .filter_map(|output| match output {
+                Output::Stdout(bytes) => Some(bytes.as_slice()),
+                _ => None,
+            })
+            .flatten()
+            .copied()
+            .collect();
+        assert!(String::from_utf8(stdout).unwrap().contains("started\n"));
+        assert_eq!(outputs.last(), Some(&Output::ExitCode(0)));
+        assert!(took < DRAIN_MAX + Duration::from_secs(3), "took {took:?}");
     }
 }
