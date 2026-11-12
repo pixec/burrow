@@ -18,9 +18,8 @@ pub const FRIENDLY_NAME: &str = "Burrow inspection CA";
 
 /// `bundle` holding `pem` as its one Burrow block, in place of any it had.
 ///
-/// An unmarked copy of `pem` is dropped too: agents before the markers
-/// appended the certificate bare. The result equals `bundle` when it already
-/// holds exactly this, which is how a caller knows there is nothing to write.
+/// The result equals `bundle` when it already holds exactly this, which is how
+/// a caller knows there is nothing to write.
 pub fn with_ca(bundle: &[u8], pem: &str) -> Vec<u8> {
     let pem = pem.trim().as_bytes();
     let mut kept = Vec::with_capacity(bundle.len() + pem.len() + BEGIN.len() + END.len() + 3);
@@ -35,13 +34,6 @@ pub fn with_ca(bundle: &[u8], pem: &str) -> Vec<u8> {
             kept.extend_from_slice(line);
         }
     }
-    if let Some(at) = find(&kept, pem) {
-        let mut end = at + pem.len();
-        if kept.get(end) == Some(&b'\n') {
-            end += 1;
-        }
-        kept.drain(at..end);
-    }
     if !kept.is_empty() && !kept.ends_with(b"\n") {
         kept.push(b'\n');
     }
@@ -50,15 +42,6 @@ pub fn with_ca(bundle: &[u8], pem: &str) -> Vec<u8> {
         kept.push(b'\n');
     }
     kept
-}
-
-fn find(haystack: &[u8], needle: &[u8]) -> Option<usize> {
-    if needle.is_empty() {
-        return None;
-    }
-    haystack
-        .windows(needle.len())
-        .position(|window| window == needle)
 }
 
 /// Which of the certificates a handshake tagged in a store to delete: every
@@ -115,14 +98,6 @@ mod tests {
     fn the_same_root_again_changes_nothing() {
         let once = with_ca(IMAGE.as_bytes(), NEW);
         assert_eq!(with_ca(&once, NEW), once);
-    }
-
-    #[test]
-    fn a_bare_copy_from_an_older_agent_is_folded_into_the_block() {
-        let legacy = format!("{IMAGE}{NEW}");
-        let bundle = with_ca(legacy.as_bytes(), NEW);
-        assert_eq!(count(&bundle, "new"), 1);
-        assert!(bundle.starts_with(IMAGE.as_bytes()));
     }
 
     #[test]

@@ -24,10 +24,6 @@ use nix::libc;
 
 use burrow_proto::guest::v1 as guestpb;
 
-/// Reported in Health: a user's command runs in their GUI session when they
-/// have one.
-pub const FEATURE_GUI_SESSION: &str = "gui-session";
-
 type MachPort = u32;
 
 /// `struct auditpinfo_addr` from `<bsm/audit.h>`.

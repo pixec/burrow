@@ -293,8 +293,6 @@ export class ChildProcess extends EventEmitter {
             break;
           case "stdout":
           case "stderr": {
-            // An older agent sends no id, so its first output is the start.
-            this.start();
             const bytes: Uint8Array = msg[msg.output];
             if (bytes.length) (msg.output === "stdout" ? this.stdout : this.stderr)?.push(Buffer.from(bytes));
             break;

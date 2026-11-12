@@ -11,7 +11,6 @@ from __future__ import annotations
 
 import errno
 import io
-import itertools
 import os
 import queue
 import signal
@@ -275,13 +274,15 @@ class Popen:
             except grpc.RpcError as err:
                 inputs.put(None)
                 raise BurrowError.from_grpc(err) from None
+            if first is None or first.WhichOneof("output") != "command_id":
+                inputs.put(None)
+                call.cancel()
+                raise BurrowError("the guest did not name the command", "unavailable")
             return inputs, call, first
 
         self._inputs, call, first = sandbox._with_resume(begin)
-        if first is not None and first.WhichOneof("output") == "command_id":
-            self.cmd_id = first.command_id
-            first = None
-        self._pump_in_background(call, first)
+        self.cmd_id = first.command_id
+        self._pump_in_background(call)
 
         if stdin == PIPE:
             self._pipe_stdin(bufsize, encoding, errors)
@@ -320,7 +321,7 @@ class Popen:
             )
         )
         call = sandbox._transport.route(sandbox.id).duplex("Attach", _drain(self._inputs), None)
-        self._pump_in_background(call, None)
+        self._pump_in_background(call)
         self._pipe_stdin(-1, encoding, errors)
         return self
 
@@ -392,14 +393,14 @@ class Popen:
             self._send(stdin=data)
         self._send(is_stdin_eof=True)
 
-    def _pump_in_background(self, call: Any, first: Any) -> None:
+    def _pump_in_background(self, call: Any) -> None:
         self._call = call
-        threading.Thread(target=self._pump, args=(call, first), daemon=True).start()
+        threading.Thread(target=self._pump, args=(call,), daemon=True).start()
 
-    def _pump(self, call: Any, first: Any) -> None:
+    def _pump(self, call: Any) -> None:
         signal_number = 0
         try:
-            for msg in itertools.chain(() if first is None else (first,), call):
+            for msg in call:
                 kind = msg.WhichOneof("output")
                 if kind in ("stdout", "stderr"):
                     sink = self._sinks[kind]

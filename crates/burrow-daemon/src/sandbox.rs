@@ -1522,8 +1522,8 @@ impl RunningSandbox {
         self.logs.stop_feed();
     }
 
-    /// Whether the agent says it supports `feature`. An agent that predates
-    /// the list says nothing, which reads as no.
+    /// Whether the agent says it supports `feature`. One it does not name
+    /// reads as no.
     pub async fn agent_has(&self, feature: &str) -> Result<bool, Status> {
         let mut agent = self.reach_agent().await?;
         let mut features = self.agent_features.lock().await;

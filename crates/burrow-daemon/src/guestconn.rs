@@ -306,8 +306,8 @@ const RECONNECT_ATTEMPT: std::time::Duration = std::time::Duration::from_secs(3)
 
 /// Handshakes, and brings the guest's agent up to this node's if it differs.
 ///
-/// A guest reports the digest of the agent it runs. One that matches, or that
-/// predates reporting, is left alone. One that differs is sent the node's
+/// A guest reports the digest of the agent it runs. One that matches is left
+/// alone. One that differs is sent the node's
 /// binary; it re-executes itself as PID 1, so the connection drops and this
 /// reconnects and handshakes the new agent, which is the client handed back.
 /// A guest that cannot upgrade right now, because a command is running, is
@@ -324,36 +324,9 @@ pub async fn handshake_upgrading(
         let response = agent.handshake(request.clone()).await?.into_inner();
         return Ok((agent, response));
     };
-    // An agent older than something the request asks of it (volumes, on a
-    // macOS agent from before it mounted them) refuses the handshake whole.
-    // It is handshaken again without them, so it can be upgraded and the new
-    // agent given all of it; if it is not replaced, the refusal stands.
-    let bare = guestpb::HandshakeRequest {
-        volumes: Vec::new(),
-        ..request.clone()
-    };
-    let (response, refused) = match agent.handshake(request.clone()).await {
-        Ok(response) => (response.into_inner(), None),
-        Err(err) if err.code() == tonic::Code::Unimplemented && !request.volumes.is_empty() => {
-            (agent.handshake(bare.clone()).await?.into_inner(), Some(err))
-        }
-        Err(err) => return Err(err),
-    };
-    let unchanged = |agent, response| match refused.clone() {
-        Some(err) => Err(err),
-        None => Ok((agent, response)),
-    };
-    // An agent that reports no digest was built before in-place upgrades and
-    // cannot be upgraded; the template it came from has to be imported again.
-    if response.agent_digest.is_empty() {
-        return Err(tonic::Status::failed_precondition(format!(
-            "the guest runs agent {}, which predates in-place upgrades; import its \
-             template again",
-            response.agent_version
-        )));
-    }
+    let response = agent.handshake(request.clone()).await?.into_inner();
     if response.agent_digest == upgrade.digest {
-        return unchanged(agent, response);
+        return Ok((agent, response));
     }
     // The digest sent is of the bytes read now, not the one hashed at
     // startup: the binary on disk may have been replaced since, and the guest
@@ -366,7 +339,7 @@ pub async fn handshake_upgrading(
         hex::encode(sha2::Sha256::digest(&bytes))
     };
     if digest == response.agent_digest {
-        return unchanged(agent, response);
+        return Ok((agent, response));
     }
     tracing::info!(
         from = response.agent_version,
@@ -387,14 +360,18 @@ pub async fn handshake_upgrading(
         Ok(resp) => resp.into_inner().is_restarting,
         Err(err) if err.code() == tonic::Code::FailedPrecondition => {
             tracing::warn!(%err, "guest agent busy; upgrading it on its next handshake");
-            return unchanged(agent, response);
+            return Ok((agent, response));
         }
         Err(err) => return Err(err),
     };
     if !restarting {
-        return unchanged(agent, response);
+        return Ok((agent, response));
     }
     drop(agent);
+    let bare = guestpb::HandshakeRequest {
+        volumes: Vec::new(),
+        ..request.clone()
+    };
     // The old agent answers and then re-executes, and how long that takes
     // is the guest's business, so a reconnect can still land on the old
     // process and be cut off as it is replaced. The new agent is the one

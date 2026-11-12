@@ -38,7 +38,6 @@ pub fn features() -> Vec<String> {
         "attach-input".to_string(),
         "output-feed".to_string(),
         fs::FEATURE_FS.to_string(),
-        session::FEATURE_GUI_SESSION.to_string(),
     ];
     if handshake::is_root_trusted() {
         features.push(handshake::FEATURE_ROOT_TRUSTED.to_string());
