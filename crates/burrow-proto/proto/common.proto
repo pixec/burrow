@@ -77,8 +77,8 @@ message ResourcePolicy {
   // Shows the guest the host's virtualization extensions, so it has a
   // /dev/kvm and can run VMs of its own (QEMU, Firecracker, the Android
   // emulator). Cloud Hypervisor on x86_64 only, placed only on nodes that
-  // report `is_nested_virt_supported`, and the guest kernel needs KVM built
-  // in. Fixed at create and kept by snapshots. Such a sandbox always boots
+  // report `is_nested_virt_supported`, and only from a template whose kernel
+  // has KVM built in (`KernelCapabilities.is_kvm_built_in`). Fixed at create and kept by snapshots. Such a sandbox always boots
   // cold: warm snapshots are taken without it.
   bool is_nested_virt_enabled = 11;
 }
@@ -587,6 +587,9 @@ message Sandbox {
   // The `request_id` of the create that made it, which a retry of that
   // create is answered with this sandbox for. Empty when none was given.
   string create_request_id = 38;
+  // The kernel its guest runs: its template's when it was created or last
+  // booted on its disk. Saved memory restores only onto this kernel.
+  Kernel kernel = 39;
 }
 
 enum CheckpointKind {
@@ -817,6 +820,48 @@ message NodeInfo {
   // Whether the node runs Cloud Hypervisor on x86_64 with its KVM's nested
   // virtualization on, which a sandbox's `is_nested_virt_enabled` needs.
   bool is_nested_virt_supported = 27;
+  // Guest kernels a template can be built with here (`--kernel`), with what
+  // each was found to have built in.
+  repeated Kernel kernels = 28;
+}
+
+// A guest kernel, named on a node and identified by content.
+message Kernel {
+  // The node's name for it, e.g. "ch-linux". A template records the name it
+  // was built with; the digest is what it runs.
+  string name = 1;
+  // SHA-256 of the image, in hex.
+  string digest = 2;
+  // Hypervisors it boots under. Empty on a template's or a sandbox's kernel,
+  // which is its hypervisor's.
+  repeated string hypervisors = 3;
+  // Read from the image itself, never from configuration.
+  KernelCapabilities capabilities = 4;
+  // "Linux version" of the image, e.g. "7.2.8+".
+  string version = 5;
+  // "x86_64" or "aarch64".
+  string arch = 6;
+  // Where the capabilities came from: "ikconfig" (the config embedded in
+  // the image), "config" (a `<image>.config` beside it) or "strings" (names
+  // that only built-in drivers put in the image).
+  string detected_from = 7;
+  // The node's default for these hypervisors.
+  repeated string default_for = 8;
+}
+
+// What a guest kernel has built in. Burrow guests load no modules, so
+// anything built as a module counts as absent.
+message KernelCapabilities {
+  // KVM, with a vendor backend on x86_64: what `is_nested_virt_enabled`
+  // needs to give the guest a usable /dev/kvm.
+  bool is_kvm_built_in = 1;
+  // virtio-mem, which live memory changes plug and unplug through.
+  bool is_virtio_mem_built_in = 2;
+  // virtio-vsock, which the guest agent is reached over.
+  bool is_vsock_built_in = 3;
+  // virtio-blk and ext4, which the root disk is.
+  bool is_virtio_blk_built_in = 4;
+  bool is_ext4_built_in = 5;
 }
 
 // What restoring a guest's saved memory needs of the CPU under it. A guest
@@ -884,6 +929,9 @@ message NodeStatus {
   // The hypervisor each of `templates` runs under here, so placement charges
   // a create the memory ceiling of the VMM it will get.
   map<string, string> template_hypervisors = 18;
+  // The kernel each of `templates` boots here, so placement can tell which
+  // can give a guest what it asks for, such as nested virtualization.
+  map<string, Kernel> template_kernels = 19;
 }
 
 // A warm snapshot of one template at one machine shape. A create of that

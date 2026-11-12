@@ -181,6 +181,7 @@ async fn scan(data_dir: &Path) -> Vec<(api::TemplateInfo, bool)> {
             is_systemd: environment.systemd,
             guest_os,
             hypervisor,
+            kernel: None,
         };
         out.push((info, is_bootable));
     }

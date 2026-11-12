@@ -674,6 +674,7 @@ fn local_node_info(args: &ServeArgs) -> anyhow::Result<NodeInfo> {
         is_io_weight_supported: burrow_vmm::is_io_weight_supported(&args.cgroup_root),
         // Filled in once the binaries have been looked for.
         is_nested_virt_supported: false,
+        kernels: Vec::new(),
     })
 }
 

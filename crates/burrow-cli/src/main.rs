@@ -3529,7 +3529,14 @@ impl Transition {
             Transition::Pause => client.pause_sandbox(id).await,
             Transition::Resume => client.resume_sandbox(id).await,
             Transition::Stop => client.stop_sandbox(id).await,
-            Transition::Start => client.start_sandbox(id).await,
+            Transition::Start => {
+                client
+                    .start_sandbox(api::StartSandboxRequest {
+                        sandbox_id: id.sandbox_id,
+                        is_kernel_kept: false,
+                    })
+                    .await
+            }
         }?;
         Ok(resp.into_inner())
     }

@@ -45,7 +45,7 @@ service NodeService {
   rpc PauseSandbox(NodeSandboxRef) returns (burrow.common.v1.Sandbox);
   rpc ResumeSandbox(NodeSandboxRef) returns (burrow.common.v1.Sandbox);
   rpc StopSandbox(NodeSandboxRef) returns (burrow.common.v1.Sandbox);
-  rpc StartSandbox(NodeSandboxRef) returns (burrow.common.v1.Sandbox);
+  rpc StartSandbox(NodeStartRequest) returns (burrow.common.v1.Sandbox);
   rpc RecreateSandbox(NodeRecreateRequest) returns (burrow.common.v1.Sandbox);
   // Sessions are recorded by the node that started the VMs, so they are read
   // from it like any other per-sandbox fact.
@@ -251,6 +251,11 @@ message PullTemplateResponse {
 
 message NodeSandboxRef {
   string sandbox_id = 1;
+}
+
+message NodeStartRequest {
+  string sandbox_id = 1;
+  bool is_kernel_kept = 2;
 }
 
 // A NodeSandboxRef with the stamp the orchestrator took, by the clock it

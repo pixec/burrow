@@ -27,7 +27,7 @@ service Burrow {
   // again. Unlike pause and resume, the guest's processes do not survive and
   // a Kit's startup hooks run again on the way up.
   rpc StopSandbox(SandboxRef) returns (burrow.common.v1.Sandbox);
-  rpc StartSandbox(SandboxRef) returns (burrow.common.v1.Sandbox);
+  rpc StartSandbox(StartSandboxRequest) returns (burrow.common.v1.Sandbox);
   // Replace a sandbox's root disk, discarding everything written to it, while
   // keeping its id, address, name and volumes. With a Kit, the composition
   // may change too.
@@ -411,6 +411,12 @@ message BuildTemplateRequest {
   // build, which needs about 28 GiB to install macOS. On a Mac node only a
   // `from_ipsw` build takes it.
   uint32 disk_mib = 12;
+  // The guest kernel, by the node's name for it (NodeInfo.kernels). Empty is
+  // the base template's, else the node's default for the hypervisor: the
+  // Firecracker CI kernel for Firecracker, Cloud Hypervisor's own for Cloud
+  // Hypervisor. Recorded with the template, by name and digest; every
+  // sandbox and warm snapshot of it boots this kernel.
+  string kernel = 13;
 }
 
 message BuildDone {
@@ -446,6 +452,9 @@ message TemplateInfo {
   string hypervisor = 7;
   // Its warm snapshots, by shape and, through the orchestrator, by node.
   repeated burrow.common.v1.WarmShape warm_shapes = 8;
+  // The kernel its sandboxes boot. Empty for a template booted from
+  // firmware or installed whole (Windows, macOS).
+  burrow.common.v1.Kernel kernel = 9;
 }
 
 message ListTemplatesResponse {
@@ -576,6 +585,13 @@ message DrainNodeResponse {
 // the same.
 message SandboxRef {
   string sandbox_id = 1;
+}
+
+message StartSandboxRequest {
+  string sandbox_id = 1;
+  // Boot the kernel the sandbox last ran rather than its template's current
+  // one, which a template rebuilt with another `kernel` has changed.
+  bool is_kernel_kept = 2;
 }
 
 message UpdateNetworkPolicyRequest {

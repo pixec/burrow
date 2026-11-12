@@ -2236,7 +2236,7 @@ impl Burrow for ApiService {
 
     async fn start_sandbox(
         &self,
-        req: Request<api::SandboxRef>,
+        req: Request<api::StartSandboxRequest>,
     ) -> Result<Response<common::Sandbox>, Status> {
         let id = self.resolve(&req.into_inner().sandbox_id).await;
         if let Some(sandbox) = self.unplaced(&id).await {
@@ -2246,7 +2246,10 @@ impl Burrow for ApiService {
         }
         let (mut client, _admitted) = self.admitted_node_for(&id).await?;
         let sandbox = client
-            .start_sandbox(nodepb::NodeSandboxRef { sandbox_id: id })
+            .start_sandbox(nodepb::NodeStartRequest {
+                sandbox_id: id,
+                is_kernel_kept: false,
+            })
             .await?
             .into_inner();
         self.0.sandboxes.update(sandbox.clone());
@@ -4561,8 +4564,9 @@ mod tests {
 
         other.refresh("sbx_a").await.unwrap();
         let err = replica(other)
-            .start_sandbox(Request::new(api::SandboxRef {
+            .start_sandbox(Request::new(api::StartSandboxRequest {
                 sandbox_id: "sbx_a".into(),
+                ..Default::default()
             }))
             .await
             .unwrap_err();
@@ -4830,8 +4834,9 @@ mod tests {
             .forget_node("node1", &common::NodeInfo::default());
         assert_eq!(unplaced.len(), 1);
         let err = api
-            .start_sandbox(Request::new(api::SandboxRef {
+            .start_sandbox(Request::new(api::StartSandboxRequest {
                 sandbox_id: "sbx_a".into(),
+                ..Default::default()
             }))
             .await
             .unwrap_err();

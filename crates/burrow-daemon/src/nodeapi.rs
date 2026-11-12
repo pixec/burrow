@@ -851,7 +851,7 @@ impl NodeService for NodeApi {
 
     async fn start_sandbox(
         &self,
-        req: Request<nodepb::NodeSandboxRef>,
+        req: Request<nodepb::NodeStartRequest>,
     ) -> Result<Response<common::Sandbox>, Status> {
         self.sandboxes.admit()?;
         let id = req.into_inner().sandbox_id;

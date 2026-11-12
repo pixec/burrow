@@ -89,7 +89,7 @@ class BurrowStub(object):
                 _registered_method=True)
         self.StartSandbox = channel.unary_unary(
                 '/burrow.api.v1.Burrow/StartSandbox',
-                request_serializer=api__pb2.SandboxRef.SerializeToString,
+                request_serializer=api__pb2.StartSandboxRequest.SerializeToString,
                 response_deserializer=common__pb2.Sandbox.FromString,
                 _registered_method=True)
         self.RecreateSandbox = channel.unary_unary(
@@ -926,7 +926,7 @@ def add_BurrowServicer_to_server(servicer, server):
             ),
             'StartSandbox': grpc.unary_unary_rpc_method_handler(
                     servicer.StartSandbox,
-                    request_deserializer=api__pb2.SandboxRef.FromString,
+                    request_deserializer=api__pb2.StartSandboxRequest.FromString,
                     response_serializer=common__pb2.Sandbox.SerializeToString,
             ),
             'RecreateSandbox': grpc.unary_unary_rpc_method_handler(
@@ -1517,7 +1517,7 @@ class Burrow(object):
             request,
             target,
             '/burrow.api.v1.Burrow/StartSandbox',
-            api__pb2.SandboxRef.SerializeToString,
+            api__pb2.StartSandboxRequest.SerializeToString,
             common__pb2.Sandbox.FromString,
             options,
             channel_credentials,
