@@ -752,6 +752,35 @@ fn warn_if_buffered_loop(dir: &std::path::Path) {
     }
 }
 
+/// Warns when Firecracker is offered and transparent huge pages are not
+/// `always`. Firecracker never asks for huge pages on guest memory, so under
+/// `madvise` a cold-booted guest runs on 4 KiB host pages: on the test server
+/// its first touch of 1 GiB took 10.5 s against 0.27 s under `always`, and its
+/// memory latency was 12% worse. Cloud Hypervisor asks for them itself.
+fn warn_if_firecracker_lacks_huge_pages(hypervisors: &[burrow_vmm::Hypervisor]) {
+    if !hypervisors.contains(&burrow_vmm::Hypervisor::Firecracker) {
+        return;
+    }
+    let Ok(enabled) = std::fs::read_to_string("/sys/kernel/mm/transparent_hugepage/enabled") else {
+        return;
+    };
+    if let Some(mode) = selected(&enabled)
+        && mode != "always"
+    {
+        tracing::warn!(
+            transparent_hugepage = mode,
+            "transparent huge pages are not `always`, so Firecracker guests booted cold run on \
+             4 KiB host pages; write `always` to /sys/kernel/mm/transparent_hugepage/enabled"
+        );
+    }
+}
+
+/// The bracketed choice in a sysfs setting such as `always [madvise] never`.
+fn selected(setting: &str) -> Option<&str> {
+    let (_, rest) = setting.split_once('[')?;
+    rest.split_once(']').map(|(mode, _)| mode)
+}
+
 /// Whether the loop device `dev` (Linux's encoding) does direct I/O to its
 /// backing file, read from `sys`; `None` when `dev` is not a loop device.
 fn loop_direct_io(sys: &std::path::Path, dev: u64) -> Option<bool> {
@@ -1506,6 +1535,7 @@ pub async fn run(args: ServeArgs) -> anyhow::Result<()> {
         })
         .collect();
     node_info.hypervisors = hypervisors.iter().map(|h| h.to_string()).collect();
+    warn_if_firecracker_lacks_huge_pages(&hypervisors);
     node_info.is_nested_virt_supported = hypervisors
         .iter()
         .any(|h| burrow_vmm::HypervisorExt::capabilities(*h).is_nested_virt_supported)
@@ -2023,6 +2053,13 @@ mod tests {
         assert_eq!(parse_io_engine("sync"), Ok(burrow_vmm::IoEngine::Sync));
         assert_eq!(parse_io_engine("async"), Ok(burrow_vmm::IoEngine::Async));
         assert!(parse_io_engine("Async").is_err());
+    }
+
+    #[test]
+    fn a_sysfs_setting_reads_as_its_bracketed_choice() {
+        assert_eq!(selected("always [madvise] never\n"), Some("madvise"));
+        assert_eq!(selected("[always] madvise never\n"), Some("always"));
+        assert_eq!(selected("always madvise never"), None);
     }
 
     #[test]
