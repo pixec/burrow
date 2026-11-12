@@ -25,6 +25,7 @@ use aws_sdk_s3::operation::create_bucket::CreateBucketError;
 use aws_sdk_s3::operation::get_object::GetObjectError;
 use aws_sdk_s3::operation::head_object::HeadObjectError;
 use aws_sdk_s3::primitives::ByteStream;
+use aws_sdk_s3::types::{BucketLocationConstraint, CreateBucketConfiguration};
 use aws_smithy_http_client::tls;
 use tokio::io::{AsyncReadExt as _, AsyncSeekExt as _, AsyncWriteExt as _};
 use tonic::Status;
@@ -182,12 +183,30 @@ impl ObjectStore {
 
     /// Creates the bucket if the store does not have it. Self-hosted stores
     /// start empty, and a node that can create its own tables should not
-    /// need an operator to make its bucket by hand.
+    /// need an operator to make its bucket by hand. A bucket that is already
+    /// there is only looked at, so a pre-created one needs no
+    /// `s3:CreateBucket`.
     pub async fn ensure_bucket(&self) -> Result<(), Status> {
+        match self.client.head_bucket().bucket(&self.bucket).send().await {
+            Ok(_) => return Ok(()),
+            Err(SdkError::ServiceError(err)) if err.err().is_not_found() => {}
+            Err(err) => return Err(unavailable("head bucket", &self.bucket, err)),
+        }
+        // S3 refuses a create without the bucket's region everywhere but
+        // us-east-1, where it refuses one with it.
+        let region = self.client.config().region().map(Region::as_ref);
+        let configuration = region
+            .filter(|region| !region.is_empty() && *region != "us-east-1")
+            .map(|region| {
+                CreateBucketConfiguration::builder()
+                    .location_constraint(BucketLocationConstraint::from(region))
+                    .build()
+            });
         match self
             .client
             .create_bucket()
             .bucket(&self.bucket)
+            .set_create_bucket_configuration(configuration)
             .send()
             .await
         {
@@ -526,8 +545,8 @@ impl ObjectStore {
 #[cfg(test)]
 pub(crate) mod fake {
     //! An S3 server of objects in a map, enough of one for the SDK: get,
-    //! head, put (conditional or not), delete and a one-page listing, over
-    //! HTTP/1.1. Puts can be throttled, as S3 throttles them with `SlowDown`.
+    //! head, put (conditional or not), delete, a one-page listing and head
+    //! and create of a bucket, over HTTP/1.1. Puts can be throttled, as S3 throttles them with `SlowDown`.
 
     use std::collections::HashMap;
     use std::sync::atomic::{AtomicUsize, Ordering};
@@ -538,9 +557,11 @@ pub(crate) mod fake {
     use super::{ObjectStore, Options};
 
     #[derive(Default)]
-    struct Objects {
+    pub struct Objects {
         by_key: HashMap<String, (Vec<u8>, String)>,
         versions: u64,
+        /// Each bucket by name, with the body of the create that made it.
+        pub buckets: HashMap<String, String>,
     }
 
     /// What the store does to puts.
@@ -558,13 +579,34 @@ pub(crate) mod fake {
     /// A store on a loopback port. `honours_conditions` false is a store that
     /// ignores `If-Match` and `If-None-Match`, as versitygw 1.0.14 does.
     pub async fn store(honours_conditions: bool) -> ObjectStore {
-        serving(honours_conditions, Arc::default(), options(10, 32, 8)).await
+        let objects = Arc::new(Mutex::new(Objects::default()));
+        objects
+            .lock()
+            .unwrap()
+            .buckets
+            .insert("test".into(), String::new());
+        serving(
+            honours_conditions,
+            Arc::default(),
+            objects,
+            options(10, 32, 8),
+        )
+        .await
+    }
+
+    /// A store signing for `region` that has no bucket yet, and its contents.
+    pub async fn bucketless(region: &str) -> (ObjectStore, Arc<Mutex<Objects>>) {
+        let objects = Arc::new(Mutex::new(Objects::default()));
+        let mut options = options(10, 32, 8);
+        options.region = region.into();
+        let store = serving(true, Arc::default(), Arc::clone(&objects), options).await;
+        (store, objects)
     }
 
     /// A store whose puts fail as `faults` says, with `options` for the client.
     pub async fn faulty(options: Options) -> (ObjectStore, Arc<Faults>) {
         let faults = Arc::new(Faults::default());
-        let mut store = serving(true, Arc::clone(&faults), options).await;
+        let mut store = serving(true, Arc::clone(&faults), Arc::default(), options).await;
         store.requeue_after = std::time::Duration::from_millis(20);
         (store, faults)
     }
@@ -583,11 +625,11 @@ pub(crate) mod fake {
     async fn serving(
         honours_conditions: bool,
         faults: Arc<Faults>,
+        objects: Arc<Mutex<Objects>>,
         mut options: Options,
     ) -> ObjectStore {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         options.endpoint = format!("http://{}", listener.local_addr().unwrap());
-        let objects = Arc::new(Mutex::new(Objects::default()));
         tokio::spawn(async move {
             loop {
                 let (stream, _) = listener.accept().await.unwrap();
@@ -656,7 +698,10 @@ pub(crate) mod fake {
             let mut body = vec![0; length];
             read.read_exact(&mut body).await.unwrap();
 
+            let bucket = key.trim_matches('/');
+            let bucket = (listing.is_none() && !bucket.contains('/')).then(|| bucket.to_string());
             let throttled = method == "PUT"
+                && bucket.is_none()
                 && faults
                     .slow_downs
                     .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |n| n.checked_sub(1))
@@ -674,6 +719,21 @@ pub(crate) mod fake {
                 let mut objects = objects.lock().unwrap();
                 let current = objects.by_key.get(&key).map(|(_, etag)| etag.clone());
                 match method.as_str() {
+                    "HEAD" if bucket.is_some() => {
+                        match objects.buckets.contains_key(bucket.as_ref().unwrap()) {
+                            true => (200, None, Vec::new()),
+                            false => (404, None, Vec::new()),
+                        }
+                    }
+                    "PUT" if bucket.is_some() => match objects.buckets.entry(bucket.unwrap()) {
+                        std::collections::hash_map::Entry::Occupied(_) => {
+                            (400, None, error("IllegalLocationConstraintException"))
+                        }
+                        std::collections::hash_map::Entry::Vacant(slot) => {
+                            slot.insert(String::from_utf8(body).unwrap());
+                            (200, None, Vec::new())
+                        }
+                    },
                     "GET" if listing.is_some() => {
                         let prefix = listing.unwrap();
                         let bucket = format!("{key}/");
@@ -829,6 +889,30 @@ mod tests {
         assert!(first >= super::REQUEUE_AFTER / 2 && first <= super::REQUEUE_AFTER);
         assert!(store.requeue_delay(40) <= super::MAX_REQUEUE_AFTER);
         assert!(store.requeue_delay(40) >= super::MAX_REQUEUE_AFTER / 2);
+    }
+
+    /// A pre-created bucket is only looked at: AWS refuses a create of an
+    /// existing bucket outside us-east-1 before it says who owns it.
+    #[tokio::test]
+    async fn an_existing_bucket_is_not_created_again() {
+        let store = super::fake::store(true).await;
+        store.ensure_bucket().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_missing_bucket_is_created_in_the_store_region() {
+        let (store, objects) = super::fake::bucketless("ap-southeast-5").await;
+        store.ensure_bucket().await.unwrap();
+        let created = objects.lock().unwrap().buckets["test"].clone();
+        assert!(
+            created.contains("<LocationConstraint>ap-southeast-5</LocationConstraint>"),
+            "{created}"
+        );
+        store.ensure_bucket().await.unwrap();
+
+        let (store, objects) = super::fake::bucketless("us-east-1").await;
+        store.ensure_bucket().await.unwrap();
+        assert!(!objects.lock().unwrap().buckets["test"].contains("LocationConstraint"));
     }
 
     #[tokio::test]

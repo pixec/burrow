@@ -72,7 +72,8 @@ pub struct ServeArgs {
     /// a self-hosted one. Required with --object-store.
     #[arg(long, env = "BURROW_OBJECT_STORE_ENDPOINT")]
     pub object_store_endpoint: Option<String>,
-    /// Region the endpoint signs for. Self-hosted stores accept anything.
+    /// Region the endpoint signs for, and the region a missing bucket is
+    /// created in. Self-hosted stores accept anything.
     #[arg(long, default_value = "us-east-1", env = "BURROW_OBJECT_STORE_REGION")]
     pub object_store_region: String,
     /// A 32-byte key every node shares, sealing the brokered credentials a
