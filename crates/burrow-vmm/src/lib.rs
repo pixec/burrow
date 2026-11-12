@@ -19,6 +19,7 @@ mod http;
 
 pub mod cloud_hypervisor;
 pub mod firecracker;
+pub mod memfile;
 #[cfg(target_os = "macos")]
 pub mod vz;
 
@@ -29,9 +30,8 @@ pub use cgroup::{Cgroup, Limits};
 pub use cloud_hypervisor::{ChJail, CloudHypervisorConfig};
 pub use error::{Error, Result};
 pub use firecracker::{FirecrackerConfig, Jail, MemorySource, PageSource};
-#[cfg(target_os = "linux")]
-pub use firecracker::{data_extents, merge_chain};
 pub use guest::{GUEST_CID, GuestAddr, VSOCK_UDS};
+pub use memfile::{data_extents, merge_chain};
 #[cfg(target_os = "macos")]
 pub use vz::{MacOsBoot, Requirements, VzConfig};
 
@@ -568,6 +568,15 @@ impl Vm {
                 hypervisor: Hypervisor::Vz,
                 what: "take a diff snapshot",
             }),
+        }
+    }
+
+    /// Whether a diff taken now would know exactly which pages it holds. A
+    /// suspend or checkpoint that cannot takes a full snapshot instead.
+    pub fn can_map_diff(&self) -> bool {
+        match self {
+            Self::Firecracker(vm) => vm.can_map_diff(),
+            _ => false,
         }
     }
 

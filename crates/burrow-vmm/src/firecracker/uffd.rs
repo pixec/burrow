@@ -30,11 +30,13 @@ use std::io;
 use std::os::fd::{AsRawFd, OwnedFd, RawFd};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use serde::Deserialize;
+
+use crate::memfile;
 
 /// Socket Firecracker connects to, relative to the VM working directory.
 pub const UFFD_SOCK: &str = "uffd.sock";
@@ -196,87 +198,57 @@ impl Drop for Backing {
     }
 }
 
-/// One memory file in a snapshot chain, with a map of where it holds data.
+/// One memory file in a snapshot chain, with the pages it defines.
 ///
-/// A diff snapshot is a sparse file the size of the whole guest: pages the VM
-/// touched are written, and everything else is a hole. A hole and a page of
-/// genuine zeroes are identical through a mapping, so the holes have to be
-/// found through the filesystem (`SEEK_DATA`/`SEEK_HOLE`) rather than by
-/// reading. Without that a diff would appear to define every page and the
-/// layers beneath it would never be consulted.
+/// A hole and a page of genuine zeroes are identical through a mapping, so a
+/// diff's pages come from the map written beside it ([`crate::memfile`]).
+/// Without that a diff would appear to define every page and the layers
+/// beneath it would never be consulted.
 struct Layer {
     backing: Backing,
-    /// Sorted, non-overlapping `[start, end)` byte ranges that hold data.
-    extents: Vec<(u64, u64)>,
+    pages: memfile::Layer,
     /// Set when the file is still arriving: every page is asked for before it
     /// is read.
     source: Option<Arc<dyn super::PageSource>>,
 }
 
 impl Layer {
-    fn open(path: &Path, source: Option<Arc<dyn super::PageSource>>) -> io::Result<Self> {
-        let extents = match &source {
-            Some(source) => source.extents(),
-            None => data_extents(&std::fs::File::open(path)?)?,
+    fn open(
+        path: &Path,
+        index: usize,
+        source: Option<Arc<dyn super::PageSource>>,
+    ) -> io::Result<Self> {
+        let file = std::fs::File::open(path)?;
+        let pages = match &source {
+            Some(source) => memfile::Layer::full(file.metadata()?.len(), source.extents()),
+            None => memfile::open_layer(path, &file, index)?,
         };
         Ok(Self {
             backing: Backing::map(path)?,
-            extents,
+            pages,
             source,
         })
     }
+}
 
-    /// Whether this layer defines the page at `offset`.
-    fn is_defined_at(&self, offset: u64) -> bool {
-        self.extents
-            .binary_search_by(|(start, end)| {
-                if offset < *start {
-                    std::cmp::Ordering::Greater
-                } else if offset >= *end {
-                    std::cmp::Ordering::Less
-                } else {
-                    std::cmp::Ordering::Equal
-                }
-            })
-            .is_ok()
+impl AsRef<memfile::Layer> for Layer {
+    fn as_ref(&self) -> &memfile::Layer {
+        &self.pages
     }
 }
 
-/// The byte ranges of a sparse file that actually hold data.
-pub fn data_extents(file: &std::fs::File) -> io::Result<Vec<(u64, u64)>> {
-    let fd = file.as_raw_fd();
-    let size = file.metadata()?.len() as i64;
-    let mut extents = Vec::new();
-    let mut cursor = 0i64;
+/// Every page the handler has filled, by file offset.
+///
+/// Firecracker writes a diff of a VM restored through this handler from
+/// `mincore`, which reports exactly the pages that are present, and a page of
+/// an anonymous mapping registered with a userfaultfd is only ever made
+/// present here. So this is a superset of what a diff holds, and the pages it
+/// adds are ones the balloon took back, which read as zeroes from the diff and
+/// are zeroes to the guest.
+type Served = Mutex<memfile::PageMap>;
 
-    while cursor < size {
-        // SAFETY: `fd` is open; SEEK_DATA/SEEK_HOLE take plain integers.
-        let start = unsafe { libc::lseek(fd, cursor, libc::SEEK_DATA) };
-        if start < 0 {
-            let err = io::Error::last_os_error();
-            // ENXIO means "no data at or after here": the rest is a hole.
-            if err.raw_os_error() == Some(libc::ENXIO) {
-                break;
-            }
-            // A filesystem without sparse-file support reports the whole file
-            // as data, which is correct if pessimistic.
-            if err.raw_os_error() == Some(libc::EINVAL) {
-                return Ok(vec![(0, size as u64)]);
-            }
-            return Err(err);
-        }
-        // SAFETY: as above.
-        let end = unsafe { libc::lseek(fd, start, libc::SEEK_HOLE) };
-        if end < 0 {
-            return Err(io::Error::last_os_error());
-        }
-        if end <= start {
-            break;
-        }
-        extents.push((start as u64, end as u64));
-        cursor = end;
-    }
-    Ok(extents)
+fn mark(served: &Served, offset: u64, len: u64) {
+    served.lock().unwrap().insert_bytes(offset, offset + len);
 }
 
 /// How guest memory should be served for one restored VM.
@@ -338,7 +310,13 @@ fn write_plan(path: &Path, offsets: &[u64]) -> io::Result<()> {
 /// thousands of individual faults, each one a stalled vCPU and a round trip
 /// into this process. Filling them in one pass turns that into a sequential
 /// copy.
-fn prefetch(fd: RawFd, regions: &[RegionMapping], layers: &[Layer], offsets: &[u64]) -> usize {
+fn prefetch(
+    fd: RawFd,
+    regions: &[RegionMapping],
+    layers: &[Layer],
+    served: &Served,
+    offsets: &[u64],
+) -> usize {
     // A base still arriving is asked for the whole plan in one go, so its
     // pages come in parallel rather than one blocking fetch per offset below.
     if let (Some(source), Some(region)) = (
@@ -361,8 +339,13 @@ fn prefetch(fd: RawFd, regions: &[RegionMapping], layers: &[Layer], offsets: &[u
         let page = region.base_host_virt_addr + (offset - region.offset);
         // A page already populated returns EEXIST, which copy_page treats as
         // success; a missing one is simply skipped.
-        if copy_page(fd, region, page, layers).is_ok() {
-            filled += 1;
+        match copy_page(fd, region, page, layers, served) {
+            Ok(()) => filled += 1,
+            // Nothing was filled, so a diff will not hold it either.
+            Err(_) => served
+                .lock()
+                .unwrap()
+                .remove_bytes(offset, offset + region.page_size as u64),
         }
     }
     filled
@@ -376,6 +359,7 @@ fn prefetch(fd: RawFd, regions: &[RegionMapping], layers: &[Layer], offsets: &[u
 pub struct UffdBackend {
     socket_path: PathBuf,
     stop: Arc<AtomicBool>,
+    served: Arc<Served>,
     thread: Option<std::thread::JoinHandle<()>>,
 }
 
@@ -417,20 +401,25 @@ impl UffdBackend {
             .map(|(index, path)| {
                 Layer::open(
                     path,
+                    index,
                     (index == 0).then(|| plan.base_source.clone()).flatten(),
                 )
             })
             .collect::<io::Result<_>>()?;
         let stop = Arc::new(AtomicBool::new(false));
+        let served = Arc::new(Mutex::new(memfile::PageMap::new(
+            layers[0].pages.len / memfile::PAGE,
+        )));
 
         let thread = {
             let stop = Arc::clone(&stop);
+            let served = Arc::clone(&served);
             let memory_file = chain.last().cloned().unwrap_or_default();
             let plan = plan.clone();
             std::thread::Builder::new()
                 .name("burrow-uffd".into())
                 .spawn(move || {
-                    if let Err(err) = serve(&listener, layers, &stop, &plan) {
+                    if let Err(err) = serve(&listener, layers, &served, &stop, &plan) {
                         // A guest whose faults go unanswered stalls silently,
                         // so this is the only warning anyone will get.
                         tracing::error!(
@@ -444,8 +433,14 @@ impl UffdBackend {
         Ok(Self {
             socket_path,
             stop,
+            served,
             thread: Some(thread),
         })
+    }
+
+    /// The pages a diff of this VM holds, at most: every page served so far.
+    pub fn served_pages(&self) -> memfile::PageMap {
+        self.served.lock().unwrap().clone()
     }
 
     /// Path Firecracker should be pointed at, relative to the working
@@ -472,6 +467,7 @@ impl Drop for UffdBackend {
 fn serve(
     listener: &UnixListener,
     layers: Vec<Layer>,
+    served: &Served,
     stop: &AtomicBool,
     plan: &MemoryPlan,
 ) -> io::Result<()> {
@@ -485,10 +481,10 @@ fn serve(
     let total: usize = regions.iter().map(|r| r.size).sum();
     // The base is sized for the whole guest; diffs are the same size with
     // holes, so any layer being short means a mismatched snapshot.
-    if let Some(short) = layers.iter().find(|layer| total > layer.backing.len) {
+    if let Some(short) = layers.iter().find(|layer| total as u64 > layer.pages.len) {
         return Err(io::Error::other(format!(
             "guest memory is {total} bytes but a snapshot layer holds {}",
-            short.backing.len
+            short.pages.len
         )));
     }
     tracing::debug!(
@@ -504,7 +500,7 @@ fn serve(
         let offsets = read_plan(path);
         if !offsets.is_empty() {
             let started = Instant::now();
-            let filled = prefetch(uffd.as_raw_fd(), &regions, &layers, &offsets);
+            let filled = prefetch(uffd.as_raw_fd(), &regions, &layers, served, &offsets);
             tracing::debug!(
                 pages = filled,
                 of = offsets.len(),
@@ -514,7 +510,7 @@ fn serve(
         }
     }
 
-    let faulted = handle_faults(&uffd, &regions, &layers, stop)?;
+    let faulted = handle_faults(&uffd, &regions, &layers, served, stop)?;
 
     if let Some(path) = &plan.record_to {
         let mut offsets: Vec<u64> = faulted.into_iter().collect();
@@ -609,6 +605,7 @@ fn handle_faults(
     uffd: &OwnedFd,
     regions: &[RegionMapping],
     layers: &[Layer],
+    served: &Served,
     stop: &AtomicBool,
 ) -> io::Result<std::collections::BTreeSet<u64>> {
     let fd = uffd.as_raw_fd();
@@ -647,9 +644,18 @@ fn handle_faults(
                 // Recorded by file offset, because the address a region lands
                 // at is a property of this restore, not of the snapshot.
                 faulted.insert(region.offset + (page - region.base_host_virt_addr));
-                copy_page(fd, region, page, layers)?;
+                copy_page(fd, region, page, layers, served)?;
             }
-            Event::Remove { start, end } => zero_range(fd, start, end)?,
+            Event::Remove { start, end } => {
+                if let Some(region) = regions.iter().find(|r| r.is_in_region(start)) {
+                    mark(
+                        served,
+                        region.offset + (start - region.base_host_virt_addr),
+                        end - start,
+                    );
+                }
+                zero_range(fd, start, end)?
+            }
             Event::Other => {}
         }
     }
@@ -659,13 +665,18 @@ fn handle_faults(
 ///
 /// A page no layer defines was never written, which for a sparse snapshot
 /// means it is zero, so it is filled rather than treated as an error.
-fn copy_page(fd: RawFd, region: &RegionMapping, page: u64, layers: &[Layer]) -> io::Result<()> {
+fn copy_page(
+    fd: RawFd,
+    region: &RegionMapping,
+    page: u64,
+    layers: &[Layer],
+    served: &Served,
+) -> io::Result<()> {
     let offset = region.offset + (page - region.base_host_virt_addr);
-    let Some(layer) = layers
-        .iter()
-        .rev()
-        .find(|layer| layer.is_defined_at(offset))
-    else {
+    // Before the page can be present, so no snapshot finds it present and
+    // unrecorded.
+    mark(served, offset, region.page_size as u64);
+    let Some(layer) = memfile::resolve(layers, offset).map(|index| &layers[index]) else {
         return zero_range(fd, page, page + region.page_size as u64);
     };
     if let Some(source) = &layer.source {
@@ -723,78 +734,6 @@ fn zero_range(fd: RawFd, start: u64, end: u64) -> io::Result<()> {
             _ => return Err(err),
         }
     }
-}
-
-/// Copies a snapshot file without filling in its holes.
-///
-/// `std::fs::copy` expands every hole into real zeroes, which turns merging a
-/// mostly-untouched 512 MiB guest into 512 MiB of writes, and leaves the
-/// merged base dense, so the next merge is expensive too. `--reflink=auto`
-/// makes it metadata-only on filesystems that support it.
-fn copy_preserving_holes(source: &Path, dest: &Path) -> io::Result<()> {
-    let status = std::process::Command::new("cp")
-        .args(["--sparse=always", "--reflink=auto"])
-        .arg(source)
-        .arg(dest)
-        .status();
-    match status {
-        Ok(status) if status.success() => Ok(()),
-        // A slow merge beats a failed one.
-        _ => std::fs::copy(source, dest).map(|_| ()),
-    }
-}
-
-/// Flattens a snapshot chain into a single memory file.
-///
-/// A chain cannot grow without bound: every layer is another lookup on the
-/// path of a page fault. The obvious way to reset it, taking a full snapshot,
-/// is the worst way, because with the page-fault handler active it makes
-/// Firecracker read the entire guest through this process, faulting in every
-/// page to write it straight back out. Measured at 6.4s against 44ms for a
-/// diff.
-///
-/// Merging on the host instead never touches the guest: it is sequential file
-/// work over the layers already on disk. The output is written to a temporary
-/// and renamed, so a merge that fails leaves the chain it was flattening
-/// intact, and so that a `snapshot.mem` hard-linked from a warm template is
-/// replaced rather than written through.
-pub fn merge_chain(chain: &[PathBuf], out: &Path) -> io::Result<()> {
-    use std::io::{Read, Seek, SeekFrom, Write};
-
-    let Some((base, diffs)) = chain.split_first() else {
-        return Err(io::Error::other("nothing to merge"));
-    };
-
-    let temp = out.with_extension("merging");
-    let _ = std::fs::remove_file(&temp);
-    copy_preserving_holes(base, &temp)?;
-
-    let mut merged = std::fs::OpenOptions::new().write(true).open(&temp)?;
-    let mut buffer = vec![0u8; 1024 * 1024];
-
-    for diff in diffs {
-        let mut source = std::fs::File::open(diff)?;
-        // Only the ranges the diff actually wrote; its holes mean "unchanged",
-        // and copying them would erase the layer underneath with zeroes.
-        for (start, end) in data_extents(&source)? {
-            source.seek(SeekFrom::Start(start))?;
-            merged.seek(SeekFrom::Start(start))?;
-            let mut left = (end - start) as usize;
-            while left > 0 {
-                let want = left.min(buffer.len());
-                let read = source.read(&mut buffer[..want])?;
-                if read == 0 {
-                    break;
-                }
-                merged.write_all(&buffer[..read])?;
-                left -= read;
-            }
-        }
-    }
-
-    merged.flush()?;
-    drop(merged);
-    std::fs::rename(&temp, out)
 }
 
 #[cfg(test)]

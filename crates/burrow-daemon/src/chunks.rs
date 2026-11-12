@@ -110,40 +110,36 @@ pub struct Reuse<'a> {
     pub covered: usize,
 }
 
-#[cfg(target_os = "linux")]
-fn extents(file: &std::fs::File) -> std::io::Result<Vec<(u64, u64)>> {
-    burrow_vmm::data_extents(file)
-}
-
-#[cfg(not(target_os = "linux"))]
-fn extents(file: &std::fs::File) -> std::io::Result<Vec<(u64, u64)>> {
-    let size = file.metadata()?.len();
-    Ok(if size == 0 {
-        Vec::new()
-    } else {
-        vec![(0, size)]
-    })
-}
-
 struct OpenLayer {
     file: std::fs::File,
-    extents: Vec<(u64, u64)>,
+    layer: burrow_vmm::memfile::Layer,
 }
 
 impl OpenLayer {
-    fn overlapping(&self, start: u64, end: u64) -> impl Iterator<Item = (u64, u64)> + '_ {
-        let first = self.extents.partition_point(|&(_, e)| e <= start);
-        self.extents[first..]
-            .iter()
-            .take_while(move |&&(s, _)| s < end)
-            .map(move |&(s, e)| (s.max(start), e.min(end)))
-    }
-
     fn chunks(&self, chunk_size: u64) -> impl Iterator<Item = u64> + '_ {
-        self.extents
+        self.layer
+            .defined
             .iter()
             .flat_map(move |&(s, e)| (s / chunk_size)..e.div_ceil(chunk_size))
     }
+}
+
+/// Opens a chain, oldest first, each layer with the ranges it defines: a
+/// diff's from its page map, never from the filesystem.
+fn open_layers(
+    paths: &[PathBuf],
+    extents: &dyn burrow_vmm::memfile::Extents,
+    exact: bool,
+) -> std::io::Result<Vec<OpenLayer>> {
+    paths
+        .iter()
+        .enumerate()
+        .map(|(index, path)| {
+            let file = std::fs::File::open(path)?;
+            let layer = burrow_vmm::memfile::open_layer_with(path, &file, index, extents, exact)?;
+            Ok(OpenLayer { file, layer })
+        })
+        .collect()
 }
 
 /// Reads one chunk of the chain as the guest sees it: oldest layer first, each
@@ -151,7 +147,7 @@ impl OpenLayer {
 fn read_merged(layers: &[OpenLayer], start: u64, end: u64) -> std::io::Result<Vec<u8>> {
     let mut buf = vec![0u8; (end - start) as usize];
     for layer in layers {
-        for (s, e) in layer.overlapping(start, end) {
+        for (s, e) in layer.layer.overlapping(start, end) {
             layer
                 .file
                 .read_exact_at(&mut buf[(s - start) as usize..(e - start) as usize], s)?;
@@ -182,14 +178,11 @@ pub async fn put_image(
     let opened: Vec<OpenLayer> = {
         let paths: Vec<PathBuf> = layers.iter().map(|name| dir.join(name)).collect();
         tokio::task::spawn_blocking(move || {
-            paths
-                .iter()
-                .map(|path| {
-                    let file = std::fs::File::open(path)?;
-                    let extents = extents(&file)?;
-                    Ok(OpenLayer { file, extents })
-                })
-                .collect::<std::io::Result<Vec<_>>>()
+            open_layers(
+                &paths,
+                &burrow_vmm::memfile::Seek,
+                burrow_vmm::memfile::are_holes_exact(),
+            )
         })
         .await
         .map_err(|err| Status::internal(format!("opening layers: {err}")))?
@@ -197,10 +190,7 @@ pub async fn put_image(
     };
     let size = opened
         .iter()
-        .map(|layer| layer.file.metadata().map(|m| m.len()))
-        .collect::<std::io::Result<Vec<_>>>()
-        .map_err(io)?
-        .into_iter()
+        .map(|layer| layer.layer.len)
         .max()
         .unwrap_or(0);
 
@@ -317,8 +307,8 @@ pub async fn put_disk_since(
                 Some(base) => crate::rootdisk::unchanged_chunks(&file, &std::fs::File::open(base)?),
                 None => None,
             };
-            let extents = crate::rootdisk::data_extents(&file)?;
-            Ok::<_, std::io::Error>((OpenLayer { file, extents }, size, unchanged))
+            let layer = burrow_vmm::memfile::Layer::full(size, burrow_vmm::data_extents(&file)?);
+            Ok::<_, std::io::Error>((OpenLayer { file, layer }, size, unchanged))
         })
         .await
         .map_err(|err| Status::internal(format!("opening a disk: {err}")))?
@@ -973,6 +963,15 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    fn layer(path: &Path, defined: Vec<(u64, u64)>) -> OpenLayer {
+        let file = std::fs::File::open(path).unwrap();
+        let len = file.metadata().unwrap().len();
+        OpenLayer {
+            file,
+            layer: burrow_vmm::memfile::Layer::full(len, defined),
+        }
+    }
+
     #[test]
     fn a_newer_layer_wins_where_it_holds_data() {
         let dir = std::env::temp_dir().join(format!("burrow-merge-{}", std::process::id()));
@@ -980,14 +979,8 @@ mod tests {
         std::fs::write(dir.join("base"), vec![1u8; 8]).unwrap();
         std::fs::write(dir.join("diff"), [0, 0, 9, 9]).unwrap();
         let layers = vec![
-            OpenLayer {
-                file: std::fs::File::open(dir.join("base")).unwrap(),
-                extents: vec![(0, 8)],
-            },
-            OpenLayer {
-                file: std::fs::File::open(dir.join("diff")).unwrap(),
-                extents: vec![(2, 4)],
-            },
+            layer(&dir.join("base"), vec![(0, 8)]),
+            layer(&dir.join("diff"), vec![(2, 4)]),
         ];
         assert_eq!(
             read_merged(&layers, 0, 8).unwrap(),
@@ -999,10 +992,53 @@ mod tests {
 
     #[test]
     fn extents_map_to_the_chunks_they_touch() {
-        let layer = OpenLayer {
-            file: std::fs::File::open("/dev/null").unwrap(),
-            extents: vec![(0, 10), (CHUNK_SIZE * 3 - 1, CHUNK_SIZE * 3 + 1)],
-        };
+        let layer = layer(
+            Path::new("/dev/null"),
+            vec![(0, 10), (CHUNK_SIZE * 3 - 1, CHUNK_SIZE * 3 + 1)],
+        );
         assert_eq!(layer.chunks(CHUNK_SIZE).collect::<Vec<_>>(), vec![0, 2, 3]);
+    }
+
+    /// A filesystem claiming every byte of every file is data, as ZFS's
+    /// records and the old `EINVAL` fallback both could.
+    struct Everything;
+
+    impl burrow_vmm::memfile::Extents for Everything {
+        fn extents(&self, file: &std::fs::File) -> std::io::Result<Vec<(u64, u64)>> {
+            Ok(vec![(0, file.metadata()?.len())])
+        }
+    }
+
+    #[test]
+    fn an_upload_flattens_diffs_by_their_page_maps() {
+        use burrow_vmm::memfile::{PAGE, PageMap, append_map};
+        let dir = std::env::temp_dir().join(format!("burrow-upload-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let pages = CHUNK_SIZE * 2 / PAGE;
+        let base = dir.join("snapshot.mem");
+        std::fs::write(&base, vec![7u8; (pages * PAGE) as usize]).unwrap();
+        let diff = dir.join("snapshot.diff1.mem");
+        let file = std::fs::File::create(&diff).unwrap();
+        file.set_len(pages * PAGE).unwrap();
+        file.write_all_at(&[3u8; PAGE as usize], 5 * PAGE).unwrap();
+        let mut map = PageMap::new(pages);
+        // Page 5 rewritten, page 6 zeroed by the guest.
+        map.insert(5);
+        map.insert(6);
+        append_map(&diff, &map).unwrap();
+
+        let layers = open_layers(&[base, diff], &Everything, false).unwrap();
+        assert_eq!(layers.iter().map(|l| l.layer.len).max(), Some(pages * PAGE));
+        assert_eq!(layers[1].chunks(CHUNK_SIZE).collect::<Vec<_>>(), vec![0]);
+        let mut expected = vec![7u8; CHUNK_SIZE as usize];
+        expected[(5 * PAGE) as usize..(6 * PAGE) as usize].fill(3);
+        expected[(6 * PAGE) as usize..(7 * PAGE) as usize].fill(0);
+        assert_eq!(read_merged(&layers, 0, CHUNK_SIZE).unwrap(), expected);
+        assert_eq!(
+            read_merged(&layers, CHUNK_SIZE, 2 * CHUNK_SIZE).unwrap(),
+            vec![7u8; CHUNK_SIZE as usize]
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

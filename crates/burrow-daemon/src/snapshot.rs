@@ -1256,7 +1256,7 @@ async fn flatten(dir: &Path, chain: &[String], layout: burrow_vmm::Layout) -> Re
     if chain.len() > 1 {
         let paths: Vec<PathBuf> = chain.iter().map(|name| dir.join(name)).collect();
         let target = target.clone();
-        tokio::task::spawn_blocking(move || merge_chain(&paths, &target))
+        tokio::task::spawn_blocking(move || burrow_vmm::merge_chain(&paths, &target))
             .await
             .map_err(|err| Status::internal(format!("flattening did not run: {err}")))?
             .map_err(|err| Status::internal(format!("flattening the memory chain: {err}")))?;
@@ -1271,16 +1271,6 @@ async fn flatten(dir: &Path, chain: &[String], layout: burrow_vmm::Layout) -> Re
         ));
     }
     Ok(())
-}
-
-#[cfg(target_os = "linux")]
-fn merge_chain(paths: &[PathBuf], target: &Path) -> std::io::Result<()> {
-    burrow_vmm::merge_chain(paths, target)
-}
-
-#[cfg(not(target_os = "linux"))]
-fn merge_chain(_paths: &[PathBuf], _target: &Path) -> std::io::Result<()> {
-    Err(std::io::Error::other("merging is linux-only"))
 }
 
 /// Writes a snapshot's manifest, atomically.

@@ -6,8 +6,6 @@ mod model;
 mod process;
 #[cfg(target_os = "linux")]
 pub mod uffd;
-#[cfg(target_os = "linux")]
-pub use uffd::data_extents;
 pub mod vsock;
 
 use std::path::{Path, PathBuf};
@@ -17,7 +15,7 @@ pub use api::FcApi;
 pub use model::{InstanceInfo, NetworkOverride, SnapshotType, VmState};
 pub use process::{FcProcess, Jail};
 #[cfg(target_os = "linux")]
-pub use uffd::{UffdBackend, merge_chain};
+pub use uffd::UffdBackend;
 
 use crate::cgroup::{Cgroup, Limits};
 use crate::error::Result;
@@ -453,7 +451,34 @@ impl MicroVm {
                 snapshot_path: SNAPSHOT_FILE.into(),
                 mem_file_path: mem_file.into(),
             })
-            .await
+            .await?;
+        if kind == SnapshotType::Diff {
+            let path = self.spec.workdir.join(mem_file);
+            let map = self.diff_pages(&path)?;
+            tracing::debug!(
+                vm_id = self.spec.vm_id,
+                pages = map.count(),
+                "diff snapshot written"
+            );
+            crate::memfile::append_map(&path, &map)?;
+        }
+        Ok(())
+    }
+
+    /// Which pages the diff just written to `path` holds. Through the
+    /// page-fault handler, every page it served; otherwise the diff's extents,
+    /// which only a data directory that reports holes exactly can give.
+    fn diff_pages(&self, path: &Path) -> Result<crate::memfile::PageMap> {
+        #[cfg(target_os = "linux")]
+        if let Some(memory) = &self.memory {
+            return Ok(memory.served_pages());
+        }
+        Ok(crate::memfile::map_from_extents(path)?)
+    }
+
+    /// Whether a diff taken now can record exactly which pages it holds.
+    pub fn can_map_diff(&self) -> bool {
+        self.is_lazy_memory_active() || crate::memfile::are_holes_exact()
     }
 
     /// Attaches a drive to a running VM.

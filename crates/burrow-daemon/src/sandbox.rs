@@ -1373,10 +1373,12 @@ impl RunningSandbox {
 
         // A diff records only the pages touched since the snapshot this VM was
         // restored from, which is nearly always a small fraction of the guest.
-        // It is only possible when there is something to diff *against*, and
-        // under a hypervisor that can take one.
+        // It is only possible when there is something to diff *against*, under
+        // a hypervisor that can take one, and when the pages it holds can be
+        // known exactly.
         let chain = self.memory_chain.lock().await.clone();
-        let diff = !chain.is_empty() && vm.capabilities().is_diff_snapshot_supported;
+        let diff =
+            !chain.is_empty() && vm.capabilities().is_diff_snapshot_supported && vm.can_map_diff();
         tracing::Span::current().record("diff", diff);
 
         let next = Layout::diff(chain.len());
@@ -1469,7 +1471,7 @@ impl RunningSandbox {
         let merged = tokio::task::spawn_blocking({
             let paths = paths.clone();
             let target = target.clone();
-            move || Self::merge_chain(&paths, &target)
+            move || burrow_vmm::merge_chain(&paths, &target)
         })
         .await;
 
@@ -1506,16 +1508,6 @@ impl RunningSandbox {
                 tracing::warn!(sandbox = self.id(), %err, "chain flattening did not run")
             }
         }
-    }
-
-    #[cfg(target_os = "linux")]
-    fn merge_chain(paths: &[std::path::PathBuf], target: &Path) -> std::io::Result<()> {
-        burrow_vmm::merge_chain(paths, target)
-    }
-
-    #[cfg(not(target_os = "linux"))]
-    fn merge_chain(_paths: &[std::path::PathBuf], _target: &Path) -> std::io::Result<()> {
-        Err(std::io::Error::other("merging is linux-only"))
     }
 
     /// Deletes diff files a full snapshot has made irrelevant.
@@ -1817,7 +1809,8 @@ impl RunningSandbox {
         };
 
         let chain = self.memory_chain.lock().await.clone();
-        let diff = !chain.is_empty() && vm.capabilities().is_diff_snapshot_supported;
+        let diff =
+            !chain.is_empty() && vm.capabilities().is_diff_snapshot_supported && vm.can_map_diff();
         tracing::Span::current().record("diff", diff);
         let next = Layout::diff(chain.len());
 
