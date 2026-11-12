@@ -504,6 +504,7 @@ impl ApiService {
                 .unwrap_or_default(),
             blkio_weight: resources.as_ref().map_or(0, |r| r.blkio_weight),
             is_nested_virt_enabled: resources.as_ref().is_some_and(|r| r.is_nested_virt_enabled),
+            is_kvm_kernel_needed: resources.as_ref().is_some_and(|r| r.is_nested_virt_enabled),
             mem_mib: match resources.as_ref().map(|r| r.mem_mib).unwrap_or(0) {
                 0 => 512,
                 mem => mem as u64,
@@ -520,6 +521,7 @@ impl ApiService {
             cpu: None,
             // The template decides, and the node holding it can say which.
             hypervisor: self.template_hypervisor(&template).await?,
+            kernel: None,
             policy_features: crate::registry::policy_features(
                 req.policy.as_ref().and_then(|p| p.network.as_ref()),
             ),
@@ -1863,6 +1865,9 @@ impl ApiService {
             cpuset_cpus: resources.cpuset_cpus.clone(),
             blkio_weight: resources.blkio_weight,
             is_nested_virt_enabled: resources.is_nested_virt_enabled,
+            // Its kernel is the one the state ran, which travels with it.
+            is_kvm_kernel_needed: false,
+            kernel: None,
             mem_mib: match resources.mem_mib {
                 0 => 512,
                 mem => mem as u64,
@@ -2238,7 +2243,8 @@ impl Burrow for ApiService {
         &self,
         req: Request<api::StartSandboxRequest>,
     ) -> Result<Response<common::Sandbox>, Status> {
-        let id = self.resolve(&req.into_inner().sandbox_id).await;
+        let req = req.into_inner();
+        let id = self.resolve(&req.sandbox_id).await;
         if let Some(sandbox) = self.unplaced(&id).await {
             return Ok(Response::new(
                 self.adopt(sandbox, "", HashMap::new()).await?,
@@ -2248,7 +2254,7 @@ impl Burrow for ApiService {
         let sandbox = client
             .start_sandbox(nodepb::NodeStartRequest {
                 sandbox_id: id,
-                is_kernel_kept: false,
+                is_kernel_kept: req.is_kernel_kept,
             })
             .await?
             .into_inner();
@@ -2910,6 +2916,8 @@ impl Burrow for ApiService {
             cpuset_cpus: String::new(),
             blkio_weight: 0,
             is_nested_virt_enabled: false,
+            is_kvm_kernel_needed: false,
+            kernel: None,
             mem_mib: 0,
             // A volume's image is the volume's, which disk admission does
             // not count yet.
@@ -3871,6 +3879,9 @@ fn build_placement(req: &api::BuildTemplateRequest) -> crate::registry::Placemen
             false => String::new(),
         },
         hypervisor: hypervisor.to_string(),
+        // A build on a base keeps the base's kernel unless it names one.
+        kernel: (req.from_ipsw.is_empty() && (!is_on_base || !req.kernel.is_empty()))
+            .then(|| req.kernel.clone()),
         ..Default::default()
     }
 }
@@ -3886,6 +3897,7 @@ pub(crate) fn placement_status(err: crate::registry::PlacementError) -> Status {
         | crate::registry::PlacementError::NoNodeWithHypervisor(_)
         | crate::registry::PlacementError::NoNodeWithPolicyFeatures(_)
         | crate::registry::PlacementError::NoNodeForHostLimits(_)
+        | crate::registry::PlacementError::NoNodeWithKernel(_)
         | crate::registry::PlacementError::NoCompatibleNode { .. }
         | crate::registry::PlacementError::NoCompatibleCpu(_) => {
             Status::failed_precondition(err.to_string())
@@ -4566,7 +4578,7 @@ mod tests {
         let err = replica(other)
             .start_sandbox(Request::new(api::StartSandboxRequest {
                 sandbox_id: "sbx_a".into(),
-                ..Default::default()
+                is_kernel_kept: false,
             }))
             .await
             .unwrap_err();
@@ -4836,7 +4848,7 @@ mod tests {
         let err = api
             .start_sandbox(Request::new(api::StartSandboxRequest {
                 sandbox_id: "sbx_a".into(),
-                ..Default::default()
+                is_kernel_kept: false,
             }))
             .await
             .unwrap_err();

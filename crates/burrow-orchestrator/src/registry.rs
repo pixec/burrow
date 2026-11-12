@@ -44,6 +44,13 @@ pub struct Placement {
     /// The guest runs KVM itself, which needs a node that can give it the
     /// extensions.
     pub is_nested_virt_enabled: bool,
+    /// The guest boots its template's kernel and runs KVM, so the template's
+    /// kernel must have KVM built in.
+    pub is_kvm_kernel_needed: bool,
+    /// A build that takes its kernel from the node: the kernel it names, or
+    /// with an empty name the node's default for its hypervisor. `None` for
+    /// anything else.
+    pub kernel: Option<String>,
     pub mem_mib: u64,
     /// The disk it is promised, in bytes: its root disk. Checked against
     /// what the node reports with the node's own rule
@@ -186,6 +193,8 @@ pub enum PlacementError {
     NoNodeWithPolicyFeatures(String),
     #[error("no healthy node can hold the sandbox's host limits: {0}")]
     NoNodeForHostLimits(String),
+    #[error("no healthy node has the kernel this needs: {0}")]
+    NoNodeWithKernel(String),
     #[error(
         "no healthy node carries {0}; label nodes with `burrowd serve --label` and check \
          `burrow nodes ls`"
@@ -206,6 +215,53 @@ pub enum RegisterError {
          the stored index is from a build with a different pool and has to be cleared"
     )]
     ClaimOutOfRange { index: u32, max: u32 },
+}
+
+/// Why `entry`'s node lacks the kernel `want` needs: a build's kernel among
+/// those it offers, or a template whose kernel has what the guest asks of it.
+/// A template's kernel travels with it, so a node that does not hold the
+/// template yet is judged by the copy `nodes` report.
+fn kernel_gap<'a>(
+    entry: &NodeEntry,
+    nodes: impl Iterator<Item = &'a NodeEntry>,
+    want: &Placement,
+) -> Option<String> {
+    if let Some(name) = &want.kernel {
+        let hypervisor = match want.hypervisor.as_str() {
+            "" => Hypervisor::default().as_str(),
+            hypervisor => hypervisor,
+        };
+        let has = entry.info.kernels.iter().any(|kernel| {
+            kernel.hypervisors.iter().any(|h| h == hypervisor)
+                && match name.as_str() {
+                    "" => kernel.default_for.iter().any(|h| h == hypervisor),
+                    name => kernel.name == name,
+                }
+        });
+        if !has {
+            return Some(match name.as_str() {
+                "" => format!("{} has no default kernel for {hypervisor}", entry.info.id),
+                name => format!("{} has no kernel {name} for {hypervisor}", entry.info.id),
+            });
+        }
+    }
+    if want.is_kvm_kernel_needed && entry.is_reported {
+        let held = entry.status.template_kernels.get(&want.template);
+        let kernel = held.or_else(|| {
+            let mut nodes = nodes;
+            nodes.find_map(|e| e.status.template_kernels.get(&want.template))
+        });
+        let is_kvm = kernel
+            .and_then(|k| k.capabilities)
+            .is_some_and(|caps| caps.is_kvm_built_in);
+        if !is_kvm {
+            return Some(format!(
+                "template {}'s kernel on {} has no KVM built in",
+                want.template, entry.info.id
+            ));
+        }
+    }
+    None
 }
 
 /// The version of `hypervisor` a node runs.
@@ -1072,6 +1128,20 @@ impl NodeRegistry {
         if with_template.is_empty() {
             return Err(PlacementError::TemplateNotOnAnyNode(want.template.clone()));
         }
+        let gaps: Vec<_> = with_template
+            .iter()
+            .map(|e| kernel_gap(e, nodes.values(), want))
+            .collect();
+        if gaps.iter().all(Option::is_some) {
+            return Err(PlacementError::NoNodeWithKernel(
+                gaps.into_iter().flatten().collect::<Vec<_>>().join("; "),
+            ));
+        }
+        let with_template: Vec<_> = with_template
+            .into_iter()
+            .zip(gaps)
+            .filter_map(|(e, gap)| gap.is_none().then_some(e))
+            .collect();
 
         // Without a mesh, peers on another node are simply unreachable, so
         // co-location is the only correct answer rather than the fast one.
@@ -2702,6 +2772,118 @@ mod tests {
             .info
             .is_nested_virt_supported = true;
         assert_eq!(registry.place_for(&nested).unwrap(), "nested");
+    }
+
+    /// A nested guest runs its template's kernel, so it goes only where that
+    /// kernel has KVM; a node about to be sent the template is judged by the
+    /// copy another holds, since the kernel travels with it.
+    #[test]
+    fn nested_virtualization_needs_the_templates_kernel_to_have_kvm() {
+        let kernel = |kvm| common::Kernel {
+            name: "k".into(),
+            capabilities: Some(common::KernelCapabilities {
+                is_kvm_built_in: kvm,
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let mut fc = status(&["t"], &[], 64_000);
+        fc.template_kernels.insert("t".into(), kernel(false));
+        let registry = registry(&[("fc", fc)]);
+        registry
+            .nodes
+            .lock()
+            .unwrap()
+            .get_mut("fc")
+            .unwrap()
+            .info
+            .is_nested_virt_supported = true;
+        let nested = Placement {
+            template: "t".into(),
+            is_nested_virt_enabled: true,
+            is_kvm_kernel_needed: true,
+            ..Default::default()
+        };
+        let err = registry.place_for(&nested).unwrap_err();
+        assert!(
+            err.to_string().contains("kernel on fc has no KVM built in"),
+            "{err}"
+        );
+        let plain = Placement {
+            template: "t".into(),
+            ..Default::default()
+        };
+        assert_eq!(registry.place_for(&plain).unwrap(), "fc");
+
+        let mut ch = status(&["t"], &[], 1_000);
+        ch.template_kernels.insert("t".into(), kernel(true));
+        add_nested_node(&registry, "ch", ch);
+        assert_eq!(registry.place_for(&nested).unwrap(), "ch");
+    }
+
+    fn add_nested_node(registry: &NodeRegistry, id: &str, status: NodeStatus) {
+        let _ = registry.register(
+            NodeInfo {
+                id: id.into(),
+                address: format!("{id}:7071"),
+                hypervisors: vec!["firecracker".into()],
+                is_nested_virt_supported: true,
+                ..Default::default()
+            },
+            format!("{id}-pubkey"),
+            format!("{id}:51820"),
+            None,
+        );
+        registry.heartbeat(id, status, None);
+    }
+
+    /// A build that takes its kernel from the node goes where that kernel
+    /// is: the one it names, or a default for its hypervisor.
+    #[test]
+    fn a_build_goes_where_its_kernel_is() {
+        let registry = registry(&[
+            ("fc", status(&[], &[], 64_000)),
+            ("ch", status(&[], &[], 1_000)),
+        ]);
+        let kernels = |id: &str, kernels: Vec<common::Kernel>| {
+            registry
+                .nodes
+                .lock()
+                .unwrap()
+                .get_mut(id)
+                .unwrap()
+                .info
+                .kernels = kernels;
+        };
+        kernels(
+            "fc",
+            vec![common::Kernel {
+                name: "firecracker-ci".into(),
+                hypervisors: vec!["firecracker".into()],
+                default_for: vec!["firecracker".into()],
+                ..Default::default()
+            }],
+        );
+        kernels(
+            "ch",
+            vec![common::Kernel {
+                name: "ch-linux".into(),
+                hypervisors: vec!["firecracker".into()],
+                ..Default::default()
+            }],
+        );
+        let build = |kernel: &str| Placement {
+            kernel: Some(kernel.into()),
+            ..Default::default()
+        };
+        assert_eq!(registry.place_for(&build("ch-linux")).unwrap(), "ch");
+        assert_eq!(registry.place_for(&build("")).unwrap(), "fc");
+        let err = registry.place_for(&build("custom")).unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("ch has no kernel custom for firecracker"),
+            "{err}"
+        );
     }
 
     /// A sandbox with a reservation is charged it, not its vCPUs or its cap:
