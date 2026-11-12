@@ -4729,16 +4729,15 @@ impl SandboxManager {
         Ok(sandbox.record())
     }
 
-    /// Stamps every Access token issued for a sandbox up to `at_ms`, or now
-    /// when that is 0, as revoked, returning the stamp in unix milliseconds.
+    /// Stamps every Access token issued for a sandbox up to `at_ms` as
+    /// revoked, returning the stamp in unix milliseconds.
     /// A stamp never moves back. Persisted with the record, which is what
     /// carries it to the next node when the sandbox moves.
     pub async fn revoke_access(&self, sandbox_id: &str, at_ms: i64) -> Result<i64, Status> {
+        if at_ms <= 0 {
+            return Err(Status::invalid_argument("a revoke needs its stamp"));
+        }
         let sandbox = self.get(sandbox_id).await?;
-        let at_ms = match at_ms {
-            0 => burrow_common::unix_now_ms(),
-            at_ms => at_ms,
-        };
         let stamp = {
             let mut record = sandbox.base_record.lock().unwrap();
             let stamp = at_ms.max(record.access_revoked_at_ms);
@@ -10785,6 +10784,7 @@ pub(crate) mod tests {
         let record = common::Sandbox {
             id: id.into(),
             template: "default".into(),
+            hypervisor: Hypervisor::Firecracker.as_str().into(),
             ..Default::default()
         };
         burrow_store::SandboxRow {

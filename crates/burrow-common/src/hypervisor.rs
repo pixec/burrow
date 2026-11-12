@@ -6,8 +6,7 @@
 /// A hypervisor burrow can run a guest under.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub enum Hypervisor {
-    /// What a sandbox gets when nothing says otherwise, and what every record
-    /// written before there was a choice ran under.
+    /// What a Linux sandbox gets when nothing says otherwise.
     #[default]
     Firecracker,
     CloudHypervisor,
@@ -30,13 +29,9 @@ impl Hypervisor {
         }
     }
 
-    /// The name a record carries. Empty is a record from before the field
-    /// existed, which can only have been Firecracker.
+    /// The name a record carries. Every record names one.
     pub fn from_record(name: &str) -> Option<Self> {
-        match name {
-            "" => Some(Self::Firecracker),
-            name => name.parse().ok(),
-        }
+        name.parse().ok()
     }
 }
 
@@ -126,7 +121,7 @@ impl GuestOs {
         }
     }
 
-    /// Empty is every template imported before the field existed, all Linux.
+    /// Empty is Linux, which is how an imported Linux template records it.
     pub fn from_record(name: &str) -> Option<Self> {
         match name {
             "" | "linux" => Some(Self::Linux),

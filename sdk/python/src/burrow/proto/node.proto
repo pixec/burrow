@@ -255,8 +255,7 @@ message NodeSandboxRef {
 }
 
 // A NodeSandboxRef with the stamp the orchestrator took, by the clock it
-// issues tokens by. 0, from an orchestrator that sends none, is the node's
-// own clock.
+// issues tokens by.
 message NodeRevokeAccessRequest {
   string sandbox_id = 1;
   int64 revoked_at_ms = 2;

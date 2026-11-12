@@ -134,7 +134,7 @@ impl Admissions {
             reserve_bytes: burrow_common::disk::reserve_bytes(policy.reserve_mib, total_bytes),
             provisioned_bytes: provisioned_bytes
                 .saturating_add(self.pending.load(Ordering::Relaxed)),
-            overcommit: burrow_common::disk::effective_overcommit(policy.overcommit),
+            overcommit: policy.overcommit,
         })
     }
 

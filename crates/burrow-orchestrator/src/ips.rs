@@ -578,7 +578,7 @@ impl ApiService {
         if !missing.is_empty() {
             return Err(Status::failed_precondition(format!(
                 "node {node} cannot route a public IP to a sandbox: a macOS node's userspace \
-                 network has no route one could arrive on, and an older burrowd has none"
+                 network has no route one could arrive on"
             )));
         }
         if let Some(pinned) = Self::pinned_node(ip)

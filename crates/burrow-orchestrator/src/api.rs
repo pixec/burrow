@@ -679,30 +679,6 @@ impl ApiService {
 }
 
 impl ApiService {
-    /// Refuses a reshape or a lifetimes update on a node that predates them,
-    /// rather than leaving it to answer unimplemented.
-    fn require_update_resources(&self, id: &str) -> Result<(), Status> {
-        let node_id = self.0.sandboxes.get(id).unwrap_or_default().node_id;
-        let missing = self
-            .0
-            .nodes
-            .info(&node_id)
-            .map(|info| {
-                crate::registry::missing_features(
-                    &info,
-                    &[burrow_common::features::UPDATE_RESOURCES],
-                )
-            })
-            .unwrap_or_default();
-        match missing.is_empty() {
-            true => Ok(()),
-            false => Err(Status::failed_precondition(format!(
-                "node {node_id} cannot update a sandbox's resources or lifetimes; upgrade \
-                 burrowd there"
-            ))),
-        }
-    }
-
     /// Takes `mem_mib` on a node for a sandbox growing there, or says why the
     /// node has no room for it.
     async fn hold_growth(&self, node_id: &str, mem_mib: u64) -> Result<PlacementGuard<'_>, String> {
@@ -1003,7 +979,7 @@ impl ApiService {
             return Ok(());
         }
         Err(Status::failed_precondition(format!(
-            "node {node_id} does not enforce {}, which this policy uses; upgrade burrowd there",
+            "node {node_id} does not enforce {}, which this policy uses",
             missing.join(", ")
         )))
     }
@@ -1373,8 +1349,7 @@ impl ApiService {
                     .unwrap_or_default();
                 if !missing.is_empty() {
                     return Err(Status::failed_precondition(format!(
-                        "node {node_id} holds snapshot {id} and does not enforce {}; upgrade \
-                         burrowd there",
+                        "node {node_id} holds snapshot {id} and does not enforce {}",
                         missing.join(", ")
                     )));
                 }
@@ -1388,13 +1363,16 @@ impl ApiService {
                     arch: snapshot.arch.clone(),
                     hypervisor_version: snapshot.hypervisor_version.clone(),
                     cpu: snapshot.cpu.clone(),
-                    hypervisor: recorded_hypervisor(&snapshot.hypervisor),
+                    hypervisor: snapshot.hypervisor.clone(),
                     disk_bytes: crate::registry::disk_bytes(snapshot.resources.as_ref()),
                     // A sandbox taking the snapshot's own policy carries
                     // fields the orchestrator never sees, so the node
-                    // restoring it elsewhere has to enforce all of them.
+                    // restoring it elsewhere has to enforce ingress, unless
+                    // the snapshot is a macOS guest's, whose policy cannot
+                    // hold any.
                     policy_features: match inherits_policy {
-                        true => burrow_common::features::ALL.to_vec(),
+                        true if snapshot.hypervisor == Hypervisor::Vz.as_str() => Vec::new(),
+                        true => vec![burrow_common::features::INGRESS],
                         false => want.policy_features.clone(),
                     },
                     ..want.clone()
@@ -1928,7 +1906,7 @@ impl ApiService {
                     && !(sandbox.checkpoint_at_unix_ms > 0
                         && sandbox.checkpoint_kind == common::CheckpointKind::Disk as i32)
             }),
-            hypervisor: recorded_hypervisor(&sandbox.hypervisor),
+            hypervisor: sandbox.hypervisor.clone(),
             policy_features: crate::registry::policy_features(
                 sandbox.policy.as_ref().and_then(|p| p.network.as_ref()),
             ),
@@ -1974,13 +1952,8 @@ impl ApiService {
                 .await
             {
                 Ok(_) => return Ok(()),
-                // A node without the store, or one older than the call.
-                Err(status)
-                    if matches!(
-                        status.code(),
-                        tonic::Code::FailedPrecondition | tonic::Code::Unimplemented
-                    ) =>
-                {
+                // A node without the store.
+                Err(status) if status.code() == tonic::Code::FailedPrecondition => {
                     last = status;
                 }
                 Err(status) => return Err(status),
@@ -2402,7 +2375,6 @@ impl Burrow for ApiService {
     ) -> Result<Response<common::Sandbox>, Status> {
         let req = req.into_inner();
         let id = self.resolve(&req.sandbox_id).await;
-        self.require_update_resources(&id)?;
         let mut client = self.node_for(&id).await?;
         let sandbox = client
             .update_lifetime(nodepb::NodeUpdateLifetimeRequest {
@@ -2431,7 +2403,6 @@ impl Burrow for ApiService {
     ) -> Result<Response<api::UpdateResourcesResponse>, Status> {
         let req = req.into_inner();
         let id = self.resolve(&req.sandbox_id).await;
-        self.require_update_resources(&id)?;
         let node_id = self.node_of(&id)?;
         let record = self.0.sandboxes.get(&id).unwrap_or_default();
         let current = record
@@ -3927,12 +3898,6 @@ fn drop_cpuset(sandbox: &mut common::Sandbox) {
     }
 }
 
-/// A record's hypervisor, for placement. Empty is a record from before the
-/// field existed, which ran under Firecracker.
-fn recorded_hypervisor(name: &str) -> String {
-    Hypervisor::from_record(name).map_or_else(|| name.to_string(), |h| h.to_string())
-}
-
 /// The hypervisor a template's `image.json` records: the one it was built
 /// for, or its guest's default where it names none.
 fn configured_hypervisor(image_config: &str) -> String {
@@ -4187,7 +4152,7 @@ mod tests {
     use super::*;
 
     /// What a template was built for decides placement, and a template
-    /// from before the choice existed is a Firecracker one.
+    /// that names none gets its guest's default.
     #[test]
     fn a_templates_hypervisor_is_read_from_its_config() {
         assert_eq!(
@@ -4200,7 +4165,6 @@ mod tests {
             configured_hypervisor(r#"{"guest_os":"windows"}"#),
             "cloud-hypervisor"
         );
-        assert_eq!(recorded_hypervisor(""), "firecracker");
     }
 
     pub(super) fn replica(sandboxes: crate::sandboxes::SandboxRegistry) -> ApiService {
@@ -4292,6 +4256,7 @@ mod tests {
                 id: id.to_string(),
                 address: format!("{id}:7071"),
                 inspection_root_fingerprint: root.to_string(),
+                hypervisors: vec!["firecracker".into()],
                 ..Default::default()
             };
             api.0
@@ -4308,6 +4273,7 @@ mod tests {
             node_id: node.into(),
             state: common::SandboxState::Running as i32,
             inspection_root_fingerprint: root.into(),
+            hypervisor: "firecracker".into(),
             ..Default::default()
         }
     }
@@ -4725,6 +4691,7 @@ mod tests {
                         id: id.into(),
                         address: "127.0.0.1:1".into(),
                         total_vcpus: vcpus,
+                        hypervisors: vec!["firecracker".into()],
                         ..Default::default()
                     },
                     String::new(),
@@ -4746,6 +4713,7 @@ mod tests {
                 }),
                 ..Default::default()
             }),
+            hypervisor: "firecracker".into(),
             ..Default::default()
         };
         let move_to = |dropped| api::MoveSandboxRequest {
@@ -5328,7 +5296,6 @@ mod create_tests {
                     .unwrap()
                     .trim_start_matches("http://")
                     .into(),
-                policy_features: vec![burrow_common::features::UPDATE_RESOURCES.into()],
                 ..Default::default()
             }),
         );

@@ -567,8 +567,8 @@ async fn vmm_version(bin: &std::path::Path) -> String {
 
 /// The hypervisors asked for whose binaries are here. One that is missing is
 /// left out rather than advertised: placement would send this node sandboxes
-/// it could only fail to start. A node offering none is refused, since an
-/// empty list is how a node from before the choice says it runs Firecracker.
+/// it could only fail to start. A node offering none is refused: it could run
+/// nothing.
 fn offered_hypervisors(args: &ServeArgs) -> anyhow::Result<Vec<burrow_vmm::Hypervisor>> {
     let mut offered = Vec::new();
     for hypervisor in &args.hypervisors {
@@ -2012,9 +2012,8 @@ mod tests {
         }
     }
 
-    /// A node whose every hypervisor binary was missing advertised an empty
-    /// list, which placement reads as a node from before the choice, running
-    /// Firecracker. It refuses to start instead.
+    /// A node whose every hypervisor binary is missing could run nothing, so
+    /// it refuses to start.
     #[test]
     fn a_node_with_no_hypervisor_binary_refuses_to_start() {
         #[derive(clap::Parser)]

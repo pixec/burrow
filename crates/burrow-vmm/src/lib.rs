@@ -790,11 +790,11 @@ mod tests {
     use super::*;
 
     #[test]
-    fn names_round_trip_and_an_empty_record_is_firecracker() {
+    fn names_round_trip_and_an_empty_record_is_refused() {
         for hypervisor in Hypervisor::ALL {
             assert_eq!(hypervisor.as_str().parse::<Hypervisor>(), Ok(hypervisor));
         }
-        assert_eq!(Hypervisor::from_record(""), Some(Hypervisor::Firecracker));
+        assert_eq!(Hypervisor::from_record(""), None);
         assert_eq!(Hypervisor::from_record("kvmtool"), None);
         assert_eq!(GuestOs::from_record(""), Some(GuestOs::Linux));
     }

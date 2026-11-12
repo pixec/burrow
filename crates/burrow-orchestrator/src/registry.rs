@@ -127,7 +127,6 @@ pub fn mem_charge_mib(
         named => named,
     };
     match hypervisor {
-        "" if info.hypervisors.is_empty() => ceiling(Hypervisor::Firecracker),
         "" => info
             .hypervisors
             .iter()
@@ -180,7 +179,7 @@ pub enum PlacementError {
          --mesh-endpoint"
     )]
     PeersUnreachable(String),
-    #[error("no healthy node enforces {0}; upgrade burrowd on the nodes")]
+    #[error("no healthy node enforces {0}")]
     NoNodeWithPolicyFeatures(String),
     #[error("no healthy node can hold the sandbox's host limits: {0}")]
     NoNodeForHostLimits(String),
@@ -206,14 +205,8 @@ pub enum RegisterError {
     ClaimOutOfRange { index: u32, max: u32 },
 }
 
-/// The version of `hypervisor` a node runs. Empty names Firecracker, which
-/// every record from before there was a choice ran under.
+/// The version of `hypervisor` a node runs.
 pub fn version_of<'a>(info: &'a NodeInfo, hypervisor: &str) -> &'a str {
-    let hypervisor = if hypervisor.is_empty() {
-        burrow_common::hypervisor::Hypervisor::Firecracker.as_str()
-    } else {
-        hypervisor
-    };
     info.hypervisor_versions
         .get(hypervisor)
         .map_or("", String::as_str)
@@ -277,13 +270,8 @@ pub fn cpu_mismatch(
     (!differences.is_empty()).then(|| differences.join(", "))
 }
 
-/// Whether a node can run sandboxes under `hypervisor`. A node that reports
-/// none predates the choice, and runs Firecracker: a node that has the field
-/// refuses to start with nothing to offer.
+/// Whether a node can run sandboxes under `hypervisor`.
 pub fn offers(info: &NodeInfo, hypervisor: &str) -> bool {
-    if info.hypervisors.is_empty() {
-        return hypervisor == burrow_common::hypervisor::Hypervisor::Firecracker.as_str();
-    }
     info.hypervisors.iter().any(|offered| offered == hypervisor)
 }
 
@@ -295,29 +283,6 @@ pub fn policy_features(network: Option<&common::NetworkPolicy>) -> Vec<&'static 
         return Vec::new();
     };
     let mut used = Vec::new();
-    if !network.deny_ports.is_empty() {
-        used.push(features::DENY_PORTS);
-    }
-    if network.is_ipv6_denied {
-        used.push(features::IPV6_DENIED);
-    }
-    if network
-        .rules
-        .iter()
-        .any(|rule| rule.expires_at_unix_ms != 0)
-    {
-        used.push(features::RULE_EXPIRY);
-    }
-    if network
-        .rules
-        .iter()
-        .any(|rule| !rule.bound_sandbox_id.is_empty())
-    {
-        used.push(features::RULE_BINDING);
-    }
-    if network.is_tls_inspected && network.mode == common::NetworkMode::Open as i32 {
-        used.push(features::OPEN_INSPECTION);
-    }
     if !network.ingress.is_empty() {
         used.push(features::INGRESS);
     }
@@ -770,16 +735,13 @@ impl NodeRegistry {
             .filter(|e| {
                 e.info.id != exclude && e.is_healthy() && !e.wireguard_public_key.is_empty()
             })
-            // `register` refuses an index the pool cannot hold, so this only
-            // fails for a node registered by an older build; such a peer is
-            // omitted rather than advertised with someone else's subnet.
-            .filter_map(|e| {
-                Some(burrow_proto::node::v1::MeshPeer {
-                    node_id: e.info.id.clone(),
-                    public_key: e.wireguard_public_key.clone(),
-                    endpoint: e.wireguard_endpoint.clone(),
-                    subnet: burrow_net::Ipam::for_node(e.index).ok()?.subnet(),
-                })
+            .map(|e| burrow_proto::node::v1::MeshPeer {
+                node_id: e.info.id.clone(),
+                public_key: e.wireguard_public_key.clone(),
+                endpoint: e.wireguard_endpoint.clone(),
+                subnet: burrow_net::Ipam::for_node(e.index)
+                    .expect("register admits only an index the pool holds")
+                    .subnet(),
             })
             .collect()
     }
@@ -1002,8 +964,7 @@ impl NodeRegistry {
         if compatible.is_empty() {
             return Err(PlacementError::NoCompatibleNode {
                 arch: want.arch.clone(),
-                hypervisor: burrow_common::hypervisor::Hypervisor::from_record(&want.hypervisor)
-                    .map_or_else(|| want.hypervisor.clone(), |h| h.to_string()),
+                hypervisor: want.hypervisor.clone(),
                 version: want.hypervisor_version.clone(),
             });
         }
@@ -1385,6 +1346,7 @@ mod tests {
                 NodeInfo {
                     id: (*id).into(),
                     address: format!("{id}:7071"),
+                    hypervisors: vec!["firecracker".into()],
                     ..Default::default()
                 },
                 format!("{id}-pubkey"),
@@ -1702,6 +1664,7 @@ mod tests {
                     id: id.into(),
                     address: format!("{id}:7071"),
                     arch: "aarch64".into(),
+                    hypervisors: vec!["firecracker".into()],
                     hypervisor_versions: [("firecracker".to_string(), version.to_string())].into(),
                     ..Default::default()
                 }),
@@ -1709,6 +1672,7 @@ mod tests {
         }
         let want = Placement {
             arch: "aarch64".into(),
+            hypervisor: "firecracker".into(),
             hypervisor_version: "v1.16.1".into(),
             vcpus: 1,
             mem_mib: 1,
@@ -1933,12 +1897,6 @@ mod tests {
         let network = common::NetworkPolicy {
             mode: common::NetworkMode::Open as i32,
             is_tls_inspected: true,
-            rules: vec![common::RequestRule {
-                domain: "api.example.com".into(),
-                expires_at_unix_ms: 1,
-                bound_sandbox_id: "sbx_a".into(),
-                ..Default::default()
-            }],
             deny_ports: vec![common::PortRule {
                 port: 25,
                 ..Default::default()
@@ -1948,14 +1906,7 @@ mod tests {
             ..Default::default()
         };
         let used = policy_features(Some(&network));
-        assert_eq!(
-            used,
-            features::ALL
-                .iter()
-                .copied()
-                .filter(|f| { !matches!(*f, features::PUBLIC_IPS | features::UPDATE_RESOURCES) })
-                .collect::<Vec<_>>()
-        );
+        assert_eq!(used, [features::INGRESS]);
         let want = Placement {
             template: "t".into(),
             vcpus: 1,
@@ -1990,12 +1941,10 @@ mod tests {
         assert!(policy_features(Some(&common::NetworkPolicy::default())).is_empty());
     }
 
-    /// A node that predates the field runs Firecracker and nothing else.
     #[test]
-    fn a_node_reporting_no_hypervisors_runs_firecracker() {
-        let old = NodeInfo::default();
-        assert!(offers(&old, "firecracker"));
-        assert!(!offers(&old, "cloud-hypervisor"));
+    fn a_node_reporting_no_hypervisors_runs_none() {
+        let none = NodeInfo::default();
+        assert!(!offers(&none, "firecracker"));
     }
 
     #[test]
@@ -2558,6 +2507,7 @@ mod tests {
             Some(NodeInfo {
                 id: "only".into(),
                 address: "only:7071".into(),
+                hypervisors: vec!["firecracker".into()],
                 vmm_memory_overhead_mib: [("firecracker".to_string(), 128)].into(),
                 ..Default::default()
             }),
@@ -2910,7 +2860,8 @@ mod tests {
         );
     }
 
-    /// A node that does not report disk (an older one) is not checked.
+    /// A node that does not report disk, one that cannot measure it, is not
+    /// checked.
     #[test]
     fn a_node_that_does_not_report_disk_is_trusted() {
         let registry = registry(&[("old", status(&[], &[], 64_000))]);

@@ -1334,7 +1334,7 @@ mod tests {
             is_evicted: false,
             arch: String::new(),
             hypervisor_version: String::new(),
-            hypervisor: String::new(),
+            hypervisor: "firecracker".into(),
             cpu: Default::default(),
             is_durable: false,
             kernel_digest: String::new(),

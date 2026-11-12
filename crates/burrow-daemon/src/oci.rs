@@ -224,8 +224,7 @@ pub struct ImageEnvironment {
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub systemd: bool,
     /// The hypervisor every sandbox from this template runs under, chosen
-    /// when it was built. Empty takes the guest's default, which is what
-    /// every template from before the choice existed means.
+    /// when it was built. Empty takes the guest's default.
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub hypervisor: String,
     /// "linux" or "windows"; empty is Linux.

@@ -72,16 +72,6 @@ pub fn reserve_bytes(configured_mib: Option<u64>, total_bytes: u64) -> u64 {
     }
 }
 
-/// An overcommit a node can run with: positive and finite. Zero and anything
-/// unreported read as 1.0, which is what a node from before the field meant.
-pub fn effective_overcommit(overcommit: f64) -> f64 {
-    if overcommit.is_finite() && overcommit > 0.0 {
-        overcommit
-    } else {
-        1.0
-    }
-}
-
 impl DiskCapacity {
     pub fn is_reported(&self) -> bool {
         self.total_bytes > 0
@@ -95,8 +85,7 @@ impl DiskCapacity {
     /// What the node may provision in all: the filesystem less its reserve,
     /// times the overcommit.
     pub fn capacity_bytes(&self) -> f64 {
-        self.total_bytes.saturating_sub(self.reserve_bytes) as f64
-            * effective_overcommit(self.overcommit)
+        self.total_bytes.saturating_sub(self.reserve_bytes) as f64 * self.overcommit
     }
 
     /// Admits `request_bytes` more provisioned disk, or says what it is short
@@ -232,17 +221,6 @@ mod tests {
         assert_eq!(reserve_bytes(None, 100 * GIB), 5 * GIB);
         assert_eq!(reserve_bytes(Some(2048), 100 * GIB), 2 * GIB);
         assert_eq!(reserve_bytes(Some(0), 100 * GIB), 0);
-    }
-
-    #[test]
-    fn a_missing_overcommit_means_none() {
-        assert_eq!(effective_overcommit(0.0), 1.0);
-        assert_eq!(effective_overcommit(f64::NAN), 1.0);
-        assert_eq!(effective_overcommit(1.5), 1.5);
-        assert_eq!(
-            node(50, 70, 0.0).admit(26 * GIB),
-            node(50, 70, 1.0).admit(26 * GIB)
-        );
     }
 
     #[test]

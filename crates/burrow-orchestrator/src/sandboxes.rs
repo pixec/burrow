@@ -1872,6 +1872,7 @@ mod tests {
         common::Sandbox {
             state: common::SandboxState::Suspended as i32,
             is_durable: true,
+            hypervisor: "firecracker".into(),
             ..named(id, node, name)
         }
     }

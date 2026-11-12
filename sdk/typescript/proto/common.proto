@@ -821,10 +821,9 @@ message NodeInfo {
   string inspection_root_fingerprint = 15;
   reserved 16;
   reserved "inspection_ca_expires_at";
-  // Policy fields this node enforces beyond the original set, e.g.
-  // "deny_ports", "ipv6_denied", "rule_expiry", "rule_binding",
-  // "open_inspection". A node that predates a field would drop it silently,
-  // so the orchestrator refuses a policy using one on a node not naming it.
+  // What this node's platform enforces: "ingress" and "public_ips" on Linux,
+  // neither on macOS. The orchestrator refuses a policy using one on a node
+  // not naming it.
   repeated string policy_features = 17;
   // Unix milliseconds when the node's inspection CA expires.
   int64 inspection_ca_expires_at_unix_ms = 18;
@@ -950,7 +949,7 @@ message DiskCapacity {
   reserved 4;
   reserved "unwritten_bytes";
   // How far provisioned disk may exceed the filesystem less its reserve
-  // (--disk-overcommit). 0, from a node that does not say, means 1.0: never.
+  // (--disk-overcommit), always positive; 1.0 never overcommits.
   double overcommit = 5;
   // Disk provisioned to sandboxes here: every sandbox's disk at its full size
   // and every volume at its size, however many blocks they share with images
