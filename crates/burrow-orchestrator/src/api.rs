@@ -2523,11 +2523,25 @@ impl Burrow for ApiService {
                 resources.reserved_cpus,
             )
         };
+        // What it gave back is free from now, not from the next heartbeat.
+        let shrunk = updated
+            .mem_mib
+            .as_ref()
+            .filter(|outcome| is_running && is_plugged && outcome.value < outcome.previous)
+            .map_or(0, |outcome| {
+                charge(outcome.previous) - charge(outcome.value)
+            });
+        let mut eased = 0;
         if let Some(sandbox) = &updated.sandbox {
             let grown = charged(sandbox).saturating_sub(charged(&record));
             if grown > 0 {
                 self.0.nodes.charge_cpu(&node_id, grown);
             }
+            eased = charged(&record).saturating_sub(charged(sandbox));
+        }
+        if shrunk > 0 || eased > 0 {
+            self.0.nodes.release(&node_id, eased, shrunk, 0);
+            release_in_store(&self.0.nodes, self.0.store.clone(), &node_id, eased, shrunk);
         }
         if let Some(sandbox) = &updated.sandbox {
             self.0.sandboxes.update(sandbox.clone());
