@@ -740,23 +740,28 @@ impl SandboxRegistry {
         // Under the same lock as the map update: clearing the node's rows
         // first and taking the lock afterwards leaves a window in which an
         // insert writes a row this call has already decided to drop.
+        //
+        // Row by row rather than clearing the node first: between a clear and
+        // the rewrite every sandbox on the node reads as gone to every other
+        // replica, and a clear also takes rows this listing predates.
         let mut sandboxes = self.sandboxes.lock().unwrap();
-        self.write(crate::persist::Op::DeletePlacementsForNode(
-            node_id.to_string(),
-        ));
-
         let reported_ids: HashSet<String> = reported.iter().map(|s| s.id.clone()).collect();
+        let creating = self.creating.lock().unwrap();
+        let mut settling = self.settling.lock().unwrap();
+        settling.retain(|_, at| at.elapsed() < SETTLING_GRACE);
         let before = sandboxes.len();
         sandboxes.retain(|id, s| {
-            let keep = s.node_id != node_id;
-            if !keep && !reported_ids.contains(id) {
-                self.write(crate::persist::Op::ReleaseClaimsUnlessMoved {
-                    sandbox_id: id.clone(),
-                    node_id: node_id.to_string(),
-                });
+            let keep = s.node_id != node_id
+                || reported_ids.contains(id)
+                || creating.contains(id)
+                || settling.contains_key(id);
+            if !keep {
+                self.forget_on(id, node_id);
             }
             keep
         });
+        drop(settling);
+        drop(creating);
         let dropped = before - sandboxes.len();
 
         let tombstones = self.tombstones.lock().unwrap();
@@ -830,8 +835,35 @@ impl SandboxRegistry {
             self.clear_tombstone(&id);
         }
 
-        out.forgotten = dropped.saturating_sub(out.adopted);
+        out.forgotten = dropped;
         out
+    }
+
+    /// The ids among `ids` the store has no placement for, caching those it
+    /// has.
+    ///
+    /// A node reporting a sandbox this replica has not cached usually means
+    /// another replica created it in the last second, not that its record
+    /// was lost, and only a lost record is worth a reconcile.
+    pub async fn missing(&self, ids: &[String]) -> Vec<String> {
+        let Some(store) = &self.store else {
+            return ids.to_vec();
+        };
+        let mut missing = Vec::new();
+        for id in ids {
+            match store.get_placement(id).await {
+                Ok(Some(row)) => {
+                    if let Some(sandbox) = self.cache(row) {
+                        self.settling
+                            .lock()
+                            .unwrap()
+                            .insert(sandbox.id, Instant::now());
+                    }
+                }
+                Ok(None) | Err(_) => missing.push(id.clone()),
+            }
+        }
+        missing
     }
 
     /// Whether some *other* sandbox, or a create in flight, holds this name.
@@ -1763,6 +1795,7 @@ mod store_tests {
             registry.insert(sandbox("gone", "node1"));
             registry.insert(sandbox("kept", "node1"));
             registry.insert(sandbox("elsewhere", "node2"));
+            registry.settled();
             registry.reconcile_node("node1", vec![sandbox("kept", "node1")]);
             registry.writer().unwrap().flush().await;
         }
@@ -1968,6 +2001,75 @@ mod store_tests {
         let rows = store.list_placements().await.unwrap();
         assert!(other.reload(mark, rows, Vec::new()));
         assert!(!other.get("sbx_a").unwrap().is_agent_unconfirmed);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// A node's heartbeat reaching the replica that did not create its
+    /// newest sandbox read that sandbox as a lost record, and the reconcile
+    /// it set off cleared every row on the node before writing them back, so
+    /// the other replica answered NOT_FOUND for all of them meanwhile.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_sandbox_another_replica_just_created_is_looked_up_not_reconciled() {
+        use burrow_proto::node::v1::SandboxStateReport;
+        let (store, path) = store().await;
+        let creator = SandboxRegistry::with_store(Arc::clone(&store)).await;
+        let other = SandboxRegistry::with_store(Arc::clone(&store)).await;
+        creator.insert(sandbox("sbx_old", "node1"));
+        creator.writer().unwrap().flush().await;
+        other.refresh("sbx_old").await.unwrap();
+        creator.insert(sandbox("sbx_new", "node1"));
+        creator.writer().unwrap().flush().await;
+
+        let reports: Vec<_> = ["sbx_old", "sbx_new"]
+            .into_iter()
+            .map(|id| SandboxStateReport {
+                sandbox_id: id.into(),
+                state: common::SandboxState::Running as i32,
+                ..Default::default()
+            })
+            .collect();
+        let applied = other.apply_states("node1", &reports);
+        assert_eq!(applied.unknown, vec!["sbx_new".to_string()]);
+        assert!(other.missing(&applied.unknown).await.is_empty());
+        assert_eq!(other.node_of("sbx_new").as_deref(), Some("node1"));
+        assert!(other.missing(&["sbx_lost".to_string()]).await == vec!["sbx_lost"]);
+
+        // A reconcile still running must never leave the node's rows absent.
+        let watcher = {
+            let store = Arc::clone(&store);
+            tokio::spawn(async move {
+                for _ in 0..2_000 {
+                    for id in ["sbx_old", "sbx_new"] {
+                        assert!(store.get_placement(id).await.unwrap().is_some(), "{id}");
+                    }
+                    tokio::task::yield_now().await;
+                }
+            })
+        };
+        for _ in 0..50 {
+            other.reconcile_node(
+                "node1",
+                vec![sandbox("sbx_old", "node1"), sandbox("sbx_new", "node1")],
+            );
+            other.writer().unwrap().flush().await;
+        }
+        watcher.await.unwrap();
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// A listing taken before another replica placed a sandbox on the node
+    /// does not delete that sandbox's row.
+    #[tokio::test]
+    async fn a_reconcile_keeps_rows_its_listing_predates() {
+        let (store, path) = store().await;
+        let creator = SandboxRegistry::with_store(Arc::clone(&store)).await;
+        let other = SandboxRegistry::with_store(Arc::clone(&store)).await;
+        creator.insert(sandbox("sbx_new", "node1"));
+        creator.writer().unwrap().flush().await;
+
+        other.reconcile_node("node1", Vec::new());
+        other.writer().unwrap().flush().await;
+        assert!(store.get_placement("sbx_new").await.unwrap().is_some());
         let _ = std::fs::remove_file(&path);
     }
 

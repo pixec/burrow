@@ -360,20 +360,29 @@ impl NodeRegistry for NodeRegistryService {
                     "adopted node-initiated sandbox changes"
                 );
             }
-            // The node is running sandboxes this orchestrator has no record
-            // of. A heartbeat carries too little to adopt them from, so the
-            // node's full listing is pulled instead, off the request path for
-            // the same reason as the reconcile after a registration.
+            // The node is running sandboxes this replica has no record of,
+            // most often ones another replica placed in the last second. Only
+            // those the store has no row for either are lost records, and a
+            // heartbeat carries too little to adopt them from, so the node's
+            // full listing is pulled instead, off the request path for the
+            // same reason as the reconcile after a registration.
             if !applied.unknown.is_empty() {
-                tracing::warn!(
-                    node_id = req.node_id,
-                    count = applied.unknown.len(),
-                    first = applied.unknown.first(),
-                    "node reports sandboxes with no placement record; reconciling"
-                );
                 let state = Arc::clone(&self.0);
                 let id = req.node_id.clone();
-                tokio::spawn(async move { reconcile_node(state, id).await });
+                let unknown = std::mem::take(&mut applied.unknown);
+                tokio::spawn(async move {
+                    let missing = state.sandboxes.missing(&unknown).await;
+                    if missing.is_empty() {
+                        return;
+                    }
+                    tracing::warn!(
+                        node_id = id,
+                        count = missing.len(),
+                        first = missing.first(),
+                        "node reports sandboxes with no placement record; reconciling"
+                    );
+                    reconcile_node(state, id).await
+                });
             }
             if !applied.relinquished.is_empty() {
                 tracing::warn!(
