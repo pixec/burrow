@@ -255,6 +255,31 @@ pub fn render(sandboxes: &[SandboxRules]) -> String {
 /// Open mode is what makes them reachable at all: it has NAT'd egress to
 /// anywhere the node can route.
 pub fn render_with(sandboxes: &[SandboxRules], control_plane: &[IpAddr]) -> String {
+    let mut out = render_policy(sandboxes, control_plane);
+    render_meter(&mut out, sandboxes);
+    out
+}
+
+/// [`render_with`] for a ruleset that already has every sandbox but `added`
+/// counted, as one this node rendered and applied has.
+///
+/// The counter table is added to rather than rebuilt, so what it has counted
+/// for the others is kept: nothing has to be read back first, and the cost of
+/// the meter does not grow with the sandboxes already on the node.
+pub fn render_adding(
+    sandboxes: &[SandboxRules],
+    control_plane: &[IpAddr],
+    added: &SandboxRules,
+) -> String {
+    let mut out = render_policy(sandboxes, control_plane);
+    let _ = writeln!(out, "add table inet {METER_TABLE}");
+    render_meter_chains(&mut out);
+    render_counted(&mut out, added);
+    out
+}
+
+/// Everything but the counter table.
+fn render_policy(sandboxes: &[SandboxRules], control_plane: &[IpAddr]) -> String {
     let mut out = String::new();
 
     // Declaring before flushing makes this work on a fresh host too: `flush`
@@ -372,7 +397,6 @@ pub fn render_with(sandboxes: &[SandboxRules], control_plane: &[IpAddr]) -> Stri
     render_host_input(&mut out, sandboxes);
     render_nat(&mut out, sandboxes);
     render_nat6(&mut out, sandboxes);
-    render_meter(&mut out, sandboxes);
     out
 }
 
@@ -408,6 +432,15 @@ pub fn counter_names(guest_ip: Ipv4Addr) -> (String, String) {
 fn render_meter(out: &mut String, sandboxes: &[SandboxRules]) {
     let _ = writeln!(out, "add table inet {METER_TABLE}");
     let _ = writeln!(out, "flush table inet {METER_TABLE}");
+    render_meter_chains(out);
+    for sandbox in sandboxes {
+        render_counted(out, sandbox);
+    }
+}
+
+/// The counter table's chains. Declared with `add`, so declaring them in a
+/// table that has them changes nothing.
+fn render_meter_chains(out: &mut String) {
     // Far ahead of the policy tables' priority 0, so a packet is counted
     // whether or not the policy goes on to drop it.
     let _ = writeln!(
@@ -418,21 +451,23 @@ fn render_meter(out: &mut String, sandboxes: &[SandboxRules]) {
         out,
         "add chain inet {METER_TABLE} tx {{ type filter hook prerouting priority -300; policy accept; }}"
     );
-    for sandbox in sandboxes {
-        let (rx, tx) = counter_names(sandbox.guest_ip);
-        let _ = writeln!(out, "add counter inet {METER_TABLE} {rx}");
-        let _ = writeln!(out, "add counter inet {METER_TABLE} {tx}");
-        let _ = writeln!(
-            out,
-            "add rule inet {METER_TABLE} rx oifname \"{}\" counter name \"{rx}\"",
-            sandbox.tap
-        );
-        let _ = writeln!(
-            out,
-            "add rule inet {METER_TABLE} tx iifname \"{}\" counter name \"{tx}\"",
-            sandbox.tap
-        );
-    }
+}
+
+/// One sandbox's two counters, and the rules feeding them.
+fn render_counted(out: &mut String, sandbox: &SandboxRules) {
+    let (rx, tx) = counter_names(sandbox.guest_ip);
+    let _ = writeln!(out, "add counter inet {METER_TABLE} {rx}");
+    let _ = writeln!(out, "add counter inet {METER_TABLE} {tx}");
+    let _ = writeln!(
+        out,
+        "add rule inet {METER_TABLE} rx oifname \"{}\" counter name \"{rx}\"",
+        sandbox.tap
+    );
+    let _ = writeln!(
+        out,
+        "add rule inet {METER_TABLE} tx iifname \"{}\" counter name \"{tx}\"",
+        sandbox.tap
+    );
 }
 
 /// Reads the byte counters back.
@@ -2554,6 +2589,31 @@ mod tests {
         let after = render(&[sandbox(Mode::Open)]);
         assert!(after.contains("flush table inet burrow_meter"));
         assert!(!after.contains("10_99_0_10"));
+    }
+
+    /// A create adds its own counters to the table rather than rebuilding it,
+    /// so the others' counts carry on and nothing is read back first. Its
+    /// policy is the full render's.
+    #[test]
+    fn an_added_sandbox_is_counted_without_resetting_the_others() {
+        let mut other = sandbox(Mode::Open);
+        other.guest_ip = Ipv4Addr::new(10, 99, 0, 10);
+        other.tap = "bt2".into();
+        let added = sandbox(Mode::Open);
+        let all = [other, added.clone()];
+        let adding = render_adding(&all, &[], &added);
+        assert!(!adding.contains("flush table inet burrow_meter"));
+        assert!(adding.contains("add counter inet burrow_meter rx_10_99_0_6"));
+        assert!(adding.contains("meter tx iifname \"bt1\" counter name \"tx_10_99_0_6\""));
+        assert!(!adding.contains("10_99_0_10"));
+        let policy = |rules: &str| {
+            rules
+                .lines()
+                .filter(|line| !line.contains("burrow_meter"))
+                .map(str::to_string)
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(policy(&adding), policy(&render(&all)));
     }
 
     #[test]

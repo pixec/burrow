@@ -4077,9 +4077,12 @@ impl SandboxManager {
     /// Renders and applies the ruleset for every sandbox in the map, plus
     /// `pending`. The caller holds the firewall lock.
     async fn render_firewall(&self, pending: Option<&Arc<RunningSandbox>>) -> Result<(), Status> {
-        // The render below flushes the counter table, so what it has counted
-        // has to be banked before it is rebuilt.
-        self.sample_usage().await;
+        // A full render flushes the counter table, so what it has counted has
+        // to be banked before it is rebuilt. Adding a sandbox only adds its
+        // own counters and leaves the rest counting.
+        if pending.is_none() {
+            self.sample_usage().await;
+        }
 
         let sandboxes = self.sandboxes.lock().await;
         let all: Vec<&Arc<RunningSandbox>> = sandboxes.values().chain(pending).collect();
@@ -4386,12 +4389,15 @@ impl SandboxManager {
         if !is_ruleset_needed {
             return Ok(());
         }
-        firewall::apply(&firewall::render_with(&rules, &denied))
-            .await
-            .map_err(|err| {
-                tracing::error!(%err, "failed to apply firewall ruleset");
-                Status::internal(format!("applying the firewall ruleset: {err}"))
-            })?;
+        let added = pending.and_then(|added| rules.iter().find(|r| r.sandbox_id == added.id()));
+        let ruleset = match added {
+            Some(added) => firewall::render_adding(&rules, &denied, added),
+            None => firewall::render_with(&rules, &denied),
+        };
+        firewall::apply(&ruleset).await.map_err(|err| {
+            tracing::error!(%err, "failed to apply firewall ruleset");
+            Status::internal(format!("applying the firewall ruleset: {err}"))
+        })?;
         self.sync_public_routes(&rules, &publics).await;
         Ok(())
     }
