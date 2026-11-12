@@ -636,7 +636,37 @@ fn local_node_info(args: &ServeArgs) -> anyhow::Result<NodeInfo> {
             .iter()
             .map(|feature| feature.to_string())
             .collect(),
+        // Filled in once the data directory has been probed.
+        hole_probe: None,
     })
+}
+
+/// Probes whether sparse files in `dir`, where sandboxes' memory lives, report
+/// their holes per page. Only an optimisation and the way into memory chains
+/// written before diffs carried page maps depend on it, so a failure is a
+/// warning.
+fn probe_holes(dir: &std::path::Path) -> burrow_proto::common::v1::HoleProbe {
+    let probe = burrow_vmm::memfile::probe(dir);
+    burrow_vmm::memfile::set_holes_exact(probe.is_exact());
+    if probe.is_exact() {
+        tracing::info!(dir = %dir.display(), "the data directory reports holes per page");
+    } else {
+        tracing::warn!(
+            dir = %dir.display(),
+            is_page_granular = probe.is_page_granular,
+            is_zero_page_kept = probe.is_zero_page_kept,
+            error = probe.error.as_deref().unwrap_or(""),
+            "the data directory does not report holes per 4 KiB page (on ZFS: recordsize=4K, \
+             compression=off). Diffs are taken only through the page-fault handler, other \
+             suspends write guest memory in full, and memory chains written before diffs \
+             carried page maps cannot be restored"
+        );
+    }
+    burrow_proto::common::v1::HoleProbe {
+        is_page_granular: probe.is_page_granular,
+        is_zero_page_kept: probe.is_zero_page_kept,
+        error: probe.error.unwrap_or_default(),
+    }
 }
 
 /// How often idle and lifetime policies are checked.
@@ -1332,6 +1362,11 @@ pub async fn run(args: ServeArgs) -> anyhow::Result<()> {
         let _ = tokio::fs::create_dir_all(&dir).await;
         restrict_to_owner(&dir);
     }
+
+    node_info.hole_probe = Some(probe_holes(match &args.jailer {
+        Some(_) => &args.chroot_base,
+        None => &args.data_dir,
+    }));
 
     let store = Arc::new(
         burrow_store::Store::open(&args.data_dir.join("node.db"))

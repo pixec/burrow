@@ -797,6 +797,24 @@ message NodeInfo {
   int64 inspection_ca_expires_at_unix_ms = 18;
   reserved 19, 20, 21, 22;
   reserved "ipv6_prefix", "ipv6_per_sandbox", "ip_providers", "is_ipv6_on_link";
+  // What a probe of the filesystem sandboxes live on found at startup.
+  HoleProbe hole_probe = 23;
+}
+
+// Whether a sparse file's extents on a node's data directory are exactly the
+// pages written to it. Correctness never depends on it: memory diffs carry
+// their own page maps. Without it a diff can only be taken through the
+// page-fault handler, a suspend otherwise writes guest memory in full, and a
+// memory chain written before page maps cannot be restored.
+message HoleProbe {
+  // One 4 KiB page written at 68 KiB was reported as exactly that page. ZFS
+  // with a 128K recordsize reports the whole record.
+  bool is_page_granular = 1;
+  // A written page of zeroes was reported as data. ZFS with compression on
+  // stores it as a hole.
+  bool is_zero_page_kept = 2;
+  // Why the probe could not run, when it could not.
+  string error = 3;
 }
 
 message NodeStatus {
