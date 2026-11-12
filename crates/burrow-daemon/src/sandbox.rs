@@ -1857,18 +1857,23 @@ impl RunningSandbox {
             Ok((agent, _)) => {
                 guestconn::handshake_upgrading(agent, guest, request, upgrade, agent_timeout)
                     .await
-                    .map(drop)
+                    .map(|(agent, _)| agent)
                     .map_err(|err| NoAgent::Handshake(err.message().to_string()))
             }
             Err(err) => Err(NoAgent::Unreachable(agent_timeout, error_chain(&*err))),
         };
-        if let Err(failure) = handshook {
-            let reason = no_agent_reason(&mut vm, failure).await;
-            let _ = vm.kill().await;
-            return Err(Status::internal(format!(
-                "the guest did not come back: {reason}"
-            )));
-        }
+        let agent = match handshook {
+            Ok(agent) => agent,
+            Err(failure) => {
+                let reason = no_agent_reason(&mut vm, failure).await;
+                let _ = vm.kill().await;
+                return Err(Status::internal(format!(
+                    "the guest did not come back: {reason}"
+                )));
+            }
+        };
+        // Kept, so the first call into the resumed guest does not dial again.
+        *self.agent_channel.lock().await = Some(agent);
         start_cpu_cap(&vm, &limits, self.id());
         // This VM handshook synchronously, whatever the last one did. A failure
         // recorded there was a verdict on a VM that no longer exists.
