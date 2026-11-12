@@ -351,7 +351,14 @@ impl NodeRegistry for NodeRegistryService {
             // A Kit's lifecycle creates volumes on the node itself, so the
             // node's own inventory is what the registry reflects.
             self.0.volumes.reconcile_node(&req.node_id, volumes);
+            for report in req.sandboxes.iter().filter(|report| report.is_fenced) {
+                self.0.sandboxes.refresh(&report.sandbox_id).await;
+            }
             applied = self.0.sandboxes.apply_states(&req.node_id, &req.sandboxes);
+            self.0
+                .sandboxes
+                .verify_fences(&req.node_id, &mut applied)
+                .await;
             if applied.restated > 0 || applied.forgotten > 0 {
                 tracing::info!(
                     node_id = req.node_id,

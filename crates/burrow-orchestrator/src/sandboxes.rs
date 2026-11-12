@@ -876,6 +876,38 @@ impl SandboxRegistry {
         out
     }
 
+    /// Narrows what a heartbeat confirms and relinquishes to what the store
+    /// says, rather than this replica's copy, which may predate a move.
+    ///
+    /// Unfencing a sandbox lets its node resume it, and relinquishing one
+    /// makes the node drop its copy, so either on a stale word can leave a
+    /// sandbox running twice or nowhere. A row that cannot be read leaves the
+    /// sandbox fenced.
+    pub async fn verify_fences(&self, node_id: &str, applied: &mut Applied) {
+        let Some(store) = &self.store else {
+            return;
+        };
+        let mut confirmed = Vec::new();
+        for id in std::mem::take(&mut applied.confirmed) {
+            if let Ok(Some(row)) = store.get_placement(&id).await
+                && row.node_id == node_id
+            {
+                confirmed.push(id);
+            }
+        }
+        let mut relinquished = Vec::new();
+        for id in std::mem::take(&mut applied.relinquished) {
+            if let Ok(Some(row)) = store.get_placement(&id).await
+                && !row.node_id.is_empty()
+                && row.node_id != node_id
+            {
+                relinquished.push(id);
+            }
+        }
+        applied.confirmed = confirmed;
+        applied.relinquished = relinquished;
+    }
+
     /// The ids among `ids` the store has no placement for, caching those it
     /// has.
     ///
@@ -2257,6 +2289,51 @@ mod store_tests {
             .unwrap()
             .expect("moved");
         assert_eq!(moved.node_id, "node2");
+        let _ = std::fs::remove_file(&path);
+    }
+
+    fn fenced(id: &str) -> burrow_proto::node::v1::SandboxStateReport {
+        burrow_proto::node::v1::SandboxStateReport {
+            is_fenced: true,
+            ..suspended(id)
+        }
+    }
+
+    /// A node back from an outage reports its durable sandboxes fenced, and
+    /// a replica whose copy predated another node adopting one confirmed it,
+    /// letting the returning node resume it too; one whose copy predated a
+    /// move back relinquished the only copy.
+    #[tokio::test]
+    async fn fences_are_lifted_and_copies_dropped_only_on_the_stores_word() {
+        let (_store, path, mover, stale) = replicas().await;
+        mover.insert(sandbox("sbx_gone", "node1"));
+        mover.insert(sandbox("sbx_back", "node2"));
+        settle(&[&mover]).await;
+        stale.refresh("sbx_gone").await.unwrap();
+        stale.refresh("sbx_back").await.unwrap();
+
+        mover.adopted(sandbox("sbx_gone", "node2"));
+        mover.adopted(sandbox("sbx_back", "node1"));
+        settle(&[&mover]).await;
+        let mut applied = stale.apply_states("node1", &[fenced("sbx_gone"), fenced("sbx_back")]);
+        assert_eq!(applied.confirmed, vec!["sbx_gone".to_string()]);
+        assert_eq!(applied.relinquished, vec!["sbx_back".to_string()]);
+        stale.verify_fences("node1", &mut applied).await;
+        assert!(applied.confirmed.is_empty(), "{:?}", applied.confirmed);
+        assert!(
+            applied.relinquished.is_empty(),
+            "{:?}",
+            applied.relinquished
+        );
+
+        // What the heartbeat does: fenced ids are read through first.
+        for id in ["sbx_gone", "sbx_back"] {
+            stale.refresh(id).await;
+        }
+        let mut applied = stale.apply_states("node1", &[fenced("sbx_gone"), fenced("sbx_back")]);
+        stale.verify_fences("node1", &mut applied).await;
+        assert_eq!(applied.confirmed, vec!["sbx_back".to_string()]);
+        assert_eq!(applied.relinquished, vec!["sbx_gone".to_string()]);
         let _ = std::fs::remove_file(&path);
     }
 
