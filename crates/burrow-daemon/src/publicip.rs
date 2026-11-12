@@ -1,27 +1,18 @@
-//! Public addresses on this node: the global IPv6 address each sandbox is
-//! given from the node's routed prefix, the dedicated addresses attached to
-//! it, waking a suspended holder on its first admitted packet, and an audit
-//! record for every connection those addresses carry.
+//! Public addresses on this node: the pool addresses attached to its
+//! sandboxes, waking a suspended holder on its first admitted packet, and an
+//! audit record for every connection those addresses carry.
 
 #![cfg_attr(not(target_os = "linux"), allow(dead_code))]
 
 use std::collections::HashMap;
-use std::net::{IpAddr, Ipv6Addr};
+use std::net::IpAddr;
 use std::sync::Arc;
 
-use burrow_net::ipam::BLOCKS_PER_NODE;
 use burrow_proto::common::v1 as common;
 
 /// How this node gives sandboxes public addresses.
 #[derive(Debug, Clone, Default)]
 pub struct PublicConfig {
-    /// The routed prefix each sandbox's global IPv6 address comes from.
-    pub ipv6_prefix: Option<(Ipv6Addr, u8)>,
-    /// The prefix each sandbox is routed out of it.
-    pub ipv6_per_sandbox: u8,
-    /// Answer NDP on the uplink for each sandbox's v6 prefix, when the
-    /// upstream looks it up there rather than routing it to the node.
-    pub is_ipv6_on_link: bool,
     /// The uplink public addresses arrive on, when it is not the interface
     /// the node reaches a pool's gateway through.
     pub interface: Option<String>,
@@ -33,67 +24,6 @@ pub struct PublicConfig {
 }
 
 impl PublicConfig {
-    /// Checks a prefix and share size against the node's 256 sandboxes.
-    pub fn with_ipv6(
-        mut self,
-        prefix: &str,
-        per_sandbox: u8,
-        is_on_link: bool,
-    ) -> anyhow::Result<Self> {
-        let (address, len) = prefix
-            .split_once('/')
-            .ok_or_else(|| anyhow::anyhow!("--ipv6-prefix {prefix:?} is not address/len"))?;
-        let address: Ipv6Addr = address.parse()?;
-        let len: u8 = len.parse()?;
-        let slots = BLOCKS_PER_NODE.trailing_zeros() as u8;
-        if per_sandbox > 128 || u16::from(len) + u16::from(slots) > u16::from(per_sandbox) {
-            anyhow::bail!(
-                "--ipv6-prefix /{len} cannot hold {BLOCKS_PER_NODE} sandboxes of /{per_sandbox}; \
-                 give a prefix at most /{} or a smaller --ipv6-per-sandbox",
-                per_sandbox.saturating_sub(slots)
-            );
-        }
-        self.ipv6_prefix = Some((address, len));
-        self.ipv6_per_sandbox = per_sandbox;
-        self.is_ipv6_on_link = is_on_link;
-        Ok(self)
-    }
-
-    /// The global address of the sandbox on lease block `block`, and the
-    /// prefix routed to it, indexed by the block within this node's slice.
-    pub fn ipv6_for(&self, block: u32) -> Option<(Ipv6Addr, u8)> {
-        let (base, len) = self.ipv6_prefix?;
-        let per = self.ipv6_per_sandbox;
-        let mask = match len {
-            0 => 0,
-            bits => u128::MAX << (128 - u32::from(bits)),
-        };
-        let index = u128::from(block % BLOCKS_PER_NODE);
-        let subnet = (u128::from(base) & mask) | (index << (128 - u32::from(per)));
-        let address = if per < 128 { subnet | 1 } else { subnet };
-        Some((Ipv6Addr::from(address), per))
-    }
-
-    /// The address sandbox `sandbox_id` on lease block `block` takes from
-    /// this node's IPv6 prefix, as a public IP of the node's own pool.
-    pub fn node_ip(&self, node_id: &str, sandbox_id: &str, block: u32) -> Option<common::PublicIp> {
-        let (address, prefix) = self.ipv6_for(block)?;
-        Some(common::PublicIp {
-            address: address.to_string(),
-            family: 6,
-            prefix_len: u32::from(prefix),
-            pool: node_pool(node_id),
-            sandbox_id: sandbox_id.to_string(),
-            node_id: node_id.to_string(),
-            allocated_at_unix_ms: burrow_common::unix_now_ms(),
-            attached_at_unix_ms: burrow_common::unix_now_ms(),
-            is_on_link: self.is_ipv6_on_link,
-            state: common::PublicIpState::Allocated as i32,
-            is_node_prefix: true,
-            ..Default::default()
-        })
-    }
-
     /// The interface the node reaches `toward` through.
     pub async fn uplink(&self, toward: IpAddr) -> Option<String> {
         if let Some(interface) = &self.interface {
@@ -106,11 +36,6 @@ impl PublicConfig {
         self.uplinks.lock().unwrap().insert(toward, dev.clone());
         Some(dev)
     }
-}
-
-/// The name of the pool a node's IPv6 prefix forms.
-pub fn node_pool(node_id: &str) -> String {
-    format!("node:{node_id}")
 }
 
 /// Which sandbox holds each public address, and whether it wakes on traffic.
@@ -163,12 +88,8 @@ impl PublicIndex {
 }
 
 /// The addresses a sandbox's record holds, as the guest configures them.
-pub fn guest_addresses(
-    ips: &[common::PublicIp],
-    ipv6: Option<(Ipv6Addr, u8)>,
-) -> Vec<burrow_proto::guest::v1::PublicAddress> {
-    let mut out: Vec<_> = ips
-        .iter()
+pub fn guest_addresses(ips: &[common::PublicIp]) -> Vec<burrow_proto::guest::v1::PublicAddress> {
+    ips.iter()
         .filter_map(|ip| {
             let address: IpAddr = ip.address.parse().ok()?;
             Some(burrow_proto::guest::v1::PublicAddress {
@@ -176,14 +97,7 @@ pub fn guest_addresses(
                 prefix_len: if address.is_ipv4() { 32 } else { 128 },
             })
         })
-        .collect();
-    if let Some((address, _)) = ipv6 {
-        out.push(burrow_proto::guest::v1::PublicAddress {
-            address: address.to_string(),
-            prefix_len: 128,
-        });
-    }
-    out
+        .collect()
 }
 
 /// Holds packets the wake queue was given until their sandbox is up.
@@ -433,66 +347,7 @@ pub fn spawn_audit(manager: crate::sandbox::SandboxManager) {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    fn config(prefix: &str, per: u8) -> PublicConfig {
-        PublicConfig::default()
-            .with_ipv6(prefix, per, false)
-            .unwrap()
-    }
-
-    #[test]
-    fn each_block_gets_its_own_share_of_the_prefix() {
-        let config = config("2001:db8:100::/56", 64);
-        assert_eq!(
-            config.ipv6_for(1),
-            Some(("2001:db8:100:1::1".parse().unwrap(), 64))
-        );
-        // A node's blocks start past its slice's base, and index within it.
-        assert_eq!(
-            config.ipv6_for(BLOCKS_PER_NODE + 5),
-            Some(("2001:db8:100:5::1".parse().unwrap(), 64))
-        );
-        let config = super::tests::config("2001:db8:100::/112", 128);
-        assert_eq!(
-            config.ipv6_for(7),
-            Some(("2001:db8:100::7".parse().unwrap(), 128))
-        );
-    }
-
-    #[test]
-    fn a_sandboxs_node_address_is_a_public_ip_of_the_nodes_pool() {
-        let config = config("2001:db8:100::/56", 64);
-        let ip = config.node_ip("node-a", "sbx_a", 3).unwrap();
-        assert_eq!(ip.address, "2001:db8:100:3::1");
-        assert_eq!((ip.family, ip.prefix_len), (6, 64));
-        assert_eq!(ip.pool, "node:node-a");
-        assert!(ip.is_node_prefix && !ip.is_smtp_allowed);
-        assert_eq!(ip.sandbox_id, "sbx_a");
-        assert!(
-            PublicConfig::default()
-                .node_ip("node-a", "sbx_a", 3)
-                .is_none()
-        );
-    }
-
-    #[test]
-    fn a_prefix_too_small_for_the_node_is_refused() {
-        assert!(
-            PublicConfig::default()
-                .with_ipv6("2001:db8::/60", 64, false)
-                .is_err()
-        );
-        assert!(
-            PublicConfig::default()
-                .with_ipv6("2001:db8::/121", 128, false)
-                .is_err()
-        );
-        assert!(
-            PublicConfig::default()
-                .with_ipv6("nonsense", 64, false)
-                .is_err()
-        );
-    }
+    use std::net::Ipv6Addr;
 
     #[test]
     fn a_holder_covers_its_prefix() {

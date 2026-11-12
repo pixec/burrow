@@ -132,7 +132,7 @@ pub struct NodeConfig {
     pub event_delivery: crate::delivery::Policy,
     /// How much disk this node promises its sandboxes, and what it keeps free.
     pub disk: crate::diskcap::DiskPolicy,
-    /// Public addresses: the routed IPv6 prefix and ingress limits.
+    /// Public addresses: the uplink and ingress limits.
     pub public: crate::publicip::PublicConfig,
     /// Which shapes are warmed, and how many snapshots are kept.
     pub warm: crate::warm::WarmPolicy,
@@ -3606,14 +3606,6 @@ impl SandboxManager {
             }
         }
         self.directory.replace(directory);
-        let settled: Vec<(Arc<RunningSandbox>, Vec<String>, Option<String>)> = all
-            .iter()
-            .filter_map(|sandbox| {
-                let (detached, attached) = self.settle_node_ipv6(sandbox);
-                (!detached.is_empty() || attached.is_some())
-                    .then(|| (Arc::clone(sandbox), detached, attached))
-            })
-            .collect();
         let mut rules: Vec<firewall::SandboxRules> = all
             .iter()
             .map(|sandbox| {
@@ -3771,18 +3763,6 @@ impl SandboxManager {
         drop(remote);
         drop(ports);
         drop(sandboxes);
-
-        for (sandbox, detached, attached) in settled {
-            if pending.is_none_or(|pending| !Arc::ptr_eq(pending, &sandbox)) {
-                self.persist(&sandbox).await;
-            }
-            for address in detached {
-                self.emit(&sandbox, EVENT_IP_DETACHED, &address).await;
-            }
-            if let Some(address) = attached {
-                self.emit(&sandbox, EVENT_IP_ATTACHED, &address).await;
-            }
-        }
 
         // A sandbox without a tap is held to the very policy the proxy table
         // and the ruleset get, by its own stack.
@@ -4034,14 +4014,7 @@ impl SandboxManager {
         is_always: bool,
     ) -> Option<burrow_proto::guest::v1::NetworkConfig> {
         let public_addresses = match is_tapped {
-            true => {
-                let pooled: Vec<_> = ips
-                    .iter()
-                    .filter(|ip| !ip.is_node_prefix)
-                    .cloned()
-                    .collect();
-                crate::publicip::guest_addresses(&pooled, self.config.public.ipv6_for(lease.block))
-            }
+            true => crate::publicip::guest_addresses(ips),
             false => Vec::new(),
         };
         (is_always || !public_addresses.is_empty()).then(|| {
@@ -4056,57 +4029,6 @@ impl SandboxManager {
                 public_addresses,
             }
         })
-    }
-
-    /// Gives a tapped sandbox the address its lease takes from this node's
-    /// IPv6 prefix, and drops one another node's prefix gave it. Returns the
-    /// addresses detached and the one attached.
-    fn settle_node_ipv6(&self, sandbox: &RunningSandbox) -> (Vec<String>, Option<String>) {
-        let is_tapped = sandbox.hypervisor.capabilities().is_tap_networked;
-        let mut record = sandbox.base_record.lock().unwrap();
-        let own = is_tapped
-            .then(|| {
-                self.config
-                    .public
-                    .node_ip(&record.node_id, &record.id, sandbox.lease.block)
-            })
-            .flatten();
-        let mut detached = Vec::new();
-        record.public_ips.retain(|ip| {
-            let is_kept =
-                !ip.is_node_prefix || own.as_ref().is_some_and(|own| own.address == ip.address);
-            if !is_kept {
-                detached.push(ip.address.clone());
-            }
-            is_kept
-        });
-        let attached = own
-            .filter(|own| !record.public_ips.iter().any(|ip| ip.address == own.address))
-            .map(|own| {
-                let address = own.address.clone();
-                record.public_ips.push(own);
-                address
-            });
-        (detached, attached)
-    }
-
-    /// Takes back the address this node's IPv6 prefix gave a sandbox that is
-    /// leaving it.
-    async fn release_node_ipv6(&self, sandbox: &RunningSandbox) {
-        let released: Vec<String> = {
-            let mut record = sandbox.base_record.lock().unwrap();
-            let released = record
-                .public_ips
-                .iter()
-                .filter(|ip| ip.is_node_prefix)
-                .map(|ip| ip.address.clone())
-                .collect();
-            record.public_ips.retain(|ip| !ip.is_node_prefix);
-            released
-        };
-        for address in released {
-            self.emit(sandbox, EVENT_IP_DETACHED, &address).await;
-        }
     }
 
     /// The sandbox's public side as the ruleset renders it.
@@ -7658,7 +7580,6 @@ impl SandboxManager {
         // Closed before the rows go, so the same one function ends every
         // session and the store is never left holding an open one.
         self.close_session(&sandbox, ENDED_DELETED).await;
-        self.release_node_ipv6(&sandbox).await;
         self.emit(&sandbox, EVENT_DESTROYED, "").await;
         let released = self.tear_down(sandbox).await;
         tracing::info!(sandbox = id, "sandbox deleted");
@@ -8128,7 +8049,6 @@ impl SandboxManager {
                 .remove(id)
                 .ok_or_else(|| Status::not_found(format!("no sandbox {id} on this node")))?
         };
-        self.release_node_ipv6(&sandbox).await;
         let record = sandbox.record();
         self.emit(&sandbox, EVENT_STOPPED, "released").await;
         // Behind the response: the sandbox is out of the map and its state is

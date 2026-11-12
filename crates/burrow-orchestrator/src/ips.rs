@@ -206,22 +206,6 @@ pub fn validate_pool(pool: &mut common::IpPool) -> Result<(), Status> {
     Ok(())
 }
 
-/// The pool a node's IPv6 prefix forms: read-only, one address per sandbox
-/// there, given at create and taken back at delete.
-fn node_pool(info: &common::NodeInfo, held: &[common::PublicIp]) -> common::IpPool {
-    let name = format!("node:{}", info.id);
-    common::IpPool {
-        allocated: held.iter().filter(|ip| ip.pool == name).count() as u32,
-        name,
-        node_id: info.id.clone(),
-        prefix6: info.ipv6_prefix.clone(),
-        per_sandbox: info.ipv6_per_sandbox,
-        is_on_link: info.is_ipv6_on_link,
-        total: burrow_net::ipam::BLOCKS_PER_NODE,
-        ..Default::default()
-    }
-}
-
 /// Whether `info` is a node `pool` reaches.
 fn covers(pool: &common::IpPool, info: &common::NodeInfo) -> bool {
     match pool.node_id.is_empty() {
@@ -285,28 +269,8 @@ impl ApiService {
             .get_ip(&normalized)
             .await
             .map_err(store_error)?
-            .filter(|row| row.state == ALLOCATED);
-        let Some(row) = row else {
-            let holder = self
-                .0
-                .sandboxes
-                .list_tagged(None)
-                .into_iter()
-                .find(|sandbox| {
-                    sandbox
-                        .public_ips
-                        .iter()
-                        .any(|ip| ip.is_node_prefix && ip.address == normalized)
-                });
-            return Err(match holder {
-                Some(sandbox) => Status::failed_precondition(format!(
-                    "{normalized} is sandbox {}'s address from node {}'s IPv6 prefix; it goes \
-                     when the sandbox is deleted or moves",
-                    sandbox.id, sandbox.node_id
-                )),
-                None => Status::not_found(format!("{normalized} is not allocated")),
-            });
-        };
+            .filter(|row| row.state == ALLOCATED)
+            .ok_or_else(|| Status::not_found(format!("{normalized} is not allocated")))?;
         let ip = common::PublicIp::decode(row.record.as_slice())
             .map_err(|err| Status::internal(format!("ip record {normalized}: {err}")))?;
         Ok((row, ip))
@@ -459,24 +423,6 @@ impl ApiService {
         for pool in &mut pools {
             pool.allocated = counts.get(&pool.name).copied().unwrap_or(0);
         }
-        let held: Vec<common::PublicIp> = self
-            .0
-            .sandboxes
-            .list_tagged(None)
-            .into_iter()
-            .flat_map(|sandbox| sandbox.public_ips)
-            .filter(|ip| ip.is_node_prefix)
-            .collect();
-        let mut nodes: Vec<_> = self
-            .0
-            .nodes
-            .healthy_ids()
-            .into_iter()
-            .filter_map(|id| self.0.nodes.info(&id))
-            .filter(|info| !info.ipv6_prefix.is_empty())
-            .collect();
-        nodes.sort_by(|a, b| a.id.cmp(&b.id));
-        pools.extend(nodes.into_iter().map(|info| node_pool(&info, &held)));
         Ok(pools)
     }
 
@@ -1052,30 +998,6 @@ mod tests {
         metadata.insert("authorization", "Bearer operator-token".parse().unwrap());
         assert!(caller(&metadata, &config).is_operator);
         assert!(caller(&MetadataMap::new(), &IpConfig::default()).is_operator);
-    }
-
-    #[test]
-    fn a_nodes_ipv6_prefix_is_a_pool_counting_its_sandboxes() {
-        let info = common::NodeInfo {
-            id: "node-a".into(),
-            ipv6_prefix: "2001:db8:100::/56".into(),
-            ipv6_per_sandbox: 64,
-            ..Default::default()
-        };
-        let held = |pool: &str| common::PublicIp {
-            pool: pool.into(),
-            is_node_prefix: true,
-            ..Default::default()
-        };
-        let pool = node_pool(&info, &[held("node:node-a"), held("node:node-b")]);
-        assert_eq!(pool.name, "node:node-a");
-        assert_eq!((pool.allocated, pool.total), (1, 256));
-        assert_eq!(
-            (pool.prefix6.as_str(), pool.per_sandbox),
-            ("2001:db8:100::/56", 64)
-        );
-        let mut named = pool;
-        assert!(validate_pool(&mut named).is_err());
     }
 
     #[test]

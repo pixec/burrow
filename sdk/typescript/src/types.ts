@@ -139,8 +139,8 @@ export interface PortRule {
 }
 
 /**
- * One door into a sandbox's public addresses: its dedicated IPs and its global
- * IPv6 address. Nothing is admitted without a rule.
+ * One door into a sandbox's public addresses, IPv4 and IPv6. Nothing is
+ * admitted without a rule.
  */
 export interface IngressRule {
   /** Omitted is both TCP and UDP. `icmp` admits echo and takes no ports. */
@@ -455,7 +455,7 @@ export interface SandboxInfo {
   hypervisorVersion: string;
   /** `linux`, `windows` or `macos`, from its template. */
   guestOs: string;
-  /** Public addresses routed to it: from pools, and its node's IPv6 prefix (`nodePrefix`). */
+  /** Public addresses of either family attached to it. */
   publicIps: PublicIp[];
 }
 
@@ -478,11 +478,6 @@ export interface PublicIp {
   attachedAt: Date | null;
   /** Set while a released address sits out its quarantine. */
   quarantinedUntil: Date | null;
-  /**
-   * From the node's own IPv6 prefix: given at create, taken back at delete,
-   * replaced on a move, and never pinning the sandbox.
-   */
-  nodePrefix: boolean;
 }
 
 /** Where public addresses come from. Operator configuration. */

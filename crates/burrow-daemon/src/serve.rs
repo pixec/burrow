@@ -209,19 +209,6 @@ pub struct ServeArgs {
     /// of the filesystem.
     #[arg(long, env = "BURROWD_DISK_RESERVE_MIB")]
     pub disk_reserve_mib: Option<u64>,
-    /// A routed IPv6 prefix, e.g. `2001:db8:100::/56`, from which every
-    /// sandbox here gets a global address of its own. Ingress to it is denied
-    /// unless the sandbox's policy admits it. Linux only.
-    #[arg(long, env = "BURROWD_IPV6_PREFIX")]
-    pub ipv6_prefix: Option<String>,
-    /// The prefix each sandbox is routed out of `--ipv6-prefix`: 64 or 128.
-    #[arg(long, default_value_t = 64, env = "BURROWD_IPV6_PER_SANDBOX")]
-    pub ipv6_per_sandbox: u8,
-    /// Answer NDP on the uplink for each sandbox's IPv6 prefix, for an
-    /// upstream that looks addresses up there rather than routing the prefix
-    /// to this node.
-    #[arg(long = "ipv6-on-link", env = "BURROWD_IPV6_ON_LINK")]
-    pub is_ipv6_on_link: bool,
     /// The interface public addresses arrive on. Unset uses the interface the
     /// node reaches each pool's gateway through.
     #[arg(long, env = "BURROWD_PUBLIC_INTERFACE")]
@@ -576,23 +563,13 @@ fn offered_hypervisors(args: &ServeArgs) -> anyhow::Result<Vec<burrow_vmm::Hyper
     Ok(offered)
 }
 
-fn public_config(args: &ServeArgs) -> anyhow::Result<crate::publicip::PublicConfig> {
-    let mut config = crate::publicip::PublicConfig {
+fn public_config(args: &ServeArgs) -> crate::publicip::PublicConfig {
+    crate::publicip::PublicConfig {
         interface: args.public_interface.clone(),
         new_per_sec: args.ingress_new_per_sec,
         kbytes_per_sec: args.ingress_kbytes_per_sec,
         ..Default::default()
-    };
-    if let Some(prefix) = &args.ipv6_prefix {
-        if !cfg!(target_os = "linux") {
-            anyhow::bail!(
-                "--ipv6-prefix needs a Linux node: a macOS node's userspace network has no \
-                 route a public address could arrive on"
-            );
-        }
-        config = config.with_ipv6(prefix, args.ipv6_per_sandbox, args.is_ipv6_on_link)?;
     }
-    Ok(config)
 }
 
 fn local_node_info(args: &ServeArgs) -> anyhow::Result<NodeInfo> {
@@ -633,12 +610,6 @@ fn local_node_info(args: &ServeArgs) -> anyhow::Result<NodeInfo> {
             .iter()
             .map(|feature| feature.to_string())
             .collect(),
-        ipv6_prefix: args.ipv6_prefix.clone().unwrap_or_default(),
-        ipv6_per_sandbox: args
-            .ipv6_prefix
-            .as_ref()
-            .map_or(0, |_| u32::from(args.ipv6_per_sandbox)),
-        is_ipv6_on_link: args.ipv6_prefix.is_some() && args.is_ipv6_on_link,
     })
 }
 
@@ -1477,7 +1448,7 @@ pub async fn run(args: ServeArgs) -> anyhow::Result<()> {
                 overcommit: args.disk_overcommit,
                 reserve_mib: args.disk_reserve_mib,
             },
-            public: public_config(&args)?,
+            public: public_config(&args),
             warm: warm_policy(&args),
         },
         Arc::clone(&proxy_policies),

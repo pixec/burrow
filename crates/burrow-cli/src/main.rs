@@ -1078,10 +1078,10 @@ struct NetworkFlags {
     /// keeps its own IPv6 behaviour.
     #[arg(long = "deny-ipv6")]
     is_ipv6_denied: bool,
-    /// What may reach the sandbox's public addresses (its dedicated IPs and
-    /// its global IPv6 address), as PROTO[/PORTS][@SOURCES]: tcp/22,
-    /// tcp/25,587, udp/27000-27015, tcp/22@203.0.113.0/24, icmp. Nothing is
-    /// admitted without one. Repeatable.
+    /// What may reach the sandbox's public addresses, IPv4 and IPv6, as
+    /// PROTO[/PORTS][@SOURCES]: tcp/22, tcp/25,587, udp/27000-27015,
+    /// tcp/22@203.0.113.0/24, icmp. Nothing is admitted without one.
+    /// Repeatable.
     #[arg(long = "ingress")]
     ingress: Vec<String>,
     /// Terminate this sandbox's TLS so the host named inside the session

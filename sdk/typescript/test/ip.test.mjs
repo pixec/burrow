@@ -50,8 +50,6 @@ test("a public ip reads back with its enums named and its stamps as dates", () =
   assert.equal(ip.allocatedAt.getTime(), 1700000000000);
   assert.equal(ip.attachedAt, null);
   assert.equal(ip.sandboxId, "sbx_a");
-  assert.equal(ip.nodePrefix, false);
-  assert.equal(toPublicIp({ pool: "node:node-a", isNodePrefix: true }).nodePrefix, true);
 });
 
 test("allocating for a sandbox and creating a pool send the wire's names", async () => {

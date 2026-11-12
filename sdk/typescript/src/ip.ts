@@ -23,7 +23,6 @@ export function toPublicIp(raw: any): PublicIp {
     allocatedAt: dateOf(raw?.allocatedAtUnixMs),
     attachedAt: dateOrNull(raw?.attachedAtUnixMs),
     quarantinedUntil: dateOrNull(raw?.quarantinedUntilUnixMs),
-    nodePrefix: Boolean(raw?.isNodePrefix),
   };
 }
 

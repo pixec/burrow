@@ -106,8 +106,8 @@ class PortRule:
 
 @dataclass
 class IngressRule:
-    """One door into a sandbox's public addresses: its dedicated IPs and its
-    global IPv6 address. Nothing is admitted without a rule.
+    """One door into a sandbox's public addresses, IPv4 and IPv6. Nothing is
+    admitted without a rule.
 
     ``protocol`` is ``"tcp"``, ``"udp"``, ``"icmp"`` (echo, no ports) or
     ``"any"`` (TCP and UDP). ``ports`` holds ports and ``"N-M"`` ranges; empty
@@ -183,8 +183,7 @@ class SandboxInfo:
     hypervisor_version: str = ""
     arch: str = ""
     guest_os: str = ""
-    # Public addresses routed to it: those attached from pools, and the one
-    # its node's IPv6 prefix gives it (`node_prefix`).
+    # Public addresses of either family attached to it.
     public_ips: List["PublicIp"] = field(default_factory=list)
 
 
@@ -209,9 +208,6 @@ class PublicIp:
     attached_at: Optional[datetime]
     # Set while a released address sits out its quarantine.
     quarantined_until: Optional[datetime]
-    # From the node's own IPv6 prefix: given at create, taken back at delete,
-    # replaced on a move, and never pinning the sandbox.
-    node_prefix: bool = False
 
 
 @dataclass
