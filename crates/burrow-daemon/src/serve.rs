@@ -713,6 +713,34 @@ fn probe_holes(dir: &std::path::Path) -> burrow_proto::common::v1::HoleProbe {
     }
 }
 
+/// Warns when `dir` is on a loop device without direct I/O. Every block a
+/// guest reads or writes then passes through the page cache twice, once as
+/// the filesystem's and once as the loop file's, and the second copy is
+/// charged to whichever VMM touched it.
+fn warn_if_buffered_loop(dir: &std::path::Path) {
+    use std::os::unix::fs::MetadataExt;
+    let Ok(meta) = std::fs::metadata(dir) else {
+        return;
+    };
+    if loop_direct_io(std::path::Path::new("/sys"), meta.dev()) == Some(false) {
+        tracing::warn!(
+            dir = %dir.display(),
+            "the data directory is on a loop device without direct I/O, so guest disk I/O is \
+             cached twice; run `losetup --direct-io=on` on it, or put it on a block device"
+        );
+    }
+}
+
+/// Whether the loop device `dev` (Linux's encoding) does direct I/O to its
+/// backing file, read from `sys`; `None` when `dev` is not a loop device.
+fn loop_direct_io(sys: &std::path::Path, dev: u64) -> Option<bool> {
+    let major = ((dev >> 8) & 0xfff) | ((dev >> 32) & !0xfff);
+    let minor = (dev & 0xff) | ((dev >> 12) & !0xff);
+    let dio =
+        std::fs::read_to_string(sys.join(format!("dev/block/{major}:{minor}/loop/dio"))).ok()?;
+    Some(dio.trim() == "1")
+}
+
 /// How often idle and lifetime policies are checked.
 ///
 /// Both are expressed in seconds but neither is a deadline anyone measures
@@ -1417,6 +1445,7 @@ pub async fn run(args: ServeArgs) -> anyhow::Result<()> {
         Some(_) => &args.chroot_base,
         None => &args.data_dir,
     }));
+    warn_if_buffered_loop(&args.data_dir);
 
     let store = Arc::new(
         burrow_store::Store::open(&args.data_dir.join("node.db"))
@@ -1966,6 +1995,20 @@ pub async fn run(args: ServeArgs) -> anyhow::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_loop_device_is_read_for_direct_io() {
+        let sys = std::env::temp_dir().join(format!("burrow-sys-{}", std::process::id()));
+        let loop0 = sys.join("dev/block/7:0/loop");
+        std::fs::create_dir_all(&loop0).unwrap();
+        std::fs::create_dir_all(sys.join("dev/block/259:3")).unwrap();
+        std::fs::write(loop0.join("dio"), "0\n").unwrap();
+        assert_eq!(loop_direct_io(&sys, 0x700), Some(false));
+        std::fs::write(loop0.join("dio"), "1\n").unwrap();
+        assert_eq!(loop_direct_io(&sys, 0x700), Some(true));
+        assert_eq!(loop_direct_io(&sys, (259 << 8) | 3), None);
+        std::fs::remove_dir_all(&sys).unwrap();
+    }
 
     /// The heartbeat carries the disk filesystem's free and total bytes, the
     /// reserve, what is provisioned, the overcommit, and whether the node is
