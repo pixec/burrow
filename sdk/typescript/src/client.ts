@@ -626,6 +626,7 @@ export class Burrow {
         address: n.info?.address ?? "",
         hostname: n.info?.hostname ?? "",
         totalVcpus: Number(n.info?.totalVcpus ?? 0),
+        committedCpus: Number(n.status?.committedCpuMillis ?? 0) / 1000,
         totalMemoryMib: Number(n.info?.totalMemMib ?? 0),
         freeMemoryMib: Number(n.status?.freeMemMib ?? 0),
         runningSandboxes: Number(n.status?.runningSandboxes ?? 0),

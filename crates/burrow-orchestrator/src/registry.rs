@@ -3,6 +3,7 @@ use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
 use burrow_common::NodeId;
+use burrow_common::cpu::cpus_text;
 use burrow_proto::common::v1::{self as common, NodeInfo, NodeStatus};
 
 pub const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(5);
@@ -22,9 +23,11 @@ pub struct Placement {
     /// Whether peers can be reached from another node.
     pub is_mesh_available: bool,
     /// What the sandbox will consume, so a node is not handed work it cannot
-    /// honour. `mem_mib` is the guest's; a node is charged
-    /// [`mem_charge_mib`](Self::mem_charge_mib).
+    /// honour. `vcpus` and `mem_mib` are the guest's; a node is charged
+    /// [`cpu_charge_millis`](Self::cpu_charge_millis), which is `cpus` where
+    /// the sandbox is capped, and [`mem_charge_mib`](Self::mem_charge_mib).
     pub vcpus: u32,
+    pub cpus: f64,
     pub mem_mib: u64,
     /// The disk it is promised, in bytes: its scratch disk. Checked against
     /// what the node reports with the node's own rule
@@ -57,11 +60,23 @@ pub struct Placement {
 }
 
 impl Placement {
+    /// The host CPU a node is charged for the sandbox, in thousandths of a
+    /// CPU.
+    pub fn cpu_charge_millis(&self) -> u64 {
+        cpu_charge_millis(self.vcpus, self.cpus)
+    }
+
     /// The host memory the sandbox may hold on `node`, which is what that node
     /// is charged.
     pub fn mem_charge_mib(&self, node: &NodeInfo) -> u64 {
         mem_charge_mib(node, &self.hypervisor, self.mem_mib)
     }
+}
+
+/// The host CPU a sandbox of `vcpus` capped at `cpus` is charged, in
+/// thousandths of a CPU.
+pub fn cpu_charge_millis(vcpus: u32, cpus: f64) -> u64 {
+    burrow_common::cpu::charge_millis(vcpus, burrow_common::cpu::cap_millis(cpus))
 }
 
 /// The host memory a guest of `mem_mib` under `hypervisor` may hold on `node`:
@@ -98,11 +113,11 @@ pub enum PlacementError {
     )]
     NoNodeWithHypervisor(String),
     #[error(
-        "no node has room for {vcpus} vcpu / {mem_mib} MiB of host memory / {disk_mib} MiB of \
+        "no node has room for {cpus} CPU / {mem_mib} MiB of host memory / {disk_mib} MiB of \
          disk{disk_note}"
     )]
     NoCapacity {
-        vcpus: u32,
+        cpus: String,
         mem_mib: u64,
         disk_mib: u64,
         /// Which node came closest on disk and what it lacked, when disk is
@@ -268,7 +283,7 @@ pub struct NodeEntry {
     pub is_reported: bool,
     /// Capacity other orchestrator replicas have promised on this node since
     /// its last heartbeat, as the store last said.
-    pub reserved_vcpus: u32,
+    pub reserved_cpu_millis: u64,
     pub reserved_mem_mib: u64,
 }
 
@@ -306,7 +321,7 @@ pub fn disk_bytes(resources: Option<&burrow_proto::common::v1::ResourcePolicy>) 
 /// Capacity promised to sandboxes a node has not yet reported.
 #[derive(Debug, Default, Clone, Copy)]
 struct Reserved {
-    vcpus: u32,
+    cpu_millis: u64,
     mem_mib: u64,
     disk_bytes: u64,
 }
@@ -319,7 +334,7 @@ struct Reserved {
 fn held(entry: &NodeEntry, pending: &HashMap<String, Reserved>) -> Reserved {
     let local = pending.get(&entry.info.id).copied().unwrap_or_default();
     Reserved {
-        vcpus: local.vcpus.max(entry.reserved_vcpus),
+        cpu_millis: local.cpu_millis.max(entry.reserved_cpu_millis),
         mem_mib: local.mem_mib.max(entry.reserved_mem_mib),
         // The store does not carry disk reservations; the node's own
         // admission is the gate, and this only keeps a burst from piling on.
@@ -352,10 +367,11 @@ fn disk_fit(
 /// Whether a node can take this sandbox without oversubscribing itself.
 fn is_fit(entry: &NodeEntry, pending: &HashMap<String, Reserved>, want: &Placement) -> bool {
     let held = held(entry, pending);
-    let committed = entry.status.committed_vcpus as u64 + held.vcpus as u64 + want.vcpus as u64;
+    let committed = entry.status.committed_cpu_millis + held.cpu_millis + want.cpu_charge_millis();
     // A node that has not reported its cpu count cannot be checked; trusting it
     // beats refusing to place anything on it.
-    let cpu_ok = entry.info.total_vcpus == 0 || committed <= entry.info.total_vcpus as u64;
+    let cpu_ok =
+        entry.info.total_vcpus == 0 || committed <= u64::from(entry.info.total_vcpus) * 1000;
     let free = entry.status.free_mem_mib.saturating_sub(held.mem_mib);
     let mem_ok = free >= want.mem_charge_mib(&entry.info);
     cpu_ok && mem_ok && disk_fit(entry, held, want).is_ok()
@@ -377,7 +393,7 @@ fn holds_warm(entry: &NodeEntry, want: &Placement) -> bool {
     };
     entry.status.warm_shapes.iter().any(|shape| {
         shape.template == want.template
-            && shape.resources.is_some_and(|resources| {
+            && shape.resources.as_ref().is_some_and(|resources| {
                 resources.vcpus == want.vcpus.max(1) && u64::from(resources.mem_mib) == mem_mib
             })
     })
@@ -393,8 +409,8 @@ fn headroom(entry: &NodeEntry, pending: &HashMap<String, Reserved>) -> f64 {
     let cpu_free = if entry.info.total_vcpus == 0 {
         1.0
     } else {
-        let committed = entry.status.committed_vcpus as f64 + held.vcpus as f64;
-        1.0 - (committed / entry.info.total_vcpus as f64).clamp(0.0, 1.0)
+        let committed = (entry.status.committed_cpu_millis + held.cpu_millis) as f64;
+        1.0 - (committed / (f64::from(entry.info.total_vcpus) * 1000.0)).clamp(0.0, 1.0)
     };
     let mem_free = if entry.info.total_mem_mib == 0 {
         1.0
@@ -520,7 +536,7 @@ impl NodeRegistry {
                 // A re-registering node re-reports on its next heartbeat; until
                 // then its previous inventory is not carried over.
                 is_reported: false,
-                reserved_vcpus: 0,
+                reserved_cpu_millis: 0,
                 reserved_mem_mib: 0,
             },
         );
@@ -552,7 +568,7 @@ impl NodeRegistry {
                 wireguard_public_key,
                 wireguard_endpoint,
                 is_reported: false,
-                reserved_vcpus: 0,
+                reserved_cpu_millis: 0,
                 reserved_mem_mib: 0,
             },
         );
@@ -600,7 +616,7 @@ impl NodeRegistry {
                     wireguard_public_key: row.wireguard_public_key,
                     wireguard_endpoint: row.wireguard_endpoint,
                     is_reported,
-                    reserved_vcpus: row.reserved_vcpus,
+                    reserved_cpu_millis: row.reserved_cpu_millis,
                     reserved_mem_mib: row.reserved_mem_mib,
                 },
             );
@@ -896,7 +912,7 @@ impl NodeRegistry {
             .collect();
         if with_room.is_empty() {
             return Err(PlacementError::NoCapacity {
-                vcpus: want.vcpus,
+                cpus: cpus_text(want.cpu_charge_millis()),
                 mem_mib: candidates
                     .iter()
                     .map(|e| want.mem_charge_mib(&e.info))
@@ -940,7 +956,7 @@ impl NodeRegistry {
     fn reserve(&self, node_id: &str, want: &Placement, mem_mib: u64) {
         let mut pending = self.pending.lock().unwrap();
         let entry = pending.entry(node_id.to_string()).or_default();
-        entry.vcpus += want.vcpus;
+        entry.cpu_millis += want.cpu_charge_millis();
         entry.mem_mib += mem_mib;
         entry.disk_bytes += want.disk_bytes;
     }
@@ -957,15 +973,15 @@ impl NodeRegistry {
     /// reporting it. If the sandbox is destroyed inside that window the charge
     /// has to be returned, or a burst of create-then-destroy exhausts a node
     /// that is in fact empty.
-    pub fn release(&self, node_id: &str, vcpus: u32, mem_mib: u64, disk_bytes: u64) {
+    pub fn release(&self, node_id: &str, cpu_millis: u64, mem_mib: u64, disk_bytes: u64) {
         let mut pending = self.pending.lock().unwrap();
         let Some(entry) = pending.get_mut(node_id) else {
             return;
         };
-        entry.vcpus = entry.vcpus.saturating_sub(vcpus);
+        entry.cpu_millis = entry.cpu_millis.saturating_sub(cpu_millis);
         entry.mem_mib = entry.mem_mib.saturating_sub(mem_mib);
         entry.disk_bytes = entry.disk_bytes.saturating_sub(disk_bytes);
-        if entry.vcpus == 0 && entry.mem_mib == 0 && entry.disk_bytes == 0 {
+        if entry.cpu_millis == 0 && entry.mem_mib == 0 && entry.disk_bytes == 0 {
             pending.remove(node_id);
         }
     }
@@ -1909,7 +1925,7 @@ mod tests {
                 "roomy-memory",
                 NodeStatus {
                     free_mem_mib: 60_000,
-                    committed_vcpus: 16,
+                    committed_cpu_millis: 16_000,
                     ..Default::default()
                 },
             ),
@@ -1917,7 +1933,7 @@ mod tests {
                 "roomy-cpu",
                 NodeStatus {
                     free_mem_mib: 8_000,
-                    committed_vcpus: 1,
+                    committed_cpu_millis: 1000,
                     ..Default::default()
                 },
             ),
@@ -1941,7 +1957,7 @@ mod tests {
             "full",
             NodeStatus {
                 free_mem_mib: 60_000,
-                committed_vcpus: 8,
+                committed_cpu_millis: 8000,
                 ..Default::default()
             },
         )]);
@@ -2020,7 +2036,7 @@ mod tests {
             "only",
             NodeStatus {
                 free_mem_mib: 4_000,
-                committed_vcpus: 1,
+                committed_cpu_millis: 1000,
                 ..Default::default()
             },
             None,
@@ -2156,7 +2172,7 @@ mod tests {
         };
         assert_eq!(registry.mem_charge_mib("only", "", 512), 512 + 64 + 4);
         assert_eq!(registry.place_for(&want).unwrap(), "only");
-        registry.release("only", 1, 580, 0);
+        registry.release("only", want.cpu_charge_millis(), 580, 0);
 
         registry.heartbeat(
             "only",
@@ -2170,6 +2186,50 @@ mod tests {
         );
         assert_eq!(registry.mem_charge_mib("only", "", 512), 512 + 128 + 4);
         assert!(registry.place_for(&want).is_err());
+    }
+
+    /// A sandbox capped below its vCPUs is charged its cap: four 2-vCPU
+    /// sandboxes at half a CPU each fit a 2-CPU node, and a fifth does not.
+    /// Committed CPU a node reports counts the same way.
+    #[test]
+    fn a_capped_sandbox_is_charged_its_cap() {
+        let registry = registry(&[(
+            "small",
+            NodeStatus {
+                free_mem_mib: 64_000,
+                ..Default::default()
+            },
+        )]);
+        set_capacity(&registry, "small", 2, 64_000);
+        let want = Placement {
+            vcpus: 2,
+            cpus: 0.5,
+            mem_mib: 512,
+            ..Default::default()
+        };
+        assert_eq!(want.cpu_charge_millis(), 500);
+        for _ in 0..4 {
+            assert_eq!(registry.place_for(&want).unwrap(), "small");
+        }
+        let err = registry.place_for(&want).unwrap_err();
+        assert!(err.to_string().contains("0.5 CPU"), "{err}");
+
+        registry.heartbeat(
+            "small",
+            NodeStatus {
+                free_mem_mib: 64_000,
+                committed_cpu_millis: 1_500,
+                ..Default::default()
+            },
+            None,
+        );
+        assert!(registry.place_for(&want).is_ok());
+        let uncapped = Placement {
+            vcpus: 2,
+            mem_mib: 512,
+            ..Default::default()
+        };
+        assert!(registry.place_for(&uncapped).is_err());
     }
 
     /// A reservation covers the window before a node reports the sandbox. If
@@ -2198,7 +2258,7 @@ mod tests {
         assert!(registry.place_for(&want).is_err());
 
         let charged = registry.mem_charge_mib("only", &want.hypervisor, want.mem_mib);
-        registry.release("only", want.vcpus, charged, want.disk_bytes);
+        registry.release("only", want.cpu_charge_millis(), charged, want.disk_bytes);
         registry
             .place_for(&want)
             .expect("releasing one placement should make room for another");
@@ -2320,7 +2380,7 @@ mod tests {
         registry.place_for(&want).unwrap();
         assert!(registry.place_for(&want).is_err());
         let charged = registry.mem_charge_mib("a", &want.hypervisor, want.mem_mib);
-        registry.release("a", want.vcpus, charged, want.disk_bytes);
+        registry.release("a", want.cpu_charge_millis(), charged, want.disk_bytes);
         assert_eq!(registry.place_for(&want).unwrap(), "a");
     }
 

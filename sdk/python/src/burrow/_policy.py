@@ -344,11 +344,23 @@ def to_resources(resources: ResourcePolicy) -> common_pb2.ResourcePolicy:
         vcpus=resources.vcpus,
         mem_mib=resources.memory_mib,
         disk_mib=resources.disk_mib,
+        cpus=resources.cpus,
+        cpu_shares=resources.cpu_shares,
+        cpuset_cpus=resources.cpuset_cpus,
+        blkio_weight=resources.blkio_weight,
     )
 
 
 def from_resources(raw: common_pb2.ResourcePolicy) -> ResourcePolicy:
-    return ResourcePolicy(vcpus=raw.vcpus, memory_mib=raw.mem_mib, disk_mib=raw.disk_mib)
+    return ResourcePolicy(
+        vcpus=raw.vcpus,
+        memory_mib=raw.mem_mib,
+        disk_mib=raw.disk_mib,
+        cpus=raw.cpus,
+        cpu_shares=raw.cpu_shares,
+        cpuset_cpus=raw.cpuset_cpus,
+        blkio_weight=raw.blkio_weight,
+    )
 
 
 def to_lifetime(lifetime: LifetimePolicy) -> common_pb2.LifetimePolicy:

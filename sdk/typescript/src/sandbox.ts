@@ -132,6 +132,12 @@ export function toResourcesUpdate(raw: any): ResourcesUpdate {
     const outcome = toResourceOutcome(field);
     if (outcome) update[name] = outcome;
   }
+  if (raw.limits) {
+    update.limits = {
+      change: enumOf(raw.limits.change, "RESOURCE_CHANGE_", RESOURCE_CHANGES),
+      reason: raw.limits.reason ?? "",
+    };
+  }
   return update;
 }
 
@@ -871,15 +877,17 @@ export class Sandbox {
   }
 
   /**
-   * Changes the sandbox's vCPUs, memory and root disk. An omitted field is
-   * left as it is.
+   * Changes the sandbox's vCPUs, memory, root disk and host limits. An
+   * omitted field is left as it is.
    *
    * A running sandbox takes what its hypervisor can hotplug: a bigger disk
    * under Firecracker and Cloud Hypervisor, whose guest grows its filesystem
    * at once, and vCPUs under Cloud Hypervisor on x86_64. A shut-down one
    * ({@link stop}) takes everything: vCPUs and memory on its next boot,
    * and its disk at once, shrunk by a helper VM that checks the filesystem
-   * first. A suspended sandbox takes none of it. What cannot be applied is
+   * first. A suspended sandbox takes none of it. The host limits (`cpus`,
+   * `cpuShares`, `cpusetCpus`, `blkioWeight`) move live on a running sandbox
+   * and otherwise when it next runs. What cannot be applied is
    * reported as `refused` with the reason rather than thrown, so check each
    * field you asked for.
    *
@@ -905,6 +913,10 @@ export class Sandbox {
         vcpus: options.vcpus,
         memMib: options.memoryMib,
         diskMib: options.diskMib,
+        cpus: options.cpus,
+        cpuShares: options.cpuShares,
+        cpusetCpus: options.cpusetCpus,
+        blkioWeight: options.blkioWeight,
       },
       // A shrink boots a helper VM that checks the filesystem first.
       { ...options, timeoutMs: options.timeoutMs ?? 600_000 },

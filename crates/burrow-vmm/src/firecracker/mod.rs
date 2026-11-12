@@ -378,6 +378,10 @@ impl MicroVm {
         self.cgroup.as_ref()?.cpu_usage_usec()
     }
 
+    pub fn cgroup(&self) -> Option<&Cgroup> {
+        self.cgroup.as_ref()
+    }
+
     pub fn console_log_path(&self) -> &Path {
         self.process.console_log_path()
     }

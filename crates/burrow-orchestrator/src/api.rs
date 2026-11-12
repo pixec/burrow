@@ -153,7 +153,7 @@ struct PlacementGuard<'a> {
     nodes: &'a crate::registry::NodeRegistry,
     store: Option<Arc<burrow_store::Store>>,
     node_id: String,
-    vcpus: u32,
+    cpu_millis: u64,
     mem_mib: u64,
     disk_bytes: u64,
     is_kept: bool,
@@ -168,9 +168,18 @@ impl PlacementGuard<'_> {
 impl Drop for PlacementGuard<'_> {
     fn drop(&mut self) {
         if !self.is_kept {
-            self.nodes
-                .release(&self.node_id, self.vcpus, self.mem_mib, self.disk_bytes);
-            release_in_store(self.store.clone(), &self.node_id, self.vcpus, self.mem_mib);
+            self.nodes.release(
+                &self.node_id,
+                self.cpu_millis,
+                self.mem_mib,
+                self.disk_bytes,
+            );
+            release_in_store(
+                self.store.clone(),
+                &self.node_id,
+                self.cpu_millis,
+                self.mem_mib,
+            );
         }
     }
 }
@@ -253,22 +262,23 @@ impl ApiService {
             let Some(store) = &self.0.store else {
                 return Ok(node_id);
             };
+            let cpu_millis = want.cpu_charge_millis();
             let mem_mib = self
                 .0
                 .nodes
                 .mem_charge_mib(&node_id, &want.hypervisor, want.mem_mib);
-            match store.reserve_capacity(&node_id, want.vcpus, mem_mib).await {
+            match store.reserve_capacity(&node_id, cpu_millis, mem_mib).await {
                 Ok(true) => return Ok(node_id),
                 Ok(false) => {
                     self.0
                         .nodes
-                        .release(&node_id, want.vcpus, mem_mib, want.disk_bytes);
+                        .release(&node_id, cpu_millis, mem_mib, want.disk_bytes);
                     excluded.insert(node_id);
                 }
                 Err(err) => {
                     self.0
                         .nodes
-                        .release(&node_id, want.vcpus, mem_mib, want.disk_bytes);
+                        .release(&node_id, cpu_millis, mem_mib, want.disk_bytes);
                     return Err(crate::registry::PlacementError::Store(err.to_string()));
                 }
             }
@@ -280,7 +290,7 @@ impl ApiService {
             nodes: &self.0.nodes,
             store: self.0.store.clone(),
             node_id: node_id.to_string(),
-            vcpus: want.vcpus,
+            cpu_millis: want.cpu_charge_millis(),
             mem_mib: self
                 .0
                 .nodes
@@ -1323,7 +1333,7 @@ impl ApiService {
         let resources = sandbox
             .policy
             .as_ref()
-            .and_then(|p| p.resources)
+            .and_then(|p| p.resources.clone())
             .unwrap_or_default();
         let networks: Vec<String> = sandbox
             .policy
@@ -1337,6 +1347,7 @@ impl ApiService {
             prefer_node: self.0.sandboxes.node_hosting_networks(&networks),
             is_mesh_available: self.0.nodes.is_mesh_available(""),
             vcpus: resources.vcpus.max(1),
+            cpus: resources.cpus,
             mem_mib: match resources.mem_mib {
                 0 => 512,
                 mem => mem as u64,
@@ -1422,9 +1433,9 @@ impl ApiService {
         let resources = sandbox
             .policy
             .as_ref()
-            .and_then(|policy| policy.resources)
+            .and_then(|policy| policy.resources.clone())
             .unwrap_or_default();
-        let vcpus = resources.vcpus.max(1);
+        let cpu_millis = crate::registry::cpu_charge_millis(resources.vcpus, resources.cpus);
         let mem_mib = self.0.nodes.mem_charge_mib(
             &sandbox.node_id,
             &sandbox.hypervisor,
@@ -1436,8 +1447,8 @@ impl ApiService {
         let disk_bytes = crate::registry::disk_bytes(Some(&resources));
         self.0
             .nodes
-            .release(&sandbox.node_id, vcpus, mem_mib, disk_bytes);
-        release_in_store(self.0.store.clone(), &sandbox.node_id, vcpus, mem_mib);
+            .release(&sandbox.node_id, cpu_millis, mem_mib, disk_bytes);
+        release_in_store(self.0.store.clone(), &sandbox.node_id, cpu_millis, mem_mib);
     }
 }
 
@@ -1647,12 +1658,24 @@ impl Burrow for ApiService {
 
         // Defaults mirror the node's own, so placement charges a node the same
         // resources the sandbox will actually be built with.
-        let resources = req.policy.as_ref().and_then(|p| p.resources);
+        let resources = req.policy.as_ref().and_then(|p| p.resources.clone());
+        if let Some(r) = &resources {
+            burrow_common::cpu::validate(
+                r.vcpus,
+                r.cpus,
+                r.cpu_shares,
+                &r.cpuset_cpus,
+                r.blkio_weight,
+                None,
+            )
+            .map_err(Status::invalid_argument)?;
+        }
         let want = crate::registry::Placement {
             template: template.clone(),
             prefer_node: self.0.sandboxes.node_hosting_networks(&networks),
             is_mesh_available: self.0.nodes.is_mesh_available(""),
             vcpus: resources.as_ref().map(|r| r.vcpus).unwrap_or(0).max(1),
+            cpus: resources.as_ref().map(|r| r.cpus).unwrap_or(0.0),
             mem_mib: match resources.as_ref().map(|r| r.mem_mib).unwrap_or(0) {
                 0 => 512,
                 mem => mem as u64,
@@ -2158,6 +2181,10 @@ impl Burrow for ApiService {
                 vcpus: req.vcpus,
                 mem_mib: req.mem_mib,
                 disk_mib: req.disk_mib,
+                cpus: req.cpus,
+                cpu_shares: req.cpu_shares,
+                cpuset_cpus: req.cpuset_cpus,
+                blkio_weight: req.blkio_weight,
             })
             .await?
             .into_inner();
@@ -2528,6 +2555,7 @@ impl Burrow for ApiService {
             prefer_node: None,
             is_mesh_available: self.0.nodes.is_mesh_available(""),
             vcpus: 1,
+            cpus: 0.0,
             mem_mib: 0,
             // A volume's image is the volume's, which disk admission does
             // not count yet.
@@ -3628,13 +3656,13 @@ fn internal(err: anyhow::Error) -> Status {
 fn release_in_store(
     store: Option<Arc<burrow_store::Store>>,
     node_id: &str,
-    vcpus: u32,
+    cpu_millis: u64,
     mem_mib: u64,
 ) {
     let Some(store) = store else { return };
     let node_id = node_id.to_string();
     tokio::spawn(async move {
-        if let Err(err) = store.release_capacity(&node_id, vcpus, mem_mib).await {
+        if let Err(err) = store.release_capacity(&node_id, cpu_millis, mem_mib).await {
             tracing::warn!(node_id, %err, "could not release capacity in the store");
         }
     });

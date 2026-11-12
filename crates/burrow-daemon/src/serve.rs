@@ -739,7 +739,7 @@ async fn current_status(sandboxes: &SandboxManager, data_dir: &std::path::Path) 
         is_draining: sandboxes.is_draining(),
         // Suspended sandboxes count: they hold their address, disks and
         // snapshot, and resuming must not find the node oversubscribed.
-        committed_vcpus: sandboxes.committed_vcpus().await,
+        committed_cpu_millis: sandboxes.committed_cpu_millis().await,
         volumes: sandboxes.volumes().list().await,
         ..disk_status(sandboxes.disk_status().await)
     }

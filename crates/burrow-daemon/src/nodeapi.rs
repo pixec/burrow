@@ -389,7 +389,7 @@ impl NodeApi {
                 .detached(move |sandboxes| async move { sandboxes.delete(&deleting).await })
                 .await?;
         }
-        policy.resources = Some(plan.resources);
+        policy.resources = Some(plan.resources.clone());
         policy.network = Some(plan.install_network.clone());
         policy.volumes.extend(mounts);
         validate_policy(&policy)?;
@@ -1022,11 +1022,33 @@ impl NodeService for NodeApi {
         req: Request<nodepb::NodeUpdateResourcesRequest>,
     ) -> Result<Response<api::UpdateResourcesResponse>, Status> {
         let req = req.into_inner();
-        if req.vcpus.is_none() && req.mem_mib.is_none() && req.disk_mib.is_none() {
+        let limits = crate::sandbox::LimitsUpdate {
+            cpus: req.cpus,
+            cpu_shares: req.cpu_shares,
+            cpuset_cpus: req.cpuset_cpus.clone(),
+            blkio_weight: req.blkio_weight,
+        };
+        if req.vcpus.is_none()
+            && req.mem_mib.is_none()
+            && req.disk_mib.is_none()
+            && limits.is_empty()
+        {
             return Err(Status::invalid_argument(
-                "name at least one of vcpus, mem_mib and disk_mib",
+                "name at least one of vcpus, mem_mib, disk_mib, cpus, cpu_shares, cpuset_cpus \
+                 and blkio_weight",
             ));
         }
+        // Checked whole here, before anything changes; only the cap against
+        // the vcpus the sandbox ends up with waits for the sandbox.
+        burrow_common::cpu::validate(
+            MAX_VCPUS,
+            req.cpus.unwrap_or_default(),
+            req.cpu_shares.unwrap_or_default(),
+            req.cpuset_cpus.as_deref().unwrap_or_default(),
+            req.blkio_weight.unwrap_or_default(),
+            Some(crate::sandbox::node_cpus()),
+        )
+        .map_err(Status::invalid_argument)?;
         let nonzero = |name: &str, value: Option<u32>| match value {
             Some(0) => Err(Status::invalid_argument(format!("{name} must be above 0"))),
             _ => Ok(()),
@@ -1041,7 +1063,13 @@ impl NodeService for NodeApi {
             .sandboxes
             .detached(move |sandboxes| async move {
                 sandboxes
-                    .update_machine(&req.sandbox_id, req.vcpus, req.mem_mib, req.disk_mib)
+                    .update_machine(
+                        &req.sandbox_id,
+                        req.vcpus,
+                        req.mem_mib,
+                        req.disk_mib,
+                        limits,
+                    )
                     .await
             })
             .await?;
@@ -1051,6 +1079,7 @@ impl NodeService for NodeApi {
             mem_mib: updated.mem_mib,
             disk_mib: updated.disk_mib,
             filesystem_bytes: updated.filesystem_bytes,
+            limits: updated.limits,
         }))
     }
 
@@ -2228,6 +2257,15 @@ fn validate_policy(policy: &common::Policy) -> Result<(), Status> {
         vcpus(resources.vcpus)?;
         mem_mib(resources.mem_mib)?;
         disk_mib(resources.disk_mib)?;
+        burrow_common::cpu::validate(
+            resources.vcpus,
+            resources.cpus,
+            resources.cpu_shares,
+            &resources.cpuset_cpus,
+            resources.blkio_weight,
+            Some(crate::sandbox::node_cpus()),
+        )
+        .map_err(Status::invalid_argument)?;
     }
     if let Some(snapshots) = &policy.snapshots {
         validate_retention(snapshots)?;
@@ -3561,6 +3599,22 @@ mod policy_tests {
             ..Default::default()
         });
         assert!(validate_policy(&oversized).is_err());
+
+        // A cap above the vCPUs, or a pin to a CPU the node lacks, is refused.
+        let mut capped = ok.clone();
+        capped.resources = Some(common::ResourcePolicy {
+            vcpus: 2,
+            cpus: 0.5,
+            ..Default::default()
+        });
+        assert!(validate_policy(&capped).is_ok());
+        capped.resources.as_mut().unwrap().cpus = 2.5;
+        assert!(validate_policy(&capped).is_err());
+        capped.resources = Some(common::ResourcePolicy {
+            cpuset_cpus: format!("0-{}", crate::sandbox::node_cpus()),
+            ..Default::default()
+        });
+        assert!(validate_policy(&capped).is_err());
 
         // An unstated policy is the common case and must stay accepted.
         assert!(validate_policy(&common::Policy::default()).is_ok());

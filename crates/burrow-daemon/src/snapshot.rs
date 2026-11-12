@@ -166,6 +166,7 @@ impl Manifest {
                 vcpus: self.vcpus,
                 mem_mib: self.mem_mib,
                 disk_mib: self.disk_mib,
+                ..Default::default()
             }),
             created_at_unix_ms: self.created_unix_ms,
             size_bytes: self.size_bytes,

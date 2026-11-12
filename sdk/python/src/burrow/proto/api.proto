@@ -663,11 +663,20 @@ message UpdateLifetimeRequest {
 // shut-down sandbox's image (OFFLINE) and its container takes the space on its
 // next boot; a shrink shrinks a running sandbox's container (NEXT_BOOT) and
 // its image is cut on its next boot. The recovery container is kept.
+//
+// The host limits, `cpus`, `cpu_shares`, `cpuset_cpus` and `blkio_weight`,
+// are the VMM's cgroup and change together: live on a running sandbox, and on
+// a suspended or shut-down one when it next runs. 0, or an empty cpuset,
+// clears one. A `cpus` above the vcpus the sandbox will have is refused.
 message UpdateResourcesRequest {
   string sandbox_id = 1;
   optional uint32 vcpus = 2;
   optional uint32 mem_mib = 3;
   optional uint32 disk_mib = 4;
+  optional double cpus = 5;
+  optional uint32 cpu_shares = 6;
+  optional string cpuset_cpus = 7;
+  optional uint32 blkio_weight = 8;
 }
 
 enum ResourceChange {
@@ -694,6 +703,13 @@ message ResourceOutcome {
   string reason = 4;
 }
 
+// What became of the host limits of an UpdateResourcesRequest, all of which
+// change together. The values are the sandbox's `policy.resources`.
+message LimitsOutcome {
+  ResourceChange change = 1;
+  string reason = 2;
+}
+
 // One outcome per field asked for; absent for a field that was not.
 message UpdateResourcesResponse {
   burrow.common.v1.Sandbox sandbox = 1;
@@ -704,6 +720,8 @@ message UpdateResourcesResponse {
   // 0 when no guest has seen the disk yet: a shut-down sandbox grown, whose
   // guest fills it on its next boot.
   uint64 filesystem_bytes = 5;
+  // Present when any host limit was asked for.
+  LimitsOutcome limits = 6;
 }
 
 // Replaces a sandbox's whole tag set: an omitted tag is a tag removed, and an

@@ -1,19 +1,25 @@
 //! Per-sandbox resource limits via cgroup v2.
 //!
 //! Firecracker already bounds a guest's *memory*: it allocates what the
-//! machine config asks for and the guest cannot exceed it. It does not bound
-//! CPU: `vcpu_count` decides how many vCPU threads exist, not how much host
-//! CPU they may consume, so a single-vCPU guest spinning in a loop will happily
-//! saturate a host core and starve its neighbours. `cpu.max` is what actually
-//! caps that, which makes this the piece that turns "isolated" from a memory
-//! statement into a scheduling one.
+//! machine config asks for and the guest cannot exceed it. Its vCPU count
+//! bounds the guest's CPU too, since each vCPU is one thread, but not the
+//! VMM's own threads, and not how host CPU is shared when the node is busy.
+//! `cpu.weight` shares it in proportion to what each sandbox was charged, so
+//! a busy neighbour cannot starve one of what placement promised it.
+//! `cpu.max` is set only for a sandbox that asked for a cap: one at the vCPU
+//! count throttled the VMM's device threads along with the vCPUs, stalling a
+//! busy guest for the rest of each period, and kept no neighbour safer than
+//! the weight does.
 
 use std::path::{Path, PathBuf};
 
 use crate::error::{Error, Result};
 
-/// Controllers burrow needs delegated to it.
-const REQUIRED: [&str; 3] = ["cpu", "memory", "pids"];
+/// Controllers burrow delegates where it can. `cpuset` and `io` are needed
+/// only by a sandbox that pins CPUs or weighs its IO.
+const CONTROLLERS: [&str; 5] = ["cpu", "memory", "pids", "cpuset", "io"];
+/// The kernel's `cpu.weight` and `io.weight` default.
+const DEFAULT_WEIGHT: u64 = 100;
 /// cgroup v2 CPU accounting period, in microseconds.
 const CPU_PERIOD_US: u64 = 100_000;
 /// Times the processes are moved out before delegation is given up on. A
@@ -23,8 +29,15 @@ const EVACUATE_ATTEMPTS: usize = 5;
 
 #[derive(Debug, Clone, Default)]
 pub struct Limits {
-    /// Whole host CPUs the sandbox may consume. 0 means unlimited.
-    pub cpus: u32,
+    /// Host CPU the VMM may consume, in thousandths of a CPU (`cpu.max`). 0
+    /// means unlimited.
+    pub cpu_max_millis: u64,
+    /// `cpu.weight`, 1 to 10000. 0 is the kernel's default.
+    pub cpu_weight: u64,
+    /// `cpuset.cpus`, in its list syntax such as "0-3,6". Empty is any CPU.
+    pub cpuset_cpus: String,
+    /// `io.weight`, 1 to 10000. 0 is the kernel's default.
+    pub io_weight: u64,
     /// Hard memory ceiling for the VMM process, in MiB. 0 means unlimited.
     pub memory_mib: u32,
     /// Cap on process count, which bounds fork bombs inside the VMM.
@@ -46,10 +59,9 @@ impl Cgroup {
             std::fs::create_dir_all(&path)?;
         }
 
-        if limits.cpus > 0 {
-            let quota = CPU_PERIOD_US * limits.cpus as u64;
-            write(&path.join("cpu.max"), &format!("{quota} {CPU_PERIOD_US}"))?;
-        }
+        let cgroup = Self { path };
+        cgroup.set_limits(limits)?;
+        let path = &cgroup.path;
         if limits.memory_mib > 0 {
             let bytes = limits.memory_mib as u64 * 1024 * 1024;
             write(&path.join("memory.max"), &bytes.to_string())?;
@@ -57,7 +69,7 @@ impl Cgroup {
         if limits.pids_max > 0 {
             write(&path.join("pids.max"), &limits.pids_max.to_string())?;
         }
-        Ok(Self { path })
+        Ok(cgroup)
     }
 
     /// The cgroup a VM's VMM is to join, made before the VMM is spawned. One
@@ -74,7 +86,9 @@ impl Cgroup {
         };
         match Self::create(root, vm_id, limits) {
             Ok(cgroup) => Ok(Some(cgroup)),
-            Err(err) if !is_required => {
+            // A pin or an IO weight is never dropped quietly: the caller
+            // asked for it by name.
+            Err(err) if !is_required && limits.cpuset_cpus.is_empty() && limits.io_weight == 0 => {
                 // Loud, because the sandbox is about to run without the CPU
                 // cap its policy asked for.
                 tracing::error!(
@@ -110,13 +124,28 @@ impl Cgroup {
         Ok(())
     }
 
-    /// Moves the CPU cap, for a guest given vCPUs or relieved of them.
-    pub fn set_cpus(&self, cpus: u32) -> Result<()> {
-        let quota = CPU_PERIOD_US * u64::from(cpus);
-        write(
-            &self.path.join("cpu.max"),
-            &format!("{quota} {CPU_PERIOD_US}"),
-        )
+    /// Writes the CPU and IO limits, on a new cgroup or a running VMM's. One
+    /// left at 0 or empty is put back to the kernel's default.
+    pub fn set_limits(&self, limits: &Limits) -> Result<()> {
+        write(&self.path.join("cpu.max"), &cpu_max(limits.cpu_max_millis))?;
+        let weight = match limits.cpu_weight {
+            0 => DEFAULT_WEIGHT,
+            weight => weight,
+        };
+        write(&self.path.join("cpu.weight"), &weight.to_string())?;
+        let cpuset = self.path.join("cpuset.cpus");
+        if !limits.cpuset_cpus.is_empty() || cpuset.exists() {
+            write_controlled(&cpuset, &limits.cpuset_cpus, "cpuset_cpus")?;
+        }
+        let io = self.path.join("io.weight");
+        if limits.io_weight > 0 || io.exists() {
+            let weight = match limits.io_weight {
+                0 => DEFAULT_WEIGHT,
+                weight => weight,
+            };
+            write_controlled(&io, &format!("default {weight}"), "blkio_weight")?;
+        }
+        Ok(())
     }
 
     pub fn path(&self) -> &Path {
@@ -167,14 +196,14 @@ fn prepare_parent(root: &Path, parent: &Path) -> Result<()> {
 
 fn enable_controllers(dir: &Path) -> Result<()> {
     let available = std::fs::read_to_string(dir.join("cgroup.controllers")).unwrap_or_default();
-    let wanted: Vec<&str> = REQUIRED
+    let wanted: Vec<&str> = CONTROLLERS
         .iter()
         .copied()
         .filter(|c| available.split_whitespace().any(|a| a == *c))
         .collect();
     if wanted.is_empty() {
         return Err(Error::CgroupUnavailable {
-            reason: format!("none of {REQUIRED:?} are delegated to {}", dir.display()),
+            reason: format!("none of {CONTROLLERS:?} are delegated to {}", dir.display()),
         });
     }
 
@@ -230,6 +259,29 @@ fn evacuate_processes(dir: &Path) -> Result<()> {
     Ok(())
 }
 
+/// `cpu.max` for a cap in thousandths of a CPU, or no cap.
+fn cpu_max(millis: u64) -> String {
+    match millis {
+        0 => format!("max {CPU_PERIOD_US}"),
+        millis => format!("{} {CPU_PERIOD_US}", CPU_PERIOD_US * millis / 1000),
+    }
+}
+
+/// Writes a file only a controller burrow may not have been delegated
+/// provides, naming the limit that needs it when it is missing.
+fn write_controlled(path: &Path, value: &str, limit: &str) -> Result<()> {
+    if !path.exists() {
+        return Err(Error::CgroupUnavailable {
+            reason: format!(
+                "{limit} needs {}, which this node's cgroup does not have: its controller is \
+                 not delegated to burrowd or the kernel lacks it",
+                path.display()
+            ),
+        });
+    }
+    write(path, value)
+}
+
 fn write(path: &Path, value: &str) -> Result<()> {
     std::fs::write(path, value).map_err(|err| {
         tracing::debug!(path = %path.display(), value, %err, "cgroup write failed");
@@ -243,15 +295,79 @@ mod tests {
 
     #[test]
     fn cpu_quota_is_scaled_by_the_accounting_period() {
-        // Two CPUs means twice the period's worth of runtime per period.
-        assert_eq!(CPU_PERIOD_US * 2, 200_000);
+        assert_eq!(cpu_max(2000), "200000 100000");
+        assert_eq!(cpu_max(500), "50000 100000");
+        assert_eq!(cpu_max(10), "1000 100000");
+        assert_eq!(cpu_max(0), "max 100000");
+    }
+
+    /// The files a cgroup holds, for a test standing in for one.
+    fn fake(name: &str, files: &[&str]) -> Cgroup {
+        let path = std::env::temp_dir().join(format!("burrow-cg-{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&path);
+        std::fs::create_dir_all(&path).unwrap();
+        for file in files {
+            std::fs::write(path.join(file), "").unwrap();
+        }
+        Cgroup { path }
+    }
+
+    #[test]
+    fn limits_are_written_and_cleared() {
+        let cgroup = fake(
+            "limits",
+            &["cpu.max", "cpu.weight", "cpuset.cpus", "io.weight"],
+        );
+        let read = |file: &str| std::fs::read_to_string(cgroup.path.join(file)).unwrap();
+        cgroup
+            .set_limits(&Limits {
+                cpu_max_millis: 500,
+                cpu_weight: 20,
+                cpuset_cpus: "0-1".into(),
+                io_weight: 4950,
+                ..Default::default()
+            })
+            .unwrap();
+        assert_eq!(read("cpu.max"), "50000 100000");
+        assert_eq!(read("cpu.weight"), "20");
+        assert_eq!(read("cpuset.cpus"), "0-1");
+        assert_eq!(read("io.weight"), "default 4950");
+        cgroup.set_limits(&Limits::default()).unwrap();
+        assert_eq!(read("cpu.max"), "max 100000");
+        assert_eq!(read("cpu.weight"), "100");
+        assert_eq!(read("cpuset.cpus"), "");
+        assert_eq!(read("io.weight"), "default 100");
+        let _ = std::fs::remove_dir_all(&cgroup.path);
+    }
+
+    /// A pin or an IO weight on a node without the controller is refused by
+    /// name, not dropped.
+    #[test]
+    fn a_missing_controller_is_named() {
+        let cgroup = fake("nocontroller", &["cpu.max", "cpu.weight"]);
+        cgroup.set_limits(&Limits::default()).unwrap();
+        let err = cgroup
+            .set_limits(&Limits {
+                io_weight: 100,
+                ..Default::default()
+            })
+            .unwrap_err();
+        assert!(err.to_string().contains("blkio_weight"), "{err}");
+        let err = cgroup
+            .set_limits(&Limits {
+                cpuset_cpus: "0".into(),
+                ..Default::default()
+            })
+            .unwrap_err();
+        assert!(err.to_string().contains("cpuset_cpus"), "{err}");
+        let _ = std::fs::remove_dir_all(&cgroup.path);
     }
 
     #[test]
     fn unavailable_controllers_are_reported_rather_than_silently_skipped() {
         let dir = std::env::temp_dir().join(format!("burrow-cg-test-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
-        std::fs::write(dir.join("cgroup.controllers"), "io rdma").unwrap();
+        std::fs::write(dir.join("cgroup.controllers"), "rdma hugetlb").unwrap();
         let err = enable_controllers(&dir).unwrap_err();
         assert!(matches!(err, Error::CgroupUnavailable { .. }));
         let _ = std::fs::remove_dir_all(&dir);

@@ -40,6 +40,22 @@ message ResourcePolicy {
   // plus 1 GiB. On the overlay layout of older sandboxes it is the scratch
   // disk under the overlay; 0 is 1 GiB.
   uint32 disk_mib = 3;
+  // Host CPU the sandbox may use, in CPUs, like `docker run --cpus`: 0.5 is
+  // half a CPU's time across all its vCPUs. A hard cap (cgroup cpu.max) and
+  // what placement charges a node, so 2 vcpus at 0.5 take half a CPU of it.
+  // At most vcpus; 0 is no cap, and every vCPU is charged.
+  double cpus = 4;
+  // Relative CPU weight under contention, like `docker run --cpu-shares`
+  // (2..=262144), converted to cpu.weight as runc does. 0 is 1024 for each
+  // CPU charged, so contention honours what placement promised.
+  uint32 cpu_shares = 5;
+  // Host CPUs the sandbox's VMM runs on, like `docker run --cpuset-cpus`,
+  // e.g. "0-3,6" (cgroup cpuset.cpus). Empty is any.
+  string cpuset_cpus = 6;
+  // Relative disk IO weight, like `docker run --blkio-weight` (10..=1000),
+  // converted to io.weight as runc does. 0 is unset. Refused on a node whose
+  // cgroup has no io.weight.
+  uint32 blkio_weight = 7;
 }
 
 // How long a sandbox stays paid for. All three are read by the same reaper on
@@ -831,9 +847,8 @@ message NodeStatus {
   // Templates this node holds. Images are node-local, so placement has to
   // know where they are rather than assuming every node is interchangeable.
   repeated string templates = 5;
-  // vCPUs promised to sandboxes on this node, running or suspended. Free
-  // memory alone hides a node that is memory-rich and cpu-saturated.
-  uint32 committed_vcpus = 6;
+  reserved 6;
+  reserved "committed_vcpus";
   // The subset of `templates` imported from Kits, whose creates the node
   // provisions through the Kit lifecycle.
   repeated string kit_templates = 7;
@@ -850,6 +865,10 @@ message NodeStatus {
   // Warm snapshots ready here, one per template and machine shape. Placement
   // prefers a node holding the shape a create asks for.
   repeated WarmShape warm_shapes = 16;
+  // Host CPU promised to sandboxes on this node, running or suspended, in
+  // thousandths of a CPU: each sandbox's `cpus` where set, else its vcpus.
+  // Free memory alone hides a node that is memory-rich and cpu-saturated.
+  uint64 committed_cpu_millis = 17;
 }
 
 // A warm snapshot of one template at one machine shape. A create of that

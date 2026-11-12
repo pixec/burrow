@@ -604,7 +604,7 @@ impl Vm {
     }
 
     /// Sets the running guest's vCPUs to `vcpus`, within the
-    /// [`VmSpec::max_vcpus`] it was booted with, and its CPU cap with them.
+    /// [`VmSpec::max_vcpus`] it was booted with.
     /// Only where [`Capabilities::is_vcpu_hotplug_supported`].
     pub async fn resize_vcpus(&self, vcpus: u32) -> Result<()> {
         match self {
@@ -617,6 +617,27 @@ impl Vm {
             Self::Vz(_) => Err(Error::Unsupported {
                 hypervisor: Hypervisor::Vz,
                 what: "change a running guest's vcpus",
+            }),
+        }
+    }
+
+    /// Moves the running VMM's CPU and IO limits.
+    pub fn set_limits(&self, limits: &Limits) -> Result<()> {
+        let cgroup = match self {
+            Self::Firecracker(vm) => vm.cgroup(),
+            Self::CloudHypervisor(vm) => vm.cgroup(),
+            #[cfg(target_os = "macos")]
+            Self::Vz(_) => {
+                return Err(Error::Unsupported {
+                    hypervisor: Hypervisor::Vz,
+                    what: "limit a machine's host CPU or IO",
+                });
+            }
+        };
+        match cgroup {
+            Some(cgroup) => cgroup.set_limits(limits),
+            None => Err(Error::CgroupUnavailable {
+                reason: "this VM runs under no cgroup".into(),
             }),
         }
     }

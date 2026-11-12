@@ -687,7 +687,7 @@ enum ConfigCommand {
         #[arg(long)]
         checkpoint_memory: Option<bool>,
     },
-    /// Change a sandbox's vCPUs, memory and root disk.
+    /// Change a sandbox's vCPUs, memory, root disk and host limits.
     ///
     /// A running sandbox takes what its hypervisor can hotplug: a bigger disk
     /// under Firecracker and Cloud Hypervisor, and vCPUs under Cloud
@@ -696,8 +696,11 @@ enum ConfigCommand {
     /// VM that checks the filesystem first and refuses a size below what it
     /// needs. A suspended sandbox takes none of it. A macOS sandbox's disk
     /// grows while it is shut down and shrinks while it runs, and its guest
-    /// finishes either on its next boot. Each change is reported as live, next
-    /// boot, offline or refused with the reason; any refusal exits non-zero.
+    /// finishes either on its next boot. The host limits (--cpus,
+    /// --cpu-shares, --cpuset-cpus, --blkio-weight) move together: live on a
+    /// running sandbox, otherwise when it next runs. Each change is reported
+    /// as live, next boot, offline or refused with the reason; any refusal
+    /// exits non-zero.
     Resources {
         id: String,
         #[arg(long)]
@@ -708,6 +711,8 @@ enum ConfigCommand {
         /// Root disk: MiB, or a number with m or g, e.g. 20g.
         #[arg(long = "disk-mib", alias = "disk", value_parser = parse_size_mib)]
         disk_mib: Option<u32>,
+        #[command(flatten)]
+        limits: HostLimitFlags,
     },
     /// Grow or shrink a sandbox's root disk: `config resources --disk-mib`.
     Disk {
@@ -741,6 +746,40 @@ enum ConfigCommand {
         #[arg(long = "port", short = 'p')]
         ports: Vec<u32>,
     },
+}
+
+/// A sandbox's host CPU and IO limits, named and measured as `docker run`
+/// names them. They confine the VMM's cgroup; `--vcpus` stays the CPUs the
+/// guest sees.
+#[derive(ClapArgs, Default)]
+struct HostLimitFlags {
+    /// Host CPU the sandbox may use across its vCPUs, e.g. 0.5 or 1.5, as
+    /// `docker run --cpus`: a hard cap, and what placement charges a node, so
+    /// `--vcpus 2 --cpus 0.5` takes half a CPU of it. At most --vcpus; 0 is
+    /// no cap.
+    #[arg(long)]
+    cpus: Option<f64>,
+    /// Relative CPU weight under contention, as `docker run --cpu-shares`
+    /// (2-262144). Unset is 1024 for each CPU charged.
+    #[arg(long = "cpu-shares")]
+    cpu_shares: Option<u32>,
+    /// Host CPUs to run on, e.g. 0-3,6, as `docker run --cpuset-cpus`. An
+    /// empty list clears it.
+    #[arg(long = "cpuset-cpus")]
+    cpuset_cpus: Option<String>,
+    /// Relative disk IO weight, as `docker run --blkio-weight` (10-1000). 0
+    /// clears it. Refused on a node without cgroup io.weight.
+    #[arg(long = "blkio-weight")]
+    blkio_weight: Option<u32>,
+}
+
+impl HostLimitFlags {
+    fn is_stated(&self) -> bool {
+        self.cpus.is_some()
+            || self.cpu_shares.is_some()
+            || self.cpuset_cpus.is_some()
+            || self.blkio_weight.is_some()
+    }
 }
 
 /// Everything `create` needs, shared with `run` so a sandbox made either way
@@ -791,6 +830,8 @@ struct CreateFlags {
     /// resources --disk-mib`.
     #[arg(long = "disk-mib")]
     disk_mib: Option<u32>,
+    #[command(flatten)]
+    limits: HostLimitFlags,
     /// Destroy the sandbox this many seconds after it is created.
     /// 0 (default) lets it live until something deletes it.
     #[arg(long, default_value_t = 0)]
@@ -874,6 +915,7 @@ impl CreateFlags {
             || self.vcpus.is_some()
             || self.mem_mib.is_some()
             || self.disk_mib.is_some()
+            || self.limits.is_stated()
             || self.max_lifetime_secs != 0
             || self.idle_suspend_secs != 0
             || self.suspended_ttl_secs != 0
@@ -1397,20 +1439,9 @@ fn parse_size_mib(size: &str) -> Result<u32, String> {
 /// when any was refused.
 async fn update_resources(
     client: &mut Client,
-    id: String,
-    vcpus: Option<u32>,
-    mem_mib: Option<u32>,
-    disk_mib: Option<u32>,
+    request: api::UpdateResourcesRequest,
 ) -> anyhow::Result<()> {
-    let updated = client
-        .update_resources(api::UpdateResourcesRequest {
-            sandbox_id: id,
-            vcpus,
-            mem_mib,
-            disk_mib,
-        })
-        .await?
-        .into_inner();
+    let updated = client.update_resources(request).await?.into_inner();
     let id = updated.sandbox.as_ref().map_or("", |s| &s.id);
     let lines = describe_update(&updated);
     for line in &lines {
@@ -1422,13 +1453,29 @@ async fn update_resources(
     Ok(())
 }
 
-/// What a resources update did, a line per field asked for.
+/// What a resources update did, a line per field asked for and one for the
+/// host limits.
 fn describe_update(updated: &api::UpdateResourcesResponse) -> Vec<String> {
     let fields = [
         ("vcpus", "", &updated.vcpus),
         ("memory", " MiB", &updated.mem_mib),
         ("disk", " MiB", &updated.disk_mib),
     ];
+    let limits = updated.limits.as_ref().map(|outcome| {
+        let resources = updated
+            .sandbox
+            .as_ref()
+            .and_then(|sandbox| sandbox.policy.as_ref())
+            .and_then(|policy| policy.resources.clone())
+            .unwrap_or_default();
+        let now = host_limits_text(&resources);
+        match api::ResourceChange::try_from(outcome.change).unwrap_or_default() {
+            api::ResourceChange::Unchanged => format!("limits already {now}"),
+            api::ResourceChange::Live => format!("limits {now} live"),
+            api::ResourceChange::NextBoot => format!("limits {now} when it next runs"),
+            _ => format!("limits refused: {}", outcome.reason),
+        }
+    });
     fields
         .into_iter()
         .filter_map(|(name, unit, outcome)| {
@@ -1464,7 +1511,34 @@ fn describe_update(updated: &api::UpdateResourcesResponse) -> Vec<String> {
                 } + &note,
             )
         })
+        .chain(limits)
         .collect()
+}
+
+/// Thousandths of a CPU as CPUs: 2000 is "2", 500 is "0.5".
+fn cpus_text(millis: u64) -> String {
+    let text = format!("{:.3}", millis as f64 / 1000.0);
+    text.trim_end_matches('0').trim_end_matches('.').to_string()
+}
+
+/// A sandbox's host limits as `docker run` flags would state them.
+fn host_limits_text(resources: &common::ResourcePolicy) -> String {
+    let mut parts = Vec::new();
+    if resources.cpus > 0.0 {
+        parts.push(format!("cpus {}", resources.cpus));
+    } else {
+        parts.push("cpus uncapped".to_string());
+    }
+    if resources.cpu_shares > 0 {
+        parts.push(format!("cpu-shares {}", resources.cpu_shares));
+    }
+    if !resources.cpuset_cpus.is_empty() {
+        parts.push(format!("cpuset-cpus {}", resources.cpuset_cpus));
+    }
+    if resources.blkio_weight > 0 {
+        parts.push(format!("blkio-weight {}", resources.blkio_weight));
+    }
+    parts.join(", ")
 }
 
 /// `512m`, `2g` or a bare number of MiB.
@@ -2359,15 +2433,31 @@ async fn main() -> anyhow::Result<()> {
             println!("{} network policy updated", sandbox.id);
         }
         Command::Config(ConfigCommand::Disk { id, mib }) => {
-            update_resources(&mut client, id, None, None, Some(mib)).await?;
+            let request = api::UpdateResourcesRequest {
+                sandbox_id: id,
+                disk_mib: Some(mib),
+                ..Default::default()
+            };
+            update_resources(&mut client, request).await?;
         }
         Command::Config(ConfigCommand::Resources {
             id,
             vcpus,
             mem_mib,
             disk_mib,
+            limits,
         }) => {
-            update_resources(&mut client, id, vcpus, mem_mib, disk_mib).await?;
+            let request = api::UpdateResourcesRequest {
+                sandbox_id: id,
+                vcpus,
+                mem_mib,
+                disk_mib,
+                cpus: limits.cpus,
+                cpu_shares: limits.cpu_shares,
+                cpuset_cpus: limits.cpuset_cpus,
+                blkio_weight: limits.blkio_weight,
+            };
+            update_resources(&mut client, request).await?;
         }
         Command::Config(ConfigCommand::Lifetime {
             id,
@@ -3219,6 +3309,7 @@ fn create_request(flags: CreateFlags) -> anyhow::Result<api::CreateSandboxReques
         vcpus,
         mem_mib,
         disk_mib,
+        limits,
         max_lifetime_secs,
         idle_suspend_secs,
         suspended_ttl_secs,
@@ -3255,6 +3346,10 @@ fn create_request(flags: CreateFlags) -> anyhow::Result<api::CreateSandboxReques
                 vcpus: vcpus.unwrap_or(0),
                 mem_mib: mem_mib.unwrap_or(0),
                 disk_mib: disk_mib.unwrap_or(0),
+                cpus: limits.cpus.unwrap_or(0.0),
+                cpu_shares: limits.cpu_shares.unwrap_or(0),
+                cpuset_cpus: limits.cpuset_cpus.unwrap_or_default(),
+                blkio_weight: limits.blkio_weight.unwrap_or(0),
             }),
             lifetime: Some(common::LifetimePolicy {
                 max_lifetime_secs,
@@ -3971,7 +4066,7 @@ fn node_table(nodes: &[api::Node]) -> String {
     let mut out = String::new();
     let _ = writeln!(
         out,
-        "{:<38} {:<22} {:>5} {:>9} {:>9} {:>16} {:>5} {:<9} {:<24} HOSTNAME",
+        "{:<38} {:<22} {:>11} {:>9} {:>9} {:>16} {:>5} {:<9} {:<24} HOSTNAME",
         "NODE", "ADDRESS", "CPUS", "MEM_MIB", "FREE_MIB", "DISK", "SBX", "STATE", "LABELS"
     );
     for node in nodes {
@@ -3988,10 +4083,14 @@ fn node_table(nodes: &[api::Node]) -> String {
         };
         let _ = writeln!(
             out,
-            "{:<38} {:<22} {:>5} {:>9} {:>9} {:>16} {:>5} {:<9} {:<24} {}",
+            "{:<38} {:<22} {:>11} {:>9} {:>9} {:>16} {:>5} {:<9} {:<24} {}",
             info.id,
             info.address,
-            info.total_vcpus,
+            format!(
+                "{}/{}",
+                cpus_text(status.committed_cpu_millis),
+                info.total_vcpus
+            ),
             info.total_mem_mib,
             status.free_mem_mib,
             disk_column(&status),
@@ -4181,7 +4280,7 @@ async fn list_templates(client: &mut Client) -> anyhow::Result<()> {
         let mut shapes: Vec<(u32, u32)> = template
             .warm_shapes
             .iter()
-            .filter_map(|shape| shape.resources)
+            .filter_map(|shape| shape.resources.clone())
             .map(|resources| (resources.vcpus, resources.mem_mib))
             .collect();
         shapes.sort_unstable();
@@ -4225,7 +4324,7 @@ async fn list_warm_shapes(client: &mut Client) -> anyhow::Result<()> {
         return Ok(());
     }
     shapes.sort_by_key(|shape| {
-        let resources = shape.resources.unwrap_or_default();
+        let resources = shape.resources.clone().unwrap_or_default();
         (
             shape.template.clone(),
             shape.node_id.clone(),
@@ -4238,7 +4337,7 @@ async fn list_warm_shapes(client: &mut Client) -> anyhow::Result<()> {
         "TEMPLATE", "NODE", "SHAPE", "DISK", "SIZE", "LAST USED"
     );
     for shape in shapes {
-        let resources = shape.resources.unwrap_or_default();
+        let resources = shape.resources.clone().unwrap_or_default();
         println!(
             "{:<24} {:<16} {:<10} {:>7}M {:>7}M  {:<24}  {}",
             shape.template,
@@ -4466,6 +4565,7 @@ fn print_config(sandbox: &common::Sandbox) {
         // 0 is stored to mean "whatever the node gives out", so printing it
         // raw tells a reader nothing about the machine they actually have.
         field("vcpus", &shape_value(resources.vcpus as u64, 1));
+        field("cpus", &host_limits_text(resources));
         field("mem-mib", &shape_value(resources.mem_mib as u64, 512));
         if resources.disk_mib > 0 {
             let layout = match common::DiskLayout::try_from(sandbox.disk_layout) {
@@ -5442,6 +5542,10 @@ fn sandbox_json(sandbox: &common::Sandbox) -> String {
             "vcpus": resources.vcpus,
             "mem_mib": resources.mem_mib,
             "disk_mib": resources.disk_mib,
+            "cpus": resources.cpus,
+            "cpu_shares": resources.cpu_shares,
+            "cpuset_cpus": resources.cpuset_cpus,
+            "blkio_weight": resources.blkio_weight,
         },
         "lifetime": {
             "max_lifetime_secs": lifetime.max_lifetime_secs,
@@ -5743,6 +5847,45 @@ mod tests {
         );
     }
 
+    /// The host limits are one line, stated as `docker run` flags.
+    #[test]
+    fn host_limits_read_as_docker_flags() {
+        let updated = |change: api::ResourceChange, reason: &str| api::UpdateResourcesResponse {
+            sandbox: Some(common::Sandbox {
+                policy: Some(common::Policy {
+                    resources: Some(common::ResourcePolicy {
+                        vcpus: 2,
+                        cpus: 0.5,
+                        cpu_shares: 512,
+                        cpuset_cpus: "0-1".into(),
+                        blkio_weight: 500,
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            }),
+            limits: Some(api::LimitsOutcome {
+                change: change as i32,
+                reason: reason.into(),
+            }),
+            ..Default::default()
+        };
+        assert_eq!(
+            super::describe_update(&updated(api::ResourceChange::Live, "")),
+            ["limits cpus 0.5, cpu-shares 512, cpuset-cpus 0-1, blkio-weight 500 live"]
+        );
+        assert_eq!(
+            super::describe_update(&updated(api::ResourceChange::Refused, "no room")),
+            ["limits refused: no room"]
+        );
+        assert_eq!(
+            super::host_limits_text(&common::ResourcePolicy::default()),
+            "cpus uncapped"
+        );
+        assert_eq!(super::cpus_text(1500), "1.5");
+    }
+
     /// `node ls` shows each node's free and total disk, and a node under its
     /// reserve says so twice: LOW beside the figure and disk-low as its state.
     #[test]
@@ -5770,6 +5913,7 @@ mod tests {
                     }),
                     is_disk_low: true,
                     running_sandboxes: 2,
+                    committed_cpu_millis: 2500,
                     ..Default::default()
                 },
             ),
@@ -5781,6 +5925,8 @@ mod tests {
         assert!(lines[1].contains(" ready "), "{table}");
         assert!(lines[2].contains("1.5/100G LOW"), "{table}");
         assert!(lines[2].contains(" disk-low "), "{table}");
+        // CPU is what is committed over what the node has.
+        assert!(lines[2].contains(" 2.5/0 "), "{table}");
         // A node that does not report disk shows a dash, not a full disk.
         let unreported: Vec<&str> = lines[3].split_whitespace().collect();
         assert_eq!(unreported[5], "-", "{table}");
@@ -6524,6 +6670,7 @@ mod tests {
                 vcpus: None,
                 mem_mib: None,
                 disk_mib: None,
+                limits: Default::default(),
                 snapshot_expiration_secs: 0,
                 keep_last_snapshots: 0,
                 is_evicted_snapshots_kept: false,

@@ -97,9 +97,9 @@ pub fn node_row(
         last_heartbeat_ms: burrow_common::unix_now_ms(),
         is_reported: false,
         total_vcpus: info.total_vcpus,
-        committed_vcpus: status.committed_vcpus,
+        committed_cpu_millis: status.committed_cpu_millis,
         free_mem_mib: status.free_mem_mib,
-        reserved_vcpus: 0,
+        reserved_cpu_millis: 0,
         reserved_mem_mib: 0,
     }
 }

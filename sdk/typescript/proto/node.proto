@@ -299,6 +299,10 @@ message NodeUpdateResourcesRequest {
   optional uint32 vcpus = 2;
   optional uint32 mem_mib = 3;
   optional uint32 disk_mib = 4;
+  optional double cpus = 5;
+  optional uint32 cpu_shares = 6;
+  optional string cpuset_cpus = 7;
+  optional uint32 blkio_weight = 8;
 }
 
 message NodeForkRequest {

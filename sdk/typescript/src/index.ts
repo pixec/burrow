@@ -93,6 +93,7 @@ export type {
   RecreateOptions,
   RequestMatch,
   RequestRule,
+  LimitsOutcome,
   ResourceChange,
   ResourceOptions,
   ResourceOutcome,

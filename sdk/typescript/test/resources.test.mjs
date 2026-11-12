@@ -38,6 +38,10 @@ test("a resources update names its fields and reads back each outcome", async ()
     vcpus: 2,
     memMib: 1024,
     diskMib: 1024,
+    cpus: undefined,
+    cpuShares: undefined,
+    cpusetCpus: undefined,
+    blkioWeight: undefined,
   });
   assert.equal(calls[0].timeoutMs, 600_000);
   assert.deepEqual(updated, {
@@ -47,6 +51,36 @@ test("a resources update names its fields and reads back each outcome", async ()
     filesystemBytes: 1073741824,
   });
   assert.equal(sandbox.policy.resources.diskMib, 1024);
+});
+
+test("host limits go out with Docker's names and come back as one outcome", async () => {
+  const { sandbox, calls } = sandboxAnswering({
+    sandbox: {
+      id: "sbx_test",
+      state: "SANDBOX_STATE_RUNNING",
+      policy: {
+        resources: { vcpus: 2, cpus: 0.5, cpuShares: 512, cpusetCpus: "0-1", blkioWeight: 500 },
+      },
+    },
+    limits: { change: "RESOURCE_CHANGE_LIVE" },
+  });
+  const updated = await sandbox.updateResources({
+    cpus: 0.5,
+    cpuShares: 512,
+    cpusetCpus: "0-1",
+    blkioWeight: 500,
+  });
+  assert.equal(calls[0].request.cpus, 0.5);
+  assert.equal(calls[0].request.cpuShares, 512);
+  assert.equal(calls[0].request.cpusetCpus, "0-1");
+  assert.equal(calls[0].request.blkioWeight, 500);
+  assert.deepEqual(updated.limits, { change: "live", reason: "" });
+  assert.equal(updated.vcpus, undefined);
+  const resources = sandbox.policy.resources;
+  assert.equal(resources.cpus, 0.5);
+  assert.equal(resources.cpuShares, 512);
+  assert.equal(resources.cpusetCpus, "0-1");
+  assert.equal(resources.blkioWeight, 500);
 });
 
 test("a field not asked for has no outcome", async () => {

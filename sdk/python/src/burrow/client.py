@@ -598,6 +598,7 @@ class Burrow:
                 healthy=n.is_healthy,
                 draining=n.status.is_draining,
                 labels=dict(n.info.labels),
+                committed_cpus=n.status.committed_cpu_millis / 1000,
                 arch=n.info.arch,
                 hypervisor_versions=dict(n.info.hypervisor_versions),
                 disk=DiskCapacity(

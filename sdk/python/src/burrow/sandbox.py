@@ -35,6 +35,7 @@ from .types import (
     DeletedUser,
     GuestGroup,
     GuestUser,
+    LimitsOutcome,
     NetworkPolicy,
     PortMapping,
     PrunedCommands,
@@ -67,10 +68,17 @@ def _to_resources_update(raw: api_pb2.UpdateResourcesResponse) -> ResourcesUpdat
     def field(name: str) -> Optional[ResourceOutcome]:
         return _to_resource_outcome(getattr(raw, name)) if raw.HasField(name) else None
 
+    limits = None
+    if raw.HasField("limits"):
+        limits = LimitsOutcome(
+            change=label(api_pb2.ResourceChange, raw.limits.change, "RESOURCE_CHANGE_"),
+            reason=raw.limits.reason,
+        )
     return ResourcesUpdate(
         vcpus=field("vcpus"),
         memory_mib=field("mem_mib"),
         disk_mib=field("disk_mib"),
+        limits=limits,
         filesystem_bytes=raw.filesystem_bytes,
     )
 
@@ -908,16 +916,23 @@ class Sandbox:
         vcpus: Optional[int] = None,
         memory_mib: Optional[int] = None,
         disk_mib: Optional[int] = None,
+        cpus: Optional[float] = None,
+        cpu_shares: Optional[int] = None,
+        cpuset_cpus: Optional[str] = None,
+        blkio_weight: Optional[int] = None,
     ) -> ResourcesUpdate:
-        """Changes the sandbox's vCPUs, memory and root disk. An omitted field
-        is left as it is.
+        """Changes the sandbox's vCPUs, memory, root disk and host limits. An
+        omitted field is left as it is.
 
         A running sandbox takes what its hypervisor can hotplug: a bigger disk
         under Firecracker and Cloud Hypervisor, whose guest grows its
         filesystem at once, and vCPUs under Cloud Hypervisor on x86_64. A
         stopped one (`stop`) takes everything: vCPUs and memory on its next
         start, and its disk at once, shrunk by a helper VM that checks the
-        filesystem first. A suspended sandbox takes none of it. What cannot be applied is
+        filesystem first. A suspended sandbox takes none of it. The host
+        limits (`cpus`, `cpu_shares`, `cpuset_cpus`, `blkio_weight`) move live
+        on a running sandbox and otherwise when it next runs; 0, or an empty
+        `cpuset_cpus`, clears one. What cannot be applied is
         reported as "refused" with the reason rather than raised, so check
         each field you asked for.
 
@@ -942,7 +957,14 @@ class Sandbox:
         raw = self._transport.unary(
             "UpdateResources",
             api_pb2.UpdateResourcesRequest(
-                sandbox_id=self.id, vcpus=vcpus, mem_mib=memory_mib, disk_mib=disk_mib
+                sandbox_id=self.id,
+                vcpus=vcpus,
+                mem_mib=memory_mib,
+                disk_mib=disk_mib,
+                cpus=cpus,
+                cpu_shares=cpu_shares,
+                cpuset_cpus=cpuset_cpus,
+                blkio_weight=blkio_weight,
             ),
             # A shrink boots a helper VM that checks the filesystem first.
             600.0,

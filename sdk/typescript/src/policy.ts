@@ -425,6 +425,10 @@ export function toResourcePolicy(options: ResourceOptions = {}): any {
     vcpus: options.vcpus ?? 0,
     memMib: options.memoryMib ?? 0,
     diskMib: options.diskMib ?? 0,
+    cpus: options.cpus ?? 0,
+    cpuShares: options.cpuShares ?? 0,
+    cpusetCpus: options.cpusetCpus ?? "",
+    blkioWeight: options.blkioWeight ?? 0,
   };
 }
 
@@ -433,6 +437,10 @@ export function fromResourcePolicy(raw: any): ResourcePolicy {
     vcpus: Number(raw?.vcpus ?? 0),
     memoryMib: Number(raw?.memMib ?? 0),
     diskMib: Number(raw?.diskMib ?? 0),
+    cpus: Number(raw?.cpus ?? 0),
+    cpuShares: Number(raw?.cpuShares ?? 0),
+    cpusetCpus: raw?.cpusetCpus ?? "",
+    blkioWeight: Number(raw?.blkioWeight ?? 0),
   };
 }
 

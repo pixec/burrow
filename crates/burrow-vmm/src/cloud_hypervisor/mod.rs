@@ -420,6 +420,10 @@ impl ChVm {
         self.cgroup.as_ref()?.cpu_usage_usec()
     }
 
+    pub fn cgroup(&self) -> Option<&Cgroup> {
+        self.cgroup.as_ref()
+    }
+
     pub fn workdir(&self) -> &Path {
         &self.workdir
     }
@@ -520,15 +524,11 @@ impl ChVm {
             .await
     }
 
-    /// Hotplugs or unplugs vCPUs, then moves the cgroup's CPU cap to match.
+    /// Hotplugs or unplugs vCPUs.
     pub async fn resize_vcpus(&self, vcpus: u32) -> Result<()> {
         self.api
             .put("/api/v1/vm.resize", &json!({ "desired_vcpus": vcpus }))
-            .await?;
-        if let Some(cgroup) = &self.cgroup {
-            cgroup.set_cpus(vcpus)?;
-        }
-        Ok(())
+            .await
     }
 
     pub async fn kill(mut self) -> Result<()> {

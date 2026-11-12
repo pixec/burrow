@@ -311,6 +311,7 @@ impl Warm {
                 vcpus: self.shape.vcpus,
                 mem_mib: self.shape.mem_mib,
                 disk_mib: self.shape.disk_mib,
+                ..Default::default()
             }),
             size_bytes: self.bytes,
             last_used_at_unix_ms: self.used_at.saturating_mul(1000),
@@ -770,11 +771,13 @@ pub async fn build_warm_snapshot(
 fn apply_confinement(spec: &mut VmSpec, config: &NodeConfig, shape: Shape) {
     spec.cgroup_root = config.cgroup_root.clone();
     spec.is_limits_required = config.is_resource_limits_required;
-    spec.limits = burrow_vmm::Limits {
-        cpus: shape.vcpus,
-        memory_mib: config.memory_ceiling_mib(spec.hypervisor(), shape.mem_mib),
-        pids_max: 0,
-    };
+    spec.limits = crate::sandbox::cgroup_limits(
+        &burrow_proto::common::v1::ResourcePolicy {
+            vcpus: shape.vcpus,
+            ..Default::default()
+        },
+        config.memory_ceiling_mib(spec.hypervisor(), shape.mem_mib),
+    );
 }
 
 /// Moves what the jailed build produced into the directory it is published
@@ -1023,6 +1026,7 @@ mod shape_tests {
             vcpus: 4,
             mem_mib: 2048,
             disk_mib: 4096,
+            ..Default::default()
         });
         assert_eq!(
             wanted,

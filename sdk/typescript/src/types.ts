@@ -207,12 +207,28 @@ export type NetworkPolicy = Required<Omit<NetworkPolicyOptions, "rules">> & {
   rules: AppliedRule[];
 };
 
-/** Machine shape. Every `0` means "the server's default". */
+/**
+ * Machine shape and host limits. Every `0` means "the server's default". The
+ * host limits are named and measured as `docker run` names them and confine
+ * the VMM's cgroup; `vcpus` stays the CPUs the guest sees.
+ */
 export interface ResourceOptions {
   vcpus?: number;
   memoryMib?: number;
   /** Root disk, at least the template's image. 0 is the image plus 1024. */
   diskMib?: number;
+  /**
+   * Host CPU the sandbox may use across its vCPUs, e.g. 0.5, as
+   * `docker run --cpus`: a hard cap, and what placement charges a node, so
+   * 2 vCPUs at 0.5 take half a CPU of it. At most `vcpus`; 0 is no cap.
+   */
+  cpus?: number;
+  /** Relative CPU weight under contention, as `--cpu-shares` (2-262144). 0 is 1024 per CPU charged. */
+  cpuShares?: number;
+  /** Host CPUs to run on, e.g. "0-3,6", as `--cpuset-cpus`. Empty is any. */
+  cpusetCpus?: string;
+  /** Relative disk IO weight, as `--blkio-weight` (10-1000). 0 is unset. */
+  blkioWeight?: number;
 }
 
 export type ResourcePolicy = Required<ResourceOptions>;
@@ -379,11 +395,18 @@ export interface Usage {
   txBytes: number;
 }
 
-/** The machine {@link Sandbox.updateResources} changes. */
+/**
+ * The machine {@link Sandbox.updateResources} changes. The host limits move
+ * together; 0, or an empty `cpusetCpus`, clears one.
+ */
 export interface ResourceUpdateOptions extends CallOptions {
   vcpus?: number;
   memoryMib?: number;
   diskMib?: number;
+  cpus?: number;
+  cpuShares?: number;
+  cpusetCpus?: string;
+  blkioWeight?: number;
 }
 
 /**
@@ -403,11 +426,23 @@ export interface ResourceOutcome {
   reason: string;
 }
 
+/**
+ * What became of the host limits, which change together: `live` on a running
+ * sandbox, `next_boot` when it next runs. The values are the sandbox's
+ * `policy.resources`.
+ */
+export interface LimitsOutcome {
+  change: ResourceChange;
+  reason: string;
+}
+
 /** What {@link Sandbox.updateResources} did, a field per one asked for. */
 export interface ResourcesUpdate {
   vcpus?: ResourceOutcome;
   memoryMib?: ResourceOutcome;
   diskMib?: ResourceOutcome;
+  /** Present when any host limit was asked for. */
+  limits?: LimitsOutcome;
   /**
    * The root filesystem's size after a disk change, in bytes. 0 when no guest
    * has seen the disk yet: a shut-down sandbox grown, whose guest fills it on
@@ -916,6 +951,8 @@ export interface NodeInfo {
   address: string;
   hostname: string;
   totalVcpus: number;
+  /** Host CPU promised to sandboxes here: each one's `cpus` where set, else its vCPUs. */
+  committedCpus: number;
   totalMemoryMib: number;
   freeMemoryMib: number;
   runningSandboxes: number;

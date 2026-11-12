@@ -10,6 +10,7 @@ use std::sync::Arc;
 use tokio::sync::Mutex;
 use tonic::{Status, transport::Channel};
 
+use burrow_common::cpu::cpus_text;
 use burrow_net::{Ipam, Lease, firewall, tap};
 use burrow_proto::common::v1 as common;
 use burrow_proto::guest::v1::guest_client::GuestClient;
@@ -17,7 +18,7 @@ use burrow_vmm::{DriveSpec, GuestAddr, Hypervisor, HypervisorExt, Layout, NetSpe
 
 use crate::guestconn;
 use crate::rootdisk::{DiskLayout, IMAGE as TEMPLATE_ROOTFS};
-use burrow_proto::api::v1::{ResourceChange, ResourceOutcome};
+use burrow_proto::api::v1::{LimitsOutcome, ResourceChange, ResourceOutcome};
 
 /// Conventional filenames inside a template directory.
 const TEMPLATE_KERNEL: &str = "vmlinux";
@@ -477,6 +478,75 @@ pub struct ResourcesUpdated {
     /// The root filesystem's size as the guest reported it after a disk
     /// change, or 0 when no guest has seen the disk yet.
     pub filesystem_bytes: u64,
+    pub limits: Option<LimitsOutcome>,
+}
+
+/// The host limits a resources update asks for; `None` leaves one as it is.
+#[derive(Default)]
+pub struct LimitsUpdate {
+    pub cpus: Option<f64>,
+    pub cpu_shares: Option<u32>,
+    pub cpuset_cpus: Option<String>,
+    pub blkio_weight: Option<u32>,
+}
+
+impl LimitsUpdate {
+    pub fn is_empty(&self) -> bool {
+        self.cpus.is_none()
+            && self.cpu_shares.is_none()
+            && self.cpuset_cpus.is_none()
+            && self.blkio_weight.is_none()
+    }
+
+    fn apply(self, resources: &mut common::ResourcePolicy) {
+        if let Some(cpus) = self.cpus {
+            resources.cpus = cpus;
+        }
+        if let Some(shares) = self.cpu_shares {
+            resources.cpu_shares = shares;
+        }
+        if let Some(cpuset) = self.cpuset_cpus {
+            resources.cpuset_cpus = cpuset;
+        }
+        if let Some(weight) = self.blkio_weight {
+            resources.blkio_weight = weight;
+        }
+    }
+}
+
+/// The host CPUs this node has.
+pub(crate) fn node_cpus() -> u32 {
+    std::thread::available_parallelism().map_or(0, |n| n.get() as u32)
+}
+
+/// The cgroup limits a sandbox's resources ask for, under a memory ceiling.
+pub(crate) fn cgroup_limits(
+    resources: &common::ResourcePolicy,
+    memory_mib: u32,
+) -> burrow_vmm::Limits {
+    use burrow_common::cpu;
+    let cap = cpu::cap_millis(resources.cpus);
+    let charge = cpu::charge_millis(resources.vcpus, cap);
+    burrow_vmm::Limits {
+        cpu_max_millis: cap,
+        cpu_weight: cpu::shares_to_weight(cpu::shares(resources.cpu_shares, charge)),
+        cpuset_cpus: resources.cpuset_cpus.clone(),
+        io_weight: match resources.blkio_weight {
+            0 => 0,
+            weight => cpu::blkio_to_io_weight(weight),
+        },
+        memory_mib,
+        pids_max: 0,
+    }
+}
+
+/// Whether a policy names a host CPU or IO limit, which a Mac node has no
+/// cgroup to enforce.
+fn has_host_limits(resources: &common::ResourcePolicy) -> bool {
+    resources.cpus > 0.0
+        || resources.cpu_shares > 0
+        || !resources.cpuset_cpus.is_empty()
+        || resources.blkio_weight > 0
 }
 
 fn outcome(change: ResourceChange, previous: u32, value: u32) -> ResourceOutcome {
@@ -1135,6 +1205,13 @@ impl RunningSandbox {
     /// vCPUs this sandbox is promised, whether or not its VMM is running.
     pub fn vcpus(&self) -> u32 {
         self.spec.lock().unwrap().vcpus
+    }
+
+    /// Host CPU this node is charged for the sandbox, in thousandths of a
+    /// CPU: its cap where it has one, otherwise its vCPUs.
+    pub fn cpu_charge_millis(&self) -> u64 {
+        let spec = self.spec.lock().unwrap();
+        burrow_common::cpu::charge_millis(spec.vcpus, spec.limits.cpu_max_millis)
     }
 
     /// The memory the VM is given, the node's default or a macOS guest's
@@ -3313,7 +3390,7 @@ impl SandboxManager {
         let resources = record
             .policy
             .as_ref()
-            .and_then(|policy| policy.resources)
+            .and_then(|policy| policy.resources.clone())
             .unwrap_or_default();
         let mut shape = (
             resources.vcpus.max(1),
@@ -4529,6 +4606,7 @@ impl SandboxManager {
         vcpus: Option<u32>,
         mem_mib: Option<u32>,
         disk_mib: Option<u32>,
+        limits: LimitsUpdate,
     ) -> Result<(common::Sandbox, ResourcesUpdated), Status> {
         let sandbox = self.get(id).await?;
         let mut updated = ResourcesUpdated::default();
@@ -4546,11 +4624,126 @@ impl SandboxManager {
             });
         }
         if vcpus.is_some() || mem_mib.is_some() {
-            let (vcpus, mem_mib) = self.reshape(&sandbox, vcpus, mem_mib).await?;
+            let cap = limits.cpus.map_or_else(
+                || sandbox.spec.lock().unwrap().limits.cpu_max_millis,
+                burrow_common::cpu::cap_millis,
+            );
+            let (vcpus, mem_mib) = self.reshape(&sandbox, vcpus, mem_mib, cap).await?;
             updated.vcpus = vcpus;
             updated.mem_mib = mem_mib;
         }
+        if !limits.is_empty() {
+            updated.limits = Some(self.update_limits(&sandbox, limits).await?);
+        }
         Ok((sandbox.record(), updated))
+    }
+
+    /// Moves a sandbox's host CPU and IO limits: on its running VMM's cgroup
+    /// at once, otherwise for when it next runs. Refused with the reason for
+    /// a cap above its vCPUs, a charge the node has no room for, or a VMM
+    /// whose cgroup cannot take them.
+    async fn update_limits(
+        &self,
+        sandbox: &Arc<RunningSandbox>,
+        limits: LimitsUpdate,
+    ) -> Result<LimitsOutcome, Status> {
+        let refuse = |reason: String| LimitsOutcome {
+            change: ResourceChange::Refused as i32,
+            reason,
+        };
+        if sandbox.hypervisor == Hypervisor::Vz {
+            return Ok(refuse(
+                "a Mac node has no cgroup to hold a sandbox's host CPU or IO limits".into(),
+            ));
+        }
+        let mut resources = sandbox
+            .base_record
+            .lock()
+            .unwrap()
+            .policy
+            .clone()
+            .unwrap_or_default()
+            .resources
+            .unwrap_or_default();
+        let previous = resources.clone();
+        limits.apply(&mut resources);
+        resources.vcpus = sandbox.vcpus();
+        if let Err(reason) = burrow_common::cpu::validate(
+            resources.vcpus,
+            resources.cpus,
+            resources.cpu_shares,
+            &resources.cpuset_cpus,
+            resources.blkio_weight,
+            Some(node_cpus()),
+        ) {
+            return Ok(refuse(reason));
+        }
+        let (memory_mib, current) = {
+            let spec = sandbox.spec.lock().unwrap();
+            (spec.limits.memory_mib, spec.limits.clone())
+        };
+        let next = cgroup_limits(&resources, memory_mib);
+        let is_unchanged = (
+            previous.cpus,
+            previous.cpu_shares,
+            &previous.cpuset_cpus,
+            previous.blkio_weight,
+        ) == (
+            resources.cpus,
+            resources.cpu_shares,
+            &resources.cpuset_cpus,
+            resources.blkio_weight,
+        );
+        if is_unchanged {
+            return Ok(LimitsOutcome {
+                change: ResourceChange::Unchanged as i32,
+                reason: String::new(),
+            });
+        }
+        let slot = sandbox.vm.lock().await;
+        let charge = burrow_common::cpu::charge_millis(resources.vcpus, next.cpu_max_millis);
+        if let Err(err) = self.admit_cpu(sandbox.cpu_charge_millis(), charge).await {
+            return Ok(refuse(err.message().to_string()));
+        }
+        let change = match slot.as_ref() {
+            Some(vm) => match vm.set_limits(&next) {
+                Ok(()) => ResourceChange::Live,
+                Err(err) => {
+                    if let Err(err) = vm.set_limits(&current) {
+                        tracing::warn!(sandbox = sandbox.id(), %err, "could not restore cgroup limits");
+                    }
+                    return Ok(refuse(format!("the VMM's cgroup refused them: {err}")));
+                }
+            },
+            None => ResourceChange::NextBoot,
+        };
+        sandbox.spec.lock().unwrap().limits = next;
+        {
+            let mut record = sandbox.base_record.lock().unwrap();
+            let stored = record
+                .policy
+                .get_or_insert_with(Default::default)
+                .resources
+                .get_or_insert_with(Default::default);
+            stored.cpus = resources.cpus;
+            stored.cpu_shares = resources.cpu_shares;
+            stored.cpuset_cpus = resources.cpuset_cpus.clone();
+            stored.blkio_weight = resources.blkio_weight;
+        }
+        drop(slot);
+        self.persist(sandbox).await;
+        tracing::info!(
+            sandbox = sandbox.id(),
+            cpus = resources.cpus,
+            cpu_shares = resources.cpu_shares,
+            cpuset_cpus = resources.cpuset_cpus,
+            blkio_weight = resources.blkio_weight,
+            "moved a sandbox's host limits"
+        );
+        Ok(LimitsOutcome {
+            change: change as i32,
+            reason: String::new(),
+        })
     }
 
     /// Resizes a sandbox's root disk to `mib`, returning what was done and
@@ -4828,6 +5021,7 @@ impl SandboxManager {
         sandbox: &Arc<RunningSandbox>,
         vcpus: Option<u32>,
         mem_mib: Option<u32>,
+        cap_millis: u64,
     ) -> Result<(Option<ResourceOutcome>, Option<ResourceOutcome>), Status> {
         let id = sandbox.id();
         let (current_vcpus, current_mem) = (sandbox.vcpus(), sandbox.mem_mib());
@@ -4863,7 +5057,15 @@ impl SandboxManager {
                 Some(outcome(ResourceChange::Unchanged, current_vcpus, want))
             }
             Some(_) if let Some(reason) = &blocked => Some(refuse(reason, current_vcpus)),
-            Some(want) => Some(match self.admit_vcpus(current_vcpus, want).await {
+            Some(want) if cap_millis > u64::from(want) * 1000 => Some(refuse(
+                &format!(
+                    "sandbox {id} is capped at {} cpus, more than {want} vcpus; lower its cpus \
+                     with them",
+                    cpus_text(cap_millis)
+                ),
+                current_vcpus,
+            )),
+            Some(want) => Some(match self.admit_vcpus(sandbox, want).await {
                 Err(err) => refused(err, current_vcpus)?,
                 Ok(()) => match slot.as_ref() {
                     None => outcome(ResourceChange::NextBoot, current_vcpus, want),
@@ -4932,7 +5134,6 @@ impl SandboxManager {
                 let mut spec = sandbox.spec.lock().unwrap();
                 if let Some(n) = new_vcpus {
                     spec.vcpus = n;
-                    spec.limits.cpus = n;
                 }
                 if let Some(mib) = new_mem {
                     spec.limits.memory_mib = self.config.memory_ceiling_mib(spec.hypervisor(), mib);
@@ -4965,17 +5166,28 @@ impl SandboxManager {
         Ok((vcpus, mem_mib))
     }
 
-    /// Refuses more vCPUs than the node has uncommitted.
-    async fn admit_vcpus(&self, current: u32, want: u32) -> Result<(), Status> {
+    /// Refuses giving `sandbox` `vcpus` where the node has no room for what
+    /// that charges it.
+    async fn admit_vcpus(&self, sandbox: &RunningSandbox, vcpus: u32) -> Result<(), Status> {
+        let cap = sandbox.spec.lock().unwrap().limits.cpu_max_millis;
+        let charge = burrow_common::cpu::charge_millis(vcpus, cap);
+        self.admit_cpu(sandbox.cpu_charge_millis(), charge).await
+    }
+
+    /// Refuses a charge of more host CPU than the node has uncommitted, both
+    /// in thousandths of a CPU.
+    async fn admit_cpu(&self, current: u64, want: u64) -> Result<(), Status> {
         if want <= current {
             return Ok(());
         }
-        let total = std::thread::available_parallelism().map_or(0, |n| n.get() as u32);
-        let committed = self.committed_vcpus().await;
+        let total = node_cpus() as u64 * 1000;
+        let committed = self.committed_cpu_millis().await;
         if committed + (want - current) > total {
             return Err(Status::resource_exhausted(format!(
-                "this node has {total} vCPUs and {committed} committed; {} more do not fit",
-                want - current
+                "this node has {} CPUs and {} committed; {} more do not fit",
+                cpus_text(total),
+                cpus_text(committed),
+                cpus_text(want - current)
             )));
         }
         Ok(())
@@ -5406,7 +5618,7 @@ impl SandboxManager {
             }
             tokio::time::sleep(std::time::Duration::from_millis(250)).await;
         }
-        self.admit_vcpus(0, shape.vcpus).await?;
+        self.admit_cpu(0, u64::from(shape.vcpus) * 1000).await?;
         let available_mib = {
             let mut sys = sysinfo::System::new();
             sys.refresh_memory();
@@ -5857,20 +6069,19 @@ impl SandboxManager {
         reports
     }
 
-    /// vCPUs promised across every sandbox this node holds, suspended included.
+    /// Host CPU promised across every sandbox this node holds, suspended
+    /// included, in thousandths of a CPU.
     ///
     /// A suspended sandbox keeps its address, disks and snapshot and can be
     /// resumed at any moment, so counting only running ones would let a node
     /// accept work it cannot honour when they all come back.
-    pub async fn committed_vcpus(&self) -> u32 {
-        let live: u32 = self
-            .sandboxes
+    pub async fn committed_cpu_millis(&self) -> u64 {
+        self.sandboxes
             .lock()
             .await
             .values()
-            .map(|sandbox| sandbox.vcpus())
-            .sum();
-        live
+            .map(|sandbox| sandbox.cpu_charge_millis())
+            .sum()
     }
 
     /// What this node has provisioned: every sandbox's disks and every
@@ -6024,16 +6235,11 @@ impl SandboxManager {
             resources.mem_mib
         };
 
-        // Firecracker bounds guest memory on its own, but nothing bounds host
-        // CPU: a 1-vCPU guest spinning saturates a core. The cgroup is what
-        // stops one sandbox starving its neighbours.
-        spec.limits = burrow_vmm::Limits {
-            cpus: spec.vcpus,
-            memory_mib: self
-                .config
+        spec.limits = cgroup_limits(
+            resources,
+            self.config
                 .memory_ceiling_mib(spec.hypervisor(), spec.mem_mib),
-            pids_max: 0,
-        };
+        );
         spec.cgroup_root = self.config.cgroup_root.clone();
         spec.is_limits_required = self.config.is_resource_limits_required;
         // Only consulted on restore; a cold boot has no memory file to serve.
@@ -6111,15 +6317,21 @@ impl SandboxManager {
         // address already applied. What is left is stamping it with this
         // caller's policy.
 
-        let resources = policy.resources.unwrap_or_default();
+        let resources = policy.resources.clone().unwrap_or_default();
+        let machine = self.image_environment(&template).await.machine();
+        if let Ok((Hypervisor::Vz, _)) = machine
+            && has_host_limits(&resources)
+        {
+            return Err(Status::failed_precondition(
+                "a Mac node has no cgroup to hold cpus, cpu_shares, cpuset_cpus or blkio_weight; \
+                 leave them unset for a macOS sandbox",
+            ));
+        }
         // A create of a shape with no warm snapshot is exactly the signal that
         // one is worth building, so the next create of it restores. Not for a
         // backend whose restore loses to its boot.
-        let is_warmable = self
-            .image_environment(&template)
-            .await
-            .machine()
-            .is_ok_and(|(hypervisor, _)| hypervisor.capabilities().is_warm_pool_supported);
+        let is_warmable =
+            machine.is_ok_and(|(hypervisor, _)| hypervisor.capabilities().is_warm_pool_supported);
         if is_warmable {
             self.warm_for_demand(&ShapeKey::of(&template, &resources));
         }
@@ -6355,7 +6567,7 @@ impl SandboxManager {
         // Every new sandbox owns its root disk.
         let disk_layout = DiskLayout::Root;
         let workdir = self.config.sandbox_dir(&id, hypervisor);
-        let mut resources = policy.resources.unwrap_or_default();
+        let mut resources = policy.resources.clone().unwrap_or_default();
         // The disk this sandbox is provisioned: its root disk at the size
         // asked for, or a macOS guest's clone of its template's disk. Charged
         // before anything is made, so a node that cannot hold it refuses
@@ -6380,7 +6592,7 @@ impl SandboxManager {
             }
         };
         // The record says the size the disk is, not the size it defaulted to.
-        policy.resources = Some(resources);
+        policy.resources = Some(resources.clone());
         let disk = self
             .admit_disk(&node_id, "create a sandbox", disk_bytes)
             .await?;
@@ -7017,7 +7229,7 @@ impl SandboxManager {
     ) -> Result<common::Sandbox, Status> {
         let manifest = self.snapshots.manifest_for_restore(snapshot_id).await?;
         let mut policy = policy;
-        let wanted = policy.resources.unwrap_or_default();
+        let wanted = policy.resources.clone().unwrap_or_default();
         let shape = (
             match wanted.vcpus {
                 0 => manifest.vcpus,
@@ -7046,6 +7258,7 @@ impl SandboxManager {
             vcpus: manifest.vcpus,
             mem_mib: manifest.mem_mib,
             disk_mib: manifest.disk_mib,
+            ..policy.resources.take().unwrap_or_default()
         });
 
         {
@@ -7190,8 +7403,8 @@ impl SandboxManager {
         let policy = match policy {
             None => inherited,
             Some(mut over) => {
-                let shape = inherited.resources.unwrap_or_default();
-                let wanted = over.resources.unwrap_or(shape);
+                let shape = inherited.resources.clone().unwrap_or_default();
+                let wanted = over.resources.clone().unwrap_or_else(|| shape.clone());
                 // Firecracker takes a restored VM's machine configuration from
                 // the snapshot, and the child's scratch disk is a copy of the
                 // source's. A shape the fork cannot honour is refused rather
@@ -7307,7 +7520,7 @@ impl SandboxManager {
         let workdir = self.config.sandbox_dir(&id, hypervisor);
         // And on the disk layout it was written on.
         let disk_layout = source.disk_layout();
-        let mut resources = policy.resources.unwrap_or_default();
+        let mut resources = policy.resources.clone().unwrap_or_default();
         // A restored sandbox gets a disk of its source's size, provisioned
         // like a created one's. An adopt is charged here too, after its claim
         // in the store, which a refusal hands back.
@@ -7315,7 +7528,7 @@ impl SandboxManager {
             0 if disk_layout == DiskLayout::Overlay => DEFAULT_SCRATCH_MIB,
             mib => mib,
         };
-        policy.resources = Some(resources);
+        policy.resources = Some(resources.clone());
         let what = match source {
             RestoreSource::Sandbox(..) => "fork a sandbox",
             RestoreSource::Snapshot { .. } => "create a sandbox from a snapshot",
@@ -7846,7 +8059,7 @@ impl SandboxManager {
                 return Err(Status::internal(format!("preparing the jail: {err}")));
             }
         }
-        let resources = policy.resources.unwrap_or_default();
+        let resources = policy.resources.clone().unwrap_or_default();
         let environment = self.environment_of(&sandbox).await;
         let is_systemd = environment.systemd;
         let disk_layout = sandbox.disk_layout();
@@ -8874,6 +9087,7 @@ impl SandboxManager {
             vcpus: manifest.vcpus,
             mem_mib: manifest.mem_mib,
             disk_mib: manifest.disk_mib,
+            ..policy.resources.take().unwrap_or_default()
         });
         // Claimed in the store before the guest starts, the rule a resume
         // follows too, and handed back if it never does. Conditional on the
@@ -8983,8 +9197,9 @@ impl SandboxManager {
             vcpus: manifest.vcpus,
             mem_mib: manifest.mem_mib,
             disk_mib: manifest.disk_mib,
+            ..policy.resources.take().unwrap_or_default()
         };
-        policy.resources = Some(resources);
+        policy.resources = Some(resources.clone());
         let _disk = self
             .admit_disk(
                 &node_id,
@@ -9772,6 +9987,47 @@ impl burrow_proxy::dns::Redirect for InspectionRedirect {
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
+
+    /// A sandbox's limits become its cgroup's the way runc makes Docker's:
+    /// a cap as cpu.max, shares as cpu.weight, Docker's default shares for
+    /// each CPU charged when none are named, blkio weight as io.weight.
+    #[test]
+    fn a_policy_maps_to_cgroup_limits_as_docker_does() {
+        let limits = cgroup_limits(
+            &common::ResourcePolicy {
+                vcpus: 2,
+                cpus: 0.5,
+                cpuset_cpus: "0-1".into(),
+                blkio_weight: 500,
+                ..Default::default()
+            },
+            640,
+        );
+        assert_eq!(limits.cpu_max_millis, 500);
+        assert_eq!(limits.cpu_weight, burrow_common::cpu::shares_to_weight(512));
+        assert_eq!(limits.cpuset_cpus, "0-1");
+        assert_eq!(limits.io_weight, 4950);
+        assert_eq!(limits.memory_mib, 640);
+
+        let uncapped = cgroup_limits(
+            &common::ResourcePolicy {
+                vcpus: 2,
+                cpu_shares: 100,
+                ..Default::default()
+            },
+            640,
+        );
+        assert_eq!(uncapped.cpu_max_millis, 0);
+        assert_eq!(
+            uncapped.cpu_weight,
+            burrow_common::cpu::shares_to_weight(100)
+        );
+        assert_eq!(uncapped.io_weight, 0);
+        assert_eq!(
+            cgroup_limits(&common::ResourcePolicy::default(), 640).cpu_weight,
+            burrow_common::cpu::shares_to_weight(1024)
+        );
+    }
 
     #[test]
     fn guest_clocks_sync_on_the_interval_or_a_node_clock_jump() {

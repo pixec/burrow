@@ -439,6 +439,7 @@ async fn run_build(
             // The build's disk is the image it makes: its base's plus room
             // for the steps, unless the build names a size.
             disk_mib: request.disk_mib,
+            ..Default::default()
         }),
         network: Some(network),
         ..Default::default()

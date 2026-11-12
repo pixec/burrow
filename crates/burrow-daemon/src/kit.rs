@@ -316,7 +316,7 @@ pub fn plan(
         env,
         install_network,
         runtime_network,
-        resources: fit_resources(*requested, &composition.resources),
+        resources: fit_resources(requested.clone(), &composition.resources),
         selection: selection_record(&composition),
         install_sentinels,
         runtime_sentinels,

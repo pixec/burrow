@@ -140,7 +140,7 @@ async fn racing_claims_and_reservations_have_one_winner() {
     stores[0]
         .heartbeat_node(&burrow_store::NodeRow {
             total_vcpus: 4,
-            committed_vcpus: 1,
+            committed_cpu_millis: 1000,
             free_mem_mib: 2048,
             ..node.clone()
         })
@@ -150,7 +150,7 @@ async fn racing_claims_and_reservations_have_one_winner() {
     let reserved = futures::future::join_all(
         stores
             .iter()
-            .map(|store| async { store.reserve_capacity(&node.id, 1, 512).await.unwrap() }),
+            .map(|store| async { store.reserve_capacity(&node.id, 1000, 512).await.unwrap() }),
     )
     .await;
     assert_eq!(reserved.iter().filter(|won| **won).count(), 3);

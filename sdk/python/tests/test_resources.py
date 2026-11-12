@@ -3,7 +3,7 @@ answers come back."""
 
 import pytest
 
-from burrow import BurrowError, ResourceOutcome, ResourcesUpdate
+from burrow import BurrowError, LimitsOutcome, ResourceOutcome, ResourcesUpdate
 from burrow._pb import api_pb2, common_pb2
 
 
@@ -50,6 +50,39 @@ def test_a_resources_update_names_its_fields_and_reads_back_each_outcome(transpo
         filesystem_bytes=1 << 30,
     )
     assert sandbox.disk_mib == 1024
+
+
+def test_host_limits_go_out_with_dockers_names_and_come_back_as_one_outcome(
+    transport, sandbox
+):
+    resources = common_pb2.ResourcePolicy(
+        vcpus=2, cpus=0.5, cpu_shares=512, cpuset_cpus="0-1", blkio_weight=500
+    )
+    calls = answering(
+        transport,
+        api_pb2.UpdateResourcesResponse(
+            sandbox=common_pb2.Sandbox(
+                id="sbx_test", policy=common_pb2.Policy(resources=resources)
+            ),
+            limits=api_pb2.LimitsOutcome(change=api_pb2.RESOURCE_CHANGE_LIVE),
+        ),
+    )
+    updated = sandbox.update_resources(cpus=0.5, cpu_shares=512, cpuset_cpus="", blkio_weight=0)
+    _, request = calls[0]
+    assert request.cpus == 0.5
+    assert request.cpu_shares == 512
+    # An empty cpuset and a zero weight clear them, so they are sent.
+    assert request.HasField("cpuset_cpus") and request.HasField("blkio_weight")
+    assert not request.HasField("vcpus")
+    assert updated.limits == LimitsOutcome(change="live")
+    assert updated.vcpus is None
+    policy = sandbox.policy.resources
+    assert (policy.cpus, policy.cpu_shares, policy.cpuset_cpus, policy.blkio_weight) == (
+        0.5,
+        512,
+        "0-1",
+        500,
+    )
 
 
 def test_a_field_not_asked_for_is_absent_on_the_wire_and_in_the_answer(transport, sandbox):

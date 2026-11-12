@@ -18,12 +18,26 @@ class Usage:
 
 @dataclass
 class ResourcePolicy:
-    """The machine a sandbox runs on. Fixed for its life; 0 is the server's
-    default, which is what lets a create from a snapshot inherit its shape."""
+    """The machine a sandbox runs on and its host limits. 0 is the server's
+    default, which is what lets a create from a snapshot inherit its shape.
+
+    The host limits are named and measured as `docker run` names them and
+    confine the VMM's cgroup; `vcpus` stays the CPUs the guest sees."""
 
     vcpus: int = 0
     memory_mib: int = 0
     disk_mib: int = 0
+    # Host CPU the sandbox may use across its vCPUs, e.g. 0.5, as
+    # `docker run --cpus`: a hard cap, and what placement charges a node, so
+    # 2 vCPUs at 0.5 take half a CPU of it. At most `vcpus`; 0 is no cap.
+    cpus: float = 0.0
+    # Relative CPU weight under contention, as `--cpu-shares` (2-262144). 0 is
+    # 1024 per CPU charged.
+    cpu_shares: int = 0
+    # Host CPUs to run on, e.g. "0-3,6", as `--cpuset-cpus`. Empty is any.
+    cpuset_cpus: str = ""
+    # Relative disk IO weight, as `--blkio-weight` (10-1000). 0 is unset.
+    blkio_weight: int = 0
 
 
 @dataclass
@@ -277,12 +291,24 @@ class ResourceOutcome:
 
 
 @dataclass
+class LimitsOutcome:
+    """What became of the host limits of `Sandbox.update_resources`, which
+    change together: "live" on a running sandbox, "next_boot" when it next
+    runs. The values are the sandbox's `policy.resources`."""
+
+    change: str
+    reason: str = ""
+
+
+@dataclass
 class ResourcesUpdate:
     """What `Sandbox.update_resources` did, a field per one asked for."""
 
     vcpus: Optional[ResourceOutcome] = None
     memory_mib: Optional[ResourceOutcome] = None
     disk_mib: Optional[ResourceOutcome] = None
+    # Present when any host limit was asked for.
+    limits: Optional[LimitsOutcome] = None
     # The root filesystem's size after a disk change, in bytes. 0 when no
     # guest has seen the disk yet: a shut-down sandbox grown, whose guest fills
     # it on its next boot.
@@ -425,6 +451,9 @@ class NodeInfo:
     healthy: bool
     draining: bool
     labels: Dict[str, str]
+    # Host CPU promised to sandboxes here: each one's `cpus` where set, else
+    # its vCPUs.
+    committed_cpus: float = 0.0
     # Cpu architecture and each offered hypervisor's version. A durable
     # snapshot only restores on a node where both match what took it.
     arch: str = ""

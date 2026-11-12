@@ -216,10 +216,11 @@ pub struct NodeRow {
     pub last_heartbeat_ms: i64,
     pub is_reported: bool,
     pub total_vcpus: u32,
-    pub committed_vcpus: u32,
+    /// Host CPU committed on the node, in thousandths of a CPU.
+    pub committed_cpu_millis: u64,
     pub free_mem_mib: u64,
     /// Capacity promised to sandboxes placed since the last heartbeat.
-    pub reserved_vcpus: u32,
+    pub reserved_cpu_millis: u64,
     pub reserved_mem_mib: u64,
 }
 
@@ -1246,14 +1247,14 @@ impl Store {
             let written = on_pool!(self, pool => sqlx::query(
                 "INSERT INTO nodes
                    (id, idx, info, status, wg_key, wg_endpoint, last_heartbeat_ms,
-                    is_reported, total_vcpus, committed_vcpus, free_mem_mib,
-                    reserved_vcpus, reserved_mem_mib)
+                    is_reported, total_vcpus, committed_cpu_millis, free_mem_mib,
+                    reserved_cpu_millis, reserved_mem_mib)
                  VALUES ($1, $2, $3, $4, $5, $6, $7, 0, $8, 0, 0, 0, 0)
                  ON CONFLICT (id) DO UPDATE SET
                    idx=excluded.idx, info=excluded.info, status=excluded.status,
                    wg_key=excluded.wg_key, wg_endpoint=excluded.wg_endpoint,
                    last_heartbeat_ms=excluded.last_heartbeat_ms, is_reported=0,
-                   total_vcpus=excluded.total_vcpus, reserved_vcpus=0, reserved_mem_mib=0",
+                   total_vcpus=excluded.total_vcpus, reserved_cpu_millis=0, reserved_mem_mib=0",
             )
             .bind(&row.id)
             .bind(index as i64)
@@ -1285,8 +1286,8 @@ impl Store {
     pub async fn heartbeat_node(&self, row: &NodeRow) -> Result<bool> {
         let done = on_pool!(self, pool => sqlx::query(
             "UPDATE nodes SET info=$2, status=$3, last_heartbeat_ms=$4, is_reported=1,
-                total_vcpus=$5, committed_vcpus=$6, free_mem_mib=$7,
-                reserved_vcpus=0, reserved_mem_mib=0
+                total_vcpus=$5, committed_cpu_millis=$6, free_mem_mib=$7,
+                reserved_cpu_millis=0, reserved_mem_mib=0
              WHERE id=$1",
         )
         .bind(&row.id)
@@ -1294,7 +1295,7 @@ impl Store {
         .bind(&row.status)
         .bind(row.last_heartbeat_ms)
         .bind(row.total_vcpus as i64)
-        .bind(row.committed_vcpus as i64)
+        .bind(row.committed_cpu_millis as i64)
         .bind(row.free_mem_mib as i64)
         .execute(pool)
         .await
@@ -1320,7 +1321,8 @@ impl Store {
         );
         let rows: Vec<Raw> = on_pool!(self, pool => sqlx::query_as(
             "SELECT id, idx, info, status, wg_key, wg_endpoint, last_heartbeat_ms, is_reported,
-                    total_vcpus, committed_vcpus, free_mem_mib, reserved_vcpus, reserved_mem_mib
+                    total_vcpus, committed_cpu_millis, free_mem_mib, reserved_cpu_millis,
+                    reserved_mem_mib
              FROM nodes ORDER BY id",
         )
         .fetch_all(pool)
@@ -1337,9 +1339,9 @@ impl Store {
                 last_heartbeat_ms: r.6,
                 is_reported: r.7 != 0,
                 total_vcpus: r.8 as u32,
-                committed_vcpus: r.9 as u32,
+                committed_cpu_millis: r.9 as u64,
                 free_mem_mib: r.10 as u64,
-                reserved_vcpus: r.11 as u32,
+                reserved_cpu_millis: r.11 as u64,
                 reserved_mem_mib: r.12 as u64,
             })
             .collect())
@@ -1387,17 +1389,24 @@ impl Store {
     /// The fit check and the charge are the same `UPDATE`, so it is atomic on
     /// both backends: of two replicas racing for the last slot on a node,
     /// exactly one sees a row change. A node that has not reported a cpu
-    /// count is trusted on cpu, as placement always has.
-    pub async fn reserve_capacity(&self, node_id: &str, vcpus: u32, mem_mib: u64) -> Result<bool> {
+    /// count is trusted on cpu, as placement always has. CPU is in
+    /// thousandths of a CPU.
+    pub async fn reserve_capacity(
+        &self,
+        node_id: &str,
+        cpu_millis: u64,
+        mem_mib: u64,
+    ) -> Result<bool> {
         let done = on_pool!(self, pool => sqlx::query(
-            "UPDATE nodes SET reserved_vcpus = reserved_vcpus + $2,
+            "UPDATE nodes SET reserved_cpu_millis = reserved_cpu_millis + $2,
                               reserved_mem_mib = reserved_mem_mib + $3
              WHERE id=$1
-               AND (total_vcpus = 0 OR committed_vcpus + reserved_vcpus + $2 <= total_vcpus)
+               AND (total_vcpus = 0
+                    OR committed_cpu_millis + reserved_cpu_millis + $2 <= total_vcpus * 1000)
                AND (is_reported = 0 OR free_mem_mib - reserved_mem_mib >= $3)",
         )
         .bind(node_id)
-        .bind(vcpus as i64)
+        .bind(cpu_millis as i64)
         .bind(mem_mib as i64)
         .execute(pool)
         .await
@@ -1406,15 +1415,21 @@ impl Store {
     }
 
     /// Gives back capacity a placement took and no longer needs.
-    pub async fn release_capacity(&self, node_id: &str, vcpus: u32, mem_mib: u64) -> Result<()> {
+    pub async fn release_capacity(
+        &self,
+        node_id: &str,
+        cpu_millis: u64,
+        mem_mib: u64,
+    ) -> Result<()> {
         on_pool!(self, pool => sqlx::query(
             "UPDATE nodes SET
-                reserved_vcpus = CASE WHEN reserved_vcpus > $2 THEN reserved_vcpus - $2 ELSE 0 END,
+                reserved_cpu_millis = CASE WHEN reserved_cpu_millis > $2
+                                      THEN reserved_cpu_millis - $2 ELSE 0 END,
                 reserved_mem_mib = CASE WHEN reserved_mem_mib > $3 THEN reserved_mem_mib - $3 ELSE 0 END
              WHERE id=$1",
         )
         .bind(node_id)
-        .bind(vcpus as i64)
+        .bind(cpu_millis as i64)
         .bind(mem_mib as i64)
         .execute(pool)
         .await

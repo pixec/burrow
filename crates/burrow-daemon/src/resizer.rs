@@ -93,13 +93,14 @@ impl Resizer {
         spec.net = None;
         spec.vcpus = 1;
         spec.mem_mib = HELPER_MEM_MIB;
-        spec.limits = burrow_vmm::Limits {
-            cpus: 1,
-            memory_mib: spec
-                .hypervisor()
+        spec.limits = crate::sandbox::cgroup_limits(
+            &burrow_proto::common::v1::ResourcePolicy {
+                vcpus: 1,
+                ..Default::default()
+            },
+            spec.hypervisor()
                 .memory_ceiling_mib(HELPER_MEM_MIB, vmm_overhead_mib),
-            pids_max: 0,
-        };
+        );
         spec.is_vsock_enabled = true;
         spec.is_dirty_pages_tracked = false;
         spec.is_memory_lazy = false;
