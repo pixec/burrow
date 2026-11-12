@@ -50,6 +50,7 @@ impl Resizer {
     /// `target_bytes`. The guest's answer is returned as it gave it: a size
     /// above the target means the target was below its minimum and nothing
     /// changed.
+    #[allow(clippy::too_many_arguments)]
     pub async fn shrink(
         &self,
         data_dir: &Path,
@@ -57,6 +58,7 @@ impl Resizer {
         mut spec: VmSpec,
         disk: &str,
         target_bytes: u64,
+        vmm_overhead_mib: u32,
         agent_timeout: Duration,
     ) -> Result<guestpb::RootDiskResponse, Status> {
         let image = self.image(data_dir, guest_binary).await?;
@@ -93,7 +95,9 @@ impl Resizer {
         spec.mem_mib = HELPER_MEM_MIB;
         spec.limits = burrow_vmm::Limits {
             cpus: 1,
-            memory_mib: HELPER_MEM_MIB + spec.capabilities().memory_headroom_mib,
+            memory_mib: spec
+                .hypervisor()
+                .memory_ceiling_mib(HELPER_MEM_MIB, vmm_overhead_mib),
             pids_max: 0,
         };
         spec.is_vsock_enabled = true;

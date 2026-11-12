@@ -202,6 +202,12 @@ pub struct ServeArgs {
     /// turning on wherever sandboxes share a host with anything that matters.
     #[arg(long = "require-resource-limits")]
     pub is_resource_limits_required: bool,
+    /// Host memory a VMM is allowed beyond its guest and the page tables over
+    /// it, as HYPERVISOR=MIB, e.g. `firecracker=48`. Repeatable. Adds to every
+    /// sandbox's cgroup memory ceiling and to what placement charges this
+    /// node. Defaults: firecracker FC_DEFAULT, cloud-hypervisor CH_DEFAULT.
+    #[arg(long = "vmm-memory-overhead-mib", value_parser = parse_vmm_overhead)]
+    pub vmm_memory_overheads: Vec<(burrow_vmm::Hypervisor, u32)>,
     /// Serve restored guest memory from burrow's own page-fault handler.
     ///
     /// Off by default: firecracker's `File` backend already maps the snapshot
@@ -601,6 +607,14 @@ fn public_config(args: &ServeArgs) -> crate::publicip::PublicConfig {
     }
 }
 
+fn parse_vmm_overhead(value: &str) -> Result<(burrow_vmm::Hypervisor, u32), String> {
+    let (hypervisor, mib) = value
+        .split_once('=')
+        .ok_or_else(|| format!("{value:?}: expected HYPERVISOR=MIB"))?;
+    let mib = mib.parse().map_err(|err| format!("{value:?}: {err}"))?;
+    Ok((hypervisor.parse()?, mib))
+}
+
 fn local_node_info(args: &ServeArgs) -> anyhow::Result<NodeInfo> {
     let mut sys = sysinfo::System::new();
     sys.refresh_memory();
@@ -632,6 +646,7 @@ fn local_node_info(args: &ServeArgs) -> anyhow::Result<NodeInfo> {
         // Filled in once the binaries have been looked for.
         hypervisors: Vec::new(),
         hypervisor_versions: Default::default(),
+        vmm_memory_overhead_mib: Default::default(),
         // Filled in once the inspection authority is loaded.
         inspection_root_fingerprint: String::new(),
         inspection_ca_expires_at_unix_ms: 0,
@@ -1393,6 +1408,18 @@ pub async fn run(args: ServeArgs) -> anyhow::Result<()> {
             .to_string(),
         path: args.guest_binary.clone(),
     }));
+    let vmm_memory_overhead_mib: std::collections::HashMap<_, _> =
+        args.vmm_memory_overheads.iter().copied().collect();
+    node_info.vmm_memory_overhead_mib = hypervisors
+        .iter()
+        .map(|h| {
+            let mib = vmm_memory_overhead_mib
+                .get(h)
+                .copied()
+                .unwrap_or_else(|| h.default_vmm_overhead_mib());
+            (h.to_string(), mib)
+        })
+        .collect();
     node_info.hypervisors = hypervisors.iter().map(|h| h.to_string()).collect();
     node_info.hypervisor_versions = hypervisors
         .iter()
@@ -1495,6 +1522,7 @@ pub async fn run(args: ServeArgs) -> anyhow::Result<()> {
                 jail: args.cloud_hypervisor_jail()?,
             },
             hypervisors,
+            vmm_memory_overhead_mib,
             artifact_retention: Duration::from_secs(
                 u64::from(args.artifact_retention_days) * 24 * 60 * 60,
             ),

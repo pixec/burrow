@@ -115,7 +115,6 @@ impl HypervisorExt for Hypervisor {
                 is_drive_hotplug_supported: true,
                 is_jailable: true,
                 guest_oses: &[GuestOs::Linux],
-                memory_headroom_mib: 128,
                 is_warm_pool_supported: true,
                 is_tap_networked: true,
                 is_live_disk_growth_supported: true,
@@ -131,7 +130,6 @@ impl HypervisorExt for Hypervisor {
                 is_drive_hotplug_supported: true,
                 is_jailable: true,
                 guest_oses: &[GuestOs::Linux],
-                memory_headroom_mib: 128,
                 is_warm_pool_supported: true,
                 is_tap_networked: true,
                 is_live_disk_growth_supported: true,
@@ -140,15 +138,13 @@ impl HypervisorExt for Hypervisor {
                 is_vcpu_hotplug_supported: cfg!(target_arch = "x86_64"),
             },
             // The framework saves a machine as one opaque file, reads it back
-            // itself and attaches storage only at configuration time. There
-            // is no cgroup on macOS for the headroom to size.
+            // itself and attaches storage only at configuration time.
             Self::Vz => Capabilities {
                 is_diff_snapshot_supported: false,
                 is_lazy_memory_supported: false,
                 is_drive_hotplug_supported: false,
                 is_jailable: false,
                 guest_oses: &[GuestOs::MacOs],
-                memory_headroom_mib: 0,
                 // A restore takes longer than a cold boot, and a saved state
                 // restores into only one running machine at a time.
                 is_warm_pool_supported: false,
@@ -198,9 +194,6 @@ pub struct Capabilities {
     pub is_jailable: bool,
     /// Guests it can boot.
     pub guest_oses: &'static [GuestOs],
-    /// Host memory its VMM needs beyond the guest's own, added to the cgroup's
-    /// ceiling. Too tight and the kernel kills the VMM rather than the guest.
-    pub memory_headroom_mib: u32,
     /// Restoring a template's warm snapshot beats booting it, and one
     /// snapshot can be restored into many sandboxes at once.
     pub is_warm_pool_supported: bool,

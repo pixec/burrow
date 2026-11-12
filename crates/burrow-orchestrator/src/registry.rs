@@ -22,7 +22,8 @@ pub struct Placement {
     /// Whether peers can be reached from another node.
     pub is_mesh_available: bool,
     /// What the sandbox will consume, so a node is not handed work it cannot
-    /// honour.
+    /// honour. `mem_mib` is the guest's; a node is charged
+    /// [`mem_charge_mib`](Self::mem_charge_mib).
     pub vcpus: u32,
     pub mem_mib: u64,
     /// The disk it is promised, in bytes: its scratch disk. Checked against
@@ -55,6 +56,30 @@ pub struct Placement {
     pub policy_features: Vec<&'static str>,
 }
 
+impl Placement {
+    /// The host memory the sandbox may hold on `node`, which is what that node
+    /// is charged.
+    pub fn mem_charge_mib(&self, node: &NodeInfo) -> u64 {
+        mem_charge_mib(node, &self.hypervisor, self.mem_mib)
+    }
+}
+
+/// The host memory a guest of `mem_mib` under `hypervisor` may hold on `node`:
+/// the cgroup ceiling the node puts on it, with the VMM overhead it reports.
+pub fn mem_charge_mib(node: &NodeInfo, hypervisor: &str, mem_mib: u64) -> u64 {
+    match burrow_common::hypervisor::Hypervisor::from_record(hypervisor) {
+        Some(hypervisor) if mem_mib > 0 => {
+            let overhead = node
+                .vmm_memory_overhead_mib
+                .get(hypervisor.as_str())
+                .copied()
+                .unwrap_or_else(|| hypervisor.default_vmm_overhead_mib());
+            u64::from(hypervisor.memory_ceiling_mib(mem_mib as u32, overhead))
+        }
+        _ => mem_mib,
+    }
+}
+
 #[derive(Debug, thiserror::Error)]
 pub enum PlacementError {
     #[error("no healthy node available")]
@@ -73,7 +98,8 @@ pub enum PlacementError {
     )]
     NoNodeWithHypervisor(String),
     #[error(
-        "no node has room for {vcpus} vcpu / {mem_mib} MiB / {disk_mib} MiB of disk{disk_note}"
+        "no node has room for {vcpus} vcpu / {mem_mib} MiB of host memory / {disk_mib} MiB of \
+         disk{disk_note}"
     )]
     NoCapacity {
         vcpus: u32,
@@ -331,7 +357,7 @@ fn is_fit(entry: &NodeEntry, pending: &HashMap<String, Reserved>, want: &Placeme
     // beats refusing to place anything on it.
     let cpu_ok = entry.info.total_vcpus == 0 || committed <= entry.info.total_vcpus as u64;
     let free = entry.status.free_mem_mib.saturating_sub(held.mem_mib);
-    let mem_ok = free >= want.mem_mib;
+    let mem_ok = free >= want.mem_charge_mib(&entry.info);
     cpu_ok && mem_ok && disk_fit(entry, held, want).is_ok()
 }
 
@@ -871,7 +897,11 @@ impl NodeRegistry {
         if with_room.is_empty() {
             return Err(PlacementError::NoCapacity {
                 vcpus: want.vcpus,
-                mem_mib: want.mem_mib,
+                mem_mib: candidates
+                    .iter()
+                    .map(|e| want.mem_charge_mib(&e.info))
+                    .min()
+                    .unwrap_or(want.mem_mib),
                 disk_mib: want.disk_bytes.div_ceil(burrow_common::disk::MIB),
                 disk_note: disk_note(&candidates, &pending, want),
             });
@@ -893,7 +923,7 @@ impl NodeRegistry {
                     free_mem(e, &pending),
                 )
             })
-            .map(|e| e.info.id.clone())
+            .map(|e| (e.info.id.clone(), want.mem_charge_mib(&e.info)))
             .ok_or(PlacementError::NoHealthyNode)?;
         drop(pending);
 
@@ -901,17 +931,24 @@ impl NodeRegistry {
         // heartbeat. Placements are far quicker than the heartbeat interval, so
         // without this a burst of concurrent creates all read the same stale
         // status and pile onto whichever node was least loaded a second ago.
-        self.reserve(&chosen, want);
+        let (chosen, mem_mib) = chosen;
+        self.reserve(&chosen, want, mem_mib);
         Ok(chosen)
     }
 
     /// Charges a placement against a node until its next heartbeat reports it.
-    fn reserve(&self, node_id: &str, want: &Placement) {
+    fn reserve(&self, node_id: &str, want: &Placement, mem_mib: u64) {
         let mut pending = self.pending.lock().unwrap();
         let entry = pending.entry(node_id.to_string()).or_default();
         entry.vcpus += want.vcpus;
-        entry.mem_mib += want.mem_mib;
+        entry.mem_mib += mem_mib;
         entry.disk_bytes += want.disk_bytes;
+    }
+
+    /// What `node_id` is charged for a guest of `mem_mib` under `hypervisor`.
+    pub fn mem_charge_mib(&self, node_id: &str, hypervisor: &str, mem_mib: u64) -> u64 {
+        let info = self.info(node_id).unwrap_or_default();
+        mem_charge_mib(&info, hypervisor, mem_mib)
     }
 
     /// Gives back capacity reserved for a placement that no longer exists.
@@ -1365,11 +1402,11 @@ mod tests {
     /// limited to nodes that match, whatever their capacity.
     #[test]
     fn a_snapshot_is_placed_only_on_a_node_that_can_restore_it() {
-        let registry = registry(&[("a", status(&[], &[], 9999)), ("b", status(&[], &[], 1))]);
+        let registry = registry(&[("a", status(&[], &[], 9999)), ("b", status(&[], &[], 1000))]);
         for (id, version) in [("a", "v1.15.0"), ("b", "v1.16.1")] {
             registry.heartbeat(
                 id,
-                status(&[], &[], if id == "a" { 9999 } else { 1 }),
+                status(&[], &[], if id == "a" { 9999 } else { 1000 }),
                 Some(NodeInfo {
                     id: id.into(),
                     address: format!("{id}:7071"),
@@ -1482,11 +1519,11 @@ mod tests {
         use burrow_common::features;
         let registry = registry(&[
             ("old", status(&["t"], &[], 9999)),
-            ("new", status(&["t"], &[], 1)),
+            ("new", status(&["t"], &[], 1000)),
         ]);
         registry.heartbeat(
             "new",
-            status(&["t"], &[], 1),
+            status(&["t"], &[], 1000),
             Some(NodeInfo {
                 id: "new".into(),
                 address: "new:7071".into(),
@@ -2107,6 +2144,34 @@ mod tests {
         ));
     }
 
+    /// A node is charged a guest's whole cgroup ceiling, with the VMM
+    /// overhead that node reports, so the books match the cap it enforces.
+    #[test]
+    fn a_guest_is_charged_its_memory_ceiling() {
+        let registry = registry(&[("only", status(&[], &[], 600))]);
+        let want = Placement {
+            vcpus: 1,
+            mem_mib: 512,
+            ..Default::default()
+        };
+        assert_eq!(registry.mem_charge_mib("only", "", 512), 512 + 64 + 4);
+        assert_eq!(registry.place_for(&want).unwrap(), "only");
+        registry.release("only", 1, 580, 0);
+
+        registry.heartbeat(
+            "only",
+            status(&[], &[], 600),
+            Some(NodeInfo {
+                id: "only".into(),
+                address: "only:7071".into(),
+                vmm_memory_overhead_mib: [("firecracker".to_string(), 128)].into(),
+                ..Default::default()
+            }),
+        );
+        assert_eq!(registry.mem_charge_mib("only", "", 512), 512 + 128 + 4);
+        assert!(registry.place_for(&want).is_err());
+    }
+
     /// A reservation covers the window before a node reports the sandbox. If
     /// the sandbox is destroyed inside that window the charge has to come
     /// back, or a burst of create-then-destroy exhausts an empty node.
@@ -2115,13 +2180,14 @@ mod tests {
         let registry = registry(&[(
             "only",
             NodeStatus {
-                free_mem_mib: 4_000,
+                free_mem_mib: 3_500,
                 ..Default::default()
             },
         )]);
         set_capacity(&registry, "only", 2, 8_000);
 
-        // Two of these fit in the reported 4,000 MiB; a third does not.
+        // Two of these, at 1,572 MiB each with the VMM and page tables, fit in
+        // the reported 3,500 MiB; a third does not.
         let want = Placement {
             vcpus: 1,
             mem_mib: 1_500,
@@ -2131,7 +2197,8 @@ mod tests {
         registry.place_for(&want).unwrap();
         assert!(registry.place_for(&want).is_err());
 
-        registry.release("only", want.vcpus, want.mem_mib, want.disk_bytes);
+        let charged = registry.mem_charge_mib("only", &want.hypervisor, want.mem_mib);
+        registry.release("only", want.vcpus, charged, want.disk_bytes);
         registry
             .place_for(&want)
             .expect("releasing one placement should make room for another");
@@ -2252,7 +2319,8 @@ mod tests {
         registry.place_for(&want).unwrap();
         registry.place_for(&want).unwrap();
         assert!(registry.place_for(&want).is_err());
-        registry.release("a", want.vcpus, want.mem_mib, want.disk_bytes);
+        let charged = registry.mem_charge_mib("a", &want.hypervisor, want.mem_mib);
+        registry.release("a", want.vcpus, charged, want.disk_bytes);
         assert_eq!(registry.place_for(&want).unwrap(), "a");
     }
 

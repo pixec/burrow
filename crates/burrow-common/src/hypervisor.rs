@@ -40,6 +40,49 @@ impl Hypervisor {
     }
 }
 
+/// Host page tables over guest memory, per GiB of guest: KVM's stage-2
+/// tables and the VMM's own mapping of it, 8 bytes per 4 KiB page each.
+/// Measured 4 MiB per GiB under Firecracker, which tracks dirty pages and so
+/// maps 4 KiB pages, and 2.3 under Cloud Hypervisor.
+const PAGE_TABLE_MIB_PER_GIB: u32 = 4;
+
+impl Hypervisor {
+    /// Host memory this hypervisor's VMM holds beyond its guest and the page
+    /// tables over it: the VMM's own heap and device buffers, slab and kernel
+    /// stacks. A node can set its own (`--vmm-memory-overhead-mib`).
+    ///
+    /// Measured on the arm64 dev harness (2026-11-12) as the VMM's resident
+    /// memory outside guest RAM plus the cgroup's other kernel memory, for
+    /// 512 MiB and 2 GiB guests idle and under disk I/O: at most 6 MiB for
+    /// Firecracker v1.16.1 and 7 MiB for Cloud Hypervisor v54.0. Cloud
+    /// Hypervisor's default is that with room for more vCPUs and queues.
+    /// Firecracker's is larger again because its disks go through host page
+    /// cache, and what is dirty cannot be reclaimed until it is written back.
+    pub fn default_vmm_overhead_mib(self) -> u32 {
+        match self {
+            Self::Firecracker => 64,
+            Self::CloudHypervisor => 32,
+            Self::Vz => 0,
+        }
+    }
+
+    /// The host memory a guest of `guest_mib` may hold under this hypervisor
+    /// with a VMM needing `overhead_mib` beyond it: its cgroup's
+    /// `memory.max`, and what placement charges a node for it. Host page
+    /// cache gets no room: Cloud Hypervisor opens disks `O_DIRECT`, and what
+    /// Firecracker's guest I/O caches is reclaimed inside the ceiling.
+    pub fn memory_ceiling_mib(self, guest_mib: u32, overhead_mib: u32) -> u32 {
+        match self {
+            Self::Firecracker | Self::CloudHypervisor => {
+                guest_mib + overhead_mib + guest_mib.div_ceil(1024) * PAGE_TABLE_MIB_PER_GIB
+            }
+            // No cgroup on a Mac node, and the framework's own footprint is
+            // the host's to absorb.
+            Self::Vz => guest_mib,
+        }
+    }
+}
+
 impl std::fmt::Display for Hypervisor {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str(self.as_str())
@@ -104,5 +147,19 @@ impl GuestOs {
 impl std::fmt::Display for GuestOs {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str(self.as_str())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_ceiling_is_the_guest_its_vmm_and_the_page_tables_over_it() {
+        let fc = Hypervisor::Firecracker;
+        assert_eq!(fc.memory_ceiling_mib(512, 40), 512 + 40 + 4);
+        assert_eq!(fc.memory_ceiling_mib(8192, 40), 8192 + 40 + 32);
+        assert_eq!(fc.memory_ceiling_mib(1025, 40), 1025 + 40 + 8);
+        assert_eq!(Hypervisor::Vz.memory_ceiling_mib(8192, 40), 8192);
     }
 }

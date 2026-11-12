@@ -772,9 +772,7 @@ fn apply_confinement(spec: &mut VmSpec, config: &NodeConfig, shape: Shape) {
     spec.is_limits_required = config.is_resource_limits_required;
     spec.limits = burrow_vmm::Limits {
         cpus: shape.vcpus,
-        // The same headroom over guest memory a sandbox gets, and for the same
-        // reason: too tight and the VMM itself is what the kernel kills.
-        memory_mib: shape.mem_mib + spec.capabilities().memory_headroom_mib,
+        memory_mib: config.memory_ceiling_mib(spec.hypervisor(), shape.mem_mib),
         pids_max: 0,
     };
 }

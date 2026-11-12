@@ -156,6 +156,9 @@ pub struct NodeConfig {
     /// The hypervisors this node offers, as it advertises them. A template or
     /// sandbox needing another is refused.
     pub hypervisors: Vec<Hypervisor>,
+    /// Host memory each hypervisor's VMM is allowed beyond its guest
+    /// (`--vmm-memory-overhead-mib`); one not named gets its default.
+    pub vmm_memory_overhead_mib: HashMap<Hypervisor, u32>,
     /// How long a build layer and an unreferenced blob are kept.
     ///
     /// Neither has an owner that could delete it: a cached layer outlives the
@@ -204,6 +207,18 @@ pub struct NodeConfig {
 impl NodeConfig {
     pub(crate) fn templates_dir(&self) -> PathBuf {
         self.data_dir.join("images")
+    }
+
+    pub(crate) fn vmm_overhead_mib(&self, hypervisor: Hypervisor) -> u32 {
+        self.vmm_memory_overhead_mib
+            .get(&hypervisor)
+            .copied()
+            .unwrap_or_else(|| hypervisor.default_vmm_overhead_mib())
+    }
+
+    /// The cgroup memory ceiling of a guest of `guest_mib` under `hypervisor`.
+    pub(crate) fn memory_ceiling_mib(&self, hypervisor: Hypervisor, guest_mib: u32) -> u32 {
+        hypervisor.memory_ceiling_mib(guest_mib, self.vmm_overhead_mib(hypervisor))
     }
 
     /// How a VM under `hypervisor` is run here.
@@ -4768,6 +4783,7 @@ impl SandboxManager {
                 ));
             };
             let spec = sandbox.spec.lock().unwrap().clone();
+            let overhead_mib = self.config.vmm_overhead_mib(spec.hypervisor());
             let shrunk = self
                 .resizer
                 .shrink(
@@ -4776,6 +4792,7 @@ impl SandboxManager {
                     spec,
                     DiskLayout::Root.disk(),
                     bytes,
+                    overhead_mib,
                     self.config.agent_timeout,
                 )
                 .await?;
@@ -4918,7 +4935,7 @@ impl SandboxManager {
                     spec.limits.cpus = n;
                 }
                 if let Some(mib) = new_mem {
-                    spec.limits.memory_mib = spec.limits.memory_mib - spec.mem_mib + mib;
+                    spec.limits.memory_mib = self.config.memory_ceiling_mib(spec.hypervisor(), mib);
                     spec.mem_mib = mib;
                 }
             }
@@ -5395,7 +5412,7 @@ impl SandboxManager {
             sys.refresh_memory();
             sys.available_memory() / burrow_common::disk::MIB
         };
-        let needed_mib = u64::from(shape.mem_mib + hypervisor.capabilities().memory_headroom_mib);
+        let needed_mib = u64::from(self.config.memory_ceiling_mib(hypervisor, shape.mem_mib));
         if available_mib < needed_mib {
             return Err(Status::resource_exhausted(format!(
                 "a {}x{} warm build needs {needed_mib} MiB and the node has {available_mib} MiB \
@@ -6012,9 +6029,9 @@ impl SandboxManager {
         // stops one sandbox starving its neighbours.
         spec.limits = burrow_vmm::Limits {
             cpus: spec.vcpus,
-            // Headroom over the guest allocation for the VMM's own footprint;
-            // too tight and the VMM itself gets OOM-killed.
-            memory_mib: spec.mem_mib + capabilities.memory_headroom_mib,
+            memory_mib: self
+                .config
+                .memory_ceiling_mib(spec.hypervisor(), spec.mem_mib),
             pids_max: 0,
         };
         spec.cgroup_root = self.config.cgroup_root.clone();
@@ -9837,6 +9854,7 @@ pub(crate) mod tests {
                     jail: None,
                 },
                 hypervisors: vec![Hypervisor::Firecracker],
+                vmm_memory_overhead_mib: HashMap::new(),
                 artifact_retention: std::time::Duration::from_secs(7 * 24 * 60 * 60),
                 control_plane: Vec::new(),
                 share: crate::share::ShareOptions {

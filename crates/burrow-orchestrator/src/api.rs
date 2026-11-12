@@ -253,21 +253,22 @@ impl ApiService {
             let Some(store) = &self.0.store else {
                 return Ok(node_id);
             };
-            match store
-                .reserve_capacity(&node_id, want.vcpus, want.mem_mib)
-                .await
-            {
+            let mem_mib = self
+                .0
+                .nodes
+                .mem_charge_mib(&node_id, &want.hypervisor, want.mem_mib);
+            match store.reserve_capacity(&node_id, want.vcpus, mem_mib).await {
                 Ok(true) => return Ok(node_id),
                 Ok(false) => {
                     self.0
                         .nodes
-                        .release(&node_id, want.vcpus, want.mem_mib, want.disk_bytes);
+                        .release(&node_id, want.vcpus, mem_mib, want.disk_bytes);
                     excluded.insert(node_id);
                 }
                 Err(err) => {
                     self.0
                         .nodes
-                        .release(&node_id, want.vcpus, want.mem_mib, want.disk_bytes);
+                        .release(&node_id, want.vcpus, mem_mib, want.disk_bytes);
                     return Err(crate::registry::PlacementError::Store(err.to_string()));
                 }
             }
@@ -280,7 +281,10 @@ impl ApiService {
             store: self.0.store.clone(),
             node_id: node_id.to_string(),
             vcpus: want.vcpus,
-            mem_mib: want.mem_mib,
+            mem_mib: self
+                .0
+                .nodes
+                .mem_charge_mib(node_id, &want.hypervisor, want.mem_mib),
             disk_bytes: want.disk_bytes,
             is_kept: false,
         }
@@ -1421,10 +1425,14 @@ impl ApiService {
             .and_then(|policy| policy.resources)
             .unwrap_or_default();
         let vcpus = resources.vcpus.max(1);
-        let mem_mib = match resources.mem_mib {
-            0 => 512,
-            mem => mem as u64,
-        };
+        let mem_mib = self.0.nodes.mem_charge_mib(
+            &sandbox.node_id,
+            &sandbox.hypervisor,
+            match resources.mem_mib {
+                0 => 512,
+                mem => mem as u64,
+            },
+        );
         let disk_bytes = crate::registry::disk_bytes(Some(&resources));
         self.0
             .nodes

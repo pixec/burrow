@@ -799,6 +799,11 @@ message NodeInfo {
   reserved "ipv6_prefix", "ipv6_per_sandbox", "ip_providers", "is_ipv6_on_link";
   // What a probe of the filesystem sandboxes live on found at startup.
   HoleProbe hole_probe = 23;
+  // Host memory each offered hypervisor's VMM is allowed beyond its guest,
+  // in MiB, e.g. {"firecracker": 32}. A sandbox's cgroup ceiling is its
+  // guest, this, and the page tables over the guest, and placement charges
+  // the node exactly that.
+  map<string, uint32> vmm_memory_overhead_mib = 24;
 }
 
 // Whether a sparse file's extents on a node's data directory are exactly the
