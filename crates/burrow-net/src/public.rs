@@ -269,7 +269,8 @@ impl HostRoutes {
     }
 }
 
-/// The interface the node reaches `destination` through.
+/// The interface the node reaches `destination` through. A sandbox's tap is
+/// never one: the address is routed there once it is attached.
 pub async fn uplink_for(destination: IpAddr) -> Option<String> {
     let family = if destination.is_ipv4() { "-4" } else { "-6" };
     let output = tokio::process::Command::new("ip")
@@ -278,6 +279,7 @@ pub async fn uplink_for(destination: IpAddr) -> Option<String> {
         .await
         .ok()?;
     parse_dev(&String::from_utf8_lossy(&output.stdout))
+        .filter(|dev| !dev.starts_with(crate::firewall::TAP_PREFIX))
 }
 
 fn parse_dev(text: &str) -> Option<String> {
