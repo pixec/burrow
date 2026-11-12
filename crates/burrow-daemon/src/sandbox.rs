@@ -808,6 +808,8 @@ struct Provisioning<'a> {
     tap: Option<String>,
     /// `None` until the VM boots or restores.
     vm: Option<Vm>,
+    /// A warm create's dial to its guest, started as the VM came up.
+    dialing: Option<guestconn::Dialing>,
     is_kept: bool,
 }
 
@@ -820,6 +822,7 @@ impl<'a> Provisioning<'a> {
             workdir: workdir.to_path_buf(),
             tap: None,
             vm: None,
+            dialing: None,
             is_kept: false,
         }
     }
@@ -842,6 +845,9 @@ impl<'a> Provisioning<'a> {
     /// Every failure path goes through here, so the order below is the only
     /// order teardown happens in.
     async fn fail(mut self, err: Status) -> Status {
+        if let Some(dialing) = self.dialing.take() {
+            dialing.abort();
+        }
         if let Some(vm) = self.vm.take() {
             let _ = vm.kill().await;
         }
@@ -882,6 +888,9 @@ impl Drop for Provisioning<'_> {
             self.tap.take(),
             self.workdir.clone(),
         );
+        if let Some(dialing) = self.dialing.take() {
+            dialing.abort();
+        }
         let vm = self.vm.take();
         if let Ok(handle) = tokio::runtime::Handle::try_current() {
             handle.spawn(async move {
@@ -912,11 +921,14 @@ impl Drop for Provisioning<'_> {
 ///
 /// `grow_to` is the size of a root disk grown under the guest before it
 /// handshook, whose filesystem it grows to fill before the sandbox is ready.
+/// `dialing` is a connect to the guest already started, which is used rather
+/// than dialling again.
 fn spawn_handshake(
     manager: &SandboxManager,
     sandbox: &Arc<RunningSandbox>,
     request: burrow_proto::guest::v1::HandshakeRequest,
     grow_to: Option<u64>,
+    dialing: Option<guestconn::Dialing>,
     timeout: std::time::Duration,
 ) {
     let id = sandbox.id.clone();
@@ -935,7 +947,10 @@ fn spawn_handshake(
         // An upgrade has its own bound on top, for the new agent's first
         // launch.
         let outcome = match tokio::time::timeout(timeout + guestconn::UPGRADE_TIMEOUT, async {
-            let (agent, _) = guestconn::connect_when_ready(guest.clone(), timeout).await?;
+            let (agent, _) = match dialing {
+                Some(dialing) => dialing.await??,
+                None => guestconn::connect_when_ready(guest.clone(), timeout).await?,
+            };
             *step.lock().unwrap() = "waiting for the agent to answer the handshake";
             let (mut agent, _) =
                 guestconn::handshake_upgrading(agent, guest, request, upgrade.as_deref(), timeout)
@@ -7353,6 +7368,15 @@ impl SandboxManager {
             Ok(vm) => guard.vm = Some(vm),
             Err(err) => return Err(guard.fail(err).await),
         }
+        // Dialled as soon as there is a guest to dial, so the wait for it to
+        // wake runs alongside the rest of the create and its registration
+        // rather than after them.
+        if from_warm {
+            guard.dialing = Some(tokio::spawn(guestconn::connect_when_ready(
+                guard.vm().guest(),
+                self.config.agent_timeout,
+            )));
+        }
 
         // A snapshot taken on a smaller disk than this sandbox asked for: the
         // disk grows under the running guest, as a live resize would, and the
@@ -7477,6 +7501,7 @@ impl SandboxManager {
 
         // Nothing below this line can fail, so it is where the sandbox takes
         // over what the guard was holding on its behalf.
+        let dialing = guard.dialing.take();
         let vm = guard.keep().expect("a create that reaches here has a vm");
 
         let record = common::Sandbox {
@@ -7576,7 +7601,14 @@ impl SandboxManager {
         // Started only once the sandbox exists, so the task can hand the
         // channel it handshook on to whoever needs the guest next.
         if from_warm {
-            spawn_handshake(self, &sandbox, request, grow_to, self.config.agent_timeout);
+            spawn_handshake(
+                self,
+                &sandbox,
+                request,
+                grow_to,
+                dialing,
+                self.config.agent_timeout,
+            );
         }
         Ok((sandbox, disk))
     }
@@ -8355,7 +8387,14 @@ impl SandboxManager {
             tap: tap_name,
         });
         *sandbox.durable.hydration.lock().unwrap() = arriving;
-        spawn_handshake(self, &sandbox, request, None, self.config.agent_timeout);
+        spawn_handshake(
+            self,
+            &sandbox,
+            request,
+            None,
+            None,
+            self.config.agent_timeout,
+        );
         Ok((sandbox, disk))
     }
 
@@ -12023,6 +12062,7 @@ pub(crate) mod tests {
             &manager,
             &sandbox,
             burrow_proto::guest::v1::HandshakeRequest::default(),
+            None,
             None,
             std::time::Duration::from_millis(1),
         );

@@ -87,6 +87,10 @@ async fn connect_timed(
     ))
 }
 
+/// A [`connect_when_ready`] already under way, on a task of its own.
+pub type Dialing =
+    tokio::task::JoinHandle<anyhow::Result<(GuestClient<Channel>, Option<std::time::Instant>)>>;
+
 /// Connects as soon as the guest's agent accepts, or gives up.
 ///
 /// The successful attempt *is* the connection, so a warm create pays one vsock
