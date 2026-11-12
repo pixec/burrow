@@ -294,6 +294,12 @@ enum Command {
         /// to Cloud Hypervisor for a Windows image.
         #[arg(long)]
         hypervisor: Option<String>,
+        /// Guest kernel the template's sandboxes boot, by the node's name for
+        /// it (`burrow nodes kernels`). Defaults to the hypervisor's
+        /// default: the Firecracker CI kernel for Firecracker, Cloud
+        /// Hypervisor's own for Cloud Hypervisor.
+        #[arg(long)]
+        kernel: Option<String>,
     },
     /// Save a sandbox's state as a snapshot. The sandbox keeps running.
     Commit {
@@ -447,8 +453,14 @@ enum Command {
         #[arg(required = true)]
         ids: Vec<String>,
     },
-    /// Cold-boot a shut-down sandbox on its existing disks.
-    Boot { id: String },
+    /// Cold-boot a shut-down sandbox on its existing disks, and on its
+    /// template's current kernel.
+    Boot {
+        id: String,
+        /// Boot the kernel it last ran instead of its template's current one.
+        #[arg(long = "keep-kernel")]
+        is_kernel_kept: bool,
+    },
     /// Replace a sandbox's root disk, discarding everything written to it,
     /// while keeping its id, name and volumes.
     Recreate {
@@ -1683,6 +1695,12 @@ enum TemplatesCommand {
         /// to Cloud Hypervisor for a Windows image.
         #[arg(long)]
         hypervisor: Option<String>,
+        /// Guest kernel the template's sandboxes boot, by the node's name for
+        /// it (`burrow nodes kernels`). Defaults to the hypervisor's
+        /// default: the Firecracker CI kernel for Firecracker, Cloud
+        /// Hypervisor's own for Cloud Hypervisor.
+        #[arg(long)]
+        kernel: Option<String>,
     },
     /// Build a template: steps run on another template, or macOS installed
     /// from a restore image on a Mac node.
@@ -1704,6 +1722,10 @@ enum TemplatesCommand {
         /// template's, and to `vz` for --from-ipsw.
         #[arg(long)]
         hypervisor: Option<String>,
+        /// Guest kernel, by the node's name for it. Defaults to the base
+        /// template's.
+        #[arg(long, conflicts_with = "from_ipsw")]
+        kernel: Option<String>,
         /// vCPUs of the build machine. Defaults to 1 for Linux and the
         /// restore image's minimum for macOS.
         #[arg(long, default_value_t = 0)]
@@ -2007,6 +2029,9 @@ enum SecretCommand {
 enum NodesCommand {
     /// List registered nodes.
     Ls,
+    /// List the guest kernels each node builds templates with, and what each
+    /// has built in.
+    Kernels,
     /// Stop placing new sandboxes on a node. Refused while sandboxes on it
     /// hold public IPs, unless they are kept there.
     Drain {
@@ -2040,6 +2065,7 @@ async fn main() -> anyhow::Result<()> {
             println!("ok (orchestrator v{})", resp.version);
         }
         Command::Nodes(NodesCommand::Ls) => list_nodes(&mut client).await?,
+        Command::Nodes(NodesCommand::Kernels) => list_kernels(&mut client).await?,
         Command::Nodes(NodesCommand::Drain {
             node_id,
             suspend,
@@ -2128,7 +2154,8 @@ async fn main() -> anyhow::Result<()> {
             name,
             systemd,
             hypervisor,
-        } => import_template(&mut client, images, name, systemd, hypervisor).await?,
+            kernel,
+        } => import_template(&mut client, images, name, systemd, hypervisor, kernel).await?,
         Command::Commit {
             sandbox,
             expiration_secs,
@@ -2378,7 +2405,9 @@ async fn main() -> anyhow::Result<()> {
         Command::Stop { ids } => transition_each(&mut client, ids, Transition::Pause).await,
         Command::Start { id } => transition_timed(&mut client, id, Transition::Resume).await?,
         Command::Shutdown { ids } => transition_each(&mut client, ids, Transition::Stop).await,
-        Command::Boot { id } => transition_timed(&mut client, id, Transition::Start).await?,
+        Command::Boot { id, is_kernel_kept } => {
+            transition_timed(&mut client, id, Transition::Start { is_kernel_kept }).await?
+        }
         Command::Recreate {
             id,
             template,
@@ -2753,13 +2782,15 @@ async fn main() -> anyhow::Result<()> {
             name,
             systemd,
             hypervisor,
-        }) => import_template(&mut client, images, name, systemd, hypervisor).await?,
+            kernel,
+        }) => import_template(&mut client, images, name, systemd, hypervisor, kernel).await?,
         Command::Templates(TemplatesCommand::Build {
             name,
             from,
             from_ipsw,
             steps,
             hypervisor,
+            kernel,
             vcpus,
             mem_mib,
             disk_mib,
@@ -2774,6 +2805,7 @@ async fn main() -> anyhow::Result<()> {
                     .map(|run| api::BuildStep { run })
                     .collect(),
                 hypervisor: hypervisor.unwrap_or_default(),
+                kernel: kernel.unwrap_or_default(),
                 vcpus,
                 mem_mib,
                 disk_mib,
@@ -3519,21 +3551,32 @@ enum Transition {
     Pause,
     Resume,
     Stop,
-    Start,
+    Start { is_kernel_kept: bool },
 }
 
 impl Transition {
     async fn call(self, client: &mut Client, id: String) -> Result<common::Sandbox, tonic::Status> {
-        let id = api::SandboxRef { sandbox_id: id };
         let resp = match self {
-            Transition::Pause => client.pause_sandbox(id).await,
-            Transition::Resume => client.resume_sandbox(id).await,
-            Transition::Stop => client.stop_sandbox(id).await,
-            Transition::Start => {
+            Transition::Pause => {
+                client
+                    .pause_sandbox(api::SandboxRef { sandbox_id: id })
+                    .await
+            }
+            Transition::Resume => {
+                client
+                    .resume_sandbox(api::SandboxRef { sandbox_id: id })
+                    .await
+            }
+            Transition::Stop => {
+                client
+                    .stop_sandbox(api::SandboxRef { sandbox_id: id })
+                    .await
+            }
+            Transition::Start { is_kernel_kept } => {
                 client
                     .start_sandbox(api::StartSandboxRequest {
-                        sandbox_id: id.sandbox_id,
-                        is_kernel_kept: false,
+                        sandbox_id: id,
+                        is_kernel_kept,
                     })
                     .await
             }
@@ -4175,6 +4218,64 @@ async fn list_nodes(client: &mut Client) -> anyhow::Result<()> {
     Ok(())
 }
 
+async fn list_kernels(client: &mut Client) -> anyhow::Result<()> {
+    let resp = client
+        .list_nodes(api::ListNodesRequest {})
+        .await?
+        .into_inner();
+    print!("{}", kernel_table(&resp.nodes));
+    Ok(())
+}
+
+/// `nodes kernels`'s table, one row per kernel on each node. CAPABILITIES
+/// names what the kernel has built in, read from the image (FROM says how).
+fn kernel_table(nodes: &[api::Node]) -> String {
+    use std::fmt::Write as _;
+    let mut out = String::new();
+    let _ = writeln!(
+        out,
+        "{:<24} {:<16} {:<10} {:<12} {:<30} {:<40} {:<8} DIGEST",
+        "NODE", "KERNEL", "VERSION", "ARCH", "HYPERVISORS", "CAPABILITIES", "FROM"
+    );
+    for node in nodes {
+        let info = node.info.clone().unwrap_or_default();
+        for kernel in &info.kernels {
+            let caps = kernel.capabilities.unwrap_or_default();
+            let names: Vec<&str> = [
+                (caps.is_kvm_built_in, "kvm"),
+                (caps.is_virtio_mem_built_in, "virtio-mem"),
+                (caps.is_vsock_built_in, "vsock"),
+                (caps.is_virtio_blk_built_in, "virtio-blk"),
+                (caps.is_ext4_built_in, "ext4"),
+            ]
+            .into_iter()
+            .filter_map(|(has, name)| has.then_some(name))
+            .collect();
+            let hypervisors: Vec<String> = kernel
+                .hypervisors
+                .iter()
+                .map(|h| match kernel.default_for.contains(h) {
+                    true => format!("{h}*"),
+                    false => h.clone(),
+                })
+                .collect();
+            let _ = writeln!(
+                out,
+                "{:<24} {:<16} {:<10} {:<12} {:<30} {:<40} {:<8} {}",
+                truncate(&info.id, 24),
+                kernel.name,
+                kernel.version,
+                kernel.arch,
+                hypervisors.join(","),
+                names.join(","),
+                kernel.detected_from,
+                &kernel.digest[..kernel.digest.len().min(12)],
+            );
+        }
+    }
+    out
+}
+
 /// `node ls`'s table, one row per node.
 ///
 /// DISK is free over total on the node's data directory. A node whose free
@@ -4393,8 +4494,8 @@ async fn list_templates(client: &mut Client) -> anyhow::Result<()> {
         return Ok(());
     }
     println!(
-        "{:<24} {:>10}  {:<7}  {:<16}  WARM",
-        "TEMPLATE", "SIZE", "INIT", "HYPERVISOR"
+        "{:<24} {:>10}  {:<7}  {:<16}  {:<28}  WARM",
+        "TEMPLATE", "SIZE", "INIT", "HYPERVISOR", "KERNEL"
     );
     for template in resp.templates {
         let mut shapes: Vec<(u32, u32)> = template
@@ -4413,8 +4514,12 @@ async fn list_templates(client: &mut Client) -> anyhow::Result<()> {
                 .collect::<Vec<_>>()
                 .join(","),
         };
+        let kernel = match &template.kernel {
+            Some(kernel) => format!("{} {}", kernel.name, kernel.version),
+            None => "-".to_string(),
+        };
         println!(
-            "{:<24} {:>9}M  {:<7}  {:<16}  {}",
+            "{:<24} {:>9}M  {:<7}  {:<16}  {:<28}  {}",
             template.name,
             template.size_bytes / (1024 * 1024),
             if template.is_systemd {
@@ -4423,6 +4528,7 @@ async fn list_templates(client: &mut Client) -> anyhow::Result<()> {
                 "agent"
             },
             template.hypervisor,
+            kernel,
             warm,
         );
     }
@@ -4508,8 +4614,10 @@ async fn import_template(
     name: Option<String>,
     is_systemd: bool,
     hypervisor: Option<String>,
+    kernel: Option<String>,
 ) -> anyhow::Result<()> {
     let hypervisor = hypervisor.unwrap_or_default();
+    let kernel = kernel.unwrap_or_default();
     // One image converts as it is; several are a kit set, which the node
     // names after its digests unless told otherwise.
     let image = images.join(" + ");
@@ -4519,6 +4627,7 @@ async fn import_template(
             from_image,
             is_systemd,
             hypervisor,
+            kernel,
             ..Default::default()
         },
         Err(kits) => api::BuildTemplateRequest {
@@ -4526,6 +4635,7 @@ async fn import_template(
             kits,
             is_systemd,
             hypervisor,
+            kernel,
             ..Default::default()
         },
     };
@@ -4658,6 +4768,17 @@ fn print_config(sandbox: &common::Sandbox) {
         );
     }
     field("template", &sandbox.template);
+    if let Some(kernel) = &sandbox.kernel {
+        field(
+            "kernel",
+            &format!(
+                "{} {} ({})",
+                kernel.name,
+                kernel.version,
+                &kernel.digest[..kernel.digest.len().min(12)]
+            ),
+        );
+    }
     field("created", &rfc3339_from_unix_ms(sandbox.created_at_unix_ms));
     if !sandbox.guest_ip.is_empty() {
         field("address", &sandbox.guest_ip);
@@ -5652,6 +5773,11 @@ fn sandbox_json(sandbox: &common::Sandbox) -> String {
         "agent_unconfirmed": sandbox.is_agent_unconfirmed,
         "node": sandbox.node_id,
         "template": sandbox.template,
+        "kernel": sandbox.kernel.as_ref().map(|kernel| serde_json::json!({
+            "name": kernel.name,
+            "version": kernel.version,
+            "digest": kernel.digest,
+        })),
         "created_at": rfc3339_from_unix_ms(sandbox.created_at_unix_ms),
         "address": sandbox.guest_ip,
         "usage": {
