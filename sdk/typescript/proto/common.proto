@@ -74,6 +74,13 @@ message ResourcePolicy {
   // `cpus`, or up to its vcpus without a cap. 0.01 <= reserved_cpus <= cpus,
   // where set, <= vcpus; 0 is no reservation.
   double reserved_cpus = 10;
+  // Shows the guest the host's virtualization extensions, so it has a
+  // /dev/kvm and can run VMs of its own (QEMU, Firecracker, the Android
+  // emulator). Cloud Hypervisor on x86_64 only, placed only on nodes that
+  // report `is_nested_virt_supported`, and the guest kernel needs KVM built
+  // in. Fixed at create and kept by snapshots. Such a sandbox always boots
+  // cold: warm snapshots are taken without it.
+  bool is_nested_virt_enabled = 11;
 }
 
 // How long a sandbox stays paid for. All three are read by the same reaper on
@@ -807,6 +814,9 @@ message NodeInfo {
   // which a sandbox's `blkio_weight` needs. Placement passes over a node
   // without it for such a sandbox.
   bool is_io_weight_supported = 26;
+  // Whether the node runs Cloud Hypervisor on x86_64 with its KVM's nested
+  // virtualization on, which a sandbox's `is_nested_virt_enabled` needs.
+  bool is_nested_virt_supported = 27;
 }
 
 // What restoring a guest's saved memory needs of the CPU under it. A guest

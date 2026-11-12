@@ -40,6 +40,12 @@ pub(crate) fn spec(spec: VmSpec, config: FirecrackerConfig) -> crate::Result<Mic
             what: "boot anything but a kernel",
         });
     };
+    if spec.is_nested_virt_enabled {
+        return Err(crate::Error::Unsupported {
+            hypervisor: crate::Hypervisor::Firecracker,
+            what: "give a guest nested virtualization",
+        });
+    }
     Ok(MicroVmSpec {
         vm_id: spec.vm_id,
         workdir: spec.workdir,
@@ -686,6 +692,22 @@ impl MicroVm {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn nested_virtualization_is_refused() {
+        let config = FirecrackerConfig {
+            bin: "firecracker".into(),
+            jail: None,
+        };
+        let backend = crate::Backend::Firecracker(config.clone());
+        let mut vm = VmSpec::new("sbx_1", "/tmp/sbx_1", backend);
+        assert!(spec(vm.clone(), config.clone()).is_ok());
+        vm.is_nested_virt_enabled = true;
+        assert!(matches!(
+            spec(vm, config),
+            Err(crate::Error::Unsupported { .. })
+        ));
+    }
 
     /// A warm-created sandbox shares its snapshot files with the template by
     /// hard link. Writing a new snapshot through that link would publish the

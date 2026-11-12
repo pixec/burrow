@@ -350,6 +350,7 @@ def to_resources(resources: ResourcePolicy) -> common_pb2.ResourcePolicy:
         cpuset_cpus=resources.cpuset_cpus,
         blkio_weight=resources.blkio_weight,
         max_mem_mib=resources.max_memory_mib,
+        is_nested_virt_enabled=resources.nested_virt,
     )
 
 
@@ -365,6 +366,7 @@ def from_resources(raw: common_pb2.ResourcePolicy) -> ResourcePolicy:
         blkio_weight=raw.blkio_weight,
         max_memory_mib=raw.max_mem_mib,
         boot_memory_mib=raw.boot_mem_mib,
+        nested_virt=raw.is_nested_virt_enabled,
     )
 
 

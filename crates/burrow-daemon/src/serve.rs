@@ -672,6 +672,8 @@ fn local_node_info(args: &ServeArgs) -> anyhow::Result<NodeInfo> {
         // Filled in once the data directory has been probed.
         hole_probe: None,
         is_io_weight_supported: burrow_vmm::is_io_weight_supported(&args.cgroup_root),
+        // Filled in once the binaries have been looked for.
+        is_nested_virt_supported: false,
     })
 }
 
@@ -1441,6 +1443,10 @@ pub async fn run(args: ServeArgs) -> anyhow::Result<()> {
         })
         .collect();
     node_info.hypervisors = hypervisors.iter().map(|h| h.to_string()).collect();
+    node_info.is_nested_virt_supported = hypervisors
+        .iter()
+        .any(|h| burrow_vmm::HypervisorExt::capabilities(*h).is_nested_virt_supported)
+        && burrow_vmm::is_nested_virt_supported();
     node_info.cpu = crate::cpuid::host().fingerprint();
     node_info.hypervisor_versions = hypervisors
         .iter()
@@ -1544,6 +1550,7 @@ pub async fn run(args: ServeArgs) -> anyhow::Result<()> {
                 jail: args.cloud_hypervisor_jail()?,
             },
             hypervisors,
+            is_nested_virt_supported: node_info.is_nested_virt_supported,
             vmm_memory_overhead_mib,
             artifact_retention: Duration::from_secs(
                 u64::from(args.artifact_retention_days) * 24 * 60 * 60,

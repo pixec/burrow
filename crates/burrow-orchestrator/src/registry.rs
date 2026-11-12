@@ -41,6 +41,9 @@ pub struct Placement {
     /// a node without them can only refuse the VM its cgroup.
     pub cpuset_cpus: String,
     pub blkio_weight: u32,
+    /// The guest runs KVM itself, which needs a node that can give it the
+    /// extensions.
+    pub is_nested_virt_enabled: bool,
     pub mem_mib: u64,
     /// The disk it is promised, in bytes: its root disk. Checked against
     /// what the node reports with the node's own rule
@@ -299,8 +302,8 @@ pub fn missing_features(info: &NodeInfo, wanted: &[&'static str]) -> Vec<&'stati
 }
 
 /// Why `info`'s node cannot hold the host limits `want` pins: a
-/// `cpuset_cpus` naming a CPU it does not have, or a `blkio_weight` without
-/// cgroup io.weight. A node that has not reported its CPU count is not ruled
+/// `cpuset_cpus` naming a CPU it does not have, a `blkio_weight` without
+/// cgroup io.weight, or nested virtualization it cannot give. A node that has not reported its CPU count is not ruled
 /// out on its cpuset.
 pub fn host_limits_gap(info: &NodeInfo, want: &Placement) -> Option<String> {
     if !want.cpuset_cpus.is_empty()
@@ -320,6 +323,9 @@ pub fn host_limits_gap(info: &NodeInfo, want: &Placement) -> Option<String> {
             "has no cgroup io.weight for blkio_weight {}",
             want.blkio_weight
         ));
+    }
+    if want.is_nested_virt_enabled && !info.is_nested_virt_supported {
+        return Some("cannot give a guest nested virtualization".to_string());
     }
     None
 }
@@ -2670,6 +2676,32 @@ mod tests {
         let text = err.to_string();
         assert!(text.contains("small has CPUs 0-1"), "{text}");
         assert!(text.contains("large has no cgroup io.weight"), "{text}");
+    }
+
+    /// A guest that runs KVM itself goes only to a node that reports it can
+    /// pass the extensions through.
+    #[test]
+    fn nested_virtualization_goes_only_where_the_node_offers_it() {
+        let registry = registry(&[
+            ("plain", status(&["t"], &[], 1_000)),
+            ("nested", status(&["t"], &[], 64_000)),
+        ]);
+        let nested = Placement {
+            template: "t".into(),
+            is_nested_virt_enabled: true,
+            ..Default::default()
+        };
+        let err = registry.place_for(&nested).unwrap_err();
+        assert!(err.to_string().contains("nested virtualization"), "{err}");
+        registry
+            .nodes
+            .lock()
+            .unwrap()
+            .get_mut("nested")
+            .unwrap()
+            .info
+            .is_nested_virt_supported = true;
+        assert_eq!(registry.place_for(&nested).unwrap(), "nested");
     }
 
     /// A sandbox with a reservation is charged it, not its vCPUs or its cap:

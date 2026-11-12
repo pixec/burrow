@@ -139,6 +139,7 @@ impl HypervisorExt for Hypervisor {
                 is_live_disk_growth_supported: true,
                 is_vcpu_hotplug_supported: false,
                 is_memory_hotplug_supported: true,
+                is_nested_virt_supported: false,
             },
             // Cloud Hypervisor copies guest memory in at restore, and its
             // own on-demand mode cannot be pointed at burrow's page-fault
@@ -157,6 +158,7 @@ impl HypervisorExt for Hypervisor {
                 // refuses one created after with EBUSY.
                 is_vcpu_hotplug_supported: cfg!(target_arch = "x86_64"),
                 is_memory_hotplug_supported: true,
+                is_nested_virt_supported: cfg!(target_arch = "x86_64"),
             },
             // The framework saves a machine as one opaque file, reads it back
             // itself and attaches storage only at configuration time.
@@ -175,6 +177,7 @@ impl HypervisorExt for Hypervisor {
                 // A running machine's memory can only be ballooned below what
                 // it was configured with, never raised.
                 is_memory_hotplug_supported: false,
+                is_nested_virt_supported: false,
             },
         }
     }
@@ -236,12 +239,32 @@ pub struct Capabilities {
     /// unplugged from it while it runs ([`Vm::resize_memory`]). The guest
     /// kernel needs `CONFIG_VIRTIO_MEM`.
     pub is_memory_hotplug_supported: bool,
+    /// A guest can be shown the host's virtualization extensions and run
+    /// KVM itself ([`VmSpec::is_nested_virt_enabled`]). Firecracker masks
+    /// them out of every guest's CPUID.
+    pub is_nested_virt_supported: bool,
 }
 
 impl Capabilities {
     pub fn runs(&self, os: GuestOs) -> bool {
         self.guest_oses.contains(&os)
     }
+}
+
+/// Whether this host's KVM lets a guest run KVM itself: `kvm_amd` or
+/// `kvm_intel` loaded with `nested` on, which a node that is itself a VM has
+/// only where its own host passes the extensions through.
+pub fn is_nested_virt_supported() -> bool {
+    ["kvm_amd", "kvm_intel"].iter().any(|module| {
+        std::fs::read_to_string(format!("/sys/module/{module}/parameters/nested"))
+            .is_ok_and(|value| is_on(&value))
+    })
+}
+
+/// A KVM module parameter's reading: `kvm_amd` prints an int, `kvm_intel` a
+/// bool.
+fn is_on(value: &str) -> bool {
+    matches!(value.trim(), "1" | "Y")
 }
 
 /// Where a snapshot's two halves live in a VM's working directory.
@@ -378,6 +401,12 @@ pub struct VmSpec {
     /// harness: output reaches the console log only while the VM's handle is
     /// alive to copy it there.
     pub is_console_interactive: bool,
+    /// Shows the guest the host's virtualization extensions (SVM or VMX), so
+    /// it gets a `/dev/kvm` of its own. Only where
+    /// [`Capabilities::is_nested_virt_supported`], on a host whose KVM has
+    /// nesting on ([`is_nested_virt_supported`]); the guest kernel needs
+    /// `CONFIG_KVM_AMD` or `CONFIG_KVM_INTEL`.
+    pub is_nested_virt_enabled: bool,
 }
 
 impl VmSpec {
@@ -407,6 +436,7 @@ impl VmSpec {
             cgroup_root: Some(PathBuf::from("/sys/fs/cgroup")),
             is_limits_required: false,
             is_console_interactive: false,
+            is_nested_virt_enabled: false,
         }
     }
 
@@ -788,6 +818,14 @@ impl Vm {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn nesting_reads_on_from_either_kvm_module() {
+        assert!(is_on("1\n"));
+        assert!(is_on("Y\n"));
+        assert!(!is_on("0\n"));
+        assert!(!is_on("N\n"));
+    }
 
     #[test]
     fn names_round_trip_and_an_empty_record_is_refused() {

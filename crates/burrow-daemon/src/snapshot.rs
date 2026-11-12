@@ -91,6 +91,10 @@ pub struct Manifest {
     /// What the VM booted with, of `mem_mib`, and what it could grow to.
     pub boot_mem_mib: u32,
     pub max_mem_mib: u32,
+    /// The guest was shown the host's virtualization extensions, and its
+    /// restore must be too.
+    #[serde(default)]
+    pub is_nested_virt_enabled: bool,
     /// Unix milliseconds. Retention evicts the oldest first, and two
     /// snapshots taken inside one second would otherwise be ordered
     /// arbitrarily, by their random ids.
@@ -152,6 +156,7 @@ impl Manifest {
             disk_mib: self.disk_mib,
             max_mem_mib: self.max_mem_mib,
             boot_mem_mib: self.boot_mem_mib,
+            is_nested_virt_enabled: self.is_nested_virt_enabled,
             ..base
         }
     }
@@ -305,6 +310,7 @@ pub struct Staged {
     pub mem_mib: u32,
     pub boot_mem_mib: u32,
     pub max_mem_mib: u32,
+    pub is_nested_virt_enabled: bool,
     pub disk_mib: u32,
     pub hypervisor: burrow_vmm::Hypervisor,
     /// Memory files in the staging directory, oldest first.
@@ -389,6 +395,7 @@ impl SnapshotStore {
             mem_mib: staged.mem_mib,
             boot_mem_mib: staged.boot_mem_mib,
             max_mem_mib: staged.max_mem_mib,
+            is_nested_virt_enabled: staged.is_nested_virt_enabled,
             disk_mib: staged.disk_mib,
             created_unix_ms: burrow_common::unix_now_ms(),
             size_bytes,
@@ -1326,6 +1333,7 @@ mod tests {
             mem_mib: 3072,
             boot_mem_mib: 1024,
             max_mem_mib: 16384,
+            is_nested_virt_enabled: false,
             disk_mib: 2048,
             created_unix_ms: burrow_common::unix_from_rfc3339(created_at).unwrap_or(0) * 1_000,
             size_bytes: 12_345,
@@ -1361,6 +1369,7 @@ mod tests {
         let mut written = manifest("snap_abc123", "sbx_a", "2026-09-02T10:00:00Z");
         written.expires_at_ms = 1_800_000_000_000;
         written.expiration_secs = 3_600;
+        written.is_nested_virt_enabled = true;
         write_manifest(&dir, &written).await.unwrap();
 
         let read = read_manifest(&dir).await.expect("a manifest");
@@ -1368,6 +1377,7 @@ mod tests {
         assert_eq!(read.sandbox_id, "sbx_a");
         assert_eq!((read.vcpus, read.mem_mib, read.disk_mib), (2, 3072, 2048));
         assert_eq!((read.boot_mem_mib, read.max_mem_mib), (1024, 16384));
+        assert!(read.resources(Default::default()).is_nested_virt_enabled);
         assert_eq!(read.expires_at_ms, 1_800_000_000_000);
         assert_eq!(read.expiration_secs, 3_600);
 
@@ -1660,6 +1670,7 @@ mod tests {
             mem_mib: 512,
             boot_mem_mib: 512,
             max_mem_mib: 512,
+            is_nested_virt_enabled: false,
             disk_mib: 1024,
             hypervisor: burrow_vmm::Hypervisor::Firecracker,
             chain: vec![memory.to_string()],

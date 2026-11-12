@@ -156,6 +156,9 @@ pub struct NodeConfig {
     /// The hypervisors this node offers, as it advertises them. A template or
     /// sandbox needing another is refused.
     pub hypervisors: Vec<Hypervisor>,
+    /// Whether a guest here can be given nested virtualization: a hypervisor
+    /// that can show it the extensions, on a KVM with nesting on.
+    pub is_nested_virt_supported: bool,
     /// Host memory each hypervisor's VMM is allowed beyond its guest
     /// (`--vmm-memory-overhead-mib`); one not named gets its default.
     pub vmm_memory_overhead_mib: HashMap<Hypervisor, u32>,
@@ -1357,6 +1360,18 @@ impl RunningSandbox {
         max.max(self.mem_mib())
     }
 
+    /// Whether the guest was shown the host's virtualization extensions,
+    /// which its snapshots keep.
+    pub fn is_nested_virt_enabled(&self) -> bool {
+        self.base_record
+            .lock()
+            .unwrap()
+            .policy
+            .as_ref()
+            .and_then(|policy| policy.resources.as_ref())
+            .is_some_and(|resources| resources.is_nested_virt_enabled)
+    }
+
     /// Marks the sandbox as used, deferring idle suspension.
     pub fn touch(&self) {
         self.last_activity.store(
@@ -2277,6 +2292,7 @@ impl RunningSandbox {
             mem_mib: self.mem_mib(),
             boot_mem_mib: self.boot_mem_mib(),
             max_mem_mib: self.max_mem_mib(),
+            is_nested_virt_enabled: self.is_nested_virt_enabled(),
             disk_mib: size_mib(&dest.join(crate::rootdisk::ROOT_DISK)),
             chain,
             inspection_root: self
@@ -2934,6 +2950,33 @@ impl SandboxManager {
         Err(Status::failed_precondition(format!(
             "this node does not run {hypervisor}; start burrowd with --hypervisors including it"
         )))
+    }
+
+    /// Refuses nested virtualization where the guest could not be given it:
+    /// under a hypervisor that masks the extensions, or on a node whose KVM
+    /// has nesting off.
+    fn require_nested_virt(
+        &self,
+        hypervisor: Hypervisor,
+        resources: &common::ResourcePolicy,
+    ) -> Result<(), Status> {
+        if !resources.is_nested_virt_enabled {
+            return Ok(());
+        }
+        if !hypervisor.capabilities().is_nested_virt_supported {
+            return Err(Status::failed_precondition(format!(
+                "{hypervisor} on {} cannot give a guest nested virtualization; it needs Cloud \
+                 Hypervisor on x86_64",
+                std::env::consts::ARCH
+            )));
+        }
+        if !self.config.is_nested_virt_supported {
+            return Err(Status::failed_precondition(
+                "this node cannot give a guest nested virtualization: its KVM has nesting off \
+                 (kvm_amd or kvm_intel nested=1) or it runs no Cloud Hypervisor",
+            ));
+        }
+        Ok(())
     }
 
     pub fn is_draining(&self) -> bool {
@@ -6697,6 +6740,7 @@ impl SandboxManager {
             });
         }
         spec.is_vsock_enabled = true;
+        spec.is_nested_virt_enabled = resources.is_nested_virt_enabled;
         spec.net = Some(NetSpec {
             tap: tap_name.to_string(),
             guest_mac: Some(lease.guest_mac()),
@@ -6788,8 +6832,11 @@ impl SandboxManager {
         // A create of a shape with no warm snapshot is exactly the signal that
         // one is worth building, so the next create of it restores. Not for a
         // backend whose restore loses to its boot.
-        let is_warmable =
-            machine.is_ok_and(|(hypervisor, _)| hypervisor.capabilities().is_warm_pool_supported);
+        // Warm snapshots are taken without nested virtualization, which a
+        // restore cannot add, so a nested sandbox always boots.
+        let is_warmable = !resources.is_nested_virt_enabled
+            && machine
+                .is_ok_and(|(hypervisor, _)| hypervisor.capabilities().is_warm_pool_supported);
         if is_warmable {
             self.warm_for_demand(&ShapeKey::of(&template, &resources));
         }
@@ -7016,6 +7063,10 @@ impl SandboxManager {
         let environment = self.image_environment(&template).await;
         let (hypervisor, guest_os) = environment.machine()?;
         self.require_hypervisor(hypervisor)?;
+        self.require_nested_virt(
+            hypervisor,
+            policy.resources.as_ref().unwrap_or(&Default::default()),
+        )?;
         let capabilities = hypervisor.capabilities();
         if !capabilities.runs(guest_os) {
             return Err(Status::failed_precondition(format!(
@@ -7086,6 +7137,7 @@ impl SandboxManager {
         let wanted = crate::warm::Shape::wanted(&resources);
         let is_warmable = seed_disk.is_none()
             && !policy.is_console_verbose
+            && !resources.is_nested_virt_enabled
             && capabilities.is_warm_pool_supported
             && (capabilities.is_drive_hotplug_supported
                 || crate::volume::block_mounts(&policy.volumes)
@@ -8003,6 +8055,7 @@ impl SandboxManager {
         let capabilities = hypervisor.capabilities();
         let workdir = self.config.sandbox_dir(&id, hypervisor);
         let mut resources = policy.resources.clone().unwrap_or_default();
+        self.require_nested_virt(hypervisor, &resources)?;
         // A restored sandbox gets a disk of its source's size, provisioned
         // like a created one's. An adopt is charged here too, after its claim
         // in the store, which a refusal hands back.
@@ -9041,6 +9094,7 @@ impl SandboxManager {
             mem_mib: sandbox.mem_mib(),
             boot_mem_mib: sandbox.boot_mem_mib(),
             max_mem_mib: sandbox.max_mem_mib(),
+            is_nested_virt_enabled: sandbox.is_nested_virt_enabled(),
             disk_mib: size_mib(&sandbox.disk_path()),
             is_systemd,
             arch: std::env::consts::ARCH.to_string(),
@@ -10707,6 +10761,7 @@ pub(crate) mod tests {
                     jail: None,
                 },
                 hypervisors: vec![Hypervisor::Firecracker],
+                is_nested_virt_supported: false,
                 vmm_memory_overhead_mib: HashMap::new(),
                 artifact_retention: std::time::Duration::from_secs(7 * 24 * 60 * 60),
                 control_plane: Vec::new(),
@@ -10742,6 +10797,38 @@ pub(crate) mod tests {
     }
 
     /// A manager whose data directory is its own, for recovery tests.
+    /// Firecracker never shows a guest SVM or VMX, and Cloud Hypervisor can
+    /// only where the node's KVM nests.
+    #[tokio::test]
+    async fn nested_virtualization_is_refused_where_it_cannot_be_given() {
+        let mut manager = manager().await;
+        let nested = common::ResourcePolicy {
+            is_nested_virt_enabled: true,
+            ..Default::default()
+        };
+        assert!(
+            manager
+                .require_nested_virt(Hypervisor::CloudHypervisor, &Default::default())
+                .is_ok()
+        );
+        let err = manager
+            .require_nested_virt(Hypervisor::Firecracker, &nested)
+            .unwrap_err();
+        assert_eq!(err.code(), tonic::Code::FailedPrecondition);
+        assert!(err.message().contains("needs Cloud Hypervisor on x86_64"));
+        let err = manager
+            .require_nested_virt(Hypervisor::CloudHypervisor, &nested)
+            .unwrap_err();
+        let why = match cfg!(target_arch = "x86_64") {
+            true => "nesting off",
+            false => "needs Cloud Hypervisor on x86_64",
+        };
+        assert!(err.message().contains(why), "{}", err.message());
+        manager.config.is_nested_virt_supported = true;
+        let supported = manager.require_nested_virt(Hypervisor::CloudHypervisor, &nested);
+        assert_eq!(supported.is_ok(), cfg!(target_arch = "x86_64"));
+    }
+
     async fn recovering(name: &str) -> (SandboxManager, PathBuf) {
         let data_dir =
             std::env::temp_dir().join(format!("burrow-recovery-{name}-{}", std::process::id()));

@@ -877,6 +877,11 @@ struct CreateFlags {
     /// resources --disk-mib`.
     #[arg(long = "disk-mib")]
     disk_mib: Option<u32>,
+    /// Give the guest a /dev/kvm of its own, to run QEMU, Firecracker or the
+    /// Android emulator inside. Cloud Hypervisor templates on x86_64 nodes
+    /// with nested virtualization only; the sandbox always boots cold.
+    #[arg(long = "nested-virt")]
+    is_nested_virt_enabled: bool,
     #[command(flatten)]
     limits: HostLimitFlags,
     /// Destroy the sandbox this many seconds after it is created.
@@ -968,6 +973,7 @@ impl CreateFlags {
             || self.mem_mib.is_some()
             || self.max_mem_mib.is_some()
             || self.disk_mib.is_some()
+            || self.is_nested_virt_enabled
             || self.limits.is_stated()
             || self.max_lifetime_secs != 0
             || self.idle_suspend_secs != 0
@@ -1608,6 +1614,9 @@ fn host_limits_text(resources: &common::ResourcePolicy) -> String {
     }
     if resources.blkio_weight > 0 {
         parts.push(format!("blkio-weight {}", resources.blkio_weight));
+    }
+    if resources.is_nested_virt_enabled {
+        parts.push("nested-virt".to_string());
     }
     parts.join(", ")
 }
@@ -3405,6 +3414,7 @@ fn create_request(flags: CreateFlags) -> anyhow::Result<api::CreateSandboxReques
         mem_mib,
         max_mem_mib,
         disk_mib,
+        is_nested_virt_enabled,
         limits,
         max_lifetime_secs,
         idle_suspend_secs,
@@ -3450,6 +3460,7 @@ fn create_request(flags: CreateFlags) -> anyhow::Result<api::CreateSandboxReques
                 cpuset_cpus: limits.cpuset_cpus.unwrap_or_default(),
                 blkio_weight: limits.blkio_weight.unwrap_or(0),
                 max_mem_mib: max_mem_mib.unwrap_or(0),
+                is_nested_virt_enabled,
                 ..Default::default()
             }),
             lifetime: Some(common::LifetimePolicy {
@@ -5652,6 +5663,7 @@ fn sandbox_json(sandbox: &common::Sandbox) -> String {
             "cpu_shares": resources.cpu_shares,
             "cpuset_cpus": resources.cpuset_cpus,
             "blkio_weight": resources.blkio_weight,
+            "nested_virt": resources.is_nested_virt_enabled,
         },
         "lifetime": {
             "max_lifetime_secs": lifetime.max_lifetime_secs,
@@ -6800,6 +6812,7 @@ mod tests {
                 mem_mib: None,
                 max_mem_mib: None,
                 disk_mib: None,
+                is_nested_virt_enabled: false,
                 limits: Default::default(),
                 snapshot_expiration_secs: 0,
                 keep_last_snapshots: 0,

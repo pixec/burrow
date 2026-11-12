@@ -49,6 +49,9 @@ class ResourcePolicy:
     # default, 16 times `memory_mib` within the node's limit; set to
     # `memory_mib`, the sandbox gets no room to grow.
     max_memory_mib: int = 0
+    # Give the guest a /dev/kvm of its own (Cloud Hypervisor on x86_64, on a
+    # node with nested virtualization). Fixed at create; always boots cold.
+    nested_virt: bool = False
     # Set by the node: what the sandbox's VM booted with, which a running
     # guest's memory cannot shrink below. Ignored on a create.
     boot_memory_mib: int = 0

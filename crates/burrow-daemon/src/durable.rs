@@ -101,6 +101,9 @@ pub struct Manifest {
     /// What the VM booted with, of `mem_mib`, and what it could grow to.
     pub boot_mem_mib: u32,
     pub max_mem_mib: u32,
+    /// See [`crate::snapshot::Manifest::is_nested_virt_enabled`].
+    #[serde(default)]
+    pub is_nested_virt_enabled: bool,
     pub is_systemd: bool,
     pub arch: String,
     /// The version of `hypervisor` that wrote the state.
@@ -174,6 +177,7 @@ impl Manifest {
             disk_mib: self.disk_mib,
             max_mem_mib: self.max_mem_mib,
             boot_mem_mib: self.boot_mem_mib,
+            is_nested_virt_enabled: self.is_nested_virt_enabled,
             ..base
         }
     }
@@ -1199,6 +1203,7 @@ mod tests {
             mem_mib: 512,
             boot_mem_mib: 512,
             max_mem_mib: 8192,
+            is_nested_virt_enabled: false,
             disk_mib: 1024,
             is_systemd: false,
             arch: "aarch64".into(),

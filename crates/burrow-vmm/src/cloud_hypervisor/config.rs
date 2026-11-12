@@ -144,6 +144,15 @@ pub(crate) fn vm_config(
             }
         }
     }
+    if spec.is_nested_virt_enabled {
+        if arch != "x86_64" {
+            return Err(Error::Unsupported {
+                hypervisor: Hypervisor::CloudHypervisor,
+                what: "give a guest nested virtualization on this architecture",
+            });
+        }
+        vm["cpus"]["nested"] = json!(true);
+    }
     if spec.guest_os == GuestOs::Windows {
         vm["tpm"] = json!({ "socket": TPM_SOCK });
         if arch == "x86_64" {
@@ -204,6 +213,20 @@ pub(crate) fn retarget(snapshot: &mut Value, spec: &VmSpec) -> Result<()> {
                 snapshot[device]["file"]
             )));
         }
+    }
+    // The guest's CPUID is in the snapshot: it was shown SVM or VMX or it
+    // was not, whatever the restoring VM asks for.
+    let is_nested = snapshot["cpus"]["nested"].as_bool().unwrap_or(false);
+    if is_nested != spec.is_nested_virt_enabled {
+        return Err(Error::Snapshot(format!(
+            "the snapshot's guest {} nested virtualization and this VM {}",
+            if is_nested { "has" } else { "does not have" },
+            if spec.is_nested_virt_enabled {
+                "asks for it"
+            } else {
+                "does not"
+            }
+        )));
     }
     if let (Some(net), Some(nics)) = (&spec.net, snapshot["net"].as_array_mut()) {
         for nic in nics.iter_mut().filter(|nic| nic["id"] == NET_ID) {
@@ -401,6 +424,28 @@ mod tests {
 
         let x86 = vm_config(&windows, &config(), "x86_64").unwrap();
         assert_eq!(x86["cpus"]["kvm_hyperv"], true);
+    }
+
+    /// Cloud Hypervisor masks SVM and VMX unless told otherwise, and a
+    /// restore cannot change what the guest was shown.
+    #[test]
+    fn nested_virtualization_is_asked_for_and_kept_across_a_restore() {
+        assert_eq!(
+            vm_config(&spec(), &config(), "x86_64").unwrap()["cpus"].get("nested"),
+            None
+        );
+        let mut nested = spec();
+        nested.is_nested_virt_enabled = true;
+        let mut snapshot = vm_config(&nested, &config(), "x86_64").unwrap();
+        assert_eq!(snapshot["cpus"]["nested"], true);
+        assert!(vm_config(&nested, &config(), "aarch64").is_err());
+        retarget(&mut snapshot, &nested).unwrap();
+        assert!(matches!(
+            retarget(&mut snapshot, &spec()),
+            Err(Error::Snapshot(_))
+        ));
+        let mut plain = vm_config(&spec(), &config(), "x86_64").unwrap();
+        assert!(retarget(&mut plain, &nested).is_err());
     }
 
     #[test]

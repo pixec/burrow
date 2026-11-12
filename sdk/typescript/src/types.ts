@@ -244,6 +244,11 @@ export interface ResourceOptions {
    * `memoryMib`, the sandbox gets no room to grow.
    */
   maxMemoryMib?: number;
+  /**
+   * Give the guest a /dev/kvm of its own (Cloud Hypervisor on x86_64, on a
+   * node with nested virtualization). Fixed at create; always boots cold.
+   */
+  nestedVirt?: boolean;
 }
 
 export type ResourcePolicy = Required<ResourceOptions> & {

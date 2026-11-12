@@ -431,6 +431,7 @@ export function toResourcePolicy(options: ResourceOptions = {}): any {
     cpusetCpus: options.cpusetCpus ?? "",
     blkioWeight: options.blkioWeight ?? 0,
     maxMemMib: options.maxMemoryMib ?? 0,
+    isNestedVirtEnabled: options.nestedVirt ?? false,
   };
 }
 
@@ -446,6 +447,7 @@ export function fromResourcePolicy(raw: any): ResourcePolicy {
     blkioWeight: Number(raw?.blkioWeight ?? 0),
     maxMemoryMib: Number(raw?.maxMemMib ?? 0),
     bootMemoryMib: Number(raw?.bootMemMib ?? 0),
+    nestedVirt: Boolean(raw?.isNestedVirtEnabled),
   };
 }
 

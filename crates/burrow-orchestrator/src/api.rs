@@ -503,6 +503,7 @@ impl ApiService {
                 .map(|r| r.cpuset_cpus.clone())
                 .unwrap_or_default(),
             blkio_weight: resources.as_ref().map_or(0, |r| r.blkio_weight),
+            is_nested_virt_enabled: resources.as_ref().is_some_and(|r| r.is_nested_virt_enabled),
             mem_mib: match resources.as_ref().map(|r| r.mem_mib).unwrap_or(0) {
                 0 => 512,
                 mem => mem as u64,
@@ -1366,6 +1367,10 @@ impl ApiService {
                     cpu: snapshot.cpu.clone(),
                     hypervisor: snapshot.hypervisor.clone(),
                     disk_bytes: crate::registry::disk_bytes(snapshot.resources.as_ref()),
+                    is_nested_virt_enabled: snapshot
+                        .resources
+                        .as_ref()
+                        .is_some_and(|r| r.is_nested_virt_enabled),
                     // A sandbox taking the snapshot's own policy carries
                     // fields the orchestrator never sees, so the node
                     // restoring it elsewhere has to enforce ingress, unless
@@ -1885,6 +1890,7 @@ impl ApiService {
             reserved_cpus: resources.reserved_cpus,
             cpuset_cpus: resources.cpuset_cpus.clone(),
             blkio_weight: resources.blkio_weight,
+            is_nested_virt_enabled: resources.is_nested_virt_enabled,
             mem_mib: match resources.mem_mib {
                 0 => 512,
                 mem => mem as u64,
@@ -2925,6 +2931,7 @@ impl Burrow for ApiService {
             reserved_cpus: 0.0,
             cpuset_cpus: String::new(),
             blkio_weight: 0,
+            is_nested_virt_enabled: false,
             mem_mib: 0,
             // A volume's image is the volume's, which disk admission does
             // not count yet.
