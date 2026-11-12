@@ -908,6 +908,52 @@ pub async fn collect_garbage(
 mod tests {
     use super::*;
 
+    /// A chunk still on its base's blocks takes the base's digest without
+    /// being read: the base here names a digest no bytes hash to, and only a
+    /// chunk that was read would have replaced it. One the disk rewrote is
+    /// read and hashed.
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn an_unchanged_chunk_keeps_its_digest_unread() {
+        let store = crate::objstore::fake::store(true).await;
+        let dir = std::env::temp_dir().join(format!("burrow-unread-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let disk = dir.join("disk");
+        let file = std::fs::File::create(&disk).unwrap();
+        file.set_len(4 * CHUNK_SIZE).unwrap();
+        for n in 0..3u64 {
+            file.write_all_at(&[n as u8 + 1; 8192], n * CHUNK_SIZE)
+                .unwrap();
+        }
+        file.sync_all().unwrap();
+        let base = dir.join("base");
+        if crate::rootdisk::clone_blocking(&disk, &base).unwrap() != crate::rootdisk::Made::Clone {
+            eprintln!("skipped: {} cannot reflink", dir.display());
+            return;
+        }
+        let carried = ImageIndex {
+            size: 4 * CHUNK_SIZE,
+            chunk_size: CHUNK_SIZE,
+            chunks: (0..3).map(|n| (n, format!("carried-{n}"))).collect(),
+        };
+        file.write_all_at(&[9; 4096], CHUNK_SIZE).unwrap();
+        file.sync_all().unwrap();
+
+        let index = put_disk_since(&store, &disk, Some((&base, &carried)), &HashSet::new())
+            .await
+            .unwrap();
+        assert_eq!(index.chunks[&0], "carried-0");
+        assert_eq!(index.chunks[&2], "carried-2");
+        let mut rewritten = vec![2u8; 8192];
+        rewritten[..4096].fill(9);
+        rewritten.resize(CHUNK_SIZE as usize, 0);
+        assert_eq!(index.chunks[&1], digest_of(&rewritten));
+        assert!(!index.chunks.contains_key(&3));
+        assert!(store.exists(&chunk_key(&index.chunks[&1])).await.unwrap());
+        assert!(!store.exists(&chunk_key("carried-0")).await.unwrap());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     #[test]
     fn zero_pages_are_left_as_holes() {
         let dir = std::env::temp_dir().join(format!("burrow-chunks-{}", std::process::id()));
