@@ -6,10 +6,19 @@
 //! `AWS_ACCESS_KEY_ID` and `AWS_SECRET_ACCESS_KEY`, the way every S3 tool
 //! reads them; the endpoint is always addressed path-style, which every
 //! self-hosted store supports and which a bucket name with a dot needs.
+//!
+//! Every request is retried on throttling (S3's `503 SlowDown`) and on
+//! transient failures, with exponential backoff and jitter. Standard mode
+//! rather than adaptive: adaptive's rate limiter, measuring a node that has
+//! sent little, held a cold upload to a request every several seconds after
+//! one throttle. The bounds on chunk uploads keep the pressure down instead.
 
 use std::path::Path;
+use std::sync::Arc;
+use std::time::Duration;
 
 use aws_sdk_s3::Client;
+use aws_sdk_s3::config::retry::{RetryConfig, RetryPartition, TokenBucket};
 use aws_sdk_s3::config::{BehaviorVersion, Credentials, Region};
 use aws_sdk_s3::error::SdkError;
 use aws_sdk_s3::operation::create_bucket::CreateBucketError;
@@ -27,14 +36,36 @@ pub struct ObjectStore {
     bucket: String,
     /// Key prefix inside the bucket, empty or ending in `/`.
     prefix: String,
+    /// Chunk puts in flight on this node, across every upload.
+    uploads: Arc<tokio::sync::Semaphore>,
+    /// Chunk puts one upload keeps in flight.
+    upload_parallelism: usize,
+    /// The first wait before an upload that failed whole is tried again.
+    requeue_after: Duration,
 }
 
-/// Where the store is, from the flags: `s3://bucket/prefix` and an endpoint.
+/// Where the store is, from the flags: `s3://bucket/prefix` and an endpoint,
+/// and how hard to push it.
 pub struct Options {
     pub url: String,
     pub endpoint: String,
     pub region: String,
+    /// Tries per request before it fails.
+    pub attempts: u32,
+    /// Chunk puts in flight on this node.
+    pub uploads: usize,
+    /// Chunk puts in flight per upload, which is per sandbox.
+    pub uploads_per_sandbox: usize,
 }
+
+/// The SDK's backoff between tries: full jitter over a cap that starts here
+/// and doubles up to [`MAX_BACKOFF`].
+const INITIAL_BACKOFF: Duration = Duration::from_millis(200);
+const MAX_BACKOFF: Duration = Duration::from_secs(20);
+
+/// Between tries of an upload that failed whole, doubling up to the cap.
+const REQUEUE_AFTER: Duration = Duration::from_secs(30);
+const MAX_REQUEUE_AFTER: Duration = Duration::from_secs(600);
 
 impl ObjectStore {
     pub fn open(options: &Options) -> anyhow::Result<Self> {
@@ -89,6 +120,20 @@ impl ObjectStore {
                 aws_sdk_s3::config::ResponseChecksumValidation::WhenRequired,
             )
             .http_client(http)
+            .retry_config(
+                RetryConfig::standard()
+                    .with_max_attempts(options.attempts.max(1))
+                    .with_initial_backoff(INITIAL_BACKOFF)
+                    .with_max_backoff(MAX_BACKOFF),
+            )
+            // Without a retry quota: the default one runs dry in a burst of
+            // throttled chunk puts, which is when retries are needed most.
+            // Attempts and the upload bounds limit them instead.
+            .retry_partition(
+                RetryPartition::custom(format!("burrow {}", options.endpoint))
+                    .token_bucket(TokenBucket::unlimited())
+                    .build(),
+            )
             .sleep_impl(aws_sdk_s3::config::SharedAsyncSleep::new(
                 aws_smithy_async::rt::sleep::TokioSleep::new(),
             ))
@@ -102,7 +147,37 @@ impl ObjectStore {
             } else {
                 format!("{prefix}/")
             },
+            uploads: Arc::new(tokio::sync::Semaphore::new(options.uploads.max(1))),
+            upload_parallelism: options.uploads_per_sandbox.max(1),
+            requeue_after: REQUEUE_AFTER,
         }
+    }
+
+    /// Chunk puts one upload keeps in flight.
+    pub fn upload_parallelism(&self) -> usize {
+        self.upload_parallelism
+    }
+
+    /// How long to wait before the `attempt`th retry of an upload that failed
+    /// whole: doubling from the first, capped, with jitter.
+    pub fn requeue_delay(&self, attempt: u32) -> Duration {
+        let cap = self
+            .requeue_after
+            .saturating_mul(1 << attempt.saturating_sub(1).min(16))
+            .min(MAX_REQUEUE_AFTER.max(self.requeue_after));
+        let jitter = (uuid::Uuid::new_v4().as_u128() % 1000) as f64 / 2000.0;
+        cap.mul_f64(0.5 + jitter)
+    }
+
+    /// Puts a chunk, holding one of the node's upload slots while it is sent
+    /// and retried.
+    pub async fn put_chunk(&self, key: &str, bytes: Vec<u8>) -> Result<(), Status> {
+        let _slot = self
+            .uploads
+            .acquire()
+            .await
+            .expect("the upload semaphore is never closed");
+        self.put_bytes(key, bytes).await
     }
 
     /// Creates the bucket if the store does not have it. Self-hosted stores
@@ -452,9 +527,10 @@ impl ObjectStore {
 pub(crate) mod fake {
     //! An S3 server of objects in a map, enough of one for the SDK: get,
     //! head, put (conditional or not), delete and a one-page listing, over
-    //! HTTP/1.1.
+    //! HTTP/1.1. Puts can be throttled, as S3 throttles them with `SlowDown`.
 
     use std::collections::HashMap;
+    use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::{Arc, Mutex};
 
     use tokio::io::{AsyncBufReadExt as _, AsyncReadExt as _, AsyncWriteExt as _, BufReader};
@@ -467,24 +543,63 @@ pub(crate) mod fake {
         versions: u64,
     }
 
+    /// What the store does to puts.
+    #[derive(Default)]
+    pub struct Faults {
+        /// Puts still to be refused with `503 SlowDown`.
+        pub slow_downs: AtomicUsize,
+        /// How long each put is held, so puts overlap.
+        pub put_delay_ms: AtomicUsize,
+        in_flight: AtomicUsize,
+        /// The most puts that were ever in flight at once.
+        pub most_in_flight: AtomicUsize,
+    }
+
     /// A store on a loopback port. `honours_conditions` false is a store that
     /// ignores `If-Match` and `If-None-Match`, as versitygw 1.0.14 does.
     pub async fn store(honours_conditions: bool) -> ObjectStore {
+        serving(honours_conditions, Arc::default(), options(10, 32, 8)).await
+    }
+
+    /// A store whose puts fail as `faults` says, with `options` for the client.
+    pub async fn faulty(options: Options) -> (ObjectStore, Arc<Faults>) {
+        let faults = Arc::new(Faults::default());
+        let mut store = serving(true, Arc::clone(&faults), options).await;
+        store.requeue_after = std::time::Duration::from_millis(20);
+        (store, faults)
+    }
+
+    pub fn options(attempts: u32, uploads: usize, uploads_per_sandbox: usize) -> Options {
+        Options {
+            url: "s3://test".into(),
+            endpoint: String::new(),
+            region: "us-east-1".into(),
+            attempts,
+            uploads,
+            uploads_per_sandbox,
+        }
+    }
+
+    async fn serving(
+        honours_conditions: bool,
+        faults: Arc<Faults>,
+        mut options: Options,
+    ) -> ObjectStore {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let endpoint = format!("http://{}", listener.local_addr().unwrap());
+        options.endpoint = format!("http://{}", listener.local_addr().unwrap());
         let objects = Arc::new(Mutex::new(Objects::default()));
         tokio::spawn(async move {
             loop {
                 let (stream, _) = listener.accept().await.unwrap();
                 let objects = Arc::clone(&objects);
-                tokio::spawn(serve(stream, objects, honours_conditions));
+                tokio::spawn(serve(
+                    stream,
+                    objects,
+                    honours_conditions,
+                    Arc::clone(&faults),
+                ));
             }
         });
-        let options = Options {
-            url: "s3://test".into(),
-            endpoint,
-            region: "us-east-1".into(),
-        };
         ObjectStore::with_credentials(
             &options,
             "test",
@@ -497,6 +612,7 @@ pub(crate) mod fake {
         stream: tokio::net::TcpStream,
         objects: Arc<Mutex<Objects>>,
         honours_conditions: bool,
+        faults: Arc<Faults>,
     ) {
         let (read, mut write) = stream.into_split();
         let mut read = BufReader::new(read);
@@ -540,7 +656,21 @@ pub(crate) mod fake {
             let mut body = vec![0; length];
             read.read_exact(&mut body).await.unwrap();
 
-            let (status, etag, payload) = {
+            let throttled = method == "PUT"
+                && faults
+                    .slow_downs
+                    .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |n| n.checked_sub(1))
+                    .is_ok();
+            if method == "PUT" {
+                let now = faults.in_flight.fetch_add(1, Ordering::Relaxed) + 1;
+                faults.most_in_flight.fetch_max(now, Ordering::Relaxed);
+                let delay = faults.put_delay_ms.load(Ordering::Relaxed) as u64;
+                tokio::time::sleep(std::time::Duration::from_millis(delay)).await;
+                faults.in_flight.fetch_sub(1, Ordering::Relaxed);
+            }
+            let (status, etag, payload) = if throttled {
+                (503, None, error("SlowDown"))
+            } else {
                 let mut objects = objects.lock().unwrap();
                 let current = objects.by_key.get(&key).map(|(_, etag)| etag.clone());
                 match method.as_str() {
@@ -632,6 +762,75 @@ pub(crate) mod fake {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::atomic::Ordering;
+
+    /// S3 throttles a burst at one prefix with `503 SlowDown`. A put that
+    /// meets it is tried again until it lands.
+    #[tokio::test]
+    async fn a_throttled_put_is_retried_until_it_lands() {
+        let (store, faults) = super::fake::faulty(super::fake::options(10, 32, 8)).await;
+        faults.slow_downs.store(3, Ordering::Relaxed);
+        store.put_bytes("chunks/a", b"a".to_vec()).await.unwrap();
+        assert_eq!(faults.slow_downs.load(Ordering::Relaxed), 0);
+        assert_eq!(store.get_bytes("chunks/a").await.unwrap().unwrap(), b"a");
+    }
+
+    /// A memory image's chunks go up through a run of throttling, and never
+    /// more at once than the node allows.
+    #[tokio::test]
+    async fn an_image_uploads_through_slow_downs_within_the_node_bound() {
+        let (store, faults) = super::fake::faulty(super::fake::options(10, 2, 8)).await;
+        faults.slow_downs.store(5, Ordering::Relaxed);
+        faults.put_delay_ms.store(20, Ordering::Relaxed);
+        let dir = std::env::temp_dir().join(format!(
+            "burrow-throttled-{}",
+            uuid::Uuid::new_v4().simple()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let chunk = crate::chunks::CHUNK_SIZE as usize;
+        let image: Vec<u8> = (0..4 * chunk).map(|i| (i / chunk + 1) as u8).collect();
+        std::fs::write(dir.join("snapshot.mem"), &image).unwrap();
+
+        let index = crate::chunks::put_image(
+            &store,
+            &dir,
+            &["snapshot.mem".to_string()],
+            None,
+            &Default::default(),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(index.chunks.len(), 4);
+        for digest in index.digests() {
+            assert!(
+                store
+                    .exists(&crate::chunks::chunk_key(digest))
+                    .await
+                    .unwrap()
+            );
+        }
+        assert_eq!(faults.slow_downs.load(Ordering::Relaxed), 0);
+        assert!(faults.most_in_flight.load(Ordering::Relaxed) <= 2);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn requeues_back_off_to_a_cap() {
+        let mut options = super::fake::options(1, 1, 1);
+        options.endpoint = "http://127.0.0.1:1".into();
+        let store = super::ObjectStore::with_credentials(
+            &options,
+            "test",
+            "",
+            aws_sdk_s3::config::Credentials::new("test", "test", None, None, "test"),
+        );
+        let first = store.requeue_delay(1);
+        assert!(first >= super::REQUEUE_AFTER / 2 && first <= super::REQUEUE_AFTER);
+        assert!(store.requeue_delay(40) <= super::MAX_REQUEUE_AFTER);
+        assert!(store.requeue_delay(40) >= super::MAX_REQUEUE_AFTER / 2);
+    }
+
     #[tokio::test]
     async fn a_store_that_ignores_conditional_writes_is_found_out() {
         assert!(

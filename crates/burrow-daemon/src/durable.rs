@@ -607,17 +607,20 @@ pub async fn replace_manifest(
         .map_err(|err| Status::internal(format!("encoding the manifest: {err}")))?;
     let key = manifest_key(&next.id);
     match store
-        .put_bytes_if(&key, json, held.map(|held| held.etag.as_str()))
+        .put_bytes_if(&key, json.clone(), held.map(|held| held.etag.as_str()))
         .await?
     {
         Some(etag) => Ok(Held {
             manifest: next.clone(),
             etag,
         }),
-        None => {
-            let current = read_manifest(store, &next.id).await?;
-            Err(lost(&next.id, current.as_ref()))
-        }
+        // A write retried after its first try landed finds itself there.
+        None => match read_manifest(store, &next.id).await? {
+            Some(current) if serde_json::to_vec_pretty(&current.manifest).ok() == Some(json) => {
+                Ok(current)
+            }
+            current => Err(lost(&next.id, current.as_ref())),
+        },
     }
 }
 
@@ -1448,6 +1451,20 @@ mod tests {
         let now = read_manifest(&store, "sbx_1").await.unwrap().unwrap();
         assert_eq!(now.manifest.node_id, winner);
         assert_eq!(now.manifest.state, STATE_RUNNING);
+    }
+
+    /// A conditional write the SDK retried after its first try landed meets
+    /// its own version, which is not another node's.
+    #[tokio::test]
+    async fn a_manifest_write_that_already_landed_is_not_lost() {
+        let store = crate::objstore::fake::store(true).await;
+        let next = manifest("node-a", STATE_SUSPENDED);
+        replace_manifest(&store, None, &next).await.unwrap();
+        let again = replace_manifest(&store, None, &next).await.unwrap();
+        assert_eq!(again.manifest.node_id, next.node_id);
+        let other = manifest("node-b", STATE_SUSPENDED);
+        let lost = replace_manifest(&store, None, &other).await.unwrap_err();
+        assert_eq!(lost.code(), tonic::Code::Aborted);
     }
 
     /// The node the sandbox moved off still has its copy. Neither a resume

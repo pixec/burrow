@@ -100,6 +100,21 @@ pub struct ServeArgs {
     /// hammer the object store.
     #[arg(long, default_value_t = 60, env = "BURROWD_CHECKPOINT_MIN_SECS")]
     pub checkpoint_min_secs: u64,
+    /// Tries per object-store request. Throttling (`503 SlowDown`) and
+    /// transient failures are retried with exponential backoff and jitter.
+    #[arg(long, default_value_t = 10, env = "BURROW_OBJECT_STORE_ATTEMPTS")]
+    pub object_store_attempts: u32,
+    /// Chunk uploads in flight to the object store on this node, across
+    /// every sandbox.
+    #[arg(long, default_value_t = 32, env = "BURROW_OBJECT_STORE_UPLOADS")]
+    pub object_store_uploads: usize,
+    /// Chunk uploads in flight to the object store per sandbox.
+    #[arg(
+        long,
+        default_value_t = 8,
+        env = "BURROW_OBJECT_STORE_UPLOADS_PER_SANDBOX"
+    )]
+    pub object_store_uploads_per_sandbox: usize,
     /// Appended to every guest kernel command line.
     #[arg(
         long,
@@ -1361,6 +1376,9 @@ pub async fn run(args: ServeArgs) -> anyhow::Result<()> {
                 url: url.clone(),
                 endpoint: endpoint.clone(),
                 region: args.object_store_region.clone(),
+                attempts: args.object_store_attempts,
+                uploads: args.object_store_uploads,
+                uploads_per_sandbox: args.object_store_uploads_per_sandbox,
             })?;
             store
                 .ensure_bucket()

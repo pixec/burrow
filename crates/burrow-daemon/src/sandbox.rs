@@ -8097,20 +8097,53 @@ impl SandboxManager {
         }
     }
 
-    /// Uploads a suspended sandbox's state behind whatever suspended it.
+    /// Uploads a suspended sandbox's state behind whatever suspended it, and
+    /// tries again with backoff until it is stored or the sandbox moves on: a
+    /// resume, stop or delete cancels it.
     fn spawn_upload(&self, sandbox: &Arc<RunningSandbox>) {
-        if self.config.object_store.is_none() || !self.is_movable(sandbox) {
+        let Some(store) = self.config.object_store.clone() else {
+            return;
+        };
+        if !self.is_movable(sandbox) {
             return;
         }
         let manager = self.clone();
         let sandbox = Arc::clone(sandbox);
         tokio::spawn(async move {
-            if let Err(err) = manager.make_durable(&sandbox).await {
+            for attempt in 1.. {
+                let token = sandbox.durable.cancel.lock().unwrap().clone();
+                let err = match manager.make_durable(&sandbox).await {
+                    Ok(_) => return,
+                    Err(err) => err,
+                };
+                // Refused for good: another node holds it, or it cannot be
+                // stored at all.
+                if matches!(
+                    err.code(),
+                    tonic::Code::Aborted | tonic::Code::FailedPrecondition
+                ) || !sandbox.is_suspended()
+                {
+                    tracing::warn!(
+                        sandbox = sandbox.id(),
+                        %err,
+                        "could not store the suspended sandbox; it stays on this node until its \
+                         next suspend"
+                    );
+                    return;
+                }
+                let wait = store.requeue_delay(attempt);
                 tracing::warn!(
                     sandbox = sandbox.id(),
                     %err,
-                    "could not store the suspended sandbox; it stays on this node until its next suspend"
+                    attempt,
+                    retry_in_secs = wait.as_secs(),
+                    "could not store the suspended sandbox yet; it is on this node only until a \
+                     retry lands"
                 );
+                tokio::select! {
+                    () = token.cancelled() => return,
+                    () = tokio::time::sleep(wait) => {}
+                }
             }
         });
     }
@@ -10718,6 +10751,77 @@ pub(crate) mod tests {
         assert_eq!(record.state, common::SandboxState::Stopped as i32);
         assert_eq!(record.state_reason, REASON_VMM_EXITED);
         assert!(sandbox.vm.lock().await.is_none());
+        let _ = std::fs::remove_dir_all(&workdir);
+    }
+
+    /// A suspend whose upload failed whole, the store throttling every try,
+    /// used to stay on its node until its next suspend. The upload is tried
+    /// again behind it until it lands.
+    #[tokio::test]
+    async fn a_failed_upload_is_retried_in_the_background_until_it_lands() {
+        use std::sync::atomic::Ordering;
+        let mut manager = manager().await;
+        let (store, faults) =
+            crate::objstore::fake::faulty(crate::objstore::fake::options(1, 32, 8)).await;
+        manager.config.object_store = Some(store);
+        let workdir =
+            std::env::temp_dir().join(format!("burrow-requeue-{}", uuid::Uuid::new_v4().simple()));
+        std::fs::create_dir_all(&workdir).unwrap();
+        for file in [
+            TEMPLATE_KERNEL,
+            TEMPLATE_ROOTFS,
+            "snapshot.vmstate",
+            "snapshot.mem",
+            crate::rootdisk::SCRATCH_DISK,
+        ] {
+            std::fs::write(workdir.join(file), vec![7u8; 8192]).unwrap();
+        }
+        let sandbox = Arc::new(sandbox_in(workdir.clone()));
+        sandbox.enter_suspended();
+        *sandbox.memory_chain.lock().await = vec!["snapshot.mem".into()];
+        faults.slow_downs.store(usize::MAX, Ordering::Relaxed);
+
+        manager.spawn_upload(&sandbox);
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        assert!(!sandbox.durable.is_current());
+
+        faults.slow_downs.store(0, Ordering::Relaxed);
+        for _ in 0..500 {
+            if sandbox.durable.is_current() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        assert!(sandbox.durable.is_current());
+        assert!(sandbox.record().is_durable);
+        let _ = std::fs::remove_dir_all(&workdir);
+    }
+
+    /// A resume ends the retries: the guest is running again, and what it was
+    /// is no longer worth storing.
+    #[tokio::test]
+    async fn a_resume_cancels_the_upload_retries() {
+        use std::sync::atomic::Ordering;
+        let mut manager = manager().await;
+        let (store, faults) =
+            crate::objstore::fake::faulty(crate::objstore::fake::options(1, 32, 8)).await;
+        manager.config.object_store = Some(store);
+        let workdir =
+            std::env::temp_dir().join(format!("burrow-requeue-{}", uuid::Uuid::new_v4().simple()));
+        std::fs::create_dir_all(&workdir).unwrap();
+        let sandbox = Arc::new(sandbox_in(workdir.clone()));
+        sandbox.enter_suspended();
+        faults.slow_downs.store(usize::MAX, Ordering::Relaxed);
+
+        manager.spawn_upload(&sandbox);
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        let uploading = sandbox.durable.stop_uploading().await;
+        sandbox.set_state(common::SandboxState::Running);
+        drop(uploading);
+        faults.slow_downs.store(0, Ordering::Relaxed);
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        assert!(!sandbox.durable.is_current());
+        assert!(!sandbox.durable.has_stored());
         let _ = std::fs::remove_dir_all(&workdir);
     }
 

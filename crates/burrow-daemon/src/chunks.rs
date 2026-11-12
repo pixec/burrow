@@ -259,11 +259,11 @@ pub async fn put_image(
                 if known.contains(&digest) {
                     return Ok((n, Some(digest), false));
                 }
-                store.put_bytes(&chunk_key(&digest), bytes).await?;
+                store.put_chunk(&chunk_key(&digest), bytes).await?;
                 Ok((n, Some(digest), true))
             }
         })
-        .buffer_unordered(PARALLELISM);
+        .buffer_unordered(store.upload_parallelism());
     while let Some(result) = results.next().await {
         let (n, digest, put) = result?;
         sent += put as usize;
@@ -366,11 +366,11 @@ pub async fn put_disk_since(
                 if known.contains(&digest) {
                     return Ok((n, Some(digest), false));
                 }
-                store.put_bytes(&chunk_key(&digest), bytes).await?;
+                store.put_chunk(&chunk_key(&digest), bytes).await?;
                 Ok((n, Some(digest), true))
             }
         })
-        .buffer_unordered(PARALLELISM);
+        .buffer_unordered(store.upload_parallelism());
     while let Some(result) = results.next().await {
         let (n, digest, put) = result?;
         sent += put as usize;
@@ -450,7 +450,8 @@ pub async fn patch(
     Ok(fetched)
 }
 
-/// Fetches one chunk and checks it is what its digest says.
+/// Fetches one chunk and checks it is what its digest says. The store retries
+/// each request itself; this retries a body cut off mid-read.
 async fn fetch_chunk(store: &ObjectStore, digest: &str) -> Result<Vec<u8>, Status> {
     let mut delay = std::time::Duration::from_millis(100);
     let mut attempt = 0;
@@ -468,7 +469,7 @@ async fn fetch_chunk(store: &ObjectStore, digest: &str) -> Result<Vec<u8>, Statu
                     "chunk {digest} is missing from the object store"
                 )));
             }
-            Err(err) if attempt < 6 => {
+            Err(err) if attempt < 3 => {
                 tracing::debug!(digest, %err, attempt, "chunk fetch failed; retrying");
                 tokio::time::sleep(delay).await;
                 delay *= 2;

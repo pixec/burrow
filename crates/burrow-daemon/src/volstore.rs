@@ -196,7 +196,11 @@ async fn replace(
             manifest: next.clone(),
             etag,
         }),
-        None => Err(lost(&next.name, read(store, &next.name).await?.as_ref())),
+        // A write retried after its first try landed finds itself there.
+        None => match read(store, &next.name).await? {
+            Some(current) if current.manifest == *next => Ok(current),
+            current => Err(lost(&next.name, current.as_ref())),
+        },
     }
 }
 
@@ -742,6 +746,20 @@ mod tests {
         for dir in [a, b, c] {
             let _ = std::fs::remove_dir_all(dir);
         }
+    }
+
+    /// A conditional write the SDK retried after its first try landed meets
+    /// its own version, which is not another node's.
+    #[tokio::test]
+    async fn a_volume_manifest_write_that_already_landed_is_not_lost() {
+        let store = crate::objstore::fake::store(true).await;
+        let next = draft("again", "node-a");
+        replace(&store, None, &next).await.unwrap();
+        assert_eq!(replace(&store, None, &next).await.unwrap().manifest, next);
+        let lost = replace(&store, None, &draft("again", "node-b"))
+            .await
+            .unwrap_err();
+        assert_eq!(lost.code(), tonic::Code::Aborted);
     }
 
     /// A released volume is anyone's to take, and the releasing node no
