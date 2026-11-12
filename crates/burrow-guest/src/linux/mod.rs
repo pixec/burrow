@@ -85,7 +85,7 @@ fn hex_lower(bytes: &[u8]) -> String {
 }
 
 pub async fn set_public_addresses(network: guestpb::NetworkConfig) -> Result<(), Status> {
-    resume::apply_public(&network)
+    resume::apply_network(&network, false)
         .await
         .map_err(|err| Status::internal(format!("applying public addresses: {err}")))
 }
@@ -168,31 +168,21 @@ pub async fn handshake(
         };
     let trusted = started.elapsed();
 
-    // Only a restored guest has the wrong address; a cold boot got its
-    // own from the kernel command line.
+    // Public addresses on every handshake, a cold boot's included: the kernel
+    // command line knows only the private one. The private address only
+    // after a restore the host says moved it; a cold boot got its own from
+    // the kernel command line.
     //
     // Fatal, like the CA install above and unlike the reseed/clock steps:
     // a guest that fails this keeps the source's address and MAC for
     // whatever it does next, and the host needs to know the handshake
     // did not really succeed.
-    if req.is_restored
-        && let Some(network) = &req.network
-        && let Err(err) = resume::apply_network(network).await
-    {
-        tracing::error!(%err, "failed to reapply network after restore");
-        return Err(Status::internal(format!(
-            "reapplying network after restore: {err}"
-        )));
-    }
-    // Public addresses on every handshake, a cold boot's included: the kernel
-    // command line knows only the private one.
     if let Some(network) = &req.network
-        && let Err(err) = resume::apply_public(network).await
+        && let Err(err) =
+            resume::apply_network(network, req.is_restored && !network.is_address_kept).await
     {
-        tracing::error!(%err, "failed to apply public addresses");
-        return Err(Status::internal(format!(
-            "applying public addresses: {err}"
-        )));
+        tracing::error!(%err, "failed to apply the network");
+        return Err(Status::internal(format!("applying the network: {err}")));
     }
     // A root disk the host grew while the guest was down is filled here,
     // online, on the boot that first sees it.

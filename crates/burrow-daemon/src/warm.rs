@@ -846,8 +846,7 @@ async fn exercise_agent(
         .handshake(crate::guestconn::handshake_full(
             true,
             Some(burrow_proto::guest::v1::NetworkConfig {
-                // Its own address: re-applying it changes nothing, and the
-                // point is to touch the code rather than the configuration.
+                // The lease its tap was made with.
                 ip: lease.guest_ip.to_string(),
                 prefix_len: lease.prefix_len as u32,
                 gateway: lease.host_ip.to_string(),
@@ -856,6 +855,7 @@ async fn exercise_agent(
                 prefix_len6: lease.prefix_len6() as u32,
                 gateway6: lease.host_ip6().to_string(),
                 public_addresses: Vec::new(),
+                is_address_kept: false,
             }),
             trust.ca.clone(),
             trust.bundles.clone(),
@@ -897,7 +897,10 @@ async fn profile_restore(
     trust: &Trust,
 ) -> Result<(), Status> {
     let agent_timeout = config.agent_timeout;
-    let lease = burrow_net::ipam::warm_lease();
+    // Not the snapshot's own address: a clone's handshake re-addresses its
+    // guest, and a plan recorded without that would leave the code doing it
+    // to fault in on every create.
+    let lease = burrow_net::ipam::profiling_lease();
     burrow_net::tap::delete(WARM_TAP).await;
     let tap = burrow_net::tap::create_named(WARM_TAP, &lease)
         .await

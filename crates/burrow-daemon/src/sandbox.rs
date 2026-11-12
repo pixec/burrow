@@ -4568,6 +4568,7 @@ impl SandboxManager {
                 prefix_len6: lease.prefix_len6() as u32,
                 gateway6: lease.host_ip6().to_string(),
                 public_addresses,
+                is_address_kept: false,
             }
         })
     }
@@ -8391,12 +8392,17 @@ impl SandboxManager {
         // holds it has nothing to do.
         let policy = record.policy.clone().unwrap_or_default();
         let mut request = guestconn::handshake_request(true);
-        request.network = self.guest_network(
-            &sandbox.lease,
-            &record.public_ips,
-            sandbox.hypervisor.capabilities().is_tap_networked,
-            false,
-        );
+        request.network = self
+            .guest_network(
+                &sandbox.lease,
+                &record.public_ips,
+                sandbox.hypervisor.capabilities().is_tap_networked,
+                false,
+            )
+            .map(|network| burrow_proto::guest::v1::NetworkConfig {
+                is_address_kept: true,
+                ..network
+            });
         request.inspection_ca_pem = self.inspection_ca_for(&policy);
         request.extra_trust_bundles =
             self.trust_bundles_in(&self.environment_of(&sandbox).await, &policy);

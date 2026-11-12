@@ -236,6 +236,12 @@ pub fn warm_lease() -> Lease {
     lease_for(MAX_BLOCKS)
 }
 
+/// A fixed lease for the restore that profiles a warm snapshot: another than
+/// [`warm_lease`], so its guest is re-addressed as every clone's is.
+pub fn profiling_lease() -> Lease {
+    lease_for(MAX_BLOCKS + 1)
+}
+
 fn lease_for(block: u32) -> Lease {
     // Block N occupies 10.99.x.y/30 starting at offset N*4.
     let offset = block * 4;

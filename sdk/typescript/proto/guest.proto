@@ -437,6 +437,9 @@ message NetworkConfig {
   // Public addresses routed to this sandbox, held beside the private ones and
   // used as the source of the default routes. Applied on every handshake.
   repeated PublicAddress public_addresses = 8;
+  // The guest already holds `ip` and `ip6`, because it was suspended under
+  // this lease, so only the public side can differ.
+  bool is_address_kept = 9;
 }
 
 message PublicAddress {

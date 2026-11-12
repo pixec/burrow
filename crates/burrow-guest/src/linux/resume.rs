@@ -378,66 +378,43 @@ fn write_atomically(path: &std::path::Path, contents: &[u8]) -> std::io::Result<
     Ok(())
 }
 
-/// Reapplies the guest's network address after a restore.
+/// Applies the addresses a handshake or a live attach names.
 ///
 /// A clone restored from a shared warm snapshot wakes holding whatever address
 /// was baked into that snapshot. Every clone would otherwise claim the same
 /// one, and the host, which routes a distinct /30 to each tap, would have no
 /// way to deliver their traffic. The host tells each clone its real address on
-/// handshake; this applies it.
-pub async fn apply_network(config: &burrow_proto::guest::v1::NetworkConfig) -> anyhow::Result<()> {
-    if config.ip.is_empty() {
-        return Ok(());
-    }
-    let ip = config.ip.parse()?;
-    let gateway = if config.gateway.is_empty() {
-        None
-    } else {
-        Some(config.gateway.parse()?)
-    };
-    let dns = (!config.dns.is_empty()).then_some(config.dns.as_str());
-    let ip6 = match config.ip6.is_empty() {
-        true => None,
-        false => Some((
-            config.ip6.parse()?,
-            config.prefix_len6.max(1) as u8,
-            (!config.gateway6.is_empty())
-                .then(|| config.gateway6.parse())
-                .transpose()?,
-        )),
-    };
-
-    crate::linux::netconf::apply(ip, config.prefix_len.max(1) as u8, gateway, dns, ip6).await?;
-    tracing::debug!(ip = config.ip, "network reapplied after restore");
-    Ok(())
-}
-
-/// Applies the public addresses a handshake or a live attach names.
-pub async fn apply_public(config: &burrow_proto::guest::v1::NetworkConfig) -> anyhow::Result<()> {
+/// handshake, and `is_private` says this guest still has to take it.
+pub async fn apply_network(
+    config: &burrow_proto::guest::v1::NetworkConfig,
+    is_private: bool,
+) -> anyhow::Result<()> {
     if config.ip.is_empty() {
         return Ok(());
     }
     let parse6 = |value: &str| -> anyhow::Result<Option<std::net::Ipv6Addr>> {
         Ok((!value.is_empty()).then(|| value.parse()).transpose()?)
     };
-    let private = crate::linux::netconf::Private {
+    let network = crate::linux::netconf::Network {
         ip: config.ip.parse()?,
+        prefix_len: config.prefix_len.max(1) as u8,
         gateway: (!config.gateway.is_empty())
             .then(|| config.gateway.parse())
             .transpose()?,
-        ip6: parse6(&config.ip6)?,
+        ip6: parse6(&config.ip6)?.map(|ip6| (ip6, config.prefix_len6.max(1) as u8)),
         gateway6: parse6(&config.gateway6)?,
+        public: config
+            .public_addresses
+            .iter()
+            .map(|address| {
+                let parsed: std::net::IpAddr = address.address.parse()?;
+                let width = if parsed.is_ipv4() { 32 } else { 128 };
+                Ok((parsed, address.prefix_len.clamp(1, width) as u8))
+            })
+            .collect::<anyhow::Result<Vec<_>>>()?,
     };
-    let public = config
-        .public_addresses
-        .iter()
-        .map(|address| {
-            let parsed: std::net::IpAddr = address.address.parse()?;
-            let width = if parsed.is_ipv4() { 32 } else { 128 };
-            Ok((parsed, address.prefix_len.clamp(1, width) as u8))
-        })
-        .collect::<anyhow::Result<Vec<_>>>()?;
-    crate::linux::netconf::apply_public(private, &public).await
+    let dns = (!config.dns.is_empty()).then_some(config.dns.as_str());
+    crate::linux::netconf::apply(&network, is_private, dns).await
 }
 
 #[cfg(test)]
