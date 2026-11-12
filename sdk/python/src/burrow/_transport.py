@@ -26,6 +26,14 @@ _GRANT_MARGIN_SECS = 30
 # or for a sandbox that has moved to another node.
 _STALE_GRANT = (grpc.StatusCode.UNAUTHENTICATED, grpc.StatusCode.NOT_FOUND)
 
+# The most file data one Fs read or write carries.
+MAX_FILE_CHUNK = 4 * 1024 * 1024
+
+# The message limit both ways, as the orchestrator and nodes hold it: a full
+# file chunk and the fields around it, with room to spare. gRPC's 4 MiB
+# default refuses a full chunk.
+MAX_MESSAGE_BYTES = 8 * 1024 * 1024
+
 # Where exec, attach and file traffic goes: the node, or the orchestrator.
 _ROUTES = ("direct", "orchestrator")
 
@@ -91,10 +99,8 @@ class Transport:
             )
 
         options = [
-            # Exec and file transfers can carry large payloads; the 4MB default
-            # turns a big file into a confusing RESOURCE_EXHAUSTED.
-            ("grpc.max_receive_message_length", 64 * 1024 * 1024),
-            ("grpc.max_send_message_length", 64 * 1024 * 1024),
+            ("grpc.max_receive_message_length", MAX_MESSAGE_BYTES),
+            ("grpc.max_send_message_length", MAX_MESSAGE_BYTES),
         ]
         if secure:
             self._channel = grpc.secure_channel(

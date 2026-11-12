@@ -79,7 +79,12 @@ async fn connect_timed(
         }))
         .await?;
     let at = *accepted.lock().unwrap();
-    Ok((GuestClient::new(channel), at))
+    Ok((
+        GuestClient::new(channel)
+            .max_decoding_message_size(burrow_proto::MAX_MESSAGE_BYTES)
+            .max_encoding_message_size(burrow_proto::MAX_MESSAGE_BYTES),
+        at,
+    ))
 }
 
 /// Connects as soon as the guest's agent accepts, or gives up.
@@ -265,12 +270,20 @@ pub async fn upload(
     let first = guestpb::FileChunk {
         path: path.to_string(),
         mode,
-        data: content.to_vec(),
         owner: owner.to_string(),
         is_existing_skipped: skip_existing,
-        user: String::new(),
+        ..Default::default()
     };
-    agent.upload_file(tokio_stream::iter(vec![first])).await?;
+    let chunks =
+        std::iter::once(first).chain(content.chunks(burrow_proto::MAX_FILE_CHUNK).map(|data| {
+            guestpb::FileChunk {
+                data: data.to_vec(),
+                ..Default::default()
+            }
+        }));
+    agent
+        .upload_file(tokio_stream::iter(chunks.collect::<Vec<_>>()))
+        .await?;
     Ok(())
 }
 

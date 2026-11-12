@@ -23,7 +23,7 @@ use std::time::{Duration, Instant};
 
 use burrow_common::access::{Claims, OP_EXEC, OP_FILES_READ, OP_FILES_WRITE, Verifier};
 use burrow_proto::api::v1 as api;
-use burrow_proto::api::v1::access_server::Access;
+use burrow_proto::api::v1::access_server::{Access, AccessServer};
 use burrow_proto::node::v1::node_service_server::NodeService;
 use tokio_stream::{Stream, StreamExt};
 use tokio_util::sync::CancellationToken;
@@ -328,6 +328,13 @@ fn until_ended<T: Send + 'static>(
     }
 }
 
+/// The service as the node serves it, with room for a full file chunk.
+pub fn service<T: Access>(access: T) -> AccessServer<T> {
+    AccessServer::new(access)
+        .max_decoding_message_size(burrow_proto::MAX_MESSAGE_BYTES)
+        .max_encoding_message_size(burrow_proto::MAX_MESSAGE_BYTES)
+}
+
 #[tonic::async_trait]
 impl Access for AccessApi {
     type ExecStream = BoxStream<api::ExecOutput>;
@@ -452,6 +459,93 @@ impl Access for AccessApi {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Answers Fs as a guest would, so the service's message limits are what
+    /// a test meets.
+    struct Echo;
+
+    #[tonic::async_trait]
+    impl Access for Echo {
+        type ExecStream = BoxStream<api::ExecOutput>;
+        async fn exec(
+            &self,
+            _: Request<tonic::Streaming<api::ExecInput>>,
+        ) -> Result<Response<Self::ExecStream>, Status> {
+            Err(Status::unimplemented("exec"))
+        }
+        type AttachStream = BoxStream<api::ExecOutput>;
+        async fn attach(
+            &self,
+            _: Request<tonic::Streaming<api::AttachInput>>,
+        ) -> Result<Response<Self::AttachStream>, Status> {
+            Err(Status::unimplemented("attach"))
+        }
+        type WatchStream = BoxStream<api::WatchEvent>;
+        async fn watch(
+            &self,
+            _: Request<api::WatchRequest>,
+        ) -> Result<Response<Self::WatchStream>, Status> {
+            Err(Status::unimplemented("watch"))
+        }
+        async fn fs(
+            &self,
+            req: Request<api::FsRequest>,
+        ) -> Result<Response<api::FsResponse>, Status> {
+            use api::fs_request::Op;
+            use api::fs_response::Result as Outcome;
+            let result = match req.into_inner().op {
+                Some(Op::Write(write)) => Outcome::Written(write.data.len() as u64),
+                Some(Op::Read(read)) => Outcome::Data(vec![1; read.length as usize]),
+                _ => return Err(Status::unimplemented("fs")),
+            };
+            Ok(Response::new(api::FsResponse {
+                result: Some(result),
+            }))
+        }
+    }
+
+    /// A full chunk goes to the node and comes back from it in one call.
+    #[tokio::test]
+    async fn a_full_chunk_crosses_the_access_service() {
+        use api::fs_request::Op;
+        use api::fs_response::Result as Outcome;
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(
+            tonic::transport::Server::builder()
+                .add_service(service(Echo))
+                .serve_with_incoming(tonic::transport::server::TcpIncoming::from(listener)),
+        );
+        let mut client = api::access_client::AccessClient::connect(format!("http://{addr}"))
+            .await
+            .unwrap()
+            .max_decoding_message_size(burrow_proto::MAX_MESSAGE_BYTES)
+            .max_encoding_message_size(burrow_proto::MAX_MESSAGE_BYTES);
+        let chunk = burrow_proto::MAX_FILE_CHUNK;
+        let call = |op| api::FsRequest {
+            sandbox_id: "sbx_a".into(),
+            op: Some(op),
+            ..Default::default()
+        };
+        let written = client
+            .fs(call(Op::Write(api::FsWrite {
+                data: vec![0; chunk],
+                ..Default::default()
+            })))
+            .await
+            .unwrap()
+            .into_inner();
+        assert_eq!(written.result, Some(Outcome::Written(chunk as u64)));
+        let read = client
+            .fs(call(Op::Read(api::FsRead {
+                length: chunk as u32,
+                ..Default::default()
+            })))
+            .await
+            .unwrap()
+            .into_inner();
+        assert!(matches!(read.result, Some(Outcome::Data(data)) if data.len() == chunk));
+    }
 
     fn claims(ops: &[&str]) -> Claims {
         Claims::new(

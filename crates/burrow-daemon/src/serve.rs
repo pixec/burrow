@@ -774,8 +774,6 @@ fn serve_access(
 ) -> anyhow::Result<impl std::future::Future<Output = Result<(), tonic::transport::Error>> + use<>>
 {
     use anyhow::Context as _;
-    use burrow_proto::api::v1::access_server::AccessServer;
-
     let advertised = args.access_advertisement();
     let advertised = advertised.as_str();
     let is_https = advertised.starts_with("https://");
@@ -809,7 +807,9 @@ fn serve_access(
         _ => anyhow::bail!("--access-tls-cert and --access-tls-key go together"),
     }
     tracing::info!(listen = %listen, advertised, "Access service listening");
-    Ok(builder.add_service(AccessServer::new(access)).serve(listen))
+    Ok(builder
+        .add_service(crate::access::service(access))
+        .serve(listen))
 }
 
 /// How long before the inspection CA expires the node starts saying so.
@@ -1891,7 +1891,9 @@ pub async fn run(args: ServeArgs) -> anyhow::Result<()> {
 
     let server = Server::builder()
         .add_service(tonic::service::interceptor::InterceptedService::new(
-            NodeServiceServer::from_arc(api),
+            NodeServiceServer::from_arc(api)
+                .max_decoding_message_size(burrow_proto::MAX_MESSAGE_BYTES)
+                .max_encoding_message_size(burrow_proto::MAX_MESSAGE_BYTES),
             auth,
         ))
         .serve(args.listen);

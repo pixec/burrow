@@ -198,6 +198,7 @@ impl NodeApi {
             .op
             .as_ref()
             .ok_or_else(|| Status::invalid_argument("FsRequest names no op"))?;
+        check_fs_size(op)?;
         let user = fs_caller(user, std::mem::take(&mut req.user))?;
         let sandbox = self.sandboxes.get(&req.sandbox_id).await?;
         let policy = sandbox.policy();
@@ -2042,6 +2043,25 @@ fn fs_refused(req: &api::FsRequest, status: Status) -> Result<api::FsResponse, S
     })
 }
 
+/// Refuses a read or write past what one call carries, which the agent would
+/// answer with no more than EINVAL.
+fn check_fs_size(op: &api::fs_request::Op) -> Result<(), Status> {
+    use api::fs_request::Op;
+    let len = match op {
+        Op::Read(read) => read.length as usize,
+        Op::Write(write) => write.data.len(),
+        _ => return Ok(()),
+    };
+    if len > burrow_proto::MAX_FILE_CHUNK {
+        return Err(Status::invalid_argument(format!(
+            "an Fs read or write carries at most {} bytes (4 MiB), not {len}; split it into \
+             several calls",
+            burrow_proto::MAX_FILE_CHUNK
+        )));
+    }
+    Ok(())
+}
+
 /// A call on an open handle names no path; its open was checked at its own.
 /// What is left is the policy's coarse permission, which may have changed
 /// since. fstat and close need nothing: neither reads nor changes the file.
@@ -3738,6 +3758,36 @@ mod policy_tests {
             user: String::new(),
             op: Some(op),
         }
+    }
+
+    #[test]
+    fn an_fs_read_or_write_carries_at_most_a_chunk() {
+        use api::fs_request::Op;
+        let chunk = burrow_proto::MAX_FILE_CHUNK;
+        let read = |length| {
+            check_fs_size(&Op::Read(api::FsRead {
+                length,
+                ..Default::default()
+            }))
+        };
+        let write = |len| {
+            check_fs_size(&Op::Write(api::FsWrite {
+                data: vec![0; len],
+                ..Default::default()
+            }))
+        };
+        assert!(read(chunk as u32).is_ok());
+        assert!(write(chunk).is_ok());
+        let refused = write(chunk + 1).unwrap_err();
+        assert_eq!(refused.code(), tonic::Code::InvalidArgument);
+        assert!(
+            refused.message().contains("at most 4194304 bytes"),
+            "{refused}"
+        );
+        assert_eq!(
+            read(chunk as u32 + 1).unwrap_err().code(),
+            tonic::Code::InvalidArgument
+        );
     }
 
     #[test]

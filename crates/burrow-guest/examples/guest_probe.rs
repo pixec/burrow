@@ -68,7 +68,9 @@ mod probe {
                 }
             }))
             .await?;
-        Ok(GuestClient::new(channel).max_decoding_message_size(64 << 20))
+        Ok(GuestClient::new(channel)
+            .max_decoding_message_size(burrow_proto::MAX_MESSAGE_BYTES)
+            .max_encoding_message_size(burrow_proto::MAX_MESSAGE_BYTES))
     }
 
     /// What a command printed and how it ended.

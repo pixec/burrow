@@ -105,11 +105,19 @@ const GRANT_MARGIN_MS = 30_000;
  */
 const STALE_GRANT = new Set(["unauthenticated", "not_found"]);
 
+/** The most file data one Fs read or write carries. */
+export const MAX_FILE_CHUNK = 4 * 1024 * 1024;
+
+/**
+ * The message limit both ways, as the orchestrator and nodes hold it: a full
+ * file chunk and the fields around it, with room to spare. gRPC's 4 MiB
+ * default refuses a full chunk.
+ */
+export const MAX_MESSAGE_BYTES = 8 * 1024 * 1024;
+
 const CHANNEL_OPTIONS = {
-  // Exec and file transfers can carry large payloads; the 4MB default turns a
-  // big file into a confusing RESOURCE_EXHAUSTED.
-  "grpc.max_receive_message_length": 64 * 1024 * 1024,
-  "grpc.max_send_message_length": 64 * 1024 * 1024,
+  "grpc.max_receive_message_length": MAX_MESSAGE_BYTES,
+  "grpc.max_send_message_length": MAX_MESSAGE_BYTES,
 };
 
 export class Transport {

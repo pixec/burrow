@@ -45,6 +45,7 @@ use nix::sys::time::TimeSpec;
 use nix::unistd::UnlinkatFlags;
 use tonic::Status;
 
+use burrow_proto::MAX_FILE_CHUNK;
 use burrow_proto::guest::v1 as guestpb;
 use guestpb::fs_request::Op;
 use guestpb::fs_response::Result as Outcome;
@@ -55,8 +56,6 @@ use crate::unix::files;
 /// path scopes and write cap enforced.
 pub const FEATURE_FS: &str = "fs-scoped";
 
-/// The most one read or write carries, so a call is one bounded message.
-const MAX_IO: usize = 4 << 20;
 /// Open handles across every caller. Each is a descriptor the agent holds, out
 /// of the same limit everything else it does draws on.
 const MAX_HANDLES: usize = 1024;
@@ -334,7 +333,7 @@ fn run(op: Op, user: String, limits: &Limits) -> nix::Result<Outcome> {
         }
         Op::Read(read) => {
             let len = read.length as usize;
-            if len > MAX_IO {
+            if len > MAX_FILE_CHUNK {
                 return Err(Errno::EINVAL);
             }
             let file = table().get(read.handle, &user)?;
@@ -348,7 +347,7 @@ fn run(op: Op, user: String, limits: &Limits) -> nix::Result<Outcome> {
             Outcome::Data(data)
         }
         Op::Write(write) => {
-            if write.data.len() > MAX_IO {
+            if write.data.len() > MAX_FILE_CHUNK {
                 return Err(Errno::EINVAL);
             }
             let file = table().get(write.handle, &user)?;
@@ -1571,7 +1570,7 @@ mod tests {
         std::fs::write(&path, b"x").unwrap();
         let handle = open(&path, 0).await;
         assert_eq!(
-            code(read("", handle, 0, (MAX_IO + 1) as u32).await),
+            code(read("", handle, 0, (MAX_FILE_CHUNK + 1) as u32).await),
             "EINVAL"
         );
         // O_PATH, then an access mode of 3.

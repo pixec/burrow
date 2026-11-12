@@ -953,8 +953,10 @@ async fn run(args: Args) -> anyhow::Result<()> {
     }
 
     Server::builder()
-        .add_service(BurrowServer::with_interceptor(
-            api::ApiService(state.clone()),
+        .add_service(tonic::service::interceptor::InterceptedService::new(
+            BurrowServer::new(api::ApiService(state.clone()))
+                .max_decoding_message_size(burrow_proto::MAX_MESSAGE_BYTES)
+                .max_encoding_message_size(burrow_proto::MAX_MESSAGE_BYTES),
             auth.clone(),
         ))
         .add_service(NodeRegistryServer::with_interceptor(

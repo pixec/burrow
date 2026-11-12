@@ -32,6 +32,7 @@ use std::time::{Duration, Instant};
 
 use tonic::Status;
 
+use burrow_proto::MAX_FILE_CHUNK;
 use burrow_proto::guest::v1 as guestpb;
 use guestpb::fs_request::Op;
 use guestpb::fs_response::Result as Outcome;
@@ -44,7 +45,6 @@ use crate::windows::{files, mode, win};
 /// What `fs-scoped` in the health response promises.
 pub const FEATURE_FS: &str = "fs-scoped";
 
-const MAX_IO: usize = 4 << 20;
 const MAX_HANDLES: usize = 1024;
 const IDLE: Duration = Duration::from_secs(600);
 
@@ -264,7 +264,7 @@ fn run(op: Op, user: String, limits: &Limits) -> R<Outcome> {
         }
         Op::Read(read) => {
             let len = read.length as usize;
-            if len > MAX_IO {
+            if len > MAX_FILE_CHUNK {
                 return Err(Errno::EINVAL);
             }
             let (file, _) = table().get(read.handle, &user)?;
@@ -277,7 +277,7 @@ fn run(op: Op, user: String, limits: &Limits) -> R<Outcome> {
             Outcome::Data(data)
         }
         Op::Write(write) => {
-            if write.data.len() > MAX_IO {
+            if write.data.len() > MAX_FILE_CHUNK {
                 return Err(Errno::EINVAL);
             }
             let (file, flags) = table().get(write.handle, &user)?;

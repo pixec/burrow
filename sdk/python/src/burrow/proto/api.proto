@@ -1306,7 +1306,8 @@ message FsRead {
   // Where to read from. Negative reads from the handle's own position and
   // moves it, as read(2) does; otherwise pread(2), and the position stays.
   int64 position = 2;
-  // At most 4 MiB. Fewer come back at end of file, and none past it.
+  // At most 4 MiB (4194304 bytes); a longer read is refused with
+  // INVALID_ARGUMENT. Fewer come back at end of file, and none past it.
   uint32 length = 3;
 }
 
@@ -1314,7 +1315,7 @@ message FsWrite {
   uint64 handle = 1;
   // As for FsRead. A handle opened with O_APPEND always writes at the end.
   int64 position = 2;
-  // At most 4 MiB.
+  // At most 4 MiB (4194304 bytes); more is refused with INVALID_ARGUMENT.
   bytes data = 3;
 }
 

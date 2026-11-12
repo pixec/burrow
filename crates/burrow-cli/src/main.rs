@@ -88,10 +88,14 @@ async fn route(client: &Client, sandbox: &str) -> anyhow::Result<Route> {
         .into_inner();
     let channel = connect(&grant.endpoint, *INSECURE.get().unwrap_or(&false)).await?;
     Ok(Route {
-        client: Passage::Direct(api::access_client::AccessClient::with_interceptor(
-            channel,
-            BearerAuth(Some(grant.token)),
-        )),
+        client: Passage::Direct(
+            api::access_client::AccessClient::with_interceptor(
+                channel,
+                BearerAuth(Some(grant.token)),
+            )
+            .max_decoding_message_size(burrow_proto::MAX_MESSAGE_BYTES)
+            .max_encoding_message_size(burrow_proto::MAX_MESSAGE_BYTES),
+        ),
         sandbox_id: grant.sandbox_id,
     })
 }
@@ -1872,7 +1876,9 @@ async fn main() -> anyhow::Result<()> {
     let _ = INSECURE.set(args.is_insecure);
     let _ = RELAYED.set(args.route == "orchestrator");
     let channel = connect(&args.orchestrator, args.is_insecure).await?;
-    let mut client = BurrowClient::with_interceptor(channel, BearerAuth(api_key));
+    let mut client = BurrowClient::with_interceptor(channel, BearerAuth(api_key))
+        .max_decoding_message_size(burrow_proto::MAX_MESSAGE_BYTES)
+        .max_encoding_message_size(burrow_proto::MAX_MESSAGE_BYTES);
 
     match args.command {
         Command::Health => {
@@ -5204,9 +5210,9 @@ async fn copy(client: &Client, src: &str, dst: &str) -> anyhow::Result<()> {
 use api::fs_request::Op as FsOp;
 use api::fs_response::Result as FsResult;
 
-/// Pieces a transfer moves per call: HTTP/2's default flow-control window,
-/// as the SDKs and the guest use.
-const FS_CHUNK: usize = 64 * 1024;
+/// Pieces a transfer moves per call: the most one call carries, as the SDKs
+/// move them, since every call is a round trip to the guest.
+const FS_CHUNK: usize = burrow_proto::MAX_FILE_CHUNK;
 
 /// One Fs call as root, with the guest's error turned into this command's.
 async fn fs_call(client: &mut Passage, sandbox_id: &str, op: FsOp) -> anyhow::Result<FsResult> {

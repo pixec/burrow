@@ -22,6 +22,15 @@ pub mod guest {
     }
 }
 
+/// The most file data one Fs read or write carries, and the most the node puts
+/// in one upload chunk to a guest.
+pub const MAX_FILE_CHUNK: usize = 4 << 20;
+
+/// The gRPC message limit, sent and received, on every hop that carries file
+/// data: a full [`MAX_FILE_CHUNK`] and the fields and framing around it, with
+/// room to spare. gRPC's own default is 4 MiB, which a full chunk overruns.
+pub const MAX_MESSAGE_BYTES: usize = 8 << 20;
+
 impl common::v1::EventKind {
     /// The name the event log and the CLI show.
     pub fn label(self) -> &'static str {

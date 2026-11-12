@@ -98,6 +98,12 @@ fn node_endpoint(endpoint: String) -> Result<tonic::transport::Endpoint, tonic::
     Ok(tonic::transport::Endpoint::try_from(endpoint)?.connect_timeout(NODE_CONNECT_TIMEOUT))
 }
 
+fn node_client(channel: tonic::transport::Channel, token: Option<&str>) -> NodeClient {
+    NodeServiceClient::with_interceptor(channel, NodeAuth(token.map(str::to_string)))
+        .max_decoding_message_size(burrow_proto::MAX_MESSAGE_BYTES)
+        .max_encoding_message_size(burrow_proto::MAX_MESSAGE_BYTES)
+}
+
 /// Dials a node's API with the cluster token attached.
 ///
 /// No per-request deadline: the same channel carries exec, watch and file
@@ -107,10 +113,7 @@ pub async fn connect_node(
     token: Option<&str>,
 ) -> Result<NodeClient, tonic::transport::Error> {
     let channel = node_endpoint(endpoint)?.connect().await?;
-    Ok(NodeServiceClient::with_interceptor(
-        channel,
-        NodeAuth(token.map(str::to_string)),
-    ))
+    Ok(node_client(channel, token))
 }
 
 /// Dials a node for a one-shot call, with a deadline on it.
@@ -125,10 +128,7 @@ async fn connect_node_unary(
         .timeout(NODE_REQUEST_TIMEOUT)
         .connect()
         .await?;
-    Ok(NodeServiceClient::with_interceptor(
-        channel,
-        NodeAuth(token.map(str::to_string)),
-    ))
+    Ok(node_client(channel, token))
 }
 
 /// The nodes a fan-out should ask: those that are registered and addressable.
@@ -4486,5 +4486,105 @@ mod tests {
         ] {
             assert!(validate_sandbox_id(bad).is_err(), "{bad:?}");
         }
+    }
+}
+
+#[cfg(test)]
+mod relay_tests {
+    use std::task::{Context, Poll};
+
+    use tonic::codegen::{BoxFuture, Service, http};
+
+    use super::*;
+
+    /// A node that answers only Fs, as a guest would, with the limits a node
+    /// serves under.
+    #[derive(Clone)]
+    struct Node;
+
+    impl tonic::server::NamedService for Node {
+        const NAME: &'static str = "burrow.node.v1.NodeService";
+    }
+
+    impl Service<http::Request<tonic::body::Body>> for Node {
+        type Response = http::Response<tonic::body::Body>;
+        type Error = std::convert::Infallible;
+        type Future = BoxFuture<Self::Response, Self::Error>;
+
+        fn poll_ready(&mut self, _: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
+            Poll::Ready(Ok(()))
+        }
+
+        fn call(&mut self, req: http::Request<tonic::body::Body>) -> Self::Future {
+            Box::pin(async move {
+                let mut grpc = tonic::server::Grpc::new(tonic::codec::ProstCodec::default())
+                    .apply_max_message_size_config(
+                        Some(burrow_proto::MAX_MESSAGE_BYTES),
+                        Some(burrow_proto::MAX_MESSAGE_BYTES),
+                    );
+                Ok(grpc.unary(Fs, req).await)
+            })
+        }
+    }
+
+    struct Fs;
+
+    impl tonic::server::UnaryService<api::FsRequest> for Fs {
+        type Response = api::FsResponse;
+        type Future = BoxFuture<Response<api::FsResponse>, Status>;
+
+        fn call(&mut self, req: Request<api::FsRequest>) -> Self::Future {
+            use api::fs_request::Op;
+            use api::fs_response::Result as Outcome;
+            let result = match req.into_inner().op {
+                Some(Op::Write(write)) => Outcome::Written(write.data.len() as u64),
+                Some(Op::Read(read)) => Outcome::Data(vec![1; read.length as usize]),
+                _ => Outcome::IsDone(true),
+            };
+            Box::pin(async move {
+                Ok(Response::new(api::FsResponse {
+                    result: Some(result),
+                }))
+            })
+        }
+    }
+
+    /// The relay hands a full chunk to the node, and back, in one call.
+    #[tokio::test]
+    async fn a_full_chunk_is_relayed_to_the_node_and_back() {
+        use api::fs_request::Op;
+        use api::fs_response::Result as Outcome;
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(
+            tonic::transport::Server::builder()
+                .add_service(Node)
+                .serve_with_incoming(tonic::transport::server::TcpIncoming::from(listener)),
+        );
+        let mut node = connect_node(format!("http://{addr}"), None).await.unwrap();
+        let chunk = burrow_proto::MAX_FILE_CHUNK;
+        let call = |op| api::FsRequest {
+            sandbox_id: "sbx_a".into(),
+            op: Some(op),
+            ..Default::default()
+        };
+        let written = node
+            .fs(call(Op::Write(api::FsWrite {
+                data: vec![0; chunk],
+                ..Default::default()
+            })))
+            .await
+            .unwrap()
+            .into_inner();
+        assert_eq!(written.result, Some(Outcome::Written(chunk as u64)));
+        let read = node
+            .fs(call(Op::Read(api::FsRead {
+                length: chunk as u32,
+                ..Default::default()
+            })))
+            .await
+            .unwrap()
+            .into_inner();
+        assert!(matches!(read.result, Some(Outcome::Data(data)) if data.len() == chunk));
     }
 }

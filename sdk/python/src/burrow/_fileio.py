@@ -16,6 +16,7 @@ from typing import TYPE_CHECKING, Any, Optional
 
 from ._os import fspath, to_stat_result
 from ._pb import api_pb2
+from ._transport import MAX_FILE_CHUNK
 
 if TYPE_CHECKING:
     from .sandbox import Sandbox
@@ -30,8 +31,6 @@ O_EXCL = 0o200
 O_TRUNC = 0o1000
 O_APPEND = 0o2000
 
-# The most one read or write call carries.
-_CHUNK = 4 * 1024 * 1024
 
 # What `buffering=-1` gives a file. CPython takes the file's st_blksize, a few
 # KiB; here every refill is a round trip to the guest, so fewer of them is
@@ -108,14 +107,14 @@ class FileIO(io.RawIOBase):
 
     def readinto(self, buffer: Any) -> int:
         with memoryview(buffer) as view, view.cast("B") as target:
-            data = self._read(min(len(target), _CHUNK))
+            data = self._read(min(len(target), MAX_FILE_CHUNK))
             target[: len(data)] = data
         return len(data)
 
     def readall(self) -> bytes:
         parts = []
         while True:
-            data = self._read(_CHUNK)
+            data = self._read(MAX_FILE_CHUNK)
             if not data:
                 return b"".join(parts)
             parts.append(data)
@@ -125,7 +124,7 @@ class FileIO(io.RawIOBase):
         if not self._writable:
             raise io.UnsupportedOperation("File not open for writing")
         with memoryview(b) as view, view.cast("B") as source:
-            data = source[:_CHUNK].tobytes()
+            data = source[:MAX_FILE_CHUNK].tobytes()
         res = self._sandbox._fs(
             write=api_pb2.FsWrite(
                 handle=self._handle,

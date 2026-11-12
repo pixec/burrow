@@ -44,6 +44,7 @@ import { getSystemErrorMap, inspect } from "node:util";
 
 import { BurrowError } from "./errors.js";
 import type { GuestLink } from "./guest.js";
+import { MAX_FILE_CHUNK } from "./transport.js";
 
 /**
  * Linux's values, not this machine's: the guest is always Linux, and a flag
@@ -110,8 +111,6 @@ const FLAGS: Record<string, number> = {
   "xa+": O_APPEND | O_CREAT | O_RDWR | O_EXCL,
 };
 
-/** The agent's ceiling on one read or write. */
-const MAX_IO = 4 * 1024 * 1024;
 
 /** What `filehandle.read()` allocates when given no buffer, as Node does. */
 const DEFAULT_READ = 16 * 1024;
@@ -533,7 +532,7 @@ export class FileHandle {
     const from = position === null || position === -1 ? -1 : Number(position);
     let done = 0;
     while (done < length) {
-      const want = Math.min(length - done, MAX_IO);
+      const want = Math.min(length - done, MAX_FILE_CHUNK);
       const data: Uint8Array = await this.fs.request(
         "read",
         { handle, position: from === -1 ? -1 : from + done, length: want },
@@ -563,7 +562,7 @@ export class FileHandle {
     const handle = this.live("read");
     const parts: Buffer[] = [];
     while (true) {
-      const data: Buffer = await this.fs.request("read", { handle, position: -1, length: MAX_IO }, signal);
+      const data: Buffer = await this.fs.request("read", { handle, position: -1, length: MAX_FILE_CHUNK }, signal);
       if (data.length === 0) break;
       parts.push(data);
     }
@@ -663,7 +662,7 @@ export class FileHandle {
     // An empty write still reaches the kernel, which is what O_CREAT and
     // the error for a handle opened read-only both depend on.
     do {
-      const data = bytes.subarray(done, done + MAX_IO);
+      const data = bytes.subarray(done, done + MAX_FILE_CHUNK);
       const written: number = await this.fs.request(
         "write",
         { handle, position: position === null || position === -1 ? -1 : position + done, data },
@@ -721,7 +720,7 @@ export class FileHandle {
       emitClose: options.emitClose ?? true,
       signal: options.signal,
       read: (size) => {
-        const want = Math.min(size, MAX_IO, position === -1 ? Infinity : end - position + 1);
+        const want = Math.min(size, MAX_FILE_CHUNK, position === -1 ? Infinity : end - position + 1);
         if (want <= 0) {
           stream.push(null);
           return;
