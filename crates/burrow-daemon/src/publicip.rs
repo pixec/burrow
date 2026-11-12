@@ -20,7 +20,7 @@ pub struct PublicConfig {
     /// The prefix each sandbox is routed out of it.
     pub ipv6_per_sandbox: u8,
     /// Answer NDP on the uplink for each sandbox's v6 prefix, when the
-    /// provider looks it up there rather than routing it to the node.
+    /// upstream looks it up there rather than routing it to the node.
     pub is_ipv6_on_link: bool,
     /// The uplink public addresses arrive on, when it is not the interface
     /// the node reaches a pool's gateway through.
@@ -29,7 +29,6 @@ pub struct PublicConfig {
     /// and inbound kilobytes per second; 0 is unlimited.
     pub new_per_sec: u32,
     pub kbytes_per_sec: u32,
-    pub providers: Arc<crate::providers::Providers>,
     pub(crate) uplinks: Arc<std::sync::Mutex<HashMap<IpAddr, String>>>,
 }
 

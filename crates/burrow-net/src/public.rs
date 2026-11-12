@@ -23,7 +23,7 @@ pub struct Route {
     pub address: IpAddr,
     pub prefix: u8,
     /// The uplink to answer ARP or NDP on for this address, when the
-    /// provider looks it up there rather than routing it to the node.
+    /// upstream looks it up there rather than routing it to the node.
     pub on_link: Option<String>,
     /// Where traffic from this address leaves, when it is not the node's
     /// default route.

@@ -2094,11 +2094,7 @@ impl Burrow for ApiService {
                 "sandbox {id} mounts volumes, which are node-local and do not move"
             )));
         }
-        self.require_movable(
-            &id,
-            (!req.node_id.is_empty()).then_some(req.node_id.as_str()),
-        )
-        .await?;
+        self.require_unpinned(&id).await?;
         if current.arch.is_empty() {
             let info = self.0.nodes.info(&source).unwrap_or_default();
             current.hypervisor_version =
@@ -2156,18 +2152,9 @@ impl Burrow for ApiService {
             released.hypervisor_version = current.hypervisor_version;
         }
         tracing::info!(sandbox = id, node = source, "sandbox released for a move");
-        // The source has let go of its addresses; the provider delivers them
-        // to the target before it restores the sandbox and brings them up.
-        if let Err(err) = self.route_to(&id, &target).await {
-            let _ = self.route_to(&id, &source).await;
-            return Err(self.hand_back(released, &source, &target, err).await);
-        }
         let moved = match self.adopt(released.clone(), &target, req.node_labels).await {
             Ok(moved) => moved,
-            Err(err) => {
-                let _ = self.route_to(&id, &source).await;
-                return Err(self.hand_back(released, &source, &target, err).await);
-            }
+            Err(err) => return Err(self.hand_back(released, &source, &target, err).await),
         };
         if let Some((_, guard)) = placed {
             guard.keep();
@@ -2463,18 +2450,6 @@ impl Burrow for ApiService {
         let metadata = req.metadata().clone();
         let ips = self.list_ips_inner(&metadata, req.into_inner()).await?;
         Ok(Response::new(api::ListIpsResponse { ips }))
-    }
-
-    async fn set_ip_rdns(
-        &self,
-        req: Request<api::SetIpRdnsRequest>,
-    ) -> Result<Response<common::PublicIp>, Status> {
-        let metadata = req.metadata().clone();
-        let req = req.into_inner();
-        Ok(Response::new(
-            self.set_ip_rdns_inner(&metadata, &req.address, &req.name)
-                .await?,
-        ))
     }
 
     async fn create_ip_pool(

@@ -84,8 +84,6 @@ service Burrow {
   rpc AttachIp(AttachIpRequest) returns (burrow.common.v1.PublicIp);
   rpc DetachIp(IpRef) returns (burrow.common.v1.PublicIp);
   rpc ListIps(ListIpsRequest) returns (ListIpsResponse);
-  // Through the address's provider; refused where it offers none.
-  rpc SetIpRdns(SetIpRdnsRequest) returns (burrow.common.v1.PublicIp);
   // Pools, operator credentials only.
   rpc CreateIpPool(burrow.common.v1.IpPool) returns (burrow.common.v1.IpPool);
   rpc UpdateIpPool(burrow.common.v1.IpPool) returns (burrow.common.v1.IpPool);
@@ -814,12 +812,6 @@ message ListIpsRequest {
 
 message ListIpsResponse {
   repeated burrow.common.v1.PublicIp ips = 1;
-}
-
-message SetIpRdnsRequest {
-  string address = 1;
-  // A host name; empty clears it.
-  string name = 2;
 }
 
 message IpPoolRef {

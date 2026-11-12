@@ -73,7 +73,6 @@ export type {
   HandleOptions,
   IngressRule,
   IpPool,
-  IpProvider,
   KitOptions,
   LifecycleEvent,
   LifetimeOptions,

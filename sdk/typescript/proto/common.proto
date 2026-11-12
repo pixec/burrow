@@ -539,19 +539,6 @@ enum DiskLayout {
   DISK_LAYOUT_ROOT = 2;
 }
 
-// Who delivers a public address to the node holding it.
-enum IpProvider {
-  IP_PROVIDER_UNSPECIFIED = 0;
-  // A routed subnet or a list of addresses only one node receives.
-  IP_PROVIDER_STATIC = 1;
-  // OVH Additional IPs.
-  IP_PROVIDER_OVH = 2;
-  // Hetzner Cloud Floating IPs.
-  IP_PROVIDER_HETZNER = 3;
-  // Burrow's own prefix announced by the holding node. Not built.
-  IP_PROVIDER_BGP = 4;
-}
-
 enum PublicIpState {
   PUBLIC_IP_STATE_UNSPECIFIED = 0;
   // Held by the credential that allocated it.
@@ -562,7 +549,8 @@ enum PublicIpState {
 
 // A dedicated public address: allocated from a pool, attached to at most one
 // sandbox, and kept until released. Routed to the sandbox's tap, so the guest
-// holds it on its own interface.
+// holds it on its own interface. It reaches one node, so a sandbox holding one
+// stays on that node.
 message PublicIp {
   string address = 1;
   // 4 or 6.
@@ -571,13 +559,12 @@ message PublicIp {
   // as 64 for IPv6.
   uint32 prefix_len = 3;
   string pool = 4;
-  IpProvider provider = 5;
-  bool is_movable = 6;
+  reserved 5, 6, 9;
+  reserved "provider", "is_movable", "rdns";
   // Empty while detached.
   string sandbox_id = 7;
-  // The node the address reaches. A static address keeps it once set.
+  // The node the address reaches, kept once set.
   string node_id = 8;
-  string rdns = 9;
   int64 allocated_at_unix_ms = 10;
   int64 attached_at_unix_ms = 11;
   // Who allocated it: a digest of the caller's credential.
@@ -602,8 +589,8 @@ message IpPool {
   // One node, or every node carrying all of `node_labels`.
   string node_id = 2;
   map<string, string> node_labels = 3;
-  // Unspecified is static.
-  IpProvider provider = 4;
+  reserved 4;
+  reserved "provider";
   // IPv4: a range "first-last" and/or explicit addresses.
   repeated string ranges = 5;
   repeated string addresses = 6;
@@ -614,7 +601,7 @@ message IpPool {
   // IPv6: a prefix and the size each sandbox gets from it.
   string prefix6 = 10;
   uint32 per_sandbox = 11;
-  // Whether the provider looks addresses up on the uplink (ARP or NDP), so
+  // Whether the upstream looks addresses up on the uplink (ARP or NDP), so
   // the node has to answer for them, or routes them to the node.
   bool is_on_link = 12;
   // Outbound TCP 25 from these addresses, blocked unless set.
@@ -774,8 +761,8 @@ message NodeInfo {
   // the size of each one's share. Empty when it has none.
   string ipv6_prefix = 19;
   uint32 ipv6_per_sandbox = 20;
-  // Address providers this node holds credentials for.
-  repeated IpProvider ip_providers = 21;
+  reserved 21;
+  reserved "ip_providers";
 }
 
 message NodeStatus {

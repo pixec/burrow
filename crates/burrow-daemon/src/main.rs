@@ -17,7 +17,6 @@ mod metrics;
 mod nodeapi;
 mod objstore;
 mod oci;
-mod providers;
 mod publicip;
 mod resizer;
 mod rootdisk;

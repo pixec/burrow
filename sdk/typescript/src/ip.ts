@@ -3,13 +3,11 @@ import type {
   AllocateIpOptions,
   CallOptions,
   IpPool,
-  IpProvider,
   ListIpsOptions,
   PublicIp,
 } from "./types.js";
-import { dateOf, dateOrNull, enumOf, enumTo } from "./wire.js";
+import { dateOf, dateOrNull, enumOf } from "./wire.js";
 
-const PROVIDERS: readonly IpProvider[] = ["static", "ovh", "hetzner", "bgp"];
 const IP_STATES: readonly ("allocated" | "quarantined")[] = ["allocated", "quarantined"];
 
 /** @internal One `PublicIp` record as the SDK reports it. */
@@ -19,12 +17,9 @@ export function toPublicIp(raw: any): PublicIp {
     family: Number(raw?.family ?? 0),
     prefixLen: Number(raw?.prefixLen ?? 0),
     pool: raw?.pool ?? "",
-    provider: enumOf(raw?.provider, "IP_PROVIDER_", PROVIDERS),
-    movable: Boolean(raw?.isMovable),
     state: enumOf(raw?.state, "PUBLIC_IP_STATE_", IP_STATES),
     sandboxId: raw?.sandboxId ?? "",
     nodeId: raw?.nodeId ?? "",
-    rdns: raw?.rdns ?? "",
     allocatedAt: dateOf(raw?.allocatedAtUnixMs),
     attachedAt: dateOrNull(raw?.attachedAtUnixMs),
     quarantinedUntil: dateOrNull(raw?.quarantinedUntilUnixMs),
@@ -36,7 +31,6 @@ function toWirePool(pool: IpPool): any {
     name: pool.name,
     nodeId: pool.nodeId ?? "",
     nodeLabels: pool.nodeLabels ?? {},
-    provider: enumTo("IP_PROVIDER_", pool.provider ?? "static"),
     ranges: pool.ranges ?? [],
     addresses: pool.addresses ?? [],
     gateway: pool.gateway ?? "",
@@ -52,12 +46,10 @@ function toWirePool(pool: IpPool): any {
 }
 
 function toPool(raw: any): IpPool {
-  const provider = enumOf(raw?.provider, "IP_PROVIDER_", PROVIDERS);
   return {
     name: raw?.name ?? "",
     nodeId: raw?.nodeId ?? "",
     nodeLabels: raw?.nodeLabels ?? {},
-    provider: provider === "unknown" ? "static" : provider,
     ranges: raw?.ranges ?? [],
     addresses: raw?.addresses ?? [],
     gateway: raw?.gateway ?? "",
@@ -79,11 +71,11 @@ function toPool(raw: any): IpPool {
  *
  * ```ts
  * const ip = await burrow.ips.allocate({ sandboxId: "api" });
- * await burrow.ips.setRdns(ip.address, "mail.example.com");
  * ```
  *
  * An address is kept until released, whatever happens to the sandbox holding
- * it, and a released one is quarantined before anyone gets it again.
+ * it, and a released one is quarantined before anyone gets it again. It
+ * reaches one node, so a sandbox holding one cannot move.
  */
 export class Ips {
   /** @internal */
@@ -123,17 +115,6 @@ export class Ips {
     const raw = await this.transport.unary<any, any>(
       "DetachIp",
       { address },
-      options.timeoutMs,
-      options.signal,
-    );
-    return toPublicIp(raw);
-  }
-
-  /** Through the address's provider; refused for a static pool. */
-  async setRdns(address: string, name: string, options: CallOptions = {}): Promise<PublicIp> {
-    const raw = await this.transport.unary<any, any>(
-      "SetIpRdns",
-      { address, name },
       options.timeoutMs,
       options.signal,
     );

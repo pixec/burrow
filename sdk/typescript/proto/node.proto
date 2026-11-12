@@ -129,10 +129,6 @@ service NodeService {
   // Routes a public address to a sandbox here, or takes it away.
   rpc AttachPublicIp(NodeAttachIpRequest) returns (burrow.common.v1.Sandbox);
   rpc DetachPublicIp(NodeDetachIpRequest) returns (burrow.common.v1.Sandbox);
-  // Asks the address's provider to deliver it to this node, with the
-  // credentials this node holds.
-  rpc RoutePublicIp(NodeProviderRequest) returns (NodeProviderResponse);
-  rpc SetPublicIpRdns(NodeProviderRequest) returns (NodeProviderResponse);
 }
 
 message AuditPage {
@@ -148,14 +144,6 @@ message NodeDetachIpRequest {
   string sandbox_id = 1;
   string address = 2;
 }
-
-message NodeProviderRequest {
-  burrow.common.v1.PublicIp ip = 1;
-  // The reverse DNS name, for SetPublicIpRdns.
-  string rdns = 2;
-}
-
-message NodeProviderResponse {}
 
 message NodeCreateRequest {
   // The orchestrator owns the id namespace and assigns it.

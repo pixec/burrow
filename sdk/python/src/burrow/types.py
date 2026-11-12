@@ -199,16 +199,12 @@ class PublicIp:
     # The prefix routed to the sandbox: 32, or 128 or a subnet for IPv6.
     prefix_len: int
     pool: str
-    # "static", "ovh", "hetzner" or "bgp".
-    provider: str
-    # Whether it can follow its sandbox to another node.
-    movable: bool
     # "allocated", or "quarantined" while a released address sits out.
     state: str
     # "" while detached.
     sandbox_id: str
+    # The node it reaches. A sandbox holding it stays there.
     node_id: str
-    rdns: str
     allocated_at: datetime
     # None while detached.
     attached_at: Optional[datetime]
@@ -230,7 +226,6 @@ class IpPool:
     name: str
     node_id: str = ""
     node_labels: Dict[str, str] = field(default_factory=dict)
-    provider: str = "static"
     ranges: List[str] = field(default_factory=list)
     addresses: List[str] = field(default_factory=list)
     gateway: str = ""
@@ -238,7 +233,7 @@ class IpPool:
     nameservers: List[str] = field(default_factory=list)
     prefix6: str = ""
     per_sandbox: int = 0
-    # The provider looks addresses up on the uplink, so the node answers for
+    # The upstream looks addresses up on the uplink, so the node answers for
     # them there.
     on_link: bool = False
     allow_smtp: bool = False

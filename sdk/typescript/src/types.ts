@@ -461,9 +461,6 @@ export interface SandboxInfo {
   ipv6Address: string;
 }
 
-/** Who delivers a public address to the node holding it. */
-export type IpProvider = "static" | "ovh" | "hetzner" | "bgp";
-
 /** A dedicated public address, as the orchestrator records it. */
 export interface PublicIp {
   address: string;
@@ -472,15 +469,12 @@ export interface PublicIp {
   /** The prefix routed to the sandbox: 32, or 128 or a subnet for IPv6. */
   prefixLen: number;
   pool: string;
-  provider: IpProvider | "unknown";
-  /** Whether it can follow its sandbox to another node. */
-  movable: boolean;
   /** `allocated`, or `quarantined` while a released address sits out. */
   state: "allocated" | "quarantined" | "unknown";
   /** `""` while detached. */
   sandboxId: string;
+  /** The node it reaches. A sandbox holding it stays there. */
   nodeId: string;
-  rdns: string;
   allocatedAt: Date;
   /** `null` while detached. */
   attachedAt: Date | null;
@@ -494,8 +488,6 @@ export interface IpPool {
   /** One node, or every node carrying all of `nodeLabels`. */
   nodeId?: string;
   nodeLabels?: Record<string, string>;
-  /** Defaults to `static`. */
-  provider?: IpProvider;
   /** IPv4 ranges as `"first-last"`, and single addresses. */
   ranges?: string[];
   addresses?: string[];
@@ -506,7 +498,7 @@ export interface IpPool {
   /** An IPv6 prefix, and the size each sandbox gets from it. */
   prefix6?: string;
   perSandbox?: number;
-  /** The provider looks addresses up on the uplink, so the node answers for them. */
+  /** The upstream looks addresses up on the uplink, so the node answers for them. */
   onLink?: boolean;
   allowSmtp?: boolean;
   wakeOnTraffic?: boolean;

@@ -40,13 +40,12 @@ test("a public ip reads back with its enums named and its stamps as dates", () =
     family: 4,
     prefixLen: 32,
     pool: "rack-a",
-    provider: "IP_PROVIDER_STATIC",
+    nodeId: "node-a",
     state: "PUBLIC_IP_STATE_ALLOCATED",
     sandboxId: "sbx_a",
     allocatedAtUnixMs: "1700000000000",
   });
-  assert.equal(ip.movable, false);
-  assert.equal(ip.provider, "static");
+  assert.equal(ip.nodeId, "node-a");
   assert.equal(ip.state, "allocated");
   assert.equal(ip.allocatedAt.getTime(), 1700000000000);
   assert.equal(ip.attachedAt, null);
@@ -67,8 +66,8 @@ test("allocating for a sandbox and creating a pool send the wire's names", async
     method: "AllocateIp",
     request: { pool: "", family: 4, sandboxId: "api" },
   });
-  const pool = await ips.createPool({ name: "rack-a", nodeId: "node-a", provider: "ovh" });
-  assert.equal(calls[1].request.provider, "IP_PROVIDER_OVH");
-  assert.equal(pool.provider, "ovh");
+  const pool = await ips.createPool({ name: "rack-a", nodeId: "node-a", onLink: true });
+  assert.equal(calls[1].request.isOnLink, true);
+  assert.equal("provider" in calls[1].request, false);
   assert.equal(pool.total, 15);
 });

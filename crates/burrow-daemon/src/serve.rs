@@ -217,8 +217,8 @@ pub struct ServeArgs {
     /// The prefix each sandbox is routed out of `--ipv6-prefix`: 64 or 128.
     #[arg(long, default_value_t = 64, env = "BURROWD_IPV6_PER_SANDBOX")]
     pub ipv6_per_sandbox: u8,
-    /// Answer NDP on the uplink for each sandbox's IPv6 prefix, for a
-    /// provider that looks addresses up there rather than routing the prefix
+    /// Answer NDP on the uplink for each sandbox's IPv6 prefix, for an
+    /// upstream that looks addresses up there rather than routing the prefix
     /// to this node.
     #[arg(long = "ipv6-on-link", env = "BURROWD_IPV6_ON_LINK")]
     pub is_ipv6_on_link: bool,
@@ -234,10 +234,6 @@ pub struct ServeArgs {
     /// packets are dropped; 0 is unlimited.
     #[arg(long, default_value_t = 12_500, env = "BURROWD_INGRESS_KBYTES_PER_SEC")]
     pub ingress_kbytes_per_sec: u32,
-    /// JSON credentials for address providers (`ovh`, `hetzner`), read at
-    /// startup and never sent to the orchestrator.
-    #[arg(long, env = "BURROWD_IP_PROVIDERS_FILE")]
-    pub ip_providers_file: Option<std::path::PathBuf>,
     /// OTLP collector to export traces and sandbox metrics to, e.g.
     /// `http://collector:4317`. Unset leaves tracing local to this node's logs.
     #[arg(long, env = "OTEL_EXPORTER_OTLP_ENDPOINT")]
@@ -585,9 +581,6 @@ fn public_config(args: &ServeArgs) -> anyhow::Result<crate::publicip::PublicConf
         interface: args.public_interface.clone(),
         new_per_sec: args.ingress_new_per_sec,
         kbytes_per_sec: args.ingress_kbytes_per_sec,
-        providers: std::sync::Arc::new(crate::providers::Providers::load(
-            args.ip_providers_file.as_deref(),
-        )?),
         ..Default::default()
     };
     if let Some(prefix) = &args.ipv6_prefix {
@@ -645,8 +638,6 @@ fn local_node_info(args: &ServeArgs) -> anyhow::Result<NodeInfo> {
             .ipv6_prefix
             .as_ref()
             .map_or(0, |_| u32::from(args.ipv6_per_sandbox)),
-        ip_providers: crate::providers::Providers::load(args.ip_providers_file.as_deref())?
-            .registered(),
     })
 }
 

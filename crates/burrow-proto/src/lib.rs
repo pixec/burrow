@@ -85,34 +85,6 @@ impl api::v1::CommandState {
     }
 }
 
-impl common::v1::IpProvider {
-    /// The name the CLI and the providers file use. Unspecified reads as
-    /// static, a pool's default.
-    pub fn label(self) -> &'static str {
-        match self {
-            Self::Unspecified | Self::Static => "static",
-            Self::Ovh => "ovh",
-            Self::Hetzner => "hetzner",
-            Self::Bgp => "bgp",
-        }
-    }
-
-    pub fn from_label(label: &str) -> Option<Self> {
-        match label {
-            "static" => Some(Self::Static),
-            "ovh" => Some(Self::Ovh),
-            "hetzner" => Some(Self::Hetzner),
-            "bgp" => Some(Self::Bgp),
-            _ => None,
-        }
-    }
-
-    /// Whether an address from it can follow its sandbox to another node.
-    pub fn is_movable(self) -> bool {
-        !matches!(self, Self::Unspecified | Self::Static)
-    }
-}
-
 impl guest::v1::fs_request::Op {
     /// The syscall an error names, and the paths it reports, as Node's do.
     pub fn describe(&self) -> (&'static str, &str, &str) {

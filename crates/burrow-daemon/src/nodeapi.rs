@@ -38,23 +38,6 @@ pub struct NodeApi {
 }
 
 impl NodeApi {
-    /// The provider `ip` comes from, when this node holds its credentials.
-    fn provider(
-        &self,
-        ip: &common::PublicIp,
-    ) -> Result<std::sync::Arc<dyn crate::providers::Provider>, Status> {
-        self.sandboxes
-            .providers()
-            .get(ip.provider())
-            .ok_or_else(|| {
-                Status::failed_precondition(format!(
-                    "this node holds no credentials for the {} provider; give it \
-                     --ip-providers-file",
-                    ip.provider().label()
-                ))
-            })
-    }
-
     pub(crate) fn node_id(&self) -> String {
         self.node_id.lock().unwrap().clone()
     }
@@ -1045,43 +1028,6 @@ impl NodeService for NodeApi {
             .detach_public_ip(&req.sandbox_id, &req.address)
             .await?;
         Ok(Response::new(redact_secrets(sandbox)))
-    }
-
-    async fn route_public_ip(
-        &self,
-        req: Request<nodepb::NodeProviderRequest>,
-    ) -> Result<Response<nodepb::NodeProviderResponse>, Status> {
-        let ip = req.into_inner().ip.unwrap_or_default();
-        let provider = self.provider(&ip)?;
-        provider.route_here(&ip.address).await.map_err(|err| {
-            Status::unavailable(format!(
-                "{} could not route {}: {err}",
-                provider.name(),
-                ip.address
-            ))
-        })?;
-        tracing::info!(
-            address = ip.address,
-            provider = provider.name(),
-            "provider routed an address here"
-        );
-        Ok(Response::new(nodepb::NodeProviderResponse {}))
-    }
-
-    async fn set_public_ip_rdns(
-        &self,
-        req: Request<nodepb::NodeProviderRequest>,
-    ) -> Result<Response<nodepb::NodeProviderResponse>, Status> {
-        let req = req.into_inner();
-        let ip = req.ip.unwrap_or_default();
-        let provider = self.provider(&ip)?;
-        provider
-            .set_rdns(&ip.address, &req.rdns)
-            .await
-            .map_err(|err| {
-                Status::failed_precondition(format!("reverse DNS for {}: {err}", ip.address))
-            })?;
-        Ok(Response::new(nodepb::NodeProviderResponse {}))
     }
 
     /// Replaces a sandbox's tags.

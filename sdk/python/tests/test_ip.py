@@ -51,24 +51,21 @@ def test_a_pool_maps_its_friendly_keys():
             "ranges": ["203.0.113.16-203.0.113.30"],
             "on_link": True,
             "node_labels": {"rack": "b7"},
-            "provider": "ovh",
         }
     )
     assert pool.is_on_link and pool.ranges == ["203.0.113.16-203.0.113.30"]
     assert dict(pool.node_labels) == {"rack": "b7"}
-    assert pool.provider == common_pb2.IP_PROVIDER_OVH
     assert from_pool(pool) == IpPool(
         name="rack-a",
         node_id="node-a",
         node_labels={"rack": "b7"},
-        provider="ovh",
         ranges=["203.0.113.16-203.0.113.30"],
         on_link=True,
     )
     with pytest.raises(BurrowError):
         to_pool({"name": "rack-a", "mode": "nat"})
     with pytest.raises(BurrowError):
-        to_pool({"name": "rack-a", "provider": "aws"})
+        to_pool({"name": "rack-a", "provider": "static"})
 
 
 def test_a_public_ip_reads_back():
@@ -77,12 +74,12 @@ def test_a_public_ip_reads_back():
             address="203.0.113.17",
             family=4,
             sandbox_id="sbx_a",
-            provider=common_pb2.IP_PROVIDER_STATIC,
+            node_id="node-a",
             state=common_pb2.PUBLIC_IP_STATE_ALLOCATED,
             allocated_at_unix_ms=1_700_000_000_000,
         )
     )
-    assert ip.address == "203.0.113.17" and ip.sandbox_id == "sbx_a" and not ip.movable
-    assert ip.provider == "static" and ip.state == "allocated"
+    assert ip.address == "203.0.113.17" and ip.sandbox_id == "sbx_a"
+    assert ip.node_id == "node-a" and ip.state == "allocated"
     assert int(ip.allocated_at.timestamp()) == 1_700_000_000
     assert ip.attached_at is None

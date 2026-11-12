@@ -8,7 +8,7 @@ from typing import Any, List
 from ._pb import api_pb2, common_pb2
 from ._policy import as_section
 from ._transport import Transport
-from ._wire import at, at_or_none, label, value
+from ._wire import at, at_or_none, label
 from .types import IpPool, PublicIp
 
 
@@ -18,12 +18,9 @@ def to_public_ip(raw: common_pb2.PublicIp) -> PublicIp:
         family=raw.family,
         prefix_len=raw.prefix_len,
         pool=raw.pool,
-        provider=label(common_pb2.IpProvider, raw.provider, "IP_PROVIDER_") or "static",
-        movable=raw.is_movable,
         state=label(common_pb2.PublicIpState, raw.state, "PUBLIC_IP_STATE_") or "unknown",
         sandbox_id=raw.sandbox_id,
         node_id=raw.node_id,
-        rdns=raw.rdns,
         allocated_at=at(raw.allocated_at_unix_ms),
         attached_at=at_or_none(raw.attached_at_unix_ms),
         quarantined_until=at_or_none(raw.quarantined_until_unix_ms),
@@ -37,7 +34,6 @@ def to_pool(pool: Any) -> common_pb2.IpPool:
         name=pool.name,
         node_id=pool.node_id,
         node_labels=pool.node_labels,
-        provider=value(common_pb2.IpProvider, pool.provider, "IP_PROVIDER_", "ip pool"),
         ranges=pool.ranges,
         addresses=pool.addresses,
         gateway=pool.gateway,
@@ -57,7 +53,6 @@ def from_pool(raw: common_pb2.IpPool) -> IpPool:
         name=raw.name,
         node_id=raw.node_id,
         node_labels=dict(raw.node_labels),
-        provider=label(common_pb2.IpProvider, raw.provider, "IP_PROVIDER_") or "static",
         ranges=list(raw.ranges),
         addresses=list(raw.addresses),
         gateway=raw.gateway,
@@ -79,11 +74,11 @@ class Ips:
 
     ```python
     ip = burrow.ips.allocate(sandbox_id="api")
-    burrow.ips.set_rdns(ip.address, "mail.example.com")
     ```
 
     An address is kept until released, whatever happens to the sandbox holding
-    it, and a released one is quarantined before anyone gets it again.
+    it, and a released one is quarantined before anyone gets it again. It
+    reaches one node, so a sandbox holding one cannot move.
     """
 
     def __init__(self, transport: Transport):
@@ -113,14 +108,6 @@ class Ips:
     def detach(self, address: str) -> PublicIp:
         """Takes an address off its sandbox, keeping it allocated."""
         return to_public_ip(self._transport.unary("DetachIp", api_pb2.IpRef(address=address)))
-
-    def set_rdns(self, address: str, name: str) -> PublicIp:
-        """Through the address's provider; refused for a static pool."""
-        return to_public_ip(
-            self._transport.unary(
-                "SetIpRdns", api_pb2.SetIpRdnsRequest(address=address, name=name)
-            )
-        )
 
     def list(
         self, *, pool: str = "", sandbox_id: str = "", quarantined: bool = False

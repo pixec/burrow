@@ -3,8 +3,8 @@
 //! release.
 //!
 //! The orchestrator holds the records; the node holding a sandbox routes the
-//! address to it and is the only party that calls a provider, with the
-//! credentials in its own configuration.
+//! address to it. An address reaches one node, so a sandbox holding one stays
+//! there.
 
 #![allow(clippy::result_large_err)]
 
@@ -159,16 +159,6 @@ fn parse_prefix6(prefix: &str) -> Result<(Ipv6Addr, u8), String> {
 pub fn validate_pool(pool: &mut common::IpPool) -> Result<(), Status> {
     let invalid = |message: String| Status::invalid_argument(message);
     super::validate_name(&pool.name)?;
-    match common::IpProvider::try_from(pool.provider) {
-        Ok(common::IpProvider::Unspecified) => pool.provider = common::IpProvider::Static as i32,
-        Ok(_) => {}
-        Err(_) => {
-            return Err(invalid(format!(
-                "provider {} is not a known provider",
-                pool.provider
-            )));
-        }
-    }
     burrow_common::tags::validate_labels(&pool.node_labels)?;
     if pool.node_id.is_empty() == pool.node_labels.is_empty() {
         return Err(invalid(
@@ -513,8 +503,6 @@ impl ApiService {
                     family,
                     prefix_len: u32::from(prefix),
                     pool: pool.name.clone(),
-                    provider: pool.provider,
-                    is_movable: pool.provider().is_movable(),
                     node_id: pool.node_id.clone(),
                     allocated_at_unix_ms: now,
                     owner: caller.owner.clone(),
@@ -572,11 +560,10 @@ impl ApiService {
         self.attach_to(row, ip, &id).await
     }
 
-    /// The node a sandbox holding `ip` must be on, when it is pinned: a
-    /// static address that has reached a node keeps it, and a pool scoped to
-    /// one node gives every address that node.
+    /// The node a sandbox holding `ip` must be on: the one the address has
+    /// reached, or the one its pool is scoped to.
     pub(super) fn pinned_node(ip: &common::PublicIp) -> Option<String> {
-        (!ip.is_movable && !ip.node_id.is_empty()).then(|| ip.node_id.clone())
+        (!ip.node_id.is_empty()).then(|| ip.node_id.clone())
     }
 
     /// Checks that a sandbox on `node` can hold `ip`.
@@ -598,8 +585,7 @@ impl ApiService {
             && pinned != node
         {
             return Err(Status::failed_precondition(format!(
-                "{} is a static address that reaches only node {pinned}, and the sandbox is on \
-                 node {node}",
+                "{} reaches only node {pinned}, and the sandbox is on node {node}",
                 ip.address
             )));
         }
@@ -608,13 +594,6 @@ impl ApiService {
             return Err(Status::failed_precondition(format!(
                 "pool {} does not cover node {node}",
                 pool.name
-            )));
-        }
-        if ip.is_movable && !info.ip_providers.contains(&ip.provider) {
-            return Err(Status::failed_precondition(format!(
-                "node {node} holds no {} credentials, so it cannot have {} routed to it",
-                ip.provider().label(),
-                ip.address
             )));
         }
         Ok(())
@@ -643,14 +622,6 @@ impl ApiService {
         }
         self.require_reachable(&ip, &node).await?;
         let mut client = self.node_client(&node).await?;
-        if ip.is_movable && ip.node_id != node {
-            client
-                .route_public_ip(nodepb::NodeProviderRequest {
-                    ip: Some(ip.clone()),
-                    rdns: String::new(),
-                })
-                .await?;
-        }
         ip.sandbox_id = sandbox_id.to_string();
         ip.node_id = node.clone();
         ip.attached_at_unix_ms = burrow_common::unix_now_ms();
@@ -735,7 +706,6 @@ impl ApiService {
         ip.released_at_unix_ms = now;
         ip.quarantined_until_unix_ms = now + quarantine * 1000;
         ip.state = QUARANTINED;
-        ip.rdns.clear();
         let row = burrow_store::IpRow {
             state: QUARANTINED,
             available_at_ms: ip.quarantined_until_unix_ms,
@@ -772,57 +742,6 @@ impl ApiService {
             .filter_map(|row| common::PublicIp::decode(row.record.as_slice()).ok())
             .filter(|ip| sandbox.as_ref().is_none_or(|id| &ip.sandbox_id == id))
             .collect())
-    }
-
-    pub(super) async fn set_ip_rdns_inner(
-        &self,
-        metadata: &MetadataMap,
-        address: &str,
-        name: &str,
-    ) -> Result<common::PublicIp, Status> {
-        let caller = caller(metadata, &self.0.ips);
-        let (row, mut ip) = self.owned_ip(address, &caller).await?;
-        if !name.is_empty() && !is_host_name(name) {
-            return Err(Status::invalid_argument(format!(
-                "{name:?} is not a host name"
-            )));
-        }
-        if !ip.provider().is_movable() {
-            return Err(Status::failed_precondition(format!(
-                "{} is from a static pool, whose provider offers no reverse DNS; set its PTR \
-                 record with whoever routes the range",
-                ip.address
-            )));
-        }
-        let pool = self.pool(&ip.pool).await?;
-        let node = match ip.node_id.is_empty() {
-            false => ip.node_id.clone(),
-            true => self
-                .0
-                .nodes
-                .healthy_ids()
-                .into_iter()
-                .filter_map(|id| self.0.nodes.info(&id))
-                .find(|info| covers(&pool, info) && info.ip_providers.contains(&ip.provider))
-                .map(|info| info.id)
-                .ok_or_else(|| {
-                    Status::failed_precondition(format!(
-                        "no healthy node in pool {} holds {} credentials",
-                        pool.name,
-                        ip.provider().label()
-                    ))
-                })?,
-        };
-        self.node_client(&node)
-            .await?
-            .set_public_ip_rdns(nodepb::NodeProviderRequest {
-                ip: Some(ip.clone()),
-                rdns: name.to_string(),
-            })
-            .await?;
-        ip.rdns = name.to_string();
-        self.save_ip(&row, &ip).await?;
-        Ok(ip)
     }
 
     /// The addresses attached to `sandbox_id`, by the orchestrator's records.
@@ -930,71 +849,26 @@ impl ApiService {
         Ok(())
     }
 
-    /// Refuses a move that would leave a static address behind, and checks a
-    /// target can take every movable one.
-    pub(super) async fn require_movable(
-        &self,
-        sandbox_id: &str,
-        target: Option<&str>,
-    ) -> Result<(), Status> {
-        for (_, ip) in self.ips_of(sandbox_id).await {
-            if !ip.is_movable {
-                return Err(Status::failed_precondition(format!(
-                    "sandbox {sandbox_id} holds {}, a static address that reaches only node {}; \
-                     detach it first, or keep the sandbox where it is",
-                    ip.address, ip.node_id
-                )));
-            }
-            if let Some(target) = target {
-                self.require_reachable(&ip, target).await?;
-            }
-        }
-        Ok(())
-    }
-
-    /// Has each movable address the sandbox holds routed to `target`, between
-    /// the source letting go and the target restoring it.
-    pub(super) async fn route_to(&self, sandbox_id: &str, target: &str) -> Result<(), Status> {
+    /// Refuses moving a sandbox that holds public addresses: each reaches
+    /// only the node it is on.
+    pub(super) async fn require_unpinned(&self, sandbox_id: &str) -> Result<(), Status> {
         let ips = self.ips_of(sandbox_id).await;
         if ips.is_empty() {
             return Ok(());
         }
-        let mut client = self.node_client(target).await?;
-        for (row, mut ip) in ips {
-            self.require_reachable(&ip, target).await?;
-            client
-                .route_public_ip(nodepb::NodeProviderRequest {
-                    ip: Some(ip.clone()),
-                    rdns: String::new(),
-                })
-                .await?;
-            ip.node_id = target.to_string();
-            self.save_ip(&row, &ip).await?;
-            tracing::info!(
-                address = ip.address,
-                sandbox = sandbox_id,
-                node = target,
-                "public ip routed for a move"
-            );
-        }
-        Ok(())
+        let addresses: Vec<&str> = ips.iter().map(|(_, ip)| ip.address.as_str()).collect();
+        Err(Status::failed_precondition(format!(
+            "sandbox {sandbox_id} holds public {} {}, which only reach node {}; detach them \
+             first to move it",
+            if addresses.len() == 1 {
+                "address"
+            } else {
+                "addresses"
+            },
+            addresses.join(", "),
+            ips[0].1.node_id
+        )))
     }
-}
-
-/// A DNS host name: labels of letters, digits and hyphens, dot-separated.
-fn is_host_name(name: &str) -> bool {
-    let name = name.strip_suffix('.').unwrap_or(name);
-    !name.is_empty()
-        && name.len() <= 253
-        && name.split('.').all(|label| {
-            !label.is_empty()
-                && label.len() <= 63
-                && !label.starts_with('-')
-                && !label.ends_with('-')
-                && label
-                    .bytes()
-                    .all(|b| b.is_ascii_alphanumeric() || b == b'-')
-        })
 }
 
 #[cfg(test)]
@@ -1018,7 +892,6 @@ mod tests {
         pool.addresses = vec!["203.0.113.16".into(), "198.51.100.7".into()];
         validate_pool(&mut pool).unwrap();
         assert_eq!(pool.total, 16);
-        assert_eq!(pool.provider(), common::IpProvider::Static);
     }
 
     #[test]
@@ -1036,10 +909,9 @@ mod tests {
 
     #[test]
     fn a_pool_is_refused_when_it_is_malformed() {
-        let cases: [fn(&mut common::IpPool); 9] = [
+        let cases: [fn(&mut common::IpPool); 8] = [
             |p| p.node_id.clear(),
             |p| p.node_labels = [("rack".to_string(), "b7".to_string())].into(),
-            |p| p.provider = 99,
             |p| p.ranges = vec!["203.0.113.30-203.0.113.16".into()],
             |p| p.ranges = vec!["10.0.0.0-10.2.0.0".into()],
             |p| p.gateway = "2001:db8::1".into(),
@@ -1090,14 +962,5 @@ mod tests {
         assert!(covers(&labelled, &info));
         info.labels.clear();
         assert!(!covers(&labelled, &info));
-    }
-
-    #[test]
-    fn reverse_dns_names_are_host_names() {
-        assert!(is_host_name("mail.example.com"));
-        assert!(is_host_name("mail.example.com."));
-        assert!(!is_host_name("-bad.example"));
-        assert!(!is_host_name("a b"));
-        assert!(!is_host_name(""));
     }
 }

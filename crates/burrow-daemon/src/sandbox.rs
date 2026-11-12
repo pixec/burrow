@@ -132,7 +132,7 @@ pub struct NodeConfig {
     pub event_delivery: crate::delivery::Policy,
     /// How much disk this node promises its sandboxes, and what it keeps free.
     pub disk: crate::diskcap::DiskPolicy,
-    /// Public addresses: the routed IPv6 prefix, ingress limits, providers.
+    /// Public addresses: the routed IPv6 prefix and ingress limits.
     pub public: crate::publicip::PublicConfig,
     /// Which shapes are warmed, and how many snapshots are kept.
     pub warm: crate::warm::WarmPolicy,
@@ -3872,10 +3872,6 @@ impl SandboxManager {
             crate::publicip::spawn_wake(self.clone());
             crate::publicip::spawn_audit(self.clone());
         }
-    }
-
-    pub fn providers(&self) -> &crate::providers::Providers {
-        &self.config.public.providers
     }
 
     #[cfg_attr(not(target_os = "linux"), allow(dead_code))]

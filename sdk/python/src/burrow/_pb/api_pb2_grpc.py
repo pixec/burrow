@@ -217,11 +217,6 @@ class BurrowStub(object):
                 request_serializer=api__pb2.ListIpsRequest.SerializeToString,
                 response_deserializer=api__pb2.ListIpsResponse.FromString,
                 _registered_method=True)
-        self.SetIpRdns = channel.unary_unary(
-                '/burrow.api.v1.Burrow/SetIpRdns',
-                request_serializer=api__pb2.SetIpRdnsRequest.SerializeToString,
-                response_deserializer=common__pb2.PublicIp.FromString,
-                _registered_method=True)
         self.CreateIpPool = channel.unary_unary(
                 '/burrow.api.v1.Burrow/CreateIpPool',
                 request_serializer=common__pb2.IpPool.SerializeToString,
@@ -640,13 +635,6 @@ class BurrowServicer(object):
         context.set_details('Method not implemented!')
         raise NotImplementedError('Method not implemented!')
 
-    def SetIpRdns(self, request, context):
-        """Through the address's provider; refused where it offers none.
-        """
-        context.set_code(grpc.StatusCode.UNIMPLEMENTED)
-        context.set_details('Method not implemented!')
-        raise NotImplementedError('Method not implemented!')
-
     def CreateIpPool(self, request, context):
         """Pools, operator credentials only.
         """
@@ -1051,11 +1039,6 @@ def add_BurrowServicer_to_server(servicer, server):
                     servicer.ListIps,
                     request_deserializer=api__pb2.ListIpsRequest.FromString,
                     response_serializer=api__pb2.ListIpsResponse.SerializeToString,
-            ),
-            'SetIpRdns': grpc.unary_unary_rpc_method_handler(
-                    servicer.SetIpRdns,
-                    request_deserializer=api__pb2.SetIpRdnsRequest.FromString,
-                    response_serializer=common__pb2.PublicIp.SerializeToString,
             ),
             'CreateIpPool': grpc.unary_unary_rpc_method_handler(
                     servicer.CreateIpPool,
@@ -2192,33 +2175,6 @@ class Burrow(object):
             '/burrow.api.v1.Burrow/ListIps',
             api__pb2.ListIpsRequest.SerializeToString,
             api__pb2.ListIpsResponse.FromString,
-            options,
-            channel_credentials,
-            insecure,
-            call_credentials,
-            compression,
-            wait_for_ready,
-            timeout,
-            metadata,
-            _registered_method=True)
-
-    @staticmethod
-    def SetIpRdns(request,
-            target,
-            options=(),
-            channel_credentials=None,
-            call_credentials=None,
-            insecure=False,
-            compression=None,
-            wait_for_ready=None,
-            timeout=None,
-            metadata=None):
-        return grpc.experimental.unary_unary(
-            request,
-            target,
-            '/burrow.api.v1.Burrow/SetIpRdns',
-            api__pb2.SetIpRdnsRequest.SerializeToString,
-            common__pb2.PublicIp.FromString,
             options,
             channel_credentials,
             insecure,

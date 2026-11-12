@@ -1621,12 +1621,6 @@ enum IpCommand {
     Attach { address: String, sandbox: String },
     /// Take an address off its sandbox, keeping it allocated.
     Detach { address: String },
-    /// Set an address's reverse DNS name, through its provider.
-    Rdns {
-        address: String,
-        /// A host name; empty clears it.
-        name: String,
-    },
     /// List the addresses this credential holds.
     #[command(alias = "list")]
     Ls {
@@ -1672,9 +1666,6 @@ struct IpPoolFlags {
     /// Labels every node the pool covers carries, as key=value. Repeatable.
     #[arg(long = "node-label")]
     node_labels: Vec<String>,
-    /// static (default), ovh, hetzner or bgp.
-    #[arg(long, default_value = "static")]
-    provider: String,
     /// IPv4 addresses, as first-last. Repeatable.
     #[arg(long = "range")]
     ranges: Vec<String>,
@@ -1696,7 +1687,7 @@ struct IpPoolFlags {
     /// The size of each sandbox's IPv6 share, e.g. 64 or 128.
     #[arg(long, default_value_t = 64)]
     per_sandbox: u32,
-    /// The provider looks addresses up on the uplink (ARP, NDP), so the node
+    /// The upstream looks addresses up on the uplink (ARP, NDP), so the node
     /// answers for them there.
     #[arg(long = "on-link")]
     is_on_link: bool,
@@ -1717,12 +1708,6 @@ impl IpPoolFlags {
             name: self.name,
             node_id: self.node.unwrap_or_default(),
             node_labels: parse_pairs("--node-label", &self.node_labels)?,
-            provider: common::IpProvider::from_label(&self.provider).ok_or_else(|| {
-                anyhow::anyhow!(
-                    "--provider {:?}: expected static, ovh, hetzner or bgp",
-                    self.provider
-                )
-            })? as i32,
             ranges: self.ranges,
             addresses: self.addresses,
             gateway: self.gateway.unwrap_or_default(),
@@ -1757,10 +1742,9 @@ fn ip_line(ip: &common::PublicIp) -> String {
         "attached"
     };
     format!(
-        "{:<40} {:<14} {:<9} {:<12} {:<20} {:<16} {}",
+        "{:<40} {:<14} {:<12} {:<20} {}",
         truncate(&address, 40),
         truncate(&ip.pool, 14),
-        ip.provider().label(),
         state,
         if ip.sandbox_id.is_empty() {
             "-"
@@ -1772,7 +1756,6 @@ fn ip_line(ip: &common::PublicIp) -> String {
         } else {
             &ip.node_id
         },
-        if ip.rdns.is_empty() { "-" } else { &ip.rdns },
     )
 }
 
@@ -1782,11 +1765,8 @@ fn ip_json(ip: &common::PublicIp) -> serde_json::Value {
         "family": ip.family,
         "prefix_len": ip.prefix_len,
         "pool": ip.pool,
-        "provider": ip.provider().label(),
-        "is_movable": ip.is_movable,
         "sandbox": ip.sandbox_id,
         "node": ip.node_id,
-        "rdns": ip.rdns,
         "quarantined_until_unix_ms": ip.quarantined_until_unix_ms,
     })
 }
@@ -3002,7 +2982,7 @@ async fn main() -> anyhow::Result<()> {
 }
 
 async fn run_ip(client: &mut Client, command: IpCommand) -> anyhow::Result<()> {
-    const HEADER: &str = "ADDRESS                                  POOL           PROVIDER  STATE        SANDBOX              NODE             RDNS";
+    const HEADER: &str = "ADDRESS                                  POOL           STATE        SANDBOX              NODE";
     match command {
         IpCommand::Allocate {
             pool,
@@ -3047,17 +3027,6 @@ async fn run_ip(client: &mut Client, command: IpCommand) -> anyhow::Result<()> {
             let ip = client.detach_ip(api::IpRef { address }).await?.into_inner();
             println!("{} detached", ip.address);
         }
-        IpCommand::Rdns { address, name } => {
-            let ip = client
-                .set_ip_rdns(api::SetIpRdnsRequest { address, name })
-                .await?
-                .into_inner();
-            println!(
-                "{} -> {}",
-                ip.address,
-                if ip.rdns.is_empty() { "-" } else { &ip.rdns }
-            );
-        }
         IpCommand::Ls {
             pool,
             sandbox,
@@ -3090,21 +3059,11 @@ async fn run_ip(client: &mut Client, command: IpCommand) -> anyhow::Result<()> {
         }
         IpCommand::Pool(IpPoolCommand::Create(flags)) => {
             let pool = client.create_ip_pool(flags.pool()?).await?.into_inner();
-            println!(
-                "{} ({} addresses, {})",
-                pool.name,
-                pool.total,
-                pool.provider().label()
-            );
+            println!("{} ({} addresses)", pool.name, pool.total);
         }
         IpCommand::Pool(IpPoolCommand::Update(flags)) => {
             let pool = client.update_ip_pool(flags.pool()?).await?.into_inner();
-            println!(
-                "{} ({} addresses, {})",
-                pool.name,
-                pool.total,
-                pool.provider().label()
-            );
+            println!("{} ({} addresses)", pool.name, pool.total);
         }
         IpCommand::Pool(IpPoolCommand::Rm { name }) => {
             client
@@ -3126,7 +3085,6 @@ async fn run_ip(client: &mut Client, command: IpCommand) -> anyhow::Result<()> {
                             "name": pool.name,
                             "node": pool.node_id,
                             "node_labels": pairs_json(&pool.node_labels),
-                            "provider": pool.provider().label(),
                             "total": pool.total,
                             "allocated": pool.allocated,
                         })
@@ -3140,8 +3098,8 @@ async fn run_ip(client: &mut Client, command: IpCommand) -> anyhow::Result<()> {
                 println!("no ip pools");
             } else {
                 println!(
-                    "{:<16} {:<24} {:<9} {:>9}  ADDRESSES",
-                    "POOL", "SCOPE", "PROVIDER", "ALLOCATED"
+                    "{:<16} {:<24} {:>9}  ADDRESSES",
+                    "POOL", "SCOPE", "ALLOCATED"
                 );
                 for pool in &pools {
                     let scope = match pool.node_id.is_empty() {
@@ -3167,10 +3125,9 @@ async fn run_ip(client: &mut Client, command: IpCommand) -> anyhow::Result<()> {
                             .join(","),
                     };
                     println!(
-                        "{:<16} {:<24} {:<9} {:>4}/{:<4}  {}",
+                        "{:<16} {:<24} {:>4}/{:<4}  {}",
                         truncate(&pool.name, 16),
                         truncate(&scope, 24),
-                        pool.provider().label(),
                         pool.allocated,
                         pool.total,
                         addresses
@@ -4427,10 +4384,7 @@ fn print_config(sandbox: &common::Sandbox) {
         );
     }
     for ip in &sandbox.public_ips {
-        field(
-            "public ip",
-            &format!("{} ({}, {})", ip.address, ip.pool, ip.provider().label()),
-        );
+        field("public ip", &format!("{} ({})", ip.address, ip.pool));
     }
     // Always shown, zeroes included: a sandbox that has spent nothing is a
     // fact, and a missing line reads as "not measured".
