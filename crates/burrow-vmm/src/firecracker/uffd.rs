@@ -43,6 +43,8 @@ pub const UFFD_SOCK: &str = "uffd.sock";
 
 /// How long to wait for Firecracker to connect after `load_snapshot` is issued.
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(30);
+/// How often an idle handler looks at whether it has been told to stop.
+const STOP_POLL_MS: libc::c_int = 100;
 
 /// One guest memory region, as Firecracker describes it.
 ///
@@ -453,9 +455,8 @@ impl UffdBackend {
 impl Drop for UffdBackend {
     fn drop(&mut self) {
         self.stop.store(true, Ordering::Relaxed);
-        // The thread wakes from its blocking read when Firecracker exits and
-        // closes the descriptor, which is the normal path; joining just keeps
-        // the mapping alive until it is genuinely finished with it.
+        // The thread sees the flag within one poll; joining keeps the mapping
+        // alive until it is genuinely finished with it.
         if let Some(thread) = self.thread.take() {
             let _ = thread.join();
         }
@@ -614,6 +615,17 @@ fn handle_faults(
     loop {
         if stop.load(Ordering::Relaxed) {
             return Ok(faulted);
+        }
+        // Firecracker makes the descriptor non-blocking, so a bare read spun
+        // a host core for as long as the guest ran.
+        let mut pollfd = libc::pollfd {
+            fd,
+            events: libc::POLLIN,
+            revents: 0,
+        };
+        // SAFETY: `pollfd` is one valid entry for the duration of the call.
+        if unsafe { libc::poll(&mut pollfd, 1, STOP_POLL_MS) } == 0 {
+            continue;
         }
         // SAFETY: `fd` is the userfaultfd and `buf` is exactly one message.
         let read = unsafe { libc::read(fd, buf.as_mut_ptr().cast(), UFFD_MSG_SIZE) };
