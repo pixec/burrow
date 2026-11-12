@@ -161,7 +161,6 @@ message NodeCreateRequest {
   string template = 2;
   burrow.common.v1.Policy policy = 3;
   map<string, string> tags = 4;
-  reserved 5;
   // Recorded on the sandbox so it survives a restart and comes back in the
   // node's inventory. The orchestrator owns name uniqueness; the node just
   // keeps what it is told.

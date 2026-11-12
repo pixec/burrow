@@ -151,7 +151,6 @@ message AttachInput {
 }
 
 message AttachStart {
-  reserved 1;
   string command_id = 2;
   // Output offset to resume from, counting stdout and stderr bytes together
   // from the command's start. An attacher that saw N bytes passes N and gets
@@ -575,7 +574,6 @@ message GuestHealthResponse {
 // call and every call on an open file goes through here, so each language's
 // own file API can be mirrored without an exec per call.
 message FsRequest {
-  reserved 1;
   // Do it as this guest user rather than as root: the guest kernel checks
   // the user may, and what is created is theirs. Empty is root.
   string user = 2;

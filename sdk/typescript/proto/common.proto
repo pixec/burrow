@@ -14,8 +14,6 @@ enum SandboxState {
   // Shut down: VMM gone, writable disk and volumes kept. A start cold-boots
   // the same disk, unlike a resume, which restores the memory of a suspend.
   SANDBOX_STATE_STOPPED = 8;
-  reserved 3, 5;
-  reserved "SANDBOX_STATE_PAUSED", "SANDBOX_STATE_STOPPING";
 }
 
 enum NetworkMode {
@@ -249,8 +247,6 @@ message RequestRule {
   // being inspected. The rule stays in the policy until a later update
   // removes it.
   uint64 expires_at_unix_ms = 5;
-  reserved 6;
-  reserved "is_expired";
   // When set, the rule applies only in the sandbox with this id. A copy of the
   // policy anywhere else, such as a fork or a sandbox created from a
   // snapshot, refuses every request the rule would have claimed rather than
@@ -288,11 +284,6 @@ message NetworkPolicy {
   // since the proxy has to terminate TLS to touch a request at all. At most 32.
   // In open mode each rule's domain must be an exact host name, since it also
   // names a host whose TLS is inspected.
-  //
-  // Field 7 was `repeated HeaderInjection inject_headers`, which is the special
-  // case of a rule with no matcher and a set_headers action.
-  reserved 7;
-  reserved "inject_headers";
   repeated RequestRule rules = 8;
   // Domain globs refused in every mode, before any allowance is consulted. A
   // name matching one is not resolved, not connected to and, inside an
@@ -449,8 +440,6 @@ message VolumeMount {
 // descriptors beside the rootfs, and a create from such a template is
 // provisioned the way they ask.
 message KitSpec {
-  reserved 1;
-  reserved "refs";
   // Create-phase arg values by arg name, applied to every Kit declaring it.
   map<string, string> args = 2;
   // Container environment overrides, applied after image defaults and arg
@@ -473,8 +462,6 @@ message Volume {
   // that was released for a move: the next sandbox to mount it places it.
   string node_id = 2;
   uint64 size_mib = 3;
-  reserved 4;
-  reserved "created_at";
   // Sandbox currently holding the writable claim, empty when free. Read-only
   // mounts are not tracked here: they do not exclude anything.
   string attached_to = 5;
@@ -499,8 +486,6 @@ message Sandbox {
   string template = 3;
   SandboxState state = 4;
   Policy policy = 5;
-  reserved 6;
-  reserved "created_at";
   // Tags, at most 16. Keys are 1..=64 bytes and values up to 256, neither
   // carrying control characters.
   map<string, string> tags = 7;
@@ -558,8 +543,6 @@ message Sandbox {
   // What the saved state needs to be restored on, while it is durable: its
   // cpu architecture and the version of `hypervisor` that wrote it.
   string arch = 21;
-  reserved 22, 23;
-  reserved "firecracker_version", "access_revoked_at";
   string hypervisor_version = 29;
   // The CPU its saved memory was written on, while it has some: its latest
   // suspend or memory checkpoint. That state restores only on a node whose
@@ -587,8 +570,6 @@ message Sandbox {
   // tap. Ingress to them follows `NetworkPolicy.ingress`. Read-only: change
   // them with AttachIp and DetachIp.
   repeated PublicIp public_ips = 31;
-  reserved 32, 33;
-  reserved "ipv6_address", "ipv6_prefix_len";
   // Unix milliseconds of the latest checkpoint in the object store; 0 for
   // none. Once the node is gone, this is how much of the sandbox survives:
   // what it did after this is lost.
@@ -629,8 +610,6 @@ message PublicIp {
   // as 64 for IPv6.
   uint32 prefix_len = 3;
   string pool = 4;
-  reserved 5, 6, 9;
-  reserved "provider", "is_movable", "rdns";
   // Empty while detached.
   string sandbox_id = 7;
   // The node the address reaches, kept once set.
@@ -651,8 +630,6 @@ message PublicIp {
   int64 released_at_unix_ms = 19;
   int64 quarantined_until_unix_ms = 20;
   PublicIpState state = 21;
-  reserved 22;
-  reserved "is_node_prefix";
 }
 
 // Where public addresses come from. Operator configuration.
@@ -661,8 +638,6 @@ message IpPool {
   // One node, or every node carrying all of `node_labels`.
   string node_id = 2;
   map<string, string> node_labels = 3;
-  reserved 4;
-  reserved "provider";
   // IPv4: a range "first-last" and/or explicit addresses.
   repeated string ranges = 5;
   repeated string addresses = 6;
@@ -699,8 +674,6 @@ message IpPool {
 message Session {
   string id = 1;
   string sandbox_id = 2;
-  reserved 3, 4;
-  reserved "started_at", "ended_at";
   SessionStart started_by = 5;
   // Unspecified while the session is open.
   SessionEnd ended_by = 6;
@@ -746,9 +719,6 @@ message Snapshot {
   // Filled in by the orchestrator from its own view of the fleet; a node knows
   // its snapshots are its own and does not set it.
   string node_id = 4;
-  reserved 5, 6, 7, 8, 10, 13;
-  reserved "vcpus", "mem_mib", "scratch_disk_mib", "created_at", "expires_at",
-      "firecracker_version";
   // Everything the snapshot occupies on the node: memory image, vmstate and
   // disk.
   uint64 size_bytes = 9;
@@ -803,8 +773,6 @@ message NodeInfo {
   // `hypervisor_versions`. A snapshot taken elsewhere is only placed here
   // when all match.
   string arch = 10;
-  reserved 11;
-  reserved "firecracker_version";
   // Where clients reach this node's Access service directly, scheme
   // included, e.g. "https://node-a.example.com:7073". Empty when it serves
   // none, the default, and then exec and files go through the orchestrator.
@@ -819,16 +787,12 @@ message NodeInfo {
   // SHA-256 of the root this node's TLS inspection leaves chain to, in hex:
   // the fleet root, or the node's own authority when it has none.
   string inspection_root_fingerprint = 15;
-  reserved 16;
-  reserved "inspection_ca_expires_at";
   // What this node's platform enforces: "ingress" and "public_ips" on Linux,
   // neither on macOS. The orchestrator refuses a policy using one on a node
   // not naming it.
   repeated string policy_features = 17;
   // Unix milliseconds when the node's inspection CA expires.
   int64 inspection_ca_expires_at_unix_ms = 18;
-  reserved 19, 20, 21, 22;
-  reserved "ipv6_prefix", "ipv6_per_sandbox", "ip_providers", "is_ipv6_on_link";
   // What a probe of the filesystem sandboxes live on found at startup.
   HoleProbe hole_probe = 23;
   // Host memory each offered hypervisor's VMM is allowed beyond its guest,
@@ -886,23 +850,16 @@ message HoleProbe {
 message NodeStatus {
   uint32 running_sandboxes = 1;
   uint64 free_mem_mib = 2;
-  reserved 3;
-  reserved "warm_templates";
   bool is_draining = 4;
   // Templates this node holds. Images are node-local, so placement has to
   // know where they are rather than assuming every node is interchangeable.
   repeated string templates = 5;
-  reserved 6;
-  reserved "committed_vcpus";
   // The subset of `templates` imported from Kits, whose creates the node
   // provisions through the Kit lifecycle.
   repeated string kit_templates = 7;
   // Volumes on this node, including those a Kit's lifecycle created on it,
   // which the orchestrator never saw a request for.
   repeated Volume volumes = 8;
-  reserved 9, 10, 11, 12, 13;
-  reserved "disk_free_bytes", "disk_total_bytes", "disk_reserve_bytes",
-      "disk_unwritten_bytes", "disk_overcommit";
   // Free disk is below the reserve while sandboxes run here. The node refuses
   // creates, resumes and adopts until it is not.
   bool is_disk_low = 14;
@@ -946,8 +903,6 @@ message DiskCapacity {
   // What the node keeps free and promises to no sandbox (--disk-reserve-mib,
   // 5% of the filesystem by default).
   uint64 reserve_bytes = 3;
-  reserved 4;
-  reserved "unwritten_bytes";
   // How far provisioned disk may exceed the filesystem less its reserve
   // (--disk-overcommit), always positive; 1.0 never overcommits.
   double overcommit = 5;
