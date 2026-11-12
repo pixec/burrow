@@ -196,6 +196,15 @@ pub(crate) fn retarget(snapshot: &mut Value, spec: &VmSpec) -> Result<()> {
             spec.vcpus, spec.mem_mib, spec.mem_hotplug_mib
         )));
     }
+    for device in ["serial", "console"] {
+        if snapshot[device]["mode"] == "File" && snapshot[device]["file"] != CONSOLE_PIPE {
+            return Err(Error::Snapshot(format!(
+                "the snapshot writes its {device} to {}, not {CONSOLE_PIPE}: it was taken by a \
+                 build before the console pipe",
+                snapshot[device]["file"]
+            )));
+        }
+    }
     if let (Some(net), Some(nics)) = (&spec.net, snapshot["net"].as_array_mut()) {
         for nic in nics.iter_mut().filter(|nic| nic["id"] == NET_ID) {
             nic["tap"] = json!(net.tap);
@@ -435,6 +444,18 @@ mod tests {
         mine.mem_mib = 2048;
         assert!(matches!(
             retarget(&mut snapshot, &mine),
+            Err(Error::Snapshot(_))
+        ));
+    }
+
+    /// A snapshot from before the console pipe names a console file a jailed
+    /// VMM cannot open.
+    #[test]
+    fn a_restore_refuses_a_console_written_to_a_file() {
+        let mut snapshot = vm_config(&spec(), &config(), "x86_64").unwrap();
+        snapshot["serial"]["file"] = json!("console.log");
+        assert!(matches!(
+            retarget(&mut snapshot, &spec()),
             Err(Error::Snapshot(_))
         ));
     }
