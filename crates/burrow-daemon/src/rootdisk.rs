@@ -240,38 +240,6 @@ fn reflink(_source: &Path, _dest: &Path) -> std::io::Result<()> {
     Err(std::io::ErrorKind::Unsupported.into())
 }
 
-/// The byte ranges of `file` that hold data, from `SEEK_DATA`/`SEEK_HOLE`.
-pub fn data_extents(file: &std::fs::File) -> std::io::Result<Vec<(u64, u64)>> {
-    use std::os::fd::AsRawFd as _;
-    let fd = file.as_raw_fd();
-    let size = file.metadata()?.len() as i64;
-    let mut extents = Vec::new();
-    let mut cursor = 0i64;
-    while cursor < size {
-        // SAFETY: `fd` is open; SEEK_DATA/SEEK_HOLE take plain integers.
-        let start = unsafe { libc::lseek(fd, cursor as libc::off_t, libc::SEEK_DATA) };
-        if start < 0 {
-            let err = std::io::Error::last_os_error();
-            match err.raw_os_error() {
-                Some(libc::ENXIO) => break,
-                Some(libc::EINVAL) => return Ok(vec![(0, size as u64)]),
-                _ => return Err(err),
-            }
-        }
-        // SAFETY: as above.
-        let end = unsafe { libc::lseek(fd, start, libc::SEEK_HOLE) };
-        if end < 0 {
-            return Err(std::io::Error::last_os_error());
-        }
-        if end <= start {
-            break;
-        }
-        extents.push((start as u64, end as u64));
-        cursor = end as i64;
-    }
-    Ok(extents)
-}
-
 /// Copies `source`'s data to a new `dest` of the same size, leaving holes.
 fn sparse_copy(source: &Path, dest: &Path) -> std::io::Result<()> {
     let from = std::fs::File::open(source)?;
@@ -282,7 +250,7 @@ fn sparse_copy(source: &Path, dest: &Path) -> std::io::Result<()> {
     let size = from.metadata()?.len();
     to.set_len(size)?;
     let mut buf = vec![0u8; CHUNK_SIZE as usize];
-    for (start, end) in data_extents(&from)? {
+    for (start, end) in burrow_vmm::data_extents(&from)? {
         let mut at = start;
         while at < end {
             let len = ((end - at) as usize).min(buf.len());
@@ -430,7 +398,11 @@ fn fiemap(file: &std::fs::File) -> std::io::Result<Vec<Mapped>> {
             out.push(Mapped {
                 logical: extent.logical,
                 end: extent.logical + extent.length,
-                physical: (extent.flags & unknown == 0).then_some(extent.physical),
+                // Block 0 is never file data. A filesystem reporting it for
+                // everything is not saying where anything is, and taken at its
+                // word would make every chunk look shared with the image.
+                physical: (extent.flags & unknown == 0 && extent.physical != 0)
+                    .then_some(extent.physical),
             });
             start = extent.logical + extent.length;
             last |= extent.flags & EXTENT_LAST != 0;
@@ -478,7 +450,8 @@ fn mapping_within(extents: &[Mapped], start: u64, end: u64) -> Vec<Mapped> {
 /// sits on the same device blocks in both files, or in a hole in both. On a
 /// filesystem that reflinks, those are the chunks the guest never wrote,
 /// found without reading either file. `None` where the filesystem cannot
-/// say, and then every chunk with data is read.
+/// say, as ZFS cannot (it has no `FIEMAP`), and then every chunk with data is
+/// read.
 pub fn unchanged_chunks(
     disk: &std::fs::File,
     image: &std::fs::File,
