@@ -30,7 +30,7 @@ use std::time::Duration;
 pub use cgroup::{Cgroup, Limits, is_io_weight_supported};
 pub use cloud_hypervisor::{ChJail, CloudHypervisorConfig};
 pub use error::{Error, Result};
-pub use firecracker::{FirecrackerConfig, Jail, MemorySource, PageSource};
+pub use firecracker::{FirecrackerConfig, IoEngine, Jail, MemorySource, PageSource};
 pub use guest::{GUEST_CID, GuestAddr, VSOCK_UDS};
 pub use memfile::{data_extents, merge_chain};
 #[cfg(target_os = "macos")]

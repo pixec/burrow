@@ -29,6 +29,22 @@ pub struct FirecrackerConfig {
     /// Confines each VMM to a chroot under an unprivileged uid. `None` runs it
     /// as root with the whole host visible.
     pub jail: Option<Jail>,
+    /// How Firecracker serves its drives' requests.
+    pub io_engine: IoEngine,
+}
+
+/// Firecracker's block I/O engine.
+///
+/// `Sync` handles one request at a time on the VMM thread, so a guest's
+/// queue depth buys it nothing. `Async` submits them through io_uring.
+/// Firecracker calls it a developer preview: its io_uring workers count
+/// against the host's PID limit, and before Linux 5.12 they ran outside the
+/// VMM's cgroup. A snapshot restores with the engine it was taken with.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize)]
+pub enum IoEngine {
+    #[default]
+    Sync,
+    Async,
 }
 
 /// The neutral spec, as Firecracker is configured from it. Firecracker boots
@@ -61,6 +77,7 @@ pub(crate) fn spec(spec: VmSpec, config: FirecrackerConfig) -> crate::Result<Mic
         is_vsock_enabled: spec.is_vsock_enabled,
         is_dirty_pages_tracked: spec.is_dirty_pages_tracked,
         jail: config.jail,
+        io_engine: config.io_engine,
         is_memory_lazy: spec.is_memory_lazy,
         memory_chain: spec.memory_chain,
         prefetch: spec.prefetch,
@@ -146,6 +163,7 @@ pub struct MicroVmSpec {
     /// Confines firecracker to a chroot under an unprivileged uid. `None`
     /// runs it as root with the host filesystem visible.
     pub jail: Option<process::Jail>,
+    pub io_engine: IoEngine,
     /// Serve guest memory lazily on restore instead of letting the kernel page
     /// the whole memory file in. Ignored on a cold boot, which has no memory
     /// file to serve from.
@@ -196,6 +214,7 @@ impl MicroVmSpec {
             record_prefetch: None,
             memory_source: None,
             jail: None,
+            io_engine: IoEngine::Sync,
             is_memory_lazy: false,
             memory_chain: Vec::new(),
             limits: Limits::default(),
@@ -345,7 +364,9 @@ impl MicroVm {
             .await?;
 
         for drive in &self.spec.drives {
-            self.api.add_drive(&Drive::from_spec(drive)).await?;
+            self.api
+                .add_drive(&Drive::from_spec(drive, self.spec.io_engine))
+                .await?;
         }
 
         if let Some(net) = &self.spec.net {
@@ -523,7 +544,9 @@ impl MicroVm {
     /// volume reaches a sandbox restored from a warm snapshot, which was
     /// captured without it.
     pub async fn attach_drive(&self, drive: &DriveSpec) -> Result<()> {
-        self.api.add_drive(&Drive::from_spec(drive)).await
+        self.api
+            .add_drive(&Drive::from_spec(drive, self.spec.io_engine))
+            .await
     }
 
     /// Tells the running guest that a drive's file changed size, which the
@@ -701,6 +724,7 @@ mod tests {
         let config = FirecrackerConfig {
             bin: "firecracker".into(),
             jail: None,
+            io_engine: IoEngine::Sync,
         };
         let backend = crate::Backend::Firecracker(config.clone());
         let mut vm = VmSpec::new("sbx_1", "/tmp/sbx_1", backend);

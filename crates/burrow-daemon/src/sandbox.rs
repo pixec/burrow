@@ -131,6 +131,7 @@ const HOST_PORT_RANGE: std::ops::Range<u16> = 20000..30000;
 pub struct NodeConfig {
     pub data_dir: PathBuf,
     pub firecracker_bin: PathBuf,
+    pub firecracker_io_engine: burrow_vmm::IoEngine,
     /// Appended to every guest kernel command line.
     pub extra_boot_args: String,
     /// Boots every guest with a verbose console, as a create can ask for one.
@@ -233,6 +234,7 @@ impl NodeConfig {
                 burrow_vmm::Backend::Firecracker(burrow_vmm::FirecrackerConfig {
                     bin: self.firecracker_bin.clone(),
                     jail: self.jail_for(hypervisor).cloned(),
+                    io_engine: self.firecracker_io_engine,
                 })
             }
             Hypervisor::CloudHypervisor => {
@@ -10998,6 +11000,7 @@ pub(crate) mod tests {
             NodeConfig {
                 data_dir: std::env::temp_dir().join(format!("burrow-fork-{}", std::process::id())),
                 firecracker_bin: "/nonexistent/firecracker".into(),
+                firecracker_io_engine: Default::default(),
                 extra_boot_args: String::new(),
                 is_console_verbose: false,
                 agent_timeout: std::time::Duration::from_millis(1),
@@ -11743,6 +11746,7 @@ pub(crate) mod tests {
                 burrow_vmm::Backend::Firecracker(burrow_vmm::FirecrackerConfig {
                     bin: "/nonexistent/firecracker".into(),
                     jail: None,
+                    io_engine: Default::default(),
                 }),
             )),
             agent_channel: Mutex::new(None),
@@ -11943,8 +11947,11 @@ pub(crate) mod tests {
         let sandbox = Arc::new(sandbox_in(workdir.clone()));
         let spec = {
             let mut spec = sandbox.spec.lock().unwrap();
-            spec.backend =
-                burrow_vmm::Backend::Firecracker(burrow_vmm::FirecrackerConfig { bin, jail: None });
+            spec.backend = burrow_vmm::Backend::Firecracker(burrow_vmm::FirecrackerConfig {
+                bin,
+                jail: None,
+                io_engine: Default::default(),
+            });
             spec.cgroup_root = None;
             spec.clone()
         };
@@ -12358,6 +12365,7 @@ pub(crate) mod tests {
                 burrow_vmm::Backend::Firecracker(burrow_vmm::FirecrackerConfig {
                     bin: "/nonexistent/firecracker".into(),
                     jail: None,
+                    io_engine: Default::default(),
                 }),
             )),
             agent_channel: Mutex::new(None),

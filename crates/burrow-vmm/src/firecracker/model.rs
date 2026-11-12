@@ -52,18 +52,21 @@ pub struct Drive {
     /// stops in the host page cache: a power cut loses writes the guest was
     /// told were durable.
     pub cache_type: CacheType,
+    pub io_engine: super::IoEngine,
 }
 
 impl Drive {
     /// The drive Firecracker is given for `spec`, the one place a drive is
-    /// rendered, so a boot and a hotplug cannot disagree on its cache mode.
-    pub fn from_spec(spec: &crate::DriveSpec) -> Self {
+    /// rendered, so a boot and a hotplug cannot disagree on its cache mode or
+    /// engine.
+    pub fn from_spec(spec: &crate::DriveSpec, io_engine: super::IoEngine) -> Self {
         Self {
             drive_id: spec.id.clone(),
             path_on_host: spec.path.clone(),
             is_root_device: spec.is_root,
             is_read_only: spec.is_read_only,
             cache_type: CacheType::Writeback,
+            io_engine,
         }
     }
 }
@@ -199,8 +202,10 @@ mod tests {
             volume,
             read_only_volume,
         ] {
-            let body = serde_json::to_value(Drive::from_spec(&spec)).unwrap();
+            let body = serde_json::to_value(Drive::from_spec(&spec, super::super::IoEngine::Sync))
+                .unwrap();
             assert_eq!(body["cache_type"], "Writeback", "{}", spec.id);
+            assert_eq!(body["io_engine"], "Sync", "{}", spec.id);
             assert_eq!(body["drive_id"], spec.id.as_str());
             assert_eq!(body["path_on_host"], spec.path.as_str());
             assert_eq!(body["is_read_only"], spec.is_read_only);

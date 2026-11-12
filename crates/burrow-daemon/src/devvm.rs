@@ -61,6 +61,7 @@ impl VmBootArgs {
             Hypervisor::Firecracker => Backend::Firecracker(FirecrackerConfig {
                 bin: self.firecracker.clone(),
                 jail: None,
+                io_engine: Default::default(),
             }),
             Hypervisor::CloudHypervisor => Backend::CloudHypervisor(CloudHypervisorConfig {
                 bin: self.cloud_hypervisor.clone(),
