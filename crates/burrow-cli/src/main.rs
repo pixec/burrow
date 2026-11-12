@@ -3380,7 +3380,7 @@ async fn run_in_sandbox(
                     // against a stopped VM.
                     if matches!(
                         common::SandboxState::try_from(sandbox.state),
-                        Ok(common::SandboxState::Suspended) | Ok(common::SandboxState::Paused)
+                        Ok(common::SandboxState::Suspended)
                     ) {
                         client
                             .resume_sandbox(api::SandboxRef {
@@ -4062,16 +4062,14 @@ async fn list_sandboxes(client: &mut Client, tag: String, all: bool) -> anyhow::
 
 /// Whether a sandbox is one a bare `ps` shows.
 ///
-/// A sandbox still being built, or on its way down, is a live machine and
-/// belongs in the same listing. Suspended, finished and lost records are what
+/// A sandbox still being built is a live machine and belongs in the same
+/// listing. Suspended, finished and lost records are what
 /// --all is for.
 fn is_running(sandbox: &common::Sandbox) -> bool {
     !sandbox.is_unreachable
         && matches!(
             common::SandboxState::try_from(sandbox.state),
-            Ok(common::SandboxState::Creating)
-                | Ok(common::SandboxState::Running)
-                | Ok(common::SandboxState::Stopping)
+            Ok(common::SandboxState::Creating) | Ok(common::SandboxState::Running)
         )
 }
 
@@ -4828,9 +4826,7 @@ fn state_name(state: i32) -> &'static str {
     match common::SandboxState::try_from(state) {
         Ok(common::SandboxState::Creating) => "creating",
         Ok(common::SandboxState::Running) => "running",
-        Ok(common::SandboxState::Paused) => "paused",
         Ok(common::SandboxState::Suspended) => "suspended",
-        Ok(common::SandboxState::Stopping) => "stopping",
         Ok(common::SandboxState::Destroyed) => "destroyed",
         Ok(common::SandboxState::Failed) => "failed",
         Ok(common::SandboxState::Stopped) => "stopped",
@@ -6097,12 +6093,10 @@ mod tests {
         for live in [
             common::SandboxState::Creating,
             common::SandboxState::Running,
-            common::SandboxState::Stopping,
         ] {
             assert!(is_running(&sandbox(live, false)), "{live:?}");
         }
         for gone in [
-            common::SandboxState::Paused,
             common::SandboxState::Suspended,
             common::SandboxState::Destroyed,
             common::SandboxState::Failed,

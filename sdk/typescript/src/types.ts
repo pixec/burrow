@@ -7,10 +7,8 @@ export type NetworkMode = "none" | "allowlist" | "open";
 export type SandboxState =
   | "creating"
   | "running"
-  | "paused"
   | "suspended"
   | "stopped"
-  | "stopping"
   | "destroyed"
   | "failed"
   | "unknown";

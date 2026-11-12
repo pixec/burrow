@@ -209,8 +209,8 @@ stdin. `lost_bytes` counts output a rotating log dropped.
   `update_access_policy`, `update_lifetime`, and `update_resources` for
   vCPUs, memory and the root disk, reported per field as live, next boot,
   offline or refused); lifecycle (`pause`, `resume`,
-  `stop`, `start`, `recreate`, `move`, `snapshot`, `delete`), named as the
-  states are: a paused sandbox keeps its memory and resumes in milliseconds,
+  `stop`, `start`, `recreate`, `move`, `snapshot`, `delete`): a paused
+  sandbox (state `suspended`) keeps its memory and resumes in milliseconds,
   a stopped one keeps only its disk and starts with a cold boot; guest users
   (`create_user`, `create_group`, `delete_user`, `delete_group`, `as_user`).
   `delete_user(name, remove_home=False)` keeps the home, handed to root on

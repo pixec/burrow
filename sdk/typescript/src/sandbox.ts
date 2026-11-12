@@ -60,10 +60,8 @@ import { dateOf, dateOrNull, enumOf } from "./wire.js";
 const STATES: readonly SandboxState[] = [
   "creating",
   "running",
-  "paused",
   "suspended",
   "stopped",
-  "stopping",
   "destroyed",
   "failed",
 ];

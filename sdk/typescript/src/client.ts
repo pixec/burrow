@@ -141,7 +141,7 @@ export class Sandboxes {
     for (let attempt = 0; attempt < GET_OR_CREATE_ATTEMPTS; attempt++) {
       try {
         const sandbox = await this.get({ id: key, env, autoResume, onResume, signal, timeoutMs });
-        if (options.resume && (sandbox.state === "paused" || sandbox.state === "suspended")) {
+        if (options.resume && sandbox.state === "suspended") {
           await sandbox.resume();
         }
         return sandbox;

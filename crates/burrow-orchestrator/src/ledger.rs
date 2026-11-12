@@ -54,7 +54,7 @@ enum Effect {
 fn counted(state: i32) -> Option<i32> {
     match SandboxState::try_from(state).unwrap_or_default() {
         SandboxState::Creating | SandboxState::Running => Some(RUNNING),
-        SandboxState::Paused | SandboxState::Suspended => Some(SUSPENDED),
+        SandboxState::Suspended => Some(SUSPENDED),
         // A failed sandbox is one a node kept on disk and could not run.
         SandboxState::Stopped | SandboxState::Failed => Some(STOPPED),
         _ => None,

@@ -7,16 +7,15 @@ enum SandboxState {
   SANDBOX_STATE_UNSPECIFIED = 0;
   SANDBOX_STATE_CREATING = 1;
   SANDBOX_STATE_RUNNING = 2;
-  // VMM alive, vCPUs paused (in-memory; fastest resume).
-  SANDBOX_STATE_PAUSED = 3;
   // Snapshotted to disk, VMM gone; survives daemon restarts.
   SANDBOX_STATE_SUSPENDED = 4;
-  SANDBOX_STATE_STOPPING = 5;
   SANDBOX_STATE_DESTROYED = 6;
   SANDBOX_STATE_FAILED = 7;
   // Shut down: VMM gone, writable disk and volumes kept. A start cold-boots
   // the same disk, unlike a resume, which restores the memory of a suspend.
   SANDBOX_STATE_STOPPED = 8;
+  reserved 3, 5;
+  reserved "SANDBOX_STATE_PAUSED", "SANDBOX_STATE_STOPPING";
 }
 
 enum NetworkMode {
