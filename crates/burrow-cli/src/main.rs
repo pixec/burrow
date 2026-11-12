@@ -780,6 +780,14 @@ struct HostLimitFlags {
     /// no cap.
     #[arg(long)]
     cpus: Option<f64>,
+    /// Host CPU reserved for the sandbox, e.g. 4, as Compose's
+    /// `deploy.resources.reservations.cpus` and Swarm's `--reserve-cpu`:
+    /// what placement charges a node instead of --cpus, and what its CPU
+    /// weight follows. It bursts past it up to --cpus, or to --vcpus without
+    /// a cap, so `--vcpus 8 --reserve-cpus 4` gives the guest 8 CPUs and
+    /// charges the node 4. At most --cpus and --vcpus; 0 clears it.
+    #[arg(long = "reserve-cpus")]
+    reserved_cpus: Option<f64>,
     /// Relative CPU weight under contention, as `docker run --cpu-shares`
     /// (2-262144). Unset is 1024 for each CPU charged.
     #[arg(long = "cpu-shares")]
@@ -797,6 +805,7 @@ struct HostLimitFlags {
 impl HostLimitFlags {
     fn is_stated(&self) -> bool {
         self.cpus.is_some()
+            || self.reserved_cpus.is_some()
             || self.cpu_shares.is_some()
             || self.cpuset_cpus.is_some()
             || self.blkio_weight.is_some()
@@ -1582,6 +1591,9 @@ fn host_limits_text(resources: &common::ResourcePolicy) -> String {
         parts.push(format!("cpus {}", resources.cpus));
     } else {
         parts.push("cpus uncapped".to_string());
+    }
+    if resources.reserved_cpus > 0.0 {
+        parts.push(format!("reserve-cpus {}", resources.reserved_cpus));
     }
     if resources.cpu_shares > 0 {
         parts.push(format!("cpu-shares {}", resources.cpu_shares));
@@ -2526,6 +2538,7 @@ async fn main() -> anyhow::Result<()> {
                 mem_mib,
                 disk_mib,
                 cpus: limits.cpus,
+                reserved_cpus: limits.reserved_cpus,
                 cpu_shares: limits.cpu_shares,
                 cpuset_cpus: limits.cpuset_cpus,
                 blkio_weight: limits.blkio_weight,
@@ -3425,6 +3438,7 @@ fn create_request(flags: CreateFlags) -> anyhow::Result<api::CreateSandboxReques
                 mem_mib: mem_mib.unwrap_or(0),
                 disk_mib: disk_mib.unwrap_or(0),
                 cpus: limits.cpus.unwrap_or(0.0),
+                reserved_cpus: limits.reserved_cpus.unwrap_or(0.0),
                 cpu_shares: limits.cpu_shares.unwrap_or(0),
                 cpuset_cpus: limits.cpuset_cpus.unwrap_or_default(),
                 blkio_weight: limits.blkio_weight.unwrap_or(0),
@@ -5635,6 +5649,7 @@ fn sandbox_json(sandbox: &common::Sandbox) -> String {
             "boot_mem_mib": resources.boot_mem_mib,
             "disk_mib": resources.disk_mib,
             "cpus": resources.cpus,
+            "reserved_cpus": resources.reserved_cpus,
             "cpu_shares": resources.cpu_shares,
             "cpuset_cpus": resources.cpuset_cpus,
             "blkio_weight": resources.blkio_weight,
@@ -5987,6 +6002,14 @@ mod tests {
         assert_eq!(
             super::host_limits_text(&common::ResourcePolicy::default()),
             "cpus uncapped"
+        );
+        assert_eq!(
+            super::host_limits_text(&common::ResourcePolicy {
+                vcpus: 8,
+                reserved_cpus: 4.0,
+                ..Default::default()
+            }),
+            "cpus uncapped, reserve-cpus 4"
         );
         assert_eq!(super::cpus_text(1500), "1.5");
     }

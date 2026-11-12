@@ -573,6 +573,7 @@ pub struct ResourcesUpdated {
 #[derive(Default)]
 pub struct LimitsUpdate {
     pub cpus: Option<f64>,
+    pub reserved_cpus: Option<f64>,
     pub cpu_shares: Option<u32>,
     pub cpuset_cpus: Option<String>,
     pub blkio_weight: Option<u32>,
@@ -581,6 +582,7 @@ pub struct LimitsUpdate {
 impl LimitsUpdate {
     pub fn is_empty(&self) -> bool {
         self.cpus.is_none()
+            && self.reserved_cpus.is_none()
             && self.cpu_shares.is_none()
             && self.cpuset_cpus.is_none()
             && self.blkio_weight.is_none()
@@ -589,6 +591,9 @@ impl LimitsUpdate {
     fn apply(self, resources: &mut common::ResourcePolicy) {
         if let Some(cpus) = self.cpus {
             resources.cpus = cpus;
+        }
+        if let Some(reserved) = self.reserved_cpus {
+            resources.reserved_cpus = reserved;
         }
         if let Some(shares) = self.cpu_shares {
             resources.cpu_shares = shares;
@@ -614,9 +619,11 @@ pub(crate) fn cgroup_limits(
 ) -> burrow_vmm::Limits {
     use burrow_common::cpu;
     let cap = cpu::cap_millis(resources.cpus);
-    let charge = cpu::charge_millis(resources.vcpus, cap);
+    let reserve = cpu::cap_millis(resources.reserved_cpus);
+    let charge = cpu::charge_millis(resources.vcpus, cap, reserve);
     burrow_vmm::Limits {
         cpu_max_millis: cap,
+        cpu_reserve_millis: reserve,
         cpu_weight: cpu::shares_to_weight(cpu::shares(resources.cpu_shares, charge)),
         cpuset_cpus: resources.cpuset_cpus.clone(),
         io_weight: match resources.blkio_weight {
@@ -644,6 +651,7 @@ fn start_cpu_cap(vm: &Vm, limits: &burrow_vmm::Limits, sandbox: &str) {
 /// cgroup to enforce.
 fn has_host_limits(resources: &common::ResourcePolicy) -> bool {
     resources.cpus > 0.0
+        || resources.reserved_cpus > 0.0
         || resources.cpu_shares > 0
         || !resources.cpuset_cpus.is_empty()
         || resources.blkio_weight > 0
@@ -1324,7 +1332,11 @@ impl RunningSandbox {
     /// CPU: its cap where it has one, otherwise its vCPUs.
     pub fn cpu_charge_millis(&self) -> u64 {
         let spec = self.spec.lock().unwrap();
-        burrow_common::cpu::charge_millis(spec.vcpus, spec.limits.cpu_max_millis)
+        burrow_common::cpu::charge_millis(
+            spec.vcpus,
+            spec.limits.cpu_max_millis,
+            spec.limits.cpu_reserve_millis,
+        )
     }
 
     /// The memory the VM is given, the node's default or a macOS guest's
@@ -4870,8 +4882,16 @@ impl SandboxManager {
     ) -> Result<(common::Sandbox, ResourcesUpdated), Status> {
         let sandbox = self.get(id).await?;
         if !sandbox.is_running() {
-            self.admit_shape(&sandbox, vcpus, mem_mib, disk_mib, limits.cpus, boot)
-                .await?;
+            self.admit_shape(
+                &sandbox,
+                vcpus,
+                mem_mib,
+                disk_mib,
+                limits.cpus,
+                limits.reserved_cpus,
+                boot,
+            )
+            .await?;
             if boot && sandbox.is_suspended() {
                 self.stop(id).await?;
             }
@@ -4891,11 +4911,14 @@ impl SandboxManager {
             });
         }
         if vcpus.is_some() || mem_mib.is_some() {
-            let cap = limits.cpus.map_or_else(
-                || sandbox.spec.lock().unwrap().limits.cpu_max_millis,
-                burrow_common::cpu::cap_millis,
-            );
-            let (vcpus, mem_mib) = self.reshape(&sandbox, vcpus, mem_mib, cap).await?;
+            let current = sandbox.spec.lock().unwrap().limits.clone();
+            let cap = limits
+                .cpus
+                .map_or(current.cpu_max_millis, burrow_common::cpu::cap_millis);
+            let reserve = limits
+                .reserved_cpus
+                .map_or(current.cpu_reserve_millis, burrow_common::cpu::cap_millis);
+            let (vcpus, mem_mib) = self.reshape(&sandbox, vcpus, mem_mib, cap, reserve).await?;
             updated.vcpus = vcpus;
             updated.mem_mib = mem_mib;
         }
@@ -4909,6 +4932,7 @@ impl SandboxManager {
     /// no room for, naming the shortfall: the memory ceiling it would boot
     /// with (on a boot, or a grow), the CPU it would be charged, and the disk
     /// it would grow by.
+    #[allow(clippy::too_many_arguments)]
     async fn admit_shape(
         &self,
         sandbox: &RunningSandbox,
@@ -4916,6 +4940,7 @@ impl SandboxManager {
         mem_mib: Option<u32>,
         disk_mib: Option<u32>,
         cpus: Option<f64>,
+        reserved_cpus: Option<f64>,
         boot: bool,
     ) -> Result<(), Status> {
         let current_mem = sandbox.mem_mib();
@@ -4924,11 +4949,12 @@ impl SandboxManager {
             let ceiling = self.config.memory_ceiling_mib(sandbox.hypervisor, mem);
             self.admit_memory(0, ceiling)?;
         }
-        let cap = cpus.map_or_else(
-            || sandbox.spec.lock().unwrap().limits.cpu_max_millis,
-            burrow_common::cpu::cap_millis,
-        );
-        let charge = burrow_common::cpu::charge_millis(vcpus.unwrap_or(sandbox.vcpus()), cap);
+        let limits = sandbox.spec.lock().unwrap().limits.clone();
+        let cap = cpus.map_or(limits.cpu_max_millis, burrow_common::cpu::cap_millis);
+        let reserve =
+            reserved_cpus.map_or(limits.cpu_reserve_millis, burrow_common::cpu::cap_millis);
+        let charge =
+            burrow_common::cpu::charge_millis(vcpus.unwrap_or(sandbox.vcpus()), cap, reserve);
         self.admit_cpu(sandbox.cpu_charge_millis(), charge).await?;
         if let Some(mib) = disk_mib.filter(|mib| *mib > sandbox.disk_mib()) {
             self.admit_disk(
@@ -4974,6 +5000,7 @@ impl SandboxManager {
         if let Err(reason) = burrow_common::cpu::validate(
             resources.vcpus,
             resources.cpus,
+            resources.reserved_cpus,
             resources.cpu_shares,
             &resources.cpuset_cpus,
             resources.blkio_weight,
@@ -4988,11 +5015,13 @@ impl SandboxManager {
         let next = cgroup_limits(&resources, memory_mib);
         let is_unchanged = (
             previous.cpus,
+            previous.reserved_cpus,
             previous.cpu_shares,
             &previous.cpuset_cpus,
             previous.blkio_weight,
         ) == (
             resources.cpus,
+            resources.reserved_cpus,
             resources.cpu_shares,
             &resources.cpuset_cpus,
             resources.blkio_weight,
@@ -5004,7 +5033,11 @@ impl SandboxManager {
             });
         }
         let slot = sandbox.vm.lock().await;
-        let charge = burrow_common::cpu::charge_millis(resources.vcpus, next.cpu_max_millis);
+        let charge = burrow_common::cpu::charge_millis(
+            resources.vcpus,
+            next.cpu_max_millis,
+            next.cpu_reserve_millis,
+        );
         if let Err(err) = self.admit_cpu(sandbox.cpu_charge_millis(), charge).await {
             return Ok(refuse(err.message().to_string()));
         }
@@ -5029,6 +5062,7 @@ impl SandboxManager {
                 .resources
                 .get_or_insert_with(Default::default);
             stored.cpus = resources.cpus;
+            stored.reserved_cpus = resources.reserved_cpus;
             stored.cpu_shares = resources.cpu_shares;
             stored.cpuset_cpus = resources.cpuset_cpus.clone();
             stored.blkio_weight = resources.blkio_weight;
@@ -5038,6 +5072,7 @@ impl SandboxManager {
         tracing::info!(
             sandbox = sandbox.id(),
             cpus = resources.cpus,
+            reserved_cpus = resources.reserved_cpus,
             cpu_shares = resources.cpu_shares,
             cpuset_cpus = resources.cpuset_cpus,
             blkio_weight = resources.blkio_weight,
@@ -5325,6 +5360,7 @@ impl SandboxManager {
         vcpus: Option<u32>,
         mem_mib: Option<u32>,
         cap_millis: u64,
+        reserve_millis: u64,
     ) -> Result<(Option<ResourceOutcome>, Option<ResourceOutcome>), Status> {
         let id = sandbox.id();
         let (current_vcpus, current_mem) = (sandbox.vcpus(), sandbox.mem_mib());
@@ -5360,49 +5396,57 @@ impl SandboxManager {
                 Some(outcome(ResourceChange::Unchanged, current_vcpus, want))
             }
             Some(_) if let Some(reason) = &blocked => Some(refuse(reason, current_vcpus)),
-            Some(want) if cap_millis > u64::from(want) * 1000 => Some(refuse(
+            Some(want) if cap_millis.max(reserve_millis) > u64::from(want) * 1000 => Some(refuse(
                 &format!(
-                    "sandbox {id} is capped at {} cpus, more than {want} vcpus; lower its cpus \
-                     with them",
-                    cpus_text(cap_millis)
+                    "sandbox {id} is capped at or reserved {} cpus, more than {want} vcpus; \
+                     lower its cpus or reserved_cpus with them",
+                    cpus_text(cap_millis.max(reserve_millis))
                 ),
                 current_vcpus,
             )),
-            Some(want) => Some(match self.admit_vcpus(sandbox, want).await {
-                Err(err) => refused(err, current_vcpus)?,
-                Ok(()) => match slot.as_ref() {
-                    None => outcome(ResourceChange::NextBoot, current_vcpus, want),
-                    Some(vm) => {
-                        let max_vcpus = sandbox.spec.lock().unwrap().max_vcpus;
-                        if !sandbox.hypervisor.capabilities().is_vcpu_hotplug_supported {
-                            refuse(
-                                &format!(
-                                    "{} cannot change a running guest's vCPUs; shut {id} \
+            Some(want) => Some(
+                match self
+                    .admit_vcpus(sandbox, want, cap_millis, reserve_millis)
+                    .await
+                {
+                    Err(err) => refused(err, current_vcpus)?,
+                    Ok(()) => match slot.as_ref() {
+                        None => outcome(ResourceChange::NextBoot, current_vcpus, want),
+                        Some(vm) => {
+                            let max_vcpus = sandbox.spec.lock().unwrap().max_vcpus;
+                            if !sandbox.hypervisor.capabilities().is_vcpu_hotplug_supported {
+                                refuse(
+                                    &format!(
+                                        "{} cannot change a running guest's vCPUs; shut {id} \
                                      down, update it, and boot it",
-                                    sandbox.hypervisor
-                                ),
-                                current_vcpus,
-                            )
-                        } else if want > max_vcpus {
-                            refuse(
-                                &format!(
-                                    "sandbox {id} was booted able to take up to {max_vcpus} \
-                                     vCPUs; shut it down, update it, and boot it for more"
-                                ),
-                                current_vcpus,
-                            )
-                        } else {
-                            match vm.resize_vcpus(want).await {
-                                Ok(()) => outcome(ResourceChange::Live, current_vcpus, want),
-                                Err(err) => refuse(
-                                    &format!("{} refused the change: {err}", sandbox.hypervisor),
+                                        sandbox.hypervisor
+                                    ),
                                     current_vcpus,
-                                ),
+                                )
+                            } else if want > max_vcpus {
+                                refuse(
+                                    &format!(
+                                        "sandbox {id} was booted able to take up to {max_vcpus} \
+                                     vCPUs; shut it down, update it, and boot it for more"
+                                    ),
+                                    current_vcpus,
+                                )
+                            } else {
+                                match vm.resize_vcpus(want).await {
+                                    Ok(()) => outcome(ResourceChange::Live, current_vcpus, want),
+                                    Err(err) => refuse(
+                                        &format!(
+                                            "{} refused the change: {err}",
+                                            sandbox.hypervisor
+                                        ),
+                                        current_vcpus,
+                                    ),
+                                }
                             }
                         }
-                    }
+                    },
                 },
-            }),
+            ),
         };
         let mem_mib = match mem_mib {
             None => None,
@@ -5604,10 +5648,15 @@ impl SandboxManager {
     }
 
     /// Refuses giving `sandbox` `vcpus` where the node has no room for what
-    /// that charges it.
-    async fn admit_vcpus(&self, sandbox: &RunningSandbox, vcpus: u32) -> Result<(), Status> {
-        let cap = sandbox.spec.lock().unwrap().limits.cpu_max_millis;
-        let charge = burrow_common::cpu::charge_millis(vcpus, cap);
+    /// that charges it under the cap and reservation it will have.
+    async fn admit_vcpus(
+        &self,
+        sandbox: &RunningSandbox,
+        vcpus: u32,
+        cap_millis: u64,
+        reserve_millis: u64,
+    ) -> Result<(), Status> {
+        let charge = burrow_common::cpu::charge_millis(vcpus, cap_millis, reserve_millis);
         self.admit_cpu(sandbox.cpu_charge_millis(), charge).await
     }
 
@@ -6801,8 +6850,8 @@ impl SandboxManager {
             && has_host_limits(&resources)
         {
             return Err(Status::failed_precondition(
-                "a Mac node has no cgroup to hold cpus, cpu_shares, cpuset_cpus or blkio_weight; \
-                 leave them unset for a macOS sandbox",
+                "a Mac node has no cgroup to hold cpus, reserved_cpus, cpu_shares, cpuset_cpus or \
+                 blkio_weight; leave them unset for a macOS sandbox",
             ));
         }
         // A create of a shape with no warm snapshot is exactly the signal that
@@ -10572,6 +10621,22 @@ pub(crate) mod tests {
             640,
         );
         assert_eq!(uncapped.cpu_max_millis, 0);
+
+        let reserved = cgroup_limits(
+            &common::ResourcePolicy {
+                vcpus: 8,
+                reserved_cpus: 4.0,
+                ..Default::default()
+            },
+            640,
+        );
+        assert_eq!(reserved.cpu_max_millis, 0, "a reservation is no cap");
+        assert_eq!(reserved.cpu_reserve_millis, 4000);
+        assert_eq!(
+            reserved.cpu_weight,
+            burrow_common::cpu::shares_to_weight(4096),
+            "weighted by the four CPUs reserved, not the eight it may burst to"
+        );
         assert_eq!(
             uncapped.cpu_weight,
             burrow_common::cpu::shares_to_weight(100)

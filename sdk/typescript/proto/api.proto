@@ -689,10 +689,12 @@ message UpdateLifetimeRequest {
 // both when the machine is configured, and offers a running macOS guest only
 // a memory balloon, which takes memory away and never adds any.
 //
-// The host limits, `cpus`, `cpu_shares`, `cpuset_cpus` and `blkio_weight`,
-// are the VMM's cgroup and change together: live on a running sandbox, and on
-// a suspended or shut-down one when it next runs. 0, or an empty cpuset,
-// clears one. A `cpus` above the vcpus the sandbox will have is refused.
+// The host limits, `cpus`, `reserved_cpus`, `cpu_shares`, `cpuset_cpus` and
+// `blkio_weight`, are the VMM's cgroup and change together: live on a running
+// sandbox, and on a suspended or shut-down one when it next runs. 0, or an
+// empty cpuset, clears one. A `cpus` above the vcpus the sandbox will have is
+// refused, as is a `reserved_cpus` above its `cpus` or vcpus. A change of what
+// the sandbox is charged is admitted against its node's CPU first.
 //
 // A suspended or shut-down sandbox is resized only if the shape it ends with
 // fits the node: the memory ceiling it would boot with, the CPU it is charged
@@ -715,6 +717,8 @@ message UpdateResourcesRequest {
   // them. Nothing is discarded when the shape does not fit. Ignored for a
   // running sandbox.
   bool boot = 9;
+  // Moves with the other host limits.
+  optional double reserved_cpus = 10;
 }
 
 enum ResourceChange {

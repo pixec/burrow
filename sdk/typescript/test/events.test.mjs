@@ -103,6 +103,7 @@ test("a snapshot surfaces where it can be restored", () => {
     memoryMib: 3072,
     diskMib: 2048,
     cpus: 0,
+    reservedCpus: 0,
     cpuShares: 0,
     cpusetCpus: "",
     blkioWeight: 0,

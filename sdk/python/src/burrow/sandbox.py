@@ -923,6 +923,7 @@ class Sandbox:
         memory_mib: Optional[int] = None,
         disk_mib: Optional[int] = None,
         cpus: Optional[float] = None,
+        reserved_cpus: Optional[float] = None,
         cpu_shares: Optional[int] = None,
         cpuset_cpus: Optional[str] = None,
         blkio_weight: Optional[int] = None,
@@ -944,10 +945,10 @@ class Sandbox:
         shape fits its node, and otherwise raises `resource_exhausted` with
         nothing changed. `boot=True` resizes one that is not running and
         starts it in the same call, a suspended one being resumed and stopped
-        cleanly first, once the shape is known to fit. The host
-        limits (`cpus`, `cpu_shares`, `cpuset_cpus`, `blkio_weight`) move live
-        on a running sandbox and otherwise when it next runs; 0, or an empty
-        `cpuset_cpus`, clears one. What cannot be applied is reported as
+        cleanly first, once the shape is known to fit. The host limits
+        (`cpus`, `reserved_cpus`, `cpu_shares`, `cpuset_cpus`,
+        `blkio_weight`) move live on a running sandbox and otherwise when it
+        next runs; 0, or an empty `cpuset_cpus`, clears one. What cannot be applied is reported as
         "refused" with the reason rather than raised, so check each field you
         asked for.
 
@@ -977,6 +978,7 @@ class Sandbox:
                 mem_mib=memory_mib,
                 disk_mib=disk_mib,
                 cpus=cpus,
+                reserved_cpus=reserved_cpus,
                 cpu_shares=cpu_shares,
                 cpuset_cpus=cpuset_cpus,
                 blkio_weight=blkio_weight,

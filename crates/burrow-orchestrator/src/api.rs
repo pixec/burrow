@@ -475,6 +475,7 @@ impl ApiService {
             burrow_common::cpu::validate(
                 r.vcpus,
                 r.cpus,
+                r.reserved_cpus,
                 r.cpu_shares,
                 &r.cpuset_cpus,
                 r.blkio_weight,
@@ -488,6 +489,7 @@ impl ApiService {
             is_mesh_available: self.0.nodes.is_mesh_available(""),
             vcpus: resources.as_ref().map(|r| r.vcpus).unwrap_or(0).max(1),
             cpus: resources.as_ref().map(|r| r.cpus).unwrap_or(0.0),
+            reserved_cpus: resources.as_ref().map(|r| r.reserved_cpus).unwrap_or(0.0),
             mem_mib: match resources.as_ref().map(|r| r.mem_mib).unwrap_or(0) {
                 0 => 512,
                 mem => mem as u64,
@@ -1884,6 +1886,7 @@ impl ApiService {
             is_mesh_available: self.0.nodes.is_mesh_available(""),
             vcpus: resources.vcpus.max(1),
             cpus: resources.cpus,
+            reserved_cpus: resources.reserved_cpus,
             mem_mib: match resources.mem_mib {
                 0 => 512,
                 mem => mem as u64,
@@ -1977,7 +1980,11 @@ impl ApiService {
             .as_ref()
             .and_then(|policy| policy.resources.clone())
             .unwrap_or_default();
-        let cpu_millis = crate::registry::cpu_charge_millis(resources.vcpus, resources.cpus);
+        let cpu_millis = crate::registry::cpu_charge_millis(
+            resources.vcpus,
+            resources.cpus,
+            resources.reserved_cpus,
+        );
         let mem_mib = self.0.nodes.mem_charge_mib(
             &sandbox.node_id,
             &sandbox.hypervisor,
@@ -2445,6 +2452,7 @@ impl Burrow for ApiService {
             },
         };
         let is_limited = req.cpus.is_some()
+            || req.reserved_cpus.is_some()
             || req.cpu_shares.is_some()
             || req.cpuset_cpus.is_some()
             || req.blkio_weight.is_some();
@@ -2465,6 +2473,7 @@ impl Burrow for ApiService {
                     mem_mib: req.mem_mib.filter(|_| refusal.is_none()),
                     disk_mib: req.disk_mib,
                     cpus: req.cpus,
+                    reserved_cpus: req.reserved_cpus,
                     cpu_shares: req.cpu_shares,
                     cpuset_cpus: req.cpuset_cpus,
                     blkio_weight: req.blkio_weight,
@@ -2496,6 +2505,26 @@ impl Burrow for ApiService {
             && (is_plugged || is_booted)
         {
             guard.keep();
+        }
+        // The node admitted what the sandbox is charged now; its next
+        // heartbeat counts it, and until then placement does here.
+        let charged = |sandbox: &common::Sandbox| {
+            let resources = sandbox
+                .policy
+                .as_ref()
+                .and_then(|policy| policy.resources.clone())
+                .unwrap_or_default();
+            crate::registry::cpu_charge_millis(
+                resources.vcpus,
+                resources.cpus,
+                resources.reserved_cpus,
+            )
+        };
+        if let Some(sandbox) = &updated.sandbox {
+            let grown = charged(sandbox).saturating_sub(charged(&record));
+            if grown > 0 {
+                self.0.nodes.charge_cpu(&node_id, grown);
+            }
         }
         if let Some(sandbox) = &updated.sandbox {
             self.0.sandboxes.update(sandbox.clone());
@@ -2870,6 +2899,7 @@ impl Burrow for ApiService {
             is_mesh_available: self.0.nodes.is_mesh_available(""),
             vcpus: 1,
             cpus: 0.0,
+            reserved_cpus: 0.0,
             mem_mib: 0,
             // A volume's image is the volume's, which disk admission does
             // not count yet.

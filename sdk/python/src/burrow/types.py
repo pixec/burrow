@@ -32,6 +32,12 @@ class ResourcePolicy:
     # `docker run --cpus`: a hard cap, and what placement charges a node, so
     # 2 vCPUs at 0.5 take half a CPU of it. At most `vcpus`; 0 is no cap.
     cpus: float = 0.0
+    # Host CPU reserved for the sandbox, e.g. 4, as Compose's
+    # `deploy.resources.reservations.cpus`: what placement charges a node in
+    # place of `cpus`, and what its CPU weight follows. It bursts past it up
+    # to `cpus`, or to `vcpus` without a cap. At most `cpus` and `vcpus`; 0
+    # is none.
+    reserved_cpus: float = 0.0
     # Relative CPU weight under contention, as `--cpu-shares` (2-262144). 0 is
     # 1024 per CPU charged.
     cpu_shares: int = 0

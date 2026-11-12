@@ -44,8 +44,9 @@ message ResourcePolicy {
   uint32 disk_mib = 3;
   // Host CPU the sandbox may use, in CPUs, like `docker run --cpus`: 0.5 is
   // half a CPU's time across all its vCPUs. A hard cap (cgroup cpu.max) and
-  // what placement charges a node, so 2 vcpus at 0.5 take half a CPU of it.
-  // At most vcpus; 0 is no cap, and every vCPU is charged.
+  // what placement charges a node without `reserved_cpus`, so 2 vcpus at 0.5
+  // take half a CPU of it. At most vcpus; 0 is no cap, and every vCPU is
+  // charged unless there is a reservation.
   double cpus = 4;
   // Relative CPU weight under contention, like `docker run --cpu-shares`
   // (2..=262144), converted to cpu.weight as runc does. 0 is 1024 for each
@@ -70,6 +71,13 @@ message ResourcePolicy {
   // booted with. Plugged memory comes and goes above it; a running guest
   // cannot go below it.
   uint32 boot_mem_mib = 9;
+  // Host CPU reserved for the sandbox, in CPUs, like Compose's
+  // `deploy.resources.reservations.cpus` or Swarm's `--reserve-cpu`: what
+  // placement charges a node in place of `cpus`, and what its cpu.weight
+  // follows (an explicit `cpu_shares` still wins). It may burst past it up to
+  // `cpus`, or up to its vcpus without a cap. 0.01 <= reserved_cpus <= cpus,
+  // where set, <= vcpus; 0 is no reservation.
+  double reserved_cpus = 10;
 }
 
 // How long a sandbox stays paid for. All three are read by the same reaper on

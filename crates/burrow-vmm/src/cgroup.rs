@@ -34,6 +34,10 @@ pub struct Limits {
     /// Host CPU the VMM may consume, in thousandths of a CPU (`cpu.max`). 0
     /// means unlimited.
     pub cpu_max_millis: u64,
+    /// Host CPU reserved for the VM, in thousandths of a CPU: what its node
+    /// is charged and what `cpu_weight` was derived from. Not a cgroup file of
+    /// its own. 0 means none.
+    pub cpu_reserve_millis: u64,
     /// `cpu.weight`, 1 to 10000. 0 is the kernel's default.
     pub cpu_weight: u64,
     /// `cpuset.cpus`, in its list syntax such as "0-3,6". Empty is any CPU.

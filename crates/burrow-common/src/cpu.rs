@@ -3,6 +3,10 @@
 //! `vcpus` is the CPUs the guest sees. `cpus` is `docker run --cpus`: a hard
 //! cap on host CPU time, and what placement and admission charge a node when
 //! it is set, so two vCPUs capped at half a CPU take half a CPU of the node.
+//! `reserved_cpus` is Compose's `deploy.resources.reservations.cpus` and
+//! Swarm's `--reserve-cpu`: what a node is charged in place of the cap, and
+//! what the sandbox weighs under contention, so it can burst past it up to
+//! the cap, or to its vCPUs without one.
 //! `cpu_shares` is `--cpu-shares`, a weight that only matters under
 //! contention; `cpuset_cpus` is `--cpuset-cpus`; `blkio_weight` is
 //! `--blkio-weight`. The cgroup v2 conversions are runc's, so a value means
@@ -26,11 +30,12 @@ pub fn cap_millis(cpus: f64) -> u64 {
 }
 
 /// The host CPU a node is charged for a sandbox, in thousandths of a CPU:
-/// its cap when it has one, otherwise every vCPU.
-pub fn charge_millis(vcpus: u32, cap_millis: u64) -> u64 {
-    match cap_millis {
-        0 => u64::from(vcpus.max(1)) * 1000,
-        cap => cap,
+/// its reservation when it has one, otherwise its cap, otherwise every vCPU.
+pub fn charge_millis(vcpus: u32, cap_millis: u64, reserve_millis: u64) -> u64 {
+    match (reserve_millis, cap_millis) {
+        (0, 0) => u64::from(vcpus.max(1)) * 1000,
+        (0, cap) => cap,
+        (reserve, _) => reserve,
     }
 }
 
@@ -86,6 +91,7 @@ pub fn parse_cpuset(list: &str) -> Result<Vec<u32>, String> {
 pub fn validate(
     vcpus: u32,
     cpus: f64,
+    reserved_cpus: f64,
     cpu_shares: u32,
     cpuset_cpus: &str,
     blkio_weight: u32,
@@ -103,6 +109,28 @@ pub fn validate(
     if cpus > f64::from(vcpus) {
         return Err(format!(
             "cpus {cpus} is more than the sandbox's {vcpus} vcpus; a guest cannot use more"
+        ));
+    }
+    if !reserved_cpus.is_finite() || reserved_cpus < 0.0 {
+        return Err(format!(
+            "reserved_cpus {reserved_cpus} must be a number of CPUs, 0 for no reservation"
+        ));
+    }
+    if reserved_cpus > 0.0 && reserved_cpus < 0.01 {
+        return Err(format!(
+            "reserved_cpus {reserved_cpus} is below the smallest reservation, 0.01"
+        ));
+    }
+    if cpus > 0.0 && reserved_cpus > cpus {
+        return Err(format!(
+            "reserved_cpus {reserved_cpus} is more than the cap of {cpus} cpus; a sandbox \
+             cannot be promised more than it may use"
+        ));
+    }
+    if reserved_cpus > f64::from(vcpus) {
+        return Err(format!(
+            "reserved_cpus {reserved_cpus} is more than the sandbox's {vcpus} vcpus; a guest \
+             cannot use more"
         ));
     }
     if cpu_shares != 0 && !(MIN_CPU_SHARES..=MAX_CPU_SHARES).contains(&cpu_shares) {
@@ -134,10 +162,12 @@ mod tests {
     use super::*;
 
     #[test]
-    fn a_cap_is_charged_and_otherwise_every_vcpu_is() {
-        assert_eq!(charge_millis(2, cap_millis(0.5)), 500);
-        assert_eq!(charge_millis(2, cap_millis(0.0)), 2000);
-        assert_eq!(charge_millis(0, 0), 1000);
+    fn a_reservation_then_a_cap_is_charged_and_otherwise_every_vcpu_is() {
+        assert_eq!(charge_millis(2, cap_millis(0.5), 0), 500);
+        assert_eq!(charge_millis(2, cap_millis(0.0), 0), 2000);
+        assert_eq!(charge_millis(0, 0, 0), 1000);
+        assert_eq!(charge_millis(8, 0, cap_millis(4.0)), 4000);
+        assert_eq!(charge_millis(8, cap_millis(6.0), cap_millis(4.0)), 4000);
         assert_eq!(cap_millis(0.3), 300);
         assert_eq!(cap_millis(1.5), 1500);
     }
@@ -179,13 +209,25 @@ mod tests {
 
     #[test]
     fn limits_are_held_to_the_vcpus_and_the_node() {
-        assert!(validate(2, 0.5, 0, "", 0, None).is_ok());
-        assert!(validate(2, 2.5, 0, "", 0, None).is_err());
-        assert!(validate(2, f64::NAN, 0, "", 0, None).is_err());
-        assert!(validate(2, -1.0, 0, "", 0, None).is_err());
-        assert!(validate(2, 0.0, 1, "", 0, None).is_err());
-        assert!(validate(2, 0.0, 0, "", 5, None).is_err());
-        assert!(validate(2, 0.0, 0, "0-3", 0, Some(4)).is_ok());
-        assert!(validate(2, 0.0, 0, "0-4", 0, Some(4)).is_err());
+        assert!(validate(2, 0.5, 0.0, 0, "", 0, None).is_ok());
+        assert!(validate(2, 2.5, 0.0, 0, "", 0, None).is_err());
+        assert!(validate(2, f64::NAN, 0.0, 0, "", 0, None).is_err());
+        assert!(validate(2, -1.0, 0.0, 0, "", 0, None).is_err());
+        assert!(validate(2, 0.0, 0.0, 1, "", 0, None).is_err());
+        assert!(validate(2, 0.0, 0.0, 0, "", 5, None).is_err());
+        assert!(validate(2, 0.0, 0.0, 0, "0-3", 0, Some(4)).is_ok());
+        assert!(validate(2, 0.0, 0.0, 0, "0-4", 0, Some(4)).is_err());
+    }
+
+    /// 0.01 <= reserved_cpus <= cpus, where set, <= vcpus.
+    #[test]
+    fn a_reservation_sits_under_the_cap_and_the_vcpus() {
+        assert!(validate(8, 0.0, 4.0, 0, "", 0, None).is_ok());
+        assert!(validate(8, 6.0, 4.0, 0, "", 0, None).is_ok());
+        assert!(validate(8, 4.0, 4.0, 0, "", 0, None).is_ok());
+        assert!(validate(8, 3.0, 4.0, 0, "", 0, None).is_err());
+        assert!(validate(2, 0.0, 4.0, 0, "", 0, None).is_err());
+        assert!(validate(2, 0.0, 0.001, 0, "", 0, None).is_err());
+        assert!(validate(2, 0.0, -1.0, 0, "", 0, None).is_err());
     }
 }

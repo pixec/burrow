@@ -899,9 +899,10 @@ export class Sandbox {
    * A suspended sandbox takes none of it unless `boot` is set. A sandbox
    * that is not running is resized only if the new shape fits its node, and
    * otherwise throws `resource_exhausted` with nothing changed. The host
-   * limits (`cpus`,
-   * `cpuShares`, `cpusetCpus`, `blkioWeight`) move live on a running sandbox
-   * and otherwise when it next runs. What cannot be applied is reported as
+   * limits (`cpus`, `reservedCpus`, `cpuShares`, `cpusetCpus`, `blkioWeight`)
+   * move live on a running sandbox and otherwise when it next runs, and what
+   * the sandbox is charged is admitted against its node first. What cannot be
+   * applied is reported as
    * `refused` with the reason rather than thrown, so check each field you
    * asked for.
    *
@@ -928,6 +929,7 @@ export class Sandbox {
         memMib: options.memoryMib,
         diskMib: options.diskMib,
         cpus: options.cpus,
+        reservedCpus: options.reservedCpus,
         cpuShares: options.cpuShares,
         cpusetCpus: options.cpusetCpus,
         blkioWeight: options.blkioWeight,

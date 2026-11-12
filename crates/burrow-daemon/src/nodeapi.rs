@@ -1054,6 +1054,7 @@ impl NodeService for NodeApi {
         let req = req.into_inner();
         let limits = crate::sandbox::LimitsUpdate {
             cpus: req.cpus,
+            reserved_cpus: req.reserved_cpus,
             cpu_shares: req.cpu_shares,
             cpuset_cpus: req.cpuset_cpus.clone(),
             blkio_weight: req.blkio_weight,
@@ -1064,8 +1065,8 @@ impl NodeService for NodeApi {
             && limits.is_empty()
         {
             return Err(Status::invalid_argument(
-                "name at least one of vcpus, mem_mib, disk_mib, cpus, cpu_shares, cpuset_cpus \
-                 and blkio_weight",
+                "name at least one of vcpus, mem_mib, disk_mib, cpus, reserved_cpus, cpu_shares, \
+                 cpuset_cpus and blkio_weight",
             ));
         }
         // Checked whole here, before anything changes; only the cap against
@@ -1073,6 +1074,7 @@ impl NodeService for NodeApi {
         burrow_common::cpu::validate(
             MAX_VCPUS,
             req.cpus.unwrap_or_default(),
+            req.reserved_cpus.unwrap_or_default(),
             req.cpu_shares.unwrap_or_default(),
             req.cpuset_cpus.as_deref().unwrap_or_default(),
             req.blkio_weight.unwrap_or_default(),
@@ -2313,6 +2315,7 @@ fn validate_policy(policy: &common::Policy) -> Result<(), Status> {
         burrow_common::cpu::validate(
             resources.vcpus,
             resources.cpus,
+            resources.reserved_cpus,
             resources.cpu_shares,
             &resources.cpuset_cpus,
             resources.blkio_weight,

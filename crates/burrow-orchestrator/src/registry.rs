@@ -30,10 +30,12 @@ pub struct Placement {
     pub is_mesh_available: bool,
     /// What the sandbox will consume, so a node is not handed work it cannot
     /// honour. `vcpus` and `mem_mib` are the guest's; a node is charged
-    /// [`cpu_charge_millis`](Self::cpu_charge_millis), which is `cpus` where
-    /// the sandbox is capped, and [`mem_charge_mib`](Self::mem_charge_mib).
+    /// [`cpu_charge_millis`](Self::cpu_charge_millis), which is
+    /// `reserved_cpus` where the sandbox has a reservation and `cpus` where it
+    /// is capped, and [`mem_charge_mib`](Self::mem_charge_mib).
     pub vcpus: u32,
     pub cpus: f64,
+    pub reserved_cpus: f64,
     pub mem_mib: u64,
     /// The disk it is promised, in bytes: its scratch disk. Checked against
     /// what the node reports with the node's own rule
@@ -72,7 +74,7 @@ impl Placement {
     /// The host CPU a node is charged for the sandbox, in thousandths of a
     /// CPU.
     pub fn cpu_charge_millis(&self) -> u64 {
-        cpu_charge_millis(self.vcpus, self.cpus)
+        cpu_charge_millis(self.vcpus, self.cpus, self.reserved_cpus)
     }
 
     /// The host memory the sandbox may hold on a node, which is what that
@@ -82,10 +84,11 @@ impl Placement {
     }
 }
 
-/// The host CPU a sandbox of `vcpus` capped at `cpus` is charged, in
-/// thousandths of a CPU.
-pub fn cpu_charge_millis(vcpus: u32, cpus: f64) -> u64 {
-    burrow_common::cpu::charge_millis(vcpus, burrow_common::cpu::cap_millis(cpus))
+/// The host CPU a sandbox of `vcpus` capped at `cpus` with `reserved_cpus`
+/// reserved is charged, in thousandths of a CPU.
+pub fn cpu_charge_millis(vcpus: u32, cpus: f64, reserved_cpus: f64) -> u64 {
+    use burrow_common::cpu::{cap_millis, charge_millis};
+    charge_millis(vcpus, cap_millis(cpus), cap_millis(reserved_cpus))
 }
 
 /// The host memory a guest of `mem_mib` may hold on a node: the cgroup
@@ -1127,6 +1130,17 @@ impl NodeRegistry {
                 mem_mib,
             ),
         }
+    }
+
+    /// Charges a node for host CPU a sandbox on it was just given, until its
+    /// next heartbeat reports it. The node admitted it already.
+    pub fn charge_cpu(&self, node_id: &str, cpu_millis: u64) {
+        self.pending
+            .lock()
+            .unwrap()
+            .entry(node_id.to_string())
+            .or_default()
+            .cpu_millis += cpu_millis;
     }
 
     /// Charges a node for memory a sandbox on it is about to be given, if the
@@ -2546,6 +2560,31 @@ mod tests {
             want.mem_charge_mib(&info, &status(&[], &[], 64_000)),
             ceiling(Hypervisor::CloudHypervisor).max(ceiling(Hypervisor::Firecracker))
         );
+    }
+
+    /// A sandbox with a reservation is charged it, not its vCPUs or its cap:
+    /// two 8-vCPU sandboxes reserving 4 CPUs each fill an 8-CPU node.
+    #[test]
+    fn a_reserved_sandbox_is_charged_its_reservation() {
+        let registry = registry(&[(
+            "xxl",
+            NodeStatus {
+                free_mem_mib: 64_000,
+                ..Default::default()
+            },
+        )]);
+        set_capacity(&registry, "xxl", 8, 64_000);
+        let want = Placement {
+            vcpus: 8,
+            reserved_cpus: 4.0,
+            mem_mib: 512,
+            ..Default::default()
+        };
+        assert_eq!(want.cpu_charge_millis(), 4000);
+        for _ in 0..2 {
+            assert_eq!(registry.place_for(&want).unwrap(), "xxl");
+        }
+        assert!(registry.place_for(&want).is_err());
     }
 
     /// A sandbox capped below its vCPUs is charged its cap: four 2-vCPU

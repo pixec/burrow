@@ -224,6 +224,14 @@ export interface ResourceOptions {
    * 2 vCPUs at 0.5 take half a CPU of it. At most `vcpus`; 0 is no cap.
    */
   cpus?: number;
+  /**
+   * Host CPU reserved for the sandbox, e.g. 4, as Compose's
+   * `deploy.resources.reservations.cpus`: what placement charges a node in
+   * place of `cpus`, and what its CPU weight follows. It bursts past it up to
+   * `cpus`, or to `vcpus` without a cap. At most `cpus` and `vcpus`; 0 is
+   * none.
+   */
+  reservedCpus?: number;
   /** Relative CPU weight under contention, as `--cpu-shares` (2-262144). 0 is 1024 per CPU charged. */
   cpuShares?: number;
   /** Host CPUs to run on, e.g. "0-3,6", as `--cpuset-cpus`. Empty is any. */
@@ -417,6 +425,7 @@ export interface ResourceUpdateOptions extends CallOptions {
   memoryMib?: number;
   diskMib?: number;
   cpus?: number;
+  reservedCpus?: number;
   cpuShares?: number;
   cpusetCpus?: string;
   blkioWeight?: number;
