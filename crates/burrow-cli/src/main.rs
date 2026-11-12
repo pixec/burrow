@@ -1821,12 +1821,17 @@ enum SecretCommand {
 enum NodesCommand {
     /// List registered nodes.
     Ls,
-    /// Stop placing new sandboxes on a node.
+    /// Stop placing new sandboxes on a node. Refused while sandboxes on it
+    /// hold public IPs, unless they are kept there.
     Drain {
         node_id: String,
         /// Also snapshot the sandboxes it is running.
         #[arg(long = "suspend")]
         suspend: bool,
+        /// Drain although sandboxes here hold public IPs. They stay on this
+        /// node and come back only here.
+        #[arg(long = "keep-pinned")]
+        is_pinned_kept: bool,
     },
     /// Resume placing sandboxes on a node.
     Undrain { node_id: String },
@@ -1847,23 +1852,34 @@ async fn main() -> anyhow::Result<()> {
             println!("ok (orchestrator v{})", resp.version);
         }
         Command::Nodes(NodesCommand::Ls) => list_nodes(&mut client).await?,
-        Command::Nodes(NodesCommand::Drain { node_id, suspend }) => {
+        Command::Nodes(NodesCommand::Drain {
+            node_id,
+            suspend,
+            is_pinned_kept,
+        }) => {
             let resp = client
                 .drain_node(api::DrainNodeRequest {
                     node_id: node_id.clone(),
                     is_draining: true,
                     is_suspending: suspend,
+                    is_pinned_kept,
                 })
                 .await?
                 .into_inner();
             println!("draining {node_id} ({} suspended)", resp.suspended);
+            if !resp.pinned_sandbox_ids.is_empty() {
+                println!(
+                    "kept on {node_id} by their public ips: {}",
+                    resp.pinned_sandbox_ids.join(", ")
+                );
+            }
         }
         Command::Nodes(NodesCommand::Undrain { node_id }) => {
             client
                 .drain_node(api::DrainNodeRequest {
                     node_id: node_id.clone(),
                     is_draining: false,
-                    is_suspending: false,
+                    ..Default::default()
                 })
                 .await?;
             println!("{node_id} accepting sandboxes again");

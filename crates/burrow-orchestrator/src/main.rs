@@ -666,11 +666,19 @@ async fn reap_dead_nodes(state: Arc<OrchestratorState>, expiry: Option<std::time
             state.snapshots.forget_node(&node_id);
             state.volumes.forget_node(&node_id);
             state.nodes.remove_node(&node_id);
+            for sandbox in unplaced.iter().filter(|s| !s.public_ips.is_empty()) {
+                tracing::warn!(
+                    node_id,
+                    sandbox = sandbox.id,
+                    "sandbox holds public addresses that reach only this node; it stays \
+                     unplaced until the node returns or its addresses are detached"
+                );
+            }
             tracing::warn!(
                 node_id,
                 placements = dropped.len(),
                 names = dropped.iter().filter(|s| !s.name.is_empty()).count(),
-                unplaced,
+                unplaced = unplaced.len(),
                 "node has been silent past its expiry; forgetting it and every \
                  placement recorded against it, except those the object store can bring back"
             );

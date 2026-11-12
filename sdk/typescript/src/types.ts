@@ -911,6 +911,8 @@ export interface NodeInfo {
 export interface DrainOptions extends CallOptions {
   /** Also suspend every sandbox the node runs, so the drain leaves nothing live. */
   suspend?: boolean;
+  /** Drain although sandboxes here hold public IPs; they stay on this node. */
+  keepPinned?: boolean;
 }
 
 /** One recorded egress attempt or DNS lookup. */

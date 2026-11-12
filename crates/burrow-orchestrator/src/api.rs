@@ -1053,6 +1053,7 @@ impl ApiService {
             .claim_adoption(&sandbox.id)
             .await
             .map_err(Status::aborted)?;
+        let node_id = &self.pinned_target(&sandbox.id, node_id).await?;
         let want = self.adoption_placement(&sandbox, node_labels);
         let subject = format!("sandbox {}", sandbox.id);
         let root = sandbox.inspection_root_fingerprint.clone();
@@ -1316,15 +1317,33 @@ impl Burrow for ApiService {
             .nodes
             .endpoint(&req.node_id)
             .ok_or_else(|| Status::not_found(format!("no healthy node {}", req.node_id)))?;
+        let pinned = match (req.is_draining, self.0.store.is_some()) {
+            (true, true) => self.pinned_on(&req.node_id).await?,
+            _ => Vec::new(),
+        };
+        if !pinned.is_empty() && !req.is_pinned_kept {
+            return Err(Status::failed_precondition(format!(
+                "node {} holds sandboxes with public addresses, which cannot leave it: {}. \
+                 Detach the addresses so they can move, or drain keeping them here \
+                 (is_pinned_kept, `burrow nodes drain --keep-pinned`): with is_suspending they \
+                 are suspended and resume on this node after maintenance",
+                req.node_id,
+                pinned
+                    .iter()
+                    .map(|(sandbox, addresses)| format!("{sandbox} ({})", addresses.join(", ")))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            )));
+        }
         let mut client = connect_node(endpoint, self.0.node_token.as_deref())
             .await
             .map_err(|err| Status::unavailable(format!("cannot reach node: {err}")))?;
-
-        let resp = client.set_drain(req.clone()).await?.into_inner();
+        let mut resp = client.set_drain(req.clone()).await?.into_inner();
         // Reflected locally too: placement consults the cached status, and
         // waiting for the next heartbeat would leave a window where a drained
         // node still receives sandboxes.
         self.0.nodes.set_draining(&req.node_id, req.is_draining);
+        resp.pinned_sandbox_ids = pinned.into_iter().map(|(sandbox, _)| sandbox).collect();
         Ok(Response::new(resp))
     }
 
@@ -3798,6 +3817,131 @@ mod tests {
         // through, rather than the routing to a node that has let go.
         assert_eq!(err.code(), tonic::Code::Unavailable, "{err}");
         assert!(err.message().contains("stored state"), "{err}");
+    }
+
+    /// A replica over a store holding `sbx_a`'s address 203.0.113.17, which
+    /// reaches node1.
+    async fn pinned(sandbox: common::Sandbox, nodes: &[&str]) -> ApiService {
+        let store = Arc::new(burrow_store::Store::open_in_memory().await.unwrap());
+        let ip = common::PublicIp {
+            address: "203.0.113.17".into(),
+            family: 4,
+            pool: "rack-a".into(),
+            sandbox_id: "sbx_a".into(),
+            node_id: "node1".into(),
+            state: common::PublicIpState::Allocated as i32,
+            ..Default::default()
+        };
+        store
+            .put_ip(&burrow_store::IpRow {
+                address: ip.address.clone(),
+                pool: ip.pool.clone(),
+                owner: "anonymous".into(),
+                state: ip.state,
+                available_at_ms: 0,
+                record: prost::Message::encode_to_vec(&ip),
+            })
+            .await
+            .unwrap();
+        let mut state = Arc::try_unwrap(replica(Default::default()).0).ok().unwrap();
+        state.store = Some(store);
+        state.control_plane_hosts = std::sync::Mutex::new(Vec::new());
+        let api = ApiService(Arc::new(state));
+        for id in nodes {
+            let info = common::NodeInfo {
+                id: id.to_string(),
+                address: format!("{id}:7071"),
+                ..Default::default()
+            };
+            api.0
+                .nodes
+                .register(info, String::new(), String::new(), None)
+                .unwrap();
+        }
+        api.0.sandboxes.insert(common::Sandbox {
+            public_ips: vec![ip],
+            ..sandbox
+        });
+        api
+    }
+
+    fn sandbox_a(node: &str) -> common::Sandbox {
+        common::Sandbox {
+            id: "sbx_a".into(),
+            node_id: node.into(),
+            state: common::SandboxState::Suspended as i32,
+            is_durable: true,
+            ..Default::default()
+        }
+    }
+
+    #[tokio::test]
+    async fn a_sandbox_holding_a_public_ip_does_not_move() {
+        let api = pinned(sandbox_a("node1"), &["node1", "node2"]).await;
+        for node in ["node2", ""] {
+            let err = api
+                .move_sandbox(Request::new(api::MoveSandboxRequest {
+                    sandbox_id: "sbx_a".into(),
+                    node_id: node.into(),
+                    ..Default::default()
+                }))
+                .await
+                .unwrap_err();
+            assert_eq!(err.code(), tonic::Code::FailedPrecondition, "{err}");
+            assert!(err.message().contains("203.0.113.17"), "{err}");
+            assert!(err.message().contains("detach"), "{err}");
+        }
+    }
+
+    /// Refused before the node is asked anything, naming the sandbox and its
+    /// address; kept on request.
+    #[tokio::test]
+    async fn a_drain_is_refused_while_a_sandbox_holds_a_public_ip() {
+        let api = pinned(sandbox_a("node1"), &["node1"]).await;
+        let drain = |is_pinned_kept| api::DrainNodeRequest {
+            node_id: "node1".into(),
+            is_draining: true,
+            is_suspending: true,
+            is_pinned_kept,
+        };
+        let err = api
+            .drain_node(Request::new(drain(false)))
+            .await
+            .unwrap_err();
+        assert_eq!(err.code(), tonic::Code::FailedPrecondition, "{err}");
+        assert!(err.message().contains("sbx_a (203.0.113.17)"), "{err}");
+        assert!(err.message().contains("--keep-pinned"), "{err}");
+        // Past the check, to the node, which a test cannot reach.
+        let err = api.drain_node(Request::new(drain(true))).await.unwrap_err();
+        assert_eq!(err.code(), tonic::Code::Unavailable, "{err}");
+    }
+
+    /// A written-off node leaves a durable sandbox unplaced, and one whose
+    /// address reaches only that node is not restored anywhere else.
+    #[tokio::test]
+    async fn a_pinned_sandbox_waits_for_its_node() {
+        let api = pinned(sandbox_a(""), &["node2"]).await;
+        let err = api
+            .resume_sandbox(Request::new(api::SandboxRef {
+                sandbox_id: "sbx_a".into(),
+            }))
+            .await
+            .unwrap_err();
+        assert_eq!(err.code(), tonic::Code::FailedPrecondition, "{err}");
+        assert!(
+            err.message().contains("node node1, and that node is down"),
+            "{err}"
+        );
+        let err = api
+            .move_sandbox(Request::new(api::MoveSandboxRequest {
+                sandbox_id: "sbx_a".into(),
+                node_id: "node2".into(),
+                ..Default::default()
+            }))
+            .await
+            .unwrap_err();
+        assert_eq!(err.code(), tonic::Code::FailedPrecondition, "{err}");
+        assert!(err.message().contains("on node node2"), "{err}");
     }
 
     /// A move whose target failed used to leave the sandbox suspended in the

@@ -421,6 +421,8 @@ class NodeInfo:
 @dataclass
 class DrainResult:
     suspended: int
+    # Sandboxes kept on the node by their public IPs.
+    pinned_sandbox_ids: List[str] = field(default_factory=list)
 
 
 @dataclass

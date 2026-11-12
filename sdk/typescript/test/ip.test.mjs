@@ -71,3 +71,22 @@ test("allocating for a sandbox and creating a pool send the wire's names", async
   assert.equal("provider" in calls[1].request, false);
   assert.equal(pool.total, 15);
 });
+
+test("a drain can keep sandboxes pinned by their public ips", async () => {
+  const { fakeBurrow } = await import("./helpers.mjs");
+  const calls = [];
+  const burrow = fakeBurrow({
+    async unary(method, request) {
+      calls.push({ method, request });
+      return { suspended: 2, pinnedSandboxIds: ["sbx_a"] };
+    },
+  });
+  const res = await burrow.drainNode("node-a", { suspend: true, keepPinned: true });
+  assert.deepEqual(calls[0].request, {
+    nodeId: "node-a",
+    isDraining: true,
+    isSuspending: true,
+    isPinnedKept: true,
+  });
+  assert.deepEqual(res, { suspended: 2, pinnedSandboxIds: ["sbx_a"] });
+});

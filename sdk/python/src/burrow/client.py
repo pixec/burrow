@@ -517,14 +517,29 @@ class Burrow:
             next_after_id=res.next_after_id,
         )
 
-    def drain_node(self, node_id: str, *, drain: bool = True, suspend: bool = False) -> DrainResult:
+    def drain_node(
+        self,
+        node_id: str,
+        *,
+        drain: bool = True,
+        suspend: bool = False,
+        keep_pinned: bool = False,
+    ) -> DrainResult:
         """Stops (or resumes) placing new sandboxes on a node; `suspend` also
-        pauses every sandbox it runs."""
+        pauses every sandbox it runs. Refused while sandboxes on it hold public
+        IPs, unless `keep_pinned` leaves them there."""
         res = self._transport.unary(
             "DrainNode",
-            api_pb2.DrainNodeRequest(node_id=node_id, is_draining=drain, is_suspending=suspend),
+            api_pb2.DrainNodeRequest(
+                node_id=node_id,
+                is_draining=drain,
+                is_suspending=suspend,
+                is_pinned_kept=keep_pinned,
+            ),
         )
-        return DrainResult(suspended=res.suspended)
+        return DrainResult(
+            suspended=res.suspended, pinned_sandbox_ids=list(res.pinned_sandbox_ids)
+        )
 
     def set_secret(
         self,

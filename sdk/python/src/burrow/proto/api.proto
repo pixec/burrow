@@ -571,10 +571,16 @@ message DrainNodeRequest {
   // Also suspend every sandbox the node is running, so the drain leaves
   // nothing live on it.
   bool is_suspending = 3;
+  // Drain although sandboxes here hold public addresses. They cannot leave
+  // this node, so they stay on it and come back only here. Unset, such a drain
+  // is refused with FAILED_PRECONDITION naming them.
+  bool is_pinned_kept = 4;
 }
 
 message DrainNodeResponse {
   uint32 suspended = 1;
+  // Sandboxes kept on the node by their public addresses.
+  repeated string pinned_sandbox_ids = 2;
 }
 
 // Names a sandbox, by its id or by the name it was created with. The id is

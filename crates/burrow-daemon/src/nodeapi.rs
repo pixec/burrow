@@ -473,7 +473,10 @@ impl NodeService for NodeApi {
             .sandboxes
             .set_drain(req.is_draining, req.is_suspending)
             .await;
-        Ok(Response::new(api::DrainNodeResponse { suspended }))
+        Ok(Response::new(api::DrainNodeResponse {
+            suspended,
+            ..Default::default()
+        }))
     }
 
     #[tracing::instrument(skip_all, fields(sandbox_id, template))]

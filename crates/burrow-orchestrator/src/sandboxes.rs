@@ -613,12 +613,14 @@ impl SandboxRegistry {
     /// exception. It does not need the node, so it is kept unplaced, with its
     /// name, for the next start to place on a node that can restore it. `info`
     /// is the dead node's, whose architecture and hypervisor version are
-    /// stamped on a record that does not carry its own.
+    /// stamped on a record that does not carry its own. One holding public
+    /// addresses is kept unplaced too, but only its own node can take it
+    /// back: the addresses reach nowhere else.
     pub fn forget_node(
         &self,
         node_id: &str,
         info: &common::NodeInfo,
-    ) -> (Vec<common::Sandbox>, usize) {
+    ) -> (Vec<common::Sandbox>, Vec<common::Sandbox>) {
         let mut sandboxes = self.sandboxes.lock().unwrap();
         self.write(crate::persist::Op::DeletePlacementsForNode(
             node_id.to_string(),
@@ -648,7 +650,7 @@ impl SandboxRegistry {
         for sandbox in &dropped {
             self.write(crate::persist::Op::ReleaseClaims(sandbox.id.clone()));
         }
-        (dropped, unplaced.len())
+        (dropped, unplaced)
     }
 
     /// Claims the right to hand an unplaced sandbox to a node, here and in
@@ -1529,7 +1531,7 @@ mod tests {
 
         let (dropped, unplaced) = registry.forget_node("node1", &common::NodeInfo::default());
 
-        assert_eq!((dropped.len(), unplaced), (1, 0));
+        assert_eq!((dropped.len(), unplaced.len()), (1, 0));
         assert!(registry.get("a").is_none());
         assert!(registry.get("b").is_some(), "another node is untouched");
         assert!(!registry.is_tombstoned("a"));
@@ -1592,7 +1594,7 @@ mod tests {
             },
         );
 
-        assert_eq!((dropped.len(), unplaced), (2, 1));
+        assert_eq!((dropped.len(), unplaced.len()), (2, 1));
         let kept = registry.get("a").expect("kept unplaced");
         assert_eq!(kept.node_id, "");
         assert_eq!(

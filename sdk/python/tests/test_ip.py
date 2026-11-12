@@ -83,3 +83,26 @@ def test_a_public_ip_reads_back():
     assert ip.node_id == "node-a" and ip.state == "allocated"
     assert int(ip.allocated_at.timestamp()) == 1_700_000_000
     assert ip.attached_at is None
+
+
+def test_a_drain_can_keep_sandboxes_pinned_by_their_public_ips():
+    from burrow import Burrow
+    from burrow._pb import api_pb2
+
+    class Unary:
+        calls = []
+
+        def unary(self, method, request, timeout=None):
+            self.calls.append((method, request))
+            return api_pb2.DrainNodeResponse(suspended=2, pinned_sandbox_ids=["sbx_a"])
+
+        def close(self):
+            pass
+
+    burrow = Burrow(endpoint="localhost:1")
+    burrow.close()
+    burrow._transport = Unary()
+    res = burrow.drain_node("node-a", suspend=True, keep_pinned=True)
+    method, request = burrow._transport.calls[0]
+    assert method == "DrainNode" and request.is_pinned_kept and request.is_suspending
+    assert res.suspended == 2 and res.pinned_sandbox_ids == ["sbx_a"]

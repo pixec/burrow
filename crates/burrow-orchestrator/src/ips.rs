@@ -661,9 +661,20 @@ impl ApiService {
         if ip.sandbox_id.is_empty() {
             return Ok(ip);
         }
-        match self.node_for(&ip.sandbox_id).await {
-            Ok(mut client) => {
-                let sandbox = client
+        match self.holder(&ip.sandbox_id).await {
+            // Stored and on no node: the address comes off the record the next
+            // node is handed.
+            Ok(node) if node.is_empty() => {
+                if let Some(mut sandbox) = self.0.sandboxes.get(&ip.sandbox_id) {
+                    sandbox.public_ips.retain(|held| held.address != ip.address);
+                    self.0.sandboxes.insert(sandbox);
+                    self.write_through().await;
+                }
+            }
+            Ok(_) => {
+                let sandbox = self
+                    .node_for(&ip.sandbox_id)
+                    .await?
                     .detach_public_ip(nodepb::NodeDetachIpRequest {
                         sandbox_id: ip.sandbox_id.clone(),
                         address: ip.address.clone(),
@@ -849,25 +860,68 @@ impl ApiService {
         Ok(())
     }
 
+    /// The node `sandbox_id`'s public addresses reach, and those addresses,
+    /// when it holds any.
+    pub(super) async fn pin_of(&self, sandbox_id: &str) -> Option<(String, Vec<String>)> {
+        let ips = self.ips_of(sandbox_id).await;
+        let node = ips.first()?.1.node_id.clone();
+        Some((node, ips.into_iter().map(|(_, ip)| ip.address).collect()))
+    }
+
     /// Refuses moving a sandbox that holds public addresses: each reaches
     /// only the node it is on.
     pub(super) async fn require_unpinned(&self, sandbox_id: &str) -> Result<(), Status> {
-        let ips = self.ips_of(sandbox_id).await;
-        if ips.is_empty() {
-            return Ok(());
+        match self.pin_of(sandbox_id).await {
+            None => Ok(()),
+            Some((node, addresses)) => Err(Status::failed_precondition(format!(
+                "sandbox {sandbox_id} holds {}, which only reach node {node}; detach them first \
+                 to move it",
+                addresses.join(", ")
+            ))),
         }
-        let addresses: Vec<&str> = ips.iter().map(|(_, ip)| ip.address.as_str()).collect();
-        Err(Status::failed_precondition(format!(
-            "sandbox {sandbox_id} holds public {} {}, which only reach node {}; detach them \
-             first to move it",
-            if addresses.len() == 1 {
-                "address"
-            } else {
-                "addresses"
-            },
-            addresses.join(", "),
-            ips[0].1.node_id
-        )))
+    }
+
+    /// Where a sandbox being placed from the object store may go: `asked`,
+    /// unless its public addresses tie it to a node, which it then goes to
+    /// or nowhere.
+    pub(super) async fn pinned_target(
+        &self,
+        sandbox_id: &str,
+        asked: &str,
+    ) -> Result<String, Status> {
+        let Some((node, addresses)) = self.pin_of(sandbox_id).await else {
+            return Ok(asked.to_string());
+        };
+        let addresses = addresses.join(", ");
+        if !asked.is_empty() && asked != node {
+            return Err(Status::failed_precondition(format!(
+                "sandbox {sandbox_id} holds {addresses}, which only reach node {node}; detach \
+                 them first to place it on node {asked}"
+            )));
+        }
+        if self.0.nodes.endpoint(&node).is_none() {
+            return Err(Status::failed_precondition(format!(
+                "sandbox {sandbox_id} holds {addresses}, which only reach node {node}, and that \
+                 node is down. It comes back with the node; detach the addresses to resume it \
+                 on another node"
+            )));
+        }
+        Ok(node)
+    }
+
+    /// The sandboxes on `node` holding public addresses, with those
+    /// addresses, sorted.
+    pub(super) async fn pinned_on(&self, node: &str) -> Result<Vec<(String, Vec<String>)>, Status> {
+        let mut pinned: std::collections::BTreeMap<String, Vec<String>> = Default::default();
+        for row in self.ip_store()?.list_ips().await.map_err(store_error)? {
+            let Ok(ip) = common::PublicIp::decode(row.record.as_slice()) else {
+                continue;
+            };
+            if row.state == ALLOCATED && !ip.sandbox_id.is_empty() && ip.node_id == node {
+                pinned.entry(ip.sandbox_id).or_default().push(ip.address);
+            }
+        }
+        Ok(pinned.into_iter().collect())
     }
 }
 

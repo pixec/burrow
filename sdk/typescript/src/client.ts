@@ -520,15 +520,29 @@ export class Burrow {
     };
   }
 
-  /** Stops placing new sandboxes on a node. {@link undrainNode} lifts it. */
-  async drainNode(nodeId: string, options: DrainOptions = {}): Promise<{ suspended: number }> {
+  /**
+   * Stops placing new sandboxes on a node. {@link undrainNode} lifts it.
+   * Refused while sandboxes on it hold public IPs, unless `keepPinned`.
+   */
+  async drainNode(
+    nodeId: string,
+    options: DrainOptions = {},
+  ): Promise<{ suspended: number; pinnedSandboxIds: string[] }> {
     const res = await this.transport.unary<any, any>(
       "DrainNode",
-      { nodeId, isDraining: true, isSuspending: options.suspend ?? false },
+      {
+        nodeId,
+        isDraining: true,
+        isSuspending: options.suspend ?? false,
+        isPinnedKept: options.keepPinned ?? false,
+      },
       options.timeoutMs,
       options.signal,
     );
-    return { suspended: Number(res.suspended ?? 0) };
+    return {
+      suspended: Number(res.suspended ?? 0),
+      pinnedSandboxIds: res.pinnedSandboxIds ?? [],
+    };
   }
 
   /** Lets a drained node take sandboxes again. */
