@@ -211,6 +211,7 @@ impl Drop for PlacementGuard<'_> {
                 self.disk_bytes,
             );
             release_in_store(
+                self.nodes,
                 self.store.clone(),
                 &self.node_id,
                 self.cpu_millis,
@@ -1962,7 +1963,9 @@ impl ApiService {
         Err(last)
     }
 
-    /// Returns the capacity a placement is still optimistically charged.
+    /// Returns what a deleted sandbox was charged: its CPU, which the node
+    /// counts until a delete whatever the state, and its memory ceiling if it
+    /// still had a VMM.
     fn release_charge(&self, sandbox: &common::Sandbox) {
         let resources = sandbox
             .policy
@@ -1974,20 +1977,33 @@ impl ApiService {
             resources.cpus,
             resources.reserved_cpus,
         );
-        let mem_mib = self.0.nodes.mem_charge_mib(
-            &sandbox.node_id,
-            &sandbox.hypervisor,
-            &sandbox.template,
-            match resources.mem_mib {
-                0 => 512,
-                mem => mem as u64,
-            },
+        let has_vmm = matches!(
+            common::SandboxState::try_from(sandbox.state),
+            Ok(common::SandboxState::Creating | common::SandboxState::Running)
         );
+        let mem_mib = match has_vmm {
+            true => self.0.nodes.mem_charge_mib(
+                &sandbox.node_id,
+                &sandbox.hypervisor,
+                &sandbox.template,
+                match resources.mem_mib {
+                    0 => 512,
+                    mem => mem as u64,
+                },
+            ),
+            false => 0,
+        };
         let disk_bytes = crate::registry::disk_bytes(Some(&resources));
         self.0
             .nodes
             .release(&sandbox.node_id, cpu_millis, mem_mib, disk_bytes);
-        release_in_store(self.0.store.clone(), &sandbox.node_id, cpu_millis, mem_mib);
+        release_in_store(
+            &self.0.nodes,
+            self.0.store.clone(),
+            &sandbox.node_id,
+            cpu_millis,
+            mem_mib,
+        );
     }
 }
 
@@ -3993,12 +4009,14 @@ fn internal(err: anyhow::Error) -> Status {
 
 /// Gives back capacity in the store from code that cannot wait for it.
 fn release_in_store(
+    nodes: &crate::registry::NodeRegistry,
     store: Option<Arc<burrow_store::Store>>,
     node_id: &str,
     cpu_millis: u64,
     mem_mib: u64,
 ) {
     let Some(store) = store else { return };
+    nodes.release_stored(node_id, cpu_millis, mem_mib);
     let node_id = node_id.to_string();
     tokio::spawn(async move {
         if let Err(err) = store.release_capacity(&node_id, cpu_millis, mem_mib).await {

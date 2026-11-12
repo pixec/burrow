@@ -220,8 +220,8 @@ pub struct NodeRow {
     pub committed_cpu_millis: u64,
     pub free_mem_mib: u64,
     /// Capacity promised to sandboxes placed since the last heartbeat.
-    pub reserved_cpu_millis: u64,
-    pub reserved_mem_mib: u64,
+    pub reserved_cpu_millis: i64,
+    pub reserved_mem_mib: i64,
 }
 
 #[derive(Debug, Clone)]
@@ -1330,8 +1330,8 @@ impl Store {
                 total_vcpus: r.8 as u32,
                 committed_cpu_millis: r.9 as u64,
                 free_mem_mib: r.10 as u64,
-                reserved_cpu_millis: r.11 as u64,
-                reserved_mem_mib: r.12 as u64,
+                reserved_cpu_millis: r.11,
+                reserved_mem_mib: r.12,
             })
             .collect())
     }
@@ -1403,7 +1403,9 @@ impl Store {
         Ok(done > 0)
     }
 
-    /// Gives back capacity a placement took and no longer needs.
+    /// Gives back capacity a placement took, or a reported sandbox held, and
+    /// no longer needs. Below zero is a credit until the node's next heartbeat
+    /// reports what was freed.
     pub async fn release_capacity(
         &self,
         node_id: &str,
@@ -1412,9 +1414,8 @@ impl Store {
     ) -> Result<()> {
         on_pool!(self, pool => sqlx::query(
             "UPDATE nodes SET
-                reserved_cpu_millis = CASE WHEN reserved_cpu_millis > $2
-                                      THEN reserved_cpu_millis - $2 ELSE 0 END,
-                reserved_mem_mib = CASE WHEN reserved_mem_mib > $3 THEN reserved_mem_mib - $3 ELSE 0 END
+                reserved_cpu_millis = reserved_cpu_millis - $2,
+                reserved_mem_mib = reserved_mem_mib - $3
              WHERE id=$1",
         )
         .bind(node_id)

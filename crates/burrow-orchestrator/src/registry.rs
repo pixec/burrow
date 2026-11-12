@@ -371,9 +371,9 @@ pub struct NodeEntry {
     /// candidate for every template on the fleet.
     pub is_reported: bool,
     /// Capacity other orchestrator replicas have promised on this node since
-    /// its last heartbeat, as the store last said.
-    pub reserved_cpu_millis: u64,
-    pub reserved_mem_mib: u64,
+    /// its last heartbeat, as the store last said, less what they released.
+    pub reserved_cpu_millis: i64,
+    pub reserved_mem_mib: i64,
 }
 
 impl NodeEntry {
@@ -411,11 +411,13 @@ pub fn disk_bytes(resources: Option<&burrow_proto::common::v1::ResourcePolicy>) 
     mib * burrow_common::disk::MIB
 }
 
-/// Capacity promised to sandboxes a node has not yet reported.
+/// Capacity promised to sandboxes a node has not yet reported, less what
+/// sandboxes it did report have given back since: below zero when more was
+/// released than placed.
 #[derive(Debug, Default, Clone, Copy)]
 struct Reserved {
-    cpu_millis: u64,
-    mem_mib: u64,
+    cpu_millis: i64,
+    mem_mib: i64,
     disk_bytes: u64,
 }
 
@@ -427,11 +429,22 @@ struct Reserved {
 fn held(entry: &NodeEntry, pending: &HashMap<String, Reserved>) -> Reserved {
     let local = pending.get(&entry.info.id).copied().unwrap_or_default();
     Reserved {
-        cpu_millis: local.cpu_millis.max(entry.reserved_cpu_millis),
-        mem_mib: local.mem_mib.max(entry.reserved_mem_mib),
+        cpu_millis: merged(local.cpu_millis, entry.reserved_cpu_millis),
+        mem_mib: merged(local.mem_mib, entry.reserved_mem_mib),
         // The store does not carry disk reservations; the node's own
         // admission is the gate, and this only keeps a burst from piling on.
         disk_bytes: local.disk_bytes,
+    }
+}
+
+/// The larger of this replica's count and the store's, except that a release
+/// both have seen is credited in full: without a store, the store's count
+/// stays at zero and would otherwise swallow every release.
+fn merged(local: i64, stored: i64) -> i64 {
+    if local < 0 && stored <= 0 {
+        local.min(stored)
+    } else {
+        local.max(stored)
     }
 }
 
@@ -460,20 +473,25 @@ fn disk_fit(
 /// Whether a node can take this sandbox without oversubscribing itself.
 fn is_fit(entry: &NodeEntry, pending: &HashMap<String, Reserved>, want: &Placement) -> bool {
     let held = held(entry, pending);
-    let committed = entry.status.committed_cpu_millis + held.cpu_millis + want.cpu_charge_millis();
+    let committed =
+        net(entry.status.committed_cpu_millis, held.cpu_millis) + want.cpu_charge_millis();
     // A node that has not reported its cpu count cannot be checked; trusting it
     // beats refusing to place anything on it.
     let cpu_ok =
         entry.info.total_vcpus == 0 || committed <= u64::from(entry.info.total_vcpus) * 1000;
-    let free = entry.status.free_mem_mib.saturating_sub(held.mem_mib);
-    let mem_ok = free >= want.mem_charge_mib(&entry.info, &entry.status);
+    let mem_ok = free_mem(entry, pending) >= want.mem_charge_mib(&entry.info, &entry.status);
     cpu_ok && mem_ok && disk_fit(entry, held, want).is_ok()
 }
 
 /// Reported free memory, less anything placed since that report.
 fn free_mem(entry: &NodeEntry, pending: &HashMap<String, Reserved>) -> u64 {
     let held = held(entry, pending);
-    entry.status.free_mem_mib.saturating_sub(held.mem_mib)
+    net(entry.status.free_mem_mib, -held.mem_mib)
+}
+
+/// A reported figure moved by what was reserved or released since.
+fn net(reported: u64, held: i64) -> u64 {
+    reported.saturating_add_signed(held)
 }
 
 /// Whether `entry` holds a warm snapshot of the template and machine `want`
@@ -502,7 +520,7 @@ fn headroom(entry: &NodeEntry, pending: &HashMap<String, Reserved>) -> f64 {
     let cpu_free = if entry.info.total_vcpus == 0 {
         1.0
     } else {
-        let committed = (entry.status.committed_cpu_millis + held.cpu_millis) as f64;
+        let committed = net(entry.status.committed_cpu_millis, held.cpu_millis) as f64;
         1.0 - (committed / (f64::from(entry.info.total_vcpus) * 1000.0)).clamp(0.0, 1.0)
     };
     let mem_free = if entry.info.total_mem_mib == 0 {
@@ -770,6 +788,8 @@ impl NodeRegistry {
                 }
                 entry.status = status;
                 entry.is_reported = true;
+                entry.reserved_cpu_millis = 0;
+                entry.reserved_mem_mib = 0;
                 entry.last_heartbeat = Instant::now();
                 entry.last_heartbeat_at_ms = burrow_common::unix_now_ms();
                 drop(nodes);
@@ -1114,8 +1134,8 @@ impl NodeRegistry {
     fn reserve(&self, node_id: &str, want: &Placement, mem_mib: u64) {
         let mut pending = self.pending.lock().unwrap();
         let entry = pending.entry(node_id.to_string()).or_default();
-        entry.cpu_millis += want.cpu_charge_millis();
-        entry.mem_mib += mem_mib;
+        entry.cpu_millis += want.cpu_charge_millis() as i64;
+        entry.mem_mib += mem_mib as i64;
         entry.disk_bytes += want.disk_bytes;
     }
 
@@ -1151,7 +1171,7 @@ impl NodeRegistry {
             .unwrap()
             .entry(node_id.to_string())
             .or_default()
-            .cpu_millis += cpu_millis;
+            .cpu_millis += cpu_millis as i64;
     }
 
     /// Charges a node for memory a sandbox on it is about to be given, if the
@@ -1165,26 +1185,31 @@ impl NodeRegistry {
         if free_mem(entry, &pending) < mem_mib {
             return false;
         }
-        pending.entry(node_id.to_string()).or_default().mem_mib += mem_mib;
+        pending.entry(node_id.to_string()).or_default().mem_mib += mem_mib as i64;
         true
     }
 
-    /// Gives back capacity reserved for a placement that no longer exists.
+    /// Gives back capacity a sandbox no longer holds, until the node's next
+    /// heartbeat reports it gone.
     ///
-    /// A reservation covers the window between placing a sandbox and the node
-    /// reporting it. If the sandbox is destroyed inside that window the charge
-    /// has to be returned, or a burst of create-then-destroy exhausts a node
-    /// that is in fact empty.
+    /// One placed since that heartbeat takes its reservation back. One the
+    /// heartbeat reported is credited instead, so a node is not held full by
+    /// a sandbox already deleted or shrunk: a burst of create-then-destroy
+    /// would otherwise exhaust a node that is in fact empty.
     pub fn release(&self, node_id: &str, cpu_millis: u64, mem_mib: u64, disk_bytes: u64) {
         let mut pending = self.pending.lock().unwrap();
-        let Some(entry) = pending.get_mut(node_id) else {
-            return;
-        };
-        entry.cpu_millis = entry.cpu_millis.saturating_sub(cpu_millis);
-        entry.mem_mib = entry.mem_mib.saturating_sub(mem_mib);
+        let entry = pending.entry(node_id.to_string()).or_default();
+        entry.cpu_millis -= cpu_millis as i64;
+        entry.mem_mib -= mem_mib as i64;
         entry.disk_bytes = entry.disk_bytes.saturating_sub(disk_bytes);
-        if entry.cpu_millis == 0 && entry.mem_mib == 0 && entry.disk_bytes == 0 {
-            pending.remove(node_id);
+    }
+
+    /// Moves this replica's copy of the store's reservations by what is
+    /// being released there, ahead of the next reload saying so.
+    pub fn release_stored(&self, node_id: &str, cpu_millis: u64, mem_mib: u64) {
+        if let Some(entry) = self.nodes.lock().unwrap().get_mut(node_id) {
+            entry.reserved_cpu_millis -= cpu_millis as i64;
+            entry.reserved_mem_mib -= mem_mib as i64;
         }
     }
 
@@ -2371,6 +2396,48 @@ mod tests {
         registry
             .place_for(&want)
             .expect("heartbeat should clear the reservation");
+    }
+
+    /// A sandbox the last heartbeat reported frees its share once it is
+    /// deleted or shrunk, not once the next heartbeat says so.
+    #[test]
+    fn a_release_after_a_heartbeat_frees_the_node_at_once() {
+        let registry = registry(&[(
+            "only",
+            NodeStatus {
+                free_mem_mib: 1_000,
+                committed_cpu_millis: 7_000,
+                ..Default::default()
+            },
+        )]);
+        set_capacity(&registry, "only", 8, 8_000);
+        let want = Placement {
+            vcpus: 2,
+            mem_mib: 1_500,
+            ..Default::default()
+        };
+        let charge = registry.mem_charge_mib("only", "", "", 1_500);
+        assert!(registry.place_for(&want).is_err());
+
+        registry.release("only", 2_000, charge, 0);
+        registry
+            .place_for(&want)
+            .expect("the release should free the node");
+        assert!(registry.place_for(&want).is_err());
+
+        registry.heartbeat(
+            "only",
+            NodeStatus {
+                free_mem_mib: 1_000,
+                committed_cpu_millis: 7_000,
+                ..Default::default()
+            },
+            None,
+        );
+        assert!(
+            registry.place_for(&want).is_err(),
+            "a heartbeat ends the credit"
+        );
     }
 
     /// Capacity is reported by the node; a node that has not said how big it is
