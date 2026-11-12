@@ -34,7 +34,7 @@ struct Args {
     listen: std::net::SocketAddr,
     /// Bearer token clients must present. Prefer --api-key-file: a token on
     /// the command line is visible in `ps` to every user on the host.
-    #[arg(long, env = "BURROW_API_KEY")]
+    #[arg(long, env = "BURROW_API_KEY", hide_env_values = true)]
     api_key: Option<String>,
     /// File of accepted tokens, one per line; `#` comments allowed. Multiple
     /// tokens let a key be rotated without downtime.
@@ -60,7 +60,7 @@ struct Args {
     /// --api-key because registration decides where exec and logs are routed,
     /// and because a client key should not drive a node directly. Unset falls
     /// back to the api key, which the startup warning calls out.
-    #[arg(long, env = "BURROW_NODE_TOKEN")]
+    #[arg(long, env = "BURROW_NODE_TOKEN", hide_env_values = true)]
     node_token: Option<String>,
     /// File of accepted node tokens, one per line; `#` comments allowed.
     #[arg(long, env = "BURROW_NODE_TOKEN_FILE")]
@@ -79,7 +79,7 @@ struct Args {
     /// URL. Unset keeps them in SQLite under --data-dir, which is fine for one
     /// host but ties the control plane to its disk. `sslmode` in the URL
     /// governs TLS; it is attempted by default.
-    #[arg(long, env = "BURROW_DATABASE_URL")]
+    #[arg(long, env = "BURROW_DATABASE_URL", hide_env_values = true)]
     database_url: Option<String>,
     /// Key that seals stored secrets. Every replica must use the same one,
     /// so with several, mount it from one place. Defaults to `secrets.key`

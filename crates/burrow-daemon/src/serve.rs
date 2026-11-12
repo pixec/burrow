@@ -183,7 +183,7 @@ pub struct ServeArgs {
     /// one token to everything. A node has no client-facing surface of its
     /// own, so using the tenant api key here lets a leaked tenant key drive
     /// this node directly; the node warns at startup when it falls back.
-    #[arg(long, env = "BURROW_API_KEY")]
+    #[arg(long, env = "BURROW_API_KEY", hide_env_values = true)]
     pub api_key: Option<String>,
     #[arg(long, env = "BURROW_API_KEY_FILE")]
     pub api_key_file: Option<PathBuf>,
@@ -193,7 +193,7 @@ pub struct ServeArgs {
     /// the orchestrator and from peer nodes) and presents it when registering
     /// and when dialling a peer. Keeping it distinct from --api-key is what
     /// stops a tenant key registering a node or calling one.
-    #[arg(long, env = "BURROW_NODE_TOKEN")]
+    #[arg(long, env = "BURROW_NODE_TOKEN", hide_env_values = true)]
     pub node_token: Option<String>,
     #[arg(long, env = "BURROW_NODE_TOKEN_FILE")]
     pub node_token_file: Option<PathBuf>,

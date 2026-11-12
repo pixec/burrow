@@ -128,7 +128,7 @@ struct Args {
     )]
     orchestrator: String,
     /// Bearer token, when the orchestrator requires one.
-    #[arg(long, global = true, env = "BURROW_API_KEY")]
+    #[arg(long, global = true, env = "BURROW_API_KEY", hide_env_values = true)]
     api_key: Option<String>,
     /// Read the bearer token from a file instead: the first non-blank,
     /// non-`#` line. Preferred on a shared machine, where a token on the
