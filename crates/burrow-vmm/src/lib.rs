@@ -27,7 +27,7 @@ pub mod vz;
 use std::path::PathBuf;
 use std::time::Duration;
 
-pub use cgroup::{Cgroup, Limits};
+pub use cgroup::{Cgroup, Limits, is_io_weight_supported};
 pub use cloud_hypervisor::{ChJail, CloudHypervisorConfig};
 pub use error::{Error, Result};
 pub use firecracker::{FirecrackerConfig, Jail, MemorySource, PageSource};

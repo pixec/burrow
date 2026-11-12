@@ -1221,7 +1221,11 @@ class Sandbox:
         return child
 
     def move(
-        self, *, node_id: str = "", node_labels: Optional[Dict[str, str]] = None
+        self,
+        *,
+        node_id: str = "",
+        node_labels: Optional[Dict[str, str]] = None,
+        drop_cpuset: bool = False,
     ) -> SandboxInfo:
         """Moves the sandbox to another node through the object store.
 
@@ -1229,12 +1233,18 @@ class Sandbox:
         id, name and policy and gets an address on the new node. `node_id`
         names the destination; otherwise it is placed like a create, on a node
         carrying `node_labels`. Durable volumes it mounts move with it; one
-        mounting a volume that is not durable cannot move.
+        mounting a volume that is not durable cannot move. A destination
+        must have every CPU its `cpuset_cpus` names, and cgroup io.weight
+        for a `blkio_weight`; `drop_cpuset` clears the cpuset for the move
+        instead of refusing.
         """
         return self._apply(
             "MoveSandbox",
             api_pb2.MoveSandboxRequest(
-                sandbox_id=self.id, node_id=node_id, node_labels=node_labels or {}
+                sandbox_id=self.id,
+                node_id=node_id,
+                node_labels=node_labels or {},
+                is_cpuset_dropped=drop_cpuset,
             ),
             300.0,
         )

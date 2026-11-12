@@ -375,9 +375,16 @@ impl ApiService {
         // and machine shape come from what the snapshot holds rather than
         // from the request.
         if !req.snapshot.is_empty() {
+            let limits = req
+                .policy
+                .as_ref()
+                .and_then(|p| p.resources.clone())
+                .unwrap_or_default();
             let placement = crate::registry::Placement {
                 vcpus: 1,
                 mem_mib: 512,
+                cpuset_cpus: limits.cpuset_cpus,
+                blkio_weight: limits.blkio_weight,
                 node_labels: req.node_labels.clone(),
                 policy_features: crate::registry::policy_features(
                     req.policy.as_ref().and_then(|p| p.network.as_ref()),
@@ -490,6 +497,11 @@ impl ApiService {
             vcpus: resources.as_ref().map(|r| r.vcpus).unwrap_or(0).max(1),
             cpus: resources.as_ref().map(|r| r.cpus).unwrap_or(0.0),
             reserved_cpus: resources.as_ref().map(|r| r.reserved_cpus).unwrap_or(0.0),
+            cpuset_cpus: resources
+                .as_ref()
+                .map(|r| r.cpuset_cpus.clone())
+                .unwrap_or_default(),
+            blkio_weight: resources.as_ref().map_or(0, |r| r.blkio_weight),
             mem_mib: match resources.as_ref().map(|r| r.mem_mib).unwrap_or(0) {
                 0 => 512,
                 mem => mem as u64,
@@ -584,7 +596,8 @@ impl ApiService {
                         crate::registry::PlacementError::PeersUnreachable(_)
                         | crate::registry::PlacementError::NoNodeWithLabels(_)
                         | crate::registry::PlacementError::NoNodeWithHypervisor(_)
-                        | crate::registry::PlacementError::NoNodeWithPolicyFeatures(_) => {
+                        | crate::registry::PlacementError::NoNodeWithPolicyFeatures(_)
+                        | crate::registry::PlacementError::NoNodeForHostLimits(_) => {
                             Status::failed_precondition(err.to_string())
                         }
                         other => Status::not_found(other.to_string()),
@@ -1582,6 +1595,13 @@ impl ApiService {
             .nodes
             .info(node_id)
             .ok_or_else(|| Status::not_found(format!("no node {node_id}")))?;
+        if let Some(gap) = crate::registry::host_limits_gap(&info, want) {
+            return Err(Status::failed_precondition(format!(
+                "node {node_id} cannot hold sandbox {sandbox_id}'s host limits: it {gap}; move \
+                 it with is_cpuset_dropped (`burrow move --drop-cpuset`) to unpin it, or clear \
+                 the setting with UpdateResources"
+            )));
+        }
         if crate::registry::can_restore(
             &info,
             &want.arch,
@@ -1887,6 +1907,8 @@ impl ApiService {
             vcpus: resources.vcpus.max(1),
             cpus: resources.cpus,
             reserved_cpus: resources.reserved_cpus,
+            cpuset_cpus: resources.cpuset_cpus.clone(),
+            blkio_weight: resources.blkio_weight,
             mem_mib: match resources.mem_mib {
                 0 => 512,
                 mem => mem as u64,
@@ -2621,6 +2643,9 @@ impl Burrow for ApiService {
             .refresh(&id)
             .await
             .ok_or_else(|| Status::not_found(format!("no sandbox {id}")))?;
+        if req.is_cpuset_dropped {
+            drop_cpuset(&mut current);
+        }
         if current.node_id.is_empty() {
             let moved = self.adopt(current, &req.node_id, req.node_labels).await?;
             return Ok(Response::new(moved));
@@ -2721,6 +2746,9 @@ impl Burrow for ApiService {
             }
         }
         let mut released = self.0.sandboxes.unplace(released);
+        if req.is_cpuset_dropped {
+            drop_cpuset(&mut released);
+        }
         self.release_charge(&common::Sandbox {
             node_id: source.clone(),
             ..released.clone()
@@ -2900,6 +2928,8 @@ impl Burrow for ApiService {
             vcpus: 1,
             cpus: 0.0,
             reserved_cpus: 0.0,
+            cpuset_cpus: String::new(),
+            blkio_weight: 0,
             mem_mib: 0,
             // A volume's image is the volume's, which disk admission does
             // not count yet.
@@ -3882,11 +3912,24 @@ pub(crate) fn placement_status(err: crate::registry::PlacementError) -> Status {
         | crate::registry::PlacementError::NoNodeWithLabels(_)
         | crate::registry::PlacementError::NoNodeWithHypervisor(_)
         | crate::registry::PlacementError::NoNodeWithPolicyFeatures(_)
+        | crate::registry::PlacementError::NoNodeForHostLimits(_)
         | crate::registry::PlacementError::NoCompatibleNode { .. }
         | crate::registry::PlacementError::NoCompatibleCpu(_) => {
             Status::failed_precondition(err.to_string())
         }
         other => Status::not_found(other.to_string()),
+    }
+}
+
+/// Unpins a moving sandbox from the host CPUs it ran on, which rarely mean
+/// the same on another machine.
+fn drop_cpuset(sandbox: &mut common::Sandbox) {
+    if let Some(resources) = sandbox
+        .policy
+        .as_mut()
+        .and_then(|policy| policy.resources.as_mut())
+    {
+        resources.cpuset_cpus.clear();
     }
 }
 
@@ -4681,6 +4724,81 @@ mod tests {
             assert!(err.message().contains("203.0.113.17"), "{err}");
             assert!(err.message().contains("detach"), "{err}");
         }
+    }
+
+    /// A move to a node that lacks a CPU the sandbox is pinned to, or the
+    /// io.weight its IO weight needs, is refused naming the setting before
+    /// the source is asked to let go. Dropping the cpuset gets it past.
+    #[tokio::test]
+    async fn a_move_to_a_node_that_cannot_hold_its_limits_is_refused_first() {
+        let api = replica(crate::sandboxes::SandboxRegistry::default());
+        for (id, vcpus) in [("node1", 8), ("node2", 2)] {
+            api.0
+                .nodes
+                .register(
+                    common::NodeInfo {
+                        id: id.into(),
+                        address: "127.0.0.1:1".into(),
+                        total_vcpus: vcpus,
+                        ..Default::default()
+                    },
+                    String::new(),
+                    String::new(),
+                    None,
+                )
+                .unwrap();
+        }
+        let pinned = |cpuset: &str, blkio_weight| common::Sandbox {
+            id: "sbx_a".into(),
+            node_id: "node1".into(),
+            state: common::SandboxState::Running as i32,
+            policy: Some(common::Policy {
+                resources: Some(common::ResourcePolicy {
+                    vcpus: 2,
+                    cpuset_cpus: cpuset.into(),
+                    blkio_weight,
+                    ..Default::default()
+                }),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let move_to = |dropped| api::MoveSandboxRequest {
+            sandbox_id: "sbx_a".into(),
+            node_id: "node2".into(),
+            is_cpuset_dropped: dropped,
+            ..Default::default()
+        };
+        api.0.sandboxes.insert(pinned("6-7", 0));
+        let err = api
+            .move_sandbox(Request::new(move_to(false)))
+            .await
+            .unwrap_err();
+        assert_eq!(err.code(), tonic::Code::FailedPrecondition, "{err}");
+        assert!(
+            err.message().contains("cpuset_cpus \"6-7\" names CPU 7"),
+            "{err}"
+        );
+        assert!(err.message().contains("--drop-cpuset"), "{err}");
+
+        // Past the check, the move goes on to ask the source to let go, which
+        // this fleet's unreachable nodes cannot answer.
+        let err = api
+            .move_sandbox(Request::new(move_to(true)))
+            .await
+            .unwrap_err();
+        assert_ne!(err.code(), tonic::Code::FailedPrecondition, "{err}");
+
+        api.0.sandboxes.insert(pinned("", 500));
+        let err = api
+            .move_sandbox(Request::new(move_to(true)))
+            .await
+            .unwrap_err();
+        assert_eq!(err.code(), tonic::Code::FailedPrecondition, "{err}");
+        assert!(
+            err.message().contains("io.weight for blkio_weight 500"),
+            "{err}"
+        );
     }
 
     /// Refused before the node is asked anything, naming the sandbox and its

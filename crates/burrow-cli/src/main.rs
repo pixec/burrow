@@ -340,6 +340,11 @@ enum Command {
         /// node is named. Repeatable.
         #[arg(long = "node-label")]
         node_labels: Vec<String>,
+        /// Clear the sandbox's --cpuset-cpus for the move. Without it, a
+        /// destination missing a pinned CPU is passed over, and a named one
+        /// is refused before anything is suspended.
+        #[arg(long)]
+        drop_cpuset: bool,
     },
     /// Run a command in an existing sandbox.
     Exec {
@@ -2154,6 +2159,7 @@ async fn main() -> anyhow::Result<()> {
             id,
             node,
             node_labels,
+            drop_cpuset,
         } => {
             let started = std::time::Instant::now();
             let sandbox = client
@@ -2161,6 +2167,7 @@ async fn main() -> anyhow::Result<()> {
                     sandbox_id: id,
                     node_id: node.unwrap_or_default(),
                     node_labels: parse_pairs("--node-label", &node_labels)?,
+                    is_cpuset_dropped: drop_cpuset,
                 })
                 .await?
                 .into_inner();

@@ -831,6 +831,12 @@ export interface MoveOptions extends CallOptions {
   nodeId?: string;
   /** Labels the destination must carry, when no node is named. */
   nodeLabels?: Record<string, string>;
+  /**
+   * Clear the sandbox's `cpusetCpus` for the move. Without it, a destination
+   * missing a pinned CPU is passed over, and a named one is refused before
+   * anything is suspended.
+   */
+  dropCpuset?: boolean;
 }
 
 /** Options for {@link Sandbox.fork}. */

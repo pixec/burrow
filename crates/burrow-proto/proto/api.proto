@@ -804,6 +804,12 @@ message MoveSandboxRequest {
   string node_id = 2;
   // Labels the destination must carry, when no node is named.
   map<string, string> node_labels = 3;
+  // Clears the sandbox's `cpuset_cpus` for the move, since pinning to host
+  // cores rarely carries across machines. Without it, a destination that
+  // lacks a CPU the cpuset names is passed over in placement, and a named
+  // one is refused with FAILED_PRECONDITION before anything is suspended, as
+  // is one without cgroup io.weight for a sandbox with a `blkio_weight`.
+  bool is_cpuset_dropped = 4;
 }
 
 // Takes a sandbox's current state and keeps it as a snapshot object.

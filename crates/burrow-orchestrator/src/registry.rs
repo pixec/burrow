@@ -36,6 +36,11 @@ pub struct Placement {
     pub vcpus: u32,
     pub cpus: f64,
     pub reserved_cpus: f64,
+    /// The host CPUs the sandbox is pinned to, which the node must have, and
+    /// its IO weight, which needs the node's cgroup io.weight. Hard, because
+    /// a node without them can only refuse the VM its cgroup.
+    pub cpuset_cpus: String,
+    pub blkio_weight: u32,
     pub mem_mib: u64,
     /// The disk it is promised, in bytes: its scratch disk. Checked against
     /// what the node reports with the node's own rule
@@ -177,6 +182,8 @@ pub enum PlacementError {
     PeersUnreachable(String),
     #[error("no healthy node enforces {0}; upgrade burrowd on the nodes")]
     NoNodeWithPolicyFeatures(String),
+    #[error("no healthy node can hold the sandbox's host limits: {0}")]
+    NoNodeForHostLimits(String),
     #[error(
         "no healthy node carries {0}; label nodes with `burrowd serve --label` and check \
          `burrow nodes ls`"
@@ -324,6 +331,32 @@ pub fn missing_features(info: &NodeInfo, wanted: &[&'static str]) -> Vec<&'stati
         .copied()
         .filter(|feature| !info.policy_features.iter().any(|f| f == feature))
         .collect()
+}
+
+/// Why `info`'s node cannot hold the host limits `want` pins: a
+/// `cpuset_cpus` naming a CPU it does not have, or a `blkio_weight` without
+/// cgroup io.weight. A node that has not reported its CPU count is not ruled
+/// out on its cpuset.
+pub fn host_limits_gap(info: &NodeInfo, want: &Placement) -> Option<String> {
+    if !want.cpuset_cpus.is_empty()
+        && info.total_vcpus > 0
+        && let Ok(set) = burrow_common::cpu::parse_cpuset(&want.cpuset_cpus)
+        && let Some(&last) = set.last()
+        && last >= info.total_vcpus
+    {
+        return Some(format!(
+            "has CPUs 0-{}, and cpuset_cpus {:?} names CPU {last}",
+            info.total_vcpus - 1,
+            want.cpuset_cpus
+        ));
+    }
+    if want.blkio_weight > 0 && !info.is_io_weight_supported {
+        return Some(format!(
+            "has no cgroup io.weight for blkio_weight {}",
+            want.blkio_weight
+        ));
+    }
+    None
 }
 
 /// Whether a node carries every label asked for.
@@ -1020,6 +1053,23 @@ impl NodeRegistry {
             ));
         }
         let live = enforcing;
+
+        let holding: Vec<_> = live
+            .iter()
+            .copied()
+            .filter(|e| host_limits_gap(&e.info, want).is_none())
+            .collect();
+        if holding.is_empty() {
+            return Err(PlacementError::NoNodeForHostLimits(
+                live.iter()
+                    .filter_map(|e| {
+                        Some(format!("{} {}", e.info.id, host_limits_gap(&e.info, want)?))
+                    })
+                    .collect::<Vec<_>>()
+                    .join("; "),
+            ));
+        }
+        let live = holding;
 
         let with_template: Vec<_> = live
             .iter()
@@ -2560,6 +2610,54 @@ mod tests {
             want.mem_charge_mib(&info, &status(&[], &[], 64_000)),
             ceiling(Hypervisor::CloudHypervisor).max(ceiling(Hypervisor::Firecracker))
         );
+    }
+
+    /// A sandbox pinned to host CPUs goes only where every one exists, and
+    /// one with an IO weight only where cgroup io.weight does; with neither
+    /// anywhere, the refusal names each node and what it lacks.
+    #[test]
+    fn host_limits_rule_out_nodes_that_cannot_hold_them() {
+        let registry = registry(&[
+            ("small", status(&["t"], &[], 64_000)),
+            ("large", status(&["t"], &[], 1_000)),
+        ]);
+        set_capacity(&registry, "small", 2, 64_000);
+        set_capacity(&registry, "large", 8, 64_000);
+        registry
+            .nodes
+            .lock()
+            .unwrap()
+            .get_mut("small")
+            .unwrap()
+            .info
+            .is_io_weight_supported = true;
+        let pinned = Placement {
+            template: "t".into(),
+            cpuset_cpus: "4-5".into(),
+            ..Default::default()
+        };
+        assert_eq!(registry.place_for(&pinned).unwrap(), "large");
+        let weighted = Placement {
+            template: "t".into(),
+            blkio_weight: 500,
+            ..Default::default()
+        };
+        assert_eq!(registry.place_for(&weighted).unwrap(), "small");
+
+        let neither = Placement {
+            template: "t".into(),
+            cpuset_cpus: "4-5".into(),
+            blkio_weight: 500,
+            ..Default::default()
+        };
+        let err = registry.place_for(&neither).unwrap_err();
+        assert!(
+            matches!(err, PlacementError::NoNodeForHostLimits(_)),
+            "{err}"
+        );
+        let text = err.to_string();
+        assert!(text.contains("small has CPUs 0-1"), "{text}");
+        assert!(text.contains("large has no cgroup io.weight"), "{text}");
     }
 
     /// A sandbox with a reservation is charged it, not its vCPUs or its cap:

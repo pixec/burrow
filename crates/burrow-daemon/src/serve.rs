@@ -671,6 +671,7 @@ fn local_node_info(args: &ServeArgs) -> anyhow::Result<NodeInfo> {
             .collect(),
         // Filled in once the data directory has been probed.
         hole_probe: None,
+        is_io_weight_supported: burrow_vmm::is_io_weight_supported(&args.cgroup_root),
     })
 }
 

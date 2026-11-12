@@ -859,6 +859,10 @@ message NodeInfo {
   // The CPU this node's guests see. Saved memory restores here only when
   // it was written on a compatible one.
   CpuFingerprint cpu = 25;
+  // Whether the node's cgroups delegate the io controller with io.weight,
+  // which a sandbox's `blkio_weight` needs. Placement passes over a node
+  // without it for such a sandbox.
+  bool is_io_weight_supported = 26;
 }
 
 // What restoring a guest's saved memory needs of the CPU under it. A guest

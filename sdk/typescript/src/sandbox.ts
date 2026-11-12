@@ -1187,7 +1187,12 @@ export class Sandbox {
   move(options: MoveOptions = {}): Promise<SandboxInfo> {
     return this.mutate(
       "MoveSandbox",
-      { sandboxId: this.id, nodeId: options.nodeId ?? "", nodeLabels: options.nodeLabels ?? {} },
+      {
+        sandboxId: this.id,
+        nodeId: options.nodeId ?? "",
+        nodeLabels: options.nodeLabels ?? {},
+        isCpusetDropped: options.dropCpuset ?? false,
+      },
       options,
       300_000,
     );

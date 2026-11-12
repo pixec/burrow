@@ -201,6 +201,13 @@ impl Cgroup {
     }
 }
 
+/// Whether VMs under `root` can be given an io.weight: the io controller is
+/// delegated to burrow's cgroups and the kernel exposes io.weight there.
+pub fn is_io_weight_supported(root: &Path) -> bool {
+    let parent = root.join("burrow");
+    prepare_parent(root, &parent).is_ok() && parent.join("io.weight").exists()
+}
+
 /// Ensures the burrow parent cgroup exists and has the controllers it needs
 /// delegated to it.
 fn prepare_parent(root: &Path, parent: &Path) -> Result<()> {
@@ -364,6 +371,22 @@ mod tests {
         assert_eq!(read("cpuset.cpus"), "");
         assert_eq!(read("io.weight"), "default 100");
         let _ = std::fs::remove_dir_all(&cgroup.path);
+    }
+
+    /// io.weight is offered only where the io controller reaches burrow's
+    /// cgroups and the kernel gives them the file.
+    #[test]
+    fn io_weight_is_offered_only_where_the_kernel_gives_it() {
+        let root = std::env::temp_dir().join(format!("burrow-cg-io-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        for dir in [root.clone(), root.join("burrow")] {
+            std::fs::create_dir_all(&dir).unwrap();
+            std::fs::write(dir.join("cgroup.controllers"), "cpu io").unwrap();
+        }
+        assert!(!is_io_weight_supported(&root));
+        std::fs::write(root.join("burrow").join("io.weight"), "default 100").unwrap();
+        assert!(is_io_weight_supported(&root));
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     /// A VMM's cgroup is made without its `cpus` cap, so a kernel boot or a
