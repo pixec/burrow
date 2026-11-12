@@ -89,6 +89,12 @@ pub struct ServeArgs {
         env = "BURROW_ALLOW_UNCONDITIONAL_OBJECT_STORE"
     )]
     pub is_unconditional_object_store_allowed: bool,
+    /// Seconds between uploads of a volume a running sandbox writes, each
+    /// taken with the guest's filesystem frozen for the instant a reflink
+    /// clone takes. A volume is also uploaded when its writer lets go or
+    /// suspends. 0 uploads only then. Needs --object-store.
+    #[arg(long, default_value_t = 300, env = "BURROWD_VOLUME_UPLOAD_SECS")]
+    pub volume_upload_secs: u64,
     /// Appended to every guest kernel command line.
     #[arg(
         long,
@@ -1480,6 +1486,11 @@ pub async fn run(args: ServeArgs) -> anyhow::Result<()> {
     }
     {
         let sandboxes = sandboxes.clone();
+        let every = Duration::from_secs(args.volume_upload_secs);
+        tokio::spawn(async move { sandboxes.upload_volumes(every).await });
+    }
+    {
+        let sandboxes = sandboxes.clone();
         tokio::spawn(async move { sandboxes.keep_clocks().await });
     }
 
@@ -1695,6 +1706,7 @@ pub async fn run(args: ServeArgs) -> anyhow::Result<()> {
     // also what it presents when registering and when dialling a peer.
     let registration_token = cluster_token.clone();
     sandboxes.metrics().register(Arc::clone(&node_id));
+    sandboxes.volumes().bind_node_id(Arc::clone(&node_id));
     tokio::spawn(crate::delivery::run(
         sandboxes.delivery(),
         Arc::clone(&store),

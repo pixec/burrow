@@ -406,11 +406,13 @@ message KitSpec {
 
 // Storage that outlives the sandboxes that mount it.
 //
-// Node-local, like a snapshot and for the same reason: it is a disk image on
-// one machine, attached to the guest as a virtio block device. A sandbox that
-// mounts one is placed on the node holding it.
+// A disk image on one node at a time, attached to the guest as a virtio block
+// device. A sandbox that mounts one is placed on the node holding it. With an
+// object store configured it is uploaded there too, and can move.
 message Volume {
   string name = 1;
+  // The node holding it. Empty for a durable volume whose node is gone or
+  // that was released for a move: the next sandbox to mount it places it.
   string node_id = 2;
   uint64 size_mib = 3;
   reserved 4;
@@ -423,6 +425,11 @@ message Volume {
   // for a path no longer declared stays findable.
   map<string, string> labels = 6;
   int64 created_at_unix_ms = 7;
+  // In the object store, so it outlives its node: attachable on another node
+  // once the orchestrator writes its node off, and moved with a sandbox.
+  bool is_durable = 8;
+  // Unix milliseconds of the upload the store holds; 0 before the first.
+  int64 uploaded_at_unix_ms = 9;
 }
 
 message Sandbox {

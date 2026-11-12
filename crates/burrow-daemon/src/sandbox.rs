@@ -61,6 +61,66 @@ async fn flush_guest(sandbox: &RunningSandbox) {
     .await;
 }
 
+/// Runs `capture` with the guest's filesystems at `paths` frozen through its
+/// agent: synced, clean and still until the thaw. A guest that cannot freeze
+/// them is synced instead, and the capture is what a power cut would leave.
+/// Returns what `capture` did, how long the guest's writes were held, and
+/// whether they were frozen.
+async fn with_frozen<T>(
+    sandbox: &RunningSandbox,
+    paths: Vec<String>,
+    capture: impl std::future::Future<Output = T>,
+) -> (T, std::time::Duration, bool) {
+    use burrow_proto::guest::v1::{RootDiskRequest, root_disk_request::Op};
+    let request = |op: Op| RootDiskRequest {
+        op: op as i32,
+        paths: paths.clone(),
+        ..Default::default()
+    };
+    let started = std::time::Instant::now();
+    let frozen = match sandbox.agent().await {
+        Ok(mut agent) => matches!(
+            tokio::time::timeout(
+                std::time::Duration::from_secs(10),
+                agent.root_disk(request(Op::Freeze)),
+            )
+            .await,
+            Ok(Ok(_))
+        ),
+        Err(_) => false,
+    };
+    if !frozen {
+        flush_guest(sandbox).await;
+    }
+    let held = std::time::Instant::now();
+    let out = capture.await;
+    if frozen {
+        let mut thawed = false;
+        for _ in 0..5 {
+            if let Ok(mut agent) = sandbox.agent().await
+                && agent.root_disk(request(Op::Thaw)).await.is_ok()
+            {
+                thawed = true;
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        }
+        if !thawed {
+            tracing::error!(
+                sandbox = sandbox.id(),
+                ?paths,
+                "could not thaw the guest's filesystems after a capture; writes to them block \
+                 until it is restarted"
+            );
+        }
+    }
+    let took = match frozen {
+        true => started.elapsed(),
+        false => held.elapsed(),
+    };
+    (out, took, frozen)
+}
+
 /// An overlay sandbox's scratch disk when its policy named none.
 const DEFAULT_SCRATCH_MIB: u32 = 1024;
 
@@ -680,6 +740,7 @@ fn spawn_handshake(
                     .root_disk(burrow_proto::guest::v1::RootDiskRequest {
                         op: burrow_proto::guest::v1::root_disk_request::Op::Grow as i32,
                         size_bytes,
+                        ..Default::default()
                     })
                     .await?;
             }
@@ -2282,7 +2343,10 @@ impl SandboxManager {
                     .map(|h| (h, config.version(h).to_string()))
                     .collect(),
             )),
-            volumes: Arc::new(crate::volume::VolumeStore::new(&config.data_dir)),
+            volumes: Arc::new(
+                crate::volume::VolumeStore::new(&config.data_dir)
+                    .with_object_store(config.object_store.clone()),
+            ),
             events: tokio::sync::broadcast::channel(1024).0,
             delivery: Arc::new(crate::delivery::Delivery::new(config.event_delivery)),
             metrics: Default::default(),
@@ -4464,6 +4528,7 @@ impl SandboxManager {
                 .root_disk(burrow_proto::guest::v1::RootDiskRequest {
                     op: burrow_proto::guest::v1::root_disk_request::Op::Shrink as i32,
                     size_bytes: bytes,
+                    ..Default::default()
                 })
                 .await?
                 .into_inner();
@@ -4547,6 +4612,7 @@ impl SandboxManager {
                         .root_disk(burrow_proto::guest::v1::RootDiskRequest {
                             op: burrow_proto::guest::v1::root_disk_request::Op::Grow as i32,
                             size_bytes: bytes,
+                            ..Default::default()
                         })
                         .await?
                         .into_inner();
@@ -6973,9 +7039,12 @@ impl SandboxManager {
                 u64::from(resources.disk_mib) * burrow_common::disk::MIB,
             )
             .await?;
-        // The state was captured without volumes, so they could only arrive by
-        // hotplug.
+        // A sandbox's own stored state was captured with its volumes attached,
+        // and restores with them. Any other was captured without, so they
+        // could only arrive by hotplug.
+        let is_attached = matches!(source, RestoreSource::Stored { .. });
         if !capabilities.is_drive_hotplug_supported
+            && !is_attached
             && crate::volume::block_mounts(&policy.volumes)
                 .next()
                 .is_some()
@@ -7124,7 +7193,10 @@ impl SandboxManager {
             &resources,
             &lease,
             &tap_name,
-            &[],
+            match is_attached {
+                true => &policy.volumes,
+                false => &[],
+            },
             is_systemd,
             disk_layout,
         );
@@ -7161,7 +7233,9 @@ impl SandboxManager {
             }
         }
 
-        if let Err(err) = attach_volumes(guard.vm(), &policy.volumes, guest_os).await {
+        if !is_attached
+            && let Err(err) = attach_volumes(guard.vm(), &policy.volumes, guest_os).await
+        {
             return Err(guard.fail(err).await);
         }
 
@@ -7175,7 +7249,10 @@ impl SandboxManager {
             self.guest_network(&lease, &[], capabilities.is_tap_networked, true),
             self.inspection_ca_for(&policy),
             self.trust_bundles_for(&source.template(), &policy).await,
-            crate::volume::agent_mounts(&policy.volumes, guest_os, disk_layout),
+            match is_attached {
+                true => Vec::new(),
+                false => crate::volume::agent_mounts(&policy.volumes, guest_os, disk_layout),
+            },
         );
         let inspection_root = self.inspection_root_of(&request);
         // Nothing below can fail, so the sandbox takes over here.
@@ -7655,20 +7732,124 @@ impl SandboxManager {
 
 /// Keeping suspended sandboxes in the object store, and taking them over.
 impl SandboxManager {
-    /// Whether a sandbox can live in the object store at all. A volume is
-    /// storage on this node with an identity of its own, and does not move.
-    fn is_movable(sandbox: &RunningSandbox) -> bool {
-        sandbox
-            .record()
-            .policy
-            .unwrap_or_default()
-            .volumes
-            .is_empty()
+    /// Whether a sandbox can live in the object store at all: one mounting
+    /// volumes only where they are kept there too.
+    fn is_movable(&self, sandbox: &RunningSandbox) -> bool {
+        self.volumes.is_durable()
+            || crate::volume::block_mounts(&sandbox.record().policy.unwrap_or_default().volumes)
+                .next()
+                .is_none()
+    }
+
+    /// Brings every volume a suspended sandbox mounts up to date in the
+    /// store, so the sandbox and its volumes move together.
+    async fn sync_volumes(&self, sandbox: &RunningSandbox) -> Result<(), Status> {
+        let policy = sandbox.record().policy.unwrap_or_default();
+        for (_, mount) in crate::volume::block_mounts(&policy.volumes) {
+            self.volumes.sync(&mount.volume).await?;
+        }
+        Ok(())
+    }
+
+    /// Uploads the volumes running sandboxes write, every `every`, and keeps
+    /// this node's copies in step with who the store says holds them.
+    pub async fn upload_volumes(&self, every: std::time::Duration) {
+        if !self.volumes.is_durable() {
+            return;
+        }
+        let tick = match every.is_zero() {
+            true => std::time::Duration::from_secs(60),
+            false => every.min(std::time::Duration::from_secs(60)),
+        };
+        let mut last = std::time::Instant::now();
+        loop {
+            tokio::time::sleep(tick).await;
+            self.volumes.reconcile_ownership().await;
+            if every.is_zero() || last.elapsed() < every {
+                continue;
+            }
+            last = std::time::Instant::now();
+            let running: Vec<Arc<RunningSandbox>> = self
+                .sandboxes
+                .lock()
+                .await
+                .values()
+                .filter(|sandbox| sandbox.is_running())
+                .cloned()
+                .collect();
+            for sandbox in running {
+                self.upload_live_volumes(&sandbox).await;
+            }
+        }
+    }
+
+    /// The writable volumes a running sandbox holds, with where its guest
+    /// mounts each.
+    fn written_volumes(&self, sandbox: &RunningSandbox) -> Vec<(String, String)> {
+        let policy = sandbox.record().policy.unwrap_or_default();
+        crate::volume::block_mounts(&policy.volumes)
+            .filter(|(_, mount)| !mount.is_read_only)
+            .filter(|(_, mount)| {
+                self.volumes.writer(&mount.volume).as_deref() == Some(sandbox.id())
+            })
+            .map(|(_, mount)| (mount.volume.clone(), mount.path.clone()))
+            .collect()
+    }
+
+    /// Captures the volumes a running sandbox writes, those that changed and
+    /// are not already uploading, with its guest's filesystems frozen for
+    /// the clones, and uploads them behind it.
+    async fn upload_live_volumes(&self, sandbox: &Arc<RunningSandbox>) {
+        let mut held = Vec::new();
+        for (name, path) in self.written_volumes(sandbox) {
+            if !self.volumes.is_changed(&name).await {
+                continue;
+            }
+            if let Some(guard) = self.volumes.try_lock_upload(&name) {
+                held.push((name, path, guard));
+            }
+        }
+        if held.is_empty() {
+            return;
+        }
+        let paths = held.iter().map(|(_, path, _)| path.clone()).collect();
+        let (captures, frozen_for, is_frozen) = with_frozen(sandbox, paths, async {
+            let mut captures = Vec::new();
+            for (name, _, _) in &held {
+                captures.push(self.volumes.capture(name).await);
+            }
+            captures
+        })
+        .await;
+        tracing::info!(
+            sandbox = sandbox.id(),
+            volumes = held.len(),
+            frozen_ms = frozen_for.as_millis() as u64,
+            is_frozen,
+            "captured the volumes a running sandbox writes"
+        );
+        for ((name, _, guard), captured) in held.into_iter().zip(captures) {
+            let volumes = Arc::clone(&self.volumes);
+            tokio::spawn(async move {
+                let uploaded = match captured {
+                    Ok((capture, stamp)) => volumes.upload_capture(&name, &capture, stamp).await,
+                    Err(err) => Err(err),
+                };
+                drop(guard);
+                if let Err(err) = uploaded {
+                    tracing::warn!(
+                        volume = name,
+                        err = err.message(),
+                        "could not upload the volume"
+                    );
+                }
+            });
+        }
     }
 
     /// Uploads a suspended sandbox's state behind whatever suspended it.
     fn spawn_upload(&self, sandbox: &Arc<RunningSandbox>) {
-        if self.config.object_store.is_none() || !Self::is_movable(sandbox) {
+        if self.config.object_store.is_none() || !self.is_movable(sandbox) {
             return;
         }
         let manager = self.clone();
@@ -7691,12 +7872,24 @@ impl SandboxManager {
         let Some(store) = &self.config.object_store else {
             return Ok(false);
         };
-        if !Self::is_movable(sandbox) {
+        if !self.is_movable(sandbox) {
             return Ok(false);
         }
         let token = sandbox.durable.cancel.lock().unwrap().clone();
         let _uploading = sandbox.durable.upload.lock().await;
         if token.is_cancelled() || !sandbox.is_suspended() {
+            return Ok(false);
+        }
+        let synced = tokio::select! {
+            () = token.cancelled() => return Ok(false),
+            synced = self.sync_volumes(sandbox) => synced,
+        };
+        if let Err(err) = synced {
+            tracing::warn!(
+                sandbox = sandbox.id(),
+                err = err.message(),
+                "a volume the sandbox mounts could not be uploaded; it stays on this node"
+            );
             return Ok(false);
         }
         let chain = sandbox.memory_chain.lock().await.clone();
@@ -8022,10 +8215,29 @@ impl SandboxManager {
             ));
         }
         let sandbox = self.get(id).await?;
-        if !Self::is_movable(&sandbox) {
+        if !self.is_movable(&sandbox) {
             return Err(Status::failed_precondition(
-                "a sandbox with volumes cannot move: its volumes stay on the node that holds them",
+                "a sandbox with volumes moves only with an object store to carry them",
             ));
+        }
+        let mounted: Vec<String> =
+            crate::volume::block_mounts(&sandbox.record().policy.unwrap_or_default().volumes)
+                .map(|(_, mount)| mount.volume.clone())
+                .collect();
+        for other in self.sandboxes.lock().await.values() {
+            if other.id() == id {
+                continue;
+            }
+            let policy = other.record().policy.unwrap_or_default();
+            if let Some((_, shared)) = crate::volume::block_mounts(&policy.volumes)
+                .find(|(_, mount)| mounted.contains(&mount.volume))
+            {
+                return Err(Status::failed_precondition(format!(
+                    "volume {} is also mounted by sandbox {}, which stays on this node",
+                    shared.volume,
+                    other.id()
+                )));
+            }
         }
         if sandbox.is_running() {
             self.pause(id).await?;
@@ -8050,6 +8262,17 @@ impl SandboxManager {
                 .ok_or_else(|| Status::not_found(format!("no sandbox {id} on this node")))?
         };
         let record = sandbox.record();
+        self.volumes.release_all(id);
+        for name in &mounted {
+            if let Err(err) = self.volumes.release(name).await {
+                tracing::warn!(
+                    sandbox = id,
+                    volume = name,
+                    err = err.message(),
+                    "could not release a volume the moving sandbox mounts; it stays here"
+                );
+            }
+        }
         self.emit(&sandbox, EVENT_STOPPED, "released").await;
         // Behind the response: the sandbox is out of the map and its state is
         // in the store, so the node adopting it has nothing to wait for here.
@@ -8104,11 +8327,6 @@ impl SandboxManager {
             Status::failed_precondition("this node has no object store to adopt sandboxes from")
         })?;
         let id = record.id.clone();
-        if !record.policy.clone().unwrap_or_default().volumes.is_empty() {
-            return Err(Status::failed_precondition(
-                "a sandbox with volumes cannot move: its volumes stay on the node that holds them",
-            ));
-        }
         let releasing = self.releasing.lock().unwrap().get(&id).cloned();
         if let Some(gate) = releasing {
             drop(gate.lock().await);

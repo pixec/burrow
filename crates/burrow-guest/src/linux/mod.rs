@@ -109,14 +109,15 @@ pub async fn root_disk(req: guestpb::RootDiskRequest) -> Result<guestpb::RootDis
         });
     }
     let expected = req.size_bytes;
+    let paths = req.paths;
     let result = tokio::task::spawn_blocking(move || match op {
         Op::Sync => {
             rootdisk::sync();
             Ok(())
         }
         Op::Trim => rootdisk::trim(),
-        Op::Freeze => rootdisk::freeze(),
-        Op::Thaw => rootdisk::thaw(),
+        Op::Freeze => rootdisk::freeze(&paths),
+        Op::Thaw => rootdisk::thaw(&paths),
         Op::Grow => rootdisk::grow(expected),
         Op::Unspecified | Op::Shrink => Err(std::io::Error::other("no operation named")),
     })

@@ -475,6 +475,9 @@ message RootDiskRequest {
   // before it grows; 0 grows to whatever it sees. OP_SHRINK: the size to
   // shrink to, on macOS the disk's.
   uint64 size_bytes = 2;
+  // OP_FREEZE, OP_THAW: the mount points to act on, `/` when empty.
+  // A freeze of several is undone by the agent if any one fails.
+  repeated string paths = 3;
 }
 
 message RootDiskResponse {

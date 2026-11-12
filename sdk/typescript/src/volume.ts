@@ -2,7 +2,7 @@ import { withClient } from "./client.js";
 import { BurrowError } from "./errors.js";
 import type { Transport, TransportOptions } from "./transport.js";
 import type { CallOptions } from "./types.js";
-import { dateOf } from "./wire.js";
+import { dateOf, dateOrNull } from "./wire.js";
 
 /** Options for {@link Volume.create}. */
 export interface CreateVolumeOptions extends CallOptions {
@@ -44,18 +44,27 @@ export interface ListVolumesOptions extends CallOptions {
  *   that sandbox stops.
  * - **Read-only mounts are shared.** Any number of sandboxes may mount one
  *   read-only at once, even alongside the writer.
- * - **A volume never moves.** A sandbox that mounts one is placed on the node
- *   holding it, and mounting one costs a cold boot rather than a warm restore.
+ * - **A volume lives on one node at a time.** A sandbox that mounts one is
+ *   placed on the node holding it. With an object store configured it is
+ *   uploaded there too ({@link durable}), moves with a sandbox that moves, and
+ *   is attached on another node once its own is written off.
  */
 export class Volume {
   readonly name: string;
-  /** The node holding it, and the only node it can be attached on. */
+  /**
+   * The node holding it, or `""` for a durable volume no node holds, which the
+   * next sandbox to mount it places.
+   */
   readonly nodeId: string;
   readonly sizeMib: number;
   readonly createdAt: Date;
   /** Sandbox holding the writable claim, or `""` when free. */
   readonly attachedTo: string;
   readonly labels: Record<string, string>;
+  /** Whether it is in the object store, so it outlives its node. */
+  readonly durable: boolean;
+  /** When the copy in the object store was uploaded; `null` before the first. */
+  readonly uploadedAt: Date | null;
 
   private readonly transport: Transport;
 
@@ -71,6 +80,8 @@ export class Volume {
     this.createdAt = dateOf(raw.createdAtUnixMs);
     this.attachedTo = String(raw.attachedTo ?? "");
     this.labels = raw.labels ?? {};
+    this.durable = Boolean(raw.isDurable);
+    this.uploadedAt = dateOrNull(raw.uploadedAtUnixMs);
   }
 
   /** Creates a volume, placing it on a node that satisfies `nodeLabels`. */

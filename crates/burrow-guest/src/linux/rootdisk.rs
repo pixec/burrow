@@ -68,26 +68,56 @@ pub fn trim() -> std::io::Result<()> {
     Ok(())
 }
 
-pub fn freeze() -> std::io::Result<()> {
-    sync();
-    let root = root()?;
-    let mut unused = 0;
-    // SAFETY: as above.
-    match unsafe { fifreeze(root.as_raw_fd(), &mut unused) } {
-        Ok(_) | Err(nix::errno::Errno::EBUSY) => Ok(()),
-        Err(err) => Err(err.into()),
+fn mount_points(paths: &[String]) -> Vec<&str> {
+    match paths.is_empty() {
+        true => vec!["/"],
+        false => paths.iter().map(String::as_str).collect(),
     }
 }
 
-pub fn thaw() -> std::io::Result<()> {
-    let root = root()?;
-    let mut unused = 0;
-    // SAFETY: as above.
-    match unsafe { fithaw(root.as_raw_fd(), &mut unused) } {
-        // Not frozen, which a thaw after a failed freeze finds.
-        Ok(_) | Err(nix::errno::Errno::EINVAL) => Ok(()),
-        Err(err) => Err(err.into()),
+/// Syncs, then freezes each mount point in turn. One that fails thaws the
+/// ones already frozen, so a failed freeze leaves nothing still.
+pub fn freeze(paths: &[String]) -> std::io::Result<()> {
+    sync();
+    let points = mount_points(paths);
+    for (done, point) in points.iter().enumerate() {
+        let frozen = std::fs::File::open(point).and_then(|dir| {
+            let mut unused = 0;
+            // SAFETY: the descriptor is open and `unused` lives across the call.
+            match unsafe { fifreeze(dir.as_raw_fd(), &mut unused) } {
+                Ok(_) | Err(nix::errno::Errno::EBUSY) => Ok(()),
+                Err(err) => Err(std::io::Error::from(err)),
+            }
+        });
+        if let Err(err) = frozen {
+            let _ = thaw_points(&points[..done]);
+            return Err(std::io::Error::other(format!("freezing {point}: {err}")));
+        }
     }
+    Ok(())
+}
+
+pub fn thaw(paths: &[String]) -> std::io::Result<()> {
+    thaw_points(&mount_points(paths))
+}
+
+fn thaw_points(points: &[&str]) -> std::io::Result<()> {
+    let mut first = None;
+    for point in points {
+        let thawed = std::fs::File::open(point).and_then(|dir| {
+            let mut unused = 0;
+            // SAFETY: as above.
+            match unsafe { fithaw(dir.as_raw_fd(), &mut unused) } {
+                // Not frozen, which a thaw after a failed freeze finds.
+                Ok(_) | Err(nix::errno::Errno::EINVAL) => Ok(()),
+                Err(err) => Err(std::io::Error::from(err)),
+            }
+        });
+        if let Err(err) = thawed {
+            first.get_or_insert(err);
+        }
+    }
+    first.map_or(Ok(()), Err)
 }
 
 /// Bytes of the block device `/` is mounted from, from sysfs.

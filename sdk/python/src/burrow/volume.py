@@ -6,7 +6,7 @@ from typing import Any, Dict, List, Optional
 
 from ._pb import api_pb2, common_pb2
 from ._transport import Transport
-from ._wire import at
+from ._wire import at, at_or_none
 from .errors import BurrowError
 
 
@@ -29,9 +29,10 @@ class Volume:
       released when that sandbox stops.
     - **Read-only mounts are shared.** Any number of sandboxes may mount one
       read-only at once, even alongside the writer.
-    - **A volume never moves.** A sandbox that mounts one is placed on the node
-      holding it, and mounting one costs a cold boot rather than a warm
-      restore.
+    - **A volume lives on one node at a time.** A sandbox that mounts one is
+      placed on the node holding it. With an object store configured it is
+      uploaded there too (`durable`), moves with a sandbox that moves, and is
+      attached on another node once its own is written off.
     """
 
     def __init__(self, transport: Transport, raw: common_pb2.Volume):
@@ -40,13 +41,18 @@ class Volume:
         self._transport = transport
         self._closed = False
         self.name = raw.name
-        # The node holding it, and the only node it can be attached on.
+        # The node holding it, or "" for a durable volume no node holds, which
+        # the next sandbox to mount it places.
         self.node_id = raw.node_id
         self.size_mib = raw.size_mib
         self.created_at = at(raw.created_at_unix_ms)
         # Sandbox holding the writable claim, or "" when free.
         self.attached_to = raw.attached_to
         self.labels = dict(raw.labels)
+        # Whether it is in the object store, so it outlives its node.
+        self.durable = raw.is_durable
+        # When the copy in the object store was uploaded; None before the first.
+        self.uploaded_at = at_or_none(raw.uploaded_at_unix_ms)
 
     @staticmethod
     def create(

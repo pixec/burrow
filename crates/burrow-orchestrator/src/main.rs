@@ -567,6 +567,28 @@ async fn inventory(state: &OrchestratorState, node_id: &str, client: &mut crate:
         }
         Err(err) => tracing::warn!(node_id, %err, "node volume inventory unavailable"),
     }
+    match client
+        .list_durable_volumes(burrow_proto::api::v1::ListVolumesRequest {
+            node_id: String::new(),
+        })
+        .await
+    {
+        Ok(resp) => {
+            let (adopted, forgotten) = state
+                .volumes
+                .reconcile_remote(resp.into_inner().volumes, |node| state.nodes.knows(node));
+            if adopted > 0 || forgotten > 0 {
+                tracing::info!(
+                    node_id,
+                    adopted,
+                    forgotten,
+                    "reconciled volumes with the object store"
+                );
+            }
+        }
+        Err(err) if err.code() == tonic::Code::FailedPrecondition => {}
+        Err(err) => tracing::warn!(node_id, %err, "object store volume inventory unavailable"),
+    }
 }
 
 /// Publishes this replica's address and reads every live replica's back, so
@@ -663,8 +685,9 @@ async fn reap_dead_nodes(state: Arc<OrchestratorState>, expiry: Option<std::time
                 tracing::warn!(node_id, %err, "could not remove a written-off node from the store");
             }
             // Its snapshots go with it: they only ever existed on that node.
+            // Its durable volumes stay, to be taken from it.
             state.snapshots.forget_node(&node_id);
-            state.volumes.forget_node(&node_id);
+            let volumes = state.volumes.forget_node(&node_id);
             state.nodes.remove_node(&node_id);
             for sandbox in unplaced.iter().filter(|s| !s.public_ips.is_empty()) {
                 tracing::warn!(
@@ -679,6 +702,7 @@ async fn reap_dead_nodes(state: Arc<OrchestratorState>, expiry: Option<std::time
                 placements = dropped.len(),
                 names = dropped.iter().filter(|s| !s.name.is_empty()).count(),
                 unplaced = unplaced.len(),
+                volumes,
                 "node has been silent past its expiry; forgetting it and every \
                  placement recorded against it, except those the object store can bring back"
             );

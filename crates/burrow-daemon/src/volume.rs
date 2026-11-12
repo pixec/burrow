@@ -22,6 +22,10 @@
 //! with the node, leaves its last writes in the journal. A reader cannot
 //! replay that, since its disk is read-only, so the node does before the
 //! reader attaches: see [`VolumeStore::prepare`].
+//!
+//! With an object store the volume is uploaded there too ([`crate::volstore`])
+//! and is held by one node at a time, so every claim on it is on the node
+//! holding it and the rule above holds across the fleet.
 
 #![allow(clippy::result_large_err)]
 
@@ -66,6 +70,11 @@ pub struct Meta {
     /// HFS+ from a macOS one. Empty until then.
     #[serde(default)]
     pub guest_os: String,
+    /// Another node took the volume over while this one was away, so this
+    /// copy is no longer the volume: never listed, claimed or uploaded, and
+    /// removed once nothing holds it.
+    #[serde(default)]
+    pub is_lost: bool,
 }
 
 /// Who currently holds one volume.
@@ -114,6 +123,11 @@ pub struct VolumeStore {
     /// another was replaying the journal waits for the replay, and finds the
     /// image clean.
     preparing: Arc<tokio::sync::Mutex<()>>,
+    object_store: Option<crate::objstore::ObjectStore>,
+    node_id: Arc<std::sync::OnceLock<Arc<Mutex<String>>>>,
+    /// Held across a capture and its upload, one per volume, so uploads land
+    /// in the order their captures were taken.
+    uploads: Arc<Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>>,
 }
 
 impl VolumeStore {
@@ -122,7 +136,35 @@ impl VolumeStore {
             root: data_dir.join("volumes"),
             claims: Arc::new(Mutex::new(HashMap::new())),
             preparing: Arc::default(),
+            object_store: None,
+            node_id: Arc::default(),
+            uploads: Arc::default(),
         }
+    }
+
+    pub fn with_object_store(self, store: Option<crate::objstore::ObjectStore>) -> Self {
+        Self {
+            object_store: store,
+            ..self
+        }
+    }
+
+    /// Where the node's id is once registration fills it in. A volume's
+    /// manifest names its holder, so nothing is uploaded before then.
+    pub fn bind_node_id(&self, node_id: Arc<Mutex<String>>) {
+        let _ = self.node_id.set(node_id);
+    }
+
+    fn node_id(&self) -> String {
+        self.node_id
+            .get()
+            .map(|id| id.lock().unwrap().clone())
+            .unwrap_or_default()
+    }
+
+    /// Whether volumes here are kept in the object store.
+    pub fn is_durable(&self) -> bool {
+        self.object_store.is_some()
     }
 
     fn dir(&self, name: &str) -> PathBuf {
@@ -187,13 +229,20 @@ impl VolumeStore {
             created_at_ms: burrow_common::unix_now_ms(),
             labels,
             guest_os: String::new(),
+            is_lost: false,
         };
         self.write_meta(&meta).await?;
         tokio::fs::rename(&pending, dir.join(IMAGE))
             .await
             .map_err(|err| Status::internal(format!("publishing volume: {err}")))?;
 
-        Ok(self.to_proto(&meta))
+        let volume = self.to_proto(&meta, None);
+        if self.is_durable() {
+            let store = self.clone();
+            let name = name.to_string();
+            tokio::spawn(async move { store.sync_logged(&name).await });
+        }
+        Ok(volume)
     }
 
     async fn write_meta(&self, meta: &Meta) -> Result<(), Status> {
@@ -215,7 +264,11 @@ impl VolumeStore {
 
     pub async fn get(&self, name: &str) -> Result<common::Volume, Status> {
         let meta = self.meta(name).await?;
-        Ok(self.to_proto(&meta))
+        if meta.is_lost {
+            return Err(Status::not_found(format!("no volume {name}")));
+        }
+        let local = crate::volstore::load_local(&self.dir(name)).await;
+        Ok(self.to_proto(&meta, local.as_ref()))
     }
 
     pub async fn list(&self) -> Vec<common::Volume> {
@@ -227,8 +280,11 @@ impl VolumeStore {
             let Some(name) = entry.file_name().to_str().map(str::to_string) else {
                 continue;
             };
-            if let Ok(meta) = self.meta(&name).await {
-                volumes.push(self.to_proto(&meta));
+            if let Ok(meta) = self.meta(&name).await
+                && !meta.is_lost
+            {
+                let local = crate::volstore::load_local(&self.dir(&name)).await;
+                volumes.push(self.to_proto(&meta, local.as_ref()));
             }
         }
         volumes.sort_by(|a, b| a.name.cmp(&b.name));
@@ -248,8 +304,15 @@ impl VolumeStore {
             )));
         }
         let dir = self.dir(name);
-        if !tokio::fs::try_exists(dir.join(META)).await.unwrap_or(false) {
-            return Err(Status::not_found(format!("no volume {name}")));
+        let meta = self.meta(name).await?;
+        let _uploading = self.upload_lock(name).lock_owned().await;
+        if let Some(store) = &self.object_store
+            && !meta.is_lost
+            && crate::volstore::load_local(&dir)
+                .await
+                .is_some_and(|local| local.is_published)
+        {
+            crate::volstore::purge(store, name, Some(&self.node_id())).await?;
         }
         tokio::fs::remove_dir_all(&dir)
             .await
@@ -350,6 +413,12 @@ impl VolumeStore {
         for (_, mount) in block_mounts(mounts) {
             let name = &mount.volume;
             let mut meta = self.meta(name).await?;
+            if meta.is_lost {
+                return Err(Status::failed_precondition(format!(
+                    "volume {name} was taken over by another node while this one was away; the \
+                     copy here is no longer the volume"
+                )));
+            }
             let image = self.image(name);
             if meta.guest_os.is_empty()
                 && let Some(made_by) = ondisk::made_by(&image).await
@@ -413,17 +482,33 @@ impl VolumeStore {
 
     /// Drops every claim one sandbox holds, on stop, suspend or delete.
     pub fn release_all(&self, sandbox_id: &str) {
+        let mut written = Vec::new();
         let restore = {
             let mut claims = self.claims.lock().unwrap();
-            for claim in claims.values_mut() {
+            for (name, claim) in claims.iter_mut() {
                 if claim.writer.as_deref() == Some(sandbox_id) {
                     claim.writer = None;
+                    written.push(name.clone());
                 }
                 claim.readers.remove(sandbox_id);
             }
             Self::drop_free(&mut claims)
         };
         self.restore_owners(restore);
+        self.upload_released(written);
+    }
+
+    /// Uploads what a writer that just let go left, behind the release.
+    fn upload_released(&self, names: Vec<String>) {
+        if !self.is_durable() || names.is_empty() {
+            return;
+        }
+        let store = self.clone();
+        tokio::spawn(async move {
+            for name in names {
+                store.sync_logged(&name).await;
+            }
+        });
     }
 
     /// Forgets the claims nobody holds, naming the images whose ownership has
@@ -479,8 +564,11 @@ impl VolumeStore {
         self.restore_owners(restore);
     }
 
-    fn to_proto(&self, meta: &Meta) -> common::Volume {
+    fn to_proto(&self, meta: &Meta, local: Option<&crate::volstore::Local>) -> common::Volume {
+        let uploaded = local.filter(|local| self.is_durable() && local.is_published);
         common::Volume {
+            is_durable: uploaded.is_some(),
+            uploaded_at_unix_ms: uploaded.map_or(0, |local| local.manifest.uploaded_at_ms),
             name: meta.name.clone(),
             // Stamped by the orchestrator from its own view of the fleet, like
             // a snapshot's.
@@ -489,6 +577,303 @@ impl VolumeStore {
             created_at_unix_ms: meta.created_at_ms,
             attached_to: self.holder(&meta.name).unwrap_or_default(),
             labels: meta.labels.clone(),
+        }
+    }
+}
+
+/// Keeping volumes in the object store, and taking them over.
+impl VolumeStore {
+    fn upload_lock(&self, name: &str) -> Arc<tokio::sync::Mutex<()>> {
+        Arc::clone(
+            self.uploads
+                .lock()
+                .unwrap()
+                .entry(name.to_string())
+                .or_default(),
+        )
+    }
+
+    /// Held across a capture and its upload; taken before a guest is frozen
+    /// for one, so the freeze never waits on an upload still running.
+    pub async fn lock_upload(&self, name: &str) -> tokio::sync::OwnedMutexGuard<()> {
+        self.upload_lock(name).lock_owned().await
+    }
+
+    /// The upload lock if nothing holds it.
+    pub fn try_lock_upload(&self, name: &str) -> Option<tokio::sync::OwnedMutexGuard<()>> {
+        self.upload_lock(name).try_lock_owned().ok()
+    }
+
+    /// The sandbox writing a volume now, if any.
+    pub fn writer(&self, name: &str) -> Option<String> {
+        self.claims
+            .lock()
+            .unwrap()
+            .get(name)
+            .and_then(|claim| claim.writer.clone())
+    }
+
+    /// Whether the image may differ from what the store holds.
+    pub async fn is_changed(&self, name: &str) -> bool {
+        match crate::volstore::load_local(&self.dir(name)).await {
+            Some(local) if local.is_published => {
+                crate::durable::Stamp::of(&self.image(name)).is_ok_and(|now| now != local.stamp)
+            }
+            _ => true,
+        }
+    }
+
+    /// A reflink clone of the image for an upload to read, with the image's
+    /// stamp as it was taken. The caller holds the image still.
+    pub async fn capture(&self, name: &str) -> Result<(PathBuf, crate::durable::Stamp), Status> {
+        let image = self.image(name);
+        let stamp = crate::durable::Stamp::of(&image)
+            .map_err(|err| Status::internal(format!("reading volume {name}: {err}")))?;
+        let capture = self.dir(name).join(crate::volstore::CAPTURE);
+        crate::rootdisk::clone(&image, &capture)
+            .await
+            .map_err(|err| Status::internal(format!("capturing volume {name}: {err}")))?;
+        Ok((capture, stamp))
+    }
+
+    /// Uploads a capture taken under the volume's upload lock.
+    pub async fn upload_capture(
+        &self,
+        name: &str,
+        capture: &Path,
+        stamp: crate::durable::Stamp,
+    ) -> Result<(), Status> {
+        let Some(store) = &self.object_store else {
+            return Ok(());
+        };
+        let node_id = self.node_id();
+        if node_id.is_empty() {
+            let _ = tokio::fs::remove_file(capture).await;
+            return Err(Status::unavailable(
+                "this node has no id until it registers, and a volume's manifest names its holder",
+            ));
+        }
+        let meta = self.meta(name).await?;
+        let dir = self.dir(name);
+        let previous = crate::volstore::load_local(&dir).await;
+        let draft = crate::volstore::Manifest {
+            format: 0,
+            name: name.to_string(),
+            generation: 0,
+            node_id,
+            state: String::new(),
+            size_mib: meta.size_mib,
+            created_at_ms: meta.created_at_ms,
+            labels: meta.labels.clone(),
+            guest_os: meta.guest_os.clone(),
+            uploaded_at_ms: 0,
+        };
+        let uploaded =
+            crate::volstore::upload(store, &dir, capture, stamp, draft, previous.as_ref()).await;
+        let _ = tokio::fs::remove_file(capture).await;
+        if let Err(err) = &uploaded
+            && err.code() == tonic::Code::Aborted
+        {
+            self.mark_lost(name).await;
+        }
+        uploaded.map(drop)
+    }
+
+    /// Uploads a volume no running guest writes, if it changed since its last
+    /// upload.
+    pub async fn sync(&self, name: &str) -> Result<(), Status> {
+        if !self.is_durable() {
+            return Ok(());
+        }
+        let _uploading = self.lock_upload(name).await;
+        if self.meta(name).await?.is_lost
+            || self.writer(name).is_some()
+            || !self.is_changed(name).await
+        {
+            return Ok(());
+        }
+        let (capture, stamp) = self.capture(name).await?;
+        self.upload_capture(name, &capture, stamp).await
+    }
+
+    async fn sync_logged(&self, name: &str) {
+        if let Err(err) = self.sync(name).await {
+            tracing::warn!(
+                volume = name,
+                err = err.message(),
+                "could not upload the volume; it is tried again when its writer next lets go"
+            );
+        }
+    }
+
+    async fn mark_lost(&self, name: &str) {
+        let Ok(mut meta) = self.meta(name).await else {
+            return;
+        };
+        tracing::error!(
+            volume = name,
+            "another node holds this volume in the object store; this copy is no longer the \
+             volume and is not served from here"
+        );
+        meta.is_lost = true;
+        let _ = self.write_meta(&meta).await;
+    }
+
+    /// Takes a durable volume onto this node from the object store. `from` is
+    /// the holder the orchestrator wrote off, empty for a released volume. A
+    /// volume already held here is returned as it is.
+    pub async fn adopt(&self, name: &str, from: &str) -> Result<common::Volume, Status> {
+        validate_name(name)?;
+        let store = self.object_store.as_ref().ok_or_else(|| {
+            Status::failed_precondition("this node has no object store to adopt volumes from")
+        })?;
+        let node_id = self.node_id();
+        if node_id.is_empty() {
+            return Err(Status::unavailable("this node has not registered yet"));
+        }
+        let _uploading = self.lock_upload(name).await;
+        let dir = self.dir(name);
+        match self.meta(name).await {
+            Ok(meta) if !meta.is_lost => return self.get(name).await,
+            Ok(_) => {
+                if let Some(holder) = self.holder(name) {
+                    return Err(Status::failed_precondition(format!(
+                        "this node's stale copy of volume {name} is still attached to sandbox \
+                         {holder}"
+                    )));
+                }
+                let _ = tokio::fs::remove_dir_all(&dir).await;
+            }
+            Err(_) => {}
+        }
+        tokio::fs::create_dir_all(&dir)
+            .await
+            .map_err(|err| Status::internal(format!("volume dir: {err}")))?;
+        let building = dir.join(format!("{IMAGE}.building"));
+        let local = match crate::volstore::adopt(store, name, &node_id, from, &building).await {
+            Ok(local) => local,
+            Err(err) => {
+                let _ = tokio::fs::remove_dir_all(&dir).await;
+                return Err(err);
+            }
+        };
+        let meta = Meta {
+            name: name.to_string(),
+            size_mib: local.manifest.size_mib,
+            created_at_ms: local.manifest.created_at_ms,
+            labels: local.manifest.labels.clone(),
+            guest_os: local.manifest.guest_os.clone(),
+            is_lost: false,
+        };
+        self.write_meta(&meta).await?;
+        tokio::fs::rename(&building, self.image(name))
+            .await
+            .map_err(|err| Status::internal(format!("publishing volume {name}: {err}")))?;
+        let local = crate::volstore::settle_adopted(&dir, &self.image(name), local).await?;
+        Ok(self.to_proto(&meta, Some(&local)))
+    }
+
+    /// Uploads a volume a sandbox moving off this node mounts, lets go of it
+    /// in the store, and removes the copy here.
+    pub async fn release(&self, name: &str) -> Result<(), Status> {
+        let store = self
+            .object_store
+            .as_ref()
+            .ok_or_else(|| Status::failed_precondition("this node has no object store"))?;
+        if let Some(holder) = self.holder(name) {
+            return Err(Status::failed_precondition(format!(
+                "volume {name} is attached to sandbox {holder}"
+            )));
+        }
+        self.sync(name).await?;
+        let _uploading = self.lock_upload(name).await;
+        let dir = self.dir(name);
+        let local = crate::volstore::load_local(&dir)
+            .await
+            .filter(|local| local.is_published)
+            .ok_or_else(|| {
+                Status::failed_precondition(format!("volume {name} is not in the object store"))
+            })?;
+        crate::volstore::release(store, &self.node_id(), &local).await?;
+        tokio::fs::remove_dir_all(&dir)
+            .await
+            .map_err(|err| Status::internal(format!("removing volume {name}: {err}")))?;
+        tracing::info!(volume = name, "volume released to the object store");
+        Ok(())
+    }
+
+    /// Volumes in the object store, each naming the node its manifest says
+    /// holds it.
+    pub async fn list_remote(&self) -> Result<Vec<common::Volume>, Status> {
+        let store = self
+            .object_store
+            .as_ref()
+            .ok_or_else(|| Status::failed_precondition("this node has no object store"))?;
+        Ok(crate::volstore::list(store)
+            .await?
+            .into_iter()
+            .map(|manifest| common::Volume {
+                name: manifest.name,
+                node_id: manifest.node_id,
+                size_mib: manifest.size_mib,
+                attached_to: String::new(),
+                labels: manifest.labels,
+                created_at_unix_ms: manifest.created_at_ms,
+                is_durable: true,
+                uploaded_at_unix_ms: manifest.uploaded_at_ms,
+            })
+            .collect())
+    }
+
+    /// Deletes a stored volume whose holder is gone.
+    pub async fn purge_remote(&self, name: &str) -> Result<(), Status> {
+        validate_name(name)?;
+        let store = self
+            .object_store
+            .as_ref()
+            .ok_or_else(|| Status::failed_precondition("this node has no object store"))?;
+        crate::volstore::purge(store, name, None).await
+    }
+
+    /// Marks lost every copy here whose manifest names another holder, and
+    /// removes the lost copies nothing holds. Run once the node knows its id.
+    pub async fn reconcile_ownership(&self) {
+        let Some(store) = &self.object_store else {
+            return;
+        };
+        let node_id = self.node_id();
+        if node_id.is_empty() {
+            return;
+        }
+        let Ok(mut entries) = tokio::fs::read_dir(&self.root).await else {
+            return;
+        };
+        while let Ok(Some(entry)) = entries.next_entry().await {
+            let Some(name) = entry.file_name().to_str().map(str::to_string) else {
+                continue;
+            };
+            let Ok(meta) = self.meta(&name).await else {
+                continue;
+            };
+            if !meta.is_lost
+                && crate::volstore::load_local(&self.dir(&name))
+                    .await
+                    .is_some_and(|local| local.is_published)
+            {
+                match crate::volstore::read(store, &name).await {
+                    Ok(Some(held))
+                        if held.manifest.node_id == node_id
+                            && held.manifest.state == crate::volstore::STATE_HELD => {}
+                    Ok(_) => self.mark_lost(&name).await,
+                    Err(err) => {
+                        tracing::warn!(volume = name, %err, "could not check who holds the volume");
+                    }
+                }
+            }
+            if self.meta(&name).await.is_ok_and(|meta| meta.is_lost) && self.holder(&name).is_none()
+            {
+                let _ = tokio::fs::remove_dir_all(self.dir(&name)).await;
+            }
         }
     }
 }
@@ -1165,6 +1550,7 @@ mod tests {
             created_at_ms: 0,
             labels: HashMap::new(),
             guest_os: String::new(),
+            is_lost: false,
         };
         std::fs::write(
             store.dir(name).join(META),
@@ -1172,6 +1558,41 @@ mod tests {
         )
         .unwrap();
         (store, dir)
+    }
+
+    /// A volume uploaded from one node is taken over by another once the
+    /// first is written off, and the first, back again, finds it lost and
+    /// stops serving its copy.
+    #[tokio::test]
+    async fn a_durable_volume_moves_to_another_node_and_the_old_copy_is_lost() {
+        let objects = crate::objstore::fake::store(true).await;
+        let (a, dir_a) = store_with("data", &[7u8; 8192]);
+        let a = a.with_object_store(Some(objects.clone()));
+        a.bind_node_id(Arc::new(Mutex::new("node-a".into())));
+        a.sync("data").await.unwrap();
+        let listed = a.get("data").await.unwrap();
+        assert!(listed.is_durable);
+        assert!(listed.uploaded_at_unix_ms > 0);
+        assert!(!a.is_changed("data").await);
+
+        let dir_b = std::env::temp_dir().join(format!("burrow-volume-{}-b", std::process::id()));
+        let b = VolumeStore::new(&dir_b).with_object_store(Some(objects.clone()));
+        b.bind_node_id(Arc::new(Mutex::new("node-b".into())));
+        let refused = b.adopt("data", "node-c").await.unwrap_err();
+        assert_eq!(refused.code(), tonic::Code::Aborted);
+        let adopted = b.adopt("data", "node-a").await.unwrap();
+        assert!(adopted.is_durable);
+        assert_eq!(
+            std::fs::read(b.image("data")).unwrap(),
+            std::fs::read(a.image("data")).unwrap()
+        );
+        assert_eq!(b.list_remote().await.unwrap()[0].node_id, "node-b");
+
+        a.reconcile_ownership().await;
+        assert!(a.list().await.is_empty());
+        assert!(!a.dir("data").exists());
+        std::fs::remove_dir_all(&dir_a).unwrap();
+        std::fs::remove_dir_all(&dir_b).unwrap();
     }
 
     /// The first writer decides what filesystem the volume holds, and a guest

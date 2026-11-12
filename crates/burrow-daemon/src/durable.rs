@@ -171,7 +171,7 @@ pub struct Stamp {
 }
 
 impl Stamp {
-    fn of(path: &Path) -> std::io::Result<Self> {
+    pub fn of(path: &Path) -> std::io::Result<Self> {
         use std::os::unix::fs::MetadataExt as _;
         let meta = std::fs::metadata(path)?;
         Ok(Self {
@@ -985,6 +985,7 @@ pub async fn collect_garbage(
         }
     }
 
+    stale += crate::volstore::collect_refs(store, GARBAGE_GRACE, &mut referenced).await?;
     let images =
         crate::rootdisk::remote_image_refs(store, &images, GARBAGE_GRACE, &mut referenced).await?;
     let removed = crate::chunks::collect_garbage(store, &referenced, GARBAGE_GRACE).await?;

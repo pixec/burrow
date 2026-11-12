@@ -323,7 +323,7 @@ enum Command {
     /// Move a sandbox to another node through the object store. A running
     /// sandbox is suspended, carried over and resumed; it keeps its id, name
     /// and policy, and gets a new address on the new node. Needs the nodes
-    /// to share an object store. Volumes do not move.
+    /// to share an object store. The volumes it mounts move with it.
     Move {
         id: String,
         /// The node to move to; omitted places it like a create.
@@ -804,7 +804,8 @@ struct CreateFlags {
     is_evicted_snapshots_kept: bool,
     /// Mount a volume, as `name:/path` or `name:/path:ro`, or a tmpfs as
     /// `tmpfs:/path[:size=512m][:mode=1777]`. Repeatable. A sandbox that
-    /// mounts a volume is placed on the node holding it. Volumes are
+    /// mounts a volume is placed on the node holding it, or brings a durable
+    /// volume whose node is gone to wherever it is placed. Volumes are
     /// hotplugged onto a warm restore, or the sandbox boots cold where the
     /// hypervisor cannot hotplug drives.
     #[arg(long = "mount")]
@@ -2586,14 +2587,14 @@ async fn main() -> anyhow::Result<()> {
                 println!("no volumes");
             } else {
                 println!(
-                    "{:<24} {:<16} {:>8}  {:<21} ATTACHED TO",
+                    "{:<24} {:<22} {:>8}  {:<21} ATTACHED TO",
                     "VOLUME", "NODE", "SIZE", "CREATED"
                 );
                 for volume in resp.volumes {
                     println!(
-                        "{:<24} {:<16} {:>7}M  {:<21} {}",
+                        "{:<24} {:<22} {:>7}M  {:<21} {}",
                         truncate(&volume.name, 24),
-                        truncate(&volume.node_id, 16),
+                        truncate(&display_volume_node(&volume), 22),
                         volume.size_mib,
                         rfc3339_from_unix_ms(volume.created_at_unix_ms),
                         if volume.attached_to.is_empty() {
@@ -2612,8 +2613,15 @@ async fn main() -> anyhow::Result<()> {
                 .await?
                 .into_inner();
             println!("name        {}", volume.name);
-            println!("node        {}", volume.node_id);
+            println!("node        {}", display_volume_node(&volume));
             println!("size        {}MiB", volume.size_mib);
+            println!(
+                "stored      {}",
+                match volume.uploaded_at_unix_ms {
+                    0 => "no".to_string(),
+                    at => rfc3339_from_unix_ms(at),
+                }
+            );
             println!(
                 "created     {}",
                 rfc3339_from_unix_ms(volume.created_at_unix_ms)
@@ -4694,6 +4702,17 @@ fn display_node(sandbox: &common::Sandbox) -> String {
     }
 }
 
+/// Where a volume is, in the terms `ps -a` uses: `+store` once it is in the
+/// object store, and the store alone for one no node holds, which the next
+/// sandbox to mount it places.
+fn display_volume_node(volume: &common::Volume) -> String {
+    match (volume.node_id.is_empty(), volume.is_durable) {
+        (false, true) => format!("{} +store", volume.node_id),
+        (false, false) => volume.node_id.clone(),
+        (true, _) => "object store".to_string(),
+    }
+}
+
 fn state_name(state: i32) -> &'static str {
     match common::SandboxState::try_from(state) {
         Ok(common::SandboxState::Creating) => "creating",
@@ -5252,6 +5271,11 @@ fn volumes_json(volumes: &[common::Volume]) -> String {
                 "created_at": rfc3339_from_unix_ms(volume.created_at_unix_ms),
                 "attached_to": volume.attached_to,
                 "labels": pairs_json(&volume.labels),
+                "durable": volume.is_durable,
+                "uploaded_at": match volume.uploaded_at_unix_ms {
+                    0 => serde_json::Value::Null,
+                    at => rfc3339_from_unix_ms(at).into(),
+                },
             })
         })
         .collect();

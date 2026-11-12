@@ -509,7 +509,11 @@ pub(crate) mod fake {
             let method = parts.next().unwrap_or_default().to_string();
             let target = parts.next().unwrap_or_default();
             let (key, query) = target.split_once('?').unwrap_or((target, ""));
-            let key = key.to_string();
+            let key = match query.is_empty() {
+                true => key,
+                false => key.trim_end_matches('/'),
+            }
+            .to_string();
             let listing = query.split('&').any(|pair| pair == "list-type=2").then(|| {
                 let prefix = query
                     .split('&')

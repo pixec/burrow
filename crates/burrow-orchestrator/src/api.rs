@@ -751,8 +751,15 @@ impl ApiService {
             },
         ))
         .await;
-        let (node_id, volume) = found.into_iter().flatten().next()?;
-        self.0.volumes.insert(&node_id, volume);
+        match found.into_iter().flatten().next() {
+            Some((node_id, volume)) => self.0.volumes.insert(&node_id, volume),
+            None => {
+                let (_, listed) = self.store_volumes().await?;
+                self.0
+                    .volumes
+                    .reconcile_remote(listed, |node| self.0.nodes.knows(node));
+            }
+        }
         self.0.volumes.get(name)
     }
 
@@ -882,6 +889,8 @@ impl ApiService {
     /// A volume is a disk image on one machine, so mounting one fixes
     /// placement the way a snapshot does. Mounting two that live on different
     /// nodes is refused rather than half satisfied: nothing can attach both.
+    /// A durable volume no node holds pins nothing: it goes where the sandbox
+    /// does ([`Self::bring_volumes`]).
     async fn node_for_volumes(
         &self,
         mounts: &[common::VolumeMount],
@@ -892,10 +901,14 @@ impl ApiService {
                 .volume(&mount.volume)
                 .await
                 .ok_or_else(|| Status::not_found(format!("no volume {}", mount.volume)))?;
+            if volume.node_id.is_empty() {
+                continue;
+            }
             match &pinned {
                 Some(node) if *node != volume.node_id => {
                     return Err(Status::failed_precondition(format!(
-                        "volumes are node-local: {} is on node {} but another requested volume                          is on node {node}",
+                        "{} is on node {} but another requested volume is on node {node}; \
+                         nothing can attach both",
                         mount.volume, volume.node_id
                     )));
                 }
@@ -906,6 +919,80 @@ impl ApiService {
         Ok(pinned)
     }
 
+    /// Has `target` take every requested volume no node holds from the
+    /// object store, before a sandbox mounting them is created or adopted
+    /// there.
+    async fn bring_volumes(
+        &self,
+        target: &str,
+        mounts: &[common::VolumeMount],
+    ) -> Result<(), Status> {
+        for mount in mounts.iter().filter(|mount| !mount.is_tmpfs) {
+            let Some(volume) = self.volume(&mount.volume).await else {
+                return Err(Status::not_found(format!("no volume {}", mount.volume)));
+            };
+            if !volume.node_id.is_empty() {
+                continue;
+            }
+            let endpoint = self
+                .0
+                .nodes
+                .endpoint(target)
+                .ok_or_else(|| Status::unavailable(format!("node {target} is unreachable")))?;
+            let mut client = self
+                .0
+                .channels
+                .get(&endpoint, self.0.node_token.as_deref())
+                .await
+                .map_err(|err| Status::unavailable(format!("cannot reach node {target}: {err}")))?;
+            let from = self.0.volumes.taken_from(&volume.name);
+            let adopted = client
+                .adopt_volume(nodepb::NodeAdoptVolumeRequest {
+                    name: volume.name.clone(),
+                    node_id: target.to_string(),
+                    from_node_id: from.clone(),
+                })
+                .await?
+                .into_inner();
+            self.0.volumes.insert(target, adopted);
+            tracing::info!(
+                volume = volume.name,
+                node = target,
+                from,
+                "volume adopted from the object store"
+            );
+        }
+        Ok(())
+    }
+
+    /// A healthy node with the object store configured, and the volumes the
+    /// store lists.
+    async fn store_volumes(&self) -> Option<(NodeClient, Vec<common::Volume>)> {
+        for node_id in self.0.nodes.healthy_ids() {
+            let Some(endpoint) = self.0.nodes.endpoint(&node_id) else {
+                continue;
+            };
+            let Ok(mut client) = self
+                .0
+                .channels
+                .get(&endpoint, self.0.node_token.as_deref())
+                .await
+            else {
+                continue;
+            };
+            let Ok(resp) = client
+                .list_durable_volumes(api::ListVolumesRequest {
+                    node_id: String::new(),
+                })
+                .await
+            else {
+                continue;
+            };
+            return Some((client, resp.into_inner().volumes));
+        }
+        None
+    }
+
     /// A client for the node holding one volume.
     async fn node_holding_volume(&self, name: &str) -> Result<(String, NodeClient), Status> {
         let volume = self
@@ -914,8 +1001,8 @@ impl ApiService {
             .ok_or_else(|| Status::not_found(format!("no volume {name}")))?;
         let endpoint = self.0.nodes.endpoint(&volume.node_id).ok_or_else(|| {
             Status::failed_precondition(format!(
-                "volume {name} lives on node {}, which is unreachable; volumes are \
-                 node-local and cannot be reached anywhere else",
+                "volume {name} lives on node {}, which is unreachable; a volume kept in the \
+                 object store is attached elsewhere once the node is written off",
                 volume.node_id
             ))
         })?;
@@ -1057,6 +1144,22 @@ impl ApiService {
         let want = self.adoption_placement(&sandbox, node_labels);
         let subject = format!("sandbox {}", sandbox.id);
         let root = sandbox.inspection_root_fingerprint.clone();
+        let mounts = sandbox
+            .policy
+            .as_ref()
+            .map(|p| p.volumes.clone())
+            .unwrap_or_default();
+        let node_id = match (self.node_for_volumes(&mounts).await?, node_id.as_str()) {
+            (Some(held), "") => held,
+            (Some(held), wanted) if held != wanted => {
+                return Err(Status::failed_precondition(format!(
+                    "sandbox {}'s volumes are on node {held}, not node {wanted}",
+                    sandbox.id
+                )));
+            }
+            (_, wanted) => wanted.to_string(),
+        };
+        let node_id = node_id.as_str();
         let (target, placed) = if node_id.is_empty() {
             let excluded = self.other_roots(&subject, &root, None)?;
             let target = self
@@ -1086,6 +1189,7 @@ impl ApiService {
             .get(&endpoint, self.0.node_token.as_deref())
             .await
             .map_err(|err| Status::unavailable(format!("cannot reach node {target}: {err}")))?;
+        self.bring_volumes(&target, &mounts).await?;
         let adopted = client
             .adopt_sandbox(nodepb::NodeAdoptRequest {
                 record: Some(sandbox),
@@ -1431,11 +1535,11 @@ impl Burrow for ApiService {
                 && node != node_id
             {
                 return Err(Status::failed_precondition(format!(
-                    "snapshot {} is on node {node_id}, but the requested volumes are on node {node}; \
-                     volumes do not travel",
+                    "snapshot {} is on node {node_id}, but the requested volumes are on node {node}",
                     snapshot.id
                 )));
             }
+            self.bring_volumes(&node_id, &mounts).await?;
             if !req.template.is_empty() && req.template != snapshot.template {
                 return Err(Status::invalid_argument(format!(
                     "snapshot {} was taken of template {:?}; a sandbox created from it \
@@ -1566,7 +1670,8 @@ impl Burrow for ApiService {
                 if self.0.nodes.endpoint(&node_id).is_none() {
                     return Err(Status::failed_precondition(format!(
                         "the requested volumes are on node {node_id}, which is unreachable; \
-                         volumes are node-local and cannot be attached anywhere else"
+                         one kept in the object store is attached elsewhere once the node is \
+                         written off"
                     )));
                 }
                 // The node is not a choice here, so the template has to come to
@@ -1615,6 +1720,14 @@ impl Burrow for ApiService {
         let mut client = connect_node(endpoint, self.0.node_token.as_deref())
             .await
             .map_err(|err| Status::unavailable(format!("cannot reach node {node_id}: {err}")))?;
+        self.bring_volumes(
+            &node_id,
+            req.policy
+                .as_ref()
+                .map(|p| p.volumes.as_slice())
+                .unwrap_or_default(),
+        )
+        .await?;
         let subject = crate::secrets::Subject {
             id: &sandbox_id,
             name: &req.name,
@@ -2101,17 +2214,22 @@ impl Burrow for ApiService {
                 "sandbox {id} is already on node {source}"
             )));
         }
-        // Refused before anything is suspended: a volume is a disk on the
-        // source node and cannot follow the sandbox.
-        let mounts = current
+        // Refused before anything is suspended: a volume follows the
+        // sandbox only through the object store.
+        let mounts: Vec<String> = current
             .policy
-            .as_ref()
-            .map(|p| p.volumes.as_slice())
-            .unwrap_or_default();
-        if mounts.iter().any(|mount| !mount.is_tmpfs) {
-            return Err(Status::failed_precondition(format!(
-                "sandbox {id} mounts volumes, which are node-local and do not move"
-            )));
+            .iter()
+            .flat_map(|p| p.volumes.iter())
+            .filter(|mount| !mount.is_tmpfs)
+            .map(|mount| mount.volume.clone())
+            .collect();
+        for name in &mounts {
+            if !self.volume(name).await.is_some_and(|v| v.is_durable) {
+                return Err(Status::failed_precondition(format!(
+                    "sandbox {id} mounts volume {name}, which is not in the object store and \
+                     cannot follow it"
+                )));
+            }
         }
         self.require_unpinned(&id).await?;
         if current.arch.is_empty() {
@@ -2161,6 +2279,9 @@ impl Burrow for ApiService {
         // Between the two nodes the sandbox is nowhere, and recorded so: if
         // the adopt fails, a later start places it rather than routing to a
         // node that has let go of it.
+        for name in &mounts {
+            self.0.volumes.release(name);
+        }
         let mut released = self.0.sandboxes.unplace(released);
         self.release_charge(&common::Sandbox {
             node_id: source.clone(),
@@ -2395,6 +2516,11 @@ impl Burrow for ApiService {
         req: Request<api::VolumeRef>,
     ) -> Result<Response<common::Volume>, Status> {
         let name = req.into_inner().name;
+        if let Some(volume) = self.volume(&name).await
+            && volume.node_id.is_empty()
+        {
+            return Ok(Response::new(volume));
+        }
         let (node_id, mut client) = self.node_holding_volume(&name).await?;
         let mut volume = client
             .get_volume(api::VolumeRef { name })
@@ -2409,10 +2535,24 @@ impl Burrow for ApiService {
         req: Request<api::VolumeRef>,
     ) -> Result<Response<api::DeleteVolumeResponse>, Status> {
         let name = req.into_inner().name;
-        let (_, mut client) = self.node_holding_volume(&name).await?;
-        client
-            .delete_volume(api::VolumeRef { name: name.clone() })
-            .await?;
+        match self.volume(&name).await {
+            Some(volume) if volume.node_id.is_empty() => {
+                let (mut client, _) = self.store_volumes().await.ok_or_else(|| {
+                    Status::unavailable(format!(
+                        "no healthy node to delete volume {name}'s stored copy through"
+                    ))
+                })?;
+                client
+                    .purge_volume(api::VolumeRef { name: name.clone() })
+                    .await?;
+            }
+            _ => {
+                let (_, mut client) = self.node_holding_volume(&name).await?;
+                client
+                    .delete_volume(api::VolumeRef { name: name.clone() })
+                    .await?;
+            }
+        }
         // Only after the node removed it: a record dropped on a failed delete
         // would leave disk nothing ever reclaims.
         self.0.volumes.remove(&name);

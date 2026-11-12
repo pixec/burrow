@@ -128,6 +128,7 @@ async fn run(
             .root_disk(guestpb::RootDiskRequest {
                 op: guestpb::root_disk_request::Op::Shrink as i32,
                 size_bytes: target_bytes,
+                ..Default::default()
             })
             .await?
             .into_inner();

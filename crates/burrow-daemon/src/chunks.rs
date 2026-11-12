@@ -287,17 +287,34 @@ pub async fn put_disk(
     image: Option<&crate::rootdisk::Image>,
     known: &HashSet<String>,
 ) -> Result<ImageIndex, Status> {
+    put_disk_since(
+        store,
+        path,
+        image.map(|image| (image.path.as_path(), &image.index)),
+        known,
+    )
+    .await
+}
+
+/// Uploads a disk as a chunk index against `base`, a file whose chunk digests
+/// are already known: a template's image, or a reflink clone of the disk as
+/// it was last uploaded. Chunks still on the same device blocks as the base's
+/// carry its digests unread.
+pub async fn put_disk_since(
+    store: &ObjectStore,
+    path: &Path,
+    base: Option<(&Path, &ImageIndex)>,
+    known: &HashSet<String>,
+) -> Result<ImageIndex, Status> {
     let io = |err: std::io::Error| Status::internal(format!("reading a disk to upload: {err}"));
     let (layer, size, unchanged) = {
         let path = path.to_path_buf();
-        let image_path = image.map(|image| image.path.clone());
+        let base_path = base.map(|(path, _)| path.to_path_buf());
         tokio::task::spawn_blocking(move || {
             let file = std::fs::File::open(&path)?;
             let size = file.metadata()?.len();
-            let unchanged = match image_path {
-                Some(image) => {
-                    crate::rootdisk::unchanged_chunks(&file, &std::fs::File::open(image)?)
-                }
+            let unchanged = match base_path {
+                Some(base) => crate::rootdisk::unchanged_chunks(&file, &std::fs::File::open(base)?),
                 None => None,
             };
             let extents = crate::rootdisk::data_extents(&file)?;
@@ -314,10 +331,10 @@ pub async fn put_disk(
     };
     let mut known = known.clone();
     let unchanged = unchanged.unwrap_or_default();
-    if let Some(image) = image {
-        known.extend(image.index.digests().map(str::to_string));
+    if let Some((_, base)) = base {
+        known.extend(base.digests().map(str::to_string));
         for n in &unchanged {
-            if let Some(digest) = image.index.chunks.get(n) {
+            if let Some(digest) = base.chunks.get(n) {
                 index.chunks.insert(*n, digest.clone());
             }
         }

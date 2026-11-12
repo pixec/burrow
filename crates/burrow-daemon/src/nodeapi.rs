@@ -696,6 +696,39 @@ impl NodeService for NodeApi {
         Ok(Response::new(volume))
     }
 
+    async fn adopt_volume(
+        &self,
+        req: Request<nodepb::NodeAdoptVolumeRequest>,
+    ) -> Result<Response<common::Volume>, Status> {
+        let req = req.into_inner();
+        let volume = self
+            .sandboxes
+            .volumes()
+            .adopt(&req.name, &req.from_node_id)
+            .await?;
+        Ok(Response::new(volume))
+    }
+
+    async fn list_durable_volumes(
+        &self,
+        _req: Request<api::ListVolumesRequest>,
+    ) -> Result<Response<api::ListVolumesResponse>, Status> {
+        Ok(Response::new(api::ListVolumesResponse {
+            volumes: self.sandboxes.volumes().list_remote().await?,
+        }))
+    }
+
+    async fn purge_volume(
+        &self,
+        req: Request<api::VolumeRef>,
+    ) -> Result<Response<api::DeleteVolumeResponse>, Status> {
+        self.sandboxes
+            .volumes()
+            .purge_remote(&req.into_inner().name)
+            .await?;
+        Ok(Response::new(api::DeleteVolumeResponse {}))
+    }
+
     async fn delete_volume(
         &self,
         req: Request<api::VolumeRef>,
