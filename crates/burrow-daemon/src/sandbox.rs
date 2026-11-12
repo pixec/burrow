@@ -2118,7 +2118,6 @@ pub struct SandboxManager {
 struct Publics {
     sandbox_id: String,
     ips: Vec<common::PublicIp>,
-    ipv6: Option<(std::net::Ipv6Addr, u8)>,
 }
 
 /// A sandbox recovery found on disk and could not bring back: its record,
@@ -3607,9 +3606,14 @@ impl SandboxManager {
             }
         }
         self.directory.replace(directory);
-        for sandbox in &all {
-            self.stamp_ipv6(sandbox);
-        }
+        let settled: Vec<(Arc<RunningSandbox>, Vec<String>, Option<String>)> = all
+            .iter()
+            .filter_map(|sandbox| {
+                let (detached, attached) = self.settle_node_ipv6(sandbox);
+                (!detached.is_empty() || attached.is_some())
+                    .then(|| (Arc::clone(sandbox), detached, attached))
+            })
+            .collect();
         let mut rules: Vec<firewall::SandboxRules> = all
             .iter()
             .map(|sandbox| {
@@ -3761,13 +3765,24 @@ impl SandboxManager {
             .map(|sandbox| Publics {
                 sandbox_id: sandbox.id().to_string(),
                 ips: sandbox.base_record.lock().unwrap().public_ips.clone(),
-                ipv6: self.config.public.ipv6_for(sandbox.lease.block),
             })
             .collect();
 
         drop(remote);
         drop(ports);
         drop(sandboxes);
+
+        for (sandbox, detached, attached) in settled {
+            if pending.is_none_or(|pending| !Arc::ptr_eq(pending, &sandbox)) {
+                self.persist(&sandbox).await;
+            }
+            for address in detached {
+                self.emit(&sandbox, EVENT_IP_DETACHED, &address).await;
+            }
+            if let Some(address) = attached {
+                self.emit(&sandbox, EVENT_IP_ATTACHED, &address).await;
+            }
+        }
 
         // A sandbox without a tap is held to the very policy the proxy table
         // and the ruleset get, by its own stack.
@@ -3849,8 +3864,7 @@ impl SandboxManager {
     /// what arrives for them is delivered, held to wake it, or dropped.
     async fn resync_public(&self, sandbox: &RunningSandbox) {
         let is_public = sandbox.hypervisor.capabilities().is_tap_networked
-            && (self.config.public.ipv6_prefix.is_some()
-                || !sandbox.base_record.lock().unwrap().public_ips.is_empty());
+            && !sandbox.base_record.lock().unwrap().public_ips.is_empty();
         if is_public && let Err(err) = self.sync_firewall().await {
             tracing::warn!(
                 sandbox = sandbox.id(),
@@ -4020,7 +4034,14 @@ impl SandboxManager {
         is_always: bool,
     ) -> Option<burrow_proto::guest::v1::NetworkConfig> {
         let public_addresses = match is_tapped {
-            true => crate::publicip::guest_addresses(ips, self.config.public.ipv6_for(lease.block)),
+            true => {
+                let pooled: Vec<_> = ips
+                    .iter()
+                    .filter(|ip| !ip.is_node_prefix)
+                    .cloned()
+                    .collect();
+                crate::publicip::guest_addresses(&pooled, self.config.public.ipv6_for(lease.block))
+            }
             false => Vec::new(),
         };
         (is_always || !public_addresses.is_empty()).then(|| {
@@ -4037,21 +4058,55 @@ impl SandboxManager {
         })
     }
 
-    /// Stamps the global IPv6 address a tapped sandbox gets from this node's
-    /// prefix on its record.
-    fn stamp_ipv6(&self, sandbox: &RunningSandbox) {
-        let ipv6 = sandbox
-            .hypervisor
-            .capabilities()
-            .is_tap_networked
-            .then(|| self.config.public.ipv6_for(sandbox.lease.block))
-            .flatten();
+    /// Gives a tapped sandbox the address its lease takes from this node's
+    /// IPv6 prefix, and drops one another node's prefix gave it. Returns the
+    /// addresses detached and the one attached.
+    fn settle_node_ipv6(&self, sandbox: &RunningSandbox) -> (Vec<String>, Option<String>) {
+        let is_tapped = sandbox.hypervisor.capabilities().is_tap_networked;
         let mut record = sandbox.base_record.lock().unwrap();
-        let (address, prefix) = ipv6
-            .map(|(address, prefix)| (address.to_string(), u32::from(prefix)))
-            .unwrap_or_default();
-        record.ipv6_address = address;
-        record.ipv6_prefix_len = prefix;
+        let own = is_tapped
+            .then(|| {
+                self.config
+                    .public
+                    .node_ip(&record.node_id, &record.id, sandbox.lease.block)
+            })
+            .flatten();
+        let mut detached = Vec::new();
+        record.public_ips.retain(|ip| {
+            let is_kept =
+                !ip.is_node_prefix || own.as_ref().is_some_and(|own| own.address == ip.address);
+            if !is_kept {
+                detached.push(ip.address.clone());
+            }
+            is_kept
+        });
+        let attached = own
+            .filter(|own| !record.public_ips.iter().any(|ip| ip.address == own.address))
+            .map(|own| {
+                let address = own.address.clone();
+                record.public_ips.push(own);
+                address
+            });
+        (detached, attached)
+    }
+
+    /// Takes back the address this node's IPv6 prefix gave a sandbox that is
+    /// leaving it.
+    async fn release_node_ipv6(&self, sandbox: &RunningSandbox) {
+        let released: Vec<String> = {
+            let mut record = sandbox.base_record.lock().unwrap();
+            let released = record
+                .public_ips
+                .iter()
+                .filter(|ip| ip.is_node_prefix)
+                .map(|ip| ip.address.clone())
+                .collect();
+            record.public_ips.retain(|ip| !ip.is_node_prefix);
+            released
+        };
+        for address in released {
+            self.emit(sandbox, EVENT_IP_DETACHED, &address).await;
+        }
     }
 
     /// The sandbox's public side as the ruleset renders it.
@@ -4078,10 +4133,6 @@ impl SandboxManager {
                 }
                 Err(_) => {}
             }
-        }
-        if let Some(own) = public.ipv6_for(sandbox.lease.block) {
-            out.v6.push(own);
-            smtp6 = false;
         }
         out.is_smtp4_allowed = smtp4 && !out.v4.is_empty();
         out.is_smtp6_allowed = smtp6 && !out.v6.is_empty();
@@ -4130,10 +4181,7 @@ impl SandboxManager {
                     std::net::IpAddr::V6(_) => ip.prefix_len.clamp(1, 128) as u8,
                 };
                 let gateway = ip.gateway.parse::<std::net::IpAddr>().ok();
-                let uplink = match gateway {
-                    Some(gateway) => public.uplink(gateway).await,
-                    None => public.interface.clone(),
-                };
+                let uplink = public.uplink(gateway.unwrap_or(address)).await;
                 routes.push(burrow_net::public::Route {
                     tap: rule.tap.clone(),
                     address,
@@ -4150,26 +4198,6 @@ impl SandboxManager {
                 });
                 holders.push(crate::publicip::Holder {
                     address,
-                    prefix,
-                    sandbox_id: rule.sandbox_id.clone(),
-                    is_waking,
-                });
-            }
-            if let Some((address, prefix)) = held.ipv6 {
-                let on_link = match public.is_ipv6_on_link {
-                    true => public.uplink(std::net::IpAddr::V6(address)).await,
-                    false => None,
-                };
-                routes.push(burrow_net::public::Route {
-                    tap: rule.tap.clone(),
-                    address: std::net::IpAddr::V6(address),
-                    prefix,
-                    on_link,
-                    egress: None,
-                    mark: 0,
-                });
-                holders.push(crate::publicip::Holder {
-                    address: std::net::IpAddr::V6(address),
                     prefix,
                     sandbox_id: rule.sandbox_id.clone(),
                     is_waking,
@@ -7630,6 +7658,7 @@ impl SandboxManager {
         // Closed before the rows go, so the same one function ends every
         // session and the store is never left holding an open one.
         self.close_session(&sandbox, ENDED_DELETED).await;
+        self.release_node_ipv6(&sandbox).await;
         self.emit(&sandbox, EVENT_DESTROYED, "").await;
         let released = self.tear_down(sandbox).await;
         tracing::info!(sandbox = id, "sandbox deleted");
@@ -8099,6 +8128,7 @@ impl SandboxManager {
                 .remove(id)
                 .ok_or_else(|| Status::not_found(format!("no sandbox {id} on this node")))?
         };
+        self.release_node_ipv6(&sandbox).await;
         let record = sandbox.record();
         self.emit(&sandbox, EVENT_STOPPED, "released").await;
         // Behind the response: the sandbox is out of the map and its state is

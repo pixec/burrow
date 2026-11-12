@@ -455,10 +455,8 @@ export interface SandboxInfo {
   hypervisorVersion: string;
   /** `linux`, `windows` or `macos`, from its template. */
   guestOs: string;
-  /** Dedicated public addresses attached to it. */
+  /** Public addresses routed to it: from pools, and its node's IPv6 prefix (`nodePrefix`). */
   publicIps: PublicIp[];
-  /** Its own global IPv6 address, from its node's routed prefix; `""` for none. */
-  ipv6Address: string;
 }
 
 /** A dedicated public address, as the orchestrator records it. */
@@ -480,6 +478,11 @@ export interface PublicIp {
   attachedAt: Date | null;
   /** Set while a released address sits out its quarantine. */
   quarantinedUntil: Date | null;
+  /**
+   * From the node's own IPv6 prefix: given at create, taken back at delete,
+   * replaced on a move, and never pinning the sandbox.
+   */
+  nodePrefix: boolean;
 }
 
 /** Where public addresses come from. Operator configuration. */

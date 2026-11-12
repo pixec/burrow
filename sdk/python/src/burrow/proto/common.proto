@@ -515,14 +515,13 @@ message Sandbox {
   // before it are refused, wherever the sandbox has moved since.
   int64 access_revoked_at_ms = 28;
   int64 created_at_unix_ms = 30;
-  // Dedicated public addresses attached to this sandbox, routed to its tap.
-  // Read-only: change them with AttachIp and DetachIp.
+  // Public addresses routed to this sandbox's tap: those attached from pools,
+  // and the one its node's IPv6 prefix gives it (`is_node_prefix`). Ingress
+  // to them follows `NetworkPolicy.ingress`. Read-only: change pool addresses
+  // with AttachIp and DetachIp.
   repeated PublicIp public_ips = 31;
-  // The sandbox's own global IPv6 address, from its node's routed prefix.
-  // Empty on a node given none. Ingress to it follows `NetworkPolicy.ingress`.
-  string ipv6_address = 32;
-  // The prefix routed to the sandbox around `ipv6_address`, e.g. 64.
-  uint32 ipv6_prefix_len = 33;
+  reserved 32, 33;
+  reserved "ipv6_address", "ipv6_prefix_len";
   // How the guest's filesystem sits on its disks. Fixed for the sandbox's
   // life and carried by its snapshots.
   DiskLayout disk_layout = 34;
@@ -581,6 +580,10 @@ message PublicIp {
   int64 released_at_unix_ms = 19;
   int64 quarantined_until_unix_ms = 20;
   PublicIpState state = 21;
+  // From the node's own IPv6 prefix, in its pool "node:<node_id>": given at
+  // create and taken back at delete, replaced by the new node's on a move,
+  // outside the quota, and never pinning the sandbox. Not in ListIps.
+  bool is_node_prefix = 22;
 }
 
 // Where public addresses come from. Operator configuration.
@@ -758,11 +761,14 @@ message NodeInfo {
   // Unix milliseconds when the node's inspection CA expires.
   int64 inspection_ca_expires_at_unix_ms = 18;
   // The routed IPv6 prefix this node gives each sandbox an address from, and
-  // the size of each one's share. Empty when it has none.
+  // the size of each one's share. Empty when it has none. ListIpPools shows
+  // it as the pool "node:<id>".
   string ipv6_prefix = 19;
   uint32 ipv6_per_sandbox = 20;
   reserved 21;
   reserved "ip_providers";
+  // Whether the node answers NDP on its uplink for those addresses.
+  bool is_ipv6_on_link = 22;
 }
 
 message NodeStatus {

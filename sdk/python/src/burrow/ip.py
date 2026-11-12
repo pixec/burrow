@@ -24,6 +24,7 @@ def to_public_ip(raw: common_pb2.PublicIp) -> PublicIp:
         allocated_at=at(raw.allocated_at_unix_ms),
         attached_at=at_or_none(raw.attached_at_unix_ms),
         quarantined_until=at_or_none(raw.quarantined_until_unix_ms),
+        node_prefix=raw.is_node_prefix,
     )
 
 

@@ -98,7 +98,6 @@ def _to_sandbox_info(raw: common_pb2.Sandbox) -> SandboxInfo:
         arch=raw.arch,
         guest_os=raw.guest_os,
         public_ips=[to_public_ip(ip) for ip in raw.public_ips],
-        ipv6_address=raw.ipv6_address,
     )
 
 

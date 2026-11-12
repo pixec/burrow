@@ -102,7 +102,6 @@ export function toSandboxInfo(raw: any): SandboxInfo {
     hypervisorVersion: raw.hypervisorVersion ?? "",
     guestOs: raw.guestOs ?? "",
     publicIps: (raw.publicIps ?? []).map(toPublicIp),
-    ipv6Address: raw.ipv6Address ?? "",
   };
 }
 

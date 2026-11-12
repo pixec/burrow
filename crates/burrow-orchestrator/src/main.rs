@@ -666,7 +666,10 @@ async fn reap_dead_nodes(state: Arc<OrchestratorState>, expiry: Option<std::time
             state.snapshots.forget_node(&node_id);
             state.volumes.forget_node(&node_id);
             state.nodes.remove_node(&node_id);
-            for sandbox in unplaced.iter().filter(|s| !s.public_ips.is_empty()) {
+            for sandbox in unplaced
+                .iter()
+                .filter(|s| s.public_ips.iter().any(|ip| !ip.is_node_prefix))
+            {
                 tracing::warn!(
                     node_id,
                     sandbox = sandbox.id,

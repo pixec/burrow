@@ -638,6 +638,7 @@ fn local_node_info(args: &ServeArgs) -> anyhow::Result<NodeInfo> {
             .ipv6_prefix
             .as_ref()
             .map_or(0, |_| u32::from(args.ipv6_per_sandbox)),
+        is_ipv6_on_link: args.ipv6_prefix.is_some() && args.is_ipv6_on_link,
     })
 }
 

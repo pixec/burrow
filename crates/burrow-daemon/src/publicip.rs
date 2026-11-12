@@ -74,6 +74,26 @@ impl PublicConfig {
         Some((Ipv6Addr::from(address), per))
     }
 
+    /// The address sandbox `sandbox_id` on lease block `block` takes from
+    /// this node's IPv6 prefix, as a public IP of the node's own pool.
+    pub fn node_ip(&self, node_id: &str, sandbox_id: &str, block: u32) -> Option<common::PublicIp> {
+        let (address, prefix) = self.ipv6_for(block)?;
+        Some(common::PublicIp {
+            address: address.to_string(),
+            family: 6,
+            prefix_len: u32::from(prefix),
+            pool: node_pool(node_id),
+            sandbox_id: sandbox_id.to_string(),
+            node_id: node_id.to_string(),
+            allocated_at_unix_ms: burrow_common::unix_now_ms(),
+            attached_at_unix_ms: burrow_common::unix_now_ms(),
+            is_on_link: self.is_ipv6_on_link,
+            state: common::PublicIpState::Allocated as i32,
+            is_node_prefix: true,
+            ..Default::default()
+        })
+    }
+
     /// The interface the node reaches `toward` through.
     pub async fn uplink(&self, toward: IpAddr) -> Option<String> {
         if let Some(interface) = &self.interface {
@@ -86,6 +106,11 @@ impl PublicConfig {
         self.uplinks.lock().unwrap().insert(toward, dev.clone());
         Some(dev)
     }
+}
+
+/// The name of the pool a node's IPv6 prefix forms.
+pub fn node_pool(node_id: &str) -> String {
+    format!("node:{node_id}")
 }
 
 /// Which sandbox holds each public address, and whether it wakes on traffic.
@@ -431,6 +456,22 @@ mod tests {
         assert_eq!(
             config.ipv6_for(7),
             Some(("2001:db8:100::7".parse().unwrap(), 128))
+        );
+    }
+
+    #[test]
+    fn a_sandboxs_node_address_is_a_public_ip_of_the_nodes_pool() {
+        let config = config("2001:db8:100::/56", 64);
+        let ip = config.node_ip("node-a", "sbx_a", 3).unwrap();
+        assert_eq!(ip.address, "2001:db8:100:3::1");
+        assert_eq!((ip.family, ip.prefix_len), (6, 64));
+        assert_eq!(ip.pool, "node:node-a");
+        assert!(ip.is_node_prefix && !ip.is_smtp_allowed);
+        assert_eq!(ip.sandbox_id, "sbx_a");
+        assert!(
+            PublicConfig::default()
+                .node_ip("node-a", "sbx_a", 3)
+                .is_none()
         );
     }
 

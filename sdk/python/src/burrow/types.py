@@ -183,10 +183,9 @@ class SandboxInfo:
     hypervisor_version: str = ""
     arch: str = ""
     guest_os: str = ""
-    # Dedicated public addresses attached to it.
+    # Public addresses routed to it: those attached from pools, and the one
+    # its node's IPv6 prefix gives it (`node_prefix`).
     public_ips: List["PublicIp"] = field(default_factory=list)
-    # Its own global IPv6 address from its node's routed prefix; "" for none.
-    ipv6_address: str = ""
 
 
 @dataclass
@@ -210,6 +209,9 @@ class PublicIp:
     attached_at: Optional[datetime]
     # Set while a released address sits out its quarantine.
     quarantined_until: Optional[datetime]
+    # From the node's own IPv6 prefix: given at create, taken back at delete,
+    # replaced on a move, and never pinning the sandbox.
+    node_prefix: bool = False
 
 
 @dataclass

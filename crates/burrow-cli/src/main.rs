@@ -4390,17 +4390,12 @@ fn print_config(sandbox: &common::Sandbox) {
     if !sandbox.guest_ip.is_empty() {
         field("address", &sandbox.guest_ip);
     }
-    if !sandbox.ipv6_address.is_empty() {
-        field(
-            "ipv6",
-            &format!(
-                "{} (/{} routed)",
-                sandbox.ipv6_address, sandbox.ipv6_prefix_len
-            ),
-        );
-    }
     for ip in &sandbox.public_ips {
-        field("public ip", &format!("{} ({})", ip.address, ip.pool));
+        let address = match ip.family {
+            6 => format!("{}/{}", ip.address, ip.prefix_len),
+            _ => ip.address.clone(),
+        };
+        field("public ip", &format!("{address} ({})", ip.pool));
     }
     // Always shown, zeroes included: a sandbox that has spent nothing is a
     // fact, and a missing line reads as "not measured".

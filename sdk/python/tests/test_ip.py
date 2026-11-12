@@ -82,7 +82,20 @@ def test_a_public_ip_reads_back():
     assert ip.address == "203.0.113.17" and ip.sandbox_id == "sbx_a"
     assert ip.node_id == "node-a" and ip.state == "allocated"
     assert int(ip.allocated_at.timestamp()) == 1_700_000_000
-    assert ip.attached_at is None
+    assert ip.attached_at is None and not ip.node_prefix
+
+
+def test_a_sandboxs_node_address_reads_back_as_a_public_ip():
+    ip = to_public_ip(
+        common_pb2.PublicIp(
+            address="2001:db8:100:3::1",
+            family=6,
+            prefix_len=64,
+            pool="node:node-a",
+            is_node_prefix=True,
+        )
+    )
+    assert ip.node_prefix and ip.pool == "node:node-a" and ip.prefix_len == 64
 
 
 def test_a_drain_can_keep_sandboxes_pinned_by_their_public_ips():
