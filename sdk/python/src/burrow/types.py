@@ -154,6 +154,10 @@ class VolumeMount:
     volume: str
     path: str
     read_only: bool = False
+    # Read back only. For a read-only mount of a durable volume another node
+    # holds: the uploaded generation this sandbox reads a copy of, as Unix
+    # milliseconds of that upload. 0 on the node holding the volume.
+    generation: int = 0
 
 
 @dataclass

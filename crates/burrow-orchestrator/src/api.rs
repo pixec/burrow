@@ -890,7 +890,8 @@ impl ApiService {
     /// placement the way a snapshot does. Mounting two that live on different
     /// nodes is refused rather than half satisfied: nothing can attach both.
     /// A durable volume no node holds pins nothing: it goes where the sandbox
-    /// does ([`Self::bring_volumes`]).
+    /// does ([`Self::bring_volumes`]). Nor does a read-only mount of a durable
+    /// volume: a node other than its holder reads a copy of its last upload.
     async fn node_for_volumes(
         &self,
         mounts: &[common::VolumeMount],
@@ -901,7 +902,7 @@ impl ApiService {
                 .volume(&mount.volume)
                 .await
                 .ok_or_else(|| Status::not_found(format!("no volume {}", mount.volume)))?;
-            if volume.node_id.is_empty() {
+            if volume.node_id.is_empty() || (mount.is_read_only && volume.is_durable) {
                 continue;
             }
             match &pinned {
@@ -927,7 +928,10 @@ impl ApiService {
         target: &str,
         mounts: &[common::VolumeMount],
     ) -> Result<(), Status> {
-        for mount in mounts.iter().filter(|mount| !mount.is_tmpfs) {
+        for mount in mounts
+            .iter()
+            .filter(|mount| !mount.is_tmpfs && !mount.is_read_only)
+        {
             let Some(volume) = self.volume(&mount.volume).await else {
                 return Err(Status::not_found(format!("no volume {}", mount.volume)));
             };
@@ -2231,6 +2235,13 @@ impl Burrow for ApiService {
             .filter(|mount| !mount.is_tmpfs)
             .map(|mount| mount.volume.clone())
             .collect();
+        let written: Vec<String> = current
+            .policy
+            .iter()
+            .flat_map(|p| p.volumes.iter())
+            .filter(|mount| !mount.is_tmpfs && !mount.is_read_only)
+            .map(|mount| mount.volume.clone())
+            .collect();
         for name in &mounts {
             if !self.volume(name).await.is_some_and(|v| v.is_durable) {
                 return Err(Status::failed_precondition(format!(
@@ -2287,8 +2298,15 @@ impl Burrow for ApiService {
         // Between the two nodes the sandbox is nowhere, and recorded so: if
         // the adopt fails, a later start places it rather than routing to a
         // node that has let go of it.
-        for name in &mounts {
-            self.0.volumes.release(name);
+        for name in &written {
+            if self
+                .0
+                .volumes
+                .get(name)
+                .is_some_and(|volume| volume.node_id == source)
+            {
+                self.0.volumes.release(name);
+            }
         }
         let mut released = self.0.sandboxes.unplace(released);
         self.release_charge(&common::Sandbox {

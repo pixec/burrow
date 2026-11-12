@@ -290,6 +290,13 @@ export interface VolumeMount {
    * once. A writable mount, the default, is exclusive to one running sandbox.
    */
   readOnly?: boolean;
+  /**
+   * Read back only. For a read-only mount of a durable volume another node
+   * holds: the uploaded generation this sandbox reads a copy of, as Unix
+   * milliseconds of that upload. It sees the volume as of then, and newer data
+   * only on its next mount. 0 on the node holding the volume.
+   */
+  generation?: number;
 }
 
 /** Membership in a named private inter-sandbox network. */

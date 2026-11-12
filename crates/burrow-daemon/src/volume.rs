@@ -57,6 +57,9 @@ const IMAGE: &str = "volume.ext4";
 #[cfg(target_os = "macos")]
 const IMAGE: &str = "volume.img";
 const META: &str = "volume.json";
+/// Read-only copies of durable volumes other nodes hold, by name and
+/// generation, for the sandboxes here that mount them read-only.
+const READERS: &str = ".readers";
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Meta {
@@ -412,6 +415,10 @@ impl VolumeStore {
         let _held = self.preparing.lock().await;
         for (_, mount) in block_mounts(mounts) {
             let name = &mount.volume;
+            // A copy of another node's volume, readied when it was fetched.
+            if mount.is_read_only && !self.is_local(name) {
+                continue;
+            }
             let mut meta = self.meta(name).await?;
             if meta.is_lost {
                 return Err(Status::failed_precondition(format!(
@@ -483,6 +490,7 @@ impl VolumeStore {
     /// Drops every claim one sandbox holds, on stop, suspend or delete.
     pub fn release_all(&self, sandbox_id: &str) {
         let mut written = Vec::new();
+        let mut read = Vec::new();
         let restore = {
             let mut claims = self.claims.lock().unwrap();
             for (name, claim) in claims.iter_mut() {
@@ -490,12 +498,26 @@ impl VolumeStore {
                     claim.writer = None;
                     written.push(name.clone());
                 }
-                claim.readers.remove(sandbox_id);
+                if claim.readers.remove(sandbox_id) {
+                    read.push(name.clone());
+                }
             }
-            Self::drop_free(&mut claims)
+            let restore = Self::drop_free(&mut claims);
+            read.retain(|name| !claims.contains_key(name));
+            restore
         };
         self.restore_owners(restore);
         self.upload_released(written);
+        self.drop_reader_copies(&read);
+    }
+
+    /// Removes the read-only copies of volumes nobody here reads any more. A
+    /// suspended reader keeps its own link to the copy it mounted, so it
+    /// resumes on the same generation.
+    fn drop_reader_copies(&self, names: &[String]) {
+        for name in names {
+            let _ = std::fs::remove_dir_all(self.root.join(READERS).join(name));
+        }
     }
 
     /// Uploads what a writer that just let go left, behind the release.
@@ -602,6 +624,80 @@ impl VolumeStore {
     /// The upload lock if nothing holds it.
     pub fn try_lock_upload(&self, name: &str) -> Option<tokio::sync::OwnedMutexGuard<()>> {
         self.upload_lock(name).try_lock_owned().ok()
+    }
+
+    /// Whether this node holds the volume, as opposed to reading a copy of it.
+    pub fn is_local(&self, name: &str) -> bool {
+        self.dir(name).join(META).exists()
+    }
+
+    /// A read-only copy of a durable volume another node holds, for a sandbox
+    /// here mounting it read-only: `generation`, or the latest uploaded one.
+    /// Every reader here of one generation shares the copy, and the store
+    /// pins the generation for `sandbox_id` until [`Self::unpin`].
+    pub async fn reader_copy(
+        &self,
+        name: &str,
+        generation: Option<u64>,
+        sandbox_id: &str,
+    ) -> Result<(PathBuf, u64), Status> {
+        validate_name(name)?;
+        let store = self
+            .object_store
+            .as_ref()
+            .ok_or_else(|| Status::not_found(format!("no volume {name} on this node")))?;
+        let held = crate::volstore::read(store, name)
+            .await?
+            .filter(|held| held.manifest.state != crate::volstore::STATE_DELETING)
+            .ok_or_else(|| Status::not_found(format!("no volume {name}")))?;
+        let generation = generation.unwrap_or(held.manifest.generation);
+        let dir = self
+            .root
+            .join(READERS)
+            .join(name)
+            .join(generation.to_string());
+        let image = dir.join(IMAGE);
+        let _fetching = self.lock_upload(&format!("{READERS}/{name}")).await;
+        if !tokio::fs::try_exists(&image).await.unwrap_or(false) {
+            tokio::fs::create_dir_all(&dir)
+                .await
+                .map_err(|err| Status::internal(format!("volume copy dir: {err}")))?;
+            let building = dir.join(format!("{IMAGE}.building"));
+            crate::volstore::fetch_generation(store, name, generation, &building).await?;
+            if ondisk::is_needed(&building, &held.manifest.guest_os).await {
+                ondisk::run(&building).await.map_err(|err| {
+                    Status::failed_precondition(format!(
+                        "volume {name}'s generation {generation} has a journal its writer left, \
+                         and replaying it failed ({err})"
+                    ))
+                })?;
+            }
+            {
+                use std::os::unix::fs::PermissionsExt as _;
+                tokio::fs::set_permissions(&building, std::fs::Permissions::from_mode(0o444))
+                    .await
+                    .map_err(|err| Status::internal(format!("volume copy: {err}")))?;
+            }
+            tokio::fs::rename(&building, &image)
+                .await
+                .map_err(|err| Status::internal(format!("volume copy: {err}")))?;
+            tracing::info!(
+                volume = name,
+                generation,
+                "fetched a read-only copy of the volume"
+            );
+        }
+        crate::volstore::pin(store, name, sandbox_id, generation).await?;
+        Ok((image, generation))
+    }
+
+    /// Lets go of the generation a deleted sandbox read from a copy.
+    pub async fn unpin(&self, name: &str, sandbox_id: &str) {
+        if let Some(store) = &self.object_store
+            && let Err(err) = crate::volstore::unpin(store, name, sandbox_id).await
+        {
+            tracing::warn!(volume = name, sandbox = sandbox_id, %err, "could not unpin a volume");
+        }
     }
 
     /// The sandbox writing a volume now, if any.
@@ -1613,6 +1709,73 @@ mod tests {
         assert!(!a.dir("data").exists());
         std::fs::remove_dir_all(&dir_a).unwrap();
         std::fs::remove_dir_all(&dir_b).unwrap();
+    }
+
+    /// A sandbox on another node reads a copy of the latest upload, pinned to
+    /// that generation while the writer goes on on the holding node, and the
+    /// copy goes once the last reader there lets go.
+    #[tokio::test]
+    async fn a_remote_reader_reads_a_pinned_copy_of_the_last_upload() {
+        use std::os::unix::fs::FileExt as _;
+        let objects = crate::objstore::fake::store(true).await;
+        let (a, dir_a) = store_with("remote", &[5u8; 8192]);
+        let a = a.with_object_store(Some(objects.clone()));
+        a.bind_node_id(Arc::new(Mutex::new("node-a".into())));
+        a.sync("remote").await.unwrap();
+        let first = a.generation("remote").await.unwrap();
+
+        let dir_b = std::env::temp_dir().join(format!("burrow-volume-{}-rb", std::process::id()));
+        let b = VolumeStore::new(&dir_b).with_object_store(Some(objects.clone()));
+        b.bind_node_id(Arc::new(Mutex::new("node-b".into())));
+        assert!(!b.is_local("remote"));
+        b.claim("sbx_r1", &[mount("remote", "/data", true)])
+            .unwrap();
+        let (copy, generation) = b.reader_copy("remote", None, "sbx_r1").await.unwrap();
+        assert_eq!(generation, first);
+        assert_eq!(std::fs::read(&copy).unwrap(), vec![5u8; 8192]);
+        assert!(std::fs::metadata(&copy).unwrap().permissions().readonly());
+        b.prepare(
+            &[mount("remote", "/data", true)],
+            "linux",
+            &Default::default(),
+        )
+        .await
+        .unwrap();
+        assert!(
+            b.list().await.is_empty(),
+            "a copy is not a volume this node holds"
+        );
+
+        // The writer moves on and uploads; the reader keeps its generation, and
+        // a new mount gets the new one.
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(a.image("remote"))
+            .unwrap()
+            .write_all_at(&[6u8; 4096], 0)
+            .unwrap();
+        a.sync("remote").await.unwrap();
+        let second = a.generation("remote").await.unwrap();
+        assert!(second > first);
+        assert_eq!(std::fs::read(&copy).unwrap(), vec![5u8; 8192]);
+        b.claim("sbx_r2", &[mount("remote", "/data", true)])
+            .unwrap();
+        let (newer, generation) = b.reader_copy("remote", None, "sbx_r2").await.unwrap();
+        assert_eq!(generation, second);
+        assert_eq!(std::fs::read(&newer).unwrap()[..4096], [6u8; 4096]);
+        let (pinned, generation) = b
+            .reader_copy("remote", Some(first), "sbx_r3")
+            .await
+            .unwrap();
+        assert_eq!((pinned, generation), (copy.clone(), first));
+
+        b.release_all("sbx_r1");
+        assert!(copy.exists(), "another reader here still has the volume");
+        b.release_all("sbx_r2");
+        assert!(!copy.exists() && !newer.exists());
+        b.unpin("remote", "sbx_r1").await;
+        std::fs::remove_dir_all(&dir_a).unwrap();
+        let _ = std::fs::remove_dir_all(&dir_b);
     }
 
     /// The first writer decides what filesystem the volume holds, and a guest

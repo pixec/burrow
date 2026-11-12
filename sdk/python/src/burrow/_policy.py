@@ -482,7 +482,12 @@ def to_volume_mounts(
 
 def from_volume_mounts(raw: Any) -> List[VolumeMount]:
     return [
-        VolumeMount(volume=mount.volume, path=mount.path, read_only=mount.is_read_only)
+        VolumeMount(
+            volume=mount.volume,
+            path=mount.path,
+            read_only=mount.is_read_only,
+            generation=mount.generation,
+        )
         for mount in raw
     ]
 

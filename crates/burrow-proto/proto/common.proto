@@ -395,6 +395,12 @@ message VolumeMount {
   // Octal permissions applied to the mount root when it is created, e.g.
   // "1777". Empty leaves the filesystem's default.
   string mode = 6;
+  // Set by the node on a read-only mount of a durable volume another node
+  // holds: the uploaded generation this sandbox reads, from a copy fetched
+  // when it mounted, kept for as long as it mounts the volume. It sees the
+  // volume as of that upload, and newer data only on its next mount. 0 for a
+  // mount on the node holding the volume, and ignored on a create.
+  uint64 generation = 7;
 }
 
 // The create-phase inputs a Docker Sandbox Kit template is expanded with.

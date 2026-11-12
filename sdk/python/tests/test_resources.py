@@ -113,3 +113,22 @@ def test_checkpoints_are_turned_on_and_a_record_says_how_old_the_latest_is(trans
     answering(transport, common_pb2.Sandbox(id="sbx_test"))
     plain = sandbox.update_lifetime(max_lifetime_secs=60)
     assert plain.checkpoint_at is None and plain.checkpoint_kind is None
+
+
+def test_a_remote_readers_generation_reads_back_on_its_mount(transport, sandbox):
+    answering(
+        transport,
+        common_pb2.Sandbox(
+            id="sbx_test",
+            policy=common_pb2.Policy(
+                volumes=[
+                    common_pb2.VolumeMount(
+                        volume="data", path="/data", is_read_only=True, generation=1_794_475_800_000
+                    )
+                ]
+            ),
+        ),
+    )
+    info = sandbox.update_lifetime(max_lifetime_secs=60)
+    assert info.policy.volumes[0].read_only
+    assert info.policy.volumes[0].generation == 1_794_475_800_000

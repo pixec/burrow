@@ -6090,6 +6090,54 @@ impl SandboxManager {
         Ok(record)
     }
 
+    /// Refuses mounts of volumes this node can neither attach nor fetch: one
+    /// it holds, or a read-only mount of one kept in the object store.
+    #[allow(clippy::result_large_err)]
+    fn require_volumes(&self, mounts: &[common::VolumeMount]) -> Result<(), Status> {
+        for (_, mount) in crate::volume::block_mounts(mounts) {
+            let is_reachable = self.volumes.is_local(&mount.volume)
+                || (mount.is_read_only && self.volumes.is_durable());
+            if !is_reachable {
+                return Err(Status::not_found(format!(
+                    "no volume {} on this node",
+                    mount.volume
+                )));
+            }
+        }
+        Ok(())
+    }
+
+    /// The image each block mount attaches: the volume itself where this node
+    /// holds it, or a read-only copy of a durable volume another node holds,
+    /// whose generation is stamped on the mount. `is_pinned` keeps the
+    /// generation a mount already names, for a sandbox taken up elsewhere
+    /// whose guest read that one; otherwise the latest upload is fetched.
+    /// Called once the claims are held, so no reader letting go here removes
+    /// a copy in between.
+    async fn volume_sources(
+        &self,
+        sandbox_id: &str,
+        mounts: &mut [common::VolumeMount],
+        is_pinned: bool,
+    ) -> Result<Vec<PathBuf>, Status> {
+        let mut sources = Vec::new();
+        for mount in mounts.iter_mut().filter(|mount| !mount.is_tmpfs) {
+            if self.volumes.is_local(&mount.volume) {
+                mount.generation = 0;
+                sources.push(self.volumes.image(&mount.volume));
+                continue;
+            }
+            let pinned = (is_pinned && mount.generation != 0).then_some(mount.generation);
+            let (copy, generation) = self
+                .volumes
+                .reader_copy(&mount.volume, pinned, sandbox_id)
+                .await?;
+            mount.generation = generation;
+            sources.push(copy);
+        }
+        Ok(sources)
+    }
+
     /// Takes one sandbox's volume claims and readies the images under them,
     /// all before anything attaches one; see [`crate::volume::VolumeStore::prepare`].
     async fn claim_volumes(
@@ -6189,22 +6237,17 @@ impl SandboxManager {
         // Taken before any resource is, so a volume conflict fails the create
         // without a tap, an address or a directory to give back.
         crate::volume::validate_mounts(&policy.volumes)?;
-        for (_, mount) in crate::volume::block_mounts(&policy.volumes) {
-            if !tokio::fs::try_exists(self.volumes.image(&mount.volume))
-                .await
-                .unwrap_or(false)
-            {
-                return Err(Status::not_found(format!(
-                    "no volume {} on this node",
-                    mount.volume
-                )));
-            }
-        }
+        self.require_volumes(&policy.volumes)?;
         self.claim_volumes(&id, &policy.volumes, guest_os).await?;
         // The claims above are the first thing this create holds, so the guard
         // starts here: everything taken from now on is given back by it, and
         // every failure below answers through [`Provisioning::fail`].
         let mut guard = Provisioning::new(self, &id, &workdir);
+        let mut policy = policy;
+        let sources = match self.volume_sources(&id, &mut policy.volumes, false).await {
+            Ok(sources) => sources,
+            Err(err) => return Err(guard.fail(err).await),
+        };
 
         // A warm snapshot was taken without volumes, so they can only reach a
         // sandbox restored from one by being hotplugged; where they cannot
@@ -6298,14 +6341,14 @@ impl SandboxManager {
             }
             // Hard-linked in after the template's own files, so a cold boot
             // that rebuilt the directory does not clear them again.
-            for (index, mount) in crate::volume::block_mounts(&policy.volumes) {
+            for ((index, mount), source) in
+                crate::volume::block_mounts(&policy.volumes).zip(&sources)
+            {
                 let dest = workdir.join(crate::sandbox::volume_image(index));
                 let _ = tokio::fs::remove_file(&dest).await;
-                tokio::fs::hard_link(self.volumes.image(&mount.volume), &dest)
-                    .await
-                    .map_err(|err| {
-                        Status::internal(format!("attaching volume {}: {err}", mount.volume))
-                    })?;
+                tokio::fs::hard_link(source, &dest).await.map_err(|err| {
+                    Status::internal(format!("attaching volume {}: {err}", mount.volume))
+                })?;
             }
             let files_ms = staging_began.elapsed();
             // Ownership is handed over inside the same task, because it has to
@@ -7140,17 +7183,7 @@ impl SandboxManager {
         // same time. Claimed first, for the reason the create path gives: a
         // conflict must fail before there is a tap or an address to give back.
         crate::volume::validate_mounts(&policy.volumes)?;
-        for (_, mount) in crate::volume::block_mounts(&policy.volumes) {
-            if !tokio::fs::try_exists(self.volumes.image(&mount.volume))
-                .await
-                .unwrap_or(false)
-            {
-                return Err(Status::not_found(format!(
-                    "no volume {} on this node",
-                    mount.volume
-                )));
-            }
-        }
+        self.require_volumes(&policy.volumes)?;
         let guest_os = match &source {
             RestoreSource::Sandbox(source, _) => {
                 burrow_vmm::GuestOs::from_record(&source.record().guest_os).unwrap_or_default()
@@ -7168,6 +7201,13 @@ impl SandboxManager {
         };
         self.claim_volumes(&id, &policy.volumes, guest_os).await?;
         let mut guard = Provisioning::new(self, &id, &workdir);
+        let sources = match self
+            .volume_sources(&id, &mut policy.volumes, is_attached)
+            .await
+        {
+            Ok(sources) => sources,
+            Err(err) => return Err(guard.fail(err).await),
+        };
 
         let allocated = self.ipam.lock().await.allocate(&id);
         let lease = match allocated {
@@ -7199,14 +7239,14 @@ impl SandboxManager {
                 .await?;
             // Linked in the same shape as a create's, so the guest sees the
             // same devices in the same order as the handshake describes.
-            for (index, mount) in crate::volume::block_mounts(&policy.volumes) {
+            for ((index, mount), source) in
+                crate::volume::block_mounts(&policy.volumes).zip(&sources)
+            {
                 let dest = workdir.join(crate::sandbox::volume_image(index));
                 let _ = tokio::fs::remove_file(&dest).await;
-                tokio::fs::hard_link(self.volumes.image(&mount.volume), &dest)
-                    .await
-                    .map_err(|err| {
-                        Status::internal(format!("attaching volume {}: {err}", mount.volume))
-                    })?;
+                tokio::fs::hard_link(source, &dest).await.map_err(|err| {
+                    Status::internal(format!("attaching volume {}: {err}", mount.volume))
+                })?;
             }
             if let Some(jail) = self.config.jail_for(hypervisor) {
                 // Both a fork and a snapshot restore hard-link only the
@@ -7754,6 +7794,9 @@ impl SandboxManager {
             flush_guest(&sandbox).await;
         }
         self.forget_stored(&sandbox).await;
+        for mount in policy.volumes.iter().filter(|mount| mount.generation != 0) {
+            self.volumes.unpin(&mount.volume, id).await;
+        }
         // Closed before the rows go, so the same one function ends every
         // session and the store is never left holding an open one.
         self.close_session(&sandbox, ENDED_DELETED).await;
@@ -7845,7 +7888,9 @@ impl SandboxManager {
     /// store, so the sandbox and its volumes move together.
     async fn sync_volumes(&self, sandbox: &RunningSandbox) -> Result<(), Status> {
         let policy = sandbox.record().policy.unwrap_or_default();
-        for (_, mount) in crate::volume::block_mounts(&policy.volumes) {
+        for (_, mount) in crate::volume::block_mounts(&policy.volumes)
+            .filter(|(_, mount)| self.volumes.is_local(&mount.volume))
+        {
             self.volumes.sync(&mount.volume).await?;
         }
         Ok(())
@@ -8371,8 +8416,11 @@ impl SandboxManager {
                 "a sandbox with volumes moves only with an object store to carry them",
             ));
         }
+        // The volumes it writes move with it. One it only reads stays where it
+        // is, and the new node reads a copy of it.
         let mounted: Vec<String> =
             crate::volume::block_mounts(&sandbox.record().policy.unwrap_or_default().volumes)
+                .filter(|(_, mount)| !mount.is_read_only && self.volumes.is_local(&mount.volume))
                 .map(|(_, mount)| mount.volume.clone())
                 .collect();
         for other in self.sandboxes.lock().await.values() {
@@ -8461,7 +8509,8 @@ impl SandboxManager {
             .object_store
             .as_ref()
             .ok_or_else(|| Status::failed_precondition("this node has no object store"))?;
-        crate::durable::purge(store, id, None).await
+        crate::durable::purge(store, id, None).await?;
+        crate::volstore::unpin_all(store, id).await
     }
 
     /// Takes over a sandbox from the object store and resumes it here.
@@ -8742,19 +8791,13 @@ impl SandboxManager {
             )
             .await?;
         crate::volume::validate_mounts(&policy.volumes)?;
-        for (_, mount) in crate::volume::block_mounts(&policy.volumes) {
-            if !tokio::fs::try_exists(self.volumes.image(&mount.volume))
-                .await
-                .unwrap_or(false)
-            {
-                return Err(Status::not_found(format!(
-                    "no volume {} on this node",
-                    mount.volume
-                )));
-            }
-        }
+        self.require_volumes(&policy.volumes)?;
         let guest_os = burrow_vmm::GuestOs::from_record(&record.guest_os).unwrap_or_default();
         let mut guard = Provisioning::new(self, &id, &workdir);
+        let sources = match self.volume_sources(&id, &mut policy.volumes, true).await {
+            Ok(sources) => sources,
+            Err(err) => return Err(guard.fail(err).await),
+        };
         let lease = match self.ipam.lock().await.allocate(&id) {
             Ok(lease) => lease,
             Err(err) => {
@@ -8772,15 +8815,14 @@ impl SandboxManager {
                 .map_err(|err| Status::internal(format!("creating the workdir: {err}")))?;
             let local =
                 crate::durable::stage_disk(store, &self.snapshots, manifest, &workdir).await?;
-            for (index, mount) in crate::volume::block_mounts(&policy.volumes) {
-                tokio::fs::hard_link(
-                    self.volumes.image(&mount.volume),
-                    workdir.join(volume_image(index)),
-                )
-                .await
-                .map_err(|err| {
-                    Status::internal(format!("attaching volume {}: {err}", mount.volume))
-                })?;
+            for ((index, mount), source) in
+                crate::volume::block_mounts(&policy.volumes).zip(&sources)
+            {
+                tokio::fs::hard_link(source, workdir.join(volume_image(index)))
+                    .await
+                    .map_err(|err| {
+                        Status::internal(format!("attaching volume {}: {err}", mount.volume))
+                    })?;
             }
             Ok::<_, Status>(local)
         };

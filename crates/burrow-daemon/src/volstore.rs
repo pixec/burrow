@@ -14,11 +14,19 @@
 //! a node writing as the holder checks the manifest still names it. A node
 //! that finds another holder has lost the volume and stops serving its copy.
 //!
+//! A sandbox on another node may mount the volume read-only. It gets a copy
+//! of the latest generation, fetched whole and never written, and keeps that
+//! generation for as long as it mounts the volume: it sees the volume as of
+//! its last upload, and newer data only on its next mount. A pin in the store
+//! names each such reader's generation, so neither the next upload nor the
+//! collector deletes it while another node may still need to fetch it.
+//!
 //! Layout, under the store's prefix:
 //!
 //! ```text
 //! volumes/<name>/manifest.json
 //! volumes/<name>/<generation>.index.json
+//! volumes/<name>/pins/<sandbox>          a remote reader's generation
 //! chunks/<sha256>
 //! ```
 
@@ -76,6 +84,76 @@ fn manifest_key(name: &str) -> String {
 
 fn index_key(name: &str, generation: u64) -> String {
     format!("volumes/{name}/{generation}.index.json")
+}
+
+fn pin_key(name: &str, sandbox_id: &str) -> String {
+    format!("volumes/{name}/pins/{sandbox_id}")
+}
+
+/// Records that `sandbox_id` reads `generation` of a volume from a copy.
+pub async fn pin(
+    store: &ObjectStore,
+    name: &str,
+    sandbox_id: &str,
+    generation: u64,
+) -> Result<(), Status> {
+    store
+        .put_bytes(
+            &pin_key(name, sandbox_id),
+            generation.to_string().into_bytes(),
+        )
+        .await
+}
+
+pub async fn unpin(store: &ObjectStore, name: &str, sandbox_id: &str) -> Result<(), Status> {
+    store.delete(&pin_key(name, sandbox_id)).await
+}
+
+async fn read_pin(store: &ObjectStore, key: &str) -> Result<Option<u64>, Status> {
+    Ok(store
+        .get_bytes(key)
+        .await?
+        .and_then(|bytes| String::from_utf8(bytes).ok())
+        .and_then(|text| text.trim().parse().ok()))
+}
+
+/// Drops every pin a sandbox holds, for one deleted while no node held it.
+pub async fn unpin_all(store: &ObjectStore, sandbox_id: &str) -> Result<(), Status> {
+    let suffix = format!("/pins/{sandbox_id}");
+    for key in store.list("volumes/").await? {
+        if key.ends_with(&suffix) {
+            store.delete(&key).await?;
+        }
+    }
+    Ok(())
+}
+
+/// The generations of a volume its remote readers pin.
+async fn pinned(store: &ObjectStore, name: &str) -> Result<HashSet<u64>, Status> {
+    let mut out = HashSet::new();
+    for key in store.list(&format!("volumes/{name}/pins/")).await? {
+        out.extend(read_pin(store, &key).await?);
+    }
+    Ok(out)
+}
+
+/// Fetches one generation of a volume whole into `image`, as a reader's
+/// copy, returning its index.
+pub async fn fetch_generation(
+    store: &ObjectStore,
+    name: &str,
+    generation: u64,
+    image: &Path,
+) -> Result<ImageIndex, Status> {
+    let index = crate::snapshot::read_index(store, &index_key(name, generation))
+        .await?
+        .ok_or_else(|| {
+            Status::not_found(format!(
+                "volume {name} has no generation {generation} in the object store"
+            ))
+        })?;
+    crate::chunks::get_image(store, &index, image).await?;
+    Ok(index)
 }
 
 /// A volume's manifest as the store holds it, with the ETag it was read at.
@@ -239,6 +317,9 @@ pub async fn upload(
     let _ = tokio::fs::rename(capture, dir.join(BASE)).await;
     if let Some(previous) = previous
         && previous.manifest.generation != generation
+        && !pinned(store, &local.manifest.name)
+            .await
+            .is_ok_and(|pins| pins.contains(&previous.manifest.generation))
     {
         let _ = store
             .delete(&index_key(
@@ -390,6 +471,24 @@ pub async fn collect_refs(
     referenced: &mut HashSet<String>,
 ) -> Result<usize, Status> {
     let objects = store.list_aged("volumes/").await?;
+    let mut kept: HashSet<(String, u64)> = HashSet::new();
+    for (key, _) in &objects {
+        let Some((name, _)) = key
+            .strip_prefix("volumes/")
+            .and_then(|rest| rest.split_once("/pins/"))
+        else {
+            continue;
+        };
+        let Some(generation) = read_pin(store, key).await? else {
+            continue;
+        };
+        if let Some(index) =
+            crate::snapshot::read_index(store, &index_key(name, generation)).await?
+        {
+            referenced.extend(index.digests().map(str::to_string));
+        }
+        kept.insert((name.to_string(), generation));
+    }
     let mut current: HashMap<String, u64> = HashMap::new();
     for (key, _) in &objects {
         let Some(name) = key
@@ -421,7 +520,10 @@ pub async fn collect_refs(
         else {
             continue;
         };
-        if current.get(name) == Some(&generation) || modified.is_none_or(|at| at > cutoff) {
+        if current.get(name) == Some(&generation)
+            || kept.contains(&(name.to_string(), generation))
+            || modified.is_none_or(|at| at > cutoff)
+        {
             continue;
         }
         if store.delete(key).await.is_ok() {
@@ -557,6 +659,54 @@ mod tests {
         );
         let _ = std::fs::remove_dir_all(&a);
         let _ = std::fs::remove_dir_all(&b);
+    }
+
+    /// A remote reader's generation outlives newer uploads and the collector,
+    /// so another node can still fetch it, until the reader lets go.
+    #[tokio::test]
+    async fn a_pinned_generation_is_kept_for_its_reader() {
+        let store = crate::objstore::fake::store(true).await;
+        let a = scratch("pin");
+        let image = a.join("volume.ext4");
+        write_image(&image, &[(0, 1)]);
+        let (clone, stamp) = capture(&a, &image).await;
+        let first = upload(&store, &a, &clone, stamp, draft("shared", "node-a"), None)
+            .await
+            .unwrap();
+        pin(&store, "shared", "sbx_reader", first.manifest.generation)
+            .await
+            .unwrap();
+        write_image(&image, &[(1 << 20, 2)]);
+        let (clone, stamp) = capture(&a, &image).await;
+        let second = upload(
+            &store,
+            &a,
+            &clone,
+            stamp,
+            draft("shared", "node-a"),
+            Some(&first),
+        )
+        .await
+        .unwrap();
+        assert_ne!(first.manifest.generation, second.manifest.generation);
+
+        let mut referenced = HashSet::new();
+        collect_refs(&store, std::time::Duration::ZERO, &mut referenced)
+            .await
+            .unwrap();
+        assert!(first.index.digests().all(|d| referenced.contains(d)));
+        let copy = a.join("reader.img");
+        let index = fetch_generation(&store, "shared", first.manifest.generation, &copy)
+            .await
+            .unwrap();
+        assert_eq!(index.chunks, first.index.chunks);
+        let bytes = std::fs::read(&copy).unwrap();
+        assert_eq!(bytes[..4096], [1u8; 4096]);
+        assert!(bytes[1 << 20..(1 << 20) + 4096].iter().all(|&b| b == 0));
+
+        unpin(&store, "shared", "sbx_reader").await.unwrap();
+        assert!(pinned(&store, "shared").await.unwrap().is_empty());
+        let _ = std::fs::remove_dir_all(&a);
     }
 
     /// Two nodes told to take one volume from a dead holder: one gets it.

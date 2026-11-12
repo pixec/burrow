@@ -555,6 +555,7 @@ export function fromVolumeMounts(raw: any): Required<VolumeMount>[] {
     volume: String(mount?.volume ?? ""),
     path: String(mount?.path ?? ""),
     readOnly: Boolean(mount?.isReadOnly),
+    generation: Number(mount?.generation ?? 0),
   }));
 }
 

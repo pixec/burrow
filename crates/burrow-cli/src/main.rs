@@ -4494,6 +4494,19 @@ fn print_config(sandbox: &common::Sandbox) {
     if let Some(checkpoint) = display_checkpoint(sandbox) {
         field("checkpoint", &checkpoint);
     }
+    for mount in policy.volumes.iter().filter(|mount| !mount.is_tmpfs) {
+        let mut line = format!("{}:{}", mount.volume, mount.path);
+        if mount.is_read_only {
+            line.push_str(":ro");
+        }
+        if mount.generation != 0 {
+            line.push_str(&format!(
+                ", a copy of the upload of {}",
+                rfc3339_from_unix_ms(mount.generation as i64)
+            ));
+        }
+        field("volume", &line);
+    }
     // Only shown when set. An absent section is no restriction, and a line
     // saying "exec allowed" on every unrestricted sandbox would bury the one
     // sandbox where it is not.
