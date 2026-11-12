@@ -257,19 +257,25 @@ class Sandbox:
         endpoint: Optional[str] = None,
         api_key: Optional[str] = None,
         tls: Optional[bool] = None,
-        timeout: Optional[float] = 60.0,
+        call_timeout: Optional[float] = 60.0,
         route: Optional[str] = None,
         **options: Any,
     ) -> "Sandbox":
         """`Burrow(...).sandboxes.create(...)` on a connection of its own.
 
         ```python
-        sandbox = Sandbox.create(template="python")
+        sandbox = Sandbox.create(template="python", timeout=300)
         ```
+
+        `timeout` is the wait for the sandbox to be ready, 120 seconds by
+        default, and `call_timeout` the default deadline of every later call
+        on the handle.
         """
         from .client import Burrow
 
-        with Burrow(endpoint=endpoint, api_key=api_key, tls=tls, timeout=timeout, route=route) as burrow:
+        with Burrow(
+            endpoint=endpoint, api_key=api_key, tls=tls, timeout=call_timeout, route=route
+        ) as burrow:
             return burrow.sandboxes.create(**options)
 
     @staticmethod
@@ -278,14 +284,17 @@ class Sandbox:
         endpoint: Optional[str] = None,
         api_key: Optional[str] = None,
         tls: Optional[bool] = None,
-        timeout: Optional[float] = 60.0,
+        call_timeout: Optional[float] = 60.0,
         route: Optional[str] = None,
         **options: Any,
     ) -> "Sandbox":
-        """`Burrow(...).sandboxes.get_or_create(...)` on a connection of its own."""
+        """`Burrow(...).sandboxes.get_or_create(...)` on a connection of its
+        own. `timeout` and `call_timeout` are as in `create`."""
         from .client import Burrow
 
-        with Burrow(endpoint=endpoint, api_key=api_key, tls=tls, timeout=timeout, route=route) as burrow:
+        with Burrow(
+            endpoint=endpoint, api_key=api_key, tls=tls, timeout=call_timeout, route=route
+        ) as burrow:
             return burrow.sandboxes.get_or_create(**options)
 
     @staticmethod

@@ -45,6 +45,11 @@ connection, call `sandbox.close()`. To share one channel across many sandboxes,
 use a [`Burrow`](#manage-the-fleet) client: `burrow.sandboxes.create(...)` takes
 the same options.
 
+On `Sandbox.create`, `Sandbox.getOrCreate` and `Template.build`, `timeoutMs` is
+that call's own wait (120 seconds for the boot, 30 minutes for a build), and
+`callTimeoutMs` is the default deadline of the channel they open, which later
+calls on the handle inherit.
+
 ## Create a sandbox
 
 `Sandbox.create` boots a VM and returns once it accepts commands. Everything is

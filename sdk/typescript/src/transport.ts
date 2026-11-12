@@ -57,6 +57,16 @@ export interface TransportOptions {
   route?: "direct" | "orchestrator";
 }
 
+/**
+ * The connection a class-level create or build opens for itself. `timeoutMs`
+ * there is that call's own deadline, so the connection's default is
+ * `callTimeoutMs`, which every later call on the returned handle inherits.
+ */
+export interface ConnectionOptions extends Omit<TransportOptions, "timeoutMs"> {
+  /** Default per-call deadline in milliseconds. */
+  callTimeoutMs?: number;
+}
+
 type AnyClient = grpc.Client & Record<string, Function>;
 
 /** Whether `host` is plainly this machine, not some other one on the network. */

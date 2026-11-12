@@ -44,7 +44,7 @@ export {
   type WriteFileOptions,
 } from "./fs.js";
 export { BurrowError, type BurrowErrorCode } from "./errors.js";
-export type { TransportOptions } from "./transport.js";
+export type { ConnectionOptions, TransportOptions } from "./transport.js";
 export type {
   AllocateIpOptions,
   AppliedRule,

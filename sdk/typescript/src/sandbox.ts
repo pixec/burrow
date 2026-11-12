@@ -1,5 +1,5 @@
 import { attach, SandboxChildProcess, type ChildProcess } from "./child-process.js";
-import { withClient } from "./client.js";
+import { withClient, withConnection } from "./client.js";
 import { BurrowError } from "./errors.js";
 import { SandboxFs } from "./fs.js";
 import type { GuestLink } from "./guest.js";
@@ -19,7 +19,7 @@ import {
 } from "./policy.js";
 import { Snapshot, type SnapshotOptions } from "./snapshot.js";
 import { Terminal, type TerminalOptions } from "./terminal.js";
-import type { Transport, TransportOptions } from "./transport.js";
+import type { ConnectionOptions, Transport, TransportOptions } from "./transport.js";
 import type {
   CheckpointKind,
   CallOptions,
@@ -324,10 +324,12 @@ export class Sandbox {
    * Creates a sandbox and waits for it to be ready to accept commands.
    *
    * Opens a connection for this one sandbox; a {@link Burrow} client shares
-   * one across many.
+   * one across many. `timeoutMs` is the wait for the boot, 120 seconds by
+   * default, and `callTimeoutMs` the default deadline of every later call on
+   * the handle.
    */
-  static create(options: CreateOptions & TransportOptions = {}): Promise<Sandbox> {
-    return withClient(options, (burrow) => burrow.sandboxes.create(options));
+  static create(options: CreateOptions & ConnectionOptions = {}): Promise<Sandbox> {
+    return withConnection(options, (burrow) => burrow.sandboxes.create(options));
   }
 
   /**
@@ -341,8 +343,8 @@ export class Sandbox {
    * });
    * ```
    */
-  static getOrCreate(options: GetOrCreateOptions & TransportOptions = {}): Promise<Sandbox> {
-    return withClient(options, (burrow) => burrow.sandboxes.getOrCreate(options));
+  static getOrCreate(options: GetOrCreateOptions & ConnectionOptions = {}): Promise<Sandbox> {
+    return withConnection(options, (burrow) => burrow.sandboxes.getOrCreate(options));
   }
 
   /**

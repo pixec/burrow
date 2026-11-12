@@ -115,7 +115,9 @@ def build_template(
 
 class _Build:
     """`build` both ways: `template.build(name)` on a builder, and
-    `Template.build(template, name)` on the class."""
+    `Template.build(template, name)` on the class. Both open a connection of
+    their own: `timeout` is the build's deadline, 30 minutes by default, and
+    `call_timeout` the connection's default."""
 
     def __get__(self, builder: Optional["TemplateBuilder"], owner: Any) -> Callable[..., BuiltTemplate]:
         if builder is None:
@@ -130,13 +132,15 @@ def _build_with_connection(
     endpoint: Optional[str] = None,
     api_key: Optional[str] = None,
     tls: Optional[bool] = None,
-    timeout: Optional[float] = 60.0,
+    call_timeout: Optional[float] = 60.0,
     route: Optional[str] = None,
     **options: Any,
 ) -> BuiltTemplate:
     from .client import Burrow
 
-    with Burrow(endpoint=endpoint, api_key=api_key, tls=tls, timeout=timeout, route=route) as burrow:
+    with Burrow(
+        endpoint=endpoint, api_key=api_key, tls=tls, timeout=call_timeout, route=route
+    ) as burrow:
         return burrow.templates.build(template, name, **options)
 
 

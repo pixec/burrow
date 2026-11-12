@@ -10,7 +10,7 @@ import {
   toBuildEvent,
   toTemplateInfo,
 } from "./template.js";
-import { Transport, type TransportOptions } from "./transport.js";
+import { Transport, type ConnectionOptions, type TransportOptions } from "./transport.js";
 import type {
   AuditEvent,
   AuditQuery,
@@ -50,6 +50,14 @@ export async function withClient<T>(
   } finally {
     burrow.close();
   }
+}
+
+/** {@link withClient} for a call whose `timeoutMs` is its own deadline. */
+export function withConnection<T>(
+  options: ConnectionOptions,
+  use: (burrow: Burrow) => Promise<T>,
+): Promise<T> {
+  return withClient({ ...options, timeoutMs: options.callTimeoutMs }, use);
 }
 
 /**

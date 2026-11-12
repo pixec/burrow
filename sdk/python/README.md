@@ -51,6 +51,14 @@ Sandbox.create(template="python", endpoint="https://burrow.example.com", api_key
 # or BURROW_ENDPOINT / BURROW_API_KEY
 ```
 
+On the shortcuts that create or build, `timeout` is that call's own wait (120
+seconds for a sandbox to be ready, 30 minutes for a build) and `call_timeout`
+the connection's default deadline, which later calls on the handle inherit:
+
+```python
+Sandbox.create(template="python", timeout=600, call_timeout=30)
+```
+
 An API key over a plaintext connection to anything but localhost is refused
 unless `tls=False` (or an `http://` scheme) says it is intended.
 

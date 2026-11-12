@@ -1,7 +1,7 @@
 import { Buffer } from "node:buffer";
 
-import { withClient } from "./client.js";
-import type { TransportOptions } from "./transport.js";
+import { withClient, withConnection } from "./client.js";
+import type { ConnectionOptions, TransportOptions } from "./transport.js";
 import type { CallOptions } from "./types.js";
 
 /** One step of a template build. */
@@ -269,11 +269,14 @@ function quote(value: string): string {
 
 interface TemplateFactory {
   (): TemplateBuilder;
-  /** Builds a template and publishes it under `name`. */
+  /**
+   * Builds a template and publishes it under `name`. `timeoutMs` is the
+   * build's deadline, 30 minutes by default.
+   */
   build(
     template: TemplateBuilder,
     name: string,
-    options?: BuildOptions & TransportOptions,
+    options?: BuildOptions & ConnectionOptions,
   ): Promise<BuildResult>;
   /** Lists the templates available across the fleet. */
   list(options?: TransportOptions & CallOptions): Promise<TemplateInfo[]>;
@@ -284,7 +287,7 @@ interface TemplateFactory {
 const factory = (() => new TemplateBuilder()) as TemplateFactory;
 
 factory.build = (template, name, options = {}) =>
-  withClient(options, (burrow) => burrow.templates.build(template, name, options));
+  withConnection(options, (burrow) => burrow.templates.build(template, name, options));
 
 factory.list = (options = {}) =>
   withClient(options, (burrow) => burrow.templates.list(options));
