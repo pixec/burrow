@@ -71,6 +71,7 @@ const COMMAND_STATES: readonly CommandState[] = ["running", "exited"];
 const RESOURCE_CHANGES: readonly ResourceChange[] = [
   "unchanged",
   "live",
+  "partial",
   "next_boot",
   "offline",
   "refused",
@@ -457,6 +458,11 @@ export class Sandbox {
 
   get memoryMib(): number {
     return this.info.policy.resources.memoryMib;
+  }
+
+  /** How far {@link updateResources} can grow the memory while it runs. */
+  get maxMemoryMib(): number {
+    return this.info.policy.resources.maxMemoryMib;
   }
 
   /**
@@ -881,19 +887,22 @@ export class Sandbox {
    * omitted field is left as it is.
    *
    * A running sandbox takes what its hypervisor can hotplug: a bigger disk
-   * under Firecracker and Cloud Hypervisor, whose guest grows its filesystem
-   * at once, and vCPUs under Cloud Hypervisor on x86_64. A shut-down one
-   * ({@link stop}) takes everything: vCPUs and memory on its next boot,
-   * and its disk at once, shrunk by a helper VM that checks the filesystem
-   * first. A suspended sandbox takes none of it. The host limits (`cpus`,
+   * and memory under Firecracker and Cloud Hypervisor, and vCPUs under Cloud
+   * Hypervisor on x86_64. Memory moves between what the sandbox booted with
+   * and its `maxMemoryMib`; more is admitted against the node's memory like a
+   * create. A guest unplugs only memory it can empty, so a shrink can come
+   * back `partial`, its `value` being where it stopped. A shut-down one
+   * ({@link stop}) takes everything: vCPUs and memory on its next boot, and
+   * its disk at once, shrunk by a helper VM that checks the filesystem first.
+   * A suspended sandbox takes none of it. The host limits (`cpus`,
    * `cpuShares`, `cpusetCpus`, `blkioWeight`) move live on a running sandbox
-   * and otherwise when it next runs. What cannot be applied is
-   * reported as `refused` with the reason rather than thrown, so check each
-   * field you asked for.
+   * and otherwise when it next runs. What cannot be applied is reported as
+   * `refused` with the reason rather than thrown, so check each field you
+   * asked for.
    *
    * ```ts
-   * const { vcpus, diskMib } = await sandbox.updateResources({ vcpus: 2, diskMib: 20 * 1024 });
-   * if (vcpus?.change === "refused") console.log(vcpus.reason);
+   * const { memoryMib } = await sandbox.updateResources({ memoryMib: 3 * 1024 });
+   * if (memoryMib?.change !== "live") console.log(memoryMib?.value, memoryMib?.reason);
    * ```
    */
   async updateResources(options: ResourceUpdateOptions): Promise<ResourcesUpdate> {

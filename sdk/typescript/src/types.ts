@@ -214,6 +214,7 @@ export type NetworkPolicy = Required<Omit<NetworkPolicyOptions, "rules">> & {
  */
 export interface ResourceOptions {
   vcpus?: number;
+  /** What the guest has now: what it booted with plus what was plugged since. */
   memoryMib?: number;
   /** Root disk, at least the template's image. 0 is the image plus 1024. */
   diskMib?: number;
@@ -229,9 +230,21 @@ export interface ResourceOptions {
   cpusetCpus?: string;
   /** Relative disk IO weight, as `--blkio-weight` (10-1000). 0 is unset. */
   blkioWeight?: number;
+  /**
+   * How far `memoryMib` can grow while the sandbox runs. 0 is the node's
+   * default, 16 times `memoryMib` within the node's limit; set to
+   * `memoryMib`, the sandbox gets no room to grow.
+   */
+  maxMemoryMib?: number;
 }
 
-export type ResourcePolicy = Required<ResourceOptions>;
+export type ResourcePolicy = Required<ResourceOptions> & {
+  /**
+   * Set by the node: what the sandbox's VM booted with, which a running
+   * guest's memory cannot shrink below.
+   */
+  bootMemoryMib: number;
+};
 
 /** How long the sandbox stays paid for. Every `0` means "unlimited". */
 export interface LifetimeOptions {
@@ -410,18 +423,30 @@ export interface ResourceUpdateOptions extends CallOptions {
 }
 
 /**
- * What became of one field. `live`: applied to the running guest.
- * `next_boot`: recorded on a shut-down sandbox for its next boot. `offline`:
- * a shut-down sandbox's disk resized now. `refused`: not applied, and
- * `reason` says why. `unchanged`: it already had that value.
+ * What became of one field. `live`: applied to the running guest. `partial`:
+ * applied to the running guest in part, `value` being as far as it got and
+ * `reason` saying why it stopped. `next_boot`: recorded on a shut-down sandbox
+ * for its next boot. `offline`: a shut-down sandbox's disk resized now.
+ * `refused`: not applied, and `reason` says why. `unchanged`: it already had
+ * that value.
  */
-export type ResourceChange = "unchanged" | "live" | "next_boot" | "offline" | "refused" | "unknown";
+export type ResourceChange =
+  | "unchanged"
+  | "live"
+  | "partial"
+  | "next_boot"
+  | "offline"
+  | "refused"
+  | "unknown";
 
 /** What became of one field of {@link Sandbox.updateResources}. */
 export interface ResourceOutcome {
   change: ResourceChange;
   previous: number;
-  /** What the sandbox has now: the value asked for, or `previous` when refused. */
+  /**
+   * What the sandbox has now: the value asked for, `previous` when refused,
+   * or as far as a partial change got.
+   */
   value: number;
   reason: string;
 }

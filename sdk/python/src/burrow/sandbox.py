@@ -411,6 +411,12 @@ class Sandbox:
         return self._info.policy.resources.memory_mib
 
     @property
+    def max_memory_mib(self) -> int:
+        """How far `update_resources` can grow the memory while the sandbox
+        runs."""
+        return self._info.policy.resources.max_memory_mib
+
+    @property
     def disk_mib(self) -> int:
         """The root disk's size, as of the last call that returned the sandbox
         record."""
@@ -925,21 +931,24 @@ class Sandbox:
         omitted field is left as it is.
 
         A running sandbox takes what its hypervisor can hotplug: a bigger disk
-        under Firecracker and Cloud Hypervisor, whose guest grows its
-        filesystem at once, and vCPUs under Cloud Hypervisor on x86_64. A
+        and memory under Firecracker and Cloud Hypervisor, and vCPUs under
+        Cloud Hypervisor on x86_64. Memory moves between what the sandbox booted
+        with and its `max_memory_mib`; more is admitted against the node's
+        memory like a create. A guest unplugs only memory it can empty, so a
+        shrink can come back "partial", its `value` being where it stopped. A
         stopped one (`stop`) takes everything: vCPUs and memory on its next
         start, and its disk at once, shrunk by a helper VM that checks the
         filesystem first. A suspended sandbox takes none of it. The host
         limits (`cpus`, `cpu_shares`, `cpuset_cpus`, `blkio_weight`) move live
         on a running sandbox and otherwise when it next runs; 0, or an empty
-        `cpuset_cpus`, clears one. What cannot be applied is
-        reported as "refused" with the reason rather than raised, so check
-        each field you asked for.
+        `cpuset_cpus`, clears one. What cannot be applied is reported as
+        "refused" with the reason rather than raised, so check each field you
+        asked for.
 
         ```python
-        updated = sandbox.update_resources(vcpus=2, disk_mib=20 * 1024)
-        if updated.vcpus.change == "refused":
-            print(updated.vcpus.reason)
+        updated = sandbox.update_resources(memory_mib=3 * 1024)
+        if updated.memory_mib.change != "live":
+            print(updated.memory_mib.value, updated.memory_mib.reason)
         ```
         """
         for name, field, value in (

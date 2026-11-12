@@ -85,6 +85,42 @@ def test_host_limits_go_out_with_dockers_names_and_come_back_as_one_outcome(
     )
 
 
+def test_memory_grows_live_and_a_shrink_reports_where_it_stopped(transport, sandbox):
+    answering(
+        transport,
+        api_pb2.UpdateResourcesResponse(
+            sandbox=common_pb2.Sandbox(
+                id="sbx_test",
+                policy=common_pb2.Policy(
+                    resources=common_pb2.ResourcePolicy(
+                        mem_mib=3072, max_mem_mib=16384, boot_mem_mib=1024
+                    )
+                ),
+            ),
+            mem_mib=api_pb2.ResourceOutcome(
+                change=api_pb2.RESOURCE_CHANGE_PARTIAL,
+                previous=8192,
+                value=3072,
+                reason="pages it could not move",
+            ),
+        ),
+    )
+    updated = sandbox.update_resources(memory_mib=1024)
+    assert updated.memory_mib == ResourceOutcome(
+        change="partial", previous=8192, value=3072, reason="pages it could not move"
+    )
+    assert (sandbox.memory_mib, sandbox.max_memory_mib) == (3072, 16384)
+
+
+def test_a_growth_limit_goes_out_with_a_create_policy():
+    from burrow import ResourcePolicy
+    from burrow._policy import from_resources, to_resources
+
+    raw = to_resources(ResourcePolicy(memory_mib=1024, max_memory_mib=16384, boot_memory_mib=9))
+    assert (raw.mem_mib, raw.max_mem_mib, raw.boot_mem_mib) == (1024, 16384, 0)
+    assert from_resources(raw).max_memory_mib == 16384
+
+
 def test_a_field_not_asked_for_is_absent_on_the_wire_and_in_the_answer(transport, sandbox):
     calls = answering(
         transport,

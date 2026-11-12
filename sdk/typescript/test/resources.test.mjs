@@ -83,6 +83,46 @@ test("host limits go out with Docker's names and come back as one outcome", asyn
   assert.equal(resources.blkioWeight, 500);
 });
 
+test("memory grows live, and a shrink says where it stopped", async () => {
+  const { sandbox } = sandboxAnswering({
+    sandbox: {
+      id: "sbx_test",
+      state: "SANDBOX_STATE_RUNNING",
+      policy: { resources: { memMib: 3072, maxMemMib: 16384, bootMemMib: 1024 } },
+    },
+    memMib: {
+      change: "RESOURCE_CHANGE_PARTIAL",
+      previous: 8192,
+      value: 3072,
+      reason: "pages it could not move",
+    },
+  });
+  const updated = await sandbox.updateResources({ memoryMib: 1024 });
+  assert.deepEqual(updated.memoryMib, {
+    change: "partial",
+    previous: 8192,
+    value: 3072,
+    reason: "pages it could not move",
+  });
+  assert.equal(sandbox.memoryMib, 3072);
+  assert.equal(sandbox.maxMemoryMib, 16384);
+  assert.equal(sandbox.policy.resources.bootMemoryMib, 1024);
+});
+
+test("a growth limit goes out with a create policy", async () => {
+  const { toResourcePolicy } = await import("../dist/policy.js");
+  assert.deepEqual(toResourcePolicy({ memoryMib: 1024, maxMemoryMib: 16384 }), {
+    vcpus: 0,
+    memMib: 1024,
+    diskMib: 0,
+    cpus: 0,
+    cpuShares: 0,
+    cpusetCpus: "",
+    blkioWeight: 0,
+    maxMemMib: 16384,
+  });
+});
+
 test("a field not asked for has no outcome", async () => {
   const { sandbox } = sandboxAnswering({
     diskMib: { change: "RESOURCE_CHANGE_LIVE", previous: 1024, value: 2048 },

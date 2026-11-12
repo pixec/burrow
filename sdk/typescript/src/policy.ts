@@ -429,6 +429,7 @@ export function toResourcePolicy(options: ResourceOptions = {}): any {
     cpuShares: options.cpuShares ?? 0,
     cpusetCpus: options.cpusetCpus ?? "",
     blkioWeight: options.blkioWeight ?? 0,
+    maxMemMib: options.maxMemoryMib ?? 0,
   };
 }
 
@@ -441,6 +442,8 @@ export function fromResourcePolicy(raw: any): ResourcePolicy {
     cpuShares: Number(raw?.cpuShares ?? 0),
     cpusetCpus: raw?.cpusetCpus ?? "",
     blkioWeight: Number(raw?.blkioWeight ?? 0),
+    maxMemoryMib: Number(raw?.maxMemMib ?? 0),
+    bootMemoryMib: Number(raw?.bootMemMib ?? 0),
   };
 }
 

@@ -25,6 +25,7 @@ class ResourcePolicy:
     confine the VMM's cgroup; `vcpus` stays the CPUs the guest sees."""
 
     vcpus: int = 0
+    # What the guest has now: what it booted with plus what was plugged since.
     memory_mib: int = 0
     disk_mib: int = 0
     # Host CPU the sandbox may use across its vCPUs, e.g. 0.5, as
@@ -38,6 +39,13 @@ class ResourcePolicy:
     cpuset_cpus: str = ""
     # Relative disk IO weight, as `--blkio-weight` (10-1000). 0 is unset.
     blkio_weight: int = 0
+    # How far `memory_mib` can grow while the sandbox runs. 0 is the node's
+    # default, 16 times `memory_mib` within the node's limit; set to
+    # `memory_mib`, the sandbox gets no room to grow.
+    max_memory_mib: int = 0
+    # Set by the node: what the sandbox's VM booted with, which a running
+    # guest's memory cannot shrink below. Ignored on a create.
+    boot_memory_mib: int = 0
 
 
 @dataclass
@@ -278,14 +286,15 @@ class IpPool:
 class ResourceOutcome:
     """What became of one field of `Sandbox.update_resources`."""
 
-    # "live": applied to the running guest. "next_boot": recorded on a
-    # shut-down sandbox for its next boot. "offline": a shut-down sandbox's
-    # disk resized now. "refused": not applied, and `reason` says why.
-    # "unchanged": it already had that value.
+    # "live": applied to the running guest. "partial": applied to the running
+    # guest in part, `value` being as far as it got and `reason` saying why it
+    # stopped. "next_boot": recorded on a shut-down sandbox for its next boot.
+    # "offline": a shut-down sandbox's disk resized now. "refused": not
+    # applied, and `reason` says why. "unchanged": it already had that value.
     change: str
     previous: int
-    # What the sandbox has now: the value asked for, or `previous` when
-    # refused.
+    # What the sandbox has now: the value asked for, `previous` when refused,
+    # or as far as a partial change got.
     value: int
     reason: str = ""
 

@@ -348,6 +348,7 @@ def to_resources(resources: ResourcePolicy) -> common_pb2.ResourcePolicy:
         cpu_shares=resources.cpu_shares,
         cpuset_cpus=resources.cpuset_cpus,
         blkio_weight=resources.blkio_weight,
+        max_mem_mib=resources.max_memory_mib,
     )
 
 
@@ -360,6 +361,8 @@ def from_resources(raw: common_pb2.ResourcePolicy) -> ResourcePolicy:
         cpu_shares=raw.cpu_shares,
         cpuset_cpus=raw.cpuset_cpus,
         blkio_weight=raw.blkio_weight,
+        max_memory_mib=raw.max_mem_mib,
+        boot_memory_mib=raw.boot_mem_mib,
     )
 
 

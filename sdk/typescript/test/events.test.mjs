@@ -91,7 +91,7 @@ test("a snapshot surfaces where it can be restored", () => {
       arch: "aarch64",
       hypervisor: "firecracker",
       hypervisorVersion: "1.13.1",
-      resources: { vcpus: 2, memMib: 1024, diskMib: 2048 },
+      resources: { vcpus: 2, memMib: 3072, diskMib: 2048, maxMemMib: 16384, bootMemMib: 1024 },
       createdAtUnixMs: 1_790_000_000_000,
     },
   );
@@ -100,12 +100,14 @@ test("a snapshot surfaces where it can be restored", () => {
   assert.equal(snapshot.hypervisorVersion, "1.13.1");
   assert.deepEqual(snapshot.resources, {
     vcpus: 2,
-    memoryMib: 1024,
+    memoryMib: 3072,
     diskMib: 2048,
     cpus: 0,
     cpuShares: 0,
     cpusetCpus: "",
     blkioWeight: 0,
+    maxMemoryMib: 16384,
+    bootMemoryMib: 1024,
   });
   assert.equal(snapshot.createdAt.getTime(), 1_790_000_000_000);
   assert.equal(snapshot.expiresAt, null);
