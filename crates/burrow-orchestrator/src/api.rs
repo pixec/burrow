@@ -614,15 +614,7 @@ impl ApiService {
         // has to give that back, or a run of failed creates makes a healthy
         // node look full. Nothing to give back on the pinned path.
         let placed = charged.then(|| self.place_guard(&node_id, &want));
-        let endpoint = self
-            .0
-            .nodes
-            .endpoint(&node_id)
-            .ok_or_else(|| Status::unavailable(format!("node {node_id} went away")))?;
-
-        let mut client = connect_node(endpoint, self.0.node_token.as_deref())
-            .await
-            .map_err(|err| Status::unavailable(format!("cannot reach node {node_id}: {err}")))?;
+        let mut client = self.node_client(&node_id).await?;
         self.bring_volumes(
             &node_id,
             req.policy
@@ -864,13 +856,7 @@ impl ApiService {
         }
 
         let manifest = {
-            let endpoint =
-                self.0.nodes.endpoint(&source_id).ok_or_else(|| {
-                    Status::unavailable(format!("node {source_id} is unreachable"))
-                })?;
-            let mut source = connect_node(endpoint, self.0.node_token.as_deref())
-                .await
-                .map_err(|err| Status::unavailable(format!("node {source_id}: {err}")))?;
+            let mut source = self.node_client(&source_id).await?;
             source
                 .get_template_manifest(nodepb::TemplateManifestRequest {
                     name: template.to_string(),
@@ -880,14 +866,7 @@ impl ApiService {
                 .into_inner()
         };
 
-        let endpoint = self
-            .0
-            .nodes
-            .endpoint(target)
-            .ok_or_else(|| Status::unavailable(format!("node {target} is unreachable")))?;
-        let mut client = connect_node(endpoint, self.0.node_token.as_deref())
-            .await
-            .map_err(|err| Status::unavailable(format!("node {target}: {err}")))?;
+        let mut client = self.node_client(target).await?;
         let result = client
             .pull_template(nodepb::PullTemplateRequest {
                 source_address,
@@ -1045,14 +1024,7 @@ impl ApiService {
         let Some((source_id, _)) = self.0.nodes.source_for_template(template) else {
             return Ok(String::new());
         };
-        let endpoint = self
-            .0
-            .nodes
-            .endpoint(&source_id)
-            .ok_or_else(|| Status::unavailable(format!("node {source_id} is unreachable")))?;
-        let mut client = connect_node(endpoint, self.0.node_token.as_deref())
-            .await
-            .map_err(|err| Status::unavailable(format!("node {source_id}: {err}")))?;
+        let mut client = self.node_client(&source_id).await?;
         let manifest = client
             .get_template_manifest(nodepb::TemplateManifestRequest {
                 name: template.to_string(),
@@ -2061,7 +2033,10 @@ impl Burrow for ApiService {
                     .join(", ")
             )));
         }
-        let mut client = connect_node(endpoint, self.0.node_token.as_deref())
+        let mut client = self
+            .0
+            .channels
+            .get(&endpoint, self.0.node_token.as_deref())
             .await
             .map_err(|err| Status::unavailable(format!("cannot reach node: {err}")))?;
         let mut resp = client.set_drain(req.clone()).await?.into_inner();
@@ -3227,14 +3202,7 @@ impl Burrow for ApiService {
             .nodes
             .place_for(&build_placement(req.get_ref()))
             .map_err(placement_status)?;
-        let endpoint = self
-            .0
-            .nodes
-            .endpoint(&node_id)
-            .ok_or_else(|| Status::unavailable(format!("node {node_id} went away")))?;
-        let mut client = connect_node(endpoint, self.0.node_token.as_deref())
-            .await
-            .map_err(|err| Status::unavailable(format!("cannot reach node {node_id}: {err}")))?;
+        let mut client = self.node_client(&node_id).await?;
 
         let stream = client.build_template(req.into_inner()).await?.into_inner();
         Ok(Response::new(Box::pin(stream)))
