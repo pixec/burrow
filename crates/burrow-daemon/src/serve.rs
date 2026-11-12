@@ -716,10 +716,12 @@ async fn current_status(sandboxes: &SandboxManager, data_dir: &std::path::Path) 
 
     let mut templates = Vec::new();
     let mut kit_templates = Vec::new();
+    let mut template_hypervisors = std::collections::HashMap::new();
     for template in crate::template::bootable(data_dir).await {
         if template.is_kit {
             kit_templates.push(template.name.clone());
         }
+        template_hypervisors.insert(template.name.clone(), template.hypervisor);
         templates.push(template.name);
     }
     // sysinfo undercounts on macOS; see `macnode::available_memory`.
@@ -736,6 +738,7 @@ async fn current_status(sandboxes: &SandboxManager, data_dir: &std::path::Path) 
         warm_shapes: sandboxes.warm_shapes().await,
         templates,
         kit_templates,
+        template_hypervisors,
         is_draining: sandboxes.is_draining(),
         // Suspended sandboxes count: they hold their address, disks and
         // snapshot, and resuming must not find the node oversubscribed.

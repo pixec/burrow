@@ -66,10 +66,10 @@ impl Placement {
         cpu_charge_millis(self.vcpus, self.cpus)
     }
 
-    /// The host memory the sandbox may hold on `node`, which is what that node
-    /// is charged.
-    pub fn mem_charge_mib(&self, node: &NodeInfo) -> u64 {
-        mem_charge_mib(node, &self.hypervisor, self.mem_mib)
+    /// The host memory the sandbox may hold on a node, which is what that
+    /// node is charged.
+    pub fn mem_charge_mib(&self, info: &NodeInfo, status: &NodeStatus) -> u64 {
+        mem_charge_mib(info, status, &self.hypervisor, &self.template, self.mem_mib)
     }
 }
 
@@ -79,19 +79,46 @@ pub fn cpu_charge_millis(vcpus: u32, cpus: f64) -> u64 {
     burrow_common::cpu::charge_millis(vcpus, burrow_common::cpu::cap_millis(cpus))
 }
 
-/// The host memory a guest of `mem_mib` under `hypervisor` may hold on `node`:
-/// the cgroup ceiling the node puts on it, with the VMM overhead it reports.
-pub fn mem_charge_mib(node: &NodeInfo, hypervisor: &str, mem_mib: u64) -> u64 {
-    match burrow_common::hypervisor::Hypervisor::from_record(hypervisor) {
-        Some(hypervisor) if mem_mib > 0 => {
-            let overhead = node
-                .vmm_memory_overhead_mib
-                .get(hypervisor.as_str())
-                .copied()
-                .unwrap_or_else(|| hypervisor.default_vmm_overhead_mib());
-            u64::from(hypervisor.memory_ceiling_mib(mem_mib as u32, overhead))
-        }
-        _ => mem_mib,
+/// The host memory a guest of `mem_mib` may hold on a node: the cgroup
+/// ceiling the node puts on it, with the VMM overhead it reports. An empty
+/// `hypervisor` is the one the node runs `template` under, and a node that
+/// does not hold `template` is charged the costliest hypervisor it offers.
+pub fn mem_charge_mib(
+    info: &NodeInfo,
+    status: &NodeStatus,
+    hypervisor: &str,
+    template: &str,
+    mem_mib: u64,
+) -> u64 {
+    use burrow_common::hypervisor::Hypervisor;
+    if mem_mib == 0 {
+        return 0;
+    }
+    let ceiling = |hypervisor: Hypervisor| {
+        let overhead = info
+            .vmm_memory_overhead_mib
+            .get(hypervisor.as_str())
+            .copied()
+            .unwrap_or_else(|| hypervisor.default_vmm_overhead_mib());
+        u64::from(hypervisor.memory_ceiling_mib(mem_mib as u32, overhead))
+    };
+    let hypervisor = match hypervisor {
+        "" => status
+            .template_hypervisors
+            .get(template)
+            .map_or("", String::as_str),
+        named => named,
+    };
+    match hypervisor {
+        "" if info.hypervisors.is_empty() => ceiling(Hypervisor::Firecracker),
+        "" => info
+            .hypervisors
+            .iter()
+            .filter_map(|name| name.parse().ok())
+            .map(ceiling)
+            .max()
+            .unwrap_or(mem_mib),
+        named => named.parse().map_or(mem_mib, ceiling),
     }
 }
 
@@ -373,7 +400,7 @@ fn is_fit(entry: &NodeEntry, pending: &HashMap<String, Reserved>, want: &Placeme
     let cpu_ok =
         entry.info.total_vcpus == 0 || committed <= u64::from(entry.info.total_vcpus) * 1000;
     let free = entry.status.free_mem_mib.saturating_sub(held.mem_mib);
-    let mem_ok = free >= want.mem_charge_mib(&entry.info);
+    let mem_ok = free >= want.mem_charge_mib(&entry.info, &entry.status);
     cpu_ok && mem_ok && disk_fit(entry, held, want).is_ok()
 }
 
@@ -915,7 +942,7 @@ impl NodeRegistry {
                 cpus: cpus_text(want.cpu_charge_millis()),
                 mem_mib: candidates
                     .iter()
-                    .map(|e| want.mem_charge_mib(&e.info))
+                    .map(|e| want.mem_charge_mib(&e.info, &e.status))
                     .min()
                     .unwrap_or(want.mem_mib),
                 disk_mib: want.disk_bytes.div_ceil(burrow_common::disk::MIB),
@@ -939,7 +966,7 @@ impl NodeRegistry {
                     free_mem(e, &pending),
                 )
             })
-            .map(|e| (e.info.id.clone(), want.mem_charge_mib(&e.info)))
+            .map(|e| (e.info.id.clone(), want.mem_charge_mib(&e.info, &e.status)))
             .ok_or(PlacementError::NoHealthyNode)?;
         drop(pending);
 
@@ -961,10 +988,28 @@ impl NodeRegistry {
         entry.disk_bytes += want.disk_bytes;
     }
 
-    /// What `node_id` is charged for a guest of `mem_mib` under `hypervisor`.
-    pub fn mem_charge_mib(&self, node_id: &str, hypervisor: &str, mem_mib: u64) -> u64 {
-        let info = self.info(node_id).unwrap_or_default();
-        mem_charge_mib(&info, hypervisor, mem_mib)
+    /// What `node_id` is charged for a guest of `mem_mib` from `template`
+    /// under `hypervisor`, as [`mem_charge_mib`] reads them.
+    pub fn mem_charge_mib(
+        &self,
+        node_id: &str,
+        hypervisor: &str,
+        template: &str,
+        mem_mib: u64,
+    ) -> u64 {
+        let nodes = self.nodes.lock().unwrap();
+        match nodes.get(node_id) {
+            Some(entry) => {
+                mem_charge_mib(&entry.info, &entry.status, hypervisor, template, mem_mib)
+            }
+            None => mem_charge_mib(
+                &NodeInfo::default(),
+                &NodeStatus::default(),
+                hypervisor,
+                template,
+                mem_mib,
+            ),
+        }
     }
 
     /// Gives back capacity reserved for a placement that no longer exists.
@@ -2170,7 +2215,7 @@ mod tests {
             mem_mib: 512,
             ..Default::default()
         };
-        assert_eq!(registry.mem_charge_mib("only", "", 512), 512 + 64 + 4);
+        assert_eq!(registry.mem_charge_mib("only", "", "", 512), 512 + 64 + 4);
         assert_eq!(registry.place_for(&want).unwrap(), "only");
         registry.release("only", want.cpu_charge_millis(), 580, 0);
 
@@ -2184,8 +2229,49 @@ mod tests {
                 ..Default::default()
             }),
         );
-        assert_eq!(registry.mem_charge_mib("only", "", 512), 512 + 128 + 4);
+        assert_eq!(registry.mem_charge_mib("only", "", "", 512), 512 + 128 + 4);
         assert!(registry.place_for(&want).is_err());
+    }
+
+    /// A create that names no hypervisor, as every create does on a fleet
+    /// offering the same ones, is charged the ceiling of the hypervisor the
+    /// node runs its template under, and a node without the template the
+    /// costliest it offers.
+    #[test]
+    fn a_template_is_charged_the_ceiling_of_its_own_hypervisor() {
+        use burrow_common::hypervisor::Hypervisor;
+        let both = |id: &str| NodeInfo {
+            id: id.into(),
+            address: format!("{id}:7071"),
+            hypervisors: vec!["firecracker".into(), "cloud-hypervisor".into()],
+            ..Default::default()
+        };
+        let holding = NodeStatus {
+            template_hypervisors: [("alpine-ch".to_string(), "cloud-hypervisor".to_string())]
+                .into(),
+            ..status(&["alpine-ch"], &[], 64_000)
+        };
+        let registry = registry(&[("holder", holding.clone())]);
+        registry.heartbeat("holder", holding, Some(both("holder")));
+        let ceiling = |hypervisor: Hypervisor| {
+            u64::from(hypervisor.memory_ceiling_mib(512, hypervisor.default_vmm_overhead_mib()))
+        };
+        let want = Placement {
+            template: "alpine-ch".into(),
+            vcpus: 1,
+            mem_mib: 512,
+            ..Default::default()
+        };
+        assert_eq!(
+            registry.mem_charge_mib("holder", "", "alpine-ch", 512),
+            ceiling(Hypervisor::CloudHypervisor)
+        );
+        assert_eq!(registry.place_for(&want).unwrap(), "holder");
+        let info = both("other");
+        assert_eq!(
+            want.mem_charge_mib(&info, &status(&[], &[], 64_000)),
+            ceiling(Hypervisor::CloudHypervisor).max(ceiling(Hypervisor::Firecracker))
+        );
     }
 
     /// A sandbox capped below its vCPUs is charged its cap: four 2-vCPU
@@ -2257,7 +2343,8 @@ mod tests {
         registry.place_for(&want).unwrap();
         assert!(registry.place_for(&want).is_err());
 
-        let charged = registry.mem_charge_mib("only", &want.hypervisor, want.mem_mib);
+        let charged =
+            registry.mem_charge_mib("only", &want.hypervisor, &want.template, want.mem_mib);
         registry.release("only", want.cpu_charge_millis(), charged, want.disk_bytes);
         registry
             .place_for(&want)
@@ -2379,7 +2466,7 @@ mod tests {
         registry.place_for(&want).unwrap();
         registry.place_for(&want).unwrap();
         assert!(registry.place_for(&want).is_err());
-        let charged = registry.mem_charge_mib("a", &want.hypervisor, want.mem_mib);
+        let charged = registry.mem_charge_mib("a", &want.hypervisor, &want.template, want.mem_mib);
         registry.release("a", want.cpu_charge_millis(), charged, want.disk_bytes);
         assert_eq!(registry.place_for(&want).unwrap(), "a");
     }

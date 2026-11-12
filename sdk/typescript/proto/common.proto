@@ -869,6 +869,9 @@ message NodeStatus {
   // thousandths of a CPU: each sandbox's `cpus` where set, else its vcpus.
   // Free memory alone hides a node that is memory-rich and cpu-saturated.
   uint64 committed_cpu_millis = 17;
+  // The hypervisor each of `templates` runs under here, so placement charges
+  // a create the memory ceiling of the VMM it will get.
+  map<string, string> template_hypervisors = 18;
 }
 
 // A warm snapshot of one template at one machine shape. A create of that

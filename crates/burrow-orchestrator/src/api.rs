@@ -263,10 +263,12 @@ impl ApiService {
                 return Ok(node_id);
             };
             let cpu_millis = want.cpu_charge_millis();
-            let mem_mib = self
-                .0
-                .nodes
-                .mem_charge_mib(&node_id, &want.hypervisor, want.mem_mib);
+            let mem_mib = self.0.nodes.mem_charge_mib(
+                &node_id,
+                &want.hypervisor,
+                &want.template,
+                want.mem_mib,
+            );
             match store.reserve_capacity(&node_id, cpu_millis, mem_mib).await {
                 Ok(true) => return Ok(node_id),
                 Ok(false) => {
@@ -291,10 +293,12 @@ impl ApiService {
             store: self.0.store.clone(),
             node_id: node_id.to_string(),
             cpu_millis: want.cpu_charge_millis(),
-            mem_mib: self
-                .0
-                .nodes
-                .mem_charge_mib(node_id, &want.hypervisor, want.mem_mib),
+            mem_mib: self.0.nodes.mem_charge_mib(
+                node_id,
+                &want.hypervisor,
+                &want.template,
+                want.mem_mib,
+            ),
             disk_bytes: want.disk_bytes,
             is_kept: false,
         }
@@ -1439,6 +1443,7 @@ impl ApiService {
         let mem_mib = self.0.nodes.mem_charge_mib(
             &sandbox.node_id,
             &sandbox.hypervisor,
+            &sandbox.template,
             match resources.mem_mib {
                 0 => 512,
                 mem => mem as u64,
