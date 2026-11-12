@@ -632,7 +632,7 @@ impl ApiService {
             })
             .await?
             .into_inner();
-        self.0.sandboxes.insert(sandbox);
+        self.0.sandboxes.update(sandbox);
         self.save_ip(&row, &ip).await?;
         tracing::info!(
             address = ip.address,
@@ -667,7 +667,7 @@ impl ApiService {
             Ok(node) if node.is_empty() => {
                 if let Some(mut sandbox) = self.0.sandboxes.get(&ip.sandbox_id) {
                     sandbox.public_ips.retain(|held| held.address != ip.address);
-                    self.0.sandboxes.insert(sandbox);
+                    self.0.sandboxes.update(sandbox);
                     self.write_through().await;
                 }
             }
@@ -681,7 +681,7 @@ impl ApiService {
                     })
                     .await?
                     .into_inner();
-                self.0.sandboxes.insert(sandbox);
+                self.0.sandboxes.update(sandbox);
             }
             // A sandbox that no longer exists holds nothing to take back.
             Err(err) if err.code() == tonic::Code::NotFound => {}

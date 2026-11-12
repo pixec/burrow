@@ -10,14 +10,16 @@ use std::time::{Duration, Instant};
 
 use burrow_proto::common::v1 as common;
 
+use crate::persist::{Change, Guard};
+
 /// Placements are stored as encoded protobuf, so the record on disk is the
 /// same shape as the one on the wire and cannot drift from it.
-fn encode(sandbox: &common::Sandbox) -> Vec<u8> {
+pub(crate) fn encode(sandbox: &common::Sandbox) -> Vec<u8> {
     use prost::Message as _;
     sandbox.encode_to_vec()
 }
 
-fn decode(bytes: &[u8]) -> Option<common::Sandbox> {
+pub(crate) fn decode(bytes: &[u8]) -> Option<common::Sandbox> {
     use prost::Message as _;
     common::Sandbox::decode(bytes).ok()
 }
@@ -54,7 +56,7 @@ pub fn is_movable(sandbox: &common::Sandbox) -> bool {
 /// brings back: stopped on a disk checkpoint, which a start boots, or
 /// suspended on a memory one, which a resume restores. The reason says how
 /// old the checkpoint is, and so what was lost.
-fn lost_to_checkpoint(sandbox: &mut common::Sandbox, node_id: &str) {
+pub(crate) fn lost_to_checkpoint(sandbox: &mut common::Sandbox, node_id: &str) {
     if sandbox.checkpoint_at_unix_ms == 0 || sandbox.state == common::SandboxState::Suspended as i32
     {
         return;
@@ -477,8 +479,30 @@ impl SandboxRegistry {
     /// and these methods are synchronous, so holding one lock across the other
     /// is a short critical section, not a deadlock.
     pub fn insert(&self, sandbox: common::Sandbox) {
+        let guard = Guard::Fresh(sandbox.node_id.clone());
+        self.record(sandbox, guard);
+    }
+
+    /// Takes the record the node it names answered with, unless the store
+    /// has the sandbox elsewhere or gone by then.
+    pub fn update(&self, sandbox: common::Sandbox) {
+        let guard = Guard::On(sandbox.node_id.clone());
+        self.record(sandbox, guard);
+    }
+
+    /// Takes the record of a sandbox its node has just claimed in the object
+    /// store, which settles who holds it whatever the row said.
+    pub fn adopted(&self, sandbox: common::Sandbox) {
+        self.record(sandbox, Guard::Any);
+    }
+
+    fn record(&self, sandbox: common::Sandbox, guard: Guard) {
         let mut sandboxes = self.sandboxes.lock().unwrap();
-        self.persist(&sandbox);
+        self.persist(
+            &sandbox.id,
+            guard,
+            Change::Replace(Box::new(sandbox.clone())),
+        );
         self.settling
             .lock()
             .unwrap()
@@ -486,18 +510,16 @@ impl SandboxRegistry {
         sandboxes.insert(sandbox.id.clone(), sandbox);
     }
 
-    fn persist(&self, sandbox: &common::Sandbox) {
+    fn persist(&self, id: &str, guard: Guard, change: Change) {
         self.usage_written
             .lock()
             .unwrap()
-            .insert(sandbox.id.clone(), Instant::now());
-        self.write(crate::persist::Op::PutPlacement(
-            burrow_store::PlacementRow {
-                id: sandbox.id.clone(),
-                node_id: sandbox.node_id.clone(),
-                record: encode(sandbox),
-            },
-        ));
+            .insert(id.to_string(), Instant::now());
+        self.write(crate::persist::Op::Update {
+            id: id.to_string(),
+            guard,
+            change,
+        });
     }
 
     /// Ages every settling entry out, as if `SETTLING_GRACE` had passed.
@@ -510,14 +532,8 @@ impl SandboxRegistry {
     }
 
     /// Drops a sandbox's row and the claims on its id and name, which is
-    /// what frees the name for the next create on any replica.
-    fn forget(&self, id: &str) {
-        self.usage_written.lock().unwrap().remove(id);
-        self.write(crate::persist::Op::DeletePlacement(id.to_string()));
-        self.write(crate::persist::Op::ReleaseClaims(id.to_string()));
-    }
-
-    /// [`forget`](Self::forget) for a sandbox `node_id` stopped reporting,
+    /// what frees the name for the next create on any replica, for a sandbox
+    /// `node_id` let go of (`""` for one no node held).
     /// leaving the row and the claims alone if the store has it elsewhere.
     ///
     /// The report says only that the node let go. Another replica may have
@@ -553,7 +569,9 @@ impl SandboxRegistry {
     pub fn remove(&self, id: &str) -> Option<common::Sandbox> {
         let mut sandboxes = self.sandboxes.lock().unwrap();
         let removed = sandboxes.remove(id);
-        self.forget(id);
+        if let Some(sandbox) = &removed {
+            self.forget_on(id, &sandbox.node_id);
+        }
         removed
     }
 
@@ -567,7 +585,9 @@ impl SandboxRegistry {
     pub fn forget_deleted(&self, id: &str) -> Option<common::Sandbox> {
         let mut sandboxes = self.sandboxes.lock().unwrap();
         let removed = sandboxes.remove(id);
-        self.forget(id);
+        if let Some(sandbox) = &removed {
+            self.forget_on(id, &sandbox.node_id);
+        }
 
         let node_id = removed
             .as_ref()
@@ -645,9 +665,6 @@ impl SandboxRegistry {
         info: &common::NodeInfo,
     ) -> (Vec<common::Sandbox>, Vec<common::Sandbox>) {
         let mut sandboxes = self.sandboxes.lock().unwrap();
-        self.write(crate::persist::Op::DeletePlacementsForNode(
-            node_id.to_string(),
-        ));
         let mut dropped = Vec::new();
         let mut unplaced = Vec::new();
         sandboxes.retain(|_, sandbox| {
@@ -668,11 +685,20 @@ impl SandboxRegistry {
             dropped.push(sandbox.clone());
             false
         });
-        for sandbox in &unplaced {
-            self.persist(sandbox);
-        }
-        for sandbox in &dropped {
-            self.write(crate::persist::Op::ReleaseClaims(sandbox.id.clone()));
+        // Decided again in the store from the row as it stands, which may
+        // have moved on since this replica cached it.
+        for sandbox in unplaced.iter().chain(&dropped) {
+            self.write(crate::persist::Op::WriteOff {
+                sandbox_id: sandbox.id.clone(),
+                node_id: node_id.to_string(),
+                arch: info.arch.clone(),
+                hypervisor_version: crate::registry::version_of(info, &sandbox.hypervisor)
+                    .to_string(),
+            });
+            self.write(crate::persist::Op::ReleaseClaimsUnlessMoved {
+                sandbox_id: sandbox.id.clone(),
+                node_id: node_id.to_string(),
+            });
         }
         (dropped, unplaced)
     }
@@ -715,11 +741,18 @@ impl SandboxRegistry {
     /// and not yet adopted it anywhere else.
     pub fn unplace(&self, sandbox: common::Sandbox) -> common::Sandbox {
         let mut sandboxes = self.sandboxes.lock().unwrap();
+        self.persist(
+            &sandbox.id,
+            Guard::On(sandbox.node_id.clone()),
+            Change::Unplace {
+                arch: sandbox.arch.clone(),
+                hypervisor_version: sandbox.hypervisor_version.clone(),
+            },
+        );
         let sandbox = common::Sandbox {
             node_id: String::new(),
             ..sandbox
         };
-        self.persist(&sandbox);
         sandboxes.insert(sandbox.id.clone(), sandbox.clone());
         sandbox
     }
@@ -814,7 +847,11 @@ impl SandboxRegistry {
                     sandbox_id: sandbox.id.clone(),
                 });
             }
-            self.persist(&sandbox);
+            self.persist(
+                &sandbox.id,
+                Guard::Adoptable(node_id.to_string()),
+                Change::Replace(Box::new(sandbox.clone())),
+            );
             sandboxes.insert(sandbox.id.clone(), sandbox);
             out.adopted += 1;
         }
@@ -1015,8 +1052,12 @@ impl SandboxRegistry {
 
         // Still under the lock: a delete racing this call must not have its
         // row rewritten by a snapshot taken before it ran.
-        for sandbox in &changed {
-            self.persist(sandbox);
+        for sandbox in changed {
+            self.persist(
+                &sandbox.id.clone(),
+                Guard::On(node_id.to_string()),
+                Change::Restate(Box::new(sandbox)),
+            );
         }
         for id in &gone {
             self.forget_on(id, node_id);
@@ -1276,6 +1317,7 @@ mod tests {
             id: id.into(),
             node_id: "node1".into(),
             record: encode(&sandbox(id, "node1", common::SandboxState::Running)),
+            version: 0,
         };
         assert!(registry.reload(0, vec![row("a"), row("b")], Vec::new()));
         let applied = registry.apply_states("node1", &[report("b", common::SandboxState::Running)]);
@@ -1851,10 +1893,9 @@ mod store_tests {
         let registry = SandboxRegistry::with_store(Arc::clone(&store)).await;
         registry.insert(sandbox("sbx_a", "node1"));
 
-        // Removed behind the registry's back, so a needless rewrite is
-        // visible: only a persist would put the row back.
         registry.writer().unwrap().flush().await;
-        store.delete_placement("sbx_a").await.unwrap();
+        let version = || async { store.get_placement("sbx_a").await.unwrap().unwrap().version };
+        let before = version().await;
         registry.apply_states(
             "node1",
             &[SandboxStateReport {
@@ -1864,7 +1905,7 @@ mod store_tests {
             }],
         );
         registry.writer().unwrap().flush().await;
-        assert!(store.list_placements().await.unwrap().is_empty());
+        assert_eq!(version().await, before);
 
         // A state that did move is still written.
         registry.apply_states(
@@ -1876,7 +1917,7 @@ mod store_tests {
             }],
         );
         registry.writer().unwrap().flush().await;
-        assert_eq!(store.list_placements().await.unwrap().len(), 1);
+        assert_eq!(version().await, before + 1);
         let _ = std::fs::remove_file(&path);
     }
 
@@ -2070,6 +2111,186 @@ mod store_tests {
         other.reconcile_node("node1", Vec::new());
         other.writer().unwrap().flush().await;
         assert!(store.get_placement("sbx_new").await.unwrap().is_some());
+        let _ = std::fs::remove_file(&path);
+    }
+
+    async fn replicas() -> (
+        Arc<burrow_store::Store>,
+        std::path::PathBuf,
+        SandboxRegistry,
+        SandboxRegistry,
+    ) {
+        let (store, path) = store().await;
+        let a = SandboxRegistry::with_store(Arc::clone(&store)).await;
+        let b = SandboxRegistry::with_store(Arc::clone(&store)).await;
+        (store, path, a, b)
+    }
+
+    async fn settle(registries: &[&SandboxRegistry]) {
+        for registry in registries {
+            registry.writer().unwrap().flush().await;
+        }
+    }
+
+    fn suspended(id: &str) -> burrow_proto::node::v1::SandboxStateReport {
+        burrow_proto::node::v1::SandboxStateReport {
+            sandbox_id: id.into(),
+            state: common::SandboxState::Suspended as i32,
+            is_durable: true,
+            ..Default::default()
+        }
+    }
+
+    /// A move pauses the sandbox on its source before letting go, and that
+    /// node's heartbeat to a replica the move did not run through restated
+    /// the sandbox there, writing the source back over the move.
+    #[tokio::test]
+    async fn a_stale_heartbeat_does_not_put_a_moved_sandbox_back() {
+        let (store, path, mover, stale) = replicas().await;
+        mover.insert(sandbox("sbx_a", "node1"));
+        mover.insert(sandbox("sbx_b", "node1"));
+        settle(&[&mover]).await;
+        stale.refresh("sbx_a").await.unwrap();
+        stale.refresh("sbx_b").await.unwrap();
+
+        mover.unplace(sandbox("sbx_a", "node1"));
+        mover.adopted(sandbox("sbx_a", "node2"));
+        settle(&[&mover]).await;
+        stale.apply_states("node1", &[suspended("sbx_a"), suspended("sbx_b")]);
+        settle(&[&stale]).await;
+
+        let row = store.get_placement("sbx_a").await.unwrap().unwrap();
+        assert_eq!(row.node_id, "node2");
+        let b = decode(&store.get_placement("sbx_b").await.unwrap().unwrap().record).unwrap();
+        assert_eq!(b.state, common::SandboxState::Suspended as i32);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// A heartbeat restate from a replica with an older copy wrote that whole
+    /// copy back, undoing a change another replica had just made.
+    #[tokio::test]
+    async fn a_stale_heartbeat_keeps_what_another_replica_changed() {
+        let (store, path, writer, stale) = replicas().await;
+        writer.insert(sandbox("sbx_a", "node1"));
+        settle(&[&writer]).await;
+        stale.refresh("sbx_a").await.unwrap();
+
+        let mut tagged = sandbox("sbx_a", "node1");
+        tagged.tags.insert("team".into(), "infra".into());
+        writer.update(tagged);
+        settle(&[&writer]).await;
+        stale.apply_states("node1", &[suspended("sbx_a")]);
+        settle(&[&stale]).await;
+
+        let row = decode(&store.get_placement("sbx_a").await.unwrap().unwrap().record).unwrap();
+        assert_eq!(row.tags.get("team").map(String::as_str), Some("infra"));
+        assert_eq!(row.state, common::SandboxState::Suspended as i32);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// A call that finished on a node after another replica deleted the
+    /// sandbox wrote its row back.
+    #[tokio::test]
+    async fn a_late_answer_does_not_bring_back_a_deleted_sandbox() {
+        let (store, path, deleter, late) = replicas().await;
+        deleter.insert(sandbox("sbx_a", "node1"));
+        settle(&[&deleter]).await;
+        late.refresh("sbx_a").await.unwrap();
+
+        deleter.remove("sbx_a");
+        settle(&[&deleter]).await;
+        late.update(sandbox("sbx_a", "node1"));
+        settle(&[&late]).await;
+        assert!(store.get_placement("sbx_a").await.unwrap().is_none());
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// A listing the source node gave before a move let go of the sandbox
+    /// took it back from the move while it was between nodes.
+    #[tokio::test]
+    async fn a_stale_listing_does_not_take_back_a_sandbox_being_moved() {
+        let (store, path, mover, stale) = replicas().await;
+        mover.insert(sandbox("sbx_a", "node1"));
+        settle(&[&mover]).await;
+        stale.refresh("sbx_a").await.unwrap();
+
+        let _adoption = mover.claim_adoption("sbx_a").await.unwrap();
+        mover.unplace(sandbox("sbx_a", "node1"));
+        settle(&[&mover]).await;
+        stale.reconcile_node("node1", vec![sandbox("sbx_a", "node1")]);
+        settle(&[&stale]).await;
+
+        let row = store.get_placement("sbx_a").await.unwrap().unwrap();
+        assert!(row.node_id.is_empty(), "{}", row.node_id);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// The leader writes a node off from its own copy of what the node held,
+    /// which may predate a suspend to the object store or a move.
+    #[tokio::test]
+    async fn a_write_off_acts_on_the_stored_row() {
+        let (store, path, other, leader) = replicas().await;
+        leader.insert(sandbox("sbx_kept", "node1"));
+        leader.insert(sandbox("sbx_moved", "node1"));
+        settle(&[&leader]).await;
+        other.refresh("sbx_kept").await.unwrap();
+
+        other.update(common::Sandbox {
+            state: common::SandboxState::Suspended as i32,
+            is_durable: true,
+            ..sandbox("sbx_kept", "node1")
+        });
+        other.adopted(sandbox("sbx_moved", "node2"));
+        settle(&[&other]).await;
+        leader.forget_node("node1", &common::NodeInfo::default());
+        settle(&[&leader]).await;
+
+        let kept = store
+            .get_placement("sbx_kept")
+            .await
+            .unwrap()
+            .expect("kept");
+        assert!(kept.node_id.is_empty(), "{}", kept.node_id);
+        let moved = store
+            .get_placement("sbx_moved")
+            .await
+            .unwrap()
+            .expect("moved");
+        assert_eq!(moved.node_id, "node2");
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// A running sandbox the leader last saw without a checkpoint, which has
+    /// one in the store by now, is recovered from it rather than dropped.
+    #[tokio::test]
+    async fn a_write_off_restates_a_stored_checkpoint() {
+        let (store, path, other, leader) = replicas().await;
+        leader.insert(sandbox("sbx_a", "node1"));
+        settle(&[&leader]).await;
+        other.refresh("sbx_a").await.unwrap();
+        other.apply_states(
+            "node1",
+            &[burrow_proto::node::v1::SandboxStateReport {
+                sandbox_id: "sbx_a".into(),
+                state: common::SandboxState::Running as i32,
+                checkpoint_at_unix_ms: 1_787_000_000_000,
+                checkpoint_kind: common::CheckpointKind::Disk as i32,
+                ..Default::default()
+            }],
+        );
+        settle(&[&other]).await;
+
+        leader.forget_node("node1", &common::NodeInfo::default());
+        settle(&[&leader]).await;
+        let row = store.get_placement("sbx_a").await.unwrap().expect("kept");
+        assert!(row.node_id.is_empty(), "{}", row.node_id);
+        let stored = decode(&row.record).unwrap();
+        assert_eq!(stored.state, common::SandboxState::Stopped as i32);
+        assert!(
+            stored.state_reason.contains("disk checkpoint"),
+            "{}",
+            stored.state_reason
+        );
         let _ = std::fs::remove_file(&path);
     }
 

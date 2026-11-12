@@ -23,6 +23,7 @@ async fn the_control_tables_round_trip_on_postgres() {
                 id: id.clone(),
                 node_id: node.into(),
                 record,
+                version: 0,
             })
             .await
             .unwrap();

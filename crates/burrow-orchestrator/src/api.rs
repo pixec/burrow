@@ -1204,7 +1204,7 @@ impl ApiService {
         if let Some(placed) = placed {
             placed.keep();
         }
-        self.0.sandboxes.insert(adopted.clone());
+        self.0.sandboxes.adopted(adopted.clone());
         self.write_through().await;
         tracing::info!(
             sandbox = adopted.id,
@@ -1906,7 +1906,7 @@ impl Burrow for ApiService {
             .await?
             .into_inner();
         // The registry mirrors node state, so the new state is written back.
-        self.0.sandboxes.insert(sandbox.clone());
+        self.0.sandboxes.update(sandbox.clone());
         Ok(Response::new(sandbox))
     }
 
@@ -1925,7 +1925,7 @@ impl Burrow for ApiService {
             .resume_sandbox(nodepb::NodeSandboxRef { sandbox_id: id })
             .await?
             .into_inner();
-        self.0.sandboxes.insert(sandbox.clone());
+        self.0.sandboxes.update(sandbox.clone());
         Ok(Response::new(sandbox))
     }
 
@@ -1939,7 +1939,7 @@ impl Burrow for ApiService {
             .stop_sandbox(nodepb::NodeSandboxRef { sandbox_id: id })
             .await?
             .into_inner();
-        self.0.sandboxes.insert(sandbox.clone());
+        self.0.sandboxes.update(sandbox.clone());
         Ok(Response::new(sandbox))
     }
 
@@ -1958,7 +1958,7 @@ impl Burrow for ApiService {
             .start_sandbox(nodepb::NodeSandboxRef { sandbox_id: id })
             .await?
             .into_inner();
-        self.0.sandboxes.insert(sandbox.clone());
+        self.0.sandboxes.update(sandbox.clone());
         Ok(Response::new(sandbox))
     }
 
@@ -2002,7 +2002,7 @@ impl Burrow for ApiService {
             })
             .await?
             .into_inner();
-        self.0.sandboxes.insert(sandbox.clone());
+        self.0.sandboxes.update(sandbox.clone());
         Ok(Response::new(sandbox))
     }
 
@@ -2097,7 +2097,7 @@ impl Burrow for ApiService {
             })
             .await?
             .into_inner();
-        self.0.sandboxes.insert(sandbox.clone());
+        self.0.sandboxes.update(sandbox.clone());
         Ok(Response::new(sandbox))
     }
 
@@ -2122,7 +2122,7 @@ impl Burrow for ApiService {
             .await?
             .into_inner();
         if let Some(sandbox) = &updated.sandbox {
-            self.0.sandboxes.insert(sandbox.clone());
+            self.0.sandboxes.update(sandbox.clone());
         }
         Ok(Response::new(updated))
     }
@@ -2697,7 +2697,7 @@ impl Burrow for ApiService {
             })
             .await?
             .into_inner();
-        self.0.sandboxes.insert(sandbox.clone());
+        self.0.sandboxes.update(sandbox.clone());
         Ok(Response::new(sandbox))
     }
 
@@ -2721,7 +2721,7 @@ impl Burrow for ApiService {
             })
             .await?
             .into_inner();
-        self.0.sandboxes.insert(sandbox.clone());
+        self.0.sandboxes.update(sandbox.clone());
         Ok(Response::new(sandbox))
     }
 
@@ -2755,7 +2755,7 @@ impl Burrow for ApiService {
             })
             .await?
             .into_inner();
-        self.0.sandboxes.insert(sandbox.clone());
+        self.0.sandboxes.update(sandbox.clone());
         Ok(Response::new(sandbox))
     }
 
@@ -3289,7 +3289,7 @@ impl Burrow for ApiService {
         if let Some(mut sandbox) = self.unplaced(&id).await {
             let revoked_at_ms = revoked_at_ms.max(sandbox.access_revoked_at_ms);
             sandbox.access_revoked_at_ms = revoked_at_ms;
-            self.0.sandboxes.insert(sandbox);
+            self.0.sandboxes.update(sandbox);
             self.write_through().await;
             tracing::info!(sandbox = id, revoked_at_ms, "access tokens revoked");
             return Ok(Response::new(api::RevokeAccessResponse {

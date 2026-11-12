@@ -187,6 +187,8 @@ pub struct PlacementRow {
     pub id: String,
     pub node_id: String,
     pub record: Vec<u8>,
+    /// What the row was read at. Ignored by an unconditional write.
+    pub version: i64,
 }
 
 /// A sandbox a caller deleted while its node was unreachable.
@@ -833,8 +835,9 @@ impl Store {
 
     pub async fn put_placement(&self, row: &PlacementRow) -> Result<()> {
         on_pool!(self, pool => sqlx::query(
-            "INSERT INTO placements (id, node_id, record) VALUES ($1, $2, $3)
-             ON CONFLICT (id) DO UPDATE SET node_id=excluded.node_id, record=excluded.record",
+            "INSERT INTO placements (id, node_id, record, version) VALUES ($1, $2, $3, 1)
+             ON CONFLICT (id) DO UPDATE SET node_id=excluded.node_id, record=excluded.record,
+                version=placements.version + 1",
         )
         .bind(&row.id)
         .bind(&row.node_id)
@@ -845,17 +848,65 @@ impl Store {
         Ok(())
     }
 
+    /// Writes `row` over the placement only while it is still at `expected`,
+    /// or only if there is none with `None`. False when another write got
+    /// there first.
+    pub async fn replace_placement(
+        &self,
+        row: &PlacementRow,
+        expected: Option<i64>,
+    ) -> Result<bool> {
+        let done = match expected {
+            None => on_pool!(self, pool => sqlx::query(
+                "INSERT INTO placements (id, node_id, record, version) VALUES ($1, $2, $3, 1)
+                 ON CONFLICT (id) DO NOTHING",
+            )
+            .bind(&row.id)
+            .bind(&row.node_id)
+            .bind(&row.record)
+            .execute(pool)
+            .await
+            .map(|done| done.rows_affected()))?,
+            Some(version) => on_pool!(self, pool => sqlx::query(
+                "UPDATE placements SET node_id=$2, record=$3, version=version + 1
+                 WHERE id=$1 AND version=$4",
+            )
+            .bind(&row.id)
+            .bind(&row.node_id)
+            .bind(&row.record)
+            .bind(version)
+            .execute(pool)
+            .await
+            .map(|done| done.rows_affected()))?,
+        };
+        Ok(done == 1)
+    }
+
+    /// Deletes the placement only while it is still at `version`.
+    pub async fn delete_placement_if(&self, id: &str, version: i64) -> Result<bool> {
+        let done = on_pool!(self, pool => sqlx::query(
+            "DELETE FROM placements WHERE id=$1 AND version=$2",
+        )
+        .bind(id)
+        .bind(version)
+        .execute(pool)
+        .await
+        .map(|done| done.rows_affected()))?;
+        Ok(done == 1)
+    }
+
     pub async fn get_placement(&self, id: &str) -> Result<Option<PlacementRow>> {
-        let row: Option<(String, String, Vec<u8>)> = on_pool!(self, pool => sqlx::query_as(
-            "SELECT id, node_id, record FROM placements WHERE id=$1",
+        let row: Option<(String, String, Vec<u8>, i64)> = on_pool!(self, pool => sqlx::query_as(
+            "SELECT id, node_id, record, version FROM placements WHERE id=$1",
         )
         .bind(id)
         .fetch_optional(pool)
         .await)?;
-        Ok(row.map(|(id, node_id, record)| PlacementRow {
+        Ok(row.map(|(id, node_id, record, version)| PlacementRow {
             id,
             node_id,
             record,
+            version,
         }))
     }
 
@@ -904,17 +955,18 @@ impl Store {
     }
 
     pub async fn list_placements(&self) -> Result<Vec<PlacementRow>> {
-        let rows: Vec<(String, String, Vec<u8>)> = on_pool!(self, pool => sqlx::query_as(
-            "SELECT id, node_id, record FROM placements ORDER BY id",
+        let rows: Vec<(String, String, Vec<u8>, i64)> = on_pool!(self, pool => sqlx::query_as(
+            "SELECT id, node_id, record, version FROM placements ORDER BY id",
         )
         .fetch_all(pool)
         .await)?;
         Ok(rows
             .into_iter()
-            .map(|(id, node_id, record)| PlacementRow {
+            .map(|(id, node_id, record, version)| PlacementRow {
                 id,
                 node_id,
                 record,
+                version,
             })
             .collect())
     }
@@ -2327,6 +2379,7 @@ mod tests {
                 id: "a".into(),
                 node_id: "n1".into(),
                 record: Vec::new(),
+                version: 0,
             })
             .await
             .unwrap();
@@ -2351,6 +2404,7 @@ mod tests {
                     id: id.into(),
                     node_id: node.into(),
                     record: Vec::new(),
+                    version: 0,
                 })
                 .await
                 .unwrap();
@@ -2359,6 +2413,36 @@ mod tests {
         let left = store.list_placements().await.unwrap();
         assert_eq!(left.len(), 1);
         assert_eq!(left[0].node_id, "n2");
+    }
+
+    #[tokio::test]
+    async fn a_placement_is_written_only_over_the_version_read() {
+        let store = Store::open_in_memory().await.unwrap();
+        let row = |node: &str| PlacementRow {
+            id: "a".into(),
+            node_id: node.into(),
+            record: Vec::new(),
+            version: 0,
+        };
+        assert!(store.replace_placement(&row("n1"), None).await.unwrap());
+        assert!(!store.replace_placement(&row("n2"), None).await.unwrap());
+        let read = store.get_placement("a").await.unwrap().unwrap();
+        assert!(
+            store
+                .replace_placement(&row("n2"), Some(read.version))
+                .await
+                .unwrap()
+        );
+        assert!(
+            !store
+                .replace_placement(&row("n3"), Some(read.version))
+                .await
+                .unwrap()
+        );
+        assert!(!store.delete_placement_if("a", read.version).await.unwrap());
+        let now = store.get_placement("a").await.unwrap().unwrap();
+        assert_eq!(now.node_id, "n2");
+        assert!(store.delete_placement_if("a", now.version).await.unwrap());
     }
 
     #[tokio::test]
@@ -2371,6 +2455,7 @@ mod tests {
                     id: id.into(),
                     node_id: node.into(),
                     record: Vec::new(),
+                    version: 0,
                 })
                 .await
                 .unwrap();
@@ -2394,6 +2479,7 @@ mod tests {
                     id: id.into(),
                     node_id: node.into(),
                     record: Vec::new(),
+                    version: 0,
                 })
                 .await
                 .unwrap();
