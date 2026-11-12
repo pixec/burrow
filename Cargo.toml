@@ -103,4 +103,5 @@ ring = "0.17"
 webpki-roots = "0.26"
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls-native-roots", "json", "stream"] }
 flate2 = "1"
+memchr = "2"
 tar = "0.4"

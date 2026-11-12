@@ -17,6 +17,7 @@ mod fsync;
 mod guestconn;
 mod ipsw;
 mod journal;
+mod kernels;
 mod kit;
 mod macnode;
 mod metrics;

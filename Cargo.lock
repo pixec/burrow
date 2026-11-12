@@ -780,6 +780,7 @@ dependencies = [
  "hex",
  "hyper-util",
  "libc",
+ "memchr",
  "nfq",
  "opentelemetry",
  "prost",

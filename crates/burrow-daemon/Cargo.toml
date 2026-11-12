@@ -39,6 +39,7 @@ reqwest = { workspace = true }
 serde = { workspace = true }
 futures = { workspace = true }
 flate2 = { workspace = true }
+memchr = { workspace = true }
 tar = { workspace = true }
 tracing-subscriber = { workspace = true }
 sysinfo = { workspace = true }
