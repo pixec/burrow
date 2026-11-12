@@ -377,8 +377,9 @@ async fn admit<'a>(
             sandbox = id,
             "resuming a suspended sandbox for a shared connection"
         );
+        let id = id.to_string();
         manager
-            .resume(id)
+            .detached(move |manager| async move { manager.resume(&id).await })
             .await
             .map_err(|err| format!("could not resume: {}", err.message()))?;
     }

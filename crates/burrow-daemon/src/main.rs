@@ -1,3 +1,7 @@
+// The node API's handlers nest lifecycle calls deep enough to pass the
+// default when their futures are laid out.
+#![recursion_limit = "256"]
+
 mod access;
 mod blobs;
 mod ca;

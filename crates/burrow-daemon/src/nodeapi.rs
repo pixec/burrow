@@ -383,7 +383,10 @@ impl NodeApi {
         let mounts = crate::kit::prepare_volumes(&self.sandboxes, &id, &plan).await?;
         let fresh = boot == crate::kit::Boot::Create;
         if !fresh {
-            self.sandboxes.delete(&id).await?;
+            let deleting = id.clone();
+            self.sandboxes
+                .detached(move |sandboxes| async move { sandboxes.delete(&deleting).await })
+                .await?;
         }
         policy.resources = Some(plan.resources);
         policy.network = Some(plan.install_network.clone());
@@ -704,8 +707,12 @@ impl NodeService for NodeApi {
         let req = req.into_inner();
         let volume = self
             .sandboxes
-            .volumes()
-            .adopt(&req.name, &req.from_node_id)
+            .detached(move |sandboxes| async move {
+                sandboxes
+                    .volumes()
+                    .adopt(&req.name, &req.from_node_id)
+                    .await
+            })
             .await?;
         Ok(Response::new(volume))
     }
@@ -723,9 +730,9 @@ impl NodeService for NodeApi {
         &self,
         req: Request<api::VolumeRef>,
     ) -> Result<Response<api::DeleteVolumeResponse>, Status> {
+        let name = req.into_inner().name;
         self.sandboxes
-            .volumes()
-            .purge_remote(&req.into_inner().name)
+            .detached(move |sandboxes| async move { sandboxes.volumes().purge_remote(&name).await })
             .await?;
         Ok(Response::new(api::DeleteVolumeResponse {}))
     }
@@ -734,9 +741,9 @@ impl NodeService for NodeApi {
         &self,
         req: Request<api::VolumeRef>,
     ) -> Result<Response<api::DeleteVolumeResponse>, Status> {
+        let name = req.into_inner().name;
         self.sandboxes
-            .volumes()
-            .delete(&req.into_inner().name)
+            .detached(move |sandboxes| async move { sandboxes.volumes().delete(&name).await })
             .await?;
         Ok(Response::new(api::DeleteVolumeResponse {}))
     }
@@ -774,7 +781,10 @@ impl NodeService for NodeApi {
         self.sandboxes.admit()?;
         let id = req.into_inner().sandbox_id;
         let kit = self.sandboxes.record_of(&id).await?.kit.is_some();
-        self.sandboxes.delete(&id).await?;
+        let deleting = id.clone();
+        self.sandboxes
+            .detached(move |sandboxes| async move { sandboxes.delete(&deleting).await })
+            .await?;
         self.access_sessions.forget(&id);
         // Removing the instance ends its storage, retained paths included.
         if kit {
@@ -788,7 +798,11 @@ impl NodeService for NodeApi {
         req: Request<nodepb::NodeSandboxRef>,
     ) -> Result<Response<common::Sandbox>, Status> {
         self.sandboxes.admit()?;
-        let sandbox = self.sandboxes.stop(&req.into_inner().sandbox_id).await?;
+        let id = req.into_inner().sandbox_id;
+        let sandbox = self
+            .sandboxes
+            .detached(move |sandboxes| async move { sandboxes.stop(&id).await })
+            .await?;
         Ok(Response::new(redact_secrets(sandbox)))
     }
 
@@ -798,7 +812,11 @@ impl NodeService for NodeApi {
     ) -> Result<Response<common::Sandbox>, Status> {
         self.sandboxes.admit()?;
         let id = req.into_inner().sandbox_id;
-        let sandbox = self.sandboxes.start(&id).await?;
+        let starting = id.clone();
+        let sandbox = self
+            .sandboxes
+            .detached(move |sandboxes| async move { sandboxes.start(&starting).await })
+            .await?;
         if let Some(kit) = &sandbox.kit {
             // A boot is a boot: files land again and startup hooks run again,
             // under the runtime policy the record already carries.
@@ -845,7 +863,10 @@ impl NodeService for NodeApi {
         crate::template::validate_name(&template)?;
         let Some(recorded) = self.image_environment(&template).await.kit else {
             // Nothing a Kit asked for: the same template on a fresh disk.
-            self.sandboxes.delete(&req.sandbox_id).await?;
+            let deleting = req.sandbox_id.clone();
+            self.sandboxes
+                .detached(move |sandboxes| async move { sandboxes.delete(&deleting).await })
+                .await?;
             let sandbox = self
                 .sandboxes
                 .create(
@@ -892,7 +913,11 @@ impl NodeService for NodeApi {
         req: Request<nodepb::NodeSandboxRef>,
     ) -> Result<Response<common::Sandbox>, Status> {
         self.sandboxes.admit()?;
-        let sandbox = self.sandboxes.pause(&req.into_inner().sandbox_id).await?;
+        let id = req.into_inner().sandbox_id;
+        let sandbox = self
+            .sandboxes
+            .detached(move |sandboxes| async move { sandboxes.pause(&id).await })
+            .await?;
         Ok(Response::new(redact_secrets(sandbox)))
     }
 
@@ -901,7 +926,11 @@ impl NodeService for NodeApi {
         req: Request<nodepb::NodeSandboxRef>,
     ) -> Result<Response<common::Sandbox>, Status> {
         self.sandboxes.admit()?;
-        let sandbox = self.sandboxes.resume(&req.into_inner().sandbox_id).await?;
+        let id = req.into_inner().sandbox_id;
+        let sandbox = self
+            .sandboxes
+            .detached(move |sandboxes| async move { sandboxes.resume(&id).await })
+            .await?;
         Ok(Response::new(redact_secrets(sandbox)))
     }
 
@@ -914,7 +943,10 @@ impl NodeService for NodeApi {
         let record = req
             .record
             .ok_or_else(|| Status::invalid_argument("adopting needs the sandbox's record"))?;
-        let sandbox = self.sandboxes.adopt(record, req.node_id).await?;
+        let sandbox = self
+            .sandboxes
+            .detached(move |sandboxes| async move { sandboxes.adopt(record, req.node_id).await })
+            .await?;
         Ok(Response::new(redact_secrets(sandbox)))
     }
 
@@ -923,7 +955,11 @@ impl NodeService for NodeApi {
         req: Request<nodepb::NodeSandboxRef>,
     ) -> Result<Response<common::Sandbox>, Status> {
         self.sandboxes.admit()?;
-        let sandbox = self.sandboxes.release(&req.into_inner().sandbox_id).await?;
+        let id = req.into_inner().sandbox_id;
+        let sandbox = self
+            .sandboxes
+            .detached(move |sandboxes| async move { sandboxes.release(&id).await })
+            .await?;
         Ok(Response::new(redact_secrets(sandbox)))
     }
 
@@ -931,7 +967,10 @@ impl NodeService for NodeApi {
         &self,
         req: Request<nodepb::NodeSandboxRef>,
     ) -> Result<Response<nodepb::NodeDeleteResponse>, Status> {
-        self.sandboxes.purge(&req.into_inner().sandbox_id).await?;
+        let id = req.into_inner().sandbox_id;
+        self.sandboxes
+            .detached(move |sandboxes| async move { sandboxes.purge(&id).await })
+            .await?;
         Ok(Response::new(nodepb::NodeDeleteResponse {}))
     }
 
@@ -999,7 +1038,11 @@ impl NodeService for NodeApi {
         req.disk_mib.map(disk_mib).transpose()?;
         let (sandbox, updated) = self
             .sandboxes
-            .update_machine(&req.sandbox_id, req.vcpus, req.mem_mib, req.disk_mib)
+            .detached(move |sandboxes| async move {
+                sandboxes
+                    .update_machine(&req.sandbox_id, req.vcpus, req.mem_mib, req.disk_mib)
+                    .await
+            })
             .await?;
         Ok(Response::new(api::UpdateResourcesResponse {
             sandbox: Some(redact_secrets(sandbox)),

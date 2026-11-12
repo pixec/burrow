@@ -411,6 +411,8 @@ const EVENT_IP_DETACHED: common::EventKind = common::EventKind::IpDetached;
 const DETAIL_LOST: &str = "lost";
 const REASON_LOST: &str = "the node stopped without suspending its VM, so its memory is lost; \
                            its disk is kept, and `burrow boot` starts it again";
+const REASON_VMM_EXITED: &str = "its VMM exited while it was running, so its memory is lost; \
+                                 its disk is kept, and `burrow boot` starts it again";
 
 /// Guest memory when the policy names none.
 const DEFAULT_MEM_MIB: u32 = 512;
@@ -1359,7 +1361,14 @@ impl RunningSandbox {
         self.forget_agent().await;
         let mut slot = self.vm.lock().await;
         let Some(vm) = slot.take() else {
-            return Err(Status::failed_precondition("sandbox is already suspended"));
+            let state = self.state.load(std::sync::atomic::Ordering::Relaxed);
+            return Err(Status::failed_precondition(
+                match common::SandboxState::try_from(state) {
+                    Ok(common::SandboxState::Suspended) => "sandbox is already suspended",
+                    Ok(common::SandboxState::Stopped) => "sandbox is stopped",
+                    _ => "sandbox is marked running but has no VMM",
+                },
+            ));
         };
 
         // A diff records only the pages touched since the snapshot this VM was
@@ -1592,14 +1601,40 @@ impl RunningSandbox {
             if let Err(err) = vm.kill().await {
                 tracing::error!(sandbox = self.id(), %err, "vmm did not stop");
             }
-        } else if self.state.load(std::sync::atomic::Ordering::Relaxed)
-            != common::SandboxState::Suspended as i32
-        {
+        } else if !self.is_running() && !self.is_suspended() {
+            // A running sandbox with no VM lost its VMM, and is stopped here.
             return Err(Status::failed_precondition("sandbox is already stopped"));
         }
-        // A suspended sandbox's memory is on disk; stopping it discards that
-        // too, since a boot must not come back to a snapshot a later resume
-        // would restore around.
+        self.discard_memory().await;
+        Ok(())
+    }
+
+    /// Stops a running sandbox whose VMM is gone, its slot emptied or its
+    /// process exited on its own, keeping its disk. False while it has a live
+    /// VMM, or a lifecycle call holds the slot and settles it itself.
+    async fn retire_lost_vmm(&self) -> bool {
+        let Ok(mut slot) = self.vm.try_lock() else {
+            return false;
+        };
+        if !self.is_running() || slot.as_mut().is_some_and(|vm| !vm.has_exited()) {
+            return false;
+        }
+        if let Some(vm) = slot.take() {
+            self.retire_cpu(&vm);
+            // Reaps the exited process and removes its cgroup.
+            let _ = vm.kill().await;
+        }
+        self.discard_memory().await;
+        self.base_record.lock().unwrap().state_reason = REASON_VMM_EXITED.to_string();
+        drop(slot);
+        self.forget_agent().await;
+        true
+    }
+
+    /// Drops the memory a stopped sandbox no longer has. A suspended
+    /// sandbox's is on disk and goes too, since a boot must not come back to
+    /// a snapshot a later resume would restore around.
+    async fn discard_memory(&self) {
         self.memory_chain.lock().await.clear();
         let layout = self.layout();
         for file in layout.files() {
@@ -1614,7 +1649,6 @@ impl RunningSandbox {
         self.suspended_at
             .store(0, std::sync::atomic::Ordering::Relaxed);
         self.set_state(common::SandboxState::Stopped);
-        Ok(())
     }
 
     /// Cold-boots a stopped sandbox on its existing disks and handshakes.
@@ -2750,6 +2784,56 @@ impl SandboxManager {
     #[allow(clippy::result_large_err)]
     pub fn admit(&self) -> Result<(), Status> {
         self.delivery.admit()
+    }
+
+    /// Runs a lifecycle call to its end on a task of its own, so a caller that
+    /// gives up, a cancelled RPC among them, cannot leave it half done.
+    pub fn detached<T, Fut>(
+        &self,
+        call: impl FnOnce(Self) -> Fut,
+    ) -> impl std::future::Future<Output = Result<T, Status>>
+    where
+        T: Send + 'static,
+        Fut: std::future::Future<Output = Result<T, Status>> + Send + 'static,
+    {
+        use tracing::Instrument as _;
+        let task = tokio::spawn(call(self.clone()).in_current_span());
+        async move {
+            task.await.map_err(|err| {
+                Status::internal(format!("the lifecycle call did not finish: {err}"))
+            })?
+        }
+    }
+
+    /// Stops a running sandbox whose VMM is gone and records why, returning
+    /// whether it was one.
+    async fn retire_lost_vmm(&self, sandbox: &Arc<RunningSandbox>) -> bool {
+        if !sandbox.retire_lost_vmm().await {
+            return false;
+        }
+        tracing::error!(
+            sandbox = sandbox.id(),
+            "the sandbox's VMM exited while it was running; keeping it stopped on its disk"
+        );
+        self.resync_public(sandbox).await;
+        self.forget_stored(sandbox).await;
+        self.volumes.release_all(sandbox.id());
+        self.persist(sandbox).await;
+        self.close_session(sandbox, ENDED_FAILED).await;
+        self.announce_now();
+        true
+    }
+
+    /// Refuses a call that needs the sandbox's VMM when it has lost it,
+    /// stopping the sandbox first.
+    async fn require_vmm(&self, sandbox: &Arc<RunningSandbox>) -> Result<(), Status> {
+        match self.retire_lost_vmm(sandbox).await {
+            true => Err(Status::failed_precondition(format!(
+                "sandbox {}: {REASON_VMM_EXITED}",
+                sandbox.id()
+            ))),
+            false => Ok(()),
+        }
     }
 
     /// Records that a VM has started for this sandbox.
@@ -5584,6 +5668,10 @@ impl SandboxManager {
         for sandbox in candidates {
             let lifetime = sandbox.lifetime();
             let id = sandbox.id().to_string();
+            if self.retire_lost_vmm(&sandbox).await {
+                acted.push((id, "vmm-exited"));
+                continue;
+            }
             tracing::debug!(
                 sandbox = id,
                 idle_secs = sandbox.idle_secs(),
@@ -6699,6 +6787,7 @@ impl SandboxManager {
     /// Snapshots a sandbox to disk and stops its VMM.
     pub async fn pause(&self, id: &str) -> Result<common::Sandbox, Status> {
         let sandbox = self.get(id).await?;
+        self.require_vmm(&sandbox).await?;
         sandbox.suspend().await?;
         self.resync_public(&sandbox).await;
         self.usernets.detach(id, false);
@@ -6731,17 +6820,26 @@ impl SandboxManager {
         capture: Option<&Path>,
         also: &[(PathBuf, PathBuf)],
     ) -> Result<std::time::Duration, Status> {
-        let result = sandbox.checkpoint(capture, also).await;
-        // The pause ended the feed along with every other connection, and a
-        // command still running has output to send.
-        sandbox.ensure_feed();
-        // That failure mode leaves the sandbox suspended, which ends its
-        // session as surely as a suspend does.
-        if result.is_err() && !sandbox.is_running() {
-            self.close_session(sandbox, ENDED_FAILED).await;
-        }
-        self.persist(sandbox).await;
-        result
+        self.require_vmm(sandbox).await?;
+        let sandbox = Arc::clone(sandbox);
+        let capture = capture.map(Path::to_path_buf);
+        let also = also.to_vec();
+        // Detached: the guest is paused while it runs, and a caller dropped
+        // there would leave it paused.
+        self.detached(move |manager| async move {
+            let result = sandbox.checkpoint(capture.as_deref(), &also).await;
+            // The pause ended the feed along with every other connection, and
+            // a command still running has output to send.
+            sandbox.ensure_feed();
+            // That failure mode leaves the sandbox suspended, which ends its
+            // session as surely as a suspend does.
+            if result.is_err() && !sandbox.is_running() {
+                manager.close_session(&sandbox, ENDED_FAILED).await;
+            }
+            manager.persist(&sandbox).await;
+            result
+        })
+        .await
     }
 
     /// This node's snapshot store.
@@ -7461,6 +7559,7 @@ impl SandboxManager {
                  instead (`burrow boot {id}`, StartSandbox)"
             )));
         }
+        self.require_vmm(&sandbox).await?;
         self.fence_if_lapsed().await;
         if sandbox.durable.is_fenced() {
             return Err(Status::unavailable(format!(
@@ -9111,6 +9210,7 @@ impl SandboxManager {
         let Some(store) = self.config.object_store.clone() else {
             return Ok(());
         };
+        self.require_vmm(sandbox).await?;
         let is_memory = sandbox.lifetime().is_memory_checkpointed
             && sandbox.layout().memory.is_some()
             && !crate::macnode::is_macos(
@@ -10447,6 +10547,178 @@ pub(crate) mod tests {
             .expect("the suspend must not panic")
             .expect_err("there is no VM to snapshot");
         assert_eq!(err.code(), tonic::Code::FailedPrecondition);
+    }
+
+    /// Firecracker's API as far as a boot, a pause and a snapshot need it,
+    /// served when the tests run this binary as their VMM. The snapshot lands
+    /// after `BURROW_FAKE_FIRECRACKER_SNAPSHOT_MS`.
+    #[tokio::test]
+    #[ignore = "run by other tests as a fake VMM"]
+    async fn fake_firecracker() {
+        use tokio::io::{AsyncBufReadExt as _, AsyncReadExt as _, AsyncWriteExt as _};
+        let Ok(delay) = std::env::var("BURROW_FAKE_FIRECRACKER_SNAPSHOT_MS") else {
+            return;
+        };
+        let delay = std::time::Duration::from_millis(delay.parse().unwrap());
+        let listener = tokio::net::UnixListener::bind(burrow_vmm::firecracker::API_SOCK).unwrap();
+        loop {
+            let (stream, _) = listener.accept().await.unwrap();
+            tokio::spawn(async move {
+                let mut stream = tokio::io::BufReader::new(stream);
+                let mut line = String::new();
+                stream.read_line(&mut line).await.unwrap();
+                let mut length = 0;
+                loop {
+                    let mut header = String::new();
+                    stream.read_line(&mut header).await.unwrap();
+                    let header = header.trim_end().to_ascii_lowercase();
+                    if header.is_empty() {
+                        break;
+                    }
+                    if let Some(value) = header.strip_prefix("content-length:") {
+                        length = value.trim().parse().unwrap();
+                    }
+                }
+                let mut body = vec![0; length];
+                stream.read_exact(&mut body).await.unwrap();
+                if line.starts_with("PUT /snapshot/create ") {
+                    let request: serde_json::Value = serde_json::from_slice(&body).unwrap();
+                    tokio::time::sleep(delay).await;
+                    for path in ["snapshot_path", "mem_file_path"] {
+                        std::fs::write(request[path].as_str().unwrap(), b"snapshot").unwrap();
+                    }
+                }
+                let _ = stream
+                    .get_mut()
+                    .write_all(b"HTTP/1.1 204 No Content\r\n\r\n")
+                    .await;
+            });
+        }
+    }
+
+    /// A registered sandbox running under [`fake_firecracker`], whose
+    /// snapshots take `snapshot_ms`.
+    async fn under_fake_vmm(
+        manager: &SandboxManager,
+        snapshot_ms: u64,
+    ) -> (Arc<RunningSandbox>, PathBuf) {
+        use std::os::unix::fs::PermissionsExt as _;
+        // Short, since the API socket's path has to fit a socket address.
+        let workdir = PathBuf::from(format!(
+            "/tmp/burrow-vmm-{}",
+            &uuid::Uuid::new_v4().simple().to_string()[..12]
+        ));
+        std::fs::create_dir_all(&workdir).unwrap();
+        let bin = workdir.join("firecracker");
+        std::fs::write(
+            &bin,
+            format!(
+                "#!/bin/sh\nBURROW_FAKE_FIRECRACKER_SNAPSHOT_MS={snapshot_ms} exec '{}' --exact \
+                 sandbox::tests::fake_firecracker --ignored --test-threads=1\n",
+                std::env::current_exe().unwrap().display()
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let sandbox = Arc::new(sandbox_in(workdir.clone()));
+        let spec = {
+            let mut spec = sandbox.spec.lock().unwrap();
+            spec.backend =
+                burrow_vmm::Backend::Firecracker(burrow_vmm::FirecrackerConfig { bin, jail: None });
+            spec.cgroup_root = None;
+            spec.clone()
+        };
+        *sandbox.vm.lock().await = Some(Vm::boot(spec).await.unwrap());
+        manager
+            .sandboxes
+            .lock()
+            .await
+            .insert(sandbox.id().to_string(), Arc::clone(&sandbox));
+        (sandbox, workdir)
+    }
+
+    /// A pause whose caller gave up mid-snapshot used to drop the VM it had
+    /// taken out of its slot, leaving a sandbox marked running with no VMM
+    /// that every later pause called already suspended. The suspend now runs
+    /// to its end without the caller, and the sandbox lands suspended.
+    #[tokio::test]
+    async fn a_pause_whose_caller_gives_up_mid_snapshot_still_lands() {
+        let manager = manager().await;
+        let (sandbox, workdir) = under_fake_vmm(&manager, 300).await;
+
+        let id = sandbox.id().to_string();
+        let paused = manager.detached(move |manager| async move { manager.pause(&id).await });
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(100), paused)
+                .await
+                .is_err(),
+            "the caller must give up while the snapshot is still being written"
+        );
+        assert!(sandbox.is_running(), "the snapshot had not landed yet");
+
+        for _ in 0..500 {
+            if !sandbox.is_running() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        assert!(sandbox.is_suspended());
+        assert!(sandbox.vm.lock().await.is_none());
+        assert_eq!(*sandbox.memory_chain.lock().await, vec!["snapshot.mem"]);
+        let _ = std::fs::remove_dir_all(&workdir);
+    }
+
+    /// A sandbox whose VMM went away under it is not "already suspended": it
+    /// is stopped on its disk with the reason, and the pause says so.
+    #[tokio::test]
+    async fn a_pause_of_a_sandbox_that_lost_its_vmm_stops_it_with_the_reason() {
+        let manager = manager().await;
+        let sandbox = running("sbx_vmm_gone");
+        manager
+            .sandboxes
+            .lock()
+            .await
+            .insert(sandbox.id().to_string(), Arc::clone(&sandbox));
+
+        let err = manager.pause("sbx_vmm_gone").await.unwrap_err();
+        assert_eq!(err.code(), tonic::Code::FailedPrecondition);
+        assert!(
+            err.message().contains(REASON_VMM_EXITED),
+            "{}",
+            err.message()
+        );
+        let record = sandbox.record();
+        assert_eq!(record.state, common::SandboxState::Stopped as i32);
+        assert_eq!(record.state_reason, REASON_VMM_EXITED);
+    }
+
+    /// A VMM process that exits on its own is noticed, and its sandbox is
+    /// stopped with the reason rather than left running with nothing behind it.
+    #[tokio::test]
+    async fn a_vmm_that_exits_on_its_own_is_noticed() {
+        let manager = manager().await;
+        let (sandbox, workdir) = under_fake_vmm(&manager, 0).await;
+        assert!(!manager.retire_lost_vmm(&sandbox).await);
+
+        let pid = sandbox.vm.lock().await.as_ref().unwrap().pid().unwrap();
+        std::process::Command::new("kill")
+            .args(["-9", &pid.to_string()])
+            .status()
+            .unwrap();
+        let mut retired = false;
+        for _ in 0..500 {
+            retired = manager.retire_lost_vmm(&sandbox).await;
+            if retired {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        assert!(retired);
+        let record = sandbox.record();
+        assert_eq!(record.state, common::SandboxState::Stopped as i32);
+        assert_eq!(record.state_reason, REASON_VMM_EXITED);
+        assert!(sandbox.vm.lock().await.is_none());
+        let _ = std::fs::remove_dir_all(&workdir);
     }
 
     /// A warm create returns before its guest has answered, so the handshake

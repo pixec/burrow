@@ -408,6 +408,10 @@ impl ChVm {
         self.child.id()
     }
 
+    pub fn has_exited(&mut self) -> bool {
+        matches!(self.child.try_wait(), Ok(Some(_)))
+    }
+
     pub fn boot_latency(&self) -> Duration {
         self.boot_latency
     }

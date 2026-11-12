@@ -365,6 +365,10 @@ impl MicroVm {
         self.process.pid()
     }
 
+    pub fn has_exited(&mut self) -> bool {
+        self.process.has_exited()
+    }
+
     pub fn boot_latency(&self) -> Duration {
         self.boot_latency
     }

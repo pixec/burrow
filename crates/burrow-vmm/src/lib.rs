@@ -471,6 +471,17 @@ impl Vm {
         }
     }
 
+    /// Whether the VMM process has exited on its own. A vz machine runs in a
+    /// service process this node does not own, so it never reads as exited.
+    pub fn has_exited(&mut self) -> bool {
+        match self {
+            Self::Firecracker(vm) => vm.has_exited(),
+            Self::CloudHypervisor(vm) => vm.has_exited(),
+            #[cfg(target_os = "macos")]
+            Self::Vz(_) => false,
+        }
+    }
+
     /// From spawning the VMM to a guest that is running or ready to.
     pub fn boot_latency(&self) -> Duration {
         match self {
