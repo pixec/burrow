@@ -84,6 +84,19 @@ spec:
             # - https://s3.eu-west-1.amazonaws.com
             # - --object-store-region
             # - eu-west-1
+            # Optional: one fleet TLS inspection root, so an inspected sandbox
+            # can move between nodes. Without it each node generates its own
+            # and keeps its inspected sandboxes. Run `burrowd ca init` once and
+            # `burrowd ca issue --node <machine>` per machine, put root.pem and
+            # every <machine>.pem and <machine>.key in a burrow-inspect secret,
+            # and mount it at /etc/burrow/inspect (below). root.key stays off
+            # the cluster.
+            # - --inspect-root-cert
+            # - /etc/burrow/inspect/root.pem
+            # - --inspect-ca-cert
+            # - /etc/burrow/inspect/$(NODE_NAME).pem
+            # - --inspect-ca-key
+            # - /etc/burrow/inspect/$(NODE_NAME).key
           env:
             - name: HOST_IP
               valueFrom:
@@ -137,6 +150,9 @@ spec:
             # follows the machine and not the pod.
             - name: data
               mountPath: /var/lib/burrow
+            # - name: inspect
+            #   mountPath: /etc/burrow/inspect
+            #   readOnly: true
       volumes:
         - name: kvm
           hostPath:
@@ -154,3 +170,7 @@ spec:
           hostPath:
             path: /var/lib/burrow
             type: DirectoryOrCreate
+        # - name: inspect
+        #   secret:
+        #     secretName: burrow-inspect
+        #     defaultMode: 0400

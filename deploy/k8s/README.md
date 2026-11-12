@@ -80,15 +80,19 @@ kubectl -n burrow create secret generic burrow-tokens \
   --from-literal=node-token="$(openssl rand -hex 32)" \
   --from-literal=database-url="postgres://burrow:...@burrow-postgres-rw:5432/burrow"
 head -c 32 /dev/urandom > secrets.key
-kubectl -n burrow create secret generic burrow-secrets-key --from-file=secrets.key
-rm secrets.key
+openssl genpkey -algorithm ed25519 -out access.key
+kubectl -n burrow create secret generic burrow-keys \
+  --from-file=secrets.key --from-file=access.key
+rm secrets.key access.key
 ```
 
 `database-url` is the orchestrator's PostgreSQL; with `05-postgres.yaml`, take
 the URI from the `burrow-postgres-app` secret CloudNativePG creates and set it
-once the cluster is up. `burrow-secrets-key` seals stored secrets and is shared
-by every replica, so it is made once rather than per pod; keep a copy, because
-losing it makes every stored secret unreadable.
+once the cluster is up. `burrow-keys` holds `secrets.key`, which seals stored
+secrets, and `access.key`, which signs the Access tokens nodes accept for
+direct exec and file calls. Every replica must share both, so they are made
+once rather than per pod; keep a copy of `secrets.key`, because losing it makes
+every stored secret unreadable.
 
 Keep the two distinct: `api-key` is what tenants present, `node-token` is what
 a node presents to register, and registration decides where exec and logs get

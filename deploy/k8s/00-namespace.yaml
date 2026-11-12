@@ -18,14 +18,21 @@
 # instance, or 05-postgres.yaml with CloudNativePG. The orchestrator creates its
 # own tables on first start.
 #
-# The key that seals stored secrets is shared by every orchestrator replica,
-# so it is made once, here, rather than by each pod:
+# Two keys are shared by every orchestrator replica, so they are made once,
+# here, rather than by each pod: secrets.key seals stored secrets, and
+# access.key (Ed25519, PKCS#8 PEM) signs the Access tokens nodes accept. A
+# replica with a key of its own would seal secrets the others cannot open and
+# sign tokens that fail on nodes which last heard from another replica.
 #
 #   head -c 32 /dev/urandom > secrets.key
-#   kubectl -n burrow create secret generic burrow-secrets-key --from-file=secrets.key
-#   rm secrets.key
+#   openssl genpkey -algorithm ed25519 -out access.key
+#   kubectl -n burrow create secret generic burrow-keys \
+#     --from-file=secrets.key --from-file=access.key
+#   rm secrets.key access.key
 #
-# Lose it and every stored secret is unreadable; keep a copy somewhere safe.
+# Lose secrets.key and every stored secret is unreadable; keep a copy
+# somewhere safe. Replacing access.key only means outstanding Access tokens
+# fail until reissued.
 apiVersion: v1
 kind: Namespace
 metadata:

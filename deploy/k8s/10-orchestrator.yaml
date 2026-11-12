@@ -10,7 +10,7 @@
 # the Service; a replica going away costs at most the calls in flight on it.
 #
 # Requires the burrow-tokens secret with a database-url key and the
-# burrow-secrets-key secret; see 00-namespace.yaml. Postgres itself is yours to
+# burrow-keys secret; see 00-namespace.yaml. Postgres itself is yours to
 # run: a managed instance, or 05-postgres.yaml with CloudNativePG.
 apiVersion: v1
 kind: Service
@@ -60,6 +60,8 @@ spec:
         runAsNonRoot: true
         runAsUser: 65532
         runAsGroup: 65532
+        # Secret files are root's otherwise, and unreadable to uid 65532.
+        fsGroup: 65532
         seccompProfile:
           type: RuntimeDefault
       containers:
@@ -74,6 +76,8 @@ spec:
             - /var/lib/burrow
             - --secrets-key-file
             - /etc/burrow/secrets.key
+            - --access-key-file
+            - /etc/burrow/access.key
           env:
             # Tokens by env rather than argv: a token on the command line is
             # visible in `ps` to every process in the container.
@@ -126,10 +130,10 @@ spec:
             capabilities:
               drop: ["ALL"]
           volumeMounts:
-            # The key that seals stored secrets. Every replica must have the
-            # same one, so it comes from a Secret rather than being generated
-            # per pod.
-            - name: secrets-key
+            # The keys that seal stored secrets and sign Access tokens. Every
+            # replica must have the same ones, so they come from a Secret
+            # rather than being generated per pod.
+            - name: keys
               mountPath: /etc/burrow
               readOnly: true
             # --data-dir; with Postgres nothing durable is written here.
@@ -138,10 +142,10 @@ spec:
             - name: tmp
               mountPath: /tmp
       volumes:
-        - name: secrets-key
+        - name: keys
           secret:
-            secretName: burrow-secrets-key
-            defaultMode: 0400
+            secretName: burrow-keys
+            defaultMode: 0440
         - name: data
           emptyDir: {}
         - name: tmp
