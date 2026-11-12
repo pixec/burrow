@@ -113,6 +113,11 @@ const SHAPE_FILE: &str = "shape";
 /// Which hypervisor took the snapshot, and so which files it is made of.
 const HYPERVISOR_FILE: &str = "hypervisor";
 
+/// The digest of the kernel the snapshot's guest booted. A restore boots the
+/// template's kernel, so a snapshot of any other is stale: rebuilding a
+/// template with another kernel rebuilds its warm snapshots.
+const KERNEL_FILE: &str = "kernel";
+
 /// The trust material a warm snapshot is built with already installed.
 ///
 /// The node's inspection CA is the same for every sandbox here, so installing
@@ -359,8 +364,8 @@ impl Warm {
     }
 }
 
-/// The snapshot in `dir`, if it is complete, in the current format and, when
-/// `agent` is given, built with that agent.
+/// The snapshot in `dir`, if it is complete, in the current format, of its
+/// template's kernel and, when `agent` is given, built with that agent.
 async fn read_warm(dir: &Path, agent: Option<&str>) -> Option<Warm> {
     use std::os::unix::fs::MetadataExt as _;
 
@@ -379,6 +384,13 @@ async fn read_warm(dir: &Path, agent: Option<&str>) -> Option<Warm> {
         if built_with.trim() != agent {
             return None;
         }
+    }
+    let template_kernel = dir.parent()?.parent()?.join("vmlinux");
+    let kernel = tokio::fs::read_to_string(dir.join(KERNEL_FILE))
+        .await
+        .ok()?;
+    if kernel.trim() != crate::kernels::digest(&template_kernel).await.ok()? {
+        return None;
     }
     let shape = Shape::parse(&tokio::fs::read_to_string(dir.join(SHAPE_FILE)).await.ok()?)?;
     let mut bytes = 0;
@@ -650,6 +662,9 @@ pub async fn build_warm_snapshot(
             .await
             .map_err(|err| Status::internal(format!("staging {name}: {err}")))?;
     }
+    let kernel = crate::kernels::digest(&run_dir.join("vmlinux"))
+        .await
+        .map_err(|err| Status::internal(format!("hashing the kernel: {err}")))?;
     crate::rootdisk::clone(&run_dir.join(IMAGE), &run_dir.join(ROOT_DISK))
         .await
         .map_err(|err| Status::internal(format!("warm root disk: {err}")))?;
@@ -745,6 +760,9 @@ pub async fn build_warm_snapshot(
             tokio::fs::write(dir.join(HYPERVISOR_FILE), hypervisor.as_str())
                 .await
                 .map_err(|err| Status::internal(format!("recording warm hypervisor: {err}")))?;
+            tokio::fs::write(dir.join(KERNEL_FILE), &kernel)
+                .await
+                .map_err(|err| Status::internal(format!("recording warm kernel: {err}")))?;
             tokio::fs::write(dir.join(USED_FILE), burrow_common::unix_now().to_string())
                 .await
                 .map_err(|err| Status::internal(format!("recording warm use: {err}")))?;
@@ -1310,11 +1328,19 @@ mod shape_tests {
         dir
     }
 
+    /// A snapshot of its template's current kernel, which is written too.
     fn write_snapshot(dir: &Path, format: &str, shape: &str) {
+        use sha2::Digest as _;
         std::fs::create_dir_all(dir).unwrap();
         for file in Hypervisor::Firecracker.layout().files().chain([ROOT_DISK]) {
             std::fs::write(dir.join(file), b"x").unwrap();
         }
+        let template_kernel = dir.parent().unwrap().parent().unwrap().join("vmlinux");
+        if !template_kernel.exists() {
+            std::fs::write(&template_kernel, b"kernel").unwrap();
+        }
+        let digest = sha2::Sha256::digest(std::fs::read(&template_kernel).unwrap());
+        std::fs::write(dir.join(KERNEL_FILE), hex::encode(digest)).unwrap();
         std::fs::write(dir.join(HYPERVISOR_FILE), "firecracker").unwrap();
         std::fs::write(dir.join(SHAPE_FILE), shape).unwrap();
         std::fs::write(dir.join("format"), format).unwrap();
@@ -1432,6 +1458,42 @@ mod shape_tests {
         assert_eq!(
             stale(&templates, "app").await,
             vec![warm.join("firecracker-4x4096")]
+        );
+        let _ = std::fs::remove_dir_all(&templates);
+    }
+
+    /// A template rebuilt with another kernel boots that kernel, so a
+    /// snapshot of the old one is stale and rebuilt.
+    #[tokio::test]
+    async fn a_snapshot_of_another_kernel_is_stale() {
+        let templates = temp("kernel");
+        let warm = warm_dir(&templates, "app");
+        let live = warm.join("firecracker-1x512");
+        write_snapshot(&live, WARM_FORMAT, "1 512 1324 512");
+        let wanted = Shape {
+            vcpus: 1,
+            mem_mib: 512,
+            disk_mib: 1324,
+            max_mem_mib: 512,
+        };
+        assert!(
+            find(&templates, "app", Hypervisor::Firecracker, wanted)
+                .await
+                .is_some()
+        );
+
+        let template_kernel = templates.join("app").join("vmlinux");
+        std::fs::remove_file(&template_kernel).unwrap();
+        std::fs::write(&template_kernel, b"another kernel").unwrap();
+        assert!(
+            find(&templates, "app", Hypervisor::Firecracker, wanted)
+                .await
+                .is_none()
+        );
+        assert_eq!(stale(&templates, "app").await, vec![live.clone()]);
+        assert_eq!(
+            find_broken(&templates, "app", Hypervisor::Firecracker, wanted).await,
+            Some(live)
         );
         let _ = std::fs::remove_dir_all(&templates);
     }

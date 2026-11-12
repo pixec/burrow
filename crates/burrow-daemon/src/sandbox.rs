@@ -156,6 +156,8 @@ pub struct NodeConfig {
     /// The hypervisors this node offers, as it advertises them. A template or
     /// sandbox needing another is refused.
     pub hypervisors: Vec<Hypervisor>,
+    /// The kernels templates are built with here (`--kernel`).
+    pub kernels: Arc<crate::kernels::Kernels>,
     /// Whether a guest here can be given nested virtualization: a hypervisor
     /// that can show it the extensions, on a KVM with nesting on.
     pub is_nested_virt_supported: bool,
@@ -2304,6 +2306,7 @@ impl RunningSandbox {
                 capture,
             )
             .await?;
+        let kernel = self.base_record.lock().unwrap().kernel.clone();
         Ok(crate::snapshot::Staged {
             sandbox_id: self.id.clone(),
             template: self.template.clone(),
@@ -2314,6 +2317,7 @@ impl RunningSandbox {
             max_mem_mib: self.max_mem_mib(),
             is_nested_virt_enabled: self.is_nested_virt_enabled(),
             disk_mib: size_mib(&dest.join(crate::rootdisk::ROOT_DISK)),
+            kernel,
             chain,
             inspection_root: self
                 .base_record
@@ -2348,6 +2352,7 @@ enum RestoreSource<'a> {
         template: String,
         hypervisor: Hypervisor,
         disk_mib: u32,
+        kernel: Option<common::Kernel>,
     },
     /// A sandbox's own state in the object store, being adopted here.
     Stored {
@@ -2395,6 +2400,15 @@ impl RestoreSource<'_> {
             Self::Sandbox(source, _) => Ok(source.hypervisor),
             Self::Snapshot { hypervisor, .. } => Ok(*hypervisor),
             Self::Stored { manifest, .. } => manifest.hypervisor(),
+        }
+    }
+
+    /// The kernel the state was saved with, the only one it restores onto.
+    fn kernel(&self) -> Option<common::Kernel> {
+        match self {
+            Self::Sandbox(source, _) => source.record().kernel,
+            Self::Snapshot { kernel, .. } => kernel.clone(),
+            Self::Stored { manifest, .. } => manifest.kernel(),
         }
     }
 
@@ -2962,6 +2976,10 @@ impl SandboxManager {
             _ = tokio::time::sleep(interval) => {}
             _ = self.announce.notified() => {}
         }
+    }
+
+    pub fn kernels(&self) -> &crate::kernels::Kernels {
+        &self.config.kernels
     }
 
     /// Refuses work needing a hypervisor this node does not offer.
@@ -5633,6 +5651,11 @@ impl SandboxManager {
                  down, update it, and boot it for more"
             )));
         }
+        if want > current
+            && let Some(why) = no_virtio_mem(&sandbox.workdir).await
+        {
+            return Ok(refuse(why));
+        }
         if !(want - boot).is_multiple_of(burrow_vmm::MEMORY_BLOCK_MIB) {
             return Ok(refuse(format!(
                 "a running guest's memory moves in steps of {} MiB above the {boot} MiB it \
@@ -5672,9 +5695,8 @@ impl SandboxManager {
         let reason = match (reached == want, want > current) {
             (true, _) => String::new(),
             (false, true) if reached == current => "the guest plugged none of it: its kernel \
-                                                    needs CONFIG_VIRTIO_MEM and \
-                                                    memhp_default_state=online_movable to take \
-                                                    memory while it runs"
+                                                    needs memhp_default_state=online_movable to \
+                                                    take memory while it runs"
                 .to_string(),
             (false, true) => format!(
                 "the guest plugged {} of {} MiB and stopped, likely short of the boot memory \
@@ -7153,6 +7175,13 @@ impl SandboxManager {
             hypervisor,
             policy.resources.as_ref().unwrap_or(&Default::default()),
         )?;
+        let kernel =
+            crate::kernels::in_dir(&templates_dir.join(&template), &environment.kernel).await?;
+        require_nested_kernel(
+            &template,
+            kernel.as_ref(),
+            policy.resources.as_ref().unwrap_or(&Default::default()),
+        )?;
         let capabilities = hypervisor.capabilities();
         if !capabilities.runs(guest_os) {
             return Err(Status::failed_precondition(format!(
@@ -7584,6 +7613,7 @@ impl SandboxManager {
             hypervisor: hypervisor.to_string(),
             guest_os: guest_os.as_str().to_string(),
             inspection_root_fingerprint: inspection_root,
+            kernel,
             // Tags and name are stamped a moment later by the caller's
             // create; usage, reachability and the handshake are filled in
             // from the live sandbox on every read.
@@ -7914,6 +7944,7 @@ impl SandboxManager {
                     template: manifest.template.clone(),
                     hypervisor: manifest.hypervisor()?,
                     disk_mib: manifest.disk_mib,
+                    kernel: manifest.kernel(),
                 },
                 id.clone(),
                 policy,
@@ -8296,6 +8327,10 @@ impl SandboxManager {
             Ok(staged) => staged,
             Err(err) => return Err(guard.fail(err).await),
         };
+        let kernel = match crate::kernels::require_saved(&workdir, source.kernel().as_ref()).await {
+            Ok(kernel) => kernel,
+            Err(err) => return Err(guard.fail(err).await),
+        };
         // Without the page-fault handler the guest cannot take memory as it
         // faults, so a base still arriving is waited for in full.
         if !capabilities.is_lazy_memory_supported
@@ -8415,6 +8450,7 @@ impl SandboxManager {
             hypervisor: hypervisor.to_string(),
             guest_os: guest_os.as_str().to_string(),
             inspection_root_fingerprint: inspection_root,
+            kernel,
             ..Default::default()
         };
         tracing::info!(
@@ -8484,6 +8520,8 @@ impl SandboxManager {
                  orchestrator to confirm it still holds it; try again shortly"
             )));
         }
+        let saved = sandbox.base_record.lock().unwrap().kernel.clone();
+        crate::kernels::require_saved(&sandbox.workdir, saved.as_ref()).await?;
         // Its disk is already counted; what is checked is that the node is not
         // already past its reserve, where a running guest's writes may fail.
         if !sandbox.is_running() {
@@ -8685,8 +8723,9 @@ impl SandboxManager {
         Ok(())
     }
 
-    /// Boots a stopped sandbox on its existing disks.
-    pub async fn start(&self, id: &str) -> Result<common::Sandbox, Status> {
+    /// Boots a stopped sandbox on its existing disks, and on its template's
+    /// current kernel unless `is_kernel_kept`, which boots the one it last ran.
+    pub async fn start(&self, id: &str, is_kernel_kept: bool) -> Result<common::Sandbox, Status> {
         let sandbox = self.get(id).await?;
         if sandbox.durable.is_fenced() {
             return Err(Status::unavailable(format!(
@@ -8702,6 +8741,9 @@ impl SandboxManager {
         }
         let guest_os = burrow_vmm::GuestOs::from_record(&record.guest_os).unwrap_or_default();
         let _slot = self.reserve_mac_slot(id, guest_os).await?;
+        if !is_kernel_kept {
+            self.take_template_kernel(&sandbox).await?;
+        }
         let policy = record.policy.unwrap_or_default();
         self.claim_volumes(id, &policy.volumes, guest_os).await?;
         // A stop handed the volume images' ownership back with the claims, so
@@ -8799,6 +8841,52 @@ impl SandboxManager {
         self.open_session(&sandbox, STARTED_BOOT, Some(from)).await;
         self.persist(&sandbox).await;
         Ok(sandbox.record())
+    }
+
+    /// Points a stopped sandbox at the kernel its template boots now, which a
+    /// rebuild of the template may have changed.
+    async fn take_template_kernel(&self, sandbox: &RunningSandbox) -> Result<(), Status> {
+        let current = sandbox.workdir.join(TEMPLATE_KERNEL);
+        if !tokio::fs::try_exists(&current).await.unwrap_or(false) {
+            return Ok(());
+        }
+        let template = sandbox.template();
+        let source = self
+            .config
+            .templates_dir()
+            .join(template)
+            .join(TEMPLATE_KERNEL);
+        if !tokio::fs::try_exists(&source).await.unwrap_or(false) {
+            return Err(Status::failed_precondition(format!(
+                "template {template} is not on this node, so there is no current kernel to boot \
+                 {} on; keep the kernel it last ran (--keep-kernel)",
+                sandbox.id()
+            )));
+        }
+        let inspected = crate::kernels::inspect(&source)
+            .await
+            .map_err(Status::failed_precondition)?;
+        if let Some(why) = inspected.detected.unbootable_under(sandbox.hypervisor) {
+            return Err(Status::failed_precondition(format!(
+                "template {template}'s kernel cannot boot under {}: {why}; keep the kernel the \
+                 sandbox last ran (--keep-kernel)",
+                sandbox.hypervisor
+            )));
+        }
+        let io =
+            |err: std::io::Error| Status::internal(format!("taking the template's kernel: {err}"));
+        if crate::kernels::digest(&current).await.map_err(io)? != inspected.digest {
+            let next = sandbox.workdir.join("vmlinux.next");
+            let _ = tokio::fs::remove_file(&next).await;
+            if tokio::fs::hard_link(&source, &next).await.is_err() {
+                tokio::fs::copy(&source, &next).await.map_err(io)?;
+            }
+            tokio::fs::rename(&next, &current).await.map_err(io)?;
+        }
+        let name = self.image_environment(template).await.kernel;
+        sandbox.base_record.lock().unwrap().kernel =
+            crate::kernels::in_dir(&sandbox.workdir, &name).await?;
+        Ok(())
     }
 
     /// The environment a template declared.
@@ -9213,6 +9301,11 @@ impl SandboxManager {
             hypervisor_version: self.config.version(sandbox.hypervisor).to_string(),
             hypervisor: sandbox.hypervisor.to_string(),
             cpu: crate::cpuid::host().clone(),
+            kernel: record
+                .kernel
+                .as_ref()
+                .map(|k| k.name.clone())
+                .unwrap_or_default(),
             kernel_digest: String::new(),
             rootfs_digest: String::new(),
             cpu_usage_usec: record.cpu_usage_usec,
@@ -9823,7 +9916,7 @@ impl SandboxManager {
                 return Err(err);
             }
         };
-        if let Err(err) = self.start(&id).await {
+        if let Err(err) = self.start(&id, true).await {
             self.sandboxes.lock().await.remove(&id);
             if let Err(err) = self.tear_down(sandbox).await {
                 tracing::warn!(sandbox = id, %err, "could not release a failed adopt");
@@ -9934,6 +10027,10 @@ impl SandboxManager {
             hypervisor: hypervisor.to_string(),
             guest_os: guest_os.as_str().to_string(),
             state_reason: String::new(),
+            kernel: match crate::kernels::in_dir(&workdir, &manifest.kernel).await {
+                Ok(kernel) => kernel,
+                Err(err) => return Err(guard.fail(err).await),
+            },
             ..record
         };
         guard.keep();
@@ -10543,6 +10640,48 @@ pub(crate) async fn grant_to_jail(
     .map_err(|err| std::io::Error::other(format!("chown did not run: {err}")))?
 }
 
+/// Refuses nested virtualization from a template whose kernel could not
+/// give the guest a usable /dev/kvm.
+#[allow(clippy::result_large_err)]
+fn require_nested_kernel(
+    template: &str,
+    kernel: Option<&common::Kernel>,
+    resources: &common::ResourcePolicy,
+) -> Result<(), Status> {
+    if !resources.is_nested_virt_enabled {
+        return Ok(());
+    }
+    let is_kvm = kernel
+        .and_then(|k| k.capabilities)
+        .is_some_and(|caps| caps.is_kvm_built_in);
+    if is_kvm {
+        return Ok(());
+    }
+    Err(Status::failed_precondition(format!(
+        "template {template}'s kernel {} has no KVM built in, so its guest could not run VMs; \
+         rebuild the template with --kernel naming one that has (Cloud Hypervisor's own kernel \
+         does)",
+        kernel.map_or("", |k| k.name.as_str())
+    )))
+}
+
+/// Why the guest booted on the kernel in `workdir` cannot take memory while
+/// it runs, if it cannot.
+async fn no_virtio_mem(workdir: &Path) -> Option<String> {
+    let inspected = crate::kernels::inspect(&workdir.join(TEMPLATE_KERNEL))
+        .await
+        .ok()?;
+    (!inspected.detected.capabilities.is_virtio_mem_built_in).then(|| {
+        format!(
+            "the guest's kernel ({} {}) has no virtio-mem built in, so it cannot take memory \
+             while it runs; shut it down, update it, and boot it, or rebuild its template with \
+             a kernel that has CONFIG_VIRTIO_MEM",
+            inspected.detected.version,
+            crate::kernels::short(&inspected.digest)
+        )
+    })
+}
+
 /// Creates a sandbox working directory with the template's kernel and image
 /// linked in. Hard links keep creation cheap; the root disk cloned from the
 /// image is the sandbox's own, and the guest never sees the image itself.
@@ -10869,10 +11008,10 @@ pub(crate) mod tests {
                 jail: None,
                 cloud_hypervisor: burrow_vmm::CloudHypervisorConfig {
                     bin: "/nonexistent/cloud-hypervisor".into(),
-                    kernel: None,
                     jail: None,
                 },
                 hypervisors: vec![Hypervisor::Firecracker],
+                kernels: Default::default(),
                 is_nested_virt_supported: false,
                 vmm_memory_overhead_mib: HashMap::new(),
                 artifact_retention: std::time::Duration::from_secs(7 * 24 * 60 * 60),
@@ -10939,6 +11078,52 @@ pub(crate) mod tests {
         manager.config.is_nested_virt_supported = true;
         let supported = manager.require_nested_virt(Hypervisor::CloudHypervisor, &nested);
         assert_eq!(supported.is_ok(), cfg!(target_arch = "x86_64"));
+    }
+
+    /// Nested virtualization needs KVM in the template's own kernel, which
+    /// the Firecracker CI kernels leave out.
+    #[test]
+    fn nested_virtualization_needs_a_kernel_with_kvm() {
+        let nested = common::ResourcePolicy {
+            is_nested_virt_enabled: true,
+            ..Default::default()
+        };
+        let kernel = |kvm| common::Kernel {
+            name: "k".into(),
+            capabilities: Some(common::KernelCapabilities {
+                is_kvm_built_in: kvm,
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        assert!(require_nested_kernel("t", Some(&kernel(false)), &Default::default()).is_ok());
+        assert!(require_nested_kernel("t", Some(&kernel(true)), &nested).is_ok());
+        let err = require_nested_kernel("t", Some(&kernel(false)), &nested).unwrap_err();
+        assert_eq!(err.code(), tonic::Code::FailedPrecondition);
+        assert!(
+            err.message().contains("has no KVM built in"),
+            "{}",
+            err.message()
+        );
+        assert!(require_nested_kernel("t", None, &nested).is_err());
+    }
+
+    /// A grow on a kernel without virtio-mem is refused for that reason,
+    /// rather than plugging nothing.
+    #[tokio::test]
+    async fn a_grow_is_refused_on_a_kernel_without_virtio_mem() {
+        let dir = std::env::temp_dir().join(format!("burrow-virtio-mem-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut image = vec![0u8; 64];
+        image[56..60].copy_from_slice(b"ARM\x64");
+        image.extend_from_slice(b"Linux version 6.1.141 #1\0\0vmw_vsock_virtio_transport\0");
+        std::fs::write(dir.join(TEMPLATE_KERNEL), &image).unwrap();
+        let why = no_virtio_mem(&dir).await.unwrap();
+        assert!(why.contains("no virtio-mem built in"), "{why}");
+        image.extend_from_slice(b"\0virtio_mem\0");
+        std::fs::write(dir.join(TEMPLATE_KERNEL), &image).unwrap();
+        assert_eq!(no_virtio_mem(&dir).await, None);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     async fn recovering(name: &str) -> (SandboxManager, PathBuf) {

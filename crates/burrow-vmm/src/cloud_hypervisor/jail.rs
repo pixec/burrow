@@ -12,7 +12,7 @@
 //!   directory, holding the working directory itself at [`VMM_WORKDIR`], device
 //!   nodes for `/dev/kvm` (owned by the jail uid) and `/dev/urandom`, and,
 //!   read-only at their own paths, the host files the VM config names
-//!   absolutely (a node-wide kernel, the UEFI firmware). Nothing else of the
+//!   absolutely (the UEFI firmware). Nothing else of the
 //!   host's filesystem exists inside;
 //! - every capability dropped, bounding set included, then the jail's uid and
 //!   gid with no supplementary groups, `no_new_privs`, and a parent-death
@@ -514,11 +514,6 @@ mod tests {
     fn only_absolute_payload_paths_are_bound_in() {
         let linux = json!({ "payload": { "kernel": "vmlinux", "cmdline": "console=hvc0" } });
         assert!(absolute_paths(&linux).is_empty());
-        let node_kernel = json!({ "payload": { "kernel": "/var/lib/burrow/vmlinux-ch" } });
-        assert_eq!(
-            absolute_paths(&node_kernel),
-            [PathBuf::from("/var/lib/burrow/vmlinux-ch")]
-        );
         let windows = json!({ "payload": { "firmware": "/usr/local/share/cloud-hypervisor/CLOUDHV_EFI.fd" } });
         assert_eq!(absolute_paths(&windows).len(), 1);
     }

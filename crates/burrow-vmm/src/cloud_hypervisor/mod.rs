@@ -82,9 +82,6 @@ const STALE_PORT_TIMEOUT: Duration = Duration::from_secs(2);
 #[derive(Debug, Clone)]
 pub struct CloudHypervisorConfig {
     pub bin: PathBuf,
-    /// Booted instead of the template's own kernel, for a template whose
-    /// kernel lacks what a PCI machine needs.
-    pub kernel: Option<PathBuf>,
     /// Confines the VMM. `None` runs it as the daemon runs, root with the
     /// host's filesystem in view.
     pub jail: Option<ChJail>,

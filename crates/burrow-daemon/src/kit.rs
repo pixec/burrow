@@ -176,6 +176,8 @@ impl KitTemplate {
             // The build's choice, not the image's.
             hypervisor: String::new(),
             guest_os: String::new(),
+            kernel: String::new(),
+            kernel_digest: String::new(),
         }
     }
 }

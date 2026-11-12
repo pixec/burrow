@@ -122,11 +122,14 @@ pub struct Manifest {
     /// Set once every object is in the store and the remote manifest is
     /// written, so a half-finished upload never reads as restorable.
     pub is_durable: bool,
-    /// The kernel and the template's image by content, filled in when
-    /// uploaded. The kernel goes to the store as a blob under its digest; the
-    /// image as chunks under `images/`, which the disk's index is a diff
-    /// against.
+    /// The kernel the guest ran, the only one its memory restores onto: the
+    /// node's name for it, and its digest. The kernel goes to the store as a
+    /// blob under its digest.
+    #[serde(default)]
+    pub kernel: String,
     pub kernel_digest: String,
+    /// The template's image by content, filled in when uploaded: chunks under
+    /// `images/`, which the disk's index is a diff against.
     pub rootfs_digest: String,
     /// The inspection root its guest trusted, when it was inspected; see
     /// [`crate::durable::Manifest::inspection_root`].
@@ -135,6 +138,15 @@ pub struct Manifest {
 }
 
 impl Manifest {
+    /// The kernel the snapshot's memory was written by, when it records one.
+    pub fn kernel(&self) -> Option<common::Kernel> {
+        (!self.kernel_digest.is_empty()).then(|| common::Kernel {
+            name: self.kernel.clone(),
+            digest: self.kernel_digest.clone(),
+            ..Default::default()
+        })
+    }
+
     pub fn hypervisor(&self) -> Result<burrow_vmm::Hypervisor, Status> {
         burrow_vmm::Hypervisor::from_record(&self.hypervisor).ok_or_else(|| {
             Status::failed_precondition(format!(
@@ -313,6 +325,7 @@ pub struct Staged {
     pub is_nested_virt_enabled: bool,
     pub disk_mib: u32,
     pub hypervisor: burrow_vmm::Hypervisor,
+    pub kernel: Option<common::Kernel>,
     /// Memory files in the staging directory, oldest first.
     pub chain: Vec<String>,
     /// The inspection root the source's guest trusted, if it was inspected.
@@ -414,7 +427,12 @@ impl SnapshotStore {
             hypervisor: staged.hypervisor.to_string(),
             cpu: crate::cpuid::host().clone(),
             is_durable: false,
-            kernel_digest: String::new(),
+            kernel: staged
+                .kernel
+                .as_ref()
+                .map(|k| k.name.clone())
+                .unwrap_or_default(),
+            kernel_digest: staged.kernel.map(|k| k.digest).unwrap_or_default(),
             rootfs_digest: String::new(),
             inspection_root: staged.inspection_root,
         };
@@ -1345,6 +1363,7 @@ mod tests {
             hypervisor: "firecracker".into(),
             cpu: Default::default(),
             is_durable: false,
+            kernel: String::new(),
             kernel_digest: String::new(),
             rootfs_digest: String::new(),
             inspection_root: String::new(),
@@ -1673,6 +1692,7 @@ mod tests {
             is_nested_virt_enabled: false,
             disk_mib: 1024,
             hypervisor: burrow_vmm::Hypervisor::Firecracker,
+            kernel: None,
             chain: vec![memory.to_string()],
             inspection_root: String::new(),
         };

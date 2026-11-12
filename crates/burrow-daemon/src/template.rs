@@ -67,45 +67,61 @@ pub async fn sweep_pending(data_dir: &Path) {
     }
 }
 
-/// The kernel this node boots guests with, set once from `--guest-kernel`.
-///
-/// Held here rather than threaded through every build because it is decided at
-/// startup and never changes, and the alternative is an extra parameter on
-/// five functions that care about nothing else.
-static GUEST_KERNEL: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
-
-pub fn set_guest_kernel(path: PathBuf) {
-    let _ = GUEST_KERNEL.set(path);
+/// A kernel a template is being built with: the node's name for it, and the
+/// file it is.
+#[derive(Debug, Clone)]
+pub(crate) struct KernelSource {
+    pub name: String,
+    pub path: PathBuf,
 }
 
-/// Gives a freshly built template its own kernel.
+/// The kernel a template under `hypervisor` is built with: the one the build
+/// names, else the hypervisor's default here.
+fn chosen_kernel(
+    manager: &SandboxManager,
+    hypervisor: &str,
+    requested: &str,
+) -> Result<KernelSource, Status> {
+    let (hypervisor, _) = crate::oci::ImageEnvironment {
+        hypervisor: hypervisor.to_string(),
+        ..Default::default()
+    }
+    .machine()?;
+    let kernel = manager.kernels().choose(hypervisor, requested)?;
+    Ok(KernelSource {
+        name: kernel.name.clone(),
+        path: kernel.path.clone(),
+    })
+}
+
+/// Gives a freshly built template its kernel, replacing any it had, and
+/// returns the digest it records.
 ///
 /// An OCI image carries a userland and no kernel, so the node supplies one.
-/// Hard-linked rather than copied: it is the same bytes for every template,
-/// and a sandbox hard-links both artifacts out of one directory.
-async fn link_kernel(target: &Path) -> Result<(), Status> {
-    let kernel = target.join("vmlinux");
-    if tokio::fs::try_exists(&kernel).await.unwrap_or(false) {
-        return Ok(());
-    }
-    let source = GUEST_KERNEL.get().ok_or_else(|| {
-        Status::failed_precondition(
-            "no guest kernel on this node: point --guest-kernel at a vmlinux",
-        )
-    })?;
+/// Hard-linked rather than copied: it is the same bytes for every template of
+/// that kernel, and a sandbox hard-links both artifacts out of one directory.
+async fn link_kernel(target: &Path, kernel: &KernelSource) -> Result<String, Status> {
+    let dest = target.join("vmlinux");
+    let pending = target.join("vmlinux.building");
+    let _ = tokio::fs::remove_file(&pending).await;
     // Across filesystems a link is refused, and a copy is still correct.
-    if tokio::fs::hard_link(source, &kernel).await.is_ok() {
-        return Ok(());
+    if tokio::fs::hard_link(&kernel.path, &pending).await.is_err() {
+        tokio::fs::copy(&kernel.path, &pending)
+            .await
+            .map_err(|err| {
+                Status::failed_precondition(format!(
+                    "kernel {} at {}: {err}",
+                    kernel.name,
+                    kernel.path.display()
+                ))
+            })?;
     }
-    tokio::fs::copy(source, &kernel)
+    tokio::fs::rename(&pending, &dest)
         .await
-        .map(drop)
-        .map_err(|err| {
-            Status::failed_precondition(format!(
-                "no guest kernel at {}: {err}; point --guest-kernel at a vmlinux",
-                source.display()
-            ))
-        })
+        .map_err(|err| Status::internal(format!("installing the kernel: {err}")))?;
+    crate::kernels::digest(&dest)
+        .await
+        .map_err(|err| Status::internal(format!("hashing the kernel: {err}")))
 }
 
 /// Every template on disk, for an operator to see.
@@ -172,6 +188,12 @@ async fn scan(data_dir: &Path) -> Vec<(api::TemplateInfo, bool)> {
                 )
             }
         };
+        let kernel = crate::kernels::in_dir(&entry.path(), &environment.kernel)
+            .await
+            .unwrap_or_else(|err| {
+                tracing::warn!(template = name, err = err.message(), "reading its kernel");
+                None
+            });
         let info = api::TemplateInfo {
             name,
             size_bytes: meta.len(),
@@ -181,7 +203,7 @@ async fn scan(data_dir: &Path) -> Vec<(api::TemplateInfo, bool)> {
             is_systemd: environment.systemd,
             guest_os,
             hypervisor,
-            kernel: None,
+            kernel,
         };
         out.push((info, is_bootable));
     }
@@ -327,6 +349,7 @@ async fn run_build(
             ));
         }
         let hypervisor = chosen_hypervisor(manager, &request.hypervisor, "")?;
+        let kernel = chosen_kernel(manager, &hypervisor, &request.kernel)?;
         return from_image::import_kit(
             manager,
             data_dir,
@@ -334,6 +357,7 @@ async fn run_build(
             &request.kits,
             request.is_systemd,
             &hypervisor,
+            &kernel,
             guest_binary,
             credentials,
             insecure,
@@ -348,8 +372,10 @@ async fn run_build(
     // converted image becomes the base they run on.
     let from_owned;
     let hypervisor;
+    let kernel;
     let from = if !request.from_image.is_empty() {
         hypervisor = chosen_hypervisor(manager, &request.hypervisor, "")?;
+        kernel = chosen_kernel(manager, &hypervisor, &request.kernel)?;
         let base = if request.steps.is_empty() {
             request.name.clone()
         } else {
@@ -364,6 +390,7 @@ async fn run_build(
             &request.from_image,
             request.is_systemd,
             &hypervisor,
+            &kernel,
             guest_binary,
             credentials,
             insecure,
@@ -382,10 +409,24 @@ async fn run_build(
             &request.from
         };
         validate_name(from)?;
-        let inherited = crate::oci::image_environment(data_dir, from)
-            .await
-            .hypervisor;
-        hypervisor = chosen_hypervisor(manager, &request.hypervisor, &inherited)?;
+        let base = crate::oci::image_environment(data_dir, from).await;
+        hypervisor = chosen_hypervisor(manager, &request.hypervisor, &base.hypervisor)?;
+        let is_same_machine = crate::oci::ImageEnvironment {
+            hypervisor: hypervisor.clone(),
+            ..Default::default()
+        }
+        .machine()
+        .ok()
+            == base.machine().ok();
+        // A build on a base keeps the base's kernel, the file itself, unless
+        // it names another or moves to a hypervisor the base's may not boot.
+        kernel = match request.kernel.is_empty() && is_same_machine && !base.kernel.is_empty() {
+            true => KernelSource {
+                name: base.kernel.clone(),
+                path: templates_dir(data_dir).join(from).join("vmlinux"),
+            },
+            false => chosen_kernel(manager, &hypervisor, &request.kernel)?,
+        };
         from
     };
     // The base names a directory under `images/` just as the target does, and
@@ -478,6 +519,7 @@ async fn run_build(
         cached_steps,
         is_systemd,
         &hypervisor,
+        &kernel,
     )
     .await;
     if let Err(err) = manager.delete(&build_id).await {
@@ -516,6 +558,7 @@ async fn build_in_sandbox(
     cached_steps: usize,
     is_systemd: bool,
     hypervisor: &str,
+    kernel: &KernelSource,
 ) -> Result<(), Status> {
     for (index, run) in commands.iter().enumerate() {
         // Steps the cache already covers are represented by the seeded disk;
@@ -569,8 +612,15 @@ async fn build_in_sandbox(
     }
     capture_disk(manager, build_id, &pending).await?;
 
-    link_kernel(&target).await?;
-    write_build_config(&target, is_systemd, hypervisor).await?;
+    let kernel_digest = link_kernel(&target, kernel).await?;
+    let config = crate::oci::ImageEnvironment {
+        systemd: is_systemd,
+        hypervisor: hypervisor.to_string(),
+        kernel: kernel.name.clone(),
+        kernel_digest,
+        ..Default::default()
+    };
+    write_build_config(&target, &config).await?;
     let final_path = target.join("rootfs.ext4");
     tokio::fs::rename(&pending, &final_path)
         .await
@@ -625,18 +675,12 @@ async fn capture_disk(manager: &SandboxManager, build_id: &str, dest: &Path) -> 
 
 /// Writes what a build records about its template, always: a rebuild over an
 /// existing template would otherwise go on reading the previous build's
-/// hypervisor and systemd from the file it left behind.
+/// hypervisor, systemd and kernel from the file it left behind.
 async fn write_build_config(
     target: &Path,
-    is_systemd: bool,
-    hypervisor: &str,
+    config: &crate::oci::ImageEnvironment,
 ) -> Result<(), Status> {
-    let config = crate::oci::ImageEnvironment {
-        systemd: is_systemd,
-        hypervisor: hypervisor.to_string(),
-        ..Default::default()
-    };
-    let config = serde_json::to_vec_pretty(&config)
+    let config = serde_json::to_vec_pretty(config)
         .map_err(|err| Status::internal(format!("image config: {err}")))?;
     tokio::fs::write(target.join("image.json"), config)
         .await
@@ -1310,15 +1354,60 @@ mod tests {
     async fn a_rebuild_replaces_the_previous_build_config() {
         let dir = std::env::temp_dir().join(format!("burrow-build-config-{}", std::process::id()));
         tokio::fs::create_dir_all(&dir).await.unwrap();
-        write_build_config(&dir, true, "cloud-hypervisor")
-            .await
-            .unwrap();
-        write_build_config(&dir, false, "").await.unwrap();
+        let first = crate::oci::ImageEnvironment {
+            systemd: true,
+            hypervisor: "cloud-hypervisor".into(),
+            kernel: "ch-linux".into(),
+            kernel_digest: "a".repeat(64),
+            ..Default::default()
+        };
+        write_build_config(&dir, &first).await.unwrap();
+        let second = crate::oci::ImageEnvironment {
+            kernel: "firecracker-ci".into(),
+            kernel_digest: "b".repeat(64),
+            ..Default::default()
+        };
+        write_build_config(&dir, &second).await.unwrap();
         let config: crate::oci::ImageEnvironment =
             serde_json::from_slice(&tokio::fs::read(dir.join("image.json")).await.unwrap())
                 .unwrap();
         assert!(!config.systemd);
         assert!(config.hypervisor.is_empty(), "{}", config.hypervisor);
+        assert_eq!(
+            (config.kernel.as_str(), config.kernel_digest),
+            ("firecracker-ci", "b".repeat(64))
+        );
+        let _ = tokio::fs::remove_dir_all(&dir).await;
+    }
+
+    /// A rebuild with another kernel replaces the one the template had,
+    /// where the old code kept whatever `vmlinux` was already there.
+    #[tokio::test]
+    async fn a_rebuild_takes_the_kernel_it_names() {
+        let dir = std::env::temp_dir().join(format!("burrow-link-kernel-{}", std::process::id()));
+        let target = dir.join("template");
+        tokio::fs::create_dir_all(&target).await.unwrap();
+        for name in ["old", "new"] {
+            tokio::fs::write(dir.join(name), name).await.unwrap();
+        }
+        let kernel = |name: &str| KernelSource {
+            name: name.into(),
+            path: dir.join(name),
+        };
+        let old = link_kernel(&target, &kernel("old")).await.unwrap();
+        let new = link_kernel(&target, &kernel("new")).await.unwrap();
+        assert_ne!(old, new);
+        assert_eq!(
+            tokio::fs::read(target.join("vmlinux")).await.unwrap(),
+            b"new"
+        );
+        assert_eq!(
+            new,
+            crate::blobs::hash_file(&dir.join("new"))
+                .await
+                .unwrap()
+                .to_string()
+        );
         let _ = tokio::fs::remove_dir_all(&dir).await;
     }
 
@@ -1527,7 +1616,8 @@ pub mod from_image {
     use tonic::Status;
 
     use super::{
-        IMAGE_SLACK_MIB, LogTx, PENDING_ROOTFS, event, path, run, templates_dir, validate_name,
+        IMAGE_SLACK_MIB, KernelSource, LogTx, PENDING_ROOTFS, event, path, run, templates_dir,
+        validate_name,
     };
     use burrow_proto::api::v1 as api;
 
@@ -1552,6 +1642,7 @@ pub mod from_image {
         image: &str,
         is_systemd: bool,
         hypervisor: &str,
+        kernel: &KernelSource,
         guest_binary: &Path,
         credentials: &crate::oci::auth::Store,
         insecure: &[String],
@@ -1584,6 +1675,7 @@ pub mod from_image {
                         name,
                         &layers,
                         &environment,
+                        kernel,
                         guest_binary,
                         tx,
                     )
@@ -1603,6 +1695,7 @@ pub mod from_image {
             name,
             &pulled.layers,
             &environment,
+            kernel,
             guest_binary,
             tx,
         )
@@ -1621,6 +1714,7 @@ pub mod from_image {
         refs: &[String],
         is_systemd: bool,
         hypervisor: &str,
+        kernel: &KernelSource,
         guest_binary: &Path,
         credentials: &crate::oci::auth::Store,
         insecure: &[String],
@@ -1647,6 +1741,7 @@ pub mod from_image {
             &name,
             &layers,
             &environment,
+            kernel,
             guest_binary,
             tx,
         )
@@ -1664,12 +1759,14 @@ pub mod from_image {
         Ok(())
     }
 
+    #[allow(clippy::too_many_arguments)]
     async fn stage(
         manager: &crate::sandbox::SandboxManager,
         data_dir: &Path,
         name: &str,
         layers: &[std::path::PathBuf],
         environment: &crate::oci::ImageEnvironment,
+        kernel: &KernelSource,
         guest_binary: &Path,
         tx: &LogTx,
     ) -> Result<(), Status> {
@@ -1687,6 +1784,7 @@ pub mod from_image {
             name,
             layers,
             environment,
+            kernel,
             guest_binary,
             tx,
         )
@@ -1705,6 +1803,7 @@ pub mod from_image {
         name: &str,
         layers: &[std::path::PathBuf],
         environment: &crate::oci::ImageEnvironment,
+        kernel: &KernelSource,
         guest_binary: &Path,
         tx: &LogTx,
     ) -> Result<(), Status> {
@@ -1754,7 +1853,7 @@ pub mod from_image {
             add_login_env(&mut environment, &passwd);
         }
 
-        assemble(manager, data_dir, rootdir, name, &environment, tx).await
+        assemble(manager, data_dir, rootdir, name, &environment, kernel, tx).await
     }
 
     /// Adds HOME and USER for the image's user, where the image did not
@@ -1806,6 +1905,7 @@ pub mod from_image {
         rootdir: &Path,
         name: &str,
         environment: &crate::oci::ImageEnvironment,
+        kernel: &KernelSource,
         tx: &LogTx,
     ) -> Result<(), Status> {
         let content_bytes = directory_size(rootdir).await;
@@ -1842,11 +1942,15 @@ pub mod from_image {
         )
         .await?;
 
-        super::link_kernel(&target).await?;
+        let environment = crate::oci::ImageEnvironment {
+            kernel: kernel.name.clone(),
+            kernel_digest: super::link_kernel(&target, kernel).await?,
+            ..environment.clone()
+        };
 
         // The image's environment and working directory are what a shell in
         // the sandbox would otherwise get wrong.
-        let config = serde_json::to_vec_pretty(environment)
+        let config = serde_json::to_vec_pretty(&environment)
             .map_err(|err| Status::internal(format!("image config: {err}")))?;
         tokio::fs::write(target.join("image.json"), config)
             .await

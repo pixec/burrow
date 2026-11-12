@@ -361,11 +361,13 @@ impl NodeApi {
     /// composition has been planned against its retained storage and before
     /// the replacement takes its id.
     /// Boots a stopped sandbox, and runs a Kit's startup again on it.
-    async fn start(&self, id: &str) -> Result<common::Sandbox, Status> {
+    async fn start(&self, id: &str, is_kernel_kept: bool) -> Result<common::Sandbox, Status> {
         let starting = id.to_string();
         let sandbox = self
             .sandboxes
-            .detached(move |sandboxes| async move { sandboxes.start(&starting).await })
+            .detached(
+                move |sandboxes| async move { sandboxes.start(&starting, is_kernel_kept).await },
+            )
             .await?;
         if let Some(kit) = &sandbox.kit {
             // A boot is a boot: files land again and startup hooks run again,
@@ -854,8 +856,10 @@ impl NodeService for NodeApi {
         req: Request<nodepb::NodeStartRequest>,
     ) -> Result<Response<common::Sandbox>, Status> {
         self.sandboxes.admit()?;
-        let id = req.into_inner().sandbox_id;
-        Ok(Response::new(self.start(&id).await?))
+        let req = req.into_inner();
+        Ok(Response::new(
+            self.start(&req.sandbox_id, req.is_kernel_kept).await?,
+        ))
     }
 
     /// Replaces a sandbox's root disk under the same id.
@@ -1108,7 +1112,7 @@ impl NodeService for NodeApi {
             })
             .await?;
         if req.boot && sandbox.state == common::SandboxState::Stopped as i32 {
-            sandbox = self.start(&id).await?;
+            sandbox = self.start(&id, false).await?;
         }
         Ok(Response::new(api::UpdateResourcesResponse {
             sandbox: Some(redact_secrets(sandbox)),

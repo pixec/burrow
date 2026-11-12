@@ -230,6 +230,13 @@ pub struct ImageEnvironment {
     /// "linux" or "windows"; empty is Linux.
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub guest_os: String,
+    /// The kernel the template was built with: the node's name for it, and
+    /// the digest of the `vmlinux` beside the image. Empty for a guest booted
+    /// from firmware or installed whole.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub kernel: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub kernel_digest: String,
 }
 
 impl ImageEnvironment {
@@ -798,6 +805,8 @@ pub async fn pull(
             // The build's choice, not the image's.
             hypervisor: String::new(),
             guest_os: String::new(),
+            kernel: String::new(),
+            kernel_digest: String::new(),
         },
         digest,
         layer_digests,

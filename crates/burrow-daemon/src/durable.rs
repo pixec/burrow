@@ -112,6 +112,10 @@ pub struct Manifest {
     pub hypervisor: String,
     /// The CPU the state was written on; see [`crate::cpuid`].
     pub cpu: crate::cpuid::Cpu,
+    /// The kernel the guest ran, by the node's name for it and by digest:
+    /// the only one its memory restores onto.
+    #[serde(default)]
+    pub kernel: String,
     pub kernel_digest: String,
     /// The template's image. The disk's index is a diff against it, by
     /// chunk, and it is in the store under `images/`.
@@ -159,6 +163,14 @@ impl Manifest {
                 "sandbox {} was stored under {:?}, which this build does not know",
                 self.id, self.hypervisor
             ))
+        })
+    }
+
+    pub fn kernel(&self) -> Option<burrow_proto::common::v1::Kernel> {
+        (!self.kernel_digest.is_empty()).then(|| burrow_proto::common::v1::Kernel {
+            name: self.kernel.clone(),
+            digest: self.kernel_digest.clone(),
+            ..Default::default()
         })
     }
 
@@ -1210,6 +1222,7 @@ mod tests {
             hypervisor_version: "1".into(),
             hypervisor: "firecracker".into(),
             cpu: Default::default(),
+            kernel: String::new(),
             kernel_digest: String::new(),
             rootfs_digest: String::new(),
             cpu_usage_usec: 0,

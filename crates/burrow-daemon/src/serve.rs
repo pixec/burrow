@@ -51,10 +51,6 @@ pub struct ServeArgs {
     pub hypervisors: Vec<burrow_vmm::Hypervisor>,
     #[arg(long, default_value = "/usr/local/bin/cloud-hypervisor")]
     pub cloud_hypervisor: PathBuf,
-    /// Kernel Cloud Hypervisor boots instead of each template's own, for
-    /// templates whose kernel lacks virtio-pci. Unset boots the template's.
-    #[arg(long)]
-    pub cloud_hypervisor_kernel: Option<PathBuf>,
     /// Run Cloud Hypervisor unconfined even with `--jailer`: as root, in the
     /// host's namespaces, with the host's filesystem in view. For a dev box
     /// whose kernel cannot build the jail; nowhere a guest is untrusted.
@@ -343,13 +339,25 @@ pub struct ServeArgs {
     /// panics, so the agent is copied in as part of the conversion.
     #[arg(long, default_value = "/usr/local/bin/burrow-guest")]
     pub guest_binary: PathBuf,
-    /// Kernel every guest boots.
+    /// A guest kernel templates can be built with, as
+    /// `NAME[@HYPERVISOR+HYPERVISOR]=PATH`, e.g.
+    /// `ch-linux@cloud-hypervisor=/srv/kernels/vmlinux`. Repeatable.
     ///
     /// An OCI image carries a userland and no kernel, so the node supplies
-    /// one and links it into each template it builds. Defaults to `vmlinux`
-    /// under the data directory, which is where the quickstart puts it.
-    #[arg(long)]
-    pub guest_kernel: Option<PathBuf>,
+    /// one, and a template records the one it was built with. Without a
+    /// hypervisor list the kernel is offered to every hypervisor it can boot
+    /// under. What it has built in is read from the image, and a `.config`
+    /// beside it is used when the image embeds none. Added to the kernels the
+    /// node image ships under /usr/local/share/burrow/kernels,
+    /// `firecracker-ci` and `ch-linux`, and replaces one of the same name.
+    #[arg(long = "kernel", value_parser = crate::kernels::parse_kernel_arg)]
+    pub kernels: Vec<crate::kernels::KernelArg>,
+    /// The kernel a template gets when its build names none, as
+    /// `HYPERVISOR=NAME`. Repeatable. Defaults: firecracker-ci for
+    /// firecracker, ch-linux for cloud-hypervisor, else a hypervisor's only
+    /// kernel.
+    #[arg(long = "default-kernel", value_parser = crate::kernels::parse_default_kernel)]
+    pub default_kernels: Vec<(burrow_vmm::Hypervisor, String)>,
     /// File of `<node-id> <wireguard-public-key>` lines that this node treats
     /// as authoritative, overriding anything the orchestrator reports.
     ///
@@ -674,6 +682,7 @@ fn local_node_info(args: &ServeArgs) -> anyhow::Result<NodeInfo> {
         is_io_weight_supported: burrow_vmm::is_io_weight_supported(&args.cgroup_root),
         // Filled in once the binaries have been looked for.
         is_nested_virt_supported: false,
+        // Filled in once the kernels have been read.
         kernels: Vec::new(),
     })
 }
@@ -735,11 +744,15 @@ async fn current_status(sandboxes: &SandboxManager, data_dir: &std::path::Path) 
     let mut templates = Vec::new();
     let mut kit_templates = Vec::new();
     let mut template_hypervisors = std::collections::HashMap::new();
+    let mut template_kernels = std::collections::HashMap::new();
     for template in crate::template::bootable(data_dir).await {
         if template.is_kit {
             kit_templates.push(template.name.clone());
         }
         template_hypervisors.insert(template.name.clone(), template.hypervisor);
+        if let Some(kernel) = template.kernel {
+            template_kernels.insert(template.name.clone(), kernel);
+        }
         templates.push(template.name);
     }
     // sysinfo undercounts on macOS; see `macnode::available_memory`.
@@ -757,6 +770,7 @@ async fn current_status(sandboxes: &SandboxManager, data_dir: &std::path::Path) 
         templates,
         kit_templates,
         template_hypervisors,
+        template_kernels,
         is_draining: sandboxes.is_draining(),
         // Suspended sandboxes count: they hold their address, disks and
         // snapshot, and resuming must not find the node oversubscribed.
@@ -865,11 +879,6 @@ async fn registration_loop(
 ) {
     // Claimed rather than requested: sandboxes here already hold addresses
     // from this slice.
-    crate::template::set_guest_kernel(
-        args.guest_kernel
-            .clone()
-            .unwrap_or_else(|| args.data_dir.join("vmlinux")),
-    );
     let claimed_index = load_node_index(&args.data_dir).await;
     let mut applied_peers: Vec<burrow_net::Peer> = Vec::new();
     let mut denied_edges: Vec<std::net::IpAddr> = Vec::new();
@@ -1451,6 +1460,10 @@ pub async fn run(args: ServeArgs) -> anyhow::Result<()> {
         .iter()
         .any(|h| burrow_vmm::HypervisorExt::capabilities(*h).is_nested_virt_supported)
         && burrow_vmm::is_nested_virt_supported();
+    let kernels = Arc::new(
+        crate::kernels::Kernels::load(&args.kernels, &args.default_kernels, &hypervisors).await?,
+    );
+    node_info.kernels = kernels.to_proto();
     node_info.cpu = crate::cpuid::host().fingerprint();
     node_info.hypervisor_versions = hypervisors
         .iter()
@@ -1550,10 +1563,10 @@ pub async fn run(args: ServeArgs) -> anyhow::Result<()> {
             jail: args.jail(),
             cloud_hypervisor: burrow_vmm::CloudHypervisorConfig {
                 bin: args.cloud_hypervisor.clone(),
-                kernel: args.cloud_hypervisor_kernel.clone(),
                 jail: args.cloud_hypervisor_jail()?,
             },
             hypervisors,
+            kernels,
             is_nested_virt_supported: node_info.is_nested_virt_supported,
             vmm_memory_overhead_mib,
             artifact_retention: Duration::from_secs(

@@ -89,10 +89,7 @@ pub(crate) fn vm_config(
     let (mut serial, mut console, console_arg) = console(arch)?;
     let payload = match (&spec.boot, spec.guest_os) {
         (Boot::Kernel { kernel, cmdline }, GuestOs::Linux) => json!({
-            "kernel": match &config.kernel {
-                Some(kernel) => kernel.display().to_string(),
-                None => kernel.clone(),
-            },
+            "kernel": kernel,
             "cmdline": format!("{cmdline}{console_arg}"),
         }),
         (Boot::Firmware { .. }, GuestOs::Linux) => json!({ "firmware": firmware(&spec.boot) }),
@@ -244,7 +241,6 @@ mod tests {
     fn config() -> CloudHypervisorConfig {
         CloudHypervisorConfig {
             bin: "/usr/local/bin/cloud-hypervisor".into(),
-            kernel: None,
             jail: None,
         }
     }
@@ -396,16 +392,6 @@ mod tests {
         let x86 = vm_config(&spec, &jailed, "x86_64").unwrap();
         assert_eq!(x86["serial"]["socket"], "/work/console.sock");
         assert_eq!(x86["console"]["mode"], "Off");
-    }
-
-    #[test]
-    fn a_configured_kernel_replaces_the_templates() {
-        let config = CloudHypervisorConfig {
-            kernel: Some("/var/lib/burrow/vmlinux-ch".into()),
-            ..config()
-        };
-        let vm = vm_config(&spec(), &config, "aarch64").unwrap();
-        assert_eq!(vm["payload"]["kernel"], "/var/lib/burrow/vmlinux-ch");
     }
 
     #[test]

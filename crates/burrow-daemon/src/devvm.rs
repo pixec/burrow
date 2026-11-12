@@ -33,10 +33,6 @@ pub struct VmBootArgs {
     pub firecracker: PathBuf,
     #[arg(long, default_value = "/usr/local/bin/cloud-hypervisor")]
     pub cloud_hypervisor: PathBuf,
-    /// Kernel Cloud Hypervisor boots instead of --kernel, for a kernel that
-    /// lacks what a PCI machine needs.
-    #[arg(long)]
-    pub cloud_hypervisor_kernel: Option<PathBuf>,
     /// Run Cloud Hypervisor in burrowd's jail as this uid and gid, as
     /// `serve --jailer` does. The working directory becomes the jail's.
     #[arg(long)]
@@ -68,7 +64,6 @@ impl VmBootArgs {
             }),
             Hypervisor::CloudHypervisor => Backend::CloudHypervisor(CloudHypervisorConfig {
                 bin: self.cloud_hypervisor.clone(),
-                kernel: self.cloud_hypervisor_kernel.clone(),
                 jail: self.jail_uid.map(|uid| burrow_vmm::ChJail {
                     helper: "/proc/self/exe".into(),
                     uid,
