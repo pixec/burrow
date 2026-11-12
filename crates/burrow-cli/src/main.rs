@@ -706,13 +706,19 @@ enum ConfigCommand {
     /// got. A shut-down one (`burrow shutdown`) takes everything: vCPUs and
     /// memory on its next `boot`, and its disk at once, shrunk by a helper VM
     /// that checks the filesystem first and refuses a size below what it
-    /// needs. A suspended sandbox takes none of it. A macOS sandbox's disk
-    /// grows while it is shut down and shrinks while it runs, and its guest
-    /// finishes either on its next boot. The host limits (--cpus,
+    /// needs. A suspended sandbox takes none of it without `--boot`. A macOS
+    /// sandbox's disk grows while it is shut down and shrinks while it runs,
+    /// and its guest finishes either on its next boot. The host limits (--cpus,
     /// --cpu-shares, --cpuset-cpus, --blkio-weight) move together: live on a
     /// running sandbox, otherwise when it next runs. Each change is reported
     /// as live, partial, next boot, offline or refused with the reason; any
     /// refusal or partial change exits non-zero.
+    ///
+    /// A suspended or shut-down sandbox is resized only if the new shape fits
+    /// its node: a shape that does not is refused with the shortfall and
+    /// nothing changes. `--boot` resizes one that is not running and boots
+    /// it in the same call; a suspended one is resumed and shut down cleanly
+    /// first, once the new shape is known to fit.
     Resources {
         id: String,
         #[arg(long)]
@@ -725,6 +731,9 @@ enum ConfigCommand {
         disk_mib: Option<u32>,
         #[command(flatten)]
         limits: HostLimitFlags,
+        /// Boot the sandbox on its new shape if it is not running.
+        #[arg(long)]
+        boot: bool,
     },
     /// Grow or shrink a sandbox's root disk: `config resources --disk-mib`.
     Disk {
@@ -2509,6 +2518,7 @@ async fn main() -> anyhow::Result<()> {
             mem_mib,
             disk_mib,
             limits,
+            boot,
         }) => {
             let request = api::UpdateResourcesRequest {
                 sandbox_id: id,
@@ -2519,6 +2529,7 @@ async fn main() -> anyhow::Result<()> {
                 cpu_shares: limits.cpu_shares,
                 cpuset_cpus: limits.cpuset_cpus,
                 blkio_weight: limits.blkio_weight,
+                boot,
             };
             update_resources(&mut client, request).await?;
         }

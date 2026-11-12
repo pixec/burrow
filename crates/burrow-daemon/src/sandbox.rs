@@ -558,7 +558,7 @@ pub struct Lifetimes {
 
 /// What became of each field of a resources update, `None` for a field not
 /// asked for.
-#[derive(Default)]
+#[derive(Debug, Default)]
 pub struct ResourcesUpdated {
     pub vcpus: Option<ResourceOutcome>,
     pub mem_mib: Option<ResourceOutcome>,
@@ -4853,6 +4853,12 @@ impl SandboxManager {
     /// state and hypervisor allow, and says per field what was done. The disk
     /// goes first: a shrink is the one change that can be refused for what
     /// the guest wrote.
+    ///
+    /// A sandbox that is not running is resized only if the shape it ends
+    /// with fits this node, checked before anything changes. With `boot`, a
+    /// suspended one is then shut down cleanly so it can take the changes;
+    /// booting it on them is the caller's.
+    #[allow(clippy::too_many_arguments)]
     pub async fn update_machine(
         &self,
         id: &str,
@@ -4860,8 +4866,16 @@ impl SandboxManager {
         mem_mib: Option<u32>,
         disk_mib: Option<u32>,
         limits: LimitsUpdate,
+        boot: bool,
     ) -> Result<(common::Sandbox, ResourcesUpdated), Status> {
         let sandbox = self.get(id).await?;
+        if !sandbox.is_running() {
+            self.admit_shape(&sandbox, vcpus, mem_mib, disk_mib, limits.cpus, boot)
+                .await?;
+            if boot && sandbox.is_suspended() {
+                self.stop(id).await?;
+            }
+        }
         let mut updated = ResourcesUpdated::default();
         if let Some(mib) = disk_mib {
             let current = sandbox.disk_mib();
@@ -4889,6 +4903,42 @@ impl SandboxManager {
             updated.limits = Some(self.update_limits(&sandbox, limits).await?);
         }
         Ok((sandbox.record(), updated))
+    }
+
+    /// Refuses a shape for a sandbox that is not running which this node has
+    /// no room for, naming the shortfall: the memory ceiling it would boot
+    /// with (on a boot, or a grow), the CPU it would be charged, and the disk
+    /// it would grow by.
+    async fn admit_shape(
+        &self,
+        sandbox: &RunningSandbox,
+        vcpus: Option<u32>,
+        mem_mib: Option<u32>,
+        disk_mib: Option<u32>,
+        cpus: Option<f64>,
+        boot: bool,
+    ) -> Result<(), Status> {
+        let current_mem = sandbox.mem_mib();
+        let mem = mem_mib.unwrap_or(current_mem);
+        if boot || mem > current_mem {
+            let ceiling = self.config.memory_ceiling_mib(sandbox.hypervisor, mem);
+            self.admit_memory(0, ceiling)?;
+        }
+        let cap = cpus.map_or_else(
+            || sandbox.spec.lock().unwrap().limits.cpu_max_millis,
+            burrow_common::cpu::cap_millis,
+        );
+        let charge = burrow_common::cpu::charge_millis(vcpus.unwrap_or(sandbox.vcpus()), cap);
+        self.admit_cpu(sandbox.cpu_charge_millis(), charge).await?;
+        if let Some(mib) = disk_mib.filter(|mib| *mib > sandbox.disk_mib()) {
+            self.admit_disk(
+                &sandbox.record().node_id,
+                "grow a disk",
+                u64::from(mib - sandbox.disk_mib()) * burrow_common::disk::MIB,
+            )
+            .await?;
+        }
+        Ok(())
     }
 
     /// Moves a sandbox's host CPU and IO limits: on its running VMM's cgroup
@@ -5293,7 +5343,7 @@ impl SandboxManager {
         } else if slot.is_none() && !is_stopped {
             Some(format!(
                 "sandbox {id} is suspended, and its restore needs the machine its snapshot was \
-                 taken of; resume it or shut it down first"
+                 taken of; resize it with boot to have it shut down cleanly, resized and booted"
             ))
         } else {
             None
@@ -11755,6 +11805,81 @@ pub(crate) mod tests {
         assert!(reason.contains("unknown option"), "{reason}");
         drop(slot);
         let _ = std::fs::remove_dir_all(&workdir);
+    }
+
+    /// A sandbox that is not running used to be resized, and a suspended
+    /// one shut down for it, before anything asked whether the new shape fit
+    /// the node. A shape that does not fit is refused with the shortfall, and
+    /// the sandbox is left exactly as it was.
+    #[tokio::test]
+    async fn a_shape_the_node_has_no_room_for_changes_nothing() {
+        let manager = manager().await;
+        let stopped = running("sbx_stopped");
+        stopped.set_state(common::SandboxState::Stopped);
+        let suspended = running("sbx_suspended");
+        suspended.enter_suspended();
+        for sandbox in [&stopped, &suspended] {
+            manager
+                .sandboxes
+                .lock()
+                .await
+                .insert(sandbox.id().to_string(), Arc::clone(sandbox));
+        }
+        let before = (stopped.vcpus(), stopped.mem_mib());
+
+        let err = manager
+            .update_machine(
+                "sbx_stopped",
+                None,
+                Some(64 << 20),
+                None,
+                LimitsUpdate::default(),
+                false,
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(err.code(), tonic::Code::ResourceExhausted);
+        assert!(
+            err.message().contains("MiB more do not fit"),
+            "{}",
+            err.message()
+        );
+
+        let err = manager
+            .update_machine(
+                "sbx_stopped",
+                Some(node_cpus() * 64),
+                None,
+                None,
+                LimitsUpdate::default(),
+                false,
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(err.code(), tonic::Code::ResourceExhausted);
+        assert!(
+            err.message().contains("more do not fit"),
+            "{}",
+            err.message()
+        );
+        assert_eq!((stopped.vcpus(), stopped.mem_mib()), before);
+
+        let err = manager
+            .update_machine(
+                "sbx_suspended",
+                None,
+                Some(64 << 20),
+                None,
+                LimitsUpdate::default(),
+                true,
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(err.code(), tonic::Code::ResourceExhausted);
+        assert!(
+            suspended.is_suspended(),
+            "nothing may be discarded for a shape that does not fit"
+        );
     }
 
     /// A stop used to discard a suspended sandbox's snapshot outright, and

@@ -360,6 +360,35 @@ impl NodeApi {
     /// For a recreation the previous instance is deleted here, after the
     /// composition has been planned against its retained storage and before
     /// the replacement takes its id.
+    /// Boots a stopped sandbox, and runs a Kit's startup again on it.
+    async fn start(&self, id: &str) -> Result<common::Sandbox, Status> {
+        let starting = id.to_string();
+        let sandbox = self
+            .sandboxes
+            .detached(move |sandboxes| async move { sandboxes.start(&starting).await })
+            .await?;
+        if let Some(kit) = &sandbox.kit {
+            // A boot is a boot: files land again and startup hooks run again,
+            // under the runtime policy the record already carries.
+            let running = self.sandboxes.get(id).await?;
+            let Some(template) = self.sandboxes.environment_of(&running).await.kit else {
+                return Err(Status::failed_precondition(format!(
+                    "template {} is no longer a kit template",
+                    sandbox.template
+                )));
+            };
+            let plan = crate::kit::plan(
+                &template,
+                kit,
+                &sandbox.kit_credentials,
+                &running.policy().resources.unwrap_or_default(),
+            )?;
+            crate::kit::provision(&self.sandboxes, &running, &plan, crate::kit::Boot::Restart)
+                .await?;
+        }
+        Ok(redact_secrets(self.sandboxes.get(id).await?.record()))
+    }
+
     async fn create_kit(
         &self,
         request: KitCreate,
@@ -826,33 +855,7 @@ impl NodeService for NodeApi {
     ) -> Result<Response<common::Sandbox>, Status> {
         self.sandboxes.admit()?;
         let id = req.into_inner().sandbox_id;
-        let starting = id.clone();
-        let sandbox = self
-            .sandboxes
-            .detached(move |sandboxes| async move { sandboxes.start(&starting).await })
-            .await?;
-        if let Some(kit) = &sandbox.kit {
-            // A boot is a boot: files land again and startup hooks run again,
-            // under the runtime policy the record already carries.
-            let running = self.sandboxes.get(&id).await?;
-            let Some(template) = self.sandboxes.environment_of(&running).await.kit else {
-                return Err(Status::failed_precondition(format!(
-                    "template {} is no longer a kit template",
-                    sandbox.template
-                )));
-            };
-            let plan = crate::kit::plan(
-                &template,
-                kit,
-                &sandbox.kit_credentials,
-                &running.policy().resources.unwrap_or_default(),
-            )?;
-            crate::kit::provision(&self.sandboxes, &running, &plan, crate::kit::Boot::Restart)
-                .await?;
-        }
-        Ok(Response::new(redact_secrets(
-            self.sandboxes.get(&id).await?.record(),
-        )))
+        Ok(Response::new(self.start(&id).await?))
     }
 
     /// Replaces a sandbox's root disk under the same id.
@@ -1086,7 +1089,8 @@ impl NodeService for NodeApi {
         req.vcpus.map(vcpus).transpose()?;
         req.mem_mib.map(mem_mib).transpose()?;
         req.disk_mib.map(disk_mib).transpose()?;
-        let (sandbox, updated) = self
+        let id = req.sandbox_id.clone();
+        let (mut sandbox, updated) = self
             .sandboxes
             .detached(move |sandboxes| async move {
                 sandboxes
@@ -1096,10 +1100,14 @@ impl NodeService for NodeApi {
                         req.mem_mib,
                         req.disk_mib,
                         limits,
+                        req.boot,
                     )
                     .await
             })
             .await?;
+        if req.boot && sandbox.state == common::SandboxState::Stopped as i32 {
+            sandbox = self.start(&id).await?;
+        }
         Ok(Response::new(api::UpdateResourcesResponse {
             sandbox: Some(redact_secrets(sandbox)),
             vcpus: updated.vcpus,

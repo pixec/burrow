@@ -306,6 +306,7 @@ message NodeUpdateResourcesRequest {
   optional uint32 cpu_shares = 6;
   optional string cpuset_cpus = 7;
   optional uint32 blkio_weight = 8;
+  bool boot = 9;
 }
 
 message NodeForkRequest {

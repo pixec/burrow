@@ -926,6 +926,7 @@ class Sandbox:
         cpu_shares: Optional[int] = None,
         cpuset_cpus: Optional[str] = None,
         blkio_weight: Optional[int] = None,
+        boot: bool = False,
     ) -> ResourcesUpdate:
         """Changes the sandbox's vCPUs, memory, root disk and host limits. An
         omitted field is left as it is.
@@ -938,7 +939,12 @@ class Sandbox:
         shrink can come back "partial", its `value` being where it stopped. A
         stopped one (`stop`) takes everything: vCPUs and memory on its next
         start, and its disk at once, shrunk by a helper VM that checks the
-        filesystem first. A suspended sandbox takes none of it. The host
+        filesystem first. A suspended sandbox takes none of it unless `boot`
+        is set. A sandbox that is not running is resized only if the new
+        shape fits its node, and otherwise raises `resource_exhausted` with
+        nothing changed. `boot=True` resizes one that is not running and
+        starts it in the same call, a suspended one being resumed and stopped
+        cleanly first, once the shape is known to fit. The host
         limits (`cpus`, `cpu_shares`, `cpuset_cpus`, `blkio_weight`) move live
         on a running sandbox and otherwise when it next runs; 0, or an empty
         `cpuset_cpus`, clears one. What cannot be applied is reported as
@@ -974,6 +980,7 @@ class Sandbox:
                 cpu_shares=cpu_shares,
                 cpuset_cpus=cpuset_cpus,
                 blkio_weight=blkio_weight,
+                boot=boot,
             ),
             # A shrink boots a helper VM that checks the filesystem first.
             600.0,

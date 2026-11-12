@@ -420,6 +420,12 @@ export interface ResourceUpdateOptions extends CallOptions {
   cpuShares?: number;
   cpusetCpus?: string;
   blkioWeight?: number;
+  /**
+   * Resize a sandbox that is not running and start it in the same call. A
+   * suspended one is resumed and stopped cleanly first, once the new shape
+   * is known to fit its node.
+   */
+  boot?: boolean;
 }
 
 /**

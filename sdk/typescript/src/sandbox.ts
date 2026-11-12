@@ -896,7 +896,10 @@ export class Sandbox {
    * back `partial`, its `value` being where it stopped. A shut-down one
    * ({@link stop}) takes everything: vCPUs and memory on its next boot, and
    * its disk at once, shrunk by a helper VM that checks the filesystem first.
-   * A suspended sandbox takes none of it. The host limits (`cpus`,
+   * A suspended sandbox takes none of it unless `boot` is set. A sandbox
+   * that is not running is resized only if the new shape fits its node, and
+   * otherwise throws `resource_exhausted` with nothing changed. The host
+   * limits (`cpus`,
    * `cpuShares`, `cpusetCpus`, `blkioWeight`) move live on a running sandbox
    * and otherwise when it next runs. What cannot be applied is reported as
    * `refused` with the reason rather than thrown, so check each field you
@@ -928,6 +931,7 @@ export class Sandbox {
         cpuShares: options.cpuShares,
         cpusetCpus: options.cpusetCpus,
         blkioWeight: options.blkioWeight,
+        boot: options.boot,
       },
       // A shrink boots a helper VM that checks the filesystem first.
       { ...options, timeoutMs: options.timeoutMs ?? 600_000 },

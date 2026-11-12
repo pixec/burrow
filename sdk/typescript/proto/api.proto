@@ -676,8 +676,8 @@ message UpdateLifetimeRequest {
 // and the rest stays plugged. A shut-down sandbox takes all of it: vCPUs and
 // memory on its next boot, and its disk at once, grown on the host or shrunk
 // by a helper VM that checks and shrinks the filesystem first. A suspended
-// sandbox takes none of it: a restore needs the machine its snapshot was
-// taken of.
+// sandbox takes none of it, a restore needing the machine its snapshot was
+// taken of, unless `boot` is set.
 //
 // A macOS sandbox's disk is resized in two halves, since
 // Virtualization.framework changes a disk only under a stopped machine and
@@ -693,6 +693,12 @@ message UpdateLifetimeRequest {
 // are the VMM's cgroup and change together: live on a running sandbox, and on
 // a suspended or shut-down one when it next runs. 0, or an empty cpuset,
 // clears one. A `cpus` above the vcpus the sandbox will have is refused.
+//
+// A suspended or shut-down sandbox is resized only if the shape it ends with
+// fits the node: the memory ceiling it would boot with, the CPU it is charged
+// and the disk it grows by are admitted before anything is changed, and a
+// shape that does not fit is RESOURCE_EXHAUSTED naming the shortfall, with the
+// sandbox left as it was.
 message UpdateResourcesRequest {
   string sandbox_id = 1;
   optional uint32 vcpus = 2;
@@ -702,6 +708,13 @@ message UpdateResourcesRequest {
   optional uint32 cpu_shares = 6;
   optional string cpuset_cpus = 7;
   optional uint32 blkio_weight = 8;
+  // Resize a sandbox that is not running and boot it, in one call. Once the
+  // new shape is admitted, a suspended sandbox is resumed and shut down
+  // cleanly, so its guest writes back what it held, then the changes are
+  // applied as to a shut-down one (NEXT_BOOT, OFFLINE) and it is booted on
+  // them. Nothing is discarded when the shape does not fit. Ignored for a
+  // running sandbox.
+  bool boot = 9;
 }
 
 enum ResourceChange {

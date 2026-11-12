@@ -2426,10 +2426,17 @@ impl Burrow for ApiService {
                 u64::from(mem_mib),
             )
         };
-        let growth = req
-            .mem_mib
-            .filter(|want| *want > current && record.state == common::SandboxState::Running as i32)
-            .map_or(0, |want| charge(want) - charge(current));
+        let is_running = record.state == common::SandboxState::Running as i32;
+        // A boot of a sandbox that is not running is charged its whole ceiling,
+        // since nothing of its memory is in use on the node yet.
+        let growth = match (is_running, req.boot) {
+            (true, _) => req
+                .mem_mib
+                .filter(|want| *want > current)
+                .map_or(0, |want| charge(want) - charge(current)),
+            (false, true) => charge(req.mem_mib.unwrap_or(current)),
+            (false, false) => 0,
+        };
         let (held, refusal) = match growth {
             0 => (None, None),
             mib => match self.hold_growth(&node_id, mib).await {
@@ -2441,6 +2448,9 @@ impl Burrow for ApiService {
             || req.cpu_shares.is_some()
             || req.cpuset_cpus.is_some()
             || req.blkio_weight.is_some();
+        if let Some(reason) = refusal.as_ref().filter(|_| req.boot && !is_running) {
+            return Err(Status::resource_exhausted(reason.clone()));
+        }
         let mut updated = match (&refusal, req.vcpus, req.disk_mib, is_limited) {
             (Some(_), None, None, false) => api::UpdateResourcesResponse {
                 sandbox: self.0.sandboxes.get(&id),
@@ -2458,6 +2468,7 @@ impl Burrow for ApiService {
                     cpu_shares: req.cpu_shares,
                     cpuset_cpus: req.cpuset_cpus,
                     blkio_weight: req.blkio_weight,
+                    boot: req.boot,
                 })
                 .await?
                 .into_inner(),
@@ -2476,8 +2487,13 @@ impl Burrow for ApiService {
                 Ok(api::ResourceChange::Live | api::ResourceChange::Partial)
             )
         });
+        let is_booted = !is_running
+            && updated
+                .sandbox
+                .as_ref()
+                .is_some_and(|sandbox| sandbox.state == common::SandboxState::Running as i32);
         if let Some(guard) = held
-            && is_plugged
+            && (is_plugged || is_booted)
         {
             guard.keep();
         }
@@ -5156,6 +5172,50 @@ mod create_tests {
             .into_inner();
         assert_eq!(sandbox.id, "sbx_reported");
         assert_eq!(calls.load(Ordering::SeqCst), 1);
+    }
+
+    /// A boot of a resized sandbox is charged its whole memory ceiling, and
+    /// one the node has no room for is refused before the node is asked to
+    /// change anything.
+    #[tokio::test]
+    async fn a_resize_and_boot_the_node_has_no_room_for_is_refused_first() {
+        let (api, _) = fleet(10, 0).await;
+        api.0.nodes.heartbeat(
+            "n1",
+            common::NodeStatus {
+                templates: vec!["t".into()],
+                free_mem_mib: 256,
+                ..Default::default()
+            },
+            Some(common::NodeInfo {
+                address: api
+                    .0
+                    .nodes
+                    .endpoint("n1")
+                    .unwrap()
+                    .trim_start_matches("http://")
+                    .into(),
+                policy_features: vec![burrow_common::features::UPDATE_RESOURCES.into()],
+                ..Default::default()
+            }),
+        );
+        api.0.sandboxes.insert(common::Sandbox {
+            id: "sbx_stopped".into(),
+            node_id: "n1".into(),
+            state: common::SandboxState::Stopped as i32,
+            ..Default::default()
+        });
+        let err = api
+            .update_resources(Request::new(api::UpdateResourcesRequest {
+                sandbox_id: "sbx_stopped".into(),
+                mem_mib: Some(4096),
+                boot: true,
+                ..Default::default()
+            }))
+            .await
+            .unwrap_err();
+        assert_eq!(err.code(), tonic::Code::ResourceExhausted);
+        assert!(err.message().contains("no room"), "{}", err.message());
     }
 
     #[test]

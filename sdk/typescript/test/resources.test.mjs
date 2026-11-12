@@ -42,6 +42,7 @@ test("a resources update names its fields and reads back each outcome", async ()
     cpuShares: undefined,
     cpusetCpus: undefined,
     blkioWeight: undefined,
+    boot: undefined,
   });
   assert.equal(calls[0].timeoutMs, 600_000);
   assert.deepEqual(updated, {
