@@ -9,6 +9,12 @@ pub enum NetError {
     #[error("node index {index} is outside the pool: only {max} nodes are addressable")]
     NodeIndexOutOfRange { index: u32, max: u32 },
 
+    #[error("address block {block} is outside this node's blocks {first}..{end}")]
+    LeaseBlockOutOfRange { block: u32, first: u32, end: u32 },
+
+    #[error("address block {block} is already leased to sandbox {sandbox_id}")]
+    LeaseBlockInUse { block: u32, sandbox_id: String },
+
     #[error("{command} failed ({status}): {stderr}")]
     Command {
         command: String,

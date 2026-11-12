@@ -8932,6 +8932,66 @@ pub(crate) mod tests {
         tokio::fs::remove_dir_all(&data_dir).await.ok();
     }
 
+    /// A recorded lease the node cannot hold, here one from the next node's
+    /// slice, must not cost the sandbox its snapshot. It is kept out of
+    /// service with the reason, and can still be deleted.
+    #[tokio::test]
+    async fn a_sandbox_whose_lease_cannot_be_reserved_is_held() {
+        let id = "ghost-foreign-lease";
+        let (manager, data_dir) = recovering("foreign-lease").await;
+        let workdir = manager.config.sandbox_dir(id, Hypervisor::Firecracker);
+        std::fs::create_dir_all(&workdir).unwrap();
+        let layout = Hypervisor::Firecracker.layout();
+        for file in [layout.state, crate::rootdisk::SCRATCH_DISK] {
+            tokio::fs::write(workdir.join(file), b"kept").await.unwrap();
+        }
+        let orphan = data_dir.join("sandboxes").join("ghost-nobody");
+        std::fs::create_dir_all(&orphan).unwrap();
+        let foreign = row(
+            id,
+            common::SandboxState::Suspended,
+            burrow_net::ipam::BLOCKS_PER_NODE,
+        );
+        manager.store.put_sandbox(&foreign).await.unwrap();
+
+        manager.recover().await;
+
+        assert_eq!(manager.store.list_sandboxes().await.unwrap().len(), 1);
+        assert!(workdir.join(layout.state).exists());
+        assert!(!orphan.exists());
+        let listed = manager.list().await;
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].state, common::SandboxState::Failed as i32);
+        assert!(
+            listed[0].state_reason.contains("address block"),
+            "{}",
+            listed[0].state_reason
+        );
+        let reports = manager.state_reports().await;
+        assert_eq!(reports.len(), 1);
+        assert_eq!(reports[0].state, common::SandboxState::Failed as i32);
+        let err = manager.get(id).await.err().unwrap();
+        assert_eq!(err.code(), tonic::Code::FailedPrecondition);
+        assert_eq!(
+            manager.record_of(id).await.unwrap().state,
+            common::SandboxState::Failed as i32
+        );
+        let kinds: Vec<_> = events_of(&manager, id)
+            .await
+            .iter()
+            .map(|event| event.kind)
+            .collect();
+        assert_eq!(kinds, [EVENT_RECOVERED as i32]);
+
+        manager.delete(id).await.unwrap();
+        assert!(manager.store.list_sandboxes().await.unwrap().is_empty());
+        assert!(manager.list().await.is_empty());
+        assert!(!workdir.exists());
+        let last = events_of(&manager, id).await.pop().unwrap();
+        assert_eq!(last.kind, EVENT_DESTROYED as i32);
+        tokio::fs::remove_dir_all(&data_dir).await.ok();
+    }
+
     /// A sandbox with neither memory nor disk left is the one thing recovery
     /// drops, and it says so with the last figures the node had.
     #[tokio::test]

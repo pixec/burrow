@@ -171,10 +171,8 @@ impl Ipam {
             return Ok(lease_for(*block));
         }
         let used: std::collections::HashSet<u32> = allocated.values().copied().collect();
-        // Block 0 of the whole pool is skipped so the first host address is
-        // never the network address; later nodes may use their first block.
-        let first = self.base_block.max(1);
-        let block = (first..self.base_block + BLOCKS_PER_NODE)
+        let block = self
+            .blocks()
             .find(|b| !used.contains(b))
             .ok_or(NetError::AddressPoolExhausted)?;
         allocated.insert(sandbox_id.to_string(), block);
@@ -195,8 +193,37 @@ impl Ipam {
 
     /// Restores a lease recorded elsewhere (e.g. loaded from disk at startup),
     /// so recovered sandboxes do not have their addresses handed to others.
+    ///
+    /// A block outside this node's slice, or one another sandbox holds, is
+    /// refused and nothing changes.
     pub fn reserve(&self, sandbox_id: &str, block: u32) -> Result<()> {
-        todo!("cleanroom: S1")
+        let blocks = self.blocks();
+        if !blocks.contains(&block) {
+            return Err(NetError::LeaseBlockOutOfRange {
+                block,
+                first: blocks.start,
+                end: blocks.end,
+            });
+        }
+        let mut allocated = self.allocated.lock().unwrap();
+        if let Some((holder, _)) = allocated
+            .iter()
+            .find(|(id, held)| **held == block && id.as_str() != sandbox_id)
+        {
+            return Err(NetError::LeaseBlockInUse {
+                block,
+                sandbox_id: holder.clone(),
+            });
+        }
+        allocated.insert(sandbox_id.to_string(), block);
+        Ok(())
+    }
+
+    /// The blocks this node may lease. Block 0 of the whole pool is skipped so
+    /// the first host address is never the network address; later nodes may
+    /// use their first block.
+    fn blocks(&self) -> std::ops::Range<u32> {
+        self.base_block.max(1)..self.base_block + BLOCKS_PER_NODE
     }
 }
 
@@ -325,6 +352,67 @@ mod tests {
         ipam.release("a");
         let b = ipam.allocate("b").unwrap();
         assert_eq!(a.guest_ip, b.guest_ip);
+    }
+
+    #[test]
+    fn a_restored_block_held_by_another_sandbox_is_refused() {
+        let ipam = Ipam::for_node(0).unwrap();
+        ipam.reserve("sbx_a", 1).unwrap();
+        let err = ipam.reserve("sbx_b", 1).unwrap_err();
+        assert!(
+            matches!(&err, NetError::LeaseBlockInUse { block: 1, sandbox_id } if sandbox_id == "sbx_a"),
+            "got {err}"
+        );
+        assert_eq!(ipam.get("sbx_a").unwrap().block, 1);
+        assert!(ipam.get("sbx_b").is_none());
+    }
+
+    #[test]
+    fn a_restored_block_from_another_node_is_refused() {
+        let ipam = Ipam::for_node(1).unwrap();
+        for block in [1, BLOCKS_PER_NODE - 1, 2 * BLOCKS_PER_NODE] {
+            let err = ipam.reserve("sbx", block).unwrap_err();
+            assert!(
+                matches!(err, NetError::LeaseBlockOutOfRange { block: got, first, end }
+                    if got == block && first == BLOCKS_PER_NODE && end == 2 * BLOCKS_PER_NODE),
+                "{block} must be refused, got {err}"
+            );
+        }
+        assert!(ipam.get("sbx").is_none());
+    }
+
+    #[test]
+    fn block_zero_cannot_be_restored() {
+        let ipam = Ipam::for_node(0).unwrap();
+        for block in [0, u32::MAX] {
+            assert!(matches!(
+                ipam.reserve("", block),
+                Err(NetError::LeaseBlockOutOfRange { first: 1, .. })
+            ));
+        }
+    }
+
+    #[test]
+    fn restoring_a_held_block_again_is_a_no_op() {
+        let ipam = Ipam::for_node(0).unwrap();
+        ipam.reserve("sbx", 7).unwrap();
+        ipam.reserve("sbx", 7).unwrap();
+        assert_eq!(ipam.get("sbx"), Some(lease_for(7)));
+        assert_ne!(ipam.allocate("other").unwrap().block, 7);
+    }
+
+    #[test]
+    fn every_allocated_block_can_be_restored() {
+        let ipam = Ipam::for_node(2).unwrap();
+        let restored = Ipam::for_node(2).unwrap();
+        while let Ok(lease) = ipam.allocate(&format!("s{}", lease_count(&ipam))) {
+            restored.reserve("sbx", lease.block).unwrap();
+        }
+        assert_eq!(lease_count(&ipam), BLOCKS_PER_NODE as usize);
+    }
+
+    fn lease_count(ipam: &Ipam) -> usize {
+        ipam.allocated.lock().unwrap().len()
     }
 
     #[test]

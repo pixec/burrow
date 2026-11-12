@@ -55,11 +55,13 @@ impl Resolutions {
         if sandbox_id.is_empty() || host.is_empty() || addresses.is_empty() {
             return;
         }
+        let host = host.trim_end_matches('.').to_ascii_lowercase();
         let lifetime = pin_lifetime(ttl);
         let mut table = self.by_sandbox.write().unwrap();
         let names = table.entry(sandbox_id.to_string()).or_default();
 
-        if names.len() >= MAX_NAMES_PER_SANDBOX {
+        // Refreshing a name already held never grows the table.
+        if !names.contains_key(&host) && names.len() >= MAX_NAMES_PER_SANDBOX {
             let now = Instant::now();
             names.retain(|_, pin| pin.expires > now);
             // Still full of live entries: refuse to grow rather than evict
@@ -70,7 +72,7 @@ impl Resolutions {
         }
 
         names.insert(
-            host.trim_end_matches('.').to_ascii_lowercase(),
+            host,
             Pin {
                 addresses,
                 expires: Instant::now() + lifetime,
@@ -336,6 +338,49 @@ mod tests {
         denied.replace([edge]);
         assert!(!denied.is_denied(orchestrator));
         assert!(denied.is_denied(edge));
+    }
+
+    fn full_table(first: IpAddr) -> Resolutions {
+        let resolutions = Resolutions::default();
+        for i in 0..MAX_NAMES_PER_SANDBOX {
+            resolutions.record(
+                "sbx",
+                &format!("host{i}.example"),
+                vec![first],
+                Duration::from_secs(300),
+            );
+        }
+        resolutions
+    }
+
+    /// A full table must not freeze a name it already holds on stale
+    /// addresses: the proxy would refuse the fresh answer until expiry.
+    #[test]
+    fn a_held_name_is_refreshed_when_the_table_is_full() {
+        let stale = IpAddr::from([198, 51, 100, 1]);
+        let fresh = IpAddr::from([198, 51, 100, 2]);
+        let resolutions = full_table(stale);
+        resolutions.record(
+            "sbx",
+            "HOST7.Example.",
+            vec![fresh],
+            Duration::from_secs(300),
+        );
+        assert!(resolutions.is_pinned("sbx", "host7.example", fresh));
+        assert!(!resolutions.is_pinned("sbx", "host7.example", stale));
+    }
+
+    #[test]
+    fn a_new_name_is_refused_when_the_table_is_full_of_live_pins() {
+        let address = IpAddr::from([198, 51, 100, 1]);
+        let resolutions = full_table(address);
+        resolutions.record(
+            "sbx",
+            "late.example",
+            vec![address],
+            Duration::from_secs(300),
+        );
+        assert!(!resolutions.is_pinned("sbx", "late.example", address));
     }
 
     fn response(host: &str, addresses: &[Ipv4Addr], ttl: u32) -> Vec<u8> {
