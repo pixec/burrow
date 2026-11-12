@@ -799,6 +799,12 @@ struct CreateFlags {
     /// once the sandbox exists.
     #[arg(long)]
     name: Option<String>,
+    /// Makes the create safe to retry: a create with the request id of one
+    /// that already made a sandbox returns that sandbox instead of making
+    /// another, and one still running is waited for. Up to 128 characters
+    /// of [A-Za-z0-9._:-].
+    #[arg(long)]
+    request_id: Option<String>,
     /// Template to boot, as imported by `burrow pull`. Required unless
     /// `--snapshot` is given, which carries its own. A template pulled from
     /// Docker Sandbox Kits is provisioned the way their descriptors ask.
@@ -3325,6 +3331,7 @@ fn create_request(flags: CreateFlags) -> anyhow::Result<api::CreateSandboxReques
     let CreateFlags {
         ips,
         name,
+        request_id,
         template,
         kit_args,
         kit_env,
@@ -3362,6 +3369,7 @@ fn create_request(flags: CreateFlags) -> anyhow::Result<api::CreateSandboxReques
     Ok(api::CreateSandboxRequest {
         public_ips: ips,
         name: name.unwrap_or_default(),
+        request_id: request_id.unwrap_or_default(),
         template,
         snapshot: snapshot.unwrap_or_default(),
         policy: Some(common::Policy {
@@ -6713,6 +6721,7 @@ mod tests {
         fn base() -> CreateFlags {
             CreateFlags {
                 name: None,
+                request_id: None,
                 template: None,
                 kit_args: Vec::new(),
                 kit_env: Vec::new(),

@@ -147,6 +147,9 @@ pub struct SandboxRegistry {
     creating: Mutex<HashSet<String>>,
     /// Names whose create is in flight, held for the same reason as `creating`.
     naming: Mutex<HashSet<String>>,
+    /// Request ids whose create is in flight here, and the sandbox id each
+    /// is building.
+    requesting: Mutex<HashMap<String, String>>,
     /// Unplaced sandboxes being handed to a node, so two starts of one cannot
     /// give it to two.
     adopting: Mutex<HashSet<String>>,
@@ -229,6 +232,7 @@ impl SandboxRegistry {
             tombstone_deletes: Mutex::new(HashMap::new()),
             creating: Mutex::new(HashSet::new()),
             naming: Mutex::new(HashSet::new()),
+            requesting: Mutex::new(HashMap::new()),
             adopting: Mutex::new(HashSet::new()),
             settling: Mutex::new(HashMap::new()),
             writer: Some(crate::persist::Writer::spawn(Arc::clone(&store))),
@@ -273,6 +277,66 @@ impl SandboxRegistry {
             }
         }
         Ok(reservation)
+    }
+
+    /// Claims a create's request id for `id`, here and in the store, so a
+    /// retry of it through any replica waits for this create rather than
+    /// making a second sandbox.
+    pub async fn claim_request(
+        &self,
+        request: &str,
+        id: &str,
+    ) -> Result<RequestClaim<'_>, RequestTaken> {
+        {
+            let mut requesting = self.requesting.lock().unwrap();
+            if requesting.contains_key(request) {
+                return Err(RequestTaken::InFlight);
+            }
+            requesting.insert(request.to_string(), id.to_string());
+        }
+        let mut claim = RequestClaim {
+            registry: self,
+            request: request.to_string(),
+            id: id.to_string(),
+            is_stored: false,
+        };
+        let Some(store) = &self.store else {
+            return Ok(claim);
+        };
+        let key = crate::persist::request_key(request);
+        match store.claim(&key, id, burrow_common::unix_now()).await {
+            Ok(true) => {
+                claim.is_stored = true;
+                Ok(claim)
+            }
+            Ok(false) => Err(RequestTaken::InFlight),
+            Err(err) => Err(RequestTaken::Failed(format!(
+                "could not claim {key}: {err}"
+            ))),
+        }
+    }
+
+    /// The sandbox a create with this request id made, here or through
+    /// another replica.
+    pub async fn by_request(&self, request: &str) -> Option<common::Sandbox> {
+        let held = self
+            .sandboxes
+            .lock()
+            .unwrap()
+            .values()
+            .find(|s| s.create_request_id == request)
+            .cloned();
+        if held.is_some() {
+            return held;
+        }
+        let store = self.store.as_ref()?;
+        let id = store
+            .claim_holder(&crate::persist::request_key(request))
+            .await
+            .ok()
+            .flatten()?;
+        let row = store.get_placement(&id).await.ok().flatten()?;
+        self.cache(row)
     }
 
     /// Replaces the cached placements and tombstones with the store's, for
@@ -1245,6 +1309,38 @@ impl Drop for Reservation<'_> {
         }
         self.registry.creating.lock().unwrap().remove(&self.id);
         self.registry.naming.lock().unwrap().remove(&self.name);
+    }
+}
+
+/// Why a create could not claim its request id.
+pub enum RequestTaken {
+    /// Another create of it is running.
+    InFlight,
+    Failed(String),
+}
+
+/// A create's claim on its request id. Given back if the create made no
+/// sandbox; otherwise kept in the store with the sandbox's other claims.
+pub struct RequestClaim<'a> {
+    registry: &'a SandboxRegistry,
+    request: String,
+    id: String,
+    is_stored: bool,
+}
+
+impl Drop for RequestClaim<'_> {
+    fn drop(&mut self) {
+        self.registry
+            .requesting
+            .lock()
+            .unwrap()
+            .remove(&self.request);
+        if self.is_stored && self.registry.get(&self.id).is_none() {
+            self.registry.write(crate::persist::Op::ReleaseClaim {
+                key: crate::persist::request_key(&self.request),
+                holder: self.id.clone(),
+            });
+        }
     }
 }
 

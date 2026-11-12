@@ -456,6 +456,7 @@ async fn run_build(
             // A build sandbox is internal and short-lived; naming it would
             // spend a name from a namespace the caller owns.
             String::new(),
+            String::new(),
         )
         .await?;
 

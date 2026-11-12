@@ -48,6 +48,7 @@ class Sandboxes:
         template: str = "",
         snapshot: str = "",
         name: str = "",
+        request_id: str = "",
         tags: Optional[Dict[str, str]] = None,
         node_labels: Optional[Dict[str, str]] = None,
         public_ips: Optional[List[str]] = None,
@@ -78,7 +79,9 @@ class Sandboxes:
         a bare mode. `public_ips` are allocated addresses attached once it is
         up; a static one places the sandbox on the node it reaches. `env` is
         merged under every command this handle runs and lives on the handle
-        alone.
+        alone. `request_id` makes the create safe to retry: a create naming
+        the request id of one that already made a sandbox returns that
+        sandbox, and one naming a create still running waits for it.
         """
         # A snapshot carries its own template, and one that disagrees is an
         # error, so nothing is sent as if the caller had asked for it. Without
@@ -93,6 +96,7 @@ class Sandboxes:
             )
         request = api_pb2.CreateSandboxRequest(
             name=name,
+            request_id=request_id,
             snapshot=snapshot,
             template=template,
             tags=tags or {},

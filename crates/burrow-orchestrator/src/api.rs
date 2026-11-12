@@ -221,6 +221,449 @@ impl Drop for PlacementGuard<'_> {
 }
 
 impl ApiService {
+    /// Runs a create at most once per request id: a retry of one that made a
+    /// sandbox gets that sandbox, and one of a create still running waits for
+    /// it, up to [`REQUEST_WAIT`].
+    ///
+    /// A node that could not be heard from may still be building the
+    /// sandbox, so then the claim is held until it is reported or
+    /// [`REQUEST_WAIT`] passes, and a retry finds it rather than making
+    /// another.
+    async fn create_once(
+        &self,
+        metadata: tonic::metadata::MetadataMap,
+        req: api::CreateSandboxRequest,
+        reply: tokio::sync::oneshot::Sender<Result<common::Sandbox, Status>>,
+    ) {
+        let request_id = req.request_id.clone();
+        let Some(claim) = self.claimed(metadata, req, reply).await else {
+            return;
+        };
+        let deadline = std::time::Instant::now() + REQUEST_WAIT;
+        while std::time::Instant::now() < deadline
+            && self.0.sandboxes.by_request(&request_id).await.is_none()
+        {
+            tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+        }
+        drop(claim);
+    }
+
+    /// Runs the create and answers `reply`, returning the request claim when
+    /// the node's outcome is unknown.
+    async fn claimed(
+        &self,
+        metadata: tonic::metadata::MetadataMap,
+        req: api::CreateSandboxRequest,
+        reply: tokio::sync::oneshot::Sender<Result<common::Sandbox, Status>>,
+    ) -> Option<crate::sandboxes::RequestClaim<'_>> {
+        let sandbox_id = burrow_common::SandboxId::generate().to_string();
+        if req.request_id.is_empty() {
+            let _ = reply.send(self.create_new(metadata, req, sandbox_id).await);
+            return None;
+        }
+        let claim = match self.claim_request(&req.request_id, &sandbox_id).await {
+            Ok(Ok(claim)) => claim,
+            Ok(Err(sandbox)) => {
+                let _ = reply.send(Ok(sandbox));
+                return None;
+            }
+            Err(err) => {
+                let _ = reply.send(Err(err));
+                return None;
+            }
+        };
+        let created = self.create_new(metadata, req, sandbox_id).await;
+        let is_unknown = created.as_ref().is_err_and(|err| {
+            matches!(
+                err.code(),
+                tonic::Code::Unavailable
+                    | tonic::Code::Unknown
+                    | tonic::Code::Cancelled
+                    | tonic::Code::DeadlineExceeded
+            )
+        });
+        let _ = reply.send(created);
+        is_unknown.then_some(claim)
+    }
+
+    /// Claims `request_id` for a create of `sandbox_id`, or answers with the
+    /// sandbox a create of it made, waiting up to [`REQUEST_WAIT`] for one
+    /// still running.
+    async fn claim_request(
+        &self,
+        request_id: &str,
+        sandbox_id: &str,
+    ) -> Result<Result<crate::sandboxes::RequestClaim<'_>, common::Sandbox>, Status> {
+        let deadline = std::time::Instant::now() + REQUEST_WAIT;
+        let claim = loop {
+            if let Some(sandbox) = self.0.sandboxes.by_request(request_id).await {
+                return Ok(Err(sandbox));
+            }
+            match self.0.sandboxes.claim_request(request_id, sandbox_id).await {
+                Ok(claim) => break claim,
+                Err(crate::sandboxes::RequestTaken::Failed(err)) => {
+                    return Err(Status::unavailable(err));
+                }
+                Err(crate::sandboxes::RequestTaken::InFlight)
+                    if std::time::Instant::now() >= deadline =>
+                {
+                    return Err(Status::aborted(format!(
+                        "a create with request id {request_id} is still running; retry it"
+                    )));
+                }
+                Err(crate::sandboxes::RequestTaken::InFlight) => {
+                    tokio::time::sleep(REQUEST_POLL).await
+                }
+            }
+        };
+        // The create holding the claim may have finished between the lookup
+        // and the claim.
+        match self.0.sandboxes.by_request(request_id).await {
+            Some(sandbox) => Ok(Err(sandbox)),
+            None => Ok(Ok(claim)),
+        }
+    }
+
+    async fn create_new(
+        &self,
+        metadata: tonic::metadata::MetadataMap,
+        mut req: api::CreateSandboxRequest,
+        sandbox_id: String,
+    ) -> Result<common::Sandbox, Status> {
+        let (public_ips, ip_node, ip_labels) =
+            self.ips_for_create(&metadata, &req.public_ips).await?;
+        if !public_ips.is_empty() && !req.snapshot.is_empty() {
+            return Err(Status::invalid_argument(
+                "attach public IPs to a sandbox created from a snapshot once it exists",
+            ));
+        }
+        req.node_labels.extend(ip_labels);
+        // Refused here as well as on the node: placement charges a node and
+        // may replicate a template before the create is ever sent, and none of
+        // that should be spent on a request the node will reject anyway.
+        burrow_common::tags::validate(&req.tags)?;
+        burrow_common::tags::validate_labels(&req.node_labels)?;
+        // A name has to be settled before placement: refusing a duplicate
+        // afterwards would mean charging a node for a sandbox that was never
+        // going to be built.
+        if !req.name.is_empty() {
+            validate_name(&req.name)?;
+        }
+        // The orchestrator owns the id namespace outright: a caller names a
+        // sandbox, and the server says what it is called.
+        // After the id, which a secret's scope may name.
+        if let Some(network) = req.policy.as_mut().and_then(|p| p.network.as_mut()) {
+            let subject = crate::secrets::Subject {
+                id: &sandbox_id,
+                name: &req.name,
+                tags: &req.tags,
+            };
+            self.resolve_secret_refs(network, subject).await?;
+        }
+        // Held until the record is in the registry: an id and a name are both
+        // claims on a namespace, and a create that is still building has to
+        // hold them or a second create makes a duplicate.
+        let reserved = self
+            .0
+            .sandboxes
+            .reserve_claimed(&sandbox_id, &req.name)
+            .await
+            .map_err(Status::already_exists)?;
+
+        // A create from a snapshot goes where the snapshot is, or, for one
+        // the object store holds, to a node that can restore it; the template
+        // and machine shape come from what the snapshot holds rather than
+        // from the request.
+        if !req.snapshot.is_empty() {
+            let placement = crate::registry::Placement {
+                vcpus: 1,
+                mem_mib: 512,
+                node_labels: req.node_labels.clone(),
+                policy_features: crate::registry::policy_features(
+                    req.policy.as_ref().and_then(|p| p.network.as_ref()),
+                ),
+                ..Default::default()
+            };
+            let is_inspected = req
+                .policy
+                .as_ref()
+                .and_then(|p| p.network.as_ref())
+                .is_some_and(|n| n.is_tls_inspected);
+            let (snapshot, node_id, mut client) = self
+                .node_for_snapshot(
+                    &req.snapshot,
+                    &placement,
+                    is_inspected,
+                    req.policy.is_none(),
+                )
+                .await?;
+            let mounts = req
+                .policy
+                .as_ref()
+                .map(|p| p.volumes.clone())
+                .unwrap_or_default();
+            if let Some(node) = self.node_for_volumes(&mounts).await?
+                && node != node_id
+            {
+                return Err(Status::failed_precondition(format!(
+                    "snapshot {} is on node {node_id}, but the requested volumes are on node {node}",
+                    snapshot.id
+                )));
+            }
+            self.bring_volumes(&node_id, &mounts).await?;
+            if !req.template.is_empty() && req.template != snapshot.template {
+                return Err(Status::invalid_argument(format!(
+                    "snapshot {} was taken of template {:?}; a sandbox created from it \
+                     cannot use template {:?}",
+                    snapshot.id, snapshot.template, req.template
+                )));
+            }
+            let _admitted = self.0.admission.admit(&node_id).await;
+            let sandbox = client
+                .create_sandbox(nodepb::NodeCreateRequest {
+                    sandbox_id,
+                    request_id: req.request_id,
+                    template: snapshot.template.clone(),
+                    policy: req.policy,
+                    tags: req.tags,
+                    name: req.name,
+                    snapshot: snapshot.id.clone(),
+                    kit: None,
+                    credentials: HashMap::new(),
+                })
+                .await?
+                .into_inner();
+            self.0.sandboxes.insert(sandbox.clone());
+            drop(reserved);
+            self.write_through().await;
+            tracing::info!(
+                sandbox = sandbox.id,
+                snapshot = snapshot.id,
+                node = node_id,
+                is_fetched = node_id != snapshot.node_id,
+                "sandbox created from a snapshot"
+            );
+            return Ok(sandbox);
+        }
+
+        // No implicit template: burrow has no image of its own to fall back
+        // on, and picking one for the caller would boot something they did not
+        // ask for. Templates come from `burrow pull`.
+        if req.template.is_empty() {
+            return Err(Status::invalid_argument(
+                "a template is required: import one with `burrow pull <image>`, \
+                 or create from a snapshot with --snapshot",
+            ));
+        }
+        let template = req.template;
+
+        // Placement is constrained by where the template lives and where any
+        // private-network peers already are; both are node-local facts that a
+        // free-memory heuristic alone would happily get wrong.
+        let networks: Vec<String> = req
+            .policy
+            .iter()
+            .flat_map(|p| p.networks.iter())
+            .map(|m| m.network.clone())
+            .filter(|name| !name.is_empty())
+            .collect();
+
+        // Defaults mirror the node's own, so placement charges a node the same
+        // resources the sandbox will actually be built with.
+        let resources = req.policy.as_ref().and_then(|p| p.resources.clone());
+        if let Some(r) = &resources {
+            burrow_common::cpu::validate(
+                r.vcpus,
+                r.cpus,
+                r.cpu_shares,
+                &r.cpuset_cpus,
+                r.blkio_weight,
+                None,
+            )
+            .map_err(Status::invalid_argument)?;
+        }
+        let want = crate::registry::Placement {
+            template: template.clone(),
+            prefer_node: self.0.sandboxes.node_hosting_networks(&networks),
+            is_mesh_available: self.0.nodes.is_mesh_available(""),
+            vcpus: resources.as_ref().map(|r| r.vcpus).unwrap_or(0).max(1),
+            cpus: resources.as_ref().map(|r| r.cpus).unwrap_or(0.0),
+            mem_mib: match resources.as_ref().map(|r| r.mem_mib).unwrap_or(0) {
+                0 => 512,
+                mem => mem as u64,
+            },
+            disk_bytes: crate::registry::disk_bytes(resources.as_ref()),
+            // First pass insists the template is already there; only if that
+            // finds nothing do we consider copying it.
+            is_template_transfer_allowed: false,
+            // Carried into the transfer pass too, so copying a template never
+            // widens placement past the hardware the caller asked for.
+            node_labels: req.node_labels,
+            arch: String::new(),
+            hypervisor_version: String::new(),
+            cpu: None,
+            // The template decides, and the node holding it can say which.
+            hypervisor: self.template_hypervisor(&template).await?,
+            policy_features: crate::registry::policy_features(
+                req.policy.as_ref().and_then(|p| p.network.as_ref()),
+            ),
+        };
+        // A mounted volume fixes the node, so placement is not a choice: it is
+        // a check that the node holding the volumes can take the sandbox.
+        let pinned = self
+            .node_for_volumes(
+                &req.policy
+                    .as_ref()
+                    .map(|p| p.volumes.clone())
+                    .unwrap_or_default(),
+            )
+            .await?;
+        let pinned = match (pinned, ip_node) {
+            (Some(volumes), Some(ips)) if volumes != ips => {
+                return Err(Status::failed_precondition(format!(
+                    "the requested volumes are on node {volumes} and the requested static IPs \
+                     reach only node {ips}"
+                )));
+            }
+            (volumes, ips) => volumes.or(ips),
+        };
+        // Whether `place_for` charged the node for this sandbox. A
+        // volume-pinned create never goes through placement, so nothing was
+        // reserved for it, and a guard over it would refund a charge it never
+        // took, out of capacity belonging to whatever create runs alongside it.
+        let mut charged = true;
+        let node_id = match pinned {
+            Some(node_id) => {
+                charged = false;
+                self.require_labels(&node_id, &want.node_labels)?;
+                self.require_policy_features(
+                    &node_id,
+                    req.policy.as_ref().and_then(|p| p.network.as_ref()),
+                )?;
+                if !want.hypervisor.is_empty()
+                    && !self
+                        .0
+                        .nodes
+                        .info(&node_id)
+                        .is_some_and(|info| crate::registry::offers(&info, &want.hypervisor))
+                {
+                    return Err(Status::failed_precondition(format!(
+                        "the requested volumes are on node {node_id}, which does not offer {}, \
+                         the hypervisor template {template} runs under",
+                        want.hypervisor
+                    )));
+                }
+                if self.0.nodes.endpoint(&node_id).is_none() {
+                    return Err(Status::failed_precondition(format!(
+                        "the requested volumes are on node {node_id}, which is unreachable; \
+                         one kept in the object store is attached elsewhere once the node is \
+                         written off"
+                    )));
+                }
+                // The node is not a choice here, so the template has to come to
+                // it rather than the sandbox going where the template is.
+                self.replicate_to(&template, &node_id).await?;
+                node_id
+            }
+            None => match self.place(&want).await {
+                Ok(node_id) => node_id,
+                // Every node that could take the sandbox lacks the template.
+                // Refusing would make placement hostage to wherever a build
+                // happened to land, so copy the template to a node with room.
+                Err(crate::registry::PlacementError::TemplateNotOnAnyNode(name)) => {
+                    self.replicate_then_place(&name, &want).await?
+                }
+                Err(err) => {
+                    return Err(match err {
+                        crate::registry::PlacementError::NoHealthyNode
+                        | crate::registry::PlacementError::NoCapacity { .. } => {
+                            Status::resource_exhausted(err.to_string())
+                        }
+                        crate::registry::PlacementError::PeersUnreachable(_)
+                        | crate::registry::PlacementError::NoNodeWithLabels(_)
+                        | crate::registry::PlacementError::NoNodeWithHypervisor(_)
+                        | crate::registry::PlacementError::NoNodeWithPolicyFeatures(_) => {
+                            Status::failed_precondition(err.to_string())
+                        }
+                        other => Status::not_found(other.to_string()),
+                    });
+                }
+            },
+        };
+        tracing::Span::current().record("template", template.as_str());
+        tracing::Span::current().record("node_id", node_id.as_str());
+
+        // Placement charged the node for this sandbox; every failure from here
+        // has to give that back, or a run of failed creates makes a healthy
+        // node look full. Nothing to give back on the pinned path.
+        let placed = charged.then(|| self.place_guard(&node_id, &want));
+        let endpoint = self
+            .0
+            .nodes
+            .endpoint(&node_id)
+            .ok_or_else(|| Status::unavailable(format!("node {node_id} went away")))?;
+
+        let mut client = connect_node(endpoint, self.0.node_token.as_deref())
+            .await
+            .map_err(|err| Status::unavailable(format!("cannot reach node {node_id}: {err}")))?;
+        self.bring_volumes(
+            &node_id,
+            req.policy
+                .as_ref()
+                .map(|p| p.volumes.as_slice())
+                .unwrap_or_default(),
+        )
+        .await?;
+        let subject = crate::secrets::Subject {
+            id: &sandbox_id,
+            name: &req.name,
+            tags: &req.tags,
+        };
+        let credentials = self
+            .kit_credentials(&mut client, &node_id, &template, subject)
+            .await?;
+
+        let _admitted = self.0.admission.admit(&node_id).await;
+        let sandbox = client
+            .create_sandbox(nodepb::NodeCreateRequest {
+                sandbox_id,
+                request_id: req.request_id,
+                template,
+                policy: req.policy,
+                tags: req.tags,
+                name: req.name,
+                snapshot: String::new(),
+                kit: req.kit,
+                credentials,
+            })
+            .await?
+            .into_inner();
+        // The sandbox exists and the node will report it; the optimistic
+        // charge is now the registry's job, not the guard's.
+        if let Some(placed) = placed {
+            placed.keep();
+        }
+
+        self.0.sandboxes.insert(sandbox.clone());
+        // The registry now holds the sandbox, so the id no longer needs
+        // holding open on its behalf.
+        drop(reserved);
+        self.write_through().await;
+        let sandbox = match public_ips.is_empty() {
+            true => sandbox,
+            false => {
+                self.attach_for_create(&sandbox.id, public_ips).await?;
+                self.0.sandboxes.get(&sandbox.id).unwrap_or(sandbox)
+            }
+        };
+        // The node's record is the truth rather than the request: it carries
+        // the state and addresses the node actually assigned.
+        tracing::info!(sandbox = sandbox.id, node = node_id, "sandbox placed");
+        Ok(sandbox)
+    }
+}
+
+impl ApiService {
     /// Refuses a reshape or a lifetimes update on a node that predates them,
     /// rather than leaving it to answer unimplemented.
     fn require_update_resources(&self, id: &str) -> Result<(), Status> {
@@ -1617,337 +2060,19 @@ impl Burrow for ApiService {
         &self,
         req: Request<api::CreateSandboxRequest>,
     ) -> Result<Response<common::Sandbox>, Status> {
+        use tracing::Instrument as _;
         let metadata = req.metadata().clone();
-        let mut req = req.into_inner();
-        let (public_ips, ip_node, ip_labels) =
-            self.ips_for_create(&metadata, &req.public_ips).await?;
-        if !public_ips.is_empty() && !req.snapshot.is_empty() {
-            return Err(Status::invalid_argument(
-                "attach public IPs to a sandbox created from a snapshot once it exists",
-            ));
-        }
-        req.node_labels.extend(ip_labels);
-        // Refused here as well as on the node: placement charges a node and
-        // may replicate a template before the create is ever sent, and none of
-        // that should be spent on a request the node will reject anyway.
-        burrow_common::tags::validate(&req.tags)?;
-        burrow_common::tags::validate_labels(&req.node_labels)?;
-        // A name has to be settled before placement: refusing a duplicate
-        // afterwards would mean charging a node for a sandbox that was never
-        // going to be built.
-        if !req.name.is_empty() {
-            validate_name(&req.name)?;
-        }
-        // The orchestrator owns the id namespace outright: a caller names a
-        // sandbox, and the server says what it is called.
-        let sandbox_id = burrow_common::SandboxId::generate().to_string();
-        // After the id, which a secret's scope may name.
-        if let Some(network) = req.policy.as_mut().and_then(|p| p.network.as_mut()) {
-            let subject = crate::secrets::Subject {
-                id: &sandbox_id,
-                name: &req.name,
-                tags: &req.tags,
-            };
-            self.resolve_secret_refs(network, subject).await?;
-        }
-        // Held until the record is in the registry: an id and a name are both
-        // claims on a namespace, and a create that is still building has to
-        // hold them or a second create makes a duplicate.
-        let reserved = self
-            .0
-            .sandboxes
-            .reserve_claimed(&sandbox_id, &req.name)
+        let req = req.into_inner();
+        validate_request_id(&req.request_id)?;
+        // On a task of its own, so a caller that gives up does not leave a
+        // sandbox built on its node and missing from the registry.
+        let api = self.clone();
+        let (reply, created) = tokio::sync::oneshot::channel();
+        tokio::spawn(async move { api.create_once(metadata, req, reply).await }.in_current_span());
+        created
             .await
-            .map_err(Status::already_exists)?;
-
-        // A create from a snapshot goes where the snapshot is, or, for one
-        // the object store holds, to a node that can restore it; the template
-        // and machine shape come from what the snapshot holds rather than
-        // from the request.
-        if !req.snapshot.is_empty() {
-            let placement = crate::registry::Placement {
-                vcpus: 1,
-                mem_mib: 512,
-                node_labels: req.node_labels.clone(),
-                policy_features: crate::registry::policy_features(
-                    req.policy.as_ref().and_then(|p| p.network.as_ref()),
-                ),
-                ..Default::default()
-            };
-            let is_inspected = req
-                .policy
-                .as_ref()
-                .and_then(|p| p.network.as_ref())
-                .is_some_and(|n| n.is_tls_inspected);
-            let (snapshot, node_id, mut client) = self
-                .node_for_snapshot(
-                    &req.snapshot,
-                    &placement,
-                    is_inspected,
-                    req.policy.is_none(),
-                )
-                .await?;
-            let mounts = req
-                .policy
-                .as_ref()
-                .map(|p| p.volumes.clone())
-                .unwrap_or_default();
-            if let Some(node) = self.node_for_volumes(&mounts).await?
-                && node != node_id
-            {
-                return Err(Status::failed_precondition(format!(
-                    "snapshot {} is on node {node_id}, but the requested volumes are on node {node}",
-                    snapshot.id
-                )));
-            }
-            self.bring_volumes(&node_id, &mounts).await?;
-            if !req.template.is_empty() && req.template != snapshot.template {
-                return Err(Status::invalid_argument(format!(
-                    "snapshot {} was taken of template {:?}; a sandbox created from it \
-                     cannot use template {:?}",
-                    snapshot.id, snapshot.template, req.template
-                )));
-            }
-            let _admitted = self.0.admission.admit(&node_id).await;
-            let sandbox = client
-                .create_sandbox(nodepb::NodeCreateRequest {
-                    sandbox_id,
-                    template: snapshot.template.clone(),
-                    policy: req.policy,
-                    tags: req.tags,
-                    name: req.name,
-                    snapshot: snapshot.id.clone(),
-                    kit: None,
-                    credentials: HashMap::new(),
-                })
-                .await?
-                .into_inner();
-            self.0.sandboxes.insert(sandbox.clone());
-            drop(reserved);
-            self.write_through().await;
-            tracing::info!(
-                sandbox = sandbox.id,
-                snapshot = snapshot.id,
-                node = node_id,
-                is_fetched = node_id != snapshot.node_id,
-                "sandbox created from a snapshot"
-            );
-            return Ok(Response::new(sandbox));
-        }
-
-        // No implicit template: burrow has no image of its own to fall back
-        // on, and picking one for the caller would boot something they did not
-        // ask for. Templates come from `burrow pull`.
-        if req.template.is_empty() {
-            return Err(Status::invalid_argument(
-                "a template is required: import one with `burrow pull <image>`, \
-                 or create from a snapshot with --snapshot",
-            ));
-        }
-        let template = req.template;
-
-        // Placement is constrained by where the template lives and where any
-        // private-network peers already are; both are node-local facts that a
-        // free-memory heuristic alone would happily get wrong.
-        let networks: Vec<String> = req
-            .policy
-            .iter()
-            .flat_map(|p| p.networks.iter())
-            .map(|m| m.network.clone())
-            .filter(|name| !name.is_empty())
-            .collect();
-
-        // Defaults mirror the node's own, so placement charges a node the same
-        // resources the sandbox will actually be built with.
-        let resources = req.policy.as_ref().and_then(|p| p.resources.clone());
-        if let Some(r) = &resources {
-            burrow_common::cpu::validate(
-                r.vcpus,
-                r.cpus,
-                r.cpu_shares,
-                &r.cpuset_cpus,
-                r.blkio_weight,
-                None,
-            )
-            .map_err(Status::invalid_argument)?;
-        }
-        let want = crate::registry::Placement {
-            template: template.clone(),
-            prefer_node: self.0.sandboxes.node_hosting_networks(&networks),
-            is_mesh_available: self.0.nodes.is_mesh_available(""),
-            vcpus: resources.as_ref().map(|r| r.vcpus).unwrap_or(0).max(1),
-            cpus: resources.as_ref().map(|r| r.cpus).unwrap_or(0.0),
-            mem_mib: match resources.as_ref().map(|r| r.mem_mib).unwrap_or(0) {
-                0 => 512,
-                mem => mem as u64,
-            },
-            disk_bytes: crate::registry::disk_bytes(resources.as_ref()),
-            // First pass insists the template is already there; only if that
-            // finds nothing do we consider copying it.
-            is_template_transfer_allowed: false,
-            // Carried into the transfer pass too, so copying a template never
-            // widens placement past the hardware the caller asked for.
-            node_labels: req.node_labels,
-            arch: String::new(),
-            hypervisor_version: String::new(),
-            cpu: None,
-            // The template decides, and the node holding it can say which.
-            hypervisor: self.template_hypervisor(&template).await?,
-            policy_features: crate::registry::policy_features(
-                req.policy.as_ref().and_then(|p| p.network.as_ref()),
-            ),
-        };
-        // A mounted volume fixes the node, so placement is not a choice: it is
-        // a check that the node holding the volumes can take the sandbox.
-        let pinned = self
-            .node_for_volumes(
-                &req.policy
-                    .as_ref()
-                    .map(|p| p.volumes.clone())
-                    .unwrap_or_default(),
-            )
-            .await?;
-        let pinned = match (pinned, ip_node) {
-            (Some(volumes), Some(ips)) if volumes != ips => {
-                return Err(Status::failed_precondition(format!(
-                    "the requested volumes are on node {volumes} and the requested static IPs \
-                     reach only node {ips}"
-                )));
-            }
-            (volumes, ips) => volumes.or(ips),
-        };
-        // Whether `place_for` charged the node for this sandbox. A
-        // volume-pinned create never goes through placement, so nothing was
-        // reserved for it, and a guard over it would refund a charge it never
-        // took, out of capacity belonging to whatever create runs alongside it.
-        let mut charged = true;
-        let node_id = match pinned {
-            Some(node_id) => {
-                charged = false;
-                self.require_labels(&node_id, &want.node_labels)?;
-                self.require_policy_features(
-                    &node_id,
-                    req.policy.as_ref().and_then(|p| p.network.as_ref()),
-                )?;
-                if !want.hypervisor.is_empty()
-                    && !self
-                        .0
-                        .nodes
-                        .info(&node_id)
-                        .is_some_and(|info| crate::registry::offers(&info, &want.hypervisor))
-                {
-                    return Err(Status::failed_precondition(format!(
-                        "the requested volumes are on node {node_id}, which does not offer {}, \
-                         the hypervisor template {template} runs under",
-                        want.hypervisor
-                    )));
-                }
-                if self.0.nodes.endpoint(&node_id).is_none() {
-                    return Err(Status::failed_precondition(format!(
-                        "the requested volumes are on node {node_id}, which is unreachable; \
-                         one kept in the object store is attached elsewhere once the node is \
-                         written off"
-                    )));
-                }
-                // The node is not a choice here, so the template has to come to
-                // it rather than the sandbox going where the template is.
-                self.replicate_to(&template, &node_id).await?;
-                node_id
-            }
-            None => match self.place(&want).await {
-                Ok(node_id) => node_id,
-                // Every node that could take the sandbox lacks the template.
-                // Refusing would make placement hostage to wherever a build
-                // happened to land, so copy the template to a node with room.
-                Err(crate::registry::PlacementError::TemplateNotOnAnyNode(name)) => {
-                    self.replicate_then_place(&name, &want).await?
-                }
-                Err(err) => {
-                    return Err(match err {
-                        crate::registry::PlacementError::NoHealthyNode
-                        | crate::registry::PlacementError::NoCapacity { .. } => {
-                            Status::resource_exhausted(err.to_string())
-                        }
-                        crate::registry::PlacementError::PeersUnreachable(_)
-                        | crate::registry::PlacementError::NoNodeWithLabels(_)
-                        | crate::registry::PlacementError::NoNodeWithHypervisor(_)
-                        | crate::registry::PlacementError::NoNodeWithPolicyFeatures(_) => {
-                            Status::failed_precondition(err.to_string())
-                        }
-                        other => Status::not_found(other.to_string()),
-                    });
-                }
-            },
-        };
-        tracing::Span::current().record("template", template.as_str());
-        tracing::Span::current().record("node_id", node_id.as_str());
-
-        // Placement charged the node for this sandbox; every failure from here
-        // has to give that back, or a run of failed creates makes a healthy
-        // node look full. Nothing to give back on the pinned path.
-        let placed = charged.then(|| self.place_guard(&node_id, &want));
-        let endpoint = self
-            .0
-            .nodes
-            .endpoint(&node_id)
-            .ok_or_else(|| Status::unavailable(format!("node {node_id} went away")))?;
-
-        let mut client = connect_node(endpoint, self.0.node_token.as_deref())
-            .await
-            .map_err(|err| Status::unavailable(format!("cannot reach node {node_id}: {err}")))?;
-        self.bring_volumes(
-            &node_id,
-            req.policy
-                .as_ref()
-                .map(|p| p.volumes.as_slice())
-                .unwrap_or_default(),
-        )
-        .await?;
-        let subject = crate::secrets::Subject {
-            id: &sandbox_id,
-            name: &req.name,
-            tags: &req.tags,
-        };
-        let credentials = self
-            .kit_credentials(&mut client, &node_id, &template, subject)
-            .await?;
-
-        let _admitted = self.0.admission.admit(&node_id).await;
-        let sandbox = client
-            .create_sandbox(nodepb::NodeCreateRequest {
-                sandbox_id,
-                template,
-                policy: req.policy,
-                tags: req.tags,
-                name: req.name,
-                snapshot: String::new(),
-                kit: req.kit,
-                credentials,
-            })
-            .await?
-            .into_inner();
-        // The sandbox exists and the node will report it; the optimistic
-        // charge is now the registry's job, not the guard's.
-        if let Some(placed) = placed {
-            placed.keep();
-        }
-
-        self.0.sandboxes.insert(sandbox.clone());
-        // The registry now holds the sandbox, so the id no longer needs
-        // holding open on its behalf.
-        drop(reserved);
-        self.write_through().await;
-        let sandbox = match public_ips.is_empty() {
-            true => sandbox,
-            false => {
-                self.attach_for_create(&sandbox.id, public_ips).await?;
-                self.0.sandboxes.get(&sandbox.id).unwrap_or(sandbox)
-            }
-        };
-        // The node's record is the truth rather than the request: it carries
-        // the state and addresses the node actually assigned.
-        tracing::info!(sandbox = sandbox.id, node = node_id, "sandbox placed");
-        Ok(Response::new(sandbox))
+            .map_err(|err| Status::internal(format!("the create did not finish: {err}")))?
+            .map(Response::new)
     }
 
     async fn get_sandbox(
@@ -3917,6 +4042,24 @@ fn validate_secret_name(name: &str) -> Result<(), Status> {
     Ok(())
 }
 
+/// How long a create waits for another create of the same request id.
+const REQUEST_WAIT: std::time::Duration = std::time::Duration::from_secs(120);
+const REQUEST_POLL: std::time::Duration = std::time::Duration::from_millis(200);
+
+#[allow(clippy::result_large_err)]
+fn validate_request_id(request_id: &str) -> Result<(), Status> {
+    let is_valid = request_id.len() <= 128
+        && request_id
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b':' | b'-'));
+    match is_valid {
+        true => Ok(()),
+        false => Err(Status::invalid_argument(
+            "request_id is up to 128 characters of [A-Za-z0-9._:-]",
+        )),
+    }
+}
+
 /// Checks a caller-chosen sandbox name.
 ///
 /// A name goes into hostnames and command lines, and it has to be told apart
@@ -3976,7 +4119,7 @@ mod tests {
         assert_eq!(recorded_hypervisor(""), "firecracker");
     }
 
-    fn replica(sandboxes: crate::sandboxes::SandboxRegistry) -> ApiService {
+    pub(super) fn replica(sandboxes: crate::sandboxes::SandboxRegistry) -> ApiService {
         ApiService(Arc::new(OrchestratorState {
             nodes: crate::registry::NodeRegistry::default(),
             sandboxes,
@@ -4775,6 +4918,242 @@ mod tests {
         ] {
             assert!(validate_sandbox_id(bad).is_err(), "{bad:?}");
         }
+    }
+}
+
+#[cfg(test)]
+mod create_tests {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::task::{Context, Poll};
+
+    use tonic::codegen::{BoxFuture, Service, http};
+
+    use super::*;
+
+    /// A node that answers CreateSandbox after `delay`, failing the first
+    /// `failures` with INTERNAL, and counts the creates it was sent.
+    #[derive(Clone)]
+    struct Node {
+        delay: std::time::Duration,
+        failures: usize,
+        code: tonic::Code,
+        calls: Arc<AtomicUsize>,
+    }
+
+    impl tonic::server::NamedService for Node {
+        const NAME: &'static str = "burrow.node.v1.NodeService";
+    }
+
+    impl Service<http::Request<tonic::body::Body>> for Node {
+        type Response = http::Response<tonic::body::Body>;
+        type Error = std::convert::Infallible;
+        type Future = BoxFuture<Self::Response, Self::Error>;
+
+        fn poll_ready(&mut self, _: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
+            Poll::Ready(Ok(()))
+        }
+
+        fn call(&mut self, req: http::Request<tonic::body::Body>) -> Self::Future {
+            let node = self.clone();
+            Box::pin(async move {
+                let mut grpc = tonic::server::Grpc::new(tonic::codec::ProstCodec::default());
+                Ok(grpc.unary(node, req).await)
+            })
+        }
+    }
+
+    impl tonic::server::UnaryService<nodepb::NodeCreateRequest> for Node {
+        type Response = common::Sandbox;
+        type Future = BoxFuture<Response<common::Sandbox>, Status>;
+
+        fn call(&mut self, req: Request<nodepb::NodeCreateRequest>) -> Self::Future {
+            let node = self.clone();
+            Box::pin(async move {
+                let call = node.calls.fetch_add(1, Ordering::SeqCst);
+                tokio::time::sleep(node.delay).await;
+                if call < node.failures {
+                    return Err(Status::new(node.code, "boot failed"));
+                }
+                let req = req.into_inner();
+                Ok(Response::new(common::Sandbox {
+                    id: req.sandbox_id,
+                    node_id: "n1".into(),
+                    template: req.template,
+                    state: common::SandboxState::Running as i32,
+                    create_request_id: req.request_id,
+                    ..Default::default()
+                }))
+            })
+        }
+    }
+
+    async fn fleet(delay_ms: u64, failures: usize) -> (ApiService, Arc<AtomicUsize>) {
+        fleet_failing(delay_ms, failures, tonic::Code::Internal).await
+    }
+
+    async fn fleet_failing(
+        delay_ms: u64,
+        failures: usize,
+        code: tonic::Code,
+    ) -> (ApiService, Arc<AtomicUsize>) {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let node = Node {
+            delay: std::time::Duration::from_millis(delay_ms),
+            failures,
+            code,
+            calls: Arc::clone(&calls),
+        };
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(
+            tonic::transport::Server::builder()
+                .add_service(node)
+                .serve_with_incoming(tonic::transport::server::TcpIncoming::from(listener)),
+        );
+        let api = super::tests::replica(crate::sandboxes::SandboxRegistry::default());
+        let info = common::NodeInfo {
+            id: "n1".into(),
+            address: addr.to_string(),
+            ..Default::default()
+        };
+        api.0
+            .nodes
+            .register(info, String::new(), String::new(), None)
+            .unwrap();
+        api.0.nodes.heartbeat(
+            "n1",
+            common::NodeStatus {
+                templates: vec!["t".into()],
+                free_mem_mib: 1 << 20,
+                ..Default::default()
+            },
+            None,
+        );
+        (api, calls)
+    }
+
+    fn create(request_id: &str) -> Request<api::CreateSandboxRequest> {
+        Request::new(api::CreateSandboxRequest {
+            template: "t".into(),
+            request_id: request_id.into(),
+            ..Default::default()
+        })
+    }
+
+    async fn settled(api: &ApiService) -> Vec<common::Sandbox> {
+        for _ in 0..200 {
+            if !api.0.sandboxes.list_tagged(Default::default()).is_empty() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        api.0.sandboxes.list_tagged(Default::default())
+    }
+
+    /// A create whose caller gave up used to be cancelled with it, leaving
+    /// the node to finish a sandbox the registry never heard of. It runs to
+    /// its end, at whichever point the caller left.
+    #[tokio::test]
+    async fn a_create_whose_caller_gives_up_still_lands() {
+        for gives_up_ms in [1, 50, 150] {
+            let (api, calls) = fleet(200, 0).await;
+            let given_up = tokio::time::timeout(
+                std::time::Duration::from_millis(gives_up_ms),
+                api.create_sandbox(create("")),
+            )
+            .await;
+            assert!(given_up.is_err());
+            let placed = settled(&api).await;
+            assert_eq!(placed.len(), 1, "gave up after {gives_up_ms}ms");
+            assert_eq!(calls.load(Ordering::SeqCst), 1);
+        }
+    }
+
+    /// A client retrying one create ten times, giving up on most of them at
+    /// different points, ends with one sandbox, built once.
+    #[tokio::test]
+    async fn retries_of_one_request_make_one_sandbox() {
+        let (api, calls) = fleet(300, 0).await;
+        let mut made = std::collections::HashSet::new();
+        for attempt in 0..10u64 {
+            let tried = tokio::time::timeout(
+                std::time::Duration::from_millis(attempt * 40),
+                api.create_sandbox(create("req-1")),
+            )
+            .await;
+            if let Ok(Ok(sandbox)) = tried {
+                made.insert(sandbox.into_inner().id);
+            }
+        }
+        let sandbox = api
+            .create_sandbox(create("req-1"))
+            .await
+            .unwrap()
+            .into_inner();
+        made.insert(sandbox.id.clone());
+        assert_eq!(made.len(), 1, "{made:?}");
+        assert_eq!(sandbox.create_request_id, "req-1");
+        assert_eq!(api.0.sandboxes.list_tagged(Default::default()).len(), 1);
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+
+        let other = api
+            .create_sandbox(create("req-2"))
+            .await
+            .unwrap()
+            .into_inner();
+        assert_ne!(other.id, sandbox.id);
+    }
+
+    /// A create that failed made nothing, so its request id is free for the
+    /// retry to make the sandbox.
+    #[tokio::test]
+    async fn a_failed_create_frees_its_request_id() {
+        let (api, calls) = fleet(10, 1).await;
+        let err = api.create_sandbox(create("req-1")).await.unwrap_err();
+        assert_eq!(err.code(), tonic::Code::Internal);
+        let sandbox = api
+            .create_sandbox(create("req-1"))
+            .await
+            .unwrap()
+            .into_inner();
+        assert_eq!(sandbox.create_request_id, "req-1");
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
+        assert_eq!(api.0.sandboxes.list_tagged(Default::default()).len(), 1);
+    }
+
+    /// A node that could not be heard from may have built the sandbox all
+    /// the same. A retry waits for it to be reported rather than building a
+    /// second.
+    #[tokio::test]
+    async fn a_retry_after_an_unanswered_create_finds_what_the_node_built() {
+        let (api, calls) = fleet_failing(10, 1, tonic::Code::Unavailable).await;
+        let err = api.create_sandbox(create("req-1")).await.unwrap_err();
+        assert_eq!(err.code(), tonic::Code::Unavailable);
+        let reported = api.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+            reported.0.sandboxes.insert(common::Sandbox {
+                id: "sbx_reported".into(),
+                node_id: "n1".into(),
+                create_request_id: "req-1".into(),
+                ..Default::default()
+            });
+        });
+        let sandbox = api
+            .create_sandbox(create("req-1"))
+            .await
+            .unwrap()
+            .into_inner();
+        assert_eq!(sandbox.id, "sbx_reported");
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn a_request_id_is_checked() {
+        assert!(validate_request_id("").is_ok());
+        assert!(validate_request_id("0f9c-4b:retry_1.a").is_ok());
+        assert!(validate_request_id("has space").is_err());
+        assert!(validate_request_id(&"a".repeat(129)).is_err());
     }
 }
 

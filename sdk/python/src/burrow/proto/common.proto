@@ -588,6 +588,9 @@ message Sandbox {
   // What that checkpoint holds, and so what a recovery does: boot on the
   // saved disk, or resume the saved memory.
   CheckpointKind checkpoint_kind = 36;
+  // The `request_id` of the create that made it, which a retry of that
+  // create is answered with this sandbox for. Empty when none was given.
+  string create_request_id = 38;
 }
 
 enum CheckpointKind {

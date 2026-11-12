@@ -350,6 +350,10 @@ pub fn name_key(name: &str) -> String {
 /// the attempt rather than the sandbox, so two replicas starting the same
 /// sandbox cannot both win it, and an attempt whose replica died is swept
 /// like an abandoned create.
+pub fn request_key(request: &str) -> String {
+    format!("request:{request}")
+}
+
 pub fn adopt_key(id: &str) -> String {
     format!("adopt:{id}")
 }

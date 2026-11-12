@@ -712,6 +712,7 @@ async fn derive(
             node_id.to_string(),
             None,
             String::new(),
+            String::new(),
         )
         .await?;
     let outcome = async {

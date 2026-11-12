@@ -303,7 +303,7 @@ dev = [
 [package.metadata]
 requires-dist = [
     { name = "grpcio", specifier = ">=1.80" },
-    { name = "grpcio-tools", marker = "extra == 'dev'", specifier = "~=1.80.0" },
+    { name = "grpcio-tools", marker = "extra == 'dev'", specifier = "==1.80.0" },
     { name = "protobuf", specifier = ">=6.31" },
     { name = "pytest", marker = "extra == 'dev'", specifier = ">=7" },
 ]

@@ -304,6 +304,7 @@ export class Sandbox {
     }
     return {
       name: options.name ?? "",
+      requestId: options.requestId ?? "",
       snapshot: options.snapshot ?? "",
       template,
       policy: {

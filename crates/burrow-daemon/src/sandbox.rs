@@ -6614,10 +6614,13 @@ impl SandboxManager {
         spec
     }
 
+    /// Creates a sandbox, on a task of its own: a caller that gives up does
+    /// not stop it half way, holding a lease, a tap and a VMM nothing will
+    /// release. The sandbox it makes is registered and reported like any
+    /// other, which is how an orchestrator that stopped waiting finds it.
     // Identity, shape and policy all arrive together, which is more than seven
     // things; grouping them into a struct would only move the list.
     #[allow(clippy::too_many_arguments)]
-    #[tracing::instrument(skip_all, fields(sandbox = %id, template = %template, from_warm))]
     pub async fn create(
         &self,
         id: String,
@@ -6626,6 +6629,27 @@ impl SandboxManager {
         tags: HashMap<String, String>,
         node_id: String,
         name: String,
+        request_id: String,
+    ) -> Result<common::Sandbox, Status> {
+        self.detached(move |manager| async move {
+            manager
+                .create_now(id, template, policy, tags, node_id, name, request_id)
+                .await
+        })
+        .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    #[tracing::instrument(skip_all, fields(sandbox = %id, template = %template, from_warm))]
+    async fn create_now(
+        &self,
+        id: String,
+        template: String,
+        policy: common::Policy,
+        tags: HashMap<String, String>,
+        node_id: String,
+        name: String,
+        request_id: String,
     ) -> Result<common::Sandbox, Status> {
         // A sandbox provisioned ahead of demand needs none of the work below:
         // its VM is already restored, its agent already handshaken, its
@@ -6651,7 +6675,7 @@ impl SandboxManager {
             self.warm_for_demand(&ShapeKey::of(&template, &resources));
         }
         let record = self
-            .create_seeded(id, template, policy, tags, node_id, None, name)
+            .create_seeded(id, template, policy, tags, node_id, None, name, request_id)
             .await?;
         self.warn_if_root_untrusted(&record);
         Ok(record)
@@ -6700,6 +6724,7 @@ impl SandboxManager {
         node_id: String,
         seed_disk: Option<&Path>,
         name: String,
+        request_id: String,
     ) -> Result<common::Sandbox, Status> {
         // Claimed before provisioning, not merely checked: provisioning takes
         // seconds, so two creates of the same id (an orchestrator retry, say)
@@ -6744,6 +6769,7 @@ impl SandboxManager {
             let mut stamped = sandbox.base_record.lock().unwrap();
             stamped.tags = tags;
             stamped.name = name;
+            stamped.create_request_id = request_id;
         }
         // Only now that the sandbox exists does its policy exist to render, so
         // its rules land here, before anything can reach it. The window a
@@ -7534,8 +7560,30 @@ impl SandboxManager {
     /// reason a fork cannot change them: Firecracker takes a restored VM's
     /// configuration from the snapshot, so a request that disagrees is refused
     /// rather than quietly given something else.
-    #[tracing::instrument(skip_all, fields(sandbox = %id, snapshot = %snapshot_id))]
+    ///
+    /// Detached, as a create is.
+    #[allow(clippy::too_many_arguments)]
     pub async fn create_from_snapshot(
+        &self,
+        id: String,
+        snapshot_id: String,
+        policy: common::Policy,
+        tags: HashMap<String, String>,
+        node_id: String,
+        name: String,
+        request_id: String,
+    ) -> Result<common::Sandbox, Status> {
+        self.detached(move |manager| async move {
+            manager
+                .create_from_snapshot_now(id, &snapshot_id, policy, tags, node_id, name, request_id)
+                .await
+        })
+        .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    #[tracing::instrument(skip_all, fields(sandbox = %id, snapshot = %snapshot_id))]
+    async fn create_from_snapshot_now(
         &self,
         id: String,
         snapshot_id: &str,
@@ -7543,6 +7591,7 @@ impl SandboxManager {
         tags: HashMap<String, String>,
         node_id: String,
         name: String,
+        request_id: String,
     ) -> Result<common::Sandbox, Status> {
         let manifest = self.snapshots.manifest_for_restore(snapshot_id).await?;
         let mut policy = policy;
@@ -7602,7 +7651,10 @@ impl SandboxManager {
             )
             .await;
         let registered = match &provisioned {
-            Ok((sandbox, _)) => self.register_or_discard(sandbox).await,
+            Ok((sandbox, _)) => {
+                sandbox.base_record.lock().unwrap().create_request_id = request_id;
+                self.register_or_discard(sandbox).await
+            }
             Err(_) => Ok(()),
         };
         self.creating.lock().await.remove(&id);

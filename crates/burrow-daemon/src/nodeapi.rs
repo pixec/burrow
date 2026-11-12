@@ -374,6 +374,7 @@ impl NodeApi {
             mut policy,
             tags,
             name,
+            request_id,
         } = request;
         let plan = crate::kit::plan(
             recorded,
@@ -396,7 +397,15 @@ impl NodeApi {
 
         let outcome = async {
             self.sandboxes
-                .create(id.clone(), template, policy, tags, self.node_id(), name)
+                .create(
+                    id.clone(),
+                    template,
+                    policy,
+                    tags,
+                    self.node_id(),
+                    name,
+                    request_id,
+                )
                 .await?;
             let provisioned = async {
                 let env = plan.env.clone().into_iter().collect();
@@ -432,6 +441,7 @@ struct KitCreate {
     policy: common::Policy,
     tags: HashMap<String, String>,
     name: String,
+    request_id: String,
 }
 
 /// What an agent lists in its health response when it does file transfers
@@ -519,6 +529,7 @@ impl NodeService for NodeApi {
                 policy,
                 tags: req.tags,
                 name: req.name,
+                request_id: req.request_id,
             };
             let sandbox = self
                 .create_kit(request, &recorded, crate::kit::Boot::Create)
@@ -541,17 +552,19 @@ impl NodeService for NodeApi {
                     req.tags,
                     self.node_id(),
                     req.name,
+                    req.request_id,
                 )
                 .await?
         } else {
             self.sandboxes
                 .create_from_snapshot(
                     req.sandbox_id,
-                    &req.snapshot,
+                    req.snapshot,
                     policy,
                     req.tags,
                     self.node_id(),
                     req.name,
+                    req.request_id,
                 )
                 .await?
         };
@@ -877,6 +890,7 @@ impl NodeService for NodeApi {
                     previous.tags,
                     self.node_id(),
                     previous.name,
+                    previous.create_request_id,
                 )
                 .await?;
             return Ok(Response::new(redact_secrets(sandbox)));
@@ -902,6 +916,7 @@ impl NodeService for NodeApi {
             policy,
             tags: previous.tags,
             name: previous.name,
+            request_id: previous.create_request_id,
         };
         let sandbox = self
             .create_kit(request, &recorded, crate::kit::Boot::Restart)

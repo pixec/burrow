@@ -176,6 +176,8 @@ message NodeCreateRequest {
   // declares. Held in the sandbox record as header-injection rules and
   // redacted on every read, like any brokered header.
   map<string, string> credentials = 9;
+  // The caller's request id, recorded as the sandbox's `create_request_id`.
+  string request_id = 10;
 }
 
 message NodeRecreateRequest {

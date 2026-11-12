@@ -669,6 +669,13 @@ export interface CreateOptions extends CallOptions, HandleOptions {
    * `already_exists`, and fixed once the sandbox exists.
    */
   name?: string;
+  /**
+   * Makes the create safe to retry. A create naming the request id of one
+   * that already made a sandbox returns that sandbox instead of making
+   * another, and one naming a create still running waits for it. Up to 128
+   * characters of `[A-Za-z0-9._:-]`, such as a UUID.
+   */
+  requestId?: string;
   /** Guest image to boot. */
   template?: string;
   /**

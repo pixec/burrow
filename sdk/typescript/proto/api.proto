@@ -918,6 +918,14 @@ message CreateSandboxRequest {
   // Allocated public IPs to attach once it is up. A static address places the
   // sandbox on its node, as a volume does.
   repeated string public_ips = 9;
+  // Makes the create safe to retry. A create naming the request id of one
+  // that already made a sandbox returns that sandbox, whatever else it asks
+  // for; one naming a create still running waits for it and returns what it
+  // made. A create whose caller gave up still finishes, so a retry with the
+  // same id finds it rather than making a second. Up to 128 characters of
+  // [A-Za-z0-9._:-]; empty makes no such promise. Kept on the sandbox as
+  // `create_request_id`.
+  string request_id = 10;
 }
 
 message RecreateSandboxRequest {
