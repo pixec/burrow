@@ -1430,6 +1430,9 @@ pub async fn run(args: ServeArgs) -> anyhow::Result<()> {
             .to_string(),
         path: args.guest_binary.clone(),
     }));
+    if let Some(upgrade) = &guest_upgrade {
+        crate::warm::set_agent(upgrade.digest.clone());
+    }
     let vmm_memory_overhead_mib: std::collections::HashMap<_, _> =
         args.vmm_memory_overheads.iter().copied().collect();
     node_info.vmm_memory_overhead_mib = hypervisors

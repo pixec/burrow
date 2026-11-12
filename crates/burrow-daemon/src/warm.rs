@@ -78,6 +78,25 @@ fn is_current_format(text: &str) -> bool {
     text.trim() == WARM_FORMAT
 }
 
+/// The digest of the agent a warm snapshot's guest runs.
+///
+/// A snapshot whose agent is not the one this node ships is stale like one in
+/// another format: every create from it would upgrade its agent in place on
+/// the first call into the guest.
+const AGENT_FILE: &str = "agent";
+
+/// The digest of the agent this node ships, set once at startup. Unset, any
+/// agent is current.
+static AGENT: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+
+pub fn set_agent(digest: String) {
+    let _ = AGENT.set(digest);
+}
+
+fn agent() -> Option<&'static str> {
+    AGENT.get().map(String::as_str)
+}
+
 /// Pages a restore of this snapshot touches first, recorded once when the
 /// snapshot is built and replayed on every create from it.
 pub const PREFETCH_PLAN: &str = "prefetch.bin";
@@ -340,8 +359,9 @@ impl Warm {
     }
 }
 
-/// The snapshot in `dir`, if it is complete and in the current format.
-async fn read_warm(dir: &Path) -> Option<Warm> {
+/// The snapshot in `dir`, if it is complete, in the current format and, when
+/// `agent` is given, built with that agent.
+async fn read_warm(dir: &Path, agent: Option<&str>) -> Option<Warm> {
     use std::os::unix::fs::MetadataExt as _;
 
     let hypervisor: Hypervisor = tokio::fs::read_to_string(dir.join(HYPERVISOR_FILE))
@@ -353,6 +373,12 @@ async fn read_warm(dir: &Path) -> Option<Warm> {
     let format = tokio::fs::read_to_string(dir.join("format")).await.ok()?;
     if !is_current_format(&format) {
         return None;
+    }
+    if let Some(agent) = agent {
+        let built_with = tokio::fs::read_to_string(dir.join(AGENT_FILE)).await.ok()?;
+        if built_with.trim() != agent {
+            return None;
+        }
     }
     let shape = Shape::parse(&tokio::fs::read_to_string(dir.join(SHAPE_FILE)).await.ok()?)?;
     let mut bytes = 0;
@@ -403,13 +429,14 @@ pub async fn find(
     wanted: Shape,
 ) -> Option<Warm> {
     let dir = warm_dir(templates_dir, template).join(wanted.dir_name(hypervisor));
-    read_warm(&dir)
+    read_warm(&dir, agent())
         .await
         .filter(|warm| warm.hypervisor == hypervisor && warm.shape.is_machine(wanted))
 }
 
 /// Where `template`'s snapshot of `wanted` under `hypervisor` is, when it is
-/// there but does not read back: a file of it gone.
+/// there but does not read back: a file of it gone, or built with another
+/// agent.
 pub async fn find_broken(
     templates_dir: &Path,
     template: &str,
@@ -417,18 +444,18 @@ pub async fn find_broken(
     wanted: Shape,
 ) -> Option<PathBuf> {
     let dir = warm_dir(templates_dir, template).join(wanted.dir_name(hypervisor));
-    is_broken(&dir).await.then_some(dir)
+    is_broken(&dir, agent()).await.then_some(dir)
 }
 
-async fn is_broken(dir: &Path) -> bool {
-    tokio::fs::try_exists(dir).await.unwrap_or(false) && read_warm(dir).await.is_none()
+async fn is_broken(dir: &Path, agent: Option<&str>) -> bool {
+    tokio::fs::try_exists(dir).await.unwrap_or(false) && read_warm(dir, agent).await.is_none()
 }
 
 /// Removes the snapshot in `dir` if it is still broken once no build is
 /// swapping it, and says whether it did.
 pub async fn discard_broken(dir: &Path) -> std::io::Result<bool> {
     let _no_builds = WARM_BUILD_LOCK.lock().await;
-    if !is_broken(dir).await {
+    if !is_broken(dir, agent()).await {
         return Ok(false);
     }
     tokio::fs::remove_dir_all(dir).await?;
@@ -442,7 +469,7 @@ pub async fn list(templates_dir: &Path, template: &str) -> Vec<Warm> {
         return out;
     };
     while let Ok(Some(entry)) = entries.next_entry().await {
-        if let Some(warm) = read_warm(&entry.path()).await {
+        if let Some(warm) = read_warm(&entry.path(), agent()).await {
             out.push(warm);
         }
     }
@@ -469,7 +496,7 @@ pub async fn list_all(templates_dir: &Path) -> Vec<(String, Warm)> {
 }
 
 /// What under `template`'s warm directory cannot be restored: snapshots in
-/// another format, and pieces of one.
+/// another format or with another agent, and pieces of one.
 pub async fn stale(templates_dir: &Path, template: &str) -> Vec<PathBuf> {
     let root = warm_dir(templates_dir, template);
     let mut out = Vec::new();
@@ -478,7 +505,7 @@ pub async fn stale(templates_dir: &Path, template: &str) -> Vec<PathBuf> {
     };
     while let Ok(Some(entry)) = entries.next_entry().await {
         let path = entry.path();
-        if read_warm(&path).await.is_none() {
+        if read_warm(&path, agent()).await.is_none() {
             out.push(path);
         }
     }
@@ -676,11 +703,18 @@ pub async fn build_warm_snapshot(
     };
     apply_confinement(&mut spec, config, shape);
 
-    let outcome = snapshot_when_ready(spec, agent_timeout, &lease, trust).await;
+    let outcome = snapshot_when_ready(
+        spec,
+        agent_timeout,
+        &lease,
+        trust,
+        config.guest_upgrade.as_deref(),
+    )
+    .await;
     burrow_net::tap::delete(WARM_TAP).await;
 
     match outcome {
-        Ok(()) => {
+        Ok(built_with) => {
             // Restore the snapshot once, purely to learn which pages a guest
             // reaches for. Doing it here costs one boot at warm time and saves
             // thousands of faults on every create afterwards. Only the
@@ -714,6 +748,9 @@ pub async fn build_warm_snapshot(
             tokio::fs::write(dir.join(USED_FILE), burrow_common::unix_now().to_string())
                 .await
                 .map_err(|err| Status::internal(format!("recording warm use: {err}")))?;
+            tokio::fs::write(dir.join(AGENT_FILE), built_with)
+                .await
+                .map_err(|err| Status::internal(format!("recording warm agent: {err}")))?;
             // Everything on the disk before the marker, and the marker before
             // the swap: every create restores from this snapshot, so one torn
             // by a power cut would corrupt every guest made from it.
@@ -741,7 +778,7 @@ pub async fn build_warm_snapshot(
                 tracing::warn!(template, %err, "could not sync the warm snapshot's rename");
             }
 
-            let warm = read_warm(&live).await.ok_or_else(|| {
+            let warm = read_warm(&live, agent()).await.ok_or_else(|| {
                 Status::internal("the published warm snapshot does not read back")
             })?;
             tracing::info!(
@@ -834,16 +871,20 @@ async fn collect_products(
 ///
 /// The handshake is the expensive one, reaching the netlink code, the entropy
 /// ioctl and the clock syscall; the health call afterwards settles the gRPC
-/// server's own machinery.
+/// server's own machinery. Returns the digest of the agent it leaves running,
+/// upgraded to `upgrade` when that differs.
 async fn exercise_agent(
     vm: &Vm,
     lease: &burrow_net::ipam::Lease,
     trust: &Trust,
     agent_timeout: std::time::Duration,
-) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    let mut agent = crate::guestconn::connect(vm.guest(), agent_timeout).await?;
-    agent
-        .handshake(crate::guestconn::handshake_full(
+    upgrade: Option<&crate::guestconn::GuestUpgrade>,
+) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
+    let agent = crate::guestconn::connect(vm.guest(), agent_timeout).await?;
+    let (mut agent, response) = crate::guestconn::handshake_upgrading(
+        agent,
+        vm.guest(),
+        crate::guestconn::handshake_full(
             true,
             Some(burrow_proto::guest::v1::NetworkConfig {
                 // The lease its tap was made with.
@@ -862,8 +903,21 @@ async fn exercise_agent(
             // A warm snapshot is shared by every sandbox restored from it, so
             // it must not carry any one sandbox's volumes.
             Vec::new(),
-        ))
-        .await?;
+        ),
+        upgrade,
+        agent_timeout,
+    )
+    .await?;
+    if let Err(err) = warm_up(&mut agent).await {
+        // Not fatal: a snapshot without the warm-up is slower, not wrong.
+        tracing::warn!(%err, "could not pre-warm the guest before snapshotting");
+    }
+    Ok(response.agent_digest)
+}
+
+async fn warm_up(
+    agent: &mut burrow_proto::guest::v1::guest_client::GuestClient<tonic::transport::Channel>,
+) -> Result<(), tonic::Status> {
     agent
         .health(burrow_proto::guest::v1::GuestHealthRequest {})
         .await?;
@@ -948,7 +1002,14 @@ async fn profile_restore(
             .wait_for_vsock(crate::guestconn::AGENT_PORT, agent_timeout)
             .await;
         if ready.is_ok() {
-            let _ = exercise_agent(&vm, &lease, trust, agent_timeout).await;
+            let _ = exercise_agent(
+                &vm,
+                &lease,
+                trust,
+                agent_timeout,
+                config.guest_upgrade.as_deref(),
+            )
+            .await;
         }
         vm.kill()
             .await
@@ -974,7 +1035,8 @@ async fn snapshot_when_ready(
     agent_timeout: std::time::Duration,
     lease: &burrow_net::ipam::Lease,
     trust: &Trust,
-) -> Result<(), Status> {
+    upgrade: Option<&crate::guestconn::GuestUpgrade>,
+) -> Result<String, Status> {
     let vm = Vm::boot(spec)
         .await
         .map_err(|err| Status::internal(format!("warm boot: {err}")))?;
@@ -990,15 +1052,21 @@ async fn snapshot_when_ready(
         )));
     }
 
-    // A full handshake before snapshotting, result thrown away. Not needed for
-    // correctness, since every clone handshakes again on create, but it bakes
-    // the warmed guest-side state into the snapshot. Measured: the first
-    // handshake after a restore cost ~180ms against ~9ms for a second on a
-    // fresh channel, so the cost is guest coldness rather than transport.
-    if let Err(err) = exercise_agent(&vm, lease, trust, agent_timeout).await {
-        // Not fatal: a snapshot without the warm-up is slower, not wrong.
-        tracing::warn!(%err, "could not pre-warm the guest before snapshotting");
-    }
+    // A full handshake before snapshotting. It bakes the warmed guest-side
+    // state into the snapshot: measured, the first handshake after a restore
+    // cost ~180ms against ~9ms for a second on a fresh channel, so the cost is
+    // guest coldness rather than transport. It also brings the agent up to
+    // this node's, which the snapshot is then keyed on, so no create from it
+    // upgrades the agent in place.
+    let agent = match exercise_agent(&vm, lease, trust, agent_timeout, upgrade).await {
+        Ok(agent) => agent,
+        Err(err) => {
+            let _ = vm.kill().await;
+            return Err(Status::internal(format!(
+                "the warm guest's agent did not handshake: {err}"
+            )));
+        }
+    };
 
     // Snapshot a quiesced guest: anything mid-flight at this moment is frozen
     // into every sandbox that later restores from it.
@@ -1012,7 +1080,8 @@ async fn snapshot_when_ready(
     }
     vm.kill()
         .await
-        .map_err(|err| Status::internal(format!("stopping warm vm: {err}")))
+        .map_err(|err| Status::internal(format!("stopping warm vm: {err}")))?;
+    Ok(agent)
 }
 
 #[cfg(test)]
@@ -1330,6 +1399,22 @@ mod shape_tests {
         std::fs::remove_file(live.join(ROOT_DISK)).unwrap();
         assert!(discard_broken(&broken).await.unwrap());
         assert!(!live.exists());
+        let _ = std::fs::remove_dir_all(&templates);
+    }
+
+    /// A snapshot built with another agent is stale like one in another
+    /// format, so a create finds it broken and it is built again.
+    #[tokio::test]
+    async fn a_snapshot_with_another_agent_is_stale() {
+        let templates = temp("agent");
+        let dir = warm_dir(&templates, "app").join("firecracker-1x512");
+        write_snapshot(&dir, WARM_FORMAT, "1 512 1324 512");
+        assert!(read_warm(&dir, Some("new")).await.is_none());
+        std::fs::write(dir.join(AGENT_FILE), "old\n").unwrap();
+        assert!(read_warm(&dir, Some("new")).await.is_none());
+        assert!(is_broken(&dir, Some("new")).await);
+        assert!(read_warm(&dir, Some("old")).await.is_some());
+        assert!(!is_broken(&dir, Some("old")).await);
         let _ = std::fs::remove_dir_all(&templates);
     }
 

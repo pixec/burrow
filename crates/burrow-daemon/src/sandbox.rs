@@ -6205,7 +6205,8 @@ impl SandboxManager {
     }
 
     /// Discards `template`'s snapshot of `shape` under `hypervisor` if it is
-    /// there with a file gone, and builds it again. Left in place it would
+    /// there with a file gone or built with another agent, and builds it
+    /// again. Left in place it would
     /// send every create of its shape to a cold boot until the node
     /// restarted, since the attempt that built it is still recorded.
     async fn rebuild_if_broken(
@@ -6231,7 +6232,7 @@ impl SandboxManager {
             template,
             vcpus = shape.vcpus,
             mem_mib = shape.mem_mib,
-            "discarded a warm snapshot with a file gone; rebuilding it"
+            "discarded a warm snapshot with a file gone or another agent; rebuilding it"
         );
         self.forget_warm(&ShapeKey {
             template: template.to_string(),
