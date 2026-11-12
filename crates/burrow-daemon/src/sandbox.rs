@@ -2955,6 +2955,7 @@ impl SandboxManager {
     /// Refuses nested virtualization where the guest could not be given it:
     /// under a hypervisor that masks the extensions, or on a node whose KVM
     /// has nesting off.
+    #[allow(clippy::result_large_err)]
     fn require_nested_virt(
         &self,
         hypervisor: Hypervisor,
