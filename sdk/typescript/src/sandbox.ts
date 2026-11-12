@@ -51,11 +51,12 @@ import type {
   SessionStart,
   Share,
   ShareOptions,
+  StartOptions,
   UpdateAccessOptions,
   UpdateLifetimeOptions,
   Usage,
 } from "./types.js";
-import { dateOf, dateOrNull, enumOf } from "./wire.js";
+import { dateOf, dateOrNull, enumOf, toKernelInfo } from "./wire.js";
 
 const STATES: readonly SandboxState[] = [
   "creating",
@@ -100,6 +101,7 @@ export function toSandboxInfo(raw: any): SandboxInfo {
     durable: raw.isDurable ?? false,
     hypervisor: raw.hypervisor ?? "",
     hypervisorVersion: raw.hypervisorVersion ?? "",
+    kernel: toKernelInfo(raw.kernel),
     guestOs: raw.guestOs ?? "",
     publicIps: (raw.publicIps ?? []).map(toPublicIp),
     checkpointAt: dateOrNull(raw.checkpointAtUnixMs),
@@ -1050,10 +1052,15 @@ export class Sandbox {
   /**
    * Cold-boots a stopped sandbox on its existing disks. It takes as long as a
    * create, since there is no memory image to restore, and the sandbox keeps
-   * its id, name, address and published ports.
+   * its id, name, address and published ports. It boots its template's
+   * current kernel unless `keepKernel`, which boots the one it last ran.
    */
-  async start(options: CallOptions = {}): Promise<SandboxInfo> {
-    const info = await this.mutate("StartSandbox", { sandboxId: this.id }, options);
+  async start(options: StartOptions = {}): Promise<SandboxInfo> {
+    const info = await this.mutate(
+      "StartSandbox",
+      { sandboxId: this.id, isKernelKept: options.keepKernel ?? false },
+      options,
+    );
     await this.onResume?.(this);
     return info;
   }

@@ -554,6 +554,12 @@ export interface SandboxInfo {
   /** The hypervisor it runs under, and the version its saved state needs. */
   hypervisor: string;
   hypervisorVersion: string;
+  /**
+   * The kernel its guest runs: its template's when it was created or last
+   * booted on its disk. Saved memory restores only onto this kernel. `null`
+   * for a guest booted from firmware or installed whole.
+   */
+  kernel: KernelInfo | null;
   /** `linux`, `windows` or `macos`, from its template. */
   guestOs: string;
   /** Public addresses of either family attached to it. */
@@ -1010,6 +1016,40 @@ export interface DiskCapacity {
   overcommit: number;
 }
 
+/** What a guest kernel has built in, read from the image itself. */
+export interface KernelCapabilities {
+  /** KVM, which {@link ResourceOptions.nestedVirt} needs. */
+  kvm: boolean;
+  /** virtio-mem, which live memory changes plug and unplug through. */
+  virtioMem: boolean;
+  vsock: boolean;
+  virtioBlk: boolean;
+  ext4: boolean;
+}
+
+/** A guest kernel, named on a node and identified by content. */
+export interface KernelInfo {
+  /** The node's name for it, e.g. `"ch-linux"`. */
+  name: string;
+  /** SHA-256 of the image, in hex. */
+  digest: string;
+  /** Its `Linux version`, e.g. `"7.2.8+"`. */
+  version: string;
+  /** `x86_64` or `aarch64`. */
+  arch: string;
+  capabilities: KernelCapabilities;
+  /** `ikconfig`, `config` or `strings`: how the capabilities were read. */
+  detectedFrom: string;
+}
+
+/** A kernel a node offers templates. */
+export interface NodeKernel extends KernelInfo {
+  /** Hypervisors it boots under. */
+  hypervisors: string[];
+  /** Hypervisors it is the node's default for. */
+  defaultFor: string[];
+}
+
 export interface NodeInfo {
   id: string;
   address: string;
@@ -1032,10 +1072,21 @@ export interface NodeInfo {
   arch: string;
   /** Each offered hypervisor's version. Saved state needs an exact match. */
   hypervisorVersions: Record<string, string>;
+  /** Guest kernels a template can be built with here. */
+  kernels: NodeKernel[];
   /** Absent for a node that does not report disk. */
   disk?: DiskCapacity;
   /** Free disk is below the reserve; the node refuses creates until it is not. */
   diskLow: boolean;
+}
+
+/** Options for {@link Sandbox.start}. */
+export interface StartOptions extends CallOptions {
+  /**
+   * Boot the kernel the sandbox last ran rather than its template's current
+   * one, which a template rebuilt with another kernel has changed.
+   */
+  keepKernel?: boolean;
 }
 
 /** Options for {@link Burrow.drainNode}. */

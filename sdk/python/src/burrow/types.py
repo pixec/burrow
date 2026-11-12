@@ -206,6 +206,40 @@ class SandboxPolicy:
 
 
 @dataclass
+class KernelCapabilities:
+    """What a guest kernel has built in, read from the image itself."""
+
+    # KVM, which `nested_virt` needs.
+    kvm: bool = False
+    # virtio-mem, which live memory changes plug and unplug through.
+    virtio_mem: bool = False
+    vsock: bool = False
+    virtio_blk: bool = False
+    ext4: bool = False
+
+
+@dataclass
+class KernelInfo:
+    """A guest kernel, named on a node and identified by content."""
+
+    # The node's name for it, e.g. "ch-linux".
+    name: str
+    # SHA-256 of the image, in hex.
+    digest: str
+    # Its "Linux version", e.g. "7.2.8+".
+    version: str = ""
+    # "x86_64" or "aarch64".
+    arch: str = ""
+    capabilities: KernelCapabilities = field(default_factory=KernelCapabilities)
+    # "ikconfig", "config" or "strings": how the capabilities were read.
+    detected_from: str = ""
+    # On a node's kernel: the hypervisors it boots under, and those it is the
+    # node's default for.
+    hypervisors: List[str] = field(default_factory=list)
+    default_for: List[str] = field(default_factory=list)
+
+
+@dataclass
 class SandboxInfo:
     id: str
     name: str
@@ -224,6 +258,10 @@ class SandboxInfo:
     durable: bool = False
     hypervisor: str = ""
     hypervisor_version: str = ""
+    # The kernel its guest runs: its template's when it was created or last
+    # booted on its disk. Saved memory restores only onto this kernel. None
+    # for a guest booted from firmware or installed whole.
+    kernel: Optional[KernelInfo] = None
     arch: str = ""
     guest_os: str = ""
     # Public addresses of either family attached to it.
@@ -476,6 +514,8 @@ class NodeInfo:
     # snapshot only restores on a node where both match what took it.
     arch: str = ""
     hypervisor_versions: Dict[str, str] = field(default_factory=dict)
+    # Guest kernels a template can be built with here.
+    kernels: List[KernelInfo] = field(default_factory=list)
     disk: DiskCapacity = field(default_factory=DiskCapacity)
     disk_low: bool = False
     last_heartbeat_at: Optional[datetime] = None
@@ -556,6 +596,9 @@ class TemplateInfo:
     # "linux", "windows" or "macos".
     guest_os: str = ""
     hypervisor: str = ""
+    # The kernel its sandboxes boot. None for a template booted from firmware
+    # or installed whole (Windows, macOS).
+    kernel: Optional[KernelInfo] = None
 
 
 @dataclass

@@ -9,7 +9,7 @@ from typing import Any, Callable, Dict, Iterator, List, Optional
 from ._pb import api_pb2, common_pb2
 from ._policy import to_policy
 from ._transport import _DEFAULT, Transport
-from ._wire import at, at_or_none, label, unix_ms, value
+from ._wire import at, at_or_none, kernel, label, unix_ms, value
 from .errors import BurrowError
 from .ip import Ips
 from .sandbox import Sandbox, _state_of, _to_kit_spec, _to_sandbox_info
@@ -289,6 +289,7 @@ class Templates:
         memory_mib: int = 0,
         disk_mib: int = 0,
         hypervisor: str = "",
+        kernel: str = "",
         allow_domains: Optional[List[str]] = None,
         systemd: bool = False,
         on_build_logs: Optional[Callable[[BuildLogEvent], Any]] = None,
@@ -303,6 +304,7 @@ class Templates:
             memory_mib=memory_mib,
             disk_mib=disk_mib,
             hypervisor=hypervisor,
+            kernel=kernel,
             allow_domains=allow_domains,
             systemd=systemd,
             on_build_logs=on_build_logs,
@@ -609,6 +611,7 @@ class Burrow:
                 committed_cpus=n.status.committed_cpu_millis / 1000,
                 arch=n.info.arch,
                 hypervisor_versions=dict(n.info.hypervisor_versions),
+                kernels=[kernel(k) for k in n.info.kernels],
                 disk=DiskCapacity(
                     free_bytes=n.status.disk.free_bytes,
                     total_bytes=n.status.disk.total_bytes,

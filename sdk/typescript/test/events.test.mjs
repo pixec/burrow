@@ -109,6 +109,7 @@ test("a snapshot surfaces where it can be restored", () => {
     blkioWeight: 0,
     maxMemoryMib: 16384,
     bootMemoryMib: 1024,
+    nestedVirt: false,
   });
   assert.equal(snapshot.createdAt.getTime(), 1_790_000_000_000);
   assert.equal(snapshot.expiresAt, null);

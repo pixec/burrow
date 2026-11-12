@@ -40,3 +40,28 @@ def at_or_none(unix_ms: int) -> Optional[datetime]:
 
 def unix_ms(when: Optional[datetime]) -> int:
     return int(when.timestamp() * 1000) if when else 0
+
+
+def kernel(raw: Any) -> Any:
+    """A `Kernel` message as a `KernelInfo`, or None for an unset one."""
+    from .types import KernelCapabilities, KernelInfo
+
+    if not raw.digest:
+        return None
+    caps = raw.capabilities
+    return KernelInfo(
+        name=raw.name,
+        digest=raw.digest,
+        version=raw.version,
+        arch=raw.arch,
+        capabilities=KernelCapabilities(
+            kvm=caps.is_kvm_built_in,
+            virtio_mem=caps.is_virtio_mem_built_in,
+            vsock=caps.is_vsock_built_in,
+            virtio_blk=caps.is_virtio_blk_built_in,
+            ext4=caps.is_ext4_built_in,
+        ),
+        detected_from=raw.detected_from,
+        hypervisors=list(raw.hypervisors),
+        default_for=list(raw.default_for),
+    )

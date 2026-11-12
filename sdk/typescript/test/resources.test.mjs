@@ -123,6 +123,7 @@ test("a growth limit goes out with a create policy", async () => {
     cpusetCpus: "",
     blkioWeight: 0,
     maxMemMib: 16384,
+    isNestedVirtEnabled: false,
   });
 });
 

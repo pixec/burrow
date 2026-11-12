@@ -8,6 +8,7 @@ from typing import Any, Callable, Dict, List, Optional, Union
 
 from ._pb import api_pb2
 from ._transport import Transport
+from ._wire import kernel as to_kernel
 from .errors import BurrowError
 from .types import BuiltTemplate, TemplateInfo
 
@@ -56,6 +57,7 @@ def to_template_info(raw: api_pb2.TemplateInfo) -> TemplateInfo:
         systemd=raw.is_systemd,
         guest_os=raw.guest_os,
         hypervisor=raw.hypervisor,
+        kernel=to_kernel(raw.kernel),
     )
 
 
@@ -68,6 +70,7 @@ def build_template(
     memory_mib: int = 0,
     disk_mib: int = 0,
     hypervisor: str = "",
+    kernel: str = "",
     allow_domains: Optional[List[str]] = None,
     systemd: bool = False,
     on_build_logs: Optional[Callable[[BuildLogEvent], Any]] = None,
@@ -93,6 +96,10 @@ def build_template(
         mem_mib=memory_mib,
         # "firecracker", "cloud-hypervisor" or "vz"; empty is the base's.
         hypervisor=hypervisor,
+        # The guest kernel by the node's name for it; empty is the base's,
+        # else the node's default for the hypervisor (the Firecracker CI
+        # kernel for Firecracker, Cloud Hypervisor's own for Cloud Hypervisor).
+        kernel=kernel,
         # The build's root disk in MiB, which is the image it makes; for
         # `from_ipsw` the installed macOS disk.
         disk_mib=disk_mib,

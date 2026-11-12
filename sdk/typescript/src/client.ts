@@ -24,6 +24,7 @@ import type {
   LifecycleEvent,
   ListOptions,
   NodeInfo,
+  NodeKernel,
   SecretInfo,
   SecretScope,
   UsageInterval,
@@ -33,7 +34,7 @@ import type {
   UsageSum,
 } from "./types.js";
 import { Volume, type CreateVolumeOptions, type ListVolumesOptions } from "./volume.js";
-import { dateOf, dateOrNull, enumOf, msOf } from "./wire.js";
+import { dateOf, dateOrNull, enumOf, msOf, toKernelInfo } from "./wire.js";
 
 /**
  * Runs `use` against a client opened for one call. Every handle `use` hands
@@ -636,6 +637,13 @@ export class Burrow {
         labels: n.info?.labels ?? {},
         arch: n.info?.arch ?? "",
         hypervisorVersions: n.info?.hypervisorVersions ?? {},
+        kernels: (n.info?.kernels ?? []).map(
+          (k: any): NodeKernel => ({
+            ...toKernelInfo(k)!,
+            hypervisors: k.hypervisors ?? [],
+            defaultFor: k.defaultFor ?? [],
+          }),
+        ),
         disk: disk
           ? {
               freeBytes: Number(disk.freeBytes ?? 0),

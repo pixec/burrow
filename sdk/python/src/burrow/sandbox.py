@@ -25,6 +25,7 @@ from ._shutil import SandboxShutil
 from ._subprocess import SandboxSubprocess
 from ._transport import _DEFAULT, Transport
 from ._wire import at, at_or_none, label
+from ._wire import kernel as to_kernel
 from .errors import BurrowError
 from .ip import to_public_ip
 from .snapshot import Snapshot
@@ -103,6 +104,7 @@ def _to_sandbox_info(raw: common_pb2.Sandbox) -> SandboxInfo:
         durable=raw.is_durable,
         hypervisor=raw.hypervisor,
         hypervisor_version=raw.hypervisor_version,
+        kernel=to_kernel(raw.kernel),
         arch=raw.arch,
         guest_os=raw.guest_os,
         public_ips=[to_public_ip(ip) for ip in raw.public_ips],
@@ -1092,11 +1094,16 @@ class Sandbox:
         hooks run again on the way up."""
         return self._apply("StopSandbox", api_pb2.SandboxRef(sandbox_id=self.id))
 
-    def start(self) -> SandboxInfo:
+    def start(self, *, keep_kernel: bool = False) -> SandboxInfo:
         """Cold-boots a stopped sandbox on its existing disks. It takes as long
         as a create, since there is no memory image to restore, and the
-        sandbox keeps its id, name, address and published ports."""
-        info = self._apply("StartSandbox", api_pb2.SandboxRef(sandbox_id=self.id))
+        sandbox keeps its id, name, address and published ports. It boots its
+        template's current kernel unless `keep_kernel`, which boots the one it
+        last ran."""
+        info = self._apply(
+            "StartSandbox",
+            api_pb2.StartSandboxRequest(sandbox_id=self.id, is_kernel_kept=keep_kernel),
+        )
         if self._on_resume:
             self._on_resume(self)
         return info

@@ -4,6 +4,8 @@
  * `Date`s on the other.
  */
 
+import type { KernelInfo } from "./types.js";
+
 /**
  * Maps a wire enum name onto the SDK's lowercase union: `SANDBOX_STATE_RUNNING`
  * with prefix `SANDBOX_STATE_` reads as `running`. A value this SDK has no
@@ -38,4 +40,24 @@ export function dateOrNull(unixMs: unknown): Date | null {
 export function msOf(at: Date | number | undefined): number {
   if (at instanceof Date) return at.getTime();
   return at ?? 0;
+}
+
+/** @internal One `Kernel` message; `null` when absent. */
+export function toKernelInfo(raw: any): KernelInfo | null {
+  if (!raw) return null;
+  const caps = raw.capabilities ?? {};
+  return {
+    name: raw.name ?? "",
+    digest: raw.digest ?? "",
+    version: raw.version ?? "",
+    arch: raw.arch ?? "",
+    capabilities: {
+      kvm: Boolean(caps.isKvmBuiltIn),
+      virtioMem: Boolean(caps.isVirtioMemBuiltIn),
+      vsock: Boolean(caps.isVsockBuiltIn),
+      virtioBlk: Boolean(caps.isVirtioBlkBuiltIn),
+      ext4: Boolean(caps.isExt4BuiltIn),
+    },
+    detectedFrom: raw.detectedFrom ?? "",
+  };
 }

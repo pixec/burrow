@@ -3,7 +3,8 @@ import { Buffer } from "node:buffer";
 import { withClient, withConnection } from "./client.js";
 import { BurrowError } from "./errors.js";
 import type { ConnectionOptions, TransportOptions } from "./transport.js";
-import type { CallOptions } from "./types.js";
+import type { CallOptions, KernelInfo } from "./types.js";
+import { toKernelInfo } from "./wire.js";
 
 /** One step of a template build. */
 export interface BuildStep {
@@ -26,6 +27,13 @@ export interface BuildOptions extends CallOptions {
    * `"cloud-hypervisor"` or `"vz"`. Defaults to the base template's.
    */
   hypervisor?: string;
+  /**
+   * Guest kernel the template's sandboxes boot, by the node's name for it
+   * ({@link NodeInfo.kernels}). Defaults to the base template's, else the
+   * node's default for the hypervisor: the Firecracker CI kernel for
+   * Firecracker, Cloud Hypervisor's own for Cloud Hypervisor.
+   */
+  kernel?: string;
   /**
    * The build's root disk in MiB, which is the size of the image it makes:
    * the base image plus 1024 by default. For {@link TemplateBuilder.fromIpsw},
@@ -72,6 +80,11 @@ export interface TemplateInfo {
   guestOs: string;
   /** The hypervisor every sandbox from this template runs under. */
   hypervisor: string;
+  /**
+   * The kernel its sandboxes boot. `null` for a template booted from firmware
+   * or installed whole (Windows, macOS).
+   */
+  kernel: KernelInfo | null;
 }
 
 /** Prints build logs the way a build tool would. */
@@ -232,6 +245,7 @@ export class TemplateBuilder {
       allowDomains: options.allowDomains ?? [],
       isSystemd: options.systemd ?? false,
       hypervisor: options.hypervisor ?? "",
+      kernel: options.kernel ?? "",
       diskMib: options.diskMib ?? 0,
     };
   }
@@ -266,6 +280,7 @@ export function toTemplateInfo(raw: any): TemplateInfo {
     systemd: Boolean(raw.isSystemd),
     guestOs: raw.guestOs ?? "",
     hypervisor: raw.hypervisor ?? "",
+    kernel: toKernelInfo(raw.kernel),
   };
 }
 
