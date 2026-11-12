@@ -129,14 +129,13 @@ impl OpenLayer {
 fn open_layers(
     paths: &[PathBuf],
     extents: &dyn burrow_vmm::memfile::Extents,
-    exact: bool,
 ) -> std::io::Result<Vec<OpenLayer>> {
     paths
         .iter()
         .enumerate()
         .map(|(index, path)| {
             let file = std::fs::File::open(path)?;
-            let layer = burrow_vmm::memfile::open_layer_with(path, &file, index, extents, exact)?;
+            let layer = burrow_vmm::memfile::open_layer_with(path, &file, index, extents)?;
             Ok(OpenLayer { file, layer })
         })
         .collect()
@@ -177,16 +176,10 @@ pub async fn put_image(
     let io = |err: std::io::Error| Status::internal(format!("reading an image to upload: {err}"));
     let opened: Vec<OpenLayer> = {
         let paths: Vec<PathBuf> = layers.iter().map(|name| dir.join(name)).collect();
-        tokio::task::spawn_blocking(move || {
-            open_layers(
-                &paths,
-                &burrow_vmm::memfile::Seek,
-                burrow_vmm::memfile::are_holes_exact(),
-            )
-        })
-        .await
-        .map_err(|err| Status::internal(format!("opening layers: {err}")))?
-        .map_err(io)?
+        tokio::task::spawn_blocking(move || open_layers(&paths, &burrow_vmm::memfile::Seek))
+            .await
+            .map_err(|err| Status::internal(format!("opening layers: {err}")))?
+            .map_err(io)?
     };
     let size = opened
         .iter()
@@ -1028,7 +1021,7 @@ mod tests {
         map.insert(6);
         append_map(&diff, &map).unwrap();
 
-        let layers = open_layers(&[base, diff], &Everything, false).unwrap();
+        let layers = open_layers(&[base, diff], &Everything).unwrap();
         assert_eq!(layers.iter().map(|l| l.layer.len).max(), Some(pages * PAGE));
         assert_eq!(layers[1].chunks(CHUNK_SIZE).collect::<Vec<_>>(), vec![0]);
         let mut expected = vec![7u8; CHUNK_SIZE as usize];

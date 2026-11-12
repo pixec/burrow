@@ -9,9 +9,8 @@
 //! after the guest's memory when the diff is written, and only a full image is
 //! read through its extents, since there a hole and a zero page are the same.
 //!
-//! Extents are an optimisation and nothing more, with one exception: a diff
-//! written before maps existed has nothing else to go on, so it is read
-//! through its extents only where [`probe`] found them exact.
+//! Extents are an optimisation and nothing more. A diff without a map is
+//! refused.
 
 use std::fs::File;
 use std::io;
@@ -292,45 +291,32 @@ impl Layer {
 }
 
 /// Reads what a chain's layer defines. `index` 0 is the full base; every
-/// other layer is a diff and must carry a map, or, written before maps, sit on
-/// a filesystem whose extents are exact.
+/// other layer is a diff and must carry a map.
 pub fn open_layer(path: &Path, file: &File, index: usize) -> io::Result<Layer> {
-    open_layer_with(path, file, index, &Seek, are_holes_exact())
+    open_layer_with(path, file, index, &Seek)
 }
 
-/// [`open_layer`] with the extents and their exactness given.
+/// [`open_layer`] with the extents given.
 pub fn open_layer_with(
     path: &Path,
     file: &File,
     index: usize,
     extents: &dyn Extents,
-    exact: bool,
 ) -> io::Result<Layer> {
-    let len = file.metadata()?.len();
     if index == 0 {
+        let len = file.metadata()?.len();
         return Ok(Layer::full(len, full_extents(file, extents)?));
     }
-    if let Some(map) = read_map(file).map_err(|err| named(path, err))? {
-        return Ok(Layer {
-            len: map.pages * PAGE,
-            defined: map.ranges(),
-        });
-    }
-    if !exact || len % PAGE != 0 {
-        return Err(io::Error::other(format!(
-            "{} has no page map: it was written before diffs carried them, or by a suspend \
-             that did not finish. This node's data directory does not report holes per 4 KiB \
-             page, so which pages it defines cannot be known. Resume it on a node whose data \
-             directory passes the hole probe, or delete it",
-            path.display()
-        )));
-    }
-    let mut map = PageMap::new(len / PAGE);
-    for (start, end) in extents.extents(file).map_err(|err| named(path, err))? {
-        map.insert_bytes(start, end);
-    }
+    let map = read_map(file)
+        .map_err(|err| named(path, err))?
+        .ok_or_else(|| {
+            io::Error::other(format!(
+                "{} has no page map: it was written by a suspend that did not finish; delete it",
+                path.display()
+            ))
+        })?;
     Ok(Layer {
-        len,
+        len: map.pages * PAGE,
         defined: map.ranges(),
     })
 }
@@ -609,17 +595,13 @@ mod tests {
         (paths, memory)
     }
 
-    fn open_with(
-        paths: &[PathBuf],
-        extents: &dyn Extents,
-        exact: bool,
-    ) -> io::Result<Vec<(File, Layer)>> {
+    fn open_with(paths: &[PathBuf], extents: &dyn Extents) -> io::Result<Vec<(File, Layer)>> {
         paths
             .iter()
             .enumerate()
             .map(|(index, path)| {
                 let file = File::open(path)?;
-                let layer = open_layer_with(path, &file, index, extents, exact)?;
+                let layer = open_layer_with(path, &file, index, extents)?;
                 Ok((file, layer))
             })
             .collect()
@@ -698,7 +680,7 @@ mod tests {
         let dir = scratch("restore");
         let (paths, memory) = chain(&dir);
         for extents in [&Seek as &dyn Extents, &Records, &Unsupported] {
-            let layers = open_with(&paths, extents, false).unwrap();
+            let layers = open_with(&paths, extents).unwrap();
             assert_eq!(served(&layers), memory);
         }
         let _ = std::fs::remove_dir_all(&dir);
@@ -708,8 +690,8 @@ mod tests {
     fn coarse_extents_would_have_corrupted_the_restore() {
         let dir = scratch("coarse");
         let (paths, memory) = chain(&dir);
-        // What reading diffs through their extents did before maps.
-        let mut layers = open_with(&paths, &Records, false).unwrap();
+        // What reading diffs through their extents would serve.
+        let mut layers = open_with(&paths, &Records).unwrap();
         for (file, layer) in &mut layers[1..] {
             layer.defined = Records.extents(file).unwrap();
         }
@@ -731,7 +713,7 @@ mod tests {
         let (paths, memory) = chain(&dir);
         for extents in [&Seek as &dyn Extents, &Records, &Unsupported] {
             let out = dir.join("merged.mem");
-            let layers = open_with(&paths, extents, false).unwrap();
+            let layers = open_with(&paths, extents).unwrap();
             merge_layers(&paths[0], &layers, &out).unwrap();
             assert_eq!(std::fs::read(&out).unwrap(), memory.concat());
         }
@@ -739,39 +721,18 @@ mod tests {
     }
 
     #[test]
-    fn a_diff_without_a_map_is_refused_unless_extents_are_exact() {
-        let dir = scratch("legacy");
+    fn a_diff_without_a_map_is_refused() {
+        let dir = scratch("unmapped");
         let (paths, _) = chain(&dir);
-        let legacy = dir.join("snapshot.diff1.mem");
         let file = std::fs::OpenOptions::new()
             .write(true)
-            .open(&legacy)
+            .open(&paths[1])
             .unwrap();
         file.set_len(PAGES * PAGE).unwrap();
         drop(file);
 
-        let err = open_with(&paths[..2], &Records, false).unwrap_err();
+        let err = open_with(&paths[..2], &Seek).unwrap_err();
         assert!(err.to_string().contains("has no page map"), "{err}");
-
-        // Where extents are exact, they are the pages Firecracker wrote.
-        let layers = open_with(
-            &paths[..2],
-            &Exact(vec![
-                (17 * PAGE, 18 * PAGE),
-                (40 * PAGE, 41 * PAGE),
-                (70 * PAGE, 71 * PAGE),
-            ]),
-            true,
-        )
-        .unwrap();
-        assert_eq!(
-            layers[1].1.defined,
-            vec![
-                (17 * PAGE, 18 * PAGE),
-                (40 * PAGE, 41 * PAGE),
-                (70 * PAGE, 71 * PAGE)
-            ]
-        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 

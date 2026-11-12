@@ -872,8 +872,7 @@ message CpuFingerprint {
 // Whether a sparse file's extents on a node's data directory are exactly the
 // pages written to it. Correctness never depends on it: memory diffs carry
 // their own page maps. Without it a diff can only be taken through the
-// page-fault handler, a suspend otherwise writes guest memory in full, and a
-// memory chain written before page maps cannot be restored.
+// page-fault handler, and a suspend otherwise writes guest memory in full.
 message HoleProbe {
   // One 4 KiB page written at 68 KiB was reported as exactly that page. ZFS
   // with a 128K recordsize reports the whole record.

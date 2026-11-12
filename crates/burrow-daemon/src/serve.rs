@@ -676,9 +676,8 @@ fn local_node_info(args: &ServeArgs) -> anyhow::Result<NodeInfo> {
 }
 
 /// Probes whether sparse files in `dir`, where sandboxes' memory lives, report
-/// their holes per page. Only an optimisation and the way into memory chains
-/// written before diffs carried page maps depend on it, so a failure is a
-/// warning.
+/// their holes per page. Only an optimisation depends on it, so a failure is
+/// a warning.
 fn probe_holes(dir: &std::path::Path) -> burrow_proto::common::v1::HoleProbe {
     let probe = burrow_vmm::memfile::probe(dir);
     burrow_vmm::memfile::set_holes_exact(probe.is_exact());
@@ -691,9 +690,8 @@ fn probe_holes(dir: &std::path::Path) -> burrow_proto::common::v1::HoleProbe {
             is_zero_page_kept = probe.is_zero_page_kept,
             error = probe.error.as_deref().unwrap_or(""),
             "the data directory does not report holes per 4 KiB page (on ZFS: recordsize=4K, \
-             compression=off). Diffs are taken only through the page-fault handler, other \
-             suspends write guest memory in full, and memory chains written before diffs \
-             carried page maps cannot be restored"
+             compression=off). Diffs are taken only through the page-fault handler, and other \
+             suspends write guest memory in full"
         );
     }
     burrow_proto::common::v1::HoleProbe {
