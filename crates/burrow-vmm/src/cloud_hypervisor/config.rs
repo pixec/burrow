@@ -51,6 +51,24 @@ pub(crate) fn disk(drive: &crate::DriveSpec) -> Value {
     })
 }
 
+/// The NIC on the sandbox's tap, with checksum and segmentation offload.
+///
+/// Cloud Hypervisor's API defaults every offload off (its command line
+/// defaults them on), and without them each guest TCP segment crosses the
+/// tap at MTU size with its checksum computed in software: guest to host
+/// TCP ran at 2 to 6 Gbit/s against Firecracker's 30 to 37 on the same
+/// host. The guest negotiates the features at boot and a restore keeps
+/// them, so this applies to VMs booted since.
+fn nic(tap: &str) -> Value {
+    json!({
+        "id": NET_ID,
+        "tap": tap,
+        "offload_csum": true,
+        "offload_tso": true,
+        "offload_ufo": true,
+    })
+}
+
 /// Where the guest's console goes, per architecture.
 ///
 /// On aarch64 Cloud Hypervisor's UART is a PL011, which a kernel built for
@@ -157,7 +175,7 @@ pub(crate) fn vm_config(
         }
     }
     if let Some(net) = &spec.net {
-        let mut nic = json!({ "id": NET_ID, "tap": net.tap });
+        let mut nic = nic(&net.tap);
         if let Some(mac) = &net.guest_mac {
             nic["mac"] = json!(mac);
         }
@@ -283,7 +301,14 @@ mod tests {
         assert_eq!(vm["payload"]["kernel"], "vmlinux");
         assert_eq!(
             vm["net"],
-            json!([{ "id": "net0", "tap": "bt7", "mac": "06:00:0a:00:00:1e" }])
+            json!([{
+                "id": "net0",
+                "tap": "bt7",
+                "mac": "06:00:0a:00:00:1e",
+                "offload_csum": true,
+                "offload_tso": true,
+                "offload_ufo": true,
+            }])
         );
         assert_eq!(
             vm["vsock"],

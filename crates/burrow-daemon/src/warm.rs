@@ -70,8 +70,13 @@ pub async fn hold_builds() -> tokio::sync::MutexGuard<'static, ()> {
 /// 8 writes a Cloud Hypervisor guest's console to `console.pipe`. A 7 names
 /// `console.log`, which the node now owns, so a jailed VMM cannot open it.
 ///
+/// 9 boots a Cloud Hypervisor guest's NIC with checksum and segmentation
+/// offload, which an 8's guest negotiated without and keeps across a restore.
+/// A 9 also records the digests of its guest's agent and kernel, which must
+/// match the node's agent and the template's kernel.
+///
 /// A snapshot in any other format is discarded.
-const WARM_FORMAT: &str = "8";
+const WARM_FORMAT: &str = "9";
 
 /// Whether a warm snapshot's `format` file names the format this build writes.
 fn is_current_format(text: &str) -> bool {
@@ -1173,10 +1178,10 @@ mod shape_tests {
 
     #[test]
     fn only_the_current_format_is_warm() {
-        assert_eq!(WARM_FORMAT, "8");
-        assert!(is_current_format("8"));
-        assert!(is_current_format("8\n"));
-        for other in ["", "7", "9"] {
+        assert_eq!(WARM_FORMAT, "9");
+        assert!(is_current_format("9"));
+        assert!(is_current_format("9\n"));
+        for other in ["", "8", "10"] {
             assert!(!is_current_format(other), "{other:?} is not current");
         }
     }
