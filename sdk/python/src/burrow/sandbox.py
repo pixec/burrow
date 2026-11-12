@@ -975,22 +975,10 @@ class Sandbox:
         re-render at once, so the sandbox is never briefly half-governed. Takes
         a mode, a dict or the `NetworkPolicy` read back from `policy.network`.
         """
-        self._assert_live()
-        wanted = network_policy(policy)
-        # The guest is handed the inspection CA during its first handshake, so
-        # a sandbox that did not start with TLS inspection cannot gain it. That
-        # makes this the one policy change refused here rather than sent.
-        if wanted.inspect_tls and not self._info.policy.network.inspect_tls:
-            raise BurrowError(
-                f"sandbox {self.id} was created without TLS inspection, so "
-                f"headers cannot be injected into its traffic; create it with "
-                f"inspect_tls set",
-                "failed_precondition",
-            )
         return self._apply(
             "UpdateNetworkPolicy",
             api_pb2.UpdateNetworkPolicyRequest(
-                sandbox_id=self.id, network=to_network_policy(wanted)
+                sandbox_id=self.id, network=to_network_policy(network_policy(policy))
             ),
         )
 

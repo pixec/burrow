@@ -290,3 +290,11 @@ def test_a_policy_read_back_and_passed_to_update_keeps_its_deny_list():
     assert list(server.sent[0].deny_domains) == ["*.example.com"]
     assert sandbox.policy.network.deny_domains == ["*.example.com"]
 
+
+def test_enabling_inspection_later_is_left_to_the_server():
+    server = PolicyServer(common_pb2.NetworkPolicy(mode=common_pb2.NETWORK_MODE_ALLOWLIST))
+    sandbox = Sandbox(server, _to_sandbox_info(server.record), False)
+    sandbox.update_network_policy(
+        {"mode": "allowlist", "allow_domains": ["pypi.org"], "inspect_tls": True}
+    )
+    assert server.sent[0].is_tls_inspected
