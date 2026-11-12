@@ -50,6 +50,7 @@ pub(crate) fn spec(spec: VmSpec, config: FirecrackerConfig) -> crate::Result<Mic
         is_pci_enabled: spec.is_pci_enabled,
         vcpus: spec.vcpus,
         mem_mib: spec.mem_mib,
+        mem_hotplug_mib: spec.mem_hotplug_mib,
         net: spec.net,
         is_vsock_enabled: spec.is_vsock_enabled,
         is_dirty_pages_tracked: spec.is_dirty_pages_tracked,
@@ -127,6 +128,9 @@ pub struct MicroVmSpec {
     pub is_pci_enabled: bool,
     pub vcpus: u32,
     pub mem_mib: u32,
+    /// The virtio-mem region above `mem_mib`; 0 for none. Ignored by a
+    /// restore, which takes the device from the snapshot.
+    pub mem_hotplug_mib: u32,
     pub net: Option<NetSpec>,
     /// Enable virtio-vsock, the transport the guest agent speaks.
     pub is_vsock_enabled: bool,
@@ -178,6 +182,7 @@ impl MicroVmSpec {
             is_pci_enabled: false,
             vcpus: 1,
             mem_mib: 512,
+            mem_hotplug_mib: 0,
             net: None,
             is_vsock_enabled: false,
             is_dirty_pages_tracked: false,
@@ -317,6 +322,14 @@ impl MicroVm {
             })
             .await?;
 
+        if self.spec.mem_hotplug_mib > 0 {
+            self.api
+                .set_memory_hotplug(&MemoryHotplug {
+                    total_size_mib: self.spec.mem_hotplug_mib,
+                })
+                .await?;
+        }
+
         self.api
             .set_boot_source(&BootSource {
                 kernel_image_path: self.spec.kernel.clone(),
@@ -361,6 +374,14 @@ impl MicroVm {
 
     pub fn pid(&self) -> Option<u32> {
         self.process.pid()
+    }
+
+    pub async fn request_memory(&self, plugged_mib: u32) -> Result<()> {
+        self.api.request_memory(plugged_mib).await
+    }
+
+    pub async fn plugged_memory(&self) -> Result<u32> {
+        Ok(self.api.memory_hotplug().await?.plugged_size_mib)
     }
 
     pub fn has_exited(&mut self) -> bool {

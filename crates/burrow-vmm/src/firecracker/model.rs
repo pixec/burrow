@@ -19,6 +19,20 @@ pub struct MachineConfig {
     pub is_dirty_pages_tracked: bool,
 }
 
+/// The virtio-mem device, configured before boot. Block and slot sizes are
+/// Firecracker's defaults: 2 MiB blocks the guest can unplug one at a time,
+/// in 128 MiB slots Firecracker removes from the guest once all of a slot's
+/// blocks are out.
+#[derive(Debug, Clone, Serialize)]
+pub struct MemoryHotplug {
+    pub total_size_mib: u32,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct MemoryHotplugStatus {
+    pub plugged_size_mib: u32,
+}
+
 #[derive(Debug, Clone, Serialize)]
 pub struct BootSource {
     pub kernel_image_path: String,

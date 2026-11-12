@@ -524,6 +524,28 @@ impl ChVm {
             .await
     }
 
+    /// Sets the guest's memory to its boot memory plus `plugged_mib`, which
+    /// its virtio-mem driver then works towards.
+    pub async fn request_memory(&self, plugged_mib: u32) -> Result<()> {
+        let info: Value = self.api.get_json("/api/v1/vm.info").await?;
+        let boot = info["config"]["memory"]["size"].as_u64().unwrap_or(0);
+        self.api
+            .put(
+                "/api/v1/vm.resize",
+                &json!({ "desired_ram": boot + u64::from(plugged_mib) * 1024 * 1024 }),
+            )
+            .await
+    }
+
+    /// `memory_actual_size` counts what the virtio-mem device has plugged,
+    /// not what it was asked for.
+    pub async fn plugged_memory(&self) -> Result<u32> {
+        let info: Value = self.api.get_json("/api/v1/vm.info").await?;
+        let boot = info["config"]["memory"]["size"].as_u64().unwrap_or(0);
+        let actual = info["memory_actual_size"].as_u64().unwrap_or(boot);
+        Ok((actual.saturating_sub(boot) / (1024 * 1024)) as u32)
+    }
+
     /// Hotplugs or unplugs vCPUs.
     pub async fn resize_vcpus(&self, vcpus: u32) -> Result<()> {
         self.api

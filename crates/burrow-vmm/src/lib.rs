@@ -41,7 +41,19 @@ pub use vz::{MacOsBoot, Requirements, VzConfig};
 /// `pci=off` is deliberately absent: virtio devices sit on a PCI bus so that
 /// volumes can be hotplugged onto a sandbox restored from a warm snapshot, and
 /// a guest told to ignore the bus would never see them.
-pub const DEFAULT_BOOT_ARGS: &str = "console=ttyS0 reboot=k panic=1";
+/// `memhp_default_state=online_movable` onlines memory virtio-mem plugs as
+/// soon as it arrives, there being no udev in the guest to do it, and in
+/// ZONE_MOVABLE, which the kernel keeps its own allocations out of so that the
+/// memory can be emptied and unplugged again.
+pub const DEFAULT_BOOT_ARGS: &str =
+    "console=ttyS0 reboot=k panic=1 memhp_default_state=online_movable";
+
+/// What a guest's memory moves in, the virtio-mem block size both backends
+/// use.
+pub const MEMORY_BLOCK_MIB: u32 = 2;
+/// What a hotplug region is sized in: Firecracker's slot, and Cloud
+/// Hypervisor's alignment for a virtio-mem region.
+pub const MEMORY_REGION_ALIGN_MIB: u32 = 128;
 
 /// A disk the guest sees, in the order it sees them.
 #[derive(Debug, Clone)]
@@ -93,6 +105,13 @@ pub struct NetSpec {
 
 pub use burrow_common::hypervisor::{GuestOs, Hypervisor};
 
+const MEMORY_POLL: Duration = Duration::from_millis(50);
+/// How long a guest may make no progress plugging or unplugging before it is
+/// taken to have stopped where it is.
+const MEMORY_STALL: Duration = Duration::from_secs(3);
+const MEMORY_TIMEOUT: Duration = Duration::from_secs(120);
+
+
 /// The framework's save file, device state and memory in one: both halves of
 /// the vz backend's [`Layout`]. Named here so every build knows the layout
 /// of state a Mac node wrote.
@@ -119,6 +138,7 @@ impl HypervisorExt for Hypervisor {
                 is_tap_networked: true,
                 is_live_disk_growth_supported: true,
                 is_vcpu_hotplug_supported: false,
+                is_memory_hotplug_supported: true,
             },
             // Cloud Hypervisor copies guest memory in at restore, and its
             // own on-demand mode cannot be pointed at burrow's page-fault
@@ -136,6 +156,7 @@ impl HypervisorExt for Hypervisor {
                 // arm64 KVM creates every vCPU before the VM first runs, and
                 // refuses one created after with EBUSY.
                 is_vcpu_hotplug_supported: cfg!(target_arch = "x86_64"),
+                is_memory_hotplug_supported: true,
             },
             // The framework saves a machine as one opaque file, reads it back
             // itself and attaches storage only at configuration time.
@@ -151,6 +172,9 @@ impl HypervisorExt for Hypervisor {
                 is_tap_networked: false,
                 is_live_disk_growth_supported: false,
                 is_vcpu_hotplug_supported: false,
+                // A running machine's memory can only be ballooned below what
+                // it was configured with, never raised.
+                is_memory_hotplug_supported: false,
             },
         }
     }
@@ -205,10 +229,13 @@ pub struct Capabilities {
     /// sandbox is shut down.
     pub is_live_disk_growth_supported: bool,
     /// A running guest can be given vCPUs up to [`VmSpec::max_vcpus`] and
-    /// have them taken away again ([`Vm::resize_vcpus`]). No backend adds
-    /// memory to a running guest: that takes virtio-mem in the guest kernel,
-    /// or ACPI memory hotplug, which Cloud Hypervisor has only on x86_64.
+    /// have them taken away again ([`Vm::resize_vcpus`]).
     pub is_vcpu_hotplug_supported: bool,
+    /// A Linux guest can be booted with a virtio-mem region of
+    /// [`VmSpec::mem_hotplug_mib`] and have memory plugged into it and
+    /// unplugged from it while it runs ([`Vm::resize_memory`]). The guest
+    /// kernel needs `CONFIG_VIRTIO_MEM`.
+    pub is_memory_hotplug_supported: bool,
 }
 
 impl Capabilities {
@@ -316,8 +343,19 @@ pub struct VmSpec {
     /// vCPUs the guest is booted able to take, where
     /// [`Capabilities::is_vcpu_hotplug_supported`]; never below `vcpus`.
     pub max_vcpus: u32,
+    /// The memory the guest boots with.
     pub mem_mib: u32,
+    /// The virtio-mem region above it, which memory is plugged into while the
+    /// guest runs; 0 for none. A multiple of [`MEMORY_REGION_ALIGN_MIB`], and
+    /// only where [`Capabilities::is_memory_hotplug_supported`]. A restore
+    /// takes the region and what is plugged in it from the snapshot.
+    pub mem_hotplug_mib: u32,
+    /// How much of the region is plugged now: none at a boot, what the
+    /// snapshot holds at a restore, and whatever [`Vm::resize_memory`] reached
+    /// since.
+    pub mem_plugged_mib: u32,
     pub net: Option<NetSpec>,
+
     /// Enable virtio-vsock, the transport the guest agent speaks.
     pub is_vsock_enabled: bool,
     /// Needed for diff snapshots.
@@ -355,6 +393,8 @@ impl VmSpec {
             vcpus: 1,
             max_vcpus: 0,
             mem_mib: 512,
+            mem_hotplug_mib: 0,
+            mem_plugged_mib: 0,
             net: None,
             is_vsock_enabled: false,
             is_dirty_pages_tracked: false,
@@ -639,6 +679,77 @@ impl Vm {
             None => Err(Error::CgroupUnavailable {
                 reason: "this VM runs under no cgroup".into(),
             }),
+        }
+    }
+
+    /// Asks the guest to have `plugged_mib` of its virtio-mem region plugged
+    /// and follows it there, returning the MiB plugged once it arrives or
+    /// stops making progress. A guest that stops short is asked to stay
+    /// where it stopped, so the device does not keep pulling at memory the
+    /// caller was told it kept. Only where
+    /// [`Capabilities::is_memory_hotplug_supported`], on a VM booted with a
+    /// region.
+    pub async fn resize_memory(&self, plugged_mib: u32) -> Result<u32> {
+        let mut plugged = self.plugged_memory().await?;
+        if plugged == plugged_mib {
+            return Ok(plugged);
+        }
+        self.request_memory(plugged_mib).await?;
+        let started = std::time::Instant::now();
+        let mut progressed = started;
+        while plugged != plugged_mib
+            && progressed.elapsed() < MEMORY_STALL
+            && started.elapsed() < MEMORY_TIMEOUT
+        {
+            tokio::time::sleep(MEMORY_POLL).await;
+            let now = self.plugged_memory().await?;
+            if now != plugged {
+                plugged = now;
+                progressed = std::time::Instant::now();
+            }
+        }
+        if plugged != plugged_mib {
+            self.request_memory(plugged).await?;
+            plugged = self.plugged_memory().await?;
+        }
+        Ok(plugged)
+    }
+
+    async fn request_memory(&self, plugged_mib: u32) -> Result<()> {
+        match self {
+            Self::Firecracker(vm) => Ok(vm.request_memory(plugged_mib).await?),
+            Self::CloudHypervisor(vm) => vm.request_memory(plugged_mib).await,
+            #[cfg(target_os = "macos")]
+            Self::Vz(_) => Err(Error::Unsupported {
+                hypervisor: Hypervisor::Vz,
+                what: "change a running guest's memory",
+            }),
+        }
+    }
+
+    /// MiB of the virtio-mem region the guest has plugged.
+    pub async fn plugged_memory(&self) -> Result<u32> {
+        match self {
+            Self::Firecracker(vm) => Ok(vm.plugged_memory().await?),
+            Self::CloudHypervisor(vm) => vm.plugged_memory().await,
+            #[cfg(target_os = "macos")]
+            Self::Vz(_) => Ok(0),
+        }
+    }
+
+    /// Moves the VMM's memory cap. A grow raises it before memory is plugged
+    /// and a shrink lowers it once memory is out, so the cap never sits below
+    /// what the guest holds.
+    pub fn set_memory_limit(&self, mib: u32) -> Result<()> {
+        let cgroup = match self {
+            Self::Firecracker(vm) => vm.cgroup(),
+            Self::CloudHypervisor(vm) => vm.cgroup(),
+            #[cfg(target_os = "macos")]
+            Self::Vz(_) => None,
+        };
+        match cgroup {
+            Some(cgroup) => cgroup.set_memory(mib),
+            None => Ok(()),
         }
     }
 

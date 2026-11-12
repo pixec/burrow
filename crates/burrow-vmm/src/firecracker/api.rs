@@ -31,6 +31,28 @@ impl FcApi {
         self.http.put("/machine-config", cfg).await
     }
 
+    /// Only valid before `InstanceStart`.
+    pub async fn set_memory_hotplug(&self, hotplug: &MemoryHotplug) -> Result<()> {
+        self.http.put("/hotplug/memory", hotplug).await
+    }
+
+    /// Sets how much of the virtio-mem region the guest is to have plugged,
+    /// which it then works towards.
+    pub async fn request_memory(&self, requested_size_mib: u32) -> Result<()> {
+        self.http
+            .call(
+                Method::PATCH,
+                "/hotplug/memory",
+                Some(&serde_json::json!({ "requested_size_mib": requested_size_mib })),
+            )
+            .await
+            .map(|_| ())
+    }
+
+    pub async fn memory_hotplug(&self) -> Result<MemoryHotplugStatus> {
+        self.http.get_json("/hotplug/memory").await
+    }
+
     pub async fn set_boot_source(&self, src: &BootSource) -> Result<()> {
         self.http.put("/boot-source", src).await
     }

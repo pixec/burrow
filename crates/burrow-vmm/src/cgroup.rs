@@ -162,6 +162,14 @@ impl Cgroup {
         Ok(())
     }
 
+    /// Moves the memory cap, for a guest given memory or relieved of it.
+    pub fn set_memory(&self, mib: u32) -> Result<()> {
+        write(
+            &self.path.join("memory.max"),
+            &(u64::from(mib) * 1024 * 1024).to_string(),
+        )
+    }
+
     pub fn path(&self) -> &Path {
         &self.path
     }

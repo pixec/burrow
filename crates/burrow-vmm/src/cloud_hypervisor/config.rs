@@ -22,6 +22,7 @@ const TPM_SOCK: &str = "swtpm.sock";
 /// Windows 11's own minimums; Setup and the OOBE refuse less.
 const WINDOWS_MIN_VCPUS: u32 = 2;
 const WINDOWS_MIN_MEM_MIB: u32 = 4096;
+const MIB: u64 = 1024 * 1024;
 
 /// One disk as Cloud Hypervisor is given it, at boot and on hotplug alike.
 ///
@@ -126,7 +127,7 @@ pub(crate) fn vm_config(
     let disks: Vec<Value> = spec.drives.iter().map(disk).collect();
     let mut vm = json!({
         "cpus": { "boot_vcpus": spec.vcpus, "max_vcpus": spec.max_vcpus.max(spec.vcpus) },
-        "memory": { "size": u64::from(spec.mem_mib) * 1024 * 1024 },
+        "memory": memory(spec),
         "payload": payload,
         // In the order given, which is the order the guest probes and names
         // them in.
@@ -168,17 +169,31 @@ pub(crate) fn vm_config(
 /// Everything else in it is relative and already right. The machine's shape
 /// cannot change across a restore, so a spec asking for another one is
 /// refused here, with both shapes named, rather than deep inside the VMM.
+/// Boot memory, and the virtio-mem region above it when there is one.
+fn memory(spec: &VmSpec) -> Value {
+    let mut memory = json!({ "size": u64::from(spec.mem_mib) * MIB });
+    if spec.mem_hotplug_mib > 0 {
+        memory["hotplug_method"] = json!("VirtioMem");
+        memory["hotplug_size"] = json!(u64::from(spec.mem_hotplug_mib) * MIB);
+    }
+    memory
+}
+
 pub(crate) fn retarget(snapshot: &mut Value, spec: &VmSpec) -> Result<()> {
-    let vcpus = snapshot["cpus"]["boot_vcpus"].as_u64();
-    let memory = snapshot["memory"]["size"].as_u64();
-    let wanted = u64::from(spec.mem_mib) * 1024 * 1024;
-    if vcpus != Some(u64::from(spec.vcpus)) || memory != Some(wanted) {
+    let vcpus = snapshot["cpus"]["boot_vcpus"].as_u64().unwrap_or(0);
+    let memory = snapshot["memory"]["size"].as_u64().unwrap_or(0) / MIB;
+    let region = snapshot["memory"]["hotplug_size"].as_u64().unwrap_or(0) / MIB;
+    if (vcpus, memory, region)
+        != (
+            u64::from(spec.vcpus),
+            u64::from(spec.mem_mib),
+            u64::from(spec.mem_hotplug_mib),
+        )
+    {
         return Err(Error::Snapshot(format!(
-            "the snapshot is of {} vcpu / {} MiB and this VM is {} vcpu / {} MiB",
-            vcpus.unwrap_or(0),
-            memory.unwrap_or(0) / (1024 * 1024),
-            spec.vcpus,
-            spec.mem_mib
+            "the snapshot is of {vcpus} vcpu / {memory} MiB with {region} MiB to plug and this \
+             VM is {} vcpu / {} MiB with {} MiB to plug",
+            spec.vcpus, spec.mem_mib, spec.mem_hotplug_mib
         )));
     }
     // Snapshots taken before disks were opened direct restore direct too.
@@ -255,6 +270,28 @@ mod tests {
     /// A disk carries only these keys. Cloud Hypervisor advertises a write
     /// cache and fsyncs on every guest flush by default, so the test is that
     /// nothing is sent that could change it.
+    #[test]
+    fn a_hotplug_region_is_a_virtio_mem_device_above_boot_memory() {
+        assert_eq!(
+            vm_config(&spec(), &config(), "aarch64").unwrap()["memory"],
+            json!({ "size": 1024 * MIB })
+        );
+        let mut grown = spec();
+        grown.mem_hotplug_mib = 15 * 1024;
+        let vm = vm_config(&grown, &config(), "aarch64").unwrap();
+        assert_eq!(
+            vm["memory"],
+            json!({
+                "size": 1024 * MIB,
+                "hotplug_method": "VirtioMem",
+                "hotplug_size": 15 * 1024 * MIB,
+            })
+        );
+        let mut snapshot = vm.clone();
+        retarget(&mut snapshot, &grown).unwrap();
+        assert!(retarget(&mut snapshot, &spec()).is_err());
+    }
+
     #[test]
     fn a_disk_is_rendered_with_flushes_left_on() {
         let vm = vm_config(&spec(), &config(), "aarch64").unwrap();
