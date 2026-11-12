@@ -132,6 +132,8 @@ class NetworkPolicy:
     allow_cidrs: List[str] = field(default_factory=list)
     allow_ports: List[int] = field(default_factory=list)
     deny_cidrs: List[str] = field(default_factory=list)
+    # Domain globs refused in every mode, before any allowance is consulted.
+    deny_domains: List[str] = field(default_factory=list)
     deny_ports: List[PortRule] = field(default_factory=list)
     # Refuse every IPv6 destination, in every mode.
     deny_ipv6: bool = False

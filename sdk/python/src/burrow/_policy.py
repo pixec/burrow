@@ -288,6 +288,7 @@ def to_network_policy(policy: NetworkPolicy) -> common_pb2.NetworkPolicy:
         allow_cidrs=policy.allow_cidrs,
         allow_ports=policy.allow_ports,
         deny_cidrs=policy.deny_cidrs,
+        deny_domains=policy.deny_domains,
         deny_ports=[
             common_pb2.PortRule(
                 protocol=getattr(common_pb2, f"PORT_PROTOCOL_{_PROTOCOLS[rule.protocol]}"),
@@ -321,6 +322,7 @@ def from_network_policy(raw: common_pb2.NetworkPolicy) -> NetworkPolicy:
         allow_cidrs=list(raw.allow_cidrs),
         allow_ports=list(raw.allow_ports),
         deny_cidrs=list(raw.deny_cidrs),
+        deny_domains=list(raw.deny_domains),
         deny_ports=[
             PortRule(
                 protocol=label(common_pb2.PortProtocol, rule.protocol, "PORT_PROTOCOL_") or "any",

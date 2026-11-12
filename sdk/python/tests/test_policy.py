@@ -3,9 +3,11 @@
 
 import pytest
 
+from burrow import Sandbox
 from burrow._pb import common_pb2
 from burrow._policy import from_network_policy, network_policy, to_network_policy
 from burrow.errors import BurrowError
+from burrow.sandbox import _to_sandbox_info
 from burrow.types import NetworkPolicy, PortRule
 
 
@@ -250,3 +252,41 @@ def test_a_secret_scope_is_carried_onto_the_wire():
     assert scopes[0].name == "api"
     assert scopes[0].allowed_sandboxes == ["sbx_a"]
     assert scopes[0].allowed_tags == ["team=ml"]
+
+
+def test_denied_domains_reach_the_wire_and_read_back():
+    policy = wire({"mode": "open", "deny_domains": ["*.example.com", "evil.test"]})
+    assert list(policy.deny_domains) == ["*.example.com", "evil.test"]
+    assert from_network_policy(policy).deny_domains == ["*.example.com", "evil.test"]
+
+
+class PolicyServer:
+    def __init__(self, network):
+        self.record = common_pb2.Sandbox(
+            id="sbx_test", policy=common_pb2.Policy(network=network)
+        )
+        self.sent = []
+
+    def route(self, sandbox_id):
+        return self
+
+    def unary(self, method, request, timeout=None):
+        assert method == "UpdateNetworkPolicy"
+        self.sent.append(request.network)
+        self.record.policy.network.CopyFrom(request.network)
+        return self.record
+
+
+def test_a_policy_read_back_and_passed_to_update_keeps_its_deny_list():
+    server = PolicyServer(
+        common_pb2.NetworkPolicy(
+            mode=common_pb2.NETWORK_MODE_OPEN, deny_domains=["*.example.com"]
+        )
+    )
+    sandbox = Sandbox(server, _to_sandbox_info(server.record), False)
+    policy = sandbox.policy.network
+    policy.deny_cidrs = ["10.0.0.0/8"]
+    sandbox.update_network_policy(policy)
+    assert list(server.sent[0].deny_domains) == ["*.example.com"]
+    assert sandbox.policy.network.deny_domains == ["*.example.com"]
+
