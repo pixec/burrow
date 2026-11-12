@@ -703,17 +703,6 @@ impl Store {
         Ok(row.map(event_row))
     }
 
-    /// The position of a node's first event that carries a shape.
-    pub async fn first_shaped_event(&self, node_id: &str) -> Result<Option<u64>> {
-        let first: (Option<i64>,) = on_pool!(self, pool => sqlx::query_as(
-            "SELECT MIN(node_seq) FROM events WHERE node_id=$1 AND vcpus > 0",
-        )
-        .bind(node_id)
-        .fetch_one(pool)
-        .await)?;
-        Ok(first.0.map(|seq| seq as u64))
-    }
-
     /// The highest `node_seq` copied from a node, so a tail resumes where the
     /// last one stopped.
     pub async fn last_event_seq_for_node(&self, node_id: &str) -> Result<u64> {

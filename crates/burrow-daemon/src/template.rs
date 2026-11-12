@@ -808,7 +808,8 @@ pub mod distribute {
             .map(|m| m.len())
             .unwrap_or(0);
 
-        // Absent for templates built the old way, which is not an error: the
+        // Absent for a template not imported from an image, which is not an
+        // error: the
         // receiving node then has exactly what this one has.
         let image_config = tokio::fs::read_to_string(dir.join(IMAGE_CONFIG))
             .await
@@ -1070,7 +1071,8 @@ pub mod distribute {
             let _ = std::fs::remove_dir_all(&dest);
         }
 
-        /// A template built the old way has no image config, and a pull of it
+        /// A template not imported from an image has no image config, and a
+        /// pull of it
         /// must clear whatever the name used to mean on the receiving node
         /// rather than leaving another image's environment behind.
         #[tokio::test]

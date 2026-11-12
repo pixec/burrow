@@ -217,7 +217,6 @@ async fn the_usage_ledger_commits_once_and_in_id_order_on_postgres() {
     for (seq, vcpus) in [(1, 0), (2, 0), (3, 2)] {
         store.append_event(&event(seq, vcpus)).await.unwrap();
     }
-    assert_eq!(store.first_shaped_event(&node).await.unwrap(), Some(3));
     assert_eq!(
         store
             .last_event_of(&sandbox)

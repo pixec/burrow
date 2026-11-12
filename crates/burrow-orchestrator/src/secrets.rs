@@ -65,8 +65,7 @@ impl Scope {
             })
     }
 
-    /// As stored: empty when unscoped, which is also every row from before
-    /// scopes existed.
+    /// As stored: empty when unscoped.
     fn encode(&self) -> String {
         if self.is_unscoped() {
             String::new()
@@ -84,8 +83,7 @@ impl Scope {
 }
 
 /// The context a value is sealed under: the name alone for an unscoped
-/// secret, so rows from before scopes still unseal, and the name with the
-/// scope otherwise.
+/// secret, and the name with the scope otherwise.
 fn context(name: &str, scope: &str) -> String {
     if scope.is_empty() {
         name.to_string()

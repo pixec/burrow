@@ -439,11 +439,6 @@ impl VolumeStore {
                 )));
             }
             let image = self.image(name);
-            if meta.guest_os.is_empty()
-                && let Some(made_by) = ondisk::made_by(&image).await
-            {
-                meta.guest_os = made_by.to_string();
-            }
             if !meta.guest_os.is_empty() && meta.guest_os != guest_os {
                 return Err(Status::failed_precondition(format!(
                     "volume {name} holds the filesystem a {} guest made ({}), which a {guest_os} \
@@ -1035,14 +1030,13 @@ mod ondisk {
     /// NTFS is never replayed here: no tool replays its log outside
     /// Windows, so a Windows reader relies on the writer's guest having
     /// flushed it.
-    /// A volume with no OS recorded predates the record, and is the node's
-    /// own kind.
+    /// A volume with no OS recorded has never been mounted writable, and
+    /// holds the ext4 the node made.
     pub async fn is_needed(image: &Path, guest_os: &str) -> bool {
         let is_hfs = match guest_os {
             "windows" => return false,
             "macos" => true,
-            "linux" => false,
-            _ => cfg!(target_os = "macos"),
+            _ => false,
         };
         if !is_hfs {
             return read_at(image, 1024, 1024)
@@ -1060,30 +1054,9 @@ mod ondisk {
             .is_some_and(|header| is_hfs_dirty(&header))
     }
 
-    /// The guest OS whose filesystem an image holds, for a volume that
-    /// predates the record of it: an ext4 that has been mounted, or HFS+.
-    /// What a node makes at create is an ext4 nobody has mounted, which any
-    /// guest may take.
-    pub async fn made_by(image: &Path) -> Option<&'static str> {
-        if read_at(image, 1024, 1024)
-            .await
-            .is_some_and(|superblock| is_used_ext4(&superblock))
-        {
-            return Some("linux");
-        }
-        let start = hfs_partition_offset(&read_at(image, 0, GPT_BYTES).await?)?;
-        let header = read_at(image, start + 1024, 2).await?;
-        matches!(&header[..], b"H+" | b"HX").then_some("macos")
-    }
-
     fn is_ext4(superblock: &[u8]) -> bool {
         superblock.len() >= 0x64
             && u16::from_le_bytes([superblock[0x38], superblock[0x39]]) == 0xef53
-    }
-
-    /// An ext4 with a last-mount time.
-    pub fn is_used_ext4(superblock: &[u8]) -> bool {
-        is_ext4(superblock) && superblock[0x2c..0x30] != [0; 4]
     }
 
     /// ext4 sets `needs_recovery` in its superblock while mounted and clears
@@ -1618,10 +1591,6 @@ mod tests {
         assert!(ondisk::is_ext4_dirty(&superblock));
         // A blank image is not a filesystem with a journal.
         assert!(!ondisk::is_ext4_dirty(&[0u8; 1024]));
-        // Made by the node, and never mounted: anyone's to take.
-        assert!(!ondisk::is_used_ext4(&superblock));
-        superblock[0x2c..0x30].copy_from_slice(&1_700_000_000u32.to_le_bytes());
-        assert!(ondisk::is_used_ext4(&superblock));
 
         // Attributes as read off a volume while mounted and after unmounting.
         let mut header = vec![0u8; 512];

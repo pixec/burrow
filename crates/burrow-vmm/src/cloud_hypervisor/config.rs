@@ -196,10 +196,6 @@ pub(crate) fn retarget(snapshot: &mut Value, spec: &VmSpec) -> Result<()> {
             spec.vcpus, spec.mem_mib, spec.mem_hotplug_mib
         )));
     }
-    // Snapshots taken before disks were opened direct restore direct too.
-    for disk in snapshot["disks"].as_array_mut().into_iter().flatten() {
-        disk["direct"] = json!(true);
-    }
     if let (Some(net), Some(nics)) = (&spec.net, snapshot["net"].as_array_mut()) {
         for nic in nics.iter_mut().filter(|nic| nic["id"] == NET_ID) {
             nic["tap"] = json!(net.tap);

@@ -350,7 +350,7 @@ impl NodeApi {
     }
 
     /// The environment an imported image declared, if this template came from
-    /// one. Templates built the old way simply have none.
+    /// one. A template not imported from an image has none.
     async fn image_environment(&self, template: &str) -> crate::oci::ImageEnvironment {
         crate::oci::image_environment(&self.data_dir, template).await
     }

@@ -292,7 +292,7 @@ impl ImageEnvironment {
 
 /// The environment an imported image declared, if this template came from one.
 ///
-/// Templates built the old way simply have none, and so does a template whose
+/// A template not imported from an image has none, and so does one whose
 /// record cannot be parsed: the environment is a convenience, and refusing to
 /// start a sandbox over it would be worse than starting one without it.
 /// A sandbox's own copy of its template's environment, in its working

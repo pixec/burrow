@@ -2857,10 +2857,8 @@ impl SandboxManager {
         self.ipam.lock().await.subnet()
     }
 
-    /// Moves a sandbox's files into its jail when they were left elsewhere:
-    /// a Cloud Hypervisor sandbox from before it could be jailed, or from a
-    /// run with `--jailer` off, or from when every jail was under
-    /// `<base>/firecracker`. Without this the sandbox would be found with no
+    /// Moves a sandbox's files into its jail when a run with `--jailer` off
+    /// left them outside it. Without this the sandbox would be found with no
     /// snapshot and discarded.
     async fn move_into_jail(&self, id: &str, hypervisor: Hypervisor, workdir: &Path) {
         let Some(jail) = self.config.jail_for(hypervisor) else {
@@ -2869,27 +2867,15 @@ impl SandboxManager {
         if tokio::fs::try_exists(workdir).await.unwrap_or(true) {
             return;
         }
-        let mut found = None;
-        for dir in [
-            jail.chroot_for(Hypervisor::Firecracker, id),
-            self.config.data_dir.join("sandboxes").join(id),
-        ] {
-            if dir != workdir && tokio::fs::try_exists(&dir).await.unwrap_or(false) {
-                found = Some(dir);
-                break;
-            }
-        }
-        let Some(found) = found else {
+        let found = self.config.data_dir.join("sandboxes").join(id);
+        if found == workdir || !tokio::fs::try_exists(&found).await.unwrap_or(false) {
             return;
-        };
+        }
         let moved = async {
             if let Some(parent) = workdir.parent() {
                 tokio::fs::create_dir_all(parent).await?;
             }
             tokio::fs::rename(&found, workdir).await?;
-            if jail.tree_of(&found) != found {
-                let _ = tokio::fs::remove_dir(jail.tree_of(&found)).await;
-            }
             let shared = [TEMPLATE_KERNEL.to_string(), TEMPLATE_ROOTFS.to_string()].into();
             grant_to_jail(workdir, jail, &shared).await
         };
@@ -3397,15 +3383,6 @@ impl SandboxManager {
             );
             return self.hold(&row, stored, None, false, reason).await;
         };
-        // Recorded before roots were: whatever this sandbox trusts, it was
-        // given on this node, by this node's root.
-        if stored.inspection_root_fingerprint.is_empty()
-            && !self
-                .inspection_ca_for(&stored.policy.clone().unwrap_or_default())
-                .is_empty()
-        {
-            stored.inspection_root_fingerprint = self.inspection_root();
-        }
         let workdir = self.config.sandbox_dir(&row.id, hypervisor);
         self.move_into_jail(&row.id, hypervisor, &workdir).await;
         let layout = hypervisor.layout();
@@ -9516,17 +9493,11 @@ impl SandboxManager {
                 self.config.version(hypervisor)
             )));
         }
-        // An older manifest has no root, and the record the orchestrator
-        // holds says the same thing.
-        let root = match manifest.inspection_root.as_str() {
-            "" => &record.inspection_root_fingerprint,
-            root => root,
-        };
         if !self
             .inspection_ca_for(&record.policy.clone().unwrap_or_default())
             .is_empty()
         {
-            self.require_inspection_root(&id, root)?;
+            self.require_inspection_root(&id, &manifest.inspection_root)?;
         }
         let mut record = record;
         self.unseal_from_store(&mut record, &manifest.secrets)?;
@@ -10854,61 +10825,6 @@ pub(crate) mod tests {
         // Here the tap cannot be made, so it is held rather than restored;
         // either way it is listed.
         assert_eq!(manager.list().await.len(), 1);
-        tokio::fs::remove_dir_all(&data_dir).await.ok();
-    }
-
-    /// Every jail used to be under `<base>/firecracker`, Cloud Hypervisor's
-    /// included. A suspended one from then is moved to its own hypervisor's
-    /// directory on recovery and keeps its snapshot, and a delete takes the
-    /// whole per-VM directory rather than leaving it empty.
-    #[tokio::test]
-    async fn a_jail_from_before_the_rename_is_moved_and_removed_whole() {
-        let id = "sbx_legacy-jail";
-        let (mut manager, data_dir) = recovering("legacy-jail").await;
-        tokio::fs::create_dir_all(&data_dir).await.unwrap();
-        let owner = std::fs::metadata(&data_dir).unwrap();
-        let jail = burrow_vmm::Jail {
-            jailer: "/nonexistent/jailer".into(),
-            uid: std::os::unix::fs::MetadataExt::uid(&owner),
-            gid: std::os::unix::fs::MetadataExt::gid(&owner),
-            chroot_base: data_dir.join("jail"),
-        };
-        manager.config.jail = Some(jail.clone());
-        manager.config.cloud_hypervisor.jail = Some(burrow_vmm::ChJail {
-            helper: "/proc/self/exe".into(),
-            uid: jail.uid,
-            gid: jail.gid,
-        });
-        manager.config.hypervisors.push(Hypervisor::CloudHypervisor);
-        let hypervisor = Hypervisor::CloudHypervisor;
-        let legacy = jail.chroot_for(Hypervisor::Firecracker, id);
-        tokio::fs::create_dir_all(&legacy).await.unwrap();
-        let layout = hypervisor.layout();
-        for file in [layout.state, crate::rootdisk::ROOT_DISK] {
-            tokio::fs::write(legacy.join(file), b"kept").await.unwrap();
-        }
-        let mut row = row(id, common::SandboxState::Suspended, 5);
-        row.record = prost::Message::encode_to_vec(&common::Sandbox {
-            id: id.into(),
-            template: "default".into(),
-            hypervisor: hypervisor.as_str().into(),
-            ..Default::default()
-        });
-        manager.store.put_sandbox(&row).await.unwrap();
-
-        manager.recover().await;
-
-        let workdir = jail.chroot_for(hypervisor, id);
-        assert!(workdir.join(layout.state).exists());
-        assert!(!jail.dir_for(Hypervisor::Firecracker, id).exists());
-        assert_eq!(
-            manager.store.list_sandboxes().await.unwrap()[0].state,
-            common::SandboxState::Suspended as i32
-        );
-
-        manager.delete(id).await.unwrap();
-        assert!(!jail.dir_for(hypervisor, id).exists());
-        assert!(jail.hypervisor_dir(hypervisor).exists());
         tokio::fs::remove_dir_all(&data_dir).await.ok();
     }
 

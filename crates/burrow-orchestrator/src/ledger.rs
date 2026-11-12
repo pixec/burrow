@@ -220,15 +220,10 @@ pub fn write_off(open: &OpenUsageRow) -> UsageRow {
     close(open, open.seen_at_ms, seen(open), CLOSED_BY_WRITE_OFF)
 }
 
-/// Consumes one batch of a node's log after `after`, moving its cursor on
-/// from `cursor`. Returns whether there may be more.
-async fn drain_batch(
-    store: &Store,
-    node_id: &str,
-    cursor: u64,
-    after: u64,
-) -> burrow_store::Result<bool> {
-    let events = store.list_node_events(node_id, after, BATCH).await?;
+/// Consumes one batch of a node's log after `cursor`, moving the cursor on.
+/// Returns whether there may be more.
+async fn drain_batch(store: &Store, node_id: &str, cursor: u64) -> burrow_store::Result<bool> {
+    let events = store.list_node_events(node_id, cursor, BATCH).await?;
     let Some(last) = events.last().map(|event| event.node_seq) else {
         return Ok(false);
     };
@@ -267,10 +262,7 @@ async fn drain_batch(
     Ok(true)
 }
 
-/// Consumes a node's log. The ledger of a node starts at its first event
-/// with a shape: a node from before events carried one logged none, and
-/// counting its history at zero vCPUs and memory would be wrong rather than
-/// missing.
+/// Consumes a node's log.
 async fn drain(store: &Store, node_id: &str) -> burrow_store::Result<()> {
     loop {
         let cursor = store
@@ -278,15 +270,8 @@ async fn drain(store: &Store, node_id: &str) -> burrow_store::Result<()> {
             .await?
             .into_iter()
             .find(|(id, _)| id == node_id)
-            .map(|(_, seq)| seq);
-        let after = match cursor {
-            Some(seq) => seq,
-            None => match store.first_shaped_event(node_id).await? {
-                Some(seq) => seq - 1,
-                None => return Ok(()),
-            },
-        };
-        if !drain_batch(store, node_id, cursor.unwrap_or(0), after).await? {
+            .map_or(0, |(_, seq)| seq);
+        if !drain_batch(store, node_id, cursor).await? {
             return Ok(());
         }
     }
@@ -833,60 +818,6 @@ mod tests {
         ]);
         assert_eq!(rows[0].state, SUSPENDED);
         assert_eq!(open.unwrap().state, STOPPED);
-    }
-
-    /// Events from before a node logged shapes are not turned into intervals
-    /// at zero vCPUs and memory: that node's ledger starts at its first
-    /// event with one.
-    #[tokio::test]
-    async fn a_nodes_ledger_starts_at_its_first_shaped_event() {
-        let store = Store::open_in_memory().await.unwrap();
-        let shapeless = |seq, kind, at| EventRow {
-            node_seq: seq,
-            vcpus: 0,
-            mem_mib: 0,
-            ..event(kind, SandboxState::Running, at, 0, 0)
-        };
-        for row in [
-            shapeless(1, EventKind::Created, 1_000),
-            shapeless(2, EventKind::Stopped, 2_000),
-            shapeless(3, EventKind::Started, 3_000),
-        ] {
-            store.append_event(&row).await.unwrap();
-        }
-        drain(&store, "node_a").await.unwrap();
-        assert!(store.usage_cursors().await.unwrap().is_empty());
-        assert!(store.open_usage("sbx_1").await.unwrap().is_none());
-
-        for (seq, kind, state, at) in [
-            (4, EventKind::Recovered, SandboxState::Suspended, 4_000),
-            (5, EventKind::Started, SandboxState::Running, 5_000),
-        ] {
-            store
-                .append_event(&EventRow {
-                    node_seq: seq,
-                    ..event(kind, state, at, 0, 0)
-                })
-                .await
-                .unwrap();
-        }
-        drain(&store, "node_a").await.unwrap();
-        let rows = store
-            .list_usage(&burrow_store::UsageFilter {
-                limit: 100,
-                ..Default::default()
-            })
-            .await
-            .unwrap();
-        assert_eq!(rows.len(), 1);
-        assert_eq!(
-            (rows[0].state, rows[0].started_at_ms, rows[0].vcpus),
-            (SUSPENDED, 4_000, 2)
-        );
-        assert_eq!(
-            store.usage_cursors().await.unwrap(),
-            [("node_a".to_string(), 5)]
-        );
     }
 
     #[tokio::test]
