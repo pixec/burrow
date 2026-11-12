@@ -16,6 +16,7 @@ mod edge;
 mod fsync;
 mod guestconn;
 mod ipsw;
+mod journal;
 mod kit;
 mod macnode;
 mod metrics;

@@ -2526,6 +2526,8 @@ pub struct SandboxManager {
     /// Pushes the log to the orchestrator and tells a lifecycle call when its
     /// event is committed there.
     delivery: Arc<crate::delivery::Delivery>,
+    /// Where event and session rows are written, in order.
+    journal: crate::journal::Journal,
     /// Every sandbox's totals as of the last reaper tick, for the exporter.
     metrics: crate::metrics::SandboxMetrics,
     volumes: Arc<crate::volume::VolumeStore>,
@@ -2768,6 +2770,7 @@ impl SandboxManager {
             ),
             events: tokio::sync::broadcast::channel(1024).0,
             delivery: Arc::new(crate::delivery::Delivery::new(config.event_delivery)),
+            journal: crate::journal::Journal::spawn(),
             metrics: Default::default(),
             shares: Arc::new(crate::share::Shares::new(
                 config.share.clone(),
@@ -3085,8 +3088,30 @@ impl SandboxManager {
         self.log_event(&sandbox.record(), shape, kind, detail).await;
     }
 
+    /// [`Self::emit`] without waiting for it: queued behind every event
+    /// already queued, and written before any emitted after it.
+    fn emit_behind(&self, sandbox: &RunningSandbox, kind: common::EventKind, detail: &str) {
+        let (record, shape) = (sandbox.record(), (sandbox.vcpus(), sandbox.mem_mib()));
+        let (manager, detail) = (self.clone(), detail.to_string());
+        self.journal
+            .queue(async move { manager.append_event(&record, shape, kind, &detail).await });
+    }
+
     /// [`Self::emit`] for a record, with the vcpus and memory its VM had.
     async fn log_event(
+        &self,
+        record: &common::Sandbox,
+        shape: (u32, u32),
+        kind: common::EventKind,
+        detail: &str,
+    ) {
+        let (manager, record, detail) = (self.clone(), record.clone(), detail.to_string());
+        self.journal
+            .write(async move { manager.append_event(&record, shape, kind, &detail).await })
+            .await;
+    }
+
+    async fn append_event(
         &self,
         record: &common::Sandbox,
         (vcpus, mem_mib): (u32, u32),
@@ -3207,6 +3232,30 @@ impl SandboxManager {
         started_by: common::SessionStart,
         from: Option<Usage>,
     ) {
+        self.journal
+            .write(self.session_opened(sandbox, started_by, from))
+            .await;
+    }
+
+    /// [`Self::open_session`] without waiting for its rows, for a create or a
+    /// resume whose caller should not wait on them. The session is the
+    /// sandbox's at once, so one closed before the rows land still ends it.
+    fn open_session_behind(
+        &self,
+        sandbox: &RunningSandbox,
+        started_by: common::SessionStart,
+        from: Option<Usage>,
+    ) {
+        self.journal
+            .queue(self.session_opened(sandbox, started_by, from));
+    }
+
+    fn session_opened(
+        &self,
+        sandbox: &RunningSandbox,
+        started_by: common::SessionStart,
+        from: Option<Usage>,
+    ) -> impl std::future::Future<Output = ()> + Send + 'static {
         let row = burrow_store::SessionRow {
             id: burrow_common::SessionId::generate().to_string(),
             sandbox_id: sandbox.id().to_string(),
@@ -3215,22 +3264,26 @@ impl SandboxManager {
             started_by: started_by as i32,
             ended_by: 0,
         };
-        if let Err(err) = self.store.put_session(&row).await {
-            tracing::error!(sandbox = sandbox.id(), %err, "could not record a session");
-            return;
-        }
-        *sandbox.session.lock().unwrap() = Some(row.id);
+        *sandbox.session.lock().unwrap() = Some(row.id.clone());
         let record = with_totals(sandbox.record(), from);
         let shape = (sandbox.vcpus(), sandbox.mem_mib());
-        self.log_event(&record, shape, EVENT_STARTED, started_by.label())
-            .await;
-        // Applied as a session lands, which is the one moment the count grows.
-        if let Err(err) = self
-            .store
-            .retain_recent_sessions(sandbox.id(), MAX_SESSIONS)
-            .await
-        {
-            tracing::warn!(sandbox = sandbox.id(), %err, "could not bound the session list");
+        let manager = self.clone();
+        async move {
+            if let Err(err) = manager.store.put_session(&row).await {
+                tracing::error!(sandbox = row.sandbox_id, %err, "could not record a session");
+                return;
+            }
+            manager
+                .append_event(&record, shape, EVENT_STARTED, started_by.label())
+                .await;
+            // Applied as a session lands, which is the one moment the count grows.
+            if let Err(err) = manager
+                .store
+                .retain_recent_sessions(&row.sandbox_id, MAX_SESSIONS)
+                .await
+            {
+                tracing::warn!(sandbox = row.sandbox_id, %err, "could not bound the session list");
+            }
         }
     }
 
@@ -3240,13 +3293,17 @@ impl SandboxManager {
             return;
         };
         self.sample_last(sandbox).await;
-        if let Err(err) = self
-            .store
-            .end_session(&id, burrow_common::unix_now_ms(), ended_by as i32)
-            .await
-        {
-            tracing::error!(sandbox = sandbox.id(), %err, "could not close a session");
-        }
+        let (store, sandbox_id) = (self.store.clone(), sandbox.id().to_string());
+        self.journal
+            .write(async move {
+                if let Err(err) = store
+                    .end_session(&id, burrow_common::unix_now_ms(), ended_by as i32)
+                    .await
+                {
+                    tracing::error!(sandbox = sandbox_id, %err, "could not close a session");
+                }
+            })
+            .await;
         self.emit(sandbox, EVENT_STOPPED, ended_by.label()).await;
     }
 
@@ -6971,8 +7028,8 @@ impl SandboxManager {
         // A create is a VM starting, whether it cold-booted or restored a warm
         // template snapshot: either way the guest begins at the image's state
         // rather than at one this sandbox left behind.
-        self.emit(&sandbox, EVENT_CREATED, "").await;
-        self.open_session(&sandbox, STARTED_BOOT, None).await;
+        self.emit_behind(&sandbox, EVENT_CREATED, "");
+        self.open_session_behind(&sandbox, STARTED_BOOT, None);
         let record = sandbox.record();
         let registered = std::time::Instant::now();
         self.persist(&sandbox).await;
@@ -7870,9 +7927,8 @@ impl SandboxManager {
         let (sandbox, _disk) = provisioned?;
         registered?;
 
-        self.emit(&sandbox, EVENT_CREATED, &format!("snapshot:{snapshot_id}"))
-            .await;
-        self.open_session(&sandbox, STARTED_RESTORE, None).await;
+        self.emit_behind(&sandbox, EVENT_CREATED, &format!("snapshot:{snapshot_id}"));
+        self.open_session_behind(&sandbox, STARTED_RESTORE, None);
         let record = sandbox.record();
         self.persist(&sandbox).await;
         // The snapshot has just proved itself worth keeping.
@@ -7926,9 +7982,8 @@ impl SandboxManager {
         let (sandbox, _disk) = forked?;
         registered?;
 
-        self.emit(&sandbox, EVENT_CREATED, &format!("fork:{source_id}"))
-            .await;
-        self.open_session(&sandbox, STARTED_RESTORE, None).await;
+        self.emit_behind(&sandbox, EVENT_CREATED, &format!("fork:{source_id}"));
+        self.open_session_behind(&sandbox, STARTED_RESTORE, None);
         let record = sandbox.record();
         self.persist(&sandbox).await;
         self.compact_if_deep(&sandbox);
@@ -8509,8 +8564,7 @@ impl SandboxManager {
             );
         }
         self.resync_public(&sandbox).await;
-        self.open_session(&sandbox, STARTED_RESUME, Some(from))
-            .await;
+        self.open_session_behind(&sandbox, STARTED_RESUME, Some(from));
         self.persist(&sandbox).await;
         Ok(sandbox.record())
     }
