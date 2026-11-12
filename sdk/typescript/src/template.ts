@@ -1,6 +1,7 @@
 import { Buffer } from "node:buffer";
 
 import { withClient, withConnection } from "./client.js";
+import { BurrowError } from "./errors.js";
 import type { ConnectionOptions, TransportOptions } from "./transport.js";
 import type { CallOptions } from "./types.js";
 
@@ -102,7 +103,7 @@ export function defaultBuildLogger(
  *
  * ```ts
  * const template = Template()
- *   .fromTemplate("default")
+ *   .fromImage("alpine:3.20")
  *   .runCmd("apk add --no-cache python3 py3-pip")
  *   .pipInstall(["cowsay", "requests"]);
  *
@@ -112,12 +113,15 @@ export function defaultBuildLogger(
  * ```
  */
 export class TemplateBuilder {
-  private base = "default";
+  private base = "";
   private image = "";
   private ipsw = "";
   private readonly steps: BuildStep[] = [];
 
-  /** Sets the burrow template to start from. Defaults to `"default"`. */
+  /**
+   * Sets the burrow template to start from. A build needs a base: this,
+   * {@link fromImage} or {@link fromIpsw}.
+   */
   fromTemplate(name: string): this {
     this.base = name;
     this.image = "";
@@ -208,6 +212,12 @@ export class TemplateBuilder {
 
   /** @internal The `BuildTemplateRequest` this builder describes. */
   toRequest(name: string, options: BuildOptions) {
+    if (!this.base && !this.image && !this.ipsw) {
+      throw new BurrowError(
+        "a template build needs a base: call fromTemplate, fromImage or fromIpsw",
+        "invalid_argument",
+      );
+    }
     return {
       name,
       // An OCI base takes the place of a template base; sending both would

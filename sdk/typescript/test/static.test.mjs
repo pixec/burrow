@@ -51,3 +51,12 @@ test("build takes its own deadline", async () => {
   });
   assert.deepEqual(calls, [{ method: "BuildTemplate", timeoutMs: 3_600_000, defaultMs: 5_000 }]);
 });
+
+test("a build without a base is refused before anything is sent", async () => {
+  const calls = record();
+  await assert.rejects(
+    Template.build(Template().runCmd("true"), "t", { endpoint: "localhost:1" }),
+    (err) => err.code === "invalid_argument" && /needs a base/.test(err.message),
+  );
+  assert.deepEqual(calls, []);
+});

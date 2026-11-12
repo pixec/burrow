@@ -74,6 +74,11 @@ def build_template(
     timeout: float = 30 * 60.0,
 ) -> BuiltTemplate:
     """Runs a build over `transport` and reports what the server published."""
+    if not (template._base or template._image or template._ipsw):
+        raise BurrowError(
+            "a template build needs a base: call from_template, from_image or from_ipsw",
+            "invalid_argument",
+        )
     request = api_pb2.BuildTemplateRequest(
         name=name,
         # An OCI base takes the place of a template base; sending both
@@ -165,13 +170,14 @@ class TemplateBuilder:
     build = _Build()
 
     def __init__(self) -> None:
-        self._base = "default"
+        self._base = ""
         self._image = ""
         self._ipsw = ""
         self._steps: List[str] = []
 
     def from_template(self, name: str) -> "TemplateBuilder":
-        """Sets the burrow template to start from. Defaults to `"default"`."""
+        """Sets the burrow template to start from. A build needs a base: this,
+        `from_image` or `from_ipsw`."""
         self._base = name
         self._image = ""
         self._ipsw = ""

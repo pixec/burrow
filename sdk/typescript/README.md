@@ -1154,8 +1154,8 @@ and every sandbox starts with them.
 import { Template, defaultBuildLogger } from "@pixec/burrow";
 
 const template = Template()
-  .fromTemplate("default")
-  .aptInstall(["python3", "python3-pip"])
+  .fromImage("python:3.12-slim")
+  .aptInstall(["git"])
   .pipInstall(["cowsay", "requests"])
   .writeFile("/etc/motd", "built by burrow\n");
 
@@ -1168,8 +1168,10 @@ const { sizeBytes } = await Template.build(template, "python-tools", {
 const sandbox = await Sandbox.create({ template: "python-tools" });
 ```
 
-Steps run in a real sandbox and the filesystem they leave behind becomes the
-image. There is no separate build language. A step that exits non-zero fails the
+Every build starts from a base: `fromTemplate` (a template that already
+exists), `fromImage` (an OCI image) or `fromIpsw` (macOS). There is no default,
+and a builder without one is refused before anything is sent. Steps run in a
+real sandbox and the filesystem they leave behind becomes the image. There is no separate build language. A step that exits non-zero fails the
 build, so a broken step never gets baked in. Linux builds default to 1 vCPU,
 1024 MiB, a 30 minute timeout, and unrestricted egress, because installing packages needs
 it; pass `allowDomains` to narrow the egress.

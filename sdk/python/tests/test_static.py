@@ -6,6 +6,7 @@ import pytest
 import burrow.client
 from burrow import Sandbox, Template
 from burrow._pb import api_pb2, common_pb2
+from burrow.errors import BurrowError
 
 
 class Recorder:
@@ -54,3 +55,10 @@ def test_build_takes_its_own_deadline(recorder):
     Template.build(Template().from_image("python:3.12"), "t", timeout=3600, call_timeout=5)
     assert recorder[0].timeout == 5
     assert recorder[0].calls == [("BuildTemplate", 3600)]
+
+
+def test_a_build_without_a_base_is_refused_before_anything_is_sent(recorder):
+    with pytest.raises(BurrowError, match="needs a base") as err:
+        Template.build(Template().run_cmd("true"), "t")
+    assert err.value.code == "invalid_argument"
+    assert recorder[0].calls == []
