@@ -1011,8 +1011,7 @@ async fn upload_logs(
     Ok(logs)
 }
 
-/// Brings a stored sandbox's command logs into `dir`. A generation uploaded
-/// before logs were kept on the node has none.
+/// Brings a stored sandbox's command logs into `dir`.
 async fn stage_logs(
     store: &ObjectStore,
     id: &str,
@@ -1020,9 +1019,11 @@ async fn stage_logs(
     dir: &Path,
 ) -> Result<std::collections::BTreeMap<String, LogImage>, Status> {
     let key = generation_key(id, generation, COMMAND_LOGS);
-    let Some(bytes) = store.get_bytes(&key).await? else {
-        return Ok(Default::default());
-    };
+    let bytes = store.get_bytes(&key).await?.ok_or_else(|| {
+        Status::not_found(format!(
+            "sandbox {id}'s stored state is missing {COMMAND_LOGS}"
+        ))
+    })?;
     let indexes: std::collections::BTreeMap<String, ImageIndex> = serde_json::from_slice(&bytes)
         .map_err(|err| Status::data_loss(format!("index {key} is unreadable: {err}")))?;
     {

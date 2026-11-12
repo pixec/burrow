@@ -27,7 +27,6 @@ use aws_sdk_s3::operation::head_object::HeadObjectError;
 use aws_sdk_s3::primitives::ByteStream;
 use aws_sdk_s3::types::{BucketLocationConstraint, CreateBucketConfiguration};
 use aws_smithy_http_client::tls;
-use tokio::io::{AsyncReadExt as _, AsyncSeekExt as _, AsyncWriteExt as _};
 use tonic::Status;
 
 #[derive(Clone)]
@@ -474,72 +473,6 @@ fn unavailable<E: std::error::Error + 'static, R: std::fmt::Debug>(
         other => other.to_string(),
     };
     Status::unavailable(format!("object store {what} {key}: {detail}"))
-}
-
-/// Sparse files, as snapshots were stored before they were chunked.
-///
-/// Each was one object of its data extents, each prefixed by where it sits,
-/// under a key with a `.sparse` suffix. Kept so a snapshot uploaded in that
-/// form still restores; nothing is written this way any more.
-///
-/// Format, all little-endian: `BRSPARSE` + u64 apparent length, then
-/// (u64 offset, u64 length, bytes) per extent in ascending order.
-const SPARSE_MAGIC: &[u8; 8] = b"BRSPARSE";
-
-pub fn sparse_key(key: &str) -> String {
-    format!("{key}.sparse")
-}
-
-impl ObjectStore {
-    /// Rebuilds a sparse file from the store. `None` when the key is absent.
-    pub async fn get_sparse_file(&self, key: &str, path: &Path) -> Result<Option<()>, Status> {
-        let sparse = sparse_key(key);
-        let Some(body) = self.get(&sparse).await? else {
-            return Ok(None);
-        };
-        let mut reader = body.into_async_read();
-        let mut file = tokio::fs::File::create(path)
-            .await
-            .map_err(|err| Status::internal(format!("creating {}: {err}", path.display())))?;
-        let read_err =
-            |err: std::io::Error| Status::unavailable(format!("object store read {sparse}: {err}"));
-        let write_err =
-            |err: std::io::Error| Status::internal(format!("writing {}: {err}", path.display()));
-        let corrupt = || Status::data_loss(format!("object {sparse} is not a sparse image"));
-
-        let mut header = [0u8; 16];
-        reader.read_exact(&mut header).await.map_err(read_err)?;
-        if &header[..8] != SPARSE_MAGIC {
-            return Err(corrupt());
-        }
-        let apparent = u64::from_le_bytes(header[8..].try_into().unwrap());
-        file.set_len(apparent).await.map_err(write_err)?;
-
-        let mut extent = [0u8; 16];
-        loop {
-            match reader.read_exact(&mut extent).await {
-                Ok(_) => {}
-                Err(err) if err.kind() == std::io::ErrorKind::UnexpectedEof => break,
-                Err(err) => return Err(read_err(err)),
-            }
-            let start = u64::from_le_bytes(extent[..8].try_into().unwrap());
-            let len = u64::from_le_bytes(extent[8..].try_into().unwrap());
-            if start.checked_add(len).is_none_or(|end| end > apparent) {
-                return Err(corrupt());
-            }
-            file.seek(std::io::SeekFrom::Start(start))
-                .await
-                .map_err(write_err)?;
-            let copied = tokio::io::copy(&mut (&mut reader).take(len), &mut file)
-                .await
-                .map_err(read_err)?;
-            if copied != len {
-                return Err(corrupt());
-            }
-        }
-        file.flush().await.map_err(write_err)?;
-        Ok(Some(()))
-    }
 }
 
 #[cfg(test)]

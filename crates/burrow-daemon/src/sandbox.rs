@@ -6212,9 +6212,9 @@ impl SandboxManager {
         }
     }
 
-    /// At startup: discards warm snapshots this build cannot restore and
-    /// rebuilds them at their shapes, warms the pinned shapes of every
-    /// template, and applies the caps, which may have changed.
+    /// At startup: discards warm snapshots this build cannot restore, warms
+    /// the pinned shapes of every template, and applies the caps, which may
+    /// have changed.
     pub async fn sweep_warm(&self) {
         let templates_dir = self.config.templates_dir();
         for template in crate::template::bootable(&self.config.data_dir).await {
@@ -6226,27 +6226,13 @@ impl SandboxManager {
             if !is_warmable {
                 continue;
             }
-            for (dir, shape) in crate::warm::stale(&templates_dir, &template.name).await {
-                if let Err(err) = tokio::fs::remove_dir_all(&dir).await {
+            for path in crate::warm::stale(&templates_dir, &template.name).await {
+                let removed = match tokio::fs::metadata(&path).await {
+                    Ok(meta) if meta.is_dir() => tokio::fs::remove_dir_all(&path).await,
+                    _ => tokio::fs::remove_file(&path).await,
+                };
+                if let Err(err) = removed {
                     tracing::warn!(template = template.name, %err, "could not discard a stale warm snapshot");
-                    continue;
-                }
-                if let Some(shape) = shape {
-                    tracing::info!(
-                        template = template.name,
-                        vcpus = shape.vcpus,
-                        mem_mib = shape.mem_mib,
-                        "rebuilding a warm snapshot in the current format"
-                    );
-                    self.warm_in_background(
-                        template.name.clone(),
-                        common::ResourcePolicy {
-                            vcpus: shape.vcpus,
-                            mem_mib: shape.mem_mib,
-                            max_mem_mib: shape.max_mem_mib,
-                            ..Default::default()
-                        },
-                    );
                 }
             }
             self.warm_template(&template.name);

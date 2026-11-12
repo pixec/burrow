@@ -124,11 +124,6 @@ pub struct Manifest {
     /// against.
     pub kernel_digest: String,
     pub rootfs_digest: String,
-    /// Memory and disk are stored as chunk indexes rather than as whole
-    /// sparse objects. Written before chunking existed, a snapshot is fetched
-    /// whole.
-    #[serde(default)]
-    pub is_chunked: bool,
     /// The inspection root its guest trusted, when it was inspected; see
     /// [`crate::durable::Manifest::inspection_root`].
     #[serde(default)]
@@ -218,8 +213,8 @@ fn log_names_key(id: &str) -> String {
     remote_key(id, &format!("{COMMAND_LOGS}.json"))
 }
 
-/// What [`log_names_key`] holds; none for a snapshot uploaded before logs
-/// went with it.
+/// What [`log_names_key`] holds; none when it is absent, as it is for an
+/// upload that did not get that far.
 async fn remote_log_names(
     remote: &crate::objstore::ObjectStore,
     id: &str,
@@ -256,9 +251,6 @@ async fn delete_remote(remote: &crate::objstore::ObjectStore, id: &str) -> Resul
             .into_iter()
             .chain([crate::rootdisk::ROOT_DISK])
         {
-            remote
-                .delete(&crate::objstore::sparse_key(&remote_key(id, file)))
-                .await?;
             remote.delete(&index_key(id, file)).await?;
         }
     }
@@ -417,7 +409,6 @@ impl SnapshotStore {
             is_durable: false,
             kernel_digest: String::new(),
             rootfs_digest: String::new(),
-            is_chunked: false,
             inspection_root: staged.inspection_root,
         };
         write_manifest(&dir, &manifest).await?;
@@ -519,7 +510,6 @@ impl SnapshotStore {
         remote.put_bytes(&log_names_key(id), json).await?;
         manifest.kernel_digest = kernel_digest;
         manifest.rootfs_digest = rootfs_digest;
-        manifest.is_chunked = true;
         manifest.is_durable = true;
         let json = serde_json::to_vec_pretty(&manifest)
             .map_err(|err| Status::internal(format!("encoding the manifest: {err}")))?;
@@ -600,21 +590,18 @@ impl SnapshotStore {
         // Begun at the path it will be served from: a hydrator names its file
         // by path, for the links it hands out. Readers of a snapshot all
         // arrive through `fetching`, which this call still holds.
-        if let Some(index) = memory {
-            let path = live.join(memory_file(layout)?);
-            let hydrator = Hydrator::begin(remote.clone(), index, &path)
-                .map_err(|err| Status::internal(format!("preparing {}: {err}", path.display())))?;
-            hydrator.start();
-            self.hydrators
-                .lock()
-                .unwrap()
-                .insert(id.to_string(), hydrator);
-        }
+        let path = live.join(memory_file(layout)?);
+        let hydrator = Hydrator::begin(remote.clone(), memory, &path)
+            .map_err(|err| Status::internal(format!("preparing {}: {err}", path.display())))?;
+        hydrator.start();
+        self.hydrators
+            .lock()
+            .unwrap()
+            .insert(id.to_string(), hydrator);
         tracing::info!(
             snapshot = id,
             size_bytes = manifest.size_bytes,
             took_ms = started.elapsed().as_millis() as u64,
-            is_memory_lazy = manifest.is_chunked,
             "snapshot fetched from the object store"
         );
         Ok(())
@@ -658,13 +645,13 @@ impl SnapshotStore {
     }
 
     /// Fetches everything a restore needs before it can start, returning the
-    /// memory image's index when memory is to arrive behind the guest.
+    /// memory image's index, which arrives behind the guest.
     async fn fetch_into(
         &self,
         remote: &crate::objstore::ObjectStore,
         manifest: &Manifest,
         dir: &Path,
-    ) -> Result<Option<crate::chunks::ImageIndex>, Status> {
+    ) -> Result<crate::chunks::ImageIndex, Status> {
         let id = &manifest.id;
         self.fetch_blob(remote, &manifest.kernel_digest, &dir.join(TEMPLATE_KERNEL))
             .await?;
@@ -701,27 +688,14 @@ impl SnapshotStore {
             crate::chunks::get_image(remote, &index, &dir.join(COMMAND_LOGS).join(&name)).await?;
         }
         let disk = crate::rootdisk::ROOT_DISK;
-        if manifest.is_chunked {
-            let index = read_index(remote, &index_key(id, disk))
-                .await?
-                .ok_or_else(|| missing(disk))?;
-            crate::rootdisk::materialise(remote, &index, Some(&image), &dir.join(disk)).await?;
-            let memory_file = memory_file(layout)?;
-            let memory = read_index(remote, &index_key(id, memory_file))
-                .await?
-                .ok_or_else(|| missing(memory_file))?;
-            return Ok(Some(memory));
-        }
-        for file in [memory_file(layout)?, disk] {
-            if remote
-                .get_sparse_file(&remote_key(id, file), &dir.join(file))
-                .await?
-                .is_none()
-            {
-                return Err(missing(file));
-            }
-        }
-        Ok(None)
+        let index = read_index(remote, &index_key(id, disk))
+            .await?
+            .ok_or_else(|| missing(disk))?;
+        crate::rootdisk::materialise(remote, &index, Some(&image), &dir.join(disk)).await?;
+        let memory_file = memory_file(layout)?;
+        read_index(remote, &index_key(id, memory_file))
+            .await?
+            .ok_or_else(|| missing(memory_file))
     }
 
     /// Brings a blob onto this node at `dest`: linked from the node's blob
@@ -1365,7 +1339,6 @@ mod tests {
             is_durable: false,
             kernel_digest: String::new(),
             rootfs_digest: String::new(),
-            is_chunked: false,
             inspection_root: String::new(),
         }
     }

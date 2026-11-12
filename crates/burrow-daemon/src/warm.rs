@@ -67,24 +67,7 @@ pub async fn hold_builds() -> tokio::sync::MutexGuard<'static, ()> {
 /// same handshake. Bumping this invalidates existing snapshots rather than
 /// restoring a guest that will not accept its new address.
 ///
-/// 2 added the node's inspection CA and the guest's note saying it installed
-/// it. Older snapshots are still correct, but their guests install the
-/// certificate on every create, so they are retired rather than kept.
-///
-/// 4 is the first with drives that flush: Firecracker restores a drive's
-/// cache mode from the snapshot's device state, so a guest restored from a
-/// snapshot taken before drives were `Writeback` would go on dropping its
-/// flushes in the host page cache.
-///
-/// 5 boots on a root disk, without the overlay: an older snapshot's guest has
-/// the overlay mounted in its memory and a scratch drive in its device state.
-///
-/// 6 keeps a snapshot per shape in a directory of its own. A 5 is the one
-/// snapshot directly under `warm/`, and is rebuilt at its shape in the new
-/// layout.
-///
-/// 7 boots with a virtio-mem region to grow into, sized by the shape's
-/// growth limit, and with the kernel told to online what is plugged.
+/// A snapshot in any other format is discarded.
 const WARM_FORMAT: &str = "7";
 
 /// Whether a warm snapshot's `format` file names the format this build writes.
@@ -190,9 +173,7 @@ impl Shape {
             vcpus: fields.next()?.parse().ok()?,
             mem_mib: fields.next()?.parse().ok()?,
             disk_mib: fields.next()?.parse().ok()?,
-            // Absent before format 7, whose snapshots are rebuilt at the
-            // node's default.
-            max_mem_mib: fields.next().map_or(Some(0), |field| field.parse().ok())?,
+            max_mem_mib: fields.next()?.parse().ok()?,
         };
         // Another field means a format this build does not understand; cold
         // booting is the safe answer.
@@ -484,19 +465,10 @@ pub async fn list_all(templates_dir: &Path) -> Vec<(String, Warm)> {
     out
 }
 
-/// What under `template`'s warm directory cannot be restored: snapshots in an
-/// older format, the single snapshot of the layout before shapes, and pieces
-/// of either. Each comes with the shape it recorded, if it did, so it can be
-/// rebuilt in the current format.
-pub async fn stale(templates_dir: &Path, template: &str) -> Vec<(PathBuf, Option<Shape>)> {
+/// What under `template`'s warm directory cannot be restored: snapshots in
+/// another format, and pieces of one.
+pub async fn stale(templates_dir: &Path, template: &str) -> Vec<PathBuf> {
     let root = warm_dir(templates_dir, template);
-    if tokio::fs::try_exists(root.join("format"))
-        .await
-        .unwrap_or(false)
-    {
-        let shape = recorded_shape(&root).await;
-        return vec![(root, shape)];
-    }
     let mut out = Vec::new();
     let Ok(mut entries) = tokio::fs::read_dir(&root).await else {
         return out;
@@ -504,15 +476,10 @@ pub async fn stale(templates_dir: &Path, template: &str) -> Vec<(PathBuf, Option
     while let Ok(Some(entry)) = entries.next_entry().await {
         let path = entry.path();
         if read_warm(&path).await.is_none() {
-            let shape = recorded_shape(&path).await;
-            out.push((path, shape));
+            out.push(path);
         }
     }
     out
-}
-
-async fn recorded_shape(dir: &Path) -> Option<Shape> {
-    Shape::parse(&tokio::fs::read_to_string(dir.join(SHAPE_FILE)).await.ok()?)
 }
 
 /// Whether `template` has a usable warm snapshot at all, whatever its shape.
@@ -1101,6 +1068,7 @@ mod shape_tests {
             "",
             "2",
             "2 1024",
+            "2 1024 1324",
             "two 1024 1 1",
             "2 lots 1 1",
             "2 1024 1 1 1",
@@ -1110,15 +1078,13 @@ mod shape_tests {
         }
     }
 
-    /// Snapshots from before shapes had directories of their own are
-    /// rebuilt in the new layout rather than restored.
     #[test]
     fn only_the_current_format_is_warm() {
         assert_eq!(WARM_FORMAT, "7");
         assert!(is_current_format("7"));
         assert!(is_current_format("7\n"));
-        for old in ["", "1", "2", "3", "4", "5", "6", "8"] {
-            assert!(!is_current_format(old), "{old:?} should be rebuilt");
+        for other in ["", "6", "8"] {
+            assert!(!is_current_format(other), "{other:?} is not current");
         }
     }
 
@@ -1333,7 +1299,7 @@ mod shape_tests {
         let templates = temp("broken");
         let wanted = parse_shape("2x2048").unwrap();
         let live = warm_dir(&templates, "app").join("firecracker-2x2048");
-        write_snapshot(&live, WARM_FORMAT, "2 2048 1324");
+        write_snapshot(&live, WARM_FORMAT, "2 2048 1324 0");
         assert!(
             find_broken(&templates, "app", Hypervisor::Firecracker, wanted)
                 .await
@@ -1351,7 +1317,7 @@ mod shape_tests {
             .unwrap();
         assert_eq!(broken, live);
 
-        write_snapshot(&live, WARM_FORMAT, "2 2048 1324");
+        write_snapshot(&live, WARM_FORMAT, "2 2048 1324 0");
         assert!(!discard_broken(&broken).await.unwrap());
         assert!(live.exists());
 
@@ -1361,38 +1327,21 @@ mod shape_tests {
         let _ = std::fs::remove_dir_all(&templates);
     }
 
-    /// A snapshot of the layout before shapes, and one of an older format,
-    /// are discarded with the shapes they recorded so they can be rebuilt.
+    /// A snapshot in another format is stale and discarded.
     #[tokio::test]
-    async fn older_snapshots_are_stale_with_their_shapes() {
+    async fn a_snapshot_in_another_format_is_stale() {
         let templates = temp("stale");
-        let warm = warm_dir(&templates, "flat");
-        write_snapshot(&warm, "5", "2 1024 1324");
-        assert_eq!(
-            stale(&templates, "flat").await,
-            vec![(
-                warm.clone(),
-                Some(Shape {
-                    vcpus: 2,
-                    mem_mib: 1024,
-                    disk_mib: 1324,
-                    max_mem_mib: 0,
-                })
-            )]
-        );
-        assert!(list(&templates, "flat").await.is_empty());
-
         let warm = warm_dir(&templates, "app");
         write_snapshot(
             &warm.join("firecracker-1x512"),
             WARM_FORMAT,
             "1 512 1324 512",
         );
-        write_snapshot(&warm.join("firecracker-4x4096"), "6", "4 4096 1324");
-        let found = stale(&templates, "app").await;
-        assert_eq!(found.len(), 1);
-        assert_eq!(found[0].0, warm.join("firecracker-4x4096"));
-        assert_eq!(found[0].1.map(|shape| shape.vcpus), Some(4));
+        write_snapshot(&warm.join("firecracker-4x4096"), "6", "4 4096 1324 4096");
+        assert_eq!(
+            stale(&templates, "app").await,
+            vec![warm.join("firecracker-4x4096")]
+        );
         let _ = std::fs::remove_dir_all(&templates);
     }
 
