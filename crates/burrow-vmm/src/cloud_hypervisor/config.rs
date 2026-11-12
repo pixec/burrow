@@ -34,13 +34,16 @@ const WINDOWS_MIN_MEM_MIB: u32 = 4096;
 /// host disk, as Firecracker's `Writeback` makes it. Nothing here may turn
 /// that off; the test below pins the keys sent.
 ///
-/// `direct` is left at its default (off) for now: the host page cache still
-/// holds what the guest wrote until a flush pushes it out.
+/// `direct` opens the image `O_DIRECT`. Buffered, the host page cache of
+/// everything the guest read or wrote was charged to the VMM's cgroup, whose
+/// ceiling is the guest's memory plus a little: reclaim inside it stalled the
+/// guest. The guest caches its own disk.
 pub(crate) fn disk(drive: &crate::DriveSpec) -> Value {
     json!({
         "id": drive.id,
         "path": drive.path,
         "readonly": drive.is_read_only,
+        "direct": true,
         "image_type": "Raw",
         // What a Windows guest finds a volume's disk by.
         "serial": drive.id,
@@ -178,6 +181,10 @@ pub(crate) fn retarget(snapshot: &mut Value, spec: &VmSpec) -> Result<()> {
             spec.mem_mib
         )));
     }
+    // Snapshots taken before disks were opened direct restore direct too.
+    for disk in snapshot["disks"].as_array_mut().into_iter().flatten() {
+        disk["direct"] = json!(true);
+    }
     if let (Some(net), Some(nics)) = (&spec.net, snapshot["net"].as_array_mut()) {
         for nic in nics.iter_mut().filter(|nic| nic["id"] == NET_ID) {
             nic["tap"] = json!(net.tap);
@@ -259,12 +266,16 @@ mod tests {
                 .map(String::as_str)
                 .collect();
             keys.sort_unstable();
-            assert_eq!(keys, ["id", "image_type", "path", "readonly", "serial"]);
+            assert_eq!(
+                keys,
+                ["direct", "id", "image_type", "path", "readonly", "serial"]
+            );
         }
         let hotplugged = disk(&crate::DriveSpec::scratch_rw("volume1.ext4"));
         assert_eq!(hotplugged["image_type"], "Raw");
         assert_eq!(hotplugged["serial"], "scratch");
-        assert_eq!(hotplugged.as_object().unwrap().len(), 5);
+        assert_eq!(hotplugged["direct"], true);
+        assert_eq!(hotplugged.as_object().unwrap().len(), 6);
     }
 
     /// A Linux guest finds its disks by order, so the order is the spec's; a
