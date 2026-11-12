@@ -1149,14 +1149,18 @@ fn render_nat6(out: &mut String, sandboxes: &[SandboxRules]) {
         if let (Some((address, _)), true) = (sandbox.public.v6.first(), sandbox.public.mark != 0) {
             let _ = writeln!(
                 out,
-                "add rule ip6 {NAT6_TABLE} postrouting meta mark {:#x} snat to {address}",
+                "add rule ip6 {NAT6_TABLE} postrouting meta mark {:#x} ip6 daddr != {POOL6} snat to {address}",
                 sandbox.public.mark
             );
         }
         if sandbox.mode == Mode::Open {
+            let translation = match sandbox.public.v6.first() {
+                Some((address, _)) => format!("snat to {address}"),
+                None => "masquerade".to_string(),
+            };
             let _ = writeln!(
                 out,
-                "add rule ip6 {NAT6_TABLE} postrouting ip6 saddr {guest} ip6 daddr != {POOL6} masquerade"
+                "add rule ip6 {NAT6_TABLE} postrouting ip6 saddr {guest} ip6 daddr != {POOL6} {translation}"
             );
         }
     }
@@ -1561,11 +1565,19 @@ mod tests {
             ruleset.contains("ip saddr 10.99.0.6 ip daddr != 10.99.0.0/16 snat to 203.0.113.17")
         );
         assert!(!ruleset.contains("ip saddr 10.99.0.6 ip daddr != 10.99.0.0/16 masquerade"));
+        assert!(ruleset.contains(&format!(
+            "ip6 saddr fd99:b070:0:1::2 ip6 daddr != {POOL6} snat to 2001:db8:100:1::1"
+        )));
+        assert!(!ruleset.contains(&format!(
+            "ip6 saddr fd99:b070:0:1::2 ip6 daddr != {POOL6} masquerade"
+        )));
         // So do the proxy's upstream connections for it.
         assert!(ruleset.contains(
             "postrouting meta mark 0xb700001 ip daddr != 10.99.0.0/16 snat to 203.0.113.17"
         ));
-        assert!(ruleset.contains("postrouting meta mark 0xb700001 snat to 2001:db8:100:1::1"));
+        assert!(ruleset.contains(&format!(
+            "postrouting meta mark 0xb700001 ip6 daddr != {POOL6} snat to 2001:db8:100:1::1"
+        )));
     }
 
     #[test]
