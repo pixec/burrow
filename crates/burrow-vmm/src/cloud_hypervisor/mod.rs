@@ -42,7 +42,9 @@ pub const STATE_FILE: &str = "snapshot.ch-state";
 /// Guest memory, Cloud Hypervisor's `memory-ranges` under the layout's name.
 pub const MEMORY_FILE: &str = "snapshot.ch-memory";
 const API_SOCK: &str = "ch.sock";
-const CONSOLE_LOG: &str = "console.log";
+/// What the VMM writes the guest's console to: a FIFO the node copies into
+/// the bounded console log.
+const CONSOLE_PIPE: &str = "console.pipe";
 /// Where an interactive console listens, in the working directory.
 const CONSOLE_SOCK: &str = "console.sock";
 /// The VMM's own log. Kept apart from the console, which the VMM opens and
@@ -108,6 +110,16 @@ pub struct ChVm {
     cgroup: Option<Cgroup>,
     /// The input side of an interactive console.
     console_in: Option<tokio::net::unix::OwnedWriteHalf>,
+    /// Copies the console into its log, until the VM is stopped.
+    console: Option<crate::console::Capture>,
+}
+
+impl Drop for ChVm {
+    fn drop(&mut self) {
+        if let Some(console) = &self.console {
+            console.abort();
+        }
+    }
 }
 
 impl ChVm {
@@ -230,6 +242,7 @@ impl ChVm {
         tokio::fs::create_dir_all(&spec.workdir).await?;
         crate::guest::clear_stale_sockets(&spec.workdir).await?;
         remove_if_present(&spec.workdir.join(CONSOLE_SOCK)).await?;
+        let console = capture_console(&spec.workdir, config.jail.as_ref()).await?;
         let socket = spec.workdir.join(API_SOCK);
         remove_if_present(&socket).await?;
 
@@ -297,6 +310,7 @@ impl ChVm {
             boot_latency: Duration::ZERO,
             cgroup,
             console_in: None,
+            console,
         };
         if let Err(err) = wait_for_socket(&mut vm.child, &socket, &spec.workdir).await {
             vm.stop().await;
@@ -313,6 +327,9 @@ impl ChVm {
     /// helper outright would leave the VMM to be reaped by whatever adopts
     /// orphans, which in a container is burrowd, and it never would.
     async fn stop(&mut self) {
+        if let Some(console) = &self.console {
+            console.abort();
+        }
         match (&self.jail, self.child.id()) {
             (Some(_), Some(pid)) => {
                 let _ = nix::sys::signal::kill(
@@ -429,7 +446,17 @@ impl ChVm {
     }
 
     pub async fn console_tail(&self, lines: usize) -> String {
-        tail(&self.workdir.join(CONSOLE_LOG), lines).await
+        crate::console::tail(&self.workdir, lines).await
+    }
+
+    /// The VMM's own output, which says why it exited.
+    pub async fn vmm_log_tail(&self, lines: usize) -> String {
+        tail(&self.workdir.join(VMM_LOG), lines).await
+    }
+
+    /// How the process ended, once it has.
+    pub fn exit_status(&mut self) -> Option<std::process::ExitStatus> {
+        self.child.try_wait().ok().flatten()
     }
 
     /// Connects to an interactive console once the VMM listens on it, and
@@ -444,11 +471,11 @@ impl ChVm {
                 Err(err) => return Err(err.into()),
             }
         };
-        let (mut output, input) = stream.into_split();
-        let mut log = tokio::fs::File::create(self.workdir.join(CONSOLE_LOG)).await?;
-        tokio::spawn(async move {
-            let _ = tokio::io::copy(&mut output, &mut log).await;
-        });
+        let (output, input) = stream.into_split();
+        if let Some(console) = self.console.take() {
+            console.abort();
+        }
+        self.console = Some(crate::console::capture(&self.workdir, vec![output])?);
         self.console_in = Some(input);
         Ok(())
     }
@@ -714,6 +741,40 @@ async fn remove_if_present(path: &Path) -> Result<()> {
 }
 
 /// Last `n` lines of a log, for diagnostics.
+/// Makes the FIFO the VMM writes the guest's console to, owned by the jail
+/// where there is one, and starts copying it into the console log. Opened for
+/// writing too, so the copy does not end each time a VMM closes its end.
+#[cfg(target_os = "linux")]
+async fn capture_console(
+    workdir: &Path,
+    jail: Option<&ChJail>,
+) -> Result<Option<crate::console::Capture>> {
+    use std::os::unix::ffi::OsStrExt as _;
+    let path = workdir.join(CONSOLE_PIPE);
+    remove_if_present(&path).await?;
+    let name = std::ffi::CString::new(path.as_os_str().as_bytes())
+        .map_err(|err| Error::Io(std::io::Error::other(err)))?;
+    // SAFETY: `name` is a valid NUL-terminated path.
+    if unsafe { libc::mkfifo(name.as_ptr(), 0o600) } != 0 {
+        return Err(std::io::Error::last_os_error().into());
+    }
+    if let Some(jail) = jail {
+        std::os::unix::fs::chown(&path, Some(jail.uid), Some(jail.gid))?;
+    }
+    let pipe = tokio::net::unix::pipe::OpenOptions::new()
+        .read_write(true)
+        .open_receiver(&path)?;
+    Ok(Some(crate::console::capture(workdir, vec![pipe])?))
+}
+
+#[cfg(not(target_os = "linux"))]
+async fn capture_console(
+    _workdir: &Path,
+    _jail: Option<&ChJail>,
+) -> Result<Option<crate::console::Capture>> {
+    Ok(None)
+}
+
 async fn tail(path: &Path, n: usize) -> String {
     let Ok(text) = tokio::fs::read_to_string(path).await else {
         return String::new();

@@ -13,6 +13,7 @@
 //! the wrong thing quietly.
 
 mod cgroup;
+pub mod console;
 mod error;
 mod guest;
 mod http;
@@ -532,6 +533,27 @@ impl Vm {
             Self::CloudHypervisor(vm) => vm.cpu_usage_usec(),
             #[cfg(target_os = "macos")]
             Self::Vz(vm) => vm.cpu_usage_usec(),
+        }
+    }
+
+    /// How the VMM process ended, once it has.
+    pub fn exit_status(&mut self) -> Option<std::process::ExitStatus> {
+        match self {
+            Self::Firecracker(vm) => vm.exit_status(),
+            Self::CloudHypervisor(vm) => vm.exit_status(),
+            #[cfg(target_os = "macos")]
+            Self::Vz(_) => None,
+        }
+    }
+
+    /// The last of what the VMM itself printed. Firecracker's goes to the
+    /// console log with the guest's.
+    pub async fn vmm_log_tail(&self, lines: usize) -> String {
+        match self {
+            Self::Firecracker(vm) => vm.console_tail(lines).await,
+            Self::CloudHypervisor(vm) => vm.vmm_log_tail(lines).await,
+            #[cfg(target_os = "macos")]
+            Self::Vz(_) => String::new(),
         }
     }
 

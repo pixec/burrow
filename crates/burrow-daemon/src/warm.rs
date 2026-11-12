@@ -701,7 +701,7 @@ pub async fn build_warm_snapshot(
             DiskLayout::Root.boot_args(),
             lease.kernel_ip_arg(),
             crate::sandbox::guest_mode_arg(is_systemd),
-            config.extra_boot_args
+            crate::sandbox::guest_boot_args(&config.extra_boot_args, config.is_console_verbose)
         ),
     };
     apply_confinement(&mut spec, config, shape);

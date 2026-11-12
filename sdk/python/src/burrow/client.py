@@ -49,6 +49,7 @@ class Sandboxes:
         snapshot: str = "",
         name: str = "",
         request_id: str = "",
+        verbose_console: bool = False,
         tags: Optional[Dict[str, str]] = None,
         node_labels: Optional[Dict[str, str]] = None,
         public_ips: Optional[List[str]] = None,
@@ -79,7 +80,9 @@ class Sandboxes:
         a bare mode. `public_ips` are allocated addresses attached once it is
         up; a static one places the sandbox on the node it reaches. `env` is
         merged under every command this handle runs and lives on the handle
-        alone. `request_id` makes the create safe to retry: a create naming
+        alone. `verbose_console` boots with a verbose kernel console, read
+        with `Sandbox.console`, for debugging a template; it boots cold.
+        `request_id` makes the create safe to retry: a create naming
         the request id of one that already made a sandbox returns that
         sandbox, and one naming a create still running waits for it.
         """
@@ -115,6 +118,7 @@ class Sandboxes:
             kit=_to_kit_spec(kit),
             public_ips=public_ips or [],
         )
+        request.policy.is_console_verbose = verbose_console
         raw = self._transport.unary("CreateSandbox", request, timeout)
         sandbox = Sandbox(self._transport.retain(), _to_sandbox_info(raw), True, auto_resume, env)
         sandbox._on_resume = on_resume

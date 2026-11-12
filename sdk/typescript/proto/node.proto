@@ -50,6 +50,7 @@ service NodeService {
   // Sessions are recorded by the node that started the VMs, so they are read
   // from it like any other per-sandbox fact.
   rpc ListSessions(NodeSandboxRef) returns (burrow.api.v1.ListSessionsResponse);
+  rpc GetConsole(burrow.api.v1.GetConsoleRequest) returns (burrow.api.v1.ConsoleLog);
   rpc UpdateLifetime(NodeUpdateLifetimeRequest) returns (burrow.common.v1.Sandbox);
   rpc UpdateResources(NodeUpdateResourcesRequest) returns (burrow.api.v1.UpdateResourcesResponse);
   // Forks on this node only: a sandbox's snapshot and disks are node-local, so

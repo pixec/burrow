@@ -136,6 +136,8 @@ pub struct NodeConfig {
     pub firecracker_bin: PathBuf,
     /// Appended to every guest kernel command line.
     pub extra_boot_args: String,
+    /// Boots every guest with a verbose console, as a create can ask for one.
+    pub is_console_verbose: bool,
     pub agent_timeout: std::time::Duration,
     /// How a command's log rotates when its exec does not say.
     pub command_log_rotation: burrow_common::cmdlog::Rotation,
@@ -821,6 +823,12 @@ impl<'a> Provisioning<'a> {
             .expect("the vm is recorded before anything uses it")
     }
 
+    fn vm_mut(&mut self) -> &mut Vm {
+        self.vm
+            .as_mut()
+            .expect("the vm is recorded before anything uses it")
+    }
+
     /// Gives everything back and turns `err` into the create's answer.
     ///
     /// Every failure path goes through here, so the order below is the only
@@ -984,14 +992,13 @@ fn spawn_handshake(
             Handshake::Failed(err) if recorded => {
                 // Loud, and with the console, because nothing else will report
                 // it: the create it belonged to has already returned.
-                let console = match &*sandbox.vm.lock().await {
-                    Some(vm) => vm.console_tail(30).await,
-                    None => String::new(),
+                let reason = match &mut *sandbox.vm.lock().await {
+                    Some(vm) => no_agent_reason(vm, NoAgent::Stalled(err)).await,
+                    None => err,
                 };
                 tracing::error!(
                     sandbox = id,
-                    %err,
-                    console,
+                    reason,
                     "the guest agent never came up; reclaiming the sandbox"
                 );
                 // This task is the one place that knows the guest has been
@@ -1803,7 +1810,7 @@ impl RunningSandbox {
         spec.memory_source = self.durable.arriving().map(|h| burrow_vmm::MemorySource(h));
         record_working_set(&mut spec, is_stored);
         let limits = spec.limits.clone();
-        let vm = Vm::restore(spec, true)
+        let mut vm = Vm::restore(spec, true)
             .await
             .map_err(|err| Status::internal(format!("restore failed: {err}")))?;
         // Retried to the deadline, as a warm create's handshake is, and the
@@ -1811,15 +1818,24 @@ impl RunningSandbox {
         // dialling again failed a resume outright whenever the second dial was
         // cut off, which a guest still waking does now and then.
         let guest = vm.guest();
-        let (agent, _) = guestconn::connect_when_ready(guest.clone(), agent_timeout)
-            .await
-            .map_err(|err| {
-                Status::internal(format!("agent did not come back: {}", error_chain(&*err)))
-            })?;
-
         // `restored: true` is what tells the guest to reseed its RNG and reset
         // its clock, which it cannot know on its own.
-        guestconn::handshake_upgrading(agent, guest, request, upgrade, agent_timeout).await?;
+        let handshook = match guestconn::connect_when_ready(guest.clone(), agent_timeout).await {
+            Ok((agent, _)) => {
+                guestconn::handshake_upgrading(agent, guest, request, upgrade, agent_timeout)
+                    .await
+                    .map(drop)
+                    .map_err(|err| NoAgent::Handshake(err.message().to_string()))
+            }
+            Err(err) => Err(NoAgent::Unreachable(agent_timeout, error_chain(&*err))),
+        };
+        if let Err(failure) = handshook {
+            let reason = no_agent_reason(&mut vm, failure).await;
+            let _ = vm.kill().await;
+            return Err(Status::internal(format!(
+                "the guest did not come back: {reason}"
+            )));
+        }
         start_cpu_cap(&vm, &limits, self.id());
         // This VM handshook synchronously, whatever the last one did. A failure
         // recorded there was a verdict on a VM that no longer exists.
@@ -1931,17 +1947,16 @@ impl RunningSandbox {
             self.cut_mac_disk().await;
             crate::macnode::seed(&spec.workdir, &request.inspection_ca_pem).await;
         }
-        let vm = Vm::boot(spec.clone())
+        let mut vm = Vm::boot(spec.clone())
             .await
             .map_err(|err| Status::internal(format!("boot failed: {err}")))?;
         let (agent, _) = match guestconn::connect_when_ready(vm.guest(), agent_timeout).await {
             Ok(ready) => ready,
             Err(err) => {
-                let console = vm.console_tail(30).await;
+                let failure = NoAgent::Unreachable(agent_timeout, error_chain(&*err));
+                let reason = no_agent_reason(&mut vm, failure).await;
                 let _ = vm.kill().await;
-                return Err(Status::internal(format!(
-                    "agent never became reachable: {err}\nconsole:\n{console}"
-                )));
+                return Err(Status::internal(reason));
             }
         };
         if let Err(err) = attach_volumes(&vm, hotplugged, spec.guest_os).await {
@@ -1951,8 +1966,10 @@ impl RunningSandbox {
         if let Err(err) =
             guestconn::handshake_upgrading(agent, vm.guest(), request, upgrade, agent_timeout).await
         {
+            let failure = NoAgent::Handshake(err.message().to_string());
+            let reason = no_agent_reason(&mut vm, failure).await;
             let _ = vm.kill().await;
-            return Err(err);
+            return Err(Status::internal(reason));
         }
         start_cpu_cap(&vm, &spec.limits, self.id());
         self.handshake.send_replace(Handshake::Done);
@@ -2362,6 +2379,57 @@ impl RestoreSource<'_> {
             Self::Snapshot { disk_mib, .. } => *disk_mib,
             Self::Stored { manifest, .. } => manifest.disk_mib,
         }
+    }
+}
+
+/// How a VM failed to give its sandbox a guest agent.
+enum NoAgent {
+    /// No vsock connection reached the agent before the deadline.
+    Unreachable(std::time::Duration, String),
+    /// The agent connected, and its handshake failed.
+    Handshake(String),
+    /// A deferred handshake gave up, at the step named.
+    Stalled(String),
+}
+
+/// Lines of the guest's console a failure carries.
+const CONSOLE_LINES: usize = 30;
+
+/// Why a VM's guest agent never answered, as an operator debugging a
+/// template needs it: the guest kernel's panic, the VMM's exit and what it
+/// last printed, or which step ran out of time, then the console's last
+/// lines.
+async fn no_agent_reason(vm: &mut Vm, failure: NoAgent) -> String {
+    let console = vm.console_tail(usize::MAX).await;
+    let lines: Vec<&str> = console.lines().collect();
+    let tail = lines[lines.len().saturating_sub(CONSOLE_LINES)..].join("\n");
+    let why = if let Some(panic) = burrow_vmm::console::kernel_panic(&console) {
+        format!("the guest kernel panicked: {panic}")
+    } else if let Some(status) = vm.exit_status() {
+        let output = vm.vmm_log_tail(20).await;
+        if output == tail {
+            return format!(
+                "the VMM exited ({status}) before the guest agent connected; its last output \
+                 and the guest's console:\n{tail}"
+            );
+        }
+        format!(
+            "the VMM exited ({status}) before the guest agent connected; it last printed:\n{output}"
+        )
+    } else {
+        match failure {
+            NoAgent::Unreachable(timeout, err) => {
+                format!("the guest agent made no vsock connection within {timeout:?}: {err}")
+            }
+            NoAgent::Handshake(err) => {
+                format!("the guest agent connected, and its handshake failed: {err}")
+            }
+            NoAgent::Stalled(err) => format!("the guest agent never came up: {err}"),
+        }
+    };
+    match tail.is_empty() {
+        true => format!("{why}\nthe guest wrote nothing to its console"),
+        false => format!("{why}\nconsole, last {CONSOLE_LINES} lines:\n{tail}"),
     }
 }
 
@@ -3148,6 +3216,22 @@ impl SandboxManager {
     }
 
     /// Every VM a sandbox has run, newest first.
+    /// The end of a sandbox's console log, `tail_bytes` of it or 64 KiB.
+    pub async fn console(
+        &self,
+        id: &str,
+        tail_bytes: u32,
+    ) -> Result<burrow_proto::api::v1::ConsoleLog, Status> {
+        let sandbox = self.get(id).await?;
+        let max_bytes = match u64::from(tail_bytes) {
+            0 => 64 * 1024,
+            bytes => bytes.min(2 * burrow_vmm::console::MAX_BYTES),
+        };
+        let (text, is_truncated) =
+            burrow_vmm::console::tail_bytes(&sandbox.workdir, max_bytes).await;
+        Ok(burrow_proto::api::v1::ConsoleLog { text, is_truncated })
+    }
+
     pub async fn list_sessions(&self, id: &str) -> Result<Vec<common::Session>, Status> {
         // Checked first, so an unknown sandbox is a not-found rather than an
         // empty list that reads as "it never ran".
@@ -3440,6 +3524,7 @@ impl SandboxManager {
             &row.tap,
             &volumes,
             is_systemd,
+            stored_policy.is_console_verbose,
             disk_layout,
         );
 
@@ -6522,6 +6607,7 @@ impl SandboxManager {
         tap_name: &str,
         volumes: &[common::VolumeMount],
         is_systemd: bool,
+        is_console_verbose: bool,
         layout: DiskLayout,
     ) -> VmSpec {
         let mut spec = VmSpec::new(id.to_string(), workdir, self.config.backend(hypervisor));
@@ -6597,7 +6683,10 @@ impl SandboxManager {
                 lease.prefix_len6(),
                 lease.host_ip6(),
                 guest_mode_arg(is_systemd),
-                self.config.extra_boot_args
+                guest_boot_args(
+                    &self.config.extra_boot_args,
+                    is_console_verbose || self.config.is_console_verbose
+                )
             ),
         };
         if crate::macnode::is_macos(guest_os)
@@ -6968,6 +7057,7 @@ impl SandboxManager {
         // disk cannot be shrunk under the guest, so that create boots.
         let wanted = crate::warm::Shape::wanted(&resources);
         let is_warmable = seed_disk.is_none()
+            && !policy.is_console_verbose
             && capabilities.is_warm_pool_supported
             && (capabilities.is_drive_hotplug_supported
                 || crate::volume::block_mounts(&policy.volumes)
@@ -7149,6 +7239,7 @@ impl SandboxManager {
             &tap_name,
             boot_volumes,
             is_systemd,
+            policy.is_console_verbose,
             disk_layout,
         );
         // Only meaningful on a restore, and only when the template was
@@ -7258,12 +7349,10 @@ impl SandboxManager {
             let (agent, accepted_at) = match connected {
                 Ok(ready) => ready,
                 Err(err) => {
-                    let console = guard.vm().console_tail(30).await;
-                    return Err(guard
-                        .fail(Status::internal(format!(
-                            "agent never became reachable: {err}\nconsole:\n{console}"
-                        )))
-                        .await);
+                    let failure =
+                        NoAgent::Unreachable(self.config.agent_timeout, error_chain(&*err));
+                    let reason = no_agent_reason(guard.vm_mut(), failure).await;
+                    return Err(guard.fail(Status::internal(reason)).await);
                 }
             };
             let agent_up = vmm_ready.elapsed();
@@ -7290,7 +7379,11 @@ impl SandboxManager {
             .await
             {
                 Ok((_, response)) => response.timing.unwrap_or_default(),
-                Err(err) => return Err(guard.fail(err).await),
+                Err(err) => {
+                    let failure = NoAgent::Handshake(err.message().to_string());
+                    let reason = no_agent_reason(guard.vm_mut(), failure).await;
+                    return Err(guard.fail(Status::internal(reason)).await);
+                }
             };
             start_cpu_cap(guard.vm(), &boot_spec.limits, &id);
             (
@@ -8069,6 +8162,7 @@ impl SandboxManager {
                 false => &[],
             },
             is_systemd,
+            policy.is_console_verbose,
             disk_layout,
         );
         // The template's plan names the pages its agent touches on the way to
@@ -8276,6 +8370,9 @@ impl SandboxManager {
             // Still suspended on files that did not change, so the stored
             // copy can be made current again.
             self.spawn_upload(&sandbox);
+            sandbox.base_record.lock().unwrap().state_reason =
+                format!("its last resume failed: {}", err.message());
+            self.persist(&sandbox).await;
             return Err(err);
         }
         sandbox
@@ -8480,6 +8577,7 @@ impl SandboxManager {
             &sandbox.tap,
             boot_volumes,
             is_systemd,
+            policy.is_console_verbose,
             disk_layout,
         );
         let from = self.boundary(&sandbox).await;
@@ -8510,6 +8608,9 @@ impl SandboxManager {
             .await
         {
             self.volumes.release_all(id);
+            sandbox.base_record.lock().unwrap().state_reason =
+                format!("its last boot failed: {}", err.message());
+            self.persist(&sandbox).await;
             return Err(err);
         }
         if !sandbox.hypervisor.capabilities().is_tap_networked
@@ -9654,6 +9755,7 @@ impl SandboxManager {
             &tap_name,
             &policy.volumes,
             manifest.is_systemd,
+            policy.is_console_verbose,
             disk_layout,
         );
         let record = common::Sandbox {
@@ -10210,6 +10312,21 @@ async fn attach_volumes(
 }
 
 /// Tells the agent to run the template's systemd under it.
+/// The node's extra kernel arguments, made verbose for a sandbox debugging
+/// its template: `quiet` and any `loglevel` dropped for `loglevel=7`, so the
+/// kernel's whole boot reaches the console.
+pub(crate) fn guest_boot_args(extra: &str, is_verbose: bool) -> String {
+    if !is_verbose {
+        return extra.to_string();
+    }
+    extra
+        .split_whitespace()
+        .filter(|arg| *arg != "quiet" && !arg.starts_with("loglevel="))
+        .chain(["loglevel=7"])
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
 pub(crate) fn guest_mode_arg(is_systemd: bool) -> &'static str {
     if is_systemd { "burrow.systemd=1" } else { "" }
 }
@@ -10483,6 +10600,19 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn a_verbose_console_drops_quiet_and_raises_the_log_level() {
+        assert_eq!(
+            guest_boot_args("quiet loglevel=0 foo=1", false),
+            "quiet loglevel=0 foo=1"
+        );
+        assert_eq!(
+            guest_boot_args("quiet loglevel=0 foo=1", true),
+            "foo=1 loglevel=7"
+        );
+        assert_eq!(guest_boot_args("", true), "loglevel=7");
+    }
+
+    #[test]
     fn guest_clocks_sync_on_the_interval_or_a_node_clock_jump() {
         use std::time::{Duration, Instant, SystemTime};
         let at = (Instant::now(), SystemTime::now());
@@ -10551,6 +10681,7 @@ pub(crate) mod tests {
                 data_dir: std::env::temp_dir().join(format!("burrow-fork-{}", std::process::id())),
                 firecracker_bin: "/nonexistent/firecracker".into(),
                 extra_boot_args: String::new(),
+                is_console_verbose: false,
                 agent_timeout: std::time::Duration::from_millis(1),
                 command_log_rotation: Default::default(),
                 cgroup_root: None,
@@ -11564,6 +11695,65 @@ pub(crate) mod tests {
         assert_eq!(record.state, common::SandboxState::Stopped as i32);
         assert_eq!(record.state_reason, REASON_VMM_EXITED);
         assert!(sandbox.vm.lock().await.is_none());
+        let _ = std::fs::remove_dir_all(&workdir);
+    }
+
+    /// A boot that never reached its agent used to say only that it timed
+    /// out. It names what happened: the guest kernel's panic, the VMM's exit,
+    /// or which step ran out of time, with the console's last lines.
+    #[tokio::test]
+    async fn an_agent_that_never_came_says_why() {
+        let manager = manager().await;
+        let (sandbox, workdir) = under_fake_vmm(&manager, 0).await;
+        let mut slot = sandbox.vm.lock().await;
+        let vm = slot.as_mut().unwrap();
+        let timeout = std::time::Duration::from_secs(30);
+
+        let reason = no_agent_reason(vm, NoAgent::Unreachable(timeout, "refused".into())).await;
+        assert!(
+            reason.starts_with("the guest agent made no vsock connection within 30s: refused"),
+            "{reason}"
+        );
+        // The fake VMM is this test binary, whose own output reached the log.
+        assert!(reason.contains("running 1 test"), "{reason}");
+
+        let reason = no_agent_reason(vm, NoAgent::Handshake("bad network".into())).await;
+        assert!(
+            reason.contains("its handshake failed: bad network"),
+            "{reason}"
+        );
+
+        std::fs::write(
+            workdir.join(burrow_vmm::console::LOG),
+            "booting\n[ 0.9] Kernel panic - not syncing: No working init found.\n",
+        )
+        .unwrap();
+        let reason = no_agent_reason(vm, NoAgent::Unreachable(timeout, "refused".into())).await;
+        assert!(
+            reason.starts_with("the guest kernel panicked: [ 0.9] Kernel panic - not syncing: No working init found."),
+            "{reason}"
+        );
+        assert!(
+            reason.contains("console, last 30 lines:\nbooting"),
+            "{reason}"
+        );
+
+        std::fs::write(workdir.join(burrow_vmm::console::LOG), "unknown option\n").unwrap();
+        let pid = vm.pid().unwrap();
+        std::process::Command::new("kill")
+            .args(["-9", &pid.to_string()])
+            .status()
+            .unwrap();
+        for _ in 0..500 {
+            if vm.has_exited() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        let reason = no_agent_reason(vm, NoAgent::Unreachable(timeout, "refused".into())).await;
+        assert!(reason.starts_with("the VMM exited ("), "{reason}");
+        assert!(reason.contains("unknown option"), "{reason}");
+        drop(slot);
         let _ = std::fs::remove_dir_all(&workdir);
     }
 

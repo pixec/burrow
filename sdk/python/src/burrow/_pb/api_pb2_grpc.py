@@ -102,6 +102,11 @@ class BurrowStub(object):
                 request_serializer=api__pb2.SandboxRef.SerializeToString,
                 response_deserializer=api__pb2.ListSessionsResponse.FromString,
                 _registered_method=True)
+        self.GetConsole = channel.unary_unary(
+                '/burrow.api.v1.Burrow/GetConsole',
+                request_serializer=api__pb2.GetConsoleRequest.SerializeToString,
+                response_deserializer=api__pb2.ConsoleLog.FromString,
+                _registered_method=True)
         self.UpdateLifetime = channel.unary_unary(
                 '/burrow.api.v1.Burrow/UpdateLifetime',
                 request_serializer=api__pb2.UpdateLifetimeRequest.SerializeToString,
@@ -469,6 +474,14 @@ class BurrowServicer(object):
 
     def ListSessions(self, request, context):
         """Every VM this sandbox has run, newest first.
+        """
+        context.set_code(grpc.StatusCode.UNIMPLEMENTED)
+        context.set_details('Method not implemented!')
+        raise NotImplementedError('Method not implemented!')
+
+    def GetConsole(self, request, context):
+        """The end of the guest's serial console as its node captured it since its
+        VM last started: the kernel's boot and anything the guest prints there.
         """
         context.set_code(grpc.StatusCode.UNIMPLEMENTED)
         context.set_details('Method not implemented!')
@@ -925,6 +938,11 @@ def add_BurrowServicer_to_server(servicer, server):
                     servicer.ListSessions,
                     request_deserializer=api__pb2.SandboxRef.FromString,
                     response_serializer=api__pb2.ListSessionsResponse.SerializeToString,
+            ),
+            'GetConsole': grpc.unary_unary_rpc_method_handler(
+                    servicer.GetConsole,
+                    request_deserializer=api__pb2.GetConsoleRequest.FromString,
+                    response_serializer=api__pb2.ConsoleLog.SerializeToString,
             ),
             'UpdateLifetime': grpc.unary_unary_rpc_method_handler(
                     servicer.UpdateLifetime,
@@ -1555,6 +1573,33 @@ class Burrow(object):
             '/burrow.api.v1.Burrow/ListSessions',
             api__pb2.SandboxRef.SerializeToString,
             api__pb2.ListSessionsResponse.FromString,
+            options,
+            channel_credentials,
+            insecure,
+            call_credentials,
+            compression,
+            wait_for_ready,
+            timeout,
+            metadata,
+            _registered_method=True)
+
+    @staticmethod
+    def GetConsole(request,
+            target,
+            options=(),
+            channel_credentials=None,
+            call_credentials=None,
+            insecure=False,
+            compression=None,
+            wait_for_ready=None,
+            timeout=None,
+            metadata=None):
+        return grpc.experimental.unary_unary(
+            request,
+            target,
+            '/burrow.api.v1.Burrow/GetConsole',
+            api__pb2.GetConsoleRequest.SerializeToString,
+            api__pb2.ConsoleLog.FromString,
             options,
             channel_credentials,
             insecure,

@@ -990,6 +990,18 @@ impl NodeService for NodeApi {
         Ok(Response::new(nodepb::NodeDeleteResponse {}))
     }
 
+    async fn get_console(
+        &self,
+        req: Request<api::GetConsoleRequest>,
+    ) -> Result<Response<api::ConsoleLog>, Status> {
+        let req = req.into_inner();
+        Ok(Response::new(
+            self.sandboxes
+                .console(&req.sandbox_id, req.tail_bytes)
+                .await?,
+        ))
+    }
+
     async fn list_sessions(
         &self,
         req: Request<nodepb::NodeSandboxRef>,

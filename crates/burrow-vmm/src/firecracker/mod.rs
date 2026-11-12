@@ -411,6 +411,10 @@ impl MicroVm {
         self.process.console_tail(lines).await
     }
 
+    pub fn exit_status(&mut self) -> Option<std::process::ExitStatus> {
+        self.process.exit_status()
+    }
+
     /// Writes to the guest serial console (dev/rescue path; see
     /// [`FcProcess::console_write`]).
     pub async fn console_write(&mut self, input: &str) -> Result<()> {

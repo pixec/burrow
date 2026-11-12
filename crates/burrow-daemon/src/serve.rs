@@ -124,6 +124,11 @@ pub struct ServeArgs {
         env = "BURROW_GUEST_BOOT_ARGS"
     )]
     pub guest_boot_args: String,
+    /// Boot every guest with a verbose console: `quiet` and `loglevel` are
+    /// dropped from --guest-boot-args for `loglevel=7`. A create can ask for
+    /// this for one sandbox.
+    #[arg(long, env = "BURROW_GUEST_CONSOLE_VERBOSE")]
+    pub guest_console_verbose: bool,
     /// Seconds to wait for a new sandbox's agent to become reachable.
     #[arg(long, default_value_t = 30)]
     pub agent_timeout: u64,
@@ -1524,6 +1529,7 @@ pub async fn run(args: ServeArgs) -> anyhow::Result<()> {
             data_dir: args.data_dir.clone(),
             firecracker_bin: args.firecracker.clone(),
             extra_boot_args: args.guest_boot_args.clone(),
+            is_console_verbose: args.guest_console_verbose,
             agent_timeout: Duration::from_secs(args.agent_timeout),
             command_log_rotation: burrow_common::cmdlog::Rotation {
                 max_bytes: args.command_log_max_size.unwrap_or(0),

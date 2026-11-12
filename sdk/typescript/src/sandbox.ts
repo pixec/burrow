@@ -318,6 +318,7 @@ export class Sandbox {
         network: toNetworkPolicy(resolveNetwork(options.networkPolicy)),
         networks: toNetworks(options.networks, options.alias),
         volumes: toVolumeMounts(options.volumes),
+        isConsoleVerbose: options.verboseConsole ?? false,
       },
       tags: options.tags ?? {},
       nodeLabels: options.nodeLabels ?? {},
@@ -1082,6 +1083,23 @@ export class Sandbox {
   async listSessions(options: CallOptions = {}): Promise<Session[]> {
     const res = await this.call<any>("ListSessions", { sandboxId: this.id }, options);
     return (res.sessions ?? []).map(toSession);
+  }
+
+  /**
+   * The end of the sandbox's serial console as its node captured it since its
+   * VM last started: the guest kernel's boot and anything printed there.
+   * `tailBytes` is how much of the end, 64 KiB by default and at most 2 MiB;
+   * `isTruncated` says the log holds more before it.
+   */
+  async console(
+    options: CallOptions & { tailBytes?: number } = {},
+  ): Promise<{ text: string; isTruncated: boolean }> {
+    const res = await this.call<any>(
+      "GetConsole",
+      { sandboxId: this.id, tailBytes: options.tailBytes ?? 0 },
+      options,
+    );
+    return { text: res.text ?? "", isTruncated: res.isTruncated ?? false };
   }
 
   /**

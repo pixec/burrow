@@ -404,6 +404,11 @@ message Policy {
   repeated VolumeMount volumes = 6;
   LifetimePolicy lifetime = 7;
   SnapshotPolicy snapshots = 8;
+  // Boots the guest with a verbose kernel console, `quiet` dropped and the
+  // log level raised, for debugging a template that does not come up. Read
+  // with `burrow logs --console` or GetConsole. Such a sandbox boots cold,
+  // since a warm snapshot's kernel has already booted quiet.
+  bool is_console_verbose = 9;
 }
 
 // A volume attached to one sandbox at one path.

@@ -366,9 +366,18 @@ enum Command {
     /// from the start unless the command asked for its log to rotate.
     Logs {
         id: String,
-        /// Command to follow, from `burrow top`. Required: burrow's logs belong
-        /// to a command, not to the sandbox as a whole.
+        /// Command to follow, from `burrow top`. Required unless --console:
+        /// burrow's logs belong to a command, not to the sandbox as a whole.
         command_id: Option<String>,
+        /// Print the end of the sandbox's serial console instead: the guest
+        /// kernel's boot and anything printed there since its VM last
+        /// started, as its node captured it.
+        #[arg(long, conflicts_with = "command_id")]
+        console: bool,
+        /// With --console, how much of the end to print, in bytes; at most
+        /// 2 MiB.
+        #[arg(long, default_value_t = 65536, requires = "console")]
+        tail_bytes: u32,
     },
     /// Remove finished commands and their output logs, as `docker container
     /// prune`. Running commands are left alone.
@@ -915,6 +924,11 @@ struct CreateFlags {
     /// always works.
     #[arg(long)]
     alias: Option<String>,
+    /// Boot with a verbose kernel console, for debugging a template that
+    /// does not come up: read it with `burrow logs --console <ID>`. Boots
+    /// cold, never from a warm snapshot.
+    #[arg(long)]
+    verbose_console: bool,
 }
 
 impl CreateFlags {
@@ -944,6 +958,7 @@ impl CreateFlags {
             || !self.node_labels.is_empty()
             || !self.networks.is_empty()
             || self.alias.is_some()
+            || self.verbose_console
             || self.network.is_stated()
             || self.access.is_stated()
     }
@@ -2148,14 +2163,32 @@ async fn main() -> anyhow::Result<()> {
                 std::process::exit(exit_status(code));
             }
         }
-        Command::Logs { id, command_id } => {
-            // The sandbox's own console log is written on the node and no RPC
-            // reads it, so `logs <SANDBOX>` has nothing to show. Naming that
-            // beats picking a command and calling it the sandbox's output.
+        Command::Logs {
+            id,
+            console: true,
+            tail_bytes,
+            ..
+        } => {
+            let log = client
+                .get_console(api::GetConsoleRequest {
+                    sandbox_id: id,
+                    tail_bytes,
+                })
+                .await?
+                .into_inner();
+            if log.is_truncated {
+                eprintln!("(earlier console output not shown; raise --tail-bytes for more)");
+            }
+            print!("{}", log.text);
+        }
+        Command::Logs { id, command_id, .. } => {
+            // Naming that a command is needed beats picking one and calling it
+            // the sandbox's output.
             let Some(command_id) = command_id else {
                 anyhow::bail!(
                     "burrow logs follows one command, so it needs a command id: \
-                     `burrow logs {id} <COMMAND-ID>`. `burrow top {id}` lists them"
+                     `burrow logs {id} <COMMAND-ID>`, or `burrow logs --console {id}` for its \
+                     serial console. `burrow top {id}` lists them"
                 );
             };
             let code = attach_command(&client, &id, &command_id).await?;
@@ -3360,6 +3393,7 @@ fn create_request(flags: CreateFlags) -> anyhow::Result<api::CreateSandboxReques
         access,
         networks,
         alias,
+        verbose_console,
     } = flags;
     let tags = parse_pairs("--tag", &tags)?;
     // A snapshot carries its own template, so nothing is sent unless the
@@ -3412,6 +3446,7 @@ fn create_request(flags: CreateFlags) -> anyhow::Result<api::CreateSandboxReques
                     alias: alias.clone().unwrap_or_default(),
                 })
                 .collect(),
+            is_console_verbose: verbose_console,
         }),
         tags,
         node_labels: parse_pairs("--node-label", &node_labels)?,
@@ -6722,6 +6757,7 @@ mod tests {
             CreateFlags {
                 name: None,
                 request_id: None,
+                verbose_console: false,
                 template: None,
                 kit_args: Vec::new(),
                 kit_env: Vec::new(),

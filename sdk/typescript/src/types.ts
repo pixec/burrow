@@ -679,6 +679,12 @@ export interface CreateOptions extends CallOptions, HandleOptions {
   /** Guest image to boot. */
   template?: string;
   /**
+   * Boot with a verbose kernel console, for debugging a template that does
+   * not come up; read it with {@link Sandbox.console}. Boots cold, never
+   * from a warm snapshot.
+   */
+  verboseConsole?: boolean;
+  /**
    * Snapshot id to start from. The sandbox **restores** that state instead of
    * booting, so it arrives with the snapshot's processes and memory, and
    * `template` and `resources` may not disagree with what the snapshot

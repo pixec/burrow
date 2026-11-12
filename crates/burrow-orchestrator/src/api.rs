@@ -2217,6 +2217,16 @@ impl Burrow for ApiService {
         Ok(Response::new(sandbox))
     }
 
+    async fn get_console(
+        &self,
+        req: Request<api::GetConsoleRequest>,
+    ) -> Result<Response<api::ConsoleLog>, Status> {
+        let mut req = req.into_inner();
+        req.sandbox_id = self.resolve(&req.sandbox_id).await;
+        let mut client = self.node_for(&req.sandbox_id).await?;
+        Ok(Response::new(client.get_console(req).await?.into_inner()))
+    }
+
     async fn stop_sandbox(
         &self,
         req: Request<api::SandboxRef>,

@@ -121,7 +121,7 @@ impl FcProcess {
     /// before it execs.
     ///
     /// Guest serial output arrives on the process's stdout, so both stdout and
-    /// stderr are captured to `console.log` inside the workdir.
+    /// stderr are captured to the bounded console log inside the workdir.
     pub async fn spawn(
         binary: &Path,
         vm_id: &str,
@@ -147,9 +147,7 @@ impl FcProcess {
             tokio::fs::remove_file(&sock_path).await?;
         }
 
-        let console_log = workdir.join("console.log");
-        let console = std::fs::File::create(&console_log)?;
-        let console_err = console.try_clone()?;
+        let console_log = workdir.join(crate::console::LOG);
 
         if let Some(jail) = jail {
             clear_jail_devices(workdir).await?;
@@ -210,11 +208,16 @@ impl FcProcess {
         }
         let mut child = command
             .stdin(Stdio::piped())
-            .stdout(Stdio::from(console))
-            .stderr(Stdio::from(console_err))
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
             .kill_on_drop(true)
             .spawn()?;
 
+        let outputs: Vec<Box<dyn tokio::io::AsyncRead + Unpin + Send>> = vec![
+            Box::new(child.stdout.take().expect("stdout is piped")),
+            Box::new(child.stderr.take().expect("stderr is piped")),
+        ];
+        crate::console::capture(workdir, outputs)?;
         let console_in = child.stdin.take();
         let mut proc = Self {
             child,
@@ -280,11 +283,12 @@ impl FcProcess {
 
     /// Last `n` lines of guest console output, for diagnostics.
     pub async fn console_tail(&self, n: usize) -> String {
-        let Ok(text) = tokio::fs::read_to_string(&self.console_log).await else {
-            return String::new();
-        };
-        let lines: Vec<&str> = text.lines().collect();
-        lines[lines.len().saturating_sub(n)..].join("\n")
+        crate::console::tail(&self.workdir, n).await
+    }
+
+    /// How the process ended, once it has.
+    pub fn exit_status(&mut self) -> Option<std::process::ExitStatus> {
+        self.child.try_wait().ok().flatten()
     }
 
     /// Waits for `marker` to appear in the guest console output.

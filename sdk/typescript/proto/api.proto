@@ -34,6 +34,9 @@ service Burrow {
   rpc RecreateSandbox(RecreateSandboxRequest) returns (burrow.common.v1.Sandbox);
   // Every VM this sandbox has run, newest first.
   rpc ListSessions(SandboxRef) returns (ListSessionsResponse);
+  // The end of the guest's serial console as its node captured it since its
+  // VM last started: the kernel's boot and anything the guest prints there.
+  rpc GetConsole(GetConsoleRequest) returns (ConsoleLog);
   // Move the clocks a sandbox is measured against: lifetime, idle
   // suspension, suspended retention and snapshot retention.
   rpc UpdateLifetime(UpdateLifetimeRequest) returns (burrow.common.v1.Sandbox);
@@ -617,6 +620,20 @@ message UpdateAccessPolicyRequest {
   string sandbox_id = 1;
   optional burrow.common.v1.ExecPolicy exec = 2;
   optional burrow.common.v1.FsPolicy fs = 3;
+}
+
+message GetConsoleRequest {
+  string sandbox_id = 1;
+  // How much of the end of the log to return, in bytes: 0 is 64 KiB, and
+  // more than 2 MiB, all a node keeps, is 2 MiB.
+  uint32 tail_bytes = 2;
+}
+
+message ConsoleLog {
+  // As the guest wrote it, invalid UTF-8 replaced.
+  string text = 1;
+  // Whether the log holds more before `text`.
+  bool is_truncated = 2;
 }
 
 message ListSessionsResponse {

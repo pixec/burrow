@@ -10,7 +10,7 @@ use serde_json::{Value, json};
 use crate::error::{Error, Result};
 use crate::{Boot, GUEST_CID, GuestOs, Hypervisor, VSOCK_UDS, VmSpec};
 
-use super::{CONSOLE_LOG, CloudHypervisorConfig};
+use super::{CONSOLE_PIPE, CloudHypervisorConfig};
 
 /// The id the NIC is created under, so a restore can find it to retarget it.
 pub(crate) const NET_ID: &str = "net0";
@@ -58,7 +58,7 @@ pub(crate) fn disk(drive: &crate::DriveSpec) -> Value {
 /// there. On x86_64 its UART is the 16550 that is `ttyS0` to the guest, as
 /// Firecracker's is.
 fn console(arch: &str) -> Result<(Value, Value, &'static str)> {
-    let file = json!({ "mode": "File", "file": CONSOLE_LOG });
+    let file = json!({ "mode": "File", "file": CONSOLE_PIPE });
     let off = json!({ "mode": "Off" });
     match arch {
         "x86_64" => Ok((file, off, "")),
@@ -106,7 +106,7 @@ pub(crate) fn vm_config(
                     what: "boot windows with fewer than 2 vcpus or 4096 MiB",
                 });
             }
-            serial = json!({ "mode": "File", "file": CONSOLE_LOG });
+            serial = json!({ "mode": "File", "file": CONSOLE_PIPE });
             console = json!({ "mode": "Off" });
             json!({ "firmware": firmware(&spec.boot) })
         }
@@ -333,7 +333,7 @@ mod tests {
     fn the_console_is_one_the_guest_kernel_can_drive() {
         let arm = vm_config(&spec(), &config(), "aarch64").unwrap();
         assert_eq!(arm["serial"]["mode"], "Off");
-        assert_eq!(arm["console"]["file"], "console.log");
+        assert_eq!(arm["console"]["file"], "console.pipe");
         assert!(
             arm["payload"]["cmdline"]
                 .as_str()
@@ -342,7 +342,7 @@ mod tests {
         );
 
         let x86 = vm_config(&spec(), &config(), "x86_64").unwrap();
-        assert_eq!(x86["serial"]["file"], "console.log");
+        assert_eq!(x86["serial"]["file"], "console.pipe");
         assert_eq!(x86["console"]["mode"], "Off");
         assert_eq!(x86["payload"]["cmdline"], "console=ttyS0 root=/dev/vda ro");
     }
@@ -391,7 +391,7 @@ mod tests {
         assert_eq!(vm["cpus"], json!({ "boot_vcpus": 4, "max_vcpus": 4 }));
         assert_eq!(vm["memory"]["size"], 8192 * 1024 * 1024u64);
         assert_eq!(vm["tpm"], json!({ "socket": "swtpm.sock" }));
-        assert_eq!(vm["serial"]["file"], "console.log");
+        assert_eq!(vm["serial"]["file"], "console.pipe");
         assert_eq!(vm["console"]["mode"], "Off");
 
         let x86 = vm_config(&windows, &config(), "x86_64").unwrap();

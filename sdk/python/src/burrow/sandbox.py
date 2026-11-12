@@ -5,7 +5,7 @@ from __future__ import annotations
 import contextlib
 import threading
 from datetime import datetime
-from typing import Any, Callable, Dict, Iterator, List, Optional, Sequence, Union
+from typing import Any, Callable, Dict, Iterator, List, Optional, Sequence, Tuple, Union
 
 import grpc
 
@@ -1121,6 +1121,20 @@ class Sandbox:
         self._assert_live()
         res = self._transport.unary("ListSessions", api_pb2.SandboxRef(sandbox_id=self.id))
         return [_to_session(raw) for raw in res.sessions]
+
+    def console(self, tail_bytes: int = 0) -> Tuple[str, bool]:
+        """The end of the sandbox's serial console as its node captured it
+        since its VM last started: the guest kernel's boot and anything
+        printed there, and whether the log holds more before it.
+
+        `tail_bytes` is how much of the end, 64 KiB when 0 and at most 2 MiB.
+        """
+        self._assert_live()
+        res = self._transport.unary(
+            "GetConsole",
+            api_pb2.GetConsoleRequest(sandbox_id=self.id, tail_bytes=tail_bytes),
+        )
+        return res.text, res.is_truncated
 
     def current_session(self) -> Optional[Session]:
         """The VM the sandbox is running now, or `None` when it has none.
