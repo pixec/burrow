@@ -9,7 +9,9 @@
 //! `cpu.max` is set only for a sandbox that asked for a cap: one at the vCPU
 //! count throttled the VMM's device threads along with the vCPUs, stalling a
 //! busy guest for the rest of each period, and kept no neighbour safer than
-//! the weight does.
+//! the weight does. A VMM starts without it: a cap below its vCPUs stalls a
+//! kernel boot past the agent's deadline, so its owner writes the cap with
+//! [`Cgroup::set_limits`] once the guest has answered.
 
 use std::path::{Path, PathBuf};
 
@@ -44,12 +46,24 @@ pub struct Limits {
     pub pids_max: u32,
 }
 
+impl Limits {
+    /// These limits without the `cpu.max` cap, which a VMM boots or restores
+    /// under.
+    pub fn uncapped(&self) -> Self {
+        Self {
+            cpu_max_millis: 0,
+            ..self.clone()
+        }
+    }
+}
+
 pub struct Cgroup {
     path: PathBuf,
 }
 
 impl Cgroup {
-    /// Creates `<root>/burrow/<name>` with the given limits.
+    /// Creates `<root>/burrow/<name>` with the given limits, all but the
+    /// `cpu.max` cap.
     pub fn create(root: &Path, name: &str, limits: &Limits) -> Result<Self> {
         let parent = root.join("burrow");
         prepare_parent(root, &parent)?;
@@ -60,7 +74,7 @@ impl Cgroup {
         }
 
         let cgroup = Self { path };
-        cgroup.set_limits(limits)?;
+        cgroup.set_limits(&limits.uncapped())?;
         let path = &cgroup.path;
         if limits.memory_mib > 0 {
             let bytes = limits.memory_mib as u64 * 1024 * 1024;
@@ -338,6 +352,33 @@ mod tests {
         assert_eq!(read("cpuset.cpus"), "");
         assert_eq!(read("io.weight"), "default 100");
         let _ = std::fs::remove_dir_all(&cgroup.path);
+    }
+
+    /// A VMM's cgroup is made without its `cpus` cap, so a kernel boot or a
+    /// restore is not throttled past the agent's deadline, and with every
+    /// other limit. The cap is written once the guest has answered.
+    #[test]
+    fn a_new_cgroup_starts_without_its_cpu_cap() {
+        let root = std::env::temp_dir().join(format!("burrow-cg-root-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        for dir in [root.clone(), root.join("burrow")] {
+            std::fs::create_dir_all(&dir).unwrap();
+            std::fs::write(dir.join("cgroup.controllers"), "cpu memory").unwrap();
+        }
+        let limits = Limits {
+            cpu_max_millis: 500,
+            cpu_weight: 20,
+            memory_mib: 580,
+            ..Default::default()
+        };
+        let cgroup = Cgroup::create(&root, "vm", &limits).unwrap();
+        let read = |file: &str| std::fs::read_to_string(cgroup.path.join(file)).unwrap();
+        assert_eq!(read("cpu.max"), "max 100000");
+        assert_eq!(read("cpu.weight"), "20");
+        assert_eq!(read("memory.max"), (580u64 << 20).to_string());
+        cgroup.set_limits(&limits).unwrap();
+        assert_eq!(read("cpu.max"), "50000 100000");
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     /// A pin or an IO weight on a node without the controller is refused by

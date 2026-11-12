@@ -540,6 +540,18 @@ pub(crate) fn cgroup_limits(
     }
 }
 
+/// Starts a sandbox's `cpus` cap on a VMM whose guest has answered. A VMM
+/// boots and restores without it, since a cap below its vCPUs can stall a
+/// kernel boot past the agent's deadline.
+fn start_cpu_cap(vm: &Vm, limits: &burrow_vmm::Limits, sandbox: &str) {
+    if limits.cpu_max_millis == 0 {
+        return;
+    }
+    if let Err(err) = vm.set_limits(limits) {
+        tracing::error!(sandbox, %err, "the sandbox's host cpu cap was NOT applied");
+    }
+}
+
 /// Whether a policy names a host CPU or IO limit, which a Mac node has no
 /// cgroup to enforce.
 fn has_host_limits(resources: &common::ResourcePolicy) -> bool {
@@ -869,6 +881,10 @@ fn spawn_handshake(
         };
         match state {
             Handshake::Done if recorded => {
+                if let Some(vm) = &*sandbox.vm.lock().await {
+                    let limits = sandbox.spec.lock().unwrap().limits.clone();
+                    start_cpu_cap(vm, &limits, &id);
+                }
                 // The channel this was made on is the one the first exec would
                 // otherwise have to dial for itself.
                 *sandbox.agent_channel.lock().await = Some(agent.expect("done means connected"));
@@ -1639,6 +1655,7 @@ impl RunningSandbox {
         }
         spec.memory_source = self.durable.arriving().map(|h| burrow_vmm::MemorySource(h));
         record_working_set(&mut spec, is_stored);
+        let limits = spec.limits.clone();
         let vm = Vm::restore(spec, true)
             .await
             .map_err(|err| Status::internal(format!("restore failed: {err}")))?;
@@ -1656,6 +1673,7 @@ impl RunningSandbox {
         // `restored: true` is what tells the guest to reseed its RNG and reset
         // its clock, which it cannot know on its own.
         guestconn::handshake_upgrading(agent, guest, request, upgrade, agent_timeout).await?;
+        start_cpu_cap(&vm, &limits, self.id());
         // This VM handshook synchronously, whatever the last one did. A failure
         // recorded there was a verdict on a VM that no longer exists.
         self.handshake.send_replace(Handshake::Done);
@@ -1789,6 +1807,7 @@ impl RunningSandbox {
             let _ = vm.kill().await;
             return Err(err);
         }
+        start_cpu_cap(&vm, &spec.limits, self.id());
         self.handshake.send_replace(Handshake::Done);
         self.touch();
         tracing::info!(
@@ -6950,6 +6969,7 @@ impl SandboxManager {
                 Ok((_, response)) => response.timing.unwrap_or_default(),
                 Err(err) => return Err(guard.fail(err).await),
             };
+            start_cpu_cap(guard.vm(), &boot_spec.limits, &id);
             (
                 settled(),
                 agent_up,
