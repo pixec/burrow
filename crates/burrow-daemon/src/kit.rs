@@ -606,7 +606,7 @@ pub async fn provision(
     plan: &Plan,
     boot: Boot,
 ) -> Result<(), Status> {
-    let image = manager.image_environment(sandbox.template()).await;
+    let image = manager.environment_of(sandbox).await;
     let baseline = baseline_env(&image);
 
     write_files(

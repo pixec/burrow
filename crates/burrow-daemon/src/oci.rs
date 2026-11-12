@@ -296,6 +296,33 @@ impl ImageEnvironment {
 /// Templates built the old way simply have none, and so does a template whose
 /// record cannot be parsed: the environment is a convenience, and refusing to
 /// start a sandbox over it would be worse than starting one without it.
+/// A sandbox's own copy of its template's environment, in its working
+/// directory. Kept for a sandbox taken up from the object store, which may
+/// land on a node that has never had its template.
+pub const SANDBOX_ENVIRONMENT: &str = "image.json";
+
+/// The environment a sandbox runs with: its own copy where it has one, and
+/// its template's otherwise.
+pub async fn sandbox_environment(
+    data_dir: &Path,
+    workdir: &Path,
+    template: &str,
+) -> ImageEnvironment {
+    match tokio::fs::read(workdir.join(SANDBOX_ENVIRONMENT)).await {
+        Ok(bytes) => serde_json::from_slice(&bytes).unwrap_or_default(),
+        Err(_) => image_environment(data_dir, template).await,
+    }
+}
+
+/// Keeps `environment` as a sandbox's own, in its working directory.
+pub async fn keep_environment(
+    workdir: &Path,
+    environment: &ImageEnvironment,
+) -> std::io::Result<()> {
+    let json = serde_json::to_vec_pretty(environment).map_err(std::io::Error::other)?;
+    tokio::fs::write(workdir.join(SANDBOX_ENVIRONMENT), json).await
+}
+
 pub async fn image_environment(data_dir: &Path, template: &str) -> ImageEnvironment {
     let path = data_dir.join("images").join(template).join("image.json");
     match tokio::fs::read(&path).await {

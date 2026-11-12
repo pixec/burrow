@@ -266,7 +266,7 @@ impl NodeApi {
         // is usually the only reason an interpreter installed at an unusual
         // prefix is findable at all. The caller's own values win, because they
         // are the more specific instruction.
-        let image = self.image_environment(sandbox.template()).await;
+        let image = self.sandboxes.environment_of(&sandbox).await;
         let mut env = image.as_map();
         env.extend(sandbox.record().env);
         env.extend(start.env);
@@ -802,13 +802,13 @@ impl NodeService for NodeApi {
         if let Some(kit) = &sandbox.kit {
             // A boot is a boot: files land again and startup hooks run again,
             // under the runtime policy the record already carries.
-            let Some(template) = self.image_environment(&sandbox.template).await.kit else {
+            let running = self.sandboxes.get(&id).await?;
+            let Some(template) = self.sandboxes.environment_of(&running).await.kit else {
                 return Err(Status::failed_precondition(format!(
                     "template {} is no longer a kit template",
                     sandbox.template
                 )));
             };
-            let running = self.sandboxes.get(&id).await?;
             let plan = crate::kit::plan(
                 &template,
                 kit,

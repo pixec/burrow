@@ -142,6 +142,11 @@ pub struct Manifest {
     /// only over the same generations, and boots on its disk otherwise.
     #[serde(default)]
     pub volumes: std::collections::BTreeMap<String, u64>,
+    /// The template's environment as the sandbox ran with it: its systemd
+    /// mode, guest OS, image environment and Kit. A node adopting the sandbox
+    /// may never have had the template, so it keeps this copy instead.
+    #[serde(default)]
+    pub image: Option<crate::oci::ImageEnvironment>,
 }
 
 pub const CHECKPOINT_DISK: &str = "disk";
@@ -764,6 +769,7 @@ pub async fn stage(
         None => Vec::new(),
     };
     let fetched_small = started.elapsed();
+    keep_image(manifest, dest).await?;
 
     let hydrator = Hydrator::begin(store.clone(), memory.clone(), &dest.join(memory_file))
         .map_err(|err| Status::internal(format!("preparing guest memory: {err}")))?;
@@ -825,6 +831,17 @@ pub async fn stage(
 }
 
 const PAGE: u64 = 4096;
+
+/// Keeps the template environment a manifest carries as the adopted
+/// sandbox's own.
+async fn keep_image(manifest: &Manifest, dest: &Path) -> Result<(), Status> {
+    match &manifest.image {
+        Some(image) => crate::oci::keep_environment(dest, image)
+            .await
+            .map_err(|err| Status::internal(format!("keeping the image environment: {err}"))),
+        None => Ok(()),
+    }
+}
 
 /// Where a disk checkpoint's clone is kept once uploaded, the base the next
 /// one is compared with.
@@ -979,6 +996,7 @@ pub async fn stage_disk(
     })?;
     let disk_path = dest.join(disk_file);
     crate::rootdisk::materialise(store, &disk_index, image.as_ref(), &disk_path).await?;
+    keep_image(manifest, dest).await?;
     crate::fsync::tree(dest)
         .await
         .map_err(|err| Status::internal(format!("syncing the adopted disk: {err}")))?;
@@ -1239,6 +1257,7 @@ mod tests {
             checkpoint: String::new(),
             checkpoint_at_ms: 0,
             volumes: Default::default(),
+            image: None,
         }
     }
 
@@ -1310,6 +1329,12 @@ mod tests {
         let mut draft = manifest("node-a", "");
         draft.disk_layout = "root".into();
         draft.checkpoint_at_ms = 42;
+        draft.image = Some(crate::oci::ImageEnvironment {
+            systemd: true,
+            env: vec!["PATH=/opt/tool/bin".into()],
+            user: "app".into(),
+            ..Default::default()
+        });
 
         let capture = workdir.join(".checkpoint.ext4");
         crate::rootdisk::clone(&disk, &capture).await.unwrap();
@@ -1374,6 +1399,20 @@ mod tests {
         assert_eq!(
             std::fs::read(dest.join(TEMPLATE_KERNEL)).unwrap(),
             b"kernel"
+        );
+
+        // Node b has never had the template, so the sandbox boots with the
+        // environment its checkpoint carried: systemd mode, image env, user.
+        let environment =
+            crate::oci::sandbox_environment(&root.join("data-b"), &dest, "never-pulled").await;
+        assert!(environment.systemd);
+        assert_eq!(environment.env, ["PATH=/opt/tool/bin"]);
+        assert_eq!(environment.user, "app");
+        assert!(
+            !crate::oci::sandbox_environment(&root.join("data-b"), &root, "never-pulled")
+                .await
+                .systemd,
+            "a sandbox with no copy of its own reads its template's"
         );
         let _ = std::fs::remove_dir_all(&root);
     }

@@ -3089,7 +3089,10 @@ impl SandboxManager {
             tx_bytes: record.tx_bytes,
             ..Default::default()
         };
-        let is_systemd = self.image_environment(&record.template).await.systemd;
+        let is_systemd =
+            crate::oci::sandbox_environment(&self.config.data_dir, &workdir, &record.template)
+                .await
+                .systemd;
         let spec = self.build_spec(
             &row.id,
             &workdir,
@@ -5086,6 +5089,26 @@ impl SandboxManager {
         crate::oci::image_environment(&self.config.data_dir, template)
             .await
             .trust_bundles()
+    }
+
+    /// The trust bundles an inspected sandbox's guest gets, from the
+    /// environment it runs with.
+    fn trust_bundles_in(
+        &self,
+        environment: &crate::oci::ImageEnvironment,
+        policy: &common::Policy,
+    ) -> Vec<burrow_proto::guest::v1::TrustBundle> {
+        match self.inspection_ca_for(policy).is_empty() {
+            true => Vec::new(),
+            false => environment.trust_bundles(),
+        }
+    }
+
+    /// The template environment a sandbox runs with: its own copy, kept when
+    /// it was taken up from the object store, or its template's.
+    pub async fn environment_of(&self, sandbox: &RunningSandbox) -> crate::oci::ImageEnvironment {
+        crate::oci::sandbox_environment(&self.config.data_dir, &sandbox.workdir, sandbox.template())
+            .await
     }
 
     /// The trust material to bake into `template`'s warm snapshot.
@@ -7132,6 +7155,11 @@ impl SandboxManager {
             RestoreSource::Sandbox(source, _) => {
                 burrow_vmm::GuestOs::from_record(&source.record().guest_os).unwrap_or_default()
             }
+            RestoreSource::Stored { manifest, .. } if manifest.image.is_some() => manifest
+                .image
+                .as_ref()
+                .and_then(|image| image.machine().ok())
+                .map_or_else(Default::default, |(_, os)| os),
             _ => self
                 .image_environment(&source.template())
                 .await
@@ -7303,7 +7331,16 @@ impl SandboxManager {
             true,
             self.guest_network(&lease, &[], capabilities.is_tap_networked, true),
             self.inspection_ca_for(&policy),
-            self.trust_bundles_for(&source.template(), &policy).await,
+            match &source {
+                RestoreSource::Stored {
+                    manifest:
+                        crate::durable::Manifest {
+                            image: Some(image), ..
+                        },
+                    ..
+                } => self.trust_bundles_in(image, &policy),
+                _ => self.trust_bundles_for(&source.template(), &policy).await,
+            },
             match is_attached {
                 true => Vec::new(),
                 false => crate::volume::agent_mounts(&policy.volumes, guest_os, disk_layout),
@@ -7412,7 +7449,8 @@ impl SandboxManager {
             false,
         );
         request.inspection_ca_pem = self.inspection_ca_for(&policy);
-        request.extra_trust_bundles = self.trust_bundles_for(sandbox.template(), &policy).await;
+        request.extra_trust_bundles =
+            self.trust_bundles_in(&self.environment_of(&sandbox).await, &policy);
         let inspection_root = self.inspection_root_of(&request);
         // Suspending gave the volumes back, so another sandbox may hold them
         // now. Taken before the VM starts, so a sandbox that cannot have them
@@ -7600,7 +7638,8 @@ impl SandboxManager {
             }
         }
         let resources = policy.resources.unwrap_or_default();
-        let is_systemd = self.image_environment(sandbox.template()).await.systemd;
+        let environment = self.environment_of(&sandbox).await;
+        let is_systemd = environment.systemd;
         let disk_layout = sandbox.disk_layout();
         // On a root disk, hotplugged once the agent is up, as a create does.
         let is_hotplugged = disk_layout == DiskLayout::Root
@@ -7637,7 +7676,7 @@ impl SandboxManager {
                 false,
             ),
             self.inspection_ca_for(&policy),
-            self.trust_bundles_for(sandbox.template(), &policy).await,
+            self.trust_bundles_in(&environment, &policy),
             crate::volume::agent_mounts(&policy.volumes, guest_os, disk_layout),
         );
         if let Err(err) = sandbox
@@ -8022,9 +8061,10 @@ impl SandboxManager {
             let spec = sandbox.spec.lock().unwrap();
             (spec.vcpus, spec.mem_mib)
         };
+        let image = self.environment_of(sandbox).await;
         let is_systemd = match previous {
             Some(previous) => previous.manifest.is_systemd,
-            None => self.image_environment(sandbox.template()).await.systemd,
+            None => image.systemd,
         };
         Ok(Some(crate::durable::Manifest {
             format: 0,
@@ -8051,6 +8091,7 @@ impl SandboxManager {
             checkpoint: String::new(),
             checkpoint_at_ms: 0,
             volumes: Default::default(),
+            image: Some(image),
         }))
     }
 
@@ -8712,11 +8753,7 @@ impl SandboxManager {
                 )));
             }
         }
-        let guest_os = self
-            .image_environment(&manifest.template)
-            .await
-            .machine()
-            .map_or_else(|_| Default::default(), |(_, os)| os);
+        let guest_os = burrow_vmm::GuestOs::from_record(&record.guest_os).unwrap_or_default();
         let mut guard = Provisioning::new(self, &id, &workdir);
         let lease = match self.ipam.lock().await.allocate(&id) {
             Ok(lease) => lease,
