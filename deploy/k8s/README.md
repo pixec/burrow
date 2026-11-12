@@ -114,21 +114,15 @@ Both manifests pin `ghcr.io/pixec/...:0.1.0`. Change that to the release you
 want before applying; they are deliberately not `:latest`, so a redeploy is
 never a silent upgrade of the control plane or a fleet-wide hypervisor bump.
 
-Give each machine a kernel. Templates are built from OCI images, which carry a
-userland and no kernel, so the node supplies one. The Firecracker CI kernels are
-the usual starting point; take the one matching your machines' architecture:
-
-```sh
-kubectl -n burrow exec ds/burrow-node -- sh -c \
-  'curl -fsSL -o /var/lib/burrow/vmlinux \
-    https://s3.amazonaws.com/spec.ccfc.min/firecracker-ci/v1.15/x86_64/vmlinux-6.1.155'
-```
-
-On `arm64` machines swap `x86_64` for `aarch64` in that URL. `/var/lib/burrow`
-is where `--guest-kernel` looks by default; pass the flag if you keep the kernel
-elsewhere. Any kernel Firecracker can boot works, so a build of your own with
-the drivers you need is fine. Live memory changes need `CONFIG_VIRTIO_MEM`,
-which the `v1.15` kernels have and the older `v1.13` ones lack.
+Templates are built from OCI images, which carry a userland and no kernel, so
+the node supplies one. The node image ships two, pinned by version and
+checksum: the Firecracker CI kernel (`firecracker-ci`), which Firecracker
+templates boot by default, and Cloud Hypervisor's own build (`ch-linux`), which
+Cloud Hypervisor templates boot by default and which has KVM and virtio-mem
+built in for `--nested-virt` and live memory changes. `burrow nodes kernels`
+lists what each node has and what each kernel has built in. To offer a kernel
+of your own, mount it and pass `--kernel NAME=PATH` (see `20-node.yaml`); a
+template takes it with `burrow pull --kernel NAME`.
 
 Then import a template; nodes hold templates on local disk, and a fleet with
 none can create nothing:

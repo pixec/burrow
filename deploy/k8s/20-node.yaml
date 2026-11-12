@@ -68,6 +68,14 @@ spec:
             - --require-resource-limits
             - --label
             - tier=general
+            # Guest kernels. The image ships firecracker-ci and ch-linux under
+            # /usr/local/share/burrow/kernels, the defaults for Firecracker and
+            # Cloud Hypervisor templates; a template picks another with
+            # `burrow pull --kernel`. Add your own from a hostPath mount:
+            # - --kernel
+            # - custom@cloud-hypervisor=/var/lib/burrow/kernels/vmlinux-custom
+            # - --default-kernel
+            # - cloud-hypervisor=custom
             # This node's edge. Point a wildcard record at the machine:
             # *.<node-name>.sandbox.example.com. An edge serves only the
             # sandboxes its own node holds, so the domain must be unique to it.

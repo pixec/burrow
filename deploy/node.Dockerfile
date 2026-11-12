@@ -46,6 +46,21 @@ ARG CH_EDK2=ch-97eeb7b09
 ARG CH_EDK2_SHA256_X86_64=dc2fc8f0e43b96712d9fccc52a3a590769606412b3e1bc911d217addd3bef624
 ARG CH_EDK2_SHA256_AARCH64=13cf4eddc44f3fac4e223b54bcf958de99539297fee8b61cca2605ab5b5009fb
 
+# Guest kernels, one per hypervisor's default. An OCI image carries no kernel,
+# so a template takes one of these when it is built (`burrow pull --kernel`):
+# the Firecracker CI kernel for Firecracker, and Cloud Hypervisor's own build
+# (KVM, virtio-mem, vsock, virtio-blk, ext4 and PVH built in, modules off) for
+# Cloud Hypervisor. burrowd finds them by these names under
+# /usr/local/share/burrow/kernels. Firecracker CI publishes no checksums, so
+# these are of the files as fetched; Cloud Hypervisor's match the release's
+# own asset digests. Bump each with its version.
+ARG FC_KERNEL=v1.15/vmlinux-6.1.155
+ARG FC_KERNEL_SHA256_X86_64=e20e46d0c36c55c0d1014eb20576171b3f3d922260d9f792017aeff53af3d4f2
+ARG FC_KERNEL_SHA256_AARCH64=e3544b10603acbf3db492cb52e000d22ba202cb4b63b9add027565683e11c591
+ARG CH_KERNEL=ch-release-v7.2.8-20261009
+ARG CH_KERNEL_SHA256_X86_64=edfeb8a8a6c04ff2979e9f1c700feaa29b8f564f952261834ef0b7d2e673a853
+ARG CH_KERNEL_SHA256_AARCH64=8f8f3d5a983809f87a4e1e9a13053a3361fda47ef04e09c771a41c5e037cb6c2
+
 # e2fsprogs builds the ext4 images that OCI imports and volumes are made of
 # without mounting them (mkfs.ext4 -d).
 RUN apt-get update && apt-get install -y --no-install-recommends \
@@ -105,6 +120,30 @@ RUN set -eu; \
         "https://github.com/cloud-hypervisor/edk2/releases/download/${CH_EDK2}/${fw}"; \
     echo "${fw_want}  /usr/local/share/cloud-hypervisor/${fw}" | sha256sum -c -; \
     cloud-hypervisor --version
+
+RUN set -eu; \
+    arch="$FC_ARCH"; \
+    if [ -z "$arch" ]; then \
+        case "$TARGETARCH" in \
+            amd64) arch=x86_64 ;; \
+            arm64) arch=aarch64 ;; \
+        esac; \
+    fi; \
+    case "$arch" in \
+        x86_64) fc_want="$FC_KERNEL_SHA256_X86_64"; \
+                ch_asset=vmlinux-x86_64; ch_want="$CH_KERNEL_SHA256_X86_64" ;; \
+        aarch64) fc_want="$FC_KERNEL_SHA256_AARCH64"; \
+                 ch_asset=Image-arm64; ch_want="$CH_KERNEL_SHA256_AARCH64" ;; \
+        *) echo "unsupported arch: $arch" >&2; exit 1 ;; \
+    esac; \
+    dir=/usr/local/share/burrow/kernels; \
+    mkdir -p "$dir"; \
+    curl -fsSL -o "$dir/firecracker-ci" \
+        "https://s3.amazonaws.com/spec.ccfc.min/firecracker-ci/${FC_KERNEL%%/*}/${arch}/${FC_KERNEL#*/}"; \
+    echo "${fc_want}  $dir/firecracker-ci" | sha256sum -c -; \
+    curl -fsSL -o "$dir/ch-linux" \
+        "https://github.com/cloud-hypervisor/linux/releases/download/${CH_KERNEL}/${ch_asset}"; \
+    echo "${ch_want}  $dir/ch-linux" | sha256sum -c -
 
 # Development harness: burrowd, burrow-guest and the rootfs builder are bind-mounted
 # from the host build, so a rebuild is zigbuild + restart with no image work.
