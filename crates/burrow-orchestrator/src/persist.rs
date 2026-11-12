@@ -43,10 +43,12 @@ pub enum Change {
     Replace(Box<common::Sandbox>),
     /// Only what a node reports on a heartbeat, taken from this record.
     Restate(Box<common::Sandbox>),
-    /// Off its node, stamped with where its state can restore.
+    /// Off its node, stamped with where its state can restore. `cpu` is the
+    /// node's that last held it, which wrote its saved memory.
     Unplace {
         arch: String,
         hypervisor_version: String,
+        cpu: Option<common::CpuFingerprint>,
     },
 }
 
@@ -68,6 +70,7 @@ pub enum Op {
         node_id: String,
         arch: String,
         hypervisor_version: String,
+        cpu: Option<common::CpuFingerprint>,
     },
     PutTombstone(burrow_store::TombstoneRow),
     DeleteTombstone(String),
@@ -168,7 +171,8 @@ async fn apply(store: &burrow_store::Store, op: &Op) -> burrow_store::Result<()>
             node_id,
             arch,
             hypervisor_version,
-        } => write_off(store, sandbox_id, node_id, arch, hypervisor_version).await,
+            cpu,
+        } => write_off(store, sandbox_id, node_id, arch, hypervisor_version, cpu).await,
         Op::PutTombstone(row) => store.put_tombstone(row).await,
         Op::DeleteTombstone(id) => store.delete_tombstone(id).await,
         Op::PruneTombstones(cutoff) => store.prune_tombstones(*cutoff).await.map(drop),
@@ -223,12 +227,14 @@ fn changed(change: &Change, current: Option<common::Sandbox>) -> Option<common::
         Change::Unplace {
             arch,
             hypervisor_version,
+            cpu,
         } => current.map(|mut sandbox| {
             sandbox.node_id.clear();
             if sandbox.arch.is_empty() {
                 sandbox.arch = arch.clone();
                 sandbox.hypervisor_version = hypervisor_version.clone();
             }
+            sandbox.cpu = cpu.clone();
             sandbox
         }),
     }
@@ -278,6 +284,7 @@ async fn write_off(
     node_id: &str,
     arch: &str,
     hypervisor_version: &str,
+    cpu: &Option<common::CpuFingerprint>,
 ) -> burrow_store::Result<()> {
     loop {
         let Some(row) = store.get_placement(id).await? else {
@@ -294,6 +301,7 @@ async fn write_off(
                     &Change::Unplace {
                         arch: arch.to_string(),
                         hypervisor_version: hypervisor_version.to_string(),
+                        cpu: cpu.clone(),
                     },
                     Some(sandbox),
                 )

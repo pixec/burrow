@@ -4,6 +4,7 @@ use std::time::{Duration, Instant};
 
 use burrow_common::NodeId;
 use burrow_common::cpu::cpus_text;
+use burrow_common::hypervisor::Hypervisor;
 use burrow_proto::common::v1::{self as common, NodeInfo, NodeStatus};
 
 pub const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(5);
@@ -55,6 +56,9 @@ pub struct Placement {
     /// machine.
     pub arch: String,
     pub hypervisor_version: String,
+    /// The CPU saved memory was written on, when the sandbox restores some:
+    /// a node must be [`cpu_mismatch`]-free with it.
+    pub cpu: Option<common::CpuFingerprint>,
     /// The hypervisor the sandbox runs under: its template's, or its state's
     /// when it restores. Empty means any. Hard, because a node without it
     /// can only refuse the create.
@@ -139,6 +143,8 @@ pub enum PlacementError {
         hypervisor: String,
         version: String,
     },
+    #[error("no node can restore this state on its CPU: {0}")]
+    NoCompatibleCpu(String),
     #[error(
         "no healthy node offers {0}; start burrowd with --hypervisors including it on a node \
          that has its binary"
@@ -209,6 +215,56 @@ pub fn can_restore(info: &NodeInfo, arch: &str, hypervisor: &str, version: &str)
     (arch.is_empty() || info.arch == arch)
         && (version.is_empty() || version_of(info, hypervisor) == version)
         && offers(info, hypervisor)
+}
+
+/// How `have`, a node's CPU, falls short of restoring memory `hypervisor`
+/// saved on `want`, or `None` when it does not; see
+/// [`common::CpuFingerprint`] for the rule.
+pub fn cpu_mismatch(
+    want: &common::CpuFingerprint,
+    have: Option<&common::CpuFingerprint>,
+    hypervisor: &str,
+) -> Option<String> {
+    let Some(have) = have else {
+        return Some("reports no CPU fingerprint".into());
+    };
+    let mut differences = Vec::new();
+    if have.vendor != want.vendor {
+        differences.push(format!("has vendor {}, not {}", have.vendor, want.vendor));
+    }
+    if have.physical_address_bits != want.physical_address_bits {
+        differences.push(format!(
+            "has {}-bit physical addresses, not {}",
+            have.physical_address_bits, want.physical_address_bits
+        ));
+    }
+    let is_superset_enough =
+        hypervisor == Hypervisor::CloudHypervisor.as_str() && !want.vendor.starts_with("0x");
+    if !is_superset_enough && (have.family, have.model) != (want.family, want.model) {
+        differences.push(format!(
+            "is family {} model {}, not family {} model {}",
+            have.family, have.model, want.family, want.model
+        ));
+    }
+    let lacking: Vec<&str> = want
+        .features
+        .iter()
+        .filter(|f| !have.features.contains(f))
+        .map(String::as_str)
+        .collect();
+    if !lacking.is_empty() {
+        differences.push(format!("lacks {}", lacking.join(" ")));
+    }
+    let adding: Vec<&str> = have
+        .features
+        .iter()
+        .filter(|f| !want.features.contains(f))
+        .map(String::as_str)
+        .collect();
+    if !is_superset_enough && !adding.is_empty() {
+        differences.push(format!("adds {}", adding.join(" ")));
+    }
+    (!differences.is_empty()).then(|| differences.join(", "))
 }
 
 /// Whether a node can run sandboxes under `hypervisor`. A node that reports
@@ -915,7 +971,28 @@ impl NodeRegistry {
                 version: want.hypervisor_version.clone(),
             });
         }
-        let live = compatible;
+        let mut live = compatible;
+
+        if let Some(cpu) = &want.cpu {
+            let mismatches: Vec<_> = live
+                .iter()
+                .map(|e| cpu_mismatch(cpu, e.info.cpu.as_ref(), &want.hypervisor))
+                .collect();
+            if mismatches.iter().all(Option::is_some) {
+                let why = live
+                    .iter()
+                    .zip(mismatches)
+                    .map(|(e, why)| format!("node {} {}", e.info.id, why.unwrap_or_default()))
+                    .collect::<Vec<_>>()
+                    .join("; ");
+                return Err(PlacementError::NoCompatibleCpu(why));
+            }
+            live = live
+                .into_iter()
+                .zip(mismatches)
+                .filter_map(|(e, why)| why.is_none().then_some(e))
+                .collect();
+        }
 
         let offering: Vec<_> = live
             .iter()
@@ -1579,6 +1656,114 @@ mod tests {
             ..want
         });
         assert!(matches!(none, Err(PlacementError::NoCompatibleNode { .. })));
+    }
+
+    fn cpu(features: &[&str], address_bits: u32) -> common::CpuFingerprint {
+        common::CpuFingerprint {
+            vendor: "GenuineIntel".into(),
+            family: 6,
+            model: 0x55,
+            features: features.iter().map(|f| f.to_string()).collect(),
+            physical_address_bits: address_bits,
+        }
+    }
+
+    /// Cloud Hypervisor restores where every feature the guest may use is
+    /// offered, and checks so itself; Firecracker does not check, so it is
+    /// held to the same CPU. Device memory is laid out under the address
+    /// width, so neither restores at another.
+    #[test]
+    fn saved_memory_restores_only_on_a_compatible_cpu() {
+        let ch = "cloud-hypervisor";
+        let fc = "firecracker";
+        let modern = cpu(&["avx", "avx2", "avx512f"], 46);
+        let legacy = cpu(&["avx"], 46);
+        assert_eq!(cpu_mismatch(&legacy, Some(&modern), ch), None);
+        assert_eq!(
+            cpu_mismatch(&modern, Some(&legacy), ch).as_deref(),
+            Some("lacks avx2 avx512f")
+        );
+        assert_eq!(
+            cpu_mismatch(&legacy, Some(&modern), fc).as_deref(),
+            Some("adds avx2 avx512f")
+        );
+        assert_eq!(cpu_mismatch(&modern, Some(&modern), fc), None);
+        assert_eq!(
+            cpu_mismatch(&cpu(&["avx"], 44), Some(&legacy), ch).as_deref(),
+            Some("has 46-bit physical addresses, not 44")
+        );
+        let amd = common::CpuFingerprint {
+            vendor: "AuthenticAMD".into(),
+            ..modern.clone()
+        };
+        assert!(
+            cpu_mismatch(&legacy, Some(&amd), ch)
+                .unwrap()
+                .contains("vendor")
+        );
+        let arm = common::CpuFingerprint {
+            vendor: "0x41".into(),
+            ..legacy.clone()
+        };
+        let newer_arm = common::CpuFingerprint {
+            model: 0xd40,
+            ..arm.clone()
+        };
+        assert!(
+            cpu_mismatch(&arm, Some(&newer_arm), ch)
+                .unwrap()
+                .contains("model")
+        );
+        assert_eq!(
+            cpu_mismatch(&legacy, None, ch).as_deref(),
+            Some("reports no CPU fingerprint")
+        );
+    }
+
+    #[test]
+    fn a_memory_restore_is_placed_only_on_a_compatible_cpu() {
+        let registry = registry(&[("a", status(&[], &[], 9999)), ("b", status(&[], &[], 1000))]);
+        for (id, fingerprint) in [("a", cpu(&["avx"], 44)), ("b", cpu(&["avx", "avx2"], 46))] {
+            registry.heartbeat(
+                id,
+                status(&[], &[], if id == "a" { 9999 } else { 1000 }),
+                Some(NodeInfo {
+                    id: id.into(),
+                    address: format!("{id}:7071"),
+                    hypervisors: vec!["cloud-hypervisor".into()],
+                    cpu: Some(fingerprint),
+                    ..Default::default()
+                }),
+            );
+        }
+        let want = Placement {
+            hypervisor: "cloud-hypervisor".into(),
+            cpu: Some(cpu(&["avx"], 46)),
+            vcpus: 1,
+            mem_mib: 1,
+            ..Default::default()
+        };
+        assert_eq!(registry.place_for(&want).unwrap(), "b");
+        let err = registry
+            .place_for(&Placement {
+                cpu: Some(cpu(&["avx", "avx512f"], 46)),
+                ..want.clone()
+            })
+            .unwrap_err();
+        assert!(matches!(err, PlacementError::NoCompatibleCpu(_)), "{err}");
+        assert!(err.to_string().contains("node b lacks avx512f"), "{err}");
+        assert!(
+            err.to_string()
+                .contains("node a has 44-bit physical addresses, not 46"),
+            "{err}"
+        );
+        // A disk boot asks for no CPU.
+        assert_eq!(
+            registry
+                .place_for(&Placement { cpu: None, ..want })
+                .unwrap(),
+            "a"
+        );
     }
 
     /// Cloud Hypervisor state names Cloud Hypervisor's version. Compared with

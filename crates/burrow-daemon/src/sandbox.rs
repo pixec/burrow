@@ -1142,10 +1142,13 @@ impl RunningSandbox {
         record.is_durable = self.durable.is_current();
         record.checkpoint_at_unix_ms = 0;
         record.checkpoint_kind = common::CheckpointKind::Unspecified as i32;
+        record.cpu = None;
         if let Some(stored) = self.durable.stored.lock().unwrap().as_ref() {
+            let cpu = stored.manifest.cpu.fingerprint();
             if record.is_durable {
                 record.arch = stored.manifest.arch.clone();
                 record.hypervisor_version = stored.manifest.hypervisor_version.clone();
+                record.cpu = cpu.clone();
             }
             let kind = match stored.manifest.checkpoint.as_str() {
                 crate::durable::CHECKPOINT_DISK => common::CheckpointKind::Disk,
@@ -1160,6 +1163,7 @@ impl RunningSandbox {
                 record.checkpoint_kind = kind as i32;
                 record.arch = stored.manifest.arch.clone();
                 record.hypervisor_version = stored.manifest.hypervisor_version.clone();
+                record.cpu = cpu;
             }
         }
         record
@@ -8821,6 +8825,7 @@ impl SandboxManager {
             arch: std::env::consts::ARCH.to_string(),
             hypervisor_version: self.config.version(sandbox.hypervisor).to_string(),
             hypervisor: sandbox.hypervisor.to_string(),
+            cpu: crate::cpuid::host().clone(),
             kernel_digest: String::new(),
             rootfs_digest: String::new(),
             cpu_usage_usec: record.cpu_usage_usec,

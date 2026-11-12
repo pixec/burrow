@@ -656,6 +656,7 @@ fn local_node_info(args: &ServeArgs) -> anyhow::Result<NodeInfo> {
         hypervisors: Vec::new(),
         hypervisor_versions: Default::default(),
         vmm_memory_overhead_mib: Default::default(),
+        cpu: None,
         // Filled in once the inspection authority is loaded.
         inspection_root_fingerprint: String::new(),
         inspection_ca_expires_at_unix_ms: 0,
@@ -1436,6 +1437,7 @@ pub async fn run(args: ServeArgs) -> anyhow::Result<()> {
         })
         .collect();
     node_info.hypervisors = hypervisors.iter().map(|h| h.to_string()).collect();
+    node_info.cpu = crate::cpuid::host().fingerprint();
     node_info.hypervisor_versions = hypervisors
         .iter()
         .map(|h| {

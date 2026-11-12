@@ -550,6 +550,10 @@ message Sandbox {
   reserved 22, 23;
   reserved "firecracker_version", "access_revoked_at";
   string hypervisor_version = 29;
+  // The CPU its saved memory was written on, while it has some: its latest
+  // suspend or memory checkpoint. That state restores only on a node whose
+  // CPU is compatible; see `CpuFingerprint`.
+  CpuFingerprint cpu = 37;
   // The hypervisor running it, its template's: "firecracker",
   // "cloud-hypervisor" or "vz".
   // Fixed for its life: snapshots, warm pools and moves stay within one.
@@ -762,6 +766,8 @@ message Snapshot {
   // inspected create from it is placed only on a node with the same root.
   string inspection_root_fingerprint = 15;
   string hypervisor_version = 16;
+  // The CPU it was taken on. It restores only on a compatible one.
+  CpuFingerprint cpu = 21;
   // The machine the snapshot was taken on. A restore takes its configuration
   // from the snapshot, so a create from it cannot ask for a different shape.
   ResourcePolicy resources = 17;
@@ -834,6 +840,32 @@ message NodeInfo {
   // guest, this, and the page tables over the guest, and placement charges
   // the node exactly that.
   map<string, uint32> vmm_memory_overhead_mib = 24;
+  // The CPU this node's guests see. Saved memory restores here only when
+  // it was written on a compatible one.
+  CpuFingerprint cpu = 25;
+}
+
+// What restoring a guest's saved memory needs of the CPU under it. A guest
+// keeps the CPUID it booted with, so under Cloud Hypervisor on x86_64 its
+// state restores where the vendor and address width are the same and every
+// feature it may use is offered, which Cloud Hypervisor checks itself.
+// Firecracker, which does not check, and aarch64 restore only on the same
+// CPU exactly.
+message CpuFingerprint {
+  // The CPUID vendor, e.g. "GenuineIntel", or on aarch64 the MIDR
+  // implementer, e.g. "0x41".
+  string vendor = 1;
+  // The CPUID family and model, or on aarch64 the MIDR variant and part.
+  uint32 family = 2;
+  uint32 model = 3;
+  // The features KVM can give a guest, sorted: names such as "avx2" where
+  // there is one, and "cpuid.<leaf>.<subleaf>.<register>.<bit>" otherwise.
+  // On aarch64, the hwcaps in /proc/cpuinfo.
+  repeated string features = 4;
+  // The guest physical address width: CPUID 0x80000008 on x86_64, the
+  // largest IPA KVM offers on aarch64. Device memory is laid out under it,
+  // so saved state restores only at the same width.
+  uint32 physical_address_bits = 5;
 }
 
 // Whether a sparse file's extents on a node's data directory are exactly the

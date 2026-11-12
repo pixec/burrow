@@ -929,6 +929,7 @@ impl ApiService {
                     template: String::new(),
                     arch: snapshot.arch.clone(),
                     hypervisor_version: snapshot.hypervisor_version.clone(),
+                    cpu: snapshot.cpu.clone(),
                     hypervisor: recorded_hypervisor(&snapshot.hypervisor),
                     disk_bytes: crate::registry::disk_bytes(snapshot.resources.as_ref()),
                     // A sandbox taking the snapshot's own policy carries
@@ -1142,7 +1143,15 @@ impl ApiService {
             &want.hypervisor,
             &want.hypervisor_version,
         ) {
-            return Ok(());
+            return match want.cpu.as_ref().and_then(|cpu| {
+                crate::registry::cpu_mismatch(cpu, info.cpu.as_ref(), &want.hypervisor)
+            }) {
+                Some(why) => Err(Status::failed_precondition(format!(
+                    "node {node_id} cannot restore sandbox {sandbox_id}'s memory on its CPU: it \
+                     {why}"
+                ))),
+                None => Ok(()),
+            };
         }
         Err(Status::failed_precondition(format!(
             "node {node_id} cannot restore sandbox {sandbox_id}: its state needs {} and {} {}, \
@@ -1448,6 +1457,12 @@ impl ApiService {
                 true => String::new(),
                 false => sandbox.hypervisor_version.clone(),
             },
+            // A stopped sandbox is booted from its disk too.
+            cpu: sandbox.cpu.clone().filter(|_| {
+                sandbox.state != common::SandboxState::Stopped as i32
+                    && !(sandbox.checkpoint_at_unix_ms > 0
+                        && sandbox.checkpoint_kind == common::CheckpointKind::Disk as i32)
+            }),
             hypervisor: recorded_hypervisor(&sandbox.hypervisor),
             policy_features: with_disk_layout(
                 crate::registry::policy_features(
@@ -1775,6 +1790,7 @@ impl Burrow for ApiService {
             node_labels: req.node_labels,
             arch: String::new(),
             hypervisor_version: String::new(),
+            cpu: None,
             // The template decides, and the node holding it can say which.
             hypervisor: self.template_hypervisor(&template).await?,
             policy_features: crate::registry::policy_features(
@@ -2460,12 +2476,14 @@ impl Burrow for ApiService {
             }
         }
         self.require_unpinned(&id).await?;
+        let info = self.0.nodes.info(&source).unwrap_or_default();
         if current.arch.is_empty() {
-            let info = self.0.nodes.info(&source).unwrap_or_default();
             current.hypervisor_version =
                 crate::registry::version_of(&info, &current.hypervisor).to_string();
-            current.arch = info.arch;
+            current.arch = info.arch.clone();
         }
+        // The move suspends it here, so its memory is written on this CPU.
+        current.cpu = info.cpu;
         // The destination is chosen before anything is suspended, so a move
         // that has nowhere to go leaves the sandbox running where it is.
         let subject = format!("sandbox {id}");
@@ -2530,6 +2548,7 @@ impl Burrow for ApiService {
         if released.arch.is_empty() {
             released.arch = current.arch;
             released.hypervisor_version = current.hypervisor_version;
+            released.cpu = current.cpu;
         }
         tracing::info!(sandbox = id, node = source, "sandbox released for a move");
         let moved = match self
@@ -2708,6 +2727,7 @@ impl Burrow for ApiService {
             node_labels: req.node_labels.clone(),
             arch: String::new(),
             hypervisor_version: String::new(),
+            cpu: None,
             hypervisor: String::new(),
             policy_features: Vec::new(),
         };
@@ -3681,7 +3701,8 @@ pub(crate) fn placement_status(err: crate::registry::PlacementError) -> Status {
         | crate::registry::PlacementError::NoNodeWithLabels(_)
         | crate::registry::PlacementError::NoNodeWithHypervisor(_)
         | crate::registry::PlacementError::NoNodeWithPolicyFeatures(_)
-        | crate::registry::PlacementError::NoCompatibleNode { .. } => {
+        | crate::registry::PlacementError::NoCompatibleNode { .. }
+        | crate::registry::PlacementError::NoCompatibleCpu(_) => {
             Status::failed_precondition(err.to_string())
         }
         other => Status::not_found(other.to_string()),
@@ -4238,6 +4259,66 @@ mod tests {
         delete().await.unwrap();
         assert!(api.0.sandboxes.is_tombstoned("sbx_a"));
         assert!(api.0.sandboxes.get("sbx_a").is_none());
+    }
+
+    /// A move whose memory the target's CPU cannot restore is refused before
+    /// the source suspends it, naming the difference. Stopped, it boots from
+    /// its disk and is not held to the CPU.
+    #[tokio::test]
+    async fn a_move_is_refused_before_suspending_to_an_incompatible_cpu() {
+        let api = replica(crate::sandboxes::SandboxRegistry::default());
+        let fingerprint = |features: &[&str]| common::CpuFingerprint {
+            vendor: "GenuineIntel".into(),
+            family: 6,
+            model: 0x55,
+            features: features.iter().map(|f| f.to_string()).collect(),
+            physical_address_bits: 46,
+        };
+        for (id, features) in [("node1", &["avx", "avx2"][..]), ("node2", &["avx"][..])] {
+            let info = common::NodeInfo {
+                id: id.into(),
+                address: format!("{id}:7071"),
+                hypervisors: vec!["cloud-hypervisor".into()],
+                cpu: Some(fingerprint(features)),
+                ..Default::default()
+            };
+            api.0
+                .nodes
+                .register(info, String::new(), String::new(), None)
+                .unwrap();
+        }
+        let running = common::Sandbox {
+            hypervisor: "cloud-hypervisor".into(),
+            ..sandbox_a("node1")
+        };
+        api.0.sandboxes.insert(running.clone());
+        let move_to_node2 = || {
+            api.move_sandbox(Request::new(api::MoveSandboxRequest {
+                sandbox_id: "sbx_a".into(),
+                node_id: "node2".into(),
+                ..Default::default()
+            }))
+        };
+
+        let err = move_to_node2().await.unwrap_err();
+        assert_eq!(err.code(), tonic::Code::FailedPrecondition, "{err}");
+        assert!(err.message().contains("lacks avx2"), "{err}");
+        let err = api
+            .move_sandbox(Request::new(api::MoveSandboxRequest {
+                sandbox_id: "sbx_a".into(),
+                ..Default::default()
+            }))
+            .await
+            .unwrap_err();
+        assert_eq!(err.code(), tonic::Code::FailedPrecondition, "{err}");
+        assert!(err.message().contains("node node2 lacks avx2"), "{err}");
+
+        api.0.sandboxes.update(common::Sandbox {
+            state: common::SandboxState::Stopped as i32,
+            ..running
+        });
+        let err = move_to_node2().await.unwrap_err();
+        assert_ne!(err.code(), tonic::Code::FailedPrecondition, "{err}");
     }
 
     /// Two starts of one unplaced sandbox through two replicas: the second

@@ -124,6 +124,9 @@ pub struct Manifest {
     /// a manifest from before there was a choice, which was Firecracker.
     #[serde(default)]
     pub hypervisor: String,
+    /// The CPU it was taken on; see [`crate::cpuid`].
+    #[serde(default)]
+    pub cpu: crate::cpuid::Cpu,
     /// Set once every object is in the store and the remote manifest is
     /// written, so a half-finished upload never reads as restorable.
     pub is_durable: bool,
@@ -188,6 +191,7 @@ impl Manifest {
             is_durable: self.is_durable,
             arch: self.arch.clone(),
             hypervisor_version: self.hypervisor_version.clone(),
+            cpu: self.cpu.fingerprint(),
             hypervisor: self
                 .hypervisor()
                 .map_or_else(|_| self.hypervisor.clone(), |h| h.to_string()),
@@ -428,6 +432,7 @@ impl SnapshotStore {
                 .cloned()
                 .unwrap_or_default(),
             hypervisor: staged.hypervisor.to_string(),
+            cpu: crate::cpuid::host().clone(),
             is_durable: false,
             kernel_digest: String::new(),
             rootfs_digest: String::new(),
@@ -1400,6 +1405,7 @@ mod tests {
             arch: String::new(),
             hypervisor_version: String::new(),
             hypervisor: String::new(),
+            cpu: Default::default(),
             is_durable: false,
             kernel_digest: String::new(),
             rootfs_digest: String::new(),

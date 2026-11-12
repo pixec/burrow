@@ -701,7 +701,8 @@ impl SandboxRegistry {
     /// exception. It does not need the node, so it is kept unplaced, with its
     /// name, for the next start to place on a node that can restore it. `info`
     /// is the dead node's, whose architecture and hypervisor version are
-    /// stamped on a record that does not carry its own. One holding public
+    /// stamped on a record that does not carry its own, and whose CPU, which
+    /// wrote the saved memory, on every one. One holding public
     /// addresses is kept unplaced too, but only its own node can take it
     /// back: the addresses reach nowhere else.
     pub fn forget_node(
@@ -724,6 +725,7 @@ impl SandboxRegistry {
                     sandbox.hypervisor_version =
                         crate::registry::version_of(info, &sandbox.hypervisor).to_string();
                 }
+                sandbox.cpu = info.cpu.clone();
                 unplaced.push(sandbox.clone());
                 return true;
             }
@@ -739,6 +741,7 @@ impl SandboxRegistry {
                 arch: info.arch.clone(),
                 hypervisor_version: crate::registry::version_of(info, &sandbox.hypervisor)
                     .to_string(),
+                cpu: info.cpu.clone(),
             });
             self.write(crate::persist::Op::ReleaseClaimsUnlessMoved {
                 sandbox_id: sandbox.id.clone(),
@@ -792,6 +795,7 @@ impl SandboxRegistry {
             Change::Unplace {
                 arch: sandbox.arch.clone(),
                 hypervisor_version: sandbox.hypervisor_version.clone(),
+                cpu: sandbox.cpu.clone(),
             },
         );
         let sandbox = common::Sandbox {
@@ -1798,6 +1802,10 @@ mod tests {
             &common::NodeInfo {
                 arch: "x86_64".into(),
                 hypervisor_versions: [("firecracker".to_string(), "1.16.1".to_string())].into(),
+                cpu: Some(common::CpuFingerprint {
+                    vendor: "GenuineIntel".into(),
+                    ..Default::default()
+                }),
                 ..Default::default()
             },
         );
@@ -1809,6 +1817,7 @@ mod tests {
             (kept.arch.as_str(), kept.hypervisor_version.as_str()),
             ("x86_64", "1.16.1")
         );
+        assert_eq!(kept.cpu.unwrap().vendor, "GenuineIntel");
         assert!(registry.reserve("", "web").is_err(), "the name stays held");
         assert!(registry.get("b").is_none());
         assert!(registry.get("c").is_none());

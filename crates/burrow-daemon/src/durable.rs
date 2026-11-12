@@ -119,6 +119,9 @@ pub struct Manifest {
     /// in a manifest from before there was a choice, which was Firecracker.
     #[serde(default)]
     pub hypervisor: String,
+    /// The CPU the state was written on; see [`crate::cpuid`].
+    #[serde(default)]
+    pub cpu: crate::cpuid::Cpu,
     pub kernel_digest: String,
     /// The template's image. On the root layout the disk's index is a diff
     /// against it, by chunk, and it is in the store under `images/`.
@@ -1274,6 +1277,7 @@ mod tests {
             arch: "aarch64".into(),
             hypervisor_version: "1".into(),
             hypervisor: "firecracker".into(),
+            cpu: Default::default(),
             kernel_digest: String::new(),
             rootfs_digest: String::new(),
             cpu_usage_usec: 0,

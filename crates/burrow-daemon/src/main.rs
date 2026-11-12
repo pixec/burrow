@@ -7,6 +7,7 @@ mod blobs;
 mod ca;
 mod chunks;
 mod cmdlogs;
+mod cpuid;
 mod delivery;
 mod devvm;
 mod diskcap;
