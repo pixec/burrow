@@ -5414,6 +5414,64 @@ impl SandboxManager {
             .map(Some)
     }
 
+    /// Discards `template`'s snapshot of `shape` under `hypervisor` if it is
+    /// there with a file gone, and builds it again. Left in place it would
+    /// send every create of its shape to a cold boot until the node
+    /// restarted, since the attempt that built it is still recorded.
+    async fn rebuild_if_broken(
+        &self,
+        template: &str,
+        hypervisor: Hypervisor,
+        shape: crate::warm::Shape,
+    ) {
+        let templates_dir = self.config.templates_dir();
+        let Some(dir) = crate::warm::find_broken(&templates_dir, template, hypervisor, shape).await
+        else {
+            return;
+        };
+        match crate::warm::discard_broken(&dir).await {
+            Ok(true) => {}
+            Ok(false) => return,
+            Err(err) => {
+                tracing::warn!(template, %err, "could not discard a broken warm snapshot");
+                return;
+            }
+        }
+        tracing::warn!(
+            template,
+            vcpus = shape.vcpus,
+            mem_mib = shape.mem_mib,
+            "discarded a warm snapshot with a file gone; rebuilding it"
+        );
+        self.forget_warm(&ShapeKey {
+            template: template.to_string(),
+            vcpus: shape.vcpus,
+            mem_mib: shape.mem_mib,
+        });
+        self.warm_in_background(
+            template.to_string(),
+            common::ResourcePolicy {
+                vcpus: shape.vcpus,
+                mem_mib: shape.mem_mib,
+                ..Default::default()
+            },
+        );
+    }
+
+    fn rebuild_in_background_if_broken(
+        &self,
+        template: &str,
+        hypervisor: Hypervisor,
+        shape: crate::warm::Shape,
+    ) {
+        let (manager, template) = (self.clone(), template.to_string());
+        tokio::spawn(async move {
+            manager
+                .rebuild_if_broken(&template, hypervisor, shape)
+                .await
+        });
+    }
+
     fn forget_warm(&self, key: &ShapeKey) {
         if let Some(shapes) = self.warm_shapes.lock().unwrap().get_mut(&key.template) {
             shapes.forget(key);
@@ -6338,23 +6396,24 @@ impl SandboxManager {
         // disk grown, where the guest's disk can grow live; one with a larger
         // disk cannot be shrunk under the guest, so that create boots.
         let wanted = crate::warm::Shape::wanted(&resources);
-        let warm = if seed_disk.is_none()
+        let is_warmable = seed_disk.is_none()
             && capabilities.is_warm_pool_supported
             && (capabilities.is_drive_hotplug_supported
                 || crate::volume::block_mounts(&policy.volumes)
                     .next()
-                    .is_none())
-        {
-            crate::warm::find(&templates_dir, &template, hypervisor, wanted)
-                .await
-                .filter(|warm| {
-                    warm.shape.disk_mib == wanted.disk_mib
-                        || (warm.shape.disk_mib < wanted.disk_mib
-                            && capabilities.is_live_disk_growth_supported)
-                })
-        } else {
-            None
+                    .is_none());
+        let found = match is_warmable {
+            true => crate::warm::find(&templates_dir, &template, hypervisor, wanted).await,
+            false => None,
         };
+        if is_warmable && found.is_none() {
+            self.rebuild_in_background_if_broken(&template, hypervisor, wanted);
+        }
+        let warm = found.filter(|warm| {
+            warm.shape.disk_mib == wanted.disk_mib
+                || (warm.shape.disk_mib < wanted.disk_mib
+                    && capabilities.is_live_disk_growth_supported)
+        });
         let from_warm = warm.is_some();
         let warm_check_ms = began.elapsed();
 
@@ -6380,10 +6439,10 @@ impl SandboxManager {
         // so they run together rather than one after the other.
         let stage = async {
             let staging_began = std::time::Instant::now();
-            // May come back false: the warm directory is rebuilt in place, so
-            // a create landing in that window finds pieces of it missing. A
-            // cold boot is slower, not wrong, and is a far better answer than
-            // failing a create because of a race with a rebuild.
+            // May come back false: a snapshot swapped out or evicted since it
+            // was found, or one with a file gone, which is rebuilt. A cold
+            // boot is slower, not wrong, and is a far better answer than
+            // failing the create.
             let mut is_warm = from_warm;
             if let Some(snapshot) = &warm
                 && let Err(err) =
@@ -6397,6 +6456,7 @@ impl SandboxManager {
                     template = %template, %err,
                     "warm snapshot is not there to stage; booting cold"
                 );
+                self.rebuild_in_background_if_broken(&template, hypervisor, wanted);
                 is_warm = false;
             }
             if crate::macnode::is_macos(guest_os) {
@@ -10281,6 +10341,39 @@ pub(crate) mod tests {
         let key = attempts.first().expect("an attempt was recorded");
         assert_eq!((key.vcpus, key.mem_mib), (4, 2048));
         assert_eq!(key.template, "app");
+    }
+
+    /// A snapshot with a file gone used to stay, its shape still recorded as
+    /// attempted, so every create of it booted cold until a restart. It
+    /// goes, and its shape is built again.
+    #[tokio::test]
+    async fn a_broken_warm_snapshot_is_discarded_and_rebuilt() {
+        let manager = manager().await;
+        let dir = crate::warm::warm_dir(&manager.config.templates_dir(), "app")
+            .join("firecracker-2x2048");
+        tokio::fs::create_dir_all(&dir).await.unwrap();
+        let layout = Hypervisor::Firecracker.layout();
+        for file in layout.files() {
+            tokio::fs::write(dir.join(file), b"x").await.unwrap();
+        }
+        for (file, text) in [
+            ("hypervisor", "firecracker"),
+            ("shape", "2 2048 1324"),
+            ("format", "6"),
+        ] {
+            tokio::fs::write(dir.join(file), text).await.unwrap();
+        }
+
+        let wanted = crate::warm::Shape::wanted(&shape(2, 2048));
+        manager
+            .rebuild_if_broken("app", Hypervisor::Firecracker, wanted)
+            .await;
+
+        assert!(!tokio::fs::try_exists(&dir).await.unwrap());
+        assert_eq!(
+            attempted(&manager),
+            vec![ShapeKey::of("app", &shape(2, 2048))]
+        );
     }
 
     /// An evicted shape, and one the node declined to build, are given back

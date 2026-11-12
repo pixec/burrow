@@ -388,6 +388,33 @@ pub async fn find(
         .filter(|warm| warm.hypervisor == hypervisor && warm.shape.is_machine(wanted))
 }
 
+/// Where `template`'s snapshot of `wanted` under `hypervisor` is, when it is
+/// there but does not read back: a file of it gone.
+pub async fn find_broken(
+    templates_dir: &Path,
+    template: &str,
+    hypervisor: Hypervisor,
+    wanted: Shape,
+) -> Option<PathBuf> {
+    let dir = warm_dir(templates_dir, template).join(wanted.dir_name(hypervisor));
+    is_broken(&dir).await.then_some(dir)
+}
+
+async fn is_broken(dir: &Path) -> bool {
+    tokio::fs::try_exists(dir).await.unwrap_or(false) && read_warm(dir).await.is_none()
+}
+
+/// Removes the snapshot in `dir` if it is still broken once no build is
+/// swapping it, and says whether it did.
+pub async fn discard_broken(dir: &Path) -> std::io::Result<bool> {
+    let _no_builds = WARM_BUILD_LOCK.lock().await;
+    if !is_broken(dir).await {
+        return Ok(false);
+    }
+    tokio::fs::remove_dir_all(dir).await?;
+    Ok(true)
+}
+
 /// Every usable warm snapshot of `template`.
 pub async fn list(templates_dir: &Path, template: &str) -> Vec<Warm> {
     let mut out = Vec::new();
@@ -1227,6 +1254,41 @@ mod shape_tests {
         );
         assert_eq!(list(&templates, "app").await.len(), 2);
         assert!(stale(&templates, "app").await.is_empty());
+        let _ = std::fs::remove_dir_all(&templates);
+    }
+
+    /// A snapshot with a file gone is broken and discarded, but not once a
+    /// build has swapped a whole one in for it.
+    #[tokio::test]
+    async fn only_a_snapshot_still_broken_is_discarded() {
+        let templates = temp("broken");
+        let wanted = parse_shape("2x2048").unwrap();
+        let live = warm_dir(&templates, "app").join("firecracker-2x2048");
+        write_snapshot(&live, WARM_FORMAT, "2 2048 1324");
+        assert!(
+            find_broken(&templates, "app", Hypervisor::Firecracker, wanted)
+                .await
+                .is_none()
+        );
+
+        std::fs::remove_file(live.join(ROOT_DISK)).unwrap();
+        assert!(
+            find(&templates, "app", Hypervisor::Firecracker, wanted)
+                .await
+                .is_none()
+        );
+        let broken = find_broken(&templates, "app", Hypervisor::Firecracker, wanted)
+            .await
+            .unwrap();
+        assert_eq!(broken, live);
+
+        write_snapshot(&live, WARM_FORMAT, "2 2048 1324");
+        assert!(!discard_broken(&broken).await.unwrap());
+        assert!(live.exists());
+
+        std::fs::remove_file(live.join(ROOT_DISK)).unwrap();
+        assert!(discard_broken(&broken).await.unwrap());
+        assert!(!live.exists());
         let _ = std::fs::remove_dir_all(&templates);
     }
 
