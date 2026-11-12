@@ -701,6 +701,7 @@ async fn reap_dead_nodes(state: Arc<OrchestratorState>, expiry: Option<std::time
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     let args = Args::parse();
+    burrow_common::banner::print(env!("CARGO_PKG_VERSION"));
     let telemetry =
         burrow_common::telemetry::init("burrow-orchestrator", args.otlp_endpoint.as_deref());
     let result = run(args).await;

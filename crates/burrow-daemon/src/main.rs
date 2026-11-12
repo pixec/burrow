@@ -85,6 +85,9 @@ fn main() -> anyhow::Result<()> {
 
 async fn daemon() -> anyhow::Result<()> {
     let args = Args::parse();
+    if matches!(args.command, Command::Serve(_)) {
+        burrow_common::banner::print(env!("CARGO_PKG_VERSION"));
+    }
     let mut telemetry = burrow_common::telemetry::init(
         "burrowd",
         match &args.command {
