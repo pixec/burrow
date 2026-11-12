@@ -133,8 +133,14 @@ fn device_bytes() -> std::io::Result<u64> {
         .map_err(std::io::Error::other)
 }
 
-/// Grows an ext4 root to fill its device, online. The kernel does nothing for
-/// one that already fills it, and a root that is not ext4 is left alone.
+/// The device size the root was last grown to. Kept across a snapshot, so a
+/// restored guest whose disk did not change skips the resize.
+static GROWN: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Grows an ext4 root to fill its device, online. A root that is not ext4 is
+/// left alone, and so is one already grown to this device's size: the kernel
+/// changes nothing for a root that fills its device, but still flushes the
+/// whole journal to disk, which is most of a handshake.
 ///
 /// `expected` is the device size the host set. The guest hears of it through
 /// a config interrupt handled on a workqueue, so the call that follows the
@@ -155,10 +161,14 @@ pub fn grow(expected: u64) -> std::io::Result<()> {
         std::thread::sleep(std::time::Duration::from_millis(20));
         device = device_bytes()?;
     }
+    if GROWN.load(std::sync::atomic::Ordering::Relaxed) == device {
+        return Ok(());
+    }
     let blocks = device / block;
     let root = root()?;
     // SAFETY: the descriptor is open and `blocks` lives across the call.
     unsafe { ext4_resize_fs(root.as_raw_fd(), &blocks) }?;
+    GROWN.store(device, std::sync::atomic::Ordering::Relaxed);
     Ok(())
 }
 
