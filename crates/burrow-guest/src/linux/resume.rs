@@ -115,8 +115,7 @@ pub fn install_inspection_ca(
     //
     // Cheap where it matters most. A warm snapshot is taken of a guest that
     // has already been through here, and guest *memory* is captured by the
-    // snapshot alongside the scratch disk holding the overlay these bundles
-    // live in, so a restored clone inherits the note and the files it
+    // snapshot alongside the root disk these bundles live on, so a restored clone inherits the note and the files it
     // describes together, or neither. That makes the trust store the one piece
     // of handshake work a create does not have to repeat.
     if is_installed_already(pem, extra) {
@@ -346,11 +345,11 @@ fn is_carrying(haystack: &[u8], needle: &[u8]) -> bool {
 /// truncated trust store, and that is `rename(2)`'s doing, not `fsync`'s: every
 /// open gets either the whole old file or the whole new one. There is nothing
 /// here for durability to protect, because this file lives on the sandbox's own
-/// scratch overlay, which exists only while its guest does. A suspend does
+/// root disk, which exists only while its guest does. A suspend does
 /// outlive a running guest, and it captures guest memory, page cache included,
 /// alongside the disk.
 ///
-/// On an ext4 overlay under nested virtualisation, the `fsync` was 100-140 ms
+/// On ext4 under nested virtualisation, the `fsync` was 100-140 ms
 /// of a warm create, for a 648-byte certificate.
 fn write_atomically(path: &std::path::Path, contents: &[u8]) -> std::io::Result<()> {
     use std::io::Write as _;

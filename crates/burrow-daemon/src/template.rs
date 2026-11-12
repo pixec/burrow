@@ -1126,7 +1126,7 @@ pub mod distribute {
     }
 }
 
-/// Snapshots the build sandbox's scratch disk as the layer for `steps`.
+/// Snapshots the build sandbox's root disk as the layer for `steps`.
 ///
 /// The disk is captured frozen, as the finished image is: a seed has to be a
 /// filesystem a guest can boot on its own, not one that needed the build's
@@ -1175,7 +1175,6 @@ pub mod layers {
     /// Bumped when the meaning of a key changes: a cached layer from an older
     /// scheme is unrelated rather than wrong, and reusing it would produce an
     /// image nobody asked for.
-    /// 2 is a whole root disk where 1 was an overlay's scratch disk.
     const KEY_VERSION: &str = "burrow-layer-v2";
 
     fn index_dir(data_dir: &Path) -> PathBuf {
@@ -1532,9 +1531,8 @@ pub mod from_image {
     /// Directories the guest needs that an image will not contain.
     ///
     /// The root is mounted read-only and the agent cannot create them itself,
-    /// so they have to exist in the image. `/scratch` in particular is where
-    /// the writable overlay is assembled.
-    const REQUIRED_DIRS: [&str; 7] = ["proc", "sys", "dev", "tmp", "run", "scratch", "usr/bin"];
+    /// so they have to exist in the image.
+    const REQUIRED_DIRS: [&str; 6] = ["proc", "sys", "dev", "tmp", "run", "usr/bin"];
 
     /// Pulls an image, converts it, and publishes it as a template.
     ///

@@ -42,7 +42,7 @@ pub struct Placement {
     pub cpuset_cpus: String,
     pub blkio_weight: u32,
     pub mem_mib: u64,
-    /// The disk it is promised, in bytes: its scratch disk. Checked against
+    /// The disk it is promised, in bytes: its root disk. Checked against
     /// what the node reports with the node's own rule
     /// ([`burrow_common::disk`]), so a node is not chosen only to refuse.
     pub disk_bytes: u64,
@@ -1953,12 +1953,7 @@ mod tests {
             features::ALL
                 .iter()
                 .copied()
-                .filter(|f| {
-                    !matches!(
-                        *f,
-                        features::PUBLIC_IPS | features::ROOT_DISK | features::UPDATE_RESOURCES
-                    )
-                })
+                .filter(|f| { !matches!(*f, features::PUBLIC_IPS | features::UPDATE_RESOURCES) })
                 .collect::<Vec<_>>()
         );
         let want = Placement {

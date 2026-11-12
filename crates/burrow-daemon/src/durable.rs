@@ -5,8 +5,7 @@
 //! a blob. A root disk is stored as a chunk index naming its image, whose own
 //! chunks are stored once for every disk cloned from it: only the chunks the
 //! guest changed are sent, and a node adopting the sandbox clones its own copy
-//! of the image and fetches only those. An overlay sandbox's rootfs goes as a
-//! blob and its scratch disk as chunks. A manifest written last names the
+//! of the image and fetches only those. A manifest written last names the
 //! generation that is complete. Another node can then adopt the sandbox: fetch
 //! the small parts, start the VM, and take memory as the guest faults on it.
 //!
@@ -45,7 +44,7 @@
 //! ```
 //!
 //! `<state>` and `<memory>` are the sandbox's hypervisor's [`burrow_vmm::Layout`],
-//! and `<disk>` is `root.ext4` or, on the overlay layout, `scratch.ext4`.
+//! and `<disk>` is `root.ext4`.
 
 #![allow(clippy::result_large_err)]
 
@@ -107,10 +106,6 @@ pub struct Manifest {
     pub boot_mem_mib: u32,
     #[serde(default)]
     pub max_mem_mib: u32,
-    /// [`crate::rootdisk::DiskLayout`]; empty in a manifest from before root
-    /// disks, which was the overlay.
-    #[serde(default)]
-    pub disk_layout: String,
     pub is_systemd: bool,
     pub arch: String,
     /// The version of `hypervisor` that wrote the state.
@@ -123,8 +118,8 @@ pub struct Manifest {
     #[serde(default)]
     pub cpu: crate::cpuid::Cpu,
     pub kernel_digest: String,
-    /// The template's image. On the root layout the disk's index is a diff
-    /// against it, by chunk, and it is in the store under `images/`.
+    /// The template's image. The disk's index is a diff against it, by
+    /// chunk, and it is in the store under `images/`.
     pub rootfs_digest: String,
     pub cpu_usage_usec: u64,
     pub rx_bytes: u64,
@@ -189,10 +184,6 @@ impl Manifest {
             boot_mem_mib: self.boot_mem_mib,
             ..base
         }
-    }
-
-    pub fn disk_layout(&self) -> crate::rootdisk::DiskLayout {
-        crate::rootdisk::DiskLayout::from_record(&self.disk_layout)
     }
 
     /// Whether another node may take the sandbox up from this manifest: a
@@ -283,7 +274,7 @@ impl LocalState {
             && self.manifest.layout().is_ok_and(|layout| {
                 Stamp::of(&workdir.join(layout.state)).is_ok_and(|now| now == self.vmstate)
             })
-            && Stamp::of(&workdir.join(self.manifest.disk_layout().disk()))
+            && Stamp::of(&workdir.join(crate::rootdisk::ROOT_DISK))
                 .is_ok_and(|now| now == self.disk)
     }
 
@@ -421,8 +412,7 @@ pub async fn upload(
         .collect::<std::io::Result<Vec<_>>>()
         .map_err(|err| io("reading the memory chain", err))?;
     let stamp = |file: &str| Stamp::of(&workdir.join(file)).map_err(|err| io(file, err));
-    let disk_layout = draft.disk_layout();
-    let disk_file = disk_layout.disk();
+    let disk_file = crate::rootdisk::ROOT_DISK;
     let vmstate = stamp(layout.state)?;
     let disk = stamp(disk_file)?;
     let kernel = stamp(TEMPLATE_KERNEL)?;
@@ -447,27 +437,11 @@ pub async fn upload(
         previous.map(|p| (&p.kernel, &p.manifest.kernel_digest)),
     )
     .await?;
-    // A root disk's image goes to the store once, as chunks every disk
-    // cloned from it shares; an overlay's rootfs goes as a blob.
-    let image = match disk_layout {
-        crate::rootdisk::DiskLayout::Root => {
-            let image = crate::rootdisk::image_of(blobs, &workdir.join(TEMPLATE_ROOTFS)).await?;
-            crate::rootdisk::upload_image(store, &image).await?;
-            Some(image)
-        }
-        crate::rootdisk::DiskLayout::Overlay => None,
-    };
-    let rootfs_digest = match &image {
-        Some(image) => image.digest.clone(),
-        None => {
-            blob(
-                TEMPLATE_ROOTFS,
-                &rootfs,
-                previous.map(|p| (&p.rootfs, &p.manifest.rootfs_digest)),
-            )
-            .await?
-        }
-    };
+    // The image goes to the store once, as chunks every disk cloned from it
+    // shares.
+    let image = crate::rootdisk::image_of(blobs, &workdir.join(TEMPLATE_ROOTFS)).await?;
+    crate::rootdisk::upload_image(store, &image).await?;
+    let rootfs_digest = image.digest.clone();
 
     let reuse = previous
         .filter(|p| layers.starts_with(&p.layers))
@@ -479,7 +453,7 @@ pub async fn upload(
     let disk_index = match previous.filter(|p| p.disk == disk) {
         Some(previous) => previous.disk_index.clone(),
         None => {
-            crate::chunks::put_disk(store, &workdir.join(disk_file), image.as_ref(), &known).await?
+            crate::chunks::put_disk(store, &workdir.join(disk_file), Some(&image), &known).await?
         }
     };
 
@@ -747,11 +721,10 @@ pub async fn stage(
     let layout = manifest.layout()?;
     let vmstate = layout.state;
     let memory_file = memory_file(layout)?;
-    let disk_layout = manifest.disk_layout();
-    let disk_file = disk_layout.disk();
+    let disk_file = crate::rootdisk::ROOT_DISK;
     // Everything small at once: each is a round trip, and none depends on
-    // another. A root disk's image comes from this node's own copy, or once
-    // from the store when it has none.
+    // another. The image comes from this node's own copy, or once from the
+    // store when it has none.
     let (kernel_path, rootfs_path) = (dest.join(TEMPLATE_KERNEL), dest.join(TEMPLATE_ROOTFS));
     let (vmstate_path, working_set_path) = (dest.join(vmstate), dest.join(WORKING_SET));
     let vmstate_key = generation_key(id, generation, vmstate);
@@ -759,25 +732,17 @@ pub async fn stage(
     let disk_key = index_key(id, generation, disk_file);
     let memory_key = index_key(id, generation, memory_file);
     let rootfs = async {
-        match disk_layout {
-            crate::rootdisk::DiskLayout::Root => {
-                let image = crate::rootdisk::fetch_image(
-                    store,
-                    snapshots.blobs(),
-                    &snapshots.templates_dir(),
-                    &manifest.rootfs_digest,
-                )
-                .await?;
-                tokio::fs::hard_link(&image.path, &rootfs_path)
-                    .await
-                    .map_err(|err| Status::internal(format!("linking the image: {err}")))?;
-                Ok(Some(image))
-            }
-            crate::rootdisk::DiskLayout::Overlay => snapshots
-                .fetch_blob(store, &manifest.rootfs_digest, &rootfs_path)
-                .await
-                .map(|()| None),
-        }
+        let image = crate::rootdisk::fetch_image(
+            store,
+            snapshots.blobs(),
+            &snapshots.templates_dir(),
+            &manifest.rootfs_digest,
+        )
+        .await?;
+        tokio::fs::hard_link(&image.path, &rootfs_path)
+            .await
+            .map_err(|err| Status::internal(format!("linking the image: {err}")))?;
+        Ok::<_, Status>(image)
     };
     let (kernel, image, vmstate_fetched, working_set, disk_index, memory) = tokio::join!(
         snapshots.fetch_blob(store, &manifest.kernel_digest, &kernel_path),
@@ -815,7 +780,7 @@ pub async fn stage(
     };
     let disk_path = dest.join(disk_file);
     let (fetched_disk, warmed) = tokio::join!(
-        crate::rootdisk::materialise(store, &disk_index, image.as_ref(), &disk_path),
+        crate::rootdisk::materialise(store, &disk_index, Some(&image), &disk_path),
         warming
     );
     let disk_fetched_bytes = fetched_disk?;
@@ -892,7 +857,7 @@ pub async fn upload_disk_checkpoint(
     let io = |what: &str, err: std::io::Error| Status::internal(format!("{what}: {err}"));
     let started = std::time::Instant::now();
     let id = draft.id.clone();
-    let disk_file = draft.disk_layout().disk();
+    let disk_file = crate::rootdisk::ROOT_DISK;
     let stamp = |file: &str| Stamp::of(&workdir.join(file)).map_err(|err| io(file, err));
     let kernel = stamp(TEMPLATE_KERNEL)?;
     let rootfs = stamp(TEMPLATE_ROOTFS)?;
@@ -900,19 +865,9 @@ pub async fn upload_disk_checkpoint(
         Some(previous) => previous.manifest.kernel_digest.clone(),
         None => crate::snapshot::put_blob(store, &workdir.join(TEMPLATE_KERNEL)).await?,
     };
-    let image = match draft.disk_layout() {
-        crate::rootdisk::DiskLayout::Root => {
-            let image = crate::rootdisk::image_of(blobs, &workdir.join(TEMPLATE_ROOTFS)).await?;
-            crate::rootdisk::upload_image(store, &image).await?;
-            Some(image)
-        }
-        crate::rootdisk::DiskLayout::Overlay => None,
-    };
-    let rootfs_digest = match (&image, previous.filter(|p| p.rootfs == rootfs)) {
-        (Some(image), _) => image.digest.clone(),
-        (None, Some(previous)) => previous.manifest.rootfs_digest.clone(),
-        (None, None) => crate::snapshot::put_blob(store, &workdir.join(TEMPLATE_ROOTFS)).await?,
-    };
+    let image = crate::rootdisk::image_of(blobs, &workdir.join(TEMPLATE_ROOTFS)).await?;
+    crate::rootdisk::upload_image(store, &image).await?;
+    let rootfs_digest = image.digest.clone();
     let known = previous.map(LocalState::digests).unwrap_or_default();
     let base_path = workdir.join(CHECKPOINT_BASE);
     let previous_disk = previous
@@ -921,14 +876,10 @@ pub async fn upload_disk_checkpoint(
         Some(previous) if tokio::fs::try_exists(&base_path).await.unwrap_or(false) => {
             Some((base_path.as_path(), &previous.disk_index))
         }
-        _ => image
-            .as_ref()
-            .map(|image| (image.path.as_path(), &image.index)),
+        _ => Some((image.path.as_path(), &image.index)),
     };
     let mut known = known;
-    if let Some(image) = &image {
-        known.extend(image.index.digests().map(str::to_string));
-    }
+    known.extend(image.index.digests().map(str::to_string));
     let disk_index = crate::chunks::put_disk_since(store, capture, base, &known).await?;
 
     let now_ms = burrow_common::unix_now_ms();
@@ -988,29 +939,21 @@ pub async fn stage_disk(
     dest: &Path,
 ) -> Result<LocalState, Status> {
     let id = &manifest.id;
-    let disk_file = manifest.disk_layout().disk();
+    let disk_file = crate::rootdisk::ROOT_DISK;
     let (kernel_path, rootfs_path) = (dest.join(TEMPLATE_KERNEL), dest.join(TEMPLATE_ROOTFS));
     let disk_key = index_key(id, manifest.generation, disk_file);
     let rootfs = async {
-        match manifest.disk_layout() {
-            crate::rootdisk::DiskLayout::Root => {
-                let image = crate::rootdisk::fetch_image(
-                    store,
-                    snapshots.blobs(),
-                    &snapshots.templates_dir(),
-                    &manifest.rootfs_digest,
-                )
-                .await?;
-                tokio::fs::hard_link(&image.path, &rootfs_path)
-                    .await
-                    .map_err(|err| Status::internal(format!("linking the image: {err}")))?;
-                Ok(Some(image))
-            }
-            crate::rootdisk::DiskLayout::Overlay => snapshots
-                .fetch_blob(store, &manifest.rootfs_digest, &rootfs_path)
-                .await
-                .map(|()| None),
-        }
+        let image = crate::rootdisk::fetch_image(
+            store,
+            snapshots.blobs(),
+            &snapshots.templates_dir(),
+            &manifest.rootfs_digest,
+        )
+        .await?;
+        tokio::fs::hard_link(&image.path, &rootfs_path)
+            .await
+            .map_err(|err| Status::internal(format!("linking the image: {err}")))?;
+        Ok::<_, Status>(image)
     };
     let (kernel, image, disk_index) = tokio::join!(
         snapshots.fetch_blob(store, &manifest.kernel_digest, &kernel_path),
@@ -1023,7 +966,7 @@ pub async fn stage_disk(
         Status::not_found(format!("sandbox {id}'s checkpoint is missing {disk_file}"))
     })?;
     let disk_path = dest.join(disk_file);
-    crate::rootdisk::materialise(store, &disk_index, image.as_ref(), &disk_path).await?;
+    crate::rootdisk::materialise(store, &disk_index, Some(&image), &disk_path).await?;
     keep_image(manifest, dest).await?;
     crate::fsync::tree(dest)
         .await
@@ -1183,13 +1126,11 @@ pub async fn collect_garbage(
         // Refused rather than skipped: skipping would leave this sandbox's
         // chunks unreferenced, and the sweep below would take them.
         let layout = manifest.layout()?;
-        if manifest.disk_layout() == crate::rootdisk::DiskLayout::Root {
-            images.insert(manifest.rootfs_digest.clone());
-        }
+        images.insert(manifest.rootfs_digest.clone());
         for file in layout
             .memory
             .into_iter()
-            .chain([manifest.disk_layout().disk()])
+            .chain([crate::rootdisk::ROOT_DISK])
         {
             if let Some(index) =
                 crate::snapshot::read_index(store, &index_key(id, manifest.generation, file))
@@ -1272,7 +1213,6 @@ mod tests {
             boot_mem_mib: 512,
             max_mem_mib: 8192,
             disk_mib: 1024,
-            disk_layout: String::new(),
             is_systemd: false,
             arch: "aarch64".into(),
             hypervisor_version: "1".into(),
@@ -1358,7 +1298,6 @@ mod tests {
             .unwrap();
         let blobs = crate::blobs::BlobStore::new(&root.join("data-a"));
         let mut draft = manifest("node-a", "");
-        draft.disk_layout = "root".into();
         draft.checkpoint_at_ms = 42;
         draft.image = Some(crate::oci::ImageEnvironment {
             systemd: true,

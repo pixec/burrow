@@ -35,7 +35,7 @@ use tonic::Status;
 use burrow_proto::common::v1 as common;
 use burrow_vmm::{Hypervisor, HypervisorExt, NetSpec, Vm, VmSpec};
 
-use crate::rootdisk::{DiskLayout, IMAGE, ROOT_DISK};
+use crate::rootdisk::{IMAGE, ROOT_DISK};
 use crate::sandbox::NodeConfig;
 
 /// A template's warm snapshots, one directory per shape.
@@ -687,7 +687,7 @@ pub async fn build_warm_snapshot(
     spec.mem_mib = shape.mem_mib;
     spec.mem_hotplug_mib =
         crate::sandbox::hotplug_region(hypervisor, guest_os, shape.mem_mib, shape.max_mem_mib);
-    spec.drives = DiskLayout::Root.drives();
+    spec.drives = crate::rootdisk::drives();
     spec.is_vsock_enabled = true;
     spec.net = Some(NetSpec {
         tap: tap.clone(),
@@ -698,7 +698,7 @@ pub async fn build_warm_snapshot(
         cmdline: format!(
             "{} {} init=/usr/bin/burrow-guest {} {} {}",
             burrow_vmm::DEFAULT_BOOT_ARGS,
-            DiskLayout::Root.boot_args(),
+            crate::rootdisk::BOOT_ARGS,
             lease.kernel_ip_arg(),
             crate::sandbox::guest_mode_arg(is_systemd),
             crate::sandbox::guest_boot_args(&config.extra_boot_args, config.is_console_verbose)
@@ -938,7 +938,7 @@ async fn profile_restore(
     // one the build already filled.
     let mut spec = VmSpec::new(vm_id.to_string(), dir, backend.clone());
     spec.is_pci_enabled = true;
-    spec.drives = DiskLayout::Root.drives();
+    spec.drives = crate::rootdisk::drives();
     spec.is_vsock_enabled = true;
     spec.net = Some(NetSpec {
         tap: tap.clone(),

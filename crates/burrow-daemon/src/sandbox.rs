@@ -17,7 +17,7 @@ use burrow_proto::guest::v1::guest_client::GuestClient;
 use burrow_vmm::{DriveSpec, GuestAddr, Hypervisor, HypervisorExt, Layout, NetSpec, Vm, VmSpec};
 
 use crate::guestconn;
-use crate::rootdisk::{DiskLayout, IMAGE as TEMPLATE_ROOTFS};
+use crate::rootdisk::IMAGE as TEMPLATE_ROOTFS;
 use burrow_proto::api::v1::{LimitsOutcome, ResourceChange, ResourceOutcome};
 
 /// Conventional filenames inside a template directory.
@@ -121,9 +121,6 @@ async fn with_frozen<T>(
     };
     (out, took, frozen)
 }
-
-/// An overlay sandbox's scratch disk when its policy named none.
-const DEFAULT_SCRATCH_MIB: u32 = 1024;
 
 /// Range the node draws from when a caller does not request a specific host
 /// port. Deliberately above the ephemeral range used for outbound sockets so
@@ -533,8 +530,8 @@ async fn container_agent(guest: GuestAddr) -> Result<GuestClient<Channel>, Statu
 }
 
 /// The file a sandbox's writable disk is, which is all a stopped sandbox is.
-fn disk_file(guest_os: burrow_vmm::GuestOs, layout: DiskLayout) -> &'static str {
-    crate::macnode::disk_file(guest_os).unwrap_or(layout.disk())
+fn disk_file(guest_os: burrow_vmm::GuestOs) -> &'static str {
+    crate::macnode::disk_file(guest_os).unwrap_or(crate::rootdisk::ROOT_DISK)
 }
 
 /// A disk's size in MiB, as a record states it.
@@ -1241,16 +1238,10 @@ impl RunningSandbox {
             .unwrap_or_default()
     }
 
-    /// How this sandbox's filesystem sits on its disks.
-    pub fn disk_layout(&self) -> DiskLayout {
-        DiskLayout::from_proto(self.base_record.lock().unwrap().disk_layout)
-    }
-
-    /// The disk this sandbox's guest writes: its root disk, on the overlay
-    /// layout its scratch disk, or a macOS guest's disk image.
+    /// The disk this sandbox's guest writes: its root disk or a macOS
+    /// guest's disk image.
     pub fn disk_path(&self) -> PathBuf {
-        self.workdir
-            .join(disk_file(self.guest_os(), self.disk_layout()))
+        self.workdir.join(disk_file(self.guest_os()))
     }
 
     fn guest_os(&self) -> burrow_vmm::GuestOs {
@@ -2231,7 +2222,7 @@ impl RunningSandbox {
         }
         // The one file both sides write: a clone, which shares its blocks
         // where the filesystem can.
-        let disk = self.disk_layout().disk();
+        let disk = crate::rootdisk::ROOT_DISK;
         match capture {
             Some(capture) => {
                 if tokio::fs::rename(capture, dest.join(disk)).await.is_err() {
@@ -2278,7 +2269,6 @@ impl RunningSandbox {
                 capture,
             )
             .await?;
-        let layout = self.disk_layout();
         Ok(crate::snapshot::Staged {
             sandbox_id: self.id.clone(),
             template: self.template.clone(),
@@ -2287,8 +2277,7 @@ impl RunningSandbox {
             mem_mib: self.mem_mib(),
             boot_mem_mib: self.boot_mem_mib(),
             max_mem_mib: self.max_mem_mib(),
-            disk_mib: size_mib(&dest.join(layout.disk())),
-            disk_layout: layout,
+            disk_mib: size_mib(&dest.join(crate::rootdisk::ROOT_DISK)),
             chain,
             inspection_root: self
                 .base_record
@@ -2322,7 +2311,6 @@ enum RestoreSource<'a> {
         id: &'a str,
         template: String,
         hypervisor: Hypervisor,
-        disk_layout: DiskLayout,
         disk_mib: u32,
     },
     /// A sandbox's own state in the object store, being adopted here.
@@ -2371,16 +2359,6 @@ impl RestoreSource<'_> {
             Self::Sandbox(source, _) => Ok(source.hypervisor),
             Self::Snapshot { hypervisor, .. } => Ok(*hypervisor),
             Self::Stored { manifest, .. } => manifest.hypervisor(),
-        }
-    }
-
-    /// The disk layout the state was written on, which the restored guest
-    /// keeps: its memory holds the mounts of that layout.
-    fn disk_layout(&self) -> DiskLayout {
-        match self {
-            Self::Sandbox(source, _) => source.disk_layout(),
-            Self::Snapshot { disk_layout, .. } => *disk_layout,
-            Self::Stored { manifest, .. } => DiskLayout::from_record(&manifest.disk_layout),
         }
     }
 
@@ -3440,8 +3418,7 @@ impl SandboxManager {
         let is_resumable =
             row.state == common::SandboxState::Suspended as i32 && exists(layout.state).await;
 
-        let disk_layout = DiskLayout::from_proto(stored.disk_layout);
-        if !exists(disk_file(guest_os, disk_layout)).await {
+        if !exists(disk_file(guest_os)).await {
             tracing::warn!(
                 sandbox = row.id,
                 "nothing of the sandbox is left on disk; recording it destroyed"
@@ -3537,7 +3514,6 @@ impl SandboxManager {
             &volumes,
             is_systemd,
             stored_policy.is_console_verbose,
-            disk_layout,
         );
 
         let sandbox = Arc::new(RunningSandbox {
@@ -3702,7 +3678,7 @@ impl SandboxManager {
 
     /// Removes sandbox directories with no corresponding record.
     ///
-    /// These accumulate from crashes. Each holds a scratch disk and possibly
+    /// These accumulate from crashes. Each holds a root disk and possibly
     /// a memory snapshot, so left alone they quietly consume the node's disk.
     async fn collect_orphan_workdirs(&self) {
         // An import stages under build/ and removes its directory when it is
@@ -5108,12 +5084,6 @@ impl SandboxManager {
                  from inside",
             ));
         }
-        if sandbox.disk_layout() != DiskLayout::Root {
-            return Err(Status::failed_precondition(format!(
-                "sandbox {id} predates root disks: its writable disk is a scratch disk under an \
-                 overlay, which is not resized"
-            )));
-        }
         let current = sandbox.disk_mib();
         if mib == current {
             return Ok((ResourceChange::Unchanged, 0, String::new()));
@@ -5321,7 +5291,7 @@ impl SandboxManager {
                     &self.config.data_dir,
                     &upgrade.path,
                     spec,
-                    DiskLayout::Root.disk(),
+                    crate::rootdisk::ROOT_DISK,
                     bytes,
                     overhead_mib,
                     self.config.agent_timeout,
@@ -6707,7 +6677,6 @@ impl SandboxManager {
         volumes: &[common::VolumeMount],
         is_systemd: bool,
         is_console_verbose: bool,
-        layout: DiskLayout,
     ) -> VmSpec {
         let mut spec = VmSpec::new(id.to_string(), workdir, self.config.backend(hypervisor));
         spec.guest_os = guest_os;
@@ -6754,7 +6723,7 @@ impl SandboxManager {
         // transport than it was taken with, and warm snapshots are shared.
         spec.is_pci_enabled = true;
 
-        spec.drives = layout.drives();
+        spec.drives = crate::rootdisk::drives();
         // After the sandbox's own disks, so the guest devices follow them and
         // match what the handshake tells the agent to mount.
         for (index, mount) in crate::volume::block_mounts(volumes) {
@@ -6775,7 +6744,7 @@ impl SandboxManager {
             cmdline: format!(
                 "{} {} init=/usr/bin/burrow-guest {} burrow.dns={} burrow.ip6={}/{} burrow.ip6gw={} {} {}",
                 burrow_vmm::DEFAULT_BOOT_ARGS,
-                layout.boot_args(),
+                crate::rootdisk::BOOT_ARGS,
                 lease.kernel_ip_arg(),
                 lease.host_ip,
                 lease.guest_ip6(),
@@ -7093,8 +7062,6 @@ impl SandboxManager {
             )));
         }
         let layout = hypervisor.layout();
-        // Every new sandbox owns its root disk.
-        let disk_layout = DiskLayout::Root;
         let workdir = self.config.sandbox_dir(&id, hypervisor);
         let mut resources = policy.resources.clone().unwrap_or_default();
         // The disk this sandbox is provisioned: its root disk at the size
@@ -7195,7 +7162,7 @@ impl SandboxManager {
         };
         let ipam_ms = began.elapsed() - warm_check_ms;
 
-        // Copying a scratch disk is disk work and programming a tap is netlink,
+        // Copying a root disk is disk work and programming a tap is netlink,
         // so they run together rather than one after the other.
         let stage = async {
             let staging_began = std::time::Instant::now();
@@ -7232,7 +7199,7 @@ impl SandboxManager {
                     .map_err(|err| {
                         Status::failed_precondition(format!("template {template:?}: {err}"))
                     })?;
-                let disk = workdir.join(disk_layout.disk());
+                let disk = workdir.join(crate::rootdisk::ROOT_DISK);
                 match seed_disk {
                     Some(seed) => crate::rootdisk::clone(seed, &disk).await.map(drop),
                     None => self.spares.take(&templates_dir, &template, &disk).await,
@@ -7320,9 +7287,7 @@ impl SandboxManager {
 
         // A warm snapshot was captured with the sandbox's own disk alone, so a
         // restore must describe exactly that; the volumes are hotplugged once
-        // it is running. A cold boot on a root disk hotplugs them too, once its
-        // agent is up: an agent from before root disks takes a second disk at
-        // boot for an overlay's scratch disk, and would build one on a volume.
+        // it is running. A cold boot hotplugs them too, once its agent is up.
         let is_hotplugged = from_warm
             || (capabilities.is_drive_hotplug_supported && !crate::macnode::is_macos(guest_os));
         let boot_volumes: &[common::VolumeMount] =
@@ -7339,7 +7304,6 @@ impl SandboxManager {
             boot_volumes,
             is_systemd,
             policy.is_console_verbose,
-            disk_layout,
         );
         // Only meaningful on a restore, and only when the template was
         // profiled; a create that boots cold has no snapshot to prefetch from.
@@ -7382,7 +7346,8 @@ impl SandboxManager {
             .map(|_| u64::from(wanted.disk_mib) * burrow_common::disk::MIB);
         if let Some(bytes) = grow_to {
             let grown = async {
-                crate::rootdisk::grow(&workdir.join(disk_layout.disk()), wanted.disk_mib).await?;
+                crate::rootdisk::grow(&workdir.join(crate::rootdisk::ROOT_DISK), wanted.disk_mib)
+                    .await?;
                 guard
                     .vm()
                     .resize_disk("rootfs", bytes)
@@ -7414,7 +7379,7 @@ impl SandboxManager {
             ),
             self.inspection_ca_for(&policy),
             self.trust_bundles_for(&template, &policy).await,
-            crate::volume::agent_mounts(&policy.volumes, guest_os, disk_layout),
+            crate::volume::agent_mounts(&policy.volumes, guest_os),
         );
         let inspected = !request.inspection_ca_pem.is_empty();
         let inspection_root = self.inspection_root_of(&request);
@@ -7509,7 +7474,6 @@ impl SandboxManager {
             hypervisor: hypervisor.to_string(),
             guest_os: guest_os.as_str().to_string(),
             inspection_root_fingerprint: inspection_root,
-            disk_layout: disk_layout.to_proto() as i32,
             // Tags and name are stamped a moment later by the caller's
             // create; usage, reachability and the handshake are filled in
             // from the live sandbox on every read.
@@ -7832,7 +7796,6 @@ impl SandboxManager {
                     id: snapshot_id,
                     template: manifest.template.clone(),
                     hypervisor: manifest.hypervisor()?,
-                    disk_layout: manifest.disk_layout(),
                     disk_mib: manifest.disk_mib,
                 },
                 id.clone(),
@@ -7964,7 +7927,7 @@ impl SandboxManager {
                 let shape = inherited.resources.clone().unwrap_or_default();
                 let wanted = over.resources.clone().unwrap_or_else(|| shape.clone());
                 // Firecracker takes a restored VM's machine configuration from
-                // the snapshot, and the child's scratch disk is a copy of the
+                // the snapshot, and the child's root disk is a copy of the
                 // source's. A shape the fork cannot honour is refused rather
                 // than accepted and quietly ignored.
                 if (wanted.vcpus, wanted.mem_mib, wanted.disk_mib)
@@ -8077,16 +8040,11 @@ impl SandboxManager {
         self.require_hypervisor(hypervisor)?;
         let capabilities = hypervisor.capabilities();
         let workdir = self.config.sandbox_dir(&id, hypervisor);
-        // And on the disk layout it was written on.
-        let disk_layout = source.disk_layout();
         let mut resources = policy.resources.clone().unwrap_or_default();
         // A restored sandbox gets a disk of its source's size, provisioned
         // like a created one's. An adopt is charged here too, after its claim
         // in the store, which a refusal hands back.
-        resources.disk_mib = match source.disk_mib() {
-            0 if disk_layout == DiskLayout::Overlay => DEFAULT_SCRATCH_MIB,
-            mib => mib,
-        };
+        resources.disk_mib = source.disk_mib();
         policy.resources = Some(resources.clone());
         let what = match source {
             RestoreSource::Sandbox(..) => "fork a sandbox",
@@ -8191,7 +8149,7 @@ impl SandboxManager {
             if let Some(jail) = self.config.jail_for(hypervisor) {
                 // Both a fork and a snapshot restore hard-link only the
                 // template's own kernel and rootfs; the snapshot state, the
-                // memory chain and the scratch disk are copies (or reflinks)
+                // memory chain and the root disk are copies (or reflinks)
                 // made just for this sandbox, so they still need the chown. A
                 // read-only volume mount is a link into the volume store and is
                 // left alone, for the reason [`grant_to_jail`] spells out.
@@ -8262,7 +8220,6 @@ impl SandboxManager {
             },
             is_systemd,
             policy.is_console_verbose,
-            disk_layout,
         );
         // The template's plan names the pages its agent touches on the way to
         // a usable handshake, which is the same code whether the guest was
@@ -8324,7 +8281,7 @@ impl SandboxManager {
             },
             match is_attached {
                 true => Vec::new(),
-                false => crate::volume::agent_mounts(&policy.volumes, guest_os, disk_layout),
+                false => crate::volume::agent_mounts(&policy.volumes, guest_os),
             },
         );
         let inspection_root = self.inspection_root_of(&request);
@@ -8347,7 +8304,6 @@ impl SandboxManager {
             hypervisor: hypervisor.to_string(),
             guest_os: guest_os.as_str().to_string(),
             inspection_root_fingerprint: inspection_root,
-            disk_layout: disk_layout.to_proto() as i32,
             ..Default::default()
         };
         tracing::info!(
@@ -8656,10 +8612,8 @@ impl SandboxManager {
             .resources = Some(resources.clone());
         let environment = self.environment_of(&sandbox).await;
         let is_systemd = environment.systemd;
-        let disk_layout = sandbox.disk_layout();
-        // On a root disk, hotplugged once the agent is up, as a create does.
-        let is_hotplugged = disk_layout == DiskLayout::Root
-            && sandbox.hypervisor.capabilities().is_drive_hotplug_supported
+        // Hotplugged once the agent is up, as a create does.
+        let is_hotplugged = sandbox.hypervisor.capabilities().is_drive_hotplug_supported
             && !crate::macnode::is_macos(guest_os);
         let (boot_volumes, hotplugged): (&[common::VolumeMount], &[common::VolumeMount]) =
             match is_hotplugged {
@@ -8677,7 +8631,6 @@ impl SandboxManager {
             boot_volumes,
             is_systemd,
             policy.is_console_verbose,
-            disk_layout,
         );
         let from = self.boundary(&sandbox).await;
         if let Err(err) = self.usernets.attach(id, &sandbox.lease, &mut spec) {
@@ -8694,7 +8647,7 @@ impl SandboxManager {
             ),
             self.inspection_ca_for(&policy),
             self.trust_bundles_in(&environment, &policy),
-            crate::volume::agent_mounts(&policy.volumes, guest_os, disk_layout),
+            crate::volume::agent_mounts(&policy.volumes, guest_os),
         );
         if let Err(err) = sandbox
             .boot(
@@ -8835,7 +8788,7 @@ impl SandboxManager {
             tracing::error!(sandbox = id, %err, "failed to remove sessions from store");
         }
         // Reported, but only after the directory is gone: a ruleset that would
-        // not apply must not also leave a scratch disk behind.
+        // not apply must not also leave a root disk behind.
         let rendered = self.sync_firewall().await;
         // Only now, once the render that stopped naming this address has been
         // applied. Held back rather than skipped when that render fails: the
@@ -9132,7 +9085,6 @@ impl SandboxManager {
             boot_mem_mib: sandbox.boot_mem_mib(),
             max_mem_mib: sandbox.max_mem_mib(),
             disk_mib: size_mib(&sandbox.disk_path()),
-            disk_layout: sandbox.disk_layout().as_str().to_string(),
             is_systemd,
             arch: std::env::consts::ARCH.to_string(),
             hypervisor_version: self.config.version(sandbox.hypervisor).to_string(),
@@ -9782,7 +9734,6 @@ impl SandboxManager {
     ) -> Result<Arc<RunningSandbox>, Status> {
         let id = record.id.clone();
         let hypervisor = manifest.hypervisor()?;
-        let disk_layout = manifest.disk_layout();
         let workdir = self.config.sandbox_dir(&id, hypervisor);
         let mut policy = record.policy.clone().unwrap_or_default();
         let resources = manifest.resources(policy.resources.take().unwrap_or_default());
@@ -9855,7 +9806,6 @@ impl SandboxManager {
             &policy.volumes,
             manifest.is_systemd,
             policy.is_console_verbose,
-            disk_layout,
         );
         let record = common::Sandbox {
             id: id.clone(),
@@ -9866,7 +9816,6 @@ impl SandboxManager {
             guest_ip: lease.guest_ip.to_string(),
             hypervisor: hypervisor.to_string(),
             guest_os: guest_os.as_str().to_string(),
-            disk_layout: disk_layout.to_proto() as i32,
             state_reason: String::new(),
             ..record
         };
@@ -10173,9 +10122,7 @@ impl SandboxManager {
             false => {
                 let mut paths: Vec<String> =
                     volumes.iter().map(|(_, path, _)| path.clone()).collect();
-                if sandbox.disk_layout() == DiskLayout::Root {
-                    paths.insert(0, "/".to_string());
-                }
+                paths.insert(0, "/".to_string());
                 let disk = sandbox.disk_path();
                 let (captured, frozen_for, is_frozen) = with_frozen(sandbox, paths, async {
                     let stamps = stamps()?;
@@ -10888,7 +10835,7 @@ pub(crate) mod tests {
         std::fs::create_dir_all(&workdir).unwrap();
         let layout = Hypervisor::Firecracker.layout();
         // A snapshot from an earlier suspend, older than the disk.
-        for file in [layout.state, crate::rootdisk::SCRATCH_DISK] {
+        for file in [layout.state, crate::rootdisk::ROOT_DISK] {
             tokio::fs::write(workdir.join(file), b"old").await.unwrap();
         }
         let stale = row(id, common::SandboxState::Running, 3);
@@ -10909,7 +10856,7 @@ pub(crate) mod tests {
         assert_eq!(rows[0].state, common::SandboxState::Stopped as i32);
         let stored: common::Sandbox = prost::Message::decode(&rows[0].record[..]).unwrap();
         assert_eq!(stored.state_reason, REASON_LOST);
-        assert!(workdir.join(crate::rootdisk::SCRATCH_DISK).exists());
+        assert!(workdir.join(crate::rootdisk::ROOT_DISK).exists());
         assert!(!workdir.join(layout.state).exists());
         let events = events_of(&manager, id).await;
         let stopped = &events[1];
@@ -10956,7 +10903,7 @@ pub(crate) mod tests {
         let legacy = jail.chroot_for(Hypervisor::Firecracker, id);
         tokio::fs::create_dir_all(&legacy).await.unwrap();
         let layout = hypervisor.layout();
-        for file in [layout.state, crate::rootdisk::SCRATCH_DISK] {
+        for file in [layout.state, crate::rootdisk::ROOT_DISK] {
             tokio::fs::write(legacy.join(file), b"kept").await.unwrap();
         }
         let mut row = row(id, common::SandboxState::Suspended, 5);
@@ -10994,7 +10941,7 @@ pub(crate) mod tests {
         let workdir = manager.config.sandbox_dir(id, Hypervisor::Firecracker);
         std::fs::create_dir_all(&workdir).unwrap();
         let layout = Hypervisor::Firecracker.layout();
-        for file in [layout.state, crate::rootdisk::SCRATCH_DISK] {
+        for file in [layout.state, crate::rootdisk::ROOT_DISK] {
             tokio::fs::write(workdir.join(file), b"kept").await.unwrap();
         }
         let orphan = data_dir.join("sandboxes").join("ghost-nobody");
@@ -12006,7 +11953,7 @@ pub(crate) mod tests {
             TEMPLATE_ROOTFS,
             "snapshot.vmstate",
             "snapshot.mem",
-            crate::rootdisk::SCRATCH_DISK,
+            crate::rootdisk::ROOT_DISK,
         ] {
             std::fs::write(workdir.join(file), vec![7u8; 8192]).unwrap();
         }
@@ -12163,8 +12110,7 @@ pub(crate) mod tests {
         std::fs::create_dir_all(&workdir).unwrap();
         let sandbox = sandbox_in(workdir.clone());
         sandbox.spec.lock().unwrap().drives = vec![
-            DriveSpec::root_ro(TEMPLATE_ROOTFS),
-            DriveSpec::scratch_rw(crate::rootdisk::SCRATCH_DISK),
+            DriveSpec::root_rw(crate::rootdisk::ROOT_DISK),
             DriveSpec {
                 id: "volume0".into(),
                 path: volume_image(0),
@@ -12183,7 +12129,7 @@ pub(crate) mod tests {
             "snapshot.vmstate",
             diff.as_str(),
             TEMPLATE_ROOTFS,
-            crate::rootdisk::SCRATCH_DISK,
+            crate::rootdisk::ROOT_DISK,
             &volume_image(0),
             &volume_image(1),
         ] {
@@ -12198,7 +12144,7 @@ pub(crate) mod tests {
             vec![
                 Synced::File(workdir.join("snapshot.vmstate")),
                 Synced::File(workdir.join(&diff)),
-                Synced::File(workdir.join(crate::rootdisk::SCRATCH_DISK)),
+                Synced::File(workdir.join(crate::rootdisk::ROOT_DISK)),
                 Synced::File(workdir.join(volume_image(0))),
                 Synced::Dir(workdir.clone()),
             ]
@@ -12217,7 +12163,7 @@ pub(crate) mod tests {
         std::fs::create_dir_all(&workdir).unwrap();
         let sandbox = sandbox_in(workdir.clone());
         sandbox.spec.lock().unwrap().drives =
-            vec![DriveSpec::scratch_rw(crate::rootdisk::SCRATCH_DISK)];
+            vec![DriveSpec::scratch_rw(crate::rootdisk::ROOT_DISK)];
         std::fs::write(workdir.join("snapshot.vmstate"), b"x").unwrap();
         // No memory file: the snapshot did not land, so the suspend must not.
         let err = sandbox

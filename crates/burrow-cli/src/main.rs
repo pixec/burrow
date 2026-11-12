@@ -4679,11 +4679,7 @@ fn print_config(sandbox: &common::Sandbox) {
             );
         }
         if resources.disk_mib > 0 {
-            let layout = match common::DiskLayout::try_from(sandbox.disk_layout) {
-                Ok(common::DiskLayout::Root) => "root disk",
-                _ => "overlay scratch disk",
-            };
-            field("disk", &format!("{} MiB {layout}", resources.disk_mib));
+            field("disk", &format!("{} MiB root disk", resources.disk_mib));
         }
     }
     if let Some(lifetime) = &policy.lifetime {
@@ -5638,10 +5634,6 @@ fn sandbox_json(sandbox: &common::Sandbox) -> String {
         "agent_unconfirmed": sandbox.is_agent_unconfirmed,
         "node": sandbox.node_id,
         "template": sandbox.template,
-        "disk_layout": match common::DiskLayout::try_from(sandbox.disk_layout) {
-            Ok(common::DiskLayout::Root) => "root",
-            _ => "overlay",
-        },
         "created_at": rfc3339_from_unix_ms(sandbox.created_at_unix_ms),
         "address": sandbox.guest_ip,
         "usage": {

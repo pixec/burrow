@@ -96,10 +96,6 @@ pub struct Manifest {
     pub boot_mem_mib: u32,
     #[serde(default)]
     pub max_mem_mib: u32,
-    /// [`crate::rootdisk::DiskLayout`]; empty in a manifest from before root
-    /// disks, which was the overlay.
-    #[serde(default)]
-    pub disk_layout: String,
     /// Unix milliseconds. Retention evicts the oldest first, and two
     /// snapshots taken inside one second would otherwise be ordered
     /// arbitrarily, by their random ids.
@@ -132,8 +128,8 @@ pub struct Manifest {
     pub is_durable: bool,
     /// The kernel and the template's image by content, filled in when
     /// uploaded. The kernel goes to the store as a blob under its digest; the
-    /// image as a blob on the overlay layout, and on the root layout as
-    /// chunks under `images/`, which the disk's index is a diff against.
+    /// image as chunks under `images/`, which the disk's index is a diff
+    /// against.
     pub kernel_digest: String,
     pub rootfs_digest: String,
     /// Memory and disk are stored as chunk indexes rather than as whole
@@ -159,10 +155,6 @@ impl Manifest {
 
     fn layout(&self) -> Result<burrow_vmm::Layout, Status> {
         self.hypervisor().map(burrow_vmm::Hypervisor::layout)
-    }
-
-    pub fn disk_layout(&self) -> crate::rootdisk::DiskLayout {
-        crate::rootdisk::DiskLayout::from_record(&self.disk_layout)
     }
 
     /// `base` with the machine it holds, which a restore cannot change.
@@ -196,7 +188,6 @@ impl Manifest {
                 .hypervisor()
                 .map_or_else(|_| self.hypervisor.clone(), |h| h.to_string()),
             inspection_root_fingerprint: self.inspection_root.clone(),
-            disk_layout: self.disk_layout().to_proto() as i32,
         }
     }
 }
@@ -271,7 +262,7 @@ async fn delete_remote(remote: &crate::objstore::ObjectStore, id: &str) -> Resul
         for file in layout
             .memory
             .into_iter()
-            .chain([crate::rootdisk::SCRATCH_DISK, crate::rootdisk::ROOT_DISK])
+            .chain([crate::rootdisk::ROOT_DISK])
         {
             remote
                 .delete(&crate::objstore::sparse_key(&remote_key(id, file)))
@@ -331,7 +322,6 @@ pub struct Staged {
     pub boot_mem_mib: u32,
     pub max_mem_mib: u32,
     pub disk_mib: u32,
-    pub disk_layout: crate::rootdisk::DiskLayout,
     pub hypervisor: burrow_vmm::Hypervisor,
     /// Memory files in the staging directory, oldest first.
     pub chain: Vec<String>,
@@ -416,7 +406,6 @@ impl SnapshotStore {
             boot_mem_mib: staged.boot_mem_mib,
             max_mem_mib: staged.max_mem_mib,
             disk_mib: staged.disk_mib,
-            disk_layout: staged.disk_layout.as_str().to_string(),
             created_unix_ms: burrow_common::unix_now_ms(),
             size_bytes,
             expires_at_ms: match expiration_secs {
@@ -489,22 +478,10 @@ impl SnapshotStore {
         let started = std::time::Instant::now();
 
         let kernel_digest = put_blob(remote, &dir.join(TEMPLATE_KERNEL)).await?;
-        // A root disk's image goes once for every snapshot of it; an
-        // overlay's rootfs goes as a blob.
-        let disk_layout = manifest.disk_layout();
-        let image = match disk_layout {
-            crate::rootdisk::DiskLayout::Root => {
-                let image =
-                    crate::rootdisk::image_of(&self.blobs, &dir.join(TEMPLATE_ROOTFS)).await?;
-                crate::rootdisk::upload_image(remote, &image).await?;
-                Some(image)
-            }
-            crate::rootdisk::DiskLayout::Overlay => None,
-        };
-        let rootfs_digest = match &image {
-            Some(image) => image.digest.clone(),
-            None => put_blob(remote, &dir.join(TEMPLATE_ROOTFS)).await?,
-        };
+        // The image goes once for every snapshot of it.
+        let image = crate::rootdisk::image_of(&self.blobs, &dir.join(TEMPLATE_ROOTFS)).await?;
+        crate::rootdisk::upload_image(remote, &image).await?;
+        let rootfs_digest = image.digest.clone();
         remote
             .put_file(&remote_key(id, layout.state), &dir.join(layout.state))
             .await?;
@@ -523,9 +500,9 @@ impl SnapshotStore {
         let json = serde_json::to_vec(&index)
             .map_err(|err| Status::internal(format!("encoding an index: {err}")))?;
         remote.put_bytes(&index_key(id, memory), json).await?;
-        let disk = disk_layout.disk();
+        let disk = crate::rootdisk::ROOT_DISK;
         let index =
-            crate::chunks::put_disk(remote, &dir.join(disk), image.as_ref(), &Default::default())
+            crate::chunks::put_disk(remote, &dir.join(disk), Some(&image), &Default::default())
                 .await?;
         let json = serde_json::to_vec(&index)
             .map_err(|err| Status::internal(format!("encoding an index: {err}")))?;
@@ -697,29 +674,18 @@ impl SnapshotStore {
         dir: &Path,
     ) -> Result<Option<crate::chunks::ImageIndex>, Status> {
         let id = &manifest.id;
-        let disk_layout = manifest.disk_layout();
         self.fetch_blob(remote, &manifest.kernel_digest, &dir.join(TEMPLATE_KERNEL))
             .await?;
-        let image = match disk_layout {
-            crate::rootdisk::DiskLayout::Root => {
-                let image = crate::rootdisk::fetch_image(
-                    remote,
-                    &self.blobs,
-                    &self.templates_dir(),
-                    &manifest.rootfs_digest,
-                )
-                .await?;
-                tokio::fs::hard_link(&image.path, dir.join(TEMPLATE_ROOTFS))
-                    .await
-                    .map_err(|err| Status::internal(format!("linking the image: {err}")))?;
-                Some(image)
-            }
-            crate::rootdisk::DiskLayout::Overlay => {
-                self.fetch_blob(remote, &manifest.rootfs_digest, &dir.join(TEMPLATE_ROOTFS))
-                    .await?;
-                None
-            }
-        };
+        let image = crate::rootdisk::fetch_image(
+            remote,
+            &self.blobs,
+            &self.templates_dir(),
+            &manifest.rootfs_digest,
+        )
+        .await?;
+        tokio::fs::hard_link(&image.path, dir.join(TEMPLATE_ROOTFS))
+            .await
+            .map_err(|err| Status::internal(format!("linking the image: {err}")))?;
         let missing = |file: &str| {
             Status::not_found(format!(
                 "snapshot {id} is missing {file} in the object store"
@@ -742,12 +708,12 @@ impl SnapshotStore {
                 .map_err(|err| Status::internal(format!("fetching snapshot {id}'s logs: {err}")))?;
             crate::chunks::get_image(remote, &index, &dir.join(COMMAND_LOGS).join(&name)).await?;
         }
-        let disk = disk_layout.disk();
+        let disk = crate::rootdisk::ROOT_DISK;
         if manifest.is_chunked {
             let index = read_index(remote, &index_key(id, disk))
                 .await?
                 .ok_or_else(|| missing(disk))?;
-            crate::rootdisk::materialise(remote, &index, image.as_ref(), &dir.join(disk)).await?;
+            crate::rootdisk::materialise(remote, &index, Some(&image), &dir.join(disk)).await?;
             let memory_file = memory_file(layout)?;
             let memory = read_index(remote, &index_key(id, memory_file))
                 .await?
@@ -818,7 +784,6 @@ impl SnapshotStore {
             if key.ends_with(&format!("/{MANIFEST}")) {
                 if let Some(bytes) = remote.get_bytes(&key).await?
                     && let Ok(manifest) = serde_json::from_slice::<Manifest>(&bytes)
-                    && manifest.disk_layout() == crate::rootdisk::DiskLayout::Root
                 {
                     images.insert(manifest.rootfs_digest);
                 }
@@ -1026,7 +991,7 @@ impl SnapshotStore {
             .await
             .map_err(|err| io(layout.state, err))?;
 
-        let disk = manifest.disk_layout().disk();
+        let disk = crate::rootdisk::ROOT_DISK;
         crate::rootdisk::clone(&dir.join(disk), &dest.join(disk))
             .await
             .map_err(|err| io(disk, err))?;
@@ -1083,7 +1048,7 @@ impl SnapshotStore {
     ///
     /// The publish is a rename, so a snapshot either has its manifest or was
     /// never published; what is left here is a staging directory a crash
-    /// orphaned, and it holds a memory image and a scratch disk that nothing
+    /// orphaned, and it holds a memory image and a root disk that nothing
     /// else would ever reclaim.
     ///
     /// A directory whose manifest is present but unreadable, say a format a
@@ -1328,7 +1293,7 @@ async fn read_manifest(dir: &Path) -> Option<Manifest> {
 }
 
 /// What the snapshot actually occupies, counting allocated blocks rather than
-/// apparent length: the memory image and the scratch disk are both sparse, and
+/// apparent length: the memory image and the root disk are both sparse, and
 /// their apparent size is the guest's memory rather than the node's disk.
 /// The log files in `dir`, which may not exist.
 fn log_names(dir: &Path) -> Vec<String> {
@@ -1396,7 +1361,6 @@ mod tests {
             boot_mem_mib: 1024,
             max_mem_mib: 16384,
             disk_mib: 2048,
-            disk_layout: String::new(),
             created_unix_ms: burrow_common::unix_from_rfc3339(created_at).unwrap_or(0) * 1_000,
             size_bytes: 12_345,
             expires_at_ms: 0,
@@ -1617,7 +1581,7 @@ mod tests {
             TEMPLATE_ROOTFS,
             layout.state,
             layout.memory.unwrap(),
-            crate::rootdisk::SCRATCH_DISK,
+            crate::rootdisk::ROOT_DISK,
         ] {
             tokio::fs::write(dir.join(file), vec![7u8; 8192])
                 .await
@@ -1634,7 +1598,7 @@ mod tests {
             async move { store.upload(&id).await }
         });
         while !remote
-            .exists(&index_key(&id, crate::rootdisk::SCRATCH_DISK))
+            .exists(&index_key(&id, crate::rootdisk::ROOT_DISK))
             .await
             .unwrap()
         {
@@ -1671,7 +1635,7 @@ mod tests {
             TEMPLATE_ROOTFS,
             layout.state,
             layout.memory.unwrap(),
-            crate::rootdisk::SCRATCH_DISK,
+            crate::rootdisk::ROOT_DISK,
         ] {
             tokio::fs::write(dir.join(file), vec![7u8; 8192])
                 .await
@@ -1720,7 +1684,7 @@ mod tests {
             TEMPLATE_ROOTFS,
             layout.state,
             memory,
-            crate::rootdisk::SCRATCH_DISK,
+            crate::rootdisk::ROOT_DISK,
         ] {
             tokio::fs::write(dir.join(file), b"bytes").await.unwrap();
         }
@@ -1732,7 +1696,6 @@ mod tests {
             boot_mem_mib: 512,
             max_mem_mib: 512,
             disk_mib: 1024,
-            disk_layout: crate::rootdisk::DiskLayout::Overlay,
             hypervisor: burrow_vmm::Hypervisor::Firecracker,
             chain: vec![memory.to_string()],
             inspection_root: String::new(),
@@ -1753,7 +1716,7 @@ mod tests {
             TEMPLATE_ROOTFS,
             layout.state,
             memory,
-            crate::rootdisk::SCRATCH_DISK,
+            crate::rootdisk::ROOT_DISK,
             MANIFEST,
         ] {
             assert!(

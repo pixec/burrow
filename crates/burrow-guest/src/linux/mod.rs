@@ -31,7 +31,6 @@ pub fn features() -> Vec<String> {
         "output-feed".to_string(),
         fs::FEATURE_FS.to_string(),
         "public-addresses".to_string(),
-        "root-disk".to_string(),
     ]
 }
 
@@ -411,9 +410,6 @@ pub async fn main() {
         std::future::pending::<()>().await;
     }
     if is_init && !is_reexec {
-        // Pivot into the writable overlay before mounting anything else, so
-        // the pseudo-filesystems land inside the final root.
-        init::setup_writable_root();
         if let Err(err) = init::mount_essentials() {
             tracing::error!(%err, "failed to mount essential filesystems");
         }

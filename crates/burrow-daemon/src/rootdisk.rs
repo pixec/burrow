@@ -1,13 +1,12 @@
 //! A sandbox's own root disk, made from its template's image.
 //!
-//! On the root layout a Linux guest boots from one writable disk, mounted as
+//! A Linux guest boots from one writable disk, mounted as
 //! `/`, which is a copy-on-write clone of the template's `rootfs.ext4`: a
 //! `FICLONE` reflink where the filesystem shares extents (XFS, btrfs), APFS's
 //! `clonefile` on a Mac, and a sparse copy of the image's data elsewhere. The
 //! image itself stays in the sandbox's directory as `rootfs.ext4`, a hard link
 //! the guest never sees, so the disk can always be compared with the image it
-//! was cloned from. Sandboxes made before root disks keep the overlay layout:
-//! the image read-only under an overlay on a scratch disk.
+//! was cloned from.
 //!
 //! Nothing here reads a guest's filesystem: a disk grows as a file, and the
 //! guest grows its filesystem from inside. A guest controls the bytes on its
@@ -25,95 +24,26 @@ use sha2::{Digest as _, Sha256};
 use tonic::Status;
 
 use burrow_common::disk::MIB;
-use burrow_proto::common::v1 as common;
 
 use crate::chunks::{CHUNK_SIZE, ImageIndex};
 
-/// A root-layout sandbox's disk, in its working directory and its snapshots.
+/// A sandbox's disk, in its working directory and its snapshots.
 pub const ROOT_DISK: &str = "root.ext4";
-/// The overlay layout's writable disk.
-pub const SCRATCH_DISK: &str = "scratch.ext4";
 /// The template's image, as a sandbox's directory and a snapshot hold it.
 pub const IMAGE: &str = "rootfs.ext4";
 
-/// What a root disk gets beyond its image when the create names no size, the
-/// room an overlay sandbox's scratch disk gave it.
+/// What a root disk gets beyond its image when the create names no size.
 pub const DEFAULT_HEADROOM_MIB: u32 = 1024;
 
-/// How a sandbox's filesystem sits on its disks.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-pub enum DiskLayout {
-    /// The image read-only under an overlay on a scratch disk. What every
-    /// record written before the field was.
-    #[default]
-    Overlay,
-    /// One writable disk, cloned from the image, mounted as `/`.
-    Root,
-}
+/// The kernel arguments that mount the root disk.
+pub const BOOT_ARGS: &str = "root=/dev/vda rw";
 
-impl DiskLayout {
-    pub fn from_record(name: &str) -> Self {
-        match name {
-            "root" => Self::Root,
-            _ => Self::Overlay,
-        }
-    }
+/// The first guest device a volume lands on, after the root disk.
+pub const FIRST_VOLUME_DEVICE: u8 = b'b';
 
-    pub fn from_proto(layout: i32) -> Self {
-        match common::DiskLayout::try_from(layout) {
-            Ok(common::DiskLayout::Root) => Self::Root,
-            _ => Self::Overlay,
-        }
-    }
-
-    pub fn to_proto(self) -> common::DiskLayout {
-        match self {
-            Self::Overlay => common::DiskLayout::Overlay,
-            Self::Root => common::DiskLayout::Root,
-        }
-    }
-
-    pub fn as_str(self) -> &'static str {
-        match self {
-            Self::Overlay => "overlay",
-            Self::Root => "root",
-        }
-    }
-
-    /// The disk the guest writes, in the sandbox's directory.
-    pub fn disk(self) -> &'static str {
-        match self {
-            Self::Overlay => SCRATCH_DISK,
-            Self::Root => ROOT_DISK,
-        }
-    }
-
-    /// The kernel arguments that mount the root under this layout.
-    pub fn boot_args(self) -> &'static str {
-        match self {
-            Self::Overlay => "root=/dev/vda ro burrow.layout=overlay",
-            Self::Root => "root=/dev/vda rw",
-        }
-    }
-
-    /// The drives the guest boots with, before any volume.
-    pub fn drives(self) -> Vec<burrow_vmm::DriveSpec> {
-        match self {
-            Self::Overlay => vec![
-                burrow_vmm::DriveSpec::root_ro(IMAGE),
-                burrow_vmm::DriveSpec::scratch_rw(SCRATCH_DISK),
-            ],
-            Self::Root => vec![burrow_vmm::DriveSpec::root_rw(ROOT_DISK)],
-        }
-    }
-
-    /// The first guest device a volume lands on.
-    pub fn first_volume_device(self) -> u8 {
-        match self {
-            Self::Overlay => b'c',
-            Self::Root => b'b',
-        }
-    }
+/// The drives the guest boots with, before any volume.
+pub fn drives() -> Vec<burrow_vmm::DriveSpec> {
+    vec![burrow_vmm::DriveSpec::root_rw(ROOT_DISK)]
 }
 
 /// A root disk's size for a create asking for `requested` MiB of an image of
@@ -898,19 +828,9 @@ mod tests {
     }
 
     #[test]
-    fn a_record_without_a_layout_is_an_overlay() {
-        assert_eq!(DiskLayout::from_record(""), DiskLayout::Overlay);
-        assert_eq!(DiskLayout::from_record("overlay"), DiskLayout::Overlay);
-        assert_eq!(DiskLayout::from_record("root"), DiskLayout::Root);
-        assert_eq!(DiskLayout::Root.as_str(), "root");
-        // The agent pivots only when told, so the overlay has to say so.
-        assert!(
-            DiskLayout::Overlay
-                .boot_args()
-                .contains("burrow.layout=overlay")
-        );
-        assert!(DiskLayout::Root.boot_args().contains(" rw"));
-        let drives = DiskLayout::Root.drives();
+    fn the_root_disk_boots_writable() {
+        assert!(BOOT_ARGS.contains(" rw"));
+        let drives = drives();
         assert_eq!(drives.len(), 1);
         assert!(drives[0].is_root && !drives[0].is_read_only);
     }

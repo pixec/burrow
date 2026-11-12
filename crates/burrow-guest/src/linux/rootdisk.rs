@@ -1,6 +1,6 @@
 //! The root filesystem as a disk of its own.
 //!
-//! On the root layout the guest boots from one writable ext4 disk mounted as
+//! The guest boots from one writable ext4 disk mounted as
 //! `/`. The host makes it bigger by growing the file, and asks the guest to
 //! flush, trim or freeze it before it captures the disk without the guest's
 //! memory. Everything here acts on `/` through the kernel; nothing reads or
@@ -134,8 +134,7 @@ fn device_bytes() -> std::io::Result<u64> {
 }
 
 /// Grows an ext4 root to fill its device, online. The kernel does nothing for
-/// one that already fills it, and a root that is not ext4 on a disk of its own
-/// (the overlay layout's) is left alone.
+/// one that already fills it, and a root that is not ext4 is left alone.
 ///
 /// `expected` is the device size the host set. The guest hears of it through
 /// a config interrupt handled on a workqueue, so the call that follows the

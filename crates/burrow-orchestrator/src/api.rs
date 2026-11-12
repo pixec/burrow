@@ -1392,13 +1392,10 @@ impl ApiService {
                     disk_bytes: crate::registry::disk_bytes(snapshot.resources.as_ref()),
                     // A sandbox taking the snapshot's own policy carries
                     // fields the orchestrator never sees, so the node
-                    // restoring it elsewhere has to enforce all of them; and
-                    // a root disk restores only where root disks are.
+                    // restoring it elsewhere has to enforce all of them.
                     policy_features: match inherits_policy {
                         true => burrow_common::features::ALL.to_vec(),
-                        false => {
-                            with_disk_layout(want.policy_features.clone(), snapshot.disk_layout)
-                        }
+                        false => want.policy_features.clone(),
                     },
                     ..want.clone()
                 };
@@ -1932,11 +1929,8 @@ impl ApiService {
                         && sandbox.checkpoint_kind == common::CheckpointKind::Disk as i32)
             }),
             hypervisor: recorded_hypervisor(&sandbox.hypervisor),
-            policy_features: with_disk_layout(
-                crate::registry::policy_features(
-                    sandbox.policy.as_ref().and_then(|p| p.network.as_ref()),
-                ),
-                sandbox.disk_layout,
+            policy_features: crate::registry::policy_features(
+                sandbox.policy.as_ref().and_then(|p| p.network.as_ref()),
             ),
         }
     }
@@ -3937,15 +3931,6 @@ fn drop_cpuset(sandbox: &mut common::Sandbox) {
 /// field existed, which ran under Firecracker.
 fn recorded_hypervisor(name: &str) -> String {
     Hypervisor::from_record(name).map_or_else(|| name.to_string(), |h| h.to_string())
-}
-
-/// `features` and, for state written on a root disk, the feature a node
-/// needs to restore one.
-fn with_disk_layout(mut features: Vec<&'static str>, disk_layout: i32) -> Vec<&'static str> {
-    if disk_layout == common::DiskLayout::Root as i32 {
-        features.push(burrow_common::features::ROOT_DISK);
-    }
-    features
 }
 
 /// The hypervisor a template's `image.json` records: the one it was built

@@ -5,106 +5,11 @@
 //! This module brings up the filesystems: the root, and the pseudo-filesystems.
 //! Reaping, init's other duty, lives in [`crate::unix::reaper`].
 //!
-//! The root is the sandbox's own disk, which the kernel mounts read-write, on
-//! every sandbox but those made before root disks: the host boots those with
-//! `burrow.layout=overlay`, and they get the read-only image under an overlay
-//! on a scratch disk, as they always have.
+//! The root is the sandbox's own disk, which the kernel mounts read-write.
 
 use std::path::Path;
 
-use nix::mount::{MntFlags, MsFlags, mount, umount2};
-
-/// Second virtio drive, if the node attached one.
-const SCRATCH_DEV: &str = "/dev/vdb";
-const SCRATCH_MNT: &str = "/scratch";
-
-/// On the overlay layout, turns the read-only template rootfs into a writable
-/// filesystem by union mounting a per-sandbox scratch disk over it, then
-/// pivoting into the union. On the root layout the root is writable already.
-///
-/// Failure is not fatal: the sandbox still boots read-only, which is degraded
-/// but usable and much easier to debug than a boot loop.
-pub fn setup_writable_root() -> bool {
-    // /dev must exist before the scratch device node is visible.
-    mount_one("devtmpfs", "/dev", "devtmpfs", MsFlags::MS_NOSUID, None);
-
-    if !is_overlay_layout() {
-        return true;
-    }
-    if !Path::new(SCRATCH_DEV).exists() {
-        tracing::debug!("no scratch disk attached; root stays read-only");
-        return false;
-    }
-    match try_pivot_to_overlay() {
-        Ok(()) => {
-            tracing::debug!("writable overlay root active");
-            true
-        }
-        Err(err) => {
-            tracing::error!(%err, "overlay root setup failed; continuing read-only");
-            false
-        }
-    }
-}
-
-/// Whether the host booted this guest on the overlay layout. Only then is a
-/// second disk the scratch disk: on the root layout it is a volume.
-fn is_overlay_layout() -> bool {
-    std::fs::read_to_string("/proc/cmdline").is_ok_and(|cmdline| {
-        cmdline
-            .split_whitespace()
-            .any(|arg| arg == "burrow.layout=overlay")
-    })
-}
-
-fn try_pivot_to_overlay() -> anyhow::Result<()> {
-    // pivot_root refuses to work when the root's parent mount is shared.
-    mount(
-        None::<&str>,
-        "/",
-        None::<&str>,
-        MsFlags::MS_PRIVATE | MsFlags::MS_REC,
-        None::<&str>,
-    )?;
-
-    std::fs::create_dir_all(SCRATCH_MNT)?;
-    mount(
-        Some(SCRATCH_DEV),
-        SCRATCH_MNT,
-        Some("ext4"),
-        MsFlags::empty(),
-        None::<&str>,
-    )?;
-
-    let upper = format!("{SCRATCH_MNT}/upper");
-    let work = format!("{SCRATCH_MNT}/work");
-    let newroot = format!("{SCRATCH_MNT}/newroot");
-    for dir in [&upper, &work, &newroot] {
-        std::fs::create_dir_all(dir)?;
-    }
-
-    // upperdir and workdir must be on the same filesystem as each other and a
-    // different one from lowerdir, which is why they live on the scratch disk.
-    mount(
-        Some("overlay"),
-        newroot.as_str(),
-        Some("overlay"),
-        MsFlags::empty(),
-        Some(format!("lowerdir=/,upperdir={upper},workdir={work}").as_str()),
-    )?;
-
-    std::env::set_current_dir(&newroot)?;
-    std::fs::create_dir_all(format!("{newroot}/oldroot"))?;
-    // Relative to the new root, so this is <newroot>/oldroot.
-    nix::unistd::pivot_root(".", "oldroot")?;
-    std::env::set_current_dir("/")?;
-
-    // Detach rather than unmount: the overlay holds live references to the
-    // scratch mount, so it stays alive while leaving the namespace clean.
-    umount2("/oldroot", MntFlags::MNT_DETACH)?;
-    let _ = std::fs::remove_dir("/oldroot");
-    Ok(())
-}
+use nix::mount::{MsFlags, mount};
 
 /// Mounts the pseudo-filesystems userspace expects. Missing ones are created;
 /// already-mounted ones are ignored, so this is safe to call more than once.
@@ -165,7 +70,7 @@ pub fn mount_essentials() -> anyhow::Result<()> {
 /// working IP connectivity and no working name resolution, which looks like a
 /// network failure to anything running inside it.
 ///
-/// Requires a writable root, so it runs after any overlay pivot.
+/// Requires a writable root.
 pub fn write_resolv_conf() {
     let Ok(cmdline) = std::fs::read_to_string("/proc/cmdline") else {
         return;

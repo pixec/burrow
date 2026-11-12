@@ -14,7 +14,7 @@ service Guest {
   rpc SetPublicAddresses(NetworkConfig) returns (SetPublicAddressesResponse);
   // Acts on the root filesystem the guest booted from: flushes it, trims it,
   // freezes or thaws it for a disk-only capture, or grows it to fill a disk
-  // the host made bigger. Linux guests on the root layout only. An agent
+  // the host made bigger. Linux guests only. An agent
   // booted as a resize helper shrinks the disk it was given instead. A macOS
   // guest grows or shrinks its boot APFS container, live.
   rpc RootDisk(RootDiskRequest) returns (RootDiskResponse);
