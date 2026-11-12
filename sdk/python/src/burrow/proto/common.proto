@@ -56,6 +56,17 @@ message LifetimePolicy {
   // with idle_suspend_secs: idle parks a sandbox, and this is how long the
   // parked state is worth paying for.
   uint64 suspended_ttl_secs = 3;
+  // Checkpoint the running sandbox into the object store this often, so a
+  // node that dies takes only what changed since; 0 = never. Raised to the
+  // node's floor (`burrowd --checkpoint-min-secs`). A checkpoint holds the
+  // root disk and the writable volumes, captured with the guest's
+  // filesystems frozen for the instant a reflink clone takes, and is skipped
+  // when nothing changed since the last. Needs an object store.
+  uint64 checkpoint_secs = 4;
+  // Checkpoints capture memory as well, so a recovery resumes the guest's
+  // processes rather than booting on the saved disk. Pauses the guest for the
+  // memory write, as a fork does.
+  bool is_memory_checkpointed = 5;
 }
 
 // How long the snapshots taken of a sandbox stay paid for.
@@ -530,6 +541,21 @@ message Sandbox {
   // How the guest's filesystem sits on its disks. Fixed for the sandbox's
   // life and carried by its snapshots.
   DiskLayout disk_layout = 34;
+  // Unix milliseconds of the latest checkpoint in the object store; 0 for
+  // none. Once the node is gone, this is how much of the sandbox survives:
+  // what it did after this is lost.
+  int64 checkpoint_at_unix_ms = 35;
+  // What that checkpoint holds, and so what a recovery does: boot on the
+  // saved disk, or resume the saved memory.
+  CheckpointKind checkpoint_kind = 36;
+}
+
+enum CheckpointKind {
+  CHECKPOINT_KIND_UNSPECIFIED = 0;
+  // The root disk and writable volumes; a recovery boots on them.
+  CHECKPOINT_KIND_DISK = 1;
+  // Memory too; a recovery resumes the guest's processes.
+  CHECKPOINT_KIND_MEMORY = 2;
 }
 
 // How a guest's filesystem sits on its disks.

@@ -1306,7 +1306,13 @@ impl ApiService {
             is_template_transfer_allowed: true,
             node_labels,
             arch: sandbox.arch.clone(),
-            hypervisor_version: sandbox.hypervisor_version.clone(),
+            // A disk checkpoint is booted, not restored, so any version will do.
+            hypervisor_version: match sandbox.checkpoint_at_unix_ms > 0
+                && sandbox.checkpoint_kind == common::CheckpointKind::Disk as i32
+            {
+                true => String::new(),
+                false => sandbox.hypervisor_version.clone(),
+            },
             hypervisor: recorded_hypervisor(&sandbox.hypervisor),
             policy_features: with_disk_layout(
                 crate::registry::policy_features(
@@ -2082,6 +2088,8 @@ impl Burrow for ApiService {
                 snapshot_expiration_secs: req.snapshot_expiration_secs,
                 snapshot_keep_last: req.snapshot_keep_last,
                 is_evicted_snapshot_kept: req.is_evicted_snapshot_kept,
+                checkpoint_secs: req.checkpoint_secs,
+                is_memory_checkpointed: req.is_memory_checkpointed,
             })
             .await?
             .into_inner();
@@ -4082,6 +4090,36 @@ mod tests {
             .unwrap_err();
         assert_eq!(err.code(), tonic::Code::FailedPrecondition, "{err}");
         assert!(err.message().contains("on node node2"), "{err}");
+    }
+
+    /// A running sandbox with a checkpoint outlives its node like a suspended
+    /// one, and like it, one holding a public address recovers only there.
+    #[tokio::test]
+    async fn a_pinned_checkpoint_waits_for_its_node() {
+        let running = common::Sandbox {
+            state: common::SandboxState::Running as i32,
+            is_durable: false,
+            checkpoint_at_unix_ms: 1_787_000_000_000,
+            checkpoint_kind: common::CheckpointKind::Disk as i32,
+            ..sandbox_a("node1")
+        };
+        let api = pinned(running, &["node2"]).await;
+        let (_, unplaced) = api
+            .0
+            .sandboxes
+            .forget_node("node1", &common::NodeInfo::default());
+        assert_eq!(unplaced.len(), 1);
+        let err = api
+            .start_sandbox(Request::new(api::SandboxRef {
+                sandbox_id: "sbx_a".into(),
+            }))
+            .await
+            .unwrap_err();
+        assert_eq!(err.code(), tonic::Code::FailedPrecondition, "{err}");
+        assert!(
+            err.message().contains("node node1, and that node is down"),
+            "{err}"
+        );
     }
 
     /// A move whose target failed used to leave the sandbox suspended in the

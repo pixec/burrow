@@ -354,6 +354,8 @@ def to_lifetime(lifetime: LifetimePolicy) -> common_pb2.LifetimePolicy:
         max_lifetime_secs=lifetime.max_lifetime_secs,
         idle_suspend_secs=lifetime.idle_suspend_secs,
         suspended_ttl_secs=lifetime.suspended_ttl_secs,
+        checkpoint_secs=lifetime.checkpoint_secs,
+        is_memory_checkpointed=lifetime.checkpoint_memory,
     )
 
 
@@ -362,6 +364,8 @@ def from_lifetime(raw: common_pb2.LifetimePolicy) -> LifetimePolicy:
         max_lifetime_secs=raw.max_lifetime_secs,
         idle_suspend_secs=raw.idle_suspend_secs,
         suspended_ttl_secs=raw.suspended_ttl_secs,
+        checkpoint_secs=raw.checkpoint_secs,
+        checkpoint_memory=raw.is_memory_checkpointed,
     )
 
 

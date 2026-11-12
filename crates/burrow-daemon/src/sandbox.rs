@@ -196,6 +196,9 @@ pub struct NodeConfig {
     pub public: crate::publicip::PublicConfig,
     /// Which shapes are warmed, and how many snapshots are kept.
     pub warm: crate::warm::WarmPolicy,
+    /// The shortest interval a sandbox's checkpoints are taken at, whatever
+    /// its policy asks, so no tenant can hammer the object store.
+    pub checkpoint_min_secs: u64,
 }
 
 impl NodeConfig {
@@ -443,6 +446,8 @@ pub struct Lifetimes {
     pub snapshot_expiration_secs: Option<u64>,
     pub snapshot_keep_last: Option<u32>,
     pub is_evicted_snapshot_kept: Option<bool>,
+    pub checkpoint_secs: Option<u64>,
+    pub is_memory_checkpointed: Option<bool>,
 }
 
 /// What became of each field of a resources update, `None` for a field not
@@ -949,11 +954,27 @@ impl RunningSandbox {
         record.rx_bytes = usage.rx_bytes;
         record.tx_bytes = usage.tx_bytes;
         record.is_durable = self.durable.is_current();
-        if record.is_durable
-            && let Some(stored) = self.durable.stored.lock().unwrap().as_ref()
-        {
-            record.arch = stored.manifest.arch.clone();
-            record.hypervisor_version = stored.manifest.hypervisor_version.clone();
+        record.checkpoint_at_unix_ms = 0;
+        record.checkpoint_kind = common::CheckpointKind::Unspecified as i32;
+        if let Some(stored) = self.durable.stored.lock().unwrap().as_ref() {
+            if record.is_durable {
+                record.arch = stored.manifest.arch.clone();
+                record.hypervisor_version = stored.manifest.hypervisor_version.clone();
+            }
+            let kind = match stored.manifest.checkpoint.as_str() {
+                crate::durable::CHECKPOINT_DISK => common::CheckpointKind::Disk,
+                crate::durable::CHECKPOINT_MEMORY => common::CheckpointKind::Memory,
+                _ => common::CheckpointKind::Unspecified,
+            };
+            if stored.is_published
+                && kind != common::CheckpointKind::Unspecified
+                && record.state != common::SandboxState::Suspended as i32
+            {
+                record.checkpoint_at_unix_ms = stored.manifest.checkpoint_at_ms;
+                record.checkpoint_kind = kind as i32;
+                record.arch = stored.manifest.arch.clone();
+                record.hypervisor_version = stored.manifest.hypervisor_version.clone();
+            }
         }
         record
     }
@@ -1744,7 +1765,14 @@ impl RunningSandbox {
     /// is paused, so the disk a fork or a snapshot takes is the one the memory
     /// just written describes rather than one the guest has written to since.
     #[tracing::instrument(skip_all, fields(sandbox = %self.id(), diff))]
-    async fn checkpoint(&self, capture: Option<&Path>) -> Result<(), Status> {
+    /// Also clones each `(image, dest)` in `also` while the guest is paused,
+    /// so volumes are captured at the instant its memory is. Returns how long
+    /// the guest was paused.
+    async fn checkpoint(
+        &self,
+        capture: Option<&Path>,
+        also: &[(PathBuf, PathBuf)],
+    ) -> Result<std::time::Duration, Status> {
         // As in a suspend: a fork restores whatever the snapshot caught.
         self.await_handshake().await?;
         let mut slot = self.vm.lock().await;
@@ -1759,6 +1787,7 @@ impl RunningSandbox {
         tracing::Span::current().record("diff", diff);
         let next = Layout::diff(chain.len());
 
+        let paused = std::time::Instant::now();
         let result = async {
             vm.pause().await?;
             if diff {
@@ -1780,6 +1809,12 @@ impl RunningSandbox {
             let _ = vm.resume().await;
             return Err(Status::internal(format!("capturing the disk: {err}")));
         }
+        for (image, dest) in also {
+            if let Err(err) = crate::rootdisk::clone(image, dest).await {
+                let _ = vm.resume().await;
+                return Err(Status::internal(format!("capturing a volume: {err}")));
+            }
+        }
         // While the guest is still paused, so the mark holds no output the
         // snapshot does not.
         self.logs.mark_checkpoint();
@@ -1795,7 +1830,9 @@ impl RunningSandbox {
             current.len() > MAX_MEMORY_CHAIN
         };
 
-        if let Err(err) = vm.resume().await {
+        let resumed = vm.resume().await;
+        let paused_for = paused.elapsed();
+        if let Err(err) = resumed {
             let vm = slot.take().expect("the vm was present a moment ago");
             self.forget_agent().await;
             self.enter_suspended();
@@ -1821,7 +1858,7 @@ impl RunningSandbox {
             drop(slot);
             self.compact_memory_chain().await;
         }
-        Ok(())
+        Ok(paused_for)
     }
 
     /// Copies everything a fork needs into `dest`, and the command logs into
@@ -1839,7 +1876,7 @@ impl RunningSandbox {
     async fn stage_fork(
         &self,
         dest: &Path,
-        logs: &Path,
+        logs: Option<&Path>,
         capture: Option<&Path>,
     ) -> Result<Vec<String>, Status> {
         self.durable.settle_memory().await;
@@ -1898,11 +1935,13 @@ impl RunningSandbox {
         // The child's guest holds the same command table, so it needs the
         // output too: without it, a command that finished before the fork
         // replays nothing.
-        let (source, logs) = (Arc::clone(&self.logs), logs.to_path_buf());
-        tokio::task::spawn_blocking(move || source.copy_to(&logs))
-            .await
-            .map_err(|err| Status::internal(format!("forking command logs: {err}")))?
-            .map_err(|err| io("command logs", err))?;
+        if let Some(logs) = logs {
+            let (source, logs) = (Arc::clone(&self.logs), logs.to_path_buf());
+            tokio::task::spawn_blocking(move || source.copy_to(&logs))
+                .await
+                .map_err(|err| Status::internal(format!("forking command logs: {err}")))?
+                .map_err(|err| io("command logs", err))?;
+        }
         Ok(chain)
     }
 
@@ -1918,7 +1957,11 @@ impl RunningSandbox {
         capture: Option<&Path>,
     ) -> Result<crate::snapshot::Staged, Status> {
         let chain = self
-            .stage_fork(dest, &dest.join(crate::snapshot::COMMAND_LOGS), capture)
+            .stage_fork(
+                dest,
+                Some(&dest.join(crate::snapshot::COMMAND_LOGS)),
+                capture,
+            )
             .await?;
         let (vcpus, mem_mib) = {
             let spec = self.spec.lock().unwrap();
@@ -1988,7 +2031,7 @@ impl RestoreSource<'_> {
         match self {
             Self::Sandbox(source, capture) => Ok((
                 source
-                    .stage_fork(dest, logs_dir, capture.as_deref())
+                    .stage_fork(dest, Some(logs_dir), capture.as_deref())
                     .await?,
                 None,
             )),
@@ -4341,6 +4384,9 @@ impl SandboxManager {
         check: impl FnOnce(&common::SnapshotPolicy) -> Result<(), Status>,
     ) -> Result<common::Sandbox, Status> {
         let sandbox = self.get(sandbox_id).await?;
+        if lifetimes.checkpoint_secs.is_some_and(|secs| secs > 0) {
+            self.require_checkpoint_store()?;
+        }
         {
             let mut record = sandbox.base_record.lock().unwrap();
             let policy = record.policy.get_or_insert_with(Default::default);
@@ -4365,6 +4411,12 @@ impl SandboxManager {
             }
             if let Some(secs) = lifetimes.suspended_ttl_secs {
                 lifetime.suspended_ttl_secs = secs;
+            }
+            if let Some(secs) = lifetimes.checkpoint_secs {
+                lifetime.checkpoint_secs = secs;
+            }
+            if let Some(memory) = lifetimes.is_memory_checkpointed {
+                lifetime.is_memory_checkpointed = memory;
             }
         }
         self.persist(&sandbox).await;
@@ -5606,6 +5658,8 @@ impl SandboxManager {
                 is_durable: record.is_durable,
                 is_fenced,
                 state_reason: record.state_reason,
+                checkpoint_at_unix_ms: record.checkpoint_at_unix_ms,
+                checkpoint_kind: record.checkpoint_kind,
             };
         let mut reports: Vec<_> = self
             .sandboxes
@@ -6609,8 +6663,9 @@ impl SandboxManager {
         &self,
         sandbox: &Arc<RunningSandbox>,
         capture: Option<&Path>,
-    ) -> Result<(), Status> {
-        let result = sandbox.checkpoint(capture).await;
+        also: &[(PathBuf, PathBuf)],
+    ) -> Result<std::time::Duration, Status> {
+        let result = sandbox.checkpoint(capture, also).await;
         // The pause ended the feed along with every other connection, and a
         // command still running has output to send.
         sandbox.ensure_feed();
@@ -6649,7 +6704,7 @@ impl SandboxManager {
         let capture = sandbox.workdir.join(format!(".capture-{snapshot_id}"));
         let is_captured = sandbox.is_running();
         if is_captured {
-            self.write_state(&sandbox, Some(&capture)).await?;
+            self.write_state(&sandbox, Some(&capture), &[]).await?;
         } else if sandbox.state.load(std::sync::atomic::Ordering::Relaxed)
             != common::SandboxState::Suspended as i32
         {
@@ -6874,7 +6929,7 @@ impl SandboxManager {
         let capture = source.workdir.join(format!(".capture-{child_id}"));
         let is_captured = source.is_running();
         if is_captured {
-            self.write_state(source, Some(&capture)).await?;
+            self.write_state(source, Some(&capture), &[]).await?;
         } else if source.state.load(std::sync::atomic::Ordering::Relaxed)
             != common::SandboxState::Suspended as i32
         {
@@ -7512,6 +7567,12 @@ impl SandboxManager {
     /// Boots a stopped sandbox on its existing disks.
     pub async fn start(&self, id: &str) -> Result<common::Sandbox, Status> {
         let sandbox = self.get(id).await?;
+        if sandbox.durable.is_fenced() {
+            return Err(Status::unavailable(format!(
+                "sandbox {id} has a checkpoint in the object store, and this node is waiting for \
+                 the orchestrator to confirm it still holds it; try again shortly"
+            )));
+        }
         let record = sandbox.record();
         // Refused for the reason a resume is: a node past its reserve.
         if !sandbox.is_running() {
@@ -7778,6 +7839,12 @@ impl SandboxManager {
                 .cloned()
                 .collect();
             for sandbox in running {
+                // Its checkpoints carry its volumes, at the instant they carry
+                // its memory, and an upload between them would be newer.
+                let lifetime = sandbox.lifetime();
+                if lifetime.checkpoint_secs > 0 && lifetime.is_memory_checkpointed {
+                    continue;
+                }
                 self.upload_live_volumes(&sandbox).await;
             }
         }
@@ -7904,45 +7971,8 @@ impl SandboxManager {
                 .store(true, std::sync::atomic::Ordering::Relaxed);
             return Ok(true);
         }
-        let record = sandbox.record();
-        let Some(secrets) = self.seal_for_store(&record)? else {
-            tracing::warn!(
-                sandbox = sandbox.id(),
-                "sandbox holds brokered credentials and this node has no \
-                 --object-store-key-file; it stays on this node"
-            );
+        let Some(draft) = self.draft_manifest(sandbox, previous.as_ref()).await? else {
             return Ok(false);
-        };
-        let (vcpus, mem_mib) = {
-            let spec = sandbox.spec.lock().unwrap();
-            (spec.vcpus, spec.mem_mib)
-        };
-        let is_systemd = match &previous {
-            Some(previous) => previous.manifest.is_systemd,
-            None => self.image_environment(sandbox.template()).await.systemd,
-        };
-        let draft = crate::durable::Manifest {
-            format: 0,
-            id: sandbox.id().to_string(),
-            generation: 0,
-            node_id: record.node_id.clone(),
-            state: String::new(),
-            template: sandbox.template().to_string(),
-            vcpus,
-            mem_mib,
-            disk_mib: size_mib(&sandbox.disk_path()),
-            disk_layout: sandbox.disk_layout().as_str().to_string(),
-            is_systemd,
-            arch: std::env::consts::ARCH.to_string(),
-            hypervisor_version: self.config.version(sandbox.hypervisor).to_string(),
-            hypervisor: sandbox.hypervisor.to_string(),
-            kernel_digest: String::new(),
-            rootfs_digest: String::new(),
-            cpu_usage_usec: record.cpu_usage_usec,
-            rx_bytes: record.rx_bytes,
-            tx_bytes: record.tx_bytes,
-            secrets,
-            inspection_root: record.inspection_root_fingerprint.clone(),
         };
         let uploaded = tokio::select! {
             () = token.cancelled() => return Ok(false),
@@ -7969,6 +7999,59 @@ impl SandboxManager {
             .store(true, std::sync::atomic::Ordering::Relaxed);
         self.announce_now();
         Ok(true)
+    }
+
+    /// What a manifest says about a sandbox, before an upload fills in its
+    /// generation and digests. `None` when its brokered credentials cannot be
+    /// sealed for the store.
+    async fn draft_manifest(
+        &self,
+        sandbox: &RunningSandbox,
+        previous: Option<&crate::durable::LocalState>,
+    ) -> Result<Option<crate::durable::Manifest>, Status> {
+        let record = sandbox.record();
+        let Some(secrets) = self.seal_for_store(&record)? else {
+            tracing::warn!(
+                sandbox = sandbox.id(),
+                "sandbox holds brokered credentials and this node has no \
+                 --object-store-key-file; it stays on this node"
+            );
+            return Ok(None);
+        };
+        let (vcpus, mem_mib) = {
+            let spec = sandbox.spec.lock().unwrap();
+            (spec.vcpus, spec.mem_mib)
+        };
+        let is_systemd = match previous {
+            Some(previous) => previous.manifest.is_systemd,
+            None => self.image_environment(sandbox.template()).await.systemd,
+        };
+        Ok(Some(crate::durable::Manifest {
+            format: 0,
+            id: sandbox.id().to_string(),
+            generation: 0,
+            node_id: record.node_id.clone(),
+            state: String::new(),
+            template: sandbox.template().to_string(),
+            vcpus,
+            mem_mib,
+            disk_mib: size_mib(&sandbox.disk_path()),
+            disk_layout: sandbox.disk_layout().as_str().to_string(),
+            is_systemd,
+            arch: std::env::consts::ARCH.to_string(),
+            hypervisor_version: self.config.version(sandbox.hypervisor).to_string(),
+            hypervisor: sandbox.hypervisor.to_string(),
+            kernel_digest: String::new(),
+            rootfs_digest: String::new(),
+            cpu_usage_usec: record.cpu_usage_usec,
+            rx_bytes: record.rx_bytes,
+            tx_bytes: record.tx_bytes,
+            secrets,
+            inspection_root: record.inspection_root_fingerprint.clone(),
+            checkpoint: String::new(),
+            checkpoint_at_ms: 0,
+            volumes: Default::default(),
+        }))
     }
 
     /// The record's brokered credentials sealed for the store, or `None` when
@@ -8142,7 +8225,12 @@ impl SandboxManager {
         if !lapsed {
             return;
         }
+        let mut checkpointed = Vec::new();
         for sandbox in self.sandboxes.lock().await.values() {
+            if sandbox.is_running() && sandbox.record().checkpoint_at_unix_ms > 0 {
+                checkpointed.push(sandbox.id().to_string());
+                continue;
+            }
             if sandbox.durable.has_stored() && !sandbox.is_running() && !sandbox.durable.is_fenced()
             {
                 tracing::warn!(
@@ -8152,6 +8240,28 @@ impl SandboxManager {
                 );
                 sandbox.durable.set_fenced(true);
             }
+        }
+        // Another node may be handed its checkpoint once this one is written
+        // off, so it stops here first, suspending into the store if it can.
+        for id in checkpointed {
+            tracing::warn!(
+                sandbox = id,
+                "lost the orchestrator's lease; suspending this checkpointed sandbox so it does \
+                 not run here while another node recovers it"
+            );
+            let manager = self.clone();
+            tokio::spawn(async move {
+                let Ok(sandbox) = manager.get(&id).await else {
+                    return;
+                };
+                match manager.pause(&id).await {
+                    Ok(_) => sandbox.durable.set_fenced(true),
+                    Err(err) if sandbox.is_running() => {
+                        tracing::error!(sandbox = id, %err, "could not suspend")
+                    }
+                    Err(_) => {}
+                }
+            });
         }
     }
 
@@ -8338,17 +8448,30 @@ impl SandboxManager {
                 Status::not_found(format!("sandbox {id} has no state in the object store"))
             })?;
         let manifest = &held.manifest;
-        if manifest.state != crate::durable::STATE_SUSPENDED {
+        if !manifest.is_adoptable() {
             return Err(Status::failed_precondition(format!(
-                "sandbox {id} was running on {} when it was last heard of; what the object store \
-                 holds is from before that, and is not resumed in its place",
+                "sandbox {id} was running on {} when it was last heard of, with no checkpoint; \
+                 what the object store holds is from before that, and is not resumed in its place",
                 manifest.node_id
             )));
         }
         let hypervisor = manifest.hypervisor()?;
         self.require_hypervisor(hypervisor)?;
+        let mut boots = manifest.checkpoint == crate::durable::CHECKPOINT_DISK;
+        if manifest.checkpoint == crate::durable::CHECKPOINT_MEMORY {
+            for (name, generation) in &manifest.volumes {
+                if self.volumes.generation(name).await != Some(*generation) {
+                    tracing::warn!(
+                        sandbox = id,
+                        volume = name,
+                        "volume moved on since the memory checkpoint; booting on its disk instead"
+                    );
+                    boots = true;
+                }
+            }
+        }
         if manifest.arch != std::env::consts::ARCH
-            || manifest.hypervisor_version != self.config.version(hypervisor)
+            || (!boots && manifest.hypervisor_version != self.config.version(hypervisor))
         {
             return Err(Status::failed_precondition(format!(
                 "sandbox {id} was stored on {} under {hypervisor} {} and cannot restore on this \
@@ -8381,6 +8504,11 @@ impl SandboxManager {
             }
         }
         let read = started.elapsed();
+        if boots {
+            let booted = self.adopt_booting(store, &held, record, node_id).await;
+            self.creating.lock().await.remove(&id);
+            return booted;
+        }
         let adopted = self
             .adopt_inner(store, &held, record, node_id.clone())
             .await;
@@ -8501,6 +8629,204 @@ impl SandboxManager {
         Ok((sandbox, from, disk))
     }
 
+    /// Takes over a sandbox from a disk checkpoint by booting on it: what
+    /// its guest had in memory is gone, and its disk is as the checkpoint
+    /// left it.
+    async fn adopt_booting(
+        &self,
+        store: &crate::objstore::ObjectStore,
+        held: &crate::durable::Held,
+        record: common::Sandbox,
+        node_id: String,
+    ) -> Result<common::Sandbox, Status> {
+        let manifest = &held.manifest;
+        let id = record.id.clone();
+        let from = manifest.node_id.clone();
+        let mut claimed = manifest.clone();
+        claimed.state = crate::durable::STATE_RUNNING.to_string();
+        claimed.node_id = node_id.clone();
+        crate::durable::replace_manifest(store, Some(held), &claimed).await?;
+        let sandbox = match self
+            .provision_from_checkpoint(store, &claimed, record, node_id.clone())
+            .await
+        {
+            Ok(sandbox) => sandbox,
+            Err(err) => {
+                self.hand_back(store, &node_id, manifest).await;
+                return Err(err);
+            }
+        };
+        if let Err(err) = self.start(&id).await {
+            self.sandboxes.lock().await.remove(&id);
+            if let Err(err) = self.tear_down(sandbox).await {
+                tracing::warn!(sandbox = id, %err, "could not release a failed adopt");
+            }
+            self.hand_back(store, &node_id, manifest).await;
+            return Err(err);
+        }
+        tracing::info!(
+            sandbox = id,
+            from,
+            checkpoint_at_ms = manifest.checkpoint_at_ms,
+            "sandbox booted on its checkpointed disk"
+        );
+        Ok(sandbox.record())
+    }
+
+    /// Builds a stopped sandbox on a checkpoint's disk, in the map and ready
+    /// for [`Self::start`].
+    async fn provision_from_checkpoint(
+        &self,
+        store: &crate::objstore::ObjectStore,
+        manifest: &crate::durable::Manifest,
+        record: common::Sandbox,
+        node_id: String,
+    ) -> Result<Arc<RunningSandbox>, Status> {
+        let id = record.id.clone();
+        let hypervisor = manifest.hypervisor()?;
+        let disk_layout = manifest.disk_layout();
+        let workdir = self.config.sandbox_dir(&id, hypervisor);
+        let mut policy = record.policy.clone().unwrap_or_default();
+        let resources = common::ResourcePolicy {
+            vcpus: manifest.vcpus,
+            mem_mib: manifest.mem_mib,
+            disk_mib: manifest.disk_mib,
+        };
+        policy.resources = Some(resources);
+        let _disk = self
+            .admit_disk(
+                &node_id,
+                "recover a sandbox",
+                u64::from(resources.disk_mib) * burrow_common::disk::MIB,
+            )
+            .await?;
+        crate::volume::validate_mounts(&policy.volumes)?;
+        for (_, mount) in crate::volume::block_mounts(&policy.volumes) {
+            if !tokio::fs::try_exists(self.volumes.image(&mount.volume))
+                .await
+                .unwrap_or(false)
+            {
+                return Err(Status::not_found(format!(
+                    "no volume {} on this node",
+                    mount.volume
+                )));
+            }
+        }
+        let guest_os = self
+            .image_environment(&manifest.template)
+            .await
+            .machine()
+            .map_or_else(|_| Default::default(), |(_, os)| os);
+        let mut guard = Provisioning::new(self, &id, &workdir);
+        let lease = match self.ipam.lock().await.allocate(&id) {
+            Ok(lease) => lease,
+            Err(err) => {
+                return Err(guard
+                    .fail(Status::resource_exhausted(format!(
+                        "address allocation: {err}"
+                    )))
+                    .await);
+            }
+        };
+        let stage = async {
+            let _ = tokio::fs::remove_dir_all(&workdir).await;
+            tokio::fs::create_dir_all(&workdir)
+                .await
+                .map_err(|err| Status::internal(format!("creating the workdir: {err}")))?;
+            let local =
+                crate::durable::stage_disk(store, &self.snapshots, manifest, &workdir).await?;
+            for (index, mount) in crate::volume::block_mounts(&policy.volumes) {
+                tokio::fs::hard_link(
+                    self.volumes.image(&mount.volume),
+                    workdir.join(volume_image(index)),
+                )
+                .await
+                .map_err(|err| {
+                    Status::internal(format!("attaching volume {}: {err}", mount.volume))
+                })?;
+            }
+            Ok::<_, Status>(local)
+        };
+        let (staged, tap) = tokio::join!(stage, tap::create(&lease));
+        guard.tap = tap.as_ref().ok().cloned();
+        let local = match staged {
+            Ok(local) => local,
+            Err(err) => return Err(guard.fail(err).await),
+        };
+        let tap_name = match tap {
+            Ok(name) => name,
+            Err(err) => {
+                return Err(guard
+                    .fail(Status::internal(format!("tap setup: {err}")))
+                    .await);
+            }
+        };
+        let spec = self.build_spec(
+            &id,
+            &workdir,
+            hypervisor,
+            guest_os,
+            &resources,
+            &lease,
+            &tap_name,
+            &policy.volumes,
+            manifest.is_systemd,
+            disk_layout,
+        );
+        let record = common::Sandbox {
+            id: id.clone(),
+            node_id,
+            template: manifest.template.clone(),
+            state: common::SandboxState::Stopped as i32,
+            policy: Some(policy),
+            guest_ip: lease.guest_ip.to_string(),
+            hypervisor: hypervisor.to_string(),
+            guest_os: guest_os.as_str().to_string(),
+            disk_layout: disk_layout.to_proto() as i32,
+            state_reason: String::new(),
+            ..record
+        };
+        guard.keep();
+        let sandbox = Arc::new(RunningSandbox {
+            id: id.clone(),
+            template: record.template.clone(),
+            hypervisor,
+            base_record: std::sync::Mutex::new(record.clone()),
+            state: std::sync::atomic::AtomicI32::new(common::SandboxState::Stopped as i32),
+            vm: Mutex::new(None),
+            spec: std::sync::Mutex::new(spec),
+            last_activity: std::sync::atomic::AtomicI64::new(burrow_common::unix_now()),
+            suspended_at: std::sync::atomic::AtomicI64::new(0),
+            agent_channel: Mutex::new(None),
+            agent_features: Mutex::new(None),
+            agent_timeout: self.config.agent_timeout,
+            handshake: settled(),
+            memory_chain: Mutex::new(Vec::new()),
+            usage: std::sync::Mutex::new(Usage {
+                cpu_usec: record.cpu_usage_usec.max(manifest.cpu_usage_usec),
+                rx_bytes: record.rx_bytes.max(manifest.rx_bytes),
+                tx_bytes: record.tx_bytes.max(manifest.tx_bytes),
+                ..Default::default()
+            }),
+            session: std::sync::Mutex::new(None),
+            durable: Default::default(),
+            logs: Arc::new(crate::cmdlogs::CommandLogs::new(
+                &self.config.command_logs_dir(&id),
+                self.config.command_log_rotation,
+            )),
+            workdir,
+            lease,
+            tap: tap_name,
+        });
+        *sandbox.durable.stored.lock().unwrap() = Some(local);
+        if let Err(err) = self.register(&sandbox).await {
+            let _ = self.tear_down(Arc::clone(&sandbox)).await;
+            return Err(err);
+        }
+        self.persist(&sandbox).await;
+        Ok(sandbox)
+    }
+
     /// Puts back the manifest a failed adopt claimed over, provided the store
     /// still names this node: the guest never ran, or was stopped, so the
     /// state is exactly as it was read.
@@ -8537,6 +8863,329 @@ impl SandboxManager {
                 tracing::warn!(%err, "could not collect unreferenced stored state");
             }
         }
+    }
+}
+
+/// When a sandbox was last checkpointed, and what it had done by then.
+struct CheckpointClock {
+    at: std::time::Instant,
+    cpu_usec: u64,
+    activity: i64,
+}
+
+/// How many sandboxes a node checkpoints at once.
+const CHECKPOINTS_AT_ONCE: usize = 2;
+
+/// Checkpointing running sandboxes into the object store.
+impl SandboxManager {
+    /// Refuses checkpoints on a node with nowhere to keep them.
+    #[allow(clippy::result_large_err)]
+    pub fn require_checkpoint_store(&self) -> Result<(), Status> {
+        match self.config.object_store {
+            Some(_) => Ok(()),
+            None => Err(Status::failed_precondition(
+                "checkpoints need an object store; this node has no --object-store",
+            )),
+        }
+    }
+
+    /// Refuses a policy asking for checkpoints on a node that cannot keep them.
+    #[allow(clippy::result_large_err)]
+    pub fn require_checkpointable(&self, policy: &common::Policy) -> Result<(), Status> {
+        match policy.lifetime.is_some_and(|l| l.checkpoint_secs > 0) {
+            true => self.require_checkpoint_store(),
+            false => Ok(()),
+        }
+    }
+
+    /// Checkpoints every running sandbox whose policy asks for it, once its
+    /// interval, raised to the node's floor, has passed since the last.
+    pub async fn checkpoint_running(&self) {
+        if self.config.object_store.is_none() {
+            return;
+        }
+        let floor = self.config.checkpoint_min_secs.max(1);
+        let limit = Arc::new(tokio::sync::Semaphore::new(CHECKPOINTS_AT_ONCE));
+        let clocks: Arc<std::sync::Mutex<HashMap<String, CheckpointClock>>> = Arc::default();
+        let busy: Arc<std::sync::Mutex<std::collections::HashSet<String>>> = Arc::default();
+        loop {
+            tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+            let running: Vec<Arc<RunningSandbox>> = self
+                .sandboxes
+                .lock()
+                .await
+                .values()
+                .filter(|sandbox| sandbox.is_running() && sandbox.lifetime().checkpoint_secs > 0)
+                .cloned()
+                .collect();
+            {
+                let ids: std::collections::HashSet<&str> =
+                    running.iter().map(|sandbox| sandbox.id()).collect();
+                clocks
+                    .lock()
+                    .unwrap()
+                    .retain(|id, _| ids.contains(id.as_str()));
+            }
+            for sandbox in running {
+                let every =
+                    std::time::Duration::from_secs(sandbox.lifetime().checkpoint_secs.max(floor));
+                let id = sandbox.id().to_string();
+                let is_due = clocks
+                    .lock()
+                    .unwrap()
+                    .get(&id)
+                    .is_none_or(|clock| clock.at.elapsed() >= every);
+                if !is_due || !busy.lock().unwrap().insert(id.clone()) {
+                    continue;
+                }
+                let (manager, limit, clocks, busy) = (
+                    self.clone(),
+                    Arc::clone(&limit),
+                    Arc::clone(&clocks),
+                    Arc::clone(&busy),
+                );
+                tokio::spawn(async move {
+                    let _slot = limit.acquire().await;
+                    let since = clocks.lock().unwrap().remove(&id);
+                    let clock = CheckpointClock {
+                        at: std::time::Instant::now(),
+                        cpu_usec: sandbox.record().cpu_usage_usec,
+                        activity: sandbox
+                            .last_activity
+                            .load(std::sync::atomic::Ordering::Relaxed),
+                    };
+                    if let Err(err) = manager.checkpoint_sandbox(&sandbox, since.as_ref()).await {
+                        tracing::warn!(sandbox = id, err = err.message(), "checkpoint failed");
+                    }
+                    clocks.lock().unwrap().insert(id.clone(), clock);
+                    busy.lock().unwrap().remove(&id);
+                });
+            }
+        }
+    }
+
+    /// Whether a sandbox's disks are as its last checkpoint left them and,
+    /// for a memory checkpoint, its guest has been idle since: nobody called
+    /// into it and it spent under 1% of a CPU.
+    async fn is_unchanged_since(
+        &self,
+        sandbox: &RunningSandbox,
+        since: Option<&CheckpointClock>,
+        is_memory: bool,
+    ) -> bool {
+        let Some(stored) = sandbox.durable.stored.lock().unwrap().clone() else {
+            return false;
+        };
+        let kind = match is_memory {
+            true => crate::durable::CHECKPOINT_MEMORY,
+            false => crate::durable::CHECKPOINT_DISK,
+        };
+        if !stored.is_published || stored.manifest.checkpoint != kind {
+            return false;
+        }
+        if crate::durable::Stamp::of(&sandbox.disk_path()).ok() != Some(stored.disk) {
+            // A freeze and thaw rewrite the superblock alone, which the clone
+            // the last disk checkpoint kept tells apart from a guest's writes.
+            let (disk, base) = (
+                sandbox.disk_path(),
+                sandbox.workdir.join(crate::durable::CHECKPOINT_BASE),
+            );
+            let is_changed = is_memory
+                || tokio::task::spawn_blocking(move || {
+                    crate::rootdisk::changed_since(&disk, &base).unwrap_or(true)
+                })
+                .await
+                .unwrap_or(true);
+            if is_changed {
+                return false;
+            }
+        }
+        for (name, _) in self.written_volumes(sandbox) {
+            if self.volumes.is_changed(&name).await {
+                return false;
+            }
+        }
+        if !is_memory {
+            return true;
+        }
+        let Some(since) = since else {
+            return false;
+        };
+        let spent = sandbox
+            .record()
+            .cpu_usage_usec
+            .saturating_sub(since.cpu_usec);
+        sandbox
+            .last_activity
+            .load(std::sync::atomic::Ordering::Relaxed)
+            <= since.activity
+            && u128::from(spent) * 100 < since.at.elapsed().as_micros()
+    }
+
+    /// Takes one checkpoint of a running sandbox, skipping it when nothing
+    /// changed since the last.
+    async fn checkpoint_sandbox(
+        &self,
+        sandbox: &Arc<RunningSandbox>,
+        since: Option<&CheckpointClock>,
+    ) -> Result<(), Status> {
+        let Some(store) = self.config.object_store.clone() else {
+            return Ok(());
+        };
+        let is_memory = sandbox.lifetime().is_memory_checkpointed
+            && sandbox.layout().memory.is_some()
+            && !crate::macnode::is_macos(
+                burrow_vmm::GuestOs::from_record(&sandbox.record().guest_os).unwrap_or_default(),
+            );
+        if self.is_unchanged_since(sandbox, since, is_memory).await {
+            tracing::debug!(
+                sandbox = sandbox.id(),
+                "nothing changed; checkpoint skipped"
+            );
+            return Ok(());
+        }
+        let previous = sandbox.durable.stored.lock().unwrap().clone();
+        let Some(mut draft) = self.draft_manifest(sandbox, previous.as_ref()).await? else {
+            return Ok(());
+        };
+        draft.checkpoint_at_ms = burrow_common::unix_now_ms();
+        let token = sandbox.durable.cancel.lock().unwrap().clone();
+        // Taken before the guest is touched, so the freeze or pause never
+        // waits on an upload still running.
+        let mut volumes = Vec::new();
+        for (name, path) in self.written_volumes(sandbox) {
+            let guard = self.volumes.lock_upload(&name).await;
+            volumes.push((name, path, guard));
+        }
+        let capture = sandbox.workdir.join(".checkpoint.ext4");
+        let started = std::time::Instant::now();
+        // Read before each clone, with the disks still: a later read that
+        // matches means nothing was written since the clone either.
+        let stamps = || {
+            std::iter::once(sandbox.disk_path())
+                .chain(volumes.iter().map(|(name, _, _)| self.volumes.image(name)))
+                .map(|path| crate::durable::Stamp::of(&path))
+                .collect::<std::io::Result<Vec<_>>>()
+        };
+        let volume_captures: Vec<(PathBuf, PathBuf)> = volumes
+            .iter()
+            .map(|(name, _, _)| {
+                (
+                    self.volumes.image(name),
+                    sandbox.workdir.join(format!(".checkpoint-{name}.img")),
+                )
+            })
+            .collect();
+        let (paused_for, is_frozen, stamps) = match is_memory {
+            true => {
+                let stamps = stamps()
+                    .map_err(|err| Status::internal(format!("reading the disks: {err}")))?;
+                let paused_for = self
+                    .write_state(sandbox, Some(&capture), &volume_captures)
+                    .await?;
+                (paused_for, false, stamps)
+            }
+            false => {
+                let mut paths: Vec<String> =
+                    volumes.iter().map(|(_, path, _)| path.clone()).collect();
+                if sandbox.disk_layout() == DiskLayout::Root {
+                    paths.insert(0, "/".to_string());
+                }
+                let disk = sandbox.disk_path();
+                let (captured, frozen_for, is_frozen) = with_frozen(sandbox, paths, async {
+                    let stamps = stamps()?;
+                    crate::rootdisk::clone(&disk, &capture).await?;
+                    for (image, dest) in &volume_captures {
+                        crate::rootdisk::clone(image, dest).await?;
+                    }
+                    Ok::<_, std::io::Error>(stamps)
+                })
+                .await;
+                let stamps = captured
+                    .map_err(|err| Status::internal(format!("capturing the disks: {err}")))?;
+                (frozen_for, is_frozen, stamps)
+            }
+        };
+        let mut stamps = stamps.into_iter();
+        let stamp = stamps.next().unwrap_or_default();
+        tracing::info!(
+            sandbox = sandbox.id(),
+            kind = if is_memory { "memory" } else { "disk" },
+            paused_ms = paused_for.as_millis() as u64,
+            is_frozen,
+            "checkpoint captured"
+        );
+
+        let _uploading = sandbox.durable.upload.lock().await;
+        let uploaded = tokio::select! {
+            () = token.cancelled() => Err(Status::aborted("the sandbox suspended or stopped")),
+            uploaded = async {
+                for (((name, _, _), (_, dest)), stamp) in
+                    volumes.iter().zip(&volume_captures).zip(stamps)
+                {
+                    self.volumes.upload_capture(name, dest, stamp).await?;
+                    if let Some(generation) = self.volumes.generation(name).await {
+                        draft.volumes.insert(name.clone(), generation);
+                    }
+                }
+                let blobs = crate::blobs::BlobStore::new(&self.config.data_dir);
+                match is_memory {
+                    true => {
+                        let staged = sandbox.workdir.join(".checkpoint");
+                        let _ = tokio::fs::remove_dir_all(&staged).await;
+                        tokio::fs::create_dir_all(&staged)
+                            .await
+                            .map_err(|err| Status::internal(format!("staging: {err}")))?;
+                        draft.checkpoint = crate::durable::CHECKPOINT_MEMORY.to_string();
+                        let chain = sandbox.stage_fork(&staged, None, Some(&capture)).await?;
+                        let mut uploaded = crate::durable::upload(
+                            &store,
+                            &blobs,
+                            &staged,
+                            sandbox.logs.dir(),
+                            &chain,
+                            draft,
+                            previous.as_ref(),
+                        )
+                        .await;
+                        if let Ok(local) = &mut uploaded {
+                            local.disk = stamp;
+                        }
+                        let _ = tokio::fs::remove_dir_all(&staged).await;
+                        uploaded
+                    }
+                    false => {
+                        crate::durable::upload_disk_checkpoint(
+                            &store,
+                            &blobs,
+                            &sandbox.workdir,
+                            &capture,
+                            stamp,
+                            draft,
+                            previous.as_ref(),
+                        )
+                        .await
+                    }
+                }
+            } => uploaded,
+        };
+        drop(volumes);
+        for (_, dest) in &volume_captures {
+            let _ = tokio::fs::remove_file(dest).await;
+        }
+        let _ = tokio::fs::remove_file(&capture).await;
+        let local = uploaded?;
+        // Kept in the working directory as a suspend's record is, so a
+        // restarted node knows what the store holds.
+        crate::durable::save_local(&sandbox.workdir, &local).await?;
+        *sandbox.durable.stored.lock().unwrap() = Some(local);
+        self.announce_now();
+        tracing::info!(
+            sandbox = sandbox.id(),
+            took_ms = started.elapsed().as_millis() as u64,
+            "checkpoint is in the object store"
+        );
+        Ok(())
     }
 }
 
@@ -8940,6 +9589,7 @@ pub(crate) mod tests {
                 disk: Default::default(),
                 public: Default::default(),
                 warm: Default::default(),
+                checkpoint_min_secs: 60,
             },
             Arc::new(burrow_proxy::PolicyTable::default()),
             Arc::new(burrow_proxy::Resolutions::default()),

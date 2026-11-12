@@ -95,6 +95,11 @@ pub struct ServeArgs {
     /// suspends. 0 uploads only then. Needs --object-store.
     #[arg(long, default_value_t = 300, env = "BURROWD_VOLUME_UPLOAD_SECS")]
     pub volume_upload_secs: u64,
+    /// The shortest interval a running sandbox is checkpointed at: a policy
+    /// asking for less is checkpointed this often instead, so no tenant can
+    /// hammer the object store.
+    #[arg(long, default_value_t = 60, env = "BURROWD_CHECKPOINT_MIN_SECS")]
+    pub checkpoint_min_secs: u64,
     /// Appended to every guest kernel command line.
     #[arg(
         long,
@@ -1456,6 +1461,7 @@ pub async fn run(args: ServeArgs) -> anyhow::Result<()> {
             },
             public: public_config(&args),
             warm: warm_policy(&args),
+            checkpoint_min_secs: args.checkpoint_min_secs,
         },
         Arc::clone(&proxy_policies),
         Arc::clone(&resolutions),
@@ -1488,6 +1494,10 @@ pub async fn run(args: ServeArgs) -> anyhow::Result<()> {
         let sandboxes = sandboxes.clone();
         let every = Duration::from_secs(args.volume_upload_secs);
         tokio::spawn(async move { sandboxes.upload_volumes(every).await });
+    }
+    {
+        let sandboxes = sandboxes.clone();
+        tokio::spawn(async move { sandboxes.checkpoint_running().await });
     }
     {
         let sandboxes = sandboxes.clone();

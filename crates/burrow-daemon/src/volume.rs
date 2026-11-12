@@ -613,14 +613,34 @@ impl VolumeStore {
             .and_then(|claim| claim.writer.clone())
     }
 
-    /// Whether the image may differ from what the store holds.
+    /// Whether the image may differ from what the store holds. A freeze and
+    /// thaw rewrite the superblock alone, so an image whose file changed is
+    /// compared with the clone of its last upload before it counts.
     pub async fn is_changed(&self, name: &str) -> bool {
-        match crate::volstore::load_local(&self.dir(name)).await {
-            Some(local) if local.is_published => {
-                crate::durable::Stamp::of(&self.image(name)).is_ok_and(|now| now != local.stamp)
-            }
-            _ => true,
+        let Some(local) = crate::volstore::load_local(&self.dir(name))
+            .await
+            .filter(|local| local.is_published)
+        else {
+            return true;
+        };
+        let image = self.image(name);
+        if crate::durable::Stamp::of(&image).is_ok_and(|now| now == local.stamp) {
+            return false;
         }
+        let base = self.dir(name).join(crate::volstore::BASE);
+        tokio::task::spawn_blocking(move || {
+            crate::rootdisk::changed_since(&image, &base).unwrap_or(true)
+        })
+        .await
+        .unwrap_or(true)
+    }
+
+    /// The generation of the volume this node last uploaded or adopted.
+    pub async fn generation(&self, name: &str) -> Option<u64> {
+        crate::volstore::load_local(&self.dir(name))
+            .await
+            .filter(|local| local.is_published)
+            .map(|local| local.manifest.generation)
     }
 
     /// A reflink clone of the image for an upload to read, with the image's

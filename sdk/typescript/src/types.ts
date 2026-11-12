@@ -231,9 +231,25 @@ export interface LifetimeOptions {
    * `suspended`, so it composes with `idleSuspendSecs`.
    */
   suspendedTtlSecs?: number;
+  /**
+   * Checkpoint the running sandbox into the object store this often, so a
+   * node that dies takes only what changed since. Raised to the node's floor
+   * (`burrowd --checkpoint-min-secs`). 0 never checkpoints. Needs an object
+   * store.
+   */
+  checkpointSecs?: number;
+  /**
+   * Capture memory in each checkpoint as well, so a recovery resumes the
+   * guest's processes rather than booting on its disk. Pauses the guest for
+   * the memory write.
+   */
+  checkpointMemory?: boolean;
 }
 
 export type LifetimePolicy = Required<LifetimeOptions>;
+
+/** What a checkpoint holds: the disks, or memory too. */
+export type CheckpointKind = "disk" | "memory";
 
 /** How long snapshots taken of the sandbox stay paid for. */
 export interface SnapshotPolicyOptions {
@@ -457,6 +473,16 @@ export interface SandboxInfo {
   guestOs: string;
   /** Public addresses of either family attached to it. */
   publicIps: PublicIp[];
+  /**
+   * When its latest checkpoint was captured; `null` for none. Once its node
+   * is gone, what it did after this is lost.
+   */
+  checkpointAt: Date | null;
+  /**
+   * What that checkpoint holds, and so what a recovery does: boot on the
+   * saved disk, or resume the saved memory. `null` for none.
+   */
+  checkpointKind: CheckpointKind | null;
 }
 
 /** A dedicated public address, as the orchestrator records it. */

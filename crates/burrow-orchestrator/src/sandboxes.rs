@@ -44,9 +44,32 @@ fn alias_of(membership: &common::NetworkMembership, sandbox_id: &str) -> String 
 const SETTLING_GRACE: Duration = Duration::from_secs(30);
 
 /// Whether a sandbox can be taken up by another node: suspended, with its
-/// latest suspend in the object store.
+/// latest suspend in the object store, or running with a checkpoint there.
 pub fn is_movable(sandbox: &common::Sandbox) -> bool {
-    sandbox.state == common::SandboxState::Suspended as i32 && sandbox.is_durable
+    (sandbox.state == common::SandboxState::Suspended as i32 && sandbox.is_durable)
+        || sandbox.checkpoint_at_unix_ms > 0
+}
+
+/// Restates a sandbox whose node was written off as what its checkpoint
+/// brings back: stopped on a disk checkpoint, which a start boots, or
+/// suspended on a memory one, which a resume restores. The reason says how
+/// old the checkpoint is, and so what was lost.
+fn lost_to_checkpoint(sandbox: &mut common::Sandbox, node_id: &str) {
+    if sandbox.checkpoint_at_unix_ms == 0 || sandbox.state == common::SandboxState::Suspended as i32
+    {
+        return;
+    }
+    let is_memory = sandbox.checkpoint_kind == common::CheckpointKind::Memory as i32;
+    sandbox.state = match is_memory {
+        true => common::SandboxState::Suspended,
+        false => common::SandboxState::Stopped,
+    } as i32;
+    sandbox.state_reason = format!(
+        "node {node_id} was lost; recovers from its {} checkpoint of {}, and what it did after \
+         that is gone",
+        if is_memory { "memory" } else { "disk" },
+        burrow_common::rfc3339_from_unix_secs(sandbox.checkpoint_at_unix_ms / 1000),
+    );
 }
 
 /// What a heartbeat's state report changed. See [`SandboxRegistry::apply_states`].
@@ -632,6 +655,7 @@ impl SandboxRegistry {
                 return true;
             }
             if is_movable(sandbox) {
+                lost_to_checkpoint(sandbox, node_id);
                 sandbox.node_id.clear();
                 if sandbox.arch.is_empty() {
                     sandbox.arch = info.arch.clone();
@@ -894,10 +918,14 @@ impl SandboxRegistry {
             if sandbox.state != report.state
                 || sandbox.is_durable != report.is_durable
                 || sandbox.state_reason != report.state_reason
+                || sandbox.checkpoint_at_unix_ms != report.checkpoint_at_unix_ms
+                || sandbox.checkpoint_kind != report.checkpoint_kind
             {
                 sandbox.state = report.state;
                 sandbox.is_durable = report.is_durable;
                 sandbox.state_reason = report.state_reason.clone();
+                sandbox.checkpoint_at_unix_ms = report.checkpoint_at_unix_ms;
+                sandbox.checkpoint_kind = report.checkpoint_kind;
                 restated += 1;
                 changed.push(sandbox.clone());
             } else if is_confirmation_changed {
@@ -1604,6 +1632,35 @@ mod tests {
         assert!(registry.reserve("", "web").is_err(), "the name stays held");
         assert!(registry.get("b").is_none());
         assert!(registry.get("c").is_none());
+    }
+
+    /// A running sandbox with a checkpoint survives its node, restated as
+    /// what the checkpoint brings back and saying how old it is.
+    #[test]
+    fn a_written_off_node_leaves_its_checkpointed_sandboxes_recoverable() {
+        let registry = SandboxRegistry::default();
+        let running = |id: &str, kind: common::CheckpointKind| common::Sandbox {
+            state: common::SandboxState::Running as i32,
+            checkpoint_at_unix_ms: 1_787_000_000_000,
+            checkpoint_kind: kind as i32,
+            ..named(id, "node1", id)
+        };
+        registry.insert(running("disk", common::CheckpointKind::Disk));
+        registry.insert(running("memory", common::CheckpointKind::Memory));
+
+        let (dropped, unplaced) = registry.forget_node("node1", &common::NodeInfo::default());
+        assert_eq!((dropped.len(), unplaced.len()), (0, 2));
+        let disk = registry.get("disk").unwrap();
+        assert_eq!(disk.state, common::SandboxState::Stopped as i32);
+        assert!(disk.node_id.is_empty());
+        assert!(
+            disk.state_reason.contains("disk checkpoint of 2026-08-17T"),
+            "{}",
+            disk.state_reason
+        );
+        let memory = registry.get("memory").unwrap();
+        assert_eq!(memory.state, common::SandboxState::Suspended as i32);
+        assert!(memory.state_reason.contains("memory checkpoint"));
     }
 
     /// A node that comes back reporting a sandbox another node adopted while

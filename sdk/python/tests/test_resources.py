@@ -86,3 +86,30 @@ def test_a_lifetime_update_sends_only_what_it_was_given(transport, sandbox):
     assert request.max_lifetime_secs == 7200 and request.snapshot_keep_last == 2
     assert not request.HasField("idle_suspend_secs")
     assert not request.HasField("snapshot_expiration_secs")
+
+
+def test_checkpoints_are_turned_on_and_a_record_says_how_old_the_latest_is(transport, sandbox):
+    at_ms = 1_794_475_800_000
+    calls = answering(
+        transport,
+        common_pb2.Sandbox(
+            id="sbx_test",
+            policy=common_pb2.Policy(
+                lifetime=common_pb2.LifetimePolicy(checkpoint_secs=300, is_memory_checkpointed=True)
+            ),
+            checkpoint_at_unix_ms=at_ms,
+            checkpoint_kind=common_pb2.CHECKPOINT_KIND_MEMORY,
+        ),
+    )
+    info = sandbox.update_lifetime(checkpoint_secs=300, checkpoint_memory=True)
+    _, request = calls[0]
+    assert request.checkpoint_secs == 300 and request.is_memory_checkpointed
+    assert not request.HasField("max_lifetime_secs")
+    assert info.policy.lifetime.checkpoint_secs == 300
+    assert info.policy.lifetime.checkpoint_memory
+    assert int(info.checkpoint_at.timestamp() * 1000) == at_ms
+    assert info.checkpoint_kind == "memory"
+
+    answering(transport, common_pb2.Sandbox(id="sbx_test"))
+    plain = sandbox.update_lifetime(max_lifetime_secs=60)
+    assert plain.checkpoint_at is None and plain.checkpoint_kind is None

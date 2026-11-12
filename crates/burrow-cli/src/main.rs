@@ -671,6 +671,14 @@ enum ConfigCommand {
         /// Let an evicted snapshot expire on its own instead of being deleted.
         #[arg(long)]
         keep_evicted_snapshots: Option<bool>,
+        /// Checkpoint the running sandbox into the object store this often;
+        /// 0 stops checkpointing.
+        #[arg(long)]
+        checkpoint_secs: Option<u64>,
+        /// Whether checkpoints capture memory too, so a recovery resumes the
+        /// guest's processes rather than booting on its disk.
+        #[arg(long)]
+        checkpoint_memory: Option<bool>,
     },
     /// Change a sandbox's vCPUs, memory and root disk.
     ///
@@ -802,6 +810,16 @@ struct CreateFlags {
     /// --keep-last-snapshots and --snapshot-expiration-secs.
     #[arg(long = "keep-evicted-snapshots")]
     is_evicted_snapshots_kept: bool,
+    /// Checkpoint the running sandbox into the object store this often, so a
+    /// node that dies takes only what changed since; `start` on another node
+    /// boots it on the checkpointed disk. Raised to the node's
+    /// `--checkpoint-min-secs`. 0 (default) never checkpoints.
+    #[arg(long, default_value_t = 0)]
+    checkpoint_secs: u64,
+    /// Capture memory in each checkpoint as well, so a recovery resumes the
+    /// guest's processes. Pauses the guest for the memory write.
+    #[arg(long = "checkpoint-memory", requires = "checkpoint_secs")]
+    is_memory_checkpointed: bool,
     /// Mount a volume, as `name:/path` or `name:/path:ro`, or a tmpfs as
     /// `tmpfs:/path[:size=512m][:mode=1777]`. Repeatable. A sandbox that
     /// mounts a volume is placed on the node holding it, or brings a durable
@@ -855,6 +873,7 @@ impl CreateFlags {
             || self.snapshot_expiration_secs != 0
             || self.keep_last_snapshots != 0
             || self.is_evicted_snapshots_kept
+            || self.checkpoint_secs != 0
             || !self.mounts.is_empty()
             || !self.tags.is_empty()
             || !self.node_labels.is_empty()
@@ -2344,6 +2363,8 @@ async fn main() -> anyhow::Result<()> {
             snapshot_expiration_secs,
             keep_last_snapshots,
             keep_evicted_snapshots,
+            checkpoint_secs,
+            checkpoint_memory,
         }) => {
             let sandbox = client
                 .update_lifetime(api::UpdateLifetimeRequest {
@@ -2354,6 +2375,8 @@ async fn main() -> anyhow::Result<()> {
                     snapshot_expiration_secs,
                     snapshot_keep_last: keep_last_snapshots,
                     is_evicted_snapshot_kept: keep_evicted_snapshots,
+                    checkpoint_secs,
+                    is_memory_checkpointed: checkpoint_memory,
                 })
                 .await?
                 .into_inner();
@@ -2366,12 +2389,18 @@ async fn main() -> anyhow::Result<()> {
                 0 => "unlimited".to_string(),
                 secs => format!("{secs}s"),
             };
+            let checkpoint = match (lifetime.checkpoint_secs, lifetime.is_memory_checkpointed) {
+                (0, _) => "off".to_string(),
+                (secs, false) => format!("{secs}s, disk"),
+                (secs, true) => format!("{secs}s, memory"),
+            };
             println!(
-                "{} max-lifetime {}, idle-suspend {}, suspended-ttl {}",
+                "{} max-lifetime {}, idle-suspend {}, suspended-ttl {}, checkpoint {}",
                 sandbox.id,
                 clock(lifetime.max_lifetime_secs),
                 clock(lifetime.idle_suspend_secs),
-                clock(lifetime.suspended_ttl_secs)
+                clock(lifetime.suspended_ttl_secs),
+                checkpoint
             );
         }
         Command::Config(ConfigCommand::Access { id, access }) => {
@@ -3182,6 +3211,8 @@ fn create_request(flags: CreateFlags) -> anyhow::Result<api::CreateSandboxReques
         snapshot_expiration_secs,
         keep_last_snapshots,
         is_evicted_snapshots_kept: keep_evicted_snapshots,
+        checkpoint_secs,
+        is_memory_checkpointed,
         mounts,
         tags,
         // Published after the sandbox exists, by its caller: the create RPC
@@ -3215,6 +3246,8 @@ fn create_request(flags: CreateFlags) -> anyhow::Result<api::CreateSandboxReques
                 max_lifetime_secs,
                 idle_suspend_secs,
                 suspended_ttl_secs,
+                checkpoint_secs,
+                is_memory_checkpointed,
             }),
             snapshots: Some(common::SnapshotPolicy {
                 expiration_secs: snapshot_expiration_secs,
@@ -4443,6 +4476,23 @@ fn print_config(sandbox: &common::Sandbox) {
                 &format!("{}s", lifetime.suspended_ttl_secs),
             );
         }
+        if lifetime.checkpoint_secs > 0 {
+            field(
+                "checkpoints",
+                &format!(
+                    "every {}s, {}",
+                    lifetime.checkpoint_secs,
+                    if lifetime.is_memory_checkpointed {
+                        "memory"
+                    } else {
+                        "disk"
+                    }
+                ),
+            );
+        }
+    }
+    if let Some(checkpoint) = display_checkpoint(sandbox) {
+        field("checkpoint", &checkpoint);
     }
     // Only shown when set. An absent section is no restriction, and a line
     // saying "exec allowed" on every unrestricted sandbox would bury the one
@@ -4694,11 +4744,59 @@ fn display_state(sandbox: &common::Sandbox) -> &'static str {
 /// Where a sandbox is, in the same terms `snapshot ls` uses: `+store` once
 /// its latest suspend is in the object store, and the store alone for one no
 /// node holds, which the next start places.
+///
+/// A running sandbox with a checkpoint shows `+ckpt` and its age; one whose
+/// node was lost shows the checkpoint it recovers from, which is how much of
+/// it survived.
 fn display_node(sandbox: &common::Sandbox) -> String {
-    match (sandbox.node_id.is_empty(), sandbox.is_durable) {
-        (false, true) => format!("{} +store", sandbox.node_id),
-        (false, false) => sandbox.node_id.clone(),
-        (true, _) => "object store".to_string(),
+    let age = || age(sandbox.checkpoint_at_unix_ms);
+    match (
+        sandbox.node_id.is_empty(),
+        sandbox.is_durable,
+        sandbox.checkpoint_at_unix_ms > 0,
+    ) {
+        (false, true, _) => format!("{} +store", sandbox.node_id),
+        (false, false, true) => format!("{} +ckpt {}", sandbox.node_id, age()),
+        (false, false, false) => sandbox.node_id.clone(),
+        (true, _, true) => format!("{} ckpt, {} ago", checkpoint_kind(sandbox), age()),
+        (true, _, false) => "object store".to_string(),
+    }
+}
+
+fn checkpoint_kind(sandbox: &common::Sandbox) -> &'static str {
+    match common::CheckpointKind::try_from(sandbox.checkpoint_kind) {
+        Ok(common::CheckpointKind::Memory) => "memory",
+        _ => "disk",
+    }
+}
+
+/// The latest checkpoint, for `inspect`: its kind and time, and once the node
+/// is gone, that everything after it was lost.
+fn display_checkpoint(sandbox: &common::Sandbox) -> Option<String> {
+    let at = sandbox.checkpoint_at_unix_ms;
+    (at > 0).then(|| {
+        let when = format!(
+            "{}, {} ({} ago)",
+            checkpoint_kind(sandbox),
+            rfc3339_from_unix_ms(at),
+            age(at)
+        );
+        match sandbox.node_id.is_empty() {
+            true => format!("{when}; lost since"),
+            false => when,
+        }
+    })
+}
+
+/// How long ago a Unix-milliseconds instant was, coarsely: `40s`, `12m`,
+/// `3h`, `2d`.
+fn age(unix_ms: i64) -> String {
+    let secs = (unix_ms_now() as i64 - unix_ms).max(0) / 1000;
+    match secs {
+        0..60 => format!("{secs}s"),
+        60..3600 => format!("{}m", secs / 60),
+        3600..86_400 => format!("{}h", secs / 3600),
+        _ => format!("{}d", secs / 86_400),
     }
 }
 
@@ -5326,6 +5424,15 @@ fn sandbox_json(sandbox: &common::Sandbox) -> String {
             "max_lifetime_secs": lifetime.max_lifetime_secs,
             "idle_suspend_secs": lifetime.idle_suspend_secs,
             "suspended_ttl_secs": lifetime.suspended_ttl_secs,
+            "checkpoint_secs": lifetime.checkpoint_secs,
+            "checkpoint_memory": lifetime.is_memory_checkpointed,
+        },
+        "checkpoint": match sandbox.checkpoint_at_unix_ms {
+            0 => serde_json::Value::Null,
+            at => serde_json::json!({
+                "at": rfc3339_from_unix_ms(at),
+                "kind": checkpoint_kind(sandbox),
+            }),
         },
         "snapshots": {
             "expiration_secs": snapshots.expiration_secs,
@@ -6399,6 +6506,8 @@ mod tests {
                 snapshot_expiration_secs: 0,
                 keep_last_snapshots: 0,
                 is_evicted_snapshots_kept: false,
+                checkpoint_secs: 0,
+                is_memory_checkpointed: false,
                 mounts: vec![],
                 ips: vec![],
                 max_lifetime_secs: 0,

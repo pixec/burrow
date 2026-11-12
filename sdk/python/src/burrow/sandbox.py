@@ -98,6 +98,12 @@ def _to_sandbox_info(raw: common_pb2.Sandbox) -> SandboxInfo:
         arch=raw.arch,
         guest_os=raw.guest_os,
         public_ips=[to_public_ip(ip) for ip in raw.public_ips],
+        checkpoint_at=at_or_none(raw.checkpoint_at_unix_ms),
+        checkpoint_kind=(
+            ("memory" if raw.checkpoint_kind == common_pb2.CHECKPOINT_KIND_MEMORY else "disk")
+            if raw.checkpoint_at_unix_ms
+            else None
+        ),
     )
 
 
@@ -862,6 +868,8 @@ class Sandbox:
         snapshot_expiration_secs: Optional[int] = None,
         snapshot_keep_last: Optional[int] = None,
         snapshot_evicted_kept: Optional[bool] = None,
+        checkpoint_secs: Optional[int] = None,
+        checkpoint_memory: Optional[bool] = None,
     ) -> SandboxInfo:
         """Moves the clocks the sandbox is measured against, and how long its
         snapshots are kept.
@@ -880,6 +888,8 @@ class Sandbox:
                 snapshot_expiration_secs=snapshot_expiration_secs,
                 snapshot_keep_last=snapshot_keep_last,
                 is_evicted_snapshot_kept=snapshot_evicted_kept,
+                checkpoint_secs=checkpoint_secs,
+                is_memory_checkpointed=checkpoint_memory,
             ),
         )
 

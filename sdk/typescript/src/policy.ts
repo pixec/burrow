@@ -441,6 +441,8 @@ export function toLifetimePolicy(options: LifetimeOptions = {}): any {
     maxLifetimeSecs: options.maxLifetimeSecs ?? 0,
     idleSuspendSecs: options.idleSuspendSecs ?? 0,
     suspendedTtlSecs: options.suspendedTtlSecs ?? 0,
+    checkpointSecs: options.checkpointSecs ?? 0,
+    isMemoryCheckpointed: options.checkpointMemory ?? false,
   };
 }
 
@@ -449,6 +451,8 @@ export function fromLifetimePolicy(raw: any): LifetimePolicy {
     maxLifetimeSecs: Number(raw?.maxLifetimeSecs ?? 0),
     idleSuspendSecs: Number(raw?.idleSuspendSecs ?? 0),
     suspendedTtlSecs: Number(raw?.suspendedTtlSecs ?? 0),
+    checkpointSecs: Number(raw?.checkpointSecs ?? 0),
+    checkpointMemory: Boolean(raw?.isMemoryCheckpointed),
   };
 }
 

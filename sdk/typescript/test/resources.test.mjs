@@ -75,3 +75,26 @@ test("a lifetime update sends only what it was given", async () => {
   assert.equal(calls[0].request.idleSuspendSecs, undefined);
   assert.equal(calls[0].request.snapshotExpirationSecs, undefined);
 });
+
+test("a lifetime update can turn checkpoints on, and a record says how old the latest is", async () => {
+  const at = Date.UTC(2026, 10, 12, 9, 30);
+  const { sandbox, calls } = sandboxAnswering({
+    id: "sbx_test",
+    state: "SANDBOX_STATE_RUNNING",
+    policy: { lifetime: { checkpointSecs: "300", isMemoryCheckpointed: true } },
+    checkpointAtUnixMs: String(at),
+    checkpointKind: "CHECKPOINT_KIND_MEMORY",
+  });
+  const info = await sandbox.updateLifetime({ checkpointSecs: 300, checkpointMemory: true });
+  assert.equal(calls[0].method, "UpdateLifetime");
+  assert.equal(calls[0].request.checkpointSecs, 300);
+  assert.equal(calls[0].request.isMemoryCheckpointed, true);
+  assert.equal(info.policy.lifetime.checkpointSecs, 300);
+  assert.equal(info.policy.lifetime.checkpointMemory, true);
+  assert.equal(info.checkpointAt.getTime(), at);
+  assert.equal(info.checkpointKind, "memory");
+
+  const none = fakeSandbox({}, {});
+  assert.equal(none.info.checkpointAt, null);
+  assert.equal(none.info.checkpointKind, null);
+});

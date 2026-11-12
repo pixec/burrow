@@ -21,6 +21,7 @@ import { Snapshot, type SnapshotOptions } from "./snapshot.js";
 import { Terminal, type TerminalOptions } from "./terminal.js";
 import type { Transport, TransportOptions } from "./transport.js";
 import type {
+  CheckpointKind,
   CallOptions,
   CommandInfo,
   CommandState,
@@ -102,7 +103,13 @@ export function toSandboxInfo(raw: any): SandboxInfo {
     hypervisorVersion: raw.hypervisorVersion ?? "",
     guestOs: raw.guestOs ?? "",
     publicIps: (raw.publicIps ?? []).map(toPublicIp),
+    checkpointAt: dateOrNull(raw.checkpointAtUnixMs),
+    checkpointKind: Number(raw.checkpointAtUnixMs ?? 0) > 0 ? checkpointKindOf(raw.checkpointKind) : null,
   };
+}
+
+function checkpointKindOf(raw: unknown): CheckpointKind {
+  return raw === "CHECKPOINT_KIND_MEMORY" ? "memory" : "disk";
 }
 
 function toResourceOutcome(raw: any): ResourceOutcome | undefined {
@@ -853,6 +860,8 @@ export class Sandbox {
         maxLifetimeSecs: options.maxLifetimeSecs,
         idleSuspendSecs: options.idleSuspendSecs,
         suspendedTtlSecs: options.suspendedTtlSecs,
+        checkpointSecs: options.checkpointSecs,
+        isMemoryCheckpointed: options.checkpointMemory,
         snapshotExpirationSecs: options.snapshots?.expirationSecs,
         snapshotKeepLast: options.snapshots?.keepLast,
         isEvictedSnapshotKept: options.snapshots?.keepEvicted,

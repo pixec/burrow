@@ -51,6 +51,7 @@ export type {
   AuditEvent,
   AuditQuery,
   CallOptions,
+  CheckpointKind,
   CommandInfo,
   CommandState,
   CreateOptions,

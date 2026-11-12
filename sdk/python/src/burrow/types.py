@@ -33,6 +33,12 @@ class LifetimePolicy:
     max_lifetime_secs: int = 0
     idle_suspend_secs: int = 0
     suspended_ttl_secs: int = 0
+    # Checkpoint the running sandbox into the object store this often, raised
+    # to the node's floor (`burrowd --checkpoint-min-secs`); 0 never does.
+    checkpoint_secs: int = 0
+    # Capture memory in each checkpoint as well, so a recovery resumes the
+    # guest's processes rather than booting on its disk.
+    checkpoint_memory: bool = False
 
 
 @dataclass
@@ -185,6 +191,12 @@ class SandboxInfo:
     guest_os: str = ""
     # Public addresses of either family attached to it.
     public_ips: List["PublicIp"] = field(default_factory=list)
+    # When its latest checkpoint was captured; None for none. Once its node
+    # is gone, what it did after this is lost.
+    checkpoint_at: Optional[datetime] = None
+    # "disk" or "memory": whether a recovery boots on the saved disk or
+    # resumes the saved memory. None for no checkpoint.
+    checkpoint_kind: Optional[str] = None
 
 
 @dataclass

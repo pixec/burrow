@@ -15,6 +15,13 @@
 //! it after this one was written off reads `running` and refuses: the state in
 //! the store is from the last suspend, and the guest has moved on since.
 //!
+//! The exception is a checkpoint, uploaded while the sandbox runs and marked
+//! as one. A disk checkpoint holds the root disk alone, cloned with the
+//! guest's filesystem frozen, and is adopted by booting on it; a memory
+//! checkpoint is a suspend's state written without stopping the guest, and is
+//! adopted by restoring it. Either way what the guest did after it is lost,
+//! which is the point of taking one.
+//!
 //! Every write that hands the sandbox to a node is conditional on the version
 //! of the manifest it was decided on (`If-Match` on its ETag, `If-None-Match`
 //! for the first), so two nodes that both read it suspended cannot both take
@@ -123,7 +130,22 @@ pub struct Manifest {
     /// restores only on a node whose leaves chain to the same one.
     #[serde(default)]
     pub inspection_root: String,
+    /// [`CHECKPOINT_DISK`] or [`CHECKPOINT_MEMORY`] for state uploaded while
+    /// the sandbox ran; empty for a suspend's.
+    #[serde(default)]
+    pub checkpoint: String,
+    /// Unix milliseconds the checkpoint was captured at.
+    #[serde(default)]
+    pub checkpoint_at_ms: i64,
+    /// The generation of each writable volume a memory checkpoint was taken
+    /// with. The guest's memory holds those volumes' caches, so it restores
+    /// only over the same generations, and boots on its disk otherwise.
+    #[serde(default)]
+    pub volumes: std::collections::BTreeMap<String, u64>,
 }
+
+pub const CHECKPOINT_DISK: &str = "disk";
+pub const CHECKPOINT_MEMORY: &str = "memory";
 
 impl Manifest {
     pub fn hypervisor(&self) -> Result<burrow_vmm::Hypervisor, Status> {
@@ -139,8 +161,15 @@ impl Manifest {
         self.hypervisor().map(burrow_vmm::Hypervisor::layout)
     }
 
-    fn disk_layout(&self) -> crate::rootdisk::DiskLayout {
+    pub fn disk_layout(&self) -> crate::rootdisk::DiskLayout {
         crate::rootdisk::DiskLayout::from_record(&self.disk_layout)
+    }
+
+    /// Whether another node may take the sandbox up from this manifest: a
+    /// suspend's state, or a checkpoint of a running sandbox.
+    pub fn is_adoptable(&self) -> bool {
+        self.state == STATE_SUSPENDED
+            || (self.state == STATE_RUNNING && !self.checkpoint.is_empty())
     }
 }
 
@@ -243,7 +272,7 @@ pub async fn load_local(workdir: &Path) -> Option<LocalState> {
     serde_json::from_slice(&bytes).ok()
 }
 
-async fn save_local(workdir: &Path, local: &LocalState) -> Result<(), Status> {
+pub async fn save_local(workdir: &Path, local: &LocalState) -> Result<(), Status> {
     let json = serde_json::to_vec(local)
         .map_err(|err| Status::internal(format!("encoding the durable state: {err}")))?;
     let temp = workdir.join(format!(".{LOCAL}.tmp"));
@@ -471,11 +500,15 @@ pub async fn upload(
         ));
     }
 
+    let state = match draft.checkpoint.is_empty() {
+        true => STATE_SUSPENDED,
+        false => STATE_RUNNING,
+    };
     let mut local = LocalState {
         manifest: Manifest {
             format: FORMAT,
             generation,
-            state: STATE_SUSPENDED.to_string(),
+            state: state.to_string(),
             kernel_digest,
             rootfs_digest,
             ..draft
@@ -525,6 +558,8 @@ pub async fn mark_running(
     let mut manifest = local.manifest.clone();
     manifest.state = STATE_RUNNING.to_string();
     manifest.node_id = node_id.to_string();
+    manifest.checkpoint.clear();
+    manifest.checkpoint_at_ms = 0;
     write_held(store, node_id, &manifest, false).await?;
     local.manifest = manifest;
     save_local(workdir, local).await
@@ -791,6 +826,180 @@ pub async fn stage(
 
 const PAGE: u64 = 4096;
 
+/// Where a disk checkpoint's clone is kept once uploaded, the base the next
+/// one is compared with.
+pub const CHECKPOINT_BASE: &str = "checkpoint-base.ext4";
+
+/// Uploads a disk checkpoint: `capture`, a clone of the running sandbox's
+/// disk taken with its filesystem frozen, beside the kernel and image the
+/// sandbox boots from. `disk` is the live disk's stamp as the clone was taken,
+/// which the next checkpoint compares to skip itself when nothing changed.
+#[allow(clippy::too_many_arguments)]
+pub async fn upload_disk_checkpoint(
+    store: &ObjectStore,
+    blobs: &crate::blobs::BlobStore,
+    workdir: &Path,
+    capture: &Path,
+    disk: Stamp,
+    draft: Manifest,
+    previous: Option<&LocalState>,
+) -> Result<LocalState, Status> {
+    let io = |what: &str, err: std::io::Error| Status::internal(format!("{what}: {err}"));
+    let started = std::time::Instant::now();
+    let id = draft.id.clone();
+    let disk_file = draft.disk_layout().disk();
+    let stamp = |file: &str| Stamp::of(&workdir.join(file)).map_err(|err| io(file, err));
+    let kernel = stamp(TEMPLATE_KERNEL)?;
+    let rootfs = stamp(TEMPLATE_ROOTFS)?;
+    let kernel_digest = match previous.filter(|p| p.kernel == kernel) {
+        Some(previous) => previous.manifest.kernel_digest.clone(),
+        None => crate::snapshot::put_blob(store, &workdir.join(TEMPLATE_KERNEL)).await?,
+    };
+    let image = match draft.disk_layout() {
+        crate::rootdisk::DiskLayout::Root => {
+            let image = crate::rootdisk::image_of(blobs, &workdir.join(TEMPLATE_ROOTFS)).await?;
+            crate::rootdisk::upload_image(store, &image).await?;
+            Some(image)
+        }
+        crate::rootdisk::DiskLayout::Overlay => None,
+    };
+    let rootfs_digest = match (&image, previous.filter(|p| p.rootfs == rootfs)) {
+        (Some(image), _) => image.digest.clone(),
+        (None, Some(previous)) => previous.manifest.rootfs_digest.clone(),
+        (None, None) => crate::snapshot::put_blob(store, &workdir.join(TEMPLATE_ROOTFS)).await?,
+    };
+    let known = previous.map(LocalState::digests).unwrap_or_default();
+    let base_path = workdir.join(CHECKPOINT_BASE);
+    let previous_disk = previous
+        .filter(|p| p.manifest.checkpoint == CHECKPOINT_DISK && !p.disk_index.chunks.is_empty());
+    let base = match previous_disk {
+        Some(previous) if tokio::fs::try_exists(&base_path).await.unwrap_or(false) => {
+            Some((base_path.as_path(), &previous.disk_index))
+        }
+        _ => image
+            .as_ref()
+            .map(|image| (image.path.as_path(), &image.index)),
+    };
+    let mut known = known;
+    if let Some(image) = &image {
+        known.extend(image.index.digests().map(str::to_string));
+    }
+    let disk_index = crate::chunks::put_disk_since(store, capture, base, &known).await?;
+
+    let now_ms = burrow_common::unix_now_ms();
+    let generation = (now_ms as u64).max(previous.map_or(0, |p| p.manifest.generation + 1));
+    let json = serde_json::to_vec(&disk_index)
+        .map_err(|err| Status::internal(format!("encoding an index: {err}")))?;
+    store
+        .put_bytes(&index_key(&id, generation, disk_file), json)
+        .await?;
+    let mut local = LocalState {
+        manifest: Manifest {
+            format: FORMAT,
+            generation,
+            state: STATE_RUNNING.to_string(),
+            kernel_digest,
+            rootfs_digest,
+            checkpoint: CHECKPOINT_DISK.to_string(),
+            ..draft
+        },
+        is_published: false,
+        layers: Vec::new(),
+        vmstate: Stamp::default(),
+        disk,
+        kernel,
+        rootfs,
+        memory: ImageIndex::default(),
+        disk_index,
+        logs: Default::default(),
+    };
+    save_local(workdir, &local).await?;
+    let may_create = previous.is_none_or(|previous| !previous.is_published);
+    write_held(store, &local.manifest.node_id, &local.manifest, may_create).await?;
+    local.is_published = true;
+    save_local(workdir, &local).await?;
+    let _ = tokio::fs::rename(capture, &base_path).await;
+    if let Some(previous) = previous
+        && previous.manifest.generation != generation
+    {
+        delete_generation(store, &id, previous.manifest.generation).await;
+    }
+    tracing::info!(
+        sandbox = id,
+        generation,
+        disk_bytes = local.disk_index.stored_bytes(),
+        took_ms = started.elapsed().as_millis() as u64,
+        "disk checkpoint is in the object store"
+    );
+    Ok(local)
+}
+
+/// Brings a disk checkpoint into `dest` for a boot: the kernel, the image and
+/// the disk, rebuilt from the image and the chunks that differ from it.
+pub async fn stage_disk(
+    store: &ObjectStore,
+    snapshots: &crate::snapshot::SnapshotStore,
+    manifest: &Manifest,
+    dest: &Path,
+) -> Result<LocalState, Status> {
+    let id = &manifest.id;
+    let disk_file = manifest.disk_layout().disk();
+    let (kernel_path, rootfs_path) = (dest.join(TEMPLATE_KERNEL), dest.join(TEMPLATE_ROOTFS));
+    let disk_key = index_key(id, manifest.generation, disk_file);
+    let rootfs = async {
+        match manifest.disk_layout() {
+            crate::rootdisk::DiskLayout::Root => {
+                let image = crate::rootdisk::fetch_image(
+                    store,
+                    snapshots.blobs(),
+                    &snapshots.templates_dir(),
+                    &manifest.rootfs_digest,
+                )
+                .await?;
+                tokio::fs::hard_link(&image.path, &rootfs_path)
+                    .await
+                    .map_err(|err| Status::internal(format!("linking the image: {err}")))?;
+                Ok(Some(image))
+            }
+            crate::rootdisk::DiskLayout::Overlay => snapshots
+                .fetch_blob(store, &manifest.rootfs_digest, &rootfs_path)
+                .await
+                .map(|()| None),
+        }
+    };
+    let (kernel, image, disk_index) = tokio::join!(
+        snapshots.fetch_blob(store, &manifest.kernel_digest, &kernel_path),
+        rootfs,
+        crate::snapshot::read_index(store, &disk_key),
+    );
+    kernel?;
+    let image = image?;
+    let disk_index = disk_index?.ok_or_else(|| {
+        Status::not_found(format!("sandbox {id}'s checkpoint is missing {disk_file}"))
+    })?;
+    let disk_path = dest.join(disk_file);
+    crate::rootdisk::materialise(store, &disk_index, image.as_ref(), &disk_path).await?;
+    crate::fsync::tree(dest)
+        .await
+        .map_err(|err| Status::internal(format!("syncing the adopted disk: {err}")))?;
+    let io = |what: &str, err: std::io::Error| Status::internal(format!("{what}: {err}"));
+    let stamp = |file: &str| Stamp::of(&dest.join(file)).map_err(|err| io(file, err));
+    let local = LocalState {
+        manifest: manifest.clone(),
+        is_published: true,
+        layers: Vec::new(),
+        vmstate: Stamp::default(),
+        disk: stamp(disk_file)?,
+        kernel: stamp(TEMPLATE_KERNEL)?,
+        rootfs: stamp(TEMPLATE_ROOTFS)?,
+        memory: ImageIndex::default(),
+        disk_index,
+        logs: Default::default(),
+    };
+    save_local(dest, &local).await?;
+    Ok(local)
+}
+
 /// Uploads the sandbox's command logs, each a chunked image so what an
 /// earlier upload put is not put again: a log only grows.
 async fn upload_logs(
@@ -1027,7 +1236,146 @@ mod tests {
             tx_bytes: 0,
             secrets: Default::default(),
             inspection_root: String::new(),
+            checkpoint: String::new(),
+            checkpoint_at_ms: 0,
+            volumes: Default::default(),
         }
+    }
+
+    /// Only a suspend's state or a checkpoint can be taken up elsewhere, and
+    /// a resume over a checkpoint says the guest has moved on from it.
+    #[tokio::test]
+    async fn a_checkpoint_is_adoptable_until_the_sandbox_resumes_past_it() {
+        assert!(manifest("node-a", STATE_SUSPENDED).is_adoptable());
+        let mut running = manifest("node-a", STATE_RUNNING);
+        assert!(!running.is_adoptable());
+        running.checkpoint = CHECKPOINT_DISK.into();
+        assert!(running.is_adoptable());
+        assert!(!manifest("node-a", STATE_DELETING).is_adoptable());
+
+        let store = crate::objstore::fake::store(true).await;
+        let dir = std::env::temp_dir().join(format!("burrow-mark-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut suspended = manifest("node-a", STATE_SUSPENDED);
+        suspended.checkpoint = CHECKPOINT_MEMORY.into();
+        suspended.checkpoint_at_ms = 5;
+        replace_manifest(&store, None, &suspended).await.unwrap();
+        let mut local = LocalState {
+            manifest: suspended,
+            is_published: true,
+            layers: Vec::new(),
+            vmstate: Stamp::default(),
+            disk: Stamp::default(),
+            kernel: Stamp::default(),
+            rootfs: Stamp::default(),
+            memory: ImageIndex::default(),
+            disk_index: ImageIndex::default(),
+            logs: Default::default(),
+        };
+        mark_running(&store, &dir, &mut local, "node-a")
+            .await
+            .unwrap();
+        let held = read_manifest(&store, "sbx_1").await.unwrap().unwrap();
+        assert!(!held.manifest.is_adoptable());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A disk checkpoint sends only the chunks the guest changed since the
+    /// image, then only those changed since the last checkpoint, and another
+    /// node rebuilds the disk from it byte for byte.
+    #[tokio::test]
+    async fn a_disk_checkpoint_rebuilds_the_disk_on_another_node() {
+        use std::os::unix::fs::FileExt as _;
+        let store = crate::objstore::fake::store(true).await;
+        let root = std::env::temp_dir().join(format!("burrow-ckpt-{}", uuid::Uuid::new_v4()));
+        let workdir = root.join("a");
+        std::fs::create_dir_all(&workdir).unwrap();
+        std::fs::write(workdir.join(TEMPLATE_KERNEL), b"kernel").unwrap();
+        let image = std::fs::File::create(workdir.join(TEMPLATE_ROOTFS)).unwrap();
+        image.set_len(4 << 20).unwrap();
+        image.write_all_at(&[1; 4096], 0).unwrap();
+        image.write_all_at(&[2; 4096], 1 << 20).unwrap();
+        drop(image);
+        let disk = workdir.join(crate::rootdisk::ROOT_DISK);
+        crate::rootdisk::clone(&workdir.join(TEMPLATE_ROOTFS), &disk)
+            .await
+            .unwrap();
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(&disk)
+            .unwrap()
+            .write_all_at(&[3; 4096], 2 << 20)
+            .unwrap();
+        let blobs = crate::blobs::BlobStore::new(&root.join("data-a"));
+        let mut draft = manifest("node-a", "");
+        draft.disk_layout = "root".into();
+        draft.checkpoint_at_ms = 42;
+
+        let capture = workdir.join(".checkpoint.ext4");
+        crate::rootdisk::clone(&disk, &capture).await.unwrap();
+        let stamp = Stamp::of(&disk).unwrap();
+        let first = upload_disk_checkpoint(
+            &store,
+            &blobs,
+            &workdir,
+            &capture,
+            stamp.clone(),
+            draft.clone(),
+            None,
+        )
+        .await
+        .unwrap();
+        assert_eq!(first.manifest.checkpoint, CHECKPOINT_DISK);
+        assert_eq!(first.manifest.state, STATE_RUNNING);
+        assert_eq!(first.disk, stamp);
+        assert!(workdir.join(CHECKPOINT_BASE).exists());
+
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(&disk)
+            .unwrap()
+            .write_all_at(&[4; 4096], 3 << 20)
+            .unwrap();
+        crate::rootdisk::clone(&disk, &capture).await.unwrap();
+        let second = upload_disk_checkpoint(
+            &store,
+            &blobs,
+            &workdir,
+            &capture,
+            Stamp::of(&disk).unwrap(),
+            draft,
+            Some(&first),
+        )
+        .await
+        .unwrap();
+        assert!(second.manifest.generation > first.manifest.generation);
+        assert_eq!(second.disk_index.chunks.len(), 4);
+        assert_eq!(
+            second.disk_index.chunks[&2], first.disk_index.chunks[&2],
+            "an unchanged chunk keeps its digest"
+        );
+
+        let held = read_manifest(&store, "sbx_1").await.unwrap().unwrap();
+        assert!(held.manifest.is_adoptable());
+        let snapshots = crate::snapshot::SnapshotStore::new(
+            &root.join("data-b"),
+            Some(store.clone()),
+            HashMap::new(),
+        );
+        let dest = root.join("b");
+        std::fs::create_dir_all(&dest).unwrap();
+        stage_disk(&store, &snapshots, &held.manifest, &dest)
+            .await
+            .unwrap();
+        assert_eq!(
+            std::fs::read(dest.join(crate::rootdisk::ROOT_DISK)).unwrap(),
+            std::fs::read(&disk).unwrap()
+        );
+        assert_eq!(
+            std::fs::read(dest.join(TEMPLATE_KERNEL)).unwrap(),
+            b"kernel"
+        );
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     /// A move racing a start, or two orchestrators placing one sandbox: both

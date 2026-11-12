@@ -501,6 +501,42 @@ pub fn unchanged_chunks(
     Some(unchanged)
 }
 
+/// Where an ext4 superblock sits. A freeze and a thaw each rewrite it, with
+/// a fresh write time and a counter, and nothing else.
+const SUPERBLOCK: std::ops::Range<usize> = 1024..2048;
+
+/// Whether `disk` holds anything `base`, a clone of it taken earlier, does
+/// not, other than the ext4 superblock a freeze and thaw rewrite. `None`
+/// where the filesystem cannot say without reading both whole.
+pub fn changed_since(disk: &Path, base: &Path) -> Option<bool> {
+    let (disk, base) = (
+        std::fs::File::open(disk).ok()?,
+        std::fs::File::open(base).ok()?,
+    );
+    let size = disk.metadata().ok()?.len();
+    if size != base.metadata().ok()?.len() {
+        return Some(true);
+    }
+    let unchanged = unchanged_chunks(&disk, &base)?;
+    let mut changed = (0..size.div_ceil(CHUNK_SIZE)).filter(|n| !unchanged.contains(n));
+    match (changed.next(), changed.next()) {
+        (None, _) => Some(false),
+        (Some(0), None) => {
+            let len = CHUNK_SIZE.min(size) as usize;
+            let (mut a, mut b) = (vec![0u8; len], vec![0u8; len]);
+            disk.read_exact_at(&mut a, 0).ok()?;
+            base.read_exact_at(&mut b, 0).ok()?;
+            let outside = |buf: &[u8]| {
+                let end = SUPERBLOCK.end.min(buf.len());
+                let start = SUPERBLOCK.start.min(end);
+                [buf[..start].to_vec(), buf[end..].to_vec()]
+            };
+            Some(outside(&a) != outside(&b))
+        }
+        _ => Some(true),
+    }
+}
+
 /// Disks made ahead of the creates that need them, on a filesystem that
 /// cannot clone: one per template, copied in the background and replaced as
 /// it is taken, so a create renames a disk into place instead of copying the
@@ -991,6 +1027,36 @@ mod tests {
             grow(&disk, 3).await.unwrap_err().code(),
             tonic::Code::InvalidArgument
         );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A freeze and thaw rewrite the superblock and nothing else, which is
+    /// not a change worth a checkpoint; a write anywhere else is.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn only_a_rewritten_superblock_is_not_a_change() {
+        let dir = scratch("changed");
+        let disk = dir.join("disk");
+        let file = std::fs::File::create(&disk).unwrap();
+        file.set_len(4 * MIB).unwrap();
+        file.write_all_at(&[1; 8192], 0).unwrap();
+        file.write_all_at(&[2; 8192], 2 * MIB).unwrap();
+        file.sync_all().unwrap();
+        let base = dir.join("base");
+        if clone_blocking(&disk, &base).unwrap() != Made::Clone {
+            return;
+        }
+        assert_eq!(changed_since(&disk, &base), Some(false));
+        file.write_all_at(&[9; 1024], 1024).unwrap();
+        file.sync_all().unwrap();
+        assert_eq!(changed_since(&disk, &base), Some(false));
+        file.write_all_at(&[9; 16], 4096).unwrap();
+        file.sync_all().unwrap();
+        assert_eq!(changed_since(&disk, &base), Some(true));
+        clone_blocking(&disk, &base).unwrap();
+        file.write_all_at(&[7; 4096], 3 * MIB).unwrap();
+        file.sync_all().unwrap();
+        assert_eq!(changed_since(&disk, &base), Some(true));
         let _ = std::fs::remove_dir_all(&dir);
     }
 

@@ -499,6 +499,7 @@ impl NodeService for NodeApi {
         }
         let policy = req.policy.unwrap_or_default();
         validate_policy(&policy)?;
+        self.sandboxes.require_checkpointable(&policy)?;
         burrow_common::tags::validate(&req.tags)?;
         // A template imported from Kits is provisioned through their
         // lifecycle whether or not the caller passed inputs.
@@ -964,6 +965,8 @@ impl NodeService for NodeApi {
                     snapshot_expiration_secs: req.snapshot_expiration_secs,
                     snapshot_keep_last: req.snapshot_keep_last,
                     is_evicted_snapshot_kept: req.is_evicted_snapshot_kept,
+                    checkpoint_secs: req.checkpoint_secs,
+                    is_memory_checkpointed: req.is_memory_checkpointed,
                 },
                 validate_retention,
             )
@@ -1028,6 +1031,7 @@ impl NodeService for NodeApi {
         }
         if let Some(policy) = &req.policy {
             validate_policy(policy)?;
+            self.sandboxes.require_checkpointable(policy)?;
         }
         let sandbox = self
             .sandboxes
@@ -3663,6 +3667,7 @@ mod policy_tests {
                 max_lifetime_secs: 0,
                 idle_suspend_secs: 86_400,
                 suspended_ttl_secs: u64::MAX,
+                ..Default::default()
             }),
             ..Default::default()
         };
