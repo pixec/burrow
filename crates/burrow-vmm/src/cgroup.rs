@@ -12,6 +12,15 @@
 //! the weight does. A VMM starts without it: a cap below its vCPUs stalls a
 //! kernel boot past the agent's deadline, so its owner writes the cap with
 //! [`Cgroup::set_limits`] once the guest has answered.
+//!
+//! Memory is held at its ceiling by `memory.high`, which reclaims and
+//! throttles but never kills, and bounded by a `memory.max` well above it.
+//! Page cache the VMM fills is charged to it: its snapshot writes, a
+//! Firecracker guest's disk I/O, and on a buffered loop device even the
+//! backing file's pages for `O_DIRECT` I/O, charged from a `GFP_NOIO` loop
+//! worker that cannot write them back. At a hard limit those dirty and
+//! writeback pages got the VMM killed; over `memory.high` they are throttled
+//! and reclaimed as they are written back.
 
 use std::path::{Path, PathBuf};
 
@@ -24,6 +33,9 @@ const CONTROLLERS: [&str; 5] = ["cpu", "memory", "pids", "cpuset", "io"];
 const DEFAULT_WEIGHT: u64 = 100;
 /// cgroup v2 CPU accounting period, in microseconds.
 const CPU_PERIOD_US: u64 = 100_000;
+/// What `memory.max` allows past the ceiling, at least: room for page cache
+/// under writeback to drain in, so only a runaway VMM reaches the hard limit.
+const MEMORY_BOUND_MIN_MIB: u32 = 512;
 /// Times the processes are moved out before delegation is given up on. A
 /// process spawned just before the move is still in the cgroup, so one pass is
 /// not always enough.
@@ -44,7 +56,8 @@ pub struct Limits {
     pub cpuset_cpus: String,
     /// `io.weight`, 1 to 10000. 0 is the kernel's default.
     pub io_weight: u64,
-    /// Hard memory ceiling for the VMM process, in MiB. 0 means unlimited.
+    /// Memory ceiling for the VMM process, in MiB (`memory.high`), with its
+    /// hard bound above it ([`memory_bound_mib`]). 0 means unlimited.
     pub memory_mib: u32,
     /// Cap on process count, which bounds fork bombs inside the VMM.
     pub pids_max: u32,
@@ -81,8 +94,7 @@ impl Cgroup {
         cgroup.set_limits(&limits.uncapped())?;
         let path = &cgroup.path;
         if limits.memory_mib > 0 {
-            let bytes = limits.memory_mib as u64 * 1024 * 1024;
-            write(&path.join("memory.max"), &bytes.to_string())?;
+            cgroup.set_memory(limits.memory_mib)?;
         }
         if limits.pids_max > 0 {
             write(&path.join("pids.max"), &limits.pids_max.to_string())?;
@@ -166,12 +178,12 @@ impl Cgroup {
         Ok(())
     }
 
-    /// Moves the memory cap, for a guest given memory or relieved of it.
+    /// Moves the memory ceiling and its hard bound, for a new VMM or a guest
+    /// given memory or relieved of it.
     pub fn set_memory(&self, mib: u32) -> Result<()> {
-        write(
-            &self.path.join("memory.max"),
-            &(u64::from(mib) * 1024 * 1024).to_string(),
-        )
+        let bytes = |mib: u32| (u64::from(mib) << 20).to_string();
+        write(&self.path.join("memory.max"), &bytes(memory_bound_mib(mib)))?;
+        write(&self.path.join("memory.high"), &bytes(mib))
     }
 
     pub fn path(&self) -> &Path {
@@ -292,6 +304,12 @@ fn evacuate_processes(dir: &Path) -> Result<()> {
     Ok(())
 }
 
+/// The `memory.max` over a ceiling of `mib`: a quarter more, and never less
+/// than [`MEMORY_BOUND_MIN_MIB`] more.
+fn memory_bound_mib(mib: u32) -> u32 {
+    mib + (mib / 4).max(MEMORY_BOUND_MIN_MIB)
+}
+
 /// `cpu.max` for a cap in thousandths of a CPU, or no cap.
 fn cpu_max(millis: u64) -> String {
     match millis {
@@ -325,6 +343,13 @@ fn write(path: &Path, value: &str) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_hard_bound_leaves_room_above_the_ceiling() {
+        assert_eq!(memory_bound_mib(580), 580 + 512);
+        assert_eq!(memory_bound_mib(2120), 2120 + 530);
+        assert_eq!(memory_bound_mib(8228), 8228 + 2057);
+    }
 
     #[test]
     fn cpu_quota_is_scaled_by_the_accounting_period() {
@@ -410,7 +435,8 @@ mod tests {
         let read = |file: &str| std::fs::read_to_string(cgroup.path.join(file)).unwrap();
         assert_eq!(read("cpu.max"), "max 100000");
         assert_eq!(read("cpu.weight"), "20");
-        assert_eq!(read("memory.max"), (580u64 << 20).to_string());
+        assert_eq!(read("memory.high"), (580u64 << 20).to_string());
+        assert_eq!(read("memory.max"), (1092u64 << 20).to_string());
         cgroup.set_limits(&limits).unwrap();
         assert_eq!(read("cpu.max"), "50000 100000");
         let _ = std::fs::remove_dir_all(&root);

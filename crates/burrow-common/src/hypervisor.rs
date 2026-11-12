@@ -53,8 +53,7 @@ impl Hypervisor {
     /// guest kernel. A warm restore touches all guest memory at once, so a
     /// tighter ceiling is hit before the guest runs. Its default is that with
     /// room for more vCPUs and queues. Firecracker v1.16.1 holds less of its
-    /// own, but its disks go through host page cache, and what is dirty
-    /// cannot be reclaimed until it is written back.
+    /// own, but its disks go through host page cache.
     pub fn default_vmm_overhead_mib(self) -> u32 {
         match self {
             Self::Firecracker => 64,
@@ -65,9 +64,10 @@ impl Hypervisor {
 
     /// The host memory a guest of `guest_mib` may hold under this hypervisor
     /// with a VMM needing `overhead_mib` beyond it: its cgroup's
-    /// `memory.max`, and what placement charges a node for it. Host page
-    /// cache gets no room: Cloud Hypervisor opens disks `O_DIRECT`, and what
-    /// Firecracker's guest I/O caches is reclaimed inside the ceiling.
+    /// `memory.high`, and what placement charges a node for it. Page cache
+    /// the VMM fills past it, from its snapshot writes or its guest's disk
+    /// I/O, is reclaimed as it is written back, under a `memory.max` that
+    /// only a runaway VMM reaches.
     pub fn memory_ceiling_mib(self, guest_mib: u32, overhead_mib: u32) -> u32 {
         match self {
             Self::Firecracker | Self::CloudHypervisor => {
