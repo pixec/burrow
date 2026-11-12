@@ -690,17 +690,20 @@ enum ConfigCommand {
     /// Change a sandbox's vCPUs, memory, root disk and host limits.
     ///
     /// A running sandbox takes what its hypervisor can hotplug: a bigger disk
-    /// under Firecracker and Cloud Hypervisor, and vCPUs under Cloud
-    /// Hypervisor on x86_64. A shut-down one (`burrow shutdown`) takes everything: vCPUs
-    /// and memory on its next `boot`, and its disk at once, shrunk by a helper
-    /// VM that checks the filesystem first and refuses a size below what it
+    /// and memory under Firecracker and Cloud Hypervisor, and vCPUs under
+    /// Cloud Hypervisor on x86_64. Memory moves between what the sandbox
+    /// booted with and its max memory (`create --max-mem-mib`); a shrink stops
+    /// short when the guest cannot empty enough memory, and says how far it
+    /// got. A shut-down one (`burrow shutdown`) takes everything: vCPUs and
+    /// memory on its next `boot`, and its disk at once, shrunk by a helper VM
+    /// that checks the filesystem first and refuses a size below what it
     /// needs. A suspended sandbox takes none of it. A macOS sandbox's disk
     /// grows while it is shut down and shrinks while it runs, and its guest
     /// finishes either on its next boot. The host limits (--cpus,
     /// --cpu-shares, --cpuset-cpus, --blkio-weight) move together: live on a
     /// running sandbox, otherwise when it next runs. Each change is reported
-    /// as live, next boot, offline or refused with the reason; any refusal
-    /// exits non-zero.
+    /// as live, partial, next boot, offline or refused with the reason; any
+    /// refusal or partial change exits non-zero.
     Resources {
         id: String,
         #[arg(long)]
@@ -825,6 +828,12 @@ struct CreateFlags {
     /// Guest memory in MiB. Defaults to 512.
     #[arg(long)]
     mem_mib: Option<u32>,
+    /// How far `config resources --mem-mib` can grow the memory while the
+    /// sandbox runs: MiB, or a number with m or g. Defaults to 16 times the
+    /// memory, within the node's limit; the same as --mem-mib gives it no
+    /// room to grow.
+    #[arg(long = "max-mem-mib", alias = "max-mem", value_parser = parse_size_mib)]
+    max_mem_mib: Option<u32>,
     /// Root disk in MiB, as the guest sees it: at least the template's image.
     /// Defaults to the image plus 1024. Resized later with `burrow config
     /// resources --disk-mib`.
@@ -914,6 +923,7 @@ impl CreateFlags {
             || self.snapshot.is_some()
             || self.vcpus.is_some()
             || self.mem_mib.is_some()
+            || self.max_mem_mib.is_some()
             || self.disk_mib.is_some()
             || self.limits.is_stated()
             || self.max_lifetime_secs != 0
@@ -1443,11 +1453,19 @@ async fn update_resources(
 ) -> anyhow::Result<()> {
     let updated = client.update_resources(request).await?.into_inner();
     let id = updated.sandbox.as_ref().map_or("", |s| &s.id);
-    let lines = describe_update(&updated);
-    for line in &lines {
+    for line in describe_update(&updated) {
         println!("{id} {line}");
     }
-    if lines.iter().any(|line| line.contains(" refused: ")) {
+    let is_short = [&updated.vcpus, &updated.mem_mib, &updated.disk_mib]
+        .into_iter()
+        .flatten()
+        .any(|outcome| {
+            matches!(
+                api::ResourceChange::try_from(outcome.change),
+                Ok(api::ResourceChange::Refused | api::ResourceChange::Partial)
+            )
+        });
+    if is_short {
         anyhow::bail!("not every change was applied");
     }
     Ok(())
@@ -1487,7 +1505,7 @@ fn describe_update(updated: &api::UpdateResourcesResponse) -> Vec<String> {
             };
             let change = api::ResourceChange::try_from(outcome.change).unwrap_or_default();
             let note = match change {
-                api::ResourceChange::Refused => String::new(),
+                api::ResourceChange::Refused | api::ResourceChange::Partial => String::new(),
                 _ if outcome.reason.is_empty() => String::new(),
                 _ => format!("; {}", outcome.reason),
             };
@@ -1506,6 +1524,12 @@ fn describe_update(updated: &api::UpdateResourcesResponse) -> Vec<String> {
                     ),
                     api::ResourceChange::Offline => {
                         format!("{name} {from} -> {to}{unit} offline{filesystem}")
+                    }
+                    api::ResourceChange::Partial => {
+                        format!(
+                            "{name} {from} -> {to}{unit} live, part way: {}",
+                            outcome.reason
+                        )
                     }
                     _ => format!("{name} refused: {}", outcome.reason),
                 } + &note,
@@ -3308,6 +3332,7 @@ fn create_request(flags: CreateFlags) -> anyhow::Result<api::CreateSandboxReques
         snapshot,
         vcpus,
         mem_mib,
+        max_mem_mib,
         disk_mib,
         limits,
         max_lifetime_secs,
@@ -3350,6 +3375,8 @@ fn create_request(flags: CreateFlags) -> anyhow::Result<api::CreateSandboxReques
                 cpu_shares: limits.cpu_shares.unwrap_or(0),
                 cpuset_cpus: limits.cpuset_cpus.unwrap_or_default(),
                 blkio_weight: limits.blkio_weight.unwrap_or(0),
+                max_mem_mib: max_mem_mib.unwrap_or(0),
+                ..Default::default()
             }),
             lifetime: Some(common::LifetimePolicy {
                 max_lifetime_secs,
@@ -4567,6 +4594,15 @@ fn print_config(sandbox: &common::Sandbox) {
         field("vcpus", &shape_value(resources.vcpus as u64, 1));
         field("cpus", &host_limits_text(resources));
         field("mem-mib", &shape_value(resources.mem_mib as u64, 512));
+        if resources.max_mem_mib > resources.mem_mib {
+            field(
+                "max-mem-mib",
+                &format!(
+                    "{} (booted with {})",
+                    resources.max_mem_mib, resources.boot_mem_mib
+                ),
+            );
+        }
         if resources.disk_mib > 0 {
             let layout = match common::DiskLayout::try_from(sandbox.disk_layout) {
                 Ok(common::DiskLayout::Root) => "root disk",
@@ -5541,6 +5577,8 @@ fn sandbox_json(sandbox: &common::Sandbox) -> String {
         "resources": {
             "vcpus": resources.vcpus,
             "mem_mib": resources.mem_mib,
+            "max_mem_mib": resources.max_mem_mib,
+            "boot_mem_mib": resources.boot_mem_mib,
             "disk_mib": resources.disk_mib,
             "cpus": resources.cpus,
             "cpu_shares": resources.cpu_shares,
@@ -5817,6 +5855,19 @@ mod tests {
                 "memory refused: cannot",
                 "disk 1024 -> 2048 MiB live, filesystem 2040 MiB",
             ]
+        );
+        let lines = super::describe_update(&api::UpdateResourcesResponse {
+            mem_mib: field(
+                api::ResourceChange::Partial,
+                8192,
+                2048,
+                "pages it could not move",
+            ),
+            ..Default::default()
+        });
+        assert_eq!(
+            lines,
+            ["memory 8192 -> 2048 MiB live, part way: pages it could not move"]
         );
         let lines = super::describe_update(&api::UpdateResourcesResponse {
             mem_mib: field(api::ResourceChange::NextBoot, 512, 1024, ""),
@@ -6669,6 +6720,7 @@ mod tests {
                 snapshot: None,
                 vcpus: None,
                 mem_mib: None,
+                max_mem_mib: None,
                 disk_mib: None,
                 limits: Default::default(),
                 snapshot_expiration_secs: 0,

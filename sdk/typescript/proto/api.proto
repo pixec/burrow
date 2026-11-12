@@ -649,20 +649,28 @@ message UpdateLifetimeRequest {
 //
 // A running sandbox takes what its hypervisor can hotplug: a bigger root disk
 // under Firecracker and Cloud Hypervisor, whose guest grows its filesystem at
-// once, and vCPUs under Cloud Hypervisor on x86_64, which boots each guest
-// able to take up to the node's CPU count (arm64 KVM cannot add a vCPU to a
-// VM that has run). Anything else is refused. A shut-down sandbox takes all of
-// it: vCPUs and memory on its next boot, and its disk at once, grown on the
-// host or shrunk by a helper VM that checks and shrinks the filesystem first.
-// A suspended sandbox takes none of it: a restore needs the machine its
-// snapshot was taken of.
+// once; memory under both, between `boot_mem_mib` and `max_mem_mib`, plugged
+// into or unplugged from the guest's virtio-mem device; and vCPUs under Cloud
+// Hypervisor on x86_64, which boots each guest able to take up to the node's
+// CPU count (arm64 KVM cannot add a vCPU to a VM that has run, and Firecracker
+// has no vCPU hotplug). Anything else is refused. More memory is admitted
+// against the node's like a create. A guest unplugs only memory it can empty,
+// so a shrink can stop short: it is then PARTIAL, `value` is where it stopped
+// and the rest stays plugged. A shut-down sandbox takes all of it: vCPUs and
+// memory on its next boot, and its disk at once, grown on the host or shrunk
+// by a helper VM that checks and shrinks the filesystem first. A suspended
+// sandbox takes none of it: a restore needs the machine its snapshot was
+// taken of.
 //
 // A macOS sandbox's disk is resized in two halves, since
 // Virtualization.framework changes a disk only under a stopped machine and
 // APFS resizes the guest's container only from inside: a grow is applied to a
 // shut-down sandbox's image (OFFLINE) and its container takes the space on its
 // next boot; a shrink shrinks a running sandbox's container (NEXT_BOOT) and
-// its image is cut on its next boot. The recovery container is kept.
+// its image is cut on its next boot. The recovery container is kept. Its
+// memory and vCPUs change only while it is shut down: the framework fixes
+// both when the machine is configured, and offers a running macOS guest only
+// a memory balloon, which takes memory away and never adds any.
 //
 // The host limits, `cpus`, `cpu_shares`, `cpuset_cpus` and `blkio_weight`,
 // are the VMM's cgroup and change together: live on a running sandbox, and on
@@ -691,14 +699,17 @@ enum ResourceChange {
   RESOURCE_CHANGE_OFFLINE = 4;
   // Not applied; `reason` says why.
   RESOURCE_CHANGE_REFUSED = 5;
+  // Applied to the running guest in part: `value` is as far as it got, and
+  // `reason` says why it stopped there.
+  RESOURCE_CHANGE_PARTIAL = 6;
 }
 
 // What became of one field of an UpdateResourcesRequest.
 message ResourceOutcome {
   ResourceChange change = 1;
   uint32 previous = 2;
-  // The value the sandbox has now: the one asked for, or `previous` when
-  // refused.
+  // The value the sandbox has now: the one asked for, `previous` when
+  // refused, or as far as a partial change got.
   uint32 value = 3;
   string reason = 4;
 }

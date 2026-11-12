@@ -1012,6 +1012,21 @@ impl NodeRegistry {
         }
     }
 
+    /// Charges a node for memory a sandbox on it is about to be given, if the
+    /// node has the room a create of that much would need.
+    pub fn reserve_growth(&self, node_id: &str, mem_mib: u64) -> bool {
+        let nodes = self.nodes.lock().unwrap();
+        let Some(entry) = nodes.get(node_id) else {
+            return false;
+        };
+        let mut pending = self.pending.lock().unwrap();
+        if free_mem(entry, &pending) < mem_mib {
+            return false;
+        }
+        pending.entry(node_id.to_string()).or_default().mem_mib += mem_mib;
+        true
+    }
+
     /// Gives back capacity reserved for a placement that no longer exists.
     ///
     /// A reservation covers the window between placing a sandbox and the node
@@ -2316,6 +2331,24 @@ mod tests {
             ..Default::default()
         };
         assert!(registry.place_for(&uncapped).is_err());
+    }
+
+    /// Memory a running sandbox grows by is charged like a create, so a node
+    /// short of it is refused and a concurrent create sees what it took.
+    #[test]
+    fn growth_is_charged_against_free_memory() {
+        let registry = registry(&[("only", status(&[], &[], 4_000))]);
+        assert!(registry.reserve_growth("only", 3_000));
+        assert!(!registry.reserve_growth("only", 2_000));
+        let want = Placement {
+            vcpus: 1,
+            mem_mib: 1_500,
+            ..Default::default()
+        };
+        assert!(registry.place_for(&want).is_err());
+        registry.release("only", 0, 3_000, 0);
+        assert_eq!(registry.place_for(&want).unwrap(), "only");
+        assert!(!registry.reserve_growth("missing", 1));
     }
 
     /// A reservation covers the window before a node reports the sandbox. If

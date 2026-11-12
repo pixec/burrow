@@ -89,6 +89,13 @@ pub struct Manifest {
     pub mem_mib: u32,
     #[serde(alias = "scratch_disk_mib")]
     pub disk_mib: u32,
+    /// What the VM booted with, of `mem_mib`, and what it could grow to. 0 in
+    /// a manifest from before memory hotplug, whose VM booted with all of
+    /// `mem_mib` and had nothing to grow into.
+    #[serde(default)]
+    pub boot_mem_mib: u32,
+    #[serde(default)]
+    pub max_mem_mib: u32,
     /// [`crate::rootdisk::DiskLayout`]; empty in a manifest from before root
     /// disks, which was the overlay.
     #[serde(default)]
@@ -155,6 +162,18 @@ impl Manifest {
         crate::rootdisk::DiskLayout::from_record(&self.disk_layout)
     }
 
+    /// `base` with the machine it holds, which a restore cannot change.
+    pub fn resources(&self, base: common::ResourcePolicy) -> common::ResourcePolicy {
+        common::ResourcePolicy {
+            vcpus: self.vcpus,
+            mem_mib: self.mem_mib,
+            disk_mib: self.disk_mib,
+            max_mem_mib: self.max_mem_mib,
+            boot_mem_mib: self.boot_mem_mib,
+            ..base
+        }
+    }
+
     fn to_proto(&self) -> common::Snapshot {
         common::Snapshot {
             id: self.id.clone(),
@@ -162,12 +181,7 @@ impl Manifest {
             template: self.template.clone(),
             // The orchestrator stamps this from its own view of the fleet.
             node_id: String::new(),
-            resources: Some(common::ResourcePolicy {
-                vcpus: self.vcpus,
-                mem_mib: self.mem_mib,
-                disk_mib: self.disk_mib,
-                ..Default::default()
-            }),
+            resources: Some(self.resources(Default::default())),
             created_at_unix_ms: self.created_unix_ms,
             size_bytes: self.size_bytes,
             expires_at_unix_ms: self.expires_at_ms,
@@ -310,6 +324,8 @@ pub struct Staged {
     pub template: String,
     pub vcpus: u32,
     pub mem_mib: u32,
+    pub boot_mem_mib: u32,
+    pub max_mem_mib: u32,
     pub disk_mib: u32,
     pub disk_layout: crate::rootdisk::DiskLayout,
     pub hypervisor: burrow_vmm::Hypervisor,
@@ -393,6 +409,8 @@ impl SnapshotStore {
             template: staged.template,
             vcpus: staged.vcpus,
             mem_mib: staged.mem_mib,
+            boot_mem_mib: staged.boot_mem_mib,
+            max_mem_mib: staged.max_mem_mib,
             disk_mib: staged.disk_mib,
             disk_layout: staged.disk_layout.as_str().to_string(),
             created_unix_ms: burrow_common::unix_now_ms(),
@@ -1369,7 +1387,9 @@ mod tests {
             sandbox_id: sandbox.into(),
             template: "default".into(),
             vcpus: 2,
-            mem_mib: 1024,
+            mem_mib: 3072,
+            boot_mem_mib: 1024,
+            max_mem_mib: 16384,
             disk_mib: 2048,
             disk_layout: String::new(),
             created_unix_ms: burrow_common::unix_from_rfc3339(created_at).unwrap_or(0) * 1_000,
@@ -1411,7 +1431,8 @@ mod tests {
         let read = read_manifest(&dir).await.expect("a manifest");
         assert_eq!(read.id, "snap_abc123");
         assert_eq!(read.sandbox_id, "sbx_a");
-        assert_eq!((read.vcpus, read.mem_mib, read.disk_mib), (2, 1024, 2048));
+        assert_eq!((read.vcpus, read.mem_mib, read.disk_mib), (2, 3072, 2048));
+        assert_eq!((read.boot_mem_mib, read.max_mem_mib), (1024, 16384));
         assert_eq!(read.expires_at_ms, 1_800_000_000_000);
         assert_eq!(read.expiration_secs, 3_600);
 
@@ -1702,6 +1723,8 @@ mod tests {
             template: "default".into(),
             vcpus: 1,
             mem_mib: 512,
+            boot_mem_mib: 512,
+            max_mem_mib: 512,
             disk_mib: 1024,
             disk_layout: crate::rootdisk::DiskLayout::Overlay,
             hypervisor: burrow_vmm::Hypervisor::Firecracker,

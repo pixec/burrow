@@ -34,6 +34,8 @@ enum NetworkMode {
 // restore.
 message ResourcePolicy {
   uint32 vcpus = 1;
+  // The guest's memory now: what it booted with plus what has been plugged
+  // into it since.
   uint32 mem_mib = 2;
   // The sandbox's own disk, in MiB. On the root layout this is the whole root
   // disk as the guest sees it, at least its template's image; 0 is the image
@@ -56,6 +58,18 @@ message ResourcePolicy {
   // converted to io.weight as runc does. 0 is unset. Refused on a node whose
   // cgroup has no io.weight.
   uint32 blkio_weight = 7;
+  // How far `mem_mib` can grow while the sandbox runs. Under Firecracker and
+  // Cloud Hypervisor a Linux guest boots with room for memory up to this
+  // much, plugged in as UpdateResources asks; the room costs neither the
+  // host nor the guest anything until it is used. 0 is the node's default,
+  // 16 times `mem_mib` capped by `burrowd --memory-hotplug-max-mib`; set
+  // to `mem_mib`, the guest gets no room. Fixed while a VM runs and kept by
+  // its snapshots, so a restore, a fork or a move keeps it too.
+  uint32 max_mem_mib = 8;
+  // Set by the node, ignored on a create: the memory the sandbox's current VM
+  // booted with. Plugged memory comes and goes above it; a running guest
+  // cannot go below it.
+  uint32 boot_mem_mib = 9;
 }
 
 // How long a sandbox stays paid for. All three are read by the same reaper on

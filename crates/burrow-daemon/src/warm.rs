@@ -82,7 +82,10 @@ pub async fn hold_builds() -> tokio::sync::MutexGuard<'static, ()> {
 /// 6 keeps a snapshot per shape in a directory of its own. A 5 is the one
 /// snapshot directly under `warm/`, and is rebuilt at its shape in the new
 /// layout.
-const WARM_FORMAT: &str = "6";
+///
+/// 7 boots with a virtio-mem region to grow into, sized by the shape's
+/// growth limit, and with the kernel told to online what is plugged.
+const WARM_FORMAT: &str = "7";
 
 /// Whether a warm snapshot's `format` file names the format this build writes.
 fn is_current_format(text: &str) -> bool {
@@ -132,6 +135,9 @@ pub struct Shape {
     /// MiB. 0 in a request is the template's image plus headroom, which
     /// [`resolve_disk`] turns into a size; a built snapshot records the size.
     pub disk_mib: u32,
+    /// What the memory can grow to, which sizes the snapshot's hotplug
+    /// region. 0 is the node's default, which [`Self::resolved`] fills in.
+    pub max_mem_mib: u32,
 }
 
 impl Shape {
@@ -145,6 +151,16 @@ impl Shape {
                 resources.mem_mib
             },
             disk_mib: resources.disk_mib,
+            max_mem_mib: resources.max_mem_mib,
+        }
+        .resolved()
+    }
+
+    /// With the node's default for a growth limit left unset.
+    pub fn resolved(self) -> Self {
+        Self {
+            max_mem_mib: crate::sandbox::max_mem_mib(self.mem_mib, self.max_mem_mib),
+            ..self
         }
     }
 
@@ -152,11 +168,18 @@ impl Shape {
     /// in. The disk is left out: a create asking for a larger one restores
     /// the snapshot and grows it.
     fn dir_name(self, hypervisor: Hypervisor) -> String {
-        format!("{hypervisor}-{}x{}", self.vcpus, self.mem_mib)
+        match self.max_mem_mib > self.mem_mib {
+            true => format!(
+                "{hypervisor}-{}x{}-{}",
+                self.vcpus, self.mem_mib, self.max_mem_mib
+            ),
+            false => format!("{hypervisor}-{}x{}", self.vcpus, self.mem_mib),
+        }
     }
 
     fn is_machine(self, other: Shape) -> bool {
-        (self.vcpus, self.mem_mib) == (other.vcpus, other.mem_mib)
+        (self.vcpus, self.mem_mib, self.max_mem_mib)
+            == (other.vcpus, other.mem_mib, other.max_mem_mib)
     }
 
     fn parse(text: &str) -> Option<Self> {
@@ -167,10 +190,20 @@ impl Shape {
             vcpus: fields.next()?.parse().ok()?,
             mem_mib: fields.next()?.parse().ok()?,
             disk_mib: fields.next()?.parse().ok()?,
+            // Absent before format 7, whose snapshots are rebuilt at the
+            // node's default.
+            max_mem_mib: fields.next().map_or(Some(0), |field| field.parse().ok())?,
         };
-        // A third field means a format this build does not understand; cold
+        // Another field means a format this build does not understand; cold
         // booting is the safe answer.
         fields.next().is_none().then_some(shape)
+    }
+
+    fn render(self) -> String {
+        format!(
+            "{} {} {} {}",
+            self.vcpus, self.mem_mib, self.disk_mib, self.max_mem_mib
+        )
     }
 }
 
@@ -202,6 +235,7 @@ pub fn parse_shape(text: &str) -> Result<Shape, String> {
             .parse()
             .map_err(|_| format!("{text:?}: {mem_mib:?} is not MiB of memory"))?,
         disk_mib: 0,
+        max_mem_mib: 0,
     })
 }
 
@@ -311,6 +345,7 @@ impl Warm {
                 vcpus: self.shape.vcpus,
                 mem_mib: self.shape.mem_mib,
                 disk_mib: self.shape.disk_mib,
+                max_mem_mib: self.shape.max_mem_mib,
                 ..Default::default()
             }),
             size_bytes: self.bytes,
@@ -650,6 +685,8 @@ pub async fn build_warm_snapshot(
     // here, not from what a later caller asks for.
     spec.vcpus = shape.vcpus;
     spec.mem_mib = shape.mem_mib;
+    spec.mem_hotplug_mib =
+        crate::sandbox::hotplug_region(hypervisor, guest_os, shape.mem_mib, shape.max_mem_mib);
     spec.drives = DiskLayout::Root.drives();
     spec.is_vsock_enabled = true;
     spec.net = Some(NetSpec {
@@ -698,12 +735,9 @@ pub async fn build_warm_snapshot(
             // makes a snapshot warm, and one that is warm without a shape can
             // never be matched to a request, so the node keeps winning
             // placement and every create cold-boots.
-            tokio::fs::write(
-                dir.join(SHAPE_FILE),
-                format!("{} {} {}", shape.vcpus, shape.mem_mib, shape.disk_mib),
-            )
-            .await
-            .map_err(|err| Status::internal(format!("recording warm shape: {err}")))?;
+            tokio::fs::write(dir.join(SHAPE_FILE), shape.render())
+                .await
+                .map_err(|err| Status::internal(format!("recording warm shape: {err}")))?;
             tokio::fs::write(dir.join(HYPERVISOR_FILE), hypervisor.as_str())
                 .await
                 .map_err(|err| Status::internal(format!("recording warm hypervisor: {err}")))?;
@@ -912,6 +946,12 @@ async fn profile_restore(
     });
     spec.vcpus = shape.vcpus;
     spec.mem_mib = shape.mem_mib;
+    spec.mem_hotplug_mib = crate::sandbox::hotplug_region(
+        backend.hypervisor(),
+        burrow_vmm::GuestOs::Linux,
+        shape.mem_mib,
+        shape.max_mem_mib,
+    );
     spec.record_prefetch = Some(PREFETCH_PLAN.to_string());
     apply_confinement(&mut spec, config, shape);
 
@@ -1016,6 +1056,7 @@ mod shape_tests {
                 vcpus: 1,
                 mem_mib: 512,
                 disk_mib: 0,
+                max_mem_mib: 8192,
             }
         );
     }
@@ -1026,6 +1067,7 @@ mod shape_tests {
             vcpus: 4,
             mem_mib: 2048,
             disk_mib: 4096,
+            max_mem_mib: 4096,
             ..Default::default()
         });
         assert_eq!(
@@ -1034,6 +1076,7 @@ mod shape_tests {
                 vcpus: 4,
                 mem_mib: 2048,
                 disk_mib: 4096,
+                max_mem_mib: 4096,
             }
         );
     }
@@ -1044,10 +1087,10 @@ mod shape_tests {
             vcpus: 2,
             mem_mib: 1024,
             disk_mib: 1324,
+            max_mem_mib: 16384,
         };
-        let text = format!("{} {} {}", shape.vcpus, shape.mem_mib, shape.disk_mib);
-        assert_eq!(Shape::parse(&text), Some(shape));
-        assert_eq!(Shape::parse("  2   1024 1324 \n"), Some(shape));
+        assert_eq!(Shape::parse(&shape.render()), Some(shape));
+        assert_eq!(Shape::parse("  2   1024 1324 16384 \n"), Some(shape));
     }
 
     #[test]
@@ -1058,9 +1101,9 @@ mod shape_tests {
             "",
             "2",
             "2 1024",
-            "two 1024 1",
-            "2 lots 1",
-            "2 1024 1 1",
+            "two 1024 1 1",
+            "2 lots 1 1",
+            "2 1024 1 1 1",
             "\n",
         ] {
             assert_eq!(Shape::parse(bad), None, "{bad:?} should not parse");
@@ -1071,10 +1114,10 @@ mod shape_tests {
     /// rebuilt in the new layout rather than restored.
     #[test]
     fn only_the_current_format_is_warm() {
-        assert_eq!(WARM_FORMAT, "6");
-        assert!(is_current_format("6"));
-        assert!(is_current_format("6\n"));
-        for old in ["", "1", "2", "3", "4", "5", "7"] {
+        assert_eq!(WARM_FORMAT, "7");
+        assert!(is_current_format("7"));
+        assert!(is_current_format("7\n"));
+        for old in ["", "1", "2", "3", "4", "5", "6", "8"] {
             assert!(!is_current_format(old), "{old:?} should be rebuilt");
         }
     }
@@ -1087,6 +1130,7 @@ mod shape_tests {
                 vcpus: 2,
                 mem_mib: 2048,
                 disk_mib: 0,
+                max_mem_mib: 0,
             })
         );
         for bad in ["", "2", "2x", "x2048", "2x2048x1", "twox2048", "2*2048"] {
@@ -1102,6 +1146,7 @@ mod shape_tests {
             vcpus,
             mem_mib,
             disk_mib,
+            max_mem_mib: mem_mib,
         };
         assert_eq!(
             shape(2, 2048, 1324).dir_name(Hypervisor::Firecracker),
@@ -1119,6 +1164,15 @@ mod shape_tests {
             shape(4, 2048, 0).dir_name(Hypervisor::Firecracker),
             shape(2, 2048, 0).dir_name(Hypervisor::Firecracker)
         );
+        let growable = Shape {
+            max_mem_mib: 16384,
+            ..shape(1, 1024, 0)
+        };
+        assert_eq!(
+            growable.dir_name(Hypervisor::Firecracker),
+            "firecracker-1x1024-16384"
+        );
+        assert!(!growable.is_machine(shape(1, 1024, 0)));
     }
 
     fn entry(template: &str, vcpus: u32, mem_mib: u32, bytes: u64, used_at: i64) -> (String, Warm) {
@@ -1131,7 +1185,9 @@ mod shape_tests {
                     vcpus,
                     mem_mib,
                     disk_mib: 1324,
-                },
+                    max_mem_mib: 0,
+                }
+                .resolved(),
                 bytes,
                 used_at,
             },
@@ -1172,7 +1228,9 @@ mod shape_tests {
         assert_eq!(policy(2, 16).evictions(&entries), vec![1]);
         // Even past a cap only pinned shapes would meet.
         let mut pinned = policy(0, 16);
-        pinned.pinned.push(parse_shape("4x4096").unwrap());
+        pinned
+            .pinned
+            .push(parse_shape("4x4096").unwrap().resolved());
         assert_eq!(pinned.evictions(&entries), vec![1]);
     }
 
@@ -1225,14 +1283,23 @@ mod shape_tests {
     async fn a_create_finds_only_its_own_machine() {
         let templates = temp("find");
         let warm = warm_dir(&templates, "app");
-        write_snapshot(&warm.join("firecracker-2x2048"), WARM_FORMAT, "2 2048 1324");
-        write_snapshot(&warm.join("firecracker-1x512"), WARM_FORMAT, "1 512 1324");
+        write_snapshot(
+            &warm.join("firecracker-2x2048"),
+            WARM_FORMAT,
+            "2 2048 1324 2048",
+        );
+        write_snapshot(
+            &warm.join("firecracker-1x512"),
+            WARM_FORMAT,
+            "1 512 1324 512",
+        );
         std::fs::write(warm.join("firecracker-2x2048").join(USED_FILE), "1234").unwrap();
 
         let wanted = |vcpus, mem_mib| Shape {
             vcpus,
             mem_mib,
             disk_mib: 4096,
+            max_mem_mib: mem_mib,
         };
         let found = find(&templates, "app", Hypervisor::Firecracker, wanted(2, 2048))
             .await
@@ -1309,14 +1376,19 @@ mod shape_tests {
                     vcpus: 2,
                     mem_mib: 1024,
                     disk_mib: 1324,
+                    max_mem_mib: 0,
                 })
             )]
         );
         assert!(list(&templates, "flat").await.is_empty());
 
         let warm = warm_dir(&templates, "app");
-        write_snapshot(&warm.join("firecracker-1x512"), WARM_FORMAT, "1 512 1324");
-        write_snapshot(&warm.join("firecracker-4x4096"), "5", "4 4096 1324");
+        write_snapshot(
+            &warm.join("firecracker-1x512"),
+            WARM_FORMAT,
+            "1 512 1324 512",
+        );
+        write_snapshot(&warm.join("firecracker-4x4096"), "6", "4 4096 1324");
         let found = stale(&templates, "app").await;
         assert_eq!(found.len(), 1);
         assert_eq!(found[0].0, warm.join("firecracker-4x4096"));
@@ -1332,6 +1404,7 @@ mod shape_tests {
             vcpus: 1,
             mem_mib: 512,
             disk_mib: 0,
+            max_mem_mib: 8192,
         };
         let asked = Shape::wanted(&common::ResourcePolicy {
             mem_mib: 2048,

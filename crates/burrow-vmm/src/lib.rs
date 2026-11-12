@@ -111,7 +111,6 @@ const MEMORY_POLL: Duration = Duration::from_millis(50);
 const MEMORY_STALL: Duration = Duration::from_secs(3);
 const MEMORY_TIMEOUT: Duration = Duration::from_secs(120);
 
-
 /// The framework's save file, device state and memory in one: both halves of
 /// the vz backend's [`Layout`]. Named here so every build knows the layout
 /// of state a Mac node wrote.

@@ -2186,6 +2186,22 @@ fn mem_mib(requested: u32) -> Result<u32, Status> {
     }
 }
 
+/// A growth limit as asked for, 0 being the node's default: at least the
+/// memory, and at most what this node lets a sandbox grow to.
+fn max_mem_mib(mem_mib: u32, requested: u32) -> Result<u32, Status> {
+    let cap = crate::sandbox::memory_hotplug_max().max(mem_mib);
+    match requested {
+        0 => Ok(0),
+        n if n < mem_mib => Err(Status::invalid_argument(format!(
+            "max_mem_mib {n} is less than mem_mib {mem_mib}"
+        ))),
+        n if n > cap => Err(Status::invalid_argument(format!(
+            "max_mem_mib {n} is more than this node lets a sandbox grow to, {cap} MiB"
+        ))),
+        n => Ok(n),
+    }
+}
+
 /// A disk size as asked for, 0 being the template's image plus headroom,
 /// which only the template can say.
 fn disk_mib(requested: u32) -> Result<u32, Status> {
@@ -2209,7 +2225,9 @@ pub(crate) fn warm_request(
         vcpus: vcpus(resources.vcpus)?,
         mem_mib: mem_mib(resources.mem_mib)?,
         disk_mib: disk_mib(resources.disk_mib)?,
-    })
+        max_mem_mib: resources.max_mem_mib,
+    }
+    .resolved())
 }
 
 /// Checks an id that is about to become a sandbox's workdir name, cgroup name
@@ -2255,7 +2273,7 @@ fn validate_policy(policy: &common::Policy) -> Result<(), Status> {
     // Same ceilings as warm builds: firecracker is handed these verbatim.
     if let Some(resources) = &policy.resources {
         vcpus(resources.vcpus)?;
-        mem_mib(resources.mem_mib)?;
+        max_mem_mib(mem_mib(resources.mem_mib)?, resources.max_mem_mib)?;
         disk_mib(resources.disk_mib)?;
         burrow_common::cpu::validate(
             resources.vcpus,
@@ -3804,6 +3822,18 @@ mod policy_tests {
 
         assert_eq!(disk_mib(0).unwrap(), 0);
         assert!(disk_mib(u32::MAX).is_err());
+    }
+
+    /// A growth limit is at least the memory it grows from and at most the
+    /// node's, 0 leaving it to the node.
+    #[test]
+    fn a_growth_limit_sits_between_the_memory_and_the_node_cap() {
+        assert_eq!(max_mem_mib(1024, 0).unwrap(), 0);
+        assert_eq!(max_mem_mib(1024, 1024).unwrap(), 1024);
+        assert_eq!(max_mem_mib(1024, 16384).unwrap(), 16384);
+        assert!(max_mem_mib(1024, 512).is_err());
+        assert!(max_mem_mib(1024, 16385).is_err());
+        assert_eq!(max_mem_mib(32768, 32768).unwrap(), 32768);
     }
 
     fn fs_req(op: api::fs_request::Op) -> api::FsRequest {

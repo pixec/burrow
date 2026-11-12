@@ -269,6 +269,14 @@ pub struct ServeArgs {
     /// startup, and never evicted. The default shape, 1x512, always is.
     #[arg(long, value_delimiter = ',', value_parser = crate::warm::parse_shape, env = "BURROWD_WARM_SHAPES")]
     pub warm_shapes: Vec<crate::warm::Shape>,
+    /// The most a sandbox's memory grows to while it runs, in MiB. A Linux
+    /// guest under Firecracker or Cloud Hypervisor boots with room to be
+    /// plugged up to its policy's `max_mem_mib`, by default 16 times its
+    /// memory and never more than this. The room is address space: it costs
+    /// the host nothing until memory is plugged into it. 0 gives no sandbox
+    /// room it did not ask for.
+    #[arg(long, default_value_t = crate::sandbox::DEFAULT_MEMORY_HOTPLUG_MAX_MIB, env = "BURROWD_MEMORY_HOTPLUG_MAX_MIB")]
+    pub memory_hotplug_max_mib: u32,
     /// Creates of a shape with no warm snapshot before the node builds one
     /// for it, in the background. 1 warms every shape on its first use.
     #[arg(long, default_value_t = 1, value_parser = clap::value_parser!(u32).range(1..), env = "BURROWD_WARM_DEMAND")]
@@ -703,8 +711,9 @@ fn warm_policy(args: &ServeArgs) -> crate::warm::WarmPolicy {
         ..Default::default()
     };
     for shape in &args.warm_shapes {
-        if !policy.is_pinned(*shape) {
-            policy.pinned.push(*shape);
+        let shape = shape.resolved();
+        if !policy.is_pinned(shape) {
+            policy.pinned.push(shape);
         }
     }
     policy
@@ -1347,6 +1356,8 @@ fn restrict_to_owner(path: &std::path::Path) {
 fn restrict_to_owner(_path: &std::path::Path) {}
 
 pub async fn run(args: ServeArgs) -> anyhow::Result<()> {
+    // Before the warm policy, whose shapes are sized by it.
+    crate::sandbox::set_memory_hotplug_max(args.memory_hotplug_max_mib);
     // Before anything is opened: a malformed label is a startup error, not a
     // node that comes up unplaceable.
     let mut node_info = local_node_info(&args)?;

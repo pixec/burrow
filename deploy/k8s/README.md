@@ -121,13 +121,14 @@ the usual starting point; take the one matching your machines' architecture:
 ```sh
 kubectl -n burrow exec ds/burrow-node -- sh -c \
   'curl -fsSL -o /var/lib/burrow/vmlinux \
-    https://s3.amazonaws.com/spec.ccfc.min/firecracker-ci/v1.13/x86_64/vmlinux-6.1.141'
+    https://s3.amazonaws.com/spec.ccfc.min/firecracker-ci/v1.15/x86_64/vmlinux-6.1.155'
 ```
 
 On `arm64` machines swap `x86_64` for `aarch64` in that URL. `/var/lib/burrow`
 is where `--guest-kernel` looks by default; pass the flag if you keep the kernel
 elsewhere. Any kernel Firecracker can boot works, so a build of your own with
-the drivers you need is fine.
+the drivers you need is fine. Live memory changes need `CONFIG_VIRTIO_MEM`,
+which the `v1.15` kernels have and the older `v1.13` ones lack.
 
 Then import a template; nodes hold templates on local disk, and a fleet with
 none can create nothing:

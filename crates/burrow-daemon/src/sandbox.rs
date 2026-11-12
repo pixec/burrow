@@ -433,6 +433,89 @@ const REASON_VMM_EXITED: &str = "its VMM exited while it was running, so its mem
 /// Guest memory when the policy names none.
 const DEFAULT_MEM_MIB: u32 = 512;
 
+/// `burrowd --memory-hotplug-max-mib`: the most a sandbox's memory grows to
+/// by default, and the most it may ask to.
+static MEMORY_HOTPLUG_MAX_MIB: std::sync::atomic::AtomicU32 =
+    std::sync::atomic::AtomicU32::new(DEFAULT_MEMORY_HOTPLUG_MAX_MIB);
+pub(crate) const DEFAULT_MEMORY_HOTPLUG_MAX_MIB: u32 = 16_384;
+/// How many times its boot memory a sandbox grows to by default. Memory
+/// plugged into ZONE_MOVABLE has its page structures, 1/64 of it, allocated
+/// from boot memory, so at 16 times a guest spends a quarter of its boot
+/// memory describing what was plugged.
+const DEFAULT_MEMORY_GROWTH: u32 = 16;
+
+pub fn set_memory_hotplug_max(mib: u32) {
+    MEMORY_HOTPLUG_MAX_MIB.store(mib, std::sync::atomic::Ordering::Relaxed);
+}
+
+pub(crate) fn memory_hotplug_max() -> u32 {
+    MEMORY_HOTPLUG_MAX_MIB.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// How far a sandbox of `mem_mib` grows while it runs, `requested` being
+/// what its policy asked for and 0 the node's default.
+pub(crate) fn max_mem_mib(mem_mib: u32, requested: u32) -> u32 {
+    match requested {
+        0 => mem_mib
+            .saturating_mul(DEFAULT_MEMORY_GROWTH)
+            .min(memory_hotplug_max())
+            .max(mem_mib),
+        n => n.max(mem_mib),
+    }
+}
+
+/// Whether a guest's memory can change while it runs. Windows has no
+/// virtio-mem driver burrow installs.
+fn can_plug_memory(hypervisor: Hypervisor, guest_os: burrow_vmm::GuestOs) -> bool {
+    hypervisor.capabilities().is_memory_hotplug_supported && guest_os == burrow_vmm::GuestOs::Linux
+}
+
+/// The virtio-mem region a VM booting with `boot_mib` gets to grow to
+/// `max_mib`: none where its memory cannot change while it runs, and
+/// otherwise rounded up to what both backends size a region in.
+pub(crate) fn hotplug_region(
+    hypervisor: Hypervisor,
+    guest_os: burrow_vmm::GuestOs,
+    boot_mib: u32,
+    max_mib: u32,
+) -> u32 {
+    if !can_plug_memory(hypervisor, guest_os) {
+        return 0;
+    }
+    max_mib
+        .saturating_sub(boot_mib)
+        .next_multiple_of(burrow_vmm::MEMORY_REGION_ALIGN_MIB)
+}
+
+/// Fixes the memory of a VM about to boot, or to restore a warm snapshot
+/// taken at boot: all of it is boot memory, and it can grow as far as the
+/// policy asks or the node's default, where anything can plug it. A limit
+/// left below the memory by a change made while shut down rises to it.
+#[allow(clippy::result_large_err)]
+fn pin_boot_memory(
+    resources: &mut common::ResourcePolicy,
+    hypervisor: Hypervisor,
+    guest_os: burrow_vmm::GuestOs,
+) -> Result<(), Status> {
+    if resources.mem_mib == 0 {
+        resources.mem_mib = DEFAULT_MEM_MIB;
+    }
+    let mem = resources.mem_mib;
+    let requested = resources.max_mem_mib;
+    resources.max_mem_mib = match can_plug_memory(hypervisor, guest_os) {
+        false if requested > mem => {
+            return Err(Status::invalid_argument(format!(
+                "max_mem_mib {requested} is more than mem_mib {mem}, and a {guest_os} guest \
+                 under {hypervisor} cannot be given memory while it runs"
+            )));
+        }
+        false => mem,
+        true => max_mem_mib(mem, requested),
+    };
+    resources.boot_mem_mib = mem;
+    Ok(())
+}
+
 /// How long a macOS guest gets to resize its APFS container, which takes
 /// minutes on a busy Mac; the sandbox's own client gives up after the agent
 /// timeout.
@@ -1231,9 +1314,30 @@ impl RunningSandbox {
     }
 
     /// The memory the VM is given, the node's default or a macOS guest's
-    /// minimum included, where the policy may say 0.
+    /// minimum included, where the policy may say 0: what it booted with and
+    /// what has been plugged since.
     pub fn mem_mib(&self) -> u32 {
+        let spec = self.spec.lock().unwrap();
+        spec.mem_mib + spec.mem_plugged_mib
+    }
+
+    /// What the VM booted with, the floor a running guest's memory shrinks
+    /// to.
+    pub fn boot_mem_mib(&self) -> u32 {
         self.spec.lock().unwrap().mem_mib
+    }
+
+    /// What the memory may grow to while the VM runs.
+    pub fn max_mem_mib(&self) -> u32 {
+        let max = self
+            .base_record
+            .lock()
+            .unwrap()
+            .policy
+            .as_ref()
+            .and_then(|policy| policy.resources.as_ref())
+            .map_or(0, |resources| resources.max_mem_mib);
+        max.max(self.mem_mib())
     }
 
     /// Marks the sandbox as used, deferring idle suspension.
@@ -2101,17 +2205,15 @@ impl RunningSandbox {
                 capture,
             )
             .await?;
-        let (vcpus, mem_mib) = {
-            let spec = self.spec.lock().unwrap();
-            (spec.vcpus, spec.mem_mib)
-        };
         let layout = self.disk_layout();
         Ok(crate::snapshot::Staged {
             sandbox_id: self.id.clone(),
             template: self.template.clone(),
             hypervisor: self.hypervisor,
-            vcpus,
-            mem_mib,
+            vcpus: self.vcpus(),
+            mem_mib: self.mem_mib(),
+            boot_mem_mib: self.boot_mem_mib(),
+            max_mem_mib: self.max_mem_mib(),
             disk_mib: size_mib(&dest.join(layout.disk())),
             disk_layout: layout,
             chain,
@@ -2477,6 +2579,7 @@ struct ShapeKey {
     template: String,
     vcpus: u32,
     mem_mib: u32,
+    max_mem_mib: u32,
 }
 
 impl ShapeKey {
@@ -2486,6 +2589,7 @@ impl ShapeKey {
             template: template.to_string(),
             vcpus: shape.vcpus,
             mem_mib: shape.mem_mib,
+            max_mem_mib: shape.max_mem_mib,
         }
     }
 
@@ -2494,6 +2598,7 @@ impl ShapeKey {
             vcpus: self.vcpus,
             mem_mib: self.mem_mib,
             disk_mib: 0,
+            max_mem_mib: self.max_mem_mib,
         }
     }
 }
@@ -5128,21 +5233,14 @@ impl SandboxManager {
             Some(_) if let Some(reason) = &blocked => Some(refuse(reason, current_mem)),
             Some(want) => Some(match slot.as_ref() {
                 None => outcome(ResourceChange::NextBoot, current_mem, want),
-                Some(_) => refuse(
-                    &format!(
-                        "{} cannot change a running guest's memory; shut {id} down, update it, \
-                         and boot it",
-                        sandbox.hypervisor
-                    ),
-                    current_mem,
-                ),
+                Some(vm) => self.replug(sandbox, vm, want).await?,
             }),
         };
         let applied = |outcome: &Option<ResourceOutcome>| {
             outcome.as_ref().and_then(|o| {
                 matches!(
                     ResourceChange::try_from(o.change),
-                    Ok(ResourceChange::Live | ResourceChange::NextBoot)
+                    Ok(ResourceChange::Live | ResourceChange::NextBoot | ResourceChange::Partial)
                 )
                 .then_some(o.value)
             })
@@ -5155,8 +5253,11 @@ impl SandboxManager {
                     spec.vcpus = n;
                 }
                 if let Some(mib) = new_mem {
+                    match slot.is_some() {
+                        true => spec.mem_plugged_mib = mib - spec.mem_mib,
+                        false => (spec.mem_mib, spec.mem_plugged_mib) = (mib, 0),
+                    }
                     spec.limits.memory_mib = self.config.memory_ceiling_mib(spec.hypervisor(), mib);
-                    spec.mem_mib = mib;
                 }
             }
             {
@@ -5183,6 +5284,144 @@ impl SandboxManager {
             );
         }
         Ok((vcpus, mem_mib))
+    }
+
+    /// Plugs memory into a running guest or unplugs it, as far as the guest
+    /// gets, between the memory it booted with and its growth limit. The
+    /// memory cap is raised before a grow and lowered to what was reached
+    /// after, so it never sits below what the guest holds.
+    async fn replug(
+        &self,
+        sandbox: &RunningSandbox,
+        vm: &Vm,
+        want: u32,
+    ) -> Result<ResourceOutcome, Status> {
+        let id = sandbox.id();
+        let current = sandbox.mem_mib();
+        let boot = sandbox.boot_mem_mib();
+        let max = sandbox.max_mem_mib();
+        let region = sandbox.spec.lock().unwrap().mem_hotplug_mib;
+        let refuse = |reason: String| ResourceOutcome {
+            change: ResourceChange::Refused as i32,
+            previous: current,
+            value: current,
+            reason,
+        };
+        if !sandbox
+            .hypervisor
+            .capabilities()
+            .is_memory_hotplug_supported
+        {
+            return Ok(refuse(format!(
+                "{} cannot change a running guest's memory; shut {id} down, update it, and \
+                 boot it",
+                sandbox.hypervisor
+            )));
+        }
+        if region == 0 {
+            return Ok(refuse(format!(
+                "sandbox {id} booted with no room to plug memory into: its max_mem_mib is its \
+                 memory, or its VM predates memory hotplug; shut it down, update it, and boot it"
+            )));
+        }
+        if want < boot {
+            return Ok(refuse(format!(
+                "sandbox {id} booted with {boot} MiB, and a running guest cannot go below the \
+                 memory it booted with; shut it down, update it, and boot it"
+            )));
+        }
+        if want > max {
+            return Ok(refuse(format!(
+                "sandbox {id} can grow to {max} MiB while it runs (its max_mem_mib); shut it \
+                 down, update it, and boot it for more"
+            )));
+        }
+        if !(want - boot).is_multiple_of(burrow_vmm::MEMORY_BLOCK_MIB) {
+            return Ok(refuse(format!(
+                "a running guest's memory moves in steps of {} MiB above the {boot} MiB it \
+                 booted with",
+                burrow_vmm::MEMORY_BLOCK_MIB
+            )));
+        }
+        let cap = |mib: u32| self.config.memory_ceiling_mib(sandbox.hypervisor, mib);
+        if let Err(err) = self.admit_memory(cap(current), cap(want)) {
+            return refused(err, current);
+        }
+        if want > current
+            && let Err(err) = vm.set_memory_limit(cap(want))
+        {
+            return Ok(refuse(format!("could not raise the memory cap: {err}")));
+        }
+        let reached = match vm.resize_memory(want - boot).await {
+            Ok(plugged) => boot + plugged,
+            Err(err) => {
+                let _ = vm.set_memory_limit(cap(current));
+                return Ok(refuse(format!(
+                    "{} refused the change: {err}",
+                    sandbox.hypervisor
+                )));
+            }
+        };
+        if let Err(err) = vm.set_memory_limit(cap(reached)) {
+            tracing::warn!(sandbox = id, %err, "could not move the memory cap");
+        }
+        tracing::info!(
+            sandbox = id,
+            from = current,
+            want,
+            reached,
+            "replugged memory"
+        );
+        let reason = match (reached == want, want > current) {
+            (true, _) => String::new(),
+            (false, true) if reached == current => "the guest plugged none of it: its kernel \
+                                                    needs CONFIG_VIRTIO_MEM and \
+                                                    memhp_default_state=online_movable to take \
+                                                    memory while it runs"
+                .to_string(),
+            (false, true) => format!(
+                "the guest plugged {} of {} MiB and stopped, likely short of the boot memory \
+                 that describes what it plugs",
+                reached - current,
+                want - current
+            ),
+            (false, false) => format!(
+                "the guest unplugged {} of {} MiB: it had no room for what the rest holds, or \
+                 could not move it, so the rest stays plugged",
+                current - reached,
+                current - want
+            ),
+        };
+        Ok(ResourceOutcome {
+            change: match reached {
+                r if r == want => ResourceChange::Live,
+                r if r == current => ResourceChange::Refused,
+                _ => ResourceChange::Partial,
+            } as i32,
+            previous: current,
+            value: reached,
+            reason,
+        })
+    }
+
+    /// Refuses raising a VMM's memory ceiling from `current` to `want` MiB
+    /// past the memory the node has available, as placement refuses a
+    /// create.
+    #[allow(clippy::result_large_err)]
+    fn admit_memory(&self, current: u32, want: u32) -> Result<(), Status> {
+        if want <= current {
+            return Ok(());
+        }
+        let mut sys = sysinfo::System::new();
+        sys.refresh_memory();
+        let available = sys.available_memory() / burrow_common::disk::MIB;
+        let needed = u64::from(want - current);
+        if available < needed {
+            return Err(Status::resource_exhausted(format!(
+                "this node has {available} MiB of memory available; {needed} MiB more do not fit"
+            )));
+        }
+        Ok(())
     }
 
     /// Refuses giving `sandbox` `vcpus` where the node has no room for what
@@ -5551,6 +5790,7 @@ impl SandboxManager {
             template: template.clone(),
             vcpus: shape.vcpus,
             mem_mib: shape.mem_mib,
+            max_mem_mib: shape.max_mem_mib,
         };
         // Claimed before the task is spawned, so a burst of creates of one
         // shape queues one build rather than one each.
@@ -5695,12 +5935,14 @@ impl SandboxManager {
             template: template.to_string(),
             vcpus: shape.vcpus,
             mem_mib: shape.mem_mib,
+            max_mem_mib: shape.max_mem_mib,
         });
         self.warm_in_background(
             template.to_string(),
             common::ResourcePolicy {
                 vcpus: shape.vcpus,
                 mem_mib: shape.mem_mib,
+                max_mem_mib: shape.max_mem_mib,
                 ..Default::default()
             },
         );
@@ -5759,6 +6001,7 @@ impl SandboxManager {
                 template: template.clone(),
                 vcpus: warm.shape.vcpus,
                 mem_mib: warm.shape.mem_mib,
+                max_mem_mib: warm.shape.max_mem_mib,
             });
             tracing::info!(
                 template,
@@ -5802,6 +6045,7 @@ impl SandboxManager {
                         common::ResourcePolicy {
                             vcpus: shape.vcpus,
                             mem_mib: shape.mem_mib,
+                            max_mem_mib: shape.max_mem_mib,
                             ..Default::default()
                         },
                     );
@@ -6248,16 +6492,24 @@ impl SandboxManager {
                 .map_or(spec.vcpus, |n| n.get() as u32)
                 .clamp(spec.vcpus, crate::nodeapi::MAX_VCPUS);
         }
-        spec.mem_mib = if resources.mem_mib == 0 {
+        let mem_mib = if resources.mem_mib == 0 {
             DEFAULT_MEM_MIB
         } else {
             resources.mem_mib
         };
+        // What the VM booted with, which a restore must describe; what has
+        // been plugged since sits in the hotplug region above it.
+        spec.mem_mib = match resources.boot_mem_mib {
+            0 => mem_mib,
+            boot => boot.min(mem_mib),
+        };
+        spec.mem_plugged_mib = mem_mib - spec.mem_mib;
+        spec.mem_hotplug_mib =
+            hotplug_region(hypervisor, guest_os, spec.mem_mib, resources.max_mem_mib);
 
         spec.limits = cgroup_limits(
             resources,
-            self.config
-                .memory_ceiling_mib(spec.hypervisor(), spec.mem_mib),
+            self.config.memory_ceiling_mib(spec.hypervisor(), mem_mib),
         );
         spec.cgroup_root = self.config.cgroup_root.clone();
         spec.is_limits_required = self.config.is_resource_limits_required;
@@ -6610,6 +6862,7 @@ impl SandboxManager {
                 u64::from(resources.disk_mib) * burrow_common::disk::MIB
             }
         };
+        pin_boot_memory(&mut resources, hypervisor, guest_os)?;
         // The record says the size the disk is, not the size it defaulted to.
         policy.resources = Some(resources.clone());
         let disk = self
@@ -7264,7 +7517,9 @@ impl SandboxManager {
                 n => n,
             },
         );
-        if shape != (manifest.vcpus, manifest.mem_mib, manifest.disk_mib) {
+        if shape != (manifest.vcpus, manifest.mem_mib, manifest.disk_mib)
+            || wanted.max_mem_mib != 0 && wanted.max_mem_mib != manifest.max_mem_mib
+        {
             return Err(Status::invalid_argument(format!(
                 "a sandbox created from snapshot {snapshot_id} restores its state and cannot \
                  change its vcpus, memory or disk: the snapshot was taken with \
@@ -7274,12 +7529,7 @@ impl SandboxManager {
         }
         // Written back so the record, the cgroup and any later restore all
         // describe the machine the snapshot actually holds.
-        policy.resources = Some(common::ResourcePolicy {
-            vcpus: manifest.vcpus,
-            mem_mib: manifest.mem_mib,
-            disk_mib: manifest.disk_mib,
-            ..policy.resources.take().unwrap_or_default()
-        });
+        policy.resources = Some(manifest.resources(policy.resources.take().unwrap_or_default()));
 
         {
             let sandboxes = self.sandboxes.lock().await;
@@ -7431,6 +7681,7 @@ impl SandboxManager {
                 // than accepted and quietly ignored.
                 if (wanted.vcpus, wanted.mem_mib, wanted.disk_mib)
                     != (shape.vcpus, shape.mem_mib, shape.disk_mib)
+                    || wanted.max_mem_mib != 0 && wanted.max_mem_mib != shape.max_mem_mib
                 {
                     let _ = tokio::fs::remove_file(&capture).await;
                     return Err(Status::invalid_argument(
@@ -7438,7 +7689,7 @@ impl SandboxManager {
                          vcpus, memory or disk",
                     ));
                 }
-                over.resources = Some(wanted);
+                over.resources = Some(shape);
                 // Section by section, because the sections are independent
                 // policies that happen to travel together: a child given only
                 // an exec policy asked to change exec, not to be stripped of
@@ -8079,7 +8330,18 @@ impl SandboxManager {
                 return Err(Status::internal(format!("preparing the jail: {err}")));
             }
         }
-        let resources = policy.resources.clone().unwrap_or_default();
+        let mut resources = policy.resources.clone().unwrap_or_default();
+        if let Err(err) = pin_boot_memory(&mut resources, sandbox.hypervisor, guest_os) {
+            self.volumes.release_all(id);
+            return Err(err);
+        }
+        sandbox
+            .base_record
+            .lock()
+            .unwrap()
+            .policy
+            .get_or_insert_with(Default::default)
+            .resources = Some(resources.clone());
         let environment = self.environment_of(&sandbox).await;
         let is_systemd = environment.systemd;
         let disk_layout = sandbox.disk_layout();
@@ -8537,10 +8799,6 @@ impl SandboxManager {
             );
             return Ok(None);
         };
-        let (vcpus, mem_mib) = {
-            let spec = sandbox.spec.lock().unwrap();
-            (spec.vcpus, spec.mem_mib)
-        };
         let image = self.environment_of(sandbox).await;
         let is_systemd = match previous {
             Some(previous) => previous.manifest.is_systemd,
@@ -8553,8 +8811,10 @@ impl SandboxManager {
             node_id: record.node_id.clone(),
             state: String::new(),
             template: sandbox.template().to_string(),
-            vcpus,
-            mem_mib,
+            vcpus: sandbox.vcpus(),
+            mem_mib: sandbox.mem_mib(),
+            boot_mem_mib: sandbox.boot_mem_mib(),
+            max_mem_mib: sandbox.max_mem_mib(),
             disk_mib: size_mib(&sandbox.disk_path()),
             disk_layout: sandbox.disk_layout().as_str().to_string(),
             is_systemd,
@@ -9103,12 +9363,7 @@ impl SandboxManager {
         claimed.state = crate::durable::STATE_RUNNING.to_string();
         claimed.node_id = node_id.clone();
         let mut policy = record.policy.clone().unwrap_or_default();
-        policy.resources = Some(common::ResourcePolicy {
-            vcpus: manifest.vcpus,
-            mem_mib: manifest.mem_mib,
-            disk_mib: manifest.disk_mib,
-            ..policy.resources.take().unwrap_or_default()
-        });
+        policy.resources = Some(manifest.resources(policy.resources.take().unwrap_or_default()));
         // Claimed in the store before the guest starts, the rule a resume
         // follows too, and handed back if it never does. Conditional on the
         // manifest read above, so a node that lost the race to another stops
@@ -9213,12 +9468,7 @@ impl SandboxManager {
         let disk_layout = manifest.disk_layout();
         let workdir = self.config.sandbox_dir(&id, hypervisor);
         let mut policy = record.policy.clone().unwrap_or_default();
-        let resources = common::ResourcePolicy {
-            vcpus: manifest.vcpus,
-            mem_mib: manifest.mem_mib,
-            disk_mib: manifest.disk_mib,
-            ..policy.resources.take().unwrap_or_default()
-        };
+        let resources = manifest.resources(policy.resources.take().unwrap_or_default());
         policy.resources = Some(resources.clone());
         let _disk = self
             .admit_disk(
@@ -10049,6 +10299,72 @@ pub(crate) mod tests {
         );
     }
 
+    /// A sandbox grows to 16 times its memory by default, within the node's
+    /// cap, and its region is rounded up to what both backends size one in.
+    #[test]
+    fn memory_grows_to_the_default_limit_through_a_rounded_region() {
+        use burrow_vmm::GuestOs;
+        assert_eq!(max_mem_mib(1024, 0), 16384);
+        assert_eq!(max_mem_mib(512, 0), 8192);
+        assert_eq!(max_mem_mib(4096, 0), 16384);
+        assert_eq!(max_mem_mib(32768, 0), 32768);
+        assert_eq!(max_mem_mib(1024, 3072), 3072);
+        assert_eq!(max_mem_mib(4096, 1024), 4096);
+
+        let fc = Hypervisor::Firecracker;
+        assert_eq!(hotplug_region(fc, GuestOs::Linux, 1024, 16384), 15360);
+        assert_eq!(hotplug_region(fc, GuestOs::Linux, 1000, 3000), 2048);
+        assert_eq!(hotplug_region(fc, GuestOs::Linux, 1024, 1024), 0);
+        assert_eq!(hotplug_region(fc, GuestOs::Linux, 1024, 0), 0);
+        let ch = Hypervisor::CloudHypervisor;
+        assert_eq!(hotplug_region(ch, GuestOs::Linux, 1024, 8192), 7168);
+        assert_eq!(hotplug_region(ch, GuestOs::Windows, 4096, 8192), 0);
+        assert_eq!(
+            hotplug_region(Hypervisor::Vz, GuestOs::MacOs, 4096, 8192),
+            0
+        );
+    }
+
+    /// A VM about to boot starts with all of its memory as boot memory and
+    /// its limit resolved, and a guest that cannot take memory live is held
+    /// to the memory it has.
+    #[test]
+    fn a_booting_vm_pins_its_memory() {
+        use burrow_vmm::GuestOs;
+        let mut resources = common::ResourcePolicy {
+            mem_mib: 3072,
+            boot_mem_mib: 1024,
+            ..Default::default()
+        };
+        pin_boot_memory(&mut resources, Hypervisor::Firecracker, GuestOs::Linux).unwrap();
+        assert_eq!(
+            (
+                resources.mem_mib,
+                resources.boot_mem_mib,
+                resources.max_mem_mib
+            ),
+            (3072, 3072, 16384)
+        );
+
+        let mut shrunk = common::ResourcePolicy {
+            mem_mib: 8192,
+            max_mem_mib: 4096,
+            ..Default::default()
+        };
+        pin_boot_memory(&mut shrunk, Hypervisor::CloudHypervisor, GuestOs::Linux).unwrap();
+        assert_eq!(shrunk.max_mem_mib, 8192);
+
+        let mut windows = common::ResourcePolicy::default();
+        pin_boot_memory(&mut windows, Hypervisor::CloudHypervisor, GuestOs::Windows).unwrap();
+        assert_eq!((windows.mem_mib, windows.max_mem_mib), (512, 512));
+        let mut grown = common::ResourcePolicy {
+            mem_mib: 4096,
+            max_mem_mib: 8192,
+            ..Default::default()
+        };
+        assert!(pin_boot_memory(&mut grown, Hypervisor::Vz, GuestOs::MacOs).is_err());
+    }
+
     #[test]
     fn guest_clocks_sync_on_the_interval_or_a_node_clock_jump() {
         use std::time::{Duration, Instant, SystemTime};
@@ -10644,7 +10960,7 @@ pub(crate) mod tests {
     async fn a_broken_warm_snapshot_is_discarded_and_rebuilt() {
         let manager = manager().await;
         let dir = crate::warm::warm_dir(&manager.config.templates_dir(), "app")
-            .join("firecracker-2x2048");
+            .join("firecracker-2x2048-16384");
         tokio::fs::create_dir_all(&dir).await.unwrap();
         let layout = Hypervisor::Firecracker.layout();
         for file in layout.files() {
@@ -10652,8 +10968,8 @@ pub(crate) mod tests {
         }
         for (file, text) in [
             ("hypervisor", "firecracker"),
-            ("shape", "2 2048 1324"),
-            ("format", "6"),
+            ("shape", "2 2048 1324 16384"),
+            ("format", "7"),
         ] {
             tokio::fs::write(dir.join(file), text).await.unwrap();
         }

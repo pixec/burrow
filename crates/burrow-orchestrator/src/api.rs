@@ -209,6 +209,34 @@ impl ApiService {
         }
     }
 
+    /// Takes `mem_mib` on a node for a sandbox growing there, or says why the
+    /// node has no room for it.
+    async fn hold_growth(&self, node_id: &str, mem_mib: u64) -> Result<PlacementGuard<'_>, String> {
+        let refusal = || format!("node {node_id} has no room for {mem_mib} MiB more host memory");
+        if !self.0.nodes.reserve_growth(node_id, mem_mib) {
+            return Err(refusal());
+        }
+        if let Some(store) = &self.0.store {
+            let reserved = store.reserve_capacity(node_id, 0, mem_mib).await;
+            if !matches!(reserved, Ok(true)) {
+                self.0.nodes.release(node_id, 0, mem_mib, 0);
+                return Err(match reserved {
+                    Err(err) => format!("could not reserve memory on node {node_id}: {err}"),
+                    _ => refusal(),
+                });
+            }
+        }
+        Ok(PlacementGuard {
+            nodes: &self.0.nodes,
+            store: self.0.store.clone(),
+            node_id: node_id.to_string(),
+            cpu_millis: 0,
+            mem_mib,
+            disk_bytes: 0,
+            is_kept: false,
+        })
+    }
+
     /// Turns a caller's reference into the id it names.
     ///
     /// The public API takes a sandbox by id or by name; nodes are only ever
@@ -2179,20 +2207,78 @@ impl Burrow for ApiService {
         let req = req.into_inner();
         let id = self.resolve(&req.sandbox_id).await;
         self.require_update_resources(&id)?;
-        let mut client = self.node_for(&id).await?;
-        let updated = client
-            .update_resources(nodepb::NodeUpdateResourcesRequest {
-                sandbox_id: id,
-                vcpus: req.vcpus,
-                mem_mib: req.mem_mib,
-                disk_mib: req.disk_mib,
-                cpus: req.cpus,
-                cpu_shares: req.cpu_shares,
-                cpuset_cpus: req.cpuset_cpus,
-                blkio_weight: req.blkio_weight,
-            })
-            .await?
-            .into_inner();
+        let node_id = self.node_of(&id)?;
+        let record = self.0.sandboxes.get(&id).unwrap_or_default();
+        let current = record
+            .policy
+            .as_ref()
+            .and_then(|policy| policy.resources.as_ref())
+            .map_or(0, |resources| resources.mem_mib);
+        // More memory is placed like a create: the node is charged what its
+        // cgroup ceiling grows by, until its next heartbeat reports it in use.
+        let charge = |mem_mib: u32| {
+            self.0.nodes.mem_charge_mib(
+                &node_id,
+                &record.hypervisor,
+                &record.template,
+                u64::from(mem_mib),
+            )
+        };
+        let growth = req
+            .mem_mib
+            .filter(|want| *want > current && record.state == common::SandboxState::Running as i32)
+            .map_or(0, |want| charge(want) - charge(current));
+        let (held, refusal) = match growth {
+            0 => (None, None),
+            mib => match self.hold_growth(&node_id, mib).await {
+                Ok(guard) => (Some(guard), None),
+                Err(reason) => (None, Some(reason)),
+            },
+        };
+        let is_limited = req.cpus.is_some()
+            || req.cpu_shares.is_some()
+            || req.cpuset_cpus.is_some()
+            || req.blkio_weight.is_some();
+        let mut updated = match (&refusal, req.vcpus, req.disk_mib, is_limited) {
+            (Some(_), None, None, false) => api::UpdateResourcesResponse {
+                sandbox: self.0.sandboxes.get(&id),
+                ..Default::default()
+            },
+            _ => self
+                .node_for(&id)
+                .await?
+                .update_resources(nodepb::NodeUpdateResourcesRequest {
+                    sandbox_id: id,
+                    vcpus: req.vcpus,
+                    mem_mib: req.mem_mib.filter(|_| refusal.is_none()),
+                    disk_mib: req.disk_mib,
+                    cpus: req.cpus,
+                    cpu_shares: req.cpu_shares,
+                    cpuset_cpus: req.cpuset_cpus,
+                    blkio_weight: req.blkio_weight,
+                })
+                .await?
+                .into_inner(),
+        };
+        if let Some(reason) = refusal {
+            updated.mem_mib = Some(api::ResourceOutcome {
+                change: api::ResourceChange::Refused as i32,
+                previous: current,
+                value: current,
+                reason,
+            });
+        }
+        let is_plugged = updated.mem_mib.as_ref().is_some_and(|outcome| {
+            matches!(
+                api::ResourceChange::try_from(outcome.change),
+                Ok(api::ResourceChange::Live | api::ResourceChange::Partial)
+            )
+        });
+        if let Some(guard) = held
+            && is_plugged
+        {
+            guard.keep();
+        }
         if let Some(sandbox) = &updated.sandbox {
             self.0.sandboxes.update(sandbox.clone());
         }

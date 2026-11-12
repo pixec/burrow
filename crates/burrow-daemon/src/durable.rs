@@ -100,6 +100,13 @@ pub struct Manifest {
     pub mem_mib: u32,
     #[serde(alias = "scratch_disk_mib")]
     pub disk_mib: u32,
+    /// What the VM booted with, of `mem_mib`, and what it could grow to. 0 in
+    /// a manifest from before memory hotplug, whose VM booted with all of
+    /// `mem_mib` and had nothing to grow into.
+    #[serde(default)]
+    pub boot_mem_mib: u32,
+    #[serde(default)]
+    pub max_mem_mib: u32,
     /// [`crate::rootdisk::DiskLayout`]; empty in a manifest from before root
     /// disks, which was the overlay.
     #[serde(default)]
@@ -164,6 +171,21 @@ impl Manifest {
 
     fn layout(&self) -> Result<burrow_vmm::Layout, Status> {
         self.hypervisor().map(burrow_vmm::Hypervisor::layout)
+    }
+
+    /// `base` with the machine it holds, which a restore cannot change.
+    pub fn resources(
+        &self,
+        base: burrow_proto::common::v1::ResourcePolicy,
+    ) -> burrow_proto::common::v1::ResourcePolicy {
+        burrow_proto::common::v1::ResourcePolicy {
+            vcpus: self.vcpus,
+            mem_mib: self.mem_mib,
+            disk_mib: self.disk_mib,
+            max_mem_mib: self.max_mem_mib,
+            boot_mem_mib: self.boot_mem_mib,
+            ..base
+        }
     }
 
     pub fn disk_layout(&self) -> crate::rootdisk::DiskLayout {
@@ -1244,6 +1266,8 @@ mod tests {
             template: "alpine".into(),
             vcpus: 1,
             mem_mib: 512,
+            boot_mem_mib: 512,
+            max_mem_mib: 8192,
             disk_mib: 1024,
             disk_layout: String::new(),
             is_systemd: false,
