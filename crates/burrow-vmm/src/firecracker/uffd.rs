@@ -27,7 +27,7 @@
 //! a stalled vCPU, so it must never queue behind unrelated async work.
 
 use std::io;
-use std::os::fd::{AsRawFd, OwnedFd, RawFd};
+use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -43,8 +43,6 @@ pub const UFFD_SOCK: &str = "uffd.sock";
 
 /// How long to wait for Firecracker to connect after `load_snapshot` is issued.
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(30);
-/// How often an idle handler looks at whether it has been told to stop.
-const STOP_POLL_MS: libc::c_int = 100;
 
 /// One guest memory region, as Firecracker describes it.
 ///
@@ -249,6 +247,65 @@ impl AsRef<memfile::Layer> for Layer {
 /// are zeroes to the guest.
 type Served = Mutex<memfile::PageMap>;
 
+/// Tells the handler thread to stop, waking it out of any poll at once.
+struct Stop {
+    flag: AtomicBool,
+    wake: OwnedFd,
+}
+
+impl Stop {
+    fn new() -> io::Result<Self> {
+        // SAFETY: eventfd takes no pointers.
+        let fd = unsafe { libc::eventfd(0, libc::EFD_CLOEXEC | libc::EFD_NONBLOCK) };
+        if fd < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(Self {
+            flag: AtomicBool::new(false),
+            // SAFETY: the descriptor was just created and is named nowhere else.
+            wake: unsafe { OwnedFd::from_raw_fd(fd) },
+        })
+    }
+
+    fn signal(&self) {
+        self.flag.store(true, Ordering::Relaxed);
+        let one = 1u64;
+        // SAFETY: `one` is eight readable bytes, what an eventfd write takes.
+        unsafe { libc::write(self.wake.as_raw_fd(), (&raw const one).cast(), 8) };
+    }
+
+    fn is_set(&self) -> bool {
+        self.flag.load(Ordering::Relaxed)
+    }
+
+    /// Waits until `fd` is readable or the stop is signalled, returning
+    /// whether `fd` is readable. `timeout_ms` of -1 waits indefinitely.
+    fn wait(&self, fd: RawFd, timeout_ms: libc::c_int) -> io::Result<bool> {
+        let mut fds = [
+            libc::pollfd {
+                fd,
+                events: libc::POLLIN,
+                revents: 0,
+            },
+            libc::pollfd {
+                fd: self.wake.as_raw_fd(),
+                events: libc::POLLIN,
+                revents: 0,
+            },
+        ];
+        // SAFETY: `fds` is two valid entries for the duration of the call.
+        if unsafe { libc::poll(fds.as_mut_ptr(), 2, timeout_ms) } < 0 {
+            let err = io::Error::last_os_error();
+            return if err.kind() == io::ErrorKind::Interrupted {
+                Ok(false)
+            } else {
+                Err(err)
+            };
+        }
+        Ok(fds[0].revents != 0)
+    }
+}
+
 fn mark(served: &Served, offset: u64, len: u64) {
     served.lock().unwrap().insert_bytes(offset, offset + len);
 }
@@ -360,7 +417,7 @@ fn prefetch(
 /// faults stop being answered hangs rather than fails.
 pub struct UffdBackend {
     socket_path: PathBuf,
-    stop: Arc<AtomicBool>,
+    stop: Arc<Stop>,
     served: Arc<Served>,
     thread: Option<std::thread::JoinHandle<()>>,
 }
@@ -408,7 +465,7 @@ impl UffdBackend {
                 )
             })
             .collect::<io::Result<_>>()?;
-        let stop = Arc::new(AtomicBool::new(false));
+        let stop = Arc::new(Stop::new()?);
         let served = Arc::new(Mutex::new(memfile::PageMap::new(
             layers[0].pages.len / memfile::PAGE,
         )));
@@ -454,9 +511,9 @@ impl UffdBackend {
 
 impl Drop for UffdBackend {
     fn drop(&mut self) {
-        self.stop.store(true, Ordering::Relaxed);
-        // The thread sees the flag within one poll; joining keeps the mapping
-        // alive until it is genuinely finished with it.
+        self.stop.signal();
+        // Joining keeps the mapping alive until the thread is genuinely
+        // finished with it.
         if let Some(thread) = self.thread.take() {
             let _ = thread.join();
         }
@@ -469,7 +526,7 @@ fn serve(
     listener: &UnixListener,
     layers: Vec<Layer>,
     served: &Served,
-    stop: &AtomicBool,
+    stop: &Stop,
     plan: &MemoryPlan,
 ) -> io::Result<()> {
     let stream = accept(listener, stop)?;
@@ -526,9 +583,12 @@ fn serve(
 }
 
 /// Waits for Firecracker to connect, giving up rather than hanging forever.
-fn accept(listener: &UnixListener, stop: &AtomicBool) -> io::Result<Option<UnixStream>> {
+fn accept(listener: &UnixListener, stop: &Stop) -> io::Result<Option<UnixStream>> {
     let deadline = Instant::now() + CONNECT_TIMEOUT;
     loop {
+        if stop.is_set() {
+            return Ok(None);
+        }
         match listener.accept() {
             Ok((stream, _)) => {
                 stream.set_nonblocking(false)?;
@@ -537,16 +597,14 @@ fn accept(listener: &UnixListener, stop: &AtomicBool) -> io::Result<Option<UnixS
             Err(err) if err.kind() == io::ErrorKind::WouldBlock => {}
             Err(err) => return Err(err),
         }
-        if stop.load(Ordering::Relaxed) {
-            return Ok(None);
-        }
-        if Instant::now() >= deadline {
+        let left = deadline.saturating_duration_since(Instant::now());
+        if left.is_zero() {
             return Err(io::Error::new(
                 io::ErrorKind::TimedOut,
                 "firecracker never connected to the page-fault socket",
             ));
         }
-        std::thread::sleep(Duration::from_millis(2));
+        stop.wait(listener.as_raw_fd(), left.as_millis().max(1) as libc::c_int)?;
     }
 }
 
@@ -607,24 +665,18 @@ fn handle_faults(
     regions: &[RegionMapping],
     layers: &[Layer],
     served: &Served,
-    stop: &AtomicBool,
+    stop: &Stop,
 ) -> io::Result<std::collections::BTreeSet<u64>> {
     let fd = uffd.as_raw_fd();
     let mut buf = [0u8; UFFD_MSG_SIZE];
     let mut faulted = std::collections::BTreeSet::new();
     loop {
-        if stop.load(Ordering::Relaxed) {
+        if stop.is_set() {
             return Ok(faulted);
         }
         // Firecracker makes the descriptor non-blocking, so a bare read spun
         // a host core for as long as the guest ran.
-        let mut pollfd = libc::pollfd {
-            fd,
-            events: libc::POLLIN,
-            revents: 0,
-        };
-        // SAFETY: `pollfd` is one valid entry for the duration of the call.
-        if unsafe { libc::poll(&mut pollfd, 1, STOP_POLL_MS) } == 0 {
+        if !stop.wait(fd, -1)? {
             continue;
         }
         // SAFETY: `fd` is the userfaultfd and `buf` is exactly one message.
@@ -751,6 +803,51 @@ fn zero_range(fd: RawFd, start: u64, end: u64) -> io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_stop_wakes_an_idle_fault_handler_at_once() {
+        let (read, _write) = nix::unistd::pipe().unwrap();
+        let stop = Arc::new(Stop::new().unwrap());
+        let served = Mutex::new(memfile::PageMap::new(0));
+        let handler = {
+            let stop = Arc::clone(&stop);
+            std::thread::spawn(move || handle_faults(&read, &[], &[], &served, &stop).map(drop))
+        };
+        std::thread::sleep(Duration::from_millis(50));
+        let started = Instant::now();
+        stop.signal();
+        handler.join().unwrap().unwrap();
+        assert!(
+            started.elapsed() < Duration::from_millis(20),
+            "took {:?}",
+            started.elapsed()
+        );
+    }
+
+    #[test]
+    fn dropping_a_backend_firecracker_never_reached_returns_promptly() {
+        let dir = std::env::temp_dir().join(format!("burrow-uffd-stop-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let mem = dir.join("snapshot.mem");
+        std::fs::write(&mem, vec![0u8; 2 * memfile::PAGE as usize]).unwrap();
+        let backend = UffdBackend::start(
+            &dir,
+            &MemoryPlan {
+                chain: vec![mem],
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        std::thread::sleep(Duration::from_millis(50));
+        let started = Instant::now();
+        drop(backend);
+        assert!(
+            started.elapsed() < Duration::from_millis(20),
+            "took {:?}",
+            started.elapsed()
+        );
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
 
     #[test]
     fn ioctl_numbers_match_the_kernel_abi() {

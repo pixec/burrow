@@ -678,8 +678,11 @@ impl MicroVm {
         let result = self.process.kill().await;
         // Strictly after the VMM is reaped: stopping the handler while a guest
         // is still running would stall it on its next fault rather than fail.
+        // Joining its thread blocks, and may write a prefetch plan.
         #[cfg(target_os = "linux")]
-        drop(self.memory.take());
+        if let Some(memory) = self.memory.take() {
+            let _ = tokio::task::spawn_blocking(move || drop(memory)).await;
+        }
         // Only removable once it holds no processes, so this must follow the
         // reap rather than accompany it.
         if let Some(cgroup) = self.cgroup.take() {
