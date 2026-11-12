@@ -39,12 +39,66 @@ pub const VMM_WORKDIR: &str = "/work";
 /// How Cloud Hypervisor is confined on this node.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ChJail {
-    /// The binary that runs as the helper: burrowd itself. `/proc/self/exe`
-    /// rather than its path, so a binary replaced on disk while the node runs
-    /// still starts helpers that speak its own plan.
+    /// The binary that runs as the helper: burrowd itself, as [`pin`] keeps
+    /// it.
     pub helper: PathBuf,
     pub uid: u32,
     pub gid: u32,
+}
+
+impl ChJail {
+    /// A jail whose helper is this very binary, pinned so it can still be
+    /// started once the file it was run from has been replaced.
+    pub fn new(uid: u32, gid: u32) -> std::io::Result<Self> {
+        Ok(Self {
+            helper: pin(Path::new("/proc/self/exe"))?,
+            uid,
+            gid,
+        })
+    }
+}
+
+/// Copies `binary` into a sealed memfd held for the life of the process and
+/// returns the path that executes it.
+///
+/// `/proc/self/exe` is no answer on its own: exec reopens the file, which a
+/// filesystem that cannot reopen an unlinked inode (virtiofs, NFS) refuses
+/// with ENOENT once the binary is replaced, failing every VMM start until
+/// burrowd restarts.
+#[cfg(target_os = "linux")]
+pub fn pin(binary: &Path) -> std::io::Result<PathBuf> {
+    use std::os::fd::{AsRawFd as _, FromRawFd as _, IntoRawFd as _, OwnedFd};
+
+    const MFD_EXEC: libc::c_uint = 0x10;
+    let name = c"burrowd-helper";
+    let flags = libc::MFD_CLOEXEC | libc::MFD_ALLOW_SEALING;
+    // SAFETY: `name` is NUL-terminated; the flags are memfd_create's own.
+    let mut fd = unsafe { libc::memfd_create(name.as_ptr(), flags | MFD_EXEC) };
+    if fd < 0 && std::io::Error::last_os_error().raw_os_error() == Some(libc::EINVAL) {
+        // A kernel before 6.3, which has no MFD_EXEC and makes every memfd
+        // executable.
+        // SAFETY: as above.
+        fd = unsafe { libc::memfd_create(name.as_ptr(), flags) };
+    }
+    if fd < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    // SAFETY: memfd_create returned a descriptor this process owns.
+    let memfd = unsafe { OwnedFd::from_raw_fd(fd) };
+    let mut file = std::fs::File::from(memfd);
+    std::io::copy(&mut std::fs::File::open(binary)?, &mut file)?;
+    let seals = libc::F_SEAL_SEAL | libc::F_SEAL_SHRINK | libc::F_SEAL_GROW | libc::F_SEAL_WRITE;
+    // SAFETY: F_ADD_SEALS takes the seals as its one argument.
+    if unsafe { libc::fcntl(file.as_raw_fd(), libc::F_ADD_SEALS, seals) } < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    let fd = file.into_raw_fd();
+    Ok(PathBuf::from(format!("/proc/self/fd/{fd}")))
+}
+
+#[cfg(not(target_os = "linux"))]
+pub fn pin(binary: &Path) -> std::io::Result<PathBuf> {
+    Ok(binary.to_path_buf())
 }
 
 /// What the helper is told, as JSON in its one argument after [`HELPER_ARG`].
@@ -410,6 +464,26 @@ mod tests {
             uid: 65534,
             gid: 65534,
         }
+    }
+
+    /// A burrowd replaced on a virtiofs mount failed every Cloud Hypervisor
+    /// start with ENOENT until it restarted, because the helper was exec'd
+    /// from a file that no longer opened.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_pinned_helper_runs_once_its_file_is_gone() {
+        let dir = std::env::temp_dir().join(format!("burrow-pin-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let binary = dir.join("helper");
+        std::fs::copy(std::env::current_exe().unwrap(), &binary).unwrap();
+        let pinned = pin(&binary).unwrap();
+        std::fs::remove_dir_all(&dir).unwrap();
+        let status = std::process::Command::new(&pinned)
+            .arg("--list")
+            .stdout(std::process::Stdio::null())
+            .status()
+            .unwrap();
+        assert!(status.success());
     }
 
     /// The helper is burrowd with the plan in one argument, which it reads

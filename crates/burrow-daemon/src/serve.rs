@@ -465,20 +465,22 @@ impl ServeArgs {
     /// How Cloud Hypervisor should be confined: whenever Firecracker is, so
     /// `--jailer` never leaves one VMM running unconfined beside the other
     /// unless `--unjailed-cloud-hypervisor` says so.
-    fn cloud_hypervisor_jail(&self) -> Option<burrow_vmm::ChJail> {
-        self.jailer.as_ref()?;
+    fn cloud_hypervisor_jail(&self) -> anyhow::Result<Option<burrow_vmm::ChJail>> {
+        if self.jailer.is_none() {
+            return Ok(None);
+        }
         if self.is_cloud_hypervisor_unjailed {
             tracing::warn!(
                 "--unjailed-cloud-hypervisor: Cloud Hypervisor runs as root with the host's \
                  filesystem in view"
             );
-            return None;
+            return Ok(None);
         }
-        Some(burrow_vmm::ChJail {
-            helper: "/proc/self/exe".into(),
-            uid: self.jail_uid,
-            gid: self.jail_gid,
-        })
+        let jail = burrow_vmm::ChJail::new(self.jail_uid, self.jail_gid);
+        Ok(Some(anyhow::Context::context(
+            jail,
+            "pinning the cloud hypervisor jail helper",
+        )?))
     }
 
     /// What this node tells the orchestrator to send sandbox traffic to.
@@ -1490,7 +1492,7 @@ pub async fn run(args: ServeArgs) -> anyhow::Result<()> {
             cloud_hypervisor: burrow_vmm::CloudHypervisorConfig {
                 bin: args.cloud_hypervisor.clone(),
                 kernel: args.cloud_hypervisor_kernel.clone(),
-                jail: args.cloud_hypervisor_jail(),
+                jail: args.cloud_hypervisor_jail()?,
             },
             hypervisors,
             artifact_retention: Duration::from_secs(
