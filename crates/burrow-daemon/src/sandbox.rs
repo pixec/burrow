@@ -429,6 +429,9 @@ const REASON_LOST: &str = "the node stopped without suspending its VM, so its me
                            its disk is kept, and `burrow boot` starts it again";
 const REASON_VMM_EXITED: &str = "its VMM exited while it was running, so its memory is lost; \
                                  its disk is kept, and `burrow boot` starts it again";
+const REASON_MEMORY_DISCARDED: &str = "stopped while suspended, and the guest could not be resumed \
+                                       to shut down cleanly, so its memory was discarded and what \
+                                       it had not written to its disk is lost";
 
 /// Guest memory when the policy names none.
 const DEFAULT_MEM_MIB: u32 = 512;
@@ -1574,6 +1577,7 @@ impl RunningSandbox {
         // deadline: the next VM at that path, a resume or an adopt back onto
         // this node, would be handshaken twice at once.
         self.await_handshake().await?;
+        self.sync_guest().await;
         self.forget_agent().await;
         let mut slot = self.vm.lock().await;
         let Some(vm) = slot.take() else {
@@ -1668,6 +1672,41 @@ impl RunningSandbox {
         }
 
         Ok(())
+    }
+
+    /// Has the guest write back what its page cache holds before its memory
+    /// is captured, so the snapshot is not the only copy of writes it has
+    /// acknowledged: a snapshot lost while suspended, or one a stop has to
+    /// discard, still leaves them on the disk. An agent that cannot sync
+    /// through RootDisk runs `sync` instead.
+    async fn sync_guest(&self) {
+        use burrow_proto::guest::v1::{RootDiskRequest, root_disk_request::Op};
+        let synced = async {
+            self.reach_agent()
+                .await?
+                .root_disk(RootDiskRequest {
+                    op: Op::Sync as i32,
+                    ..Default::default()
+                })
+                .await
+        };
+        match tokio::time::timeout(std::time::Duration::from_secs(5), synced).await {
+            Ok(Ok(_)) => {}
+            Ok(Err(err)) if err.code() == tonic::Code::Unimplemented => flush_guest(self).await,
+            Ok(Err(err)) => {
+                tracing::warn!(
+                    sandbox = self.id(),
+                    err = err.message(),
+                    "could not sync the guest before capturing its memory"
+                )
+            }
+            Err(_) => {
+                tracing::warn!(
+                    sandbox = self.id(),
+                    "the guest did not sync within 5s of a capture"
+                )
+            }
+        }
     }
 
     /// Merges the memory chain back down to a single base file.
@@ -2020,6 +2059,7 @@ impl RunningSandbox {
     ) -> Result<std::time::Duration, Status> {
         // As in a suspend: a fork restores whatever the snapshot caught.
         self.await_handshake().await?;
+        self.sync_guest().await;
         let mut slot = self.vm.lock().await;
         let Some(vm) = slot.as_ref() else {
             return Err(Status::failed_precondition(
@@ -8211,13 +8251,33 @@ impl SandboxManager {
 
     /// Shuts a sandbox down, keeping its disks. Unlike a pause, nothing of
     /// the guest's memory survives: a start boots the image's init again.
+    ///
+    /// A suspended sandbox is resumed first and shut down from there, since
+    /// its snapshot can hold writes its guest had not yet put on the disk.
+    /// One that cannot be resumed is stopped on what its disk holds, and the
+    /// reason says its memory was discarded.
     pub async fn stop(&self, id: &str) -> Result<common::Sandbox, Status> {
         let sandbox = self.get(id).await?;
+        let discarded = match sandbox.is_suspended() {
+            true => self.resume(id).await.err(),
+            false => None,
+        };
+        if let Some(err) = &discarded {
+            tracing::warn!(
+                sandbox = id,
+                err = err.message(),
+                "could not resume a suspended sandbox to stop it cleanly; discarding its memory"
+            );
+        }
         // The VMM is killed, not powered off, so the guest's page cache
         // would otherwise die with it and the disk a boot comes back to
         // would miss what was last written.
         flush_guest(&sandbox).await;
         sandbox.shutdown().await?;
+        if let Some(err) = discarded {
+            sandbox.base_record.lock().unwrap().state_reason =
+                format!("{REASON_MEMORY_DISCARDED}: {}", err.message());
+        }
         self.resync_public(&sandbox).await;
         // Its memory is gone, so what the store holds is a guest that no
         // longer exists.
@@ -11452,6 +11512,47 @@ pub(crate) mod tests {
         assert_eq!(record.state, common::SandboxState::Stopped as i32);
         assert_eq!(record.state_reason, REASON_VMM_EXITED);
         assert!(sandbox.vm.lock().await.is_none());
+        let _ = std::fs::remove_dir_all(&workdir);
+    }
+
+    /// A stop used to discard a suspended sandbox's snapshot outright, and
+    /// with it whatever its guest had not written back. It resumes the guest
+    /// to shut it down; one that cannot be resumed is still stopped on its
+    /// disk, and the reason says its memory went and why.
+    #[tokio::test]
+    async fn a_suspended_sandbox_that_cannot_resume_is_stopped_with_the_reason() {
+        let manager = manager().await;
+        let workdir = std::env::temp_dir().join(format!(
+            "burrow-stop-suspended-{}",
+            uuid::Uuid::new_v4().simple()
+        ));
+        std::fs::create_dir_all(&workdir).unwrap();
+        for file in ["snapshot.vmstate", "snapshot.mem"] {
+            std::fs::write(workdir.join(file), b"x").unwrap();
+        }
+        let sandbox = Arc::new(sandbox_in(workdir.clone()));
+        sandbox.enter_suspended();
+        *sandbox.memory_chain.lock().await = vec!["snapshot.mem".into()];
+        manager
+            .sandboxes
+            .lock()
+            .await
+            .insert(sandbox.id().to_string(), Arc::clone(&sandbox));
+
+        let record = manager.stop("sbx_a").await.unwrap();
+        assert_eq!(record.state, common::SandboxState::Stopped as i32);
+        assert!(
+            record.state_reason.starts_with(REASON_MEMORY_DISCARDED),
+            "{}",
+            record.state_reason
+        );
+        assert!(
+            record.state_reason.contains("restore failed"),
+            "the resume must have been tried first: {}",
+            record.state_reason
+        );
+        assert!(!workdir.join("snapshot.mem").exists());
+        assert!(sandbox.memory_chain.lock().await.is_empty());
         let _ = std::fs::remove_dir_all(&workdir);
     }
 
