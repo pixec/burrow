@@ -106,5 +106,5 @@ To become a sponsor, open an issue or write to `oss+burrow[at]pixec.net`.
 
 ## License
 
-Burrow is licensed under the GNU Affero General Public License, version 3.
-See [LICENSE](LICENSE) for the full text.
+Burrow is licensed under the GNU Affero General Public License, version 3, in [LICENSE](LICENSE).
+Contributions are accepted under the [Contributor License Agreement](CLA.md).
