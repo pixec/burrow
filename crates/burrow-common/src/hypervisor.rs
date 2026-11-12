@@ -51,17 +51,19 @@ impl Hypervisor {
     /// tables over it: the VMM's own heap and device buffers, slab and kernel
     /// stacks. A node can set its own (`--vmm-memory-overhead-mib`).
     ///
-    /// Measured on the arm64 dev harness (2026-11-12) as the VMM's resident
-    /// memory outside guest RAM plus the cgroup's other kernel memory, for
-    /// 512 MiB and 2 GiB guests idle and under disk I/O: at most 6 MiB for
-    /// Firecracker v1.16.1 and 7 MiB for Cloud Hypervisor v54.0. Cloud
-    /// Hypervisor's default is that with room for more vCPUs and queues.
-    /// Firecracker's is larger again because its disks go through host page
-    /// cache, and what is dirty cannot be reclaimed until it is written back.
+    /// Measured on the arm64 dev harness (2026-11-12) as what a 512 MiB
+    /// guest's cgroup holds beyond guest RAM once the guest has touched all
+    /// of it. Cloud Hypervisor v54.0 holds about 49 MiB: 6 MiB of its own,
+    /// 9 MiB of kernel memory and 33 MiB of page cache for its binary and the
+    /// guest kernel. A warm restore touches all guest memory at once, so a
+    /// tighter ceiling is hit before the guest runs. Its default is that with
+    /// room for more vCPUs and queues. Firecracker v1.16.1 holds less of its
+    /// own, but its disks go through host page cache, and what is dirty
+    /// cannot be reclaimed until it is written back.
     pub fn default_vmm_overhead_mib(self) -> u32 {
         match self {
             Self::Firecracker => 64,
-            Self::CloudHypervisor => 32,
+            Self::CloudHypervisor => 64,
             Self::Vz => 0,
         }
     }
