@@ -131,6 +131,42 @@ async fn connect_node_unary(
     Ok(node_client(channel, token))
 }
 
+/// How long a node gets to carry out a delete. Well past the heartbeat
+/// threshold, so a node that is only busy finishes the delete rather than
+/// having it tombstoned.
+const DELETE_DEADLINE: std::time::Duration = std::time::Duration::from_secs(120);
+
+/// Destroys `sandbox_id` on `node_id`, through the node's admission slots.
+pub async fn delete_on_node(
+    state: &OrchestratorState,
+    node_id: &str,
+    sandbox_id: &str,
+) -> Result<(), Status> {
+    let endpoint = state
+        .nodes
+        .endpoint_any(node_id)
+        .ok_or_else(|| Status::unavailable(format!("no node {node_id}")))?;
+    let _admitted = state.admission.admit(node_id).await;
+    let mut client = match state
+        .channels
+        .get(&endpoint, state.node_token.as_deref())
+        .await
+    {
+        Ok(client) => client,
+        Err(err) => {
+            state.channels.forget(&endpoint).await;
+            return Err(Status::unavailable(format!(
+                "cannot reach node {node_id}: {err}"
+            )));
+        }
+    };
+    let mut request = Request::new(nodepb::NodeSandboxRef {
+        sandbox_id: sandbox_id.to_string(),
+    });
+    request.set_timeout(DELETE_DEADLINE);
+    client.delete_sandbox(request).await.map(drop)
+}
+
 /// The nodes a fan-out should ask: those that are registered and addressable.
 fn reachable_nodes(state: &OrchestratorState) -> Vec<(String, String)> {
     state
@@ -636,7 +672,22 @@ impl ApiService {
     /// reused; see [`NodeChannels`].
     async fn node_for(&self, sandbox_id: &str) -> Result<NodeClient, Status> {
         let node_id = self.placed_on(sandbox_id).await?;
-        let endpoint = self.0.nodes.endpoint(&node_id).ok_or_else(|| {
+        self.client_on(&node_id, sandbox_id).await
+    }
+
+    /// [`Self::node_for`] for a create or lifecycle call, holding one of the
+    /// node's admission slots until the permit drops.
+    async fn admitted_node_for(
+        &self,
+        sandbox_id: &str,
+    ) -> Result<(NodeClient, tokio::sync::OwnedSemaphorePermit), Status> {
+        let node_id = self.placed_on(sandbox_id).await?;
+        let admitted = self.0.admission.admit(&node_id).await;
+        Ok((self.client_on(&node_id, sandbox_id).await?, admitted))
+    }
+
+    async fn client_on(&self, node_id: &str, sandbox_id: &str) -> Result<NodeClient, Status> {
+        let endpoint = self.0.nodes.endpoint(node_id).ok_or_else(|| {
             Status::unavailable(format!(
                 "node {node_id} hosting {sandbox_id} is unreachable"
             ))
@@ -1275,6 +1326,7 @@ impl ApiService {
             .await
             .map_err(|err| Status::unavailable(format!("cannot reach node {target}: {err}")))?;
         self.bring_volumes(&target, &mounts).await?;
+        let _admitted = self.0.admission.admit(&target).await;
         let adopted = client
             .adopt_sandbox(nodepb::NodeAdoptRequest {
                 record: Some(sandbox),
@@ -1641,6 +1693,7 @@ impl Burrow for ApiService {
                     snapshot.id, snapshot.template, req.template
                 )));
             }
+            let _admitted = self.0.admission.admit(&node_id).await;
             let sandbox = client
                 .create_sandbox(nodepb::NodeCreateRequest {
                     sandbox_id,
@@ -1843,6 +1896,7 @@ impl Burrow for ApiService {
             .kit_credentials(&mut client, &node_id, &template, subject)
             .await?;
 
+        let _admitted = self.0.admission.admit(&node_id).await;
         let sandbox = client
             .create_sandbox(nodepb::NodeCreateRequest {
                 sandbox_id,
@@ -1948,15 +2002,17 @@ impl Burrow for ApiService {
             self.write_through().await;
             return Ok(Response::new(api::DeleteSandboxResponse {}));
         }
-        let mut client = match self.node_for(&id).await {
-            Ok(client) => client,
-            // The node is not merely refusing this connection, it has stopped
-            // heartbeating. Waiting for it would leave an undeletable sandbox
-            // holding its name and its capacity for as long as the node stays
-            // down, which for a node that never returns is forever. So the
-            // placement is dropped on the orchestrator's word, and a tombstone
-            // remembers the delete in case the node comes back still holding it.
-            Err(_) if self.is_node_dead(&node_id) => {
+        match delete_on_node(&self.0, &node_id, &id).await {
+            Ok(()) => {}
+            // The node has stopped heartbeating, not merely slowed down: one
+            // whose heartbeats still arrive is given the delete again rather
+            // than written off. Waiting for an absent one would leave an
+            // undeletable sandbox holding its name and its capacity for as
+            // long as the node stays down, which for a node that never
+            // returns is forever. So the placement is dropped on the
+            // orchestrator's word, and a tombstone remembers the delete for
+            // when the node is heard from again still holding it.
+            Err(_) if self.0.nodes.is_absent(&node_id) => {
                 let forgotten = self.0.sandboxes.forget_deleted(&id);
                 if let Some(sandbox) = &forgotten {
                     self.release_charge(sandbox);
@@ -1968,20 +2024,15 @@ impl Burrow for ApiService {
                         .as_ref()
                         .map(|s| s.name.clone())
                         .unwrap_or_default(),
-                    "node is unreachable; forgetting the sandbox and recording a \
-                     tombstone. It will be destroyed if the node returns"
+                    "node is absent; forgetting the sandbox and recording a tombstone. It \
+                     will be destroyed once the node is heard from"
                 );
                 self.forget_attachments(&id).await;
                 self.write_through().await;
                 return Ok(Response::new(api::DeleteSandboxResponse {}));
             }
             Err(err) => return Err(err),
-        };
-        client
-            .delete_sandbox(nodepb::NodeSandboxRef {
-                sandbox_id: id.clone(),
-            })
-            .await?;
+        }
         // Return any capacity still charged optimistically for this sandbox.
         if let Some(sandbox) = self.0.sandboxes.remove(&id) {
             self.release_charge(&sandbox);
@@ -1996,7 +2047,7 @@ impl Burrow for ApiService {
         req: Request<api::SandboxRef>,
     ) -> Result<Response<common::Sandbox>, Status> {
         let id = self.resolve(&req.into_inner().sandbox_id).await;
-        let mut client = self.node_for(&id).await?;
+        let (mut client, _admitted) = self.admitted_node_for(&id).await?;
         let sandbox = client
             .pause_sandbox(nodepb::NodeSandboxRef { sandbox_id: id })
             .await?
@@ -2016,7 +2067,7 @@ impl Burrow for ApiService {
                 self.adopt(sandbox, "", HashMap::new()).await?,
             ));
         }
-        let mut client = self.node_for(&id).await?;
+        let (mut client, _admitted) = self.admitted_node_for(&id).await?;
         let sandbox = client
             .resume_sandbox(nodepb::NodeSandboxRef { sandbox_id: id })
             .await?
@@ -2030,7 +2081,7 @@ impl Burrow for ApiService {
         req: Request<api::SandboxRef>,
     ) -> Result<Response<common::Sandbox>, Status> {
         let id = self.resolve(&req.into_inner().sandbox_id).await;
-        let mut client = self.node_for(&id).await?;
+        let (mut client, _admitted) = self.admitted_node_for(&id).await?;
         let sandbox = client
             .stop_sandbox(nodepb::NodeSandboxRef { sandbox_id: id })
             .await?
@@ -2049,7 +2100,7 @@ impl Burrow for ApiService {
                 self.adopt(sandbox, "", HashMap::new()).await?,
             ));
         }
-        let mut client = self.node_for(&id).await?;
+        let (mut client, _admitted) = self.admitted_node_for(&id).await?;
         let sandbox = client
             .start_sandbox(nodepb::NodeSandboxRef { sandbox_id: id })
             .await?
@@ -2070,12 +2121,12 @@ impl Burrow for ApiService {
             .get(&id)
             .ok_or_else(|| Status::not_found(format!("no sandbox {id}")))?;
         let node_id = current.node_id.clone();
-        let mut client = self.node_for(&id).await?;
         // A replacement template has to be where the sandbox is: its disks
         // and volumes do not move, so the template comes to them.
         if !req.template.is_empty() {
             self.replicate_to(&req.template, &node_id).await?;
         }
+        let (mut client, _admitted) = self.admitted_node_for(&id).await?;
         let judged = if req.template.is_empty() {
             &current.template
         } else {
@@ -2333,7 +2384,7 @@ impl Burrow for ApiService {
             &node_id,
             req.policy.as_ref().and_then(|p| p.network.as_ref()),
         )?;
-        let mut client = self.node_for(&source_id).await?;
+        let (mut client, _admitted) = self.admitted_node_for(&source_id).await?;
         let sandbox = client
             .fork_sandbox(nodepb::NodeForkRequest {
                 sandbox_id: source_id.clone(),
@@ -2449,13 +2500,15 @@ impl Burrow for ApiService {
         // Held from before the source lets go until the sandbox is placed
         // again, so no other call can place it, or move it again, meanwhile.
         let _adoption = self.claim_placing(&id, &source).await?;
-        let mut client = self.node_for(&id).await?;
+        let (mut client, admitted) = self.admitted_node_for(&id).await?;
         let released = client
             .release_sandbox(nodepb::NodeSandboxRef {
                 sandbox_id: id.clone(),
             })
             .await?
             .into_inner();
+        // A hand back is admitted to the source again.
+        drop(admitted);
         // Between the two nodes the sandbox is nowhere, and recorded so: if
         // the adopt fails, a later start places it rather than routing to a
         // node that has let go of it.
@@ -2502,7 +2555,7 @@ impl Burrow for ApiService {
         // The orchestrator owns the id namespace, here as everywhere else.
         let snapshot_id = burrow_common::SnapshotId::generate().to_string();
 
-        let mut client = self.node_for(&sandbox_id).await?;
+        let (mut client, _admitted) = self.admitted_node_for(&sandbox_id).await?;
         let snapshot = client
             .create_snapshot(nodepb::NodeCreateSnapshotRequest {
                 sandbox_id: sandbox_id.clone(),
@@ -3919,6 +3972,7 @@ mod tests {
             node_token: None,
             sandbox_lease_secs: 0,
             ips: Default::default(),
+            admission: Default::default(),
         }))
     }
 
@@ -4149,6 +4203,41 @@ mod tests {
         // through, rather than the routing to a node that has let go.
         assert_eq!(err.code(), tonic::Code::Unavailable, "{err}");
         assert!(err.message().contains("stored state"), "{err}");
+    }
+
+    /// A node whose heartbeats still arrive is slow, not gone: a delete it
+    /// fails is the caller's error, and only one against an absent node is
+    /// taken on the orchestrator's word and tombstoned.
+    #[tokio::test]
+    async fn a_delete_is_tombstoned_only_against_an_absent_node() {
+        let mut state = Arc::try_unwrap(replica(Default::default()).0).ok().unwrap();
+        state.control_plane_hosts = std::sync::Mutex::new(Vec::new());
+        let api = ApiService(Arc::new(state));
+        let info = common::NodeInfo {
+            id: "node1".into(),
+            address: "127.0.0.1:1".into(),
+            ..Default::default()
+        };
+        api.0
+            .nodes
+            .register(info, String::new(), String::new(), None)
+            .unwrap();
+        api.0.sandboxes.insert(sandbox_a("node1"));
+        let delete = || {
+            api.delete_sandbox(Request::new(api::SandboxRef {
+                sandbox_id: "sbx_a".into(),
+            }))
+        };
+
+        let err = delete().await.unwrap_err();
+        assert_eq!(err.code(), tonic::Code::Unavailable, "{err}");
+        assert!(!api.0.sandboxes.is_tombstoned("sbx_a"));
+        assert_eq!(api.0.sandboxes.node_of("sbx_a").as_deref(), Some("node1"));
+
+        api.0.nodes.age("node1", crate::registry::ABSENT_AFTER);
+        delete().await.unwrap();
+        assert!(api.0.sandboxes.is_tombstoned("sbx_a"));
+        assert!(api.0.sandboxes.get("sbx_a").is_none());
     }
 
     /// Two starts of one unplaced sandbox through two replicas: the second

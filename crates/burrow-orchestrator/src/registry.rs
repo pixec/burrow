@@ -9,6 +9,11 @@ use burrow_proto::common::v1::{self as common, NodeInfo, NodeStatus};
 pub const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(5);
 /// A node missing this many intervals is reported unhealthy.
 const STALE_AFTER: Duration = Duration::from_secs(15);
+/// A node unheard for this long is taken to be gone rather than slow: it is
+/// no longer called, placed on, or given a delete before one is tombstoned.
+/// Until then a node whose heartbeats arrive late, as they do from one busy
+/// with a burst, is still called and placed on, after every punctual node.
+pub const ABSENT_AFTER: Duration = Duration::from_secs(60);
 
 /// What a sandbox needs from the node it lands on.
 #[derive(Debug, Clone, Default)]
@@ -317,6 +322,10 @@ pub struct NodeEntry {
 impl NodeEntry {
     pub fn is_healthy(&self) -> bool {
         self.last_heartbeat.elapsed() < STALE_AFTER
+    }
+
+    pub fn is_present(&self) -> bool {
+        self.last_heartbeat.elapsed() < ABSENT_AFTER
     }
 }
 
@@ -717,6 +726,23 @@ impl NodeRegistry {
         }
     }
 
+    /// Records that a node was heard from, ahead of the store write that
+    /// queues behind a burst's on the pool.
+    pub fn touch(&self, node_id: &str) {
+        if let Some(entry) = self.nodes.lock().unwrap().get_mut(node_id) {
+            entry.last_heartbeat = Instant::now();
+            entry.last_heartbeat_at_ms = burrow_common::unix_now_ms();
+        }
+    }
+
+    /// Moves a node's last heartbeat `by` into the past.
+    #[cfg(test)]
+    pub fn age(&self, node_id: &str, by: Duration) {
+        let mut nodes = self.nodes.lock().unwrap();
+        let entry = nodes.get_mut(node_id).unwrap();
+        entry.last_heartbeat = Instant::now() - by;
+    }
+
     /// The labels a node carries, empty for one the registry does not know.
     ///
     /// For the paths that cannot place, and so can only check: a fork is built
@@ -738,6 +764,17 @@ impl NodeRegistry {
     /// never come back, and only the second may be written off.
     pub fn health(&self, node_id: &str) -> Option<bool> {
         Some(self.nodes.lock().unwrap().get(node_id)?.is_healthy())
+    }
+
+    /// Whether a node is unknown or has gone [`ABSENT_AFTER`] without a
+    /// heartbeat, as opposed to merely slow.
+    pub fn is_absent(&self, node_id: &str) -> bool {
+        !self
+            .nodes
+            .lock()
+            .unwrap()
+            .get(node_id)
+            .is_some_and(NodeEntry::is_present)
     }
 
     /// Ids of every node still heartbeating.
@@ -783,7 +820,6 @@ impl NodeRegistry {
         self.pending.lock().unwrap().remove(node_id);
     }
 
-    /// gRPC endpoint for a node, if it is known and healthy.
     /// A registered node's endpoint whether or not it is answering, for
     /// callers that keep trying until the node is forgotten.
     pub fn endpoint_any(&self, node_id: &str) -> Option<String> {
@@ -791,16 +827,17 @@ impl NodeRegistry {
         Some(format!("http://{}", nodes.get(node_id)?.info.address))
     }
 
+    /// gRPC endpoint for a node, if it is known and not absent.
     pub fn endpoint(&self, node_id: &str) -> Option<String> {
         let nodes = self.nodes.lock().unwrap();
         let entry = nodes.get(node_id)?;
-        if !entry.is_healthy() {
+        if !entry.is_present() {
             return None;
         }
         Some(format!("http://{}", entry.info.address))
     }
 
-    /// Picks a node for a new sandbox: healthy, not draining, most free memory.
+    /// Picks a node for a new sandbox: not absent, not draining, most free memory.
     ///
     /// Prefer [`place_for`] when a template or private network is involved;
     /// this is the unconstrained case.
@@ -840,7 +877,7 @@ impl NodeRegistry {
 
         let live: Vec<_> = nodes
             .values()
-            .filter(|e| e.is_healthy() && !e.status.is_draining && !excluded.contains(&e.info.id))
+            .filter(|e| e.is_present() && !e.status.is_draining && !excluded.contains(&e.info.id))
             .collect();
         if live.is_empty() {
             return Err(PlacementError::NoHealthyNode);
@@ -954,6 +991,9 @@ impl NodeRegistry {
             .into_iter()
             .max_by_key(|e| {
                 (
+                    // A node whose heartbeats are late is busy, so it only
+                    // takes what no punctual node can.
+                    e.is_healthy(),
                     // Same node as the peers: no encryption, no extra hop.
                     want.prefer_node.as_deref() == Some(e.info.id.as_str()),
                     holds_warm(e, want),
@@ -1263,6 +1303,40 @@ mod tests {
             ["10.0.0.5:7071", "https://node-a.example.com:7073"]
         );
         assert!(registry.edge_hosts().is_empty());
+    }
+
+    /// A node whose heartbeats arrive late is busy, not gone: it is still
+    /// called and placed on, after every punctual node, until it has been
+    /// silent long enough to be absent.
+    #[test]
+    fn a_late_node_is_placed_on_after_punctual_ones_until_it_is_absent() {
+        let registry = registry(&[
+            ("node-a", NodeStatus::default()),
+            ("node-b", NodeStatus::default()),
+        ]);
+        label(&registry, "node-a", &[("cpu", "modern")]);
+        label(&registry, "node-b", &[("cpu", "modern")]);
+        let late = STALE_AFTER + Duration::from_secs(5);
+        registry.age("node-a", late);
+        assert_eq!(registry.health("node-a"), Some(false));
+        assert!(!registry.is_absent("node-a"));
+        assert!(registry.endpoint("node-a").is_some());
+
+        let want = Placement {
+            node_labels: wants(&[("cpu", "modern")]),
+            ..Default::default()
+        };
+        assert_eq!(registry.place_for(&want).unwrap(), "node-b");
+        registry.age("node-b", late);
+        label(&registry, "node-b", &[("cpu", "legacy")]);
+        assert_eq!(registry.place_for(&want).unwrap(), "node-a");
+
+        registry.age("node-a", ABSENT_AFTER);
+        assert!(registry.is_absent("node-a"));
+        assert!(registry.endpoint("node-a").is_none());
+        let err = registry.place_for(&want).unwrap_err();
+        assert!(matches!(err, PlacementError::NoNodeWithLabels(_)), "{err}");
+        assert!(registry.is_absent("node-c"));
     }
 
     /// Sets what an operator labelled a node with.

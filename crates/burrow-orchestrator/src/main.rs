@@ -1,3 +1,4 @@
+mod admission;
 mod api;
 mod cluster;
 mod events;
@@ -112,6 +113,16 @@ struct Args {
     /// threshold, which only means "unreachable right now".
     #[arg(long, default_value_t = 86_400, env = "BURROW_NODE_EXPIRY_SECS")]
     node_expiry_secs: u64,
+    /// Creates and lifecycle calls (start, stop, pause, resume, delete, fork,
+    /// move, snapshot) this replica sends one node at once. More queue here
+    /// instead of piling onto the node.
+    #[arg(
+        long,
+        default_value_t = admission::DEFAULT_LIMIT,
+        value_parser = clap::value_parser!(u32).range(1..),
+        env = "BURROW_NODE_CONCURRENCY"
+    )]
+    node_concurrency: u32,
 }
 
 pub struct OrchestratorState {
@@ -154,6 +165,8 @@ pub struct OrchestratorState {
     pub sandbox_lease_secs: u32,
     /// Who may manage address pools, and the limits on everyone else.
     pub ips: api::ips::IpConfig,
+    /// Bounds the creates and lifecycle calls in flight to each node.
+    pub admission: admission::Admission,
 }
 
 #[derive(Clone)]
@@ -283,6 +296,7 @@ impl NodeRegistry for NodeRegistryService {
         }
         let mut status = req.status.unwrap_or_default();
         let volumes = std::mem::take(&mut status.volumes);
+        self.0.nodes.touch(&req.node_id);
         if let Some(store) = &self.0.store {
             // The store decides whether the fleet knows this node: it may have
             // registered through another replica, whose cache this one only
@@ -391,6 +405,19 @@ impl NodeRegistry for NodeRegistryService {
                     reconcile_node(state, id).await
                 });
             }
+            // Deleted while the node was absent, and the node is back without
+            // having re-registered, so no reconcile is coming to do it.
+            let due = self
+                .0
+                .sandboxes
+                .due_tombstone_deletes(std::mem::take(&mut applied.tombstoned));
+            if !due.is_empty() {
+                tokio::spawn(destroy_tombstoned(
+                    Arc::clone(&self.0),
+                    req.node_id.clone(),
+                    due,
+                ));
+            }
             if !applied.relinquished.is_empty() {
                 tracing::warn!(
                     node_id = req.node_id,
@@ -474,39 +501,45 @@ async fn reconcile_node(state: Arc<OrchestratorState>, node_id: String) {
                 tombstoned = outcome.tombstoned.len(),
                 "reconciled node inventory"
             );
-            // The node was down when these were deleted, so it never carried
-            // the deletes out. Doing it now is what makes a delete against a
-            // dead node mean the same thing as one against a live node.
-            for sandbox_id in outcome.tombstoned {
-                match client
-                    .delete_sandbox(nodepb::NodeSandboxRef {
-                        sandbox_id: sandbox_id.clone(),
-                    })
-                    .await
-                {
-                    Ok(_) => {
-                        tracing::info!(
-                            node_id,
-                            sandbox = sandbox_id,
-                            "destroyed a sandbox deleted while this node was down"
-                        );
-                        state.sandboxes.clear_tombstone(&sandbox_id);
-                    }
-                    // The tombstone is kept: the sandbox is still there, and
-                    // the next registration gets another go at it.
-                    Err(err) => tracing::warn!(
-                        node_id,
-                        sandbox = sandbox_id,
-                        %err,
-                        "could not destroy a sandbox deleted while this node was down"
-                    ),
-                }
-            }
+            destroy_tombstoned(Arc::clone(&state), node_id.clone(), outcome.tombstoned).await;
         }
         Err(err) => tracing::warn!(node_id, %err, "node inventory unavailable"),
     }
 
     inventory(&state, &node_id, &mut client).await;
+}
+
+/// Destroys sandboxes deleted while their node was absent, which it still
+/// holds. Doing it is what makes a delete against an absent node mean the
+/// same as one against a present node. A delete that fails keeps the
+/// tombstone, backed off, for the next heartbeat or registration.
+async fn destroy_tombstoned(state: Arc<OrchestratorState>, node_id: String, ids: Vec<String>) {
+    let deletes = ids.into_iter().map(|sandbox_id| {
+        let state = Arc::clone(&state);
+        let node_id = node_id.clone();
+        async move {
+            match crate::api::delete_on_node(&state, &node_id, &sandbox_id).await {
+                Ok(()) => tracing::info!(
+                    node_id,
+                    sandbox = sandbox_id,
+                    "destroyed a sandbox deleted while its node was absent"
+                ),
+                Err(err) if err.code() == tonic::Code::NotFound => {}
+                Err(err) => {
+                    tracing::warn!(
+                        node_id,
+                        sandbox = sandbox_id,
+                        %err,
+                        "could not destroy a sandbox deleted while its node was absent"
+                    );
+                    state.sandboxes.tombstone_delete_failed(&sandbox_id);
+                    return;
+                }
+            }
+            state.sandboxes.clear_tombstone(&sandbox_id);
+        }
+    });
+    futures::future::join_all(deletes).await;
 }
 
 /// Re-reads a node's snapshots and volumes, for a replica that does not get
@@ -904,6 +937,7 @@ async fn run(args: Args) -> anyhow::Result<()> {
             quota: args.ip_quota,
             quarantine_secs: args.ip_quarantine_secs.max(0),
         },
+        admission: admission::Admission::new(args.node_concurrency),
     });
 
     tracing::info!(

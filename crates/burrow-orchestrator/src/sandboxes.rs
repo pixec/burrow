@@ -87,6 +87,9 @@ pub struct Applied {
     pub confirmed: Vec<String>,
     /// Fenced sandboxes another node adopted while this one was away.
     pub relinquished: Vec<String>,
+    /// Ids the node still holds that a caller already deleted, for the
+    /// caller to destroy there.
+    pub tombstoned: Vec<String>,
 }
 
 /// How long a tombstone is kept before it is assumed no longer needed.
@@ -95,6 +98,14 @@ pub struct Applied {
 /// destroyed; one that never comes back would otherwise leave the record here
 /// forever.
 pub const TOMBSTONE_TTL_SECS: i64 = 30 * 86_400;
+
+/// How long a tombstoned sandbox's delete is left to run before a heartbeat
+/// may send another.
+const TOMBSTONE_DELETE_HOLD: Duration = Duration::from_secs(150);
+/// The wait after a tombstoned sandbox's first failed delete, doubling up to
+/// [`MAX_TOMBSTONE_RETRY`].
+const TOMBSTONE_RETRY: Duration = Duration::from_secs(5);
+const MAX_TOMBSTONE_RETRY: Duration = Duration::from_secs(300);
 
 /// A delete that was accepted while the hosting node was unreachable.
 #[derive(Debug, Clone)]
@@ -123,6 +134,9 @@ pub struct SandboxRegistry {
     /// the orchestrator's word alone. This is what stops the node re-asserting
     /// the sandbox into existence if it ever comes back.
     tombstones: Mutex<HashMap<String, Tombstone>>,
+    /// Per tombstoned id a heartbeat reported, the deletes that failed and
+    /// when the next may be sent.
+    tombstone_deletes: Mutex<HashMap<String, (u32, Instant)>>,
     /// Ids whose create is in flight.
     ///
     /// A record only enters `sandboxes` once its node has built the sandbox,
@@ -212,6 +226,7 @@ impl SandboxRegistry {
         Self {
             sandboxes: Mutex::new(sandboxes),
             tombstones: Mutex::new(tombstones),
+            tombstone_deletes: Mutex::new(HashMap::new()),
             creating: Mutex::new(HashSet::new()),
             naming: Mutex::new(HashSet::new()),
             adopting: Mutex::new(HashSet::new()),
@@ -617,10 +632,40 @@ impl SandboxRegistry {
 
     /// Forgets a tombstone: the node no longer holds the sandbox, or never will.
     pub fn clear_tombstone(&self, id: &str) {
+        self.tombstone_deletes.lock().unwrap().remove(id);
         if self.tombstones.lock().unwrap().remove(id).is_none() {
             return;
         }
         self.write(crate::persist::Op::DeleteTombstone(id.to_string()));
+    }
+
+    /// The tombstoned ids among `ids` whose delete is due, each held for
+    /// [`TOMBSTONE_DELETE_HOLD`] so the next heartbeat does not send it again
+    /// while it runs.
+    pub fn due_tombstone_deletes(&self, ids: Vec<String>) -> Vec<String> {
+        let now = Instant::now();
+        let mut deletes = self.tombstone_deletes.lock().unwrap();
+        ids.into_iter()
+            .filter(|id| {
+                let (_, next) = deletes.entry(id.clone()).or_insert((0, now));
+                if *next > now {
+                    return false;
+                }
+                *next = now + TOMBSTONE_DELETE_HOLD;
+                true
+            })
+            .collect()
+    }
+
+    /// Backs off a tombstoned id whose delete failed.
+    pub fn tombstone_delete_failed(&self, id: &str) {
+        if let Some((failures, next)) = self.tombstone_deletes.lock().unwrap().get_mut(id) {
+            *failures += 1;
+            *next = Instant::now()
+                + TOMBSTONE_RETRY
+                    .saturating_mul(1 << (*failures - 1).min(16))
+                    .min(MAX_TOMBSTONE_RETRY);
+        }
     }
 
     /// Drops tombstones older than `ttl_secs`, returning how many.
@@ -981,10 +1026,11 @@ impl SandboxRegistry {
         let mut changed = Vec::new();
         let mut restated = 0;
         for report in reported {
-            // A node that was down when a delete arrived keeps reporting the
-            // sandbox until its registration reconciles. Nothing here may put
-            // it back: the delete already succeeded for the caller.
+            // A node that was absent when a delete arrived keeps reporting the
+            // sandbox until the delete is carried out. Nothing here may put it
+            // back: the delete already succeeded for the caller.
             if tombstoned.contains_key(&report.sandbox_id) {
+                out.tombstoned.push(report.sandbox_id.clone());
                 continue;
             }
             let Some(sandbox) = sandboxes.get_mut(&report.sandbox_id) else {
@@ -1636,9 +1682,37 @@ mod tests {
         registry.insert(named("a", "node1", "web"));
         registry.forget_deleted("a");
 
-        registry.apply_states("node1", &[report("a", common::SandboxState::Running)]);
+        let applied = registry.apply_states("node1", &[report("a", common::SandboxState::Running)]);
 
         assert!(registry.get("a").is_none());
+        assert_eq!(applied.tombstoned, ["a"]);
+    }
+
+    /// A node that never went away reports a tombstoned sandbox on every
+    /// heartbeat. Its delete is sent once while it runs, and after a failure
+    /// again only once the backoff has passed.
+    #[test]
+    fn a_tombstoned_delete_is_sent_once_at_a_time_and_backed_off() {
+        let registry = SandboxRegistry::default();
+        registry.insert(named("a", "node1", "web"));
+        registry.forget_deleted("a");
+
+        assert_eq!(registry.due_tombstone_deletes(vec!["a".into()]), ["a"]);
+        assert!(registry.due_tombstone_deletes(vec!["a".into()]).is_empty());
+        registry.tombstone_delete_failed("a");
+        assert!(registry.due_tombstone_deletes(vec!["a".into()]).is_empty());
+        registry
+            .tombstone_deletes
+            .lock()
+            .unwrap()
+            .get_mut("a")
+            .unwrap()
+            .1 = Instant::now();
+        assert_eq!(registry.due_tombstone_deletes(vec!["a".into()]), ["a"]);
+
+        registry.clear_tombstone("a");
+        assert!(!registry.is_tombstoned("a"));
+        assert!(registry.tombstone_deletes.lock().unwrap().is_empty());
     }
 
     /// Once the node stops listing it, the delete has actually happened and
