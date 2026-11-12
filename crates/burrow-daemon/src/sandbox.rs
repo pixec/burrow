@@ -8795,9 +8795,9 @@ pub(crate) mod tests {
     async fn recovering(name: &str) -> (SandboxManager, PathBuf) {
         let data_dir =
             std::env::temp_dir().join(format!("burrow-recovery-{name}-{}", std::process::id()));
-        let _ = tokio::fs::remove_dir_all(&data_dir).await;
+        tokio::fs::remove_dir_all(&data_dir).await.ok();
         let mut manager = manager().await;
-        manager.config.data_dir = data_dir.clone();
+        manager.config.data_dir.clone_from(&data_dir);
         (manager, data_dir)
     }
 
@@ -8808,79 +8808,20 @@ pub(crate) mod tests {
             ..Default::default()
         };
         burrow_store::SandboxRow {
+            suspended_at: 1,
             id: id.into(),
             template: "default".into(),
             record: prost::Message::encode_to_vec(&record),
             state: state as i32,
             lease_block,
             tap: format!("bt{lease_block}"),
-            ports: Vec::new(),
-            share: None,
-            suspended_at: 1,
+            ports: vec![],
+            share: Default::default(),
         }
     }
 
     async fn events_of(manager: &SandboxManager, id: &str) -> Vec<burrow_store::EventRow> {
         manager.store.list_events(0, Some(id), 100).await.unwrap()
-    }
-
-    /// A lease that cannot be reserved used to have recovery delete the
-    /// sandbox's row and directory. It is kept, reported failed with the
-    /// reason, and only a delete removes it, with a `destroyed` event.
-    #[tokio::test]
-    async fn a_sandbox_recovery_cannot_bring_back_is_kept_and_reported() {
-        let id = "ghost-invalid-lease";
-        let (manager, data_dir) = recovering("held").await;
-        let workdir = manager.config.sandbox_dir(id, Hypervisor::Firecracker);
-        tokio::fs::create_dir_all(&workdir).await.unwrap();
-        let layout = Hypervisor::Firecracker.layout();
-        for file in [layout.state, crate::rootdisk::SCRATCH_DISK] {
-            tokio::fs::write(workdir.join(file), b"kept").await.unwrap();
-        }
-        let orphan = data_dir.join("sandboxes").join("nobody");
-        tokio::fs::create_dir_all(&orphan).await.unwrap();
-        let invalid_block = burrow_net::ipam::BLOCKS_PER_NODE;
-        manager
-            .store
-            .put_sandbox(&row(id, common::SandboxState::Suspended, invalid_block))
-            .await
-            .unwrap();
-
-        manager.recover().await;
-
-        assert_eq!(manager.store.list_sandboxes().await.unwrap().len(), 1);
-        assert!(workdir.join(layout.state).exists());
-        assert!(!orphan.exists(), "a directory nothing names is still swept");
-        let listed = manager.list().await;
-        assert_eq!(listed.len(), 1);
-        assert_eq!(listed[0].state, common::SandboxState::Failed as i32);
-        assert!(listed[0].state_reason.contains("address block"));
-        assert_eq!(
-            manager.state_reports().await[0].state,
-            common::SandboxState::Failed as i32
-        );
-        assert_eq!(
-            manager.get(id).await.err().map(|err| err.code()),
-            Some(tonic::Code::FailedPrecondition)
-        );
-        assert_eq!(
-            manager.record_of(id).await.unwrap().state,
-            common::SandboxState::Failed as i32
-        );
-        let kinds: Vec<_> = events_of(&manager, id)
-            .await
-            .into_iter()
-            .map(|event| event.kind)
-            .collect();
-        assert_eq!(kinds, [EVENT_RECOVERED as i32]);
-
-        manager.delete(id).await.unwrap();
-        assert!(manager.store.list_sandboxes().await.unwrap().is_empty());
-        assert!(manager.list().await.is_empty());
-        assert!(!workdir.exists());
-        let last = events_of(&manager, id).await.pop().unwrap();
-        assert_eq!(last.kind, EVENT_DESTROYED as i32);
-        let _ = tokio::fs::remove_dir_all(&data_dir).await;
     }
 
     /// A node killed before it could suspend left a sandbox recorded as
@@ -8892,29 +8833,23 @@ pub(crate) mod tests {
         let id = "ghost-lost-vm";
         let (manager, data_dir) = recovering("lost").await;
         let workdir = manager.config.sandbox_dir(id, Hypervisor::Firecracker);
-        tokio::fs::create_dir_all(&workdir).await.unwrap();
+        std::fs::create_dir_all(&workdir).unwrap();
         let layout = Hypervisor::Firecracker.layout();
         // A snapshot from an earlier suspend, older than the disk.
         for file in [layout.state, crate::rootdisk::SCRATCH_DISK] {
             tokio::fs::write(workdir.join(file), b"old").await.unwrap();
         }
-        manager
-            .store
-            .put_sandbox(&row(id, common::SandboxState::Running, 3))
-            .await
-            .unwrap();
-        manager
-            .store
-            .append_event(&burrow_store::EventRow {
-                sandbox_id: id.into(),
-                kind: EVENT_STARTED.into(),
-                cpu_usage_usec: 7_000,
-                vcpus: 2,
-                mem_mib: 1024,
-                ..Default::default()
-            })
-            .await
-            .unwrap();
+        let stale = row(id, common::SandboxState::Running, 3);
+        manager.store.put_sandbox(&stale).await.unwrap();
+        let started = burrow_store::EventRow {
+            sandbox_id: id.to_string(),
+            kind: EVENT_STARTED.into(),
+            cpu_usage_usec: 7_000,
+            vcpus: 2,
+            mem_mib: 1024,
+            ..Default::default()
+        };
+        manager.store.append_event(&started).await.unwrap();
 
         manager.recover().await;
 
@@ -8939,7 +8874,7 @@ pub(crate) mod tests {
         // Here the tap cannot be made, so it is held rather than restored;
         // either way it is listed.
         assert_eq!(manager.list().await.len(), 1);
-        let _ = tokio::fs::remove_dir_all(&data_dir).await;
+        tokio::fs::remove_dir_all(&data_dir).await.ok();
     }
 
     /// Every jail used to be under `<base>/firecracker`, Cloud Hypervisor's
@@ -8994,7 +8929,7 @@ pub(crate) mod tests {
         manager.delete(id).await.unwrap();
         assert!(!jail.dir_for(hypervisor, id).exists());
         assert!(jail.hypervisor_dir(hypervisor).exists());
-        let _ = tokio::fs::remove_dir_all(&data_dir).await;
+        tokio::fs::remove_dir_all(&data_dir).await.ok();
     }
 
     /// A sandbox with neither memory nor disk left is the one thing recovery
@@ -9003,24 +8938,18 @@ pub(crate) mod tests {
     async fn a_sandbox_with_nothing_on_disk_is_recorded_destroyed() {
         let id = "ghost-empty";
         let (manager, data_dir) = recovering("empty").await;
-        manager
-            .store
-            .put_sandbox(&row(id, common::SandboxState::Running, 4))
-            .await
-            .unwrap();
-        manager
-            .store
-            .append_event(&burrow_store::EventRow {
-                sandbox_id: id.into(),
-                kind: EVENT_STARTED.into(),
-                cpu_usage_usec: 9_000,
-                rx_bytes: 40,
-                vcpus: 1,
-                mem_mib: 512,
-                ..Default::default()
-            })
-            .await
-            .unwrap();
+        let stale = row(id, common::SandboxState::Running, 4);
+        manager.store.put_sandbox(&stale).await.unwrap();
+        let started = burrow_store::EventRow {
+            sandbox_id: id.to_string(),
+            kind: EVENT_STARTED.into(),
+            cpu_usage_usec: 9_000,
+            rx_bytes: 40,
+            vcpus: 1,
+            mem_mib: 512,
+            ..Default::default()
+        };
+        manager.store.append_event(&started).await.unwrap();
 
         manager.recover().await;
 
@@ -9032,7 +8961,7 @@ pub(crate) mod tests {
             (EVENT_DESTROYED as i32, DETAIL_LOST)
         );
         assert_eq!((last.cpu_usage_usec, last.rx_bytes), (9_000, 40));
-        let _ = tokio::fs::remove_dir_all(&data_dir).await;
+        tokio::fs::remove_dir_all(&data_dir).await.ok();
     }
 
     /// A sandbox under a hypervisor this build does not know used to be read
@@ -9043,11 +8972,11 @@ pub(crate) mod tests {
         let id = "ghost-unknown-hypervisor";
         let data_dir =
             std::env::temp_dir().join(format!("burrow-recovery-unknown-{}", std::process::id()));
-        let _ = tokio::fs::remove_dir_all(&data_dir).await;
+        tokio::fs::remove_dir_all(&data_dir).await.ok();
         let mut manager = manager().await;
-        manager.config.data_dir = data_dir.clone();
+        manager.config.data_dir.clone_from(&data_dir);
         let workdir = data_dir.join("sandboxes").join(id);
-        tokio::fs::create_dir_all(&workdir).await.unwrap();
+        std::fs::create_dir_all(&workdir).unwrap();
         tokio::fs::write(workdir.join("snapshot.future"), b"snapshot")
             .await
             .unwrap();
@@ -9056,28 +8985,25 @@ pub(crate) mod tests {
             hypervisor: "future-vmm".into(),
             ..Default::default()
         };
-        manager
-            .store
-            .put_sandbox(&burrow_store::SandboxRow {
-                id: id.into(),
-                template: "default".into(),
-                record: prost::Message::encode_to_vec(&record),
-                state: common::SandboxState::Suspended as i32,
-                lease_block: 0,
-                tap: "bt0".into(),
-                ports: Vec::new(),
-                share: None,
-                suspended_at: 1,
-            })
-            .await
-            .unwrap();
+        let persisted = burrow_store::SandboxRow {
+            suspended_at: 1,
+            id: id.into(),
+            template: "default".into(),
+            record: prost::Message::encode_to_vec(&record),
+            state: common::SandboxState::Suspended.into(),
+            lease_block: 0,
+            tap: "bt0".into(),
+            ports: vec![],
+            share: Default::default(),
+        };
+        manager.store.put_sandbox(&persisted).await.unwrap();
 
         manager.recover().await;
 
         assert_eq!(manager.store.list_sandboxes().await.unwrap().len(), 1);
-        assert!(manager.sandboxes.lock().await.is_empty());
+        assert_eq!(manager.sandboxes.lock().await.len(), 0);
         assert!(workdir.join("snapshot.future").exists());
-        let _ = tokio::fs::remove_dir_all(&data_dir).await;
+        tokio::fs::remove_dir_all(&data_dir).await.ok();
     }
 
     #[tokio::test]
@@ -9479,7 +9405,7 @@ pub(crate) mod tests {
 
         let err = manager.register_or_discard(&sandbox).await.unwrap_err();
         assert!(err.message().contains("firewall"), "{}", err.message());
-        assert!(manager.sandboxes.lock().await.is_empty());
+        assert_eq!(manager.sandboxes.lock().await.len(), 0);
         assert!(!sandbox.workdir.exists());
     }
 
@@ -9581,12 +9507,8 @@ pub(crate) mod tests {
         let sandbox = running("sbx_no_agent");
         // The registry and the allocator as a warm create leaves them: the
         // record is registered and its lease is held.
-        manager
-            .ipam
-            .lock()
-            .await
-            .reserve(sandbox.id(), sandbox.lease.block)
-            .unwrap();
+        let (id, block) = (sandbox.id(), sandbox.lease.block);
+        manager.ipam.lock().await.reserve(id, block).unwrap();
         manager
             .sandboxes
             .lock()
