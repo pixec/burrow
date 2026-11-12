@@ -235,9 +235,7 @@ impl VolumeStore {
             is_lost: false,
         };
         self.write_meta(&meta).await?;
-        tokio::fs::rename(&pending, dir.join(IMAGE))
-            .await
-            .map_err(|err| Status::internal(format!("publishing volume: {err}")))?;
+        self.publish(name, &pending).await?;
 
         let volume = self.to_proto(&meta, None);
         if self.is_durable() {
@@ -248,10 +246,25 @@ impl VolumeStore {
         Ok(volume)
     }
 
+    /// Renames a built image into place and returns once a power cut can no
+    /// longer take the volume back: the image, the rename and the volume's
+    /// own directory are all on the disk.
+    async fn publish(&self, name: &str, building: &Path) -> Result<(), Status> {
+        let fail =
+            |err: std::io::Error| Status::internal(format!("publishing volume {name}: {err}"));
+        crate::fsync::file(building).await.map_err(fail)?;
+        tokio::fs::rename(building, self.image(name))
+            .await
+            .map_err(fail)?;
+        crate::fsync::dir(&self.dir(name)).await.map_err(fail)?;
+        crate::fsync::dir(&self.root).await.map_err(fail)
+    }
+
     async fn write_meta(&self, meta: &Meta) -> Result<(), Status> {
         let json = serde_json::to_vec_pretty(meta)
             .map_err(|err| Status::internal(format!("volume metadata: {err}")))?;
-        tokio::fs::write(self.dir(&meta.name).join(META), json)
+        let dir = self.dir(&meta.name);
+        crate::fsync::replace(&dir.join(META), &dir.join(format!(".{META}.tmp")), json)
             .await
             .map_err(|err| Status::internal(format!("writing volume metadata: {err}")))
     }
@@ -882,9 +895,7 @@ impl VolumeStore {
             is_lost: false,
         };
         self.write_meta(&meta).await?;
-        tokio::fs::rename(&building, self.image(name))
-            .await
-            .map_err(|err| Status::internal(format!("publishing volume {name}: {err}")))?;
+        self.publish(name, &building).await?;
         let local = crate::volstore::settle_adopted(&dir, &self.image(name), local).await?;
         Ok(self.to_proto(&meta, Some(&local)))
     }
