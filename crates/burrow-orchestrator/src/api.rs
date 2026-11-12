@@ -1138,12 +1138,47 @@ impl ApiService {
         node_id: &str,
         node_labels: HashMap<String, String>,
     ) -> Result<common::Sandbox, Status> {
-        let _adoption = self
+        let _adoption = self.claim_placing(&sandbox.id, "").await?;
+        self.adopt_claimed(sandbox, node_id, node_labels).await
+    }
+
+    /// Claims the right to place a sandbox, then checks the store still has
+    /// it on `holder` (`""` for no node): another replica may have placed or
+    /// moved it between this replica reading it and the claim.
+    async fn claim_placing(
+        &self,
+        id: &str,
+        holder: &str,
+    ) -> Result<crate::sandboxes::Adoption<'_>, Status> {
+        let adoption = self
             .0
             .sandboxes
-            .claim_adoption(&sandbox.id)
+            .claim_adoption(id)
             .await
             .map_err(Status::aborted)?;
+        let held = self
+            .0
+            .sandboxes
+            .refresh(id)
+            .await
+            .ok_or_else(|| Status::not_found(format!("no sandbox {id}")))?
+            .node_id;
+        if held != holder {
+            return Err(Status::aborted(match held.as_str() {
+                "" => format!("sandbox {id} was let go of by another call; start it to place it"),
+                node => format!("sandbox {id} was placed on node {node} by another call"),
+            }));
+        }
+        Ok(adoption)
+    }
+
+    /// [`Self::adopt`] for a caller holding the claim on placing it.
+    async fn adopt_claimed(
+        &self,
+        sandbox: common::Sandbox,
+        node_id: &str,
+        node_labels: HashMap<String, String>,
+    ) -> Result<common::Sandbox, Status> {
         let node_id = &self.pinned_target(&sandbox.id, node_id).await?;
         let want = self.adoption_placement(&sandbox, node_labels);
         let subject = format!("sandbox {}", sandbox.id);
@@ -1242,10 +1277,7 @@ impl ApiService {
                 ),
             );
         }
-        // The failed attempt's claim on placing the sandbox is released by a
-        // queued write, which has to land before this attempt claims again.
-        self.write_through().await;
-        match self.adopt(released, source, HashMap::new()).await {
+        match self.adopt_claimed(released, source, HashMap::new()).await {
             Ok(_) => {
                 tracing::warn!(
                     sandbox = id,
@@ -2288,6 +2320,9 @@ impl Burrow for ApiService {
         let target = placed
             .as_ref()
             .map_or_else(|| req.node_id.clone(), |(target, _)| target.clone());
+        // Held from before the source lets go until the sandbox is placed
+        // again, so no other call can place it, or move it again, meanwhile.
+        let _adoption = self.claim_placing(&id, &source).await?;
         let mut client = self.node_for(&id).await?;
         let released = client
             .release_sandbox(nodepb::NodeSandboxRef {
@@ -2318,7 +2353,10 @@ impl Burrow for ApiService {
             released.hypervisor_version = current.hypervisor_version;
         }
         tracing::info!(sandbox = id, node = source, "sandbox released for a move");
-        let moved = match self.adopt(released.clone(), &target, req.node_labels).await {
+        let moved = match self
+            .adopt_claimed(released.clone(), &target, req.node_labels)
+            .await
+        {
             Ok(moved) => moved,
             Err(err) => return Err(self.hand_back(released, &source, &target, err).await),
         };
@@ -3983,6 +4021,55 @@ mod tests {
         // through, rather than the routing to a node that has let go.
         assert_eq!(err.code(), tonic::Code::Unavailable, "{err}");
         assert!(err.message().contains("stored state"), "{err}");
+    }
+
+    /// Two starts of one unplaced sandbox through two replicas: the second
+    /// read it unplaced before the first placed it, and once the first let
+    /// go of its claim the second placed it again, on another node.
+    #[tokio::test]
+    async fn a_sandbox_another_replica_placed_is_not_placed_again() {
+        let store = Arc::new(burrow_store::Store::open_in_memory().await.unwrap());
+        let first = crate::sandboxes::SandboxRegistry::with_store(Arc::clone(&store)).await;
+        let second = crate::sandboxes::SandboxRegistry::with_store(Arc::clone(&store)).await;
+        first.insert(sandbox_a(""));
+        first.writer().unwrap().flush().await;
+        let stale = second.refresh("sbx_a").await.unwrap();
+        assert!(stale.node_id.is_empty());
+
+        first.adopted(sandbox_a("node1"));
+        first.writer().unwrap().flush().await;
+        let err = replica(second)
+            .adopt(stale, "", HashMap::new())
+            .await
+            .unwrap_err();
+        assert_eq!(err.code(), tonic::Code::Aborted, "{err}");
+        assert!(err.message().contains("node node1"), "{err}");
+    }
+
+    /// A move holds the claim on placing the sandbox from before its source
+    /// lets go, so a start through another replica cannot place it while it
+    /// is between nodes.
+    #[tokio::test]
+    async fn a_sandbox_being_moved_is_not_started_elsewhere() {
+        let store = Arc::new(burrow_store::Store::open_in_memory().await.unwrap());
+        let mover =
+            replica(crate::sandboxes::SandboxRegistry::with_store(Arc::clone(&store)).await);
+        let other = crate::sandboxes::SandboxRegistry::with_store(Arc::clone(&store)).await;
+        mover.0.sandboxes.insert(sandbox_a("node1"));
+        mover.0.sandboxes.writer().unwrap().flush().await;
+        let _moving = mover.claim_placing("sbx_a", "node1").await.unwrap();
+        mover.0.sandboxes.unplace(sandbox_a("node1"));
+        mover.0.sandboxes.writer().unwrap().flush().await;
+
+        other.refresh("sbx_a").await.unwrap();
+        let err = replica(other)
+            .start_sandbox(Request::new(api::SandboxRef {
+                sandbox_id: "sbx_a".into(),
+            }))
+            .await
+            .unwrap_err();
+        assert_eq!(err.code(), tonic::Code::Aborted, "{err}");
+        assert!(err.message().contains("already being placed"), "{err}");
     }
 
     /// A replica over a store holding `sbx_a`'s address 203.0.113.17, which
