@@ -22,8 +22,8 @@ pub struct Cpu {
 }
 
 impl Cpu {
-    /// As a record carries it: none for an empty one, from a manifest
-    /// written before fingerprints or a node that could not read its own.
+    /// As a record carries it: none for an empty one, from a node that could
+    /// not read its own.
     pub fn fingerprint(&self) -> Option<CpuFingerprint> {
         (!self.vendor.is_empty()).then(|| CpuFingerprint {
             vendor: self.vendor.clone(),

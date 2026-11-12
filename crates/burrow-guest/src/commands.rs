@@ -634,9 +634,7 @@ struct SavedEntry {
     started_at_ms: i64,
     ended_at_ms: i64,
     exit_code: i32,
-    #[serde(default)]
     exit_signal: i32,
-    #[serde(default)]
     produced: u64,
 }
 
@@ -645,9 +643,7 @@ struct Saved {
     next_id: u64,
     entries: Vec<SavedEntry>,
     /// Output the host had not yet confirmed, which the next agent sends.
-    #[serde(default)]
     pending: Vec<Pending>,
-    #[serde(default)]
     next_seq: u64,
 }
 
@@ -689,9 +685,7 @@ pub fn save(path: &str) -> std::io::Result<()> {
 }
 
 /// Reads what [`save`] wrote and removes the file. Best effort: a table that
-/// cannot be read is an empty history, not a failed upgrade. An older agent's
-/// table, with each command's output inline rather than pending, still reads:
-/// the output it carries is not sent on, since that agent kept it in the guest.
+/// cannot be read is an empty history, not a failed upgrade.
 ///
 /// `signaller` gives a restored command what signals it, from its pid.
 pub fn restore(path: &str, signaller: impl Fn(i32) -> Option<Arc<dyn Signaller>>) {

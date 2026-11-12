@@ -5514,7 +5514,7 @@ impl SandboxManager {
         if region == 0 {
             return Ok(refuse(format!(
                 "sandbox {id} booted with no room to plug memory into: its max_mem_mib is its \
-                 memory, or its VM predates memory hotplug; shut it down, update it, and boot it"
+                 memory; shut it down, update it, and boot it"
             )));
         }
         if want < boot {
@@ -8086,11 +8086,10 @@ impl SandboxManager {
             RestoreSource::Sandbox(source, _) => {
                 burrow_vmm::GuestOs::from_record(&source.record().guest_os).unwrap_or_default()
             }
-            RestoreSource::Stored { manifest, .. } if manifest.image.is_some() => manifest
+            RestoreSource::Stored { manifest, .. } => manifest
                 .image
-                .as_ref()
-                .and_then(|image| image.machine().ok())
-                .map_or_else(Default::default, |(_, os)| os),
+                .machine()
+                .map_or_else(|_| Default::default(), |(_, os)| os),
             _ => self
                 .image_environment(&source.template())
                 .await
@@ -8270,13 +8269,9 @@ impl SandboxManager {
             self.guest_network(&lease, &[], capabilities.is_tap_networked, true),
             self.inspection_ca_for(&policy),
             match &source {
-                RestoreSource::Stored {
-                    manifest:
-                        crate::durable::Manifest {
-                            image: Some(image), ..
-                        },
-                    ..
-                } => self.trust_bundles_in(image, &policy),
+                RestoreSource::Stored { manifest, .. } => {
+                    self.trust_bundles_in(&manifest.image, &policy)
+                }
                 _ => self.trust_bundles_for(&source.template(), &policy).await,
             },
             match is_attached {
@@ -9100,7 +9095,7 @@ impl SandboxManager {
             checkpoint: String::new(),
             checkpoint_at_ms: 0,
             volumes: Default::default(),
-            image: Some(image),
+            image,
         }))
     }
 

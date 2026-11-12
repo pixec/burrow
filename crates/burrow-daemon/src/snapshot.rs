@@ -87,14 +87,9 @@ pub struct Manifest {
     pub template: String,
     pub vcpus: u32,
     pub mem_mib: u32,
-    #[serde(alias = "scratch_disk_mib")]
     pub disk_mib: u32,
-    /// What the VM booted with, of `mem_mib`, and what it could grow to. 0 in
-    /// a manifest from before memory hotplug, whose VM booted with all of
-    /// `mem_mib` and had nothing to grow into.
-    #[serde(default)]
+    /// What the VM booted with, of `mem_mib`, and what it could grow to.
     pub boot_mem_mib: u32,
-    #[serde(default)]
     pub max_mem_mib: u32,
     /// Unix milliseconds. Retention evicts the oldest first, and two
     /// snapshots taken inside one second would otherwise be ordered
@@ -116,12 +111,9 @@ pub struct Manifest {
     /// The version of `hypervisor` that wrote it, which is the only one its
     /// state is known to restore under.
     pub hypervisor_version: String,
-    /// The hypervisor that took it, and so the one it restores under. Empty in
-    /// a manifest from before there was a choice, which was Firecracker.
-    #[serde(default)]
+    /// The hypervisor that took it, and so the one it restores under.
     pub hypervisor: String,
     /// The CPU it was taken on; see [`crate::cpuid`].
-    #[serde(default)]
     pub cpu: crate::cpuid::Cpu,
     /// Set once every object is in the store and the remote manifest is
     /// written, so a half-finished upload never reads as restorable.

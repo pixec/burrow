@@ -58,9 +58,7 @@ pub struct Claims {
     pub exp: u64,
     pub jti: String,
     /// `iat` to the millisecond, so a token issued just after a revoke in
-    /// the same second is told apart from one issued just before it. Absent
-    /// from a token an older orchestrator signed.
-    #[serde(default)]
+    /// the same second is told apart from one issued just before it.
     pub iat_ms: u64,
 }
 
@@ -86,13 +84,9 @@ impl Claims {
         self.ops.iter().any(|held| held == op)
     }
 
-    /// Unix milliseconds the token was issued at; the start of its second for
-    /// a token that says only the second.
+    /// Unix milliseconds the token was issued at.
     pub fn issued_ms(&self) -> i64 {
-        match self.iat_ms {
-            0 => self.iat as i64 * 1000,
-            ms => ms as i64,
-        }
+        self.iat_ms as i64
     }
 }
 

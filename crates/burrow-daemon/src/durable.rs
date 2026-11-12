@@ -97,25 +97,17 @@ pub struct Manifest {
     pub template: String,
     pub vcpus: u32,
     pub mem_mib: u32,
-    #[serde(alias = "scratch_disk_mib")]
     pub disk_mib: u32,
-    /// What the VM booted with, of `mem_mib`, and what it could grow to. 0 in
-    /// a manifest from before memory hotplug, whose VM booted with all of
-    /// `mem_mib` and had nothing to grow into.
-    #[serde(default)]
+    /// What the VM booted with, of `mem_mib`, and what it could grow to.
     pub boot_mem_mib: u32,
-    #[serde(default)]
     pub max_mem_mib: u32,
     pub is_systemd: bool,
     pub arch: String,
     /// The version of `hypervisor` that wrote the state.
     pub hypervisor_version: String,
-    /// The sandbox's hypervisor, the only one its state restores under. Empty
-    /// in a manifest from before there was a choice, which was Firecracker.
-    #[serde(default)]
+    /// The sandbox's hypervisor, the only one its state restores under.
     pub hypervisor: String,
     /// The CPU the state was written on; see [`crate::cpuid`].
-    #[serde(default)]
     pub cpu: crate::cpuid::Cpu,
     pub kernel_digest: String,
     /// The template's image. The disk's index is a diff against it, by
@@ -132,7 +124,8 @@ pub struct Manifest {
     pub secrets: std::collections::BTreeMap<String, String>,
     /// SHA-256 of the TLS inspection root the guest was told to trust, when
     /// it is inspected. Its processes hold that root in memory, so the state
-    /// restores only on a node whose leaves chain to the same one.
+    /// restores only on a node whose leaves chain to the same one. Empty when
+    /// it is not inspected.
     #[serde(default)]
     pub inspection_root: String,
     /// [`CHECKPOINT_DISK`] or [`CHECKPOINT_MEMORY`] for state uploaded while
@@ -150,8 +143,7 @@ pub struct Manifest {
     /// The template's environment as the sandbox ran with it: its systemd
     /// mode, guest OS, image environment and Kit. A node adopting the sandbox
     /// may never have had the template, so it keeps this copy instead.
-    #[serde(default)]
-    pub image: Option<crate::oci::ImageEnvironment>,
+    pub image: crate::oci::ImageEnvironment,
 }
 
 pub const CHECKPOINT_DISK: &str = "disk";
@@ -242,14 +234,11 @@ pub struct LocalState {
     pub is_published: bool,
     pub layers: Vec<LayerId>,
     pub vmstate: Stamp,
-    #[serde(alias = "scratch")]
     pub disk: Stamp,
     pub kernel: Stamp,
     pub rootfs: Stamp,
     pub memory: ImageIndex,
-    #[serde(alias = "scratch_index")]
     pub disk_index: ImageIndex,
-    #[serde(default)]
     pub logs: std::collections::BTreeMap<String, LogImage>,
 }
 
@@ -828,12 +817,9 @@ const PAGE: u64 = 4096;
 /// Keeps the template environment a manifest carries as the adopted
 /// sandbox's own.
 async fn keep_image(manifest: &Manifest, dest: &Path) -> Result<(), Status> {
-    match &manifest.image {
-        Some(image) => crate::oci::keep_environment(dest, image)
-            .await
-            .map_err(|err| Status::internal(format!("keeping the image environment: {err}"))),
-        None => Ok(()),
-    }
+    crate::oci::keep_environment(dest, &manifest.image)
+        .await
+        .map_err(|err| Status::internal(format!("keeping the image environment: {err}")))
 }
 
 /// Where a disk checkpoint's clone is kept once uploaded, the base the next
@@ -1228,7 +1214,7 @@ mod tests {
             checkpoint: String::new(),
             checkpoint_at_ms: 0,
             volumes: Default::default(),
-            image: None,
+            image: Default::default(),
         }
     }
 
@@ -1299,12 +1285,12 @@ mod tests {
         let blobs = crate::blobs::BlobStore::new(&root.join("data-a"));
         let mut draft = manifest("node-a", "");
         draft.checkpoint_at_ms = 42;
-        draft.image = Some(crate::oci::ImageEnvironment {
+        draft.image = crate::oci::ImageEnvironment {
             systemd: true,
             env: vec!["PATH=/opt/tool/bin".into()],
             user: "app".into(),
             ..Default::default()
-        });
+        };
 
         let capture = workdir.join(".checkpoint.ext4");
         crate::rootdisk::clone(&disk, &capture).await.unwrap();
