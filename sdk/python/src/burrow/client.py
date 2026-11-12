@@ -239,9 +239,10 @@ class Volumes:
     ) -> Volume:
         """Creates a volume, placing it on a node that satisfies `node_labels`.
 
-        A volume never moves, so the labels are the only chance to influence
-        where it lands, and where every sandbox that mounts it will therefore
-        run.
+        A volume stays where this places it, and so does every sandbox that
+        mounts it, unless it is durable (its node has an object store): a
+        durable volume moves with a sandbox that mounts it, or to another node
+        once its own is written off.
         """
         raw = self._transport.unary(
             "CreateVolume",
@@ -550,8 +551,8 @@ class Burrow:
         allowed_tags: Optional[List[str]] = None,
     ) -> None:
         """Stores a credential that Sandbox Kits ask for by service name. The
-        value stays on the node and is injected into matching requests by the
-        egress proxy, so a guest never holds it. `name` is lowercase
+        orchestrator keeps it sealed, and the egress proxy on the sandbox's
+        node injects it into matching requests, so a guest never holds it. `name` is lowercase
         kebab-case, the `service` a Kit credential names.
 
         `allowed_sandboxes` (ids or names) and `allowed_tags` (`key=value`)

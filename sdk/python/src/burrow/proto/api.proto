@@ -57,8 +57,9 @@ service Burrow {
 
   // Snapshots: a sandbox's state, kept as an object of its own.
   //
-  // Node-local, like templates: a snapshot can only be restored on the node
-  // that took it, so a create from one is placed there.
+  // A create from one is placed on the node holding it, or, for a durable
+  // snapshot whose node is gone, on any node matching its architecture and
+  // hypervisor version.
   rpc CreateSnapshot(CreateSnapshotRequest) returns (burrow.common.v1.Snapshot);
   rpc ListSnapshots(ListSnapshotsRequest) returns (ListSnapshotsResponse);
   rpc GetSnapshot(SnapshotRef) returns (burrow.common.v1.Snapshot);
@@ -373,9 +374,10 @@ message BuildStep {
 message BuildTemplateRequest {
   // Name the finished image is published under.
   string name = 1;
-  // Template to start from, as imported by a pull. Required unless `snapshot`
-  // is set, which carries its own: burrow has no built-in image to fall back
-  // on, and choosing one would boot something the caller did not ask for.
+  // Template to start from, as imported by a pull. Required unless
+  // `from_image`, `kits` or `from_ipsw` takes its place: burrow has no
+  // built-in image to fall back on, and choosing one would boot something the
+  // caller did not ask for.
   string from = 2;
   repeated BuildStep steps = 3;
   // The machine the build runs in. Zero is 1 vCPU and 1024 MiB for a Linux
@@ -409,8 +411,10 @@ message BuildTemplateRequest {
   // into its data directory and keeps for the next build. Takes the place of
   // `from`, `from_image` and `kits`; `steps` must be empty.
   string from_ipsw = 11;
-  // The installed macOS disk, for a `from_ipsw` build. Zero is 64 GiB; macOS
-  // needs about 28 GiB to install.
+  // The build's root disk, which is the size of the image it makes. Zero is
+  // the base's plus 1 GiB for a Linux build, and 64 GiB for a `from_ipsw`
+  // build, which needs about 28 GiB to install macOS. On a Mac node only a
+  // `from_ipsw` build takes it.
   uint32 disk_mib = 12;
 }
 
@@ -765,8 +769,9 @@ message CreateVolumeRequest {
   // is addressed by the name you chose, since nothing generates one for you.
   string name = 1;
   uint64 size_mib = 2;
-  // Labels the node holding this volume must carry. A volume never moves, so
-  // this is the only chance to influence where it lands.
+  // Labels the node holding this volume must carry. A volume stays where this
+  // places it unless it is durable, which moves with a sandbox that mounts it
+  // or to another node once its own is written off.
   map<string, string> node_labels = 3;
   // Recorded on the volume; see `Volume.labels`.
   map<string, string> labels = 4;
@@ -859,7 +864,8 @@ message CreateSandboxRequest {
   // repeat the shape it was taken with, because a restore takes its
   // configuration from the snapshot, so anything else is refused rather than
   // ignored.
-  // Placed on the node holding the snapshot, since snapshots do not travel.
+  // Placed on the node holding the snapshot, or on a compatible node when it
+  // is durable and no node holds it.
   string snapshot = 6;
   // Labels the hosting node must carry, all of them, matched exactly. This is
   // what burrow has instead of regions: operators label nodes, and a caller

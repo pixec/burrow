@@ -13,7 +13,7 @@ That makes the mapping straightforward:
 | --- | --- | --- |
 | orchestrator | Deployment, 2 replicas + Service + PodDisruptionBudget | Stateless over PostgreSQL; any replica serves, one leads background work |
 | PostgreSQL | Your own, or CloudNativePG (`05-postgres.yaml`) | Where every replica's state meets; its failover is the control plane's |
-| node (`burrowd`) | DaemonSet, `hostNetwork`, privileged | Owns a machine's `/dev/kvm`, taps, nftables and local sandbox state; a running sandbox never moves between nodes |
+| node (`burrowd`) | DaemonSet, `hostNetwork`, privileged | Owns a machine's `/dev/kvm`, taps, nftables and local sandbox state |
 | sandbox | *nothing* | A microVM `burrowd` manages directly |
 
 ## What the cluster has to give you
@@ -163,8 +163,9 @@ burrow nodes ls
   `burrow nodes drain` first, or the sandboxes
   on it are lost rather than suspended.
 - **`hostPath` state.** `/var/lib/burrow` follows the machine, not the pod.
-  Snapshots are node-local and sandboxes do not move, so this is correct, but
-  it also means wiping a machine wipes its sandboxes.
+  Without `--object-store`, sandboxes, snapshots and volumes never leave the
+  machine, so wiping it wipes them. With one, durable sandboxes, snapshots and
+  volumes survive it.
 - **Placement labels are per DaemonSet.** The downward API cannot read a
   machine's labels, so `--label` is set in the manifest. For pools that differ,
   run one DaemonSet per pool with its own `nodeSelector` and `--label` flags,

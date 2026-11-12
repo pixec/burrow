@@ -38,7 +38,8 @@ pub struct ServeArgs {
     #[arg(long, default_value = "/usr/local/bin/firecracker")]
     pub firecracker: PathBuf,
     /// Hypervisors this node offers, comma-separated: `firecracker`,
-    /// `cloud-hypervisor`. A template records one when it is built, and its
+    /// `cloud-hypervisor`, and `vz` on a Mac. A template records one when it
+    /// is built, and its
     /// sandboxes are only placed on nodes offering it. One whose binary is
     /// missing is left out of what the node advertises, with a warning.
     #[arg(
@@ -354,8 +355,8 @@ pub struct ServeArgs {
     /// hostname routing at all: a published port on it is reachable only at
     /// the node address the caller is handed.
     ///
-    /// Sandboxes never move between nodes, so a hostname served here stays
-    /// correct for a sandbox's whole life.
+    /// A hostname here names this node's edge, so a sandbox that moves to
+    /// another node is reachable under that node's edge domain instead.
     #[arg(long, env = "BURROWD_EDGE_LISTEN")]
     pub edge_listen: Option<std::net::SocketAddr>,
     /// Domain this node's edge serves under, e.g. `node-a.sandbox.example.com`.

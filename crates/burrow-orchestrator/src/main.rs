@@ -136,8 +136,8 @@ pub struct OrchestratorState {
     pub access: Option<burrow_common::access::Signer>,
     /// Keys announced alongside the signing key, as `(kid, public key)`.
     pub access_trusted: Vec<(String, Vec<u8>)>,
-    /// Which node holds which snapshot. Snapshots do not travel, so a create
-    /// from one has to be placed where it is.
+    /// Which node holds which snapshot, so a create from one is placed where
+    /// it is.
     pub snapshots: snapshots::SnapshotRegistry,
     /// Which node holds which volume. A volume is a disk image on one machine,
     /// so a sandbox mounting one has to be placed where it is.

@@ -11,8 +11,10 @@ export interface CreateVolumeOptions extends CallOptions {
   /**
    * Labels the node holding it must carry, all of them.
    *
-   * A volume never moves, so this is the only chance to influence where it
-   * lands, and where every sandbox that mounts it will therefore run.
+   * A volume stays where this places it, and so does every sandbox that
+   * mounts it, unless it is durable (its node has an object store): a durable
+   * volume moves with a sandbox that mounts it, or to another node once its
+   * own is written off.
    */
   nodeLabels?: Record<string, string>;
   /** Free-form key/value pairs recorded on the volume. */

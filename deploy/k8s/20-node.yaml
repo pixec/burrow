@@ -2,8 +2,8 @@
 #
 # A DaemonSet rather than a Deployment because a node is not a replica. It owns
 # the machine's /dev/kvm, its tap devices, its nftables rules and its sandbox
-# state on local disk, and sandboxes never move between nodes. "One per
-# machine, pinned to that machine's disk" is exactly what a DaemonSet is.
+# state on local disk. "One per machine, pinned to that machine's disk" is
+# exactly what a DaemonSet is.
 #
 # Scheduled only onto machines you have labelled:
 #   kubectl label node <machine> burrow.pixec.net/kvm=true
@@ -146,7 +146,7 @@ spec:
             - name: cgroup
               mountPath: /sys/fs/cgroup
             # Sandbox state, templates and snapshots, on the machine's own disk.
-            # Snapshots are node-local and sandboxes do not move, so this
+            # Without an object store none of it leaves the machine, so this
             # follows the machine and not the pod.
             - name: data
               mountPath: /var/lib/burrow

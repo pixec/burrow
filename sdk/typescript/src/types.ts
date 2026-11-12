@@ -615,7 +615,8 @@ export interface CreateOptions extends CallOptions, HandleOptions {
    * Snapshot id to start from. The sandbox **restores** that state instead of
    * booting, so it arrives with the snapshot's processes and memory, and
    * `template` and `resources` may not disagree with what the snapshot
-   * holds. Placed on the node holding it: snapshots do not travel.
+   * holds. Placed on the node holding it, or on a compatible node when it is
+   * durable and no node holds it.
    */
   snapshot?: string;
   /** Machine shape. */

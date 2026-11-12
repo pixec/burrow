@@ -275,8 +275,10 @@ enum Command {
         /// are a Docker Sandbox Kit set, composed into one template.
         #[arg(required = true)]
         images: Vec<String>,
-        /// Template name. Defaults to the image's repository name, or for a
-        /// kit set to one derived from its digests.
+        /// Template name. Defaults to the image's repository name with its
+        /// tag appended (`python:3.12-slim` is `python-3.12-slim`), leaving
+        /// off `latest` and digests; for a kit set, a name derived from its
+        /// digests.
         #[arg(long)]
         name: Option<String>,
         /// Boot the image's own systemd under the agent. The image has to
@@ -284,7 +286,8 @@ enum Command {
         #[arg(long)]
         systemd: bool,
         /// Hypervisor every sandbox from the template runs under:
-        /// `firecracker` or `cloud-hypervisor`. Defaults to Firecracker.
+        /// `firecracker` or `cloud-hypervisor`. Defaults to Firecracker, and
+        /// to Cloud Hypervisor for a Windows image.
         #[arg(long)]
         hypervisor: Option<String>,
     },
@@ -1507,8 +1510,10 @@ enum TemplatesCommand {
         /// are a Docker Sandbox Kit set, composed into one template.
         #[arg(required = true)]
         images: Vec<String>,
-        /// Template name. Defaults to the image's repository name, or for a
-        /// kit set to one derived from its digests.
+        /// Template name. Defaults to the image's repository name with its
+        /// tag appended (`python:3.12-slim` is `python-3.12-slim`), leaving
+        /// off `latest` and digests; for a kit set, a name derived from its
+        /// digests.
         #[arg(long)]
         name: Option<String>,
         /// Boot the image's own systemd under the agent. The image has to
@@ -1516,7 +1521,8 @@ enum TemplatesCommand {
         #[arg(long)]
         systemd: bool,
         /// Hypervisor every sandbox from the template runs under:
-        /// `firecracker` or `cloud-hypervisor`. Defaults to Firecracker.
+        /// `firecracker` or `cloud-hypervisor`. Defaults to Firecracker, and
+        /// to Cloud Hypervisor for a Windows image.
         #[arg(long)]
         hypervisor: Option<String>,
     },
@@ -1597,7 +1603,9 @@ enum VolumeCommand {
         #[arg(long, default_value_t = 1024)]
         size_mib: u64,
         /// Labels the node holding it must carry, as key=value. Repeatable.
-        /// A volume never moves, so this is the only chance to say where.
+        /// Only a durable volume, on a node with an object store, ever moves:
+        /// with a sandbox that mounts it, or to another node once its own is
+        /// written off. Any other volume stays where this places it.
         #[arg(long = "node-label")]
         node_labels: Vec<String>,
     },

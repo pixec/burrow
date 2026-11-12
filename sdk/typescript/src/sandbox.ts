@@ -1131,7 +1131,8 @@ export class Sandbox {
    * Moves the sandbox to another node through the object store.
    *
    * A running sandbox is suspended, carried over and resumed. It keeps its id,
-   * name and policy and gets an address on the new node. Volumes do not move.
+   * name and policy and gets an address on the new node. Durable volumes it
+   * mounts move with it; one mounting a volume that is not durable cannot move.
    *
    * ```ts
    * await sandbox.move({ nodeLabels: { tier: "dedicated" } });

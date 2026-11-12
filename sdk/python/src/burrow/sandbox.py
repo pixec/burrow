@@ -1174,7 +1174,8 @@ class Sandbox:
         A running sandbox is paused, carried over and resumed. It keeps its
         id, name and policy and gets an address on the new node. `node_id`
         names the destination; otherwise it is placed like a create, on a node
-        carrying `node_labels`. Volumes do not move.
+        carrying `node_labels`. Durable volumes it mounts move with it; one
+        mounting a volume that is not durable cannot move.
         """
         return self._apply(
             "MoveSandbox",

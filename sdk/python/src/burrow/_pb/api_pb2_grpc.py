@@ -532,8 +532,9 @@ class BurrowServicer(object):
     def CreateSnapshot(self, request, context):
         """Snapshots: a sandbox's state, kept as an object of its own.
 
-        Node-local, like templates: a snapshot can only be restored on the node
-        that took it, so a create from one is placed there.
+        A create from one is placed on the node holding it, or, for a durable
+        snapshot whose node is gone, on any node matching its architecture and
+        hypervisor version.
         """
         context.set_code(grpc.StatusCode.UNIMPLEMENTED)
         context.set_details('Method not implemented!')

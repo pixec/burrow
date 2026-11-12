@@ -1066,8 +1066,10 @@ none of them are avoidable:
   mount one read-only at once (`readOnly: true`), but not while a writer holds
   it, and a writer is refused while anything is reading. A filesystem a writer
   has mounted has a dirty journal, which a read-only mount cannot replay.
-- **A volume never moves.** The sandbox is placed on the node holding it.
-  Mounting one costs nothing in create latency: the node hotplugs it onto the
+- **A sandbox runs where its volume is.** It is placed on the node holding
+  the volume, which stays there unless it is durable: on a node with an object
+  store, a volume moves with a sandbox that mounts it, and another node takes
+  it once its own is written off. Mounting one costs nothing in create latency: the node hotplugs it onto the
   restored VM and the agent mounts it during the handshake.
 
 Mount paths must be absolute, may not overlap each other, and may not sit
@@ -1273,8 +1275,8 @@ works with `using` for scope-bound cleanup. Every method takes `signal` and
 ### Secrets
 
 Sandbox Kits ask for credentials by service name. A `Burrow` stores them. The
-value stays on the node and is injected into matching requests by the egress
-proxy, so a guest never holds it.
+orchestrator keeps the value sealed, and the egress proxy on the sandbox's node
+injects it into matching requests, so a guest never holds it.
 
 ```ts
 await burrow.setSecret("github", process.env.GITHUB_TOKEN);

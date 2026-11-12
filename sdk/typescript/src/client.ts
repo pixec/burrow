@@ -564,9 +564,9 @@ export class Burrow {
   }
 
   /**
-   * Stores a credential that Sandbox Kits ask for by service name. The value
-   * stays on the node and is injected into matching requests by the egress
-   * proxy, so a guest never holds it. `name` is lowercase kebab-case, the
+   * Stores a credential that Sandbox Kits ask for by service name. The
+   * orchestrator keeps it sealed, and the egress proxy on the sandbox's node
+   * injects it into matching requests, so a guest never holds it. `name` is lowercase kebab-case, the
    * `service` a Kit credential names.
    *
    * `scope` limits which sandboxes may use it, by id or name or by tag; a

@@ -2497,8 +2497,9 @@ impl Burrow for ApiService {
 
     /// Creates a volume on one node, which is then where it lives.
     ///
-    /// Placed like a sandbox, because that is what the choice decides: every
-    /// sandbox that ever mounts this volume is pinned to the node it lands on.
+    /// Placed like a sandbox, because that is what the choice decides: a
+    /// sandbox mounting this volume runs on the node holding it, which only a
+    /// durable volume ever leaves.
     async fn create_volume(
         &self,
         req: Request<api::CreateVolumeRequest>,
