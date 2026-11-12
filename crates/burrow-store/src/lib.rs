@@ -1345,13 +1345,41 @@ impl Store {
             .collect())
     }
 
-    pub async fn delete_node(&self, id: &str) -> Result<()> {
-        on_pool!(self, pool => sqlx::query("DELETE FROM nodes WHERE id=$1")
-            .bind(id)
-            .execute(pool)
-            .await
-            .map(drop))?;
-        Ok(())
+    /// Removes a node silent since before `before_ms`, for the leader of
+    /// `epoch` only. False when the node has been heard from since, or a
+    /// later leader has taken over.
+    pub async fn write_off_node(&self, id: &str, before_ms: i64, epoch: i64) -> Result<bool> {
+        let done = on_pool!(self, pool => sqlx::query(
+            "DELETE FROM nodes WHERE id=$1 AND last_heartbeat_ms < $2
+               AND (SELECT epoch FROM leader_epoch WHERE id=1) = $3",
+        )
+        .bind(id)
+        .bind(before_ms)
+        .bind(epoch)
+        .execute(pool)
+        .await
+        .map(|done| done.rows_affected()))?;
+        Ok(done == 1)
+    }
+
+    /// Starts a leader's term, returning its epoch.
+    pub async fn next_leader_epoch(&self) -> Result<i64> {
+        let (epoch,): (i64,) = on_pool!(self, pool => sqlx::query_as(
+            "UPDATE leader_epoch SET epoch = epoch + 1 WHERE id=1 RETURNING epoch",
+        )
+        .fetch_one(pool)
+        .await)?;
+        Ok(epoch)
+    }
+
+    /// The epoch of the current leader's term.
+    pub async fn leader_epoch(&self) -> Result<i64> {
+        let (epoch,): (i64,) = on_pool!(self, pool => sqlx::query_as(
+            "SELECT epoch FROM leader_epoch WHERE id=1",
+        )
+        .fetch_one(pool)
+        .await)?;
+        Ok(epoch)
     }
 
     /// Takes capacity on a node if it still has it, in one statement.
@@ -2443,6 +2471,31 @@ mod tests {
         let now = store.get_placement("a").await.unwrap().unwrap();
         assert_eq!(now.node_id, "n2");
         assert!(store.delete_placement_if("a", now.version).await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn a_node_is_written_off_only_by_the_current_leader_while_silent() {
+        let store = Store::open_in_memory().await.unwrap();
+        store
+            .register_node(
+                &NodeRow {
+                    id: "n1".into(),
+                    last_heartbeat_ms: 1_000,
+                    ..Default::default()
+                },
+                None,
+                8,
+            )
+            .await
+            .unwrap();
+        assert_eq!(store.leader_epoch().await.unwrap(), 0);
+        let deposed = store.next_leader_epoch().await.unwrap();
+        let current = store.next_leader_epoch().await.unwrap();
+        assert_eq!(store.leader_epoch().await.unwrap(), current);
+        assert!(!store.write_off_node("n1", 2_000, deposed).await.unwrap());
+        assert!(!store.write_off_node("n1", 500, current).await.unwrap());
+        assert!(store.write_off_node("n1", 2_000, current).await.unwrap());
+        assert!(store.list_nodes().await.unwrap().is_empty());
     }
 
     #[tokio::test]

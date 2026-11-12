@@ -174,8 +174,12 @@ async fn racing_claims_and_reservations_have_one_winner() {
     unique.dedup();
     assert_eq!(unique.len(), indexes.len() + 1);
 
+    let epoch = stores[0].leader_epoch().await.unwrap();
     for row in rows.iter().chain(std::iter::once(&node)) {
-        stores[0].delete_node(&row.id).await.unwrap();
+        stores[0]
+            .write_off_node(&row.id, i64::MAX, epoch)
+            .await
+            .unwrap();
     }
     stores[0].release_claims(&format!("{run}_0")).await.ok();
     for i in 0..8 {
@@ -304,4 +308,58 @@ async fn the_usage_ledger_commits_once_and_in_id_order_on_postgres() {
     };
     assert!(store.commit_usage(&closed).await.unwrap());
     assert!(store.open_usage(&sandbox).await.unwrap().is_none());
+}
+
+#[tokio::test]
+#[ignore]
+async fn placements_and_write_offs_are_conditional_on_postgres() {
+    let url = std::env::var("BURROW_TEST_DATABASE_URL").unwrap();
+    let store = Store::connect_postgres(&url).await.unwrap();
+    let id = format!("cas{}", std::process::id());
+    let row = |node: &str| PlacementRow {
+        id: id.clone(),
+        node_id: node.into(),
+        record: Vec::new(),
+        version: 0,
+    };
+    assert!(store.replace_placement(&row("cas-n1"), None).await.unwrap());
+    assert!(!store.replace_placement(&row("cas-n2"), None).await.unwrap());
+    let read = store.get_placement(&id).await.unwrap().unwrap();
+    assert!(
+        store
+            .replace_placement(&row("cas-n2"), Some(read.version))
+            .await
+            .unwrap()
+    );
+    assert!(
+        !store
+            .replace_placement(&row("cas-n3"), Some(read.version))
+            .await
+            .unwrap()
+    );
+    let now = store.get_placement(&id).await.unwrap().unwrap();
+    assert!(store.delete_placement_if(&id, now.version).await.unwrap());
+
+    let deposed = store.next_leader_epoch().await.unwrap();
+    let current = store.next_leader_epoch().await.unwrap();
+    assert_eq!(store.leader_epoch().await.unwrap(), current);
+    let node = burrow_store::NodeRow {
+        id: format!("writeoff{}", std::process::id()),
+        last_heartbeat_ms: 1_000,
+        ..Default::default()
+    };
+    store.register_node(&node, None, 4096).await.unwrap();
+    assert!(
+        !store
+            .write_off_node(&node.id, 2_000, deposed)
+            .await
+            .unwrap()
+    );
+    assert!(!store.write_off_node(&node.id, 500, current).await.unwrap());
+    assert!(
+        store
+            .write_off_node(&node.id, 2_000, current)
+            .await
+            .unwrap()
+    );
 }

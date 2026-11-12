@@ -691,37 +691,10 @@ async fn reap_dead_nodes(state: Arc<OrchestratorState>, expiry: Option<std::time
         if !state.leader.is_leader() {
             continue;
         }
-        for node_id in expiry.map(|e| state.nodes.expired(e)).unwrap_or_default() {
-            ledger::write_off_node(&state, &node_id).await;
-            let info = state.nodes.info(&node_id).unwrap_or_default();
-            let (dropped, unplaced) = state.sandboxes.forget_node(&node_id, &info);
-            if let Some(store) = &state.store
-                && let Err(err) = store.delete_node(&node_id).await
-            {
-                tracing::warn!(node_id, %err, "could not remove a written-off node from the store");
+        if let Some(expiry) = expiry {
+            for node_id in state.nodes.expired(expiry) {
+                write_off_node(&state, &node_id, expiry).await;
             }
-            // Its snapshots go with it: they only ever existed on that node.
-            // Its durable volumes stay, to be taken from it.
-            state.snapshots.forget_node(&node_id);
-            let volumes = state.volumes.forget_node(&node_id);
-            state.nodes.remove_node(&node_id);
-            for sandbox in unplaced.iter().filter(|s| !s.public_ips.is_empty()) {
-                tracing::warn!(
-                    node_id,
-                    sandbox = sandbox.id,
-                    "sandbox holds public addresses that reach only this node; it stays \
-                     unplaced until the node returns or its addresses are detached"
-                );
-            }
-            tracing::warn!(
-                node_id,
-                placements = dropped.len(),
-                names = dropped.iter().filter(|s| !s.name.is_empty()).count(),
-                unplaced = unplaced.len(),
-                volumes,
-                "node has been silent past its expiry; forgetting it and every \
-                 placement recorded against it, except those the object store can bring back"
-            );
         }
         let pruned = state
             .sandboxes
@@ -744,6 +717,56 @@ async fn reap_dead_nodes(state: Arc<OrchestratorState>, expiry: Option<std::time
             }
         }
     }
+}
+
+/// Writes off one node, if this replica still leads and the node is still
+/// silent in the store, which another replica's heartbeat may have updated
+/// since this one read it. Returns whether it did.
+async fn write_off_node(
+    state: &OrchestratorState,
+    node_id: &str,
+    expiry: std::time::Duration,
+) -> bool {
+    let Some(epoch) = state.leader.epoch() else {
+        return false;
+    };
+    if let Some(store) = &state.store {
+        let before = burrow_common::unix_now_ms() - expiry.as_millis() as i64;
+        match store.write_off_node(node_id, before, epoch).await {
+            Ok(true) => {}
+            Ok(false) => return false,
+            Err(err) => {
+                tracing::warn!(node_id, %err, "could not write off a node in the store");
+                return false;
+            }
+        }
+    }
+    ledger::write_off_node(state, node_id).await;
+    let info = state.nodes.info(node_id).unwrap_or_default();
+    let (dropped, unplaced) = state.sandboxes.forget_node(node_id, &info);
+    // Its snapshots go with it: they only ever existed on that node.
+    // Its durable volumes stay, to be taken from it.
+    state.snapshots.forget_node(node_id);
+    let volumes = state.volumes.forget_node(node_id);
+    state.nodes.remove_node(node_id);
+    for sandbox in unplaced.iter().filter(|s| !s.public_ips.is_empty()) {
+        tracing::warn!(
+            node_id,
+            sandbox = sandbox.id,
+            "sandbox holds public addresses that reach only this node; it stays \
+             unplaced until the node returns or its addresses are detached"
+        );
+    }
+    tracing::warn!(
+        node_id,
+        placements = dropped.len(),
+        names = dropped.iter().filter(|s| !s.name.is_empty()).count(),
+        unplaced = unplaced.len(),
+        volumes,
+        "node has been silent past its expiry; forgetting it and every \
+         placement recorded against it, except those the object store can bring back"
+    );
+    true
 }
 
 #[tokio::main]

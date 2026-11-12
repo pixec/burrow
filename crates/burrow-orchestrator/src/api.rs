@@ -4072,6 +4072,46 @@ mod tests {
         assert!(err.message().contains("already being placed"), "{err}");
     }
 
+    /// A leader that lost its term without noticing yet wrote nodes off on
+    /// its own stale view, as did one whose cache had not caught up with a
+    /// heartbeat another replica took.
+    #[tokio::test]
+    async fn only_the_current_leader_writes_off_a_node_still_silent() {
+        let store = Arc::new(burrow_store::Store::open_in_memory().await.unwrap());
+        let row = |last_heartbeat_ms| burrow_store::NodeRow {
+            id: "node1".into(),
+            last_heartbeat_ms,
+            ..Default::default()
+        };
+        store.register_node(&row(1_000), None, 8).await.unwrap();
+        let deposed = store.next_leader_epoch().await.unwrap();
+        let current = store.next_leader_epoch().await.unwrap();
+        let leader = |epoch| {
+            let mut state = Arc::try_unwrap(replica(Default::default()).0).ok().unwrap();
+            state.store = Some(Arc::clone(&store));
+            state.leader = crate::leader::Leader::holding(epoch);
+            let api = ApiService(Arc::new(state));
+            api.0.sandboxes.insert(sandbox_a("node1"));
+            api
+        };
+        let expiry = std::time::Duration::from_secs(60);
+
+        for epoch in [None, Some(deposed)] {
+            let api = leader(epoch);
+            assert!(!crate::write_off_node(&api.0, "node1", expiry).await);
+            assert_eq!(api.0.sandboxes.node_of("sbx_a").as_deref(), Some("node1"));
+        }
+        store
+            .heartbeat_node(&row(burrow_common::unix_now_ms()))
+            .await
+            .unwrap();
+        assert!(!crate::write_off_node(&leader(Some(current)).0, "node1", expiry).await);
+        store.heartbeat_node(&row(1_000)).await.unwrap();
+        let api = leader(Some(current));
+        assert!(crate::write_off_node(&api.0, "node1", expiry).await);
+        assert_eq!(api.0.sandboxes.node_of("sbx_a").as_deref(), Some(""));
+    }
+
     /// A replica over a store holding `sbx_a`'s address 203.0.113.17, which
     /// reaches node1.
     async fn pinned(sandbox: common::Sandbox, nodes: &[&str]) -> ApiService {
