@@ -1,13 +1,25 @@
 [build-system]
-requires = ["hatchling"]
+requires = ["hatchling>=1.27"]
 build-backend = "hatchling.build"
 
 [project]
 name = "pixec-burrow"
 version = "0.1.0"
-description = "Python client for Burrow, sandboxes that run untrusted code in Firecracker microVMs"
-license = { text = "AGPL-3.0-only" }
+description = "Python client for Burrow, self-hosted microVM sandboxes for running untrusted code"
+readme = "README.md"
+license = "MIT"
+license-files = ["LICENSE"]
 requires-python = ">=3.9"
+authors = [{ name = "Pixec Technologies", email = "oss+burrow@pixec.net" }]
+keywords = ["sandbox", "microvm", "firecracker", "cloud-hypervisor", "agents"]
+classifiers = [
+  "Development Status :: 4 - Beta",
+  "Intended Audience :: Developers",
+  "Operating System :: OS Independent",
+  "Programming Language :: Python :: 3",
+  "Topic :: Software Development :: Libraries",
+  "Typing :: Typed",
+]
 # Floors match what the committed `_pb` modules were generated against:
 # api_pb2_grpc.py refuses grpcio older than 1.80, and api_pb2.py validates
 # the protobuf runtime at 6.31.1. Older wheels fail at import, not at use.
@@ -17,6 +29,13 @@ dependencies = ["grpcio>=1.80", "protobuf>=6.31"]
 # Pinned to the release that produced the committed `_pb`, so a regenerate
 # does not silently move the runtime floors above.
 dev = ["grpcio-tools==1.80.0", "pytest>=7"]
+
+[project.urls]
+Homepage = "https://burrow.pixec.net"
+Documentation = "https://burrow.pixec.net/sdk/python/overview"
+
+[tool.hatch.build.targets.sdist]
+include = ["src", "tests", "README.md", "LICENSE"]
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/burrow"]

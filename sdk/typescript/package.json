@@ -1,8 +1,11 @@
 {
   "name": "@pixec/burrow",
   "version": "0.1.0",
-  "description": "TypeScript client for Burrow, sandboxes that run untrusted code in Firecracker microVMs",
-  "license": "AGPL-3.0-only",
+  "description": "TypeScript client for Burrow, self-hosted microVM sandboxes for running untrusted code",
+  "license": "MIT",
+  "author": "Pixec Technologies <oss+burrow@pixec.net>",
+  "homepage": "https://burrow.pixec.net",
+  "keywords": ["sandbox", "microvm", "firecracker", "cloud-hypervisor", "agents"],
   "type": "module",
   "main": "./dist/index.js",
   "types": "./dist/index.d.ts",
@@ -16,11 +19,14 @@
     "dist",
     "proto"
   ],
+  "publishConfig": {
+    "access": "public"
+  },
   "engines": {
     "node": ">=18"
   },
   "scripts": {
-    "sync-protos": "cp ../../crates/burrow-proto/proto/*.proto proto/",
+    "sync-protos": "cp ../../crates/burrow-proto/proto/api.proto ../../crates/burrow-proto/proto/common.proto proto/",
     "build": "npm run sync-protos && tsc",
     "prepublishOnly": "npm run build",
     "typecheck": "tsc --noEmit",
