@@ -34,10 +34,12 @@ const CANDIDATES: [&str; 2] = ["/usr/lib/systemd/systemd", "/lib/systemd/systemd
 /// cloud-init waits on a datasource there is none of. The clock is set from
 /// the host before a handshake returns, so nothing has to wait for NTP, and
 /// udev-settle waits on hardware a microVM does not have. The package
-/// managers' timers take the package lock out from under a user's own install.
+/// managers' timers take the package lock out from under a user's own install,
+/// and snapd's seeding waits on the Snap Store and holds multi-user.target
+/// back for as long as it is out of reach.
 ///
 /// A template unmasks any of them with `burrow.systemd.unmask=`.
-const MASKED: [&str; 24] = [
+const MASKED: [&str; 25] = [
     "console-getty.service",
     "getty@.service",
     "serial-getty@.service",
@@ -62,10 +64,15 @@ const MASKED: [&str; 24] = [
     "apt-daily.timer",
     "apt-daily-upgrade.timer",
     "dnf-makecache.timer",
+    "snapd.seeded.service",
 ];
 
 /// Masked on a kernel built without module support, where they can only fail.
 const MODULE_UNITS: [&str; 2] = ["systemd-modules-load.service", "modprobe@.service"];
+
+/// Masked in a guest with no TPM, such as any Firecracker one, where they can
+/// only fail and leave systemd degraded.
+const TPM_UNITS: [&str; 2] = ["tpm-udev.path", "tpm-udev.service"];
 
 const CGROUP_ROOT: &str = "/sys/fs/cgroup";
 
@@ -109,11 +116,13 @@ fn is_ready_at_agent() -> bool {
 }
 
 /// What to mask on this boot: [`MASKED`], the module units on a kernel that
-/// cannot load modules, less whatever the template unmasked.
-fn masks(unmasked: &str, is_modular: bool) -> Vec<&'static str> {
+/// cannot load modules, the TPM units in a guest without one, less whatever
+/// the template unmasked.
+fn masks(unmasked: &str, is_modular: bool, has_tpm: bool) -> Vec<&'static str> {
     MASKED
         .into_iter()
         .chain(MODULE_UNITS.into_iter().filter(|_| !is_modular))
+        .chain(TPM_UNITS.into_iter().filter(|_| !has_tpm))
         .filter(|unit| !unmasked.split(',').any(|kept| kept == *unit))
         .collect()
 }
@@ -360,8 +369,9 @@ fn spawn(binary: &'static str) -> std::io::Result<i32> {
     // the kernel's. Status goes to /dev/console whatever stdout is.
     let unmasked = boot_arg("burrow.systemd.unmask=").unwrap_or_default();
     let is_modular = std::path::Path::new("/proc/modules").exists();
+    let has_tpm = std::fs::read_dir("/sys/class/tpm").is_ok_and(|mut dir| dir.next().is_some());
     command.args(
-        masks(&unmasked, is_modular)
+        masks(&unmasked, is_modular, has_tpm)
             .into_iter()
             .map(|unit| format!("systemd.mask={unit}")),
     );
@@ -534,7 +544,7 @@ mod tests {
 
     #[test]
     fn a_template_unmasks_only_what_it_names() {
-        let masked = masks("chrony-wait.service,apt-daily.timer", true);
+        let masked = masks("chrony-wait.service,apt-daily.timer", true, true);
         assert!(!masked.contains(&"chrony-wait.service"));
         assert!(!masked.contains(&"apt-daily.timer"));
         assert!(masked.contains(&"systemd-networkd.service"));
@@ -543,8 +553,15 @@ mod tests {
 
     #[test]
     fn module_units_are_masked_only_without_module_support() {
-        assert!(!masks("", true).contains(&"modprobe@.service"));
-        assert!(masks("", false).contains(&"modprobe@.service"));
-        assert!(!masks("modprobe@.service", false).contains(&"modprobe@.service"));
+        assert!(!masks("", true, true).contains(&"modprobe@.service"));
+        assert!(masks("", false, true).contains(&"modprobe@.service"));
+        assert!(!masks("modprobe@.service", false, true).contains(&"modprobe@.service"));
+    }
+
+    #[test]
+    fn tpm_units_are_masked_only_without_a_tpm() {
+        assert!(!masks("", true, true).contains(&"tpm-udev.service"));
+        assert!(masks("", true, false).contains(&"tpm-udev.path"));
+        assert!(!masks("tpm-udev.path", true, false).contains(&"tpm-udev.path"));
     }
 }
