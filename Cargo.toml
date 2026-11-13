@@ -77,7 +77,7 @@ tokio-vsock = "0.7"
 rtnetlink = "0.23"
 netlink-packet-route = "0.33"
 futures = "0.3"
-nix = { version = "0.31", features = ["mount", "process", "fs", "time", "ioctl", "signal", "term", "socket", "uio", "mman", "poll"] }
+nix = { version = "0.31", features = ["mount", "process", "fs", "time", "ioctl", "signal", "term", "socket", "uio", "mman", "poll", "hostname"] }
 tower = "0.5"
 async-stream = "0.3"
 userfaultfd = "0.8"
@@ -105,3 +105,9 @@ reqwest = { version = "0.12", default-features = false, features = ["rustls-tls-
 flate2 = "1"
 memchr = "2"
 tar = "0.4"
+
+# The guest agent runs from a restored snapshot, where every page it touches
+# for the first time costs a fault: a smaller binary touches fewer of them.
+[profile.release.package.burrow-guest]
+opt-level = "s"
+codegen-units = 1
