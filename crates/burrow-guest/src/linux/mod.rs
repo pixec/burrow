@@ -137,6 +137,36 @@ pub async fn root_disk(req: guestpb::RootDiskRequest) -> Result<guestpb::RootDis
     })
 }
 
+/// Names the guest, and makes the name resolve without DNS as an image's own
+/// name would.
+fn set_hostname(hostname: &str) -> std::io::Result<()> {
+    const PATH: &str = "/etc/hosts";
+    nix::unistd::sethostname(hostname)?;
+    let current = std::fs::read_to_string(PATH).unwrap_or_default();
+    let entry = format!("127.0.1.1\t{hostname}");
+    if current.lines().any(|line| line == entry) {
+        return Ok(());
+    }
+    let mut hosts: String = current
+        .lines()
+        .filter(|line| !line.starts_with("127.0.1.1"))
+        .map(|line| format!("{line}\n"))
+        .collect();
+    if hosts.is_empty() {
+        hosts.push_str("127.0.0.1\tlocalhost\n::1\tlocalhost\n");
+    }
+    hosts.push_str(&entry);
+    hosts.push('\n');
+    // Not truncated first, for the reason resolv.conf is not.
+    let mut file = std::fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(PATH)?;
+    std::io::Write::write_all(&mut file, hosts.as_bytes())?;
+    file.set_len(hosts.len() as u64)
+}
+
 pub async fn handshake(
     arrival: Option<vsock::Arrival>,
     req: guestpb::HandshakeRequest,
@@ -191,7 +221,7 @@ pub async fn handshake(
         return Err(Status::internal(format!("applying the network: {err}")));
     }
     if !req.hostname.is_empty()
-        && let Err(err) = nix::unistd::sethostname(&req.hostname)
+        && let Err(err) = set_hostname(&req.hostname)
     {
         tracing::warn!(%err, "could not set the hostname");
     }
