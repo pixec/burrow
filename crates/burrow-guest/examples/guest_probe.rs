@@ -246,6 +246,7 @@ mod probe {
                     is_created_if_missing: true,
                 }],
                 volumes: vec![],
+                hostname: String::new(),
             })
             .await;
         let digest = match &handshake {

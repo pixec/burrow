@@ -399,6 +399,8 @@ message HandshakeRequest {
   // first: a resumed guest has the devices but not the mounts, since a mount
   // does not survive the VM it was made in.
   repeated VolumeMount volumes = 7;
+  // The guest's hostname. Empty leaves it as it is.
+  string hostname = 8;
 }
 
 // Deliberately not burrow.common.v1.VolumeMount: the guest protocol versions

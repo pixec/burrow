@@ -190,6 +190,11 @@ pub async fn handshake(
         tracing::error!(%err, "failed to apply the network");
         return Err(Status::internal(format!("applying the network: {err}")));
     }
+    if !req.hostname.is_empty()
+        && let Err(err) = nix::unistd::sethostname(&req.hostname)
+    {
+        tracing::warn!(%err, "could not set the hostname");
+    }
     // A root disk the host grew while the guest was down is filled here,
     // online, on the boot that first sees it. Only a boot: a restored guest
     // keeps the disk size its memory holds, and one grown under it since is

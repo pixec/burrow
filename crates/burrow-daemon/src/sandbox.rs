@@ -7067,7 +7067,7 @@ impl SandboxManager {
                 "{} {} init=/usr/bin/burrow-guest {} burrow.dns={} burrow.ip6={}/{} burrow.ip6gw={} {} {}",
                 burrow_vmm::DEFAULT_BOOT_ARGS,
                 crate::rootdisk::BOOT_ARGS,
-                lease.kernel_ip_arg(),
+                lease.kernel_ip_arg(&guestconn::hostname(id)),
                 lease.host_ip,
                 lease.guest_ip6(),
                 lease.prefix_len6(),
@@ -7814,6 +7814,7 @@ impl SandboxManager {
             self.inspection_ca_for(&policy),
             self.trust_bundles_for(&template, &policy).await,
             crate::volume::agent_mounts(&policy.volumes, guest_os),
+            guestconn::hostname(&id),
         );
         let inspected = !request.inspection_ca_pem.is_empty();
         let inspection_root = self.inspection_root_of(&request);
@@ -8832,6 +8833,7 @@ impl SandboxManager {
                 true => Vec::new(),
                 false => crate::volume::agent_mounts(&policy.volumes, guest_os),
             },
+            guestconn::hostname(&id),
         );
         let inspection_root = self.inspection_root_of(&request);
         phases.mark("attach");
@@ -8949,6 +8951,7 @@ impl SandboxManager {
         // holds it has nothing to do.
         let policy = record.policy.clone().unwrap_or_default();
         let mut request = guestconn::handshake_request(true);
+        request.hostname = guestconn::hostname(id);
         request.network = self
             .guest_network(
                 &sandbox.lease,
@@ -9224,6 +9227,7 @@ impl SandboxManager {
             self.inspection_ca_for(&policy),
             self.trust_bundles_in(&environment, &policy),
             crate::volume::agent_mounts(&policy.volumes, guest_os),
+            guestconn::hostname(id),
         );
         if let Err(err) = sandbox
             .boot(

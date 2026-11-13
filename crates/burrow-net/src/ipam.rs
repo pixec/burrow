@@ -109,9 +109,9 @@ impl Lease {
 
     /// Kernel command line fragment that configures the guest NIC at boot,
     /// avoiding any need for DHCP inside the sandbox.
-    pub fn kernel_ip_arg(&self) -> String {
+    pub fn kernel_ip_arg(&self, hostname: &str) -> String {
         format!(
-            "ip={}::{}:{}::eth0:off",
+            "ip={}::{}:{}:{hostname}:eth0:off",
             self.guest_ip,
             self.host_ip,
             self.netmask()

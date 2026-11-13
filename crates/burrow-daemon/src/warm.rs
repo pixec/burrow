@@ -717,7 +717,7 @@ pub async fn build_warm_snapshot(
             "{} {} init=/usr/bin/burrow-guest {} {} {}",
             burrow_vmm::DEFAULT_BOOT_ARGS,
             crate::rootdisk::BOOT_ARGS,
-            lease.kernel_ip_arg(),
+            lease.kernel_ip_arg(""),
             crate::sandbox::guest_mode_arg(environment.booted_systemd(), true),
             crate::sandbox::guest_boot_args(&config.extra_boot_args, config.is_console_verbose)
         ),
@@ -934,6 +934,7 @@ async fn exercise_agent(
             // A warm snapshot is shared by every sandbox restored from it, so
             // it must not carry any one sandbox's volumes.
             Vec::new(),
+            String::new(),
         ),
         upgrade,
         agent_timeout,

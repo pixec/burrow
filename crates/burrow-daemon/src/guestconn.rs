@@ -127,7 +127,14 @@ pub fn handshake_with_network(
     restored: bool,
     network: Option<burrow_proto::guest::v1::NetworkConfig>,
 ) -> burrow_proto::guest::v1::HandshakeRequest {
-    handshake_full(restored, network, String::new(), Vec::new(), Vec::new())
+    handshake_full(
+        restored,
+        network,
+        String::new(),
+        Vec::new(),
+        Vec::new(),
+        String::new(),
+    )
 }
 
 /// Handshake carrying the inspection CA as well.
@@ -142,6 +149,7 @@ pub fn handshake_full(
     inspection_ca_pem: String,
     extra_trust_bundles: Vec<burrow_proto::guest::v1::TrustBundle>,
     volumes: Vec<burrow_proto::guest::v1::VolumeMount>,
+    hostname: String,
 ) -> burrow_proto::guest::v1::HandshakeRequest {
     burrow_proto::guest::v1::HandshakeRequest {
         inspection_ca_pem,
@@ -151,7 +159,13 @@ pub fn handshake_full(
         is_restored: restored,
         network,
         volumes,
+        hostname,
     }
+}
+
+/// The hostname a sandbox's guest runs under: its id, made a valid host name.
+pub fn hostname(sandbox_id: &str) -> String {
+    sandbox_id.replace('_', "-")
 }
 
 /// The request with the host clock read now, as it goes out: the guest steps
