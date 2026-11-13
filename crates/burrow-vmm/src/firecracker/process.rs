@@ -1,12 +1,12 @@
 //! Spawning and supervising a `firecracker` process.
 
 use std::path::{Path, PathBuf};
-use std::process::Stdio;
 use std::time::{Duration, Instant};
 
 use tokio::io::AsyncWriteExt;
-use tokio::process::{Child, ChildStdin, Command};
+use tokio::net::unix::pipe;
 
+use crate::child::Child;
 use crate::error::{Error, Result};
 
 /// How long to wait for firecracker to create its API socket.
@@ -112,7 +112,7 @@ pub struct FcProcess {
     console_log: PathBuf,
     /// Firecracker's stdin is wired to the guest serial port, giving us a way
     /// to drive a guest that has no agent yet (dev and rescue only).
-    console_in: Option<ChildStdin>,
+    console_in: Option<pipe::Sender>,
 }
 
 impl FcProcess {
@@ -162,67 +162,56 @@ impl FcProcess {
 
         phases.mark("prespawn");
         let id = sanitize_vm_id(vm_id);
-        let mut command = match jail {
+        let mut args: Vec<std::ffi::OsString> = Vec::new();
+        let program = match jail {
             None => {
-                let mut command = Command::new(binary);
-                command
-                    .current_dir(workdir)
-                    .args(["--api-sock", api_sock, "--id", &id]);
-                if enable_pci {
-                    command.arg("--enable-pci");
-                }
-                command
+                args.extend(["--api-sock", api_sock, "--id", &id].map(Into::into));
+                binary
             }
             Some(jail) => {
                 // Everything the VM needs is already inside the chroot, and
                 // every path handed to the API is relative, so firecracker's
-                // view of them is unchanged by the pivot.
-                let mut command = Command::new(&jail.jailer);
-                command.args([
-                    "--id",
-                    &id,
-                    "--exec-file",
-                    &binary.to_string_lossy(),
-                    "--uid",
-                    &jail.uid.to_string(),
-                    "--gid",
-                    &jail.gid.to_string(),
-                    "--chroot-base-dir",
-                    &jail.chroot_base.to_string_lossy(),
-                    // v2 with no --cgroup means the jailer touches no cgroup at
-                    // all, leaving the limits burrow applies by pid intact.
-                    "--cgroup-version",
-                    "2",
-                    "--",
-                    "--api-sock",
-                    api_sock,
+                // view of them is unchanged by the pivot. v2 with no --cgroup
+                // has the jailer touch no cgroup: the VMM is cloned into its
+                // own already.
+                args.extend([
+                    "--id".into(),
+                    id.into(),
+                    "--exec-file".into(),
+                    binary.into(),
+                    "--uid".into(),
+                    jail.uid.to_string().into(),
+                    "--gid".into(),
+                    jail.gid.to_string().into(),
+                    "--chroot-base-dir".into(),
+                    jail.chroot_base.clone().into(),
                 ]);
-                if enable_pci {
-                    command.arg("--enable-pci");
-                }
-                command
+                args.extend(
+                    ["--cgroup-version", "2", "--", "--api-sock", api_sock].map(Into::into),
+                );
+                &jail.jailer
             }
         };
-
-        // The jailer execs firecracker in place, so what joins here before
-        // the jailer runs is firecracker itself.
-        if let Some(cgroup) = cgroup {
-            cgroup.join_before_exec(&mut command)?;
+        if enable_pci {
+            args.push("--enable-pci".into());
         }
-        let mut child = command
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .kill_on_drop(true)
-            .spawn()?;
+        // The jailer execs firecracker in place, so what is cloned into the
+        // cgroup here is firecracker itself.
+        let spawned = crate::child::spawn(
+            program,
+            &args,
+            workdir,
+            cgroup.map(crate::cgroup::Cgroup::path),
+        )?;
+        let child = spawned.child;
 
         let outputs: Vec<Box<dyn tokio::io::AsyncRead + Unpin + Send>> = vec![
-            Box::new(child.stdout.take().expect("stdout is piped")),
-            Box::new(child.stderr.take().expect("stderr is piped")),
+            Box::new(pipe::Receiver::from_owned_fd(spawned.stdout)?),
+            Box::new(pipe::Receiver::from_owned_fd(spawned.stderr)?),
         ];
         crate::console::capture(workdir, outputs)?;
         phases.mark("spawn");
-        let console_in = child.stdin.take();
+        let console_in = Some(pipe::Sender::from_owned_fd(spawned.stdin)?);
         let mut proc = Self {
             child,
             workdir: workdir.to_path_buf(),

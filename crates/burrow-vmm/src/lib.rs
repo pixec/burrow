@@ -13,6 +13,7 @@
 //! the wrong thing quietly.
 
 mod cgroup;
+mod child;
 pub mod console;
 mod error;
 mod guest;
