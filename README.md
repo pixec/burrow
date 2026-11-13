@@ -4,8 +4,8 @@ MicroVM sandboxes for untrusted code, run on your own hardware.
 
 [![License: AGPL-3.0](https://img.shields.io/badge/license-AGPL--3.0-blue.svg)](LICENSE)
 [![Releases](https://img.shields.io/github/v/release/pixec/burrow?display_name=tag)](https://github.com/pixec/burrow/releases)
-[![TypeScript SDK](https://img.shields.io/npm/v/%40pixec%2Fburrow?label=npm)](https://www.npmjs.com/package/@pixec/burrow)
-[![Python SDK](https://img.shields.io/pypi/v/pixec-burrow?label=pypi)](https://pypi.org/project/pixec-burrow/)
+[![TypeScript SDK](https://img.shields.io/npm/v/%40pixec%2Fburrow?label=npm&cacheSeconds=3600)](https://www.npmjs.com/package/@pixec/burrow)
+[![Python SDK](https://img.shields.io/pypi/v/pixec-burrow?label=pypi&cacheSeconds=3600)](https://pypi.org/project/pixec-burrow/)
 
 ## Sponsors
 

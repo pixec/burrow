@@ -3,7 +3,7 @@
 The Python SDK for [Burrow](https://burrow.pixec.net): microVM sandboxes for untrusted code, run on your own hardware.
 
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
-[![PyPI](https://img.shields.io/pypi/v/pixec-burrow?label=pypi)](https://pypi.org/project/pixec-burrow/)
+[![PyPI](https://img.shields.io/pypi/v/pixec-burrow?label=pypi&cacheSeconds=3600)](https://pypi.org/project/pixec-burrow/)
 
 ## Install
 

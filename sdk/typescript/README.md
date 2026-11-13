@@ -3,7 +3,7 @@
 The TypeScript SDK for [Burrow](https://burrow.pixec.net): microVM sandboxes for untrusted code, run on your own hardware.
 
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
-[![npm](https://img.shields.io/npm/v/%40pixec%2Fburrow?label=npm)](https://www.npmjs.com/package/@pixec/burrow)
+[![npm](https://img.shields.io/npm/v/%40pixec%2Fburrow?label=npm&cacheSeconds=3600)](https://www.npmjs.com/package/@pixec/burrow)
 
 ## Install
 
