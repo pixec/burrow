@@ -840,6 +840,7 @@ dependencies = [
  "burrow-proxy",
  "burrow-vmm",
  "libc",
+ "rtnetlink",
  "serde_json",
  "smoltcp",
  "socket2 0.5.10",

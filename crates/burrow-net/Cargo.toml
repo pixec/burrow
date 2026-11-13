@@ -27,6 +27,9 @@ burrow-proxy = { workspace = true, optional = true }
 boringtun = { version = "0.7", default-features = false, optional = true }
 x25519-dalek = { version = "2", features = ["static_secrets", "getrandom"], optional = true }
 
+[target.'cfg(target_os = "linux")'.dependencies]
+rtnetlink = { workspace = true }
+
 [features]
 usernet = ["dep:smoltcp", "dep:burrow-proxy", "dep:boringtun", "dep:x25519-dalek"]
 
