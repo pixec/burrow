@@ -21,6 +21,13 @@
 //! worker that cannot write them back. At a hard limit those dirty and
 //! writeback pages got the VMM killed; over `memory.high` they are throttled
 //! and reclaimed as they are written back.
+//!
+//! A snapshot is the exception: it writes the whole guest, or every page it
+//! dirtied, through the page cache at once. Charged against a ceiling sized to
+//! the guest, that write was held to the disk's writeback speed and reclaimed
+//! the running guest into swap to make room, so a paused guest stayed paused
+//! for seconds. The VMM writes it from [`SNAPSHOT_CGROUP`] instead, which has
+//! no limits, and its pages are reclaimed as ordinary page cache.
 
 use std::path::{Path, PathBuf};
 
@@ -36,6 +43,8 @@ const CPU_PERIOD_US: u64 = 100_000;
 /// What `memory.max` allows past the ceiling, at least: room for page cache
 /// under writeback to drain in, so only a runaway VMM reaches the hard limit.
 const MEMORY_BOUND_MIN_MIB: u32 = 512;
+/// The cgroup beside every VMM's that a snapshot is written from.
+const SNAPSHOT_CGROUP: &str = "_snapshot";
 /// Times the processes are moved out before delegation is given up on. A
 /// process spawned just before the move is still in the cgroup, so one pass is
 /// not always enough.
@@ -190,6 +199,26 @@ impl Cgroup {
         &self.path
     }
 
+    /// Moves the VMM to [`SNAPSHOT_CGROUP`] until the returned guard drops,
+    /// for the length of a snapshot. Only for a paused guest: its vCPUs run
+    /// without the cgroup's CPU limits until then.
+    pub(crate) fn snapshotting(&self) -> Result<Snapshotting<'_>> {
+        let parent = self.path.parent().unwrap_or(&self.path);
+        let outside = parent.join(SNAPSHOT_CGROUP);
+        if !outside.exists() {
+            std::fs::create_dir_all(&outside)?;
+        }
+        let pids = std::fs::read_to_string(self.path.join("cgroup.procs"))?;
+        let guard = Snapshotting {
+            home: self,
+            pids: pids.split_whitespace().map(String::from).collect(),
+        };
+        for pid in &guard.pids {
+            write(&outside.join("cgroup.procs"), pid)?;
+        }
+        Ok(guard)
+    }
+
     /// Host CPU this cgroup has consumed, in microseconds.
     ///
     /// The same `cpu` controller that enforces `cpu.max` also accounts for it,
@@ -209,6 +238,28 @@ impl Cgroup {
     pub fn remove(&self) {
         if let Err(err) = std::fs::remove_dir(&self.path) {
             tracing::debug!(path = %self.path.display(), %err, "could not remove cgroup");
+        }
+    }
+}
+
+/// A VMM moved out of its cgroup for a snapshot, which it rejoins on drop.
+pub(crate) struct Snapshotting<'a> {
+    home: &'a Cgroup,
+    pids: Vec<String>,
+}
+
+impl Drop for Snapshotting<'_> {
+    fn drop(&mut self) {
+        let procs = self.home.path.join("cgroup.procs");
+        for pid in &self.pids {
+            if let Err(err) = write(&procs, pid) {
+                tracing::warn!(
+                    cgroup = %self.home.path.display(),
+                    pid,
+                    %err,
+                    "could not return a vmm to its cgroup after a snapshot"
+                );
+            }
         }
     }
 }
@@ -368,6 +419,28 @@ mod tests {
             std::fs::write(path.join(file), "").unwrap();
         }
         Cgroup { path }
+    }
+
+    /// A snapshot is written from outside the VMM's cgroup, and the VMM is
+    /// back in its own once the snapshot ends.
+    #[test]
+    fn a_snapshot_is_written_outside_the_vmm_cgroup() {
+        let root = fake("snapshotting", &[]).path;
+        let cgroup = Cgroup {
+            path: root.join("vm"),
+        };
+        std::fs::create_dir_all(&cgroup.path).unwrap();
+        std::fs::write(cgroup.path.join("cgroup.procs"), "41\n").unwrap();
+        let outside = root.join(SNAPSHOT_CGROUP).join("cgroup.procs");
+        let guard = cgroup.snapshotting().unwrap();
+        assert_eq!(std::fs::read_to_string(&outside).unwrap(), "41");
+        std::fs::write(cgroup.path.join("cgroup.procs"), "").unwrap();
+        drop(guard);
+        assert_eq!(
+            std::fs::read_to_string(cgroup.path.join("cgroup.procs")).unwrap(),
+            "41"
+        );
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]

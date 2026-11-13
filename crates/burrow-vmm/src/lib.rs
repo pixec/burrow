@@ -627,6 +627,7 @@ impl Vm {
 
     /// Snapshots a **paused** VM in full, into its [`Layout`].
     pub async fn snapshot(&self) -> Result<()> {
+        let _outside = self.snapshotting();
         match self {
             Self::Firecracker(vm) => Ok(vm.snapshot(firecracker::SnapshotType::Full).await?),
             Self::CloudHypervisor(vm) => vm.snapshot().await,
@@ -639,6 +640,7 @@ impl Vm {
     /// the memory it was restored from. Only where
     /// [`Capabilities::is_diff_snapshot_supported`].
     pub async fn snapshot_diff(&self, mem_file: &str) -> Result<()> {
+        let _outside = self.snapshotting();
         match self {
             Self::Firecracker(vm) => Ok(vm
                 .snapshot_to(firecracker::SnapshotType::Diff, mem_file)
@@ -653,6 +655,24 @@ impl Vm {
                 what: "take a diff snapshot",
             }),
         }
+    }
+
+    /// Moves the VMM out of its cgroup for a snapshot, so the page cache the
+    /// write fills is not charged against the guest's memory ceiling. A VMM
+    /// that cannot be moved snapshots where it is, only slower.
+    fn snapshotting(&self) -> Option<cgroup::Snapshotting<'_>> {
+        let cgroup = match self {
+            Self::Firecracker(vm) => vm.cgroup(),
+            Self::CloudHypervisor(vm) => vm.cgroup(),
+            #[cfg(target_os = "macos")]
+            Self::Vz(_) => None,
+        }?;
+        cgroup
+            .snapshotting()
+            .inspect_err(
+                |err| tracing::warn!(%err, "could not move the vmm out of its cgroup to snapshot"),
+            )
+            .ok()
     }
 
     /// Whether a diff taken now would know exactly which pages it holds. A
