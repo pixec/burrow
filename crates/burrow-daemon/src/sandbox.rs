@@ -2111,14 +2111,20 @@ impl RunningSandbox {
     /// Also clones each `(image, dest)` in `also` while the guest is paused,
     /// so volumes are captured at the instant its memory is. Returns how long
     /// the guest was paused.
+    ///
+    /// `is_synced` has the guest write its page cache back first, for a
+    /// capture that may outlive the memory it was taken with.
     async fn checkpoint(
         &self,
         capture: Option<&Path>,
         also: &[(PathBuf, PathBuf)],
+        is_synced: bool,
     ) -> Result<std::time::Duration, Status> {
         // As in a suspend: a fork restores whatever the snapshot caught.
         self.await_handshake().await?;
-        self.sync_guest().await;
+        if is_synced {
+            self.sync_guest().await;
+        }
         let mut slot = self.vm.lock().await;
         let Some(vm) = slot.as_ref() else {
             return Err(Status::failed_precondition(
@@ -2164,7 +2170,7 @@ impl RunningSandbox {
         // snapshot does not.
         self.logs.mark_checkpoint();
 
-        let flattened = {
+        {
             let mut current = self.memory_chain.lock().await;
             if diff {
                 current.push(next);
@@ -2172,8 +2178,7 @@ impl RunningSandbox {
                 *current = self.layout().memory.map(String::from).into_iter().collect();
                 Self::remove_stale_diffs(&self.workdir).await;
             }
-            current.len() > MAX_MEMORY_CHAIN
-        };
+        }
 
         let resumed = vm.resume().await;
         let paused_for = paused.elapsed();
@@ -2195,15 +2200,18 @@ impl RunningSandbox {
         // at a connection that no longer exists. Dropping it here is what stops
         // the next exec failing as though the guest itself were broken.
         self.forget_agent().await;
+        Ok(paused_for)
+    }
 
-        // Safe with the guest running: `merge_chain` renames a new file over
-        // the base and the diffs are only unlinked, so the page-fault handler
-        // keeps serving the inodes it already holds open.
-        if flattened {
-            drop(slot);
+    /// Flattens the memory chain when it is longer than `depth`.
+    ///
+    /// Safe with the guest running: `merge_chain` renames a new file over the
+    /// base and the diffs are only unlinked, so the page-fault handler keeps
+    /// serving the inodes it already holds open.
+    async fn compact_past(&self, depth: usize) {
+        if self.memory_chain.lock().await.len() > depth {
             self.compact_memory_chain().await;
         }
-        Ok(paused_for)
     }
 
     /// Copies everything a fork needs into `dest`, and the command logs into
@@ -7744,11 +7752,14 @@ impl SandboxManager {
     /// The record is persisted whichever way it ends, because a write that
     /// could not resume its guest leaves the sandbox suspended and a store
     /// still saying `Running` would have recovery discard it.
+    ///
+    /// `is_synced` is [`RunningSandbox::checkpoint`]'s.
     async fn write_state(
         &self,
         sandbox: &Arc<RunningSandbox>,
         capture: Option<&Path>,
         also: &[(PathBuf, PathBuf)],
+        is_synced: bool,
     ) -> Result<std::time::Duration, Status> {
         self.require_vmm(sandbox).await?;
         let sandbox = Arc::clone(sandbox);
@@ -7757,7 +7768,9 @@ impl SandboxManager {
         // Detached: the guest is paused while it runs, and a caller dropped
         // there would leave it paused.
         self.detached(move |manager| async move {
-            let result = sandbox.checkpoint(capture.as_deref(), &also).await;
+            let result = sandbox
+                .checkpoint(capture.as_deref(), &also, is_synced)
+                .await;
             // The pause ended the feed along with every other connection, and
             // a command still running has output to send.
             sandbox.ensure_feed();
@@ -7798,7 +7811,8 @@ impl SandboxManager {
         let capture = sandbox.workdir.join(format!(".capture-{snapshot_id}"));
         let is_captured = sandbox.is_running();
         if is_captured {
-            self.write_state(&sandbox, Some(&capture), &[]).await?;
+            self.write_state(&sandbox, Some(&capture), &[], true)
+                .await?;
         } else if sandbox.state.load(std::sync::atomic::Ordering::Relaxed)
             != common::SandboxState::Suspended as i32
         {
@@ -7825,6 +7839,7 @@ impl SandboxManager {
             Err(err) => Err(err),
         };
         let _ = tokio::fs::remove_file(&capture).await;
+        self.compact_behind(&sandbox, MAX_MEMORY_CHAIN);
         let staged = match staged {
             Ok(staged) => staged,
             Err(err) => {
@@ -7972,7 +7987,7 @@ impl SandboxManager {
         self.persist(&sandbox).await;
         // The snapshot has just proved itself worth keeping.
         self.snapshots.touch(snapshot_id).await;
-        self.compact_if_deep(&sandbox);
+        self.compact_behind(&sandbox, MAX_RESTORED_CHAIN);
         tracing::info!("sandbox created from a snapshot");
         Ok(record)
     }
@@ -8011,6 +8026,9 @@ impl SandboxManager {
         let forked = self
             .fork_inner(&source, child_id.clone(), policy, node_id, name)
             .await;
+        // After the child has linked the chain it restores from, so a flatten
+        // the capture made due stays off the fork's critical path.
+        self.compact_behind(&source, MAX_MEMORY_CHAIN);
         // The child has its own address and its own policy, neither of which
         // the ruleset knows about until now.
         let registered = match &forked {
@@ -8025,7 +8043,7 @@ impl SandboxManager {
         self.open_session_behind(&sandbox, STARTED_RESTORE, None);
         let record = sandbox.record();
         self.persist(&sandbox).await;
-        self.compact_if_deep(&sandbox);
+        self.compact_behind(&sandbox, MAX_RESTORED_CHAIN);
         tracing::info!(source = source_id, sandbox = child_id, "sandbox forked");
         Ok(record)
     }
@@ -8044,8 +8062,13 @@ impl SandboxManager {
         // and cloning its last suspend.
         let capture = source.workdir.join(format!(".capture-{child_id}"));
         let is_captured = source.is_running();
+        // Not synced: the source runs on with its page cache, and the child
+        // restores the memory that holds it with the disk cloned beside it,
+        // so neither depends on the guest having written it back. On
+        // Firecracker, whose disks are cached on the host, a sync is a host
+        // fsync that waits behind every other write on the data directory.
         if is_captured {
-            self.write_state(source, Some(&capture), &[]).await?;
+            self.write_state(source, Some(&capture), &[], false).await?;
         } else if source.state.load(std::sync::atomic::Ordering::Relaxed)
             != common::SandboxState::Suspended as i32
         {
@@ -8162,15 +8185,11 @@ impl SandboxManager {
             || tokio::fs::copy(&plan, &dest).await.is_ok()
     }
 
-    /// Flattens a restored sandbox's chain behind the create when it is deep.
-    fn compact_if_deep(&self, sandbox: &Arc<RunningSandbox>) {
+    /// Flattens a sandbox's chain behind the call when it is longer than
+    /// `depth`.
+    fn compact_behind(&self, sandbox: &Arc<RunningSandbox>, depth: usize) {
         let sandbox = Arc::clone(sandbox);
-        tokio::spawn(async move {
-            let depth = sandbox.memory_chain.lock().await.len();
-            if depth > MAX_RESTORED_CHAIN {
-                sandbox.compact_memory_chain().await;
-            }
-        });
+        tokio::spawn(async move { sandbox.compact_past(depth).await });
     }
 
     async fn provision_restored(
@@ -10331,8 +10350,9 @@ impl SandboxManager {
                 let stamps = stamps()
                     .map_err(|err| Status::internal(format!("reading the disks: {err}")))?;
                 let paused_for = self
-                    .write_state(sandbox, Some(&capture), &volume_captures)
+                    .write_state(sandbox, Some(&capture), &volume_captures, true)
                     .await?;
+                sandbox.compact_past(MAX_MEMORY_CHAIN).await;
                 (paused_for, false, stamps)
             }
             false => {
