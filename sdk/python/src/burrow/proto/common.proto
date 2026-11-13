@@ -712,7 +712,15 @@ enum SessionEnd {
   SESSION_END_FAILED = 3;
   // The session was still open when the node died.
   SESSION_END_UNKNOWN = 4;
+  // Shut down or stopped through the API.
   SESSION_END_STOPPED = 5;
+  // The VMM exited cleanly because the guest reset itself: a power-off, a
+  // halt, a reboot of a guest without systemd, or a kernel panic. Cloud
+  // Hypervisor reboots the VM in place on all but a power-off or halt.
+  SESSION_END_GUEST_EXITED = 6;
+  // The VMM died: killed by a signal, the OOM killer among them, or exited
+  // with an error.
+  SESSION_END_CRASHED = 7;
 }
 
 // A sandbox's saved state, addressable on its own.

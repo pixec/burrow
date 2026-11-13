@@ -67,7 +67,14 @@ const STATES: readonly SandboxState[] = [
   "failed",
 ];
 const SESSION_STARTS: readonly SessionStart[] = ["boot", "restore", "resume"];
-const SESSION_ENDS: readonly SessionEnd[] = ["suspended", "deleted", "failed", "stopped"];
+const SESSION_ENDS: readonly SessionEnd[] = [
+  "suspended",
+  "deleted",
+  "failed",
+  "stopped",
+  "guest_exited",
+  "crashed",
+];
 const COMMAND_STATES: readonly CommandState[] = ["running", "exited"];
 const RESOURCE_CHANGES: readonly ResourceChange[] = [
   "unchanged",

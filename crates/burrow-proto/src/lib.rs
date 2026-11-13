@@ -69,6 +69,8 @@ impl common::v1::SessionEnd {
             Self::Failed => "failed",
             Self::Unknown => "unknown",
             Self::Stopped => "stopped",
+            Self::GuestExited => "guest_exited",
+            Self::Crashed => "crashed",
         }
     }
 }

@@ -408,6 +408,10 @@ const ENDED_SUSPENDED: common::SessionEnd = common::SessionEnd::Suspended;
 const ENDED_DELETED: common::SessionEnd = common::SessionEnd::Deleted;
 const ENDED_FAILED: common::SessionEnd = common::SessionEnd::Failed;
 const ENDED_STOPPED: common::SessionEnd = common::SessionEnd::Stopped;
+/// A VMM that exited on its own: cleanly, because its guest reset itself, or
+/// not.
+const ENDED_GUEST_EXITED: common::SessionEnd = common::SessionEnd::GuestExited;
+const ENDED_CRASHED: common::SessionEnd = common::SessionEnd::Crashed;
 /// A session that was still open when the node died. Nothing observed when its
 /// VM stopped, so its end time stays unset rather than being invented.
 const ENDED_UNKNOWN: common::SessionEnd = common::SessionEnd::Unknown;
@@ -434,6 +438,8 @@ const REASON_LOST: &str = "the node stopped without suspending its VM, so its me
                            its disk is kept, and `burrow boot` starts it again";
 const REASON_VMM_EXITED: &str = "its VMM exited while it was running, so its memory is lost; \
                                  its disk is kept, and `burrow boot` starts it again";
+const REASON_GUEST_EXITED: &str = "its guest shut down or reset itself, so its memory is lost; \
+                                   its disk is kept, and `burrow boot` starts it again";
 const REASON_MEMORY_DISCARDED: &str = "stopped while suspended, and the guest could not be resumed \
                                        to shut down cleanly, so its memory was discarded and what \
                                        it had not written to its disk is lost";
@@ -2003,25 +2009,45 @@ impl RunningSandbox {
     }
 
     /// Stops a running sandbox whose VMM is gone, its slot emptied or its
-    /// process exited on its own, keeping its disk. False while it has a live
-    /// VMM, or a lifecycle call holds the slot and settles it itself.
-    async fn retire_lost_vmm(&self) -> bool {
+    /// process exited on its own, keeping its disk, and says how its session
+    /// ended. `None` while it has a live VMM, or a lifecycle call holds the
+    /// slot and settles it itself.
+    ///
+    /// Firecracker exits 0 when the guest resets or powers the machine off,
+    /// which a kernel panic does too, under the `panic=1` every guest boots
+    /// with. Cloud Hypervisor exits 0 on a power-off, and reboots the VM in
+    /// place on a reset. A jailed Cloud Hypervisor's helper exits with the
+    /// VMM's code, or 128 and the signal that killed it.
+    async fn retire_lost_vmm(&self) -> Option<common::SessionEnd> {
         let Ok(mut slot) = self.vm.try_lock() else {
-            return false;
+            return None;
         };
         if !self.is_running() || slot.as_mut().is_some_and(|vm| !vm.has_exited()) {
-            return false;
+            return None;
         }
+        let (ended_by, reason) = match slot.as_mut().and_then(Vm::exit_status) {
+            Some(status) if status.success() => {
+                (ENDED_GUEST_EXITED, REASON_GUEST_EXITED.to_string())
+            }
+            Some(status) => (
+                ENDED_CRASHED,
+                format!(
+                    "its VMM died ({status}) while it was running, so its memory is lost; \
+                     its disk is kept, and `burrow boot` starts it again"
+                ),
+            ),
+            None => (ENDED_FAILED, REASON_VMM_EXITED.to_string()),
+        };
         if let Some(vm) = slot.take() {
             self.retire_cpu(&vm);
             // Reaps the exited process and removes its cgroup.
             let _ = vm.kill().await;
         }
         self.discard_memory().await;
-        self.base_record.lock().unwrap().state_reason = REASON_VMM_EXITED.to_string();
+        self.base_record.lock().unwrap().state_reason = reason;
         drop(slot);
         self.forget_agent().await;
-        true
+        Some(ended_by)
     }
 
     /// Drops the memory a stopped sandbox no longer has. A suspended
@@ -3316,18 +3342,20 @@ impl SandboxManager {
     /// Stops a running sandbox whose VMM is gone and records why, returning
     /// whether it was one.
     async fn retire_lost_vmm(&self, sandbox: &Arc<RunningSandbox>) -> bool {
-        if !sandbox.retire_lost_vmm().await {
+        let Some(ended_by) = sandbox.retire_lost_vmm().await else {
             return false;
-        }
-        tracing::error!(
+        };
+        tracing::warn!(
             sandbox = sandbox.id(),
+            ended_by = ended_by.label(),
+            reason = sandbox.record().state_reason,
             "the sandbox's VMM exited while it was running; keeping it stopped on its disk"
         );
         self.resync_public(sandbox).await;
         self.forget_stored(sandbox).await;
         self.volumes.release_all(sandbox.id());
         self.persist(sandbox).await;
-        self.close_session(sandbox, ENDED_FAILED).await;
+        self.close_session(sandbox, ended_by).await;
         self.announce_now();
         true
     }
@@ -3337,8 +3365,9 @@ impl SandboxManager {
     async fn require_vmm(&self, sandbox: &Arc<RunningSandbox>) -> Result<(), Status> {
         match self.retire_lost_vmm(sandbox).await {
             true => Err(Status::failed_precondition(format!(
-                "sandbox {}: {REASON_VMM_EXITED}",
-                sandbox.id()
+                "sandbox {}: {}",
+                sandbox.id(),
+                sandbox.record().state_reason
             ))),
             false => Ok(()),
         }
@@ -12392,6 +12421,10 @@ pub(crate) mod tests {
                 }
                 let mut body = vec![0; length];
                 stream.read_exact(&mut body).await.unwrap();
+                // A guest resetting the machine, which Firecracker exits 0 on.
+                if line.starts_with("PUT /actions ") && body.ends_with(b"SendCtrlAltDel\"}") {
+                    std::process::exit(0);
+                }
                 if line.starts_with("PUT /snapshot/create ") {
                     let request: serde_json::Value = serde_json::from_slice(&body).unwrap();
                     tokio::time::sleep(delay).await;
@@ -12506,12 +12539,30 @@ pub(crate) mod tests {
         assert_eq!(record.state_reason, REASON_VMM_EXITED);
     }
 
-    /// A VMM process that exits on its own is noticed, and its sandbox is
-    /// stopped with the reason rather than left running with nothing behind it.
+    /// Retires `sandbox` once its VMM has exited, returning how its session
+    /// ended.
+    async fn retired(manager: &SandboxManager, sandbox: &Arc<RunningSandbox>) -> i32 {
+        let mut retired = false;
+        for _ in 0..500 {
+            retired = manager.retire_lost_vmm(sandbox).await;
+            if retired {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        assert!(retired);
+        assert_eq!(sandbox.record().state, common::SandboxState::Stopped as i32);
+        assert!(sandbox.vm.lock().await.is_none());
+        manager.list_sessions(sandbox.id()).await.unwrap()[0].ended_by
+    }
+
+    /// A VMM process that dies is noticed, and its sandbox is stopped with
+    /// the reason rather than left running with nothing behind it.
     #[tokio::test]
-    async fn a_vmm_that_exits_on_its_own_is_noticed() {
+    async fn a_vmm_that_dies_is_noticed_as_crashed() {
         let manager = manager().await;
         let (sandbox, workdir) = under_fake_vmm(&manager, 0).await;
+        manager.open_session(&sandbox, STARTED_BOOT, None).await;
         assert!(!manager.retire_lost_vmm(&sandbox).await);
 
         let pid = sandbox.vm.lock().await.as_ref().unwrap().pid().unwrap();
@@ -12519,19 +12570,36 @@ pub(crate) mod tests {
             .args(["-9", &pid.to_string()])
             .status()
             .unwrap();
-        let mut retired = false;
-        for _ in 0..500 {
-            retired = manager.retire_lost_vmm(&sandbox).await;
-            if retired {
-                break;
-            }
-            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
-        }
-        assert!(retired);
-        let record = sandbox.record();
-        assert_eq!(record.state, common::SandboxState::Stopped as i32);
-        assert_eq!(record.state_reason, REASON_VMM_EXITED);
-        assert!(sandbox.vm.lock().await.is_none());
+        assert_eq!(retired(&manager, &sandbox).await, ENDED_CRASHED as i32);
+        let reason = sandbox.record().state_reason;
+        assert!(reason.starts_with("its VMM died (signal: 9"), "{reason}");
+        let _ = std::fs::remove_dir_all(&workdir);
+    }
+
+    /// A VMM that exits cleanly does so because its guest reset the machine,
+    /// which is not a crash.
+    #[tokio::test]
+    async fn a_vmm_whose_guest_reset_it_is_noticed_as_guest_exited() {
+        use std::io::Write as _;
+        let manager = manager().await;
+        let (sandbox, workdir) = under_fake_vmm(&manager, 0).await;
+        manager.open_session(&sandbox, STARTED_BOOT, None).await;
+
+        let mut api = std::os::unix::net::UnixStream::connect(
+            workdir.join(burrow_vmm::firecracker::API_SOCK),
+        )
+        .unwrap();
+        let body = r#"{"action_type":"SendCtrlAltDel"}"#;
+        api.write_all(
+            format!(
+                "PUT /actions HTTP/1.1\r\nContent-Length: {}\r\n\r\n{body}",
+                body.len()
+            )
+            .as_bytes(),
+        )
+        .unwrap();
+        assert_eq!(retired(&manager, &sandbox).await, ENDED_GUEST_EXITED as i32);
+        assert_eq!(sandbox.record().state_reason, REASON_GUEST_EXITED);
         let _ = std::fs::remove_dir_all(&workdir);
     }
 

@@ -523,8 +523,20 @@ export interface Session {
  */
 export type SessionStart = "boot" | "restore" | "resume" | "unknown";
 
-/** How a VM stopped. `unknown` is a session that was open when the node died. */
-export type SessionEnd = "suspended" | "deleted" | "failed" | "stopped" | "unknown";
+/**
+ * How a VM stopped. `stopped` is a shutdown through the API; `guest_exited` a
+ * guest that powered off, halted, rebooted without systemd or panicked;
+ * `crashed` a VMM that was killed or failed. `unknown` is a session that was
+ * open when the node died.
+ */
+export type SessionEnd =
+  | "suspended"
+  | "deleted"
+  | "failed"
+  | "stopped"
+  | "guest_exited"
+  | "crashed"
+  | "unknown";
 
 export interface SandboxInfo {
   id: string;
@@ -1161,8 +1173,8 @@ export interface LifecycleEvent {
   state: SandboxState;
   /**
    * How a VM started (`boot`, `restore`, `resume`) or stopped (`suspended`,
-   * `deleted`, `stopped`, `failed`, or `lost` for a VM a node found gone on
-   * restart), what a sandbox was created from (`fork:<id>`,
+   * `deleted`, `stopped`, `guest_exited`, `crashed`, `failed`, or `lost` for a
+   * VM a node found gone on restart), what a sandbox was created from (`fork:<id>`,
    * `snapshot:<id>`), or the snapshot a commit produced.
    */
   detail: string;
