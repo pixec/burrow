@@ -3,7 +3,8 @@
 //! Writing a pid into `cgroup.procs` takes the kernel's threadgroup lock for
 //! writing, which waits out an RCU grace period: 10 to 20 ms per VM, paid on
 //! every create. `clone3` with `CLONE_INTO_CGROUP` places the child at fork
-//! instead, with no migration and no wait.
+//! instead, with no migration and no wait. A kernel or seccomp profile
+//! without it gets the write, from the child before it execs.
 
 use std::ffi::OsString;
 use std::io;
@@ -15,8 +16,10 @@ use std::process::ExitStatus;
 /// A child process, killed when dropped unless it has been reaped.
 pub struct Child {
     pid: libc::pid_t,
+    /// Readable once the child exits; `None` where the kernel has no pidfds,
+    /// and the exit is polled for.
     #[cfg(target_os = "linux")]
-    pidfd: tokio::io::unix::AsyncFd<OwnedFd>,
+    pidfd: Option<tokio::io::unix::AsyncFd<OwnedFd>>,
     status: Option<ExitStatus>,
 }
 
@@ -56,6 +59,24 @@ fn cstring(value: &std::ffi::OsStr) -> io::Result<std::ffi::CString> {
         .map_err(|_| io::Error::other("an argument holds a NUL"))
 }
 
+/// `fd` moved above the standard streams, so a parent started with them
+/// closed never hands the child a descriptor that its own `dup2`s onto 0, 1
+/// and 2 would clobber or leave close-on-exec.
+#[cfg(target_os = "linux")]
+fn above_stdio(fd: OwnedFd) -> io::Result<OwnedFd> {
+    use std::os::fd::{AsRawFd as _, FromRawFd as _};
+    if fd.as_raw_fd() > 2 {
+        return Ok(fd);
+    }
+    // SAFETY: duplicates a descriptor this function owns.
+    let moved = unsafe { libc::fcntl(fd.as_raw_fd(), libc::F_DUPFD_CLOEXEC, 3) };
+    if moved < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    // SAFETY: fcntl just opened it and nothing else names it.
+    Ok(unsafe { OwnedFd::from_raw_fd(moved) })
+}
+
 #[cfg(target_os = "linux")]
 fn pipe() -> io::Result<(OwnedFd, OwnedFd)> {
     use std::os::fd::FromRawFd as _;
@@ -65,19 +86,56 @@ fn pipe() -> io::Result<(OwnedFd, OwnedFd)> {
         return Err(io::Error::last_os_error());
     }
     // SAFETY: both were just opened and are owned nowhere else.
-    Ok(unsafe { (OwnedFd::from_raw_fd(fds[0]), OwnedFd::from_raw_fd(fds[1])) })
+    let (read, write) = unsafe { (OwnedFd::from_raw_fd(fds[0]), OwnedFd::from_raw_fd(fds[1])) };
+    Ok((above_stdio(read)?, above_stdio(write)?))
+}
+
+#[cfg(target_os = "linux")]
+fn open_above_stdio(path: &Path, write: bool) -> io::Result<OwnedFd> {
+    let file = std::fs::OpenOptions::new()
+        .read(!write)
+        .write(write)
+        .open(path)?;
+    above_stdio(file.into())
 }
 
 /// Runs `program` with `args` in `cwd`, inside the cgroup directory
 /// `cgroup` from its first instruction when one is given.
 #[cfg(target_os = "linux")]
-pub fn spawn(
+pub async fn spawn(
     program: &Path,
     args: &[OsString],
     cwd: &Path,
     cgroup: Option<&Path>,
 ) -> io::Result<Spawned> {
+    use tokio::io::AsyncReadExt as _;
+    let (spawned, status_read) = start(program, args, cwd, cgroup)?;
+    let mut errno = Vec::new();
+    tokio::net::unix::pipe::Receiver::from_owned_fd(status_read)?
+        .read_to_end(&mut errno)
+        .await?;
+    if let Ok(errno) = <[u8; 4]>::try_from(errno.as_slice()) {
+        return Err(io::Error::from_raw_os_error(i32::from_ne_bytes(errno)));
+    }
+    if !errno.is_empty() {
+        return Err(io::Error::other(
+            "the child reported a malformed exec failure",
+        ));
+    }
+    Ok(spawned)
+}
+
+/// The child started and the read end of its exec status pipe, which reaches
+/// end of file once the exec succeeds.
+#[cfg(target_os = "linux")]
+fn start(
+    program: &Path,
+    args: &[OsString],
+    cwd: &Path,
+    cgroup: Option<&Path>,
+) -> io::Result<(Spawned, OwnedFd)> {
     use std::os::fd::{AsRawFd as _, FromRawFd as _};
+
     let program = cstring(program.as_os_str())?;
     let argv: Vec<std::ffi::CString> = std::iter::once(Ok(program.clone()))
         .chain(args.iter().map(|arg| cstring(arg)))
@@ -91,32 +149,51 @@ pub fn spawn(
     let (stderr_read, stderr_write) = pipe()?;
     // Carries errno back if exec fails; closed by the exec when it succeeds.
     let (status_read, status_write) = pipe()?;
-    let cgroup_dir = cgroup
-        .map(|dir| std::fs::File::open(dir).map(OwnedFd::from))
+    let cgroup_dir = cgroup.map(|dir| open_above_stdio(dir, false)).transpose()?;
+    let cgroup_procs = cgroup
+        .map(|dir| open_above_stdio(&dir.join("cgroup.procs"), true))
         .transpose()?;
 
     let mut pidfd: libc::c_int = -1;
-    let mut args = CloneArgs {
-        flags: libc::CLONE_PIDFD as u64,
-        pidfd: std::ptr::addr_of_mut!(pidfd) as u64,
-        exit_signal: libc::SIGCHLD as u64,
-        ..Default::default()
+    let clone = |into_cgroup: bool, pidfd: &mut libc::c_int| {
+        let mut args = CloneArgs {
+            flags: libc::CLONE_PIDFD as u64,
+            pidfd: std::ptr::from_mut(pidfd) as u64,
+            exit_signal: libc::SIGCHLD as u64,
+            ..Default::default()
+        };
+        if let (true, Some(dir)) = (into_cgroup, &cgroup_dir) {
+            args.flags |= CLONE_INTO_CGROUP;
+            args.cgroup = dir.as_raw_fd() as u64;
+        }
+        // SAFETY: a fork-style clone3 (no CLONE_VM, no new stack). The child
+        // runs only async-signal-safe calls on memory prepared above before
+        // exec or _exit, so no lock another thread held at the fork is ever
+        // taken in it.
+        let pid = unsafe {
+            libc::syscall(
+                libc::SYS_clone3,
+                std::ptr::addr_of_mut!(args),
+                std::mem::size_of::<CloneArgs>(),
+            )
+        };
+        (pid, io::Error::last_os_error().raw_os_error())
     };
-    if let Some(dir) = &cgroup_dir {
-        args.flags |= CLONE_INTO_CGROUP;
-        args.cgroup = dir.as_raw_fd() as u64;
+    // Joined by the child's own write when it could not be cloned into the
+    // cgroup: a kernel before 5.7 refuses the flag, and one before 5.3 or a
+    // seccomp profile (Docker's default) has no clone3 at all.
+    let mut is_joining = false;
+    let (mut pid, mut errno) = clone(true, &mut pidfd);
+    if pid < 0 && errno == Some(libc::EINVAL) && cgroup_dir.is_some() {
+        is_joining = true;
+        (pid, errno) = clone(false, &mut pidfd);
     }
-
-    // SAFETY: a fork-style clone3 (no CLONE_VM, no new stack). The child runs
-    // only async-signal-safe calls on memory prepared above before exec or
-    // _exit, so no lock another thread held at the fork is ever taken in it.
-    let pid = unsafe {
-        libc::syscall(
-            libc::SYS_clone3,
-            std::ptr::addr_of_mut!(args),
-            std::mem::size_of::<CloneArgs>(),
-        )
-    };
+    if pid < 0 && errno == Some(libc::ENOSYS) {
+        is_joining = cgroup_dir.is_some();
+        pidfd = -1;
+        // SAFETY: as for clone3 above.
+        pid = unsafe { libc::fork() } as libc::c_long;
+    }
     if pid < 0 {
         return Err(io::Error::last_os_error());
     }
@@ -129,6 +206,11 @@ pub fn spawn(
                 libc::_exit(127)
             };
             let status = status_write.as_raw_fd();
+            if let (true, Some(procs)) = (is_joining, &cgroup_procs)
+                && libc::write(procs.as_raw_fd(), b"0".as_ptr().cast(), 1) != 1
+            {
+                fail(status);
+            }
             for (from, to) in [
                 (stdin_read.as_raw_fd(), 0),
                 (stdout_write.as_raw_fd(), 1),
@@ -152,11 +234,10 @@ pub fn spawn(
         }
     }
 
-    // SAFETY: CLONE_PIDFD stored a descriptor the parent now owns.
-    let pidfd = unsafe { OwnedFd::from_raw_fd(pidfd) };
-    let child = Child {
+    // Held from here on, so any failure below kills the child as it returns.
+    let mut child = Child {
         pid: pid as libc::pid_t,
-        pidfd: tokio::io::unix::AsyncFd::with_interest(pidfd, tokio::io::Interest::READABLE)?,
+        pidfd: None,
         status: None,
     };
     drop((
@@ -165,29 +246,34 @@ pub fn spawn(
         stdout_write,
         stderr_write,
         cgroup_dir,
+        cgroup_procs,
     ));
-    let mut errno = [0u8; 4];
-    let read = loop {
-        // SAFETY: reads into a buffer of the length given.
-        let read = unsafe { libc::read(status_read.as_raw_fd(), errno.as_mut_ptr().cast(), 4) };
-        if read >= 0 || io::Error::last_os_error().kind() != io::ErrorKind::Interrupted {
-            break read;
-        }
-    };
-    if read == 4 {
-        return Err(io::Error::from_raw_os_error(i32::from_ne_bytes(errno)));
+    if pidfd < 0 {
+        // SAFETY: opens a pidfd for this process's own unreaped child.
+        pidfd = unsafe { libc::syscall(libc::SYS_pidfd_open, child.pid, 0) } as libc::c_int;
     }
-    Ok(Spawned {
-        child,
-        stdin: stdin_write,
-        stdout: stdout_read,
-        stderr: stderr_read,
-    })
+    if pidfd >= 0 {
+        // SAFETY: a descriptor CLONE_PIDFD or pidfd_open gave this process.
+        let pidfd = unsafe { OwnedFd::from_raw_fd(pidfd) };
+        child.pidfd = Some(tokio::io::unix::AsyncFd::with_interest(
+            pidfd,
+            tokio::io::Interest::READABLE,
+        )?);
+    }
+    Ok((
+        Spawned {
+            child,
+            stdin: stdin_write,
+            stdout: stdout_read,
+            stderr: stderr_read,
+        },
+        status_read,
+    ))
 }
 
 /// Elsewhere there is no cgroup to clone into, and only the tests run a VMM.
 #[cfg(not(target_os = "linux"))]
-pub fn spawn(
+pub async fn spawn(
     program: &Path,
     args: &[OsString],
     cwd: &Path,
@@ -257,7 +343,10 @@ impl Child {
             if let Some(status) = self.try_wait()? {
                 return Ok(status);
             }
-            self.pidfd.readable().await?.clear_ready();
+            match &self.pidfd {
+                Some(pidfd) => pidfd.readable().await?.clear_ready(),
+                None => tokio::time::sleep(std::time::Duration::from_millis(5)).await,
+            }
         }
     }
 
@@ -294,7 +383,9 @@ mod tests {
     async fn runs_in_its_directory_and_reports_how_it_ended() {
         let cwd = std::env::temp_dir();
         let script = ["-c".into(), "pwd; exit 3".into()];
-        let mut spawned = spawn(Path::new("/bin/sh"), &script, &cwd, None).unwrap();
+        let mut spawned = spawn(Path::new("/bin/sh"), &script, &cwd, None)
+            .await
+            .unwrap();
         let status = spawned.child.wait().await.unwrap();
         assert_eq!(status.code(), Some(3));
         let out = std::fs::File::from(spawned.stdout);
@@ -306,6 +397,7 @@ mod tests {
     #[tokio::test]
     async fn a_missing_program_fails_the_spawn() {
         let err = spawn(Path::new("/nonexistent"), &[], Path::new("/"), None)
+            .await
             .err()
             .unwrap();
         assert_eq!(err.kind(), io::ErrorKind::NotFound);
@@ -319,6 +411,7 @@ mod tests {
             Path::new("/"),
             None,
         )
+        .await
         .unwrap();
         let pid = spawned.child.pid;
         drop(spawned);
@@ -330,5 +423,23 @@ mod tests {
             std::thread::sleep(std::time::Duration::from_millis(10));
         }
         panic!("the dropped child is still alive");
+    }
+
+    /// Needs a writable cgroup2 tree, as a node has; skipped elsewhere.
+    #[tokio::test]
+    async fn starts_inside_its_cgroup() {
+        let dir = Path::new("/sys/fs/cgroup").join(format!("burrow-child-{}", std::process::id()));
+        if std::fs::create_dir(&dir).is_err() {
+            return;
+        }
+        let script = ["-c".into(), "cat /proc/self/cgroup".into()];
+        let mut spawned = spawn(Path::new("/bin/sh"), &script, Path::new("/"), Some(&dir))
+            .await
+            .unwrap();
+        spawned.child.wait().await.unwrap();
+        let printed = std::io::read_to_string(std::fs::File::from(spawned.stdout)).unwrap();
+        let _ = std::fs::remove_dir(&dir);
+        let name = dir.file_name().unwrap().to_str().unwrap();
+        assert!(printed.trim().ends_with(name), "{printed}");
     }
 }

@@ -206,7 +206,8 @@ impl FcProcess {
             &args,
             workdir,
             cgroup.map(crate::cgroup::Cgroup::path),
-        )?;
+        )
+        .await?;
         let child = spawned.child;
 
         let outputs: Vec<Box<dyn tokio::io::AsyncRead + Unpin + Send>> = vec![
