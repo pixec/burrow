@@ -730,6 +730,7 @@ pub async fn build_warm_snapshot(
         &lease,
         trust,
         config.guest_upgrade.as_deref(),
+        capabilities.is_tap_networked && guest_os == burrow_vmm::GuestOs::Linux,
     )
     .await;
     burrow_net::tap::delete(WARM_TAP).await;
@@ -895,15 +896,21 @@ async fn collect_products(
 ///
 /// The handshake is the expensive one, reaching the netlink code, the entropy
 /// ioctl and the clock syscall; the health call afterwards settles the gRPC
-/// server's own machinery. Returns the digest of the agent it leaves running,
-/// upgraded to `upgrade` when that differs.
+/// server's own machinery. Returns the client it did this on and the digest of
+/// the agent it leaves running, upgraded to `upgrade` when that differs.
 async fn exercise_agent(
     vm: &Vm,
     lease: &burrow_net::ipam::Lease,
     trust: &Trust,
     agent_timeout: std::time::Duration,
     upgrade: Option<&crate::guestconn::GuestUpgrade>,
-) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
+) -> Result<
+    (
+        burrow_proto::guest::v1::guest_client::GuestClient<tonic::transport::Channel>,
+        String,
+    ),
+    Box<dyn std::error::Error + Send + Sync>,
+> {
     let agent = crate::guestconn::connect(vm.guest(), agent_timeout).await?;
     let (mut agent, response) = crate::guestconn::handshake_upgrading(
         agent,
@@ -936,7 +943,7 @@ async fn exercise_agent(
         // Not fatal: a snapshot without the warm-up is slower, not wrong.
         tracing::warn!(%err, "could not pre-warm the guest before snapshotting");
     }
-    Ok(response.agent_digest)
+    Ok((agent, response.agent_digest))
 }
 
 async fn warm_up(
@@ -1060,6 +1067,7 @@ async fn snapshot_when_ready(
     lease: &burrow_net::ipam::Lease,
     trust: &Trust,
     upgrade: Option<&crate::guestconn::GuestUpgrade>,
+    is_cleared: bool,
 ) -> Result<String, Status> {
     let vm = Vm::boot(spec)
         .await
@@ -1082,8 +1090,9 @@ async fn snapshot_when_ready(
     // guest coldness rather than transport. It also brings the agent up to
     // this node's, which the snapshot is then keyed on, so no create from it
     // upgrades the agent in place.
-    let agent = match exercise_agent(&vm, lease, trust, agent_timeout, upgrade).await {
-        Ok(agent) => agent,
+    let (mut agent, digest) = match exercise_agent(&vm, lease, trust, agent_timeout, upgrade).await
+    {
+        Ok(exercised) => exercised,
         Err(err) => {
             let _ = vm.kill().await;
             return Err(Status::internal(format!(
@@ -1091,6 +1100,17 @@ async fn snapshot_when_ready(
             )));
         }
     };
+    // Taken without an address, so a clone's handshake adds its own and has
+    // nothing to remove. Not fatal: a guest that keeps the warm address is
+    // re-addressed the slower way.
+    if is_cleared
+        && let Err(err) = agent
+            .clear_network(burrow_proto::guest::v1::ClearNetworkRequest {})
+            .await
+    {
+        tracing::warn!(%err, "could not clear the warm guest's network");
+    }
+    drop(agent);
 
     // Snapshot a quiesced guest: anything mid-flight at this moment is frozen
     // into every sandbox that later restores from it.
@@ -1105,7 +1125,7 @@ async fn snapshot_when_ready(
     vm.kill()
         .await
         .map_err(|err| Status::internal(format!("stopping warm vm: {err}")))?;
-    Ok(agent)
+    Ok(digest)
 }
 
 #[cfg(test)]

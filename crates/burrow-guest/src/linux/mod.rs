@@ -90,6 +90,12 @@ pub async fn set_public_addresses(network: guestpb::NetworkConfig) -> Result<(),
         .map_err(|err| Status::internal(format!("applying public addresses: {err}")))
 }
 
+pub async fn clear_network() -> Result<(), Status> {
+    netconf::clear()
+        .await
+        .map_err(|err| Status::internal(format!("clearing the network: {err}")))
+}
+
 pub async fn root_disk(req: guestpb::RootDiskRequest) -> Result<guestpb::RootDiskResponse, Status> {
     use guestpb::root_disk_request::Op;
     let op = Op::try_from(req.op).unwrap_or(Op::Unspecified);

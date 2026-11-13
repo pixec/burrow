@@ -68,6 +68,14 @@ impl Guest for AgentService {
         Ok(Response::new(guestpb::SetPublicAddressesResponse {}))
     }
 
+    async fn clear_network(
+        &self,
+        _req: Request<guestpb::ClearNetworkRequest>,
+    ) -> Result<Response<guestpb::ClearNetworkResponse>, Status> {
+        os::clear_network().await?;
+        Ok(Response::new(guestpb::ClearNetworkResponse {}))
+    }
+
     async fn root_disk(
         &self,
         req: Request<guestpb::RootDiskRequest>,

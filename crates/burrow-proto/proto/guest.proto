@@ -12,6 +12,10 @@ service Guest {
   rpc Health(GuestHealthRequest) returns (GuestHealthResponse);
   // Replaces the public addresses on the guest's interface while it runs.
   rpc SetPublicAddresses(NetworkConfig) returns (SetPublicAddressesResponse);
+  // Drops every address and gateway route from the guest's interface, so the
+  // warm snapshot taken next is one a clone's handshake only adds to. Linux
+  // guests on a tap only.
+  rpc ClearNetwork(ClearNetworkRequest) returns (ClearNetworkResponse);
   // Acts on the root filesystem the guest booted from: flushes it, trims it,
   // freezes or thaws it for a disk-only capture, or grows it to fill a disk
   // the host made bigger. Linux guests only. An agent
@@ -449,6 +453,9 @@ message PublicAddress {
 }
 
 message SetPublicAddressesResponse {}
+
+message ClearNetworkRequest {}
+message ClearNetworkResponse {}
 
 message RootDiskRequest {
   enum Op {

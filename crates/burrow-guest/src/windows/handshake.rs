@@ -415,6 +415,12 @@ pub async fn set_public_addresses(network: guestpb::NetworkConfig) -> Result<(),
         .map_err(|err| Status::internal(format!("applying public addresses: {err}")))
 }
 
+pub async fn clear_network() -> Result<(), Status> {
+    Err(Status::unimplemented(
+        "a Windows guest is not stripped for a warm snapshot",
+    ))
+}
+
 fn apply_network(config: &guestpb::NetworkConfig) -> anyhow::Result<()> {
     use std::os::windows::process::CommandExt as _;
     use windows_sys::Win32::System::Threading::CREATE_NO_WINDOW;

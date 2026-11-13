@@ -7,6 +7,7 @@
 
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use std::sync::OnceLock;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use futures::{FutureExt as _, TryStreamExt};
 use netlink_packet_route::address::{
@@ -36,6 +37,15 @@ static NETLINK: OnceLock<Netlink> = OnceLock::new();
 /// Held across a reapply, so two handshakes of one guest cannot interleave
 /// their flushes and adds.
 static APPLYING: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+/// Set by [`clear`] and taken by the next reconcile, which then knows the
+/// interface holds no address and no gateway route without asking.
+///
+/// A warm snapshot is taken right after [`clear`], so every clone wakes with
+/// this set. Reading the interface back cost a clone more than re-addressing
+/// it: hundreds of guest pages of netlink dump code, each a fault on a guest
+/// just restored.
+static IS_BARE: AtomicBool = AtomicBool::new(false);
 
 /// Opens the netlink connection and resolves the interface, so a later restore
 /// does not have to. Call once, at startup.
@@ -120,6 +130,41 @@ async fn add_one_ipv6(
             tracing::warn!(%gateway, %err, "could not add the guest's IPv6 default route");
         }
     }
+    Ok(())
+}
+
+/// Strips the interface down to its link-local address and the routes the
+/// kernel keeps for itself, leaving it up.
+pub async fn clear() -> anyhow::Result<()> {
+    let netlink = NETLINK
+        .get()
+        .ok_or_else(|| anyhow::anyhow!("no netlink connection"))?;
+    let handle = &netlink.handle;
+    let _applying = APPLYING.lock().await;
+    let (current, routes, addresses) = current(handle, netlink.index).await?;
+    let mut requests = Vec::new();
+    for (route, message) in current.routes.iter().zip(routes) {
+        if route.gateway.is_some() {
+            requests.push(Request {
+                what: "remove a gateway route".into(),
+                is_fatal: true,
+                sent: handle.route().del(message).execute().boxed(),
+            });
+        }
+    }
+    for (held, message) in current.addresses.iter().zip(addresses) {
+        if !matches!(held.address, IpAddr::V6(v6) if v6.is_unicast_link_local()) {
+            requests.push(Request {
+                what: format!("remove {}", held.address),
+                is_fatal: true,
+                sent: handle.address().del(message).execute().boxed(),
+            });
+        }
+    }
+    send(requests).await?;
+    // systemd may run something that configures the interface again before
+    // the snapshot, so a clone of one still reads what it holds.
+    IS_BARE.store(crate::linux::systemd::pid().is_none(), Ordering::Relaxed);
     Ok(())
 }
 
@@ -452,7 +497,17 @@ async fn reconcile(
     is_private: bool,
 ) -> anyhow::Result<()> {
     let _applying = APPLYING.lock().await;
-    let (current, routes, addresses) = current(handle, index).await?;
+    let (current, routes, addresses) = match IS_BARE.swap(false, Ordering::Relaxed) {
+        true => (
+            Current {
+                is_up: true,
+                ..Current::default()
+            },
+            Vec::new(),
+            Vec::new(),
+        ),
+        false => current(handle, index).await?,
+    };
     let plan = plan(&current, network, index, is_private);
     if plan.is_empty() {
         return Ok(());

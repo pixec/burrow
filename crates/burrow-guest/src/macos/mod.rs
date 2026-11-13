@@ -136,6 +136,12 @@ pub async fn set_public_addresses(_network: guestpb::NetworkConfig) -> Result<()
     ))
 }
 
+pub async fn clear_network() -> Result<(), Status> {
+    Err(Status::unimplemented(
+        "a macOS guest sits behind its node's userspace network and holds no address to clear",
+    ))
+}
+
 pub async fn upgrade(
     mut stream: tonic::Streaming<guestpb::UpgradeChunk>,
 ) -> Result<guestpb::UpgradeResponse, Status> {
