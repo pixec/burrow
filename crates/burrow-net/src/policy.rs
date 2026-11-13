@@ -830,9 +830,19 @@ mod tests {
         };
         let chain = |name: &str| {
             let prefix = format!("add rule {name} ");
-            ruleset
-                .lines()
-                .filter_map(move |line| line.strip_prefix(prefix.as_str()).map(str::to_string))
+            let rules = |prefix: &str| {
+                ruleset
+                    .lines()
+                    .filter_map(|line| line.strip_prefix(prefix).map(str::to_string))
+                    .collect::<Vec<_>>()
+            };
+            // The sandbox chain jumps to its accepts, which return to it.
+            rules(&prefix)
+                .into_iter()
+                .flat_map(|rule| match rule.as_str() {
+                    "jump allow" => rules("add rule inet burrow allow "),
+                    _ => vec![rule],
+                })
                 .collect::<Vec<_>>()
         };
 
@@ -1047,9 +1057,19 @@ mod tests {
         };
         let chain = |name: &str| {
             let prefix = format!("add rule {name} ");
-            ruleset
-                .lines()
-                .filter_map(move |line| line.strip_prefix(prefix.as_str()).map(str::to_string))
+            let rules = |prefix: &str| {
+                ruleset
+                    .lines()
+                    .filter_map(|line| line.strip_prefix(prefix).map(str::to_string))
+                    .collect::<Vec<_>>()
+            };
+            // The sandbox chain jumps to its accepts, which return to it.
+            rules(&prefix)
+                .into_iter()
+                .flat_map(|rule| match rule.as_str() {
+                    "jump allow" => rules("add rule inet burrow allow "),
+                    _ => vec![rule],
+                })
                 .collect::<Vec<_>>()
         };
         let redirected = chain("ip burrow_nat prerouting")

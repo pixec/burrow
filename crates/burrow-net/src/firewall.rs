@@ -35,6 +35,9 @@ pub const TAP_PREFIX: &str = "bt";
 pub const MESH_INTERFACE: &str = crate::mesh::MESH_INTERFACE;
 
 const FILTER_TABLE: &str = "burrow";
+/// The filter chain every sandbox's accepts are in, reached from `sandbox`
+/// once every drop that precedes them has had its turn.
+const ALLOW_CHAIN: &str = "allow";
 const NAT_TABLE: &str = "burrow_nat";
 const NAT6_TABLE: &str = "burrow_nat6";
 /// Holds nothing but per-sandbox byte counters, in a table of its own so that
@@ -278,6 +281,38 @@ pub fn render_adding(
     out
 }
 
+/// The rules `added` brings and nothing else, for a ruleset this node
+/// rendered and applied that holds every other sandbox: no table is flushed,
+/// so no rule is deleted, and a deletion is what makes the kernel wait out a
+/// grace period on every apply.
+///
+/// Where nftables takes the first verdict, each rule goes where order cannot
+/// matter: a drop or a sandbox's own accept at the head of a chain that ends
+/// in a drop, its accepts and their exceptions appended to the chain of
+/// accepts, each matching this sandbox's tap or address alone.
+///
+/// `None` when adding it changes rules beyond its own: a peer, a public
+/// address, a published port or a selectively inspected host. Those take a
+/// full render.
+pub fn render_added(added: &SandboxRules) -> Option<String> {
+    let is_alone = added.peers.is_empty()
+        && added.public.is_empty()
+        && added.ports.is_empty()
+        && !is_selectively_inspected(added);
+    if !is_alone {
+        return None;
+    }
+    let mut out = String::new();
+    antispoof_rules(&mut out, added, "insert");
+    render_sandbox_denials(&mut out, "insert", added);
+    render_sandbox_allowances(&mut out, added);
+    tohost_rules(&mut out, added, "insert");
+    nat_rules(&mut out, added);
+    nat6_rules(&mut out, added);
+    render_counted(&mut out, added);
+    Some(out)
+}
+
 /// Everything but the counter table.
 fn render_policy(sandboxes: &[SandboxRules], control_plane: &[IpAddr]) -> String {
     let mut out = String::new();
@@ -352,7 +387,7 @@ fn render_policy(sandboxes: &[SandboxRules], control_plane: &[IpAddr]) -> String
     // connection opened under the looser policy. Entries already in the table
     // are cleared separately; see [`flush_conntrack`].
     for sandbox in sandboxes {
-        render_sandbox_denials(&mut out, sandbox);
+        render_sandbox_denials(&mut out, "add", sandbox);
     }
 
     // Return traffic for connections burrow already allowed.
@@ -386,6 +421,14 @@ fn render_policy(sandboxes: &[SandboxRules], control_plane: &[IpAddr]) -> String
         );
     }
 
+    // Every accept a sandbox's own policy makes, in a chain of their own so
+    // a new sandbox's can be appended without rewriting the rest: see
+    // [`render_added`].
+    let _ = writeln!(out, "add chain inet {FILTER_TABLE} {ALLOW_CHAIN}");
+    let _ = writeln!(
+        out,
+        "add rule inet {FILTER_TABLE} sandbox jump {ALLOW_CHAIN}"
+    );
     for sandbox in sandboxes {
         render_sandbox_allowances(&mut out, sandbox);
         render_ingress(&mut out, sandbox);
@@ -554,46 +597,7 @@ fn parse_counter_name(name: &str) -> Option<(Ipv4Addr, bool)> {
 fn render_antispoof(out: &mut String, sandboxes: &[SandboxRules]) {
     let _ = writeln!(out, "add chain inet {FILTER_TABLE} antispoof");
     for sandbox in sandboxes {
-        let _ = writeln!(
-            out,
-            "add rule inet {FILTER_TABLE} antispoof iifname \"{}\" ip saddr {} return",
-            sandbox.tap, sandbox.guest_ip
-        );
-        // Per tap and per address, exactly as the v4 rule above. A blanket
-        // `ip6 saddr` return would pass every forged v6 source and make every
-        // address-based rule below decorative.
-        let _ = writeln!(
-            out,
-            "add rule inet {FILTER_TABLE} antispoof iifname \"{}\" ip6 saddr {} return",
-            sandbox.tap, sandbox.guest_ip6
-        );
-        if !sandbox.public.v4.is_empty() {
-            let v4: Vec<String> = sandbox.public.v4.iter().map(Ipv4Addr::to_string).collect();
-            let _ = writeln!(
-                out,
-                "add rule inet {FILTER_TABLE} antispoof iifname \"{}\" ip saddr {} return",
-                sandbox.tap,
-                set_of(&v4)
-            );
-        }
-        if !sandbox.public.v6.is_empty() {
-            let _ = writeln!(
-                out,
-                "add rule inet {FILTER_TABLE} antispoof iifname \"{}\" ip6 saddr {} return",
-                sandbox.tap,
-                set_of(&sandbox.public.networks6())
-            );
-        }
-        // Neighbour discovery is sourced from a link-local address the guest
-        // picks itself, so it can never match the rule above, and a v6 link
-        // does not come up without it. Narrowed to the discovery types: this
-        // is not a general link-local allowance.
-        let _ = writeln!(
-            out,
-            "add rule inet {FILTER_TABLE} antispoof iifname \"{}\" ip6 saddr fe80::/10 \
-             icmpv6 type {{ nd-neighbor-solicit, nd-neighbor-advert, nd-router-solicit }} return",
-            sandbox.tap
-        );
+        antispoof_rules(out, sandbox, "add");
     }
     // Reached only by a packet on a burrow tap whose source is not that
     // sandbox's own address. Counted and logged rather than dropped in silence:
@@ -602,6 +606,49 @@ fn render_antispoof(out: &mut String, sandboxes: &[SandboxRules]) {
         out,
         "add rule inet {FILTER_TABLE} antispoof iifname \"{TAP_PREFIX}*\" \
          counter log prefix \"burrow-spoof \" level warn drop"
+    );
+}
+
+fn antispoof_rules(out: &mut String, sandbox: &SandboxRules, verb: &str) {
+    let _ = writeln!(
+        out,
+        "{verb} rule inet {FILTER_TABLE} antispoof iifname \"{}\" ip saddr {} return",
+        sandbox.tap, sandbox.guest_ip
+    );
+    // Per tap and per address, exactly as the v4 rule above. A blanket
+    // `ip6 saddr` return would pass every forged v6 source and make every
+    // address-based rule below decorative.
+    let _ = writeln!(
+        out,
+        "{verb} rule inet {FILTER_TABLE} antispoof iifname \"{}\" ip6 saddr {} return",
+        sandbox.tap, sandbox.guest_ip6
+    );
+    if !sandbox.public.v4.is_empty() {
+        let v4: Vec<String> = sandbox.public.v4.iter().map(Ipv4Addr::to_string).collect();
+        let _ = writeln!(
+            out,
+            "{verb} rule inet {FILTER_TABLE} antispoof iifname \"{}\" ip saddr {} return",
+            sandbox.tap,
+            set_of(&v4)
+        );
+    }
+    if !sandbox.public.v6.is_empty() {
+        let _ = writeln!(
+            out,
+            "{verb} rule inet {FILTER_TABLE} antispoof iifname \"{}\" ip6 saddr {} return",
+            sandbox.tap,
+            set_of(&sandbox.public.networks6())
+        );
+    }
+    // Neighbour discovery is sourced from a link-local address the guest
+    // picks itself, so it can never match the rule above, and a v6 link
+    // does not come up without it. Narrowed to the discovery types: this
+    // is not a general link-local allowance.
+    let _ = writeln!(
+        out,
+        "{verb} rule inet {FILTER_TABLE} antispoof iifname \"{}\" ip6 saddr fe80::/10 \
+         icmpv6 type {{ nd-neighbor-solicit, nd-neighbor-advert, nd-router-solicit }} return",
+        sandbox.tap
     );
 }
 
@@ -648,59 +695,63 @@ fn render_host_input(out: &mut String, sandboxes: &[SandboxRules]) {
     );
 
     for sandbox in sandboxes {
-        let (guest, host) = (sandbox.guest_ip, sandbox.host_ip);
-
-        // The resolver is burrow's own and records every lookup, so modes with
-        // *some* egress reach it. `none` does not: a name is arbitrary
-        // attacker-chosen bytes leaving the sandbox, so a resolver is an exfil
-        // channel like any other.
-        //
-        // UDP only: the resolver binds a UDP socket and nothing else, so a
-        // TCP/53 accept is a hole pointed at whatever might later listen on
-        // the gateway's port 53. Nothing needs the TCP fallback, because the
-        // resolver never truncates (see `burrow-proxy`'s `dns` module).
-        if sandbox.mode != Mode::None {
-            let _ = writeln!(
-                out,
-                "add rule inet {FILTER_TABLE} tohost ip saddr {guest} ip daddr {host} udp dport {DNS_PORT} accept"
-            );
-        }
-
-        // The proxy only serves sandboxes whose policy routes through it.
-        //
-        // Both families: the v6 redirect in `burrow_nat6` rewrites the
-        // destination to this address and port, and the packet then arrives
-        // here on the input hook. Without the v6 accept the redirect would
-        // deliver every allowlisted v6 connection straight into the closing
-        // drop, which looks like the proxy being down rather than a missing
-        // rule.
-        let sources = src4(sandbox);
-        if is_selectively_inspected(sandbox) {
-            // IPv4 only: the resolver hands out no AAAA records, so there is
-            // no v6 address an inspected host could have been redirected at.
-            let _ = writeln!(
-                out,
-                "add rule inet {FILTER_TABLE} tohost ip saddr {sources} ip daddr {host} tcp dport {PROXY_PORT} accept"
-            );
-        }
-        if sandbox.mode == Mode::Allowlist {
-            let _ = writeln!(
-                out,
-                "add rule inet {FILTER_TABLE} tohost ip saddr {sources} ip daddr {host} tcp dport {PROXY_PORT} accept"
-            );
-            // Not for a sandbox denied v6, which gets no v6 redirect.
-            if !sandbox.is_ipv6_denied {
-                let _ = writeln!(
-                    out,
-                    "add rule inet {FILTER_TABLE} tohost ip6 saddr {} ip6 daddr {} tcp dport {PROXY_PORT} accept",
-                    src6(sandbox),
-                    sandbox.host_ip6
-                );
-            }
-        }
+        tohost_rules(out, sandbox, "add");
     }
 
     let _ = writeln!(out, "add rule inet {FILTER_TABLE} tohost drop");
+}
+
+fn tohost_rules(out: &mut String, sandbox: &SandboxRules, verb: &str) {
+    let (guest, host) = (sandbox.guest_ip, sandbox.host_ip);
+
+    // The resolver is burrow's own and records every lookup, so modes with
+    // *some* egress reach it. `none` does not: a name is arbitrary
+    // attacker-chosen bytes leaving the sandbox, so a resolver is an exfil
+    // channel like any other.
+    //
+    // UDP only: the resolver binds a UDP socket and nothing else, so a
+    // TCP/53 accept is a hole pointed at whatever might later listen on
+    // the gateway's port 53. Nothing needs the TCP fallback, because the
+    // resolver never truncates (see `burrow-proxy`'s `dns` module).
+    if sandbox.mode != Mode::None {
+        let _ = writeln!(
+            out,
+            "{verb} rule inet {FILTER_TABLE} tohost ip saddr {guest} ip daddr {host} udp dport {DNS_PORT} accept"
+        );
+    }
+
+    // The proxy only serves sandboxes whose policy routes through it.
+    //
+    // Both families: the v6 redirect in `burrow_nat6` rewrites the
+    // destination to this address and port, and the packet then arrives
+    // here on the input hook. Without the v6 accept the redirect would
+    // deliver every allowlisted v6 connection straight into the closing
+    // drop, which looks like the proxy being down rather than a missing
+    // rule.
+    let sources = src4(sandbox);
+    if is_selectively_inspected(sandbox) {
+        // IPv4 only: the resolver hands out no AAAA records, so there is
+        // no v6 address an inspected host could have been redirected at.
+        let _ = writeln!(
+            out,
+            "{verb} rule inet {FILTER_TABLE} tohost ip saddr {sources} ip daddr {host} tcp dport {PROXY_PORT} accept"
+        );
+    }
+    if sandbox.mode == Mode::Allowlist {
+        let _ = writeln!(
+            out,
+            "{verb} rule inet {FILTER_TABLE} tohost ip saddr {sources} ip daddr {host} tcp dport {PROXY_PORT} accept"
+        );
+        // Not for a sandbox denied v6, which gets no v6 redirect.
+        if !sandbox.is_ipv6_denied {
+            let _ = writeln!(
+                out,
+                "{verb} rule inet {FILTER_TABLE} tohost ip6 saddr {} ip6 daddr {} tcp dport {PROXY_PORT} accept",
+                src6(sandbox),
+                sandbox.host_ip6
+            );
+        }
+    }
 }
 
 /// Matches only traffic that came from neither a sandbox tap nor the mesh,
@@ -735,7 +786,7 @@ fn label(sandbox_id: &str) -> String {
 /// verdict, so a range named here is unreachable whatever the mode is,
 /// whatever else the policy allows, and whatever conntrack remembers of a
 /// connection opened under an earlier policy.
-fn render_sandbox_denials(out: &mut String, sandbox: &SandboxRules) {
+fn render_sandbox_denials(out: &mut String, verb: &str, sandbox: &SandboxRules) {
     let guest = src4(sandbox);
     let _ = writeln!(out, "# sandbox {} denials", label(&sandbox.sandbox_id));
 
@@ -744,7 +795,7 @@ fn render_sandbox_denials(out: &mut String, sandbox: &SandboxRules) {
     // service lives, and no sandbox has a reason to reach one.
     let _ = writeln!(
         out,
-        "add rule inet {FILTER_TABLE} sandbox ip6 saddr {} ip6 daddr fe80::/10 drop",
+        "{verb} rule inet {FILTER_TABLE} sandbox ip6 saddr {} ip6 daddr fe80::/10 drop",
         src6(sandbox)
     );
 
@@ -754,17 +805,17 @@ fn render_sandbox_denials(out: &mut String, sandbox: &SandboxRules) {
     // no sandbox has a legitimate reason to have this in a private network.
     let _ = writeln!(
         out,
-        "add rule inet {FILTER_TABLE} sandbox ip saddr {guest} ip daddr {METADATA_CIDR} drop"
+        "{verb} rule inet {FILTER_TABLE} sandbox ip saddr {guest} ip daddr {METADATA_CIDR} drop"
     );
 
     let guest6 = src6(sandbox);
-    render_public_denials(out, sandbox);
+    render_public_denials(out, verb, sandbox);
     // Every v6 destination, when the policy says so. Nothing but the forward
     // path is affected: the gateway's own services are on the input hook.
     if sandbox.is_ipv6_denied {
         let _ = writeln!(
             out,
-            "add rule inet {FILTER_TABLE} sandbox ip6 saddr {guest6} drop"
+            "{verb} rule inet {FILTER_TABLE} sandbox ip6 saddr {guest6} drop"
         );
     }
 
@@ -774,11 +825,11 @@ fn render_sandbox_denials(out: &mut String, sandbox: &SandboxRules) {
                 let source = source_match(sandbox, cidr.is_v4());
                 let _ = writeln!(
                     out,
-                    "add rule inet {FILTER_TABLE} sandbox {source} {} {cidr} drop",
+                    "{verb} rule inet {FILTER_TABLE} sandbox {source} {} {cidr} drop",
                     cidr.daddr()
                 );
             }
-            render_port_denials(out, sandbox, &denied);
+            render_port_denials(out, verb, sandbox, &denied);
         }
         None => {
             // An unparseable denial is not ignorable: rather than render the
@@ -786,11 +837,11 @@ fn render_sandbox_denials(out: &mut String, sandbox: &SandboxRules) {
             // in either family.
             let _ = writeln!(
                 out,
-                "add rule inet {FILTER_TABLE} sandbox ip saddr {guest} drop"
+                "{verb} rule inet {FILTER_TABLE} sandbox ip saddr {guest} drop"
             );
             let _ = writeln!(
                 out,
-                "add rule inet {FILTER_TABLE} sandbox ip6 saddr {guest6} drop"
+                "{verb} rule inet {FILTER_TABLE} sandbox ip6 saddr {guest6} drop"
             );
         }
     }
@@ -838,7 +889,7 @@ fn source_match(sandbox: &SandboxRules, is_v4: bool) -> String {
 ///
 /// SMTP is refused for every source of a family the sandbox holds a public
 /// address in, since its private address leaves translated to that one.
-fn render_public_denials(out: &mut String, sandbox: &SandboxRules) {
+fn render_public_denials(out: &mut String, verb: &str, sandbox: &SandboxRules) {
     let public = &sandbox.public;
     for (is_present, is_allowed, source) in [
         (
@@ -855,7 +906,7 @@ fn render_public_denials(out: &mut String, sandbox: &SandboxRules) {
         if is_present && !is_allowed {
             let _ = writeln!(
                 out,
-                "add rule inet {FILTER_TABLE} sandbox {source} ct direction original tcp dport 25 drop"
+                "{verb} rule inet {FILTER_TABLE} sandbox {source} ct direction original tcp dport 25 drop"
             );
         }
     }
@@ -863,7 +914,7 @@ fn render_public_denials(out: &mut String, sandbox: &SandboxRules) {
         for destination in public_destinations(sandbox) {
             let _ = writeln!(
                 out,
-                "add rule inet {FILTER_TABLE} sandbox oifname \"{}\" {destination} \
+                "{verb} rule inet {FILTER_TABLE} sandbox oifname \"{}\" {destination} \
                  limit rate over {} kbytes/second drop",
                 sandbox.tap, public.kbytes_per_sec
             );
@@ -917,7 +968,7 @@ fn render_ingress(out: &mut String, sandbox: &SandboxRules) {
         for destination in public_destinations(sandbox) {
             let _ = writeln!(
                 out,
-                "add rule inet {FILTER_TABLE} sandbox oifname \"{tap}\" {external} {destination} \
+                "add rule inet {FILTER_TABLE} {ALLOW_CHAIN} oifname \"{tap}\" {external} {destination} \
                  ct state new limit rate over {}/second burst {} packets drop",
                 public.new_per_sec, public.new_per_sec
             );
@@ -938,7 +989,7 @@ fn render_ingress(out: &mut String, sandbox: &SandboxRules) {
                 }
             };
             let prefix = format!(
-                "add rule inet {FILTER_TABLE} sandbox oifname \"{tap}\" {external} {destination}{sources}"
+                "add rule inet {FILTER_TABLE} {ALLOW_CHAIN} oifname \"{tap}\" {external} {destination}{sources}"
             );
             match door.protocol {
                 IngressProtocol::Icmp => {
@@ -981,7 +1032,7 @@ fn render_ingress(out: &mut String, sandbox: &SandboxRules) {
 /// whenever the remote side's ephemeral port fell in a denied range. Packets
 /// conntrack holds no direction for, invalid or untracked ones, are dropped by
 /// a second rule rather than let through to the accepts below.
-fn render_port_denials(out: &mut String, sandbox: &SandboxRules, denials: &Denials) {
+fn render_port_denials(out: &mut String, verb: &str, sandbox: &SandboxRules, denials: &Denials) {
     for block in &denials.ports {
         let mut targets: Vec<(bool, Option<String>)> = Vec::new();
         if block.cidrs.is_empty() {
@@ -1014,7 +1065,7 @@ fn render_port_denials(out: &mut String, sandbox: &SandboxRules, denials: &Denia
                 for state in ["ct direction original", "ct state invalid,untracked"] {
                     let _ = writeln!(
                         out,
-                        "add rule inet {FILTER_TABLE} sandbox {source}{destination} {state} \
+                        "{verb} rule inet {FILTER_TABLE} sandbox {source}{destination} {state} \
                          {protocol} dport {ports} drop"
                     );
                 }
@@ -1049,11 +1100,11 @@ fn render_sandbox_allowances(out: &mut String, sandbox: &SandboxRules) {
     for peer in &sandbox.peers {
         let _ = writeln!(
             out,
-            "add rule inet {FILTER_TABLE} sandbox ip saddr {guest} ip daddr {peer} accept"
+            "add rule inet {FILTER_TABLE} {ALLOW_CHAIN} ip saddr {guest} ip daddr {peer} accept"
         );
         let _ = writeln!(
             out,
-            "add rule inet {FILTER_TABLE} sandbox ip saddr {peer} ip daddr {guest} accept"
+            "add rule inet {FILTER_TABLE} {ALLOW_CHAIN} ip saddr {peer} ip daddr {guest} accept"
         );
     }
 
@@ -1081,11 +1132,11 @@ fn render_sandbox_allowances(out: &mut String, sandbox: &SandboxRules) {
             let sources = src4(sandbox);
             let _ = writeln!(
                 out,
-                "add rule inet {FILTER_TABLE} sandbox ip saddr {sources} ip daddr {SANDBOX_POOL} drop"
+                "add rule inet {FILTER_TABLE} {ALLOW_CHAIN} ip saddr {sources} ip daddr {SANDBOX_POOL} drop"
             );
             let _ = writeln!(
                 out,
-                "add rule inet {FILTER_TABLE} sandbox ip saddr {sources} accept"
+                "add rule inet {FILTER_TABLE} {ALLOW_CHAIN} ip saddr {sources} accept"
             );
             // The same two rules in the other family. Private networks are
             // addressed in v4, so there are no v6 peer accepts above this and
@@ -1093,12 +1144,12 @@ fn render_sandbox_allowances(out: &mut String, sandbox: &SandboxRules) {
             // sandbox reaches the internet over v6 and no sandbox at all.
             let _ = writeln!(
                 out,
-                "add rule inet {FILTER_TABLE} sandbox ip6 saddr {} ip6 daddr {POOL6} drop",
+                "add rule inet {FILTER_TABLE} {ALLOW_CHAIN} ip6 saddr {} ip6 daddr {POOL6} drop",
                 src6(sandbox)
             );
             let _ = writeln!(
                 out,
-                "add rule inet {FILTER_TABLE} sandbox ip6 saddr {} accept",
+                "add rule inet {FILTER_TABLE} {ALLOW_CHAIN} ip6 saddr {} accept",
                 src6(sandbox)
             );
         }
@@ -1123,14 +1174,14 @@ fn render_sandbox_allowances(out: &mut String, sandbox: &SandboxRules) {
                 None => {
                     let _ = writeln!(
                         out,
-                        "add rule inet {FILTER_TABLE} sandbox ip saddr {sources} ip daddr {cidr} accept"
+                        "add rule inet {FILTER_TABLE} {ALLOW_CHAIN} ip saddr {sources} ip daddr {cidr} accept"
                     );
                 }
                 Some(list) => {
                     for protocol in ["tcp", "udp"] {
                         let _ = writeln!(
                             out,
-                            "add rule inet {FILTER_TABLE} sandbox ip saddr {sources} ip daddr {cidr} {protocol} dport {{ {list} }} accept"
+                            "add rule inet {FILTER_TABLE} {ALLOW_CHAIN} ip saddr {sources} ip daddr {cidr} {protocol} dport {{ {list} }} accept"
                         );
                     }
                 }
@@ -1145,7 +1196,7 @@ fn render_sandbox_allowances(out: &mut String, sandbox: &SandboxRules) {
     for port in &sandbox.ports {
         let _ = writeln!(
             out,
-            "add rule inet {FILTER_TABLE} sandbox {external} ip daddr {guest} {} dport {} accept",
+            "add rule inet {FILTER_TABLE} {ALLOW_CHAIN} {external} ip daddr {guest} {} dport {} accept",
             port.protocol.keyword(),
             port.guest_port
         );
@@ -1165,39 +1216,43 @@ fn render_nat6(out: &mut String, sandboxes: &[SandboxRules]) {
     );
 
     for sandbox in sandboxes {
-        let guest = sandbox.guest_ip6;
-        // A sandbox denied v6 is neither redirected nor translated: its v6
-        // packets meet the drop in the sandbox chain and nothing else.
-        if sandbox.is_ipv6_denied {
-            continue;
-        }
-        if sandbox.mode == Mode::Allowlist {
-            let _ = writeln!(
-                out,
-                "add rule ip6 {NAT6_TABLE} prerouting ip6 saddr {} tcp dport {{ 80, 443 }} redirect to :{PROXY_PORT}",
-                src6(sandbox)
-            );
-        }
-        // The proxy's upstream sockets for this sandbox leave from its own
-        // address, which is routed to the tap rather than held by the host,
-        // so they are bound to the node's and translated on the way out.
-        if let (Some((address, _)), true) = (sandbox.public.v6.first(), sandbox.public.mark != 0) {
-            let _ = writeln!(
-                out,
-                "add rule ip6 {NAT6_TABLE} postrouting meta mark {:#x} ip6 daddr != {POOL6} snat to {address}",
-                sandbox.public.mark
-            );
-        }
-        if sandbox.mode == Mode::Open {
-            let translation = match sandbox.public.v6.first() {
-                Some((address, _)) => format!("snat to {address}"),
-                None => "masquerade".to_string(),
-            };
-            let _ = writeln!(
-                out,
-                "add rule ip6 {NAT6_TABLE} postrouting ip6 saddr {guest} ip6 daddr != {POOL6} {translation}"
-            );
-        }
+        nat6_rules(out, sandbox);
+    }
+}
+
+fn nat6_rules(out: &mut String, sandbox: &SandboxRules) {
+    let guest = sandbox.guest_ip6;
+    // A sandbox denied v6 is neither redirected nor translated: its v6
+    // packets meet the drop in the sandbox chain and nothing else.
+    if sandbox.is_ipv6_denied {
+        return;
+    }
+    if sandbox.mode == Mode::Allowlist {
+        let _ = writeln!(
+            out,
+            "add rule ip6 {NAT6_TABLE} prerouting ip6 saddr {} tcp dport {{ 80, 443 }} redirect to :{PROXY_PORT}",
+            src6(sandbox)
+        );
+    }
+    // The proxy's upstream sockets for this sandbox leave from its own
+    // address, which is routed to the tap rather than held by the host,
+    // so they are bound to the node's and translated on the way out.
+    if let (Some((address, _)), true) = (sandbox.public.v6.first(), sandbox.public.mark != 0) {
+        let _ = writeln!(
+            out,
+            "add rule ip6 {NAT6_TABLE} postrouting meta mark {:#x} ip6 daddr != {POOL6} snat to {address}",
+            sandbox.public.mark
+        );
+    }
+    if sandbox.mode == Mode::Open {
+        let translation = match sandbox.public.v6.first() {
+            Some((address, _)) => format!("snat to {address}"),
+            None => "masquerade".to_string(),
+        };
+        let _ = writeln!(
+            out,
+            "add rule ip6 {NAT6_TABLE} postrouting ip6 saddr {guest} ip6 daddr != {POOL6} {translation}"
+        );
     }
 }
 
@@ -1251,81 +1306,85 @@ fn render_nat(out: &mut String, sandboxes: &[SandboxRules]) {
     }
 
     for sandbox in sandboxes {
-        // Allowlist mode never routes outward on its own: its web traffic is
-        // redirected to the proxy, which reads the requested hostname and
-        // decides. Redirect happens in prerouting, before any routing
-        // decision, so the guest needs no proxy configuration.
-        if sandbox.mode == Mode::Allowlist {
-            // Traffic to a private-network peer is not egress and must reach
-            // the peer unchanged. Without this it is swept into the egress
-            // proxy along with everything else on 80/443 and denied there for
-            // not being an allowlisted *domain*, so joining a network would
-            // silently stop working under allowlist mode. Ordered before the
-            // redirect because nftables takes the first terminating verdict.
-            if !sandbox.peers.is_empty() {
-                let _ = writeln!(
-                    out,
-                    "add rule ip {NAT_TABLE} prerouting ip saddr {} ip daddr {{ {} }} accept",
-                    sandbox.guest_ip,
-                    sandbox
-                        .peers
-                        .iter()
-                        .map(|peer| peer.to_string())
-                        .collect::<Vec<_>>()
-                        .join(", ")
-                );
-            }
+        nat_rules(out, sandbox);
+    }
+}
+
+fn nat_rules(out: &mut String, sandbox: &SandboxRules) {
+    // Allowlist mode never routes outward on its own: its web traffic is
+    // redirected to the proxy, which reads the requested hostname and
+    // decides. Redirect happens in prerouting, before any routing
+    // decision, so the guest needs no proxy configuration.
+    if sandbox.mode == Mode::Allowlist {
+        // Traffic to a private-network peer is not egress and must reach
+        // the peer unchanged. Without this it is swept into the egress
+        // proxy along with everything else on 80/443 and denied there for
+        // not being an allowlisted *domain*, so joining a network would
+        // silently stop working under allowlist mode. Ordered before the
+        // redirect because nftables takes the first terminating verdict.
+        if !sandbox.peers.is_empty() {
             let _ = writeln!(
                 out,
-                "add rule ip {NAT_TABLE} prerouting ip saddr {} tcp dport {{ 80, 443 }} redirect to :{PROXY_PORT}",
-                src4(sandbox)
-            );
-        }
-        if let (Some(address), true) = (sandbox.public.v4.first(), sandbox.public.mark != 0) {
-            let _ = writeln!(
-                out,
-                "add rule ip {NAT_TABLE} postrouting meta mark {:#x} ip daddr != {SANDBOX_POOL} snat to {address}",
-                sandbox.public.mark
-            );
-        }
-        // Only open-mode sandboxes reach the internet directly; allowlist mode
-        // egresses through the proxy, which is a host-local connection.
-        if sandbox.mode == Mode::Open {
-            // Everywhere except the sandbox pool, for the same reason allowlist
-            // mode exempts its peers from the redirect: traffic to a
-            // private-network peer is not egress. Translated, it would reach a
-            // local peer wearing the gateway's address, and a peer on another
-            // node wearing this node's mesh address, which that node's rules do
-            // not recognise as this sandbox and so drop.
-            // A sandbox with an address of its own leaves from it even when a
-            // socket chose the private one: a guest is not obliged to prefer
-            // the source its default route names.
-            let translation = match sandbox.public.v4.first() {
-                Some(address) => format!("snat to {address}"),
-                None => "masquerade".to_string(),
-            };
-            let _ = writeln!(
-                out,
-                "add rule ip {NAT_TABLE} postrouting ip saddr {} ip daddr != {SANDBOX_POOL} {translation}",
-                sandbox.guest_ip
-            );
-        }
-        // Published ports are doors from outside the fleet. Without the
-        // interface guard the rule matches on destination port alone, so any
-        // sandbox, including one in `none` mode, could hit its own gateway
-        // address on a published port and be translated into a neighbour's
-        // service; a mesh peer could do the same across nodes.
-        let external = external_only();
-        for port in &sandbox.ports {
-            let _ = writeln!(
-                out,
-                "add rule ip {NAT_TABLE} prerouting {external} {} dport {} dnat to {}:{}",
-                port.protocol.keyword(),
-                port.host_port,
+                "add rule ip {NAT_TABLE} prerouting ip saddr {} ip daddr {{ {} }} accept",
                 sandbox.guest_ip,
-                port.guest_port
+                sandbox
+                    .peers
+                    .iter()
+                    .map(|peer| peer.to_string())
+                    .collect::<Vec<_>>()
+                    .join(", ")
             );
         }
+        let _ = writeln!(
+            out,
+            "add rule ip {NAT_TABLE} prerouting ip saddr {} tcp dport {{ 80, 443 }} redirect to :{PROXY_PORT}",
+            src4(sandbox)
+        );
+    }
+    if let (Some(address), true) = (sandbox.public.v4.first(), sandbox.public.mark != 0) {
+        let _ = writeln!(
+            out,
+            "add rule ip {NAT_TABLE} postrouting meta mark {:#x} ip daddr != {SANDBOX_POOL} snat to {address}",
+            sandbox.public.mark
+        );
+    }
+    // Only open-mode sandboxes reach the internet directly; allowlist mode
+    // egresses through the proxy, which is a host-local connection.
+    if sandbox.mode == Mode::Open {
+        // Everywhere except the sandbox pool, for the same reason allowlist
+        // mode exempts its peers from the redirect: traffic to a
+        // private-network peer is not egress. Translated, it would reach a
+        // local peer wearing the gateway's address, and a peer on another
+        // node wearing this node's mesh address, which that node's rules do
+        // not recognise as this sandbox and so drop.
+        // A sandbox with an address of its own leaves from it even when a
+        // socket chose the private one: a guest is not obliged to prefer
+        // the source its default route names.
+        let translation = match sandbox.public.v4.first() {
+            Some(address) => format!("snat to {address}"),
+            None => "masquerade".to_string(),
+        };
+        let _ = writeln!(
+            out,
+            "add rule ip {NAT_TABLE} postrouting ip saddr {} ip daddr != {SANDBOX_POOL} {translation}",
+            sandbox.guest_ip
+        );
+    }
+    // Published ports are doors from outside the fleet. Without the
+    // interface guard the rule matches on destination port alone, so any
+    // sandbox, including one in `none` mode, could hit its own gateway
+    // address on a published port and be translated into a neighbour's
+    // service; a mesh peer could do the same across nodes.
+    let external = external_only();
+    for port in &sandbox.ports {
+        let _ = writeln!(
+            out,
+            "add rule ip {NAT_TABLE} prerouting {external} {} dport {} dnat to {}:{}",
+            port.protocol.keyword(),
+            port.host_port,
+            sandbox.guest_ip,
+            port.guest_port
+        );
     }
 }
 
@@ -1530,7 +1589,7 @@ mod tests {
             door(IngressProtocol::Icmp, &[], &[]),
         ];
         let ruleset = render(&[rules]);
-        let door = "add rule inet burrow sandbox oifname \"bt1\" iifname != \"bt*\" iifname != \"burrow-wg\"";
+        let door = "add rule inet burrow allow oifname \"bt1\" iifname != \"bt*\" iifname != \"burrow-wg\"";
         assert!(ruleset.contains(&format!(
             "{door} ip daddr 203.0.113.17 tcp dport {{ 25, 587 }} accept"
         )));
@@ -1594,7 +1653,7 @@ mod tests {
         let ruleset = render(&[public(Mode::Open)]);
         assert!(ruleset.contains("antispoof iifname \"bt1\" ip saddr 203.0.113.17 return"));
         assert!(ruleset.contains("antispoof iifname \"bt1\" ip6 saddr 2001:db8:100:1::/64 return"));
-        assert!(ruleset.contains("sandbox ip saddr { 10.99.0.6, 203.0.113.17 } accept"));
+        assert!(ruleset.contains("allow ip saddr { 10.99.0.6, 203.0.113.17 } accept"));
         // The private address leaves translated to the public one, not the node's.
         assert!(
             ruleset.contains("ip saddr 10.99.0.6 ip daddr != 10.99.0.0/16 snat to 203.0.113.17")
@@ -1745,7 +1804,7 @@ mod tests {
             }
         }
         // Reaching arbitrary hosts is still refused in allowlist mode.
-        assert!(!render(&[sandbox(Mode::Allowlist)]).contains("sandbox ip saddr 10.99.0.6 accept"));
+        assert!(!render(&[sandbox(Mode::Allowlist)]).contains("allow ip saddr 10.99.0.6 accept"));
     }
 
     #[test]
@@ -1769,7 +1828,7 @@ mod tests {
             "tohost ip saddr 10.99.0.6 ip daddr 10.99.0.5 udp dport {DNS_PORT} accept"
         )));
         // No blanket egress accept for the guest address.
-        assert!(!ruleset.contains("sandbox ip saddr 10.99.0.6 accept"));
+        assert!(!ruleset.contains("allow ip saddr 10.99.0.6 accept"));
     }
 
     #[test]
@@ -1901,7 +1960,7 @@ mod tests {
     fn open_mode_cannot_reach_another_sandbox_here_or_on_another_node() {
         let ruleset = render(&[sandbox(Mode::Open)]);
 
-        let deny = "sandbox ip saddr 10.99.0.6 ip daddr 10.99.0.0/16 drop";
+        let deny = "allow ip saddr 10.99.0.6 ip daddr 10.99.0.0/16 drop";
         assert!(
             ruleset.contains(deny),
             "missing the pool denial:\n{ruleset}"
@@ -1911,7 +1970,7 @@ mod tests {
         assert!(!ruleset.contains("ip daddr 10.99.0.0/22 drop"));
 
         // Before the blanket accept, or the accept wins.
-        let accept = "sandbox ip saddr 10.99.0.6 accept";
+        let accept = "allow ip saddr 10.99.0.6 accept";
         assert!(
             ruleset.find(deny) < ruleset.find(accept),
             "the denial must precede the blanket accept"
@@ -1933,7 +1992,7 @@ mod tests {
             "missing the metadata denial:\n{ruleset}"
         );
 
-        let accept = "sandbox ip saddr 10.99.0.6 accept";
+        let accept = "allow ip saddr 10.99.0.6 accept";
         assert!(
             ruleset.find(deny) < ruleset.find(accept),
             "the denial must precede the blanket accept"
@@ -1950,7 +2009,7 @@ mod tests {
         let ruleset = render(&[s]);
 
         let deny = "sandbox ip saddr 10.99.0.6 ip daddr 169.254.0.0/16 drop";
-        let peer_accept = "sandbox ip saddr 10.99.0.6 ip daddr 169.254.169.254 accept";
+        let peer_accept = "allow ip saddr 10.99.0.6 ip daddr 169.254.169.254 accept";
         assert!(
             ruleset.contains(deny),
             "missing the metadata denial:\n{ruleset}"
@@ -1970,10 +2029,10 @@ mod tests {
         s.peers = vec![Ipv4Addr::new(10, 99, 0, 10), Ipv4Addr::new(10, 99, 4, 6)];
         let ruleset = render(&[s]);
 
-        let deny = "sandbox ip saddr 10.99.0.6 ip daddr 10.99.0.0/16 drop";
+        let deny = "allow ip saddr 10.99.0.6 ip daddr 10.99.0.0/16 drop";
         for peer in [
-            "sandbox ip saddr 10.99.0.6 ip daddr 10.99.0.10 accept",
-            "sandbox ip saddr 10.99.0.6 ip daddr 10.99.4.6 accept",
+            "allow ip saddr 10.99.0.6 ip daddr 10.99.0.10 accept",
+            "allow ip saddr 10.99.0.6 ip daddr 10.99.4.6 accept",
         ] {
             assert!(ruleset.contains(peer), "missing {peer}:\n{ruleset}");
             assert!(
@@ -1994,7 +2053,7 @@ mod tests {
         )));
         // Egress itself is untouched: everything outside the pool is accepted
         // and translated.
-        assert!(open.contains("sandbox ip saddr 10.99.0.6 accept"));
+        assert!(open.contains("allow ip saddr 10.99.0.6 accept"));
         assert!(open.contains("ip daddr != 10.99.0.0/16 masquerade"));
 
         // Allowlist is unchanged in every respect, proxy included.
@@ -2116,7 +2175,7 @@ mod tests {
     /// closing drop is what enforces the latter.
     #[test]
     fn ipv6_egress_follows_the_same_mode_as_ipv4() {
-        let accept = "sandbox ip6 saddr fd99:b070:0:1::2 accept";
+        let accept = "allow ip6 saddr fd99:b070:0:1::2 accept";
         for mode in [Mode::None, Mode::Allowlist] {
             let ruleset = render(&[sandbox(mode)]);
             assert!(
@@ -2128,7 +2187,7 @@ mod tests {
         assert!(open.contains(accept), "open must accept guest v6:\n{open}");
         // And the fleet is not the internet: the pool is dropped first, so an
         // open sandbox reaches out and never sideways.
-        let pool = format!("sandbox ip6 saddr fd99:b070:0:1::2 ip6 daddr {POOL6} drop");
+        let pool = format!("allow ip6 saddr fd99:b070:0:1::2 ip6 daddr {POOL6} drop");
         assert!(open.contains(&pool), "{open}");
         assert!(
             open.find(&pool) < open.find(accept),
@@ -2274,7 +2333,7 @@ mod tests {
         );
         assert!(
             ruleset.contains(&format!(
-                "sandbox {guard} ip daddr 10.99.0.6 tcp dport 8000 accept"
+                "allow {guard} ip daddr 10.99.0.6 tcp dport 8000 accept"
             )),
             "the forward accept must not grant sandbox-to-sandbox access:\n{ruleset}"
         );
@@ -2385,7 +2444,7 @@ mod tests {
         before.allow_cidrs = vec!["10.77.0.0/16".into()];
         let before = render(&[before]);
         assert!(before.contains("ip daddr 10.77.0.0/16 accept"));
-        assert!(before.contains("sandbox ip saddr 10.99.0.6 accept"));
+        assert!(before.contains("allow ip saddr 10.99.0.6 accept"));
 
         let mut after = sandbox(Mode::None);
         after.deny_cidrs = vec!["10.77.0.0/16".into()];
@@ -2393,7 +2452,7 @@ mod tests {
 
         assert!(after.contains("flush table inet burrow"));
         assert!(!after.contains("ip daddr 10.77.0.0/16 accept"));
-        assert!(!after.contains("sandbox ip saddr 10.99.0.6 accept"));
+        assert!(!after.contains("allow ip saddr 10.99.0.6 accept"));
         assert!(after.contains("ip daddr 10.77.0.0/16 drop"));
     }
 
@@ -2755,8 +2814,8 @@ mod tests {
         // TCP only: nothing was said about UDP.
         assert!(!ruleset.contains("udp dport 25"));
         // And the rest of open mode is as it was.
-        assert!(ruleset.contains("sandbox ip saddr 10.99.0.6 accept"));
-        assert!(ruleset.contains("sandbox ip6 saddr fd99:b070:0:1::2 accept"));
+        assert!(ruleset.contains("allow ip saddr 10.99.0.6 accept"));
+        assert!(ruleset.contains("allow ip6 saddr fd99:b070:0:1::2 accept"));
     }
 
     #[test]
@@ -2815,7 +2874,7 @@ mod tests {
         assert!(ruleset.contains("add rule inet burrow sandbox ip saddr 10.99.0.6 drop"));
         assert!(ruleset.contains("add rule inet burrow sandbox ip6 saddr fd99:b070:0:1::2 drop"));
         assert!(!ruleset.contains("70000"));
-        assert!(!ruleset.contains("sandbox ip saddr 10.99.0.6 accept"));
+        assert!(!ruleset.contains("allow ip saddr 10.99.0.6 accept"));
     }
 
     #[test]
@@ -2854,7 +2913,7 @@ mod tests {
             assert!(ruleset.contains("nd-neighbor-solicit"));
             // And v4 is untouched.
             if mode == Mode::Open {
-                assert!(ruleset.contains("sandbox ip saddr 10.99.0.6 accept"));
+                assert!(ruleset.contains("allow ip saddr 10.99.0.6 accept"));
                 assert!(ruleset.contains("ip saddr 10.99.0.6 ip daddr != 10.99.0.0/16 masquerade"));
             }
         }
@@ -2863,7 +2922,7 @@ mod tests {
     #[test]
     fn ipv6_is_rendered_as_before_when_not_denied() {
         let open = render(&[sandbox(Mode::Open)]);
-        assert!(open.contains("sandbox ip6 saddr fd99:b070:0:1::2 accept"));
+        assert!(open.contains("allow ip6 saddr fd99:b070:0:1::2 accept"));
         assert!(open.contains("ip6 saddr fd99:b070:0:1::2 ip6 daddr != fd99:b070::/48 masquerade"));
         assert!(!open.contains("sandbox ip6 saddr fd99:b070:0:1::2 drop"));
         let allow = render(&[sandbox(Mode::Allowlist)]);
@@ -2927,7 +2986,7 @@ mod tests {
         )));
         // Everything else is still open mode's blanket accept and masquerade,
         // with no blanket redirect of 80 or 443.
-        assert!(ruleset.contains("sandbox ip saddr 10.99.0.6 accept"));
+        assert!(ruleset.contains("allow ip saddr 10.99.0.6 accept"));
         assert!(!ruleset.contains("tcp dport { 80, 443 } redirect"));
 
         // Selective inspection is an open-mode notion: an allowlist sandbox
@@ -2968,5 +3027,48 @@ mod tests {
             ]
         );
         assert!(redirect_inspected(guest, &[Ipv4Addr::new(10, 0, 0, 1)], 60).is_empty());
+    }
+
+    /// An added sandbox's rules are the ones a full render gives it, so a
+    /// node that adds them to what it applied holds what it would render.
+    #[test]
+    fn an_added_sandbox_gets_exactly_its_full_render_rules() {
+        let neighbour = SandboxRules {
+            sandbox_id: "sbx_other".into(),
+            tap: "bt2".into(),
+            host_ip: Ipv4Addr::new(10, 99, 0, 9),
+            guest_ip: Ipv4Addr::new(10, 99, 0, 10),
+            host_ip6: "fd99:b070:0:2::1".parse().unwrap(),
+            guest_ip6: "fd99:b070:0:2::2".parse().unwrap(),
+            ..sandbox(Mode::Open)
+        };
+        for mode in [Mode::None, Mode::Allowlist, Mode::Open] {
+            let added = sandbox(mode);
+            let before = render_with(std::slice::from_ref(&neighbour), &[]);
+            let after = render_with(&[neighbour.clone(), added.clone()], &[]);
+            let rules = |text: &str| -> std::collections::BTreeSet<String> {
+                text.lines()
+                    .filter(|line| line.starts_with("add rule") || line.starts_with("add counter"))
+                    .map(str::to_string)
+                    .collect()
+            };
+            let gained: std::collections::BTreeSet<String> =
+                rules(&after).difference(&rules(&before)).cloned().collect();
+            let incremental: std::collections::BTreeSet<String> = render_added(&added)
+                .unwrap()
+                .lines()
+                .filter(|line| !line.starts_with('#'))
+                .map(|line| line.replacen("insert rule", "add rule", 1))
+                .collect();
+            assert_eq!(incremental, gained, "{mode:?}");
+        }
+    }
+
+    #[test]
+    fn a_sandbox_that_changes_others_is_not_added_alone() {
+        let mut peered = sandbox(Mode::Open);
+        peered.peers = vec![Ipv4Addr::new(10, 99, 0, 10)];
+        assert!(render_added(&peered).is_none());
+        assert!(render_added(&public(Mode::Open)).is_none());
     }
 }

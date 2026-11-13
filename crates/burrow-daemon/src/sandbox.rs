@@ -2674,6 +2674,9 @@ pub struct SandboxManager {
     /// Creates whose rules are in force before their sandbox is in the map;
     /// see [`SandboxManager::rule_ahead`].
     ruled_ahead: Arc<std::sync::Mutex<HashMap<String, Ruled>>>,
+    /// The control plane the last full render denied, which is what an
+    /// incremental add relies on being in force; `None` before one lands.
+    applied_denied: Arc<std::sync::Mutex<Option<Vec<std::net::IpAddr>>>>,
     /// What each template has been asked for, and what has been warmed.
     ///
     /// Both halves are bounded per template. The shapes come from create
@@ -2866,6 +2869,7 @@ impl SandboxManager {
             warm_queue: Arc::new(tokio::sync::Mutex::new(())),
             firewall: Arc::new(tokio::sync::Mutex::new(())),
             ruled_ahead: Default::default(),
+            applied_denied: Default::default(),
             snapshots: Arc::new(crate::snapshot::SnapshotStore::new(
                 &config.data_dir,
                 config.object_store.clone(),
@@ -4614,14 +4618,36 @@ impl SandboxManager {
             return Ok(());
         }
         let added = added.and_then(|added| rules.iter().find(|r| r.sandbox_id == added.id));
-        let ruleset = match added {
-            Some(added) => firewall::render_adding(&rules, &denied, added),
-            None => firewall::render_with(&rules, &denied),
+        // Added on its own to the ruleset this node last applied in full,
+        // which holds everyone else already, when nothing else changes with
+        // it. A failure falls back to the full render, which a half-known
+        // state is no reason to skip.
+        let is_current = self.applied_denied.lock().unwrap().as_ref() == Some(&denied);
+        let incremental = added
+            .filter(|_| is_current)
+            .and_then(firewall::render_added);
+        let is_added = match incremental {
+            Some(script) => match firewall::apply(&script).await {
+                Ok(()) => true,
+                Err(err) => {
+                    tracing::warn!(%err, "adding a sandbox's rules alone failed; rendering them all");
+                    false
+                }
+            },
+            None => false,
         };
-        firewall::apply(&ruleset).await.map_err(|err| {
-            tracing::error!(%err, "failed to apply firewall ruleset");
-            Status::internal(format!("applying the firewall ruleset: {err}"))
-        })?;
+        if !is_added {
+            *self.applied_denied.lock().unwrap() = None;
+            let ruleset = match added {
+                Some(added) => firewall::render_adding(&rules, &denied, added),
+                None => firewall::render_with(&rules, &denied),
+            };
+            firewall::apply(&ruleset).await.map_err(|err| {
+                tracing::error!(%err, "failed to apply firewall ruleset");
+                Status::internal(format!("applying the firewall ruleset: {err}"))
+            })?;
+            *self.applied_denied.lock().unwrap() = Some(denied);
+        }
         self.sync_public_routes(&rules, &publics).await;
         Ok(())
     }
