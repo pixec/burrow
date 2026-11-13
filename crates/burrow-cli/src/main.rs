@@ -4761,12 +4761,12 @@ async fn list_sessions(client: &mut Client, id: String) -> anyhow::Result<()> {
         return Ok(());
     }
     println!(
-        "{:<40} {:<9} {:<11} {:<22} ENDED AT",
+        "{:<40} {:<9} {:<13} {:<22} ENDED AT",
         "SESSION", "START", "END", "STARTED AT"
     );
     for session in resp.sessions {
         println!(
-            "{:<40} {:<9} {:<11} {:<22} {}",
+            "{:<40} {:<9} {:<13} {:<22} {}",
             session.id,
             common::SessionStart::try_from(session.started_by)
                 .unwrap_or_default()
