@@ -26,23 +26,45 @@ const CANDIDATES: [&str; 2] = ["/usr/lib/systemd/systemd", "/lib/systemd/systemd
 
 /// Units masked for every boot, without touching the image's disk.
 ///
-/// The getty would take over the agent's console, which nobody can log in on.
-/// The rest manage the network burrow configures: they would fight it for the
-/// interface, a restore re-addresses it under them, and their wait-online
+/// The gettys would take over the agent's console, or a VT nobody can log in
+/// on. Networkd, NetworkManager, netplan, resolved and their helpers manage
+/// the network burrow configures: they would fight it for the interface and
+/// the resolver, a restore re-addresses it under them, and their wait-online
 /// units would hold boot for minutes on a DHCP lease nothing hands out.
-const MASKED: [&str; 11] = [
+/// cloud-init waits on a datasource there is none of. The clock is set from
+/// the host before a handshake returns, so nothing has to wait for NTP, and
+/// udev-settle waits on hardware a microVM does not have. The package
+/// managers' timers take the package lock out from under a user's own install.
+const MASKED: [&str; 24] = [
     "console-getty.service",
+    "getty@.service",
+    "serial-getty@.service",
     "systemd-networkd.service",
     "systemd-networkd.socket",
     "systemd-networkd-wait-online.service",
     "NetworkManager.service",
     "NetworkManager-wait-online.service",
+    "netplan-configure.service",
+    "networkd-dispatcher.service",
+    "systemd-resolved.service",
+    "cloud-init.target",
     "cloud-init-local.service",
+    "cloud-init-main.service",
     "cloud-init.service",
     "cloud-init-network.service",
     "cloud-config.service",
     "cloud-final.service",
+    "systemd-time-wait-sync.service",
+    "chrony-wait.service",
+    "systemd-udev-settle.service",
+    "apt-daily.timer",
+    "apt-daily-upgrade.timer",
+    "dnf-makecache.timer",
 ];
+
+/// Masked on a kernel built without module support, where they can only fail.
+const MODULE_UNITS: [&str; 2] = ["systemd-modules-load.service", "modprobe@.service"];
+
 const CGROUP_ROOT: &str = "/sys/fs/cgroup";
 
 /// Where systemd reports readiness. Abstract, so it needs no path both mount
@@ -66,11 +88,50 @@ fn ready() -> &'static tokio::sync::watch::Sender<bool> {
 }
 
 pub fn is_requested() -> bool {
-    std::fs::read_to_string("/proc/cmdline").is_ok_and(|cmdline| {
-        cmdline
-            .split_whitespace()
-            .any(|arg| arg == "burrow.systemd=1")
-    })
+    boot_arg("burrow.systemd=").as_deref() == Some("1")
+}
+
+fn boot_arg(key: &str) -> Option<String> {
+    std::fs::read_to_string("/proc/cmdline")
+        .ok()?
+        .split_whitespace()
+        .find_map(|arg| arg.strip_prefix(key))
+        .map(str::to_owned)
+}
+
+/// What to mask on this boot: [`MASKED`], and the module units on a kernel
+/// that cannot load modules.
+fn masks(is_modular: bool) -> Vec<&'static str> {
+    MASKED
+        .into_iter()
+        .chain(MODULE_UNITS.into_iter().filter(|_| !is_modular))
+        .collect()
+}
+
+/// Gives a guest whose image left the machine ID for its first boot one of
+/// its own, before systemd sees it.
+///
+/// Every sandbox boots a fresh copy of the template's disk, so to systemd
+/// each of them would be a first boot: systemd-firstboot, presets applied to
+/// every unit, and units conditioned on it, on every create.
+fn ensure_machine_id() {
+    const PATH: &str = "/etc/machine-id";
+    match std::fs::read_to_string(PATH) {
+        Ok(id) if id.trim() != "uninitialized" => return,
+        Err(err) if err.kind() != std::io::ErrorKind::NotFound => return,
+        _ => {}
+    }
+    let mut id = [0u8; 16];
+    if let Err(err) = std::fs::File::open("/dev/urandom")
+        .and_then(|mut random| std::io::Read::read_exact(&mut random, &mut id))
+    {
+        tracing::warn!(%err, "no randomness for a machine ID; systemd will take a first boot");
+        return;
+    }
+    let id: String = id.iter().map(|byte| format!("{byte:02x}")).collect();
+    if let Err(err) = std::fs::write(PATH, format!("{id}\n")) {
+        tracing::warn!(%err, "could not write a machine ID; systemd will take a first boot");
+    }
 }
 
 pub fn pid() -> Option<i32> {
@@ -105,6 +166,7 @@ pub fn start() {
         tracing::error!(%err, "cannot delegate cgroups to systemd; running agent-only");
         return;
     }
+    ensure_machine_id();
     listen_for_notify();
     ready().send_replace(false);
     let _gate = reaper::hold();
@@ -280,7 +342,12 @@ fn spawn(binary: &'static str) -> std::io::Result<i32> {
     let mut command = Command::new(binary);
     // In a container systemd reads these from its own arguments rather than
     // the kernel's. Status goes to /dev/console whatever stdout is.
-    command.args(MASKED.map(|unit| format!("systemd.mask={unit}")));
+    let is_modular = std::path::Path::new("/proc/modules").exists();
+    command.args(
+        masks(is_modular)
+            .into_iter()
+            .map(|unit| format!("systemd.mask={unit}")),
+    );
     if !tracing::enabled!(tracing::Level::DEBUG) {
         command.args(["systemd.show_status=0", "systemd.log_target=journal"]);
     }
@@ -441,5 +508,16 @@ impl Namespaces {
                 .join()
                 .map_err(|_| std::io::Error::other("spawner panicked"))?
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn module_units_are_masked_only_without_module_support() {
+        assert!(!masks(true).contains(&"modprobe@.service"));
+        assert!(masks(false).contains(&"modprobe@.service"));
     }
 }
