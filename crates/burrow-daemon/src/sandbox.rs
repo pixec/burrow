@@ -3628,10 +3628,9 @@ impl SandboxManager {
             tx_bytes: record.tx_bytes,
             ..Default::default()
         };
-        let is_systemd =
+        let environment =
             crate::oci::sandbox_environment(&self.config.data_dir, &workdir, &record.template)
-                .await
-                .systemd;
+                .await;
         let spec = self.build_spec(
             &row.id,
             &workdir,
@@ -3641,7 +3640,7 @@ impl SandboxManager {
             &lease,
             &row.tap,
             &volumes,
-            is_systemd,
+            environment.booted_systemd(),
             stored_policy.is_console_verbose,
         );
 
@@ -6801,7 +6800,7 @@ impl SandboxManager {
         lease: &Lease,
         tap_name: &str,
         volumes: &[common::VolumeMount],
-        is_systemd: bool,
+        systemd: Option<&crate::oci::SystemdBoot>,
         is_console_verbose: bool,
     ) -> VmSpec {
         let mut spec = VmSpec::new(id.to_string(), workdir, self.config.backend(hypervisor));
@@ -6877,7 +6876,7 @@ impl SandboxManager {
                 lease.guest_ip6(),
                 lease.prefix_len6(),
                 lease.host_ip6(),
-                guest_mode_arg(is_systemd),
+                guest_mode_arg(systemd, false),
                 guest_boot_args(
                     &self.config.extra_boot_args,
                     is_console_verbose || self.config.is_console_verbose
@@ -7434,7 +7433,6 @@ impl SandboxManager {
             || (capabilities.is_drive_hotplug_supported && !crate::macnode::is_macos(guest_os));
         let boot_volumes: &[common::VolumeMount] =
             if is_hotplugged { &[] } else { &policy.volumes };
-        let is_systemd = environment.systemd;
         let mut spec = self.build_spec(
             &id,
             &workdir,
@@ -7444,7 +7442,7 @@ impl SandboxManager {
             &lease,
             &tap_name,
             boot_volumes,
-            is_systemd,
+            environment.booted_systemd(),
             policy.is_console_verbose,
         );
         // Only meaningful on a restore, and only when the template was
@@ -8378,9 +8376,12 @@ impl SandboxManager {
         // the snapshot this is restoring was taken without them. They are
         // hotplugged below instead, before the handshake that tells the guest
         // to rescan for them.
-        let is_systemd = match &source {
-            RestoreSource::Stored { manifest, .. } => manifest.is_systemd,
-            _ => self.image_environment(&source.template()).await.systemd,
+        let environment = match &source {
+            RestoreSource::Stored { manifest, .. } => crate::oci::ImageEnvironment {
+                systemd: manifest.is_systemd,
+                ..manifest.image.clone()
+            },
+            _ => self.image_environment(&source.template()).await,
         };
         let mut spec = self.build_spec(
             &id,
@@ -8394,7 +8395,7 @@ impl SandboxManager {
                 true => &policy.volumes,
                 false => &[],
             },
-            is_systemd,
+            environment.booted_systemd(),
             policy.is_console_verbose,
         );
         // The template's plan names the pages its agent touches on the way to
@@ -8801,7 +8802,6 @@ impl SandboxManager {
             .get_or_insert_with(Default::default)
             .resources = Some(resources.clone());
         let environment = self.environment_of(&sandbox).await;
-        let is_systemd = environment.systemd;
         // Hotplugged once the agent is up, as a create does.
         let is_hotplugged = sandbox.hypervisor.capabilities().is_drive_hotplug_supported
             && !crate::macnode::is_macos(guest_os);
@@ -8819,7 +8819,7 @@ impl SandboxManager {
             &sandbox.lease,
             &sandbox.tap,
             boot_volumes,
-            is_systemd,
+            environment.booted_systemd(),
             policy.is_console_verbose,
         );
         let from = self.boundary(&sandbox).await;
@@ -10040,7 +10040,7 @@ impl SandboxManager {
             &lease,
             &tap_name,
             &policy.volumes,
-            manifest.is_systemd,
+            manifest.is_systemd.then_some(&manifest.image.systemd_boot),
             policy.is_console_verbose,
         );
         let record = common::Sandbox {
@@ -10598,7 +10598,6 @@ async fn attach_volumes(
     Ok(())
 }
 
-/// Tells the agent to run the template's systemd under it.
 /// The node's extra kernel arguments, made verbose for a sandbox debugging
 /// its template: `quiet` and any `loglevel` dropped for `loglevel=7`, so the
 /// kernel's whole boot reaches the console.
@@ -10614,8 +10613,23 @@ pub(crate) fn guest_boot_args(extra: &str, is_verbose: bool) -> String {
         .join(" ")
 }
 
-pub(crate) fn guest_mode_arg(is_systemd: bool) -> &'static str {
-    if is_systemd { "burrow.systemd=1" } else { "" }
+/// Tells the agent to run the template's systemd under it, and how.
+///
+/// A warm build always waits for systemd to finish starting, whatever the
+/// template accepts for a cold boot: its clones restore with it up.
+pub(crate) fn guest_mode_arg(systemd: Option<&crate::oci::SystemdBoot>, is_warm: bool) -> String {
+    let Some(systemd) = systemd else {
+        return String::new();
+    };
+    let mut args = String::from("burrow.systemd=1");
+    if systemd.is_ready_at_agent && !is_warm {
+        args.push_str(" burrow.systemd.ready=agent");
+    }
+    if !systemd.unmask.is_empty() {
+        args.push_str(" burrow.systemd.unmask=");
+        args.push_str(&systemd.unmask.join(","));
+    }
+    args
 }
 
 /// Hands a sandbox's staged files to the uid firecracker will drop to.

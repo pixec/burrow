@@ -35,6 +35,8 @@ const CANDIDATES: [&str; 2] = ["/usr/lib/systemd/systemd", "/lib/systemd/systemd
 /// the host before a handshake returns, so nothing has to wait for NTP, and
 /// udev-settle waits on hardware a microVM does not have. The package
 /// managers' timers take the package lock out from under a user's own install.
+///
+/// A template unmasks any of them with `burrow.systemd.unmask=`.
 const MASKED: [&str; 24] = [
     "console-getty.service",
     "getty@.service",
@@ -99,12 +101,20 @@ fn boot_arg(key: &str) -> Option<String> {
         .map(str::to_owned)
 }
 
-/// What to mask on this boot: [`MASKED`], and the module units on a kernel
-/// that cannot load modules.
-fn masks(is_modular: bool) -> Vec<&'static str> {
+/// Whether the template has the handshake return once the agent is up rather
+/// than once systemd has finished starting.
+fn is_ready_at_agent() -> bool {
+    static AT_AGENT: OnceLock<bool> = OnceLock::new();
+    *AT_AGENT.get_or_init(|| boot_arg("burrow.systemd.ready=").as_deref() == Some("agent"))
+}
+
+/// What to mask on this boot: [`MASKED`], the module units on a kernel that
+/// cannot load modules, less whatever the template unmasked.
+fn masks(unmasked: &str, is_modular: bool) -> Vec<&'static str> {
     MASKED
         .into_iter()
         .chain(MODULE_UNITS.into_iter().filter(|_| !is_modular))
+        .filter(|unit| !unmasked.split(',').any(|kept| kept == *unit))
         .collect()
 }
 
@@ -146,6 +156,9 @@ pub fn pid() -> Option<i32> {
 /// A guest whose systemd is slow or never reports is still usable through the
 /// agent, so running out of time is logged rather than failed.
 pub async fn wait_ready(timeout: std::time::Duration) {
+    if is_ready_at_agent() {
+        return;
+    }
     let mut rx = ready().subscribe();
     if tokio::time::timeout(timeout, rx.wait_for(|ready| *ready))
         .await
@@ -342,9 +355,10 @@ fn spawn(binary: &'static str) -> std::io::Result<i32> {
     let mut command = Command::new(binary);
     // In a container systemd reads these from its own arguments rather than
     // the kernel's. Status goes to /dev/console whatever stdout is.
+    let unmasked = boot_arg("burrow.systemd.unmask=").unwrap_or_default();
     let is_modular = std::path::Path::new("/proc/modules").exists();
     command.args(
-        masks(is_modular)
+        masks(&unmasked, is_modular)
             .into_iter()
             .map(|unit| format!("systemd.mask={unit}")),
     );
@@ -516,8 +530,18 @@ mod tests {
     use super::*;
 
     #[test]
+    fn a_template_unmasks_only_what_it_names() {
+        let masked = masks("chrony-wait.service,apt-daily.timer", true);
+        assert!(!masked.contains(&"chrony-wait.service"));
+        assert!(!masked.contains(&"apt-daily.timer"));
+        assert!(masked.contains(&"systemd-networkd.service"));
+        assert_eq!(masked.len(), MASKED.len() - 2);
+    }
+
+    #[test]
     fn module_units_are_masked_only_without_module_support() {
-        assert!(!masks(true).contains(&"modprobe@.service"));
-        assert!(masks(false).contains(&"modprobe@.service"));
+        assert!(!masks("", true).contains(&"modprobe@.service"));
+        assert!(masks("", false).contains(&"modprobe@.service"));
+        assert!(!masks("modprobe@.service", false).contains(&"modprobe@.service"));
     }
 }

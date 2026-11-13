@@ -202,6 +202,8 @@ struct ImageConfigInner {
     cmd: Vec<String>,
     #[serde(rename = "User", default)]
     user: String,
+    #[serde(rename = "Labels", default)]
+    labels: Option<HashMap<String, String>>,
 }
 
 /// What a sandbox needs to behave like the image it came from.
@@ -223,6 +225,9 @@ pub struct ImageEnvironment {
     /// agent alone.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub systemd: bool,
+    /// How that systemd boots, from the image's labels.
+    #[serde(default, skip_serializing_if = "SystemdBoot::is_default")]
+    pub systemd_boot: SystemdBoot,
     /// The hypervisor every sandbox from this template runs under, chosen
     /// when it was built. Empty takes the guest's default.
     #[serde(default, skip_serializing_if = "String::is_empty")]
@@ -239,7 +244,75 @@ pub struct ImageEnvironment {
     pub kernel_digest: String,
 }
 
+/// A systemd template's boot options, which its image sets with labels.
+#[derive(Debug, Default, Clone, PartialEq, Eq, serde::Serialize, Deserialize)]
+pub struct SystemdBoot {
+    /// A create returns once the agent answers rather than once systemd has
+    /// finished starting. `dev.burrow.systemd.ready=agent`.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub is_ready_at_agent: bool,
+    /// Units the agent would mask that this image needs.
+    /// `dev.burrow.systemd.unmask`, separated by spaces or commas.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub unmask: Vec<String>,
+}
+
+const LABEL_READY: &str = "dev.burrow.systemd.ready";
+const LABEL_UNMASK: &str = "dev.burrow.systemd.unmask";
+
+impl SystemdBoot {
+    fn is_default(&self) -> bool {
+        *self == Self::default()
+    }
+
+    /// Reads the options from an image's labels. A unit name that is not one
+    /// is dropped: these end up on the guest's kernel command line.
+    fn from_labels(labels: &HashMap<String, String>) -> Self {
+        let is_ready_at_agent = match labels.get(LABEL_READY).map(|value| value.trim()) {
+            Some("agent") => true,
+            None | Some("startup") => false,
+            Some(other) => {
+                tracing::warn!(
+                    value = other,
+                    "ignoring {LABEL_READY}: not `startup` or `agent`"
+                );
+                false
+            }
+        };
+        let unmask = labels
+            .get(LABEL_UNMASK)
+            .map(|value| {
+                value
+                    .split(|c: char| c == ',' || c.is_whitespace())
+                    .filter(|unit| !unit.is_empty())
+                    .filter(|unit| {
+                        let is_unit = unit.contains('.')
+                            && unit.chars().all(|c| {
+                                c.is_ascii_alphanumeric()
+                                    || matches!(c, ':' | '_' | '.' | '@' | '-' | '\\')
+                            });
+                        if !is_unit {
+                            tracing::warn!(unit, "ignoring {LABEL_UNMASK} entry: not a unit name");
+                        }
+                        is_unit
+                    })
+                    .map(str::to_owned)
+                    .collect()
+            })
+            .unwrap_or_default();
+        Self {
+            is_ready_at_agent,
+            unmask,
+        }
+    }
+}
+
 impl ImageEnvironment {
+    /// The systemd this template's sandboxes boot, if they boot one.
+    pub fn booted_systemd(&self) -> Option<&SystemdBoot> {
+        self.systemd.then_some(&self.systemd_boot)
+    }
+
     /// The hypervisor and guest this template's sandboxes run as.
     #[allow(clippy::result_large_err)]
     pub fn machine(&self) -> Result<(burrow_vmm::Hypervisor, burrow_vmm::GuestOs), tonic::Status> {
@@ -802,6 +875,7 @@ pub async fn pull(
             user: envelope.config.user,
             kit: None,
             systemd: false,
+            systemd_boot: SystemdBoot::from_labels(&envelope.config.labels.unwrap_or_default()),
             // The build's choice, not the image's.
             hypervisor: String::new(),
             guest_os: String::new(),
@@ -1233,6 +1307,23 @@ fn remove_any(path: &Path) -> std::io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn systemd_labels_keep_only_unit_names() {
+        let labels = HashMap::from([
+            (LABEL_READY.to_string(), "agent".to_string()),
+            (
+                LABEL_UNMASK.to_string(),
+                "chrony-wait.service, getty@.service init=/bin/sh x".to_string(),
+            ),
+        ]);
+        let boot = SystemdBoot::from_labels(&labels);
+        assert!(boot.is_ready_at_agent);
+        assert_eq!(boot.unmask, ["chrony-wait.service", "getty@.service"]);
+
+        let unknown = HashMap::from([(LABEL_READY.to_string(), "basic.target".to_string())]);
+        assert_eq!(SystemdBoot::from_labels(&unknown), SystemdBoot::default());
+    }
 
     #[test]
     fn a_registry_error_document_is_quoted_back() {

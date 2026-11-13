@@ -173,6 +173,7 @@ impl KitTemplate {
             user: merged.user,
             kit: Some(self.clone()),
             systemd: false,
+            systemd_boot: Default::default(),
             // The build's choice, not the image's.
             hypervisor: String::new(),
             guest_os: String::new(),

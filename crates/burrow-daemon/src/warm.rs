@@ -625,7 +625,6 @@ pub async fn build_warm_snapshot(
     }
     let shape = resolve_disk(&templates_dir, template, shape).await?;
     let environment = crate::oci::image_environment(&config.data_dir, template).await;
-    let is_systemd = environment.systemd;
     let (hypervisor, guest_os) = environment.machine()?;
     if !config.hypervisors.contains(&hypervisor) {
         return Err(Status::failed_precondition(format!(
@@ -717,7 +716,7 @@ pub async fn build_warm_snapshot(
             burrow_vmm::DEFAULT_BOOT_ARGS,
             crate::rootdisk::BOOT_ARGS,
             lease.kernel_ip_arg(),
-            crate::sandbox::guest_mode_arg(is_systemd),
+            crate::sandbox::guest_mode_arg(environment.booted_systemd(), true),
             crate::sandbox::guest_boot_args(&config.extra_boot_args, config.is_console_verbose)
         ),
     };

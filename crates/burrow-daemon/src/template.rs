@@ -503,9 +503,9 @@ async fn run_build(
         .await?;
 
     // Steps run on a systemd base, under its systemd, and the image they make
-    // keeps it.
-    let is_systemd =
-        request.is_systemd || crate::oci::image_environment(data_dir, from).await.systemd;
+    // keeps it, with the base's boot options.
+    let base = crate::oci::image_environment(data_dir, from).await;
+    let systemd = (request.is_systemd || base.systemd).then_some(base.systemd_boot);
 
     // From here on the sandbox exists and must be cleaned up on every path.
     let outcome = build_in_sandbox(
@@ -517,7 +517,7 @@ async fn run_build(
         &base_rootfs,
         &commands,
         cached_steps,
-        is_systemd,
+        systemd,
         &hypervisor,
         &kernel,
     )
@@ -556,7 +556,7 @@ async fn build_in_sandbox(
     base_rootfs: &crate::blobs::Digest,
     commands: &[String],
     cached_steps: usize,
-    is_systemd: bool,
+    systemd: Option<crate::oci::SystemdBoot>,
     hypervisor: &str,
     kernel: &KernelSource,
 ) -> Result<(), Status> {
@@ -614,7 +614,8 @@ async fn build_in_sandbox(
 
     let kernel_digest = link_kernel(&target, kernel).await?;
     let config = crate::oci::ImageEnvironment {
-        systemd: is_systemd,
+        systemd: systemd.is_some(),
+        systemd_boot: systemd.unwrap_or_default(),
         hypervisor: hypervisor.to_string(),
         kernel: kernel.name.clone(),
         kernel_digest,
