@@ -320,14 +320,13 @@ impl NodeConfig {
 /// which costs one slow pause and resets the chain.
 const MAX_MEMORY_CHAIN: usize = 4;
 
-/// Longest chain a restored sandbox is left with.
+/// Longest chain a sandbox restored from a snapshot object is left with.
 ///
-/// A fork copies its source's chain whole, so a fork of a fork restores
-/// through three layers and every page fault consults each of them. Past this
-/// the child's chain is flattened behind the create, which is sequential file
-/// work the running guest never notices, rather than on the fork's critical
-/// path. Lower than [`MAX_MEMORY_CHAIN`] because a fork's chain only grows from
-/// here, and a flatten now is cheaper than one under a later suspend.
+/// Past this its chain is flattened behind the create, which is sequential
+/// file work the running guest never notices. Lower than [`MAX_MEMORY_CHAIN`]
+/// because the chain only grows from here, and a flatten now is cheaper than
+/// one under a later suspend. A fork is not held to it: its children are
+/// mostly short-lived, so theirs waits for [`MAX_MEMORY_CHAIN`].
 const MAX_RESTORED_CHAIN: usize = 2;
 
 /// Rebuilds a sandbox's memory chain from the files in its working directory.
@@ -8046,8 +8045,10 @@ impl SandboxManager {
         self.emit_behind(&sandbox, EVENT_CREATED, &format!("fork:{source_id}"));
         self.open_session_behind(&sandbox, STARTED_RESTORE, None);
         let record = sandbox.record();
+        // The child's chain is its source's, flattened only once it suspends
+        // or forks past [`MAX_MEMORY_CHAIN`]: most children are gone before
+        // then, and a flatten now would be a merge and an fsync for nothing.
         self.persist(&sandbox).await;
-        self.compact_behind(&sandbox, MAX_RESTORED_CHAIN);
         tracing::info!(source = source_id, sandbox = child_id, "sandbox forked");
         Ok(record)
     }
