@@ -386,26 +386,38 @@ fn prefetch(
         tracing::warn!(%err, "could not fetch the prefetch plan's pages ahead of the guest");
     }
     let mut filled = 0;
-    for &offset in offsets {
+    let mut at = 0;
+    while at < offsets.len() {
+        let offset = offsets[at];
         // The plan stores file offsets; the address to populate depends on
         // which region covers that offset in *this* restore.
         let Some(region) = regions
             .iter()
             .find(|r| offset >= r.offset && offset < r.offset + r.size as u64)
         else {
+            at += 1;
             continue;
         };
-        let page = region.base_host_virt_addr + (offset - region.offset);
-        // A page already populated returns EEXIST, which copy_page treats as
-        // success; a missing one is simply skipped.
-        match copy_page(fd, region, page, layers, served) {
-            Ok(()) => filled += 1,
-            // Nothing was filled, so a diff will not hold it either.
-            Err(_) => served
-                .lock()
-                .unwrap()
-                .remove_bytes(offset, offset + region.page_size as u64),
+        // Adjacent pages from the same layer go in one copy. The plan is
+        // sorted, and a guest's pages come in runs, so this is a fraction of
+        // the ioctls one per page would be.
+        let page_size = region.page_size as u64;
+        let layer = memfile::resolve(layers, offset);
+        let mut end = at + 1;
+        while end < offsets.len()
+            && offsets[end] == offsets[end - 1] + page_size
+            && offsets[end] < region.offset + region.size as u64
+            && memfile::resolve(layers, offsets[end]) == layer
+        {
+            end += 1;
         }
+        let start = region.base_host_virt_addr + (offset - region.offset);
+        let len = (end - at) as u64 * page_size;
+        // A missing page is simply skipped, and with it the rest of its run.
+        if fill(fd, region, start, len, layer, layers, served).is_ok() {
+            filled += end - at;
+        }
+        at = end;
     }
     filled
 }
@@ -737,20 +749,45 @@ fn copy_page(
     served: &Served,
 ) -> io::Result<()> {
     let offset = region.offset + (page - region.base_host_virt_addr);
-    // Before the page can be present, so no snapshot finds it present and
+    let layer = memfile::resolve(layers, offset);
+    fill(
+        fd,
+        region,
+        page,
+        region.page_size as u64,
+        layer,
+        layers,
+        served,
+    )
+}
+
+/// Populates `len` bytes of `region` from `start`, from the layer at index
+/// `layer`, or with zeroes when no layer defines them.
+fn fill(
+    fd: RawFd,
+    region: &RegionMapping,
+    start: u64,
+    len: u64,
+    layer: Option<usize>,
+    layers: &[Layer],
+    served: &Served,
+) -> io::Result<()> {
+    let offset = region.offset + (start - region.base_host_virt_addr);
+    // Before the pages can be present, so no snapshot finds one present and
     // unrecorded.
-    mark(served, offset, region.page_size as u64);
-    let Some(layer) = memfile::resolve(layers, offset).map(|index| &layers[index]) else {
-        return zero_range(fd, page, page + region.page_size as u64);
+    mark(served, offset, len);
+    let Some(layer) = layer.map(|index| &layers[index]) else {
+        return zero_range(fd, start, start + len);
     };
     if let Some(source) = &layer.source {
-        source.ensure(offset, region.page_size as u64)?;
+        source.ensure(offset, len)?;
     }
-    loop {
+    let mut done = 0;
+    while done < len {
         let mut arg = UffdioCopy {
-            dst: page,
-            src: layer.backing.addr as u64 + offset,
-            len: region.page_size as u64,
+            dst: start + done,
+            src: layer.backing.addr as u64 + offset + done,
+            len: len - done,
             mode: 0,
             copy: 0,
         };
@@ -760,16 +797,25 @@ fn copy_page(
         }
         let err = io::Error::last_os_error();
         match err.raw_os_error() {
-            // Another thread faulted the same page first; the guest is
+            // Another thread faulted the next page first; the guest is
             // unblocked either way.
-            Some(libc::EEXIST) => return Ok(()),
-            // The address space changed under the copy, which filled nothing
-            // and woke nobody. A vCPU stalled on this page stays stalled
-            // until it is filled, so the copy is tried again.
-            Some(libc::EAGAIN) => continue,
-            _ => return Err(err),
+            Some(libc::EEXIST) => done += region.page_size as u64,
+            // A copy cut short, by a page filled since or by the address
+            // space changing under it, which filled what `copy` says and
+            // nothing after. A vCPU stalled on the rest stays stalled until
+            // it is filled, so the copy goes on from there.
+            Some(libc::EAGAIN) => done += arg.copy.max(0) as u64,
+            _ => {
+                // Nothing past `done` was filled, so a diff will not hold it.
+                served
+                    .lock()
+                    .unwrap()
+                    .remove_bytes(offset + done, offset + len);
+                return Err(err);
+            }
         }
     }
+    Ok(())
 }
 
 /// Answers a ballooned-away range with zeroes.
