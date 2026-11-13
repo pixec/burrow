@@ -5,6 +5,11 @@
   "license": "MIT",
   "author": "Pixec Technologies <oss+burrow@pixec.net>",
   "homepage": "https://burrow.pixec.net",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/pixec/burrow.git",
+    "directory": "sdk/typescript"
+  },
   "keywords": ["sandbox", "microvm", "firecracker", "cloud-hypervisor", "agents"],
   "type": "module",
   "main": "./dist/index.js",
