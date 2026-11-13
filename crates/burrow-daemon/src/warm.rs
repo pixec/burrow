@@ -1323,6 +1323,22 @@ mod shape_tests {
         assert_eq!(by_node.evictions(&entries), vec![0, 1]);
     }
 
+    /// A build counts its snapshot as the newest, so the caps pick it only
+    /// when the pinned snapshots leave it no room, which is how the node
+    /// knows not to build it at all.
+    #[test]
+    fn a_snapshot_the_pinned_ones_leave_no_room_for_is_its_own_eviction() {
+        let entries = [
+            entry("app", 1, 512, 6 << 30, 0),
+            entry("app", 1, 1024, 6 << 30, i64::MAX),
+        ];
+        let mut policy = policy(16, 16);
+        policy.per_template_bytes = 8 << 30;
+        assert_eq!(policy.evictions(&entries), vec![1]);
+        policy.per_template_bytes = 12 << 30;
+        assert!(policy.evictions(&entries).is_empty());
+    }
+
     fn temp(name: &str) -> PathBuf {
         let dir = std::env::temp_dir().join(format!(
             "burrow-warm-{name}-{}",

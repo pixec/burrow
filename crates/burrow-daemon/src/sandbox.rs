@@ -6229,8 +6229,19 @@ impl SandboxManager {
         }
         // What the caps would evict once this snapshot is in goes first, so
         // the disk it frees counts towards admitting the build.
-        self.enforce_warm_limits(Some((template, hypervisor, shape, estimate)))
-            .await;
+        if !self
+            .enforce_warm_limits(Some((template, hypervisor, shape, estimate)))
+            .await
+        {
+            return Err(Status::failed_precondition(format!(
+                "a {}x{} snapshot takes about {} MiB, and the pinned shapes' snapshots leave no \
+                 room for it under the --warm-disk-* and --warm-shapes-per-* caps; raise them \
+                 to warm it",
+                shape.vcpus,
+                shape.mem_mib,
+                estimate / burrow_common::disk::MIB
+            )));
+        }
         let _charged = self.admit_disk("", "warm a template", estimate).await?;
         let trust = self.warm_trust(template).await;
         crate::warm::build_warm_snapshot(&self.config, template, shape, &trust)
@@ -6307,11 +6318,14 @@ impl SandboxManager {
 
     /// Evicts the least recently used warm snapshots past the node's caps,
     /// counting `incoming`, a snapshot about to be built, as the newest.
+    /// Returns false, evicting nothing, when the caps would evict `incoming`
+    /// itself: the snapshots they keep leave it no room.
     async fn enforce_warm_limits(
         &self,
         incoming: Option<(&str, Hypervisor, crate::warm::Shape, u64)>,
-    ) {
+    ) -> bool {
         let mut entries = crate::warm::list_all(&self.config.templates_dir()).await;
+        let incoming_index = incoming.is_some().then_some(entries.len());
         if let Some((template, hypervisor, shape, bytes)) = incoming {
             entries.push((
                 template.to_string(),
@@ -6324,11 +6338,12 @@ impl SandboxManager {
                 },
             ));
         }
-        for index in self.config.warm.evictions(&entries) {
+        let evictions = self.config.warm.evictions(&entries);
+        if incoming_index.is_some_and(|incoming| evictions.contains(&incoming)) {
+            return false;
+        }
+        for index in evictions {
             let (template, warm) = &entries[index];
-            if warm.dir.as_os_str().is_empty() {
-                continue;
-            }
             let _no_builds = crate::warm::hold_builds().await;
             if let Err(err) = tokio::fs::remove_dir_all(&warm.dir).await {
                 tracing::warn!(template, %err, "could not evict a warm snapshot");
@@ -6349,6 +6364,7 @@ impl SandboxManager {
                 "evicted a warm snapshot"
             );
         }
+        true
     }
 
     /// At startup: discards warm snapshots this build cannot restore, warms
