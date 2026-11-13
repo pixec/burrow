@@ -155,10 +155,7 @@ pub async fn apply(network: &Network, is_private: bool, dns: Option<&str>) -> an
     // The resolver is a file write with no kernel round trip, so it is done
     // first and costs nothing against the netlink work.
     if is_private && let Some(dns) = dns {
-        let resolv = format!("nameserver {dns}\n");
-        if std::fs::read_to_string("/etc/resolv.conf").ok().as_deref() != Some(resolv.as_str()) {
-            std::fs::write("/etc/resolv.conf", resolv)?;
-        }
+        crate::linux::init::set_resolver(dns)?;
     }
 
     match NETLINK.get() {

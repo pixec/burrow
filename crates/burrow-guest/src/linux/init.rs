@@ -84,16 +84,28 @@ pub fn write_resolv_conf() {
     if dns.is_empty() {
         return;
     }
-    // Images built for systemd-resolved link it into /run, which is empty
-    // here; writing through the link would fail on the missing directory.
-    if std::fs::symlink_metadata("/etc/resolv.conf").is_ok_and(|meta| meta.is_symlink()) {
-        let _ = std::fs::remove_file("/etc/resolv.conf");
-    }
-    if let Err(err) = std::fs::write("/etc/resolv.conf", format!("nameserver {dns}\n")) {
+    if let Err(err) = set_resolver(dns) {
         tracing::warn!(dns, %err, "could not write /etc/resolv.conf");
     } else {
         tracing::debug!(dns, "resolver configured");
     }
+}
+
+/// Points `/etc/resolv.conf` at `dns`, leaving a file that already does alone.
+///
+/// Images built for systemd-resolved link it into /run, which is empty here;
+/// writing through the link would fail on the missing directory. A warm boot
+/// has no `burrow.dns=` argument, so the link is still there when its
+/// handshake writes the resolver.
+pub fn set_resolver(dns: &str) -> std::io::Result<()> {
+    const PATH: &str = "/etc/resolv.conf";
+    let resolv = format!("nameserver {dns}\n");
+    if std::fs::symlink_metadata(PATH).is_ok_and(|meta| meta.is_symlink()) {
+        std::fs::remove_file(PATH)?;
+    } else if std::fs::read_to_string(PATH).ok().as_deref() == Some(resolv.as_str()) {
+        return Ok(());
+    }
+    std::fs::write(PATH, resolv)
 }
 
 /// The guest's IPv6 address, as `<address>/<prefix>`, from `burrow.ip6=`.
