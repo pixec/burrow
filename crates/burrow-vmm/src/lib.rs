@@ -72,6 +72,11 @@ impl Phases {
         }
     }
 
+    /// Starts timing again from now, leaving out the time since the last mark.
+    pub fn restart(&mut self) {
+        self.last = Some(std::time::Instant::now());
+    }
+
     /// Charges the time since the previous mark to `name`.
     pub fn mark(&mut self, name: &'static str) {
         let now = std::time::Instant::now();
@@ -96,6 +101,28 @@ impl std::fmt::Display for Phases {
             write!(f, "{sep}{name}={:.1}", took.as_secs_f64() * 1000.0)?;
         }
         Ok(())
+    }
+}
+
+/// A VM restore under way: its VMM started, its snapshot not yet loaded.
+pub enum Restoring {
+    Firecracker(Box<firecracker::MicroVm>),
+    /// A backend that starts and loads in one step, which happens at load.
+    Later(Box<VmSpec>),
+}
+
+impl Restoring {
+    pub async fn load(self, resume: bool) -> Result<Vm> {
+        match self {
+            Self::Firecracker(vm) => Ok(Vm::Firecracker(Box::new(vm.load(resume).await?))),
+            Self::Later(spec) => Vm::restore(*spec, resume).await,
+        }
+    }
+
+    pub async fn abandon(self) {
+        if let Self::Firecracker(vm) = self {
+            vm.abandon().await;
+        }
     }
 }
 
@@ -518,6 +545,17 @@ impl Vm {
             ))),
             #[cfg(target_os = "macos")]
             Backend::Vz(config) => Ok(Self::Vz(Box::new(vz::VzVm::boot(spec, config).await?))),
+        }
+    }
+
+    /// Starts the VMM for [`Restoring::load`], before the snapshot it loads
+    /// need be in `spec.workdir`, so the two can be made ready together.
+    pub async fn launch(spec: VmSpec) -> Result<Restoring> {
+        match spec.backend.clone() {
+            Backend::Firecracker(config) => Ok(Restoring::Firecracker(Box::new(
+                firecracker::MicroVm::launch(firecracker::spec(spec, config)?).await?,
+            ))),
+            _ => Ok(Restoring::Later(Box::new(spec))),
         }
     }
 

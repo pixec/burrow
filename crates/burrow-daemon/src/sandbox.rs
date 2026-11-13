@@ -7317,7 +7317,6 @@ impl SandboxManager {
                     && capabilities.is_live_disk_growth_supported)
         });
         let from_warm = warm.is_some();
-        let warm_check_ms = began.elapsed();
         phases.mark("warm_find");
 
         // Networking: a private /30 on a dedicated tap. The guest configures
@@ -7336,118 +7335,7 @@ impl SandboxManager {
                     .await);
             }
         };
-        let ipam_ms = began.elapsed() - warm_check_ms;
         phases.mark("ipam");
-
-        // Copying a root disk is disk work and programming a tap is netlink,
-        // so they run together rather than one after the other.
-        let stage = async {
-            let staging_began = std::time::Instant::now();
-            let mut staged = burrow_vmm::Phases::start();
-            // May come back false: a snapshot swapped out or evicted since it
-            // was found, or one with a file gone, which is rebuilt. A cold
-            // boot is slower, not wrong, and is a far better answer than
-            // failing the create.
-            let mut is_warm = from_warm;
-            if let Some(snapshot) = &warm
-                && let Err(err) = crate::warm::stage_from_warm(
-                    &templates_dir,
-                    &template,
-                    snapshot,
-                    &workdir,
-                    &mut staged,
-                )
-                .await
-            {
-                if err.kind() != std::io::ErrorKind::NotFound {
-                    return Err(Status::internal(format!("staging warm snapshot: {err}")));
-                }
-                tracing::warn!(
-                    template = %template, %err,
-                    "warm snapshot is not there to stage; booting cold"
-                );
-                self.rebuild_in_background_if_broken(&template, hypervisor, wanted);
-                is_warm = false;
-            }
-            if crate::macnode::is_macos(guest_os) {
-                let root = self.inspection_ca_for(&policy);
-                crate::macnode::prepare(&templates_dir.join(&template), &workdir, &root)
-                    .await
-                    .map_err(|err| {
-                        Status::failed_precondition(format!("template {template:?}: {err}"))
-                    })?;
-            } else if !is_warm {
-                prepare_workdir(&templates_dir.join(&template), &workdir)
-                    .await
-                    .map_err(|err| {
-                        Status::failed_precondition(format!("template {template:?}: {err}"))
-                    })?;
-                let disk = workdir.join(crate::rootdisk::ROOT_DISK);
-                match seed_disk {
-                    Some(seed) => crate::rootdisk::clone(seed, &disk).await.map(drop),
-                    None => self.spares.take(&templates_dir, &template, &disk).await,
-                }
-                .map_err(|err| Status::internal(format!("making the root disk: {err}")))?;
-                crate::rootdisk::grow(&disk, resources.disk_mib).await?;
-            }
-            // Hard-linked in after the template's own files, so a cold boot
-            // that rebuilt the directory does not clear them again.
-            for ((index, mount), source) in
-                crate::volume::block_mounts(&policy.volumes).zip(&sources)
-            {
-                let dest = workdir.join(crate::sandbox::volume_image(index));
-                let _ = tokio::fs::remove_file(&dest).await;
-                tokio::fs::hard_link(source, &dest).await.map_err(|err| {
-                    Status::internal(format!("attaching volume {}: {err}", mount.volume))
-                })?;
-            }
-            staged.mark("volume_links");
-            let files_ms = staging_began.elapsed();
-            // Ownership is handed over inside the same task, because it has to
-            // follow staging and nothing else waits on it.
-            if let Some(jail) = self.config.jail_for(hypervisor) {
-                // The template's own files are always hard links; a warm boot
-                // additionally hard-links the snapshot state and memory image
-                // (and, if one exists, the prefetch plan) instead of writing
-                // fresh copies. A read-only volume mount is a hard link too,
-                // regardless of warm or cold: the many-readers side of the
-                // volume store's "many readers, one writer" rule has nothing
-                // else keeping a reader from writing back if this doesn't.
-                let mut shared: std::collections::HashSet<String> =
-                    [TEMPLATE_KERNEL.to_string(), TEMPLATE_ROOTFS.to_string()].into();
-                if is_warm {
-                    shared.extend(layout.files().map(String::from));
-                    shared.insert(crate::warm::PREFETCH_PLAN.to_string());
-                }
-                for (index, mount) in crate::volume::block_mounts(&policy.volumes) {
-                    if mount.is_read_only {
-                        shared.insert(crate::sandbox::volume_image(index));
-                    }
-                }
-                // A writable mount is the one shared inode that does get
-                // chowned, so its owner is recorded first and put back when the
-                // claim goes.
-                self.remember_volume_owners(&policy.volumes).await;
-                grant_to_jail(&workdir, jail, &shared)
-                    .await
-                    .map_err(|err| Status::internal(format!("preparing the jail: {err}")))?;
-            }
-            staged.mark("chown");
-            Ok::<
-                (
-                    bool,
-                    std::time::Duration,
-                    std::time::Duration,
-                    burrow_vmm::Phases,
-                ),
-                Status,
-            >((
-                is_warm,
-                files_ms,
-                staging_began.elapsed() - files_ms,
-                staged,
-            ))
-        };
 
         // A backend without a tap gets no interface at all, and an empty name
         // that nothing tears down.
@@ -7458,82 +7346,218 @@ impl SandboxManager {
             }
             (tap::create(&lease).await, began.elapsed())
         };
-        let staged_at = std::time::Instant::now();
-        let (staged, (tap, tap_ms)) = tokio::join!(stage, tap_timed);
-        let stage_wall_ms = staged_at.elapsed();
-        // Recorded before either half is inspected: the tap may well have come
-        // up alongside a staging failure, and an interface belonging to a
-        // sandbox that never existed must not be left behind.
-        guard.tap = tap.as_ref().ok().filter(|name| !name.is_empty()).cloned();
-        let (from_warm, files_ms, jail_ms, staged) = match staged {
-            Ok(parts) => parts,
-            Err(err) => return Err(guard.fail(err).await),
+        let tap_name = match capabilities.is_tap_networked {
+            true => tap::tap_name(&lease),
+            false => String::new(),
         };
-        phases.mark("stage");
-        phases.add("tap", tap_ms);
-        phases.append(&staged);
-        tracing::Span::current().record("from_warm", from_warm);
-        let tap_name = match tap {
-            Ok(name) => name,
-            Err(err) => {
+        let is_macos = crate::macnode::is_macos(guest_os);
+        // A warm snapshot was captured with the sandbox's own disk alone, so a
+        // restore must describe exactly that; the volumes are hotplugged once
+        // it is running. A cold boot hotplugs them too, once its agent is up.
+        let spec_for = |is_warm: bool| {
+            let is_hotplugged = is_warm || (capabilities.is_drive_hotplug_supported && !is_macos);
+            let boot_volumes: &[common::VolumeMount] =
+                if is_hotplugged { &[] } else { &policy.volumes };
+            self.build_spec(
+                &id,
+                &workdir,
+                hypervisor,
+                guest_os,
+                &resources,
+                &lease,
+                &tap_name,
+                boot_volumes,
+                environment.booted_systemd(),
+                policy.is_console_verbose,
+            )
+        };
+
+        // May come back false: a snapshot swapped out or evicted since it was
+        // found, or one with a file gone, which is rebuilt. A cold boot is
+        // slower, not wrong, and is a far better answer than failing the
+        // create.
+        let mut is_warm = from_warm;
+        if let Some(snapshot) = &warm {
+            let mut linked = burrow_vmm::Phases::start();
+            match crate::warm::link_warm(&templates_dir, &template, snapshot, &workdir, &mut linked)
+                .await
+            {
+                Ok(()) => {}
+                Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+                    tracing::warn!(
+                        template = %template, %err,
+                        "warm snapshot is not there to stage; booting cold"
+                    );
+                    self.rebuild_in_background_if_broken(&template, hypervisor, wanted);
+                    is_warm = false;
+                }
+                Err(err) => {
+                    return Err(guard
+                        .fail(Status::internal(format!("staging warm snapshot: {err}")))
+                        .await);
+                }
+            }
+        }
+        tracing::Span::current().record("from_warm", is_warm);
+
+        let started_vm = if is_warm && !is_macos {
+            // Everything but the disk is linked and handed to the jail first,
+            // so the VMM starts while the disk is copied and the tap is made:
+            // nothing reads the disk before the snapshot loads, and nothing is
+            // chowned once the jailer is at work in the directory.
+            if let Err(err) = self
+                .finish_workdir(&workdir, hypervisor, true, &policy.volumes, &sources)
+                .await
+            {
+                return Err(guard.fail(err).await);
+            }
+            let mut spec = spec_for(true);
+            // Only when the template was profiled.
+            if capabilities.is_lazy_memory_supported
+                && tokio::fs::try_exists(workdir.join(crate::warm::PREFETCH_PLAN))
+                    .await
+                    .unwrap_or(false)
+            {
+                spec.prefetch = Some(crate::warm::PREFETCH_PLAN.to_string());
+            }
+            if let Err(err) = self.usernets.attach(&id, &lease, &mut spec) {
+                return Err(guard.fail(err).await);
+            }
+            let boot_spec = spec.clone();
+            record_working_set(&mut spec, self.config.object_store.is_some());
+            phases.mark("link");
+
+            let snapshot = warm.as_ref().expect("a warm create has its snapshot");
+            let jail = self.config.jail_for(hypervisor);
+            let disk = async {
+                let mut timed = burrow_vmm::Phases::start();
+                crate::warm::clone_warm_disk(snapshot, &workdir, &mut timed).await?;
+                if let Some(jail) = jail {
+                    let disk = workdir.join(crate::rootdisk::ROOT_DISK);
+                    std::os::unix::fs::chown(disk, Some(jail.uid), Some(jail.gid))?;
+                }
+                timed.mark("chown");
+                Ok::<_, std::io::Error>(timed)
+            };
+            let launch = async {
+                let began = std::time::Instant::now();
+                (Vm::launch(spec).await, began.elapsed())
+            };
+            let (disk, (tap, tap_ms), (launched, launch_ms)) =
+                tokio::join!(disk, tap_timed, launch);
+            // Recorded before anything is inspected: the tap may well have
+            // come up alongside a failure, and an interface belonging to a
+            // sandbox that never existed must not be left behind.
+            guard.tap = tap.as_ref().ok().filter(|name| !name.is_empty()).cloned();
+            phases.mark("stage");
+            phases.add("tap", tap_ms);
+            phases.add("launch", launch_ms);
+            let failed = match (&disk, &tap) {
+                (Err(err), _) => Some(Status::internal(format!("staging warm snapshot: {err}"))),
+                (_, Err(err)) => Some(Status::internal(format!("tap setup: {err}"))),
+                _ => None,
+            };
+            let launched = match (launched, failed) {
+                (Ok(launched), None) => launched,
+                (Ok(launched), Some(err)) => {
+                    launched.abandon().await;
+                    return Err(guard.fail(err).await);
+                }
+                (Err(err), failed) => {
+                    let err = failed
+                        .unwrap_or_else(|| Status::internal(format!("warm restore failed: {err}")));
+                    return Err(guard.fail(err).await);
+                }
+            };
+            if let Ok(disk) = &disk {
+                phases.append(disk);
+            }
+            // The override points the snapshotted interface at this sandbox's
+            // own tap; the address inside the guest is corrected on handshake.
+            launched
+                .load(true)
+                .await
+                .map(|vm| (vm, boot_spec))
+                .map_err(|err| Status::internal(format!("warm restore failed: {err}")))
+        } else {
+            // Copying a root disk is disk work and programming a tap is
+            // netlink, so they run together rather than one after the other.
+            let stage = async {
+                let mut staged = burrow_vmm::Phases::start();
+                if is_macos {
+                    if let Some(snapshot) = warm.as_ref().filter(|_| is_warm) {
+                        crate::warm::clone_warm_disk(snapshot, &workdir, &mut staged)
+                            .await
+                            .map_err(|err| {
+                                Status::internal(format!("staging warm snapshot: {err}"))
+                            })?;
+                    }
+                    let root = self.inspection_ca_for(&policy);
+                    crate::macnode::prepare(&templates_dir.join(&template), &workdir, &root)
+                        .await
+                        .map_err(|err| {
+                            Status::failed_precondition(format!("template {template:?}: {err}"))
+                        })?;
+                } else {
+                    prepare_workdir(&templates_dir.join(&template), &workdir)
+                        .await
+                        .map_err(|err| {
+                            Status::failed_precondition(format!("template {template:?}: {err}"))
+                        })?;
+                    let disk = workdir.join(crate::rootdisk::ROOT_DISK);
+                    match seed_disk {
+                        Some(seed) => crate::rootdisk::clone(seed, &disk).await.map(drop),
+                        None => self.spares.take(&templates_dir, &template, &disk).await,
+                    }
+                    .map_err(|err| Status::internal(format!("making the root disk: {err}")))?;
+                    crate::rootdisk::grow(&disk, resources.disk_mib).await?;
+                }
+                staged.mark("disk");
+                self.finish_workdir(&workdir, hypervisor, is_warm, &policy.volumes, &sources)
+                    .await?;
+                staged.mark("jail");
+                Ok::<_, Status>(staged)
+            };
+            let (staged, (tap, tap_ms)) = tokio::join!(stage, tap_timed);
+            guard.tap = tap.as_ref().ok().filter(|name| !name.is_empty()).cloned();
+            let staged = match staged {
+                Ok(staged) => staged,
+                Err(err) => return Err(guard.fail(err).await),
+            };
+            if let Err(err) = tap {
                 return Err(guard
                     .fail(Status::internal(format!("tap setup: {err}")))
                     .await);
             }
+            phases.mark("stage");
+            phases.add("tap", tap_ms);
+            phases.append(&staged);
+            let mut spec = spec_for(is_warm);
+            if let Err(err) = self.usernets.attach(&id, &lease, &mut spec) {
+                return Err(guard.fail(err).await);
+            }
+            let boot_spec = spec.clone();
+            record_working_set(&mut spec, self.config.object_store.is_some());
+            phases.mark("spec");
+            match is_warm {
+                true => Vm::restore(spec, true)
+                    .await
+                    .map_err(|err| Status::internal(format!("warm restore failed: {err}"))),
+                false => Vm::boot(spec)
+                    .await
+                    .map_err(|err| Status::internal(format!("boot failed: {err}"))),
+            }
+            .map(|vm| (vm, boot_spec))
         };
-
-        // A warm snapshot was captured with the sandbox's own disk alone, so a
-        // restore must describe exactly that; the volumes are hotplugged once
-        // it is running. A cold boot hotplugs them too, once its agent is up.
-        let is_hotplugged = from_warm
-            || (capabilities.is_drive_hotplug_supported && !crate::macnode::is_macos(guest_os));
-        let boot_volumes: &[common::VolumeMount] =
-            if is_hotplugged { &[] } else { &policy.volumes };
-        let mut spec = self.build_spec(
-            &id,
-            &workdir,
-            hypervisor,
-            guest_os,
-            &resources,
-            &lease,
-            &tap_name,
-            boot_volumes,
-            environment.booted_systemd(),
-            policy.is_console_verbose,
-        );
-        // Only meaningful on a restore, and only when the template was
-        // profiled; a create that boots cold has no snapshot to prefetch from.
-        if from_warm
-            && capabilities.is_lazy_memory_supported
-            && tokio::fs::try_exists(workdir.join(crate::warm::PREFETCH_PLAN))
-                .await
-                .unwrap_or(false)
-        {
-            spec.prefetch = Some(crate::warm::PREFETCH_PLAN.to_string());
-        }
-        if let Err(err) = self.usernets.attach(&id, &lease, &mut spec) {
-            return Err(guard.fail(err).await);
-        }
-        let boot_spec = spec.clone();
-        record_working_set(&mut spec, self.config.object_store.is_some());
-        phases.mark("spec");
+        let from_warm = is_warm;
         let started = std::time::Instant::now();
-        let spec_ms = started - staged_at - stage_wall_ms;
-        let started_vm = if from_warm {
-            // The override points the snapshotted interface at this sandbox's
-            // own tap; the address inside the guest is corrected on handshake.
-            Vm::restore(spec, true)
-                .await
-                .map_err(|err| Status::internal(format!("warm restore failed: {err}")))
-        } else {
-            Vm::boot(spec)
-                .await
-                .map_err(|err| Status::internal(format!("boot failed: {err}")))
-        };
-        match started_vm {
-            Ok(vm) => guard.vm = Some(vm),
+        let boot_spec = match started_vm {
+            Ok((vm, boot_spec)) => {
+                guard.vm = Some(vm);
+                boot_spec
+            }
             Err(err) => return Err(guard.fail(err).await),
-        }
+        };
         phases.mark("vmm");
         phases.append(&guard.vm().phases());
         // Dialled as soon as there is a guest to dial, so the wait for it to
@@ -7630,7 +7654,8 @@ impl SandboxManager {
                 }
             };
             let agent_up = vmm_ready.elapsed();
-            if is_hotplugged
+            if capabilities.is_drive_hotplug_supported
+                && !is_macos
                 && let Err(err) = attach_volumes(guard.vm(), &policy.volumes, guest_os).await
             {
                 return Err(guard.fail(err).await);
@@ -7711,14 +7736,6 @@ impl SandboxManager {
             sandbox = id,
             warm = from_warm,
             inspected,
-            // Host, before the VM exists.
-            warm_check_ms = warm_check_ms.as_millis() as u64,
-            ipam_ms = ipam_ms.as_millis() as u64,
-            stage_wall_ms = stage_wall_ms.as_millis() as u64,
-            stage_files_ms = files_ms.as_millis() as u64,
-            jail_ms = jail_ms.as_millis() as u64,
-            tap_ms = tap_ms.as_millis() as u64,
-            spec_ms = spec_ms.as_millis() as u64,
             // The VM, and the wait for a guest to answer on it.
             vmm_ms = vm.boot_latency().as_millis() as u64,
             agent_up_ms = agent_up.as_millis() as u64,
@@ -7784,6 +7801,55 @@ impl SandboxManager {
         }
         phases.mark("record");
         Ok((sandbox, disk, from_warm))
+    }
+
+    /// Hard-links a sandbox's volumes into its working directory and hands
+    /// the directory, and what in it is the sandbox's own, to its jail.
+    ///
+    /// The template's own files are always hard links; a warm boot
+    /// additionally hard-links the snapshot state and memory image (and, if
+    /// one exists, the prefetch plan) instead of writing fresh copies. A
+    /// read-only volume mount is a hard link too, regardless of warm or cold:
+    /// the many-readers side of the volume store's "many readers, one writer"
+    /// rule has nothing else keeping a reader from writing back if this
+    /// doesn't.
+    async fn finish_workdir(
+        &self,
+        workdir: &Path,
+        hypervisor: Hypervisor,
+        is_warm: bool,
+        volumes: &[common::VolumeMount],
+        sources: &[PathBuf],
+    ) -> Result<(), Status> {
+        // Hard-linked in after the template's own files, so a cold boot that
+        // rebuilt the directory does not clear them again.
+        for ((index, mount), source) in crate::volume::block_mounts(volumes).zip(sources) {
+            let dest = workdir.join(crate::sandbox::volume_image(index));
+            let _ = tokio::fs::remove_file(&dest).await;
+            tokio::fs::hard_link(source, &dest).await.map_err(|err| {
+                Status::internal(format!("attaching volume {}: {err}", mount.volume))
+            })?;
+        }
+        let Some(jail) = self.config.jail_for(hypervisor) else {
+            return Ok(());
+        };
+        let mut shared: std::collections::HashSet<String> =
+            [TEMPLATE_KERNEL.to_string(), TEMPLATE_ROOTFS.to_string()].into();
+        if is_warm {
+            shared.extend(hypervisor.layout().files().map(String::from));
+            shared.insert(crate::warm::PREFETCH_PLAN.to_string());
+        }
+        for (index, mount) in crate::volume::block_mounts(volumes) {
+            if mount.is_read_only {
+                shared.insert(crate::sandbox::volume_image(index));
+            }
+        }
+        // A writable mount is the one shared inode that does get chowned, so
+        // its owner is recorded first and put back when the claim goes.
+        self.remember_volume_owners(volumes).await;
+        grant_to_jail(workdir, jail, &shared)
+            .await
+            .map_err(|err| Status::internal(format!("preparing the jail: {err}")))
     }
 
     /// Snapshots a sandbox to disk and stops its VMM.

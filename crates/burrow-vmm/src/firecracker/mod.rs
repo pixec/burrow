@@ -569,6 +569,13 @@ impl MicroVm {
     /// instead of cold-booting. `spec` must describe the same resources
     /// (tap name, drive paths) as the snapshotted VM.
     pub async fn restore(spec: MicroVmSpec, resume: bool) -> Result<Self> {
+        Self::launch(spec).await?.load(resume).await
+    }
+
+    /// Starts the VMM a restore loads its snapshot into. Nothing in the
+    /// working directory is read until [`Self::load`], so the snapshot's files
+    /// may still be arriving while this runs.
+    pub async fn launch(spec: MicroVmSpec) -> Result<Self> {
         let start = Instant::now();
         let mut phases = crate::Phases::start();
         if spec.is_vsock_enabled {
@@ -577,22 +584,27 @@ impl MicroVm {
         phases.mark("sockets");
         let (process, cgroup) = spawn(&spec, &mut phases).await?;
         let api = FcApi::new(spec.workdir.join(API_SOCK));
-
-        let mut vm = Self {
+        Ok(Self {
             process,
             api,
             spec,
-            boot_latency: Duration::ZERO,
+            boot_latency: start.elapsed(),
             phases,
             cgroup,
             #[cfg(target_os = "linux")]
             memory: None,
-        };
+        })
+    }
+
+    /// Loads the snapshot into a VMM from [`Self::launch`].
+    pub async fn load(mut self, resume: bool) -> Result<Self> {
+        let start = Instant::now();
+        self.phases.restart();
         // A chain has no single file for the kernel to map, so lazy memory is
         // not optional there. Started before `load_snapshot`, because
         // firecracker connects to it while handling that request and fails
         // outright if nothing is listening.
-        let mem_backend = match vm.start_lazy_memory() {
+        let mem_backend = match self.start_lazy_memory() {
             Ok(Some(backend_path)) => MemBackend {
                 backend_type: "Uffd".into(),
                 backend_path,
@@ -602,21 +614,21 @@ impl MicroVm {
                 backend_path: SNAPSHOT_MEM_FILE.into(),
             },
             Err(err) => {
-                let _ = vm.process.kill().await;
+                let _ = self.process.kill().await;
                 return Err(err);
             }
         };
-        vm.phases.mark("uffd");
+        self.phases.mark("uffd");
         let req = LoadSnapshot {
             snapshot_path: SNAPSHOT_FILE.into(),
             mem_backend,
             // Pages the handler serves are what mincore reports, so only a
             // restore mapping the memory file itself needs KVM's dirty log.
-            is_diff_snapshots_enabled: vm.spec.is_dirty_pages_tracked
-                && !vm.is_lazy_memory_active(),
+            is_diff_snapshots_enabled: self.spec.is_dirty_pages_tracked
+                && !self.is_lazy_memory_active(),
             is_vm_resumed: resume,
             // Point the snapshotted interface at this sandbox's own tap.
-            network_overrides: vm
+            network_overrides: self
                 .spec
                 .net
                 .as_ref()
@@ -628,19 +640,25 @@ impl MicroVm {
                 })
                 .unwrap_or_default(),
         };
-        if let Err(err) = vm.api.load_snapshot(&req).await {
-            let _ = vm.process.kill().await;
+        if let Err(err) = self.api.load_snapshot(&req).await {
+            let _ = self.process.kill().await;
             return Err(err);
         }
-        vm.phases.mark("load");
-        vm.boot_latency = start.elapsed();
+        self.phases.mark("load");
+        // The VMM's own time, not the time it spent waiting to be loaded.
+        self.boot_latency += start.elapsed();
         tracing::info!(
-            vm_id = vm.spec.vm_id,
-            latency_ms = vm.boot_latency.as_millis() as u64,
-            lazy_memory = vm.is_lazy_memory_active(),
+            vm_id = self.spec.vm_id,
+            latency_ms = self.boot_latency.as_millis() as u64,
+            lazy_memory = self.is_lazy_memory_active(),
             "microvm restored from snapshot"
         );
-        Ok(vm)
+        Ok(self)
+    }
+
+    /// Stops a VMM from [`Self::launch`] that will not be loaded.
+    pub async fn abandon(self) {
+        let _ = self.kill().await;
     }
 
     /// Brings up this VM's page-fault handler, returning the path firecracker

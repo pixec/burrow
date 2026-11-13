@@ -534,11 +534,10 @@ pub async fn is_warm(templates_dir: &Path, template: &str) -> bool {
     !list(templates_dir, template).await.is_empty()
 }
 
-/// Files a sandbox needs in its working directory to restore from warm.
-///
-/// The root disk is cloned because the guest will write to it; everything
-/// else is hard-linked because it is read-only or verified immutable.
-pub async fn stage_from_warm(
+/// Files a sandbox needs in its working directory to restore from warm, but
+/// its disk ([`clone_warm_disk`]): hard links, every one read-only or
+/// verified immutable.
+pub async fn link_warm(
     templates_dir: &Path,
     template: &str,
     snapshot: &Warm,
@@ -571,8 +570,17 @@ pub async fn stage_from_warm(
         let _ = tokio::fs::hard_link(&plan, &dest).await;
     }
     phases.mark("link");
+    Ok(())
+}
 
-    // The one file that must not be shared.
+/// Gives `workdir` its own copy of the snapshot's disk, the one file of it
+/// that must not be shared.
+pub async fn clone_warm_disk(
+    snapshot: &Warm,
+    workdir: &Path,
+    phases: &mut burrow_vmm::Phases,
+) -> std::io::Result<()> {
+    let warm = &snapshot.dir;
     crate::rootdisk::clone(&warm.join(ROOT_DISK), &workdir.join(ROOT_DISK)).await?;
     phases.mark("disk");
     // Best effort: a snapshot whose use went unrecorded is only evicted a
