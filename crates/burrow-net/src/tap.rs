@@ -132,8 +132,8 @@ mod linux {
     /// Best effort, and per interface rather than globally: burrow has no
     /// business changing a host-wide sysctl, and a host with IPv6 disabled
     /// outright has no such knob to write.
-    fn accept_no_router_advertisements(tap: &str) {
-        for key in ["accept_ra", "autoconf"] {
+    fn quiet_ipv6(tap: &str) {
+        for key in ["accept_ra", "autoconf", "accept_dad"] {
             let _ = std::fs::write(format!("/proc/sys/net/ipv6/conf/{tap}/{key}"), "0");
         }
     }
@@ -165,8 +165,10 @@ mod linux {
         // Router advertisements are refused before the interface is up, so
         // the guest never learns an address from anything but us. Burrow
         // assigns both families itself, and a tap that autoconfigured from a
-        // neighbouring router would carry an address no rule names.
-        accept_no_router_advertisements(name);
+        // neighbouring router would carry an address no rule names. Duplicate
+        // detection is off too: the link has one other end, and the gateway
+        // address would otherwise be unusable for the first second.
+        quiet_ipv6(name);
 
         // Non-fatal: a host with IPv6 compiled out still runs sandboxes, they
         // just have no v6 link. Failing the create would take the v4 sandbox

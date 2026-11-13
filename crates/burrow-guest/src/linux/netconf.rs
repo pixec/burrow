@@ -99,6 +99,17 @@ pub async fn add_ipv6(
     }
 }
 
+/// Skips duplicate detection: the host routes every one of a sandbox's
+/// addresses to its link alone, and a tentative address can neither source a
+/// route nor be used for the seconds detection takes.
+fn without_dad(add: &mut rtnetlink::AddressAddRequest) {
+    let message = add.message_mut();
+    message.header.flags |= AddressHeaderFlags::Nodad;
+    message
+        .attributes
+        .push(AddressAttribute::Flags(AddressFlags::Nodad));
+}
+
 async fn add_one_ipv6(
     handle: &Handle,
     index: u32,
@@ -107,12 +118,12 @@ async fn add_one_ipv6(
     gateway: Option<Ipv6Addr>,
 ) -> anyhow::Result<()> {
     // Replaced rather than added, as in `configure`.
-    handle
+    let mut add = handle
         .address()
         .add(index, std::net::IpAddr::V6(address), prefix_len)
-        .replace()
-        .execute()
-        .await?;
+        .replace();
+    without_dad(&mut add);
+    add.execute().await?;
     // Without a default route the address is decorative: every destination
     // outside the sandbox's own /64 is unreachable before a rule sees it.
     if let Some(gateway) = gateway {
@@ -546,15 +557,8 @@ async fn reconcile(
             .public
             .iter()
             .any(|&(address, _)| address == held.address);
-        // No duplicate detection: the host routes every one of a sandbox's
-        // addresses to its link alone, and a tentative address can neither
-        // source a route nor be used for the seconds detection takes.
         if held.address.is_ipv6() {
-            let message = add.message_mut();
-            message.header.flags |= AddressHeaderFlags::Nodad;
-            message
-                .attributes
-                .push(AddressAttribute::Flags(AddressFlags::Nodad));
+            without_dad(&mut add);
         }
         first.push(Request {
             what: format!("add {}", held.address),
