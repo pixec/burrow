@@ -803,6 +803,36 @@ fn settled() -> Arc<tokio::sync::watch::Sender<Handshake>> {
 /// still in it), and a create that returns before its directory is gone can be
 /// retried straight into the middle of its own cleanup. `Drop` is left as the
 /// backstop that says loudly when a path forgot.
+/// What the firewall needs of a sandbox, which a create has before its VM.
+#[derive(Clone)]
+struct Ruled {
+    id: String,
+    tap: String,
+    lease: Lease,
+    hypervisor: Hypervisor,
+    record: common::Sandbox,
+}
+
+impl Ruled {
+    fn of(sandbox: &RunningSandbox) -> Self {
+        Self {
+            id: sandbox.id().to_string(),
+            tap: sandbox.tap.clone(),
+            lease: sandbox.lease,
+            hypervisor: sandbox.hypervisor,
+            record: sandbox.record(),
+        }
+    }
+
+    fn id(&self) -> &str {
+        &self.id
+    }
+
+    fn record(&self) -> common::Sandbox {
+        self.record.clone()
+    }
+}
+
 struct Provisioning<'a> {
     manager: &'a SandboxManager,
     id: String,
@@ -813,6 +843,8 @@ struct Provisioning<'a> {
     vm: Option<Vm>,
     /// A warm create's dial to its guest, started as the VM came up.
     dialing: Option<guestconn::Dialing>,
+    /// The rules [`SandboxManager::rule_ahead`] put in force, to withdraw.
+    is_ruled: bool,
     is_kept: bool,
 }
 
@@ -826,6 +858,7 @@ impl<'a> Provisioning<'a> {
             tap: None,
             vm: None,
             dialing: None,
+            is_ruled: false,
             is_kept: false,
         }
     }
@@ -856,6 +889,10 @@ impl<'a> Provisioning<'a> {
         }
         if let Some(tap) = self.tap.take() {
             tap::delete(&tap).await;
+        }
+        // Before the lease goes back, so its next holder never inherits them.
+        if self.is_ruled {
+            self.manager.unrule(&self.id).await;
         }
         self.manager.release_lease(&self.id).await;
         self.manager.volumes.release_all(&self.id);
@@ -895,6 +932,7 @@ impl Drop for Provisioning<'_> {
             dialing.abort();
         }
         let vm = self.vm.take();
+        let is_ruled = self.is_ruled;
         if let Ok(handle) = tokio::runtime::Handle::try_current() {
             handle.spawn(async move {
                 if let Some(vm) = vm {
@@ -902,6 +940,9 @@ impl Drop for Provisioning<'_> {
                 }
                 if let Some(tap) = tap {
                     tap::delete(&tap).await;
+                }
+                if is_ruled {
+                    manager.unrule(&id).await;
                 }
                 manager.release_lease(&id).await;
                 manager.volumes.release_all(&id);
@@ -2593,6 +2634,9 @@ pub struct SandboxManager {
     /// still names a sandbox that has been deleted. Held across snapshot,
     /// render and apply, so the last render to start is the last to land.
     firewall: Arc<tokio::sync::Mutex<()>>,
+    /// Creates whose rules are in force before their sandbox is in the map;
+    /// see [`SandboxManager::rule_ahead`].
+    ruled_ahead: Arc<std::sync::Mutex<HashMap<String, Ruled>>>,
     /// What each template has been asked for, and what has been warmed.
     ///
     /// Both halves are bounded per template. The shapes come from create
@@ -2784,6 +2828,7 @@ impl SandboxManager {
             warm_shapes: Arc::new(std::sync::Mutex::new(HashMap::new())),
             warm_queue: Arc::new(tokio::sync::Mutex::new(())),
             firewall: Arc::new(tokio::sync::Mutex::new(())),
+            ruled_ahead: Default::default(),
             snapshots: Arc::new(crate::snapshot::SnapshotStore::new(
                 &config.data_dir,
                 config.object_store.clone(),
@@ -4147,12 +4192,52 @@ impl SandboxManager {
     /// network until now.
     async fn register(&self, sandbox: &Arc<RunningSandbox>) -> Result<(), Status> {
         let _ordered = self.firewall.lock().await;
-        self.render_firewall(Some(sandbox)).await?;
+        // Ruled ahead by [`Self::rule_ahead`]: every render since has carried
+        // it, so it moves into the map with its rules already in force.
+        let is_ruled = self
+            .ruled_ahead
+            .lock()
+            .unwrap()
+            .remove(sandbox.id())
+            .is_some();
+        if !is_ruled {
+            self.render_firewall(Some(&Ruled::of(sandbox))).await?;
+        }
         self.sandboxes
             .lock()
             .await
             .insert(sandbox.id().to_string(), Arc::clone(sandbox));
         Ok(())
+    }
+
+    /// Applies a sandbox's rules before it exists, so a create can have them
+    /// land while its VM is still being made. Every render carries it until
+    /// [`Self::register`] moves it into the map or [`Self::unrule`] drops it.
+    async fn rule_ahead(&self, ruled: Ruled) -> Result<(), Status> {
+        let _ordered = self.firewall.lock().await;
+        self.ruled_ahead
+            .lock()
+            .unwrap()
+            .insert(ruled.id.clone(), ruled.clone());
+        let rendered = self.render_firewall(Some(&ruled)).await;
+        if rendered.is_err() {
+            self.ruled_ahead.lock().unwrap().remove(&ruled.id);
+        }
+        rendered
+    }
+
+    /// Withdraws the rules of a create that failed after [`Self::rule_ahead`].
+    async fn unrule(&self, id: &str) {
+        let _ordered = self.firewall.lock().await;
+        if self.ruled_ahead.lock().unwrap().remove(id).is_some()
+            && let Err(err) = self.render_firewall(None).await
+        {
+            tracing::warn!(
+                sandbox = id,
+                err = err.message(),
+                "could not withdraw a failed create's rules"
+            );
+        }
     }
 
     /// [`Self::register`], tearing the sandbox down when it fails.
@@ -4168,16 +4253,26 @@ impl SandboxManager {
 
     /// Renders and applies the ruleset for every sandbox in the map, plus
     /// `pending`. The caller holds the firewall lock.
-    async fn render_firewall(&self, pending: Option<&Arc<RunningSandbox>>) -> Result<(), Status> {
+    async fn render_firewall(&self, added: Option<&Ruled>) -> Result<(), Status> {
         // A full render flushes the counter table, so what it has counted has
         // to be banked before it is rebuilt. Adding a sandbox only adds its
         // own counters and leaves the rest counting.
-        if pending.is_none() {
+        if added.is_none() {
             self.sample_usage().await;
         }
 
         let sandboxes = self.sandboxes.lock().await;
-        let all: Vec<&Arc<RunningSandbox>> = sandboxes.values().chain(pending).collect();
+        let mut members: Vec<Ruled> = sandboxes
+            .values()
+            .map(|sandbox| Ruled::of(sandbox))
+            .collect();
+        members.extend(self.ruled_ahead.lock().unwrap().values().cloned());
+        if let Some(added) = added
+            && !members.iter().any(|member| member.id == added.id)
+        {
+            members.push(added.clone());
+        }
+        let all: Vec<&Ruled> = members.iter().collect();
         // nftables is Linux's. A node elsewhere renders the same policies for
         // its sandboxes' userspace stacks and needs no ruleset so long as none
         // of them has a tap.
@@ -4407,7 +4502,7 @@ impl SandboxManager {
             .filter(|sandbox| sandbox.hypervisor.capabilities().is_tap_networked)
             .map(|sandbox| Publics {
                 sandbox_id: sandbox.id().to_string(),
-                ips: sandbox.base_record.lock().unwrap().public_ips.clone(),
+                ips: sandbox.record.public_ips.clone(),
             })
             .collect();
 
@@ -4481,7 +4576,7 @@ impl SandboxManager {
         if !is_ruleset_needed {
             return Ok(());
         }
-        let added = pending.and_then(|added| rules.iter().find(|r| r.sandbox_id == added.id()));
+        let added = added.and_then(|added| rules.iter().find(|r| r.sandbox_id == added.id));
         let ruleset = match added {
             Some(added) => firewall::render_adding(&rules, &denied, added),
             None => firewall::render_with(&rules, &denied),
@@ -4687,7 +4782,7 @@ impl SandboxManager {
     }
 
     /// The sandbox's public side as the ruleset renders it.
-    fn public_rules(&self, sandbox: &RunningSandbox, record: &common::Sandbox) -> firewall::Public {
+    fn public_rules(&self, sandbox: &Ruled, record: &common::Sandbox) -> firewall::Public {
         if !sandbox.hypervisor.capabilities().is_tap_networked {
             return firewall::Public::default();
         }
@@ -4724,9 +4819,10 @@ impl SandboxManager {
                     .collect()
             })
             .unwrap_or_default();
-        out.state = if sandbox.is_running() {
+        out.state = if record.state == common::SandboxState::Running as i32 {
             firewall::IngressState::Admit
-        } else if sandbox.is_suspended() && record.public_ips.iter().any(|ip| ip.is_wake_on_traffic)
+        } else if record.state == common::SandboxState::Suspended as i32
+            && record.public_ips.iter().any(|ip| ip.is_wake_on_traffic)
         {
             firewall::IngressState::Wake
         } else {
@@ -7443,18 +7539,42 @@ impl SandboxManager {
                 let began = std::time::Instant::now();
                 (Vm::launch(spec).await, began.elapsed())
             };
-            let (disk, (tap, tap_ms), (launched, launch_ms)) =
-                tokio::join!(disk, tap_timed, launch);
+            // The rules need only the lease, the tap's name and the policy, so
+            // they are applied alongside too. A tap no rule names has every
+            // packet dropped, so the guest has no network until they land,
+            // and the create still waits for them.
+            let ruled = Ruled {
+                id: id.clone(),
+                tap: tap_name.clone(),
+                lease,
+                hypervisor,
+                record: common::Sandbox {
+                    id: id.clone(),
+                    state: common::SandboxState::Running as i32,
+                    policy: Some(policy.clone()),
+                    guest_ip: lease.guest_ip.to_string(),
+                    ..Default::default()
+                },
+            };
+            let rule = async {
+                let began = std::time::Instant::now();
+                (self.rule_ahead(ruled).await, began.elapsed())
+            };
+            let (disk, (tap, tap_ms), (launched, launch_ms), (rules, rules_ms)) =
+                tokio::join!(disk, tap_timed, launch, rule);
             // Recorded before anything is inspected: the tap may well have
             // come up alongside a failure, and an interface belonging to a
             // sandbox that never existed must not be left behind.
             guard.tap = tap.as_ref().ok().filter(|name| !name.is_empty()).cloned();
+            guard.is_ruled = rules.is_ok();
             phases.mark("stage");
             phases.add("tap", tap_ms);
             phases.add("launch", launch_ms);
-            let failed = match (&disk, &tap) {
-                (Err(err), _) => Some(Status::internal(format!("staging warm snapshot: {err}"))),
-                (_, Err(err)) => Some(Status::internal(format!("tap setup: {err}"))),
+            phases.add("rules", rules_ms);
+            let failed = match (&disk, &tap, rules) {
+                (Err(err), _, _) => Some(Status::internal(format!("staging warm snapshot: {err}"))),
+                (_, Err(err), _) => Some(Status::internal(format!("tap setup: {err}"))),
+                (_, _, Err(err)) => Some(err),
                 _ => None,
             };
             let launched = match (launched, failed) {
