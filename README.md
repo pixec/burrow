@@ -15,6 +15,7 @@ To become a sponsor, open an issue or write to `oss+burrow[at]pixec.net`.
 | Company | About |
 | --- | --- |
 | [BoxCompute](https://boxcompute.ai) | BoxCompute provides cloud computers for AI agents. Each agent gets its own Linux virtual machine that keeps running after you close the browser; connect tools such as Claude Code, Codex or Cursor, or describe a task to BoxCompute's built-in agent, which sets up the software, runs your app, and gives you a live preview link. |
+| [berrybyte](https://berrybyte.net) | berrybyte hosts game servers for players and their friends. It runs more than twenty games, including Minecraft, Hytale, Rust, Palworld and Valheim, with one-click modpack installs, a browser dashboard, automatic off-site backups and DDoS protection, in US East, US West and EU Central. It also offers dedicated servers. |
 
 ## Documentation
 
