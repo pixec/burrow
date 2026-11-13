@@ -286,7 +286,8 @@ enum Command {
         #[arg(long)]
         name: Option<String>,
         /// Boot the image's own systemd under the agent. The image has to
-        /// ship systemd.
+        /// ship systemd. An image whose entrypoint runs systemd, or that sets
+        /// `dev.burrow.systemd=true`, boots it without this.
         #[arg(long)]
         systemd: bool,
         /// Hypervisor every sandbox from the template runs under:
@@ -1687,7 +1688,8 @@ enum TemplatesCommand {
         #[arg(long)]
         name: Option<String>,
         /// Boot the image's own systemd under the agent. The image has to
-        /// ship systemd.
+        /// ship systemd. An image whose entrypoint runs systemd, or that sets
+        /// `dev.burrow.systemd=true`, boots it without this.
         #[arg(long)]
         systemd: bool,
         /// Hypervisor every sandbox from the template runs under:

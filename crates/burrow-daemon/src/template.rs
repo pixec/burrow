@@ -1688,7 +1688,10 @@ pub mod from_image {
             }
         }
         let mut environment = pulled.environment;
-        environment.systemd = is_systemd;
+        if environment.systemd && !is_systemd {
+            progress(format!("{image} runs systemd; booting it under the agent"));
+        }
+        environment.systemd |= is_systemd;
         environment.hypervisor = hypervisor.to_string();
         stage(
             manager,

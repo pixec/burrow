@@ -257,8 +257,41 @@ pub struct SystemdBoot {
     pub unmask: Vec<String>,
 }
 
+const LABEL_SYSTEMD: &str = "dev.burrow.systemd";
 const LABEL_READY: &str = "dev.burrow.systemd.ready";
 const LABEL_UNMASK: &str = "dev.burrow.systemd.unmask";
+
+/// Where systemd lives, as an entrypoint names it.
+const SYSTEMD_PATHS: [&str; 4] = [
+    "/lib/systemd/systemd",
+    "/usr/lib/systemd/systemd",
+    "/bin/systemd",
+    "/usr/bin/systemd",
+];
+
+/// Whether an image asks to boot its systemd: `dev.burrow.systemd=true`, or
+/// an entrypoint (or, without one, a command) that runs systemd. The label
+/// wins either way, so `dev.burrow.systemd=false` keeps an image that names
+/// systemd from booting it.
+fn image_wants_systemd(
+    labels: &HashMap<String, String>,
+    entrypoint: &[String],
+    cmd: &[String],
+) -> bool {
+    match labels.get(LABEL_SYSTEMD).map(|value| value.trim()) {
+        Some("true" | "1") => return true,
+        Some("false" | "0") => return false,
+        Some(other) => {
+            tracing::warn!(
+                value = other,
+                "ignoring {LABEL_SYSTEMD}: not `true` or `false`"
+            )
+        }
+        None => {}
+    }
+    let first = entrypoint.first().or_else(|| cmd.first());
+    first.is_some_and(|program| SYSTEMD_PATHS.contains(&program.as_str()))
+}
 
 impl SystemdBoot {
     fn is_default(&self) -> bool {
@@ -865,17 +898,22 @@ pub async fn pull(
         layer_digests.push(layer.digest.clone());
     }
 
+    let labels = envelope.config.labels.unwrap_or_default();
     Ok(PulledImage {
         layers,
         environment: ImageEnvironment {
             env: envelope.config.env,
             working_dir: envelope.config.working_dir,
+            systemd: image_wants_systemd(
+                &labels,
+                &envelope.config.entrypoint,
+                &envelope.config.cmd,
+            ),
             entrypoint: envelope.config.entrypoint,
             cmd: envelope.config.cmd,
             user: envelope.config.user,
             kit: None,
-            systemd: false,
-            systemd_boot: SystemdBoot::from_labels(&envelope.config.labels.unwrap_or_default()),
+            systemd_boot: SystemdBoot::from_labels(&labels),
             // The build's choice, not the image's.
             hypervisor: String::new(),
             guest_os: String::new(),
@@ -1307,6 +1345,20 @@ fn remove_any(path: &Path) -> std::io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn an_image_that_runs_systemd_boots_it() {
+        let none = HashMap::new();
+        let systemd = ["/lib/systemd/systemd".to_string()];
+        assert!(image_wants_systemd(&none, &systemd, &[]));
+        assert!(image_wants_systemd(&none, &[], &systemd));
+        assert!(!image_wants_systemd(&none, &["/bin/sh".into()], &systemd));
+        assert!(!image_wants_systemd(&none, &["/sbin/init".into()], &[]));
+        let on = HashMap::from([(LABEL_SYSTEMD.to_string(), "true".to_string())]);
+        assert!(image_wants_systemd(&on, &["/bin/sh".into()], &[]));
+        let off = HashMap::from([(LABEL_SYSTEMD.to_string(), "false".to_string())]);
+        assert!(!image_wants_systemd(&off, &systemd, &[]));
+    }
 
     #[test]
     fn systemd_labels_keep_only_unit_names() {
