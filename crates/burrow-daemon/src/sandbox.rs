@@ -1637,7 +1637,7 @@ impl RunningSandbox {
     pub async fn agent_has(&self, feature: &str) -> Result<bool, Status> {
         let mut agent = self.reach_agent().await?;
         let mut features = self.agent_features.lock().await;
-        if features.is_none() {
+        if features.as_ref().is_none_or(Vec::is_empty) {
             let health = agent
                 .health(burrow_proto::guest::v1::GuestHealthRequest {})
                 .await?
