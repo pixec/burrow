@@ -8,9 +8,9 @@
 # sdk/typescript/package.json.
 #
 # A manual run with `dev` set publishes a prerelease of the commit it runs on:
-# npm gets <version>-dev.<short hash> under the `next` dist-tag, and PyPI gets
-# <version>.dev<UTC minute>, since PyPI versions cannot carry a hash; its
-# description names the commit. Neither is installed by default. A manual run
+# npm gets <version>-dev.<UTC minute>.g<short hash> under the `next` dist-tag,
+# and PyPI gets <version>.dev<UTC minute>, since PyPI versions cannot carry a
+# hash; its description names the commit. Neither is installed by default. A manual run
 # without `dev` builds and tests both packages and publishes nothing.
 #
 # Both registries use trusted publishing, so no token is stored: PyPI and npm
@@ -127,8 +127,9 @@ jobs:
         if: env.DEV == 'true'
         run: |
           version=$(node -p "require('./package.json').version")
-          npm version "$version-dev.${GITHUB_SHA::7}" --no-git-tag-version
-          echo "Publishing $version-dev.${GITHUB_SHA::7}"
+          dev="$version-dev.$(date -u +%Y%m%d%H%M).g${GITHUB_SHA::7}"
+          npm version "$dev" --no-git-tag-version
+          echo "Publishing $dev"
 
       - name: Test
         run: |
