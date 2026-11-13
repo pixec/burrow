@@ -803,6 +803,12 @@ fn settled() -> Arc<tokio::sync::watch::Sender<Handshake>> {
 /// still in it), and a create that returns before its directory is gone can be
 /// retried straight into the middle of its own cleanup. `Drop` is left as the
 /// backstop that says loudly when a path forgot.
+/// `work`'s output and how long it took.
+async fn timed<T>(work: impl std::future::Future<Output = T>) -> (T, std::time::Duration) {
+    let began = std::time::Instant::now();
+    (work.await, began.elapsed())
+}
+
 /// What the firewall needs of a sandbox, which a create has before its VM.
 #[derive(Clone)]
 struct Ruled {
@@ -1893,6 +1899,8 @@ impl RunningSandbox {
         upgrade: Option<&guestconn::GuestUpgrade>,
         is_stored: bool,
     ) -> Result<(), Status> {
+        let began = std::time::Instant::now();
+        let mut phases = burrow_vmm::Phases::start();
         self.forget_agent().await;
         let mut slot = self.vm.lock().await;
         if slot.is_some() {
@@ -1909,9 +1917,12 @@ impl RunningSandbox {
         spec.memory_source = self.durable.arriving().map(|h| burrow_vmm::MemorySource(h));
         record_working_set(&mut spec, is_stored);
         let limits = spec.limits.clone();
+        phases.mark("spec");
         let mut vm = Vm::restore(spec, true)
             .await
             .map_err(|err| Status::internal(format!("restore failed: {err}")))?;
+        phases.mark("vmm");
+        phases.append(&vm.phases());
         // Retried to the deadline, as a warm create's handshake is, and the
         // connection that succeeds is the one kept. Probing first and then
         // dialling again failed a resume outright whenever the second dial was
@@ -1921,6 +1932,7 @@ impl RunningSandbox {
         // its clock, which it cannot know on its own.
         let handshook = match guestconn::connect_when_ready(guest.clone(), agent_timeout).await {
             Ok((agent, _)) => {
+                phases.mark("dial");
                 guestconn::handshake_upgrading(agent, guest, request, upgrade, agent_timeout)
                     .await
                     .map(|(agent, _)| agent)
@@ -1946,9 +1958,12 @@ impl RunningSandbox {
         self.handshake.send_replace(Handshake::Done);
 
         self.touch();
+        phases.mark("handshake");
         tracing::info!(
             sandbox = self.id(),
             restore_ms = vm.boot_latency().as_millis() as u64,
+            total_ms = began.elapsed().as_millis() as u64,
+            %phases,
             "sandbox resumed"
         );
         *slot = Some(vm);
@@ -7457,13 +7472,12 @@ impl SandboxManager {
 
         // A backend without a tap gets no interface at all, and an empty name
         // that nothing tears down.
-        let tap_timed = async {
-            let began = std::time::Instant::now();
-            if !capabilities.is_tap_networked {
-                return (Ok(String::new()), began.elapsed());
+        let tap_timed = timed(async {
+            match capabilities.is_tap_networked {
+                true => tap::create(&lease).await,
+                false => Ok(String::new()),
             }
-            (tap::create(&lease).await, began.elapsed())
-        };
+        });
         let tap_name = match capabilities.is_tap_networked {
             true => tap::tap_name(&lease),
             false => String::new(),
@@ -7557,10 +7571,6 @@ impl SandboxManager {
                 timed.mark("chown");
                 Ok::<_, std::io::Error>(timed)
             };
-            let launch = async {
-                let began = std::time::Instant::now();
-                (Vm::launch(spec).await, began.elapsed())
-            };
             // The rules need only the lease, the tap's name and the policy, so
             // they are applied alongside too. A tap no rule names has every
             // packet dropped, so the guest has no network until they land,
@@ -7578,12 +7588,12 @@ impl SandboxManager {
                     ..Default::default()
                 },
             };
-            let rule = async {
-                let began = std::time::Instant::now();
-                (self.rule_ahead(ruled).await, began.elapsed())
-            };
-            let (disk, (tap, tap_ms), (launched, launch_ms), (rules, rules_ms)) =
-                tokio::join!(disk, tap_timed, launch, rule);
+            let (disk, (tap, tap_ms), (launched, launch_ms), (rules, rules_ms)) = tokio::join!(
+                disk,
+                tap_timed,
+                timed(Vm::launch(spec)),
+                timed(self.rule_ahead(ruled))
+            );
             // Recorded before anything is inspected: the tap may well have
             // come up alongside a failure, and an interface belonging to a
             // sandbox that never existed must not be left behind.
@@ -8475,6 +8485,8 @@ impl SandboxManager {
         node_id: String,
         name: String,
     ) -> Result<(Arc<RunningSandbox>, crate::diskcap::Admitted), Status> {
+        let began = std::time::Instant::now();
+        let mut phases = burrow_vmm::Phases::start();
         // State restores only under the hypervisor that wrote it, so the
         // source decides, whatever the template says now.
         let hypervisor = source.hypervisor()?;
@@ -8548,6 +8560,7 @@ impl SandboxManager {
             Err(err) => return Err(guard.fail(err).await),
         };
 
+        phases.mark("checks");
         let allocated = self.ipam.lock().await.allocate(&id);
         let lease = match allocated {
             Ok(lease) => lease,
@@ -8616,8 +8629,40 @@ impl SandboxManager {
             Ok::<_, Status>((chain, arriving))
         };
 
-        let (staged, tap) = tokio::join!(stage, tap::create(&lease));
+        phases.mark("ipam");
+        // The rules need only the lease, the tap's name and the policy, so
+        // they land alongside the staging; see the warm create.
+        let tap_name = match capabilities.is_tap_networked {
+            true => tap::tap_name(&lease),
+            false => String::new(),
+        };
+        let ruled = Ruled {
+            id: id.clone(),
+            tap: tap_name.clone(),
+            lease,
+            hypervisor,
+            record: common::Sandbox {
+                id: id.clone(),
+                state: common::SandboxState::Running as i32,
+                policy: Some(policy.clone()),
+                guest_ip: lease.guest_ip.to_string(),
+                ..Default::default()
+            },
+        };
+        let ((staged, stage_ms), (tap, tap_ms), (rules, rules_ms)) = tokio::join!(
+            timed(stage),
+            timed(tap::create(&lease)),
+            timed(self.rule_ahead(ruled))
+        );
         guard.tap = tap.as_ref().ok().cloned();
+        guard.is_ruled = rules.is_ok();
+        phases.mark("stage");
+        phases.add("files", stage_ms);
+        phases.add("tap", tap_ms);
+        phases.add("rules", rules_ms);
+        if let Err(err) = rules {
+            return Err(guard.fail(err).await);
+        }
         let (chain, mut arriving) = match staged {
             Ok(staged) => staged,
             Err(err) => return Err(guard.fail(err).await),
@@ -8633,14 +8678,11 @@ impl SandboxManager {
         {
             hydrator.wait().await;
         }
-        let tap_name = match tap {
-            Ok(name) => name,
-            Err(err) => {
-                return Err(guard
-                    .fail(Status::internal(format!("tap setup: {err}")))
-                    .await);
-            }
-        };
+        if let Err(err) = tap {
+            return Err(guard
+                .fail(Status::internal(format!("tap setup: {err}")))
+                .await);
+        }
 
         // No volumes in the spec, exactly as a warm create's restore describes
         // none: firecracker takes a restored VM's drives from the snapshot, and
@@ -8691,6 +8733,7 @@ impl SandboxManager {
         spec.memory_chain = chain.clone();
         spec.memory_source = arriving.clone().map(|h| burrow_vmm::MemorySource(h));
         record_working_set(&mut spec, self.config.object_store.is_some());
+        phases.mark("spec");
 
         let started = std::time::Instant::now();
         match Vm::restore(spec, true).await {
@@ -8701,6 +8744,13 @@ impl SandboxManager {
                     .await);
             }
         }
+        phases.mark("vmm");
+        phases.append(&guard.vm().phases());
+        // Dialled as soon as there is a guest to dial, as a warm create does.
+        guard.dialing = Some(tokio::spawn(guestconn::connect_when_ready(
+            guard.vm().guest(),
+            self.config.agent_timeout,
+        )));
 
         if !is_attached
             && let Err(err) = attach_volumes(guard.vm(), &policy.volumes, guest_os).await
@@ -8729,7 +8779,9 @@ impl SandboxManager {
             },
         );
         let inspection_root = self.inspection_root_of(&request);
+        phases.mark("attach");
         // Nothing below can fail, so the sandbox takes over here.
+        let dialing = guard.dialing.take();
         let vm = guard.keep().expect("a restore that reaches here has a vm");
 
         let record = common::Sandbox {
@@ -8757,6 +8809,13 @@ impl SandboxManager {
             restore_ms = vm.boot_latency().as_millis() as u64,
             total_ms = started.elapsed().as_millis() as u64,
             "restored sandbox running; handshake deferred"
+        );
+        tracing::info!(
+            sandbox = id,
+            what,
+            total_ms = began.elapsed().as_millis() as u64,
+            %phases,
+            "restore timing"
         );
 
         let sandbox = Arc::new(RunningSandbox {
@@ -8793,7 +8852,7 @@ impl SandboxManager {
             &sandbox,
             request,
             None,
-            None,
+            dialing,
             self.config.agent_timeout,
         );
         Ok((sandbox, disk))
