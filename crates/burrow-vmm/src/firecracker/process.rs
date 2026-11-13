@@ -11,7 +11,11 @@ use crate::error::{Error, Result};
 
 /// How long to wait for firecracker to create its API socket.
 const SOCKET_TIMEOUT: Duration = Duration::from_millis(5_000);
-const SOCKET_POLL: Duration = Duration::from_millis(2);
+/// Firecracker listens a few milliseconds after it starts, and tokio's timer
+/// rounds a sleep up to a whole millisecond, so the socket is polled from a
+/// blocking thread, a slice at a time between checks that it still runs.
+const SOCKET_POLL: Duration = Duration::from_micros(100);
+const SOCKET_SLICE: Duration = Duration::from_millis(20);
 
 /// Firecracker accepts only alphanumerics and hyphens in `--id`, and panics
 /// on anything else. Burrow's own ids use underscores (`sbx_1a2b…`), so they
@@ -229,7 +233,20 @@ impl FcProcess {
             // Accepting, not merely present: the socket file appears at bind,
             // before firecracker listens, and an API call in that gap is
             // refused and fails the boot or restore it belongs to.
-            if tokio::net::UnixStream::connect(sock_path).await.is_ok() {
+            let path = sock_path.to_path_buf();
+            let is_listening = tokio::task::spawn_blocking(move || {
+                let slice = Instant::now() + SOCKET_SLICE;
+                while Instant::now() < slice {
+                    if std::os::unix::net::UnixStream::connect(&path).is_ok() {
+                        return true;
+                    }
+                    std::thread::sleep(SOCKET_POLL);
+                }
+                false
+            })
+            .await
+            .map_err(std::io::Error::other)?;
+            if is_listening {
                 return Ok(());
             }
             // A firecracker that died on startup will never create the socket;
@@ -246,7 +263,6 @@ impl FcProcess {
                     timeout_ms: SOCKET_TIMEOUT.as_millis() as u64,
                 });
             }
-            tokio::time::sleep(SOCKET_POLL).await;
         }
     }
 
