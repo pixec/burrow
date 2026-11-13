@@ -8284,6 +8284,7 @@ impl SandboxManager {
                 tags,
                 node_id,
                 name,
+                Vec::new(),
             )
             .await;
         let registered = match &provisioned {
@@ -8463,6 +8464,7 @@ impl SandboxManager {
                 tags,
                 node_id,
                 name,
+                Vec::new(),
             )
             .await;
         let _ = tokio::fs::remove_file(&capture).await;
@@ -8510,6 +8512,7 @@ impl SandboxManager {
         tokio::spawn(async move { sandbox.compact_past(depth).await });
     }
 
+    #[allow(clippy::too_many_arguments)]
     async fn provision_restored(
         &self,
         source: RestoreSource<'_>,
@@ -8518,6 +8521,7 @@ impl SandboxManager {
         tags: HashMap<String, String>,
         node_id: String,
         name: String,
+        public_ips: Vec<common::PublicIp>,
     ) -> Result<(Arc<RunningSandbox>, crate::diskcap::Admitted), Status> {
         let began = std::time::Instant::now();
         let mut phases = burrow_vmm::Phases::start();
@@ -8680,6 +8684,7 @@ impl SandboxManager {
                 state: common::SandboxState::Running as i32,
                 policy: Some(policy.clone()),
                 guest_ip: lease.guest_ip.to_string(),
+                public_ips: public_ips.clone(),
                 ..Default::default()
             },
         };
@@ -8834,6 +8839,7 @@ impl SandboxManager {
             guest_os: guest_os.as_str().to_string(),
             inspection_root_fingerprint: inspection_root,
             kernel,
+            public_ips,
             ..Default::default()
         };
         tracing::info!(
@@ -10251,6 +10257,7 @@ impl SandboxManager {
                 record.tags.clone(),
                 node_id.clone(),
                 record.name.clone(),
+                record.public_ips.clone(),
             )
             .await;
         let (sandbox, disk) = match provisioned {
@@ -10270,7 +10277,6 @@ impl SandboxManager {
             base.kit_credentials = record.kit_credentials.clone();
             base.kit_selection = record.kit_selection.clone();
             base.access_revoked_at_ms = record.access_revoked_at_ms;
-            base.public_ips = record.public_ips.clone();
         }
         *sandbox.usage.lock().unwrap() = Usage {
             cpu_usec: record.cpu_usage_usec.max(manifest.cpu_usage_usec),
