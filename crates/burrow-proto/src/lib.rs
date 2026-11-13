@@ -157,10 +157,9 @@ impl guest::v1::fs_request::Op {
 mod sdk_protos {
     use std::path::PathBuf;
 
-    /// Every proto the SDKs carry, including `node` and `guest`: they are not
-    /// used by an SDK today, but a stale copy is a trap for whoever reaches
-    /// for one next.
-    const SHIPPED: [&str; 4] = ["common", "api", "node", "guest"];
+    /// The protos the SDKs load. `node` and `guest` are internal to the
+    /// fleet and are not shipped in the published packages.
+    const SHIPPED: [&str; 2] = ["common", "api"];
 
     const SDK_DIRS: [&str; 2] = [
         "../../sdk/typescript/proto",

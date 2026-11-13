@@ -1,0 +1,106 @@
+# Publishes the Python and TypeScript SDKs for a tagged release.
+#
+# Runs on the same version tag as release.yml:
+#
+#   git tag v0.1.0 && git push origin v0.1.0
+#
+# Both registries use trusted publishing, so no token is stored: PyPI and
+# npm each trust this workflow file on this repository. The tag must match
+# the version in sdk/python/pyproject.toml and sdk/typescript/package.json.
+# A manual run builds and tests both packages but publishes nothing.
+name: sdk-release
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  python:
+    runs-on: ubuntu-24.04
+    defaults:
+      run:
+        working-directory: sdk/python
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
+        with:
+          python-version: "3.9"
+
+      - name: Version matches the tag
+        if: startsWith(github.ref, 'refs/tags/v')
+        run: |
+          version=$(grep -m1 '^version' pyproject.toml | cut -d'"' -f2)
+          test "v$version" = "$GITHUB_REF_NAME" || { echo "pyproject.toml says $version, tag is $GITHUB_REF_NAME"; exit 1; }
+
+      - name: Test
+        run: |
+          pip install -e '.[dev]'
+          pytest
+          python scripts/genproto.py --check
+
+      - name: Build
+        run: |
+          pip install build
+          python -m build
+
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: python-dist
+          path: sdk/python/dist/
+
+  python-publish:
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: python
+    runs-on: ubuntu-24.04
+    environment: pypi
+    permissions:
+      id-token: write
+    steps:
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: python-dist
+          path: dist/
+
+      - uses: pypa/gh-action-pypi-publish@7245906fb61fa33a13554f9d5fb856fe61758086 # v1.14.3
+
+  typescript:
+    runs-on: ubuntu-24.04
+    defaults:
+      run:
+        working-directory: sdk/typescript
+    permissions:
+      contents: read
+      id-token: write
+    environment: ${{ startsWith(github.ref, 'refs/tags/v') && 'npm' || '' }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+
+      # Trusted publishing needs npm 11.5.1 or later, which Node 24 ships.
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: 24
+          registry-url: https://registry.npmjs.org
+
+      - name: Version matches the tag
+        if: startsWith(github.ref, 'refs/tags/v')
+        run: |
+          version=$(node -p "require('./package.json').version")
+          test "v$version" = "$GITHUB_REF_NAME" || { echo "package.json says $version, tag is $GITHUB_REF_NAME"; exit 1; }
+
+      - name: Test
+        run: |
+          npm ci
+          npm test
+
+      - name: Pack
+        run: npm pack --dry-run
+
+      - name: Publish
+        if: startsWith(github.ref, 'refs/tags/v')
+        run: npm publish

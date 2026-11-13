@@ -10,7 +10,7 @@ cd "$(dirname "$0")/.."
 
 src=crates/burrow-proto/proto
 dsts="sdk/typescript/proto sdk/python/src/burrow/proto"
-protos="common api node guest"
+protos="common api"
 
 stale=""
 for dst in $dsts; do
