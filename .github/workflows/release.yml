@@ -5,7 +5,9 @@
 #   git tag v0.1.0 && git push origin v0.1.0
 #
 # A manual run builds and uploads artifacts but publishes nothing, so the whole
-# path can be exercised without cutting a release.
+# path can be exercised without cutting a release. With `images` set it also
+# pushes both images tagged <version>-dev.<short hash> and `dev`, never
+# `latest`.
 name: release
 
 on:
@@ -13,6 +15,11 @@ on:
     tags:
       - "v*"
   workflow_dispatch:
+    inputs:
+      images:
+        description: Push dev images of this commit
+        type: boolean
+        default: false
 
 # Read-only by default; the two jobs that publish widen it themselves.
 permissions:
@@ -130,7 +137,7 @@ jobs:
   # under the target platform, so arm64 needs emulation on this runner.
   images:
     needs: build
-    if: github.ref_type == 'tag'
+    if: github.ref_type == 'tag' || (github.event_name == 'workflow_dispatch' && inputs.images)
     runs-on: ubuntu-latest
     permissions:
       contents: read
@@ -167,7 +174,15 @@ jobs:
 
       - name: Version
         id: version
-        run: echo "version=${GITHUB_REF_NAME#v}" >> "$GITHUB_OUTPUT"
+        run: |
+          if [ "${GITHUB_REF_TYPE}" = "tag" ]; then
+            echo "version=${GITHUB_REF_NAME#v}" >> "$GITHUB_OUTPUT"
+            echo "channel=latest" >> "$GITHUB_OUTPUT"
+          else
+            crate=$(grep -m1 '^version' Cargo.toml | cut -d'"' -f2)
+            echo "version=${crate}-dev.${GITHUB_SHA::7}" >> "$GITHUB_OUTPUT"
+            echo "channel=dev" >> "$GITHUB_OUTPUT"
+          fi
 
       - name: Orchestrator image
         uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6
@@ -182,7 +197,7 @@ jobs:
           push: true
           tags: |
             ghcr.io/${{ github.repository }}-orchestrator:${{ steps.version.outputs.version }}
-            ghcr.io/${{ github.repository }}-orchestrator:latest
+            ghcr.io/${{ github.repository }}-orchestrator:${{ steps.version.outputs.channel }}
 
       - name: Node image
         uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6
@@ -200,7 +215,7 @@ jobs:
           push: true
           tags: |
             ghcr.io/${{ github.repository }}-node:${{ steps.version.outputs.version }}
-            ghcr.io/${{ github.repository }}-node:latest
+            ghcr.io/${{ github.repository }}-node:${{ steps.version.outputs.channel }}
 
   release:
     needs: build
