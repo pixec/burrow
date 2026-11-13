@@ -26,8 +26,9 @@
 //! dirtied, through the page cache at once. Charged against a ceiling sized to
 //! the guest, that write was held to the disk's writeback speed and reclaimed
 //! the running guest into swap to make room, so a paused guest stayed paused
-//! for seconds. The VMM writes it from [`SNAPSHOT_CGROUP`] instead, which has
-//! no limits, and its pages are reclaimed as ordinary page cache.
+//! for seconds. The VMM writes it from a cgroup of its own beside the VM's
+//! instead, which has no limits, and its pages are reclaimed as ordinary page
+//! cache. The CPU it spends there is still the VM's.
 
 use std::path::{Path, PathBuf};
 
@@ -43,8 +44,9 @@ const CPU_PERIOD_US: u64 = 100_000;
 /// What `memory.max` allows past the ceiling, at least: room for page cache
 /// under writeback to drain in, so only a runaway VMM reaches the hard limit.
 const MEMORY_BOUND_MIN_MIB: u32 = 512;
-/// The cgroup beside every VMM's that a snapshot is written from.
-const SNAPSHOT_CGROUP: &str = "_snapshot";
+/// Prefixes the name of the cgroup beside a VMM's that it writes a snapshot
+/// from.
+const SNAPSHOT_PREFIX: &str = "_snapshot-";
 /// How long a dropped VM's cgroup is waited on to empty once its processes
 /// are killed.
 const REMOVE_ATTEMPTS: usize = 50;
@@ -89,6 +91,8 @@ impl Limits {
 
 pub struct Cgroup {
     path: PathBuf,
+    /// CPU the VMM spent in its snapshot cgroups, in microseconds.
+    snapshot_usec: std::sync::atomic::AtomicU64,
 }
 
 impl Cgroup {
@@ -103,7 +107,10 @@ impl Cgroup {
             std::fs::create_dir_all(&path)?;
         }
 
-        let cgroup = Self { path };
+        let cgroup = Self {
+            path,
+            snapshot_usec: Default::default(),
+        };
         cgroup.set_limits(&limits.uncapped())?;
         let path = &cgroup.path;
         if limits.memory_mib > 0 {
@@ -203,22 +210,22 @@ impl Cgroup {
         &self.path
     }
 
-    /// Moves the VMM to [`SNAPSHOT_CGROUP`] until the returned guard drops,
-    /// for the length of a snapshot. Only for a paused guest: its vCPUs run
-    /// without the cgroup's CPU limits until then.
+    /// Moves the VMM to a cgroup of its own beside this one until the
+    /// returned guard drops, for the length of a snapshot. Only for a paused
+    /// guest: its vCPUs run without the cgroup's CPU limits until then.
     pub(crate) fn snapshotting(&self) -> Result<Snapshotting<'_>> {
+        let name = self.path.file_name().unwrap_or_default().to_string_lossy();
         let parent = self.path.parent().unwrap_or(&self.path);
-        let outside = parent.join(SNAPSHOT_CGROUP);
-        if !outside.exists() {
-            std::fs::create_dir_all(&outside)?;
-        }
+        let outside = parent.join(format!("{SNAPSHOT_PREFIX}{name}"));
+        std::fs::create_dir_all(&outside)?;
         let pids = std::fs::read_to_string(self.path.join("cgroup.procs"))?;
         let guard = Snapshotting {
             home: self,
+            outside,
             pids: pids.split_whitespace().map(String::from).collect(),
         };
         for pid in &guard.pids {
-            write(&outside.join("cgroup.procs"), pid)?;
+            write(&guard.outside.join("cgroup.procs"), pid)?;
         }
         Ok(guard)
     }
@@ -230,11 +237,13 @@ impl Cgroup {
     /// Firecracker's own work on their behalf, and needs nothing from inside
     /// the guest. `None` where the controller is not delegated, which is the
     /// same condition that leaves the cap unenforced.
+    ///
+    /// The CPU it spent writing snapshots, outside this cgroup, is included.
     pub fn cpu_usage_usec(&self) -> Option<u64> {
-        let stat = std::fs::read_to_string(self.path.join("cpu.stat")).ok()?;
-        stat.lines()
-            .find_map(|line| line.strip_prefix("usage_usec "))
-            .and_then(|value| value.trim().parse().ok())
+        let snapshots = self
+            .snapshot_usec
+            .load(std::sync::atomic::Ordering::Relaxed);
+        Some(usage_usec(&self.path)? + snapshots)
     }
 }
 
@@ -275,10 +284,7 @@ pub fn sweep_empty_cgroups(root: &Path) {
     let mut removed = 0;
     for entry in entries.flatten() {
         let path = entry.path();
-        if path.is_dir()
-            && !entry.file_name().to_string_lossy().starts_with('_')
-            && std::fs::remove_dir(&path).is_ok()
-        {
+        if path.is_dir() && std::fs::remove_dir(&path).is_ok() {
             removed += 1;
         }
     }
@@ -287,9 +293,19 @@ pub fn sweep_empty_cgroups(root: &Path) {
     }
 }
 
-/// A VMM moved out of its cgroup for a snapshot, which it rejoins on drop.
+/// `usage_usec` from a cgroup's `cpu.stat`.
+fn usage_usec(cgroup: &Path) -> Option<u64> {
+    let stat = std::fs::read_to_string(cgroup.join("cpu.stat")).ok()?;
+    stat.lines()
+        .find_map(|line| line.strip_prefix("usage_usec "))
+        .and_then(|value| value.trim().parse().ok())
+}
+
+/// A VMM moved out of its cgroup for a snapshot. On drop it rejoins its own,
+/// which is credited the CPU it spent outside, and the snapshot cgroup goes.
 pub(crate) struct Snapshotting<'a> {
     home: &'a Cgroup,
+    outside: PathBuf,
     pids: Vec<String>,
 }
 
@@ -306,6 +322,11 @@ impl Drop for Snapshotting<'_> {
                 );
             }
         }
+        let spent = usage_usec(&self.outside).unwrap_or(0);
+        self.home
+            .snapshot_usec
+            .fetch_add(spent, std::sync::atomic::Ordering::Relaxed);
+        let _ = std::fs::remove_dir(&self.outside);
     }
 }
 
@@ -463,29 +484,40 @@ mod tests {
         for file in files {
             std::fs::write(path.join(file), "").unwrap();
         }
-        Cgroup { path }
+        at(path)
+    }
+
+    fn at(path: PathBuf) -> Cgroup {
+        Cgroup {
+            path,
+            snapshot_usec: Default::default(),
+        }
     }
 
     /// A snapshot is written from outside the VMM's cgroup, and the VMM is
-    /// back in its own once the snapshot ends.
+    /// back in its own once the snapshot ends, credited what it spent.
     #[test]
     fn a_snapshot_is_written_outside_the_vmm_cgroup() {
         let root = std::env::temp_dir().join(format!("burrow-cg-snap-{}", std::process::id()));
-        let cgroup = Cgroup {
-            path: root.join("vm"),
-        };
+        let cgroup = at(root.join("vm"));
         std::fs::create_dir_all(&cgroup.path).unwrap();
         std::fs::write(cgroup.path.join("cgroup.procs"), "41\n").unwrap();
-        let outside = root.join(SNAPSHOT_CGROUP).join("cgroup.procs");
+        std::fs::write(cgroup.path.join("cpu.stat"), "usage_usec 1000\n").unwrap();
+        let outside = root.join("_snapshot-vm");
         let guard = cgroup.snapshotting().unwrap();
-        assert_eq!(std::fs::read_to_string(&outside).unwrap(), "41");
+        assert_eq!(
+            std::fs::read_to_string(outside.join("cgroup.procs")).unwrap(),
+            "41"
+        );
         std::fs::write(cgroup.path.join("cgroup.procs"), "").unwrap();
+        std::fs::write(outside.join("cpu.stat"), "usage_usec 250\nuser_usec 0\n").unwrap();
         drop(guard);
         assert_eq!(
             std::fs::read_to_string(cgroup.path.join("cgroup.procs")).unwrap(),
             "41"
         );
-        drop(cgroup);
+        // The CPU the snapshot spent outside is still the VM's.
+        assert_eq!(cgroup.cpu_usage_usec(), Some(1250));
         let _ = std::fs::remove_dir_all(&root);
     }
 
@@ -495,18 +527,16 @@ mod tests {
     fn empty_cgroups_are_removed() {
         let root = std::env::temp_dir().join(format!("burrow-cg-sweep-{}", std::process::id()));
         let parent = root.join("burrow");
-        for dir in ["dropped", "left", "busy", "_snapshot"] {
+        for dir in ["dropped", "left", "_snapshot-left", "busy"] {
             std::fs::create_dir_all(parent.join(dir)).unwrap();
         }
         std::fs::write(parent.join("busy").join("cgroup.procs"), "41\n").unwrap();
-        drop(Cgroup {
-            path: parent.join("dropped"),
-        });
+        drop(at(parent.join("dropped")));
         assert!(!parent.join("dropped").exists());
         sweep_empty_cgroups(&root);
         assert!(!parent.join("left").exists());
+        assert!(!parent.join("_snapshot-left").exists());
         assert!(parent.join("busy").exists());
-        assert!(parent.join("_snapshot").exists());
         let _ = std::fs::remove_dir_all(&root);
     }
 
