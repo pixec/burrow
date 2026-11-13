@@ -990,15 +990,26 @@ fn spawn_handshake(
         let step = std::sync::Mutex::new("waiting for the guest's vsock to accept");
         // An upgrade has its own bound on top, for the new agent's first
         // launch.
+        let phases = std::sync::Mutex::new(burrow_vmm::Phases::start());
+        let guest_timing = std::sync::Mutex::new(None);
         let outcome = match tokio::time::timeout(timeout + guestconn::UPGRADE_TIMEOUT, async {
-            let (agent, _) = match dialing {
+            let (agent, accepted_at) = match dialing {
                 Some(dialing) => dialing.await??,
                 None => guestconn::connect_when_ready(guest.clone(), timeout).await?,
             };
+            if let Some(accepted_at) = accepted_at {
+                phases
+                    .lock()
+                    .unwrap()
+                    .add("vsock", accepted_at.duration_since(began));
+            }
+            phases.lock().unwrap().mark("dial");
             *step.lock().unwrap() = "waiting for the agent to answer the handshake";
-            let (mut agent, _) =
+            let (mut agent, response) =
                 guestconn::handshake_upgrading(agent, guest, request, upgrade.as_deref(), timeout)
                     .await?;
+            phases.lock().unwrap().mark("handshake");
+            *guest_timing.lock().unwrap() = response.timing;
             if let Some(size_bytes) = grow_to {
                 *step.lock().unwrap() = "waiting for the guest to grow its filesystem";
                 agent
@@ -1050,10 +1061,21 @@ fn spawn_handshake(
                 // otherwise have to dial for itself.
                 *sandbox.agent_channel.lock().await = Some(agent.expect("done means connected"));
                 manager.emit(&sandbox, EVENT_AGENT_READY, "").await;
-                tracing::debug!(
+                let mut phases = phases.into_inner().unwrap();
+                phases.mark("ready");
+                let guest = guest_timing.into_inner().unwrap().unwrap_or_default();
+                tracing::info!(
                     sandbox = id,
-                    took_ms = began.elapsed().as_millis() as u64,
-                    "deferred handshake complete"
+                    total_ms = began.elapsed().as_millis() as u64,
+                    %phases,
+                    guest_parked_us = guest.parked_us,
+                    guest_accept_to_call_us = guest.accept_to_call_us,
+                    guest_reseed_us = guest.reseed_us,
+                    guest_clock_us = guest.clock_us,
+                    guest_trust_us = guest.trust_us,
+                    guest_network_us = guest.network_us,
+                    guest_handshake_us = guest.total_us,
+                    "handshake timing"
                 );
             }
             Handshake::Failed(err) if recorded => {
