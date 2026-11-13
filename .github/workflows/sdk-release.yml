@@ -1,13 +1,20 @@
-# Publishes the Python and TypeScript SDKs for a tagged release.
+# Publishes the Python and TypeScript SDKs.
 #
-# Runs on the same version tag as release.yml:
+# A version tag publishes a release, on the same tag as release.yml:
 #
 #   git tag v0.1.0 && git push origin v0.1.0
 #
-# Both registries use trusted publishing, so no token is stored: PyPI and
-# npm each trust this workflow file on this repository. The tag must match
-# the version in sdk/python/pyproject.toml and sdk/typescript/package.json.
-# A manual run builds and tests both packages but publishes nothing.
+# The tag must match the version in sdk/python/pyproject.toml and
+# sdk/typescript/package.json.
+#
+# A manual run with `dev` set publishes a prerelease of the commit it runs on:
+# npm gets <version>-dev.<short hash> under the `next` dist-tag, and PyPI gets
+# <version>.dev<UTC minute>, since PyPI versions cannot carry a hash; its
+# description names the commit. Neither is installed by default. A manual run
+# without `dev` builds and tests both packages and publishes nothing.
+#
+# Both registries use trusted publishing, so no token is stored: PyPI and npm
+# each trust this workflow file on this repository.
 name: sdk-release
 
 on:
@@ -15,9 +22,18 @@ on:
     tags:
       - "v*"
   workflow_dispatch:
+    inputs:
+      dev:
+        description: Publish a prerelease of this commit
+        type: boolean
+        default: false
 
 permissions:
   contents: read
+
+env:
+  RELEASE: ${{ startsWith(github.ref, 'refs/tags/v') }}
+  DEV: ${{ github.event_name == 'workflow_dispatch' && inputs.dev }}
 
 jobs:
   python:
@@ -33,10 +49,24 @@ jobs:
           python-version: "3.9"
 
       - name: Version matches the tag
-        if: startsWith(github.ref, 'refs/tags/v')
+        if: env.RELEASE == 'true'
         run: |
           version=$(grep -m1 '^version' pyproject.toml | cut -d'"' -f2)
           test "v$version" = "$GITHUB_REF_NAME" || { echo "pyproject.toml says $version, tag is $GITHUB_REF_NAME"; exit 1; }
+
+      - name: Stamp a dev version
+        if: env.DEV == 'true'
+        run: |
+          version=$(grep -m1 '^version' pyproject.toml | cut -d'"' -f2)
+          dev="$version.dev$(date -u +%Y%m%d%H%M)"
+          sed -i "s/^version = \"$version\"/version = \"$dev\"/" pyproject.toml
+          python - <<EOF
+          from pathlib import Path
+          readme = Path("README.md")
+          title, rest = readme.read_text().split("\n", 1)
+          readme.write_text(f"{title}\n\nDevelopment build of commit ${GITHUB_SHA::7}.\n{rest}")
+          EOF
+          echo "Publishing $dev from ${GITHUB_SHA::7}"
 
       - name: Test
         run: |
@@ -55,7 +85,7 @@ jobs:
           path: sdk/python/dist/
 
   python-publish:
-    if: startsWith(github.ref, 'refs/tags/v')
+    if: startsWith(github.ref, 'refs/tags/v') || (github.event_name == 'workflow_dispatch' && inputs.dev)
     needs: python
     runs-on: ubuntu-24.04
     environment: pypi
@@ -77,7 +107,7 @@ jobs:
     permissions:
       contents: read
       id-token: write
-    environment: ${{ startsWith(github.ref, 'refs/tags/v') && 'npm' || '' }}
+    environment: ${{ (startsWith(github.ref, 'refs/tags/v') || (github.event_name == 'workflow_dispatch' && inputs.dev)) && 'npm' || '' }}
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
 
@@ -88,10 +118,17 @@ jobs:
           registry-url: https://registry.npmjs.org
 
       - name: Version matches the tag
-        if: startsWith(github.ref, 'refs/tags/v')
+        if: env.RELEASE == 'true'
         run: |
           version=$(node -p "require('./package.json').version")
           test "v$version" = "$GITHUB_REF_NAME" || { echo "package.json says $version, tag is $GITHUB_REF_NAME"; exit 1; }
+
+      - name: Stamp a dev version
+        if: env.DEV == 'true'
+        run: |
+          version=$(node -p "require('./package.json').version")
+          npm version "$version-dev.${GITHUB_SHA::7}" --no-git-tag-version
+          echo "Publishing $version-dev.${GITHUB_SHA::7}"
 
       - name: Test
         run: |
@@ -101,6 +138,14 @@ jobs:
       - name: Pack
         run: npm pack --dry-run
 
+      # A version already on the registry is skipped, so a run can be retried.
       - name: Publish
-        if: startsWith(github.ref, 'refs/tags/v')
-        run: npm publish
+        if: env.RELEASE == 'true' || env.DEV == 'true'
+        run: |
+          name=$(node -p "require('./package.json').name")
+          version=$(node -p "require('./package.json').version")
+          if npm view "$name@$version" version >/dev/null 2>&1; then
+            echo "$name@$version is already published"
+            exit 0
+          fi
+          if [ "$DEV" = true ]; then npm publish --tag next; else npm publish; fi
