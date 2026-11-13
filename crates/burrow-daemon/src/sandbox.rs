@@ -11031,7 +11031,10 @@ pub(crate) mod tests {
                 cloud_hypervisor_version: String::new(),
                 guest_upgrade: None,
                 event_delivery: Default::default(),
-                disk: Default::default(),
+                disk: crate::diskcap::DiskPolicy {
+                    reserve_mib: Some(0),
+                    ..Default::default()
+                },
                 public: Default::default(),
                 warm: Default::default(),
                 checkpoint_min_secs: 60,
