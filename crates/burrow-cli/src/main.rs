@@ -5236,22 +5236,16 @@ async fn run_exec(
     // A terminal that is not driving a pty has nothing to send: closing stdin
     // straight away lets the command see EOF rather than hang on a user who is
     // not typing at it. Anything else (a pipe, a file, an interactive pty) is
-    // forwarded, and the pump's handle is kept so it can be stopped once the
-    // command is over: it sits in a read of stdin, and a pipe nobody is writing
-    // to keeps it there long after there is anywhere to send the bytes.
-    let stdin_pump = if interactive || !std::io::stdin().is_terminal() {
-        Some(tokio::spawn(forward_stdin(
-            tx.clone(),
-            flags.is_pty_allocated,
-        )))
+    // forwarded.
+    if interactive || !std::io::stdin().is_terminal() {
+        forward_stdin(tx.clone(), flags.is_pty_allocated);
     } else {
         tx.send(api::ExecInput {
             input: Some(api::exec_input::Input::IsStdinEof(true)),
         })
         .await
         .ok();
-        None
-    };
+    }
     if interactive {
         tokio::spawn(forward_resizes(tx.clone()));
     }
@@ -5270,18 +5264,8 @@ async fn run_exec(
     // `None` until the guest says how the command ended: defaulting to 0 would
     // report a command whose stream was cut as a success.
     let mut code = None;
-    let mut outcome = Ok(());
     while let Some(msg) = stream.next().await {
-        let msg = match msg {
-            Ok(msg) => msg,
-            // Kept rather than returned so the pump below is stopped on this
-            // path too.
-            Err(err) => {
-                outcome = Err(err);
-                break;
-            }
-        };
-        match msg.output {
+        match msg?.output {
             Some(api::exec_output::Output::Stdout(b)) => {
                 stdout.write_all(&b)?;
                 stdout.flush()?;
@@ -5299,10 +5283,6 @@ async fn run_exec(
             | None => {}
         }
     }
-    if let Some(pump) = stdin_pump {
-        pump.abort();
-    }
-    outcome?;
     code.ok_or_else(|| {
         anyhow::anyhow!(
             "the exec stream ended without an exit status; `burrow top` lists \
@@ -5442,33 +5422,39 @@ async fn attach_command(client: &Client, id: &str, command_id: &str) -> anyhow::
 /// the terminal down, so a pty session sends the EOF character and lets the
 /// guest's line discipline turn it into an end of file. Only a piped command
 /// gets a real close.
-async fn forward_stdin(tx: tokio::sync::mpsc::Sender<api::ExecInput>, pty: bool) {
-    use tokio::io::AsyncReadExt;
+///
+/// The reads run on a thread of their own: a read of a pipe nobody writes to
+/// cannot be cancelled, and on tokio's blocking pool it would hold the runtime
+/// open after the command has exited.
+fn forward_stdin(tx: tokio::sync::mpsc::Sender<api::ExecInput>, pty: bool) {
+    use std::io::Read;
 
     /// ^D, the default VEOF.
     const EOT: u8 = 0x04;
 
-    let mut stdin = tokio::io::stdin();
-    let mut buf = vec![0u8; 8 * 1024];
-    loop {
-        match stdin.read(&mut buf).await {
-            Ok(0) | Err(_) => break,
-            Ok(n) => {
-                let msg = api::ExecInput {
-                    input: Some(api::exec_input::Input::Stdin(buf[..n].to_vec())),
-                };
-                if tx.send(msg).await.is_err() {
-                    return;
+    std::thread::spawn(move || {
+        let mut stdin = std::io::stdin().lock();
+        let mut buf = vec![0u8; 8 * 1024];
+        loop {
+            match stdin.read(&mut buf) {
+                Ok(0) | Err(_) => break,
+                Ok(n) => {
+                    let msg = api::ExecInput {
+                        input: Some(api::exec_input::Input::Stdin(buf[..n].to_vec())),
+                    };
+                    if tx.blocking_send(msg).is_err() {
+                        return;
+                    }
                 }
             }
         }
-    }
-    let end = if pty {
-        api::exec_input::Input::Stdin(vec![EOT])
-    } else {
-        api::exec_input::Input::IsStdinEof(true)
-    };
-    tx.send(api::ExecInput { input: Some(end) }).await.ok();
+        let end = if pty {
+            api::exec_input::Input::Stdin(vec![EOT])
+        } else {
+            api::exec_input::Input::IsStdinEof(true)
+        };
+        tx.blocking_send(api::ExecInput { input: Some(end) }).ok();
+    });
 }
 
 /// Keeps the guest's pty the same size as the local terminal.
