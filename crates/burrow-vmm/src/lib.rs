@@ -56,6 +56,48 @@ pub const MEMORY_BLOCK_MIB: u32 = 2;
 /// Hypervisor's alignment for a virtio-mem region.
 pub const MEMORY_REGION_ALIGN_MIB: u32 = 128;
 
+/// Where a VM start spent its time, phase by phase, in the order they ran.
+#[derive(Debug, Clone, Default)]
+pub struct Phases {
+    marks: Vec<(&'static str, Duration)>,
+    last: Option<std::time::Instant>,
+}
+
+impl Phases {
+    pub fn start() -> Self {
+        Self {
+            marks: Vec::new(),
+            last: Some(std::time::Instant::now()),
+        }
+    }
+
+    /// Charges the time since the previous mark to `name`.
+    pub fn mark(&mut self, name: &'static str) {
+        let now = std::time::Instant::now();
+        let since = self.last.replace(now).unwrap_or(now);
+        self.marks.push((name, now - since));
+    }
+
+    /// Records a phase that ran alongside the others, without moving the mark.
+    pub fn add(&mut self, name: &'static str, took: Duration) {
+        self.marks.push((name, took));
+    }
+
+    pub fn append(&mut self, other: &Phases) {
+        self.marks.extend_from_slice(&other.marks);
+    }
+}
+
+impl std::fmt::Display for Phases {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        for (index, (name, took)) in self.marks.iter().enumerate() {
+            let sep = if index == 0 { "" } else { " " };
+            write!(f, "{sep}{name}={:.1}", took.as_secs_f64() * 1000.0)?;
+        }
+        Ok(())
+    }
+}
+
 /// A disk the guest sees, in the order it sees them.
 #[derive(Debug, Clone)]
 pub struct DriveSpec {
@@ -546,6 +588,17 @@ impl Vm {
     }
 
     /// From spawning the VMM to a guest that is running or ready to.
+    /// The phases of this VM's start; empty for a backend that does not
+    /// record them.
+    pub fn phases(&self) -> Phases {
+        match self {
+            Self::Firecracker(vm) => vm.phases().clone(),
+            Self::CloudHypervisor(_) => Phases::default(),
+            #[cfg(target_os = "macos")]
+            Self::Vz(_) => Phases::default(),
+        }
+    }
+
     pub fn boot_latency(&self) -> Duration {
         match self {
             Self::Firecracker(vm) => vm.boot_latency(),

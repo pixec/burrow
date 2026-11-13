@@ -122,6 +122,7 @@ impl FcProcess {
     ///
     /// Guest serial output arrives on the process's stdout, so both stdout and
     /// stderr are captured to the bounded console log inside the workdir.
+    #[allow(clippy::too_many_arguments)]
     pub async fn spawn(
         binary: &Path,
         vm_id: &str,
@@ -130,6 +131,7 @@ impl FcProcess {
         jail: Option<&Jail>,
         enable_pci: bool,
         cgroup: Option<&crate::cgroup::Cgroup>,
+        phases: &mut crate::Phases,
     ) -> Result<Self> {
         if !binary.exists() {
             return Err(Error::BinaryNotFound(binary.to_path_buf()));
@@ -158,6 +160,7 @@ impl FcProcess {
             let _ = jail;
         }
 
+        phases.mark("prespawn");
         let id = sanitize_vm_id(vm_id);
         let mut command = match jail {
             None => {
@@ -218,6 +221,7 @@ impl FcProcess {
             Box::new(child.stderr.take().expect("stderr is piped")),
         ];
         crate::console::capture(workdir, outputs)?;
+        phases.mark("spawn");
         let console_in = child.stdin.take();
         let mut proc = Self {
             child,
@@ -226,6 +230,7 @@ impl FcProcess {
             console_in,
         };
         proc.wait_for_socket(&sock_path).await?;
+        phases.mark("api_ready");
         Ok(proc)
     }
 

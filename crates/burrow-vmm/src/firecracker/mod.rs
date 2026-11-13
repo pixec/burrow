@@ -231,6 +231,7 @@ pub struct MicroVm {
     spec: MicroVmSpec,
     /// Time from process spawn to a successful `InstanceStart`.
     boot_latency: Duration,
+    phases: crate::Phases,
     /// Held for the VM's lifetime; removed once the process is reaped.
     cgroup: Option<Cgroup>,
     /// Serves this VM's page faults when restored with lazy memory. Dropped
@@ -267,13 +268,17 @@ async fn detach_snapshot_targets(workdir: &Path, mem_file: &str) -> Result<()> {
 
 /// Starts the VMM inside the VM's cgroup, made first so the VMM joins it
 /// before it execs and never runs outside its caps.
-async fn spawn(spec: &MicroVmSpec) -> Result<(FcProcess, Option<Cgroup>)> {
+async fn spawn(
+    spec: &MicroVmSpec,
+    phases: &mut crate::Phases,
+) -> Result<(FcProcess, Option<Cgroup>)> {
     let cgroup = Cgroup::for_vm(
         spec.cgroup_root.as_deref(),
         &spec.vm_id,
         &spec.limits,
         spec.is_limits_required,
     )?;
+    phases.mark("cgroup");
     let process = FcProcess::spawn(
         &spec.firecracker_bin,
         &spec.vm_id,
@@ -282,6 +287,7 @@ async fn spawn(spec: &MicroVmSpec) -> Result<(FcProcess, Option<Cgroup>)> {
         spec.jail.as_ref(),
         spec.is_pci_enabled,
         cgroup.as_ref(),
+        phases,
     )
     .await;
     Ok((process?, cgroup))
@@ -291,10 +297,11 @@ impl MicroVm {
     /// Spawns the VMM, applies the configuration, and starts the instance.
     pub async fn boot(spec: MicroVmSpec) -> Result<Self> {
         let start = Instant::now();
+        let mut phases = crate::Phases::start();
         if spec.is_vsock_enabled {
             crate::guest::clear_stale_sockets(&spec.workdir).await?;
         }
-        let (process, cgroup) = spawn(&spec).await?;
+        let (process, cgroup) = spawn(&spec, &mut phases).await?;
         let api = FcApi::new(spec.workdir.join(API_SOCK));
 
         // Configure, then start. Any failure here kills the VMM so we never
@@ -304,6 +311,7 @@ impl MicroVm {
             api,
             spec,
             boot_latency: Duration::ZERO,
+            phases,
             cgroup,
             #[cfg(target_os = "linux")]
             memory: None,
@@ -409,6 +417,10 @@ impl MicroVm {
 
     pub fn boot_latency(&self) -> Duration {
         self.boot_latency
+    }
+
+    pub fn phases(&self) -> &crate::Phases {
+        &self.phases
     }
 
     /// Host CPU this VM has consumed, in microseconds. `None` when the VM runs
@@ -558,10 +570,12 @@ impl MicroVm {
     /// (tap name, drive paths) as the snapshotted VM.
     pub async fn restore(spec: MicroVmSpec, resume: bool) -> Result<Self> {
         let start = Instant::now();
+        let mut phases = crate::Phases::start();
         if spec.is_vsock_enabled {
             crate::guest::clear_stale_sockets(&spec.workdir).await?;
         }
-        let (process, cgroup) = spawn(&spec).await?;
+        phases.mark("sockets");
+        let (process, cgroup) = spawn(&spec, &mut phases).await?;
         let api = FcApi::new(spec.workdir.join(API_SOCK));
 
         let mut vm = Self {
@@ -569,6 +583,7 @@ impl MicroVm {
             api,
             spec,
             boot_latency: Duration::ZERO,
+            phases,
             cgroup,
             #[cfg(target_os = "linux")]
             memory: None,
@@ -591,6 +606,7 @@ impl MicroVm {
                 return Err(err);
             }
         };
+        vm.phases.mark("uffd");
         let req = LoadSnapshot {
             snapshot_path: SNAPSHOT_FILE.into(),
             mem_backend,
@@ -616,6 +632,7 @@ impl MicroVm {
             let _ = vm.process.kill().await;
             return Err(err);
         }
+        vm.phases.mark("load");
         vm.boot_latency = start.elapsed();
         tracing::info!(
             vm_id = vm.spec.vm_id,

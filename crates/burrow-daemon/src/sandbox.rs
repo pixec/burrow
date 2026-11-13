@@ -7028,6 +7028,8 @@ impl SandboxManager {
         name: String,
         request_id: String,
     ) -> Result<common::Sandbox, Status> {
+        let began = std::time::Instant::now();
+        let mut phases = burrow_vmm::Phases::start();
         // Claimed before provisioning, not merely checked: provisioning takes
         // seconds, so two creates of the same id (an orchestrator retry, say)
         // would otherwise both get past the check and then share one lease,
@@ -7054,10 +7056,18 @@ impl SandboxManager {
             }
         };
 
+        phases.mark("claim");
         let provisioned = self
-            .provision_with(id.clone(), template, policy, seed_disk, node_id)
+            .provision_with(
+                id.clone(),
+                template,
+                policy,
+                seed_disk,
+                node_id,
+                &mut phases,
+            )
             .await;
-        let (sandbox, _disk) = match provisioned {
+        let (sandbox, _disk, from_warm) = match provisioned {
             Ok(provisioned) => provisioned,
             Err(err) => {
                 self.creating.lock().await.remove(&id);
@@ -7078,26 +7088,31 @@ impl SandboxManager {
         // recycled address block inheriting the previous holder's rules would
         // open is closed at the source instead, by [`Self::delete`] returning
         // the lease only after the render that stopped naming it.
+        phases.mark("stamp");
         let registered = self.register_or_discard(&sandbox).await;
         self.creating.lock().await.remove(&id);
         registered?;
+        phases.mark("register");
         // A create is a VM starting, whether it cold-booted or restored a warm
         // template snapshot: either way the guest begins at the image's state
         // rather than at one this sandbox left behind.
         self.emit_behind(&sandbox, EVENT_CREATED, "");
         self.open_session_behind(&sandbox, STARTED_BOOT, None);
         let record = sandbox.record();
-        let registered = std::time::Instant::now();
         self.persist(&sandbox).await;
-        tracing::debug!(
-            sandbox = id,
-            persist_ms = registered.elapsed().as_millis() as u64,
-            "create tail"
-        );
+        phases.mark("persist");
         // The other half of the reclaim: a warm create's handshake may have
         // given up while this was still registering, when there was nothing in
         // the registry to reclaim. A no-op in every other case.
         self.reclaim_unconfirmed(&id).await;
+        phases.mark("reclaim");
+        tracing::info!(
+            sandbox = id,
+            warm = from_warm,
+            total_ms = began.elapsed().as_millis() as u64,
+            %phases,
+            "create timing"
+        );
         Ok(record)
     }
 
@@ -7186,7 +7201,8 @@ impl SandboxManager {
         mut policy: common::Policy,
         seed_disk: Option<&Path>,
         node_id: String,
-    ) -> Result<(Arc<RunningSandbox>, crate::diskcap::Admitted), Status> {
+        phases: &mut burrow_vmm::Phases,
+    ) -> Result<(Arc<RunningSandbox>, crate::diskcap::Admitted, bool), Status> {
         let began = std::time::Instant::now();
         // The last place it can be checked before it is joined onto the
         // templates directory. The API checks it too, but every create on this
@@ -7249,6 +7265,7 @@ impl SandboxManager {
         let disk = self
             .admit_disk(&node_id, "create a sandbox", disk_bytes)
             .await?;
+        phases.mark("checks");
 
         // A seeded disk has to survive into the guest untouched, and the warm
         // path stages its own disk, so it is not usable here. Nor is a warm
@@ -7269,6 +7286,7 @@ impl SandboxManager {
             Ok(sources) => sources,
             Err(err) => return Err(guard.fail(err).await),
         };
+        phases.mark("volumes");
 
         // A warm snapshot was taken without volumes, so they can only reach a
         // sandbox restored from one by being hotplugged; where they cannot
@@ -7300,6 +7318,7 @@ impl SandboxManager {
         });
         let from_warm = warm.is_some();
         let warm_check_ms = began.elapsed();
+        phases.mark("warm_find");
 
         // Networking: a private /30 on a dedicated tap. The guest configures
         // itself from the kernel command line, so no DHCP client is needed.
@@ -7318,20 +7337,27 @@ impl SandboxManager {
             }
         };
         let ipam_ms = began.elapsed() - warm_check_ms;
+        phases.mark("ipam");
 
         // Copying a root disk is disk work and programming a tap is netlink,
         // so they run together rather than one after the other.
         let stage = async {
             let staging_began = std::time::Instant::now();
+            let mut staged = burrow_vmm::Phases::start();
             // May come back false: a snapshot swapped out or evicted since it
             // was found, or one with a file gone, which is rebuilt. A cold
             // boot is slower, not wrong, and is a far better answer than
             // failing the create.
             let mut is_warm = from_warm;
             if let Some(snapshot) = &warm
-                && let Err(err) =
-                    crate::warm::stage_from_warm(&templates_dir, &template, snapshot, &workdir)
-                        .await
+                && let Err(err) = crate::warm::stage_from_warm(
+                    &templates_dir,
+                    &template,
+                    snapshot,
+                    &workdir,
+                    &mut staged,
+                )
+                .await
             {
                 if err.kind() != std::io::ErrorKind::NotFound {
                     return Err(Status::internal(format!("staging warm snapshot: {err}")));
@@ -7375,6 +7401,7 @@ impl SandboxManager {
                     Status::internal(format!("attaching volume {}: {err}", mount.volume))
                 })?;
             }
+            staged.mark("volume_links");
             let files_ms = staging_began.elapsed();
             // Ownership is handed over inside the same task, because it has to
             // follow staging and nothing else waits on it.
@@ -7405,10 +7432,20 @@ impl SandboxManager {
                     .await
                     .map_err(|err| Status::internal(format!("preparing the jail: {err}")))?;
             }
-            Ok::<(bool, std::time::Duration, std::time::Duration), Status>((
+            staged.mark("chown");
+            Ok::<
+                (
+                    bool,
+                    std::time::Duration,
+                    std::time::Duration,
+                    burrow_vmm::Phases,
+                ),
+                Status,
+            >((
                 is_warm,
                 files_ms,
                 staging_began.elapsed() - files_ms,
+                staged,
             ))
         };
 
@@ -7428,10 +7465,13 @@ impl SandboxManager {
         // up alongside a staging failure, and an interface belonging to a
         // sandbox that never existed must not be left behind.
         guard.tap = tap.as_ref().ok().filter(|name| !name.is_empty()).cloned();
-        let (from_warm, files_ms, jail_ms) = match staged {
+        let (from_warm, files_ms, jail_ms, staged) = match staged {
             Ok(parts) => parts,
             Err(err) => return Err(guard.fail(err).await),
         };
+        phases.mark("stage");
+        phases.add("tap", tap_ms);
+        phases.append(&staged);
         tracing::Span::current().record("from_warm", from_warm);
         let tap_name = match tap {
             Ok(name) => name,
@@ -7476,6 +7516,7 @@ impl SandboxManager {
         }
         let boot_spec = spec.clone();
         record_working_set(&mut spec, self.config.object_store.is_some());
+        phases.mark("spec");
         let started = std::time::Instant::now();
         let spec_ms = started - staged_at - stage_wall_ms;
         let started_vm = if from_warm {
@@ -7493,6 +7534,8 @@ impl SandboxManager {
             Ok(vm) => guard.vm = Some(vm),
             Err(err) => return Err(guard.fail(err).await),
         }
+        phases.mark("vmm");
+        phases.append(&guard.vm().phases());
         // Dialled as soon as there is a guest to dial, so the wait for it to
         // wake runs alongside the rest of the create and its registration
         // rather than after them.
@@ -7531,6 +7574,7 @@ impl SandboxManager {
             return Err(guard.fail(err).await);
         }
 
+        phases.mark("attach");
         // What a guest still has to be told. Assembled before any clock starts,
         // because reading host entropy and the image's trust bundles is host
         // work and charging it to the guest would hide what the guest costs.
@@ -7548,6 +7592,7 @@ impl SandboxManager {
         );
         let inspected = !request.inspection_ca_pem.is_empty();
         let inspection_root = self.inspection_root_of(&request);
+        phases.mark("request");
 
         // A warm create does not wait for the guest to answer. The round trip
         // is most of what it costs, and all of it benefits code running
@@ -7624,6 +7669,7 @@ impl SandboxManager {
             )
         };
 
+        phases.mark("agent");
         // Nothing below this line can fail, so it is where the sandbox takes
         // over what the guard was holding on its behalf.
         let dialing = guard.dialing.take();
@@ -7736,7 +7782,8 @@ impl SandboxManager {
                 self.config.agent_timeout,
             );
         }
-        Ok((sandbox, disk))
+        phases.mark("record");
+        Ok((sandbox, disk, from_warm))
     }
 
     /// Snapshots a sandbox to disk and stops its VMM.

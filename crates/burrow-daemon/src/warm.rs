@@ -543,8 +543,8 @@ pub async fn stage_from_warm(
     template: &str,
     snapshot: &Warm,
     workdir: &Path,
+    phases: &mut burrow_vmm::Phases,
 ) -> std::io::Result<()> {
-    let began = std::time::Instant::now();
     let warm = &snapshot.dir;
     let template_dir = templates_dir.join(template);
     let layout = snapshot.hypervisor.layout();
@@ -562,8 +562,6 @@ pub async fn stage_from_warm(
         tokio::fs::hard_link(&source, &dest).await?;
     }
 
-    let linked = std::time::Instant::now();
-
     // Optional: profiling is best effort, and a warm snapshot whose profiling
     // run failed simply has no plan.
     let plan = warm.join(PREFETCH_PLAN);
@@ -572,19 +570,15 @@ pub async fn stage_from_warm(
         let _ = tokio::fs::remove_file(&dest).await;
         let _ = tokio::fs::hard_link(&plan, &dest).await;
     }
+    phases.mark("link");
 
     // The one file that must not be shared.
-    let before_disk = std::time::Instant::now();
     crate::rootdisk::clone(&warm.join(ROOT_DISK), &workdir.join(ROOT_DISK)).await?;
+    phases.mark("disk");
     // Best effort: a snapshot whose use went unrecorded is only evicted a
     // little sooner than it should be.
     let _ = tokio::fs::write(warm.join(USED_FILE), burrow_common::unix_now().to_string()).await;
-    tracing::debug!(
-        template,
-        link_ms = (linked - began).as_millis() as u64,
-        disk_ms = before_disk.elapsed().as_millis() as u64,
-        "staged a warm snapshot"
-    );
+    phases.mark("used");
     Ok(())
 }
 
