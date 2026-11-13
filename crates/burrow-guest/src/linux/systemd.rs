@@ -154,7 +154,9 @@ pub fn pid() -> Option<i32> {
 /// Waits for systemd to report it has started, up to `timeout`.
 ///
 /// A guest whose systemd is slow or never reports is still usable through the
-/// agent, so running out of time is logged rather than failed.
+/// agent, so running out of time is logged rather than failed, and counts as
+/// ready from then on: a warm snapshot taken after it would otherwise make
+/// every clone's handshake wait out the timeout again.
 pub async fn wait_ready(timeout: std::time::Duration) {
     if is_ready_at_agent() {
         return;
@@ -165,6 +167,7 @@ pub async fn wait_ready(timeout: std::time::Duration) {
         .is_err()
     {
         tracing::warn!(?timeout, "systemd has not reported ready; continuing");
+        ready().send_replace(true);
     }
 }
 
