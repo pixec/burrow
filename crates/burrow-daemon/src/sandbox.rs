@@ -7101,7 +7101,7 @@ impl SandboxManager {
                 lease.guest_ip6(),
                 lease.prefix_len6(),
                 lease.host_ip6(),
-                guest_mode_arg(systemd, false),
+                guest_mode_arg(systemd, hypervisor, false),
                 guest_boot_args(
                     &self.config.extra_boot_args,
                     is_console_verbose || self.config.is_console_verbose
@@ -11035,15 +11035,20 @@ pub(crate) fn guest_boot_args(extra: &str, is_verbose: bool) -> String {
         .join(" ")
 }
 
-/// Tells the agent to run the template's systemd under it, and how.
+/// Tells the agent to run the template's systemd under it, and how, and the
+/// hypervisor, which decides how a power-off ends the VM.
 ///
 /// A warm build always waits for systemd to finish starting, whatever the
 /// template accepts for a cold boot: its clones restore with it up.
-pub(crate) fn guest_mode_arg(systemd: Option<&crate::oci::SystemdBoot>, is_warm: bool) -> String {
+pub(crate) fn guest_mode_arg(
+    systemd: Option<&crate::oci::SystemdBoot>,
+    hypervisor: Hypervisor,
+    is_warm: bool,
+) -> String {
     let Some(systemd) = systemd else {
         return String::new();
     };
-    let mut args = String::from("burrow.systemd=1");
+    let mut args = format!("burrow.systemd=1 burrow.hypervisor={hypervisor}");
     if systemd.is_ready_at_agent && !is_warm {
         args.push_str(" burrow.systemd.ready=agent");
     }

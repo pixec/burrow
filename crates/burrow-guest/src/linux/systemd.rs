@@ -270,13 +270,22 @@ fn listen_for_notify() {
     });
 }
 
+/// How the guest asks the hypervisor to end the VM: Firecracker ends it on a
+/// reset, the only exit its x86 machine has, while Cloud Hypervisor reboots
+/// it in place on one and ends it on a power-off.
+fn power_off_cmd() -> libc::c_int {
+    match boot_arg("burrow.hypervisor=").as_deref() {
+        Some("cloud-hypervisor") => libc::LINUX_REBOOT_CMD_POWER_OFF,
+        _ => libc::LINUX_REBOOT_CMD_RESTART,
+    }
+}
+
 /// Watches systemd and acts on how it ended.
 ///
 /// systemd in a PID namespace cannot reset the machine: its `reboot(2)` ends
 /// the namespace instead, killing its init with SIGHUP for a reboot and
 /// SIGINT for a power-off or halt. A reboot is a fresh systemd on the same
-/// disk; a power-off resets the VM, which Firecracker treats as the VM
-/// shutting down.
+/// disk; a power-off ends the VM.
 fn supervise(binary: &'static str, pid: i32) {
     let exit = reaper::watch(pid);
     PID.store(pid, Ordering::Release);
@@ -289,7 +298,7 @@ fn supervise(binary: &'static str, pid: i32) {
                 tracing::warn!("systemd powered off; shutting the VM down");
                 nix::unistd::sync();
                 // SAFETY: a bare syscall; the guest ends here if it succeeds.
-                unsafe { libc::reboot(libc::LINUX_REBOOT_CMD_RESTART) };
+                unsafe { libc::reboot(power_off_cmd()) };
                 return;
             }
             code if code == 128 + libc::SIGHUP => tracing::warn!("systemd rebooting"),

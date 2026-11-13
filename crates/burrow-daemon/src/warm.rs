@@ -718,7 +718,7 @@ pub async fn build_warm_snapshot(
             burrow_vmm::DEFAULT_BOOT_ARGS,
             crate::rootdisk::BOOT_ARGS,
             lease.kernel_ip_arg(""),
-            crate::sandbox::guest_mode_arg(environment.booted_systemd(), true),
+            crate::sandbox::guest_mode_arg(environment.booted_systemd(), hypervisor, true),
             crate::sandbox::guest_boot_args(&config.extra_boot_args, config.is_console_verbose)
         ),
     };
