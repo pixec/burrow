@@ -490,9 +490,13 @@ class DiskCapacity:
 
     free_bytes: int = 0
     total_bytes: int = 0
+    # What the node keeps free and promises to no sandbox.
     reserve_bytes: int = 0
-    unwritten_bytes: int = 0
+    # How far provisioned disk may exceed the filesystem less its reserve; 1.0
+    # never overcommits.
     overcommit: float = 0.0
+    # Every sandbox's disk and volume at full size, plus warm snapshots.
+    provisioned_bytes: int = 0
 
 
 @dataclass
