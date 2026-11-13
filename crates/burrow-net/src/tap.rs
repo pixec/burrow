@@ -145,6 +145,16 @@ mod linux {
         add_tap(name)?;
         let index = index_of(name)
             .ok_or_else(|| std::io::Error::other(format!("tap {name} vanished once made")))?;
+        // The tap is persistent, so one left half made by a failure below
+        // would outlive the create that made it.
+        let made = address(handle, name, index, lease).await;
+        if made.is_err() {
+            let _ = handle.link().del(index).execute().await;
+        }
+        made
+    }
+
+    async fn address(handle: &Handle, name: &str, index: u32, lease: &Lease) -> Result<()> {
         handle
             .address()
             .add(index, IpAddr::V4(lease.host_ip), lease.prefix_len)
