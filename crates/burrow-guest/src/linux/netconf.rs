@@ -546,9 +546,10 @@ async fn reconcile(
             .public
             .iter()
             .any(|&(address, _)| address == held.address);
-        // No duplicate detection: the host routes this address to this link
-        // alone, and a tentative address cannot be the source of a route.
-        if is_public && held.address.is_ipv6() {
+        // No duplicate detection: the host routes every one of a sandbox's
+        // addresses to its link alone, and a tentative address can neither
+        // source a route nor be used for the seconds detection takes.
+        if held.address.is_ipv6() {
             let message = add.message_mut();
             message.header.flags |= AddressHeaderFlags::Nodad;
             message
