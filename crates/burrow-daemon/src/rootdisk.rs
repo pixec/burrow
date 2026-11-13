@@ -36,7 +36,12 @@ pub const IMAGE: &str = "rootfs.ext4";
 pub const DEFAULT_HEADROOM_MIB: u32 = 1024;
 
 /// The kernel arguments that mount the root disk.
-pub const BOOT_ARGS: &str = "root=/dev/vda rw";
+///
+/// `noinit_itable` because a grown disk's new block groups otherwise have
+/// their inode tables zeroed in the background, a pass a warm snapshot catches
+/// part way and every clone then resumes, writing to its own disk on the
+/// guest's only vCPU while its first handshake and exec wait.
+pub const BOOT_ARGS: &str = "root=/dev/vda rw rootflags=noinit_itable";
 
 /// The first guest device a volume lands on, after the root disk.
 pub const FIRST_VOLUME_DEVICE: u8 = b'b';
