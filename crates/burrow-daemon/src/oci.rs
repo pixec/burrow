@@ -1105,6 +1105,9 @@ fn apply_entries<R: std::io::Read>(
     // non-root user needs its home to be that user's, and the node extracts
     // as root so it can say so.
     archive.set_preserve_ownerships(true);
+    // Setuid, setgid and sticky bits too: su, passwd and a browser's sandbox
+    // helper stop working without them.
+    archive.set_preserve_permissions(true);
     let mut seen = 0usize;
     for entry in archive.entries()? {
         seen += 1;
@@ -1686,6 +1689,45 @@ mod tests {
         }
         builder.finish().unwrap();
         path
+    }
+
+    #[test]
+    fn setuid_setgid_and_sticky_bits_survive_extraction() {
+        let path = std::env::temp_dir().join(format!("burrow-modes-{}.tar", std::process::id()));
+        let file = std::fs::File::create(&path).unwrap();
+        let meta = file.metadata().unwrap();
+        let (owner, group) = (
+            std::os::unix::fs::MetadataExt::uid(&meta),
+            std::os::unix::fs::MetadataExt::gid(&meta),
+        );
+        let mut builder = tar::Builder::new(file);
+        for (name, mode) in [("suid", 0o4755), ("sgid", 0o2755), ("sticky", 0o1777)] {
+            let mut header = tar::Header::new_gnu();
+            header.set_size(0);
+            header.set_mode(mode);
+            header.set_uid(owner.into());
+            header.set_gid(group.into());
+            header.set_cksum();
+            builder.append_data(&mut header, name, &[][..]).unwrap();
+        }
+        builder.finish().unwrap();
+
+        let dest = std::env::temp_dir().join(format!("burrow-modes-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dest);
+        std::fs::create_dir_all(&dest).unwrap();
+        apply_entries(
+            tar::Archive::new(std::fs::File::open(&path).unwrap()),
+            &dest,
+        )
+        .unwrap();
+        for (name, mode) in [("suid", 0o4755), ("sgid", 0o2755), ("sticky", 0o1777)] {
+            let got = std::os::unix::fs::PermissionsExt::mode(
+                &std::fs::metadata(dest.join(name)).unwrap().permissions(),
+            ) & 0o7777;
+            assert_eq!(got, mode, "{name}");
+        }
+        let _ = std::fs::remove_dir_all(&dest);
+        let _ = std::fs::remove_file(&path);
     }
 
     /// A one-entry tar written byte by byte, so the name can be anything,
