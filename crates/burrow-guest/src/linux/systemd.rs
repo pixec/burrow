@@ -187,8 +187,8 @@ pub fn start() {
         tracing::error!("burrow.systemd=1 but the image has no systemd; running agent-only");
         return;
     };
-    if let Err(err) = delegate_cgroups() {
-        tracing::error!(%err, "cannot delegate cgroups to systemd; running agent-only");
+    if let Err(err) = share_mounts() {
+        tracing::error!(%err, "cannot share mounts with systemd; running agent-only");
         return;
     }
     ensure_machine_id();
@@ -228,42 +228,16 @@ fn locate() -> Option<&'static str> {
         .find(|path| std::path::Path::new(path).exists())
 }
 
-/// Mounts the cgroup2 hierarchy and enables every controller for children of
-/// the root, where each systemd boot gets its subtree. The agent and the
-/// commands it runs stay in the root, which is exempt from the rule that a
-/// cgroup with controllers enabled holds no processes.
-///
-/// The root is made shared so the slave copy systemd gets keeps receiving the
-/// volumes a later handshake mounts.
-fn delegate_cgroups() -> anyhow::Result<()> {
-    std::fs::create_dir_all(CGROUP_ROOT)?;
-    match mount(
-        Some("cgroup2"),
-        CGROUP_ROOT,
-        Some("cgroup2"),
-        MsFlags::MS_NOSUID | MsFlags::MS_NOEXEC | MsFlags::MS_NODEV,
-        None::<&str>,
-    ) {
-        Ok(()) | Err(nix::errno::Errno::EBUSY) => {}
-        Err(err) => anyhow::bail!("mounting cgroup2: {err}"),
-    }
-    let controllers = std::fs::read_to_string(format!("{CGROUP_ROOT}/cgroup.controllers"))?;
-    for controller in controllers.split_whitespace() {
-        if let Err(err) = std::fs::write(
-            format!("{CGROUP_ROOT}/cgroup.subtree_control"),
-            format!("+{controller}"),
-        ) {
-            tracing::debug!(controller, %err, "controller not delegated");
-        }
-    }
+/// Makes the root mount shared, so the slave copy systemd gets keeps
+/// receiving the volumes a later handshake mounts.
+fn share_mounts() -> nix::Result<()> {
     mount(
         None::<&str>,
         "/",
         None::<&str>,
         MsFlags::MS_SHARED | MsFlags::MS_REC,
         None::<&str>,
-    )?;
-    Ok(())
+    )
 }
 
 fn listen_for_notify() {

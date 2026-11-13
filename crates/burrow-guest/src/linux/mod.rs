@@ -449,6 +449,9 @@ pub async fn main() {
         if let Err(err) = init::mount_essentials() {
             tracing::error!(%err, "failed to mount essential filesystems");
         }
+        if let Err(err) = init::mount_cgroup2() {
+            tracing::warn!(%err, "no cgroup2 hierarchy; running without one");
+        }
         init::write_resolv_conf();
         // The kernel brought the interface up over IPv4; v6 has no equivalent
         // boot argument the kernel understands, so burrow passes its own and

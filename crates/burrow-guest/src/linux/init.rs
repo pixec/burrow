@@ -63,6 +63,36 @@ pub fn mount_essentials() -> anyhow::Result<()> {
     Ok(())
 }
 
+const CGROUP_ROOT: &str = "/sys/fs/cgroup";
+
+/// Mounts the cgroup2 hierarchy and enables every controller it offers for
+/// the root's children, where Docker and the like, or systemd, make their
+/// own. The agent and the commands it runs stay in the root, which is exempt
+/// from the rule that a cgroup with controllers enabled holds no processes.
+pub fn mount_cgroup2() -> anyhow::Result<()> {
+    std::fs::create_dir_all(CGROUP_ROOT)?;
+    match mount(
+        Some("cgroup2"),
+        CGROUP_ROOT,
+        Some("cgroup2"),
+        MsFlags::MS_NOSUID | MsFlags::MS_NOEXEC | MsFlags::MS_NODEV,
+        None::<&str>,
+    ) {
+        Ok(()) | Err(nix::errno::Errno::EBUSY) => {}
+        Err(err) => anyhow::bail!("mounting cgroup2: {err}"),
+    }
+    let controllers = std::fs::read_to_string(format!("{CGROUP_ROOT}/cgroup.controllers"))?;
+    for controller in controllers.split_whitespace() {
+        if let Err(err) = std::fs::write(
+            format!("{CGROUP_ROOT}/cgroup.subtree_control"),
+            format!("+{controller}"),
+        ) {
+            tracing::debug!(controller, %err, "controller not enabled");
+        }
+    }
+    Ok(())
+}
+
 /// Writes `/etc/resolv.conf` from the `burrow.dns=` kernel argument.
 ///
 /// The kernel's `ip=` argument configures the interface but never the
