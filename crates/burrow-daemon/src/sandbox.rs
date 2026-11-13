@@ -849,8 +849,6 @@ struct Provisioning<'a> {
     vm: Option<Vm>,
     /// A warm create's dial to its guest, started as the VM came up.
     dialing: Option<guestconn::Dialing>,
-    /// The rules [`SandboxManager::rule_ahead`] put in force, to withdraw.
-    is_ruled: bool,
     is_kept: bool,
 }
 
@@ -864,7 +862,6 @@ impl<'a> Provisioning<'a> {
             tap: None,
             vm: None,
             dialing: None,
-            is_ruled: false,
             is_kept: false,
         }
     }
@@ -897,9 +894,9 @@ impl<'a> Provisioning<'a> {
             tap::delete(&tap).await;
         }
         // Before the lease goes back, so its next holder never inherits them.
-        if self.is_ruled {
-            self.manager.unrule(&self.id).await;
-        }
+        // Unconditional: a create dropped part way may have ruled ahead
+        // without ever hearing back.
+        self.manager.unrule(&self.id).await;
         self.manager.release_lease(&self.id).await;
         self.manager.volumes.release_all(&self.id);
         let _ = self.manager.config.remove_workdir(&self.workdir).await;
@@ -938,7 +935,6 @@ impl Drop for Provisioning<'_> {
             dialing.abort();
         }
         let vm = self.vm.take();
-        let is_ruled = self.is_ruled;
         if let Ok(handle) = tokio::runtime::Handle::try_current() {
             handle.spawn(async move {
                 if let Some(vm) = vm {
@@ -947,9 +943,7 @@ impl Drop for Provisioning<'_> {
                 if let Some(tap) = tap {
                     tap::delete(&tap).await;
                 }
-                if is_ruled {
-                    manager.unrule(&id).await;
-                }
+                manager.unrule(&id).await;
                 manager.release_lease(&id).await;
                 manager.volumes.release_all(&id);
                 let _ = manager.config.remove_workdir(&workdir).await;
@@ -4254,7 +4248,18 @@ impl SandboxManager {
     /// Applies a sandbox's rules before it exists, so a create can have them
     /// land while its VM is still being made. Every render carries it until
     /// [`Self::register`] moves it into the map or [`Self::unrule`] drops it.
+    ///
+    /// Runs to its end on a task of its own: a caller dropped part way
+    /// through must not leave an apply running behind an [`Self::unrule`]
+    /// that has already withdrawn it.
     async fn rule_ahead(&self, ruled: Ruled) -> Result<(), Status> {
+        let manager = self.clone();
+        tokio::spawn(async move { manager.rule_ahead_now(ruled).await })
+            .await
+            .map_err(|err| Status::internal(format!("applying the rules did not run: {err}")))?
+    }
+
+    async fn rule_ahead_now(&self, ruled: Ruled) -> Result<(), Status> {
         let _ordered = self.firewall.lock().await;
         self.ruled_ahead
             .lock()
@@ -4267,7 +4272,8 @@ impl SandboxManager {
         rendered
     }
 
-    /// Withdraws the rules of a create that failed after [`Self::rule_ahead`].
+    /// Withdraws the rules of a create that failed after [`Self::rule_ahead`],
+    /// if it got that far.
     async fn unrule(&self, id: &str) {
         let _ordered = self.firewall.lock().await;
         if self.ruled_ahead.lock().unwrap().remove(id).is_some()
@@ -7614,6 +7620,10 @@ impl SandboxManager {
                     ..Default::default()
                 },
             };
+            // Recorded before anything is awaited, so a create dropped part
+            // way still has its tap taken down; removing one never made is a
+            // no-op.
+            guard.tap = Some(tap_name.clone()).filter(|name| !name.is_empty());
             let (disk, (tap, tap_ms), (launched, launch_ms), (rules, rules_ms)) = tokio::join!(
                 disk,
                 tap_timed,
@@ -7623,8 +7633,6 @@ impl SandboxManager {
             // Recorded before anything is inspected: the tap may well have
             // come up alongside a failure, and an interface belonging to a
             // sandbox that never existed must not be left behind.
-            guard.tap = tap.as_ref().ok().filter(|name| !name.is_empty()).cloned();
-            guard.is_ruled = rules.is_ok();
             phases.mark("stage");
             phases.add("tap", tap_ms);
             phases.add("launch", launch_ms);
@@ -8675,13 +8683,12 @@ impl SandboxManager {
                 ..Default::default()
             },
         };
+        guard.tap = Some(tap_name.clone()).filter(|name| !name.is_empty());
         let ((staged, stage_ms), (tap, tap_ms), (rules, rules_ms)) = tokio::join!(
             timed(stage),
             timed(tap::create(&lease)),
             timed(self.rule_ahead(ruled))
         );
-        guard.tap = tap.as_ref().ok().cloned();
-        guard.is_ruled = rules.is_ok();
         phases.mark("stage");
         phases.add("files", stage_ms);
         phases.add("tap", tap_ms);
@@ -9381,6 +9388,9 @@ impl SandboxManager {
         }
         // Reported, but only after the directory is gone: a ruleset that would
         // not apply must not also leave a root disk behind.
+        // A sandbox torn down before it was registered, a failed adopt's, is
+        // still carried as ruled ahead, and would be rendered on.
+        self.ruled_ahead.lock().unwrap().remove(id);
         let rendered = self.sync_firewall().await;
         // Only now, once the render that stopped naming this address has been
         // applied. Held back rather than skipped when that render fails: the
@@ -12182,6 +12192,58 @@ pub(crate) mod tests {
         assert!(err.message().contains("firewall"), "{}", err.message());
         assert_eq!(manager.sandboxes.lock().await.len(), 0);
         assert!(!sandbox.workdir.exists());
+    }
+
+    /// A sandbox ruled ahead, its rules in force as a create's would be when
+    /// its caller went away, and the address they name.
+    async fn ruled_ahead_of(
+        manager: &SandboxManager,
+        id: &str,
+    ) -> (Arc<RunningSandbox>, std::net::IpAddr) {
+        let sandbox = running(id);
+        tokio::fs::create_dir_all(&sandbox.workdir).await.unwrap();
+        manager
+            .ruled_ahead
+            .lock()
+            .unwrap()
+            .insert(id.to_string(), Ruled::of(&sandbox));
+        // The apply fails without nftables; the proxy's table is replaced
+        // before it either way.
+        let _ = manager.sync_firewall().await;
+        let ip = std::net::IpAddr::V4(sandbox.lease.guest_ip);
+        assert!(manager.proxy_policies.get(ip).is_some());
+        (sandbox, ip)
+    }
+
+    /// A create dropped mid-provisioning, a client gone or a deadline passed,
+    /// left its rules carried as ruled ahead, so the next sandbox on the
+    /// recycled address inherited them.
+    #[tokio::test]
+    async fn a_dropped_create_withdraws_the_rules_it_ruled_ahead() {
+        let manager = manager().await;
+        let (sandbox, ip) = ruled_ahead_of(&manager, "sbx_dropped").await;
+
+        drop(Provisioning::new(&manager, sandbox.id(), &sandbox.workdir));
+        for _ in 0..200 {
+            if manager.ruled_ahead.lock().unwrap().is_empty() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        assert!(manager.ruled_ahead.lock().unwrap().is_empty());
+        assert!(manager.proxy_policies.get(ip).is_none());
+    }
+
+    /// An adopt whose handshake failed tore the sandbox down without
+    /// withdrawing what it had ruled ahead.
+    #[tokio::test]
+    async fn a_failed_adopt_withdraws_the_rules_it_ruled_ahead() {
+        let manager = manager().await;
+        let (sandbox, ip) = ruled_ahead_of(&manager, "sbx_unadopted").await;
+
+        let _ = manager.tear_down(sandbox).await;
+        assert!(manager.ruled_ahead.lock().unwrap().is_empty());
+        assert!(manager.proxy_policies.get(ip).is_none());
     }
 
     /// What a warm create gave up when it stopped waiting for the guest: a
