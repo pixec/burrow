@@ -1221,6 +1221,7 @@ fn apply_entries<R: std::io::Read>(
     // helper stop working without them.
     archive.set_preserve_permissions(true);
     let mut seen = 0usize;
+    let mut directories = Vec::new();
     for entry in archive.entries()? {
         seen += 1;
         if seen > MAX_LAYER_ENTRIES {
@@ -1259,11 +1260,40 @@ fn apply_entries<R: std::io::Read>(
         {
             remove_any(&target)?;
         }
+        if entry.header().entry_type() == tar::EntryType::Directory {
+            directories.push((path, entry.header().mtime()?));
+        }
         // `unpack_in` refuses paths that escape `dest`, which is what stops a
         // hostile image writing outside the staging directory.
         entry.unpack_in(dest)?;
     }
+    // Each entry written into a directory moved its mtime to now, so it is put
+    // back once the layer is in. systemd's ConditionNeedsUpdate compares /usr
+    // with the stamps in /etc and /var, and pyc caches compare with sources.
+    for (path, mtime) in directories {
+        set_directory_mtime(&safe_join(dest, &path)?, mtime)?;
+    }
     Ok(())
+}
+
+/// Without following a symlink: a later entry may have replaced the
+/// directory with one pointing out of the staging directory.
+fn set_directory_mtime(dir: &Path, mtime: u64) -> std::io::Result<()> {
+    use std::os::unix::fs::OpenOptionsExt as _;
+    let opened = std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW)
+        .open(dir);
+    let dir = match opened {
+        Ok(dir) => dir,
+        // Removed or replaced by a later entry of the same layer.
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(err) if err.raw_os_error() == Some(libc::ELOOP) => return Ok(()),
+        Err(err) if err.raw_os_error() == Some(libc::ENOTDIR) => return Ok(()),
+        Err(err) => return Err(err),
+    };
+    let mtime = std::time::UNIX_EPOCH + std::time::Duration::from_secs(mtime);
+    dir.set_times(std::fs::FileTimes::new().set_modified(mtime))
 }
 
 /// Resolves a tar entry's path inside the staging directory, or refuses it.
@@ -1868,6 +1898,48 @@ mod tests {
                 &std::fs::metadata(dest.join(name)).unwrap().permissions(),
             ) & 0o7777;
             assert_eq!(got, mode, "{name}");
+        }
+        let _ = std::fs::remove_dir_all(&dest);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn a_directory_keeps_its_mtime_when_entries_land_in_it() {
+        let path = std::env::temp_dir().join(format!("burrow-mtime-{}.tar", std::process::id()));
+        let file = std::fs::File::create(&path).unwrap();
+        let meta = file.metadata().unwrap();
+        let (owner, group) = (
+            std::os::unix::fs::MetadataExt::uid(&meta),
+            std::os::unix::fs::MetadataExt::gid(&meta),
+        );
+        let mut builder = tar::Builder::new(file);
+        for (name, kind) in [
+            ("usr/", tar::EntryType::Directory),
+            ("usr/bin/", tar::EntryType::Directory),
+            ("usr/bin/tool", tar::EntryType::Regular),
+        ] {
+            let mut header = tar::Header::new_gnu();
+            header.set_entry_type(kind);
+            header.set_size(0);
+            header.set_mode(0o755);
+            header.set_mtime(1_600_000_000);
+            header.set_uid(owner.into());
+            header.set_gid(group.into());
+            header.set_cksum();
+            builder.append_data(&mut header, name, &[][..]).unwrap();
+        }
+        builder.finish().unwrap();
+
+        let dest = scratch("mtime");
+        apply_entries(
+            tar::Archive::new(std::fs::File::open(&path).unwrap()),
+            &dest,
+        )
+        .unwrap();
+        for dir in ["usr", "usr/bin"] {
+            let mtime =
+                std::os::unix::fs::MetadataExt::mtime(&std::fs::metadata(dest.join(dir)).unwrap());
+            assert_eq!(mtime, 1_600_000_000, "{dir}");
         }
         let _ = std::fs::remove_dir_all(&dest);
         let _ = std::fs::remove_file(&path);

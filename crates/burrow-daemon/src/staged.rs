@@ -21,6 +21,11 @@ use sha2::{Digest as _, Sha256};
 /// How long an unused prefix tree is kept.
 const TTL: Duration = Duration::from_secs(7 * 24 * 60 * 60);
 
+/// Part of every key, changed when what a tree holds does, so trees staged
+/// the old way are pruned rather than reused. Bumped when directory mtimes
+/// started being kept.
+const FORMAT: &[u8] = b"2\n";
+
 pub struct Cache {
     root: PathBuf,
 }
@@ -34,6 +39,7 @@ impl Cache {
 
     fn entry(&self, layers: &[PathBuf]) -> PathBuf {
         let mut hasher = Sha256::new();
+        hasher.update(FORMAT);
         for layer in layers {
             hasher.update(layer.file_name().unwrap_or_default().as_encoded_bytes());
             hasher.update(b"\n");
@@ -134,7 +140,8 @@ fn link_tree(src: &Path, dst: &Path) -> io::Result<()> {
     // otherwise refuse them.
     std::fs::set_permissions(dst, meta.permissions())?;
     lchown(dst, Some(meta.uid()), Some(meta.gid()))?;
-    Ok(())
+    // Last, since linking the children moved it: see `oci::apply_entries`.
+    std::fs::File::open(dst)?.set_times(std::fs::FileTimes::new().set_modified(meta.modified()?))
 }
 
 #[cfg(test)]
@@ -224,6 +231,26 @@ mod tests {
         assert_eq!(cache.populate(&[base, top], &second).unwrap(), 1);
         assert_eq!(read(&second.join("etc/motd")).as_deref(), Some("new"));
         assert_eq!(read(&first.join("etc/motd")).as_deref(), Some("old"));
+    }
+
+    #[test]
+    fn a_tree_linked_from_the_cache_keeps_its_directory_mtimes() {
+        let dir = Scratch::new("mtimes");
+        let cache = Cache::new(dir.path());
+        let base = layer(dir.path(), "base", &[("usr/bin/sh", "shell")]);
+        let first = dir.path().join("first");
+        cache.populate(std::slice::from_ref(&base), &first).unwrap();
+        let old = std::time::UNIX_EPOCH + std::time::Duration::from_secs(1_600_000_000);
+        let cached = cache.entry(std::slice::from_ref(&base)).join("root/usr");
+        std::fs::File::open(&cached)
+            .unwrap()
+            .set_times(std::fs::FileTimes::new().set_modified(old))
+            .unwrap();
+
+        let second = dir.path().join("second");
+        assert_eq!(cache.populate(&[base], &second).unwrap(), 1);
+        let linked = std::fs::metadata(second.join("usr")).unwrap();
+        assert_eq!(linked.modified().unwrap(), old);
     }
 
     #[test]
