@@ -1035,6 +1035,14 @@ fn spawn_handshake(
             Ok(agent) => (Handshake::Done, Some(agent)),
             Err(err) => (Handshake::Failed(error_chain(&*err)), None),
         };
+        let sandbox = weak.upgrade();
+        // The channel this was made on is the one the first exec would
+        // otherwise have to dial for itself, so it is in place before anything
+        // waiting on the verdict wakes and looks for one.
+        let mut channel = match &sandbox {
+            Some(sandbox) => Some(sandbox.agent_channel.lock().await),
+            None => None,
+        };
         // The sandbox may have been resumed under this task, and a resume
         // handshakes for itself, so a verdict on the VM this task was watching
         // is only recorded while that VM's handshake is still the open one.
@@ -1047,8 +1055,12 @@ fn spawn_handshake(
             *current = state.clone();
             true
         });
+        if recorded && let (Some(channel), Some(agent)) = (channel.as_mut(), agent) {
+            **channel = Some(agent);
+        }
+        drop(channel);
 
-        let Some(sandbox) = weak.upgrade() else {
+        let Some(sandbox) = sandbox else {
             return;
         };
         match state {
@@ -1057,9 +1069,6 @@ fn spawn_handshake(
                     let limits = sandbox.spec.lock().unwrap().limits.clone();
                     start_cpu_cap(vm, &limits, &id);
                 }
-                // The channel this was made on is the one the first exec would
-                // otherwise have to dial for itself.
-                *sandbox.agent_channel.lock().await = Some(agent.expect("done means connected"));
                 manager.emit(&sandbox, EVENT_AGENT_READY, "").await;
                 let mut phases = phases.into_inner().unwrap();
                 phases.mark("ready");
