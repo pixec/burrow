@@ -100,6 +100,7 @@ pub async fn handshake(
         agent_version: VERSION.into(),
         timing: Some(timing),
         agent_digest: crate::macos::self_digest().to_string(),
+        features: crate::macos::features(),
     })
 }
 

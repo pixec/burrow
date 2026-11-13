@@ -511,6 +511,8 @@ message HandshakeResponse {
   // SHA-256 of the running agent binary, lowercase hex. The host compares it
   // with the binary it ships and upgrades a guest that differs.
   string agent_digest = 3;
+  // What Health would answer, so the host knows without asking.
+  repeated string features = 4;
 }
 
 message UpgradeChunk {

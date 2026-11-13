@@ -82,6 +82,7 @@ pub async fn handshake(
         agent_version: VERSION.into(),
         timing: Some(timing),
         agent_digest: crate::windows::service::self_digest().to_string(),
+        features: crate::windows::features(),
     })
 }
 

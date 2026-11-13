@@ -1010,6 +1010,7 @@ fn spawn_handshake(
                     .await?;
             phases.lock().unwrap().mark("handshake");
             *guest_timing.lock().unwrap() = response.timing;
+            let features = response.features;
             if let Some(size_bytes) = grow_to {
                 *step.lock().unwrap() = "waiting for the guest to grow its filesystem";
                 agent
@@ -1020,7 +1021,7 @@ fn spawn_handshake(
                     })
                     .await?;
             }
-            Ok::<_, anyhow::Error>(agent)
+            Ok::<_, anyhow::Error>((agent, features))
         })
         .await
         {
@@ -1031,8 +1032,8 @@ fn spawn_handshake(
             )),
         };
 
-        let (state, agent) = match outcome {
-            Ok(agent) => (Handshake::Done, Some(agent)),
+        let (state, ready) = match outcome {
+            Ok(ready) => (Handshake::Done, Some(ready)),
             Err(err) => (Handshake::Failed(error_chain(&*err)), None),
         };
         let sandbox = weak.upgrade();
@@ -1055,8 +1056,12 @@ fn spawn_handshake(
             *current = state.clone();
             true
         });
-        if recorded && let (Some(channel), Some(agent)) = (channel.as_mut(), agent) {
+        if recorded
+            && let (Some(sandbox), Some(channel), Some((agent, features))) =
+                (&sandbox, channel.as_mut(), ready)
+        {
             **channel = Some(agent);
+            *sandbox.agent_features.lock().await = Some(features);
         }
         drop(channel);
 
@@ -1938,13 +1943,13 @@ impl RunningSandbox {
                 phases.mark("dial");
                 guestconn::handshake_upgrading(agent, guest, request, upgrade, agent_timeout)
                     .await
-                    .map(|(agent, _)| agent)
+                    .map(|(agent, response)| (agent, response.features))
                     .map_err(|err| NoAgent::Handshake(err.message().to_string()))
             }
             Err(err) => Err(NoAgent::Unreachable(agent_timeout, error_chain(&*err))),
         };
-        let agent = match handshook {
-            Ok(agent) => agent,
+        let (agent, features) = match handshook {
+            Ok(handshook) => handshook,
             Err(failure) => {
                 let reason = no_agent_reason(&mut vm, failure).await;
                 let _ = vm.kill().await;
@@ -1955,6 +1960,7 @@ impl RunningSandbox {
         };
         // Kept, so the first call into the resumed guest does not dial again.
         *self.agent_channel.lock().await = Some(agent);
+        *self.agent_features.lock().await = Some(features);
         start_cpu_cap(&vm, &limits, self.id());
         // This VM handshook synchronously, whatever the last one did. A failure
         // recorded there was a verdict on a VM that no longer exists.
@@ -7824,13 +7830,14 @@ impl SandboxManager {
         // this handshake rather than baked into a snapshot, which makes waiting
         // the only way to know an inspected sandbox can verify the proxy.
         let vmm_ready = std::time::Instant::now();
-        let (handshake, agent_up, vsock_up, handshake_ms, guest_timing) = if from_warm {
+        let (handshake, agent_up, vsock_up, handshake_ms, guest_timing, features) = if from_warm {
             (
                 Arc::new(tokio::sync::watch::channel(Handshake::Pending).0),
                 std::time::Duration::ZERO,
                 std::time::Duration::ZERO,
                 std::time::Duration::ZERO,
                 burrow_proto::guest::v1::GuestResumeTiming::default(),
+                None,
             )
         } else {
             // A VM that never produces a reachable agent is useless; tear it
@@ -7863,7 +7870,7 @@ impl SandboxManager {
             // A failed handshake gets the same teardown as a failed connect. It
             // did not, and a template that reliably fails to handshake would
             // exhaust the node's taps and address blocks one create at a time.
-            let guest_timing = match guestconn::handshake_upgrading(
+            let (guest_timing, features) = match guestconn::handshake_upgrading(
                 agent,
                 guard.vm().guest(),
                 request.clone(),
@@ -7872,7 +7879,7 @@ impl SandboxManager {
             )
             .await
             {
-                Ok((_, response)) => response.timing.unwrap_or_default(),
+                Ok((_, response)) => (response.timing.unwrap_or_default(), response.features),
                 Err(err) => {
                     let failure = NoAgent::Handshake(err.message().to_string());
                     let reason = no_agent_reason(guard.vm_mut(), failure).await;
@@ -7886,6 +7893,7 @@ impl SandboxManager {
                 vsock_up,
                 handshake_began.elapsed(),
                 guest_timing,
+                Some(features),
             )
         };
 
@@ -7961,7 +7969,7 @@ impl SandboxManager {
             last_activity: std::sync::atomic::AtomicI64::new(burrow_common::unix_now()),
             suspended_at: std::sync::atomic::AtomicI64::new(0),
             agent_channel: Mutex::new(None),
-            agent_features: Mutex::new(None),
+            agent_features: Mutex::new(features),
             agent_timeout: self.config.agent_timeout,
             handshake,
             // A warm-created sandbox already restores from the template's
