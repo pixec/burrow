@@ -649,7 +649,7 @@ export class Burrow {
               freeBytes: Number(disk.freeBytes ?? 0),
               totalBytes: Number(disk.totalBytes ?? 0),
               reserveBytes: Number(disk.reserveBytes ?? 0),
-              unwrittenBytes: Number(disk.unwrittenBytes ?? 0),
+              provisionedBytes: Number(disk.provisionedBytes ?? 0),
               overcommit: Number(disk.overcommit ?? 0),
             }
           : undefined,

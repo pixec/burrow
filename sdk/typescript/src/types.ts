@@ -1010,8 +1010,8 @@ export interface DiskCapacity {
   totalBytes: number;
   /** What the node keeps free and promises to no sandbox. */
   reserveBytes: number;
-  /** Disk promised to sandboxes and not yet written. */
-  unwrittenBytes: number;
+  /** Disk promised to sandboxes, counted against free space. */
+  provisionedBytes: number;
   /** How far promises may exceed free space; 1 means never. */
   overcommit: number;
 }
