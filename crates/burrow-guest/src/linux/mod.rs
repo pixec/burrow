@@ -185,8 +185,12 @@ pub async fn handshake(
         return Err(Status::internal(format!("applying the network: {err}")));
     }
     // A root disk the host grew while the guest was down is filled here,
-    // online, on the boot that first sees it.
-    if let Err(err) = rootdisk::grow(0) {
+    // online, on the boot that first sees it. Only a boot: a restored guest
+    // keeps the disk size its memory holds, and one grown under it since is
+    // grown by a call of its own.
+    if !req.is_restored
+        && let Err(err) = rootdisk::grow(0)
+    {
         tracing::warn!(%err, "could not grow the root filesystem");
     }
     // After the network, because a mount is local work and nothing above
