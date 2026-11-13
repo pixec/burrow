@@ -154,6 +154,15 @@ pub fn handshake_full(
     }
 }
 
+/// The request with the host clock read now, as it goes out: the guest steps
+/// to it, and a request assembled before a slow boot would set it back.
+fn stamped(request: &guestpb::HandshakeRequest) -> guestpb::HandshakeRequest {
+    guestpb::HandshakeRequest {
+        host_time_unix_nanos: unix_nanos_now(),
+        ..request.clone()
+    }
+}
+
 /// The host clock, for the guest to step to if it has drifted from it.
 pub fn clock_request() -> guestpb::SyncClockRequest {
     guestpb::SyncClockRequest {
@@ -325,10 +334,10 @@ pub async fn handshake_upgrading(
     timeout: std::time::Duration,
 ) -> Result<(GuestClient<Channel>, guestpb::HandshakeResponse), tonic::Status> {
     let Some(upgrade) = upgrade else {
-        let response = agent.handshake(request.clone()).await?.into_inner();
+        let response = agent.handshake(stamped(&request)).await?.into_inner();
         return Ok((agent, response));
     };
-    let response = agent.handshake(request.clone()).await?.into_inner();
+    let response = agent.handshake(stamped(&request)).await?.into_inner();
     if response.agent_digest == upgrade.digest {
         return Ok((agent, response));
     }
@@ -388,7 +397,7 @@ pub async fn handshake_upgrading(
             let (mut agent, _) = connect_when_ready(guest.clone(), timeout)
                 .await
                 .map_err(|err| tonic::Status::internal(format!("upgraded agent: {err}")))?;
-            let response = agent.handshake(bare.clone()).await?.into_inner();
+            let response = agent.handshake(stamped(&bare)).await?.into_inner();
             Ok::<_, tonic::Status>((agent, response))
         };
         let attempt = match tokio::time::timeout(RECONNECT_ATTEMPT, attempt).await {
@@ -403,7 +412,7 @@ pub async fn handshake_upgrading(
                 // they wait for the new agent to be the one answering.
                 let response = match request.volumes.is_empty() {
                     true => response,
-                    false => agent.handshake(request.clone()).await?.into_inner(),
+                    false => agent.handshake(stamped(&request)).await?.into_inner(),
                 };
                 tracing::info!(
                     version = response.agent_version,
