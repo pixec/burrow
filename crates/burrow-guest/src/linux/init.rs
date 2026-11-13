@@ -105,7 +105,16 @@ pub fn set_resolver(dns: &str) -> std::io::Result<()> {
     } else if std::fs::read_to_string(PATH).ok().as_deref() == Some(resolv.as_str()) {
         return Ok(());
     }
-    std::fs::write(PATH, resolv)
+    // Overwritten and then cut to length, never truncated to nothing first:
+    // ext4 flushes a file emptied by truncation when it is closed, which
+    // put a block allocation and a disk write on every clone's handshake.
+    let mut file = std::fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(PATH)?;
+    std::io::Write::write_all(&mut file, resolv.as_bytes())?;
+    file.set_len(resolv.len() as u64)
 }
 
 /// The guest's IPv6 address, as `<address>/<prefix>`, from `burrow.ip6=`.
