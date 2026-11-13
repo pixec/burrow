@@ -3494,6 +3494,10 @@ impl SandboxManager {
         }
 
         self.collect_orphan_workdirs().await;
+        if let Some(root) = self.config.cgroup_root.clone() {
+            let _ =
+                tokio::task::spawn_blocking(move || burrow_vmm::sweep_empty_cgroups(&root)).await;
+        }
         tracing::info!(restored, held, discarded, "sandbox recovery complete");
         if self.config.object_store.is_some() {
             let (blobs, templates) = (

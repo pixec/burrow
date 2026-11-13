@@ -45,6 +45,10 @@ const CPU_PERIOD_US: u64 = 100_000;
 const MEMORY_BOUND_MIN_MIB: u32 = 512;
 /// The cgroup beside every VMM's that a snapshot is written from.
 const SNAPSHOT_CGROUP: &str = "_snapshot";
+/// How long a dropped VM's cgroup is waited on to empty once its processes
+/// are killed.
+const REMOVE_ATTEMPTS: usize = 50;
+const REMOVE_RETRY: std::time::Duration = std::time::Duration::from_millis(100);
 /// Times the processes are moved out before delegation is given up on. A
 /// process spawned just before the move is still in the cgroup, so one pass is
 /// not always enough.
@@ -232,13 +236,54 @@ impl Cgroup {
             .find_map(|line| line.strip_prefix("usage_usec "))
             .and_then(|value| value.trim().parse().ok())
     }
+}
 
-    /// Removes the cgroup. Only succeeds once it holds no processes, which is
-    /// why teardown happens after the VMM has been reaped.
-    pub fn remove(&self) {
-        if let Err(err) = std::fs::remove_dir(&self.path) {
-            tracing::debug!(path = %self.path.display(), %err, "could not remove cgroup");
+/// Removes the cgroup with its handle, which every way a VM ends drops. A VMM
+/// dropped on a path that never killed and reaped it is killed here first, and
+/// the cgroup is removed once its processes have gone: a failed boot or
+/// restore used to leave both behind.
+impl Drop for Cgroup {
+    fn drop(&mut self) {
+        let kill = self.path.join("cgroup.kill");
+        if std::fs::remove_dir(&self.path).is_ok() || !kill.exists() {
+            return;
         }
+        let _ = std::fs::write(&kill, "1");
+        let path = self.path.clone();
+        std::thread::spawn(move || {
+            for _ in 0..REMOVE_ATTEMPTS {
+                std::thread::sleep(REMOVE_RETRY);
+                match std::fs::remove_dir(&path) {
+                    Ok(()) => return,
+                    Err(err) if err.kind() == std::io::ErrorKind::NotFound => return,
+                    Err(_) => {}
+                }
+            }
+            tracing::warn!(path = %path.display(), "a vm's cgroup still holds processes after they were killed");
+        });
+    }
+}
+
+/// Removes every VM cgroup under `root` that holds no processes, left by a
+/// previous run that ended without tearing them down. Only for a node that
+/// is not yet running VMs: a cgroup made for a VMM about to spawn is empty
+/// too.
+pub fn sweep_empty_cgroups(root: &Path) {
+    let Ok(entries) = std::fs::read_dir(root.join("burrow")) else {
+        return;
+    };
+    let mut removed = 0;
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.is_dir()
+            && !entry.file_name().to_string_lossy().starts_with('_')
+            && std::fs::remove_dir(&path).is_ok()
+        {
+            removed += 1;
+        }
+    }
+    if removed > 0 {
+        tracing::info!(removed, "removed empty vm cgroups left by a previous run");
     }
 }
 
@@ -425,7 +470,7 @@ mod tests {
     /// back in its own once the snapshot ends.
     #[test]
     fn a_snapshot_is_written_outside_the_vmm_cgroup() {
-        let root = fake("snapshotting", &[]).path;
+        let root = std::env::temp_dir().join(format!("burrow-cg-snap-{}", std::process::id()));
         let cgroup = Cgroup {
             path: root.join("vm"),
         };
@@ -440,6 +485,28 @@ mod tests {
             std::fs::read_to_string(cgroup.path.join("cgroup.procs")).unwrap(),
             "41"
         );
+        drop(cgroup);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// A dropped handle takes its empty cgroup with it, and a sweep removes
+    /// the empty ones a previous run left, never one with processes.
+    #[test]
+    fn empty_cgroups_are_removed() {
+        let root = std::env::temp_dir().join(format!("burrow-cg-sweep-{}", std::process::id()));
+        let parent = root.join("burrow");
+        for dir in ["dropped", "left", "busy", "_snapshot"] {
+            std::fs::create_dir_all(parent.join(dir)).unwrap();
+        }
+        std::fs::write(parent.join("busy").join("cgroup.procs"), "41\n").unwrap();
+        drop(Cgroup {
+            path: parent.join("dropped"),
+        });
+        assert!(!parent.join("dropped").exists());
+        sweep_empty_cgroups(&root);
+        assert!(!parent.join("left").exists());
+        assert!(parent.join("busy").exists());
+        assert!(parent.join("_snapshot").exists());
         let _ = std::fs::remove_dir_all(&root);
     }
 

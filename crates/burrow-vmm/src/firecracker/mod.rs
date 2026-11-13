@@ -284,15 +284,7 @@ async fn spawn(spec: &MicroVmSpec) -> Result<(FcProcess, Option<Cgroup>)> {
         cgroup.as_ref(),
     )
     .await;
-    match process {
-        Ok(process) => Ok((process, cgroup)),
-        Err(err) => {
-            if let Some(cgroup) = cgroup {
-                cgroup.remove();
-            }
-            Err(err)
-        }
-    }
+    Ok((process?, cgroup))
 }
 
 impl MicroVm {
@@ -708,9 +700,7 @@ impl MicroVm {
         }
         // Only removable once it holds no processes, so this must follow the
         // reap rather than accompany it.
-        if let Some(cgroup) = self.cgroup.take() {
-            cgroup.remove();
-        }
+        drop(self.cgroup.take());
         result
     }
 }

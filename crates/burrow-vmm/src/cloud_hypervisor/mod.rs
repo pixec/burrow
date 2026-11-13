@@ -289,18 +289,9 @@ impl ChVm {
             )
         }
         .await;
-        let child = match spawned {
-            Ok(child) => child,
-            Err(err) => {
-                if let Some(cgroup) = cgroup {
-                    cgroup.remove();
-                }
-                return Err(err);
-            }
-        };
         let mut vm = Self {
             api: UnixHttp::new(socket.clone()),
-            child,
+            child: spawned?,
             workdir: spec.workdir.clone(),
             vmm_workdir: jail::vmm_workdir(&spec.workdir, config.jail.as_ref())?,
             jail: config.jail.clone(),
@@ -311,9 +302,6 @@ impl ChVm {
         };
         if let Err(err) = wait_for_socket(&mut vm.child, &socket, &spec.workdir).await {
             vm.stop().await;
-            if let Some(cgroup) = vm.cgroup.take() {
-                cgroup.remove();
-            }
             return Err(err);
         }
         Ok(vm)
@@ -581,9 +569,7 @@ impl ChVm {
         self.stop().await;
         let _ = tokio::fs::remove_file(self.workdir.join(API_SOCK)).await;
         // Only removable once it holds no processes, so this follows the reap.
-        if let Some(cgroup) = self.cgroup.take() {
-            cgroup.remove();
-        }
+        drop(self.cgroup.take());
         Ok(())
     }
 }
