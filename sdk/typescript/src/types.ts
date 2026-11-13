@@ -1072,6 +1072,11 @@ export interface NodeInfo {
   arch: string;
   /** Each offered hypervisor's version. Saved state needs an exact match. */
   hypervisorVersions: Record<string, string>;
+  /**
+   * Can give a sandbox its own /dev/kvm ({@link ResourceOptions.nestedVirt}),
+   * with a kernel here whose capabilities have `kvm`.
+   */
+  nestedVirtSupported: boolean;
   /** Guest kernels a template can be built with here. */
   kernels: NodeKernel[];
   /** Absent for a node that does not report disk. */

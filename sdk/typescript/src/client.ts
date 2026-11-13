@@ -637,6 +637,7 @@ export class Burrow {
         labels: n.info?.labels ?? {},
         arch: n.info?.arch ?? "",
         hypervisorVersions: n.info?.hypervisorVersions ?? {},
+        nestedVirtSupported: Boolean(n.info?.isNestedVirtSupported),
         kernels: (n.info?.kernels ?? []).map(
           (k: any): NodeKernel => ({
             ...toKernelInfo(k)!,

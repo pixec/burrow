@@ -518,6 +518,9 @@ class NodeInfo:
     # snapshot only restores on a node where both match what took it.
     arch: str = ""
     hypervisor_versions: Dict[str, str] = field(default_factory=dict)
+    # Can give a sandbox its own /dev/kvm (`nested_virt`), with a kernel here
+    # whose capabilities have `kvm`.
+    nested_virt_supported: bool = False
     # Guest kernels a template can be built with here.
     kernels: List[KernelInfo] = field(default_factory=list)
     disk: DiskCapacity = field(default_factory=DiskCapacity)

@@ -2028,7 +2028,10 @@ enum SecretCommand {
 #[derive(Subcommand)]
 enum NodesCommand {
     /// List registered nodes.
-    Ls,
+    Ls {
+        #[arg(long = "json")]
+        is_json_requested: bool,
+    },
     /// List the guest kernels each node builds templates with, and what each
     /// has built in.
     Kernels,
@@ -2064,7 +2067,9 @@ async fn main() -> anyhow::Result<()> {
             let resp = client.health(api::HealthRequest {}).await?.into_inner();
             println!("ok (orchestrator v{})", resp.version);
         }
-        Command::Nodes(NodesCommand::Ls) => list_nodes(&mut client).await?,
+        Command::Nodes(NodesCommand::Ls { is_json_requested }) => {
+            list_nodes(&mut client, is_json_requested).await?
+        }
         Command::Nodes(NodesCommand::Kernels) => list_kernels(&mut client).await?,
         Command::Nodes(NodesCommand::Drain {
             node_id,
@@ -4205,11 +4210,15 @@ fn print_share(share: &api::Share) {
     eprintln!("# connect with: tailcat {} <port>", share.address);
 }
 
-async fn list_nodes(client: &mut Client) -> anyhow::Result<()> {
+async fn list_nodes(client: &mut Client, is_json_requested: bool) -> anyhow::Result<()> {
     let resp = client
         .list_nodes(api::ListNodesRequest {})
         .await?
         .into_inner();
+    if is_json_requested {
+        println!("{}", nodes_json(&resp.nodes));
+        return Ok(());
+    }
     if resp.nodes.is_empty() {
         println!("no nodes registered");
         return Ok(());
@@ -4276,6 +4285,39 @@ fn kernel_table(nodes: &[api::Node]) -> String {
     out
 }
 
+/// What `node ls` says a node is doing.
+fn node_state(node: &api::Node) -> &'static str {
+    let status = node.status.clone().unwrap_or_default();
+    if !node.is_healthy {
+        "stale"
+    } else if status.is_draining {
+        "draining"
+    } else if status.is_disk_low {
+        "disk-low"
+    } else {
+        "ready"
+    }
+}
+
+/// `node ls`'s NESTED column: whether the node can give a sandbox its own
+/// /dev/kvm, and if so which of its kernels have the KVM a guest needs to
+/// use it.
+fn nested_column(info: &common::NodeInfo) -> String {
+    if !info.is_nested_virt_supported {
+        return "no".into();
+    }
+    let kernels: Vec<&str> = info
+        .kernels
+        .iter()
+        .filter(|kernel| kernel.capabilities.is_some_and(|caps| caps.is_kvm_built_in))
+        .map(|kernel| kernel.name.as_str())
+        .collect();
+    match kernels.is_empty() {
+        true => "yes (no kvm kernel)".into(),
+        false => format!("yes ({})", kernels.join(",")),
+    }
+}
+
 /// `node ls`'s table, one row per node.
 ///
 /// DISK is free over total on the node's data directory. A node whose free
@@ -4287,24 +4329,24 @@ fn node_table(nodes: &[api::Node]) -> String {
     let mut out = String::new();
     let _ = writeln!(
         out,
-        "{:<38} {:<22} {:>11} {:>9} {:>9} {:>16} {:>5} {:<9} {:<24} HOSTNAME",
-        "NODE", "ADDRESS", "CPUS", "MEM_MIB", "FREE_MIB", "DISK", "SBX", "STATE", "LABELS"
+        "{:<38} {:<22} {:>11} {:>9} {:>9} {:>16} {:>5} {:<9} {:<24} {:<24} HOSTNAME",
+        "NODE",
+        "ADDRESS",
+        "CPUS",
+        "MEM_MIB",
+        "FREE_MIB",
+        "DISK",
+        "SBX",
+        "STATE",
+        "NESTED",
+        "LABELS"
     );
     for node in nodes {
         let info = node.info.clone().unwrap_or_default();
         let status = node.status.clone().unwrap_or_default();
-        let state = if !node.is_healthy {
-            "stale"
-        } else if status.is_draining {
-            "draining"
-        } else if status.is_disk_low {
-            "disk-low"
-        } else {
-            "ready"
-        };
         let _ = writeln!(
             out,
-            "{:<38} {:<22} {:>11} {:>9} {:>9} {:>16} {:>5} {:<9} {:<24} {}",
+            "{:<38} {:<22} {:>11} {:>9} {:>9} {:>16} {:>5} {:<9} {:<24} {:<24} {}",
             info.id,
             info.address,
             format!(
@@ -4316,7 +4358,8 @@ fn node_table(nodes: &[api::Node]) -> String {
             status.free_mem_mib,
             disk_column(&status),
             status.running_sandboxes,
-            state,
+            node_state(node),
+            truncate(&nested_column(&info), 24),
             truncate(&format_tags(&info.labels), 24),
             info.hostname,
         );
@@ -5713,6 +5756,50 @@ fn pairs_json(pairs: &std::collections::HashMap<String, String>) -> serde_json::
         .collect()
 }
 
+/// `nodes ls --json`: the table's facts in full, each kernel with whether it
+/// has KVM built in.
+fn nodes_json(nodes: &[api::Node]) -> String {
+    let items: Vec<_> = nodes
+        .iter()
+        .map(|node| {
+            let info = node.info.clone().unwrap_or_default();
+            let status = node.status.clone().unwrap_or_default();
+            let disk = status.disk.unwrap_or_default();
+            let kernels: Vec<_> = info
+                .kernels
+                .iter()
+                .map(|kernel| {
+                    serde_json::json!({
+                        "name": kernel.name,
+                        "version": kernel.version,
+                        "hypervisors": kernel.hypervisors,
+                        "kvm": kernel.capabilities.is_some_and(|caps| caps.is_kvm_built_in),
+                    })
+                })
+                .collect();
+            serde_json::json!({
+                "id": info.id,
+                "address": info.address,
+                "hostname": info.hostname,
+                "state": node_state(node),
+                "arch": info.arch,
+                "total_vcpus": info.total_vcpus,
+                "committed_cpus": status.committed_cpu_millis as f64 / 1000.0,
+                "total_mem_mib": info.total_mem_mib,
+                "free_mem_mib": status.free_mem_mib,
+                "disk_free_bytes": disk.free_bytes,
+                "disk_total_bytes": disk.total_bytes,
+                "running_sandboxes": status.running_sandboxes,
+                "hypervisors": info.hypervisors,
+                "nested_virt_supported": info.is_nested_virt_supported,
+                "kernels": kernels,
+                "labels": pairs_json(&info.labels),
+            })
+        })
+        .collect();
+    serde_json::to_string_pretty(&items).expect("a value renders")
+}
+
 fn volumes_json(volumes: &[common::Volume]) -> String {
     let items: Vec<_> = volumes
         .iter()
@@ -6188,6 +6275,42 @@ mod tests {
         // A node that does not report disk shows a dash, not a full disk.
         let unreported: Vec<&str> = lines[3].split_whitespace().collect();
         assert_eq!(unreported[5], "-", "{table}");
+    }
+
+    /// `node ls` says whether a node supports nested virtualization and which
+    /// of its kernels have the KVM to give it, as a column and in `--json`.
+    #[test]
+    fn node_ls_shows_nested_virtualization() {
+        use burrow_proto::common::v1::{Kernel, KernelCapabilities, NodeStatus};
+        let mut nested = node("node-a", NodeStatus::default());
+        let info = nested.info.as_mut().unwrap();
+        info.is_nested_virt_supported = true;
+        info.kernels = vec![
+            Kernel {
+                name: "ch-linux".into(),
+                capabilities: Some(KernelCapabilities {
+                    is_kvm_built_in: true,
+                    ..Default::default()
+                }),
+                ..Default::default()
+            },
+            Kernel {
+                name: "firecracker-ci".into(),
+                ..Default::default()
+            },
+        ];
+        let nodes = [nested, node("node-b", NodeStatus::default())];
+        let table = node_table(&nodes);
+        let lines: Vec<&str> = table.lines().collect();
+        assert!(lines[0].contains(" NESTED "), "{table}");
+        assert!(lines[1].contains(" yes (ch-linux) "), "{table}");
+        assert!(lines[2].contains(" ready     no "), "{table}");
+
+        let json: serde_json::Value = serde_json::from_str(&super::nodes_json(&nodes)).unwrap();
+        assert_eq!(json[0]["nested_virt_supported"], true);
+        assert_eq!(json[0]["kernels"][0]["kvm"], true);
+        assert_eq!(json[0]["kernels"][1]["kvm"], false);
+        assert_eq!(json[1]["nested_virt_supported"], false);
     }
 
     #[test]

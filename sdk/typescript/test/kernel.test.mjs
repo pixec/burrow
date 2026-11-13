@@ -71,3 +71,14 @@ test("a node lists its kernels and which hypervisors each is the default for", a
     { ...parsed, hypervisors: ["cloud-hypervisor"], defaultFor: ["cloud-hypervisor"] },
   ]);
 });
+
+test("a node says whether it supports nested virtualization", async () => {
+  const burrow = fakeBurrow({
+    async unary() {
+      return { nodes: [{ info: { id: "a", isNestedVirtSupported: true } }, { info: { id: "b" } }] };
+    },
+  });
+  const [nested, plain] = await burrow.nodes();
+  assert.equal(nested.nestedVirtSupported, true);
+  assert.equal(plain.nestedVirtSupported, false);
+});

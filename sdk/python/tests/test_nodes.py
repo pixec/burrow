@@ -47,3 +47,21 @@ def test_a_node_reports_its_disk():
         provisioned_bytes=120 << 30,
     )
     assert node.disk_low
+
+
+def test_a_node_reports_nested_virtualization():
+    burrow = Burrow(endpoint="localhost:1")
+    burrow.close()
+    burrow._transport = _Unary(
+        api_pb2.ListNodesResponse(
+            nodes=[
+                api_pb2.Node(
+                    info=common_pb2.NodeInfo(id="n1", is_nested_virt_supported=True)
+                ),
+                api_pb2.Node(info=common_pb2.NodeInfo(id="n2")),
+            ]
+        )
+    )
+    nested, plain = burrow.nodes()
+    assert nested.nested_virt_supported
+    assert not plain.nested_virt_supported

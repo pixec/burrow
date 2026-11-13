@@ -611,6 +611,7 @@ class Burrow:
                 committed_cpus=n.status.committed_cpu_millis / 1000,
                 arch=n.info.arch,
                 hypervisor_versions=dict(n.info.hypervisor_versions),
+                nested_virt_supported=n.info.is_nested_virt_supported,
                 kernels=[kernel(k) for k in n.info.kernels],
                 disk=DiskCapacity(
                     free_bytes=n.status.disk.free_bytes,
