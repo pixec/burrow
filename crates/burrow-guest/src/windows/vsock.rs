@@ -221,6 +221,9 @@ pub fn listen_on(port: u32) -> std::io::Result<mpsc::Receiver<VsockConn>> {
     std::thread::Builder::new()
         .name("vsock-accept".into())
         .spawn(move || {
+            // Moved whole: the loop names only `listener.0`, and a closure
+            // capturing just that would let the socket close here.
+            let listener = listener;
             loop {
                 let parked_since = std::time::Instant::now();
                 let mut peer = SockaddrVm::default();
