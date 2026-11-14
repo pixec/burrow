@@ -1845,6 +1845,10 @@ pub mod from_image {
             .await
             .map_err(|err| Status::internal(format!("installing the agent: {err}")))?;
         set_executable(&rootdir.join("usr/bin/burrow-guest")).await?;
+        if environment.systemd {
+            stamp_updated(rootdir)
+                .map_err(|err| Status::internal(format!("stamping /etc and /var: {err}")))?;
+        }
 
         // A container runtime takes HOME and USER from the image user's passwd
         // entry rather than from ENV, and a Kit's descriptors reference them
@@ -1858,6 +1862,42 @@ pub mod from_image {
         }
 
         assemble(manager, data_dir, rootdir, name, &environment, kernel, tx).await
+    }
+
+    /// Marks /etc and /var up to date with /usr, as systemd-update-done does
+    /// on an image's first boot.
+    ///
+    /// Every sandbox boots a fresh copy of the image, so to systemd each would
+    /// be that first boot, rebuilding the linker cache, the journal catalog and
+    /// the image's declared users on every cold create. A stamp the image
+    /// ships is kept, and a directory that is a link is left alone: the image
+    /// chose where it points.
+    fn stamp_updated(rootdir: &Path) -> std::io::Result<()> {
+        let usr = match std::fs::symlink_metadata(rootdir.join("usr")) {
+            Ok(usr) if usr.is_dir() => usr.modified()?,
+            Ok(_) => return Ok(()),
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+            Err(err) => return Err(err),
+        };
+        let nanos = usr
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_err(std::io::Error::other)?
+            .as_nanos();
+        for dir in ["etc", "var"] {
+            if !std::fs::symlink_metadata(rootdir.join(dir)).is_ok_and(|meta| meta.is_dir()) {
+                continue;
+            }
+            let stamp = rootdir.join(dir).join(".updated");
+            if std::fs::symlink_metadata(&stamp).is_ok() {
+                continue;
+            }
+            std::fs::write(&stamp, format!("TIMESTAMP_NSEC={nanos}\n"))?;
+            std::fs::File::options()
+                .write(true)
+                .open(&stamp)?
+                .set_times(std::fs::FileTimes::new().set_modified(usr))?;
+        }
+        Ok(())
     }
 
     /// Adds HOME and USER for the image's user, where the image did not
@@ -2003,5 +2043,62 @@ pub mod from_image {
         })
         .await
         .unwrap_or(0)
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        fn scratch(name: &str) -> std::path::PathBuf {
+            let dir =
+                std::env::temp_dir().join(format!("burrow-stamp-{name}-{}", std::process::id()));
+            let _ = std::fs::remove_dir_all(&dir);
+            for sub in ["usr", "etc", "var"] {
+                std::fs::create_dir_all(dir.join(sub)).unwrap();
+            }
+            dir
+        }
+
+        /// systemd's ConditionNeedsUpdate holds while /usr is newer than the
+        /// stamp, so the stamp has to carry /usr's own time.
+        #[test]
+        fn stamps_carry_the_time_of_usr() {
+            let dir = scratch("time");
+            stamp_updated(&dir).unwrap();
+            let usr = std::fs::metadata(dir.join("usr"))
+                .unwrap()
+                .modified()
+                .unwrap();
+            for sub in ["etc", "var"] {
+                let stamp = dir.join(sub).join(".updated");
+                assert_eq!(std::fs::metadata(&stamp).unwrap().modified().unwrap(), usr);
+                let nanos = usr
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap()
+                    .as_nanos();
+                assert_eq!(
+                    std::fs::read_to_string(&stamp).unwrap(),
+                    format!("TIMESTAMP_NSEC={nanos}\n")
+                );
+            }
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+
+        #[test]
+        fn an_image_keeps_its_own_stamp_and_its_links() {
+            let dir = scratch("own");
+            std::fs::write(dir.join("etc/.updated"), "mine").unwrap();
+            std::fs::remove_dir(dir.join("var")).unwrap();
+            let elsewhere = dir.join("elsewhere");
+            std::fs::create_dir(&elsewhere).unwrap();
+            std::os::unix::fs::symlink(&elsewhere, dir.join("var")).unwrap();
+            stamp_updated(&dir).unwrap();
+            assert_eq!(
+                std::fs::read_to_string(dir.join("etc/.updated")).unwrap(),
+                "mine"
+            );
+            assert!(!elsewhere.join(".updated").exists());
+            let _ = std::fs::remove_dir_all(&dir);
+        }
     }
 }
