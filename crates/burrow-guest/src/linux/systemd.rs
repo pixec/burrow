@@ -27,22 +27,32 @@ const CANDIDATES: [&str; 2] = ["/usr/lib/systemd/systemd", "/lib/systemd/systemd
 /// Units masked for every boot, without touching the image's disk.
 ///
 /// The gettys would take over the agent's console, or a VT nobody can log in
-/// on. Networkd, NetworkManager, netplan, resolved and their helpers manage
-/// the network burrow configures: they would fight it for the interface and
-/// the resolver, a restore re-addresses it under them, and their wait-online
-/// units would hold boot for minutes on a DHCP lease nothing hands out.
-/// cloud-init waits on a datasource there is none of. The clock is set from
-/// the host before a handshake returns, so nothing has to wait for NTP, and
-/// udev-settle waits on hardware a microVM does not have. The package
-/// managers' timers take the package lock out from under a user's own install,
-/// and snapd's seeding waits on the Snap Store and holds multi-user.target
-/// back for as long as it is out of reach.
+/// on, and the console and keyboard setup only style those VTs, which no
+/// display shows. Networkd, NetworkManager, netplan, resolved and their
+/// helpers manage the network burrow configures: they would fight it for the
+/// interface and the resolver, a restore re-addresses it under them, and
+/// their wait-online units would hold boot for minutes on a DHCP lease nothing
+/// hands out. cloud-init waits on a datasource there is none of. The clock is
+/// set from the host before systemd starts, so nothing has to wait for NTP,
+/// and udev-settle waits on hardware a microVM does not have. GRUB never boots
+/// the guest, so it has no good boot to record, and e2scrub only checks
+/// filesystems on LVM, which no guest disk is. The package managers' timers
+/// take the package lock out from under a user's own install, and snapd's
+/// seeding waits on the Snap Store and holds multi-user.target back for as
+/// long as it is out of reach. The daily jobs that remain re-index man pages,
+/// back up the package database, fetch Ubuntu's login news and refresh
+/// firmware metadata for firmware a microVM does not have: a clone restored
+/// from a snapshot a day old runs every one of them the moment it wakes, while
+/// its first commands wait for the CPU.
 ///
 /// A template unmasks any of them with `burrow.systemd.unmask=`.
-const MASKED: [&str; 25] = [
+const MASKED: [&str; 36] = [
     "console-getty.service",
     "getty@.service",
     "serial-getty@.service",
+    "console-setup.service",
+    "keyboard-setup.service",
+    "setvtrgb.service",
     "systemd-networkd.service",
     "systemd-networkd.socket",
     "systemd-networkd-wait-online.service",
@@ -61,10 +71,18 @@ const MASKED: [&str; 25] = [
     "systemd-time-wait-sync.service",
     "chrony-wait.service",
     "systemd-udev-settle.service",
+    "grub-common.service",
+    "grub-initrd-fallback.service",
+    "e2scrub_reap.service",
+    "e2scrub_all.timer",
     "apt-daily.timer",
     "apt-daily-upgrade.timer",
     "dnf-makecache.timer",
     "snapd.seeded.service",
+    "man-db.timer",
+    "dpkg-db-backup.timer",
+    "motd-news.timer",
+    "fwupd-refresh.timer",
 ];
 
 /// Masked on a kernel built without module support, where they can only fail.
@@ -568,6 +586,14 @@ mod tests {
         assert!(!masked.contains(&"apt-daily.timer"));
         assert!(masked.contains(&"systemd-networkd.service"));
         assert_eq!(masked.len(), MASKED.len() - 2);
+    }
+
+    #[test]
+    fn no_unit_is_masked_twice() {
+        let mut units = MASKED.to_vec();
+        units.sort_unstable();
+        units.dedup();
+        assert_eq!(units.len(), MASKED.len());
     }
 
     #[test]
