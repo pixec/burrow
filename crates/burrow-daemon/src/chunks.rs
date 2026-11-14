@@ -130,10 +130,13 @@ pub async fn read_index(store: &ObjectStore, key: &str) -> Result<Option<ImageIn
         .map_err(|err| Status::data_loss(format!("index {key} is unreadable: {err}")))
 }
 
-/// An object as the current format stores it, refusing one only the
-/// format before casync has.
+/// An object as the current format stores it. One that is only in the
+/// format before casync is migrated on the way.
 async fn get_current(store: &ObjectStore, key: &str) -> Result<Option<Vec<u8>>, Status> {
     if let Some(bytes) = store.get_bytes(key).await? {
+        return Ok(Some(bytes));
+    }
+    if let Some(bytes) = crate::migrate::on_demand(store, key).await? {
         return Ok(Some(bytes));
     }
     refuse_legacy(store, key).await?;

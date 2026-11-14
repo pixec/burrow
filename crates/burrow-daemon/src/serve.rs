@@ -1723,6 +1723,7 @@ pub async fn run(args: ServeArgs) -> anyhow::Result<()> {
                 store = store.describe(),
                 "snapshots are copied to the object store"
             );
+            crate::migrate::start(store.clone());
             Some(store)
         }
         (Some(_), None) => anyhow::bail!("--object-store needs --object-store-endpoint"),
