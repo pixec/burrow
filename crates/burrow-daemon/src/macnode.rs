@@ -1619,6 +1619,16 @@ impl UserNets {
         Ok(())
     }
 
+    /// Routes the fleet's pool between the stacks and onto the mesh.
+    pub fn set_pool(&self, pool: burrow_net::ipam::AddressPool) {
+        #[cfg(target_os = "macos")]
+        if let Some(node) = &self.inner.lock().unwrap().node {
+            node.router.set_pool(pool);
+        }
+        #[cfg(not(target_os = "macos"))]
+        let _ = pool;
+    }
+
     /// Replaces the mesh's peers, as Linux's `burrow-wg` is reconfigured.
     pub async fn configure_mesh(&self, peers: &[burrow_net::Peer]) {
         #[cfg(target_os = "macos")]

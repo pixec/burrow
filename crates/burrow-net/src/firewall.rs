@@ -19,15 +19,7 @@ use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use crate::error::{NetError, Result};
 #[cfg(test)]
 use crate::policy::parse_cidr;
-use crate::policy::{
-    Cidr, Denials, IngressProtocol, IngressRule, METADATA_CIDR, PortDenial, SANDBOX_POOL,
-};
-
-/// The address range every sandbox lease comes from.
-pub const SANDBOX_CIDR: &str = "10.99.0.0/16";
-/// The v6 pool, as [`SANDBOX_CIDR`] is for v4: the range a rule names when it
-/// means any sandbox anywhere rather than one on this node.
-pub const POOL6: &str = "fd99:b070::/48";
+use crate::policy::{Cidr, Denials, IngressProtocol, IngressRule, METADATA_CIDR, PortDenial};
 /// Prefix shared by every burrow tap, used for interface wildcard matches.
 pub const TAP_PREFIX: &str = "bt";
 
@@ -92,6 +84,9 @@ pub struct SandboxRules {
     /// understand it would be egress nothing inspects.
     pub host_ip6: Ipv6Addr,
     pub guest_ip6: Ipv6Addr,
+    /// The fleet's pool the lease came from: the range a rule names when it
+    /// means any sandbox anywhere rather than one on this node.
+    pub pool: crate::ipam::AddressPool,
     pub mode: Mode,
     /// Extra destinations permitted at L3 regardless of mode.
     pub allow_cidrs: Vec<String>,
@@ -1132,7 +1127,8 @@ fn render_sandbox_allowances(out: &mut String, sandbox: &SandboxRules) {
             let sources = src4(sandbox);
             let _ = writeln!(
                 out,
-                "add rule inet {FILTER_TABLE} {ALLOW_CHAIN} ip saddr {sources} ip daddr {SANDBOX_POOL} drop"
+                "add rule inet {FILTER_TABLE} {ALLOW_CHAIN} ip saddr {sources} ip daddr {} drop",
+                sandbox.pool.cidr()
             );
             let _ = writeln!(
                 out,
@@ -1144,8 +1140,9 @@ fn render_sandbox_allowances(out: &mut String, sandbox: &SandboxRules) {
             // sandbox reaches the internet over v6 and no sandbox at all.
             let _ = writeln!(
                 out,
-                "add rule inet {FILTER_TABLE} {ALLOW_CHAIN} ip6 saddr {} ip6 daddr {POOL6} drop",
-                src6(sandbox)
+                "add rule inet {FILTER_TABLE} {ALLOW_CHAIN} ip6 saddr {} ip6 daddr {} drop",
+                src6(sandbox),
+                sandbox.pool.cidr6()
             );
             let _ = writeln!(
                 out,
@@ -1240,8 +1237,9 @@ fn nat6_rules(out: &mut String, sandbox: &SandboxRules) {
     if let (Some((address, _)), true) = (sandbox.public.v6.first(), sandbox.public.mark != 0) {
         let _ = writeln!(
             out,
-            "add rule ip6 {NAT6_TABLE} postrouting meta mark {:#x} ip6 daddr != {POOL6} snat to {address}",
-            sandbox.public.mark
+            "add rule ip6 {NAT6_TABLE} postrouting meta mark {:#x} ip6 daddr != {} snat to {address}",
+            sandbox.public.mark,
+            sandbox.pool.cidr6()
         );
     }
     if sandbox.mode == Mode::Open {
@@ -1251,7 +1249,8 @@ fn nat6_rules(out: &mut String, sandbox: &SandboxRules) {
         };
         let _ = writeln!(
             out,
-            "add rule ip6 {NAT6_TABLE} postrouting ip6 saddr {guest} ip6 daddr != {POOL6} {translation}"
+            "add rule ip6 {NAT6_TABLE} postrouting ip6 saddr {guest} ip6 daddr != {} {translation}",
+            sandbox.pool.cidr6()
         );
     }
 }
@@ -1344,8 +1343,9 @@ fn nat_rules(out: &mut String, sandbox: &SandboxRules) {
     if let (Some(address), true) = (sandbox.public.v4.first(), sandbox.public.mark != 0) {
         let _ = writeln!(
             out,
-            "add rule ip {NAT_TABLE} postrouting meta mark {:#x} ip daddr != {SANDBOX_POOL} snat to {address}",
-            sandbox.public.mark
+            "add rule ip {NAT_TABLE} postrouting meta mark {:#x} ip daddr != {} snat to {address}",
+            sandbox.public.mark,
+            sandbox.pool.cidr()
         );
     }
     // Only open-mode sandboxes reach the internet directly; allowlist mode
@@ -1366,8 +1366,9 @@ fn nat_rules(out: &mut String, sandbox: &SandboxRules) {
         };
         let _ = writeln!(
             out,
-            "add rule ip {NAT_TABLE} postrouting ip saddr {} ip daddr != {SANDBOX_POOL} {translation}",
-            sandbox.guest_ip
+            "add rule ip {NAT_TABLE} postrouting ip saddr {} ip daddr != {} {translation}",
+            sandbox.guest_ip,
+            sandbox.pool.cidr()
         );
     }
     // Published ports are doors from outside the fleet. Without the
@@ -1535,6 +1536,7 @@ mod tests {
             guest_ip: Ipv4Addr::new(10, 99, 0, 6),
             host_ip6: "fd99:b070:0:1::1".parse().unwrap(),
             guest_ip6: "fd99:b070:0:1::2".parse().unwrap(),
+            pool: Default::default(),
             mode,
             allow_cidrs: vec![],
             deny_cidrs: vec![],
@@ -1659,19 +1661,19 @@ mod tests {
             ruleset.contains("ip saddr 10.99.0.6 ip daddr != 10.99.0.0/16 snat to 203.0.113.17")
         );
         assert!(!ruleset.contains("ip saddr 10.99.0.6 ip daddr != 10.99.0.0/16 masquerade"));
-        assert!(ruleset.contains(&format!(
-            "ip6 saddr fd99:b070:0:1::2 ip6 daddr != {POOL6} snat to 2001:db8:100:1::1"
-        )));
-        assert!(!ruleset.contains(&format!(
-            "ip6 saddr fd99:b070:0:1::2 ip6 daddr != {POOL6} masquerade"
-        )));
+        assert!(ruleset.contains(
+            "ip6 saddr fd99:b070:0:1::2 ip6 daddr != fd99:b070::/48 snat to 2001:db8:100:1::1"
+        ));
+        assert!(
+            !ruleset.contains("ip6 saddr fd99:b070:0:1::2 ip6 daddr != fd99:b070::/48 masquerade")
+        );
         // So do the proxy's upstream connections for it.
         assert!(ruleset.contains(
             "postrouting meta mark 0xb700001 ip daddr != 10.99.0.0/16 snat to 203.0.113.17"
         ));
-        assert!(ruleset.contains(&format!(
-            "postrouting meta mark 0xb700001 ip6 daddr != {POOL6} snat to 2001:db8:100:1::1"
-        )));
+        assert!(ruleset.contains(
+            "postrouting meta mark 0xb700001 ip6 daddr != fd99:b070::/48 snat to 2001:db8:100:1::1"
+        ));
     }
 
     #[test]
@@ -1867,8 +1869,8 @@ mod tests {
         let ruleset = render(&[sandbox(Mode::Open)]);
         assert!(ruleset.contains(&format!("forward iifname \"{TAP_PREFIX}*\" jump sandbox")));
         assert!(ruleset.contains(&format!("input iifname \"{TAP_PREFIX}*\" jump tohost")));
-        assert!(!ruleset.contains(&format!("forward ip saddr {SANDBOX_CIDR} jump")));
-        assert!(!ruleset.contains(&format!("input ip saddr {SANDBOX_CIDR} jump")));
+        assert!(!ruleset.contains("forward ip saddr 10.99.0.0/16 jump"));
+        assert!(!ruleset.contains("input ip saddr 10.99.0.0/16 jump"));
     }
 
     #[test]
@@ -1942,14 +1944,6 @@ mod tests {
         assert!(!ruleset.contains(&format!(
             "tohost ip saddr 10.99.0.6 ip daddr 10.99.0.5 tcp dport {PROXY_PORT}"
         )));
-    }
-
-    /// The constant callers name and the value rules are rendered from have to
-    /// be the same range, or the policy would deny something other than the
-    /// pool addresses are handed out of.
-    #[test]
-    fn the_named_pool_and_the_rendered_one_are_the_same_range() {
-        assert_eq!(parse_cidr(SANDBOX_CIDR), Some(SANDBOX_POOL));
     }
 
     /// "Open" is egress off the node. A blanket accept also reached every other
@@ -2063,6 +2057,23 @@ mod tests {
         )));
         assert!(!allowlist.contains("ip daddr 10.99.0.0/16 drop"));
         assert!(!render(&[sandbox(Mode::None)]).contains("ip daddr 10.99.0.0/16 drop"));
+    }
+
+    /// Every pool-wide rule names the pool the fleet was given, not the
+    /// default one.
+    #[test]
+    fn a_custom_pool_is_the_one_every_rule_names() {
+        let pool = crate::ipam::AddressPool::new("100.64.0.0/16", "fd00:b070::/48", 1024).unwrap();
+        let open = render(&[SandboxRules {
+            pool,
+            ..sandbox(Mode::Open)
+        }]);
+        assert!(open.contains("allow ip saddr 10.99.0.6 ip daddr 100.64.0.0/16 drop"));
+        assert!(open.contains("ip daddr != 100.64.0.0/16 masquerade"));
+        assert!(open.contains("ip6 daddr fd00:b070::/48 drop"));
+        assert!(open.contains("ip6 daddr != fd00:b070::/48 masquerade"));
+        assert!(!open.contains("10.99.0.0/16"));
+        assert!(!open.contains("fd99:b070::/48"));
     }
 
     /// The rules above are only as good as the routes: the orchestrator's API
@@ -2187,10 +2198,10 @@ mod tests {
         assert!(open.contains(accept), "open must accept guest v6:\n{open}");
         // And the fleet is not the internet: the pool is dropped first, so an
         // open sandbox reaches out and never sideways.
-        let pool = format!("allow ip6 saddr fd99:b070:0:1::2 ip6 daddr {POOL6} drop");
-        assert!(open.contains(&pool), "{open}");
+        let pool = "allow ip6 saddr fd99:b070:0:1::2 ip6 daddr fd99:b070::/48 drop";
+        assert!(open.contains(pool), "{open}");
         assert!(
-            open.find(&pool) < open.find(accept),
+            open.find(pool) < open.find(accept),
             "the pool drop must precede the accept, or neighbours are reachable"
         );
     }
@@ -2233,9 +2244,7 @@ mod tests {
         )));
 
         let open = render(&[sandbox(Mode::Open)]);
-        assert!(open.contains(&format!(
-            "ip6 burrow_nat6 postrouting ip6 saddr fd99:b070:0:1::2 ip6 daddr != {POOL6} masquerade"
-        )));
+        assert!(open.contains("ip6 burrow_nat6 postrouting ip6 saddr fd99:b070:0:1::2 ip6 daddr != fd99:b070::/48 masquerade"));
         assert!(!render(&[sandbox(Mode::None)]).contains("burrow_nat6 prerouting ip6 saddr"));
     }
 

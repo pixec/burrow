@@ -20,7 +20,7 @@ use tokio::sync::{Notify, watch};
 use tokio::task::{AbortHandle, JoinHandle};
 
 use super::conn::{self, GuestConn};
-use super::{Flow, Meter, Node, Policy, Router, SandboxNet, Services, udp, wire};
+use super::{Flow, Meter, Node, Policy, SandboxNet, Services, udp, wire};
 use crate::policy::{self, NodeDenials, Transport, Verdict};
 
 /// Per direction. Large enough that one flow can fill a fast upstream: the
@@ -186,6 +186,7 @@ impl Shared {
         let node = NodeDenials {
             control_plane: self.node.denied.addresses(),
             node: super::node_addresses(),
+            pool: self.node.router.pool(),
         };
         // The resolver may be given an address of its own, but it is the
         // gateway's service all the same.
@@ -322,7 +323,7 @@ impl Shared {
         if src != self.net.guest_ip {
             return;
         }
-        if Router::is_routed(dst)
+        if self.node.router.is_routed(dst)
             && dst != self.net.gateway_ip
             && dst != self.net.dns_ip
             && self.node.router.forward(self, packet)

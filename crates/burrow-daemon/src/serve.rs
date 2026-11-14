@@ -971,7 +971,9 @@ async fn registration_loop(
 ) {
     // Claimed rather than requested: sandboxes here already hold addresses
     // from this slice.
-    let claimed_index = load_node_index(&args.data_dir).await;
+    let claimed_index = load_address_slice(&args.data_dir)
+        .await
+        .map(|(_, index)| index);
     let mut applied_peers: Vec<burrow_net::Peer> = Vec::new();
     let mut denied_edges: Vec<std::net::IpAddr> = Vec::new();
     let mut pins =
@@ -1006,13 +1008,36 @@ async fn registration_loop(
                 continue;
             }
         };
+        // Confines address allocation to this node's slice before any sandbox
+        // is created, so no address can collide with another node's.
+        let assigned = match &resp.address_pool {
+            Some(pool) => {
+                burrow_net::ipam::AddressPool::new(&pool.v4, &pool.v6, pool.blocks_per_node)
+            }
+            None => Err("the orchestrator gave no address pool".to_string()),
+        };
+        let assigned = match assigned {
+            Ok(pool) => sandboxes
+                .set_address_slice(pool, resp.node_index)
+                .await
+                .map(|()| pool),
+            Err(err) => Err(err),
+        };
+        match assigned {
+            Ok(pool) => store_address_slice(&args.data_dir, pool, resp.node_index).await,
+            Err(err) => {
+                tracing::error!(
+                    %err,
+                    "refusing the address slice the orchestrator assigned; not serving the fleet \
+                     until it assigns one this node can take"
+                );
+                tokio::time::sleep(Duration::from_secs(30)).await;
+                continue;
+            }
+        }
         info.id = resp.node_id.clone();
         *node_id.lock().unwrap() = resp.node_id.clone();
         crate::access::apply_keys(&access_keys, &resp.access_keys);
-        // Confines address allocation to this node's slice before any sandbox
-        // is created, so no address can collide with another node's.
-        sandboxes.set_node_index(resp.node_index).await;
-        store_node_index(&args.data_dir, sandboxes.node_index().await).await;
         let interval = Duration::from_secs(resp.heartbeat_interval_secs.max(1) as u64);
         tracing::info!(
             node_id = info.id,
@@ -1110,18 +1135,43 @@ async fn publish_address(args: &ServeArgs) -> std::net::IpAddr {
     args.listen.ip()
 }
 
-/// The address slice this node used last time it ran, if any.
-async fn load_node_index(data_dir: &std::path::Path) -> Option<u32> {
-    tokio::fs::read_to_string(data_dir.join("node-index"))
+/// The pool and the slice of it this node used last time it ran, if any. A
+/// node that recorded no pool used the default one.
+async fn load_address_slice(
+    data_dir: &std::path::Path,
+) -> Option<(burrow_net::ipam::AddressPool, u32)> {
+    let index = tokio::fs::read_to_string(data_dir.join("node-index"))
         .await
-        .ok()
-        .and_then(|value| value.trim().parse().ok())
+        .ok()?
+        .trim()
+        .parse()
+        .ok()?;
+    let pool = match tokio::fs::read_to_string(data_dir.join("address-pool")).await {
+        Ok(text) => match text.parse() {
+            Ok(pool) => pool,
+            Err(err) => {
+                tracing::error!(%err, "the recorded address pool does not parse");
+                return None;
+            }
+        },
+        Err(_) => burrow_net::ipam::AddressPool::default(),
+    };
+    Some((pool, index))
 }
 
-async fn store_node_index(data_dir: &std::path::Path, index: u32) {
-    let path = data_dir.join("node-index");
-    if let Err(err) = tokio::fs::write(&path, index.to_string()).await {
-        tracing::warn!(path = %path.display(), %err, "could not record the address slice");
+async fn store_address_slice(
+    data_dir: &std::path::Path,
+    pool: burrow_net::ipam::AddressPool,
+    index: u32,
+) {
+    for (file, value) in [
+        ("address-pool", pool.to_string()),
+        ("node-index", index.to_string()),
+    ] {
+        let path = data_dir.join(file);
+        if let Err(err) = tokio::fs::write(&path, value).await {
+            tracing::warn!(path = %path.display(), %err, "could not record the address slice");
+        }
     }
 }
 
@@ -1263,12 +1313,21 @@ async fn apply_mesh(
     if peers == *applied_peers {
         return;
     }
+    let Some((pool, index)) = sandboxes.address_slice().await else {
+        return;
+    };
     let configured = if cfg!(target_os = "macos") {
         sandboxes.configure_usernet_mesh(&peers).await;
         Ok(())
     } else {
-        burrow_net::mesh::configure(identity, args.mesh_port, &sandboxes.subnet().await, &peers)
-            .await
+        burrow_net::mesh::configure(
+            identity,
+            args.mesh_port,
+            &pool,
+            &pool.node_subnet(index),
+            &peers,
+        )
+        .await
     };
     match configured {
         Ok(()) => *applied_peers = peers,
@@ -1879,9 +1938,11 @@ pub async fn run(args: ServeArgs) -> anyhow::Result<()> {
     }
 
     // Before recovery, so recovered sandboxes reload into the range they were
-    // created in rather than whatever index 0 happens to be.
-    if let Some(index) = load_node_index(&args.data_dir).await {
-        sandboxes.set_node_index(index).await;
+    // created in. A node that never registered has none.
+    if let Some((pool, index)) = load_address_slice(&args.data_dir).await
+        && let Err(err) = sandboxes.set_address_slice(pool, index).await
+    {
+        tracing::error!(%err, "could not take the address slice this node recorded");
     }
 
     // Pick up anything the previous run left behind before serving, so a

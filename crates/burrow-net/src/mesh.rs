@@ -118,6 +118,7 @@ async fn derive_public_key(private_key: &str) -> Result<String> {
 pub async fn configure(
     identity: &Identity,
     listen_port: u16,
+    pool: &crate::ipam::AddressPool,
     subnet: &str,
     peers: &[Peer],
 ) -> Result<()> {
@@ -125,7 +126,10 @@ pub async fn configure(
 
     // Nothing unvalidated reaches the config or the routing table; see
     // [`is_valid_peer`].
-    let peers: Vec<&Peer> = peers.iter().filter(|peer| is_valid_peer(peer)).collect();
+    let peers: Vec<&Peer> = peers
+        .iter()
+        .filter(|peer| is_valid_peer(peer, pool))
+        .collect();
 
     // `syncconf` removes peers absent from the config, which is what makes a
     // node that left the fleet stop being routable.
@@ -162,8 +166,8 @@ pub async fn configure(
 ///
 /// A peer failing any check is dropped rather than corrected: a malformed
 /// record says nothing reliable about which node it describes.
-pub(crate) fn is_valid_peer(peer: &Peer) -> bool {
-    let reason = if !is_valid_subnet(&peer.subnet) {
+pub(crate) fn is_valid_peer(peer: &Peer, pool: &crate::ipam::AddressPool) -> bool {
+    let reason = if !is_valid_subnet(&peer.subnet, pool) {
         "subnet is not a CIDR inside the sandbox pool, or claims more than one node's slice"
     } else if !is_valid_public_key(&peer.public_key) {
         "public key is not 32 bytes of base64"
@@ -184,10 +188,10 @@ pub(crate) fn is_valid_peer(peer: &Peer) -> bool {
 /// than one node's slice.
 ///
 /// Inside the pool because a peer owns sandbox addresses and nothing else; no
-/// shorter than [`crate::ipam::NODE_PREFIX`] because no node legitimately owns
-/// more than its slice, and a shorter prefix would authorise the peer to speak
-/// for addresses another node hands out.
-fn is_valid_subnet(subnet: &str) -> bool {
+/// shorter than [`crate::ipam::AddressPool::node_prefix`] because no node
+/// legitimately owns more than its slice, and a shorter prefix would authorise
+/// the peer to speak for addresses another node hands out.
+fn is_valid_subnet(subnet: &str, pool: &crate::ipam::AddressPool) -> bool {
     let Some((address, prefix)) = subnet.split_once('/') else {
         return false;
     };
@@ -201,13 +205,7 @@ fn is_valid_subnet(subnet: &str) -> bool {
     let Ok(address) = address.parse::<std::net::Ipv4Addr>() else {
         return false;
     };
-    if !(crate::ipam::NODE_PREFIX..=32).contains(&prefix) {
-        return false;
-    }
-    // Inside the pool: the peer's range must share the pool's prefix bits.
-    let pool = u32::from(crate::ipam::POOL_ADDRESS);
-    let mask = u32::MAX << (32 - crate::ipam::POOL_PREFIX);
-    u32::from(address) & mask == pool & mask
+    (pool.node_prefix()..=32).contains(&prefix) && pool.contains(std::net::IpAddr::V4(address))
 }
 
 /// A WireGuard public key: 32 raw bytes, which base64 spells as exactly 44
@@ -381,7 +379,11 @@ mod tests {
 
     /// Validates and renders, the way `configure` does.
     fn render(identity: &Identity, port: u16, peers: &[Peer]) -> String {
-        let peers: Vec<&Peer> = peers.iter().filter(|peer| is_valid_peer(peer)).collect();
+        let pool = crate::ipam::AddressPool::default();
+        let peers: Vec<&Peer> = peers
+            .iter()
+            .filter(|peer| is_valid_peer(peer, &pool))
+            .collect();
         render_config(identity, port, &peers)
     }
 
@@ -451,7 +453,10 @@ mod tests {
     #[test]
     fn a_peer_may_only_claim_a_range_inside_the_pool() {
         for good in ["10.99.4.0/22", "10.99.8.0/24", "10.99.0.2/32"] {
-            assert!(is_valid_subnet(good), "{good} should be accepted");
+            assert!(
+                is_valid_subnet(good, &Default::default()),
+                "{good} should be accepted"
+            );
         }
         for bad in [
             // Wider than a node's slice: covers ranges other nodes own.
@@ -470,8 +475,21 @@ mod tests {
             "10.99.4.0/22\nAllowedIPs = 0.0.0.0/0",
             "",
         ] {
-            assert!(!is_valid_subnet(bad), "{bad:?} should be refused");
+            assert!(
+                !is_valid_subnet(bad, &Default::default()),
+                "{bad:?} should be refused"
+            );
         }
+    }
+
+    /// With a pool of its own, a slice is that pool's: a /20 of it where
+    /// its slices are 1024 blocks, and nothing of the default pool.
+    #[test]
+    fn a_custom_pool_bounds_what_a_peer_may_claim() {
+        let pool = crate::ipam::AddressPool::new("100.64.0.0/16", "fd00:b070::/48", 1024).unwrap();
+        assert!(is_valid_subnet("100.64.16.0/20", &pool));
+        assert!(!is_valid_subnet("100.64.0.0/19", &pool));
+        assert!(!is_valid_subnet("10.99.4.0/22", &pool));
     }
 
     #[test]

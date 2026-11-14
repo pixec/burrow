@@ -26,7 +26,7 @@ use smoltcp::wire::{
 
 use super::Flow;
 use super::stack::Shared;
-use crate::policy::{self, SANDBOX_POOL, Transport, Verdict};
+use crate::policy::{self, Transport, Verdict};
 
 /// How long a tracked flow outlives its last packet. An established TCP flow
 /// lasts as long as conntrack would plausibly keep it; one that has seen a
@@ -202,6 +202,7 @@ pub struct Router {
     table: Mutex<Table>,
     uplink: RwLock<Option<Weak<dyn Uplink>>>,
     is_sweeping: AtomicBool,
+    pool: RwLock<crate::ipam::AddressPool>,
 }
 
 impl Router {
@@ -210,10 +211,19 @@ impl Router {
         *self.uplink.write().unwrap() = Some(uplink);
     }
 
+    /// Routes the fleet's pool, which the node is given at registration.
+    pub fn set_pool(&self, pool: crate::ipam::AddressPool) {
+        *self.pool.write().unwrap() = pool;
+    }
+
+    pub(super) fn pool(&self) -> crate::ipam::AddressPool {
+        *self.pool.read().unwrap()
+    }
+
     /// Whether the router, rather than the stack, handles a packet from a
     /// guest to `address`.
-    pub(super) fn is_routed(address: Ipv4Addr) -> bool {
-        SANDBOX_POOL.contains(std::net::IpAddr::V4(address))
+    pub(super) fn is_routed(&self, address: Ipv4Addr) -> bool {
+        self.pool().contains(std::net::IpAddr::V4(address))
     }
 
     pub(super) fn attach(self: &Arc<Self>, address: Ipv4Addr, link: Weak<Shared>) {
@@ -300,7 +310,7 @@ impl Router {
             return;
         };
         let key = parsed.key;
-        if !Self::is_routed(key.src.0) {
+        if !self.is_routed(key.src.0) {
             return;
         }
         let Some(to) = self.link(key.dst.0) else {

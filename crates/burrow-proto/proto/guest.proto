@@ -446,6 +446,10 @@ message NetworkConfig {
   // The guest already holds `ip` and `ip6`, because it was suspended under
   // this lease, so only the public side can differ.
   bool is_address_kept = 9;
+  // The fleet's sandbox pools, v4 and v6 CIDRs, routed through the gateways
+  // from the private addresses: a peer knows this sandbox by its lease.
+  string pool = 10;
+  string pool6 = 11;
 }
 
 message PublicAddress {

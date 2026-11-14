@@ -456,6 +456,9 @@ pub struct NodeRegistry {
     /// Capacity handed out since each node's last heartbeat. Cleared when a
     /// fresh status arrives, which already reflects it.
     pending: Mutex<HashMap<String, Reserved>>,
+    /// The fleet's sandbox address pool, which each node's index is a slice
+    /// of.
+    pool: burrow_net::ipam::AddressPool,
 }
 
 /// What placement charges a sandbox whose policy names no disk. The node
@@ -642,6 +645,17 @@ fn disk_note(
 }
 
 impl NodeRegistry {
+    pub fn new(pool: burrow_net::ipam::AddressPool) -> Self {
+        Self {
+            pool,
+            ..Default::default()
+        }
+    }
+
+    pub fn pool(&self) -> burrow_net::ipam::AddressPool {
+        self.pool
+    }
+
     /// Registers a node, returning its id and address-pool index.
     ///
     /// A returning node keeps its index: its sandboxes' addresses derive from
@@ -657,11 +671,11 @@ impl NodeRegistry {
         // already has sandboxes addressed from it, and handing it a different
         // slice would leave those addresses pointing into another node's range.
         if let Some(claimed) = claimed_index
-            && claimed >= burrow_net::ipam::MAX_NODES
+            && claimed >= self.pool.max_nodes()
         {
             return Err(RegisterError::ClaimOutOfRange {
                 index: claimed,
-                max: burrow_net::ipam::MAX_NODES,
+                max: self.pool.max_nodes(),
             });
         }
         let node_id = if info.id.is_empty() {
@@ -687,9 +701,9 @@ impl NodeRegistry {
             // nodes handing out the same guest addresses makes cross-node
             // routing ambiguous and lets one node's sandbox answer for
             // another's.
-            (None, _) => (0..burrow_net::ipam::MAX_NODES)
+            (None, _) => (0..self.pool.max_nodes())
                 .find(|candidate| !taken.contains(candidate))
-                .ok_or(RegisterError::NoAddressSlice(burrow_net::ipam::MAX_NODES))?,
+                .ok_or(RegisterError::NoAddressSlice(self.pool.max_nodes()))?,
         };
         if let Some(claimed) = claimed_index
             && claimed != index
@@ -826,9 +840,7 @@ impl NodeRegistry {
                 node_id: e.info.id.clone(),
                 public_key: e.wireguard_public_key.clone(),
                 endpoint: e.wireguard_endpoint.clone(),
-                subnet: burrow_net::Ipam::for_node(e.index)
-                    .expect("register admits only an index the pool holds")
-                    .subnet(),
+                subnet: self.pool.node_subnet(e.index),
             })
             .collect()
     }
@@ -1641,7 +1653,7 @@ mod tests {
     #[test]
     fn a_full_fleet_refuses_a_new_node_rather_than_sharing_a_slice() {
         let registry = NodeRegistry::default();
-        for index in 0..burrow_net::ipam::MAX_NODES {
+        for index in 0..registry.pool().max_nodes() {
             registry
                 .register(
                     NodeInfo {
@@ -1687,6 +1699,46 @@ mod tests {
 
     /// A claim the pool cannot hold was once silently reassigned, which left
     /// the node's existing sandbox addresses inside another node's range.
+    /// A pool sliced thinner holds more nodes, and each node's mesh subnet is
+    /// its slice of that pool.
+    #[test]
+    fn slices_come_from_the_fleet_pool() {
+        let pool =
+            burrow_net::ipam::AddressPool::new("100.64.0.0/16", "fd00:b070::/48", 1024).unwrap();
+        let registry = NodeRegistry::new(pool);
+        for id in ["a", "b"] {
+            registry
+                .register(
+                    NodeInfo {
+                        id: id.into(),
+                        address: format!("{id}:7071"),
+                        ..Default::default()
+                    },
+                    "key".repeat(15),
+                    String::new(),
+                    None,
+                )
+                .unwrap();
+            registry.touch(id);
+        }
+        let peers = registry.mesh_peers("a");
+        assert_eq!(peers.len(), 1);
+        assert_eq!(peers[0].subnet, "100.64.16.0/20");
+        assert!(matches!(
+            registry.register(
+                NodeInfo {
+                    id: "c".into(),
+                    address: "c:7071".into(),
+                    ..Default::default()
+                },
+                String::new(),
+                String::new(),
+                Some(15),
+            ),
+            Err(RegisterError::ClaimOutOfRange { max: 15, .. })
+        ));
+    }
+
     #[test]
     fn a_claim_past_the_pool_is_refused() {
         let registry = NodeRegistry::default();
@@ -1699,7 +1751,7 @@ mod tests {
                 },
                 String::new(),
                 String::new(),
-                Some(burrow_net::ipam::MAX_NODES),
+                Some(registry.pool().max_nodes()),
             )
             .expect_err("the pool has no such slice");
         assert!(

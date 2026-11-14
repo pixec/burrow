@@ -11,6 +11,7 @@ use tokio::sync::Mutex;
 use tonic::{Status, transport::Channel};
 
 use burrow_common::cpu::cpus_text;
+use burrow_net::ipam::AddressPool;
 use burrow_net::{Ipam, Lease, firewall, tap};
 use burrow_proto::common::v1 as common;
 use burrow_proto::guest::v1::guest_client::GuestClient;
@@ -2648,7 +2649,8 @@ pub struct SandboxManager {
     /// duplicate create is refused during the seconds a VM takes to build,
     /// rather than only before and after.
     creating: Arc<Mutex<std::collections::HashSet<String>>>,
-    ipam: Arc<Mutex<Arc<Ipam>>>,
+    /// `None` until the node is given a slice of the fleet's pool.
+    ipam: Arc<Mutex<Option<Arc<Ipam>>>>,
     /// sandbox id -> published ports.
     ports: Arc<Mutex<HashMap<String, Vec<firewall::PortMap>>>>,
     /// The userspace network stacks of sandboxes without a tap, which the
@@ -2954,12 +2956,7 @@ impl SandboxManager {
             sandboxes: Arc::new(Mutex::new(HashMap::new())),
             disk_admissions: Default::default(),
             creating: Arc::new(Mutex::new(std::collections::HashSet::new())),
-            // Replaced once the orchestrator assigns this node its slice.
-            // Node 0 is the first slice of the pool and always in range, so
-            // the only way this fails is a pool with no slices at all.
-            ipam: Arc::new(Mutex::new(Arc::new(
-                Ipam::for_node(0).expect("node 0 is always inside the address pool"),
-            ))),
+            ipam: Default::default(),
             ports: Arc::new(Mutex::new(HashMap::new())),
             usernets: Default::default(),
             mac_slots: Default::default(),
@@ -3014,53 +3011,80 @@ impl SandboxManager {
         denied
     }
 
-    /// Confines address allocation to this node's slice of the pool.
+    /// Confines address allocation to this node's slice of the fleet's pool.
     ///
-    /// Applied before recovery, so sandboxes reload into the same range they
-    /// were created in. Changing it once sandboxes exist would strand their
-    /// addresses, so that case is refused loudly rather than silently
-    /// producing a node whose sandboxes span two slices.
-    pub async fn set_node_index(&self, index: u32) {
-        if self.ipam.lock().await.node_index() == index {
-            return;
+    /// Applied before recovery from what the node last recorded, so sandboxes
+    /// reload into the same range they were created in, and again at every
+    /// registration. Until then the node has no slice and creates nothing.
+    ///
+    /// Moving to another slice or pool once sandboxes exist would strand
+    /// their addresses, and a pool holding one of the node's own addresses or
+    /// the control plane's would route them into sandboxes, so both are
+    /// refused and the node keeps what it had.
+    pub async fn set_address_slice(&self, pool: AddressPool, index: u32) -> Result<(), String> {
+        let held = self.ipam.lock().await.clone();
+        if let Some(held) = &held
+            && held.pool() == pool
+            && held.node_index() == index
+        {
+            return Ok(());
         }
-        if !self.sandboxes.lock().await.is_empty() {
-            tracing::error!(
-                current = self.ipam.lock().await.node_index(),
-                assigned = index,
-                "cannot move address slice while sandboxes exist; their addresses \
-                 would be stranded and may collide with another node's"
-            );
-            return;
+        let count = self.sandboxes.lock().await.len();
+        if let Some(held) = &held
+            && count > 0
+        {
+            return Err(format!(
+                "this node holds {count} sandboxes addressed from slice {} of the pool {} {}; \
+                 it cannot move to slice {index} of {} {} until they are deleted",
+                held.node_index(),
+                held.pool().cidr(),
+                held.pool().cidr6(),
+                pool.cidr(),
+                pool.cidr6()
+            ));
         }
-        let mut ipam = self.ipam.lock().await;
-        if ipam.node_index() == index {
-            return;
+        let mut own = burrow_net::ipam::host_addresses();
+        own.extend(self.denied_addresses());
+        if let Some(address) = pool.overlap(own) {
+            return Err(format!(
+                "the pool {} {} holds {address}, an address of this node or of the control \
+                 plane, which its sandboxes would take over",
+                pool.cidr(),
+                pool.cidr6()
+            ));
         }
-        // An index past the end of the pool is the orchestrator's mistake, not
-        // this node's: keep the slice already in use and say so, rather than
-        // taking the node down over an assignment it did not choose.
-        let assigned = match Ipam::for_node(index) {
-            Ok(ipam) => ipam,
-            Err(err) => {
-                tracing::error!(
-                    index, %err,
-                    "refusing an address slice this node cannot allocate from; \
-                     keeping the current one"
-                );
-                return;
-            }
-        };
-        *ipam = Arc::new(assigned);
-        tracing::info!(index, subnet = %ipam.subnet(), "address pool assigned");
+        let assigned = Ipam::for_node(pool, index).map_err(|err| err.to_string())?;
+        tracing::info!(index, subnet = %assigned.subnet(), %pool, "address pool assigned");
+        self.usernets.set_pool(pool);
+        *self.ipam.lock().await = Some(Arc::new(assigned));
+        Ok(())
     }
 
-    pub async fn node_index(&self) -> u32 {
-        self.ipam.lock().await.node_index()
+    /// This node's slice of the pool, once it has one.
+    pub async fn address_slice(&self) -> Option<(AddressPool, u32)> {
+        self.ipam
+            .lock()
+            .await
+            .as_ref()
+            .map(|ipam| (ipam.pool(), ipam.node_index()))
     }
 
-    pub async fn subnet(&self) -> String {
-        self.ipam.lock().await.subnet()
+    /// The allocator for this node's slice.
+    async fn ipam(&self) -> Result<Arc<Ipam>, Status> {
+        self.ipam.lock().await.clone().ok_or_else(|| {
+            Status::unavailable(
+                "this node has no sandbox address pool yet; the orchestrator gives it one when \
+                 it registers",
+            )
+        })
+    }
+
+    /// Allocates `id` an address, as the status a create fails with.
+    async fn allocate_lease(&self, id: &str) -> Result<Lease, Status> {
+        self.ipam()
+            .await?
+            .allocate(id)
+            .map_err(|err| Status::resource_exhausted(format!("address allocation: {err}")))
     }
 
     /// Moves a sandbox's files into its jail when a run with `--jailer` off
@@ -3744,15 +3768,25 @@ impl SandboxManager {
         // recovered sandbox keeps the address baked into its snapshot. A
         // duplicate lease may name a tap the accepted sandbox owns; the orphan
         // sweep removes only taps no sandbox kept.
-        if let Err(err) = self.ipam.lock().await.reserve(&row.id, row.lease_block) {
-            let reason = format!(
-                "its address block {} cannot be reserved: {err}",
-                row.lease_block
-            );
-            return self.hold(&row, stored, Some(workdir), false, reason).await;
-        }
-        let Some(lease) = self.ipam.lock().await.get(&row.id) else {
-            self.ipam.lock().await.release(&row.id);
+        let reserved = match self.ipam().await {
+            Ok(ipam) => ipam
+                .reserve(&row.id, row.lease_block)
+                .map(|()| ipam)
+                .map_err(|err| err.to_string()),
+            Err(status) => Err(status.message().to_string()),
+        };
+        let ipam = match reserved {
+            Ok(ipam) => ipam,
+            Err(err) => {
+                let reason = format!(
+                    "its address block {} cannot be reserved: {err}",
+                    row.lease_block
+                );
+                return self.hold(&row, stored, Some(workdir), false, reason).await;
+            }
+        };
+        let Some(lease) = ipam.get(&row.id) else {
+            ipam.release(&row.id);
             let reason = format!("its address block {} has no lease", row.lease_block);
             return self.hold(&row, stored, Some(workdir), false, reason).await;
         };
@@ -4258,12 +4292,11 @@ impl SandboxManager {
     /// also inherits the previous sandbox's live connections, whatever its
     /// own policy says.
     async fn release_lease(&self, id: &str) {
-        let guest_ip = {
-            let ipam = self.ipam.lock().await;
+        let guest_ip = self.ipam.lock().await.clone().and_then(|ipam| {
             let lease = ipam.get(id);
             ipam.release(id);
             lease.map(|lease| (lease.guest_ip, lease.guest_ip6()))
-        };
+        });
         if let Some((guest_ip, guest_ip6)) = guest_ip {
             firewall::flush_conntrack(guest_ip, guest_ip6).await;
         }
@@ -4493,6 +4526,7 @@ impl SandboxManager {
                     guest_ip: own_ip,
                     host_ip6: sandbox.lease.host_ip6(),
                     guest_ip6: sandbox.lease.guest_ip6(),
+                    pool: sandbox.lease.pool(),
                     mode: policy_mode(&record),
                     allow_cidrs: record
                         .policy
@@ -4913,6 +4947,8 @@ impl SandboxManager {
                 gateway6: lease.host_ip6().to_string(),
                 public_addresses,
                 is_address_kept: false,
+                pool: lease.pool().cidr(),
+                pool6: lease.pool().cidr6(),
             }
         })
     }
@@ -6472,7 +6508,8 @@ impl SandboxManager {
         }
         let _charged = self.admit_disk("", "warm a template", estimate).await?;
         let trust = self.warm_trust(template).await;
-        crate::warm::build_warm_snapshot(&self.config, template, shape, &trust)
+        let pool = self.ipam().await?.pool();
+        crate::warm::build_warm_snapshot(&self.config, pool, template, shape, &trust)
             .await
             .map(Some)
     }
@@ -7550,18 +7587,9 @@ impl SandboxManager {
         // Networking: a private /30 on a dedicated tap. The guest configures
         // itself from the kernel command line, so no DHCP client is needed.
         // The address is taken first because the tap is named after it.
-        // Bound to its own statement so the ipam lock is released before the
-        // failure path, which takes it again to hand back the volume claims.
-        let allocated = self.ipam.lock().await.allocate(&id);
-        let lease = match allocated {
+        let lease = match self.allocate_lease(&id).await {
             Ok(lease) => lease,
-            Err(err) => {
-                return Err(guard
-                    .fail(Status::resource_exhausted(format!(
-                        "address allocation: {err}"
-                    )))
-                    .await);
-            }
+            Err(err) => return Err(guard.fail(err).await),
         };
         phases.mark("ipam");
 
@@ -8665,16 +8693,9 @@ impl SandboxManager {
         };
 
         phases.mark("checks");
-        let allocated = self.ipam.lock().await.allocate(&id);
-        let lease = match allocated {
+        let lease = match self.allocate_lease(&id).await {
             Ok(lease) => lease,
-            Err(err) => {
-                return Err(guard
-                    .fail(Status::resource_exhausted(format!(
-                        "address allocation: {err}"
-                    )))
-                    .await);
-            }
+            Err(err) => return Err(guard.fail(err).await),
         };
 
         let stage = async {
@@ -10430,15 +10451,9 @@ impl SandboxManager {
             Ok(sources) => sources,
             Err(err) => return Err(guard.fail(err).await),
         };
-        let lease = match self.ipam.lock().await.allocate(&id) {
+        let lease = match self.allocate_lease(&id).await {
             Ok(lease) => lease,
-            Err(err) => {
-                return Err(guard
-                    .fail(Status::resource_exhausted(format!(
-                        "address allocation: {err}"
-                    )))
-                    .await);
-            }
+            Err(err) => return Err(guard.fail(err).await),
         };
         let stage = async {
             let _ = tokio::fs::remove_dir_all(&workdir).await;
@@ -11497,7 +11512,7 @@ pub(crate) mod tests {
     /// A manager with no VMs behind it. Shared with the node edge's tests,
     /// which need a sandbox map to miss in.
     pub(crate) async fn manager() -> SandboxManager {
-        SandboxManager::new(
+        let manager = SandboxManager::new(
             NodeConfig {
                 data_dir: std::env::temp_dir().join(format!("burrow-fork-{}", std::process::id())),
                 firecracker_bin: "/nonexistent/firecracker".into(),
@@ -11552,7 +11567,48 @@ pub(crate) mod tests {
                 burrow_common::SandboxId::generate()
             )))
             .unwrap(),
-        )
+        );
+        manager
+            .set_address_slice(AddressPool::default(), 0)
+            .await
+            .unwrap();
+        manager
+    }
+
+    /// A node creates nothing until it has a slice, and once it holds
+    /// sandboxes it keeps the slice it has rather than strand them.
+    #[tokio::test]
+    async fn the_address_slice_is_taken_once_and_kept_while_sandboxes_exist() {
+        let mut manager = manager().await;
+        *manager.ipam.lock().await = None;
+        let refused = manager.allocate_lease("sbx_a").await.unwrap_err();
+        assert_eq!(refused.code(), tonic::Code::Unavailable);
+
+        let pool = AddressPool::new("100.64.0.0/16", "fd00:b070::/48", 1024).unwrap();
+        manager.set_address_slice(pool, 1).await.unwrap();
+        assert_eq!(manager.address_slice().await, Some((pool, 1)));
+        let lease = manager.allocate_lease("sbx_a").await.unwrap();
+        assert_eq!(lease.guest_ip, std::net::Ipv4Addr::new(100, 64, 16, 2));
+        assert_eq!(lease.pool(), pool);
+
+        manager
+            .sandboxes
+            .lock()
+            .await
+            .insert("sbx_a".into(), running("sbx_a"));
+        let err = manager
+            .set_address_slice(AddressPool::default(), 1)
+            .await
+            .unwrap_err();
+        assert!(err.contains("cannot move"), "{err}");
+        manager.set_address_slice(pool, 1).await.unwrap();
+        assert_eq!(manager.address_slice().await, Some((pool, 1)));
+
+        manager.sandboxes.lock().await.clear();
+        manager.config.control_plane = vec!["100.64.200.1".parse().unwrap()];
+        let err = manager.set_address_slice(pool, 0).await.unwrap_err();
+        assert!(err.contains("100.64.200.1"), "{err}");
+        assert_eq!(manager.address_slice().await, Some((pool, 1)));
     }
 
     /// A manager whose data directory is its own, for recovery tests.
@@ -11738,7 +11794,7 @@ pub(crate) mod tests {
         let foreign = row(
             id,
             common::SandboxState::Suspended,
-            burrow_net::ipam::BLOCKS_PER_NODE,
+            burrow_net::ipam::DEFAULT_BLOCKS_PER_NODE,
         );
         manager.store.put_sandbox(&foreign).await.unwrap();
 
@@ -12236,7 +12292,10 @@ pub(crate) mod tests {
     /// A registered, running sandbox, for tests about what happens after one
     /// exists rather than about how it was built.
     fn running(id: &str) -> Arc<RunningSandbox> {
-        let lease = Ipam::for_node(0).unwrap().allocate(id).unwrap();
+        let lease = Ipam::for_node(AddressPool::default(), 0)
+            .unwrap()
+            .allocate(id)
+            .unwrap();
         let workdir = std::env::temp_dir().join(format!("burrow-test-{id}"));
         Arc::new(RunningSandbox {
             id: id.into(),
@@ -12902,7 +12961,7 @@ pub(crate) mod tests {
         // The registry and the allocator as a warm create leaves them: the
         // record is registered and its lease is held.
         let (id, block) = (sandbox.id(), sandbox.lease.block);
-        manager.ipam.lock().await.reserve(id, block).unwrap();
+        manager.ipam().await.unwrap().reserve(id, block).unwrap();
         manager
             .sandboxes
             .lock()
@@ -12927,7 +12986,7 @@ pub(crate) mod tests {
         // The lease goes back last, after the registry entry and the firewall
         // re-render, so it is the condition to wait on.
         for _ in 0..200 {
-            if manager.ipam.lock().await.get("sbx_no_agent").is_none() {
+            if manager.ipam().await.unwrap().get("sbx_no_agent").is_none() {
                 break;
             }
             tokio::time::sleep(std::time::Duration::from_millis(10)).await;
@@ -12937,7 +12996,7 @@ pub(crate) mod tests {
             "a sandbox whose agent never came up was left registered"
         );
         assert!(
-            manager.ipam.lock().await.get("sbx_no_agent").is_none(),
+            manager.ipam().await.unwrap().get("sbx_no_agent").is_none(),
             "its address lease was not released"
         );
     }
@@ -12947,7 +13006,10 @@ pub(crate) mod tests {
     }
 
     fn sandbox_in(workdir: std::path::PathBuf) -> RunningSandbox {
-        let lease = Ipam::for_node(0).unwrap().allocate("sbx_a").unwrap();
+        let lease = Ipam::for_node(AddressPool::default(), 0)
+            .unwrap()
+            .allocate("sbx_a")
+            .unwrap();
         RunningSandbox {
             id: "sbx_a".into(),
             template: "default".into(),

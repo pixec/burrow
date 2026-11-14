@@ -11,14 +11,6 @@ use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 
 use crate::firewall::{DNS_PORT, Mode, PROXY_PORT, Protocol};
 
-/// The renderer's validated form of [`crate::firewall::SANDBOX_CIDR`]. Nothing
-/// reaches the nft script that was not parsed first, a constant included, so
-/// this is built from [`crate::ipam`]'s numbers rather than from the string.
-pub(crate) const SANDBOX_POOL: Cidr = Cidr {
-    addr: IpAddr::V4(crate::ipam::POOL_ADDRESS),
-    prefix: crate::ipam::POOL_PREFIX,
-};
-
 /// Link-local space, home to `169.254.169.254`: on EC2, GCP, Azure and most
 /// other clouds, the instance's own credentials are an unauthenticated HTTP
 /// GET away at that address. Denied to every sandbox regardless of egress
@@ -556,6 +548,9 @@ pub struct NodeDenials {
     /// gateway's services; a userspace stack dials outward from the node, so
     /// it must refuse these itself, loopback included.
     pub node: Vec<IpAddr>,
+    /// The fleet's sandbox addresses, which open mode reaches no further into
+    /// than its peers.
+    pub pool: crate::ipam::AddressPool,
 }
 
 impl NodeDenials {
@@ -639,7 +634,7 @@ pub fn decide(
 
     let v4 = match destination {
         IpAddr::V4(v4) => v4,
-        IpAddr::V6(v6) => return decide_v6(rules, v6, transport, port),
+        IpAddr::V6(v6) => return decide_v6(rules, node.pool, v6, transport, port),
     };
     if METADATA_CIDR.contains(destination) {
         return Verdict::Deny("destination is an internal or metadata address");
@@ -655,7 +650,7 @@ pub fn decide(
         return Verdict::Direct;
     }
     if rules.mode == Mode::Open {
-        if SANDBOX_POOL.contains(IpAddr::V4(destination)) {
+        if node.pool.contains(IpAddr::V4(destination)) {
             return Verdict::Deny("destination is another sandbox");
         }
         return Verdict::Direct;
@@ -710,7 +705,13 @@ pub fn decide_peer(sender: Option<Verdict>, receiver: Option<&Rules>, source: Ip
 /// The sandbox chain's v6 rules: link-local denied in every mode, then the
 /// policy's own denials, and only open mode forwarding at all, never into the
 /// fleet's v6 pool.
-fn decide_v6(rules: &Rules, destination: Ipv6Addr, transport: Transport, port: u16) -> Verdict {
+fn decide_v6(
+    rules: &Rules,
+    pool: crate::ipam::AddressPool,
+    destination: Ipv6Addr,
+    transport: Transport,
+    port: u16,
+) -> Verdict {
     if (destination.segments()[0] & 0xffc0) == 0xfe80 {
         return Verdict::Deny("destination is an internal or metadata address");
     }
@@ -726,7 +727,7 @@ fn decide_v6(rules: &Rules, destination: Ipv6Addr, transport: Transport, port: u
     if rules.mode != Mode::Open {
         return Verdict::Deny("ipv6 egress is open mode only");
     }
-    if destination.segments()[..3] == crate::ipam::POOL6_ADDRESS.segments()[..3] {
+    if pool.contains(IpAddr::V6(destination)) {
         return Verdict::Deny("destination is another sandbox");
     }
     Verdict::Direct
@@ -750,6 +751,7 @@ mod tests {
             guest_ip: GUEST,
             host_ip6: "fd99:b070:0:1::1".parse().unwrap(),
             guest_ip6: "fd99:b070:0:1::2".parse().unwrap(),
+            pool: Default::default(),
             mode,
             allow_cidrs: vec![],
             deny_cidrs: vec![],
@@ -993,6 +995,7 @@ mod tests {
         let node_denials = NodeDenials {
             control_plane: vec![CONTROL],
             node: vec![NODE],
+            ..Default::default()
         };
         let mut checked = 0;
         for sandbox in [

@@ -1356,6 +1356,43 @@ impl Store {
         Ok(done == 1)
     }
 
+    /// The fleet's sandbox address pool: its v4 and v6 CIDRs and the blocks
+    /// in each node's slice.
+    pub async fn address_pool(&self) -> Result<(String, String, u32)> {
+        let (v4, v6, blocks): (String, String, i64) = on_pool!(self, pool => sqlx::query_as(
+            "SELECT v4, v6, blocks_per_node FROM address_pool WHERE id=1",
+        )
+        .fetch_one(pool)
+        .await)?;
+        Ok((v4, v6, blocks as u32))
+    }
+
+    /// Changes the fleet's sandbox address pool, unless a sandbox is placed
+    /// anywhere, since every one has an address from the pool it replaces.
+    /// Every node is forgotten with it, so each registers again and is given
+    /// the new one. False, changing nothing, while a sandbox is placed.
+    pub async fn change_address_pool(&self, v4: &str, v6: &str, blocks: u32) -> Result<bool> {
+        on_pool!(self, pool => {
+            let mut tx = pool.begin().await?;
+            let (placed,): (i64,) = sqlx::query_as("SELECT COUNT(*) FROM placements")
+                .fetch_one(&mut *tx)
+                .await?;
+            if placed > 0 {
+                tx.rollback().await?;
+                return Ok(false);
+            }
+            sqlx::query("UPDATE address_pool SET v4=$1, v6=$2, blocks_per_node=$3 WHERE id=1")
+                .bind(v4)
+                .bind(v6)
+                .bind(i64::from(blocks))
+                .execute(&mut *tx)
+                .await?;
+            sqlx::query("DELETE FROM nodes").execute(&mut *tx).await?;
+            tx.commit().await?;
+        });
+        Ok(true)
+    }
+
     /// Starts a leader's term, returning its epoch.
     pub async fn next_leader_epoch(&self) -> Result<i64> {
         let (epoch,): (i64,) = on_pool!(self, pool => sqlx::query_as(
@@ -2480,6 +2517,52 @@ mod tests {
         let now = store.get_placement("a").await.unwrap().unwrap();
         assert_eq!(now.node_id, "n2");
         assert!(store.delete_placement_if("a", now.version).await.unwrap());
+    }
+
+    /// A store starts on the pool fleets had before it was configurable, and
+    /// changes it only while no sandbox is placed, forgetting every node.
+    #[tokio::test]
+    async fn the_address_pool_changes_only_while_nothing_is_placed() {
+        let store = Store::open_in_memory().await.unwrap();
+        assert_eq!(
+            store.address_pool().await.unwrap(),
+            ("10.99.0.0/16".into(), "fd99:b070::/48".into(), 256)
+        );
+        let node = NodeRow {
+            id: "n1".into(),
+            ..Default::default()
+        };
+        store.register_node(&node, None, 8).await.unwrap();
+        store
+            .put_placement(&PlacementRow {
+                id: "sbx_a".into(),
+                node_id: "n1".into(),
+                record: vec![],
+                version: 0,
+            })
+            .await
+            .unwrap();
+        assert!(
+            !store
+                .change_address_pool("100.64.0.0/16", "fd00::/48", 1024)
+                .await
+                .unwrap()
+        );
+        assert_eq!(store.address_pool().await.unwrap().2, 256);
+        assert_eq!(store.list_nodes().await.unwrap().len(), 1);
+
+        store.delete_placement("sbx_a").await.unwrap();
+        assert!(
+            store
+                .change_address_pool("100.64.0.0/16", "fd00::/48", 1024)
+                .await
+                .unwrap()
+        );
+        assert_eq!(
+            store.address_pool().await.unwrap(),
+            ("100.64.0.0/16".into(), "fd00::/48".into(), 1024)
+        );
+        assert!(store.list_nodes().await.unwrap().is_empty());
     }
 
     /// The reservation checks a node's capacity, which carries its

@@ -123,6 +123,35 @@ struct Args {
         env = "BURROW_NODE_CONCURRENCY"
     )]
     node_concurrency: u32,
+    /// The fleet's sandbox address pool: one /30 per sandbox, sliced between
+    /// nodes. Private: inside 10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16 or
+    /// 100.64.0.0/10, a /10 at most, and overlapping no node's own network.
+    /// Nodes are given it at registration. Kept in the store, and changed only
+    /// while no sandbox is placed anywhere: startup is refused otherwise.
+    /// Every replica must be given the same one.
+    #[arg(
+        long,
+        default_value = burrow_net::ipam::DEFAULT_POOL,
+        env = "BURROW_SANDBOX_POOL"
+    )]
+    sandbox_pool: String,
+    /// The IPv6 pool beside it: a ULA prefix with a /64 for every /30 of
+    /// --sandbox-pool, so a /48 serves a /16 and a /44 a /10.
+    #[arg(
+        long,
+        default_value = burrow_net::ipam::DEFAULT_POOL6,
+        env = "BURROW_SANDBOX_POOL6"
+    )]
+    sandbox_pool6: String,
+    /// /30 blocks in each node's slice of --sandbox-pool, a power of two: the
+    /// most sandboxes one node holds (one fewer on the first node). The pool
+    /// holds as many nodes as it has slices, less the top two blocks.
+    #[arg(
+        long,
+        default_value_t = burrow_net::ipam::DEFAULT_BLOCKS_PER_NODE,
+        env = "BURROW_SANDBOX_POOL_NODE_BLOCKS"
+    )]
+    sandbox_pool_node_blocks: u32,
 }
 
 pub struct OrchestratorState {
@@ -169,6 +198,45 @@ pub struct OrchestratorState {
     pub admission: admission::Admission,
 }
 
+/// Makes `pool` the fleet's sandbox address pool, refusing when the store
+/// records another and a sandbox is placed on it: every one of them has an
+/// address from the pool it records.
+async fn adopt_address_pool(
+    store: &burrow_store::Store,
+    pool: burrow_net::ipam::AddressPool,
+) -> anyhow::Result<()> {
+    let (v4, v6, blocks) = store
+        .address_pool()
+        .await
+        .context("reading the sandbox address pool")?;
+    let recorded = burrow_net::ipam::AddressPool::new(&v4, &v6, blocks)
+        .map_err(|err| anyhow::anyhow!("the recorded sandbox address pool: {err}"))?;
+    if recorded == pool {
+        return Ok(());
+    }
+    let changed = store
+        .change_address_pool(&pool.cidr(), &pool.cidr6(), pool.blocks_per_node())
+        .await
+        .context("changing the sandbox address pool")?;
+    if !changed {
+        anyhow::bail!(
+            "the fleet's sandbox address pool is {v4} {v6} with {blocks} blocks per node, and \
+             sandboxes are placed on it; {} {} with {} blocks per node can take its place only \
+             once every sandbox is deleted. Start with the recorded pool, or delete every \
+             sandbox first",
+            pool.cidr(),
+            pool.cidr6(),
+            pool.blocks_per_node()
+        );
+    }
+    tracing::warn!(
+        from = %recorded,
+        to = %pool,
+        "changed the fleet's sandbox address pool; every node registers again and is given it"
+    );
+    Ok(())
+}
+
 #[derive(Clone)]
 struct NodeRegistryService(Arc<OrchestratorState>);
 
@@ -196,13 +264,14 @@ impl NodeRegistry for NodeRegistryService {
             // The slice is chosen by the store, so two replicas registering
             // two nodes at once cannot hand out the same one.
             Some(store) => {
+                let max_nodes = self.0.nodes.pool().max_nodes();
                 if let Some(claimed) = req.claimed_node_index
-                    && claimed >= burrow_net::ipam::MAX_NODES
+                    && claimed >= max_nodes
                 {
                     return Err(Status::invalid_argument(
                         crate::registry::RegisterError::ClaimOutOfRange {
                             index: claimed,
-                            max: burrow_net::ipam::MAX_NODES,
+                            max: max_nodes,
                         }
                         .to_string(),
                     ));
@@ -218,15 +287,12 @@ impl NodeRegistry for NodeRegistryService {
                     &req.wireguard_endpoint,
                 );
                 let index = store
-                    .register_node(&row, req.claimed_node_index, burrow_net::ipam::MAX_NODES)
+                    .register_node(&row, req.claimed_node_index, max_nodes)
                     .await
                     .map_err(|err| Status::unavailable(format!("recording the node: {err}")))?
                     .ok_or_else(|| {
                         Status::resource_exhausted(
-                            crate::registry::RegisterError::NoAddressSlice(
-                                burrow_net::ipam::MAX_NODES,
-                            )
-                            .to_string(),
+                            crate::registry::RegisterError::NoAddressSlice(max_nodes).to_string(),
                         )
                     })?;
                 if let Some(claimed) = req.claimed_node_index
@@ -268,6 +334,7 @@ impl NodeRegistry for NodeRegistryService {
                 })?,
         };
         tracing::info!(node_id, node_index, "node registered");
+        let pool = self.0.nodes.pool();
 
         // Adopt whatever the node currently has. Done off the registration
         // path because the node is mid-call to us and is not yet serving this
@@ -280,6 +347,11 @@ impl NodeRegistry for NodeRegistryService {
             heartbeat_interval_secs: HEARTBEAT_INTERVAL.as_secs() as u32,
             node_index,
             access_keys: access_keys(&self.0),
+            address_pool: Some(nodepb::AddressPool {
+                v4: pool.cidr(),
+                v6: pool.cidr6(),
+                blocks_per_node: pool.blocks_per_node(),
+            }),
         }))
     }
 
@@ -875,6 +947,15 @@ async fn run(args: Args) -> anyhow::Result<()> {
                 })?,
         )),
     };
+    let pool = burrow_net::ipam::AddressPool::new(
+        &args.sandbox_pool,
+        &args.sandbox_pool6,
+        args.sandbox_pool_node_blocks,
+    )
+    .map_err(|err| anyhow::anyhow!("--sandbox-pool: {err}"))?;
+    if let Some(store) = &store {
+        adopt_address_pool(store, pool).await?;
+    }
     let sandboxes = match &store {
         Some(store) => {
             let key = args
@@ -918,7 +999,7 @@ async fn run(args: Args) -> anyhow::Result<()> {
             .min(u32::MAX as u64) as u32,
     };
     let state = Arc::new(OrchestratorState {
-        nodes: registry::NodeRegistry::default(),
+        nodes: registry::NodeRegistry::new(pool),
         sandboxes,
         leader: leader::Leader::spawn(store.clone()),
         events: events::EventLog::new(store.clone()),

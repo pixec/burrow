@@ -189,12 +189,11 @@ pub struct Network {
     /// Held beside the private addresses, the first of each family the source
     /// of its default route.
     pub public: Vec<(IpAddr, u8)>,
+    /// The fleet's sandbox pools, kept on the private addresses: a peer or the
+    /// node knows this sandbox by its lease, not by a public address.
+    pub pool: Option<(Ipv4Addr, u8)>,
+    pub pool6: Option<(Ipv6Addr, u8)>,
 }
-
-/// The fleet's sandbox pools, kept on the private addresses: a peer or the
-/// node knows this sandbox by its lease, not by a public address.
-const POOL: (Ipv4Addr, u8) = (Ipv4Addr::new(10, 99, 0, 0), 16);
-const POOL6: (Ipv6Addr, u8) = (Ipv6Addr::new(0xfd99, 0xb070, 0, 0, 0, 0, 0, 0), 48);
 
 /// Makes the interface hold exactly `network`, changing only what differs.
 ///
@@ -342,12 +341,14 @@ fn plan(current: &Current, network: &Network, index: u32, is_private: bool) -> P
             oif: Some(index),
             source: source(true),
         });
-        wanted_routes.push(Route {
-            destination: Some((IpAddr::V4(POOL.0), POOL.1)),
-            gateway: Some(IpAddr::V4(gateway)),
-            oif: Some(index),
-            source: Some(IpAddr::V4(network.ip)),
-        });
+        if let Some((pool, prefix)) = network.pool {
+            wanted_routes.push(Route {
+                destination: Some((IpAddr::V4(pool), prefix)),
+                gateway: Some(IpAddr::V4(gateway)),
+                oif: Some(index),
+                source: Some(IpAddr::V4(network.ip)),
+            });
+        }
     }
     if let Some(gateway6) = network.gateway6 {
         wanted_routes.push(Route {
@@ -357,9 +358,9 @@ fn plan(current: &Current, network: &Network, index: u32, is_private: bool) -> P
             source: source(false),
         });
         // Source selection prefers the lease's ULA for the pool by itself.
-        if network.ip6.is_some() {
+        if let (Some(_), Some((pool6, prefix))) = (network.ip6, network.pool6) {
             wanted_routes.push(Route {
-                destination: Some((IpAddr::V6(POOL6.0), POOL6.1)),
+                destination: Some((IpAddr::V6(pool6), prefix)),
                 gateway: Some(IpAddr::V6(gateway6)),
                 oif: Some(index),
                 source: None,
@@ -684,6 +685,8 @@ mod tests {
         IpAddr::V6(Ipv6Addr::new(0xfd99, 0xb070, 0, 1, 0, 0, 0, last))
     }
 
+    const POOL: (Ipv4Addr, u8) = (Ipv4Addr::new(10, 99, 0, 0), 16);
+
     fn network(third: u8, public: Vec<(IpAddr, u8)>) -> Network {
         Network {
             ip: Ipv4Addr::new(10, 99, third, 2),
@@ -695,6 +698,8 @@ mod tests {
             )),
             gateway6: Some(Ipv6Addr::new(0xfd99, 0xb070, 0, third.into(), 0, 0, 0, 1)),
             public,
+            pool: Some(POOL),
+            pool6: Some((Ipv6Addr::new(0xfd99, 0xb070, 0, 0, 0, 0, 0, 0), 48)),
         }
     }
 

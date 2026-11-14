@@ -603,6 +603,7 @@ pub async fn clone_warm_disk(
 /// nobody is watching be the only one running unjailed and uncapped.
 pub async fn build_warm_snapshot(
     config: &NodeConfig,
+    pool: burrow_net::ipam::AddressPool,
     template: &str,
     shape: Shape,
     trust: &Trust,
@@ -688,7 +689,7 @@ pub async fn build_warm_snapshot(
 
     // A throwaway lease: the address only has to be valid enough for the guest
     // to finish booting, and every clone is re-addressed on resume anyway.
-    let lease = burrow_net::ipam::warm_lease();
+    let lease = pool.warm_lease();
     burrow_net::tap::delete(WARM_TAP).await;
     let tap = burrow_net::tap::create_named(WARM_TAP, &lease)
         .await
@@ -743,7 +744,7 @@ pub async fn build_warm_snapshot(
             // page-fault handler records faults, or replays a plan.
             if capabilities.is_lazy_memory_supported
                 && let Err(err) =
-                    profile_restore(&vm_id, &run_dir, &backend, config, shape, trust).await
+                    profile_restore(&vm_id, &run_dir, &backend, config, &pool, shape, trust).await
             {
                 tracing::warn!(template, %err, "could not record a prefetch plan");
             }
@@ -928,6 +929,8 @@ async fn exercise_agent(
                 gateway6: lease.host_ip6().to_string(),
                 public_addresses: Vec::new(),
                 is_address_kept: false,
+                pool: lease.pool().cidr(),
+                pool6: lease.pool().cidr6(),
             }),
             trust.ca.clone(),
             trust.bundles.clone(),
@@ -979,6 +982,7 @@ async fn profile_restore(
     dir: &Path,
     backend: &burrow_vmm::Backend,
     config: &NodeConfig,
+    pool: &burrow_net::ipam::AddressPool,
     shape: Shape,
     trust: &Trust,
 ) -> Result<(), Status> {
@@ -986,7 +990,7 @@ async fn profile_restore(
     // Not the snapshot's own address: a clone's handshake re-addresses its
     // guest, and a plan recorded without that would leave the code doing it
     // to fault in on every create.
-    let lease = burrow_net::ipam::profiling_lease();
+    let lease = pool.profiling_lease();
     burrow_net::tap::delete(WARM_TAP).await;
     let tap = burrow_net::tap::create_named(WARM_TAP, &lease)
         .await

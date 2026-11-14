@@ -375,6 +375,19 @@ message RegisterResponse {
   // Keys Access tokens are signed with. Empty when the orchestrator issues
   // none, and then the node refuses every Access call.
   repeated AccessKey access_keys = 4;
+  // The fleet's sandbox address pool, which `node_index` is a slice of. Every
+  // node must hold the same one: the mesh, the firewall and every guest's
+  // routes assume it.
+  AddressPool address_pool = 5;
+}
+
+// The fleet's sandbox addresses: one /30 per sandbox out of `v4`, one /64 per
+// sandbox out of `v6` indexed by the same block, `blocks_per_node` blocks to
+// each node's slice.
+message AddressPool {
+  string v4 = 1;
+  string v6 = 2;
+  uint32 blocks_per_node = 3;
 }
 
 // An orchestrator's public key for Access tokens, named by the `kid` in the

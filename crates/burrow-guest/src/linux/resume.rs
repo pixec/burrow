@@ -412,9 +412,25 @@ pub async fn apply_network(
                 Ok((parsed, address.prefix_len.clamp(1, width) as u8))
             })
             .collect::<anyhow::Result<Vec<_>>>()?,
+        pool: parse_cidr(&config.pool)?,
+        pool6: parse_cidr(&config.pool6)?,
     };
     let dns = (!config.dns.is_empty()).then_some(config.dns.as_str());
     crate::linux::netconf::apply(&network, is_private, dns).await
+}
+
+/// A pool the handshake names, `None` when it names none.
+fn parse_cidr<T: std::str::FromStr>(text: &str) -> anyhow::Result<Option<(T, u8)>>
+where
+    T::Err: std::error::Error + Send + Sync + 'static,
+{
+    if text.is_empty() {
+        return Ok(None);
+    }
+    let (address, prefix) = text
+        .split_once('/')
+        .ok_or_else(|| anyhow::anyhow!("{text} is not a CIDR"))?;
+    Ok(Some((address.parse()?, prefix.parse()?)))
 }
 
 #[cfg(test)]

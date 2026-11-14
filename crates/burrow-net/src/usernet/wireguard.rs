@@ -115,7 +115,11 @@ impl Mesh {
     /// heartbeat restating the fleet does not renegotiate every session.
     pub async fn configure(&self, peers: &[Peer]) {
         let mut wanted = Vec::new();
-        for peer in peers.iter().filter(|peer| crate::mesh::is_valid_peer(peer)) {
+        let pool = self.router.pool();
+        for peer in peers
+            .iter()
+            .filter(|peer| crate::mesh::is_valid_peer(peer, &pool))
+        {
             let (Some(public_key), Some(subnet)) =
                 (decode_key(&peer.public_key), parse_cidr(&peer.subnet))
             else {
