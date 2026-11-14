@@ -35,11 +35,11 @@
 //! ```text
 //! sandboxes/<id>/manifest.json
 //! sandboxes/<id>/<generation>/<state>
-//! sandboxes/<id>/<generation>/<memory>.index.json
-//! sandboxes/<id>/<generation>/<disk>.index.json
+//! sandboxes/<id>/<generation>/<memory>.caibx
+//! sandboxes/<id>/<generation>/<disk>.caibx
 //! sandboxes/<id>/<generation>/command-logs.json
-//! images/<digest>.index.json
-//! chunks/<sha256>
+//! images/<digest>.caibx
+//! chunks.castr/<first 4 hex>/<sha256>.cacnk
 //! blobs/<digest>
 //! ```
 //!
@@ -215,7 +215,7 @@ fn generation_key(id: &str, generation: u64, file: &str) -> String {
 }
 
 fn index_key(id: &str, generation: u64, file: &str) -> String {
-    generation_key(id, generation, &format!("{file}.index.json"))
+    generation_key(id, generation, &format!("{file}.caibx"))
 }
 
 /// Which version of a file this is, cheaply. Firecracker writes a fresh
@@ -288,7 +288,6 @@ impl LocalState {
             .digests()
             .chain(self.disk_index.digests())
             .chain(self.logs.values().flat_map(|log| log.index.digests()))
-            .map(str::to_string)
             .collect()
     }
 }
@@ -486,11 +485,7 @@ pub async fn upload(
             .await?;
     }
     for (file, index) in [(memory_file, &memory), (disk_file, &disk_index)] {
-        let json = serde_json::to_vec(index)
-            .map_err(|err| Status::internal(format!("encoding an index: {err}")))?;
-        store
-            .put_bytes(&index_key(&id, generation, file), json)
-            .await?;
+        crate::chunks::put_index(store, &index_key(&id, generation, file), index).await?;
     }
     let indexes: std::collections::BTreeMap<&String, &ImageIndex> =
         logs.iter().map(|(name, log)| (name, &log.index)).collect();
@@ -754,8 +749,8 @@ pub async fn stage(
         rootfs,
         store.get_to_file(&vmstate_key, &vmstate_path),
         store.get_to_file(&working_set_key, &working_set_path),
-        crate::snapshot::read_index(store, &disk_key),
-        crate::snapshot::read_index(store, &memory_key),
+        crate::chunks::read_index(store, &disk_key),
+        crate::chunks::read_index(store, &memory_key),
     );
     kernel?;
     let image = image?;
@@ -881,16 +876,12 @@ pub async fn upload_disk_checkpoint(
         _ => Some((image.path.as_path(), &image.index)),
     };
     let mut known = known;
-    known.extend(image.index.digests().map(str::to_string));
+    known.extend(image.index.digests());
     let disk_index = crate::chunks::put_disk_since(store, capture, base, &known).await?;
 
     let now_ms = burrow_common::unix_now_ms();
     let generation = (now_ms as u64).max(previous.map_or(0, |p| p.manifest.generation + 1));
-    let json = serde_json::to_vec(&disk_index)
-        .map_err(|err| Status::internal(format!("encoding an index: {err}")))?;
-    store
-        .put_bytes(&index_key(&id, generation, disk_file), json)
-        .await?;
+    crate::chunks::put_index(store, &index_key(&id, generation, disk_file), &disk_index).await?;
     let mut local = LocalState {
         manifest: Manifest {
             format: FORMAT,
@@ -960,7 +951,7 @@ pub async fn stage_disk(
     let (kernel, image, disk_index) = tokio::join!(
         snapshots.fetch_blob(store, &manifest.kernel_digest, &kernel_path),
         rootfs,
-        crate::snapshot::read_index(store, &disk_key),
+        crate::chunks::read_index(store, &disk_key),
     );
     kernel?;
     let image = image?;
@@ -1136,10 +1127,9 @@ pub async fn collect_garbage(
             .chain([crate::rootdisk::ROOT_DISK])
         {
             if let Some(index) =
-                crate::snapshot::read_index(store, &index_key(id, manifest.generation, file))
-                    .await?
+                crate::chunks::read_index(store, &index_key(id, manifest.generation, file)).await?
             {
-                referenced.extend(index.digests().map(str::to_string));
+                referenced.extend(index.digests());
             }
         }
         if let Some(bytes) = store
@@ -1152,11 +1142,7 @@ pub async fn collect_garbage(
                         "sandbox {id}'s command log index is unreadable: {err}"
                     ))
                 })?;
-            referenced.extend(
-                logs.values()
-                    .flat_map(ImageIndex::digests)
-                    .map(str::to_string),
-            );
+            referenced.extend(logs.values().flat_map(ImageIndex::digests));
         }
         current.insert(id.to_string(), manifest.generation);
     }

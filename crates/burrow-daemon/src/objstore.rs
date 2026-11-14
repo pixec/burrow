@@ -798,7 +798,7 @@ mod tests {
         for digest in index.digests() {
             assert!(
                 store
-                    .exists(&crate::chunks::chunk_key(digest))
+                    .exists(&crate::chunks::chunk_key(&digest))
                     .await
                     .unwrap()
             );

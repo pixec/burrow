@@ -217,7 +217,7 @@ fn blob_key(digest: &str) -> String {
 }
 
 fn index_key(id: &str, file: &str) -> String {
-    remote_key(id, &format!("{file}.index.json"))
+    remote_key(id, &format!("{file}.caibx"))
 }
 
 /// One command log's index, beside the images' so the chunk sweep finds it.
@@ -505,16 +505,12 @@ impl SnapshotStore {
             &Default::default(),
         )
         .await?;
-        let json = serde_json::to_vec(&index)
-            .map_err(|err| Status::internal(format!("encoding an index: {err}")))?;
-        remote.put_bytes(&index_key(id, memory), json).await?;
+        crate::chunks::put_index(remote, &index_key(id, memory), &index).await?;
         let disk = crate::rootdisk::ROOT_DISK;
         let index =
             crate::chunks::put_disk(remote, &dir.join(disk), Some(&image), &Default::default())
                 .await?;
-        let json = serde_json::to_vec(&index)
-            .map_err(|err| Status::internal(format!("encoding an index: {err}")))?;
-        remote.put_bytes(&index_key(id, disk), json).await?;
+        crate::chunks::put_index(remote, &index_key(id, disk), &index).await?;
         let logs = dir.join(COMMAND_LOGS);
         let names = log_names(&logs);
         for name in &names {
@@ -526,9 +522,7 @@ impl SnapshotStore {
                 &Default::default(),
             )
             .await?;
-            let json = serde_json::to_vec(&index)
-                .map_err(|err| Status::internal(format!("encoding an index: {err}")))?;
-            remote.put_bytes(&log_index_key(id, name), json).await?;
+            crate::chunks::put_index(remote, &log_index_key(id, name), &index).await?;
         }
         let json = serde_json::to_vec(&names)
             .map_err(|err| Status::internal(format!("encoding log names: {err}")))?;
@@ -705,7 +699,7 @@ impl SnapshotStore {
             return Err(missing(file));
         }
         for name in remote_log_names(remote, id).await? {
-            let index = read_index(remote, &log_index_key(id, &name))
+            let index = crate::chunks::read_index(remote, &log_index_key(id, &name))
                 .await?
                 .ok_or_else(|| missing(&name))?;
             create_private_dir(&dir.join(COMMAND_LOGS))
@@ -713,12 +707,12 @@ impl SnapshotStore {
             crate::chunks::get_image(remote, &index, &dir.join(COMMAND_LOGS).join(&name)).await?;
         }
         let disk = crate::rootdisk::ROOT_DISK;
-        let index = read_index(remote, &index_key(id, disk))
+        let index = crate::chunks::read_index(remote, &index_key(id, disk))
             .await?
             .ok_or_else(|| missing(disk))?;
         crate::rootdisk::materialise(remote, &index, Some(&image), &dir.join(disk)).await?;
         let memory_file = memory_file(layout)?;
-        read_index(remote, &index_key(id, memory_file))
+        crate::chunks::read_index(remote, &index_key(id, memory_file))
             .await?
             .ok_or_else(|| missing(memory_file))
     }
@@ -780,11 +774,11 @@ impl SnapshotStore {
                 }
                 continue;
             }
-            if !key.ends_with(".index.json") {
+            if !key.ends_with(".caibx") {
                 continue;
             }
-            if let Some(index) = read_index(remote, &key).await? {
-                out.extend(index.digests().map(str::to_string));
+            if let Some(index) = crate::chunks::read_index(remote, &key).await? {
+                out.extend(index.digests());
             }
         }
         Ok(())
@@ -1197,18 +1191,6 @@ pub async fn put_blob(
         remote.put_file(&key, path).await?;
     }
     Ok(digest.to_string())
-}
-
-pub async fn read_index(
-    remote: &crate::objstore::ObjectStore,
-    key: &str,
-) -> Result<Option<crate::chunks::ImageIndex>, Status> {
-    let Some(bytes) = remote.get_bytes(key).await? else {
-        return Ok(None);
-    };
-    serde_json::from_slice(&bytes)
-        .map(Some)
-        .map_err(|err| Status::data_loss(format!("index {key} is unreadable: {err}")))
 }
 
 /// Whether a path was last written longer ago than `age`.

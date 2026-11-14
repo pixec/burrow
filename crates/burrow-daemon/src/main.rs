@@ -5,6 +5,7 @@
 mod access;
 mod blobs;
 mod ca;
+mod caibx;
 mod chunks;
 mod cmdlogs;
 mod cpuid;

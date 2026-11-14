@@ -1,8 +1,11 @@
 //! Disk and memory images in the object store, as content-addressed chunks.
 //!
-//! An image is cut into fixed chunks, each stored once under its digest at
-//! `chunks/<sha256>`, and described by an index naming the digest of every
-//! chunk that holds data. Two things follow:
+//! An image is cut into fixed chunks, each stored once under its SHA-256,
+//! compressed, and described by an index naming the digest of every chunk.
+//! The store is laid out as casync lays one out, chunks at
+//! `chunks.castr/<first 4 hex>/<sha256>.cacnk` as zstd frames and indexes in
+//! casync's format ([`crate::caibx`]), so casync and desync can rebuild an
+//! image from it without Burrow. Two things follow from the chunking:
 //!
 //! - **Uploads cost what changed.** A sandbox suspended a second time shares
 //!   almost every chunk with its first suspend, and a snapshot shares most of
@@ -37,6 +40,10 @@ pub const CHUNK_SIZE: u64 = 1 << 20;
 /// Requests in flight per image, for uploads and background fills alike.
 const PARALLELISM: usize = 8;
 
+/// zstd's default: most of what the higher levels save at a fraction of their
+/// CPU, and decompressing it is cheap on the page-fault path.
+const LEVEL: i32 = 3;
+
 /// The granularity zeroes are left as holes at. A guest page.
 const PAGE: usize = 4096;
 
@@ -50,18 +57,37 @@ pub struct ImageIndex {
     pub size: u64,
     pub chunk_size: u64,
     /// Chunk number to digest, for every chunk that holds data. A chunk absent
-    /// here is zeroes.
+    /// here is zeroes, stored as the zero chunk but never fetched.
     pub chunks: BTreeMap<u64, String>,
 }
 
 impl ImageIndex {
-    fn range(&self, chunk: u64) -> (u64, u64) {
+    pub fn range(&self, chunk: u64) -> (u64, u64) {
         let start = chunk * self.chunk_size;
         (start, (start + self.chunk_size).min(self.size))
     }
 
-    pub fn digests(&self) -> impl Iterator<Item = &str> {
-        self.chunks.values().map(String::as_str)
+    /// Every chunk id the stored index lists: the chunks holding data, and
+    /// the zero chunk of each length its holes come in.
+    pub fn digests(&self) -> impl Iterator<Item = String> + '_ {
+        self.chunks
+            .values()
+            .cloned()
+            .chain(self.hole_lengths().map(crate::caibx::zero_id))
+    }
+
+    /// The lengths of zero chunk the index has: whole ones, and a short last.
+    fn hole_lengths(&self) -> impl Iterator<Item = u64> {
+        let (whole, tail) = match self.chunk_size {
+            0 => (0, 0),
+            chunk => (self.size / chunk, self.size % chunk),
+        };
+        [
+            (self.chunks.range(..whole).count() < whole as usize).then_some(self.chunk_size),
+            (tail > 0 && !self.chunks.contains_key(&whole)).then_some(tail),
+        ]
+        .into_iter()
+        .flatten()
     }
 
     pub fn stored_bytes(&self) -> u64 {
@@ -75,8 +101,65 @@ impl ImageIndex {
     }
 }
 
+const CHUNK_STORE: &str = "chunks.castr/";
+
 pub fn chunk_key(digest: &str) -> String {
-    format!("chunks/{digest}")
+    format!("{CHUNK_STORE}{}/{digest}.cacnk", &digest[..4])
+}
+
+pub fn compress(bytes: &[u8]) -> std::io::Result<Vec<u8>> {
+    zstd::bulk::compress(bytes, LEVEL)
+}
+
+pub fn decompress(digest: &str, packed: &[u8]) -> Result<Vec<u8>, Status> {
+    zstd::bulk::decompress(packed, CHUNK_SIZE as usize)
+        .map_err(|err| Status::data_loss(format!("chunk {digest} does not decompress: {err}")))
+}
+
+/// Puts an image's index, as casync's `.caibx`.
+pub async fn put_index(store: &ObjectStore, key: &str, index: &ImageIndex) -> Result<(), Status> {
+    store.put_bytes(key, crate::caibx::encode(index)).await
+}
+
+pub async fn read_index(store: &ObjectStore, key: &str) -> Result<Option<ImageIndex>, Status> {
+    let Some(bytes) = get_current(store, key).await? else {
+        return Ok(None);
+    };
+    crate::caibx::decode(&bytes)
+        .map(Some)
+        .map_err(|err| Status::data_loss(format!("index {key} is unreadable: {err}")))
+}
+
+/// An object as the current format stores it, refusing one only the
+/// format before casync has.
+async fn get_current(store: &ObjectStore, key: &str) -> Result<Option<Vec<u8>>, Status> {
+    if let Some(bytes) = store.get_bytes(key).await? {
+        return Ok(Some(bytes));
+    }
+    refuse_legacy(store, key).await?;
+    Ok(None)
+}
+
+/// Where the format before casync kept the object at `key`: chunks
+/// uncompressed at `chunks/<sha256>`, indexes as JSON at `<name>.index.json`.
+pub fn legacy_key(key: &str) -> Option<String> {
+    if let Some(rest) = key.strip_prefix(CHUNK_STORE) {
+        let digest = rest.split_once('/')?.1.strip_suffix(".cacnk")?;
+        return Some(format!("chunks/{digest}"));
+    }
+    key.strip_suffix(".caibx")
+        .map(|stem| format!("{stem}.index.json"))
+}
+
+async fn refuse_legacy(store: &ObjectStore, key: &str) -> Result<(), Status> {
+    match legacy_key(key) {
+        Some(legacy) if store.exists(&legacy).await? => Err(Status::failed_precondition(format!(
+            "{legacy} is in the object store's format from before casync chunks, which this \
+             build does not read; run the previous release of burrowd on a node of this store \
+             once to migrate it"
+        ))),
+        _ => Ok(()),
+    }
 }
 
 /// Which file a layer is, without reading it. A memory layer is never written
@@ -159,6 +242,59 @@ fn digest_of(bytes: &[u8]) -> String {
     hex::encode(Sha256::digest(bytes))
 }
 
+/// Reads the chain's bytes from `start` to `end` and puts them as a chunk,
+/// unless they are zeroes or `known`. Returns their digest, `None` for
+/// zeroes, and whether they were put.
+async fn put_chunk(
+    store: &ObjectStore,
+    layers: Arc<Vec<OpenLayer>>,
+    known: Arc<HashSet<String>>,
+    start: u64,
+    end: u64,
+) -> Result<(Option<String>, bool), Status> {
+    let read = tokio::task::spawn_blocking(move || {
+        let bytes = read_merged(&layers, start, end)?;
+        if bytes.iter().all(|&b| b == 0) {
+            return Ok(None);
+        }
+        let digest = digest_of(&bytes);
+        let packed = match known.contains(&digest) {
+            true => None,
+            false => Some(compress(&bytes)?),
+        };
+        Ok::<_, std::io::Error>(Some((digest, packed)))
+    })
+    .await
+    .map_err(|err| Status::internal(format!("reading a chunk: {err}")))?
+    .map_err(|err| Status::internal(format!("reading a chunk to upload: {err}")))?;
+    match read {
+        None => Ok((None, false)),
+        Some((digest, None)) => Ok((Some(digest), false)),
+        Some((digest, Some(packed))) => {
+            store.put_chunk(&chunk_key(&digest), packed).await?;
+            Ok((Some(digest), true))
+        }
+    }
+}
+
+/// Puts the zero chunks an index lists. Burrow never fetches them, but
+/// casync fetches every chunk an index names.
+pub async fn put_zeroes(
+    store: &ObjectStore,
+    index: &ImageIndex,
+    known: &HashSet<String>,
+) -> Result<(), Status> {
+    for len in index.hole_lengths() {
+        let digest = crate::caibx::zero_id(len);
+        if !known.contains(&digest) {
+            let packed = compress(&vec![0u8; len as usize])
+                .map_err(|err| Status::internal(format!("compressing zeroes: {err}")))?;
+            store.put_chunk(&chunk_key(&digest), packed).await?;
+        }
+    }
+    Ok(())
+}
+
 /// Uploads a chain of layers, oldest first, as one flattened image.
 ///
 /// `known` holds digests the store is already relied on to have, because the
@@ -225,26 +361,15 @@ pub async fn put_image(
     let mut sent = 0usize;
     let mut results = futures::stream::iter(candidates)
         .map(|n| {
-            let opened = Arc::clone(&opened);
-            let known = Arc::clone(&known);
-            let store = store.clone();
             let start = n * CHUNK_SIZE;
-            let end = (start + CHUNK_SIZE).min(size);
-            async move {
-                let bytes = tokio::task::spawn_blocking(move || read_merged(&opened, start, end))
-                    .await
-                    .map_err(|err| Status::internal(format!("reading a chunk: {err}")))?
-                    .map_err(io)?;
-                if bytes.iter().all(|&b| b == 0) {
-                    return Ok::<_, Status>((n, None, false));
-                }
-                let digest = digest_of(&bytes);
-                if known.contains(&digest) {
-                    return Ok((n, Some(digest), false));
-                }
-                store.put_chunk(&chunk_key(&digest), bytes).await?;
-                Ok((n, Some(digest), true))
-            }
+            let put = put_chunk(
+                store,
+                Arc::clone(&opened),
+                Arc::clone(&known),
+                start,
+                (start + CHUNK_SIZE).min(size),
+            );
+            async move { put.await.map(|(digest, put)| (n, digest, put)) }
         })
         .buffer_unordered(store.upload_parallelism());
     while let Some(result) = results.next().await {
@@ -255,6 +380,8 @@ pub async fn put_image(
             None => index.chunks.remove(&n),
         };
     }
+    drop(results);
+    put_zeroes(store, &index, &known).await?;
     tracing::debug!(chunks = index.chunks.len(), read, sent, "image uploaded");
     Ok(index)
 }
@@ -315,7 +442,7 @@ pub async fn put_disk_since(
     let mut known = known.clone();
     let unchanged = unchanged.unwrap_or_default();
     if let Some((_, base)) = base {
-        known.extend(base.digests().map(str::to_string));
+        known.extend(base.digests());
         for n in &unchanged {
             if let Some(digest) = base.chunks.get(n) {
                 index.chunks.insert(*n, digest.clone());
@@ -332,26 +459,15 @@ pub async fn put_disk_since(
     let mut sent = 0usize;
     let mut results = futures::stream::iter(candidates)
         .map(|n| {
-            let layers = Arc::clone(&layers);
-            let known = Arc::clone(&known);
-            let store = store.clone();
             let start = n * CHUNK_SIZE;
-            let end = (start + CHUNK_SIZE).min(size);
-            async move {
-                let bytes = tokio::task::spawn_blocking(move || read_merged(&layers, start, end))
-                    .await
-                    .map_err(|err| Status::internal(format!("reading a chunk: {err}")))?
-                    .map_err(io)?;
-                if bytes.iter().all(|&b| b == 0) {
-                    return Ok::<_, Status>((n, None, false));
-                }
-                let digest = digest_of(&bytes);
-                if known.contains(&digest) {
-                    return Ok((n, Some(digest), false));
-                }
-                store.put_chunk(&chunk_key(&digest), bytes).await?;
-                Ok((n, Some(digest), true))
-            }
+            let put = put_chunk(
+                store,
+                Arc::clone(&layers),
+                Arc::clone(&known),
+                start,
+                (start + CHUNK_SIZE).min(size),
+            );
+            async move { put.await.map(|(digest, put)| (n, digest, put)) }
         })
         .buffer_unordered(store.upload_parallelism());
     while let Some(result) = results.next().await {
@@ -361,6 +477,8 @@ pub async fn put_disk_since(
             index.chunks.insert(n, digest);
         }
     }
+    drop(results);
+    put_zeroes(store, &index, &known).await?;
     tracing::info!(
         disk = %path.display(),
         chunks = index.chunks.len(),
@@ -440,9 +558,12 @@ async fn fetch_chunk(store: &ObjectStore, digest: &str) -> Result<Vec<u8>, Statu
     let mut attempt = 0;
     loop {
         attempt += 1;
-        match store.get_bytes(&chunk_key(digest)).await {
-            Ok(Some(bytes)) if digest_of(&bytes) == digest => return Ok(bytes),
-            Ok(Some(_)) => {
+        match get_current(store, &chunk_key(digest)).await {
+            Ok(Some(packed)) => {
+                let bytes = decompress(digest, &packed)?;
+                if digest_of(&bytes) == digest {
+                    return Ok(bytes);
+                }
                 return Err(Status::data_loss(format!(
                     "chunk {digest} from the object store does not match its digest"
                 )));
@@ -875,8 +996,12 @@ pub async fn collect_garbage(
 ) -> Result<usize, Status> {
     let cutoff = std::time::SystemTime::now() - grace;
     let mut removed = 0;
-    for (key, modified) in store.list_aged("chunks/").await? {
-        let Some(digest) = key.strip_prefix("chunks/") else {
+    for (key, modified) in store.list_aged(CHUNK_STORE).await? {
+        let Some(digest) = key
+            .strip_prefix(CHUNK_STORE)
+            .and_then(|rest| rest.split_once('/'))
+            .and_then(|(_, name)| name.strip_suffix(".cacnk"))
+        else {
             continue;
         };
         if referenced.contains(digest) || modified.is_none_or(|at| at > cutoff) {
@@ -936,6 +1061,38 @@ mod tests {
         assert!(store.exists(&chunk_key(&index.chunks[&1])).await.unwrap());
         assert!(!store.exists(&chunk_key("carried-0")).await.unwrap());
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// What the format before casync kept, once no build migrates it, is
+    /// refused naming the release that does.
+    #[tokio::test]
+    async fn an_object_left_in_the_old_format_is_refused() {
+        let digest = "ab".repeat(32);
+        assert_eq!(
+            legacy_key(&chunk_key(&digest)).unwrap(),
+            format!("chunks/{digest}")
+        );
+        assert_eq!(
+            legacy_key("volumes/data/7.caibx").unwrap(),
+            "volumes/data/7.index.json"
+        );
+        assert_eq!(legacy_key("sandboxes/sbx_1/manifest.json"), None);
+
+        let store = crate::objstore::fake::store(true).await;
+        refuse_legacy(&store, "volumes/data/7.caibx").await.unwrap();
+        store
+            .put_bytes("volumes/data/7.index.json", b"{}".to_vec())
+            .await
+            .unwrap();
+        let refused = refuse_legacy(&store, "volumes/data/7.caibx")
+            .await
+            .unwrap_err();
+        assert_eq!(refused.code(), tonic::Code::FailedPrecondition);
+        assert!(
+            refused.message().contains("previous release"),
+            "{}",
+            refused.message()
+        );
     }
 
     #[test]

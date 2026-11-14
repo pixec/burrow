@@ -25,9 +25,9 @@
 //!
 //! ```text
 //! volumes/<name>/manifest.json
-//! volumes/<name>/<generation>.index.json
+//! volumes/<name>/<generation>.caibx
 //! volumes/<name>/pins/<sandbox>          a remote reader's generation
-//! chunks/<sha256>
+//! chunks.castr/<first 4 hex>/<sha256>.cacnk
 //! ```
 
 #![allow(clippy::result_large_err)]
@@ -83,7 +83,7 @@ fn manifest_key(name: &str) -> String {
 }
 
 fn index_key(name: &str, generation: u64) -> String {
-    format!("volumes/{name}/{generation}.index.json")
+    format!("volumes/{name}/{generation}.caibx")
 }
 
 fn pin_key(name: &str, sandbox_id: &str) -> String {
@@ -145,7 +145,7 @@ pub async fn fetch_generation(
     generation: u64,
     image: &Path,
 ) -> Result<ImageIndex, Status> {
-    let index = crate::snapshot::read_index(store, &index_key(name, generation))
+    let index = crate::chunks::read_index(store, &index_key(name, generation))
         .await?
         .ok_or_else(|| {
             Status::not_found(format!(
@@ -278,7 +278,7 @@ pub async fn upload(
         _ => None,
     };
     let known: HashSet<String> = previous
-        .map(|p| p.index.digests().map(str::to_string).collect())
+        .map(|p| p.index.digests().collect())
         .unwrap_or_default();
     let index = crate::chunks::put_disk_since(store, capture, base, &known).await?;
     if let Some(previous) = previous
@@ -296,11 +296,7 @@ pub async fn upload(
     }
     let now = burrow_common::unix_now_ms();
     let generation = (now as u64).max(previous.map_or(0, |p| p.manifest.generation + 1));
-    let json = serde_json::to_vec(&index)
-        .map_err(|err| Status::internal(format!("encoding an index: {err}")))?;
-    store
-        .put_bytes(&index_key(&draft.name, generation), json)
-        .await?;
+    crate::chunks::put_index(store, &index_key(&draft.name, generation), &index).await?;
     let mut local = Local {
         manifest: Manifest {
             format: FORMAT,
@@ -368,7 +364,7 @@ pub async fn adopt(
             manifest.state, manifest.node_id
         )));
     }
-    let index = crate::snapshot::read_index(store, &index_key(name, manifest.generation))
+    let index = crate::chunks::read_index(store, &index_key(name, manifest.generation))
         .await?
         .ok_or_else(|| {
             Status::data_loss(format!(
@@ -486,10 +482,8 @@ pub async fn collect_refs(
         let Some(generation) = read_pin(store, key).await? else {
             continue;
         };
-        if let Some(index) =
-            crate::snapshot::read_index(store, &index_key(name, generation)).await?
-        {
-            referenced.extend(index.digests().map(str::to_string));
+        if let Some(index) = crate::chunks::read_index(store, &index_key(name, generation)).await? {
+            referenced.extend(index.digests());
         }
         kept.insert((name.to_string(), generation));
     }
@@ -505,8 +499,8 @@ pub async fn collect_refs(
             continue;
         };
         let key = index_key(name, held.manifest.generation);
-        if let Some(index) = crate::snapshot::read_index(store, &key).await? {
-            referenced.extend(index.digests().map(str::to_string));
+        if let Some(index) = crate::chunks::read_index(store, &key).await? {
+            referenced.extend(index.digests());
         }
         current.insert(name.to_string(), held.manifest.generation);
     }
@@ -517,7 +511,7 @@ pub async fn collect_refs(
             .strip_prefix("volumes/")
             .and_then(|rest| rest.split_once('/'))
             .and_then(|(name, file)| {
-                file.strip_suffix(".index.json")
+                file.strip_suffix(".caibx")
                     .and_then(|g| g.parse::<u64>().ok())
                     .map(|g| (name, g))
             })
@@ -698,7 +692,7 @@ mod tests {
         collect_refs(&store, std::time::Duration::ZERO, &mut referenced)
             .await
             .unwrap();
-        assert!(first.index.digests().all(|d| referenced.contains(d)));
+        assert!(first.index.digests().all(|d| referenced.contains(&d)));
         let copy = a.join("reader.img");
         let index = fetch_generation(&store, "shared", first.manifest.generation, &copy)
             .await

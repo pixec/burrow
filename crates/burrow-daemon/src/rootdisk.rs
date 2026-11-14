@@ -686,7 +686,7 @@ pub async fn index_templates(blobs: &crate::blobs::BlobStore, templates_dir: &Pa
 
 /// Object key of an image's index in the store.
 pub fn remote_index_key(digest: &str) -> String {
-    format!("images/{digest}.index.json")
+    format!("images/{digest}.caibx")
 }
 
 /// Puts an image into the object store once: its chunks, then the index that
@@ -712,9 +712,7 @@ pub async fn upload_image(
             image.digest
         )));
     }
-    let json = serde_json::to_vec(&index)
-        .map_err(|err| Status::internal(format!("encoding an index: {err}")))?;
-    store.put_bytes(&key, json).await
+    crate::chunks::put_index(store, &key, &index).await
 }
 
 /// Brings the image with `digest` onto this node from the object store,
@@ -730,7 +728,7 @@ pub async fn fetch_image(
     }
     let parsed = crate::blobs::Digest::parse(digest)
         .ok_or_else(|| Status::data_loss(format!("{digest:?} is not an image digest")))?;
-    let index = crate::snapshot::read_index(store, &remote_index_key(digest))
+    let index = crate::chunks::read_index(store, &remote_index_key(digest))
         .await?
         .ok_or_else(|| Status::not_found(format!("image {digest} is not in the object store")))?;
     let incoming = blobs.incoming_path(&parsed);
@@ -771,7 +769,7 @@ pub async fn remote_image_refs(
     for (key, modified) in store.list_aged("images/").await? {
         let Some(digest) = key
             .strip_prefix("images/")
-            .and_then(|rest| rest.strip_suffix(".index.json"))
+            .and_then(|rest| rest.strip_suffix(".caibx"))
         else {
             continue;
         };
@@ -780,8 +778,8 @@ pub async fn remote_image_refs(
             removed += 1;
             continue;
         }
-        if let Some(index) = crate::snapshot::read_index(store, &key).await? {
-            out.extend(index.digests().map(str::to_string));
+        if let Some(index) = crate::chunks::read_index(store, &key).await? {
+            out.extend(index.digests());
         }
     }
     Ok(removed)
