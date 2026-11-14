@@ -101,6 +101,7 @@ pub async fn handshake(
         timing: Some(timing),
         agent_digest: crate::macos::self_digest().to_string(),
         features: crate::macos::features(),
+        is_systemd_held: false,
     })
 }
 

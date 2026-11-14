@@ -81,8 +81,9 @@ pub async fn handshake(
     Ok(guestpb::HandshakeResponse {
         agent_version: VERSION.into(),
         timing: Some(timing),
-        agent_digest: crate::windows::service::self_digest().to_string(),
+        agent_digest: crate::windows::self_digest().to_string(),
         features: crate::windows::features(),
+        is_systemd_held: false,
     })
 }
 

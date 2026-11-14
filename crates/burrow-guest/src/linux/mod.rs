@@ -70,7 +70,7 @@ const FS_STATE: &str = "/run/burrow-guest.fs";
 const SYSTEMD_READY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(20);
 
 /// SHA-256 of the binary this process is running, as the host compares it.
-fn self_digest() -> &'static str {
+pub fn self_digest() -> &'static str {
     static DIGEST: std::sync::OnceLock<String> = std::sync::OnceLock::new();
     DIGEST.get_or_init(|| {
         use sha2::Digest as _;
@@ -220,10 +220,11 @@ pub async fn handshake(
         tracing::error!(%err, "failed to apply the network");
         return Err(Status::internal(format!("applying the network: {err}")));
     }
-    if !req.hostname.is_empty()
-        && let Err(err) = set_hostname(&req.hostname)
-    {
-        tracing::warn!(%err, "could not set the hostname");
+    if !req.hostname.is_empty() {
+        match set_hostname(&req.hostname) {
+            Ok(()) => systemd::named(),
+            Err(err) => tracing::warn!(%err, "could not set the hostname"),
+        }
     }
     // A root disk the host grew while the guest was down is filled here,
     // online, on the boot that first sees it. Only a boot: a restored guest
@@ -241,9 +242,14 @@ pub async fn handshake(
         tracing::error!(%err, "failed to mount volumes");
         return Err(Status::internal(format!("mounting volumes: {err}")));
     }
-    // Last, because it can take as long as systemd's boot. A warm snapshot
-    // is taken when this returns, so its clones restore with systemd up.
-    systemd::wait_ready(SYSTEMD_READY_TIMEOUT).await;
+    // Last, so systemd boots with the guest's clock, name and volumes in
+    // place, and because waiting for it can take as long as its boot. A warm
+    // snapshot is taken when this returns, so its clones restore with systemd
+    // up. A host shipping another agent upgrades this one first.
+    if req.agent_digest.is_empty() || req.agent_digest == self_digest() {
+        systemd::start_held();
+        systemd::wait_ready(SYSTEMD_READY_TIMEOUT).await;
+    }
 
     let total = started.elapsed();
     let timing = guestpb::GuestResumeTiming {
@@ -280,6 +286,7 @@ pub async fn handshake(
         timing: Some(timing),
         agent_digest: self_digest().to_string(),
         features: features(),
+        is_systemd_held: systemd::is_held(),
     })
 }
 
@@ -484,8 +491,8 @@ pub async fn main() {
             "agent upgraded in place"
         );
     }
-    if is_systemd && !is_reexec {
-        systemd::start();
+    if is_systemd && systemd::pid().is_none() {
+        systemd::hold();
     }
 
     tokio::spawn(fs::close_idle());

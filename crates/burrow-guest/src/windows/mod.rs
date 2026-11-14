@@ -37,7 +37,7 @@ pub use handshake::{
     clear_network, handshake, is_clock_disciplined, root_disk, set_clock, set_public_addresses,
 };
 #[cfg(windows)]
-pub use service::{main, upgrade};
+pub use service::{main, self_digest, upgrade};
 #[cfg(windows)]
 pub use vsock::Arrival;
 

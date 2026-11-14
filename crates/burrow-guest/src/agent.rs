@@ -57,6 +57,7 @@ impl Guest for AgentService {
     ) -> Result<Response<guestpb::GuestHealthResponse>, Status> {
         Ok(Response::new(guestpb::GuestHealthResponse {
             features: os::features(),
+            agent_digest: os::self_digest().to_string(),
         }))
     }
 

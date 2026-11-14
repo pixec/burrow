@@ -247,6 +247,7 @@ mod probe {
                 }],
                 volumes: vec![],
                 hostname: String::new(),
+                agent_digest: String::new(),
             })
             .await;
         let digest = match &handshake {

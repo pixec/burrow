@@ -160,6 +160,7 @@ pub fn handshake_full(
         network,
         volumes,
         hostname,
+        agent_digest: String::new(),
     }
 }
 
@@ -341,6 +342,10 @@ const RECONNECT_ATTEMPT: std::time::Duration = std::time::Duration::from_secs(3)
 /// reconnects and handshakes the new agent, which is the client handed back.
 /// A guest that cannot upgrade right now, because a command is running, is
 /// logged and left on the old agent until its next handshake.
+///
+/// Each handshake names the agent it expects, and a systemd guest booting
+/// under another holds its systemd back until it is upgraded. One left on its
+/// own agent is handshaken again naming that one, which starts it.
 #[allow(clippy::result_large_err)]
 pub async fn handshake_upgrading(
     mut agent: GuestClient<Channel>,
@@ -353,7 +358,14 @@ pub async fn handshake_upgrading(
         let response = agent.handshake(stamped(&request)).await?.into_inner();
         return Ok((agent, response));
     };
-    let response = agent.handshake(stamped(&request)).await?.into_inner();
+    let expecting = |digest: &str| guestpb::HandshakeRequest {
+        agent_digest: digest.to_string(),
+        ..request.clone()
+    };
+    let response = agent
+        .handshake(stamped(&expecting(&upgrade.digest)))
+        .await?
+        .into_inner();
     if response.agent_digest == upgrade.digest {
         return Ok((agent, response));
     }
@@ -367,8 +379,18 @@ pub async fn handshake_upgrading(
         use sha2::Digest as _;
         hex::encode(sha2::Sha256::digest(&bytes))
     };
+    let kept = async |mut agent: GuestClient<Channel>, response: guestpb::HandshakeResponse| {
+        if !response.is_systemd_held {
+            return Ok((agent, response));
+        }
+        let response = agent
+            .handshake(stamped(&expecting(&response.agent_digest)))
+            .await?
+            .into_inner();
+        Ok((agent, response))
+    };
     if digest == response.agent_digest {
-        return Ok((agent, response));
+        return kept(agent, response).await;
     }
     tracing::info!(
         from = response.agent_version,
@@ -389,23 +411,19 @@ pub async fn handshake_upgrading(
         Ok(resp) => resp.into_inner().is_restarting,
         Err(err) if err.code() == tonic::Code::FailedPrecondition => {
             tracing::warn!(%err, "guest agent busy; upgrading it on its next handshake");
-            return Ok((agent, response));
+            return kept(agent, response).await;
         }
         Err(err) => return Err(err),
     };
     if !restarting {
-        return Ok((agent, response));
+        return kept(agent, response).await;
     }
     drop(agent);
-    let bare = guestpb::HandshakeRequest {
-        volumes: Vec::new(),
-        ..request.clone()
-    };
     // The old agent answers and then re-executes, and how long that takes
     // is the guest's business, so a reconnect can still land on the old
     // process and be cut off as it is replaced. The new agent is the one
-    // reporting the digest it was sent, so connecting and handshaking is
-    // repeated until that is who answers.
+    // reporting the digest it was sent, so connecting and asking is repeated
+    // until that is who answers.
     let deadline = std::time::Instant::now() + UPGRADE_TIMEOUT;
     loop {
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
@@ -413,8 +431,11 @@ pub async fn handshake_upgrading(
             let (mut agent, _) = connect_when_ready(guest.clone(), timeout)
                 .await
                 .map_err(|err| tonic::Status::internal(format!("upgraded agent: {err}")))?;
-            let response = agent.handshake(stamped(&bare)).await?.into_inner();
-            Ok::<_, tonic::Status>((agent, response))
+            let health = agent
+                .health(guestpb::GuestHealthRequest {})
+                .await?
+                .into_inner();
+            Ok::<_, tonic::Status>((agent, health.agent_digest))
         };
         let attempt = match tokio::time::timeout(RECONNECT_ATTEMPT, attempt).await {
             Ok(attempt) => attempt,
@@ -423,13 +444,13 @@ pub async fn handshake_upgrading(
             )),
         };
         match attempt {
-            Ok((mut agent, response)) if response.agent_digest == digest => {
-                // Mounting volumes can take longer than an attempt may, so
-                // they wait for the new agent to be the one answering.
-                let response = match request.volumes.is_empty() {
-                    true => response,
-                    false => agent.handshake(stamped(&request)).await?.into_inner(),
-                };
+            Ok((mut agent, running)) if running == digest => {
+                // Outside the attempt's bound: the handshake mounts volumes
+                // and waits for systemd, either of which can take longer.
+                let response = agent
+                    .handshake(stamped(&expecting(&digest)))
+                    .await?
+                    .into_inner();
                 tracing::info!(
                     version = response.agent_version,
                     took_ms = started.elapsed().as_millis() as u64,
@@ -438,10 +459,9 @@ pub async fn handshake_upgrading(
                 return Ok((agent, response));
             }
             Ok(_) | Err(_) if std::time::Instant::now() < deadline => continue,
-            Ok((_, response)) => {
+            Ok((_, running)) => {
                 return Err(tonic::Status::internal(format!(
-                    "the guest agent did not come back as the new build: it reports {}",
-                    response.agent_digest
+                    "the guest agent did not come back as the new build: it reports {running}"
                 )));
             }
             Err(err) => return Err(err),

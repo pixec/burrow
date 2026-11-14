@@ -15,7 +15,7 @@ use std::os::fd::{AsRawFd as _, OwnedFd};
 use std::os::unix::process::CommandExt as _;
 use std::process::{Command, Stdio};
 use std::sync::OnceLock;
-use std::sync::atomic::{AtomicI32, AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU32, Ordering};
 
 use nix::libc;
 use nix::mount::{MsFlags, mount};
@@ -88,6 +88,10 @@ pub const PID_MARK: &str = "BURROW_GUEST_SYSTEMD";
 static PID: AtomicI32 = AtomicI32::new(0);
 /// Counts systemd boots, to give each a cgroup of its own.
 static BOOTS: AtomicU32 = AtomicU32::new(0);
+/// Set while systemd waits for its first start; see [`hold`].
+static HELD: AtomicBool = AtomicBool::new(false);
+/// Set once a handshake has named the guest; see [`named`].
+static IS_NAMED: AtomicBool = AtomicBool::new(false);
 
 /// Whether the guest is ready for the host: always in agent-only mode, and in
 /// systemd mode once systemd has finished starting up.
@@ -180,9 +184,35 @@ pub async fn wait_ready(timeout: std::time::Duration) {
     }
 }
 
-/// Starts systemd on a fresh boot and keeps it running for the life of the
-/// guest.
-pub fn start() {
+/// Holds systemd back on a fresh boot until [`start_held`].
+///
+/// The agent on a template's disk is the build it was imported with, which
+/// the host replaces on the first handshake when it ships another. systemd
+/// keeps the masks and arguments of the agent that started it for as long as
+/// it runs, so it waits for the agent the host ships.
+pub fn hold() {
+    HELD.store(true, Ordering::Release);
+}
+
+pub fn is_held() -> bool {
+    HELD.load(Ordering::Acquire)
+}
+
+/// Has every systemd started from now on keep the guest's name rather than
+/// take the one in its image's /etc/hostname.
+pub fn named() {
+    IS_NAMED.store(true, Ordering::Release);
+}
+
+/// Starts the systemd [`hold`] held back, once.
+pub fn start_held() {
+    if HELD.swap(false, Ordering::AcqRel) {
+        start();
+    }
+}
+
+/// Starts systemd and keeps it running for the life of the guest.
+fn start() {
     let Some(binary) = locate() else {
         tracing::error!("burrow.systemd=1 but the image has no systemd; running agent-only");
         return;
@@ -360,6 +390,12 @@ fn spawn(binary: &'static str) -> std::io::Result<i32> {
     );
     if !tracing::enabled!(tracing::Level::DEBUG) {
         command.args(["systemd.show_status=0", "systemd.log_target=journal"]);
+    }
+    if IS_NAMED.load(Ordering::Acquire)
+        && let Ok(hostname) = nix::unistd::gethostname()
+        && let Some(hostname) = hostname.to_str()
+    {
+        command.arg(format!("systemd.hostname={hostname}"));
     }
     command
         .env_clear()

@@ -401,6 +401,11 @@ message HandshakeRequest {
   repeated VolumeMount volumes = 7;
   // The guest's hostname. Empty leaves it as it is.
   string hostname = 8;
+  // SHA-256 of the agent the host ships, lowercase hex. A systemd guest whose
+  // agent is another build answers without starting systemd, so that the host
+  // can upgrade it first and systemd always boots under the host's agent.
+  // Empty starts it under whatever agent answers.
+  string agent_digest = 9;
 }
 
 // Deliberately not burrow.common.v1.VolumeMount: the guest protocol versions
@@ -519,6 +524,9 @@ message HandshakeResponse {
   string agent_digest = 3;
   // What Health would answer, so the host knows without asking.
   repeated string features = 4;
+  // The guest's systemd has not started, because the request named another
+  // agent than this one. A handshake naming this one starts it.
+  bool is_systemd_held = 5;
 }
 
 message UpgradeChunk {
@@ -585,6 +593,8 @@ message GuestHealthResponse {
   // "attach-input": Attach, exit_signal and lost_bytes.
   // "output-feed": Feed, and command output kept on the host.
   repeated string features = 1;
+  // SHA-256 of the running agent binary, as the handshake reports it.
+  string agent_digest = 2;
 }
 
 // One POSIX file operation, as the guest kernel performs it. What `fs` in
