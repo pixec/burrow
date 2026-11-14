@@ -4331,7 +4331,7 @@ fn node_table(nodes: &[api::Node]) -> String {
     let mut out = String::new();
     let _ = writeln!(
         out,
-        "{:<38} {:<22} {:>11} {:>9} {:>9} {:>16} {:>5} {:<9} {:<24} {:<24} HOSTNAME",
+        "{:<38} {:<22} {:>13} {:>9} {:>9} {:>16} {:>5} {:<9} {:<24} {:<24} HOSTNAME",
         "NODE",
         "ADDRESS",
         "CPUS",
@@ -4348,14 +4348,10 @@ fn node_table(nodes: &[api::Node]) -> String {
         let status = node.status.clone().unwrap_or_default();
         let _ = writeln!(
             out,
-            "{:<38} {:<22} {:>11} {:>9} {:>9} {:>16} {:>5} {:<9} {:<24} {:<24} {}",
+            "{:<38} {:<22} {:>13} {:>9} {:>9} {:>16} {:>5} {:<9} {:<24} {:<24} {}",
             info.id,
             info.address,
-            format!(
-                "{}/{}",
-                cpus_text(status.committed_cpu_millis),
-                info.total_vcpus
-            ),
+            cpus_column(&info, &status),
             info.total_mem_mib,
             status.free_mem_mib,
             disk_column(&status),
@@ -4367,6 +4363,21 @@ fn node_table(nodes: &[api::Node]) -> String {
         );
     }
     out
+}
+
+/// Committed CPUs over the node's cores, with `xN` after a node that
+/// overcommits them N times.
+fn cpus_column(info: &common::NodeInfo, status: &common::NodeStatus) -> String {
+    let column = format!(
+        "{}/{}",
+        cpus_text(status.committed_cpu_millis),
+        info.total_vcpus
+    );
+    if info.cpu_overcommit > 0.0 && info.cpu_overcommit != 1.0 {
+        format!("{column}x{}", info.cpu_overcommit)
+    } else {
+        column
+    }
 }
 
 /// Free over total disk in GiB, `LOW` when under the reserve, `-` for a node
@@ -5786,6 +5797,7 @@ fn nodes_json(nodes: &[api::Node]) -> String {
                 "state": node_state(node),
                 "arch": info.arch,
                 "total_vcpus": info.total_vcpus,
+                "cpu_overcommit": if info.cpu_overcommit > 0.0 { info.cpu_overcommit } else { 1.0 },
                 "committed_cpus": status.committed_cpu_millis as f64 / 1000.0,
                 "total_mem_mib": info.total_mem_mib,
                 "free_mem_mib": status.free_mem_mib,
@@ -6274,6 +6286,12 @@ mod tests {
         assert!(lines[2].contains(" disk-low "), "{table}");
         // CPU is what is committed over what the node has.
         assert!(lines[2].contains(" 2.5/0 "), "{table}");
+        let mut dense = node("node-d", NodeStatus::default());
+        let info = dense.info.as_mut().unwrap();
+        info.total_vcpus = 4;
+        info.cpu_overcommit = 4.0;
+        dense.status.as_mut().unwrap().committed_cpu_millis = 16_000;
+        assert!(node_table(&[dense]).contains(" 16/4x4 "));
         // A node that does not report disk shows a dash, not a full disk.
         let unreported: Vec<&str> = lines[3].split_whitespace().collect();
         assert_eq!(unreported[5], "-", "{table}");

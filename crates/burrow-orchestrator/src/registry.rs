@@ -539,10 +539,16 @@ fn is_fit(entry: &NodeEntry, pending: &HashMap<String, Reserved>, want: &Placeme
         net(entry.status.committed_cpu_millis, held.cpu_millis) + want.cpu_charge_millis();
     // A node that has not reported its cpu count cannot be checked; trusting it
     // beats refusing to place anything on it.
-    let cpu_ok =
-        entry.info.total_vcpus == 0 || committed <= u64::from(entry.info.total_vcpus) * 1000;
+    let cpu_ok = cpu_capacity(&entry.info).is_none_or(|capacity| committed <= capacity);
     let mem_ok = free_mem(entry, pending) >= want.mem_charge_mib(&entry.info, &entry.status);
     cpu_ok && mem_ok && disk_fit(entry, held, want).is_ok()
+}
+
+/// The CPU a node may commit, its cores times its overcommit, in thousandths
+/// of a CPU. `None` for a node that has not reported its cores.
+pub fn cpu_capacity(info: &NodeInfo) -> Option<u64> {
+    (info.total_vcpus > 0)
+        .then(|| burrow_common::cpu::capacity_millis(info.total_vcpus, info.cpu_overcommit))
 }
 
 /// Reported free memory, less anything placed since that report.
@@ -579,11 +585,12 @@ fn holds_warm(entry: &NodeEntry, want: &Placement) -> bool {
 /// like the best place to put more work.
 fn headroom(entry: &NodeEntry, pending: &HashMap<String, Reserved>) -> f64 {
     let held = held(entry, pending);
-    let cpu_free = if entry.info.total_vcpus == 0 {
-        1.0
-    } else {
-        let committed = net(entry.status.committed_cpu_millis, held.cpu_millis) as f64;
-        1.0 - (committed / (f64::from(entry.info.total_vcpus) * 1000.0)).clamp(0.0, 1.0)
+    let cpu_free = match cpu_capacity(&entry.info) {
+        None | Some(0) => 1.0,
+        Some(capacity) => {
+            let committed = net(entry.status.committed_cpu_millis, held.cpu_millis) as f64;
+            1.0 - (committed / capacity as f64).clamp(0.0, 1.0)
+        }
     };
     let mem_free = if entry.info.total_mem_mib == 0 {
         1.0
@@ -2399,6 +2406,41 @@ mod tests {
             })
             .unwrap_err();
         assert!(matches!(err, PlacementError::NoCapacity { .. }), "{err}");
+    }
+
+    /// A node overcommitting its CPU is offered work up to its cores times the
+    /// ratio, and scored against that rather than against its cores.
+    #[test]
+    fn an_overcommitted_node_is_offered_its_cores_times_the_ratio() {
+        let registry = registry(&[(
+            "dense",
+            NodeStatus {
+                free_mem_mib: 60_000,
+                committed_cpu_millis: 15_000,
+                ..Default::default()
+            },
+        )]);
+        set_capacity(&registry, "dense", 4, 64_000);
+        let one = Placement {
+            vcpus: 1,
+            mem_mib: 128,
+            ..Default::default()
+        };
+        assert!(registry.place_for(&one).is_err(), "4 cores at 1.0 are full");
+
+        registry
+            .nodes
+            .lock()
+            .unwrap()
+            .get_mut("dense")
+            .unwrap()
+            .info
+            .cpu_overcommit = 4.0;
+        assert_eq!(registry.place_for(&one).unwrap(), "dense");
+        assert!(
+            registry.place_for(&one).is_err(),
+            "the 16th CPU is now held, so a 17th does not fit"
+        );
     }
 
     /// Placements are far quicker than the heartbeat interval, so a burst of

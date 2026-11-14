@@ -96,7 +96,7 @@ pub fn node_row(
         wireguard_endpoint: wireguard_endpoint.to_string(),
         last_heartbeat_ms: burrow_common::unix_now_ms(),
         is_reported: false,
-        total_vcpus: info.total_vcpus,
+        cpu_capacity_millis: crate::registry::cpu_capacity(info).unwrap_or(0),
         committed_cpu_millis: status.committed_cpu_millis,
         free_mem_mib: status.free_mem_mib,
         reserved_cpu_millis: 0,

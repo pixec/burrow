@@ -249,6 +249,19 @@ pub struct ServeArgs {
         env = "BURROWD_DISK_OVERCOMMIT"
     )]
     pub disk_overcommit: f64,
+    /// How far the CPU committed to sandboxes may exceed this node's cores.
+    /// Each sandbox is charged its reservation, else its cap, else every
+    /// vCPU, running or suspended: at 1.0, the default, every charged CPU has
+    /// a core behind it. At 4.0 a 4-core node admits 16 one-vCPU sandboxes,
+    /// which share the cores by their cgroup weight when all are busy. One
+    /// sandbox still gets no more vCPUs than the node has cores.
+    #[arg(
+        long,
+        default_value_t = 1.0,
+        value_parser = crate::diskcap::parse_overcommit,
+        env = "BURROWD_CPU_OVERCOMMIT"
+    )]
+    pub cpu_overcommit: f64,
     /// Disk to keep free on the filesystem sandboxes' disks are on (the
     /// jailer's chroot base under `--jailer`, else the data directory), in
     /// MiB. It is left out of what may be provisioned, and while free disk is
@@ -675,6 +688,7 @@ fn local_node_info(args: &ServeArgs) -> anyhow::Result<NodeInfo> {
         total_vcpus: std::thread::available_parallelism()
             .map(|n| n.get() as u32)
             .unwrap_or(1),
+        cpu_overcommit: args.cpu_overcommit,
         total_mem_mib: sys.total_memory() / (1024 * 1024),
         hostname: sysinfo::System::host_name().unwrap_or_default(),
         sandbox_proxy_address: args.sandbox_proxy_advertisement(),
@@ -1670,6 +1684,7 @@ pub async fn run(args: ServeArgs) -> anyhow::Result<()> {
                 overcommit: args.disk_overcommit,
                 reserve_mib: args.disk_reserve_mib,
             },
+            cpu_overcommit: args.cpu_overcommit,
             public: public_config(&args),
             warm: warm_policy(&args),
             checkpoint_min_secs: args.checkpoint_min_secs,
@@ -2103,9 +2118,10 @@ mod tests {
         assert!(!none.is_disk_low);
     }
 
-    /// The flags' defaults: never overcommit, and the reserve left to 5%.
+    /// The flags' defaults: never overcommit disk or CPU, and the reserve left
+    /// to 5%.
     #[test]
-    fn disk_flags_default_to_no_overcommit_and_a_proportional_reserve() {
+    fn capacity_flags_default_to_no_overcommit_and_a_proportional_reserve() {
         use clap::Parser as _;
         #[derive(clap::Parser)]
         struct Cli {
@@ -2126,6 +2142,10 @@ mod tests {
         assert_eq!(cli.serve.disk_overcommit, 2.0);
         assert_eq!(cli.serve.disk_reserve_mib, Some(10240));
         assert!(Cli::try_parse_from(["burrowd", "--disk-overcommit", "0"]).is_err());
+        assert_eq!(cli.serve.cpu_overcommit, 1.0);
+        let cli = Cli::try_parse_from(["burrowd", "--cpu-overcommit", "4"]).unwrap();
+        assert_eq!(cli.serve.cpu_overcommit, 4.0);
+        assert!(Cli::try_parse_from(["burrowd", "--cpu-overcommit", "0"]).is_err());
     }
 
     /// The orchestrator's address is what a sandbox is denied, so the host has

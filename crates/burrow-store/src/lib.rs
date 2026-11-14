@@ -215,7 +215,9 @@ pub struct NodeRow {
     pub wireguard_endpoint: String,
     pub last_heartbeat_ms: i64,
     pub is_reported: bool,
-    pub total_vcpus: u32,
+    /// Host CPU the node may commit, its cores times its overcommit, in
+    /// thousandths of a CPU. 0 for a node that has not reported its cores.
+    pub cpu_capacity_millis: u64,
     /// Host CPU committed on the node, in thousandths of a CPU.
     pub committed_cpu_millis: u64,
     pub free_mem_mib: u64,
@@ -1236,14 +1238,15 @@ impl Store {
             let written = on_pool!(self, pool => sqlx::query(
                 "INSERT INTO nodes
                    (id, idx, info, status, wg_key, wg_endpoint, last_heartbeat_ms,
-                    is_reported, total_vcpus, committed_cpu_millis, free_mem_mib,
+                    is_reported, cpu_capacity_millis, committed_cpu_millis, free_mem_mib,
                     reserved_cpu_millis, reserved_mem_mib)
                  VALUES ($1, $2, $3, $4, $5, $6, $7, 0, $8, 0, 0, 0, 0)
                  ON CONFLICT (id) DO UPDATE SET
                    idx=excluded.idx, info=excluded.info, status=excluded.status,
                    wg_key=excluded.wg_key, wg_endpoint=excluded.wg_endpoint,
                    last_heartbeat_ms=excluded.last_heartbeat_ms, is_reported=0,
-                   total_vcpus=excluded.total_vcpus, reserved_cpu_millis=0, reserved_mem_mib=0",
+                   cpu_capacity_millis=excluded.cpu_capacity_millis, reserved_cpu_millis=0,
+                   reserved_mem_mib=0",
             )
             .bind(&row.id)
             .bind(index as i64)
@@ -1252,7 +1255,7 @@ impl Store {
             .bind(&row.wireguard_public_key)
             .bind(&row.wireguard_endpoint)
             .bind(row.last_heartbeat_ms)
-            .bind(row.total_vcpus as i64)
+            .bind(row.cpu_capacity_millis as i64)
             .execute(pool)
             .await
             .map(drop));
@@ -1275,7 +1278,7 @@ impl Store {
     pub async fn heartbeat_node(&self, row: &NodeRow) -> Result<bool> {
         let done = on_pool!(self, pool => sqlx::query(
             "UPDATE nodes SET info=$2, status=$3, last_heartbeat_ms=$4, is_reported=1,
-                total_vcpus=$5, committed_cpu_millis=$6, free_mem_mib=$7,
+                cpu_capacity_millis=$5, committed_cpu_millis=$6, free_mem_mib=$7,
                 reserved_cpu_millis=0, reserved_mem_mib=0
              WHERE id=$1",
         )
@@ -1283,7 +1286,7 @@ impl Store {
         .bind(&row.info)
         .bind(&row.status)
         .bind(row.last_heartbeat_ms)
-        .bind(row.total_vcpus as i64)
+        .bind(row.cpu_capacity_millis as i64)
         .bind(row.committed_cpu_millis as i64)
         .bind(row.free_mem_mib as i64)
         .execute(pool)
@@ -1310,7 +1313,7 @@ impl Store {
         );
         let rows: Vec<Raw> = on_pool!(self, pool => sqlx::query_as(
             "SELECT id, idx, info, status, wg_key, wg_endpoint, last_heartbeat_ms, is_reported,
-                    total_vcpus, committed_cpu_millis, free_mem_mib, reserved_cpu_millis,
+                    cpu_capacity_millis, committed_cpu_millis, free_mem_mib, reserved_cpu_millis,
                     reserved_mem_mib
              FROM nodes ORDER BY id",
         )
@@ -1327,7 +1330,7 @@ impl Store {
                 wireguard_endpoint: r.5,
                 last_heartbeat_ms: r.6,
                 is_reported: r.7 != 0,
-                total_vcpus: r.8 as u32,
+                cpu_capacity_millis: r.8 as u64,
                 committed_cpu_millis: r.9 as u64,
                 free_mem_mib: r.10 as u64,
                 reserved_cpu_millis: r.11,
@@ -1379,7 +1382,8 @@ impl Store {
     /// both backends: of two replicas racing for the last slot on a node,
     /// exactly one sees a row change. A node that has not reported a cpu
     /// count is trusted on cpu, as placement always has. CPU is in
-    /// thousandths of a CPU.
+    /// thousandths of a CPU, and a node's capacity already carries its
+    /// overcommit.
     pub async fn reserve_capacity(
         &self,
         node_id: &str,
@@ -1390,8 +1394,8 @@ impl Store {
             "UPDATE nodes SET reserved_cpu_millis = reserved_cpu_millis + $2,
                               reserved_mem_mib = reserved_mem_mib + $3
              WHERE id=$1
-               AND (total_vcpus = 0
-                    OR committed_cpu_millis + reserved_cpu_millis + $2 <= total_vcpus * 1000)
+               AND (cpu_capacity_millis = 0
+                    OR committed_cpu_millis + reserved_cpu_millis + $2 <= cpu_capacity_millis)
                AND (is_reported = 0 OR free_mem_mib - reserved_mem_mib >= $3)",
         )
         .bind(node_id)
@@ -2476,6 +2480,30 @@ mod tests {
         let now = store.get_placement("a").await.unwrap().unwrap();
         assert_eq!(now.node_id, "n2");
         assert!(store.delete_placement_if("a", now.version).await.unwrap());
+    }
+
+    /// The reservation checks a node's capacity, which carries its
+    /// overcommit, rather than its cores.
+    #[tokio::test]
+    async fn capacity_is_reserved_up_to_the_overcommitted_cpu() {
+        let store = Store::open_in_memory().await.unwrap();
+        let node = NodeRow {
+            id: "n1".into(),
+            cpu_capacity_millis: 16_000,
+            ..Default::default()
+        };
+        store.register_node(&node, None, 8).await.unwrap();
+        store
+            .heartbeat_node(&NodeRow {
+                committed_cpu_millis: 14_000,
+                free_mem_mib: 4096,
+                ..node.clone()
+            })
+            .await
+            .unwrap();
+        assert!(store.reserve_capacity("n1", 1000, 128).await.unwrap());
+        assert!(store.reserve_capacity("n1", 1000, 128).await.unwrap());
+        assert!(!store.reserve_capacity("n1", 1000, 128).await.unwrap());
     }
 
     #[tokio::test]

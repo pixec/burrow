@@ -39,6 +39,13 @@ pub fn charge_millis(vcpus: u32, cap_millis: u64, reserve_millis: u64) -> u64 {
     }
 }
 
+/// The host CPU a node may commit to sandboxes, in thousandths of a CPU: its
+/// cores times how far it overcommits them, where 0 is 1.0.
+pub fn capacity_millis(cores: u32, overcommit: f64) -> u64 {
+    let ratio = if overcommit > 0.0 { overcommit } else { 1.0 };
+    (f64::from(cores) * 1000.0 * ratio).floor() as u64
+}
+
 /// Thousandths of a CPU as CPUs, for a message: 2000 is "2", 500 is "0.5".
 pub fn cpus_text(millis: u64) -> String {
     let text = format!("{:.3}", millis as f64 / 1000.0);
@@ -160,6 +167,15 @@ pub fn validate(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn capacity_is_cores_times_the_overcommit() {
+        assert_eq!(capacity_millis(4, 1.0), 4000);
+        assert_eq!(capacity_millis(4, 4.0), 16_000);
+        assert_eq!(capacity_millis(3, 1.5), 4500);
+        assert_eq!(capacity_millis(4, 0.0), 4000, "0 is a node saying nothing");
+        assert_eq!(capacity_millis(4, 0.5), 2000);
+    }
 
     #[test]
     fn a_reservation_then_a_cap_is_charged_and_otherwise_every_vcpu_is() {

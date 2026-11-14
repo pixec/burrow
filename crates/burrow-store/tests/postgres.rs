@@ -129,7 +129,7 @@ async fn racing_claims_and_reservations_have_one_winner() {
         id: format!("{run}_node"),
         info: vec![1],
         status: vec![1],
-        total_vcpus: 4,
+        cpu_capacity_millis: 4000,
         ..Default::default()
     };
     let index = stores[0]
@@ -139,7 +139,7 @@ async fn racing_claims_and_reservations_have_one_winner() {
         .unwrap();
     stores[0]
         .heartbeat_node(&burrow_store::NodeRow {
-            total_vcpus: 4,
+            cpu_capacity_millis: 4000,
             committed_cpu_millis: 1000,
             free_mem_mib: 2048,
             ..node.clone()

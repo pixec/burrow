@@ -831,6 +831,9 @@ message NodeInfo {
   // Guest kernels a template can be built with here (`--kernel`), with what
   // each was found to have built in.
   repeated Kernel kernels = 28;
+  // How far CPU committed to sandboxes may exceed `total_vcpus`
+  // (--cpu-overcommit). 0 is 1.0, which never overcommits.
+  double cpu_overcommit = 29;
 }
 
 // A guest kernel, named on a node and identified by content.

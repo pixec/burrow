@@ -202,7 +202,7 @@ impl Admissions {
     }
 }
 
-/// `--disk-overcommit`: a positive, finite factor.
+/// `--disk-overcommit` and `--cpu-overcommit`: a positive, finite factor.
 pub fn parse_overcommit(text: &str) -> Result<f64, String> {
     let value: f64 = text
         .parse()

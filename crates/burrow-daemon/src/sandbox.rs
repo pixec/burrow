@@ -201,6 +201,9 @@ pub struct NodeConfig {
     pub event_delivery: crate::delivery::Policy,
     /// How much disk this node promises its sandboxes, and what it keeps free.
     pub disk: crate::diskcap::DiskPolicy,
+    /// How far CPU committed to sandboxes may exceed the node's cores
+    /// (`--cpu-overcommit`).
+    pub cpu_overcommit: f64,
     /// Public addresses: the uplink and ingress limits.
     pub public: crate::publicip::PublicConfig,
     /// Which shapes are warmed, and how many snapshots are kept.
@@ -619,6 +622,26 @@ impl LimitsUpdate {
 /// The host CPUs this node has.
 pub(crate) fn node_cpus() -> u32 {
     std::thread::available_parallelism().map_or(0, |n| n.get() as u32)
+}
+
+/// Refuses `more` CPU on a node of `cores` that has `committed`, all in
+/// thousandths of a CPU but the cores.
+#[allow(clippy::result_large_err)]
+fn cpu_fit(cores: u32, overcommit: f64, committed: u64, more: u64) -> Result<(), Status> {
+    let capacity = burrow_common::cpu::capacity_millis(cores, overcommit);
+    if committed + more <= capacity {
+        return Ok(());
+    }
+    let has = if overcommit == 1.0 {
+        format!("{cores} CPUs")
+    } else {
+        format!("{cores} CPUs overcommitted to {}", cpus_text(capacity))
+    };
+    Err(Status::resource_exhausted(format!(
+        "this node has {has} and {} committed; {} more do not fit",
+        cpus_text(committed),
+        cpus_text(more)
+    )))
 }
 
 /// The cgroup limits a sandbox's resources ask for, under a memory ceiling.
@@ -5983,17 +6006,13 @@ impl SandboxManager {
         if want <= current {
             return Ok(());
         }
-        let total = node_cpus() as u64 * 1000;
         let committed = self.committed_cpu_millis().await;
-        if committed + (want - current) > total {
-            return Err(Status::resource_exhausted(format!(
-                "this node has {} CPUs and {} committed; {} more do not fit",
-                cpus_text(total),
-                cpus_text(committed),
-                cpus_text(want - current)
-            )));
-        }
-        Ok(())
+        cpu_fit(
+            node_cpus(),
+            self.config.cpu_overcommit,
+            committed,
+            want - current,
+        )
     }
 
     pub async fn count(&self) -> usize {
@@ -11262,6 +11281,22 @@ impl burrow_proxy::dns::Redirect for InspectionRedirect {
 pub(crate) mod tests {
     use super::*;
 
+    /// Overcommit raises what a node admits to its cores times the ratio, and
+    /// a refusal says what it ran into.
+    #[test]
+    fn cpu_admission_allows_the_overcommitted_capacity() {
+        assert!(cpu_fit(4, 1.0, 3000, 1000).is_ok());
+        assert_eq!(
+            cpu_fit(4, 1.0, 4000, 500).unwrap_err().message(),
+            "this node has 4 CPUs and 4 committed; 0.5 more do not fit"
+        );
+        assert!(cpu_fit(4, 4.0, 15_000, 1000).is_ok());
+        assert_eq!(
+            cpu_fit(4, 4.0, 15_000, 2000).unwrap_err().message(),
+            "this node has 4 CPUs overcommitted to 16 and 15 committed; 2 more do not fit"
+        );
+    }
+
     /// A sandbox's limits become its cgroup's the way runc makes Docker's:
     /// a cap as cpu.max, shares as cpu.weight, Docker's default shares for
     /// each CPU charged when none are named, blkio weight as io.weight.
@@ -11501,6 +11536,7 @@ pub(crate) mod tests {
                     reserve_mib: Some(0),
                     ..Default::default()
                 },
+                cpu_overcommit: 1.0,
                 public: Default::default(),
                 warm: Default::default(),
                 checkpoint_min_secs: 60,
