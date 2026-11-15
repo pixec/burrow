@@ -2773,6 +2773,8 @@ pub struct SandboxManager {
     /// duplicate create is refused during the seconds a VM takes to build,
     /// rather than only before and after.
     creating: Arc<Mutex<std::collections::HashSet<String>>>,
+    /// Ids whose root disk is being replaced; see [`Self::require_settled`].
+    recreating: Arc<std::sync::Mutex<std::collections::HashSet<String>>>,
     /// `None` until the node is given a slice of the fleet's pool.
     ipam: Arc<Mutex<Option<Arc<Ipam>>>>,
     /// sandbox id -> published ports.
@@ -3082,6 +3084,7 @@ impl SandboxManager {
             cpu_admitted: Default::default(),
             cpu_admission: Default::default(),
             creating: Arc::new(Mutex::new(std::collections::HashSet::new())),
+            recreating: Default::default(),
             ipam: Default::default(),
             ports: Arc::new(Mutex::new(HashMap::new())),
             usernets: Default::default(),
@@ -4193,13 +4196,14 @@ impl SandboxManager {
             known.iter().map(|id| logs_root.join(id)).collect(),
         ));
 
+        let journaled = self.journaled_dirs().await;
         let mut removed = 0;
         for (root, live) in roots {
             let Ok(mut entries) = tokio::fs::read_dir(&root).await else {
                 continue;
             };
             while let Ok(Some(entry)) = entries.next_entry().await {
-                if live.contains(&entry.path()) {
+                if live.contains(&entry.path()) || journaled.contains(&entry.path()) {
                     continue;
                 }
                 if tokio::fs::remove_dir_all(entry.path()).await.is_ok() {
@@ -5225,6 +5229,7 @@ impl SandboxManager {
         sandbox_id: &str,
         network: common::NetworkPolicy,
     ) -> Result<common::Sandbox, Status> {
+        self.require_settled(sandbox_id)?;
         let sandbox = self.get(sandbox_id).await?;
 
         let previous = {
@@ -5279,6 +5284,7 @@ impl SandboxManager {
         sandbox_id: &str,
         tags: HashMap<String, String>,
     ) -> Result<common::Sandbox, Status> {
+        self.require_settled(sandbox_id)?;
         let sandbox = self.get(sandbox_id).await?;
         sandbox.base_record.lock().unwrap().tags = tags;
         self.persist(&sandbox).await;
@@ -5322,6 +5328,7 @@ impl SandboxManager {
         exec: Option<common::ExecPolicy>,
         fs: Option<common::FsPolicy>,
     ) -> Result<common::Sandbox, Status> {
+        self.require_settled(sandbox_id)?;
         let sandbox = self.get(sandbox_id).await?;
         apply_access_policy(
             sandbox
@@ -5351,6 +5358,7 @@ impl SandboxManager {
         lifetimes: Lifetimes,
         check: impl FnOnce(&common::SnapshotPolicy) -> Result<(), Status>,
     ) -> Result<common::Sandbox, Status> {
+        self.require_settled(sandbox_id)?;
         let sandbox = self.get(sandbox_id).await?;
         if lifetimes.checkpoint_secs.is_some_and(|secs| secs > 0) {
             self.require_checkpoint_store()?;
@@ -5411,6 +5419,7 @@ impl SandboxManager {
         limits: LimitsUpdate,
         boot: bool,
     ) -> Result<(common::Sandbox, ResourcesUpdated), Status> {
+        self.require_settled(id)?;
         let sandbox = self.get(id).await?;
         if !sandbox.is_running() {
             self.admit_shape(
@@ -7220,6 +7229,19 @@ impl SandboxManager {
             .await
     }
 
+    /// Refuses a call that would change a sandbox while its root disk is
+    /// being replaced: the recreate holds both the old and the new instance,
+    /// and puts one of them back in place when it ends.
+    #[allow(clippy::result_large_err)]
+    fn require_settled(&self, id: &str) -> Result<(), Status> {
+        match self.recreating.lock().unwrap().contains(id) {
+            true => Err(Status::aborted(format!(
+                "sandbox {id} is being recreated; try again once that finishes"
+            ))),
+            false => Ok(()),
+        }
+    }
+
     pub async fn get(&self, id: &str) -> Result<Arc<RunningSandbox>, Status> {
         if let Some(sandbox) = self.sandboxes.lock().await.get(id) {
             return Ok(Arc::clone(sandbox));
@@ -8341,6 +8363,7 @@ impl SandboxManager {
 
     /// Snapshots a sandbox to disk and stops its VMM.
     pub async fn pause(&self, id: &str) -> Result<common::Sandbox, Status> {
+        self.require_settled(id)?;
         let sandbox = self.get(id).await?;
         self.require_vmm(&sandbox).await?;
         sandbox.suspend().await?;
@@ -8423,6 +8446,7 @@ impl SandboxManager {
         snapshot_id: String,
         expiration_secs: u64,
     ) -> Result<common::Snapshot, Status> {
+        self.require_settled(sandbox_id)?;
         crate::snapshot::validate_id(&snapshot_id)?;
         let sandbox = self.get(sandbox_id).await?;
         require_kernel_carried(&sandbox, "snapshotted")?;
@@ -8629,6 +8653,7 @@ impl SandboxManager {
         node_id: String,
         name: String,
     ) -> Result<common::Sandbox, Status> {
+        self.require_settled(source_id)?;
         let source = self.get(source_id).await?;
         require_kernel_carried(&source, "forked")?;
 
@@ -9199,6 +9224,11 @@ impl SandboxManager {
 
     /// Restores a suspended sandbox from its snapshot.
     pub async fn resume(&self, id: &str) -> Result<common::Sandbox, Status> {
+        self.require_settled(id)?;
+        self.resume_now(id).await
+    }
+
+    async fn resume_now(&self, id: &str) -> Result<common::Sandbox, Status> {
         let sandbox = self.get(id).await?;
         if sandbox.state.load(std::sync::atomic::Ordering::Relaxed)
             == common::SandboxState::Stopped as i32
@@ -9318,6 +9348,7 @@ impl SandboxManager {
     /// One that cannot be resumed is stopped on what its disk holds, and the
     /// reason says its memory was discarded.
     pub async fn stop(&self, id: &str) -> Result<common::Sandbox, Status> {
+        self.require_settled(id)?;
         let sandbox = self.get(id).await?;
         self.halt(&sandbox, false).await
     }
@@ -9332,7 +9363,7 @@ impl SandboxManager {
     ) -> Result<common::Sandbox, Status> {
         let id = sandbox.id();
         let discarded = match sandbox.is_suspended() {
-            true => self.resume(id).await.err(),
+            true => self.resume_now(id).await.err(),
             false => None,
         };
         if let Some(err) = &discarded {
@@ -9437,6 +9468,11 @@ impl SandboxManager {
     /// Boots a stopped sandbox on its existing disks, and on its template's
     /// current kernel unless `is_kernel_kept`, which boots the one it last ran.
     pub async fn start(&self, id: &str, is_kernel_kept: bool) -> Result<common::Sandbox, Status> {
+        self.require_settled(id)?;
+        self.start_now(id, is_kernel_kept).await
+    }
+
+    async fn start_now(&self, id: &str, is_kernel_kept: bool) -> Result<common::Sandbox, Status> {
         let sandbox = self.get(id).await?;
         if sandbox.durable.is_fenced() {
             return Err(Status::unavailable(format!(
@@ -9627,6 +9663,7 @@ impl SandboxManager {
     }
 
     pub async fn delete(&self, id: &str) -> Result<(), Status> {
+        self.require_settled(id)?;
         let held = self.held.lock().unwrap().remove(id);
         if let Some(held) = held {
             self.remove_held(held).await;
@@ -10302,6 +10339,7 @@ impl SandboxManager {
     /// Suspends a sandbox, makes sure its state is in the store, and lets go
     /// of it here.
     pub async fn release(&self, id: &str) -> Result<common::Sandbox, Status> {
+        self.require_settled(id)?;
         if self.config.object_store.is_none() {
             return Err(Status::failed_precondition(
                 "this node has no object store to move sandboxes through",
@@ -10875,7 +10913,11 @@ impl SandboxManager {
                 .lock()
                 .await
                 .values()
-                .filter(|sandbox| sandbox.is_running() && sandbox.lifetime().checkpoint_secs > 0)
+                .filter(|sandbox| {
+                    sandbox.is_running()
+                        && sandbox.lifetime().checkpoint_secs > 0
+                        && self.require_settled(sandbox.id()).is_ok()
+                })
                 .cloned()
                 .collect();
             {

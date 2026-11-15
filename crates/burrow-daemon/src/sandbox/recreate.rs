@@ -58,17 +58,36 @@ fn within(base: &Path, tree: &Path, workdir: &Path) -> PathBuf {
     base.join(workdir.strip_prefix(tree).unwrap_or(Path::new("")))
 }
 
-/// Puts the old directory back where it was and removes the replacement,
-/// wherever a recreate stopped. Before the switch only the staged directory
-/// exists; after it the retired one does, and whatever holds the sandbox's
-/// directory is the replacement.
-async fn restore_dirs(old_tree: &Path, tree: &Path) -> std::io::Result<()> {
-    let prev = retired(old_tree);
-    if tokio::fs::try_exists(&prev).await? {
-        if tokio::fs::try_exists(tree).await? {
-            tokio::fs::remove_dir_all(tree).await?;
-        }
-        tokio::fs::rename(&prev, old_tree).await?;
+/// Which of the two renames that put the replacement in place were made.
+#[derive(Debug, Clone, Copy, Default)]
+struct Moved {
+    /// The old directory to its retired place.
+    old: bool,
+    /// The staged directory to the sandbox's.
+    new: bool,
+}
+
+impl Moved {
+    /// What a recreate the node died in had done, read from what is on disk.
+    /// The retired place is cleared before a journal is written, so a
+    /// retired directory under a journal is that recreate's.
+    async fn found(old_tree: &Path, tree: &Path) -> std::io::Result<Self> {
+        let old = tokio::fs::try_exists(retired(old_tree)).await?;
+        Ok(Self {
+            old,
+            new: old && tokio::fs::try_exists(tree).await?,
+        })
+    }
+}
+
+/// Undoes the renames in `moved` and removes the staged directory, so the
+/// old directory is where it was and nothing of the replacement is left.
+async fn restore_dirs(old_tree: &Path, tree: &Path, moved: Moved) -> std::io::Result<()> {
+    if moved.new {
+        tokio::fs::remove_dir_all(tree).await?;
+    }
+    if moved.old {
+        tokio::fs::rename(retired(old_tree), old_tree).await?;
     }
     let next = staged(tree);
     if tokio::fs::try_exists(&next).await? {
@@ -125,13 +144,13 @@ impl SandboxManager {
         F: FnOnce(Arc<RunningSandbox>) -> Fut,
         Fut: std::future::Future<Output = Result<(), Status>>,
     {
-        if !self.creating.lock().await.insert(id.to_string()) {
+        if !self.recreating.lock().unwrap().insert(id.to_string()) {
             return Err(Status::aborted(format!(
-                "sandbox {id} is already being created or recreated"
+                "sandbox {id} is already being recreated"
             )));
         }
         let recreated = self.recreate_claimed(id, replacement, ready).await;
-        self.creating.lock().await.remove(id);
+        self.recreating.lock().unwrap().remove(id);
         recreated
     }
 
@@ -228,10 +247,14 @@ impl SandboxManager {
         let next = staged(&tree);
         let staged_workdir = within(&next, &tree, &workdir);
         let made = async {
-            if tokio::fs::try_exists(&next).await.unwrap_or(false) {
-                tokio::fs::remove_dir_all(&next).await.map_err(|err| {
-                    Status::internal(format!("clearing {}: {err}", next.display()))
-                })?;
+            // Left by an earlier recreate that could not finish removing
+            // them, and nothing this one may take for its own.
+            for leftover in [&next, &retired(&old_tree)] {
+                if tokio::fs::try_exists(leftover).await.unwrap_or(false) {
+                    tokio::fs::remove_dir_all(leftover).await.map_err(|err| {
+                        Status::internal(format!("clearing {}: {err}", leftover.display()))
+                    })?;
+                }
             }
             let template_dir = templates_dir.join(&template);
             if is_macos {
@@ -288,6 +311,7 @@ impl SandboxManager {
             return Err(err);
         }
 
+        let mut moved = Moved::default();
         let switched = async {
             self.claim_volumes(id, &policy.volumes, guest_os).await?;
             let linked = async {
@@ -306,7 +330,10 @@ impl SandboxManager {
                 tokio::fs::rename(&old_tree, retired(&old_tree))
                     .await
                     .map_err(io)?;
-                tokio::fs::rename(&next, &tree).await.map_err(io)
+                moved.old = true;
+                tokio::fs::rename(&next, &tree).await.map_err(io)?;
+                moved.new = true;
+                Ok(())
             }
             .await;
             if linked.is_err() {
@@ -316,7 +343,9 @@ impl SandboxManager {
         }
         .await;
         if let Err(err) = switched {
-            return Err(self.roll_back(&old, None, &tree, was_running, err).await);
+            return Err(self
+                .roll_back(&old, None, &tree, moved, was_running, err)
+                .await);
         }
 
         let mut record = old.base_record.lock().unwrap().clone();
@@ -327,6 +356,11 @@ impl SandboxManager {
         record.policy = Some(policy);
         record.state = common::SandboxState::Stopped as i32;
         record.state_reason.clear();
+        // A Kit's are set again by its `ready`; a plain template has none.
+        record.kit = None;
+        record.env.clear();
+        record.kit_credentials.clear();
+        record.kit_selection.clear();
         let new = Arc::new(RunningSandbox {
             id: id.to_string(),
             template,
@@ -357,7 +391,7 @@ impl SandboxManager {
 
         let booted = async {
             self.sync_firewall().await?;
-            self.start(id, true).await?;
+            self.start_now(id, true).await?;
             if !keep.is_empty() {
                 let old_disk = within(&retired(&old_tree), &old_tree, &old.workdir)
                     .join(crate::rootdisk::ROOT_DISK);
@@ -368,10 +402,13 @@ impl SandboxManager {
         .await;
         if let Err(err) = booted {
             return Err(self
-                .roll_back(&old, Some(&new), &tree, was_running, err)
+                .roll_back(&old, Some(&new), &tree, moved, was_running, err)
                 .await);
         }
 
+        if !self.holds(&new).await {
+            return Err(self.abandon(id, &old_tree, &tree, moved).await);
+        }
         self.persist(&new).await;
         if let Err(err) = Journal::remove(&self.config.data_dir, id).await {
             tracing::error!(sandbox = id, %err, "could not remove the recreate's journal");
@@ -386,15 +423,24 @@ impl SandboxManager {
     /// Puts `old` back on its own disk after a recreate that failed with
     /// `err`, taking down `new` if it got as far as existing, and boots `old`
     /// again if it was running.
+    #[allow(clippy::too_many_arguments)]
     async fn roll_back(
         &self,
         old: &Arc<RunningSandbox>,
         new: Option<&Arc<RunningSandbox>>,
         tree: &Path,
+        moved: Moved,
         was_running: bool,
         err: Status,
     ) -> Status {
         let id = old.id();
+        let old_tree = self.config.tree_of(&old.workdir).to_path_buf();
+        if let Some(new) = new
+            && !self.holds(new).await
+        {
+            self.abandon(id, &old_tree, tree, moved).await;
+            return err;
+        }
         if let Some(new) = new {
             let _ = new.shutdown().await;
             self.volumes.release_all(id);
@@ -407,8 +453,7 @@ impl SandboxManager {
                 tracing::error!(sandbox = id, err = err.message(), "restoring the old rules");
             }
         }
-        let old_tree = self.config.tree_of(&old.workdir).to_path_buf();
-        if let Err(io) = restore_dirs(&old_tree, tree).await {
+        if let Err(io) = restore_dirs(&old_tree, tree, moved).await {
             tracing::error!(sandbox = id, err = %io, "could not put the old root disk back");
             return Status::new(
                 err.code(),
@@ -424,7 +469,7 @@ impl SandboxManager {
             tracing::error!(sandbox = id, %err, "could not remove the recreate's journal");
         }
         let restarted = match was_running {
-            true => match self.start(id, true).await {
+            true => match self.start_now(id, true).await {
                 Ok(_) => crate::kit::restart(self, id).await.err(),
                 Err(err) => Some(err),
             },
@@ -439,6 +484,56 @@ impl SandboxManager {
             ),
         };
         Status::new(err.code(), message)
+    }
+
+    /// Whether `new` is still the sandbox this node holds under its id. Only
+    /// a lifecycle call that should have been refused could have changed it.
+    async fn holds(&self, new: &Arc<RunningSandbox>) -> bool {
+        self.sandboxes
+            .lock()
+            .await
+            .get(new.id())
+            .is_some_and(|held| Arc::ptr_eq(held, new))
+    }
+
+    /// Lets go of a recreate whose sandbox was taken out from under it: what
+    /// it left on disk goes, and nothing is put back or recorded.
+    async fn abandon(&self, id: &str, old_tree: &Path, tree: &Path, moved: Moved) -> Status {
+        tracing::error!(sandbox = id, "a recreate's sandbox went away under it");
+        if moved.old {
+            let _ = tokio::fs::remove_dir_all(retired(old_tree)).await;
+        }
+        let _ = tokio::fs::remove_dir_all(staged(tree)).await;
+        let _ = Journal::remove(&self.config.data_dir, id).await;
+        Status::aborted(format!(
+            "sandbox {id} was removed while it was being recreated"
+        ))
+    }
+
+    /// Every directory a recreate journal still names or implies, under any
+    /// hypervisor: kept out of the orphan sweep while a journal recovery
+    /// could not undo is waiting for someone to look at it.
+    pub(super) async fn journaled_dirs(&self) -> std::collections::HashSet<PathBuf> {
+        let mut dirs = std::collections::HashSet::new();
+        let Ok(mut entries) = tokio::fs::read_dir(Journal::dir(&self.config.data_dir)).await else {
+            return dirs;
+        };
+        while let Ok(Some(entry)) = entries.next_entry().await {
+            let name = entry.file_name();
+            let Some(id) = name.to_str().and_then(|name| name.strip_suffix(".json")) else {
+                continue;
+            };
+            for hypervisor in burrow_vmm::Hypervisor::ALL {
+                let tree = self
+                    .config
+                    .tree_of(&self.config.sandbox_dir(id, hypervisor))
+                    .to_path_buf();
+                dirs.insert(staged(&tree));
+                dirs.insert(retired(&tree));
+                dirs.insert(tree);
+            }
+        }
+        dirs
     }
 
     /// Undoes recreates a previous run of this node left between the halt and
@@ -472,7 +567,25 @@ impl SandboxManager {
                     continue;
                 }
             };
-            if let Err(err) = restore_dirs(&journal.old_tree, &journal.tree).await {
+            let moved = match Moved::found(&journal.old_tree, &journal.tree).await {
+                Ok(moved) => moved,
+                Err(err) => {
+                    tracing::error!(sandbox = id, %err, "could not read an interrupted recreate");
+                    continue;
+                }
+            };
+            // Neither the retired nor the staged directory: the recreate got
+            // past its commit, or its rollback did, and only the journal's
+            // removal failed. The store already matches the disk.
+            if !moved.old
+                && !tokio::fs::try_exists(staged(&journal.tree))
+                    .await
+                    .unwrap_or(true)
+            {
+                let _ = Journal::remove(&self.config.data_dir, &id).await;
+                continue;
+            }
+            if let Err(err) = restore_dirs(&journal.old_tree, &journal.tree, moved).await {
                 tracing::error!(sandbox = id, %err, "could not undo an interrupted recreate");
                 continue;
             }
@@ -549,7 +662,7 @@ mod tests {
         assert!(!staged(&tree).exists());
         assert!(!retired(&old.workdir).exists());
         assert!(!Journal::path(&manager.config.data_dir, old.id()).exists());
-        assert!(!manager.creating.lock().await.contains(old.id()));
+        assert!(!manager.recreating.lock().unwrap().contains(old.id()));
     }
 
     /// A plain recreate on a node that has lost the template used to delete
@@ -643,7 +756,9 @@ mod tests {
     }
 
     /// A replacement that is made but does not boot puts the old disk back,
-    /// and the record the store holds is the old one.
+    /// and the record the store holds is the old one. A retired directory an
+    /// earlier recreate left behind is cleared first rather than mistaken
+    /// for this one's.
     #[tokio::test]
     async fn a_recreate_whose_guest_does_not_boot_puts_the_old_disk_back() {
         let (manager, data_dir) = recovering("recreate-boot").await;
@@ -653,6 +768,11 @@ mod tests {
         old.base_record.lock().unwrap().template = "default".into();
         tokio::fs::create_dir_all(&old.workdir).await.unwrap();
         tokio::fs::write(old.workdir.join(crate::rootdisk::ROOT_DISK), b"old")
+            .await
+            .unwrap();
+        let stale = retired(&old.workdir);
+        tokio::fs::create_dir_all(&stale).await.unwrap();
+        tokio::fs::write(stale.join(crate::rootdisk::ROOT_DISK), b"stale")
             .await
             .unwrap();
         manager
@@ -705,6 +825,124 @@ mod tests {
         );
         assert_untouched(&manager, &old, b"old").await;
         let _ = tokio::fs::remove_dir_all(&workdir).await;
+        let _ = tokio::fs::remove_dir_all(&data_dir).await;
+    }
+
+    /// Nothing else may change a sandbox while it is recreated: a delete
+    /// would tear down the new instance's tap and lease, and the recreate
+    /// would then put the old one back on an address no longer its own.
+    #[tokio::test]
+    async fn lifecycle_calls_wait_for_a_recreate() {
+        let manager = crate::sandbox::tests::manager().await;
+        let sandbox = running("sbx_recreate_busy");
+        let id = sandbox.id().to_string();
+        manager
+            .sandboxes
+            .lock()
+            .await
+            .insert(id.clone(), Arc::clone(&sandbox));
+        manager.recreating.lock().unwrap().insert(id.clone());
+
+        let refused = [
+            manager.delete(&id).await.err(),
+            manager.stop(&id).await.err(),
+            manager.start(&id, false).await.err(),
+            manager.pause(&id).await.err(),
+            manager.resume(&id).await.err(),
+            manager.release(&id).await.err(),
+        ];
+        for err in refused {
+            let err = err.expect("refused");
+            assert_eq!(err.code(), tonic::Code::Aborted);
+            assert!(
+                err.message().contains("being recreated"),
+                "{}",
+                err.message()
+            );
+        }
+        let again = manager
+            .recreate(&id, replacement("fresh"), |_| async { Ok(()) })
+            .await
+            .unwrap_err();
+        assert_eq!(again.code(), tonic::Code::Aborted);
+        assert!(manager.get(&id).await.is_ok());
+    }
+
+    /// A recreate whose sandbox was removed under it anyway does not put the
+    /// old one back or record it: it removes what it left and says so.
+    #[tokio::test]
+    async fn a_recreate_whose_sandbox_was_removed_lets_go() {
+        let (manager, data_dir) = recovering("recreate-gone").await;
+        let old = running("sbx_recreate_gone");
+        let new = running("sbx_recreate_gone");
+        let old_tree = old.workdir.clone();
+        std::fs::create_dir_all(retired(&old_tree)).unwrap();
+        Journal {
+            old_tree: old_tree.clone(),
+            tree: old_tree.clone(),
+            template: "default".into(),
+            record: String::new(),
+        }
+        .write(&data_dir, old.id())
+        .await
+        .unwrap();
+        let moved = Moved {
+            old: true,
+            new: true,
+        };
+
+        let err = manager
+            .roll_back(
+                &old,
+                Some(&new),
+                &old_tree,
+                moved,
+                true,
+                Status::internal("keep failed"),
+            )
+            .await;
+
+        assert_eq!(err.message(), "keep failed");
+        assert!(
+            manager.get(old.id()).await.is_err(),
+            "the old sandbox is not put back"
+        );
+        assert!(manager.store.list_sandboxes().await.unwrap().is_empty());
+        assert!(!retired(&old_tree).exists());
+        assert!(!Journal::path(&data_dir, old.id()).exists());
+        let _ = tokio::fs::remove_dir_all(&data_dir).await;
+    }
+
+    /// A journal whose recreate got past its commit, or its rollback, before
+    /// the node died leaves neither directory behind; the store already
+    /// matches the disk, so the journal goes and nothing is restored.
+    #[tokio::test]
+    async fn a_journal_outliving_its_recreate_is_dropped() {
+        let (manager, data_dir) = recovering("recreate-done").await;
+        let id = "sbx_recreate_done";
+        let tree = manager.config.sandbox_dir(id, Hypervisor::Firecracker);
+        std::fs::create_dir_all(&tree).unwrap();
+        Journal {
+            old_tree: tree.clone(),
+            tree: tree.clone(),
+            template: "before".into(),
+            record: String::new(),
+        }
+        .write(&data_dir, id)
+        .await
+        .unwrap();
+        assert!(manager.journaled_dirs().await.contains(&retired(&tree)));
+        let mut row = crate::sandbox::tests::row(id, common::SandboxState::Stopped, 1);
+        row.template = "after".into();
+        manager.store.put_sandbox(&row).await.unwrap();
+
+        let rows = manager
+            .undo_recreations(manager.store.list_sandboxes().await.unwrap())
+            .await;
+
+        assert_eq!(rows[0].template, "after");
+        assert!(tree.exists());
+        assert!(!Journal::path(&data_dir, id).exists());
         let _ = tokio::fs::remove_dir_all(&data_dir).await;
     }
 
