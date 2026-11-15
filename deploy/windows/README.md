@@ -15,11 +15,11 @@ is activated.
   34 s. The unattended install at 4 vCPU / 6 GiB reaches SetupComplete in
   about 9 minutes and uses 9.0 GB of a 64 GiB sparse disk. SetupComplete
   installs virtio-win's 2k22 amd64 drivers (all but smbus, refused for its
-  certificate), opens the firewall, sets the static IP and installs the agent
+  certificate), opens ICMP, sets the static IP and installs the agent
   service.
 - **Boot**: serial shows edk2, bootmgr and the SAC console. The agent answers
   on vsock 12 s after CH starts, and a cold handshake takes 2.6 s, most of it
-  configuring the NIC. RDP (NLA) logs in as `burrow`. `VirtIO Socket Driver`
+  configuring the NIC. With `RDP=1`, RDP (NLA) logs in. `VirtIO Socket Driver`
   and `Microsoft Hyper-V Generation Counter` are bound.
 - **Snapshot/restore (raw CH)**: pause and snapshot of 6 GiB takes 12 s;
   restore 5.7 s cold, 2.7 s with a warm page cache, since CH copies all of
@@ -31,6 +31,25 @@ is activated.
   as `nt authority\system`. `stop` takes 24 s, `start` 1.5 s, and a file
   written before the stop is there after it, with the clock right. `rm` takes
   0.2 s and leaves no CH process or tap.
+
+## Credentials and identity
+
+- The repo holds no password. `build-media.sh` sets the built-in
+  Administrator's from `ADMIN_PASSWORD`, or makes a random one and prints it
+  once. Setup writes it into the image, there is no other account and no
+  AutoLogon, and the agent runs as SYSTEM, so nothing in Burrow needs it.
+  Per-sandbox credentials will come from the agent, through a planned
+  password-reset call.
+- Remote Desktop is off and its firewall rule closed unless the media is
+  built with `RDP=1`. Every sandbox of a template shares its Administrator
+  password, so leave it off for a template others create from.
+- Known limitation: the image is not sysprep-generalized, so every sandbox of
+  a template has the same machine SID and computer name. That is harmless for
+  standalone machines but breaks joining more than one to a domain.
+  Generalizing would make each clone run specialize and OOBE on its first
+  boot, minutes per create, and clones restored from a snapshot would still
+  share whatever SID the snapshot holds, so it waits on a per-sandbox
+  identity step through the agent.
 
 ## Making a template
 
@@ -56,7 +75,10 @@ rewritten with the same partition GUIDs, which the BCD names). It boots, and
 also boots grown.
 
 burrowd needs `--cloud-hypervisor-firmware` pointing at CH's edk2 build
-(`CLOUDHV.fd` on x86_64) when it is not at the default path.
+(`CLOUDHV.fd` on x86_64) when it is not at the default path, and an
+`--agent-timeout` of 90 or more: at 2 vCPUs / 4096 MiB the agent is up 25-30 s
+after CH starts with the image in the page cache, and later than the default
+30 s without it.
 
 ## How Burrow runs a Windows guest
 
@@ -67,10 +89,9 @@ burrowd needs `--cloud-hypervisor-firmware` pointing at CH's edk2 build
 - No TPM: Server 2022 needs none. Windows 11 would need swtpm per sandbox, and
   Ubuntu's AppArmor profile for swtpm only lets it write under `$HOME` and
   libvirt's directories, so it needs a local rule for `/var/lib/burrow`.
-- Creates and warm builds below 2 vCPUs / 4096 MiB are refused. The pinned
-  1x512 warm shape is skipped for Windows templates, and a 4x6144 snapshot
-  (24 GiB image plus memory) is over this node's default warm disk caps, so
-  Windows sandboxes cold-boot here.
+- Creates below 2 vCPUs / 4096 MiB are refused. Windows templates are not
+  warmed, and fork, snapshot, move and checkpoint of a Windows sandbox are
+  refused with `FailedPrecondition`.
 - Windows has no kernel command line, so the network settings travel in the
   handshake on every boot, and Windows guests are never sent the Linux agent
   as an upgrade.
@@ -83,7 +104,7 @@ burrowd needs `--cloud-hypervisor-firmware` pointing at CH's edk2 build
 | --- | --- |
 | `fetch-uup.sh` | UUP set from Microsoft's CDN (Windows 11 arm64) |
 | `fetch-virtio.sh` | virtio-win drivers for `VIRTIO_OS` (w11, 2k22, ...) and `VIRTIO_ARCH` (ARM64, amd64); macOS or Linux |
-| `build-media.sh` | installer disk from an ISO or UUP set; `ARCH`, `IMAGE`, `PRODUCT_KEY` |
+| `build-media.sh` | installer disk from an ISO or UUP set; `ARCH`, `IMAGE`, `PRODUCT_KEY`, `ADMIN_PASSWORD`, `RDP` |
 | `autounattend.xml`, `pe.cmd`, `winpeshl.ini`, `SetupComplete.cmd` | unattended install |
 | `run-vm.sh`, `stop-vm.sh` | install/run/restore by hand under CH; `CH`, `FW`, `TPM`, `TPM_DIR`, `VCPUS`, `MEMORY_MIB`, `DISK_MIB` |
 | `restore-test.sh` | snapshot once, restore twice, time it and check clock, RNG and network |
@@ -94,7 +115,7 @@ Server 2022 on x86_64:
 ```sh
 VIRTIO_OS=2k22 VIRTIO_ARCH=amd64 sh fetch-virtio.sh ~/win
 cargo zigbuild -p burrow-guest --target x86_64-pc-windows-gnullvm --release
-ARCH=amd64 IMAGE="Desktop Experience" PRODUCT_KEY= \
+ARCH=amd64 IMAGE="Desktop Experience" PRODUCT_KEY= ADMIN_PASSWORD=... \
   sh build-media.sh server2022-eval.iso ~/win/virtio-amd64 \
   target/x86_64-pc-windows-gnullvm/release/burrow-guest.exe ~/win/media.img
 DIR=/var/lib/burrow/spike-win VCPUS=4 MEMORY_MIB=6144 sh run-vm.sh install
@@ -104,8 +125,13 @@ DIR=/var/lib/burrow/spike-win VCPUS=4 MEMORY_MIB=6144 sh run-vm.sh install
 
 - A template import command for installed disks, and a disk-size floor for
   Windows against the node's disk cap.
-- Warm snapshots for Windows: the warm disk caps count the template's whole
-  image, which leaves no room on a small node.
+- Warm snapshots, fork, snapshots, moves and durable state for Windows. Each
+  carries the template's `vmlinux` and the Linux agent's digest, so they are
+  refused for Windows guests for now, and creates of a Windows template always
+  boot cold.
+- A password-reset call in the agent, and per-sandbox machine identity.
+- An agent timeout per guest OS, so a node running Windows need not wait as
+  long for a Linux guest that never comes up.
 - swtpm per sandbox, and the AppArmor rule, for Windows 11.
 - Shipping the Windows agent build beside the Linux one, so Windows guests
   can be upgraded.

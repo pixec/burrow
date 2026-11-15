@@ -15,7 +15,9 @@
 # Environment: ARCH (amd64 or arm64, default arm64), IMAGE (the install.wim
 # image name to install, default the first matching "Windows 11"),
 # PRODUCT_KEY (default Windows 11 Pro's generic key; empty for evaluation
-# media, which takes none).
+# media, which takes none), ADMIN_PASSWORD (the built-in Administrator's;
+# unset, a random one is made and printed once), RDP (1 turns Remote Desktop
+# on and opens its firewall rule; off by default).
 # Needs: wimlib-imagex cabextract mkfs.fat mcopy python3, 7z for an ISO.
 set -eu
 src=$1
@@ -94,10 +96,27 @@ done
 crlf() { perl -pe 's/\r?\n/\r\n/' "$1" > "$2"; }
 crlf "$here/pe.cmd" "$work/pe/pe.cmd"
 crlf "$here/winpeshl.ini" "$work/winpeshl.ini"
-sed -e "s/processorArchitecture=\"arm64\"/processorArchitecture=\"$arch\"/" \
-  -e "s/@KEY@/$key/" "$here/autounattend.xml" > "$work/pe/autounattend.xml"
-[ -n "$key" ] || sed -i.bak '/<ProductKey>/d' "$work/pe/autounattend.xml"
-rm -f "$work/pe/autounattend.xml.bak"
+ARCH=$arch KEY=$key RDP=${RDP:-0} python3 -I - "$here/autounattend.xml" "$work/pe/autounattend.xml" <<'PY'
+import os, secrets, string, sys
+from xml.sax.saxutils import escape
+password = os.environ.get("ADMIN_PASSWORD") or ""
+if not password:
+    alphabet = string.ascii_letters + string.digits
+    password = "".join(secrets.choice(alphabet) for _ in range(20)) + "-9a"
+    print(f"Administrator password (not stored anywhere): {password}", file=sys.stderr)
+rdp = os.environ["RDP"] == "1"
+text = open(sys.argv[1]).read()
+text = text.replace('processorArchitecture="arm64"', f'processorArchitecture="{os.environ["ARCH"]}"')
+text = text.replace("@ADMIN_PASSWORD@", escape(password))
+text = text.replace("@RDP_DENY@", str(not rdp).lower()).replace("@RDP@", str(rdp).lower())
+key = os.environ["KEY"]
+lines = text.splitlines(keepends=True)
+if key:
+    text = text.replace("@KEY@", key)
+else:
+    text = "".join(line for line in lines if "<ProductKey>" not in line)
+open(sys.argv[2], "w").write(text)
+PY
 printf "add '%s' /burrow\nadd '%s' /Windows/System32/winpeshl.ini\n" "$work/pe" "$work/winpeshl.ini" |
   wimlib-imagex update "$iso/sources/boot.wim" 1
 

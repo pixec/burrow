@@ -1,6 +1,7 @@
 <?xml version="1.0" encoding="utf-8"?>
 <!-- Unattended Windows install for a Cloud Hypervisor guest. build-media.sh
-     sets processorArchitecture and the product key. Setup is
+     sets processorArchitecture, the product key, the Administrator password
+     and whether Remote Desktop is on. Setup is
      started by pe.cmd with /unattend, after it has loaded viostor in WinPE.
      Disk 0 is the target (the first virtio-blk disk on the command line). -->
 <unattend xmlns="urn:schemas-microsoft-com:unattend" xmlns:wcm="http://schemas.microsoft.com/WMIConfig/2002/State">
@@ -53,11 +54,11 @@
       <TimeZone>UTC</TimeZone>
     </component>
     <component name="Microsoft-Windows-TerminalServices-LocalSessionManager" processorArchitecture="arm64" publicKeyToken="31bf3856ad364e35" language="neutral" versionScope="nonSxS">
-      <fDenyTSConnections>false</fDenyTSConnections>
+      <fDenyTSConnections>@RDP_DENY@</fDenyTSConnections>
     </component>
     <component name="Networking-MPSSVC-Svc" processorArchitecture="arm64" publicKeyToken="31bf3856ad364e35" language="neutral" versionScope="nonSxS">
       <FirewallGroups>
-        <FirewallGroup wcm:action="add" wcm:keyValue="rdp"><Active>true</Active><Group>Remote Desktop</Group><Profile>all</Profile></FirewallGroup>
+        <FirewallGroup wcm:action="add" wcm:keyValue="rdp"><Active>@RDP@</Active><Group>Remote Desktop</Group><Profile>all</Profile></FirewallGroup>
       </FirewallGroups>
     </component>
     <component name="Microsoft-Windows-Deployment" processorArchitecture="arm64" publicKeyToken="31bf3856ad364e35" language="neutral" versionScope="nonSxS">
@@ -80,24 +81,8 @@
         <ProtectYourPC>3</ProtectYourPC>
       </OOBE>
       <UserAccounts>
-        <AdministratorPassword><Value>Burrow-spike-1</Value><PlainText>true</PlainText></AdministratorPassword>
-        <LocalAccounts>
-          <LocalAccount wcm:action="add">
-            <Name>burrow</Name>
-            <Group>Administrators</Group>
-            <Password><Value>Burrow-spike-1</Value><PlainText>true</PlainText></Password>
-          </LocalAccount>
-        </LocalAccounts>
+        <AdministratorPassword><Value>@ADMIN_PASSWORD@</Value><PlainText>true</PlainText></AdministratorPassword>
       </UserAccounts>
-      <AutoLogon>
-        <Enabled>true</Enabled>
-        <Username>burrow</Username>
-        <Password><Value>Burrow-spike-1</Value><PlainText>true</PlainText></Password>
-        <LogonCount>1</LogonCount>
-      </AutoLogon>
-      <FirstLogonCommands>
-        <SynchronousCommand wcm:action="add"><Order>1</Order><CommandLine>cmd /c echo logged-on %DATE% %TIME% &gt;&gt; C:\burrow\progress.log</CommandLine></SynchronousCommand>
-      </FirstLogonCommands>
     </component>
   </settings>
 </unattend>
