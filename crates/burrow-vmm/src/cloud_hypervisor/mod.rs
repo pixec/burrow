@@ -33,7 +33,7 @@ use tokio::process::{Child, Command};
 use crate::cgroup::Cgroup;
 use crate::error::{Error, Result};
 use crate::http::UnixHttp;
-use crate::{DriveSpec, VSOCK_UDS, VmSpec};
+use crate::{DriveSpec, GuestOs, VSOCK_UDS, VmSpec};
 
 pub use jail::ChJail;
 
@@ -78,10 +78,15 @@ const FIRST_HOST_PORT: u32 = 1 << 30;
 const STALE_PORT_WINDOW: u32 = 64;
 const STALE_PORT_TIMEOUT: Duration = Duration::from_secs(2);
 
+/// Cloud Hypervisor's edk2 build, where the node image installs it.
+pub const DEFAULT_FIRMWARE: &str = "/usr/local/share/cloud-hypervisor/CLOUDHV_EFI.fd";
+
 /// How this node runs Cloud Hypervisor.
 #[derive(Debug, Clone)]
 pub struct CloudHypervisorConfig {
     pub bin: PathBuf,
+    /// The edk2 build a guest without a kernel boots, Windows included.
+    pub firmware: PathBuf,
     /// Confines the VMM. `None` runs it as the daemon runs, root with the
     /// host's filesystem in view.
     pub jail: Option<ChJail>,
@@ -102,6 +107,8 @@ pub struct ChVm {
     /// [`Self::workdir`] as the VMM sees it.
     vmm_workdir: PathBuf,
     jail: Option<ChJail>,
+    /// What [`config::disk`] opens a hotplugged drive for.
+    guest_os: GuestOs,
     boot_latency: Duration,
     /// Held for the VM's lifetime; removed once the process is reaped.
     cgroup: Option<Cgroup>,
@@ -295,6 +302,7 @@ impl ChVm {
             workdir: spec.workdir.clone(),
             vmm_workdir: jail::vmm_workdir(&spec.workdir, config.jail.as_ref())?,
             jail: config.jail.clone(),
+            guest_os: spec.guest_os,
             boot_latency: Duration::ZERO,
             cgroup,
             console_in: None,
@@ -519,7 +527,7 @@ impl ChVm {
             .call(
                 Method::PUT,
                 "/api/v1/vm.add-disk",
-                Some(&config::disk(drive)),
+                Some(&config::disk(drive, self.guest_os)),
             )
             .await
             .map(|_| ())

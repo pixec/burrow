@@ -730,7 +730,7 @@ pub async fn build_warm_snapshot(
         agent_timeout,
         &lease,
         trust,
-        config.guest_upgrade.as_deref(),
+        config.upgrade_for(guest_os),
         capabilities.is_tap_networked && guest_os == burrow_vmm::GuestOs::Linux,
     )
     .await;

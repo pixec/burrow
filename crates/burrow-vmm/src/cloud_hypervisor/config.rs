@@ -14,14 +14,6 @@ use super::{CONSOLE_PIPE, CloudHypervisorConfig};
 
 /// The id the NIC is created under, so a restore can find it to retarget it.
 pub(crate) const NET_ID: &str = "net0";
-/// Cloud Hypervisor's edk2 build, where the node image installs it. A Windows
-/// guest boots it from its disk instead of a kernel.
-const UEFI_FIRMWARE: &str = "/usr/local/share/cloud-hypervisor/CLOUDHV_EFI.fd";
-/// swtpm's socket in the VM's working directory, for Windows 11's TPM 2.0.
-const TPM_SOCK: &str = "swtpm.sock";
-/// Windows 11's own minimums; Setup and the OOBE refuse less.
-const WINDOWS_MIN_VCPUS: u32 = 2;
-const WINDOWS_MIN_MEM_MIB: u32 = 4096;
 const MIB: u64 = 1024 * 1024;
 
 /// One disk as Cloud Hypervisor is given it, at boot and on hotplug alike.
@@ -38,13 +30,15 @@ const MIB: u64 = 1024 * 1024;
 /// `direct` opens the image `O_DIRECT`. Buffered, the host page cache of
 /// everything the guest read or wrote was charged to the VMM's cgroup, whose
 /// ceiling is the guest's memory plus a little: reclaim inside it stalled the
-/// guest. The guest caches its own disk.
-pub(crate) fn disk(drive: &crate::DriveSpec) -> Value {
+/// guest. The guest caches its own disk. Not for Windows: Cloud Hypervisor
+/// then gives the disk 4096-byte logical blocks, and neither its firmware nor
+/// Windows finds the GPT of a disk installed with 512-byte sectors.
+pub(crate) fn disk(drive: &crate::DriveSpec, guest_os: GuestOs) -> Value {
     json!({
         "id": drive.id,
         "path": drive.path,
         "readonly": drive.is_read_only,
-        "direct": true,
+        "direct": guest_os == GuestOs::Linux,
         "image_type": "Raw",
         // What a Windows guest finds a volume's disk by.
         "serial": drive.id,
@@ -89,12 +83,12 @@ fn console(arch: &str) -> Result<(Value, Value, &'static str)> {
 }
 
 /// The firmware a [`Boot::Firmware`] names, or the node's edk2 build.
-fn firmware(boot: &Boot) -> String {
+fn firmware(boot: &Boot, config: &CloudHypervisorConfig) -> String {
     match boot {
         Boot::Firmware {
             firmware: Some(firmware),
         } => firmware.display().to_string(),
-        _ => UEFI_FIRMWARE.into(),
+        _ => config.firmware.display().to_string(),
     }
 }
 
@@ -110,12 +104,15 @@ pub(crate) fn vm_config(
             "kernel": kernel,
             "cmdline": format!("{cmdline}{console_arg}"),
         }),
-        (Boot::Firmware { .. }, GuestOs::Linux) => json!({ "firmware": firmware(&spec.boot) }),
+        (Boot::Firmware { .. }, GuestOs::Linux) => {
+            json!({ "firmware": firmware(&spec.boot, config) })
+        }
         // UEFI firmware boots Windows from the first disk. The firmware,
         // bootmgr and EMS all write to the UART (a PL011 on aarch64), and
         // Windows has no virtio-console driver.
         (Boot::Kernel { .. } | Boot::Firmware { .. }, GuestOs::Windows) => {
-            if spec.vcpus < WINDOWS_MIN_VCPUS || spec.mem_mib < WINDOWS_MIN_MEM_MIB {
+            let (min_vcpus, min_mem_mib) = GuestOs::Windows.min_machine();
+            if spec.vcpus < min_vcpus || spec.mem_mib < min_mem_mib {
                 return Err(Error::Unsupported {
                     hypervisor: Hypervisor::CloudHypervisor,
                     what: "boot windows with fewer than 2 vcpus or 4096 MiB",
@@ -123,7 +120,7 @@ pub(crate) fn vm_config(
             }
             serial = json!({ "mode": "File", "file": CONSOLE_PIPE });
             console = json!({ "mode": "Off" });
-            json!({ "firmware": firmware(&spec.boot) })
+            json!({ "firmware": firmware(&spec.boot, config) })
         }
         #[cfg(target_os = "macos")]
         (Boot::MacOs(_), _) => {
@@ -139,7 +136,11 @@ pub(crate) fn vm_config(
             });
         }
     };
-    let disks: Vec<Value> = spec.drives.iter().map(disk).collect();
+    let disks: Vec<Value> = spec
+        .drives
+        .iter()
+        .map(|drive| disk(drive, spec.guest_os))
+        .collect();
     let mut vm = json!({
         "cpus": { "boot_vcpus": spec.vcpus, "max_vcpus": spec.max_vcpus.max(spec.vcpus) },
         "memory": memory(spec),
@@ -168,11 +169,8 @@ pub(crate) fn vm_config(
         }
         vm["cpus"]["nested"] = json!(true);
     }
-    if spec.guest_os == GuestOs::Windows {
-        vm["tpm"] = json!({ "socket": TPM_SOCK });
-        if arch == "x86_64" {
-            vm["cpus"]["kvm_hyperv"] = json!(true);
-        }
+    if spec.guest_os == GuestOs::Windows && arch == "x86_64" {
+        vm["cpus"]["kvm_hyperv"] = json!(true);
     }
     if let Some(net) = &spec.net {
         let mut nic = nic(&net.tap);
@@ -254,11 +252,13 @@ pub(crate) fn retarget(snapshot: &mut Value, spec: &VmSpec) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::cloud_hypervisor::DEFAULT_FIRMWARE;
     use crate::{Backend, DriveSpec, NetSpec};
 
     fn config() -> CloudHypervisorConfig {
         CloudHypervisorConfig {
             bin: "/usr/local/bin/cloud-hypervisor".into(),
+            firmware: DEFAULT_FIRMWARE.into(),
             jail: None,
         }
     }
@@ -357,7 +357,10 @@ mod tests {
                 ["direct", "id", "image_type", "path", "readonly", "serial"]
             );
         }
-        let hotplugged = disk(&crate::DriveSpec::scratch_rw("volume1.ext4"));
+        let hotplugged = disk(
+            &crate::DriveSpec::scratch_rw("volume1.ext4"),
+            GuestOs::Linux,
+        );
         assert_eq!(hotplugged["image_type"], "Raw");
         assert_eq!(hotplugged["serial"], "scratch");
         assert_eq!(hotplugged["direct"], true);
@@ -420,16 +423,23 @@ mod tests {
     }
 
     #[test]
-    fn windows_boots_firmware_with_a_tpm_on_the_uart() {
+    fn windows_boots_firmware_on_the_uart() {
         let mut windows = spec();
         windows.guest_os = GuestOs::Windows;
         windows.vcpus = 4;
         windows.mem_mib = 8192;
         let vm = vm_config(&windows, &config(), "aarch64").unwrap();
-        assert_eq!(vm["payload"], json!({ "firmware": UEFI_FIRMWARE }));
+        assert_eq!(vm["payload"], json!({ "firmware": DEFAULT_FIRMWARE }));
         assert_eq!(vm["cpus"], json!({ "boot_vcpus": 4, "max_vcpus": 4 }));
         assert_eq!(vm["memory"]["size"], 8192 * 1024 * 1024u64);
-        assert_eq!(vm["tpm"], json!({ "socket": "swtpm.sock" }));
+        assert_eq!(vm.get("tpm"), None);
+        assert!(
+            vm["disks"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .all(|disk| disk["direct"] == false)
+        );
         assert_eq!(vm["serial"]["file"], "console.pipe");
         assert_eq!(vm["console"]["mode"], "Off");
 

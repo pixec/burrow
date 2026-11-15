@@ -131,6 +131,15 @@ impl GuestOs {
         }
     }
 
+    /// The smallest machine, as vCPUs and MiB of memory, a guest of this OS
+    /// boots on. Windows 11's Setup and OOBE refuse less.
+    pub fn min_machine(self) -> (u32, u32) {
+        match self {
+            Self::Windows => (2, 4096),
+            Self::Linux | Self::MacOs => (1, 0),
+        }
+    }
+
     /// The hypervisor a template of this OS gets when its build names none.
     pub fn default_hypervisor(self) -> Hypervisor {
         match self {

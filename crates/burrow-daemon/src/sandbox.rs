@@ -38,6 +38,23 @@ fn volume_image(index: usize) -> String {
     }
 }
 
+#[allow(clippy::result_large_err)]
+fn require_min_machine(
+    template: &str,
+    guest_os: burrow_vmm::GuestOs,
+    shape: crate::warm::Shape,
+) -> Result<(), Status> {
+    let (vcpus, mem_mib) = guest_os.min_machine();
+    if shape.vcpus < vcpus || shape.mem_mib < mem_mib {
+        return Err(Status::invalid_argument(format!(
+            "template {template} is a {guest_os} guest, which needs at least {vcpus} vCPUs and \
+             {mem_mib} MiB; asked for {}x{}",
+            shape.vcpus, shape.mem_mib
+        )));
+    }
+    Ok(())
+}
+
 /// Has the guest write what it holds in memory back to its disks, so a VMM
 /// killed next leaves them as the guest last saw them. Best effort: a guest
 /// that has stopped answering is stopped all the same.
@@ -218,6 +235,16 @@ pub struct NodeConfig {
 }
 
 impl NodeConfig {
+    /// The agent a `guest_os` guest is upgraded to, when this node ships one.
+    pub(crate) fn upgrade_for(
+        &self,
+        guest_os: burrow_vmm::GuestOs,
+    ) -> Option<&guestconn::GuestUpgrade> {
+        self.guest_upgrade
+            .as_deref()
+            .filter(|upgrade| upgrade.guest_os == guest_os)
+    }
+
     pub(crate) fn templates_dir(&self) -> PathBuf {
         self.data_dir.join("images")
     }
@@ -1034,9 +1061,13 @@ fn spawn_handshake(
     // Weak: a sandbox deleted while its guest is still waking must not be kept
     // alive by the task that was going to talk to it.
     let weak = Arc::downgrade(sandbox);
+    let upgrade = manager
+        .config
+        .guest_upgrade
+        .clone()
+        .filter(|upgrade| upgrade.guest_os == sandbox.guest_os());
     tokio::spawn(async move {
         let began = std::time::Instant::now();
-        let upgrade = manager.config.guest_upgrade.clone();
         // Which step the deadline caught, so a guest that never came up says
         // whether its vsock never accepted or its agent never answered.
         let step = std::sync::Mutex::new("waiting for the guest's vsock to accept");
@@ -4977,9 +5008,10 @@ impl SandboxManager {
         Ok(())
     }
 
-    /// What the guest is told about its addresses: everything on a restore,
-    /// and otherwise only when it has public ones to configure, which the
-    /// guest applies on any handshake.
+    /// What the guest is told about its addresses: everything on a restore
+    /// and on a Windows boot, which has no kernel command line to take them
+    /// from, and otherwise only when it has public ones to configure, which
+    /// the guest applies on any handshake.
     fn guest_network(
         &self,
         lease: &Lease,
@@ -6499,7 +6531,8 @@ impl SandboxManager {
         shape: crate::warm::Shape,
     ) -> Result<Option<crate::warm::Warm>, Status> {
         let templates_dir = self.config.templates_dir();
-        let (hypervisor, _) = self.image_environment(template).await.machine()?;
+        let (hypervisor, guest_os) = self.image_environment(template).await.machine()?;
+        require_min_machine(template, guest_os, shape)?;
         // It may already be warm: a pinned shape kept across a restart, or one
         // create's build finishing while another was queued.
         if crate::warm::find(&templates_dir, template, hypervisor, shape)
@@ -7594,6 +7627,7 @@ impl SandboxManager {
         let layout = hypervisor.layout();
         let workdir = self.config.sandbox_dir(&id, hypervisor);
         let mut resources = policy.resources.clone().unwrap_or_default();
+        require_min_machine(&template, guest_os, crate::warm::Shape::wanted(&resources))?;
         // The disk this sandbox is provisioned: its root disk at the size
         // asked for, or a macOS guest's clone of its template's disk. Charged
         // before anything is made, so a node that cannot hold it refuses
@@ -7981,7 +8015,7 @@ impl SandboxManager {
                 &lease,
                 &[],
                 hypervisor.capabilities().is_tap_networked,
-                from_warm,
+                from_warm || guest_os == burrow_vmm::GuestOs::Windows,
             ),
             self.inspection_ca_for(&policy),
             self.trust_bundles_for(&template, &policy).await,
@@ -8047,7 +8081,7 @@ impl SandboxManager {
                 agent,
                 guard.vm().guest(),
                 request.clone(),
-                self.config.guest_upgrade.as_deref(),
+                self.config.upgrade_for(guest_os),
                 self.config.agent_timeout,
             )
             .await
@@ -9160,7 +9194,7 @@ impl SandboxManager {
             .resume(
                 request,
                 self.config.agent_timeout,
-                self.config.guest_upgrade.as_deref(),
+                self.config.upgrade_for(guest_os),
                 self.config.object_store.is_some(),
             )
             .await;
@@ -9390,7 +9424,7 @@ impl SandboxManager {
                 &sandbox.lease,
                 &sandbox.record().public_ips,
                 sandbox.hypervisor.capabilities().is_tap_networked,
-                false,
+                guest_os == burrow_vmm::GuestOs::Windows,
             ),
             self.inspection_ca_for(&policy),
             self.trust_bundles_in(&environment, &policy),
@@ -9402,7 +9436,7 @@ impl SandboxManager {
                 spec,
                 request,
                 self.config.agent_timeout,
-                self.config.guest_upgrade.as_deref(),
+                self.config.upgrade_for(guest_os),
                 hotplugged,
             )
             .await
@@ -11294,7 +11328,12 @@ async fn prepare_workdir(template_dir: &Path, workdir: &Path) -> std::io::Result
     tokio::fs::create_dir_all(workdir).await?;
     for file in [TEMPLATE_KERNEL, TEMPLATE_ROOTFS] {
         let source = template_dir.join(file);
-        if !tokio::fs::try_exists(&source).await.unwrap_or(false) {
+        let exists = tokio::fs::try_exists(&source).await.unwrap_or(false);
+        // A guest booted from firmware, Windows, has no kernel beside its disk.
+        if file == TEMPLATE_KERNEL && !exists {
+            continue;
+        }
+        if !exists {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::NotFound,
                 format!("missing {}", source.display()),
@@ -11462,6 +11501,27 @@ pub(crate) mod tests {
         assert_eq!(manager.committed_cpu_millis().await, 2000);
         drop(admitted);
         assert_eq!(manager.committed_cpu_millis().await, 1000);
+    }
+
+    #[test]
+    fn a_windows_template_refuses_a_machine_below_its_minimum() {
+        use burrow_vmm::GuestOs;
+        let shape = |resources| crate::warm::Shape::wanted(&resources);
+        let default = shape(common::ResourcePolicy::default());
+        assert!(require_min_machine("alpine", GuestOs::Linux, default).is_ok());
+        assert!(require_min_machine("win", GuestOs::Windows, default).is_err());
+        let small = shape(common::ResourcePolicy {
+            vcpus: 4,
+            mem_mib: 2048,
+            ..Default::default()
+        });
+        assert!(require_min_machine("win", GuestOs::Windows, small).is_err());
+        let enough = shape(common::ResourcePolicy {
+            vcpus: 2,
+            mem_mib: 4096,
+            ..Default::default()
+        });
+        assert!(require_min_machine("win", GuestOs::Windows, enough).is_ok());
     }
 
     /// A sandbox's limits become its cgroup's the way runc makes Docker's:
@@ -11679,6 +11739,7 @@ pub(crate) mod tests {
                 jail: None,
                 cloud_hypervisor: burrow_vmm::CloudHypervisorConfig {
                     bin: "/nonexistent/cloud-hypervisor".into(),
+                    firmware: burrow_vmm::cloud_hypervisor::DEFAULT_FIRMWARE.into(),
                     jail: None,
                 },
                 hypervisors: vec![Hypervisor::Firecracker],

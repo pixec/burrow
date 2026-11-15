@@ -318,6 +318,8 @@ pub async fn upload(
 #[derive(Debug, Clone)]
 pub struct GuestUpgrade {
     pub path: std::path::PathBuf,
+    /// The guest it runs on; another guest's agent is never replaced with it.
+    pub guest_os: burrow_vmm::GuestOs,
     /// SHA-256 of `path`, lowercase hex.
     pub digest: String,
 }

@@ -220,7 +220,13 @@ impl HypervisorExt for Hypervisor {
                 is_lazy_memory_supported: false,
                 is_drive_hotplug_supported: true,
                 is_jailable: true,
-                guest_oses: &[GuestOs::Linux],
+                // Windows on arm64 needs a vPMU, which KVM on the hosts tried
+                // could not give it.
+                guest_oses: if cfg!(target_arch = "x86_64") {
+                    &[GuestOs::Linux, GuestOs::Windows]
+                } else {
+                    &[GuestOs::Linux]
+                },
                 is_warm_pool_supported: true,
                 is_tap_networked: true,
                 is_live_disk_growth_supported: true,

@@ -64,6 +64,9 @@ pub struct ServeArgs {
     pub hypervisors: Vec<burrow_vmm::Hypervisor>,
     #[arg(long, default_value = "/usr/local/bin/cloud-hypervisor")]
     pub cloud_hypervisor: PathBuf,
+    /// The edk2 build Cloud Hypervisor boots a guest without a kernel from.
+    #[arg(long, default_value = burrow_vmm::cloud_hypervisor::DEFAULT_FIRMWARE)]
+    pub cloud_hypervisor_firmware: PathBuf,
     /// Run Cloud Hypervisor unconfined even with `--jailer`: as root, in the
     /// host's namespaces, with the host's filesystem in view. For a dev box
     /// whose kernel cannot build the jail; nowhere a guest is untrusted.
@@ -1621,6 +1624,11 @@ pub async fn run(args: ServeArgs) -> anyhow::Result<()> {
             })?
             .to_string(),
         path: args.guest_binary.clone(),
+        guest_os: if cfg!(target_os = "macos") {
+            burrow_vmm::GuestOs::MacOs
+        } else {
+            burrow_vmm::GuestOs::Linux
+        },
     }));
     if let Some(upgrade) = &guest_upgrade {
         crate::warm::set_agent(upgrade.digest.clone());
@@ -1747,6 +1755,7 @@ pub async fn run(args: ServeArgs) -> anyhow::Result<()> {
             jail: args.jail(),
             cloud_hypervisor: burrow_vmm::CloudHypervisorConfig {
                 bin: args.cloud_hypervisor.clone(),
+                firmware: args.cloud_hypervisor_firmware.clone(),
                 jail: args.cloud_hypervisor_jail()?,
             },
             hypervisors,

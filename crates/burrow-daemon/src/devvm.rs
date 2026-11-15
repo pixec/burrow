@@ -65,6 +65,7 @@ impl VmBootArgs {
             }),
             Hypervisor::CloudHypervisor => Backend::CloudHypervisor(CloudHypervisorConfig {
                 bin: self.cloud_hypervisor.clone(),
+                firmware: burrow_vmm::cloud_hypervisor::DEFAULT_FIRMWARE.into(),
                 jail: self.jail_uid.map(|uid| burrow_vmm::ChJail {
                     helper: "/proc/self/exe".into(),
                     uid,
