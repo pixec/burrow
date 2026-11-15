@@ -57,6 +57,11 @@ const CONNECT_TIMEOUT: Duration = Duration::from_secs(30);
 /// What a fault is answered with when huge pages are on: one huge page.
 const BLOCK: u64 = 2 << 20;
 
+/// How long collapsing is left alone once the kernel has no huge page to
+/// give. Each refusal is a compaction stall with a vCPU waiting on it, and on
+/// a fragmented host the next block's would fail the same way.
+const COLLAPSE_PAUSE: Duration = Duration::from_secs(1);
+
 /// One guest memory region, as Firecracker describes it.
 ///
 /// Field names are Firecracker's wire format, not ours; they must match its
@@ -382,6 +387,7 @@ struct Collapse {
     /// Once a block has collapsed, `EINVAL` is that block's trouble rather
     /// than a kernel without `MADV_COLLAPSE`.
     has_collapsed: bool,
+    paused_until: Option<Instant>,
 }
 
 impl Collapse {
@@ -396,11 +402,18 @@ impl Collapse {
         Self {
             pidfd,
             has_collapsed: false,
+            paused_until: None,
         }
     }
 
     fn run(&mut self, start: u64, end: u64) {
         let Some(pidfd) = &self.pidfd else { return };
+        if self
+            .paused_until
+            .is_some_and(|until| Instant::now() < until)
+        {
+            return;
+        }
         let iov = libc::iovec {
             iov_base: start as *mut libc::c_void,
             iov_len: (end - start) as usize,
@@ -422,17 +435,19 @@ impl Collapse {
             return;
         }
         let err = io::Error::last_os_error();
-        // Out of huge pages for now is worth trying again next block; a
-        // kernel that cannot do it at all is not.
-        let is_unsupported = match err.raw_os_error() {
-            Some(libc::ENOSYS | libc::EPERM) => true,
-            Some(libc::EINVAL) => !self.has_collapsed,
-            _ => false,
-        };
-        if is_unsupported {
-            tracing::debug!(%err, "cannot collapse guest memory into huge pages");
-            self.pidfd = None;
+        match err.raw_os_error() {
+            // Out of huge pages for now is worth trying again in a while; a
+            // kernel that cannot do it at all is not.
+            Some(libc::ENOMEM) => self.paused_until = Some(Instant::now() + COLLAPSE_PAUSE),
+            Some(libc::ENOSYS | libc::EPERM) => self.give_up(&err),
+            Some(libc::EINVAL) if !self.has_collapsed => self.give_up(&err),
+            _ => {}
         }
+    }
+
+    fn give_up(&mut self, err: &io::Error) {
+        tracing::debug!(%err, "cannot collapse guest memory into huge pages");
+        self.pidfd = None;
     }
 }
 
@@ -1360,6 +1375,7 @@ mod tests {
                     _ => None,
                 },
                 has_collapsed: false,
+                paused_until: None,
             },
         };
         let after_one = serve_a_guest(Some(&mut blocks));
