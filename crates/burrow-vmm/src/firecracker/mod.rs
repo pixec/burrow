@@ -285,6 +285,9 @@ async fn spawn(
         &spec.limits,
         spec.is_limits_required,
     )?;
+    if let Some(cgroup) = &cgroup {
+        cgroup.forbid_swap()?;
+    }
     phases.mark("cgroup");
     let process = FcProcess::spawn(
         &spec.firecracker_bin,

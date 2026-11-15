@@ -206,6 +206,21 @@ impl Cgroup {
         write(&self.path.join("memory.high"), &bytes(mib))
     }
 
+    /// Keeps the VM's memory out of swap. Firecracker finds the pages a diff
+    /// snapshot holds with mincore, which counts a page swapped out as
+    /// absent, so a guest page written since the last snapshot and swapped
+    /// out before the next would be left out of its diff, and a restore
+    /// would read an older layer's contents for it. Reclaim under the ceiling
+    /// takes page cache instead; the guest's memory fits within it. A kernel
+    /// without swap has no such file.
+    pub fn forbid_swap(&self) -> Result<()> {
+        let path = self.path.join("memory.swap.max");
+        if !path.exists() {
+            return Ok(());
+        }
+        write(&path, "0")
+    }
+
     pub fn path(&self) -> &Path {
         &self.path
     }
@@ -610,6 +625,21 @@ mod tests {
         cgroup.set_limits(&limits).unwrap();
         assert_eq!(read("cpu.max"), "50000 100000");
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn swap_is_forbidden_where_the_kernel_has_it() {
+        let cgroup = fake("swap", &["memory.swap.max"]);
+        cgroup.forbid_swap().unwrap();
+        assert_eq!(
+            std::fs::read_to_string(cgroup.path.join("memory.swap.max")).unwrap(),
+            "0"
+        );
+        let _ = std::fs::remove_dir_all(&cgroup.path);
+        let cgroup = fake("noswap", &[]);
+        cgroup.forbid_swap().unwrap();
+        assert!(!cgroup.path.join("memory.swap.max").exists());
+        let _ = std::fs::remove_dir_all(&cgroup.path);
     }
 
     /// A pin or an IO weight on a node without the controller is refused by
