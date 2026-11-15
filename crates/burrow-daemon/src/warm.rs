@@ -592,6 +592,19 @@ pub async fn clone_warm_disk(
 
 /// Boots a template, waits for its agent, and snapshots the running VM.
 ///
+/// Refuses a guest whose warm snapshots this node cannot build and read back:
+/// a snapshot carries the template's `vmlinux` and the Linux agent's digest,
+/// and a Windows template has neither.
+#[allow(clippy::result_large_err)]
+pub fn require_warm_guest(template: &str, guest_os: burrow_vmm::GuestOs) -> Result<(), Status> {
+    if guest_os == burrow_vmm::GuestOs::Windows {
+        return Err(Status::failed_precondition(format!(
+            "template {template} is a windows guest, which is not warmed yet"
+        )));
+    }
+    Ok(())
+}
+
 /// The warm VM runs on a fixed tap of its own. It never carries a policy or
 /// serves anyone: its only job is to reach the point where a sandbox would be
 /// ready, and stop there.
@@ -629,6 +642,7 @@ pub async fn build_warm_snapshot(
     let shape = resolve_disk(&templates_dir, template, shape).await?;
     let environment = crate::oci::image_environment(&config.data_dir, template).await;
     let (hypervisor, guest_os) = environment.machine()?;
+    require_warm_guest(template, guest_os)?;
     if !config.hypervisors.contains(&hypervisor) {
         return Err(Status::failed_precondition(format!(
             "template {template} runs under {hypervisor}, which this node does not offer"
@@ -1137,6 +1151,13 @@ async fn snapshot_when_ready(
 mod shape_tests {
     use super::*;
     use burrow_proto::common::v1 as common;
+
+    #[test]
+    fn a_windows_template_is_not_warmed() {
+        let refused = require_warm_guest("win", burrow_vmm::GuestOs::Windows).unwrap_err();
+        assert_eq!(refused.code(), tonic::Code::FailedPrecondition);
+        assert!(require_warm_guest("alpine", burrow_vmm::GuestOs::Linux).is_ok());
+    }
 
     #[test]
     fn defaults_fill_in_for_an_unset_policy() {

@@ -38,6 +38,22 @@ fn volume_image(index: usize) -> String {
     }
 }
 
+/// Refuses what copies a sandbox's state elsewhere, which carries its
+/// template's `vmlinux` beside its disk: a Windows guest boots firmware from
+/// its disk and has none.
+#[allow(clippy::result_large_err)]
+fn require_kernel_carried(sandbox: &RunningSandbox, what: &str) -> Result<(), Status> {
+    if burrow_vmm::GuestOs::from_record(&sandbox.record().guest_os)
+        == Some(burrow_vmm::GuestOs::Windows)
+    {
+        return Err(Status::failed_precondition(format!(
+            "sandbox {} is a windows guest, which cannot be {what} yet",
+            sandbox.id()
+        )));
+    }
+    Ok(())
+}
+
 #[allow(clippy::result_large_err)]
 fn require_min_machine(
     template: &str,
@@ -2421,6 +2437,7 @@ impl RunningSandbox {
         logs: Option<&Path>,
         capture: Option<&Path>,
     ) -> Result<Vec<String>, Status> {
+        require_kernel_carried(self, "copied")?;
         self.durable.settle_memory().await;
         let _slot = self.vm.lock().await;
         let chain = self.memory_chain.lock().await.clone();
@@ -6532,7 +6549,7 @@ impl SandboxManager {
     ) -> Result<Option<crate::warm::Warm>, Status> {
         let templates_dir = self.config.templates_dir();
         let (hypervisor, guest_os) = self.image_environment(template).await.machine()?;
-        require_min_machine(template, guest_os, shape)?;
+        crate::warm::require_warm_guest(template, guest_os)?;
         // It may already be warm: a pinned shape kept across a restart, or one
         // create's build finishing while another was queued.
         if crate::warm::find(&templates_dir, template, hypervisor, shape)
@@ -6730,7 +6747,10 @@ impl SandboxManager {
                 .image_environment(&template.name)
                 .await
                 .machine()
-                .is_ok_and(|(hypervisor, _)| hypervisor.capabilities().is_warm_pool_supported);
+                .is_ok_and(|(hypervisor, guest_os)| {
+                    hypervisor.capabilities().is_warm_pool_supported
+                        && crate::warm::require_warm_guest(&template.name, guest_os).is_ok()
+                });
             if !is_warmable {
                 continue;
             }
@@ -7362,8 +7382,10 @@ impl SandboxManager {
         // Warm snapshots are taken without nested virtualization, which a
         // restore cannot add, so a nested sandbox always boots.
         let is_warmable = !resources.is_nested_virt_enabled
-            && machine
-                .is_ok_and(|(hypervisor, _)| hypervisor.capabilities().is_warm_pool_supported);
+            && machine.is_ok_and(|(hypervisor, guest_os)| {
+                hypervisor.capabilities().is_warm_pool_supported
+                    && crate::warm::require_warm_guest(&template, guest_os).is_ok()
+            });
         if is_warmable {
             self.warm_for_demand(&ShapeKey::of(&template, &resources));
         }
@@ -7695,6 +7717,7 @@ impl SandboxManager {
             && !policy.is_console_verbose
             && !resources.is_nested_virt_enabled
             && capabilities.is_warm_pool_supported
+            && crate::warm::require_warm_guest(&template, guest_os).is_ok()
             && (capabilities.is_drive_hotplug_supported
                 || crate::volume::block_mounts(&policy.volumes)
                     .next()
@@ -7906,7 +7929,7 @@ impl SandboxManager {
                             Status::failed_precondition(format!("template {template:?}: {err}"))
                         })?;
                 } else {
-                    prepare_workdir(&templates_dir.join(&template), &workdir)
+                    prepare_workdir(&templates_dir.join(&template), &workdir, guest_os)
                         .await
                         .map_err(|err| {
                             Status::failed_precondition(format!("template {template:?}: {err}"))
@@ -8348,6 +8371,7 @@ impl SandboxManager {
     ) -> Result<common::Snapshot, Status> {
         crate::snapshot::validate_id(&snapshot_id)?;
         let sandbox = self.get(sandbox_id).await?;
+        require_kernel_carried(&sandbox, "snapshotted")?;
         let capture = sandbox.workdir.join(format!(".capture-{snapshot_id}"));
         let is_captured = sandbox.is_running();
         if is_captured {
@@ -8552,6 +8576,7 @@ impl SandboxManager {
         name: String,
     ) -> Result<common::Sandbox, Status> {
         let source = self.get(source_id).await?;
+        require_kernel_carried(&source, "forked")?;
 
         // Claimed the same way a create claims one, and before any state is
         // captured: two forks naming the same child would otherwise share a
@@ -9642,10 +9667,13 @@ impl SandboxManager {
     /// Whether a sandbox can live in the object store at all: one mounting
     /// volumes only where they are kept there too.
     fn is_movable(&self, sandbox: &RunningSandbox) -> bool {
-        self.volumes.is_durable()
-            || crate::volume::block_mounts(&sandbox.record().policy.unwrap_or_default().volumes)
+        require_kernel_carried(sandbox, "moved").is_ok()
+            && (self.volumes.is_durable()
+                || crate::volume::block_mounts(
+                    &sandbox.record().policy.unwrap_or_default().volumes,
+                )
                 .next()
-                .is_none()
+                .is_none())
     }
 
     /// Brings every volume a suspended sandbox mounts up to date in the
@@ -10212,6 +10240,7 @@ impl SandboxManager {
             ));
         }
         let sandbox = self.get(id).await?;
+        require_kernel_carried(&sandbox, "moved")?;
         if !self.is_movable(&sandbox) {
             return Err(Status::failed_precondition(
                 "a sandbox with volumes moves only with an object store to carry them",
@@ -10895,6 +10924,7 @@ impl SandboxManager {
         let Some(store) = self.config.object_store.clone() else {
             return Ok(());
         };
+        require_kernel_carried(sandbox, "checkpointed")?;
         self.require_vmm(sandbox).await?;
         let is_memory = sandbox.lifetime().is_memory_checkpointed
             && sandbox.layout().memory.is_some()
@@ -11321,7 +11351,11 @@ async fn no_virtio_mem(workdir: &Path) -> Option<String> {
 /// Creates a sandbox working directory with the template's kernel and image
 /// linked in. Hard links keep creation cheap; the root disk cloned from the
 /// image is the sandbox's own, and the guest never sees the image itself.
-async fn prepare_workdir(template_dir: &Path, workdir: &Path) -> std::io::Result<()> {
+async fn prepare_workdir(
+    template_dir: &Path,
+    workdir: &Path,
+    guest_os: burrow_vmm::GuestOs,
+) -> std::io::Result<()> {
     if tokio::fs::try_exists(workdir).await.unwrap_or(false) {
         tokio::fs::remove_dir_all(workdir).await?;
     }
@@ -11329,8 +11363,8 @@ async fn prepare_workdir(template_dir: &Path, workdir: &Path) -> std::io::Result
     for file in [TEMPLATE_KERNEL, TEMPLATE_ROOTFS] {
         let source = template_dir.join(file);
         let exists = tokio::fs::try_exists(&source).await.unwrap_or(false);
-        // A guest booted from firmware, Windows, has no kernel beside its disk.
-        if file == TEMPLATE_KERNEL && !exists {
+        // Windows boots firmware from its disk and has no kernel beside it.
+        if file == TEMPLATE_KERNEL && !exists && guest_os == burrow_vmm::GuestOs::Windows {
             continue;
         }
         if !exists {
@@ -11501,6 +11535,37 @@ pub(crate) mod tests {
         assert_eq!(manager.committed_cpu_millis().await, 2000);
         drop(admitted);
         assert_eq!(manager.committed_cpu_millis().await, 1000);
+    }
+
+    #[tokio::test]
+    async fn a_windows_sandbox_refuses_what_carries_a_kernel() {
+        let dest = std::env::temp_dir().join(format!("burrow-winfork-{}", std::process::id()));
+        let windows = sandbox_in(dest.join("work"));
+        windows.base_record.lock().unwrap().guest_os = "windows".into();
+        let refused = windows.stage_fork(&dest, None, None).await.unwrap_err();
+        assert_eq!(refused.code(), tonic::Code::FailedPrecondition);
+        assert!(refused.message().contains("windows guest"));
+        assert!(require_kernel_carried(&windows, "moved").is_err());
+        assert!(!dest.exists());
+        assert!(require_kernel_carried(&suspended_sandbox(), "moved").is_ok());
+    }
+
+    #[tokio::test]
+    async fn only_a_windows_workdir_does_without_a_kernel() {
+        let template = std::env::temp_dir().join(format!("burrow-winwork-{}", std::process::id()));
+        std::fs::create_dir_all(&template).unwrap();
+        std::fs::write(template.join(TEMPLATE_ROOTFS), b"disk").unwrap();
+        let workdir = template.join("work");
+        prepare_workdir(&template, &workdir, burrow_vmm::GuestOs::Windows)
+            .await
+            .unwrap();
+        assert!(workdir.join(TEMPLATE_ROOTFS).exists());
+        assert!(!workdir.join(TEMPLATE_KERNEL).exists());
+        let missing = prepare_workdir(&template, &workdir, burrow_vmm::GuestOs::Linux)
+            .await
+            .unwrap_err();
+        assert!(missing.to_string().contains(TEMPLATE_KERNEL));
+        std::fs::remove_dir_all(&template).unwrap();
     }
 
     #[test]
