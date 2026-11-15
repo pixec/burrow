@@ -119,8 +119,10 @@ async fn migrate_index(
     let Some(index) = read_legacy_index(store, legacy).await? else {
         return Ok(None);
     };
-    crate::chunks::put_zeroes(store, &index, &Default::default()).await?;
-    let bytes = crate::caibx::encode(&index);
+    let bytes = crate::caibx::encode(&index).map_err(|err| {
+        Status::failed_precondition(format!("{legacy} cannot be migrated: {err}"))
+    })?;
+    crate::chunks::put_zeroes(store, &index).await?;
     store.put_bytes(key, bytes.clone()).await?;
     Ok(Some(bytes))
 }

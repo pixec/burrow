@@ -118,7 +118,9 @@ pub fn decompress(digest: &str, packed: &[u8]) -> Result<Vec<u8>, Status> {
 
 /// Puts an image's index, as casync's `.caibx`.
 pub async fn put_index(store: &ObjectStore, key: &str, index: &ImageIndex) -> Result<(), Status> {
-    store.put_bytes(key, crate::caibx::encode(index)).await
+    let bytes = crate::caibx::encode(index)
+        .map_err(|err| Status::internal(format!("encoding index {key}: {err}")))?;
+    store.put_bytes(key, bytes).await
 }
 
 pub async fn read_index(store: &ObjectStore, key: &str) -> Result<Option<ImageIndex>, Status> {
@@ -280,20 +282,16 @@ async fn put_chunk(
     }
 }
 
-/// Puts the zero chunks an index lists. Burrow never fetches them, but
+/// Puts the zero chunks an index lists, on every upload whatever is known:
+/// Burrow never fetches them, so nothing else would notice one missing, but
 /// casync fetches every chunk an index names.
-pub async fn put_zeroes(
-    store: &ObjectStore,
-    index: &ImageIndex,
-    known: &HashSet<String>,
-) -> Result<(), Status> {
+pub async fn put_zeroes(store: &ObjectStore, index: &ImageIndex) -> Result<(), Status> {
     for len in index.hole_lengths() {
-        let digest = crate::caibx::zero_id(len);
-        if !known.contains(&digest) {
-            let packed = compress(&vec![0u8; len as usize])
-                .map_err(|err| Status::internal(format!("compressing zeroes: {err}")))?;
-            store.put_chunk(&chunk_key(&digest), packed).await?;
-        }
+        let packed = compress(&vec![0u8; len as usize])
+            .map_err(|err| Status::internal(format!("compressing zeroes: {err}")))?;
+        store
+            .put_chunk(&chunk_key(&crate::caibx::zero_id(len)), packed)
+            .await?;
     }
     Ok(())
 }
@@ -384,7 +382,7 @@ pub async fn put_image(
         };
     }
     drop(results);
-    put_zeroes(store, &index, &known).await?;
+    put_zeroes(store, &index).await?;
     tracing::debug!(chunks = index.chunks.len(), read, sent, "image uploaded");
     Ok(index)
 }
@@ -481,7 +479,7 @@ pub async fn put_disk_since(
         }
     }
     drop(results);
-    put_zeroes(store, &index, &known).await?;
+    put_zeroes(store, &index).await?;
     tracing::info!(
         disk = %path.display(),
         chunks = index.chunks.len(),
@@ -1096,6 +1094,32 @@ mod tests {
             "{}",
             refused.message()
         );
+    }
+
+    /// An index naming the zero chunk has it in the store, even when the
+    /// upload was told the store already had it: a build before casync
+    /// chunks never put one.
+    #[tokio::test]
+    async fn the_zero_chunk_is_put_whatever_is_known() {
+        let store = crate::objstore::fake::store(true).await;
+        let dir = std::env::temp_dir().join(format!("burrow-zero-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = std::fs::File::create(dir.join("image")).unwrap();
+        file.set_len(2 * CHUNK_SIZE).unwrap();
+        file.write_all_at(&[1; 4096], 0).unwrap();
+        let zero = crate::caibx::zero_id(CHUNK_SIZE);
+        let index = put_image(
+            &store,
+            &dir,
+            &["image".to_string()],
+            None,
+            &[zero.clone()].into(),
+        )
+        .await
+        .unwrap();
+        assert!(index.digests().any(|digest| digest == zero));
+        assert!(store.exists(&chunk_key(&zero)).await.unwrap());
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
