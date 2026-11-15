@@ -178,7 +178,9 @@ impl Image {
     /// named from `path`'s last component. Directories, regular files,
     /// symlinks and hard links within the tree go with their mode, owner,
     /// times and extended attributes; devices, fifos and sockets are left
-    /// out and counted.
+    /// out and counted. A sparse file is written whole, its holes as zeros,
+    /// and counts against `max_bytes` at its full size: the archive has no
+    /// sparse entries, so the new disk holds the file without holes.
     pub fn tar(
         &self,
         path: &str,

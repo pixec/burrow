@@ -30,9 +30,29 @@ fn limit(resource: libc::c_int, soft: u64, hard: u64) -> io::Result<()> {
     check(unsafe { libc::setrlimit(resource, &value) })
 }
 
-pub fn confine(limits: &Limits) -> io::Result<()> {
+/// Closes every descriptor above the image's: with `close_range` where the
+/// kernel has it (5.9), one by one up to the descriptor limit where not.
+fn close_others() -> io::Result<()> {
     // SAFETY: closes descriptors this process never uses.
-    unsafe { libc::syscall(libc::SYS_close_range, IMAGE_FD + 1, u32::MAX, 0) };
+    if unsafe { libc::syscall(libc::SYS_close_range, IMAGE_FD + 1, u32::MAX, 0) } == 0 {
+        return Ok(());
+    }
+    let mut open = libc::rlimit {
+        rlim_cur: 0,
+        rlim_max: 0,
+    };
+    // SAFETY: a plain syscall filling a value that outlives it.
+    check(unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &mut open) })?;
+    let highest = libc::c_int::try_from(open.rlim_cur.min(1 << 20)).unwrap_or(1 << 20);
+    for fd in IMAGE_FD + 1..highest {
+        // SAFETY: as above; a descriptor that is not open is EBADF.
+        unsafe { libc::close(fd) };
+    }
+    Ok(())
+}
+
+pub fn confine(limits: &Limits) -> io::Result<()> {
+    close_others()?;
     let memory = limits.memory_mib << 20;
     limit(libc::RLIMIT_AS, memory, memory)?;
     limit(libc::RLIMIT_CPU, limits.cpu_secs, limits.cpu_secs + 1)?;
