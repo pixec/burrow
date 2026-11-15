@@ -479,6 +479,29 @@ pub async fn discard_broken(dir: &Path) -> std::io::Result<bool> {
     Ok(true)
 }
 
+/// Removes the snapshot in `dir` if `restored`, a file a sandbox linked from
+/// it, is still one of its own, and says whether it did. A snapshot rebuilt
+/// since is left alone.
+pub async fn discard_restored(dir: &Path, restored: &Path) -> std::io::Result<bool> {
+    use std::os::unix::fs::MetadataExt as _;
+
+    let _no_builds = WARM_BUILD_LOCK.lock().await;
+    let Some(name) = restored.file_name() else {
+        return Ok(false);
+    };
+    let (Ok(own), Ok(linked)) = (
+        tokio::fs::metadata(dir.join(name)).await,
+        tokio::fs::metadata(restored).await,
+    ) else {
+        return Ok(false);
+    };
+    if (own.dev(), own.ino()) != (linked.dev(), linked.ino()) {
+        return Ok(false);
+    }
+    tokio::fs::remove_dir_all(dir).await?;
+    Ok(true)
+}
+
 /// Every usable warm snapshot of `template`.
 pub async fn list(templates_dir: &Path, template: &str) -> Vec<Warm> {
     let mut out = Vec::new();
@@ -1497,6 +1520,34 @@ mod shape_tests {
         std::fs::remove_file(live.join(ROOT_DISK)).unwrap();
         assert!(discard_broken(&broken).await.unwrap());
         assert!(!live.exists());
+        let _ = std::fs::remove_dir_all(&templates);
+    }
+
+    /// A snapshot whose restored guest never came up is discarded, but not
+    /// one rebuilt since that sandbox linked its files.
+    #[tokio::test]
+    async fn only_the_snapshot_a_failed_sandbox_restored_is_discarded() {
+        let templates = temp("restored");
+        let live = warm_dir(&templates, "app").join("firecracker-2x2048");
+        let sandbox = templates.join("sbx");
+        std::fs::create_dir_all(&sandbox).unwrap();
+        let state = Hypervisor::Firecracker.layout().state;
+        let link = |snapshot: &Path| {
+            let _ = std::fs::remove_file(sandbox.join(state));
+            std::fs::hard_link(snapshot.join(state), sandbox.join(state)).unwrap();
+        };
+
+        write_snapshot(&live, WARM_FORMAT, "2 2048 1324 0");
+        link(&live);
+        std::fs::remove_dir_all(&live).unwrap();
+        write_snapshot(&live, WARM_FORMAT, "2 2048 1324 0");
+        assert!(!discard_restored(&live, &sandbox.join(state)).await.unwrap());
+        assert!(live.exists());
+
+        link(&live);
+        assert!(discard_restored(&live, &sandbox.join(state)).await.unwrap());
+        assert!(!live.exists());
+        assert!(!discard_restored(&live, &sandbox.join(state)).await.unwrap());
         let _ = std::fs::remove_dir_all(&templates);
     }
 

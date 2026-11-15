@@ -1118,6 +1118,7 @@ fn spawn_handshake(
     grow_to: Option<u64>,
     dialing: Option<guestconn::Dialing>,
     timeout: std::time::Duration,
+    warm: Option<WarmOrigin>,
 ) {
     let id = sandbox.id.clone();
     let guest = GuestAddr::in_workdir(&sandbox.workdir);
@@ -1252,6 +1253,11 @@ fn spawn_handshake(
                     reason,
                     "the guest agent never came up; reclaiming the sandbox"
                 );
+                if let Some(warm) = &warm {
+                    manager
+                        .discard_failed_warm(warm, &sandbox.workdir.join(sandbox.layout().state))
+                        .await;
+                }
                 // This task is the one place that knows the guest has been
                 // given up on, so it is the one that gives back what the
                 // sandbox is holding: nothing else is waiting to fail the
@@ -1266,6 +1272,13 @@ fn spawn_handshake(
             _ => {}
         }
     });
+}
+
+/// The warm snapshot a sandbox was restored from.
+struct WarmOrigin {
+    template: String,
+    dir: PathBuf,
+    shape: crate::warm::Shape,
 }
 
 /// What a guest agent able to take public addresses names among its features.
@@ -6707,6 +6720,36 @@ impl SandboxManager {
             mem_mib = shape.mem_mib,
             "discarded a warm snapshot with a file gone or another agent; rebuilding it"
         );
+        self.rebuild_warm(template, shape);
+    }
+
+    /// Discards the warm snapshot a sandbox was restored from once that
+    /// sandbox's guest never came up, and builds it again. Left in place, every
+    /// create of its shape restored the same broken guest and was reclaimed
+    /// once its handshake timed out.
+    async fn discard_failed_warm(&self, warm: &WarmOrigin, restored: &Path) {
+        match crate::warm::discard_restored(&warm.dir, restored).await {
+            Ok(true) => {}
+            Ok(false) => return,
+            Err(err) => {
+                tracing::warn!(
+                    template = warm.template,
+                    %err,
+                    "could not discard a warm snapshot whose guest never came up"
+                );
+                return;
+            }
+        }
+        tracing::warn!(
+            template = warm.template,
+            vcpus = warm.shape.vcpus,
+            mem_mib = warm.shape.mem_mib,
+            "discarded a warm snapshot whose restored guest never came up; rebuilding it"
+        );
+        self.rebuild_warm(&warm.template, warm.shape);
+    }
+
+    fn rebuild_warm(&self, template: &str, shape: crate::warm::Shape) {
         self.forget_warm(&ShapeKey {
             template: template.to_string(),
             vcpus: shape.vcpus,
@@ -8071,6 +8114,11 @@ impl SandboxManager {
             )));
         }
 
+        let warm_origin = warm.as_ref().filter(|_| from_warm).map(|warm| WarmOrigin {
+            template: template.clone(),
+            dir: warm.dir.clone(),
+            shape: warm.shape,
+        });
         // A snapshot taken on a smaller disk than this sandbox asked for: the
         // disk grows under the running guest, as a live resize would, and the
         // guest grows its filesystem once it has handshaken.
@@ -8306,6 +8354,7 @@ impl SandboxManager {
                 grow_to,
                 dialing,
                 self.config.agent_timeout(guest_os),
+                warm_origin,
             );
         }
         phases.mark("record");
@@ -9218,6 +9267,7 @@ impl SandboxManager {
             None,
             dialing,
             self.config.agent_timeout(guest_os),
+            None,
         );
         Ok((sandbox, disk))
     }
@@ -13378,6 +13428,7 @@ pub(crate) mod tests {
             None,
             None,
             std::time::Duration::from_millis(1),
+            None,
         );
         // The registry's reference is the one that matters; a test holding
         // another would look like an in-flight request.
