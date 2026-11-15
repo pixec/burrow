@@ -33,6 +33,9 @@ pub struct VmBootArgs {
     pub firecracker: PathBuf,
     #[arg(long, default_value = "/usr/local/bin/cloud-hypervisor")]
     pub cloud_hypervisor: PathBuf,
+    /// The edk2 build Cloud Hypervisor boots a guest without a kernel from.
+    #[arg(long, default_value = burrow_vmm::cloud_hypervisor::DEFAULT_FIRMWARE)]
+    pub cloud_hypervisor_firmware: PathBuf,
     /// Run Cloud Hypervisor in burrowd's jail as this uid and gid, as
     /// `serve --jailer` does. The working directory becomes the jail's.
     #[arg(long)]
@@ -65,7 +68,7 @@ impl VmBootArgs {
             }),
             Hypervisor::CloudHypervisor => Backend::CloudHypervisor(CloudHypervisorConfig {
                 bin: self.cloud_hypervisor.clone(),
-                firmware: burrow_vmm::cloud_hypervisor::DEFAULT_FIRMWARE.into(),
+                firmware: self.cloud_hypervisor_firmware.clone(),
                 jail: self.jail_uid.map(|uid| burrow_vmm::ChJail {
                     helper: "/proc/self/exe".into(),
                     uid,
