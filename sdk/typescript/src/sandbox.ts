@@ -1073,15 +1073,22 @@ export class Sandbox {
   }
 
   /**
-   * Replaces the root disk, discarding everything written to it, while
-   * keeping the sandbox's id, name, address and volumes. With `template` the
-   * sandbox moves onto another template; a Kit is provisioned again on the
-   * new disk with the recorded inputs, as changed by `kit`.
+   * Replaces the root disk, discarding everything written to it but the
+   * paths in `keep`, while keeping the sandbox's id, name, address and
+   * volumes. The old disk is let go only once the new one has booted; a
+   * failure leaves the sandbox as it was. With `template` the sandbox moves
+   * onto another template; a Kit is provisioned again on the new disk with
+   * the recorded inputs, as changed by `kit`.
    */
   async recreate(options: RecreateOptions = {}): Promise<SandboxInfo> {
     const info = await this.mutate(
       "RecreateSandbox",
-      { sandboxId: this.id, template: options.template ?? "", kit: toKitSpec(options.kit) },
+      {
+        sandboxId: this.id,
+        template: options.template ?? "",
+        kit: toKitSpec(options.kit),
+        keep: options.keep ?? [],
+      },
       options,
     );
     await this.onResume?.(this);

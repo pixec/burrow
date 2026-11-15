@@ -464,9 +464,11 @@ class BurrowServicer(object):
         raise NotImplementedError('Method not implemented!')
 
     def RecreateSandbox(self, request, context):
-        """Replace a sandbox's root disk, discarding everything written to it, while
-        keeping its id, address, name and volumes. With a Kit, the composition
-        may change too.
+        """Replace a sandbox's root disk, discarding everything written to it but
+        the paths it names to keep, while keeping its id, address, name and
+        volumes. Nothing of the old sandbox is let go until the replacement has
+        booted; a failure leaves it as it was. With a Kit, the composition may
+        change too.
         """
         context.set_code(grpc.StatusCode.UNIMPLEMENTED)
         context.set_details('Method not implemented!')

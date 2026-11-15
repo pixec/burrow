@@ -850,7 +850,11 @@ impl NodeService for NodeApi {
         };
         crate::template::validate_name(&template)?;
         let Some(recorded) = self.image_environment(&template).await.kit else {
-            let replacement = crate::sandbox::Replacement { template, policy };
+            let replacement = crate::sandbox::Replacement {
+                template,
+                policy,
+                keep: req.keep,
+            };
             let sandbox = self
                 .sandboxes
                 .detached(move |sandboxes| async move {
@@ -885,7 +889,11 @@ impl NodeService for NodeApi {
         policy.network = Some(plan.install_network.clone());
         policy.volumes.extend(mounts);
         validate_policy(&policy)?;
-        let replacement = crate::sandbox::Replacement { template, policy };
+        let replacement = crate::sandbox::Replacement {
+            template,
+            policy,
+            keep: req.keep,
+        };
         let sandbox = self
             .sandboxes
             .detached(move |sandboxes| async move {

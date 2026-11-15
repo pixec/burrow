@@ -186,6 +186,8 @@ message NodeRecreateRequest {
   string template = 2;
   burrow.common.v1.KitSpec kit = 3;
   map<string, string> credentials = 4;
+  // Absolute paths copied from the old root disk to the new one.
+  repeated string keep = 5;
 }
 
 message NodeCreateSnapshotRequest {

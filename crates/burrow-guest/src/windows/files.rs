@@ -219,6 +219,16 @@ fn give_to(file: &File, sid: &[u8], is_dir: bool) -> std::io::Result<()> {
     result
 }
 
+/// Not served: a Windows guest has no POSIX owners or modes for an archive's
+/// entries to keep.
+pub async fn extract_tar(
+    _inbound: Streaming<guestpb::TarChunk>,
+) -> Result<guestpb::ExtractTarResponse, Status> {
+    Err(Status::unimplemented(
+        "a Windows guest cannot unpack a tar archive with its owners and modes",
+    ))
+}
+
 /// Streams an uploaded file to disk, as burrow-guest does on Linux: the
 /// first chunk carries the path, mode, owner and whether to leave an existing
 /// file alone.

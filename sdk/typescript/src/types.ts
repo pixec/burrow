@@ -675,6 +675,12 @@ export interface RecreateOptions extends CallOptions {
    * `rejectCapabilities` wholesale, so an empty list clears it.
    */
   kit?: KitOptions;
+  /**
+   * Absolute paths, directories or files, copied from the old root disk to
+   * the same place on the new one, with their owners, modes, times, links
+   * and extended attributes. Linux guests only.
+   */
+  keep?: string[];
 }
 
 /** What a handle keeps for itself, beside what the server holds. */

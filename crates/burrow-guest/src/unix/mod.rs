@@ -13,6 +13,7 @@ pub mod pty;
 pub mod reaper;
 pub mod rootdisk;
 pub mod signals;
+pub mod untar;
 
 /// What the macOS SDK declares and `libc` does not bind yet.
 #[cfg(target_os = "macos")]

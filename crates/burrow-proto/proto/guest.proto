@@ -40,6 +40,11 @@ service Guest {
   // One POSIX file operation. An agent that serves it, scopes and cap
   // included, lists "fs-scoped" in its health response.
   rpc Fs(FsRequest) returns (FsResponse);
+  // Unpacks a tar stream as root into a directory, keeping each entry's
+  // mode, owner, times and extended attributes, symlinks, and hard links
+  // within the stream, and replacing what is in the way. An agent that serves
+  // it lists "extract-tar" in its health response.
+  rpc ExtractTar(stream TarChunk) returns (ExtractTarResponse);
 
   // Commands the agent has run, addressable after the stream that started
   // them is gone.
@@ -288,6 +293,17 @@ message FileChunk {
 
 message UploadResult {
   uint64 bytes_written = 1;
+}
+
+message TarChunk {
+  // Set on the first message only: the absolute directory the archive's
+  // entries are named from, made if it is missing.
+  string path = 1;
+  bytes data = 2;
+}
+
+message ExtractTarResponse {
+  uint64 entries = 1;
 }
 
 message DownloadRequest {

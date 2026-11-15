@@ -28,9 +28,11 @@ service Burrow {
   // a Kit's startup hooks run again on the way up.
   rpc StopSandbox(SandboxRef) returns (burrow.common.v1.Sandbox);
   rpc StartSandbox(StartSandboxRequest) returns (burrow.common.v1.Sandbox);
-  // Replace a sandbox's root disk, discarding everything written to it, while
-  // keeping its id, address, name and volumes. With a Kit, the composition
-  // may change too.
+  // Replace a sandbox's root disk, discarding everything written to it but
+  // the paths it names to keep, while keeping its id, address, name and
+  // volumes. Nothing of the old sandbox is let go until the replacement has
+  // booted; a failure leaves it as it was. With a Kit, the composition may
+  // change too.
   rpc RecreateSandbox(RecreateSandboxRequest) returns (burrow.common.v1.Sandbox);
   // Every VM this sandbox has run, newest first.
   rpc ListSessions(SandboxRef) returns (ListSessionsResponse);
@@ -971,6 +973,12 @@ message RecreateSandboxRequest {
   // A Kit sandbox moved onto another Kit template keeps its volumes, under
   // the same compatibility rule a recreation always applies.
   string template = 3;
+  // Absolute paths, directories or files, copied from the old root disk to
+  // the same place on the new one before the sandbox is handed back, with
+  // their modes, owners, times, symlinks, hard links and extended
+  // attributes. Linux guests only; never `/`, `/proc`, `/sys`, `/dev`,
+  // `/run` or a path at, above or under a volume.
+  repeated string keep = 4;
 }
 
 message SetSecretRequest {

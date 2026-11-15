@@ -234,6 +234,8 @@ thread_local! {
         const { std::cell::RefCell::new(None) };
 }
 
+pub use super::untar::extract as extract_tar;
+
 /// What `files-as-user` in the health response promises.
 pub const FEATURE_FILES_AS_USER: &str = "files-as-user";
 

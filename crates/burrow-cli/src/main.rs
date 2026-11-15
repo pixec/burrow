@@ -462,13 +462,19 @@ enum Command {
         #[arg(long = "keep-kernel")]
         is_kernel_kept: bool,
     },
-    /// Replace a sandbox's root disk, discarding everything written to it,
-    /// while keeping its id, name and volumes.
+    /// Replace a sandbox's root disk, discarding everything written to it
+    /// but the paths kept, while keeping its id, address, name and volumes.
+    /// The old disk is let go only once the new one has booted.
     Recreate {
         id: String,
         /// Template for the new disk; omitted keeps the current one.
         #[arg(long)]
         template: Option<String>,
+        /// Copy this absolute path, a directory or a file, from the old root
+        /// disk to the new one, with its owners, modes, times, links and
+        /// extended attributes. Repeatable. Linux guests only.
+        #[arg(long = "keep", value_name = "PATH")]
+        keep: Vec<String>,
         /// Kit arg values replacing the recorded ones by name.
         #[arg(long = "arg")]
         kit_args: Vec<String>,
@@ -2418,6 +2424,7 @@ async fn main() -> anyhow::Result<()> {
         Command::Recreate {
             id,
             template,
+            keep,
             kit_args,
             kit_env,
             reject_capabilities,
@@ -2430,6 +2437,7 @@ async fn main() -> anyhow::Result<()> {
                     sandbox_id: id,
                     kit: Some(kit),
                     template: template.unwrap_or_default(),
+                    keep,
                 })
                 .await?
                 .into_inner();

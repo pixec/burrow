@@ -33,6 +33,8 @@ use super::{
 pub struct Replacement {
     pub template: String,
     pub policy: common::Policy,
+    /// Paths carried from the old root disk to the new one.
+    pub keep: Vec<String>,
 }
 
 /// Where the replacement is made before it takes the sandbox's directory.
@@ -153,6 +155,7 @@ impl SandboxManager {
         let Replacement {
             template,
             mut policy,
+            keep,
         } = replacement;
         crate::template::validate_name(&template)?;
         let templates_dir = self.config.templates_dir();
@@ -179,6 +182,10 @@ impl SandboxManager {
             )));
         }
         require_min_machine(&template, guest_os, crate::warm::Shape::wanted(&resources))?;
+        let keep = match keep.is_empty() {
+            true => keep,
+            false => crate::keep::check(&keep, &policy.volumes, old.guest_os(), guest_os)?,
+        };
         let is_macos = crate::macnode::is_macos(guest_os);
         let disk_bytes = match crate::macnode::disk_file(guest_os) {
             Some(disk) => {
@@ -351,6 +358,11 @@ impl SandboxManager {
         let booted = async {
             self.sync_firewall().await?;
             self.start(id, true).await?;
+            if !keep.is_empty() {
+                let old_disk = within(&retired(&old_tree), &old_tree, &old.workdir)
+                    .join(crate::rootdisk::ROOT_DISK);
+                crate::keep::carry(&new, &old_disk, &keep).await?;
+            }
             ready(Arc::clone(&new)).await
         }
         .await;
@@ -500,6 +512,7 @@ mod tests {
         Replacement {
             template: template.to_string(),
             policy: Default::default(),
+            keep: Vec::new(),
         }
     }
 
@@ -594,6 +607,33 @@ mod tests {
         );
         assert!(old.is_running());
         assert!(old.vm.lock().await.is_some());
+        assert_untouched(&manager, &old, b"old").await;
+        if let Some(vm) = old.vm.lock().await.take() {
+            let _ = vm.kill().await;
+        }
+        let _ = tokio::fs::remove_dir_all(&workdir).await;
+        let _ = tokio::fs::remove_dir_all(&data_dir).await;
+    }
+
+    /// A path a recreate cannot keep is refused before anything is made.
+    #[tokio::test]
+    async fn a_path_that_cannot_be_kept_changes_nothing() {
+        let (manager, data_dir) = recovering("recreate-keep").await;
+        template(&data_dir, "fresh", Some(b"new")).await;
+        let (old, workdir) = under_fake_vmm(&manager, 0).await;
+        tokio::fs::write(workdir.join(crate::rootdisk::ROOT_DISK), b"old")
+            .await
+            .unwrap();
+        let mut keeping = replacement("fresh");
+        keeping.keep = vec!["/proc/self".into()];
+
+        let err = manager
+            .recreate(old.id(), keeping, |_| async { Ok(()) })
+            .await
+            .unwrap_err();
+
+        assert_eq!(err.code(), tonic::Code::InvalidArgument);
+        assert!(old.is_running());
         assert_untouched(&manager, &old, b"old").await;
         if let Some(vm) = old.vm.lock().await.take() {
             let _ = vm.kill().await;

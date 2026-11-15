@@ -2267,6 +2267,7 @@ impl Burrow for ApiService {
         req: Request<api::RecreateSandboxRequest>,
     ) -> Result<Response<common::Sandbox>, Status> {
         let req = req.into_inner();
+        let keep = burrow_common::keep::validate(&req.keep).map_err(Status::invalid_argument)?;
         let id = self.resolve(&req.sandbox_id).await;
         let current = self
             .0
@@ -2298,6 +2299,7 @@ impl Burrow for ApiService {
                 template: req.template,
                 kit: req.kit,
                 credentials,
+                keep,
             })
             .await?
             .into_inner();

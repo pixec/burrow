@@ -110,6 +110,15 @@ impl Guest for AgentService {
         Ok(Response::new(os::files::upload(req.into_inner()).await?))
     }
 
+    async fn extract_tar(
+        &self,
+        req: Request<tonic::Streaming<guestpb::TarChunk>>,
+    ) -> Result<Response<guestpb::ExtractTarResponse>, Status> {
+        Ok(Response::new(
+            os::files::extract_tar(req.into_inner()).await?,
+        ))
+    }
+
     type DownloadFileStream =
         tokio_stream::wrappers::ReceiverStream<Result<guestpb::FileChunk, Status>>;
 

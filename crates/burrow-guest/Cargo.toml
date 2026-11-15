@@ -27,12 +27,14 @@ hyper-util = { workspace = true }
 tower = { workspace = true }
 
 [target.'cfg(target_os = "linux")'.dependencies]
+tar = { workspace = true }
 tokio-vsock = { workspace = true }
 nix = { workspace = true }
 rtnetlink = { workspace = true }
 netlink-packet-route = { workspace = true }
 
 [target.'cfg(target_os = "macos")'.dependencies]
+tar = { workspace = true }
 nix = { workspace = true }
 base64 = { workspace = true }
 

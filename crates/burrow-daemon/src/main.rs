@@ -17,6 +17,7 @@ mod fsync;
 mod guestconn;
 mod ipsw;
 mod journal;
+mod keep;
 mod kernels;
 mod kit;
 mod macnode;
@@ -87,6 +88,7 @@ fn main() -> anyhow::Result<()> {
     // Hypervisor unshares its mount namespace, which a threaded process
     // cannot.
     burrow_vmm::cloud_hypervisor::jail::run_if_helper();
+    burrow_diskread::run_if_reader();
     tokio::runtime::Runtime::new()?.block_on(daemon())
 }
 

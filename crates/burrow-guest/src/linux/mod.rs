@@ -31,6 +31,7 @@ pub fn features() -> Vec<String> {
         "output-feed".to_string(),
         fs::FEATURE_FS.to_string(),
         "public-addresses".to_string(),
+        crate::unix::untar::FEATURE_EXTRACT_TAR.to_string(),
     ]
 }
 

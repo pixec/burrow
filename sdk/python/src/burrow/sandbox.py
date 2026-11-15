@@ -1109,18 +1109,29 @@ class Sandbox:
         return info
 
     def recreate(
-        self, *, template: Optional[str] = None, kit: Optional[Dict[str, Any]] = None
+        self,
+        *,
+        template: Optional[str] = None,
+        kit: Optional[Dict[str, Any]] = None,
+        keep: Optional[List[str]] = None,
     ) -> SandboxInfo:
-        """Replaces the root disk, discarding everything written to it, while
-        keeping the sandbox's id, name, address and volumes. With `template`
-        the sandbox moves onto another template; a Kit is provisioned again on
-        the new disk with the recorded inputs, as changed by `kit`: `args` and
-        `env` replace by name, `reject_capabilities` wholesale, so an empty
-        list clears it."""
+        """Replaces the root disk, discarding everything written to it but the
+        paths in `keep`, while keeping the sandbox's id, name, address and
+        volumes. The old disk is let go only once the new one has booted; a
+        failure leaves the sandbox as it was. With `template` the sandbox
+        moves onto another template; a Kit is provisioned again on the new
+        disk with the recorded inputs, as changed by `kit`: `args` and `env`
+        replace by name, `reject_capabilities` wholesale, so an empty list
+        clears it. Each path in `keep` is an absolute directory or file copied
+        from the old disk to the same place on the new one, owners, modes,
+        times, links and extended attributes included; Linux guests only."""
         info = self._apply(
             "RecreateSandbox",
             api_pb2.RecreateSandboxRequest(
-                sandbox_id=self.id, template=template or "", kit=_to_kit_spec(kit)
+                sandbox_id=self.id,
+                template=template or "",
+                kit=_to_kit_spec(kit),
+                keep=keep or [],
             ),
         )
         if self._on_resume:
