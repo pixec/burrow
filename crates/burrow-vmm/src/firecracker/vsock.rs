@@ -15,7 +15,9 @@
 //! Note that these connections do not survive a pause/snapshot cycle: always
 //! reconnect after a resume rather than holding a channel across it.
 
-use std::path::Path;
+use std::collections::HashMap;
+use std::path::{Path, PathBuf};
+use std::sync::{LazyLock, Mutex};
 use std::time::Duration;
 
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -34,6 +36,31 @@ const MAX_HANDSHAKE_LEN: usize = 64;
 /// nothing until the reply arrives. A guest that accepts and then goes quiet
 /// would otherwise park the caller on this read forever.
 pub const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// The highest host port each tracked socket's VMM has handed out, from the
+/// `OK <port>` replies. Only sockets [`track_ports`] registered are recorded.
+static HOST_PORTS: LazyLock<Mutex<HashMap<PathBuf, u32>>> = LazyLock::new(Default::default);
+
+/// Starts recording the host ports handed out through `uds`, from `from`: the
+/// highest one its VMM has already used, or 0.
+pub fn track_ports(uds: &Path, from: u32) {
+    HOST_PORTS.lock().unwrap().insert(uds.to_path_buf(), from);
+}
+
+pub fn untrack_ports(uds: &Path) {
+    HOST_PORTS.lock().unwrap().remove(uds);
+}
+
+/// The highest host port handed out through `uds` since [`track_ports`], or 0.
+pub fn highest_port(uds: &Path) -> u32 {
+    HOST_PORTS.lock().unwrap().get(uds).copied().unwrap_or(0)
+}
+
+fn note_port(uds: &Path, port: u32) {
+    if let Some(highest) = HOST_PORTS.lock().unwrap().get_mut(uds) {
+        *highest = (*highest).max(port);
+    }
+}
 
 /// Connects through the hybrid vsock UDS to `port` inside the guest.
 pub async fn connect(uds_path: &Path, port: u32) -> Result<UnixStream> {
@@ -80,11 +107,14 @@ async fn handshake(uds_path: &Path, port: u32) -> Result<UnixStream> {
 
     let response = String::from_utf8_lossy(&line);
     let response = response.trim_end_matches('\r');
-    if !response.starts_with("OK ") {
+    let Some(host_port) = response.strip_prefix("OK ") else {
         return Err(Error::VsockRejected {
             port,
             response: response.to_string(),
         });
+    };
+    if let Ok(host_port) = host_port.trim().parse() {
+        note_port(uds_path, host_port);
     }
     Ok(stream)
 }
@@ -138,12 +168,16 @@ mod tests {
             tokio::time::sleep(Duration::from_millis(200)).await;
         });
 
+        track_ports(&path, 7);
         let mut stream = connect_within(&path, 1024, Duration::from_secs(5))
             .await
             .expect("the peer answered");
         let mut rest = [0u8; 7];
         stream.read_exact(&mut rest).await.unwrap();
         assert_eq!(&rest, b"PAYLOAD");
+        assert_eq!(highest_port(&path), 4242);
+        untrack_ports(&path);
+        assert_eq!(highest_port(&path), 0);
         let _ = std::fs::remove_dir_all(&dir);
     }
 }
