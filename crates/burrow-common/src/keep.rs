@@ -46,17 +46,10 @@ fn normalize(path: &str) -> Result<String, String> {
     if path.chars().any(char::is_control) {
         return Err(format!("--keep {path:?}: holds a control character"));
     }
-    let mut normal = String::new();
-    for part in path
-        .split('/')
-        .filter(|part| !part.is_empty() && *part != ".")
-    {
-        if part == ".." {
-            return Err(format!("--keep {path}: holds `..`"));
-        }
-        normal.push('/');
-        normal.push_str(part);
+    if path.split('/').any(|part| part == "..") {
+        return Err(format!("--keep {path}: holds `..`"));
     }
+    let normal = clean(path);
     if normal.is_empty() {
         return Err("--keep /: the whole disk is what a recreate replaces; keep the paths that matter, or put them on a volume".into());
     }
@@ -66,6 +59,20 @@ fn normalize(path: &str) -> Result<String, String> {
         ));
     }
     Ok(normal)
+}
+
+/// `path` without repeated or trailing slashes or `.` components, as
+/// [`covers`] compares paths; `/` is the empty string.
+pub fn clean(path: &str) -> String {
+    let mut normal = String::new();
+    for part in path
+        .split('/')
+        .filter(|part| !part.is_empty() && *part != ".")
+    {
+        normal.push('/');
+        normal.push_str(part);
+    }
+    normal
 }
 
 /// Whether `outer` is `inner` or one of its ancestors.
@@ -92,6 +99,8 @@ mod tests {
         );
         assert_eq!(kept(&["/var/lib/app", "/var"]).unwrap(), ["/var"]);
         assert_eq!(kept(&["/homes", "/home"]).unwrap(), ["/home", "/homes"]);
+        assert_eq!(clean("//data/./x/"), "/data/x");
+        assert_eq!(clean("/"), "");
     }
 
     #[test]

@@ -49,8 +49,9 @@ pub fn check(
     }
     for path in &paths {
         let mounted = volumes.iter().find(|mount| {
-            burrow_common::keep::covers(path, &mount.path)
-                || burrow_common::keep::covers(&mount.path, path)
+            let mounted = burrow_common::keep::clean(&mount.path);
+            burrow_common::keep::covers(path, &mounted)
+                || burrow_common::keep::covers(&mounted, path)
         });
         if let Some(mount) = mounted {
             return Err(Status::invalid_argument(format!(
@@ -159,8 +160,14 @@ mod tests {
     #[cfg(target_os = "linux")]
     #[test]
     fn a_path_a_volume_holds_is_refused() {
-        let volumes = [mount("/home/me/data")];
-        for path in ["/home", "/home/me/data", "/home/me/data/x"] {
+        let volumes = [mount("/home/me/data"), mount("//srv/./data/")];
+        for path in [
+            "/home",
+            "/home/me/data",
+            "/home/me/data/x",
+            "/srv/data/x",
+            "/srv",
+        ] {
             let err = check(&[path.into()], &volumes, GuestOs::Linux, GuestOs::Linux).unwrap_err();
             assert!(err.message().contains("volume"), "{}", err.message());
         }
