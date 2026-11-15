@@ -56,7 +56,8 @@ pub fn highest_port(uds: &Path) -> u32 {
     HOST_PORTS.lock().unwrap().get(uds).copied().unwrap_or(0)
 }
 
-fn note_port(uds: &Path, port: u32) {
+/// Raises the highest host port recorded for a tracked `uds` to `port`.
+pub fn note_port(uds: &Path, port: u32) {
     if let Some(highest) = HOST_PORTS.lock().unwrap().get_mut(uds) {
         *highest = (*highest).max(port);
     }

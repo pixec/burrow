@@ -659,14 +659,16 @@ fn vsock_connections(state: &Value) -> Vec<(u32, u32)> {
 /// port it reached across a snapshot only from cloud-hypervisor#9318, which
 /// v54 predates.
 ///
-/// Only the first ports matter: the guest closes its stale sockets soon after
-/// it resumes, long before a fresh VMM counts up to ports further on. The
+/// Only the first ports matter, so the skip stops at the window: the guest
+/// closes its stale sockets soon after it resumes, long before a fresh VMM
+/// counts up to ports further on. The
 /// connections are made at once, since the VMM gives out a port for each in
 /// whatever order it takes them.
 async fn skip_stale_ports(uds: &Path, last: u32) {
-    if !(FIRST_HOST_PORT..FIRST_HOST_PORT + STALE_PORT_WINDOW).contains(&last) {
+    if last < FIRST_HOST_PORT {
         return;
     }
+    let last = last.min(FIRST_HOST_PORT + STALE_PORT_WINDOW - 1);
     let mut skipping = tokio::task::JoinSet::new();
     for _ in FIRST_HOST_PORT..=last {
         let uds = uds.to_path_buf();
@@ -674,8 +676,18 @@ async fn skip_stale_ports(uds: &Path, last: u32) {
             let _ = crate::firecracker::vsock::connect(&uds, UNLISTENED_PORT).await;
         });
     }
-    let _ = tokio::time::timeout(STALE_PORT_TIMEOUT, skipping.join_all()).await;
-    crate::firecracker::vsock::track_ports(uds, last);
+    if tokio::time::timeout(STALE_PORT_TIMEOUT, skipping.join_all())
+        .await
+        .is_err()
+    {
+        tracing::warn!(
+            uds = %uds.display(),
+            ports = last - FIRST_HOST_PORT + 1,
+            "the guest did not refuse every skipped vsock port in time; a new connection may \
+             still be given a port the restored guest holds"
+        );
+    }
+    crate::firecracker::vsock::note_port(uds, last);
 }
 
 /// Each NIC's id and the tap it names.
@@ -834,7 +846,8 @@ mod tests {
     /// had closed just before the suspend, and its RST reset the handshake of
     /// the restored VMM's first connection, given the same port. Every port
     /// the snapshotted VMM used is skipped, each against a port the guest
-    /// refuses, and a restore of a VMM that used none skips nothing.
+    /// refuses, up to the end of the window, and a restore of a VMM that used
+    /// none skips nothing. A skip never lowers the highest port recorded.
     #[tokio::test]
     async fn a_restore_skips_every_host_port_the_snapshotted_vmm_used() {
         let dir = std::env::temp_dir().join(format!("burrow-ch-ports-{}", std::process::id()));
@@ -855,8 +868,8 @@ mod tests {
                     .push(String::from_utf8_lossy(&line).into_owned());
             }
         });
+        crate::firecracker::vsock::track_ports(&uds, 0);
         skip_stale_ports(&uds, 0).await;
-        skip_stale_ports(&uds, FIRST_HOST_PORT + STALE_PORT_WINDOW).await;
         assert!(refused.lock().unwrap().is_empty());
 
         skip_stale_ports(&uds, FIRST_HOST_PORT + 2).await;
@@ -867,6 +880,21 @@ mod tests {
         assert_eq!(
             crate::firecracker::vsock::highest_port(&uds),
             FIRST_HOST_PORT + 2
+        );
+
+        crate::firecracker::vsock::note_port(&uds, FIRST_HOST_PORT + 10);
+        skip_stale_ports(&uds, FIRST_HOST_PORT + 2).await;
+        assert_eq!(
+            crate::firecracker::vsock::highest_port(&uds),
+            FIRST_HOST_PORT + 10
+        );
+
+        refused.lock().unwrap().clear();
+        skip_stale_ports(&uds, FIRST_HOST_PORT + STALE_PORT_WINDOW + 5).await;
+        assert_eq!(refused.lock().unwrap().len(), STALE_PORT_WINDOW as usize);
+        assert_eq!(
+            crate::firecracker::vsock::highest_port(&uds),
+            FIRST_HOST_PORT + STALE_PORT_WINDOW - 1
         );
         crate::firecracker::vsock::untrack_ports(&uds);
         let _ = tokio::fs::remove_dir_all(&dir).await;
