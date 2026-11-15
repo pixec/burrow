@@ -7,12 +7,16 @@ members = [
     "crates/burrow-net",
     "crates/burrow-proxy",
     "crates/burrow-store",
+    "crates/burrow-diskread",
     "crates/tailcat-rs",
     "crates/burrow-guest",
     "crates/burrow-orchestrator",
     "crates/burrow-daemon",
     "crates/burrow-cli",
 ]
+# ext4-view with inode numbers, link counts and extended attributes added;
+# see vendor/ext4-view/src/xattr.rs.
+exclude = ["vendor/ext4-view"]
 # burrow-guest is a Linux-only guest binary (vsock, mount syscalls). Excluding
 # it here keeps a bare `cargo build`/`cargo clippy` working on macOS; the
 # zigbuild invocation in the development harness docs builds it for the Linux target.
@@ -23,6 +27,7 @@ default-members = [
     "crates/burrow-net",
     "crates/burrow-proxy",
     "crates/burrow-store",
+    "crates/burrow-diskread",
     "crates/tailcat-rs",
     "crates/burrow-orchestrator",
     "crates/burrow-daemon",
@@ -41,6 +46,7 @@ burrow-vmm = { path = "crates/burrow-vmm" }
 burrow-net = { path = "crates/burrow-net" }
 burrow-proxy = { path = "crates/burrow-proxy" }
 burrow-store = { path = "crates/burrow-store" }
+burrow-diskread = { path = "crates/burrow-diskread" }
 tailcat-rs = { path = "crates/tailcat-rs" }
 
 tokio = { version = "1", features = ["full"] }

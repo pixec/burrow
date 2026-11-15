@@ -805,6 +805,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "burrow-diskread"
+version = "0.1.0"
+dependencies = [
+ "ext4-view",
+ "flate2",
+ "libc",
+ "seccompiler",
+ "serde",
+ "serde_json",
+ "tar",
+ "tokio",
+]
+
+[[package]]
 name = "burrow-guest"
 version = "0.1.0"
 dependencies = [
@@ -1513,6 +1527,14 @@ checksum = "5a23add41df1562121a9393cb065eab5146a1242410f23a644851e90cfd669d2"
 dependencies = [
  "parking",
  "pin-project-lite",
+]
+
+[[package]]
+name = "ext4-view"
+version = "1.0.0"
+dependencies = [
+ "bitflags 2.13.1",
+ "crc",
 ]
 
 [[package]]
@@ -3519,6 +3541,15 @@ name = "scopeguard"
 version = "1.2.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "94143f37725109f92c262ed2cf5e59bce7498c01bcc1502d7b9afe439a4e9f49"
+
+[[package]]
+name = "seccompiler"
+version = "0.5.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "a4ae55de56877481d112a559bbc12667635fdaf5e005712fd4e2b2fa50ffc884"
+dependencies = [
+ "libc",
+]
 
 [[package]]
 name = "security-framework"

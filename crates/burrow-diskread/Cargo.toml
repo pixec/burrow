@@ -1,0 +1,23 @@
+[package]
+name = "burrow-diskread"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+ext4-view = { path = "../../vendor/ext4-view", features = ["std"] }
+serde = { workspace = true }
+serde_json = { workspace = true }
+tar = { workspace = true }
+libc = { workspace = true }
+tokio = { workspace = true }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+seccompiler = "0.5"
+
+[dev-dependencies]
+flate2 = { workspace = true }
+
+[[test]]
+name = "confined"
+harness = false
