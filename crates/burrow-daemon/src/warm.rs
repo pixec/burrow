@@ -622,7 +622,6 @@ pub async fn build_warm_snapshot(
     trust: &Trust,
 ) -> Result<Warm, Status> {
     let templates_dir = config.templates_dir();
-    let agent_timeout = config.agent_timeout;
     // Defence in depth: the name becomes a directory under `templates_dir` and
     // this function removes and recreates it, so a caller that skipped
     // validation must not be able to point it at an arbitrary host path.
@@ -643,6 +642,7 @@ pub async fn build_warm_snapshot(
     let environment = crate::oci::image_environment(&config.data_dir, template).await;
     let (hypervisor, guest_os) = environment.machine()?;
     require_warm_guest(template, guest_os)?;
+    let agent_timeout = config.agent_timeout(guest_os);
     if !config.hypervisors.contains(&hypervisor) {
         return Err(Status::failed_precondition(format!(
             "template {template} runs under {hypervisor}, which this node does not offer"
@@ -757,8 +757,10 @@ pub async fn build_warm_snapshot(
             // thousands of faults on every create afterwards. Only the
             // page-fault handler records faults, or replays a plan.
             if capabilities.is_lazy_memory_supported
-                && let Err(err) =
-                    profile_restore(&vm_id, &run_dir, &backend, config, &pool, shape, trust).await
+                && let Err(err) = profile_restore(
+                    &vm_id, &run_dir, &backend, config, &pool, shape, trust, guest_os,
+                )
+                .await
             {
                 tracing::warn!(template, %err, "could not record a prefetch plan");
             }
@@ -991,6 +993,7 @@ async fn warm_up(
 /// The recording VM is otherwise identical to a real create, same tap and same
 /// handshake, because a plan gathered from a different code path would prefetch
 /// the wrong pages.
+#[allow(clippy::too_many_arguments)]
 async fn profile_restore(
     vm_id: &str,
     dir: &Path,
@@ -999,8 +1002,9 @@ async fn profile_restore(
     pool: &burrow_net::ipam::AddressPool,
     shape: Shape,
     trust: &Trust,
+    guest_os: burrow_vmm::GuestOs,
 ) -> Result<(), Status> {
-    let agent_timeout = config.agent_timeout;
+    let agent_timeout = config.agent_timeout(guest_os);
     // Not the snapshot's own address: a clone's handshake re-addresses its
     // guest, and a plan recorded without that would leave the code doing it
     // to fault in on every create.

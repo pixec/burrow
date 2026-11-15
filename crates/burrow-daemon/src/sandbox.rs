@@ -170,7 +170,9 @@ pub struct NodeConfig {
     pub extra_boot_args: String,
     /// Boots every guest with a verbose console, as a create can ask for one.
     pub is_console_verbose: bool,
-    pub agent_timeout: std::time::Duration,
+    /// `--agent-timeout`: raises every guest's agent timeout to at least this.
+    /// Read through [`Self::agent_timeout`].
+    pub min_agent_timeout: std::time::Duration,
     /// How a command's log rotates when its exec does not say.
     pub command_log_rotation: burrow_common::cmdlog::Rotation,
     /// cgroup2 mount point; `None` disables resource limits entirely.
@@ -251,6 +253,12 @@ pub struct NodeConfig {
 }
 
 impl NodeConfig {
+    /// How long a `guest_os` sandbox's agent gets to answer: its OS's own
+    /// timeout, or the node's `--agent-timeout` where that is longer.
+    pub fn agent_timeout(&self, guest_os: burrow_vmm::GuestOs) -> std::time::Duration {
+        guest_os.agent_timeout_at_least(self.min_agent_timeout)
+    }
+
     /// The agent a `guest_os` guest is upgraded to, when this node ships one.
     pub(crate) fn upgrade_for(
         &self,
@@ -3947,7 +3955,7 @@ impl SandboxManager {
             }),
             agent_channel: Mutex::new(None),
             agent_features: Mutex::new(None),
-            agent_timeout: self.config.agent_timeout,
+            agent_timeout: self.config.agent_timeout(guest_os),
             // A recovered sandbox is suspended: it has no VM, so there is
             // no handshake in flight. The resume that starts one does its
             // own, synchronously.
@@ -5800,7 +5808,7 @@ impl SandboxManager {
                     crate::rootdisk::ROOT_DISK,
                     bytes,
                     overhead_mib,
-                    self.config.agent_timeout,
+                    sandbox.agent_timeout,
                 )
                 .await?;
             if shrunk.size_bytes > bytes {
@@ -7996,7 +8004,7 @@ impl SandboxManager {
         if from_warm {
             guard.dialing = Some(tokio::spawn(guestconn::connect_when_ready(
                 guard.vm().guest(),
-                self.config.agent_timeout,
+                self.config.agent_timeout(guest_os),
             )));
         }
 
@@ -8074,13 +8082,18 @@ impl SandboxManager {
             // down rather than leaving an unusable sandbox in the registry. The
             // first connection that succeeds is kept, rather than probing with
             // one and then dialling another.
-            let connected =
-                guestconn::connect_when_ready(guard.vm().guest(), self.config.agent_timeout).await;
+            let connected = guestconn::connect_when_ready(
+                guard.vm().guest(),
+                self.config.agent_timeout(guest_os),
+            )
+            .await;
             let (agent, accepted_at) = match connected {
                 Ok(ready) => ready,
                 Err(err) => {
-                    let failure =
-                        NoAgent::Unreachable(self.config.agent_timeout, error_chain(&*err));
+                    let failure = NoAgent::Unreachable(
+                        self.config.agent_timeout(guest_os),
+                        error_chain(&*err),
+                    );
                     let reason = no_agent_reason(guard.vm_mut(), failure).await;
                     return Err(guard.fail(Status::internal(reason)).await);
                 }
@@ -8105,7 +8118,7 @@ impl SandboxManager {
                 guard.vm().guest(),
                 request.clone(),
                 self.config.upgrade_for(guest_os),
-                self.config.agent_timeout,
+                self.config.agent_timeout(guest_os),
             )
             .await
             {
@@ -8200,7 +8213,7 @@ impl SandboxManager {
             suspended_at: std::sync::atomic::AtomicI64::new(0),
             agent_channel: Mutex::new(None),
             agent_features: Mutex::new(features),
-            agent_timeout: self.config.agent_timeout,
+            agent_timeout: self.config.agent_timeout(guest_os),
             handshake,
             // A warm-created sandbox already restores from the template's
             // memory file, so its first suspend has a base to diff against.
@@ -8229,7 +8242,7 @@ impl SandboxManager {
                 request,
                 grow_to,
                 dialing,
-                self.config.agent_timeout,
+                self.config.agent_timeout(guest_os),
             );
         }
         phases.mark("record");
@@ -9032,7 +9045,7 @@ impl SandboxManager {
         // Dialled as soon as there is a guest to dial, as a warm create does.
         guard.dialing = Some(tokio::spawn(guestconn::connect_when_ready(
             guard.vm().guest(),
-            self.config.agent_timeout,
+            self.config.agent_timeout(guest_os),
         )));
 
         if !is_attached
@@ -9115,7 +9128,7 @@ impl SandboxManager {
             suspended_at: std::sync::atomic::AtomicI64::new(0),
             agent_channel: Mutex::new(None),
             agent_features: Mutex::new(None),
-            agent_timeout: self.config.agent_timeout,
+            agent_timeout: self.config.agent_timeout(guest_os),
             handshake: Arc::new(tokio::sync::watch::channel(Handshake::Pending).0),
             memory_chain: Mutex::new(chain),
             // A restore copies state, not the bill for producing it: the child
@@ -9138,7 +9151,7 @@ impl SandboxManager {
             request,
             None,
             dialing,
-            self.config.agent_timeout,
+            self.config.agent_timeout(guest_os),
         );
         Ok((sandbox, disk))
     }
@@ -9218,7 +9231,7 @@ impl SandboxManager {
         let resumed = sandbox
             .resume(
                 request,
-                self.config.agent_timeout,
+                self.config.agent_timeout(guest_os),
                 self.config.upgrade_for(guest_os),
                 self.config.object_store.is_some(),
             )
@@ -9460,7 +9473,7 @@ impl SandboxManager {
             .boot(
                 spec,
                 request,
-                self.config.agent_timeout,
+                self.config.agent_timeout(guest_os),
                 self.config.upgrade_for(guest_os),
                 hotplugged,
             )
@@ -10691,7 +10704,7 @@ impl SandboxManager {
             suspended_at: std::sync::atomic::AtomicI64::new(0),
             agent_channel: Mutex::new(None),
             agent_features: Mutex::new(None),
-            agent_timeout: self.config.agent_timeout,
+            agent_timeout: self.config.agent_timeout(guest_os),
             handshake: settled(),
             memory_chain: Mutex::new(Vec::new()),
             usage: std::sync::Mutex::new(Usage {
@@ -11796,7 +11809,7 @@ pub(crate) mod tests {
                 firecracker_io_engine: Default::default(),
                 extra_boot_args: String::new(),
                 is_console_verbose: false,
-                agent_timeout: std::time::Duration::from_millis(1),
+                min_agent_timeout: std::time::Duration::from_millis(1),
                 command_log_rotation: Default::default(),
                 cgroup_root: None,
                 is_resource_limits_required: false,

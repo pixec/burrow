@@ -141,8 +141,10 @@ pub struct ServeArgs {
     /// this for one sandbox.
     #[arg(long, env = "BURROW_GUEST_CONSOLE_VERBOSE")]
     pub guest_console_verbose: bool,
-    /// Seconds to wait for a new sandbox's agent to become reachable.
-    #[arg(long, default_value_t = 30)]
+    /// Seconds a sandbox's agent gets to become reachable, at least. Each guest
+    /// OS has its own timeout (30 s for Linux, 120 s for Windows); this only
+    /// raises it, never lowers it.
+    #[arg(long, default_value_t = 0)]
     pub agent_timeout: u64,
     /// Default size a command's output log rotates at, as Docker's
     /// `max-size`; unset keeps every byte. An exec may ask for its own.
@@ -1744,7 +1746,7 @@ pub async fn run(args: ServeArgs) -> anyhow::Result<()> {
             firecracker_io_engine: args.firecracker_io_engine,
             extra_boot_args: args.guest_boot_args.clone(),
             is_console_verbose: args.guest_console_verbose,
-            agent_timeout: Duration::from_secs(args.agent_timeout),
+            min_agent_timeout: Duration::from_secs(args.agent_timeout),
             command_log_rotation: burrow_common::cmdlog::Rotation {
                 max_bytes: args.command_log_max_size.unwrap_or(0),
                 max_files: args.command_log_max_files,

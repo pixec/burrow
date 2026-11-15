@@ -47,7 +47,8 @@ pub struct VmBootArgs {
     /// Console string that means the guest reached userspace.
     #[arg(long, default_value = "login:")]
     pub ready_marker: String,
-    /// Seconds to wait for the ready marker.
+    /// Seconds to wait for the ready marker. The agent gets at least its guest
+    /// OS's own timeout; this only raises that.
     #[arg(long, default_value_t = 30)]
     pub timeout: u64,
     /// Boot this many times in sequence and report latencies.
@@ -59,6 +60,11 @@ pub struct VmBootArgs {
 }
 
 impl VmBootArgs {
+    /// How long the agent gets to answer. These commands boot Linux kernels.
+    fn agent_timeout(&self) -> Duration {
+        burrow_vmm::GuestOs::Linux.agent_timeout_at_least(Duration::from_secs(self.timeout))
+    }
+
     fn spec(&self, vm_id: impl Into<String>) -> VmSpec {
         let backend = match self.hypervisor {
             Hypervisor::Firecracker => Backend::Firecracker(FirecrackerConfig {
@@ -228,10 +234,7 @@ pub async fn agent_boot(args: VmBootArgs) -> anyhow::Result<()> {
     let vm = Vm::boot(spec).await?;
 
     let ready = match vm
-        .wait_for_vsock(
-            crate::guestconn::AGENT_PORT,
-            Duration::from_secs(args.timeout),
-        )
+        .wait_for_vsock(crate::guestconn::AGENT_PORT, args.agent_timeout())
         .await
     {
         Ok(elapsed) => elapsed,
@@ -243,8 +246,7 @@ pub async fn agent_boot(args: VmBootArgs) -> anyhow::Result<()> {
         }
     };
 
-    let mut client =
-        crate::guestconn::connect(vm.guest(), Duration::from_secs(args.timeout)).await?;
+    let mut client = crate::guestconn::connect(vm.guest(), args.agent_timeout()).await?;
     let handshake = client
         .handshake(crate::guestconn::handshake_request(false))
         .await?
@@ -268,8 +270,7 @@ pub async fn agent_boot(args: VmBootArgs) -> anyhow::Result<()> {
 /// Runs a command in a freshly booted agent sandbox and streams the result.
 pub async fn agent_exec(args: VmBootArgs, cmd: Vec<String>) -> anyhow::Result<()> {
     let vm = boot_agent_vm(&args, "exectest").await?;
-    let mut client =
-        crate::guestconn::connect(vm.guest(), Duration::from_secs(args.timeout)).await?;
+    let mut client = crate::guestconn::connect(vm.guest(), args.agent_timeout()).await?;
     client
         .handshake(crate::guestconn::handshake_request(false))
         .await?;
@@ -293,10 +294,7 @@ async fn boot_agent_vm(args: &VmBootArgs, id: &str) -> anyhow::Result<Vm> {
     ));
     let vm = Vm::boot(spec).await?;
     if let Err(err) = vm
-        .wait_for_vsock(
-            crate::guestconn::AGENT_PORT,
-            Duration::from_secs(args.timeout),
-        )
+        .wait_for_vsock(crate::guestconn::AGENT_PORT, args.agent_timeout())
         .await
     {
         eprintln!("--- console tail ---\n{}", vm.console_tail(30).await);
@@ -366,8 +364,7 @@ const RNG_PROBE: &str = "head -c 16 /dev/urandom | od -An -tx1 | tr -d ' \\n'";
 /// answers whether clones can share one memory file, which warm snapshots rely on.
 pub async fn clone_divergence(args: VmBootArgs) -> anyhow::Result<()> {
     let base = boot_agent_vm(&args, "clonebase").await?;
-    let mut client =
-        crate::guestconn::connect(base.guest(), Duration::from_secs(args.timeout)).await?;
+    let mut client = crate::guestconn::connect(base.guest(), args.agent_timeout()).await?;
     client
         .handshake(crate::guestconn::handshake_request(false))
         .await?;
@@ -396,14 +393,10 @@ pub async fn clone_divergence(args: VmBootArgs) -> anyhow::Result<()> {
         spec.workdir = dir;
         spec.is_vsock_enabled = true;
         let vm = Vm::restore(spec, true).await?;
-        vm.wait_for_vsock(
-            crate::guestconn::AGENT_PORT,
-            Duration::from_secs(args.timeout),
-        )
-        .await?;
+        vm.wait_for_vsock(crate::guestconn::AGENT_PORT, args.agent_timeout())
+            .await?;
 
-        let mut client =
-            crate::guestconn::connect(vm.guest(), Duration::from_secs(args.timeout)).await?;
+        let mut client = crate::guestconn::connect(vm.guest(), args.agent_timeout()).await?;
 
         // Before the handshake the clone still carries the snapshot's RNG.
         let mut pre = String::new();

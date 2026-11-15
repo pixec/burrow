@@ -140,6 +140,24 @@ impl GuestOs {
         }
     }
 
+    /// How long a sandbox of this OS gets for its agent to answer after its
+    /// VMM starts. Windows Server 2022 under Cloud Hypervisor answered 11 s
+    /// in at 4 vCPUs and 25-30 s at 2 vCPUs with its image in the page cache,
+    /// and later than 30 s without it, so it gets four times the worst seen.
+    /// macOS keeps the default: nothing here has measured it.
+    pub fn agent_timeout(self) -> std::time::Duration {
+        match self {
+            Self::Windows => std::time::Duration::from_secs(120),
+            Self::Linux | Self::MacOs => std::time::Duration::from_secs(30),
+        }
+    }
+
+    /// [`Self::agent_timeout`], raised to `at_least` where that is longer: what
+    /// an operator's override can do to it.
+    pub fn agent_timeout_at_least(self, at_least: std::time::Duration) -> std::time::Duration {
+        at_least.max(self.agent_timeout())
+    }
+
     /// The hypervisor a template of this OS gets when its build names none.
     pub fn default_hypervisor(self) -> Hypervisor {
         match self {
@@ -159,6 +177,28 @@ impl std::fmt::Display for GuestOs {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn an_override_only_raises_a_guests_agent_timeout() {
+        use std::time::Duration;
+        let linux = GuestOs::Linux;
+        assert_eq!(
+            linux.agent_timeout_at_least(Duration::ZERO),
+            Duration::from_secs(30)
+        );
+        assert_eq!(
+            linux.agent_timeout_at_least(Duration::from_secs(5)),
+            Duration::from_secs(30)
+        );
+        assert_eq!(
+            linux.agent_timeout_at_least(Duration::from_secs(90)),
+            Duration::from_secs(90)
+        );
+        assert_eq!(
+            GuestOs::Windows.agent_timeout_at_least(Duration::from_secs(90)),
+            Duration::from_secs(120)
+        );
+    }
 
     #[test]
     fn a_ceiling_is_the_guest_its_vmm_and_the_page_tables_over_it() {

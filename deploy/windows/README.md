@@ -75,10 +75,11 @@ rewritten with the same partition GUIDs, which the BCD names). It boots, and
 also boots grown.
 
 burrowd needs `--cloud-hypervisor-firmware` pointing at CH's edk2 build
-(`CLOUDHV.fd` on x86_64) when it is not at the default path, and an
-`--agent-timeout` of 90 or more: at 2 vCPUs / 4096 MiB the agent is up 25-30 s
-after CH starts with the image in the page cache, and later than the default
-30 s without it.
+(`CLOUDHV.fd` on x86_64) when it is not at the default path. A Windows
+sandbox's agent gets 120 s to answer (`GuestOs::agent_timeout`), against
+Linux's 30 s: at 2 vCPUs / 4096 MiB it is up 25-30 s after CH starts with the
+image in the page cache, and later without it. `--agent-timeout` can only
+raise these.
 
 ## How Burrow runs a Windows guest
 
@@ -130,8 +131,6 @@ DIR=/var/lib/burrow/spike-win VCPUS=4 MEMORY_MIB=6144 sh run-vm.sh install
   refused for Windows guests for now, and creates of a Windows template always
   boot cold.
 - A password-reset call in the agent, and per-sandbox machine identity.
-- An agent timeout per guest OS, so a node running Windows need not wait as
-  long for a Linux guest that never comes up.
 - swtpm per sandbox, and the AppArmor rule, for Windows 11.
 - Shipping the Windows agent build beside the Linux one, so Windows guests
   can be upgraded.
