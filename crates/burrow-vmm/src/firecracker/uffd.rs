@@ -458,8 +458,13 @@ struct Blocks {
 }
 
 impl Blocks {
-    /// Fills every page of the block around `page` not served yet, and `page`
-    /// itself whatever the record says, then wakes the block once it is whole.
+    /// Fills `page` whatever the record says, then every page of the block
+    /// around it not served yet, and wakes the block.
+    ///
+    /// Only `page` must be filled: the guest asked for nothing else. A
+    /// neighbour that cannot be, its contents failing to arrive or its memory
+    /// to be charged, ends the filling and leaves the block on small pages,
+    /// with the rest to fault in on their own.
     fn serve(
         &mut self,
         fd: RawFd,
@@ -470,10 +475,23 @@ impl Blocks {
     ) -> io::Result<()> {
         let size = region.page_size as u64;
         let (start, end) = region.block_of(page);
+        let fill = |at: u64, len: u64, layer: Option<usize>| {
+            fill(
+                fd,
+                region,
+                at,
+                len,
+                layer,
+                layers,
+                Some(&self.zeroes),
+                served,
+                UFFDIO_COPY_MODE_DONTWAKE,
+            )
+        };
+        fill(page, size, memfile::resolve(layers, region.offset_of(page)))?;
         let runs = {
             let served = served.lock().unwrap();
-            let is_missing =
-                |at: u64| at == page || !served.contains(region.offset_of(at) / memfile::PAGE);
+            let is_missing = |at: u64| !served.contains(region.offset_of(at) / memfile::PAGE);
             let mut runs = Vec::new();
             let mut at = start;
             while at < end {
@@ -494,20 +512,10 @@ impl Blocks {
             }
             runs
         };
-        for (at, run_end, layer) in runs {
-            fill(
-                fd,
-                region,
-                at,
-                run_end - at,
-                layer,
-                layers,
-                Some(&self.zeroes),
-                served,
-                UFFDIO_COPY_MODE_DONTWAKE,
-            )?;
-        }
-        if end - start == BLOCK {
+        let is_whole = runs
+            .into_iter()
+            .all(|(at, run_end, layer)| fill(at, run_end - at, layer).is_ok());
+        if is_whole && end - start == BLOCK {
             self.collapse.run(start, end);
         }
         wake(fd, start, end)
@@ -1511,6 +1519,26 @@ mod tests {
             });
             assert!(served.lock().unwrap().contains(15));
         }
+    }
+
+    /// A neighbour that fails to arrive costs the block its huge page, not
+    /// the guest its fault.
+    #[test]
+    fn a_neighbour_that_never_arrives_leaves_the_fault_answered() {
+        let guest = Guest::new("neighbour");
+        let source = Arc::new(Arriving {
+            missing: Mutex::new(Some((1100 * memfile::PAGE, 1110 * memfile::PAGE))),
+        });
+        let layers = vec![guest.layer(vec![(0, PAGES * memfile::PAGE)], Some(source.clone()))];
+        let served = Mutex::new(memfile::PageMap::new(PAGES));
+        let mut blocks = blocks();
+        guest.serve(layers, Some(&mut blocks), &served, || {
+            assert_eq!(guest.read(1500), 1501);
+            assert!(served.lock().unwrap().contains(1500));
+            assert!(!(1100..1110).any(|page| served.lock().unwrap().contains(page)));
+            *source.missing.lock().unwrap() = None;
+            assert_eq!(guest.read(1105), 1106);
+        });
     }
 
     #[test]
