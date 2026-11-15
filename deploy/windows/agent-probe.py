@@ -59,8 +59,7 @@ def stubs(proto_dir):
     from grpc_tools import protoc
 
     out = tempfile.mkdtemp()
-    protos = [f for f in os.listdir(proto_dir) if f.endswith(".proto")]
-    rc = protoc.main(["protoc", f"-I{proto_dir}", f"--python_out={out}", f"--grpc_python_out={out}", *protos])
+    rc = protoc.main(["protoc", f"-I{proto_dir}", f"--python_out={out}", f"--grpc_python_out={out}", "guest.proto"])
     if rc:
         raise SystemExit("protoc failed")
     sys.path.insert(0, out)

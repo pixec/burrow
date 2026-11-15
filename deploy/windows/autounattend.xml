@@ -1,5 +1,6 @@
 <?xml version="1.0" encoding="utf-8"?>
-<!-- Unattended Windows 11 ARM64 install for a Cloud Hypervisor guest. Setup is
+<!-- Unattended Windows install for a Cloud Hypervisor guest. build-media.sh
+     sets processorArchitecture and the product key. Setup is
      started by pe.cmd with /unattend, after it has loaded viostor in WinPE.
      Disk 0 is the target (the first virtio-blk disk on the command line). -->
 <unattend xmlns="urn:schemas-microsoft-com:unattend" xmlns:wcm="http://schemas.microsoft.com/WMIConfig/2002/State">
@@ -41,8 +42,7 @@
       </ImageInstall>
       <UserData>
         <AcceptEula>true</AcceptEula>
-        <!-- Microsoft's generic Windows 11 Pro installation key: installs, never activates. -->
-        <ProductKey><Key>VK7JG-NPHTM-C97JM-9MPGT-3V66T</Key><WillShowUI>Never</WillShowUI></ProductKey>
+        <ProductKey><Key>@KEY@</Key><WillShowUI>Never</WillShowUI></ProductKey>
       </UserData>
       <DynamicUpdate><Enable>false</Enable><WillShowUI>Never</WillShowUI></DynamicUpdate>
     </component>
@@ -80,6 +80,7 @@
         <ProtectYourPC>3</ProtectYourPC>
       </OOBE>
       <UserAccounts>
+        <AdministratorPassword><Value>Burrow-spike-1</Value><PlainText>true</PlainText></AdministratorPassword>
         <LocalAccounts>
           <LocalAccount wcm:action="add">
             <Name>burrow</Name>

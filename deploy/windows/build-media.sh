@@ -1,64 +1,89 @@
 #!/bin/sh
-# Builds the installer disk for an unattended Windows 11 ARM64 install under
-# Cloud Hypervisor, from a UUP set (fetch-uup.sh) and virtio-win's ARM64
-# drivers (fetch-virtio.sh).
+# Builds the installer disk for an unattended Windows install under Cloud
+# Hypervisor, from a Microsoft ISO (an evaluation ISO's direct link) or a UUP
+# set (fetch-uup.sh), and virtio-win's drivers for the same arch
+# (fetch-virtio.sh).
 #
 # Cloud Hypervisor has no CD-ROM, AHCI or NVMe, only virtio-blk, so the media
-# is a USB-stick style disk: MBR, one FAT32 partition, \EFI\BOOT\BOOTAA64.EFI,
-# and install.wim (split into .swm files if over 4 GiB). boot.wim
-# runs pe.cmd (winpeshl.ini) to load viostor and start Setup with the unattend.
-# sources\$OEM$\$1 lands on C:\ of the installed system, with SetupComplete.cmd
-# installing the remaining drivers and the agent.
+# is a USB-stick style disk: MBR, one FAT32 partition, \EFI\BOOT\BOOT*.EFI,
+# and install.wim (split into .swm files if over 4 GiB). boot.wim runs pe.cmd
+# (winpeshl.ini) to load viostor and start Setup with the unattend.
+# sources\$OEM$\$1 lands on C:\ of the installed system, with
+# SetupComplete.cmd installing the remaining drivers and the agent.
 #
-# usage: build-media.sh UUP_DIR VIRTIO_DIR AGENT_EXE OUT_IMG
-# Needs: wimlib-imagex cabextract mkfs.fat mcopy python3.
+# usage: build-media.sh ISO|UUP_DIR VIRTIO_DIR AGENT_EXE OUT_IMG
+# Environment: ARCH (amd64 or arm64, default arm64), IMAGE (the install.wim
+# image name to install, default the first matching "Windows 11"),
+# PRODUCT_KEY (default Windows 11 Pro's generic key; empty for evaluation
+# media, which takes none).
+# Needs: wimlib-imagex cabextract mkfs.fat mcopy python3, 7z for an ISO.
 set -eu
-uups=$1/UUPs
+src=$1
 virtio=$2
 agent=$3
 img=$4
+arch=${ARCH:-arm64}
+image=${IMAGE:-Windows 11}
+key=${PRODUCT_KEY-VK7JG-NPHTM-C97JM-9MPGT-3V66T}
 here=$(cd "$(dirname "$0")" && pwd)
 work=$(dirname "$img")/media-work
 rm -rf "$work"
 mkdir -p "$work/iso" "$work/pe"
-
-meta=$(ls "$uups"/*_*-*.esd | grep -v -i -E 'Microsoft-|Package' | head -1)
-wimlib-imagex info "$meta" > "$work/meta.txt"
-idx() { awk -v n="$1" '/^Index:/{i=$2} /^Name:/{sub(/^Name: +/,""); if (index($0, n)) {print i; exit}}' "$work/meta.txt"; }
-media=$(idx 'Setup Media')
-re=$(idx 'Recovery Environment')
-os=$(idx 'Windows 11')
-echo "media=$media re=$re os=$os"
-
-# Feature packages come as .cab files, whose files the edition's image
-# references by hash as it does the .ESD packages'. Repack each as a WIM
-# so wimlib can resolve them.
-mkdir -p "$work/refs" "$work/cab"
-for cab in "$uups"/*.cab; do
-  case $(basename "$cab") in *AggregatedMetadata*|DesktopDeployment*) continue ;; esac
-  rm -rf "$work/cab"/*
-  cabextract -q -d "$work/cab" "$cab"
-  wimlib-imagex capture "$work/cab" "$work/refs/$(basename "$cab" .cab).wim" --compress=none --no-acls >/dev/null
-done
-rm -rf "$work/cab"
-
 iso=$work/iso
-wimlib-imagex apply "$meta" "$media" "$iso" --no-acls
-mkdir -p "$iso/sources"
-wimlib-imagex export "$meta" "$re" "$work/winre.wim" --compress=LZX
-# The UUP set has no WinPE or Setup image (24H2 on), so boot.wim is WinRE,
-# which is WinPE underneath, with winpeshl.ini running pe.cmd instead of the
-# recovery UI. pe.cmd starts Setup from the media's own sources directory.
-wimlib-imagex export "$meta" "$re" "$iso/sources/boot.wim" --compress=LZX --boot
-wimlib-imagex export "$meta" "$os" "$work/install.wim" --ref="$uups/*.[eE][sS][dD]" --ref="$uups/*.wim" --ref="$work/refs/*.wim" --compress=LZX
-wimlib-imagex update "$work/install.wim" 1 --command="add '$work/winre.wim' /Windows/System32/Recovery/Winre.wim"
+# The image named exactly, else the first whose name contains it.
+idx() { awk -v n="$2" '/^Index:/{i=$2} /^Name:/{sub(/^Name: +/,""); if ($0 == n) e=i; else if (!s && index($0, n)) s=i} END{print e ? e : s}' "$1"; }
+
+if [ -f "$src" ]; then
+  7z x -bd -o"$iso" "$src" >/dev/null
+  mv "$iso/sources/boot.wim" "$work/boot.wim"
+  mv "$iso/sources/install.wim" "$work/media-install.wim"
+  wimlib-imagex info "$work/media-install.wim" > "$work/meta.txt"
+  os=$(idx "$work/meta.txt" "$image")
+  echo "os=$os"
+  # Index 2 of an ISO's boot.wim is WinPE with Setup.
+  wimlib-imagex export "$work/boot.wim" 2 "$iso/sources/boot.wim" --boot
+  wimlib-imagex export "$work/media-install.wim" "$os" "$work/install.wim"
+  rm -f "$work/boot.wim" "$work/media-install.wim"
+else
+  uups=$src/UUPs
+  meta=$(ls "$uups"/*_*-*.esd | grep -v -i -E 'Microsoft-|Package' | head -1)
+  wimlib-imagex info "$meta" > "$work/meta.txt"
+  media=$(idx "$work/meta.txt" 'Setup Media')
+  re=$(idx "$work/meta.txt" 'Recovery Environment')
+  os=$(idx "$work/meta.txt" "$image")
+  echo "media=$media re=$re os=$os"
+
+  # Feature packages come as .cab files, whose files the edition's image
+  # references by hash as it does the .ESD packages'. Repack each as a WIM
+  # so wimlib can resolve them.
+  mkdir -p "$work/refs" "$work/cab"
+  for cab in "$uups"/*.cab; do
+    case $(basename "$cab") in *AggregatedMetadata*|DesktopDeployment*) continue ;; esac
+    rm -rf "$work/cab"/*
+    cabextract -q -d "$work/cab" "$cab"
+    wimlib-imagex capture "$work/cab" "$work/refs/$(basename "$cab" .cab).wim" --compress=none --no-acls >/dev/null
+  done
+  rm -rf "$work/cab"
+
+  wimlib-imagex apply "$meta" "$media" "$iso" --no-acls
+  mkdir -p "$iso/sources"
+  wimlib-imagex export "$meta" "$re" "$work/winre.wim" --compress=LZX
+  # The UUP set has no WinPE or Setup image (24H2 on), so boot.wim is WinRE,
+  # which is WinPE underneath, with winpeshl.ini running pe.cmd instead of
+  # the recovery UI. pe.cmd starts Setup from the media's own sources
+  # directory.
+  wimlib-imagex export "$meta" "$re" "$iso/sources/boot.wim" --compress=LZX --boot
+  wimlib-imagex export "$meta" "$os" "$work/install.wim" --ref="$uups/*.[eE][sS][dD]" --ref="$uups/*.wim" --ref="$work/refs/*.wim" --compress=LZX
+  wimlib-imagex update "$work/install.wim" 1 --command="add '$work/winre.wim' /Windows/System32/Recovery/Winre.wim"
+  rm -f "$work/winre.wim"
+fi
+
 if [ "$(du -m "$work/install.wim" | cut -f1)" -lt 4000 ]; then
   mv "$work/install.wim" "$iso/sources/install.wim"
 else
   wimlib-imagex split "$work/install.wim" "$iso/sources/install.swm" 3800
   rm -f "$work/install.wim"
 fi
-rm -f "$work/winre.wim"
 echo burrow > "$iso/burrow-media.txt"
 
 # WinPE (boot.wim): our launcher, the unattend and the drivers.
@@ -69,7 +94,10 @@ done
 crlf() { perl -pe 's/\r?\n/\r\n/' "$1" > "$2"; }
 crlf "$here/pe.cmd" "$work/pe/pe.cmd"
 crlf "$here/winpeshl.ini" "$work/winpeshl.ini"
-cp "$here/autounattend.xml" "$work/pe/"
+sed -e "s/processorArchitecture=\"arm64\"/processorArchitecture=\"$arch\"/" \
+  -e "s/@KEY@/$key/" "$here/autounattend.xml" > "$work/pe/autounattend.xml"
+[ -n "$key" ] || sed -i.bak '/<ProductKey>/d' "$work/pe/autounattend.xml"
+rm -f "$work/pe/autounattend.xml.bak"
 printf "add '%s' /burrow\nadd '%s' /Windows/System32/winpeshl.ini\n" "$work/pe" "$work/winpeshl.ini" |
   wimlib-imagex update "$iso/sources/boot.wim" 1
 
@@ -80,7 +108,6 @@ cp -R "$virtio" "$oem/\$1/burrow/drivers"
 cp "$agent" "$oem/\$1/burrow/burrow-guest.exe"
 crlf "$here/SetupComplete.cmd" "$oem/\$\$/Setup/Scripts/SetupComplete.cmd"
 
-# EFI fallback loader name for removable media; the Setup Media image has it.
 ls "$iso/efi/boot/" "$iso/EFI/BOOT/" 2>/dev/null || true
 
 size_mb=$(( $(du -sk "$iso" | cut -f1) / 1024 + 512 ))
