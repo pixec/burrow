@@ -521,6 +521,7 @@ impl NodeRegistry for NodeRegistryService {
             confirmed_sandboxes: applied.confirmed,
             relinquished_sandboxes: applied.relinquished,
             access_keys: access_keys(&self.0),
+            is_fleet_on_casync_chunks: self.0.nodes.is_fleet_on_casync_chunks(),
         }))
     }
 

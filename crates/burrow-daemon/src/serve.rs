@@ -738,6 +738,7 @@ fn local_node_info(args: &ServeArgs) -> anyhow::Result<NodeInfo> {
         is_nested_virt_supported: false,
         // Filled in once the kernels have been read.
         kernels: Vec::new(),
+        is_casync_chunk_store: true,
     })
 }
 
@@ -1100,6 +1101,7 @@ async fn registration_loop(
                         break;
                     }
                     sandboxes.renew_lease(resp.sandbox_lease_secs);
+                    crate::migrate::set_fleet_upgraded(resp.is_fleet_on_casync_chunks);
                     crate::access::apply_keys(&access_keys, &resp.access_keys);
                     sandboxes.confirm(&resp.confirmed_sandboxes);
                     sandboxes.relinquish(&resp.relinquished_sandboxes).await;

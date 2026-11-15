@@ -1340,6 +1340,14 @@ impl NodeRegistry {
         ))
     }
 
+    /// Whether every registered node, healthy or not, keeps object-store
+    /// chunks as casync does. A node that stopped beating may come back on
+    /// the build it had, so it counts until it is removed.
+    pub fn is_fleet_on_casync_chunks(&self) -> bool {
+        let nodes = self.nodes.lock().unwrap();
+        nodes.values().all(|entry| entry.info.is_casync_chunk_store)
+    }
+
     /// Every host in the fleet running an edge router.
     ///
     /// Handed to nodes so they can deny them to their sandboxes. The node's own
@@ -1509,6 +1517,27 @@ mod tests {
         // The machine, not the wildcard domain: a firewall rule needs an
         // address, and the domain resolves per hostname.
         assert_eq!(registry.edge_hosts(), ["node-a:7071"]);
+    }
+
+    /// One node on a build from before casync chunks, beating or not, keeps
+    /// the fleet from deleting what that build reads.
+    #[test]
+    fn the_fleet_is_on_casync_chunks_only_once_every_node_is() {
+        let registry = registry(&[
+            ("node-a", NodeStatus::default()),
+            ("node-b", NodeStatus::default()),
+        ]);
+        assert!(!registry.is_fleet_on_casync_chunks());
+        let upgraded = |id: &str| NodeInfo {
+            id: id.into(),
+            address: format!("{id}:7071"),
+            is_casync_chunk_store: true,
+            ..Default::default()
+        };
+        registry.heartbeat("node-a", NodeStatus::default(), Some(upgraded("node-a")));
+        assert!(!registry.is_fleet_on_casync_chunks());
+        registry.heartbeat("node-b", NodeStatus::default(), Some(upgraded("node-b")));
+        assert!(registry.is_fleet_on_casync_chunks());
     }
 
     /// A node's Access endpoint is denied to sandboxes whether or not it runs

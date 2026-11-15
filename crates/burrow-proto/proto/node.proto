@@ -486,6 +486,8 @@ message HeartbeatResponse {
   // As in RegisterResponse, repeated on every beat so a rotated key reaches
   // nodes without a re-registration.
   repeated AccessKey access_keys = 9;
+  // Every registered node, healthy or not, reports `is_casync_chunk_store`.
+  bool is_fleet_on_casync_chunks = 11;
 }
 
 message MeshPeer {

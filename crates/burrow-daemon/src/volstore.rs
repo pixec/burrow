@@ -242,6 +242,10 @@ pub struct Local {
     /// The image as it was when the upload's clone was taken.
     pub stamp: Stamp,
     pub is_published: bool,
+    /// Every chunk `index` names is in `chunks.castr/`; see
+    /// [`crate::durable::LocalState::is_casync`].
+    #[serde(default)]
+    pub is_casync: bool,
 }
 
 pub async fn load_local(dir: &Path) -> Option<Local> {
@@ -270,18 +274,19 @@ pub async fn upload(
     previous: Option<&Local>,
 ) -> Result<Local, Status> {
     let started = std::time::Instant::now();
+    let reusable = previous.filter(|previous| previous.is_casync);
     let base = dir.join(BASE);
-    let base = match previous {
+    let base = match reusable {
         Some(previous) if tokio::fs::try_exists(&base).await.unwrap_or(false) => {
             Some((base.as_path(), &previous.index))
         }
         _ => None,
     };
-    let known: HashSet<String> = previous
+    let known: HashSet<String> = reusable
         .map(|p| p.index.digests().collect())
         .unwrap_or_default();
     let index = crate::chunks::put_disk_since(store, capture, base, &known).await?;
-    if let Some(previous) = previous
+    if let Some(previous) = reusable
         && previous.is_published
         && previous.index.chunks == index.chunks
         && previous.index.size == index.size
@@ -308,6 +313,7 @@ pub async fn upload(
         index,
         stamp,
         is_published: false,
+        is_casync: true,
     };
     save_local(dir, &local).await?;
     let may_create = previous.is_none_or(|previous| !previous.is_published);
@@ -395,6 +401,7 @@ pub async fn adopt(
         index,
         stamp: Stamp::default(),
         is_published: true,
+        is_casync: true,
     })
 }
 

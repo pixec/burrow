@@ -767,6 +767,14 @@ pub async fn remote_image_refs(
     let cutoff = std::time::SystemTime::now() - grace;
     let mut removed = 0;
     for (key, modified) in store.list_aged("images/").await? {
+        // An index only the format before casync has, for this release:
+        // counted, read from where it is, and never deleted here.
+        if let Some(stem) = key.strip_suffix(".index.json") {
+            if let Some(index) = crate::chunks::read_index(store, &format!("{stem}.caibx")).await? {
+                out.extend(index.digests());
+            }
+            continue;
+        }
         let Some(digest) = key
             .strip_prefix("images/")
             .and_then(|rest| rest.strip_suffix(".caibx"))

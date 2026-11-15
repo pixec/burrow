@@ -256,6 +256,19 @@ pub struct LocalState {
     pub memory: ImageIndex,
     pub disk_index: ImageIndex,
     pub logs: std::collections::BTreeMap<String, LogImage>,
+    /// Every chunk the indexes above name is in `chunks.castr/`, so a later
+    /// upload may skip them. Not so for state a build before casync chunks
+    /// wrote: its chunks may be only in the old format, which an older
+    /// node's collector deletes once no old index names them.
+    #[serde(default)]
+    pub is_casync: bool,
+}
+
+impl LocalState {
+    /// What a later upload may take as already in the store.
+    fn reusable(&self) -> Option<&Self> {
+        self.is_casync.then_some(self)
+    }
 }
 
 /// One command log file as uploaded.
@@ -421,7 +434,8 @@ pub async fn upload(
     let disk = stamp(disk_file)?;
     let kernel = stamp(TEMPLATE_KERNEL)?;
     let rootfs = stamp(TEMPLATE_ROOTFS)?;
-    let known = previous.map(LocalState::digests).unwrap_or_default();
+    let reusable = previous.and_then(LocalState::reusable);
+    let known = reusable.map(LocalState::digests).unwrap_or_default();
 
     let blob = |file: &'static str, stamp: &Stamp, held: Option<(&Stamp, &String)>| {
         let path = workdir.join(file);
@@ -447,21 +461,21 @@ pub async fn upload(
     crate::rootdisk::upload_image(store, &image).await?;
     let rootfs_digest = image.digest.clone();
 
-    let reuse = previous
+    let reuse = reusable
         .filter(|p| layers.starts_with(&p.layers))
         .map(|p| Reuse {
             index: &p.memory,
             covered: p.layers.len(),
         });
     let memory = crate::chunks::put_image(store, workdir, chain, reuse, &known).await?;
-    let disk_index = match previous.filter(|p| p.disk == disk) {
+    let disk_index = match reusable.filter(|p| p.disk == disk) {
         Some(previous) => previous.disk_index.clone(),
         None => {
             crate::chunks::put_disk(store, &workdir.join(disk_file), Some(&image), &known).await?
         }
     };
 
-    let logs = upload_logs(store, logs_dir, previous, &known).await?;
+    let logs = upload_logs(store, logs_dir, reusable, &known).await?;
 
     let now_ms = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -526,6 +540,7 @@ pub async fn upload(
         memory,
         disk_index,
         logs,
+        is_casync: true,
     };
     save_local(workdir, &local).await?;
     // A previous upload that never heard back may or may not have landed.
@@ -809,6 +824,7 @@ pub async fn stage(
         memory,
         disk_index,
         logs,
+        is_casync: true,
     };
     save_local(dest, &local).await?;
     tracing::info!(
@@ -865,9 +881,10 @@ pub async fn upload_disk_checkpoint(
     let image = crate::rootdisk::image_of(blobs, &workdir.join(TEMPLATE_ROOTFS)).await?;
     crate::rootdisk::upload_image(store, &image).await?;
     let rootfs_digest = image.digest.clone();
-    let known = previous.map(LocalState::digests).unwrap_or_default();
+    let reusable = previous.and_then(LocalState::reusable);
+    let known = reusable.map(LocalState::digests).unwrap_or_default();
     let base_path = workdir.join(CHECKPOINT_BASE);
-    let previous_disk = previous
+    let previous_disk = reusable
         .filter(|p| p.manifest.checkpoint == CHECKPOINT_DISK && !p.disk_index.chunks.is_empty());
     let base = match previous_disk {
         Some(previous) if tokio::fs::try_exists(&base_path).await.unwrap_or(false) => {
@@ -901,6 +918,7 @@ pub async fn upload_disk_checkpoint(
         memory: ImageIndex::default(),
         disk_index,
         logs: Default::default(),
+        is_casync: true,
     };
     save_local(workdir, &local).await?;
     let may_create = previous.is_none_or(|previous| !previous.is_published);
@@ -977,6 +995,7 @@ pub async fn stage_disk(
         memory: ImageIndex::default(),
         disk_index,
         logs: Default::default(),
+        is_casync: true,
     };
     save_local(dest, &local).await?;
     Ok(local)
@@ -1252,6 +1271,7 @@ mod tests {
             memory: ImageIndex::default(),
             disk_index: ImageIndex::default(),
             logs: Default::default(),
+            is_casync: true,
         };
         mark_running(&store, &dir, &mut local, "node-a")
             .await
@@ -1375,6 +1395,86 @@ mod tests {
                 .systemd,
             "a sandbox with no copy of its own reads its template's"
         );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// State a build before casync chunks wrote names chunks that may be
+    /// only in the old format, which an older node's collector deletes. An
+    /// upload over it skips none of them, so the new generation needs nothing
+    /// the old format holds.
+    #[tokio::test]
+    async fn an_upload_over_pre_casync_state_skips_no_chunk() {
+        use std::os::unix::fs::FileExt as _;
+        let store = crate::objstore::fake::store(true).await;
+        let root = std::env::temp_dir().join(format!("burrow-reput-{}", uuid::Uuid::new_v4()));
+        let workdir = root.join("a");
+        std::fs::create_dir_all(&workdir).unwrap();
+        std::fs::write(workdir.join(TEMPLATE_KERNEL), b"kernel").unwrap();
+        let image = std::fs::File::create(workdir.join(TEMPLATE_ROOTFS)).unwrap();
+        image.set_len(4 << 20).unwrap();
+        image.write_all_at(&[1; 4096], 0).unwrap();
+        drop(image);
+        let disk = workdir.join(crate::rootdisk::ROOT_DISK);
+        crate::rootdisk::clone(&workdir.join(TEMPLATE_ROOTFS), &disk)
+            .await
+            .unwrap();
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(&disk)
+            .unwrap()
+            .write_all_at(&[3; 4096], 2 << 20)
+            .unwrap();
+        let blobs = crate::blobs::BlobStore::new(&root.join("data"));
+        let capture = workdir.join(".checkpoint.ext4");
+        let checkpoint = |previous| {
+            let (store, blobs, workdir, capture, disk) =
+                (&store, &blobs, &workdir, &capture, &disk);
+            async move {
+                crate::rootdisk::clone(disk, capture).await.unwrap();
+                upload_disk_checkpoint(
+                    store,
+                    blobs,
+                    workdir,
+                    capture,
+                    Stamp::of(disk).unwrap(),
+                    manifest("node-a", ""),
+                    previous,
+                )
+                .await
+                .unwrap()
+            }
+        };
+        let mut first = checkpoint(None).await;
+        assert!(first.is_casync);
+        first.is_casync = false;
+        // The image's `.caibx` was written with every chunk it names; the
+        // disk's own chunks are what an old build left in the old format.
+        let image = crate::chunks::read_index(
+            &store,
+            &crate::rootdisk::remote_index_key(&first.manifest.rootfs_digest),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        let image: HashSet<String> = image.digests().collect();
+        for digest in first.disk_index.digests() {
+            if !image.contains(&digest) {
+                store
+                    .delete(&crate::chunks::chunk_key(&digest))
+                    .await
+                    .unwrap();
+            }
+        }
+        let second = checkpoint(Some(&first)).await;
+        for digest in second.disk_index.digests() {
+            assert!(
+                store
+                    .exists(&crate::chunks::chunk_key(&digest))
+                    .await
+                    .unwrap(),
+                "the new generation names {digest}, which chunks.castr/ lacks"
+            );
+        }
         let _ = std::fs::remove_dir_all(&root);
     }
 

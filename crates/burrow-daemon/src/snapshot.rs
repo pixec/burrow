@@ -257,8 +257,9 @@ async fn remote_log_names(
 /// object that is not there is not an error.
 async fn delete_remote(remote: &crate::objstore::ObjectStore, id: &str) -> Result<(), Status> {
     remote.delete(&remote_key(id, MANIFEST)).await?;
+    let mut indexes = Vec::new();
     for name in remote_log_names(remote, id).await? {
-        remote.delete(&log_index_key(id, &name)).await?;
+        indexes.push(log_index_key(id, &name));
     }
     remote.delete(&log_names_key(id)).await?;
     for layout in burrow_vmm::Hypervisor::ALL.map(burrow_vmm::Hypervisor::layout) {
@@ -268,7 +269,15 @@ async fn delete_remote(remote: &crate::objstore::ObjectStore, id: &str) -> Resul
             .into_iter()
             .chain([crate::rootdisk::ROOT_DISK])
         {
-            remote.delete(&index_key(id, file)).await?;
+            indexes.push(index_key(id, file));
+        }
+    }
+    // With the copies the format before casync left beside them, for this
+    // release: nothing else removes those of a deleted snapshot.
+    for key in indexes {
+        remote.delete(&key).await?;
+        if let Some(legacy) = crate::chunks::legacy_key(&key) {
+            remote.delete(&legacy).await?;
         }
     }
     Ok(())
@@ -765,18 +774,38 @@ impl SnapshotStore {
         let Some(remote) = &self.remote else {
             return Ok(());
         };
-        for key in remote.list("snapshots/").await? {
-            if key.ends_with(&format!("/{MANIFEST}")) {
-                if let Some(bytes) = remote.get_bytes(&key).await?
+        let keys = remote.list("snapshots/").await?;
+        let mut stored = std::collections::HashSet::new();
+        for key in &keys {
+            if let Some(id) = key
+                .strip_prefix("snapshots/")
+                .and_then(|rest| rest.strip_suffix(&format!("/{MANIFEST}")))
+            {
+                stored.insert(id);
+                if let Some(bytes) = remote.get_bytes(key).await?
                     && let Ok(manifest) = serde_json::from_slice::<Manifest>(&bytes)
                 {
                     images.insert(manifest.rootfs_digest);
                 }
-                continue;
             }
-            if !key.ends_with(".caibx") {
-                continue;
-            }
+        }
+        // Only the indexes of snapshots with a manifest: one left by a delete
+        // names chunks nothing restores. An upload in flight has its
+        // manifest yet to come, and its chunks are younger than the grace.
+        // An index only the format before casync has is read from there.
+        let indexes: std::collections::BTreeSet<String> = keys
+            .iter()
+            .filter(|key| {
+                key.strip_prefix("snapshots/")
+                    .and_then(|rest| rest.split_once('/'))
+                    .is_some_and(|(id, _)| stored.contains(id))
+            })
+            .filter_map(|key| match key.strip_suffix(".index.json") {
+                Some(stem) => Some(format!("{stem}.caibx")),
+                None => key.ends_with(".caibx").then(|| key.clone()),
+            })
+            .collect();
+        for key in indexes {
             if let Some(index) = crate::chunks::read_index(remote, &key).await? {
                 out.extend(index.digests());
             }
@@ -1643,6 +1672,50 @@ mod tests {
         );
         assert!(!remote.exists(&log_names_key(&id)).await.unwrap());
         let _ = std::fs::remove_dir_all(&scratch);
+    }
+
+    /// For this release a deleted snapshot takes the indexes the format
+    /// before casync left with it, and the collector counts an index only
+    /// while its snapshot has a manifest, reading an old one from where it
+    /// is.
+    #[tokio::test]
+    async fn the_collector_counts_only_stored_snapshots_old_indexes_included() {
+        let remote = crate::objstore::fake::store(true).await;
+        let root = std::env::temp_dir().join(format!(
+            "burrow-snapshots-refs-{}",
+            burrow_common::SnapshotId::generate()
+        ));
+        let store = SnapshotStore::new(&root, Some(remote.clone()), HashMap::new());
+        let index = |digest: &str| crate::chunks::ImageIndex {
+            size: crate::chunks::CHUNK_SIZE,
+            chunk_size: crate::chunks::CHUNK_SIZE,
+            chunks: [(0, digest.to_string())].into(),
+        };
+        let (kept, orphan) = ("snap_kept", "snap_orphan");
+        let manifest =
+            serde_json::to_vec(&manifest(kept, "sbx_a", "2026-09-02T10:00:00Z")).unwrap();
+        remote
+            .put_bytes(&remote_key(kept, MANIFEST), manifest)
+            .await
+            .unwrap();
+        let old = |id: &str| remote_key(id, "snapshot.mem.index.json");
+        for (id, digest) in [(kept, "aa".repeat(32)), (orphan, "bb".repeat(32))] {
+            remote
+                .put_bytes(&old(id), serde_json::to_vec(&index(&digest)).unwrap())
+                .await
+                .unwrap();
+        }
+        let (mut refs, mut images) = Default::default();
+        store
+            .remote_chunk_refs(&mut refs, &mut images)
+            .await
+            .unwrap();
+        assert!(refs.contains(&"aa".repeat(32)));
+        assert!(!refs.contains(&"bb".repeat(32)));
+
+        delete_remote(&remote, kept).await.unwrap();
+        assert!(!remote.exists(&old(kept)).await.unwrap());
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     /// A snapshot is reported taken only once every file in it, the manifest
