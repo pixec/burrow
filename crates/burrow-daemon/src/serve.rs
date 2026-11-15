@@ -971,9 +971,6 @@ async fn registration_loop(
 ) {
     // Claimed rather than requested: sandboxes here already hold addresses
     // from this slice.
-    let claimed_index = load_address_slice(&args.data_dir)
-        .await
-        .map(|(_, index)| index);
     let mut applied_peers: Vec<burrow_net::Peer> = Vec::new();
     let mut denied_edges: Vec<std::net::IpAddr> = Vec::new();
     let mut pins =
@@ -989,6 +986,13 @@ async fn registration_loop(
             }
         };
 
+        // Claimed only while sandboxes here hold addresses from the slice: a
+        // node with none takes whichever it is given, so a pool that has
+        // since shrunk past its old index does not lock it out.
+        let claimed_index = match sandboxes.sandbox_count().await {
+            0 => None,
+            _ => load_node_index(&args.data_dir).await,
+        };
         let resp = match client
             .register(nodepb::RegisterRequest {
                 info: Some(info.clone()),
@@ -1135,30 +1139,33 @@ async fn publish_address(args: &ServeArgs) -> std::net::IpAddr {
     args.listen.ip()
 }
 
-/// The pool and the slice of it this node used last time it ran, if any. A
-/// node that recorded no pool used the default one.
-async fn load_address_slice(
-    data_dir: &std::path::Path,
-) -> Option<(burrow_net::ipam::AddressPool, u32)> {
-    let index = tokio::fs::read_to_string(data_dir.join("node-index"))
+/// The slice of the pool this node used last time it ran, if any.
+async fn load_node_index(data_dir: &std::path::Path) -> Option<u32> {
+    tokio::fs::read_to_string(data_dir.join("node-index"))
         .await
         .ok()?
         .trim()
         .parse()
-        .ok()?;
-    let pool = match tokio::fs::read_to_string(data_dir.join("address-pool")).await {
-        Ok(text) => match text.parse() {
-            Ok(pool) => pool,
-            Err(err) => {
-                tracing::error!(%err, "the recorded address pool does not parse");
-                return None;
-            }
-        },
-        Err(_) => burrow_net::ipam::AddressPool::default(),
-    };
-    Some((pool, index))
+        .ok()
 }
 
+/// The pool this node used last time it ran. A node that recorded none used
+/// the default one; one whose record does not parse has none.
+async fn load_pool(data_dir: &std::path::Path) -> Option<burrow_net::ipam::AddressPool> {
+    match tokio::fs::read_to_string(data_dir.join("address-pool")).await {
+        Ok(text) => match text.parse() {
+            Ok(pool) => Some(pool),
+            Err(err) => {
+                tracing::error!(%err, "the recorded address pool does not parse");
+                None
+            }
+        },
+        Err(_) => Some(burrow_net::ipam::AddressPool::default()),
+    }
+}
+
+/// Records the pool and slice, writing a file only when it changes, and
+/// whole: a crash mid-write must not leave a node unable to read its slice.
 async fn store_address_slice(
     data_dir: &std::path::Path,
     pool: burrow_net::ipam::AddressPool,
@@ -1169,7 +1176,15 @@ async fn store_address_slice(
         ("node-index", index.to_string()),
     ] {
         let path = data_dir.join(file);
-        if let Err(err) = tokio::fs::write(&path, value).await {
+        if tokio::fs::read_to_string(&path).await.ok().as_deref() == Some(value.as_str()) {
+            continue;
+        }
+        let staged = data_dir.join(format!("{file}.new"));
+        let written = async {
+            tokio::fs::write(&staged, &value).await?;
+            tokio::fs::rename(&staged, &path).await
+        };
+        if let Err(err) = written.await {
             tracing::warn!(path = %path.display(), %err, "could not record the address slice");
         }
     }
@@ -1387,6 +1402,21 @@ async fn control_plane_addresses(endpoint: &str) -> Vec<std::net::IpAddr> {
             ?addresses,
             "denying the control plane to sandboxes"
         );
+    }
+    addresses
+}
+
+/// What the node reaches beyond the control plane: its object store, its
+/// registries and the resolver guests' lookups go to. Best effort, like
+/// [`control_plane_addresses`].
+async fn depended_addresses(args: &ServeArgs) -> Vec<std::net::IpAddr> {
+    let mut addresses = vec![args.dns_upstream.ip()];
+    let hosts = args
+        .object_store_endpoint
+        .iter()
+        .chain(&args.insecure_registry);
+    for host in hosts {
+        addresses.extend(resolve_denied(endpoint_host(host)).await);
     }
     addresses
 }
@@ -1727,6 +1757,7 @@ pub async fn run(args: ServeArgs) -> anyhow::Result<()> {
                 u64::from(args.artifact_retention_days) * 24 * 60 * 60,
             ),
             control_plane: control_plane_addresses(&args.orchestrator).await,
+            depends_on: depended_addresses(&args).await,
             share: crate::share::ShareOptions {
                 is_enabled: !args.is_tailcat_disabled,
                 is_transparent: !args.is_transparent_ip_disabled,
@@ -1939,8 +1970,10 @@ pub async fn run(args: ServeArgs) -> anyhow::Result<()> {
 
     // Before recovery, so recovered sandboxes reload into the range they were
     // created in. A node that never registered has none.
-    if let Some((pool, index)) = load_address_slice(&args.data_dir).await
-        && let Err(err) = sandboxes.set_address_slice(pool, index).await
+    if let (Some(pool), Some(index)) = (
+        load_pool(&args.data_dir).await,
+        load_node_index(&args.data_dir).await,
+    ) && let Err(err) = sandboxes.set_address_slice(pool, index).await
     {
         tracing::error!(%err, "could not take the address slice this node recorded");
     }
@@ -2123,6 +2156,32 @@ pub async fn run(args: ServeArgs) -> anyhow::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The slice is recorded whole and read back, and a pool record that
+    /// does not parse costs the node its pool but not the index it claims.
+    #[tokio::test]
+    async fn the_address_slice_is_recorded_and_read_back() {
+        let dir = std::env::temp_dir().join(format!("burrow-slice-{}", std::process::id()));
+        let _ = tokio::fs::remove_dir_all(&dir).await;
+        tokio::fs::create_dir_all(&dir).await.unwrap();
+        assert_eq!(load_node_index(&dir).await, None);
+        assert_eq!(load_pool(&dir).await, Some(Default::default()));
+
+        let pool =
+            burrow_net::ipam::AddressPool::new("100.64.0.0/16", "fd00:b070::/48", 1024).unwrap();
+        store_address_slice(&dir, pool, 3).await;
+        store_address_slice(&dir, pool, 3).await;
+        assert_eq!(load_pool(&dir).await, Some(pool));
+        assert_eq!(load_node_index(&dir).await, Some(3));
+        assert!(!dir.join("node-index.new").exists());
+
+        tokio::fs::write(dir.join("address-pool"), "garbage")
+            .await
+            .unwrap();
+        assert_eq!(load_pool(&dir).await, None);
+        assert_eq!(load_node_index(&dir).await, Some(3));
+        let _ = tokio::fs::remove_dir_all(&dir).await;
+    }
 
     #[test]
     fn the_firecracker_io_engine_is_named_in_lower_case() {

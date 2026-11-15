@@ -123,7 +123,7 @@ impl AddressPool {
             v6_prefix,
             blocks_per_node,
         };
-        if pool.max_nodes() == 0 {
+        if pool.blocks() < blocks_per_node + 2 {
             return Err(format!(
                 "{v4} holds {} /30 blocks, too few for one node's {blocks_per_node} and the two \
                  a warm build takes",
@@ -217,6 +217,15 @@ impl AddressPool {
             .find(|address| self.contains(*address))
     }
 
+    /// Whether the network `address/prefix` and the pool share an address.
+    pub fn overlaps(&self, address: IpAddr, prefix: u8) -> bool {
+        let pool = match address {
+            IpAddr::V4(_) => IpAddr::V4(self.v4),
+            IpAddr::V6(_) => IpAddr::V6(self.v6),
+        };
+        self.contains(address) || within(pool, address, prefix)
+    }
+
     /// A fixed lease for the transient VM used to build a warm snapshot.
     ///
     /// Taken from the top of the pool so it cannot collide with an allocated
@@ -300,16 +309,30 @@ fn within4(address: Ipv4Addr, network: Ipv4Addr, prefix: u8) -> bool {
     u32::from(address) & mask4(prefix) == u32::from(network)
 }
 
-/// This host's addresses outside burrow's own taps and mesh, which the pool
-/// must not overlap.
-pub fn host_addresses() -> Vec<IpAddr> {
-    let mut addresses = Vec::new();
+/// Whether `address` is in the network `network/prefix` names, whatever the
+/// host bits of either.
+fn within(address: IpAddr, network: IpAddr, prefix: u8) -> bool {
+    match (address, network) {
+        (IpAddr::V4(address), IpAddr::V4(network)) => {
+            u32::from(address) & mask4(prefix) == u32::from(network) & mask4(prefix)
+        }
+        (IpAddr::V6(address), IpAddr::V6(network)) => {
+            u128::from(address) & mask6(prefix) == u128::from(network) & mask6(prefix)
+        }
+        _ => false,
+    }
+}
+
+/// This host's addresses outside burrow's own taps and mesh, each with the
+/// prefix of the network it is connected to, which the pool must not overlap.
+pub fn host_networks() -> Vec<(IpAddr, u8)> {
+    let mut networks = Vec::new();
     let mut head: *mut libc::ifaddrs = std::ptr::null_mut();
     // SAFETY: getifaddrs fills `head` with a list freed below, and every
     // entry is read only while that list is alive.
     unsafe {
         if libc::getifaddrs(&mut head) != 0 {
-            return addresses;
+            return networks;
         }
         let mut at = head;
         while let Some(entry) = at.as_ref() {
@@ -317,15 +340,32 @@ pub fn host_addresses() -> Vec<IpAddr> {
             let is_ours = name.starts_with(crate::firewall::TAP_PREFIX)
                 || name == crate::mesh::MESH_INTERFACE;
             if let Some(addr) = entry.ifa_addr.as_ref().filter(|_| !is_ours) {
+                let has_mask = !entry.ifa_netmask.is_null();
                 match i32::from(addr.sa_family) {
                     libc::AF_INET => {
                         let v4 = &*entry.ifa_addr.cast::<libc::sockaddr_in>();
-                        addresses
-                            .push(IpAddr::V4(Ipv4Addr::from(u32::from_be(v4.sin_addr.s_addr))));
+                        let prefix = match has_mask {
+                            true => {
+                                let mask = &*entry.ifa_netmask.cast::<libc::sockaddr_in>();
+                                u32::from_be(mask.sin_addr.s_addr).count_ones() as u8
+                            }
+                            false => 32,
+                        };
+                        networks.push((
+                            IpAddr::V4(Ipv4Addr::from(u32::from_be(v4.sin_addr.s_addr))),
+                            prefix,
+                        ));
                     }
                     libc::AF_INET6 => {
                         let v6 = &*entry.ifa_addr.cast::<libc::sockaddr_in6>();
-                        addresses.push(IpAddr::V6(v6.sin6_addr.s6_addr.into()));
+                        let prefix = match has_mask {
+                            true => {
+                                let mask = &*entry.ifa_netmask.cast::<libc::sockaddr_in6>();
+                                u128::from_be_bytes(mask.sin6_addr.s6_addr).count_ones() as u8
+                            }
+                            false => 128,
+                        };
+                        networks.push((IpAddr::V6(v6.sin6_addr.s6_addr.into()), prefix));
                     }
                     _ => {}
                 }
@@ -334,7 +374,7 @@ pub fn host_addresses() -> Vec<IpAddr> {
         }
         libc::freeifaddrs(head);
     }
-    addresses
+    networks
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -782,6 +822,8 @@ mod tests {
         assert!(refused(DEFAULT_POOL, DEFAULT_POOL6, 300).contains("power of two"));
         assert!(refused(DEFAULT_POOL, DEFAULT_POOL6, 2).contains("power of two"));
         assert!(refused("10.99.0.0/24", DEFAULT_POOL6, 64).contains("too few"));
+        assert!(refused("10.99.0.0/30", DEFAULT_POOL6, 4).contains("too few"));
+        assert!(refused("10.99.0.0/28", DEFAULT_POOL6, 4).contains("too few"));
         assert!(refused(DEFAULT_POOL, "2001:db8::/48", 256).contains("unique local"));
         assert!(refused(DEFAULT_POOL, "fd99:b070::1/48", 256).contains("unique local"));
         assert!(refused("10.96.0.0/12", DEFAULT_POOL6, 256).contains("/46 or shorter"));
@@ -800,6 +842,19 @@ mod tests {
                 .parse::<AddressPool>()
                 .is_err()
         );
+    }
+
+    #[test]
+    fn a_connected_network_overlapping_the_pool_is_found() {
+        let pool = AddressPool::default();
+        let v4 = |a, b, c, d| IpAddr::V4(Ipv4Addr::new(a, b, c, d));
+        assert!(pool.overlaps(v4(10, 0, 0, 5), 8), "a /8 around the pool");
+        assert!(pool.overlaps(v4(10, 99, 7, 1), 24), "a /24 inside it");
+        assert!(!pool.overlaps(v4(10, 98, 0, 1), 16));
+        assert!(!pool.overlaps(v4(192, 168, 5, 15), 24));
+        assert!(pool.overlaps("fd99::1".parse().unwrap(), 16));
+        assert!(!pool.overlaps("fd98::1".parse().unwrap(), 16));
+        assert!(host_networks().iter().all(|(_, prefix)| *prefix <= 128));
     }
 
     #[test]

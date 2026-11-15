@@ -205,6 +205,9 @@ pub struct NodeConfig {
     /// How far CPU committed to sandboxes may exceed the node's cores
     /// (`--cpu-overcommit`).
     pub cpu_overcommit: f64,
+    /// What this node itself reaches beyond the control plane: its object
+    /// store, its registries and its resolver, which the pool must not hold.
+    pub depends_on: Vec<std::net::IpAddr>,
     /// Public addresses: the uplink and ingress limits.
     pub public: crate::publicip::PublicConfig,
     /// Which shapes are warmed, and how many snapshots are kept.
@@ -3010,6 +3013,15 @@ impl SandboxManager {
     /// without a packet crossing a rule about private networks. Every node's
     /// edge is in here, this node's own included.
     pub async fn set_edge_addresses(&self, addresses: Vec<std::net::IpAddr>) -> Result<(), Status> {
+        if let Some((pool, _)) = self.address_slice().await
+            && let Some(address) = pool.overlap(addresses.iter().copied())
+        {
+            tracing::error!(
+                %address,
+                %pool,
+                "a fleet address is inside the sandbox pool, so this node routes it to a sandbox"
+            );
+        }
         *self.edge_addresses.lock().unwrap() = addresses;
         self.sync_firewall().await
     }
@@ -3055,7 +3067,7 @@ impl SandboxManager {
         {
             return Ok(());
         }
-        let count = self.sandboxes.lock().await.len();
+        let count = self.sandbox_count().await;
         if let Some(held) = &held
             && count > 0
         {
@@ -3069,12 +3081,23 @@ impl SandboxManager {
                 pool.cidr6()
             ));
         }
-        let mut own = burrow_net::ipam::host_addresses();
-        own.extend(self.denied_addresses());
-        if let Some(address) = pool.overlap(own) {
+        if let Some((address, prefix)) = burrow_net::ipam::host_networks()
+            .into_iter()
+            .find(|(address, prefix)| pool.overlaps(*address, *prefix))
+        {
             return Err(format!(
-                "the pool {} {} holds {address}, an address of this node or of the control \
-                 plane, which its sandboxes would take over",
+                "the pool {} {} overlaps {address}/{prefix}, a network this node is on, which \
+                 its sandboxes would take over",
+                pool.cidr(),
+                pool.cidr6()
+            ));
+        }
+        let mut depended = self.denied_addresses();
+        depended.extend(self.config.depends_on.iter().copied());
+        if let Some(address) = pool.overlap(depended) {
+            return Err(format!(
+                "the pool {} {} holds {address}, which this node reaches for its control plane, \
+                 a peer, its object store, a registry or its resolver",
                 pool.cidr(),
                 pool.cidr6()
             ));
@@ -3084,6 +3107,12 @@ impl SandboxManager {
         self.usernets.set_pool(pool);
         *self.ipam.lock().await = Some(Arc::new(assigned));
         Ok(())
+    }
+
+    /// Sandboxes this node holds, those recovery left out of service
+    /// included: they keep the address they were recorded with.
+    pub async fn sandbox_count(&self) -> usize {
+        self.sandboxes.lock().await.len() + self.held.lock().unwrap().len()
     }
 
     /// This node's slice of the pool, once it has one.
@@ -11675,6 +11704,7 @@ pub(crate) mod tests {
                     ..Default::default()
                 },
                 cpu_overcommit: 1.0,
+                depends_on: Vec::new(),
                 public: Default::default(),
                 warm: Default::default(),
                 checkpoint_min_secs: 60,
@@ -11731,6 +11761,10 @@ pub(crate) mod tests {
         manager.config.control_plane = vec!["100.64.200.1".parse().unwrap()];
         let err = manager.set_address_slice(pool, 0).await.unwrap_err();
         assert!(err.contains("100.64.200.1"), "{err}");
+        manager.config.control_plane.clear();
+        manager.config.depends_on = vec!["100.64.9.9".parse().unwrap()];
+        let err = manager.set_address_slice(pool, 0).await.unwrap_err();
+        assert!(err.contains("100.64.9.9"), "{err}");
         assert_eq!(manager.address_slice().await, Some((pool, 1)));
     }
 
