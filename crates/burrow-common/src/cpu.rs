@@ -39,11 +39,34 @@ pub fn charge_millis(vcpus: u32, cap_millis: u64, reserve_millis: u64) -> u64 {
     }
 }
 
+/// The bounds of `--cpu-overcommit`.
+pub const MIN_OVERCOMMIT: f64 = 0.1;
+pub const MAX_OVERCOMMIT: f64 = 64.0;
+
 /// The host CPU a node may commit to sandboxes, in thousandths of a CPU: its
-/// cores times how far it overcommits them, where 0 is 1.0.
+/// cores times how far it overcommits them, where 0 is 1.0 and anything else
+/// is held to [`MIN_OVERCOMMIT`]..=[`MAX_OVERCOMMIT`], since the figure is
+/// also what a node reports and the store compares.
 pub fn capacity_millis(cores: u32, overcommit: f64) -> u64 {
-    let ratio = if overcommit > 0.0 { overcommit } else { 1.0 };
+    let ratio = if overcommit.is_finite() && overcommit > 0.0 {
+        overcommit.clamp(MIN_OVERCOMMIT, MAX_OVERCOMMIT)
+    } else {
+        1.0
+    };
     (f64::from(cores) * 1000.0 * ratio).floor() as u64
+}
+
+/// `--cpu-overcommit`: a factor from [`MIN_OVERCOMMIT`] to [`MAX_OVERCOMMIT`].
+pub fn parse_overcommit(text: &str) -> Result<f64, String> {
+    let value: f64 = text
+        .parse()
+        .map_err(|_| format!("{text:?} is not a number"))?;
+    if !(MIN_OVERCOMMIT..=MAX_OVERCOMMIT).contains(&value) {
+        return Err(format!(
+            "must be from {MIN_OVERCOMMIT} to {MAX_OVERCOMMIT}; 1.0 never overcommits"
+        ));
+    }
+    Ok(value)
 }
 
 /// Thousandths of a CPU as CPUs, for a message: 2000 is "2", 500 is "0.5".
@@ -175,6 +198,18 @@ mod tests {
         assert_eq!(capacity_millis(3, 1.5), 4500);
         assert_eq!(capacity_millis(4, 0.0), 4000, "0 is a node saying nothing");
         assert_eq!(capacity_millis(4, 0.5), 2000);
+        assert_eq!(capacity_millis(4, f64::INFINITY), 4000);
+        assert_eq!(capacity_millis(4, 1e12), 256_000);
+        assert_eq!(capacity_millis(4, 1e-9), 400);
+    }
+
+    #[test]
+    fn the_overcommit_flag_is_bounded() {
+        assert_eq!(parse_overcommit("4"), Ok(4.0));
+        assert_eq!(parse_overcommit("64"), Ok(64.0));
+        for bad in ["0", "0.05", "65", "inf", "NaN", "-1", "lots"] {
+            assert!(parse_overcommit(bad).is_err(), "{bad}");
+        }
     }
 
     #[test]

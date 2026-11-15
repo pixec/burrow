@@ -625,6 +625,13 @@ pub(crate) fn node_cpus() -> u32 {
     std::thread::available_parallelism().map_or(0, |n| n.get() as u32)
 }
 
+/// The disk and CPU a new sandbox is charged until it is registered and
+/// counted on its own, which its caller drops it after.
+pub(crate) struct Admitted {
+    _disk: crate::diskcap::Admitted,
+    _cpu: CpuAdmitted,
+}
+
 /// CPU charged to a sandbox being created until it is dropped.
 struct CpuAdmitted {
     admitted: Arc<std::sync::Mutex<u64>>,
@@ -2657,6 +2664,8 @@ pub struct SandboxManager {
     /// CPU admitted to sandboxes being created, restored or recovered, until
     /// they are registered and counted on their own.
     cpu_admitted: Arc<std::sync::Mutex<u64>>,
+    /// Held across a CPU admission, so two cannot both fit the last slot.
+    cpu_admission: Arc<Mutex<()>>,
     /// Root disks made ahead of creates, where the filesystem cannot clone.
     spares: crate::rootdisk::Spares,
     resizer: Arc<crate::resizer::Resizer>,
@@ -2971,6 +2980,7 @@ impl SandboxManager {
             sandboxes: Arc::new(Mutex::new(HashMap::new())),
             disk_admissions: Default::default(),
             cpu_admitted: Default::default(),
+            cpu_admission: Default::default(),
             creating: Arc::new(Mutex::new(std::collections::HashSet::new())),
             ipam: Default::default(),
             ports: Arc::new(Mutex::new(HashMap::new())),
@@ -6983,6 +6993,7 @@ impl SandboxManager {
             cpu::cap_millis(resources.cpus),
             cpu::cap_millis(resources.reserved_cpus),
         );
+        let _admitting = self.cpu_admission.lock().await;
         let registered: u64 = self
             .sandboxes
             .lock()
@@ -7520,7 +7531,7 @@ impl SandboxManager {
         seed_disk: Option<&Path>,
         node_id: String,
         phases: &mut burrow_vmm::Phases,
-    ) -> Result<(Arc<RunningSandbox>, crate::diskcap::Admitted, bool), Status> {
+    ) -> Result<(Arc<RunningSandbox>, Admitted, bool), Status> {
         let began = std::time::Instant::now();
         // The last place it can be checked before it is joined onto the
         // templates directory. The API checks it too, but every create on this
@@ -7580,10 +7591,12 @@ impl SandboxManager {
         pin_boot_memory(&mut resources, hypervisor, guest_os)?;
         // The record says the size the disk is, not the size it defaulted to.
         policy.resources = Some(resources.clone());
-        let disk = self
-            .admit_disk(&node_id, "create a sandbox", disk_bytes)
-            .await?;
-        let _cpu = self.admit_new_cpu(&resources).await?;
+        let disk = Admitted {
+            _disk: self
+                .admit_disk(&node_id, "create a sandbox", disk_bytes)
+                .await?,
+            _cpu: self.admit_new_cpu(&resources).await?,
+        };
         phases.mark("checks");
 
         // A seeded disk has to survive into the guest untouched, and the warm
@@ -8523,7 +8536,7 @@ impl SandboxManager {
         policy: Option<common::Policy>,
         node_id: String,
         name: String,
-    ) -> Result<(Arc<RunningSandbox>, crate::diskcap::Admitted), Status> {
+    ) -> Result<(Arc<RunningSandbox>, Admitted), Status> {
         // A running source has state in memory that its snapshot does not
         // hold; capturing it is the whole difference between forking a sandbox
         // and cloning its last suspend.
@@ -8670,7 +8683,7 @@ impl SandboxManager {
         node_id: String,
         name: String,
         public_ips: Vec<common::PublicIp>,
-    ) -> Result<(Arc<RunningSandbox>, crate::diskcap::Admitted), Status> {
+    ) -> Result<(Arc<RunningSandbox>, Admitted), Status> {
         let began = std::time::Instant::now();
         let mut phases = burrow_vmm::Phases::start();
         // State restores only under the hypervisor that wrote it, so the
@@ -8691,14 +8704,16 @@ impl SandboxManager {
             RestoreSource::Snapshot { .. } => "create a sandbox from a snapshot",
             RestoreSource::Stored { .. } => "adopt a sandbox",
         };
-        let disk = self
-            .admit_disk(
-                &node_id,
-                what,
-                u64::from(resources.disk_mib) * burrow_common::disk::MIB,
-            )
-            .await?;
-        let _cpu = self.admit_new_cpu(&resources).await?;
+        let disk = Admitted {
+            _disk: self
+                .admit_disk(
+                    &node_id,
+                    what,
+                    u64::from(resources.disk_mib) * burrow_common::disk::MIB,
+                )
+                .await?,
+            _cpu: self.admit_new_cpu(&resources).await?,
+        };
         // A sandbox's own stored state was captured with its volumes attached,
         // and restores with them. Any other was captured without, so they
         // could only arrive by hotplug.
@@ -10378,7 +10393,7 @@ impl SandboxManager {
         held: &crate::durable::Held,
         record: common::Sandbox,
         node_id: String,
-    ) -> Result<(Arc<RunningSandbox>, String, crate::diskcap::Admitted), Status> {
+    ) -> Result<(Arc<RunningSandbox>, String, Admitted), Status> {
         let manifest = &held.manifest;
         let from = manifest.node_id.clone();
         let mut claimed = manifest.clone();
@@ -11393,6 +11408,31 @@ pub(crate) mod tests {
         manager.admit_new_cpu(&one).await.unwrap();
         drop(held);
         assert_eq!(manager.committed_cpu_millis().await, 0);
+    }
+
+    /// What create, fork, restore and adopt provision comes back with the CPU
+    /// still charged, and the charge outlives the sandbox's registration
+    /// rather than leaving a window where it is counted nowhere.
+    #[tokio::test]
+    async fn a_new_sandbox_stays_charged_until_it_is_registered() {
+        let manager = manager().await;
+        let one = common::ResourcePolicy {
+            vcpus: 1,
+            ..Default::default()
+        };
+        let admitted = Admitted {
+            _disk: manager.admit_disk("", "create a sandbox", 0).await.unwrap(),
+            _cpu: manager.admit_new_cpu(&one).await.unwrap(),
+        };
+        assert_eq!(manager.committed_cpu_millis().await, 1000);
+        manager
+            .sandboxes
+            .lock()
+            .await
+            .insert("sbx_a".into(), running("sbx_a"));
+        assert_eq!(manager.committed_cpu_millis().await, 2000);
+        drop(admitted);
+        assert_eq!(manager.committed_cpu_millis().await, 1000);
     }
 
     /// A sandbox's limits become its cgroup's the way runc makes Docker's:

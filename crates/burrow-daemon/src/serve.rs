@@ -258,7 +258,7 @@ pub struct ServeArgs {
     #[arg(
         long,
         default_value_t = 1.0,
-        value_parser = crate::diskcap::parse_overcommit,
+        value_parser = burrow_common::cpu::parse_overcommit,
         env = "BURROWD_CPU_OVERCOMMIT"
     )]
     pub cpu_overcommit: f64,
@@ -2207,6 +2207,7 @@ mod tests {
         let cli = Cli::try_parse_from(["burrowd", "--cpu-overcommit", "4"]).unwrap();
         assert_eq!(cli.serve.cpu_overcommit, 4.0);
         assert!(Cli::try_parse_from(["burrowd", "--cpu-overcommit", "0"]).is_err());
+        assert!(Cli::try_parse_from(["burrowd", "--cpu-overcommit", "1e300"]).is_err());
     }
 
     /// The orchestrator's address is what a sandbox is denied, so the host has
