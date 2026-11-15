@@ -1626,7 +1626,7 @@ pub mod from_image {
     ///
     /// The root is mounted read-only and the agent cannot create them itself,
     /// so they have to exist in the image.
-    const REQUIRED_DIRS: [&str; 6] = ["proc", "sys", "dev", "tmp", "run", "usr/bin"];
+    const REQUIRED_DIRS: [&str; 5] = ["proc", "sys", "dev", "tmp", "run"];
 
     /// Pulls an image, converts it, and publishes it as a template.
     ///
@@ -1838,13 +1838,18 @@ pub mod from_image {
         }
 
         for dir in REQUIRED_DIRS {
-            let _ = tokio::fs::create_dir_all(rootdir.join(dir)).await;
+            let path = rootdir.join(dir);
+            if std::fs::symlink_metadata(&path).is_err() {
+                let _ = tokio::fs::create_dir_all(&path).await;
+            }
         }
         // Without this the VM boots an image with no init and panics.
-        tokio::fs::copy(guest_binary, rootdir.join("usr/bin/burrow-guest"))
+        let (rootdir_owned, guest_binary_owned) =
+            (rootdir.to_path_buf(), guest_binary.to_path_buf());
+        tokio::task::spawn_blocking(move || install_agent(&rootdir_owned, &guest_binary_owned))
             .await
-            .map_err(|err| Status::internal(format!("installing the agent: {err}")))?;
-        set_executable(&rootdir.join("usr/bin/burrow-guest")).await?;
+            .map_err(|err| Status::internal(format!("installing the agent did not run: {err}")))?
+            .map_err(|err| Status::failed_precondition(format!("installing the agent: {err}")))?;
         if environment.systemd {
             stamp_updated(rootdir)
                 .map_err(|err| Status::internal(format!("stamping /etc and /var: {err}")))?;
@@ -1855,13 +1860,74 @@ pub mod from_image {
         // as `${{ kit.env.HOME }}`. Read them out of the rootfs the same way.
         let mut environment = environment.clone();
         if environment.kit.is_some() {
-            let passwd = tokio::fs::read_to_string(rootdir.join("etc/passwd"))
-                .await
-                .unwrap_or_default();
+            let passwd = match real_path_in(rootdir, "etc/passwd") {
+                Ok(path) => tokio::fs::read_to_string(path).await.unwrap_or_default(),
+                Err(_) => String::new(),
+            };
             add_login_env(&mut environment, &passwd);
         }
 
         assemble(manager, data_dir, rootdir, name, &environment, kernel, tx).await
+    }
+
+    /// `rel` under `root`, refused when any part of it is a link: the tree is
+    /// an image's, and the node writes and reads it as root, so a link there
+    /// could point it at any path on the host.
+    fn real_path_in(root: &Path, rel: &str) -> std::io::Result<std::path::PathBuf> {
+        let mut path = root.to_path_buf();
+        for part in rel.split('/') {
+            path.push(part);
+            if std::fs::symlink_metadata(&path)?.file_type().is_symlink() {
+                return Err(std::io::Error::other(format!(
+                    "/{rel} passes through a link in the image"
+                )));
+            }
+        }
+        Ok(path)
+    }
+
+    /// `parent`'s directory `name`, made when it is missing and refused when
+    /// it is a link or not a directory. `parent` must already be checked:
+    /// only the last component of a path is looked at without following it.
+    fn real_dir(parent: &Path, name: &str) -> std::io::Result<std::path::PathBuf> {
+        let path = parent.join(name);
+        match std::fs::symlink_metadata(&path) {
+            Ok(meta) if meta.file_type().is_symlink() => Err(std::io::Error::other(format!(
+                "{} is a link in the image",
+                path.display()
+            ))),
+            Ok(meta) if meta.is_dir() => Ok(path),
+            Ok(_) => Err(std::io::Error::other(format!(
+                "{} is not a directory",
+                path.display()
+            ))),
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+                std::fs::create_dir(&path)?;
+                Ok(path)
+            }
+            Err(err) => Err(err),
+        }
+    }
+
+    /// Writes the agent to the image's /usr/bin, which must be a directory
+    /// of the image's own, never through a link out of it.
+    fn install_agent(rootdir: &Path, guest_binary: &Path) -> std::io::Result<()> {
+        use std::os::unix::fs::OpenOptionsExt;
+        let bin = real_dir(&real_dir(rootdir, "usr")?, "bin")?;
+        let dest = bin.join("burrow-guest");
+        match std::fs::symlink_metadata(&dest) {
+            Ok(meta) if meta.is_dir() => std::fs::remove_dir_all(&dest)?,
+            Ok(_) => std::fs::remove_file(&dest)?,
+            Err(_) => {}
+        }
+        let mut to = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o755)
+            .custom_flags(libc::O_NOFOLLOW)
+            .open(&dest)?;
+        std::io::copy(&mut std::fs::File::open(guest_binary)?, &mut to)?;
+        to.set_permissions(std::os::unix::fs::PermissionsExt::from_mode(0o755))
     }
 
     /// Marks /etc and /var up to date with /usr, as systemd-update-done does
@@ -1879,10 +1945,10 @@ pub mod from_image {
             Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(()),
             Err(err) => return Err(err),
         };
-        let nanos = usr
-            .duration_since(std::time::UNIX_EPOCH)
-            .map_err(std::io::Error::other)?
-            .as_nanos();
+        let Ok(since) = usr.duration_since(std::time::UNIX_EPOCH) else {
+            return Ok(());
+        };
+        let nanos = since.as_nanos();
         for dir in ["etc", "var"] {
             if !std::fs::symlink_metadata(rootdir.join(dir)).is_ok_and(|meta| meta.is_dir()) {
                 continue;
@@ -1930,17 +1996,6 @@ pub mod from_image {
             }
             (fields[0] == user || fields[2] == user).then_some((fields[0], fields[5]))
         })
-    }
-
-    async fn set_executable(path: &Path) -> Result<(), Status> {
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            tokio::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755))
-                .await
-                .map_err(|err| Status::internal(format!("agent permissions: {err}")))?;
-        }
-        Ok(())
     }
 
     async fn assemble(
@@ -2099,6 +2154,51 @@ pub mod from_image {
             );
             assert!(!elsewhere.join(".updated").exists());
             let _ = std::fs::remove_dir_all(&dir);
+        }
+
+        /// An image whose /usr or /usr/bin is a link would otherwise have the
+        /// node write the agent wherever the link points on the host.
+        #[test]
+        fn the_agent_is_never_written_through_a_link_in_the_image() {
+            use std::os::unix::fs::{PermissionsExt, symlink};
+            let agent = scratch("agent-src").join("burrow-guest");
+            std::fs::write(&agent, b"agent").unwrap();
+
+            let dir = scratch("agent-ok");
+            install_agent(&dir, &agent).unwrap();
+            let installed = dir.join("usr/bin/burrow-guest");
+            assert_eq!(std::fs::read(&installed).unwrap(), b"agent");
+            assert_eq!(
+                std::fs::metadata(&installed).unwrap().permissions().mode() & 0o777,
+                0o755
+            );
+
+            let host = scratch("agent-host");
+            let dir = scratch("agent-usr");
+            std::fs::remove_dir(dir.join("usr")).unwrap();
+            symlink(&host, dir.join("usr")).unwrap();
+            assert!(install_agent(&dir, &agent).is_err());
+            assert!(!host.join("bin").exists());
+
+            let dir = scratch("agent-bin");
+            std::fs::create_dir(dir.join("usr/bin")).unwrap();
+            let target = host.join("victim");
+            std::fs::write(&target, b"host file").unwrap();
+            symlink(&target, dir.join("usr/bin/burrow-guest")).unwrap();
+            install_agent(&dir, &agent).unwrap();
+            assert_eq!(std::fs::read(&target).unwrap(), b"host file");
+            assert!(
+                !std::fs::symlink_metadata(dir.join("usr/bin/burrow-guest"))
+                    .unwrap()
+                    .file_type()
+                    .is_symlink()
+            );
+
+            assert!(real_path_in(&dir, "usr/bin/burrow-guest").is_ok());
+            let dir = scratch("passwd");
+            std::fs::create_dir(dir.join("etc/x")).unwrap();
+            symlink(&target, dir.join("etc/passwd")).unwrap();
+            assert!(real_path_in(&dir, "etc/passwd").is_err());
         }
     }
 }
