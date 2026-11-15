@@ -166,6 +166,7 @@ pub struct NodeConfig {
     pub data_dir: PathBuf,
     pub firecracker_bin: PathBuf,
     pub firecracker_io_engine: burrow_vmm::IoEngine,
+    pub is_firecracker_huge_page_fill_enabled: bool,
     /// Appended to every guest kernel command line.
     pub extra_boot_args: String,
     /// Boots every guest with a verbose console, as a create can ask for one.
@@ -293,6 +294,7 @@ impl NodeConfig {
                     bin: self.firecracker_bin.clone(),
                     jail: self.jail_for(hypervisor).cloned(),
                     io_engine: self.firecracker_io_engine,
+                    is_huge_page_fill_enabled: self.is_firecracker_huge_page_fill_enabled,
                 })
             }
             Hypervisor::CloudHypervisor => {
@@ -11807,6 +11809,7 @@ pub(crate) mod tests {
                 data_dir: std::env::temp_dir().join(format!("burrow-fork-{}", std::process::id())),
                 firecracker_bin: "/nonexistent/firecracker".into(),
                 firecracker_io_engine: Default::default(),
+                is_firecracker_huge_page_fill_enabled: true,
                 extra_boot_args: String::new(),
                 is_console_verbose: false,
                 min_agent_timeout: std::time::Duration::from_millis(1),
@@ -12607,6 +12610,7 @@ pub(crate) mod tests {
                     bin: "/nonexistent/firecracker".into(),
                     jail: None,
                     io_engine: Default::default(),
+                    is_huge_page_fill_enabled: true,
                 }),
             )),
             agent_channel: Mutex::new(None),
@@ -12867,6 +12871,7 @@ pub(crate) mod tests {
                 bin,
                 jail: None,
                 io_engine: Default::default(),
+                is_huge_page_fill_enabled: true,
             });
             spec.cgroup_root = None;
             spec.clone()
@@ -13320,6 +13325,7 @@ pub(crate) mod tests {
                     bin: "/nonexistent/firecracker".into(),
                     jail: None,
                     io_engine: Default::default(),
+                    is_huge_page_fill_enabled: true,
                 }),
             )),
             agent_channel: Mutex::new(None),

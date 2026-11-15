@@ -71,6 +71,7 @@ impl VmBootArgs {
                 bin: self.firecracker.clone(),
                 jail: None,
                 io_engine: Default::default(),
+                is_huge_page_fill_enabled: true,
             }),
             Hypervisor::CloudHypervisor => Backend::CloudHypervisor(CloudHypervisorConfig {
                 bin: self.cloud_hypervisor.clone(),

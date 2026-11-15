@@ -50,6 +50,20 @@ pub struct ServeArgs {
         env = "BURROWD_FIRECRACKER_IO_ENGINE"
     )]
     pub firecracker_io_engine: burrow_vmm::IoEngine,
+    /// Answer a fault on lazily served Firecracker memory with the 2 MiB
+    /// block around it, collapsed into a transparent huge page, rather than
+    /// with the one 4 KiB page asked for. On the test server first touch of
+    /// 1 GiB went from 17 s to 1.1 s and buffered writes 4 times faster, but
+    /// an idle 512 MiB sandbox cost 135 MiB rather than 58 and suspends write
+    /// whole blocks. Off keeps 4 KiB filling, for density. Applies to VMs
+    /// restored from now on.
+    #[arg(
+        long = "firecracker-huge-pages",
+        default_value_t = true,
+        action = clap::ArgAction::Set,
+        env = "BURROWD_FIRECRACKER_HUGE_PAGES"
+    )]
+    pub is_firecracker_huge_page_fill_enabled: bool,
     /// Hypervisors this node offers, comma-separated: `firecracker`,
     /// `cloud-hypervisor`, and `vz` on a Mac. A template records one when it
     /// is built, and its
@@ -1744,6 +1758,7 @@ pub async fn run(args: ServeArgs) -> anyhow::Result<()> {
             data_dir: args.data_dir.clone(),
             firecracker_bin: args.firecracker.clone(),
             firecracker_io_engine: args.firecracker_io_engine,
+            is_firecracker_huge_page_fill_enabled: args.is_firecracker_huge_page_fill_enabled,
             extra_boot_args: args.guest_boot_args.clone(),
             is_console_verbose: args.guest_console_verbose,
             min_agent_timeout: Duration::from_secs(args.agent_timeout),
@@ -2278,6 +2293,25 @@ mod tests {
         assert_eq!(cli.serve.cpu_overcommit, 4.0);
         assert!(Cli::try_parse_from(["burrowd", "--cpu-overcommit", "0"]).is_err());
         assert!(Cli::try_parse_from(["burrowd", "--cpu-overcommit", "1e300"]).is_err());
+    }
+
+    #[test]
+    fn firecracker_huge_pages_default_on_and_turn_off() {
+        use clap::Parser as _;
+        #[derive(clap::Parser)]
+        struct Cli {
+            #[command(flatten)]
+            serve: ServeArgs,
+        }
+        let huge = |args: &[&str]| {
+            Cli::try_parse_from(["burrowd"].iter().chain(args))
+                .unwrap()
+                .serve
+                .is_firecracker_huge_page_fill_enabled
+        };
+        assert!(huge(&[]));
+        assert!(!huge(&["--firecracker-huge-pages", "false"]));
+        assert!(huge(&["--firecracker-huge-pages", "true"]));
     }
 
     /// The orchestrator's address is what a sandbox is denied, so the host has

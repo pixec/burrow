@@ -31,6 +31,8 @@ pub struct FirecrackerConfig {
     pub jail: Option<Jail>,
     /// How Firecracker serves its drives' requests.
     pub io_engine: IoEngine,
+    /// Serve lazily restored memory a huge page at a time.
+    pub is_huge_page_fill_enabled: bool,
 }
 
 /// Firecracker's block I/O engine.
@@ -78,6 +80,7 @@ pub(crate) fn spec(spec: VmSpec, config: FirecrackerConfig) -> crate::Result<Mic
         is_dirty_pages_tracked: spec.is_dirty_pages_tracked,
         jail: config.jail,
         io_engine: config.io_engine,
+        is_huge_page_fill_enabled: config.is_huge_page_fill_enabled,
         is_memory_lazy: spec.is_memory_lazy,
         memory_chain: spec.memory_chain,
         prefetch: spec.prefetch,
@@ -164,6 +167,9 @@ pub struct MicroVmSpec {
     /// runs it as root with the host filesystem visible.
     pub jail: Option<process::Jail>,
     pub io_engine: IoEngine,
+    /// Answer each fault on lazily served memory with the 2 MiB block around
+    /// it, collapsed into a huge page, rather than with the one page.
+    pub is_huge_page_fill_enabled: bool,
     /// Serve guest memory lazily on restore instead of letting the kernel page
     /// the whole memory file in. Ignored on a cold boot, which has no memory
     /// file to serve from.
@@ -215,6 +221,7 @@ impl MicroVmSpec {
             memory_source: None,
             jail: None,
             io_engine: IoEngine::Sync,
+            is_huge_page_fill_enabled: true,
             is_memory_lazy: false,
             memory_chain: Vec::new(),
             limits: Limits::default(),
@@ -701,7 +708,7 @@ impl MicroVm {
                     .as_ref()
                     .map(|name| self.spec.workdir.join(name)),
                 base_source: self.spec.memory_source.as_ref().map(|s| s.0.clone()),
-                is_huge_page_fill_enabled: true,
+                is_huge_page_fill_enabled: self.spec.is_huge_page_fill_enabled,
             },
         )?;
         self.memory = Some(backend);
@@ -751,6 +758,7 @@ mod tests {
             bin: "firecracker".into(),
             jail: None,
             io_engine: IoEngine::Sync,
+            is_huge_page_fill_enabled: true,
         };
         let backend = crate::Backend::Firecracker(config.clone());
         let mut vm = VmSpec::new("sbx_1", "/tmp/sbx_1", backend);
