@@ -1141,6 +1141,7 @@ fn spawn_handshake(
         // launch.
         let phases = std::sync::Mutex::new(burrow_vmm::Phases::start());
         let guest_timing = std::sync::Mutex::new(None);
+        let reached = std::sync::Mutex::new(Reached::Nothing);
         let outcome = match tokio::time::timeout(timeout + guestconn::UPGRADE_TIMEOUT, async {
             let (agent, accepted_at) = match dialing {
                 Some(dialing) => dialing.await??,
@@ -1153,10 +1154,12 @@ fn spawn_handshake(
                     .add("vsock", accepted_at.duration_since(began));
             }
             phases.lock().unwrap().mark("dial");
+            *reached.lock().unwrap() = Reached::Accepted;
             *step.lock().unwrap() = "waiting for the agent to answer the handshake";
             let (mut agent, response) =
                 guestconn::handshake_upgrading(agent, guest, request, upgrade.as_deref(), timeout)
                     .await?;
+            *reached.lock().unwrap() = Reached::Answered;
             phases.lock().unwrap().mark("handshake");
             *guest_timing.lock().unwrap() = response.timing;
             let features = response.features;
@@ -1181,6 +1184,9 @@ fn spawn_handshake(
             )),
         };
 
+        let is_snapshot_suspect = outcome
+            .as_ref()
+            .is_err_and(|err| warm.is_some() && is_snapshot_suspect(*reached.lock().unwrap(), err));
         let (state, ready) = match outcome {
             Ok(ready) => (Handshake::Done, Some(ready)),
             Err(err) => (Handshake::Failed(error_chain(&*err)), None),
@@ -1244,16 +1250,22 @@ fn spawn_handshake(
             Handshake::Failed(err) if recorded => {
                 // Loud, and with the console, because nothing else will report
                 // it: the create it belonged to has already returned.
-                let reason = match &mut *sandbox.vm.lock().await {
-                    Some(vm) => no_agent_reason(vm, NoAgent::Stalled(err)).await,
-                    None => err,
+                let (reason, has_vm) = match &mut *sandbox.vm.lock().await {
+                    Some(vm) => (no_agent_reason(vm, NoAgent::Stalled(err)).await, true),
+                    None => (err, false),
                 };
                 tracing::error!(
                     sandbox = id,
                     reason,
                     "the guest agent never came up; reclaiming the sandbox"
                 );
-                if let Some(warm) = &warm {
+                // A sandbox deleted under its handshake lost its VM to the
+                // delete, which says nothing about the snapshot.
+                let is_registered = manager.sandboxes.lock().await.contains_key(&id);
+                if let Some(warm) = warm
+                    .as_ref()
+                    .filter(|_| is_snapshot_suspect && has_vm && is_registered)
+                {
                     manager
                         .discard_failed_warm(warm, &sandbox.workdir.join(sandbox.layout().state))
                         .await;
@@ -1272,6 +1284,53 @@ fn spawn_handshake(
             _ => {}
         }
     });
+}
+
+/// How far a handshake got before it failed.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Reached {
+    Nothing,
+    /// The guest's vsock accepted.
+    Accepted,
+    /// The agent answered the handshake.
+    Answered,
+}
+
+/// Whether a failed warm handshake says the snapshot restored a broken guest:
+/// its vsock never accepted, or the connection failed under the handshake
+/// before the agent answered it with anything. An agent that answered, even
+/// with an error, came up, and a handshake that went quiet after the guest
+/// accepted is as likely an overloaded node as a broken snapshot.
+fn is_snapshot_suspect(reached: Reached, err: &anyhow::Error) -> bool {
+    match reached {
+        Reached::Nothing => true,
+        Reached::Accepted => err
+            .downcast_ref::<tonic::Status>()
+            .is_some_and(|status| std::error::Error::source(status).is_some()),
+        Reached::Answered => false,
+    }
+}
+
+/// How long after discarding a warm snapshot whose guest never came up the
+/// node keeps the next one of the same shape whatever its guests do, so an
+/// environment that fails every guest does not rebuild it over and over.
+const WARM_DISCARD_COOLDOWN: std::time::Duration = std::time::Duration::from_secs(300);
+
+/// Says whether a snapshot in `dir` may be discarded at `now`, and if so
+/// counts this as its shape's discard.
+fn may_discard_warm(
+    discards: &mut HashMap<PathBuf, std::time::Instant>,
+    dir: &Path,
+    now: std::time::Instant,
+) -> bool {
+    if discards
+        .get(dir)
+        .is_some_and(|at| now.duration_since(*at) < WARM_DISCARD_COOLDOWN)
+    {
+        return false;
+    }
+    discards.insert(dir.to_path_buf(), now);
+    true
 }
 
 /// The warm snapshot a sandbox was restored from.
@@ -2884,6 +2943,9 @@ pub struct SandboxManager {
     /// build, costing a boot, a snapshot and the node's one warm build lock,
     /// for every novel one.
     warm_shapes: Arc<std::sync::Mutex<HashMap<String, WarmShapes>>>,
+    /// When each warm snapshot directory was last discarded for a guest that
+    /// never came up.
+    warm_discards: Arc<std::sync::Mutex<HashMap<PathBuf, std::time::Instant>>>,
     /// Held by an automatic warm build from its admission checks to its
     /// finish, so they run one after another with the checks made against
     /// the node as it is when each starts.
@@ -3065,6 +3127,7 @@ impl SandboxManager {
             audit: Arc::new(std::sync::Mutex::new(None)),
             expired_rules: Arc::new(std::sync::Mutex::new(std::collections::HashSet::new())),
             warm_shapes: Arc::new(std::sync::Mutex::new(HashMap::new())),
+            warm_discards: Arc::default(),
             warm_queue: Arc::new(tokio::sync::Mutex::new(())),
             firewall: Arc::new(tokio::sync::Mutex::new(())),
             ruled_ahead: Default::default(),
@@ -6728,6 +6791,20 @@ impl SandboxManager {
     /// create of its shape restored the same broken guest and was reclaimed
     /// once its handshake timed out.
     async fn discard_failed_warm(&self, warm: &WarmOrigin, restored: &Path) {
+        if !may_discard_warm(
+            &mut self.warm_discards.lock().unwrap(),
+            &warm.dir,
+            std::time::Instant::now(),
+        ) {
+            tracing::warn!(
+                template = warm.template,
+                vcpus = warm.shape.vcpus,
+                mem_mib = warm.shape.mem_mib,
+                "keeping a warm snapshot whose restored guest never came up: one of its shape was \
+                 discarded within the last 5 minutes"
+            );
+            return;
+        }
         match crate::warm::discard_restored(&warm.dir, restored).await {
             Ok(true) => {}
             Ok(false) => return,
@@ -13450,6 +13527,104 @@ pub(crate) mod tests {
             manager.ipam().await.unwrap().get("sbx_no_agent").is_none(),
             "its address lease was not released"
         );
+    }
+
+    /// A warm sandbox whose handshake failed because it had no VM, as one
+    /// deleted under its handshake has not, is reclaimed without its snapshot
+    /// being blamed.
+    #[tokio::test]
+    async fn a_failed_handshake_without_a_vm_keeps_the_warm_snapshot() {
+        let manager = manager().await;
+        let sandbox = running("sbx_warm_gone");
+        let (id, block) = (sandbox.id(), sandbox.lease.block);
+        manager.ipam().await.unwrap().reserve(id, block).unwrap();
+        manager
+            .sandboxes
+            .lock()
+            .await
+            .insert(sandbox.id().to_string(), sandbox.clone());
+        sandbox.handshake.send_replace(Handshake::Pending);
+        let warm_dir = std::env::temp_dir().join(format!(
+            "burrow-warm-kept-{}",
+            uuid::Uuid::new_v4().simple()
+        ));
+        let state = sandbox.layout().state;
+        std::fs::create_dir_all(&warm_dir).unwrap();
+        std::fs::create_dir_all(&sandbox.workdir).unwrap();
+        std::fs::write(warm_dir.join(state), b"x").unwrap();
+        let _ = std::fs::remove_file(sandbox.workdir.join(state));
+        std::fs::hard_link(warm_dir.join(state), sandbox.workdir.join(state)).unwrap();
+
+        spawn_handshake(
+            &manager,
+            &sandbox,
+            burrow_proto::guest::v1::HandshakeRequest::default(),
+            None,
+            None,
+            std::time::Duration::from_millis(1),
+            Some(WarmOrigin {
+                template: "default".into(),
+                dir: warm_dir.clone(),
+                shape: crate::warm::Shape {
+                    vcpus: 1,
+                    mem_mib: 512,
+                    disk_mib: 0,
+                    max_mem_mib: 0,
+                },
+            }),
+        );
+        drop(sandbox);
+        for _ in 0..200 {
+            if manager.ipam().await.unwrap().get("sbx_warm_gone").is_none() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        assert!(manager.sandboxes.lock().await.is_empty());
+        assert!(warm_dir.join(state).exists(), "the snapshot was blamed");
+        let _ = std::fs::remove_dir_all(&warm_dir);
+    }
+
+    /// Only a guest that never came up blames its snapshot: one whose vsock
+    /// never accepted, or whose connection failed before the agent answered.
+    #[test]
+    fn only_a_guest_that_never_answered_blames_its_snapshot() {
+        let transport = || {
+            anyhow::Error::from(tonic::Status::from_error(Box::new(std::io::Error::other(
+                "connection reset",
+            ))))
+        };
+        let refused = || anyhow::Error::from(tonic::Status::internal("mounting /data failed"));
+        let stalled = || anyhow::anyhow!("stalled waiting for the agent to answer the handshake");
+
+        assert!(is_snapshot_suspect(
+            Reached::Nothing,
+            &anyhow::anyhow!("no vsock")
+        ));
+        assert!(is_snapshot_suspect(Reached::Accepted, &transport()));
+        assert!(!is_snapshot_suspect(Reached::Accepted, &refused()));
+        assert!(!is_snapshot_suspect(Reached::Accepted, &stalled()));
+        assert!(!is_snapshot_suspect(Reached::Answered, &transport()));
+        assert!(!is_snapshot_suspect(Reached::Answered, &refused()));
+    }
+
+    #[test]
+    fn a_shape_is_discarded_at_most_once_per_cooldown() {
+        let mut discards = HashMap::new();
+        let (dir, other) = (Path::new("/w/a"), Path::new("/w/b"));
+        let now = std::time::Instant::now();
+        assert!(may_discard_warm(&mut discards, dir, now));
+        assert!(!may_discard_warm(
+            &mut discards,
+            dir,
+            now + WARM_DISCARD_COOLDOWN / 2
+        ));
+        assert!(may_discard_warm(&mut discards, other, now));
+        assert!(may_discard_warm(
+            &mut discards,
+            dir,
+            now + WARM_DISCARD_COOLDOWN
+        ));
     }
 
     fn suspended_sandbox() -> RunningSandbox {
