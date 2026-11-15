@@ -1010,20 +1010,26 @@ fn fill(
     mode: u64,
 ) -> io::Result<()> {
     let offset = region.offset_of(start);
+    let layer = layer.map(|index| &layers[index]);
+    // Before the pages are recorded: one that never arrives is never filled,
+    // and a diff could not hold it.
+    if let Some(source) = layer.and_then(|layer| layer.source.as_ref()) {
+        source.ensure(offset, len)?;
+    }
     // Before the pages can be present, so no snapshot finds one present and
     // unrecorded.
     mark(served, offset, len);
     // Zeroes are copied from one block of them, a block at a time.
-    let (src, stride) = match layer.map(|index| &layers[index]) {
-        Some(layer) => {
-            if let Some(source) = &layer.source {
-                source.ensure(offset, len)?;
-            }
-            (layer.backing.addr as u64 + offset, len)
-        }
+    let (src, stride) = match layer {
+        Some(layer) => (layer.backing.addr as u64 + offset, len),
         None => match zeroes {
             Some(zeroes) => (zeroes.addr as u64, zeroes.len as u64),
-            None => return zero_range(fd, start, start + len),
+            // A page this did fill and no longer recorded is zeroes in every
+            // layer, which is what a restore reads for it anyway.
+            None => {
+                return zero_range(fd, start, start + len)
+                    .inspect_err(|_| served.lock().unwrap().remove_bytes(offset, offset + len));
+            }
         },
     };
     let mut done = 0;
@@ -1244,127 +1250,155 @@ mod tests {
         assert_eq!(region.offset_of(0x7f00_0020_0000), 0x1010_0000);
     }
 
+    const PAGES: u64 = 4 * BLOCK / memfile::PAGE;
+
     /// Four blocks of anonymous memory registered with a userfaultfd, as
-    /// Firecracker hands a guest's over, served from a file whose every page
-    /// holds its index plus one, but for pages 500..530, which no layer
-    /// defines. A prefetch fills 505..520 and 1000..1010 first, across a
-    /// block boundary, as the plan of an earlier restore would.
-    fn serve_a_guest(blocks: Option<&mut Blocks>) -> memfile::PageMap {
-        const UFFDIO_API: u32 = iowr(0x3f, 24);
-        const UFFDIO_REGISTER: u32 = iowr(0x00, 32);
-        const PAGES: u64 = 4 * BLOCK / memfile::PAGE;
-        let len = (PAGES * memfile::PAGE) as usize;
-
-        let dir = std::env::temp_dir().join(format!(
-            "burrow-uffd-blocks-{}-{}",
-            std::process::id(),
-            blocks.is_some()
-        ));
-        std::fs::create_dir_all(&dir).unwrap();
-        let mem = dir.join("snapshot.mem");
-        let mut contents = vec![0u8; len];
-        for (index, page) in contents.chunks_mut(memfile::PAGE as usize).enumerate() {
-            page[..8].copy_from_slice(&(index as u64 + 1).to_ne_bytes());
-        }
-        std::fs::write(&mem, contents).unwrap();
-        let layers = [Layer {
-            backing: Backing::map(&mem).unwrap(),
-            pages: memfile::Layer::full(
-                len as u64,
-                vec![(0, 500 * memfile::PAGE), (530 * memfile::PAGE, len as u64)],
-            ),
-            source: None,
-        }];
-
-        // SAFETY: an anonymous mapping takes no descriptor.
-        let mapped = unsafe {
-            libc::mmap(
-                std::ptr::null_mut(),
-                len + BLOCK as usize,
-                libc::PROT_READ | libc::PROT_WRITE,
-                libc::MAP_PRIVATE | libc::MAP_ANONYMOUS,
-                -1,
-                0,
-            )
-        };
-        assert_ne!(mapped, libc::MAP_FAILED);
-        let base = (mapped as u64 + BLOCK - 1) & !(BLOCK - 1);
-        // SAFETY: userfaultfd takes flags; user mode only needs no privilege.
-        let fd = unsafe {
-            libc::syscall(
-                libc::SYS_userfaultfd,
-                libc::O_CLOEXEC | libc::O_NONBLOCK | 1,
-            )
-        };
-        assert!(fd >= 0, "{}", io::Error::last_os_error());
-        // SAFETY: the descriptor was just created and is named nowhere else.
-        let uffd = unsafe { OwnedFd::from_raw_fd(fd as RawFd) };
-        let mut api = [0xaa_u64, 0, 0];
-        let mut register = [base, len as u64, 1, 0];
-        // SAFETY: both arguments match their kernel structs.
-        unsafe {
-            assert_eq!(libc::ioctl(fd as RawFd, UFFDIO_API as _, &mut api), 0);
-            assert_eq!(
-                libc::ioctl(fd as RawFd, UFFDIO_REGISTER as _, &mut register),
-                0
-            );
-        }
-        let regions = [RegionMapping {
-            base_host_virt_addr: base,
-            size: len,
-            offset: 0,
-            page_size: memfile::PAGE as usize,
-        }];
-
-        let served = Mutex::new(memfile::PageMap::new(PAGES));
-        let plan: Vec<u64> = (505..520)
-            .chain(1000..1010)
-            .map(|page| page * memfile::PAGE)
-            .collect();
-        let zeroes = blocks.as_ref().map(|blocks| &blocks.zeroes);
-        assert_eq!(
-            prefetch(fd as RawFd, &regions, &layers, zeroes, &served, &plan),
-            plan.len()
-        );
-
-        let stop = Stop::new().unwrap();
-        let read = |page: u64| {
-            // SAFETY: the page is inside the registered mapping.
-            unsafe { std::ptr::read_volatile((base + page * memfile::PAGE) as *const u64) }
-        };
-        let after_one = std::thread::scope(|scope| {
-            let handler = scope.spawn({
-                let (uffd, served, stop) = (&uffd, &served, &stop);
-                move || handle_faults(uffd, &regions, &layers, served, stop, blocks)
-            });
-            assert_eq!(read(1500), 1501);
-            let after_one = served.lock().unwrap().clone();
-            for page in 0..PAGES {
-                let expected = if (500..530).contains(&page) {
-                    0
-                } else {
-                    page + 1
-                };
-                assert_eq!(read(page), expected, "page {page}");
-            }
-            // SAFETY: as for a read.
-            unsafe { std::ptr::write_volatile((base + 7 * memfile::PAGE) as *mut u64, 42) };
-            assert_eq!(read(7), 42);
-            stop.signal();
-            let faulted = handler.join().unwrap().unwrap();
-            assert!(faulted.contains(&(1500 * memfile::PAGE)));
-            assert_eq!(served.lock().unwrap().count(), PAGES);
-            after_one
-        });
-        // SAFETY: the mapping was created above and nothing refers to it now.
-        unsafe { libc::munmap(mapped, len + BLOCK as usize) };
-        std::fs::remove_dir_all(&dir).unwrap();
-        after_one
+    /// Firecracker hands a guest's over, and a memory file whose every page
+    /// holds its index plus one.
+    struct Guest {
+        uffd: OwnedFd,
+        regions: [RegionMapping; 1],
+        mapped: u64,
+        dir: PathBuf,
     }
 
-    #[test]
-    fn a_fault_fills_and_collapses_its_block_around_prefetched_pages() {
-        let mut blocks = Blocks {
+    impl Guest {
+        fn new(name: &str) -> Self {
+            const UFFDIO_API: u32 = iowr(0x3f, 24);
+            const UFFDIO_REGISTER: u32 = iowr(0x00, 32);
+            let len = (PAGES * memfile::PAGE) as usize;
+            let dir =
+                std::env::temp_dir().join(format!("burrow-uffd-{name}-{}", std::process::id()));
+            std::fs::create_dir_all(&dir).unwrap();
+            let mut contents = vec![0u8; len];
+            for (index, page) in contents.chunks_mut(memfile::PAGE as usize).enumerate() {
+                page[..8].copy_from_slice(&(index as u64 + 1).to_ne_bytes());
+            }
+            std::fs::write(dir.join("snapshot.mem"), contents).unwrap();
+
+            // SAFETY: an anonymous mapping takes no descriptor.
+            let mapped = unsafe {
+                libc::mmap(
+                    std::ptr::null_mut(),
+                    len + BLOCK as usize,
+                    libc::PROT_READ | libc::PROT_WRITE,
+                    libc::MAP_PRIVATE | libc::MAP_ANONYMOUS,
+                    -1,
+                    0,
+                )
+            };
+            assert_ne!(mapped, libc::MAP_FAILED);
+            let base = (mapped as u64 + BLOCK - 1) & !(BLOCK - 1);
+            // SAFETY: userfaultfd takes flags; user mode only needs no privilege.
+            let fd = unsafe {
+                libc::syscall(
+                    libc::SYS_userfaultfd,
+                    libc::O_CLOEXEC | libc::O_NONBLOCK | 1,
+                )
+            };
+            assert!(fd >= 0, "{}", io::Error::last_os_error());
+            // SAFETY: the descriptor was just created and is named nowhere else.
+            let uffd = unsafe { OwnedFd::from_raw_fd(fd as RawFd) };
+            let mut api = [0xaa_u64, 0, 0];
+            let mut register = [base, len as u64, 1, 0];
+            // SAFETY: both arguments match their kernel structs.
+            unsafe {
+                assert_eq!(libc::ioctl(fd as RawFd, UFFDIO_API as _, &mut api), 0);
+                assert_eq!(
+                    libc::ioctl(fd as RawFd, UFFDIO_REGISTER as _, &mut register),
+                    0
+                );
+            }
+            Self {
+                uffd,
+                regions: [RegionMapping {
+                    base_host_virt_addr: base,
+                    size: len,
+                    offset: 0,
+                    page_size: memfile::PAGE as usize,
+                }],
+                mapped: mapped as u64,
+                dir,
+            }
+        }
+
+        /// The memory file as a base layer defining `defined`.
+        fn layer(
+            &self,
+            defined: Vec<(u64, u64)>,
+            source: Option<Arc<dyn super::super::PageSource>>,
+        ) -> Layer {
+            let mem = self.dir.join("snapshot.mem");
+            Layer {
+                backing: Backing::map(&mem).unwrap(),
+                pages: memfile::Layer::full(PAGES * memfile::PAGE, defined),
+                source,
+            }
+        }
+
+        fn prefetch(
+            &self,
+            layers: &[Layer],
+            blocks: Option<&Blocks>,
+            served: &Served,
+            pages: impl Iterator<Item = u64>,
+        ) -> usize {
+            let plan: Vec<u64> = pages.map(|page| page * memfile::PAGE).collect();
+            let zeroes = blocks.map(|blocks| &blocks.zeroes);
+            prefetch(
+                self.uffd.as_raw_fd(),
+                &self.regions,
+                layers,
+                zeroes,
+                served,
+                &plan,
+            )
+        }
+
+        /// Serves faults from `layers` while `guest` runs, then stops.
+        fn serve(
+            &self,
+            layers: Vec<Layer>,
+            blocks: Option<&mut Blocks>,
+            served: &Served,
+            guest: impl FnOnce(),
+        ) -> std::collections::BTreeSet<u64> {
+            let stop = Stop::new().unwrap();
+            std::thread::scope(|scope| {
+                let handler = scope.spawn({
+                    let stop = &stop;
+                    move || handle_faults(&self.uffd, &self.regions, &layers, served, stop, blocks)
+                });
+                guest();
+                stop.signal();
+                handler.join().unwrap().unwrap()
+            })
+        }
+
+        fn read(&self, page: u64) -> u64 {
+            let at = self.regions[0].base_host_virt_addr + page * memfile::PAGE;
+            // SAFETY: the page is inside the registered mapping.
+            unsafe { std::ptr::read_volatile(at as *const u64) }
+        }
+
+        fn write(&self, page: u64, value: u64) {
+            let at = self.regions[0].base_host_virt_addr + page * memfile::PAGE;
+            // SAFETY: as for a read.
+            unsafe { std::ptr::write_volatile(at as *mut u64, value) }
+        }
+    }
+
+    impl Drop for Guest {
+        fn drop(&mut self) {
+            let len = self.regions[0].size + BLOCK as usize;
+            // SAFETY: the mapping was made in `new` and nothing refers to it now.
+            unsafe { libc::munmap(self.mapped as *mut libc::c_void, len) };
+            let _ = std::fs::remove_dir_all(&self.dir);
+        }
+    }
+
+    fn blocks() -> Blocks {
+        Blocks {
             zeroes: Backing::zeroes().unwrap(),
             collapse: Collapse {
                 // SAFETY: pidfd_open takes a pid and flags.
@@ -1377,8 +1411,75 @@ mod tests {
                 has_collapsed: false,
                 paused_until: None,
             },
-        };
-        let after_one = serve_a_guest(Some(&mut blocks));
+        }
+    }
+
+    /// A base that has not arrived where `missing` says, failing whoever asks
+    /// for it there.
+    struct Arriving {
+        missing: Mutex<Option<(u64, u64)>>,
+    }
+
+    impl super::super::PageSource for Arriving {
+        fn extents(&self) -> Vec<(u64, u64)> {
+            vec![(0, PAGES * memfile::PAGE)]
+        }
+
+        fn ensure(&self, offset: u64, len: u64) -> io::Result<()> {
+            match *self.missing.lock().unwrap() {
+                Some((start, end)) if offset < end && start < offset + len => {
+                    Err(io::Error::other("not arrived"))
+                }
+                _ => Ok(()),
+            }
+        }
+    }
+
+    /// Pages 500..530 are defined by no layer. A prefetch fills 505..520 and
+    /// 1000..1010 first, across a block boundary, as the plan of an earlier
+    /// restore would.
+    fn serve_a_guest(name: &str, mut blocks: Option<&mut Blocks>) -> memfile::PageMap {
+        let guest = Guest::new(name);
+        let layers = vec![guest.layer(
+            vec![
+                (0, 500 * memfile::PAGE),
+                (530 * memfile::PAGE, PAGES * memfile::PAGE),
+            ],
+            None,
+        )];
+        let served = Mutex::new(memfile::PageMap::new(PAGES));
+        assert_eq!(
+            guest.prefetch(
+                &layers,
+                blocks.as_deref(),
+                &served,
+                (505..520).chain(1000..1010)
+            ),
+            25
+        );
+        let mut after_one = None;
+        let faulted = guest.serve(layers, blocks.take(), &served, || {
+            assert_eq!(guest.read(1500), 1501);
+            after_one = Some(served.lock().unwrap().clone());
+            for page in 0..PAGES {
+                let expected = if (500..530).contains(&page) {
+                    0
+                } else {
+                    page + 1
+                };
+                assert_eq!(guest.read(page), expected, "page {page}");
+            }
+            guest.write(7, 42);
+            assert_eq!(guest.read(7), 42);
+        });
+        assert!(faulted.contains(&(1500 * memfile::PAGE)));
+        assert_eq!(served.lock().unwrap().count(), PAGES);
+        after_one.unwrap()
+    }
+
+    #[test]
+    fn a_fault_fills_and_collapses_its_block_around_prefetched_pages() {
+        let after_one = serve_a_guest("blocks", Some(&mut blocks()));
         let block = 1500 / (BLOCK / memfile::PAGE) * (BLOCK / memfile::PAGE);
         assert!((block..block + BLOCK / memfile::PAGE).all(|page| after_one.contains(page)));
         assert_eq!(after_one.count(), BLOCK / memfile::PAGE + 25);
@@ -1386,9 +1487,30 @@ mod tests {
 
     #[test]
     fn a_fault_fills_one_page_with_huge_pages_off() {
-        let after_one = serve_a_guest(None);
+        let after_one = serve_a_guest("pages", None);
         assert!(after_one.contains(1500));
         assert_eq!(after_one.count(), 1 + 25);
+    }
+
+    /// A planned page whose fetch fails is left unrecorded, so no diff claims
+    /// it, and is filled when the guest faults on it once it has arrived.
+    #[test]
+    fn a_planned_page_that_never_arrives_is_left_to_its_fault() {
+        for mut blocks in [None, Some(blocks())] {
+            let guest = Guest::new(&format!("arriving-{}", blocks.is_some()));
+            let source = Arc::new(Arriving {
+                missing: Mutex::new(Some((10 * memfile::PAGE, 20 * memfile::PAGE))),
+            });
+            let layers = vec![guest.layer(vec![(0, PAGES * memfile::PAGE)], Some(source.clone()))];
+            let served = Mutex::new(memfile::PageMap::new(PAGES));
+            assert_eq!(guest.prefetch(&layers, blocks.as_ref(), &served, 10..20), 0);
+            assert_eq!(served.lock().unwrap().count(), 0);
+            *source.missing.lock().unwrap() = None;
+            guest.serve(layers, blocks.as_mut(), &served, || {
+                assert_eq!(guest.read(15), 16);
+            });
+            assert!(served.lock().unwrap().contains(15));
+        }
     }
 
     #[test]
