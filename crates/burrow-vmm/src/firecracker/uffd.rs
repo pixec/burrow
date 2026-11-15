@@ -121,6 +121,7 @@ const UFFDIO_COPY: u32 = iowr(0x03, std::mem::size_of::<UffdioCopy>() as u32);
 const UFFDIO_ZEROPAGE: u32 = iowr(0x04, std::mem::size_of::<UffdioZeropage>() as u32);
 const UFFDIO_COPY_MODE_DONTWAKE: u64 = 1;
 const MADV_COLLAPSE: libc::c_int = 25;
+const SO_PEERPIDFD: libc::c_int = 77;
 
 #[repr(C)]
 #[derive(Default)]
@@ -391,16 +392,34 @@ struct Collapse {
 }
 
 impl Collapse {
+    /// The peer's pidfd, from the socket where the kernel can give one
+    /// (Linux 6.5), else opened from its pid.
     fn of(stream: &UnixStream) -> Self {
         use nix::sys::socket::{getsockopt, sockopt::PeerCredentials};
-        let pidfd = getsockopt(stream, PeerCredentials).ok().and_then(|cred| {
-            // SAFETY: pidfd_open takes a pid and flags.
-            let fd = unsafe { libc::syscall(libc::SYS_pidfd_open, cred.pid(), 0) };
-            // SAFETY: the descriptor was just created and is named nowhere else.
-            (fd >= 0).then(|| unsafe { OwnedFd::from_raw_fd(fd as RawFd) })
-        });
+        let mut fd: libc::c_int = -1;
+        let mut len = std::mem::size_of::<libc::c_int>() as libc::socklen_t;
+        // SAFETY: `fd` and `len` describe the int the option is read into.
+        let peer = unsafe {
+            libc::getsockopt(
+                stream.as_raw_fd(),
+                libc::SOL_SOCKET,
+                SO_PEERPIDFD,
+                (&raw mut fd).cast(),
+                &mut len,
+            )
+        };
+        let fd = if peer == 0 {
+            Some(fd)
+        } else {
+            getsockopt(stream, PeerCredentials).ok().and_then(|cred| {
+                // SAFETY: pidfd_open takes a pid and flags.
+                let fd = unsafe { libc::syscall(libc::SYS_pidfd_open, cred.pid(), 0) };
+                (fd >= 0).then_some(fd as RawFd)
+            })
+        };
         Self {
-            pidfd,
+            // SAFETY: the descriptor was just created and is named nowhere else.
+            pidfd: fd.map(|fd| unsafe { OwnedFd::from_raw_fd(fd) }),
             has_collapsed: false,
             paused_until: None,
         }
@@ -760,6 +779,16 @@ fn serve(
 ) -> io::Result<()> {
     let stream = accept(listener, stop)?;
     let Some(stream) = stream else { return Ok(()) };
+    // As soon as Firecracker connects, while the peer is the process that
+    // did: its pid could be reused while the layout is waited for.
+    let mut blocks = if plan.is_huge_page_fill_enabled {
+        Some(Blocks {
+            zeroes: Backing::zeroes()?,
+            collapse: Collapse::of(&stream),
+        })
+    } else {
+        None
+    };
 
     let (regions, uffd) = receive_layout(&stream)?;
     if regions.is_empty() {
@@ -780,15 +809,6 @@ fn serve(
         layers = layers.len(),
         "serving guest memory lazily"
     );
-
-    let mut blocks = if plan.is_huge_page_fill_enabled {
-        Some(Blocks {
-            zeroes: Backing::zeroes()?,
-            collapse: Collapse::of(&stream),
-        })
-    } else {
-        None
-    };
 
     // Before the guest is unpaused, not while it runs: a page filled here is
     // a fault the guest never takes.
@@ -1519,6 +1539,19 @@ mod tests {
             });
             assert!(served.lock().unwrap().contains(15));
         }
+    }
+
+    #[test]
+    fn the_peers_pidfd_names_the_process_that_connected() {
+        let (ours, _theirs) = UnixStream::pair().unwrap();
+        let pidfd = Collapse::of(&ours).pidfd.unwrap();
+        let info =
+            std::fs::read_to_string(format!("/proc/self/fdinfo/{}", pidfd.as_raw_fd())).unwrap();
+        assert!(
+            info.lines()
+                .any(|line| line == format!("Pid:\t{}", std::process::id())),
+            "{info}"
+        );
     }
 
     /// A neighbour that fails to arrive costs the block its huge page, not
