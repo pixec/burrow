@@ -21,6 +21,9 @@ use crate::guestconn;
 use crate::rootdisk::IMAGE as TEMPLATE_ROOTFS;
 use burrow_proto::api::v1::{LimitsOutcome, ResourceChange, ResourceOutcome};
 
+mod recreate;
+pub use recreate::Replacement;
+
 /// Conventional filenames inside a template directory.
 const TEMPLATE_KERNEL: &str = "vmlinux";
 
@@ -94,6 +97,27 @@ async fn flush_guest(sandbox: &RunningSandbox) {
         guestconn::run_to_completion(sandbox, start),
     )
     .await;
+}
+
+/// Freezes a Linux guest's root filesystem through its agent and leaves it
+/// frozen, for a VM about to be killed. False where it could not be.
+async fn freeze_root(sandbox: &RunningSandbox) -> bool {
+    use burrow_proto::guest::v1::{RootDiskRequest, root_disk_request::Op};
+    if sandbox.guest_os() != burrow_vmm::GuestOs::Linux {
+        return false;
+    }
+    let Ok(mut agent) = sandbox.agent().await else {
+        return false;
+    };
+    let request = RootDiskRequest {
+        op: Op::Freeze as i32,
+        paths: vec!["/".to_string()],
+        ..Default::default()
+    };
+    matches!(
+        tokio::time::timeout(std::time::Duration::from_secs(10), agent.root_disk(request)).await,
+        Ok(Ok(_))
+    )
 }
 
 /// Runs `capture` with the guest's filesystems at `paths` frozen through its
@@ -349,11 +373,16 @@ impl NodeConfig {
     /// Removes a VM's working directory, and under the jail the directory
     /// the chroot sits in.
     pub(crate) async fn remove_workdir(&self, workdir: &Path) -> std::io::Result<()> {
-        let tree = match &self.jail {
+        tokio::fs::remove_dir_all(self.tree_of(workdir)).await
+    }
+
+    /// The directory holding everything of a VM's whose working directory
+    /// is `workdir`: under the jail the one its chroot sits in.
+    fn tree_of<'a>(&self, workdir: &'a Path) -> &'a Path {
+        match &self.jail {
             Some(jail) => jail.tree_of(workdir),
             None => workdir,
-        };
-        tokio::fs::remove_dir_all(tree).await
+        }
     }
 
     /// The directory whose filesystem holds sandboxes' disks, which is the
@@ -698,6 +727,16 @@ impl Drop for CpuAdmitted {
     fn drop(&mut self) {
         *self.admitted.lock().unwrap() -= self.millis;
     }
+}
+
+/// The CPU a sandbox of `resources` is charged, in thousandths of a CPU.
+fn charge_of(resources: &common::ResourcePolicy) -> u64 {
+    use burrow_common::cpu;
+    cpu::charge_millis(
+        resources.vcpus,
+        cpu::cap_millis(resources.cpus),
+        cpu::cap_millis(resources.reserved_cpus),
+    )
 }
 
 /// Refuses `more` CPU on a node of `cores` that has `committed`, all in
@@ -3749,7 +3788,7 @@ impl SandboxManager {
     /// disk is dropped, and its `destroyed` event says so.
     pub async fn recover(&self) {
         let rows = match self.store.list_sandboxes().await {
-            Ok(rows) => rows,
+            Ok(rows) => self.undo_recreations(rows).await,
             Err(err) => {
                 tracing::error!(%err, "cannot read sandbox store; starting empty");
                 return;
@@ -7079,12 +7118,12 @@ impl SandboxManager {
         &self,
         resources: &common::ResourcePolicy,
     ) -> Result<CpuAdmitted, Status> {
-        use burrow_common::cpu;
-        let charge = cpu::charge_millis(
-            resources.vcpus,
-            cpu::cap_millis(resources.cpus),
-            cpu::cap_millis(resources.reserved_cpus),
-        );
+        self.hold_cpu(charge_of(resources)).await
+    }
+
+    /// Admits `charge` more CPU to the node, held until the returned charge
+    /// is dropped.
+    async fn hold_cpu(&self, charge: u64) -> Result<CpuAdmitted, Status> {
         let _admitting = self.cpu_admission.lock().await;
         let registered: u64 = self
             .sandboxes
@@ -9280,6 +9319,18 @@ impl SandboxManager {
     /// reason says its memory was discarded.
     pub async fn stop(&self, id: &str) -> Result<common::Sandbox, Status> {
         let sandbox = self.get(id).await?;
+        self.halt(&sandbox, false).await
+    }
+
+    /// Stops a sandbox's VM with its disk as the guest last wrote it. One
+    /// about to be replaced has its root filesystem frozen first, so a
+    /// guest still writing leaves it whole rather than mid-write.
+    async fn halt(
+        &self,
+        sandbox: &Arc<RunningSandbox>,
+        is_replaced: bool,
+    ) -> Result<common::Sandbox, Status> {
+        let id = sandbox.id();
         let discarded = match sandbox.is_suspended() {
             true => self.resume(id).await.err(),
             false => None,
@@ -9294,20 +9345,22 @@ impl SandboxManager {
         // The VMM is killed, not powered off, so the guest's page cache
         // would otherwise die with it and the disk a boot comes back to
         // would miss what was last written.
-        flush_guest(&sandbox).await;
+        if !is_replaced || !freeze_root(sandbox).await {
+            flush_guest(sandbox).await;
+        }
         sandbox.shutdown().await?;
         if let Some(err) = discarded {
             sandbox.base_record.lock().unwrap().state_reason =
                 format!("{REASON_MEMORY_DISCARDED}: {}", err.message());
         }
-        self.resync_public(&sandbox).await;
+        self.resync_public(sandbox).await;
         // Its memory is gone, so what the store holds is a guest that no
         // longer exists.
-        self.forget_stored(&sandbox).await;
+        self.forget_stored(sandbox).await;
         self.volumes.release_all(id);
-        self.sample_last(&sandbox).await;
-        self.persist(&sandbox).await;
-        self.close_session(&sandbox, ENDED_STOPPED).await;
+        self.sample_last(sandbox).await;
+        self.persist(sandbox).await;
+        self.close_session(sandbox, ENDED_STOPPED).await;
         tracing::info!(sandbox = id, "sandbox stopped");
         Ok(sandbox.record())
     }
@@ -11989,7 +12042,7 @@ pub(crate) mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    async fn recovering(name: &str) -> (SandboxManager, PathBuf) {
+    pub(super) async fn recovering(name: &str) -> (SandboxManager, PathBuf) {
         let data_dir =
             std::env::temp_dir().join(format!("burrow-recovery-{name}-{}", std::process::id()));
         tokio::fs::remove_dir_all(&data_dir).await.ok();
@@ -11998,7 +12051,11 @@ pub(crate) mod tests {
         (manager, data_dir)
     }
 
-    fn row(id: &str, state: common::SandboxState, lease_block: u32) -> burrow_store::SandboxRow {
+    pub(super) fn row(
+        id: &str,
+        state: common::SandboxState,
+        lease_block: u32,
+    ) -> burrow_store::SandboxRow {
         let record = common::Sandbox {
             id: id.into(),
             template: "default".into(),
@@ -12590,7 +12647,7 @@ pub(crate) mod tests {
 
     /// A registered, running sandbox, for tests about what happens after one
     /// exists rather than about how it was built.
-    fn running(id: &str) -> Arc<RunningSandbox> {
+    pub(super) fn running(id: &str) -> Arc<RunningSandbox> {
         let lease = Ipam::for_node(AddressPool::default(), 0)
             .unwrap()
             .allocate(id)
@@ -12842,7 +12899,7 @@ pub(crate) mod tests {
 
     /// A registered sandbox running under [`fake_firecracker`], whose
     /// snapshots take `snapshot_ms`.
-    async fn under_fake_vmm(
+    pub(super) async fn under_fake_vmm(
         manager: &SandboxManager,
         snapshot_ms: u64,
     ) -> (Arc<RunningSandbox>, PathBuf) {

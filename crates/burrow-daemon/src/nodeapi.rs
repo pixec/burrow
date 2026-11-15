@@ -355,47 +355,23 @@ impl NodeApi {
         crate::oci::image_environment(&self.data_dir, template).await
     }
 
-    /// Creates a sandbox from a Kit template and walks its lifecycle.
-    ///
-    /// For a recreation the previous instance is deleted here, after the
-    /// composition has been planned against its retained storage and before
-    /// the replacement takes its id.
     /// Boots a stopped sandbox, and runs a Kit's startup again on it.
     async fn start(&self, id: &str, is_kernel_kept: bool) -> Result<common::Sandbox, Status> {
         let starting = id.to_string();
-        let sandbox = self
-            .sandboxes
+        self.sandboxes
             .detached(
                 move |sandboxes| async move { sandboxes.start(&starting, is_kernel_kept).await },
             )
             .await?;
-        if let Some(kit) = &sandbox.kit {
-            // A boot is a boot: files land again and startup hooks run again,
-            // under the runtime policy the record already carries.
-            let running = self.sandboxes.get(id).await?;
-            let Some(template) = self.sandboxes.environment_of(&running).await.kit else {
-                return Err(Status::failed_precondition(format!(
-                    "template {} is no longer a kit template",
-                    sandbox.template
-                )));
-            };
-            let plan = crate::kit::plan(
-                &template,
-                kit,
-                &sandbox.kit_credentials,
-                &running.policy().resources.unwrap_or_default(),
-            )?;
-            crate::kit::provision(&self.sandboxes, &running, &plan, crate::kit::Boot::Restart)
-                .await?;
-        }
+        crate::kit::restart(&self.sandboxes, id).await?;
         Ok(redact_secrets(self.sandboxes.get(id).await?.record()))
     }
 
+    /// Creates a sandbox from a Kit template and walks its lifecycle.
     async fn create_kit(
         &self,
         request: KitCreate,
         recorded: &crate::kit::KitTemplate,
-        boot: crate::kit::Boot,
     ) -> Result<common::Sandbox, Status> {
         let KitCreate {
             id,
@@ -414,13 +390,6 @@ impl NodeApi {
             &policy.resources.unwrap_or_default(),
         )?;
         let mounts = crate::kit::prepare_volumes(&self.sandboxes, &id, &plan).await?;
-        let fresh = boot == crate::kit::Boot::Create;
-        if !fresh {
-            let deleting = id.clone();
-            self.sandboxes
-                .detached(move |sandboxes| async move { sandboxes.delete(&deleting).await })
-                .await?;
-        }
         policy.resources = Some(plan.resources.clone());
         policy.network = Some(plan.install_network.clone());
         policy.volumes.extend(mounts);
@@ -444,7 +413,8 @@ impl NodeApi {
                     .set_kit(&id, kit, env, credentials, plan.selection.clone())
                     .await?;
                 let running = self.sandboxes.get(&id).await?;
-                crate::kit::provision(&self.sandboxes, &running, &plan, boot).await
+                crate::kit::provision(&self.sandboxes, &running, &plan, crate::kit::Boot::Create)
+                    .await
             }
             .await;
             if provisioned.is_err() {
@@ -454,16 +424,14 @@ impl NodeApi {
         }
         .await;
         if let Err(err) = outcome {
-            if fresh {
-                crate::kit::remove_volumes(&self.sandboxes, &id).await;
-            }
+            crate::kit::remove_volumes(&self.sandboxes, &id).await;
             return Err(err);
         }
         Ok(self.sandboxes.get(&id).await?.record())
     }
 }
 
-/// What a Kit sandbox is created from, by a create or a recreation.
+/// What a Kit sandbox is created from.
 struct KitCreate {
     id: String,
     template: String,
@@ -562,9 +530,7 @@ impl NodeService for NodeApi {
                 name: req.name,
                 request_id: req.request_id,
             };
-            let sandbox = self
-                .create_kit(request, &recorded, crate::kit::Boot::Create)
-                .await?;
+            let sandbox = self.create_kit(request, &recorded).await?;
             return Ok(Response::new(redact_secrets(sandbox)));
         }
         // A create from a snapshot restores rather than boots, and takes its
@@ -864,17 +830,18 @@ impl NodeService for NodeApi {
 
     /// Replaces a sandbox's root disk under the same id.
     ///
-    /// Judged before anything is destroyed: the replacement composition is
-    /// planned and its storage compared against what is retained, so a
-    /// refusal leaves the previous sandbox running. Only then is the old
-    /// instance deleted, volumes kept, and a new one created in its place.
+    /// Judged before anything is touched: the replacement composition is
+    /// planned and its storage compared against what is retained, and the
+    /// new disk is made beside the old one, so a refusal leaves the previous
+    /// sandbox as it was; see [`crate::sandbox::SandboxManager::recreate`].
     async fn recreate_sandbox(
         &self,
         req: Request<nodepb::NodeRecreateRequest>,
     ) -> Result<Response<common::Sandbox>, Status> {
         self.sandboxes.admit()?;
         let req = req.into_inner();
-        let mut previous = self.sandboxes.get(&req.sandbox_id).await?.record();
+        let id = req.sandbox_id;
+        let mut previous = self.sandboxes.get(&id).await?.record();
         let mut policy = previous.policy.take().unwrap_or_default();
         let template = if req.template.is_empty() {
             std::mem::take(&mut previous.template)
@@ -883,22 +850,14 @@ impl NodeService for NodeApi {
         };
         crate::template::validate_name(&template)?;
         let Some(recorded) = self.image_environment(&template).await.kit else {
-            // Nothing a Kit asked for: the same template on a fresh disk.
-            let deleting = req.sandbox_id.clone();
-            self.sandboxes
-                .detached(move |sandboxes| async move { sandboxes.delete(&deleting).await })
-                .await?;
+            let replacement = crate::sandbox::Replacement { template, policy };
             let sandbox = self
                 .sandboxes
-                .create(
-                    req.sandbox_id,
-                    template,
-                    policy,
-                    previous.tags,
-                    self.node_id(),
-                    previous.name,
-                    previous.create_request_id,
-                )
+                .detached(move |sandboxes| async move {
+                    sandboxes
+                        .recreate(&id, replacement, |_| async { Ok(()) })
+                        .await
+                })
                 .await?;
             return Ok(Response::new(redact_secrets(sandbox)));
         };
@@ -915,18 +874,33 @@ impl NodeService for NodeApi {
         policy
             .volumes
             .retain(|m| !m.is_tmpfs && !m.volume.starts_with("kit-"));
-        let request = KitCreate {
-            id: req.sandbox_id,
-            template,
-            kit,
-            credentials,
-            policy,
-            tags: previous.tags,
-            name: previous.name,
-            request_id: previous.create_request_id,
-        };
+        let plan = crate::kit::plan(
+            &recorded,
+            &kit,
+            &credentials,
+            &policy.resources.unwrap_or_default(),
+        )?;
+        let mounts = crate::kit::prepare_volumes(&self.sandboxes, &id, &plan).await?;
+        policy.resources = Some(plan.resources.clone());
+        policy.network = Some(plan.install_network.clone());
+        policy.volumes.extend(mounts);
+        validate_policy(&policy)?;
+        let replacement = crate::sandbox::Replacement { template, policy };
         let sandbox = self
-            .create_kit(request, &recorded, crate::kit::Boot::Restart)
+            .sandboxes
+            .detached(move |sandboxes| async move {
+                let manager = sandboxes.clone();
+                sandboxes
+                    .recreate(&id, replacement, move |running| async move {
+                        let env = plan.env.clone().into_iter().collect();
+                        manager
+                            .set_kit(running.id(), kit, env, credentials, plan.selection.clone())
+                            .await?;
+                        crate::kit::provision(&manager, &running, &plan, crate::kit::Boot::Restart)
+                            .await
+                    })
+                    .await
+            })
             .await?;
         Ok(Response::new(redact_secrets(sandbox)))
     }

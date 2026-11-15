@@ -602,6 +602,30 @@ pub enum Boot {
     Restart,
 }
 
+/// A boot is a boot: a Kit sandbox's files land again and its startup hooks
+/// run again, under the runtime policy the record already carries. Nothing
+/// for a sandbox without a Kit.
+pub async fn restart(manager: &SandboxManager, id: &str) -> Result<(), Status> {
+    let running = manager.get(id).await?;
+    let sandbox = running.record();
+    let Some(kit) = &sandbox.kit else {
+        return Ok(());
+    };
+    let Some(template) = manager.environment_of(&running).await.kit else {
+        return Err(Status::failed_precondition(format!(
+            "template {} is no longer a kit template",
+            sandbox.template
+        )));
+    };
+    let plan = plan(
+        &template,
+        kit,
+        &sandbox.kit_credentials,
+        &running.policy().resources.unwrap_or_default(),
+    )?;
+    provision(manager, &running, &plan, Boot::Restart).await
+}
+
 /// Walks the lifecycle inside a running sandbox.
 pub async fn provision(
     manager: &SandboxManager,

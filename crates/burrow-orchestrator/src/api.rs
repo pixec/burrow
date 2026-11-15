@@ -2274,17 +2274,16 @@ impl Burrow for ApiService {
             .get(&id)
             .ok_or_else(|| Status::not_found(format!("no sandbox {id}")))?;
         let node_id = current.node_id.clone();
-        // A replacement template has to be where the sandbox is: its disks
-        // and volumes do not move, so the template comes to them.
-        if !req.template.is_empty() {
-            self.replicate_to(&req.template, &node_id).await?;
-        }
-        let (mut client, _admitted) = self.admitted_node_for(&id).await?;
         let judged = if req.template.is_empty() {
             &current.template
         } else {
             &req.template
         };
+        // The template has to be where the sandbox is, the one it already
+        // runs included, which the node may since have lost: its disks and
+        // volumes do not move, so the template comes to them.
+        self.replicate_to(judged, &node_id).await?;
+        let (mut client, _admitted) = self.admitted_node_for(&id).await?;
         let subject = crate::secrets::Subject {
             id: &id,
             name: &current.name,
