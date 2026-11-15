@@ -625,6 +625,18 @@ pub(crate) fn node_cpus() -> u32 {
     std::thread::available_parallelism().map_or(0, |n| n.get() as u32)
 }
 
+/// CPU charged to a sandbox being created until it is dropped.
+struct CpuAdmitted {
+    admitted: Arc<std::sync::Mutex<u64>>,
+    millis: u64,
+}
+
+impl Drop for CpuAdmitted {
+    fn drop(&mut self) {
+        *self.admitted.lock().unwrap() -= self.millis;
+    }
+}
+
 /// Refuses `more` CPU on a node of `cores` that has `committed`, all in
 /// thousandths of a CPU but the cores.
 #[allow(clippy::result_large_err)]
@@ -2642,6 +2654,9 @@ pub struct SandboxManager {
     /// Disk promised to creates still building, and the lock that makes
     /// measuring and promising one step.
     disk_admissions: Arc<crate::diskcap::Admissions>,
+    /// CPU admitted to sandboxes being created, restored or recovered, until
+    /// they are registered and counted on their own.
+    cpu_admitted: Arc<std::sync::Mutex<u64>>,
     /// Root disks made ahead of creates, where the filesystem cannot clone.
     spares: crate::rootdisk::Spares,
     resizer: Arc<crate::resizer::Resizer>,
@@ -2955,6 +2970,7 @@ impl SandboxManager {
             config,
             sandboxes: Arc::new(Mutex::new(HashMap::new())),
             disk_admissions: Default::default(),
+            cpu_admitted: Default::default(),
             creating: Arc::new(Mutex::new(std::collections::HashSet::new())),
             ipam: Default::default(),
             ports: Arc::new(Mutex::new(HashMap::new())),
@@ -6941,14 +6957,51 @@ impl SandboxManager {
     ///
     /// A suspended sandbox keeps its address, disks and snapshot and can be
     /// resumed at any moment, so counting only running ones would let a node
-    /// accept work it cannot honour when they all come back.
+    /// accept work it cannot honour when they all come back. A sandbox still
+    /// being created counts too, or a heartbeat sampled mid-create would hand
+    /// the orchestrator back the capacity it reserved for it.
     pub async fn committed_cpu_millis(&self) -> u64 {
-        self.sandboxes
+        let registered: u64 = self
+            .sandboxes
             .lock()
             .await
             .values()
             .map(|sandbox| sandbox.cpu_charge_millis())
-            .sum()
+            .sum();
+        registered + *self.cpu_admitted.lock().unwrap()
+    }
+
+    /// Admits a new sandbox of `resources` to the node's CPU, held until the
+    /// returned charge is dropped, once the sandbox is registered.
+    async fn admit_new_cpu(
+        &self,
+        resources: &common::ResourcePolicy,
+    ) -> Result<CpuAdmitted, Status> {
+        use burrow_common::cpu;
+        let charge = cpu::charge_millis(
+            resources.vcpus,
+            cpu::cap_millis(resources.cpus),
+            cpu::cap_millis(resources.reserved_cpus),
+        );
+        let registered: u64 = self
+            .sandboxes
+            .lock()
+            .await
+            .values()
+            .map(|sandbox| sandbox.cpu_charge_millis())
+            .sum();
+        let mut admitted = self.cpu_admitted.lock().unwrap();
+        cpu_fit(
+            node_cpus(),
+            self.config.cpu_overcommit,
+            registered + *admitted,
+            charge,
+        )?;
+        *admitted += charge;
+        Ok(CpuAdmitted {
+            admitted: Arc::clone(&self.cpu_admitted),
+            millis: charge,
+        })
     }
 
     /// What this node has provisioned: every sandbox's disks and every
@@ -7530,6 +7583,7 @@ impl SandboxManager {
         let disk = self
             .admit_disk(&node_id, "create a sandbox", disk_bytes)
             .await?;
+        let _cpu = self.admit_new_cpu(&resources).await?;
         phases.mark("checks");
 
         // A seeded disk has to survive into the guest untouched, and the warm
@@ -8644,6 +8698,7 @@ impl SandboxManager {
                 u64::from(resources.disk_mib) * burrow_common::disk::MIB,
             )
             .await?;
+        let _cpu = self.admit_new_cpu(&resources).await?;
         // A sandbox's own stored state was captured with its volumes attached,
         // and restores with them. Any other was captured without, so they
         // could only arrive by hotplug.
@@ -10443,6 +10498,7 @@ impl SandboxManager {
                 u64::from(resources.disk_mib) * burrow_common::disk::MIB,
             )
             .await?;
+        let _cpu = self.admit_new_cpu(&resources).await?;
         crate::volume::validate_mounts(&policy.volumes)?;
         self.require_volumes(&policy.volumes)?;
         let guest_os = burrow_vmm::GuestOs::from_record(&record.guest_os).unwrap_or_default();
@@ -11310,6 +11366,33 @@ pub(crate) mod tests {
             cpu_fit(4, 4.0, 15_000, 2000).unwrap_err().message(),
             "this node has 4 CPUs overcommitted to 16 and 15 committed; 2 more do not fit"
         );
+    }
+
+    /// Creates still in flight hold their CPU, so a node refuses the one
+    /// that would overfill it before any of them registers, and reports them
+    /// as committed meanwhile.
+    #[tokio::test]
+    async fn creates_in_flight_hold_their_cpu() {
+        let mut manager = manager().await;
+        manager.config.cpu_overcommit = 2.0;
+        let one = common::ResourcePolicy {
+            vcpus: 1,
+            ..Default::default()
+        };
+        let mut held = Vec::new();
+        for _ in 0..node_cpus() * 2 {
+            held.push(manager.admit_new_cpu(&one).await.unwrap());
+        }
+        let refused = manager.admit_new_cpu(&one).await.err().unwrap();
+        assert_eq!(refused.code(), tonic::Code::ResourceExhausted);
+        assert_eq!(
+            manager.committed_cpu_millis().await,
+            u64::from(node_cpus()) * 2000
+        );
+        held.pop();
+        manager.admit_new_cpu(&one).await.unwrap();
+        drop(held);
+        assert_eq!(manager.committed_cpu_millis().await, 0);
     }
 
     /// A sandbox's limits become its cgroup's the way runc makes Docker's:
