@@ -413,6 +413,13 @@ pub async fn handshake_upgrading(
             tracing::warn!(%err, "guest agent busy; upgrading it on its next handshake");
             return kept(agent, response).await;
         }
+        // The agent answers and then re-executes, and a loaded guest can be
+        // replaced before its answer is out. Whether it upgraded is what the
+        // reconnect below finds out.
+        Err(err) if matches!(err.code(), tonic::Code::Unknown | tonic::Code::Unavailable) => {
+            tracing::debug!(%err, "the upgrade's answer was cut off; reconnecting");
+            true
+        }
         Err(err) => return Err(err),
     };
     if !restarting {
