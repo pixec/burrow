@@ -4589,6 +4589,26 @@ mod tests {
     /// A leader that lost its term without noticing yet wrote nodes off on
     /// its own stale view, as did one whose cache had not caught up with a
     /// heartbeat another replica took.
+    /// A replica started on the old pool follows the one another replica
+    /// recorded, so a node registering through it is given the fleet's pool
+    /// and a slice of it.
+    #[tokio::test]
+    async fn a_replica_follows_the_pool_another_replica_recorded() {
+        let store = Arc::new(burrow_store::Store::open_in_memory().await.unwrap());
+        let mut state = Arc::try_unwrap(replica(Default::default()).0).ok().unwrap();
+        state.store = Some(Arc::clone(&store));
+        assert!(
+            store
+                .change_address_pool("100.64.0.0/16", "fd00:b070::/48", 1024)
+                .await
+                .unwrap()
+        );
+        let pool = crate::cluster::reload_pool(&state, &store).await.unwrap();
+        assert_eq!(pool.cidr(), "100.64.0.0/16");
+        assert_eq!(pool.max_nodes(), 15);
+        assert_eq!(state.nodes.pool(), pool);
+    }
+
     #[tokio::test]
     async fn only_the_current_leader_writes_off_a_node_still_silent() {
         let store = Arc::new(burrow_store::Store::open_in_memory().await.unwrap());

@@ -260,11 +260,19 @@ impl NodeRegistry for NodeRegistryService {
         // refused: admitting it on someone else's slice would give two nodes
         // the same guest addresses, which is what the slicing exists to
         // prevent.
+        // The store's pool, not this replica's flags: during a rolling change
+        // another replica may already have moved it.
+        let pool = match &self.0.store {
+            Some(store) => cluster::reload_pool(&self.0, store)
+                .await
+                .map_err(|err| Status::unavailable(format!("reading the address pool: {err}")))?,
+            None => self.0.nodes.pool(),
+        };
         let (node_id, node_index) = match &self.0.store {
             // The slice is chosen by the store, so two replicas registering
             // two nodes at once cannot hand out the same one.
             Some(store) => {
-                let max_nodes = self.0.nodes.pool().max_nodes();
+                let max_nodes = pool.max_nodes();
                 if let Some(claimed) = req.claimed_node_index
                     && claimed >= max_nodes
                 {
@@ -334,7 +342,6 @@ impl NodeRegistry for NodeRegistryService {
                 })?,
         };
         tracing::info!(node_id, node_index, "node registered");
-        let pool = self.0.nodes.pool();
 
         // Adopt whatever the node currently has. Done off the registration
         // path because the node is mid-call to us and is not yet serving this

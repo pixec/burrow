@@ -457,8 +457,8 @@ pub struct NodeRegistry {
     /// fresh status arrives, which already reflects it.
     pending: Mutex<HashMap<String, Reserved>>,
     /// The fleet's sandbox address pool, which each node's index is a slice
-    /// of.
-    pool: burrow_net::ipam::AddressPool,
+    /// of. Followed from the store, where another replica may change it.
+    pool: std::sync::RwLock<burrow_net::ipam::AddressPool>,
 }
 
 /// What placement charges a sandbox whose policy names no disk. The node
@@ -647,13 +647,17 @@ fn disk_note(
 impl NodeRegistry {
     pub fn new(pool: burrow_net::ipam::AddressPool) -> Self {
         Self {
-            pool,
+            pool: std::sync::RwLock::new(pool),
             ..Default::default()
         }
     }
 
     pub fn pool(&self) -> burrow_net::ipam::AddressPool {
-        self.pool
+        *self.pool.read().unwrap()
+    }
+
+    pub fn set_pool(&self, pool: burrow_net::ipam::AddressPool) {
+        *self.pool.write().unwrap() = pool;
     }
 
     /// Registers a node, returning its id and address-pool index.
@@ -671,11 +675,11 @@ impl NodeRegistry {
         // already has sandboxes addressed from it, and handing it a different
         // slice would leave those addresses pointing into another node's range.
         if let Some(claimed) = claimed_index
-            && claimed >= self.pool.max_nodes()
+            && claimed >= self.pool().max_nodes()
         {
             return Err(RegisterError::ClaimOutOfRange {
                 index: claimed,
-                max: self.pool.max_nodes(),
+                max: self.pool().max_nodes(),
             });
         }
         let node_id = if info.id.is_empty() {
@@ -701,9 +705,9 @@ impl NodeRegistry {
             // nodes handing out the same guest addresses makes cross-node
             // routing ambiguous and lets one node's sandbox answer for
             // another's.
-            (None, _) => (0..self.pool.max_nodes())
+            (None, _) => (0..self.pool().max_nodes())
                 .find(|candidate| !taken.contains(candidate))
-                .ok_or(RegisterError::NoAddressSlice(self.pool.max_nodes()))?,
+                .ok_or(RegisterError::NoAddressSlice(self.pool().max_nodes()))?,
         };
         if let Some(claimed) = claimed_index
             && claimed != index
@@ -830,6 +834,7 @@ impl NodeRegistry {
     /// A node with no key is omitted rather than listed unreachable: it cannot
     /// participate, and a peer entry without a key would be meaningless.
     pub fn mesh_peers(&self, exclude: &str) -> Vec<burrow_proto::node::v1::MeshPeer> {
+        let pool = self.pool();
         let nodes = self.nodes.lock().unwrap();
         nodes
             .values()
@@ -840,7 +845,7 @@ impl NodeRegistry {
                 node_id: e.info.id.clone(),
                 public_key: e.wireguard_public_key.clone(),
                 endpoint: e.wireguard_endpoint.clone(),
-                subnet: self.pool.node_subnet(e.index),
+                subnet: pool.node_subnet(e.index),
             })
             .collect()
     }

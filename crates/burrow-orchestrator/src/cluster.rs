@@ -43,6 +43,7 @@ async fn sync_once(
     store: &burrow_store::Store,
     inventoried: &mut HashMap<String, Instant>,
 ) -> burrow_store::Result<()> {
+    reload_pool(state, store).await?;
     reload_nodes(state, store).await?;
     state.sandboxes.reload_since(Instant::now()).await?;
 
@@ -60,6 +61,25 @@ async fn sync_once(
         tokio::spawn(async move { crate::refresh_inventory(&state, &node_id).await });
     }
     Ok(())
+}
+
+/// Follows the fleet's sandbox address pool from the store, which a replica
+/// started with other flags may have changed, and returns it.
+pub async fn reload_pool(
+    state: &OrchestratorState,
+    store: &burrow_store::Store,
+) -> burrow_store::Result<burrow_net::ipam::AddressPool> {
+    let (v4, v6, blocks) = store.address_pool().await?;
+    match burrow_net::ipam::AddressPool::new(&v4, &v6, blocks) {
+        Ok(pool) => {
+            if pool != state.nodes.pool() {
+                tracing::warn!(%pool, "following the fleet's sandbox address pool from the store");
+                state.nodes.set_pool(pool);
+            }
+        }
+        Err(err) => tracing::error!(%err, "the stored sandbox address pool does not parse"),
+    }
+    Ok(state.nodes.pool())
 }
 
 /// Replaces the node cache with the store's view of the fleet.
