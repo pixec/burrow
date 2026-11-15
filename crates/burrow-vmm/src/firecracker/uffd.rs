@@ -25,6 +25,16 @@
 //!
 //! The handler runs on a dedicated OS thread, not the tokio runtime: a fault is
 //! a stalled vCPU, so it must never queue behind unrelated async work.
+//!
+//! With huge pages on, a fault is answered with the whole 2 MiB block around
+//! it, which is then collapsed into a huge page in Firecracker's address
+//! space. The kernel never allocates a huge page for a range registered with
+//! a userfaultfd, so served a page at a time a restored guest ran on 4 KiB
+//! mappings for good: every first touch was a fault, a round trip through
+//! this thread and, nested, an exit to the outer hypervisor, and touching
+//! 1 GiB took 16 s against 0.3 s on Cloud Hypervisor. A block costs 2 MiB of
+//! memory where one page was asked for, which is what a huge page costs
+//! anyway, and a node that would rather have the density turns it off.
 
 use std::io;
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
@@ -44,6 +54,9 @@ pub const UFFD_SOCK: &str = "uffd.sock";
 /// How long to wait for Firecracker to connect after `load_snapshot` is issued.
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(30);
 
+/// What a fault is answered with when huge pages are on: one huge page.
+const BLOCK: u64 = 2 << 20;
+
 /// One guest memory region, as Firecracker describes it.
 ///
 /// Field names are Firecracker's wire format, not ours; they must match its
@@ -61,15 +74,34 @@ struct RegionMapping {
 
 impl RegionMapping {
     fn is_in_region(&self, addr: u64) -> bool {
-        addr >= self.base_host_virt_addr && addr < self.base_host_virt_addr + self.size as u64
+        addr >= self.base_host_virt_addr && addr < self.end()
+    }
+
+    fn end(&self) -> u64 {
+        self.base_host_virt_addr + self.size as u64
+    }
+
+    /// Where `addr` lies in the memory file.
+    fn offset_of(&self, addr: u64) -> u64 {
+        self.offset + (addr - self.base_host_virt_addr)
+    }
+
+    /// The block around `addr`, cut to this region.
+    fn block_of(&self, addr: u64) -> (u64, u64) {
+        let start = addr & !(BLOCK - 1);
+        (
+            start.max(self.base_host_virt_addr),
+            (start + BLOCK).min(self.end()),
+        )
     }
 }
 //
 // Bound by hand rather than through a crate. Firecracker creates the fd,
 // performs the API handshake, and registers the regions, so the handler only
 // ever needs to resolve a fault: `COPY` for a page that has contents in the
-// memory file, `ZEROPAGE` for one the balloon removed. Two ioctls and two
-// structs is less surface than a bindgen dependency in a cross-compiled build.
+// memory file, `ZEROPAGE` for one the balloon removed, `WAKE` once a block
+// is in place. Three ioctls and three structs is less surface than a bindgen
+// dependency in a cross-compiled build.
 
 const UFFDIO: u32 = 0xAA;
 const IOC_READ_WRITE: u32 = 3;
@@ -78,8 +110,12 @@ const fn iowr(nr: u32, size: u32) -> u32 {
     (IOC_READ_WRITE << 30) | (size << 16) | (UFFDIO << 8) | nr
 }
 
+const UFFDIO_WAKE: u32 =
+    (2 << 30) | ((std::mem::size_of::<UffdioRange>() as u32) << 16) | (UFFDIO << 8) | 0x02;
 const UFFDIO_COPY: u32 = iowr(0x03, std::mem::size_of::<UffdioCopy>() as u32);
 const UFFDIO_ZEROPAGE: u32 = iowr(0x04, std::mem::size_of::<UffdioZeropage>() as u32);
+const UFFDIO_COPY_MODE_DONTWAKE: u64 = 1;
+const MADV_COLLAPSE: libc::c_int = 25;
 
 #[repr(C)]
 #[derive(Default)]
@@ -164,6 +200,32 @@ struct Backing {
 unsafe impl Send for Backing {}
 
 impl Backing {
+    /// A read-only anonymous block, which reads as zeroes without using any
+    /// memory: the source of every page no layer defines, when it is to
+    /// become part of a huge page. A page mapped from the zero page would
+    /// keep its block from collapsing, and cost a write a second fault.
+    fn zeroes() -> io::Result<Self> {
+        let len = BLOCK as usize;
+        // SAFETY: an anonymous mapping takes no descriptor.
+        let addr = unsafe {
+            libc::mmap(
+                std::ptr::null_mut(),
+                len,
+                libc::PROT_READ,
+                libc::MAP_PRIVATE | libc::MAP_ANONYMOUS,
+                -1,
+                0,
+            )
+        };
+        if addr == libc::MAP_FAILED {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(Self {
+            addr: addr.cast(),
+            len,
+        })
+    }
+
     fn map(path: &Path) -> io::Result<Self> {
         let file = std::fs::File::open(path)?;
         let len = file.metadata()?.len() as usize;
@@ -310,6 +372,133 @@ fn mark(served: &Served, offset: u64, len: u64) {
     served.lock().unwrap().insert_bytes(offset, offset + len);
 }
 
+/// Collapses filled blocks into huge pages in Firecracker's address space.
+///
+/// `MADV_COLLAPSE` only succeeds on a block whose every page is present, which
+/// is why a fault fills the whole block first. A kernel or a VMM that refuses
+/// it leaves the blocks on small pages: slower, never wrong.
+struct Collapse {
+    pidfd: Option<OwnedFd>,
+    /// Once a block has collapsed, `EINVAL` is that block's trouble rather
+    /// than a kernel without `MADV_COLLAPSE`.
+    has_collapsed: bool,
+}
+
+impl Collapse {
+    fn of(stream: &UnixStream) -> Self {
+        use nix::sys::socket::{getsockopt, sockopt::PeerCredentials};
+        let pidfd = getsockopt(stream, PeerCredentials).ok().and_then(|cred| {
+            // SAFETY: pidfd_open takes a pid and flags.
+            let fd = unsafe { libc::syscall(libc::SYS_pidfd_open, cred.pid(), 0) };
+            // SAFETY: the descriptor was just created and is named nowhere else.
+            (fd >= 0).then(|| unsafe { OwnedFd::from_raw_fd(fd as RawFd) })
+        });
+        Self {
+            pidfd,
+            has_collapsed: false,
+        }
+    }
+
+    fn run(&mut self, start: u64, end: u64) {
+        let Some(pidfd) = &self.pidfd else { return };
+        let iov = libc::iovec {
+            iov_base: start as *mut libc::c_void,
+            iov_len: (end - start) as usize,
+        };
+        // SAFETY: `iov` is one valid entry; the range it names is in the
+        // target's address space and only read by the kernel.
+        let done = unsafe {
+            libc::syscall(
+                libc::SYS_process_madvise,
+                pidfd.as_raw_fd(),
+                &raw const iov,
+                1,
+                MADV_COLLAPSE,
+                0,
+            )
+        };
+        if done >= 0 {
+            self.has_collapsed = true;
+            return;
+        }
+        let err = io::Error::last_os_error();
+        // Out of huge pages for now is worth trying again next block; a
+        // kernel that cannot do it at all is not.
+        let is_unsupported = match err.raw_os_error() {
+            Some(libc::ENOSYS | libc::EPERM) => true,
+            Some(libc::EINVAL) => !self.has_collapsed,
+            _ => false,
+        };
+        if is_unsupported {
+            tracing::debug!(%err, "cannot collapse guest memory into huge pages");
+            self.pidfd = None;
+        }
+    }
+}
+
+/// Answers faults a block at a time, collapsing each into a huge page.
+struct Blocks {
+    zeroes: Backing,
+    collapse: Collapse,
+}
+
+impl Blocks {
+    /// Fills every page of the block around `page` not served yet, and `page`
+    /// itself whatever the record says, then wakes the block once it is whole.
+    fn serve(
+        &mut self,
+        fd: RawFd,
+        region: &RegionMapping,
+        page: u64,
+        layers: &[Layer],
+        served: &Served,
+    ) -> io::Result<()> {
+        let size = region.page_size as u64;
+        let (start, end) = region.block_of(page);
+        let runs = {
+            let served = served.lock().unwrap();
+            let is_missing =
+                |at: u64| at == page || !served.contains(region.offset_of(at) / memfile::PAGE);
+            let mut runs = Vec::new();
+            let mut at = start;
+            while at < end {
+                if !is_missing(at) {
+                    at += size;
+                    continue;
+                }
+                let layer = memfile::resolve(layers, region.offset_of(at));
+                let mut run_end = at + size;
+                while run_end < end
+                    && is_missing(run_end)
+                    && memfile::resolve(layers, region.offset_of(run_end)) == layer
+                {
+                    run_end += size;
+                }
+                runs.push((at, run_end, layer));
+                at = run_end;
+            }
+            runs
+        };
+        for (at, run_end, layer) in runs {
+            fill(
+                fd,
+                region,
+                at,
+                run_end - at,
+                layer,
+                layers,
+                Some(&self.zeroes),
+                served,
+                UFFDIO_COPY_MODE_DONTWAKE,
+            )?;
+        }
+        if end - start == BLOCK {
+            self.collapse.run(start, end);
+        }
+        wake(fd, start, end)
+    }
+}
+
 /// How guest memory should be served for one restored VM.
 #[derive(Default, Clone)]
 pub struct MemoryPlan {
@@ -325,6 +514,9 @@ pub struct MemoryPlan {
     pub record_to: Option<PathBuf>,
     /// Where the oldest layer is still being filled in from.
     pub base_source: Option<Arc<dyn super::PageSource>>,
+    /// Answer a fault with its whole block and collapse it into a huge page,
+    /// rather than with the one page asked for.
+    pub is_huge_page_fill_enabled: bool,
 }
 
 impl std::fmt::Debug for MemoryPlan {
@@ -333,6 +525,7 @@ impl std::fmt::Debug for MemoryPlan {
             .field("chain", &self.chain)
             .field("prefetch", &self.prefetch)
             .field("is_base_arriving", &self.base_source.is_some())
+            .field("is_huge_page_fill_enabled", &self.is_huge_page_fill_enabled)
             .finish()
     }
 }
@@ -373,6 +566,7 @@ fn prefetch(
     fd: RawFd,
     regions: &[RegionMapping],
     layers: &[Layer],
+    zeroes: Option<&Backing>,
     served: &Served,
     offsets: &[u64],
 ) -> usize {
@@ -414,7 +608,7 @@ fn prefetch(
         let start = region.base_host_virt_addr + (offset - region.offset);
         let len = (end - at) as u64 * page_size;
         // A missing page is simply skipped, and with it the rest of its run.
-        if fill(fd, region, start, len, layer, layers, served).is_ok() {
+        if fill(fd, region, start, len, layer, layers, zeroes, served, 0).is_ok() {
             filled += end - at;
         }
         at = end;
@@ -564,13 +758,29 @@ fn serve(
         "serving guest memory lazily"
     );
 
+    let mut blocks = if plan.is_huge_page_fill_enabled {
+        Some(Blocks {
+            zeroes: Backing::zeroes()?,
+            collapse: Collapse::of(&stream),
+        })
+    } else {
+        None
+    };
+
     // Before the guest is unpaused, not while it runs: a page filled here is
     // a fault the guest never takes.
     if let Some(path) = &plan.prefetch {
         let offsets = read_plan(path);
         if !offsets.is_empty() {
             let started = Instant::now();
-            let filled = prefetch(uffd.as_raw_fd(), &regions, &layers, served, &offsets);
+            let filled = prefetch(
+                uffd.as_raw_fd(),
+                &regions,
+                &layers,
+                blocks.as_ref().map(|blocks| &blocks.zeroes),
+                served,
+                &offsets,
+            );
             tracing::debug!(
                 pages = filled,
                 of = offsets.len(),
@@ -580,7 +790,7 @@ fn serve(
         }
     }
 
-    let faulted = handle_faults(&uffd, &regions, &layers, served, stop)?;
+    let faulted = handle_faults(&uffd, &regions, &layers, served, stop, blocks.as_mut())?;
 
     if let Some(path) = &plan.record_to {
         let mut offsets: Vec<u64> = faulted.into_iter().collect();
@@ -678,6 +888,7 @@ fn handle_faults(
     layers: &[Layer],
     served: &Served,
     stop: &Stop,
+    mut blocks: Option<&mut Blocks>,
 ) -> io::Result<std::collections::BTreeSet<u64>> {
     let fd = uffd.as_raw_fd();
     let mut buf = [0u8; UFFD_MSG_SIZE];
@@ -719,8 +930,13 @@ fn handle_faults(
                 let page = address & !(region.page_size as u64 - 1);
                 // Recorded by file offset, because the address a region lands
                 // at is a property of this restore, not of the snapshot.
-                faulted.insert(region.offset + (page - region.base_host_virt_addr));
-                copy_page(fd, region, page, layers, served)?;
+                faulted.insert(region.offset_of(page));
+                match blocks.as_deref_mut() {
+                    Some(blocks) if region.page_size as u64 == memfile::PAGE => {
+                        blocks.serve(fd, region, page, layers, served)?
+                    }
+                    _ => copy_page(fd, region, page, layers, served)?,
+                }
             }
             Event::Remove { start, end } => {
                 if let Some(region) = regions.iter().find(|r| r.is_in_region(start)) {
@@ -757,12 +973,16 @@ fn copy_page(
         region.page_size as u64,
         layer,
         layers,
+        None,
         served,
+        0,
     )
 }
 
 /// Populates `len` bytes of `region` from `start`, from the layer at index
-/// `layer`, or with zeroes when no layer defines them.
+/// `layer`, or with zeroes when no layer defines them: copied from `zeroes`
+/// when given, else mapped from the zero page.
+#[allow(clippy::too_many_arguments)]
 fn fill(
     fd: RawFd,
     region: &RegionMapping,
@@ -770,30 +990,41 @@ fn fill(
     len: u64,
     layer: Option<usize>,
     layers: &[Layer],
+    zeroes: Option<&Backing>,
     served: &Served,
+    mode: u64,
 ) -> io::Result<()> {
-    let offset = region.offset + (start - region.base_host_virt_addr);
+    let offset = region.offset_of(start);
     // Before the pages can be present, so no snapshot finds one present and
     // unrecorded.
     mark(served, offset, len);
-    let Some(layer) = layer.map(|index| &layers[index]) else {
-        return zero_range(fd, start, start + len);
+    // Zeroes are copied from one block of them, a block at a time.
+    let (src, stride) = match layer.map(|index| &layers[index]) {
+        Some(layer) => {
+            if let Some(source) = &layer.source {
+                source.ensure(offset, len)?;
+            }
+            (layer.backing.addr as u64 + offset, len)
+        }
+        None => match zeroes {
+            Some(zeroes) => (zeroes.addr as u64, zeroes.len as u64),
+            None => return zero_range(fd, start, start + len),
+        },
     };
-    if let Some(source) = &layer.source {
-        source.ensure(offset, len)?;
-    }
     let mut done = 0;
     while done < len {
+        let skew = done % stride;
         let mut arg = UffdioCopy {
             dst: start + done,
-            src: layer.backing.addr as u64 + offset + done,
-            len: len - done,
-            mode: 0,
+            src: src + skew,
+            len: (len - done).min(stride - skew),
+            mode,
             copy: 0,
         };
         // SAFETY: `fd` is the userfaultfd and `arg` matches `struct uffdio_copy`.
         if unsafe { libc::ioctl(fd, UFFDIO_COPY as _, &mut arg) } == 0 {
-            return Ok(());
+            done += arg.len;
+            continue;
         }
         let err = io::Error::last_os_error();
         match err.raw_os_error() {
@@ -814,6 +1045,19 @@ fn fill(
                 return Err(err);
             }
         }
+    }
+    Ok(())
+}
+
+/// Lets every vCPU stalled in `[start, end)` carry on.
+fn wake(fd: RawFd, start: u64, end: u64) -> io::Result<()> {
+    let mut arg = UffdioRange {
+        start,
+        len: end - start,
+    };
+    // SAFETY: `fd` is the userfaultfd and `arg` matches `struct uffdio_range`.
+    if unsafe { libc::ioctl(fd, UFFDIO_WAKE as _, &mut arg) } != 0 {
+        return Err(io::Error::last_os_error());
     }
     Ok(())
 }
@@ -857,7 +1101,9 @@ mod tests {
         let served = Mutex::new(memfile::PageMap::new(0));
         let handler = {
             let stop = Arc::clone(&stop);
-            std::thread::spawn(move || handle_faults(&read, &[], &[], &served, &stop).map(drop))
+            std::thread::spawn(move || {
+                handle_faults(&read, &[], &[], &served, &stop, None).map(drop)
+            })
         };
         std::thread::sleep(Duration::from_millis(50));
         let started = Instant::now();
@@ -899,6 +1145,7 @@ mod tests {
     fn ioctl_numbers_match_the_kernel_abi() {
         // Values from linux/userfaultfd.h on both x86_64 and aarch64; a
         // mismatch here means every fault fails with ENOTTY.
+        assert_eq!(UFFDIO_WAKE, 0x8010aa02);
         assert_eq!(UFFDIO_COPY, 0xc028aa03);
         assert_eq!(UFFDIO_ZEROPAGE, 0xc020aa04);
     }
@@ -957,6 +1204,175 @@ mod tests {
         assert!(regions[1].is_in_region(0x101000));
         // The gap between regions belongs to neither.
         assert!(!regions.iter().any(|r| r.is_in_region(0x50000)));
+    }
+
+    #[test]
+    fn a_fault_is_served_its_block_cut_to_the_region() {
+        let region = RegionMapping {
+            base_host_virt_addr: 0x7f00_0010_0000,
+            size: 0x40_0000,
+            offset: 0x1000_0000,
+            page_size: 0x1000,
+        };
+        assert_eq!(
+            region.block_of(0x7f00_0010_3000),
+            (0x7f00_0010_0000, 0x7f00_0020_0000)
+        );
+        assert_eq!(
+            region.block_of(0x7f00_0020_5000),
+            (0x7f00_0020_0000, 0x7f00_0040_0000)
+        );
+        assert_eq!(
+            region.block_of(0x7f00_004f_f000),
+            (0x7f00_0040_0000, 0x7f00_0050_0000)
+        );
+        assert_eq!(region.offset_of(0x7f00_0020_0000), 0x1010_0000);
+    }
+
+    /// Four blocks of anonymous memory registered with a userfaultfd, as
+    /// Firecracker hands a guest's over, served from a file whose every page
+    /// holds its index plus one, but for pages 500..530, which no layer
+    /// defines. A prefetch fills 505..520 and 1000..1010 first, across a
+    /// block boundary, as the plan of an earlier restore would.
+    fn serve_a_guest(blocks: Option<&mut Blocks>) -> memfile::PageMap {
+        const UFFDIO_API: u32 = iowr(0x3f, 24);
+        const UFFDIO_REGISTER: u32 = iowr(0x00, 32);
+        const PAGES: u64 = 4 * BLOCK / memfile::PAGE;
+        let len = (PAGES * memfile::PAGE) as usize;
+
+        let dir = std::env::temp_dir().join(format!(
+            "burrow-uffd-blocks-{}-{}",
+            std::process::id(),
+            blocks.is_some()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let mem = dir.join("snapshot.mem");
+        let mut contents = vec![0u8; len];
+        for (index, page) in contents.chunks_mut(memfile::PAGE as usize).enumerate() {
+            page[..8].copy_from_slice(&(index as u64 + 1).to_ne_bytes());
+        }
+        std::fs::write(&mem, contents).unwrap();
+        let layers = [Layer {
+            backing: Backing::map(&mem).unwrap(),
+            pages: memfile::Layer::full(
+                len as u64,
+                vec![(0, 500 * memfile::PAGE), (530 * memfile::PAGE, len as u64)],
+            ),
+            source: None,
+        }];
+
+        // SAFETY: an anonymous mapping takes no descriptor.
+        let mapped = unsafe {
+            libc::mmap(
+                std::ptr::null_mut(),
+                len + BLOCK as usize,
+                libc::PROT_READ | libc::PROT_WRITE,
+                libc::MAP_PRIVATE | libc::MAP_ANONYMOUS,
+                -1,
+                0,
+            )
+        };
+        assert_ne!(mapped, libc::MAP_FAILED);
+        let base = (mapped as u64 + BLOCK - 1) & !(BLOCK - 1);
+        // SAFETY: userfaultfd takes flags; user mode only needs no privilege.
+        let fd = unsafe {
+            libc::syscall(
+                libc::SYS_userfaultfd,
+                libc::O_CLOEXEC | libc::O_NONBLOCK | 1,
+            )
+        };
+        assert!(fd >= 0, "{}", io::Error::last_os_error());
+        // SAFETY: the descriptor was just created and is named nowhere else.
+        let uffd = unsafe { OwnedFd::from_raw_fd(fd as RawFd) };
+        let mut api = [0xaa_u64, 0, 0];
+        let mut register = [base, len as u64, 1, 0];
+        // SAFETY: both arguments match their kernel structs.
+        unsafe {
+            assert_eq!(libc::ioctl(fd as RawFd, UFFDIO_API as _, &mut api), 0);
+            assert_eq!(
+                libc::ioctl(fd as RawFd, UFFDIO_REGISTER as _, &mut register),
+                0
+            );
+        }
+        let regions = [RegionMapping {
+            base_host_virt_addr: base,
+            size: len,
+            offset: 0,
+            page_size: memfile::PAGE as usize,
+        }];
+
+        let served = Mutex::new(memfile::PageMap::new(PAGES));
+        let plan: Vec<u64> = (505..520)
+            .chain(1000..1010)
+            .map(|page| page * memfile::PAGE)
+            .collect();
+        let zeroes = blocks.as_ref().map(|blocks| &blocks.zeroes);
+        assert_eq!(
+            prefetch(fd as RawFd, &regions, &layers, zeroes, &served, &plan),
+            plan.len()
+        );
+
+        let stop = Stop::new().unwrap();
+        let read = |page: u64| {
+            // SAFETY: the page is inside the registered mapping.
+            unsafe { std::ptr::read_volatile((base + page * memfile::PAGE) as *const u64) }
+        };
+        let after_one = std::thread::scope(|scope| {
+            let handler = scope.spawn({
+                let (uffd, served, stop) = (&uffd, &served, &stop);
+                move || handle_faults(uffd, &regions, &layers, served, stop, blocks)
+            });
+            assert_eq!(read(1500), 1501);
+            let after_one = served.lock().unwrap().clone();
+            for page in 0..PAGES {
+                let expected = if (500..530).contains(&page) {
+                    0
+                } else {
+                    page + 1
+                };
+                assert_eq!(read(page), expected, "page {page}");
+            }
+            // SAFETY: as for a read.
+            unsafe { std::ptr::write_volatile((base + 7 * memfile::PAGE) as *mut u64, 42) };
+            assert_eq!(read(7), 42);
+            stop.signal();
+            let faulted = handler.join().unwrap().unwrap();
+            assert!(faulted.contains(&(1500 * memfile::PAGE)));
+            assert_eq!(served.lock().unwrap().count(), PAGES);
+            after_one
+        });
+        // SAFETY: the mapping was created above and nothing refers to it now.
+        unsafe { libc::munmap(mapped, len + BLOCK as usize) };
+        std::fs::remove_dir_all(&dir).unwrap();
+        after_one
+    }
+
+    #[test]
+    fn a_fault_fills_and_collapses_its_block_around_prefetched_pages() {
+        let mut blocks = Blocks {
+            zeroes: Backing::zeroes().unwrap(),
+            collapse: Collapse {
+                // SAFETY: pidfd_open takes a pid and flags.
+                pidfd: match unsafe { libc::syscall(libc::SYS_pidfd_open, std::process::id(), 0) } {
+                    // SAFETY: the descriptor was just created and is named
+                    // nowhere else.
+                    fd if fd >= 0 => Some(unsafe { OwnedFd::from_raw_fd(fd as RawFd) }),
+                    _ => None,
+                },
+                has_collapsed: false,
+            },
+        };
+        let after_one = serve_a_guest(Some(&mut blocks));
+        let block = 1500 / (BLOCK / memfile::PAGE) * (BLOCK / memfile::PAGE);
+        assert!((block..block + BLOCK / memfile::PAGE).all(|page| after_one.contains(page)));
+        assert_eq!(after_one.count(), BLOCK / memfile::PAGE + 25);
+    }
+
+    #[test]
+    fn a_fault_fills_one_page_with_huge_pages_off() {
+        let after_one = serve_a_guest(None);
+        assert!(after_one.contains(1500));
+        assert_eq!(after_one.count(), 1 + 25);
     }
 
     #[test]

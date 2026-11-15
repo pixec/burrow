@@ -701,6 +701,7 @@ impl MicroVm {
                     .as_ref()
                     .map(|name| self.spec.workdir.join(name)),
                 base_source: self.spec.memory_source.as_ref().map(|s| s.0.clone()),
+                is_huge_page_fill_enabled: true,
             },
         )?;
         self.memory = Some(backend);
