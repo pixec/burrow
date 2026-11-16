@@ -42,7 +42,7 @@ fn volume_image(index: usize) -> String {
 }
 
 #[allow(clippy::result_large_err)]
-fn require_min_machine(
+pub(crate) fn require_min_machine(
     template: &str,
     guest_os: burrow_vmm::GuestOs,
     shape: crate::warm::Shape,
@@ -6663,7 +6663,20 @@ impl SandboxManager {
     ) -> Result<Option<crate::warm::Warm>, Status> {
         let templates_dir = self.config.templates_dir();
         let (hypervisor, guest_os) = self.image_environment(template).await.machine()?;
-        crate::warm::require_warm_guest(template, guest_os)?;
+        // A pinned shape below what the guest boots on, the default 1x512 for
+        // a Windows template, is not one any create of it can ask for.
+        if require_min_machine(template, guest_os, shape).is_err() {
+            return Ok(None);
+        }
+        // As a create pins it, or the snapshot is kept under a shape no
+        // create of this guest asks for.
+        let shape = match can_plug_memory(hypervisor, guest_os) {
+            true => shape,
+            false => crate::warm::Shape {
+                max_mem_mib: shape.mem_mib,
+                ..shape
+            },
+        };
         // It may already be warm: a pinned shape kept across a restart, or one
         // create's build finishing while another was queued.
         if crate::warm::find(&templates_dir, template, hypervisor, shape)
@@ -6674,9 +6687,20 @@ impl SandboxManager {
         }
         let shape = crate::warm::resolve_disk(&templates_dir, template, shape).await?;
         let policy = &self.config.warm;
-        let image_bytes = tokio::fs::metadata(templates_dir.join(template).join(TEMPLATE_ROOTFS))
-            .await
-            .map_or(0, |meta| meta.len());
+        // The snapshot's disk is a clone of the image: free where the
+        // filesystem shares blocks, and the image's data where it copies, but
+        // never the image's apparent size, which for a Windows install is
+        // mostly unallocated.
+        let image = templates_dir.join(template).join(TEMPLATE_ROOTFS);
+        let image_bytes = match crate::rootdisk::is_clonable(&image, &templates_dir) {
+            true => 0,
+            false => {
+                use std::os::unix::fs::MetadataExt as _;
+                tokio::fs::metadata(&image)
+                    .await
+                    .map_or(0, |meta| meta.blocks() * 512)
+            }
+        };
         let estimate = u64::from(shape.mem_mib) * burrow_common::disk::MIB + image_bytes;
         if estimate > policy.per_template_bytes || estimate > policy.per_node_bytes {
             return Err(Status::failed_precondition(format!(
@@ -6905,10 +6929,7 @@ impl SandboxManager {
                 .image_environment(&template.name)
                 .await
                 .machine()
-                .is_ok_and(|(hypervisor, guest_os)| {
-                    hypervisor.capabilities().is_warm_pool_supported
-                        && crate::warm::require_warm_guest(&template.name, guest_os).is_ok()
-                });
+                .is_ok_and(|(hypervisor, _)| hypervisor.capabilities().is_warm_pool_supported);
             if !is_warmable {
                 continue;
             }
@@ -7556,10 +7577,8 @@ impl SandboxManager {
         // Warm snapshots are taken without nested virtualization, which a
         // restore cannot add, so a nested sandbox always boots.
         let is_warmable = !resources.is_nested_virt_enabled
-            && machine.is_ok_and(|(hypervisor, guest_os)| {
-                hypervisor.capabilities().is_warm_pool_supported
-                    && crate::warm::require_warm_guest(&template, guest_os).is_ok()
-            });
+            && machine
+                .is_ok_and(|(hypervisor, _)| hypervisor.capabilities().is_warm_pool_supported);
         if is_warmable {
             self.warm_for_demand(&ShapeKey::of(&template, &resources));
         }
@@ -7891,7 +7910,6 @@ impl SandboxManager {
             && !policy.is_console_verbose
             && !resources.is_nested_virt_enabled
             && capabilities.is_warm_pool_supported
-            && crate::warm::require_warm_guest(&template, guest_os).is_ok()
             && (capabilities.is_drive_hotplug_supported
                 || crate::volume::block_mounts(&policy.volumes)
                     .next()
@@ -7903,10 +7921,13 @@ impl SandboxManager {
         if is_warmable && found.is_none() {
             self.rebuild_in_background_if_broken(&template, hypervisor, wanted);
         }
+        // A Windows guest does not grow its volume from inside, so its disk
+        // is only ever the size the snapshot was taken with.
         let warm = found.filter(|warm| {
             warm.shape.disk_mib == wanted.disk_mib
                 || (warm.shape.disk_mib < wanted.disk_mib
-                    && capabilities.is_live_disk_growth_supported)
+                    && capabilities.is_live_disk_growth_supported
+                    && guest_os != burrow_vmm::GuestOs::Windows)
         });
         let from_warm = warm.is_some();
         phases.mark("warm_find");

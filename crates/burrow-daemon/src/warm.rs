@@ -391,16 +391,26 @@ async fn read_warm(dir: &Path, agents: Option<&[String]>) -> Option<Warm> {
             return None;
         }
     }
-    let template_kernel = dir.parent()?.parent()?.join("vmlinux");
-    let kernel = tokio::fs::read_to_string(dir.join(KERNEL_FILE))
+    // A snapshot carrying its firmware restores with it whatever the node
+    // has; one of a kernel restores with its template's, which must be the
+    // one it booted.
+    let carried = tokio::fs::try_exists(dir.join(crate::boot::FIRMWARE))
         .await
-        .ok()?;
-    if kernel.trim() != crate::kernels::digest(&template_kernel).await.ok()? {
-        return None;
+        .unwrap_or(false);
+    if !carried {
+        let template_kernel = dir.parent()?.parent()?.join(crate::boot::KERNEL);
+        let kernel = tokio::fs::read_to_string(dir.join(KERNEL_FILE))
+            .await
+            .ok()?;
+        if kernel.trim() != crate::kernels::digest(&template_kernel).await.ok()? {
+            return None;
+        }
     }
     let shape = Shape::parse(&tokio::fs::read_to_string(dir.join(SHAPE_FILE)).await.ok()?)?;
-    let mut bytes = 0;
-    for file in hypervisor.layout().files().chain([ROOT_DISK]) {
+    // The disk by what it does not share with its image: a reflinked clone
+    // of a large image costs only what the build wrote to it.
+    let mut bytes = crate::rootdisk::unshared_bytes(&dir.join(ROOT_DISK)).ok()?;
+    for file in hypervisor.layout().files() {
         bytes += tokio::fs::metadata(dir.join(file)).await.ok()?.blocks() * 512;
     }
     if let Ok(plan) = tokio::fs::metadata(dir.join(PREFETCH_PLAN)).await {
@@ -573,12 +583,13 @@ pub async fn link_warm(
     let layout = snapshot.hypervisor.layout();
 
     tokio::fs::create_dir_all(workdir).await?;
-    let linked = [
-        (template_dir.join("vmlinux"), "vmlinux"),
-        (template_dir.join(IMAGE), IMAGE),
-    ]
-    .into_iter()
-    .chain(layout.files().map(|name| (warm.join(name), name)));
+    let boot = match tokio::fs::try_exists(warm.join(crate::boot::FIRMWARE)).await? {
+        true => (warm.join(crate::boot::FIRMWARE), crate::boot::FIRMWARE),
+        false => (template_dir.join(crate::boot::KERNEL), crate::boot::KERNEL),
+    };
+    let linked = [boot, (template_dir.join(IMAGE), IMAGE)]
+        .into_iter()
+        .chain(layout.files().map(|name| (warm.join(name), name)));
     for (source, name) in linked {
         let dest = workdir.join(name);
         let _ = tokio::fs::remove_file(&dest).await;
@@ -616,19 +627,6 @@ pub async fn clone_warm_disk(
 
 /// Boots a template, waits for its agent, and snapshots the running VM.
 ///
-/// Refuses a guest whose warm snapshots this node cannot build and read back:
-/// a snapshot carries the template's `vmlinux` and the Linux agent's digest,
-/// and a Windows template has neither.
-#[allow(clippy::result_large_err)]
-pub fn require_warm_guest(template: &str, guest_os: burrow_vmm::GuestOs) -> Result<(), Status> {
-    if guest_os == burrow_vmm::GuestOs::Windows {
-        return Err(Status::failed_precondition(format!(
-            "template {template} is a windows guest, which is not warmed yet"
-        )));
-    }
-    Ok(())
-}
-
 /// The warm VM runs on a fixed tap of its own. It never carries a policy or
 /// serves anyone: its only job is to reach the point where a sandbox would be
 /// ready, and stop there.
@@ -665,7 +663,7 @@ pub async fn build_warm_snapshot(
     let shape = resolve_disk(&templates_dir, template, shape).await?;
     let environment = crate::oci::image_environment(&config.data_dir, template).await;
     let (hypervisor, guest_os) = environment.machine()?;
-    require_warm_guest(template, guest_os)?;
+    crate::sandbox::require_min_machine(template, guest_os, shape)?;
     let agent_timeout = config.agent_timeout(guest_os);
     if !config.hypervisors.contains(&hypervisor) {
         return Err(Status::failed_precondition(format!(
@@ -702,14 +700,26 @@ pub async fn build_warm_snapshot(
             .map_err(|err| Status::internal(format!("warm chroot: {err}")))?;
     }
 
-    for name in ["vmlinux", IMAGE] {
+    // A firmware guest's snapshot carries the firmware it booted, as a
+    // sandbox does, and so goes stale with nothing on the node.
+    let boot = crate::boot::file(guest_os);
+    let mut linked = vec![IMAGE];
+    match boot {
+        crate::boot::FIRMWARE => {
+            crate::boot::take_firmware(&config.cloud_hypervisor.firmware, &run_dir)
+                .await
+                .map_err(|err| Status::internal(format!("staging the firmware: {err}")))?
+        }
+        kernel => linked.push(kernel),
+    }
+    for name in linked {
         tokio::fs::hard_link(template_dir.join(name), run_dir.join(name))
             .await
             .map_err(|err| Status::internal(format!("staging {name}: {err}")))?;
     }
-    let kernel = crate::kernels::digest(&run_dir.join("vmlinux"))
+    let kernel = crate::kernels::digest(&run_dir.join(boot))
         .await
-        .map_err(|err| Status::internal(format!("hashing the kernel: {err}")))?;
+        .map_err(|err| Status::internal(format!("hashing the boot file: {err}")))?;
     crate::rootdisk::clone(&run_dir.join(IMAGE), &run_dir.join(ROOT_DISK))
         .await
         .map_err(|err| Status::internal(format!("warm root disk: {err}")))?;
@@ -719,8 +729,7 @@ pub async fn build_warm_snapshot(
         // directory and are left alone for the reason
         // [`crate::sandbox::grant_to_jail`] gives; the root disk is this
         // build's own and has to be writable by the uid the VMM drops to.
-        let shared = ["vmlinux".to_string(), IMAGE.to_string()].into();
-        crate::sandbox::grant_to_jail(&run_dir, jail, &shared)
+        crate::sandbox::grant_to_jail(&run_dir, jail, &crate::boot::shared())
             .await
             .map_err(|err| Status::internal(format!("preparing the warm jail: {err}")))?;
     }
@@ -761,6 +770,9 @@ pub async fn build_warm_snapshot(
             crate::sandbox::guest_boot_args(&config.extra_boot_args, config.is_console_verbose)
         ),
     };
+    if boot == crate::boot::FIRMWARE {
+        spec.boot = crate::boot::firmware_boot();
+    }
     apply_confinement(&mut spec, config, shape);
 
     let outcome = snapshot_when_ready(
@@ -770,6 +782,7 @@ pub async fn build_warm_snapshot(
         trust,
         config.upgrade_for(guest_os),
         capabilities.is_tap_networked && guest_os == burrow_vmm::GuestOs::Linux,
+        guest_os == burrow_vmm::GuestOs::Windows,
     )
     .await;
     burrow_net::tap::delete(WARM_TAP).await;
@@ -789,7 +802,7 @@ pub async fn build_warm_snapshot(
                 tracing::warn!(template, %err, "could not record a prefetch plan");
             }
             if run_dir != dir {
-                let collected = collect_products(&run_dir, &dir, hypervisor).await;
+                let collected = collect_products(&run_dir, &dir, hypervisor, boot).await;
                 // The chroot itself is the jailer's; what was worth keeping is
                 // out of it.
                 let _ = config.remove_workdir(&run_dir).await;
@@ -901,6 +914,7 @@ async fn collect_products(
     run_dir: &Path,
     dir: &Path,
     hypervisor: Hypervisor,
+    boot: &'static str,
 ) -> Result<(), Status> {
     use std::os::unix::fs::MetadataExt as _;
 
@@ -910,7 +924,8 @@ async fn collect_products(
     let (uid, gid) = (owner.uid(), owner.gid());
 
     let layout = hypervisor.layout();
-    for name in layout.files().chain([ROOT_DISK]) {
+    let carried = (boot == crate::boot::FIRMWARE).then_some(boot);
+    for name in layout.files().chain([ROOT_DISK]).chain(carried) {
         tokio::fs::rename(run_dir.join(name), dir.join(name))
             .await
             .map_err(|err| Status::internal(format!("collecting {name}: {err}")))?;
@@ -945,6 +960,7 @@ async fn exercise_agent(
     trust: &Trust,
     agent_timeout: std::time::Duration,
     upgrade: Option<&crate::guestconn::GuestUpgrade>,
+    guest_os: burrow_vmm::GuestOs,
 ) -> Result<
     (
         burrow_proto::guest::v1::guest_client::GuestClient<tonic::transport::Channel>,
@@ -983,7 +999,7 @@ async fn exercise_agent(
         agent_timeout,
     )
     .await?;
-    if let Err(err) = warm_up(&mut agent).await {
+    if let Err(err) = warm_up(&mut agent, guest_os).await {
         // Not fatal: a snapshot without the warm-up is slower, not wrong.
         tracing::warn!(%err, "could not pre-warm the guest before snapshotting");
     }
@@ -992,6 +1008,7 @@ async fn exercise_agent(
 
 async fn warm_up(
     agent: &mut burrow_proto::guest::v1::guest_client::GuestClient<tonic::transport::Channel>,
+    guest_os: burrow_vmm::GuestOs,
 ) -> Result<(), tonic::Status> {
     agent
         .health(burrow_proto::guest::v1::GuestHealthRequest {})
@@ -1001,7 +1018,12 @@ async fn warm_up(
     let start = burrow_proto::guest::v1::ExecInput {
         input: Some(burrow_proto::guest::v1::exec_input::Input::Start(
             burrow_proto::guest::v1::ExecStart {
-                cmd: vec!["sh".into(), "-c".into(), "true".into()],
+                cmd: match guest_os {
+                    burrow_vmm::GuestOs::Windows => {
+                        vec!["cmd.exe".into(), "/c".into(), "rem".into()]
+                    }
+                    _ => vec!["sh".into(), "-c".into(), "true".into()],
+                },
                 ..Default::default()
             },
         )),
@@ -1086,6 +1108,7 @@ async fn profile_restore(
                 trust,
                 agent_timeout,
                 config.upgrade_for(guest_os),
+                guest_os,
             )
             .await;
         }
@@ -1115,7 +1138,9 @@ async fn snapshot_when_ready(
     trust: &Trust,
     upgrade: Option<&crate::guestconn::GuestUpgrade>,
     is_cleared: bool,
+    is_settled: bool,
 ) -> Result<String, Status> {
+    let guest_os = spec.guest_os;
     let vm = Vm::boot(spec)
         .await
         .map_err(|err| Status::internal(format!("warm boot: {err}")))?;
@@ -1137,16 +1162,16 @@ async fn snapshot_when_ready(
     // guest coldness rather than transport. It also brings the agent up to
     // this node's, which the snapshot is then keyed on, so no create from it
     // upgrades the agent in place.
-    let (mut agent, digest) = match exercise_agent(&vm, lease, trust, agent_timeout, upgrade).await
-    {
-        Ok(exercised) => exercised,
-        Err(err) => {
-            let _ = vm.kill().await;
-            return Err(Status::internal(format!(
-                "the warm guest's agent did not handshake: {err}"
-            )));
-        }
-    };
+    let (mut agent, digest) =
+        match exercise_agent(&vm, lease, trust, agent_timeout, upgrade, guest_os).await {
+            Ok(exercised) => exercised,
+            Err(err) => {
+                let _ = vm.kill().await;
+                return Err(Status::internal(format!(
+                    "the warm guest's agent did not handshake: {err}"
+                )));
+            }
+        };
     // Taken without an address, so a clone's handshake adds its own and has
     // nothing to remove. Not fatal: a guest that keeps the warm address is
     // re-addressed the slower way.
@@ -1158,6 +1183,9 @@ async fn snapshot_when_ready(
         tracing::warn!(%err, "could not clear the warm guest's network");
     }
     drop(agent);
+    if is_settled {
+        settle(&vm).await;
+    }
 
     // Snapshot a quiesced guest: anything mid-flight at this moment is frozen
     // into every sandbox that later restores from it.
@@ -1175,17 +1203,41 @@ async fn snapshot_when_ready(
     Ok(digest)
 }
 
+/// Waits, up to [`SETTLE_LIMIT`], for a guest to go quiet. Windows spends
+/// its first minutes after boot on services, updates and scans, and a
+/// snapshot taken in the middle of that hands the same work to every clone.
+async fn settle(vm: &Vm) {
+    let started = std::time::Instant::now();
+    let mut quiet = 0;
+    let mut last = vm.cpu_usage_usec();
+    while started.elapsed() < SETTLE_LIMIT && quiet < 2 {
+        tokio::time::sleep(SETTLE_WINDOW).await;
+        let now = vm.cpu_usage_usec();
+        let busy = match (last, now) {
+            (Some(last), Some(now)) => now.saturating_sub(last),
+            _ => return,
+        };
+        last = now;
+        // Under a fifth of one CPU across the window.
+        quiet = match busy < SETTLE_WINDOW.as_micros() as u64 / 5 {
+            true => quiet + 1,
+            false => 0,
+        };
+    }
+    tracing::info!(
+        settled = quiet >= 2,
+        took_ms = started.elapsed().as_millis() as u64,
+        "waited for the warm guest to go quiet"
+    );
+}
+
+const SETTLE_WINDOW: std::time::Duration = std::time::Duration::from_secs(5);
+const SETTLE_LIMIT: std::time::Duration = std::time::Duration::from_secs(300);
+
 #[cfg(test)]
 mod shape_tests {
     use super::*;
     use burrow_proto::common::v1 as common;
-
-    #[test]
-    fn a_windows_template_is_not_warmed() {
-        let refused = require_warm_guest("win", burrow_vmm::GuestOs::Windows).unwrap_err();
-        assert_eq!(refused.code(), tonic::Code::FailedPrecondition);
-        assert!(require_warm_guest("alpine", burrow_vmm::GuestOs::Linux).is_ok());
-    }
 
     #[test]
     fn defaults_fill_in_for_an_unset_policy() {
@@ -1590,6 +1642,45 @@ mod shape_tests {
 
     /// A template rebuilt with another kernel boots that kernel, so a
     /// snapshot of the old one is stale and rebuilt.
+    /// A snapshot of a firmware guest carries the firmware it booted, so a
+    /// template with no kernel at all still has a current snapshot, and a
+    /// restore links the snapshot's firmware rather than anything of the
+    /// template's.
+    #[tokio::test]
+    async fn a_snapshot_carrying_its_firmware_needs_no_template_kernel() {
+        let templates = temp("firmware");
+        let live = warm_dir(&templates, "win").join("firecracker-2x4096");
+        write_snapshot(&live, WARM_FORMAT, "2 4096 25600 4096");
+        std::fs::remove_file(templates.join("win").join(crate::boot::KERNEL)).unwrap();
+        std::fs::write(live.join(crate::boot::FIRMWARE), b"edk2").unwrap();
+        std::fs::write(templates.join("win").join(IMAGE), b"image").unwrap();
+        let wanted = Shape {
+            vcpus: 2,
+            mem_mib: 4096,
+            disk_mib: 25600,
+            max_mem_mib: 4096,
+        };
+        let warm = find(&templates, "win", Hypervisor::Firecracker, wanted)
+            .await
+            .unwrap();
+        let workdir = templates.join("work");
+        link_warm(
+            &templates,
+            "win",
+            &warm,
+            &workdir,
+            &mut burrow_vmm::Phases::start(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            std::fs::read(workdir.join(crate::boot::FIRMWARE)).unwrap(),
+            b"edk2"
+        );
+        assert!(!workdir.join(crate::boot::KERNEL).exists());
+        let _ = std::fs::remove_dir_all(&templates);
+    }
+
     #[tokio::test]
     async fn a_snapshot_of_another_kernel_is_stale() {
         let templates = temp("kernel");

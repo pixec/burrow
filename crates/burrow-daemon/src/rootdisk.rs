@@ -269,6 +269,9 @@ struct Mapped {
     logical: u64,
     end: u64,
     physical: Option<u64>,
+    /// Its blocks are shared with another file, as a reflinked clone's are
+    /// with what it was cloned from.
+    is_shared: bool,
 }
 
 #[cfg(target_os = "linux")]
@@ -282,6 +285,7 @@ fn fiemap(file: &std::fs::File) -> std::io::Result<Vec<Mapped>> {
     const EXTENT_DELALLOC: u32 = 0x4;
     const EXTENT_NOT_ALIGNED: u32 = 0x100;
     const EXTENT_DATA_INLINE: u32 = 0x200;
+    const EXTENT_SHARED: u32 = 0x2000;
     const COUNT: usize = 256;
 
     #[repr(C)]
@@ -338,6 +342,7 @@ fn fiemap(file: &std::fs::File) -> std::io::Result<Vec<Mapped>> {
                 // word would make every chunk look shared with the image.
                 physical: (extent.flags & unknown == 0 && extent.physical != 0)
                     .then_some(extent.physical),
+                is_shared: extent.flags & EXTENT_SHARED != 0,
             });
             start = extent.logical + extent.length;
             last |= extent.flags & EXTENT_LAST != 0;
@@ -366,6 +371,7 @@ fn mapping_within(extents: &[Mapped], start: u64, end: u64) -> Vec<Mapped> {
             logical: from,
             end: to,
             physical: extent.physical.map(|p| p + (from - extent.logical)),
+            is_shared: false,
         };
         match out.last_mut() {
             Some(prev)
@@ -379,6 +385,22 @@ fn mapping_within(extents: &[Mapped], start: u64, end: u64) -> Vec<Mapped> {
         }
     }
     out
+}
+
+/// Bytes of `path` on blocks of its own, shared with no other file: what a
+/// reflinked clone costs beyond what it was cloned from. All its allocated
+/// blocks where the filesystem cannot say.
+pub fn unshared_bytes(path: &Path) -> std::io::Result<u64> {
+    use std::os::unix::fs::MetadataExt as _;
+    let file = std::fs::File::open(path)?;
+    match fiemap(&file) {
+        Ok(extents) => Ok(extents
+            .iter()
+            .filter(|extent| !extent.is_shared)
+            .map(|extent| extent.end - extent.logical)
+            .sum()),
+        Err(_) => Ok(file.metadata()?.blocks() * 512),
+    }
 }
 
 /// The chunks of `disk` that are still exactly `image`'s: every byte of them
@@ -999,11 +1021,13 @@ mod tests {
                 logical: 0,
                 end: 4096,
                 physical: Some(1 << 20),
+                is_shared: false,
             },
             Mapped {
                 logical: 4096,
                 end: 8192,
                 physical: Some((1 << 20) + 4096),
+                is_shared: false,
             },
         ];
         // The same blocks, reported as one extent.
@@ -1011,6 +1035,7 @@ mod tests {
             logical: 0,
             end: 8192,
             physical: Some(1 << 20),
+            is_shared: false,
         }];
         assert_eq!(
             mapping_within(&image, 0, 8192),
@@ -1022,11 +1047,13 @@ mod tests {
                 logical: 0,
                 end: 4096,
                 physical: Some(1 << 20),
+                is_shared: false,
             },
             Mapped {
                 logical: 4096,
                 end: 8192,
                 physical: Some(9 << 20),
+                is_shared: false,
             },
         ];
         assert_ne!(
