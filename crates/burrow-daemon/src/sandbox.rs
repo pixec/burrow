@@ -6805,15 +6805,18 @@ impl SandboxManager {
         // never the image's apparent size, which for a Windows install is
         // mostly unallocated.
         let image = templates_dir.join(template).join(TEMPLATE_ROOTFS);
-        let image_bytes = match crate::rootdisk::is_clonable(&image, &templates_dir) {
-            true => 0,
-            false => {
+        let image_bytes = tokio::task::spawn_blocking({
+            let (image, templates_dir) = (image.clone(), templates_dir.clone());
+            move || {
                 use std::os::unix::fs::MetadataExt as _;
-                tokio::fs::metadata(&image)
-                    .await
-                    .map_or(0, |meta| meta.blocks() * 512)
+                match crate::rootdisk::is_clone_shared(&image, &templates_dir) {
+                    true => 0,
+                    false => std::fs::metadata(&image).map_or(0, |meta| meta.blocks() * 512),
+                }
             }
-        };
+        })
+        .await
+        .map_err(|err| Status::internal(format!("measuring the template's image: {err}")))?;
         let estimate = u64::from(shape.mem_mib) * burrow_common::disk::MIB + image_bytes;
         if estimate > policy.per_template_bytes || estimate > policy.per_node_bytes {
             return Err(Status::failed_precondition(format!(

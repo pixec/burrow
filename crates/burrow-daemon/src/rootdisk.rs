@@ -78,6 +78,9 @@ pub enum Made {
 /// not made, and the warning not given, on every disk.
 static UNCLONABLE: Mutex<Vec<(u64, u64)>> = Mutex::new(Vec::new());
 
+/// Directories a disk has been cloned into, sharing its source's blocks.
+static CLONABLE: Mutex<Vec<(u64, u64)>> = Mutex::new(Vec::new());
+
 fn device_of(path: &Path) -> std::io::Result<u64> {
     use std::os::unix::fs::MetadataExt as _;
     Ok(std::fs::metadata(path)?.dev())
@@ -93,7 +96,13 @@ pub fn clone_blocking(source: &Path, dest: &Path) -> std::io::Result<Made> {
     );
     if !UNCLONABLE.lock().unwrap().contains(&pair) {
         match reflink(source, dest) {
-            Ok(()) => return Ok(Made::Clone),
+            Ok(()) => {
+                let mut known = CLONABLE.lock().unwrap();
+                if !known.contains(&pair) {
+                    known.push(pair);
+                }
+                return Ok(Made::Clone);
+            }
             Err(err) if is_unclonable(&err) => {
                 tracing::warn!(
                     source = %source.display(),
@@ -125,6 +134,27 @@ pub fn is_clonable(source: &Path, dir: &Path) -> bool {
         (Ok(a), Ok(b)) => !UNCLONABLE.lock().unwrap().contains(&(a, b)),
         _ => false,
     }
+}
+
+/// Whether a disk cloned from `source` into `dir` will share its blocks, by
+/// a clone between the two that has worked, or else by cloning a small file
+/// in `dir` now. Two filesystems never share blocks.
+pub fn is_clone_shared(source: &Path, dir: &Path) -> bool {
+    let (Ok(from), Ok(into)) = (device_of(source), device_of(dir)) else {
+        return false;
+    };
+    if CLONABLE.lock().unwrap().contains(&(from, into)) {
+        return true;
+    }
+    if from != into || UNCLONABLE.lock().unwrap().contains(&(from, into)) {
+        return false;
+    }
+    let probe = dir.join(format!(".burrow-clone-probe-{}", std::process::id()));
+    let copy = probe.with_extension("copy");
+    let made = std::fs::write(&probe, [0u8; 4096]).and_then(|()| clone_blocking(&probe, &copy));
+    let _ = std::fs::remove_file(&probe);
+    let _ = std::fs::remove_file(&copy);
+    matches!(made, Ok(Made::Clone))
 }
 
 fn is_unclonable(err: &std::io::Error) -> bool {

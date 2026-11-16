@@ -1675,7 +1675,12 @@ pub async fn run(args: ServeArgs) -> anyhow::Result<()> {
             digest,
         }));
     }
-    crate::warm::set_agents(guest_upgrades.iter().map(|u| u.digest.clone()).collect());
+    crate::warm::set_agents(
+        guest_upgrades
+            .iter()
+            .map(|upgrade| (upgrade.guest_os, upgrade.digest.clone()))
+            .collect(),
+    );
     let vmm_memory_overhead_mib: std::collections::HashMap<_, _> =
         args.vmm_memory_overheads.iter().copied().collect();
     node_info.vmm_memory_overhead_mib = hypervisors

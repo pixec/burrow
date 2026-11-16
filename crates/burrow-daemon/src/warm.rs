@@ -75,8 +75,11 @@ pub async fn hold_builds() -> tokio::sync::MutexGuard<'static, ()> {
 /// A 9 also records the digests of its guest's agent and kernel, which must
 /// match the node's agent and the template's kernel.
 ///
+/// 10 records its guest's OS, whose agent it is checked against, and the disk
+/// it takes, measured once when it is built.
+///
 /// A snapshot in any other format is discarded.
-const WARM_FORMAT: &str = "9";
+const WARM_FORMAT: &str = "10";
 
 /// Whether a warm snapshot's `format` file names the format this build writes.
 fn is_current_format(text: &str) -> bool {
@@ -90,17 +93,28 @@ fn is_current_format(text: &str) -> bool {
 /// the first call into the guest.
 const AGENT_FILE: &str = "agent";
 
-/// The digests of the agents this node ships, one per guest OS, set once at
-/// startup. Unset, any agent is current. A guest runs only its own OS's
-/// agent, so a snapshot built with any of them was built with its own's.
-static AGENTS: std::sync::OnceLock<Vec<String>> = std::sync::OnceLock::new();
+/// The guest OS a warm snapshot's guest runs, which says whose agent it is.
+const GUEST_OS_FILE: &str = "guest_os";
 
-pub fn set_agents(digests: Vec<String>) {
+/// The disk a warm snapshot takes: its memory, and its root disk's blocks
+/// not shared with its image. Measured once, when it is built, because a
+/// snapshot never changes and measuring a large disk's extents takes time.
+const BYTES_FILE: &str = "bytes";
+
+/// The digest of the agent this node ships for each guest OS, set once at
+/// startup. A guest whose OS the node ships no agent for keeps whichever it
+/// runs, so its snapshot is current with any.
+static AGENTS: std::sync::OnceLock<std::collections::HashMap<burrow_vmm::GuestOs, String>> =
+    std::sync::OnceLock::new();
+
+pub fn set_agents(digests: std::collections::HashMap<burrow_vmm::GuestOs, String>) {
     let _ = AGENTS.set(digests);
 }
 
-fn agent() -> Option<&'static [String]> {
-    AGENTS.get().map(Vec::as_slice)
+type Agents = std::collections::HashMap<burrow_vmm::GuestOs, String>;
+
+fn agent() -> Option<&'static Agents> {
+    AGENTS.get()
 }
 
 /// Pages a restore of this snapshot touches first, recorded once when the
@@ -372,7 +386,7 @@ impl Warm {
 
 /// The snapshot in `dir`, if it is complete, in the current format, of its
 /// template's kernel and, when `agent` is given, built with that agent.
-async fn read_warm(dir: &Path, agents: Option<&[String]>) -> Option<Warm> {
+async fn read_warm(dir: &Path, agents: Option<&Agents>) -> Option<Warm> {
     use std::os::unix::fs::MetadataExt as _;
 
     let hypervisor: Hypervisor = tokio::fs::read_to_string(dir.join(HYPERVISOR_FILE))
@@ -385,9 +399,15 @@ async fn read_warm(dir: &Path, agents: Option<&[String]>) -> Option<Warm> {
     if !is_current_format(&format) {
         return None;
     }
-    if let Some(agents) = agents {
+    let guest_os = burrow_vmm::GuestOs::from_record(
+        tokio::fs::read_to_string(dir.join(GUEST_OS_FILE))
+            .await
+            .ok()?
+            .trim(),
+    )?;
+    if let Some(shipped) = agents.and_then(|agents| agents.get(&guest_os)) {
         let built_with = tokio::fs::read_to_string(dir.join(AGENT_FILE)).await.ok()?;
-        if !agents.iter().any(|agent| agent == built_with.trim()) {
+        if built_with.trim() != shipped {
             return None;
         }
     }
@@ -407,15 +427,15 @@ async fn read_warm(dir: &Path, agents: Option<&[String]>) -> Option<Warm> {
         }
     }
     let shape = Shape::parse(&tokio::fs::read_to_string(dir.join(SHAPE_FILE)).await.ok()?)?;
-    // The disk by what it does not share with its image: a reflinked clone
-    // of a large image costs only what the build wrote to it.
-    let mut bytes = crate::rootdisk::unshared_bytes(&dir.join(ROOT_DISK)).ok()?;
-    for file in hypervisor.layout().files() {
-        bytes += tokio::fs::metadata(dir.join(file)).await.ok()?.blocks() * 512;
+    for file in hypervisor.layout().files().chain([ROOT_DISK]) {
+        tokio::fs::metadata(dir.join(file)).await.ok()?;
     }
-    if let Ok(plan) = tokio::fs::metadata(dir.join(PREFETCH_PLAN)).await {
-        bytes += plan.blocks() * 512;
-    }
+    let bytes = tokio::fs::read_to_string(dir.join(BYTES_FILE))
+        .await
+        .ok()?
+        .trim()
+        .parse()
+        .ok()?;
     let used_at = match tokio::fs::read_to_string(dir.join(USED_FILE)).await {
         Ok(text) => text.trim().parse().ok(),
         Err(_) => None,
@@ -431,6 +451,26 @@ async fn read_warm(dir: &Path, agents: Option<&[String]>) -> Option<Warm> {
         bytes,
         used_at,
     })
+}
+
+/// The disk a snapshot in `dir` takes: its files' blocks, its root disk by
+/// what it does not share with its image, since a reflinked clone of a large
+/// image costs only what the build wrote to it.
+async fn measure(dir: &Path, hypervisor: Hypervisor) -> std::io::Result<u64> {
+    use std::os::unix::fs::MetadataExt as _;
+    let dir = dir.to_path_buf();
+    tokio::task::spawn_blocking(move || {
+        let mut bytes = crate::rootdisk::unshared_bytes(&dir.join(ROOT_DISK))?;
+        for file in hypervisor.layout().files() {
+            bytes += std::fs::metadata(dir.join(file))?.blocks() * 512;
+        }
+        if let Ok(plan) = std::fs::metadata(dir.join(PREFETCH_PLAN)) {
+            bytes += plan.blocks() * 512;
+        }
+        Ok(bytes)
+    })
+    .await
+    .map_err(std::io::Error::other)?
 }
 
 pub fn warm_dir(templates_dir: &Path, template: &str) -> PathBuf {
@@ -475,7 +515,7 @@ pub async fn find_broken(
     is_broken(&dir, agent()).await.then_some(dir)
 }
 
-async fn is_broken(dir: &Path, agents: Option<&[String]>) -> bool {
+async fn is_broken(dir: &Path, agents: Option<&Agents>) -> bool {
     tokio::fs::try_exists(dir).await.unwrap_or(false) && read_warm(dir, agents).await.is_none()
 }
 
@@ -836,6 +876,15 @@ pub async fn build_warm_snapshot(
             tokio::fs::write(dir.join(AGENT_FILE), built_with)
                 .await
                 .map_err(|err| Status::internal(format!("recording warm agent: {err}")))?;
+            tokio::fs::write(dir.join(GUEST_OS_FILE), guest_os.as_str())
+                .await
+                .map_err(|err| Status::internal(format!("recording warm guest: {err}")))?;
+            let bytes = measure(&dir, hypervisor)
+                .await
+                .map_err(|err| Status::internal(format!("measuring the warm snapshot: {err}")))?;
+            tokio::fs::write(dir.join(BYTES_FILE), bytes.to_string())
+                .await
+                .map_err(|err| Status::internal(format!("recording warm size: {err}")))?;
             // Everything on the disk before the marker, and the marker before
             // the swap: every create restores from this snapshot, so one torn
             // by a power cut would corrupt every guest made from it.
@@ -1311,10 +1360,10 @@ mod shape_tests {
 
     #[test]
     fn only_the_current_format_is_warm() {
-        assert_eq!(WARM_FORMAT, "9");
-        assert!(is_current_format("9"));
-        assert!(is_current_format("9\n"));
-        for other in ["", "8", "10"] {
+        assert_eq!(WARM_FORMAT, "10");
+        assert!(is_current_format("10"));
+        assert!(is_current_format("10\n"));
+        for other in ["", "9", "11"] {
             assert!(!is_current_format(other), "{other:?} is not current");
         }
     }
@@ -1496,6 +1545,8 @@ mod shape_tests {
         let digest = sha2::Sha256::digest(std::fs::read(&template_kernel).unwrap());
         std::fs::write(dir.join(KERNEL_FILE), hex::encode(digest)).unwrap();
         std::fs::write(dir.join(HYPERVISOR_FILE), "firecracker").unwrap();
+        std::fs::write(dir.join(GUEST_OS_FILE), "linux").unwrap();
+        std::fs::write(dir.join(BYTES_FILE), "1").unwrap();
         std::fs::write(dir.join(SHAPE_FILE), shape).unwrap();
         std::fs::write(dir.join("format"), format).unwrap();
     }
@@ -1617,14 +1668,22 @@ mod shape_tests {
         let templates = temp("agent");
         let dir = warm_dir(&templates, "app").join("firecracker-1x512");
         write_snapshot(&dir, WARM_FORMAT, "1 512 1324 512");
-        let new = ["new".to_string()];
-        let both = ["windows".to_string(), "old".to_string()];
-        assert!(read_warm(&dir, Some(&new)).await.is_none());
+        let agents = |linux: &str| {
+            Agents::from([
+                (burrow_vmm::GuestOs::Linux, linux.to_string()),
+                (burrow_vmm::GuestOs::Windows, "windows".to_string()),
+            ])
+        };
+        assert!(read_warm(&dir, Some(&agents("new"))).await.is_none());
         std::fs::write(dir.join(AGENT_FILE), "old\n").unwrap();
-        assert!(read_warm(&dir, Some(&new)).await.is_none());
-        assert!(is_broken(&dir, Some(&new)).await);
-        assert!(read_warm(&dir, Some(&both)).await.is_some());
-        assert!(!is_broken(&dir, Some(&both)).await);
+        assert!(read_warm(&dir, Some(&agents("new"))).await.is_none());
+        assert!(is_broken(&dir, Some(&agents("new"))).await);
+        assert!(read_warm(&dir, Some(&agents("old"))).await.is_some());
+        assert!(!is_broken(&dir, Some(&agents("old"))).await);
+        // A node shipping no agent for the snapshot's OS keeps it.
+        std::fs::write(dir.join(GUEST_OS_FILE), "windows").unwrap();
+        let linux_only = Agents::from([(burrow_vmm::GuestOs::Linux, "new".to_string())]);
+        assert!(read_warm(&dir, Some(&linux_only)).await.is_some());
         let _ = std::fs::remove_dir_all(&templates);
     }
 
