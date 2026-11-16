@@ -41,9 +41,52 @@ impl Reading {
     }
 }
 
+/// How the node's object-store collector is faring. A collector that cannot
+/// finish a pass deletes nothing, so the store grows until it can.
+#[derive(Debug, Default)]
+pub struct Collector {
+    state: Mutex<CollectorState>,
+}
+
+#[derive(Debug, Default, Clone)]
+struct CollectorState {
+    /// Unix seconds; 0 before the first pass here succeeds.
+    succeeded_at: i64,
+    error: Option<String>,
+    failures: u32,
+}
+
+impl Collector {
+    pub fn succeeded(&self, at: i64) {
+        *self.state.lock().unwrap() = CollectorState {
+            succeeded_at: at,
+            error: None,
+            failures: 0,
+        };
+    }
+
+    /// Records a failed pass and says how many have failed in a row.
+    pub fn failed(&self, err: String) -> u32 {
+        let mut state = self.state.lock().unwrap();
+        state.error = Some(err);
+        state.failures += 1;
+        state.failures
+    }
+
+    pub fn succeeded_at(&self) -> i64 {
+        self.state.lock().unwrap().succeeded_at
+    }
+
+    /// Why the latest pass failed, while it is the latest.
+    pub fn error(&self) -> Option<String> {
+        self.state.lock().unwrap().error.clone()
+    }
+}
+
 #[derive(Clone, Default)]
 pub struct SandboxMetrics {
     readings: Arc<Mutex<Vec<Reading>>>,
+    pub collector: Arc<Collector>,
 }
 
 impl SandboxMetrics {
@@ -85,12 +128,47 @@ impl SandboxMetrics {
             .with_description("Memory the sandbox's running VM holds")
             .with_callback(observe(|r| r.mem_mib))
             .build();
+
+        let node = |pick: fn(&Collector) -> u64| {
+            let collector = Arc::clone(&self.collector);
+            let node_id = Arc::clone(&node_id);
+            move |observer: &dyn opentelemetry::metrics::AsyncInstrument<u64>| {
+                let node_id = node_id.lock().unwrap().clone();
+                observer.observe(pick(&collector), &[KeyValue::new("node_id", node_id)]);
+            }
+        };
+        meter
+            .u64_observable_gauge("burrow.node.gc_succeeded_unix_s")
+            .with_description(
+                "When the node's object-store collector last finished a pass; 0 before the first",
+            )
+            .with_callback(node(|c| c.succeeded_at().max(0) as u64))
+            .build();
+        meter
+            .u64_observable_gauge("burrow.node.gc_stalled")
+            .with_description("1 while the node's latest object-store collection failed")
+            .with_callback(node(|c| u64::from(c.error().is_some())))
+            .build();
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_collector_is_stalled_from_a_failed_pass_until_one_succeeds() {
+        let collector = Collector::default();
+        assert_eq!((collector.succeeded_at(), collector.error()), (0, None));
+        collector.succeeded(100);
+        assert_eq!(collector.failed("unreadable manifest".into()), 1);
+        assert_eq!(collector.failed("unreadable manifest".into()), 2);
+        assert_eq!(collector.succeeded_at(), 100);
+        assert_eq!(collector.error().as_deref(), Some("unreadable manifest"));
+        collector.succeeded(200);
+        assert_eq!((collector.succeeded_at(), collector.error()), (200, None));
+        assert_eq!(collector.failed("again".into()), 1);
+    }
 
     #[test]
     fn tags_become_attributes_and_cannot_replace_the_fixed_ones() {

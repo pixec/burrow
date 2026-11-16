@@ -976,6 +976,12 @@ message NodeStatus {
   // The kernel each of `templates` boots here, so placement can tell which
   // can give a guest what it asks for, such as nested virtualization.
   map<string, Kernel> template_kernels = 19;
+  // Unix milliseconds when this node's object-store collector last finished
+  // a pass; 0 before the first, and on a node without an object store.
+  int64 gc_succeeded_at_unix_ms = 20;
+  // Why the collector's latest pass failed. Set, the collector deletes
+  // nothing and the store grows until a pass finishes.
+  string gc_error = 21;
 }
 
 // A warm snapshot of one template at one machine shape. A create of that

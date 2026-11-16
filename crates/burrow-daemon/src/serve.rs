@@ -931,6 +931,8 @@ async fn current_status(sandboxes: &SandboxManager, data_dir: &std::path::Path) 
         // snapshot, and resuming must not find the node oversubscribed.
         committed_cpu_millis: sandboxes.committed_cpu_millis().await,
         volumes: sandboxes.volumes().list().await,
+        gc_succeeded_at_unix_ms: sandboxes.metrics().collector.succeeded_at() * 1000,
+        gc_error: sandboxes.metrics().collector.error().unwrap_or_default(),
         ..disk_status(sandboxes.disk_status().await)
     }
 }

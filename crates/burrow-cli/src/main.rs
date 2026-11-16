@@ -4399,6 +4399,8 @@ fn node_state(node: &api::Node) -> &'static str {
         "draining"
     } else if status.is_disk_low {
         "disk-low"
+    } else if !status.gc_error.is_empty() {
+        "gc-stalled"
     } else {
         "ready"
     }
@@ -5926,6 +5928,14 @@ fn nodes_json(nodes: &[api::Node]) -> String {
                 "disk_free_bytes": disk.free_bytes,
                 "disk_total_bytes": disk.total_bytes,
                 "running_sandboxes": status.running_sandboxes,
+                "gc_succeeded_at": match status.gc_succeeded_at_unix_ms {
+                    0 => serde_json::Value::Null,
+                    at => rfc3339_from_unix_ms(at).into(),
+                },
+                "gc_error": match status.gc_error.as_str() {
+                    "" => serde_json::Value::Null,
+                    err => err.into(),
+                },
                 "hypervisors": info.hypervisors,
                 "nested_virt_supported": info.is_nested_virt_supported,
                 "kernels": kernels,
@@ -6453,6 +6463,43 @@ mod tests {
         assert_eq!(json[0]["kernels"][0]["kvm"], true);
         assert_eq!(json[0]["kernels"][1]["kvm"], false);
         assert_eq!(json[1]["nested_virt_supported"], false);
+    }
+
+    /// A node whose object-store collector cannot finish a pass says so in
+    /// STATE, and `--json` carries why and when one last finished.
+    #[test]
+    fn node_ls_shows_a_stalled_collector() {
+        use burrow_proto::common::v1::NodeStatus;
+        let nodes = [
+            node(
+                "node-a",
+                NodeStatus {
+                    gc_succeeded_at_unix_ms: 1_790_812_800_000,
+                    gc_error: "sandboxes/sbx_1/manifest.json is unreadable".into(),
+                    ..Default::default()
+                },
+            ),
+            node(
+                "node-b",
+                NodeStatus {
+                    gc_succeeded_at_unix_ms: 1_790_812_800_000,
+                    ..Default::default()
+                },
+            ),
+        ];
+        let table = node_table(&nodes);
+        let lines: Vec<&str> = table.lines().collect();
+        assert!(lines[1].contains(" gc-stalled "), "{table}");
+        assert!(lines[2].contains(" ready "), "{table}");
+
+        let json: serde_json::Value = serde_json::from_str(&super::nodes_json(&nodes)).unwrap();
+        assert_eq!(json[0]["state"], "gc-stalled");
+        assert_eq!(
+            json[0]["gc_error"],
+            "sandboxes/sbx_1/manifest.json is unreadable"
+        );
+        assert_eq!(json[0]["gc_succeeded_at"], "2026-10-01T00:00:00Z");
+        assert!(json[1]["gc_error"].is_null());
     }
 
     #[test]

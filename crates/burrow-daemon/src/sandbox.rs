@@ -11229,19 +11229,50 @@ impl SandboxManager {
 
     /// Collects stored state nothing references, every few hours, with
     /// jitter so a fleet started together does not list the bucket together.
+    /// A failed pass is retried, and warned about, every hour until one
+    /// succeeds.
     pub async fn collect_stored_garbage(&self) {
         let Some(store) = self.config.object_store.clone() else {
             return;
         };
+        let mut is_stalled = false;
         loop {
             let jitter = std::time::Duration::from_secs(
                 std::time::SystemTime::now()
                     .duration_since(std::time::UNIX_EPOCH)
                     .map_or(0, |d| u64::from(d.subsec_nanos()) % 3600),
             );
-            tokio::time::sleep(std::time::Duration::from_secs(6 * 3600) + jitter).await;
-            if let Err(err) = crate::durable::collect_garbage(&store, &self.snapshots).await {
-                tracing::warn!(%err, "could not collect unreferenced stored state");
+            let interval = match is_stalled {
+                true => std::time::Duration::from_secs(3600),
+                false => std::time::Duration::from_secs(6 * 3600),
+            };
+            tokio::time::sleep(interval + jitter).await;
+            is_stalled = !self.collect_stored_garbage_once(&store).await;
+        }
+    }
+
+    /// One collection pass, recorded for the metrics and the heartbeat. Says
+    /// whether it finished.
+    async fn collect_stored_garbage_once(&self, store: &crate::objstore::ObjectStore) -> bool {
+        let collector = &self.metrics.collector;
+        match crate::durable::collect_garbage(store, &self.snapshots).await {
+            Ok(()) => {
+                if collector.error().is_some() {
+                    tracing::info!("the object-store collector finished a pass again");
+                }
+                collector.succeeded(burrow_common::unix_now());
+                true
+            }
+            Err(err) => {
+                let failures = collector.failed(err.message().to_string());
+                tracing::warn!(
+                    %err,
+                    failures,
+                    succeeded_at = collector.succeeded_at(),
+                    "the object-store collector could not finish a pass; nothing unreferenced \
+                     is deleted until one does"
+                );
+                false
             }
         }
     }
@@ -12939,6 +12970,27 @@ pub(crate) mod tests {
             attempted(&manager),
             vec![ShapeKey::of("app", &shape(2, 2048))]
         );
+    }
+
+    /// A pass that cannot finish leaves the collector stalled, for the
+    /// metrics and the heartbeat, until one does.
+    #[tokio::test]
+    async fn a_failed_collection_is_reported_until_one_finishes() {
+        let manager = manager().await;
+        let (store, faults, _) = crate::objstore::fake::controlled().await;
+        let manifest = "sandboxes/sbx_1/manifest.json";
+        store.put_bytes(manifest, b"{}".to_vec()).await.unwrap();
+        *faults.failing_gets.lock().unwrap() = Some(manifest.into());
+        assert!(!manager.collect_stored_garbage_once(&store).await);
+        let collector = &manager.metrics.collector;
+        assert!(collector.error().is_some());
+        assert_eq!(collector.succeeded_at(), 0);
+
+        *faults.failing_gets.lock().unwrap() = None;
+        store.delete(manifest).await.unwrap();
+        assert!(manager.collect_stored_garbage_once(&store).await);
+        assert_eq!(collector.error(), None);
+        assert!(collector.succeeded_at() > 0);
     }
 
     /// A snapshot the hypervisor refuses to restore, its state cut short or
