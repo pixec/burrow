@@ -23,7 +23,7 @@ also needs `--disk-gib N`. The spike ran with `--cpus 4 --memory-mib 8192
 ## Build and sign
 
 ```sh
-deploy/macos/sign.sh        # builds the example and signs a copy at target/vz-signed/vz
+scripts/macos/sign.sh        # builds the example and signs a copy at target/vz-signed/vz
 ```
 
 Virtualization.framework refuses to create a machine in a process without the
@@ -114,7 +114,7 @@ each connection. Build it on the host (the binary runs unchanged in the
 guest), copy it in and run it:
 
 ```sh
-cc -O2 -o /tmp/vsock-echo deploy/macos/vsock-echo.c
+cc -O2 -o /tmp/vsock-echo scripts/macos/vsock-echo.c
 scp /tmp/vsock-echo burrow@<address>:
 ssh burrow@<address> 'nohup ./vsock-echo 1024 >/dev/null 2>&1 </dev/null &'
 printf 'CONNECT 1024\nping\n' | nc -U "$M/base/vsock.sock"
@@ -168,7 +168,7 @@ DESIGN.md.
 
 ## burrowd as a macOS node
 
-`deploy/macos/node.sh` builds burrowd for the Mac, signs it with the
+`scripts/macos/node.sh` builds burrowd for the Mac, signs it with the
 entitlement and runs `burrowd serve --hypervisors vz` against the colima
 harness orchestrator (127.0.0.1:7070 from the Mac; the orchestrator dials the
 node back at `host.lima.internal:7171`). The node advertises `vz` with the

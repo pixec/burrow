@@ -5,13 +5,13 @@
 //! vz-usernet <dir> [--cpus N] [--memory-mib N] [--ssh-port P]
 //! ```
 //!
-//! `<dir>` is a machine made by `vz new` (see deploy/macos/README.md). The
+//! `<dir>` is a machine made by `vz new` (see scripts/macos/README.md). The
 //! binary needs the virtualization entitlement, as the `vz` driver does:
 //!
 //! ```sh
 //! cargo build -p burrow-net --features usernet --example vz-usernet
 //! cp target/debug/examples/vz-usernet target/vz-signed/vz-usernet
-//! codesign --force --sign - --entitlements deploy/macos/vz.entitlements target/vz-signed/vz-usernet
+//! codesign --force --sign - --entitlements scripts/macos/vz.entitlements target/vz-signed/vz-usernet
 //! ```
 //!
 //! The guest gets 10.99.0.6/30 behind gateway 10.99.0.5, which resolves

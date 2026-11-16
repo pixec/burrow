@@ -2,7 +2,7 @@
 # Drives burrow through the Docker Sandbox Kit conformance contract
 # (docs/spec/conformance.md in github.com/docker/sandbox-kit-spec):
 #
-#   kit-tck runtime --adapter deploy/kit-tck/burrow-adapter
+#   kit-tck runtime --adapter scripts/kit-tck/burrow-adapter
 #
 # Every verb maps onto a burrow CLI command. The suite hands over kits as
 # directories, which burrow does not build, so a directory is built with the

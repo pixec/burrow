@@ -3,7 +3,7 @@
 # template imported with --systemd, booting its own systemd under the agent
 # with Docker as one of its services.
 #
-#   deploy/dev/systemd-docker/test.sh
+#   scripts/systemd-docker/test.sh
 #
 # Checks that exec lands in systemd's namespaces, that file transfer sees its
 # mounts, that Docker runs containers, that `systemctl reboot` restarts

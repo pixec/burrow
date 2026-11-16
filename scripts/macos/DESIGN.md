@@ -137,7 +137,7 @@ that matters, and it works.
 
 Real. The SDK has had `<sys/vsock.h>` (`AF_VSOCK` = 40, `struct sockaddr_vm`,
 `IOCTL_VM_SOCKETS_GET_LOCAL_CID`); on the host it fails with ENODEV, inside the
-guest `deploy/macos/vsock-echo.c` ran as an ordinary user: `socket`, `bind`
+guest `scripts/macos/vsock-echo.c` ran as an ordinary user: `socket`, `bind`
 on `VMADDR_CID_ANY:1024`, `listen` and `accept` all work, the local CID is 3,
 the peer is CID 2. The host reached it through `connectToPort` (via the
 bridge), and the listener survived a save and restore. `netstat -f vsock`

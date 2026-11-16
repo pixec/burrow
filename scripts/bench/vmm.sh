@@ -1,6 +1,6 @@
 #!/bin/bash
 # VMM-layer benchmark: burrowd vm agent / clones on both hypervisors, inside burrow-node-1.
-# Usage: deploy/bench/vmm.sh <runs> <outdir>
+# Usage: scripts/bench/vmm.sh <runs> <outdir>
 set -euo pipefail
 RUNS=${1:-10}
 OUT=${2:-./bench-out}

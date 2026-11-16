@@ -1,7 +1,7 @@
 //! `burrow-guest install`: puts the agent where its LaunchDaemon runs it from
 //! and loads the daemon.
 //!
-//! Run once, as root, while a template is built (see deploy/macos/README.md).
+//! Run once, as root, while a template is built (see scripts/macos/README.md).
 //! Running it again replaces the binary and restarts the daemon.
 
 use std::os::unix::fs::PermissionsExt as _;

@@ -1,7 +1,7 @@
 //! Dev driver for the Virtualization.framework backend, over [`burrow_vmm::Vm`].
 //!
-//! The binary needs the virtualization entitlement: `deploy/macos/sign.sh`
-//! builds it and signs a copy. See deploy/macos/README.md.
+//! The binary needs the virtualization entitlement: `scripts/macos/sign.sh`
+//! builds it and signs a copy. See scripts/macos/README.md.
 //!
 //! ```text
 //! vz install <ipsw> <template> --disk-gib N   build a template from a restore image
