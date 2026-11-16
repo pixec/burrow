@@ -1365,6 +1365,44 @@ fn may_discard_warm(
     true
 }
 
+/// Refused restores of one warm snapshot in a row before it is discarded. A
+/// broken snapshot is refused every time, while a refusal the host caused,
+/// such as a tap that went missing under load, is followed by a restore that
+/// works and starts the count over.
+const WARM_RESTORE_FAILURES: u32 = 3;
+
+/// Refused restores in a row, by the snapshot file they were of.
+#[derive(Default)]
+struct RestoreFailures(HashMap<crate::warm::Restored, u32>);
+
+/// Snapshots tracked at once; past it the counts start over rather than grow.
+const MAX_RESTORE_FAILURES_TRACKED: usize = 64;
+
+impl RestoreFailures {
+    /// Counts a failed restore of `restored` with `err`, and says whether the
+    /// snapshot is now to be discarded. Only the hypervisor refusing the
+    /// snapshot counts: failing to start, to answer in time or to get host
+    /// resources says nothing about the files.
+    fn record(&mut self, restored: crate::warm::Restored, err: &burrow_vmm::Error) -> bool {
+        if !matches!(
+            err,
+            burrow_vmm::Error::Api { .. } | burrow_vmm::Error::Snapshot(_)
+        ) {
+            return false;
+        }
+        if self.0.len() >= MAX_RESTORE_FAILURES_TRACKED && !self.0.contains_key(&restored) {
+            self.0.clear();
+        }
+        let failures = self.0.entry(restored.clone()).or_default();
+        *failures += 1;
+        if *failures < WARM_RESTORE_FAILURES {
+            return false;
+        }
+        self.0.remove(&restored);
+        true
+    }
+}
+
 /// The warm snapshot a sandbox was restored from.
 struct WarmOrigin {
     template: String,
@@ -3000,6 +3038,8 @@ pub struct SandboxManager {
     /// When each warm snapshot directory was last discarded for a guest that
     /// never came up.
     warm_discards: Arc<std::sync::Mutex<HashMap<PathBuf, std::time::Instant>>>,
+    /// Restores of each warm snapshot the hypervisor has refused in a row.
+    warm_restore_failures: Arc<std::sync::Mutex<RestoreFailures>>,
     /// A test manager's data directory, removed with its last clone.
     #[cfg(test)]
     temp: Option<Arc<tempfile::TempDir>>,
@@ -3185,6 +3225,7 @@ impl SandboxManager {
             expired_rules: Arc::new(std::sync::Mutex::new(std::collections::HashSet::new())),
             warm_shapes: Arc::new(std::sync::Mutex::new(HashMap::new())),
             warm_discards: Arc::default(),
+            warm_restore_failures: Arc::default(),
             #[cfg(test)]
             temp: None,
             warm_queue: Arc::new(tokio::sync::Mutex::new(())),
@@ -7023,20 +7064,29 @@ impl SandboxManager {
         self.rebuild_warm(&warm.template, warm.shape);
     }
 
-    /// [`Self::discard_failed_warm`] for a snapshot the hypervisor could not
-    /// restore into `workdir`, on a task of its own so the create fails without
-    /// waiting on a warm build.
+    /// [`Self::discard_failed_warm`] for a snapshot the hypervisor has refused
+    /// to restore [`WARM_RESTORE_FAILURES`] times in a row, on a task of its
+    /// own so the create fails without waiting on a warm build.
     fn discard_unrestorable_warm(
         &self,
         snapshot: &crate::warm::Warm,
         template: &str,
         workdir: &Path,
         hypervisor: Hypervisor,
+        err: &burrow_vmm::Error,
     ) {
         let Ok(restored) = crate::warm::Restored::of(&workdir.join(hypervisor.layout().state))
         else {
             return;
         };
+        if !self
+            .warm_restore_failures
+            .lock()
+            .unwrap()
+            .record(restored.clone(), err)
+        {
+            return;
+        }
         let warm = WarmOrigin {
             template: template.to_string(),
             dir: snapshot.dir.clone(),
@@ -7048,6 +7098,18 @@ impl SandboxManager {
                 .discard_failed_warm(&warm, &restored, "the hypervisor could not restore it")
                 .await
         });
+    }
+
+    /// Starts the count of refused restores over for the snapshot `workdir`
+    /// was just restored from.
+    fn restored_warm(&self, workdir: &Path, hypervisor: Hypervisor) {
+        let mut failures = self.warm_restore_failures.lock().unwrap();
+        if failures.0.is_empty() {
+            return;
+        }
+        if let Ok(restored) = crate::warm::Restored::of(&workdir.join(hypervisor.layout().state)) {
+            failures.0.remove(&restored);
+        }
     }
 
     fn rebuild_warm(&self, template: &str, shape: crate::warm::Shape) {
@@ -8333,7 +8395,7 @@ impl SandboxManager {
                 .await
                 .map(|vm| (vm, boot_spec))
                 .map_err(|err| {
-                    self.discard_unrestorable_warm(snapshot, &template, &workdir, hypervisor);
+                    self.discard_unrestorable_warm(snapshot, &template, &workdir, hypervisor, &err);
                     Status::internal(format!("warm restore failed: {err}"))
                 })
         } else {
@@ -8408,7 +8470,9 @@ impl SandboxManager {
             match is_warm {
                 true => Vm::restore(spec, true).await.map_err(|err| {
                     if let Some(snapshot) = &warm {
-                        self.discard_unrestorable_warm(snapshot, &template, &workdir, hypervisor);
+                        self.discard_unrestorable_warm(
+                            snapshot, &template, &workdir, hypervisor, &err,
+                        );
                     }
                     Status::internal(format!("warm restore failed: {err}"))
                 }),
@@ -8423,6 +8487,9 @@ impl SandboxManager {
         let boot_spec = match started_vm {
             Ok((vm, boot_spec)) => {
                 guard.vm = Some(vm);
+                if from_warm {
+                    self.restored_warm(&workdir, hypervisor);
+                }
                 boot_spec
             }
             Err(err) => return Err(guard.fail(err).await),
@@ -13028,7 +13095,25 @@ pub(crate) mod tests {
             used_at: 0,
         };
 
-        manager.discard_unrestorable_warm(&snapshot, "app", &workdir, Hypervisor::Firecracker);
+        let refused = || burrow_vmm::Error::Snapshot("vmstate checksum mismatch".into());
+        for _ in 1..WARM_RESTORE_FAILURES {
+            manager.discard_unrestorable_warm(
+                &snapshot,
+                "app",
+                &workdir,
+                Hypervisor::Firecracker,
+                &refused(),
+            );
+        }
+        assert!(attempted(&manager).is_empty());
+        assert!(tokio::fs::try_exists(&dir).await.unwrap());
+        manager.discard_unrestorable_warm(
+            &snapshot,
+            "app",
+            &workdir,
+            Hypervisor::Firecracker,
+            &refused(),
+        );
         tokio::time::timeout(std::time::Duration::from_secs(10), async {
             while attempted(&manager).is_empty() {
                 tokio::time::sleep(std::time::Duration::from_millis(5)).await;
@@ -13042,6 +13127,40 @@ pub(crate) mod tests {
             attempted(&manager),
             vec![ShapeKey::of("app", &shape(2, 2048))]
         );
+    }
+
+    /// Only the hypervisor refusing the same snapshot again and again
+    /// condemns it: the host failing to run a VM, or a restore that works in
+    /// between, does not.
+    #[test]
+    fn only_refusals_in_a_row_condemn_a_warm_snapshot() {
+        let dir = std::env::temp_dir().join(format!("bwr-{}", uuid::Uuid::new_v4().simple()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("snapshot.vmstate"), b"x").unwrap();
+        let restored = crate::warm::Restored::of(&dir.join("snapshot.vmstate")).unwrap();
+        let refused = burrow_vmm::Error::Api {
+            method: "PUT".into(),
+            path: "/snapshot/load".into(),
+            status: 400,
+            body: "Load snapshot error".into(),
+        };
+        let host = burrow_vmm::Error::SocketTimeout {
+            path: dir.join("api.sock"),
+            timeout_ms: 5000,
+        };
+
+        let mut failures = RestoreFailures::default();
+        for _ in 0..10 {
+            assert!(!failures.record(restored.clone(), &host));
+        }
+        assert!(!failures.record(restored.clone(), &refused));
+        assert!(!failures.record(restored.clone(), &refused));
+        failures.0.remove(&restored);
+        assert!(!failures.record(restored.clone(), &refused));
+        assert!(!failures.record(restored.clone(), &refused));
+        assert!(failures.record(restored.clone(), &refused));
+        assert!(failures.0.is_empty());
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// An evicted shape, and one the node declined to build, are given back

@@ -559,7 +559,7 @@ pub async fn discard_broken(dir: &Path) -> std::io::Result<bool> {
 /// A file a sandbox linked from a warm snapshot, by name and inode, so the
 /// snapshot can be told apart from one rebuilt since after the sandbox's own
 /// link is gone.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct Restored {
     name: std::ffi::OsString,
     file: (u64, u64),
