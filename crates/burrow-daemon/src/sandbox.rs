@@ -726,9 +726,9 @@ fn plan_reshape(
     }
     if from.guest_os != burrow_vmm::GuestOs::Linux {
         return Err(Status::failed_precondition(format!(
-            "{what} restores a {} guest at {} vcpu / {} MiB / {} MiB disk, and a {} guest's \
-             machine cannot change while it runs; leave vcpus, mem_mib and disk_mib unset",
-            from.guest_os, from.vcpus, from.mem_mib, from.disk_mib, from.guest_os
+            "{what} of a {} guest keeps its source's {} vcpu / {} MiB / {} MiB disk; leave \
+             vcpus, mem_mib and disk_mib unset",
+            from.guest_os, from.vcpus, from.mem_mib, from.disk_mib
         )));
     }
     let capabilities = from.hypervisor.capabilities();
@@ -2811,6 +2811,95 @@ impl RunningSandbox {
         Ok(paused_for)
     }
 
+    /// Clones a macOS sandbox's machine into `dest` for a cold boot, with its
+    /// image environment. A running guest flushes its writes and is paused
+    /// for the clone, which is crash-consistent at that instant. The pause,
+    /// clone and resume run on a task of their own, so a caller that gives up
+    /// cannot leave the guest paused.
+    async fn capture_machine(
+        self: &Arc<Self>,
+        dest: &Path,
+        environment: &crate::oci::ImageEnvironment,
+    ) -> Result<(), Status> {
+        if self.is_running() {
+            self.await_handshake().await?;
+            self.sync_guest().await;
+        }
+        let (sandbox, to) = (Arc::clone(self), dest.to_path_buf());
+        tokio::spawn(async move {
+            let captured = sandbox.capture_paused(&to).await;
+            // A macOS guest's clock falls back to its own across a pause.
+            if sandbox.is_running()
+                && let Err(err) = sandbox.sync_clock().await
+            {
+                tracing::debug!(sandbox = sandbox.id(), %err, "guest clock not synced after a capture");
+            }
+            captured
+        })
+        .await
+        .map_err(|err| Status::internal(format!("the capture did not finish: {err}")))??;
+        crate::oci::keep_environment(dest, environment)
+            .await
+            .map_err(|err| Status::internal(format!("keeping the image environment: {err}")))
+    }
+
+    /// [`Self::capture_machine`]'s clone, under a paused guest when it runs.
+    /// A clone past its deadline is given up on. A guest that cannot be
+    /// resumed is stopped on its disk rather than left paused while it reads
+    /// as running.
+    async fn capture_paused(&self, dest: &Path) -> Result<(), Status> {
+        let capture = |dest: &Path| {
+            let (from, to) = (self.workdir.clone(), dest.to_path_buf());
+            async move {
+                match tokio::time::timeout(CAPTURE_TIMEOUT, crate::macnode::capture(&from, &to))
+                    .await
+                {
+                    Ok(captured) => captured
+                        .map_err(|err| Status::internal(format!("capturing the machine: {err}"))),
+                    Err(_) => Err(Status::deadline_exceeded(format!(
+                        "cloning the machine took longer than {}s",
+                        CAPTURE_TIMEOUT.as_secs()
+                    ))),
+                }
+            }
+        };
+        let mut slot = self.vm.lock().await;
+        let Some(vm) = slot.as_ref() else {
+            return capture(dest).await;
+        };
+        let mut phases = burrow_vmm::Phases::start();
+        vm.pause()
+            .await
+            .map_err(|err| Status::internal(format!("pausing the guest: {err}")))?;
+        phases.mark("pause");
+        let captured = capture(dest).await;
+        phases.mark("clone");
+        let mut resumed = vm.resume().await;
+        for _ in 1..RESUME_ATTEMPTS {
+            if resumed.is_ok() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+            resumed = vm.resume().await;
+        }
+        phases.mark("resume");
+        tracing::debug!(sandbox = self.id(), %phases, "captured a running macOS machine");
+        if let Err(err) = resumed {
+            let vm = slot.take().expect("the vm was present a moment ago");
+            self.retire_cpu(&vm);
+            if let Err(err) = vm.kill().await {
+                tracing::error!(sandbox = self.id(), %err, "vmm did not stop");
+            }
+            drop(slot);
+            self.forget_agent().await;
+            return Err(Status::internal(format!(
+                "the guest paused for a capture could not be resumed, so it was stopped on its \
+                 disk: {err}"
+            )));
+        }
+        captured
+    }
+
     /// Flattens the memory chain when it is longer than `depth`.
     ///
     /// Safe with the guest running: `merge_chain` renames a new file over the
@@ -2948,12 +3037,49 @@ impl RunningSandbox {
             is_disk_only: false,
         })
     }
+
+    /// A macOS sandbox's disk snapshot, staged into `dest`: its machine as
+    /// [`Self::capture_machine`] takes it, at the shape it has now.
+    async fn stage_machine_snapshot(
+        self: &Arc<Self>,
+        dest: &Path,
+        environment: &crate::oci::ImageEnvironment,
+    ) -> Result<crate::snapshot::Staged, Status> {
+        self.capture_machine(dest, environment).await?;
+        let _ = tokio::fs::remove_file(dest.join(crate::macnode::MACHINE_ID)).await;
+        Ok(crate::snapshot::Staged {
+            sandbox_id: self.id.clone(),
+            template: self.template.clone(),
+            hypervisor: self.hypervisor,
+            guest_os: self.guest_os(),
+            vcpus: self.vcpus(),
+            mem_mib: self.mem_mib(),
+            boot_mem_mib: self.boot_mem_mib(),
+            max_mem_mib: self.max_mem_mib(),
+            is_nested_virt_enabled: false,
+            disk_mib: size_mib(&dest.join(crate::macnode::DISK)),
+            kernel: None,
+            chain: Vec::new(),
+            inspection_root: String::new(),
+            is_disk_only: true,
+        })
+    }
 }
 
 /// Where the state a new sandbox restores from comes from.
 ///
 /// A live sandbox and a snapshot object hold the same files under the same
 /// names, which is what makes both restorable, so they differ only in the copy.
+/// How long cloning a paused macOS machine may hold it paused.
+const CAPTURE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
+/// Tries at resuming a guest paused for a capture before it is stopped.
+const RESUME_ATTEMPTS: usize = 3;
+
+/// Why a macOS guest's memory never leaves the Mac that ran it.
+const MAC_MEMORY_STAYS: &str = "a macOS guest's memory is saved in a file encrypted for the Mac that \
+     wrote it, so it cannot be checkpointed, snapshotted, moved or forked; its disk can be: \
+     leave is_memory_checkpointed unset for a disk checkpoint";
+
 /// What a macOS agent reports in Health when its Security framework trusts
 /// the inspection root it was given.
 const FEATURE_ROOT_TRUSTED: &str = "inspection-root-trusted";
@@ -2963,6 +3089,17 @@ const FEATURE_ROOT_TRUSTED: &str = "inspection-root-trusted";
 struct InspectionRoot {
     pem: String,
     fingerprint: String,
+}
+
+/// What a created sandbox's disk starts from, when not its template's image.
+#[derive(Clone, Copy)]
+pub(crate) enum Seed<'a> {
+    /// A Linux root disk to clone, as a template build resumes from a step.
+    Disk(&'a Path),
+    /// A stopped macOS machine's directory to clone and boot cold: a fork's
+    /// capture, or a disk snapshot. It carries the image environment, so the
+    /// template need not be on this node.
+    Machine(&'a Path),
 }
 
 enum RestoreSource<'a> {
@@ -5837,6 +5974,11 @@ impl SandboxManager {
         if lifetimes.checkpoint_secs.is_some_and(|secs| secs > 0) {
             self.require_checkpoint_store()?;
         }
+        if lifetimes.is_memory_checkpointed == Some(true)
+            && crate::macnode::is_macos(sandbox.guest_os())
+        {
+            return Err(Status::failed_precondition(MAC_MEMORY_STAYS));
+        }
         {
             let mut record = sandbox.base_record.lock().unwrap();
             let policy = record.policy.get_or_insert_with(Default::default);
@@ -8117,7 +8259,7 @@ impl SandboxManager {
         policy: common::Policy,
         tags: HashMap<String, String>,
         node_id: String,
-        seed_disk: Option<&Path>,
+        seed: Option<Seed<'_>>,
         name: String,
         request_id: String,
     ) -> Result<common::Sandbox, Status> {
@@ -8137,7 +8279,7 @@ impl SandboxManager {
         }
         // Held until the sandbox is registered running, so a create racing
         // this one sees it either starting or running.
-        let slot = match self.image_environment(&template).await.machine() {
+        let slot = match self.seeded_environment(&template, seed).await.machine() {
             Ok((_, guest_os)) => self.reserve_mac_slot(&id, guest_os).await,
             Err(_) => Ok(None),
         };
@@ -8151,14 +8293,7 @@ impl SandboxManager {
 
         phases.mark("claim");
         let provisioned = self
-            .provision_with(
-                id.clone(),
-                template,
-                policy,
-                seed_disk,
-                node_id,
-                &mut phases,
-            )
+            .provision_with(id.clone(), template, policy, seed, node_id, &mut phases)
             .await;
         let (sandbox, _disk, from_warm) = match provisioned {
             Ok(provisioned) => provisioned,
@@ -8292,7 +8427,7 @@ impl SandboxManager {
         id: String,
         template: String,
         mut policy: common::Policy,
-        seed_disk: Option<&Path>,
+        seed: Option<Seed<'_>>,
         node_id: String,
         phases: &mut burrow_vmm::Phases,
     ) -> Result<(Arc<RunningSandbox>, Admitted, bool), Status> {
@@ -8305,8 +8440,29 @@ impl SandboxManager {
         let templates_dir = self.config.templates_dir();
         // The template decides the hypervisor, for this sandbox and every VM
         // it will ever run.
-        let environment = self.image_environment(&template).await;
+        let environment = self.seeded_environment(&template, seed).await;
         let (hypervisor, guest_os) = environment.machine()?;
+        let (seed_disk, seed_machine) = match seed {
+            Some(Seed::Disk(disk)) => (Some(disk), None),
+            Some(Seed::Machine(dir)) => (None, Some(dir)),
+            None => (None, None),
+        };
+        if seed_machine.is_some() && !crate::macnode::is_macos(guest_os) {
+            return Err(Status::failed_precondition(format!(
+                "a {} guest is not created from a machine's directory",
+                guest_os.as_str()
+            )));
+        }
+        if crate::macnode::is_macos(guest_os)
+            && policy
+                .lifetime
+                .as_ref()
+                .is_some_and(|lifetime| lifetime.is_memory_checkpointed)
+        {
+            return Err(Status::failed_precondition(MAC_MEMORY_STAYS));
+        }
+        let machine_dir =
+            seed_machine.map_or_else(|| templates_dir.join(&template), Path::to_path_buf);
         self.require_hypervisor(hypervisor)?;
         self.require_nested_virt(
             hypervisor,
@@ -8336,8 +8492,7 @@ impl SandboxManager {
         // without a tap or a directory to give back.
         let disk_bytes = match crate::macnode::disk_file(guest_os) {
             Some(disk) => {
-                let bytes =
-                    crate::rootdisk::provisioned_bytes(&templates_dir.join(&template).join(disk));
+                let bytes = crate::rootdisk::provisioned_bytes(&machine_dir.join(disk));
                 resources.disk_mib =
                     u32::try_from(bytes.div_ceil(burrow_common::disk::MIB)).unwrap_or(u32::MAX);
                 bytes
@@ -8623,11 +8778,18 @@ impl SandboxManager {
                             })?;
                     }
                     let root = self.inspection_ca_for(&policy);
-                    crate::macnode::prepare(&templates_dir.join(&template), &workdir, &root)
+                    crate::macnode::prepare(&machine_dir, &workdir, &root)
                         .await
                         .map_err(|err| {
                             Status::failed_precondition(format!("template {template:?}: {err}"))
                         })?;
+                    if seed_machine.is_some() {
+                        crate::oci::keep_environment(&workdir, &environment)
+                            .await
+                            .map_err(|err| {
+                                Status::internal(format!("keeping the image environment: {err}"))
+                            })?;
+                    }
                 } else {
                     prepare_workdir(
                         &templates_dir.join(&template),
@@ -9099,13 +9261,15 @@ impl SandboxManager {
         crate::snapshot::validate_id(&snapshot_id)?;
         let sandbox = self.get(sandbox_id).await?;
         sandbox.refuse_copy()?;
+        let is_disk_only = crate::macnode::is_macos(sandbox.guest_os());
         let capture = sandbox.workdir.join(format!(".capture-{snapshot_id}"));
-        let is_captured = sandbox.is_running();
+        let is_captured = sandbox.is_running() && !is_disk_only;
         if is_captured {
             self.write_state(&sandbox, Some(&capture), &[], true)
                 .await?;
-        } else if sandbox.state.load(std::sync::atomic::Ordering::Relaxed)
-            != common::SandboxState::Suspended as i32
+        } else if !is_disk_only
+            && sandbox.state.load(std::sync::atomic::Ordering::Relaxed)
+                != common::SandboxState::Suspended as i32
         {
             return Err(Status::failed_precondition(
                 "only a running or suspended sandbox can be snapshotted",
@@ -9121,7 +9285,9 @@ impl SandboxManager {
         };
 
         let started = std::time::Instant::now();
+        let environment = self.environment_of(&sandbox).await;
         let staged = match self.snapshots.begin(&snapshot_id).await {
+            Ok(dir) if is_disk_only => sandbox.stage_machine_snapshot(&dir, &environment).await,
             Ok(dir) => {
                 sandbox
                     .stage_snapshot(&dir, is_captured.then_some(capture.as_path()))
@@ -9204,6 +9370,11 @@ impl SandboxManager {
         request_id: String,
     ) -> Result<common::Sandbox, Status> {
         let manifest = self.snapshots.manifest_for_restore(snapshot_id).await?;
+        if manifest.is_disk_only {
+            return self
+                .create_from_disk_snapshot(id, &manifest, policy, tags, node_id, name, request_id)
+                .await;
+        }
         let mut policy = policy;
         let wanted = policy.resources.clone().unwrap_or_default();
         let hypervisor = manifest.hypervisor()?;
@@ -9300,6 +9471,65 @@ impl SandboxManager {
         Ok(record)
     }
 
+    /// Creates a sandbox from a macOS machine's disk snapshot by booting it
+    /// cold, as a create from a template does, at the shape it was taken
+    /// with.
+    #[allow(clippy::too_many_arguments)]
+    async fn create_from_disk_snapshot(
+        &self,
+        id: String,
+        manifest: &crate::snapshot::Manifest,
+        policy: common::Policy,
+        tags: HashMap<String, String>,
+        node_id: String,
+        name: String,
+        request_id: String,
+    ) -> Result<common::Sandbox, Status> {
+        let snapshot_id = &manifest.id;
+        let dir = self.snapshots.machine_dir(snapshot_id).await?;
+        let mut policy = policy;
+        let environment =
+            crate::oci::sandbox_environment(&self.config.data_dir, &dir, &manifest.template).await;
+        let from = RestoredShape {
+            hypervisor: manifest.hypervisor()?,
+            guest_os: environment
+                .machine()
+                .map_or_else(|_| Default::default(), |(_, os)| os),
+            vcpus: manifest.vcpus,
+            max_vcpus: manifest.vcpus,
+            mem_mib: manifest.mem_mib,
+            boot_mem_mib: manifest.boot_mem_mib,
+            max_mem_mib: manifest.max_mem_mib,
+            disk_mib: manifest.disk_mib,
+            cpu_floor_millis: 0,
+        };
+        plan_reshape(
+            &format!("a sandbox created from snapshot {snapshot_id}"),
+            &from,
+            &policy.resources.clone().unwrap_or_default(),
+        )?;
+        policy.resources = Some(manifest.resources(policy.resources.take().unwrap_or_default()));
+        let record = self
+            .create_seeded(
+                id,
+                manifest.template.clone(),
+                policy,
+                tags,
+                node_id,
+                Some(Seed::Machine(&dir)),
+                name,
+                request_id,
+            )
+            .await?;
+        self.snapshots.touch(snapshot_id).await;
+        tracing::info!(
+            snapshot = snapshot_id,
+            sandbox = record.id,
+            "sandbox booted from a disk snapshot"
+        );
+        Ok(record)
+    }
+
     /// Creates a sandbox from another's current state.
     ///
     /// A running source is checkpointed first, so the child starts from the
@@ -9342,6 +9572,15 @@ impl SandboxManager {
         self.require_settled(source_id)?;
         let source = self.get(source_id).await?;
         source.refuse_copy()?;
+        if crate::macnode::is_macos(source.guest_os()) {
+            return self
+                .detached(move |manager| async move {
+                    manager
+                        .fork_mac(&source, child_id, policy, node_id, name)
+                        .await
+                })
+                .await;
+        }
 
         // Claimed the same way a create claims one, and before any state is
         // captured: two forks naming the same child would otherwise share a
@@ -9383,6 +9622,67 @@ impl SandboxManager {
         // then, and a flatten now would be a merge and an fsync for nothing.
         self.persist(&sandbox).await;
         tracing::info!(source = source_id, sandbox = child_id, "sandbox forked");
+        Ok(record)
+    }
+
+    /// Forks a macOS sandbox by its disk: a clone of its machine with a new
+    /// identity, booted cold on this Mac and counted against its guests. Its
+    /// memory stays behind, since the framework restores a saved state only
+    /// into the machine it was saved from, and into one at a time.
+    async fn fork_mac(
+        &self,
+        source: &Arc<RunningSandbox>,
+        child_id: String,
+        policy: Option<common::Policy>,
+        node_id: String,
+        name: String,
+    ) -> Result<common::Sandbox, Status> {
+        let source_id = source.id().to_string();
+        let state = source.state.load(std::sync::atomic::Ordering::Relaxed);
+        if ![
+            common::SandboxState::Running,
+            common::SandboxState::Suspended,
+            common::SandboxState::Stopped,
+        ]
+        .iter()
+        .any(|allowed| *allowed as i32 == state)
+        {
+            return Err(Status::failed_precondition(
+                "only a running, suspended or shut-down macOS sandbox can be forked",
+            ));
+        }
+        let (policy, wanted, tags) = Self::fork_policy(source, policy);
+        if let Some(wanted) = &wanted {
+            plan_reshape("a fork", &source.restored_shape(), wanted)?;
+        }
+        let _slot = self.reserve_mac_slot(&child_id, source.guest_os()).await?;
+        let staged = self
+            .config
+            .sandbox_dir(&format!(".fork-{child_id}"), source.hypervisor);
+        let _ = tokio::fs::remove_dir_all(&staged).await;
+        let environment = self.environment_of(source).await;
+        let created = async {
+            source.capture_machine(&staged, &environment).await?;
+            self.create_seeded(
+                child_id.clone(),
+                source.template().to_string(),
+                policy,
+                tags,
+                node_id,
+                Some(Seed::Machine(&staged)),
+                name,
+                String::new(),
+            )
+            .await
+        }
+        .await;
+        let _ = tokio::fs::remove_dir_all(&staged).await;
+        let record = created?;
+        tracing::info!(
+            source = source_id,
+            sandbox = child_id,
+            "macOS sandbox forked by its disk"
+        );
         Ok(record)
     }
 
@@ -10489,6 +10789,21 @@ impl SandboxManager {
         crate::oci::image_environment(&self.config.data_dir, template).await
     }
 
+    /// The environment a create runs with: a seeding machine's own where it
+    /// carries one, and its template's otherwise.
+    async fn seeded_environment(
+        &self,
+        template: &str,
+        seed: Option<Seed<'_>>,
+    ) -> crate::oci::ImageEnvironment {
+        match seed {
+            Some(Seed::Machine(dir)) => {
+                crate::oci::sandbox_environment(&self.config.data_dir, dir, template).await
+            }
+            _ => self.image_environment(template).await,
+        }
+    }
+
     /// Records what a Kit sandbox runs with, so execs and later boots see it.
     pub async fn set_kit(
         &self,
@@ -10864,6 +11179,49 @@ impl SandboxManager {
         Ok(true)
     }
 
+    /// Stores a shut-down macOS sandbox's machine, its disk and identity, as
+    /// a disk checkpoint marked suspended: what another Mac boots it from.
+    async fn make_machine_durable(&self, sandbox: &Arc<RunningSandbox>) -> Result<(), Status> {
+        let Some(store) = &self.config.object_store else {
+            return Err(Status::failed_precondition("this node has no object store"));
+        };
+        let _uploading = sandbox.durable.upload.lock().await;
+        let previous = sandbox.durable.stored.lock().unwrap().clone();
+        let Some(mut draft) = self.draft_manifest(sandbox, previous.as_ref()).await? else {
+            return Err(Status::failed_precondition(format!(
+                "sandbox {} holds brokered credentials and this node has no \
+                 --object-store-key-file to store them with",
+                sandbox.id()
+            )));
+        };
+        draft.state = crate::durable::STATE_SUSPENDED.to_string();
+        let capture = sandbox.workdir.join(".release.img");
+        crate::rootdisk::clone(&sandbox.disk_path(), &capture)
+            .await
+            .map_err(|err| Status::internal(format!("capturing the disk: {err}")))?;
+        let stamp = crate::durable::Stamp::of(&sandbox.disk_path())
+            .map_err(|err| Status::internal(format!("reading the disk: {err}")))?;
+        let image = self.disk_image_of(sandbox).await;
+        let uploaded = crate::durable::upload_disk_checkpoint(
+            store,
+            &crate::blobs::BlobStore::new(&self.config.data_dir),
+            &sandbox.workdir,
+            &capture,
+            image.as_deref(),
+            stamp,
+            draft,
+            previous.as_ref(),
+        )
+        .await;
+        let _ = tokio::fs::remove_file(&capture).await;
+        *sandbox.durable.stored.lock().unwrap() = Some(uploaded?);
+        sandbox
+            .durable
+            .is_current
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+        Ok(())
+    }
+
     /// What a manifest says about a sandbox, before an upload fills in its
     /// generation and digests. `None` when its brokered credentials cannot be
     /// sealed for the store.
@@ -11196,6 +11554,13 @@ impl SandboxManager {
             ));
         }
         let sandbox = self.get(id).await?;
+        let is_machine = crate::macnode::is_macos(sandbox.guest_os());
+        if is_machine && sandbox.is_suspended() {
+            return Err(Status::failed_precondition(format!(
+                "sandbox {id} is suspended, and a macOS guest's saved memory restores only on \
+                 this Mac; resume it, or shut it down (`burrow shutdown {id}`), and move its disk"
+            )));
+        }
         if !self.is_movable(&sandbox) {
             return Err(Status::failed_precondition(match sandbox.has_tpm() {
                 true => "a sandbox with a TPM stays on the node holding its TPM's state",
@@ -11224,10 +11589,32 @@ impl SandboxManager {
                 )));
             }
         }
-        if sandbox.is_running() {
+        if is_machine {
+            let was_running = sandbox.is_running();
+            if was_running {
+                self.halt(&sandbox, false).await?;
+            }
+            if let Err(err) = self.make_machine_durable(&sandbox).await {
+                if !was_running {
+                    return Err(err);
+                }
+                return Err(match self.start(id, true).await {
+                    Ok(_) => err,
+                    Err(boot) => Status::new(
+                        err.code(),
+                        format!(
+                            "{}; sandbox {id} was shut down for the move and did not boot again \
+                             ({}), so it is stopped on its disk",
+                            err.message(),
+                            boot.message()
+                        ),
+                    ),
+                });
+            }
+        } else if sandbox.is_running() {
             self.pause(id).await?;
         }
-        if !self.make_durable(&sandbox).await? {
+        if !is_machine && !self.make_durable(&sandbox).await? {
             return Err(Status::failed_precondition(format!(
                 "sandbox {id} could not be stored: it must be suspended, and one holding \
                  brokered credentials needs --object-store-key-file on every node"
@@ -11592,8 +11979,15 @@ impl SandboxManager {
             }
             Ok::<_, Status>(local)
         };
-        let (staged, tap) = tokio::join!(stage, tap::create(&lease));
-        guard.tap = tap.as_ref().ok().cloned();
+        let is_tapped = hypervisor.capabilities().is_tap_networked;
+        let tapped = async {
+            match is_tapped {
+                true => tap::create(&lease).await,
+                false => Ok(String::new()),
+            }
+        };
+        let (staged, tap) = tokio::join!(stage, tapped);
+        guard.tap = tap.as_ref().ok().filter(|name| !name.is_empty()).cloned();
         let local = match staged {
             Ok(local) => local,
             Err(err) => return Err(guard.fail(err).await),

@@ -494,7 +494,7 @@ async fn run_build(
             policy,
             Default::default(),
             node_id.to_string(),
-            seed.as_deref(),
+            seed.as_deref().map(crate::sandbox::Seed::Disk),
             // A build sandbox is internal and short-lived; naming it would
             // spend a name from a namespace the caller owns.
             String::new(),

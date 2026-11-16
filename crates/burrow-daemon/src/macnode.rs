@@ -44,6 +44,26 @@ pub const HARDWARE_MODEL: &str = "hardware-model";
 pub const REQUIREMENTS: &str = "requirements.json";
 pub const MACHINE_ID: &str = "machine-id";
 
+/// Clones the machine in `workdir` into `dest` as a cold boot needs it: its
+/// disk and auxiliary storage, its hardware model and requirements, and a
+/// fresh identity. The machine must not be running, or must be paused.
+pub async fn capture(workdir: &Path, dest: &Path) -> std::io::Result<()> {
+    #[cfg(target_os = "macos")]
+    {
+        let (from, to) = (workdir.to_path_buf(), dest.to_path_buf());
+        tokio::task::spawn_blocking(move || burrow_vmm::vz::clone_machine(&from, &to, false))
+            .await
+            .map_err(std::io::Error::other)?
+            .map(drop)
+            .map_err(std::io::Error::other)
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = (workdir, dest);
+        Err(std::io::Error::other("macOS guests need a macOS node"))
+    }
+}
+
 /// Makes `workdir` a new machine cloned from the template in `template_dir`,
 /// [`seed`]ed with `root_pem`.
 pub async fn prepare(template_dir: &Path, workdir: &Path, root_pem: &str) -> std::io::Result<()> {
