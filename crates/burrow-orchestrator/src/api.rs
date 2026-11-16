@@ -1929,6 +1929,8 @@ impl ApiService {
             .map(|m| m.network.clone())
             .filter(|name| !name.is_empty())
             .collect();
+        let is_booted = sandbox.checkpoint_at_unix_ms > 0
+            && sandbox.checkpoint_kind == common::CheckpointKind::Disk as i32;
         crate::registry::Placement {
             template: sandbox.template.clone(),
             prefer_node: self.0.sandboxes.node_hosting_networks(&networks),
@@ -1951,18 +1953,17 @@ impl ApiService {
             is_template_transfer_allowed: true,
             node_labels,
             arch: sandbox.arch.clone(),
-            // A disk checkpoint is booted, not restored, so any version will do.
-            hypervisor_version: match sandbox.checkpoint_at_unix_ms > 0
-                && sandbox.checkpoint_kind == common::CheckpointKind::Disk as i32
-            {
+            // A disk checkpoint is booted, not restored, so any version will
+            // do, and a macOS guest only ever moves by its disk.
+            hypervisor_version: match is_booted || sandbox.hypervisor == Hypervisor::Vz.as_str() {
                 true => String::new(),
                 false => sandbox.hypervisor_version.clone(),
             },
             // A stopped sandbox is booted from its disk too.
             cpu: sandbox.cpu.clone().filter(|_| {
                 sandbox.state != common::SandboxState::Stopped as i32
-                    && !(sandbox.checkpoint_at_unix_ms > 0
-                        && sandbox.checkpoint_kind == common::CheckpointKind::Disk as i32)
+                    && !is_booted
+                    && sandbox.hypervisor != Hypervisor::Vz.as_str()
             }),
             hypervisor: sandbox.hypervisor.clone(),
             policy_features: crate::registry::policy_features(
@@ -2761,6 +2762,14 @@ impl Burrow for ApiService {
         if req.node_id == source {
             return Err(Status::invalid_argument(format!(
                 "sandbox {id} is already on node {source}"
+            )));
+        }
+        if current.hypervisor == Hypervisor::Vz.as_str()
+            && current.state == common::SandboxState::Suspended as i32
+        {
+            return Err(Status::failed_precondition(format!(
+                "sandbox {id} is suspended, and a macOS guest's saved memory restores only on \
+                 the Mac that wrote it; resume it, or shut it down, and move its disk"
             )));
         }
         // Refused before anything is suspended: a volume follows the
