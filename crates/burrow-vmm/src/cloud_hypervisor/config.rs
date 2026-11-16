@@ -183,7 +183,7 @@ pub(crate) fn vm_config(
         vm["vsock"] = json!({ "id": "vsock", "cid": GUEST_CID, "socket": VSOCK_UDS });
     }
     if let Some(tpm) = &spec.tpm {
-        vm["tpm"] = json!({ "socket": super::tpm::socket(tpm, &spec.workdir) });
+        vm["tpm"] = json!({ "socket": super::tpm::socket(tpm) });
     }
     Ok(vm)
 }
@@ -529,29 +529,21 @@ mod tests {
         ));
     }
 
-    /// A TPM kept in the working directory is named relative to it, so a
-    /// jailed VMM finds it there; one kept elsewhere by its absolute path,
-    /// which the jail binds in.
+    /// The TPM socket is named by its absolute path, which a jail binds in.
     #[test]
-    fn a_tpm_socket_is_relative_to_the_workdir_when_it_is_in_it() {
+    fn a_tpm_socket_is_named_by_its_path() {
         let mut windows = spec();
         windows.guest_os = GuestOs::Windows;
         windows.vcpus = 2;
         windows.mem_mib = 4096;
         windows.tpm = Some(crate::TpmSpec {
             swtpm: "swtpm".into(),
-            dir: windows.workdir.join("tpm"),
-        });
-        let vm = vm_config(&windows, &config(), "x86_64").unwrap();
-        assert_eq!(vm["tpm"], json!({ "socket": "tpm/swtpm.sock" }));
-        windows.tpm = Some(crate::TpmSpec {
-            swtpm: "swtpm".into(),
-            dir: "/var/lib/swtpm/burrow/sbx_a".into(),
+            dir: "/var/lib/burrow/tpm/sbx_a".into(),
         });
         let vm = vm_config(&windows, &config(), "x86_64").unwrap();
         assert_eq!(
             vm["tpm"],
-            json!({ "socket": "/var/lib/swtpm/burrow/sbx_a/swtpm.sock" })
+            json!({ "socket": "/var/lib/burrow/tpm/sbx_a/swtpm.sock" })
         );
         assert_eq!(
             vm_config(&spec(), &config(), "x86_64").unwrap().get("tpm"),

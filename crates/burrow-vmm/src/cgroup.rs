@@ -225,6 +225,12 @@ impl Cgroup {
         &self.path
     }
 
+    /// Moves a process the VM depends on into this cgroup, to be counted
+    /// and capped with it.
+    pub(crate) fn add(&self, pid: u32) -> Result<()> {
+        write(&self.path.join("cgroup.procs"), &pid.to_string())
+    }
+
     /// Moves the VMM to a cgroup of its own beside this one until the
     /// returned guard drops, for the length of a snapshot. Only for a paused
     /// guest: its vCPUs run without the cgroup's CPU limits until then.

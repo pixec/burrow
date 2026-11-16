@@ -492,8 +492,8 @@ pub struct VmSpec {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TpmSpec {
     pub swtpm: PathBuf,
-    /// The emulator's state and control socket. Inside `workdir` it travels
-    /// with the VM's other files.
+    /// The emulator's state and control socket, outside the VM's working
+    /// directory.
     pub dir: PathBuf,
 }
 

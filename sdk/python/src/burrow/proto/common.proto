@@ -596,6 +596,8 @@ message Sandbox {
   // Windows guests created with an activation: how they activate, and how
   // the last attempt went.
   WindowsActivation activation = 41;
+  // It has a TPM of its own, as its template asked when it was created.
+  bool is_tpm = 42;
 }
 
 message WindowsActivation {

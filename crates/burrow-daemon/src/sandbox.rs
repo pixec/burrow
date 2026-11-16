@@ -201,7 +201,7 @@ pub struct NodeConfig {
     pub cloud_hypervisor: burrow_vmm::CloudHypervisorConfig,
     /// swtpm, for templates whose sandboxes get a TPM.
     pub swtpm: PathBuf,
-    /// Where those TPMs keep their state; `None` is each sandbox's working
+    /// Where those TPMs keep their state; `None` is `tpm/` under the data
     /// directory.
     pub tpm_state_dir: Option<PathBuf>,
     /// The hypervisors this node offers, as it advertises them. A template or
@@ -353,13 +353,14 @@ impl NodeConfig {
     /// Under the jailer this *is* the chroot the VMM is pivoted into, because
     /// everything firecracker touches has to be inside it and every path
     /// burrow hands the API is already relative.
-    /// Where `id`'s TPM is, when its template gives it one.
-    pub(crate) fn tpm(&self, id: &str, workdir: &Path) -> burrow_vmm::TpmSpec {
+    /// Where `id`'s TPM is, when its template gives it one: never in its
+    /// working directory, which a jailed VMM owns.
+    pub(crate) fn tpm(&self, id: &str) -> burrow_vmm::TpmSpec {
         burrow_vmm::TpmSpec {
             swtpm: self.swtpm.clone(),
             dir: match &self.tpm_state_dir {
                 Some(root) => root.join(id),
-                None => workdir.join("tpm"),
+                None => self.data_dir.join("tpm").join(id),
             },
         }
     }
@@ -1051,7 +1052,7 @@ impl<'a> Provisioning<'a> {
         self.manager.release_lease(&self.id).await;
         self.manager.volumes.release_all(&self.id);
         let _ = self.manager.config.remove_workdir(&self.workdir).await;
-        let tpm = self.manager.config.tpm(&self.id, &self.workdir);
+        let tpm = self.manager.config.tpm(&self.id);
         let _ = tokio::fs::remove_dir_all(tpm.dir).await;
         let _ = tokio::fs::remove_dir_all(self.manager.config.command_logs_dir(&self.id)).await;
         self.is_kept = true;
@@ -1100,7 +1101,7 @@ impl Drop for Provisioning<'_> {
                 manager.release_lease(&id).await;
                 manager.volumes.release_all(&id);
                 let _ = manager.config.remove_workdir(&workdir).await;
-                let _ = tokio::fs::remove_dir_all(manager.config.tpm(&id, &workdir).dir).await;
+                let _ = tokio::fs::remove_dir_all(manager.config.tpm(&id).dir).await;
             });
         }
     }
@@ -1570,7 +1571,20 @@ impl RunningSandbox {
 
     /// Whether the guest has a TPM of its own, which nothing copies.
     fn has_tpm(&self) -> bool {
-        self.spec.lock().unwrap().tpm.is_some()
+        self.base_record.lock().unwrap().is_tpm
+    }
+
+    /// Refuses a copy of a sandbox with a TPM, which would hold the same
+    /// TPM's keys.
+    #[allow(clippy::result_large_err)]
+    fn refuse_copy(&self) -> Result<(), Status> {
+        match self.has_tpm() {
+            true => Err(Status::failed_precondition(format!(
+                "sandbox {} has a TPM, and a copy of it would hold the same TPM's keys",
+                self.id
+            ))),
+            false => Ok(()),
+        }
     }
 
     fn guest_os(&self) -> burrow_vmm::GuestOs {
@@ -2569,12 +2583,7 @@ impl RunningSandbox {
         logs: Option<&Path>,
         capture: Option<&Path>,
     ) -> Result<Vec<String>, Status> {
-        if self.has_tpm() {
-            return Err(Status::failed_precondition(format!(
-                "sandbox {} has a TPM, and a copy of it would hold the same TPM's keys",
-                self.id
-            )));
-        }
+        self.refuse_copy()?;
         self.durable.settle_memory().await;
         let _slot = self.vm.lock().await;
         let chain = self.memory_chain.lock().await.clone();
@@ -4070,7 +4079,7 @@ impl SandboxManager {
             &volumes,
             environment.booted_systemd(),
             stored_policy.is_console_verbose,
-            environment.tpm,
+            record.is_tpm,
         );
 
         let sandbox = Arc::new(RunningSandbox {
@@ -7610,7 +7619,7 @@ impl SandboxManager {
             spec.boot = crate::boot::firmware_boot();
         }
         if is_tpm {
-            spec.tpm = Some(self.config.tpm(id, workdir));
+            spec.tpm = Some(self.config.tpm(id));
         }
         if crate::macnode::is_macos(guest_os)
             && let Err(err) = crate::macnode::apply(&mut spec, resources)
@@ -8465,6 +8474,7 @@ impl SandboxManager {
             guest_os: guest_os.as_str().to_string(),
             inspection_root_fingerprint: inspection_root,
             kernel,
+            is_tpm: environment.tpm,
             // Tags and name are stamped a moment later by the caller's
             // create; usage, reachability and the handshake are filled in
             // from the live sandbox on every read.
@@ -8693,6 +8703,7 @@ impl SandboxManager {
         self.require_settled(sandbox_id)?;
         crate::snapshot::validate_id(&snapshot_id)?;
         let sandbox = self.get(sandbox_id).await?;
+        sandbox.refuse_copy()?;
         let capture = sandbox.workdir.join(format!(".capture-{snapshot_id}"));
         let is_captured = sandbox.is_running();
         if is_captured {
@@ -8898,6 +8909,7 @@ impl SandboxManager {
     ) -> Result<common::Sandbox, Status> {
         self.require_settled(source_id)?;
         let source = self.get(source_id).await?;
+        source.refuse_copy()?;
 
         // Claimed the same way a create claims one, and before any state is
         // captured: two forks naming the same child would otherwise share a
@@ -9313,7 +9325,7 @@ impl SandboxManager {
             },
             environment.booted_systemd(),
             policy.is_console_verbose,
-            environment.tpm,
+            false,
         );
         // The template's plan names the pages its agent touches on the way to
         // a usable handshake, which is the same code whether the guest was
@@ -9783,7 +9795,7 @@ impl SandboxManager {
             boot_volumes,
             environment.booted_systemd(),
             policy.is_console_verbose,
-            environment.tpm,
+            record.is_tpm,
         );
         let from = self.boundary(&sandbox).await;
         if let Err(err) = self.usernets.attach(id, &sandbox.lease, &mut spec) {
@@ -10014,8 +10026,7 @@ impl SandboxManager {
         if let Err(err) = self.config.remove_workdir(&workdir).await {
             tracing::warn!(sandbox = id, %err, "failed to remove sandbox directory");
         }
-        // A TPM kept outside the working directory, by `--tpm-state-dir`.
-        let _ = tokio::fs::remove_dir_all(self.config.tpm(id, &workdir).dir).await;
+        let _ = tokio::fs::remove_dir_all(self.config.tpm(id).dir).await;
         let _ = tokio::fs::remove_dir_all(self.config.command_logs_dir(id)).await;
         rendered
     }
@@ -11022,7 +11033,7 @@ impl SandboxManager {
             &policy.volumes,
             manifest.is_systemd.then_some(&manifest.image.systemd_boot),
             policy.is_console_verbose,
-            manifest.image.tpm,
+            false,
         );
         let record = common::Sandbox {
             id: id.clone(),
@@ -11661,7 +11672,9 @@ pub(crate) async fn grant_to_jail(
         // handed over: firecracker cannot traverse its own chroot without it.
         chown(&workdir, uid, gid)?;
         for entry in std::fs::read_dir(&workdir)?.flatten() {
-            if shared.contains(&entry.file_name().to_string_lossy().into_owned()) {
+            let name = entry.file_name().to_string_lossy().into_owned();
+            // A TPM's state is never the jail's, whoever put it here.
+            if name == "tpm" || shared.contains(&name) {
                 continue;
             }
             chown(&entry.path(), uid, gid)?;

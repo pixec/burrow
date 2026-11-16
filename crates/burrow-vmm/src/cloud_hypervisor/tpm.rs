@@ -7,13 +7,18 @@
 //! kill saved, which the emulator resumes from when the restored VMM
 //! initialises it. Stopping the VMM saves that volatile state and stops the
 //! emulator.
+//!
+//! The state is kept outside the VM's working directory, which a jailed VMM
+//! owns, and a jailed VMM is shown the socket alone. swtpm runs as the jail's
+//! uid, under its own seccomp filter, in the VM's cgroup. It is not
+//! chrooted: Ubuntu's AppArmor profile for it refuses `CAP_SYS_CHROOT`.
 
 use std::path::{Path, PathBuf};
 
 use crate::TpmSpec;
 use crate::error::{Error, Result};
 
-pub(crate) const SOCKET: &str = "swtpm.sock";
+const SOCKET: &str = "swtpm.sock";
 const PID: &str = "swtpm.pid";
 const LOG: &str = "swtpm.log";
 const VOLATILE: &str = "tpm2-00.volatilestate";
@@ -22,59 +27,61 @@ const VOLATILE: &str = "tpm2-00.volatilestate";
 const CMD_SHUTDOWN: u32 = 3;
 const CMD_STORE_VOLATILE: u32 = 10;
 
-/// The socket as the VM config names it: relative to the working directory
-/// when the state is in it, so a jailed VMM finds it there too.
-pub(crate) fn socket(tpm: &TpmSpec, workdir: &Path) -> PathBuf {
-    let socket = tpm.dir.join(SOCKET);
-    match socket.strip_prefix(workdir) {
-        Ok(relative) => relative.to_path_buf(),
-        Err(_) => socket,
-    }
+/// The socket the VM config names, which a jail binds in by this path.
+pub(crate) fn socket(tpm: &TpmSpec) -> PathBuf {
+    tpm.dir.join(SOCKET)
 }
 
 /// Starts the emulator, after stopping one a VMM that ended left running.
-/// `is_fresh` drops saved volatile state, for a boot.
-///
-/// A jailed VMM runs as another uid, so the socket is left open to every uid
-/// and what guards it is the directory: closed to all but root when the VMM
-/// reaches the socket through a bind mount of it alone, and only passable
-/// inside the working directory, which is the jail's own. Handing the socket
-/// to the jail's uid instead breaks Ubuntu's AppArmor profile for swtpm,
-/// which lets it write only to files it owns.
-pub(crate) async fn start(
-    tpm: &TpmSpec,
-    workdir: &Path,
-    is_fresh: bool,
-    is_jailed: bool,
-) -> Result<()> {
+/// `is_fresh` drops saved volatile state, for a boot. `owner` is the uid and
+/// gid a jailed VMM runs as, which the emulator runs as too, its state and
+/// socket that uid's alone; unjailed, both are root's.
+pub(crate) async fn start(tpm: &TpmSpec, is_fresh: bool, owner: Option<(u32, u32)>) -> Result<()> {
     use std::os::unix::fs::PermissionsExt as _;
-    tokio::fs::create_dir_all(&tpm.dir).await?;
-    let dir_mode = match is_jailed && tpm.dir.starts_with(workdir) {
-        true => 0o711,
-        false => 0o700,
-    };
-    tokio::fs::set_permissions(&tpm.dir, std::fs::Permissions::from_mode(dir_mode)).await?;
     stop(tpm, false).await;
+    if let Some(parent) = tpm.dir.parent() {
+        tokio::fs::create_dir_all(parent).await?;
+        // Passable, not listable, to the uid the emulator runs as.
+        tokio::fs::set_permissions(parent, std::fs::Permissions::from_mode(0o711)).await?;
+    }
+    tokio::fs::create_dir_all(&tpm.dir).await?;
+    let (uid, gid) = owner.unwrap_or((0, 0));
+    let dir = tpm.dir.clone();
+    tokio::task::spawn_blocking(move || {
+        std::os::unix::fs::lchown(&dir, Some(uid), Some(gid))?;
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700))?;
+        for entry in std::fs::read_dir(&dir)? {
+            std::os::unix::fs::lchown(entry?.path(), Some(uid), Some(gid))?;
+        }
+        Ok::<_, std::io::Error>(())
+    })
+    .await
+    .map_err(std::io::Error::other)??;
     if is_fresh {
         let _ = tokio::fs::remove_file(tpm.dir.join(VOLATILE)).await;
     }
-    let mode = if is_jailed { "0666" } else { "0600" };
-    let ctrl = format!(
-        "type=unixio,path={},mode={mode}",
-        tpm.dir.join(SOCKET).display()
-    );
-    let output = tokio::process::Command::new(&tpm.swtpm)
+    let mut command = tokio::process::Command::new(&tpm.swtpm);
+    command
         .arg("socket")
         .arg("--tpm2")
         .arg("--tpmstate")
         .arg(format!("dir={}", tpm.dir.display()))
         .arg("--ctrl")
-        .arg(ctrl)
+        .arg(format!(
+            "type=unixio,path={},mode=0600",
+            socket(tpm).display()
+        ))
         .arg("--pid")
         .arg(format!("file={}", tpm.dir.join(PID).display()))
         .arg("--log")
         .arg(format!("file={},level=1", tpm.dir.join(LOG).display()))
-        .arg("--daemon")
+        .arg("--seccomp")
+        .arg("action=kill")
+        .arg("--daemon");
+    if owner.is_some() {
+        command.arg("--runas").arg(uid.to_string());
+    }
+    let output = command
         .output()
         .await
         .map_err(|err| Error::Tpm(format!("starting {}: {err}", tpm.swtpm.display())))?;
@@ -89,25 +96,57 @@ pub(crate) async fn start(
     Ok(())
 }
 
+/// The emulator's pid, when the pid file names a live swtpm serving this
+/// state directory: the file is in a directory the emulator's uid writes.
+pub(crate) fn pid(tpm: &TpmSpec) -> Option<u32> {
+    let pid: u32 = std::fs::read_to_string(tpm.dir.join(PID))
+        .ok()?
+        .trim()
+        .parse()
+        .ok()?;
+    let exe = std::fs::read_link(format!("/proc/{pid}/exe")).ok()?;
+    if exe != std::fs::canonicalize(&tpm.swtpm).ok()? {
+        return None;
+    }
+    let cmdline = std::fs::read(format!("/proc/{pid}/cmdline")).ok()?;
+    let state = format!("dir={}", tpm.dir.display());
+    cmdline
+        .split(|b| *b == 0)
+        .any(|arg| arg == state.as_bytes())
+        .then_some(pid)
+}
+
 /// Stops the emulator, first having it save its volatile state when
-/// `is_saved`, for a restore to resume from.
+/// `is_saved`, for a restore to resume from. Signalled only when it does not
+/// answer its control socket.
 pub(crate) async fn stop(tpm: &TpmSpec, is_saved: bool) {
-    let socket = tpm.dir.join(SOCKET);
+    let socket = socket(tpm);
     let commands: &[u32] = match is_saved {
         true => &[CMD_STORE_VOLATILE, CMD_SHUTDOWN],
         false => &[CMD_SHUTDOWN],
     };
-    if let Err(err) = control(&socket, commands).await
-        && is_saved
-    {
-        tracing::warn!(dir = %tpm.dir.display(), %err, "could not save the TPM's volatile state");
+    let running = pid(tpm);
+    match control(&socket, commands).await {
+        Ok(()) => {}
+        Err(err) => {
+            if is_saved {
+                tracing::warn!(dir = %tpm.dir.display(), %err, "could not save the TPM's volatile state");
+            }
+            if let Some(pid) = running {
+                // SAFETY: a plain signal to a process just checked to be this
+                // TPM's swtpm.
+                unsafe { libc::kill(pid as i32, libc::SIGTERM) };
+            }
+        }
     }
-    // A shutdown the emulator never heard, from one hung or gone.
-    if let Ok(pid) = tokio::fs::read_to_string(tpm.dir.join(PID)).await
-        && let Ok(pid) = pid.trim().parse::<i32>()
-    {
-        // SAFETY: a plain signal to the pid swtpm recorded.
-        unsafe { libc::kill(pid, libc::SIGTERM) };
+    // Gone before the VM's cgroup, which it is in, is removed.
+    if let Some(pid) = running {
+        for _ in 0..40 {
+            if !Path::new(&format!("/proc/{pid}")).exists() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
     }
     let _ = tokio::fs::remove_file(tpm.dir.join(PID)).await;
     let _ = tokio::fs::remove_file(&socket).await;

@@ -86,8 +86,8 @@ pub struct ServeArgs {
     #[arg(long, default_value = "/usr/bin/swtpm")]
     pub swtpm: PathBuf,
     /// Where each sandbox's TPM state is kept, in a directory named for it.
-    /// Unset keeps it in the sandbox's working directory. Ubuntu's AppArmor
-    /// profile for swtpm lets it write only under a few paths, among them
+    /// Unset is `tpm/` under the data directory. Ubuntu's AppArmor profile
+    /// for swtpm lets it write only under a few paths, among them
     /// `/var/lib/swtpm`; elsewhere it needs a local rule.
     #[arg(long)]
     pub tpm_state_dir: Option<PathBuf>,
