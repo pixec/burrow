@@ -12238,7 +12238,8 @@ pub(crate) mod tests {
     pub(crate) async fn manager() -> SandboxManager {
         let manager = SandboxManager::new(
             NodeConfig {
-                data_dir: std::env::temp_dir().join(format!("burrow-fork-{}", std::process::id())),
+                data_dir: std::env::temp_dir()
+                    .join(format!("burrow-manager-{}", uuid::Uuid::new_v4().simple())),
                 firecracker_bin: "/nonexistent/firecracker".into(),
                 firecracker_io_engine: Default::default(),
                 is_firecracker_huge_page_fill_enabled: true,
@@ -12304,6 +12305,14 @@ pub(crate) mod tests {
             .await
             .unwrap();
         manager
+    }
+
+    /// Tests run in parallel and remove templates' warm directories, so two
+    /// managers must not share a data directory.
+    #[tokio::test]
+    async fn every_test_manager_has_a_data_dir_of_its_own() {
+        let (a, b) = (manager().await, manager().await);
+        assert_ne!(a.config.data_dir, b.config.data_dir);
     }
 
     /// A node creates nothing until it has a slice, and once it holds
