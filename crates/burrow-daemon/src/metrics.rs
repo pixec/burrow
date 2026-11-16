@@ -43,6 +43,8 @@ impl Reading {
 
 /// How the node's object-store collector is faring. A collector that cannot
 /// finish a pass deletes nothing, so the store grows until it can.
+const MAX_ERROR_BYTES: usize = 512;
+
 #[derive(Debug, Default)]
 pub struct Collector {
     state: Mutex<CollectorState>,
@@ -65,8 +67,16 @@ impl Collector {
         };
     }
 
-    /// Records a failed pass and says how many have failed in a row.
-    pub fn failed(&self, err: String) -> u32 {
+    /// Records a failed pass and says how many have failed in a row. The
+    /// error is cut to [`MAX_ERROR_BYTES`], since it rides every heartbeat.
+    pub fn failed(&self, mut err: String) -> u32 {
+        if err.len() > MAX_ERROR_BYTES {
+            let mut end = MAX_ERROR_BYTES;
+            while !err.is_char_boundary(end) {
+                end -= 1;
+            }
+            err.truncate(end);
+        }
         let mut state = self.state.lock().unwrap();
         state.error = Some(err);
         state.failures += 1;
@@ -191,6 +201,15 @@ mod tests {
         collector.succeeded(200);
         assert_eq!((collector.succeeded_at(), collector.error()), (200, None));
         assert_eq!(collector.failed("again".into()), 1);
+    }
+
+    #[test]
+    fn a_collector_error_is_cut_on_a_character_boundary() {
+        let collector = Collector::default();
+        collector.failed(format!("x{}", "é".repeat(600)));
+        let error = collector.error().unwrap();
+        assert_eq!(error.len(), 511);
+        assert!(error.ends_with('é'));
     }
 
     #[test]
