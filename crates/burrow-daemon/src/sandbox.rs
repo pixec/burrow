@@ -3000,6 +3000,9 @@ pub struct SandboxManager {
     /// When each warm snapshot directory was last discarded for a guest that
     /// never came up.
     warm_discards: Arc<std::sync::Mutex<HashMap<PathBuf, std::time::Instant>>>,
+    /// A test manager's data directory, removed with its last clone.
+    #[cfg(test)]
+    temp: Option<Arc<tempfile::TempDir>>,
     /// Held by an automatic warm build from its admission checks to its
     /// finish, so they run one after another with the checks made against
     /// the node as it is when each starts.
@@ -3182,6 +3185,8 @@ impl SandboxManager {
             expired_rules: Arc::new(std::sync::Mutex::new(std::collections::HashSet::new())),
             warm_shapes: Arc::new(std::sync::Mutex::new(HashMap::new())),
             warm_discards: Arc::default(),
+            #[cfg(test)]
+            temp: None,
             warm_queue: Arc::new(tokio::sync::Mutex::new(())),
             firewall: Arc::new(tokio::sync::Mutex::new(())),
             ruled_ahead: Default::default(),
@@ -12327,10 +12332,10 @@ pub(crate) mod tests {
     /// A manager with no VMs behind it. Shared with the node edge's tests,
     /// which need a sandbox map to miss in.
     pub(crate) async fn manager() -> SandboxManager {
-        let manager = SandboxManager::new(
+        let temp = tempfile::tempdir().unwrap();
+        let mut manager = SandboxManager::new(
             NodeConfig {
-                data_dir: std::env::temp_dir()
-                    .join(format!("burrow-manager-{}", uuid::Uuid::new_v4().simple())),
+                data_dir: temp.path().join("data"),
                 firecracker_bin: "/nonexistent/firecracker".into(),
                 firecracker_io_engine: Default::default(),
                 is_firecracker_huge_page_fill_enabled: true,
@@ -12385,26 +12390,14 @@ pub(crate) mod tests {
             Arc::new(burrow_proxy::DeniedAddresses::default()),
             Arc::new(burrow_proxy::directory::Directory::default()),
             Arc::new(burrow_store::Store::open_in_memory().await.unwrap()),
-            burrow_common::vault::Vault::open(&std::env::temp_dir().join(format!(
-                "burrow-test-{}-{}.key",
-                std::process::id(),
-                burrow_common::SandboxId::generate()
-            )))
-            .unwrap(),
+            burrow_common::vault::Vault::open(&temp.path().join("secrets.key")).unwrap(),
         );
+        manager.temp = Some(Arc::new(temp));
         manager
             .set_address_slice(AddressPool::default(), 0)
             .await
             .unwrap();
         manager
-    }
-
-    /// Tests run in parallel and remove templates' warm directories, so two
-    /// managers must not share a data directory.
-    #[tokio::test]
-    async fn every_test_manager_has_a_data_dir_of_its_own() {
-        let (a, b) = (manager().await, manager().await);
-        assert_ne!(a.config.data_dir, b.config.data_dir);
     }
 
     /// A node creates nothing until it has a slice, and once it holds

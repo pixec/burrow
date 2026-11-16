@@ -61,3 +61,6 @@ nfq = "0.2"
 burrow-net = { workspace = true, features = ["usernet"] }
 # The issuer and serial trustd files a trusted root under.
 x509-parser = "0.16"
+
+[dev-dependencies]
+tempfile = { workspace = true }

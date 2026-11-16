@@ -113,23 +113,17 @@ pub(crate) fn write_private(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
 mod tests {
     use super::*;
 
-    fn key_path() -> std::path::PathBuf {
-        let dir =
-            std::env::temp_dir().join(format!("burrow-vault-{}", uuid::Uuid::new_v4().simple()));
-        std::fs::create_dir_all(&dir).unwrap();
-        dir.join("secrets.key")
-    }
-
-    /// Tests run in parallel, and a clock read alone can give two of them the
-    /// same directory, where the second finds the first's key already made.
-    #[test]
-    fn every_test_key_has_a_directory_of_its_own() {
-        assert_ne!(key_path().parent(), key_path().parent());
+    /// Where a test keeps its key, in a directory removed with the guard.
+    fn key_path() -> (tempfile::TempDir, std::path::PathBuf) {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("secrets.key");
+        (dir, path)
     }
 
     #[test]
     fn round_trips_and_binds_the_context() {
-        let vault = Vault::open(&key_path()).unwrap();
+        let (_dir, path) = key_path();
+        let vault = Vault::open(&path).unwrap();
         let sealed = vault.seal("github", "ghp_value").unwrap();
         assert!(!sealed.contains("ghp_value"));
         assert_eq!(vault.unseal("github", &sealed).unwrap(), "ghp_value");
@@ -138,7 +132,7 @@ mod tests {
 
     #[test]
     fn the_key_persists_and_is_private() {
-        let path = key_path();
+        let (_dir, path) = key_path();
         let sealed = Vault::open(&path).unwrap().seal("svc", "v").unwrap();
         assert_eq!(
             Vault::open(&path).unwrap().unseal("svc", &sealed).unwrap(),
