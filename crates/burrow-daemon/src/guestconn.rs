@@ -383,16 +383,20 @@ fn restart_grace(guest_os: burrow_vmm::GuestOs) -> std::time::Duration {
     }
 }
 
-/// Whether the VMM behind `guest` is gone: nothing listens on its vsock
-/// socket any more, so no agent will ever answer there again.
-fn is_vmm_gone(guest: &GuestAddr) -> bool {
-    matches!(
-        std::os::unix::net::UnixStream::connect(guest.socket_path()),
-        Err(err) if matches!(
-            err.kind(),
-            std::io::ErrorKind::NotFound | std::io::ErrorKind::ConnectionRefused
-        )
-    )
+/// Whether the VMM behind `guest` is gone: its vsock socket is not there, or
+/// on Linux nothing listens on it any more, so no agent will ever answer there
+/// again. macOS refuses a connection to a listener whose backlog is full too,
+/// so there only a missing socket counts.
+async fn is_vmm_gone(guest: &GuestAddr) -> bool {
+    let connect = tokio::net::UnixStream::connect(guest.socket_path());
+    match tokio::time::timeout(std::time::Duration::from_millis(500), connect).await {
+        Ok(Err(err)) => match err.kind() {
+            std::io::ErrorKind::NotFound => true,
+            std::io::ErrorKind::ConnectionRefused => cfg!(target_os = "linux"),
+            _ => false,
+        },
+        _ => false,
+    }
 }
 
 /// Why an upgrade that has not come back as `new` never will, if that is
@@ -609,13 +613,14 @@ async fn handshake_upgrading_once(
             }
             attempt => {
                 let running = attempt.as_ref().ok().map(|(_, running)| running.as_str());
+                let is_gone = running.is_none() && is_vmm_gone(&guest).await;
                 if let Some(failure) = upgrade_failure(
                     running,
                     &response.agent_digest,
                     &digest,
                     answered.elapsed(),
                     grace,
-                    running.is_none() && is_vmm_gone(&guest),
+                    is_gone,
                 ) {
                     return Err(tonic::Status::internal(failure));
                 }
@@ -698,17 +703,19 @@ mod tests {
         assert!(restart_grace(burrow_vmm::GuestOs::Linux) < UPGRADE_TIMEOUT);
     }
 
-    #[test]
-    fn a_vmm_is_gone_once_nothing_listens_on_its_socket() {
+    #[tokio::test]
+    async fn a_vmm_is_gone_once_nothing_listens_on_its_socket() {
         let id = uuid::Uuid::new_v4().simple().to_string();
         let dir = std::env::temp_dir().join(format!("bvg-{}", &id[..12]));
         std::fs::create_dir_all(&dir).unwrap();
         let guest = GuestAddr::in_workdir(&dir);
-        assert!(is_vmm_gone(&guest));
+        assert!(is_vmm_gone(&guest).await);
         let listener = std::os::unix::net::UnixListener::bind(guest.socket_path()).unwrap();
-        assert!(!is_vmm_gone(&guest));
+        assert!(!is_vmm_gone(&guest).await);
         drop(listener);
-        assert!(is_vmm_gone(&guest));
+        assert_eq!(is_vmm_gone(&guest).await, cfg!(target_os = "linux"));
+        std::fs::remove_file(guest.socket_path()).unwrap();
+        assert!(is_vmm_gone(&guest).await);
         let _ = std::fs::remove_dir_all(&dir);
     }
 }
