@@ -371,6 +371,55 @@ pub const RESTART_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(
 /// old process accepts as it goes is never answered, and waiting it out to the
 /// agent timeout is most of what an upgrade used to cost.
 const RECONNECT_ATTEMPT: std::time::Duration = std::time::Duration::from_secs(3);
+/// How long after answering an upgrade the old agent may still be the one
+/// answering. A Linux agent re-executes 100 ms after its answer, so one still
+/// answering well past that failed to. A macOS or Windows guest checks the new
+/// binary as it launches, which can keep the old process serving for most of
+/// [`UPGRADE_TIMEOUT`].
+fn restart_grace(guest_os: burrow_vmm::GuestOs) -> std::time::Duration {
+    match guest_os {
+        burrow_vmm::GuestOs::Linux => std::time::Duration::from_secs(10),
+        _ => UPGRADE_TIMEOUT,
+    }
+}
+
+/// Whether the VMM behind `guest` is gone: nothing listens on its vsock
+/// socket any more, so no agent will ever answer there again.
+fn is_vmm_gone(guest: &GuestAddr) -> bool {
+    matches!(
+        std::os::unix::net::UnixStream::connect(guest.socket_path()),
+        Err(err) if matches!(
+            err.kind(),
+            std::io::ErrorKind::NotFound | std::io::ErrorKind::ConnectionRefused
+        )
+    )
+}
+
+/// Why an upgrade that has not come back as `new` never will, if that is
+/// already certain: the VMM is gone, the agent answered as a build that is
+/// neither, or the old one is still answering past its `grace`.
+fn upgrade_failure(
+    running: Option<&str>,
+    old: &str,
+    new: &str,
+    since_answer: std::time::Duration,
+    grace: std::time::Duration,
+    is_vmm_gone: bool,
+) -> Option<String> {
+    match running {
+        None if is_vmm_gone => Some("the guest's VM exited during its agent upgrade".into()),
+        None => None,
+        Some(running) if running == new => None,
+        Some(running) if running != old => Some(format!(
+            "the guest agent came back as {running}, not the new build {new}"
+        )),
+        Some(_) if since_answer >= grace => Some(format!(
+            "the guest agent did not re-execute: it still runs {old} {}s after accepting the upgrade",
+            since_answer.as_secs()
+        )),
+        Some(_) => None,
+    }
+}
 
 /// Handshakes, and brings the guest's agent up to this node's if it differs.
 ///
@@ -516,6 +565,8 @@ async fn handshake_upgrading_once(
     if !restarting {
         return kept(agent, response).await;
     }
+    let answered = std::time::Instant::now();
+    let grace = restart_grace(upgrade.guest_os);
     drop(agent);
     // The old agent answers and then re-executes, and how long that takes
     // is the guest's business, so a reconnect can still land on the old
@@ -556,13 +607,28 @@ async fn handshake_upgrading_once(
                 );
                 return Ok((agent, response));
             }
-            Ok(_) | Err(_) if std::time::Instant::now() < deadline => continue,
-            Ok((_, running)) => {
-                return Err(tonic::Status::internal(format!(
-                    "the guest agent did not come back as the new build: it reports {running}"
-                )));
+            attempt => {
+                let running = attempt.as_ref().ok().map(|(_, running)| running.as_str());
+                if let Some(failure) = upgrade_failure(
+                    running,
+                    &response.agent_digest,
+                    &digest,
+                    answered.elapsed(),
+                    grace,
+                    running.is_none() && is_vmm_gone(&guest),
+                ) {
+                    return Err(tonic::Status::internal(failure));
+                }
+                if std::time::Instant::now() < deadline {
+                    continue;
+                }
+                return Err(match attempt {
+                    Ok((_, running)) => tonic::Status::internal(format!(
+                        "the guest agent did not come back as the new build: it reports {running}"
+                    )),
+                    Err(err) => err,
+                });
             }
-            Err(err) => return Err(err),
         }
     }
 }
@@ -570,6 +636,7 @@ async fn handshake_upgrading_once(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::time::Duration;
 
     #[test]
     fn a_generated_password_is_four_groups_with_every_class() {
@@ -590,5 +657,58 @@ mod tests {
             assert!(!password.contains(['0', 'O', 'l', '1', 'I']), "{password}");
         }
         assert_ne!(generate_password().unwrap(), generate_password().unwrap());
+    }
+
+    const GRACE: Duration = Duration::from_secs(10);
+
+    #[test]
+    fn an_upgrade_is_given_up_on_once_its_failure_is_certain() {
+        let judge = |running, since, gone| {
+            upgrade_failure(
+                running,
+                "old",
+                "new",
+                Duration::from_secs(since),
+                GRACE,
+                gone,
+            )
+        };
+        assert_eq!(judge(Some("new"), 0, false), None);
+        assert_eq!(judge(Some("new"), 60, false), None);
+        assert_eq!(judge(Some("old"), 1, false), None);
+        assert_eq!(judge(None, 1, false), None);
+        assert_eq!(judge(None, 60, false), None);
+        assert!(
+            judge(Some("old"), 10, false)
+                .unwrap()
+                .contains("did not re-execute")
+        );
+        assert!(
+            judge(Some("other"), 0, false)
+                .unwrap()
+                .contains("came back as other")
+        );
+        assert!(judge(None, 0, true).unwrap().contains("VM exited"));
+    }
+
+    #[test]
+    fn only_a_linux_agent_is_expected_to_be_replaced_at_once() {
+        assert_eq!(restart_grace(burrow_vmm::GuestOs::MacOs), UPGRADE_TIMEOUT);
+        assert_eq!(restart_grace(burrow_vmm::GuestOs::Windows), UPGRADE_TIMEOUT);
+        assert!(restart_grace(burrow_vmm::GuestOs::Linux) < UPGRADE_TIMEOUT);
+    }
+
+    #[test]
+    fn a_vmm_is_gone_once_nothing_listens_on_its_socket() {
+        let id = uuid::Uuid::new_v4().simple().to_string();
+        let dir = std::env::temp_dir().join(format!("bvg-{}", &id[..12]));
+        std::fs::create_dir_all(&dir).unwrap();
+        let guest = GuestAddr::in_workdir(&dir);
+        assert!(is_vmm_gone(&guest));
+        let listener = std::os::unix::net::UnixListener::bind(guest.socket_path()).unwrap();
+        assert!(!is_vmm_gone(&guest));
+        drop(listener);
+        assert!(is_vmm_gone(&guest));
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
