@@ -1,5 +1,6 @@
 mod admission;
 mod api;
+mod chunkfleet;
 mod cluster;
 mod events;
 mod leader;
@@ -156,6 +157,8 @@ struct Args {
 
 pub struct OrchestratorState {
     pub nodes: registry::NodeRegistry,
+    /// Whether nodes may delete the object-store format before casync chunks.
+    pub chunk_fleet: chunkfleet::ChunkFleet,
     pub sandboxes: sandboxes::SandboxRegistry,
     /// Where every replica's state meets. `None` only when even the local
     /// SQLite file could not be opened, which leaves a single process
@@ -256,6 +259,10 @@ impl NodeRegistry for NodeRegistryService {
         // Labels are rendered into operator output and into placement errors,
         // so they are bounded at the door like any other caller-supplied map.
         burrow_common::tags::validate_labels(&info.labels)?;
+        self.0
+            .chunk_fleet
+            .note(self.0.store.as_deref(), &info, burrow_common::unix_now_ms())
+            .await;
         // A node that cannot be given a guest-address slice of its own is
         // refused: admitting it on someone else's slice would give two nodes
         // the same guest addresses, which is what the slicing exists to
@@ -372,6 +379,12 @@ impl NodeRegistry for NodeRegistryService {
         // would otherwise reach the registry and every `nodes ls` after it.
         if let Some(info) = &req.info {
             burrow_common::tags::validate_labels(&info.labels)?;
+        }
+        if let Some(info) = &req.info {
+            self.0
+                .chunk_fleet
+                .note(self.0.store.as_deref(), info, burrow_common::unix_now_ms())
+                .await;
         }
         let mut status = req.status.unwrap_or_default();
         let volumes = std::mem::take(&mut status.volumes);
@@ -521,7 +534,7 @@ impl NodeRegistry for NodeRegistryService {
             confirmed_sandboxes: applied.confirmed,
             relinquished_sandboxes: applied.relinquished,
             access_keys: access_keys(&self.0),
-            is_fleet_on_casync_chunks: self.0.nodes.is_fleet_on_casync_chunks(),
+            is_fleet_on_casync_chunks: self.0.chunk_fleet.is_upgraded(),
         }))
     }
 
@@ -1008,6 +1021,11 @@ async fn run(args: Args) -> anyhow::Result<()> {
     };
     let state = Arc::new(OrchestratorState {
         nodes: registry::NodeRegistry::new(pool),
+        chunk_fleet: chunkfleet::ChunkFleet::new(
+            (args.node_expiry_secs > 0)
+                .then(|| std::time::Duration::from_secs(args.node_expiry_secs)),
+            burrow_common::unix_now_ms(),
+        ),
         sandboxes,
         leader: leader::Leader::spawn(store.clone()),
         events: events::EventLog::new(store.clone()),
@@ -1048,6 +1066,7 @@ async fn run(args: Args) -> anyhow::Result<()> {
         secs => Some(std::time::Duration::from_secs(secs)),
     };
     tokio::spawn(reap_dead_nodes(Arc::clone(&state), expiry));
+    tokio::spawn(chunkfleet::refresh_loop(Arc::clone(&state)));
     let advertise = match args.advertise.clone() {
         Some(address) => Some(address),
         None => own_address().await,

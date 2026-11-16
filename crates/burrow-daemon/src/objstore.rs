@@ -492,9 +492,23 @@ pub(crate) mod fake {
     #[derive(Default)]
     pub struct Objects {
         by_key: HashMap<String, (Vec<u8>, String)>,
+        /// When each object was last written, as listings report it.
+        written: HashMap<String, std::time::SystemTime>,
         versions: u64,
         /// Each bucket by name, with the body of the create that made it.
         pub buckets: HashMap<String, String>,
+    }
+
+    impl Objects {
+        /// Makes every object under `prefix` read as written `by` ago.
+        pub fn age(&mut self, prefix: &str, by: std::time::Duration) {
+            let prefix = format!("/test/{prefix}");
+            for (key, at) in &mut self.written {
+                if key.starts_with(&prefix) {
+                    *at -= by;
+                }
+            }
+        }
     }
 
     /// What the store does to puts.
@@ -507,6 +521,8 @@ pub(crate) mod fake {
         in_flight: AtomicUsize,
         /// The most puts that were ever in flight at once.
         pub most_in_flight: AtomicUsize,
+        /// GETs of keys ending in this fail with `500`.
+        pub failing_gets: Mutex<Option<String>>,
     }
 
     /// A store on a loopback port. `honours_conditions` false is a store that
@@ -534,6 +550,26 @@ pub(crate) mod fake {
         options.region = region.into();
         let store = serving(true, Arc::default(), Arc::clone(&objects), options).await;
         (store, objects)
+    }
+
+    /// A store whose requests fail as `faults` says and whose objects the
+    /// test can reach, one try per request.
+    pub async fn controlled() -> (ObjectStore, Arc<Faults>, Arc<Mutex<Objects>>) {
+        let faults = Arc::new(Faults::default());
+        let objects = Arc::new(Mutex::new(Objects::default()));
+        objects
+            .lock()
+            .unwrap()
+            .buckets
+            .insert("test".into(), String::new());
+        let store = serving(
+            true,
+            Arc::clone(&faults),
+            Arc::clone(&objects),
+            options(1, 32, 8),
+        )
+        .await;
+        (store, faults, objects)
     }
 
     /// A store whose puts fail as `faults` says, with `options` for the client.
@@ -646,8 +682,18 @@ pub(crate) mod fake {
                 tokio::time::sleep(std::time::Duration::from_millis(delay)).await;
                 faults.in_flight.fetch_sub(1, Ordering::Relaxed);
             }
+            let failing = method == "GET"
+                && listing.is_none()
+                && faults
+                    .failing_gets
+                    .lock()
+                    .unwrap()
+                    .as_deref()
+                    .is_some_and(|suffix| key.ends_with(suffix));
             let (status, etag, payload) = if throttled {
                 (503, None, error("SlowDown"))
+            } else if failing {
+                (500, None, error("InternalError"))
             } else {
                 let mut objects = objects.lock().unwrap();
                 let current = objects.by_key.get(&key).map(|(_, etag)| etag.clone());
@@ -675,8 +721,17 @@ pub(crate) mod fake {
                             .keys()
                             .filter(|stored| stored.starts_with(&prefix))
                             .map(|stored| {
+                                let written = objects
+                                    .written
+                                    .get(stored)
+                                    .map(|at| {
+                                        aws_sdk_s3::primitives::DateTime::from(*at)
+                                            .fmt(aws_sdk_s3::primitives::DateTimeFormat::DateTime)
+                                            .unwrap()
+                                    })
+                                    .unwrap_or_default();
                                 format!(
-                                    "<Contents><Key>{}</Key></Contents>",
+                                    "<Contents><Key>{}</Key><LastModified>{written}</LastModified></Contents>",
                                     &stored[bucket.len()..]
                                 )
                             })
@@ -692,6 +747,7 @@ pub(crate) mod fake {
                     },
                     "DELETE" => {
                         objects.by_key.remove(&key);
+                        objects.written.remove(&key);
                         (204, None, Vec::new())
                     }
                     "PUT" => {
@@ -705,6 +761,9 @@ pub(crate) mod fake {
                         } else {
                             objects.versions += 1;
                             let etag = format!("\"{}\"", objects.versions);
+                            objects
+                                .written
+                                .insert(key.clone(), std::time::SystemTime::now());
                             objects.by_key.insert(key, (body, etag.clone()));
                             (200, Some(etag), Vec::new())
                         }

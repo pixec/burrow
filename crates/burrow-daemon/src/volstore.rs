@@ -129,7 +129,7 @@ pub async fn unpin_all(store: &ObjectStore, sandbox_id: &str) -> Result<(), Stat
 }
 
 /// The generations of a volume its remote readers pin.
-async fn pinned(store: &ObjectStore, name: &str) -> Result<HashSet<u64>, Status> {
+pub async fn pinned(store: &ObjectStore, name: &str) -> Result<HashSet<u64>, Status> {
     let mut out = HashSet::new();
     for key in store.list(&format!("volumes/{name}/pins/")).await? {
         out.extend(read_pin(store, &key).await?);

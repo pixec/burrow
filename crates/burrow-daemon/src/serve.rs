@@ -1128,6 +1128,7 @@ async fn registration_loop(
                 }
                 Err(err) => {
                     tracing::warn!(%err, "heartbeat failed; re-registering");
+                    crate::migrate::set_fleet_upgraded(false);
                     break;
                 }
             }

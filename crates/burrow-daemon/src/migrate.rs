@@ -2,7 +2,10 @@
 //! chunks across one release. The release after removes this module, its
 //! start and fleet report in `serve`, its call in [`crate::chunks`], the
 //! legacy keys in [`crate::snapshot`]'s delete and collector and in
-//! [`crate::rootdisk`]'s collector, and its command.
+//! [`crate::rootdisk`]'s collector, and its command; the orchestrator's
+//! `chunkfleet` and its store table; and the `is_casync_chunk_store` and
+//! `is_fleet_on_casync_chunks` fields, leaving `reserved 30;` in `NodeInfo`
+//! and `reserved 11;` in `HeartbeatResponse`, since `NodeInfo` is stored.
 //!
 //! That format kept each chunk uncompressed at `chunks/<sha256>` and each
 //! index as JSON at `<name>.index.json`. Chunk ids are the same SHA-256 in
@@ -21,13 +24,17 @@
 //!   its `.caibx`, so new uploads and the new collector never depend on an
 //!   old object.
 //!
-//! Once every node is upgraded the pass also retires the old objects: each old
+//! Once the orchestrator reports that no node on the old build has been heard
+//! from for a day, the pass also retires the old objects: each old
 //! chunk is put again in the new format, which refreshes its age for the
 //! collector, read back, and only then deleted; old indexes go last, after
 //! every chunk. Any number of nodes may run passes at once: a chunk's object
 //! is named by its content and an index's encoding is a function of its JSON,
 //! so two nodes write the same thing, and a delete another node got to first
-//! is not an error.
+//! is not an error. The report is checked again before and while old objects
+//! are deleted, and nothing younger than the collector's grace is deleted
+//! whatever it says: an old build's upload in flight writes its objects
+//! before the manifest that makes them live.
 
 #![allow(clippy::result_large_err)]
 
@@ -50,6 +57,9 @@ const OWNERS: [&str; 4] = ["images/", "snapshots/", "sandboxes/", "volumes/"];
 const START_AFTER: Duration = Duration::from_secs(60);
 const RETRY_AFTER: Duration = Duration::from_secs(600);
 const PROGRESS_EVERY: Duration = Duration::from_secs(30);
+/// The collector's grace: an old object younger than this may belong to an
+/// upload in flight.
+const GRACE: Duration = Duration::from_secs(24 * 3600);
 /// Chunks migrated at once, each a core's worth of compression at most, so a
 /// pass leaves the node's CPU and upload slots to its sandboxes.
 const PARALLELISM: usize = 2;
@@ -60,6 +70,21 @@ static FLEET_UPGRADED: AtomicBool = AtomicBool::new(false);
 
 pub fn set_fleet_upgraded(is_upgraded: bool) {
     FLEET_UPGRADED.store(is_upgraded, Ordering::Relaxed);
+}
+
+/// Stops a deleting pass the moment the orchestrator stops reporting the
+/// fleet upgraded.
+fn still_upgraded(upgraded: &AtomicBool) -> Result<(), Status> {
+    match upgraded.load(Ordering::Relaxed) {
+        true => Ok(()),
+        false => Err(Status::aborted(
+            "the orchestrator no longer reports every node upgraded; old objects are kept",
+        )),
+    }
+}
+
+fn is_old(modified: Option<std::time::SystemTime>) -> bool {
+    modified.is_some_and(|at| at.elapsed().is_ok_and(|age| age >= GRACE))
 }
 
 /// Runs passes behind the node's start until the store holds nothing in the
@@ -77,7 +102,7 @@ pub fn start(store: ObjectStore) {
                 );
                 waiting_said = true;
             }
-            match run(&store, may_delete).await {
+            match run(&store, &FLEET_UPGRADED).await {
                 Ok(true) => {
                     tracing::info!(
                         "the background migration from the format before casync is finished; \
@@ -172,32 +197,46 @@ fn current_key(legacy: &str) -> Option<String> {
         .map(|stem| format!("{stem}.caibx"))
 }
 
-async fn legacy_indexes(store: &ObjectStore) -> Result<Vec<String>, Status> {
+type Aged = (String, Option<std::time::SystemTime>);
+
+async fn legacy_indexes(store: &ObjectStore) -> Result<Vec<Aged>, Status> {
     let mut out = Vec::new();
     for owner in OWNERS {
         out.extend(
             store
-                .list(owner)
+                .list_aged(owner)
                 .await?
                 .into_iter()
-                .filter(|key| key.ends_with(LEGACY_INDEX)),
+                .filter(|(key, _)| key.ends_with(LEGACY_INDEX)),
         );
     }
     Ok(out)
 }
 
 /// Whether anything still reads the old index at `legacy`: an image's always,
-/// a snapshot's or volume's while it has a manifest, a stored sandbox's for
-/// its current generation. The rest is left to the collector, and deleted
-/// with the other old objects.
+/// a snapshot's while it has a manifest, a volume's for its current and
+/// pinned generations, a stored sandbox's for its current generation. The
+/// rest is left to the collector, and deleted with the other old objects.
 async fn is_live(store: &ObjectStore, legacy: &str) -> Result<bool, Status> {
     let mut parts = legacy.split('/');
     match (parts.next(), parts.next(), parts.next()) {
         (Some("snapshots"), Some(id), _) => {
             store.exists(&format!("snapshots/{id}/manifest.json")).await
         }
-        (Some("volumes"), Some(name), _) => {
-            store.exists(&format!("volumes/{name}/manifest.json")).await
+        (Some("volumes"), Some(name), Some(file)) => {
+            let Some(generation) = file
+                .strip_suffix(LEGACY_INDEX)
+                .and_then(|g| g.parse::<u64>().ok())
+            else {
+                return Ok(false);
+            };
+            let Some(held) = crate::volstore::read(store, name).await? else {
+                return Ok(false);
+            };
+            Ok(held.manifest.generation == generation
+                || crate::volstore::pinned(store, name)
+                    .await?
+                    .contains(&generation))
         }
         (Some("sandboxes"), Some(id), Some(generation)) => {
             Ok(crate::durable::read_manifest(store, id)
@@ -242,21 +281,31 @@ async fn convert_index(store: &ObjectStore, legacy: &str) -> Result<(), Status> 
 }
 
 /// Removes an old index once nothing needs it: its `.caibx` reads back as the
-/// same index, or nothing reads it.
-async fn retire_index(store: &ObjectStore, legacy: &str) -> Result<(), Status> {
+/// same index, or nothing reads it and it is older than the grace. Returns
+/// whether it is gone.
+async fn retire_index(store: &ObjectStore, (legacy, modified): &Aged) -> Result<bool, Status> {
     if !is_live(store, legacy).await? {
-        return delete_legacy(store, legacy).await;
+        if !is_old(*modified) {
+            return Ok(false);
+        }
+        delete_legacy(store, legacy).await?;
+        return Ok(true);
     }
     let key = current_key(legacy).expect("listed by its suffix");
-    let (Some(old), Some(new)) = (
-        read_legacy_index(store, legacy).await?,
-        store.get_bytes(&key).await?,
-    ) else {
-        return Ok(());
+    // Its `.caibx` may have gone since the conversion, to the collector.
+    convert_index(store, legacy).await?;
+    let Some(old) = read_legacy_index(store, legacy).await? else {
+        return Ok(true);
+    };
+    let Some(new) = store.get_bytes(&key).await? else {
+        return Err(Status::unavailable(format!(
+            "{legacy} has no {key} to retire it for"
+        )));
     };
     match crate::caibx::decode(&new) {
         Ok(new) if new.size == old.size && new.chunks == old.chunks => {
-            delete_legacy(store, legacy).await
+            delete_legacy(store, legacy).await?;
+            Ok(true)
         }
         _ => Err(Status::data_loss(format!(
             "{key} does not read back as the index in {legacy}"
@@ -296,14 +345,15 @@ async fn reads_back(store: &ObjectStore, key: &str, digest: &str) -> Result<bool
         .is_ok_and(|bytes| hex::encode(Sha256::digest(bytes)) == digest))
 }
 
-/// One pass over the store: every live old index converted, and with
-/// `may_delete`, every old object retired, chunks before indexes. Returns
-/// whether nothing old is left.
-pub async fn run(store: &ObjectStore, may_delete: bool) -> Result<bool, Status> {
+/// One pass over the store: every live old index converted, and while
+/// `upgraded` holds, every old object retired, chunks before indexes.
+/// Returns whether nothing old is left.
+pub async fn run(store: &ObjectStore, upgraded: &AtomicBool) -> Result<bool, Status> {
+    let may_delete = upgraded.load(Ordering::Relaxed);
     let started = std::time::Instant::now();
     let indexes = legacy_indexes(store).await?;
     let mut failed = 0;
-    for legacy in &indexes {
+    for (legacy, _) in &indexes {
         if let Err(err) = convert_index(store, legacy).await {
             tracing::warn!(
                 index = legacy,
@@ -322,12 +372,17 @@ pub async fn run(store: &ObjectStore, may_delete: bool) -> Result<bool, Status> 
     if !may_delete {
         return Ok(false);
     }
+    still_upgraded(upgraded)?;
 
-    let mut digests: Vec<String> = store
-        .list(LEGACY_CHUNKS)
-        .await?
+    let chunks = store.list_aged(LEGACY_CHUNKS).await?;
+    let young = chunks
+        .iter()
+        .filter(|(_, modified)| !is_old(*modified))
+        .count();
+    let mut digests: Vec<String> = chunks
         .into_iter()
-        .filter_map(|key| key.strip_prefix(LEGACY_CHUNKS).map(str::to_string))
+        .filter(|(_, modified)| is_old(*modified))
+        .filter_map(|(key, _)| key.strip_prefix(LEGACY_CHUNKS).map(str::to_string))
         .filter(|digest| digest.len() == 64 && !digest.contains('/'))
         .collect();
     let total = digests.len();
@@ -352,6 +407,7 @@ pub async fn run(store: &ObjectStore, may_delete: bool) -> Result<bool, Status> 
         })
         .buffer_unordered(PARALLELISM);
     while let Some((digest, result)) = results.next().await {
+        still_upgraded(upgraded)?;
         match result {
             Ok(()) => done.fetch_add(1, Ordering::Relaxed),
             Err(err) => {
@@ -381,8 +437,17 @@ pub async fn run(store: &ObjectStore, may_delete: bool) -> Result<bool, Status> 
     }
     // Last, so an old build's collector that is still running after all
     // still finds every chunk named until the chunks are gone too.
-    for legacy in &indexes {
-        retire_index(store, legacy).await?;
+    let mut kept = young;
+    for index in &indexes {
+        still_upgraded(upgraded)?;
+        kept += usize::from(!retire_index(store, index).await?);
+    }
+    if kept > 0 {
+        tracing::info!(
+            kept,
+            "old objects younger than the collector's grace are kept for a later pass"
+        );
+        return Ok(false);
     }
     tracing::info!(
         indexes = indexes.len(),
@@ -435,7 +500,7 @@ pub async fn command(args: Args) -> anyhow::Result<()> {
         uploads_per_sandbox: 8,
     })?;
     if !args.check {
-        run(&store, args.delete_old)
+        run(&store, &AtomicBool::new(args.delete_old))
             .await
             .map_err(|err| anyhow::anyhow!("{}", err.message()))?;
     }
@@ -465,8 +530,10 @@ mod tests {
         digest
     }
 
-    async fn legacy_store() -> (ObjectStore, ImageIndex) {
-        let store = crate::objstore::fake::store(true).await;
+    type Objects = std::sync::Arc<std::sync::Mutex<crate::objstore::fake::Objects>>;
+
+    async fn legacy_store() -> (ObjectStore, ImageIndex, Objects) {
+        let (store, _, objects) = crate::objstore::fake::controlled().await;
         let index = ImageIndex {
             size: 3 * CHUNK_SIZE,
             chunk_size: CHUNK_SIZE,
@@ -484,14 +551,24 @@ mod tests {
             .put_bytes("snapshots/snap_1/manifest.json", b"{}".to_vec())
             .await
             .unwrap();
-        (store, index)
+        (store, index, objects)
+    }
+
+    async fn pass(store: &ObjectStore, upgraded: bool) -> Result<bool, Status> {
+        run(store, &AtomicBool::new(upgraded)).await
+    }
+
+    /// A pass of an upgraded fleet once everything old is past the grace.
+    async fn aged_pass(store: &ObjectStore, objects: &Objects) -> Result<bool, Status> {
+        objects.lock().unwrap().age("", 2 * GRACE);
+        pass(store, true).await
     }
 
     /// What the old build's collector deletes: every old chunk no old index
     /// names.
     async fn old_collector(store: &ObjectStore) {
         let mut named = std::collections::HashSet::new();
-        for key in legacy_indexes(store).await.unwrap() {
+        for (key, _) in legacy_indexes(store).await.unwrap() {
             let index = read_legacy_index(store, &key).await.unwrap().unwrap();
             named.extend(index.chunks.into_values());
         }
@@ -519,7 +596,7 @@ mod tests {
     /// them, copies the chunk to its new path and deletes nothing.
     #[tokio::test]
     async fn a_restore_reads_the_old_format_and_deletes_nothing() {
-        let (store, index) = legacy_store().await;
+        let (store, index, _) = legacy_store().await;
         let key = "snapshots/snap_1/snapshot.mem.caibx";
         let read = crate::chunks::read_index(&store, key)
             .await
@@ -555,8 +632,8 @@ mod tests {
     /// finds every chunk it needs, and nothing new depends on an old chunk.
     #[tokio::test]
     async fn an_old_collector_beside_a_pass_loses_nothing() {
-        let (store, index) = legacy_store().await;
-        assert!(!run(&store, false).await.unwrap());
+        let (store, index, _) = legacy_store().await;
+        assert!(!pass(&store, false).await.unwrap());
         old_collector(&store).await;
         assert!(store.exists(SNAPSHOT_INDEX).await.unwrap());
         for digest in index.chunks.values() {
@@ -579,9 +656,9 @@ mod tests {
     /// and a second finds nothing.
     #[tokio::test]
     async fn a_pass_of_an_upgraded_fleet_retires_every_old_object() {
-        let (store, index) = legacy_store().await;
+        let (store, index, objects) = legacy_store().await;
         let garbage = legacy_chunk(&store, 3).await;
-        assert!(run(&store, true).await.unwrap());
+        assert!(aged_pass(&store, &objects).await.unwrap());
         assert!(legacy_indexes(&store).await.unwrap().is_empty());
         assert!(store.list(LEGACY_CHUNKS).await.unwrap().is_empty());
         for digest in index.digests().chain([garbage]) {
@@ -591,14 +668,14 @@ mod tests {
                     .unwrap()
             );
         }
-        assert!(run(&store, true).await.unwrap());
+        assert!(aged_pass(&store, &objects).await.unwrap());
     }
 
     /// A new copy already there is put again before its old one goes: it may
     /// be old enough for the collector, or not what it should be.
     #[tokio::test]
     async fn retiring_a_chunk_puts_its_new_copy_again() {
-        let (store, index) = legacy_store().await;
+        let (store, index, _) = legacy_store().await;
         let digest = &index.chunks[&0];
         store
             .put_bytes(&chunk_key(digest), b"stale".to_vec())
@@ -623,19 +700,19 @@ mod tests {
     /// other old objects.
     #[tokio::test]
     async fn an_old_index_with_no_manifest_is_not_converted() {
-        let (store, _) = legacy_store().await;
+        let (store, _, objects) = legacy_store().await;
         store
             .delete("snapshots/snap_1/manifest.json")
             .await
             .unwrap();
-        assert!(!run(&store, false).await.unwrap());
+        assert!(!pass(&store, false).await.unwrap());
         assert!(
             !store
                 .exists("snapshots/snap_1/snapshot.mem.caibx")
                 .await
                 .unwrap()
         );
-        assert!(run(&store, true).await.unwrap());
+        assert!(aged_pass(&store, &objects).await.unwrap());
         assert!(!store.exists(SNAPSHOT_INDEX).await.unwrap());
     }
 
@@ -645,14 +722,17 @@ mod tests {
     async fn an_unreadable_old_index_is_refused() {
         let store = crate::objstore::fake::store(true).await;
         store
-            .put_bytes("volumes/data/manifest.json", b"{}".to_vec())
+            .put_bytes("snapshots/snap_2/manifest.json", b"{}".to_vec())
             .await
             .unwrap();
         store
-            .put_bytes("volumes/data/7.index.json", b"not an index".to_vec())
+            .put_bytes(
+                "snapshots/snap_2/snapshot.mem.index.json",
+                b"not an index".to_vec(),
+            )
             .await
             .unwrap();
-        let refused = crate::chunks::read_index(&store, "volumes/data/7.caibx")
+        let refused = crate::chunks::read_index(&store, "snapshots/snap_2/snapshot.mem.caibx")
             .await
             .unwrap_err();
         assert_eq!(refused.code(), tonic::Code::FailedPrecondition);
@@ -661,8 +741,13 @@ mod tests {
             "{}",
             refused.message()
         );
-        assert!(run(&store, true).await.is_err());
-        assert!(store.exists("volumes/data/7.index.json").await.unwrap());
+        assert!(pass(&store, true).await.is_err());
+        assert!(
+            store
+                .exists("snapshots/snap_2/snapshot.mem.index.json")
+                .await
+                .unwrap()
+        );
 
         let odd = ImageIndex {
             size: 8 << 30,
@@ -671,12 +756,12 @@ mod tests {
         };
         store
             .put_bytes(
-                "volumes/data/7.index.json",
+                "snapshots/snap_2/snapshot.mem.index.json",
                 serde_json::to_vec(&odd).unwrap(),
             )
             .await
             .unwrap();
-        let refused = crate::chunks::read_index(&store, "volumes/data/7.caibx")
+        let refused = crate::chunks::read_index(&store, "snapshots/snap_2/snapshot.mem.caibx")
             .await
             .unwrap_err();
         assert!(
@@ -690,13 +775,13 @@ mod tests {
     /// and a restore needing it is refused rather than given bad bytes.
     #[tokio::test]
     async fn a_corrupt_old_chunk_is_refused_and_kept() {
-        let (store, index) = legacy_store().await;
+        let (store, index, objects) = legacy_store().await;
         let digest = &index.chunks[&2];
         store
             .put_bytes(&format!("{LEGACY_CHUNKS}{digest}"), vec![9; 16])
             .await
             .unwrap();
-        assert!(run(&store, true).await.is_err());
+        assert!(aged_pass(&store, &objects).await.is_err());
         assert!(
             store
                 .exists(&format!("{LEGACY_CHUNKS}{digest}"))
@@ -714,5 +799,110 @@ mod tests {
             "{}",
             refused.message()
         );
+    }
+
+    /// The deleting pass stops the moment the orchestrator stops reporting
+    /// the fleet upgraded, and what it had not reached is kept.
+    #[tokio::test]
+    async fn a_deleting_pass_stops_when_the_fleet_is_no_longer_upgraded() {
+        let (store, faults, objects) = crate::objstore::fake::controlled().await;
+        for fill in 1..=40 {
+            legacy_chunk(&store, fill).await;
+        }
+        objects.lock().unwrap().age("", 2 * GRACE);
+        faults.put_delay_ms.store(20, Ordering::Relaxed);
+        let upgraded = std::sync::Arc::new(AtomicBool::new(true));
+        let flip = {
+            let upgraded = std::sync::Arc::clone(&upgraded);
+            tokio::spawn(async move {
+                tokio::time::sleep(Duration::from_millis(100)).await;
+                upgraded.store(false, Ordering::Relaxed);
+            })
+        };
+        let stopped = run(&store, &upgraded).await.unwrap_err();
+        flip.await.unwrap();
+        assert_eq!(stopped.code(), tonic::Code::Aborted);
+        assert!(!store.list(LEGACY_CHUNKS).await.unwrap().is_empty());
+    }
+
+    /// Whatever the orchestrator says, an old object younger than the grace
+    /// may be an old build's upload whose manifest is still to come, so it
+    /// is kept, and the pass is not reported finished.
+    #[tokio::test]
+    async fn an_old_object_younger_than_the_grace_is_kept() {
+        let (store, _, objects) = legacy_store().await;
+        store
+            .delete("snapshots/snap_1/manifest.json")
+            .await
+            .unwrap();
+        assert!(!pass(&store, true).await.unwrap());
+        assert!(store.exists(SNAPSHOT_INDEX).await.unwrap());
+        assert_eq!(store.list(LEGACY_CHUNKS).await.unwrap().len(), 2);
+        assert!(aged_pass(&store, &objects).await.unwrap());
+        assert!(!store.exists(SNAPSHOT_INDEX).await.unwrap());
+    }
+
+    /// A live old index whose `.caibx` went between its conversion and its
+    /// retirement is converted again, not left behind with the pass
+    /// reported finished.
+    #[tokio::test]
+    async fn a_caibx_gone_before_retirement_is_written_again() {
+        let (store, _, objects) = legacy_store().await;
+        assert!(!pass(&store, false).await.unwrap());
+        let key = "snapshots/snap_1/snapshot.mem.caibx";
+        store.delete(key).await.unwrap();
+        assert!(aged_pass(&store, &objects).await.unwrap());
+        assert!(store.exists(key).await.unwrap());
+        assert!(!store.exists(SNAPSHOT_INDEX).await.unwrap());
+        new_chunks_present(&store, key).await;
+    }
+
+    /// Of a volume's old indexes only its current and pinned generations are
+    /// converted, the ones the collector keeps.
+    #[tokio::test]
+    async fn only_a_volume_s_current_and_pinned_generations_are_converted() {
+        let (store, index, _) = legacy_store().await;
+        let manifest = crate::volstore::Manifest {
+            format: 1,
+            name: "data".into(),
+            generation: 7,
+            node_id: "node-a".into(),
+            state: crate::volstore::STATE_HELD.into(),
+            size_mib: 3,
+            created_at_ms: 0,
+            labels: Default::default(),
+            guest_os: String::new(),
+            uploaded_at_ms: 0,
+        };
+        store
+            .put_bytes(
+                "volumes/data/manifest.json",
+                serde_json::to_vec(&manifest).unwrap(),
+            )
+            .await
+            .unwrap();
+        crate::volstore::pin(&store, "data", "sbx_reader", 5)
+            .await
+            .unwrap();
+        for generation in [5, 6, 7] {
+            store
+                .put_bytes(
+                    &format!("volumes/data/{generation}.index.json"),
+                    serde_json::to_vec(&index).unwrap(),
+                )
+                .await
+                .unwrap();
+        }
+        assert!(!pass(&store, false).await.unwrap());
+        for (generation, converted) in [(5, true), (6, false), (7, true)] {
+            assert_eq!(
+                store
+                    .exists(&format!("volumes/data/{generation}.caibx"))
+                    .await
+                    .unwrap(),
+                converted,
+                "generation {generation}"
+            );
+        }
     }
 }
