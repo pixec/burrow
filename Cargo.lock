@@ -4098,7 +4098,7 @@ dependencies = [
 [[package]]
 name = "tailcat-rs"
 version = "0.1.0"
-source = "git+https://github.com/pixec/tailcat-rs?rev=6a9a41839f6d341c927bee802ac4892896233052#6a9a41839f6d341c927bee802ac4892896233052"
+source = "git+https://github.com/pixec/tailcat-rs?rev=641ba434e452be85ddcfd181dbea040c93cfa4e7#641ba434e452be85ddcfd181dbea040c93cfa4e7"
 dependencies = [
  "base64",
  "boringtun",
@@ -4109,6 +4109,7 @@ dependencies = [
  "hmac 0.12.1",
  "nix 0.31.3",
  "rand 0.8.8",
+ "rand_core 0.6.4",
  "reqwest",
  "rustls",
  "serde",

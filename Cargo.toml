@@ -42,7 +42,7 @@ burrow-net = { path = "crates/burrow-net" }
 burrow-proxy = { path = "crates/burrow-proxy" }
 burrow-store = { path = "crates/burrow-store" }
 burrow-diskread = { path = "crates/burrow-diskread" }
-tailcat-rs = { git = "https://github.com/pixec/tailcat-rs", rev = "6a9a41839f6d341c927bee802ac4892896233052" }
+tailcat-rs = { git = "https://github.com/pixec/tailcat-rs", rev = "641ba434e452be85ddcfd181dbea040c93cfa4e7" }
 
 tokio = { version = "1", features = ["full"] }
 tokio-stream = "0.1"
