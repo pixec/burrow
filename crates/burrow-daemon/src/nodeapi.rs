@@ -78,13 +78,10 @@ impl NodeApi {
         agent
             .enable_remote_desktop(guestpb::EnableRemoteDesktopRequest::default())
             .await?;
-        tracing::info!(
-            sandbox = id,
-            user = account.username,
-            "remote desktop enabled"
-        );
+        let username = bounded(account.username, MAX_NAME);
+        tracing::info!(sandbox = id, user = username, "remote desktop enabled");
         Ok(common::RemoteDesktopCredential {
-            username: account.username,
+            username,
             password,
             port: 3389,
         })
