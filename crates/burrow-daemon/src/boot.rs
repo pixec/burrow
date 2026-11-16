@@ -46,7 +46,18 @@ pub async fn take_firmware(firmware: &Path, workdir: &Path) -> std::io::Result<(
     {
         return Ok(());
     }
+    // Made afresh, never written through: the working directory may be a
+    // jail's, where whatever sits at the name could be a link out of it.
     let next = workdir.join(format!("{FIRMWARE}.next"));
-    tokio::fs::copy(firmware, &next).await?;
+    let _ = tokio::fs::remove_file(&next).await;
+    let mut to = tokio::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o644)
+        .custom_flags(libc::O_NOFOLLOW)
+        .open(&next)
+        .await?;
+    tokio::io::copy(&mut tokio::fs::File::open(firmware).await?, &mut to).await?;
+    to.sync_all().await?;
     tokio::fs::rename(&next, &dest).await
 }
