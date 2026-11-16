@@ -2,13 +2,15 @@
 //!
 //! Entropy: Windows has no call that credits outside entropy to the kernel's
 //! RNG the way Linux's `RNDADDENTROPY` does; `BCryptGenRandom` takes no seed.
-//! What reseeds a restored Windows guest is the VM Generation ID: Windows'
-//! vmgenid driver sees the identifier change and reseeds the kernel RNG,
-//! which needs a VMM that gives each restored process a new identifier;
-//! Burrow's Cloud Hypervisor config adds no vmgenid device. The host's bytes
-//! are accepted and not used, and `reseed_us` reports zero. A host that
-//! restores without vmgenid leaves clones sharing RNG state, and that is the
-//! host's to provide, not something the agent can repair.
+//! What reseeds a restored Windows guest is the VM Generation ID: Cloud
+//! Hypervisor (v54) gives every VM the ACPI device and draws a new
+//! identifier on every restore, the "Microsoft Hyper-V Generation Counter"
+//! driver binds to it, and Windows reseeds its root RNG when it changes.
+//! Measured 2026-11-16 on Server 2022: the counter read through
+//! `\\.\VmGenerationCounter` differs in the source and in each clone of a
+//! snapshot, and the first GUIDs and `CryptGenRandom` bytes of two clones
+//! differ. The host's bytes are accepted and not used, and `reseed_us`
+//! reports zero.
 
 #![allow(clippy::result_large_err)]
 
