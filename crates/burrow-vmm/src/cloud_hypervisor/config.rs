@@ -539,6 +539,7 @@ mod tests {
         windows.tpm = Some(crate::TpmSpec {
             swtpm: "swtpm".into(),
             dir: "/var/lib/burrow/tpm/sbx_a".into(),
+            uid: 300_000,
         });
         let vm = vm_config(&windows, &config(), "x86_64").unwrap();
         assert_eq!(

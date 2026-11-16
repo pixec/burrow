@@ -156,7 +156,7 @@ impl ChVm {
         };
         let read_only = jail::absolute_paths(&vm_config);
         if let Some(tpm) = &spec.tpm {
-            tpm::start(tpm, true, owner(&config)).await?;
+            tpm::start(tpm, true).await?;
         }
         let spawned = Self::spawn(&spec, &config, &[], read_only).await;
         let mut vm = without_tpm_on_error(&spec, spawned).await?;
@@ -204,7 +204,7 @@ impl ChVm {
         let (restore_dir, vm_config, last_host_port) = unpack(&spec, config.jail.as_ref()).await?;
         let read_only = jail::absolute_paths(&vm_config);
         if let Some(tpm) = &spec.tpm {
-            tpm::start(tpm, false, owner(&config)).await?;
+            tpm::start(tpm, false).await?;
         }
         let source = jail::vmm_workdir(&spec.workdir, config.jail.as_ref())?.join(RESTORE_DIR);
         let source_url = format!("file://{}", source.display());
@@ -624,11 +624,6 @@ async fn without_tpm_on_error(spec: &VmSpec, spawned: Result<ChVm>) -> Result<Ch
         }
     }
     spawned
-}
-
-/// The uid and gid a jailed VMM, and so its TPM emulator, runs as.
-fn owner(config: &CloudHypervisorConfig) -> Option<(u32, u32)> {
-    config.jail.as_ref().map(|jail| (jail.uid, jail.gid))
 }
 
 /// Lays a packed snapshot out the way a restore reads one, addressed to this

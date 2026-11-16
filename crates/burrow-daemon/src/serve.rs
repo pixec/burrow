@@ -91,6 +91,11 @@ pub struct ServeArgs {
     /// `/var/lib/swtpm`; elsewhere it needs a local rule.
     #[arg(long)]
     pub tpm_state_dir: Option<PathBuf>,
+    /// The first of the uids sandboxes' TPM emulators run as, each its
+    /// sandbox's own: this plus its address block, up to 2^20 more. The range
+    /// must hold no other user, `--jail-uid` among them.
+    #[arg(long, default_value_t = 300_000)]
+    pub tpm_uid_base: u32,
     /// Run Cloud Hypervisor unconfined even with `--jailer`: as root, in the
     /// host's namespaces, with the host's filesystem in view. For a dev box
     /// whose kernel cannot build the jail; nowhere a guest is untrusted.
@@ -569,6 +574,25 @@ impl ServeArgs {
             jail,
             "pinning the cloud hypervisor jail helper",
         )?))
+    }
+
+    /// `--tpm-uid-base`, once its range is known to be clear of root and of
+    /// the jail's uid and gid.
+    fn tpm_uid_base(&self) -> anyhow::Result<u32> {
+        let base = self.tpm_uid_base;
+        let Some(end) = base.checked_add(1 << 20).filter(|end| *end < u32::MAX) else {
+            anyhow::bail!("--tpm-uid-base {base} leaves no room for 2^20 uids");
+        };
+        let range = base..end;
+        if base == 0 || range.contains(&self.jail_uid) || range.contains(&self.jail_gid) {
+            anyhow::bail!(
+                "--tpm-uid-base {base} puts TPM emulators' uids, {base} to {end}, over root or \
+                 the jail's uid {} or gid {}",
+                self.jail_uid,
+                self.jail_gid
+            );
+        }
+        Ok(base)
     }
 
     /// What this node tells the orchestrator to send sandbox traffic to.
@@ -1810,6 +1834,7 @@ pub async fn run(args: ServeArgs) -> anyhow::Result<()> {
             },
             swtpm: args.swtpm.clone(),
             tpm_state_dir: args.tpm_state_dir.clone(),
+            tpm_uid_base: args.tpm_uid_base()?,
             hypervisors,
             kernels,
             is_nested_virt_supported: node_info.is_nested_virt_supported,

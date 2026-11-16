@@ -204,6 +204,8 @@ pub struct NodeConfig {
     /// Where those TPMs keep their state; `None` is `tpm/` under the data
     /// directory.
     pub tpm_state_dir: Option<PathBuf>,
+    /// The first of the uids those TPMs run as, one per address block.
+    pub tpm_uid_base: u32,
     /// The hypervisors this node offers, as it advertises them. A template or
     /// sandbox needing another is refused.
     pub hypervisors: Vec<Hypervisor>,
@@ -348,23 +350,35 @@ impl NodeConfig {
         }
     }
 
+    /// The TPM of the sandbox `id` holding address block `block`, when its
+    /// template gives it one. Its uid is the block's, which no other sandbox
+    /// on the node holds at the same time.
+    pub(crate) fn tpm(&self, id: &str, block: u32) -> burrow_vmm::TpmSpec {
+        burrow_vmm::TpmSpec {
+            swtpm: self.swtpm.clone(),
+            dir: self.tpm_dir(id),
+            uid: self.tpm_uid_base + block,
+        }
+    }
+
+    /// Where `id`'s TPM state is: never in its working directory, which a
+    /// jailed VMM owns.
+    pub(crate) fn tpm_dir(&self, id: &str) -> PathBuf {
+        self.tpm_root().join(id)
+    }
+
+    fn tpm_root(&self) -> PathBuf {
+        match &self.tpm_state_dir {
+            Some(root) => root.clone(),
+            None => self.data_dir.join("tpm"),
+        }
+    }
+
     /// Where a sandbox's files live.
     ///
     /// Under the jailer this *is* the chroot the VMM is pivoted into, because
     /// everything firecracker touches has to be inside it and every path
     /// burrow hands the API is already relative.
-    /// Where `id`'s TPM is, when its template gives it one: never in its
-    /// working directory, which a jailed VMM owns.
-    pub(crate) fn tpm(&self, id: &str) -> burrow_vmm::TpmSpec {
-        burrow_vmm::TpmSpec {
-            swtpm: self.swtpm.clone(),
-            dir: match &self.tpm_state_dir {
-                Some(root) => root.join(id),
-                None => self.data_dir.join("tpm").join(id),
-            },
-        }
-    }
-
     fn sandbox_dir(&self, id: &str, hypervisor: Hypervisor) -> PathBuf {
         match self.jail_for(hypervisor) {
             Some(jail) => jail.chroot_for(hypervisor, id),
@@ -1052,8 +1066,7 @@ impl<'a> Provisioning<'a> {
         self.manager.release_lease(&self.id).await;
         self.manager.volumes.release_all(&self.id);
         let _ = self.manager.config.remove_workdir(&self.workdir).await;
-        let tpm = self.manager.config.tpm(&self.id);
-        let _ = tokio::fs::remove_dir_all(tpm.dir).await;
+        let _ = tokio::fs::remove_dir_all(self.manager.config.tpm_dir(&self.id)).await;
         let _ = tokio::fs::remove_dir_all(self.manager.config.command_logs_dir(&self.id)).await;
         self.is_kept = true;
         err
@@ -1101,7 +1114,7 @@ impl Drop for Provisioning<'_> {
                 manager.release_lease(&id).await;
                 manager.volumes.release_all(&id);
                 let _ = manager.config.remove_workdir(&workdir).await;
-                let _ = tokio::fs::remove_dir_all(manager.config.tpm(&id).dir).await;
+                let _ = tokio::fs::remove_dir_all(manager.config.tpm_dir(&id)).await;
             });
         }
     }
@@ -7624,7 +7637,7 @@ impl SandboxManager {
             spec.boot = crate::boot::firmware_boot();
         }
         if is_tpm {
-            spec.tpm = Some(self.config.tpm(id));
+            spec.tpm = Some(self.config.tpm(id, lease.block));
         }
         if crate::macnode::is_macos(guest_os)
             && let Err(err) = crate::macnode::apply(&mut spec, resources)
@@ -10031,7 +10044,7 @@ impl SandboxManager {
         if let Err(err) = self.config.remove_workdir(&workdir).await {
             tracing::warn!(sandbox = id, %err, "failed to remove sandbox directory");
         }
-        let _ = tokio::fs::remove_dir_all(self.config.tpm(id).dir).await;
+        let _ = tokio::fs::remove_dir_all(self.config.tpm_dir(id)).await;
         let _ = tokio::fs::remove_dir_all(self.config.command_logs_dir(id)).await;
         rendered
     }
@@ -12190,6 +12203,7 @@ pub(crate) mod tests {
                 },
                 swtpm: "swtpm".into(),
                 tpm_state_dir: None,
+                tpm_uid_base: 300_000,
                 hypervisors: vec![Hypervisor::Firecracker],
                 kernels: Default::default(),
                 is_nested_virt_supported: false,

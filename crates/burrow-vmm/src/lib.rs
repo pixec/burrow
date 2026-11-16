@@ -495,6 +495,10 @@ pub struct TpmSpec {
     /// The emulator's state and control socket, outside the VM's working
     /// directory.
     pub dir: PathBuf,
+    /// The uid and gid the emulator runs as: its sandbox's alone, neither
+    /// root, the jail's, nor another sandbox's, so it can neither read
+    /// another TPM's state nor signal another process.
+    pub uid: u32,
 }
 
 impl VmSpec {

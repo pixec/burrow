@@ -110,9 +110,12 @@ A template whose `image.json` has `"tpm": true` gives each sandbox a TPM 2.0
 of its own from swtpm (`--swtpm`, default `/usr/bin/swtpm`). Its state lives
 in a directory per sandbox under `tpm/` in the data directory, or under
 `--tpm-state-dir`, never in the working directory a jailed VMM owns, and is
-removed with the sandbox. swtpm runs as the jail's uid, with its own seccomp
-filter set to kill, in the VM's cgroup; its directory is that uid's alone
-(0700, under a root-owned 0711 parent) and a jailed VMM is shown its socket
+removed with the sandbox. Each sandbox's swtpm runs as a uid of its own,
+`--tpm-uid-base` (default 300000) plus the sandbox's address block, with its
+own seccomp filter set to kill, in the VM's cgroup. Those 2^20 uids must
+belong to no other user, and burrowd refuses a range holding `--jail-uid`.
+The directory is that uid's alone (0700, under a root-owned 0711 parent); the
+control socket in it is open to any uid, and a jailed VMM is shown that socket
 alone. It is not chrooted, because Ubuntu's AppArmor profile for swtpm
 refuses `CAP_SYS_CHROOT`. It starts before the VMM; stopping the VMM has it
 save its volatile state, which a `start` (memory restore) resumes from, while

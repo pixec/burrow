@@ -9,9 +9,10 @@
 //! emulator.
 //!
 //! The state is kept outside the VM's working directory, which a jailed VMM
-//! owns, and a jailed VMM is shown the socket alone. swtpm runs as the jail's
-//! uid, under its own seccomp filter, in the VM's cgroup. It is not
-//! chrooted: Ubuntu's AppArmor profile for it refuses `CAP_SYS_CHROOT`.
+//! owns, in a directory only the emulator's own uid can enter, and a jailed
+//! VMM is shown the socket alone. swtpm runs as a uid of its sandbox's own,
+//! under its own seccomp filter, in the VM's cgroup. It is not chrooted:
+//! Ubuntu's AppArmor profile for it refuses `CAP_SYS_CHROOT`.
 
 use std::path::{Path, PathBuf};
 
@@ -33,10 +34,13 @@ pub(crate) fn socket(tpm: &TpmSpec) -> PathBuf {
 }
 
 /// Starts the emulator, after stopping one a VMM that ended left running.
-/// `is_fresh` drops saved volatile state, for a boot. `owner` is the uid and
-/// gid a jailed VMM runs as, which the emulator runs as too, its state and
-/// socket that uid's alone; unjailed, both are root's.
-pub(crate) async fn start(tpm: &TpmSpec, is_fresh: bool, owner: Option<(u32, u32)>) -> Result<()> {
+/// `is_fresh` drops saved volatile state, for a boot.
+///
+/// The socket is open to every uid: a jailed VMM runs as another uid, and
+/// swtpm, never root, cannot give it to that uid's group. What
+/// guards it is its directory, 0700 to the emulator's uid, which the VMM
+/// reaches only through a bind mount of the socket itself.
+pub(crate) async fn start(tpm: &TpmSpec, is_fresh: bool) -> Result<()> {
     use std::os::unix::fs::PermissionsExt as _;
     stop(tpm, false).await;
     if let Some(parent) = tpm.dir.parent() {
@@ -45,7 +49,7 @@ pub(crate) async fn start(tpm: &TpmSpec, is_fresh: bool, owner: Option<(u32, u32
         tokio::fs::set_permissions(parent, std::fs::Permissions::from_mode(0o711)).await?;
     }
     tokio::fs::create_dir_all(&tpm.dir).await?;
-    let (uid, gid) = owner.unwrap_or((0, 0));
+    let (uid, gid) = (tpm.uid, tpm.uid);
     let dir = tpm.dir.clone();
     tokio::task::spawn_blocking(move || {
         std::os::unix::fs::lchown(&dir, Some(uid), Some(gid))?;
@@ -68,7 +72,7 @@ pub(crate) async fn start(tpm: &TpmSpec, is_fresh: bool, owner: Option<(u32, u32
         .arg(format!("dir={}", tpm.dir.display()))
         .arg("--ctrl")
         .arg(format!(
-            "type=unixio,path={},mode=0600",
+            "type=unixio,path={},mode=0666",
             socket(tpm).display()
         ))
         .arg("--pid")
@@ -77,10 +81,11 @@ pub(crate) async fn start(tpm: &TpmSpec, is_fresh: bool, owner: Option<(u32, u32
         .arg(format!("file={},level=1", tpm.dir.join(LOG).display()))
         .arg("--seccomp")
         .arg("action=kill")
-        .arg("--daemon");
-    if owner.is_some() {
-        command.arg("--runas").arg(uid.to_string());
-    }
+        .arg("--daemon")
+        // Not `--runas`, which leaves root's supplementary groups on a uid
+        // with no passwd entry; dropping to a uid clears them.
+        .uid(uid)
+        .gid(gid);
     let output = command
         .output()
         .await
