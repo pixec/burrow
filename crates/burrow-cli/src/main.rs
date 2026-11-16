@@ -902,8 +902,10 @@ struct CreateFlags {
     #[arg(long = "reject-capability")]
     reject_capabilities: Vec<String>,
     /// Snapshot to start from. The sandbox restores that state instead of
-    /// booting, and takes its template and machine shape from the snapshot,
-    /// so --template, --vcpus and --mem-mib may not disagree with it.
+    /// booting and takes its template from the snapshot, so --template may
+    /// not disagree with it. It restores at the snapshot's shape; --vcpus,
+    /// --mem-mib and --disk-mib are then reached live where the guest can
+    /// take them, and refused up front where it cannot.
     #[arg(long)]
     snapshot: Option<String>,
     /// vCPUs. Defaults to 1.
