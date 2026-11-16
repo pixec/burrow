@@ -282,7 +282,10 @@ const NAMES: &[(u32, u32, usize, u32, &str)] = &[
     (0x8000_0008, 0, EBX, 9, "wbnoinvd"),
 ];
 
-#[cfg_attr(not(target_arch = "x86_64"), allow(dead_code))]
+#[cfg_attr(
+    not(all(target_os = "linux", target_arch = "x86_64")),
+    allow(dead_code)
+)]
 /// A fingerprint from the host's vendor registers (CPUID 0 EBX, EDX, ECX),
 /// its CPUID 1 EAX and 0x80000008 EAX, and what KVM supports.
 fn x86(vendor: [u32; 3], signature: u32, address: u32, supported: &[(u32, u32, [u32; 4])]) -> Cpu {
@@ -335,7 +338,10 @@ fn x86(vendor: [u32; 3], signature: u32, address: u32, supported: &[(u32, u32, [
 }
 
 /// A fingerprint from MIDR_EL1, `/proc/cpuinfo` and KVM's IPA limit.
-#[cfg_attr(not(target_arch = "aarch64"), allow(dead_code))]
+#[cfg_attr(
+    not(all(target_os = "linux", target_arch = "aarch64")),
+    allow(dead_code)
+)]
 fn aarch64(midr: u64, cpuinfo: &str, ipa_bits: u32) -> Cpu {
     let mut features: Vec<String> = cpuinfo
         .lines()
