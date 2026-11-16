@@ -1151,7 +1151,8 @@ fn spawn_handshake(
     // Weak: a sandbox deleted while its guest is still waking must not be kept
     // alive by the task that was going to talk to it.
     let weak = Arc::downgrade(sandbox);
-    let upgrade = manager.config.upgrade_for(sandbox.guest_os()).cloned();
+    let guest_os = sandbox.guest_os();
+    let upgrade = manager.config.upgrade_for(guest_os).cloned();
     tokio::spawn(async move {
         let began = std::time::Instant::now();
         // Which step the deadline caught, so a guest that never came up says
@@ -1162,8 +1163,11 @@ fn spawn_handshake(
         let phases = std::sync::Mutex::new(burrow_vmm::Phases::start());
         let guest_timing = std::sync::Mutex::new(None);
         let reached = std::sync::Mutex::new(Reached::Nothing);
-        // A guest restarting for its name boots again, on top of the rest.
-        let bound = timeout + guestconn::UPGRADE_TIMEOUT + guestconn::RESTART_TIMEOUT + timeout;
+        let mut bound = timeout + guestconn::UPGRADE_TIMEOUT;
+        // A Windows guest restarting for its name boots again, on top.
+        if guest_os == burrow_vmm::GuestOs::Windows {
+            bound += guestconn::RESTART_TIMEOUT + timeout;
+        }
         let outcome = match tokio::time::timeout(bound, async {
             let (agent, accepted_at) = match dialing {
                 Some(dialing) => dialing.await??,
