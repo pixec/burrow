@@ -234,11 +234,189 @@ fn validated_denials(sandbox: &SandboxRules) -> Option<Denials> {
     )
 }
 
+/// Whether the sandbox chains' drops are logged to NFLOG for the audit log.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum DropLog {
+    #[default]
+    Off,
+    Nflog,
+}
+
+/// The NFLOG group every audited drop is logged to.
+pub const DROP_LOG_GROUP: u16 = 7101;
+/// Prefixes the NFLOG prefix of an audited drop, ahead of its [`Refusal`].
+const DROP_LOG_PREFIX: &str = "burrow:";
+/// Holds the rate state of audited drops per input and output interface,
+/// which is per sandbox: one tap's flood cannot use up another's records.
+const DROP_RATE_SET: &str = "audit_rate";
+/// Counts, per interface pair, the drops past the rate that were not logged.
+pub const DROP_SUPPRESSED_SET: &str = "audit_suppressed";
+/// Audited drops logged per interface pair each second, and the burst.
+const DROP_LOG_RATE: u32 = 10;
+const DROP_LOG_BURST: u32 = 20;
+
+/// Why a sandbox chain dropped a packet, carried in its NFLOG prefix.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Refusal {
+    ControlPlane,
+    Internal,
+    Ipv6,
+    Range,
+    Port,
+    Malformed,
+    Smtp,
+    PublicAddress,
+    Neighbour,
+    Unmatched,
+    Host,
+    Forged,
+}
+
+const REFUSALS: [(Refusal, &str); 12] = [
+    (Refusal::ControlPlane, "control-plane"),
+    (Refusal::Internal, "internal"),
+    (Refusal::Ipv6, "ipv6"),
+    (Refusal::Range, "range"),
+    (Refusal::Port, "port"),
+    (Refusal::Malformed, "malformed"),
+    (Refusal::Smtp, "smtp"),
+    (Refusal::PublicAddress, "public-address"),
+    (Refusal::Neighbour, "neighbour"),
+    (Refusal::Unmatched, "unmatched"),
+    (Refusal::Host, "host"),
+    (Refusal::Forged, "forged"),
+];
+
+impl Refusal {
+    fn prefix(self) -> String {
+        let code = REFUSALS
+            .iter()
+            .find(|(refusal, _)| *refusal == self)
+            .map(|(_, code)| *code)
+            .unwrap_or_default();
+        format!("{DROP_LOG_PREFIX}{code}")
+    }
+
+    /// The refusal an NFLOG prefix names, or `None` for a prefix this
+    /// renderer did not write.
+    pub fn from_prefix(prefix: &str) -> Option<Self> {
+        let code = prefix.trim_end().strip_prefix(DROP_LOG_PREFIX)?;
+        REFUSALS
+            .iter()
+            .find(|(_, known)| *known == code)
+            .map(|(refusal, _)| *refusal)
+    }
+
+    /// The audit reason, worded as the proxy and a macOS node word theirs.
+    /// `is_inbound` is a packet to the sandbox rather than from it.
+    pub fn reason(self, mode: Mode, is_v6: bool, is_inbound: bool) -> &'static str {
+        match self {
+            Refusal::ControlPlane => "destination is a control-plane address",
+            Refusal::Internal => "destination is an internal or metadata address",
+            Refusal::Ipv6 => "ipv6 egress is denied",
+            Refusal::Range => "destination is in a denied range",
+            Refusal::Port => "destination port is denied",
+            Refusal::Malformed => "policy has a malformed denial",
+            Refusal::Smtp => "outbound smtp from a public address is denied",
+            Refusal::PublicAddress => "destination is another sandbox's public address",
+            Refusal::Neighbour => "destination is another sandbox",
+            Refusal::Host => "destination is this node",
+            Refusal::Forged => "source address is not the sandbox's own",
+            Refusal::Unmatched if is_inbound => "no rule admits this inbound traffic",
+            Refusal::Unmatched => match (mode, is_v6) {
+                (Mode::None | Mode::Unspecified, _) => "sandbox has no egress",
+                (Mode::Allowlist, true) => "ipv6 egress is open mode only",
+                (Mode::Allowlist, false) => "destination not in allowlist",
+                (Mode::Open, _) => "no rule admits this traffic",
+            },
+        }
+    }
+}
+
+/// The sets audited drops keep their rate and their suppressed count in.
+/// Declared with `add`, so a table that has them keeps them and what they
+/// hold across a flush.
+fn declare_drop_log(out: &mut String, table: &str) {
+    let _ = writeln!(
+        out,
+        "add set inet {table} {DROP_RATE_SET} {{ type ifname . ifname; flags dynamic,timeout; timeout 1m; }}"
+    );
+    let _ = writeln!(
+        out,
+        "add set inet {table} {DROP_SUPPRESSED_SET} {{ type ifname . ifname; flags dynamic,timeout; timeout 1h; counter; }}"
+    );
+}
+
+/// A drop, logged to NFLOG under its refusal when `log` says so.
+///
+/// The log is rate limited per interface pair: past the rate a drop is
+/// counted in [`DROP_SUPPRESSED_SET`] instead, so a flood costs the node a
+/// counter increment and not a netlink message.
+fn refuse(
+    out: &mut String,
+    log: DropLog,
+    verb: &str,
+    chain: &str,
+    matcher: &str,
+    refusal: Refusal,
+) {
+    let rule = match matcher {
+        "" => format!("{verb} rule inet {FILTER_TABLE} {chain}"),
+        matcher => format!("{verb} rule inet {FILTER_TABLE} {chain} {matcher}"),
+    };
+    if log == DropLog::Off {
+        let _ = writeln!(out, "{rule} drop");
+        return;
+    }
+    let limited = format!(
+        "{rule} update @{DROP_RATE_SET} {{ iifname . oifname limit rate over \
+         {DROP_LOG_RATE}/second burst {DROP_LOG_BURST} packets }} \
+         update @{DROP_SUPPRESSED_SET} {{ iifname . oifname }} drop"
+    );
+    let logged = format!(
+        "{rule} log group {DROP_LOG_GROUP} prefix \"{}\" drop",
+        refusal.prefix()
+    );
+    // `insert` puts each rule at the head of the chain, so the limit goes in
+    // last to end up first.
+    let pair = match verb {
+        "insert" => [logged, limited],
+        _ => [limited, logged],
+    };
+    for line in pair {
+        let _ = writeln!(out, "{line}");
+    }
+}
+
+/// A throwaway table using everything [`DropLog::Nflog`] renders, which
+/// applies only where the kernel and nft have all of it.
+pub fn drop_log_probe() -> String {
+    const PROBE: &str = "burrow_probe";
+    let mut out = String::new();
+    let _ = writeln!(out, "add table inet {PROBE}");
+    declare_drop_log(&mut out, PROBE);
+    let _ = writeln!(out, "add chain inet {PROBE} probe");
+    let mut rules = String::new();
+    refuse(
+        &mut rules,
+        DropLog::Nflog,
+        "add",
+        "probe",
+        "ip daddr 192.0.2.1",
+        Refusal::Range,
+    );
+    out.push_str(&rules.replace(&format!("inet {FILTER_TABLE} "), &format!("inet {PROBE} ")));
+    out
+}
+
+/// Removes what [`drop_log_probe`] made.
+pub const DROP_LOG_PROBE_CLEANUP: &str = "delete table inet burrow_probe";
+
 /// Renders the complete ruleset for the given sandboxes.
 ///
 /// Equivalent to [`render_with`] with no control-plane addresses.
 pub fn render(sandboxes: &[SandboxRules]) -> String {
-    render_with(sandboxes, &[])
+    render_with(sandboxes, &[], DropLog::Off)
 }
 
 /// Renders the complete ruleset, with `control_plane` denied to every sandbox.
@@ -252,8 +430,8 @@ pub fn render(sandboxes: &[SandboxRules]) -> String {
 ///
 /// Open mode is what makes them reachable at all: it has NAT'd egress to
 /// anywhere the node can route.
-pub fn render_with(sandboxes: &[SandboxRules], control_plane: &[IpAddr]) -> String {
-    let mut out = render_policy(sandboxes, control_plane);
+pub fn render_with(sandboxes: &[SandboxRules], control_plane: &[IpAddr], log: DropLog) -> String {
+    let mut out = render_policy(sandboxes, control_plane, log);
     render_meter(&mut out, sandboxes);
     out
 }
@@ -268,8 +446,9 @@ pub fn render_adding(
     sandboxes: &[SandboxRules],
     control_plane: &[IpAddr],
     added: &SandboxRules,
+    log: DropLog,
 ) -> String {
-    let mut out = render_policy(sandboxes, control_plane);
+    let mut out = render_policy(sandboxes, control_plane, log);
     let _ = writeln!(out, "add table inet {METER_TABLE}");
     render_meter_chains(&mut out);
     render_counted(&mut out, added);
@@ -289,7 +468,7 @@ pub fn render_adding(
 /// `None` when adding it changes rules beyond its own: a peer, a public
 /// address, a published port or a selectively inspected host. Those take a
 /// full render.
-pub fn render_added(added: &SandboxRules) -> Option<String> {
+pub fn render_added(added: &SandboxRules, log: DropLog) -> Option<String> {
     let is_alone = added.peers.is_empty()
         && added.public.is_empty()
         && added.ports.is_empty()
@@ -299,8 +478,8 @@ pub fn render_added(added: &SandboxRules) -> Option<String> {
     }
     let mut out = String::new();
     antispoof_rules(&mut out, added, "insert");
-    render_sandbox_denials(&mut out, "insert", added);
-    render_sandbox_allowances(&mut out, added);
+    render_sandbox_denials(&mut out, "insert", added, log);
+    render_sandbox_allowances(&mut out, added, log);
     tohost_rules(&mut out, added, "insert");
     nat_rules(&mut out, added);
     nat6_rules(&mut out, added);
@@ -309,7 +488,7 @@ pub fn render_added(added: &SandboxRules) -> Option<String> {
 }
 
 /// Everything but the counter table.
-fn render_policy(sandboxes: &[SandboxRules], control_plane: &[IpAddr]) -> String {
+fn render_policy(sandboxes: &[SandboxRules], control_plane: &[IpAddr], log: DropLog) -> String {
     let mut out = String::new();
 
     // Declaring before flushing makes this work on a fresh host too: `flush`
@@ -322,8 +501,11 @@ fn render_policy(sandboxes: &[SandboxRules], control_plane: &[IpAddr]) -> String
     // cannot share the one above and the two are rendered in step instead.
     let _ = writeln!(out, "add table ip6 {NAT6_TABLE}");
     let _ = writeln!(out, "flush table ip6 {NAT6_TABLE}");
+    if log == DropLog::Nflog {
+        declare_drop_log(&mut out, FILTER_TABLE);
+    }
 
-    render_antispoof(&mut out, sandboxes);
+    render_antispoof(&mut out, sandboxes, log);
 
     // Traffic routed *through* the host: sandbox to internet, or peer to peer.
     let _ = writeln!(
@@ -370,9 +552,13 @@ fn render_policy(sandboxes: &[SandboxRules], control_plane: &[IpAddr]) -> String
             IpAddr::V4(_) => "ip daddr",
             IpAddr::V6(_) => "ip6 daddr",
         };
-        let _ = writeln!(
-            out,
-            "add rule inet {FILTER_TABLE} sandbox {matcher} {address} drop"
+        refuse(
+            &mut out,
+            log,
+            "add",
+            "sandbox",
+            &format!("{matcher} {address}"),
+            Refusal::ControlPlane,
         );
     }
 
@@ -382,7 +568,7 @@ fn render_policy(sandboxes: &[SandboxRules], control_plane: &[IpAddr]) -> String
     // connection opened under the looser policy. Entries already in the table
     // are cleared separately; see [`flush_conntrack`].
     for sandbox in sandboxes {
-        render_sandbox_denials(&mut out, "add", sandbox);
+        render_sandbox_denials(&mut out, "add", sandbox, log);
     }
 
     // Return traffic for connections burrow already allowed.
@@ -398,10 +584,13 @@ fn render_policy(sandboxes: &[SandboxRules], control_plane: &[IpAddr]) -> String
         .flat_map(|sandbox| sandbox.public.v4.iter().map(Ipv4Addr::to_string))
         .collect();
     if !local4.is_empty() {
-        let _ = writeln!(
-            out,
-            "add rule inet {FILTER_TABLE} sandbox iifname \"{TAP_PREFIX}*\" ip daddr {} drop",
-            set_of(&local4)
+        refuse(
+            &mut out,
+            log,
+            "add",
+            "sandbox",
+            &format!("iifname \"{TAP_PREFIX}*\" ip daddr {}", set_of(&local4)),
+            Refusal::PublicAddress,
         );
     }
     let local6: Vec<String> = sandboxes
@@ -409,10 +598,13 @@ fn render_policy(sandboxes: &[SandboxRules], control_plane: &[IpAddr]) -> String
         .flat_map(|sandbox| sandbox.public.networks6())
         .collect();
     if !local6.is_empty() {
-        let _ = writeln!(
-            out,
-            "add rule inet {FILTER_TABLE} sandbox iifname \"{TAP_PREFIX}*\" ip6 daddr {} drop",
-            set_of(&local6)
+        refuse(
+            &mut out,
+            log,
+            "add",
+            "sandbox",
+            &format!("iifname \"{TAP_PREFIX}*\" ip6 daddr {}", set_of(&local6)),
+            Refusal::PublicAddress,
         );
     }
 
@@ -425,14 +617,14 @@ fn render_policy(sandboxes: &[SandboxRules], control_plane: &[IpAddr]) -> String
         "add rule inet {FILTER_TABLE} sandbox jump {ALLOW_CHAIN}"
     );
     for sandbox in sandboxes {
-        render_sandbox_allowances(&mut out, sandbox);
+        render_sandbox_allowances(&mut out, sandbox, log);
         render_ingress(&mut out, sandbox);
     }
 
     // Anything in the sandbox range that no rule above accepted.
-    let _ = writeln!(out, "add rule inet {FILTER_TABLE} sandbox drop");
+    refuse(&mut out, log, "add", "sandbox", "", Refusal::Unmatched);
 
-    render_host_input(&mut out, sandboxes);
+    render_host_input(&mut out, sandboxes, log);
     render_nat(&mut out, sandboxes);
     render_nat6(&mut out, sandboxes);
     out
@@ -589,7 +781,7 @@ fn parse_counter_name(name: &str) -> Option<(Ipv4Addr, bool)> {
 /// network it does not belong to, borrow a more permissive sandbox's egress
 /// policy, or fall through unmatched to the base hook's `accept`. Interface
 /// identity is the only thing the guest cannot forge.
-fn render_antispoof(out: &mut String, sandboxes: &[SandboxRules]) {
+fn render_antispoof(out: &mut String, sandboxes: &[SandboxRules], log: DropLog) {
     let _ = writeln!(out, "add chain inet {FILTER_TABLE} antispoof");
     for sandbox in sandboxes {
         antispoof_rules(out, sandbox, "add");
@@ -597,11 +789,23 @@ fn render_antispoof(out: &mut String, sandboxes: &[SandboxRules]) {
     // Reached only by a packet on a burrow tap whose source is not that
     // sandbox's own address. Counted and logged rather than dropped in silence:
     // forging addresses is a deliberate act the operator should be able to see.
-    let _ = writeln!(
-        out,
-        "add rule inet {FILTER_TABLE} antispoof iifname \"{TAP_PREFIX}*\" \
-         counter log prefix \"burrow-spoof \" level warn drop"
-    );
+    match log {
+        DropLog::Off => {
+            let _ = writeln!(
+                out,
+                "add rule inet {FILTER_TABLE} antispoof iifname \"{TAP_PREFIX}*\" \
+                 counter log prefix \"burrow-spoof \" level warn drop"
+            );
+        }
+        DropLog::Nflog => refuse(
+            out,
+            log,
+            "add",
+            "antispoof",
+            &format!("iifname \"{TAP_PREFIX}*\""),
+            Refusal::Forged,
+        ),
+    }
 }
 
 fn antispoof_rules(out: &mut String, sandbox: &SandboxRules, verb: &str) {
@@ -654,7 +858,7 @@ fn antispoof_rules(out: &mut String, sandbox: &SandboxRules, verb: &str) {
 /// reach it can create, delete, and exec into its neighbours. Sandboxes get
 /// nothing on the host except burrow's own proxy and resolver, and only when
 /// their policy calls for them.
-fn render_host_input(out: &mut String, sandboxes: &[SandboxRules]) {
+fn render_host_input(out: &mut String, sandboxes: &[SandboxRules], log: DropLog) {
     let _ = writeln!(
         out,
         "add chain inet {FILTER_TABLE} input {{ type filter hook input priority 0; policy accept; }}"
@@ -693,7 +897,7 @@ fn render_host_input(out: &mut String, sandboxes: &[SandboxRules]) {
         tohost_rules(out, sandbox, "add");
     }
 
-    let _ = writeln!(out, "add rule inet {FILTER_TABLE} tohost drop");
+    refuse(out, log, "add", "tohost", "", Refusal::Host);
 }
 
 fn tohost_rules(out: &mut String, sandbox: &SandboxRules, verb: &str) {
@@ -781,36 +985,47 @@ fn label(sandbox_id: &str) -> String {
 /// verdict, so a range named here is unreachable whatever the mode is,
 /// whatever else the policy allows, and whatever conntrack remembers of a
 /// connection opened under an earlier policy.
-fn render_sandbox_denials(out: &mut String, verb: &str, sandbox: &SandboxRules) {
+fn render_sandbox_denials(out: &mut String, verb: &str, sandbox: &SandboxRules, log: DropLog) {
     let guest = src4(sandbox);
     let _ = writeln!(out, "# sandbox {} denials", label(&sandbox.sandbox_id));
 
     // Link-local, in every mode and ahead of everything, the v6 counterpart
     // of the metadata denial below: `fe80::/10` is where a v6 metadata
     // service lives, and no sandbox has a reason to reach one.
-    let _ = writeln!(
+    refuse(
         out,
-        "{verb} rule inet {FILTER_TABLE} sandbox ip6 saddr {} ip6 daddr fe80::/10 drop",
-        src6(sandbox)
+        log,
+        verb,
+        "sandbox",
+        &format!("ip6 saddr {} ip6 daddr fe80::/10", src6(sandbox)),
+        Refusal::Internal,
     );
 
     // The cloud metadata address, ahead of everything else including the
     // operator's own deny_cidrs: unlike those, this is not something an
     // operator opts into, and it applies in every mode, peers included, since
     // no sandbox has a legitimate reason to have this in a private network.
-    let _ = writeln!(
+    refuse(
         out,
-        "{verb} rule inet {FILTER_TABLE} sandbox ip saddr {guest} ip daddr {METADATA_CIDR} drop"
+        log,
+        verb,
+        "sandbox",
+        &format!("ip saddr {guest} ip daddr {METADATA_CIDR}"),
+        Refusal::Internal,
     );
 
     let guest6 = src6(sandbox);
-    render_public_denials(out, verb, sandbox);
+    render_public_denials(out, verb, sandbox, log);
     // Every v6 destination, when the policy says so. Nothing but the forward
     // path is affected: the gateway's own services are on the input hook.
     if sandbox.is_ipv6_denied {
-        let _ = writeln!(
+        refuse(
             out,
-            "{verb} rule inet {FILTER_TABLE} sandbox ip6 saddr {guest6} drop"
+            log,
+            verb,
+            "sandbox",
+            &format!("ip6 saddr {guest6}"),
+            Refusal::Ipv6,
         );
     }
 
@@ -818,25 +1033,36 @@ fn render_sandbox_denials(out: &mut String, verb: &str, sandbox: &SandboxRules) 
         Some(denied) => {
             for cidr in &denied.cidrs {
                 let source = source_match(sandbox, cidr.is_v4());
-                let _ = writeln!(
+                refuse(
                     out,
-                    "{verb} rule inet {FILTER_TABLE} sandbox {source} {} {cidr} drop",
-                    cidr.daddr()
+                    log,
+                    verb,
+                    "sandbox",
+                    &format!("{source} {} {cidr}", cidr.daddr()),
+                    Refusal::Range,
                 );
             }
-            render_port_denials(out, verb, sandbox, &denied);
+            render_port_denials(out, verb, sandbox, &denied, log);
         }
         None => {
             // An unparseable denial is not ignorable: rather than render the
             // allowances it was meant to override, this sandbox gets nothing,
             // in either family.
-            let _ = writeln!(
+            refuse(
                 out,
-                "{verb} rule inet {FILTER_TABLE} sandbox ip saddr {guest} drop"
+                log,
+                verb,
+                "sandbox",
+                &format!("ip saddr {guest}"),
+                Refusal::Malformed,
             );
-            let _ = writeln!(
+            refuse(
                 out,
-                "{verb} rule inet {FILTER_TABLE} sandbox ip6 saddr {guest6} drop"
+                log,
+                verb,
+                "sandbox",
+                &format!("ip6 saddr {guest6}"),
+                Refusal::Malformed,
             );
         }
     }
@@ -884,7 +1110,7 @@ fn source_match(sandbox: &SandboxRules, is_v4: bool) -> String {
 ///
 /// SMTP is refused for every source of a family the sandbox holds a public
 /// address in, since its private address leaves translated to that one.
-fn render_public_denials(out: &mut String, verb: &str, sandbox: &SandboxRules) {
+fn render_public_denials(out: &mut String, verb: &str, sandbox: &SandboxRules, log: DropLog) {
     let public = &sandbox.public;
     for (is_present, is_allowed, source) in [
         (
@@ -899,9 +1125,13 @@ fn render_public_denials(out: &mut String, verb: &str, sandbox: &SandboxRules) {
         ),
     ] {
         if is_present && !is_allowed {
-            let _ = writeln!(
+            refuse(
                 out,
-                "{verb} rule inet {FILTER_TABLE} sandbox {source} ct direction original tcp dport 25 drop"
+                log,
+                verb,
+                "sandbox",
+                &format!("{source} ct direction original tcp dport 25"),
+                Refusal::Smtp,
             );
         }
     }
@@ -1027,7 +1257,13 @@ fn render_ingress(out: &mut String, sandbox: &SandboxRules) {
 /// whenever the remote side's ephemeral port fell in a denied range. Packets
 /// conntrack holds no direction for, invalid or untracked ones, are dropped by
 /// a second rule rather than let through to the accepts below.
-fn render_port_denials(out: &mut String, verb: &str, sandbox: &SandboxRules, denials: &Denials) {
+fn render_port_denials(
+    out: &mut String,
+    verb: &str,
+    sandbox: &SandboxRules,
+    denials: &Denials,
+    log: DropLog,
+) {
     for block in &denials.ports {
         let mut targets: Vec<(bool, Option<String>)> = Vec::new();
         if block.cidrs.is_empty() {
@@ -1058,10 +1294,13 @@ fn render_port_denials(out: &mut String, verb: &str, sandbox: &SandboxRules, den
                 .unwrap_or_default();
             for protocol in block.protocols() {
                 for state in ["ct direction original", "ct state invalid,untracked"] {
-                    let _ = writeln!(
+                    refuse(
                         out,
-                        "{verb} rule inet {FILTER_TABLE} sandbox {source}{destination} {state} \
-                         {protocol} dport {ports} drop"
+                        log,
+                        verb,
+                        "sandbox",
+                        &format!("{source}{destination} {state} {protocol} dport {ports}"),
+                        Refusal::Port,
                     );
                 }
             }
@@ -1074,7 +1313,7 @@ fn render_port_denials(out: &mut String, verb: &str, sandbox: &SandboxRules, den
 /// Rendered after the established accept, unlike [`render_sandbox_denials`]:
 /// nothing here needs to outrank a conntrack entry, since an entry only exists
 /// for a connection one of these accepts already permitted.
-fn render_sandbox_allowances(out: &mut String, sandbox: &SandboxRules) {
+fn render_sandbox_allowances(out: &mut String, sandbox: &SandboxRules, log: DropLog) {
     // A sandbox whose denials did not parse was blanket-dropped, and renders
     // no policy at all.
     if validated_denials(sandbox).is_none() {
@@ -1125,10 +1364,13 @@ fn render_sandbox_allowances(out: &mut String, sandbox: &SandboxRules) {
             // locally and policed by `tohost` on the input hook, which this
             // forward-path rule never sees.
             let sources = src4(sandbox);
-            let _ = writeln!(
+            refuse(
                 out,
-                "add rule inet {FILTER_TABLE} {ALLOW_CHAIN} ip saddr {sources} ip daddr {} drop",
-                sandbox.pool.cidr()
+                log,
+                "add",
+                ALLOW_CHAIN,
+                &format!("ip saddr {sources} ip daddr {}", sandbox.pool.cidr()),
+                Refusal::Neighbour,
             );
             let _ = writeln!(
                 out,
@@ -1138,11 +1380,17 @@ fn render_sandbox_allowances(out: &mut String, sandbox: &SandboxRules) {
             // addressed in v4, so there are no v6 peer accepts above this and
             // the pool drop is the whole of the neighbour policy: an open
             // sandbox reaches the internet over v6 and no sandbox at all.
-            let _ = writeln!(
+            refuse(
                 out,
-                "add rule inet {FILTER_TABLE} {ALLOW_CHAIN} ip6 saddr {} ip6 daddr {} drop",
-                src6(sandbox),
-                sandbox.pool.cidr6()
+                log,
+                "add",
+                ALLOW_CHAIN,
+                &format!(
+                    "ip6 saddr {} ip6 daddr {}",
+                    src6(sandbox),
+                    sandbox.pool.cidr6()
+                ),
+                Refusal::Neighbour,
             );
             let _ = writeln!(
                 out,
@@ -2087,7 +2335,7 @@ mod tests {
         for mode in [Mode::None, Mode::Allowlist, Mode::Open] {
             let mut s = sandbox(mode);
             s.peers = vec![Ipv4Addr::new(10, 99, 0, 10)];
-            let ruleset = render_with(&[s], &[orchestrator]);
+            let ruleset = render_with(&[s], &[orchestrator], DropLog::Off);
 
             let deny = "sandbox ip daddr 172.18.0.4 drop";
             assert!(
@@ -2104,7 +2352,7 @@ mod tests {
         // On the destination only: traffic *from* one of these addresses is how
         // a node's edge reaches a guest port.
         assert!(
-            !render_with(&[sandbox(Mode::Open)], &[orchestrator])
+            !render_with(&[sandbox(Mode::Open)], &[orchestrator], DropLog::Off)
                 .contains("sandbox ip saddr 172.18.0.4")
         );
         // And a node with none named renders none.
@@ -2117,7 +2365,7 @@ mod tests {
     #[test]
     fn a_control_plane_is_denied_whichever_family_it_has() {
         let v6: IpAddr = "2001:db8::4".parse().unwrap();
-        let ruleset = render_with(&[sandbox(Mode::Open)], &[v6]);
+        let ruleset = render_with(&[sandbox(Mode::Open)], &[v6], DropLog::Off);
         assert!(
             ruleset.contains("sandbox ip6 daddr 2001:db8::4 drop"),
             "a v6 control plane must be denied with a v6 matcher:\n{ruleset}"
@@ -2130,6 +2378,7 @@ mod tests {
         let both = render_with(
             &[sandbox(Mode::Open)],
             &[IpAddr::V4(Ipv4Addr::new(172, 18, 0, 4)), v6],
+            DropLog::Off,
         );
         assert!(both.contains("sandbox ip daddr 172.18.0.4 drop"));
         assert!(both.contains("sandbox ip6 daddr 2001:db8::4 drop"));
@@ -2669,7 +2918,7 @@ mod tests {
         other.tap = "bt2".into();
         let added = sandbox(Mode::Open);
         let all = [other, added.clone()];
-        let adding = render_adding(&all, &[], &added);
+        let adding = render_adding(&all, &[], &added, DropLog::Off);
         assert!(!adding.contains("flush table inet burrow_meter"));
         assert!(adding.contains("add counter inet burrow_meter rx_10_99_0_6"));
         assert!(adding.contains("meter tx iifname \"bt1\" counter name \"tx_10_99_0_6\""));
@@ -2718,7 +2967,11 @@ mod tests {
             s.deny_cidrs = vec!["10.77.0.0/16".into()];
             s.allow_cidrs = vec!["10.88.0.0/16".into()];
             s.peers = vec![Ipv4Addr::new(10, 99, 0, 10)];
-            let rules = render_with(&[s], &[IpAddr::V4(Ipv4Addr::new(172, 18, 0, 4))]);
+            let rules = render_with(
+                &[s],
+                &[IpAddr::V4(Ipv4Addr::new(172, 18, 0, 4))],
+                DropLog::Off,
+            );
 
             let established = rules
                 .find("sandbox ct state established,related accept")
@@ -3051,10 +3304,19 @@ mod tests {
             guest_ip6: "fd99:b070:0:2::2".parse().unwrap(),
             ..sandbox(Mode::Open)
         };
-        for mode in [Mode::None, Mode::Allowlist, Mode::Open] {
-            let added = sandbox(mode);
-            let before = render_with(std::slice::from_ref(&neighbour), &[]);
-            let after = render_with(&[neighbour.clone(), added.clone()], &[]);
+        for (mode, log) in [Mode::None, Mode::Allowlist, Mode::Open]
+            .into_iter()
+            .flat_map(|mode| [(mode, DropLog::Off), (mode, DropLog::Nflog)])
+        {
+            let mut added = sandbox(mode);
+            added.deny_cidrs = vec!["192.0.2.0/24".into()];
+            added.deny_ports = vec![PortDenial {
+                first: 25,
+                ..Default::default()
+            }];
+            added.is_ipv6_denied = mode == Mode::Allowlist;
+            let before = render_with(std::slice::from_ref(&neighbour), &[], log);
+            let after = render_with(&[neighbour.clone(), added.clone()], &[], log);
             let rules = |text: &str| -> std::collections::BTreeSet<String> {
                 text.lines()
                     .filter(|line| line.starts_with("add rule") || line.starts_with("add counter"))
@@ -3063,13 +3325,13 @@ mod tests {
             };
             let gained: std::collections::BTreeSet<String> =
                 rules(&after).difference(&rules(&before)).cloned().collect();
-            let incremental: std::collections::BTreeSet<String> = render_added(&added)
+            let incremental: std::collections::BTreeSet<String> = render_added(&added, log)
                 .unwrap()
                 .lines()
                 .filter(|line| !line.starts_with('#'))
                 .map(|line| line.replacen("insert rule", "add rule", 1))
                 .collect();
-            assert_eq!(incremental, gained, "{mode:?}");
+            assert_eq!(incremental, gained, "{mode:?} {log:?}");
         }
     }
 
@@ -3077,7 +3339,161 @@ mod tests {
     fn a_sandbox_that_changes_others_is_not_added_alone() {
         let mut peered = sandbox(Mode::Open);
         peered.peers = vec![Ipv4Addr::new(10, 99, 0, 10)];
-        assert!(render_added(&peered).is_none());
-        assert!(render_added(&public(Mode::Open)).is_none());
+        assert!(render_added(&peered, DropLog::Off).is_none());
+        assert!(render_added(&public(Mode::Open), DropLog::Off).is_none());
+    }
+
+    fn audited(mode: Mode) -> SandboxRules {
+        SandboxRules {
+            public: public(mode).public,
+            ..denying(mode)
+        }
+    }
+
+    fn denying(mode: Mode) -> SandboxRules {
+        let mut rules = sandbox(mode);
+        rules.deny_cidrs = vec!["192.0.2.0/24".into(), "2001:db8:dead::/48".into()];
+        rules.deny_ports = vec![PortDenial {
+            protocol: Some(Protocol::Tcp),
+            first: 5432,
+            ..Default::default()
+        }];
+        rules.is_ipv6_denied = mode == Mode::Allowlist;
+        rules
+    }
+
+    /// Logging changes what the log sees and nothing the packets meet: with
+    /// the rate rules and the log statements taken out, the audited ruleset
+    /// is the silent one.
+    #[test]
+    fn logged_drops_drop_exactly_what_silent_ones_do() {
+        let control = [IpAddr::V4(Ipv4Addr::new(172, 18, 0, 4))];
+        let log = format!(" log group {DROP_LOG_GROUP} prefix ");
+        for mode in [Mode::None, Mode::Allowlist, Mode::Open] {
+            let mut broken = sandbox(mode);
+            broken.sandbox_id = "sbx_broken".into();
+            broken.tap = "bt9".into();
+            broken.deny_cidrs = vec!["not a cidr".into()];
+            let sandboxes = [audited(mode), broken];
+            let silent = render_with(&sandboxes, &control, DropLog::Off).replace(
+                " counter log prefix \"burrow-spoof \" level warn drop",
+                " drop",
+            );
+            let logged: String = render_with(&sandboxes, &control, DropLog::Nflog)
+                .lines()
+                .filter(|line| !line.contains(&format!("update @{DROP_RATE_SET} ")))
+                .filter(|line| !line.starts_with("add set "))
+                .map(|line| match line.split_once(&log) {
+                    Some((rule, rest)) => {
+                        let verdict = rest.rsplit_once(' ').unwrap().1;
+                        format!("{rule} {verdict}\n")
+                    }
+                    None => format!("{line}\n"),
+                })
+                .collect();
+            assert_eq!(logged, silent, "{mode:?}");
+        }
+    }
+
+    /// Every drop the policy makes is logged, each one behind its rate rule,
+    /// and under a prefix that reads back as the refusal it was written for.
+    #[test]
+    fn every_policy_drop_is_logged_behind_its_rate_limit() {
+        let ruleset = render_with(
+            &[audited(Mode::Allowlist)],
+            &[IpAddr::V4(Ipv4Addr::new(172, 18, 0, 4))],
+            DropLog::Nflog,
+        );
+        let lines: Vec<&str> = ruleset.lines().collect();
+        let mut seen = std::collections::BTreeSet::new();
+        for (i, line) in lines.iter().enumerate() {
+            if !line.ends_with(" drop")
+                || line.contains("kbytes/second")
+                || line.contains("ct state new limit")
+            {
+                continue;
+            }
+            if line.contains(&format!("update @{DROP_RATE_SET} ")) {
+                assert!(lines[i + 1].contains(" log group "), "{line}");
+                continue;
+            }
+            let (_, prefix) = line.split_once(" prefix \"").expect(line);
+            let prefix = prefix.split('"').next().unwrap();
+            seen.insert(format!("{:?}", Refusal::from_prefix(prefix).expect(prefix)));
+            assert!(
+                lines[i - 1].contains(&format!("update @{DROP_RATE_SET} ")),
+                "{line}"
+            );
+            assert!(
+                lines[i - 1].contains(&format!(
+                    "update @{DROP_SUPPRESSED_SET} {{ iifname . oifname }}"
+                )),
+                "{}",
+                lines[i - 1]
+            );
+        }
+        for want in [
+            "ControlPlane",
+            "Internal",
+            "Ipv6",
+            "Range",
+            "Port",
+            "Smtp",
+            "PublicAddress",
+            "Unmatched",
+            "Host",
+            "Forged",
+        ] {
+            assert!(seen.contains(want), "{want} not logged: {seen:?}");
+        }
+        assert!(ruleset.contains(&format!("add set inet burrow {DROP_SUPPRESSED_SET} ")));
+    }
+
+    /// `insert` reverses what it is given, so an added sandbox's rate rule
+    /// is written after its log rule to land in front of it.
+    #[test]
+    fn an_added_sandbox_keeps_each_rate_rule_ahead_of_its_log() {
+        let script = render_added(&denying(Mode::Open), DropLog::Nflog).unwrap();
+        let lines: Vec<&str> = script.lines().collect();
+        let mut pairs = 0;
+        for (i, line) in lines.iter().enumerate() {
+            if line.starts_with("insert rule") && line.contains(" log group ") {
+                assert!(
+                    lines[i + 1].contains(&format!("update @{DROP_RATE_SET} ")),
+                    "{line}"
+                );
+                pairs += 1;
+            }
+        }
+        assert!(pairs >= 4, "{script}");
+    }
+
+    #[test]
+    fn refusal_prefixes_read_back_and_no_other_prefix_does() {
+        for (refusal, _) in REFUSALS {
+            assert_eq!(Refusal::from_prefix(&refusal.prefix()), Some(refusal));
+        }
+        assert_eq!(Refusal::from_prefix("burrow-spoof "), None);
+        assert_eq!(Refusal::from_prefix("burrow:nonsense"), None);
+        assert_eq!(
+            Refusal::Unmatched.reason(Mode::Allowlist, false, false),
+            "destination not in allowlist"
+        );
+        assert_eq!(
+            Refusal::Unmatched.reason(Mode::Open, false, true),
+            "no rule admits this inbound traffic"
+        );
+    }
+
+    #[test]
+    fn the_probe_uses_its_own_table_only() {
+        let probe = drop_log_probe();
+        assert!(probe.contains(" log group "));
+        assert!(
+            probe
+                .lines()
+                .all(|line| line.contains("inet burrow_probe") && !line.contains("inet burrow ")),
+            "{probe}"
+        );
     }
 }

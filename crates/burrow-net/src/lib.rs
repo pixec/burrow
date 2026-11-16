@@ -8,6 +8,7 @@ mod error;
 pub mod firewall;
 pub mod ipam;
 pub mod mesh;
+pub mod nflog;
 pub mod pinning;
 pub mod policy;
 pub mod public;

@@ -13,6 +13,7 @@ mod cpuid;
 mod delivery;
 mod devvm;
 mod diskcap;
+mod droplog;
 mod durable;
 mod edge;
 mod fsync;

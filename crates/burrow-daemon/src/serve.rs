@@ -1814,6 +1814,10 @@ pub async fn run(args: ServeArgs) -> anyhow::Result<()> {
     // sync, the proxy consults it per connection.
     let denied = Arc::new(burrow_proxy::DeniedAddresses::default());
     let directory = Arc::new(burrow_proxy::directory::Directory::default());
+    #[cfg(target_os = "linux")]
+    let drop_log = crate::droplog::open().await;
+    #[cfg(not(target_os = "linux"))]
+    let drop_log: Option<()> = None;
     let sandboxes = SandboxManager::new(
         NodeConfig {
             data_dir: args.data_dir.clone(),
@@ -1847,6 +1851,10 @@ pub async fn run(args: ServeArgs) -> anyhow::Result<()> {
                 u64::from(args.artifact_retention_days) * 24 * 60 * 60,
             ),
             control_plane: control_plane_addresses(&args.orchestrator).await,
+            drop_log: match &drop_log {
+                Some(_) => burrow_net::firewall::DropLog::Nflog,
+                None => burrow_net::firewall::DropLog::Off,
+            },
             depends_on: depended_addresses(&args).await,
             share: crate::share::ShareOptions {
                 is_enabled: !args.is_tailcat_disabled,
@@ -1968,6 +1976,10 @@ pub async fn run(args: ServeArgs) -> anyhow::Result<()> {
         authority.root_fingerprint().to_string(),
     );
     sandboxes.set_audit(audit.clone());
+    #[cfg(target_os = "linux")]
+    if let Some(socket) = drop_log {
+        crate::droplog::spawn(sandboxes.clone(), socket);
+    }
     sandboxes.start_public().await;
 
     let proxy = Arc::new(burrow_proxy::Proxy {

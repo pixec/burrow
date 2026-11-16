@@ -736,7 +736,7 @@ fn decide_v6(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::firewall::{SandboxRules, render_with};
+    use crate::firewall::{DropLog, SandboxRules, render_with};
 
     const HOST: Ipv4Addr = Ipv4Addr::new(10, 99, 0, 5);
     const GUEST: Ipv4Addr = Ipv4Addr::new(10, 99, 0, 6);
@@ -1011,7 +1011,7 @@ mod tests {
             allow_ports_denied,
             broken_ports,
         ] {
-            let ruleset = render_with(std::slice::from_ref(&sandbox), &[CONTROL]);
+            let ruleset = render_with(std::slice::from_ref(&sandbox), &[CONTROL], DropLog::Off);
             let rules = rules_of(&sandbox);
             for to in destinations {
                 for (transport, port) in probes {
@@ -1156,7 +1156,8 @@ mod tests {
                             deny(&mut sender, "10.99.0.8/29");
                             let receiver =
                                 member(neighbour, receiver_mode, is_member.then_some(local.1));
-                            let ruleset = render_with(&[sender.clone(), receiver.clone()], &[]);
+                            let ruleset =
+                                render_with(&[sender.clone(), receiver.clone()], &[], DropLog::Off);
                             let decided = decide_peer(
                                 Some(decide(
                                     &rules_of(&sender),
@@ -1181,7 +1182,8 @@ mod tests {
                             let mut sender =
                                 member(local, sender_mode, is_member.then_some(remote));
                             deny(&mut sender, "10.99.4.0/24");
-                            let ruleset = render_with(std::slice::from_ref(&sender), &[]);
+                            let ruleset =
+                                render_with(std::slice::from_ref(&sender), &[], DropLog::Off);
                             let decided = decide_peer(
                                 Some(decide(
                                     &rules_of(&sender),
@@ -1206,7 +1208,8 @@ mod tests {
                             let mut receiver =
                                 member(neighbour, receiver_mode, is_member.then_some(remote));
                             deny(&mut receiver, "10.99.4.0/24");
-                            let ruleset = render_with(std::slice::from_ref(&receiver), &[]);
+                            let ruleset =
+                                render_with(std::slice::from_ref(&receiver), &[], DropLog::Off);
                             let decided = decide_peer(None, Some(&rules_of(&receiver)), remote);
                             let rendered =
                                 evaluate_between(&ruleset, remote, neighbour.1, transport, port);

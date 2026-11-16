@@ -318,7 +318,7 @@ pub fn spawn_audit(manager: crate::sandbox::SandboxManager) {
                     }
                     (None, None) => continue,
                 };
-                manager.audit_public(burrow_proxy::EgressEvent {
+                manager.audit(burrow_proxy::EgressEvent {
                     at_ms: burrow_proxy::unix_now_ms(),
                     sandbox_id: holder.sandbox_id,
                     source_ip: connection.source.to_string(),

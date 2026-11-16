@@ -232,6 +232,8 @@ pub struct NodeConfig {
     /// has reached every other sandbox, without a packet ever crossing a rule
     /// about them.
     pub control_plane: Vec<std::net::IpAddr>,
+    /// Whether the sandbox chains' drops are logged for the audit log.
+    pub drop_log: firewall::DropLog,
     /// Whether and through which relay sandboxes here can be shared.
     pub share: crate::share::ShareOptions,
     /// Where snapshots are copied so they outlive this node. `None` keeps
@@ -2980,6 +2982,8 @@ pub struct SandboxManager {
     /// The control plane the last full render denied, which is what an
     /// incremental add relies on being in force; `None` before one lands.
     applied_denied: Arc<std::sync::Mutex<Option<Vec<std::net::IpAddr>>>>,
+    /// Which sandbox each tap is, for the drops the firewall logs.
+    drop_owners: Arc<crate::droplog::Owners>,
     /// What each template has been asked for, and what has been warmed.
     ///
     /// Both halves are bounded per template. The shapes come from create
@@ -3177,6 +3181,7 @@ impl SandboxManager {
             firewall: Arc::new(tokio::sync::Mutex::new(())),
             ruled_ahead: Default::default(),
             applied_denied: Default::default(),
+            drop_owners: Default::default(),
             snapshots: Arc::new(crate::snapshot::SnapshotStore::new(
                 &config.data_dir,
                 config.object_store.clone(),
@@ -5010,6 +5015,7 @@ impl SandboxManager {
                 .collect(),
         );
         self.proxy_policies.replace(proxy_table);
+        self.drop_owners.replace(&rules);
         let denied = self.denied_addresses();
         // The proxy is told before the ruleset is applied, not after: it is the
         // path that does not go through nftables at all, so the moment to have
@@ -5028,7 +5034,7 @@ impl SandboxManager {
         let is_current = self.applied_denied.lock().unwrap().as_ref() == Some(&denied);
         let incremental = added
             .filter(|_| is_current)
-            .and_then(firewall::render_added);
+            .and_then(|added| firewall::render_added(added, self.config.drop_log));
         let is_added = match incremental {
             Some(script) => match firewall::apply(&script).await {
                 Ok(()) => true,
@@ -5042,8 +5048,10 @@ impl SandboxManager {
         if !is_added {
             *self.applied_denied.lock().unwrap() = None;
             let ruleset = match added {
-                Some(added) => firewall::render_adding(&rules, &denied, added),
-                None => firewall::render_with(&rules, &denied),
+                Some(added) => {
+                    firewall::render_adding(&rules, &denied, added, self.config.drop_log)
+                }
+                None => firewall::render_with(&rules, &denied, self.config.drop_log),
             };
             firewall::apply(&ruleset).await.map_err(|err| {
                 tracing::error!(%err, "failed to apply firewall ruleset");
@@ -5088,9 +5096,14 @@ impl SandboxManager {
         &self.public_index
     }
 
-    /// Records a connection on a public address beside the proxy's records.
     #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
-    pub fn audit_public(&self, event: burrow_proxy::EgressEvent) {
+    pub fn drop_owners(&self) -> Arc<crate::droplog::Owners> {
+        Arc::clone(&self.drop_owners)
+    }
+
+    /// Records what the node itself saw beside the proxy's records.
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+    pub fn audit(&self, event: burrow_proxy::EgressEvent) {
         if let Some(audit) = self.audit.lock().unwrap().as_ref() {
             audit.record(event);
         }
@@ -12246,6 +12259,7 @@ pub(crate) mod tests {
                 vmm_memory_overhead_mib: HashMap::new(),
                 artifact_retention: std::time::Duration::from_secs(7 * 24 * 60 * 60),
                 control_plane: Vec::new(),
+                drop_log: firewall::DropLog::Off,
                 share: crate::share::ShareOptions {
                     is_enabled: false,
                     is_transparent: false,
