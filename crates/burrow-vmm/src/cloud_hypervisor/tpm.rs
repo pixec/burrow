@@ -131,17 +131,15 @@ pub(crate) async fn stop(tpm: &TpmSpec, is_saved: bool) {
         false => &[CMD_SHUTDOWN],
     };
     let running = pid(tpm);
-    match control(&socket, commands).await {
-        Ok(()) => {}
-        Err(err) => {
-            if is_saved {
-                tracing::warn!(dir = %tpm.dir.display(), %err, "could not save the TPM's volatile state");
-            }
-            if let Some(pid) = running {
-                // SAFETY: a plain signal to a process just checked to be this
-                // TPM's swtpm.
-                unsafe { libc::kill(pid as i32, libc::SIGTERM) };
-            }
+    if let Err(err) = control(&socket, commands).await {
+        if is_saved {
+            tracing::warn!(dir = %tpm.dir.display(), %err, "could not save the TPM's volatile state");
+        }
+        // Checked again now: the control socket can take seconds to fail.
+        if let Some(pid) = pid(tpm) {
+            // SAFETY: a plain signal to a process just checked to be this
+            // TPM's swtpm.
+            unsafe { libc::kill(pid as i32, libc::SIGTERM) };
         }
     }
     // Gone before the VM's cgroup, which it is in, is removed.
