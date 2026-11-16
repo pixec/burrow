@@ -782,9 +782,11 @@ impl SnapshotStore {
                 .and_then(|rest| rest.strip_suffix(&format!("/{MANIFEST}")))
             {
                 stored.insert(id);
-                if let Some(bytes) = remote.get_bytes(key).await?
-                    && let Ok(manifest) = serde_json::from_slice::<Manifest>(&bytes)
-                {
+                // One that cannot be read stops the collector: passing over
+                // it would leave its image unwanted, and collected.
+                if let Some(bytes) = remote.get_bytes(key).await? {
+                    let manifest: Manifest = serde_json::from_slice(&bytes)
+                        .map_err(|err| Status::data_loss(format!("{key} is unreadable: {err}")))?;
                     images.insert(manifest.rootfs_digest);
                 }
             }

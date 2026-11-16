@@ -1133,7 +1133,9 @@ pub async fn collect_garbage(
         else {
             continue;
         };
-        let Ok(Some(Held { manifest, .. })) = read_manifest(store, id).await else {
+        // A manifest that cannot be read stops the pass: taking the sandbox
+        // for gone would sweep its current generation below.
+        let Some(Held { manifest, .. }) = read_manifest(store, id).await? else {
             continue;
         };
         // Refused rather than skipped: skipping would leave this sandbox's
@@ -1475,6 +1477,28 @@ mod tests {
                 "the new generation names {digest}, which chunks.castr/ lacks"
             );
         }
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// A manifest the collector cannot read, for a moment or for good, stops
+    /// the pass rather than reading as a sandbox that is gone, whose current
+    /// generation the sweep would then delete.
+    #[tokio::test]
+    async fn an_unreadable_manifest_stops_the_collector() {
+        let (store, faults, objects) = crate::objstore::fake::controlled().await;
+        replace_manifest(&store, None, &manifest("node-a", STATE_SUSPENDED))
+            .await
+            .unwrap();
+        let vmstate = generation_key("sbx_1", 1, "snapshot.vmstate");
+        store.put_bytes(&vmstate, b"state".to_vec()).await.unwrap();
+        objects.lock().unwrap().age("", 2 * GARBAGE_GRACE);
+        *faults.failing_gets.lock().unwrap() = Some("sbx_1/manifest.json".into());
+        let root = std::env::temp_dir().join(format!("burrow-gc-{}", uuid::Uuid::new_v4()));
+        let snapshots =
+            crate::snapshot::SnapshotStore::new(&root, Some(store.clone()), HashMap::new());
+        assert!(collect_garbage(&store, &snapshots).await.is_err());
+        assert!(store.exists(&vmstate).await.unwrap());
+        *faults.failing_gets.lock().unwrap() = None;
         let _ = std::fs::remove_dir_all(&root);
     }
 
