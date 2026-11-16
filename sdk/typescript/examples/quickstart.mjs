@@ -33,55 +33,52 @@ const sandbox = await Sandbox.getOrCreate({
 console.log("sandbox:", sandbox.name, sandbox.id, sandbox.state, `${sandbox.vcpus} vcpu`, `${sandbox.memoryMib} MiB`);
 
 // The same calls as node:child_process and node:fs/promises, run in the guest.
-const { exec, execFile, spawn } = sandbox.childProcess;
-const fs = sandbox.fs;
-
 try {
   // execFile runs the program directly: no shell, so nothing needs quoting.
-  const hello = await execFile("echo", ["hello from the sandbox"]);
+  const hello = await sandbox.execFile("echo", ["hello from the sandbox"]);
   console.log("execFile:", hello.stdout.trim());
 
   // exec goes through /bin/sh, so pipes and redirection work.
-  const piped = await exec("echo one two three | tr ' ' '\\n' | wc -l");
+  const piped = await sandbox.exec("echo one two three | tr ' ' '\\n' | wc -l");
   console.log("shell:", piped.stdout.trim());
 
   // Options carry cwd and env.
-  const where = await exec("pwd; echo $QUICKSTART $STAGE", {
+  const where = await sandbox.exec("pwd; echo $QUICKSTART $STAGE", {
     cwd: "/work",
     env: { STAGE: "tour" },
   });
   console.log("cwd and env:", where.stdout.trim().split("\n").join(" | "));
 
   // spawn hands back a ChildProcess: streams and events, as Node's.
-  const job = spawn("sh", ["-c", "for i in 1 2 3; do echo tick $i; done"]);
+  const job = sandbox.spawn("sh", ["-c", "for i in 1 2 3; do echo tick $i; done"]);
   job.stdout.on("data", (chunk) => process.stdout.write(`  ${chunk}`));
   console.log("job closed:", await once(job, "close"));
 
   // Signals by name; a command a signal ended has a null exit code.
-  const sleeper = spawn("sleep", ["60"]);
+  const sleeper = sandbox.spawn("sleep", ["60"]);
   await once(sleeper, "spawn");
   sleeper.kill("SIGTERM");
   console.log("killed:", await once(sleeper, "exit"));
 
   // stdin is a Writable that reaches the command.
-  const cat = spawn("cat");
+  const cat = sandbox.spawn("cat");
   cat.stdin.end("piped through cat\n");
   cat.stdout.on("data", (chunk) => process.stdout.write(`  ${chunk}`));
   await once(cat, "close");
 
   // Files, as fs/promises.
-  await fs.mkdir("/work", { recursive: true });
-  await fs.writeFile("/work/hello.sh", "echo written from the SDK\n");
-  await fs.writeFile("/work/run.sh", "sh /work/hello.sh\n", { mode: 0o755 });
-  const script = await execFile("sh", ["/work/run.sh"]);
+  await sandbox.mkdir("/work", { recursive: true });
+  await sandbox.writeFile("/work/hello.sh", "echo written from the SDK\n");
+  await sandbox.writeFile("/work/run.sh", "sh /work/hello.sh\n", { mode: 0o755 });
+  const script = await sandbox.execFile("sh", ["/work/run.sh"]);
   console.log("file:", script.stdout.trim());
-  console.log("dir:", (await fs.readdir("/work")).join(", "));
-  const stats = await fs.stat("/work/run.sh");
+  console.log("dir:", (await sandbox.readdir("/work")).join(", "));
+  const stats = await sandbox.stat("/work/run.sh");
   console.log("run.sh:", stats.size, "bytes, mode", (stats.mode & 0o777).toString(8));
 
   // Errors are Node's, code and all.
   try {
-    await fs.readFile("/work/nope.txt");
+    await sandbox.readFile("/work/nope.txt");
   } catch (err) {
     console.log("missing file:", err.code, err.message);
   }
@@ -89,12 +86,12 @@ try {
   // Copy one back out to the local filesystem through a FileHandle stream.
   const local = `${tmpdir()}/burrow-quickstart/hello.sh`;
   await mkdir(`${tmpdir()}/burrow-quickstart`, { recursive: true });
-  const handle = await fs.open("/work/hello.sh");
+  const handle = await sandbox.open("/work/hello.sh");
   await pipeline(handle.createReadStream(), createWriteStream(local));
   console.log("downloaded to:", local);
 
   // Denied hosts fail rather than silently succeeding.
-  const blocked = await exec("wget -qO- http://example.com/").catch((err) => err);
+  const blocked = await sandbox.exec("wget -qO- http://example.com/").catch((err) => err);
   console.log("example.com reachable:", !(blocked instanceof Error));
 
   // Tighten the policy on a running sandbox.
@@ -104,7 +101,7 @@ try {
 
   // A failed command rejects with Node's error.
   try {
-    await exec("exit 3");
+    await sandbox.exec("exit 3");
   } catch (err) {
     console.log("caught exit:", err.code);
   }
@@ -114,7 +111,7 @@ try {
   const child = await sandbox.fork({ name: `${sandbox.name}-fork` });
   try {
     console.log("fork:", child.name, child.id);
-    console.log("fork sees the file:", (await child.fs.readFile("/work/hello.sh", "utf8")).trim());
+    console.log("fork sees the file:", (await child.readFile("/work/hello.sh", "utf8")).trim());
   } finally {
     await child.delete();
   }
@@ -124,11 +121,11 @@ try {
   const started = Date.now();
   await sandbox.resume();
   console.log("resumed in:", `${Date.now() - started}ms`);
-  console.log("file survived:", (await fs.readFile("/work/hello.sh", "utf8")).trim());
+  console.log("file survived:", (await sandbox.readFile("/work/hello.sh", "utf8")).trim());
 
   // Auto-resume: a call on a suspended sandbox resumes it and retries once.
   await sandbox.pause();
-  const revived = await execFile("cat", ["/work/hello.sh"]);
+  const revived = await sandbox.execFile("cat", ["/work/hello.sh"]);
   console.log("auto-resumed:", revived.stdout.trim());
 } finally {
   await sandbox.delete();

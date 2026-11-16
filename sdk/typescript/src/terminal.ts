@@ -17,7 +17,7 @@ export interface TerminalOptions {
 /**
  * A live shell in a sandbox.
  *
- * Unlike `childProcess.exec`, the input side stays open: the caller writes
+ * Unlike `exec`, the input side stays open: the caller writes
  * keystrokes and resizes as they happen. That is what makes this usable behind
  * a WebSocket, where a browser terminal is on the other end.
  *

@@ -1,9 +1,9 @@
 import type { Direct, Transport } from "./transport.js";
 
 /**
- * @internal What `sandbox.fs` and `sandbox.childProcess` reach their sandbox
- * through. Read live rather than copied, so a handle from `asUser` and the
- * handle it came from never disagree about which sandbox they are on.
+ * @internal What the sandbox's file and command methods reach it through.
+ * Read live rather than copied, so a handle from `asUser` and the handle it
+ * came from never disagree about which sandbox they are on.
  */
 export interface GuestLink {
   readonly sandboxId: string;

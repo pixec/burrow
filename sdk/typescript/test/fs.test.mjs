@@ -1,4 +1,4 @@
-// `sandbox.fs` is `fs/promises`: the same calls produce the same shapes, and
+// The sandbox's file methods are `fs/promises`: the same calls produce the same shapes, and
 // a kernel error is indistinguishable from one Node's own `fs` raised.
 
 import assert from "node:assert/strict";
@@ -33,7 +33,7 @@ const ENOENT = { code: "ENOENT", errno: 2, syscall: "open", path: "/x", dest: ""
 test("a kernel error is shaped as Node's own", async () => {
   const { sandbox } = fsSandbox(() => ({ error: ENOENT }));
   const theirs = await hostOpen("/burrow-sdk-test-does-not-exist").catch((err) => err);
-  const ours = await sandbox.fs.open("/x").catch((err) => err);
+  const ours = await sandbox.open("/x").catch((err) => err);
 
   assert.ok(ours instanceof Error);
   assert.equal(ours.message, "ENOENT: no such file or directory, open '/x'");
@@ -54,7 +54,7 @@ test("a two-path error names both, as rename's does", async () => {
   const { sandbox } = fsSandbox(() => ({
     error: { code: "EXDEV", errno: 18, syscall: "rename", path: "/a", dest: "/b" },
   }));
-  await assert.rejects(sandbox.fs.rename("/a", "/b"), {
+  await assert.rejects(sandbox.rename("/a", "/b"), {
     message: "EXDEV: cross-device link not permitted, rename '/a' -> '/b'",
     code: "EXDEV",
     errno: -18,
@@ -67,7 +67,7 @@ test("a policy refusal stays a BurrowError", async () => {
   const { sandbox } = fsSandbox(() => {
     throw new BurrowError("path is outside the sandbox's file scope", "permission_denied");
   });
-  await assert.rejects(sandbox.fs.stat("/etc/shadow"), (err) => {
+  await assert.rejects(sandbox.stat("/etc/shadow"), (err) => {
     assert.ok(err instanceof BurrowError);
     assert.equal(err.code, "permission_denied");
     return true;
@@ -89,16 +89,16 @@ test("string flags map to Linux's open(2) values", async () => {
     "ax+": 0o2302,
   };
   for (const [flag, value] of Object.entries(expected)) {
-    await sandbox.fs.open("/f", flag);
+    await sandbox.open("/f", flag);
     assert.equal(calls.at(-1).body.flags, value, flag);
   }
-  await sandbox.fs.open("/f");
+  await sandbox.open("/f");
   assert.equal(calls.at(-1).body.flags, 0, "defaults to r");
   assert.equal(calls.at(-1).body.mode, 0o666);
-  await sandbox.fs.open("/f", 0o102, "644");
+  await sandbox.open("/f", 0o102, "644");
   assert.deepEqual(calls.at(-1).body, { path: "/f", flags: 0o102, mode: 0o644 });
 
-  await assert.rejects(sandbox.fs.open("/f", "rw"), {
+  await assert.rejects(sandbox.open("/f", "rw"), {
     name: "TypeError",
     code: "ERR_INVALID_ARG_VALUE",
   });
@@ -136,7 +136,7 @@ function fileSandbox(initial = "") {
 
 test("a handle reads and writes by position", async () => {
   const { sandbox, calls } = fileSandbox("0123456789");
-  const handle = await sandbox.fs.open("/f", "r+");
+  const handle = await sandbox.open("/f", "r+");
   assert.equal(handle.fd, 7);
 
   const buffer = Buffer.alloc(8, ".");
@@ -165,7 +165,7 @@ test("a handle reads and writes by position", async () => {
 
 test("a closed handle rejects with EBADF, as Node's does", async () => {
   const { sandbox, calls } = fileSandbox("x");
-  const handle = await sandbox.fs.open("/f");
+  const handle = await sandbox.open("/f");
   await handle.close();
   assert.equal(handle.fd, -1);
 
@@ -182,7 +182,7 @@ test("a closed handle rejects with EBADF, as Node's does", async () => {
 
 test("writeFile opens, writes and closes, as the handle's user", async () => {
   const { sandbox, calls } = fileSandbox();
-  await sandbox.asUser("alice").fs.writeFile("/home/alice/a.txt", "hi", { mode: 0o600 });
+  await sandbox.asUser("alice").writeFile("/home/alice/a.txt", "hi", { mode: 0o600 });
   assert.deepEqual(
     calls.map((call) => call.op),
     ["open", "write", "close"],
@@ -210,7 +210,7 @@ test("readdir with file types returns Dirents, and stats what d_type left unknow
     return { stat: { mode: 0o10644 } };
   });
 
-  const entries = await sandbox.fs.readdir("/work", { withFileTypes: true });
+  const entries = await sandbox.readdir("/work", { withFileTypes: true });
   assert.deepEqual(
     entries.map((e) => [e.name, e.isFile(), e.isDirectory(), e.isSymbolicLink(), e.isFIFO()]),
     [
@@ -223,7 +223,7 @@ test("readdir with file types returns Dirents, and stats what d_type left unknow
   assert.equal(entries[0].parentPath, "/work");
   assert.equal(calls[0].op, "readDir");
 
-  assert.deepEqual(await sandbox.fs.readdir("/work"), ["a.txt", "src", "link", "pipe"]);
+  assert.deepEqual(await sandbox.readdir("/work"), ["a.txt", "src", "link", "pipe"]);
 });
 
 test("a recursive readdir names entries by their path below the root", async () => {
@@ -232,21 +232,21 @@ test("a recursive readdir names entries by their path below the root", async () 
     "/w/a": [{ name: "g", type: "FILE_TYPE_FILE" }],
   };
   const { sandbox } = fsSandbox((_op, body) => ({ entries: { entries: tree[body.path] } }));
-  assert.deepEqual(await sandbox.fs.readdir("/w", { recursive: true }), ["a", "f", "a/g"]);
+  assert.deepEqual(await sandbox.readdir("/w", { recursive: true }), ["a", "f", "a/g"]);
 });
 
 test("mkdir resolves the first directory a recursive call created", async () => {
   let created = "/a/b";
   const { sandbox, calls } = fsSandbox(() => (created === null ? { isDone: true } : { path: created }));
 
-  assert.equal(await sandbox.fs.mkdir("/a/b/c", { recursive: true }), "/a/b");
+  assert.equal(await sandbox.mkdir("/a/b/c", { recursive: true }), "/a/b");
   assert.deepEqual(calls.at(-1).body, { path: "/a/b/c", mode: 0o777, isRecursive: true });
 
   created = "";
-  assert.equal(await sandbox.fs.mkdir("/a/b/c", { recursive: true }), undefined);
+  assert.equal(await sandbox.mkdir("/a/b/c", { recursive: true }), undefined);
 
   created = null;
-  assert.equal(await sandbox.fs.mkdir("/d", 0o750), undefined);
+  assert.equal(await sandbox.mkdir("/d", 0o750), undefined);
   assert.deepEqual(calls.at(-1).body, { path: "/d", mode: 0o750, isRecursive: false });
 });
 
@@ -269,7 +269,7 @@ test("stat converts times and types as Node's Stats does", async () => {
       birthtimeNs: 0,
     },
   }));
-  const stats = await sandbox.fs.stat("/f");
+  const stats = await sandbox.stat("/f");
   assert.equal(stats.isFile(), true);
   assert.equal(stats.isDirectory(), false);
   assert.equal(stats.size, 12);
@@ -279,7 +279,7 @@ test("stat converts times and types as Node's Stats does", async () => {
 
 test("utimes takes Dates, seconds and numeric strings", async () => {
   const { sandbox, calls } = fsSandbox(() => ({ isDone: true }));
-  await sandbox.fs.utimes("/f", new Date(1_500), "2.25");
+  await sandbox.utimes("/f", new Date(1_500), "2.25");
   assert.deepEqual(calls.at(-1).body, {
     path: "/f",
     atimeNs: "1500000000",

@@ -1,4 +1,4 @@
-// `sandbox.childProcess` is `child_process`: argv built the way Node builds
+// The sandbox's command methods are `child_process`: argv built the way Node builds
 // it, the events Node emits in the order it emits them, and the same error
 // from a failed `exec`.
 
@@ -74,14 +74,14 @@ const runs = (...messages) => (stream) => {
 
 test("without a shell the command is the program, with no shell involved", () => {
   const { sandbox, execs } = execSandbox();
-  sandbox.childProcess.spawn("echo", ["a b", "$HOME"]);
+  sandbox.spawn("echo", ["a b", "$HOME"]);
   assert.deepEqual(execs[0].start.cmd, ["echo", "a b", "$HOME"]);
 });
 
 test("with a shell the words are joined and run by it, as Node does", () => {
   const { sandbox, execs } = execSandbox();
-  const child = sandbox.childProcess.spawn("ls", ["-l", "/work"], { shell: true });
-  sandbox.childProcess.spawn("echo $HOME", { shell: "/bin/bash" });
+  const child = sandbox.spawn("ls", ["-l", "/work"], { shell: true });
+  sandbox.spawn("echo $HOME", { shell: "/bin/bash" });
   assert.deepEqual(execs[0].start.cmd, ["/bin/sh", "-c", "ls -l /work"]);
   assert.deepEqual(execs[1].start.cmd, ["/bin/bash", "-c", "echo $HOME"]);
   assert.equal(child.spawnfile, "/bin/sh");
@@ -90,8 +90,8 @@ test("with a shell the words are joined and run by it, as Node does", () => {
 
 test("exec goes through a shell and execFile does not", async () => {
   const { sandbox, execs } = execSandbox(runs({ output: "exitCode", exitCode: 0 }));
-  await sandbox.childProcess.exec("ls | wc -l");
-  await sandbox.childProcess.execFile("python3", ["-c", "print(1)"]);
+  await sandbox.exec("ls | wc -l");
+  await sandbox.execFile("python3", ["-c", "print(1)"]);
   assert.deepEqual(execs[0].start.cmd, ["/bin/sh", "-c", "ls | wc -l"]);
   assert.deepEqual(execs[1].start.cmd, ["python3", "-c", "print(1)"]);
 });
@@ -104,7 +104,7 @@ test("a command a signal ended exits with a null code and the signal's name", as
       { output: "exitCode", exitCode: 143 },
     ),
   );
-  const child = sandbox.childProcess.spawn("sleep", ["9"]);
+  const child = sandbox.spawn("sleep", ["9"]);
   assert.equal(child.pid, undefined);
   const events = [];
   let stdout = "";
@@ -127,7 +127,7 @@ test("a command a signal ended exits with a null code and the signal's name", as
 
 test("an ordinary exit reports its code and no signal", async () => {
   const { sandbox } = execSandbox(runs({ output: "exitCode", exitCode: 3 }));
-  const child = sandbox.childProcess.spawn("false");
+  const child = sandbox.spawn("false");
   const exit = once(child, "exit");
   const close = once(child, "close");
   assert.deepEqual(await exit, [3, null]);
@@ -139,7 +139,7 @@ test("an ordinary exit reports its code and no signal", async () => {
 test("stdin waits for the command, then reaches the exec stream", async () => {
   let stream;
   const { sandbox, execs } = execSandbox((s) => (stream = s));
-  const child = sandbox.childProcess.spawn("cat");
+  const child = sandbox.spawn("cat");
   child.stdin.write("hello ");
   child.stdin.end("world");
   await new Promise((resolve) => setImmediate(resolve));
@@ -162,7 +162,7 @@ test("stdin waits for the command, then reaches the exec stream", async () => {
 
 test("an ignored stdin is closed at once and is null", () => {
   const { sandbox, execs } = execSandbox();
-  const child = sandbox.childProcess.spawn("true", [], { stdio: ["ignore", "pipe", "pipe"] });
+  const child = sandbox.spawn("true", [], { stdio: ["ignore", "pipe", "pipe"] });
   assert.equal(child.stdin, null);
   assert.deepEqual(execs[0].writes, [{ isStdinEof: true }]);
 });
@@ -173,7 +173,7 @@ test("kill sends SIGTERM by its Linux number and reports false once exited", asy
     stream = s;
     s.push({ output: "commandId", commandId: "cmd_1" });
   });
-  const child = sandbox.childProcess.spawn("sleep", ["60"]);
+  const child = sandbox.spawn("sleep", ["60"]);
   await once(child, "spawn");
   assert.equal(child.kill(), true);
   assert.equal(child.killed, true);
@@ -204,8 +204,8 @@ test("exec resolves stdout and stderr, decoded across chunk boundaries", async (
       { output: "exitCode", exitCode: 0 },
     ),
   );
-  assert.deepEqual(await sandbox.childProcess.exec("echo"), { stdout: "price €5", stderr: "warn" });
-  const raw = await sandbox.childProcess.exec("echo", { encoding: "buffer" });
+  assert.deepEqual(await sandbox.exec("echo"), { stdout: "price €5", stderr: "warn" });
+  const raw = await sandbox.exec("echo", { encoding: "buffer" });
   assert.deepEqual(raw.stdout, Buffer.from("price €5"));
 });
 
@@ -217,7 +217,7 @@ test("a failed exec rejects with Node's error", async () => {
       { output: "exitCode", exitCode: 2 },
     ),
   );
-  const promise = sandbox.childProcess.exec("make all");
+  const promise = sandbox.exec("make all");
   assert.ok(promise.child);
   await assert.rejects(promise, (err) => {
     assert.ok(err instanceof Error);
@@ -236,7 +236,7 @@ test("an exec a signal ended rejects with a null code and the signal", async () 
   const { sandbox } = execSandbox(
     runs({ output: "exitSignal", exitSignal: 9 }, { output: "exitCode", exitCode: 137 }),
   );
-  await assert.rejects(sandbox.childProcess.execFile("sleep", ["9"]), {
+  await assert.rejects(sandbox.execFile("sleep", ["9"]), {
     code: null,
     signal: "SIGKILL",
     cmd: "sleep 9",
@@ -245,7 +245,7 @@ test("an exec a signal ended rejects with a null code and the signal", async () 
 
 test("the handle's env and user go under the command's own", () => {
   const { sandbox, execs } = execSandbox();
-  sandbox.asUser("alice").childProcess.spawn("env", { env: { STAGE: "x", DROP: undefined }, cwd: "/work" });
+  sandbox.asUser("alice").spawn("env", { env: { STAGE: "x", DROP: undefined }, cwd: "/work" });
   assert.equal(execs[0].start.user, "alice");
   assert.deepEqual(execs[0].start.env, { STAGE: "x" });
   assert.equal(execs[0].start.cwd, "/work");
@@ -255,6 +255,6 @@ test("output a rotated log dropped is reported, by how much", async () => {
   const { sandbox } = execSandbox(
     runs({ output: "lostBytes", lostBytes: 42 }, { output: "exitCode", exitCode: 0 }),
   );
-  const child = sandbox.childProcess.spawn("yes");
+  const child = sandbox.spawn("yes");
   assert.deepEqual(await once(child, "lost"), [42]);
 });

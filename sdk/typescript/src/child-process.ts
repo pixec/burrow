@@ -1,5 +1,5 @@
 /**
- * `sandbox.childProcess`: Node's `child_process`, run in the guest.
+ * Commands in the guest, behind the sandbox's `spawn`, `exec` and `execFile`.
  *
  * A command is an `Exec` stream, and a command started elsewhere is reached
  * with `Attach`; either way it surfaces as a `ChildProcess` that behaves like
@@ -173,7 +173,7 @@ interface ChildInit {
  * A command in the sandbox, as Node's `ChildProcess`.
  *
  * ```ts
- * const child = sandbox.childProcess.spawn("python3", ["-u", "train.py"]);
+ * const child = sandbox.spawn("python3", ["-u", "train.py"]);
  * child.stdout.on("data", (chunk) => process.stdout.write(chunk));
  * child.on("close", (code, signal) => console.log("done", code, signal));
  * ```
@@ -440,140 +440,51 @@ function stdioOf(stdio: SpawnOptions["stdio"]): [StdioMode, StdioMode, StdioMode
   }) as [StdioMode, StdioMode, StdioMode];
 }
 
-/**
- * Starting commands in the sandbox, as `node:child_process`.
- *
- * ```ts
- * const { stdout } = await sandbox.childProcess.exec("ls -la /work");
- * const { stdout: version } = await sandbox.childProcess.execFile("python3", ["--version"]);
- * ```
- *
- * Commands run as the handle's user, with the handle's `env` under their own.
- * Only the asynchronous API: a sync call would block this process on the
- * network. Methods are bound, so `const { exec } = sandbox.childProcess`
- * works as it does with `child_process`.
- */
-export class SandboxChildProcess {
-  /** @internal */
-  constructor(private readonly guest: GuestLink) {
-    for (const name of Object.getOwnPropertyNames(SandboxChildProcess.prototype)) {
-      const value = (this as any)[name];
-      if (name !== "constructor" && typeof value === "function") (this as any)[name] = value.bind(this);
-    }
+/** @internal Starts `[file, ...argv]` over `Exec`, as Node's `spawn` once its arguments are sorted out. */
+export function startCommand(
+  guest: GuestLink,
+  command: string,
+  args: string[],
+  options: SpawnOptions,
+): ChildProcess {
+  let file = command;
+  let argv = args;
+  if (options.shell) {
+    // Node's own construction: the words joined with spaces, unquoted.
+    file = typeof options.shell === "string" ? options.shell : "/bin/sh";
+    argv = ["-c", [command, ...args].join(" ")];
   }
-
-  /**
-   * Starts `command` with `args`, as Node's `spawn`: without `shell` the
-   * command is the program and no shell is involved, so `args` need no
-   * quoting. `argv0` is not offered, since the guest runs `argv` as given.
-   */
-  spawn(command: string, options?: SpawnOptions): ChildProcess;
-  spawn(command: string, args: readonly string[], options?: SpawnOptions): ChildProcess;
-  spawn(
-    command: string,
-    argsOrOptions?: readonly string[] | SpawnOptions,
-    maybeOptions?: SpawnOptions,
-  ): ChildProcess {
-    const args = Array.isArray(argsOrOptions) ? [...argsOrOptions] : [];
-    const options: SpawnOptions =
-      (Array.isArray(argsOrOptions) ? maybeOptions : (argsOrOptions as SpawnOptions | undefined)) ?? {};
-    let file = command;
-    let argv = args;
-    if (options.shell) {
-      // Node's own construction: the words joined with spaces, unquoted.
-      file = typeof options.shell === "string" ? options.shell : "/bin/sh";
-      argv = ["-c", [command, ...args].join(" ")];
-    }
-    const stdio = stdioOf(options.stdio);
-    const env: Record<string, string> = { ...this.guest.env };
-    for (const [name, value] of Object.entries(options.env ?? {})) {
-      if (value !== undefined) env[name] = value;
-    }
-    const start = {
-      start: {
-        sandboxId: this.guest.sandboxId,
-        cmd: [file, ...argv],
-        env,
-        cwd: options.cwd === undefined ? "" : toPath(options.cwd),
-        isPty: options.pty ?? false,
-        rows: options.rows ?? 24,
-        cols: options.cols ?? 80,
-        user: options.user ?? this.guest.user,
-        logMaxBytes: options.logMaxBytes ?? 0,
-        logMaxFiles: options.logMaxFiles ?? 0,
-      },
-    };
-    return new ChildProcess(execChannel(this.guest, start, stdio[0] === "ignore"), {
-      spawnfile: file,
-      spawnargs: [file, ...argv],
-      stdio,
-      timeout: options.timeout,
-      killSignal: options.killSignal,
-      signal: options.signal,
-    });
+  const stdio = stdioOf(options.stdio);
+  const env: Record<string, string> = { ...guest.env };
+  for (const [name, value] of Object.entries(options.env ?? {})) {
+    if (value !== undefined) env[name] = value;
   }
-
-  /**
-   * Runs `command` through a shell and resolves `{ stdout, stderr }` once it
-   * exits 0, as `util.promisify(exec)`. Otherwise rejects with Node's error:
-   * `code` the exit code (null after a signal), `signal`, `killed`, `cmd`,
-   * and the output so far.
-   */
-  exec(
-    command: string,
-    options?: ExecCommandOptions & { encoding?: BufferEncoding },
-  ): PromiseWithChild<{ stdout: string; stderr: string }>;
-  exec(
-    command: string,
-    options: ExecCommandOptions & { encoding: "buffer" | null },
-  ): PromiseWithChild<{ stdout: Buffer; stderr: Buffer }>;
-  exec(
-    command: string,
-    options?: ExecCommandOptions,
-  ): PromiseWithChild<{ stdout: string | Buffer; stderr: string | Buffer }>;
-  exec(
-    command: string,
-    options: ExecCommandOptions = {},
-  ): PromiseWithChild<{ stdout: string | Buffer; stderr: string | Buffer }> {
-    return collect(this.spawn(command, { ...options, shell: options.shell ?? true }), command, options);
-  }
-
-  /** Runs `file` with `args`, no shell, as `util.promisify(execFile)`. Settles as {@link exec}. */
-  execFile(
-    file: string,
-    options?: ExecFileOptions & { encoding?: BufferEncoding },
-  ): PromiseWithChild<{ stdout: string; stderr: string }>;
-  execFile(
-    file: string,
-    args: readonly string[] | null | undefined,
-    options?: ExecFileOptions & { encoding?: BufferEncoding },
-  ): PromiseWithChild<{ stdout: string; stderr: string }>;
-  execFile(
-    file: string,
-    args: readonly string[] | null | undefined,
-    options: ExecFileOptions & { encoding: "buffer" | null },
-  ): PromiseWithChild<{ stdout: Buffer; stderr: Buffer }>;
-  execFile(
-    file: string,
-    args?: readonly string[] | null,
-    options?: ExecFileOptions,
-  ): PromiseWithChild<{ stdout: string | Buffer; stderr: string | Buffer }>;
-  execFile(
-    file: string,
-    argsOrOptions?: readonly string[] | null | ExecFileOptions,
-    maybeOptions?: ExecFileOptions,
-  ): PromiseWithChild<{ stdout: string | Buffer; stderr: string | Buffer }> {
-    const args = Array.isArray(argsOrOptions) ? [...argsOrOptions] : [];
-    const options: ExecFileOptions =
-      (Array.isArray(argsOrOptions) || argsOrOptions === null
-        ? maybeOptions
-        : (argsOrOptions as ExecFileOptions | undefined)) ?? {};
-    return collect(this.spawn(file, args, options), [file, ...args].join(" "), options);
-  }
+  const start = {
+    start: {
+      sandboxId: guest.sandboxId,
+      cmd: [file, ...argv],
+      env,
+      cwd: options.cwd === undefined ? "" : toPath(options.cwd),
+      isPty: options.pty ?? false,
+      rows: options.rows ?? 24,
+      cols: options.cols ?? 80,
+      user: options.user ?? guest.user,
+      logMaxBytes: options.logMaxBytes ?? 0,
+      logMaxFiles: options.logMaxFiles ?? 0,
+    },
+  };
+  return new ChildProcess(execChannel(guest, start, stdio[0] === "ignore"), {
+    spawnfile: file,
+    spawnargs: [file, ...argv],
+    stdio,
+    timeout: options.timeout,
+    killSignal: options.killSignal,
+    signal: options.signal,
+  });
 }
 
-/** Gathers a child's output and settles as Node's `exec` callback does. */
-function collect(
+/** @internal Gathers a child's output and settles as Node's `exec` callback does. */
+export function collect(
   child: ChildProcess,
   cmd: string,
   options: ExecFileOptions,

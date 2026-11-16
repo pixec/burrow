@@ -17,7 +17,7 @@ Node 18 or newer.
 import { Sandbox } from "@pixec/burrow";
 
 await using sandbox = await Sandbox.create({ template: "python" });
-const { stdout } = await sandbox.childProcess.execFile("echo", ["hello"]);
+const { stdout } = await sandbox.execFile("echo", ["hello"]);
 console.log(stdout); // "hello\n"
 ```
 

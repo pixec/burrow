@@ -1,7 +1,55 @@
-import { attach, SandboxChildProcess, type ChildProcess } from "./child-process.js";
+import { Buffer } from "node:buffer";
+import type { Abortable } from "node:events";
+import type {
+  BufferEncodingOption,
+  CopyOptions,
+  EncodingOption,
+  MakeDirectoryOptions,
+  Mode,
+  ObjectEncodingOptions,
+  OpenMode,
+  PathLike,
+  RmDirOptions,
+  RmOptions,
+  StatOptions,
+  TimeLike,
+} from "node:fs";
+import type { FileChangeInfo } from "node:fs/promises";
+import { posix } from "node:path";
+
+import {
+  attach,
+  collect,
+  startCommand,
+  type ChildProcess,
+  type ExecCommandOptions,
+  type ExecFileOptions,
+  type PromiseWithChild,
+  type SpawnOptions,
+} from "./child-process.js";
 import { withClient, withConnection } from "./client.js";
 import { BurrowError } from "./errors.js";
-import { SandboxFs } from "./fs.js";
+import {
+  abortError,
+  constants,
+  Dirent,
+  encoded,
+  FileHandle,
+  fsError,
+  fsRequest,
+  optionsOf,
+  Stats,
+  toFlags,
+  toMode,
+  toNanos,
+  toPath,
+  typeOf,
+  type Encoding,
+  type ReadFileOptions,
+  type WatchOptions,
+  type WriteData,
+  type WriteFileOptions,
+} from "./fs.js";
 import type { GuestLink } from "./guest.js";
 import { toPublicIp } from "./ip.js";
 import {
@@ -217,6 +265,15 @@ function toPort(raw: any, fallbackHost: string): PortMapping {
  *
  * Obtained from {@link Sandbox.create}, {@link Sandbox.get}, a {@link Burrow}
  * client's `sandboxes`, or {@link Sandbox.fork}; not constructed directly.
+ *
+ * Besides its lifecycle, a handle carries the guest's files and commands as
+ * Node's `fs/promises` and `child_process` functions:
+ *
+ * ```ts
+ * await sandbox.mkdir("/work/src", { recursive: true });
+ * await sandbox.writeFile("/work/src/app.py", "print('hi')\n");
+ * const { stdout } = await sandbox.execFile("python3", ["/work/src/app.py"]);
+ * ```
  */
 export class Sandbox {
   readonly id: string;
@@ -242,15 +299,8 @@ export class Sandbox {
   private readonly onResume?: (sandbox: Sandbox) => void | Promise<void>;
   /** Set by {@link delete}: a destroyed sandbox has nothing left to call. */
   private destroyed = false;
-  /** What `fs` and `childProcess` reach the sandbox through, read live. */
-  private readonly link: GuestLink;
-  /**
-   * The sandbox's filesystem, as Node's `fs/promises`: the same functions,
-   * signatures and errors, performed by the guest kernel.
-   */
-  readonly fs: SandboxFs;
-  /** Commands in the sandbox, as Node's `child_process`: `spawn`, `exec`, `execFile`. */
-  readonly childProcess: SandboxChildProcess;
+  /** What the file and command methods reach the sandbox through, read live. */
+  private readonly guest: GuestLink;
 
   /**
    * @internal A handle on `transport`. An owned handle holds one share of
@@ -266,7 +316,7 @@ export class Sandbox {
     this.env = options.env ?? {};
     this.onResume = options.onResume;
     const sandbox = this;
-    this.link = {
+    this.guest = {
       sandboxId: this.id,
       get user() {
         return sandbox.defaultUser;
@@ -288,8 +338,6 @@ export class Sandbox {
       resume: () => this.resume(),
       signalCommand: (cmdId, signal) => this.killCommand(cmdId, signal),
     };
-    this.fs = new SandboxFs(this.link);
-    this.childProcess = new SandboxChildProcess(this.link);
   }
 
   /** @internal The SDK's name for a wire `SandboxState`. */
@@ -355,7 +403,7 @@ export class Sandbox {
    * const sandbox = await Sandbox.getOrCreate({
    *   name: "build-482",
    *   template: "python-tools",
-   *   onCreate: (s) => s.fs.writeFile("/work/app.py", src),
+   *   onCreate: (s) => s.writeFile("/work/app.py", src),
    * });
    * ```
    */
@@ -583,7 +631,7 @@ export class Sandbox {
       { sandboxId: this.id, commandId: cmdId },
       options,
     );
-    return attach(this.link, cmdId, options.fromOffset ?? 0, toCommandInfo(raw).cmd);
+    return attach(this.guest, cmdId, options.fromOffset ?? 0, toCommandInfo(raw).cmd);
   }
 
   /**
@@ -596,6 +644,501 @@ export class Sandbox {
       removed: Number(res.removed ?? 0),
       freedBytes: Number(res.freedBytes ?? 0),
     };
+  }
+
+  // Commands, as Node's `child_process`: `spawn`, `exec` and `execFile`.
+  // Each runs as the handle's user, with the handle's `env` under its own.
+  // Only the asynchronous API: a sync call would block this process on the
+  // network.
+
+  /**
+   * Starts `command` with `args`, as Node's `spawn`: without `shell` the
+   * command is the program and no shell is involved, so `args` need no
+   * quoting. `argv0` is not offered, since the guest runs `argv` as given.
+   */
+  spawn(command: string, options?: SpawnOptions): ChildProcess;
+  spawn(command: string, args: readonly string[], options?: SpawnOptions): ChildProcess;
+  spawn(
+    command: string,
+    argsOrOptions?: readonly string[] | SpawnOptions,
+    maybeOptions?: SpawnOptions,
+  ): ChildProcess {
+    const args = Array.isArray(argsOrOptions) ? [...argsOrOptions] : [];
+    const options: SpawnOptions =
+      (Array.isArray(argsOrOptions) ? maybeOptions : (argsOrOptions as SpawnOptions | undefined)) ?? {};
+    return startCommand(this.guest, command, args, options);
+  }
+
+  /**
+   * Runs `command` through a shell and resolves `{ stdout, stderr }` once it
+   * exits 0, as `util.promisify(exec)`. Otherwise rejects with Node's error:
+   * `code` the exit code (null after a signal), `signal`, `killed`, `cmd`,
+   * and the output so far.
+   */
+  exec(
+    command: string,
+    options?: ExecCommandOptions & { encoding?: BufferEncoding },
+  ): PromiseWithChild<{ stdout: string; stderr: string }>;
+  exec(
+    command: string,
+    options: ExecCommandOptions & { encoding: "buffer" | null },
+  ): PromiseWithChild<{ stdout: Buffer; stderr: Buffer }>;
+  exec(
+    command: string,
+    options?: ExecCommandOptions,
+  ): PromiseWithChild<{ stdout: string | Buffer; stderr: string | Buffer }>;
+  exec(
+    command: string,
+    options: ExecCommandOptions = {},
+  ): PromiseWithChild<{ stdout: string | Buffer; stderr: string | Buffer }> {
+    return collect(this.spawn(command, { ...options, shell: options.shell ?? true }), command, options);
+  }
+
+  /** Runs `file` with `args`, no shell, as `util.promisify(execFile)`. Settles as {@link exec}. */
+  execFile(
+    file: string,
+    options?: ExecFileOptions & { encoding?: BufferEncoding },
+  ): PromiseWithChild<{ stdout: string; stderr: string }>;
+  execFile(
+    file: string,
+    args: readonly string[] | null | undefined,
+    options?: ExecFileOptions & { encoding?: BufferEncoding },
+  ): PromiseWithChild<{ stdout: string; stderr: string }>;
+  execFile(
+    file: string,
+    args: readonly string[] | null | undefined,
+    options: ExecFileOptions & { encoding: "buffer" | null },
+  ): PromiseWithChild<{ stdout: Buffer; stderr: Buffer }>;
+  execFile(
+    file: string,
+    args?: readonly string[] | null,
+    options?: ExecFileOptions,
+  ): PromiseWithChild<{ stdout: string | Buffer; stderr: string | Buffer }>;
+  execFile(
+    file: string,
+    argsOrOptions?: readonly string[] | null | ExecFileOptions,
+    maybeOptions?: ExecFileOptions,
+  ): PromiseWithChild<{ stdout: string | Buffer; stderr: string | Buffer }> {
+    const args = Array.isArray(argsOrOptions) ? [...argsOrOptions] : [];
+    const options: ExecFileOptions =
+      (Array.isArray(argsOrOptions) || argsOrOptions === null
+        ? maybeOptions
+        : (argsOrOptions as ExecFileOptions | undefined)) ?? {};
+    return collect(this.spawn(file, args, options), [file, ...args].join(" "), options);
+  }
+
+  // Files, as Node's `fs/promises`: the same functions, signatures, defaults
+  // and errors, performed by the guest kernel as the handle's user. Kernel
+  // errors are Node's (`code`, negative `errno`, `syscall`, `path`). The file
+  // policy refuses the way the kernel would: `EACCES` for a path or a
+  // direction it does not allow, `EFBIG` past its write ceiling.
+
+  async access(path: PathLike, mode: number = constants.F_OK): Promise<void> {
+    await fsRequest(this.guest, "access", { path: toPath(path), mode });
+  }
+
+  /** {@link writeFile} with `flag` defaulting to `"a"`. */
+  async appendFile(
+    path: PathLike | FileHandle,
+    data: WriteData,
+    options?: WriteFileOptions | BufferEncoding | null,
+  ): Promise<void> {
+    const opts = optionsOf(options);
+    await this.writeWhole(path, data, { ...opts, flag: opts.flag ?? "a" });
+  }
+
+  async chmod(path: PathLike, mode: Mode): Promise<void> {
+    await fsRequest(this.guest, "chmod", { path: toPath(path), mode: toMode(mode, 0) });
+  }
+
+  async chown(path: PathLike, uid: number, gid: number): Promise<void> {
+    await fsRequest(this.guest, "chown", { path: toPath(path), uid, gid, isNofollow: false });
+  }
+
+  /**
+   * Copies one file. `COPYFILE_EXCL` fails with `EEXIST` rather than
+   * replacing; `COPYFILE_FICLONE` is a hint and ignored. The agent cannot
+   * promise a copy-on-write clone, so `COPYFILE_FICLONE_FORCE` fails with
+   * `ENOSYS`, as Node's does on a filesystem without one.
+   */
+  async copyFile(src: PathLike, dest: PathLike, mode = 0): Promise<void> {
+    if (mode & constants.COPYFILE_FICLONE_FORCE) {
+      throw fsError({ code: "ENOSYS", errno: 38, syscall: "copyfile", path: toPath(src), dest: toPath(dest) });
+    }
+    await fsRequest(this.guest, "copy", {
+      src: toPath(src),
+      dst: toPath(dest),
+      isExclusive: (mode & constants.COPYFILE_EXCL) !== 0,
+      isRecursive: false,
+      isPreserving: false,
+    });
+  }
+
+  /**
+   * Copies a file or, with `recursive`, a tree. One call does it unless
+   * existing files are to be skipped (`force: false` without `errorOnExist`)
+   * or a `filter` is given; those walk the tree from here, a call per entry.
+   * `preserveTimestamps` carries the mode over as well as the times.
+   * `dereference` and `verbatimSymlinks` are not offered: links are copied
+   * as links.
+   */
+  async cp(source: string | URL, destination: string | URL, options: CopyOptions = {}): Promise<void> {
+    const src = toPath(source);
+    const dst = toPath(destination);
+    const force = options.force ?? true;
+    const errorOnExist = options.errorOnExist ?? false;
+    const copy = (from: string, to: string, isRecursive: boolean) =>
+      fsRequest(this.guest, "copy", {
+        src: from,
+        dst: to,
+        isExclusive: !force,
+        isRecursive,
+        isPreserving: options.preserveTimestamps ?? false,
+      });
+
+    if (!options.filter && (force || errorOnExist)) {
+      await copy(src, dst, options.recursive ?? false);
+      return;
+    }
+
+    const walk = async (from: string, to: string): Promise<void> => {
+      if (options.filter && !(await options.filter(from, to))) return;
+      const stats = await this.lstat(from);
+      if (!stats.isDirectory()) {
+        try {
+          await copy(from, to, false);
+        } catch (err) {
+          if (!force && !errorOnExist && (err as NodeJS.ErrnoException).code === "EEXIST") return;
+          throw err;
+        }
+        return;
+      }
+      if (!options.recursive) {
+        throw fsError({ code: "EISDIR", errno: 21, syscall: "cp", path: from });
+      }
+      await this.mkdir(to, { recursive: true });
+      for (const name of await this.readdir(from)) {
+        await walk(posix.join(from, name), posix.join(to, name));
+      }
+    };
+    await walk(src, dst);
+  }
+
+  async lchown(path: PathLike, uid: number, gid: number): Promise<void> {
+    await fsRequest(this.guest, "chown", { path: toPath(path), uid, gid, isNofollow: true });
+  }
+
+  async link(existingPath: PathLike, newPath: PathLike): Promise<void> {
+    await fsRequest(this.guest, "link", { existing: toPath(existingPath), path: toPath(newPath) });
+  }
+
+  async lstat(path: PathLike, _options?: StatOptions & { bigint?: false }): Promise<Stats> {
+    return new Stats(await fsRequest(this.guest, "stat", { path: toPath(path), isNofollow: true }));
+  }
+
+  async lutimes(path: PathLike, atime: TimeLike, mtime: TimeLike): Promise<void> {
+    await fsRequest(this.guest, "utimes", {
+      path: toPath(path),
+      atimeNs: toNanos(atime),
+      mtimeNs: toNanos(mtime),
+      isNofollow: true,
+    });
+  }
+
+  /**
+   * Creates a directory. With `recursive`, missing parents too, and resolves
+   * with the first directory it created, or `undefined` when it created none.
+   */
+  mkdir(
+    path: PathLike,
+    options: MakeDirectoryOptions & { recursive: true },
+  ): Promise<string | undefined>;
+  mkdir(
+    path: PathLike,
+    options?: Mode | (MakeDirectoryOptions & { recursive?: false }) | null,
+  ): Promise<void>;
+  mkdir(path: PathLike, options?: Mode | MakeDirectoryOptions | null): Promise<string | undefined>;
+  async mkdir(
+    path: PathLike,
+    options?: Mode | MakeDirectoryOptions | null,
+  ): Promise<string | void> {
+    const opts: MakeDirectoryOptions =
+      typeof options === "object" && options !== null ? options : { mode: options ?? undefined };
+    const created: string | undefined = await fsRequest(this.guest, "mkdir", {
+      path: toPath(path),
+      mode: toMode(opts.mode, 0o777),
+      isRecursive: opts.recursive ?? false,
+    });
+    return opts.recursive ? created || undefined : undefined;
+  }
+
+  /** Creates a unique directory by appending six random characters to `prefix`. */
+  mkdtemp(prefix: string, options?: EncodingOption): Promise<string>;
+  mkdtemp(prefix: string, options: BufferEncodingOption): Promise<Buffer>;
+  async mkdtemp(
+    prefix: string,
+    options?: EncodingOption | BufferEncodingOption,
+  ): Promise<string | Buffer> {
+    return encoded(await fsRequest(this.guest, "mkdtemp", { prefix }), optionsOf(options).encoding);
+  }
+
+  /** Opens a file. Flags as Node's strings (`"r"`, `"w+"`, `"ax"`, ...) or Linux numbers. */
+  async open(path: PathLike, flags?: OpenMode, mode?: Mode | null): Promise<FileHandle> {
+    const resolved = toPath(path);
+    const handle: number = await fsRequest(this.guest, "open", {
+      path: resolved,
+      flags: toFlags(flags, "r"),
+      mode: toMode(mode, 0o666),
+    });
+    return new FileHandle(this.guest, handle, resolved);
+  }
+
+  /**
+   * Lists a directory. `withFileTypes` returns {@link Dirent}s; `recursive`
+   * descends, naming entries by their path below `path`. Where the guest
+   * filesystem reports no d_type, the entry is stat'ed, as Node does.
+   */
+  readdir(
+    path: PathLike,
+    options?:
+      | (ObjectEncodingOptions & { withFileTypes?: false; recursive?: boolean })
+      | BufferEncoding
+      | null,
+  ): Promise<string[]>;
+  readdir(
+    path: PathLike,
+    options: { encoding: "buffer"; withFileTypes?: false; recursive?: boolean } | "buffer",
+  ): Promise<Buffer[]>;
+  readdir(
+    path: PathLike,
+    options: ObjectEncodingOptions & { withFileTypes: true; recursive?: boolean },
+  ): Promise<Dirent[]>;
+  readdir(
+    path: PathLike,
+    options: { encoding: "buffer"; withFileTypes: true; recursive?: boolean },
+  ): Promise<Dirent<Buffer>[]>;
+  async readdir(
+    path: PathLike,
+    options?:
+      | (Omit<ObjectEncodingOptions, "encoding"> & {
+          encoding?: Encoding;
+          withFileTypes?: boolean;
+          recursive?: boolean;
+        })
+      | BufferEncoding
+      | "buffer"
+      | null,
+  ): Promise<Array<string | Buffer | Dirent<string | Buffer>>> {
+    const { encoding, withFileTypes, recursive } = optionsOf(options);
+    const root = toPath(path);
+    const out: Array<string | Buffer | Dirent<string | Buffer>> = [];
+    // Breadth first, which is the order Node's recursive listing comes in.
+    const queue = [""];
+    for (let below = queue.shift(); below !== undefined; below = queue.shift()) {
+      const dir = below ? posix.join(root, below) : root;
+      const { entries } = await fsRequest(this.guest, "readDir", { path: dir });
+      for (const entry of entries as Array<{ name: string; type: string }>) {
+        let type = entry.type.replace("FILE_TYPE_", "").toLowerCase();
+        if (type === "unspecified") type = typeOf(await this.lstat(posix.join(dir, entry.name)));
+        const relative = below ? posix.join(below, entry.name) : entry.name;
+        if (recursive && type === "dir") queue.push(relative);
+        out.push(
+          withFileTypes
+            ? new Dirent(encoded(entry.name, encoding), dir, type)
+            : encoded(relative, encoding),
+        );
+      }
+    }
+    return out;
+  }
+
+  /** Reads a whole file: an open, a read per 4 MiB, a close. */
+  readFile(
+    path: PathLike | FileHandle,
+    options?: ({ encoding?: null; flag?: OpenMode } & Abortable) | null,
+  ): Promise<Buffer>;
+  readFile(
+    path: PathLike | FileHandle,
+    options: ({ encoding: BufferEncoding; flag?: OpenMode } & Abortable) | BufferEncoding,
+  ): Promise<string>;
+  readFile(
+    path: PathLike | FileHandle,
+    options?: ReadFileOptions | BufferEncoding | null,
+  ): Promise<string | Buffer>;
+  async readFile(
+    path: PathLike | FileHandle,
+    options?: ReadFileOptions | BufferEncoding | null,
+  ): Promise<string | Buffer> {
+    if (path instanceof FileHandle) return path.readFile(options);
+    const { encoding, flag, signal } = optionsOf(options);
+    const flags = toFlags(flag, "r");
+    const handle = await this.open(toPath(path), flags);
+    try {
+      return await handle.readFile({ encoding: encoding ?? null, signal });
+    } finally {
+      await handle.close();
+    }
+  }
+
+  readlink(path: PathLike, options?: EncodingOption): Promise<string>;
+  readlink(path: PathLike, options: BufferEncodingOption): Promise<Buffer>;
+  async readlink(
+    path: PathLike,
+    options?: EncodingOption | BufferEncodingOption,
+  ): Promise<string | Buffer> {
+    return encoded(await fsRequest(this.guest, "readlink", { path: toPath(path) }), optionsOf(options).encoding);
+  }
+
+  realpath(path: PathLike, options?: EncodingOption): Promise<string>;
+  realpath(path: PathLike, options: BufferEncodingOption): Promise<Buffer>;
+  async realpath(
+    path: PathLike,
+    options?: EncodingOption | BufferEncodingOption,
+  ): Promise<string | Buffer> {
+    return encoded(await fsRequest(this.guest, "realpath", { path: toPath(path) }), optionsOf(options).encoding);
+  }
+
+  async rename(oldPath: PathLike, newPath: PathLike): Promise<void> {
+    await fsRequest(this.guest, "rename", { src: toPath(oldPath), dst: toPath(newPath) });
+  }
+
+  /**
+   * Removes a file, or with `recursive` a tree; `force` makes a missing path
+   * not an error. `maxRetries` and `retryDelay` are accepted and unused: the
+   * busy-file errors they retry are Windows'.
+   */
+  async rm(path: PathLike, options: RmOptions = {}): Promise<void> {
+    await fsRequest(this.guest, "remove", {
+      path: toPath(path),
+      isRecursive: options.recursive ?? false,
+      isForce: options.force ?? false,
+      isDirOnly: false,
+    });
+  }
+
+  /** Removes an empty directory. Node's deprecated `recursive` acts as {@link rm}'s. */
+  async rmdir(path: PathLike, options: RmDirOptions = {}): Promise<void> {
+    await fsRequest(this.guest, "remove", {
+      path: toPath(path),
+      isRecursive: options.recursive ?? false,
+      isForce: false,
+      isDirOnly: !options.recursive,
+    });
+  }
+
+  /** `bigint` is not offered: times arrive from the guest as doubles already. */
+  async stat(path: PathLike, _options?: StatOptions & { bigint?: false }): Promise<Stats> {
+    return new Stats(await fsRequest(this.guest, "stat", { path: toPath(path), isNofollow: false }));
+  }
+
+  /** `type` is Windows' and ignored, as Node ignores it elsewhere. */
+  async symlink(target: PathLike, path: PathLike, _type?: string | null): Promise<void> {
+    await fsRequest(this.guest, "symlink", { target: toPath(target), path: toPath(path) });
+  }
+
+  async truncate(path: PathLike, len = 0): Promise<void> {
+    await fsRequest(this.guest, "truncate", { path: toPath(path), length: len });
+  }
+
+  async unlink(path: PathLike): Promise<void> {
+    await fsRequest(this.guest, "remove", {
+      path: toPath(path),
+      isRecursive: false,
+      isForce: false,
+      isDirOnly: false,
+    });
+  }
+
+  /** Times as a `Date`, seconds since the epoch, or a numeric string of them. */
+  async utimes(path: PathLike, atime: TimeLike, mtime: TimeLike): Promise<void> {
+    await fsRequest(this.guest, "utimes", {
+      path: toPath(path),
+      atimeNs: toNanos(atime),
+      mtimeNs: toNanos(mtime),
+      isNofollow: false,
+    });
+  }
+
+  /**
+   * Watches a directory, as Node's `fs/promises` `watch`: an async iterable
+   * of `{ eventType, filename }`, `filename` relative to the directory.
+   *
+   * ```ts
+   * const ac = new AbortController();
+   * for await (const { eventType, filename } of sandbox.watch("/work", { signal: ac.signal })) {
+   *   console.log(eventType, filename);
+   * }
+   * ```
+   *
+   * The guest polls rather than using inotify, so an edit is seen within
+   * about `intervalMs`, and only directories can be watched. Aborting
+   * `signal` ends the iteration with an `AbortError`, as Node's does.
+   */
+  async *watch(
+    filename: PathLike,
+    options: WatchOptions | BufferEncoding | "buffer" = {},
+  ): AsyncGenerator<FileChangeInfo<string | Buffer>> {
+    const { recursive, signal, encoding, intervalMs } = optionsOf<WatchOptions>(options);
+    const root = toPath(filename);
+    if (signal?.aborted) throw abortError(signal);
+    try {
+      for await (const raw of this.guest.node().serverStream<any, any>(
+        "Watch",
+        {
+          sandboxId: this.guest.sandboxId,
+          path: root,
+          isRecursive: recursive ?? false,
+          intervalMs: intervalMs ?? 0,
+        },
+        // A watch outlives any request deadline.
+        Infinity,
+        signal,
+      )) {
+        yield {
+          // Node's two kinds: a name that appeared or went, and a change in place.
+          eventType: raw.kind === "WATCH_EVENT_KIND_MODIFIED" ? "change" : "rename",
+          filename: encoded(posix.relative(root, raw.path), encoding),
+        };
+      }
+    } catch (err) {
+      if (signal?.aborted) throw abortError(signal);
+      throw err;
+    }
+  }
+
+  /**
+   * Writes a whole file, replacing it: `flag` `"w"`, `mode` 0o666 before the
+   * umask. `data` may be a string, bytes, or an (async) iterable of either,
+   * a `Readable` among them. Always opens and writes, never the upload
+   * stream, which creates missing parents where Node fails with `ENOENT` and
+   * cannot write as a user.
+   */
+  async writeFile(
+    file: PathLike | FileHandle,
+    data: WriteData,
+    options?: WriteFileOptions | BufferEncoding | null,
+  ): Promise<void> {
+    await this.writeWhole(file, data, optionsOf(options));
+  }
+
+  private async writeWhole(
+    file: PathLike | FileHandle,
+    data: WriteData,
+    options: Omit<Partial<WriteFileOptions>, "encoding"> & { encoding?: Encoding },
+  ): Promise<void> {
+    const { mode, flag, flush, signal } = options;
+    const encoding = options.encoding === "buffer" ? null : options.encoding;
+    if (file instanceof FileHandle) {
+      await file.writeFile(data, { encoding, signal });
+      return;
+    }
+    const handle = await this.open(file, toFlags(flag, "w"), mode);
+    try {
+      await handle.writeFile(data, { encoding, signal });
+      if (flush) await handle.sync();
+    } finally {
+      await handle.close();
+    }
   }
 
   /**
@@ -632,7 +1175,7 @@ export class Sandbox {
    *
    * ```ts
    * const alice = await sandbox.createUser("alice");
-   * await sandbox.childProcess.exec("whoami", { user: alice.username });
+   * await sandbox.exec("whoami", { user: alice.username });
    * ```
    *
    * The home is 0700, so one agent's files are not readable by another's.
@@ -732,13 +1275,13 @@ export class Sandbox {
    *
    * ```ts
    * const alice = sandbox.asUser("alice");
-   * await alice.childProcess.exec("touch ~/notes.txt");
-   * await alice.fs.writeFile("/home/alice/todo.txt", "ship it\n");
+   * await alice.exec("touch ~/notes.txt");
+   * await alice.writeFile("/home/alice/todo.txt", "ship it\n");
    * ```
    *
-   * Commands and terminals run as the user, and every `fs` call is made as
+   * Commands and terminals run as the user, and every file call is made as
    * them, so the guest kernel refuses what the user could not do and what
-   * they create is theirs. `fs.watch` is the exception: the guest scans as
+   * they create is theirs. `watch` is the exception: the guest scans as
    * root. The user has to exist already.
    */
   asUser(name: string): Sandbox {
@@ -757,7 +1300,7 @@ export class Sandbox {
   /**
    * Opens an interactive shell with a pty, for when input arrives over time
    * (a browser terminal, an agent driving a REPL). For a command that runs to
-   * completion, use `childProcess.exec`.
+   * completion, use `exec`.
    */
   terminal(options: TerminalOptions = {}): Terminal {
     this.assertLive();

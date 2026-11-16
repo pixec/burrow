@@ -24,7 +24,6 @@ export {
 } from "./template.js";
 export {
   ChildProcess,
-  SandboxChildProcess,
   type BurrowCommandOptions,
   type ExecCommandOptions,
   type ExecError,
@@ -33,9 +32,9 @@ export {
   type SpawnOptions,
 } from "./child-process.js";
 export {
+  constants,
   Dirent,
   FileHandle,
-  SandboxFs,
   Stats,
   type Encoding,
   type ReadFileOptions,

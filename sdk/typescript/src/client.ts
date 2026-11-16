@@ -115,7 +115,7 @@ export class Sandboxes {
    * const sandbox = await burrow.sandboxes.getOrCreate({
    *   name: "build-482",
    *   template: "python-tools",
-   *   onCreate: (s) => s.fs.writeFile("/work/app.py", src),
+   *   onCreate: (s) => s.writeFile("/work/app.py", src),
    * });
    * ```
    *
