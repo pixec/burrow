@@ -69,8 +69,13 @@ fn time(stamp: ext4_view::Timestamp) -> Time {
 fn portable(name: &[u8], value: Vec<u8>) -> Option<Vec<u8>> {
     match name {
         b"system.posix_acl_access" | b"system.posix_acl_default" => acl_to_xattr(&value),
-        _ if name.starts_with(b"system.") => None,
-        _ => Some(value),
+        _ if [&b"user."[..], b"trusted.", b"security."]
+            .iter()
+            .any(|prefix| name.starts_with(prefix)) =>
+        {
+            Some(value)
+        }
+        _ => None,
     }
 }
 
@@ -135,9 +140,14 @@ impl Image {
         };
         let xattrs = self
             .0
-            .xattrs(path)?
+            .symlink_xattrs(path)?
             .into_iter()
-            .filter_map(|xattr| Some((xattr.name.clone(), portable(&xattr.name, xattr.value)?)))
+            .filter_map(|xattr| {
+                Some((
+                    xattr.name().to_vec(),
+                    portable(xattr.name(), xattr.value().to_vec())?,
+                ))
+            })
             .collect();
         Ok(stat_of(&metadata, target, xattrs))
     }
@@ -299,8 +309,8 @@ fn stat_of(metadata: &Metadata, target: Option<Vec<u8>>, xattrs: Vec<(Vec<u8>, V
         uid: metadata.uid(),
         gid: metadata.gid(),
         size: metadata.len(),
-        inode: metadata.inode(),
-        links: metadata.links(),
+        inode: metadata.ino(),
+        links: metadata.nlink(),
         atime: time(metadata.accessed()),
         mtime: time(metadata.modified()),
         target,

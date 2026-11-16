@@ -13,9 +13,6 @@ members = [
     "crates/burrow-daemon",
     "crates/burrow-cli",
 ]
-# ext4-view with inode numbers, link counts and extended attributes added;
-# see vendor/ext4-view/src/xattr.rs.
-exclude = ["vendor/ext4-view"]
 # burrow-guest is a Linux-only guest binary (vsock, mount syscalls). Excluding
 # it here keeps a bare `cargo build`/`cargo clippy` working on macOS; the
 # zigbuild invocation in the development harness docs builds it for the Linux target.

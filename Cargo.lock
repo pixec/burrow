@@ -1537,6 +1537,7 @@ dependencies = [
 [[package]]
 name = "ext4-view"
 version = "1.0.0"
+source = "git+https://github.com/pixec/ext4-view-rs?rev=de7185299d69628551b912143e5afe4793e5aa69#de7185299d69628551b912143e5afe4793e5aa69"
 dependencies = [
  "bitflags 2.13.1",
  "crc",

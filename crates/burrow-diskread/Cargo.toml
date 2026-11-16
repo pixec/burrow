@@ -5,7 +5,9 @@ edition.workspace = true
 license.workspace = true
 
 [dependencies]
-ext4-view = { path = "../../vendor/ext4-view", features = ["std"] }
+# ext4-view with inode numbers, link counts and extended attributes, meant for
+# upstream, from the fork's `burrow` branch.
+ext4-view = { git = "https://github.com/pixec/ext4-view-rs", rev = "de7185299d69628551b912143e5afe4793e5aa69", features = ["std"] }
 serde = { workspace = true }
 serde_json = { workspace = true }
 tar = { workspace = true }
