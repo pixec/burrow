@@ -8,7 +8,6 @@ members = [
     "crates/burrow-proxy",
     "crates/burrow-store",
     "crates/burrow-diskread",
-    "crates/tailcat-rs",
     "crates/burrow-guest",
     "crates/burrow-orchestrator",
     "crates/burrow-daemon",
@@ -28,7 +27,6 @@ default-members = [
     "crates/burrow-proxy",
     "crates/burrow-store",
     "crates/burrow-diskread",
-    "crates/tailcat-rs",
     "crates/burrow-orchestrator",
     "crates/burrow-daemon",
     "crates/burrow-cli",
@@ -47,7 +45,7 @@ burrow-net = { path = "crates/burrow-net" }
 burrow-proxy = { path = "crates/burrow-proxy" }
 burrow-store = { path = "crates/burrow-store" }
 burrow-diskread = { path = "crates/burrow-diskread" }
-tailcat-rs = { path = "crates/tailcat-rs" }
+tailcat-rs = { git = "https://github.com/pixec/tailcat-rs", rev = "ab9be4c18c5706a6ff2c5ad9fcbace4a796a1033" }
 
 tokio = { version = "1", features = ["full"] }
 tokio-stream = "0.1"
