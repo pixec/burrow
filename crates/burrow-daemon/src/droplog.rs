@@ -12,9 +12,13 @@ use burrow_net::firewall::{self, Mode};
 /// How often drops past the log's rate are counted into the audit log.
 const SUPPRESSED_EVERY: std::time::Duration = std::time::Duration::from_secs(10);
 
-/// The sandbox behind each tap, as the last render named them.
+/// The sandbox behind each tap, as the last render named them, and the
+/// suppressed count last reported for each tap.
 #[derive(Default)]
-pub struct Owners(RwLock<HashMap<String, Owner>>);
+pub struct Owners {
+    taps: RwLock<HashMap<String, Owner>>,
+    seen: tokio::sync::Mutex<HashMap<String, u64>>,
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Owner {
@@ -23,8 +27,10 @@ pub struct Owner {
 }
 
 impl Owners {
-    pub fn replace(&self, rules: &[firewall::SandboxRules]) {
-        *self.0.write().unwrap() = rules
+    /// Takes the taps `rules` name, returning each tap that no longer
+    /// belongs to the sandbox it did, with that sandbox.
+    pub fn replace(&self, rules: &[firewall::SandboxRules]) -> Vec<(String, Owner)> {
+        let taps: HashMap<String, Owner> = rules
             .iter()
             .map(|rule| {
                 (
@@ -36,10 +42,17 @@ impl Owners {
                 )
             })
             .collect();
+        let previous = std::mem::replace(&mut *self.taps.write().unwrap(), taps.clone());
+        let mut gone: Vec<(String, Owner)> = previous
+            .into_iter()
+            .filter(|(tap, owner)| taps.get(tap) != Some(owner))
+            .collect();
+        gone.sort_by(|a, b| a.0.cmp(&b.0));
+        gone
     }
 
     fn get(&self, tap: &str) -> Option<Owner> {
-        self.0.read().unwrap().get(tap).cloned()
+        self.taps.read().unwrap().get(tap).cloned()
     }
 }
 
@@ -94,48 +107,116 @@ pub fn suppressed_event(owner: Owner, count: u64) -> burrow_proxy::EgressEvent {
     }
 }
 
-/// Each interface pair's count in `nft -j list set` output.
-pub fn parse_suppressed(json: &str) -> HashMap<(String, String), u64> {
-    let Ok(value) = serde_json::from_str::<serde_json::Value>(json) else {
-        return HashMap::new();
-    };
-    value["nftables"]
-        .as_array()
-        .into_iter()
-        .flatten()
-        .filter_map(|entry| entry["set"]["elem"].as_array())
-        .flatten()
-        .filter_map(|elem| {
-            let elem = &elem["elem"];
-            let pair = elem["val"]["concat"].as_array()?;
-            let name = |i: usize| pair.get(i).and_then(|v| v.as_str()).map(str::to_owned);
-            let packets = elem["counter"]["packets"].as_u64()?;
-            Some(((name(0)?, name(1)?), packets))
-        })
-        .collect()
+/// Each tap's count in `nft -j list set` output, or `None` for output that
+/// is not a listing of the set.
+pub fn parse_suppressed(json: &str) -> Option<HashMap<String, u64>> {
+    let value = serde_json::from_str::<serde_json::Value>(json).ok()?;
+    let set = value["nftables"]
+        .as_array()?
+        .iter()
+        .find(|entry| entry["set"].is_object())?;
+    Some(
+        set["set"]["elem"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter_map(|elem| {
+                let elem = &elem["elem"];
+                Some((
+                    elem["val"].as_str()?.to_owned(),
+                    elem["counter"]["packets"].as_u64()?,
+                ))
+            })
+            .collect(),
+    )
 }
 
-/// What each pair counted since `seen`, which is moved on. A pair counting
+/// What each tap counted since `seen`, which is moved on. A tap counting
 /// less than before timed out of the set and started again.
 pub fn suppressed_since(
-    seen: &mut HashMap<(String, String), u64>,
-    now: HashMap<(String, String), u64>,
-) -> Vec<((String, String), u64)> {
+    seen: &mut HashMap<String, u64>,
+    now: HashMap<String, u64>,
+) -> Vec<(String, u64)> {
     let mut grown: Vec<_> = now
         .iter()
-        .filter_map(|(pair, &count)| {
-            let before = seen.get(pair).copied().unwrap_or(0);
+        .filter_map(|(tap, &count)| {
+            let before = seen.get(tap).copied().unwrap_or(0);
             let added = if count >= before {
                 count - before
             } else {
                 count
             };
-            (added > 0).then(|| (pair.clone(), added))
+            (added > 0).then(|| (tap.clone(), added))
         })
         .collect();
     grown.sort();
     *seen = now;
     grown
+}
+
+/// The suppressed counts the kernel holds now, or `None` when they cannot
+/// be read.
+#[cfg(target_os = "linux")]
+async fn read_suppressed() -> Option<HashMap<String, u64>> {
+    let output = tokio::process::Command::new("nft")
+        .args([
+            "-j",
+            "list",
+            "set",
+            "inet",
+            "burrow",
+            firewall::DROP_SUPPRESSED_SET,
+        ])
+        .output()
+        .await
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    parse_suppressed(&String::from_utf8_lossy(&output.stdout))
+}
+
+/// Reports what each tap suppressed since the last report.
+#[cfg(target_os = "linux")]
+async fn report_suppressed(manager: &crate::sandbox::SandboxManager, owners: &Owners) {
+    let mut seen = owners.seen.lock().await;
+    let Some(now) = read_suppressed().await else {
+        return;
+    };
+    for (tap, count) in suppressed_since(&mut seen, now) {
+        if let Some(owner) = owners.get(&tap) {
+            manager.audit(suppressed_event(owner, count));
+        }
+    }
+}
+
+/// Settles the taps a render took from their sandboxes: what each suppressed
+/// since the last report goes on its old sandbox's record, and its rate and
+/// count are removed, so a sandbox given the tap next starts with neither.
+#[cfg(target_os = "linux")]
+pub async fn retire(manager: &crate::sandbox::SandboxManager, gone: Vec<(String, Owner)>) {
+    let owners = manager.drop_owners();
+    let mut seen = owners.seen.lock().await;
+    let now = read_suppressed().await.unwrap_or_default();
+    for (tap, owner) in gone {
+        let before = seen.remove(&tap).unwrap_or(0);
+        let count = now.get(&tap).copied().unwrap_or(0);
+        let added = if count >= before {
+            count - before
+        } else {
+            count
+        };
+        if added > 0 {
+            manager.audit(suppressed_event(owner, added));
+        }
+        for set in [firewall::DROP_RATE_SET, firewall::DROP_SUPPRESSED_SET] {
+            let _ = tokio::process::Command::new("nft")
+                .args(["delete", "element", "inet", "burrow", set])
+                .arg(format!("{{ \"{tap}\" }}"))
+                .output()
+                .await;
+        }
+    }
 }
 
 /// Whether this kernel and nft can log the sandbox chains' drops, and the
@@ -238,30 +319,10 @@ pub fn spawn(manager: crate::sandbox::SandboxManager, socket: burrow_net::nflog:
     });
     tokio::spawn(async move {
         let owners = manager.drop_owners();
-        let mut seen = HashMap::new();
         let mut interval = tokio::time::interval(SUPPRESSED_EVERY);
         loop {
             interval.tick().await;
-            let output = tokio::process::Command::new("nft")
-                .args([
-                    "-j",
-                    "list",
-                    "set",
-                    "inet",
-                    "burrow",
-                    firewall::DROP_SUPPRESSED_SET,
-                ])
-                .output()
-                .await;
-            let Ok(output) = output else {
-                continue;
-            };
-            let now = parse_suppressed(&String::from_utf8_lossy(&output.stdout));
-            for ((indev, outdev), count) in suppressed_since(&mut seen, now) {
-                if let Some(owner) = owners.get(&indev).or_else(|| owners.get(&outdev)) {
-                    manager.audit(suppressed_event(owner, count));
-                }
-            }
+            report_suppressed(&manager, &owners).await;
         }
     });
 }
@@ -273,7 +334,7 @@ mod tests {
 
     fn owners() -> Owners {
         let owners = Owners::default();
-        owners.0.write().unwrap().insert(
+        owners.taps.write().unwrap().insert(
             "bt3".into(),
             Owner {
                 sandbox_id: "sbx_a".into(),
@@ -354,25 +415,65 @@ mod tests {
     fn suppressed_counts_are_read_from_nft_json_and_reported_once() {
         let json = r#"{"nftables": [{"metainfo": {"version": "1.0.6"}}, {"set": {"family": "inet",
             "name": "audit_suppressed", "table": "burrow", "elem": [
-            {"elem": {"val": {"concat": ["bt3", "eth0"]}, "counter": {"packets": 45, "bytes": 1350}}},
-            {"elem": {"val": {"concat": ["eth0", "bt3"]}, "counter": {"packets": 0, "bytes": 0}}}]}}]}"#;
-        let pair = ("bt3".to_string(), "eth0".to_string());
+            {"elem": {"val": "bt3", "counter": {"packets": 45, "bytes": 1350}}},
+            {"elem": {"val": "bt4", "counter": {"packets": 0, "bytes": 0}}}]}}]}"#;
+        let tap = "bt3".to_string();
         let mut seen = HashMap::new();
-        assert_eq!(
-            suppressed_since(&mut seen, parse_suppressed(json)),
-            [(pair.clone(), 45)]
-        );
-        assert!(suppressed_since(&mut seen, parse_suppressed(json)).is_empty());
+        let read = |json: &str| parse_suppressed(json).unwrap();
+        assert_eq!(suppressed_since(&mut seen, read(json)), [(tap.clone(), 45)]);
+        assert!(suppressed_since(&mut seen, read(json)).is_empty());
         let grown = json.replace("\"packets\": 45", "\"packets\": 50");
         assert_eq!(
-            suppressed_since(&mut seen, parse_suppressed(&grown)),
-            [(pair.clone(), 5)]
+            suppressed_since(&mut seen, read(&grown)),
+            [(tap.clone(), 5)]
         );
         let restarted = json.replace("\"packets\": 45", "\"packets\": 3");
-        assert_eq!(
-            suppressed_since(&mut seen, parse_suppressed(&restarted)),
-            [(pair, 3)]
+        assert_eq!(suppressed_since(&mut seen, read(&restarted)), [(tap, 3)]);
+    }
+
+    /// An unreadable listing is not an empty one: taken as empty, it would
+    /// forget every count, and the next listing would report them all again.
+    #[test]
+    fn an_unreadable_listing_reads_as_nothing_rather_than_empty() {
+        assert_eq!(parse_suppressed("not json"), None);
+        assert_eq!(parse_suppressed(r#"{"nftables": []}"#), None);
+        let empty = r#"{"nftables": [{"set": {"name": "audit_suppressed"}}]}"#;
+        assert_eq!(parse_suppressed(empty), Some(HashMap::new()));
+    }
+
+    #[test]
+    fn a_tap_taken_from_its_sandbox_is_returned_with_it() {
+        let rule = |tap: &str, id: &str| firewall::SandboxRules {
+            sandbox_id: id.into(),
+            tap: tap.into(),
+            host_ip: "10.99.0.5".parse().unwrap(),
+            guest_ip: "10.99.0.6".parse().unwrap(),
+            host_ip6: "fd99::1".parse().unwrap(),
+            guest_ip6: "fd99::2".parse().unwrap(),
+            pool: Default::default(),
+            mode: Mode::Open,
+            allow_cidrs: vec![],
+            deny_cidrs: vec![],
+            deny_ports: vec![],
+            is_ipv6_denied: false,
+            allow_ports: vec![],
+            peers: vec![],
+            ports: vec![],
+            inspected: None,
+            public: Default::default(),
+        };
+        let owners = Owners::default();
+        assert!(
+            owners
+                .replace(&[rule("bt1", "sbx_a"), rule("bt2", "sbx_b")])
+                .is_empty()
         );
-        assert!(parse_suppressed("not json").is_empty());
+        let gone = owners.replace(&[rule("bt1", "sbx_c")]);
+        let ids: Vec<(&str, &str)> = gone
+            .iter()
+            .map(|(tap, owner)| (tap.as_str(), owner.sandbox_id.as_str()))
+            .collect();
+        assert_eq!(ids, [("bt1", "sbx_a"), ("bt2", "sbx_b")]);
+        assert_eq!(owners.get("bt1").unwrap().sandbox_id, "sbx_c");
     }
 }

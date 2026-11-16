@@ -246,12 +246,16 @@ pub enum DropLog {
 pub const DROP_LOG_GROUP: u16 = 7101;
 /// Prefixes the NFLOG prefix of an audited drop, ahead of its [`Refusal`].
 const DROP_LOG_PREFIX: &str = "burrow:";
-/// Holds the rate state of audited drops per input and output interface,
-/// which is per sandbox: one tap's flood cannot use up another's records.
-const DROP_RATE_SET: &str = "audit_rate";
-/// Counts, per interface pair, the drops past the rate that were not logged.
+/// Holds the rate state of audited drops per sandbox tap: one sandbox's flood
+/// cannot use up another's records, and each sandbox has one bucket however
+/// many destinations it is refused.
+pub const DROP_RATE_SET: &str = "audit_rate";
+/// Counts, per sandbox tap, the drops past the rate that were not logged.
 pub const DROP_SUPPRESSED_SET: &str = "audit_suppressed";
-/// Audited drops logged per interface pair each second, and the burst.
+/// Room for every tap a node can hold. A full set fails the update, and the
+/// packet goes on to the log rule, which still drops it.
+const DROP_SET_SIZE: u32 = 65536;
+/// Audited drops logged per sandbox tap each second, and the burst.
 const DROP_LOG_RATE: u32 = 10;
 const DROP_LOG_BURST: u32 = 20;
 
@@ -272,39 +276,48 @@ pub enum Refusal {
     Forged,
 }
 
-const REFUSALS: [(Refusal, &str); 12] = [
-    (Refusal::ControlPlane, "control-plane"),
-    (Refusal::Internal, "internal"),
-    (Refusal::Ipv6, "ipv6"),
-    (Refusal::Range, "range"),
-    (Refusal::Port, "port"),
-    (Refusal::Malformed, "malformed"),
-    (Refusal::Smtp, "smtp"),
-    (Refusal::PublicAddress, "public-address"),
-    (Refusal::Neighbour, "neighbour"),
-    (Refusal::Unmatched, "unmatched"),
-    (Refusal::Host, "host"),
-    (Refusal::Forged, "forged"),
-];
-
 impl Refusal {
+    const ALL: [Refusal; 12] = [
+        Refusal::ControlPlane,
+        Refusal::Internal,
+        Refusal::Ipv6,
+        Refusal::Range,
+        Refusal::Port,
+        Refusal::Malformed,
+        Refusal::Smtp,
+        Refusal::PublicAddress,
+        Refusal::Neighbour,
+        Refusal::Unmatched,
+        Refusal::Host,
+        Refusal::Forged,
+    ];
+
+    fn code(self) -> &'static str {
+        match self {
+            Refusal::ControlPlane => "control-plane",
+            Refusal::Internal => "internal",
+            Refusal::Ipv6 => "ipv6",
+            Refusal::Range => "range",
+            Refusal::Port => "port",
+            Refusal::Malformed => "malformed",
+            Refusal::Smtp => "smtp",
+            Refusal::PublicAddress => "public-address",
+            Refusal::Neighbour => "neighbour",
+            Refusal::Unmatched => "unmatched",
+            Refusal::Host => "host",
+            Refusal::Forged => "forged",
+        }
+    }
+
     fn prefix(self) -> String {
-        let code = REFUSALS
-            .iter()
-            .find(|(refusal, _)| *refusal == self)
-            .map(|(_, code)| *code)
-            .unwrap_or_default();
-        format!("{DROP_LOG_PREFIX}{code}")
+        format!("{DROP_LOG_PREFIX}{}", self.code())
     }
 
     /// The refusal an NFLOG prefix names, or `None` for a prefix this
     /// renderer did not write.
     pub fn from_prefix(prefix: &str) -> Option<Self> {
         let code = prefix.trim_end().strip_prefix(DROP_LOG_PREFIX)?;
-        REFUSALS
-            .iter()
-            .find(|(_, known)| *known == code)
-            .map(|(refusal, _)| *refusal)
+        Self::ALL.into_iter().find(|refusal| refusal.code() == code)
     }
 
     /// The audit reason, worded as the proxy and a macOS node word theirs.
@@ -339,19 +352,37 @@ impl Refusal {
 fn declare_drop_log(out: &mut String, table: &str) {
     let _ = writeln!(
         out,
-        "add set inet {table} {DROP_RATE_SET} {{ type ifname . ifname; flags dynamic,timeout; timeout 1m; }}"
+        "add set inet {table} {DROP_RATE_SET} {{ type ifname; size {DROP_SET_SIZE}; flags dynamic,timeout; timeout 1m; }}"
     );
     let _ = writeln!(
         out,
-        "add set inet {table} {DROP_SUPPRESSED_SET} {{ type ifname . ifname; flags dynamic,timeout; timeout 1h; counter; }}"
+        "add set inet {table} {DROP_SUPPRESSED_SET} {{ type ifname; size {DROP_SET_SIZE}; flags dynamic,timeout; timeout 1h; counter; }}"
     );
 }
 
-/// A drop, logged to NFLOG under its refusal when `log` says so.
+/// Which interface names the sandbox a drop is charged to: the tap a packet
+/// came in on, or the tap it was going out of.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Tap {
+    In,
+    Out,
+}
+
+impl Tap {
+    fn key(self) -> &'static str {
+        match self {
+            Tap::In => "iifname",
+            Tap::Out => "oifname",
+        }
+    }
+}
+
+/// A drop of packets from a sandbox's tap, logged to NFLOG under its
+/// refusal when `log` says so.
 ///
-/// The log is rate limited per interface pair: past the rate a drop is
-/// counted in [`DROP_SUPPRESSED_SET`] instead, so a flood costs the node a
-/// counter increment and not a netlink message.
+/// The log is rate limited per tap: past the rate a drop is counted in
+/// [`DROP_SUPPRESSED_SET`] instead, so a flood costs the node a counter
+/// increment and not a netlink message.
 fn refuse(
     out: &mut String,
     log: DropLog,
@@ -359,6 +390,18 @@ fn refuse(
     chain: &str,
     matcher: &str,
     refusal: Refusal,
+) {
+    refuse_keyed(out, log, verb, chain, matcher, refusal, Tap::In);
+}
+
+fn refuse_keyed(
+    out: &mut String,
+    log: DropLog,
+    verb: &str,
+    chain: &str,
+    matcher: &str,
+    refusal: Refusal,
+    tap: Tap,
 ) {
     let rule = match matcher {
         "" => format!("{verb} rule inet {FILTER_TABLE} {chain}"),
@@ -368,10 +411,11 @@ fn refuse(
         let _ = writeln!(out, "{rule} drop");
         return;
     }
+    let key = tap.key();
     let limited = format!(
-        "{rule} update @{DROP_RATE_SET} {{ iifname . oifname limit rate over \
+        "{rule} update @{DROP_RATE_SET} {{ {key} limit rate over \
          {DROP_LOG_RATE}/second burst {DROP_LOG_BURST} packets }} \
-         update @{DROP_SUPPRESSED_SET} {{ iifname . oifname }} drop"
+         update @{DROP_SUPPRESSED_SET} {{ {key} }} drop"
     );
     let logged = format!(
         "{rule} log group {DROP_LOG_GROUP} prefix \"{}\" drop",
@@ -386,6 +430,38 @@ fn refuse(
     for line in pair {
         let _ = writeln!(out, "{line}");
     }
+}
+
+/// A drop of a rule that matches more than one sandbox's traffic: logged for
+/// packets from a tap, and for `inbound` packets to one, each charged to its
+/// own tap, then dropped unlogged for whatever else reaches it.
+fn refuse_shared(
+    out: &mut String,
+    log: DropLog,
+    chain: &str,
+    matcher: &str,
+    refusal: Refusal,
+    is_inbound: bool,
+) {
+    if log == DropLog::Nflog {
+        let scoped = |side: &str| match matcher {
+            "" => format!("{side} \"{TAP_PREFIX}*\""),
+            matcher => format!("{side} \"{TAP_PREFIX}*\" {matcher}"),
+        };
+        refuse_keyed(out, log, "add", chain, &scoped("iifname"), refusal, Tap::In);
+        if is_inbound {
+            refuse_keyed(
+                out,
+                log,
+                "add",
+                chain,
+                &scoped("oifname"),
+                refusal,
+                Tap::Out,
+            );
+        }
+    }
+    refuse_keyed(out, DropLog::Off, "add", chain, matcher, refusal, Tap::In);
 }
 
 /// A throwaway table using everything [`DropLog::Nflog`] renders, which
@@ -552,13 +628,13 @@ fn render_policy(sandboxes: &[SandboxRules], control_plane: &[IpAddr], log: Drop
             IpAddr::V4(_) => "ip daddr",
             IpAddr::V6(_) => "ip6 daddr",
         };
-        refuse(
+        refuse_shared(
             &mut out,
             log,
-            "add",
             "sandbox",
             &format!("{matcher} {address}"),
             Refusal::ControlPlane,
+            false,
         );
     }
 
@@ -622,7 +698,7 @@ fn render_policy(sandboxes: &[SandboxRules], control_plane: &[IpAddr], log: Drop
     }
 
     // Anything in the sandbox range that no rule above accepted.
-    refuse(&mut out, log, "add", "sandbox", "", Refusal::Unmatched);
+    refuse_shared(&mut out, log, "sandbox", "", Refusal::Unmatched, true);
 
     render_host_input(&mut out, sandboxes, log);
     render_nat(&mut out, sandboxes);
@@ -3379,17 +3455,36 @@ mod tests {
                 " counter log prefix \"burrow-spoof \" level warn drop",
                 " drop",
             );
-            let logged: String = render_with(&sandboxes, &control, DropLog::Nflog)
+            let stripped: Vec<String> = render_with(&sandboxes, &control, DropLog::Nflog)
                 .lines()
                 .filter(|line| !line.contains(&format!("update @{DROP_RATE_SET} ")))
                 .filter(|line| !line.starts_with("add set "))
                 .map(|line| match line.split_once(&log) {
                     Some((rule, rest)) => {
                         let verdict = rest.rsplit_once(' ').unwrap().1;
-                        format!("{rule} {verdict}\n")
+                        format!("{rule} {verdict}")
                     }
-                    None => format!("{line}\n"),
+                    None => line.to_string(),
                 })
+                .collect();
+            // A shared drop is logged per tap ahead of its unlogged self,
+            // which the silent ruleset has alone.
+            let silent_lines: std::collections::HashSet<&str> = silent.lines().collect();
+            let logged: String = stripped
+                .iter()
+                .filter(|line| {
+                    if silent_lines.contains(line.as_str()) {
+                        return true;
+                    }
+                    let unscoped = [" iifname \"bt*\"", " oifname \"bt*\""]
+                        .iter()
+                        .map(|scope| line.replacen(scope, "", 1))
+                        .find(|unscoped| unscoped != *line)
+                        .expect(line);
+                    assert!(silent_lines.contains(unscoped.as_str()), "{line}");
+                    false
+                })
+                .map(|line| format!("{line}\n"))
                 .collect();
             assert_eq!(logged, silent, "{mode:?}");
         }
@@ -3417,6 +3512,9 @@ mod tests {
                 assert!(lines[i + 1].contains(" log group "), "{line}");
                 continue;
             }
+            if !line.contains(" log group ") && lines[i - 1].contains(" log group ") {
+                continue;
+            }
             let (_, prefix) = line.split_once(" prefix \"").expect(line);
             let prefix = prefix.split('"').next().unwrap();
             seen.insert(format!("{:?}", Refusal::from_prefix(prefix).expect(prefix)));
@@ -3424,10 +3522,14 @@ mod tests {
                 lines[i - 1].contains(&format!("update @{DROP_RATE_SET} ")),
                 "{line}"
             );
+            let key = if line.contains(" oifname \"bt*\"") {
+                "oifname"
+            } else {
+                "iifname"
+            };
             assert!(
-                lines[i - 1].contains(&format!(
-                    "update @{DROP_SUPPRESSED_SET} {{ iifname . oifname }}"
-                )),
+                lines[i - 1].contains(&format!("@{DROP_RATE_SET} {{ {key} limit rate over"))
+                    && lines[i - 1].contains(&format!("update @{DROP_SUPPRESSED_SET} {{ {key} }}")),
                 "{}",
                 lines[i - 1]
             );
@@ -3470,7 +3572,7 @@ mod tests {
 
     #[test]
     fn refusal_prefixes_read_back_and_no_other_prefix_does() {
-        for (refusal, _) in REFUSALS {
+        for refusal in Refusal::ALL {
             assert_eq!(Refusal::from_prefix(&refusal.prefix()), Some(refusal));
         }
         assert_eq!(Refusal::from_prefix("burrow-spoof "), None);
@@ -3495,5 +3597,47 @@ mod tests {
                 .all(|line| line.contains("inet burrow_probe") && !line.contains("inet burrow ")),
             "{probe}"
         );
+    }
+
+    /// Each drop is charged to the sandbox whose tap it crossed: a refused
+    /// destination never gets a bucket of its own, the input hook keys on the
+    /// input interface alone, and only the closing drop logs inbound packets.
+    #[test]
+    fn drops_are_rate_limited_per_sandbox_tap() {
+        let ruleset = render_with(
+            &[audited(Mode::Open)],
+            &[IpAddr::V4(Ipv4Addr::new(172, 18, 0, 4))],
+            DropLog::Nflog,
+        );
+        let limited: Vec<&str> = ruleset
+            .lines()
+            .filter(|line| line.contains(&format!("update @{DROP_RATE_SET} ")))
+            .collect();
+        assert!(limited.iter().all(|line| !line.contains(" . ")));
+        for line in &limited {
+            let is_outbound = line.contains("{ oifname limit");
+            let chain = line.split(' ').nth(4).unwrap();
+            if is_outbound {
+                assert_eq!(chain, "sandbox", "{line}");
+                assert!(line.contains(" oifname \"bt*\" "), "{line}");
+            }
+        }
+        assert_eq!(
+            limited
+                .iter()
+                .filter(|line| line.contains("{ oifname limit"))
+                .count(),
+            1
+        );
+        for chain in ["tohost", "antispoof"] {
+            assert!(
+                limited
+                    .iter()
+                    .filter(|line| line.split(' ').nth(4) == Some(chain))
+                    .all(|line| line.contains("{ iifname limit")),
+                "{chain}"
+            );
+        }
+        assert!(ruleset.contains(&format!("size {DROP_SET_SIZE};")));
     }
 }

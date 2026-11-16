@@ -5015,7 +5015,12 @@ impl SandboxManager {
                 .collect(),
         );
         self.proxy_policies.replace(proxy_table);
-        self.drop_owners.replace(&rules);
+        #[cfg_attr(not(target_os = "linux"), allow(unused_variables))]
+        let retired = self.drop_owners.replace(&rules);
+        #[cfg(target_os = "linux")]
+        if self.config.drop_log == firewall::DropLog::Nflog && !retired.is_empty() {
+            crate::droplog::retire(self, retired).await;
+        }
         let denied = self.denied_addresses();
         // The proxy is told before the ruleset is applied, not after: it is the
         // path that does not go through nftables at all, so the moment to have
