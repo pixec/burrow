@@ -65,7 +65,6 @@ const FORMAT: u32 = 1;
 const MANIFEST: &str = "manifest.json";
 /// The last upload, as this node made or adopted it, in the working directory.
 const LOCAL: &str = "durable.json";
-const TEMPLATE_KERNEL: &str = "vmlinux";
 const TEMPLATE_ROOTFS: &str = crate::rootdisk::IMAGE;
 /// The sandbox's command logs, by file name, as chunked images.
 const COMMAND_LOGS: &str = "command-logs.json";
@@ -117,6 +116,10 @@ pub struct Manifest {
     #[serde(default)]
     pub kernel: String,
     pub kernel_digest: String,
+    /// The UEFI firmware a firmware guest booted, by digest: the blob it is in
+    /// the store under, as `kernel_digest` is for a kernel.
+    #[serde(default)]
+    pub firmware_digest: String,
     /// The template's image. The disk's index is a diff against it, by
     /// chunk, and it is in the store under `images/`.
     pub rootfs_digest: String,
@@ -176,6 +179,30 @@ impl Manifest {
 
     fn layout(&self) -> Result<burrow_vmm::Layout, Status> {
         self.hypervisor().map(burrow_vmm::Hypervisor::layout)
+    }
+
+    /// The file the guest boots beside its disk; see [`crate::boot`].
+    fn boot_file(&self) -> &'static str {
+        crate::boot::file(
+            burrow_vmm::GuestOs::from_record(&self.image.guest_os).unwrap_or_default(),
+        )
+    }
+
+    /// The boot file's digest in the store.
+    fn boot_digest(&self) -> &str {
+        match self.boot_file() {
+            crate::boot::FIRMWARE => &self.firmware_digest,
+            _ => &self.kernel_digest,
+        }
+    }
+
+    /// Itself with `digest` as its boot file's.
+    fn with_boot_digest(mut self, digest: String) -> Self {
+        match self.boot_file() {
+            crate::boot::FIRMWARE => self.firmware_digest = digest,
+            _ => self.kernel_digest = digest,
+        }
+        self
     }
 
     /// `base` with the machine it holds, which a restore cannot change.
@@ -432,16 +459,17 @@ pub async fn upload(
     let disk_file = crate::rootdisk::ROOT_DISK;
     let vmstate = stamp(layout.state)?;
     let disk = stamp(disk_file)?;
-    let kernel = stamp(TEMPLATE_KERNEL)?;
+    let boot_file = draft.boot_file();
+    let kernel = stamp(boot_file)?;
     let rootfs = stamp(TEMPLATE_ROOTFS)?;
     let reusable = previous.and_then(LocalState::reusable);
     let known = reusable.map(LocalState::digests).unwrap_or_default();
 
-    let blob = |file: &'static str, stamp: &Stamp, held: Option<(&Stamp, &String)>| {
+    let blob = |file: &'static str, stamp: &Stamp, held: Option<(&Stamp, String)>| {
         let path = workdir.join(file);
         let reused = held
             .filter(|(was, _)| *was == stamp)
-            .map(|(_, digest)| digest.clone());
+            .map(|(_, digest)| digest);
         async move {
             match reused {
                 Some(digest) => Ok(digest),
@@ -449,10 +477,10 @@ pub async fn upload(
             }
         }
     };
-    let kernel_digest = blob(
-        TEMPLATE_KERNEL,
+    let boot_digest = blob(
+        boot_file,
         &kernel,
-        previous.map(|p| (&p.kernel, &p.manifest.kernel_digest)),
+        previous.map(|p| (&p.kernel, p.manifest.boot_digest().to_string())),
     )
     .await?;
     // The image goes to the store once, as chunks every disk cloned from it
@@ -527,10 +555,10 @@ pub async fn upload(
             format: FORMAT,
             generation,
             state: state.to_string(),
-            kernel_digest,
             rootfs_digest,
             ..draft
-        },
+        }
+        .with_boot_digest(boot_digest),
         is_published: false,
         layers,
         vmstate,
@@ -741,7 +769,7 @@ pub async fn stage(
     // Everything small at once: each is a round trip, and none depends on
     // another. The image comes from this node's own copy, or once from the
     // store when it has none.
-    let (kernel_path, rootfs_path) = (dest.join(TEMPLATE_KERNEL), dest.join(TEMPLATE_ROOTFS));
+    let (kernel_path, rootfs_path) = (dest.join(manifest.boot_file()), dest.join(TEMPLATE_ROOTFS));
     let (vmstate_path, working_set_path) = (dest.join(vmstate), dest.join(WORKING_SET));
     let vmstate_key = generation_key(id, generation, vmstate);
     let working_set_key = generation_key(id, generation, WORKING_SET);
@@ -761,7 +789,7 @@ pub async fn stage(
         Ok::<_, Status>(image)
     };
     let (kernel, image, vmstate_fetched, working_set, disk_index, memory) = tokio::join!(
-        snapshots.fetch_blob(store, &manifest.kernel_digest, &kernel_path),
+        snapshots.fetch_blob(store, manifest.boot_digest(), &kernel_path),
         rootfs,
         store.get_to_file(&vmstate_key, &vmstate_path),
         store.get_to_file(&working_set_key, &working_set_path),
@@ -820,7 +848,7 @@ pub async fn stage(
         layers: vec![LayerId::of(dest, memory_file).map_err(|err| io(memory_file, err))?],
         vmstate: stamp(vmstate)?,
         disk: stamp(disk_file)?,
-        kernel: stamp(TEMPLATE_KERNEL)?,
+        kernel: stamp(manifest.boot_file())?,
         rootfs: stamp(TEMPLATE_ROOTFS)?,
         memory,
         disk_index,
@@ -873,11 +901,12 @@ pub async fn upload_disk_checkpoint(
     let id = draft.id.clone();
     let disk_file = crate::rootdisk::ROOT_DISK;
     let stamp = |file: &str| Stamp::of(&workdir.join(file)).map_err(|err| io(file, err));
-    let kernel = stamp(TEMPLATE_KERNEL)?;
+    let boot_file = draft.boot_file();
+    let kernel = stamp(boot_file)?;
     let rootfs = stamp(TEMPLATE_ROOTFS)?;
-    let kernel_digest = match previous.filter(|p| p.kernel == kernel) {
-        Some(previous) => previous.manifest.kernel_digest.clone(),
-        None => crate::snapshot::put_blob(store, &workdir.join(TEMPLATE_KERNEL)).await?,
+    let boot_digest = match previous.filter(|p| p.kernel == kernel) {
+        Some(previous) => previous.manifest.boot_digest().to_string(),
+        None => crate::snapshot::put_blob(store, &workdir.join(boot_file)).await?,
     };
     let image = crate::rootdisk::image_of(blobs, &workdir.join(TEMPLATE_ROOTFS)).await?;
     crate::rootdisk::upload_image(store, &image).await?;
@@ -905,11 +934,11 @@ pub async fn upload_disk_checkpoint(
             format: FORMAT,
             generation,
             state: STATE_RUNNING.to_string(),
-            kernel_digest,
             rootfs_digest,
             checkpoint: CHECKPOINT_DISK.to_string(),
             ..draft
-        },
+        }
+        .with_boot_digest(boot_digest),
         is_published: false,
         layers: Vec::new(),
         vmstate: Stamp::default(),
@@ -953,7 +982,7 @@ pub async fn stage_disk(
 ) -> Result<LocalState, Status> {
     let id = &manifest.id;
     let disk_file = crate::rootdisk::ROOT_DISK;
-    let (kernel_path, rootfs_path) = (dest.join(TEMPLATE_KERNEL), dest.join(TEMPLATE_ROOTFS));
+    let (kernel_path, rootfs_path) = (dest.join(manifest.boot_file()), dest.join(TEMPLATE_ROOTFS));
     let disk_key = index_key(id, manifest.generation, disk_file);
     let rootfs = async {
         let image = crate::rootdisk::fetch_image(
@@ -969,7 +998,7 @@ pub async fn stage_disk(
         Ok::<_, Status>(image)
     };
     let (kernel, image, disk_index) = tokio::join!(
-        snapshots.fetch_blob(store, &manifest.kernel_digest, &kernel_path),
+        snapshots.fetch_blob(store, manifest.boot_digest(), &kernel_path),
         rootfs,
         crate::chunks::read_index(store, &disk_key),
     );
@@ -992,7 +1021,7 @@ pub async fn stage_disk(
         layers: Vec::new(),
         vmstate: Stamp::default(),
         disk: stamp(disk_file)?,
-        kernel: stamp(TEMPLATE_KERNEL)?,
+        kernel: stamp(manifest.boot_file())?,
         rootfs: stamp(TEMPLATE_ROOTFS)?,
         memory: ImageIndex::default(),
         disk_index,
@@ -1233,6 +1262,7 @@ mod tests {
             cpu: Default::default(),
             kernel: String::new(),
             kernel_digest: String::new(),
+            firmware_digest: String::new(),
             rootfs_digest: String::new(),
             cpu_usage_usec: 0,
             rx_bytes: 0,
@@ -1244,6 +1274,27 @@ mod tests {
             volumes: Default::default(),
             image: Default::default(),
         }
+    }
+
+    /// A Windows guest's stored state names the firmware it booted in place
+    /// of a kernel, and the kernel stays unrecorded.
+    #[test]
+    fn a_firmware_guest_stores_its_firmware_instead_of_a_kernel() {
+        let mut windows = manifest("node_a", STATE_SUSPENDED);
+        windows.image.guest_os = "windows".into();
+        let windows = windows.with_boot_digest("fw".into());
+        assert_eq!(windows.boot_file(), crate::boot::FIRMWARE);
+        assert_eq!(
+            (windows.kernel_digest.as_str(), windows.boot_digest()),
+            ("", "fw")
+        );
+        assert!(windows.kernel().is_none());
+        let linux = manifest("node_a", STATE_SUSPENDED).with_boot_digest("k".into());
+        assert_eq!(linux.boot_file(), crate::boot::KERNEL);
+        assert_eq!(
+            (linux.firmware_digest.as_str(), linux.boot_digest()),
+            ("", "k")
+        );
     }
 
     /// Only a suspend's state or a checkpoint can be taken up elsewhere, and
@@ -1295,7 +1346,7 @@ mod tests {
         let root = std::env::temp_dir().join(format!("burrow-ckpt-{}", uuid::Uuid::new_v4()));
         let workdir = root.join("a");
         std::fs::create_dir_all(&workdir).unwrap();
-        std::fs::write(workdir.join(TEMPLATE_KERNEL), b"kernel").unwrap();
+        std::fs::write(workdir.join(crate::boot::KERNEL), b"kernel").unwrap();
         let image = std::fs::File::create(workdir.join(TEMPLATE_ROOTFS)).unwrap();
         image.set_len(4 << 20).unwrap();
         image.write_all_at(&[1; 4096], 0).unwrap();
@@ -1382,7 +1433,7 @@ mod tests {
             std::fs::read(&disk).unwrap()
         );
         assert_eq!(
-            std::fs::read(dest.join(TEMPLATE_KERNEL)).unwrap(),
+            std::fs::read(dest.join(crate::boot::KERNEL)).unwrap(),
             b"kernel"
         );
 
@@ -1413,7 +1464,7 @@ mod tests {
         let root = std::env::temp_dir().join(format!("burrow-reput-{}", uuid::Uuid::new_v4()));
         let workdir = root.join("a");
         std::fs::create_dir_all(&workdir).unwrap();
-        std::fs::write(workdir.join(TEMPLATE_KERNEL), b"kernel").unwrap();
+        std::fs::write(workdir.join(crate::boot::KERNEL), b"kernel").unwrap();
         let image = std::fs::File::create(workdir.join(TEMPLATE_ROOTFS)).unwrap();
         image.set_len(4 << 20).unwrap();
         image.write_all_at(&[1; 4096], 0).unwrap();

@@ -4,6 +4,7 @@
 
 mod access;
 mod blobs;
+mod boot;
 mod ca;
 mod caibx;
 mod chunks;

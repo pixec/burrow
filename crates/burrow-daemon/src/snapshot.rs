@@ -6,8 +6,8 @@
 //!
 //! Three properties the layout exists to guarantee:
 //!
-//! - **Self-contained.** The kernel and the template's image are hard-linked
-//!   in beside the state, so deleting the source sandbox or the template
+//! - **Self-contained.** The guest's boot file (see [`crate::boot`]) and the
+//!   template's image are hard-linked in beside the state, so deleting the source sandbox or the template
 //!   leaves the snapshot restorable. Links cost nothing and share the
 //!   template's pages. The sandbox's own disk is a clone, taken while its
 //!   guest was paused for the memory beside it.
@@ -48,7 +48,6 @@ use burrow_proto::common::v1 as common;
 
 /// Written last, and the only thing that makes a directory a snapshot.
 const MANIFEST: &str = "manifest.json";
-const TEMPLATE_KERNEL: &str = "vmlinux";
 const TEMPLATE_ROOTFS: &str = crate::rootdisk::IMAGE;
 /// The source's command logs, as far as its guest had produced them: the
 /// restored guest remembers those commands and is asked about them.
@@ -128,6 +127,14 @@ pub struct Manifest {
     #[serde(default)]
     pub kernel: String,
     pub kernel_digest: String,
+    /// The guest's OS, which says what it boots from; empty is Linux.
+    #[serde(default)]
+    pub guest_os: String,
+    /// The UEFI firmware a firmware guest booted, by digest, filled in when
+    /// uploaded: the blob it is in the store under, as `kernel_digest` is for a
+    /// kernel.
+    #[serde(default)]
+    pub firmware_digest: String,
     /// The template's image by content, filled in when uploaded: chunks under
     /// `images/`, which the disk's index is a diff against.
     pub rootfs_digest: String,
@@ -158,6 +165,30 @@ impl Manifest {
 
     fn layout(&self) -> Result<burrow_vmm::Layout, Status> {
         self.hypervisor().map(burrow_vmm::Hypervisor::layout)
+    }
+
+    pub fn guest_os(&self) -> burrow_vmm::GuestOs {
+        burrow_vmm::GuestOs::from_record(&self.guest_os).unwrap_or_default()
+    }
+
+    /// The file the guest boots beside its disk.
+    fn boot_file(&self) -> &'static str {
+        crate::boot::file(self.guest_os())
+    }
+
+    /// The boot file's digest in the store, once uploaded.
+    fn boot_digest(&self) -> &str {
+        match self.boot_file() {
+            crate::boot::FIRMWARE => &self.firmware_digest,
+            _ => &self.kernel_digest,
+        }
+    }
+
+    fn set_boot_digest(&mut self, digest: String) {
+        match self.boot_file() {
+            crate::boot::FIRMWARE => self.firmware_digest = digest,
+            _ => self.kernel_digest = digest,
+        }
     }
 
     /// `base` with the machine it holds, which a restore cannot change.
@@ -334,6 +365,7 @@ pub struct Staged {
     pub is_nested_virt_enabled: bool,
     pub disk_mib: u32,
     pub hypervisor: burrow_vmm::Hypervisor,
+    pub guest_os: burrow_vmm::GuestOs,
     pub kernel: Option<common::Kernel>,
     /// Memory files in the staging directory, oldest first.
     pub chain: Vec<String>,
@@ -442,6 +474,8 @@ impl SnapshotStore {
                 .map(|k| k.name.clone())
                 .unwrap_or_default(),
             kernel_digest: staged.kernel.map(|k| k.digest).unwrap_or_default(),
+            guest_os: staged.guest_os.as_str().to_string(),
+            firmware_digest: String::new(),
             rootfs_digest: String::new(),
             inspection_root: staged.inspection_root,
         };
@@ -494,7 +528,7 @@ impl SnapshotStore {
         let layout = manifest.layout()?;
         let started = std::time::Instant::now();
 
-        let kernel_digest = put_blob(remote, &dir.join(TEMPLATE_KERNEL)).await?;
+        let boot_digest = put_blob(remote, &dir.join(manifest.boot_file())).await?;
         // The image goes once for every snapshot of it.
         let image = crate::rootdisk::image_of(&self.blobs, &dir.join(TEMPLATE_ROOTFS)).await?;
         crate::rootdisk::upload_image(remote, &image).await?;
@@ -536,7 +570,7 @@ impl SnapshotStore {
         let json = serde_json::to_vec(&names)
             .map_err(|err| Status::internal(format!("encoding log names: {err}")))?;
         remote.put_bytes(&log_names_key(id), json).await?;
-        manifest.kernel_digest = kernel_digest;
+        manifest.set_boot_digest(boot_digest);
         manifest.rootfs_digest = rootfs_digest;
         manifest.is_durable = true;
         let json = serde_json::to_vec_pretty(&manifest)
@@ -682,8 +716,12 @@ impl SnapshotStore {
         dir: &Path,
     ) -> Result<crate::chunks::ImageIndex, Status> {
         let id = &manifest.id;
-        self.fetch_blob(remote, &manifest.kernel_digest, &dir.join(TEMPLATE_KERNEL))
-            .await?;
+        self.fetch_blob(
+            remote,
+            manifest.boot_digest(),
+            &dir.join(manifest.boot_file()),
+        )
+        .await?;
         let image = crate::rootdisk::fetch_image(
             remote,
             &self.blobs,
@@ -997,7 +1035,7 @@ impl SnapshotStore {
             Status::internal(format!("staging snapshot {id} ({what}): {err}"))
         };
 
-        for file in [TEMPLATE_KERNEL, TEMPLATE_ROOTFS] {
+        for file in [manifest.boot_file(), TEMPLATE_ROOTFS] {
             tokio::fs::hard_link(dir.join(file), dest.join(file))
                 .await
                 .map_err(|err| io(file, err))?;
@@ -1379,6 +1417,8 @@ mod tests {
             is_durable: false,
             kernel: String::new(),
             kernel_digest: String::new(),
+            guest_os: String::new(),
+            firmware_digest: String::new(),
             rootfs_digest: String::new(),
             inspection_root: String::new(),
         }
@@ -1585,7 +1625,7 @@ mod tests {
         let written = manifest(&id, "sbx_a", "2026-09-02T10:00:00Z");
         let layout = written.layout().unwrap();
         for file in [
-            TEMPLATE_KERNEL,
+            crate::boot::KERNEL,
             TEMPLATE_ROOTFS,
             layout.state,
             layout.memory.unwrap(),
@@ -1639,7 +1679,7 @@ mod tests {
         let written = manifest(&id, "sbx_a", "2026-09-02T10:00:00Z");
         let layout = written.layout().unwrap();
         for file in [
-            TEMPLATE_KERNEL,
+            crate::boot::KERNEL,
             TEMPLATE_ROOTFS,
             layout.state,
             layout.memory.unwrap(),
@@ -1732,7 +1772,7 @@ mod tests {
         let layout = burrow_vmm::Hypervisor::Firecracker.layout();
         let memory = layout.memory.unwrap();
         for file in [
-            TEMPLATE_KERNEL,
+            crate::boot::KERNEL,
             TEMPLATE_ROOTFS,
             layout.state,
             memory,
@@ -1750,6 +1790,7 @@ mod tests {
             is_nested_virt_enabled: false,
             disk_mib: 1024,
             hypervisor: burrow_vmm::Hypervisor::Firecracker,
+            guest_os: burrow_vmm::GuestOs::Linux,
             kernel: None,
             chain: vec![memory.to_string()],
             inspection_root: String::new(),
@@ -1766,7 +1807,7 @@ mod tests {
             )
             .collect();
         for name in [
-            TEMPLATE_KERNEL,
+            crate::boot::KERNEL,
             TEMPLATE_ROOTFS,
             layout.state,
             memory,

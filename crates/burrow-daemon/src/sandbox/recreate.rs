@@ -266,11 +266,14 @@ impl SandboxManager {
                     })?;
                 return Ok(());
             }
-            prepare_workdir(&template_dir, &staged_workdir, guest_os)
-                .await
-                .map_err(|err| {
-                    Status::failed_precondition(format!("template {template:?}: {err}"))
-                })?;
+            prepare_workdir(
+                &template_dir,
+                &staged_workdir,
+                guest_os,
+                &self.config.cloud_hypervisor.firmware,
+            )
+            .await
+            .map_err(|err| Status::failed_precondition(format!("template {template:?}: {err}")))?;
             let disk = staged_workdir.join(crate::rootdisk::ROOT_DISK);
             self.spares
                 .take(&templates_dir, &template, &disk)

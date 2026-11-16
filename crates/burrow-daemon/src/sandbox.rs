@@ -25,7 +25,7 @@ mod recreate;
 pub use recreate::Replacement;
 
 /// Conventional filenames inside a template directory.
-const TEMPLATE_KERNEL: &str = "vmlinux";
+const TEMPLATE_KERNEL: &str = crate::boot::KERNEL;
 
 /// A volume's image, hard-linked into the sandbox's working directory.
 ///
@@ -39,22 +39,6 @@ fn volume_image(index: usize) -> String {
         true => format!("volume{index}.img"),
         false => format!("volume{index}.ext4"),
     }
-}
-
-/// Refuses what copies a sandbox's state elsewhere, which carries its
-/// template's `vmlinux` beside its disk: a Windows guest boots firmware from
-/// its disk and has none.
-#[allow(clippy::result_large_err)]
-fn require_kernel_carried(sandbox: &RunningSandbox, what: &str) -> Result<(), Status> {
-    if burrow_vmm::GuestOs::from_record(&sandbox.record().guest_os)
-        == Some(burrow_vmm::GuestOs::Windows)
-    {
-        return Err(Status::failed_precondition(format!(
-            "sandbox {} is a windows guest, which cannot be {what} yet",
-            sandbox.id()
-        )));
-    }
-    Ok(())
 }
 
 #[allow(clippy::result_large_err)]
@@ -2555,7 +2539,6 @@ impl RunningSandbox {
         logs: Option<&Path>,
         capture: Option<&Path>,
     ) -> Result<Vec<String>, Status> {
-        require_kernel_carried(self, "copied")?;
         self.durable.settle_memory().await;
         let _slot = self.vm.lock().await;
         let chain = self.memory_chain.lock().await.clone();
@@ -2570,7 +2553,7 @@ impl RunningSandbox {
 
         // Read-only for the guest's whole life, and already links to the
         // template; another link costs nothing and shares the same pages.
-        for file in [TEMPLATE_KERNEL, TEMPLATE_ROOTFS] {
+        for file in [crate::boot::file(self.guest_os()), TEMPLATE_ROOTFS] {
             tokio::fs::hard_link(self.workdir.join(file), dest.join(file))
                 .await
                 .map_err(|err| io(file, err))?;
@@ -2645,6 +2628,7 @@ impl RunningSandbox {
             sandbox_id: self.id.clone(),
             template: self.template.clone(),
             hypervisor: self.hypervisor,
+            guest_os: self.guest_os(),
             vcpus: self.vcpus(),
             mem_mib: self.mem_mib(),
             boot_mem_mib: self.boot_mem_mib(),
@@ -3334,8 +3318,7 @@ impl SandboxManager {
                 tokio::fs::create_dir_all(parent).await?;
             }
             tokio::fs::rename(&found, workdir).await?;
-            let shared = [TEMPLATE_KERNEL.to_string(), TEMPLATE_ROOTFS.to_string()].into();
-            grant_to_jail(workdir, jail, &shared).await
+            grant_to_jail(workdir, jail, &crate::boot::shared()).await
         };
         match moved.await {
             Ok(()) => {
@@ -7498,6 +7481,9 @@ impl SandboxManager {
                 )
             ),
         };
+        if crate::boot::file(guest_os) == crate::boot::FIRMWARE {
+            spec.boot = crate::boot::firmware_boot();
+        }
         if crate::macnode::is_macos(guest_os)
             && let Err(err) = crate::macnode::apply(&mut spec, resources)
         {
@@ -8117,11 +8103,16 @@ impl SandboxManager {
                             Status::failed_precondition(format!("template {template:?}: {err}"))
                         })?;
                 } else {
-                    prepare_workdir(&templates_dir.join(&template), &workdir, guest_os)
-                        .await
-                        .map_err(|err| {
-                            Status::failed_precondition(format!("template {template:?}: {err}"))
-                        })?;
+                    prepare_workdir(
+                        &templates_dir.join(&template),
+                        &workdir,
+                        guest_os,
+                        &self.config.cloud_hypervisor.firmware,
+                    )
+                    .await
+                    .map_err(|err| {
+                        Status::failed_precondition(format!("template {template:?}: {err}"))
+                    })?;
                     let disk = workdir.join(crate::rootdisk::ROOT_DISK);
                     match seed_disk {
                         Some(seed) => crate::rootdisk::clone(seed, &disk).await.map(drop),
@@ -8465,8 +8456,7 @@ impl SandboxManager {
         let Some(jail) = self.config.jail_for(hypervisor) else {
             return Ok(());
         };
-        let mut shared: std::collections::HashSet<String> =
-            [TEMPLATE_KERNEL.to_string(), TEMPLATE_ROOTFS.to_string()].into();
+        let mut shared = crate::boot::shared();
         if is_warm {
             shared.extend(hypervisor.layout().files().map(String::from));
             shared.insert(crate::warm::PREFETCH_PLAN.to_string());
@@ -8572,7 +8562,6 @@ impl SandboxManager {
         self.require_settled(sandbox_id)?;
         crate::snapshot::validate_id(&snapshot_id)?;
         let sandbox = self.get(sandbox_id).await?;
-        require_kernel_carried(&sandbox, "snapshotted")?;
         let capture = sandbox.workdir.join(format!(".capture-{snapshot_id}"));
         let is_captured = sandbox.is_running();
         if is_captured {
@@ -8778,7 +8767,6 @@ impl SandboxManager {
     ) -> Result<common::Sandbox, Status> {
         self.require_settled(source_id)?;
         let source = self.get(source_id).await?;
-        require_kernel_carried(&source, "forked")?;
 
         // Claimed the same way a create claims one, and before any state is
         // captured: two forks naming the same child would otherwise share a
@@ -9092,8 +9080,7 @@ impl SandboxManager {
                 // made just for this sandbox, so they still need the chown. A
                 // read-only volume mount is a link into the volume store and is
                 // left alone, for the reason [`grant_to_jail`] spells out.
-                let mut shared: std::collections::HashSet<String> =
-                    [TEMPLATE_KERNEL.to_string(), TEMPLATE_ROOTFS.to_string()].into();
+                let mut shared = crate::boot::shared();
                 // A fork links its source's memory chain rather than copying
                 // it, and those inodes are the source's, already readable by
                 // the jail's uid; a snapshot restore copies its chain and
@@ -9620,8 +9607,7 @@ impl SandboxManager {
         // A stop handed the volume images' ownership back with the claims, so
         // the jail has to be given them again before the VMM opens them.
         if let Some(jail) = self.config.jail_for(sandbox.hypervisor) {
-            let mut shared: std::collections::HashSet<String> =
-                [TEMPLATE_KERNEL.to_string(), TEMPLATE_ROOTFS.to_string()].into();
+            let mut shared = crate::boot::shared();
             for (index, mount) in crate::volume::block_mounts(&policy.volumes) {
                 if mount.is_read_only {
                     shared.insert(volume_image(index));
@@ -9715,8 +9701,17 @@ impl SandboxManager {
     }
 
     /// Points a stopped sandbox at the kernel its template boots now, which a
-    /// rebuild of the template may have changed.
+    /// rebuild of the template may have changed, or a firmware guest at the
+    /// node's firmware.
     async fn take_template_kernel(&self, sandbox: &RunningSandbox) -> Result<(), Status> {
+        if crate::boot::file(sandbox.guest_os()) == crate::boot::FIRMWARE {
+            return crate::boot::take_firmware(
+                &self.config.cloud_hypervisor.firmware,
+                &sandbox.workdir,
+            )
+            .await
+            .map_err(|err| Status::internal(format!("taking the node's firmware: {err}")));
+        }
         let current = sandbox.workdir.join(TEMPLATE_KERNEL);
         if !tokio::fs::try_exists(&current).await.unwrap_or(false) {
             return Ok(());
@@ -9896,13 +9891,10 @@ impl SandboxManager {
     /// Whether a sandbox can live in the object store at all: one mounting
     /// volumes only where they are kept there too.
     fn is_movable(&self, sandbox: &RunningSandbox) -> bool {
-        require_kernel_carried(sandbox, "moved").is_ok()
-            && (self.volumes.is_durable()
-                || crate::volume::block_mounts(
-                    &sandbox.record().policy.unwrap_or_default().volumes,
-                )
+        self.volumes.is_durable()
+            || crate::volume::block_mounts(&sandbox.record().policy.unwrap_or_default().volumes)
                 .next()
-                .is_none())
+                .is_none()
     }
 
     /// Brings every volume a suspended sandbox mounts up to date in the
@@ -10185,6 +10177,7 @@ impl SandboxManager {
                 .map(|k| k.name.clone())
                 .unwrap_or_default(),
             kernel_digest: String::new(),
+            firmware_digest: String::new(),
             rootfs_digest: String::new(),
             cpu_usage_usec: record.cpu_usage_usec,
             rx_bytes: record.rx_bytes,
@@ -10470,7 +10463,6 @@ impl SandboxManager {
             ));
         }
         let sandbox = self.get(id).await?;
-        require_kernel_carried(&sandbox, "moved")?;
         if !self.is_movable(&sandbox) {
             return Err(Status::failed_precondition(
                 "a sandbox with volumes moves only with an object store to carry them",
@@ -11158,7 +11150,6 @@ impl SandboxManager {
         let Some(store) = self.config.object_store.clone() else {
             return Ok(());
         };
-        require_kernel_carried(sandbox, "checkpointed")?;
         self.require_vmm(sandbox).await?;
         let is_memory = sandbox.lifetime().is_memory_checkpointed
             && sandbox.layout().memory.is_some()
@@ -11582,26 +11573,29 @@ async fn no_virtio_mem(workdir: &Path) -> Option<String> {
     })
 }
 
-/// Creates a sandbox working directory with the template's kernel and image
-/// linked in. Hard links keep creation cheap; the root disk cloned from the
-/// image is the sandbox's own, and the guest never sees the image itself.
+/// Creates a sandbox working directory with the template's image linked in
+/// beside the guest's boot file: the template's kernel, linked, or for a
+/// Windows guest the node's `firmware`, copied. Hard links keep creation
+/// cheap; the root disk cloned from the image is the sandbox's own, and the
+/// guest never sees the image itself.
 async fn prepare_workdir(
     template_dir: &Path,
     workdir: &Path,
     guest_os: burrow_vmm::GuestOs,
+    firmware: &Path,
 ) -> std::io::Result<()> {
     if tokio::fs::try_exists(workdir).await.unwrap_or(false) {
         tokio::fs::remove_dir_all(workdir).await?;
     }
     tokio::fs::create_dir_all(workdir).await?;
-    for file in [TEMPLATE_KERNEL, TEMPLATE_ROOTFS] {
+    let mut linked = vec![TEMPLATE_ROOTFS];
+    match crate::boot::file(guest_os) {
+        crate::boot::FIRMWARE => crate::boot::take_firmware(firmware, workdir).await?,
+        kernel => linked.push(kernel),
+    }
+    for file in linked {
         let source = template_dir.join(file);
-        let exists = tokio::fs::try_exists(&source).await.unwrap_or(false);
-        // Windows boots firmware from its disk and has no kernel beside it.
-        if file == TEMPLATE_KERNEL && !exists && guest_os == burrow_vmm::GuestOs::Windows {
-            continue;
-        }
-        if !exists {
+        if !tokio::fs::try_exists(&source).await.unwrap_or(false) {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::NotFound,
                 format!("missing {}", source.display()),
@@ -11772,30 +11766,23 @@ pub(crate) mod tests {
     }
 
     #[tokio::test]
-    async fn a_windows_sandbox_refuses_what_carries_a_kernel() {
-        let dest = std::env::temp_dir().join(format!("burrow-winfork-{}", std::process::id()));
-        let windows = sandbox_in(dest.join("work"));
-        windows.base_record.lock().unwrap().guest_os = "windows".into();
-        let refused = windows.stage_fork(&dest, None, None).await.unwrap_err();
-        assert_eq!(refused.code(), tonic::Code::FailedPrecondition);
-        assert!(refused.message().contains("windows guest"));
-        assert!(require_kernel_carried(&windows, "moved").is_err());
-        assert!(!dest.exists());
-        assert!(require_kernel_carried(&suspended_sandbox(), "moved").is_ok());
-    }
-
-    #[tokio::test]
-    async fn only_a_windows_workdir_does_without_a_kernel() {
+    async fn a_windows_workdir_boots_the_nodes_firmware() {
         let template = std::env::temp_dir().join(format!("burrow-winwork-{}", std::process::id()));
         std::fs::create_dir_all(&template).unwrap();
         std::fs::write(template.join(TEMPLATE_ROOTFS), b"disk").unwrap();
+        let firmware = template.join("CLOUDHV.fd");
+        std::fs::write(&firmware, b"edk2").unwrap();
         let workdir = template.join("work");
-        prepare_workdir(&template, &workdir, burrow_vmm::GuestOs::Windows)
+        prepare_workdir(&template, &workdir, burrow_vmm::GuestOs::Windows, &firmware)
             .await
             .unwrap();
         assert!(workdir.join(TEMPLATE_ROOTFS).exists());
         assert!(!workdir.join(TEMPLATE_KERNEL).exists());
-        let missing = prepare_workdir(&template, &workdir, burrow_vmm::GuestOs::Linux)
+        assert_eq!(
+            std::fs::read(workdir.join(crate::boot::FIRMWARE)).unwrap(),
+            b"edk2"
+        );
+        let missing = prepare_workdir(&template, &workdir, burrow_vmm::GuestOs::Linux, &firmware)
             .await
             .unwrap_err();
         assert!(missing.to_string().contains(TEMPLATE_KERNEL));
