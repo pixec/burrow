@@ -694,8 +694,9 @@ fn index_file(path: &Path) -> std::io::Result<(String, ImageIndex)> {
 }
 
 /// The image with `digest` on this node: in the blob store, or as one of its
-/// templates' images. A template's is indexed the first time it is looked at
-/// and found by inode after, so the search reads each image once.
+/// templates' images, a macOS template's disk among them. A template's is
+/// indexed the first time it is looked at and found by inode after, so the
+/// search reads each image once.
 pub async fn local_image(
     blobs: &crate::blobs::BlobStore,
     templates_dir: &Path,
@@ -707,14 +708,16 @@ pub async fn local_image(
     }
     let mut entries = tokio::fs::read_dir(templates_dir).await.ok()?;
     while let Ok(Some(entry)) = entries.next_entry().await {
-        let path = entry.path().join(IMAGE);
-        if !tokio::fs::try_exists(&path).await.unwrap_or(false) {
-            continue;
-        }
-        if let Ok(image) = image_of(blobs, &path).await
-            && image.digest == digest
-        {
-            return Some(image);
+        for name in [IMAGE, crate::macnode::DISK] {
+            let path = entry.path().join(name);
+            if !tokio::fs::try_exists(&path).await.unwrap_or(false) {
+                continue;
+            }
+            if let Ok(image) = image_of(blobs, &path).await
+                && image.digest == digest
+            {
+                return Some(image);
+            }
         }
     }
     None

@@ -11906,6 +11906,24 @@ impl SandboxManager {
             && u128::from(spent) * 100 < since.at.elapsed().as_micros()
     }
 
+    /// The image a sandbox's disk is stored as a diff against: its own link
+    /// to its template's image, or for a macOS machine its template's disk
+    /// while this node has the template.
+    async fn disk_image_of(&self, sandbox: &RunningSandbox) -> Option<PathBuf> {
+        let path = match crate::macnode::is_macos(sandbox.guest_os()) {
+            true => self
+                .config
+                .templates_dir()
+                .join(sandbox.template())
+                .join(crate::macnode::DISK),
+            false => sandbox.workdir.join(TEMPLATE_ROOTFS),
+        };
+        tokio::fs::try_exists(&path)
+            .await
+            .unwrap_or(false)
+            .then_some(path)
+    }
+
     /// Takes one checkpoint of a running sandbox, skipping it when nothing
     /// changed since the last.
     async fn checkpoint_sandbox(
@@ -12039,11 +12057,13 @@ impl SandboxManager {
                         uploaded
                     }
                     false => {
+                        let image = self.disk_image_of(sandbox).await;
                         crate::durable::upload_disk_checkpoint(
                             &store,
                             &blobs,
                             &sandbox.workdir,
                             &capture,
+                            image.as_deref(),
                             stamp,
                             draft,
                             previous.as_ref(),

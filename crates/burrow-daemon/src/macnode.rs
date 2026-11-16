@@ -34,6 +34,16 @@ pub fn disk_file(guest_os: GuestOs) -> Option<&'static str> {
     None
 }
 
+/// The files a macOS machine is, by the names [`burrow_vmm::vz`] gives them:
+/// its disk, its boot firmware's storage, and the small files a cold boot
+/// reads beside them. Named here too so a Linux node can carry them through
+/// the object store without the framework.
+pub const DISK: &str = "disk.img";
+pub const AUX: &str = "aux.img";
+pub const HARDWARE_MODEL: &str = "hardware-model";
+pub const REQUIREMENTS: &str = "requirements.json";
+pub const MACHINE_ID: &str = "machine-id";
+
 /// Makes `workdir` a new machine cloned from the template in `template_dir`,
 /// [`seed`]ed with `root_pem`.
 pub async fn prepare(template_dir: &Path, workdir: &Path, root_pem: &str) -> std::io::Result<()> {
@@ -1219,6 +1229,17 @@ pub fn available_memory() -> Option<u64> {
 
 #[cfg(test)]
 mod tests {
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn the_machine_files_are_the_frameworks() {
+        use burrow_vmm::vz;
+        assert_eq!(super::DISK, vz::DISK_FILE);
+        assert_eq!(super::AUX, vz::AUX_FILE);
+        assert_eq!(super::HARDWARE_MODEL, vz::HARDWARE_MODEL_FILE);
+        assert_eq!(super::REQUIREMENTS, vz::REQUIREMENTS_FILE);
+        assert_eq!(super::MACHINE_ID, vz::MACHINE_ID_FILE);
+    }
+
     use super::*;
 
     #[cfg(target_os = "macos")]

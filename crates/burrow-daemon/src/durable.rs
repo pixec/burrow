@@ -882,16 +882,48 @@ async fn keep_image(manifest: &Manifest, dest: &Path) -> Result<(), Status> {
 /// one is compared with.
 pub const CHECKPOINT_BASE: &str = "checkpoint-base.ext4";
 
+/// The small files a macOS machine needs beside its disk and auxiliary
+/// storage to boot as the same Mac.
+const MACHINE_FILES: [&str; 3] = [
+    crate::macnode::HARDWARE_MODEL,
+    crate::macnode::REQUIREMENTS,
+    crate::macnode::MACHINE_ID,
+];
+
+impl Manifest {
+    /// Whether this is a macOS machine's state: its disk, its auxiliary
+    /// storage and its identity, booted cold, with no kernel or image of
+    /// burrow's own.
+    pub fn is_machine(&self) -> bool {
+        self.image
+            .machine()
+            .is_ok_and(|(_, guest_os)| crate::macnode::is_macos(guest_os))
+    }
+
+    fn disk_file(&self) -> &'static str {
+        match self.is_machine() {
+            true => crate::macnode::DISK,
+            false => crate::rootdisk::ROOT_DISK,
+        }
+    }
+}
+
 /// Uploads a disk checkpoint: `capture`, a clone of the running sandbox's
 /// disk taken with its filesystem frozen, beside the kernel and image the
 /// sandbox boots from. `disk` is the live disk's stamp as the clone was taken,
 /// which the next checkpoint compares to skip itself when nothing changed.
+///
+/// A macOS machine's has no kernel or image of its own: its disk goes as the
+/// chunks it changed from `image`, its template's disk where the node has
+/// it, with its auxiliary storage and identity beside it. A stopped
+/// sandbox's is written as suspended, being exactly its state.
 #[allow(clippy::too_many_arguments)]
 pub async fn upload_disk_checkpoint(
     store: &ObjectStore,
     blobs: &crate::blobs::BlobStore,
     workdir: &Path,
     capture: &Path,
+    image: Option<&Path>,
     disk: Stamp,
     draft: Manifest,
     previous: Option<&LocalState>,
@@ -899,18 +931,37 @@ pub async fn upload_disk_checkpoint(
     let io = |what: &str, err: std::io::Error| Status::internal(format!("{what}: {err}"));
     let started = std::time::Instant::now();
     let id = draft.id.clone();
-    let disk_file = crate::rootdisk::ROOT_DISK;
+    let is_machine = draft.is_machine();
+    let disk_file = draft.disk_file();
     let stamp = |file: &str| Stamp::of(&workdir.join(file)).map_err(|err| io(file, err));
     let boot_file = draft.boot_file();
-    let kernel = stamp(boot_file)?;
-    let rootfs = stamp(TEMPLATE_ROOTFS)?;
-    let boot_digest = match previous.filter(|p| p.kernel == kernel) {
-        Some(previous) => previous.manifest.boot_digest().to_string(),
-        None => crate::snapshot::put_blob(store, &workdir.join(boot_file)).await?,
+    let (kernel, boot_digest) = match is_machine {
+        true => (Stamp::default(), String::new()),
+        false => {
+            let kernel = stamp(boot_file)?;
+            let digest = match previous.filter(|p| p.kernel == kernel) {
+                Some(previous) => previous.manifest.boot_digest().to_string(),
+                None => crate::snapshot::put_blob(store, &workdir.join(boot_file)).await?,
+            };
+            (kernel, digest)
+        }
     };
-    let image = crate::rootdisk::image_of(blobs, &workdir.join(TEMPLATE_ROOTFS)).await?;
-    crate::rootdisk::upload_image(store, &image).await?;
-    let rootfs_digest = image.digest.clone();
+    let image = match image {
+        Some(path) => {
+            let image = crate::rootdisk::image_of(blobs, path).await?;
+            crate::rootdisk::upload_image(store, &image).await?;
+            Some(image)
+        }
+        None => None,
+    };
+    let rootfs = match is_machine {
+        true => Stamp::default(),
+        false => stamp(TEMPLATE_ROOTFS)?,
+    };
+    let rootfs_digest = image
+        .as_ref()
+        .map(|image| image.digest.clone())
+        .unwrap_or_default();
     let reusable = previous.and_then(LocalState::reusable);
     let known = reusable.map(LocalState::digests).unwrap_or_default();
     let base_path = workdir.join(CHECKPOINT_BASE);
@@ -920,20 +971,45 @@ pub async fn upload_disk_checkpoint(
         Some(previous) if tokio::fs::try_exists(&base_path).await.unwrap_or(false) => {
             Some((base_path.as_path(), &previous.disk_index))
         }
-        _ => Some((image.path.as_path(), &image.index)),
+        _ => image
+            .as_ref()
+            .map(|image| (image.path.as_path(), &image.index)),
     };
     let mut known = known;
-    known.extend(image.index.digests());
+    if let Some(image) = &image {
+        known.extend(image.index.digests());
+    }
     let disk_index = crate::chunks::put_disk_since(store, capture, base, &known).await?;
 
     let now_ms = burrow_common::unix_now_ms();
     let generation = (now_ms as u64).max(previous.map_or(0, |p| p.manifest.generation + 1));
     crate::chunks::put_index(store, &index_key(&id, generation, disk_file), &disk_index).await?;
+    if is_machine {
+        let aux = crate::macnode::AUX;
+        let index = crate::chunks::put_image(
+            store,
+            workdir,
+            &[aux.to_string()],
+            None,
+            &Default::default(),
+        )
+        .await?;
+        crate::chunks::put_index(store, &index_key(&id, generation, aux), &index).await?;
+        for file in MACHINE_FILES {
+            store
+                .put_file(&generation_key(&id, generation, file), &workdir.join(file))
+                .await?;
+        }
+    }
+    let state = match draft.state.is_empty() {
+        true => STATE_RUNNING.to_string(),
+        false => draft.state.clone(),
+    };
     let mut local = LocalState {
         manifest: Manifest {
             format: FORMAT,
             generation,
-            state: STATE_RUNNING.to_string(),
+            state,
             rootfs_digest,
             checkpoint: CHECKPOINT_DISK.to_string(),
             ..draft
@@ -955,7 +1031,9 @@ pub async fn upload_disk_checkpoint(
     write_held(store, &local.manifest.node_id, &local.manifest, may_create).await?;
     local.is_published = true;
     save_local(workdir, &local).await?;
-    crate::rootdisk::confirm_image(store, &image).await?;
+    if let Some(image) = &image {
+        crate::rootdisk::confirm_image(store, image).await?;
+    }
     let _ = tokio::fs::rename(capture, &base_path).await;
     if let Some(previous) = previous
         && previous.manifest.generation != generation
@@ -973,7 +1051,9 @@ pub async fn upload_disk_checkpoint(
 }
 
 /// Brings a disk checkpoint into `dest` for a boot: the kernel, the image and
-/// the disk, rebuilt from the image and the chunks that differ from it.
+/// the disk, rebuilt from the image and the chunks that differ from it. A
+/// macOS machine's is its disk, rebuilt from its template's where it was
+/// stored as a diff, its auxiliary storage and its identity.
 pub async fn stage_disk(
     store: &ObjectStore,
     snapshots: &crate::snapshot::SnapshotStore,
@@ -981,10 +1061,14 @@ pub async fn stage_disk(
     dest: &Path,
 ) -> Result<LocalState, Status> {
     let id = &manifest.id;
-    let disk_file = crate::rootdisk::ROOT_DISK;
+    let is_machine = manifest.is_machine();
+    let disk_file = manifest.disk_file();
     let (kernel_path, rootfs_path) = (dest.join(manifest.boot_file()), dest.join(TEMPLATE_ROOTFS));
     let disk_key = index_key(id, manifest.generation, disk_file);
     let rootfs = async {
+        if manifest.rootfs_digest.is_empty() {
+            return Ok(None);
+        }
         let image = crate::rootdisk::fetch_image(
             store,
             snapshots.blobs(),
@@ -992,37 +1076,69 @@ pub async fn stage_disk(
             &manifest.rootfs_digest,
         )
         .await?;
-        tokio::fs::hard_link(&image.path, &rootfs_path)
-            .await
-            .map_err(|err| Status::internal(format!("linking the image: {err}")))?;
-        Ok::<_, Status>(image)
+        if !is_machine {
+            tokio::fs::hard_link(&image.path, &rootfs_path)
+                .await
+                .map_err(|err| Status::internal(format!("linking the image: {err}")))?;
+        }
+        Ok::<_, Status>(Some(image))
     };
-    let (kernel, image, disk_index) = tokio::join!(
-        snapshots.fetch_blob(store, manifest.boot_digest(), &kernel_path),
-        rootfs,
-        crate::chunks::read_index(store, &disk_key),
-    );
+    let kernel = async {
+        match is_machine {
+            true => Ok(()),
+            false => {
+                snapshots
+                    .fetch_blob(store, manifest.boot_digest(), &kernel_path)
+                    .await
+            }
+        }
+    };
+    let (kernel, image, disk_index) =
+        tokio::join!(kernel, rootfs, crate::chunks::read_index(store, &disk_key));
     kernel?;
     let image = image?;
-    let disk_index = disk_index?.ok_or_else(|| {
-        Status::not_found(format!("sandbox {id}'s checkpoint is missing {disk_file}"))
-    })?;
+    let missing =
+        |file: &str| Status::not_found(format!("sandbox {id}'s checkpoint is missing {file}"));
+    let disk_index = disk_index?.ok_or_else(|| missing(disk_file))?;
     let disk_path = dest.join(disk_file);
-    crate::rootdisk::materialise(store, &disk_index, Some(&image), &disk_path).await?;
+    crate::rootdisk::materialise(store, &disk_index, image.as_ref(), &disk_path).await?;
+    if is_machine {
+        let aux = crate::macnode::AUX;
+        let index = crate::chunks::read_index(store, &index_key(id, manifest.generation, aux))
+            .await?
+            .ok_or_else(|| missing(aux))?;
+        crate::chunks::get_image(store, &index, &dest.join(aux)).await?;
+        for file in MACHINE_FILES {
+            if store
+                .get_to_file(
+                    &generation_key(id, manifest.generation, file),
+                    &dest.join(file),
+                )
+                .await?
+                .is_none()
+            {
+                return Err(missing(file));
+            }
+        }
+    }
     keep_image(manifest, dest).await?;
     crate::fsync::tree(dest)
         .await
         .map_err(|err| Status::internal(format!("syncing the adopted disk: {err}")))?;
     let io = |what: &str, err: std::io::Error| Status::internal(format!("{what}: {err}"));
     let stamp = |file: &str| Stamp::of(&dest.join(file)).map_err(|err| io(file, err));
+    let (kernel, rootfs) = match is_machine {
+        true => (Stamp::default(), Stamp::default()),
+        false => (stamp(manifest.boot_file())?, stamp(TEMPLATE_ROOTFS)?),
+    };
     let local = LocalState {
         manifest: manifest.clone(),
         is_published: true,
         layers: Vec::new(),
         vmstate: Stamp::default(),
         disk: stamp(disk_file)?,
-        kernel: stamp(manifest.boot_file())?,
-        rootfs: stamp(TEMPLATE_ROOTFS)?,
+        kernel,
+        rootfs,
         memory: ImageIndex::default(),
         disk_index,
         logs: Default::default(),
@@ -1169,15 +1285,21 @@ pub async fn collect_garbage(
         let Some(Held { manifest, .. }) = read_manifest(store, id).await? else {
             continue;
         };
-        // Refused rather than skipped: skipping would leave this sandbox's
-        // chunks unreferenced, and the sweep below would take them.
-        let layout = manifest.layout()?;
+        // Every index the current generation holds, whatever its backend
+        // and guest named its files: a memory image, a root disk, or a
+        // macOS machine's disk and auxiliary storage.
         images.insert(manifest.rootfs_digest.clone());
-        for file in layout
-            .memory
-            .into_iter()
-            .chain([crate::rootdisk::ROOT_DISK])
-        {
+        let prefix = generation_key(id, manifest.generation, "");
+        let files: std::collections::BTreeSet<&str> = objects
+            .iter()
+            .filter_map(|(key, _)| key.strip_prefix(&prefix))
+            .filter_map(|rest| {
+                rest.strip_suffix(".caibx")
+                    .or_else(|| rest.strip_suffix(".index.json"))
+            })
+            .filter(|file| !file.contains('/'))
+            .collect();
+        for file in files {
             if let Some(index) =
                 crate::chunks::read_index(store, &index_key(id, manifest.generation, file)).await?
             {
@@ -1380,6 +1502,7 @@ mod tests {
             &blobs,
             &workdir,
             &capture,
+            Some(&workdir.join(TEMPLATE_ROOTFS)),
             stamp.clone(),
             draft.clone(),
             None,
@@ -1403,6 +1526,7 @@ mod tests {
             &blobs,
             &workdir,
             &capture,
+            Some(&workdir.join(TEMPLATE_ROOTFS)),
             Stamp::of(&disk).unwrap(),
             draft,
             Some(&first),
@@ -1453,6 +1577,110 @@ mod tests {
         let _ = std::fs::remove_dir_all(&root);
     }
 
+    /// A macOS machine's checkpoint is its disk as a diff against its
+    /// template's, its auxiliary storage and its identity. The collector
+    /// keeps every chunk of it, and another Mac that has the template
+    /// rebuilds all of it with no kernel or image of burrow's.
+    #[tokio::test]
+    async fn a_machine_checkpoint_outlives_the_collector_and_rebuilds_on_another_mac() {
+        use std::os::unix::fs::FileExt as _;
+        let (store, _, objects) = crate::objstore::fake::controlled().await;
+        let root = std::env::temp_dir().join(format!("burrow-mac-{}", uuid::Uuid::new_v4()));
+        let template = root.join("data-a/images/macos");
+        std::fs::create_dir_all(&template).unwrap();
+        let base = std::fs::File::create(template.join(crate::macnode::DISK)).unwrap();
+        base.set_len(4 << 20).unwrap();
+        base.write_all_at(&[1; 4096], 0).unwrap();
+        drop(base);
+        let workdir = root.join("a");
+        std::fs::create_dir_all(&workdir).unwrap();
+        let disk = workdir.join(crate::macnode::DISK);
+        crate::rootdisk::clone(&template.join(crate::macnode::DISK), &disk)
+            .await
+            .unwrap();
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(&disk)
+            .unwrap()
+            .write_all_at(&[5; 4096], 3 << 20)
+            .unwrap();
+        std::fs::write(workdir.join(crate::macnode::AUX), [7u8; 8192]).unwrap();
+        for file in MACHINE_FILES {
+            std::fs::write(workdir.join(file), file.as_bytes()).unwrap();
+        }
+        let mut draft = manifest("node-a", "");
+        draft.hypervisor = "vz".into();
+        draft.image = crate::oci::ImageEnvironment {
+            hypervisor: "vz".into(),
+            guest_os: "macos".into(),
+            ..Default::default()
+        };
+        draft.state = STATE_SUSPENDED.into();
+        assert!(draft.is_machine());
+        let capture = workdir.join(".release.img");
+        crate::rootdisk::clone(&disk, &capture).await.unwrap();
+        let blobs = crate::blobs::BlobStore::new(&root.join("data-a"));
+        let stored = upload_disk_checkpoint(
+            &store,
+            &blobs,
+            &workdir,
+            &capture,
+            Some(&template.join(crate::macnode::DISK)),
+            Stamp::of(&disk).unwrap(),
+            draft,
+            None,
+        )
+        .await
+        .unwrap();
+        assert_eq!(stored.manifest.state, STATE_SUSPENDED);
+        assert!(stored.manifest.kernel_digest.is_empty());
+        assert!(!stored.manifest.rootfs_digest.is_empty());
+
+        let held = read_manifest(&store, "sbx_1").await.unwrap().unwrap();
+        assert!(held.manifest.is_adoptable());
+        objects.lock().unwrap().age("", 2 * GARBAGE_GRACE);
+        let collector = crate::snapshot::SnapshotStore::new(
+            &root.join("data-c"),
+            Some(store.clone()),
+            HashMap::new(),
+        );
+        collect_garbage(&store, &collector).await.unwrap();
+        let other = root.join("data-b/images/macos");
+        std::fs::create_dir_all(&other).unwrap();
+        crate::rootdisk::clone(
+            &template.join(crate::macnode::DISK),
+            &other.join(crate::macnode::DISK),
+        )
+        .await
+        .unwrap();
+        let snapshots = crate::snapshot::SnapshotStore::new(
+            &root.join("data-b"),
+            Some(store.clone()),
+            HashMap::new(),
+        );
+        let dest = root.join("b");
+        std::fs::create_dir_all(&dest).unwrap();
+        stage_disk(&store, &snapshots, &held.manifest, &dest)
+            .await
+            .unwrap();
+        for file in [crate::macnode::DISK, crate::macnode::AUX]
+            .into_iter()
+            .chain(MACHINE_FILES)
+        {
+            assert_eq!(
+                std::fs::read(dest.join(file)).unwrap(),
+                std::fs::read(workdir.join(file)).unwrap(),
+                "{file}"
+            );
+        }
+        assert!(!dest.join(crate::boot::KERNEL).exists());
+        assert!(!dest.join(crate::rootdisk::ROOT_DISK).exists());
+        let environment =
+            crate::oci::sandbox_environment(&root.join("data-b"), &dest, "never-pulled").await;
+        assert_eq!(environment.guest_os, "macos");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
     /// State a build before casync chunks wrote names chunks that may be
     /// only in the old format, which an older node's collector deletes. An
     /// upload over it skips none of them, so the new generation needs nothing
@@ -1491,6 +1719,7 @@ mod tests {
                     blobs,
                     workdir,
                     capture,
+                    Some(&workdir.join(TEMPLATE_ROOTFS)),
                     Stamp::of(disk).unwrap(),
                     manifest("node-a", ""),
                     previous,
