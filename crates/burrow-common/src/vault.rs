@@ -114,13 +114,17 @@ mod tests {
     use super::*;
 
     fn key_path() -> std::path::PathBuf {
-        let nanos = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_nanos();
-        let dir = std::env::temp_dir().join(format!("burrow-vault-{}-{nanos}", std::process::id()));
+        let dir =
+            std::env::temp_dir().join(format!("burrow-vault-{}", uuid::Uuid::new_v4().simple()));
         std::fs::create_dir_all(&dir).unwrap();
         dir.join("secrets.key")
+    }
+
+    /// Tests run in parallel, and a clock read alone can give two of them the
+    /// same directory, where the second finds the first's key already made.
+    #[test]
+    fn every_test_key_has_a_directory_of_its_own() {
+        assert_ne!(key_path().parent(), key_path().parent());
     }
 
     #[test]
