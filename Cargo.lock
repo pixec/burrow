@@ -2021,7 +2021,7 @@ dependencies = [
  "libc",
  "percent-encoding",
  "pin-project-lite",
- "socket2 0.6.5",
+ "socket2 0.5.10",
  "tokio",
  "tower-service",
  "tracing",
@@ -3118,7 +3118,7 @@ dependencies = [
  "quinn-udp",
  "rustc-hash 2.1.3",
  "rustls",
- "socket2 0.6.5",
+ "socket2 0.5.10",
  "thiserror 2.0.20",
  "tokio",
  "tracing",
@@ -3156,7 +3156,7 @@ dependencies = [
  "cfg_aliases",
  "libc",
  "once_cell",
- "socket2 0.6.5",
+ "socket2 0.5.10",
  "tracing",
  "windows-sys 0.61.2",
 ]
@@ -4097,7 +4097,7 @@ dependencies = [
 [[package]]
 name = "tailcat-rs"
 version = "0.1.0"
-source = "git+https://github.com/pixec/tailcat-rs?rev=ab9be4c18c5706a6ff2c5ad9fcbace4a796a1033#ab9be4c18c5706a6ff2c5ad9fcbace4a796a1033"
+source = "git+https://github.com/pixec/tailcat-rs?rev=6a9a41839f6d341c927bee802ac4892896233052#6a9a41839f6d341c927bee802ac4892896233052"
 dependencies = [
  "base64",
  "boringtun",

@@ -25,5 +25,4 @@ The documentation is available at [burrow.pixec.net](https://burrow.pixec.net).
 
 Burrow is licensed under the GNU Affero General Public License, version 3, in [LICENSE](LICENSE).
 The Python and TypeScript SDKs in `sdk/` are licensed under the MIT License, in their own `LICENSE` files.
-Third-party code included in Burrow's binaries is listed, with its notices, in [THIRD-PARTY-NOTICES.md](THIRD-PARTY-NOTICES.md).
 Contributions are accepted under the [Contributor License Agreement](CLA.md).

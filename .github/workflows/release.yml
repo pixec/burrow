@@ -119,7 +119,6 @@ jobs:
             cp "$out/$bin" "dist/${{ matrix.docker_arch }}/$bin"
             cp "$out/$bin" "release/$bin-${{ matrix.arch }}-${{ steps.version.outputs.version }}"
           done
-          cp THIRD-PARTY-NOTICES.md release/
           cd release && sha256sum * > "SHA256SUMS-${{ matrix.arch }}-${{ steps.version.outputs.version }}"
 
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4

@@ -156,5 +156,4 @@ FROM base AS release
 ARG TARGETARCH
 COPY dist/${TARGETARCH}/burrowd /burrow/bin/burrowd
 COPY dist/${TARGETARCH}/burrow-guest /burrow/bin/burrow-guest
-COPY THIRD-PARTY-NOTICES.md /burrow/THIRD-PARTY-NOTICES.md
 ENTRYPOINT ["/burrow/bin/burrowd"]
