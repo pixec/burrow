@@ -9,7 +9,7 @@
 
 #![allow(clippy::result_large_err)]
 
-use std::os::unix::fs::{MetadataExt as _, PermissionsExt};
+use std::os::unix::fs::{MetadataExt as _, OpenOptionsExt as _, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 
@@ -670,8 +670,16 @@ fn rewrite(path: &str, mut edit: impl FnMut(&[&str]) -> Option<String>) -> Resul
     }
     let meta =
         std::fs::metadata(path).map_err(|err| Status::internal(format!("stat {path}: {err}")))?;
+    // Made with the file's own mode, never the umask's: `/etc/shadow` must not
+    // be readable for the instant before the chmod.
     let temporary = format!("{path}.burrow");
-    std::fs::write(&temporary, &out)
+    let _ = std::fs::remove_file(&temporary);
+    std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(meta.permissions().mode() & 0o7777)
+        .open(&temporary)
+        .and_then(|mut file| std::io::Write::write_all(&mut file, out.as_bytes()))
         .map_err(|err| Status::internal(format!("write {temporary}: {err}")))?;
     chown(&temporary, meta.uid(), meta.gid())?;
     std::fs::set_permissions(&temporary, meta.permissions())
