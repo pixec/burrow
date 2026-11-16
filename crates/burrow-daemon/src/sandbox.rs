@@ -199,6 +199,11 @@ pub struct NodeConfig {
     /// sandbox recovered from a run that had it still needs a backend to
     /// describe its VM with, even if all it can then do is fail to resume.
     pub cloud_hypervisor: burrow_vmm::CloudHypervisorConfig,
+    /// swtpm, for templates whose sandboxes get a TPM.
+    pub swtpm: PathBuf,
+    /// Where those TPMs keep their state; `None` is each sandbox's working
+    /// directory.
+    pub tpm_state_dir: Option<PathBuf>,
     /// The hypervisors this node offers, as it advertises them. A template or
     /// sandbox needing another is refused.
     pub hypervisors: Vec<Hypervisor>,
@@ -348,6 +353,17 @@ impl NodeConfig {
     /// Under the jailer this *is* the chroot the VMM is pivoted into, because
     /// everything firecracker touches has to be inside it and every path
     /// burrow hands the API is already relative.
+    /// Where `id`'s TPM is, when its template gives it one.
+    pub(crate) fn tpm(&self, id: &str, workdir: &Path) -> burrow_vmm::TpmSpec {
+        burrow_vmm::TpmSpec {
+            swtpm: self.swtpm.clone(),
+            dir: match &self.tpm_state_dir {
+                Some(root) => root.join(id),
+                None => workdir.join("tpm"),
+            },
+        }
+    }
+
     fn sandbox_dir(&self, id: &str, hypervisor: Hypervisor) -> PathBuf {
         match self.jail_for(hypervisor) {
             Some(jail) => jail.chroot_for(hypervisor, id),
@@ -1029,6 +1045,8 @@ impl<'a> Provisioning<'a> {
         self.manager.release_lease(&self.id).await;
         self.manager.volumes.release_all(&self.id);
         let _ = self.manager.config.remove_workdir(&self.workdir).await;
+        let tpm = self.manager.config.tpm(&self.id, &self.workdir);
+        let _ = tokio::fs::remove_dir_all(tpm.dir).await;
         let _ = tokio::fs::remove_dir_all(self.manager.config.command_logs_dir(&self.id)).await;
         self.is_kept = true;
         err
@@ -1076,6 +1094,7 @@ impl Drop for Provisioning<'_> {
                 manager.release_lease(&id).await;
                 manager.volumes.release_all(&id);
                 let _ = manager.config.remove_workdir(&workdir).await;
+                let _ = tokio::fs::remove_dir_all(manager.config.tpm(&id, &workdir).dir).await;
             });
         }
     }
@@ -1541,6 +1560,11 @@ impl RunningSandbox {
     /// guest's disk image.
     pub fn disk_path(&self) -> PathBuf {
         self.workdir.join(disk_file(self.guest_os()))
+    }
+
+    /// Whether the guest has a TPM of its own, which nothing copies.
+    fn has_tpm(&self) -> bool {
+        self.spec.lock().unwrap().tpm.is_some()
     }
 
     fn guest_os(&self) -> burrow_vmm::GuestOs {
@@ -2539,6 +2563,12 @@ impl RunningSandbox {
         logs: Option<&Path>,
         capture: Option<&Path>,
     ) -> Result<Vec<String>, Status> {
+        if self.has_tpm() {
+            return Err(Status::failed_precondition(format!(
+                "sandbox {} has a TPM, and a copy of it would hold the same TPM's keys",
+                self.id
+            )));
+        }
         self.durable.settle_memory().await;
         let _slot = self.vm.lock().await;
         let chain = self.memory_chain.lock().await.clone();
@@ -4034,6 +4064,7 @@ impl SandboxManager {
             &volumes,
             environment.booted_systemd(),
             stored_policy.is_console_verbose,
+            environment.tpm,
         );
 
         let sandbox = Arc::new(RunningSandbox {
@@ -6718,10 +6749,12 @@ impl SandboxManager {
         shape: crate::warm::Shape,
     ) -> Result<Option<crate::warm::Warm>, Status> {
         let templates_dir = self.config.templates_dir();
-        let (hypervisor, guest_os) = self.image_environment(template).await.machine()?;
+        let environment = self.image_environment(template).await;
+        let (hypervisor, guest_os) = environment.machine()?;
         // A pinned shape below what the guest boots on, the default 1x512 for
-        // a Windows template, is not one any create of it can ask for.
-        if require_min_machine(template, guest_os, shape).is_err() {
+        // a Windows template, is not one any create of it can ask for, and a
+        // template giving each sandbox a TPM is not warmed at all.
+        if require_min_machine(template, guest_os, shape).is_err() || environment.tpm {
             return Ok(None);
         }
         // As a create pins it, or the snapshot is kept under a shape no
@@ -6981,11 +7014,11 @@ impl SandboxManager {
     pub async fn sweep_warm(&self) {
         let templates_dir = self.config.templates_dir();
         for template in crate::template::bootable(&self.config.data_dir).await {
-            let is_warmable = self
-                .image_environment(&template.name)
-                .await
-                .machine()
-                .is_ok_and(|(hypervisor, _)| hypervisor.capabilities().is_warm_pool_supported);
+            let environment = self.image_environment(&template.name).await;
+            let is_warmable = !environment.tpm
+                && environment
+                    .machine()
+                    .is_ok_and(|(hypervisor, _)| hypervisor.capabilities().is_warm_pool_supported);
             if !is_warmable {
                 continue;
             }
@@ -7478,6 +7511,7 @@ impl SandboxManager {
         volumes: &[common::VolumeMount],
         systemd: Option<&crate::oci::SystemdBoot>,
         is_console_verbose: bool,
+        is_tpm: bool,
     ) -> VmSpec {
         let mut spec = VmSpec::new(id.to_string(), workdir, self.config.backend(hypervisor));
         spec.guest_os = guest_os;
@@ -7561,6 +7595,9 @@ impl SandboxManager {
         };
         if crate::boot::file(guest_os) == crate::boot::FIRMWARE {
             spec.boot = crate::boot::firmware_boot();
+        }
+        if is_tpm {
+            spec.tpm = Some(self.config.tpm(id, workdir));
         }
         if crate::macnode::is_macos(guest_os)
             && let Err(err) = crate::macnode::apply(&mut spec, resources)
@@ -7963,9 +8000,11 @@ impl SandboxManager {
         // disk grown, where the guest's disk can grow live; one with a larger
         // disk cannot be shrunk under the guest, so that create boots.
         let wanted = crate::warm::Shape::wanted(&resources);
+        // A TPM's state is the sandbox's own, which no shared snapshot holds.
         let is_warmable = seed_disk.is_none()
             && !policy.is_console_verbose
             && !resources.is_nested_virt_enabled
+            && !environment.tpm
             && capabilities.is_warm_pool_supported
             && (capabilities.is_drive_hotplug_supported
                 || crate::volume::block_mounts(&policy.volumes)
@@ -8029,6 +8068,7 @@ impl SandboxManager {
                 boot_volumes,
                 environment.booted_systemd(),
                 policy.is_console_verbose,
+                environment.tpm,
             )
         };
 
@@ -9260,6 +9300,7 @@ impl SandboxManager {
             },
             environment.booted_systemd(),
             policy.is_console_verbose,
+            environment.tpm,
         );
         // The template's plan names the pages its agent touches on the way to
         // a usable handshake, which is the same code whether the guest was
@@ -9729,6 +9770,7 @@ impl SandboxManager {
             boot_volumes,
             environment.booted_systemd(),
             policy.is_console_verbose,
+            environment.tpm,
         );
         let from = self.boundary(&sandbox).await;
         if let Err(err) = self.usernets.attach(id, &sandbox.lease, &mut spec) {
@@ -9959,6 +10001,8 @@ impl SandboxManager {
         if let Err(err) = self.config.remove_workdir(&workdir).await {
             tracing::warn!(sandbox = id, %err, "failed to remove sandbox directory");
         }
+        // A TPM kept outside the working directory, by `--tpm-state-dir`.
+        let _ = tokio::fs::remove_dir_all(self.config.tpm(id, &workdir).dir).await;
         let _ = tokio::fs::remove_dir_all(self.config.command_logs_dir(id)).await;
         rendered
     }
@@ -9969,10 +10013,13 @@ impl SandboxManager {
     /// Whether a sandbox can live in the object store at all: one mounting
     /// volumes only where they are kept there too.
     fn is_movable(&self, sandbox: &RunningSandbox) -> bool {
-        self.volumes.is_durable()
-            || crate::volume::block_mounts(&sandbox.record().policy.unwrap_or_default().volumes)
+        !sandbox.has_tpm()
+            && (self.volumes.is_durable()
+                || crate::volume::block_mounts(
+                    &sandbox.record().policy.unwrap_or_default().volumes,
+                )
                 .next()
-                .is_none()
+                .is_none())
     }
 
     /// Brings every volume a suspended sandbox mounts up to date in the
@@ -10542,9 +10589,10 @@ impl SandboxManager {
         }
         let sandbox = self.get(id).await?;
         if !self.is_movable(&sandbox) {
-            return Err(Status::failed_precondition(
-                "a sandbox with volumes moves only with an object store to carry them",
-            ));
+            return Err(Status::failed_precondition(match sandbox.has_tpm() {
+                true => "a sandbox with a TPM stays on the node holding its TPM's state",
+                false => "a sandbox with volumes moves only with an object store to carry them",
+            }));
         }
         // The volumes it writes move with it. One it only reads stays where it
         // is, and the new node reads a copy of it.
@@ -10961,6 +11009,7 @@ impl SandboxManager {
             &policy.volumes,
             manifest.is_systemd.then_some(&manifest.image.systemd_boot),
             policy.is_console_verbose,
+            manifest.image.tpm,
         );
         let record = common::Sandbox {
             id: id.clone(),
@@ -11110,6 +11159,7 @@ impl SandboxManager {
                 .filter(|sandbox| {
                     sandbox.is_running()
                         && sandbox.lifetime().checkpoint_secs > 0
+                        && !sandbox.has_tpm()
                         && self.require_settled(sandbox.id()).is_ok()
                 })
                 .cloned()
@@ -12107,6 +12157,8 @@ pub(crate) mod tests {
                     firmware: burrow_vmm::cloud_hypervisor::DEFAULT_FIRMWARE.into(),
                     jail: None,
                 },
+                swtpm: "swtpm".into(),
+                tpm_state_dir: None,
                 hypervisors: vec![Hypervisor::Firecracker],
                 kernels: Default::default(),
                 is_nested_virt_supported: false,

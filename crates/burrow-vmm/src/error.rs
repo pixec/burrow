@@ -29,6 +29,10 @@ pub enum Error {
     #[error("snapshot: {0}")]
     Snapshot(String),
 
+    /// The guest's TPM emulator could not be started.
+    #[error("tpm: {0}")]
+    Tpm(String),
+
     #[error("hypervisor binary not found at {0}")]
     BinaryNotFound(PathBuf),
 

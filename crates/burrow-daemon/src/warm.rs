@@ -664,6 +664,12 @@ pub async fn build_warm_snapshot(
     let environment = crate::oci::image_environment(&config.data_dir, template).await;
     let (hypervisor, guest_os) = environment.machine()?;
     crate::sandbox::require_min_machine(template, guest_os, shape)?;
+    if environment.tpm {
+        return Err(Status::failed_precondition(format!(
+            "template {template} gives each sandbox a TPM of its own, which no shared snapshot \
+             can hold"
+        )));
+    }
     let agent_timeout = config.agent_timeout(guest_os);
     if !config.hypervisors.contains(&hypervisor) {
         return Err(Status::failed_precondition(format!(

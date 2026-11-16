@@ -483,6 +483,18 @@ pub struct VmSpec {
     /// nesting on ([`is_nested_virt_supported`]); the guest kernel needs
     /// `CONFIG_KVM_AMD` or `CONFIG_KVM_INTEL`.
     pub is_nested_virt_enabled: bool,
+    /// A TPM 2.0 for the guest, from an swtpm the backend starts and stops
+    /// with the VMM. Cloud Hypervisor only.
+    pub tpm: Option<TpmSpec>,
+}
+
+/// Where a guest's TPM emulator comes from and keeps its state.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TpmSpec {
+    pub swtpm: PathBuf,
+    /// The emulator's state and control socket. Inside `workdir` it travels
+    /// with the VM's other files.
+    pub dir: PathBuf,
 }
 
 impl VmSpec {
@@ -513,6 +525,7 @@ impl VmSpec {
             is_limits_required: false,
             is_console_interactive: false,
             is_nested_virt_enabled: false,
+            tpm: None,
         }
     }
 

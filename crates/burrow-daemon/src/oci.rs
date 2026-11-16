@@ -242,6 +242,10 @@ pub struct ImageEnvironment {
     pub kernel: String,
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub kernel_digest: String,
+    /// Every sandbox of this template gets a TPM 2.0 of its own, from swtpm:
+    /// what Windows 11 will not install or boot without.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub tpm: bool,
 }
 
 /// A systemd template's boot options, which its image sets with labels.
@@ -919,6 +923,7 @@ pub async fn pull(
             guest_os: String::new(),
             kernel: String::new(),
             kernel_digest: String::new(),
+            tpm: false,
         },
         digest,
         layer_digests,

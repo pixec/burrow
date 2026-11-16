@@ -124,12 +124,14 @@ impl Plan {
 }
 
 /// The host files a VM config names by absolute path, which have to be bound
-/// into the jail where the VMM will look for them. Everything else in it is
-/// relative to the working directory.
+/// into the jail where the VMM will look for them: the boot files, and a TPM
+/// emulator's socket, which a read-only bind still lets the VMM connect to.
+/// Everything else in it is relative to the working directory.
 pub(crate) fn absolute_paths(vm_config: &serde_json::Value) -> Vec<PathBuf> {
     ["kernel", "firmware", "initramfs"]
         .iter()
         .filter_map(|field| vm_config["payload"][field].as_str())
+        .chain(vm_config["tpm"]["socket"].as_str())
         .map(PathBuf::from)
         .filter(|path| path.is_absolute())
         .collect()
@@ -516,6 +518,11 @@ mod tests {
         assert!(absolute_paths(&linux).is_empty());
         let windows = json!({ "payload": { "firmware": "/usr/local/share/cloud-hypervisor/CLOUDHV_EFI.fd" } });
         assert_eq!(absolute_paths(&windows).len(), 1);
+        let tpm = json!({ "payload": { "firmware": "firmware.fd" }, "tpm": { "socket": "/var/lib/swtpm/burrow/sbx_a/swtpm.sock" } });
+        assert_eq!(
+            absolute_paths(&tpm),
+            vec![PathBuf::from("/var/lib/swtpm/burrow/sbx_a/swtpm.sock")]
+        );
     }
 
     #[test]

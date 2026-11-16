@@ -179,6 +179,7 @@ impl KitTemplate {
             guest_os: String::new(),
             kernel: String::new(),
             kernel_digest: String::new(),
+            tpm: false,
         }
     }
 }

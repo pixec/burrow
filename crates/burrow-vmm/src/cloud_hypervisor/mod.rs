@@ -20,6 +20,7 @@
 
 mod config;
 pub mod jail;
+mod tpm;
 
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
@@ -123,6 +124,8 @@ pub struct ChVm {
     console_in: Option<tokio::net::unix::OwnedWriteHalf>,
     /// Copies the console into its log, until the VM is stopped.
     console: Option<crate::console::Capture>,
+    /// The guest's TPM emulator, stopped with the VMM.
+    tpm: Option<crate::TpmSpec>,
 }
 
 impl Drop for ChVm {
@@ -152,7 +155,11 @@ impl ChVm {
             None => Vec::new(),
         };
         let read_only = jail::absolute_paths(&vm_config);
-        let mut vm = Self::spawn(&spec, &config, &[], read_only).await?;
+        if let Some(tpm) = &spec.tpm {
+            tpm::start(tpm, &spec.workdir, true, config.jail.is_some()).await?;
+        }
+        let spawned = Self::spawn(&spec, &config, &[], read_only).await;
+        let mut vm = without_tpm_on_error(&spec, spawned).await?;
         let booted = async {
             vm.api.put("/api/v1/vm.create", &vm_config).await?;
             for nic in nics {
@@ -196,16 +203,20 @@ impl ChVm {
         }
         let (restore_dir, vm_config, last_host_port) = unpack(&spec, config.jail.as_ref()).await?;
         let read_only = jail::absolute_paths(&vm_config);
+        if let Some(tpm) = &spec.tpm {
+            tpm::start(tpm, &spec.workdir, false, config.jail.is_some()).await?;
+        }
         let source = jail::vmm_workdir(&spec.workdir, config.jail.as_ref())?.join(RESTORE_DIR);
         let source_url = format!("file://{}", source.display());
-        let mut vm = match &config.jail {
-            Some(_) => Self::spawn(&spec, &config, &[], read_only).await?,
+        let spawned = match &config.jail {
+            Some(_) => Self::spawn(&spec, &config, &[], read_only).await,
             None => {
                 let source =
                     format!("source_url={source_url},memory_restore_mode={MEMORY_RESTORE_MODE}");
-                Self::spawn(&spec, &config, &["--restore", &source], read_only).await?
+                Self::spawn(&spec, &config, &["--restore", &source], read_only).await
             }
         };
+        let mut vm = without_tpm_on_error(&spec, spawned).await?;
         let loaded = async {
             if config.jail.is_some() {
                 vm.restore_jailed(&source_url, &vm_config).await?;
@@ -316,6 +327,7 @@ impl ChVm {
             cgroup,
             console_in: None,
             console,
+            tpm: spec.tpm.clone(),
         };
         if let Err(err) = wait_for_socket(&mut vm.child, &socket, &spec.workdir).await {
             vm.stop().await;
@@ -343,6 +355,9 @@ impl ChVm {
             _ => {
                 let _ = self.child.kill().await;
             }
+        }
+        if let Some(tpm) = &self.tpm {
+            tpm::stop(tpm, true).await;
         }
     }
 
@@ -590,6 +605,16 @@ impl ChVm {
         drop(self.cgroup.take());
         Ok(())
     }
+}
+
+/// Stops the TPM emulator started for a VMM that did not start.
+async fn without_tpm_on_error(spec: &VmSpec, spawned: Result<ChVm>) -> Result<ChVm> {
+    if spawned.is_err()
+        && let Some(tpm) = &spec.tpm
+    {
+        tpm::stop(tpm, false).await;
+    }
+    spawned
 }
 
 /// Lays a packed snapshot out the way a restore reads one, addressed to this

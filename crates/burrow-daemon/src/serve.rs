@@ -81,6 +81,16 @@ pub struct ServeArgs {
     /// The edk2 build Cloud Hypervisor boots a guest without a kernel from.
     #[arg(long, default_value = burrow_vmm::cloud_hypervisor::DEFAULT_FIRMWARE)]
     pub cloud_hypervisor_firmware: PathBuf,
+    /// swtpm, which gives each sandbox of a template asking for a TPM one of
+    /// its own.
+    #[arg(long, default_value = "/usr/bin/swtpm")]
+    pub swtpm: PathBuf,
+    /// Where each sandbox's TPM state is kept, in a directory named for it.
+    /// Unset keeps it in the sandbox's working directory. Ubuntu's AppArmor
+    /// profile for swtpm lets it write only under a few paths, among them
+    /// `/var/lib/swtpm`; elsewhere it needs a local rule.
+    #[arg(long)]
+    pub tpm_state_dir: Option<PathBuf>,
     /// Run Cloud Hypervisor unconfined even with `--jailer`: as root, in the
     /// host's namespaces, with the host's filesystem in view. For a dev box
     /// whose kernel cannot build the jail; nowhere a guest is untrusted.
@@ -1793,6 +1803,8 @@ pub async fn run(args: ServeArgs) -> anyhow::Result<()> {
                 firmware: args.cloud_hypervisor_firmware.clone(),
                 jail: args.cloud_hypervisor_jail()?,
             },
+            swtpm: args.swtpm.clone(),
+            tpm_state_dir: args.tpm_state_dir.clone(),
             hypervisors,
             kernels,
             is_nested_virt_supported: node_info.is_nested_virt_supported,
