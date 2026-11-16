@@ -110,6 +110,12 @@ export interface SecretScope {
   sandboxes?: string[];
   /** Tags as `key=value`. */
   tags?: string[];
+  /**
+   * A Windows product key, which a create may name as its
+   * `activation.productKeySecret`. It is handed to the guest, so anyone who
+   * can create a sandbox it is scoped to can read it there.
+   */
+  productKey?: boolean;
 }
 
 /** A stored secret's name and scope. The value is never returned. */

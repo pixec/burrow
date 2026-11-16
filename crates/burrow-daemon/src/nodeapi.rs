@@ -569,6 +569,11 @@ impl NodeService for NodeApi {
         }
         let policy = req.policy.unwrap_or_default();
         validate_policy(&policy)?;
+        // Each runs the guest's own tools as its administrator, which a
+        // sandbox that may not run commands may not have done either.
+        if req.is_remote_desktop_enabled || req.activation.is_some() {
+            check_exec(&policy)?;
+        }
         self.sandboxes.require_checkpointable(&policy)?;
         burrow_common::tags::validate(&req.tags)?;
         // A template imported from Kits is provisioned through their
@@ -2018,7 +2023,7 @@ fn check_exec_user(user: &str) -> Result<(), Status> {
 }
 
 /// Trims a string a guest reported to something a client can be handed.
-fn bounded(mut value: String, max: usize) -> String {
+pub(crate) fn bounded(mut value: String, max: usize) -> String {
     value.retain(|c| !c.is_control());
     // On a char boundary, so a multi-byte character is never cut in half.
     if value.len() > max {

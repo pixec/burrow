@@ -572,6 +572,7 @@ class Burrow:
         *,
         allowed_sandboxes: Optional[List[str]] = None,
         allowed_tags: Optional[List[str]] = None,
+        product_key: bool = False,
     ) -> None:
         """Stores a credential that Sandbox Kits ask for by service name. The
         orchestrator keeps it sealed, and the egress proxy on the sandbox's
@@ -581,7 +582,11 @@ class Burrow:
         `allowed_sandboxes` (ids or names) and `allowed_tags` (`key=value`)
         scope the secret: a reference to it from any other sandbox is refused.
         Neither given, every sandbox may use it. Setting a secret replaces its
-        scope along with its value."""
+        scope along with its value.
+
+        `product_key` marks a Windows product key, which a create may name as
+        its `product_key_secret`. It is handed to the guest, so anyone who can
+        create a sandbox it is scoped to can read it there."""
         self._transport.unary(
             "SetSecret",
             api_pb2.SetSecretRequest(
@@ -589,6 +594,7 @@ class Burrow:
                 value=value,
                 allowed_sandboxes=list(allowed_sandboxes or []),
                 allowed_tags=list(allowed_tags or []),
+                is_product_key=product_key,
             ),
         )
 
@@ -600,6 +606,7 @@ class Burrow:
                 name=secret.name,
                 allowed_sandboxes=list(secret.allowed_sandboxes),
                 allowed_tags=list(secret.allowed_tags),
+                product_key=secret.is_product_key,
             )
             for secret in res.secrets
         ]

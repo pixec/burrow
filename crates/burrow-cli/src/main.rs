@@ -2053,6 +2053,11 @@ enum SecretCommand {
         /// Repeatable.
         #[arg(long = "allow-tag")]
         allowed_tags: Vec<String>,
+        /// The secret is a Windows product key, which `create
+        /// --product-key-secret` may hand to a guest: anyone who can create a
+        /// sandbox it is scoped to can read it there.
+        #[arg(long = "product-key")]
+        is_product_key: bool,
     },
     /// List secret names and their scopes. Values are never shown.
     #[command(visible_alias = "list")]
@@ -2512,6 +2517,7 @@ async fn main() -> anyhow::Result<()> {
             value,
             allowed_sandboxes,
             allowed_tags,
+            is_product_key,
         }) => {
             let value = match value {
                 Some(value) => value,
@@ -2527,6 +2533,7 @@ async fn main() -> anyhow::Result<()> {
                     value,
                     allowed_sandboxes,
                     allowed_tags,
+                    is_product_key,
                 })
                 .await?;
             println!("stored {name}");
@@ -2547,6 +2554,7 @@ async fn main() -> anyhow::Result<()> {
                             .iter()
                             .map(|entry| format!("tag:{entry}")),
                     )
+                    .chain(secret.is_product_key.then(|| "product-key".to_string()))
                     .collect();
                 if scope.is_empty() {
                     println!("{}", secret.name);

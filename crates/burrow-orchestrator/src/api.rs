@@ -1053,10 +1053,11 @@ impl ApiService {
                     .get_scoped(name)
                     .await
                     .map_err(internal)?
-                    .filter(|secret| secret.scope.admits(&subject))
+                    .filter(|secret| secret.scope.is_product_key && secret.scope.admits(&subject))
                     .ok_or_else(|| {
                         Status::failed_precondition(format!(
-                            "no secret {name} this sandbox may use for its product key"
+                            "no product-key secret {name} this sandbox may use; store one with \
+                             `burrow secret set {name} --product-key`"
                         ))
                     })?;
                 secret.value
@@ -2372,7 +2373,10 @@ impl Burrow for ApiService {
         if req.value.is_empty() {
             return Err(Status::invalid_argument("a secret needs a value"));
         }
-        let scope = validate_secret_scope(req.allowed_sandboxes, req.allowed_tags)?;
+        let scope = crate::secrets::Scope {
+            is_product_key: req.is_product_key,
+            ..validate_secret_scope(req.allowed_sandboxes, req.allowed_tags)?
+        };
         self.secrets()?
             .set_scoped(&req.name, &req.value, &scope)
             .await
@@ -2392,6 +2396,7 @@ impl Burrow for ApiService {
                     name,
                     allowed_sandboxes: scope.sandboxes,
                     allowed_tags: scope.tags,
+                    is_product_key: scope.is_product_key,
                 })
                 .collect(),
         }))

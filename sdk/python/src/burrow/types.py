@@ -124,6 +124,8 @@ class SecretInfo:
     name: str
     allowed_sandboxes: List[str] = field(default_factory=list)
     allowed_tags: List[str] = field(default_factory=list)
+    # A Windows product key, which a create may hand to a guest.
+    product_key: bool = False
 
 
 @dataclass

@@ -1122,8 +1122,9 @@ async fn run(args: Args) -> anyhow::Result<()> {
                 .max_encoding_message_size(burrow_proto::MAX_MESSAGE_BYTES),
             auth.clone(),
         ))
-        .add_service(NodeRegistryServer::with_interceptor(
-            NodeRegistryService(state),
+        .add_service(tonic::service::interceptor::InterceptedService::new(
+            NodeRegistryServer::new(NodeRegistryService(state))
+                .max_decoding_message_size(burrow_proto::MAX_MESSAGE_BYTES),
             node_auth,
         ))
         .serve(args.listen)

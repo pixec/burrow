@@ -491,7 +491,7 @@ impl SandboxManager {
 
     /// Whether `new` is still the sandbox this node holds under its id. Only
     /// a lifecycle call that should have been refused could have changed it.
-    async fn holds(&self, new: &Arc<RunningSandbox>) -> bool {
+    pub(super) async fn holds(&self, new: &Arc<RunningSandbox>) -> bool {
         self.sandboxes
             .lock()
             .await

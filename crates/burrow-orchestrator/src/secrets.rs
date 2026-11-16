@@ -26,6 +26,9 @@ pub struct Scope {
     /// Tags as `key=value`.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub tags: Vec<String>,
+    /// Holds a Windows product key, which a create may hand to a guest.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub is_product_key: bool,
 }
 
 /// The sandbox a secret is being resolved for.
@@ -44,7 +47,11 @@ impl Scope {
         sandboxes.dedup();
         tags.sort();
         tags.dedup();
-        Self { sandboxes, tags }
+        Self {
+            sandboxes,
+            tags,
+            is_product_key: false,
+        }
     }
 
     pub fn is_unscoped(&self) -> bool {
@@ -67,7 +74,7 @@ impl Scope {
 
     /// As stored: empty when unscoped.
     fn encode(&self) -> String {
-        if self.is_unscoped() {
+        if *self == Self::default() {
             String::new()
         } else {
             serde_json::to_string(self).unwrap_or_default()
@@ -178,6 +185,19 @@ impl Secrets {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Marking a secret a product key survives storage even with no scope,
+    /// and an unmarked, unscoped secret still stores as it always has.
+    #[test]
+    fn a_product_key_mark_survives_without_a_scope() {
+        let marked = Scope {
+            is_product_key: true,
+            ..Scope::default()
+        };
+        assert!(marked.is_unscoped());
+        assert_eq!(Scope::decode(&marked.encode()).unwrap(), marked);
+        assert_eq!(Scope::default().encode(), "");
+    }
 
     async fn secrets() -> Secrets {
         let nanos = std::time::SystemTime::now()

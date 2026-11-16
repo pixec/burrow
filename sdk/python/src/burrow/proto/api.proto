@@ -974,8 +974,9 @@ message CreateSandboxRequest {
 }
 
 message ActivationRequest {
-  // A stored secret (`burrow secret set`) holding a product key, installed
-  // at create. The key is never logged or kept on the sandbox.
+  // A stored secret holding a product key, set with `is_product_key`,
+  // installed at create. The key is never logged or kept on the sandbox,
+  // but the guest holds it once installed.
   string product_key_secret = 1;
   // A KMS host the caller runs, host or host:port.
   string kms_host = 2;
@@ -1011,6 +1012,11 @@ message SetSecretRequest {
   repeated string allowed_sandboxes = 3;
   // Tags as `key=value`, compared exactly.
   repeated string allowed_tags = 4;
+  // The secret holds a Windows product key, which a create may name as its
+  // `activation.product_key_secret`. Unlike a brokered credential it is
+  // handed to the guest, so anyone who can create a sandbox it is scoped to
+  // can read it there.
+  bool is_product_key = 5;
 }
 message SetSecretResponse {}
 message ListSecretsRequest {}
@@ -1022,6 +1028,7 @@ message SecretInfo {
   string name = 1;
   repeated string allowed_sandboxes = 2;
   repeated string allowed_tags = 3;
+  bool is_product_key = 4;
 }
 message DeleteSecretRequest {
   string name = 1;

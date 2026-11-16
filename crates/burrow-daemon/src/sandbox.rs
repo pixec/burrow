@@ -620,6 +620,12 @@ fn pin_boot_memory(
     Ok(())
 }
 
+/// How long a Windows guest's `slmgr` gets to activate: a KMS host that
+/// does not answer holds it for most of a minute per attempt.
+const ACTIVATION_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(300);
+/// The most of an activation status a sandbox's record keeps.
+const ACTIVATION_STATUS_MAX: usize = 512;
+
 /// How long a macOS guest gets to resize its APFS container, which takes
 /// minutes on a busy Mac; the sandbox's own client gives up after the agent
 /// timeout.
@@ -5404,7 +5410,7 @@ impl SandboxManager {
                 Some(activation) => activation.kms_host.clone(),
                 None => return,
             };
-            let outcome = async {
+            let outcome = tokio::time::timeout(ACTIVATION_TIMEOUT, async {
                 let mut agent = sandbox.agent().await?;
                 agent
                     .activate(burrow_proto::guest::v1::ActivateRequest {
@@ -5413,12 +5419,19 @@ impl SandboxManager {
                     })
                     .await
                     .map(tonic::Response::into_inner)
-            }
+            })
             .await;
             let (is_activated, status) = match outcome {
-                Ok(done) => (done.is_activated, done.status),
-                Err(err) => (false, format!("activation failed: {}", err.message())),
+                Ok(Ok(done)) => (done.is_activated, done.status),
+                Ok(Err(err)) => (false, format!("activation failed: {}", err.message())),
+                Err(_) => (false, "activation did not finish in time".to_string()),
             };
+            // The guest wrote it, and every heartbeat carries it.
+            let status = crate::nodeapi::bounded(status, ACTIVATION_STATUS_MAX);
+            // Deleted, or replaced by another copy, while the guest worked.
+            if !manager.holds(&sandbox).await {
+                return;
+            }
             if let Some(activation) = sandbox.base_record.lock().unwrap().activation.as_mut() {
                 activation.is_activated = is_activated;
                 activation.status = status.clone();

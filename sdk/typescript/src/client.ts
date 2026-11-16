@@ -586,6 +586,7 @@ export class Burrow {
         value,
         allowedSandboxes: scope.sandboxes ?? [],
         allowedTags: scope.tags ?? [],
+        isProductKey: scope.productKey ?? false,
       },
       scope.timeoutMs,
       scope.signal,
@@ -605,6 +606,7 @@ export class Burrow {
       scope: {
         sandboxes: [...(secret.allowedSandboxes ?? [])],
         tags: [...(secret.allowedTags ?? [])],
+        productKey: secret.isProductKey ?? false,
       },
     }));
   }
