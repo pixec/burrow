@@ -647,6 +647,166 @@ const ACTIVATION_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(3
 /// The most of an activation status a sandbox's record keeps.
 const ACTIVATION_STATUS_MAX: usize = 512;
 
+/// The vCPUs a guest of `vcpus` boots able to take: up to the node's CPU
+/// count where the hypervisor hotplugs them. It costs the guest a few per-CPU
+/// areas for each possible vCPU and the VMM nothing until one is plugged.
+fn max_vcpus(hypervisor: Hypervisor, vcpus: u32) -> u32 {
+    match hypervisor.capabilities().is_vcpu_hotplug_supported {
+        true => std::thread::available_parallelism()
+            .map_or(vcpus, |n| n.get() as u32)
+            .clamp(vcpus, crate::nodeapi::MAX_VCPUS),
+        false => vcpus,
+    }
+}
+
+/// The machine a restore brings a sandbox back as, which only a change made
+/// once it runs can move.
+#[derive(Debug, Clone, Copy)]
+struct RestoredShape {
+    hypervisor: Hypervisor,
+    guest_os: burrow_vmm::GuestOs,
+    vcpus: u32,
+    max_vcpus: u32,
+    mem_mib: u32,
+    boot_mem_mib: u32,
+    max_mem_mib: u32,
+    disk_mib: u32,
+    /// The host CPU it is capped at or reserved, in thousandths, which its
+    /// vCPUs may not go below.
+    cpu_floor_millis: u64,
+}
+
+/// What a restored sandbox is changed to once it runs; each field set differs
+/// from the shape it restored at.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct Reshape {
+    vcpus: Option<u32>,
+    mem_mib: Option<u32>,
+    disk_mib: Option<u32>,
+}
+
+impl Reshape {
+    fn is_empty(&self) -> bool {
+        *self == Self::default()
+    }
+
+    /// `resources` as they are once the change is made.
+    fn applied(&self, mut resources: common::ResourcePolicy) -> common::ResourcePolicy {
+        resources.vcpus = self.vcpus.unwrap_or(resources.vcpus);
+        resources.mem_mib = self.mem_mib.unwrap_or(resources.mem_mib);
+        resources.disk_mib = self.disk_mib.unwrap_or(resources.disk_mib);
+        resources
+    }
+}
+
+/// The change from `from` to `wanted` that a restored guest can take while it
+/// runs, or why it cannot: memory moves only within the virtio-mem region it
+/// restored with, a disk only grows, and vCPUs change only where the
+/// hypervisor hotplugs them. A field of 0 keeps what `from` has.
+#[allow(clippy::result_large_err)]
+fn plan_reshape(
+    what: &str,
+    from: &RestoredShape,
+    wanted: &common::ResourcePolicy,
+) -> Result<Reshape, Status> {
+    let pick = |want: u32, current: u32| (want != 0 && want != current).then_some(want);
+    let reshape = Reshape {
+        vcpus: pick(wanted.vcpus, from.vcpus),
+        mem_mib: pick(wanted.mem_mib, from.mem_mib),
+        disk_mib: pick(wanted.disk_mib, from.disk_mib),
+    };
+    if wanted.max_mem_mib != 0 && wanted.max_mem_mib != from.max_mem_mib {
+        return Err(Status::invalid_argument(format!(
+            "{what} keeps the max_mem_mib it restores with, {} MiB; leave max_mem_mib unset",
+            from.max_mem_mib
+        )));
+    }
+    if reshape.is_empty() {
+        return Ok(reshape);
+    }
+    if from.guest_os != burrow_vmm::GuestOs::Linux {
+        return Err(Status::failed_precondition(format!(
+            "{what} restores a {} guest at {} vcpu / {} MiB / {} MiB disk, and a {} guest's \
+             machine cannot change while it runs; leave vcpus, mem_mib and disk_mib unset",
+            from.guest_os, from.vcpus, from.mem_mib, from.disk_mib, from.guest_os
+        )));
+    }
+    let capabilities = from.hypervisor.capabilities();
+    if let Some(mib) = reshape.disk_mib {
+        if mib < from.disk_mib {
+            return Err(Status::failed_precondition(format!(
+                "{what} restores a {} MiB disk, and a running guest's disk only grows; ask for \
+                 at least {} MiB",
+                from.disk_mib, from.disk_mib
+            )));
+        }
+        if !capabilities.is_live_disk_growth_supported {
+            return Err(Status::failed_precondition(format!(
+                "{} cannot grow a running guest's disk; {what} keeps its {} MiB",
+                from.hypervisor, from.disk_mib
+            )));
+        }
+    }
+    if let Some(vcpus) = reshape.vcpus {
+        if !capabilities.is_vcpu_hotplug_supported {
+            return Err(Status::failed_precondition(format!(
+                "{} on this node cannot change a running guest's vCPUs; {what} keeps its {}",
+                from.hypervisor, from.vcpus
+            )));
+        }
+        if vcpus > from.max_vcpus {
+            return Err(Status::failed_precondition(format!(
+                "{what} restores a guest that can take up to {} vCPUs; {vcpus} were asked for",
+                from.max_vcpus
+            )));
+        }
+        if from.cpu_floor_millis > u64::from(vcpus) * 1000 {
+            return Err(Status::failed_precondition(format!(
+                "{what} is capped at or reserved {} cpus, more than {vcpus} vcpus; lower its \
+                 cpus or reserved_cpus with them",
+                cpus_text(from.cpu_floor_millis)
+            )));
+        }
+    }
+    if let Some(mib) = reshape.mem_mib {
+        let region = hotplug_region(
+            from.hypervisor,
+            from.guest_os,
+            from.boot_mem_mib,
+            from.max_mem_mib,
+        );
+        if region == 0 {
+            return Err(Status::failed_precondition(format!(
+                "{what} restores a guest with no room to plug memory into; it keeps its {} MiB",
+                from.mem_mib
+            )));
+        }
+        if mib < from.boot_mem_mib {
+            return Err(Status::failed_precondition(format!(
+                "{what} restores a guest that booted with {} MiB, and a running guest cannot go \
+                 below the memory it booted with",
+                from.boot_mem_mib
+            )));
+        }
+        if mib > from.max_mem_mib {
+            return Err(Status::failed_precondition(format!(
+                "{what} restores a guest that can grow to {} MiB while it runs (its \
+                 max_mem_mib); {mib} MiB was asked for",
+                from.max_mem_mib
+            )));
+        }
+        if !(mib - from.boot_mem_mib).is_multiple_of(burrow_vmm::MEMORY_BLOCK_MIB) {
+            return Err(Status::invalid_argument(format!(
+                "a running guest's memory moves in steps of {} MiB above the {} MiB it booted \
+                 with",
+                burrow_vmm::MEMORY_BLOCK_MIB,
+                from.boot_mem_mib
+            )));
+        }
+    }
+    Ok(reshape)
+}
+
 /// How long a macOS guest gets to resize its APFS container, which takes
 /// minutes on a busy Mac; the sandbox's own client gives up after the agent
 /// timeout.
@@ -1727,6 +1887,30 @@ impl RunningSandbox {
     }
 
     /// vCPUs this sandbox is promised, whether or not its VMM is running.
+    /// The machine a restore of this sandbox's state comes back as.
+    fn restored_shape(&self) -> RestoredShape {
+        let (max_vcpus, cpu_floor_millis) = {
+            let spec = self.spec.lock().unwrap();
+            (
+                spec.max_vcpus,
+                spec.limits
+                    .cpu_max_millis
+                    .max(spec.limits.cpu_reserve_millis),
+            )
+        };
+        RestoredShape {
+            hypervisor: self.hypervisor,
+            guest_os: self.guest_os(),
+            vcpus: self.vcpus(),
+            max_vcpus,
+            mem_mib: self.mem_mib(),
+            boot_mem_mib: self.boot_mem_mib(),
+            max_mem_mib: self.max_mem_mib(),
+            disk_mib: self.disk_mib(),
+            cpu_floor_millis,
+        }
+    }
+
     pub fn vcpus(&self) -> u32 {
         self.spec.lock().unwrap().vcpus
     }
@@ -7730,13 +7914,8 @@ impl SandboxManager {
         spec.guest_os = guest_os;
         let capabilities = hypervisor.capabilities();
         spec.vcpus = resources.vcpus.max(1);
-        // Room to hotplug up to the node's CPU count. It costs the guest a
-        // few per-CPU areas for each possible vCPU and the VMM nothing until
-        // one is plugged.
         if capabilities.is_vcpu_hotplug_supported {
-            spec.max_vcpus = std::thread::available_parallelism()
-                .map_or(spec.vcpus, |n| n.get() as u32)
-                .clamp(spec.vcpus, crate::nodeapi::MAX_VCPUS);
+            spec.max_vcpus = max_vcpus(hypervisor, spec.vcpus);
         }
         let mem_mib = if resources.mem_mib == 0 {
             DEFAULT_MEM_MIB
@@ -8987,10 +9166,9 @@ impl SandboxManager {
 
     /// Creates a sandbox by restoring a snapshot object.
     ///
-    /// The template and the machine shape come from the snapshot, for the same
-    /// reason a fork cannot change them: Firecracker takes a restored VM's
-    /// configuration from the snapshot, so a request that disagrees is refused
-    /// rather than quietly given something else.
+    /// The template comes from the snapshot, and the machine restores at the
+    /// shape it was taken with: a different shape is reached once it runs, as
+    /// a fork's is, and one it cannot reach that way is refused up front.
     ///
     /// Detached, as a create is.
     #[allow(clippy::too_many_arguments)]
@@ -9027,33 +9205,45 @@ impl SandboxManager {
         let manifest = self.snapshots.manifest_for_restore(snapshot_id).await?;
         let mut policy = policy;
         let wanted = policy.resources.clone().unwrap_or_default();
-        let shape = (
-            match wanted.vcpus {
-                0 => manifest.vcpus,
-                n => n,
-            },
-            match wanted.mem_mib {
-                0 => manifest.mem_mib,
-                n => n,
-            },
-            match wanted.disk_mib {
-                0 => manifest.disk_mib,
-                n => n,
-            },
-        );
-        if shape != (manifest.vcpus, manifest.mem_mib, manifest.disk_mib)
-            || wanted.max_mem_mib != 0 && wanted.max_mem_mib != manifest.max_mem_mib
+        let hypervisor = manifest.hypervisor()?;
+        // The vCPUs its VM booted able to take are in the snapshot's own
+        // state, which says nothing of them here, so none are added.
+        let from = RestoredShape {
+            hypervisor,
+            guest_os: burrow_vmm::GuestOs::from_record(&manifest.guest_os).unwrap_or_default(),
+            vcpus: manifest.vcpus,
+            max_vcpus: manifest.vcpus,
+            mem_mib: manifest.mem_mib,
+            boot_mem_mib: manifest.boot_mem_mib,
+            max_mem_mib: manifest.max_mem_mib,
+            disk_mib: manifest.disk_mib,
+            cpu_floor_millis: burrow_common::cpu::cap_millis(wanted.cpus)
+                .max(burrow_common::cpu::cap_millis(wanted.reserved_cpus)),
+        };
+        let reshape = plan_reshape(
+            &format!("a sandbox created from snapshot {snapshot_id}"),
+            &from,
+            &wanted,
+        )?;
+        if reshape.mem_mib.is_some_and(|mib| mib > from.mem_mib)
+            && let Some(why) = no_virtio_mem(&self.snapshots.path(snapshot_id)).await
         {
-            return Err(Status::invalid_argument(format!(
-                "a sandbox created from snapshot {snapshot_id} restores its state and cannot \
-                 change its vcpus, memory or disk: the snapshot was taken with \
-                 {} vcpu / {} MiB / {} MiB disk; grow the disk once it runs",
-                manifest.vcpus, manifest.mem_mib, manifest.disk_mib
-            )));
+            return Err(Status::failed_precondition(why));
         }
         // Written back so the record, the cgroup and any later restore all
-        // describe the machine the snapshot actually holds.
+        // describe the machine the snapshot actually holds, until the
+        // reshape below moves it.
         policy.resources = Some(manifest.resources(policy.resources.take().unwrap_or_default()));
+        let shape = policy.resources.clone().unwrap_or_default();
+        let growth = self
+            .admit_growth(
+                &node_id,
+                "create a sandbox from a snapshot",
+                hypervisor,
+                &shape,
+                &reshape.applied(shape.clone()),
+            )
+            .await?;
 
         {
             let sandboxes = self.sandboxes.lock().await;
@@ -9090,8 +9280,13 @@ impl SandboxManager {
             Err(_) => Ok(()),
         };
         self.creating.lock().await.remove(&id);
-        let (sandbox, _disk) = provisioned?;
+        let (sandbox, disk) = provisioned?;
         registered?;
+        drop(disk);
+        if let Err(err) = self.apply_reshape(&sandbox, reshape, growth).await {
+            self.discard_restored(&sandbox).await;
+            return Err(err);
+        }
 
         self.emit_behind(&sandbox, EVENT_CREATED, &format!("snapshot:{snapshot_id}"));
         self.open_session_behind(&sandbox, STARTED_RESTORE, None);
@@ -9112,9 +9307,30 @@ impl SandboxManager {
     ///
     /// The child is built by restoring the copied snapshot rather than booting:
     /// the point of a fork is to arrive with the source's processes and memory,
-    /// which a cold boot would discard.
-    #[tracing::instrument(skip_all, fields(source = %source_id, sandbox = %child_id))]
+    /// which a cold boot would discard. It restores at the source's shape and
+    /// is resized live to the one asked for before it is handed back.
+    ///
+    /// Detached, as a create is: a caller that gives up mid-resize leaves no
+    /// child half made.
     pub async fn fork(
+        &self,
+        source_id: &str,
+        child_id: String,
+        policy: Option<common::Policy>,
+        node_id: String,
+        name: String,
+    ) -> Result<common::Sandbox, Status> {
+        let source_id = source_id.to_string();
+        self.detached(move |manager| async move {
+            manager
+                .fork_now(&source_id, child_id, policy, node_id, name)
+                .await
+        })
+        .await
+    }
+
+    #[tracing::instrument(skip_all, fields(source = %source_id, sandbox = %child_id))]
+    async fn fork_now(
         &self,
         source_id: &str,
         child_id: String,
@@ -9146,12 +9362,17 @@ impl SandboxManager {
         // The child has its own address and its own policy, neither of which
         // the ruleset knows about until now.
         let registered = match &forked {
-            Ok((sandbox, _)) => self.register_or_discard(sandbox).await,
+            Ok((sandbox, ..)) => self.register_or_discard(sandbox).await,
             Err(_) => Ok(()),
         };
         self.creating.lock().await.remove(&child_id);
-        let (sandbox, _disk) = forked?;
+        let (sandbox, disk, growth, reshape) = forked?;
         registered?;
+        drop(disk);
+        if let Err(err) = self.apply_reshape(&sandbox, reshape, growth).await {
+            self.discard_restored(&sandbox).await;
+            return Err(err);
+        }
 
         self.emit_behind(&sandbox, EVENT_CREATED, &format!("fork:{source_id}"));
         self.open_session_behind(&sandbox, STARTED_RESTORE, None);
@@ -9164,35 +9385,16 @@ impl SandboxManager {
         Ok(record)
     }
 
-    /// The part of a fork that runs with the child's id already claimed.
-    async fn fork_inner(
-        &self,
-        source: &Arc<RunningSandbox>,
-        child_id: String,
+    /// The child's policy and tags: the source's, with each section an
+    /// override names replaced, and the machine shape it asked for apart.
+    fn fork_policy(
+        source: &RunningSandbox,
         policy: Option<common::Policy>,
-        node_id: String,
-        name: String,
-    ) -> Result<(Arc<RunningSandbox>, Admitted), Status> {
-        // A running source has state in memory that its snapshot does not
-        // hold; capturing it is the whole difference between forking a sandbox
-        // and cloning its last suspend.
-        let capture = source.workdir.join(format!(".capture-{child_id}"));
-        let is_captured = source.is_running();
-        // Not synced: the source runs on with its page cache, and the child
-        // restores the memory that holds it with the disk cloned beside it,
-        // so neither depends on the guest having written it back. On
-        // Firecracker, whose disks are cached on the host, a sync is a host
-        // fsync that waits behind every other write on the data directory.
-        if is_captured {
-            self.write_state(source, Some(&capture), &[], false).await?;
-        } else if source.state.load(std::sync::atomic::Ordering::Relaxed)
-            != common::SandboxState::Suspended as i32
-        {
-            return Err(Status::failed_precondition(
-                "only a running or suspended sandbox can be forked",
-            ));
-        }
-
+    ) -> (
+        common::Policy,
+        Option<common::ResourcePolicy>,
+        HashMap<String, String>,
+    ) {
         let (mut inherited, tags) = {
             let record = source.base_record.lock().unwrap();
             (
@@ -9208,26 +9410,11 @@ impl SandboxManager {
         inherited.volumes.clear();
         // Inherited unless overridden, including the network policy and the
         // tags: a fork is meant to be the same sandbox again.
-        let policy = match policy {
-            None => inherited,
+        match policy {
+            None => (inherited, None, tags),
             Some(mut over) => {
-                let shape = inherited.resources.clone().unwrap_or_default();
-                let wanted = over.resources.clone().unwrap_or_else(|| shape.clone());
-                // Firecracker takes a restored VM's machine configuration from
-                // the snapshot, and the child's root disk is a copy of the
-                // source's. A shape the fork cannot honour is refused rather
-                // than accepted and quietly ignored.
-                if (wanted.vcpus, wanted.mem_mib, wanted.disk_mib)
-                    != (shape.vcpus, shape.mem_mib, shape.disk_mib)
-                    || wanted.max_mem_mib != 0 && wanted.max_mem_mib != shape.max_mem_mib
-                {
-                    let _ = tokio::fs::remove_file(&capture).await;
-                    return Err(Status::invalid_argument(
-                        "a fork restores the source's snapshot and cannot change its \
-                         vcpus, memory or disk",
-                    ));
-                }
-                over.resources = Some(shape);
+                let wanted = over.resources.take();
+                over.resources = inherited.resources;
                 // Section by section, because the sections are independent
                 // policies that happen to travel together: a child given only
                 // an exec policy asked to change exec, not to be stripped of
@@ -9235,12 +9422,147 @@ impl SandboxManager {
                 over.network = over.network.or(inherited.network);
                 over.exec = over.exec.or(inherited.exec);
                 over.fs = over.fs.or(inherited.fs);
+                over.lifetime = over.lifetime.or(inherited.lifetime);
+                over.snapshots = over.snapshots.or(inherited.snapshots);
+                over.is_console_verbose |= inherited.is_console_verbose;
                 if over.networks.is_empty() {
                     over.networks = inherited.networks;
                 }
-                over
+                (over, wanted, tags)
             }
+        }
+    }
+
+    /// Holds what a restored sandbox grows by once it runs, from `from` to
+    /// `to`, refusing a node without room for it before anything is restored.
+    async fn admit_growth(
+        &self,
+        node_id: &str,
+        what: &str,
+        hypervisor: Hypervisor,
+        from: &common::ResourcePolicy,
+        to: &common::ResourcePolicy,
+    ) -> Result<Admitted, Status> {
+        let cap = |mib: u32| self.config.memory_ceiling_mib(hypervisor, mib);
+        self.admit_memory(cap(from.mem_mib), cap(to.mem_mib))?;
+        Ok(Admitted {
+            _disk: self
+                .admit_disk(
+                    node_id,
+                    what,
+                    u64::from(to.disk_mib.saturating_sub(from.disk_mib)) * burrow_common::disk::MIB,
+                )
+                .await?,
+            _cpu: self
+                .hold_cpu(charge_of(to).saturating_sub(charge_of(from)))
+                .await?,
+        })
+    }
+
+    /// Makes a restored sandbox the shape it was asked for, through the
+    /// resize a running sandbox takes. Anything short of the whole change
+    /// done live is a failure.
+    /// `growth` holds what it grows by until the resize takes it again.
+    async fn apply_reshape(
+        &self,
+        sandbox: &Arc<RunningSandbox>,
+        reshape: Reshape,
+        growth: Admitted,
+    ) -> Result<(), Status> {
+        if reshape.is_empty() {
+            return Ok(());
+        }
+        let id = sandbox.id();
+        // A guest that never woke takes no memory or vCPUs, and its device
+        // requests would be left waiting on it.
+        sandbox.await_handshake().await?;
+        drop(growth);
+        if let Some(mib) = reshape.disk_mib {
+            let (change, _, reason) = self.resize_disk(sandbox, mib).await?;
+            if !matches!(change, ResourceChange::Live | ResourceChange::Unchanged) {
+                return Err(Status::failed_precondition(format!(
+                    "sandbox {id}'s disk could not grow to {mib} MiB while it runs: {reason}"
+                )));
+            }
+        }
+        if reshape.vcpus.is_none() && reshape.mem_mib.is_none() {
+            return Ok(());
+        }
+        let limits = sandbox.spec.lock().unwrap().limits.clone();
+        let (vcpus, mem_mib) = self
+            .reshape(
+                sandbox,
+                reshape.vcpus,
+                reshape.mem_mib,
+                limits.cpu_max_millis,
+                limits.cpu_reserve_millis,
+            )
+            .await?;
+        for (what, outcome) in [("vcpus", vcpus), ("memory", mem_mib)] {
+            if let Some(outcome) = outcome
+                && !matches!(
+                    ResourceChange::try_from(outcome.change),
+                    Ok(ResourceChange::Live | ResourceChange::Unchanged)
+                )
+            {
+                return Err(Status::failed_precondition(format!(
+                    "sandbox {id}'s {what} could not change from {} to the {} asked for while it \
+                     runs, reaching {}: {}",
+                    outcome.previous,
+                    match what {
+                        "vcpus" => reshape.vcpus,
+                        _ => reshape.mem_mib,
+                    }
+                    .unwrap_or_default(),
+                    outcome.value,
+                    outcome.reason
+                )));
+            }
+        }
+        Ok(())
+    }
+
+    /// Drops a restored sandbox whose change of shape failed, as though it
+    /// had never been made.
+    async fn discard_restored(&self, sandbox: &Arc<RunningSandbox>) {
+        self.sandboxes.lock().await.remove(sandbox.id());
+        if let Err(err) = self.tear_down(Arc::clone(sandbox)).await {
+            tracing::warn!(sandbox = sandbox.id(), %err, "could not release a sandbox whose resize failed");
+        }
+    }
+
+    /// The part of a fork that runs with the child's id already claimed.
+    async fn fork_inner(
+        &self,
+        source: &Arc<RunningSandbox>,
+        child_id: String,
+        policy: Option<common::Policy>,
+        node_id: String,
+        name: String,
+    ) -> Result<(Arc<RunningSandbox>, Admitted, Admitted, Reshape), Status> {
+        let is_captured = source.is_running();
+        if !is_captured
+            && source.state.load(std::sync::atomic::Ordering::Relaxed)
+                != common::SandboxState::Suspended as i32
+        {
+            return Err(Status::failed_precondition(
+                "only a running or suspended sandbox can be forked",
+            ));
+        }
+        let (policy, wanted, tags) = Self::fork_policy(source, policy);
+        // The child restores at the source's shape, which Firecracker takes
+        // from the snapshot, and is changed once it runs. Whatever cannot
+        // change then is refused here, before the source is paused.
+        let from = source.restored_shape();
+        let reshape = match &wanted {
+            Some(wanted) => plan_reshape("a fork", &from, wanted)?,
+            None => Reshape::default(),
         };
+        if reshape.mem_mib.is_some_and(|mib| mib > from.mem_mib)
+            && let Some(why) = no_virtio_mem(&source.workdir).await
+        {
+            return Err(Status::failed_precondition(why));
+        }
         if !self.inspection_ca_for(&policy).is_empty() {
             let parent = source
                 .base_record
@@ -9248,10 +9570,35 @@ impl SandboxManager {
                 .unwrap()
                 .inspection_root_fingerprint
                 .clone();
-            if let Err(err) = self.require_inspection_root(&child_id, &parent) {
-                let _ = tokio::fs::remove_file(&capture).await;
-                return Err(err);
-            }
+            self.require_inspection_root(&child_id, &parent)?;
+        }
+        let shape = common::ResourcePolicy {
+            vcpus: from.vcpus,
+            mem_mib: from.mem_mib,
+            disk_mib: from.disk_mib,
+            ..policy.resources.clone().unwrap_or_default()
+        };
+        let growth = self
+            .admit_growth(
+                &node_id,
+                "fork a sandbox",
+                source.hypervisor,
+                &shape,
+                &reshape.applied(shape.clone()),
+            )
+            .await?;
+
+        // A running source has state in memory that its snapshot does not
+        // hold; capturing it is the whole difference between forking a sandbox
+        // and cloning its last suspend.
+        let capture = source.workdir.join(format!(".capture-{child_id}"));
+        // Not synced: the source runs on with its page cache, and the child
+        // restores the memory that holds it with the disk cloned beside it,
+        // so neither depends on the guest having written it back. On
+        // Firecracker, whose disks are cached on the host, a sync is a host
+        // fsync that waits behind every other write on the data directory.
+        if is_captured {
+            self.write_state(source, Some(&capture), &[], false).await?;
         }
         let restored = self
             .provision_restored(
@@ -9265,7 +9612,8 @@ impl SandboxManager {
             )
             .await;
         let _ = tokio::fs::remove_file(&capture).await;
-        restored
+        let (sandbox, admitted) = restored?;
+        Ok((sandbox, admitted, growth, reshape))
     }
 
     /// Builds a VM that starts by restoring state rather than booting: its own
@@ -12285,6 +12633,125 @@ pub(crate) mod tests {
             cgroup_limits(&common::ResourcePolicy::default(), 640).cpu_weight,
             burrow_common::cpu::shares_to_weight(1024)
         );
+    }
+
+    fn restored(hypervisor: Hypervisor) -> RestoredShape {
+        RestoredShape {
+            hypervisor,
+            guest_os: burrow_vmm::GuestOs::Linux,
+            vcpus: 1,
+            max_vcpus: 4,
+            mem_mib: 512,
+            boot_mem_mib: 512,
+            max_mem_mib: 8192,
+            disk_mib: 2048,
+            cpu_floor_millis: 0,
+        }
+    }
+
+    fn wanted(vcpus: u32, mem_mib: u32, disk_mib: u32) -> common::ResourcePolicy {
+        common::ResourcePolicy {
+            vcpus,
+            mem_mib,
+            disk_mib,
+            ..Default::default()
+        }
+    }
+
+    /// A restored guest is resized to what it can take while it runs: more
+    /// memory within its region, a bigger disk, and vCPUs where they hotplug.
+    #[test]
+    fn a_restore_reshapes_what_a_running_guest_can_take() {
+        let fc = restored(Hypervisor::Firecracker);
+        assert_eq!(
+            plan_reshape("a fork", &fc, &wanted(0, 0, 0)).unwrap(),
+            Reshape::default()
+        );
+        assert_eq!(
+            plan_reshape("a fork", &fc, &wanted(1, 512, 2048)).unwrap(),
+            Reshape::default()
+        );
+        assert_eq!(
+            plan_reshape("a fork", &fc, &wanted(0, 2048, 4096)).unwrap(),
+            Reshape {
+                mem_mib: Some(2048),
+                disk_mib: Some(4096),
+                ..Default::default()
+            }
+        );
+        let plugged = RestoredShape {
+            mem_mib: 2048,
+            ..fc
+        };
+        assert_eq!(
+            plan_reshape("a fork", &plugged, &wanted(0, 1024, 0)).unwrap(),
+            Reshape {
+                mem_mib: Some(1024),
+                ..Default::default()
+            }
+        );
+        let ch = restored(Hypervisor::CloudHypervisor);
+        let vcpus = plan_reshape("a fork", &ch, &wanted(4, 0, 0));
+        match Hypervisor::CloudHypervisor
+            .capabilities()
+            .is_vcpu_hotplug_supported
+        {
+            true => assert_eq!(vcpus.unwrap().vcpus, Some(4)),
+            false => assert_eq!(vcpus.unwrap_err().code(), tonic::Code::FailedPrecondition),
+        }
+    }
+
+    /// What only a boot could give is refused before anything is restored.
+    #[test]
+    fn a_restore_refuses_what_a_running_guest_cannot_take() {
+        let fc = restored(Hypervisor::Firecracker);
+        let refused = |from: &RestoredShape, want: common::ResourcePolicy| {
+            plan_reshape("a fork", from, &want).unwrap_err().code()
+        };
+        let precondition = tonic::Code::FailedPrecondition;
+        assert_eq!(refused(&fc, wanted(2, 0, 0)), precondition);
+        assert_eq!(refused(&fc, wanted(0, 8194, 0)), precondition);
+        assert_eq!(refused(&fc, wanted(0, 256, 0)), precondition);
+        assert_eq!(refused(&fc, wanted(0, 0, 1024)), precondition);
+        assert_eq!(
+            refused(&fc, wanted(0, 513, 0)),
+            tonic::Code::InvalidArgument
+        );
+        assert_eq!(
+            refused(
+                &fc,
+                common::ResourcePolicy {
+                    max_mem_mib: 4096,
+                    ..Default::default()
+                }
+            ),
+            tonic::Code::InvalidArgument
+        );
+        let unplugged = RestoredShape {
+            max_mem_mib: 512,
+            ..fc
+        };
+        assert_eq!(refused(&unplugged, wanted(0, 1024, 0)), precondition);
+        let ch = RestoredShape {
+            max_vcpus: 2,
+            ..restored(Hypervisor::CloudHypervisor)
+        };
+        assert_eq!(refused(&ch, wanted(4, 0, 0)), precondition);
+        let capped = RestoredShape {
+            vcpus: 4,
+            cpu_floor_millis: 3000,
+            ..restored(Hypervisor::CloudHypervisor)
+        };
+        assert_eq!(refused(&capped, wanted(2, 0, 0)), precondition);
+        for guest_os in [burrow_vmm::GuestOs::Windows, burrow_vmm::GuestOs::MacOs] {
+            let other = RestoredShape { guest_os, ..fc };
+            assert_eq!(refused(&other, wanted(0, 1024, 0)), precondition);
+            assert_eq!(refused(&other, wanted(0, 0, 4096)), precondition);
+            assert_eq!(
+                plan_reshape("a fork", &other, &wanted(1, 512, 2048)).unwrap(),
+                Reshape::default()
+            );
+        }
     }
 
     /// A sandbox grows to 16 times its memory by default, within the node's

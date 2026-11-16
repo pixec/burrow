@@ -394,6 +394,11 @@ impl SnapshotStore {
         self.root.join(id)
     }
 
+    /// Where snapshot `id` is on this node, whether or not it is there.
+    pub fn path(&self, id: &str) -> PathBuf {
+        self.dir(id)
+    }
+
     /// A directory to assemble a snapshot in, beside the store it will join.
     ///
     /// Beside rather than in `/tmp`: the rename that publishes it has to be
