@@ -90,16 +90,17 @@ fn is_current_format(text: &str) -> bool {
 /// the first call into the guest.
 const AGENT_FILE: &str = "agent";
 
-/// The digest of the agent this node ships, set once at startup. Unset, any
-/// agent is current.
-static AGENT: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+/// The digests of the agents this node ships, one per guest OS, set once at
+/// startup. Unset, any agent is current. A guest runs only its own OS's
+/// agent, so a snapshot built with any of them was built with its own's.
+static AGENTS: std::sync::OnceLock<Vec<String>> = std::sync::OnceLock::new();
 
-pub fn set_agent(digest: String) {
-    let _ = AGENT.set(digest);
+pub fn set_agents(digests: Vec<String>) {
+    let _ = AGENTS.set(digests);
 }
 
-fn agent() -> Option<&'static str> {
-    AGENT.get().map(String::as_str)
+fn agent() -> Option<&'static [String]> {
+    AGENTS.get().map(Vec::as_slice)
 }
 
 /// Pages a restore of this snapshot touches first, recorded once when the
@@ -371,7 +372,7 @@ impl Warm {
 
 /// The snapshot in `dir`, if it is complete, in the current format, of its
 /// template's kernel and, when `agent` is given, built with that agent.
-async fn read_warm(dir: &Path, agent: Option<&str>) -> Option<Warm> {
+async fn read_warm(dir: &Path, agents: Option<&[String]>) -> Option<Warm> {
     use std::os::unix::fs::MetadataExt as _;
 
     let hypervisor: Hypervisor = tokio::fs::read_to_string(dir.join(HYPERVISOR_FILE))
@@ -384,9 +385,9 @@ async fn read_warm(dir: &Path, agent: Option<&str>) -> Option<Warm> {
     if !is_current_format(&format) {
         return None;
     }
-    if let Some(agent) = agent {
+    if let Some(agents) = agents {
         let built_with = tokio::fs::read_to_string(dir.join(AGENT_FILE)).await.ok()?;
-        if built_with.trim() != agent {
+        if !agents.iter().any(|agent| agent == built_with.trim()) {
             return None;
         }
     }
@@ -464,8 +465,8 @@ pub async fn find_broken(
     is_broken(&dir, agent()).await.then_some(dir)
 }
 
-async fn is_broken(dir: &Path, agent: Option<&str>) -> bool {
-    tokio::fs::try_exists(dir).await.unwrap_or(false) && read_warm(dir, agent).await.is_none()
+async fn is_broken(dir: &Path, agents: Option<&[String]>) -> bool {
+    tokio::fs::try_exists(dir).await.unwrap_or(false) && read_warm(dir, agents).await.is_none()
 }
 
 /// Removes the snapshot in `dir` if it is still broken once no build is
@@ -1084,7 +1085,7 @@ async fn profile_restore(
                 &lease,
                 trust,
                 agent_timeout,
-                config.guest_upgrade.as_deref(),
+                config.upgrade_for(guest_os),
             )
             .await;
         }
@@ -1558,12 +1559,14 @@ mod shape_tests {
         let templates = temp("agent");
         let dir = warm_dir(&templates, "app").join("firecracker-1x512");
         write_snapshot(&dir, WARM_FORMAT, "1 512 1324 512");
-        assert!(read_warm(&dir, Some("new")).await.is_none());
+        let new = ["new".to_string()];
+        let both = ["windows".to_string(), "old".to_string()];
+        assert!(read_warm(&dir, Some(&new)).await.is_none());
         std::fs::write(dir.join(AGENT_FILE), "old\n").unwrap();
-        assert!(read_warm(&dir, Some("new")).await.is_none());
-        assert!(is_broken(&dir, Some("new")).await);
-        assert!(read_warm(&dir, Some("old")).await.is_some());
-        assert!(!is_broken(&dir, Some("old")).await);
+        assert!(read_warm(&dir, Some(&new)).await.is_none());
+        assert!(is_broken(&dir, Some(&new)).await);
+        assert!(read_warm(&dir, Some(&both)).await.is_some());
+        assert!(!is_broken(&dir, Some(&both)).await);
         let _ = std::fs::remove_dir_all(&templates);
     }
 

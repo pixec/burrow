@@ -41,9 +41,11 @@ jobs:
           - arch: x86_64
             docker_arch: amd64
             target: x86_64-unknown-linux-musl
+            windows_target: x86_64-pc-windows-gnullvm
           - arch: aarch64
             docker_arch: arm64
             target: aarch64-unknown-linux-musl
+            windows_target: aarch64-pc-windows-gnullvm
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
 
@@ -80,7 +82,7 @@ jobs:
           python3 -m pip install ziglang==0.13.0
           command -v cargo-zigbuild >/dev/null || \
             cargo install cargo-zigbuild --locked --version 0.19.8
-          rustup target add ${{ matrix.target }}
+          rustup target add ${{ matrix.target }} ${{ matrix.windows_target }}
 
       # The tag is the version, so the binaries report it too: `burrow
       # --version` on a v0.2.0 download must not say 0.1.0 because nobody
@@ -107,9 +109,11 @@ jobs:
         run: |
           cargo zigbuild --release --target ${{ matrix.target }} \
             -p burrow-orchestrator -p burrow-daemon -p burrow-cli -p burrow-guest
+          cargo zigbuild --release --target ${{ matrix.windows_target }} -p burrow-guest
 
-      # Two layouts of the same four binaries: dist/<docker-arch>/ is what the
-      # Dockerfiles COPY from, and release/ is what people download.
+      # Two layouts of the same binaries: dist/<docker-arch>/ is what the
+      # Dockerfiles COPY from, and release/ is what people download. The
+      # Windows agent goes to nodes, which upgrade Windows guests to it.
       - name: Stage
         run: |
           set -eu
@@ -119,6 +123,9 @@ jobs:
             cp "$out/$bin" "dist/${{ matrix.docker_arch }}/$bin"
             cp "$out/$bin" "release/$bin-${{ matrix.arch }}-${{ steps.version.outputs.version }}"
           done
+          exe=target/${{ matrix.windows_target }}/release/burrow-guest.exe
+          cp "$exe" "dist/${{ matrix.docker_arch }}/burrow-guest.exe"
+          cp "$exe" "release/burrow-guest-windows-${{ matrix.arch }}-${{ steps.version.outputs.version }}.exe"
           cd release && sha256sum * > "SHA256SUMS-${{ matrix.arch }}-${{ steps.version.outputs.version }}"
 
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4

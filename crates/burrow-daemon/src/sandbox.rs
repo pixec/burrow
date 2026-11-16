@@ -254,9 +254,9 @@ pub struct NodeConfig {
     pub firecracker_version: String,
     /// What the Cloud Hypervisor binary reports, for the same reason.
     pub cloud_hypervisor_version: String,
-    /// The agent this node ships. A guest found running another build on
-    /// handshake is upgraded to it in place.
-    pub guest_upgrade: Option<Arc<guestconn::GuestUpgrade>>,
+    /// The agents this node ships, one per guest OS. A guest found running
+    /// another build on handshake is upgraded to its OS's in place.
+    pub guest_upgrades: Vec<Arc<guestconn::GuestUpgrade>>,
     /// What lifecycle calls do while the orchestrator cannot acknowledge
     /// events.
     pub event_delivery: crate::delivery::Policy,
@@ -289,9 +289,10 @@ impl NodeConfig {
         &self,
         guest_os: burrow_vmm::GuestOs,
     ) -> Option<&guestconn::GuestUpgrade> {
-        self.guest_upgrade
-            .as_deref()
-            .filter(|upgrade| upgrade.guest_os == guest_os)
+        self.guest_upgrades
+            .iter()
+            .map(Arc::as_ref)
+            .find(|upgrade| upgrade.guest_os == guest_os)
     }
 
     pub(crate) fn templates_dir(&self) -> PathBuf {
@@ -1127,11 +1128,7 @@ fn spawn_handshake(
     // Weak: a sandbox deleted while its guest is still waking must not be kept
     // alive by the task that was going to talk to it.
     let weak = Arc::downgrade(sandbox);
-    let upgrade = manager
-        .config
-        .guest_upgrade
-        .clone()
-        .filter(|upgrade| upgrade.guest_os == sandbox.guest_os());
+    let upgrade = manager.config.upgrade_for(sandbox.guest_os()).cloned();
     tokio::spawn(async move {
         let began = std::time::Instant::now();
         // Which step the deadline caught, so a guest that never came up says
@@ -1157,7 +1154,7 @@ fn spawn_handshake(
             *reached.lock().unwrap() = Reached::Accepted;
             *step.lock().unwrap() = "waiting for the agent to answer the handshake";
             let (mut agent, response) =
-                guestconn::handshake_upgrading(agent, guest, request, upgrade.as_deref(), timeout)
+                guestconn::handshake_upgrading(agent, guest, request, upgrade.as_ref(), timeout)
                     .await?;
             *reached.lock().unwrap() = Reached::Answered;
             phases.lock().unwrap().mark("handshake");
@@ -5918,7 +5915,7 @@ impl SandboxManager {
                      down (`burrow shutdown {id}`), resize it, and boot it"
                 )));
             }
-            let Some(upgrade) = self.config.guest_upgrade.as_ref() else {
+            let Some(upgrade) = self.config.upgrade_for(burrow_vmm::GuestOs::Linux) else {
                 return Err(Status::failed_precondition(
                     "this node has no guest agent to boot a resize helper with",
                 ));
@@ -12061,7 +12058,7 @@ pub(crate) mod tests {
                 store_vault: None,
                 firecracker_version: String::new(),
                 cloud_hypervisor_version: String::new(),
-                guest_upgrade: None,
+                guest_upgrades: Vec::new(),
                 event_delivery: Default::default(),
                 disk: crate::diskcap::DiskPolicy {
                     reserve_mib: Some(0),

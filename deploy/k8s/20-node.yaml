@@ -61,6 +61,8 @@ spec:
             - /var/lib/burrow
             - --guest-binary
             - /burrow/bin/burrow-guest
+            - --guest-binary-windows
+            - /burrow/bin/burrow-guest.exe
             # Chroot each firecracker and drop it to an unprivileged uid. Worth
             # having on wherever sandboxes share a machine with anything else.
             - --jailer

@@ -384,6 +384,11 @@ pub struct ServeArgs {
     /// panics, so the agent is copied in as part of the conversion.
     #[arg(long, default_value = "/usr/local/bin/burrow-guest")]
     pub guest_binary: PathBuf,
+    /// The Windows build of the guest agent (`burrow-guest.exe`). A Windows
+    /// guest found running another build on handshake is upgraded to it in
+    /// place; without it, Windows guests keep the agent their image holds.
+    #[arg(long)]
+    pub guest_binary_windows: Option<PathBuf>,
     /// A guest kernel templates can be built with, as
     /// `NAME[@HYPERVISOR+HYPERVISOR]=PATH`, e.g.
     /// `ch-linux@cloud-hypervisor=/srv/kernels/vmlinux`. Repeatable.
@@ -1633,25 +1638,34 @@ pub async fn run(args: ServeArgs) -> anyhow::Result<()> {
     let hypervisors = offered_hypervisors(&args)?;
     #[cfg(target_os = "macos")]
     let vz_version = burrow_vmm::vz::host_version();
-    // Hashed once: every handshake compares the guest's agent against it, and
-    // a guest running another build is upgraded in place.
-    let guest_upgrade = Some(Arc::new(crate::guestconn::GuestUpgrade {
-        digest: crate::blobs::hash_file(&args.guest_binary)
+    // Hashed once: every handshake compares the guest's agent against its
+    // OS's, and a guest running another build is upgraded in place.
+    let native_guest = if cfg!(target_os = "macos") {
+        burrow_vmm::GuestOs::MacOs
+    } else {
+        burrow_vmm::GuestOs::Linux
+    };
+    let mut guest_upgrades = Vec::new();
+    for (flag, path, guest_os) in [("--guest-binary", Some(&args.guest_binary), native_guest)]
+        .into_iter()
+        .chain([(
+            "--guest-binary-windows",
+            args.guest_binary_windows.as_ref(),
+            burrow_vmm::GuestOs::Windows,
+        )])
+    {
+        let Some(path) = path else { continue };
+        let digest = crate::blobs::hash_file(path)
             .await
-            .map_err(|err| {
-                anyhow::anyhow!("--guest-binary {}: {err}", args.guest_binary.display())
-            })?
-            .to_string(),
-        path: args.guest_binary.clone(),
-        guest_os: if cfg!(target_os = "macos") {
-            burrow_vmm::GuestOs::MacOs
-        } else {
-            burrow_vmm::GuestOs::Linux
-        },
-    }));
-    if let Some(upgrade) = &guest_upgrade {
-        crate::warm::set_agent(upgrade.digest.clone());
+            .map_err(|err| anyhow::anyhow!("{flag} {}: {err}", path.display()))?
+            .to_string();
+        guest_upgrades.push(Arc::new(crate::guestconn::GuestUpgrade {
+            path: path.clone(),
+            guest_os,
+            digest,
+        }));
     }
+    crate::warm::set_agents(guest_upgrades.iter().map(|u| u.digest.clone()).collect());
     let vmm_memory_overhead_mib: std::collections::HashMap<_, _> =
         args.vmm_memory_overheads.iter().copied().collect();
     node_info.vmm_memory_overhead_mib = hypervisors
@@ -1798,7 +1812,7 @@ pub async fn run(args: ServeArgs) -> anyhow::Result<()> {
             store_vault,
             firecracker_version,
             cloud_hypervisor_version,
-            guest_upgrade,
+            guest_upgrades,
             event_delivery: args.event_delivery,
             disk: crate::diskcap::DiskPolicy {
                 overcommit: args.disk_overcommit,

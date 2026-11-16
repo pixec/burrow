@@ -156,4 +156,5 @@ FROM base AS release
 ARG TARGETARCH
 COPY dist/${TARGETARCH}/burrowd /burrow/bin/burrowd
 COPY dist/${TARGETARCH}/burrow-guest /burrow/bin/burrow-guest
+COPY dist/${TARGETARCH}/burrow-guest.exe /burrow/bin/burrow-guest.exe
 ENTRYPOINT ["/burrow/bin/burrowd"]
