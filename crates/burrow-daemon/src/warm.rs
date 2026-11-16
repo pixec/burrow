@@ -1239,6 +1239,25 @@ async fn profile_restore(
     outcome
 }
 
+/// Has the warm guest write back its page cache, so the disk published with
+/// the snapshot holds every write the guest has acknowledged.
+async fn sync_guest<T>(agent: &mut burrow_proto::guest::v1::guest_client::GuestClient<T>)
+where
+    T: tonic::client::GrpcService<tonic::body::Body>,
+    T::Error: Into<tonic::codegen::StdError>,
+    T::ResponseBody: tonic::codegen::Body<Data = tonic::codegen::Bytes> + Send + 'static,
+    <T::ResponseBody as tonic::codegen::Body>::Error: Into<tonic::codegen::StdError> + Send,
+{
+    use burrow_proto::guest::v1::{RootDiskRequest, root_disk_request::Op};
+    let request = RootDiskRequest {
+        op: Op::Sync as i32,
+        ..Default::default()
+    };
+    if let Err(err) = agent.root_disk(request).await {
+        tracing::warn!(%err, "could not sync the warm guest before snapshotting it");
+    }
+}
+
 async fn snapshot_when_ready(
     spec: VmSpec,
     agent_timeout: std::time::Duration,
@@ -1290,6 +1309,7 @@ async fn snapshot_when_ready(
     {
         tracing::warn!(%err, "could not clear the warm guest's network");
     }
+    sync_guest(&mut agent).await;
     drop(agent);
     if is_settled {
         settle(&vm).await;
@@ -1884,6 +1904,52 @@ mod shape_tests {
             Some(live)
         );
         let _ = std::fs::remove_dir_all(&templates);
+    }
+
+    /// Answers RootDisk, recording the op it was asked for.
+    #[derive(Clone, Default)]
+    struct RootDiskGuest(std::sync::Arc<std::sync::Mutex<Vec<i32>>>);
+
+    impl tower::Service<tonic::codegen::http::Request<tonic::body::Body>> for RootDiskGuest {
+        type Response = tonic::codegen::http::Response<tonic::body::Body>;
+        type Error = std::convert::Infallible;
+        type Future = tonic::codegen::BoxFuture<Self::Response, Self::Error>;
+
+        fn poll_ready(
+            &mut self,
+            _: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<Result<(), Self::Error>> {
+            std::task::Poll::Ready(Ok(()))
+        }
+
+        fn call(&mut self, req: tonic::codegen::http::Request<tonic::body::Body>) -> Self::Future {
+            struct RootDisk(std::sync::Arc<std::sync::Mutex<Vec<i32>>>);
+            impl tonic::server::UnaryService<burrow_proto::guest::v1::RootDiskRequest> for RootDisk {
+                type Response = burrow_proto::guest::v1::RootDiskResponse;
+                type Future = tonic::codegen::BoxFuture<tonic::Response<Self::Response>, Status>;
+                fn call(
+                    &mut self,
+                    req: tonic::Request<burrow_proto::guest::v1::RootDiskRequest>,
+                ) -> Self::Future {
+                    self.0.lock().unwrap().push(req.get_ref().op);
+                    Box::pin(async { Ok(tonic::Response::new(Default::default())) })
+                }
+            }
+            let ops = self.0.clone();
+            Box::pin(async move {
+                let mut grpc = tonic::server::Grpc::new(tonic::codec::ProstCodec::default());
+                Ok(grpc.unary(RootDisk(ops), req).await)
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn the_warm_guest_is_synced_before_its_snapshot() {
+        use burrow_proto::guest::v1::root_disk_request::Op;
+        let guest = RootDiskGuest::default();
+        let mut agent = burrow_proto::guest::v1::guest_client::GuestClient::new(guest.clone());
+        sync_guest(&mut agent).await;
+        assert_eq!(*guest.0.lock().unwrap(), vec![Op::Sync as i32]);
     }
 
     /// The bug this exists to prevent: a caller asking for more memory than
