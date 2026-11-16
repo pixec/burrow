@@ -237,7 +237,7 @@ mod tests {
     use super::*;
     use std::os::unix::fs::MetadataExt as _;
 
-    fn archive() -> Vec<u8> {
+    fn archive(owner: (u32, u32)) -> Vec<u8> {
         let mut builder = tar::Builder::new(Vec::new());
         let mut add = |name: &str,
                        kind: tar::EntryType,
@@ -251,8 +251,8 @@ mod tests {
             let mut header = tar::Header::new_gnu();
             header.set_entry_type(kind);
             header.set_mode(mode);
-            header.set_uid(0);
-            header.set_gid(0);
+            header.set_uid(owner.0.into());
+            header.set_gid(owner.1.into());
             header.set_size(body.len() as u64);
             match link {
                 Some(link) => builder.append_link(&mut header, name, link).unwrap(),
@@ -297,7 +297,9 @@ mod tests {
         std::fs::write(dest.join("app/link"), b"in the way").unwrap();
         std::fs::write(dest.join("app/other"), b"stays").unwrap();
 
-        let count = unpack(&dest, std::io::Cursor::new(archive())).unwrap();
+        let mine = std::fs::metadata(dest.join("app/other")).unwrap();
+        let archive = archive((mine.uid(), mine.gid()));
+        let count = unpack(&dest, std::io::Cursor::new(archive)).unwrap();
 
         assert_eq!(count, 4);
         let data = std::fs::metadata(dest.join("app/data")).unwrap();
