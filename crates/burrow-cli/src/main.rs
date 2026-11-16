@@ -333,6 +333,19 @@ enum Command {
         /// moved. Repeatable.
         #[arg(long = "node-label")]
         node_labels: Vec<String>,
+        /// vCPUs for the child, plugged in once it restores; only where the
+        /// hypervisor hotplugs them. Omitted keeps the source's.
+        #[arg(long)]
+        vcpus: Option<u32>,
+        /// Memory for the child: MiB, or a number with m or g. Plugged or
+        /// unplugged once it restores, within the source's max memory and
+        /// not below what it booted with. Omitted keeps the source's.
+        #[arg(long = "mem-mib", alias = "mem", value_parser = parse_size_mib)]
+        mem_mib: Option<u32>,
+        /// Root disk for the child: MiB, or a number with m or g. Grown once
+        /// it restores; never smaller than the source's.
+        #[arg(long = "disk-mib", alias = "disk", value_parser = parse_size_mib)]
+        disk_mib: Option<u32>,
     },
     /// Move a sandbox to another node through the object store. A running
     /// sandbox is suspended, carried over and resumed; it keeps its id, name
@@ -2214,6 +2227,9 @@ async fn main() -> anyhow::Result<()> {
             network,
             access,
             node_labels,
+            vcpus,
+            mem_mib,
+            disk_mib,
         } => {
             // Only an override the caller actually asked for: an unset flag
             // group means "inherit", not "no egress" and not "no access".
@@ -2221,12 +2237,20 @@ async fn main() -> anyhow::Result<()> {
                 .is_stated()
                 .then(|| network_policy(network))
                 .transpose()?;
-            let policy = (egress.is_some() || access.is_stated()).then(|| common::Policy {
-                network: egress,
-                exec: access.exec_policy(),
-                fs: access.fs_policy(),
-                ..Default::default()
-            });
+            let is_reshaped = vcpus.is_some() || mem_mib.is_some() || disk_mib.is_some();
+            let policy =
+                (egress.is_some() || access.is_stated() || is_reshaped).then(|| common::Policy {
+                    network: egress,
+                    exec: access.exec_policy(),
+                    fs: access.fs_policy(),
+                    resources: is_reshaped.then(|| common::ResourcePolicy {
+                        vcpus: vcpus.unwrap_or(0),
+                        mem_mib: mem_mib.unwrap_or(0),
+                        disk_mib: disk_mib.unwrap_or(0),
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                });
             let started = std::time::Instant::now();
             let sandbox = client
                 .fork_sandbox(api::ForkSandboxRequest {
