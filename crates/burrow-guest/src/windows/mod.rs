@@ -17,6 +17,8 @@ pub mod fs;
 #[cfg(windows)]
 mod handshake;
 #[cfg(windows)]
+pub mod machine;
+#[cfg(windows)]
 mod nt;
 #[cfg(windows)]
 mod process;

@@ -288,6 +288,7 @@ pub async fn handshake(
         agent_digest: self_digest().to_string(),
         features: features(),
         is_systemd_held: systemd::is_held(),
+        is_restarting: false,
     })
 }
 

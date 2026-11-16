@@ -346,8 +346,62 @@ const RECONNECT_ATTEMPT: std::time::Duration = std::time::Duration::from_secs(3)
 /// Each handshake names the agent it expects, and a systemd guest booting
 /// under another holds its systemd back until it is upgraded. One left on its
 /// own agent is handshaken again naming that one, which starts it.
+///
+/// A guest that restarts to take the name it was given, as a Windows guest
+/// does on its first boot, is waited out and handshaken again once.
 #[allow(clippy::result_large_err)]
 pub async fn handshake_upgrading(
+    agent: GuestClient<Channel>,
+    guest: GuestAddr,
+    request: guestpb::HandshakeRequest,
+    upgrade: Option<&GuestUpgrade>,
+    timeout: std::time::Duration,
+) -> Result<(GuestClient<Channel>, guestpb::HandshakeResponse), tonic::Status> {
+    let (agent, response) =
+        handshake_upgrading_once(agent, guest.clone(), request.clone(), upgrade, timeout).await?;
+    if !response.is_restarting {
+        return Ok((agent, response));
+    }
+    let started = std::time::Instant::now();
+    wait_until_gone(agent, timeout).await?;
+    let (agent, _) = connect_when_ready(guest.clone(), timeout)
+        .await
+        .map_err(|err| tonic::Status::internal(format!("the restarted guest: {err}")))?;
+    let (agent, response) =
+        handshake_upgrading_once(agent, guest, request, upgrade, timeout).await?;
+    tracing::info!(
+        took_ms = started.elapsed().as_millis() as u64,
+        "guest restarted to take its name"
+    );
+    if response.is_restarting {
+        return Err(tonic::Status::internal(
+            "the guest asked to restart again after restarting to take its name",
+        ));
+    }
+    Ok((agent, response))
+}
+
+/// Polls an agent that said it is restarting until it stops answering.
+async fn wait_until_gone(
+    mut agent: GuestClient<Channel>,
+    timeout: std::time::Duration,
+) -> Result<(), tonic::Status> {
+    let deadline = std::time::Instant::now() + timeout;
+    while std::time::Instant::now() < deadline {
+        tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+        let health = agent.health(guestpb::GuestHealthRequest {});
+        match tokio::time::timeout(RECONNECT_ATTEMPT, health).await {
+            Ok(Ok(_)) => continue,
+            Ok(Err(_)) | Err(_) => return Ok(()),
+        }
+    }
+    Err(tonic::Status::deadline_exceeded(
+        "the guest said it was restarting and kept answering",
+    ))
+}
+
+#[allow(clippy::result_large_err)]
+async fn handshake_upgrading_once(
     mut agent: GuestClient<Channel>,
     guest: GuestAddr,
     request: guestpb::HandshakeRequest,

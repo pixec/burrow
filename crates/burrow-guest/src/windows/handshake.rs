@@ -1,4 +1,4 @@
-//! The host's handshake, on Windows: clock, trust, network, volumes.
+//! The host's handshake, on Windows: clock, trust, network, volumes, name.
 //!
 //! Entropy: Windows has no call that credits outside entropy to the kernel's
 //! RNG the way Linux's `RNDADDENTROPY` does; `BCryptGenRandom` takes no seed.
@@ -64,6 +64,23 @@ pub async fn handshake(
     // the directory beneath instead.
     crate::windows::volumes::mount(&req.volumes).await?;
 
+    // A cold boot restarts to take its name; a restored guest takes it at
+    // its next boot rather than lose the state it was restored for.
+    let is_restarting = match req.hostname.as_str() {
+        _ if crate::windows::machine::is_restarting() => true,
+        "" => false,
+        name => match crate::windows::machine::rename(name) {
+            Ok(changed) => changed && !req.is_restored,
+            Err(err) => {
+                tracing::warn!(%err, "could not set the computer name");
+                false
+            }
+        },
+    };
+    if is_restarting && !crate::windows::machine::is_restarting() {
+        crate::windows::machine::restart_soon();
+    }
+
     let total = started.elapsed();
     let timing = guestpb::GuestResumeTiming {
         parked_us: arrival.map_or(0, |a| a.parked.as_micros() as u64),
@@ -84,6 +101,7 @@ pub async fn handshake(
         agent_digest: crate::windows::self_digest().to_string(),
         features: crate::windows::features(),
         is_systemd_held: false,
+        is_restarting,
     })
 }
 

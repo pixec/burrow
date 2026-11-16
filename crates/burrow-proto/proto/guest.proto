@@ -415,7 +415,10 @@ message HandshakeRequest {
   // first: a resumed guest has the devices but not the mounts, since a mount
   // does not survive the VM it was made in.
   repeated VolumeMount volumes = 7;
-  // The guest's hostname. Empty leaves it as it is.
+  // The guest's hostname. Empty leaves it as it is. A Windows guest takes it
+  // as its computer name, which applies at the next boot: a cold boot
+  // restarts once to take it (see HandshakeResponse.is_restarting), a
+  // restored guest keeps its old name until it is next booted.
   string hostname = 8;
   // SHA-256 of the agent the host ships, lowercase hex. A systemd guest whose
   // agent is another build answers without starting systemd, so that the host
@@ -543,6 +546,9 @@ message HandshakeResponse {
   // The guest's systemd has not started, because the request named another
   // agent than this one. A handshake naming this one starts it.
   bool is_systemd_held = 5;
+  // The guest restarts once this response is out, to boot under the name the
+  // request gave it. The host reconnects and handshakes again.
+  bool is_restarting = 6;
 }
 
 message UpgradeChunk {

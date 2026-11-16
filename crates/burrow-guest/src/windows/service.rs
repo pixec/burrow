@@ -58,6 +58,7 @@ const PRIVILEGES: &[&str] = &[
     "SeBackupPrivilege",
     "SeTakeOwnershipPrivilege",
     "SeCreateSymbolicLinkPrivilege",
+    "SeShutdownPrivilege",
 ];
 
 /// The SCM's handle on this service, once it is running as one.
@@ -242,6 +243,12 @@ fn run(is_service: bool) -> i32 {
         }
     };
     runtime.block_on(async {
+        // Running as far as the SCM is concerned while Setup finishes, which
+        // takes longer than it waits for a service to start.
+        set_state(SERVICE_RUNNING, 0, 0);
+        while !crate::windows::machine::is_setup_complete() {
+            tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+        }
         let listener = match vsock::listen_on(AGENT_PORT) {
             Ok(listener) => listener,
             Err(err) => {
@@ -249,7 +256,6 @@ fn run(is_service: bool) -> i32 {
                 return 1;
             }
         };
-        set_state(SERVICE_RUNNING, 0, 0);
         tracing::debug!(
             port = AGENT_PORT,
             version = VERSION,
