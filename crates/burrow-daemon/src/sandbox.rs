@@ -3511,6 +3511,21 @@ impl SandboxManager {
     }
 
     /// Writes a sandbox's current shape to the store.
+    /// Persists `sandbox` while this node still holds that very copy of it,
+    /// returning whether it did. Under the lock a delete takes it out with,
+    /// so its row is never written back after the delete removed it.
+    async fn persist_held(&self, sandbox: &Arc<RunningSandbox>) -> bool {
+        let sandboxes = self.sandboxes.lock().await;
+        if !sandboxes
+            .get(sandbox.id())
+            .is_some_and(|held| Arc::ptr_eq(held, sandbox))
+        {
+            return false;
+        }
+        self.persist(sandbox).await;
+        true
+    }
+
     async fn persist(&self, sandbox: &RunningSandbox) {
         let record = sandbox.record();
         let ports = self
@@ -5452,16 +5467,15 @@ impl SandboxManager {
             };
             // The guest wrote it, and every heartbeat carries it.
             let status = crate::nodeapi::bounded(status, ACTIVATION_STATUS_MAX);
-            // Deleted, or replaced by another copy, while the guest worked.
-            if !manager.holds(&sandbox).await {
-                return;
-            }
             if let Some(activation) = sandbox.base_record.lock().unwrap().activation.as_mut() {
                 activation.is_activated = is_activated;
                 activation.status = status.clone();
                 activation.checked_at_unix_ms = burrow_common::unix_now_ms();
             }
-            manager.persist(&sandbox).await;
+            // Deleted, or replaced by another copy, while the guest worked.
+            if !manager.persist_held(&sandbox).await {
+                return;
+            }
             tracing::info!(
                 sandbox = id,
                 is_activated,
