@@ -103,7 +103,8 @@ impl Cgroup {
         prepare_parent(root, &parent)?;
 
         let path = parent.join(name);
-        if !path.exists() {
+        let is_new = !path.exists();
+        if is_new {
             std::fs::create_dir_all(&path)?;
         }
 
@@ -111,15 +112,36 @@ impl Cgroup {
             path,
             snapshot_usec: Default::default(),
         };
-        cgroup.set_limits(&limits.uncapped())?;
-        let path = &cgroup.path;
+        let limited = cgroup.limit(limits);
+        if limited.is_err() && is_new {
+            let _ = std::fs::remove_dir(&cgroup.path);
+        }
+        limited.map(|()| cgroup)
+    }
+
+    fn limit(&self, limits: &Limits) -> Result<()> {
+        self.set_limits(&limits.uncapped())?;
         if limits.memory_mib > 0 {
-            cgroup.set_memory(limits.memory_mib)?;
+            self.set_memory(limits.memory_mib)?;
         }
         if limits.pids_max > 0 {
-            write(&path.join("pids.max"), &limits.pids_max.to_string())?;
+            write(&self.path.join("pids.max"), &limits.pids_max.to_string())?;
         }
-        Ok(cgroup)
+        Ok(())
+    }
+
+    /// Whether VMs can be capped under `root`: a cgroup made there with CPU,
+    /// memory and process limits, and removed again.
+    pub fn check(root: &Path) -> Result<()> {
+        let probe = format!("_probe-{}", std::process::id());
+        let limits = Limits {
+            memory_mib: 64,
+            pids_max: 16,
+            ..Default::default()
+        };
+        let cgroup = Self::create(root, &probe, &limits)?;
+        let _ = std::fs::remove_dir(&cgroup.path);
+        Ok(())
     }
 
     /// The cgroup a VM's VMM is to join, made before the VMM is spawned. One
@@ -147,11 +169,9 @@ impl Cgroup {
                 );
                 Ok(None)
             }
-            Err(err) if is_required => {
-                let reason = match err {
-                    Error::CgroupUnavailable { reason } => reason,
-                    err => err.to_string(),
-                };
+            Err(Error::CgroupUnavailable { reason })
+                if is_required && limits.cpuset_cpus.is_empty() && limits.io_weight == 0 =>
+            {
                 Err(Error::CgroupUnavailable {
                     reason: format!(
                         "{reason}; a node started with --allow-unlimited-resources runs it uncapped"
@@ -690,5 +710,62 @@ mod tests {
         let err = enable_controllers(&dir).unwrap_err();
         assert!(matches!(err, Error::CgroupUnavailable { .. }));
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A root standing in for a cgroup2 mount with every controller burrow
+    /// asks for delegated to it and to its `burrow` child.
+    fn fake_root(name: &str) -> PathBuf {
+        let root =
+            std::env::temp_dir().join(format!("burrow-cg-root-{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        for dir in [root.clone(), root.join("burrow")] {
+            std::fs::create_dir_all(&dir).unwrap();
+            std::fs::write(dir.join("cgroup.controllers"), CONTROLLERS.join(" ")).unwrap();
+        }
+        root
+    }
+
+    #[test]
+    fn a_root_is_checked_by_limiting_a_cgroup_under_it() {
+        let root = fake_root("check");
+        Cgroup::check(&root).unwrap();
+        let bare = std::env::temp_dir().join(format!("burrow-cg-unchecked-{}", std::process::id()));
+        std::fs::create_dir_all(&bare).unwrap();
+        assert!(matches!(
+            Cgroup::check(&bare),
+            Err(Error::CgroupUnavailable { .. })
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        let _ = std::fs::remove_dir_all(&bare);
+    }
+
+    /// The way out is named only where it would let the VM run: a pin or an
+    /// IO weight is refused with or without it.
+    #[test]
+    fn a_refusal_names_the_opt_out_only_where_it_applies() {
+        let root = std::env::temp_dir().join(format!("burrow-cg-bare-{}", std::process::id()));
+        std::fs::create_dir_all(&root).unwrap();
+        let hint = "--allow-unlimited-resources";
+        let err = Cgroup::for_vm(Some(&root), "vm", &Limits::default(), true)
+            .err()
+            .unwrap();
+        assert!(matches!(err, Error::CgroupUnavailable { .. }));
+        assert!(err.to_string().contains(hint), "{err}");
+        let pinned = Limits {
+            cpuset_cpus: "0".into(),
+            ..Default::default()
+        };
+        for is_required in [true, false] {
+            let err = Cgroup::for_vm(Some(&root), "vm", &pinned, is_required)
+                .err()
+                .unwrap();
+            assert!(!err.to_string().contains(hint), "{err}");
+        }
+        assert!(
+            Cgroup::for_vm(Some(&root), "vm", &Limits::default(), false)
+                .unwrap()
+                .is_none()
+        );
+        let _ = std::fs::remove_dir_all(&root);
     }
 }

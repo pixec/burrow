@@ -1815,6 +1815,16 @@ pub async fn run(args: ServeArgs) -> anyhow::Result<()> {
     let denied = Arc::new(burrow_proxy::DeniedAddresses::default());
     let directory = Arc::new(burrow_proxy::directory::Directory::default());
     #[cfg(target_os = "linux")]
+    if !args.is_unlimited_resources_allowed {
+        burrow_vmm::Cgroup::check(&args.cgroup_root).map_err(|err| {
+            anyhow::anyhow!(
+                "sandboxes cannot be capped under {}: {err}. Make the cgroup2 tree writable, or \
+                 start burrowd with --allow-unlimited-resources to run them uncapped",
+                args.cgroup_root.display()
+            )
+        })?;
+    }
+    #[cfg(target_os = "linux")]
     let drop_log = crate::droplog::open().await;
     #[cfg(not(target_os = "linux"))]
     let drop_log: Option<()> = None;
