@@ -1,11 +1,10 @@
 # Windows guests under Cloud Hypervisor
 
 Windows Server 2022 runs as a Burrow sandbox under Cloud Hypervisor v54 on
-x86_64 (bench server, 2026-11-15/16): create, exec, stop/start, delete, warm
-creates, fork, snapshots, durable state, passwords, Remote Desktop,
-activation and a per-sandbox TPM all work through `burrow`. Moves between
-nodes go through the same durable path but were not run (one node). Windows
-on arm64 does not boot on the Mac harness; see the last section.
+x86_64: create, exec, stop/start, delete, warm creates, fork, snapshots,
+durable state and moves, passwords, Remote Desktop, activation and a
+per-sandbox TPM all work through `burrow`. Windows on arm64 does not boot on
+the Mac harness; see the last section.
 
 ## Results on x86_64
 
@@ -32,23 +31,12 @@ is activated.
   as `nt authority\system`. `stop` takes 24 s, `start` 1.5 s, and a file
   written before the stop is there after it, with the clock right. `rm` takes
   0.2 s and leaves no CH process or tap.
-- **Burrow, 2026-11-16** (4 vCPUs, 15 GiB host): a cold create of 2x4096 or
-  4x6144 takes 36-47 s: agent up 11-25 s, an in-place agent upgrade 4-5 s
-  while the template's agent is older than the node's, and 20-30 s for the
-  restart that takes the computer name. A warm create of 2x4096 returns in
-  0.6 s and its first exec in 1.3-2.2 s, the clock within 0.15 s of the host
-  and the address re-applied. `commit` of a 4x6144 sandbox takes 18.5 s;
-  each create from the snapshot 9.5-17 s (CH copies memory in); `fork` 6-8 s.
-  `stop` writes 6 GiB in 12-27 s and `start` restores in 0.5-30 s depending
-  on the page cache. A durable suspend uploads in 49 s the first time (the
-  9 GB image once, chunked), a durable commit in 5 s, and a create from that
-  snapshot on a node without it fetches and restores in 8.2 s.
-- **RNG after restore**: the VM generation counter, read through
-  `\\.\VmGenerationCounter`, differs in the source and in every clone of a
-  snapshot (CH v54 always provides the device and draws a new ID on each
-  restore), and the first `[guid]::NewGuid()` and `CryptGenRandom` bytes of
-  two clones differ. Windows reseeds its root RNG on the change, so the agent
-  does nothing with the handshake's entropy.
+- **RNG after restore**: Cloud Hypervisor v54 gives every VM a VM
+  generation ID and draws a new one on each restore; Windows binds its
+  "Microsoft Hyper-V Generation Counter" driver to it and reseeds its root
+  RNG when it changes, so clones of one snapshot draw different random
+  numbers from the start. The agent does nothing with the handshake's
+  entropy.
 
 ## Credentials and identity
 
@@ -63,15 +51,15 @@ is activated.
   `/etc/shadow` (root by default).
 - `burrow create --rdp` gives Administrator a fresh password, turns Remote
   Desktop on (`fDenyTSConnections` 0 and the Remote Desktop firewall group,
-  by its resource name so any language matches) and prints the logon once.
-  NLA logs in with it (checked with `xfreerdp3 /auth-only`). The port is the
+  by its resource name so any language matches) and prints the logon once,
+  which NLA accepts. The port is the
   guest's 3389; publish it with `burrow expose` or reach it over a private
   network.
 - Computer name: the handshake carries the sandbox's hostname (its id with
   `_` turned to `-`, as on Linux), which the agent sets with
   `SetComputerNameExW` (DNS name, and its first 15 characters as the NetBIOS
   name). Windows applies a name only at boot, so a cold create restarts the
-  guest once (20-30 s) and the node waits for the agent to come back. A
+  guest once, a full reboot, and the node waits for the agent to come back. A
   restored guest (warm create, fork, snapshot) keeps its old name until its
   next boot (`burrow shutdown` and `burrow boot`), which then takes the new
   one without a further restart.
@@ -81,71 +69,85 @@ is activated.
   are unsupported, so Burrow does neither. Duplicate SIDs do not matter to a
   standalone machine, but Microsoft does not support them in a domain, and
   recent Windows releases fail NTLM and Kerberos between machines that share
-  one. A generalized template works: running
-  `sysprep /generalize /oobe /shutdown /quiet /unattend:...` in a sandbox
-  (44 s to power off, with an unattend that skips OOBE and sets
-  `ComputerName` to `*`) and taking its disk as a template gives every
-  create a new machine SID. Setup's specialize and OOBE then run on each
-  first boot: about 110 s at 4 vCPUs before Setup reports
-  `IMAGE_STATE_COMPLETE`, against 11-25 s for the agent of an ungeneralized
-  template, and a create from it took 184 s with the restart for the name
-  (measured 2026-11-16). The agent does not answer until Setup has finished,
-  so the node needs `--agent-timeout 300` for such a template. Clones
-  restored from a snapshot share the SID the snapshot holds whichever way
-  the template was made.
+  one. A generalized template gives every create a new machine SID: run
+  `sysprep /generalize /oobe /shutdown /quiet /unattend:...` in a sandbox,
+  with an unattend that skips OOBE and sets `ComputerName` to `*`, and take
+  its disk as a template. Setup's specialize and OOBE then run on each first
+  boot, which takes a few minutes more than an ungeneralized boot, and the
+  agent does not answer until Setup has finished, so a node creating from
+  such a template needs `--agent-timeout 300`. Clones restored from a
+  snapshot share the SID the snapshot holds whichever way the template was
+  made.
 
 ## Activation
 
 Bring your own license, per sandbox:
 
 ```sh
-echo XXXXX-XXXXX-XXXXX-XXXXX-XXXXX | burrow secret set winkey
+echo XXXXX-XXXXX-XXXXX-XXXXX-XXXXX | burrow secret set winkey --product-key
 burrow create --template win2022 --product-key-secret winkey
 burrow create --template win2022 --kms-host kms.example.com:1688
 ```
 
-The orchestrator reads the key out of the secret (scoped like any other) and
-hands it to the node, which passes it to the agent once and keeps only
-whether one was installed; the key is never logged, stored on the sandbox or
-returned. The agent runs `slmgr /ipk`, `/skms` and `/ato` and reads the
+Only a secret stored with `--product-key` serves as one. The orchestrator
+reads the key out of the secret (scoped like any other) and hands it to the
+node, which passes it to the agent once and keeps only whether one was
+installed; the key is never logged, stored on the sandbox or returned. Unlike
+a brokered credential it does reach the guest, where Windows keeps it, so
+anyone who can create a sandbox the secret is scoped to can read the key.
+Creates that activate, or turn Remote Desktop on, are refused for a sandbox
+whose exec policy forbids commands. A status the guest reports is cut to 512
+bytes, and an attempt that takes over five minutes is recorded as such. The agent runs `slmgr /ipk`, `/skms` and `/ato` and reads the
 license state back. A KMS host is kept on the sandbox and activated against
 again at every cold boot. `burrow inspect` shows the outcome, e.g. `not
 activated via kms kms.invalid: out-of-box grace (... TIMEBASED_EVAL channel):
 ... Error: 0x80072EE7`. An orchestrator started with `--byol-node-label
 KEY=VALUE` places every activating create on nodes carrying that label.
 
-Tested only with the public KMS client key for Server 2022 Standard (refused
-by the evaluation edition, `0xC004F069`) and with a KMS host that does not
-resolve; no retail key was used.
-
 ## TPM
 
 A template whose `image.json` has `"tpm": true` gives each sandbox a TPM 2.0
 of its own from swtpm (`--swtpm`, default `/usr/bin/swtpm`). Its state lives
-in the sandbox's working directory, or under `--tpm-state-dir`, one
-directory per sandbox, removed with it. The emulator starts before the VMM;
-stopping the VMM has it save its volatile state, which a `start` (memory
-restore) resumes from, while a cold boot drops it. Snapshots, forks, warm
-builds, checkpoints and moves of a TPM sandbox are refused: a copy would hold
-the same TPM's keys.
+in a directory per sandbox under `tpm/` in the data directory, or under
+`--tpm-state-dir`, never in the working directory a jailed VMM owns, and is
+removed with the sandbox. swtpm runs as the jail's uid, with its own seccomp
+filter set to kill, in the VM's cgroup; its directory is that uid's alone
+(0700, under a root-owned 0711 parent) and a jailed VMM is shown its socket
+alone. It is not chrooted, because Ubuntu's AppArmor profile for swtpm
+refuses `CAP_SYS_CHROOT`. It starts before the VMM; stopping the VMM has it
+save its volatile state, which a `start` (memory restore) resumes from, while
+a cold boot drops it. Snapshots, forks, warm builds, checkpoints and moves of
+a TPM sandbox are refused: a copy would hold the same TPM's keys. Whether a
+sandbox has a TPM is fixed at create, on its record.
 
 Ubuntu's AppArmor profile for swtpm lets it write only to files it owns under
-a few directories, among them `/var/lib/swtpm`; the bench node runs with
-`--tpm-state-dir /var/lib/swtpm/burrow`. Keeping the state in the sandbox's
-working directory instead needs a local rule, in
-`/etc/apparmor.d/local/usr.bin.swtpm`:
+a few directories, among them `/var/lib/swtpm`. On such a host either set
+`--tpm-state-dir /var/lib/swtpm/burrow`, or keep the default, under the data
+directory, with a local rule in `/etc/apparmor.d/local/usr.bin.swtpm`:
 
 ```
-owner /var/lib/burrow/sandboxes/*/tpm/** rwk,
-owner /var/lib/burrow/jail/cloud-hypervisor/*/root/tpm/** rwk,
+owner /var/lib/burrow/tpm/** rwk,
 ```
 
-On Server 2022 the device shows as `Trusted Platform Module 2.0` (IBM,
-spec 1.83), `tpmtool getdeviceinformation` reports it ready for storage, and
-the endorsement key's hash is the same after `stop`/`start` and after
-`shutdown`/`boot`. `Get-Tpm` itself fails under the agent with `0x80284001`;
-the WMI class it reads (`Win32_Tpm`) answers. A Windows 11 template was not
-installed.
+What works and what does not under Cloud Hypervisor v54:
+
+- The device shows as `Trusted Platform Module 2.0` (IBM, spec 1.83),
+  `tpmtool getdeviceinformation` reports it ready for storage, the
+  endorsement key is readable, and its hash is the same after `stop`/`start`
+  and after `shutdown`/`boot`.
+- BitLocker cannot use it: `manage-bde -protectors -add C: -tpm` fails with
+  `0x80284001`, as does `Get-Tpm`.
+- It is not ready for attestation: there is no measured-boot event log.
+- Whether Windows 11 Setup accepts it is unverified.
+
+The cause is what Cloud Hypervisor gives the guest, not Burrow. Its ACPI
+`TPM2` table (revision 3, 52 bytes, CRB) has no event-log area, and its
+`MSFT0101` device has `_HID`, `_STA` and `_CRS` but no `_DSM`, so Windows
+finds no Physical Presence Interface: the PPI methods of `Win32_Tpm` and
+`GetTcgLog` fail with `0x80284001`, and the TPM driver logs event 15 with
+`0xC0000034` (object name not found) from the first boot. The edk2 firmware
+adds no measured-boot log of its own. A `_DSM` in Cloud Hypervisor's TPM
+device, and a firmware build with the Tcg2 stack, would be needed.
 
 ## Making a template
 
@@ -234,9 +236,9 @@ DIR=/var/lib/burrow/spike-win VCPUS=4 MEMORY_MIB=6144 sh run-vm.sh install
 ## Still to do
 
 - A template import command for installed disks.
-- Moves between two nodes, which take the durable path tested here.
 - A Windows 11 template, for the TPM path.
-- `Get-Tpm` under the agent.
+- PPI and a measured-boot log for the TPM, in Cloud Hypervisor and its
+  firmware.
 
 ## Windows 11 arm64 on the Mac harness (2026-10-29)
 

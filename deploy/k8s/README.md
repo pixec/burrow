@@ -47,13 +47,17 @@ stages. `dev` is what the compose harness builds and bind-mounts binaries into;
 `release` bakes them in for publishing. One file, so the firecracker and
 tooling versions cannot drift between what you test on and what you ship.
 
-To build one yourself, stage the binaries where `release` expects them:
+To build one yourself, stage the binaries where `release` expects them,
+the Windows agent included: the node image ships it, and the manifest's
+`--guest-binary-windows` names it, so a node built without it does not start.
 
 ```sh
 cargo zigbuild --release --target x86_64-unknown-linux-musl \
   -p burrow-orchestrator -p burrow-daemon -p burrow-cli -p burrow-guest
+cargo zigbuild --release --target x86_64-pc-windows-gnullvm -p burrow-guest
 mkdir -p dist/amd64
 cp target/x86_64-unknown-linux-musl/release/{burrow-orchestrator,burrowd,burrow-guest} dist/amd64/
+cp target/x86_64-pc-windows-gnullvm/release/burrow-guest.exe dist/amd64/
 
 docker buildx build --platform linux/amd64 --load \
   -f deploy/orchestrator.Dockerfile -t <registry>/burrow-orchestrator:latest .

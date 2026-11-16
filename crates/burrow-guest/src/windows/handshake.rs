@@ -6,10 +6,8 @@
 //! Hypervisor (v54) gives every VM the ACPI device and draws a new
 //! identifier on every restore, the "Microsoft Hyper-V Generation Counter"
 //! driver binds to it, and Windows reseeds its root RNG when it changes.
-//! Measured 2026-11-16 on Server 2022: the counter read through
-//! `\\.\VmGenerationCounter` differs in the source and in each clone of a
-//! snapshot, and the first GUIDs and `CryptGenRandom` bytes of two clones
-//! differ. The host's bytes are accepted and not used, and `reseed_us`
+//! Clones of one snapshot therefore draw different random numbers from the
+//! start. The host's bytes are accepted and not used, and `reseed_us`
 //! reports zero.
 
 #![allow(clippy::result_large_err)]
