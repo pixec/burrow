@@ -714,6 +714,8 @@ pub async fn clone_warm_disk(
 /// serves anyone: its only job is to reach the point where a sandbox would be
 /// ready, and stop there.
 ///
+/// Its boot takes a cold-boot slot like a sandbox's, until its agent accepts.
+///
 /// It runs under the template's hypervisor and the node's confinement all the
 /// same, taking the jailer, the cgroup root and the resource limits straight
 /// off [`NodeConfig`] the way `SandboxManager::build_spec` does. A warm build boots a tenant's own image
@@ -725,6 +727,7 @@ pub async fn build_warm_snapshot(
     template: &str,
     shape: Shape,
     trust: &Trust,
+    cold_boots: &crate::coldboot::ColdBoots,
 ) -> Result<Warm, Status> {
     let templates_dir = config.templates_dir();
     // Defence in depth: the name becomes a directory under `templates_dir` and
@@ -864,16 +867,22 @@ pub async fn build_warm_snapshot(
     }
     apply_confinement(&mut spec, config, shape);
 
-    let outcome = snapshot_when_ready(
-        spec,
-        agent_timeout,
-        &lease,
-        trust,
-        config.upgrade_for(guest_os),
-        capabilities.is_tap_networked && guest_os == burrow_vmm::GuestOs::Linux,
-        guest_os == burrow_vmm::GuestOs::Windows,
-    )
-    .await;
+    let outcome = match cold_boots.admit(&vm_id).await {
+        Ok(cold_boot) => {
+            snapshot_when_ready(
+                spec,
+                cold_boot,
+                agent_timeout,
+                &lease,
+                trust,
+                config.upgrade_for(guest_os),
+                capabilities.is_tap_networked && guest_os == burrow_vmm::GuestOs::Linux,
+                guest_os == burrow_vmm::GuestOs::Windows,
+            )
+            .await
+        }
+        Err(err) => Err(err),
+    };
     burrow_net::tap::delete(WARM_TAP).await;
 
     match outcome {
@@ -1258,8 +1267,10 @@ where
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn snapshot_when_ready(
     spec: VmSpec,
+    cold_boot: crate::coldboot::ColdBoot,
     agent_timeout: std::time::Duration,
     lease: &burrow_net::ipam::Lease,
     trust: &Trust,
@@ -1272,10 +1283,11 @@ async fn snapshot_when_ready(
         .await
         .map_err(|err| Status::internal(format!("warm boot: {err}")))?;
 
-    if let Err(err) = vm
+    let ready = vm
         .wait_for_vsock(crate::guestconn::AGENT_PORT, agent_timeout)
-        .await
-    {
+        .await;
+    drop(cold_boot);
+    if let Err(err) = ready {
         let console = vm.console_tail(30).await;
         let _ = vm.kill().await;
         return Err(Status::internal(format!(

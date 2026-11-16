@@ -301,12 +301,19 @@ pub struct ServeArgs {
     )]
     pub cpu_overcommit: f64,
     /// Sandboxes that may boot cold at once; more wait their turn. Booting
-    /// keeps a guest's vCPUs busy until its agent answers, so under
-    /// `--cpu-overcommit` a burst of boots can take every host CPU. Restores
-    /// from a warm snapshot are not counted. Unset is one per host CPU, and 0
-    /// is unlimited.
+    /// keeps a guest's vCPUs busy until its agent accepts, so under
+    /// `--cpu-overcommit` a burst of boots can take every host CPU. Creates,
+    /// starts and warm snapshot builds are counted until the guest's agent
+    /// accepts a connection. Restores from a warm snapshot, the helper VM a
+    /// disk shrink boots and a macOS template's first boot are not. Unset is
+    /// one per host CPU, and 0 is unlimited.
     #[arg(long, env = "BURROWD_COLD_BOOTS")]
     pub cold_boots: Option<usize>,
+    /// Seconds a boot waits for a `--cold-boots` slot before its create is
+    /// refused with UNAVAILABLE, for the caller to retry or place elsewhere.
+    /// 0 waits for as long as it takes.
+    #[arg(long, default_value_t = 300, env = "BURROWD_COLD_BOOT_WAIT_SECS")]
+    pub cold_boot_wait_secs: u64,
     /// Disk to keep free on the filesystem sandboxes' disks are on (the
     /// jailer's chroot base under `--jailer`, else the data directory), in
     /// MiB. It is left out of what may be provisioned, and while free disk is
@@ -1895,6 +1902,7 @@ pub async fn run(args: ServeArgs) -> anyhow::Result<()> {
             cold_boots: args
                 .cold_boots
                 .unwrap_or_else(crate::coldboot::default_limit),
+            cold_boot_wait: std::time::Duration::from_secs(args.cold_boot_wait_secs),
             public: public_config(&args),
             warm: warm_policy(&args),
             checkpoint_min_secs: args.checkpoint_min_secs,

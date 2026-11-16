@@ -265,6 +265,8 @@ pub struct NodeConfig {
     pub public: crate::publicip::PublicConfig,
     /// Sandboxes that may boot cold at once (`--cold-boots`); 0 is unlimited.
     pub cold_boots: usize,
+    /// How long a boot waits for one of those slots; zero is for ever.
+    pub cold_boot_wait: std::time::Duration,
     /// Which shapes are warmed, and how many snapshots are kept.
     pub warm: crate::warm::WarmPolicy,
     /// The shortest interval a sandbox's checkpoints are taken at, whatever
@@ -1019,6 +1021,8 @@ struct Provisioning<'a> {
     vm: Option<Vm>,
     /// A warm create's dial to its guest, started as the VM came up.
     dialing: Option<guestconn::Dialing>,
+    /// A cold boot's slot, until its guest's agent accepts.
+    cold_boot: Option<crate::coldboot::ColdBoot>,
     is_kept: bool,
 }
 
@@ -1032,6 +1036,7 @@ impl<'a> Provisioning<'a> {
             tap: None,
             vm: None,
             dialing: None,
+            cold_boot: None,
             is_kept: false,
         }
     }
@@ -1054,6 +1059,7 @@ impl<'a> Provisioning<'a> {
     /// Every failure path goes through here, so the order below is the only
     /// order teardown happens in.
     async fn fail(mut self, err: Status) -> Status {
+        self.cold_boot = None;
         if let Some(dialing) = self.dialing.take() {
             dialing.abort();
         }
@@ -2374,7 +2380,8 @@ impl RunningSandbox {
 
     /// Cold-boots a stopped sandbox on its existing disks and handshakes.
     /// `hotplugged` are volumes attached once the agent is up rather than at
-    /// boot, as a create on a root disk attaches them.
+    /// boot, as a create on a root disk attaches them. `cold_boot` is the
+    /// boot's slot, given back once the agent accepts.
     #[tracing::instrument(skip_all, fields(sandbox = %self.id()))]
     async fn boot(
         &self,
@@ -2383,6 +2390,7 @@ impl RunningSandbox {
         agent_timeout: std::time::Duration,
         upgrade: Option<&guestconn::GuestUpgrade>,
         hotplugged: &[common::VolumeMount],
+        cold_boot: crate::coldboot::ColdBoot,
     ) -> Result<(), Status> {
         self.forget_agent().await;
         let mut slot = self.vm.lock().await;
@@ -2406,7 +2414,9 @@ impl RunningSandbox {
         let mut vm = Vm::boot(spec.clone())
             .await
             .map_err(|err| Status::internal(format!("boot failed: {err}")))?;
-        let (agent, _) = match guestconn::connect_when_ready(vm.guest(), agent_timeout).await {
+        let connected = guestconn::connect_when_ready(vm.guest(), agent_timeout).await;
+        drop(cold_boot);
+        let (agent, _) = match connected {
             Ok(ready) => ready,
             Err(err) => {
                 let failure = NoAgent::Unreachable(agent_timeout, error_chain(&*err));
@@ -3255,7 +3265,10 @@ impl SandboxManager {
             )),
             spares: crate::rootdisk::Spares::new(config.data_dir.join("spares")),
             resizer: Default::default(),
-            cold_boots: Arc::new(crate::coldboot::ColdBoots::new(config.cold_boots)),
+            cold_boots: Arc::new(crate::coldboot::ColdBoots::new(
+                config.cold_boots,
+                config.cold_boot_wait,
+            )),
             config,
             sandboxes: Arc::new(Mutex::new(HashMap::new())),
             disk_admissions: Default::default(),
@@ -6977,9 +6990,16 @@ impl SandboxManager {
         let _charged = self.admit_disk("", "warm a template", estimate).await?;
         let trust = self.warm_trust(template).await;
         let pool = self.ipam().await?.pool();
-        crate::warm::build_warm_snapshot(&self.config, pool, template, shape, &trust)
-            .await
-            .map(Some)
+        crate::warm::build_warm_snapshot(
+            &self.config,
+            pool,
+            template,
+            shape,
+            &trust,
+            &self.cold_boots,
+        )
+        .await
+        .map(Some)
     }
 
     /// Discards `template`'s snapshot of `shape` under `hypervisor` if it is
@@ -8220,6 +8240,14 @@ impl SandboxManager {
         });
         let from_warm = warm.is_some();
         phases.mark("warm_find");
+        // Before the lease, tap and disk, so a boot waiting its turn holds none.
+        if !from_warm {
+            match self.cold_boots.admit(&id).await {
+                Ok(slot) => guard.cold_boot = Some(slot),
+                Err(err) => return Err(guard.fail(err).await),
+            }
+            phases.mark("cold_boot_queue");
+        }
 
         // Networking: a private /30 on a dedicated tap. The guest configures
         // itself from the kernel command line, so no DHCP client is needed.
@@ -8283,6 +8311,10 @@ impl SandboxManager {
                     );
                     self.rebuild_in_background_if_broken(&template, hypervisor, wanted);
                     is_warm = false;
+                    match self.cold_boots.admit(&id).await {
+                        Ok(slot) => guard.cold_boot = Some(slot),
+                        Err(err) => return Err(guard.fail(err).await),
+                    }
                 }
                 Err(err) => {
                     return Err(guard
@@ -8293,7 +8325,6 @@ impl SandboxManager {
         }
         tracing::Span::current().record("from_warm", is_warm);
 
-        let mut cold_boot = None;
         let started_vm = if is_warm && !is_macos {
             // Everything but the disk is linked and handed to the jail first,
             // so the VMM starts while the disk is copied and the tap is made:
@@ -8463,10 +8494,6 @@ impl SandboxManager {
             let boot_spec = spec.clone();
             record_working_set(&mut spec, self.config.object_store.is_some());
             phases.mark("spec");
-            if !is_warm {
-                cold_boot = Some(self.cold_boots.admit(&id).await);
-                phases.mark("cold_boot_queue");
-            }
             match is_warm {
                 true => Vm::restore(spec, true).await.map_err(|err| {
                     if let Some(snapshot) = &warm {
@@ -8590,6 +8617,7 @@ impl SandboxManager {
                 self.config.agent_timeout(guest_os),
             )
             .await;
+            guard.cold_boot = None;
             let (agent, accepted_at) = match connected {
                 Ok(ready) => ready,
                 Err(err) => {
@@ -8644,7 +8672,6 @@ impl SandboxManager {
         };
 
         phases.mark("agent");
-        drop(cold_boot);
         // Nothing below this line can fail, so it is where the sandbox takes
         // over what the guard was holding on its behalf.
         let dialing = guard.dialing.take();
@@ -10003,17 +10030,21 @@ impl SandboxManager {
             crate::volume::agent_mounts(&policy.volumes, guest_os),
             guestconn::hostname(id),
         );
-        let cold_boot = self.cold_boots.admit(id).await;
-        let booted = sandbox
-            .boot(
-                spec,
-                request,
-                self.config.agent_timeout(guest_os),
-                self.config.upgrade_for(guest_os),
-                hotplugged,
-            )
-            .await;
-        drop(cold_boot);
+        let booted = match self.cold_boots.admit(id).await {
+            Ok(cold_boot) => {
+                sandbox
+                    .boot(
+                        spec,
+                        request,
+                        self.config.agent_timeout(guest_os),
+                        self.config.upgrade_for(guest_os),
+                        hotplugged,
+                        cold_boot,
+                    )
+                    .await
+            }
+            Err(err) => Err(err),
+        };
         if let Err(err) = booted {
             self.volumes.release_all(id);
             sandbox.base_record.lock().unwrap().state_reason =
@@ -12447,6 +12478,7 @@ pub(crate) mod tests {
                 },
                 cpu_overcommit: 1.0,
                 cold_boots: 0,
+                cold_boot_wait: std::time::Duration::ZERO,
                 depends_on: Vec::new(),
                 public: Default::default(),
                 warm: Default::default(),
