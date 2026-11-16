@@ -574,6 +574,11 @@ export interface SandboxInfo {
   kernel: KernelInfo | null;
   /** `linux`, `windows` or `macos`, from its template. */
   guestOs: string;
+  /**
+   * The Remote Desktop logon a create with `remoteDesktop` made, on the
+   * handle that create returned only; `null` everywhere else.
+   */
+  remoteDesktop: RemoteDesktopCredential | null;
   /** Public addresses of either family attached to it. */
   publicIps: PublicIp[];
   /**
@@ -728,6 +733,11 @@ export interface CreateOptions extends CallOptions, HandleOptions {
    * from a warm snapshot.
    */
   verboseConsole?: boolean;
+  /**
+   * Windows guests: turn Remote Desktop on and give Administrator a fresh
+   * password, on the returned handle's {@link Sandbox.remoteDesktop} only.
+   */
+  remoteDesktop?: boolean;
   /**
    * Snapshot id to start from. The sandbox **restores** that state instead of
    * booting, so it arrives with the snapshot's processes and memory, and
@@ -949,6 +959,22 @@ export interface GuestUser {
   gid: number;
   /** The user's home, created 0700 so other sandbox users cannot read it. */
   home: string;
+}
+
+/** A Remote Desktop logon, shown once. */
+export interface RemoteDesktopCredential {
+  username: string;
+  password: string;
+  /** The guest port RDP listens on. */
+  port: number;
+}
+
+/** A guest account whose password was set. */
+export interface PasswordSet {
+  username: string;
+  /** The password generated when none was given, shown only here. */
+  password: string;
+  created: boolean;
 }
 
 /** A group created inside the guest. */

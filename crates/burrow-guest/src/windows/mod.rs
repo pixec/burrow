@@ -39,6 +39,8 @@ pub use handshake::{
     clear_network, handshake, is_clock_disciplined, root_disk, set_clock, set_public_addresses,
 };
 #[cfg(windows)]
+pub use machine::enable_remote_desktop;
+#[cfg(windows)]
 pub use service::{main, self_digest, upgrade};
 #[cfg(windows)]
 pub use vsock::Arrival;
@@ -52,5 +54,6 @@ pub fn features() -> Vec<String> {
         "output-feed".to_string(),
         fs::FEATURE_FS.to_string(),
         "public-addresses".to_string(),
+        "set-password".to_string(),
     ]
 }

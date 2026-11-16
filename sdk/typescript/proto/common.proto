@@ -590,6 +590,17 @@ message Sandbox {
   // The kernel its guest runs: its template's when it was created or last
   // booted on its disk. Saved memory restores only onto this kernel.
   Kernel kernel = 39;
+  // The Remote Desktop logon a create with `is_remote_desktop_enabled` made,
+  // in that create's response only: never stored, listed or sent again.
+  RemoteDesktopCredential remote_desktop = 40;
+}
+
+message RemoteDesktopCredential {
+  string username = 1;
+  string password = 2;
+  // The guest port RDP listens on; reach it through `burrow expose` or a
+  // private network.
+  uint32 port = 3;
 }
 
 enum CheckpointKind {

@@ -349,6 +349,24 @@ impl Guest for AgentService {
             os::users::delete_group(&req.name, req.is_shared_dir_removed).await?,
         ))
     }
+
+    async fn set_password(
+        &self,
+        req: Request<guestpb::SetPasswordRequest>,
+    ) -> Result<Response<guestpb::SetPasswordResponse>, Status> {
+        Ok(Response::new(
+            os::users::set_password(req.into_inner()).await?,
+        ))
+    }
+
+    async fn enable_remote_desktop(
+        &self,
+        req: Request<guestpb::EnableRemoteDesktopRequest>,
+    ) -> Result<Response<guestpb::EnableRemoteDesktopResponse>, Status> {
+        os::enable_remote_desktop(req.into_inner().user).await?;
+        Ok(Response::new(guestpb::EnableRemoteDesktopResponse {}))
+    }
+
 }
 
 #[cfg(all(test, unix))]

@@ -407,6 +407,20 @@ enum Command {
     /// Guest user operations.
     #[command(subcommand)]
     User(UserCommand),
+    /// Set a guest account's password: root, or Administrator on Windows,
+    /// unless --user names another. Prints a generated password once, or
+    /// takes one from stdin with --stdin.
+    Passwd {
+        id: String,
+        #[arg(long)]
+        user: Option<String>,
+        /// Read the password from stdin instead of generating one.
+        #[arg(long = "stdin")]
+        is_stdin: bool,
+        /// Create the account when it does not exist.
+        #[arg(long = "create")]
+        is_created_if_missing: bool,
+    },
     /// Guest group operations.
     #[command(subcommand)]
     Group(GroupCommand),
@@ -976,6 +990,10 @@ struct CreateFlags {
     /// cold, never from a warm snapshot.
     #[arg(long)]
     verbose_console: bool,
+    /// Windows guests: turn Remote Desktop on and give Administrator a fresh
+    /// password, printed once.
+    #[arg(long = "rdp")]
+    is_remote_desktop_enabled: bool,
 }
 
 impl CreateFlags {
@@ -1007,6 +1025,7 @@ impl CreateFlags {
             || !self.networks.is_empty()
             || self.alias.is_some()
             || self.verbose_console
+            || self.is_remote_desktop_enabled
             || self.network.is_stated()
             || self.access.is_stated()
     }
@@ -2125,6 +2144,7 @@ async fn main() -> anyhow::Result<()> {
             } else {
                 println!("{} ({})", sandbox.id, sandbox.name);
             }
+            print_remote_desktop(&sandbox);
             // The sandbox is already there, so a port that could not be
             // published is a partial result, not a failed create: say which
             // one, keep the sandbox, and exit nonzero.
@@ -2307,6 +2327,40 @@ async fn main() -> anyhow::Result<()> {
                 })
                 .await?;
             println!("signalled {command_id}");
+        }
+        Command::Passwd {
+            id,
+            user,
+            is_stdin,
+            is_created_if_missing,
+        } => {
+            let password = match is_stdin {
+                true => {
+                    let mut buf = String::new();
+                    std::io::Read::read_to_string(&mut std::io::stdin(), &mut buf)?;
+                    let password = buf.trim_end_matches(['\r', '\n']).to_string();
+                    anyhow::ensure!(!password.is_empty(), "no password on stdin");
+                    password
+                }
+                false => String::new(),
+            };
+            let resp = client
+                .set_password(api::SetPasswordRequest {
+                    sandbox_id: id,
+                    user: user.unwrap_or_default(),
+                    password,
+                    is_created_if_missing,
+                })
+                .await?
+                .into_inner();
+            let created = if resp.is_created { " (created)" } else { "" };
+            match resp.password.as_str() {
+                "" => println!("set the password of {}{created}", resp.username),
+                password => {
+                    eprintln!("password of {}{created}, shown once:", resp.username);
+                    println!("{password}");
+                }
+            }
         }
         Command::User(UserCommand::Create { id, name }) => {
             let resp = client
@@ -3482,6 +3536,7 @@ fn create_request(flags: CreateFlags) -> anyhow::Result<api::CreateSandboxReques
         networks,
         alias,
         verbose_console,
+        is_remote_desktop_enabled,
     } = flags;
     let tags = parse_pairs("--tag", &tags)?;
     // A snapshot carries its own template, so nothing is sent unless the
@@ -3545,7 +3600,19 @@ fn create_request(flags: CreateFlags) -> anyhow::Result<api::CreateSandboxReques
         } else {
             Some(kit_spec(&kit_args, &kit_env, reject_capabilities)?)
         },
+        is_remote_desktop_enabled,
     })
+}
+
+/// The Remote Desktop logon a create made, which no later call shows again.
+fn print_remote_desktop(sandbox: &common::Sandbox) {
+    if let Some(rdp) = &sandbox.remote_desktop {
+        eprintln!(
+            "remote desktop on guest port {} as {}, password shown once:",
+            rdp.port, rdp.username
+        );
+        eprintln!("{}", rdp.password);
+    }
 }
 
 fn kit_spec(
@@ -3684,6 +3751,7 @@ async fn run_in_sandbox(
                         .into_inner();
                     // stderr, so piping the command's output stays clean.
                     eprintln!("sandbox {}", sandbox.id);
+                    print_remote_desktop(&sandbox);
                     sandbox.id
                 }
                 Err(status) => return Err(status.into()),
@@ -3696,6 +3764,7 @@ async fn run_in_sandbox(
                 .into_inner();
             // stderr, so piping the command's output stays clean.
             eprintln!("sandbox {}", sandbox.id);
+            print_remote_desktop(&sandbox);
             sandbox.id
         }
     };
@@ -7073,6 +7142,7 @@ mod tests {
                 name: None,
                 request_id: None,
                 verbose_console: false,
+                is_remote_desktop_enabled: false,
                 template: None,
                 kit_args: Vec::new(),
                 kit_env: Vec::new(),

@@ -32,6 +32,7 @@ pub fn features() -> Vec<String> {
         fs::FEATURE_FS.to_string(),
         "public-addresses".to_string(),
         crate::unix::untar::FEATURE_EXTRACT_TAR.to_string(),
+        "set-password".to_string(),
     ]
 }
 
@@ -509,3 +510,11 @@ pub async fn main() {
         std::future::pending::<()>().await;
     }
 }
+
+/// Remote Desktop is a Windows guest's.
+pub async fn enable_remote_desktop(_user: String) -> Result<(), tonic::Status> {
+    Err(tonic::Status::unimplemented(
+        "remote desktop is for windows guests",
+    ))
+}
+

@@ -206,6 +206,40 @@ fn fresh_entropy() -> Vec<u8> {
     }
 }
 
+/// A password for a guest account, as four dash-joined groups of five from
+/// an alphabet without look-alikes: about 113 bits, and every class Windows'
+/// complexity rule counts.
+pub fn generate_password() -> std::io::Result<String> {
+    use std::io::Read;
+    const CHARS: &[u8] = b"ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz23456789";
+    loop {
+        let mut bytes = [0u8; 20];
+        std::fs::File::open("/dev/urandom")?.read_exact(&mut bytes)?;
+        // Below the largest multiple of the alphabet, so no character is
+        // likelier than another; a draw with any byte above it starts over.
+        let limit = (256 / CHARS.len() * CHARS.len()) as u8;
+        if bytes.iter().any(|b| *b >= limit) {
+            continue;
+        }
+        let chars: Vec<char> = bytes
+            .iter()
+            .map(|b| char::from(CHARS[usize::from(*b) % CHARS.len()]))
+            .collect();
+        let has = |class: fn(&char) -> bool| chars.iter().any(class);
+        if !(has(char::is_ascii_uppercase)
+            && has(char::is_ascii_lowercase)
+            && has(char::is_ascii_digit))
+        {
+            continue;
+        }
+        return Ok(chars
+            .chunks(5)
+            .map(|group| group.iter().collect::<String>())
+            .collect::<Vec<_>>()
+            .join("-"));
+    }
+}
+
 /// What a command run to completion left behind.
 pub struct Finished {
     pub exit_code: i32,
@@ -527,5 +561,31 @@ async fn handshake_upgrading_once(
             }
             Err(err) => return Err(err),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_generated_password_is_four_groups_with_every_class() {
+        for _ in 0..50 {
+            let password = generate_password().unwrap();
+            let groups: Vec<&str> = password.split('-').collect();
+            assert_eq!(groups.len(), 4, "{password}");
+            assert!(groups.iter().all(|group| group.len() == 5), "{password}");
+            assert!(
+                password.chars().any(|c| c.is_ascii_uppercase()),
+                "{password}"
+            );
+            assert!(
+                password.chars().any(|c| c.is_ascii_lowercase()),
+                "{password}"
+            );
+            assert!(password.chars().any(|c| c.is_ascii_digit()), "{password}");
+            assert!(!password.contains(['0', 'O', 'l', '1', 'I']), "{password}");
+        }
+        assert_ne!(generate_password().unwrap(), generate_password().unwrap());
     }
 }

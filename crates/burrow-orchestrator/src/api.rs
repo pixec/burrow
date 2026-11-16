@@ -427,7 +427,7 @@ impl ApiService {
                 )));
             }
             let _admitted = self.0.admission.admit(&node_id).await;
-            let sandbox = client
+            let mut sandbox = client
                 .create_sandbox(nodepb::NodeCreateRequest {
                     sandbox_id,
                     request_id: req.request_id,
@@ -438,9 +438,12 @@ impl ApiService {
                     snapshot: snapshot.id.clone(),
                     kit: None,
                     credentials: HashMap::new(),
+                    is_remote_desktop_enabled: req.is_remote_desktop_enabled,
                 })
                 .await?
                 .into_inner();
+            // The caller's alone: the registry and every later read go without.
+            let remote_desktop = sandbox.remote_desktop.take();
             self.0.sandboxes.insert(sandbox.clone());
             drop(reserved);
             self.write_through().await;
@@ -451,6 +454,7 @@ impl ApiService {
                 is_fetched = node_id != snapshot.node_id,
                 "sandbox created from a snapshot"
             );
+            sandbox.remote_desktop = remote_desktop;
             return Ok(sandbox);
         }
 
@@ -635,7 +639,7 @@ impl ApiService {
             .await?;
 
         let _admitted = self.0.admission.admit(&node_id).await;
-        let sandbox = client
+        let mut sandbox = client
             .create_sandbox(nodepb::NodeCreateRequest {
                 sandbox_id,
                 request_id: req.request_id,
@@ -646,9 +650,11 @@ impl ApiService {
                 snapshot: String::new(),
                 kit: req.kit,
                 credentials,
+                is_remote_desktop_enabled: req.is_remote_desktop_enabled,
             })
             .await?
             .into_inner();
+        let remote_desktop = sandbox.remote_desktop.take();
         // The sandbox exists and the node will report it; the optimistic
         // charge is now the registry's job, not the guard's.
         if let Some(placed) = placed {
@@ -660,7 +666,7 @@ impl ApiService {
         // holding open on its behalf.
         drop(reserved);
         self.write_through().await;
-        let sandbox = match public_ips.is_empty() {
+        let mut sandbox = match public_ips.is_empty() {
             true => sandbox,
             false => {
                 self.attach_for_create(&sandbox.id, public_ips).await?;
@@ -670,6 +676,7 @@ impl ApiService {
         // The node's record is the truth rather than the request: it carries
         // the state and addresses the node actually assigned.
         tracing::info!(sandbox = sandbox.id, node = node_id, "sandbox placed");
+        sandbox.remote_desktop = remote_desktop;
         Ok(sandbox)
     }
 }
@@ -3800,6 +3807,16 @@ impl Burrow for ApiService {
         req.sandbox_id = self.resolve(&req.sandbox_id).await;
         let mut client = self.node_for(&req.sandbox_id).await?;
         Ok(Response::new(client.create_user(req).await?.into_inner()))
+    }
+
+    async fn set_password(
+        &self,
+        req: Request<api::SetPasswordRequest>,
+    ) -> Result<Response<api::SetPasswordResponse>, Status> {
+        let mut req = req.into_inner();
+        req.sandbox_id = self.resolve(&req.sandbox_id).await;
+        let mut client = self.node_for(&req.sandbox_id).await?;
+        Ok(Response::new(client.set_password(req).await?.into_inner()))
     }
 
     async fn create_group(

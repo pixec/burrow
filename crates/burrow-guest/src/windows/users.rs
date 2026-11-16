@@ -19,8 +19,9 @@ use windows_sys::Win32::Foundation::HANDLE;
 use windows_sys::Win32::NetworkManagement::NetManagement::{
     LOCALGROUP_INFO_1, LOCALGROUP_MEMBERS_INFO_3, NetApiBufferFree, NetLocalGroupAdd,
     NetLocalGroupAddMembers, NetLocalGroupDel, NetLocalGroupDelMembers, NetLocalGroupGetInfo,
-    NetUserAdd, NetUserDel, NetUserGetInfo, UF_DONT_EXPIRE_PASSWD, UF_SCRIPT, USER_INFO_1,
-    USER_PRIV_ADMIN, USER_PRIV_USER,
+    NetUserAdd, NetUserDel, NetUserGetInfo, NetUserSetInfo, UF_ACCOUNTDISABLE,
+    UF_DONT_EXPIRE_PASSWD, UF_SCRIPT, USER_INFO_1, USER_INFO_1003, USER_INFO_1008, USER_PRIV_ADMIN,
+    USER_PRIV_USER,
 };
 
 use crate::windows::win;
@@ -276,6 +277,129 @@ fn create_user_blocking(name: &str) -> Result<burrow_proto::guest::v1::CreateUse
         gid: PRIMARY_GROUP_RID,
         home: profile.dir.clone(),
     })
+}
+
+/// The built-in administrator, which `SetPassword` names when given no user.
+const ADMINISTRATOR: &str = "Administrator";
+
+/// Sets a local account's password through `NetUserSetInfo`, creating the
+/// account first when asked, and enables it if it was disabled: an account
+/// given a password is one meant to be logged on to.
+pub async fn set_password(
+    req: burrow_proto::guest::v1::SetPasswordRequest,
+) -> Result<burrow_proto::guest::v1::SetPasswordResponse, Status> {
+    if req.password.is_empty() {
+        return Err(Status::invalid_argument("the password is empty"));
+    }
+    tokio::task::spawn_blocking(move || set_password_blocking(req))
+        .await
+        .map_err(|err| Status::internal(format!("set password did not run: {err}")))?
+}
+
+fn set_password_blocking(
+    req: burrow_proto::guest::v1::SetPasswordRequest,
+) -> Result<burrow_proto::guest::v1::SetPasswordResponse, Status> {
+    let name = match req.user.as_str() {
+        "" => ADMINISTRATOR.to_string(),
+        user if is_agent(user) => {
+            return Err(Status::invalid_argument(format!(
+                "{user} is the agent's own account, which has no password"
+            )));
+        }
+        user => user.to_string(),
+    };
+    let is_created = match lookup_user(&name) {
+        Ok(()) => false,
+        Err(err) if err.code() == tonic::Code::NotFound && req.is_created_if_missing => {
+            validate_new(&name, 20)?;
+            create_user_blocking(&name)?;
+            true
+        }
+        Err(err) => return Err(err),
+    };
+    let name_w = win::wide(&name);
+    let mut password = win::wide(&req.password);
+    let info = USER_INFO_1003 {
+        usri1003_password: password.as_mut_ptr(),
+    };
+    let mut parm = 0u32;
+    // SAFETY: `info` and the strings it points at outlive the call.
+    let rc = unsafe {
+        NetUserSetInfo(
+            std::ptr::null(),
+            name_w.as_ptr(),
+            1003,
+            (&raw const info).cast(),
+            &mut parm,
+        )
+    };
+    password.fill(0);
+    if rc != NERR_SUCCESS {
+        return Err(net_error(&format!("setting {name}'s password"), rc));
+    }
+    let mut buf = std::ptr::null_mut();
+    // SAFETY: `name_w` is NUL-terminated; the buffer is freed below.
+    let rc = unsafe { NetUserGetInfo(std::ptr::null(), name_w.as_ptr(), 1, &mut buf) };
+    if rc != NERR_SUCCESS {
+        return Err(net_error(&format!("reading {name}"), rc));
+    }
+    // SAFETY: level 1 fills a USER_INFO_1, freed once read.
+    let flags = unsafe { (*buf.cast::<USER_INFO_1>()).usri1_flags };
+    unsafe { NetApiBufferFree(buf.cast()) };
+    if flags & UF_ACCOUNTDISABLE != 0 {
+        let info = USER_INFO_1008 {
+            usri1008_flags: flags & !UF_ACCOUNTDISABLE,
+        };
+        // SAFETY: as above.
+        let rc = unsafe {
+            NetUserSetInfo(
+                std::ptr::null(),
+                name_w.as_ptr(),
+                1008,
+                (&raw const info).cast(),
+                &mut parm,
+            )
+        };
+        if rc != NERR_SUCCESS {
+            return Err(net_error(&format!("enabling {name}"), rc));
+        }
+    }
+    Ok(burrow_proto::guest::v1::SetPasswordResponse {
+        username: name,
+        is_created,
+    })
+}
+
+/// The local name of a built-in group, from its well-known RID under
+/// S-1-5-32: names are localized, SIDs are not.
+fn builtin_group(rid: u32) -> Result<String, Status> {
+    use windows_sys::Win32::Security::{LookupAccountSidW, SID_NAME_USE};
+    let mut sid = vec![1u8, 2, 0, 0, 0, 0, 0, 5, 32, 0, 0, 0];
+    sid.extend_from_slice(&rid.to_le_bytes());
+    let mut name = vec![0u16; 256];
+    let mut name_len = name.len() as u32;
+    let mut domain = vec![0u16; 256];
+    let mut domain_len = domain.len() as u32;
+    let mut kind: SID_NAME_USE = 0;
+    // SAFETY: buffers are sized as passed; `sid` is a well-formed SID.
+    win::check(unsafe {
+        LookupAccountSidW(
+            std::ptr::null(),
+            sid.as_ptr().cast_mut().cast(),
+            name.as_mut_ptr(),
+            &mut name_len,
+            domain.as_mut_ptr(),
+            &mut domain_len,
+            &mut kind,
+        )
+    })
+    .map_err(|err| Status::internal(format!("naming built-in group {rid}: {err}")))?;
+    Ok(win::from_wide(&name))
+}
+
+/// Adds `user` to Remote Desktop Users (S-1-5-32-555).
+pub fn allow_remote_desktop(user: &str) -> Result<(), Status> {
+    membership(user, &builtin_group(555)?, true)
 }
 
 pub async fn create_group(

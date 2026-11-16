@@ -38,6 +38,58 @@ pub struct NodeApi {
 }
 
 impl NodeApi {
+    /// Fails unless `id` is a Windows guest, for what only one has.
+    async fn require_windows(&self, id: &str) -> Result<(), Status> {
+        let sandbox = self.sandboxes.get(id).await?;
+        if sandbox.record().guest_os != burrow_vmm::GuestOs::Windows.as_str() {
+            return Err(Status::invalid_argument(
+                "remote desktop is for windows guests",
+            ));
+        }
+        Ok(())
+    }
+
+    /// Removes a sandbox a create made and then failed after.
+    async fn delete_failed(&self, id: &str) {
+        let id = id.to_string();
+        let _ = self
+            .sandboxes
+            .detached(move |sandboxes| async move { sandboxes.delete(&id).await })
+            .await;
+    }
+
+    /// Gives a Windows sandbox's Administrator a fresh password and turns
+    /// Remote Desktop on, returning the logon.
+    async fn enable_remote_desktop(
+        &self,
+        id: &str,
+    ) -> Result<common::RemoteDesktopCredential, Status> {
+        let sandbox = self.sandboxes.get(id).await?;
+        let password = crate::guestconn::generate_password()
+            .map_err(|err| Status::internal(format!("generating a password: {err}")))?;
+        let mut agent = sandbox.agent().await?;
+        let account = agent
+            .set_password(guestpb::SetPasswordRequest {
+                password: password.clone(),
+                ..Default::default()
+            })
+            .await?
+            .into_inner();
+        agent
+            .enable_remote_desktop(guestpb::EnableRemoteDesktopRequest::default())
+            .await?;
+        tracing::info!(
+            sandbox = id,
+            user = account.username,
+            "remote desktop enabled"
+        );
+        Ok(common::RemoteDesktopCredential {
+            username: account.username,
+            password,
+            port: 3389,
+        })
+    }
+
     pub(crate) fn node_id(&self) -> String {
         self.node_id.lock().unwrap().clone()
     }
@@ -536,7 +588,8 @@ impl NodeService for NodeApi {
         // A create from a snapshot restores rather than boots, and takes its
         // template and shape from what the snapshot holds; it shares nothing
         // with the cold path but the checks above.
-        let sandbox = if req.snapshot.is_empty() {
+        let is_remote_desktop_enabled = req.is_remote_desktop_enabled;
+        let mut sandbox = if req.snapshot.is_empty() {
             // The template names a directory under `images/`, and a create is
             // the one path that reaches it with a string the orchestrator
             // passed straight through from a tenant.
@@ -565,6 +618,22 @@ impl NodeService for NodeApi {
                 )
                 .await?
         };
+        if is_remote_desktop_enabled {
+            if let Err(err) = self.require_windows(&sandbox.id).await {
+                self.delete_failed(&sandbox.id).await;
+                return Err(err);
+            }
+            match self.enable_remote_desktop(&sandbox.id).await {
+                Ok(credential) => sandbox.remote_desktop = Some(credential),
+                Err(err) => {
+                    self.delete_failed(&sandbox.id).await;
+                    return Err(Status::new(
+                        err.code(),
+                        format!("enabling remote desktop: {}", err.message()),
+                    ));
+                }
+            }
+        }
         Ok(Response::new(redact_secrets(sandbox)))
     }
 
@@ -1680,6 +1749,55 @@ impl NodeService for NodeApi {
             uid: resp.uid,
             gid: resp.gid,
             home: bounded(resp.home, MAX_PATH),
+        }))
+    }
+
+    /// Sets a guest account's password, generating one when none is given,
+    /// which goes back once in the response and is never logged or kept.
+    ///
+    /// Held to the exec policy like CreateUser: a caller who may not run
+    /// commands in the sandbox may not take over its accounts either.
+    async fn set_password(
+        &self,
+        req: Request<api::SetPasswordRequest>,
+    ) -> Result<Response<api::SetPasswordResponse>, Status> {
+        let req = req.into_inner();
+        if req.user.len() > MAX_NAME {
+            return Err(Status::invalid_argument(format!(
+                "user names are at most {MAX_NAME} bytes"
+            )));
+        }
+        let sandbox = self.sandboxes.get(&req.sandbox_id).await?;
+        check_exec(&sandbox.policy())?;
+        let is_generated = req.password.is_empty();
+        let password = match is_generated {
+            true => crate::guestconn::generate_password()
+                .map_err(|err| Status::internal(format!("generating a password: {err}")))?,
+            false => req.password,
+        };
+        let mut agent = sandbox.agent().await?;
+        let resp = agent
+            .set_password(guestpb::SetPasswordRequest {
+                user: req.user,
+                password: password.clone(),
+                is_created_if_missing: req.is_created_if_missing,
+            })
+            .await?
+            .into_inner();
+        tracing::info!(
+            sandbox = sandbox.id(),
+            user = resp.username,
+            created = resp.is_created,
+            "set a guest account's password"
+        );
+        Ok(Response::new(api::SetPasswordResponse {
+            username: bounded(resp.username, MAX_NAME),
+            password: if is_generated {
+                password
+            } else {
+                String::new()
+            },
+            is_created: resp.is_created,
         }))
     }
 

@@ -134,6 +134,7 @@ service NodeService {
   rpc RemoveUserFromGroup(burrow.api.v1.GroupMembershipRequest) returns (burrow.api.v1.GroupMembershipResponse);
   rpc DeleteUser(burrow.api.v1.DeleteUserRequest) returns (burrow.api.v1.DeleteUserResponse);
   rpc DeleteGroup(burrow.api.v1.DeleteGroupRequest) returns (burrow.api.v1.DeleteGroupResponse);
+  rpc SetPassword(burrow.api.v1.SetPasswordRequest) returns (burrow.api.v1.SetPasswordResponse);
   rpc QueryAudit(burrow.api.v1.AuditQuery) returns (AuditPage);  // collected, not streamed: the orchestrator merges pages from every node
 
   // Routes a public address to a sandbox here, or takes it away.
@@ -178,6 +179,9 @@ message NodeCreateRequest {
   map<string, string> credentials = 9;
   // The caller's request id, recorded as the sandbox's `create_request_id`.
   string request_id = 10;
+  // Turns Remote Desktop on and sets a fresh Administrator password, which
+  // the response carries and nothing keeps. A failure fails the create.
+  bool is_remote_desktop_enabled = 11;
 }
 
 message NodeRecreateRequest {

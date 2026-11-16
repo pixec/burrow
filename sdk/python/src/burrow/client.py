@@ -50,6 +50,7 @@ class Sandboxes:
         name: str = "",
         request_id: str = "",
         verbose_console: bool = False,
+        remote_desktop: bool = False,
         tags: Optional[Dict[str, str]] = None,
         node_labels: Optional[Dict[str, str]] = None,
         public_ips: Optional[List[str]] = None,
@@ -85,6 +86,10 @@ class Sandboxes:
         `request_id` makes the create safe to retry: a create naming
         the request id of one that already made a sandbox returns that
         sandbox, and one naming a create still running waits for it.
+
+        Windows guests: `remote_desktop` turns Remote Desktop on and gives
+        Administrator a fresh password, on the returned handle's
+        `remote_desktop` and nowhere else.
         """
         # A snapshot carries its own template, and one that disagrees is an
         # error, so nothing is sent as if the caller had asked for it. Without
@@ -117,6 +122,7 @@ class Sandboxes:
             ),
             kit=_to_kit_spec(kit),
             public_ips=public_ips or [],
+            is_remote_desktop_enabled=remote_desktop,
         )
         request.policy.is_console_verbose = verbose_console
         raw = self._transport.unary("CreateSandbox", request, timeout)

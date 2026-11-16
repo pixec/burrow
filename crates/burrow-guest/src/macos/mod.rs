@@ -300,3 +300,11 @@ async fn run() {
         std::process::exit(1);
     }
 }
+
+/// Remote Desktop is a Windows guest's.
+pub async fn enable_remote_desktop(_user: String) -> Result<(), tonic::Status> {
+    Err(tonic::Status::unimplemented(
+        "remote desktop is for windows guests",
+    ))
+}
+

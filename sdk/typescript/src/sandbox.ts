@@ -85,9 +85,11 @@ import type {
   ListOptions,
   MoveOptions,
   NetworkInput,
+  PasswordSet,
   PortMapping,
   PublicIp,
   RecreateOptions,
+  RemoteDesktopCredential,
   ResourceChange,
   ResourceOutcome,
   ResourcesUpdate,
@@ -161,6 +163,13 @@ export function toSandboxInfo(raw: any): SandboxInfo {
     publicIps: (raw.publicIps ?? []).map(toPublicIp),
     checkpointAt: dateOrNull(raw.checkpointAtUnixMs),
     checkpointKind: Number(raw.checkpointAtUnixMs ?? 0) > 0 ? checkpointKindOf(raw.checkpointKind) : null,
+    remoteDesktop: raw.remoteDesktop
+      ? {
+          username: raw.remoteDesktop.username ?? "",
+          password: raw.remoteDesktop.password ?? "",
+          port: Number(raw.remoteDesktop.port ?? 0),
+        }
+      : null,
   };
 }
 
@@ -381,6 +390,7 @@ export class Sandbox {
       nodeLabels: options.nodeLabels ?? {},
       kit: toKitSpec(options.kit),
       publicIps: options.publicIps ?? [],
+      isRemoteDesktopEnabled: options.remoteDesktop ?? false,
     };
   }
 
@@ -504,6 +514,14 @@ export class Sandbox {
    */
   get durable(): boolean {
     return this.info.durable;
+  }
+
+  /**
+   * The Remote Desktop logon a create with `remoteDesktop` made. Only the
+   * handle that create returned has it; nothing shows it again.
+   */
+  get remoteDesktop(): RemoteDesktopCredential | null {
+    return this.info.remoteDesktop;
   }
 
   /** Tags, as of the last call that returned the sandbox record. */
@@ -1190,6 +1208,41 @@ export class Sandbox {
       uid: Number(res.uid ?? 0),
       gid: Number(res.gid ?? 0),
       home: res.home ?? "",
+    };
+  }
+
+  /**
+   * Sets a guest account's password: root, or Administrator on Windows,
+   * unless `user` names another.
+   *
+   * ```ts
+   * const admin = await sandbox.setPassword();
+   * console.log(admin.username, admin.password);
+   * ```
+   *
+   * With no `password` one is generated and returned once; it is never
+   * stored. `create` makes the account when it does not exist.
+   */
+  async setPassword(
+    options: { user?: string; password?: string; create?: boolean } & CallOptions = {},
+  ): Promise<PasswordSet> {
+    const { user, password, create, ...call } = options;
+    const res = await this.withResume(() =>
+      this.call<any>(
+        "SetPassword",
+        {
+          sandboxId: this.id,
+          user: user ?? "",
+          password: password ?? "",
+          isCreatedIfMissing: create ?? false,
+        },
+        call,
+      ),
+    );
+    return {
+      username: res.username ?? "",
+      password: res.password ?? "",
+      created: Boolean(res.isCreated),
     };
   }
 

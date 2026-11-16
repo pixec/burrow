@@ -76,7 +76,37 @@ service Guest {
   // system or built-in account, an administrator or one the agent relies on.
   rpc DeleteUser(DeleteUserRequest) returns (DeleteUserResponse);
   rpc DeleteGroup(DeleteGroupRequest) returns (DeleteGroupResponse);
+  // Sets a local account's password, creating the account first when asked:
+  // root or Administrator when no user is named. An agent that serves it
+  // lists "set-password" in its health response.
+  rpc SetPassword(SetPasswordRequest) returns (SetPasswordResponse);
+  // Lets Remote Desktop in: the listener on and its firewall rules open.
+  // Windows guests only.
+  rpc EnableRemoteDesktop(EnableRemoteDesktopRequest) returns (EnableRemoteDesktopResponse);
 }
+
+message SetPasswordRequest {
+  // Empty is the guest's administrator: root, or Administrator on Windows.
+  string user = 1;
+  string password = 2;
+  // Creates the account when it does not exist, as CreateUser would, rather
+  // than failing.
+  bool is_created_if_missing = 3;
+}
+
+message SetPasswordResponse {
+  // The account as the guest spells it.
+  string username = 1;
+  bool is_created = 2;
+}
+
+message EnableRemoteDesktopRequest {
+  // Also adds this account to Remote Desktop Users. Empty adds no one; an
+  // administrator may log on already.
+  string user = 1;
+}
+
+message EnableRemoteDesktopResponse {}
 
 message CreateUserRequest {
   string name = 1;

@@ -38,9 +38,11 @@ from .types import (
     GuestUser,
     LimitsOutcome,
     NetworkPolicy,
+    PasswordSet,
     PortMapping,
     PrunedCommands,
     PublicIp,
+    RemoteDesktopCredential,
     ResourceOutcome,
     ResourcesUpdate,
     SandboxInfo,
@@ -112,6 +114,15 @@ def _to_sandbox_info(raw: common_pb2.Sandbox) -> SandboxInfo:
         checkpoint_kind=(
             ("memory" if raw.checkpoint_kind == common_pb2.CHECKPOINT_KIND_MEMORY else "disk")
             if raw.checkpoint_at_unix_ms
+            else None
+        ),
+        remote_desktop=(
+            RemoteDesktopCredential(
+                username=raw.remote_desktop.username,
+                password=raw.remote_desktop.password,
+                port=raw.remote_desktop.port,
+            )
+            if raw.HasField("remote_desktop")
             else None
         ),
     )
@@ -405,6 +416,12 @@ class Sandbox(ShutilMixin, SubprocessMixin):
         return self._info.unreachable
 
     @property
+    def remote_desktop(self) -> Optional[RemoteDesktopCredential]:
+        """The Remote Desktop logon a create with `remote_desktop=True` made.
+        Only the handle that create returned has it; nothing shows it again."""
+        return self._info.remote_desktop
+
+    @property
     def durable(self) -> bool:
         """Suspended with its latest suspend in the object store, so it can
         resume on another node."""
@@ -612,6 +629,40 @@ class Sandbox(ShutilMixin, SubprocessMixin):
         )
         return GuestUser(
             username=res.username or name, uid=res.uid, gid=res.gid, home=res.home
+        )
+
+    def set_password(
+        self,
+        user: str | None = None,
+        password: str | None = None,
+        *,
+        create: bool = False,
+    ) -> PasswordSet:
+        """Sets a guest account's password: root, or Administrator on Windows,
+        unless `user` names another.
+
+        ```python
+        admin = sandbox.set_password()
+        print(admin.username, admin.password)
+        ```
+
+        With no `password` one is generated and returned once; it is never
+        stored. `create` makes the account when it does not exist.
+        """
+        self._assert_live()
+        res = self._with_resume(
+            lambda: self._transport.unary(
+                "SetPassword",
+                api_pb2.SetPasswordRequest(
+                    sandbox_id=self.id,
+                    user=user or "",
+                    password=password or "",
+                    is_created_if_missing=create,
+                ),
+            )
+        )
+        return PasswordSet(
+            username=res.username, password=res.password, created=res.is_created
         )
 
     def create_group(self, name: str) -> GuestGroup:

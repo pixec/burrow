@@ -331,6 +331,81 @@ pub async fn create_user(name: &str) -> Result<guestpb::CreateUserResponse, Stat
     })
 }
 
+/// Sets an account's password, as `chpasswd` would and without needing it: a
+/// SHA-512 crypt hash into `/etc/shadow`, or `/etc/passwd` on an image with
+/// no shadow file. The password never reaches an argv or a pipe.
+pub async fn set_password(
+    req: guestpb::SetPasswordRequest,
+) -> Result<guestpb::SetPasswordResponse, Status> {
+    let name = match req.user.as_str() {
+        "" => "root".to_string(),
+        user => user.to_string(),
+    };
+    if req.password.is_empty() {
+        return Err(Status::invalid_argument("the password is empty"));
+    }
+    let is_created = match lookup_user(&name) {
+        Ok(_) => false,
+        Err(err) if err.code() == tonic::Code::NotFound && req.is_created_if_missing => {
+            create_user(&name).await?;
+            true
+        }
+        Err(err) => return Err(err),
+    };
+    let hash = crypt(&req.password)?;
+    let is_shadowed = Path::new("/etc/shadow").exists();
+    let path = if is_shadowed {
+        "/etc/shadow"
+    } else {
+        "/etc/passwd"
+    };
+    let days = (std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs()
+        / 86_400)
+        .to_string();
+    let mut found = false;
+    rewrite(path, |fields| {
+        let mut fields: Vec<&str> = fields.to_vec();
+        if fields[0] == name {
+            found = true;
+            fields[1] = &hash;
+            if is_shadowed && fields.len() > 2 {
+                fields[2] = &days;
+            }
+        }
+        Some(fields.join(":"))
+    })?;
+    if !found {
+        append_line(path, &format!("{name}:{hash}:{days}:0:99999:7:::"))?;
+    }
+    Ok(guestpb::SetPasswordResponse {
+        username: name,
+        is_created,
+    })
+}
+
+/// `password` as a `$6$` SHA-512 crypt string with a fresh salt.
+fn crypt(password: &str) -> Result<String, Status> {
+    const SALT: &[u8] = b"./0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz";
+    let mut bytes = [0u8; 16];
+    std::fs::File::open("/dev/urandom")
+        .and_then(|mut random| std::io::Read::read_exact(&mut random, &mut bytes))
+        .map_err(|err| Status::internal(format!("reading a salt: {err}")))?;
+    let salt: String = bytes
+        .iter()
+        .map(|b| char::from(SALT[usize::from(*b) % SALT.len()]))
+        .collect();
+    let hash = sha_crypt::sha512_crypt_b64(
+        password.as_bytes(),
+        salt.as_bytes(),
+        &sha_crypt::Sha512Params::default(),
+    )
+    .map_err(|err| Status::internal(format!("hashing the password: {err:?}")))?;
+    Ok(format!("$6${salt}${hash}"))
+}
+
 pub async fn create_group(name: &str) -> Result<guestpb::CreateGroupResponse, Status> {
     validate_name(name)?;
     if lookup_group(name).is_ok() {

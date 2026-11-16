@@ -125,6 +125,9 @@ service Burrow {
   // relies on are refused.
   rpc DeleteUser(DeleteUserRequest) returns (DeleteUserResponse);
   rpc DeleteGroup(DeleteGroupRequest) returns (DeleteGroupResponse);
+  // Sets a guest account's password, generating one when none is given:
+  // root or Administrator when no user is named. Not through Access tokens.
+  rpc SetPassword(SetPasswordRequest) returns (SetPasswordResponse);
 
   // Templates: build a reusable guest image by running steps in a sandbox.
   rpc BuildTemplate(BuildTemplateRequest) returns (stream BuildLog);
@@ -962,6 +965,9 @@ message CreateSandboxRequest {
   // [A-Za-z0-9._:-]; empty makes no such promise. Kept on the sandbox as
   // `create_request_id`.
   string request_id = 10;
+  // Windows guests: turns Remote Desktop on and gives Administrator a fresh
+  // password, returned once in the response's `remote_desktop`.
+  bool is_remote_desktop_enabled = 11;
 }
 
 message RecreateSandboxRequest {
@@ -1178,6 +1184,23 @@ message CreateUserResponse {
   uint32 gid = 3;
   // The user's home, created 0700 so other sandbox users cannot read it.
   string home = 4;
+}
+
+message SetPasswordRequest {
+  string sandbox_id = 1;
+  // Empty is the guest's administrator: root, or Administrator on Windows.
+  string user = 2;
+  // Empty generates one, returned once in the response.
+  string password = 3;
+  // Creates the account when it does not exist rather than failing.
+  bool is_created_if_missing = 4;
+}
+
+message SetPasswordResponse {
+  string username = 1;
+  // The password generated, when the request gave none. Never stored.
+  string password = 2;
+  bool is_created = 3;
 }
 
 message CreateGroupRequest {

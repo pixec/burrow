@@ -240,6 +240,15 @@ class KernelInfo:
 
 
 @dataclass
+class RemoteDesktopCredential:
+    username: str
+    password: str
+    # The guest port RDP listens on; reach it through an exposed port or a
+    # private network.
+    port: int
+
+
+@dataclass
 class SandboxInfo:
     id: str
     name: str
@@ -272,6 +281,9 @@ class SandboxInfo:
     # "disk" or "memory": whether a recovery boots on the saved disk or
     # resumes the saved memory. None for no checkpoint.
     checkpoint_kind: Optional[str] = None
+    # The Remote Desktop logon a create with `remote_desktop=True` made, on
+    # the handle that create returned only.
+    remote_desktop: Optional[RemoteDesktopCredential] = None
 
 
 @dataclass
@@ -472,6 +484,15 @@ class GuestGroup:
 class DeletedUser:
     home: str
     home_removed: bool
+
+
+@dataclass
+class PasswordSet:
+    username: str
+    # The password generated when none was given, shown only here; empty
+    # otherwise.
+    password: str
+    created: bool
 
 
 @dataclass

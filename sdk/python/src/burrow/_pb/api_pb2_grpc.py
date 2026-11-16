@@ -312,6 +312,11 @@ class BurrowStub(object):
                 request_serializer=api__pb2.DeleteGroupRequest.SerializeToString,
                 response_deserializer=api__pb2.DeleteGroupResponse.FromString,
                 _registered_method=True)
+        self.SetPassword = channel.unary_unary(
+                '/burrow.api.v1.Burrow/SetPassword',
+                request_serializer=api__pb2.SetPasswordRequest.SerializeToString,
+                response_deserializer=api__pb2.SetPasswordResponse.FromString,
+                _registered_method=True)
         self.BuildTemplate = channel.unary_stream(
                 '/burrow.api.v1.Burrow/BuildTemplate',
                 request_serializer=api__pb2.BuildTemplateRequest.SerializeToString,
@@ -773,6 +778,14 @@ class BurrowServicer(object):
         context.set_details('Method not implemented!')
         raise NotImplementedError('Method not implemented!')
 
+    def SetPassword(self, request, context):
+        """Sets a guest account's password, generating one when none is given:
+        root or Administrator when no user is named. Not through Access tokens.
+        """
+        context.set_code(grpc.StatusCode.UNIMPLEMENTED)
+        context.set_details('Method not implemented!')
+        raise NotImplementedError('Method not implemented!')
+
     def BuildTemplate(self, request, context):
         """Templates: build a reusable guest image by running steps in a sandbox.
         """
@@ -1150,6 +1163,11 @@ def add_BurrowServicer_to_server(servicer, server):
                     servicer.DeleteGroup,
                     request_deserializer=api__pb2.DeleteGroupRequest.FromString,
                     response_serializer=api__pb2.DeleteGroupResponse.SerializeToString,
+            ),
+            'SetPassword': grpc.unary_unary_rpc_method_handler(
+                    servicer.SetPassword,
+                    request_deserializer=api__pb2.SetPasswordRequest.FromString,
+                    response_serializer=api__pb2.SetPasswordResponse.SerializeToString,
             ),
             'BuildTemplate': grpc.unary_stream_rpc_method_handler(
                     servicer.BuildTemplate,
@@ -2709,6 +2727,33 @@ class Burrow(object):
             '/burrow.api.v1.Burrow/DeleteGroup',
             api__pb2.DeleteGroupRequest.SerializeToString,
             api__pb2.DeleteGroupResponse.FromString,
+            options,
+            channel_credentials,
+            insecure,
+            call_credentials,
+            compression,
+            wait_for_ready,
+            timeout,
+            metadata,
+            _registered_method=True)
+
+    @staticmethod
+    def SetPassword(request,
+            target,
+            options=(),
+            channel_credentials=None,
+            call_credentials=None,
+            insecure=False,
+            compression=None,
+            wait_for_ready=None,
+            timeout=None,
+            metadata=None):
+        return grpc.experimental.unary_unary(
+            request,
+            target,
+            '/burrow.api.v1.Burrow/SetPassword',
+            api__pb2.SetPasswordRequest.SerializeToString,
+            api__pb2.SetPasswordResponse.FromString,
             options,
             channel_credentials,
             insecure,

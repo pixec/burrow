@@ -1,8 +1,83 @@
-//! The machine itself: its name.
+//! The machine itself: its name, Remote Desktop.
 
 #![allow(clippy::result_large_err)]
 
+use std::os::windows::process::CommandExt as _;
+
+use tonic::Status;
+use windows_sys::Win32::System::Threading::CREATE_NO_WINDOW;
+
 use crate::windows::win;
+
+/// Turns the Remote Desktop listener on (`fDenyTSConnections` 0, which
+/// Terminal Services reads live), opens the Remote Desktop firewall rules,
+/// and lets `user` log on through it when one is named.
+pub async fn enable_remote_desktop(user: String) -> Result<(), Status> {
+    tokio::task::spawn_blocking(move || {
+        set_dword(
+            r"SYSTEM\CurrentControlSet\Control\Terminal Server",
+            "fDenyTSConnections",
+            0,
+        )?;
+        // The rule group by its resource name, which every language shares.
+        netsh(&[
+            "advfirewall",
+            "firewall",
+            "set",
+            "rule",
+            "group=@FirewallAPI.dll,-28752",
+            "new",
+            "enable=yes",
+        ])?;
+        if !user.is_empty() {
+            crate::windows::users::allow_remote_desktop(&user)?;
+        }
+        Ok(())
+    })
+    .await
+    .map_err(|err| Status::internal(format!("enabling remote desktop did not run: {err}")))?
+}
+
+/// Sets a DWORD under HKEY_LOCAL_MACHINE.
+pub fn set_dword(key: &str, value: &str, data: u32) -> Result<(), Status> {
+    use windows_sys::Win32::System::Registry::{HKEY_LOCAL_MACHINE, REG_DWORD, RegSetKeyValueW};
+    let (key_w, value_w) = (win::wide(key), win::wide(value));
+    // SAFETY: both names are NUL-terminated and `data` outlives the call.
+    let rc = unsafe {
+        RegSetKeyValueW(
+            HKEY_LOCAL_MACHINE,
+            key_w.as_ptr(),
+            value_w.as_ptr(),
+            REG_DWORD,
+            (&raw const data).cast(),
+            4,
+        )
+    };
+    if rc != 0 {
+        return Err(Status::internal(format!(
+            "setting {key}\\{value}: {}",
+            std::io::Error::from_raw_os_error(rc as i32)
+        )));
+    }
+    Ok(())
+}
+
+fn netsh(args: &[&str]) -> Result<(), Status> {
+    let output = std::process::Command::new("netsh")
+        .args(args)
+        .creation_flags(CREATE_NO_WINDOW)
+        .output()
+        .map_err(|err| Status::internal(format!("running netsh: {err}")))?;
+    if !output.status.success() {
+        return Err(Status::internal(format!(
+            "netsh {} exited {}: {}",
+            args.join(" "),
+            output.status,
+            String::from_utf8_lossy(&output.stdout).trim()
+        )));
+    }
+    Ok(())
+}
 
 /// `ComputerNamePhysicalDnsHostname`: the DNS host name, whose first 15
 /// characters Windows makes the NetBIOS name.

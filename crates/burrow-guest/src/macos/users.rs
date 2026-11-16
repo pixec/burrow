@@ -549,6 +549,14 @@ fn chown(path: impl AsRef<Path>, uid: u32, gid: u32) -> Result<(), Status> {
         .map_err(|err| Status::internal(format!("chown {}: {err}", path.display())))
 }
 
+pub async fn set_password(
+    _req: guestpb::SetPasswordRequest,
+) -> Result<guestpb::SetPasswordResponse, Status> {
+    Err(Status::unimplemented(
+        "setting a password is not supported on macos guests",
+    ))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
