@@ -96,7 +96,11 @@ impl SandboxMetrics {
 
     /// Registers the instruments on the global meter. Without an exporter the
     /// global meter is a no-op and nothing is read.
-    pub fn register(&self, node_id: Arc<Mutex<String>>) {
+    pub fn register(
+        &self,
+        node_id: Arc<Mutex<String>>,
+        cold_boots: Arc<crate::coldboot::ColdBoots>,
+    ) {
         let meter = opentelemetry::global::meter("burrowd");
         let observe = |pick: fn(&Reading) -> u64| {
             let readings = Arc::clone(&self.readings);
@@ -148,6 +152,25 @@ impl SandboxMetrics {
             .u64_observable_gauge("burrow.node.gc_stalled")
             .with_description("1 while the node's latest object-store collection failed")
             .with_callback(node(|c| u64::from(c.error().is_some())))
+            .build();
+
+        let boots = |pick: fn(&crate::coldboot::ColdBoots) -> u64| {
+            let cold_boots = Arc::clone(&cold_boots);
+            let node_id = Arc::clone(&node_id);
+            move |observer: &dyn opentelemetry::metrics::AsyncInstrument<u64>| {
+                let node_id = node_id.lock().unwrap().clone();
+                observer.observe(pick(&cold_boots), &[KeyValue::new("node_id", node_id)]);
+            }
+        };
+        meter
+            .u64_observable_gauge("burrow.node.cold_boots_waiting")
+            .with_description("Cold boots waiting for a --cold-boots slot")
+            .with_callback(boots(crate::coldboot::ColdBoots::waiting))
+            .build();
+        meter
+            .u64_observable_gauge("burrow.node.cold_boots_running")
+            .with_description("Cold boots holding a --cold-boots slot")
+            .with_callback(boots(crate::coldboot::ColdBoots::running))
             .build();
     }
 }

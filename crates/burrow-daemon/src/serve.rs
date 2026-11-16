@@ -300,6 +300,13 @@ pub struct ServeArgs {
         env = "BURROWD_CPU_OVERCOMMIT"
     )]
     pub cpu_overcommit: f64,
+    /// Sandboxes that may boot cold at once; more wait their turn. Booting
+    /// keeps a guest's vCPUs busy until its agent answers, so under
+    /// `--cpu-overcommit` a burst of boots can take every host CPU. Restores
+    /// from a warm snapshot are not counted. Unset is one per host CPU, and 0
+    /// is unlimited.
+    #[arg(long, env = "BURROWD_COLD_BOOTS")]
+    pub cold_boots: Option<usize>,
     /// Disk to keep free on the filesystem sandboxes' disks are on (the
     /// jailer's chroot base under `--jailer`, else the data directory), in
     /// MiB. It is left out of what may be provisioned, and while free disk is
@@ -1885,6 +1892,9 @@ pub async fn run(args: ServeArgs) -> anyhow::Result<()> {
                 reserve_mib: args.disk_reserve_mib,
             },
             cpu_overcommit: args.cpu_overcommit,
+            cold_boots: args
+                .cold_boots
+                .unwrap_or_else(crate::coldboot::default_limit),
             public: public_config(&args),
             warm: warm_policy(&args),
             checkpoint_min_secs: args.checkpoint_min_secs,
@@ -2149,7 +2159,9 @@ pub async fn run(args: ServeArgs) -> anyhow::Result<()> {
     // One token for the whole node-facing hop, so what this node accepts is
     // also what it presents when registering and when dialling a peer.
     let registration_token = cluster_token.clone();
-    sandboxes.metrics().register(Arc::clone(&node_id));
+    sandboxes
+        .metrics()
+        .register(Arc::clone(&node_id), sandboxes.cold_boots());
     sandboxes.volumes().bind_node_id(Arc::clone(&node_id));
     tokio::spawn(crate::delivery::run(
         sandboxes.delivery(),

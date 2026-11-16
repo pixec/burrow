@@ -9,6 +9,7 @@ mod ca;
 mod caibx;
 mod chunks;
 mod cmdlogs;
+mod coldboot;
 mod cpuid;
 mod delivery;
 mod devvm;

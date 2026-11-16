@@ -263,6 +263,8 @@ pub struct NodeConfig {
     pub depends_on: Vec<std::net::IpAddr>,
     /// Public addresses: the uplink and ingress limits.
     pub public: crate::publicip::PublicConfig,
+    /// Sandboxes that may boot cold at once (`--cold-boots`); 0 is unlimited.
+    pub cold_boots: usize,
     /// Which shapes are warmed, and how many snapshots are kept.
     pub warm: crate::warm::WarmPolicy,
     /// The shortest interval a sandbox's checkpoints are taken at, whatever
@@ -2885,6 +2887,7 @@ pub struct SandboxManager {
     /// CPU admitted to sandboxes being created, restored or recovered, until
     /// they are registered and counted on their own.
     cpu_admitted: Arc<std::sync::Mutex<u64>>,
+    cold_boots: Arc<crate::coldboot::ColdBoots>,
     /// Held across a CPU admission, so two cannot both fit the last slot.
     cpu_admission: Arc<Mutex<()>>,
     /// Root disks made ahead of creates, where the filesystem cannot clone.
@@ -3206,6 +3209,7 @@ impl SandboxManager {
             )),
             spares: crate::rootdisk::Spares::new(config.data_dir.join("spares")),
             resizer: Default::default(),
+            cold_boots: Arc::new(crate::coldboot::ColdBoots::new(config.cold_boots)),
             config,
             sandboxes: Arc::new(Mutex::new(HashMap::new())),
             disk_admissions: Default::default(),
@@ -3655,6 +3659,10 @@ impl SandboxManager {
 
     pub fn metrics(&self) -> &crate::metrics::SandboxMetrics {
         &self.metrics
+    }
+
+    pub fn cold_boots(&self) -> Arc<crate::coldboot::ColdBoots> {
+        Arc::clone(&self.cold_boots)
     }
 
     /// Refuses a lifecycle call while its events could not be delivered, if
@@ -8218,6 +8226,7 @@ impl SandboxManager {
         }
         tracing::Span::current().record("from_warm", is_warm);
 
+        let mut cold_boot = None;
         let started_vm = if is_warm && !is_macos {
             // Everything but the disk is linked and handed to the jail first,
             // so the VMM starts while the disk is copied and the tap is made:
@@ -8387,6 +8396,10 @@ impl SandboxManager {
             let boot_spec = spec.clone();
             record_working_set(&mut spec, self.config.object_store.is_some());
             phases.mark("spec");
+            if !is_warm {
+                cold_boot = Some(self.cold_boots.admit(&id).await);
+                phases.mark("cold_boot_queue");
+            }
             match is_warm {
                 true => Vm::restore(spec, true).await.map_err(|err| {
                     if let Some(snapshot) = &warm {
@@ -8559,6 +8572,7 @@ impl SandboxManager {
         };
 
         phases.mark("agent");
+        drop(cold_boot);
         // Nothing below this line can fail, so it is where the sandbox takes
         // over what the guard was holding on its behalf.
         let dialing = guard.dialing.take();
@@ -9917,7 +9931,8 @@ impl SandboxManager {
             crate::volume::agent_mounts(&policy.volumes, guest_os),
             guestconn::hostname(id),
         );
-        if let Err(err) = sandbox
+        let cold_boot = self.cold_boots.admit(id).await;
+        let booted = sandbox
             .boot(
                 spec,
                 request,
@@ -9925,8 +9940,9 @@ impl SandboxManager {
                 self.config.upgrade_for(guest_os),
                 hotplugged,
             )
-            .await
-        {
+            .await;
+        drop(cold_boot);
+        if let Err(err) = booted {
             self.volumes.release_all(id);
             sandbox.base_record.lock().unwrap().state_reason =
                 format!("its last boot failed: {}", err.message());
@@ -12358,6 +12374,7 @@ pub(crate) mod tests {
                     ..Default::default()
                 },
                 cpu_overcommit: 1.0,
+                cold_boots: 0,
                 depends_on: Vec::new(),
                 public: Default::default(),
                 warm: Default::default(),
