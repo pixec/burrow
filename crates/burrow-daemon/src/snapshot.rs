@@ -553,6 +553,7 @@ impl SnapshotStore {
             return Ok(());
         }
         remote.put_bytes(&remote_key(id, MANIFEST), json).await?;
+        crate::rootdisk::confirm_image(remote, &image).await?;
         write_manifest(&dir, &manifest).await?;
         tracing::info!(
             snapshot = id,

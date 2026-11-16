@@ -548,6 +548,7 @@ pub async fn upload(
     write_held(store, &local.manifest.node_id, &local.manifest, may_create).await?;
     local.is_published = true;
     save_local(workdir, &local).await?;
+    crate::rootdisk::confirm_image(store, &image).await?;
 
     if let Some(previous) = previous
         && previous.manifest.generation != generation
@@ -925,6 +926,7 @@ pub async fn upload_disk_checkpoint(
     write_held(store, &local.manifest.node_id, &local.manifest, may_create).await?;
     local.is_published = true;
     save_local(workdir, &local).await?;
+    crate::rootdisk::confirm_image(store, &image).await?;
     let _ = tokio::fs::rename(capture, &base_path).await;
     if let Some(previous) = previous
         && previous.manifest.generation != generation

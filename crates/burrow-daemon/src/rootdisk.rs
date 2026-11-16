@@ -696,8 +696,11 @@ pub async fn upload_image(
     image: &Image,
 ) -> Result<(), Status> {
     let key = remote_index_key(&image.digest);
-    if store.exists(&key).await? {
-        return Ok(());
+    // Put again when it is there, which refreshes its age: the collector
+    // takes the index of an image no manifest names once it is past the
+    // grace, and the manifest of the upload this is for is still to come.
+    if let Some(bytes) = store.get_bytes(&key).await? {
+        return store.put_bytes(&key, bytes).await;
     }
     let dir = image.path.parent().unwrap_or(Path::new("/"));
     let name = image
@@ -713,6 +716,23 @@ pub async fn upload_image(
         )));
     }
     crate::chunks::put_index(store, &key, &index).await
+}
+
+/// Puts the image back if the collector took its index while an upload
+/// naming it was in flight. Called once that upload's manifest is written,
+/// after which the collector wants the image.
+pub async fn confirm_image(
+    store: &crate::objstore::ObjectStore,
+    image: &Image,
+) -> Result<(), Status> {
+    if store.exists(&remote_index_key(&image.digest)).await? {
+        return Ok(());
+    }
+    tracing::warn!(
+        image = image.digest,
+        "the collector took an image an upload names; putting it back"
+    );
+    upload_image(store, image).await
 }
 
 /// Brings the image with `digest` onto this node from the object store,
@@ -782,8 +802,16 @@ pub async fn remote_image_refs(
             continue;
         };
         if !wanted.contains(digest) && modified.is_some_and(|at| at <= cutoff) {
-            store.delete(&key).await?;
-            removed += 1;
+            // Its chunks still count for this pass, and its age is read
+            // again just before the delete: an upload naming the image may
+            // have just put its index again, its manifest still to come.
+            if let Some(index) = crate::chunks::read_index(store, &key).await? {
+                out.extend(index.digests());
+            }
+            if store.modified(&key).await?.is_some_and(|at| at <= cutoff) {
+                store.delete(&key).await?;
+                removed += 1;
+            }
             continue;
         }
         if let Some(index) = crate::chunks::read_index(store, &key).await? {
@@ -1032,6 +1060,46 @@ mod tests {
         );
         let found = local_image(&blobs, &dir, &image.digest).await.unwrap();
         assert_eq!(found.index.chunks, image.index.chunks);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// An upload relying on an image already in the store refreshes its
+    /// index, so the collector does not take it before the upload's manifest
+    /// names it; one that took it anyway still counts its chunks for that
+    /// pass, and the upload puts it back once its manifest is written.
+    #[tokio::test]
+    async fn an_image_an_upload_relies_on_outlives_the_collector() {
+        let dir = scratch("image-race");
+        let (store, _, objects) = crate::objstore::fake::controlled().await;
+        let blobs = crate::blobs::BlobStore::new(&dir);
+        let image_path = dir.join(IMAGE);
+        let file = std::fs::File::create(&image_path).unwrap();
+        file.set_len(2 * MIB).unwrap();
+        file.write_all_at(&[1; 4096], 0).unwrap();
+        drop(file);
+        let image = image_of(&blobs, &image_path).await.unwrap();
+        upload_image(&store, &image).await.unwrap();
+        let day = std::time::Duration::from_secs(24 * 3600);
+        let collect = || async {
+            let mut refs = std::collections::HashSet::new();
+            let removed = remote_image_refs(&store, &Default::default(), day, &mut refs)
+                .await
+                .unwrap();
+            (removed, refs)
+        };
+
+        objects.lock().unwrap().age("images/", 2 * day);
+        upload_image(&store, &image).await.unwrap();
+        assert_eq!(collect().await.0, 0, "refreshed by the upload");
+
+        objects.lock().unwrap().age("images/", 2 * day);
+        let (removed, refs) = collect().await;
+        assert_eq!(removed, 1);
+        assert!(image.index.digests().all(|digest| refs.contains(&digest)));
+        let key = remote_index_key(&image.digest);
+        assert!(!store.exists(&key).await.unwrap());
+        confirm_image(&store, &image).await.unwrap();
+        assert!(store.exists(&key).await.unwrap());
         let _ = std::fs::remove_dir_all(&dir);
     }
 

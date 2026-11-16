@@ -398,6 +398,29 @@ impl ObjectStore {
         }
     }
 
+    /// When the object at `key` was last written, or `None` when there is
+    /// none.
+    pub async fn modified(&self, key: &str) -> Result<Option<std::time::SystemTime>, Status> {
+        match self
+            .client
+            .head_object()
+            .bucket(&self.bucket)
+            .key(self.key(key))
+            .send()
+            .await
+        {
+            Ok(head) => Ok(head
+                .last_modified()
+                .and_then(|at| std::time::SystemTime::try_from(*at).ok())),
+            Err(SdkError::ServiceError(err))
+                if matches!(err.err(), HeadObjectError::NotFound(_)) =>
+            {
+                Ok(None)
+            }
+            Err(err) => Err(unavailable("head", key, err)),
+        }
+    }
+
     pub async fn delete(&self, key: &str) -> Result<(), Status> {
         self.client
             .delete_object()
@@ -682,6 +705,7 @@ pub(crate) mod fake {
                 tokio::time::sleep(std::time::Duration::from_millis(delay)).await;
                 faults.in_flight.fetch_sub(1, Ordering::Relaxed);
             }
+            let (is_listing, object) = (listing.is_some(), key.clone());
             let failing = method == "GET"
                 && listing.is_none()
                 && faults
@@ -774,6 +798,15 @@ pub(crate) mod fake {
             let mut response = format!("HTTP/1.1 {status} X\r\n");
             if let Some(etag) = etag {
                 response.push_str(&format!("ETag: {etag}\r\n"));
+            }
+            if status == 200
+                && !is_listing
+                && let Some(at) = objects.lock().unwrap().written.get(&object)
+            {
+                let at = aws_sdk_s3::primitives::DateTime::from(*at)
+                    .fmt(aws_sdk_s3::primitives::DateTimeFormat::HttpDate)
+                    .unwrap();
+                response.push_str(&format!("Last-Modified: {at}\r\n"));
             }
             let sent = if method == "HEAD" { 0 } else { payload.len() };
             response.push_str(&format!("Content-Length: {}\r\n\r\n", payload.len()));
