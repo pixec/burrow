@@ -782,10 +782,18 @@ message ForkSandboxRequest {
   // first so the child starts from its state as of the call.
   string sandbox_id = 1;
   // Replaces the source's policy on the child. Empty inherits it, which is the
-  // usual case: a fork is meant to be the same sandbox again. `resources` is
-  // the exception: a restore takes its machine configuration from the
-  // snapshot, so an override naming different vcpus, memory or disk is
-  // refused rather than silently ignored.
+  // usual case: a fork is meant to be the same sandbox again. Each section
+  // left unset is inherited on its own, and `is_console_verbose` can be
+  // turned on for the child but not off. Of `resources` only vcpus, mem_mib
+  // and disk_mib are taken, 0 keeping the source's, and a max_mem_mib other
+  // than the source's is refused: the child restores at the source's shape
+  // and is resized live before it is returned. Memory moves within the source's max_mem_mib and not below the
+  // memory it booted with, a disk only grows, and vcpus change only where the
+  // hypervisor hotplugs them (Cloud Hypervisor on x86_64). Anything else is
+  // refused with FAILED_PRECONDITION before the source is touched, as is any
+  // change for a Windows or macOS guest. A macOS guest's fork is its disk
+  // alone: a clone booted cold on the same Mac, without the source's
+  // processes.
   burrow.common.v1.Policy policy = 3;
   // Name for the child, under the same rules as on a create. A fork does not
   // inherit its source's name: names are unique, and there can only be one.
@@ -815,7 +823,10 @@ message MoveSandboxRequest {
 // Takes a sandbox's current state and keeps it as a snapshot object.
 //
 // The sandbox goes on running: the guest is paused only long enough to write
-// its state. Stopping a sandbox is what PauseSandbox is for.
+// its state. Stopping a sandbox is what PauseSandbox is for. A macOS guest's
+// snapshot holds its disk alone, since Virtualization.framework's saved
+// memory restores only on the Mac that wrote it; one taken while it runs is
+// a crash-consistent copy after its writes are flushed.
 message CreateSnapshotRequest {
   string sandbox_id = 1;
   // Seconds from last use before the snapshot is swept, refreshed whenever a
@@ -927,11 +938,12 @@ message CreateSandboxRequest {
   // possible. Empty leaves the sandbox unnamed.
   string name = 5;
   // Snapshot to start from. The new sandbox **restores** that state rather
-  // than cold-booting, and inherits the snapshot's template and machine shape:
-  // `template` may only name the snapshot's own, and `resources` may only
-  // repeat the shape it was taken with, because a restore takes its
-  // configuration from the snapshot, so anything else is refused rather than
-  // ignored.
+  // than cold-booting, and inherits the snapshot's template: `template` may
+  // only name the snapshot's own. It restores at the shape the snapshot was
+  // taken with, and `resources` naming another vcpus, mem_mib or disk_mib is
+  // reached live once it runs, under the rules ForkSandboxRequest.policy
+  // gives; what cannot be is refused up front. A macOS guest's snapshot is
+  // its disk alone, and a sandbox from it boots cold.
   // Placed on the node holding the snapshot, or on a compatible node when it
   // is durable and no node holds it.
   string snapshot = 6;
