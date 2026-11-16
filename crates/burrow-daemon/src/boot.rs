@@ -41,8 +41,8 @@ pub fn firmware_boot() -> burrow_vmm::Boot {
 /// another filesystem, and it is a few MiB.
 pub async fn take_firmware(firmware: &Path, workdir: &Path) -> std::io::Result<()> {
     let dest = workdir.join(FIRMWARE);
-    if tokio::fs::try_exists(&dest).await.unwrap_or(false)
-        && crate::kernels::digest(&dest).await? == crate::kernels::digest(firmware).await?
+    if crate::kernels::digest_unfollowed(&dest).await?
+        == Some(crate::kernels::digest(firmware).await?)
     {
         return Ok(());
     }

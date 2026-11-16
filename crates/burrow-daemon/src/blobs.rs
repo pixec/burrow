@@ -329,9 +329,13 @@ impl Drop for BlobWriter {
 /// Digest of a file on disk, read in chunks so a rootfs is never held in
 /// memory.
 pub async fn hash_file(path: &Path) -> io::Result<Digest> {
+    hash_open(tokio::fs::File::open(path).await?).await
+}
+
+/// Digest of a file already open.
+pub async fn hash_open(mut file: tokio::fs::File) -> io::Result<Digest> {
     use tokio::io::AsyncReadExt;
 
-    let mut file = tokio::fs::File::open(path).await?;
     let mut hasher = Sha256::new();
     let mut buffer = vec![0u8; CHUNK];
     loop {

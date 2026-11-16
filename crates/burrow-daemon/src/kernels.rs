@@ -300,6 +300,37 @@ pub async fn digest(path: &Path) -> std::io::Result<String> {
     Ok(digest)
 }
 
+/// The SHA-256 of the regular file at `path`, `None` when there is none:
+/// never through a link, for a file in a jail's working directory.
+pub async fn digest_unfollowed(path: &Path) -> std::io::Result<Option<String>> {
+    let file = match tokio::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
+        .open(path)
+        .await
+    {
+        Ok(file) => file,
+        Err(err)
+            if err.kind() == std::io::ErrorKind::NotFound
+                || err.raw_os_error() == Some(libc::ELOOP) =>
+        {
+            return Ok(None);
+        }
+        Err(err) => return Err(err),
+    };
+    let meta = file.metadata().await?;
+    if !meta.is_file() {
+        return Ok(None);
+    }
+    let key = file_key(&meta);
+    if let Some(digest) = DIGESTS.lock().unwrap().get(&key) {
+        return Ok(Some(digest.clone()));
+    }
+    let digest = crate::blobs::hash_open(file).await?.to_string();
+    DIGESTS.lock().unwrap().insert(key, digest.clone());
+    Ok(Some(digest))
+}
+
 /// The kernel at `path`: its digest, and what it has built in.
 pub async fn inspect(path: &Path) -> Result<Inspected, String> {
     inspect_with(path, None).await

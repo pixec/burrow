@@ -9876,7 +9876,7 @@ impl SandboxManager {
             .map_err(|err| Status::internal(format!("taking the node's firmware: {err}")));
         }
         let current = sandbox.workdir.join(TEMPLATE_KERNEL);
-        if !tokio::fs::try_exists(&current).await.unwrap_or(false) {
+        if tokio::fs::symlink_metadata(&current).await.is_err() {
             return Ok(());
         }
         let template = sandbox.template();
@@ -9904,11 +9904,25 @@ impl SandboxManager {
         }
         let io =
             |err: std::io::Error| Status::internal(format!("taking the template's kernel: {err}"));
-        if crate::kernels::digest(&current).await.map_err(io)? != inspected.digest {
+        if crate::kernels::digest_unfollowed(&current)
+            .await
+            .map_err(io)?
+            .as_ref()
+            != Some(&inspected.digest)
+        {
             let next = sandbox.workdir.join("vmlinux.next");
             let _ = tokio::fs::remove_file(&next).await;
             if tokio::fs::hard_link(&source, &next).await.is_err() {
-                tokio::fs::copy(&source, &next).await.map_err(io)?;
+                let mut to = tokio::fs::OpenOptions::new()
+                    .write(true)
+                    .create_new(true)
+                    .mode(0o644)
+                    .custom_flags(libc::O_NOFOLLOW)
+                    .open(&next)
+                    .await
+                    .map_err(io)?;
+                let mut from = tokio::fs::File::open(&source).await.map_err(io)?;
+                tokio::io::copy(&mut from, &mut to).await.map_err(io)?;
             }
             tokio::fs::rename(&next, &current).await.map_err(io)?;
         }
