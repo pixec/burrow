@@ -4327,6 +4327,10 @@ impl SandboxManager {
             logs_root.clone(),
             known.iter().map(|id| logs_root.join(id)).collect(),
         ));
+        roots.push((
+            self.config.tpm_root(),
+            known.iter().map(|id| self.config.tpm_dir(id)).collect(),
+        ));
 
         let journaled = self.journaled_dirs().await;
         let mut removed = 0;
@@ -12503,6 +12507,12 @@ pub(crate) mod tests {
         }
         let orphan = data_dir.join("sandboxes").join("ghost-nobody");
         std::fs::create_dir_all(&orphan).unwrap();
+        let (tpm, orphan_tpm) = (
+            manager.config.tpm_dir(id),
+            manager.config.tpm_dir("ghost-nobody"),
+        );
+        std::fs::create_dir_all(&tpm).unwrap();
+        std::fs::create_dir_all(&orphan_tpm).unwrap();
         let foreign = row(
             id,
             common::SandboxState::Suspended,
@@ -12515,6 +12525,8 @@ pub(crate) mod tests {
         assert_eq!(manager.store.list_sandboxes().await.unwrap().len(), 1);
         assert!(workdir.join(layout.state).exists());
         assert!(!orphan.exists());
+        assert!(tpm.exists());
+        assert!(!orphan_tpm.exists());
         let listed = manager.list().await;
         assert_eq!(listed.len(), 1);
         assert_eq!(listed[0].state, common::SandboxState::Failed as i32);
