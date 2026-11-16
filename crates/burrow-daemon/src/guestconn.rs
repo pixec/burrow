@@ -363,6 +363,10 @@ pub struct GuestUpgrade {
 /// timeout: a macOS guest assesses a binary it has not run before on its
 /// first launch, which on its own can take most of that.
 pub const UPGRADE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(120);
+/// How long a guest that said it is restarting gets to stop answering: a
+/// Windows shutdown. Coming back up is then bound by the agent timeout, so a
+/// caller bounding a whole handshake allows both on top of its own.
+pub const RESTART_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(120);
 /// How long one reconnect to an upgrading agent may take. A connection the
 /// old process accepts as it goes is never answered, and waiting it out to the
 /// agent timeout is most of what an upgrade used to cost.
@@ -382,7 +386,9 @@ const RECONNECT_ATTEMPT: std::time::Duration = std::time::Duration::from_secs(3)
 /// own agent is handshaken again naming that one, which starts it.
 ///
 /// A guest that restarts to take the name it was given, as a Windows guest
-/// does on its first boot, is waited out and handshaken again once.
+/// does on its first boot, is waited out and handshaken again once, and only
+/// then upgraded: an agent replaced mid-restart could be cut off by the
+/// restart, or leave one pending under the caller's first call.
 #[allow(clippy::result_large_err)]
 pub async fn handshake_upgrading(
     agent: GuestClient<Channel>,
@@ -397,7 +403,7 @@ pub async fn handshake_upgrading(
         return Ok((agent, response));
     }
     let started = std::time::Instant::now();
-    wait_until_gone(agent, timeout).await?;
+    wait_until_gone(agent).await?;
     let (agent, _) = connect_when_ready(guest.clone(), timeout)
         .await
         .map_err(|err| tonic::Status::internal(format!("the restarted guest: {err}")))?;
@@ -416,11 +422,8 @@ pub async fn handshake_upgrading(
 }
 
 /// Polls an agent that said it is restarting until it stops answering.
-async fn wait_until_gone(
-    mut agent: GuestClient<Channel>,
-    timeout: std::time::Duration,
-) -> Result<(), tonic::Status> {
-    let deadline = std::time::Instant::now() + timeout;
+async fn wait_until_gone(mut agent: GuestClient<Channel>) -> Result<(), tonic::Status> {
+    let deadline = std::time::Instant::now() + RESTART_TIMEOUT;
     while std::time::Instant::now() < deadline {
         tokio::time::sleep(std::time::Duration::from_millis(250)).await;
         let health = agent.health(guestpb::GuestHealthRequest {});
@@ -454,7 +457,7 @@ async fn handshake_upgrading_once(
         .handshake(stamped(&expecting(&upgrade.digest)))
         .await?
         .into_inner();
-    if response.agent_digest == upgrade.digest {
+    if response.agent_digest == upgrade.digest || response.is_restarting {
         return Ok((agent, response));
     }
     // The digest sent is of the bytes read now, not the one hashed at

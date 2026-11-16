@@ -309,6 +309,13 @@ pub async fn upgrade(
 ) -> Result<guestpb::UpgradeResponse, Status> {
     use sha2::Digest as _;
     use tokio::io::AsyncWriteExt as _;
+    // The restart this agent started would cut the new one off, or fire
+    // under whatever the host does next.
+    if crate::windows::machine::is_restarting() {
+        return Err(Status::failed_precondition(
+            "the guest is restarting to take its name",
+        ));
+    }
     let exe =
         std::env::current_exe().map_err(|err| Status::internal(format!("own path: {err}")))?;
     let temp = exe.with_extension(format!("{}.new", std::process::id()));

@@ -1149,7 +1149,9 @@ fn spawn_handshake(
         let phases = std::sync::Mutex::new(burrow_vmm::Phases::start());
         let guest_timing = std::sync::Mutex::new(None);
         let reached = std::sync::Mutex::new(Reached::Nothing);
-        let outcome = match tokio::time::timeout(timeout + guestconn::UPGRADE_TIMEOUT, async {
+        // A guest restarting for its name boots again, on top of the rest.
+        let bound = timeout + guestconn::UPGRADE_TIMEOUT + guestconn::RESTART_TIMEOUT + timeout;
+        let outcome = match tokio::time::timeout(bound, async {
             let (agent, accepted_at) = match dialing {
                 Some(dialing) => dialing.await??,
                 None => guestconn::connect_when_ready(guest.clone(), timeout).await?,
