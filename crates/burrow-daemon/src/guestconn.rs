@@ -389,14 +389,12 @@ fn restart_grace(guest_os: burrow_vmm::GuestOs) -> std::time::Duration {
 /// so there only a missing socket counts.
 async fn is_vmm_gone(guest: &GuestAddr) -> bool {
     let connect = tokio::net::UnixStream::connect(guest.socket_path());
-    match tokio::time::timeout(std::time::Duration::from_millis(500), connect).await {
-        Ok(Err(err)) => match err.kind() {
-            std::io::ErrorKind::NotFound => true,
-            std::io::ErrorKind::ConnectionRefused => cfg!(target_os = "linux"),
-            _ => false,
-        },
-        _ => false,
-    }
+    let Ok(Err(err)) = tokio::time::timeout(std::time::Duration::from_millis(500), connect).await
+    else {
+        return false;
+    };
+    err.kind() == std::io::ErrorKind::NotFound
+        || (cfg!(target_os = "linux") && err.kind() == std::io::ErrorKind::ConnectionRefused)
 }
 
 /// Why an upgrade that has not come back as `new` never will, if that is
