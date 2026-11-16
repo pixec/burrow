@@ -579,6 +579,11 @@ impl NodeService for NodeApi {
             && let Some(recorded) = self.image_environment(&req.template).await.kit
         {
             crate::template::validate_name(&req.template)?;
+            if req.is_remote_desktop_enabled || req.activation.is_some() {
+                return Err(Status::invalid_argument(
+                    "remote desktop and activation are for windows guests",
+                ));
+            }
             let request = KitCreate {
                 id: req.sandbox_id,
                 template: req.template,
