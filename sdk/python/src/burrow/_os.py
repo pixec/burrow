@@ -1,5 +1,5 @@
-"""`sandbox.os` and `sandbox.os.path`: the stdlib's functions, against the
-sandbox's filesystem.
+"""The sandbox's `os` and `os.path` methods: the stdlib's functions, against
+the sandbox's filesystem.
 
 Each is one `Fs` call, or the few the stdlib's own definition takes, and fails
 the way the stdlib does: a kernel error is raised as the `OSError` subclass its
@@ -14,7 +14,7 @@ import os
 import posixpath
 import stat as _stat
 import time
-from typing import TYPE_CHECKING, Any, Dict, Iterator, List, Optional
+from typing import TYPE_CHECKING, Any, Callable, Dict, Iterator, List, Optional
 
 from ._pb import api_pb2
 from ._wire import label
@@ -105,8 +105,8 @@ class DirEntry:
     `stat` and `inode` make a call the first time and keep the answer.
     """
 
-    def __init__(self, os_: "SandboxOs", top: str, name: str, kind: str):
-        self._os = os_
+    def __init__(self, sandbox: "Sandbox", top: str, name: str, kind: str):
+        self._sandbox = sandbox
         self.name = name
         self.path = posixpath.join(top, name)
         self._kind = kind
@@ -145,10 +145,10 @@ class DirEntry:
     def stat(self, *, follow_symlinks: bool = True) -> os.stat_result:
         if follow_symlinks and self.is_symlink():
             if self._stat is None:
-                self._stat = self._os.stat(self.path)
+                self._stat = self._sandbox.stat(self.path)
             return self._stat
         if self._lstat is None:
-            self._lstat = self._os.lstat(self.path)
+            self._lstat = self._sandbox.lstat(self.path)
         return self._lstat
 
 
@@ -175,123 +175,17 @@ class _ScandirIterator:
         self.close()
 
 
-class SandboxOsPath:
-    """`os.path`, with every question that touches the filesystem asked of the
-    sandbox. The pure string functions are `posixpath`'s own, since the guest
-    is Linux whatever this machine is."""
-
-    sep = posixpath.sep
-    curdir = posixpath.curdir
-    pardir = posixpath.pardir
-    extsep = posixpath.extsep
-    altsep = posixpath.altsep
-    pathsep = posixpath.pathsep
-    devnull = posixpath.devnull
-
-    basename = staticmethod(posixpath.basename)
-    commonpath = staticmethod(posixpath.commonpath)
-    commonprefix = staticmethod(posixpath.commonprefix)
-    dirname = staticmethod(posixpath.dirname)
-    isabs = staticmethod(posixpath.isabs)
-    join = staticmethod(posixpath.join)
-    normcase = staticmethod(posixpath.normcase)
-    normpath = staticmethod(posixpath.normpath)
-    samestat = staticmethod(posixpath.samestat)
-    split = staticmethod(posixpath.split)
-    splitdrive = staticmethod(posixpath.splitdrive)
-    splitext = staticmethod(posixpath.splitext)
-
-    def __init__(self, os_: "SandboxOs"):
-        self._os = os_
-
-    def exists(self, path: Any) -> bool:
-        try:
-            self._os.stat(path)
-        except (OSError, ValueError):
-            return False
-        return True
-
-    def lexists(self, path: Any) -> bool:
-        try:
-            self._os.lstat(path)
-        except (OSError, ValueError):
-            return False
-        return True
-
-    def _mode(self, path: Any, follow_symlinks: bool = True) -> int:
-        try:
-            return self._os.stat(path, follow_symlinks=follow_symlinks).st_mode
-        except (OSError, ValueError):
-            return 0
-
-    def isfile(self, path: Any) -> bool:
-        return _stat.S_ISREG(self._mode(path))
-
-    def isdir(self, s: Any) -> bool:
-        return _stat.S_ISDIR(self._mode(s))
-
-    def islink(self, path: Any) -> bool:
-        return _stat.S_ISLNK(self._mode(path, follow_symlinks=False))
-
-    def getsize(self, filename: Any) -> int:
-        return self._os.stat(filename).st_size
-
-    def getmtime(self, filename: Any) -> float:
-        return self._os.stat(filename).st_mtime
-
-    def getatime(self, filename: Any) -> float:
-        return self._os.stat(filename).st_atime
-
-    def getctime(self, filename: Any) -> float:
-        return self._os.stat(filename).st_ctime
-
-    def samefile(self, f1: Any, f2: Any) -> bool:
-        return posixpath.samestat(self._os.stat(f1), self._os.stat(f2))
-
-    def realpath(self, filename: Any, *, strict: bool = False) -> str:
-        path = fspath(filename)
-        try:
-            return self._os._sandbox._fs(realpath=api_pb2.FsRealpath(path=path)).path
-        except OSError:
-            head, tail = posixpath.split(path.rstrip("/"))
-            if strict or not tail:
-                raise
-        # Without strict the stdlib resolves what exists and appends the rest
-        # as written. Nothing past a missing component can be a symlink, so
-        # normalising that part is all resolving it would do.
-        return posixpath.normpath(posixpath.join(self.realpath(head or "."), tail))
-
-
-class SandboxOs:
-    """`os`, for the sandbox's filesystem.
+class OsMixin:
+    """`os` and the filesystem half of `os.path`, as `Sandbox` methods.
 
     Paths are the guest's: absolute, or relative to the guest agent's working
     directory. Signatures, defaults and exceptions are the stdlib's; `dir_fd`
-    is not taken, since there is no descriptor here to be relative to.
+    is not taken, since there is no descriptor here to be relative to. The
+    pure path functions (`join`, `basename`, ...) are `posixpath`'s, since the
+    guest is Linux whatever this machine is.
     """
 
-    F_OK = 0
-    X_OK = 1
-    W_OK = 2
-    R_OK = 4
-
-    sep = posixpath.sep
-    curdir = posixpath.curdir
-    pardir = posixpath.pardir
-    extsep = posixpath.extsep
-    altsep = posixpath.altsep
-    pathsep = posixpath.pathsep
-    linesep = "\n"
-    devnull = posixpath.devnull
-
-    fspath = staticmethod(os.fspath)
-
-    def __init__(self, sandbox: "Sandbox"):
-        self._sandbox = sandbox
-        self.path = SandboxOsPath(self)
-
-    def _fs(self, **op: Any) -> api_pb2.FsResponse:
-        return self._sandbox._fs(**op)
+    _fs: Callable[..., api_pb2.FsResponse]
 
     def stat(self, path: Any, *, follow_symlinks: bool = True) -> os.stat_result:
         res = self._fs(stat=api_pb2.FsStat(path=fspath(path), is_nofollow=not follow_symlinks))
@@ -357,7 +251,7 @@ class SandboxOs:
                     if (
                         followlinks
                         or not links.get(dirname, True)
-                        or (dirname not in links and not self.path.islink(new_path))
+                        or (dirname not in links and not self.islink(new_path))
                     ):
                         stack.append(new_path)
             else:
@@ -383,13 +277,11 @@ class SandboxOs:
                 self._fs(mkdir=api_pb2.FsMkdir(path=head, is_recursive=True))
                 self.mkdir(path, mode)
         except OSError:
-            if not exist_ok or not self.path.isdir(path):
+            if not exist_ok or not self.isdir(path):
                 raise
 
     def remove(self, path: Any) -> None:
         self._fs(remove=api_pb2.FsRemove(path=fspath(path)))
-
-    unlink = remove
 
     def rmdir(self, path: Any) -> None:
         self._fs(remove=api_pb2.FsRemove(path=fspath(path), is_dir_only=True))
@@ -407,11 +299,9 @@ class SandboxOs:
             head, tail = posixpath.split(head)
 
     def rename(self, src: Any, dst: Any) -> None:
+        """`os.rename`, which on Linux also replaces an existing `dst`, as
+        `os.replace` does."""
         self._fs(rename=api_pb2.FsRename(src=fspath(src), dst=fspath(dst)))
-
-    # rename(2) already replaces on Linux; the stdlib has both names because
-    # Windows' rename does not.
-    replace = rename
 
     def chmod(self, path: Any, mode: int) -> None:
         self._fs(chmod=api_pb2.FsChmod(path=fspath(path), mode=mode))
@@ -476,3 +366,60 @@ class SandboxOs:
         except OSError:
             return False
         return True
+
+    def exists(self, path: Any) -> bool:
+        try:
+            self.stat(path)
+        except (OSError, ValueError):
+            return False
+        return True
+
+    def lexists(self, path: Any) -> bool:
+        try:
+            self.lstat(path)
+        except (OSError, ValueError):
+            return False
+        return True
+
+    def _mode(self, path: Any, follow_symlinks: bool = True) -> int:
+        try:
+            return self.stat(path, follow_symlinks=follow_symlinks).st_mode
+        except (OSError, ValueError):
+            return 0
+
+    def isfile(self, path: Any) -> bool:
+        return _stat.S_ISREG(self._mode(path))
+
+    def isdir(self, s: Any) -> bool:
+        return _stat.S_ISDIR(self._mode(s))
+
+    def islink(self, path: Any) -> bool:
+        return _stat.S_ISLNK(self._mode(path, follow_symlinks=False))
+
+    def getsize(self, filename: Any) -> int:
+        return self.stat(filename).st_size
+
+    def getmtime(self, filename: Any) -> float:
+        return self.stat(filename).st_mtime
+
+    def getatime(self, filename: Any) -> float:
+        return self.stat(filename).st_atime
+
+    def getctime(self, filename: Any) -> float:
+        return self.stat(filename).st_ctime
+
+    def samefile(self, f1: Any, f2: Any) -> bool:
+        return posixpath.samestat(self.stat(f1), self.stat(f2))
+
+    def realpath(self, filename: Any, *, strict: bool = False) -> str:
+        path = fspath(filename)
+        try:
+            return self._fs(realpath=api_pb2.FsRealpath(path=path)).path
+        except OSError:
+            head, tail = posixpath.split(path.rstrip("/"))
+            if strict or not tail:
+                raise
+        # Without strict the stdlib resolves what exists and appends the rest
+        # as written. Nothing past a missing component can be a symlink, so
+        # normalising that part is all resolving it would do.
+        return posixpath.normpath(posixpath.join(self.realpath(head or "."), tail))

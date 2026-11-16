@@ -10,7 +10,7 @@ from typing import Any, Callable, Dict, Iterator, List, Optional, Sequence, Tupl
 import grpc
 
 from ._fileio import open_file
-from ._os import SandboxOs, os_error
+from ._os import os_error
 from ._pathlib import SandboxPath
 from ._pb import api_pb2, common_pb2
 from ._policy import (
@@ -21,8 +21,8 @@ from ._policy import (
     to_network_policy,
     to_policy,
 )
-from ._shutil import SandboxShutil
-from ._subprocess import SandboxSubprocess
+from ._shutil import ShutilMixin
+from ._subprocess import Popen, SubprocessMixin
 from ._transport import _DEFAULT, Transport
 from ._wire import at, at_or_none, label
 from ._wire import kernel as to_kernel
@@ -212,11 +212,26 @@ class Watcher:
         self.stop()
 
 
-class Sandbox:
+class Sandbox(ShutilMixin, SubprocessMixin):
     """A sandbox.
 
     Obtained from `Burrow.sandboxes`, the `Sandbox.create`/`get`/`list`
     shortcuts or `Sandbox.fork`; not constructed directly.
+
+    Besides its lifecycle, a handle carries the stdlib's file and process
+    functions against the guest, as its own methods: `open`, the `os` and
+    `os.path` functions that touch the filesystem (`stat`, `listdir`,
+    `makedirs`, `remove`, `exists`, `isdir`, ...), `shutil`'s (`copy`,
+    `copytree`, `rmtree`, and `move_path` for `shutil.move`, since `move`
+    moves the sandbox), and `subprocess`'s (`run`, `check_output`, ...).
+    `Path` and `Popen` are `pathlib.Path` and `subprocess.Popen` bound to the
+    sandbox. Each acts as this handle's user.
+
+    ```python
+    sandbox.makedirs("/work/src", exist_ok=True)
+    sandbox.Path("/work/src/app.py").write_text("print('hi')\n")
+    sandbox.run(["python3", "/work/src/app.py"], check=True)
+    ```
     """
 
     def __init__(
@@ -246,13 +261,9 @@ class Sandbox:
         # Set by `delete`: a destroyed sandbox has nothing left to call.
         self._destroyed = False
         self._closed = False
-        # The stdlib's file and process APIs, against this sandbox: someone
-        # who knows `os`, `shutil`, `pathlib` and `subprocess` already knows
-        # these. Each acts as this handle's user.
-        self.os = SandboxOs(self)
-        self.shutil = SandboxShutil(self)
-        self.subprocess = SandboxSubprocess(self)
+        # pathlib's and subprocess's classes, bound to this handle.
         self.Path = type("Path", (SandboxPath,), {"__slots__": (), "_sandbox": self})
+        self.Popen = type("Popen", (Popen,), {"_sandbox": self})
 
     def _assert_live(self) -> None:
         """Refuses a call on a deleted sandbox. `delete` released the
@@ -542,7 +553,7 @@ class Sandbox:
 
         The command need not have been started by this process: it lives in the
         sandbox, and so does every byte it has printed. What comes back is a
-        `sandbox.subprocess.Popen` whose `stdout` and `stderr` replay from
+        `sandbox.Popen` whose `stdout` and `stderr` replay from
         `from_offset`, counting both streams' bytes together from the
         command's start, and then follow the command live; a reader that saw N
         bytes passes N and gets only what came after. `stdin` feeds it, a
@@ -559,7 +570,7 @@ class Sandbox:
             "GetCommand",
             api_pb2.GetCommandRequest(sandbox_id=self.id, command_id=cmd_id),
         )
-        return self.subprocess.Popen._attach(
+        return self.Popen._attach(
             _to_command_info(raw), from_offset, encoding, errors, text
         )
 
@@ -587,7 +598,7 @@ class Sandbox:
 
         ```python
         alice = sandbox.create_user("alice")
-        sandbox.subprocess.run(["whoami"], user=alice.username)
+        sandbox.run(["whoami"], user=alice.username)
         ```
 
         The home is 0700, so one agent's files are not readable by another's.
@@ -685,12 +696,12 @@ class Sandbox:
 
         ```python
         alice = sandbox.as_user("alice")
-        alice.subprocess.run("touch ~/notes.txt", shell=True)
+        alice.run("touch ~/notes.txt", shell=True)
         alice.Path("/home/alice/notes.txt").exists()
         ```
 
-        Its `open`, `os`, `shutil`, `Path`, `subprocess` and `terminal` all
-        act as the user: the guest kernel decides what the user may read and
+        Its file and process methods, `Path`, `Popen` and `terminal` all act
+        as the user: the guest kernel decides what the user may read and
         write, and what they create is theirs. A per-command `user` still wins.
         The user has to exist already.
         """
@@ -713,7 +724,7 @@ class Sandbox:
     ) -> Terminal:
         """Opens an interactive shell with a pty, for when input arrives over
         time (a browser terminal, an agent driving a REPL). For a command that
-        runs to completion, use `subprocess.run`."""
+        runs to completion, use `run`."""
         self._assert_live()
         return Terminal(
             self._transport.route(self.id),

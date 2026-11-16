@@ -4,6 +4,7 @@
 #   python examples/quickstart.py
 import os
 import shutil
+import subprocess
 import tempfile
 import time
 
@@ -31,42 +32,41 @@ sandbox = Sandbox.get_or_create(
 )
 print("sandbox:", sandbox.name, sandbox.id, sandbox.state, f"{sandbox.vcpus} vcpu", f"{sandbox.memory_mib} MiB")
 
-# The sandbox's own `subprocess`, `os`, `shutil`, `open` and `Path`: the
-# stdlib's names and semantics, acting on the guest.
-sp = sandbox.subprocess
+# The stdlib's `subprocess`, `os`, `shutil`, `open` and `Path`, as the
+# sandbox's own methods: the stdlib's names and semantics, acting on the guest.
 
 try:
     # A list is passed to execve as it is.
-    hello = sp.run(["echo", "hello from the sandbox"], capture_output=True, text=True)
+    hello = sandbox.run(["echo", "hello from the sandbox"], capture_output=True, text=True)
     print("run:", hello.returncode, hello.stdout.strip())
 
     # shell=True goes through /bin/sh, so pipes and redirection work.
-    piped = sp.check_output("echo one two three | tr ' ' '\\n' | wc -l", shell=True, text=True)
+    piped = sandbox.check_output("echo one two three | tr ' ' '\\n' | wc -l", shell=True, text=True)
     print("shell:", piped.strip())
 
     # cwd and env as the stdlib takes them; env is laid over the guest's.
-    where = sp.check_output("pwd; echo $QUICKSTART $STAGE", shell=True, text=True, cwd="/work", env={"STAGE": "tour"})
+    where = sandbox.check_output("pwd; echo $QUICKSTART $STAGE", shell=True, text=True, cwd="/work", env={"STAGE": "tour"})
     print("cwd and env:", " | ".join(where.strip().split("\n")))
 
     # Popen streams; the command also has a cmd_id that get_command reattaches to.
-    with sp.Popen("for i in 1 2 3; do echo tick $i; done", shell=True, stdout=sp.PIPE, text=True) as job:
+    with sandbox.Popen("for i in 1 2 3; do echo tick $i; done", shell=True, stdout=subprocess.PIPE, text=True) as job:
         for line in job.stdout:
             print(f"  {line}", end="")
 
-    sleeper = sp.Popen(["sleep", "60"])
+    sleeper = sandbox.Popen(["sleep", "60"])
     sleeper.kill()
     print("killed:", sleeper.wait())  # -9, as POSIX Popen reports a signal
 
     # Files, the stdlib way.
-    sandbox.os.makedirs("/work", exist_ok=True)
+    sandbox.makedirs("/work", exist_ok=True)
     with sandbox.open("/work/hello.sh", "w") as f:
         f.write("echo written from the SDK\n")
     run = sandbox.Path("/work/run.sh")
     run.write_text("sh /work/hello.sh\n")
     run.chmod(0o755)
-    print("file:", sp.check_output(["sh", "/work/run.sh"], text=True).strip())
-    print("dir:", ", ".join(sorted(sandbox.os.listdir("/work"))))
-    print("size:", sandbox.os.path.getsize("/work/hello.sh"))
+    print("file:", sandbox.check_output(["sh", "/work/run.sh"], text=True).strip())
+    print("dir:", ", ".join(sorted(sandbox.listdir("/work"))))
+    print("size:", sandbox.getsize("/work/hello.sh"))
 
     # Copy one back out to the local filesystem.
     local = os.path.join(tempfile.gettempdir(), "burrow-quickstart", "hello.sh")
@@ -76,7 +76,7 @@ try:
     print("downloaded to:", local)
 
     # Denied hosts fail rather than silently succeeding.
-    blocked = sp.run("wget -qO- http://example.com/", shell=True, capture_output=True)
+    blocked = sandbox.run("wget -qO- http://example.com/", shell=True, capture_output=True)
     print("example.com reachable:", blocked.returncode == 0)
 
     # Tighten the policy on a running sandbox.
@@ -85,12 +85,12 @@ try:
     print("tags now:", sandbox.tags)
 
     try:
-        sp.run("exit 3", shell=True, check=True)
-    except sp.CalledProcessError as err:
+        sandbox.run("exit 3", shell=True, check=True)
+    except subprocess.CalledProcessError as err:
         print("caught exit:", err.returncode)
 
     try:
-        sandbox.os.stat("/work/missing")
+        sandbox.stat("/work/missing")
     except FileNotFoundError as err:
         print("missing:", err.filename)
 
@@ -113,7 +113,7 @@ try:
 
     # Auto-resume: a call on a paused sandbox resumes it and retries once.
     sandbox.pause()
-    revived = sp.check_output(["cat", "/work/hello.sh"], text=True)
+    revived = sandbox.check_output(["cat", "/work/hello.sh"], text=True)
     print("auto-resumed:", revived.strip())
 finally:
     sandbox.delete()

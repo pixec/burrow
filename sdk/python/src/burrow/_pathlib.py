@@ -29,30 +29,30 @@ class SandboxPath(PurePosixPath):
     _sandbox: "Sandbox"
 
     def stat(self, *, follow_symlinks: bool = True) -> Any:
-        return self._sandbox.os.stat(self, follow_symlinks=follow_symlinks)
+        return self._sandbox.stat(self, follow_symlinks=follow_symlinks)
 
     def lstat(self) -> Any:
-        return self._sandbox.os.lstat(self)
+        return self._sandbox.lstat(self)
 
     def exists(self, *, follow_symlinks: bool = True) -> bool:
         if follow_symlinks:
-            return self._sandbox.os.path.exists(self)
-        return self._sandbox.os.path.lexists(self)
+            return self._sandbox.exists(self)
+        return self._sandbox.lexists(self)
 
     def is_dir(self) -> bool:
-        return self._sandbox.os.path.isdir(self)
+        return self._sandbox.isdir(self)
 
     def is_file(self) -> bool:
-        return self._sandbox.os.path.isfile(self)
+        return self._sandbox.isfile(self)
 
     def is_symlink(self) -> bool:
-        return self._sandbox.os.path.islink(self)
+        return self._sandbox.islink(self)
 
     def samefile(self, other_path: Any) -> bool:
         # The other path is read in this sandbox even when it is some other
         # kind of path; pathlib would call its own stat(), which for a local
         # Path means this machine's filesystem.
-        return posixpath.samestat(self.stat(), self._sandbox.os.stat(other_path))
+        return posixpath.samestat(self.stat(), self._sandbox.stat(other_path))
 
     def open(
         self,
@@ -97,11 +97,11 @@ class SandboxPath(PurePosixPath):
     def iterdir(self) -> Iterator["SandboxPath"]:
         # Listed when called, as pathlib does since 3.13, so a missing
         # directory raises here rather than at the first next().
-        return iter([self / name for name in self._sandbox.os.listdir(self)])
+        return iter([self / name for name in self._sandbox.listdir(self)])
 
     def mkdir(self, mode: int = 0o777, parents: bool = False, exist_ok: bool = False) -> None:
         try:
-            self._sandbox.os.mkdir(self, mode)
+            self._sandbox.mkdir(self, mode)
         except FileNotFoundError:
             if not parents or self.parent == self:
                 raise
@@ -115,7 +115,7 @@ class SandboxPath(PurePosixPath):
     def touch(self, mode: int = 0o666, exist_ok: bool = True) -> None:
         if exist_ok:
             try:
-                self._sandbox.os.utime(self)
+                self._sandbox.utime(self)
             except OSError:
                 pass
             else:
@@ -126,33 +126,33 @@ class SandboxPath(PurePosixPath):
 
     def unlink(self, missing_ok: bool = False) -> None:
         try:
-            self._sandbox.os.unlink(self)
+            self._sandbox.remove(self)
         except FileNotFoundError:
             if not missing_ok:
                 raise
 
     def rmdir(self) -> None:
-        self._sandbox.os.rmdir(self)
+        self._sandbox.rmdir(self)
 
     def rename(self, target: Any) -> "SandboxPath":
-        self._sandbox.os.rename(self, target)
+        self._sandbox.rename(self, target)
         return type(self)(target)
 
     def replace(self, target: Any) -> "SandboxPath":
-        self._sandbox.os.replace(self, target)
+        self._sandbox.rename(self, target)
         return type(self)(target)
 
     def chmod(self, mode: int) -> None:
-        self._sandbox.os.chmod(self, mode)
+        self._sandbox.chmod(self, mode)
 
     def symlink_to(self, target: Any, target_is_directory: bool = False) -> None:
-        self._sandbox.os.symlink(target, self, target_is_directory)
+        self._sandbox.symlink(target, self, target_is_directory)
 
     def hardlink_to(self, target: Any) -> None:
-        self._sandbox.os.link(target, self)
+        self._sandbox.link(target, self)
 
     def readlink(self) -> "SandboxPath":
-        return type(self)(self._sandbox.os.readlink(self))
+        return type(self)(self._sandbox.readlink(self))
 
     def resolve(self, strict: bool = False) -> "SandboxPath":
-        return type(self)(self._sandbox.os.path.realpath(self, strict=strict))
+        return type(self)(self._sandbox.realpath(self, strict=strict))

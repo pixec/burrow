@@ -1,4 +1,4 @@
-"""`sandbox.subprocess`: the `subprocess` module, for commands in the sandbox.
+"""The sandbox's `subprocess` methods, for commands in the sandbox.
 
 `Popen` drives one `Exec` stream (or, from `Sandbox.get_command`, one
 `Attach`). A thread reads the stream for as long as it lasts and hands each
@@ -25,7 +25,7 @@ from subprocess import (
     SubprocessError,
     TimeoutExpired,
 )
-from typing import TYPE_CHECKING, Any, Dict, Iterator, List, Optional, Tuple
+from typing import TYPE_CHECKING, Any, Dict, Iterator, List, Optional, Tuple, Type
 
 import grpc
 
@@ -526,19 +526,13 @@ class Popen:
         return f"<{type(self).__name__}: returncode: {self.returncode} args: {self.args!r}>"
 
 
-class SandboxSubprocess:
-    """`subprocess`, for the sandbox. See `Popen` for where it differs."""
+class SubprocessMixin:
+    """`subprocess`'s functions, as `Sandbox` methods. `Popen` is the
+    sandbox's own subclass, `sandbox.Popen`; see it for where they differ.
+    The constants and exceptions are the stdlib's: `subprocess.PIPE`,
+    `subprocess.CalledProcessError` and the rest."""
 
-    PIPE = PIPE
-    STDOUT = STDOUT
-    DEVNULL = DEVNULL
-    CompletedProcess = CompletedProcess
-    CalledProcessError = CalledProcessError
-    TimeoutExpired = TimeoutExpired
-    SubprocessError = SubprocessError
-
-    def __init__(self, sandbox: "Sandbox"):
-        self.Popen = type("Popen", (Popen,), {"_sandbox": sandbox})
+    Popen: Type[Popen]
 
     def run(
         self,

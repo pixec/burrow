@@ -17,7 +17,7 @@ Python 3.9 or newer.
 from burrow import Sandbox
 
 with Sandbox.create(template="python").deleting() as sandbox:
-    result = sandbox.subprocess.run(["echo", "hello"], capture_output=True, text=True)
+    result = sandbox.run(["echo", "hello"], capture_output=True, text=True)
     print(result.stdout)  # "hello\n"
 ```
 

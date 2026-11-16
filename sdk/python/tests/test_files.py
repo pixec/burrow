@@ -1,4 +1,4 @@
-# `sandbox.open`, `sandbox.os`, `sandbox.shutil` and `sandbox.Path` against
+# The sandbox's `open`, `os`, `shutil` and `Path` methods against
 # the fake guest in conftest.py, whose filesystem is a real directory.
 
 import errno
@@ -57,10 +57,10 @@ def test_scope_and_size_refusals_are_plain_oserrors():
 
 def test_kernel_errors_raise_from_calls(sandbox):
     with pytest.raises(FileNotFoundError) as caught:
-        sandbox.os.stat("/missing")
+        sandbox.stat("/missing")
     assert caught.value.filename == "/missing"
     with pytest.raises(FileNotFoundError) as caught:
-        sandbox.os.rename("/missing", "/elsewhere")
+        sandbox.rename("/missing", "/elsewhere")
     assert (caught.value.filename, caught.value.filename2) == ("/missing", "/elsewhere")
 
 
@@ -70,11 +70,11 @@ def test_a_policy_refusal_stays_a_burrow_error(sandbox, transport):
 
     transport.fs = refuse
     with pytest.raises(BurrowError):
-        sandbox.os.listdir("/")
+        sandbox.listdir("/")
 
 
 def test_a_user_handle_names_its_user_on_every_call(sandbox, transport):
-    sandbox.as_user("alice").os.path.exists("/")
+    sandbox.as_user("alice").exists("/")
     assert transport.fs.calls[-1][2] == "alice"
 
 
@@ -106,7 +106,7 @@ def test_binary_modes_return_buffered_objects(sandbox):
 def test_modes_send_linux_open_flags(sandbox, transport):
     for mode in ("w", "a", "x", "r", "r+", "w+", "a+"):
         if mode == "x":
-            sandbox.os.remove("/f")
+            sandbox.remove("/f")
         sandbox.open("/f", mode).close()
     flags = [op.flags for op in calls(transport, "open")]
     assert flags == [
@@ -156,7 +156,7 @@ def test_plus_reads_and_writes_one_file(sandbox):
     with sandbox.open("/rw", "r+b") as f:
         assert f.read() == b"Xbcdef"
         f.truncate(3)
-    assert sandbox.os.stat("/rw").st_size == 3
+    assert sandbox.stat("/rw").st_size == 3
 
 
 def test_a_misused_mode_fails_as_the_stdlib_does(sandbox):
@@ -232,7 +232,7 @@ def test_stat_is_a_real_stat_result(sandbox, root):
     with open(os.path.join(root, "s"), "wb") as f:
         f.write(b"12345")
     local = os.stat(os.path.join(root, "s"))
-    st = sandbox.os.stat("/s")
+    st = sandbox.stat("/s")
     assert isinstance(st, os.stat_result)
     assert stat.S_ISREG(st.st_mode)
     assert st.st_size == 5 and st[6] == 5
@@ -245,26 +245,26 @@ def test_stat_is_a_real_stat_result(sandbox, root):
 
 def test_utime_and_lstat(sandbox):
     sandbox.open("/u", "w").close()
-    sandbox.os.utime("/u", ns=(1_000_000_000_123, 2_000_000_000_456))
-    st = sandbox.os.stat("/u")
+    sandbox.utime("/u", ns=(1_000_000_000_123, 2_000_000_000_456))
+    st = sandbox.stat("/u")
     assert (st.st_atime_ns, st.st_mtime_ns) == (1_000_000_000_123, 2_000_000_000_456)
-    sandbox.os.utime("/u", (10, 20.5))
-    assert sandbox.os.stat("/u").st_mtime == 20.5
+    sandbox.utime("/u", (10, 20.5))
+    assert sandbox.stat("/u").st_mtime == 20.5
     with pytest.raises(ValueError):
-        sandbox.os.utime("/u", (1, 2), ns=(1, 2))
-    sandbox.os.symlink("u", "/link")
-    assert stat.S_ISLNK(sandbox.os.lstat("/link").st_mode)
-    assert sandbox.os.readlink("/link") == "u"
+        sandbox.utime("/u", (1, 2), ns=(1, 2))
+    sandbox.symlink("u", "/link")
+    assert stat.S_ISLNK(sandbox.lstat("/link").st_mode)
+    assert sandbox.readlink("/link") == "u"
 
 
 def test_scandir_and_listdir(sandbox):
-    sandbox.os.mkdir("/d")
-    sandbox.os.mkdir("/d/sub")
+    sandbox.mkdir("/d")
+    sandbox.mkdir("/d/sub")
     sandbox.Path("/d/file").write_bytes(b"xyz")
-    sandbox.os.symlink("sub", "/d/link")
-    sandbox.os.symlink("missing", "/d/dangling")
-    assert sorted(sandbox.os.listdir("/d")) == ["dangling", "file", "link", "sub"]
-    with sandbox.os.scandir("/d") as it:
+    sandbox.symlink("sub", "/d/link")
+    sandbox.symlink("missing", "/d/dangling")
+    assert sorted(sandbox.listdir("/d")) == ["dangling", "file", "link", "sub"]
+    with sandbox.scandir("/d") as it:
         entries = {e.name: e for e in it}
     assert entries["sub"].path == "/d/sub"
     assert entries["sub"].is_dir() and not entries["sub"].is_file()
@@ -272,132 +272,129 @@ def test_scandir_and_listdir(sandbox):
     assert entries["link"].is_symlink() and entries["link"].is_dir()
     assert not entries["link"].is_dir(follow_symlinks=False)
     assert not entries["dangling"].is_dir() and not entries["dangling"].is_file()
-    assert entries["file"].inode() == sandbox.os.stat("/d/file").st_ino
+    assert entries["file"].inode() == sandbox.stat("/d/file").st_ino
     assert os.fspath(entries["file"]) == "/d/file"
 
 
 def test_walk(sandbox):
-    sandbox.os.makedirs("/w/a/b")
+    sandbox.makedirs("/w/a/b")
     sandbox.Path("/w/a/f").touch()
-    sandbox.os.symlink("a", "/w/link")
-    top = list(sandbox.os.walk("/w"))
+    sandbox.symlink("a", "/w/link")
+    top = list(sandbox.walk("/w"))
     assert top[0] == ("/w", ["a", "link"], [])
     assert ("/w/a", ["b"], ["f"]) in top
     assert all(not path.startswith("/w/link") for path, _, _ in top)
-    bottom = [path for path, _, _ in sandbox.os.walk("/w", topdown=False)]
+    bottom = [path for path, _, _ in sandbox.walk("/w", topdown=False)]
     assert bottom == ["/w/a/b", "/w/a", "/w"]
 
 
 def test_makedirs_exist_ok(sandbox):
-    sandbox.os.makedirs("/m/a/b", mode=0o700)
-    assert sandbox.os.path.isdir("/m/a/b")
+    sandbox.makedirs("/m/a/b", mode=0o700)
+    assert sandbox.isdir("/m/a/b")
     with pytest.raises(FileExistsError):
-        sandbox.os.makedirs("/m/a/b")
-    sandbox.os.makedirs("/m/a/b", exist_ok=True)
+        sandbox.makedirs("/m/a/b")
+    sandbox.makedirs("/m/a/b", exist_ok=True)
     sandbox.open("/m/file", "w").close()
     with pytest.raises(FileExistsError):
-        sandbox.os.makedirs("/m/file", exist_ok=True)
+        sandbox.makedirs("/m/file", exist_ok=True)
 
 
 def test_remove_rmdir_removedirs(sandbox):
-    sandbox.os.makedirs("/r/a/b")
+    sandbox.makedirs("/r/a/b")
     with pytest.raises(OSError) as caught:
-        sandbox.os.rmdir("/r/a")
+        sandbox.rmdir("/r/a")
     assert caught.value.errno == errno.ENOTEMPTY
-    sandbox.os.removedirs("/r/a/b")
-    assert not sandbox.os.path.exists("/r")
+    sandbox.removedirs("/r/a/b")
+    assert not sandbox.exists("/r")
     with pytest.raises(FileNotFoundError):
-        sandbox.os.remove("/r")
+        sandbox.remove("/r")
 
 
 def test_os_path(sandbox):
-    sandbox.os.mkdir("/p")
+    sandbox.mkdir("/p")
     sandbox.Path("/p/f.txt").write_text("hello")
-    sandbox.os.symlink("f.txt", "/p/l")
-    sandbox.os.symlink("nothing", "/p/broken")
-    path = sandbox.os.path
-    assert path.exists("/p/f.txt") and not path.exists("/p/broken")
-    assert path.lexists("/p/broken")
-    assert path.isfile("/p/l") and path.islink("/p/l") and path.isdir("/p")
-    assert path.getsize("/p/f.txt") == 5
-    assert path.getmtime("/p/f.txt") == sandbox.os.stat("/p/f.txt").st_mtime
-    assert path.realpath("/p/l") == "/p/f.txt"
-    assert path.realpath("/p/missing/../x") == "/p/x"
+    sandbox.symlink("f.txt", "/p/l")
+    sandbox.symlink("nothing", "/p/broken")
+    assert sandbox.exists("/p/f.txt") and not sandbox.exists("/p/broken")
+    assert sandbox.lexists("/p/broken")
+    assert sandbox.isfile("/p/l") and sandbox.islink("/p/l") and sandbox.isdir("/p")
+    assert sandbox.getsize("/p/f.txt") == 5
+    assert sandbox.getmtime("/p/f.txt") == sandbox.stat("/p/f.txt").st_mtime
+    assert sandbox.realpath("/p/l") == "/p/f.txt"
+    assert sandbox.realpath("/p/missing/../x") == "/p/x"
     with pytest.raises(FileNotFoundError):
-        path.realpath("/p/missing", strict=True)
-    assert path.samefile("/p/l", "/p/f.txt")
-    assert path.join("/p", "f.txt") == "/p/f.txt"
-    assert path.splitext("/p/f.txt") == ("/p/f", ".txt")
+        sandbox.realpath("/p/missing", strict=True)
+    assert sandbox.samefile("/p/l", "/p/f.txt")
 
 
 def test_access(sandbox):
     sandbox.open("/x", "w").close()
-    assert sandbox.os.access("/x", sandbox.os.R_OK | sandbox.os.W_OK)
-    assert not sandbox.os.access("/x", sandbox.os.X_OK)
-    assert not sandbox.os.access("/missing", sandbox.os.F_OK)
+    assert sandbox.access("/x", os.R_OK | os.W_OK)
+    assert not sandbox.access("/x", os.X_OK)
+    assert not sandbox.access("/missing", os.F_OK)
 
 
 # shutil
 
 
 def tree(sandbox):
-    sandbox.os.makedirs("/src/sub")
+    sandbox.makedirs("/src/sub")
     sandbox.Path("/src/a.txt").write_text("a")
     sandbox.Path("/src/sub/b.txt").write_text("b")
-    sandbox.os.symlink("a.txt", "/src/link")
-    sandbox.os.chmod("/src/a.txt", 0o640)
+    sandbox.symlink("a.txt", "/src/link")
+    sandbox.chmod("/src/a.txt", 0o640)
 
 
 def test_copytree_follows_or_keeps_symlinks(sandbox):
     tree(sandbox)
-    assert sandbox.shutil.copytree("/src", "/dst") == "/dst"
+    assert sandbox.copytree("/src", "/dst") == "/dst"
     assert sandbox.Path("/dst/sub/b.txt").read_text() == "b"
-    assert not sandbox.os.path.islink("/dst/link")
+    assert not sandbox.islink("/dst/link")
     assert sandbox.Path("/dst/link").read_text() == "a"
-    assert stat.S_IMODE(sandbox.os.stat("/dst/a.txt").st_mode) == 0o640
+    assert stat.S_IMODE(sandbox.stat("/dst/a.txt").st_mode) == 0o640
 
-    sandbox.shutil.copytree("/src", "/kept", symlinks=True)
-    assert sandbox.os.readlink("/kept/link") == "a.txt"
+    sandbox.copytree("/src", "/kept", symlinks=True)
+    assert sandbox.readlink("/kept/link") == "a.txt"
 
     with pytest.raises(FileExistsError):
-        sandbox.shutil.copytree("/src", "/dst")
+        sandbox.copytree("/src", "/dst")
     sandbox.Path("/src/new.txt").write_text("new")
-    sandbox.shutil.copytree("/src", "/dst", dirs_exist_ok=True)
+    sandbox.copytree("/src", "/dst", dirs_exist_ok=True)
     assert sandbox.Path("/dst/new.txt").read_text() == "new"
 
-    sandbox.shutil.copytree("/src", "/some", ignore=sandbox.shutil.ignore_patterns("*.txt"))
-    assert sorted(sandbox.os.listdir("/some")) == ["link", "sub"]
+    sandbox.copytree("/src", "/some", ignore=shutil.ignore_patterns("*.txt"))
+    assert sorted(sandbox.listdir("/some")) == ["link", "sub"]
 
 
 def test_rmtree(sandbox, transport):
     tree(sandbox)
-    sandbox.shutil.rmtree("/src")
-    assert not sandbox.os.path.exists("/src")
+    sandbox.rmtree("/src")
+    assert not sandbox.exists("/src")
     assert len(calls(transport, "remove")) == 1
     with pytest.raises(FileNotFoundError):
-        sandbox.shutil.rmtree("/src")
-    sandbox.shutil.rmtree("/src", ignore_errors=True)
+        sandbox.rmtree("/src")
+    sandbox.rmtree("/src", ignore_errors=True)
 
     tree(sandbox)
     with pytest.raises(OSError, match="symbolic link"):
-        sandbox.shutil.rmtree("/src/link")
+        sandbox.rmtree("/src/link")
     seen = []
-    sandbox.shutil.rmtree("/src/link", onexc=lambda func, path, exc: seen.append(path))
+    sandbox.rmtree("/src/link", onexc=lambda func, path, exc: seen.append(path))
     assert seen == ["/src/link"]
 
 
 def test_copy_copy2_and_move(sandbox):
     tree(sandbox)
-    sandbox.os.utime("/src/a.txt", ns=(5_000_000_000, 6_000_000_000))
-    assert sandbox.shutil.copy("/src/a.txt", "/src/sub") == "/src/sub/a.txt"
-    assert stat.S_IMODE(sandbox.os.stat("/src/sub/a.txt").st_mode) == 0o640
-    sandbox.shutil.copy2("/src/a.txt", "/c2")
-    assert sandbox.os.stat("/c2").st_mtime_ns == 6_000_000_000
+    sandbox.utime("/src/a.txt", ns=(5_000_000_000, 6_000_000_000))
+    assert sandbox.copy("/src/a.txt", "/src/sub") == "/src/sub/a.txt"
+    assert stat.S_IMODE(sandbox.stat("/src/sub/a.txt").st_mode) == 0o640
+    sandbox.copy2("/src/a.txt", "/c2")
+    assert sandbox.stat("/c2").st_mtime_ns == 6_000_000_000
     with pytest.raises(shutil.SameFileError):
-        sandbox.shutil.copyfile("/src/a.txt", "/src/link")
-    assert sandbox.shutil.move("/c2", "/src/sub") == "/src/sub/c2"
+        sandbox.copyfile("/src/a.txt", "/src/link")
+    assert sandbox.move_path("/c2", "/src/sub") == "/src/sub/c2"
     with pytest.raises(shutil.Error, match="already exists"):
-        sandbox.shutil.move("/src/sub/c2", "/src/sub")
+        sandbox.move_path("/src/sub/c2", "/src/sub")
 
 
 # Path
