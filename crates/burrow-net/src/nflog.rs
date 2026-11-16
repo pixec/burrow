@@ -182,16 +182,17 @@ impl Socket {
             socket
         };
         // Command 1 binds the group.
-        socket.configure(group, 1, &[1])?;
+        socket.configure(1, group, 1, &[1])?;
         let mut mode = COPY_RANGE.to_be_bytes().to_vec();
         // NFULNL_COPY_PACKET, then padding.
         mode.extend_from_slice(&[2, 0]);
-        socket.configure(group, 2, &mode)?;
+        socket.configure(2, group, 2, &mode)?;
         Ok(socket)
     }
 
-    /// Sends one config attribute for `group` and waits for its ack.
-    fn configure(&self, group: u16, attribute: u16, value: &[u8]) -> std::io::Result<()> {
+    /// Sends one config attribute for `group` as message `seq` and waits for
+    /// its ack, passing over packets logged meanwhile.
+    fn configure(&self, seq: u32, group: u16, attribute: u16, value: &[u8]) -> std::io::Result<()> {
         use std::os::fd::AsRawFd as _;
         let attr_len = 4 + value.len();
         let len = NLMSG_HDRLEN + NFGENMSG_LEN + align(attr_len);
@@ -200,7 +201,7 @@ impl Socket {
         message.extend_from_slice(&((NFNL_SUBSYS_ULOG << 8) | NFULNL_MSG_CONFIG).to_ne_bytes());
         let flags = (libc::NLM_F_REQUEST | libc::NLM_F_ACK) as u16;
         message.extend_from_slice(&flags.to_ne_bytes());
-        message.extend_from_slice(&0u32.to_ne_bytes());
+        message.extend_from_slice(&seq.to_ne_bytes());
         message.extend_from_slice(&0u32.to_ne_bytes());
         message.extend_from_slice(&[libc::AF_UNSPEC as u8, 0]);
         message.extend_from_slice(&group.to_be_bytes());
@@ -212,11 +213,14 @@ impl Socket {
         if unsafe { libc::send(self.0.as_raw_fd(), message.as_ptr().cast(), len, 0) } < 0 {
             return Err(std::io::Error::last_os_error());
         }
-        let mut buf = [0u8; 256];
-        let read = self.recv(&mut buf)?;
-        match ack_error(&buf[..read]) {
-            0 => Ok(()),
-            errno => Err(std::io::Error::from_raw_os_error(errno)),
+        let mut buf = vec![0u8; 1 << 16];
+        loop {
+            let read = self.recv(&mut buf)?;
+            match ack_for(&buf[..read], seq) {
+                Some(0) => return Ok(()),
+                Some(errno) => return Err(std::io::Error::from_raw_os_error(errno)),
+                None => {}
+            }
         }
     }
 
@@ -232,15 +236,25 @@ impl Socket {
     }
 }
 
-/// The errno an ack carries, 0 for success or for no ack at all.
+/// The errno the ack to message `seq` carries, 0 for success, or `None`
+/// when `buf` holds no ack to it.
 #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
-fn ack_error(buf: &[u8]) -> i32 {
-    if buf.len() < NLMSG_HDRLEN + 4
-        || u16::from_ne_bytes(buf[4..6].try_into().unwrap()) != NLMSG_ERROR
-    {
-        return 0;
+fn ack_for(mut buf: &[u8], seq: u32) -> Option<i32> {
+    while buf.len() >= NLMSG_HDRLEN {
+        let len = u32::from_ne_bytes(buf[0..4].try_into().unwrap()) as usize;
+        if len < NLMSG_HDRLEN || len > buf.len() {
+            return None;
+        }
+        let kind = u16::from_ne_bytes(buf[4..6].try_into().unwrap());
+        let acked = u32::from_ne_bytes(buf[8..12].try_into().unwrap());
+        if kind == NLMSG_ERROR && acked == seq && len >= NLMSG_HDRLEN + 4 {
+            return Some(-i32::from_ne_bytes(
+                buf[NLMSG_HDRLEN..NLMSG_HDRLEN + 4].try_into().unwrap(),
+            ));
+        }
+        buf = &buf[align(len).min(buf.len())..];
     }
-    -i32::from_ne_bytes(buf[NLMSG_HDRLEN..NLMSG_HDRLEN + 4].try_into().unwrap())
+    None
 }
 
 #[cfg(test)]
@@ -371,14 +385,24 @@ mod tests {
     }
 
     #[test]
-    fn an_ack_reports_its_errno() {
-        let mut ack = 36u32.to_ne_bytes().to_vec();
-        ack.extend_from_slice(&NLMSG_ERROR.to_ne_bytes());
-        ack.extend_from_slice(&[0; 10]);
-        ack.extend_from_slice(&(-16i32).to_ne_bytes());
-        ack.extend_from_slice(&[0; 16]);
-        assert_eq!(ack_error(&ack), 16);
-        ack[NLMSG_HDRLEN..NLMSG_HDRLEN + 4].copy_from_slice(&0i32.to_ne_bytes());
-        assert_eq!(ack_error(&ack), 0);
+    fn only_the_ack_to_the_message_sent_answers_it() {
+        let ack = |seq: u32, errno: i32| {
+            let mut ack = 36u32.to_ne_bytes().to_vec();
+            ack.extend_from_slice(&NLMSG_ERROR.to_ne_bytes());
+            ack.extend_from_slice(&[0; 2]);
+            ack.extend_from_slice(&seq.to_ne_bytes());
+            ack.extend_from_slice(&[0; 4]);
+            ack.extend_from_slice(&(-errno).to_ne_bytes());
+            ack.extend_from_slice(&[0; 16]);
+            ack
+        };
+        let packet = message(
+            (NFNL_SUBSYS_ULOG << 8) | NFULNL_MSG_PACKET,
+            &[attr(NFULA_PREFIX, b"burrow:range\0")],
+        );
+        assert_eq!(ack_for(&packet, 2), None);
+        assert_eq!(ack_for(&[packet.clone(), ack(2, 16)].concat(), 2), Some(16));
+        assert_eq!(ack_for(&ack(1, 0), 2), None);
+        assert_eq!(ack_for(&ack(2, 0), 2), Some(0));
     }
 }
