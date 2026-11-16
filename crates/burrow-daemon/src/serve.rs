@@ -246,11 +246,15 @@ pub struct ServeArgs {
     pub node_token: Option<String>,
     #[arg(long, env = "BURROW_NODE_TOKEN_FILE")]
     pub node_token_file: Option<PathBuf>,
-    /// Refuse to start a sandbox whose resource limits cannot be applied.
-    /// Off by default so the stack runs where cgroups are unavailable; worth
-    /// turning on wherever sandboxes share a host with anything that matters.
-    #[arg(long = "require-resource-limits")]
-    pub is_resource_limits_required: bool,
+    /// Start a sandbox whose resource limits cannot be applied, uncapped,
+    /// instead of refusing it. Only for a host where cgroup2 is not writable
+    /// and nothing else shares the machine: such a sandbox can take every CPU
+    /// and all the memory the host has.
+    #[arg(
+        long = "allow-unlimited-resources",
+        env = "BURROWD_ALLOW_UNLIMITED_RESOURCES"
+    )]
+    pub is_unlimited_resources_allowed: bool,
     /// Host memory a VMM is allowed beyond its guest and the page tables over
     /// it, as HYPERVISOR=MIB, e.g. `firecracker=48`. Repeatable. Adds to every
     /// sandbox's cgroup memory ceiling and to what placement charges this
@@ -1824,7 +1828,7 @@ pub async fn run(args: ServeArgs) -> anyhow::Result<()> {
                 max_files: args.command_log_max_files,
             },
             cgroup_root: Some(args.cgroup_root.clone()),
-            is_resource_limits_required: args.is_resource_limits_required,
+            is_resource_limits_required: !args.is_unlimited_resources_allowed,
             is_memory_lazy: args.is_memory_lazy,
             jail: args.jail(),
             cloud_hypervisor: burrow_vmm::CloudHypervisorConfig {
@@ -2372,6 +2376,24 @@ mod tests {
         assert!(huge(&[]));
         assert!(!huge(&["--firecracker-huge-pages", "false"]));
         assert!(huge(&["--firecracker-huge-pages", "true"]));
+    }
+
+    #[test]
+    fn resource_limits_are_required_unless_unlimited_is_allowed() {
+        use clap::Parser as _;
+        #[derive(clap::Parser)]
+        struct Cli {
+            #[command(flatten)]
+            serve: ServeArgs,
+        }
+        let allowed = |args: &[&str]| {
+            Cli::try_parse_from(["burrowd"].iter().chain(args))
+                .unwrap()
+                .serve
+                .is_unlimited_resources_allowed
+        };
+        assert!(!allowed(&[]));
+        assert!(allowed(&["--allow-unlimited-resources"]));
     }
 
     /// The orchestrator's address is what a sandbox is denied, so the host has

@@ -147,6 +147,17 @@ impl Cgroup {
                 );
                 Ok(None)
             }
+            Err(err) if is_required => {
+                let reason = match err {
+                    Error::CgroupUnavailable { reason } => reason,
+                    err => err.to_string(),
+                };
+                Err(Error::CgroupUnavailable {
+                    reason: format!(
+                        "{reason}; a node started with --allow-unlimited-resources runs it uncapped"
+                    ),
+                })
+            }
             Err(err) => Err(err),
         }
     }
