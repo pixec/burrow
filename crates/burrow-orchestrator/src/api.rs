@@ -395,8 +395,9 @@ impl ApiService {
                 .and_then(|p| p.resources.clone())
                 .unwrap_or_default();
             let placement = crate::registry::Placement {
-                vcpus: 1,
-                mem_mib: 512,
+                vcpus: limits.vcpus,
+                mem_mib: u64::from(limits.mem_mib),
+                disk_bytes: u64::from(limits.disk_mib) * burrow_common::disk::MIB,
                 cpuset_cpus: limits.cpuset_cpus,
                 blkio_weight: limits.blkio_weight,
                 node_labels: req.node_labels.clone(),
@@ -1389,15 +1390,31 @@ impl ApiService {
                 node_id
             }
             None if snapshot.is_durable => {
+                let shape = snapshot.resources.clone().unwrap_or_default();
+                let pick = |want: u64, have: u32| match want {
+                    0 => u64::from(have),
+                    want => want,
+                };
+                // A macOS guest's snapshot is its disk alone and boots cold,
+                // under whatever version of the framework the Mac has.
+                let is_disk_only = snapshot.hypervisor == Hypervisor::Vz.as_str();
                 let want = crate::registry::Placement {
                     // The snapshot carries its own kernel and rootfs, so the
                     // template need not be on the node.
                     template: String::new(),
                     arch: snapshot.arch.clone(),
-                    hypervisor_version: snapshot.hypervisor_version.clone(),
-                    cpu: snapshot.cpu.clone(),
+                    hypervisor_version: match is_disk_only {
+                        true => String::new(),
+                        false => snapshot.hypervisor_version.clone(),
+                    },
+                    cpu: snapshot.cpu.clone().filter(|_| !is_disk_only),
                     hypervisor: snapshot.hypervisor.clone(),
-                    disk_bytes: crate::registry::disk_bytes(snapshot.resources.as_ref()),
+                    vcpus: pick(u64::from(want.vcpus), shape.vcpus).max(1) as u32,
+                    mem_mib: pick(want.mem_mib, shape.mem_mib),
+                    disk_bytes: match want.disk_bytes {
+                        0 => crate::registry::disk_bytes(Some(&shape)),
+                        bytes => bytes,
+                    },
                     is_nested_virt_enabled: snapshot
                         .resources
                         .as_ref()
@@ -1408,7 +1425,7 @@ impl ApiService {
                     // the snapshot is a macOS guest's, whose policy cannot
                     // hold any.
                     policy_features: match inherits_policy {
-                        true if snapshot.hypervisor == Hypervisor::Vz.as_str() => Vec::new(),
+                        true if is_disk_only => Vec::new(),
                         true => vec![burrow_common::features::INGRESS],
                         false => want.policy_features.clone(),
                     },
@@ -2605,8 +2622,8 @@ impl Burrow for ApiService {
     ///
     /// A sandbox's snapshot, disks and address lease are node-local files, so
     /// there is nothing to place: the child is built where the state already
-    /// is. The node is charged for it afterwards, from the record it returns,
-    /// because placement never got a say.
+    /// is. That node is held to having room for the child's memory first, as
+    /// a create's node is, and charged its CPU once it exists.
     async fn fork_sandbox(
         &self,
         req: Request<api::ForkSandboxRequest>,
@@ -2649,6 +2666,47 @@ impl Burrow for ApiService {
             &node_id,
             req.policy.as_ref().and_then(|p| p.network.as_ref()),
         )?;
+        // Charged at the shape the child ends at, which may be bigger than its
+        // source's: it restores at the source's and is resized before the
+        // node answers.
+        let source = match self.0.sandboxes.get(&source_id) {
+            Some(source) => source,
+            None => self
+                .0
+                .sandboxes
+                .load(&source_id)
+                .await
+                .ok_or_else(|| Status::not_found(format!("no sandbox {source_id}")))?,
+        };
+        let inherited = source
+            .policy
+            .as_ref()
+            .and_then(|policy| policy.resources.clone())
+            .unwrap_or_default();
+        let wanted = req
+            .policy
+            .as_ref()
+            .and_then(|policy| policy.resources.clone())
+            .unwrap_or_default();
+        let pick = |want: u32, have: u32| if want == 0 { have } else { want };
+        let mem_mib = pick(wanted.mem_mib, inherited.mem_mib);
+        let cpu_millis = crate::registry::cpu_charge_millis(
+            pick(wanted.vcpus, inherited.vcpus),
+            inherited.cpus,
+            inherited.reserved_cpus,
+        );
+        let held = self
+            .hold_growth(
+                &node_id,
+                self.0.nodes.mem_charge_mib(
+                    &node_id,
+                    &source.hypervisor,
+                    &source.template,
+                    u64::from(mem_mib),
+                ),
+            )
+            .await
+            .map_err(Status::resource_exhausted)?;
         let (mut client, _admitted) = self.admitted_node_for(&source_id).await?;
         let sandbox = client
             .fork_sandbox(nodepb::NodeForkRequest {
@@ -2659,6 +2717,8 @@ impl Burrow for ApiService {
             })
             .await?
             .into_inner();
+        held.keep();
+        self.0.nodes.charge_cpu(&node_id, cpu_millis);
 
         self.0.sandboxes.insert(sandbox.clone());
         self.write_through().await;
