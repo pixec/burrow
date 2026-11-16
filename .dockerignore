@@ -11,3 +11,4 @@ sdk/
 docs/
 .github/
 *.md
+!THIRD-PARTY-NOTICES.md
