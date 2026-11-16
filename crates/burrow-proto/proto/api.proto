@@ -1229,10 +1229,11 @@ message GroupMembershipRequest {
 
 message GroupMembershipResponse {}
 
-// One POSIX file operation, as the guest kernel performs it. What `fs` in
-// Node and `os`, `shutil` and `open()` in Python are built on: every path
-// call and every call on an open file goes through here, so each language's
-// own file API can be mirrored without an exec per call.
+// One POSIX file operation, as the guest kernel performs it. What the SDKs'
+// file methods on a sandbox are built on (Node's `fs/promises` functions in
+// TypeScript, `open()` and the `os` and `shutil` functions in Python): every
+// path call and every call on an open file goes through here, so each
+// language's own file API can be mirrored without an exec per call.
 message FsRequest {
   string sandbox_id = 1;
   // Do it as this guest user rather than as root: the guest kernel checks
