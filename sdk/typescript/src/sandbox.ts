@@ -1786,7 +1786,12 @@ export class Sandbox {
   private forkRequest(options: ForkOptions): any {
     this.assertLive();
     const network = options.networkPolicy;
+    const reshaped =
+      options.vcpus !== undefined ||
+      options.memoryMib !== undefined ||
+      options.diskMib !== undefined;
     const stated =
+      reshaped ||
       network !== undefined ||
       options.networks !== undefined ||
       options.exec !== undefined ||
@@ -1794,8 +1799,13 @@ export class Sandbox {
     const policy = !stated
       ? undefined
       : {
-          // Resources are absent deliberately: a restore takes its machine
-          // configuration from the snapshot, and the node refuses an override.
+          resources: reshaped
+            ? {
+                vcpus: options.vcpus ?? 0,
+                memMib: options.memoryMib ?? 0,
+                diskMib: options.diskMib ?? 0,
+              }
+            : undefined,
           network: network === undefined ? undefined : toNetworkPolicy(resolveNetwork(network)),
           networks: toNetworks(options.networks, options.alias),
           // Each section is inherited on its own, so overriding one does not

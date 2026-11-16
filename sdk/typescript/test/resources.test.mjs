@@ -176,3 +176,15 @@ test("a lifetime update can turn checkpoints on, and a record says how old the l
   assert.equal(none.info.checkpointAt, null);
   assert.equal(none.info.checkpointKind, null);
 });
+
+test("a fork sends only the shape it changes", async () => {
+  const { sandbox, calls } = sandboxAnswering({ id: "sbx_child", state: "SANDBOX_STATE_RUNNING" });
+  sandbox.transport.retain = () => sandbox.transport;
+  const child = await sandbox.fork({ memoryMib: 4096, diskMib: 8192 });
+  assert.equal(calls[0].method, "ForkSandbox");
+  assert.deepEqual(calls[0].request.policy.resources, { vcpus: 0, memMib: 4096, diskMib: 8192 });
+  assert.equal(calls[0].request.policy.network, undefined);
+  assert.equal(child.id, "sbx_child");
+  await sandbox.fork();
+  assert.equal(calls[1].request.policy, undefined);
+});

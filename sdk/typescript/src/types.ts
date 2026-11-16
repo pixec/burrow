@@ -915,6 +915,17 @@ export interface ForkOptions extends CallOptions {
   /** Replaces the source's fs policy on the child. Omitted inherits it. */
   fs?: FsOptions;
   /**
+   * The child's vCPUs, memory and root disk; omitted keeps the source's. The
+   * child restores at the source's shape and is resized live before it is
+   * returned: memory within the source's `maxMemoryMib` and not below what it
+   * booted with, a disk only bigger, vCPUs only under Cloud Hypervisor on
+   * x86_64. What cannot be done live fails with `failed_precondition` before
+   * the source is touched, as does any change for a Windows or macOS guest.
+   */
+  vcpus?: number;
+  memoryMib?: number;
+  diskMib?: number;
+  /**
    * Require the source's node to carry every one of these labels. A fork is
    * built where its source's state already is, so this cannot move the child:
    * a source on a node without them fails with `failed_precondition`.

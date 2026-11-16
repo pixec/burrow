@@ -1265,6 +1265,9 @@ class Sandbox(ShutilMixin, SubprocessMixin):
         exec_policy: Any = None,
         fs: Any = None,
         volumes: Any = None,
+        vcpus: Optional[int] = None,
+        memory_mib: Optional[int] = None,
+        disk_mib: Optional[int] = None,
     ) -> "Sandbox":
         """Creates a sandbox from this one's current state.
 
@@ -1272,12 +1275,19 @@ class Sandbox(ShutilMixin, SubprocessMixin):
         so the child starts from its state as of the call. The child lands on
         the same node, because a snapshot and its disks are node-local files.
         The policy options are `create`'s; a child with none stated inherits
-        its source's whole policy. The machine shape cannot change: a restore
-        takes it from the state.
+        its source's whole policy.
+
+        `vcpus`, `memory_mib` and `disk_mib` give the child another shape. It
+        restores at this sandbox's and is resized live before it is returned:
+        memory within this sandbox's `max_memory_mib` and not below what it
+        booted with, a disk only bigger, vCPUs only under Cloud Hypervisor on
+        x86_64. What cannot be done live fails before this sandbox is touched,
+        as does any change for a Windows or macOS guest.
 
         ```python
         child = sandbox.fork()
         branch = sandbox.fork(network_policy="none")
+        bigger = sandbox.fork(memory_mib=4096, disk_mib=8192)
         ```
         """
         self._assert_live()
@@ -1285,7 +1295,9 @@ class Sandbox(ShutilMixin, SubprocessMixin):
             sandbox_id=self.id, name=name, node_labels=node_labels or {}
         )
         sections = (network_policy, networks, exec_policy, fs, volumes)
-        if any(section is not None for section in sections):
+        shape = (vcpus, memory_mib, disk_mib)
+        is_reshaped = any(field is not None for field in shape)
+        if is_reshaped or any(section is not None for section in sections):
             policy = to_policy(
                 network_policy=network_policy,
                 networks=networks,
@@ -1295,9 +1307,12 @@ class Sandbox(ShutilMixin, SubprocessMixin):
                 volumes=volumes,
             )
             # Each inherited section stays off the wire, so overriding one does
-            # not strip the others off the child. Resources are never sent:
-            # the node refuses a shape other than the state's.
+            # not strip the others off the child.
             policy.ClearField("resources")
+            if is_reshaped:
+                policy.resources.vcpus = vcpus or 0
+                policy.resources.mem_mib = memory_mib or 0
+                policy.resources.disk_mib = disk_mib or 0
             policy.ClearField("lifetime")
             policy.ClearField("snapshots")
             if network_policy is None:

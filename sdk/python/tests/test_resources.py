@@ -201,3 +201,17 @@ def test_a_remote_readers_generation_reads_back_on_its_mount(transport, sandbox)
     info = sandbox.update_lifetime(max_lifetime_secs=60)
     assert info.policy.volumes[0].read_only
     assert info.policy.volumes[0].generation == 1_794_475_800_000
+
+
+def test_a_fork_sends_only_the_shape_it_changes(transport, sandbox):
+    calls = answering(transport, common_pb2.Sandbox(id="sbx_child"))
+    child = sandbox.fork(memory_mib=4096, disk_mib=8192)
+    method, request = calls[0]
+    assert method == "ForkSandbox"
+    resources = request.policy.resources
+    assert (resources.vcpus, resources.mem_mib, resources.disk_mib) == (0, 4096, 8192)
+    assert not request.policy.HasField("network")
+    assert not request.policy.HasField("lifetime")
+    assert child.id == "sbx_child"
+    sandbox.fork()
+    assert not calls[1][1].HasField("policy")
