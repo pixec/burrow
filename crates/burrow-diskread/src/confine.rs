@@ -21,7 +21,12 @@ fn check(rc: libc::c_int) -> io::Result<()> {
     }
 }
 
-fn limit(resource: libc::c_int, soft: u64, hard: u64) -> io::Result<()> {
+#[cfg(target_env = "gnu")]
+type Resource = libc::__rlimit_resource_t;
+#[cfg(not(target_env = "gnu"))]
+type Resource = libc::c_int;
+
+fn limit(resource: Resource, soft: u64, hard: u64) -> io::Result<()> {
     let value = libc::rlimit {
         rlim_cur: soft,
         rlim_max: hard,
