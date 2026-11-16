@@ -53,6 +53,15 @@ const TEMPLATE_ROOTFS: &str = crate::rootdisk::IMAGE;
 /// restored guest remembers those commands and is asked about them.
 pub const COMMAND_LOGS: &str = "command-logs";
 
+/// The small files a macOS machine's disk snapshot carries beside its disk
+/// and auxiliary storage: what a cold boot reads, and the image environment,
+/// so a Mac without the template can boot it.
+const MACHINE_FILES: [&str; 3] = [
+    crate::macnode::HARDWARE_MODEL,
+    crate::macnode::REQUIREMENTS,
+    crate::oci::SANDBOX_ENVIRONMENT,
+];
+
 /// Prefix of the directory a snapshot is assembled in before it is renamed.
 ///
 /// Dotted so it cannot collide with a snapshot id, which the validator below
@@ -142,6 +151,11 @@ pub struct Manifest {
     /// [`crate::durable::Manifest::inspection_root`].
     #[serde(default)]
     pub inspection_root: String,
+    /// The snapshot is a machine's disk and nothing of its memory: a macOS
+    /// guest's, whose saved state restores only on the Mac that wrote it. A
+    /// sandbox made from it boots cold.
+    #[serde(default)]
+    pub is_disk_only: bool,
 }
 
 impl Manifest {
@@ -283,33 +297,12 @@ async fn remote_log_names(
 /// snapshots may share them.
 ///
 /// Manifest first, so a fetch racing this sees nothing rather than a manifest
-/// naming files that are going. Every backend's names, since a snapshot whose
-/// local manifest is gone says nothing about which one took it. A delete of an
-/// object that is not there is not an error.
+/// naming files that are going, then everything under the snapshot's prefix,
+/// whichever backend wrote it.
 async fn delete_remote(remote: &crate::objstore::ObjectStore, id: &str) -> Result<(), Status> {
     remote.delete(&remote_key(id, MANIFEST)).await?;
-    let mut indexes = Vec::new();
-    for name in remote_log_names(remote, id).await? {
-        indexes.push(log_index_key(id, &name));
-    }
-    remote.delete(&log_names_key(id)).await?;
-    for layout in burrow_vmm::Hypervisor::ALL.map(burrow_vmm::Hypervisor::layout) {
-        remote.delete(&remote_key(id, layout.state)).await?;
-        for file in layout
-            .memory
-            .into_iter()
-            .chain([crate::rootdisk::ROOT_DISK])
-        {
-            indexes.push(index_key(id, file));
-        }
-    }
-    // With the copies the format before casync left beside them, for this
-    // release: nothing else removes those of a deleted snapshot.
-    for key in indexes {
+    for key in remote.list(&remote_key(id, "")).await? {
         remote.delete(&key).await?;
-        if let Some(legacy) = crate::chunks::legacy_key(&key) {
-            remote.delete(&legacy).await?;
-        }
     }
     Ok(())
 }
@@ -371,6 +364,8 @@ pub struct Staged {
     pub chain: Vec<String>,
     /// The inspection root the source's guest trusted, if it was inspected.
     pub inspection_root: String,
+    /// See [`Manifest::is_disk_only`].
+    pub is_disk_only: bool,
 }
 
 impl SnapshotStore {
@@ -442,7 +437,9 @@ impl SnapshotStore {
         expiration_secs: u64,
     ) -> Result<common::Snapshot, Status> {
         let dir = self.staging(id);
-        flatten(&dir, &staged.chain, staged.hypervisor.layout()).await?;
+        if !staged.is_disk_only {
+            flatten(&dir, &staged.chain, staged.hypervisor.layout()).await?;
+        }
 
         let size_bytes = directory_size(&dir).await;
         let manifest = Manifest {
@@ -483,6 +480,7 @@ impl SnapshotStore {
             firmware_digest: String::new(),
             rootfs_digest: String::new(),
             inspection_root: staged.inspection_root,
+            is_disk_only: staged.is_disk_only,
         };
         write_manifest(&dir, &manifest).await?;
         // Every file on the disk, then the directory, before the rename that
@@ -532,6 +530,17 @@ impl SnapshotStore {
         let mut manifest = self.manifest(id).await?;
         let layout = manifest.layout()?;
         let started = std::time::Instant::now();
+        if manifest.is_disk_only {
+            let image = self.upload_machine(remote, &manifest, &dir).await?;
+            manifest.rootfs_digest = image
+                .as_ref()
+                .map(|image| image.digest.clone())
+                .unwrap_or_default();
+            manifest.is_durable = true;
+            return self
+                .publish_remote(remote, &dir, &manifest, image.as_ref(), started)
+                .await;
+        }
 
         let boot_digest = put_blob(remote, &dir.join(manifest.boot_file())).await?;
         // The image goes once for every snapshot of it.
@@ -578,12 +587,68 @@ impl SnapshotStore {
         manifest.set_boot_digest(boot_digest);
         manifest.rootfs_digest = rootfs_digest;
         manifest.is_durable = true;
-        let json = serde_json::to_vec_pretty(&manifest)
+        self.publish_remote(remote, &dir, &manifest, Some(&image), started)
+            .await
+    }
+
+    /// Puts a macOS machine's files: its disk as the chunks it changed from
+    /// its template's disk where this node has the template, whole where it
+    /// does not, then its auxiliary storage and the small files a cold boot
+    /// reads. Returns the template disk it is a diff against.
+    async fn upload_machine(
+        &self,
+        remote: &crate::objstore::ObjectStore,
+        manifest: &Manifest,
+        dir: &Path,
+    ) -> Result<Option<crate::rootdisk::Image>, Status> {
+        let id = &manifest.id;
+        let base = self
+            .templates_dir()
+            .join(&manifest.template)
+            .join(crate::macnode::DISK);
+        let image = match tokio::fs::try_exists(&base).await.unwrap_or(false) {
+            true => {
+                let image = crate::rootdisk::image_of(&self.blobs, &base).await?;
+                crate::rootdisk::upload_image(remote, &image).await?;
+                Some(image)
+            }
+            false => None,
+        };
+        let disk = crate::macnode::DISK;
+        let index =
+            crate::chunks::put_disk(remote, &dir.join(disk), image.as_ref(), &Default::default())
+                .await?;
+        crate::chunks::put_index(remote, &index_key(id, disk), &index).await?;
+        let aux = crate::macnode::AUX;
+        let index =
+            crate::chunks::put_image(remote, dir, &[aux.to_string()], None, &Default::default())
+                .await?;
+        crate::chunks::put_index(remote, &index_key(id, aux), &index).await?;
+        for file in MACHINE_FILES {
+            remote
+                .put_file(&remote_key(id, file), &dir.join(file))
+                .await?;
+        }
+        Ok(image)
+    }
+
+    /// Writes the remote manifest that makes an uploaded snapshot durable,
+    /// unless it was deleted while uploading.
+    async fn publish_remote(
+        &self,
+        remote: &crate::objstore::ObjectStore,
+        dir: &Path,
+        manifest: &Manifest,
+        image: Option<&crate::rootdisk::Image>,
+        started: std::time::Instant,
+    ) -> Result<(), Status> {
+        let id = &manifest.id;
+        let json = serde_json::to_vec_pretty(manifest)
             .map_err(|err| Status::internal(format!("encoding the manifest: {err}")))?;
         let _publishing = self.publishing.lock().await;
         // Deleted while uploading: what went up is dropped rather than
         // published, since a manifest written now would resurrect it.
-        if read_manifest(&dir).await.is_none() {
+        if read_manifest(dir).await.is_none() {
             delete_remote(remote, id).await?;
             tracing::info!(
                 snapshot = id,
@@ -592,8 +657,10 @@ impl SnapshotStore {
             return Ok(());
         }
         remote.put_bytes(&remote_key(id, MANIFEST), json).await?;
-        crate::rootdisk::confirm_image(remote, &image).await?;
-        write_manifest(&dir, &manifest).await?;
+        if let Some(image) = image {
+            crate::rootdisk::confirm_image(remote, image).await?;
+        }
+        write_manifest(dir, manifest).await?;
         tracing::info!(
             snapshot = id,
             size_bytes = manifest.size_bytes,
@@ -633,7 +700,14 @@ impl SnapshotStore {
         let layout = manifest.layout()?;
         let started = std::time::Instant::now();
         let dir = self.begin(id).await?;
-        let memory = match self.fetch_into(remote, &manifest, &dir).await {
+        let fetched = match manifest.is_disk_only {
+            true => self
+                .fetch_machine(remote, &manifest, &dir)
+                .await
+                .map(|()| None),
+            false => self.fetch_into(remote, &manifest, &dir).await.map(Some),
+        };
+        let memory = match fetched {
             Ok(memory) => memory,
             Err(err) => {
                 self.abandon(id).await;
@@ -655,6 +729,15 @@ impl SnapshotStore {
         crate::fsync::dir(&self.root)
             .await
             .map_err(|err| Status::internal(format!("syncing the snapshot store: {err}")))?;
+        let Some(memory) = memory else {
+            tracing::info!(
+                snapshot = id,
+                size_bytes = manifest.size_bytes,
+                took_ms = started.elapsed().as_millis() as u64,
+                "disk snapshot fetched from the object store"
+            );
+            return Ok(());
+        };
         // Begun at the path it will be served from: a hydrator names its file
         // by path, for the links it hands out. Readers of a snapshot all
         // arrive through `fetching`, which this call still holds.
@@ -768,6 +851,62 @@ impl SnapshotStore {
         crate::chunks::read_index(remote, &index_key(id, memory_file))
             .await?
             .ok_or_else(|| missing(memory_file))
+    }
+
+    /// Fetches a macOS machine's files into `dir`, its disk cloned from its
+    /// template's where this node has that disk or can fetch it.
+    async fn fetch_machine(
+        &self,
+        remote: &crate::objstore::ObjectStore,
+        manifest: &Manifest,
+        dir: &Path,
+    ) -> Result<(), Status> {
+        let id = &manifest.id;
+        let missing = |file: &str| {
+            Status::not_found(format!(
+                "snapshot {id} is missing {file} in the object store"
+            ))
+        };
+        let image = match manifest.rootfs_digest.is_empty() {
+            true => None,
+            false => Some(
+                crate::rootdisk::fetch_image(
+                    remote,
+                    &self.blobs,
+                    &self.templates_dir(),
+                    &manifest.rootfs_digest,
+                )
+                .await?,
+            ),
+        };
+        let disk = crate::macnode::DISK;
+        let index = crate::chunks::read_index(remote, &index_key(id, disk))
+            .await?
+            .ok_or_else(|| missing(disk))?;
+        crate::rootdisk::materialise(remote, &index, image.as_ref(), &dir.join(disk)).await?;
+        let aux = crate::macnode::AUX;
+        let index = crate::chunks::read_index(remote, &index_key(id, aux))
+            .await?
+            .ok_or_else(|| missing(aux))?;
+        crate::chunks::get_image(remote, &index, &dir.join(aux)).await?;
+        for file in MACHINE_FILES {
+            if remote
+                .get_to_file(&remote_key(id, file), &dir.join(file))
+                .await?
+                .is_none()
+            {
+                return Err(missing(file));
+            }
+        }
+        Ok(())
+    }
+
+    /// The directory a disk snapshot's machine is in on this node, fetching
+    /// it first where only the object store has it.
+    pub async fn machine_dir(&self, id: &str) -> Result<PathBuf, Status> {
+        validate_id(id)?;
+        self.ensure_local(id).await?;
+        Ok(self.dir(id))
     }
 
     /// Brings a blob onto this node at `dest`: linked from the node's blob
@@ -1426,6 +1565,7 @@ mod tests {
             firmware_digest: String::new(),
             rootfs_digest: String::new(),
             inspection_root: String::new(),
+            is_disk_only: false,
         }
     }
 
@@ -1722,6 +1862,88 @@ mod tests {
         let _ = std::fs::remove_dir_all(&scratch);
     }
 
+    /// A macOS machine's snapshot is its disk alone: published with no memory
+    /// to flatten, stored as the chunks its disk changed from its template's,
+    /// fetched by a node that has the template as a clone of it, and deleted
+    /// whole.
+    #[tokio::test]
+    async fn a_disk_snapshot_goes_through_the_store_without_memory() {
+        use std::os::unix::fs::FileExt as _;
+        let remote = crate::objstore::fake::store(true).await;
+        let scratch = std::env::temp_dir().join(format!(
+            "burrow-snapshots-disk-{}",
+            burrow_common::SnapshotId::generate()
+        ));
+        for data in ["a", "b"] {
+            let template = scratch.join(data).join("images/macos");
+            std::fs::create_dir_all(&template).unwrap();
+            let base = std::fs::File::create(template.join(crate::macnode::DISK)).unwrap();
+            base.set_len(4 << 20).unwrap();
+            base.write_all_at(&[1; 4096], 0).unwrap();
+        }
+        let taken = SnapshotStore::new(&scratch.join("a"), None, HashMap::new());
+        let id = burrow_common::SnapshotId::generate().to_string();
+        let dir = taken.begin(&id).await.unwrap();
+        let disk = dir.join(crate::macnode::DISK);
+        crate::rootdisk::clone(
+            &scratch.join("a/images/macos").join(crate::macnode::DISK),
+            &disk,
+        )
+        .await
+        .unwrap();
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(&disk)
+            .unwrap()
+            .write_all_at(&[9; 4096], 2 << 20)
+            .unwrap();
+        std::fs::write(dir.join(crate::macnode::AUX), [3u8; 4096]).unwrap();
+        for file in MACHINE_FILES {
+            std::fs::write(dir.join(file), file.as_bytes()).unwrap();
+        }
+        let staged = Staged {
+            sandbox_id: "sbx_mac".into(),
+            template: "macos".into(),
+            vcpus: 4,
+            mem_mib: 8192,
+            boot_mem_mib: 8192,
+            max_mem_mib: 8192,
+            is_nested_virt_enabled: false,
+            disk_mib: 4,
+            hypervisor: burrow_vmm::Hypervisor::Vz,
+            guest_os: burrow_vmm::GuestOs::MacOs,
+            kernel: None,
+            chain: Vec::new(),
+            inspection_root: String::new(),
+            is_disk_only: true,
+        };
+        taken.publish(&id, staged, 0).await.unwrap();
+        let taken = SnapshotStore::new(&scratch.join("a"), Some(remote.clone()), HashMap::new());
+        taken.upload(&id).await.unwrap();
+        let stored = taken.manifest(&id).await.unwrap();
+        assert!(stored.is_disk_only && stored.is_durable);
+        assert!(stored.kernel_digest.is_empty() && !stored.rootfs_digest.is_empty());
+
+        let elsewhere =
+            SnapshotStore::new(&scratch.join("b"), Some(remote.clone()), HashMap::new());
+        let fetched = elsewhere.machine_dir(&id).await.unwrap();
+        for file in [crate::macnode::DISK, crate::macnode::AUX]
+            .into_iter()
+            .chain(MACHINE_FILES)
+        {
+            assert_eq!(
+                std::fs::read(fetched.join(file)).unwrap(),
+                std::fs::read(taken.dir(&id).join(file)).unwrap(),
+                "{file}"
+            );
+        }
+        assert!(elsewhere.manifest(&id).await.unwrap().is_disk_only);
+
+        elsewhere.delete(&id).await.unwrap();
+        assert!(remote.list(&remote_key(&id, "")).await.unwrap().is_empty());
+        let _ = std::fs::remove_dir_all(&scratch);
+    }
+
     /// For this release a deleted snapshot takes the indexes the format
     /// before casync left with it, and the collector counts an index only
     /// while its snapshot has a manifest, reading an old one from where it
@@ -1799,6 +2021,7 @@ mod tests {
             kernel: None,
             chain: vec![memory.to_string()],
             inspection_root: String::new(),
+            is_disk_only: false,
         };
         store.publish(&id, staged, 0).await.unwrap();
 

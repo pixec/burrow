@@ -2945,6 +2945,7 @@ impl RunningSandbox {
                 .unwrap()
                 .inspection_root_fingerprint
                 .clone(),
+            is_disk_only: false,
         })
     }
 }
