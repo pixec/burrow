@@ -1293,9 +1293,11 @@ fn spawn_handshake(
                 if let Some(warm) = warm
                     .as_ref()
                     .filter(|_| is_snapshot_suspect && has_vm && is_registered)
+                    && let Ok(restored) =
+                        crate::warm::Restored::of(&sandbox.workdir.join(sandbox.layout().state))
                 {
                     manager
-                        .discard_failed_warm(warm, &sandbox.workdir.join(sandbox.layout().state))
+                        .discard_failed_warm(warm, &restored, "its restored guest never came up")
                         .await;
                 }
                 // This task is the one place that knows the guest has been
@@ -6927,8 +6929,8 @@ impl SandboxManager {
     }
 
     /// Discards `template`'s snapshot of `shape` under `hypervisor` if it is
-    /// there with a file gone or built with another agent, and builds it
-    /// again. Left in place it would
+    /// there with a file gone or of another size than it was built with, or
+    /// built with another agent, and builds it again. Left in place it would
     /// send every create of its shape to a cold boot until the node
     /// restarted, since the attempt that built it is still recorded.
     async fn rebuild_if_broken(
@@ -6954,16 +6956,22 @@ impl SandboxManager {
             template,
             vcpus = shape.vcpus,
             mem_mib = shape.mem_mib,
-            "discarded a warm snapshot with a file gone or another agent; rebuilding it"
+            "discarded a warm snapshot with a file gone, cut short or built with another agent; \
+             rebuilding it"
         );
         self.rebuild_warm(template, shape);
     }
 
-    /// Discards the warm snapshot a sandbox was restored from once that
-    /// sandbox's guest never came up, and builds it again. Left in place, every
-    /// create of its shape restored the same broken guest and was reclaimed
-    /// once its handshake timed out.
-    async fn discard_failed_warm(&self, warm: &WarmOrigin, restored: &Path) {
+    /// Discards the warm snapshot a sandbox was restored from once the
+    /// hypervisor refused to restore it or the sandbox's guest never came up,
+    /// and builds it again. Left in place, every create of its shape restored
+    /// the same broken snapshot and failed.
+    async fn discard_failed_warm(
+        &self,
+        warm: &WarmOrigin,
+        restored: &crate::warm::Restored,
+        cause: &'static str,
+    ) {
         if !may_discard_warm(
             &mut self.warm_discards.lock().unwrap(),
             &warm.dir,
@@ -6973,8 +6981,9 @@ impl SandboxManager {
                 template = warm.template,
                 vcpus = warm.shape.vcpus,
                 mem_mib = warm.shape.mem_mib,
-                "keeping a warm snapshot whose restored guest never came up: one of its shape was \
-                 discarded within the last 5 minutes"
+                cause,
+                "keeping a failed warm snapshot: one of its shape was discarded within the last \
+                 5 minutes"
             );
             return;
         }
@@ -6984,8 +6993,9 @@ impl SandboxManager {
             Err(err) => {
                 tracing::warn!(
                     template = warm.template,
+                    cause,
                     %err,
-                    "could not discard a warm snapshot whose guest never came up"
+                    "could not discard a failed warm snapshot"
                 );
                 return;
             }
@@ -6994,9 +7004,37 @@ impl SandboxManager {
             template = warm.template,
             vcpus = warm.shape.vcpus,
             mem_mib = warm.shape.mem_mib,
-            "discarded a warm snapshot whose restored guest never came up; rebuilding it"
+            cause,
+            "discarded a failed warm snapshot; rebuilding it"
         );
         self.rebuild_warm(&warm.template, warm.shape);
+    }
+
+    /// [`Self::discard_failed_warm`] for a snapshot the hypervisor could not
+    /// restore into `workdir`, on a task of its own so the create fails without
+    /// waiting on a warm build.
+    fn discard_unrestorable_warm(
+        &self,
+        snapshot: &crate::warm::Warm,
+        template: &str,
+        workdir: &Path,
+        hypervisor: Hypervisor,
+    ) {
+        let Ok(restored) = crate::warm::Restored::of(&workdir.join(hypervisor.layout().state))
+        else {
+            return;
+        };
+        let warm = WarmOrigin {
+            template: template.to_string(),
+            dir: snapshot.dir.clone(),
+            shape: snapshot.shape,
+        };
+        let manager = self.clone();
+        tokio::spawn(async move {
+            manager
+                .discard_failed_warm(&warm, &restored, "the hypervisor could not restore it")
+                .await
+        });
     }
 
     fn rebuild_warm(&self, template: &str, shape: crate::warm::Shape) {
@@ -8280,7 +8318,10 @@ impl SandboxManager {
                 .load(true)
                 .await
                 .map(|vm| (vm, boot_spec))
-                .map_err(|err| Status::internal(format!("warm restore failed: {err}")))
+                .map_err(|err| {
+                    self.discard_unrestorable_warm(snapshot, &template, &workdir, hypervisor);
+                    Status::internal(format!("warm restore failed: {err}"))
+                })
         } else {
             // Copying a root disk is disk work and programming a tap is
             // netlink, so they run together rather than one after the other.
@@ -8347,9 +8388,12 @@ impl SandboxManager {
             record_working_set(&mut spec, self.config.object_store.is_some());
             phases.mark("spec");
             match is_warm {
-                true => Vm::restore(spec, true)
-                    .await
-                    .map_err(|err| Status::internal(format!("warm restore failed: {err}"))),
+                true => Vm::restore(spec, true).await.map_err(|err| {
+                    if let Some(snapshot) = &warm {
+                        self.discard_unrestorable_warm(snapshot, &template, &workdir, hypervisor);
+                    }
+                    Status::internal(format!("warm restore failed: {err}"))
+                }),
                 false => Vm::boot(spec)
                     .await
                     .map_err(|err| Status::internal(format!("boot failed: {err}"))),
@@ -12889,6 +12933,47 @@ pub(crate) mod tests {
         manager
             .rebuild_if_broken("app", Hypervisor::Firecracker, wanted)
             .await;
+
+        assert!(!tokio::fs::try_exists(&dir).await.unwrap());
+        assert_eq!(
+            attempted(&manager),
+            vec![ShapeKey::of("app", &shape(2, 2048))]
+        );
+    }
+
+    /// A snapshot the hypervisor refuses to restore, its state cut short or
+    /// failing its checksum, fails every create of its shape until it goes.
+    #[tokio::test]
+    async fn a_warm_snapshot_that_will_not_restore_is_discarded_and_rebuilt() {
+        let manager = manager().await;
+        let dir = crate::warm::warm_dir(&manager.config.templates_dir(), "app")
+            .join("firecracker-2x2048-16384");
+        let workdir = manager.config.data_dir.join("sbx_unrestorable");
+        tokio::fs::create_dir_all(&dir).await.unwrap();
+        tokio::fs::create_dir_all(&workdir).await.unwrap();
+        let layout = Hypervisor::Firecracker.layout();
+        for file in layout.files() {
+            tokio::fs::write(dir.join(file), b"x").await.unwrap();
+        }
+        tokio::fs::hard_link(dir.join(layout.state), workdir.join(layout.state))
+            .await
+            .unwrap();
+        let snapshot = crate::warm::Warm {
+            dir: dir.clone(),
+            hypervisor: Hypervisor::Firecracker,
+            shape: crate::warm::Shape::wanted(&shape(2, 2048)),
+            bytes: 0,
+            used_at: 0,
+        };
+
+        manager.discard_unrestorable_warm(&snapshot, "app", &workdir, Hypervisor::Firecracker);
+        tokio::time::timeout(std::time::Duration::from_secs(10), async {
+            while attempted(&manager).is_empty() {
+                tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .unwrap();
 
         assert!(!tokio::fs::try_exists(&dir).await.unwrap());
         assert_eq!(

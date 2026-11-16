@@ -75,8 +75,9 @@ pub async fn hold_builds() -> tokio::sync::MutexGuard<'static, ()> {
 /// A 9 also records the digests of its guest's agent and kernel, which must
 /// match the node's agent and the template's kernel.
 ///
-/// 10 records its guest's OS, whose agent it is checked against, and the disk
-/// it takes, measured once when it is built.
+/// 10 records its guest's OS, whose agent it is checked against, the disk
+/// it takes, measured once when it is built, and the size of each of its
+/// files, which a restore checks them against.
 ///
 /// A snapshot in any other format is discarded.
 const WARM_FORMAT: &str = "10";
@@ -132,6 +133,26 @@ const SHAPE_FILE: &str = "shape";
 
 /// Which hypervisor took the snapshot, and so which files it is made of.
 const HYPERVISOR_FILE: &str = "hypervisor";
+
+/// The size of each of the snapshot's files when it was built. One of another
+/// size was truncated or overwritten, and restoring it fails every create.
+const SIZES_FILE: &str = "sizes";
+
+fn render_sizes(sizes: &[(&str, u64)]) -> String {
+    sizes
+        .iter()
+        .map(|(name, size)| format!("{name} {size}\n"))
+        .collect()
+}
+
+fn parse_sizes(text: &str) -> Option<std::collections::HashMap<&str, u64>> {
+    text.lines()
+        .map(|line| {
+            let (name, size) = line.split_once(' ')?;
+            Some((name, size.parse().ok()?))
+        })
+        .collect()
+}
 
 /// The digest of the kernel the snapshot's guest booted. A restore boots the
 /// template's kernel, so a snapshot of any other is stale: rebuilding a
@@ -427,8 +448,13 @@ async fn read_warm(dir: &Path, agents: Option<&Agents>) -> Option<Warm> {
         }
     }
     let shape = Shape::parse(&tokio::fs::read_to_string(dir.join(SHAPE_FILE)).await.ok()?)?;
+    let sizes = tokio::fs::read_to_string(dir.join(SIZES_FILE)).await.ok()?;
+    let sizes = parse_sizes(&sizes)?;
     for file in hypervisor.layout().files().chain([ROOT_DISK]) {
-        tokio::fs::metadata(dir.join(file)).await.ok()?;
+        let meta = tokio::fs::metadata(dir.join(file)).await.ok()?;
+        if sizes.get(file) != Some(&meta.len()) {
+            return None;
+        }
     }
     let bytes = tokio::fs::read_to_string(dir.join(BYTES_FILE))
         .await
@@ -530,23 +556,40 @@ pub async fn discard_broken(dir: &Path) -> std::io::Result<bool> {
     Ok(true)
 }
 
-/// Removes the snapshot in `dir` if `restored`, a file a sandbox linked from
-/// it, is still one of its own, and says whether it did. A snapshot rebuilt
-/// since is left alone.
-pub async fn discard_restored(dir: &Path, restored: &Path) -> std::io::Result<bool> {
+/// A file a sandbox linked from a warm snapshot, by name and inode, so the
+/// snapshot can be told apart from one rebuilt since after the sandbox's own
+/// link is gone.
+#[derive(Debug, Clone)]
+pub struct Restored {
+    name: std::ffi::OsString,
+    file: (u64, u64),
+}
+
+impl Restored {
+    pub fn of(path: &Path) -> std::io::Result<Self> {
+        use std::os::unix::fs::MetadataExt as _;
+
+        let meta = std::fs::metadata(path)?;
+        let name = path
+            .file_name()
+            .ok_or_else(|| std::io::Error::other("a restored file has a name"))?;
+        Ok(Self {
+            name: name.to_os_string(),
+            file: (meta.dev(), meta.ino()),
+        })
+    }
+}
+
+/// Removes the snapshot in `dir` if `restored` is still one of its own files,
+/// and says whether it did. A snapshot rebuilt since is left alone.
+pub async fn discard_restored(dir: &Path, restored: &Restored) -> std::io::Result<bool> {
     use std::os::unix::fs::MetadataExt as _;
 
     let _no_builds = WARM_BUILD_LOCK.lock().await;
-    let Some(name) = restored.file_name() else {
+    let Ok(own) = tokio::fs::metadata(dir.join(&restored.name)).await else {
         return Ok(false);
     };
-    let (Ok(own), Ok(linked)) = (
-        tokio::fs::metadata(dir.join(name)).await,
-        tokio::fs::metadata(restored).await,
-    ) else {
-        return Ok(false);
-    };
-    if (own.dev(), own.ino()) != (linked.dev(), linked.ino()) {
+    if (own.dev(), own.ino()) != restored.file {
         return Ok(false);
     }
     tokio::fs::remove_dir_all(dir).await?;
@@ -885,6 +928,16 @@ pub async fn build_warm_snapshot(
             tokio::fs::write(dir.join(BYTES_FILE), bytes.to_string())
                 .await
                 .map_err(|err| Status::internal(format!("recording warm size: {err}")))?;
+            let mut sizes = Vec::new();
+            for file in hypervisor.layout().files().chain([ROOT_DISK]) {
+                let meta = tokio::fs::metadata(dir.join(file))
+                    .await
+                    .map_err(|err| Status::internal(format!("sizing warm {file}: {err}")))?;
+                sizes.push((file, meta.len()));
+            }
+            tokio::fs::write(dir.join(SIZES_FILE), render_sizes(&sizes))
+                .await
+                .map_err(|err| Status::internal(format!("recording warm sizes: {err}")))?;
             // Everything on the disk before the marker, and the marker before
             // the swap: every create restores from this snapshot, so one torn
             // by a power cut would corrupt every guest made from it.
@@ -1548,6 +1601,13 @@ mod shape_tests {
         std::fs::write(dir.join(GUEST_OS_FILE), "linux").unwrap();
         std::fs::write(dir.join(BYTES_FILE), "1").unwrap();
         std::fs::write(dir.join(SHAPE_FILE), shape).unwrap();
+        let sizes: Vec<(&str, u64)> = Hypervisor::Firecracker
+            .layout()
+            .files()
+            .chain([ROOT_DISK])
+            .map(|file| (file, 1))
+            .collect();
+        std::fs::write(dir.join(SIZES_FILE), render_sizes(&sizes)).unwrap();
         std::fs::write(dir.join("format"), format).unwrap();
     }
 
@@ -1649,16 +1709,62 @@ mod shape_tests {
 
         write_snapshot(&live, WARM_FORMAT, "2 2048 1324 0");
         link(&live);
+        let restored = Restored::of(&sandbox.join(state)).unwrap();
         std::fs::remove_dir_all(&live).unwrap();
         write_snapshot(&live, WARM_FORMAT, "2 2048 1324 0");
-        assert!(!discard_restored(&live, &sandbox.join(state)).await.unwrap());
+        assert!(!discard_restored(&live, &restored).await.unwrap());
         assert!(live.exists());
 
         link(&live);
-        assert!(discard_restored(&live, &sandbox.join(state)).await.unwrap());
+        let restored = Restored::of(&sandbox.join(state)).unwrap();
+        std::fs::remove_dir_all(&sandbox).unwrap();
+        assert!(discard_restored(&live, &restored).await.unwrap());
         assert!(!live.exists());
-        assert!(!discard_restored(&live, &sandbox.join(state)).await.unwrap());
+        assert!(!discard_restored(&live, &restored).await.unwrap());
         let _ = std::fs::remove_dir_all(&templates);
+    }
+
+    /// A memory or state file cut short, or overwritten with another size,
+    /// makes its snapshot broken, so it is rebuilt rather than restored.
+    #[tokio::test]
+    async fn a_snapshot_with_a_file_of_another_size_is_broken() {
+        let templates = temp("sizes");
+        let wanted = parse_shape("2x2048").unwrap();
+        let live = warm_dir(&templates, "app").join("firecracker-2x2048");
+        let layout = Hypervisor::Firecracker.layout();
+        for file in layout.files().chain([ROOT_DISK]) {
+            write_snapshot(&live, WARM_FORMAT, "2 2048 1324 0");
+            assert!(
+                find(&templates, "app", Hypervisor::Firecracker, wanted)
+                    .await
+                    .is_some()
+            );
+            std::fs::write(live.join(file), b"").unwrap();
+            assert!(
+                find(&templates, "app", Hypervisor::Firecracker, wanted)
+                    .await
+                    .is_none(),
+                "{file} cut short"
+            );
+            assert_eq!(
+                find_broken(&templates, "app", Hypervisor::Firecracker, wanted).await,
+                Some(live.clone())
+            );
+        }
+        write_snapshot(&live, WARM_FORMAT, "2 2048 1324 0");
+        std::fs::remove_file(live.join(SIZES_FILE)).unwrap();
+        assert!(read_warm(&live, None).await.is_none());
+        let _ = std::fs::remove_dir_all(&templates);
+    }
+
+    #[test]
+    fn sizes_round_trip_through_their_file() {
+        let sizes = [("snapshot.mem", 536870912), ("root.ext4", 1)];
+        let text = render_sizes(&sizes);
+        let parsed = parse_sizes(&text).unwrap();
+        assert_eq!(parsed.len(), 2);
+        assert_eq!(parsed["snapshot.mem"], 536870912);
+        assert_eq!(parse_sizes("snapshot.mem lots\n"), None);
     }
 
     /// A snapshot built with another agent is stale like one in another
