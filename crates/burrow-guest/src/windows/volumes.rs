@@ -101,7 +101,9 @@ pub fn script_env(volume: &guestpb::VolumeMount, target: &Target) -> Vec<(&'stat
 
 /// Finds the disk, formats it if nothing ever has, and gives its partition
 /// the path. A path it already has is left alone, so a second handshake in
-/// one boot changes nothing.
+/// one boot changes nothing. Windows keeps a volume's mount points across a
+/// restart and restores them behind the disk coming online, so a path found
+/// in use is waited for before it counts as a failure.
 const SCRIPT: &str = r#"
 $ErrorActionPreference = 'Stop'
 trap { [Console]::Error.WriteLine($_.Exception.Message); exit 1 }
@@ -124,15 +126,28 @@ if ((Get-Disk -Number $number).PartitionStyle -eq 'RAW') {
 $part = Get-Partition -DiskNumber $number | Where-Object Type -eq 'Basic' | Select-Object -First 1
 if (-not $part) { throw "disk $($env:BURROW_SERIAL) has no NTFS partition; it holds a filesystem another guest OS made" }
 $at = @{ DiskNumber = $number; PartitionNumber = $part.PartitionNumber }
+function Wait-Path($path) {
+    $deadline = (Get-Date).AddSeconds(15)
+    while ((Get-Date) -lt $deadline) {
+        if (@((Get-Partition @at).AccessPaths) -contains $path) { return $true }
+        Start-Sleep -Milliseconds 500
+    }
+    return $false
+}
 $assigned = "$($part.DriveLetter)".Trim([char]0).Trim()
 if ($env:BURROW_LETTER) {
-    if ($assigned -ne $env:BURROW_LETTER) { Set-Partition @at -NewDriveLetter $env:BURROW_LETTER }
+    if ($assigned -ne $env:BURROW_LETTER) {
+        try { Set-Partition @at -NewDriveLetter $env:BURROW_LETTER }
+        catch { if (-not (Wait-Path "$($env:BURROW_LETTER):\")) { throw } }
+    }
     $root = "$($env:BURROW_LETTER):\"
 } else {
     if (@($part.AccessPaths) -notcontains $env:BURROW_FOLDER) {
         New-Item -ItemType Directory -Force -Path $env:BURROW_FOLDER | Out-Null
-        Add-PartitionAccessPath @at -AccessPath $env:BURROW_FOLDER
+        try { Add-PartitionAccessPath @at -AccessPath $env:BURROW_FOLDER }
+        catch { if (-not (Wait-Path $env:BURROW_FOLDER)) { throw } }
     }
+    $assigned = "$((Get-Partition @at).DriveLetter)".Trim([char]0).Trim()
     if ($assigned) { Remove-PartitionAccessPath @at -AccessPath "$($assigned):\" }
     $root = $env:BURROW_FOLDER
 }
