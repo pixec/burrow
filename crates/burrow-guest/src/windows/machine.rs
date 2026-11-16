@@ -1,4 +1,4 @@
-//! The machine itself: its name, Remote Desktop.
+//! The machine itself: its name, Remote Desktop, its license.
 
 #![allow(clippy::result_large_err)]
 
@@ -155,6 +155,120 @@ pub fn restart_soon() {
             tracing::error!(err = %win::last_io_error(), "could not restart to take the new name");
         }
     });
+}
+
+/// A product key as Windows takes one: five groups of five letters and
+/// digits.
+pub fn is_product_key(key: &str) -> bool {
+    let groups: Vec<&str> = key.split('-').collect();
+    groups.len() == 5
+        && groups
+            .iter()
+            .all(|group| group.len() == 5 && group.bytes().all(|b| b.is_ascii_alphanumeric()))
+}
+
+/// A KMS host as slmgr takes one: a name or address, and a port.
+pub fn is_kms_host(host: &str) -> bool {
+    (1..=255).contains(&host.len())
+        && host
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b".-:[]".contains(&b))
+}
+
+/// Installs `product_key` and points the guest at `kms_host` when given,
+/// then activates. slmgr does the work, as the supported tool; its output
+/// goes back with the key cut out of it.
+pub async fn activate(
+    req: burrow_proto::guest::v1::ActivateRequest,
+) -> Result<burrow_proto::guest::v1::ActivateResponse, Status> {
+    if !req.product_key.is_empty() && !is_product_key(&req.product_key) {
+        return Err(Status::invalid_argument("not a product key"));
+    }
+    if !req.kms_host.is_empty() && !is_kms_host(&req.kms_host) {
+        return Err(Status::invalid_argument(format!(
+            "{:?} is not a KMS host",
+            req.kms_host
+        )));
+    }
+    tokio::task::spawn_blocking(move || {
+        let key = req.product_key;
+        if !key.is_empty() {
+            let (ok, out) = slmgr(&["/ipk", &key], &key)?;
+            if !ok {
+                return Ok(burrow_proto::guest::v1::ActivateResponse {
+                    is_activated: false,
+                    status: format!("installing the product key: {out}"),
+                });
+            }
+        }
+        if !req.kms_host.is_empty() {
+            let (ok, out) = slmgr(&["/skms", &req.kms_host], &key)?;
+            if !ok {
+                return Ok(burrow_proto::guest::v1::ActivateResponse {
+                    is_activated: false,
+                    status: format!("setting the KMS host: {out}"),
+                });
+            }
+        }
+        let (_, attempt) = slmgr(&["/ato"], &key)?;
+        let (is_activated, state) = license_state()?;
+        let status = match is_activated {
+            true => state,
+            false => format!("{state}: {attempt}"),
+        };
+        Ok(burrow_proto::guest::v1::ActivateResponse {
+            is_activated,
+            status,
+        })
+    })
+    .await
+    .map_err(|err| Status::internal(format!("activation did not run: {err}")))?
+}
+
+/// Runs slmgr under cscript, answering whether it succeeded and what it
+/// printed, with `secret` replaced wherever it appears.
+fn slmgr(args: &[&str], secret: &str) -> Result<(bool, String), Status> {
+    let script = format!(r"{}:\Windows\System32\slmgr.vbs", win::system_drive());
+    let output = std::process::Command::new("cscript.exe")
+        .arg("//nologo")
+        .arg(&script)
+        .args(args)
+        .creation_flags(CREATE_NO_WINDOW)
+        .output()
+        .map_err(|err| Status::internal(format!("running slmgr: {err}")))?;
+    let mut text = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    if !secret.is_empty() {
+        text = text.replace(secret, "<product key>");
+    }
+    // slmgr exits 0 whatever happened and says so in words.
+    let ok = output.status.success() && !text.contains("Error:");
+    Ok((ok, text.split_whitespace().collect::<Vec<_>>().join(" ")))
+}
+
+/// Whether Windows itself is licensed, and its state as `LicenseStatus` and
+/// the license's description name it.
+fn license_state() -> Result<(bool, String), Status> {
+    const QUERY: &str = "$p = Get-CimInstance SoftwareLicensingProduct -Filter \"ApplicationID='55c92734-d682-4d71-983e-d6ec3f16059f' AND PartialProductKey IS NOT NULL\" | Select-Object -First 1; if ($p) { \"$($p.LicenseStatus)|$($p.Description)\" }";
+    let output = std::process::Command::new("powershell.exe")
+        .args(["-NoProfile", "-NonInteractive", "-Command", QUERY])
+        .creation_flags(CREATE_NO_WINDOW)
+        .output()
+        .map_err(|err| Status::internal(format!("reading the license state: {err}")))?;
+    let text = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    let (code, description) = text
+        .split_once('|')
+        .unwrap_or(("", "no installed product key"));
+    let state = match code {
+        "0" => "unlicensed",
+        "1" => "licensed",
+        "2" => "out-of-box grace",
+        "3" => "out-of-tolerance grace",
+        "4" => "non-genuine grace",
+        "5" => "notification",
+        "6" => "extended grace",
+        _ => "unknown",
+    };
+    Ok((code == "1", format!("{state} ({description})")))
 }
 
 /// Whether Windows Setup has finished with this install. A generalized image

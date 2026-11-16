@@ -43,7 +43,7 @@ impl NodeApi {
         let sandbox = self.sandboxes.get(id).await?;
         if sandbox.record().guest_os != burrow_vmm::GuestOs::Windows.as_str() {
             return Err(Status::invalid_argument(
-                "remote desktop is for windows guests",
+                "remote desktop and activation are for windows guests",
             ));
         }
         Ok(())
@@ -416,7 +416,12 @@ impl NodeApi {
             )
             .await?;
         crate::kit::restart(&self.sandboxes, id).await?;
-        Ok(redact_secrets(self.sandboxes.get(id).await?.record()))
+        let record = self.sandboxes.get(id).await?.record();
+        if record.activation.is_some() {
+            self.sandboxes
+                .activate_in_background(id.to_string(), String::new());
+        }
+        Ok(redact_secrets(record))
     }
 
     /// Creates a sandbox from a Kit template and walks its lifecycle.
@@ -589,6 +594,10 @@ impl NodeService for NodeApi {
         // template and shape from what the snapshot holds; it shares nothing
         // with the cold path but the checks above.
         let is_remote_desktop_enabled = req.is_remote_desktop_enabled;
+        let activation = req.activation;
+        if let Some(activation) = &activation {
+            validate_activation(activation)?;
+        }
         let mut sandbox = if req.snapshot.is_empty() {
             // The template names a directory under `images/`, and a create is
             // the one path that reaches it with a string the orchestrator
@@ -618,11 +627,30 @@ impl NodeService for NodeApi {
                 )
                 .await?
         };
+        let windows_only = match is_remote_desktop_enabled || activation.is_some() {
+            true => self.require_windows(&sandbox.id).await,
+            false => Ok(()),
+        };
+        if let Err(err) = windows_only {
+            self.delete_failed(&sandbox.id).await;
+            return Err(err);
+        }
+        if let Some(activation) = activation {
+            let recorded = common::WindowsActivation {
+                kms_host: activation.kms_host,
+                is_product_key_installed: !activation.product_key.is_empty(),
+                status: "activating".into(),
+                ..Default::default()
+            };
+            sandbox.activation = self
+                .sandboxes
+                .set_activation(&sandbox.id, recorded)
+                .await?
+                .activation;
+            self.sandboxes
+                .activate_in_background(sandbox.id.clone(), activation.product_key);
+        }
         if is_remote_desktop_enabled {
-            if let Err(err) = self.require_windows(&sandbox.id).await {
-                self.delete_failed(&sandbox.id).await;
-                return Err(err);
-            }
             match self.enable_remote_desktop(&sandbox.id).await {
                 Ok(credential) => sandbox.remote_desktop = Some(credential),
                 Err(err) => {
@@ -1926,6 +1954,39 @@ fn check_command_id(id: &str) -> Result<String, Status> {
 ///
 /// POSIX portable: `[a-z_][a-z0-9_-]*`, at most 32. The name reaches an argv in
 /// the guest, so it is refused at the door rather than escaped later.
+/// A product key in the shape Windows takes, and a KMS host that is a host
+/// name or address with an optional port, checked before a sandbox is made
+/// for them.
+#[allow(clippy::result_large_err)]
+fn validate_activation(activation: &nodepb::NodeActivation) -> Result<(), Status> {
+    let groups: Vec<&str> = activation.product_key.split('-').collect();
+    let is_key = groups.len() == 5
+        && groups
+            .iter()
+            .all(|group| group.len() == 5 && group.bytes().all(|b| b.is_ascii_alphanumeric()));
+    if !activation.product_key.is_empty() && !is_key {
+        return Err(Status::invalid_argument(
+            "the product key is not five groups of five letters and digits",
+        ));
+    }
+    let host = &activation.kms_host;
+    let is_host = (1..=255).contains(&host.len())
+        && host
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b".-:[]".contains(&b));
+    if !host.is_empty() && !is_host {
+        return Err(Status::invalid_argument(format!(
+            "{host:?} is not a KMS host: a host name or address, and an optional port"
+        )));
+    }
+    if activation.product_key.is_empty() && host.is_empty() {
+        return Err(Status::invalid_argument(
+            "an activation names a product key, a KMS host, or both",
+        ));
+    }
+    Ok(())
+}
+
 fn check_user_name(name: &str) -> Result<(), Status> {
     let mut chars = name.chars();
     let ok = (1..=MAX_NAME).contains(&name.len())
@@ -3275,6 +3336,29 @@ fn translate_exec_output(msg: guestpb::ExecOutput) -> api::ExecOutput {
 #[cfg(test)]
 mod policy_tests {
     use super::*;
+
+    #[test]
+    fn an_activation_names_a_well_formed_key_or_kms_host() {
+        let activation = |product_key: &str, kms_host: &str| nodepb::NodeActivation {
+            product_key: product_key.into(),
+            kms_host: kms_host.into(),
+        };
+        assert!(validate_activation(&activation("VDYBN-27WPP-V4HQT-9VMD4-VMK7H", "")).is_ok());
+        assert!(validate_activation(&activation("", "kms.example.com:1688")).is_ok());
+        assert!(validate_activation(&activation("", "[2001:db8::1]:1688")).is_ok());
+        for (key, host) in [
+            ("", ""),
+            ("VDYBN-27WPP-V4HQT-9VMD4", ""),
+            ("VDYBN-27WPP-V4HQT-9VMD4-VMK7H /ato", ""),
+            ("", "kms.example.com /skms"),
+            ("", "a,b"),
+        ] {
+            assert!(
+                validate_activation(&activation(key, host)).is_err(),
+                "{key:?} {host:?}"
+            );
+        }
+    }
 
     /// A traversal-shaped id becomes a path this sandbox's own setup will
     /// `remove_dir_all` and recreate, so it must be refused before it gets

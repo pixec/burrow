@@ -83,6 +83,24 @@ service Guest {
   // Lets Remote Desktop in: the listener on and its firewall rules open.
   // Windows guests only.
   rpc EnableRemoteDesktop(EnableRemoteDesktopRequest) returns (EnableRemoteDesktopResponse);
+  // Installs a product key or points the guest at a KMS host, as asked, then
+  // activates and answers with the license status. Windows guests only.
+  rpc Activate(ActivateRequest) returns (ActivateResponse);
+}
+
+message ActivateRequest {
+  // Installed first when given: XXXXX-XXXXX-XXXXX-XXXXX-XXXXX.
+  string product_key = 1;
+  // The KMS host to activate against, host or host:port; empty leaves the
+  // guest's own setting, which is DNS discovery unless one was set before.
+  string kms_host = 2;
+}
+
+message ActivateResponse {
+  bool is_activated = 1;
+  // The license state as Windows names it, and why activation failed when
+  // it did. Never holds the product key.
+  string status = 2;
 }
 
 message SetPasswordRequest {

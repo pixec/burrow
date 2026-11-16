@@ -182,6 +182,14 @@ message NodeCreateRequest {
   // Turns Remote Desktop on and sets a fresh Administrator password, which
   // the response carries and nothing keeps. A failure fails the create.
   bool is_remote_desktop_enabled = 11;
+  // A Windows guest's license: the product key, resolved from its secret,
+  // is installed once and dropped; the KMS host is kept on the sandbox.
+  NodeActivation activation = 12;
+}
+
+message NodeActivation {
+  string product_key = 1;
+  string kms_host = 2;
 }
 
 message NodeRecreateRequest {
@@ -453,6 +461,9 @@ message SandboxStateReport {
   // The record's latest checkpoint in the object store.
   int64 checkpoint_at_unix_ms = 10;
   burrow.common.v1.CheckpointKind checkpoint_kind = 11;
+  // A Windows guest's last activation attempt, which runs behind its create
+  // and its boots.
+  burrow.common.v1.WindowsActivation activation = 12;
 }
 
 message HeartbeatResponse {

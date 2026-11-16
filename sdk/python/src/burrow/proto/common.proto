@@ -593,6 +593,22 @@ message Sandbox {
   // The Remote Desktop logon a create with `is_remote_desktop_enabled` made,
   // in that create's response only: never stored, listed or sent again.
   RemoteDesktopCredential remote_desktop = 40;
+  // Windows guests created with an activation: how they activate, and how
+  // the last attempt went.
+  WindowsActivation activation = 41;
+}
+
+message WindowsActivation {
+  // The customer KMS host it activates against; empty when it activates with
+  // a product key alone.
+  string kms_host = 1;
+  // A product key was installed at create. The key itself is never kept.
+  bool is_product_key_installed = 2;
+  bool is_activated = 3;
+  // The license state Windows reports, and the failure when there was one.
+  string status = 4;
+  // Unix milliseconds of the last attempt, made at create and at every boot.
+  int64 checked_at_unix_ms = 5;
 }
 
 message RemoteDesktopCredential {

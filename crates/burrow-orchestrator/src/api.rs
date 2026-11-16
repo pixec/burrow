@@ -339,6 +339,19 @@ impl ApiService {
             ));
         }
         req.node_labels.extend(ip_labels);
+        let activation = self
+            .activation_for(
+                req.activation.take(),
+                crate::secrets::Subject {
+                    id: &sandbox_id,
+                    name: &req.name,
+                    tags: &req.tags,
+                },
+            )
+            .await?;
+        if activation.is_some() {
+            req.node_labels.extend(self.0.byol_node_labels.clone());
+        }
         // Refused here as well as on the node: placement charges a node and
         // may replicate a template before the create is ever sent, and none of
         // that should be spent on a request the node will reject anyway.
@@ -439,6 +452,7 @@ impl ApiService {
                     kit: None,
                     credentials: HashMap::new(),
                     is_remote_desktop_enabled: req.is_remote_desktop_enabled,
+                    activation,
                 })
                 .await?
                 .into_inner();
@@ -651,6 +665,7 @@ impl ApiService {
                 kit: req.kit,
                 credentials,
                 is_remote_desktop_enabled: req.is_remote_desktop_enabled,
+                activation,
             })
             .await?
             .into_inner();
@@ -1017,6 +1032,40 @@ impl ApiService {
             }
         }
         apply_secrets(network, subject, &stored)
+    }
+
+    /// What a node is told to activate a Windows guest with: the product key
+    /// read out of the secret the request names, which must be scoped to the
+    /// sandbox, and the KMS host as given.
+    async fn activation_for(
+        &self,
+        requested: Option<api::ActivationRequest>,
+        subject: crate::secrets::Subject<'_>,
+    ) -> Result<Option<nodepb::NodeActivation>, Status> {
+        let Some(requested) = requested else {
+            return Ok(None);
+        };
+        let product_key = match requested.product_key_secret.as_str() {
+            "" => String::new(),
+            name => {
+                let secret = self
+                    .secrets()?
+                    .get_scoped(name)
+                    .await
+                    .map_err(internal)?
+                    .filter(|secret| secret.scope.admits(&subject))
+                    .ok_or_else(|| {
+                        Status::failed_precondition(format!(
+                            "no secret {name} this sandbox may use for its product key"
+                        ))
+                    })?;
+                secret.value
+            }
+        };
+        Ok(Some(nodepb::NodeActivation {
+            product_key,
+            kms_host: requested.kms_host,
+        }))
     }
 
     /// The hypervisor `template` runs under, from the config a node holding it
@@ -4226,6 +4275,7 @@ mod tests {
             sandbox_lease_secs: 0,
             ips: Default::default(),
             admission: Default::default(),
+            byol_node_labels: Default::default(),
         }))
     }
 

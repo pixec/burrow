@@ -994,6 +994,14 @@ struct CreateFlags {
     /// password, printed once.
     #[arg(long = "rdp")]
     is_remote_desktop_enabled: bool,
+    /// Windows guests: a stored secret holding your own product key, installed
+    /// and activated at create. The status is on `burrow inspect`.
+    #[arg(long)]
+    product_key_secret: Option<String>,
+    /// Windows guests: your KMS host, host or host:port, activated against at
+    /// create and at every boot.
+    #[arg(long)]
+    kms_host: Option<String>,
 }
 
 impl CreateFlags {
@@ -1026,6 +1034,8 @@ impl CreateFlags {
             || self.alias.is_some()
             || self.verbose_console
             || self.is_remote_desktop_enabled
+            || self.product_key_secret.is_some()
+            || self.kms_host.is_some()
             || self.network.is_stated()
             || self.access.is_stated()
     }
@@ -3537,6 +3547,8 @@ fn create_request(flags: CreateFlags) -> anyhow::Result<api::CreateSandboxReques
         alias,
         verbose_console,
         is_remote_desktop_enabled,
+        product_key_secret,
+        kms_host,
     } = flags;
     let tags = parse_pairs("--tag", &tags)?;
     // A snapshot carries its own template, so nothing is sent unless the
@@ -3601,6 +3613,12 @@ fn create_request(flags: CreateFlags) -> anyhow::Result<api::CreateSandboxReques
             Some(kit_spec(&kit_args, &kit_env, reject_capabilities)?)
         },
         is_remote_desktop_enabled,
+        activation: (product_key_secret.is_some() || kms_host.is_some()).then(|| {
+            api::ActivationRequest {
+                product_key_secret: product_key_secret.unwrap_or_default(),
+                kms_host: kms_host.unwrap_or_default(),
+            }
+        }),
     })
 }
 
@@ -4934,6 +4952,25 @@ fn print_config(sandbox: &common::Sandbox) {
             bytes(sandbox.tx_bytes)
         ),
     );
+    if let Some(activation) = &sandbox.activation {
+        let source = match (
+            activation.is_product_key_installed,
+            activation.kms_host.as_str(),
+        ) {
+            (true, "") => "product key".to_string(),
+            (false, host) => format!("kms {host}"),
+            (true, host) => format!("product key, kms {host}"),
+        };
+        let state = if activation.is_activated {
+            "activated"
+        } else {
+            "not activated"
+        };
+        field(
+            "activation",
+            &format!("{state} via {source}: {}", activation.status),
+        );
+    }
     let policy = sandbox.policy.clone().unwrap_or_default();
     if let Some(resources) = &policy.resources {
         // 0 is stored to mean "whatever the node gives out", so printing it
@@ -7143,6 +7180,8 @@ mod tests {
                 request_id: None,
                 verbose_console: false,
                 is_remote_desktop_enabled: false,
+                product_key_secret: None,
+                kms_host: None,
                 template: None,
                 kit_args: Vec::new(),
                 kit_env: Vec::new(),

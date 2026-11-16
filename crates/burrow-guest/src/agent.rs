@@ -367,6 +367,12 @@ impl Guest for AgentService {
         Ok(Response::new(guestpb::EnableRemoteDesktopResponse {}))
     }
 
+    async fn activate(
+        &self,
+        req: Request<guestpb::ActivateRequest>,
+    ) -> Result<Response<guestpb::ActivateResponse>, Status> {
+        Ok(Response::new(os::activate(req.into_inner()).await?))
+    }
 }
 
 #[cfg(all(test, unix))]

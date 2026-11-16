@@ -579,6 +579,11 @@ export interface SandboxInfo {
    * handle that create returned only; `null` everywhere else.
    */
   remoteDesktop: RemoteDesktopCredential | null;
+  /**
+   * How a Windows guest created with an activation activates, and how the
+   * last attempt went; `null` for none.
+   */
+  activation: WindowsActivation | null;
   /** Public addresses of either family attached to it. */
   publicIps: PublicIp[];
   /**
@@ -738,6 +743,11 @@ export interface CreateOptions extends CallOptions, HandleOptions {
    * password, on the returned handle's {@link Sandbox.remoteDesktop} only.
    */
   remoteDesktop?: boolean;
+  /**
+   * Windows guests: activate with your own license, at create and at every
+   * boot. `productKeySecret` names a stored secret holding the key.
+   */
+  activation?: { productKeySecret?: string; kmsHost?: string };
   /**
    * Snapshot id to start from. The sandbox **restores** that state instead of
    * booting, so it arrives with the snapshot's processes and memory, and
@@ -967,6 +977,18 @@ export interface RemoteDesktopCredential {
   password: string;
   /** The guest port RDP listens on. */
   port: number;
+}
+
+/** How a Windows guest activates with the caller's own license. */
+export interface WindowsActivation {
+  /** The customer KMS host; empty for a product key alone. */
+  kmsHost: string;
+  /** A product key was installed at create; the key is never kept. */
+  productKeyInstalled: boolean;
+  activated: boolean;
+  /** The license state Windows reports, and the failure when there was one. */
+  status: string;
+  checkedAt: Date | null;
 }
 
 /** A guest account whose password was set. */

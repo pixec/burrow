@@ -59,6 +59,7 @@ from .types import (
     UsageSum,
     VolumeMount,
     WatchEvent,
+    WindowsActivation,
 )
 from .volume import Volume
 
@@ -124,5 +125,6 @@ __all__ = [
     "VolumeMount",
     "WatchEvent",
     "Watcher",
+    "WindowsActivation",
     "default_build_logger",
 ]

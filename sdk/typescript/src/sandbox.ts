@@ -105,6 +105,7 @@ import type {
   UpdateAccessOptions,
   UpdateLifetimeOptions,
   Usage,
+  WindowsActivation,
 } from "./types.js";
 import { dateOf, dateOrNull, enumOf, toKernelInfo } from "./wire.js";
 
@@ -168,6 +169,15 @@ export function toSandboxInfo(raw: any): SandboxInfo {
           username: raw.remoteDesktop.username ?? "",
           password: raw.remoteDesktop.password ?? "",
           port: Number(raw.remoteDesktop.port ?? 0),
+        }
+      : null,
+    activation: raw.activation
+      ? {
+          kmsHost: raw.activation.kmsHost ?? "",
+          productKeyInstalled: raw.activation.isProductKeyInstalled ?? false,
+          activated: raw.activation.isActivated ?? false,
+          status: raw.activation.status ?? "",
+          checkedAt: dateOrNull(raw.activation.checkedAtUnixMs),
         }
       : null,
   };
@@ -391,6 +401,12 @@ export class Sandbox {
       kit: toKitSpec(options.kit),
       publicIps: options.publicIps ?? [],
       isRemoteDesktopEnabled: options.remoteDesktop ?? false,
+      activation: options.activation
+        ? {
+            productKeySecret: options.activation.productKeySecret ?? "",
+            kmsHost: options.activation.kmsHost ?? "",
+          }
+        : undefined,
     };
   }
 
@@ -522,6 +538,11 @@ export class Sandbox {
    */
   get remoteDesktop(): RemoteDesktopCredential | null {
     return this.info.remoteDesktop;
+  }
+
+  /** How a Windows guest created with an activation activates. */
+  get activation(): WindowsActivation | null {
+    return this.info.activation;
   }
 
   /** Tags, as of the last call that returned the sandbox record. */

@@ -5347,6 +5347,62 @@ impl SandboxManager {
         Ok(sandbox.record())
     }
 
+    /// Records how a Windows sandbox activates.
+    pub async fn set_activation(
+        &self,
+        id: &str,
+        activation: common::WindowsActivation,
+    ) -> Result<common::Sandbox, Status> {
+        let sandbox = self.get(id).await?;
+        sandbox.base_record.lock().unwrap().activation = Some(activation);
+        self.persist(&sandbox).await;
+        Ok(sandbox.record())
+    }
+
+    /// Has a Windows guest that carries an activation activate, installing
+    /// `product_key` first when one is given, and records how it went. Off
+    /// this task: activation against a KMS host that does not answer takes
+    /// its time, and a create or boot does not wait on it.
+    pub fn activate_in_background(&self, id: String, product_key: String) {
+        let manager = self.clone();
+        tokio::spawn(async move {
+            let Ok(sandbox) = manager.get(&id).await else {
+                return;
+            };
+            let kms_host = match &sandbox.base_record.lock().unwrap().activation {
+                Some(activation) => activation.kms_host.clone(),
+                None => return,
+            };
+            let outcome = async {
+                let mut agent = sandbox.agent().await?;
+                agent
+                    .activate(burrow_proto::guest::v1::ActivateRequest {
+                        product_key,
+                        kms_host,
+                    })
+                    .await
+                    .map(tonic::Response::into_inner)
+            }
+            .await;
+            let (is_activated, status) = match outcome {
+                Ok(done) => (done.is_activated, done.status),
+                Err(err) => (false, format!("activation failed: {}", err.message())),
+            };
+            if let Some(activation) = sandbox.base_record.lock().unwrap().activation.as_mut() {
+                activation.is_activated = is_activated;
+                activation.status = status.clone();
+                activation.checked_at_unix_ms = burrow_common::unix_now_ms();
+            }
+            manager.persist(&sandbox).await;
+            tracing::info!(
+                sandbox = id,
+                is_activated,
+                status,
+                "windows activation attempted"
+            );
+        });
+    }
+
     /// Stamps every Access token issued for a sandbox up to `at_ms` as
     /// revoked, returning the stamp in unix milliseconds.
     /// A stamp never moves back. Persisted with the record, which is what
@@ -7205,6 +7261,7 @@ impl SandboxManager {
                 state_reason: record.state_reason,
                 checkpoint_at_unix_ms: record.checkpoint_at_unix_ms,
                 checkpoint_kind: record.checkpoint_kind,
+                activation: record.activation,
             };
         let mut reports: Vec<_> = self
             .sandboxes

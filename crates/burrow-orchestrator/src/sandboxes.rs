@@ -1135,12 +1135,14 @@ impl SandboxRegistry {
                 || sandbox.state_reason != report.state_reason
                 || sandbox.checkpoint_at_unix_ms != report.checkpoint_at_unix_ms
                 || sandbox.checkpoint_kind != report.checkpoint_kind
+                || sandbox.activation != report.activation
             {
                 sandbox.state = report.state;
                 sandbox.is_durable = report.is_durable;
                 sandbox.state_reason = report.state_reason.clone();
                 sandbox.checkpoint_at_unix_ms = report.checkpoint_at_unix_ms;
                 sandbox.checkpoint_kind = report.checkpoint_kind;
+                sandbox.activation = report.activation.clone();
                 restated += 1;
                 changed.push(sandbox.clone());
             } else if is_confirmation_changed {

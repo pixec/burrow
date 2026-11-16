@@ -308,3 +308,11 @@ pub async fn enable_remote_desktop(_user: String) -> Result<(), tonic::Status> {
     ))
 }
 
+/// Activation is a Windows guest's.
+pub async fn activate(
+    _req: burrow_proto::guest::v1::ActivateRequest,
+) -> Result<burrow_proto::guest::v1::ActivateResponse, tonic::Status> {
+    Err(tonic::Status::unimplemented(
+        "activation is for windows guests",
+    ))
+}

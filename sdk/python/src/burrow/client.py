@@ -51,6 +51,8 @@ class Sandboxes:
         request_id: str = "",
         verbose_console: bool = False,
         remote_desktop: bool = False,
+        product_key_secret: str = "",
+        kms_host: str = "",
         tags: Optional[Dict[str, str]] = None,
         node_labels: Optional[Dict[str, str]] = None,
         public_ips: Optional[List[str]] = None,
@@ -89,7 +91,9 @@ class Sandboxes:
 
         Windows guests: `remote_desktop` turns Remote Desktop on and gives
         Administrator a fresh password, on the returned handle's
-        `remote_desktop` and nowhere else.
+        `remote_desktop` and nowhere else. `product_key_secret` names a stored
+        secret holding your own product key and `kms_host` your KMS host,
+        activated at create and at every boot; `activation` says how it went.
         """
         # A snapshot carries its own template, and one that disagrees is an
         # error, so nothing is sent as if the caller had asked for it. Without
@@ -124,6 +128,9 @@ class Sandboxes:
             public_ips=public_ips or [],
             is_remote_desktop_enabled=remote_desktop,
         )
+        if product_key_secret or kms_host:
+            request.activation.product_key_secret = product_key_secret
+            request.activation.kms_host = kms_host
         request.policy.is_console_verbose = verbose_console
         raw = self._transport.unary("CreateSandbox", request, timeout)
         sandbox = Sandbox(self._transport.retain(), _to_sandbox_info(raw), True, auto_resume, env)

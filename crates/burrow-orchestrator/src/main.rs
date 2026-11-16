@@ -124,6 +124,16 @@ struct Args {
         env = "BURROW_NODE_CONCURRENCY"
     )]
     node_concurrency: u32,
+    /// A node label, KEY=VALUE, every create that activates Windows with the
+    /// caller's own license is placed on, as `--node-label` would place it:
+    /// for keeping bring-your-own-license guests on the hosts that license
+    /// covers. Repeatable.
+    #[arg(
+        long = "byol-node-label",
+        env = "BURROW_BYOL_NODE_LABEL",
+        value_delimiter = ','
+    )]
+    byol_node_labels: Vec<String>,
     /// The fleet's sandbox address pool: one /30 per sandbox, sliced between
     /// nodes. Private: inside 10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16 or
     /// 100.64.0.0/10, a /10 at most, and overlapping no node's own network.
@@ -199,6 +209,8 @@ pub struct OrchestratorState {
     pub ips: api::ips::IpConfig,
     /// Bounds the creates and lifecycle calls in flight to each node.
     pub admission: admission::Admission,
+    /// Labels a create activating Windows with the caller's license needs.
+    pub byol_node_labels: std::collections::HashMap<String, String>,
 }
 
 /// Makes `pool` the fleet's sandbox address pool, refusing when the store
@@ -1045,6 +1057,15 @@ async fn run(args: Args) -> anyhow::Result<()> {
             quarantine_secs: args.ip_quarantine_secs.max(0),
         },
         admission: admission::Admission::new(args.node_concurrency),
+        byol_node_labels: args
+            .byol_node_labels
+            .iter()
+            .map(|pair| {
+                pair.split_once('=')
+                    .map(|(key, value)| (key.to_string(), value.to_string()))
+                    .ok_or_else(|| anyhow::anyhow!("--byol-node-label {pair:?} is not KEY=VALUE"))
+            })
+            .collect::<anyhow::Result<_>>()?,
     });
 
     tracing::info!(

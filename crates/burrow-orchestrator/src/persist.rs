@@ -218,6 +218,7 @@ fn changed(change: &Change, current: Option<common::Sandbox>) -> Option<common::
             sandbox.state_reason = reported.state_reason.clone();
             sandbox.checkpoint_at_unix_ms = reported.checkpoint_at_unix_ms;
             sandbox.checkpoint_kind = reported.checkpoint_kind;
+            sandbox.activation = reported.activation.clone();
             sandbox.is_agent_unconfirmed = reported.is_agent_unconfirmed;
             sandbox.cpu_usage_usec = reported.cpu_usage_usec;
             sandbox.rx_bytes = reported.rx_bytes;

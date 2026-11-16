@@ -128,4 +128,5 @@ export type {
   UsageState,
   UsageSum,
   VolumeMount,
+  WindowsActivation,
 } from "./types.js";

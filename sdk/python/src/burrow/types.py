@@ -249,6 +249,19 @@ class RemoteDesktopCredential:
 
 
 @dataclass
+class WindowsActivation:
+    # The customer KMS host it activates against; empty for a product key
+    # alone.
+    kms_host: str
+    # A product key was installed at create; the key itself is never kept.
+    product_key_installed: bool
+    activated: bool
+    # The license state Windows reports, and the failure when there was one.
+    status: str
+    checked_at: Optional[datetime]
+
+
+@dataclass
 class SandboxInfo:
     id: str
     name: str
@@ -284,6 +297,9 @@ class SandboxInfo:
     # The Remote Desktop logon a create with `remote_desktop=True` made, on
     # the handle that create returned only.
     remote_desktop: Optional[RemoteDesktopCredential] = None
+    # How a Windows guest created with an activation activates, and how the
+    # last attempt went.
+    activation: Optional[WindowsActivation] = None
 
 
 @dataclass

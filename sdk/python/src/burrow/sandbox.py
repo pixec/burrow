@@ -51,6 +51,7 @@ from .types import (
     Share,
     Usage,
     WatchEvent,
+    WindowsActivation,
 )
 
 
@@ -123,6 +124,17 @@ def _to_sandbox_info(raw: common_pb2.Sandbox) -> SandboxInfo:
                 port=raw.remote_desktop.port,
             )
             if raw.HasField("remote_desktop")
+            else None
+        ),
+        activation=(
+            WindowsActivation(
+                kms_host=raw.activation.kms_host,
+                product_key_installed=raw.activation.is_product_key_installed,
+                activated=raw.activation.is_activated,
+                status=raw.activation.status,
+                checked_at=at_or_none(raw.activation.checked_at_unix_ms),
+            )
+            if raw.HasField("activation")
             else None
         ),
     )
@@ -420,6 +432,12 @@ class Sandbox(ShutilMixin, SubprocessMixin):
         """The Remote Desktop logon a create with `remote_desktop=True` made.
         Only the handle that create returned has it; nothing shows it again."""
         return self._info.remote_desktop
+
+    @property
+    def activation(self) -> Optional[WindowsActivation]:
+        """How a Windows guest created with an activation activates, and how
+        its last attempt went, as of the last call that returned the record."""
+        return self._info.activation
 
     @property
     def durable(self) -> bool:

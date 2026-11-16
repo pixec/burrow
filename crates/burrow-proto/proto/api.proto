@@ -968,6 +968,17 @@ message CreateSandboxRequest {
   // Windows guests: turns Remote Desktop on and gives Administrator a fresh
   // password, returned once in the response's `remote_desktop`.
   bool is_remote_desktop_enabled = 11;
+  // Windows guests: activates with the caller's own license, at create and
+  // at every boot. The status is on the sandbox's `activation`.
+  ActivationRequest activation = 12;
+}
+
+message ActivationRequest {
+  // A stored secret (`burrow secret set`) holding a product key, installed
+  // at create. The key is never logged or kept on the sandbox.
+  string product_key_secret = 1;
+  // A KMS host the caller runs, host or host:port.
+  string kms_host = 2;
 }
 
 message RecreateSandboxRequest {
