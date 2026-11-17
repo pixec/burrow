@@ -907,9 +907,17 @@ async fn reap_dead_nodes(state: Arc<OrchestratorState>, expiry: Option<std::time
                 }
                 Err(err) => tracing::warn!(%err, "could not sweep abandoned claims"),
             }
+            let before = burrow_common::unix_now_ms() - PLACEMENT_DELETES_KEPT_MS;
+            if let Err(err) = store.prune_placement_deletes(before).await {
+                tracing::warn!(%err, "could not prune the placement delete log");
+            }
         }
     }
 }
+
+/// How long deleted placement ids are kept for replicas catching up, far
+/// past the furthest back one reads.
+const PLACEMENT_DELETES_KEPT_MS: i64 = 600_000;
 
 /// Records, once, the snapshots and volumes the object store held before
 /// they had rows, as any node with the store lists them. Exists for the

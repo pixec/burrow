@@ -25,3 +25,19 @@ ALTER TABLE sandboxes ADD COLUMN generation INTEGER NOT NULL DEFAULT 0;
 -- The row's primary key now claims the id, and a placement's generation
 -- decides who places a sandbox no node holds.
 DELETE FROM claims WHERE key LIKE 'id:%' OR key LIKE 'adopt:%';
+-- When each row was last written, by the database's clock, and the ids of
+-- rows deleted, so a replica catching up reads only what changed.
+ALTER TABLE placements ADD COLUMN changed_at_ms INTEGER NOT NULL DEFAULT 0;
+CREATE INDEX placements_changed_at ON placements (changed_at_ms);
+CREATE TABLE placement_deletes (id TEXT NOT NULL, at_ms INTEGER NOT NULL);
+CREATE INDEX placement_deletes_at ON placement_deletes (at_ms);
+CREATE TRIGGER placement_inserted AFTER INSERT ON placements BEGIN
+    UPDATE placements SET changed_at_ms = CAST((julianday('now') - 2440587.5) * 86400000 AS INTEGER) WHERE id = NEW.id;
+END;
+CREATE TRIGGER placement_updated AFTER UPDATE ON placements
+    WHEN NEW.changed_at_ms = OLD.changed_at_ms BEGIN
+    UPDATE placements SET changed_at_ms = CAST((julianday('now') - 2440587.5) * 86400000 AS INTEGER) WHERE id = NEW.id;
+END;
+CREATE TRIGGER placement_deleted AFTER DELETE ON placements BEGIN
+    INSERT INTO placement_deletes (id, at_ms) VALUES (OLD.id, CAST((julianday('now') - 2440587.5) * 86400000 AS INTEGER));
+END;

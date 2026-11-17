@@ -306,6 +306,20 @@ fn placed(row: &burrow_store::PlacementRow) -> Option<Placed> {
     })
 }
 
+/// `entry` with the usage the cache holds for it when that is the newer:
+/// usage moves on every heartbeat and is only written back now and then.
+fn with_held_usage(cache: &Cache, id: &str, mut entry: Placed) -> Placed {
+    if let Some(held) = cache.get(id)
+        && held.generation == entry.generation
+        && held.sandbox.cpu_usage_usec > entry.sandbox.cpu_usage_usec
+    {
+        entry.sandbox.cpu_usage_usec = held.sandbox.cpu_usage_usec;
+        entry.sandbox.rx_bytes = held.sandbox.rx_bytes;
+        entry.sandbox.tx_bytes = held.sandbox.tx_bytes;
+    }
+    entry
+}
+
 /// What writing off a node did with the sandboxes placed on it.
 #[derive(Debug, Default)]
 pub struct WrittenOff {
@@ -356,10 +370,26 @@ pub struct SandboxRegistry {
     seq: AtomicU64,
     /// The ids written since the last reload began, and when.
     written: Mutex<HashMap<String, u64>>,
-    /// When the last applied reload started reading, held across a reload so
-    /// callers arriving together share one read of the store.
-    reloaded: tokio::sync::Mutex<Option<Instant>>,
+    /// The last applied reload, held across a reload so callers arriving
+    /// together share one read of the store.
+    reloaded: tokio::sync::Mutex<Option<Reloaded>>,
 }
+
+/// When a reload read the store, by this process's clock and the store's.
+#[derive(Clone, Copy)]
+struct Reloaded {
+    started: Instant,
+    read_at_ms: i64,
+    full_at: Instant,
+}
+
+/// How often a replica reads every placement rather than what changed, which
+/// bounds how long anything a catch-up could miss stays wrong.
+const FULL_RELOAD_PERIOD: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// How far before its last read a catch-up reads from, for writes committed
+/// after it that their database time puts before it.
+const RELOAD_OVERLAP_MS: i64 = 10_000;
 
 impl SandboxRegistry {
     /// Opens the registry over the store, caching what it holds.
@@ -429,20 +459,9 @@ impl SandboxRegistry {
         let mut written = self.written.lock().unwrap();
         let mut fresh = Cache::default();
         for row in &rows {
-            let Some(mut entry) = placed(row) else {
-                continue;
-            };
-            // Usage moves on every heartbeat and is only written back now and
-            // then, so a figure this replica already holds is the newer one.
-            if let Some(held) = cache.get(&row.id)
-                && held.generation == entry.generation
-                && held.sandbox.cpu_usage_usec > entry.sandbox.cpu_usage_usec
-            {
-                entry.sandbox.cpu_usage_usec = held.sandbox.cpu_usage_usec;
-                entry.sandbox.rx_bytes = held.sandbox.rx_bytes;
-                entry.sandbox.tx_bytes = held.sandbox.tx_bytes;
+            if let Some(entry) = placed(row) {
+                fresh.insert(row.id.clone(), with_held_usage(&cache, &row.id, entry));
             }
-            fresh.insert(row.id.clone(), entry);
         }
         for (id, seq) in written.iter() {
             if *seq <= mark {
@@ -457,6 +476,34 @@ impl SandboxRegistry {
         *cache = fresh;
     }
 
+    /// Applies the rows written and the ids deleted since the last read to
+    /// the cache, keeping what this replica wrote after the read began.
+    fn catch_up(&self, mark: u64, rows: Vec<burrow_store::PlacementRow>, deleted: Vec<String>) {
+        let mut cache = self.cache.lock().unwrap();
+        let mut written = self.written.lock().unwrap();
+        let ours = |id: &str| written.get(id).is_some_and(|seq| *seq > mark);
+        let present: std::collections::HashSet<&str> =
+            rows.iter().map(|row| row.id.as_str()).collect();
+        for id in &deleted {
+            if !present.contains(id.as_str()) && !ours(id) {
+                cache.remove(id);
+            }
+        }
+        for row in &rows {
+            if ours(&row.id) {
+                continue;
+            }
+            match placed(row) {
+                Some(entry) => {
+                    let entry = with_held_usage(&cache, &row.id, entry);
+                    cache.insert(row.id.clone(), entry)
+                }
+                None => cache.remove(&row.id),
+            };
+        }
+        written.retain(|_, seq| *seq > mark);
+    }
+
     /// Catches up with the store unless a reload that started reading at or
     /// after `since` has already been applied.
     ///
@@ -467,14 +514,30 @@ impl SandboxRegistry {
     /// every placement.
     pub async fn reload_since(&self, since: Instant) -> burrow_store::Result<()> {
         let mut reloaded = self.reloaded.lock().await;
-        if reloaded.is_some_and(|at| at >= since) {
+        if reloaded.is_some_and(|last| last.started >= since) {
             return Ok(());
         }
         let started = Instant::now();
         let mark = self.seq.load(Ordering::SeqCst);
-        let rows = self.store.list_placements().await?;
-        self.reload(mark, rows);
-        *reloaded = Some(started);
+        let since_ms = reloaded
+            .filter(|last| last.full_at.elapsed() < FULL_RELOAD_PERIOD)
+            .map(|last| last.read_at_ms - RELOAD_OVERLAP_MS);
+        let read = self.store.read_placements(since_ms).await?;
+        let full_at = match (since_ms, *reloaded) {
+            (Some(_), Some(last)) => {
+                self.catch_up(mark, read.rows, read.deleted);
+                last.full_at
+            }
+            _ => {
+                self.reload(mark, read.rows);
+                started
+            }
+        };
+        *reloaded = Some(Reloaded {
+            started,
+            read_at_ms: read.read_at_ms,
+            full_at,
+        });
         Ok(())
     }
 
@@ -1796,6 +1859,17 @@ mod tests {
         let rows = registry.store().list_placements().await.unwrap();
         registry.reload(registry.seq.load(Ordering::SeqCst), rows);
         assert!(registry.written.lock().unwrap().is_empty());
+    }
+
+    /// Nor does a catch-up whose delete log names a sandbox created since.
+    #[tokio::test]
+    async fn a_catch_up_does_not_undo_a_write_made_while_it_read() {
+        let registry = SandboxRegistry::in_memory().await;
+        let mark = registry.seq.load(Ordering::SeqCst);
+        let read = registry.store().read_placements(Some(0)).await.unwrap();
+        created(&registry, "sbx_a", "n1").await;
+        registry.catch_up(mark, read.rows, vec!["sbx_a".into()]);
+        assert!(registry.get("sbx_a").is_some());
     }
 
     /// The digest covers what a node reports about a sandbox, not its usage.

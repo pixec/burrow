@@ -732,7 +732,15 @@ async fn reconcile_time_at_scale_on_postgres() {
     let mut steady = Vec::new();
     let mut restating = Vec::new();
     let mut walls = Vec::new();
+    let mut last_round_from = 0;
     for seq in 2..14 {
+        if seq == 12 {
+            last_round_from = store
+                .read_placements(Some(i64::MAX))
+                .await
+                .unwrap()
+                .read_at_ms;
+        }
         let restates = seq % 2 == 0;
         for report in reports.iter_mut() {
             report.seq = seq;
@@ -763,6 +771,13 @@ async fn reconcile_time_at_scale_on_postgres() {
     let rows = store.list_placements().await.unwrap().len();
     println!(
         "a replica's full reload of {rows} placements took {:?}",
+        started.elapsed()
+    );
+    let started = std::time::Instant::now();
+    let read = store.read_placements(Some(last_round_from)).await.unwrap();
+    println!(
+        "a replica's catch-up on the last two rounds' {} changed rows took {:?}",
+        read.rows.len(),
         started.elapsed()
     );
     println!(

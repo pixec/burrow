@@ -226,6 +226,16 @@ fn placement_row(r: PlacementRaw) -> PlacementRow {
     }
 }
 
+/// What [`Store::read_placements`] read.
+#[derive(Debug, Default)]
+pub struct PlacementChanges {
+    pub rows: Vec<PlacementRow>,
+    /// Ids deleted since, and not necessarily absent now.
+    pub deleted: Vec<String>,
+    /// The database's time before the read.
+    pub read_at_ms: i64,
+}
+
 /// Keeps a lost placement with no node when `unplaced` carries its record,
 /// and deletes it with its claims otherwise, while it is still on the node
 /// and at the generation it was read at. False when a move got there first.
@@ -1374,6 +1384,59 @@ impl Store {
             tx.commit().await?;
         });
         Ok(())
+    }
+
+    /// The placements written at or after `since_ms` by the database's
+    /// clock and the ids deleted since then, or every placement for `None`,
+    /// with the database's time before anything was read.
+    ///
+    /// Deletes are read before rows, so an id in both was written again and
+    /// the row is the current one.
+    pub async fn read_placements(&self, since_ms: Option<i64>) -> Result<PlacementChanges> {
+        let now = match self.is_postgres() {
+            true => "SELECT (extract(epoch FROM clock_timestamp()) * 1000)::BIGINT",
+            false => "SELECT CAST((julianday('now') - 2440587.5) * 86400000 AS INTEGER)",
+        };
+        let rows_sql = match since_ms {
+            Some(_) => format!(
+                "SELECT {PLACEMENT_COLUMNS} FROM placements WHERE changed_at_ms >= $1 ORDER BY id"
+            ),
+            None => format!("SELECT {PLACEMENT_COLUMNS} FROM placements ORDER BY id"),
+        };
+        let (read_at_ms, deleted, rows) = on_pool!(self, pool => {
+            let (read_at_ms,): (i64,) = sqlx::query_as(now).fetch_one(pool).await?;
+            let deleted: Vec<(String,)> = match since_ms {
+                Some(since) => {
+                    sqlx::query_as("SELECT DISTINCT id FROM placement_deletes WHERE at_ms >= $1")
+                        .bind(since)
+                        .fetch_all(pool)
+                        .await?
+                }
+                None => Vec::new(),
+            };
+            let mut query = sqlx::query_as::<_, PlacementRaw>(&rows_sql);
+            if let Some(since) = since_ms {
+                query = query.bind(since);
+            }
+            let rows = query.fetch_all(pool).await?;
+            (read_at_ms, deleted, rows)
+        });
+        Ok(PlacementChanges {
+            rows: rows.into_iter().map(placement_row).collect(),
+            deleted: deleted.into_iter().map(|(id,)| id).collect(),
+            read_at_ms,
+        })
+    }
+
+    /// Forgets deletes logged before `before_ms`, which no replica catching
+    /// up reads back that far.
+    pub async fn prune_placement_deletes(&self, before_ms: i64) -> Result<u64> {
+        let pruned = on_pool!(self, pool => sqlx::query("DELETE FROM placement_deletes WHERE at_ms < $1")
+            .bind(before_ms)
+            .execute(pool)
+            .await
+            .map(|done| done.rows_affected()))?;
+        Ok(pruned)
     }
 
     pub async fn list_placements(&self) -> Result<Vec<PlacementRow>> {
@@ -3686,6 +3749,54 @@ mod tests {
         applied(apply(&store, &beat).await);
         let row = store.get_placement("a").await.unwrap().unwrap();
         assert_eq!((row.usage, row.version), (Some([70, 8, 9]), 1));
+    }
+
+    /// A read since a time returns only rows written since and ids deleted
+    /// since, and pruning forgets the deletes.
+    #[tokio::test]
+    async fn a_read_since_returns_only_what_changed() {
+        let store = Store::open_in_memory().await.unwrap();
+        store
+            .insert_placement(&placed("old", "n1", 1))
+            .await
+            .unwrap();
+        store
+            .insert_placement(&placed("gone", "n1", 1))
+            .await
+            .unwrap();
+        let all = store.read_placements(None).await.unwrap();
+        assert_eq!(all.rows.len(), 2);
+        assert!(all.deleted.is_empty());
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        let since = store
+            .read_placements(Some(i64::MAX))
+            .await
+            .unwrap()
+            .read_at_ms;
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        store
+            .insert_placement(&placed("new", "n1", 1))
+            .await
+            .unwrap();
+        store.remove_placement("gone").await.unwrap();
+        let changed = store.read_placements(Some(since)).await.unwrap();
+        let ids: Vec<_> = changed.rows.iter().map(|row| row.id.as_str()).collect();
+        assert_eq!(ids, ["new"]);
+        assert_eq!(changed.deleted, ["gone"]);
+        assert!(changed.read_at_ms >= since);
+
+        store
+            .prune_placement_deletes(changed.read_at_ms + 1)
+            .await
+            .unwrap();
+        assert!(
+            store
+                .read_placements(Some(since))
+                .await
+                .unwrap()
+                .deleted
+                .is_empty()
+        );
     }
 
     /// A batch padded up to its statement's size writes only its own rows.
