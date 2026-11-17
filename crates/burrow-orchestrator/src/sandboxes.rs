@@ -191,6 +191,101 @@ struct Placed {
     generation: i64,
 }
 
+/// The cached rows, indexed by what lookups and routing ask by, so none of
+/// them walks every sandbox in the fleet.
+#[derive(Default)]
+struct Cache {
+    placed: HashMap<String, Placed>,
+    by_name: HashMap<String, String>,
+    by_request: HashMap<String, String>,
+    by_network: HashMap<String, std::collections::BTreeSet<String>>,
+}
+
+fn networks_of(sandbox: &common::Sandbox) -> impl Iterator<Item = &str> {
+    sandbox
+        .policy
+        .iter()
+        .flat_map(|p| p.networks.iter())
+        .map(|m| m.network.as_str())
+        .filter(|network| !network.is_empty())
+}
+
+impl Cache {
+    fn get(&self, id: &str) -> Option<&Placed> {
+        self.placed.get(id)
+    }
+
+    /// For usage figures only, which no index covers.
+    fn get_mut(&mut self, id: &str) -> Option<&mut Placed> {
+        self.placed.get_mut(id)
+    }
+
+    fn contains_key(&self, id: &str) -> bool {
+        self.placed.contains_key(id)
+    }
+
+    fn values(&self) -> impl Iterator<Item = &Placed> {
+        self.placed.values()
+    }
+
+    fn insert(&mut self, id: String, entry: Placed) -> Option<Placed> {
+        let held = self.remove(&id);
+        let sandbox = &entry.sandbox;
+        if !sandbox.name.is_empty() {
+            self.by_name.insert(sandbox.name.clone(), id.clone());
+        }
+        if !sandbox.create_request_id.is_empty() {
+            self.by_request
+                .insert(sandbox.create_request_id.clone(), id.clone());
+        }
+        for network in networks_of(sandbox) {
+            self.by_network
+                .entry(network.to_string())
+                .or_default()
+                .insert(id.clone());
+        }
+        self.placed.insert(id, entry);
+        held
+    }
+
+    fn remove(&mut self, id: &str) -> Option<Placed> {
+        let held = self.placed.remove(id)?;
+        let sandbox = &held.sandbox;
+        if self
+            .by_name
+            .get(&sandbox.name)
+            .is_some_and(|held| held == id)
+        {
+            self.by_name.remove(&sandbox.name);
+        }
+        if self
+            .by_request
+            .get(&sandbox.create_request_id)
+            .is_some_and(|held| held == id)
+        {
+            self.by_request.remove(&sandbox.create_request_id);
+        }
+        for network in networks_of(sandbox) {
+            if let Some(members) = self.by_network.get_mut(network) {
+                members.remove(id);
+                if members.is_empty() {
+                    self.by_network.remove(network);
+                }
+            }
+        }
+        Some(held)
+    }
+
+    /// The members of `network`.
+    fn members(&self, network: &str) -> impl Iterator<Item = &Placed> {
+        self.by_network
+            .get(network)
+            .into_iter()
+            .flatten()
+            .filter_map(|id| self.placed.get(id))
+    }
+}
+
 /// A create whose node has not answered, which reads leave out: its row is
 /// only the stub written ahead of it.
 fn is_unanswered_create(row: &burrow_store::PlacementRow, sandbox: &common::Sandbox) -> bool {
@@ -252,7 +347,7 @@ pub struct Reconciled {
 }
 
 pub struct SandboxRegistry {
-    cache: Mutex<HashMap<String, Placed>>,
+    cache: Mutex<Cache>,
     store: Arc<burrow_store::Store>,
     /// Numbers this replica's own writes, so a reload that read the store
     /// before one does not undo it in the cache.
@@ -268,7 +363,7 @@ impl SandboxRegistry {
     /// Opens the registry over the store, caching what it holds.
     pub async fn open(store: Arc<burrow_store::Store>) -> burrow_store::Result<Self> {
         let registry = Self {
-            cache: Mutex::new(HashMap::new()),
+            cache: Mutex::new(Cache::default()),
             store,
             seq: AtomicU64::new(0),
             written: Mutex::new(HashMap::new()),
@@ -307,7 +402,7 @@ impl SandboxRegistry {
 
     /// Sets what the cache holds for `id`, `None` for nothing, and notes the
     /// write so a reload already reading does not undo it.
-    fn cached(&self, cache: &mut HashMap<String, Placed>, id: &str, entry: Option<Placed>) {
+    fn cached(&self, cache: &mut Cache, id: &str, entry: Option<Placed>) {
         let seq = self.seq.fetch_add(1, Ordering::SeqCst) + 1;
         self.written.lock().unwrap().insert(id.to_string(), seq);
         match entry {
@@ -330,7 +425,7 @@ impl SandboxRegistry {
     fn reload(&self, mark: u64, rows: Vec<burrow_store::PlacementRow>) {
         let mut cache = self.cache.lock().unwrap();
         let mut written = self.written.lock().unwrap();
-        let mut fresh: HashMap<String, Placed> = HashMap::with_capacity(rows.len());
+        let mut fresh = Cache::default();
         for row in &rows {
             let Some(mut entry) = placed(row) else {
                 continue;
@@ -436,13 +531,14 @@ impl SandboxRegistry {
     /// The sandbox a create with this request id made, here or through
     /// another replica.
     pub async fn by_request(&self, request: &str) -> Option<common::Sandbox> {
-        let held = self
-            .cache
-            .lock()
-            .unwrap()
-            .values()
-            .find(|p| p.sandbox.create_request_id == request)
-            .map(|p| p.sandbox.clone());
+        let held = {
+            let cache = self.cache.lock().unwrap();
+            cache
+                .by_request
+                .get(request)
+                .and_then(|id| cache.get(id))
+                .map(|p| p.sandbox.clone())
+        };
         if held.is_some() {
             return held;
         }
@@ -764,12 +860,7 @@ impl SandboxRegistry {
         if name.is_empty() {
             return None;
         }
-        self.cache
-            .lock()
-            .unwrap()
-            .values()
-            .find(|p| p.sandbox.name == name)
-            .map(|p| p.sandbox.id.clone())
+        self.cache.lock().unwrap().by_name.get(name).cloned()
     }
 
     /// Writes off a node silent since before `before_ms`, for the leader of
@@ -964,16 +1055,12 @@ impl SandboxRegistry {
             return None;
         }
         let cache = self.cache.lock().unwrap();
-        cache.values().find_map(|p| {
-            let sandbox = &p.sandbox;
-            let joined = sandbox
-                .policy
-                .iter()
-                .flat_map(|p| p.networks.iter())
-                .any(|m| networks.contains(&m.network));
+        networks
+            .iter()
+            .flat_map(|network| cache.members(network))
             // An unplaced member is not anywhere, so it pins nothing.
-            (joined && !sandbox.node_id.is_empty()).then(|| sandbox.node_id.clone())
-        })
+            .find(|p| !p.sandbox.node_id.is_empty())
+            .map(|p| p.sandbox.node_id.clone())
     }
 
     /// Guest addresses on each private network that live on *other* nodes.
@@ -983,32 +1070,35 @@ impl SandboxRegistry {
     /// firewall needs in order to let mesh traffic through.
     pub fn network_members(&self, for_node: &str) -> Vec<nodepb::NetworkMembers> {
         let cache = self.cache.lock().unwrap();
-        let mut by_network: std::collections::BTreeMap<String, Vec<nodepb::NetworkMember>> =
-            std::collections::BTreeMap::new();
-
-        for sandbox in cache.values().map(|p| &p.sandbox) {
-            if sandbox.node_id == for_node || sandbox.guest_ip.is_empty() {
-                continue;
-            }
-            for membership in sandbox.policy.iter().flat_map(|p| p.networks.iter()) {
-                if membership.network.is_empty() {
-                    continue;
-                }
-                by_network
-                    .entry(membership.network.clone())
-                    .or_default()
-                    .push(nodepb::NetworkMember {
-                        sandbox_id: sandbox.id.clone(),
-                        alias: alias_of(membership, &sandbox.id),
-                        guest_ip: sandbox.guest_ip.clone(),
-                    });
-            }
-        }
-
-        by_network
-            .into_iter()
-            .map(|(network, members)| nodepb::NetworkMembers { network, members })
-            .collect()
+        let mut out: Vec<_> = cache
+            .by_network
+            .keys()
+            .filter_map(|network| {
+                let members: Vec<_> = cache
+                    .members(network)
+                    .map(|p| &p.sandbox)
+                    .filter(|sandbox| sandbox.node_id != for_node && !sandbox.guest_ip.is_empty())
+                    .flat_map(|sandbox| {
+                        sandbox
+                            .policy
+                            .iter()
+                            .flat_map(|p| p.networks.iter())
+                            .filter(|m| &m.network == network)
+                            .map(|membership| nodepb::NetworkMember {
+                                sandbox_id: sandbox.id.clone(),
+                                alias: alias_of(membership, &sandbox.id),
+                                guest_ip: sandbox.guest_ip.clone(),
+                            })
+                    })
+                    .collect();
+                (!members.is_empty()).then(|| nodepb::NetworkMembers {
+                    network: network.clone(),
+                    members,
+                })
+            })
+            .collect();
+        out.sort_by(|a, b| a.network.cmp(&b.network));
+        out
     }
 
     /// Every sandbox, or only those carrying an exact `key=value` tag.
