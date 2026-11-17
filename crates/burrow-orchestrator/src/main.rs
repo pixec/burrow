@@ -741,6 +741,7 @@ async fn inventory(state: &OrchestratorState, node_id: &str, client: &mut crate:
         Ok(resp) => match named_snapshots(state, resp.into_inner().snapshots).await {
             Ok(listed) => {
                 let held = state.snapshots.reconcile_node(&node_id, listed);
+                builds::note_inventory(state, &node_id);
                 tracing::debug!(node_id, held, "refreshed node snapshots");
             }
             Err(err) => tracing::warn!(node_id, %err, "could not read snapshot rows"),
@@ -1218,6 +1219,7 @@ async fn run(args: Args) -> anyhow::Result<()> {
         secs => Some(std::time::Duration::from_secs(secs)),
     };
     tokio::spawn(reap_dead_nodes(Arc::clone(&state), expiry));
+    tokio::spawn(builds::retain_forever(Arc::clone(&state)));
     tokio::spawn(chunkfleet::refresh_loop(Arc::clone(&state)));
     tokio::spawn(collect::run(Arc::clone(&state)));
     let advertise = match args.advertise.clone() {

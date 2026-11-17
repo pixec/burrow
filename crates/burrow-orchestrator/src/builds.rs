@@ -12,6 +12,7 @@
 
 use std::collections::{BTreeMap, HashSet};
 use std::sync::Arc;
+use std::time::Duration;
 
 use tonic::Status;
 
@@ -21,6 +22,18 @@ use burrow_proto::common::v1 as common;
 use burrow_store::{BuildRow, Finished, Store, StoreError, TagRow};
 
 use crate::OrchestratorState;
+
+/// Assignments kept per tag, the current one among them.
+pub const KEEP_ASSIGNMENTS: usize = 5;
+const DAY_MS: i64 = 24 * 60 * 60 * 1000;
+/// How long a build no tag keeps is kept, unless something uses it.
+pub const UNTAGGED_RETENTION_MS: i64 = 7 * DAY_MS;
+/// How long the builds of a deleted template are kept, unless something
+/// uses them: long enough for a create that resolved one to reach its node.
+pub const DELETED_GRACE_MS: i64 = 10 * 60 * 1000;
+/// A build still building after this long lost its orchestrator or node.
+const STALE_BUILD_MS: i64 = DAY_MS;
+const RETENTION_INTERVAL: Duration = Duration::from_secs(10 * 60);
 
 fn store_error(err: StoreError) -> Status {
     Status::unavailable(format!("the template store: {err}"))
@@ -266,7 +279,11 @@ impl Recorder {
 /// The builds tags resolve to, read from the store at most every
 /// [`TAGGED_FOR`].
 #[derive(Default)]
-pub struct Tagged(std::sync::Mutex<Option<(std::time::Instant, Vec<String>)>>);
+pub struct Tagged(
+    std::sync::Mutex<Option<(std::time::Instant, Vec<String>)>>,
+    /// Nodes whose snapshots this replica has read since it started.
+    std::sync::Mutex<HashSet<String>>,
+);
 
 const TAGGED_FOR: std::time::Duration = std::time::Duration::from_secs(10);
 
@@ -589,6 +606,181 @@ pub async fn note_builds(state: &OrchestratorState, node_id: &str, status: &comm
     }
 }
 
+/// Records that a node's snapshots have been read, so retention knows what
+/// they use.
+pub fn note_inventory(state: &OrchestratorState, node_id: &str) {
+    state.tagged.1.lock().unwrap().insert(node_id.to_string());
+}
+
+/// Whether every healthy node's snapshots have been read since this replica
+/// started. Until then a build only a snapshot uses looks unused.
+fn is_inventoried(state: &OrchestratorState) -> bool {
+    let inventoried = state.tagged.1.lock().unwrap();
+    state
+        .nodes
+        .healthy_ids()
+        .iter()
+        .all(|node_id| inventoried.contains(node_id))
+}
+
+/// Drops builds nothing keeps, once per interval, on the leader. The first
+/// pass waits an interval, for nodes to register and report.
+pub async fn retain_forever(state: Arc<OrchestratorState>) {
+    let mut ticker = tokio::time::interval_at(
+        tokio::time::Instant::now() + RETENTION_INTERVAL,
+        RETENTION_INTERVAL,
+    );
+    ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    loop {
+        ticker.tick().await;
+        if !state.leader.is_leader() {
+            continue;
+        }
+        match retain(&state, burrow_common::unix_now_ms()).await {
+            Ok(dropped) if dropped.is_empty() => {}
+            Ok(dropped) => tracing::info!(builds = dropped.len(), "dropped builds nothing keeps"),
+            Err(err) => tracing::warn!(%err, "could not apply build retention"),
+        }
+        evict(&state).await;
+    }
+}
+
+/// The builds snapshots use, as nodes last reported them: a snapshot's row
+/// in the store names no build. A build column there would make this read
+/// the store instead.
+fn snapshot_builds(state: &OrchestratorState) -> impl Iterator<Item = String> {
+    state
+        .snapshots
+        .list(None)
+        .into_iter()
+        .map(|snapshot| snapshot.build_digest)
+}
+
+/// Marks dropped every ready build that no tag keeps among its last
+/// [`KEEP_ASSIGNMENTS`] assignments and no sandbox or snapshot uses, once it
+/// has been untagged for [`UNTAGGED_RETENTION_MS`], or its template deleted
+/// for [`DELETED_GRACE_MS`]. Warm snapshots keep nothing: they are evicted
+/// with their build. The rows stay for the chunk collector. Does nothing
+/// until every healthy node's snapshots are known. Returns what was dropped.
+pub async fn retain(state: &OrchestratorState, now_ms: i64) -> Result<Vec<String>, StoreError> {
+    let Some(store) = &state.store else {
+        return Ok(Vec::new());
+    };
+    if !is_inventoried(state) {
+        tracing::debug!("build retention waits for every node's snapshots");
+        return Ok(Vec::new());
+    }
+    store
+        .fail_stale_builds(now_ms - STALE_BUILD_MS, now_ms)
+        .await?;
+    store.prune_tags(KEEP_ASSIGNMENTS, now_ms).await?;
+    let mut kept: HashSet<String> = store
+        .list_tags(None)
+        .await?
+        .into_iter()
+        .map(|tag| tag.digest)
+        .collect();
+    kept.extend(
+        state
+            .sandboxes
+            .list_tagged(None)
+            .into_iter()
+            .map(|sandbox| sandbox.build_digest),
+    );
+    kept.extend(snapshot_builds(state));
+    let deleted: std::collections::HashMap<String, i64> = store
+        .list_templates()
+        .await?
+        .into_iter()
+        .filter(|template| template.deleted_at_ms != 0)
+        .map(|template| (template.name, template.deleted_at_ms))
+        .collect();
+    let dropped: Vec<String> = store
+        .list_builds(None)
+        .await?
+        .into_iter()
+        .filter(|build| {
+            if build.status != burrow_store::READY
+                || build.digest.is_empty()
+                || kept.contains(&build.digest)
+            {
+                return false;
+            }
+            let (since, grace) = match deleted.get(&build.template) {
+                Some(&deleted_at) => (deleted_at, DELETED_GRACE_MS),
+                None if build.untagged_at_ms > 0 => (build.untagged_at_ms, UNTAGGED_RETENTION_MS),
+                None => return false,
+            };
+            now_ms - since > grace
+        })
+        .map(|build| build.digest)
+        .collect();
+    store.drop_builds(&dropped, now_ms).await?;
+    Ok(dropped)
+}
+
+/// Asks every node reporting a dropped build to delete it, on every pass,
+/// so a node that missed one is asked again. A build brought back since is
+/// left alone, and a node refuses one it still uses.
+async fn evict(state: &OrchestratorState) {
+    let Some(store) = &state.store else {
+        return;
+    };
+    let dropped: HashSet<String> = match store.list_builds(None).await {
+        Ok(builds) => builds
+            .into_iter()
+            .filter(|build| build.status == burrow_store::DROPPED)
+            .map(|build| build.digest)
+            .collect(),
+        Err(err) => {
+            tracing::warn!(%err, "could not read dropped builds");
+            return;
+        }
+    };
+    for (node_id, status) in statuses(state) {
+        let held: Vec<String> = status
+            .builds
+            .into_iter()
+            .filter(|digest| dropped.contains(digest))
+            .collect();
+        if held.is_empty() {
+            continue;
+        }
+        let Some(endpoint) = state.nodes.endpoint(&node_id) else {
+            continue;
+        };
+        let Ok(mut client) =
+            crate::api::connect_node_unary(endpoint, state.node_token.as_deref()).await
+        else {
+            continue;
+        };
+        for digest in held {
+            let still_dropped = matches!(
+                store.get_build(&digest).await,
+                Ok(Some(build)) if build.status == burrow_store::DROPPED
+            );
+            if !still_dropped {
+                continue;
+            }
+            match client
+                .delete_template(api::DeleteTemplateRequest {
+                    name: digest.clone(),
+                })
+                .await
+            {
+                Ok(_) => tracing::info!(node_id, build = digest, "evicted a dropped build"),
+                Err(err) if err.code() == tonic::Code::NotFound => {}
+                Err(err) if err.code() == tonic::Code::FailedPrecondition => {
+                    tracing::debug!(node_id, build = digest, err = err.message(), "kept in use")
+                }
+                Err(err) => {
+                    tracing::warn!(node_id, build = digest, %err, "could not evict a dropped build")
+                }
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -613,6 +805,187 @@ mod tests {
             hypervisor_of(&manifest(serde_json::json!({"guest_os": "windows"}))),
             "cloud-hypervisor"
         );
+    }
+
+    const DAY: i64 = 24 * 60 * 60 * 1000;
+    const NOW: i64 = 100 * DAY;
+
+    fn digest(c: char) -> String {
+        format!("sha256:{}", c.to_string().repeat(64))
+    }
+
+    /// A replica with a store, one healthy node whose snapshots it has
+    /// read, and `builds` put into the store at `created_at`.
+    async fn fleet(builds: &[(char, &str)]) -> (crate::api::ApiService, Arc<Store>) {
+        let store = Arc::new(Store::open_in_memory().await.unwrap());
+        let mut api = crate::api::tests::replica(
+            crate::sandboxes::SandboxRegistry::open(Arc::clone(&store))
+                .await
+                .unwrap(),
+        );
+        for (n, (c, template)) in builds.iter().enumerate() {
+            store
+                .put_ready_build(&BuildRow {
+                    id: format!("b{n}"),
+                    digest: digest(*c),
+                    template: template.to_string(),
+                    created_at_ms: DAY,
+                    ..Default::default()
+                })
+                .await
+                .unwrap();
+        }
+        Arc::get_mut(&mut api.0).unwrap().store = Some(Arc::clone(&store));
+        api.0
+            .nodes
+            .register(
+                common::NodeInfo {
+                    id: "n1".into(),
+                    address: "n1:1".into(),
+                    ..Default::default()
+                },
+                String::new(),
+                String::new(),
+                None,
+            )
+            .unwrap();
+        api.0
+            .nodes
+            .heartbeat("n1", common::NodeStatus::default(), None);
+        note_inventory(&api.0, "n1");
+        (api, store)
+    }
+
+    /// Each rule of retention: what a tag, a sandbox or a snapshot uses is
+    /// kept, a warm snapshot keeps nothing, and the grace counts from when
+    /// a build lost its last tag or its template was deleted, not from when
+    /// it was built.
+    #[tokio::test]
+    async fn retention_drops_only_what_nothing_keeps() {
+        let (api, store) = fleet(&[
+            ('a', "py"),
+            ('b', "py"),
+            ('c', "py"),
+            ('d', "py"),
+            ('e', "py"),
+            ('f', "gone"),
+            ('g', "gone"),
+            ('h', "py"),
+        ])
+        .await;
+        // Tagged long ago and still tagged.
+        store
+            .assign_tag("py", "latest", &digest('a'), DAY)
+            .await
+            .unwrap();
+        // Untagged yesterday: within the week.
+        store
+            .assign_tag("py", "old", &digest('b'), DAY)
+            .await
+            .unwrap();
+        store.delete_tag("py", "old", NOW - DAY).await.unwrap();
+        // Never tagged, and old, but a sandbox and a snapshot use them.
+        api.0
+            .sandboxes
+            .put(common::Sandbox {
+                id: "sbx_1".into(),
+                node_id: "n1".into(),
+                build_digest: digest('c'),
+                ..Default::default()
+            })
+            .await;
+        api.0.snapshots.insert(
+            "n1",
+            common::Snapshot {
+                id: "snap_1".into(),
+                build_digest: digest('d'),
+                ..Default::default()
+            },
+        );
+        // Warm on a node, which keeps nothing.
+        api.0.nodes.heartbeat(
+            "n1",
+            common::NodeStatus {
+                warm_shapes: vec![common::WarmShape {
+                    build_digest: digest('e'),
+                    ..Default::default()
+                }],
+                ..Default::default()
+            },
+            None,
+        );
+        // A deleted template's builds go ten minutes after the delete, but
+        // not before, however old they are.
+        store
+            .assign_tag("gone", "latest", &digest('f'), DAY)
+            .await
+            .unwrap();
+        store
+            .delete_template("gone", NOW - DELETED_GRACE_MS / 2)
+            .await
+            .unwrap();
+        // Assigned five times since: out of the history, untagged now.
+        store
+            .assign_tag("py", "v", &digest('h'), DAY)
+            .await
+            .unwrap();
+        for _ in 0..KEEP_ASSIGNMENTS {
+            store
+                .assign_tag("py", "v", &digest('a'), DAY)
+                .await
+                .unwrap();
+        }
+
+        let mut dropped = retain(&api.0, NOW).await.unwrap();
+        dropped.sort();
+        assert_eq!(dropped, vec![digest('e')]);
+        assert!(
+            store
+                .list_tags(Some("py"))
+                .await
+                .unwrap()
+                .iter()
+                .all(|t| t.digest != digest('h'))
+        );
+
+        let later = NOW + DELETED_GRACE_MS;
+        let mut dropped = retain(&api.0, later).await.unwrap();
+        dropped.sort();
+        assert_eq!(dropped, vec![digest('f'), digest('g')]);
+
+        let mut dropped = retain(&api.0, NOW + 8 * DAY).await.unwrap();
+        dropped.sort();
+        assert_eq!(dropped, vec![digest('b'), digest('h')]);
+        assert_eq!(
+            store.get_build(&digest('a')).await.unwrap().unwrap().status,
+            burrow_store::READY
+        );
+    }
+
+    /// Until every healthy node's snapshots are known, a build only a
+    /// snapshot uses would look unused, so nothing is dropped.
+    #[tokio::test]
+    async fn retention_waits_for_every_nodes_snapshots() {
+        let (api, _store) = fleet(&[('a', "py")]).await;
+        api.0
+            .nodes
+            .register(
+                common::NodeInfo {
+                    id: "n2".into(),
+                    address: "n2:1".into(),
+                    ..Default::default()
+                },
+                String::new(),
+                String::new(),
+                None,
+            )
+            .unwrap();
+        api.0
+            .nodes
+            .heartbeat("n2", common::NodeStatus::default(), None);
+        assert!(retain(&api.0, NOW).await.unwrap().is_empty());
+        note_inventory(&api.0, "n2");
+        assert_eq!(retain(&api.0, NOW).await.unwrap(), vec![digest('a')]);
     }
 
     #[tokio::test]
