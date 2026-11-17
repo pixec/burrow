@@ -760,6 +760,12 @@ async fn reconcile_time_at_scale_on_postgres() {
         timings[timings.len() / 2]
     };
     let max_wall = walls.iter().max().copied().unwrap_or_default();
+    let started = std::time::Instant::now();
+    let rows = store.list_placements().await.unwrap().len();
+    println!(
+        "a replica's full reload of {rows} placements took {:?}",
+        started.elapsed()
+    );
     println!(
         "{nodes} nodes x {count} sandboxes, reconciling together: one node's reconcile median \
          {:?} unchanged, {:?} with a sixth restated; a round of all {nodes} at most {max_wall:?}",

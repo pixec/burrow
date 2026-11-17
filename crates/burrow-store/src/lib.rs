@@ -205,6 +205,8 @@ type PlacementRaw = (String, String, Vec<u8>, i64, i64, i64);
 const PLACEMENT_COLUMNS: &str = "id, node_id, record, version, generation, pending_since_ms";
 const PLACEMENT_COLUMNS_OF_P: &str =
     "p.id, p.node_id, p.record, p.version, p.generation, p.pending_since_ms";
+const PLACEMENT_COLUMNS_OF_PLACEMENTS: &str = "placements.id, placements.node_id, \
+    placements.record, placements.version, placements.generation, placements.pending_since_ms";
 
 fn placement_row(r: PlacementRaw) -> PlacementRow {
     PlacementRow {
@@ -261,8 +263,10 @@ macro_rules! settle_lost {
     }};
 }
 
-/// Rows rewritten from a heartbeat per statement.
-const RESTATE_BATCH: usize = 500;
+/// The sizes a heartbeat's rewrite statements come in, a batch padded up to
+/// the next with rows that match nothing, so each backend prepares a handful
+/// of statements rather than one per count of rows.
+const RESTATE_BATCHES: [usize; 5] = [1, 8, 32, 128, 512];
 
 /// How many consecutive complete listings may leave a placement out before
 /// it is lost. One can always be a listing sampled before the sandbox
@@ -1484,10 +1488,11 @@ impl Store {
                 sqlx::query(fill).bind(&listing).execute(&mut *tx).await?;
 
                 let replaced: Vec<PlacementRaw> = sqlx::query_as(&format!(
-                    "UPDATE placements SET node_id=$1, missed=0, version=version + 1
-                     WHERE node_id='' AND EXISTS (SELECT 1 FROM reported r
-                        WHERE r.id = placements.id AND r.generation = placements.generation)
-                     RETURNING {PLACEMENT_COLUMNS}"
+                    "UPDATE placements SET node_id=$1, missed=0, version=placements.version + 1
+                     FROM reported r
+                     WHERE placements.node_id='' AND r.id = placements.id
+                       AND r.generation = placements.generation
+                     RETURNING {PLACEMENT_COLUMNS_OF_PLACEMENTS}"
                 ))
                 .bind(&node.id)
                 .fetch_all(&mut *tx)
@@ -1502,9 +1507,9 @@ impl Store {
                 .fetch_all(&mut *tx)
                 .await?;
                 sqlx::query(
-                    "UPDATE placements SET missed=0
-                     WHERE node_id=$1 AND missed > 0 AND EXISTS (SELECT 1 FROM reported r
-                        WHERE r.id = placements.id AND r.generation = placements.generation)",
+                    "UPDATE placements SET missed=0 FROM reported r
+                     WHERE placements.node_id=$1 AND placements.missed > 0
+                       AND r.id = placements.id AND r.generation = placements.generation",
                 )
                 .bind(&node.id)
                 .execute(&mut *tx)
@@ -1571,8 +1576,17 @@ impl Store {
                 // generation: the read took no lock, and an edit or a move
                 // committed since wins, to be restated at the next beat.
                 let mut written = std::collections::HashSet::new();
-                for (rows, hashes) in changed.chunks(RESTATE_BATCH).zip(hashes.chunks(RESTATE_BATCH)) {
-                    let values = (0..rows.len())
+                let mut rest = &changed[..];
+                let mut rest_hashes = &hashes[..];
+                while !rest.is_empty() {
+                    let size = RESTATE_BATCHES
+                        .into_iter()
+                        .find(|size| *size >= rest.len())
+                        .unwrap_or(RESTATE_BATCHES[RESTATE_BATCHES.len() - 1]);
+                    let taken = size.min(rest.len());
+                    let (rows, hashes) = (&rest[..taken], &rest_hashes[..taken]);
+                    (rest, rest_hashes) = (&rest[taken..], &rest_hashes[taken..]);
+                    let values = (0..size)
                         .map(|i| {
                             let n = 5 * i + 3;
                             format!("(${n}, ${}, ${}, ${}, ${})", n + 1, n + 2, n + 3, n + 4)
@@ -1597,6 +1611,14 @@ impl Store {
                             .bind(row.generation)
                             .bind(&row.record)
                             .bind(*hash);
+                    }
+                    for _ in taken..size {
+                        query = query
+                            .bind("")
+                            .bind(-1i64)
+                            .bind(-1i64)
+                            .bind(Vec::<u8>::new())
+                            .bind(0i64);
                     }
                     written.extend(query.fetch_all(&mut *tx).await?.into_iter().map(|(id,)| id));
                 }
@@ -3592,6 +3614,33 @@ mod tests {
                 .unwrap(),
         );
         assert!(again.restated.is_empty());
+    }
+
+    /// A batch padded up to its statement's size writes only its own rows.
+    #[tokio::test]
+    async fn a_padded_rewrite_writes_every_changed_row_and_nothing_else() {
+        let store = Store::open_in_memory().await.unwrap();
+        reporting(&store, "n1").await;
+        let ids: Vec<String> = (0..10).map(|i| format!("s{i}")).collect();
+        for id in &ids {
+            store.insert_placement(&placed(id, "n1", 1)).await.unwrap();
+        }
+        let entries: Vec<(&str, i64)> = ids.iter().map(|id| (id.as_str(), 1)).collect();
+        let mut beat = report("n1", 1, &entries);
+        for sandbox in &mut beat.sandboxes {
+            sandbox.hash = 7;
+        }
+        let out = applied(
+            store
+                .reconcile_node(&beat, |_| Some((vec![1], 7)), |_, _| None)
+                .await
+                .unwrap(),
+        );
+        assert_eq!(out.restated.len(), 10);
+        for id in &ids {
+            let row = store.get_placement(id).await.unwrap().unwrap();
+            assert_eq!((row.record, row.version), (vec![1], 2));
+        }
     }
 
     /// The last time an old-build node was heard from starts at the upgrade,
