@@ -31,7 +31,10 @@ use super::{
 
 /// What a sandbox is recreated as.
 pub struct Replacement {
+    /// The build, by directory key.
     pub template: String,
+    /// The template as the caller named it.
+    pub template_ref: String,
     pub policy: common::Policy,
     /// Paths carried from the old root disk to the new one.
     pub keep: Vec<String>,
@@ -173,11 +176,12 @@ impl SandboxManager {
         }
         let Replacement {
             template,
+            template_ref,
             mut policy,
             keep,
         } = replacement;
         crate::template::validate_name(&template)?;
-        let templates_dir = self.config.templates_dir();
+        let templates_dir = self.config.builds_dir();
         let environment = self.image_environment(&template).await;
         let (hypervisor, guest_os) = environment.machine()?;
         self.require_hypervisor(hypervisor)?;
@@ -298,7 +302,7 @@ impl SandboxManager {
         let journal = Journal {
             old_tree: old_tree.clone(),
             tree: tree.clone(),
-            template: old.template.clone(),
+            template: old.template_ref(),
             record: base64::engine::general_purpose::STANDARD
                 .encode(prost::Message::encode_to_vec(&sealed)),
         };
@@ -352,7 +356,8 @@ impl SandboxManager {
         }
 
         let mut record = old.base_record.lock().unwrap().clone();
-        record.template.clone_from(&template);
+        record.template = template_ref;
+        record.build_digest = crate::template::record_digest(&template);
         record.hypervisor = hypervisor.to_string();
         record.guest_os = guest_os.as_str().to_string();
         record.kernel = kernel;
@@ -366,7 +371,7 @@ impl SandboxManager {
         record.kit_selection.clear();
         let new = Arc::new(RunningSandbox {
             id: id.to_string(),
-            template,
+            build: template,
             hypervisor,
             generation: std::sync::atomic::AtomicU64::new(old.generation()),
             base_record: std::sync::Mutex::new(record),
@@ -420,7 +425,7 @@ impl SandboxManager {
         if let Err(err) = tokio::fs::remove_dir_all(retired(&old_tree)).await {
             tracing::warn!(sandbox = id, %err, "could not remove the old root disk");
         }
-        tracing::info!(sandbox = id, template = new.template(), "sandbox recreated");
+        tracing::info!(sandbox = id, build = new.build(), "sandbox recreated");
         Ok(new.record())
     }
 
@@ -628,13 +633,14 @@ mod tests {
     fn replacement(template: &str) -> Replacement {
         Replacement {
             template: template.to_string(),
+            template_ref: template.to_string(),
             policy: Default::default(),
             keep: Vec::new(),
         }
     }
 
     async fn template(data_dir: &Path, name: &str, rootfs: Option<&[u8]>) {
-        let dir = data_dir.join("images").join(name);
+        let dir = data_dir.join("builds").join(name);
         tokio::fs::create_dir_all(&dir).await.unwrap();
         let mut kernel = vec![0u8; 64];
         kernel[56..60].copy_from_slice(b"ARM\x64");

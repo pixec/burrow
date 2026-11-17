@@ -292,8 +292,8 @@ impl NodeConfig {
             .find(|upgrade| upgrade.guest_os == guest_os)
     }
 
-    pub(crate) fn templates_dir(&self) -> PathBuf {
-        self.data_dir.join("images")
+    pub(crate) fn builds_dir(&self) -> PathBuf {
+        crate::template::builds_dir(&self.data_dir)
     }
 
     pub(crate) fn vmm_overhead_mib(&self, hypervisor: Hypervisor) -> u32 {
@@ -1639,11 +1639,19 @@ async fn feed(
     Ok(())
 }
 
+/// The directory key of the build a record names.
+fn build_key(record: &common::Sandbox) -> String {
+    crate::template::key_of(&record.build_digest).unwrap_or_default()
+}
+
 pub struct RunningSandbox {
     /// Fixed for the sandbox's life, and held outside the record because the
     /// record is rebuilt from policy while these two never change.
     id: String,
-    template: String,
+    /// The build it was created from, by directory key: empty for a sandbox
+    /// from before builds, or one taken up from the object store whose build
+    /// this node has never had.
+    build: String,
     /// Its template's, and fixed for its life the same way: every VM it ever
     /// runs, and every snapshot it leaves, is this hypervisor's.
     hypervisor: Hypervisor,
@@ -1864,9 +1872,14 @@ impl RunningSandbox {
         }
     }
 
-    /// The template this sandbox was created from.
-    pub fn template(&self) -> &str {
-        &self.template
+    /// The build this sandbox was created from, by directory key.
+    pub fn build(&self) -> &str {
+        &self.build
+    }
+
+    /// The template as its creator named it.
+    pub fn template_ref(&self) -> String {
+        self.base_record.lock().unwrap().template.clone()
     }
 
     fn layout(&self) -> Layout {
@@ -3042,7 +3055,8 @@ impl RunningSandbox {
         let kernel = self.base_record.lock().unwrap().kernel.clone();
         Ok(crate::snapshot::Staged {
             sandbox_id: self.id.clone(),
-            template: self.template.clone(),
+            template: self.template_ref(),
+            build_digest: crate::template::record_digest(&self.build),
             hypervisor: self.hypervisor,
             guest_os: self.guest_os(),
             vcpus: self.vcpus(),
@@ -3074,7 +3088,8 @@ impl RunningSandbox {
         let _ = tokio::fs::remove_file(dest.join(crate::macnode::MACHINE_ID)).await;
         Ok(crate::snapshot::Staged {
             sandbox_id: self.id.clone(),
-            template: self.template.clone(),
+            template: self.template_ref(),
+            build_digest: crate::template::record_digest(&self.build),
             hypervisor: self.hypervisor,
             guest_os: self.guest_os(),
             vcpus: self.vcpus(),
@@ -3119,20 +3134,20 @@ struct InspectionRoot {
 /// What a created sandbox's disk starts from, when not its template's image.
 #[derive(Clone, Copy)]
 pub(crate) enum Seed<'a> {
-    /// A Linux root disk to clone, as a template build resumes from a step.
-    Disk(&'a Path),
     /// A stopped macOS machine's directory to clone and boot cold: a fork's
     /// capture, or a disk snapshot. It carries the image environment, so the
     /// template need not be on this node.
     Machine(&'a Path),
 }
 
+#[allow(clippy::large_enum_variant)]
 enum RestoreSource<'a> {
     /// A live sandbox, and the disk a checkpoint captured of it if it runs.
     Sandbox(&'a Arc<RunningSandbox>, Option<PathBuf>),
     Snapshot {
         id: &'a str,
         template: String,
+        build_digest: String,
         hypervisor: Hypervisor,
         disk_mib: u32,
         kernel: Option<common::Kernel>,
@@ -3167,9 +3182,24 @@ impl RestoreSource<'_> {
         }
     }
 
-    fn template(&self) -> String {
+    /// The build the state was made from, by directory key; empty when it
+    /// predates builds.
+    fn build(&self) -> String {
         match self {
-            Self::Sandbox(source, _) => source.template().to_string(),
+            Self::Sandbox(source, _) => source.build().to_string(),
+            Self::Snapshot { build_digest, .. } => {
+                crate::template::key_of(build_digest).unwrap_or_default()
+            }
+            Self::Stored { manifest, .. } => {
+                crate::template::key_of(&manifest.build_digest).unwrap_or_default()
+            }
+        }
+    }
+
+    /// The template as the source's creator named it.
+    fn template_ref(&self) -> String {
+        match self {
+            Self::Sandbox(source, _) => source.template_ref(),
             Self::Snapshot { template, .. } => template.clone(),
             Self::Stored { manifest, .. } => manifest.template.clone(),
         }
@@ -3414,6 +3444,9 @@ pub struct SandboxManager {
     releasing: Arc<std::sync::Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>>,
     /// Sandboxes recovery kept but could not put back in service.
     held: Arc<std::sync::Mutex<HashMap<String, Held>>>,
+    /// The builds the orchestrator wants warm, by directory key: those a tag
+    /// resolves to. `None` until it first says.
+    warm_wanted: Arc<std::sync::Mutex<Option<std::collections::HashSet<String>>>>,
     /// The routes bringing public addresses to their taps, synced with every
     /// ruleset.
     host_routes: Arc<burrow_net::public::HostRoutes>,
@@ -3648,6 +3681,7 @@ impl SandboxManager {
             lease: Default::default(),
             releasing: Default::default(),
             held: Default::default(),
+            warm_wanted: Default::default(),
             host_routes: Default::default(),
             public_index: Default::default(),
         }
@@ -4393,7 +4427,7 @@ impl SandboxManager {
         if self.config.object_store.is_some() {
             let (blobs, templates) = (
                 crate::blobs::BlobStore::new(&self.config.data_dir),
-                self.config.templates_dir(),
+                self.config.builds_dir(),
             );
             tokio::spawn(async move { crate::rootdisk::index_templates(&blobs, &templates).await });
         }
@@ -4549,7 +4583,7 @@ impl SandboxManager {
 
         let sandbox = Arc::new(RunningSandbox {
             id: record.id.clone(),
-            template: record.template.clone(),
+            build: build_key(&record),
             hypervisor,
             generation: std::sync::atomic::AtomicU64::new(row.generation),
             base_record: std::sync::Mutex::new(record),
@@ -7087,7 +7121,7 @@ impl SandboxManager {
     /// The template environment a sandbox runs with: its own copy, kept when
     /// it was taken up from the object store, or its template's.
     pub async fn environment_of(&self, sandbox: &RunningSandbox) -> crate::oci::ImageEnvironment {
-        crate::oci::sandbox_environment(&self.config.data_dir, &sandbox.workdir, sandbox.template())
+        crate::oci::sandbox_environment(&self.config.data_dir, &sandbox.workdir, sandbox.build())
             .await
     }
 
@@ -7161,21 +7195,58 @@ impl SandboxManager {
         }
     }
 
-    /// Discards every warm snapshot of `template` and lets them be built again.
+    /// Deletes a build, refused while anything on this node uses it.
+    pub async fn delete_build(&self, digest: &str) -> Result<(), Status> {
+        let manager = self.clone();
+        crate::template::delete(&self.config.data_dir, digest, |key| async move {
+            manager.build_user(&key).await
+        })
+        .await?;
+        self.forget_build_warm(&crate::template::key_of(digest)?)
+            .await;
+        Ok(())
+    }
+
+    /// What on this node uses the build in `key`: a sandbox, a sandbox held
+    /// for an operator, or a local snapshot.
+    async fn build_user(&self, key: &str) -> Option<String> {
+        if let Some(sandbox) = self
+            .sandboxes
+            .lock()
+            .await
+            .values()
+            .find(|sandbox| sandbox.build() == key)
+        {
+            return Some(format!("sandbox {}", sandbox.id()));
+        }
+        let digest = crate::template::digest_of(key);
+        if let Some(held) = self
+            .held
+            .lock()
+            .unwrap()
+            .values()
+            .find(|held| held.record.build_digest == digest)
+        {
+            return Some(format!("sandbox {}", held.record.id));
+        }
+        self.snapshots
+            .list(None)
+            .await
+            .into_iter()
+            .find(|snapshot| snapshot.build_digest == digest)
+            .map(|snapshot| format!("snapshot {}", snapshot.id))
+    }
+
+    /// Discards every warm snapshot of the build `template` and what was
+    /// attempted of it, for a build being deleted.
     ///
-    /// A snapshot's memory image is only valid over the rootfs it was captured
-    /// on, and `stage_from_warm` links whichever `rootfs.ext4` is there now.
-    /// Republishing a template without this leaves the two mismatched, which
-    /// restores a guest onto a disk it never saw. Clearing the attempts too is
-    /// what lets the replacements be built.
-    ///
-    /// Taken under the warm build lock, so a build of the old rootfs already
-    /// running finishes, and is discarded, before this returns rather than
-    /// publishing after it.
-    pub async fn invalidate_warm(&self, template: &str) {
+    /// Taken under the warm build lock, so a build of it already running
+    /// finishes, and is discarded, before this returns rather than publishing
+    /// after it.
+    pub async fn forget_build_warm(&self, template: &str) {
         let _no_builds = crate::warm::hold_builds().await;
         self.warm_shapes.lock().unwrap().remove(template);
-        let warm = crate::warm::warm_dir(&self.config.templates_dir(), template);
+        let warm = crate::warm::warm_dir(&self.config.builds_dir(), template);
         if let Err(err) = tokio::fs::remove_dir_all(&warm).await
             && err.kind() != std::io::ErrorKind::NotFound
         {
@@ -7259,7 +7330,7 @@ impl SandboxManager {
         template: &str,
         shape: crate::warm::Shape,
     ) -> Result<Option<crate::warm::Warm>, Status> {
-        let templates_dir = self.config.templates_dir();
+        let templates_dir = self.config.builds_dir();
         let environment = self.image_environment(template).await;
         let (hypervisor, guest_os) = environment.machine()?;
         // A pinned shape below what the guest boots on, the default 1x512 for
@@ -7378,7 +7449,7 @@ impl SandboxManager {
         hypervisor: Hypervisor,
         shape: crate::warm::Shape,
     ) {
-        let templates_dir = self.config.templates_dir();
+        let templates_dir = self.config.builds_dir();
         let Some(dir) = crate::warm::find_broken(&templates_dir, template, hypervisor, shape).await
         else {
             return;
@@ -7543,7 +7614,7 @@ impl SandboxManager {
         &self,
         incoming: Option<(&str, Hypervisor, crate::warm::Shape, u64)>,
     ) -> bool {
-        let mut entries = crate::warm::list_all(&self.config.templates_dir()).await;
+        let mut entries = crate::warm::list_all(&self.config.builds_dir()).await;
         let incoming_index = incoming.is_some().then_some(entries.len());
         if let Some((template, hypervisor, shape, bytes)) = incoming {
             entries.push((
@@ -7557,7 +7628,8 @@ impl SandboxManager {
                 },
             ));
         }
-        let evictions = self.config.warm.evictions(&entries);
+        let wanted = self.warm_wanted.lock().unwrap().clone();
+        let evictions = self.config.warm.evictions(&entries, wanted.as_ref());
         if incoming_index.is_some_and(|incoming| evictions.contains(&incoming)) {
             return false;
         }
@@ -7590,9 +7662,12 @@ impl SandboxManager {
     /// the pinned shapes of every template, and applies the caps, which may
     /// have changed.
     pub async fn sweep_warm(&self) {
-        let templates_dir = self.config.templates_dir();
-        for template in crate::template::bootable(&self.config.data_dir).await {
-            let environment = self.image_environment(&template.name).await;
+        let templates_dir = self.config.builds_dir();
+        for build in crate::template::bootable(&self.config.data_dir).await {
+            let Ok(template) = crate::template::key_of(&build.digest) else {
+                continue;
+            };
+            let environment = self.image_environment(&template).await;
             let is_warmable = !environment.tpm
                 && environment
                     .machine()
@@ -7600,23 +7675,53 @@ impl SandboxManager {
             if !is_warmable {
                 continue;
             }
-            for path in crate::warm::stale(&templates_dir, &template.name).await {
+            for path in crate::warm::stale(&templates_dir, &template).await {
                 let removed = match tokio::fs::metadata(&path).await {
                     Ok(meta) if meta.is_dir() => tokio::fs::remove_dir_all(&path).await,
                     _ => tokio::fs::remove_file(&path).await,
                 };
                 if let Err(err) = removed {
-                    tracing::warn!(template = template.name, %err, "could not discard a stale warm snapshot");
+                    tracing::warn!(build = template, %err, "could not discard a stale warm snapshot");
                 }
             }
-            self.warm_template(&template.name);
         }
         self.enforce_warm_limits(None).await;
     }
 
+    /// Records which builds the orchestrator wants warm, and warms the
+    /// pinned shapes of each one held here that it did not want before.
+    /// The pinned shapes of a build no longer wanted are evicted like any
+    /// other.
+    pub fn set_warm_wanted(&self, digests: &[String]) {
+        let wanted: std::collections::HashSet<String> = digests
+            .iter()
+            .filter_map(|digest| crate::template::key_of(digest).ok())
+            .collect();
+        let added: Vec<String> = {
+            let mut held = self.warm_wanted.lock().unwrap();
+            let before = held.replace(wanted.clone()).unwrap_or_default();
+            wanted.difference(&before).cloned().collect()
+        };
+        if added.is_empty() {
+            return;
+        }
+        let manager = self.clone();
+        tokio::spawn(async move {
+            for key in added {
+                if crate::template::read_manifest(&manager.config.data_dir, &key)
+                    .await
+                    .is_some()
+                {
+                    manager.warm_template(&key);
+                }
+            }
+            manager.enforce_warm_limits(None).await;
+        });
+    }
+
     /// Every warm snapshot here, as the node reports them.
     pub async fn warm_shapes(&self) -> Vec<common::WarmShape> {
-        crate::warm::list_all(&self.config.templates_dir())
+        crate::warm::list_all(&self.config.builds_dir())
             .await
             .iter()
             .map(|(template, warm)| warm.to_proto(template, &self.config.warm))
@@ -7638,9 +7743,9 @@ impl SandboxManager {
             return;
         }
         let data_dir = &self.config.data_dir;
-        let (entries, referenced) = crate::template::layers::prune(data_dir, age).await;
+        let entries = crate::template::layers::prune(data_dir, age).await;
         let (blobs, freed) = crate::blobs::BlobStore::new(data_dir)
-            .collect_garbage(&referenced, age)
+            .collect_garbage(&Default::default(), age)
             .await;
         if entries > 0 || blobs > 0 {
             tracing::info!(
@@ -7977,7 +8082,7 @@ impl SandboxManager {
             .iter()
             .map(|volume| volume.size_mib.saturating_mul(burrow_common::disk::MIB))
             .sum();
-        let warm_bytes = crate::warm::list_all(&self.config.templates_dir())
+        let warm_bytes = crate::warm::list_all(&self.config.builds_dir())
             .await
             .iter()
             .map(|(_, warm)| warm.bytes)
@@ -8213,23 +8318,24 @@ impl SandboxManager {
     pub async fn create(
         &self,
         id: String,
-        template: String,
+        build: String,
         policy: common::Policy,
         tags: HashMap<String, String>,
         node_id: String,
         name: String,
         request_id: String,
+        template: String,
     ) -> Result<common::Sandbox, Status> {
         self.detached(move |manager| async move {
             manager
-                .create_now(id, template, policy, tags, node_id, name, request_id)
+                .create_now(id, build, policy, tags, node_id, name, request_id, template)
                 .await
         })
         .await
     }
 
     #[allow(clippy::too_many_arguments)]
-    #[tracing::instrument(skip_all, fields(sandbox = %id, template = %template, from_warm))]
+    #[tracing::instrument(skip_all, fields(sandbox = %id, template = %template_ref, from_warm))]
     async fn create_now(
         &self,
         id: String,
@@ -8239,6 +8345,7 @@ impl SandboxManager {
         node_id: String,
         name: String,
         request_id: String,
+        template_ref: String,
     ) -> Result<common::Sandbox, Status> {
         // A sandbox provisioned ahead of demand needs none of the work below:
         // its VM is already restored, its agent already handshaken, its
@@ -8267,7 +8374,17 @@ impl SandboxManager {
             self.warm_for_demand(&ShapeKey::of(&template, &resources));
         }
         let record = self
-            .create_seeded(id, template, policy, tags, node_id, None, name, request_id)
+            .create_seeded(
+                id,
+                template,
+                policy,
+                tags,
+                node_id,
+                None,
+                name,
+                request_id,
+                template_ref,
+            )
             .await?;
         self.warn_if_root_untrusted(&record);
         Ok(record)
@@ -8317,6 +8434,7 @@ impl SandboxManager {
         seed: Option<Seed<'_>>,
         name: String,
         request_id: String,
+        template_ref: String,
     ) -> Result<common::Sandbox, Status> {
         let began = std::time::Instant::now();
         let mut phases = burrow_vmm::Phases::start();
@@ -8333,6 +8451,18 @@ impl SandboxManager {
             }
             creating.insert(id.clone(), FIRST_GENERATION);
         }
+        // Held until the sandbox is registered, so a delete of its build
+        // either refuses or happens before this create looks for it.
+        let _build = match template.is_empty() {
+            true => None,
+            false => match crate::template::use_build(&self.config.data_dir, &template).await {
+                Ok(held) => Some(held),
+                Err(err) => {
+                    self.creating.lock().await.remove(&id);
+                    return Err(err);
+                }
+            },
+        };
         // Held until the sandbox is registered running, so a create racing
         // this one sees it either starting or running.
         let slot = match self.seeded_environment(&template, seed).await.machine() {
@@ -8366,6 +8496,9 @@ impl SandboxManager {
             stamped.tags = tags;
             stamped.name = name;
             stamped.create_request_id = request_id;
+            if !template_ref.is_empty() {
+                stamped.template = template_ref;
+            }
         }
         // Only now that the sandbox exists does its policy exist to render, so
         // its rules land here, before anything can reach it. The window a
@@ -8492,17 +8625,17 @@ impl SandboxManager {
         // templates directory. The API checks it too, but every create on this
         // node funnels through here, including the ones a build starts for
         // itself, so this is the one that cannot be routed around.
-        crate::template::validate_name(&template)?;
-        let templates_dir = self.config.templates_dir();
+        // A machine's directory carries everything, so a sandbox seeded from
+        // one may name no build.
+        if !(template.is_empty() && seed.is_some()) {
+            crate::template::validate_name(&template)?;
+        }
+        let templates_dir = self.config.builds_dir();
         // The template decides the hypervisor, for this sandbox and every VM
         // it will ever run.
         let environment = self.seeded_environment(&template, seed).await;
         let (hypervisor, guest_os) = environment.machine()?;
-        let (seed_disk, seed_machine) = match seed {
-            Some(Seed::Disk(disk)) => (Some(disk), None),
-            Some(Seed::Machine(dir)) => (None, Some(dir)),
-            None => (None, None),
-        };
+        let seed_machine = seed.map(|Seed::Machine(dir)| dir);
         if seed_machine.is_some() && !crate::macnode::is_macos(guest_os) {
             return Err(Status::failed_precondition(format!(
                 "a {} guest is not created from a machine's directory",
@@ -8605,8 +8738,7 @@ impl SandboxManager {
         // disk cannot be shrunk under the guest, so that create boots.
         let wanted = crate::warm::Shape::wanted(&resources);
         // A TPM's state is the sandbox's own, which no shared snapshot holds.
-        let is_warmable = seed_disk.is_none()
-            && !policy.is_console_verbose
+        let is_warmable = !policy.is_console_verbose
             && !resources.is_nested_virt_enabled
             && !environment.tpm
             && capabilities.is_warm_pool_supported
@@ -8858,11 +8990,10 @@ impl SandboxManager {
                         Status::failed_precondition(format!("template {template:?}: {err}"))
                     })?;
                     let disk = workdir.join(crate::rootdisk::ROOT_DISK);
-                    match seed_disk {
-                        Some(seed) => crate::rootdisk::clone(seed, &disk).await.map(drop),
-                        None => self.spares.take(&templates_dir, &template, &disk).await,
-                    }
-                    .map_err(|err| Status::internal(format!("making the root disk: {err}")))?;
+                    self.spares
+                        .take(&templates_dir, &template, &disk)
+                        .await
+                        .map_err(|err| Status::internal(format!("making the root disk: {err}")))?;
                     crate::rootdisk::grow(&disk, resources.disk_mib).await?;
                 }
                 staged.mark("disk");
@@ -9078,6 +9209,7 @@ impl SandboxManager {
         let record = common::Sandbox {
             id: id.clone(),
             node_id,
+            build_digest: crate::template::record_digest(&template),
             template,
             state: common::SandboxState::Running as i32,
             policy: Some(policy),
@@ -9133,7 +9265,7 @@ impl SandboxManager {
         );
         let sandbox = Arc::new(RunningSandbox {
             id: record.id.clone(),
-            template: record.template.clone(),
+            build: build_key(&record),
             hypervisor,
             generation: std::sync::atomic::AtomicU64::new(FIRST_GENERATION),
             base_record: std::sync::Mutex::new(record.clone()),
@@ -9490,6 +9622,7 @@ impl SandboxManager {
                 RestoreSource::Snapshot {
                     id: snapshot_id,
                     template: manifest.template.clone(),
+                    build_digest: manifest.build_digest.clone(),
                     hypervisor: manifest.hypervisor()?,
                     disk_mib: manifest.disk_mib,
                     kernel: manifest.kernel(),
@@ -9570,13 +9703,14 @@ impl SandboxManager {
         let record = self
             .create_seeded(
                 id,
-                manifest.template.clone(),
+                crate::template::key_of(&manifest.build_digest).unwrap_or_default(),
                 policy,
                 tags,
                 node_id,
                 Some(Seed::Machine(&dir)),
                 name,
                 request_id,
+                manifest.template.clone(),
             )
             .await?;
         self.snapshots.touch(snapshot_id).await;
@@ -9724,13 +9858,14 @@ impl SandboxManager {
             source.capture_machine(&staged, &environment).await?;
             self.create_seeded(
                 child_id.clone(),
-                source.template().to_string(),
+                source.build().to_string(),
                 policy,
                 tags,
                 node_id,
                 Some(Seed::Machine(&staged)),
                 name,
                 String::new(),
+                source.template_ref(),
             )
             .await
         }
@@ -10001,7 +10136,7 @@ impl SandboxManager {
         }
         let shape = crate::warm::Shape::wanted(resources);
         let Some(warm) =
-            crate::warm::find(&self.config.templates_dir(), template, hypervisor, shape).await
+            crate::warm::find(&self.config.builds_dir(), template, hypervisor, shape).await
         else {
             return false;
         };
@@ -10091,7 +10226,7 @@ impl SandboxManager {
                 .machine()
                 .map_or_else(|_| Default::default(), |(_, os)| os),
             _ => self
-                .image_environment(&source.template())
+                .image_environment(&source.build())
                 .await
                 .machine()
                 .map_or_else(|_| Default::default(), |(_, os)| os),
@@ -10232,7 +10367,7 @@ impl SandboxManager {
                 systemd: manifest.is_systemd,
                 ..manifest.image.clone()
             },
-            _ => self.image_environment(&source.template()).await,
+            _ => self.image_environment(&source.build()).await,
         };
         let mut spec = self.build_spec(
             &id,
@@ -10258,7 +10393,7 @@ impl SandboxManager {
         // stalled vCPU at a time.
         if capabilities.is_lazy_memory_supported {
             let linked = self
-                .link_prefetch_plan(&source.template(), hypervisor, &resources, &workdir)
+                .link_prefetch_plan(&source.build(), hypervisor, &resources, &workdir)
                 .await;
             let merged = matches!(source, RestoreSource::Stored { .. })
                 && crate::durable::merge_working_set(&workdir, crate::warm::PREFETCH_PLAN)
@@ -10310,7 +10445,7 @@ impl SandboxManager {
                 RestoreSource::Stored { manifest, .. } => {
                     self.trust_bundles_in(&manifest.image, &policy)
                 }
-                _ => self.trust_bundles_for(&source.template(), &policy).await,
+                _ => self.trust_bundles_for(&source.build(), &policy).await,
             },
             match is_attached {
                 true => Vec::new(),
@@ -10327,7 +10462,8 @@ impl SandboxManager {
         let record = common::Sandbox {
             id: id.clone(),
             node_id,
-            template: source.template(),
+            template: source.template_ref(),
+            build_digest: crate::template::record_digest(&source.build()),
             state: common::SandboxState::Running as i32,
             policy: Some(policy),
             created_at_unix_ms: burrow_common::unix_now_ms(),
@@ -10361,7 +10497,7 @@ impl SandboxManager {
 
         let sandbox = Arc::new(RunningSandbox {
             id: record.id.clone(),
-            template: record.template.clone(),
+            build: build_key(&record),
             hypervisor,
             generation: std::sync::atomic::AtomicU64::new(FIRST_GENERATION),
             base_record: std::sync::Mutex::new(record),
@@ -10775,9 +10911,8 @@ impl SandboxManager {
         Ok(sandbox.record())
     }
 
-    /// Points a stopped sandbox at the kernel its template boots now, which a
-    /// rebuild of the template may have changed, or a firmware guest at the
-    /// node's firmware.
+    /// Points a stopped sandbox at its build's kernel, or a firmware guest at
+    /// the node's firmware.
     async fn take_template_kernel(&self, sandbox: &RunningSandbox) -> Result<(), Status> {
         if crate::boot::file(sandbox.guest_os()) == crate::boot::FIRMWARE {
             return crate::boot::take_firmware(
@@ -10791,18 +10926,16 @@ impl SandboxManager {
         if tokio::fs::symlink_metadata(&current).await.is_err() {
             return Ok(());
         }
-        let template = sandbox.template();
+        let template = sandbox.template_ref();
+        // A build never changes, so a sandbox whose build is not here, or
+        // that predates builds, already has the kernel it would take.
         let source = self
             .config
-            .templates_dir()
-            .join(template)
+            .builds_dir()
+            .join(sandbox.build())
             .join(TEMPLATE_KERNEL);
-        if !tokio::fs::try_exists(&source).await.unwrap_or(false) {
-            return Err(Status::failed_precondition(format!(
-                "template {template} is not on this node, so there is no current kernel to boot \
-                 {} on; keep the kernel it last ran (--keep-kernel)",
-                sandbox.id()
-            )));
+        if sandbox.build().is_empty() || !tokio::fs::try_exists(&source).await.unwrap_or(false) {
+            return Ok(());
         }
         let inspected = crate::kernels::inspect(&source)
             .await
@@ -10838,7 +10971,7 @@ impl SandboxManager {
             }
             tokio::fs::rename(&next, &current).await.map_err(io)?;
         }
-        let name = self.image_environment(template).await.kernel;
+        let name = self.image_environment(sandbox.build()).await.kernel;
         sandbox.base_record.lock().unwrap().kernel =
             crate::kernels::in_dir(&sandbox.workdir, &name).await?;
         Ok(())
@@ -11344,7 +11477,8 @@ impl SandboxManager {
             node_id: record.node_id.clone(),
             placement: sandbox.generation(),
             state: String::new(),
-            template: sandbox.template().to_string(),
+            template: sandbox.template_ref(),
+            build_digest: crate::template::record_digest(sandbox.build()),
             vcpus: sandbox.vcpus(),
             mem_mib: sandbox.mem_mib(),
             boot_mem_mib: sandbox.boot_mem_mib(),
@@ -12256,6 +12390,7 @@ impl SandboxManager {
             id: id.clone(),
             node_id,
             template: manifest.template.clone(),
+            build_digest: manifest.build_digest.clone(),
             state: common::SandboxState::Stopped as i32,
             policy: Some(policy),
             guest_ip: lease.guest_ip.to_string(),
@@ -12271,7 +12406,7 @@ impl SandboxManager {
         guard.keep();
         let sandbox = Arc::new(RunningSandbox {
             id: id.clone(),
-            template: record.template.clone(),
+            build: build_key(&record),
             hypervisor,
             generation: std::sync::atomic::AtomicU64::new(FIRST_GENERATION),
             base_record: std::sync::Mutex::new(record.clone()),
@@ -12548,8 +12683,8 @@ impl SandboxManager {
         let path = match crate::macnode::is_macos(sandbox.guest_os()) {
             true => self
                 .config
-                .templates_dir()
-                .join(sandbox.template())
+                .builds_dir()
+                .join(sandbox.build())
                 .join(crate::macnode::DISK),
             false => sandbox.workdir.join(TEMPLATE_ROOTFS),
         };
@@ -14260,17 +14395,16 @@ pub(crate) mod tests {
         assert_eq!(attempted(&manager).len(), 4);
     }
 
-    /// A republished template's old snapshots restore a guest onto a rootfs
-    /// it never saw, so invalidating must both discard every shape and let
-    /// the replacements be built.
+    /// Deleting a build discards every shape of its warm snapshots and what
+    /// was attempted of it, and nothing of any other build.
     #[tokio::test]
-    async fn republishing_a_template_discards_its_warm_snapshots() {
+    async fn deleting_a_build_discards_its_warm_snapshots() {
         let manager = manager().await;
         manager.warm_in_background("app".into(), shape(2, 1024));
         manager.warm_in_background("app".into(), shape(4, 2048));
         manager.warm_in_background("other".into(), shape(2, 1024));
 
-        let warm = crate::warm::warm_dir(&manager.config.templates_dir(), "app");
+        let warm = crate::warm::warm_dir(&manager.config.builds_dir(), "app");
         for name in ["firecracker-2x1024", "firecracker-4x2048"] {
             tokio::fs::create_dir_all(warm.join(name)).await.unwrap();
             tokio::fs::write(
@@ -14282,7 +14416,7 @@ pub(crate) mod tests {
             .unwrap();
         }
 
-        manager.invalidate_warm("app").await;
+        manager.forget_build_warm("app").await;
 
         assert!(!tokio::fs::try_exists(&warm).await.unwrap());
         // Every shape of that template, and nothing of any other.
@@ -14353,7 +14487,7 @@ pub(crate) mod tests {
     #[tokio::test]
     async fn a_broken_warm_snapshot_is_discarded_and_rebuilt() {
         let manager = manager().await;
-        let dir = crate::warm::warm_dir(&manager.config.templates_dir(), "app")
+        let dir = crate::warm::warm_dir(&manager.config.builds_dir(), "app")
             .join("firecracker-2x2048-16384");
         tokio::fs::create_dir_all(&dir).await.unwrap();
         let layout = Hypervisor::Firecracker.layout();
@@ -14406,7 +14540,7 @@ pub(crate) mod tests {
     #[tokio::test]
     async fn a_warm_snapshot_that_will_not_restore_is_discarded_and_rebuilt() {
         let manager = manager().await;
-        let dir = crate::warm::warm_dir(&manager.config.templates_dir(), "app")
+        let dir = crate::warm::warm_dir(&manager.config.builds_dir(), "app")
             .join("firecracker-2x2048-16384");
         let workdir = manager.config.data_dir.join("sbx_unrestorable");
         tokio::fs::create_dir_all(&dir).await.unwrap();
@@ -14584,11 +14718,22 @@ pub(crate) mod tests {
         }
     }
 
-    /// Writes an image config beside a template, the way an import does.
+    /// Records an image config in a build's manifest, the way an import does.
     async fn with_image_config(manager: &SandboxManager, template: &str, config: &str) {
-        let dir = manager.config.templates_dir().join(template);
+        let dir = manager.config.builds_dir().join(template);
         tokio::fs::create_dir_all(&dir).await.unwrap();
-        tokio::fs::write(dir.join("image.json"), config)
+        let manifest = burrow_common::build::Manifest {
+            rootfs: burrow_common::build::Artifact {
+                file: crate::rootdisk::IMAGE.into(),
+                ..Default::default()
+            },
+            config: serde_json::from_str(config).unwrap(),
+            ..Default::default()
+        };
+        tokio::fs::write(dir.join(crate::rootdisk::IMAGE), b"")
+            .await
+            .unwrap();
+        tokio::fs::write(dir.join(crate::template::MANIFEST), manifest.canonical())
             .await
             .unwrap();
     }
@@ -14652,7 +14797,7 @@ pub(crate) mod tests {
         let workdir = std::env::temp_dir().join(format!("burrow-test-{id}"));
         Arc::new(RunningSandbox {
             id: id.into(),
-            template: "default".into(),
+            build: "default".into(),
             hypervisor: Hypervisor::Firecracker,
             generation: std::sync::atomic::AtomicU64::new(FIRST_GENERATION),
             base_record: std::sync::Mutex::new(common::Sandbox::default()),
@@ -15467,7 +15612,7 @@ pub(crate) mod tests {
             .unwrap();
         RunningSandbox {
             id: "sbx_a".into(),
-            template: "default".into(),
+            build: "default".into(),
             hypervisor: Hypervisor::Firecracker,
             generation: std::sync::atomic::AtomicU64::new(FIRST_GENERATION),
             base_record: std::sync::Mutex::new(common::Sandbox::default()),

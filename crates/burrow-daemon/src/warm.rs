@@ -38,11 +38,12 @@ use burrow_vmm::{Hypervisor, HypervisorExt, NetSpec, Vm, VmSpec};
 use crate::rootdisk::{IMAGE, ROOT_DISK};
 use crate::sandbox::NodeConfig;
 
-/// A template's warm snapshots, one directory per shape.
+/// Warm snapshots, one directory per build and in it one per shape, beside
+/// the builds rather than in them: a build never changes once published.
 const WARM_DIR: &str = "warm";
-/// Where a build is assembled before it is swapped in. One at a time on the
-/// whole node, under [`WARM_BUILD_LOCK`].
-const WARM_STAGING_DIR: &str = "warm.tmp";
+/// Where a snapshot is assembled before it is swapped in, beside the build's
+/// own. One at a time on the whole node, under [`WARM_BUILD_LOCK`].
+const WARM_STAGING_SUFFIX: &str = ".tmp";
 /// Unix seconds of the last restore from a snapshot, which eviction orders by.
 const USED_FILE: &str = "used";
 const WARM_TAP: &str = "btwarm";
@@ -116,6 +117,14 @@ type Agents = std::collections::HashMap<burrow_vmm::GuestOs, String>;
 
 fn agent() -> Option<&'static Agents> {
     AGENTS.get()
+}
+
+/// The digest of the agent this node ships for `guest_os`, empty for none.
+pub fn shipped_agent(guest_os: burrow_vmm::GuestOs) -> String {
+    agent()
+        .and_then(|agents| agents.get(&guest_os))
+        .cloned()
+        .unwrap_or_default()
 }
 
 /// Pages a restore of this snapshot touches first, recorded once when the
@@ -323,13 +332,28 @@ impl WarmPolicy {
     }
 
     /// Which of `entries` to evict, least recently used first, so that every
-    /// template and then the node fit their caps. Pinned shapes count against
-    /// the caps and are never chosen.
-    pub fn evictions(&self, entries: &[(String, Warm)]) -> Vec<usize> {
+    /// build and then the node fit their caps. Pinned shapes count against
+    /// the caps and are never chosen, unless `wanted` is given and leaves
+    /// their build out: a build no tag resolves to keeps no pinned shape.
+    pub fn evictions(
+        &self,
+        entries: &[(String, Warm)],
+        wanted: Option<&std::collections::HashSet<String>>,
+    ) -> Vec<usize> {
+        let is_kept = |(key, warm): &(String, Warm)| {
+            self.is_pinned(warm.shape) && wanted.is_none_or(|wanted| wanted.contains(key))
+        };
         let mut order: Vec<usize> = (0..entries.len())
-            .filter(|&index| !self.is_pinned(entries[index].1.shape))
+            .filter(|&index| !is_kept(&entries[index]))
             .collect();
-        order.sort_by_key(|&index| entries[index].1.used_at);
+        // A build no tag resolves to goes first, then by use.
+        order.sort_by_key(|&index| {
+            let (key, warm) = &entries[index];
+            (
+                wanted.is_some_and(|wanted| wanted.contains(key)),
+                warm.used_at,
+            )
+        });
         let mut evicted = std::collections::HashSet::new();
 
         let mut templates: Vec<&str> = entries.iter().map(|(name, _)| name.as_str()).collect();
@@ -387,9 +411,9 @@ pub struct Warm {
 }
 
 impl Warm {
-    pub fn to_proto(&self, template: &str, policy: &WarmPolicy) -> common::WarmShape {
+    pub fn to_proto(&self, key: &str, policy: &WarmPolicy) -> common::WarmShape {
         common::WarmShape {
-            template: template.to_string(),
+            build_digest: crate::template::digest_of(key),
             resources: Some(common::ResourcePolicy {
                 vcpus: self.shape.vcpus,
                 mem_mib: self.shape.mem_mib,
@@ -401,6 +425,7 @@ impl Warm {
             last_used_at_unix_ms: self.used_at.saturating_mul(1000),
             is_pinned: policy.is_pinned(self.shape),
             node_id: String::new(),
+            template: String::new(),
         }
     }
 }
@@ -429,21 +454,6 @@ async fn read_warm(dir: &Path, agents: Option<&Agents>) -> Option<Warm> {
     if let Some(shipped) = agents.and_then(|agents| agents.get(&guest_os)) {
         let built_with = tokio::fs::read_to_string(dir.join(AGENT_FILE)).await.ok()?;
         if built_with.trim() != shipped {
-            return None;
-        }
-    }
-    // A snapshot carrying its firmware restores with it whatever the node
-    // has; one of a kernel restores with its template's, which must be the
-    // one it booted.
-    let carried = tokio::fs::try_exists(dir.join(crate::boot::FIRMWARE))
-        .await
-        .unwrap_or(false);
-    if !carried {
-        let template_kernel = dir.parent()?.parent()?.join(crate::boot::KERNEL);
-        let kernel = tokio::fs::read_to_string(dir.join(KERNEL_FILE))
-            .await
-            .ok()?;
-        if kernel.trim() != crate::kernels::digest(&template_kernel).await.ok()? {
             return None;
         }
     }
@@ -499,16 +509,27 @@ async fn measure(dir: &Path, hypervisor: Hypervisor) -> std::io::Result<u64> {
     .map_err(std::io::Error::other)?
 }
 
-pub fn warm_dir(templates_dir: &Path, template: &str) -> PathBuf {
-    templates_dir.join(template).join(WARM_DIR)
+/// Every build's warm snapshots, beside `builds_dir`.
+fn warm_root(builds_dir: &Path) -> PathBuf {
+    builds_dir.parent().map_or_else(
+        || builds_dir.join(WARM_DIR),
+        |data_dir| data_dir.join(WARM_DIR),
+    )
+}
+
+/// The warm snapshots of the build in `key`. Keyed by the build, which never
+/// changes, so a snapshot can never be restored onto a disk it was not taken
+/// over and nothing has to invalidate one.
+pub fn warm_dir(builds_dir: &Path, key: &str) -> PathBuf {
+    warm_root(builds_dir).join(key)
 }
 
 /// Where a new snapshot is assembled before it is published.
 ///
 /// Building in place would pull the snapshot out from under creates that
 /// already decided to restore from it and are about to link its files.
-fn warm_staging_dir(templates_dir: &Path, template: &str) -> PathBuf {
-    templates_dir.join(template).join(WARM_STAGING_DIR)
+fn warm_staging_dir(builds_dir: &Path, key: &str) -> PathBuf {
+    warm_root(builds_dir).join(format!("{key}{WARM_STAGING_SUFFIX}"))
 }
 
 /// The snapshot of `template` under `hypervisor` with `wanted`'s vCPUs and
@@ -611,15 +632,15 @@ pub async fn list(templates_dir: &Path, template: &str) -> Vec<Warm> {
     out
 }
 
-/// Every usable warm snapshot on the node, by template.
+/// Every usable warm snapshot on the node, by build.
 pub async fn list_all(templates_dir: &Path) -> Vec<(String, Warm)> {
     let mut out = Vec::new();
-    let Ok(mut templates) = tokio::fs::read_dir(templates_dir).await else {
+    let Ok(mut templates) = tokio::fs::read_dir(warm_root(templates_dir)).await else {
         return out;
     };
     while let Ok(Some(entry)) = templates.next_entry().await {
         let name = entry.file_name().to_string_lossy().into_owned();
-        if name.starts_with('.') {
+        if name.starts_with('.') || name.contains('.') {
             continue;
         }
         for warm in list(templates_dir, &name).await {
@@ -729,7 +750,7 @@ pub async fn build_warm_snapshot(
     trust: &Trust,
     cold_boots: &crate::coldboot::ColdBoots,
 ) -> Result<Warm, Status> {
-    let templates_dir = config.templates_dir();
+    let templates_dir = config.builds_dir();
     // Defence in depth: the name becomes a directory under `templates_dir` and
     // this function removes and recreates it, so a caller that skipped
     // validation must not be able to point it at an arbitrary host path.
@@ -780,7 +801,7 @@ pub async fn build_warm_snapshot(
     // snapshot is published from. So the VM runs there and its products are
     // moved into the staging directory afterwards; without the jailer the two
     // are the same place and nothing moves.
-    let vm_id = format!("warm-{template}");
+    let vm_id = format!("warm-{}", template.get(..16).unwrap_or(template));
     let run_dir = match config.jail_for(hypervisor) {
         Some(jail) => jail.chroot_for(hypervisor, &vm_id),
         None => dir.clone(),
@@ -1542,9 +1563,9 @@ mod shape_tests {
             entry("app", 2, 2048, 1, 100),
             entry("app", 4, 4096, 1, 200),
         ];
-        assert_eq!(policy(2, 16).evictions(&entries), vec![1]);
-        assert_eq!(policy(1, 16).evictions(&entries), vec![1, 2]);
-        assert!(policy(3, 16).evictions(&entries).is_empty());
+        assert_eq!(policy(2, 16).evictions(&entries, None), vec![1]);
+        assert_eq!(policy(1, 16).evictions(&entries, None), vec![1, 2]);
+        assert!(policy(3, 16).evictions(&entries, None).is_empty());
     }
 
     /// The default shape is what a create naming nothing asks for, so it
@@ -1556,13 +1577,13 @@ mod shape_tests {
             entry("app", 2, 2048, 1, 100),
             entry("app", 4, 4096, 1, 200),
         ];
-        assert_eq!(policy(2, 16).evictions(&entries), vec![1]);
+        assert_eq!(policy(2, 16).evictions(&entries, None), vec![1]);
         // Even past a cap only pinned shapes would meet.
         let mut pinned = policy(0, 16);
         pinned
             .pinned
             .push(parse_shape("4x4096").unwrap().resolved());
-        assert_eq!(pinned.evictions(&entries), vec![1]);
+        assert_eq!(pinned.evictions(&entries, None), vec![1]);
     }
 
     #[test]
@@ -1573,7 +1594,7 @@ mod shape_tests {
             entry("db", 4, 1024, 1, 400),
             entry("web", 2, 1024, 1, 300),
         ];
-        assert_eq!(policy(4, 2).evictions(&entries), vec![0, 1]);
+        assert_eq!(policy(4, 2).evictions(&entries, None), vec![0, 1]);
     }
 
     #[test]
@@ -1585,10 +1606,10 @@ mod shape_tests {
         ];
         let mut by_template = policy(16, 16);
         by_template.per_template_bytes = 1000;
-        assert_eq!(by_template.evictions(&entries), vec![0]);
+        assert_eq!(by_template.evictions(&entries, None), vec![0]);
         let mut by_node = policy(16, 16);
         by_node.per_node_bytes = 1000;
-        assert_eq!(by_node.evictions(&entries), vec![0, 1]);
+        assert_eq!(by_node.evictions(&entries, None), vec![0, 1]);
     }
 
     /// A build counts its snapshot as the newest, so the caps pick it only
@@ -1602,33 +1623,50 @@ mod shape_tests {
         ];
         let mut policy = policy(16, 16);
         policy.per_template_bytes = 8 << 30;
-        assert_eq!(policy.evictions(&entries), vec![1]);
+        assert_eq!(policy.evictions(&entries, None), vec![1]);
         policy.per_template_bytes = 12 << 30;
-        assert!(policy.evictions(&entries).is_empty());
+        assert!(policy.evictions(&entries, None).is_empty());
     }
 
+    /// A pinned snapshot of a build no tag resolves to is evicted like any
+    /// other, and before a wanted build's.
+    #[test]
+    fn a_build_nobody_wants_keeps_no_pinned_snapshot() {
+        let entries = [
+            entry("old", 1, 512, 6 << 30, 5),
+            entry("new", 1, 512, 6 << 30, 1),
+            entry("new", 2, 1024, 6 << 30, 0),
+        ];
+        let mut policy = policy(16, 16);
+        policy.per_node_bytes = 12 << 30;
+        assert_eq!(policy.evictions(&entries, None), vec![2]);
+        let wanted: std::collections::HashSet<String> = ["new".to_string()].into();
+        assert_eq!(policy.evictions(&entries, Some(&wanted)), vec![0]);
+        assert_eq!(
+            policy.evictions(&entries, Some(&Default::default())),
+            vec![2]
+        );
+    }
+
+    /// A data directory's builds directory, so its warm snapshots are beside
+    /// it and nobody else's.
     fn temp(name: &str) -> PathBuf {
-        let dir = std::env::temp_dir().join(format!(
-            "burrow-warm-{name}-{}",
-            uuid::Uuid::new_v4().simple()
-        ));
+        let dir = std::env::temp_dir()
+            .join(format!(
+                "burrow-warm-{name}-{}",
+                uuid::Uuid::new_v4().simple()
+            ))
+            .join("builds");
         std::fs::create_dir_all(&dir).unwrap();
         dir
     }
 
-    /// A snapshot of its template's current kernel, which is written too.
     fn write_snapshot(dir: &Path, format: &str, shape: &str) {
-        use sha2::Digest as _;
         std::fs::create_dir_all(dir).unwrap();
         for file in Hypervisor::Firecracker.layout().files().chain([ROOT_DISK]) {
             std::fs::write(dir.join(file), b"x").unwrap();
         }
-        let template_kernel = dir.parent().unwrap().parent().unwrap().join("vmlinux");
-        if !template_kernel.exists() {
-            std::fs::write(&template_kernel, b"kernel").unwrap();
-        }
-        let digest = sha2::Sha256::digest(std::fs::read(&template_kernel).unwrap());
-        std::fs::write(dir.join(KERNEL_FILE), hex::encode(digest)).unwrap();
+        std::fs::write(dir.join(KERNEL_FILE), "kernel").unwrap();
         std::fs::write(dir.join(HYPERVISOR_FILE), "firecracker").unwrap();
         std::fs::write(dir.join(GUEST_OS_FILE), "linux").unwrap();
         std::fs::write(dir.join(BYTES_FILE), "1").unwrap();
@@ -1687,7 +1725,7 @@ mod shape_tests {
         );
         assert_eq!(list(&templates, "app").await.len(), 2);
         assert!(stale(&templates, "app").await.is_empty());
-        let _ = std::fs::remove_dir_all(&templates);
+        let _ = std::fs::remove_dir_all(templates.parent().unwrap());
     }
 
     /// A snapshot with a file gone is broken and discarded, but not once a
@@ -1722,7 +1760,7 @@ mod shape_tests {
         std::fs::remove_file(live.join(ROOT_DISK)).unwrap();
         assert!(discard_broken(&broken).await.unwrap());
         assert!(!live.exists());
-        let _ = std::fs::remove_dir_all(&templates);
+        let _ = std::fs::remove_dir_all(templates.parent().unwrap());
     }
 
     /// A snapshot whose restored guest never came up is discarded, but not
@@ -1753,7 +1791,7 @@ mod shape_tests {
         assert!(discard_restored(&live, &restored).await.unwrap());
         assert!(!live.exists());
         assert!(!discard_restored(&live, &restored).await.unwrap());
-        let _ = std::fs::remove_dir_all(&templates);
+        let _ = std::fs::remove_dir_all(templates.parent().unwrap());
     }
 
     /// A memory or state file cut short, or overwritten with another size,
@@ -1786,7 +1824,7 @@ mod shape_tests {
         write_snapshot(&live, WARM_FORMAT, "2 2048 1324 0");
         std::fs::remove_file(live.join(SIZES_FILE)).unwrap();
         assert!(read_warm(&live, None).await.is_none());
-        let _ = std::fs::remove_dir_all(&templates);
+        let _ = std::fs::remove_dir_all(templates.parent().unwrap());
     }
 
     #[test]
@@ -1822,7 +1860,7 @@ mod shape_tests {
         std::fs::write(dir.join(GUEST_OS_FILE), "windows").unwrap();
         let linux_only = Agents::from([(burrow_vmm::GuestOs::Linux, "new".to_string())]);
         assert!(read_warm(&dir, Some(&linux_only)).await.is_some());
-        let _ = std::fs::remove_dir_all(&templates);
+        let _ = std::fs::remove_dir_all(templates.parent().unwrap());
     }
 
     /// A snapshot in another format is stale and discarded.
@@ -1840,11 +1878,9 @@ mod shape_tests {
             stale(&templates, "app").await,
             vec![warm.join("firecracker-4x4096")]
         );
-        let _ = std::fs::remove_dir_all(&templates);
+        let _ = std::fs::remove_dir_all(templates.parent().unwrap());
     }
 
-    /// A template rebuilt with another kernel boots that kernel, so a
-    /// snapshot of the old one is stale and rebuilt.
     /// A snapshot of a firmware guest carries the firmware it booted, so a
     /// template with no kernel at all still has a current snapshot, and a
     /// restore links the snapshot's firmware rather than anything of the
@@ -1854,7 +1890,7 @@ mod shape_tests {
         let templates = temp("firmware");
         let live = warm_dir(&templates, "win").join("firecracker-2x4096");
         write_snapshot(&live, WARM_FORMAT, "2 4096 25600 4096");
-        std::fs::remove_file(templates.join("win").join(crate::boot::KERNEL)).unwrap();
+        std::fs::create_dir_all(templates.join("win")).unwrap();
         std::fs::write(live.join(crate::boot::FIRMWARE), b"edk2").unwrap();
         std::fs::write(templates.join("win").join(IMAGE), b"image").unwrap();
         let wanted = Shape {
@@ -1881,41 +1917,7 @@ mod shape_tests {
             b"edk2"
         );
         assert!(!workdir.join(crate::boot::KERNEL).exists());
-        let _ = std::fs::remove_dir_all(&templates);
-    }
-
-    #[tokio::test]
-    async fn a_snapshot_of_another_kernel_is_stale() {
-        let templates = temp("kernel");
-        let warm = warm_dir(&templates, "app");
-        let live = warm.join("firecracker-1x512");
-        write_snapshot(&live, WARM_FORMAT, "1 512 1324 512");
-        let wanted = Shape {
-            vcpus: 1,
-            mem_mib: 512,
-            disk_mib: 1324,
-            max_mem_mib: 512,
-        };
-        assert!(
-            find(&templates, "app", Hypervisor::Firecracker, wanted)
-                .await
-                .is_some()
-        );
-
-        let template_kernel = templates.join("app").join("vmlinux");
-        std::fs::remove_file(&template_kernel).unwrap();
-        std::fs::write(&template_kernel, b"another kernel").unwrap();
-        assert!(
-            find(&templates, "app", Hypervisor::Firecracker, wanted)
-                .await
-                .is_none()
-        );
-        assert_eq!(stale(&templates, "app").await, vec![live.clone()]);
-        assert_eq!(
-            find_broken(&templates, "app", Hypervisor::Firecracker, wanted).await,
-            Some(live)
-        );
-        let _ = std::fs::remove_dir_all(&templates);
+        let _ = std::fs::remove_dir_all(templates.parent().unwrap());
     }
 
     /// Answers RootDisk, recording the op it was asked for.

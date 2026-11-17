@@ -240,15 +240,14 @@ pub async fn plan(
     let base = match request.from.as_str() {
         "" => None,
         from => {
-            crate::template::validate_name(from)?;
-            let dir = crate::template::templates_dir(data_dir).join(from);
-            match tokio::fs::try_exists(&dir).await.unwrap_or(false) {
-                true => Some(
-                    crate::oci::image_environment(data_dir, from)
+            let key = crate::template::key_of(from)?;
+            match crate::template::read_manifest(data_dir, &key).await {
+                Some(_) => Some(
+                    crate::oci::image_environment(data_dir, &key)
                         .await
                         .hypervisor,
                 ),
-                false => None,
+                None => None,
             }
         }
     };
@@ -313,7 +312,7 @@ pub fn plan_with(
                 ));
             }
         };
-        crate::template::validate_name(&request.name)?;
+        burrow_common::build::validate_name(&request.name).map_err(Status::invalid_argument)?;
         return Ok(Some(MacBuild {
             name: request.name.clone(),
             source: MacSource::Install { ipsw, disk_mib },
@@ -361,11 +360,11 @@ pub fn plan_with(
     if request.is_systemd {
         return invalid("a macOS template has no systemd mode".into());
     }
-    crate::template::validate_name(&request.name)?;
+    burrow_common::build::validate_name(&request.name).map_err(Status::invalid_argument)?;
     Ok(Some(MacBuild {
         name: request.name.clone(),
         source: MacSource::Template {
-            from: from.clone(),
+            from: crate::template::key_of(from)?,
             steps: request
                 .steps
                 .iter()
@@ -379,8 +378,8 @@ pub fn plan_with(
     }))
 }
 
-/// Builds `plan` beside its final name and renames it into place, so a scan
-/// never lists a half-built machine and a failed rebuild leaves the old one.
+/// Builds `plan` beside the builds and publishes it under its digest, so a
+/// scan never lists a half-built machine.
 #[cfg(target_os = "macos")]
 pub async fn build(
     manager: &crate::sandbox::SandboxManager,
@@ -389,14 +388,13 @@ pub async fn build(
     plan: MacBuild,
     guest_binary: &Path,
     tx: &crate::template::LogTx,
-) -> Result<(), Status> {
+) -> Result<crate::template::Built, Status> {
     manager.require_hypervisor(burrow_vmm::Hypervisor::Vz)?;
-    let templates = crate::template::templates_dir(data_dir);
-    let building = templates.join(format!(".{}.building", plan.name));
-    let _ = tokio::fs::remove_dir_all(&building).await;
+    let building = crate::template::staging_dir(data_dir, "macos").await?;
+    let _ = tokio::fs::remove_dir(&building).await;
     let started = std::time::Instant::now();
-    let built = match &plan.source {
-        MacSource::Install { ipsw, disk_mib } => {
+    let (built, parent) = match &plan.source {
+        MacSource::Install { ipsw, disk_mib } => (
             install(
                 manager,
                 data_dir,
@@ -407,13 +405,14 @@ pub async fn build(
                 guest_binary,
                 tx,
             )
-            .await
-        }
+            .await,
+            String::new(),
+        ),
         MacSource::Template {
             from,
             steps,
             allow_domains,
-        } => {
+        } => (
             derive(
                 manager,
                 node_id,
@@ -424,35 +423,33 @@ pub async fn build(
                 &building,
                 tx,
             )
-            .await
-        }
+            .await,
+            from.clone(),
+        ),
     };
     let published = match built {
-        Ok(()) => publish(&templates, &plan.name, &building).await,
+        Ok(()) => publish(data_dir, &building).await,
         Err(err) => Err(err),
     };
-    if let Err(err) = published {
-        let _ = tokio::fs::remove_dir_all(&building).await;
-        return Err(err);
-    }
-    let size_bytes =
-        tokio::fs::metadata(templates.join(&plan.name).join(burrow_vmm::vz::DISK_FILE))
-            .await
-            .map_or(0, |meta| meta.len());
+    let (key, manifest) = match published {
+        Ok(published) => published,
+        Err(err) => {
+            let _ = tokio::fs::remove_dir_all(&building).await;
+            return Err(err);
+        }
+    };
     tracing::info!(
         template = plan.name,
+        build = key,
         secs = started.elapsed().as_secs(),
         "macOS template ready"
     );
-    let _ = tx
-        .send(crate::template::event(api::build_log::Event::Done(
-            api::BuildDone {
-                template: plan.name,
-                size_bytes,
-            },
-        )))
-        .await;
-    Ok(())
+    Ok(crate::template::Built {
+        name: plan.name,
+        key,
+        manifest,
+        parent,
+    })
 }
 
 #[cfg(not(target_os = "macos"))]
@@ -463,7 +460,7 @@ pub async fn build(
     _: MacBuild,
     _: &Path,
     _: &crate::template::LogTx,
-) -> Result<(), Status> {
+) -> Result<crate::template::Built, Status> {
     Err(Status::failed_precondition(
         "macOS templates are built on a Mac node offering vz; this node cannot install or boot \
          macOS",
@@ -487,32 +484,63 @@ async fn step(tx: &crate::template::LogTx, step: String) {
         .await;
 }
 
-/// Records what the template runs on and renames it into place.
+/// Publishes an installed machine as a build.
 #[cfg(target_os = "macos")]
-async fn publish(templates: &Path, name: &str, building: &Path) -> Result<(), Status> {
-    let failed =
-        |err: std::io::Error| Status::internal(format!("publishing template {name}: {err}"));
+async fn publish(
+    data_dir: &Path,
+    building: &Path,
+) -> Result<(String, burrow_common::build::Manifest), Status> {
+    let manifest = machine_manifest(building, crate::warm::shipped_agent(GuestOs::MacOs)).await?;
+    let key = crate::template::publish(data_dir, building, &manifest).await?;
+    Ok((key, manifest))
+}
+
+/// The manifest of an installed machine in `dir`: its disk and the files
+/// that make it this machine, each hashed once.
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+pub(crate) async fn machine_manifest(
+    dir: &Path,
+    agent: String,
+) -> Result<burrow_common::build::Manifest, Status> {
+    let failed = |err: std::io::Error| Status::internal(format!("describing the machine: {err}"));
     let environment = crate::oci::ImageEnvironment {
         hypervisor: burrow_vmm::Hypervisor::Vz.to_string(),
         guest_os: GuestOs::MacOs.as_str().to_string(),
         ..Default::default()
     };
-    let environment = serde_json::to_vec(&environment)
-        .map_err(|err| Status::internal(format!("image config: {err}")))?;
-    tokio::fs::write(building.join("image.json"), environment)
-        .await
-        .map_err(failed)?;
-    let dir = templates.join(name);
-    if tokio::fs::try_exists(&dir).await.unwrap_or(false) {
-        let old = templates.join(format!(".{name}.old"));
-        let _ = tokio::fs::remove_dir_all(&old).await;
-        tokio::fs::rename(&dir, &old).await.map_err(failed)?;
-        tokio::fs::rename(building, &dir).await.map_err(failed)?;
-        tokio::fs::remove_dir_all(&old).await.map_err(failed)?;
-    } else {
-        tokio::fs::rename(building, &dir).await.map_err(failed)?;
+    let disk = dir.join(DISK);
+    let bytes = tokio::fs::metadata(&disk).await.map_err(failed)?.len();
+    let digest = crate::blobs::hash_file(&disk).await.map_err(failed)?;
+    let mut files = std::collections::BTreeMap::new();
+    let mut entries = tokio::fs::read_dir(dir).await.map_err(failed)?;
+    while let Some(entry) = entries.next_entry().await.map_err(failed)? {
+        let name = entry.file_name().to_string_lossy().into_owned();
+        if name == DISK
+            || name == crate::template::MANIFEST
+            || !entry.file_type().await.map_err(failed)?.is_file()
+        {
+            continue;
+        }
+        let digest = crate::blobs::hash_file(&entry.path())
+            .await
+            .map_err(failed)?;
+        files.insert(name, digest.to_string());
     }
-    Ok(())
+    Ok(burrow_common::build::Manifest {
+        version: burrow_common::build::MANIFEST_VERSION,
+        rootfs: burrow_common::build::Artifact {
+            file: DISK.to_string(),
+            digest: digest.to_string(),
+            bytes,
+        },
+        files,
+        config: serde_json::to_value(&environment)
+            .map_err(|err| Status::internal(format!("image config: {err}")))?,
+        hypervisor: environment.hypervisor.clone(),
+        guest_os: environment.guest_os.clone(),
+        agent,
+        ..Default::default()
+    })
 }
 
 /// Installs the restore image into `building`, boots it once with
@@ -741,6 +769,7 @@ async fn derive(
             Default::default(),
             node_id.to_string(),
             None,
+            String::new(),
             String::new(),
             String::new(),
         )
@@ -1506,8 +1535,9 @@ mod tests {
 
     #[test]
     fn a_build_on_a_vz_template_runs_its_steps_in_a_clone() {
+        let base = "a".repeat(64);
         let derived = api::BuildTemplateRequest {
-            from: "macos-27".into(),
+            from: format!("sha256:{base}"),
             steps: vec![
                 api::BuildStep {
                     run: " brew install git ".into(),
@@ -1521,7 +1551,7 @@ mod tests {
             Some(MacBuild {
                 name: "macos-dev".into(),
                 source: MacSource::Template {
-                    from: "macos-27".into(),
+                    from: base,
                     steps: vec!["brew install git".into()],
                     allow_domains: vec![],
                 },

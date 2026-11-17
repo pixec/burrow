@@ -490,6 +490,7 @@ message Sandbox {
   // Guest address, so the orchestrator can tell nodes which remote addresses
   // belong to a shared private network.
   string guest_ip = 8;
+  // The template as the caller named it, for display.
   string template = 3;
   SandboxState state = 4;
   Policy policy = 5;
@@ -598,6 +599,10 @@ message Sandbox {
   WindowsActivation activation = 41;
   // It has a TPM of its own, as its template asked when it was created.
   bool is_tpm = 42;
+  // The build it was created from, `sha256:<hex>`: its identity, where
+  // `template` is what the caller named it by. Empty for a sandbox created
+  // before builds.
+  string build_digest = 43;
 }
 
 message WindowsActivation {
@@ -791,6 +796,9 @@ message Snapshot {
   int64 created_at_unix_ms = 18;
   // 0 means the snapshot does not expire.
   int64 expires_at_unix_ms = 19;
+  // The build its sandbox ran, `sha256:<hex>`. Empty for a snapshot taken
+  // before builds.
+  string build_digest = 22;
 }
 
 message NodeInfo {
@@ -950,12 +958,12 @@ message NodeStatus {
   uint32 running_sandboxes = 1;
   uint64 free_mem_mib = 2;
   bool is_draining = 4;
-  // Templates this node holds. Images are node-local, so placement has to
-  // know where they are rather than assuming every node is interchangeable.
-  repeated string templates = 5;
-  // The subset of `templates` imported from Kits, whose creates the node
+  // Builds this node holds, `sha256:<hex>`. Placement prefers a node that
+  // holds the build a create asks for.
+  repeated string builds = 5;
+  // The subset of `builds` imported from Kits, whose creates the node
   // provisions through the Kit lifecycle.
-  repeated string kit_templates = 7;
+  repeated string kit_builds = 7;
   // Volumes on this node, including those a Kit's lifecycle created on it,
   // which the orchestrator never saw a request for.
   repeated Volume volumes = 8;
@@ -970,12 +978,12 @@ message NodeStatus {
   // thousandths of a CPU: each sandbox's `cpus` where set, else its vcpus.
   // Free memory alone hides a node that is memory-rich and cpu-saturated.
   uint64 committed_cpu_millis = 17;
-  // The hypervisor each of `templates` runs under here, so placement charges
-  // a create the memory ceiling of the VMM it will get.
-  map<string, string> template_hypervisors = 18;
-  // The kernel each of `templates` boots here, so placement can tell which
-  // can give a guest what it asks for, such as nested virtualization.
-  map<string, Kernel> template_kernels = 19;
+  // The hypervisor each of `builds` runs under, so placement charges a
+  // create the memory ceiling of the VMM it will get.
+  map<string, string> build_hypervisors = 18;
+  // The kernel each of `builds` boots, so placement can tell which can give
+  // a guest what it asks for, such as nested virtualization.
+  map<string, Kernel> build_kernels = 19;
   // Unix milliseconds when this node's object-store collector last finished
   // a pass; 0 before the first, and on a node without an object store.
   int64 gc_succeeded_at_unix_ms = 20;
@@ -984,11 +992,12 @@ message NodeStatus {
   string gc_error = 21;
 }
 
-// A warm snapshot of one template at one machine shape. A create of that
-// template asking for these vCPUs and this memory restores it instead of
+// A warm snapshot of one build at one machine shape. A create of that
+// build asking for these vCPUs and this memory restores it instead of
 // booting.
 message WarmShape {
-  string template = 1;
+  // `sha256:<hex>`.
+  string build_digest = 1;
   // The shape it was taken at. A create asking for a bigger root disk than
   // `disk_mib` restores it and grows the disk; one asking for less boots.
   ResourcePolicy resources = 2;
@@ -1000,6 +1009,8 @@ message WarmShape {
   bool is_pinned = 5;
   // The node holding it, filled in by the orchestrator.
   string node_id = 6;
+  // The template the build belongs to, filled in by the orchestrator.
+  string template = 7;
 }
 
 // The data directory's filesystem, reported like memory. A total of 0 is a

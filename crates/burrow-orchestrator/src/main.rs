@@ -1,5 +1,6 @@
 mod admission;
 mod api;
+mod builds;
 mod chunkfleet;
 mod cluster;
 mod collect;
@@ -211,6 +212,8 @@ pub struct OrchestratorState {
     pub admission: admission::Admission,
     /// Labels a create activating Windows with the caller's license needs.
     pub byol_node_labels: std::collections::HashMap<String, String>,
+    /// The builds tags resolve to, as last read from the store.
+    pub tagged: builds::Tagged,
 }
 
 /// Makes `pool` the fleet's sandbox address pool, refusing when the store
@@ -471,7 +474,10 @@ impl NodeRegistry for NodeRegistryService {
             let _ = cluster::reload_nodes(&self.0, store).await;
         }
         let known = match reconciled.is_applied {
-            true => self.0.nodes.heartbeat(&req.node_id, status, req.info),
+            true => {
+                builds::note_builds(&self.0, &req.node_id, &status).await;
+                self.0.nodes.heartbeat(&req.node_id, status, req.info)
+            }
             false => self.0.nodes.knows(&req.node_id),
         };
         if !known {
@@ -580,6 +586,7 @@ impl NodeRegistry for NodeRegistryService {
         // The peer list and cross-node membership ride on the heartbeat, so a
         // node converges on the current fleet without a separate subscription.
         Ok(Response::new(nodepb::HeartbeatResponse {
+            warm_builds: builds::tagged(&self.0).await,
             is_reregistration_required: !known,
             peers: self.0.nodes.mesh_peers(&req.node_id),
             network_members: self.0.sandboxes.network_members(&req.node_id),
@@ -1180,6 +1187,7 @@ async fn run(args: Args) -> anyhow::Result<()> {
             quarantine_secs: args.ip_quarantine_secs.max(0),
         },
         admission: admission::Admission::new(args.node_concurrency),
+        tagged: Default::default(),
         byol_node_labels: args
             .byol_node_labels
             .iter()

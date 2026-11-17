@@ -131,7 +131,7 @@ pub fn mem_charge_mib(
     };
     let hypervisor = match hypervisor {
         "" => status
-            .template_hypervisors
+            .build_hypervisors
             .get(template)
             .map_or("", String::as_str),
         named => named,
@@ -246,10 +246,10 @@ fn kernel_gap<'a>(
         }
     }
     if want.is_kvm_kernel_needed && entry.is_reported {
-        let held = entry.status.template_kernels.get(&want.template);
+        let held = entry.status.build_kernels.get(&want.template);
         let kernel = held.or_else(|| {
             let mut nodes = nodes;
-            nodes.find_map(|e| e.status.template_kernels.get(&want.template))
+            nodes.find_map(|e| e.status.build_kernels.get(&want.template))
         });
         let is_kvm = kernel
             .and_then(|k| k.capabilities)
@@ -579,7 +579,7 @@ fn holds_warm(entry: &NodeEntry, want: &Placement) -> bool {
         mem => mem,
     };
     entry.status.warm_shapes.iter().any(|shape| {
-        shape.template == want.template
+        shape.build_digest == want.template
             && shape.resources.as_ref().is_some_and(|resources| {
                 resources.vcpus == want.vcpus.max(1) && u64::from(resources.mem_mib) == mem_mib
             })
@@ -1164,7 +1164,7 @@ impl NodeRegistry {
                     // A node that has not reported yet is given the benefit of
                     // the doubt; one that has is taken at its word.
                     || !e.is_reported
-                    || e.status.templates.contains(&want.template)
+                    || e.status.builds.contains(&want.template)
             })
             .collect();
         if with_template.is_empty() {
@@ -1407,16 +1407,16 @@ impl NodeRegistry {
         hosts
     }
 
-    /// Whether a node already reports holding `template`.
+    /// Whether a node already reports holding the build `template`.
     ///
-    /// Read from the node's last heartbeat, so a template imported since then
-    /// reads as absent and the transfer is a no-op the node resolves itself.
+    /// Read from the node's last heartbeat, so a build pulled since then
+    /// reads as absent and the pull is a no-op the node resolves itself.
     pub fn has_template(&self, node_id: &str, template: &str) -> bool {
         self.nodes
             .lock()
             .unwrap()
             .get(node_id)
-            .is_some_and(|e| e.status.templates.iter().any(|t| t == template))
+            .is_some_and(|e| e.status.builds.iter().any(|t| t == template))
     }
 
     /// Whether a node reports `template` as imported from Kits.
@@ -1425,20 +1425,40 @@ impl NodeRegistry {
             .lock()
             .unwrap()
             .get(node_id)
-            .is_some_and(|e| e.status.kit_templates.iter().any(|t| t == template))
+            .is_some_and(|e| e.status.kit_builds.iter().any(|t| t == template))
     }
 
-    /// A healthy node holding `template`, to copy it from.
+    /// A healthy node holding the build `template`, to copy it from.
     ///
-    /// Any node with the artifacts will do: they are content-addressed, so
+    /// Any node holding it will do: a build is named by its contents, so
     /// every copy is the same copy. Draining nodes are eligible, since they
     /// refuse new sandboxes, not reads.
     pub fn source_for_template(&self, template: &str) -> Option<(String, String)> {
         let nodes = self.nodes.lock().unwrap();
         nodes
             .values()
-            .find(|e| e.is_healthy() && e.status.templates.iter().any(|t| t == template))
+            .find(|e| e.is_healthy() && e.status.builds.iter().any(|t| t == template))
             .map(|e| (e.info.id.clone(), e.info.address.clone()))
+    }
+
+    /// Every known node's id and last status.
+    pub fn statuses(&self) -> Vec<(String, NodeStatus)> {
+        self.nodes
+            .lock()
+            .unwrap()
+            .values()
+            .map(|e| (e.info.id.clone(), e.status.clone()))
+            .collect()
+    }
+
+    /// The builds a node last reported holding, `None` before it reports.
+    pub fn builds_of(&self, node_id: &str) -> Option<Vec<String>> {
+        self.nodes
+            .lock()
+            .unwrap()
+            .get(node_id)
+            .filter(|e| e.is_reported)
+            .map(|e| e.status.builds.clone())
     }
 
     /// Records a drain decision immediately, rather than waiting for the
@@ -1641,11 +1661,11 @@ mod tests {
 
     fn status(templates: &[&str], warm: &[&str], free_mem_mib: u64) -> NodeStatus {
         NodeStatus {
-            templates: templates.iter().map(|t| (*t).to_string()).collect(),
+            builds: templates.iter().map(|t| (*t).to_string()).collect(),
             warm_shapes: warm
                 .iter()
                 .map(|t| burrow_proto::common::v1::WarmShape {
-                    template: (*t).to_string(),
+                    build_digest: (*t).to_string(),
                     resources: Some(burrow_proto::common::v1::ResourcePolicy {
                         vcpus: 1,
                         mem_mib: 512,
@@ -2827,8 +2847,7 @@ mod tests {
             ..Default::default()
         };
         let holding = NodeStatus {
-            template_hypervisors: [("alpine-ch".to_string(), "cloud-hypervisor".to_string())]
-                .into(),
+            build_hypervisors: [("alpine-ch".to_string(), "cloud-hypervisor".to_string())].into(),
             ..status(&["alpine-ch"], &[], 64_000)
         };
         let registry = registry(&[("holder", holding.clone())]);
@@ -2942,7 +2961,7 @@ mod tests {
             ..Default::default()
         };
         let mut fc = status(&["t"], &[], 64_000);
-        fc.template_kernels.insert("t".into(), kernel(false));
+        fc.build_kernels.insert("t".into(), kernel(false));
         let registry = registry(&[("fc", fc)]);
         registry
             .nodes
@@ -2970,7 +2989,7 @@ mod tests {
         assert_eq!(registry.place_for(&plain).unwrap(), "fc");
 
         let mut ch = status(&["t"], &[], 1_000);
-        ch.template_kernels.insert("t".into(), kernel(true));
+        ch.build_kernels.insert("t".into(), kernel(true));
         add_nested_node(&registry, "ch", ch);
         assert_eq!(registry.place_for(&nested).unwrap(), "ch");
     }

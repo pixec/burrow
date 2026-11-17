@@ -398,6 +398,21 @@ impl NodeApi {
         Ok((req.user, req.group, agent))
     }
 
+    /// The directory key of the build `digest` names, refused when this node
+    /// does not hold it.
+    async fn held_build(&self, digest: &str) -> Result<String, Status> {
+        let key = crate::template::key_of(digest)?;
+        if crate::template::read_manifest(&self.data_dir, &key)
+            .await
+            .is_none()
+        {
+            return Err(Status::not_found(format!(
+                "build {digest} is not on this node"
+            )));
+        }
+        Ok(key)
+    }
+
     /// The environment an imported image declared, if this template came from
     /// one. A template not imported from an image has none.
     async fn image_environment(&self, template: &str) -> crate::oci::ImageEnvironment {
@@ -429,6 +444,7 @@ impl NodeApi {
     ) -> Result<common::Sandbox, Status> {
         let KitCreate {
             id,
+            build,
             template,
             kit,
             credentials,
@@ -453,12 +469,13 @@ impl NodeApi {
             self.sandboxes
                 .create(
                     id.clone(),
-                    template,
+                    build,
                     policy,
                     tags,
                     self.node_id(),
                     name,
                     request_id,
+                    template,
                 )
                 .await?;
             let provisioned = async {
@@ -488,6 +505,9 @@ impl NodeApi {
 /// What a Kit sandbox is created from.
 struct KitCreate {
     id: String,
+    /// The build, by directory key.
+    build: String,
+    /// The template as the caller named it.
     template: String,
     kit: common::KitSpec,
     credentials: HashMap<String, String>,
@@ -573,12 +593,15 @@ impl NodeService for NodeApi {
         }
         self.sandboxes.require_checkpointable(&policy)?;
         burrow_common::tags::validate(&req.tags)?;
+        let build = match req.snapshot.is_empty() {
+            true => self.held_build(&req.build_digest).await?,
+            false => String::new(),
+        };
         // A template imported from Kits is provisioned through their
         // lifecycle whether or not the caller passed inputs.
         if req.snapshot.is_empty()
-            && let Some(recorded) = self.image_environment(&req.template).await.kit
+            && let Some(recorded) = self.image_environment(&build).await.kit
         {
-            crate::template::validate_name(&req.template)?;
             if req.is_remote_desktop_enabled || req.activation.is_some() {
                 return Err(Status::invalid_argument(
                     "remote desktop and activation are for windows guests",
@@ -586,6 +609,7 @@ impl NodeService for NodeApi {
             }
             let request = KitCreate {
                 id: req.sandbox_id,
+                build,
                 template: req.template,
                 kit: req.kit.unwrap_or_default(),
                 credentials: req.credentials,
@@ -606,19 +630,16 @@ impl NodeService for NodeApi {
             validate_activation(activation)?;
         }
         let mut sandbox = if req.snapshot.is_empty() {
-            // The template names a directory under `images/`, and a create is
-            // the one path that reaches it with a string the orchestrator
-            // passed straight through from a tenant.
-            crate::template::validate_name(&req.template)?;
             self.sandboxes
                 .create(
                     req.sandbox_id,
-                    req.template,
+                    build,
                     policy,
                     req.tags,
                     self.node_id(),
                     req.name,
                     req.request_id,
+                    req.template,
                 )
                 .await?
         } else {
@@ -932,15 +953,22 @@ impl NodeService for NodeApi {
         let id = req.sandbox_id;
         let mut previous = self.sandboxes.get(&id).await?.record();
         let mut policy = previous.policy.take().unwrap_or_default();
-        let template = if req.template.is_empty() {
-            std::mem::take(&mut previous.template)
+        let (template, template_ref) = if req.build_digest.is_empty() {
+            (
+                crate::template::key_of(&previous.build_digest).map_err(|_| {
+                    Status::failed_precondition(format!(
+                        "sandbox {id} predates builds; recreate it from a template"
+                    ))
+                })?,
+                std::mem::take(&mut previous.template),
+            )
         } else {
-            req.template
+            (self.held_build(&req.build_digest).await?, req.template)
         };
-        crate::template::validate_name(&template)?;
         let Some(recorded) = self.image_environment(&template).await.kit else {
             let replacement = crate::sandbox::Replacement {
                 template,
+                template_ref,
                 policy,
                 keep: req.keep,
             };
@@ -980,6 +1008,7 @@ impl NodeService for NodeApi {
         validate_policy(&policy)?;
         let replacement = crate::sandbox::Replacement {
             template,
+            template_ref,
             policy,
             keep: req.keep,
         };
@@ -1378,7 +1407,7 @@ impl NodeService for NodeApi {
         for template in &mut templates {
             template.warm_shapes = warm
                 .iter()
-                .filter(|shape| shape.template == template.name)
+                .filter(|shape| shape.build_digest == template.digest)
                 .cloned()
                 .collect();
         }
@@ -1389,7 +1418,8 @@ impl NodeService for NodeApi {
         &self,
         req: Request<api::DeleteTemplateRequest>,
     ) -> Result<Response<api::DeleteTemplateResponse>, Status> {
-        crate::template::delete(&self.data_dir, &req.into_inner().name).await?;
+        self.sandboxes.delete_build(&req.into_inner().name).await?;
+        self.sandboxes.announce_now();
         Ok(Response::new(api::DeleteTemplateResponse {}))
     }
 
@@ -1398,9 +1428,7 @@ impl NodeService for NodeApi {
         req: Request<nodepb::TemplateManifestRequest>,
     ) -> Result<Response<nodepb::TemplateManifest>, Status> {
         let req = req.into_inner();
-        let manifest =
-            crate::template::distribute::manifest(&self.data_dir, &req.name, req.is_config_only)
-                .await?;
+        let manifest = crate::template::distribute::manifest(&self.data_dir, &req.digest).await?;
         Ok(Response::new(manifest))
     }
 
@@ -1444,13 +1472,11 @@ impl NodeService for NodeApi {
         let manifest = req
             .manifest
             .ok_or_else(|| Status::invalid_argument("manifest is required"))?;
-        // A template whose hypervisor this node does not run is one it could
+        // A build whose hypervisor this node does not run is one it could
         // hold and never boot. Refused before a byte is copied.
-        let environment: crate::oci::ImageEnvironment = match manifest.image_config.as_str() {
-            "" => Default::default(),
-            config => serde_json::from_str(config)
-                .map_err(|err| Status::invalid_argument(format!("image config: {err}")))?,
-        };
+        let verified = crate::template::distribute::verify(&manifest)?;
+        let environment: crate::oci::ImageEnvironment = serde_json::from_value(verified.config)
+            .map_err(|err| Status::invalid_argument(format!("image config: {err}")))?;
         let (hypervisor, _) = environment.machine()?;
         self.sandboxes.require_hypervisor(hypervisor)?;
         let (bytes_transferred, blobs_reused) = crate::template::distribute::pull(
@@ -1463,10 +1489,9 @@ impl NodeService for NodeApi {
         // The point of pulling was to be placed on; say so at once.
         self.sandboxes.announce_now();
         // The snapshot is the one artifact that does not travel, so a node
-        // that received a template warms it itself. Never blocks the pull.
-        // Anything already here was captured on the rootfs this pull replaced.
-        self.sandboxes.invalidate_warm(&manifest.name).await;
-        self.sandboxes.warm_template(&manifest.name);
+        // that received a build warms it itself. Never blocks the pull.
+        self.sandboxes
+            .warm_template(&crate::template::key_of(&manifest.digest)?);
         Ok(Response::new(nodepb::PullTemplateResponse {
             bytes_transferred,
             blobs_reused,

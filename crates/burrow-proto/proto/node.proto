@@ -103,9 +103,8 @@ service NodeService {
   rpc ListTemplates(burrow.api.v1.ListTemplatesRequest) returns (burrow.api.v1.ListTemplatesResponse);
   rpc DeleteTemplate(burrow.api.v1.DeleteTemplateRequest) returns (burrow.api.v1.DeleteTemplateResponse);
 
-  // Template distribution. A template is only runnable on the node that built
-  // it until its artifacts are copied elsewhere; these three RPCs are what
-  // move them.
+  // Build distribution, by digest. A build is only runnable on a node that
+  // holds it; these three RPCs copy one from a peer.
   rpc GetTemplateManifest(TemplateManifestRequest) returns (TemplateManifest);
   rpc FetchBlob(BlobRequest) returns (stream BlobChunk);
   rpc PullTemplate(PullTemplateRequest) returns (PullTemplateResponse);
@@ -161,6 +160,7 @@ message NodeDetachIpRequest {
 message NodeCreateRequest {
   // The orchestrator owns the id namespace and assigns it.
   string sandbox_id = 1;
+  // What the caller named the template by, kept for display.
   string template = 2;
   burrow.common.v1.Policy policy = 3;
   map<string, string> tags = 4;
@@ -187,6 +187,9 @@ message NodeCreateRequest {
   // A Windows guest's license: the product key, resolved from its secret,
   // is installed once and dropped; the KMS host is kept on the sandbox.
   NodeActivation activation = 12;
+  // The build to boot, `sha256:<hex>`, resolved by the orchestrator. Empty
+  // for a create from a snapshot, which carries its own.
+  string build_digest = 13;
 }
 
 message NodeActivation {
@@ -202,6 +205,8 @@ message NodeRecreateRequest {
   map<string, string> credentials = 4;
   // Absolute paths copied from the old root disk to the new one.
   repeated string keep = 5;
+  // The build `template` resolved to; empty keeps the current one.
+  string build_digest = 6;
 }
 
 message NodeCreateSnapshotRequest {
@@ -218,31 +223,19 @@ message NodeListSnapshotsRequest {
   string sandbox_id = 1;
 }
 
-// What a template is made of, named by content so a node can tell what it
-// already has without transferring anything.
+// A build, by its digest and canonical manifest. The manifest names every
+// artifact by content, so a node can tell what it already has without
+// transferring anything, and verifies the manifest against the digest.
 //
 // Warm snapshots are deliberately absent: they encode host cpu features and
-// the exact firecracker version, so the receiving node builds its own.
+// the exact hypervisor version, so the receiving node builds its own.
 message TemplateManifest {
-  string name = 1;
-  string kernel_digest = 2;
-  string rootfs_digest = 3;
-  uint64 rootfs_bytes = 4;
-  // The image config an imported template carries (`image.json`): the
-  // environment and working directory the image declared. Carried inline
-  // rather than as a blob because it is a few hundred bytes, and a node that
-  // received a template without it would silently run sandboxes with no PATH,
-  // no WORKDIR, and no idea which trust bundles the image points its tooling
-  // at. Empty for a template that has none.
-  string image_config = 5;
+  string digest = 1;
+  string manifest = 2;
 }
 
 message TemplateManifestRequest {
-  string name = 1;
-  // Return only `image_config`, leaving the digests empty. Hashing a rootfs
-  // is seconds of work a caller that wants the recorded config has no use
-  // for.
-  bool is_config_only = 2;
+  string digest = 1;
 }
 
 message BlobRequest {
@@ -531,6 +524,10 @@ message HeartbeatResponse {
   repeated AccessKey access_keys = 9;
   // Every registered node, healthy or not, reports `is_casync_chunk_store`.
   bool is_fleet_on_casync_chunks = 11;
+  // The builds a tag resolves to now, `sha256:<hex>`. A node warms its
+  // pinned shapes of these, and a warm snapshot of any other build is
+  // evicted like an unpinned one.
+  repeated string warm_builds = 20;
 }
 
 message SandboxGeneration {

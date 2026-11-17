@@ -439,11 +439,11 @@ pub async fn keep_environment(
     tokio::fs::write(workdir.join(SANDBOX_ENVIRONMENT), json).await
 }
 
-pub async fn image_environment(data_dir: &Path, template: &str) -> ImageEnvironment {
-    let path = data_dir.join("images").join(template).join("image.json");
-    match tokio::fs::read(&path).await {
-        Ok(bytes) => serde_json::from_slice(&bytes).unwrap_or_default(),
-        Err(_) => ImageEnvironment::default(),
+/// The image config the build in `key` records in its manifest.
+pub async fn image_environment(data_dir: &Path, key: &str) -> ImageEnvironment {
+    match crate::template::read_manifest(data_dir, key).await {
+        Some(manifest) => serde_json::from_value(manifest.config).unwrap_or_default(),
+        None => ImageEnvironment::default(),
     }
 }
 

@@ -93,6 +93,9 @@ pub struct Manifest {
     pub id: String,
     pub sandbox_id: String,
     pub template: String,
+    /// The build its sandbox ran. Empty for one taken before builds.
+    #[serde(default)]
+    pub build_digest: String,
     pub vcpus: u32,
     pub mem_mib: u32,
     pub disk_mib: u32,
@@ -223,6 +226,7 @@ impl Manifest {
             id: self.id.clone(),
             sandbox_id: self.sandbox_id.clone(),
             template: self.template.clone(),
+            build_digest: self.build_digest.clone(),
             // The orchestrator stamps this from its own view of the fleet.
             node_id: String::new(),
             resources: Some(self.resources(Default::default())),
@@ -354,6 +358,7 @@ pub struct SnapshotStore {
 pub struct Staged {
     pub sandbox_id: String,
     pub template: String,
+    pub build_digest: String,
     pub vcpus: u32,
     pub mem_mib: u32,
     pub boot_mem_mib: u32,
@@ -451,6 +456,7 @@ impl SnapshotStore {
             id: id.to_string(),
             sandbox_id: staged.sandbox_id,
             template: staged.template,
+            build_digest: staged.build_digest,
             vcpus: staged.vcpus,
             mem_mib: staged.mem_mib,
             boot_mem_mib: staged.boot_mem_mib,
@@ -607,8 +613,8 @@ impl SnapshotStore {
     ) -> Result<Option<crate::rootdisk::Image>, Status> {
         let id = &manifest.id;
         let base = self
-            .templates_dir()
-            .join(&manifest.template)
+            .builds_dir()
+            .join(crate::template::key_of(&manifest.build_digest).unwrap_or_default())
             .join(crate::macnode::DISK);
         let image = match tokio::fs::try_exists(&base).await.unwrap_or(false) {
             true => {
@@ -817,7 +823,7 @@ impl SnapshotStore {
         let image = crate::rootdisk::fetch_image(
             remote,
             &self.blobs,
-            &self.templates_dir(),
+            &self.builds_dir(),
             &manifest.rootfs_digest,
         )
         .await?;
@@ -877,7 +883,7 @@ impl SnapshotStore {
                 crate::rootdisk::fetch_image(
                     remote,
                     &self.blobs,
-                    &self.templates_dir(),
+                    &self.builds_dir(),
                     &manifest.rootfs_digest,
                 )
                 .await?,
@@ -1008,10 +1014,10 @@ impl SnapshotStore {
         &self.blobs
     }
 
-    /// Where the node's templates are, whose images a root disk may have
-    /// been cloned from.
-    pub fn templates_dir(&self) -> PathBuf {
-        self.root.with_file_name("images")
+    /// Where the node's builds are, whose images a root disk may have been
+    /// cloned from.
+    pub fn builds_dir(&self) -> PathBuf {
+        self.root.with_file_name("builds")
     }
 
     /// Snapshots in the object store, whether or not this node holds them.
@@ -1561,6 +1567,7 @@ mod tests {
             id: id.into(),
             sandbox_id: sandbox.into(),
             template: "default".into(),
+            build_digest: String::new(),
             vcpus: 2,
             mem_mib: 3072,
             boot_mem_mib: 1024,
@@ -1895,8 +1902,9 @@ mod tests {
             "burrow-snapshots-disk-{}",
             burrow_common::SnapshotId::generate()
         ));
+        let key = "c".repeat(64);
         for data in ["a", "b"] {
-            let template = scratch.join(data).join("images/macos");
+            let template = scratch.join(data).join("builds").join(&key);
             std::fs::create_dir_all(&template).unwrap();
             let base = std::fs::File::create(template.join(crate::macnode::DISK)).unwrap();
             base.set_len(4 << 20).unwrap();
@@ -1907,7 +1915,10 @@ mod tests {
         let dir = taken.begin(&id).await.unwrap();
         let disk = dir.join(crate::macnode::DISK);
         crate::rootdisk::clone(
-            &scratch.join("a/images/macos").join(crate::macnode::DISK),
+            &scratch
+                .join("a/builds")
+                .join(&key)
+                .join(crate::macnode::DISK),
             &disk,
         )
         .await
@@ -1925,6 +1936,7 @@ mod tests {
         let staged = Staged {
             sandbox_id: "sbx_mac".into(),
             template: "macos".into(),
+            build_digest: format!("sha256:{key}"),
             vcpus: 4,
             mem_mib: 8192,
             boot_mem_mib: 8192,
@@ -2031,6 +2043,7 @@ mod tests {
         let staged = Staged {
             sandbox_id: "sbx_a".into(),
             template: "default".into(),
+            build_digest: String::new(),
             vcpus: 1,
             mem_mib: 512,
             boot_mem_mib: 512,

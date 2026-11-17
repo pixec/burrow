@@ -9,7 +9,7 @@ use std::sync::Arc;
 use tokio_stream::{Stream, StreamExt};
 use tonic::{Request, Response, Status};
 
-use burrow_common::hypervisor::{GuestOs, Hypervisor};
+use burrow_common::hypervisor::Hypervisor;
 use burrow_proto::api::v1 as api;
 use burrow_proto::api::v1::burrow_server::Burrow;
 use burrow_proto::common::v1 as common;
@@ -120,7 +120,7 @@ pub async fn connect_node(
 ///
 /// Used by the fan-outs, where one wedged node must not hold up an answer the
 /// rest of the fleet has already given.
-async fn connect_node_unary(
+pub(crate) async fn connect_node_unary(
     endpoint: String,
     token: Option<&str>,
 ) -> Result<NodeClient, tonic::transport::Error> {
@@ -416,7 +416,7 @@ impl ApiService {
                         self.0.nodes.mem_charge_mib(
                             &node_id,
                             &snapshot.hypervisor,
-                            &snapshot.template,
+                            &snapshot.build_digest,
                             u64::from(pick(limits.mem_mib, shape.mem_mib)),
                         ),
                     )
@@ -443,7 +443,10 @@ impl ApiService {
                 )));
             }
             self.bring_volumes(&node_id, &mounts).await?;
-            if !req.template.is_empty() && req.template != snapshot.template {
+            if !req.template.is_empty()
+                && crate::builds::resolve(crate::builds::store(&self.0)?, &req.template).await?
+                    != snapshot.build_digest
+            {
                 return Err(Status::invalid_argument(format!(
                     "snapshot {} was taken of template {:?}; a sandbox created from it \
                      cannot use template {:?}",
@@ -454,15 +457,18 @@ impl ApiService {
                 .sandboxes
                 .write_ahead(
                     &mut reserved,
-                    stub(
-                        &sandbox_id,
-                        &node_id,
-                        &req.name,
-                        &req.tags,
-                        &snapshot.template,
-                        &req.request_id,
-                        req.policy.as_ref(),
-                    ),
+                    common::Sandbox {
+                        build_digest: snapshot.build_digest.clone(),
+                        ..stub(
+                            &sandbox_id,
+                            &node_id,
+                            &req.name,
+                            &req.tags,
+                            &snapshot.template,
+                            &req.request_id,
+                            req.policy.as_ref(),
+                        )
+                    },
                 )
                 .await?;
             let _admitted = self.0.admission.admit(&node_id).await;
@@ -471,6 +477,7 @@ impl ApiService {
                     sandbox_id,
                     request_id: req.request_id,
                     template: snapshot.template.clone(),
+                    build_digest: String::new(),
                     policy: req.policy,
                     tags: req.tags,
                     name: req.name,
@@ -510,6 +517,7 @@ impl ApiService {
             ));
         }
         let template = req.template;
+        let build = crate::builds::resolve(crate::builds::store(&self.0)?, &template).await?;
 
         // Placement is constrained by where the template lives and where any
         // private-network peers already are; both are node-local facts that a
@@ -538,7 +546,7 @@ impl ApiService {
             .map_err(Status::invalid_argument)?;
         }
         let want = crate::registry::Placement {
-            template: template.clone(),
+            template: build.clone(),
             prefer_node: self.0.sandboxes.node_hosting_networks(&networks),
             is_mesh_available: self.0.nodes.is_mesh_available(""),
             vcpus: resources.as_ref().map(|r| r.vcpus).unwrap_or(0).max(1),
@@ -565,8 +573,8 @@ impl ApiService {
             arch: String::new(),
             hypervisor_version: String::new(),
             cpu: None,
-            // The template decides, and the node holding it can say which.
-            hypervisor: self.template_hypervisor(&template).await?,
+            // The build decides.
+            hypervisor: self.template_hypervisor(&build).await?,
             kernel: None,
             policy_features: crate::registry::policy_features(
                 req.policy.as_ref().and_then(|p| p.network.as_ref()),
@@ -626,7 +634,7 @@ impl ApiService {
                 }
                 // The node is not a choice here, so the template has to come to
                 // it rather than the sandbox going where the template is.
-                self.replicate_to(&template, &node_id).await?;
+                self.replicate_to(&build, &node_id).await?;
                 node_id
             }
             None => match self.place(&want).await {
@@ -677,22 +685,25 @@ impl ApiService {
             tags: &req.tags,
         };
         let credentials = self
-            .kit_credentials(&mut client, &node_id, &template, subject)
+            .kit_credentials(&mut client, &node_id, &build, subject)
             .await?;
 
         self.0
             .sandboxes
             .write_ahead(
                 &mut reserved,
-                stub(
-                    &sandbox_id,
-                    &node_id,
-                    &req.name,
-                    &req.tags,
-                    &template,
-                    &req.request_id,
-                    req.policy.as_ref(),
-                ),
+                common::Sandbox {
+                    build_digest: build.clone(),
+                    ..stub(
+                        &sandbox_id,
+                        &node_id,
+                        &req.name,
+                        &req.tags,
+                        &template,
+                        &req.request_id,
+                        req.policy.as_ref(),
+                    )
+                },
             )
             .await?;
         let _admitted = self.0.admission.admit(&node_id).await;
@@ -701,6 +712,7 @@ impl ApiService {
                 sandbox_id,
                 request_id: req.request_id,
                 template,
+                build_digest: build,
                 policy: req.policy,
                 tags: req.tags,
                 name: req.name,
@@ -932,8 +944,8 @@ impl ApiService {
             return Ok(());
         }
         let Some((source_id, source_address)) = self.0.nodes.source_for_template(template) else {
-            return Err(Status::not_found(format!(
-                "no node has template {template:?}; import it with `burrow pull`"
+            return Err(Status::unavailable(format!(
+                "no reachable node holds build {template}"
             )));
         };
         if source_id == target {
@@ -944,8 +956,7 @@ impl ApiService {
             let mut source = self.node_client(&source_id).await?;
             source
                 .get_template_manifest(nodepb::TemplateManifestRequest {
-                    name: template.to_string(),
-                    is_config_only: false,
+                    digest: template.to_string(),
                 })
                 .await?
                 .into_inner()
@@ -966,7 +977,7 @@ impl ApiService {
             to = target,
             bytes = result.bytes_transferred,
             reused = result.blobs_reused,
-            "template replicated to place a sandbox"
+            "build replicated to place a sandbox"
         );
         Ok(())
     }
@@ -1130,29 +1141,16 @@ impl ApiService {
         }))
     }
 
-    /// The hypervisor `template` runs under, from the config a node holding it
-    /// recorded when it was built.
+    /// The hypervisor the build `template` runs under, from its manifest.
     ///
     /// Empty, meaning any, when every healthy node offers the same ones: a
-    /// node only holds a template it can boot, so any holder will do and the
-    /// round trip is not worth paying on every create.
+    /// node only holds a build it can boot.
     async fn template_hypervisor(&self, template: &str) -> Result<String, Status> {
         if self.0.nodes.is_uniform_in_hypervisors() {
             return Ok(String::new());
         }
-        // Placement reports a template no node holds; nothing to ask here.
-        let Some((source_id, _)) = self.0.nodes.source_for_template(template) else {
-            return Ok(String::new());
-        };
-        let mut client = self.node_client(&source_id).await?;
-        let manifest = client
-            .get_template_manifest(nodepb::TemplateManifestRequest {
-                name: template.to_string(),
-                is_config_only: true,
-            })
-            .await?
-            .into_inner();
-        Ok(configured_hypervisor(&manifest.image_config))
+        let manifest = crate::builds::manifest(crate::builds::store(&self.0)?, template).await?;
+        Ok(crate::builds::hypervisor_of(&manifest))
     }
 
     /// The bound secrets for the credential services a Kit template's
@@ -1164,7 +1162,7 @@ impl ApiService {
     /// had not been stored: the descriptor's `optional` then decides.
     async fn kit_credentials(
         &self,
-        client: &mut NodeClient,
+        _client: &mut NodeClient,
         node_id: &str,
         template: &str,
         subject: crate::secrets::Subject<'_>,
@@ -1173,17 +1171,11 @@ impl ApiService {
         if !self.0.nodes.is_kit_template(node_id, template) {
             return Ok(out);
         }
-        let manifest = client
-            .get_template_manifest(nodepb::TemplateManifestRequest {
-                name: template.to_string(),
-                is_config_only: true,
-            })
-            .await?
-            .into_inner();
+        let manifest = crate::builds::manifest(crate::builds::store(&self.0)?, template).await?;
         let Some(secrets) = &self.0.secrets else {
             return Ok(out);
         };
-        for service in burrow_common::kit::credential_services(&manifest.image_config) {
+        for service in burrow_common::kit::credential_services(&manifest.config.to_string()) {
             if let Some(secret) = secrets.get_scoped(&service).await.map_err(internal)?
                 && secret.scope.admits(&subject)
             {
@@ -2028,7 +2020,7 @@ impl ApiService {
         let is_booted = sandbox.checkpoint_at_unix_ms > 0
             && sandbox.checkpoint_kind == common::CheckpointKind::Disk as i32;
         crate::registry::Placement {
-            template: sandbox.template.clone(),
+            template: sandbox.build_digest.clone(),
             prefer_node: self.0.sandboxes.node_hosting_networks(&networks),
             is_mesh_available: self.0.nodes.is_mesh_available(""),
             vcpus: resources.vcpus.max(1),
@@ -2139,7 +2131,7 @@ impl ApiService {
             true => self.0.nodes.mem_charge_mib(
                 &sandbox.node_id,
                 &sandbox.hypervisor,
-                &sandbox.template,
+                &sandbox.build_digest,
                 match resources.mem_mib {
                     0 => 512,
                     mem => mem as u64,
@@ -2433,15 +2425,17 @@ impl Burrow for ApiService {
             .get(&id)
             .ok_or_else(|| Status::not_found(format!("no sandbox {id}")))?;
         let node_id = current.node_id.clone();
-        let judged = if req.template.is_empty() {
-            &current.template
-        } else {
-            &req.template
+        let build = match req.template.is_empty() {
+            true => current.build_digest.clone(),
+            false => crate::builds::resolve(crate::builds::store(&self.0)?, &req.template).await?,
         };
-        // The template has to be where the sandbox is, the one it already
-        // runs included, which the node may since have lost: its disks and
-        // volumes do not move, so the template comes to them.
-        self.replicate_to(judged, &node_id).await?;
+        let judged = &build;
+        // The build has to be where the sandbox is, the one it already runs
+        // included, which the node may since have lost: its disks and volumes
+        // do not move, so the build comes to them.
+        if !judged.is_empty() {
+            self.replicate_to(judged, &node_id).await?;
+        }
         let (mut client, _admitted) = self.admitted_node_for(&id).await?;
         let subject = crate::secrets::Subject {
             id: &id,
@@ -2454,6 +2448,10 @@ impl Burrow for ApiService {
         let sandbox = client
             .recreate_sandbox(nodepb::NodeRecreateRequest {
                 sandbox_id: id,
+                build_digest: match req.template.is_empty() {
+                    true => String::new(),
+                    false => build.clone(),
+                },
                 template: req.template,
                 kit: req.kit,
                 credentials,
@@ -2585,7 +2583,7 @@ impl Burrow for ApiService {
             self.0.nodes.mem_charge_mib(
                 &node_id,
                 &record.hypervisor,
-                &record.template,
+                &record.build_digest,
                 u64::from(mem_mib),
             )
         };
@@ -2780,7 +2778,7 @@ impl Burrow for ApiService {
                 self.0.nodes.mem_charge_mib(
                     &node_id,
                     &source.hypervisor,
-                    &source.template,
+                    &source.build_digest,
                     u64::from(mem_mib),
                 ),
             )
@@ -3509,109 +3507,120 @@ impl Burrow for ApiService {
 
     type BuildTemplateStream = BoxStream<api::BuildLog>;
 
-    /// Builds on one node.
+    /// Builds on one node and records the build.
     ///
-    /// Templates are node-local files, so a build only produces an image on the
-    /// node that ran it; placement pins to nodes that hold it, and copies it
-    /// on demand. See `place_for`.
+    /// The base is resolved to one build first, and the build runs on a node
+    /// holding it. The new build gets a row while it runs, each step it keeps
+    /// one of its own, and the tag moves to it only once it is ready. A
+    /// caller that goes away does not stop the recording.
     async fn build_template(
         &self,
         req: Request<api::BuildTemplateRequest>,
     ) -> Result<Response<Self::BuildTemplateStream>, Status> {
-        let node_id = self
-            .0
-            .nodes
-            .place_for(&build_placement(req.get_ref()))
-            .map_err(placement_status)?;
+        let mut req = req.into_inner();
+        let store = Arc::clone(crate::builds::store(&self.0)?);
+        let (name, tag) = match req.name.is_empty() && !req.kits.is_empty() {
+            true => (String::new(), burrow_common::build::DEFAULT_TAG.to_string()),
+            false => crate::builds::target(&req.name)?,
+        };
+        req.name = name.clone();
+        let is_on_base =
+            req.from_image.is_empty() && req.kits.is_empty() && req.from_ipsw.is_empty();
+        if is_on_base {
+            let from = match req.from.is_empty() {
+                true => "default",
+                false => req.from.as_str(),
+            };
+            req.from = crate::builds::resolve(&store, from).await?;
+        }
+        let want = build_placement(&req);
+        let node_id = match self.0.nodes.place_for(&want) {
+            Ok(node_id) => node_id,
+            Err(crate::registry::PlacementError::TemplateNotOnAnyNode(build)) => {
+                self.replicate_then_place(&build, &want).await?
+            }
+            Err(err) => return Err(placement_status(err)),
+        };
         let mut client = self.node_client(&node_id).await?;
-
-        let stream = client.build_template(req.into_inner()).await?.into_inner();
-        Ok(Response::new(Box::pin(stream)))
+        let mut recorder = crate::builds::Recorder::begin(
+            store,
+            name,
+            tag,
+            node_id,
+            match is_on_base {
+                true => req.from.clone(),
+                false => String::new(),
+            },
+        )
+        .await?;
+        let mut stream = match client.build_template(req).await {
+            Ok(stream) => stream.into_inner(),
+            Err(err) => {
+                recorder.fail(err.message()).await;
+                return Err(err);
+            }
+        };
+        let (tx, rx) = tokio::sync::mpsc::channel(64);
+        tokio::spawn(async move {
+            loop {
+                let item = match stream.message().await {
+                    Ok(Some(mut log)) => match recorder.observe(&log).await {
+                        Ok(()) => {
+                            if let Some(api::build_log::Event::Done(done)) = &mut log.event {
+                                done.template = recorder.reference();
+                            }
+                            Ok(log)
+                        }
+                        Err(err) => {
+                            recorder.fail(err.message()).await;
+                            Err(err)
+                        }
+                    },
+                    Ok(None) => {
+                        recorder.fail("the build ended without a result").await;
+                        break;
+                    }
+                    Err(err) => {
+                        recorder.fail(err.message()).await;
+                        Err(err)
+                    }
+                };
+                let is_err = item.is_err();
+                let _ = tx.send(item).await;
+                if is_err {
+                    break;
+                }
+            }
+        });
+        Ok(Response::new(Box::pin(
+            tokio_stream::wrappers::ReceiverStream::new(rx),
+        )))
     }
 
     async fn list_templates(
         &self,
         _req: Request<api::ListTemplatesRequest>,
     ) -> Result<Response<api::ListTemplatesResponse>, Status> {
-        // Reported per node and merged, since an image built on one node does
-        // not exist on the others.
-        let mut seen: std::collections::BTreeMap<String, api::TemplateInfo> =
-            std::collections::BTreeMap::new();
-        // Dialled together rather than one after another: sequentially, this
-        // costs the sum of the fleet's round trips.
-        let polled = futures::future::join_all(reachable_nodes(&self.0).into_iter().map(
-            |(node_id, endpoint)| async move {
-                let mut client = connect_node_unary(endpoint, self.0.node_token.as_deref())
-                    .await
-                    .ok()?;
-                let resp = client
-                    .list_templates(api::ListTemplatesRequest {})
-                    .await
-                    .ok()?;
-                Some((node_id, resp))
-            },
-        ))
-        .await;
-        for (node_id, resp) in polled.into_iter().flatten() {
-            for mut template in resp.into_inner().templates {
-                for shape in &mut template.warm_shapes {
-                    shape.node_id = node_id.clone();
-                }
-                match seen.get_mut(&template.name) {
-                    // Merged rather than overwritten. A warm snapshot is
-                    // node-local, so one node holding the template cold says
-                    // nothing about another holding it warm, and letting the
-                    // last node polled win reported a template as cold while a
-                    // create from it restored in milliseconds. Warm anywhere is
-                    // the answer that matches what placement does with it,
-                    // since placement prefers a node that has one.
-                    Some(existing) => {
-                        existing.is_warm |= template.is_warm;
-                        existing.warm_shapes.extend(template.warm_shapes);
-                        existing.size_bytes = existing.size_bytes.max(template.size_bytes);
-                    }
-                    None => {
-                        seen.insert(template.name.clone(), template);
-                    }
-                }
-            }
-        }
         Ok(Response::new(api::ListTemplatesResponse {
-            templates: seen.into_values().collect(),
+            templates: crate::builds::list(&self.0).await?,
         }))
+    }
+
+    async fn get_template(
+        &self,
+        req: Request<api::GetTemplateRequest>,
+    ) -> Result<Response<api::TemplateDetail>, Status> {
+        Ok(Response::new(
+            crate::builds::detail(&self.0, &req.into_inner().name).await?,
+        ))
     }
 
     async fn delete_template(
         &self,
         req: Request<api::DeleteTemplateRequest>,
     ) -> Result<Response<api::DeleteTemplateResponse>, Status> {
-        let req = req.into_inner();
-        let mut removed = false;
-        let mut last_error = None;
-        // A template can be on any number of nodes, so every node is asked,
-        // and asked at once.
-        let outcomes = futures::future::join_all(reachable_nodes(&self.0).into_iter().map({
-            let req = &req;
-            move |(_, endpoint)| async move {
-                let mut client = connect_node_unary(endpoint, self.0.node_token.as_deref())
-                    .await
-                    .ok()?;
-                Some(client.delete_template(req.clone()).await)
-            }
-        }))
-        .await;
-        for outcome in outcomes.into_iter().flatten() {
-            match outcome {
-                Ok(_) => removed = true,
-                Err(err) if err.code() == tonic::Code::NotFound => {}
-                Err(err) => last_error = Some(err),
-            }
-        }
-        match (removed, last_error) {
-            (true, _) => Ok(Response::new(api::DeleteTemplateResponse {})),
-            (false, Some(err)) => Err(err),
-            (false, None) => Err(Status::not_found(format!("no template {}", req.name))),
-        }
+        crate::builds::delete(&self.0, &req.into_inner().name).await?;
+        Ok(Response::new(api::DeleteTemplateResponse {}))
     }
 
     async fn expose_port(
@@ -4237,19 +4246,6 @@ fn drop_cpuset(sandbox: &mut common::Sandbox) {
     }
 }
 
-/// The hypervisor a template's `image.json` records: the one it was built
-/// for, or its guest's default where it names none.
-fn configured_hypervisor(image_config: &str) -> String {
-    let config: serde_json::Value = serde_json::from_str(image_config).unwrap_or_default();
-    match config["hypervisor"].as_str() {
-        Some(name) if !name.is_empty() => name.to_string(),
-        _ => GuestOs::from_record(config["guest_os"].as_str().unwrap_or_default())
-            .unwrap_or_default()
-            .default_hypervisor()
-            .to_string(),
-    }
-}
-
 fn validate_sandbox_id(id: &str) -> Result<(), Status> {
     if id.len() > 63 {
         return Err(Status::invalid_argument(
@@ -4551,22 +4547,6 @@ fn target_let_go(err: &Status) -> bool {
 pub(crate) mod tests {
     use super::*;
 
-    /// What a template was built for decides placement, and a template
-    /// that names none gets its guest's default.
-    #[test]
-    fn a_templates_hypervisor_is_read_from_its_config() {
-        assert_eq!(
-            configured_hypervisor(r#"{"env":[],"hypervisor":"cloud-hypervisor"}"#),
-            "cloud-hypervisor"
-        );
-        assert_eq!(configured_hypervisor(r#"{"env":[]}"#), "firecracker");
-        assert_eq!(configured_hypervisor(""), "firecracker");
-        assert_eq!(
-            configured_hypervisor(r#"{"guest_os":"windows"}"#),
-            "cloud-hypervisor"
-        );
-    }
-
     pub(crate) fn replica(sandboxes: crate::sandboxes::SandboxRegistry) -> ApiService {
         ApiService(Arc::new(OrchestratorState {
             nodes: crate::registry::NodeRegistry::default(),
@@ -4587,6 +4567,7 @@ pub(crate) mod tests {
             ips: Default::default(),
             admission: Default::default(),
             byol_node_labels: Default::default(),
+            tagged: Default::default(),
         }))
     }
 
@@ -5734,25 +5715,41 @@ mod create_tests {
                 .add_service(node)
                 .serve_with_incoming(tonic::transport::server::TcpIncoming::from(listener)),
         );
-        let api = super::tests::replica(crate::sandboxes::SandboxRegistry::in_memory().await);
+        let store = Arc::new(burrow_store::Store::open_in_memory().await.unwrap());
+        let mut api = super::tests::replica(
+            crate::sandboxes::SandboxRegistry::open(Arc::clone(&store))
+                .await
+                .unwrap(),
+        );
+        let build = format!("sha256:{}", "b".repeat(64));
+        store
+            .put_ready_build(&burrow_store::BuildRow {
+                id: "b1".into(),
+                digest: build.clone(),
+                template: "t".into(),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        store.assign_tag("t", "latest", &build, 1).await.unwrap();
         let info = common::NodeInfo {
             id: "n1".into(),
             address: addr.to_string(),
             ..Default::default()
         };
+        let status = common::NodeStatus {
+            builds: vec![build],
+            free_mem_mib: 1 << 20,
+            ..Default::default()
+        };
+        let row = crate::cluster::node_row(&info, &status, "", "");
+        store.register_node(&row, None, 64).await.unwrap();
+        Arc::get_mut(&mut api.0).unwrap().store = Some(store);
         api.0
             .nodes
             .register(info, String::new(), String::new(), None)
             .unwrap();
-        api.0.nodes.heartbeat(
-            "n1",
-            common::NodeStatus {
-                templates: vec!["t".into()],
-                free_mem_mib: 1 << 20,
-                ..Default::default()
-            },
-            None,
-        );
+        api.0.nodes.heartbeat("n1", status, None);
         (api, calls)
     }
 
@@ -5885,7 +5882,7 @@ mod create_tests {
         api.0.nodes.heartbeat(
             "n1",
             common::NodeStatus {
-                templates: vec!["t".into()],
+                builds: vec!["t".into()],
                 free_mem_mib: 256,
                 ..Default::default()
             },

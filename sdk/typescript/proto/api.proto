@@ -132,6 +132,8 @@ service Burrow {
   // Templates: build a reusable guest image by running steps in a sandbox.
   rpc BuildTemplate(BuildTemplateRequest) returns (stream BuildLog);
   rpc ListTemplates(ListTemplatesRequest) returns (ListTemplatesResponse);
+  // One template's builds, tag history and the nodes holding each build.
+  rpc GetTemplate(GetTemplateRequest) returns (TemplateDetail);
   rpc DeleteTemplate(DeleteTemplateRequest) returns (DeleteTemplateResponse);
 
   // Ports: publish a guest port on the node's address.
@@ -372,9 +374,11 @@ message BuildStep {
 }
 
 message BuildTemplateRequest {
-  // Name the finished image is published under.
+  // Template the finished build is tagged under: `name` (`name:latest`) or
+  // `name:tag`. The tag moves to the build only once it is ready.
   string name = 1;
-  // Template to start from, as imported by a pull. Required unless
+  // Template to start from: `name`, `name:tag`, `name@sha256:<hex>` or
+  // `sha256:<hex>`, resolved to one build before the build starts. Required unless
   // `from_image`, `kits` or `from_ipsw` takes its place: burrow has no
   // built-in image to fall back on, and choosing one would boot something the
   // caller did not ask for.
@@ -427,6 +431,12 @@ message BuildTemplateRequest {
 message BuildDone {
   string template = 1;
   uint64 size_bytes = 2;
+  // The build, `sha256:<hex>`: the digest of `manifest`.
+  string digest = 3;
+  // The canonical manifest, as JSON.
+  string manifest = 4;
+  // The build this one was made from, for a build with steps.
+  string parent_digest = 5;
 }
 
 message BuildLog {
@@ -436,6 +446,9 @@ message BuildLog {
     bytes stdout = 2;
     bytes stderr = 3;
     BuildDone done = 4;
+    // A step finished: its result kept as an untagged build, the layer a
+    // rebuild with the same steps on the same base resumes from.
+    BuildDone layer = 5;
   }
 }
 
@@ -460,13 +473,65 @@ message TemplateInfo {
   // The kernel its sandboxes boot. Empty for a template booted from
   // firmware or installed whole (Windows, macOS).
   burrow.common.v1.Kernel kernel = 9;
+  // The tag this row is for; empty for a build no tag points at yet, such
+  // as one still building or one that failed.
+  string tag = 10;
+  // The build, `sha256:<hex>`; empty for one still building.
+  string digest = 11;
+  // "building", "ready" or "failed".
+  string status = 12;
+  int64 created_at_unix_ms = 13;
 }
 
+// One row per tag, pointing at the build it resolves to, plus the latest
+// build of each template that is building or failed after it.
 message ListTemplatesResponse {
   repeated TemplateInfo templates = 1;
 }
 
+message GetTemplateRequest {
+  string name = 1;
+}
+
+message TemplateBuild {
+  string digest = 1;
+  // "building", "ready", "failed" or "dropped".
+  string status = 2;
+  string parent_digest = 3;
+  int64 created_at_unix_ms = 4;
+  int64 finished_at_unix_ms = 5;
+  uint64 size_bytes = 6;
+  string hypervisor = 7;
+  string guest_os = 8;
+  // Tags that currently resolve to it.
+  repeated string tags = 9;
+  // Nodes that last reported holding it.
+  repeated string node_ids = 10;
+  // Why it failed.
+  string error = 11;
+  // Its warm snapshots, by node and shape.
+  repeated burrow.common.v1.WarmShape warm_shapes = 12;
+  // The node it was built on.
+  string built_on = 13;
+}
+
+message TagAssignment {
+  string tag = 1;
+  string digest = 2;
+  int64 assigned_at_unix_ms = 3;
+}
+
+message TemplateDetail {
+  string name = 1;
+  // Oldest first.
+  repeated TemplateBuild builds = 2;
+  // Every assignment kept, oldest first.
+  repeated TagAssignment tag_history = 3;
+}
+
 message DeleteTemplateRequest {
+  // `name` deletes the template and every tag; `name:tag` removes one tag.
+  // Builds left untagged are dropped by retention once nothing uses them.
   string name = 1;
 }
 

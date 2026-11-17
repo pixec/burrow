@@ -917,19 +917,19 @@ async fn current_status(sandboxes: &SandboxManager, data_dir: &std::path::Path) 
     let mut sys = sysinfo::System::new();
     sys.refresh_memory();
 
-    let mut templates = Vec::new();
-    let mut kit_templates = Vec::new();
-    let mut template_hypervisors = std::collections::HashMap::new();
-    let mut template_kernels = std::collections::HashMap::new();
-    for template in crate::template::bootable(data_dir).await {
-        if template.is_kit {
-            kit_templates.push(template.name.clone());
+    let mut builds = Vec::new();
+    let mut kit_builds = Vec::new();
+    let mut build_hypervisors = std::collections::HashMap::new();
+    let mut build_kernels = std::collections::HashMap::new();
+    for build in crate::template::bootable(data_dir).await {
+        if build.is_kit {
+            kit_builds.push(build.digest.clone());
         }
-        template_hypervisors.insert(template.name.clone(), template.hypervisor);
-        if let Some(kernel) = template.kernel {
-            template_kernels.insert(template.name.clone(), kernel);
+        build_hypervisors.insert(build.digest.clone(), build.hypervisor);
+        if let Some(kernel) = build.kernel {
+            build_kernels.insert(build.digest.clone(), kernel);
         }
-        templates.push(template.name);
+        builds.push(build.digest);
     }
     // sysinfo undercounts on macOS; see `macnode::available_memory`.
     #[cfg(target_os = "macos")]
@@ -943,10 +943,10 @@ async fn current_status(sandboxes: &SandboxManager, data_dir: &std::path::Path) 
         running_sandboxes: sandboxes.count().await as u32,
         free_mem_mib: avail / (1024 * 1024),
         warm_shapes: sandboxes.warm_shapes().await,
-        templates,
-        kit_templates,
-        template_hypervisors,
-        template_kernels,
+        builds,
+        kit_builds,
+        build_hypervisors,
+        build_kernels,
         is_draining: sandboxes.is_draining(),
         // Suspended sandboxes count: they hold their address, disks and
         // snapshot, and resuming must not find the node oversubscribed.
@@ -1194,6 +1194,7 @@ async fn registration_loop(
                     }
                     crate::migrate::set_fleet_upgraded(resp.is_fleet_on_casync_chunks);
                     crate::access::apply_keys(&access_keys, &resp.access_keys);
+                    sandboxes.set_warm_wanted(&resp.warm_builds);
                     apply_edge_denial(
                         &sandboxes,
                         &[

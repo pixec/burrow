@@ -99,6 +99,9 @@ pub struct Manifest {
     pub placement: u64,
     pub state: String,
     pub template: String,
+    /// The build it was created from. Empty for one from before builds.
+    #[serde(default)]
+    pub build_digest: String,
     pub vcpus: u32,
     pub mem_mib: u32,
     pub disk_mib: u32,
@@ -809,7 +812,7 @@ pub async fn stage(
         let image = crate::rootdisk::fetch_image(
             store,
             snapshots.blobs(),
-            &snapshots.templates_dir(),
+            &snapshots.builds_dir(),
             &manifest.rootfs_digest,
         )
         .await?;
@@ -1102,7 +1105,7 @@ pub async fn stage_disk(
         let image = crate::rootdisk::fetch_image(
             store,
             snapshots.blobs(),
-            &snapshots.templates_dir(),
+            &snapshots.builds_dir(),
             &manifest.rootfs_digest,
         )
         .await?;
@@ -1402,6 +1405,7 @@ pub(crate) mod tests {
             placement: 1,
             state: state.into(),
             template: "alpine".into(),
+            build_digest: String::new(),
             vcpus: 1,
             mem_mib: 512,
             boot_mem_mib: 512,
@@ -1617,7 +1621,7 @@ pub(crate) mod tests {
         use std::os::unix::fs::FileExt as _;
         let (store, _, objects) = crate::objstore::fake::controlled().await;
         let root = std::env::temp_dir().join(format!("burrow-mac-{}", uuid::Uuid::new_v4()));
-        let template = root.join("data-a/images/macos");
+        let template = root.join("data-a/builds").join("c".repeat(64));
         std::fs::create_dir_all(&template).unwrap();
         let base = std::fs::File::create(template.join(crate::macnode::DISK)).unwrap();
         base.set_len(4 << 20).unwrap();
@@ -1676,7 +1680,7 @@ pub(crate) mod tests {
             HashMap::new(),
         );
         collect_garbage(&store, &collector).await.unwrap();
-        let other = root.join("data-b/images/macos");
+        let other = root.join("data-b/builds").join("c".repeat(64));
         std::fs::create_dir_all(&other).unwrap();
         crate::rootdisk::clone(
             &template.join(crate::macnode::DISK),

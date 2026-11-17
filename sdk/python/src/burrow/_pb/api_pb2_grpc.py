@@ -327,6 +327,11 @@ class BurrowStub(object):
                 request_serializer=api__pb2.ListTemplatesRequest.SerializeToString,
                 response_deserializer=api__pb2.ListTemplatesResponse.FromString,
                 _registered_method=True)
+        self.GetTemplate = channel.unary_unary(
+                '/burrow.api.v1.Burrow/GetTemplate',
+                request_serializer=api__pb2.GetTemplateRequest.SerializeToString,
+                response_deserializer=api__pb2.TemplateDetail.FromString,
+                _registered_method=True)
         self.DeleteTemplate = channel.unary_unary(
                 '/burrow.api.v1.Burrow/DeleteTemplate',
                 request_serializer=api__pb2.DeleteTemplateRequest.SerializeToString,
@@ -799,6 +804,13 @@ class BurrowServicer(object):
         context.set_details('Method not implemented!')
         raise NotImplementedError('Method not implemented!')
 
+    def GetTemplate(self, request, context):
+        """One template's builds, tag history and the nodes holding each build.
+        """
+        context.set_code(grpc.StatusCode.UNIMPLEMENTED)
+        context.set_details('Method not implemented!')
+        raise NotImplementedError('Method not implemented!')
+
     def DeleteTemplate(self, request, context):
         """Missing associated documentation comment in .proto file."""
         context.set_code(grpc.StatusCode.UNIMPLEMENTED)
@@ -1178,6 +1190,11 @@ def add_BurrowServicer_to_server(servicer, server):
                     servicer.ListTemplates,
                     request_deserializer=api__pb2.ListTemplatesRequest.FromString,
                     response_serializer=api__pb2.ListTemplatesResponse.SerializeToString,
+            ),
+            'GetTemplate': grpc.unary_unary_rpc_method_handler(
+                    servicer.GetTemplate,
+                    request_deserializer=api__pb2.GetTemplateRequest.FromString,
+                    response_serializer=api__pb2.TemplateDetail.SerializeToString,
             ),
             'DeleteTemplate': grpc.unary_unary_rpc_method_handler(
                     servicer.DeleteTemplate,
@@ -2808,6 +2825,33 @@ class Burrow(object):
             '/burrow.api.v1.Burrow/ListTemplates',
             api__pb2.ListTemplatesRequest.SerializeToString,
             api__pb2.ListTemplatesResponse.FromString,
+            options,
+            channel_credentials,
+            insecure,
+            call_credentials,
+            compression,
+            wait_for_ready,
+            timeout,
+            metadata,
+            _registered_method=True)
+
+    @staticmethod
+    def GetTemplate(request,
+            target,
+            options=(),
+            channel_credentials=None,
+            call_credentials=None,
+            insecure=False,
+            compression=None,
+            wait_for_ready=None,
+            timeout=None,
+            metadata=None):
+        return grpc.experimental.unary_unary(
+            request,
+            target,
+            '/burrow.api.v1.Burrow/GetTemplate',
+            api__pb2.GetTemplateRequest.SerializeToString,
+            api__pb2.TemplateDetail.FromString,
             options,
             channel_credentials,
             insecure,

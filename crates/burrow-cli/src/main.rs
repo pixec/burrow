@@ -279,10 +279,11 @@ enum Command {
         /// are a Docker Sandbox Kit set, composed into one template.
         #[arg(required = true)]
         images: Vec<String>,
-        /// Template name. Defaults to the image's repository name with its
-        /// tag appended (`python:3.12-slim` is `python-3.12-slim`), leaving
-        /// off `latest` and digests; for a kit set, a name derived from its
-        /// digests.
+        /// Template to publish the build under, `name` or `name:tag`.
+        /// Defaults to the image's repository name and tag
+        /// (`python:3.12-slim` is template `python`, tag `3.12-slim`), a
+        /// digest reference to the repository name; for a kit set, a name
+        /// derived from its digests.
         #[arg(long)]
         name: Option<String>,
         /// Boot the image's own systemd under the agent. The image has to
@@ -1719,22 +1720,27 @@ fn parse_pairs(
 
 #[derive(Subcommand)]
 enum TemplatesCommand {
-    /// List templates, with the shapes (VCPUSxMEM_MIB) each is warm at.
+    /// List templates: each tag and the build it resolves to, with the
+    /// shapes (VCPUSxMEM_MIB) it is warm at.
     Ls {
         /// One row per warm snapshot instead: node, shape, disk and last use.
         #[arg(long)]
         warm: bool,
     },
+    /// Show a template's builds, its tag history and which nodes hold each
+    /// build.
+    Show { name: String },
     /// Import an OCI image as a template, e.g. `python:3.12-slim`.
     Import {
         /// Image references: [registry/]repository[:tag|@digest]. Several
         /// are a Docker Sandbox Kit set, composed into one template.
         #[arg(required = true)]
         images: Vec<String>,
-        /// Template name. Defaults to the image's repository name with its
-        /// tag appended (`python:3.12-slim` is `python-3.12-slim`), leaving
-        /// off `latest` and digests; for a kit set, a name derived from its
-        /// digests.
+        /// Template to publish the build under, `name` or `name:tag`.
+        /// Defaults to the image's repository name and tag
+        /// (`python:3.12-slim` is template `python`, tag `3.12-slim`), a
+        /// digest reference to the repository name; for a kit set, a name
+        /// derived from its digests.
         #[arg(long)]
         name: Option<String>,
         /// Boot the image's own systemd under the agent. The image has to
@@ -1757,9 +1763,10 @@ enum TemplatesCommand {
     /// Build a template: steps run on another template, or macOS installed
     /// from a restore image on a Mac node.
     Build {
-        /// Template name.
+        /// Template to publish the build under, `name` or `name:tag`.
         name: String,
-        /// Template to start from.
+        /// Template to start from: `name`, `name:tag` or
+        /// `name@sha256:<digest>`.
         #[arg(long, conflicts_with = "from_ipsw")]
         from: Option<String>,
         /// macOS restore image to install, as a path on the Mac node or
@@ -1796,7 +1803,8 @@ enum TemplatesCommand {
         #[arg(long = "allow-domain")]
         allow_domains: Vec<String>,
     },
-    /// Remove a template.
+    /// Remove a template, or one tag of it as `name:tag`. Builds no tag
+    /// keeps are dropped once nothing uses them.
     Rm { name: String },
 }
 
@@ -2889,6 +2897,9 @@ async fn main() -> anyhow::Result<()> {
         }
         Command::Templates(TemplatesCommand::Ls { warm: true }) => {
             list_warm_shapes(&mut client).await?
+        }
+        Command::Templates(TemplatesCommand::Show { name }) => {
+            show_template(&mut client, name).await?
         }
         Command::Templates(TemplatesCommand::Import {
             images,
@@ -4681,8 +4692,8 @@ async fn list_templates(client: &mut Client) -> anyhow::Result<()> {
         return Ok(());
     }
     println!(
-        "{:<24} {:>10}  {:<7}  {:<16}  {:<28}  WARM",
-        "TEMPLATE", "SIZE", "INIT", "HYPERVISOR", "KERNEL"
+        "{:<24} {:<16} {:<19}  {:<8} {:>10}  {:<7}  {:<16}  WARM",
+        "TEMPLATE", "TAG", "BUILD", "STATUS", "SIZE", "INIT", "HYPERVISOR"
     );
     for template in resp.templates {
         let mut shapes: Vec<(u32, u32)> = template
@@ -4701,22 +4712,80 @@ async fn list_templates(client: &mut Client) -> anyhow::Result<()> {
                 .collect::<Vec<_>>()
                 .join(","),
         };
-        let kernel = match &template.kernel {
-            Some(kernel) => format!("{} {}", kernel.name, kernel.version),
-            None => "-".to_string(),
-        };
         println!(
-            "{:<24} {:>9}M  {:<7}  {:<16}  {:<28}  {}",
-            template.name,
+            "{:<24} {:<16} {:<19}  {:<8} {:>9}M  {:<7}  {:<16}  {}",
+            truncate(&template.name, 24),
+            or_dash(&template.tag),
+            or_dash(&short_digest(&template.digest)),
+            template.status,
             template.size_bytes / (1024 * 1024),
             if template.is_systemd {
                 "systemd"
             } else {
                 "agent"
             },
-            template.hypervisor,
-            kernel,
+            or_dash(&template.hypervisor),
             warm,
+        );
+    }
+    Ok(())
+}
+
+fn or_dash(value: &str) -> &str {
+    if value.is_empty() { "-" } else { value }
+}
+
+/// `sha256:` and the first 12 hex digits of a build digest.
+fn short_digest(digest: &str) -> String {
+    match digest.strip_prefix("sha256:") {
+        Some(hex) if hex.len() > 12 => format!("sha256:{}", &hex[..12]),
+        _ => digest.to_string(),
+    }
+}
+
+async fn show_template(client: &mut Client, name: String) -> anyhow::Result<()> {
+    let detail = client
+        .get_template(api::GetTemplateRequest { name })
+        .await?
+        .into_inner();
+    println!("template {}", detail.name);
+    println!();
+    println!(
+        "{:<19}  {:<8} {:<20} {:<24} {:>10}  {:<16}  NODES",
+        "BUILD", "STATUS", "TAGS", "CREATED", "SIZE", "HYPERVISOR"
+    );
+    for build in &detail.builds {
+        let tags = build.tags.join(",");
+        let nodes = build.node_ids.join(",");
+        println!(
+            "{:<19}  {:<8} {:<20} {:<24} {:>9}M  {:<16}  {}",
+            or_dash(&short_digest(&build.digest)),
+            build.status,
+            or_dash(&tags),
+            rfc3339_from_unix_ms(build.created_at_unix_ms),
+            build.size_bytes / (1024 * 1024),
+            or_dash(&build.hypervisor),
+            or_dash(&nodes),
+        );
+        if !build.error.is_empty() {
+            println!("    failed: {}", build.error);
+        }
+        for shape in &build.warm_shapes {
+            let resources = shape.resources.clone().unwrap_or_default();
+            println!(
+                "    warm on {} at {}x{}",
+                shape.node_id, resources.vcpus, resources.mem_mib
+            );
+        }
+    }
+    println!();
+    println!("{:<16} {:<19}  ASSIGNED", "TAG", "BUILD");
+    for assignment in &detail.tag_history {
+        println!(
+            "{:<16} {:<19}  {}",
+            assignment.tag,
+            short_digest(&assignment.digest),
+            rfc3339_from_unix_ms(assignment.assigned_at_unix_ms),
         );
     }
     Ok(())
@@ -4740,20 +4809,22 @@ async fn list_warm_shapes(client: &mut Client) -> anyhow::Result<()> {
         let resources = shape.resources.clone().unwrap_or_default();
         (
             shape.template.clone(),
+            shape.build_digest.clone(),
             shape.node_id.clone(),
             resources.vcpus,
             resources.mem_mib,
         )
     });
     println!(
-        "{:<24} {:<16} {:<10} {:>8} {:>8}  {:<24}  PINNED",
-        "TEMPLATE", "NODE", "SHAPE", "DISK", "SIZE", "LAST USED"
+        "{:<24} {:<19}  {:<16} {:<10} {:>8} {:>8}  {:<24}  PINNED",
+        "TEMPLATE", "BUILD", "NODE", "SHAPE", "DISK", "SIZE", "LAST USED"
     );
     for shape in shapes {
         let resources = shape.resources.clone().unwrap_or_default();
         println!(
-            "{:<24} {:<16} {:<10} {:>7}M {:>7}M  {:<24}  {}",
-            shape.template,
+            "{:<24} {:<19}  {:<16} {:<10} {:>7}M {:>7}M  {:<24}  {}",
+            truncate(&shape.template, 24),
+            short_digest(&shape.build_digest),
             shape.node_id,
             format!("{}x{}", resources.vcpus, resources.mem_mib),
             resources.disk_mib,
@@ -4765,14 +4836,14 @@ async fn list_warm_shapes(client: &mut Client) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Template name for an image reference that did not come with `--name`.
+/// Template and tag for an image reference that did not come with `--name`.
 ///
-/// The last path segment plus the tag, so `python:3.12-slim` and `python:3.13`
-/// are different templates rather than the second silently replacing the
-/// first. `latest` is left off, because a name ending in `-latest` says
-/// nothing and is what most people type first.
+/// The last path segment is the template and the image's tag its tag, so
+/// `python:3.12-slim` and `python:3.13` are two tags of one template rather
+/// than the second moving the first. `latest` is the default tag and is left
+/// off.
 ///
-/// A digest reference keeps the bare segment: a name carrying 64 hex
+/// A digest reference keeps the bare segment: a tag carrying 64 hex
 /// characters is not one anybody would type, and `--name` is the answer when
 /// two digests of one repository have to coexist.
 fn template_name_for(image: &str) -> String {
@@ -4789,7 +4860,7 @@ fn template_name_for(image: &str) -> String {
     let repo = if repo.is_empty() { "imported" } else { repo };
     match tag {
         Some(tag) if !has_digest && !tag.is_empty() && tag != "latest" => {
-            format!("{repo}-{tag}")
+            format!("{repo}:{tag}")
         }
         _ => repo.to_string(),
     }
@@ -4834,10 +4905,12 @@ async fn import_template(
             | Some(api::build_log::Event::Stderr(bytes)) => {
                 print!("{}", String::from_utf8_lossy(&bytes));
             }
+            Some(api::build_log::Event::Layer(layer)) => println!("  kept {}", layer.digest),
             Some(api::build_log::Event::Done(done)) => println!(
-                "imported {image} as template {} ({}MiB)",
+                "imported {image} as template {} ({}MiB)\n{}",
                 done.template,
-                done.size_bytes / (1024 * 1024)
+                done.size_bytes / (1024 * 1024),
+                done.digest
             ),
             None => {}
         }
@@ -4858,11 +4931,13 @@ async fn build_template(
             | Some(api::build_log::Event::Stderr(bytes)) => {
                 print!("{}", String::from_utf8_lossy(&bytes));
             }
+            Some(api::build_log::Event::Layer(layer)) => println!("==> kept {}", layer.digest),
             Some(api::build_log::Event::Done(done)) => println!(
-                "built template {} ({}MiB) in {}s",
+                "built template {} ({}MiB) in {}s\n{}",
                 done.template,
                 done.size_bytes / (1024 * 1024),
-                started.elapsed().as_secs()
+                started.elapsed().as_secs(),
+                done.digest
             ),
             None => {}
         }
@@ -4955,6 +5030,7 @@ fn print_config(sandbox: &common::Sandbox) {
         );
     }
     field("template", &sandbox.template);
+    field("build", &sandbox.build_digest);
     if let Some(kernel) = &sandbox.kernel {
         field(
             "kernel",
@@ -6018,6 +6094,7 @@ fn sandbox_json(sandbox: &common::Sandbox) -> String {
         "agent_unconfirmed": sandbox.is_agent_unconfirmed,
         "node": sandbox.node_id,
         "template": sandbox.template,
+        "build_digest": sandbox.build_digest,
         "kernel": sandbox.kernel.as_ref().map(|kernel| serde_json::json!({
             "name": kernel.name,
             "version": kernel.version,
@@ -6624,15 +6701,15 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// Two tags of one repository are two templates. Before this, both
-    /// `python:3.12-slim` and `python:3.13` imported as `python`, and the
-    /// second silently replaced the first.
+    /// An image's tag is the template's tag, so `python:3.12-slim` and
+    /// `python:3.13` are two tags of one template rather than the second
+    /// moving the first.
     #[test]
     fn an_imported_template_is_named_after_its_repository_and_tag() {
         let name = super::template_name_for;
-        assert_eq!(name("python:3.12-slim"), "python-3.12-slim");
-        assert_eq!(name("python:3.13"), "python-3.13");
-        assert_eq!(name("ghcr.io/org/tool:v1"), "tool-v1");
+        assert_eq!(name("python:3.12-slim"), "python:3.12-slim");
+        assert_eq!(name("python:3.13"), "python:3.13");
+        assert_eq!(name("ghcr.io/org/tool:v1"), "tool:v1");
 
         // `latest` says nothing, and is what most people type first.
         assert_eq!(name("alpine:latest"), "alpine");
@@ -6644,7 +6721,7 @@ mod tests {
         assert_eq!(name("tool:v1@sha256:abc123"), "tool");
 
         // A registry with a port is a host, not a tag on the last segment.
-        assert_eq!(name("localhost:5000/tool:v2"), "tool-v2");
+        assert_eq!(name("localhost:5000/tool:v2"), "tool:v2");
         assert_eq!(name("localhost:5000/tool"), "tool");
     }
 
