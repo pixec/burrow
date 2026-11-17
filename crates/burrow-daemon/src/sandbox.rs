@@ -3445,10 +3445,17 @@ enum Recovery {
 /// Renewed by every heartbeat the orchestrator answers. Once it runs out the
 /// orchestrator may write this node off and let another adopt its durable
 /// sandboxes, so from then on this node resumes none of them on its own say.
+///
+/// The confirm lease is the node's own, off unless set: how long it keeps
+/// sandboxes running without the orchestrator confirming it should, counted
+/// from the last confirmation or, before any, from when it was set.
 #[derive(Default)]
 struct NodeLease {
     renewed: Option<std::time::Instant>,
     length: std::time::Duration,
+    confirmed: Option<std::time::Instant>,
+    confirm_length: std::time::Duration,
+    is_unconfirmed: bool,
 }
 
 /// Distinct shapes of one template whose demand is counted, and whose build
@@ -7723,6 +7730,7 @@ impl SandboxManager {
     /// deliberately different actions: an idle sandbox is parked, an expired
     /// one is destroyed.
     pub async fn reap(&self) -> Vec<(String, &'static str)> {
+        self.suspend_if_unconfirmed().await;
         // The reaper's tick is also what keeps the usage figures on a read
         // fresh: nothing else runs regularly with every sandbox in hand.
         self.sample_usage().await;
@@ -10413,8 +10421,8 @@ impl SandboxManager {
         self.fence_if_lapsed().await;
         if sandbox.durable.is_fenced() {
             return Err(Status::unavailable(format!(
-                "sandbox {id} is kept in the object store, and this node is waiting for the \
-                 orchestrator to confirm it still holds it; try again shortly"
+                "sandbox {id} is waiting for the orchestrator to confirm this node still holds \
+                 it; try again shortly"
             )));
         }
         let saved = sandbox.base_record.lock().unwrap().kernel.clone();
@@ -10647,8 +10655,8 @@ impl SandboxManager {
         let sandbox = self.get(id).await?;
         if sandbox.durable.is_fenced() {
             return Err(Status::unavailable(format!(
-                "sandbox {id} has a checkpoint in the object store, and this node is waiting for \
-                 the orchestrator to confirm it still holds it; try again shortly"
+                "sandbox {id} is waiting for the orchestrator to confirm this node still holds \
+                 it; try again shortly"
             )));
         }
         let record = sandbox.record();
@@ -11615,9 +11623,61 @@ impl SandboxManager {
         }
     }
 
+    pub fn set_confirm_lease(&self, length: std::time::Duration) {
+        let mut lease = self.lease.lock().unwrap();
+        lease.confirm_length = length;
+        lease.confirmed = Some(std::time::Instant::now());
+    }
+
+    /// Suspends every running sandbox once the confirm lease has run out, and
+    /// fences each so nothing resumes it until the orchestrator confirms it.
+    async fn suspend_if_unconfirmed(&self) {
+        {
+            let mut lease = self.lease.lock().unwrap();
+            let lapsed = !lease.confirm_length.is_zero()
+                && lease
+                    .confirmed
+                    .is_some_and(|at| at.elapsed() >= lease.confirm_length);
+            if !lapsed {
+                return;
+            }
+            if !lease.is_unconfirmed {
+                tracing::warn!(
+                    lease_secs = lease.confirm_length.as_secs(),
+                    "the orchestrator has not confirmed this node's sandboxes within the lease; \
+                     suspending them until it does"
+                );
+            }
+            lease.is_unconfirmed = true;
+        }
+        let running: Vec<Arc<RunningSandbox>> = self
+            .sandboxes
+            .lock()
+            .await
+            .values()
+            .filter(|sandbox| sandbox.is_running() && !sandbox.durable.is_fenced())
+            .cloned()
+            .collect();
+        for sandbox in running {
+            sandbox.durable.set_fenced(true);
+            let id = sandbox.id().to_string();
+            match self.pause(&id).await {
+                Ok(_) => tracing::warn!(sandbox = id, "suspended: not confirmed within the lease"),
+                Err(err) => {
+                    tracing::error!(sandbox = id, %err, "could not suspend an unconfirmed sandbox")
+                }
+            }
+        }
+    }
+
     /// Unfences sandboxes the store still lists here, at the generation this
-    /// node holds them at.
+    /// node holds them at, and renews the confirm lease.
     pub fn confirm(&self, ids: &[String]) {
+        {
+            let mut lease = self.lease.lock().unwrap();
+            lease.confirmed = Some(std::time::Instant::now());
+            lease.is_unconfirmed = false;
+        }
         if ids.is_empty() {
             return;
         }
@@ -13976,6 +14036,42 @@ pub(crate) mod tests {
             .await
             .unwrap();
         assert!(manager.sandboxes.lock().await.contains_key("sbx_1"));
+    }
+
+    /// With the confirm lease set, a node the orchestrator has not confirmed
+    /// within it fences every running sandbox, so none resumes on its own
+    /// say, and tries to suspend each; the next confirmation lifts it.
+    #[tokio::test]
+    async fn an_unconfirmed_node_fences_its_running_sandboxes() {
+        let manager = manager().await;
+        let sandbox = running("sbx_unconfirmed");
+        manager
+            .sandboxes
+            .lock()
+            .await
+            .insert(sandbox.id().to_string(), Arc::clone(&sandbox));
+        manager.suspend_if_unconfirmed().await;
+        assert!(!sandbox.durable.is_fenced(), "off unless set");
+
+        manager.set_confirm_lease(std::time::Duration::from_secs(3600));
+        manager.suspend_if_unconfirmed().await;
+        assert!(!sandbox.durable.is_fenced(), "within the lease");
+
+        manager.set_confirm_lease(std::time::Duration::from_millis(1));
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        manager.suspend_if_unconfirmed().await;
+        assert!(sandbox.durable.is_fenced());
+        assert!(manager.lease.lock().unwrap().is_unconfirmed);
+
+        manager.confirm(&[sandbox.id().to_string()]);
+        for _ in 0..100 {
+            if !sandbox.durable.is_fenced() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        assert!(!sandbox.durable.is_fenced());
+        assert!(!manager.lease.lock().unwrap().is_unconfirmed);
     }
 
     /// A sandbox with neither memory nor disk left is the one thing recovery

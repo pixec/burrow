@@ -96,6 +96,13 @@ pub struct ServeArgs {
     /// must hold no other user, `--jail-uid` among them.
     #[arg(long, default_value_t = 300_000)]
     pub tpm_uid_base: u32,
+    /// Suspend every running sandbox once the orchestrator has not confirmed
+    /// what this node holds for this many seconds, and resume none until it
+    /// does. A sandbox deleted or placed elsewhere during a partition then
+    /// stops serving within the lease, rather than running until this node
+    /// is heard from again. 0, the default, keeps sandboxes running.
+    #[arg(long, default_value_t = 0, env = "BURROWD_CONFIRM_LEASE_SECS")]
+    pub confirm_lease_secs: u64,
     /// Run Cloud Hypervisor unconfined even with `--jailer`: as root, in the
     /// host's namespaces, with the host's filesystem in view. For a dev box
     /// whose kernel cannot build the jail; nowhere a guest is untrusted.
@@ -1990,6 +1997,7 @@ pub async fn run(args: ServeArgs) -> anyhow::Result<()> {
         burrow_common::vault::Vault::open(&args.data_dir.join("secrets.key"))
             .map_err(|err| anyhow::anyhow!("secrets key: {err}"))?,
     );
+    sandboxes.set_confirm_lease(Duration::from_secs(args.confirm_lease_secs));
 
     // Policy fields are only real if something acts on them; this is what
     // makes idle_suspend_secs and max_lifetime_secs mean anything.
