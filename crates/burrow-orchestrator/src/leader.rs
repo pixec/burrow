@@ -1,6 +1,6 @@
 //! Which orchestrator replica runs the fleet's background work.
 //!
-//! Writing off dead nodes, ageing out tombstones and claims, and copying
+//! Writing off dead nodes, sweeping abandoned claims, and copying
 //! every node's event log must each happen once, not once per replica. One
 //! replica holds a Postgres advisory lock on a connection of its own and is
 //! the leader for as long as that connection lives; if the replica dies, the

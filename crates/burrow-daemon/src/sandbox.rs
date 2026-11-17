@@ -536,6 +536,23 @@ const EVENT_STARTED: common::EventKind = common::EventKind::Started;
 const EVENT_AGENT_READY: common::EventKind = common::EventKind::AgentReady;
 const EVENT_STOPPED: common::EventKind = common::EventKind::Stopped;
 const EVENT_DESTROYED: common::EventKind = common::EventKind::Destroyed;
+/// Why a sandbox is destroyed here.
+#[derive(Clone, Copy)]
+enum Destroy {
+    /// Deleted, its stored state with it.
+    Deleted,
+    /// Not listed here by the store at this generation. Only the local copy
+    /// goes.
+    Unlisted(u64),
+}
+
+/// The generation of every new sandbox's first placement: a create, a fork
+/// and a restore from a snapshot all make one.
+const FIRST_GENERATION: u64 = 1;
+/// A destroyed event's detail for a copy the store no longer lists here, or
+/// lists at a newer generation. Anything but a deliberate delete keeps a
+/// sandbox the object store can bring back.
+const DETAIL_UNLISTED: &str = "unlisted";
 const EVENT_SNAPSHOT_CREATED: common::EventKind = common::EventKind::SnapshotCreated;
 /// Logged on a node's start for each sandbox it holds, in the state it found
 /// it in.
@@ -1630,6 +1647,10 @@ pub struct RunningSandbox {
     /// Its template's, and fixed for its life the same way: every VM it ever
     /// runs, and every snapshot it leaves, is this hypervisor's.
     hypervisor: Hypervisor,
+    /// The placement generation the orchestrator gave this node the sandbox
+    /// at, reported on every heartbeat. A copy at an older one than the
+    /// store lists is stale and destroyed.
+    generation: std::sync::atomic::AtomicU64,
     /// Everything else about the sandbox. Mutable because a pre-provisioned
     /// sandbox is stamped with the requesting caller's policy and tags
     /// when it is handed out.
@@ -1776,6 +1797,10 @@ impl RunningSandbox {
 
     pub fn id(&self) -> &str {
         &self.id
+    }
+
+    pub fn generation(&self) -> u64 {
+        self.generation.load(std::sync::atomic::Ordering::Relaxed)
     }
 
     /// The policy this sandbox runs under.
@@ -3266,7 +3291,8 @@ pub struct SandboxManager {
     /// Ids claimed by a create that has not finished provisioning. Held so a
     /// duplicate create is refused during the seconds a VM takes to build,
     /// rather than only before and after.
-    creating: Arc<Mutex<std::collections::HashSet<String>>>,
+    /// Creates and adopts in flight, with the generation each is at.
+    creating: Arc<Mutex<HashMap<String, u64>>>,
     /// Ids whose root disk is being replaced; see [`Self::require_settled`].
     recreating: Arc<std::sync::Mutex<std::collections::HashSet<String>>>,
     /// `None` until the node is given a slice of the fleet's pool.
@@ -3405,6 +3431,7 @@ struct Publics {
 /// failed and with the reason, and what of this node it still holds.
 struct Held {
     record: common::Sandbox,
+    generation: u64,
     workdir: Option<PathBuf>,
     is_leased: bool,
 }
@@ -3596,7 +3623,7 @@ impl SandboxManager {
             disk_admissions: Default::default(),
             cpu_admitted: Default::default(),
             cpu_admission: Default::default(),
-            creating: Arc::new(Mutex::new(std::collections::HashSet::new())),
+            creating: Arc::new(Mutex::new(HashMap::new())),
             recreating: Default::default(),
             ipam: Default::default(),
             ports: Arc::new(Mutex::new(HashMap::new())),
@@ -3953,6 +3980,7 @@ impl SandboxManager {
                 .collect(),
             share: self.shares.spec(sandbox.id()).await,
             suspended_at: sandbox.suspended_at(),
+            generation: sandbox.generation(),
         };
         if let Err(err) = self.store.put_sandbox(&row).await {
             tracing::error!(sandbox = record.id, %err, "failed to persist sandbox");
@@ -4516,6 +4544,7 @@ impl SandboxManager {
             id: record.id.clone(),
             template: record.template.clone(),
             hypervisor,
+            generation: std::sync::atomic::AtomicU64::new(row.generation),
             base_record: std::sync::Mutex::new(record),
             state: std::sync::atomic::AtomicI32::new(row.state),
             vm: Mutex::new(None),
@@ -4611,6 +4640,7 @@ impl SandboxManager {
             row.id.clone(),
             Held {
                 record,
+                generation: row.generation,
                 workdir,
                 is_leased,
             },
@@ -4648,9 +4678,10 @@ impl SandboxManager {
     }
 
     /// Removes a sandbox recovery left out of service.
-    async fn remove_held(&self, held: Held) {
+    async fn remove_held(&self, held: Held, detail: &str) {
         let id = held.record.id.clone();
-        self.log_recorded(&held.record, EVENT_DESTROYED, "").await;
+        self.log_recorded(&held.record, EVENT_DESTROYED, detail)
+            .await;
         if let Err(err) = self.store.delete_sandbox(&id).await {
             tracing::error!(sandbox = id, %err, "failed to remove sandbox from store");
         }
@@ -7814,7 +7845,8 @@ impl SandboxManager {
         acted
     }
 
-    /// This node's inventory, for the orchestrator to adopt.
+    /// This node's complete inventory, with each sandbox's generation, for
+    /// the orchestrator to compare against the store.
     ///
     /// Sent whole rather than as a delta: a delta needs the two sides to agree
     /// on where they started, and a full list makes a missed heartbeat
@@ -7822,7 +7854,7 @@ impl SandboxManager {
     pub async fn state_reports(&self) -> Vec<burrow_proto::node::v1::SandboxStateReport> {
         self.fence_if_lapsed().await;
         let report =
-            |record: common::Sandbox, is_fenced| burrow_proto::node::v1::SandboxStateReport {
+            |record: common::Sandbox, generation| burrow_proto::node::v1::SandboxStateReport {
                 sandbox_id: record.id,
                 state: record.state,
                 cpu_usage_usec: record.cpu_usage_usec,
@@ -7830,26 +7862,40 @@ impl SandboxManager {
                 tx_bytes: record.tx_bytes,
                 is_agent_unconfirmed: record.is_agent_unconfirmed,
                 is_durable: record.is_durable,
-                is_fenced,
                 state_reason: record.state_reason,
                 checkpoint_at_unix_ms: record.checkpoint_at_unix_ms,
                 checkpoint_kind: record.checkpoint_kind,
                 activation: record.activation,
+                generation,
+                is_in_flight: false,
             };
         let mut reports: Vec<_> = self
             .sandboxes
             .lock()
             .await
             .values()
-            .map(|sandbox| report(sandbox.record(), sandbox.durable.is_fenced()))
+            .map(|sandbox| report(sandbox.record(), sandbox.generation()))
             .collect();
         reports.extend(
             self.held
                 .lock()
                 .unwrap()
                 .values()
-                .map(|held| report(held.record.clone(), false)),
+                .map(|held| report(held.record.clone(), held.generation)),
         );
+        let listed: std::collections::HashSet<String> =
+            reports.iter().map(|r| r.sandbox_id.clone()).collect();
+        for (id, generation) in self.creating.lock().await.iter() {
+            if !listed.contains(id) {
+                reports.push(burrow_proto::node::v1::SandboxStateReport {
+                    sandbox_id: id.clone(),
+                    state: common::SandboxState::Creating as i32,
+                    generation: *generation,
+                    is_in_flight: true,
+                    ..Default::default()
+                });
+            }
+        }
         reports
     }
 
@@ -8014,6 +8060,7 @@ impl SandboxManager {
         Ok(self.get(id).await?.record())
     }
 
+    #[cfg(test)]
     pub async fn list(&self) -> Vec<common::Sandbox> {
         let mut out: Vec<_> = self
             .sandboxes
@@ -8273,9 +8320,10 @@ impl SandboxManager {
         {
             let sandboxes = self.sandboxes.lock().await;
             let mut creating = self.creating.lock().await;
-            if sandboxes.contains_key(&id) || !creating.insert(id.clone()) {
+            if sandboxes.contains_key(&id) || creating.contains_key(&id) {
                 return Err(Status::already_exists(format!("sandbox {id} exists")));
             }
+            creating.insert(id.clone(), FIRST_GENERATION);
         }
         // Held until the sandbox is registered running, so a create racing
         // this one sees it either starting or running.
@@ -9079,6 +9127,7 @@ impl SandboxManager {
             id: record.id.clone(),
             template: record.template.clone(),
             hypervisor,
+            generation: std::sync::atomic::AtomicU64::new(FIRST_GENERATION),
             base_record: std::sync::Mutex::new(record.clone()),
             state: std::sync::atomic::AtomicI32::new(common::SandboxState::Running as i32),
             vm: Mutex::new(Some(vm)),
@@ -9420,9 +9469,10 @@ impl SandboxManager {
         {
             let sandboxes = self.sandboxes.lock().await;
             let mut creating = self.creating.lock().await;
-            if sandboxes.contains_key(&id) || !creating.insert(id.clone()) {
+            if sandboxes.contains_key(&id) || creating.contains_key(&id) {
                 return Err(Status::already_exists(format!("sandbox {id} exists")));
             }
+            creating.insert(id.clone(), FIRST_GENERATION);
         }
         if !self.inspection_ca_for(&policy).is_empty() {
             self.require_inspection_root(&id, &manifest.inspection_root)?;
@@ -9588,9 +9638,10 @@ impl SandboxManager {
         {
             let sandboxes = self.sandboxes.lock().await;
             let mut creating = self.creating.lock().await;
-            if sandboxes.contains_key(&child_id) || !creating.insert(child_id.clone()) {
+            if sandboxes.contains_key(&child_id) || creating.contains_key(&child_id) {
                 return Err(Status::already_exists(format!("sandbox {child_id} exists")));
             }
+            creating.insert(child_id.clone(), FIRST_GENERATION);
         }
 
         let forked = self
@@ -10304,6 +10355,7 @@ impl SandboxManager {
             id: record.id.clone(),
             template: record.template.clone(),
             hypervisor,
+            generation: std::sync::atomic::AtomicU64::new(FIRST_GENERATION),
             base_record: std::sync::Mutex::new(record),
             state: std::sync::atomic::AtomicI32::new(common::SandboxState::Running as i32),
             vm: Mutex::new(Some(vm)),
@@ -10826,18 +10878,39 @@ impl SandboxManager {
     }
 
     pub async fn delete(&self, id: &str) -> Result<(), Status> {
+        self.destroy(id, Destroy::Deleted).await
+    }
+
+    /// Destroys a sandbox here: deleted, with its stored state, or a copy the
+    /// store does not list here at the generation named, which is kept if
+    /// this node holds the sandbox at another by now.
+    async fn destroy(&self, id: &str, how: Destroy) -> Result<(), Status> {
         self.require_settled(id)?;
-        let held = self.held.lock().unwrap().remove(id);
+        let (detail, unlisted) = match how {
+            Destroy::Deleted => ("", None),
+            Destroy::Unlisted(generation) => (DETAIL_UNLISTED, Some(generation)),
+        };
+        let held = {
+            let mut held = self.held.lock().unwrap();
+            match held.get(id) {
+                Some(entry) if unlisted.is_none_or(|g| entry.generation == g) => held.remove(id),
+                Some(_) => return Ok(()),
+                None => None,
+            }
+        };
         if let Some(held) = held {
-            self.remove_held(held).await;
+            self.remove_held(held, detail).await;
             return Ok(());
         }
-        let sandbox = self
-            .sandboxes
-            .lock()
-            .await
-            .remove(id)
-            .ok_or_else(|| Status::not_found(format!("no sandbox {id} on this node")))?;
+        let sandbox = {
+            let mut sandboxes = self.sandboxes.lock().await;
+            match sandboxes.get(id) {
+                Some(sandbox) if unlisted.is_none_or(|g| sandbox.generation() == g) => {}
+                Some(_) => return Ok(()),
+                None => return Err(Status::not_found(format!("no sandbox {id} on this node"))),
+            }
+            sandboxes.remove(id).expect("checked above")
+        };
         // A writable volume outlives the sandbox, and what the guest had not
         // written back would otherwise die with its page cache. Committed to
         // the journal, it is replayed for the next reader.
@@ -10847,14 +10920,26 @@ impl SandboxManager {
         {
             flush_guest(&sandbox).await;
         }
-        self.forget_stored(&sandbox).await;
+        match unlisted {
+            // Stored state may be the only copy, handed back by another
+            // node's failed adopt; the collector takes it once no row names
+            // the sandbox.
+            Some(_) => {
+                let _uploading = sandbox.durable.stop_uploading().await;
+                sandbox.durable.invalidate();
+                if sandbox.durable.stored.lock().unwrap().take().is_some() {
+                    crate::durable::remove_local(&sandbox.workdir).await;
+                }
+            }
+            None => self.forget_stored(&sandbox).await,
+        }
         for mount in policy.volumes.iter().filter(|mount| mount.generation != 0) {
             self.volumes.unpin(&mount.volume, id).await;
         }
         // Closed before the rows go, so the same one function ends every
         // session and the store is never left holding an open one.
         self.close_session(&sandbox, ENDED_DELETED).await;
-        self.emit(&sandbox, EVENT_DESTROYED, "").await;
+        self.emit(&sandbox, EVENT_DESTROYED, detail).await;
         let released = self.tear_down(sandbox).await;
         tracing::info!(sandbox = id, "sandbox deleted");
         released
@@ -11249,6 +11334,7 @@ impl SandboxManager {
             id: sandbox.id().to_string(),
             generation: 0,
             node_id: record.node_id.clone(),
+            placement: sandbox.generation(),
             state: String::new(),
             template: sandbox.template().to_string(),
             vcpus: sandbox.vcpus(),
@@ -11393,7 +11479,10 @@ impl SandboxManager {
         }
         crate::durable::remove_local(&sandbox.workdir).await;
         let holder = sandbox.record().node_id;
-        if let Err(err) = crate::durable::purge(store, sandbox.id(), Some(&holder)).await {
+        let placement = sandbox.generation();
+        if let Err(err) =
+            crate::durable::purge(store, sandbox.id(), Some((&holder, placement))).await
+        {
             tracing::warn!(sandbox = sandbox.id(), %err, "could not remove the sandbox's stored state");
         }
     }
@@ -11493,7 +11582,8 @@ impl SandboxManager {
         }
     }
 
-    /// Unfences sandboxes the orchestrator still places here.
+    /// Unfences sandboxes the store still lists here, at the generation this
+    /// node holds them at.
     pub fn confirm(&self, ids: &[String]) {
         if ids.is_empty() {
             return;
@@ -11510,37 +11600,47 @@ impl SandboxManager {
         });
     }
 
-    /// Drops this node's copy of sandboxes another node has adopted. Only a
-    /// fenced one, which this node has not resumed since it could have lost
-    /// it, is dropped: anything else would be a guest someone is using.
-    pub async fn relinquish(&self, ids: &[String]) {
-        for id in ids {
-            let sandbox = {
-                let mut sandboxes = self.sandboxes.lock().await;
-                match sandboxes.get(id) {
-                    Some(sandbox) if sandbox.durable.is_fenced() && !sandbox.is_running() => {
-                        sandboxes.remove(id)
-                    }
-                    Some(_) => {
-                        tracing::error!(
-                            sandbox = id,
-                            "orchestrator says another node holds this sandbox, but it is not \
-                             fenced here; keeping it"
-                        );
-                        None
-                    }
-                    None => None,
+    /// The generation this node holds a sandbox at, if it holds one.
+    async fn generation_of(&self, id: &str) -> Option<u64> {
+        if let Some(sandbox) = self.sandboxes.lock().await.get(id) {
+            return Some(sandbox.generation());
+        }
+        self.held
+            .lock()
+            .unwrap()
+            .get(id)
+            .map(|held| held.generation)
+    }
+
+    /// Destroys copies the store does not list for this node at the
+    /// generation this node reported them at: deleted, placed elsewhere, or
+    /// placed here again since. One this node has taken up again at a newer
+    /// generation in the meantime is kept.
+    pub fn destroy_unlisted(&self, unlisted: &[burrow_proto::node::v1::SandboxGeneration]) {
+        for entry in unlisted {
+            let manager = self.clone();
+            let id = entry.sandbox_id.clone();
+            let generation = entry.generation;
+            tokio::spawn(async move {
+                if manager.generation_of(&id).await != Some(generation) {
+                    return;
                 }
-            };
-            let Some(sandbox) = sandbox else { continue };
-            self.emit(&sandbox, EVENT_STOPPED, "relinquished").await;
-            if let Err(err) = self.tear_down(sandbox).await {
-                tracing::warn!(sandbox = id, %err, "could not fully release a relinquished sandbox");
-            }
-            tracing::info!(
-                sandbox = id,
-                "another node adopted this sandbox; dropped the copy here"
-            );
+                let is_kit = manager.record_of(&id).await.is_ok_and(|r| r.kit.is_some());
+                match manager.destroy(&id, Destroy::Unlisted(generation)).await {
+                    Ok(()) => tracing::warn!(
+                        sandbox = id,
+                        generation,
+                        "the store does not list this sandbox here at this generation; destroyed it"
+                    ),
+                    Err(err) => {
+                        tracing::warn!(sandbox = id, %err, "could not destroy a sandbox the store does not list here");
+                        return;
+                    }
+                }
+                if is_kit {
+                    crate::kit::remove_volumes(&manager, &id).await;
+                }
+            });
         }
     }
 
@@ -11695,6 +11795,7 @@ impl SandboxManager {
         &self,
         record: common::Sandbox,
         node_id: String,
+        generation: u64,
     ) -> Result<common::Sandbox, Status> {
         let store = self.config.object_store.as_ref().ok_or_else(|| {
             Status::failed_precondition("this node has no object store to adopt sandboxes from")
@@ -11704,6 +11805,21 @@ impl SandboxManager {
         if let Some(gate) = releasing {
             drop(gate.lock().await);
         }
+        // A copy from an older placement, kept from before the sandbox moved
+        // away, or recovered after a restart, is stale: the store has handed
+        // the sandbox to this node again since.
+        if let Some(stale) = self
+            .generation_of(&id)
+            .await
+            .filter(|held| *held < generation)
+        {
+            tracing::warn!(
+                sandbox = id,
+                generation,
+                "replacing a stale copy of a sandbox placed here again"
+            );
+            self.destroy(&id, Destroy::Unlisted(stale)).await?;
+        }
         let started = std::time::Instant::now();
         let held = crate::durable::read_manifest(store, &id)
             .await?
@@ -11711,6 +11827,13 @@ impl SandboxManager {
                 Status::not_found(format!("sandbox {id} has no state in the object store"))
             })?;
         let manifest = &held.manifest;
+        if manifest.placement > generation {
+            return Err(Status::aborted(format!(
+                "sandbox {id} was placed again since, at generation {}; this adopt at {generation} \
+                 is stale",
+                manifest.placement
+            )));
+        }
         if !manifest.is_adoptable() {
             return Err(Status::failed_precondition(format!(
                 "sandbox {id} was running on {} when it was last heard of, with no checkpoint; \
@@ -11756,18 +11879,21 @@ impl SandboxManager {
         {
             let sandboxes = self.sandboxes.lock().await;
             let mut creating = self.creating.lock().await;
-            if sandboxes.contains_key(&id) || !creating.insert(id.clone()) {
+            if sandboxes.contains_key(&id) || creating.contains_key(&id) {
                 return Err(Status::already_exists(format!("sandbox {id} exists")));
             }
+            creating.insert(id.clone(), generation);
         }
         let read = started.elapsed();
         if boots {
-            let booted = self.adopt_booting(store, &held, record, node_id).await;
+            let booted = self
+                .adopt_booting(store, &held, record, node_id, generation)
+                .await;
             self.creating.lock().await.remove(&id);
             return booted;
         }
         let adopted = self
-            .adopt_inner(store, &held, record, node_id.clone())
+            .adopt_inner(store, &held, record, node_id.clone(), generation)
             .await;
         let (sandbox, from, _disk) = match adopted {
             Ok(adopted) => adopted,
@@ -11828,12 +11954,14 @@ impl SandboxManager {
         held: &crate::durable::Held,
         record: common::Sandbox,
         node_id: String,
+        generation: u64,
     ) -> Result<(Arc<RunningSandbox>, String, Admitted), Status> {
         let manifest = &held.manifest;
         let from = manifest.node_id.clone();
         let mut claimed = manifest.clone();
         claimed.state = crate::durable::STATE_RUNNING.to_string();
         claimed.node_id = node_id.clone();
+        claimed.placement = generation;
         let mut policy = record.policy.clone().unwrap_or_default();
         policy.resources = Some(manifest.resources(policy.resources.take().unwrap_or_default()));
         // Claimed in the store before the guest starts, the rule a resume
@@ -11862,6 +11990,9 @@ impl SandboxManager {
                 return Err(err);
             }
         };
+        sandbox
+            .generation
+            .store(generation, std::sync::atomic::Ordering::Relaxed);
         *sandbox.durable.stored.lock().unwrap() =
             crate::durable::load_local(&sandbox.workdir).await;
         {
@@ -11891,6 +12022,7 @@ impl SandboxManager {
         held: &crate::durable::Held,
         record: common::Sandbox,
         node_id: String,
+        generation: u64,
     ) -> Result<common::Sandbox, Status> {
         let manifest = &held.manifest;
         let id = record.id.clone();
@@ -11898,6 +12030,7 @@ impl SandboxManager {
         let mut claimed = manifest.clone();
         claimed.state = crate::durable::STATE_RUNNING.to_string();
         claimed.node_id = node_id.clone();
+        claimed.placement = generation;
         crate::durable::replace_manifest(store, Some(held), &claimed).await?;
         let sandbox = match self
             .provision_from_checkpoint(store, &claimed, record, node_id.clone())
@@ -11909,6 +12042,9 @@ impl SandboxManager {
                 return Err(err);
             }
         };
+        sandbox
+            .generation
+            .store(generation, std::sync::atomic::Ordering::Relaxed);
         if let Err(err) = self.start(&id, true).await {
             self.sandboxes.lock().await.remove(&id);
             if let Err(err) = self.tear_down(sandbox).await {
@@ -12034,6 +12170,7 @@ impl SandboxManager {
             id: id.clone(),
             template: record.template.clone(),
             hypervisor,
+            generation: std::sync::atomic::AtomicU64::new(FIRST_GENERATION),
             base_record: std::sync::Mutex::new(record.clone()),
             state: std::sync::atomic::AtomicI32::new(common::SandboxState::Stopped as i32),
             vm: Mutex::new(None),
@@ -13530,6 +13667,7 @@ pub(crate) mod tests {
             tap: format!("bt{lease_block}"),
             ports: vec![],
             share: Default::default(),
+            generation: 3,
         }
     }
 
@@ -13636,6 +13774,7 @@ pub(crate) mod tests {
         let reports = manager.state_reports().await;
         assert_eq!(reports.len(), 1);
         assert_eq!(reports[0].state, common::SandboxState::Failed as i32);
+        assert_eq!(reports[0].generation, 3);
         let err = manager.get(id).await.err().unwrap();
         assert_eq!(err.code(), tonic::Code::FailedPrecondition);
         assert_eq!(
@@ -13656,6 +13795,144 @@ pub(crate) mod tests {
         let last = events_of(&manager, id).await.pop().unwrap();
         assert_eq!(last.kind, EVENT_DESTROYED as i32);
         tokio::fs::remove_dir_all(&data_dir).await.ok();
+    }
+
+    /// The orchestrator names a copy the store does not list here with the
+    /// generation the node reported it at. One the node holds at another
+    /// generation by the time the answer arrives is kept; the one it named is
+    /// destroyed, and recorded as unlisted rather than deleted.
+    #[tokio::test]
+    async fn a_copy_the_store_does_not_list_is_destroyed_only_at_the_generation_reported() {
+        let id = "ghost-unlisted";
+        let (manager, data_dir) = recovering("unlisted").await;
+        let workdir = manager.config.sandbox_dir(id, Hypervisor::Firecracker);
+        std::fs::create_dir_all(&workdir).unwrap();
+        let layout = Hypervisor::Firecracker.layout();
+        for file in [layout.state, crate::rootdisk::ROOT_DISK] {
+            tokio::fs::write(workdir.join(file), b"kept").await.unwrap();
+        }
+        let foreign = row(
+            id,
+            common::SandboxState::Suspended,
+            burrow_net::ipam::DEFAULT_BLOCKS_PER_NODE,
+        );
+        manager.store.put_sandbox(&foreign).await.unwrap();
+        manager.recover().await;
+        assert_eq!(manager.generation_of(id).await, Some(3));
+
+        let unlisted = |generation| burrow_proto::node::v1::SandboxGeneration {
+            sandbox_id: id.into(),
+            generation,
+        };
+        manager.destroy_unlisted(&[unlisted(2)]);
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        assert_eq!(manager.list().await.len(), 1);
+
+        manager.destroy_unlisted(&[unlisted(3)]);
+        for _ in 0..100 {
+            if manager.list().await.is_empty() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        assert!(manager.list().await.is_empty());
+        assert!(manager.store.list_sandboxes().await.unwrap().is_empty());
+        let last = events_of(&manager, id).await.pop().unwrap();
+        assert_eq!(
+            (last.kind, last.detail.as_str()),
+            (EVENT_DESTROYED as i32, DETAIL_UNLISTED)
+        );
+        tokio::fs::remove_dir_all(&data_dir).await.ok();
+    }
+
+    /// A copy the store no longer lists here, or lists at a newer
+    /// generation, is destroyed here only. The stored state may be the only
+    /// copy of the sandbox, the manifest still naming this node at this
+    /// generation: another node's adopt failed and handed it back, or is
+    /// still in flight. Only the collector removes stored state, once no row
+    /// names the sandbox.
+    #[tokio::test]
+    async fn an_unlisted_copy_is_destroyed_without_touching_stored_state() {
+        let mut manager = manager().await;
+        let store = crate::objstore::fake::store(true).await;
+        manager.config.object_store = Some(store.clone());
+        let sandbox = running("sbx_1");
+        sandbox.base_record.lock().unwrap().node_id = "node-a".into();
+        let manifest = crate::durable::tests::manifest("node-a", crate::durable::STATE_SUSPENDED);
+        crate::durable::replace_manifest(&store, None, &manifest)
+            .await
+            .unwrap();
+        *sandbox.durable.stored.lock().unwrap() = Some(crate::durable::LocalState {
+            manifest,
+            is_published: true,
+            layers: Vec::new(),
+            vmstate: Default::default(),
+            disk: Default::default(),
+            kernel: Default::default(),
+            rootfs: Default::default(),
+            memory: Default::default(),
+            disk_index: Default::default(),
+            logs: Default::default(),
+            is_casync: true,
+        });
+        manager
+            .sandboxes
+            .lock()
+            .await
+            .insert("sbx_1".into(), Arc::clone(&sandbox));
+        let unlisted = |generation| burrow_proto::node::v1::SandboxGeneration {
+            sandbox_id: "sbx_1".into(),
+            generation,
+        };
+        manager.destroy_unlisted(&[unlisted(FIRST_GENERATION)]);
+        for _ in 0..100 {
+            if manager.sandboxes.lock().await.is_empty() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        assert!(manager.sandboxes.lock().await.is_empty());
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        assert!(
+            crate::durable::read_manifest(&store, "sbx_1")
+                .await
+                .unwrap()
+                .is_some(),
+            "the stored state was purged"
+        );
+    }
+
+    /// A create or adopt still running is listed, at its generation and
+    /// marked in flight, so its placement is kept however long it takes.
+    #[tokio::test]
+    async fn a_create_in_flight_is_listed() {
+        let manager = manager().await;
+        manager.creating.lock().await.insert("sbx_slow".into(), 3);
+        let reports = manager.state_reports().await;
+        let listed = reports.iter().find(|r| r.sandbox_id == "sbx_slow").unwrap();
+        assert!(listed.is_in_flight);
+        assert_eq!(listed.generation, 3);
+    }
+
+    /// Asked to destroy a copy at one generation, a node now holding the
+    /// sandbox at another keeps it, however the two calls interleave.
+    #[tokio::test]
+    async fn a_destroy_names_the_generation_it_destroys() {
+        let manager = manager().await;
+        let sandbox = running("sbx_1");
+        sandbox
+            .generation
+            .store(2, std::sync::atomic::Ordering::Relaxed);
+        manager
+            .sandboxes
+            .lock()
+            .await
+            .insert("sbx_1".into(), Arc::clone(&sandbox));
+        manager
+            .destroy("sbx_1", Destroy::Unlisted(FIRST_GENERATION))
+            .await
+            .unwrap();
+        assert!(manager.sandboxes.lock().await.contains_key("sbx_1"));
     }
 
     /// A sandbox with neither memory nor disk left is the one thing recovery
@@ -13721,6 +13998,7 @@ pub(crate) mod tests {
             tap: "bt0".into(),
             ports: vec![],
             share: Default::default(),
+            generation: 0,
         };
         manager.store.put_sandbox(&persisted).await.unwrap();
 
@@ -14237,6 +14515,7 @@ pub(crate) mod tests {
             id: id.into(),
             template: "default".into(),
             hypervisor: Hypervisor::Firecracker,
+            generation: std::sync::atomic::AtomicU64::new(FIRST_GENERATION),
             base_record: std::sync::Mutex::new(common::Sandbox::default()),
             state: std::sync::atomic::AtomicI32::new(common::SandboxState::Running as i32),
             vm: Mutex::new(None),
@@ -15051,6 +15330,7 @@ pub(crate) mod tests {
             id: "sbx_a".into(),
             template: "default".into(),
             hypervisor: Hypervisor::Firecracker,
+            generation: std::sync::atomic::AtomicU64::new(FIRST_GENERATION),
             base_record: std::sync::Mutex::new(common::Sandbox::default()),
             state: std::sync::atomic::AtomicI32::new(common::SandboxState::Running as i32),
             vm: Mutex::new(None),

@@ -4,9 +4,9 @@
 //! needed to reattach to its own sandboxes after a restart: the address lease,
 //! the tap name, and the published ports, none of which can be re-derived. It
 //! is always SQLite, because a node must keep working with the control plane
-//! gone. The orchestrator stores which sandbox lives on which node, its
-//! tombstones, sealed secrets and the fleet's event log, on SQLite for a single
-//! process or PostgreSQL for several.
+//! gone. The orchestrator stores which sandbox lives on which node, sealed
+//! secrets and the fleet's event log, on SQLite for a single process or
+//! PostgreSQL for several.
 //!
 //! One [`Store`] serves both backends, and every query is written once:
 //! placeholders are `$N`, which both drivers accept, conflicts are `ON
@@ -59,6 +59,9 @@ pub struct SandboxRow {
     /// Persisted because `suspended_ttl_secs` is measured from it, and a node
     /// restart that reset it would let a sandbox outlive its retention forever.
     pub suspended_at: i64,
+    /// The placement generation the orchestrator gave this node the sandbox
+    /// at, reported back with it.
+    pub generation: u64,
 }
 
 /// One published port.
@@ -181,22 +184,157 @@ pub struct EgressFilter {
     pub limit: u32,
 }
 
-/// An orchestrator's record of where a sandbox lives.
-#[derive(Debug, Clone)]
+/// An orchestrator's record of where a sandbox lives: every sandbox that
+/// should exist has one, written before any node is asked to act on it.
+#[derive(Debug, Clone, Default)]
 pub struct PlacementRow {
     pub id: String,
     pub node_id: String,
     pub record: Vec<u8>,
-    /// What the row was read at. Ignored by an unconditional write.
+    /// Bumped by every write of the row.
     pub version: i64,
+    /// Raised by every change of node. A node holding the sandbox at any
+    /// other generation holds a stale copy.
+    pub generation: i64,
+    /// When a node was asked to act on this placement, 0 once it answered.
+    pub pending_since_ms: i64,
 }
 
-/// A sandbox a caller deleted while its node was unreachable.
-///
-/// The delete could not be carried out on the node, so the record is dropped
-/// here and this is what remembers the intent: if the node ever comes back
-/// still holding the sandbox, the orchestrator destroys it there rather than
-/// adopting it.
+type PlacementRaw = (String, String, Vec<u8>, i64, i64, i64);
+
+const PLACEMENT_COLUMNS: &str = "id, node_id, record, version, generation, pending_since_ms";
+const PLACEMENT_COLUMNS_OF_P: &str =
+    "p.id, p.node_id, p.record, p.version, p.generation, p.pending_since_ms";
+
+fn placement_row(r: PlacementRaw) -> PlacementRow {
+    PlacementRow {
+        id: r.0,
+        node_id: r.1,
+        record: r.2,
+        version: r.3,
+        generation: r.4,
+        pending_since_ms: r.5,
+    }
+}
+
+/// Keeps a lost placement with no node when `unplaced` carries its record,
+/// and deletes it with its claims otherwise, while it is still on the node
+/// and at the generation it was read at. False when a move got there first.
+/// A macro rather than a function, so it runs on either backend's
+/// transaction inside `on_pool!`.
+macro_rules! settle_lost {
+    ($tx:expr, $row:expr, $unplaced:expr) => {{
+        let row: &PlacementRow = $row;
+        let settled = match $unplaced {
+            Some(record) => sqlx::query(
+                "UPDATE placements SET node_id='', record=$4, pending_since_ms=0, missed=0,
+                    version=version + 1
+                 WHERE id=$1 AND node_id=$2 AND generation=$3",
+            )
+            .bind(&row.id)
+            .bind(&row.node_id)
+            .bind(row.generation)
+            .bind(record)
+            .execute(&mut *$tx)
+            .await?
+            .rows_affected(),
+            None => {
+                let done = sqlx::query(
+                    "DELETE FROM placements WHERE id=$1 AND node_id=$2 AND generation=$3",
+                )
+                .bind(&row.id)
+                .bind(&row.node_id)
+                .bind(row.generation)
+                .execute(&mut *$tx)
+                .await?
+                .rows_affected();
+                if done == 1 {
+                    sqlx::query("DELETE FROM claims WHERE sandbox_id=$1")
+                        .bind(&row.id)
+                        .execute(&mut *$tx)
+                        .await?;
+                }
+                done
+            }
+        };
+        settled == 1
+    }};
+}
+
+/// Rows rewritten from a heartbeat per statement.
+const RESTATE_BATCH: usize = 500;
+
+/// How many consecutive complete listings may leave a placement out before
+/// it is lost. One can always be a listing sampled before the sandbox
+/// landed; two in a row cannot.
+pub const LOST_AFTER_MISSES: i64 = 2;
+
+/// One sandbox in a node's complete listing.
+#[derive(Debug, Clone, Serialize)]
+pub struct ReportedSandbox {
+    #[serde(rename = "i")]
+    pub id: String,
+    #[serde(rename = "g")]
+    pub generation: i64,
+    /// Digest of what the node says about the sandbox, compared against the
+    /// row's so only what changed is rewritten.
+    #[serde(rename = "h")]
+    pub hash: i64,
+    /// 1 for a create or adopt its node is still carrying out, which keeps
+    /// the row from going missing and leaves its record alone.
+    #[serde(rename = "f")]
+    pub in_flight: i64,
+}
+
+/// A node's heartbeat, as [`Store::reconcile_node`] applies it.
+#[derive(Debug, Clone, Default)]
+pub struct NodeReport {
+    /// The node's status columns, written with the report.
+    pub node: NodeRow,
+    /// The node's own number for the report, rising with every one it sends.
+    pub seq: i64,
+    pub sandboxes: Vec<ReportedSandbox>,
+    /// Rows a node was asked to act on after this are not yet missing.
+    pub pending_after_ms: i64,
+    /// Rows whose usage figures were last written before this are rewritten.
+    pub usage_before_ms: i64,
+    /// Reported rows still pending since before this are returned as
+    /// unanswered.
+    pub unanswered_before_ms: i64,
+}
+
+pub enum Reconciled {
+    /// No node by that id: it must register again.
+    Unknown,
+    /// A report no newer than one already applied. Nothing was changed.
+    Stale,
+    Applied(NodeReconciled),
+}
+
+#[derive(Debug, Default)]
+pub struct NodeReconciled {
+    /// Rows no node held that the node holds at their generation, placed
+    /// back on it: nothing has placed them since it held them, so its copy
+    /// is current. A node written off and back keeps what it still has.
+    pub replaced: Vec<PlacementRow>,
+    /// What the node holds that no row lists for it at that generation.
+    pub destroy: Vec<(String, i64)>,
+    pub lost: Vec<Lost>,
+    /// Rows rewritten from the report, as written.
+    pub restated: Vec<PlacementRow>,
+    /// Rows the node holds whose create or adopt never had its answer
+    /// recorded.
+    pub unanswered: Vec<String>,
+}
+
+/// A placement whose node no longer holds it, and the record it was kept
+/// with when it was kept unplaced.
+#[derive(Debug)]
+pub struct Lost {
+    pub row: PlacementRow,
+    pub unplaced: Option<Vec<u8>>,
+}
+
 /// A node as the control plane records it, shared by every orchestrator
 /// replica.
 ///
@@ -224,14 +362,6 @@ pub struct NodeRow {
     /// Capacity promised to sandboxes placed since the last heartbeat.
     pub reserved_cpu_millis: i64,
     pub reserved_mem_mib: i64,
-}
-
-#[derive(Debug, Clone)]
-pub struct TombstoneRow {
-    pub sandbox_id: String,
-    pub node_id: String,
-    /// Unix seconds the delete was accepted, so tombstones can age out.
-    pub at: i64,
 }
 
 /// One allocated or quarantined public address.
@@ -401,6 +531,15 @@ impl Store {
         })
     }
 
+    /// Locks the rows a select reads until the transaction ends, where the
+    /// backend has row locks; SQLite has one writer at a time.
+    fn row_lock(&self) -> &'static str {
+        match self.is_postgres() {
+            true => " FOR UPDATE",
+            false => "",
+        }
+    }
+
     pub fn is_postgres(&self) -> bool {
         matches!(self.db, Db::Postgres(_))
     }
@@ -422,13 +561,15 @@ impl Store {
         };
         on_pool!(self, pool => sqlx::query(
             "INSERT INTO sandboxes
-                (id, template, record, state, lease_block, tap, ports_json, suspended_at, share_json)
-             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+                (id, template, record, state, lease_block, tap, ports_json, suspended_at, share_json,
+                 generation)
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
              ON CONFLICT (id) DO UPDATE SET
                 template=excluded.template, record=excluded.record,
                 state=excluded.state, lease_block=excluded.lease_block,
                 tap=excluded.tap, ports_json=excluded.ports_json,
-                suspended_at=excluded.suspended_at, share_json=excluded.share_json",
+                suspended_at=excluded.suspended_at, share_json=excluded.share_json,
+                generation=excluded.generation",
         )
         .bind(&row.id)
         .bind(&row.template)
@@ -439,6 +580,7 @@ impl Store {
         .bind(&ports)
         .bind(row.suspended_at)
         .bind(&share)
+        .bind(row.generation as i64)
         .execute(pool)
         .await
         .map(drop))?;
@@ -476,9 +618,11 @@ impl Store {
             String,
             i64,
             String,
+            i64,
         );
         let rows: Vec<Raw> = on_pool!(self, pool => sqlx::query_as(
-            "SELECT id, template, record, state, lease_block, tap, ports_json, suspended_at, share_json
+            "SELECT id, template, record, state, lease_block, tap, ports_json, suspended_at,
+                    share_json, generation
              FROM sandboxes ORDER BY id",
         )
         .fetch_all(pool)
@@ -486,7 +630,18 @@ impl Store {
         Ok(rows
             .into_iter()
             .map(
-                |(id, template, record, state, lease_block, tap, ports, suspended_at, share)| {
+                |(
+                    id,
+                    template,
+                    record,
+                    state,
+                    lease_block,
+                    tap,
+                    ports,
+                    suspended_at,
+                    share,
+                    generation,
+                )| {
                     SandboxRow {
                         id,
                         template,
@@ -497,6 +652,7 @@ impl Store {
                         ports: split_json(&ports),
                         share: serde_json::from_str(&share).ok(),
                         suspended_at,
+                        generation: generation as u64,
                     }
                 },
             )
@@ -825,81 +981,195 @@ impl Store {
         Ok(done as usize)
     }
 
-    pub async fn put_placement(&self, row: &PlacementRow) -> Result<()> {
-        on_pool!(self, pool => sqlx::query(
-            "INSERT INTO placements (id, node_id, record, version) VALUES ($1, $2, $3, 1)
-             ON CONFLICT (id) DO UPDATE SET node_id=excluded.node_id, record=excluded.record,
-                version=placements.version + 1",
+    /// Writes a placement ahead of asking its node to act, for a sandbox id
+    /// no row has yet. False when one does.
+    pub async fn insert_placement(&self, row: &PlacementRow) -> Result<bool> {
+        let done = on_pool!(self, pool => sqlx::query(
+            "INSERT INTO placements
+               (id, node_id, record, version, generation, pending_since_ms, missed, report_hash,
+                usage_at_ms)
+             VALUES ($1, $2, $3, 1, $4, $5, 0, 0, 0)
+             ON CONFLICT (id) DO NOTHING",
         )
         .bind(&row.id)
         .bind(&row.node_id)
         .bind(&row.record)
-        .execute(pool)
-        .await
-        .map(drop))?;
-        Ok(())
-    }
-
-    /// Writes `row` over the placement only while it is still at `expected`,
-    /// or only if there is none with `None`. False when another write got
-    /// there first.
-    pub async fn replace_placement(
-        &self,
-        row: &PlacementRow,
-        expected: Option<i64>,
-    ) -> Result<bool> {
-        let done = match expected {
-            None => on_pool!(self, pool => sqlx::query(
-                "INSERT INTO placements (id, node_id, record, version) VALUES ($1, $2, $3, 1)
-                 ON CONFLICT (id) DO NOTHING",
-            )
-            .bind(&row.id)
-            .bind(&row.node_id)
-            .bind(&row.record)
-            .execute(pool)
-            .await
-            .map(|done| done.rows_affected()))?,
-            Some(version) => on_pool!(self, pool => sqlx::query(
-                "UPDATE placements SET node_id=$2, record=$3, version=version + 1
-                 WHERE id=$1 AND version=$4",
-            )
-            .bind(&row.id)
-            .bind(&row.node_id)
-            .bind(&row.record)
-            .bind(version)
-            .execute(pool)
-            .await
-            .map(|done| done.rows_affected()))?,
-        };
-        Ok(done == 1)
-    }
-
-    /// Deletes the placement only while it is still at `version`.
-    pub async fn delete_placement_if(&self, id: &str, version: i64) -> Result<bool> {
-        let done = on_pool!(self, pool => sqlx::query(
-            "DELETE FROM placements WHERE id=$1 AND version=$2",
-        )
-        .bind(id)
-        .bind(version)
+        .bind(row.generation)
+        .bind(row.pending_since_ms)
         .execute(pool)
         .await
         .map(|done| done.rows_affected()))?;
         Ok(done == 1)
     }
 
-    pub async fn get_placement(&self, id: &str) -> Result<Option<PlacementRow>> {
-        let row: Option<(String, String, Vec<u8>, i64)> = on_pool!(self, pool => sqlx::query_as(
-            "SELECT id, node_id, record, version FROM placements WHERE id=$1",
+    /// Takes the record a node answered with for the placement it was asked
+    /// to act on, while the row still names that node at that generation.
+    /// `is_settled` clears the row's pending mark.
+    pub async fn update_placement(
+        &self,
+        row: &PlacementRow,
+        report_hash: i64,
+        is_settled: bool,
+    ) -> Result<bool> {
+        let done = on_pool!(self, pool => sqlx::query(
+            "UPDATE placements SET record=$4, report_hash=$5, version=version + 1,
+                pending_since_ms = CASE WHEN $6 THEN 0 ELSE pending_since_ms END,
+                missed = CASE WHEN $6 THEN 0 ELSE missed END
+             WHERE id=$1 AND node_id=$2 AND generation=$3",
         )
+        .bind(&row.id)
+        .bind(&row.node_id)
+        .bind(row.generation)
+        .bind(&row.record)
+        .bind(report_hash)
+        .bind(is_settled)
+        .execute(pool)
+        .await
+        .map(|done| done.rows_affected()))?;
+        Ok(done == 1)
+    }
+
+    /// Marks a placement pending with `record`, while it is still on its
+    /// node at its generation, ahead of asking that node to act on it.
+    pub async fn mark_placement_pending(
+        &self,
+        row: &PlacementRow,
+        report_hash: i64,
+        now_ms: i64,
+    ) -> Result<bool> {
+        let done = on_pool!(self, pool => sqlx::query(
+            "UPDATE placements SET record=$4, report_hash=$5, pending_since_ms=$6, missed=0,
+                version=version + 1
+             WHERE id=$1 AND node_id=$2 AND generation=$3",
+        )
+        .bind(&row.id)
+        .bind(&row.node_id)
+        .bind(row.generation)
+        .bind(&row.record)
+        .bind(report_hash)
+        .bind(now_ms)
+        .execute(pool)
+        .await
+        .map(|done| done.rows_affected()))?;
+        Ok(done == 1)
+    }
+
+    /// Hands a placement to `to_node` at the next generation, while it is
+    /// still on `from_node` (`""` for none) at `generation`, and marks it
+    /// pending until that node answers. Returns the new generation, or
+    /// `None` when another call placed or removed the sandbox first.
+    pub async fn move_placement(
+        &self,
+        id: &str,
+        from_node: &str,
+        generation: i64,
+        to_node: &str,
+        record: &[u8],
+        now_ms: i64,
+    ) -> Result<Option<i64>> {
+        let row: Option<(i64,)> = on_pool!(self, pool => sqlx::query_as(
+            "UPDATE placements SET node_id=$4, record=$5, generation=generation + 1,
+                pending_since_ms=$6, missed=0, version=version + 1
+             WHERE id=$1 AND node_id=$2 AND generation=$3
+             RETURNING generation",
+        )
+        .bind(id)
+        .bind(from_node)
+        .bind(generation)
+        .bind(to_node)
+        .bind(record)
+        .bind(now_ms)
+        .fetch_optional(pool)
+        .await)?;
+        Ok(row.map(|(generation,)| generation))
+    }
+
+    /// Takes a placement off its node, while it is still on `node_id` at
+    /// `generation`, for a sandbox the object store can bring back.
+    pub async fn unplace_placement(
+        &self,
+        id: &str,
+        node_id: &str,
+        generation: i64,
+        record: &[u8],
+    ) -> Result<bool> {
+        let done = on_pool!(self, pool => sqlx::query(
+            "UPDATE placements SET node_id='', record=$4, pending_since_ms=0, missed=0,
+                version=version + 1
+             WHERE id=$1 AND node_id=$2 AND generation=$3",
+        )
+        .bind(id)
+        .bind(node_id)
+        .bind(generation)
+        .bind(record)
+        .execute(pool)
+        .await
+        .map(|done| done.rows_affected()))?;
+        Ok(done == 1)
+    }
+
+    /// Deletes a sandbox: its row and every claim it holds, in one
+    /// transaction, so its name is free the moment it is gone. Returns the
+    /// row there was.
+    pub async fn remove_placement(&self, id: &str) -> Result<Option<PlacementRow>> {
+        let row: Option<PlacementRaw> = on_pool!(self, pool => {
+            let mut tx = pool.begin().await?;
+            let row = sqlx::query_as(&format!(
+                "DELETE FROM placements WHERE id=$1 RETURNING {PLACEMENT_COLUMNS}"
+            ))
+            .bind(id)
+            .fetch_optional(&mut *tx)
+            .await?;
+            sqlx::query("DELETE FROM claims WHERE sandbox_id=$1")
+                .bind(id)
+                .execute(&mut *tx)
+                .await?;
+            tx.commit().await?;
+            row
+        });
+        Ok(row.map(placement_row))
+    }
+
+    /// [`remove_placement`](Self::remove_placement), only while the row is
+    /// still on `node_id` at `generation`: a create that failed takes back
+    /// the row it wrote and nothing written since.
+    pub async fn remove_placement_at(
+        &self,
+        id: &str,
+        node_id: &str,
+        generation: i64,
+    ) -> Result<bool> {
+        let done = on_pool!(self, pool => {
+            let mut tx = pool.begin().await?;
+            let done = sqlx::query(
+                "DELETE FROM placements WHERE id=$1 AND node_id=$2 AND generation=$3",
+            )
+            .bind(id)
+            .bind(node_id)
+            .bind(generation)
+            .execute(&mut *tx)
+            .await?
+            .rows_affected();
+            if done == 1 {
+                sqlx::query("DELETE FROM claims WHERE sandbox_id=$1")
+                    .bind(id)
+                    .execute(&mut *tx)
+                    .await?;
+            }
+            tx.commit().await?;
+            done
+        });
+        Ok(done == 1)
+    }
+
+    pub async fn get_placement(&self, id: &str) -> Result<Option<PlacementRow>> {
+        let row: Option<PlacementRaw> = on_pool!(self, pool => sqlx::query_as(&format!(
+            "SELECT {PLACEMENT_COLUMNS} FROM placements WHERE id=$1"
+        ))
         .bind(id)
         .fetch_optional(pool)
         .await)?;
-        Ok(row.map(|(id, node_id, record, version)| PlacementRow {
-            id,
-            node_id,
-            record,
-            version,
-        }))
+        Ok(row.map(placement_row))
     }
 
     /// The sandbox holding a claim, if anyone does.
@@ -913,104 +1183,251 @@ impl Store {
         Ok(row.map(|(id,)| id))
     }
 
-    pub async fn delete_placement(&self, id: &str) -> Result<()> {
-        on_pool!(self, pool => sqlx::query("DELETE FROM placements WHERE id=$1")
-            .bind(id)
-            .execute(pool)
-            .await
-            .map(drop))?;
-        Ok(())
-    }
-
-    /// [`delete_placement`](Self::delete_placement), only while the row still
-    /// names `node_id`: a replica that has not caught up with a move would
-    /// otherwise delete the row the move just wrote.
-    pub async fn delete_placement_on(&self, id: &str, node_id: &str) -> Result<()> {
-        on_pool!(self, pool => sqlx::query("DELETE FROM placements WHERE id=$1 AND node_id=$2")
-            .bind(id)
-            .bind(node_id)
-            .execute(pool)
-            .await
-            .map(drop))?;
-        Ok(())
-    }
-
-    /// Drops every placement on a node. Used when a node re-registers, since
-    /// its sandboxes did not survive whatever restarted it.
-    pub async fn delete_placements_for_node(&self, node_id: &str) -> Result<usize> {
-        let done = on_pool!(self, pool => sqlx::query("DELETE FROM placements WHERE node_id=$1")
-            .bind(node_id)
-            .execute(pool)
-            .await
-            .map(|done| done.rows_affected()))?;
-        Ok(done as usize)
-    }
-
     pub async fn list_placements(&self) -> Result<Vec<PlacementRow>> {
-        let rows: Vec<(String, String, Vec<u8>, i64)> = on_pool!(self, pool => sqlx::query_as(
-            "SELECT id, node_id, record, version FROM placements ORDER BY id",
-        )
+        let rows: Vec<PlacementRaw> = on_pool!(self, pool => sqlx::query_as(&format!(
+            "SELECT {PLACEMENT_COLUMNS} FROM placements ORDER BY id"
+        ))
         .fetch_all(pool)
         .await)?;
-        Ok(rows
-            .into_iter()
-            .map(|(id, node_id, record, version)| PlacementRow {
-                id,
-                node_id,
-                record,
-                version,
-            })
-            .collect())
+        Ok(rows.into_iter().map(placement_row).collect())
     }
 
-    pub async fn put_tombstone(&self, row: &TombstoneRow) -> Result<()> {
-        on_pool!(self, pool => sqlx::query(
-            "INSERT INTO tombstones (sandbox_id, node_id, at) VALUES ($1, $2, $3)
-             ON CONFLICT (sandbox_id) DO UPDATE SET node_id=excluded.node_id, at=excluded.at",
-        )
-        .bind(&row.sandbox_id)
-        .bind(&row.node_id)
-        .bind(row.at)
-        .execute(pool)
-        .await
-        .map(drop))?;
-        Ok(())
-    }
+    /// Applies one node's heartbeat in one transaction: its status, and its
+    /// complete listing of sandboxes compared against the placements.
+    ///
+    /// A report numbered at or below the last one applied for the node is
+    /// ignored whole, so a delayed one cannot bring back what a later one
+    /// settled. Otherwise the listing is compared by set difference:
+    ///
+    /// * reported sandboxes whose row has no node and their generation are
+    ///   placed back on this node;
+    /// * reported sandboxes no row lists for this node at their generation
+    ///   come back in [`NodeReconciled::destroy`], for the node to destroy;
+    /// * rows for this node the listing leaves out count a miss, unless a
+    ///   node was asked to act on them after `pending_after_ms`, and a row
+    ///   at two consecutive misses is lost: `lose` decides it as it does for
+    ///   a write-off, given the kind and detail of the sandbox's last event
+    ///   from this node;
+    /// * rows whose report digest changed, or whose usage was last written
+    ///   before `usage_before_ms`, are rewritten with what `restate` makes of
+    ///   them.
+    pub async fn reconcile_node(
+        &self,
+        report: &NodeReport,
+        restate: impl Fn(&PlacementRow) -> Option<(Vec<u8>, i64)>,
+        lose: impl Fn(&PlacementRow, Option<(i32, String)>) -> Option<Vec<u8>>,
+    ) -> Result<Reconciled> {
+        let listing = serde_json::to_string(&report.sandboxes)?;
+        let (create, clear, fill) = if self.is_postgres() {
+            (
+                "CREATE TEMP TABLE IF NOT EXISTS reported
+                   (id TEXT PRIMARY KEY, generation BIGINT NOT NULL, hash BIGINT NOT NULL,
+                    in_flight BIGINT NOT NULL)
+                   ON COMMIT DELETE ROWS",
+                None,
+                "INSERT INTO reported (id, generation, hash, in_flight)
+                 SELECT i, g, h, f
+                 FROM jsonb_to_recordset($1::jsonb) AS x(i TEXT, g BIGINT, h BIGINT, f BIGINT)
+                 WHERE true ON CONFLICT (id) DO NOTHING",
+            )
+        } else {
+            (
+                "CREATE TEMP TABLE IF NOT EXISTS reported
+                   (id TEXT PRIMARY KEY, generation INTEGER NOT NULL, hash INTEGER NOT NULL,
+                    in_flight INTEGER NOT NULL)",
+                Some("DELETE FROM reported"),
+                "INSERT INTO reported (id, generation, hash, in_flight)
+                 SELECT json_extract(value, '$.i'), json_extract(value, '$.g'),
+                        json_extract(value, '$.h'), json_extract(value, '$.f')
+                 FROM json_each($1) WHERE true ON CONFLICT (id) DO NOTHING",
+            )
+        };
+        let node = &report.node;
+        let lock = self.row_lock();
+        let outcome = on_pool!(self, pool => {
+            let mut tx = pool.begin().await?;
+            let applied = sqlx::query(
+                "UPDATE nodes SET info=$2, status=$3, last_heartbeat_ms=$4, is_reported=1,
+                    cpu_capacity_millis=$5, committed_cpu_millis=$6, free_mem_mib=$7,
+                    reserved_cpu_millis=0, reserved_mem_mib=0, report_seq=$8
+                 WHERE id=$1 AND report_seq < $8",
+            )
+            .bind(&node.id)
+            .bind(&node.info)
+            .bind(&node.status)
+            .bind(node.last_heartbeat_ms)
+            .bind(node.cpu_capacity_millis as i64)
+            .bind(node.committed_cpu_millis as i64)
+            .bind(node.free_mem_mib as i64)
+            .bind(report.seq)
+            .execute(&mut *tx)
+            .await?
+            .rows_affected();
+            if applied == 0 {
+                let known: Option<(i64,)> = sqlx::query_as("SELECT report_seq FROM nodes WHERE id=$1")
+                    .bind(&node.id)
+                    .fetch_optional(&mut *tx)
+                    .await?;
+                tx.commit().await?;
+                match known {
+                    Some(_) => Reconciled::Stale,
+                    None => Reconciled::Unknown,
+                }
+            } else {
+                sqlx::query(create).execute(&mut *tx).await?;
+                if let Some(clear) = clear {
+                    sqlx::query(clear).execute(&mut *tx).await?;
+                }
+                sqlx::query(fill).bind(&listing).execute(&mut *tx).await?;
 
-    pub async fn delete_tombstone(&self, sandbox_id: &str) -> Result<()> {
-        on_pool!(self, pool => sqlx::query("DELETE FROM tombstones WHERE sandbox_id=$1")
-            .bind(sandbox_id)
-            .execute(pool)
-            .await
-            .map(drop))?;
-        Ok(())
-    }
+                let replaced: Vec<PlacementRaw> = sqlx::query_as(&format!(
+                    "UPDATE placements SET node_id=$1, missed=0, version=version + 1
+                     WHERE node_id='' AND EXISTS (SELECT 1 FROM reported r
+                        WHERE r.id = placements.id AND r.generation = placements.generation)
+                     RETURNING {PLACEMENT_COLUMNS}"
+                ))
+                .bind(&node.id)
+                .fetch_all(&mut *tx)
+                .await?;
+                let destroy: Vec<(String, i64)> = sqlx::query_as(
+                    "SELECT r.id, r.generation FROM reported r
+                     WHERE NOT EXISTS (SELECT 1 FROM placements p
+                        WHERE p.id = r.id AND p.node_id = $1 AND p.generation = r.generation)
+                     ORDER BY r.id",
+                )
+                .bind(&node.id)
+                .fetch_all(&mut *tx)
+                .await?;
+                sqlx::query(
+                    "UPDATE placements SET missed=0
+                     WHERE node_id=$1 AND missed > 0 AND EXISTS (SELECT 1 FROM reported r
+                        WHERE r.id = placements.id AND r.generation = placements.generation)",
+                )
+                .bind(&node.id)
+                .execute(&mut *tx)
+                .await?;
+                sqlx::query(
+                    "UPDATE placements SET missed=missed + 1
+                     WHERE node_id=$1 AND pending_since_ms <= $2 AND NOT EXISTS (
+                        SELECT 1 FROM reported r
+                        WHERE r.id = placements.id AND r.generation = placements.generation)",
+                )
+                .bind(&node.id)
+                .bind(report.pending_after_ms)
+                .execute(&mut *tx)
+                .await?;
 
-    pub async fn list_tombstones(&self) -> Result<Vec<TombstoneRow>> {
-        let rows: Vec<(String, String, i64)> = on_pool!(self, pool => sqlx::query_as(
-            "SELECT sandbox_id, node_id, at FROM tombstones ORDER BY sandbox_id",
-        )
-        .fetch_all(pool)
-        .await)?;
-        Ok(rows
-            .into_iter()
-            .map(|(sandbox_id, node_id, at)| TombstoneRow {
-                sandbox_id,
-                node_id,
-                at,
-            })
-            .collect())
-    }
+                let missing: Vec<PlacementRaw> = sqlx::query_as(&format!(
+                    "SELECT {PLACEMENT_COLUMNS} FROM placements
+                     WHERE node_id=$1 AND missed >= {LOST_AFTER_MISSES} ORDER BY id{lock}"
+                ))
+                .bind(&node.id)
+                .fetch_all(&mut *tx)
+                .await?;
+                let mut lost = Vec::with_capacity(missing.len());
+                for row in missing.into_iter().map(placement_row) {
+                    let last: Option<(i64, String)> = sqlx::query_as(
+                        "SELECT kind, detail FROM events WHERE sandbox_id=$1 AND node_id=$2
+                         ORDER BY seq DESC LIMIT 1",
+                    )
+                    .bind(&row.id)
+                    .bind(&node.id)
+                    .fetch_optional(&mut *tx)
+                    .await?;
+                    let unplaced = lose(&row, last.map(|(kind, detail)| (kind as i32, detail)));
+                    if settle_lost!(tx, &row, unplaced.as_deref()) {
+                        lost.push(Lost { row, unplaced });
+                    }
+                }
 
-    /// Drops tombstones recorded before `cutoff` (unix seconds), returning how
-    /// many. A node that never comes back must not accumulate them forever.
-    pub async fn prune_tombstones(&self, cutoff: i64) -> Result<usize> {
-        let done = on_pool!(self, pool => sqlx::query("DELETE FROM tombstones WHERE at < $1")
-            .bind(cutoff)
-            .execute(pool)
-            .await
-            .map(|done| done.rows_affected()))?;
-        Ok(done as usize)
+                let stale: Vec<PlacementRaw> = sqlx::query_as(&format!(
+                    "SELECT {PLACEMENT_COLUMNS_OF_P} FROM placements p
+                     JOIN reported r ON r.id = p.id AND r.generation = p.generation
+                     WHERE p.node_id=$1 AND r.in_flight = 0
+                       AND (p.report_hash <> r.hash OR p.usage_at_ms < $2)
+                     ORDER BY p.id"
+                ))
+                .bind(&node.id)
+                .bind(report.usage_before_ms)
+                .fetch_all(&mut *tx)
+                .await?;
+                let mut changed = Vec::new();
+                let mut hashes = Vec::new();
+                for mut row in stale.into_iter().map(placement_row) {
+                    let Some((record, hash)) = restate(&row) else {
+                        continue;
+                    };
+                    row.record = record;
+                    changed.push(row);
+                    hashes.push(hash);
+                }
+                // Written in batches of one statement each: a row at a time
+                // is a round trip each, which at a node's thousands of
+                // sandboxes is most of the heartbeat. Each row is written
+                // only over the version read, on this node at its
+                // generation: the read took no lock, and an edit or a move
+                // committed since wins, to be restated at the next beat.
+                let mut written = std::collections::HashSet::new();
+                for (rows, hashes) in changed.chunks(RESTATE_BATCH).zip(hashes.chunks(RESTATE_BATCH)) {
+                    let values = (0..rows.len())
+                        .map(|i| {
+                            let n = 5 * i + 3;
+                            format!("(${n}, ${}, ${}, ${}, ${})", n + 1, n + 2, n + 3, n + 4)
+                        })
+                        .collect::<Vec<_>>()
+                        .join(", ");
+                    let sql = format!(
+                        "UPDATE placements SET record=v.column4, report_hash=v.column5,
+                            usage_at_ms=$1, version=placements.version + 1
+                         FROM (VALUES {values}) AS v
+                         WHERE placements.id = v.column1 AND placements.version = v.column2
+                           AND placements.generation = v.column3 AND placements.node_id = $2
+                         RETURNING placements.id"
+                    );
+                    let mut query = sqlx::query_as::<_, (String,)>(&sql)
+                        .bind(report.node.last_heartbeat_ms)
+                        .bind(&node.id);
+                    for (row, hash) in rows.iter().zip(hashes) {
+                        query = query
+                            .bind(&row.id)
+                            .bind(row.version)
+                            .bind(row.generation)
+                            .bind(&row.record)
+                            .bind(*hash);
+                    }
+                    written.extend(query.fetch_all(&mut *tx).await?.into_iter().map(|(id,)| id));
+                }
+                let restated: Vec<PlacementRow> = changed
+                    .into_iter()
+                    .filter(|row| written.contains(&row.id))
+                    .map(|row| PlacementRow {
+                        version: row.version + 1,
+                        ..row
+                    })
+                    .collect();
+
+                let unanswered: Vec<(String,)> = sqlx::query_as(
+                    "SELECT p.id FROM placements p
+                     JOIN reported r ON r.id = p.id AND r.generation = p.generation
+                     WHERE p.node_id=$1 AND r.in_flight = 0 AND p.pending_since_ms > 0
+                       AND p.pending_since_ms <= $2
+                     ORDER BY p.id",
+                )
+                .bind(&node.id)
+                .bind(report.unanswered_before_ms)
+                .fetch_all(&mut *tx)
+                .await?;
+                tx.commit().await?;
+                Reconciled::Applied(NodeReconciled {
+                    replaced: replaced.into_iter().map(placement_row).collect(),
+                    destroy,
+                    lost,
+                    restated,
+                    unanswered: unanswered.into_iter().map(|(id,)| id).collect(),
+                })
+            }
+        });
+        Ok(outcome)
     }
 
     /// Stores an unscoped secret, clearing any scope the name had.
@@ -1270,29 +1687,15 @@ impl Store {
         Err(StoreError::Contended("address slice"))
     }
 
-    /// Records a heartbeat. Returns false for a node the fleet does not know,
-    /// which is the signal for it to register again.
-    ///
-    /// Clears the node's reservations: the status it carries was sampled
-    /// after them, so it already accounts for what they held.
-    pub async fn heartbeat_node(&self, row: &NodeRow) -> Result<bool> {
-        let done = on_pool!(self, pool => sqlx::query(
-            "UPDATE nodes SET info=$2, status=$3, last_heartbeat_ms=$4, is_reported=1,
-                cpu_capacity_millis=$5, committed_cpu_millis=$6, free_mem_mib=$7,
-                reserved_cpu_millis=0, reserved_mem_mib=0
-             WHERE id=$1",
+    /// The last report applied from a node, which its next must exceed.
+    pub async fn node_report_seq(&self, id: &str) -> Result<i64> {
+        let row: Option<(i64,)> = on_pool!(self, pool => sqlx::query_as(
+            "SELECT report_seq FROM nodes WHERE id=$1",
         )
-        .bind(&row.id)
-        .bind(&row.info)
-        .bind(&row.status)
-        .bind(row.last_heartbeat_ms)
-        .bind(row.cpu_capacity_millis as i64)
-        .bind(row.committed_cpu_millis as i64)
-        .bind(row.free_mem_mib as i64)
-        .execute(pool)
-        .await
-        .map(|done| done.rows_affected()))?;
-        Ok(done > 0)
+        .bind(id)
+        .fetch_optional(pool)
+        .await)?;
+        Ok(row.map_or(0, |(seq,)| seq))
     }
 
     pub async fn list_nodes(&self) -> Result<Vec<NodeRow>> {
@@ -1340,20 +1743,53 @@ impl Store {
     }
 
     /// Removes a node silent since before `before_ms`, for the leader of
-    /// `epoch` only. False when the node has been heard from since, or a
-    /// later leader has taken over.
-    pub async fn write_off_node(&self, id: &str, before_ms: i64, epoch: i64) -> Result<bool> {
-        let done = on_pool!(self, pool => sqlx::query(
-            "DELETE FROM nodes WHERE id=$1 AND last_heartbeat_ms < $2
-               AND (SELECT epoch FROM leader_epoch WHERE id=1) = $3",
-        )
-        .bind(id)
-        .bind(before_ms)
-        .bind(epoch)
-        .execute(pool)
-        .await
-        .map(|done| done.rows_affected()))?;
-        Ok(done == 1)
+    /// `epoch` only, and settles every placement on it in the same
+    /// transaction: `lose` gives the record of one the object store can
+    /// bring back, which is kept with no node, and `None` for one it cannot,
+    /// which is deleted with its claims. `None` when the node has been heard
+    /// from since, or a later leader has taken over.
+    pub async fn write_off_node(
+        &self,
+        id: &str,
+        before_ms: i64,
+        epoch: i64,
+        lose: impl Fn(&PlacementRow) -> Option<Vec<u8>>,
+    ) -> Result<Option<Vec<Lost>>> {
+        let lock = self.row_lock();
+        let lost = on_pool!(self, pool => {
+            let mut tx = pool.begin().await?;
+            let done = sqlx::query(
+                "DELETE FROM nodes WHERE id=$1 AND last_heartbeat_ms < $2
+                   AND (SELECT epoch FROM leader_epoch WHERE id=1) = $3",
+            )
+            .bind(id)
+            .bind(before_ms)
+            .bind(epoch)
+            .execute(&mut *tx)
+            .await?
+            .rows_affected();
+            if done == 1 {
+                let rows: Vec<PlacementRaw> = sqlx::query_as(&format!(
+                    "SELECT {PLACEMENT_COLUMNS} FROM placements WHERE node_id=$1 ORDER BY id{lock}"
+                ))
+                .bind(id)
+                .fetch_all(&mut *tx)
+                .await?;
+                let mut lost = Vec::with_capacity(rows.len());
+                for row in rows.into_iter().map(placement_row) {
+                    let unplaced = lose(&row);
+                    if settle_lost!(tx, &row, unplaced.as_deref()) {
+                        lost.push(Lost { row, unplaced });
+                    }
+                }
+                tx.commit().await?;
+                Some(lost)
+            } else {
+                tx.commit().await?;
+                None
+            }
+        });
+        Ok(lost)
     }
 
     /// Records that a node on a build from before casync chunks was heard
@@ -1526,23 +1962,6 @@ impl Store {
     pub async fn release_claims(&self, sandbox_id: &str) -> Result<()> {
         on_pool!(self, pool => sqlx::query("DELETE FROM claims WHERE sandbox_id=$1")
             .bind(sandbox_id)
-            .execute(pool)
-            .await
-            .map(drop))?;
-        Ok(())
-    }
-
-    /// [`release_claims`](Self::release_claims), unless the sandbox is placed
-    /// anywhere but `node_id`. A node that stops reporting a sandbox may only
-    /// mean it moved, and a replica that has not caught up with the move
-    /// would otherwise free a name that is still in use.
-    pub async fn release_claims_unless_moved(&self, sandbox_id: &str, node_id: &str) -> Result<()> {
-        on_pool!(self, pool => sqlx::query(
-            "DELETE FROM claims WHERE sandbox_id=$1
-               AND NOT EXISTS (SELECT 1 FROM placements WHERE id=$1 AND node_id<>$2)",
-        )
-            .bind(sandbox_id)
-            .bind(node_id)
             .execute(pool)
             .await
             .map(drop))?;
@@ -2132,6 +2551,7 @@ mod tests {
             }],
             share: None,
             suspended_at: 0,
+            generation: 0,
         }
     }
 
@@ -2472,15 +2892,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
         let path = dir.join("state.db");
         let store = Store::open(&path).await.unwrap();
-        store
-            .put_placement(&PlacementRow {
-                id: "a".into(),
-                node_id: "n1".into(),
-                record: Vec::new(),
-                version: 0,
-            })
-            .await
-            .unwrap();
+        assert!(store.insert_placement(&placed("a", "n1", 1)).await.unwrap());
 
         let file = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
         assert_eq!(file, 0o600, "database is {file:o}");
@@ -2493,54 +2905,353 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    #[tokio::test]
-    async fn placements_can_be_dropped_per_node() {
-        let store = Store::open_in_memory().await.unwrap();
-        for (id, node) in [("a", "n1"), ("b", "n1"), ("c", "n2")] {
-            store
-                .put_placement(&PlacementRow {
-                    id: id.into(),
-                    node_id: node.into(),
-                    record: Vec::new(),
-                    version: 0,
-                })
-                .await
-                .unwrap();
+    fn placed(id: &str, node: &str, generation: i64) -> PlacementRow {
+        PlacementRow {
+            id: id.into(),
+            node_id: node.into(),
+            record: Vec::new(),
+            generation,
+            ..Default::default()
         }
-        assert_eq!(store.delete_placements_for_node("n1").await.unwrap(), 2);
-        let left = store.list_placements().await.unwrap();
-        assert_eq!(left.len(), 1);
-        assert_eq!(left[0].node_id, "n2");
     }
 
     #[tokio::test]
-    async fn a_placement_is_written_only_over_the_version_read() {
+    async fn a_placement_moves_only_from_where_and_what_generation_it_was_read() {
         let store = Store::open_in_memory().await.unwrap();
-        let row = |node: &str| PlacementRow {
-            id: "a".into(),
-            node_id: node.into(),
-            record: Vec::new(),
-            version: 0,
-        };
-        assert!(store.replace_placement(&row("n1"), None).await.unwrap());
-        assert!(!store.replace_placement(&row("n2"), None).await.unwrap());
-        let read = store.get_placement("a").await.unwrap().unwrap();
-        assert!(
+        assert!(store.insert_placement(&placed("a", "n1", 1)).await.unwrap());
+        assert!(!store.insert_placement(&placed("a", "n2", 1)).await.unwrap());
+        assert_eq!(
             store
-                .replace_placement(&row("n2"), Some(read.version))
+                .move_placement("a", "n1", 1, "n2", &[], 5)
                 .await
-                .unwrap()
+                .unwrap(),
+            Some(2)
+        );
+        assert_eq!(
+            store
+                .move_placement("a", "n1", 1, "n3", &[], 6)
+                .await
+                .unwrap(),
+            None
+        );
+        let row = store.get_placement("a").await.unwrap().unwrap();
+        assert_eq!(
+            (row.node_id.as_str(), row.generation, row.pending_since_ms),
+            ("n2", 2, 5)
         );
         assert!(
             !store
-                .replace_placement(&row("n3"), Some(read.version))
+                .update_placement(&placed("a", "n2", 1), 0, true)
                 .await
                 .unwrap()
         );
-        assert!(!store.delete_placement_if("a", read.version).await.unwrap());
-        let now = store.get_placement("a").await.unwrap().unwrap();
-        assert_eq!(now.node_id, "n2");
-        assert!(store.delete_placement_if("a", now.version).await.unwrap());
+        assert!(
+            store
+                .update_placement(&placed("a", "n2", 2), 0, true)
+                .await
+                .unwrap()
+        );
+        assert_eq!(
+            store
+                .get_placement("a")
+                .await
+                .unwrap()
+                .unwrap()
+                .pending_since_ms,
+            0
+        );
+        assert!(!store.unplace_placement("a", "n1", 2, &[]).await.unwrap());
+        assert!(store.unplace_placement("a", "n2", 2, &[]).await.unwrap());
+        assert_eq!(
+            store
+                .move_placement("a", "", 2, "n1", &[], 7)
+                .await
+                .unwrap(),
+            Some(3)
+        );
+    }
+
+    /// A write-off or a lost listing settles the row it read. A move that
+    /// committed after the read put the sandbox on another node, which the
+    /// settling must not delete or take back.
+    #[tokio::test]
+    async fn a_lost_row_is_settled_only_as_it_was_read() {
+        let store = Store::open_in_memory().await.unwrap();
+        store.insert_placement(&placed("a", "n1", 1)).await.unwrap();
+        let read = store.get_placement("a").await.unwrap().unwrap();
+        store
+            .move_placement("a", "n1", 1, "n2", &[], 5)
+            .await
+            .unwrap();
+        let settled = async {
+            on_pool!(store, pool => {
+                let mut tx = pool.begin().await?;
+                let settled = settle_lost!(tx, &read, None::<&[u8]>);
+                tx.commit().await?;
+                Ok::<_, sqlx::Error>(settled)
+            })
+        };
+        assert!(!settled.await.unwrap());
+        let row = store.get_placement("a").await.unwrap();
+        assert_eq!(row.map(|row| row.node_id).as_deref(), Some("n2"));
+    }
+
+    /// A delete takes the sandbox's claims in the same transaction, so its
+    /// name is free the moment the row is gone.
+    #[tokio::test]
+    async fn removing_a_placement_frees_its_claims() {
+        let store = Store::open_in_memory().await.unwrap();
+        store.claim("name:web", "a", 1).await.unwrap();
+        assert!(store.insert_placement(&placed("a", "n1", 1)).await.unwrap());
+        assert!(!store.remove_placement_at("a", "n1", 2).await.unwrap());
+        assert_eq!(
+            store.claim_holder("name:web").await.unwrap().as_deref(),
+            Some("a")
+        );
+        let removed = store.remove_placement("a").await.unwrap().unwrap();
+        assert_eq!(removed.node_id, "n1");
+        assert_eq!(store.claim_holder("name:web").await.unwrap(), None);
+        assert!(store.remove_placement("a").await.unwrap().is_none());
+    }
+
+    async fn reporting(store: &Store, node: &str) {
+        store
+            .register_node(
+                &NodeRow {
+                    id: node.into(),
+                    ..Default::default()
+                },
+                None,
+                8,
+            )
+            .await
+            .unwrap();
+    }
+
+    fn report(node: &str, seq: i64, listed: &[(&str, i64)]) -> NodeReport {
+        NodeReport {
+            node: NodeRow {
+                id: node.into(),
+                last_heartbeat_ms: 1_000 + seq,
+                ..Default::default()
+            },
+            seq,
+            sandboxes: listed
+                .iter()
+                .map(|(id, generation)| ReportedSandbox {
+                    id: id.to_string(),
+                    generation: *generation,
+                    hash: 0,
+                    in_flight: 0,
+                })
+                .collect(),
+            pending_after_ms: 100,
+            usage_before_ms: 0,
+            unanswered_before_ms: 50,
+        }
+    }
+
+    async fn apply(store: &Store, report: &NodeReport) -> Reconciled {
+        store
+            .reconcile_node(
+                report,
+                |_| None,
+                |row, _| (row.id == "durable").then(Vec::new),
+            )
+            .await
+            .unwrap()
+    }
+
+    fn applied(outcome: Reconciled) -> NodeReconciled {
+        match outcome {
+            Reconciled::Applied(applied) => applied,
+            Reconciled::Stale => panic!("stale"),
+            Reconciled::Unknown => panic!("unknown"),
+        }
+    }
+
+    /// A node holding a sandbox at a generation the store no longer lists
+    /// for it holds a stale copy, and so does one holding a sandbox placed
+    /// elsewhere or deleted.
+    #[tokio::test]
+    async fn a_node_destroys_what_the_store_does_not_list_for_it() {
+        let store = Store::open_in_memory().await.unwrap();
+        reporting(&store, "n1").await;
+        for row in [
+            placed("kept", "n1", 3),
+            placed("moved", "n2", 2),
+            placed("old", "n1", 4),
+        ] {
+            store.insert_placement(&row).await.unwrap();
+        }
+        let out = applied(
+            apply(
+                &store,
+                &report(
+                    "n1",
+                    1,
+                    &[("kept", 3), ("moved", 1), ("old", 3), ("gone", 1)],
+                ),
+            )
+            .await,
+        );
+        assert_eq!(
+            out.destroy,
+            [("gone".into(), 1), ("moved".into(), 1), ("old".into(), 3)]
+        );
+    }
+
+    /// A node written off and back still holding a sandbox kept unplaced,
+    /// at the generation the row has, holds the current copy: nothing placed
+    /// it since. It is placed back there rather than destroyed. At an older
+    /// generation it is a stale copy all the same.
+    #[tokio::test]
+    async fn a_returning_node_keeps_what_nothing_placed_since() {
+        let store = Store::open_in_memory().await.unwrap();
+        reporting(&store, "n1").await;
+        store
+            .insert_placement(&placed("kept", "", 2))
+            .await
+            .unwrap();
+        store
+            .insert_placement(&placed("stale", "", 3))
+            .await
+            .unwrap();
+        let out = applied(apply(&store, &report("n1", 1, &[("kept", 2), ("stale", 2)])).await);
+        let replaced: Vec<_> = out.replaced.iter().map(|row| row.id.as_str()).collect();
+        assert_eq!(replaced, ["kept"]);
+        assert_eq!(out.destroy, [("stale".into(), 2)]);
+        assert_eq!(
+            store.get_placement("kept").await.unwrap().unwrap().node_id,
+            "n1"
+        );
+        assert_eq!(
+            store.get_placement("stale").await.unwrap().unwrap().node_id,
+            ""
+        );
+    }
+
+    /// Reports are numbered by their node, and one no newer than the last
+    /// applied changes nothing: a delayed one cannot count a miss, restate a
+    /// sandbox or move the node's status back.
+    #[tokio::test]
+    async fn a_delayed_report_is_ignored() {
+        let store = Store::open_in_memory().await.unwrap();
+        reporting(&store, "n1").await;
+        store.insert_placement(&placed("a", "n1", 1)).await.unwrap();
+        applied(apply(&store, &report("n1", 5, &[("a", 1)])).await);
+        for seq in [5, 4] {
+            assert!(matches!(
+                apply(&store, &report("n1", seq, &[])).await,
+                Reconciled::Stale
+            ));
+        }
+        assert_eq!(store.node_report_seq("n1").await.unwrap(), 5);
+        applied(apply(&store, &report("n1", 6, &[])).await);
+        applied(apply(&store, &report("n1", 7, &[("a", 1)])).await);
+        assert!(store.get_placement("a").await.unwrap().is_some());
+        assert!(matches!(
+            apply(&store, &report("nx", 1, &[])).await,
+            Reconciled::Unknown
+        ));
+    }
+
+    /// A row is lost only after two consecutive complete listings leave it
+    /// out. One that comes back in between starts counting again, and a row
+    /// whose node is still acting on it is not counted at all.
+    #[tokio::test]
+    async fn a_listing_that_leaves_a_row_out_once_loses_nothing() {
+        let store = Store::open_in_memory().await.unwrap();
+        reporting(&store, "n1").await;
+        store.insert_placement(&placed("a", "n1", 1)).await.unwrap();
+        store
+            .insert_placement(&PlacementRow {
+                pending_since_ms: 500,
+                ..placed("pending", "n1", 1)
+            })
+            .await
+            .unwrap();
+        store
+            .insert_placement(&placed("durable", "n1", 1))
+            .await
+            .unwrap();
+        assert!(
+            applied(apply(&store, &report("n1", 1, &[])).await)
+                .lost
+                .is_empty()
+        );
+        assert!(
+            applied(apply(&store, &report("n1", 2, &[("a", 1), ("durable", 1)])).await)
+                .lost
+                .is_empty()
+        );
+        assert!(
+            applied(apply(&store, &report("n1", 3, &[])).await)
+                .lost
+                .is_empty()
+        );
+        let lost = applied(apply(&store, &report("n1", 4, &[])).await).lost;
+        let ids: Vec<_> = lost
+            .iter()
+            .map(|l| (l.row.id.as_str(), l.unplaced.is_some()))
+            .collect();
+        assert_eq!(ids, [("a", false), ("durable", true)]);
+        assert!(store.get_placement("a").await.unwrap().is_none());
+        assert_eq!(
+            store
+                .get_placement("durable")
+                .await
+                .unwrap()
+                .unwrap()
+                .node_id,
+            ""
+        );
+        assert!(store.get_placement("pending").await.unwrap().is_some());
+    }
+
+    /// Only rows whose report changed are rewritten, and a row the node
+    /// holds whose create never had its answer recorded is named.
+    #[tokio::test]
+    async fn a_report_rewrites_only_what_changed() {
+        let store = Store::open_in_memory().await.unwrap();
+        reporting(&store, "n1").await;
+        store
+            .insert_placement(&placed("same", "n1", 1))
+            .await
+            .unwrap();
+        store
+            .insert_placement(&placed("changed", "n1", 1))
+            .await
+            .unwrap();
+        store
+            .insert_placement(&PlacementRow {
+                pending_since_ms: 10,
+                ..placed("unanswered", "n1", 1)
+            })
+            .await
+            .unwrap();
+        let mut beat = report("n1", 1, &[("same", 1), ("changed", 1), ("unanswered", 1)]);
+        beat.sandboxes[1].hash = 7;
+        let out = store
+            .reconcile_node(
+                &beat,
+                |row| Some((vec![1], if row.id == "changed" { 7 } else { 0 })),
+                |_, _| None,
+            )
+            .await
+            .unwrap();
+        let out = applied(out);
+        let ids: Vec<_> = out.restated.iter().map(|row| row.id.as_str()).collect();
+        assert_eq!(ids, ["changed"]);
+        assert_eq!(out.unanswered, ["unanswered"]);
+        beat.seq = 2;
+        let again = applied(
+            store
+                .reconcile_node(&beat, |_| Some((vec![2], 7)), |_, _| None)
+                .await
+                .unwrap(),
+        );
+        assert!(again.restated.is_empty());
     }
 
     /// The last time an old-build node was heard from starts at the upgrade,
@@ -2577,12 +3288,7 @@ mod tests {
         };
         store.register_node(&node, None, 8).await.unwrap();
         store
-            .put_placement(&PlacementRow {
-                id: "sbx_a".into(),
-                node_id: "n1".into(),
-                record: vec![],
-                version: 0,
-            })
+            .insert_placement(&placed("sbx_a", "n1", 1))
             .await
             .unwrap();
         assert!(
@@ -2594,7 +3300,7 @@ mod tests {
         assert_eq!(store.address_pool().await.unwrap().2, 256);
         assert_eq!(store.list_nodes().await.unwrap().len(), 1);
 
-        store.delete_placement("sbx_a").await.unwrap();
+        store.remove_placement("sbx_a").await.unwrap();
         assert!(
             store
                 .change_address_pool("100.64.0.0/16", "fd00::/48", 1024)
@@ -2619,12 +3325,17 @@ mod tests {
             ..Default::default()
         };
         store.register_node(&node, None, 8).await.unwrap();
-        store
-            .heartbeat_node(&NodeRow {
+        let beat = NodeReport {
+            node: NodeRow {
                 committed_cpu_millis: 14_000,
                 free_mem_mib: 4096,
                 ..node.clone()
-            })
+            },
+            seq: 1,
+            ..Default::default()
+        };
+        store
+            .reconcile_node(&beat, |_| None, |_, _| None)
             .await
             .unwrap();
         assert!(store.reserve_capacity("n1", 1000, 128).await.unwrap());
@@ -2651,103 +3362,30 @@ mod tests {
         let deposed = store.next_leader_epoch().await.unwrap();
         let current = store.next_leader_epoch().await.unwrap();
         assert_eq!(store.leader_epoch().await.unwrap(), current);
-        assert!(!store.write_off_node("n1", 2_000, deposed).await.unwrap());
-        assert!(!store.write_off_node("n1", 500, current).await.unwrap());
-        assert!(store.write_off_node("n1", 2_000, current).await.unwrap());
-        assert!(store.list_nodes().await.unwrap().is_empty());
-    }
-
-    #[tokio::test]
-    async fn claims_of_a_sandbox_that_moved_are_kept() {
-        let store = Store::open_in_memory().await.unwrap();
-        for (id, node) in [("moved", "n2"), ("gone", "n1")] {
-            store.claim(&format!("name:{id}"), id, 1).await.unwrap();
+        assert!(store.insert_placement(&placed("a", "n1", 1)).await.unwrap());
+        let lose = |_: &PlacementRow| None;
+        assert!(
             store
-                .put_placement(&PlacementRow {
-                    id: id.into(),
-                    node_id: node.into(),
-                    record: Vec::new(),
-                    version: 0,
-                })
+                .write_off_node("n1", 2_000, deposed, lose)
                 .await
-                .unwrap();
-        }
-        for id in ["moved", "gone"] {
-            store.release_claims_unless_moved(id, "n1").await.unwrap();
-        }
-        assert_eq!(
-            store.claim_holder("name:moved").await.unwrap().as_deref(),
-            Some("moved")
+                .unwrap()
+                .is_none()
         );
-        assert_eq!(store.claim_holder("name:gone").await.unwrap(), None);
-    }
-
-    #[tokio::test]
-    async fn a_placement_is_deleted_only_from_the_node_it_names() {
-        let store = Store::open_in_memory().await.unwrap();
-        for (id, node) in [("moved", ""), ("gone", "n1")] {
+        assert!(
             store
-                .put_placement(&PlacementRow {
-                    id: id.into(),
-                    node_id: node.into(),
-                    record: Vec::new(),
-                    version: 0,
-                })
+                .write_off_node("n1", 500, current, lose)
                 .await
-                .unwrap();
-        }
-        for id in ["moved", "gone"] {
-            store.delete_placement_on(id, "n1").await.unwrap();
-        }
-        let left: Vec<String> = store
-            .list_placements()
+                .unwrap()
+                .is_none()
+        );
+        assert!(store.get_placement("a").await.unwrap().is_some());
+        let lost = store
+            .write_off_node("n1", 2_000, current, lose)
             .await
             .unwrap()
-            .into_iter()
-            .map(|row| row.id)
-            .collect();
-        assert_eq!(left, ["moved"]);
-    }
-
-    /// A delete accepted while the node was down has to outlive the process
-    /// that accepted it, or a node returning days later is simply re-adopted.
-    #[tokio::test]
-    async fn tombstones_round_trip_and_can_be_cleared() {
-        let store = Store::open_in_memory().await.unwrap();
-        store
-            .put_tombstone(&TombstoneRow {
-                sandbox_id: "sbx_a".into(),
-                node_id: "n1".into(),
-                at: 1_800_000_000,
-            })
-            .await
             .unwrap();
-        let listed = store.list_tombstones().await.unwrap();
-        assert_eq!(listed.len(), 1);
-        assert_eq!(listed[0].node_id, "n1");
-        assert_eq!(listed[0].at, 1_800_000_000);
-
-        store.delete_tombstone("sbx_a").await.unwrap();
-        assert!(store.list_tombstones().await.unwrap().is_empty());
-    }
-
-    /// A node that never returns must not leave its tombstones behind forever.
-    #[tokio::test]
-    async fn old_tombstones_are_pruned() {
-        let store = Store::open_in_memory().await.unwrap();
-        for (id, at) in [("old", 1_000), ("new", 9_000)] {
-            store
-                .put_tombstone(&TombstoneRow {
-                    sandbox_id: id.into(),
-                    node_id: "n1".into(),
-                    at,
-                })
-                .await
-                .unwrap();
-        }
-        assert_eq!(store.prune_tombstones(5_000).await.unwrap(), 1);
-        let left = store.list_tombstones().await.unwrap();
-        assert_eq!(left.len(), 1);
-        assert_eq!(left[0].sandbox_id, "new");
+        assert_eq!(lost.len(), 1);
+        assert!(store.get_placement("a").await.unwrap().is_none());
+        assert!(store.list_nodes().await.unwrap().is_empty());
     }
 }

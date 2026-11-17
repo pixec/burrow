@@ -40,7 +40,6 @@ service NodeService {
 
   rpc CreateSandbox(NodeCreateRequest) returns (burrow.common.v1.Sandbox);
   rpc GetSandbox(NodeSandboxRef) returns (burrow.common.v1.Sandbox);
-  rpc ListSandboxes(NodeListRequest) returns (NodeListResponse);
   rpc DeleteSandbox(NodeSandboxRef) returns (NodeDeleteResponse);
   rpc PauseSandbox(NodeSandboxRef) returns (burrow.common.v1.Sandbox);
   rpc ResumeSandbox(NodeSandboxRef) returns (burrow.common.v1.Sandbox);
@@ -339,15 +338,6 @@ message NodeForkRequest {
   string name = 4;
 }
 
-// Carries no filter: the orchestrator answers ListSandboxes from its own
-// registry and filters there, and this exists for reconciliation, which wants
-// everything the node holds.
-message NodeListRequest {}
-
-message NodeListResponse {
-  repeated burrow.common.v1.Sandbox sandboxes = 1;
-}
-
 message NodeDeleteResponse {}
 
 message NodeAdoptRequest {
@@ -355,6 +345,11 @@ message NodeAdoptRequest {
   // secrets travel from here, never through the object store.
   burrow.common.v1.Sandbox record = 1;
   string node_id = 2;
+  // The placement generation the store gave this node the sandbox at. The
+  // node reports it back, and a copy it holds at an older one is stale and
+  // replaced. A sandbox created, forked or restored from a snapshot is new
+  // and starts at generation 1.
+  uint64 generation = 3;
 }
 
 message NodeAdoptVolumeRequest {
@@ -393,6 +388,9 @@ message RegisterResponse {
   // node must hold the same one: the mesh, the firewall and every guest's
   // routes assume it.
   AddressPool address_pool = 5;
+  // The number of the last heartbeat applied from this node. Its next must
+  // be higher, or it is ignored.
+  uint64 report_seq = 6;
 }
 
 // The fleet's sandbox addresses: one /30 per sandbox out of `v4`, one /64 per
@@ -433,6 +431,10 @@ message HeartbeatRequest {
   // The orchestrator keeps the id it assigned; everything else is the node's to
   // say.
   burrow.common.v1.NodeInfo info = 5;
+  // Rises with every heartbeat the node sends, across its restarts. The
+  // orchestrator ignores one no higher than the last it applied, so a delayed
+  // heartbeat cannot undo what a later one settled. 0 is refused.
+  uint64 report_seq = 7;
 }
 
 message SandboxStateReport {
@@ -453,9 +455,6 @@ message SandboxStateReport {
   bool is_agent_unconfirmed = 6;
   // Suspended, and its latest suspend is in the object store.
   bool is_durable = 7;
-  // The node will not resume this durable sandbox until the orchestrator
-  // confirms it still lives here: the node restarted, or lost its lease.
-  bool is_fenced = 8;
   // The record's `state_reason`.
   string state_reason = 9;
   // The record's latest checkpoint in the object store.
@@ -464,6 +463,12 @@ message SandboxStateReport {
   // A Windows guest's last activation attempt, which runs behind its create
   // and its boots.
   burrow.common.v1.WindowsActivation activation = 12;
+  // The placement generation the node holds the sandbox at.
+  uint64 generation = 13;
+  // A create or adopt the node is still carrying out. Listed so its
+  // placement is not lost however long it takes; nothing else in the report
+  // describes it yet.
+  bool is_in_flight = 14;
 }
 
 message HeartbeatResponse {
@@ -494,15 +499,24 @@ message HeartbeatResponse {
   // adopt them, so the two never both think they hold one. 0 means the
   // orchestrator never writes nodes off.
   uint32 sandbox_lease_secs = 6;
-  // Fenced sandboxes the orchestrator still places on this node.
-  repeated string confirmed_sandboxes = 7;
-  // Fenced sandboxes another node has adopted. The node drops its copy.
-  repeated string relinquished_sandboxes = 8;
+  // Whether the heartbeat was applied. One the orchestrator ignored for its
+  // number confirms nothing.
+  bool is_report_applied = 12;
+  // Sandboxes the node reported that the store does not list for it at the
+  // generation it reported: deleted, placed elsewhere, or placed here again
+  // since. The node destroys its copy if it still holds that generation.
+  // Every other sandbox it reported is confirmed.
+  repeated SandboxGeneration destroyed_sandboxes = 13;
   // As in RegisterResponse, repeated on every beat so a rotated key reaches
   // nodes without a re-registration.
   repeated AccessKey access_keys = 9;
   // Every registered node, healthy or not, reports `is_casync_chunk_store`.
   bool is_fleet_on_casync_chunks = 11;
+}
+
+message SandboxGeneration {
+  string sandbox_id = 1;
+  uint64 generation = 2;
 }
 
 message MeshPeer {

@@ -1055,6 +1055,7 @@ async fn registration_loop(
     let mut pins =
         burrow_net::pinning::PinnedKeys::load(&args.data_dir.join("mesh-pins"), &args.mesh_pins)
             .await;
+    let mut report_seq = ReportSeq::open(&args.data_dir).await;
     loop {
         let mut client = match connect_orchestrator(&args.orchestrator, token.clone()).await {
             Ok(c) => c,
@@ -1120,6 +1121,7 @@ async fn registration_loop(
         }
         info.id = resp.node_id.clone();
         *node_id.lock().unwrap() = resp.node_id.clone();
+        report_seq.at_least(resp.report_seq);
         crate::access::apply_keys(&access_keys, &resp.access_keys);
         let interval = Duration::from_secs(resp.heartbeat_interval_secs.max(1) as u64);
         tracing::info!(
@@ -1137,11 +1139,14 @@ async fn registration_loop(
             {
                 ca_warned = Some(std::time::Instant::now());
             }
+            let reports = sandboxes.state_reports().await;
+            let reported: Vec<String> = reports.iter().map(|r| r.sandbox_id.clone()).collect();
             match client
                 .heartbeat(nodepb::HeartbeatRequest {
                     node_id: info.id.clone(),
                     status: Some(current_status(&sandboxes, &args.data_dir).await),
-                    sandboxes: sandboxes.state_reports().await,
+                    sandboxes: reports,
+                    report_seq: report_seq.next().await,
                     // The node's reaper sweeps expired snapshots and retention
                     // evicts old ones, neither of which the orchestrator asked
                     // for; this is how it learns they are gone.
@@ -1159,11 +1164,22 @@ async fn registration_loop(
                         tracing::warn!("orchestrator asked us to re-register");
                         break;
                     }
-                    sandboxes.renew_lease(resp.sandbox_lease_secs);
+                    if resp.is_report_applied {
+                        sandboxes.renew_lease(resp.sandbox_lease_secs);
+                        let unlisted: std::collections::HashSet<&str> = resp
+                            .destroyed_sandboxes
+                            .iter()
+                            .map(|d| d.sandbox_id.as_str())
+                            .collect();
+                        let confirmed: Vec<String> = reported
+                            .into_iter()
+                            .filter(|id| !unlisted.contains(id.as_str()))
+                            .collect();
+                        sandboxes.confirm(&confirmed);
+                        sandboxes.destroy_unlisted(&resp.destroyed_sandboxes);
+                    }
                     crate::migrate::set_fleet_upgraded(resp.is_fleet_on_casync_chunks);
                     crate::access::apply_keys(&access_keys, &resp.access_keys);
-                    sandboxes.confirm(&resp.confirmed_sandboxes);
-                    sandboxes.relinquish(&resp.relinquished_sandboxes).await;
                     apply_edge_denial(
                         &sandboxes,
                         &[
@@ -1218,6 +1234,57 @@ async fn publish_address(args: &ServeArgs) -> std::net::IpAddr {
         }
     }
     args.listen.ip()
+}
+
+/// Numbers this node's heartbeats above every number it sent before, across
+/// restarts, so the orchestrator can ignore one that arrives late. Numbers are
+/// reserved in blocks in a file, and a restart starts past the last block.
+struct ReportSeq {
+    path: std::path::PathBuf,
+    next: u64,
+    reserved: u64,
+}
+
+/// How many heartbeat numbers one write of the file reserves.
+const REPORT_SEQ_BLOCK: u64 = 10_000;
+
+impl ReportSeq {
+    async fn open(data_dir: &std::path::Path) -> Self {
+        let path = data_dir.join("report-seq");
+        let reserved = tokio::fs::read_to_string(&path)
+            .await
+            .ok()
+            .and_then(|text| text.trim().parse().ok())
+            .unwrap_or(0);
+        Self {
+            path,
+            next: reserved + 1,
+            reserved,
+        }
+    }
+
+    /// Moves past the last number the orchestrator applied, which a node
+    /// whose file was lost could otherwise fall behind.
+    fn at_least(&mut self, applied: u64) {
+        self.next = self.next.max(applied + 1);
+    }
+
+    async fn next(&mut self) -> u64 {
+        if self.next > self.reserved {
+            let reserved = self.next + REPORT_SEQ_BLOCK;
+            let temp = self.path.with_extension("tmp");
+            let bytes = reserved.to_string().into_bytes();
+            match crate::fsync::replace(&self.path, &temp, bytes).await {
+                Ok(()) => self.reserved = reserved,
+                Err(err) => {
+                    tracing::warn!(%err, path = %self.path.display(), "could not record heartbeat numbers")
+                }
+            }
+        }
+        let seq = self.next;
+        self.next += 1;
+        seq
+    }
 }
 
 /// The slice of the pool this node used last time it ran, if any.

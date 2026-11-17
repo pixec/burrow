@@ -25,8 +25,9 @@
 //! of the manifest it was decided on (`If-Match` on its ETag, `If-None-Match`
 //! for the first), so two nodes that both read it suspended cannot both take
 //! it: one write lands and the other is refused before anything starts. A
-//! node writing as the holder checks the manifest still names it, so one the
-//! sandbox moved off cannot write over the node running it now. Together with
+//! node writing as the holder checks the manifest still names it at no newer
+//! placement generation, so one the sandbox moved off cannot write over the
+//! node running it now. Together with
 //! the lease a node holds through its heartbeats, that is what keeps one
 //! sandbox from running in two places.
 //!
@@ -92,6 +93,10 @@ pub struct Manifest {
     pub generation: u64,
     /// The node that last held the sandbox.
     pub node_id: String,
+    /// The placement generation `node_id` held it at. A node never writes
+    /// over a newer placement's manifest, and adopts only at a newer one.
+    #[serde(default)]
+    pub placement: u64,
     pub state: String,
     pub template: String,
     pub vcpus: u32,
@@ -670,9 +675,10 @@ pub async fn replace_manifest(
 /// Writes `next` for a sandbox the store must record as held by `holder`, or,
 /// when `may_create`, have nothing for yet.
 ///
-/// Only a node writes its own name in, and a failed adopt hands back exactly
-/// what it read, so while the manifest names `holder` no other node runs the
-/// sandbox, whatever else changed.
+/// Only a node writes its own name in, never at an older placement than the
+/// store has, and a failed adopt hands back exactly what it read, so while
+/// the manifest names `holder` no other node runs the sandbox, whatever else
+/// changed.
 pub async fn write_held(
     store: &ObjectStore,
     holder: &str,
@@ -681,7 +687,10 @@ pub async fn write_held(
 ) -> Result<Held, Status> {
     let current = read_manifest(store, &next.id).await?;
     match &current {
-        Some(held) if held.manifest.node_id == holder => {
+        Some(held)
+            if held.manifest.node_id == holder
+                && (next.node_id != holder || next.placement >= held.manifest.placement) =>
+        {
             replace_manifest(store, Some(held), next).await
         }
         None if may_create => replace_manifest(store, None, next).await,
@@ -714,8 +723,8 @@ async fn delete_generation(store: &ObjectStore, id: &str, generation: u64) {
     }
 }
 
-/// Removes everything stored for a sandbox, as `holder` or, with `None`, for
-/// a sandbox the store says no node runs.
+/// Removes everything stored for a sandbox, as `holder` at a placement
+/// generation or, with `None`, for a sandbox the store says no node runs.
 ///
 /// Conditional the way every other write is: the manifest is first marked
 /// deleting under the version it was read at, so a node that took the
@@ -724,10 +733,16 @@ async fn delete_generation(store: &ObjectStore, id: &str, generation: u64) {
 /// goes, so a node reading it mid-purge finds nothing rather than a
 /// generation half deleted. Chunks are left to the collector, since other
 /// images may share them.
-pub async fn purge(store: &ObjectStore, id: &str, holder: Option<&str>) -> Result<(), Status> {
+pub async fn purge(
+    store: &ObjectStore,
+    id: &str,
+    holder: Option<(&str, u64)>,
+) -> Result<(), Status> {
     if let Some(held) = read_manifest(store, id).await? {
         let is_ours = match holder {
-            Some(holder) => held.manifest.node_id == holder,
+            Some((holder, placement)) => {
+                held.manifest.node_id == holder && held.manifest.placement <= placement
+            }
             None => held.manifest.state != STATE_RUNNING,
         };
         if !is_ours {
@@ -1360,15 +1375,16 @@ pub async fn collect_garbage(
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
 
-    fn manifest(node_id: &str, state: &str) -> Manifest {
+    pub(crate) fn manifest(node_id: &str, state: &str) -> Manifest {
         Manifest {
             format: FORMAT,
             id: "sbx_1".into(),
             generation: 1,
             node_id: node_id.into(),
+            placement: 1,
             state: state.into(),
             template: "alpine".into(),
             vcpus: 1,
@@ -1871,6 +1887,38 @@ mod tests {
             .unwrap();
     }
 
+    /// A node holding a sandbox at an older placement than the store records
+    /// for it, its copy from before a move away and back, writes nothing.
+    #[tokio::test]
+    async fn a_holder_cannot_write_at_an_older_placement() {
+        let store = crate::objstore::fake::store(true).await;
+        let newer = Manifest {
+            placement: 3,
+            ..manifest("node-a", STATE_RUNNING)
+        };
+        replace_manifest(&store, None, &newer).await.unwrap();
+        let stale = write_held(
+            &store,
+            "node-a",
+            &manifest("node-a", STATE_SUSPENDED),
+            false,
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(stale.code(), tonic::Code::Aborted);
+        write_held(
+            &store,
+            "node-a",
+            &Manifest {
+                placement: 3,
+                ..manifest("node-a", STATE_SUSPENDED)
+            },
+            false,
+        )
+        .await
+        .unwrap();
+    }
+
     /// A delete reaching the node the sandbox moved off, or the orchestrator
     /// purging one it thinks no node holds, used to delete the state the
     /// node running it now depends on.
@@ -1885,7 +1933,9 @@ mod tests {
             .await
             .unwrap();
 
-        for holder in [Some("node-a"), None] {
+        // The node it moved off, the node it runs on at an older placement,
+        // and the orchestrator while it runs.
+        for holder in [Some(("node-a", 1)), Some(("node-b", 0)), None] {
             let refused = purge(&store, "sbx_1", holder).await.unwrap_err();
             assert_eq!(refused.code(), tonic::Code::Aborted);
             assert!(
@@ -1897,7 +1947,7 @@ mod tests {
         assert!(read_manifest(&store, "sbx_1").await.unwrap().is_some());
         assert!(store.exists(&generation).await.unwrap());
 
-        purge(&store, "sbx_1", Some("node-b")).await.unwrap();
+        purge(&store, "sbx_1", Some(("node-b", 1))).await.unwrap();
         assert!(read_manifest(&store, "sbx_1").await.unwrap().is_none());
 
         // Suspended, nobody runs it, so the orchestrator's purge goes through.

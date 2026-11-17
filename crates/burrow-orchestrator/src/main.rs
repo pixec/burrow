@@ -5,7 +5,6 @@ mod cluster;
 mod events;
 mod leader;
 mod ledger;
-mod persist;
 mod registry;
 mod sandboxes;
 mod secrets;
@@ -77,7 +76,7 @@ struct Args {
     /// once, losing the sandbox-to-node mapping.
     #[arg(long, default_value = "/var/lib/burrow")]
     data_dir: std::path::PathBuf,
-    /// PostgreSQL to keep placements, tombstones and secrets in, as a libpq
+    /// PostgreSQL to keep placements and secrets in, as a libpq
     /// URL. Unset keeps them in SQLite under --data-dir, which is fine for one
     /// host but ties the control plane to its disk. `sslmode` in the URL
     /// governs TLS; it is attempted by default.
@@ -361,17 +360,24 @@ impl NodeRegistry for NodeRegistryService {
                 })?,
         };
         tracing::info!(node_id, node_index, "node registered");
+        let report_seq = self
+            .0
+            .sandboxes
+            .store()
+            .node_report_seq(&node_id)
+            .await
+            .map_err(|err| Status::unavailable(format!("reading the node: {err}")))?;
 
-        // Adopt whatever the node currently has. Done off the registration
-        // path because the node is mid-call to us and is not yet serving this
-        // request's caller; blocking here would deadlock the handshake.
+        // Off the registration path: the node is mid-call to us and is not
+        // yet serving this request's caller.
         let state = Arc::clone(&self.0);
         let id = node_id.clone();
-        tokio::spawn(async move { reconcile_node(state, id).await });
+        tokio::spawn(async move { refresh_inventory(&state, &id).await });
         Ok(Response::new(nodepb::RegisterResponse {
             node_id,
             heartbeat_interval_secs: HEARTBEAT_INTERVAL.as_secs() as u32,
             node_index,
+            report_seq: report_seq as u64,
             access_keys: access_keys(&self.0),
             address_pool: Some(nodepb::AddressPool {
                 v4: pool.cidr(),
@@ -392,6 +398,14 @@ impl NodeRegistry for NodeRegistryService {
         if let Some(info) = &req.info {
             burrow_common::tags::validate_labels(&info.labels)?;
         }
+        // A node that does not number its reports cannot have a delayed one
+        // told apart, and lists no generations to compare.
+        if req.report_seq == 0 {
+            return Err(Status::failed_precondition(
+                "this node's burrowd does not number its heartbeats; upgrade it along with the \
+                 orchestrator",
+            ));
+        }
         if let Some(info) = &req.info {
             self.0
                 .chunk_fleet
@@ -401,60 +415,75 @@ impl NodeRegistry for NodeRegistryService {
         let mut status = req.status.unwrap_or_default();
         let volumes = std::mem::take(&mut status.volumes);
         self.0.nodes.touch(&req.node_id);
-        if let Some(store) = &self.0.store {
-            // The store decides whether the fleet knows this node: it may have
-            // registered through another replica, whose cache this one only
-            // catches up with once a second.
-            let mut info = req.info.clone().unwrap_or_default();
-            info.id = req.node_id.clone();
-            let row = cluster::node_row(&info, &status, "", "");
-            let row = burrow_store::NodeRow {
-                is_reported: true,
-                ..row
-            };
-            let in_store = store
-                .heartbeat_node(&burrow_store::NodeRow {
-                    info: match &req.info {
-                        Some(_) => row.info.clone(),
-                        None => Vec::new(),
-                    },
-                    ..row
-                })
-                .await
-                .map_err(|err| Status::unavailable(format!("recording the heartbeat: {err}")))?;
-            if in_store && !self.0.nodes.knows(&req.node_id) {
-                let _ = cluster::reload_nodes(&self.0, store).await;
-            }
-            if !in_store {
-                self.0.nodes.remove_node(&req.node_id);
-            }
-            let totals: Vec<_> = req
-                .sandboxes
-                .iter()
-                .map(|s| {
-                    (
-                        s.sandbox_id.clone(),
-                        s.cpu_usage_usec,
-                        s.rx_bytes,
-                        s.tx_bytes,
-                    )
-                })
-                .collect();
-            if let Err(err) = store
-                .observe_usage(&req.node_id, burrow_common::unix_now_ms(), &totals)
-                .await
-            {
-                tracing::warn!(node_id = req.node_id, %err, "could not record usage from a heartbeat");
-            }
+        let mut info = req.info.clone().unwrap_or_default();
+        info.id = req.node_id.clone();
+        let row = cluster::node_row(&info, &status, "", "");
+        let row = burrow_store::NodeRow {
+            is_reported: true,
+            info: match &req.info {
+                Some(_) => row.info.clone(),
+                None => Vec::new(),
+            },
+            ..row
+        };
+        let started = std::time::Instant::now();
+        let reconciled = self
+            .0
+            .sandboxes
+            .reconcile(row, &info, req.report_seq, &req.sandboxes)
+            .await?;
+        tracing::debug!(
+            node_id = req.node_id,
+            sandboxes = req.sandboxes.len(),
+            elapsed_ms = started.elapsed().as_secs_f64() * 1000.0,
+            "reconciled a heartbeat"
+        );
+        // The store decides whether the fleet knows this node: it may have
+        // registered through another replica, whose cache this one only
+        // catches up with once a second.
+        if !reconciled.is_known {
+            self.0.nodes.remove_node(&req.node_id);
+        } else if !self.0.nodes.knows(&req.node_id)
+            && let Some(store) = &self.0.store
+        {
+            let _ = cluster::reload_nodes(&self.0, store).await;
         }
-        let known = self.0.nodes.heartbeat(&req.node_id, status, req.info);
-        let mut applied = sandboxes::Applied::default();
+        let known = match reconciled.is_applied {
+            true => self.0.nodes.heartbeat(&req.node_id, status, req.info),
+            false => self.0.nodes.knows(&req.node_id),
+        };
         if !known {
             tracing::warn!(
                 node_id = req.node_id,
                 "heartbeat from unknown node; asking to re-register"
             );
+        } else if !reconciled.is_applied {
+            tracing::info!(
+                node_id = req.node_id,
+                seq = req.report_seq,
+                "ignored a heartbeat no newer than one already applied"
+            );
         } else {
+            if let Some(store) = &self.0.store {
+                let totals: Vec<_> = req
+                    .sandboxes
+                    .iter()
+                    .map(|s| {
+                        (
+                            s.sandbox_id.clone(),
+                            s.cpu_usage_usec,
+                            s.rx_bytes,
+                            s.tx_bytes,
+                        )
+                    })
+                    .collect();
+                if let Err(err) = store
+                    .observe_usage(&req.node_id, burrow_common::unix_now_ms(), &totals)
+                    .await
+                {
+                    tracing::warn!(node_id = req.node_id, %err, "could not record usage from a heartbeat");
+                }
+            }
             let dropped =
                 self.0
                     .snapshots
@@ -469,65 +498,38 @@ impl NodeRegistry for NodeRegistryService {
             // A Kit's lifecycle creates volumes on the node itself, so the
             // node's own inventory is what the registry reflects.
             self.0.volumes.reconcile_node(&req.node_id, volumes);
-            for report in req.sandboxes.iter().filter(|report| report.is_fenced) {
-                self.0.sandboxes.refresh(&report.sandbox_id).await;
-            }
-            applied = self.0.sandboxes.apply_states(&req.node_id, &req.sandboxes);
-            self.0
-                .sandboxes
-                .verify_fences(&req.node_id, &mut applied)
-                .await;
-            if applied.restated > 0 || applied.forgotten > 0 {
+            if reconciled.restated > 0 || !reconciled.lost.is_empty() {
                 tracing::info!(
                     node_id = req.node_id,
-                    restated = applied.restated,
-                    forgotten = applied.forgotten,
-                    "adopted node-initiated sandbox changes"
+                    restated = reconciled.restated,
+                    lost = reconciled.lost.len(),
+                    first_lost = reconciled.lost.first(),
+                    "took node-initiated sandbox changes"
                 );
             }
-            // The node is running sandboxes this replica has no record of,
-            // most often ones another replica placed in the last second. Only
-            // those the store has no row for either are lost records, and a
-            // heartbeat carries too little to adopt them from, so the node's
-            // full listing is pulled instead, off the request path for the
-            // same reason as the reconcile after a registration.
-            if !applied.unknown.is_empty() {
-                let state = Arc::clone(&self.0);
-                let id = req.node_id.clone();
-                let unknown = std::mem::take(&mut applied.unknown);
-                tokio::spawn(async move {
-                    let missing = state.sandboxes.missing(&unknown).await;
-                    if missing.is_empty() {
-                        return;
-                    }
-                    tracing::warn!(
-                        node_id = id,
-                        count = missing.len(),
-                        first = missing.first(),
-                        "node reports sandboxes with no placement record; reconciling"
-                    );
-                    reconcile_node(state, id).await
-                });
+            if !reconciled.replaced.is_empty() {
+                tracing::info!(
+                    node_id = req.node_id,
+                    count = reconciled.replaced.len(),
+                    first = reconciled.replaced.first(),
+                    "node still holds sandboxes nothing placed since it was written off; \
+                     placing them back there"
+                );
             }
-            // Deleted while the node was absent, and the node is back without
-            // having re-registered, so no reconcile is coming to do it.
-            let due = self
-                .0
-                .sandboxes
-                .due_tombstone_deletes(std::mem::take(&mut applied.tombstoned));
-            if !due.is_empty() {
-                tokio::spawn(destroy_tombstoned(
-                    Arc::clone(&self.0),
-                    req.node_id.clone(),
-                    due,
-                ));
-            }
-            if !applied.relinquished.is_empty() {
+            if !reconciled.destroy.is_empty() {
                 tracing::warn!(
                     node_id = req.node_id,
-                    count = applied.relinquished.len(),
-                    "node still holds sandboxes another node adopted; telling it to let go"
+                    count = reconciled.destroy.len(),
+                    first = reconciled.destroy.first().map(|d| d.sandbox_id.as_str()),
+                    "node holds sandboxes the store does not list for it; telling it to destroy them"
                 );
+            }
+            if !reconciled.unanswered.is_empty() {
+                tokio::spawn(settle_unanswered(
+                    Arc::clone(&self.0),
+                    req.node_id.clone(),
+                    reconciled.unanswered,
+                ));
             }
         }
         // The peer list and cross-node membership ride on the heartbeat, so a
@@ -543,8 +545,8 @@ impl NodeRegistry for NodeRegistryService {
             node_hosts: self.0.nodes.node_hosts(),
             control_plane_hosts: self.0.control_plane_hosts.lock().unwrap().clone(),
             sandbox_lease_secs: self.0.sandbox_lease_secs,
-            confirmed_sandboxes: applied.confirmed,
-            relinquished_sandboxes: applied.relinquished,
+            is_report_applied: reconciled.is_applied,
+            destroyed_sandboxes: reconciled.destroy,
             access_keys: access_keys(&self.0),
             is_fleet_on_casync_chunks: self.0.chunk_fleet.is_upgraded(),
         }))
@@ -582,69 +584,56 @@ fn access_keys(state: &OrchestratorState) -> Vec<nodepb::AccessKey> {
     keys
 }
 
-/// Rebuilds the orchestrator's view of one node from that node's own listing.
-async fn reconcile_node(state: Arc<OrchestratorState>, node_id: String) {
+/// Records what a node built for creates and adopts whose answer never
+/// reached the store: the replica that asked died, or lost the node's reply.
+/// The node reports the sandbox at the generation the row has, so the record
+/// it holds is the one the row should.
+async fn settle_unanswered(state: Arc<OrchestratorState>, node_id: String, ids: Vec<String>) {
     let Some(endpoint) = state.nodes.endpoint(&node_id) else {
         return;
     };
     let mut client = match crate::api::connect_node(endpoint, state.node_token.as_deref()).await {
         Ok(client) => client,
         Err(err) => {
-            tracing::warn!(node_id, %err, "cannot reach node to reconcile; its sandboxes stay as recorded");
+            tracing::warn!(node_id, %err, "cannot reach node to record what it built");
             return;
         }
     };
-    match client.list_sandboxes(nodepb::NodeListRequest {}).await {
-        Ok(resp) => {
-            let outcome = state
-                .sandboxes
-                .reconcile_node(&node_id, resp.into_inner().sandboxes);
-            tracing::info!(
-                node_id,
-                adopted = outcome.adopted,
-                forgotten = outcome.forgotten,
-                tombstoned = outcome.tombstoned.len(),
-                "reconciled node inventory"
-            );
-            destroy_tombstoned(Arc::clone(&state), node_id.clone(), outcome.tombstoned).await;
+    for id in ids {
+        let Ok(Some(row)) = state.sandboxes.store().get_placement(&id).await else {
+            continue;
+        };
+        if row.node_id != node_id {
+            continue;
         }
-        Err(err) => tracing::warn!(node_id, %err, "node inventory unavailable"),
-    }
-
-    inventory(&state, &node_id, &mut client).await;
-}
-
-/// Destroys sandboxes deleted while their node was absent, which it still
-/// holds. Doing it is what makes a delete against an absent node mean the
-/// same as one against a present node. A delete that fails keeps the
-/// tombstone, backed off, for the next heartbeat or registration.
-async fn destroy_tombstoned(state: Arc<OrchestratorState>, node_id: String, ids: Vec<String>) {
-    let deletes = ids.into_iter().map(|sandbox_id| {
-        let state = Arc::clone(&state);
-        let node_id = node_id.clone();
-        async move {
-            match crate::api::delete_on_node(&state, &node_id, &sandbox_id).await {
-                Ok(()) => tracing::info!(
-                    node_id,
-                    sandbox = sandbox_id,
-                    "destroyed a sandbox deleted while its node was absent"
-                ),
-                Err(err) if err.code() == tonic::Code::NotFound => {}
-                Err(err) => {
-                    tracing::warn!(
-                        node_id,
-                        sandbox = sandbox_id,
-                        %err,
-                        "could not destroy a sandbox deleted while its node was absent"
-                    );
-                    state.sandboxes.tombstone_delete_failed(&sandbox_id);
-                    return;
-                }
+        let record = match client
+            .get_sandbox(nodepb::NodeSandboxRef {
+                sandbox_id: id.clone(),
+            })
+            .await
+        {
+            Ok(record) => record.into_inner(),
+            Err(err) => {
+                tracing::warn!(node_id, sandbox = id, %err, "could not read what the node built");
+                continue;
             }
-            state.sandboxes.clear_tombstone(&sandbox_id);
+        };
+        let record = burrow_proto::common::v1::Sandbox {
+            node_id: node_id.clone(),
+            ..record
+        };
+        match state.sandboxes.settle(record, row.generation).await {
+            Ok(true) => tracing::info!(
+                node_id,
+                sandbox = id,
+                "recorded a sandbox whose create or adopt went unanswered"
+            ),
+            Ok(false) => {}
+            Err(err) => {
+                tracing::warn!(node_id, sandbox = id, %err, "could not record what the node built")
+            }
         }
-    });
-    futures::future::join_all(deletes).await;
+    }
 }
 
 /// Re-reads a node's snapshots and volumes, for a replica that does not get
@@ -809,16 +798,12 @@ const CLAIM_ORPHAN_SECS: i64 = 600;
 /// Writes off nodes that have been silent far longer than unhealthy.
 ///
 /// A node silent for `expiry` is presumed gone: its placements are dropped so
-/// the names and capacity they held come back, and its entry with them. No
-/// tombstones are recorded, unlike a caller's delete against a dead node,
-/// because nobody asked for these sandboxes to be destroyed; if the node comes
-/// back, reconcile re-adopts its own inventory. A suspended sandbox whose
-/// state is in the object store is kept, unplaced, for the next start to put
-/// on another node. Its open usage intervals are closed at its last heartbeat,
-/// so none of the silence is attributed to its sandboxes.
-///
-/// Ageing out tombstones rides on the same tick, and happens even when reaping
-/// is switched off: they are bounded by their own TTL either way.
+/// the names and capacity they held come back, and its entry with them. If it
+/// ever comes back, it destroys whatever it still holds, since the store lists
+/// nothing for it. A suspended sandbox whose state is in the object store is
+/// kept, unplaced, for the next start to put on another node. Its open usage
+/// intervals are closed at its last heartbeat, so none of the silence is
+/// attributed to its sandboxes.
 async fn reap_dead_nodes(state: Arc<OrchestratorState>, expiry: Option<std::time::Duration>) {
     let period = expiry.map_or(REAP_INTERVAL, |expiry| REAP_INTERVAL.min(expiry));
     let mut ticker = tokio::time::interval(period);
@@ -833,12 +818,6 @@ async fn reap_dead_nodes(state: Arc<OrchestratorState>, expiry: Option<std::time
             for node_id in state.nodes.expired(expiry) {
                 write_off_node(&state, &node_id, expiry).await;
             }
-        }
-        let pruned = state
-            .sandboxes
-            .prune_tombstones(sandboxes::TOMBSTONE_TTL_SECS);
-        if pruned > 0 {
-            tracing::info!(pruned, "aged out tombstones for nodes that never returned");
         }
         // A replica that died half way through a create leaves its claims on
         // an id and a name with no sandbox behind them.
@@ -868,20 +847,22 @@ async fn write_off_node(
     let Some(epoch) = state.leader.epoch() else {
         return false;
     };
-    if let Some(store) = &state.store {
-        let before = burrow_common::unix_now_ms() - expiry.as_millis() as i64;
-        match store.write_off_node(node_id, before, epoch).await {
-            Ok(true) => {}
-            Ok(false) => return false,
-            Err(err) => {
-                tracing::warn!(node_id, %err, "could not write off a node in the store");
-                return false;
-            }
-        }
-    }
-    ledger::write_off_node(state, node_id).await;
     let info = state.nodes.info(node_id).unwrap_or_default();
-    let (dropped, unplaced) = state.sandboxes.forget_node(node_id, &info);
+    let before = burrow_common::unix_now_ms() - expiry.as_millis() as i64;
+    let written_off = match state
+        .sandboxes
+        .write_off(node_id, &info, before, epoch)
+        .await
+    {
+        Ok(Some(written_off)) => written_off,
+        Ok(None) => return false,
+        Err(err) => {
+            tracing::warn!(node_id, %err, "could not write off a node in the store");
+            return false;
+        }
+    };
+    ledger::write_off_node(state, node_id).await;
+    let sandboxes::WrittenOff { dropped, unplaced } = written_off;
     // Its snapshots go with it: they only ever existed on that node.
     // Its durable volumes stay, to be taken from it.
     state.snapshots.forget_node(node_id);
@@ -999,9 +980,11 @@ async fn run(args: Args) -> anyhow::Result<()> {
                 Ok(opened) => secrets = Some(opened),
                 Err(err) => tracing::error!(%err, "secrets are unavailable: no usable key"),
             }
-            sandboxes::SandboxRegistry::with_store(Arc::clone(store)).await
+            sandboxes::SandboxRegistry::open(Arc::clone(store))
+                .await
+                .context("reading placements")?
         }
-        None => sandboxes::SandboxRegistry::default(),
+        None => anyhow::bail!("the orchestrator has no store"),
     };
 
     let access_key = args

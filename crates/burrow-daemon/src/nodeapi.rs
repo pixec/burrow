@@ -874,21 +874,6 @@ impl NodeService for NodeApi {
         Ok(Response::new(redact_secrets(record)))
     }
 
-    async fn list_sandboxes(
-        &self,
-        _req: Request<nodepb::NodeListRequest>,
-    ) -> Result<Response<nodepb::NodeListResponse>, Status> {
-        Ok(Response::new(nodepb::NodeListResponse {
-            sandboxes: self
-                .sandboxes
-                .list()
-                .await
-                .into_iter()
-                .map(redact_secrets)
-                .collect(),
-        }))
-    }
-
     async fn delete_sandbox(
         &self,
         req: Request<nodepb::NodeSandboxRef>,
@@ -1054,7 +1039,9 @@ impl NodeService for NodeApi {
             .ok_or_else(|| Status::invalid_argument("adopting needs the sandbox's record"))?;
         let sandbox = self
             .sandboxes
-            .detached(move |sandboxes| async move { sandboxes.adopt(record, req.node_id).await })
+            .detached(move |sandboxes| async move {
+                sandboxes.adopt(record, req.node_id, req.generation).await
+            })
             .await?;
         Ok(Response::new(redact_secrets(sandbox)))
     }

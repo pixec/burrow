@@ -368,6 +368,7 @@ impl SandboxManager {
             id: id.to_string(),
             template,
             hypervisor,
+            generation: std::sync::atomic::AtomicU64::new(old.generation()),
             base_record: std::sync::Mutex::new(record),
             state: std::sync::atomic::AtomicI32::new(common::SandboxState::Stopped as i32),
             vm: tokio::sync::Mutex::new(None),

@@ -131,9 +131,8 @@ async fn connect_node_unary(
     Ok(node_client(channel, token))
 }
 
-/// How long a node gets to carry out a delete. Well past the heartbeat
-/// threshold, so a node that is only busy finishes the delete rather than
-/// having it tombstoned.
+/// How long a node gets to carry out a delete before the caller is answered
+/// anyway. One it has not finished by then it finishes at its next heartbeat.
 const DELETE_DEADLINE: std::time::Duration = std::time::Duration::from_secs(120);
 
 /// Destroys `sandbox_id` on `node_id`, through the node's admission slots.
@@ -256,7 +255,7 @@ impl ApiService {
         metadata: tonic::metadata::MetadataMap,
         req: api::CreateSandboxRequest,
         reply: tokio::sync::oneshot::Sender<Result<common::Sandbox, Status>>,
-    ) -> Option<crate::sandboxes::RequestClaim<'_>> {
+    ) -> Option<crate::sandboxes::RequestClaim> {
         let sandbox_id = burrow_common::SandboxId::generate().to_string();
         if req.request_id.is_empty() {
             let _ = reply.send(self.create_new(metadata, req, sandbox_id).await);
@@ -274,15 +273,7 @@ impl ApiService {
             }
         };
         let created = self.create_new(metadata, req, sandbox_id).await;
-        let is_unknown = created.as_ref().is_err_and(|err| {
-            matches!(
-                err.code(),
-                tonic::Code::Unavailable
-                    | tonic::Code::Unknown
-                    | tonic::Code::Cancelled
-                    | tonic::Code::DeadlineExceeded
-            )
-        });
+        let is_unknown = created.as_ref().is_err_and(is_outcome_unknown);
         let _ = reply.send(created);
         is_unknown.then_some(claim)
     }
@@ -294,7 +285,7 @@ impl ApiService {
         &self,
         request_id: &str,
         sandbox_id: &str,
-    ) -> Result<Result<crate::sandboxes::RequestClaim<'_>, common::Sandbox>, Status> {
+    ) -> Result<Result<crate::sandboxes::RequestClaim, common::Sandbox>, Status> {
         let deadline = std::time::Instant::now() + REQUEST_WAIT;
         let claim = loop {
             if let Some(sandbox) = self.0.sandboxes.by_request(request_id).await {
@@ -302,19 +293,18 @@ impl ApiService {
             }
             match self.0.sandboxes.claim_request(request_id, sandbox_id).await {
                 Ok(claim) => break claim,
-                Err(crate::sandboxes::RequestTaken::Failed(err)) => {
-                    return Err(Status::unavailable(err));
-                }
-                Err(crate::sandboxes::RequestTaken::InFlight)
-                    if std::time::Instant::now() >= deadline =>
+                Err(err)
+                    if err.code() == tonic::Code::Aborted
+                        && std::time::Instant::now() < deadline =>
                 {
+                    tokio::time::sleep(REQUEST_POLL).await
+                }
+                Err(err) if err.code() == tonic::Code::Aborted => {
                     return Err(Status::aborted(format!(
                         "a create with request id {request_id} is still running; retry it"
                     )));
                 }
-                Err(crate::sandboxes::RequestTaken::InFlight) => {
-                    tokio::time::sleep(REQUEST_POLL).await
-                }
+                Err(err) => return Err(err),
             }
         };
         // The create holding the claim may have finished between the lookup
@@ -374,15 +364,9 @@ impl ApiService {
             };
             self.resolve_secret_refs(network, subject).await?;
         }
-        // Held until the record is in the registry: an id and a name are both
-        // claims on a namespace, and a create that is still building has to
-        // hold them or a second create makes a duplicate.
-        let reserved = self
-            .0
-            .sandboxes
-            .reserve_claimed(&sandbox_id, &req.name)
-            .await
-            .map_err(Status::already_exists)?;
+        // Held until the sandbox exists, or may: a create that is still
+        // building has to hold its name or a second create takes it.
+        let mut reserved = self.0.sandboxes.reserve(&sandbox_id, &req.name).await?;
 
         // A create from a snapshot goes where the snapshot is, or, for one
         // the object store holds, to a node that can restore it; the template
@@ -466,8 +450,22 @@ impl ApiService {
                     snapshot.id, snapshot.template, req.template
                 )));
             }
+            self.0
+                .sandboxes
+                .write_ahead(
+                    &mut reserved,
+                    stub(
+                        &sandbox_id,
+                        &node_id,
+                        &req.name,
+                        &req.tags,
+                        &snapshot.template,
+                        &req.request_id,
+                    ),
+                )
+                .await?;
             let _admitted = self.0.admission.admit(&node_id).await;
-            let mut sandbox = client
+            let created = client
                 .create_sandbox(nodepb::NodeCreateRequest {
                     sandbox_id,
                     request_id: req.request_id,
@@ -481,17 +479,15 @@ impl ApiService {
                     is_remote_desktop_enabled: req.is_remote_desktop_enabled,
                     activation,
                 })
-                .await?
-                .into_inner();
+                .await;
+            let (mut sandbox, reserved) = answered(created, reserved)?;
             held.keep();
             if !is_placed {
                 self.0.nodes.charge_cpu(&node_id, cpu_millis);
             }
             // The caller's alone: the registry and every later read go without.
             let remote_desktop = sandbox.remote_desktop.take();
-            self.0.sandboxes.insert(sandbox.clone());
-            drop(reserved);
-            self.write_through().await;
+            self.settle_created(&sandbox, reserved).await?;
             tracing::info!(
                 sandbox = sandbox.id,
                 snapshot = snapshot.id,
@@ -683,8 +679,22 @@ impl ApiService {
             .kit_credentials(&mut client, &node_id, &template, subject)
             .await?;
 
+        self.0
+            .sandboxes
+            .write_ahead(
+                &mut reserved,
+                stub(
+                    &sandbox_id,
+                    &node_id,
+                    &req.name,
+                    &req.tags,
+                    &template,
+                    &req.request_id,
+                ),
+            )
+            .await?;
         let _admitted = self.0.admission.admit(&node_id).await;
-        let mut sandbox = client
+        let created = client
             .create_sandbox(nodepb::NodeCreateRequest {
                 sandbox_id,
                 request_id: req.request_id,
@@ -698,20 +708,15 @@ impl ApiService {
                 is_remote_desktop_enabled: req.is_remote_desktop_enabled,
                 activation,
             })
-            .await?
-            .into_inner();
+            .await;
+        let (mut sandbox, reserved) = answered(created, reserved)?;
         let remote_desktop = sandbox.remote_desktop.take();
         // The sandbox exists and the node will report it; the optimistic
         // charge is now the registry's job, not the guard's.
         if let Some(placed) = placed {
             placed.keep();
         }
-
-        self.0.sandboxes.insert(sandbox.clone());
-        // The registry now holds the sandbox, so the id no longer needs
-        // holding open on its behalf.
-        drop(reserved);
-        self.write_through().await;
+        self.settle_created(&sandbox, reserved).await?;
         let mut sandbox = match public_ips.is_empty() {
             true => sandbox,
             false => {
@@ -728,6 +733,29 @@ impl ApiService {
 }
 
 impl ApiService {
+    /// Records the sandbox a node built for a create or a fork, over the row
+    /// written ahead of it. A row that went meanwhile was deleted while the
+    /// node built it, which the node destroys at its next heartbeat.
+    async fn settle_created(
+        &self,
+        sandbox: &common::Sandbox,
+        reserved: crate::sandboxes::Reservation,
+    ) -> Result<(), Status> {
+        let settled = self
+            .0
+            .sandboxes
+            .settle(sandbox.clone(), crate::sandboxes::FIRST_GENERATION)
+            .await?;
+        reserved.keep();
+        if !settled {
+            return Err(Status::aborted(format!(
+                "sandbox {} was deleted while its node built it",
+                sandbox.id
+            )));
+        }
+        Ok(())
+    }
+
     /// Takes `mem_mib` on a node for a sandbox growing there, or says why the
     /// node has no room for it.
     async fn hold_growth(&self, node_id: &str, mem_mib: u64) -> Result<PlacementGuard<'_>, String> {
@@ -1773,50 +1801,39 @@ impl ApiService {
         )))
     }
 
+    /// Places a sandbox no node holds, as read from the store.
     async fn adopt(
         &self,
         sandbox: common::Sandbox,
         node_id: &str,
         node_labels: HashMap<String, String>,
     ) -> Result<common::Sandbox, Status> {
-        let _adoption = self.claim_placing(&sandbox.id, "").await?;
-        self.adopt_claimed(sandbox, node_id, node_labels).await
-    }
-
-    /// Claims the right to place a sandbox, then checks the store still has
-    /// it on `holder` (`""` for no node): another replica may have placed or
-    /// moved it between this replica reading it and the claim.
-    async fn claim_placing(
-        &self,
-        id: &str,
-        holder: &str,
-    ) -> Result<crate::sandboxes::Adoption<'_>, Status> {
-        let adoption = self
-            .0
-            .sandboxes
-            .claim_adoption(id)
-            .await
-            .map_err(Status::aborted)?;
-        let held = self
-            .0
-            .sandboxes
-            .refresh(id)
-            .await
-            .ok_or_else(|| Status::not_found(format!("no sandbox {id}")))?
-            .node_id;
-        if held != holder {
-            return Err(Status::aborted(match held.as_str() {
-                "" => format!("sandbox {id} was let go of by another call; start it to place it"),
-                node => format!("sandbox {id} was placed on node {node} by another call"),
-            }));
+        let (current, generation) = self.0.sandboxes.placed(&sandbox.id).await?;
+        if !current.node_id.is_empty() {
+            return Err(Status::aborted(format!(
+                "sandbox {} was placed on node {} by another call",
+                sandbox.id, current.node_id
+            )));
         }
-        Ok(adoption)
+        self.adopt_from(sandbox, "", generation, node_id, node_labels)
+            .await
     }
 
-    /// [`Self::adopt`] for a caller holding the claim on placing it.
-    async fn adopt_claimed(
+    /// Hands `sandbox`, which the store has on `from` (`""` for no node) at
+    /// `generation`, to `node_id`, or wherever placement finds room for it,
+    /// to take up from the object store.
+    ///
+    /// The row is moved to the target at the next generation before the
+    /// target is asked, so of two calls placing one sandbox only one gets
+    /// that far, and any copy left behind is older than the one the target
+    /// takes up. A target whose answer says it let go leaves the sandbox
+    /// unplaced; one that may still be taking it up leaves it there, for its
+    /// heartbeats to settle.
+    async fn adopt_from(
         &self,
         sandbox: common::Sandbox,
+        from: &str,
+        generation: i64,
         node_id: &str,
         node_labels: HashMap<String, String>,
     ) -> Result<common::Sandbox, Status> {
@@ -1870,22 +1887,36 @@ impl ApiService {
             .await
             .map_err(|err| Status::unavailable(format!("cannot reach node {target}: {err}")))?;
         self.bring_volumes(&target, &mounts).await?;
+        let next = self
+            .0
+            .sandboxes
+            .move_to(&sandbox, from, generation, &target)
+            .await?;
         let _admitted = self.0.admission.admit(&target).await;
-        let adopted = client
+        let adopted = match client
             .adopt_sandbox(nodepb::NodeAdoptRequest {
-                record: Some(sandbox),
+                record: Some(sandbox.clone()),
                 node_id: target.clone(),
+                generation: next as u64,
             })
-            .await?
-            .into_inner();
+            .await
+        {
+            Ok(adopted) => adopted.into_inner(),
+            Err(err) => {
+                if target_let_go(&err) {
+                    self.0.sandboxes.unplace(sandbox, &target, next).await?;
+                }
+                return Err(err);
+            }
+        };
         if let Some(placed) = placed {
             placed.keep();
         }
-        self.0.sandboxes.adopted(adopted.clone());
-        self.write_through().await;
+        self.0.sandboxes.settle(adopted.clone(), next).await?;
         tracing::info!(
             sandbox = adopted.id,
             node = target,
+            generation = next,
             "sandbox adopted from the object store"
         );
         Ok(adopted)
@@ -1910,16 +1941,23 @@ impl ApiService {
             "moving sandbox {id} to node {target} failed: {}",
             err.message()
         );
-        if !target_let_go(&err) {
+        let unplaced = match self.0.sandboxes.placed(&id).await {
+            Ok((current, generation)) if current.node_id.is_empty() => Some(generation),
+            _ => None,
+        };
+        let Some(generation) = unplaced.filter(|_| target_let_go(&err)) else {
             return Status::new(
                 err.code(),
                 format!(
                     "{failed}; node {target} may still be taking it up, so it is left in the \
-                     object store, and `burrow start` places it"
+                     object store, and its heartbeats settle where it is"
                 ),
             );
-        }
-        match self.adopt_claimed(released, source, HashMap::new()).await {
+        };
+        match self
+            .adopt_from(released, "", generation, source, HashMap::new())
+            .await
+        {
             Ok(_) => {
                 tracing::warn!(
                     sandbox = id,
@@ -1938,17 +1976,6 @@ impl ApiService {
                     back.message()
                 ),
             ),
-        }
-    }
-
-    /// Waits for this replica's queued writes to reach the store.
-    ///
-    /// Called before answering a call that made a sandbox exist, go, or
-    /// change hands: the caller's next call may reach another replica, which
-    /// reads the store, and its claim on a name lands before the row does.
-    async fn write_through(&self) {
-        if let Some(writer) = self.0.sandboxes.writer() {
-            writer.flush().await;
         }
     }
 
@@ -2239,61 +2266,48 @@ impl Burrow for ApiService {
         Ok(Response::new(api::ListSandboxesResponse { sandboxes }))
     }
 
+    /// Deletes a sandbox, which always succeeds once its row is gone,
+    /// whether or not its node can be reached. A reachable node is told at
+    /// once; one that is not destroys the sandbox at its next heartbeat,
+    /// however long that takes, because the store no longer lists it.
     async fn delete_sandbox(
         &self,
         req: Request<api::SandboxRef>,
     ) -> Result<Response<api::DeleteSandboxResponse>, Status> {
         let id = self.resolve(&req.into_inner().sandbox_id).await;
-        // Not the cached placement: a move through another replica that
-        // failed half way leaves this one naming the node that let go, and
-        // the delete would go there and be told no node holds the sandbox.
-        let node_id = self.holder(&id).await?;
-        // Nothing on any node to destroy, so no tombstone either: the stored
-        // state is all there is.
-        if node_id.is_empty() {
-            self.purge(&id).await?;
-            self.0.sandboxes.remove(&id);
-            self.forget_attachments(&id).await;
-            self.write_through().await;
+        let sandbox = self
+            .0
+            .sandboxes
+            .remove(&id)
+            .await?
+            .ok_or_else(|| Status::not_found(format!("no sandbox {id}")))?;
+        self.forget_attachments(&id).await;
+        if sandbox.node_id.is_empty() {
+            // Its state in the object store is all there is. Left for the
+            // collector when no node can delete it now.
+            if let Err(err) = self.purge(&id).await {
+                tracing::warn!(sandbox = id, %err, "could not delete a sandbox's stored state; the collector takes it");
+            }
             return Ok(Response::new(api::DeleteSandboxResponse {}));
         }
-        match delete_on_node(&self.0, &node_id, &id).await {
-            Ok(()) => {}
-            // The node has stopped heartbeating, not merely slowed down: one
-            // whose heartbeats still arrive is given the delete again rather
-            // than written off. Waiting for an absent one would leave an
-            // undeletable sandbox holding its name and its capacity for as
-            // long as the node stays down, which for a node that never
-            // returns is forever. So the placement is dropped on the
-            // orchestrator's word, and a tombstone remembers the delete for
-            // when the node is heard from again still holding it.
-            Err(_) if self.0.nodes.is_absent(&node_id) => {
-                let forgotten = self.0.sandboxes.forget_deleted(&id);
-                if let Some(sandbox) = &forgotten {
-                    self.release_charge(sandbox);
-                }
-                tracing::warn!(
-                    sandbox = id,
-                    node = node_id,
-                    name = forgotten
-                        .as_ref()
-                        .map(|s| s.name.clone())
-                        .unwrap_or_default(),
-                    "node is absent; forgetting the sandbox and recording a tombstone. It \
-                     will be destroyed once the node is heard from"
-                );
-                self.forget_attachments(&id).await;
-                self.write_through().await;
-                return Ok(Response::new(api::DeleteSandboxResponse {}));
-            }
-            Err(err) => return Err(err),
-        }
         // Return any capacity still charged optimistically for this sandbox.
-        if let Some(sandbox) = self.0.sandboxes.remove(&id) {
-            self.release_charge(&sandbox);
+        self.release_charge(&sandbox);
+        if self.is_node_dead(&sandbox.node_id) {
+            tracing::info!(
+                sandbox = id,
+                node = sandbox.node_id,
+                "deleted a sandbox whose node is not heard from; it destroys it when it is"
+            );
+        } else if let Err(err) = delete_on_node(&self.0, &sandbox.node_id, &id).await
+            && err.code() != tonic::Code::NotFound
+        {
+            tracing::warn!(
+                sandbox = id,
+                node = sandbox.node_id,
+                %err,
+                "deleted a sandbox its node could not destroy now; it does at its next heartbeat"
+            );
         }
-        self.forget_attachments(&id).await;
-        self.write_through().await;
         Ok(Response::new(api::DeleteSandboxResponse {}))
     }
 
@@ -2308,7 +2322,7 @@ impl Burrow for ApiService {
             .await?
             .into_inner();
         // The registry mirrors node state, so the new state is written back.
-        self.0.sandboxes.update(sandbox.clone());
+        self.0.sandboxes.update(sandbox.clone()).await;
         Ok(Response::new(sandbox))
     }
 
@@ -2327,7 +2341,7 @@ impl Burrow for ApiService {
             .resume_sandbox(nodepb::NodeSandboxRef { sandbox_id: id })
             .await?
             .into_inner();
-        self.0.sandboxes.update(sandbox.clone());
+        self.0.sandboxes.update(sandbox.clone()).await;
         Ok(Response::new(sandbox))
     }
 
@@ -2351,7 +2365,7 @@ impl Burrow for ApiService {
             .stop_sandbox(nodepb::NodeSandboxRef { sandbox_id: id })
             .await?
             .into_inner();
-        self.0.sandboxes.update(sandbox.clone());
+        self.0.sandboxes.update(sandbox.clone()).await;
         Ok(Response::new(sandbox))
     }
 
@@ -2374,7 +2388,7 @@ impl Burrow for ApiService {
             })
             .await?
             .into_inner();
-        self.0.sandboxes.update(sandbox.clone());
+        self.0.sandboxes.update(sandbox.clone()).await;
         Ok(Response::new(sandbox))
     }
 
@@ -2419,7 +2433,7 @@ impl Burrow for ApiService {
             })
             .await?
             .into_inner();
-        self.0.sandboxes.update(sandbox.clone());
+        self.0.sandboxes.update(sandbox.clone()).await;
         Ok(Response::new(sandbox))
     }
 
@@ -2517,7 +2531,7 @@ impl Burrow for ApiService {
             })
             .await?
             .into_inner();
-        self.0.sandboxes.update(sandbox.clone());
+        self.0.sandboxes.update(sandbox.clone()).await;
         Ok(Response::new(sandbox))
     }
 
@@ -2655,7 +2669,7 @@ impl Burrow for ApiService {
             release_in_store(&self.0.nodes, self.0.store.clone(), &node_id, eased, shrunk);
         }
         if let Some(sandbox) = &updated.sandbox {
-            self.0.sandboxes.update(sandbox.clone());
+            self.0.sandboxes.update(sandbox.clone()).await;
         }
         Ok(Response::new(updated))
     }
@@ -2695,14 +2709,9 @@ impl Burrow for ApiService {
             };
             self.resolve_secret_refs(network, subject).await?;
         }
-        // Held until the child is in the registry, so two forks naming the
-        // same child cannot both be built.
-        let _reserved = self
-            .0
-            .sandboxes
-            .reserve_claimed(&child_id, &req.name)
-            .await
-            .map_err(Status::already_exists)?;
+        // Held until the child exists, so two forks naming the same child
+        // cannot both be built.
+        let mut reserved = self.0.sandboxes.reserve(&child_id, &req.name).await?;
 
         self.require_policy_features(
             &node_id,
@@ -2749,21 +2758,33 @@ impl Burrow for ApiService {
             )
             .await
             .map_err(Status::resource_exhausted)?;
+        self.0
+            .sandboxes
+            .write_ahead(
+                &mut reserved,
+                stub(
+                    &child_id,
+                    &node_id,
+                    &req.name,
+                    &source.tags,
+                    &source.template,
+                    "",
+                ),
+            )
+            .await?;
         let (mut client, _admitted) = self.admitted_node_for(&source_id).await?;
-        let sandbox = client
+        let forked = client
             .fork_sandbox(nodepb::NodeForkRequest {
                 sandbox_id: source_id.clone(),
                 child_id: child_id.clone(),
                 policy: req.policy,
                 name: req.name,
             })
-            .await?
-            .into_inner();
+            .await;
+        let (sandbox, reserved) = answered(forked, reserved)?;
         held.keep();
         self.0.nodes.charge_cpu(&node_id, cpu_millis);
-
-        self.0.sandboxes.insert(sandbox.clone());
-        self.write_through().await;
+        self.settle_created(&sandbox, reserved).await?;
         tracing::info!(
             source = source_id,
             sandbox = child_id,
@@ -2786,17 +2807,15 @@ impl Burrow for ApiService {
         let id = self.resolve(&req.sandbox_id).await;
         // Read from the store rather than the cache: the sandbox may have
         // moved through another replica in the last second.
-        let mut current = self
-            .0
-            .sandboxes
-            .refresh(&id)
-            .await
-            .ok_or_else(|| Status::not_found(format!("no sandbox {id}")))?;
+        let (mut current, generation) = self.0.sandboxes.placed(&id).await?;
+        let before = current.clone();
         if req.is_cpuset_dropped {
             drop_cpuset(&mut current);
         }
         if current.node_id.is_empty() {
-            let moved = self.adopt(current, &req.node_id, req.node_labels).await?;
+            let moved = self
+                .adopt_from(current, "", generation, &req.node_id, req.node_labels)
+                .await?;
             return Ok(Response::new(moved));
         }
         let source = current.node_id.clone();
@@ -2877,21 +2896,26 @@ impl Burrow for ApiService {
         let target = placed
             .as_ref()
             .map_or_else(|| req.node_id.clone(), |(target, _)| target.clone());
-        // Held from before the source lets go until the sandbox is placed
-        // again, so no other call can place it, or move it again, meanwhile.
-        let _adoption = self.claim_placing(&id, &source).await?;
         let (mut client, admitted) = self.admitted_node_for(&id).await?;
-        let released = client
+        self.0.sandboxes.mark_releasing(&before, generation).await?;
+        let released = match client
             .release_sandbox(nodepb::NodeSandboxRef {
                 sandbox_id: id.clone(),
             })
-            .await?
-            .into_inner();
+            .await
+        {
+            Ok(released) => released.into_inner(),
+            Err(err) => {
+                // The source kept it, or may have: put the record back, and
+                // let its listings settle which.
+                if !is_outcome_unknown(&err) {
+                    self.0.sandboxes.settle(before, generation).await?;
+                }
+                return Err(err);
+            }
+        };
         // A hand back is admitted to the source again.
         drop(admitted);
-        // Between the two nodes the sandbox is nowhere, and recorded so: if
-        // the adopt fails, a later start places it rather than routing to a
-        // node that has let go of it.
         for name in &written {
             if self
                 .0
@@ -2902,7 +2926,10 @@ impl Burrow for ApiService {
                 self.0.volumes.release(name);
             }
         }
-        let mut released = self.0.sandboxes.unplace(released);
+        let mut released = common::Sandbox {
+            node_id: String::new(),
+            ..released
+        };
         if req.is_cpuset_dropped {
             drop_cpuset(&mut released);
         }
@@ -2917,7 +2944,13 @@ impl Burrow for ApiService {
         }
         tracing::info!(sandbox = id, node = source, "sandbox released for a move");
         let moved = match self
-            .adopt_claimed(released.clone(), &target, req.node_labels)
+            .adopt_from(
+                released.clone(),
+                &source,
+                generation,
+                &target,
+                req.node_labels,
+            )
             .await
         {
             Ok(moved) => moved,
@@ -3307,7 +3340,7 @@ impl Burrow for ApiService {
             })
             .await?
             .into_inner();
-        self.0.sandboxes.update(sandbox.clone());
+        self.0.sandboxes.update(sandbox.clone()).await;
         Ok(Response::new(sandbox))
     }
 
@@ -3331,7 +3364,7 @@ impl Burrow for ApiService {
             })
             .await?
             .into_inner();
-        self.0.sandboxes.update(sandbox.clone());
+        self.0.sandboxes.update(sandbox.clone()).await;
         Ok(Response::new(sandbox))
     }
 
@@ -3365,7 +3398,7 @@ impl Burrow for ApiService {
             })
             .await?
             .into_inner();
-        self.0.sandboxes.update(sandbox.clone());
+        self.0.sandboxes.update(sandbox.clone()).await;
         Ok(Response::new(sandbox))
     }
 
@@ -3892,8 +3925,7 @@ impl Burrow for ApiService {
         if let Some(mut sandbox) = self.unplaced(&id).await {
             let revoked_at_ms = revoked_at_ms.max(sandbox.access_revoked_at_ms);
             sandbox.access_revoked_at_ms = revoked_at_ms;
-            self.0.sandboxes.update(sandbox);
-            self.write_through().await;
+            self.0.sandboxes.update(sandbox).await;
             tracing::info!(sandbox = id, revoked_at_ms, "access tokens revoked");
             return Ok(Response::new(api::RevokeAccessResponse {
                 ended_sessions: 0,
@@ -4189,6 +4221,58 @@ fn apply_secrets(
     Ok(())
 }
 
+/// Whether a node call's failure leaves open that the node did what it was
+/// asked: its answer, not its work, may be what was lost.
+fn is_outcome_unknown(err: &Status) -> bool {
+    matches!(
+        err.code(),
+        tonic::Code::Unavailable
+            | tonic::Code::Unknown
+            | tonic::Code::Cancelled
+            | tonic::Code::DeadlineExceeded
+    )
+}
+
+/// The row written ahead of a create, before the node has built anything:
+/// enough to name and route it, nothing of its policy.
+fn stub(
+    id: &str,
+    node_id: &str,
+    name: &str,
+    tags: &HashMap<String, String>,
+    template: &str,
+    request_id: &str,
+) -> common::Sandbox {
+    common::Sandbox {
+        id: id.to_string(),
+        node_id: node_id.to_string(),
+        name: name.to_string(),
+        tags: tags.clone(),
+        template: template.to_string(),
+        create_request_id: request_id.to_string(),
+        state: common::SandboxState::Creating as i32,
+        ..Default::default()
+    }
+}
+
+/// A create's node answer, with its reservation. A failure gives the
+/// reservation back unless the node may have built the sandbox anyway, in
+/// which case its row stays for the node's next heartbeat to settle.
+fn answered(
+    result: Result<Response<common::Sandbox>, Status>,
+    reserved: crate::sandboxes::Reservation,
+) -> Result<(common::Sandbox, crate::sandboxes::Reservation), Status> {
+    match result {
+        Ok(response) => Ok((response.into_inner(), reserved)),
+        Err(err) => {
+            if is_outcome_unknown(&err) {
+                reserved.keep();
+            }
+            Err(err)
+        }
+    }
+}
+
 fn internal(err: anyhow::Error) -> Status {
     Status::internal(format!("{err:#}"))
 }
@@ -4394,8 +4478,8 @@ mod tests {
         }))
     }
 
-    fn offering(nodes: &[(&str, &[&str])]) -> ApiService {
-        let api = replica(crate::sandboxes::SandboxRegistry::default());
+    async fn offering(nodes: &[(&str, &[&str])]) -> ApiService {
+        let api = replica(crate::sandboxes::SandboxRegistry::in_memory().await);
         for (id, hypervisors) in nodes {
             let info = burrow_proto::common::v1::NodeInfo {
                 id: id.to_string(),
@@ -4413,8 +4497,8 @@ mod tests {
 
     /// A restore image is installed only on a node offering vz, and a fleet
     /// without one says so rather than sending it to a node that cannot.
-    #[test]
-    fn a_build_is_placed_where_it_can_run() {
+    #[tokio::test]
+    async fn a_build_is_placed_where_it_can_run() {
         let ipsw = api::BuildTemplateRequest {
             name: "macos-27".into(),
             from_ipsw: "latest".into(),
@@ -4432,7 +4516,7 @@ mod tests {
             hypervisor: "firecracker".into(),
             ..Default::default()
         };
-        let fleet = offering(&[("linux", &["firecracker"]), ("mac", &["vz"])]);
+        let fleet = offering(&[("linux", &["firecracker"]), ("mac", &["vz"])]).await;
         for (request, node) in [(&ipsw, "mac"), (&on_mac, "mac"), (&linux, "linux")] {
             assert_eq!(
                 fleet.0.nodes.place_for(&build_placement(request)).unwrap(),
@@ -4442,7 +4526,7 @@ mod tests {
         assert_eq!(build_placement(&on_mac).template, "macos-27");
         assert_eq!(build_placement(&ipsw).template, "");
 
-        let linux_only = offering(&[("linux", &["firecracker", "cloud-hypervisor"])]);
+        let linux_only = offering(&[("linux", &["firecracker", "cloud-hypervisor"])]).await;
         let refused = placement_status(
             linux_only
                 .0
@@ -4455,8 +4539,8 @@ mod tests {
     }
 
     /// A fleet of nodes, each under the inspection root named beside it.
-    fn under_roots(nodes: &[(&str, &str)]) -> ApiService {
-        let api = replica(crate::sandboxes::SandboxRegistry::default());
+    async fn under_roots(nodes: &[(&str, &str)]) -> ApiService {
+        let api = replica(crate::sandboxes::SandboxRegistry::in_memory().await);
         for (id, root) in nodes {
             let info = burrow_proto::common::v1::NodeInfo {
                 id: id.to_string(),
@@ -4488,8 +4572,11 @@ mod tests {
     /// another root is refused before the source lets go, naming both.
     #[tokio::test]
     async fn an_inspected_sandbox_moves_only_to_a_node_under_its_root() {
-        let api = under_roots(&[("node1", "aaaa"), ("node2", "bbbb"), ("node3", "aaaa")]);
-        api.0.sandboxes.insert(inspected("sbx_a", "node1", "aaaa"));
+        let api = under_roots(&[("node1", "aaaa"), ("node2", "bbbb"), ("node3", "aaaa")]).await;
+        api.0
+            .sandboxes
+            .put(inspected("sbx_a", "node1", "aaaa"))
+            .await;
 
         let err = api
             .move_sandbox(Request::new(api::MoveSandboxRequest {
@@ -4524,8 +4611,11 @@ mod tests {
     /// the guest holds once it lands.
     #[tokio::test]
     async fn a_sandbox_under_a_per_node_root_has_nowhere_to_move() {
-        let api = under_roots(&[("node1", "aaaa"), ("node2", "bbbb")]);
-        api.0.sandboxes.insert(inspected("sbx_a", "node1", "aaaa"));
+        let api = under_roots(&[("node1", "aaaa"), ("node2", "bbbb")]).await;
+        api.0
+            .sandboxes
+            .put(inspected("sbx_a", "node1", "aaaa"))
+            .await;
         let err = api
             .move_sandbox(Request::new(api::MoveSandboxRequest {
                 sandbox_id: "sbx_a".into(),
@@ -4542,9 +4632,9 @@ mod tests {
         assert!(err.message().contains("node2: bbbb"), "{err}");
     }
 
-    #[test]
-    fn placement_passes_over_nodes_under_another_root() {
-        let api = under_roots(&[("node1", "aaaa"), ("node2", "bbbb"), ("node3", "aaaa")]);
+    #[tokio::test]
+    async fn placement_passes_over_nodes_under_another_root() {
+        let api = under_roots(&[("node1", "aaaa"), ("node2", "bbbb"), ("node3", "aaaa")]).await;
         let excluded = api
             .other_roots("sandbox sbx_a", "aaaa", Some("node1"))
             .unwrap();
@@ -4570,14 +4660,17 @@ mod tests {
     /// source's node, which a test has no way to reach.
     #[tokio::test]
     async fn a_fork_names_its_source_not_its_child() {
-        let api = offering(&[("node1", &["firecracker"])]);
-        api.0.sandboxes.insert(common::Sandbox {
-            id: "sbx_a".into(),
-            name: "web".into(),
-            node_id: "node1".into(),
-            state: common::SandboxState::Running as i32,
-            ..Default::default()
-        });
+        let api = offering(&[("node1", &["firecracker"])]).await;
+        api.0
+            .sandboxes
+            .put(common::Sandbox {
+                id: "sbx_a".into(),
+                name: "web".into(),
+                node_id: "node1".into(),
+                state: common::SandboxState::Running as i32,
+                ..Default::default()
+            })
+            .await;
         for source in ["sbx_a", "web"] {
             let err = api
                 .fork_sandbox(Request::new(api::ForkSandboxRequest {
@@ -4591,48 +4684,32 @@ mod tests {
         }
     }
 
-    /// A move that failed at its target leaves the sandbox unplaced in the
-    /// store, but a replica that did not run the move can still cache the
-    /// node that let go. Its delete went to that node, was told no node holds
-    /// the sandbox, and never purged the stored state.
+    /// A delete always succeeds once the row is gone. For a sandbox no node
+    /// holds, the stored state is purged through any node that can reach the
+    /// object store, and left for the collector when none can; for one on a
+    /// node that does not answer, the node destroys it at its next heartbeat.
+    /// A replica whose cache still names the node a move left does not stop
+    /// it either.
     #[tokio::test]
-    async fn a_delete_purges_a_sandbox_another_replica_left_unplaced() {
+    async fn a_delete_succeeds_whether_or_not_a_node_answers() {
         let store = Arc::new(burrow_store::Store::open_in_memory().await.unwrap());
-        let mover = crate::sandboxes::SandboxRegistry::with_store(Arc::clone(&store)).await;
-        let stale = crate::sandboxes::SandboxRegistry::with_store(Arc::clone(&store)).await;
-        let placed = common::Sandbox {
-            id: "sbx_a".into(),
-            node_id: "node1".into(),
-            state: common::SandboxState::Suspended as i32,
-            is_durable: true,
-            ..Default::default()
-        };
-        mover.insert(placed.clone());
-        mover.writer().unwrap().flush().await;
-        assert_eq!(stale.refresh("sbx_a").await.unwrap().node_id, "node1");
-        mover.unplace(placed);
-        mover.writer().unwrap().flush().await;
-
-        let err = replica(stale)
-            .delete_sandbox(Request::new(api::SandboxRef {
-                sandbox_id: "sbx_a".into(),
-            }))
+        let mover = crate::sandboxes::SandboxRegistry::open(Arc::clone(&store))
             .await
-            .expect_err("no node to purge through in a test");
-        // The purge is what fails here, for want of a node to reach the store
-        // through, rather than the routing to a node that has let go.
-        assert_eq!(err.code(), tonic::Code::Unavailable, "{err}");
-        assert!(err.message().contains("stored state"), "{err}");
-    }
+            .unwrap();
+        let stale = crate::sandboxes::SandboxRegistry::open(Arc::clone(&store))
+            .await
+            .unwrap();
+        mover.put(sandbox_a("node1")).await;
+        assert_eq!(stale.refresh("sbx_a").await.unwrap().node_id, "node1");
+        mover.unplace(sandbox_a("node1"), "node1", 1).await.unwrap();
+        let api = replica(stale);
+        api.delete_sandbox(Request::new(api::SandboxRef {
+            sandbox_id: "sbx_a".into(),
+        }))
+        .await
+        .unwrap();
+        assert!(store.get_placement("sbx_a").await.unwrap().is_none());
 
-    /// A node whose heartbeats still arrive is slow, not gone: a delete it
-    /// fails is the caller's error, and only one against an absent node is
-    /// taken on the orchestrator's word and tombstoned.
-    #[tokio::test]
-    async fn a_delete_is_tombstoned_only_against_an_absent_node() {
-        let mut state = Arc::try_unwrap(replica(Default::default()).0).ok().unwrap();
-        state.control_plane_hosts = std::sync::Mutex::new(Vec::new());
-        let api = ApiService(Arc::new(state));
         let info = common::NodeInfo {
             id: "node1".into(),
             address: "127.0.0.1:1".into(),
@@ -4642,22 +4719,33 @@ mod tests {
             .nodes
             .register(info, String::new(), String::new(), None)
             .unwrap();
-        api.0.sandboxes.insert(sandbox_a("node1"));
-        let delete = || {
+        for aged in [None, Some(crate::registry::ABSENT_AFTER)] {
+            api.0
+                .sandboxes
+                .put(common::Sandbox {
+                    name: "web".into(),
+                    ..sandbox_a("node1")
+                })
+                .await;
+            store.claim("name:web", "sbx_a", 1).await.unwrap();
+            if let Some(aged) = aged {
+                api.0.nodes.age("node1", aged);
+            }
             api.delete_sandbox(Request::new(api::SandboxRef {
+                sandbox_id: "web".into(),
+            }))
+            .await
+            .unwrap();
+            assert!(api.0.sandboxes.get("sbx_a").is_none());
+            assert_eq!(store.claim_holder("name:web").await.unwrap(), None);
+        }
+        let err = api
+            .delete_sandbox(Request::new(api::SandboxRef {
                 sandbox_id: "sbx_a".into(),
             }))
-        };
-
-        let err = delete().await.unwrap_err();
-        assert_eq!(err.code(), tonic::Code::Unavailable, "{err}");
-        assert!(!api.0.sandboxes.is_tombstoned("sbx_a"));
-        assert_eq!(api.0.sandboxes.node_of("sbx_a").as_deref(), Some("node1"));
-
-        api.0.nodes.age("node1", crate::registry::ABSENT_AFTER);
-        delete().await.unwrap();
-        assert!(api.0.sandboxes.is_tombstoned("sbx_a"));
-        assert!(api.0.sandboxes.get("sbx_a").is_none());
+            .await
+            .unwrap_err();
+        assert_eq!(err.code(), tonic::Code::NotFound, "{err}");
     }
 
     /// A move whose memory the target's CPU cannot restore is refused before
@@ -4665,7 +4753,7 @@ mod tests {
     /// its disk and is not held to the CPU.
     #[tokio::test]
     async fn a_move_is_refused_before_suspending_to_an_incompatible_cpu() {
-        let api = replica(crate::sandboxes::SandboxRegistry::default());
+        let api = replica(crate::sandboxes::SandboxRegistry::in_memory().await);
         let fingerprint = |features: &[&str]| common::CpuFingerprint {
             vendor: "GenuineIntel".into(),
             family: 6,
@@ -4690,7 +4778,7 @@ mod tests {
             hypervisor: "cloud-hypervisor".into(),
             ..sandbox_a("node1")
         };
-        api.0.sandboxes.insert(running.clone());
+        api.0.sandboxes.put(running.clone()).await;
         let move_to_node2 = || {
             api.move_sandbox(Request::new(api::MoveSandboxRequest {
                 sandbox_id: "sbx_a".into(),
@@ -4712,62 +4800,49 @@ mod tests {
         assert_eq!(err.code(), tonic::Code::FailedPrecondition, "{err}");
         assert!(err.message().contains("node node2 lacks avx2"), "{err}");
 
-        api.0.sandboxes.update(common::Sandbox {
-            state: common::SandboxState::Stopped as i32,
-            ..running
-        });
+        api.0
+            .sandboxes
+            .update(common::Sandbox {
+                state: common::SandboxState::Stopped as i32,
+                ..running
+            })
+            .await;
         let err = move_to_node2().await.unwrap_err();
         assert_ne!(err.code(), tonic::Code::FailedPrecondition, "{err}");
     }
 
     /// Two starts of one unplaced sandbox through two replicas: the second
-    /// read it unplaced before the first placed it, and once the first let
-    /// go of its claim the second placed it again, on another node.
+    /// read it unplaced before the first placed it. The first raised its
+    /// generation, so the second cannot place it again.
     #[tokio::test]
     async fn a_sandbox_another_replica_placed_is_not_placed_again() {
         let store = Arc::new(burrow_store::Store::open_in_memory().await.unwrap());
-        let first = crate::sandboxes::SandboxRegistry::with_store(Arc::clone(&store)).await;
-        let second = crate::sandboxes::SandboxRegistry::with_store(Arc::clone(&store)).await;
-        first.insert(sandbox_a(""));
-        first.writer().unwrap().flush().await;
-        let stale = second.refresh("sbx_a").await.unwrap();
+        let first = crate::sandboxes::SandboxRegistry::open(Arc::clone(&store))
+            .await
+            .unwrap();
+        let second = crate::sandboxes::SandboxRegistry::open(Arc::clone(&store))
+            .await
+            .unwrap();
+        first.put(sandbox_a("")).await;
+        let (stale, generation) = second.placed("sbx_a").await.unwrap();
         assert!(stale.node_id.is_empty());
 
-        first.adopted(sandbox_a("node1"));
-        first.writer().unwrap().flush().await;
+        first
+            .move_to(&stale, "", generation, "node1")
+            .await
+            .unwrap();
+        let err = second
+            .move_to(&stale, "", generation, "node2")
+            .await
+            .unwrap_err();
+        assert_eq!(err.code(), tonic::Code::Aborted, "{err}");
+        assert!(err.message().contains("node node1"), "{err}");
         let err = replica(second)
             .adopt(stale, "", HashMap::new())
             .await
             .unwrap_err();
         assert_eq!(err.code(), tonic::Code::Aborted, "{err}");
         assert!(err.message().contains("node node1"), "{err}");
-    }
-
-    /// A move holds the claim on placing the sandbox from before its source
-    /// lets go, so a start through another replica cannot place it while it
-    /// is between nodes.
-    #[tokio::test]
-    async fn a_sandbox_being_moved_is_not_started_elsewhere() {
-        let store = Arc::new(burrow_store::Store::open_in_memory().await.unwrap());
-        let mover =
-            replica(crate::sandboxes::SandboxRegistry::with_store(Arc::clone(&store)).await);
-        let other = crate::sandboxes::SandboxRegistry::with_store(Arc::clone(&store)).await;
-        mover.0.sandboxes.insert(sandbox_a("node1"));
-        mover.0.sandboxes.writer().unwrap().flush().await;
-        let _moving = mover.claim_placing("sbx_a", "node1").await.unwrap();
-        mover.0.sandboxes.unplace(sandbox_a("node1"));
-        mover.0.sandboxes.writer().unwrap().flush().await;
-
-        other.refresh("sbx_a").await.unwrap();
-        let err = replica(other)
-            .start_sandbox(Request::new(api::StartSandboxRequest {
-                sandbox_id: "sbx_a".into(),
-                is_kernel_kept: false,
-            }))
-            .await
-            .unwrap_err();
-        assert_eq!(err.code(), tonic::Code::Aborted, "{err}");
-        assert!(err.message().contains("already being placed"), "{err}");
     }
 
     /// A leader that lost its term without noticing yet wrote nodes off on
@@ -4779,7 +4854,10 @@ mod tests {
     #[tokio::test]
     async fn a_replica_follows_the_pool_another_replica_recorded() {
         let store = Arc::new(burrow_store::Store::open_in_memory().await.unwrap());
-        let mut state = Arc::try_unwrap(replica(Default::default()).0).ok().unwrap();
+        let mut state =
+            Arc::try_unwrap(replica(crate::sandboxes::SandboxRegistry::in_memory().await).0)
+                .ok()
+                .unwrap();
         state.store = Some(Arc::clone(&store));
         assert!(
             store
@@ -4804,28 +4882,49 @@ mod tests {
         store.register_node(&row(1_000), None, 8).await.unwrap();
         let deposed = store.next_leader_epoch().await.unwrap();
         let current = store.next_leader_epoch().await.unwrap();
-        let leader = |epoch| {
-            let mut state = Arc::try_unwrap(replica(Default::default()).0).ok().unwrap();
+        let leader = async |epoch| {
+            let registry = crate::sandboxes::SandboxRegistry::open(Arc::clone(&store))
+                .await
+                .unwrap();
+            let mut state = Arc::try_unwrap(replica(registry).0).ok().unwrap();
             state.store = Some(Arc::clone(&store));
             state.leader = crate::leader::Leader::holding(epoch);
             let api = ApiService(Arc::new(state));
-            api.0.sandboxes.insert(sandbox_a("node1"));
+            api.0.sandboxes.put(sandbox_a("node1")).await;
             api
         };
         let expiry = std::time::Duration::from_secs(60);
 
         for epoch in [None, Some(deposed)] {
-            let api = leader(epoch);
+            let api = leader(epoch).await;
             assert!(!crate::write_off_node(&api.0, "node1", expiry).await);
             assert_eq!(api.0.sandboxes.node_of("sbx_a").as_deref(), Some("node1"));
         }
+        let beat = |seq, last_heartbeat_ms| burrow_store::NodeReport {
+            node: row(last_heartbeat_ms),
+            seq,
+            sandboxes: vec![burrow_store::ReportedSandbox {
+                id: "sbx_a".into(),
+                generation: 1,
+                hash: 0,
+                in_flight: 0,
+            }],
+            ..Default::default()
+        };
         store
-            .heartbeat_node(&row(burrow_common::unix_now_ms()))
+            .reconcile_node(
+                &beat(1, burrow_common::unix_now_ms()),
+                |_| None,
+                |_, _| None,
+            )
             .await
             .unwrap();
-        assert!(!crate::write_off_node(&leader(Some(current)).0, "node1", expiry).await);
-        store.heartbeat_node(&row(1_000)).await.unwrap();
-        let api = leader(Some(current));
+        assert!(!crate::write_off_node(&leader(Some(current)).await.0, "node1", expiry).await);
+        store
+            .reconcile_node(&beat(2, 1_000), |_| None, |_, _| None)
+            .await
+            .unwrap();
+        let api = leader(Some(current)).await;
         assert!(crate::write_off_node(&api.0, "node1", expiry).await);
         assert_eq!(api.0.sandboxes.node_of("sbx_a").as_deref(), Some(""));
     }
@@ -4854,7 +4953,10 @@ mod tests {
             })
             .await
             .unwrap();
-        let mut state = Arc::try_unwrap(replica(Default::default()).0).ok().unwrap();
+        let registry = crate::sandboxes::SandboxRegistry::open(Arc::clone(&store))
+            .await
+            .unwrap();
+        let mut state = Arc::try_unwrap(replica(registry).0).ok().unwrap();
         state.store = Some(store);
         state.control_plane_hosts = std::sync::Mutex::new(Vec::new());
         let api = ApiService(Arc::new(state));
@@ -4869,10 +4971,13 @@ mod tests {
                 .register(info, String::new(), String::new(), None)
                 .unwrap();
         }
-        api.0.sandboxes.insert(common::Sandbox {
-            public_ips: vec![ip],
-            ..sandbox
-        });
+        api.0
+            .sandboxes
+            .put(common::Sandbox {
+                public_ips: vec![ip],
+                ..sandbox
+            })
+            .await;
         api
     }
 
@@ -4909,7 +5014,7 @@ mod tests {
     /// the source is asked to let go. Dropping the cpuset gets it past.
     #[tokio::test]
     async fn a_move_to_a_node_that_cannot_hold_its_limits_is_refused_first() {
-        let api = replica(crate::sandboxes::SandboxRegistry::default());
+        let api = replica(crate::sandboxes::SandboxRegistry::in_memory().await);
         for (id, vcpus) in [("node1", 8), ("node2", 2)] {
             api.0
                 .nodes
@@ -4949,7 +5054,7 @@ mod tests {
             is_cpuset_dropped: dropped,
             ..Default::default()
         };
-        api.0.sandboxes.insert(pinned("6-7", 0));
+        api.0.sandboxes.put(pinned("6-7", 0)).await;
         let err = api
             .move_sandbox(Request::new(move_to(false)))
             .await
@@ -4969,7 +5074,7 @@ mod tests {
             .unwrap_err();
         assert_ne!(err.code(), tonic::Code::FailedPrecondition, "{err}");
 
-        api.0.sandboxes.insert(pinned("", 500));
+        api.0.sandboxes.put(pinned("", 500)).await;
         let err = api
             .move_sandbox(Request::new(move_to(true)))
             .await
@@ -5044,11 +5149,22 @@ mod tests {
             ..sandbox_a("node1")
         };
         let api = pinned(running, &["node2"]).await;
-        let (_, unplaced) = api
+        let store = api.0.sandboxes.store();
+        let node = burrow_store::NodeRow {
+            id: "node1".into(),
+            last_heartbeat_ms: 1_000,
+            ..Default::default()
+        };
+        store.register_node(&node, None, 8).await.unwrap();
+        let epoch = store.next_leader_epoch().await.unwrap();
+        let written_off = api
             .0
             .sandboxes
-            .forget_node("node1", &common::NodeInfo::default());
-        assert_eq!(unplaced.len(), 1);
+            .write_off("node1", &common::NodeInfo::default(), 2_000, epoch)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(written_off.unplaced.len(), 1);
         let err = api
             .start_sandbox(Request::new(api::StartSandboxRequest {
                 sandbox_id: "sbx_a".into(),
@@ -5365,7 +5481,7 @@ mod create_tests {
                 .add_service(node)
                 .serve_with_incoming(tonic::transport::server::TcpIncoming::from(listener)),
         );
-        let api = super::tests::replica(crate::sandboxes::SandboxRegistry::default());
+        let api = super::tests::replica(crate::sandboxes::SandboxRegistry::in_memory().await);
         let info = common::NodeInfo {
             id: "n1".into(),
             address: addr.to_string(),
@@ -5487,12 +5603,16 @@ mod create_tests {
         let reported = api.clone();
         tokio::spawn(async move {
             tokio::time::sleep(std::time::Duration::from_millis(300)).await;
-            reported.0.sandboxes.insert(common::Sandbox {
-                id: "sbx_reported".into(),
-                node_id: "n1".into(),
-                create_request_id: "req-1".into(),
-                ..Default::default()
-            });
+            reported
+                .0
+                .sandboxes
+                .put(common::Sandbox {
+                    id: "sbx_reported".into(),
+                    node_id: "n1".into(),
+                    create_request_id: "req-1".into(),
+                    ..Default::default()
+                })
+                .await;
         });
         let sandbox = api
             .create_sandbox(create("req-1"))
@@ -5527,12 +5647,15 @@ mod create_tests {
                 ..Default::default()
             }),
         );
-        api.0.sandboxes.insert(common::Sandbox {
-            id: "sbx_stopped".into(),
-            node_id: "n1".into(),
-            state: common::SandboxState::Stopped as i32,
-            ..Default::default()
-        });
+        api.0
+            .sandboxes
+            .put(common::Sandbox {
+                id: "sbx_stopped".into(),
+                node_id: "n1".into(),
+                state: common::SandboxState::Stopped as i32,
+                ..Default::default()
+            })
+            .await;
         let err = api
             .update_resources(Request::new(api::UpdateResourcesRequest {
                 sandbox_id: "sbx_stopped".into(),

@@ -11,8 +11,8 @@ pub const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(5);
 /// A node missing this many intervals is reported unhealthy.
 const STALE_AFTER: Duration = Duration::from_secs(15);
 /// A node unheard for this long is taken to be gone rather than slow: it is
-/// no longer called, placed on, or given a delete before one is tombstoned.
-/// Until then a node whose heartbeats arrive late, as they do from one busy
+/// no longer called or placed on, and a delete does not wait for it. Until
+/// then a node whose heartbeats arrive late, as they do from one busy
 /// with a burst, is still called and placed on, after every punctual node.
 pub const ABSENT_AFTER: Duration = Duration::from_secs(60);
 
