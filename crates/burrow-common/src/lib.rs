@@ -1,6 +1,7 @@
 pub mod access;
 pub mod auth;
 pub mod banner;
+pub mod build;
 pub mod cmdlog;
 pub mod cpu;
 pub mod disk;
