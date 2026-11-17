@@ -411,6 +411,7 @@ fn upgrade_failure(
     match running {
         None if is_vmm_gone => Some("the guest's VM exited during its agent upgrade".into()),
         None => None,
+        Some("") => None,
         Some(running) if running == new => None,
         Some(running) if running != old => Some(format!(
             "the guest agent came back as {running}, not the new build {new}"
@@ -692,6 +693,7 @@ mod tests {
                 .contains("came back as other")
         );
         assert!(judge(None, 0, true).unwrap().contains("VM exited"));
+        assert_eq!(judge(Some(""), 60, false), None);
     }
 
     #[test]
