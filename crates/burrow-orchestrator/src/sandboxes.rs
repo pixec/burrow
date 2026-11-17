@@ -216,6 +216,15 @@ pub struct WrittenOff {
     pub unplaced: Vec<common::Sandbox>,
 }
 
+/// What a node holds besides sandboxes, as one heartbeat lists it.
+#[derive(Debug, Default)]
+pub struct Holdings {
+    pub snapshots: Vec<String>,
+    /// Snapshots the node removed itself since its last applied heartbeat.
+    pub swept_snapshots: Vec<String>,
+    pub volumes: Vec<String>,
+}
+
 /// What a heartbeat's complete listing settled. See
 /// [`SandboxRegistry::reconcile`].
 #[derive(Debug, Default)]
@@ -237,6 +246,9 @@ pub struct Reconciled {
     /// Rows the node holds whose create or adopt never had its answer
     /// recorded.
     pub unanswered: Vec<String>,
+    /// Snapshots and volumes the node holds that no row names.
+    pub destroy_snapshots: Vec<String>,
+    pub destroy_volumes: Vec<String>,
 }
 
 pub struct SandboxRegistry {
@@ -820,7 +832,13 @@ impl SandboxRegistry {
         info: &common::NodeInfo,
         seq: u64,
         reported: &[nodepb::SandboxStateReport],
+        holdings: Holdings,
     ) -> Result<Reconciled, Status> {
+        let Holdings {
+            snapshots,
+            swept_snapshots,
+            volumes,
+        } = holdings;
         let now = node.last_heartbeat_ms;
         let node_id = node.id.clone();
         let by_id: HashMap<&str, &nodepb::SandboxStateReport> = reported
@@ -842,6 +860,9 @@ impl SandboxRegistry {
             pending_after_ms: now - PENDING_DEADLINE_MS,
             usage_before_ms: now - USAGE_WRITE_INTERVAL_MS,
             unanswered_before_ms: now - UNANSWERED_AFTER_MS,
+            snapshots,
+            swept_snapshots,
+            volumes,
         };
         let restate = |row: &burrow_store::PlacementRow| {
             let report = by_id.get(row.id.as_str()).filter(|r| !r.is_in_flight)?;
@@ -928,6 +949,8 @@ impl SandboxRegistry {
             replaced: applied.replaced.into_iter().map(|row| row.id).collect(),
             lost,
             unanswered: applied.unanswered,
+            destroy_snapshots: applied.destroy_snapshots,
+            destroy_volumes: applied.destroy_volumes,
         })
     }
 
@@ -1136,7 +1159,13 @@ mod tests {
             ..Default::default()
         };
         registry
-            .reconcile(row, &common::NodeInfo::default(), seq, &listing(entries))
+            .reconcile(
+                row,
+                &common::NodeInfo::default(),
+                seq,
+                &listing(entries),
+                Holdings::default(),
+            )
             .await
             .unwrap()
     }
@@ -1412,7 +1441,13 @@ mod tests {
                 ..Default::default()
             };
             let out = registry
-                .reconcile(row, &common::NodeInfo::default(), seq, &in_flight)
+                .reconcile(
+                    row,
+                    &common::NodeInfo::default(),
+                    seq,
+                    &in_flight,
+                    Holdings::default(),
+                )
                 .await
                 .unwrap();
             assert!(out.lost.is_empty() && out.destroy.is_empty() && out.unanswered.is_empty());
@@ -1482,7 +1517,13 @@ mod tests {
             ..Default::default()
         };
         let out = registry
-            .reconcile(row, &common::NodeInfo::default(), 2, &both)
+            .reconcile(
+                row,
+                &common::NodeInfo::default(),
+                2,
+                &both,
+                Holdings::default(),
+            )
             .await
             .unwrap();
         assert!(out.lost.is_empty());
@@ -1609,7 +1650,13 @@ mod tests {
             ..Default::default()
         };
         let out = first
-            .reconcile(row, &common::NodeInfo::default(), 1, &suspended)
+            .reconcile(
+                row,
+                &common::NodeInfo::default(),
+                1,
+                &suspended,
+                Holdings::default(),
+            )
             .await
             .unwrap();
         assert_eq!(out.restated, 1);

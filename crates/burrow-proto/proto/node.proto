@@ -431,6 +431,11 @@ message HeartbeatRequest {
   // The orchestrator keeps the id it assigned; everything else is the node's to
   // say.
   burrow.common.v1.NodeInfo info = 5;
+  // Snapshots the node deleted on its own, expired or evicted from
+  // retention, since its last applied heartbeat. Their rows go; a snapshot
+  // missing from `snapshots` is no word on its row, since the listing may
+  // predate its create.
+  repeated string swept_snapshots = 8;
   // Rises with every heartbeat the node sends, across its restarts. The
   // orchestrator ignores one no higher than the last it applied, so a delayed
   // heartbeat cannot undo what a later one settled. 0 is refused.
@@ -507,6 +512,11 @@ message HeartbeatResponse {
   // since. The node destroys its copy if it still holds that generation.
   // Every other sandbox it reported is confirmed.
   repeated SandboxGeneration destroyed_sandboxes = 13;
+  // Snapshots and volumes the node reported that no row names: deleted, or
+  // never made through the orchestrator. The node destroys them. A Kit's
+  // volumes go with their sandbox and are never named here.
+  repeated string destroyed_snapshots = 14;
+  repeated string destroyed_volumes = 15;
   // As in RegisterResponse, repeated on every beat so a rotated key reaches
   // nodes without a re-registration.
   repeated AccessKey access_keys = 9;

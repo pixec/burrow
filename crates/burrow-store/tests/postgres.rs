@@ -41,6 +41,61 @@ async fn the_control_tables_round_trip_on_postgres() {
     store.remove_placement(&a).await.unwrap().unwrap();
     store.remove_placement(&b).await.unwrap().unwrap();
 
+    assert!(store.insert_snapshot(&a, 1).await.unwrap());
+    assert!(!store.insert_snapshot(&a, 1).await.unwrap());
+    assert!(store.insert_volume(&b, 1).await.unwrap());
+    let node = format!("{run}_node");
+    store
+        .register_node(
+            &NodeRow {
+                id: node.clone(),
+                ..Default::default()
+            },
+            None,
+            4096,
+        )
+        .await
+        .unwrap();
+    let first = NodeReport {
+        node: NodeRow {
+            id: node.clone(),
+            ..Default::default()
+        },
+        seq: 1,
+        ..Default::default()
+    };
+    store
+        .reconcile_node(&first, |_| None, |_, _| None)
+        .await
+        .unwrap();
+    store.record_stored_inventory(&[], &[], 1).await.unwrap();
+    let report = NodeReport {
+        node: NodeRow {
+            id: node.clone(),
+            ..Default::default()
+        },
+        seq: 2,
+        snapshots: vec![a.clone(), format!("{run}_gone")],
+        volumes: vec![b.clone(), format!("{run}_gone")],
+        ..Default::default()
+    };
+    let Reconciled::Applied(out) = store
+        .reconcile_node(&report, |_| None, |_, _| None)
+        .await
+        .unwrap()
+    else {
+        panic!("not applied");
+    };
+    assert_eq!(out.destroy_snapshots, [format!("{run}_gone")]);
+    assert_eq!(out.destroy_volumes, [format!("{run}_gone")]);
+    assert!(store.remove_snapshot(&a).await.unwrap());
+    assert!(store.remove_volume(&b).await.unwrap());
+    let epoch = store.leader_epoch().await.unwrap();
+    store
+        .write_off_node(&node, i64::MAX, epoch, |_| None)
+        .await
+        .unwrap();
+
     store.put_secret(&a, "sealed").await.unwrap();
     store.put_secret(&a, "sealed2").await.unwrap();
     assert_eq!(
@@ -414,6 +469,9 @@ fn beat(node: &str, seq: i64, entries: &[(&str, i64)]) -> NodeReport {
         pending_after_ms: 0,
         usage_before_ms: 0,
         unanswered_before_ms: 0,
+        snapshots: Vec::new(),
+        swept_snapshots: Vec::new(),
+        volumes: Vec::new(),
     }
 }
 

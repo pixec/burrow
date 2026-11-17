@@ -27,8 +27,6 @@ use crate::sandbox::{RunningSandbox, SandboxManager};
 /// The capability types this node answers.
 pub const CLAIMED: &[&str] = burrow_common::kit::KNOWN_TYPES;
 
-/// Label on a Kit volume naming the sandbox it belongs to.
-pub const LABEL_SANDBOX: &str = "burrow.kit/sandbox";
 /// Label on a Kit volume naming the path it mounts at.
 pub const LABEL_PATH: &str = "burrow.kit/path";
 /// Labels a recreation compares against the storage it would reattach.
@@ -513,7 +511,7 @@ pub fn volume_name(sandbox_id: &str, path: &str) -> String {
 fn is_owned_by(volume: &common::Volume, sandbox_id: &str) -> bool {
     volume
         .labels
-        .get(LABEL_SANDBOX)
+        .get(burrow_common::kit::VOLUME_OWNER_LABEL)
         .is_some_and(|s| s == sandbox_id)
 }
 
@@ -563,7 +561,10 @@ pub async fn prepare_volumes(
             None => {
                 let size_mib = cfg.size.map_or(DEFAULT_VOLUME_MIB, |s| s.mib_ceil()).max(1);
                 let labels = HashMap::from([
-                    (LABEL_SANDBOX.to_string(), sandbox_id.to_string()),
+                    (
+                        burrow_common::kit::VOLUME_OWNER_LABEL.to_string(),
+                        sandbox_id.to_string(),
+                    ),
                     (LABEL_PATH.to_string(), cfg.path.clone()),
                     (LABEL_SIZE.to_string(), size),
                     (LABEL_MODE.to_string(), mode.clone()),

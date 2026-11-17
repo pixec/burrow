@@ -426,11 +426,32 @@ impl NodeRegistry for NodeRegistryService {
             },
             ..row
         };
+        // A Kit's volumes are made and removed with their sandbox on its node,
+        // so the store names none of them.
+        let named_volumes = volumes
+            .iter()
+            .filter(|volume| {
+                !volume
+                    .labels
+                    .contains_key(burrow_common::kit::VOLUME_OWNER_LABEL)
+            })
+            .map(|volume| volume.name.clone())
+            .collect();
         let started = std::time::Instant::now();
         let reconciled = self
             .0
             .sandboxes
-            .reconcile(row, &info, req.report_seq, &req.sandboxes)
+            .reconcile(
+                row,
+                &info,
+                req.report_seq,
+                &req.sandboxes,
+                sandboxes::Holdings {
+                    snapshots: req.snapshots.clone(),
+                    swept_snapshots: req.swept_snapshots.clone(),
+                    volumes: named_volumes,
+                },
+            )
             .await?;
         tracing::debug!(
             node_id = req.node_id,
@@ -484,20 +505,41 @@ impl NodeRegistry for NodeRegistryService {
                     tracing::warn!(node_id = req.node_id, %err, "could not record usage from a heartbeat");
                 }
             }
-            let dropped =
+            let unnamed_snapshots: std::collections::HashSet<&str> = reconciled
+                .destroy_snapshots
+                .iter()
+                .map(String::as_str)
+                .collect();
+            let held: Vec<String> = req
+                .snapshots
+                .iter()
+                .filter(|id| !unnamed_snapshots.contains(id.as_str()))
+                .cloned()
+                .collect();
+            let forgotten =
                 self.0
                     .snapshots
-                    .apply_report(&req.node_id, &req.snapshots, &req.durable_snapshots);
-            if dropped > 0 {
+                    .apply_report(&req.node_id, &held, &req.durable_snapshots);
+            if !forgotten.is_empty() {
                 tracing::info!(
                     node_id = req.node_id,
-                    dropped,
+                    dropped = forgotten.len(),
                     "forgot snapshots the node no longer holds"
                 );
             }
-            // A Kit's lifecycle creates volumes on the node itself, so the
-            // node's own inventory is what the registry reflects.
+            let volumes = volumes
+                .into_iter()
+                .filter(|volume| !reconciled.destroy_volumes.contains(&volume.name))
+                .collect();
             self.0.volumes.reconcile_node(&req.node_id, volumes);
+            if !reconciled.destroy_snapshots.is_empty() || !reconciled.destroy_volumes.is_empty() {
+                tracing::warn!(
+                    node_id = req.node_id,
+                    snapshots = reconciled.destroy_snapshots.len(),
+                    volumes = reconciled.destroy_volumes.len(),
+                    "node holds snapshots or volumes no row names; telling it to destroy them"
+                );
+            }
             if reconciled.restated > 0 || !reconciled.lost.is_empty() {
                 tracing::info!(
                     node_id = req.node_id,
@@ -547,6 +589,8 @@ impl NodeRegistry for NodeRegistryService {
             sandbox_lease_secs: self.0.sandbox_lease_secs,
             is_report_applied: reconciled.is_applied,
             destroyed_sandboxes: reconciled.destroy,
+            destroyed_snapshots: reconciled.destroy_snapshots,
+            destroyed_volumes: reconciled.destroy_volumes,
             access_keys: access_keys(&self.0),
             is_fleet_on_casync_chunks: self.0.chunk_fleet.is_upgraded(),
         }))
@@ -648,25 +692,49 @@ pub async fn refresh_inventory(state: &OrchestratorState, node_id: &str) {
     }
 }
 
+/// The snapshots among `listed` the store has rows for.
+pub async fn named_snapshots(
+    state: &OrchestratorState,
+    mut listed: Vec<burrow_proto::common::v1::Snapshot>,
+) -> burrow_store::Result<Vec<burrow_proto::common::v1::Snapshot>> {
+    let named = state.sandboxes.store().snapshot_ids().await?;
+    listed.retain(|snapshot| named.contains(&snapshot.id));
+    Ok(listed)
+}
+
+/// The volumes among `listed` the store has rows for, and every Kit volume,
+/// which belongs to its sandbox.
+pub async fn named_volumes(
+    state: &OrchestratorState,
+    mut listed: Vec<burrow_proto::common::v1::Volume>,
+) -> burrow_store::Result<Vec<burrow_proto::common::v1::Volume>> {
+    let named = state.sandboxes.store().volume_names().await?;
+    listed.retain(|volume| {
+        named.contains(&volume.name)
+            || volume
+                .labels
+                .contains_key(burrow_common::kit::VOLUME_OWNER_LABEL)
+    });
+    Ok(listed)
+}
+
 async fn inventory(state: &OrchestratorState, node_id: &str, client: &mut crate::api::NodeClient) {
     let node_id = node_id.to_string();
-    // Snapshots are only recorded here, so a restarted orchestrator has no
-    // idea where any of them live until each node says. The node is the
-    // authority, exactly as it is for its sandboxes.
+    // Where each snapshot lives is learned from the nodes, which of them
+    // exist from the store.
     match client
         .list_snapshots(nodepb::NodeListSnapshotsRequest {
             sandbox_id: String::new(),
         })
         .await
     {
-        Ok(resp) => {
-            let adopted = state
-                .snapshots
-                .reconcile_node(&node_id, resp.into_inner().snapshots);
-            if adopted > 0 {
-                tracing::info!(node_id, adopted, "adopted node snapshots");
+        Ok(resp) => match named_snapshots(state, resp.into_inner().snapshots).await {
+            Ok(listed) => {
+                let held = state.snapshots.reconcile_node(&node_id, listed);
+                tracing::debug!(node_id, held, "refreshed node snapshots");
             }
-        }
+            Err(err) => tracing::warn!(node_id, %err, "could not read snapshot rows"),
+        },
         Err(err) => tracing::warn!(node_id, %err, "node snapshot inventory unavailable"),
     }
     // What the object store holds, as this node sees it. Any node with the
@@ -677,19 +745,20 @@ async fn inventory(state: &OrchestratorState, node_id: &str, client: &mut crate:
         })
         .await
     {
-        Ok(resp) => {
-            let (adopted, forgotten) = state
-                .snapshots
-                .reconcile_remote(resp.into_inner().snapshots);
-            if adopted > 0 || forgotten > 0 {
-                tracing::info!(
-                    node_id,
-                    adopted,
-                    forgotten,
-                    "reconciled snapshots with the object store"
-                );
+        Ok(resp) => match named_snapshots(state, resp.into_inner().snapshots).await {
+            Ok(listed) => {
+                let (adopted, forgotten) = state.snapshots.reconcile_remote(listed);
+                if adopted > 0 || !forgotten.is_empty() {
+                    tracing::info!(
+                        node_id,
+                        adopted,
+                        forgotten = forgotten.len(),
+                        "reconciled snapshots with the object store"
+                    );
+                }
             }
-        }
+            Err(err) => tracing::warn!(node_id, %err, "could not read snapshot rows"),
+        },
         Err(err) if err.code() == tonic::Code::FailedPrecondition => {}
         Err(err) => tracing::warn!(node_id, %err, "object store snapshot inventory unavailable"),
     }
@@ -700,14 +769,13 @@ async fn inventory(state: &OrchestratorState, node_id: &str, client: &mut crate:
         })
         .await
     {
-        Ok(resp) => {
-            let adopted = state
-                .volumes
-                .reconcile_node(&node_id, resp.into_inner().volumes);
-            if adopted > 0 {
-                tracing::info!(node_id, adopted, "adopted node volumes");
+        Ok(resp) => match named_volumes(state, resp.into_inner().volumes).await {
+            Ok(listed) => {
+                let held = state.volumes.reconcile_node(&node_id, listed);
+                tracing::debug!(node_id, held, "refreshed node volumes");
             }
-        }
+            Err(err) => tracing::warn!(node_id, %err, "could not read volume rows"),
+        },
         Err(err) => tracing::warn!(node_id, %err, "node volume inventory unavailable"),
     }
     match client
@@ -716,19 +784,22 @@ async fn inventory(state: &OrchestratorState, node_id: &str, client: &mut crate:
         })
         .await
     {
-        Ok(resp) => {
-            let (adopted, forgotten) = state
-                .volumes
-                .reconcile_remote(resp.into_inner().volumes, |node| state.nodes.knows(node));
-            if adopted > 0 || forgotten > 0 {
-                tracing::info!(
-                    node_id,
-                    adopted,
-                    forgotten,
-                    "reconciled volumes with the object store"
-                );
+        Ok(resp) => match named_volumes(state, resp.into_inner().volumes).await {
+            Ok(listed) => {
+                let (adopted, forgotten) = state
+                    .volumes
+                    .reconcile_remote(listed, |node| state.nodes.knows(node));
+                if adopted > 0 || forgotten > 0 {
+                    tracing::info!(
+                        node_id,
+                        adopted,
+                        forgotten,
+                        "reconciled volumes with the object store"
+                    );
+                }
             }
-        }
+            Err(err) => tracing::warn!(node_id, %err, "could not read volume rows"),
+        },
         Err(err) if err.code() == tonic::Code::FailedPrecondition => {}
         Err(err) => tracing::warn!(node_id, %err, "object store volume inventory unavailable"),
     }
@@ -819,6 +890,7 @@ async fn reap_dead_nodes(state: Arc<OrchestratorState>, expiry: Option<std::time
                 write_off_node(&state, &node_id, expiry).await;
             }
         }
+        record_stored_inventory(&state).await;
         // A replica that died half way through a create leaves its claims on
         // an id and a name with no sandbox behind them.
         if let Some(store) = &state.store {
@@ -833,6 +905,63 @@ async fn reap_dead_nodes(state: Arc<OrchestratorState>, expiry: Option<std::time
                 Err(err) => tracing::warn!(%err, "could not sweep abandoned claims"),
             }
         }
+    }
+}
+
+/// Records, once, the snapshots and volumes the object store held before
+/// they had rows, as any node with the store lists them. Exists for the
+/// release that gives them rows; the release after removes it, with the
+/// store's recording (see `Store::is_stored_inventory_recorded`).
+async fn record_stored_inventory(state: &OrchestratorState) {
+    let store = state.sandboxes.store();
+    if store.is_stored_inventory_recorded().await.unwrap_or(true) {
+        return;
+    }
+    for node_id in state.nodes.healthy_ids() {
+        let Some(endpoint) = state.nodes.endpoint(&node_id) else {
+            continue;
+        };
+        let Ok(mut client) = crate::api::connect_node(endpoint, state.node_token.as_deref()).await
+        else {
+            continue;
+        };
+        let snapshots = client
+            .list_durable_snapshots(nodepb::NodeListSnapshotsRequest {
+                sandbox_id: String::new(),
+            })
+            .await;
+        let volumes = client
+            .list_durable_volumes(burrow_proto::api::v1::ListVolumesRequest {
+                node_id: String::new(),
+            })
+            .await;
+        let (Ok(snapshots), Ok(volumes)) = (snapshots, volumes) else {
+            continue;
+        };
+        let snapshots: Vec<String> = snapshots
+            .into_inner()
+            .snapshots
+            .into_iter()
+            .map(|snapshot| snapshot.id)
+            .collect();
+        let volumes: Vec<String> = volumes
+            .into_inner()
+            .volumes
+            .into_iter()
+            .map(|volume| volume.name)
+            .collect();
+        match store
+            .record_stored_inventory(&snapshots, &volumes, burrow_common::unix_now_ms())
+            .await
+        {
+            Ok(()) => tracing::info!(
+                snapshots = snapshots.len(),
+                volumes = volumes.len(),
+                "recorded the snapshots and volumes the object store held"
+            ),
+            Err(err) => tracing::warn!(%err, "could not record what the object store holds"),
+        }
+        return;
     }
 }
 

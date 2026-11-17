@@ -11582,6 +11582,39 @@ impl SandboxManager {
         }
     }
 
+    /// Deletes snapshots and volumes no row in the store names, as a delete
+    /// through the orchestrator would have: deleted while this node was away,
+    /// or never made through it. A volume a sandbox has attached is refused
+    /// and asked about again at the next heartbeat.
+    pub fn destroy_unnamed(&self, snapshots: &[String], volumes: &[String]) {
+        for id in snapshots {
+            let manager = self.clone();
+            let id = id.clone();
+            tokio::spawn(async move {
+                match manager.snapshots().delete(&id).await {
+                    Ok(()) => {
+                        tracing::warn!(snapshot = id, "no row names this snapshot; deleted it")
+                    }
+                    Err(err) => {
+                        tracing::warn!(snapshot = id, %err, "could not delete a snapshot no row names")
+                    }
+                }
+            });
+        }
+        for name in volumes {
+            let manager = self.clone();
+            let name = name.clone();
+            tokio::spawn(async move {
+                match manager.volumes().delete(&name).await {
+                    Ok(()) => tracing::warn!(volume = name, "no row names this volume; deleted it"),
+                    Err(err) => {
+                        tracing::warn!(volume = name, %err, "could not delete a volume no row names")
+                    }
+                }
+            });
+        }
+    }
+
     /// Unfences sandboxes the store still lists here, at the generation this
     /// node holds them at.
     pub fn confirm(&self, ids: &[String]) {

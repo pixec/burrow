@@ -461,6 +461,7 @@ impl ApiService {
                         &req.tags,
                         &snapshot.template,
                         &req.request_id,
+                        req.policy.as_ref(),
                     ),
                 )
                 .await?;
@@ -690,6 +691,7 @@ impl ApiService {
                     &req.tags,
                     &template,
                     &req.request_id,
+                    req.policy.as_ref(),
                 ),
             )
             .await?;
@@ -1317,7 +1319,10 @@ impl ApiService {
             else {
                 continue;
             };
-            return Some((client, resp.into_inner().snapshots));
+            let listed = crate::named_snapshots(&self.0, resp.into_inner().snapshots)
+                .await
+                .ok()?;
+            return Some((client, listed));
         }
         None
     }
@@ -1330,6 +1335,17 @@ impl ApiService {
     /// took a snapshot and used it straight away should not be told it does
     /// not exist in that window.
     async fn find_snapshot(&self, id: &str) -> Option<common::Snapshot> {
+        if !self
+            .0
+            .sandboxes
+            .store()
+            .snapshot_ids()
+            .await
+            .ok()?
+            .contains(id)
+        {
+            return None;
+        }
         let found = futures::future::join_all(reachable_nodes(&self.0).into_iter().map(
             |(node_id, endpoint)| async move {
                 let mut client = self
@@ -1374,7 +1390,16 @@ impl ApiService {
             },
         ))
         .await;
-        match found.into_iter().flatten().next() {
+        let found = found.into_iter().flatten().next();
+        let found = match found {
+            Some((node_id, volume)) => crate::named_volumes(&self.0, vec![volume])
+                .await
+                .ok()?
+                .pop()
+                .map(|volume| (node_id, volume)),
+            None => None,
+        };
+        match found {
             Some((node_id, volume)) => self.0.volumes.insert(&node_id, volume),
             None => {
                 let (_, listed) = self.store_volumes().await?;
@@ -1646,7 +1671,10 @@ impl ApiService {
             else {
                 continue;
             };
-            return Some((client, resp.into_inner().volumes));
+            let listed = crate::named_volumes(&self.0, resp.into_inner().volumes)
+                .await
+                .ok()?;
+            return Some((client, listed));
         }
         None
     }
@@ -2769,6 +2797,7 @@ impl Burrow for ApiService {
                     &source.tags,
                     &source.template,
                     "",
+                    source.policy.as_ref(),
                 ),
             )
             .await?;
@@ -2973,14 +3002,29 @@ impl Burrow for ApiService {
         let snapshot_id = burrow_common::SnapshotId::generate().to_string();
 
         let (mut client, _admitted) = self.admitted_node_for(&sandbox_id).await?;
-        let snapshot = client
+        let store = self.0.sandboxes.store();
+        store
+            .insert_snapshot(&snapshot_id, burrow_common::unix_now_ms())
+            .await
+            .map_err(|err| Status::unavailable(format!("recording the snapshot: {err}")))?;
+        let taken = client
             .create_snapshot(nodepb::NodeCreateSnapshotRequest {
                 sandbox_id: sandbox_id.clone(),
-                snapshot_id,
+                snapshot_id: snapshot_id.clone(),
                 expiration_secs: req.expiration_secs,
             })
-            .await?
-            .into_inner();
+            .await;
+        let snapshot = match taken {
+            Ok(snapshot) => snapshot.into_inner(),
+            Err(err) => {
+                // One the node may have taken anyway keeps its row, so the
+                // node's heartbeat does not destroy it.
+                if !is_outcome_unknown(&err) {
+                    let _ = store.remove_snapshot(&snapshot_id).await;
+                }
+                return Err(err);
+            }
+        };
 
         self.0.snapshots.insert(&node_id, snapshot.clone());
         // Read back so the caller is told the node it is pinned to, which is
@@ -3009,9 +3053,11 @@ impl Burrow for ApiService {
         } else {
             Some(self.resolve(&sandbox).await)
         };
-        Ok(Response::new(api::ListSnapshotsResponse {
-            snapshots: self.0.snapshots.list(sandbox.as_deref()),
-        }))
+        let listed = self.0.snapshots.list(sandbox.as_deref());
+        let snapshots = crate::named_snapshots(&self.0, listed)
+            .await
+            .map_err(|err| Status::unavailable(format!("reading snapshots: {err}")))?;
+        Ok(Response::new(api::ListSnapshotsResponse { snapshots }))
     }
 
     async fn get_snapshot(
@@ -3025,69 +3071,50 @@ impl Burrow for ApiService {
             .ok_or_else(|| Status::not_found(format!("no snapshot {id}")))
     }
 
-    /// Deletes through the node holding the snapshot or, with no holder
-    /// reachable, through any node that can reach the object store: deleting
-    /// stored data needs no particular host, unlike restoring it.
+    /// Deletes a snapshot, which always succeeds once its row is gone. The
+    /// node holding it is told at once if it answers, and otherwise destroys
+    /// its copy at its next heartbeat; a copy in the object store is deleted
+    /// through any node that can reach it, or collected once no row names it.
     async fn delete_snapshot(
         &self,
         req: Request<api::SnapshotRef>,
     ) -> Result<Response<api::DeleteSnapshotResponse>, Status> {
         let id = req.into_inner().id;
-        // A replica that has not re-read the store since the snapshot lost its
-        // holder is asked to delete what it does not yet list.
-        if self.snapshot(&id).await.is_none() {
-            self.refresh_durable(&id).await;
-        }
-        let snapshot = self
+        let removed = self
             .0
-            .snapshots
-            .get(&id)
-            .ok_or_else(|| Status::not_found(format!("no snapshot {id}")))?;
-        let holder = (!snapshot.node_id.is_empty())
-            .then(|| self.0.nodes.endpoint(&snapshot.node_id))
-            .flatten();
-        let mut client = match holder {
+            .sandboxes
+            .store()
+            .remove_snapshot(&id)
+            .await
+            .map_err(|err| Status::unavailable(format!("deleting the snapshot: {err}")))?;
+        let held = self.0.snapshots.remove(&id);
+        if !removed {
+            return Err(Status::not_found(format!("no snapshot {id}")));
+        }
+        let holder = held
+            .as_ref()
+            .filter(|snapshot| !snapshot.node_id.is_empty())
+            .and_then(|snapshot| self.0.nodes.endpoint(&snapshot.node_id));
+        let client = match holder {
             Some(endpoint) => self
                 .0
                 .channels
                 .get(&endpoint, self.0.node_token.as_deref())
                 .await
-                .map_err(|err| {
-                    Status::unavailable(format!("cannot reach node {}: {err}", snapshot.node_id))
-                })?,
-            None if snapshot.is_durable => {
-                let (client, listed) = self.store_node().await.ok_or_else(|| {
-                    Status::unavailable("no healthy node can reach the object store")
-                })?;
-                if !listed.iter().any(|stored| stored.id == id) {
-                    // Deleted already, through another replica: the record
-                    // this one kept is the only trace, and reconciling drops it.
-                    self.0.snapshots.reconcile_remote(listed);
-                    return Ok(Response::new(api::DeleteSnapshotResponse {}));
-                }
-                client
-            }
-            None => {
-                return Err(Status::failed_precondition(format!(
-                    "snapshot {id} lives on node {}, which is unreachable, and is not in the \
-                     object store",
-                    snapshot.node_id
-                )));
-            }
+                .ok(),
+            None => match held.is_some_and(|snapshot| snapshot.is_durable) {
+                true => self.store_node().await.map(|(client, _)| client),
+                false => None,
+            },
         };
-        match client
-            .delete_snapshot(api::SnapshotRef { id: id.clone() })
-            .await
+        if let Some(mut client) = client
+            && let Err(err) = client
+                .delete_snapshot(api::SnapshotRef { id: id.clone() })
+                .await
+            && err.code() != tonic::Code::NotFound
         {
-            Ok(_) => {}
-            // The node holds no copy and the store none either, so the record
-            // outlived the snapshot and dropping it is the whole delete.
-            Err(status) if status.code() == tonic::Code::NotFound => {}
-            Err(status) => return Err(status),
+            tracing::warn!(snapshot = id, %err, "deleted a snapshot no node could remove now; its node or the collector does");
         }
-        // Only after the node has actually removed it: a record dropped on a
-        // failed delete would leave disk nothing ever reclaims.
-        self.0.snapshots.remove(&id);
         Ok(Response::new(api::DeleteSnapshotResponse {}))
     }
 
@@ -3142,19 +3169,43 @@ impl Burrow for ApiService {
             }
             other => Status::failed_precondition(other.to_string()),
         })?;
+        let store = self.0.sandboxes.store();
+        if !store
+            .insert_volume(&req.name, burrow_common::unix_now_ms())
+            .await
+            .map_err(|err| Status::unavailable(format!("recording the volume: {err}")))?
+        {
+            return Err(Status::already_exists(format!(
+                "volume {} exists",
+                req.name
+            )));
+        }
+        let name = req.name.clone();
         let endpoint = self
             .0
             .nodes
             .endpoint(&node_id)
             .ok_or_else(|| Status::unavailable(format!("node {node_id} went away")))?;
-        let mut client = self
+        let made = match self
             .0
             .channels
             .get(&endpoint, self.0.node_token.as_deref())
             .await
-            .map_err(|err| Status::unavailable(format!("cannot reach node {node_id}: {err}")))?;
-
-        let volume = client.create_volume(req).await?.into_inner();
+        {
+            Ok(mut client) => client.create_volume(req).await,
+            Err(err) => Err(Status::unavailable(format!(
+                "cannot reach node {node_id}: {err}"
+            ))),
+        };
+        let volume = match made {
+            Ok(volume) => volume.into_inner(),
+            Err(err) => {
+                if !is_outcome_unknown(&err) {
+                    let _ = store.remove_volume(&name).await;
+                }
+                return Err(err);
+            }
+        };
         self.0.volumes.insert(&node_id, volume.clone());
         // Read back for the node stamp, which the node cannot know for itself.
         let volume = self.0.volumes.get(&volume.name).unwrap_or(volume);
@@ -3173,9 +3224,10 @@ impl Burrow for ApiService {
     ) -> Result<Response<api::ListVolumesResponse>, Status> {
         let node_id = req.into_inner().node_id;
         let filter = (!node_id.is_empty()).then_some(node_id.as_str());
-        Ok(Response::new(api::ListVolumesResponse {
-            volumes: self.0.volumes.list(filter),
-        }))
+        let volumes = crate::named_volumes(&self.0, self.0.volumes.list(filter))
+            .await
+            .map_err(|err| Status::unavailable(format!("reading volumes: {err}")))?;
+        Ok(Response::new(api::ListVolumesResponse { volumes }))
     }
 
     /// Reads a volume from the node holding it, so the writable claim is live
@@ -3199,32 +3251,85 @@ impl Burrow for ApiService {
         Ok(Response::new(volume))
     }
 
+    /// Deletes a volume, which always succeeds once its row is gone, unless
+    /// a sandbox has it attached. The node holding it is told at once if it
+    /// answers, and otherwise destroys it at its next heartbeat; a copy in
+    /// the object store is deleted through any node that can reach it, or
+    /// collected once no row names it.
     async fn delete_volume(
         &self,
         req: Request<api::VolumeRef>,
     ) -> Result<Response<api::DeleteVolumeResponse>, Status> {
         let name = req.into_inner().name;
-        match self.volume(&name).await {
-            Some(volume) if volume.node_id.is_empty() => {
-                let (mut client, _) = self.store_volumes().await.ok_or_else(|| {
-                    Status::unavailable(format!(
-                        "no healthy node to delete volume {name}'s stored copy through"
-                    ))
-                })?;
-                client
-                    .purge_volume(api::VolumeRef { name: name.clone() })
-                    .await?;
-            }
-            _ => {
-                let (_, mut client) = self.node_holding_volume(&name).await?;
-                client
-                    .delete_volume(api::VolumeRef { name: name.clone() })
-                    .await?;
-            }
+        let held = self.volume(&name).await;
+        if let Some(sandbox) = held
+            .as_ref()
+            .map(|volume| &volume.attached_to)
+            .filter(|sandbox| !sandbox.is_empty())
+        {
+            return Err(Status::failed_precondition(format!(
+                "volume {name} is attached to sandbox {sandbox}"
+            )));
         }
-        // Only after the node removed it: a record dropped on a failed delete
-        // would leave disk nothing ever reclaims.
+        let mounts = |record: &[u8]| {
+            crate::sandboxes::decode(record).is_some_and(|sandbox| {
+                sandbox
+                    .policy
+                    .iter()
+                    .flat_map(|policy| policy.volumes.iter())
+                    .any(|mount| mount.volume == name)
+            })
+        };
+        let removed = match self
+            .0
+            .sandboxes
+            .store()
+            .remove_volume_unless_mounted(&name, mounts)
+            .await
+            .map_err(|err| Status::unavailable(format!("deleting the volume: {err}")))?
+        {
+            burrow_store::VolumeRemoval::Removed => true,
+            burrow_store::VolumeRemoval::Missing => false,
+            burrow_store::VolumeRemoval::Mounted(sandbox) => {
+                return Err(Status::failed_precondition(format!(
+                    "volume {name} is mounted by sandbox {sandbox}"
+                )));
+            }
+        };
         self.0.volumes.remove(&name);
+        if !removed {
+            return Err(Status::not_found(format!("no volume {name}")));
+        }
+        let deleted = match held {
+            Some(volume) if volume.node_id.is_empty() => match self.store_volumes().await {
+                Some((mut client, _)) => client
+                    .purge_volume(api::VolumeRef { name: name.clone() })
+                    .await
+                    .map(drop),
+                None => Ok(()),
+            },
+            Some(volume) => match self.0.nodes.endpoint(&volume.node_id) {
+                Some(endpoint) => match self
+                    .0
+                    .channels
+                    .get(&endpoint, self.0.node_token.as_deref())
+                    .await
+                {
+                    Ok(mut client) => client
+                        .delete_volume(api::VolumeRef { name: name.clone() })
+                        .await
+                        .map(drop),
+                    Err(err) => Err(Status::unavailable(err.to_string())),
+                },
+                None => Ok(()),
+            },
+            None => Ok(()),
+        };
+        if let Err(err) = deleted
+            && err.code() != tonic::Code::NotFound
+        {
+            tracing::warn!(volume = name, %err, "deleted a volume no node could remove now; its node or the collector does");
+        }
         Ok(Response::new(api::DeleteVolumeResponse {}))
     }
 
@@ -4234,7 +4339,8 @@ fn is_outcome_unknown(err: &Status) -> bool {
 }
 
 /// The row written ahead of a create, before the node has built anything:
-/// enough to name and route it, nothing of its policy.
+/// enough to name and route it, and the volumes it mounts, which a volume
+/// delete checks against; nothing else of its policy.
 fn stub(
     id: &str,
     node_id: &str,
@@ -4242,8 +4348,14 @@ fn stub(
     tags: &HashMap<String, String>,
     template: &str,
     request_id: &str,
+    policy: Option<&common::Policy>,
 ) -> common::Sandbox {
+    let volumes = policy.map(|p| p.volumes.clone()).unwrap_or_default();
     common::Sandbox {
+        policy: (!volumes.is_empty()).then(|| common::Policy {
+            volumes,
+            ..Default::default()
+        }),
         id: id.to_string(),
         node_id: node_id.to_string(),
         name: name.to_string(),
@@ -4809,6 +4921,148 @@ mod tests {
             .await;
         let err = move_to_node2().await.unwrap_err();
         assert_ne!(err.code(), tonic::Code::FailedPrecondition, "{err}");
+    }
+
+    /// A volume a suspended or unplaced sandbox mounts is attached to no VM,
+    /// so its node does not count it held, but the sandbox needs it back. Its
+    /// delete is refused on the store's word, whatever any replica caches.
+    #[tokio::test]
+    async fn a_volume_a_stopped_sandbox_mounts_is_not_deleted() {
+        let api = replica(crate::sandboxes::SandboxRegistry::in_memory().await);
+        let store = Arc::clone(api.0.sandboxes.store());
+        store.insert_volume("data", 1).await.unwrap();
+        let mounting = common::Sandbox {
+            policy: Some(common::Policy {
+                volumes: vec![common::VolumeMount {
+                    volume: "data".into(),
+                    path: "/data".into(),
+                    ..Default::default()
+                }],
+                ..Default::default()
+            }),
+            ..sandbox_a("")
+        };
+        api.0.sandboxes.put(mounting).await;
+        let err = api
+            .delete_volume(Request::new(api::VolumeRef {
+                name: "data".into(),
+            }))
+            .await
+            .unwrap_err();
+        assert_eq!(err.code(), tonic::Code::FailedPrecondition, "{err}");
+        assert!(err.message().contains("sbx_a"), "{err}");
+        assert!(store.volume_names().await.unwrap().contains("data"));
+    }
+
+    /// A heartbeat sampled before a snapshot was taken, and applied after,
+    /// lists the node's snapshots without it. That is no word on its row,
+    /// which goes only when the node reports it swept the snapshot itself.
+    #[tokio::test]
+    async fn a_heartbeat_older_than_a_snapshot_keeps_its_row() {
+        let api = replica(crate::sandboxes::SandboxRegistry::in_memory().await);
+        let store = Arc::clone(api.0.sandboxes.store());
+        store
+            .register_node(
+                &burrow_store::NodeRow {
+                    id: "n1".into(),
+                    ..Default::default()
+                },
+                None,
+                8,
+            )
+            .await
+            .unwrap();
+        api.0
+            .nodes
+            .register(
+                common::NodeInfo {
+                    id: "n1".into(),
+                    address: "127.0.0.1:1".into(),
+                    ..Default::default()
+                },
+                String::new(),
+                String::new(),
+                None,
+            )
+            .unwrap();
+        for id in ["snap_old", "snap_new"] {
+            store.insert_snapshot(id, 1).await.unwrap();
+            api.0.snapshots.insert(
+                "n1",
+                common::Snapshot {
+                    id: id.into(),
+                    ..Default::default()
+                },
+            );
+        }
+        let service = crate::NodeRegistryService(Arc::clone(&api.0));
+        let beat = |seq, swept: Vec<String>| {
+            service.heartbeat(Request::new(nodepb::HeartbeatRequest {
+                node_id: "n1".into(),
+                report_seq: seq,
+                snapshots: vec!["snap_old".into()],
+                swept_snapshots: swept,
+                ..Default::default()
+            }))
+        };
+        use burrow_proto::node::v1::node_registry_server::NodeRegistry as _;
+        beat(1, Vec::new()).await.unwrap();
+        assert!(store.snapshot_ids().await.unwrap().contains("snap_new"));
+        beat(2, vec!["snap_old".into()]).await.unwrap();
+        assert!(!store.snapshot_ids().await.unwrap().contains("snap_old"));
+    }
+
+    /// A snapshot or volume delete succeeds once its row is gone, with its
+    /// node unreachable, which destroys its copy when next heard from. A
+    /// volume a sandbox has attached is still refused.
+    #[tokio::test]
+    async fn snapshot_and_volume_deletes_need_no_node() {
+        let api = replica(crate::sandboxes::SandboxRegistry::in_memory().await);
+        let store = Arc::clone(api.0.sandboxes.store());
+        let info = common::NodeInfo {
+            id: "node1".into(),
+            address: "127.0.0.1:1".into(),
+            ..Default::default()
+        };
+        api.0
+            .nodes
+            .register(info, String::new(), String::new(), None)
+            .unwrap();
+        store.insert_snapshot("snap_a", 1).await.unwrap();
+        api.0.snapshots.insert(
+            "node1",
+            common::Snapshot {
+                id: "snap_a".into(),
+                ..Default::default()
+            },
+        );
+        let delete = || {
+            api.delete_snapshot(Request::new(api::SnapshotRef {
+                id: "snap_a".into(),
+            }))
+        };
+        delete().await.unwrap();
+        assert!(!store.snapshot_ids().await.unwrap().contains("snap_a"));
+        assert_eq!(delete().await.unwrap_err().code(), tonic::Code::NotFound);
+
+        store.insert_volume("data", 1).await.unwrap();
+        let volume = |attached_to: &str| common::Volume {
+            name: "data".into(),
+            attached_to: attached_to.into(),
+            ..Default::default()
+        };
+        let delete = || {
+            api.delete_volume(Request::new(api::VolumeRef {
+                name: "data".into(),
+            }))
+        };
+        api.0.volumes.insert("node1", volume("sbx_a"));
+        let err = delete().await.unwrap_err();
+        assert_eq!(err.code(), tonic::Code::FailedPrecondition, "{err}");
+        assert!(store.volume_names().await.unwrap().contains("data"));
+        api.0.volumes.insert("node1", volume(""));
+        delete().await.unwrap();
+        assert!(store.volume_names().await.unwrap().is_empty());
     }
 
     /// Two starts of one unplaced sandbox through two replicas: the second

@@ -42,6 +42,10 @@ pub const DESCRIPTOR_ANNOTATION: &str = "vnd.docker.sandbox.kit.descriptor";
 /// The annotation naming the descriptor's schema version.
 pub const SCHEMA_VERSION_ANNOTATION: &str = "vnd.docker.sandbox.kit.schema-version";
 
+/// Label on a Kit volume naming the sandbox it belongs to. Such a volume is
+/// made and removed with its sandbox, on its node.
+pub const VOLUME_OWNER_LABEL: &str = "burrow.kit/sandbox";
+
 /// The namespace of the capability types the spec itself defines.
 pub const NAMESPACE: &str = "com.docker.sandbox";
 

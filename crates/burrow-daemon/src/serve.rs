@@ -1140,6 +1140,7 @@ async fn registration_loop(
                 ca_warned = Some(std::time::Instant::now());
             }
             let reports = sandboxes.state_reports().await;
+            let swept = sandboxes.snapshots().take_swept();
             let reported: Vec<String> = reports.iter().map(|r| r.sandbox_id.clone()).collect();
             match client
                 .heartbeat(nodepb::HeartbeatRequest {
@@ -1147,6 +1148,7 @@ async fn registration_loop(
                     status: Some(current_status(&sandboxes, &args.data_dir).await),
                     sandboxes: reports,
                     report_seq: report_seq.next().await,
+                    swept_snapshots: swept.clone(),
                     // The node's reaper sweeps expired snapshots and retention
                     // evicts old ones, neither of which the orchestrator asked
                     // for; this is how it learns they are gone.
@@ -1161,10 +1163,13 @@ async fn registration_loop(
                 Ok(resp) => {
                     let resp = resp.into_inner();
                     if resp.is_reregistration_required {
+                        sandboxes.snapshots().return_swept(swept);
                         tracing::warn!("orchestrator asked us to re-register");
                         break;
                     }
-                    if resp.is_report_applied {
+                    if !resp.is_report_applied {
+                        sandboxes.snapshots().return_swept(swept);
+                    } else {
                         sandboxes.renew_lease(resp.sandbox_lease_secs);
                         let unlisted: std::collections::HashSet<&str> = resp
                             .destroyed_sandboxes
@@ -1177,6 +1182,8 @@ async fn registration_loop(
                             .collect();
                         sandboxes.confirm(&confirmed);
                         sandboxes.destroy_unlisted(&resp.destroyed_sandboxes);
+                        sandboxes
+                            .destroy_unnamed(&resp.destroyed_snapshots, &resp.destroyed_volumes);
                     }
                     crate::migrate::set_fleet_upgraded(resp.is_fleet_on_casync_chunks);
                     crate::access::apply_keys(&access_keys, &resp.access_keys);
@@ -1202,6 +1209,7 @@ async fn registration_loop(
                     .await;
                 }
                 Err(err) => {
+                    sandboxes.snapshots().return_swept(swept);
                     tracing::warn!(%err, "heartbeat failed; re-registering");
                     crate::migrate::set_fleet_upgraded(false);
                     break;

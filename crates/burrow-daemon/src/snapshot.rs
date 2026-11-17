@@ -344,6 +344,9 @@ pub struct SnapshotStore {
     /// gone: listed from the store with no node holding it, and every later
     /// delete of it answered that there was no such snapshot.
     publishing: std::sync::Arc<tokio::sync::Mutex<()>>,
+    /// Snapshots this node deleted on its own, expired or evicted, not yet
+    /// reported to the orchestrator, which deletes their rows.
+    swept: std::sync::Arc<std::sync::Mutex<Vec<String>>>,
 }
 
 /// Everything a create needs from the sandbox it is snapshotting, gathered
@@ -382,6 +385,7 @@ impl SnapshotStore {
             hydrators: Default::default(),
             fetching: Default::default(),
             publishing: Default::default(),
+            swept: Default::default(),
         }
     }
 
@@ -1290,6 +1294,18 @@ impl SnapshotStore {
         }
     }
 
+    /// The snapshots this node deleted on its own since the last call, for a
+    /// heartbeat to report.
+    pub fn take_swept(&self) -> Vec<String> {
+        std::mem::take(&mut *self.swept.lock().unwrap())
+    }
+
+    /// Puts back what a heartbeat that was not applied reported, for the
+    /// next one.
+    pub fn return_swept(&self, ids: Vec<String>) {
+        self.swept.lock().unwrap().extend(ids);
+    }
+
     /// Deletes snapshots whose TTL has run out, returning their ids.
     pub async fn sweep_expired(&self) -> Vec<String> {
         let now_ms = burrow_common::unix_now_ms();
@@ -1308,6 +1324,7 @@ impl SnapshotStore {
                         sandbox = manifest.sandbox_id,
                         "snapshot expired and was swept"
                     );
+                    self.swept.lock().unwrap().push(snapshot.id.clone());
                     swept.push(snapshot.id);
                 }
                 Err(err) => {
@@ -1373,6 +1390,7 @@ impl SnapshotStore {
                         keep,
                         "evicted the oldest snapshot to stay within keep_last_snapshots"
                     );
+                    self.swept.lock().unwrap().push(snapshot.id.clone());
                     evicted.push(snapshot.id);
                 }
                 Err(err) => {
@@ -1738,6 +1756,9 @@ mod tests {
         }
 
         assert_eq!(store.sweep_expired().await, vec!["snap_ccc1".to_string()]);
+        // Reported on the next heartbeat, so the orchestrator drops its row.
+        assert_eq!(store.take_swept(), vec!["snap_ccc1".to_string()]);
+        assert!(store.take_swept().is_empty());
         assert!(store.get("snap_ccc1").await.is_err());
         assert!(store.get("snap_ccc2").await.is_ok());
         assert!(store.get("snap_ccc3").await.is_ok());
