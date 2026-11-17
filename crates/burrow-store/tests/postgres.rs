@@ -799,3 +799,85 @@ async fn reconcile_time_at_scale_on_postgres() {
             .unwrap();
     }
 }
+
+#[tokio::test]
+#[ignore]
+async fn builds_and_tags_round_trip_on_postgres() {
+    use burrow_store::{BuildRow, Finished};
+    let url = std::env::var("BURROW_TEST_DATABASE_URL").unwrap();
+    let store = Store::connect_postgres(&url).await.unwrap();
+    let run = format!("t{}", std::process::id());
+    let digest = |n: u32| format!("sha256:{run}{n}");
+    let building = |id: &str, at: i64| BuildRow {
+        id: format!("{run}_{id}"),
+        template: run.clone(),
+        created_at_ms: at,
+        ..Default::default()
+    };
+    let tags = vec!["latest".to_string()];
+
+    store.begin_build(&building("b1", 1)).await.unwrap();
+    assert_eq!(
+        store
+            .finish_build(&format!("{run}_b1"), &digest(1), "{}", &tags, 2)
+            .await
+            .unwrap(),
+        Finished::Ready
+    );
+    store.begin_build(&building("b2", 3)).await.unwrap();
+    assert!(
+        store
+            .fail_build(&format!("{run}_b2"), "boom", 4)
+            .await
+            .unwrap()
+    );
+    store.begin_build(&building("b3", 5)).await.unwrap();
+    assert_eq!(
+        store
+            .finish_build(&format!("{run}_b3"), &digest(1), "{}", &tags, 6)
+            .await
+            .unwrap(),
+        Finished::Existing
+    );
+    assert_eq!(
+        store.resolve_tag(&run, "latest").await.unwrap(),
+        Some(digest(1))
+    );
+    store
+        .put_ready_build(&BuildRow {
+            id: format!("{run}_b4"),
+            digest: digest(2),
+            template: run.clone(),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+    store
+        .assign_tag(&run, "latest", &digest(2), 7)
+        .await
+        .unwrap();
+    assert_eq!(
+        store.resolve_tag(&run, "latest").await.unwrap(),
+        Some(digest(2))
+    );
+    store.prune_tags(5, 8).await.unwrap();
+    store.drop_builds(&[digest(2)], 8).await.unwrap();
+    assert_eq!(
+        store.resolve_tag(&run, "latest").await.unwrap(),
+        Some(digest(1))
+    );
+    store
+        .replace_node_builds(&run, &[digest(1)], 9)
+        .await
+        .unwrap();
+    assert!(
+        store
+            .list_node_builds()
+            .await
+            .unwrap()
+            .contains(&(run.clone(), digest(1)))
+    );
+    store.replace_node_builds(&run, &[], 10).await.unwrap();
+    assert!(store.delete_template(&run, 11).await.unwrap());
+    assert_eq!(store.resolve_tag(&run, "latest").await.unwrap(), None);
+}

@@ -445,6 +445,10 @@ pub struct Store {
     db: Db,
 }
 
+mod builds;
+pub use builds::{BUILDING, DROPPED, FAILED, READY};
+pub use builds::{BuildRow, Finished, TagRow, TemplateRow};
+
 #[cfg(unix)]
 fn precreate(path: &Path, mode: u32) {
     use std::os::unix::fs::OpenOptionsExt as _;
