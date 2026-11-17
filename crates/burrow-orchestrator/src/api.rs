@@ -411,7 +411,7 @@ impl ApiService {
                 .as_ref()
                 .and_then(|p| p.network.as_ref())
                 .is_some_and(|n| n.is_tls_inspected);
-            let (snapshot, node_id, mut client) = self
+            let (snapshot, node_id, mut client, placed) = self
                 .node_for_snapshot(
                     &req.snapshot,
                     &placement,
@@ -419,6 +419,32 @@ impl ApiService {
                     req.policy.is_none(),
                 )
                 .await?;
+            // A durable snapshot was placed, which reserved the node; the
+            // node holding a local one is held to having room for it here.
+            let shape = snapshot.resources.clone().unwrap_or_default();
+            let pick = |want: u32, have: u32| if want == 0 { have } else { want };
+            let is_placed = placed.is_some();
+            let held = match placed {
+                Some(guard) => guard,
+                None => self
+                    .hold_growth(
+                        &node_id,
+                        self.0.nodes.mem_charge_mib(
+                            &node_id,
+                            &snapshot.hypervisor,
+                            &snapshot.template,
+                            u64::from(pick(limits.mem_mib, shape.mem_mib)),
+                        ),
+                    )
+                    .await
+                    .map_err(Status::resource_exhausted)?,
+            };
+
+            let cpu_millis = crate::registry::cpu_charge_millis(
+                pick(limits.vcpus, shape.vcpus),
+                limits.cpus,
+                limits.reserved_cpus,
+            );
             let mounts = req
                 .policy
                 .as_ref()
@@ -457,6 +483,10 @@ impl ApiService {
                 })
                 .await?
                 .into_inner();
+            held.keep();
+            if !is_placed {
+                self.0.nodes.charge_cpu(&node_id, cpu_millis);
+            }
             // The caller's alone: the registry and every later read go without.
             let remote_desktop = sandbox.remote_desktop.take();
             self.0.sandboxes.insert(sandbox.clone());
@@ -1358,7 +1388,15 @@ impl ApiService {
         want: &crate::registry::Placement,
         is_inspected: bool,
         inherits_policy: bool,
-    ) -> Result<(common::Snapshot, String, NodeClient), Status> {
+    ) -> Result<
+        (
+            common::Snapshot,
+            String,
+            NodeClient,
+            Option<PlacementGuard<'_>>,
+        ),
+        Status,
+    > {
         let mut snapshot = self
             .snapshot(id)
             .await
@@ -1372,7 +1410,7 @@ impl ApiService {
         if holder.is_none() && !snapshot.is_durable && self.refresh_durable(id).await {
             snapshot.is_durable = true;
         }
-        let node_id = match holder {
+        let (node_id, placed) = match holder {
             Some(node_id) => {
                 self.require_labels(&node_id, &want.node_labels)?;
                 let missing = self
@@ -1387,7 +1425,7 @@ impl ApiService {
                         missing.join(", ")
                     )));
                 }
-                node_id
+                (node_id, None)
             }
             None if snapshot.is_durable => {
                 let shape = snapshot.resources.clone().unwrap_or_default();
@@ -1436,15 +1474,18 @@ impl ApiService {
                     false => "",
                 };
                 let excluded = self.other_roots(&format!("snapshot {id}"), root, None)?;
-                self.place_avoiding(&want, excluded)
-                    .await
-                    .map_err(|err| match err {
-                        crate::registry::PlacementError::NoHealthyNode
-                        | crate::registry::PlacementError::NoCapacity { .. } => {
-                            Status::resource_exhausted(err.to_string())
-                        }
-                        other => Status::failed_precondition(other.to_string()),
-                    })?
+                let node_id =
+                    self.place_avoiding(&want, excluded)
+                        .await
+                        .map_err(|err| match err {
+                            crate::registry::PlacementError::NoHealthyNode
+                            | crate::registry::PlacementError::NoCapacity { .. } => {
+                                Status::resource_exhausted(err.to_string())
+                            }
+                            other => Status::failed_precondition(other.to_string()),
+                        })?;
+                let guard = self.place_guard(&node_id, &want);
+                (node_id, Some(guard))
             }
             None => {
                 return Err(Status::failed_precondition(format!(
@@ -1466,7 +1507,7 @@ impl ApiService {
             .get(&endpoint, self.0.node_token.as_deref())
             .await
             .map_err(|err| Status::unavailable(format!("cannot reach node {node_id}: {err}")))?;
-        Ok((snapshot, node_id, client))
+        Ok((snapshot, node_id, client, placed))
     }
 
     /// The node every requested volume lives on, if any were requested.
