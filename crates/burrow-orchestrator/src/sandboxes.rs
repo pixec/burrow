@@ -174,9 +174,6 @@ fn restated(mut sandbox: common::Sandbox, report: &nodepb::SandboxStateReport) -
     sandbox.checkpoint_kind = report.checkpoint_kind;
     sandbox.activation = report.activation.clone();
     sandbox.is_agent_unconfirmed = report.is_agent_unconfirmed;
-    sandbox.cpu_usage_usec = report.cpu_usage_usec;
-    sandbox.rx_bytes = report.rx_bytes;
-    sandbox.tx_bytes = report.tx_bytes;
     sandbox
 }
 
@@ -298,6 +295,11 @@ fn placed(row: &burrow_store::PlacementRow) -> Option<Placed> {
         return None;
     }
     sandbox.node_id = row.node_id.clone();
+    if let Some([cpu, rx, tx]) = row.usage {
+        sandbox.cpu_usage_usec = cpu as u64;
+        sandbox.rx_bytes = rx as u64;
+        sandbox.tx_bytes = tx as u64;
+    }
     Some(Placed {
         sandbox,
         generation: row.generation,
@@ -946,6 +948,9 @@ impl SandboxRegistry {
                     generation: report.generation as i64,
                     hash: report_hash(report),
                     in_flight: i64::from(report.is_in_flight),
+                    cpu_usage_usec: report.cpu_usage_usec as i64,
+                    rx_bytes: report.rx_bytes as i64,
+                    tx_bytes: report.tx_bytes as i64,
                 })
                 .collect(),
             pending_after_ms: now - PENDING_DEADLINE_MS,

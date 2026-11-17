@@ -451,8 +451,7 @@ fn listing(entries: &[(&str, i64)]) -> Vec<ReportedSandbox> {
         .map(|(id, generation)| ReportedSandbox {
             id: id.to_string(),
             generation: *generation,
-            hash: 0,
-            in_flight: 0,
+            ..Default::default()
         })
         .collect()
 }

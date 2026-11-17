@@ -13,7 +13,11 @@ ALTER TABLE placements ADD COLUMN missed BIGINT NOT NULL DEFAULT 0;
 -- Digest of what the node last reported about the sandbox, so a heartbeat
 -- rewrites only what changed.
 ALTER TABLE placements ADD COLUMN report_hash BIGINT NOT NULL DEFAULT 0;
+-- Usage totals, written apart from the record and its version every so often.
 ALTER TABLE placements ADD COLUMN usage_at_ms BIGINT NOT NULL DEFAULT 0;
+ALTER TABLE placements ADD COLUMN cpu_usage_usec BIGINT NOT NULL DEFAULT 0;
+ALTER TABLE placements ADD COLUMN rx_bytes BIGINT NOT NULL DEFAULT 0;
+ALTER TABLE placements ADD COLUMN tx_bytes BIGINT NOT NULL DEFAULT 0;
 -- The last heartbeat applied from the node, which numbers them.
 ALTER TABLE nodes ADD COLUMN report_seq BIGINT NOT NULL DEFAULT 0;
 -- A node's own copy of each sandbox's generation.

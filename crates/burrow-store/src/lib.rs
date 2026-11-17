@@ -198,15 +198,21 @@ pub struct PlacementRow {
     pub generation: i64,
     /// When a node was asked to act on this placement, 0 once it answered.
     pub pending_since_ms: i64,
+    /// The usage totals heartbeats last wrote, apart from the record and
+    /// without a new version, as `[cpu_usage_usec, rx_bytes, tx_bytes]`.
+    /// `None` when none has been written, or for a row not read back.
+    pub usage: Option<[i64; 3]>,
 }
 
-type PlacementRaw = (String, String, Vec<u8>, i64, i64, i64);
+type PlacementRaw = (String, String, Vec<u8>, i64, i64, i64, i64, i64, i64, i64);
 
-const PLACEMENT_COLUMNS: &str = "id, node_id, record, version, generation, pending_since_ms";
-const PLACEMENT_COLUMNS_OF_P: &str =
-    "p.id, p.node_id, p.record, p.version, p.generation, p.pending_since_ms";
+const PLACEMENT_COLUMNS: &str = "id, node_id, record, version, generation, pending_since_ms, \
+    usage_at_ms, cpu_usage_usec, rx_bytes, tx_bytes";
+const PLACEMENT_COLUMNS_OF_P: &str = "p.id, p.node_id, p.record, p.version, p.generation, \
+    p.pending_since_ms, p.usage_at_ms, p.cpu_usage_usec, p.rx_bytes, p.tx_bytes";
 const PLACEMENT_COLUMNS_OF_PLACEMENTS: &str = "placements.id, placements.node_id, \
-    placements.record, placements.version, placements.generation, placements.pending_since_ms";
+    placements.record, placements.version, placements.generation, placements.pending_since_ms, \
+    placements.usage_at_ms, placements.cpu_usage_usec, placements.rx_bytes, placements.tx_bytes";
 
 fn placement_row(r: PlacementRaw) -> PlacementRow {
     PlacementRow {
@@ -216,6 +222,7 @@ fn placement_row(r: PlacementRaw) -> PlacementRow {
         version: r.3,
         generation: r.4,
         pending_since_ms: r.5,
+        usage: (r.6 > 0).then_some([r.7, r.8, r.9]),
     }
 }
 
@@ -274,7 +281,7 @@ const RESTATE_BATCHES: [usize; 5] = [1, 8, 32, 128, 512];
 pub const LOST_AFTER_MISSES: i64 = 2;
 
 /// One sandbox in a node's complete listing.
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Default, Serialize)]
 pub struct ReportedSandbox {
     #[serde(rename = "i")]
     pub id: String,
@@ -288,6 +295,12 @@ pub struct ReportedSandbox {
     /// the row from going missing and leaves its record alone.
     #[serde(rename = "f")]
     pub in_flight: i64,
+    #[serde(rename = "c")]
+    pub cpu_usage_usec: i64,
+    #[serde(rename = "r")]
+    pub rx_bytes: i64,
+    #[serde(rename = "t")]
+    pub tx_bytes: i64,
 }
 
 /// A node's heartbeat, as [`Store::reconcile_node`] applies it.
@@ -1388,9 +1401,10 @@ impl Store {
     ///   at two consecutive misses is lost: `lose` decides it as it does for
     ///   a write-off, given the kind and detail of the sandbox's last event
     ///   from this node;
-    /// * rows whose report digest changed, or whose usage was last written
-    ///   before `usage_before_ms`, are rewritten with what `restate` makes of
-    ///   them.
+    /// * rows whose report digest changed are rewritten with what `restate`
+    ///   makes of them;
+    /// * rows whose usage was last written before `usage_before_ms` take the
+    ///   reported totals in their usage columns, leaving record and version.
     pub async fn reconcile_node(
         &self,
         report: &NodeReport,
@@ -1402,23 +1416,30 @@ impl Store {
             (
                 "CREATE TEMP TABLE IF NOT EXISTS reported
                    (id TEXT PRIMARY KEY, generation BIGINT NOT NULL, hash BIGINT NOT NULL,
-                    in_flight BIGINT NOT NULL)
+                    in_flight BIGINT NOT NULL, cpu_usage_usec BIGINT NOT NULL,
+                    rx_bytes BIGINT NOT NULL, tx_bytes BIGINT NOT NULL)
                    ON COMMIT DELETE ROWS",
                 None,
-                "INSERT INTO reported (id, generation, hash, in_flight)
-                 SELECT i, g, h, f
-                 FROM jsonb_to_recordset($1::jsonb) AS x(i TEXT, g BIGINT, h BIGINT, f BIGINT)
+                "INSERT INTO reported (id, generation, hash, in_flight, cpu_usage_usec, rx_bytes,
+                    tx_bytes)
+                 SELECT i, g, h, f, c, r, t
+                 FROM jsonb_to_recordset($1::jsonb)
+                    AS x(i TEXT, g BIGINT, h BIGINT, f BIGINT, c BIGINT, r BIGINT, t BIGINT)
                  WHERE true ON CONFLICT (id) DO NOTHING",
             )
         } else {
             (
                 "CREATE TEMP TABLE IF NOT EXISTS reported
                    (id TEXT PRIMARY KEY, generation INTEGER NOT NULL, hash INTEGER NOT NULL,
-                    in_flight INTEGER NOT NULL)",
+                    in_flight INTEGER NOT NULL, cpu_usage_usec INTEGER NOT NULL,
+                    rx_bytes INTEGER NOT NULL, tx_bytes INTEGER NOT NULL)",
                 Some("DELETE FROM reported"),
-                "INSERT INTO reported (id, generation, hash, in_flight)
+                "INSERT INTO reported (id, generation, hash, in_flight, cpu_usage_usec, rx_bytes,
+                    tx_bytes)
                  SELECT json_extract(value, '$.i'), json_extract(value, '$.g'),
-                        json_extract(value, '$.h'), json_extract(value, '$.f')
+                        json_extract(value, '$.h'), json_extract(value, '$.f'),
+                        json_extract(value, '$.c'), json_extract(value, '$.r'),
+                        json_extract(value, '$.t')
                  FROM json_each($1) WHERE true ON CONFLICT (id) DO NOTHING",
             )
         };
@@ -1548,15 +1569,26 @@ impl Store {
                     }
                 }
 
+                sqlx::query(
+                    "UPDATE placements SET cpu_usage_usec=r.cpu_usage_usec, rx_bytes=r.rx_bytes,
+                        tx_bytes=r.tx_bytes, usage_at_ms=$2
+                     FROM reported r
+                     WHERE placements.node_id=$1 AND r.id = placements.id
+                       AND r.generation = placements.generation AND r.in_flight = 0
+                       AND placements.usage_at_ms < $3",
+                )
+                .bind(&node.id)
+                .bind(node.last_heartbeat_ms)
+                .bind(report.usage_before_ms)
+                .execute(&mut *tx)
+                .await?;
                 let stale: Vec<PlacementRaw> = sqlx::query_as(&format!(
                     "SELECT {PLACEMENT_COLUMNS_OF_P} FROM placements p
                      JOIN reported r ON r.id = p.id AND r.generation = p.generation
-                     WHERE p.node_id=$1 AND r.in_flight = 0
-                       AND (p.report_hash <> r.hash OR p.usage_at_ms < $2)
+                     WHERE p.node_id=$1 AND r.in_flight = 0 AND p.report_hash <> r.hash
                      ORDER BY p.id"
                 ))
                 .bind(&node.id)
-                .bind(report.usage_before_ms)
                 .fetch_all(&mut *tx)
                 .await?;
                 let mut changed = Vec::new();
@@ -1588,22 +1620,20 @@ impl Store {
                     (rest, rest_hashes) = (&rest[taken..], &rest_hashes[taken..]);
                     let values = (0..size)
                         .map(|i| {
-                            let n = 5 * i + 3;
+                            let n = 5 * i + 2;
                             format!("(${n}, ${}, ${}, ${}, ${})", n + 1, n + 2, n + 3, n + 4)
                         })
                         .collect::<Vec<_>>()
                         .join(", ");
                     let sql = format!(
                         "UPDATE placements SET record=v.column4, report_hash=v.column5,
-                            usage_at_ms=$1, version=placements.version + 1
+                            version=placements.version + 1
                          FROM (VALUES {values}) AS v
                          WHERE placements.id = v.column1 AND placements.version = v.column2
-                           AND placements.generation = v.column3 AND placements.node_id = $2
+                           AND placements.generation = v.column3 AND placements.node_id = $1
                          RETURNING placements.id"
                     );
-                    let mut query = sqlx::query_as::<_, (String,)>(&sql)
-                        .bind(report.node.last_heartbeat_ms)
-                        .bind(&node.id);
+                    let mut query = sqlx::query_as::<_, (String,)>(&sql).bind(&node.id);
                     for (row, hash) in rows.iter().zip(hashes) {
                         query = query
                             .bind(&row.id)
@@ -3320,8 +3350,7 @@ mod tests {
                 .map(|(id, generation)| ReportedSandbox {
                     id: id.to_string(),
                     generation: *generation,
-                    hash: 0,
-                    in_flight: 0,
+                    ..Default::default()
                 })
                 .collect(),
             pending_after_ms: 100,
@@ -3614,6 +3643,37 @@ mod tests {
                 .unwrap(),
         );
         assert!(again.restated.is_empty());
+    }
+
+    /// Usage lands in its own columns, leaving record and version alone,
+    /// and only once the last write is older than the interval.
+    #[tokio::test]
+    async fn usage_is_written_apart_from_the_record() {
+        let store = Store::open_in_memory().await.unwrap();
+        reporting(&store, "n1").await;
+        store.insert_placement(&placed("a", "n1", 1)).await.unwrap();
+        let mut beat = report("n1", 1, &[("a", 1)]);
+        beat.node.last_heartbeat_ms = 1_000;
+        beat.usage_before_ms = 500;
+        beat.sandboxes[0].cpu_usage_usec = 7;
+        beat.sandboxes[0].rx_bytes = 8;
+        beat.sandboxes[0].tx_bytes = 9;
+        let out = applied(apply(&store, &beat).await);
+        assert!(out.restated.is_empty());
+        let row = store.get_placement("a").await.unwrap().unwrap();
+        assert_eq!((row.usage, row.version), (Some([7, 8, 9]), 1));
+
+        beat.seq = 2;
+        beat.sandboxes[0].cpu_usage_usec = 70;
+        applied(apply(&store, &beat).await);
+        let row = store.get_placement("a").await.unwrap().unwrap();
+        assert_eq!(row.usage, Some([7, 8, 9]));
+
+        beat.seq = 3;
+        beat.usage_before_ms = 1_500;
+        applied(apply(&store, &beat).await);
+        let row = store.get_placement("a").await.unwrap().unwrap();
+        assert_eq!((row.usage, row.version), (Some([70, 8, 9]), 1));
     }
 
     /// A batch padded up to its statement's size writes only its own rows.

@@ -5160,8 +5160,7 @@ pub(crate) mod tests {
             sandboxes: vec![burrow_store::ReportedSandbox {
                 id: "sbx_a".into(),
                 generation: 1,
-                hash: 0,
-                in_flight: 0,
+                ..Default::default()
             }],
             ..Default::default()
         };
