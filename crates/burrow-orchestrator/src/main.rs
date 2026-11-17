@@ -2,6 +2,7 @@ mod admission;
 mod api;
 mod chunkfleet;
 mod cluster;
+mod collect;
 mod events;
 mod leader;
 mod ledger;
@@ -1200,6 +1201,7 @@ async fn run(args: Args) -> anyhow::Result<()> {
     };
     tokio::spawn(reap_dead_nodes(Arc::clone(&state), expiry));
     tokio::spawn(chunkfleet::refresh_loop(Arc::clone(&state)));
+    tokio::spawn(collect::run(Arc::clone(&state)));
     let advertise = match args.advertise.clone() {
         Some(address) => Some(address),
         None => own_address().await,

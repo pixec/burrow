@@ -60,9 +60,12 @@ service NodeService {
   // Suspends a sandbox, waits for its state to reach the object store, and
   // lets go of it here, leaving the stored state for another node to adopt.
   rpc ReleaseSandbox(NodeSandboxRef) returns (burrow.common.v1.Sandbox);
-  // Deletes a durable sandbox's state from the object store, for a sandbox
-  // no node holds.
+  // Deletes a sandbox's state from the object store, for a sandbox the
+  // store no longer has a row for, whatever node the state names.
   rpc PurgeSandbox(NodeSandboxRef) returns (NodeDeleteResponse);
+  // The ids of every sandbox the object store holds state for, so the
+  // orchestrator can collect the state no row references.
+  rpc ListStoredSandboxes(NodeListStoredRequest) returns (NodeListStoredResponse);
   rpc UpdateNetworkPolicy(NodeUpdateNetworkRequest) returns (burrow.common.v1.Sandbox);
   rpc UpdateTags(NodeUpdateTagsRequest) returns (burrow.common.v1.Sandbox);
   rpc UpdateAccessPolicy(NodeUpdateAccessRequest) returns (burrow.common.v1.Sandbox);
@@ -339,6 +342,12 @@ message NodeForkRequest {
 }
 
 message NodeDeleteResponse {}
+
+message NodeListStoredRequest {}
+
+message NodeListStoredResponse {
+  repeated string sandbox_ids = 1;
+}
 
 message NodeAdoptRequest {
   // The orchestrator's record of the sandbox: its policy, name, metadata and

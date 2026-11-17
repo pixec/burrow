@@ -4548,7 +4548,7 @@ fn target_let_go(err: &Status) -> bool {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
 
     /// What a template was built for decides placement, and a template
@@ -4567,7 +4567,7 @@ mod tests {
         );
     }
 
-    pub(super) fn replica(sandboxes: crate::sandboxes::SandboxRegistry) -> ApiService {
+    pub(crate) fn replica(sandboxes: crate::sandboxes::SandboxRegistry) -> ApiService {
         ApiService(Arc::new(OrchestratorState {
             nodes: crate::registry::NodeRegistry::default(),
             chunk_fleet: crate::chunkfleet::ChunkFleet::new(None, 0),

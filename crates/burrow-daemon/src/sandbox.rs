@@ -11808,7 +11808,17 @@ impl SandboxManager {
         Ok(record)
     }
 
-    /// Deletes a stored sandbox no node holds.
+    /// The ids of every sandbox the object store holds state for.
+    pub async fn stored_ids(&self) -> Result<Vec<String>, Status> {
+        let store = self
+            .config
+            .object_store
+            .as_ref()
+            .ok_or_else(|| Status::failed_precondition("this node has no object store"))?;
+        crate::durable::stored_ids(store).await
+    }
+
+    /// Deletes a stored sandbox no row references.
     pub async fn purge(&self, id: &str) -> Result<(), Status> {
         let store = self
             .config

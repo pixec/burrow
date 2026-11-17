@@ -1059,6 +1059,15 @@ impl NodeService for NodeApi {
         Ok(Response::new(redact_secrets(sandbox)))
     }
 
+    async fn list_stored_sandboxes(
+        &self,
+        _req: Request<nodepb::NodeListStoredRequest>,
+    ) -> Result<Response<nodepb::NodeListStoredResponse>, Status> {
+        Ok(Response::new(nodepb::NodeListStoredResponse {
+            sandbox_ids: self.sandboxes.stored_ids().await?,
+        }))
+    }
+
     async fn purge_sandbox(
         &self,
         req: Request<nodepb::NodeSandboxRef>,

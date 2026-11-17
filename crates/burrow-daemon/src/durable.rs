@@ -711,6 +711,20 @@ fn lost(id: &str, current: Option<&Held>) -> Status {
     }
 }
 
+/// The ids of every sandbox with a manifest in the store.
+pub async fn stored_ids(store: &ObjectStore) -> Result<Vec<String>, Status> {
+    Ok(store
+        .list("sandboxes/")
+        .await?
+        .into_iter()
+        .filter_map(|key| {
+            key.strip_prefix("sandboxes/")
+                .and_then(|rest| rest.strip_suffix(&format!("/{MANIFEST}")))
+                .map(str::to_string)
+        })
+        .collect())
+}
+
 async fn delete_generation(store: &ObjectStore, id: &str, generation: u64) {
     let prefix = format!("sandboxes/{id}/{generation}/");
     match store.list(&prefix).await {
@@ -724,7 +738,8 @@ async fn delete_generation(store: &ObjectStore, id: &str, generation: u64) {
 }
 
 /// Removes everything stored for a sandbox, as `holder` at a placement
-/// generation or, with `None`, for a sandbox the store says no node runs.
+/// generation or, with `None`, for a sandbox the orchestrator no longer has
+/// a row for, whatever the manifest says.
 ///
 /// Conditional the way every other write is: the manifest is first marked
 /// deleting under the version it was read at, so a node that took the
@@ -743,7 +758,7 @@ pub async fn purge(
             Some((holder, placement)) => {
                 held.manifest.node_id == holder && held.manifest.placement <= placement
             }
-            None => held.manifest.state != STATE_RUNNING,
+            None => true,
         };
         if !is_ours {
             return Err(Status::aborted(format!(
@@ -1933,9 +1948,9 @@ pub(crate) mod tests {
             .await
             .unwrap();
 
-        // The node it moved off, the node it runs on at an older placement,
-        // and the orchestrator while it runs.
-        for holder in [Some(("node-a", 1)), Some(("node-b", 0)), None] {
+        // The node it moved off, and the node it runs on at an older
+        // placement.
+        for holder in [Some(("node-a", 1)), Some(("node-b", 0))] {
             let refused = purge(&store, "sbx_1", holder).await.unwrap_err();
             assert_eq!(refused.code(), tonic::Code::Aborted);
             assert!(
@@ -1950,8 +1965,8 @@ pub(crate) mod tests {
         purge(&store, "sbx_1", Some(("node-b", 1))).await.unwrap();
         assert!(read_manifest(&store, "sbx_1").await.unwrap().is_none());
 
-        // Suspended, nobody runs it, so the orchestrator's purge goes through.
-        replace_manifest(&store, None, &manifest("node-b", STATE_SUSPENDED))
+        // The orchestrator purges only what no row references, running or not.
+        replace_manifest(&store, None, &manifest("node-b", STATE_RUNNING))
             .await
             .unwrap();
         purge(&store, "sbx_1", None).await.unwrap();
