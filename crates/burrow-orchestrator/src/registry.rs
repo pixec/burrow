@@ -459,7 +459,12 @@ pub struct NodeRegistry {
     /// The fleet's sandbox address pool, which each node's index is a slice
     /// of. Followed from the store, where another replica may change it.
     pool: std::sync::RwLock<burrow_net::ipam::AddressPool>,
+    /// When each node's usage totals were last recorded by this replica.
+    usage_observed: Mutex<HashMap<String, Instant>>,
 }
+
+/// How often a node's usage totals are recorded against its open intervals.
+const USAGE_OBSERVE_PERIOD: std::time::Duration = std::time::Duration::from_secs(30);
 
 /// What placement charges a sandbox whose policy names no disk. The node
 /// gives it the template's image plus 1 GiB, and the image's size is the
@@ -649,6 +654,19 @@ impl NodeRegistry {
         Self {
             pool: std::sync::RwLock::new(pool),
             ..Default::default()
+        }
+    }
+
+    /// Whether a node's usage is due to be recorded, noting that it now is.
+    pub fn usage_due(&self, node_id: &str) -> bool {
+        let mut observed = self.usage_observed.lock().unwrap();
+        let now = Instant::now();
+        match observed.get(node_id) {
+            Some(at) if now.duration_since(*at) < USAGE_OBSERVE_PERIOD => false,
+            _ => {
+                observed.insert(node_id.to_string(), now);
+                true
+            }
         }
     }
 
@@ -1471,6 +1489,14 @@ impl NodeRegistry {
 mod tests {
     use super::*;
     use burrow_proto::common::v1::{NodeInfo, NodeStatus};
+
+    #[test]
+    fn usage_is_due_once_a_period_per_node() {
+        let registry = NodeRegistry::default();
+        assert!(registry.usage_due("n1"));
+        assert!(!registry.usage_due("n1"));
+        assert!(registry.usage_due("n2"));
+    }
 
     fn registry(nodes: &[(&str, NodeStatus)]) -> NodeRegistry {
         let registry = NodeRegistry::default();

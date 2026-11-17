@@ -486,7 +486,9 @@ impl NodeRegistry for NodeRegistryService {
                 "ignored a heartbeat no newer than one already applied"
             );
         } else {
-            if let Some(store) = &self.0.store {
+            if let Some(store) = &self.0.store
+                && self.0.nodes.usage_due(&req.node_id)
+            {
                 let totals: Vec<_> = req
                     .sandboxes
                     .iter()

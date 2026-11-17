@@ -2528,25 +2528,37 @@ impl Store {
         if totals.is_empty() {
             return Ok(());
         }
-        on_pool!(self, pool => {
-            let mut tx = pool.begin().await?;
-            for (sandbox_id, cpu, rx, tx_bytes) in totals {
-                sqlx::query(
-                    "UPDATE usage_open SET seen_at=$3, seen_cpu_usage_usec=$4,
-                       seen_rx_bytes=$5, seen_tx_bytes=$6
-                     WHERE sandbox_id=$1 AND node_id=$2 AND seen_at < $3 AND started_at <= $3",
-                )
-                .bind(sandbox_id)
-                .bind(node_id)
-                .bind(at_ms)
-                .bind(*cpu as i64)
-                .bind(*rx as i64)
-                .bind(*tx_bytes as i64)
-                .execute(&mut *tx)
-                .await?;
+        let totals: Vec<_> = totals
+            .iter()
+            .map(|(id, cpu, rx, tx)| (id, *cpu as i64, *rx as i64, *tx as i64))
+            .collect();
+        let totals = serde_json::to_string(&totals)?;
+        let source = match self.is_postgres() {
+            true => {
+                "SELECT x->>0 AS id, (x->>1)::BIGINT AS cpu, (x->>2)::BIGINT AS rx,
+                    (x->>3)::BIGINT AS tx
+                 FROM jsonb_array_elements($3::jsonb) AS x"
             }
-            tx.commit().await?;
-        });
+            false => {
+                "SELECT json_extract(value, '$[0]') AS id, json_extract(value, '$[1]') AS cpu,
+                    json_extract(value, '$[2]') AS rx, json_extract(value, '$[3]') AS tx
+                 FROM json_each($3)"
+            }
+        };
+        let sql = format!(
+            "UPDATE usage_open SET seen_at=$2, seen_cpu_usage_usec=x.cpu, seen_rx_bytes=x.rx,
+                seen_tx_bytes=x.tx
+             FROM ({source}) AS x
+             WHERE usage_open.sandbox_id = x.id AND usage_open.node_id=$1
+               AND usage_open.seen_at < $2 AND usage_open.started_at <= $2"
+        );
+        on_pool!(self, pool => sqlx::query(&sql)
+            .bind(node_id)
+            .bind(at_ms)
+            .bind(&totals)
+            .execute(pool)
+            .await
+            .map(|_| ()))?;
         Ok(())
     }
 
