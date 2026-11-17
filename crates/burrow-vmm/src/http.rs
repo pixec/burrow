@@ -17,6 +17,35 @@ use tokio::net::UnixStream;
 
 use crate::error::{Error, Result};
 
+/// How long a VMM gets to answer a request. A hung VMM fails the call
+/// rather than holding its caller, and a snapshot written, loaded or booted
+/// from gets the time a large guest's memory takes to move through disk.
+const REQUEST_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(120);
+const SLOW_REQUEST_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30 * 60);
+
+fn deadline(path: &str) -> std::time::Duration {
+    match ["snapshot", "restore", "vm.create", "vm.boot"]
+        .iter()
+        .any(|slow| path.contains(slow))
+    {
+        true => SLOW_REQUEST_TIMEOUT,
+        false => REQUEST_TIMEOUT,
+    }
+}
+
+async fn within<T>(
+    path: &str,
+    limit: std::time::Duration,
+    request: impl std::future::Future<Output = Result<T>>,
+) -> Result<T> {
+    tokio::time::timeout(limit, request).await.map_err(|_| {
+        Error::Io(std::io::Error::new(
+            std::io::ErrorKind::TimedOut,
+            format!("{path}: the vmm did not answer within {}s", limit.as_secs()),
+        ))
+    })?
+}
+
 pub(crate) struct UnixHttp {
     socket: PathBuf,
 }
@@ -33,6 +62,15 @@ impl UnixHttp {
     }
 
     async fn send(&self, method: Method, path: &str, body: Bytes) -> Result<(StatusCode, Bytes)> {
+        within(path, deadline(path), self.send_now(method, path, body)).await
+    }
+
+    async fn send_now(
+        &self,
+        method: Method,
+        path: &str,
+        body: Bytes,
+    ) -> Result<(StatusCode, Bytes)> {
         let stream = UnixStream::connect(&self.socket).await?;
         let (mut sender, conn) =
             hyper::client::conn::http1::handshake(TokioIo::new(stream)).await?;
@@ -97,6 +135,16 @@ impl UnixHttp {
     /// and its response read here by hand.
     #[cfg(target_os = "linux")]
     pub async fn put_with_fds<T: Serialize>(
+        &self,
+        path: &str,
+        body: &T,
+        fds: &[std::os::fd::RawFd],
+    ) -> Result<()> {
+        within(path, deadline(path), self.put_with_fds_now(path, body, fds)).await
+    }
+
+    #[cfg(target_os = "linux")]
+    async fn put_with_fds_now<T: Serialize>(
         &self,
         path: &str,
         body: &T,
@@ -184,5 +232,27 @@ impl UnixHttp {
     pub async fn get_json<T: DeserializeOwned>(&self, path: &str) -> Result<T> {
         let body = self.call::<()>(Method::GET, path, None).await?;
         Ok(serde_json::from_slice(&body)?)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A VMM that never answers fails the call once its deadline passes, and
+    /// a snapshot gets the long one.
+    #[tokio::test]
+    async fn a_vmm_that_never_answers_times_out() {
+        let err = within(
+            "/hotplug/memory",
+            std::time::Duration::from_millis(20),
+            std::future::pending::<Result<()>>(),
+        )
+        .await
+        .unwrap_err();
+        assert!(err.to_string().contains("did not answer"), "{err}");
+        assert_eq!(deadline("/snapshot/load"), SLOW_REQUEST_TIMEOUT);
+        assert_eq!(deadline("/api/v1/vm.restore"), SLOW_REQUEST_TIMEOUT);
+        assert_eq!(deadline("/api/v1/vm.resize"), REQUEST_TIMEOUT);
     }
 }
