@@ -268,6 +268,7 @@ class SandboxInfo:
     id: str
     name: str
     node_id: str
+    # The template as it was named at create.
     template: str
     state: str
     created_at: datetime
@@ -288,6 +289,8 @@ class SandboxInfo:
     kernel: Optional[KernelInfo] = None
     arch: str = ""
     guest_os: str = ""
+    # The build it was created from, "sha256:<hex>".
+    build_digest: str = ""
     # Public addresses of either family attached to it.
     public_ips: List["PublicIp"] = field(default_factory=list)
     # When its latest checkpoint was captured; None for none. Once its node
@@ -648,6 +651,12 @@ class TemplateInfo:
     # The kernel its sandboxes boot. None for a template booted from firmware
     # or installed whole (Windows, macOS).
     kernel: Optional[KernelInfo] = None
+    # The tag this row is for; "" for a build no tag points at yet.
+    tag: str = ""
+    # The build, "sha256:<hex>"; "" for one still building.
+    digest: str = ""
+    # "building", "ready" or "failed".
+    status: str = ""
 
 
 @dataclass
@@ -656,6 +665,9 @@ class BuiltTemplate:
 
     name: str
     size_bytes: int
+    # The build, "sha256:<hex>". Create from exactly this build with
+    # f"{name}@{digest}".
+    digest: str = ""
 
 
 @dataclass

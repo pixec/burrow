@@ -33,7 +33,7 @@ def default_build_logger(
         elif event["type"] == "done":
             write(
                 f"\n✓ built {event['template']} "
-                f"({event['size_bytes'] / 1e6:.1f} MB)\n"
+                f"({event['size_bytes'] / 1e6:.1f} MB) {event['digest']}\n"
             )
 
     return log
@@ -58,6 +58,9 @@ def to_template_info(raw: api_pb2.TemplateInfo) -> TemplateInfo:
         guest_os=raw.guest_os,
         hypervisor=raw.hypervisor,
         kernel=to_kernel(raw.kernel),
+        tag=raw.tag,
+        digest=raw.digest,
+        status=raw.status,
     )
 
 
@@ -119,7 +122,9 @@ def build_template(
         if on_build_logs:
             on_build_logs(event)
         if event["type"] == "done":
-            result = BuiltTemplate(name=event["template"], size_bytes=event["size_bytes"])
+            result = BuiltTemplate(
+                name=event["template"], size_bytes=event["size_bytes"], digest=event["digest"]
+            )
     if result is None:
         raise BurrowError("build ended without producing an image", "internal")
     return result
@@ -323,5 +328,6 @@ def _to_event(raw: api_pb2.BuildLog) -> Optional[BuildLogEvent]:
             "type": "done",
             "template": raw.done.template,
             "size_bytes": raw.done.size_bytes,
+            "digest": raw.done.digest,
         }
     return None

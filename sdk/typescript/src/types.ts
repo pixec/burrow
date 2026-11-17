@@ -549,7 +549,10 @@ export interface SandboxInfo {
   /** The name it was created with, or `""` when it was created without one. */
   name: string;
   nodeId: string;
+  /** The template as it was named at create. */
   template: string;
+  /** The build it was created from, `sha256:<hex>`. */
+  buildDigest: string;
   state: SandboxState;
   createdAt: Date;
   /** Address the sandbox holds on the networks it joined. */

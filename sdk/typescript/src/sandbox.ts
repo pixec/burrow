@@ -143,6 +143,7 @@ export function toSandboxInfo(raw: any): SandboxInfo {
     name: raw.name ?? "",
     nodeId: raw.nodeId ?? "",
     template: raw.template ?? "",
+    buildDigest: raw.buildDigest ?? "",
     state: Sandbox.stateOf(raw.state),
     createdAt: dateOf(raw.createdAtUnixMs),
     guestIp: raw.guestIp ?? "",

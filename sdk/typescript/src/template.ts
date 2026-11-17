@@ -59,12 +59,14 @@ export type BuildLogEvent =
   | { type: "step"; command: string }
   | { type: "stdout"; data: string }
   | { type: "stderr"; data: string }
-  | { type: "done"; template: string; sizeBytes: number };
+  | { type: "done"; template: string; sizeBytes: number; digest: string };
 
 /** What a finished build reports. */
 export interface BuildResult {
   template: string;
   sizeBytes: number;
+  /** The build, `sha256:<hex>`. Create from exactly this build with `${template}@${digest}`. */
+  digest: string;
 }
 
 export interface TemplateInfo {
@@ -85,6 +87,12 @@ export interface TemplateInfo {
    * or installed whole (Windows, macOS).
    */
   kernel: KernelInfo | null;
+  /** The tag this row is for; `""` for a build no tag points at yet. */
+  tag: string;
+  /** The build, `sha256:<hex>`; `""` for one still building. */
+  digest: string;
+  /** `building`, `ready` or `failed`. */
+  status: string;
 }
 
 /** Prints build logs the way a build tool would. */
@@ -101,7 +109,7 @@ export function defaultBuildLogger(
         write(log.data);
         break;
       case "done":
-        write(`\n✓ built ${log.template} (${(log.sizeBytes / 1e6).toFixed(1)} MB)\n`);
+        write(`\n✓ built ${log.template} (${(log.sizeBytes / 1e6).toFixed(1)} MB) ${log.digest}\n`);
         break;
     }
   };
@@ -265,6 +273,7 @@ export function toBuildEvent(raw: any): BuildLogEvent | undefined {
       type: "done",
       template: raw.done.template,
       sizeBytes: Number(raw.done.sizeBytes ?? 0),
+      digest: raw.done.digest ?? "",
     };
   }
   return undefined;
@@ -281,6 +290,9 @@ export function toTemplateInfo(raw: any): TemplateInfo {
     guestOs: raw.guestOs ?? "",
     hypervisor: raw.hypervisor ?? "",
     kernel: toKernelInfo(raw.kernel),
+    tag: raw.tag ?? "",
+    digest: raw.digest ?? "",
+    status: raw.status ?? "",
   };
 }
 

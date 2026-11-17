@@ -93,6 +93,7 @@ def _to_sandbox_info(raw: common_pb2.Sandbox) -> SandboxInfo:
         name=raw.name,
         node_id=raw.node_id,
         template=raw.template,
+        build_digest=raw.build_digest,
         state=_state_of(raw.state),
         created_at=at(raw.created_at_unix_ms),
         guest_ip=raw.guest_ip,

@@ -295,7 +295,7 @@ export class Templates {
       if (!event) continue;
       options.onBuildLogs?.(event);
       if (event.type === "done") {
-        result = { template: event.template, sizeBytes: event.sizeBytes };
+        result = { template: event.template, sizeBytes: event.sizeBytes, digest: event.digest };
       }
     }
     if (!result) {
