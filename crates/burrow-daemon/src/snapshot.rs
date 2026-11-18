@@ -987,7 +987,6 @@ impl SnapshotStore {
         // Only the indexes of snapshots with a manifest: one left by a delete
         // names chunks nothing restores. An upload in flight has its
         // manifest yet to come, and its chunks are younger than the grace.
-        // An index only the format before casync has is read from there.
         let indexes: std::collections::BTreeSet<String> = keys
             .iter()
             .filter(|key| {
@@ -995,10 +994,8 @@ impl SnapshotStore {
                     .and_then(|rest| rest.split_once('/'))
                     .is_some_and(|(id, _)| stored.contains(id))
             })
-            .filter_map(|key| match key.strip_suffix(".index.json") {
-                Some(stem) => Some(format!("{stem}.caibx")),
-                None => key.ends_with(".caibx").then(|| key.clone()),
-            })
+            .filter(|key| key.ends_with(".caibx"))
+            .cloned()
             .collect();
         for key in indexes {
             if let Some(index) = crate::chunks::read_index(remote, &key).await? {
@@ -1977,12 +1974,9 @@ mod tests {
         let _ = std::fs::remove_dir_all(&scratch);
     }
 
-    /// For this release a deleted snapshot takes the indexes the format
-    /// before casync left with it, and the collector counts an index only
-    /// while its snapshot has a manifest, reading an old one from where it
-    /// is.
+    /// The collector counts an index only while its snapshot has a manifest.
     #[tokio::test]
-    async fn the_collector_counts_only_stored_snapshots_old_indexes_included() {
+    async fn the_collector_counts_only_stored_snapshots() {
         let remote = crate::objstore::fake::store(true).await;
         let root = std::env::temp_dir().join(format!(
             "burrow-snapshots-refs-{}",
@@ -2001,10 +1995,9 @@ mod tests {
             .put_bytes(&remote_key(kept, MANIFEST), manifest)
             .await
             .unwrap();
-        let old = |id: &str| remote_key(id, "snapshot.mem.index.json");
+        let key = |id: &str| remote_key(id, "snapshot.mem.caibx");
         for (id, digest) in [(kept, "aa".repeat(32)), (orphan, "bb".repeat(32))] {
-            remote
-                .put_bytes(&old(id), serde_json::to_vec(&index(&digest)).unwrap())
+            crate::chunks::put_index(&remote, &key(id), &index(&digest))
                 .await
                 .unwrap();
         }
@@ -2016,8 +2009,6 @@ mod tests {
         assert!(refs.contains(&"aa".repeat(32)));
         assert!(!refs.contains(&"bb".repeat(32)));
 
-        delete_remote(&remote, kept).await.unwrap();
-        assert!(!remote.exists(&old(kept)).await.unwrap());
         let _ = std::fs::remove_dir_all(&root);
     }
 

@@ -2168,30 +2168,6 @@ impl Store {
         Ok(lost)
     }
 
-    /// Records that a node on a build from before casync chunks was heard
-    /// from at `at_ms`. Never moves back.
-    pub async fn note_pre_casync_node(&self, at_ms: i64) -> Result<()> {
-        on_pool!(self, pool => sqlx::query(
-            "UPDATE pre_casync_seen SET at_ms=$1 WHERE id=1 AND at_ms < $1",
-        )
-        .bind(at_ms)
-        .execute(pool)
-        .await
-        .map(drop))?;
-        Ok(())
-    }
-
-    /// When a node on a build from before casync chunks was last heard from,
-    /// in Unix milliseconds.
-    pub async fn pre_casync_seen_at(&self) -> Result<i64> {
-        let (at_ms,): (i64,) = on_pool!(self, pool => sqlx::query_as(
-            "SELECT at_ms FROM pre_casync_seen WHERE id=1",
-        )
-        .fetch_one(pool)
-        .await)?;
-        Ok(at_ms)
-    }
-
     /// The fleet's sandbox address pool: its v4 and v6 CIDRs and the blocks
     /// in each node's slice.
     pub async fn address_pool(&self) -> Result<(String, String, u32)> {
@@ -3828,25 +3804,6 @@ mod tests {
             let row = store.get_placement(id).await.unwrap().unwrap();
             assert_eq!((row.record, row.version), (vec![1], 2));
         }
-    }
-
-    /// The last time an old-build node was heard from starts at the upgrade,
-    /// only moves forward, and survives the nodes being forgotten.
-    #[tokio::test]
-    async fn a_pre_casync_node_is_remembered_past_the_nodes_table() {
-        let store = Store::open_in_memory().await.unwrap();
-        let seeded = store.pre_casync_seen_at().await.unwrap();
-        assert!(seeded > 0);
-        store.note_pre_casync_node(seeded + 10).await.unwrap();
-        store.note_pre_casync_node(seeded + 5).await.unwrap();
-        assert_eq!(store.pre_casync_seen_at().await.unwrap(), seeded + 10);
-        assert!(
-            store
-                .change_address_pool("100.64.0.0/16", "fd00::/48", 256)
-                .await
-                .unwrap()
-        );
-        assert_eq!(store.pre_casync_seen_at().await.unwrap(), seeded + 10);
     }
 
     /// A store starts on the pool fleets had before it was configurable, and

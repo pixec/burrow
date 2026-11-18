@@ -26,7 +26,6 @@ mod kernels;
 mod kit;
 mod macnode;
 mod metrics;
-mod migrate;
 mod nodeapi;
 mod objstore;
 mod oci;
@@ -64,9 +63,6 @@ enum Command {
     /// Development commands for the microVM layer.
     #[command(subcommand)]
     Vm(VmCommand),
-    /// Migrate the object store from the chunk format before casync, as every
-    /// node also does in the background, or with --check report what is left.
-    MigrateChunks(migrate::Args),
 }
 
 #[derive(Subcommand)]
@@ -131,6 +127,5 @@ async fn run(args: Args) -> anyhow::Result<()> {
         Command::Vm(VmCommand::Agent(args)) => devvm::agent_boot(args).await,
         Command::Vm(VmCommand::Exec { boot, cmd }) => devvm::agent_exec(boot, cmd).await,
         Command::Vm(VmCommand::Clones(args)) => devvm::clone_divergence(args).await,
-        Command::MigrateChunks(args) => migrate::command(args).await,
     }
 }

@@ -1326,10 +1326,7 @@ pub async fn collect_garbage(
         let files: std::collections::BTreeSet<&str> = objects
             .iter()
             .filter_map(|(key, _)| key.strip_prefix(&prefix))
-            .filter_map(|rest| {
-                rest.strip_suffix(".caibx")
-                    .or_else(|| rest.strip_suffix(".index.json"))
-            })
+            .filter_map(|rest| rest.strip_suffix(".caibx"))
             .filter(|file| !file.contains('/'))
             .collect();
         for file in files {

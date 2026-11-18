@@ -4550,7 +4550,6 @@ pub(crate) mod tests {
     pub(crate) fn replica(sandboxes: crate::sandboxes::SandboxRegistry) -> ApiService {
         ApiService(Arc::new(OrchestratorState {
             nodes: crate::registry::NodeRegistry::default(),
-            chunk_fleet: crate::chunkfleet::ChunkFleet::new(None, 0),
             sandboxes,
             store: None,
             leader: crate::leader::Leader::spawn(None),

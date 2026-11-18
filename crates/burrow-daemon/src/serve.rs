@@ -802,7 +802,6 @@ fn local_node_info(args: &ServeArgs) -> anyhow::Result<NodeInfo> {
         is_nested_virt_supported: false,
         // Filled in once the kernels have been read.
         kernels: Vec::new(),
-        is_casync_chunk_store: true,
     })
 }
 
@@ -1192,7 +1191,6 @@ async fn registration_loop(
                         sandboxes
                             .destroy_unnamed(&resp.destroyed_snapshots, &resp.destroyed_volumes);
                     }
-                    crate::migrate::set_fleet_upgraded(resp.is_fleet_on_casync_chunks);
                     crate::access::apply_keys(&access_keys, &resp.access_keys);
                     sandboxes.set_warm_wanted(&resp.warm_builds);
                     apply_edge_denial(
@@ -1219,7 +1217,6 @@ async fn registration_loop(
                 Err(err) => {
                     sandboxes.snapshots().return_swept(swept);
                     tracing::warn!(%err, "heartbeat failed; re-registering");
-                    crate::migrate::set_fleet_upgraded(false);
                     break;
                 }
             }
@@ -1885,7 +1882,9 @@ pub async fn run(args: ServeArgs) -> anyhow::Result<()> {
                 store = store.describe(),
                 "snapshots are copied to the object store"
             );
-            crate::migrate::start(store.clone());
+            crate::chunks::refuse_old_format(&store)
+                .await
+                .map_err(|err| anyhow::anyhow!("--object-store: {}", err.message()))?;
             Some(store)
         }
         (Some(_), None) => anyhow::bail!("--object-store needs --object-store-endpoint"),

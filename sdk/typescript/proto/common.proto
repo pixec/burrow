@@ -871,10 +871,6 @@ message NodeInfo {
   // How far CPU committed to sandboxes may exceed `total_vcpus`
   // (--cpu-overcommit). 0 is 1.0, which never overcommits.
   double cpu_overcommit = 29;
-  // Whether this node keeps object-store chunks as casync does. Until every
-  // node does, no node deletes what the format before it wrote, which an
-  // older node's collector still reads.
-  bool is_casync_chunk_store = 30;
 }
 
 // A guest kernel, named on a node and identified by content.

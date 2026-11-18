@@ -124,7 +124,7 @@ pub async fn put_index(store: &ObjectStore, key: &str, index: &ImageIndex) -> Re
 }
 
 pub async fn read_index(store: &ObjectStore, key: &str) -> Result<Option<ImageIndex>, Status> {
-    let Some(bytes) = get_current(store, key).await? else {
+    let Some(bytes) = store.get_bytes(key).await? else {
         return Ok(None);
     };
     crate::caibx::decode(&bytes)
@@ -132,38 +132,17 @@ pub async fn read_index(store: &ObjectStore, key: &str) -> Result<Option<ImageIn
         .map_err(|err| Status::data_loss(format!("index {key} is unreadable: {err}")))
 }
 
-/// An object as the current format stores it. One that is only in the
-/// format before casync is migrated on the way.
-async fn get_current(store: &ObjectStore, key: &str) -> Result<Option<Vec<u8>>, Status> {
-    if let Some(bytes) = store.get_bytes(key).await? {
-        return Ok(Some(bytes));
-    }
-    if let Some(bytes) = crate::migrate::on_demand(store, key).await? {
-        return Ok(Some(bytes));
-    }
-    refuse_legacy(store, key).await?;
-    Ok(None)
-}
+const OLD_CHUNKS: &str = "chunks/";
 
-/// Where the format before casync kept the object at `key`: chunks
-/// uncompressed at `chunks/<sha256>`, indexes as JSON at `<name>.index.json`.
-pub fn legacy_key(key: &str) -> Option<String> {
-    if let Some(rest) = key.strip_prefix(CHUNK_STORE) {
-        let digest = rest.split_once('/')?.1.strip_suffix(".cacnk")?;
-        return Some(format!("chunks/{digest}"));
-    }
-    key.strip_suffix(".caibx")
-        .map(|stem| format!("{stem}.index.json"))
-}
-
-async fn refuse_legacy(store: &ObjectStore, key: &str) -> Result<(), Status> {
-    match legacy_key(key) {
-        Some(legacy) if store.exists(&legacy).await? => Err(Status::failed_precondition(format!(
-            "{legacy} is in the object store's format from before casync chunks, which this \
-             build does not read; run the previous release of burrowd on a node of this store \
-             once to migrate it"
+/// Refuses an object store holding chunks in the uncompressed format, which
+/// this build does not read.
+pub async fn refuse_old_format(store: &ObjectStore) -> Result<(), Status> {
+    match store.has_any(OLD_CHUNKS).await? {
+        true => Err(Status::failed_precondition(format!(
+            "{} holds chunks under `{OLD_CHUNKS}` in an unsupported format; use an empty store",
+            store.describe()
         ))),
-        _ => Ok(()),
+        false => Ok(()),
     }
 }
 
@@ -559,7 +538,7 @@ async fn fetch_chunk(store: &ObjectStore, digest: &str) -> Result<Vec<u8>, Statu
     let mut attempt = 0;
     loop {
         attempt += 1;
-        match get_current(store, &chunk_key(digest)).await {
+        match store.get_bytes(&chunk_key(digest)).await {
             Ok(Some(packed)) => {
                 let bytes = decompress(digest, &packed)?;
                 if digest_of(&bytes) == digest {
@@ -1064,41 +1043,24 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// What the format before casync kept, once no build migrates it, is
-    /// refused naming the release that does.
     #[tokio::test]
-    async fn an_object_left_in_the_old_format_is_refused() {
-        let digest = "ab".repeat(32);
-        assert_eq!(
-            legacy_key(&chunk_key(&digest)).unwrap(),
-            format!("chunks/{digest}")
-        );
-        assert_eq!(
-            legacy_key("volumes/data/7.caibx").unwrap(),
-            "volumes/data/7.index.json"
-        );
-        assert_eq!(legacy_key("sandboxes/sbx_1/manifest.json"), None);
-
+    async fn a_store_with_uncompressed_chunks_is_refused() {
         let store = crate::objstore::fake::store(true).await;
-        refuse_legacy(&store, "volumes/data/7.caibx").await.unwrap();
         store
-            .put_bytes("volumes/data/7.index.json", b"{}".to_vec())
+            .put_bytes(&chunk_key(&"ab".repeat(32)), b"a".to_vec())
             .await
             .unwrap();
-        let refused = refuse_legacy(&store, "volumes/data/7.caibx")
+        refuse_old_format(&store).await.unwrap();
+        store
+            .put_bytes(&format!("chunks/{}", "ab".repeat(32)), b"a".to_vec())
             .await
-            .unwrap_err();
+            .unwrap();
+        let refused = refuse_old_format(&store).await.unwrap_err();
         assert_eq!(refused.code(), tonic::Code::FailedPrecondition);
-        assert!(
-            refused.message().contains("previous release"),
-            "{}",
-            refused.message()
-        );
     }
 
     /// An index naming the zero chunk has it in the store, even when the
-    /// upload was told the store already had it: a build before casync
-    /// chunks never put one.
+    /// upload was told the store already had it.
     #[tokio::test]
     async fn the_zero_chunk_is_put_whatever_is_known() {
         let store = crate::objstore::fake::store(true).await;

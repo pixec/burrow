@@ -432,6 +432,19 @@ impl ObjectStore {
             .map_err(|err| unavailable("delete", key, err))
     }
 
+    /// Whether any object is under `prefix`.
+    pub async fn has_any(&self, prefix: &str) -> Result<bool, Status> {
+        self.client
+            .list_objects_v2()
+            .bucket(&self.bucket)
+            .prefix(self.key(prefix))
+            .max_keys(1)
+            .send()
+            .await
+            .map(|page| !page.contents().is_empty())
+            .map_err(|err| unavailable("list", prefix, err))
+    }
+
     /// Keys under `prefix`, relative to the store's own prefix.
     pub async fn list(&self, prefix: &str) -> Result<Vec<String>, Status> {
         let mut keys = Vec::new();
