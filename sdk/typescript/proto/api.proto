@@ -802,6 +802,9 @@ enum ResourceChange {
   // Applied to the running guest in part: `value` is as far as it got, and
   // `reason` says why it stopped there.
   RESOURCE_CHANGE_PARTIAL = 6;
+  // Recorded for a running guest that takes it only at its next boot, in the
+  // sandbox's `pending_resources`; `value` is what it keeps until then.
+  RESOURCE_CHANGE_PENDING = 7;
 }
 
 // What became of one field of an UpdateResourcesRequest.

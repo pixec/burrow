@@ -56,6 +56,12 @@ pub const MEMORY_BLOCK_MIB: u32 = 2;
 /// What a hotplug region is sized in: Firecracker's slot, and Cloud
 /// Hypervisor's alignment for a virtio-mem region.
 pub const MEMORY_REGION_ALIGN_MIB: u32 = 128;
+/// What an ACPI memory hotplug adds at least and in multiples of: Cloud
+/// Hypervisor's DIMM alignment.
+pub const ACPI_MEMORY_BLOCK_MIB: u32 = 128;
+/// How many ACPI memory hotplugs a running guest can take, Cloud
+/// Hypervisor's DIMM slots.
+pub const ACPI_MEMORY_SLOTS: usize = 8;
 
 /// Where a VM start spent its time, phase by phase, in the order they ran.
 #[derive(Debug, Clone, Default)]
@@ -209,6 +215,7 @@ impl HypervisorExt for Hypervisor {
                 is_live_disk_growth_supported: true,
                 is_vcpu_hotplug_supported: false,
                 is_memory_hotplug_supported: true,
+                is_acpi_memory_hotplug_supported: false,
                 is_nested_virt_supported: false,
             },
             // Cloud Hypervisor copies guest memory in at restore, and its
@@ -234,6 +241,7 @@ impl HypervisorExt for Hypervisor {
                 // refuses one created after with EBUSY.
                 is_vcpu_hotplug_supported: cfg!(target_arch = "x86_64"),
                 is_memory_hotplug_supported: true,
+                is_acpi_memory_hotplug_supported: cfg!(target_arch = "x86_64"),
                 is_nested_virt_supported: cfg!(target_arch = "x86_64"),
             },
             // The framework saves a machine as one opaque file, reads it back
@@ -253,6 +261,7 @@ impl HypervisorExt for Hypervisor {
                 // A running machine's memory can only be ballooned below what
                 // it was configured with, never raised.
                 is_memory_hotplug_supported: false,
+                is_acpi_memory_hotplug_supported: false,
                 is_nested_virt_supported: false,
             },
         }
@@ -315,6 +324,12 @@ pub struct Capabilities {
     /// unplugged from it while it runs ([`Vm::resize_memory`]). The guest
     /// kernel needs `CONFIG_VIRTIO_MEM`.
     pub is_memory_hotplug_supported: bool,
+    /// A Windows guest, which has no virtio-mem driver, can be booted with an
+    /// ACPI hotplug region of [`VmSpec::mem_hotplug_mib`] and have memory
+    /// added to it in [`ACPI_MEMORY_BLOCK_MIB`] steps while it runs, at most
+    /// [`ACPI_MEMORY_SLOTS`] times per boot. Nothing added is taken away
+    /// until the guest boots again.
+    pub is_acpi_memory_hotplug_supported: bool,
     /// A guest can be shown the host's virtualization extensions and run
     /// KVM itself ([`VmSpec::is_nested_virt_enabled`]). Firecracker masks
     /// them out of every guest's CPUID.
@@ -913,7 +928,7 @@ impl Vm {
         }
     }
 
-    /// MiB of the virtio-mem region the guest has plugged.
+    /// MiB of the hotplug region the guest has plugged.
     pub async fn plugged_memory(&self) -> Result<u32> {
         match self {
             Self::Firecracker(vm) => Ok(vm.plugged_memory().await?),

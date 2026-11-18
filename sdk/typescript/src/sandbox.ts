@@ -133,6 +133,7 @@ const RESOURCE_CHANGES: readonly ResourceChange[] = [
   "partial",
   "next_boot",
   "offline",
+  "pending",
   "refused",
 ];
 

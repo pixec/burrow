@@ -606,11 +606,28 @@ pub(crate) fn max_mem_mib(mem_mib: u32, requested: u32) -> u32 {
     }
 }
 
-/// Whether a guest's memory can change while it runs. Windows has no
-/// virtio-mem driver burrow installs.
+/// Whether a guest's memory can grow while it runs: through virtio-mem for
+/// Linux, and through ACPI hotplug for Windows, which has no virtio-mem
+/// driver and only ever takes memory.
 fn can_plug_memory(hypervisor: Hypervisor, guest_os: burrow_vmm::GuestOs) -> bool {
-    hypervisor.capabilities().is_memory_hotplug_supported && guest_os == burrow_vmm::GuestOs::Linux
+    let capabilities = hypervisor.capabilities();
+    match guest_os {
+        burrow_vmm::GuestOs::Linux => capabilities.is_memory_hotplug_supported,
+        burrow_vmm::GuestOs::Windows => capabilities.is_acpi_memory_hotplug_supported,
+        burrow_vmm::GuestOs::MacOs => false,
+    }
 }
+
+/// What a running guest's memory moves in above what it booted with.
+fn memory_step_mib(guest_os: burrow_vmm::GuestOs) -> u32 {
+    match guest_os {
+        burrow_vmm::GuestOs::Windows => burrow_vmm::ACPI_MEMORY_BLOCK_MIB,
+        _ => burrow_vmm::MEMORY_BLOCK_MIB,
+    }
+}
+
+/// Why a Windows guest keeps its vCPUs or memory until it boots again.
+const WINDOWS_KEEPS: &str = "a Windows guest gives up neither vCPUs nor memory";
 
 /// The virtio-mem region a VM booting with `boot_mib` gets to grow to
 /// `max_mib`: none where its memory cannot change while it runs, and
@@ -627,6 +644,20 @@ pub(crate) fn hotplug_region(
     max_mib
         .saturating_sub(boot_mib)
         .next_multiple_of(burrow_vmm::MEMORY_REGION_ALIGN_MIB)
+}
+
+/// Gives a machine about to boot the smaller shape its guest could not take
+/// while it ran.
+fn take_pending(resources: &mut common::ResourcePolicy, pending: Option<common::PendingResources>) {
+    let Some(pending) = pending else {
+        return;
+    };
+    if pending.vcpus > 0 {
+        resources.vcpus = pending.vcpus;
+    }
+    if pending.mem_mib > 0 {
+        resources.mem_mib = pending.mem_mib;
+    }
 }
 
 /// Fixes the memory of a VM about to boot, or to restore a warm snapshot
@@ -741,12 +772,31 @@ fn plan_reshape(
     if reshape.is_empty() {
         return Ok(reshape);
     }
-    if from.guest_os != burrow_vmm::GuestOs::Linux {
-        return Err(Status::failed_precondition(format!(
-            "{what} of a {} guest keeps its source's {} vcpu / {} MiB / {} MiB disk; leave \
-             vcpus, mem_mib and disk_mib unset",
-            from.guest_os, from.vcpus, from.mem_mib, from.disk_mib
-        )));
+    match from.guest_os {
+        burrow_vmm::GuestOs::Linux => {}
+        burrow_vmm::GuestOs::Windows => {
+            let shrinks = [
+                ("vcpus", reshape.vcpus, from.vcpus),
+                ("mem_mib", reshape.mem_mib, from.mem_mib),
+            ];
+            if let Some((field, Some(want), current)) = shrinks
+                .into_iter()
+                .find(|(_, want, current)| want.is_some_and(|want| want < *current))
+            {
+                return Err(Status::failed_precondition(format!(
+                    "{what} restores a Windows guest at {field} {current}, and {WINDOWS_KEEPS} \
+                     while it runs; ask for at least {current} instead of {want}, or shut it \
+                     down and boot it smaller"
+                )));
+            }
+        }
+        burrow_vmm::GuestOs::MacOs => {
+            return Err(Status::failed_precondition(format!(
+                "{what} of a {} guest keeps its source's {} vcpu / {} MiB / {} MiB disk; leave \
+                 vcpus, mem_mib and disk_mib unset",
+                from.guest_os, from.vcpus, from.mem_mib, from.disk_mib
+            )));
+        }
     }
     let capabilities = from.hypervisor.capabilities();
     if let Some(mib) = reshape.disk_mib {
@@ -812,12 +862,12 @@ fn plan_reshape(
                 from.max_mem_mib
             )));
         }
-        if !(mib - from.boot_mem_mib).is_multiple_of(burrow_vmm::MEMORY_BLOCK_MIB) {
+        let step = memory_step_mib(from.guest_os);
+        if !(mib - from.boot_mem_mib).is_multiple_of(step) {
             return Err(Status::invalid_argument(format!(
-                "a running guest's memory moves in steps of {} MiB above the {} MiB it booted \
-                 with",
-                burrow_vmm::MEMORY_BLOCK_MIB,
-                from.boot_mem_mib
+                "a running {} guest's memory moves in steps of {step} MiB above the {} MiB it \
+                 booted with",
+                from.guest_os, from.boot_mem_mib
             )));
         }
     }
@@ -6573,7 +6623,8 @@ impl SandboxManager {
     /// Changes a sandbox's vCPUs and memory: live where the hypervisor can
     /// hotplug them, on a shut-down sandbox for its next boot, and refused on
     /// a suspended one, whose restore needs the machine its snapshot was
-    /// taken of.
+    /// taken of. A running Windows guest only grows; a smaller shape is
+    /// recorded as pending and taken at its next boot.
     async fn reshape(
         &self,
         sandbox: &Arc<RunningSandbox>,
@@ -6586,17 +6637,24 @@ impl SandboxManager {
         let (current_vcpus, current_mem) = (sandbox.vcpus(), sandbox.mem_mib());
         let guest_os =
             burrow_vmm::GuestOs::from_record(&sandbox.record().guest_os).unwrap_or_default();
+        let (asked_vcpus, asked_mem) = (vcpus, mem_mib);
         let slot = sandbox.vm.lock().await;
         let is_stopped = slot.is_none()
             && sandbox.state.load(std::sync::atomic::Ordering::Relaxed)
                 == common::SandboxState::Stopped as i32;
-        let blocked = if guest_os == burrow_vmm::GuestOs::Windows {
-            Some(
-                "a Windows guest's machine is not reshaped: its agent cannot bring vCPUs or \
-                 memory online"
-                    .to_string(),
-            )
-        } else if slot.is_none() && !is_stopped {
+        let is_kept = |want: u32, current: u32| {
+            guest_os == burrow_vmm::GuestOs::Windows && slot.is_some() && want < current
+        };
+        let pending = |what: &str, previous: u32, want: u32| ResourceOutcome {
+            change: ResourceChange::Pending as i32,
+            previous,
+            value: previous,
+            reason: format!(
+                "{WINDOWS_KEEPS} while it runs, so sandbox {id} boots with {want} {what} next \
+                 time (`burrow shutdown {id}` and `burrow boot {id}`)"
+            ),
+        };
+        let blocked = if slot.is_none() && !is_stopped {
             Some(format!(
                 "sandbox {id} is suspended, and its restore needs the machine its snapshot was \
                  taken of; resize it with boot to have it shut down cleanly, resized and booted"
@@ -6624,6 +6682,9 @@ impl SandboxManager {
                 ),
                 current_vcpus,
             )),
+            Some(want) if is_kept(want, current_vcpus) => {
+                Some(pending("vCPUs", current_vcpus, want))
+            }
             Some(want) => Some(
                 match self
                     .admit_vcpus(sandbox, want, cap_millis, reserve_millis)
@@ -6674,6 +6735,7 @@ impl SandboxManager {
                 Some(outcome(ResourceChange::Unchanged, current_mem, want))
             }
             Some(_) if let Some(reason) = &blocked => Some(refuse(reason, current_mem)),
+            Some(want) if is_kept(want, current_mem) => Some(pending("MiB", current_mem, want)),
             Some(want) => Some(match slot.as_ref() {
                 None => outcome(ResourceChange::NextBoot, current_mem, want),
                 Some(vm) => self.replug(sandbox, vm, want).await?,
@@ -6689,6 +6751,31 @@ impl SandboxManager {
             })
         };
         let (new_vcpus, new_mem) = (applied(&vcpus), applied(&mem_mib));
+        // A field asked for again settles what was pending for it: pending
+        // once more, or no longer.
+        let settled = |asked: Option<u32>, outcome: &Option<ResourceOutcome>, was: u32| match (
+            asked, outcome,
+        ) {
+            (Some(want), Some(o)) if o.change == ResourceChange::Pending as i32 => want,
+            (Some(_), Some(o)) if o.change == ResourceChange::Refused as i32 => was,
+            (Some(_), _) => 0,
+            (None, _) => was,
+        };
+        let was = sandbox
+            .base_record
+            .lock()
+            .unwrap()
+            .pending_resources
+            .unwrap_or_default();
+        let next = common::PendingResources {
+            vcpus: settled(asked_vcpus, &vcpus, was.vcpus),
+            mem_mib: settled(asked_mem, &mem_mib, was.mem_mib),
+        };
+        let is_pending_moved = next != was;
+        if is_pending_moved {
+            sandbox.base_record.lock().unwrap().pending_resources =
+                (next != common::PendingResources::default()).then_some(next);
+        }
         if new_vcpus.is_some() || new_mem.is_some() {
             {
                 let mut spec = sandbox.spec.lock().unwrap();
@@ -6725,6 +6812,9 @@ impl SandboxManager {
                 mem_mib = new_mem,
                 "reshaped a sandbox"
             );
+        } else if is_pending_moved {
+            drop(slot);
+            self.persist(sandbox).await;
         }
         Ok((vcpus, mem_mib))
     }
@@ -6750,11 +6840,8 @@ impl SandboxManager {
             value: current,
             reason,
         };
-        if !sandbox
-            .hypervisor
-            .capabilities()
-            .is_memory_hotplug_supported
-        {
+        let guest_os = sandbox.guest_os();
+        if !can_plug_memory(sandbox.hypervisor, guest_os) {
             return Ok(refuse(format!(
                 "{} cannot change a running guest's memory; shut {id} down, update it, and \
                  boot it",
@@ -6780,15 +6867,16 @@ impl SandboxManager {
             )));
         }
         if want > current
+            && guest_os == burrow_vmm::GuestOs::Linux
             && let Some(why) = no_virtio_mem(&sandbox.workdir).await
         {
             return Ok(refuse(why));
         }
-        if !(want - boot).is_multiple_of(burrow_vmm::MEMORY_BLOCK_MIB) {
+        let step = memory_step_mib(guest_os);
+        if !(want - boot).is_multiple_of(step) {
             return Ok(refuse(format!(
-                "a running guest's memory moves in steps of {} MiB above the {boot} MiB it \
-                 booted with",
-                burrow_vmm::MEMORY_BLOCK_MIB
+                "a running {guest_os} guest's memory moves in steps of {step} MiB above the \
+                 {boot} MiB it booted with"
             )));
         }
         let cap = |mib: u32| self.config.memory_ceiling_mib(sandbox.hypervisor, mib);
@@ -10819,6 +10907,8 @@ impl SandboxManager {
             }
         }
         let mut resources = policy.resources.clone().unwrap_or_default();
+        let pending = sandbox.base_record.lock().unwrap().pending_resources.take();
+        take_pending(&mut resources, pending);
         if let Err(err) = pin_boot_memory(&mut resources, sandbox.hypervisor, guest_os) {
             self.volumes.release_all(id);
             return Err(err);
@@ -13528,15 +13618,83 @@ pub(crate) mod tests {
             ..restored(Hypervisor::CloudHypervisor)
         };
         assert_eq!(refused(&capped, wanted(2, 0, 0)), precondition);
-        for guest_os in [burrow_vmm::GuestOs::Windows, burrow_vmm::GuestOs::MacOs] {
-            let other = RestoredShape { guest_os, ..fc };
-            assert_eq!(refused(&other, wanted(0, 1024, 0)), precondition);
-            assert_eq!(refused(&other, wanted(0, 0, 4096)), precondition);
-            assert_eq!(
-                plan_reshape("a fork", &other, &wanted(1, 512, 2048)).unwrap(),
-                Reshape::default()
-            );
+        let mac = RestoredShape {
+            guest_os: burrow_vmm::GuestOs::MacOs,
+            ..fc
+        };
+        assert_eq!(refused(&mac, wanted(0, 1024, 0)), precondition);
+        assert_eq!(refused(&mac, wanted(0, 0, 4096)), precondition);
+        assert_eq!(
+            plan_reshape("a fork", &mac, &wanted(1, 512, 2048)).unwrap(),
+            Reshape::default()
+        );
+    }
+
+    /// A restored Windows guest grows its vCPUs, its memory in ACPI steps
+    /// and its disk, and gives up none of them while it runs.
+    #[test]
+    fn a_windows_restore_only_grows() {
+        let windows = RestoredShape {
+            guest_os: burrow_vmm::GuestOs::Windows,
+            vcpus: 2,
+            mem_mib: 4096,
+            boot_mem_mib: 4096,
+            max_mem_mib: 16384,
+            disk_mib: 24576,
+            ..restored(Hypervisor::CloudHypervisor)
+        };
+        let refused = |want: common::ResourcePolicy| {
+            plan_reshape("a fork", &windows, &want).unwrap_err().code()
+        };
+        let precondition = tonic::Code::FailedPrecondition;
+        assert_eq!(refused(wanted(0, 0, 16384)), precondition);
+        assert_eq!(refused(wanted(0, 2048, 0)), precondition);
+        let capabilities = Hypervisor::CloudHypervisor.capabilities();
+        if !capabilities.is_acpi_memory_hotplug_supported {
+            assert_eq!(refused(wanted(0, 6144, 32768)), precondition);
+            return;
         }
+        assert_eq!(
+            refused(wanted(0, 4096 + 64, 0)),
+            tonic::Code::InvalidArgument
+        );
+        assert_eq!(refused(wanted(1, 0, 0)), precondition);
+        assert_eq!(
+            plan_reshape("a fork", &windows, &wanted(4, 6144, 32768)).unwrap(),
+            Reshape {
+                vcpus: Some(4),
+                mem_mib: Some(6144),
+                disk_mib: Some(32768),
+            }
+        );
+    }
+
+    /// A smaller shape a running guest could not take is what it boots with.
+    #[test]
+    fn a_boot_takes_the_shape_left_pending() {
+        let mut resources = common::ResourcePolicy {
+            vcpus: 4,
+            mem_mib: 8192,
+            ..Default::default()
+        };
+        take_pending(&mut resources, None);
+        assert_eq!((resources.vcpus, resources.mem_mib), (4, 8192));
+        take_pending(
+            &mut resources,
+            Some(common::PendingResources {
+                vcpus: 2,
+                mem_mib: 0,
+            }),
+        );
+        assert_eq!((resources.vcpus, resources.mem_mib), (2, 8192));
+        take_pending(
+            &mut resources,
+            Some(common::PendingResources {
+                vcpus: 0,
+                mem_mib: 4096,
+            }),
+        );
+        assert_eq!((resources.vcpus, resources.mem_mib), (2, 4096));
     }
 
     /// A sandbox grows to 16 times its memory by default, within the node's
@@ -13558,7 +13716,11 @@ pub(crate) mod tests {
         assert_eq!(hotplug_region(fc, GuestOs::Linux, 1024, 0), 0);
         let ch = Hypervisor::CloudHypervisor;
         assert_eq!(hotplug_region(ch, GuestOs::Linux, 1024, 8192), 7168);
-        assert_eq!(hotplug_region(ch, GuestOs::Windows, 4096, 8192), 0);
+        let is_acpi = ch.capabilities().is_acpi_memory_hotplug_supported;
+        assert_eq!(
+            hotplug_region(ch, GuestOs::Windows, 4096, 8192),
+            if is_acpi { 4096 } else { 0 }
+        );
         assert_eq!(
             hotplug_region(Hypervisor::Vz, GuestOs::MacOs, 4096, 8192),
             0
@@ -13596,7 +13758,14 @@ pub(crate) mod tests {
 
         let mut windows = common::ResourcePolicy::default();
         pin_boot_memory(&mut windows, Hypervisor::CloudHypervisor, GuestOs::Windows).unwrap();
-        assert_eq!((windows.mem_mib, windows.max_mem_mib), (512, 512));
+        let windows_max = match Hypervisor::CloudHypervisor
+            .capabilities()
+            .is_acpi_memory_hotplug_supported
+        {
+            true => max_mem_mib(512, 0),
+            false => 512,
+        };
+        assert_eq!((windows.mem_mib, windows.max_mem_mib), (512, windows_max));
         let mut grown = common::ResourcePolicy {
             mem_mib: 4096,
             max_mem_mib: 8192,

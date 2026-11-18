@@ -188,37 +188,47 @@ pub(crate) fn vm_config(
     Ok(vm)
 }
 
-/// Points a snapshot's recorded config at the sandbox restoring it.
-///
-/// The config is the snapshotted VM's, whose NIC was another sandbox's tap.
-/// Everything else in it is relative and already right. The machine's shape
-/// cannot change across a restore, so a spec asking for another one is
-/// refused here, with both shapes named, rather than deep inside the VMM.
-/// Boot memory, and the virtio-mem region above it when there is one.
+/// Boot memory, and the hotplug region above it when there is one: a
+/// virtio-mem device for Linux, and ACPI DIMM slots for Windows, which has no
+/// virtio-mem driver.
 fn memory(spec: &VmSpec) -> Value {
     let mut memory = json!({ "size": u64::from(spec.mem_mib) * MIB });
     if spec.mem_hotplug_mib > 0 {
-        memory["hotplug_method"] = json!("VirtioMem");
+        memory["hotplug_method"] = json!(match spec.guest_os {
+            GuestOs::Windows => "Acpi",
+            _ => "VirtioMem",
+        });
         memory["hotplug_size"] = json!(u64::from(spec.mem_hotplug_mib) * MIB);
     }
     memory
 }
 
+/// Points a snapshot's recorded config at the sandbox restoring it.
+///
+/// The config is the snapshotted VM's, whose NIC was another sandbox's tap.
+/// Everything else in it is relative and already right. The machine's shape
+/// cannot change across a restore, so a spec asking for another one is
+/// refused here, with both shapes named, rather than deep inside the VMM. An ACPI hotplug counts
+/// what it added in the recorded memory size, which virtio-mem does not.
 pub(crate) fn retarget(snapshot: &mut Value, spec: &VmSpec) -> Result<()> {
     let vcpus = snapshot["cpus"]["boot_vcpus"].as_u64().unwrap_or(0);
     let memory = snapshot["memory"]["size"].as_u64().unwrap_or(0) / MIB;
     let region = snapshot["memory"]["hotplug_size"].as_u64().unwrap_or(0) / MIB;
+    let expected = match snapshot["memory"]["hotplug_method"].as_str() {
+        Some("Acpi") => spec.mem_mib + spec.mem_plugged_mib,
+        _ => spec.mem_mib,
+    };
     if (vcpus, memory, region)
         != (
             u64::from(spec.vcpus),
-            u64::from(spec.mem_mib),
+            u64::from(expected),
             u64::from(spec.mem_hotplug_mib),
         )
     {
         return Err(Error::Snapshot(format!(
             "the snapshot is of {vcpus} vcpu / {memory} MiB with {region} MiB to plug and this \
-             VM is {} vcpu / {} MiB with {} MiB to plug",
-            spec.vcpus, spec.mem_mib, spec.mem_hotplug_mib
+             VM is {} vcpu / {expected} MiB with {} MiB to plug",
+            spec.vcpus, spec.mem_hotplug_mib
         )));
     }
     for device in ["serial", "console"] {
@@ -527,6 +537,24 @@ mod tests {
             retarget(&mut snapshot, &spec()),
             Err(Error::Snapshot(_))
         ));
+    }
+
+    /// A Windows guest's hotplug region is ACPI DIMM slots, whose additions
+    /// a snapshot records in its memory size.
+    #[test]
+    fn windows_memory_plugs_over_acpi() {
+        let mut windows = spec();
+        windows.guest_os = GuestOs::Windows;
+        windows.vcpus = 2;
+        windows.mem_mib = 4096;
+        windows.mem_hotplug_mib = 4096;
+        let mut snapshot = vm_config(&windows, &config(), "x86_64").unwrap();
+        assert_eq!(snapshot["memory"]["hotplug_method"], "Acpi");
+        assert_eq!(snapshot["memory"]["hotplug_size"], 4096 * MIB);
+        snapshot["memory"]["size"] = json!(6144 * MIB);
+        assert!(retarget(&mut snapshot.clone(), &windows).is_err());
+        windows.mem_plugged_mib = 2048;
+        retarget(&mut snapshot, &windows).unwrap();
     }
 
     /// The TPM socket is named by its absolute path, which a jail binds in.

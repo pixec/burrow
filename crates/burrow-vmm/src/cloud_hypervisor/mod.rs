@@ -125,6 +125,9 @@ pub struct ChVm {
     console: Option<crate::console::Capture>,
     /// The guest's TPM emulator, stopped with the VMM.
     tpm: Option<crate::TpmSpec>,
+    /// The memory the guest booted with, in bytes, which the hotplug region
+    /// sits above.
+    boot_mem: u64,
 }
 
 impl Drop for ChVm {
@@ -327,6 +330,7 @@ impl ChVm {
             console_in: None,
             console,
             tpm: spec.tpm.clone(),
+            boot_mem: u64::from(spec.mem_mib) * 1024 * 1024,
         };
         if let Err(err) = wait_for_socket(&mut vm.child, &socket, &spec.workdir).await {
             vm.stop().await;
@@ -569,25 +573,24 @@ impl ChVm {
     }
 
     /// Sets the guest's memory to its boot memory plus `plugged_mib`, which
-    /// its virtio-mem driver then works towards.
+    /// its virtio-mem driver then works towards; an ACPI hotplug adds it at
+    /// once.
     pub async fn request_memory(&self, plugged_mib: u32) -> Result<()> {
-        let info: Value = self.api.get_json("/api/v1/vm.info").await?;
-        let boot = info["config"]["memory"]["size"].as_u64().unwrap_or(0);
         self.api
             .put(
                 "/api/v1/vm.resize",
-                &json!({ "desired_ram": boot + u64::from(plugged_mib) * 1024 * 1024 }),
+                &json!({ "desired_ram": self.boot_mem + u64::from(plugged_mib) * 1024 * 1024 }),
             )
             .await
     }
 
     /// `memory_actual_size` counts what the virtio-mem device has plugged,
-    /// not what it was asked for.
+    /// not what it was asked for. An ACPI hotplug moves the recorded memory
+    /// size itself, which it counts.
     pub async fn plugged_memory(&self) -> Result<u32> {
         let info: Value = self.api.get_json("/api/v1/vm.info").await?;
-        let boot = info["config"]["memory"]["size"].as_u64().unwrap_or(0);
-        let actual = info["memory_actual_size"].as_u64().unwrap_or(boot);
-        Ok((actual.saturating_sub(boot) / (1024 * 1024)) as u32)
+        let actual = info["memory_actual_size"].as_u64().unwrap_or(self.boot_mem);
+        Ok((actual.saturating_sub(self.boot_mem) / (1024 * 1024)) as u32)
     }
 
     /// Hotplugs or unplugs vCPUs.

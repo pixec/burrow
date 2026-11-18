@@ -1645,6 +1645,9 @@ fn describe_update(updated: &api::UpdateResourcesResponse) -> Vec<String> {
                             outcome.reason
                         )
                     }
+                    api::ResourceChange::Pending => {
+                        format!("{name} stays {to}{unit} until its next boot")
+                    }
                     _ => format!("{name} refused: {}", outcome.reason),
                 } + &note,
             )
@@ -5103,6 +5106,16 @@ fn print_config(sandbox: &common::Sandbox) {
             field("disk", &format!("{} MiB root disk", resources.disk_mib));
         }
     }
+    if let Some(pending) = &sandbox.pending_resources {
+        let parts: Vec<String> = [("vcpus", pending.vcpus), ("mem-mib", pending.mem_mib)]
+            .into_iter()
+            .filter(|(_, value)| *value > 0)
+            .map(|(name, value)| format!("{name} {value}"))
+            .collect();
+        if !parts.is_empty() {
+            field("next boot", &parts.join(", "));
+        }
+    }
     if let Some(lifetime) = &policy.lifetime {
         if lifetime.max_lifetime_secs > 0 {
             field("max-lifetime", &format!("{}s", lifetime.max_lifetime_secs));
@@ -6120,6 +6133,10 @@ fn sandbox_json(sandbox: &common::Sandbox) -> String {
             "blkio_weight": resources.blkio_weight,
             "nested_virt": resources.is_nested_virt_enabled,
         },
+        "pending_resources": sandbox.pending_resources.as_ref().map(|pending| serde_json::json!({
+            "vcpus": pending.vcpus,
+            "mem_mib": pending.mem_mib,
+        })),
         "lifetime": {
             "max_lifetime_secs": lifetime.max_lifetime_secs,
             "idle_suspend_secs": lifetime.idle_suspend_secs,

@@ -602,6 +602,16 @@ message Sandbox {
   // The build it was created from, `sha256:<hex>`: its identity, where
   // `template` is what the caller named it by.
   string build_digest = 43;
+  // A smaller shape its running guest takes only at its next boot, a
+  // Windows guest giving up neither vCPUs nor memory while it runs.
+  // `policy.resources` is the machine it runs as until then.
+  PendingResources pending_resources = 44;
+}
+
+// Fields of 0 are not pending.
+message PendingResources {
+  uint32 vcpus = 1;
+  uint32 mem_mib = 2;
 }
 
 message WindowsActivation {

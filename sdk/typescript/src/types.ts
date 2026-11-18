@@ -453,7 +453,8 @@ export interface ResourceUpdateOptions extends CallOptions {
  * applied to the running guest in part, `value` being as far as it got and
  * `reason` saying why it stopped. `next_boot`: recorded on a shut-down sandbox
  * for its next boot. `offline`: a shut-down sandbox's disk resized now.
- * `refused`: not applied, and `reason` says why. `unchanged`: it already had
+ * `pending`: a running guest takes it only at its next boot, and keeps
+ * `value` until then. `refused`: not applied, and `reason` says why. `unchanged`: it already had
  * that value.
  */
 export type ResourceChange =
@@ -462,6 +463,7 @@ export type ResourceChange =
   | "partial"
   | "next_boot"
   | "offline"
+  | "pending"
   | "refused"
   | "unknown";
 

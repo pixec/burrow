@@ -196,10 +196,23 @@ raise these.
   manifests record its digest (`firmware_digest`) where a Linux sandbox's
   record its kernel's. A `boot` takes the node's current firmware.
 - Creates below 2 vCPUs / 4096 MiB are refused, and so are warm shapes below
-  it; the pinned default 1x512 is skipped for Windows templates. A Windows
-  guest's memory cannot change while it runs, so its warm shapes have no
-  hotplug region. A warm build waits up to five minutes for the guest to go
-  quiet before snapshotting, so clones do not each redo its startup work.
+  it; the pinned default 1x512 is skipped for Windows templates. A warm
+  build waits up to five minutes for the guest to go quiet before
+  snapshotting, so clones do not each redo its startup work.
+- vCPUs and memory grow live. Windows has no virtio-mem driver, so a Windows
+  VM's hotplug region is ACPI DIMM slots (`hotplug_method` `Acpi`), up to its
+  `max_mem_mib`, in 128 MiB steps and at most eight additions per boot; its
+  vCPUs are CH's ACPI CPU hotplug up to the node's CPU count, as a Linux
+  guest's. Server 2022 Standard Evaluation brings both online at once, as
+  Datacenter does. Windows ejects neither again, and CH, asked for less,
+  would record the smaller shape in the config a snapshot carries while the
+  guest kept the larger, so a smaller vCPU count or memory for a running
+  guest is never sent to CH: it is kept on the sandbox as
+  `pending_resources` (`PENDING` in the response, `next boot` in `burrow
+  inspect`) and taken at its next `burrow boot`. An ACPI addition moves CH's
+  recorded `memory.size`, so a restore expects boot plus plugged memory there.
+  Forks and snapshot restores grow to a larger shape the same way, and are
+  refused a smaller one.
 - The disk grows, running or shut down; it never shrinks, NTFS being beyond
   the ext4 resize helper. The agent reads the disk's new size with
   `IOCTL_DISK_UPDATE_PROPERTIES` and, when space lies past the system

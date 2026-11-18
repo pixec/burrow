@@ -369,8 +369,10 @@ class ResourceOutcome:
     # "live": applied to the running guest. "partial": applied to the running
     # guest in part, `value` being as far as it got and `reason` saying why it
     # stopped. "next_boot": recorded on a shut-down sandbox for its next boot.
-    # "offline": a shut-down sandbox's disk resized now. "refused": not
-    # applied, and `reason` says why. "unchanged": it already had that value.
+    # "offline": a shut-down sandbox's disk resized now. "pending": a running
+    # guest takes it only at its next boot, and keeps `value` until then.
+    # "refused": not applied, and `reason` says why. "unchanged": it already
+    # had that value.
     change: str
     previous: int
     # What the sandbox has now: the value asked for, `previous` when refused,
