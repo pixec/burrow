@@ -80,6 +80,11 @@ pub async fn handshake(
     if is_restarting && !crate::windows::machine::is_restarting() {
         crate::windows::machine::restart_soon();
     }
+    // A disk the host grew while the guest was shut down, or a create
+    // larger than its template, is filled once the guest has its name.
+    if !is_restarting && !req.is_restored {
+        crate::windows::rootdisk::fill_in_background();
+    }
 
     let total = started.elapsed();
     let timing = guestpb::GuestResumeTiming {
@@ -418,12 +423,26 @@ fn applied() -> &'static Mutex<Option<guestpb::NetworkConfig>> {
     &APPLIED
 }
 
-pub async fn root_disk(
-    _req: guestpb::RootDiskRequest,
-) -> Result<guestpb::RootDiskResponse, Status> {
-    Err(Status::unimplemented(
-        "a Windows guest's disk is not resized or captured from inside",
-    ))
+/// Syncs or grows the system volume; the other operations are Linux's.
+pub async fn root_disk(req: guestpb::RootDiskRequest) -> Result<guestpb::RootDiskResponse, Status> {
+    use guestpb::root_disk_request::Op;
+    let op = Op::try_from(req.op).unwrap_or(Op::Unspecified);
+    let size_bytes = tokio::task::spawn_blocking(move || match op {
+        Op::Grow => crate::windows::rootdisk::grow(req.size_bytes),
+        Op::Sync => crate::windows::rootdisk::sync()
+            .map(|()| 0)
+            .map_err(|err| Status::internal(format!("syncing the system volume: {err}"))),
+        _ => Err(Status::unimplemented(format!(
+            "a Windows guest's disk takes no {}",
+            op.as_str_name()
+        ))),
+    })
+    .await
+    .map_err(|err| Status::internal(format!("the root disk operation did not run: {err}")))??;
+    Ok(guestpb::RootDiskResponse {
+        size_bytes,
+        ..Default::default()
+    })
 }
 
 /// Applies a live attach or detach: the whole configuration again, since

@@ -198,10 +198,19 @@ raise these.
 - Creates below 2 vCPUs / 4096 MiB are refused, and so are warm shapes below
   it; the pinned default 1x512 is skipped for Windows templates. A Windows
   guest's memory cannot change while it runs, so its warm shapes have no
-  hotplug region, and a warm snapshot is used only for a create of exactly
-  its disk size (Windows does not grow its volume from inside). A warm build
-  waits up to five minutes for the guest to go quiet before snapshotting, so
-  clones do not each redo its startup work.
+  hotplug region. A warm build waits up to five minutes for the guest to go
+  quiet before snapshotting, so clones do not each redo its startup work.
+- The disk grows, running or shut down; it never shrinks, NTFS being beyond
+  the ext4 resize helper. The agent reads the disk's new size with
+  `IOCTL_DISK_UPDATE_PROPERTIES` and, when space lies past the system
+  partition, which the unattended install makes the last, extends it with
+  `Resize-Partition` over the disk's free extent. `Get-PartitionSupportedSize`
+  is not used: it refuses a volume whose dirty bit is set, as the shrunk
+  template's is, which `Resize-Partition` extends all the same. A running
+  guest does it when the host grows the disk; a guest grown while shut down,
+  or created larger than its template, does it after its first handshake of
+  a boot. A warm snapshot serves creates of a larger disk too, grown under
+  the restored guest.
 - Windows has no kernel command line, so the network settings travel in the
   handshake on every boot, including every restore.
 - The node ships the Windows agent beside the Linux one

@@ -22,6 +22,7 @@ pub mod machine;
 mod nt;
 #[cfg(windows)]
 mod process;
+pub mod rootdisk;
 #[cfg(windows)]
 mod service;
 #[cfg(windows)]

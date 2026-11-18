@@ -6315,9 +6315,10 @@ impl SandboxManager {
     /// Growing: under a hypervisor that can announce it, a running guest is
     /// told at once and grows its filesystem online; a stopped sandbox's disk
     /// grows on the host, and its guest fills it on its next boot. Shrinking:
-    /// only a stopped sandbox, through a helper VM ([`crate::resizer`]). A
-    /// suspended guest holds its disk's size in memory, so its disk is not
-    /// touched either way. A macOS guest's disk is resized in two halves; see
+    /// only a stopped sandbox, through a helper VM ([`crate::resizer`]), whose
+    /// tools are ext4's, so never a Windows guest's NTFS. A suspended guest
+    /// holds its disk's size in memory, so its disk is not touched either
+    /// way. A macOS guest's disk is resized in two halves; see
     /// [`Self::resize_mac_disk`].
     async fn resize_disk(
         &self,
@@ -6327,15 +6328,15 @@ impl SandboxManager {
         let id = sandbox.id();
         let record = sandbox.record();
         let guest_os = burrow_vmm::GuestOs::from_record(&record.guest_os).unwrap_or_default();
-        if guest_os == burrow_vmm::GuestOs::Windows {
-            return Err(Status::failed_precondition(
-                "a Windows guest's disk is not resized: its agent does not grow or shrink NTFS \
-                 from inside",
-            ));
-        }
         let current = sandbox.disk_mib();
         if mib == current {
             return Ok((ResourceChange::Unchanged, 0, String::new()));
+        }
+        if guest_os == burrow_vmm::GuestOs::Windows && mib < current {
+            return Err(Status::failed_precondition(format!(
+                "a Windows guest's disk only grows: NTFS is not shrunk offline; sandbox {id} \
+                 keeps at least its {current} MiB"
+            )));
         }
         let slot = sandbox.vm.lock().await;
         let is_stopped = slot.is_none()
@@ -8750,13 +8751,10 @@ impl SandboxManager {
         if is_warmable && found.is_none() {
             self.rebuild_in_background_if_broken(&template, hypervisor, wanted);
         }
-        // A Windows guest does not grow its volume from inside, so its disk
-        // is only ever the size the snapshot was taken with.
         let warm = found.filter(|warm| {
             warm.shape.disk_mib == wanted.disk_mib
                 || (warm.shape.disk_mib < wanted.disk_mib
-                    && capabilities.is_live_disk_growth_supported
-                    && guest_os != burrow_vmm::GuestOs::Windows)
+                    && capabilities.is_live_disk_growth_supported)
         });
         let from_warm = warm.is_some();
         phases.mark("warm_find");
