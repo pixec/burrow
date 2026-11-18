@@ -9,7 +9,10 @@ CTX=${CTX:-colima-burrow}
 NODE=${NODE:-burrow-node-1}
 N="docker --context $CTX exec -i $NODE"
 WD=/var/lib/burrow/benchvm
-$N sh -c "mkdir -p $WD && cd $WD && ln -f /var/lib/burrow/images/alpine-ch/vmlinux vmlinux && cp --sparse=always /var/lib/burrow/images/alpine-ch/rootfs.ext4 rootfs.ext4"
+# The build the template alpine-ch resolves to, as `burrow templates ls` shows it.
+BUILD=${BUILD:?set BUILD to the alpine-ch build digest, sha256:<hex>}
+SRC=/var/lib/burrow/builds/${BUILD#sha256:}
+$N sh -c "mkdir -p $WD && cd $WD && cp $SRC/vmlinux vmlinux && cp --sparse=always $SRC/rootfs.ext4 rootfs.ext4"
 W="--workdir $WD --rootfs rootfs.ext4"
 strip() { sed 's/\x1b\[[0-9;]*m//g'; }
 for h in firecracker cloud-hypervisor; do

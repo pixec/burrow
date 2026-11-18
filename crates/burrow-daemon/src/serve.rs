@@ -1808,6 +1808,9 @@ pub async fn run(args: ServeArgs) -> anyhow::Result<()> {
             .map(|upgrade| (upgrade.guest_os, upgrade.digest.clone()))
             .collect(),
     );
+    crate::template::refuse_legacy(&args.data_dir)
+        .await
+        .map_err(|err| anyhow::anyhow!(err))?;
     let vmm_memory_overhead_mib: std::collections::HashMap<_, _> =
         args.vmm_memory_overheads.iter().copied().collect();
     node_info.vmm_memory_overhead_mib = hypervisors

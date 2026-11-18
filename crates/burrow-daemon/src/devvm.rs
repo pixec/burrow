@@ -18,7 +18,7 @@ use burrow_vmm::{
 #[derive(Args, Clone)]
 pub struct VmBootArgs {
     /// Directory holding the kernel and rootfs; also the VM's working dir.
-    #[arg(long, default_value = "/var/lib/burrow/images/dev")]
+    #[arg(long, default_value = "/var/lib/burrow/dev-vm")]
     pub workdir: PathBuf,
     /// Kernel filename, relative to --workdir.
     #[arg(long, default_value = "vmlinux")]

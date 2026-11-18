@@ -49,6 +49,9 @@ pub const MANIFEST: &str = "manifest.json";
 /// Prefix of a build being assembled, renamed into place once complete.
 const STAGING_PREFIX: &str = ".tmp-";
 
+/// Where nodes kept templates by name before builds.
+const LEGACY_DIR: &str = "images";
+
 /// The directory name of the build `digest` names, `sha256:<hex>` or the
 /// hex alone.
 pub(crate) fn key_of(digest: &str) -> Result<String, Status> {
@@ -253,6 +256,33 @@ pub(crate) async fn manifest_for(
         agent,
         ..Default::default()
     })
+}
+
+/// Refuses a data directory holding templates as nodes kept them before
+/// builds, which this build cannot use. Dot entries are leftovers and do not
+/// count.
+pub async fn refuse_legacy(data_dir: &Path) -> Result<(), String> {
+    let legacy = data_dir.join(LEGACY_DIR);
+    let Ok(mut entries) = tokio::fs::read_dir(&legacy).await else {
+        return Ok(());
+    };
+    let mut names = Vec::new();
+    while let Ok(Some(entry)) = entries.next_entry().await {
+        let name = entry.file_name().to_string_lossy().into_owned();
+        if !name.starts_with('.') {
+            names.push(name);
+        }
+    }
+    if names.is_empty() {
+        return Ok(());
+    }
+    names.sort();
+    Err(format!(
+        "{} holds templates in the layout before builds ({}), which this build does not \
+         support: pull or build them again, then remove the directory",
+        legacy.display(),
+        names.join(", ")
+    ))
 }
 
 /// Removes builds a node died assembling.
@@ -1517,6 +1547,28 @@ mod tests {
             .unwrap();
         let manifest = manifest_for(&staging, config, String::new()).await.unwrap();
         publish(data_dir, &staging, &manifest).await.unwrap()
+    }
+
+    /// A node with templates in the old layout refuses to start; leftover
+    /// dot entries and an empty or absent directory do not stop it.
+    #[tokio::test]
+    async fn templates_in_the_old_layout_are_refused() {
+        let data_dir = std::env::temp_dir().join(format!("burrow-legacy-{}", std::process::id()));
+        let _ = tokio::fs::remove_dir_all(&data_dir).await;
+        assert!(refuse_legacy(&data_dir).await.is_ok());
+        tokio::fs::create_dir_all(data_dir.join("images/.python.building"))
+            .await
+            .unwrap();
+        assert!(refuse_legacy(&data_dir).await.is_ok());
+        tokio::fs::create_dir_all(data_dir.join("images/python"))
+            .await
+            .unwrap();
+        let err = refuse_legacy(&data_dir).await.unwrap_err();
+        assert!(
+            err.contains("(python)") && err.contains("pull or build"),
+            "{err}"
+        );
+        let _ = tokio::fs::remove_dir_all(&data_dir).await;
     }
 
     /// A build recording a hypervisor this node does not know is listed, so

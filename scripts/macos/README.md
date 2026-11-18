@@ -187,8 +187,9 @@ Apple's catalogue and downloads into `~/.burrow/ipsw/` once. The build
 installs the restore image, boots it once with provisioning and NAT, copies
 the node's `--guest-binary` in over SSH as the provisioned admin, runs
 `burrow-guest install`, waits for the agent on vsock, turns Remote Login off
-and shuts the guest down from inside; the result replaces
-`~/.burrow/images/<name>` with an `image.json` naming `vz`/`macos`. SSH
+and shuts the guest down from inside; the result is published as a build
+under `~/.burrow/builds/<digest>` with a manifest naming `vz`/`macos`, and
+the orchestrator tags it as `<name>` once it is ready. SSH
 rather than writing the disk offline: the agent's files must be root-owned on
 the guest's Data volume, which the host can write only as root, and a booted
 guest proves the agent answers before the template is published. A build
