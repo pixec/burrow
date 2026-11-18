@@ -700,6 +700,13 @@ pub async fn link_warm(
         tokio::fs::hard_link(&source, &dest).await?;
     }
 
+    // Copied, being the TPM's secrets: a link would be one inode shared
+    // with every sandbox of the template.
+    let tpm = warm.join(crate::tpm::FILE);
+    if tokio::fs::try_exists(&tpm).await? {
+        tokio::fs::copy(&tpm, workdir.join(crate::tpm::FILE)).await?;
+    }
+
     // Optional: profiling is best effort, and a warm snapshot whose profiling
     // run failed simply has no plan.
     let plan = warm.join(PREFETCH_PLAN);
@@ -771,12 +778,6 @@ pub async fn build_warm_snapshot(
     let environment = crate::oci::image_environment(&config.data_dir, template).await;
     let (hypervisor, guest_os) = environment.machine()?;
     crate::sandbox::require_min_machine(template, guest_os, shape)?;
-    if environment.tpm {
-        return Err(Status::failed_precondition(format!(
-            "template {template} gives each sandbox a TPM of its own, which no shared snapshot \
-             can hold"
-        )));
-    }
     let agent_timeout = config.agent_timeout(guest_os);
     if !config.hypervisors.contains(&hypervisor) {
         return Err(Status::failed_precondition(format!(
@@ -886,6 +887,13 @@ pub async fn build_warm_snapshot(
     if boot == crate::boot::FIRMWARE {
         spec.boot = crate::boot::firmware_boot();
     }
+    // A TPM template's snapshot holds a TPM, made fresh for the build, which
+    // every sandbox restored from it starts with a copy of.
+    let tpm = environment.tpm.then(|| config.tpm(&vm_id, lease.block));
+    if let Some(tpm) = &tpm {
+        let _ = tokio::fs::remove_dir_all(&tpm.dir).await;
+    }
+    spec.tpm = tpm.clone();
     apply_confinement(&mut spec, config, shape);
 
     let outcome = match cold_boots.admit(&vm_id).await {
@@ -926,6 +934,14 @@ pub async fn build_warm_snapshot(
                 // out of it.
                 let _ = config.remove_workdir(&run_dir).await;
                 if let Err(err) = collected {
+                    let _ = tokio::fs::remove_dir_all(&dir).await;
+                    return Err(err);
+                }
+            }
+            if let Some(tpm) = &tpm {
+                let packed = crate::tpm::pack(&tpm.dir, &dir.join(crate::tpm::FILE)).await;
+                let _ = tokio::fs::remove_dir_all(&tpm.dir).await;
+                if let Err(err) = packed {
                     let _ = tokio::fs::remove_dir_all(&dir).await;
                     return Err(err);
                 }
@@ -1012,6 +1028,9 @@ pub async fn build_warm_snapshot(
             // A partial warm snapshot would be picked up by the next create.
             // The live one is left alone: it is still usable.
             let _ = tokio::fs::remove_dir_all(&dir).await;
+            if let Some(tpm) = &tpm {
+                let _ = tokio::fs::remove_dir_all(&tpm.dir).await;
+            }
             if run_dir != dir {
                 let _ = config.remove_workdir(&run_dir).await;
             }

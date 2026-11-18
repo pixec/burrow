@@ -1879,21 +1879,34 @@ impl RunningSandbox {
         self.workdir.join(disk_file(self.guest_os()))
     }
 
-    /// Whether the guest has a TPM of its own, which nothing copies.
+    /// Whether the guest has a TPM of its own, whose state its copies carry;
+    /// see [`crate::tpm`].
     fn has_tpm(&self) -> bool {
         self.base_record.lock().unwrap().is_tpm
     }
 
-    /// Refuses a copy of a sandbox with a TPM, which would hold the same
-    /// TPM's keys.
-    #[allow(clippy::result_large_err)]
-    fn refuse_copy(&self) -> Result<(), Status> {
-        match self.has_tpm() {
-            true => Err(Status::failed_precondition(format!(
-                "sandbox {} has a TPM, and a copy of it would hold the same TPM's keys",
-                self.id
-            ))),
-            false => Ok(()),
+    /// The directory its TPM keeps its state in, when it has one.
+    fn tpm_dir(&self) -> Option<PathBuf> {
+        self.spec
+            .lock()
+            .unwrap()
+            .tpm
+            .as_ref()
+            .map(|tpm| tpm.dir.clone())
+    }
+
+    /// Where a checkpoint captures this sandbox's TPM beside the disk it
+    /// captures to `capture`: beside the TPM's own directory.
+    fn tpm_capture(&self, capture: &Path) -> Option<PathBuf> {
+        let dir = self.tpm_dir()?;
+        Some(crate::tpm::capture_path(dir.parent()?, &self.id, capture))
+    }
+
+    /// Removes a checkpoint's captures, disk and TPM, that nothing took.
+    async fn discard_capture(&self, capture: &Path) {
+        let _ = tokio::fs::remove_file(capture).await;
+        if let Some(tpm) = self.tpm_capture(capture) {
+            let _ = tokio::fs::remove_file(tpm).await;
         }
     }
 
@@ -2867,11 +2880,26 @@ impl RunningSandbox {
         {
             let mut current = self.memory_chain.lock().await;
             if diff {
-                current.push(next);
+                current.push(next.clone());
             } else {
                 *current = self.layout().memory.map(String::from).into_iter().collect();
                 Self::remove_stale_diffs(&self.workdir).await;
             }
+        }
+
+        if let Some(tpm) = capture
+            .filter(|_| self.has_tpm())
+            .and_then(|capture| self.tpm_capture(capture))
+        {
+            let written = match diff {
+                true => Some(next.as_str()),
+                false => self.layout().memory,
+            };
+            if let Err(err) = self.sync_snapshot(written).await {
+                let _ = vm.resume().await;
+                return Err(err);
+            }
+            return self.restore_past_tpm(slot, &tpm, paused).await;
         }
 
         let resumed = vm.resume().await;
@@ -2894,6 +2922,52 @@ impl RunningSandbox {
         // at a connection that no longer exists. Dropping it here is what stops
         // the next exec failing as though the guest itself were broken.
         self.forget_agent().await;
+        Ok(paused_for)
+    }
+
+    /// Ends a checkpoint of a TPM guest, paused with its snapshot written:
+    /// packs its TPM's state into `tpm` and restores the guest from that
+    /// snapshot. swtpm answers one control connection at a time, which the
+    /// running VMM holds, so the state is read once that VMM has stopped and
+    /// had the emulator store its volatile state, which the restore resumes
+    /// from. The guest carries on from the instant it was paused, as after a
+    /// resume. A guest that cannot be restored is left suspended on the
+    /// snapshot.
+    async fn restore_past_tpm(
+        &self,
+        mut slot: tokio::sync::MutexGuard<'_, Option<Vm>>,
+        tpm: &Path,
+        paused: std::time::Instant,
+    ) -> Result<std::time::Duration, Status> {
+        let vm = slot.take().expect("the vm was present a moment ago");
+        self.retire_cpu(&vm);
+        if let Err(err) = vm.kill().await {
+            tracing::error!(sandbox = self.id(), %err, "vmm did not stop for a TPM capture");
+        }
+        let packed = match self.tpm_dir() {
+            Some(dir) => crate::tpm::pack(&dir, tpm).await,
+            None => Err(Status::internal("the sandbox's TPM has no directory")),
+        };
+        let mut spec = self.spec.lock().unwrap().clone();
+        spec.memory_chain = self.memory_chain.lock().await.clone();
+        let limits = spec.limits.clone();
+        let restored = Vm::restore(spec, true).await;
+        let paused_for = paused.elapsed();
+        self.forget_agent().await;
+        match restored {
+            Ok(vm) => {
+                start_cpu_cap(&vm, &limits, self.id());
+                *slot = Some(vm);
+            }
+            Err(err) => {
+                self.enter_suspended();
+                return Err(Status::internal(format!(
+                    "checkpoint written but the guest could not be restored after its TPM was \
+                     captured; the sandbox is suspended and can be resumed: {err}"
+                )));
+            }
+        }
+        packed?;
         Ok(paused_for)
     }
 
@@ -3015,7 +3089,6 @@ impl RunningSandbox {
         logs: Option<&Path>,
         capture: Option<&Path>,
     ) -> Result<Vec<String>, Status> {
-        self.refuse_copy()?;
         self.durable.settle_memory().await;
         let _slot = self.vm.lock().await;
         let chain = self.memory_chain.lock().await.clone();
@@ -3067,6 +3140,20 @@ impl RunningSandbox {
                 crate::rootdisk::clone(&self.workdir.join(disk), &dest.join(disk))
                     .await
                     .map_err(|err| io(disk, err))?;
+            }
+        }
+        // The TPM a checkpoint captured with the disk, or a suspended
+        // guest's, whose emulator stored its volatile state as it stopped.
+        if self.has_tpm() {
+            let dest = dest.join(crate::tpm::FILE);
+            match capture.and_then(|capture| self.tpm_capture(capture)) {
+                Some(captured) => crate::tpm::place(&captured, &dest)
+                    .await
+                    .map_err(|err| io(crate::tpm::FILE, err))?,
+                None => match self.tpm_dir() {
+                    Some(dir) => crate::tpm::pack(&dir, &dest).await?,
+                    None => return Err(Status::internal("the sandbox's TPM has no directory")),
+                },
             }
         }
         // The child's guest holds the same command table, so it needs the
@@ -4852,6 +4939,7 @@ impl SandboxManager {
         ));
 
         let journaled = self.journaled_dirs().await;
+        let tpm_root = self.config.tpm_root();
         let mut removed = 0;
         for (root, live) in roots {
             let Ok(mut entries) = tokio::fs::read_dir(&root).await else {
@@ -4861,7 +4949,19 @@ impl SandboxManager {
                 if live.contains(&entry.path()) || journaled.contains(&entry.path()) {
                     continue;
                 }
-                if tokio::fs::remove_dir_all(entry.path()).await.is_ok() {
+                // Beside the TPMs' directories are the captures copies of a
+                // sandbox are made from, named after it, which a live
+                // sandbox's upload or fork may be writing as this runs.
+                let is_capture =
+                    root == tpm_root && entry.file_type().await.is_ok_and(|kind| kind.is_file());
+                if is_capture && known.contains(crate::tpm::capture_owner(&entry.file_name())) {
+                    continue;
+                }
+                let gone = match is_capture {
+                    true => tokio::fs::remove_file(entry.path()).await,
+                    false => tokio::fs::remove_dir_all(entry.path()).await,
+                };
+                if gone.is_ok() {
                     removed += 1;
                 }
             }
@@ -7420,9 +7520,8 @@ impl SandboxManager {
         let environment = self.image_environment(template).await;
         let (hypervisor, guest_os) = environment.machine()?;
         // A pinned shape below what the guest boots on, the default 1x512 for
-        // a Windows template, is not one any create of it can ask for, and a
-        // template giving each sandbox a TPM is not warmed at all.
-        if require_min_machine(template, guest_os, shape).is_err() || environment.tpm {
+        // a Windows template, is not one any create of it can ask for.
+        if require_min_machine(template, guest_os, shape).is_err() {
             return Ok(None);
         }
         // As a create pins it, or the snapshot is kept under a shape no
@@ -7754,10 +7853,9 @@ impl SandboxManager {
                 continue;
             };
             let environment = self.image_environment(&template).await;
-            let is_warmable = !environment.tpm
-                && environment
-                    .machine()
-                    .is_ok_and(|(hypervisor, _)| hypervisor.capabilities().is_warm_pool_supported);
+            let is_warmable = environment
+                .machine()
+                .is_ok_and(|(hypervisor, _)| hypervisor.capabilities().is_warm_pool_supported);
             if !is_warmable {
                 continue;
             }
@@ -8823,10 +8921,8 @@ impl SandboxManager {
         // disk grown, where the guest's disk can grow live; one with a larger
         // disk cannot be shrunk under the guest, so that create boots.
         let wanted = crate::warm::Shape::wanted(&resources);
-        // A TPM's state is the sandbox's own, which no shared snapshot holds.
         let is_warmable = !policy.is_console_verbose
             && !resources.is_nested_virt_enabled
-            && !environment.tpm
             && capabilities.is_warm_pool_supported
             && (capabilities.is_drive_hotplug_supported
                 || crate::volume::block_mounts(&policy.volumes)
@@ -8909,7 +9005,13 @@ impl SandboxManager {
             match crate::warm::link_warm(&templates_dir, &template, snapshot, &workdir, &mut linked)
                 .await
             {
-                Ok(()) => {}
+                // A TPM template's snapshot brings the TPM every sandbox
+                // made from it starts with.
+                Ok(()) => {
+                    if let Err(err) = crate::tpm::take(&workdir, &self.config.tpm_dir(&id)).await {
+                        return Err(guard.fail(err).await);
+                    }
+                }
                 Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
                     tracing::warn!(
                         template = %template, %err,
@@ -9532,7 +9634,6 @@ impl SandboxManager {
         self.require_settled(sandbox_id)?;
         crate::snapshot::validate_id(&snapshot_id)?;
         let sandbox = self.get(sandbox_id).await?;
-        sandbox.refuse_copy()?;
         let is_disk_only = crate::macnode::is_macos(sandbox.guest_os());
         let capture = sandbox.workdir.join(format!(".capture-{snapshot_id}"));
         let is_captured = sandbox.is_running() && !is_disk_only;
@@ -9567,7 +9668,7 @@ impl SandboxManager {
             }
             Err(err) => Err(err),
         };
-        let _ = tokio::fs::remove_file(&capture).await;
+        sandbox.discard_capture(&capture).await;
         self.compact_behind(&sandbox, MAX_MEMORY_CHAIN);
         let staged = match staged {
             Ok(staged) => staged,
@@ -9846,7 +9947,6 @@ impl SandboxManager {
     ) -> Result<common::Sandbox, Status> {
         self.require_settled(source_id)?;
         let source = self.get(source_id).await?;
-        source.refuse_copy()?;
         if crate::macnode::is_macos(source.guest_os()) {
             return self
                 .detached(move |manager| async move {
@@ -10189,7 +10289,7 @@ impl SandboxManager {
                 Vec::new(),
             )
             .await;
-        let _ = tokio::fs::remove_file(&capture).await;
+        source.discard_capture(&capture).await;
         let (sandbox, admitted) = restored?;
         Ok((sandbox, admitted, growth, reshape))
     }
@@ -10346,6 +10446,9 @@ impl SandboxManager {
             let (chain, arriving) = source
                 .stage_into(&self.snapshots, &workdir, &logs_dir)
                 .await?;
+            // A TPM guest's copy brings its TPM, which goes to this sandbox's
+            // own state directory before anything is the jail's.
+            let is_tpm = crate::tpm::take(&workdir, &self.config.tpm_dir(&id)).await?;
             // Linked in the same shape as a create's, so the guest sees the
             // same devices in the same order as the handshake describes.
             for ((index, mount), source) in
@@ -10382,7 +10485,7 @@ impl SandboxManager {
                     .await
                     .map_err(|err| Status::internal(format!("preparing the jail: {err}")))?;
             }
-            Ok::<_, Status>((chain, arriving))
+            Ok::<_, Status>((chain, arriving, is_tpm))
         };
 
         phases.mark("ipam");
@@ -10419,7 +10522,7 @@ impl SandboxManager {
         if let Err(err) = rules {
             return Err(guard.fail(err).await);
         }
-        let (chain, mut arriving) = match staged {
+        let (chain, mut arriving, is_tpm) = match staged {
             Ok(staged) => staged,
             Err(err) => return Err(guard.fail(err).await),
         };
@@ -10466,7 +10569,7 @@ impl SandboxManager {
             },
             environment.booted_systemd(),
             policy.is_console_verbose,
-            false,
+            is_tpm,
         );
         // The template's plan names the pages its agent touches on the way to
         // a usable handshake, which is the same code whether the guest was
@@ -10561,6 +10664,7 @@ impl SandboxManager {
             inspection_root_fingerprint: inspection_root,
             kernel,
             public_ips,
+            is_tpm,
             ..Default::default()
         };
         tracing::info!(
@@ -11247,13 +11351,10 @@ impl SandboxManager {
     /// Whether a sandbox can live in the object store at all: one mounting
     /// volumes only where they are kept there too.
     fn is_movable(&self, sandbox: &RunningSandbox) -> bool {
-        !sandbox.has_tpm()
-            && (self.volumes.is_durable()
-                || crate::volume::block_mounts(
-                    &sandbox.record().policy.unwrap_or_default().volumes,
-                )
+        self.volumes.is_durable()
+            || crate::volume::block_mounts(&sandbox.record().policy.unwrap_or_default().volumes)
                 .next()
-                .is_none())
+                .is_none()
     }
 
     /// Brings every volume a suspended sandbox mounts up to date in the
@@ -11460,9 +11561,10 @@ impl SandboxManager {
                 .store(true, std::sync::atomic::Ordering::Relaxed);
             return Ok(true);
         }
-        let Some(draft) = self.draft_manifest(sandbox, previous.as_ref()).await? else {
+        let Some(mut draft) = self.draft_manifest(sandbox, previous.as_ref()).await? else {
             return Ok(false);
         };
+        draft.tpm_digest = self.store_tpm(store, sandbox, None).await?;
         let uploaded = tokio::select! {
             () = token.cancelled() => return Ok(false),
             uploaded = async {
@@ -11582,6 +11684,7 @@ impl SandboxManager {
                 .unwrap_or_default(),
             kernel_digest: String::new(),
             firmware_digest: String::new(),
+            tpm_digest: String::new(),
             rootfs_digest: String::new(),
             cpu_usage_usec: record.cpu_usage_usec,
             rx_bytes: record.rx_bytes,
@@ -11593,6 +11696,36 @@ impl SandboxManager {
             volumes: Default::default(),
             image,
         }))
+    }
+
+    /// Puts a TPM guest's packed state in the store and returns its digest,
+    /// or nothing for a guest without one. `packed` is a capture taken with
+    /// the guest paused; without one the state is packed from the TPM's own
+    /// directory: a suspended guest's whole, a running guest's permanent
+    /// state for a cold boot.
+    async fn store_tpm(
+        &self,
+        store: &crate::objstore::ObjectStore,
+        sandbox: &RunningSandbox,
+        packed: Option<&Path>,
+    ) -> Result<String, Status> {
+        if !sandbox.has_tpm() {
+            return Ok(String::new());
+        }
+        if let Some(packed) = packed {
+            return crate::snapshot::put_blob(store, packed).await;
+        }
+        let dir = sandbox
+            .tpm_dir()
+            .ok_or_else(|| Status::internal("the sandbox's TPM has no directory"))?;
+        let temp = self
+            .config
+            .tpm_root()
+            .join(format!("{}.store.tpm", sandbox.id()));
+        crate::tpm::pack(&dir, &temp).await?;
+        let digest = crate::snapshot::put_blob(store, &temp).await;
+        let _ = tokio::fs::remove_file(&temp).await;
+        digest
     }
 
     /// The record's brokered credentials sealed for the store, or `None` when
@@ -11974,10 +12107,9 @@ impl SandboxManager {
             )));
         }
         if !self.is_movable(&sandbox) {
-            return Err(Status::failed_precondition(match sandbox.has_tpm() {
-                true => "a sandbox with a TPM stays on the node holding its TPM's state",
-                false => "a sandbox with volumes moves only with an object store to carry them",
-            }));
+            return Err(Status::failed_precondition(
+                "a sandbox with volumes moves only with an object store to carry them",
+            ));
         }
         // The volumes it writes move with it. One it only reads stays where it
         // is, and the new node reads a copy of it.
@@ -12426,6 +12558,7 @@ impl SandboxManager {
                 .map_err(|err| Status::internal(format!("creating the workdir: {err}")))?;
             let local =
                 crate::durable::stage_disk(store, &self.snapshots, manifest, &workdir).await?;
+            let is_tpm = crate::tpm::take(&workdir, &self.config.tpm_dir(&id)).await?;
             for ((index, mount), source) in
                 crate::volume::block_mounts(&policy.volumes).zip(&sources)
             {
@@ -12435,7 +12568,7 @@ impl SandboxManager {
                         Status::internal(format!("attaching volume {}: {err}", mount.volume))
                     })?;
             }
-            Ok::<_, Status>(local)
+            Ok::<_, Status>((local, is_tpm))
         };
         let is_tapped = hypervisor.capabilities().is_tap_networked;
         let tapped = async {
@@ -12446,8 +12579,8 @@ impl SandboxManager {
         };
         let (staged, tap) = tokio::join!(stage, tapped);
         guard.tap = tap.as_ref().ok().filter(|name| !name.is_empty()).cloned();
-        let local = match staged {
-            Ok(local) => local,
+        let (local, is_tpm) = match staged {
+            Ok(staged) => staged,
             Err(err) => return Err(guard.fail(err).await),
         };
         let tap_name = match tap {
@@ -12469,7 +12602,7 @@ impl SandboxManager {
             &policy.volumes,
             manifest.is_systemd.then_some(&manifest.image.systemd_boot),
             policy.is_console_verbose,
-            false,
+            is_tpm,
         );
         let record = common::Sandbox {
             id: id.clone(),
@@ -12486,6 +12619,7 @@ impl SandboxManager {
                 Ok(kernel) => kernel,
                 Err(err) => return Err(guard.fail(err).await),
             },
+            is_tpm,
             ..record
         };
         guard.keep();
@@ -12652,7 +12786,6 @@ impl SandboxManager {
                 .filter(|sandbox| {
                     sandbox.is_running()
                         && sandbox.lifetime().checkpoint_secs > 0
-                        && !sandbox.has_tpm()
                         && self.require_settled(sandbox.id()).is_ok()
                 })
                 .cloned()
@@ -12895,6 +13028,10 @@ impl SandboxManager {
                             .map_err(|err| Status::internal(format!("staging: {err}")))?;
                         draft.checkpoint = crate::durable::CHECKPOINT_MEMORY.to_string();
                         let chain = sandbox.stage_fork(&staged, None, Some(&capture)).await?;
+                        let packed = staged.join(crate::tpm::FILE);
+                        draft.tpm_digest = self
+                            .store_tpm(&store, sandbox, Some(&packed))
+                            .await?;
                         let mut uploaded = crate::durable::upload(
                             &store,
                             &blobs,
@@ -12913,6 +13050,7 @@ impl SandboxManager {
                     }
                     false => {
                         let image = self.disk_image_of(sandbox).await;
+                        draft.tpm_digest = self.store_tpm(&store, sandbox, None).await?;
                         crate::durable::upload_disk_checkpoint(
                             &store,
                             &blobs,
@@ -12932,7 +13070,7 @@ impl SandboxManager {
         for (_, dest) in &volume_captures {
             let _ = tokio::fs::remove_file(dest).await;
         }
-        let _ = tokio::fs::remove_file(&capture).await;
+        sandbox.discard_capture(&capture).await;
         let local = uploaded?;
         // Kept in the working directory as a suspend's record is, so a
         // restarted node knows what the store holds.
@@ -13163,7 +13301,7 @@ pub(crate) async fn grant_to_jail(
         for entry in std::fs::read_dir(&workdir)?.flatten() {
             let name = entry.file_name().to_string_lossy().into_owned();
             // A TPM's state is never the jail's, whoever put it here.
-            if name == "tpm" || shared.contains(&name) {
+            if name == crate::tpm::FILE || shared.contains(&name) {
                 continue;
             }
             chown(&entry.path(), uid, gid)?;
@@ -14151,6 +14289,15 @@ pub(crate) mod tests {
         );
         std::fs::create_dir_all(&tpm).unwrap();
         std::fs::create_dir_all(&orphan_tpm).unwrap();
+        let capture =
+            crate::tpm::capture_path(tpm.parent().unwrap(), id, Path::new(".capture-sbx_child"));
+        std::fs::write(&capture, b"captured").unwrap();
+        let orphan_capture = crate::tpm::capture_path(
+            tpm.parent().unwrap(),
+            "ghost-nobody",
+            Path::new(".capture-sbx_child"),
+        );
+        std::fs::write(&orphan_capture, b"captured").unwrap();
         let foreign = row(
             id,
             common::SandboxState::Suspended,
@@ -14165,6 +14312,8 @@ pub(crate) mod tests {
         assert!(!orphan.exists());
         assert!(tpm.exists());
         assert!(!orphan_tpm.exists());
+        assert!(capture.exists());
+        assert!(!orphan_capture.exists());
         let listed = manager.list().await;
         assert_eq!(listed.len(), 1);
         assert_eq!(listed[0].state, common::SandboxState::Failed as i32);

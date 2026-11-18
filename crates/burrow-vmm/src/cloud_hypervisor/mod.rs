@@ -20,7 +20,7 @@
 
 mod config;
 pub mod jail;
-mod tpm;
+pub mod tpm;
 
 use std::path::{Path, PathBuf};
 use std::process::Stdio;

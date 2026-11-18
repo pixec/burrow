@@ -119,9 +119,33 @@ control socket in it is open to any uid, and a jailed VMM is shown that socket
 alone. It is not chrooted, because Ubuntu's AppArmor profile for swtpm
 refuses `CAP_SYS_CHROOT`. It starts before the VMM; stopping the VMM has it
 save its volatile state, which a `start` (memory restore) resumes from, while
-a cold boot drops it. Snapshots, forks, warm builds, checkpoints and moves of
-a TPM sandbox are refused: a copy would hold the same TPM's keys. Whether a
-sandbox has a TPM is fixed at create, on its record.
+a cold boot drops it. Whether a sandbox has a TPM is fixed at create, on its
+record.
+
+Copies carry the TPM. Forks, snapshots, checkpoints (disk and memory),
+stored state, moves and warm snapshots pack swtpm's state files
+(`tpm2-00.permall`, and `tpm2-00.volatilestate` when there is one; the same
+blobs swtpm's `CMD_GET_STATEBLOB` hands out for QEMU's migration) into one
+file, `tpm.state`, beside the memory and disk. A sandbox restored from the
+copy has it unpacked into its own state directory, chowned to its own uid by
+swtpm's start, before its VMM starts; restoring rewrites the snapshot's TPM
+socket to that sandbox's. The file is created 0600 root, never handed to a
+jail, and in the object store it is a blob named in the manifest
+(`tpm_digest`). Every copy holds the same TPM: the same EK and SRK, so a key
+sealed to it (a BitLocker TPM protector, a TPM-backed certificate key)
+works in every copy.
+
+The state must match the paused guest's memory, so it is read after the
+emulator has stored its volatile state. swtpm serves one control connection
+at a time and the running VMM holds it, so the state cannot be asked for
+while the VMM runs. A suspended or warm-built guest's VMM is gone already;
+a running guest being forked, snapshotted or memory-checkpointed is paused
+and snapshotted, its VMM is stopped (swtpm stores its volatile state), the
+state is packed, and the guest is restored from the snapshot just written,
+resuming from the stored volatile state. That costs the guest a CH restore
+on top of the pause. A disk checkpoint carries the permanent state as it is.
+The packed captures of running guests sit beside the TPM directories and
+are swept with them at startup.
 
 Ubuntu's AppArmor profile for swtpm lets it write only to files it owns under
 a few directories, among them `/var/lib/swtpm`. On such a host either set

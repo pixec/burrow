@@ -142,6 +142,9 @@ pub struct Manifest {
     /// uploaded: the blob it is in the store under, as `kernel_digest` is for a
     /// kernel.
     pub firmware_digest: String,
+    /// A TPM guest's packed emulator state ([`crate::tpm`]) by digest, filled
+    /// in when uploaded; empty for a guest without one.
+    pub tpm_digest: String,
     /// The template's image by content, filled in when uploaded: chunks under
     /// `images/`, which the disk's index is a diff against.
     pub rootfs_digest: String,
@@ -481,6 +484,7 @@ impl SnapshotStore {
             kernel_digest: staged.kernel.map(|k| k.digest).unwrap_or_default(),
             guest_os: staged.guest_os.as_str().to_string(),
             firmware_digest: String::new(),
+            tpm_digest: String::new(),
             rootfs_digest: String::new(),
             inspection_root: staged.inspection_root,
             is_disk_only: staged.is_disk_only,
@@ -546,6 +550,10 @@ impl SnapshotStore {
         }
 
         let boot_digest = put_blob(remote, &dir.join(manifest.boot_file())).await?;
+        let tpm = dir.join(crate::tpm::FILE);
+        if tokio::fs::try_exists(&tpm).await.unwrap_or(false) {
+            manifest.tpm_digest = put_blob(remote, &tpm).await?;
+        }
         // The image goes once for every snapshot of it.
         let image = crate::rootdisk::image_of(&self.blobs, &dir.join(TEMPLATE_ROOTFS)).await?;
         crate::rootdisk::upload_image(remote, &image).await?;
@@ -813,6 +821,10 @@ impl SnapshotStore {
             &dir.join(manifest.boot_file()),
         )
         .await?;
+        if !manifest.tpm_digest.is_empty() {
+            self.fetch_blob(remote, &manifest.tpm_digest, &dir.join(crate::tpm::FILE))
+                .await?;
+        }
         let image = crate::rootdisk::fetch_image(
             remote,
             &self.blobs,
@@ -1189,6 +1201,12 @@ impl SnapshotStore {
         tokio::fs::copy(dir.join(layout.state), dest.join(layout.state))
             .await
             .map_err(|err| io(layout.state, err))?;
+        let tpm = dir.join(crate::tpm::FILE);
+        if tokio::fs::try_exists(&tpm).await.unwrap_or(false) {
+            tokio::fs::copy(&tpm, dest.join(crate::tpm::FILE))
+                .await
+                .map_err(|err| io(crate::tpm::FILE, err))?;
+        }
 
         let disk = crate::rootdisk::ROOT_DISK;
         crate::rootdisk::clone(&dir.join(disk), &dest.join(disk))
@@ -1578,6 +1596,7 @@ mod tests {
             kernel_digest: String::new(),
             guest_os: String::new(),
             firmware_digest: String::new(),
+            tpm_digest: String::new(),
             rootfs_digest: String::new(),
             inspection_root: String::new(),
             is_disk_only: false,

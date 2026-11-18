@@ -39,6 +39,7 @@ mod share;
 mod snapshot;
 mod staged;
 mod template;
+mod tpm;
 mod volstore;
 mod volume;
 mod warm;

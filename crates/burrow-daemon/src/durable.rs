@@ -123,6 +123,9 @@ pub struct Manifest {
     /// The UEFI firmware a firmware guest booted, by digest: the blob it is in
     /// the store under, as `kernel_digest` is for a kernel.
     pub firmware_digest: String,
+    /// A TPM guest's emulator state, packed ([`crate::tpm`]), by blob digest;
+    /// empty for a guest without one.
+    pub tpm_digest: String,
     /// The template's image. The disk's index is a diff against it, by
     /// chunk, and it is in the store under `images/`.
     pub rootfs_digest: String,
@@ -796,15 +799,17 @@ pub async fn stage(
             .map_err(|err| Status::internal(format!("linking the image: {err}")))?;
         Ok::<_, Status>(image)
     };
-    let (kernel, image, vmstate_fetched, working_set, disk_index, memory) = tokio::join!(
+    let (kernel, image, vmstate_fetched, working_set, disk_index, memory, tpm) = tokio::join!(
         snapshots.fetch_blob(store, manifest.boot_digest(), &kernel_path),
         rootfs,
         store.get_to_file(&vmstate_key, &vmstate_path),
         store.get_to_file(&working_set_key, &working_set_path),
         crate::chunks::read_index(store, &disk_key),
         crate::chunks::read_index(store, &memory_key),
+        fetch_tpm(store, snapshots, manifest, dest),
     );
     kernel?;
+    tpm?;
     let image = image?;
     vmstate_fetched?.ok_or_else(|| missing(vmstate))?;
     let disk_index = disk_index?.ok_or_else(|| missing(disk_file))?;
@@ -876,6 +881,21 @@ pub async fn stage(
 }
 
 const PAGE: u64 = 4096;
+
+/// Fetches a TPM guest's packed emulator state beside the rest.
+async fn fetch_tpm(
+    store: &ObjectStore,
+    snapshots: &crate::snapshot::SnapshotStore,
+    manifest: &Manifest,
+    dest: &Path,
+) -> Result<(), Status> {
+    if manifest.tpm_digest.is_empty() {
+        return Ok(());
+    }
+    snapshots
+        .fetch_blob(store, &manifest.tpm_digest, &dest.join(crate::tpm::FILE))
+        .await
+}
 
 /// Keeps the template environment a manifest carries as the adopted
 /// sandbox's own.
@@ -1098,9 +1118,14 @@ pub async fn stage_disk(
             }
         }
     };
-    let (kernel, image, disk_index) =
-        tokio::join!(kernel, rootfs, crate::chunks::read_index(store, &disk_key));
+    let (kernel, image, disk_index, tpm) = tokio::join!(
+        kernel,
+        rootfs,
+        crate::chunks::read_index(store, &disk_key),
+        fetch_tpm(store, snapshots, manifest, dest)
+    );
     kernel?;
+    tpm?;
     let image = image?;
     let missing =
         |file: &str| Status::not_found(format!("sandbox {id}'s checkpoint is missing {file}"));
@@ -1388,6 +1413,7 @@ pub(crate) mod tests {
             kernel: String::new(),
             kernel_digest: String::new(),
             firmware_digest: String::new(),
+            tpm_digest: String::new(),
             rootfs_digest: String::new(),
             cpu_usage_usec: 0,
             rx_bytes: 0,
@@ -1523,6 +1549,9 @@ pub(crate) mod tests {
             .write_all_at(&[4; 4096], 3 << 20)
             .unwrap();
         crate::rootdisk::clone(&disk, &capture).await.unwrap();
+        let tpm = root.join("tpm.packed");
+        std::fs::write(&tpm, b"packed tpm").unwrap();
+        draft.tpm_digest = crate::snapshot::put_blob(&store, &tpm).await.unwrap();
         let second = upload_disk_checkpoint(
             &store,
             &blobs,
@@ -1561,6 +1590,11 @@ pub(crate) mod tests {
         assert_eq!(
             std::fs::read(dest.join(crate::boot::KERNEL)).unwrap(),
             b"kernel"
+        );
+        assert_eq!(
+            std::fs::read(dest.join(crate::tpm::FILE)).unwrap(),
+            b"packed tpm",
+            "a TPM guest's state comes with its disk"
         );
 
         // Node b has never had the template, so the sandbox boots with the

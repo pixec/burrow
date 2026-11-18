@@ -205,10 +205,11 @@ fn memory(spec: &VmSpec) -> Value {
 
 /// Points a snapshot's recorded config at the sandbox restoring it.
 ///
-/// The config is the snapshotted VM's, whose NIC was another sandbox's tap.
-/// Everything else in it is relative and already right. The machine's shape
-/// cannot change across a restore, so a spec asking for another one is
-/// refused here, with both shapes named, rather than deep inside the VMM. An ACPI hotplug counts
+/// The config is the snapshotted VM's, whose NIC was another sandbox's tap
+/// and whose TPM was another sandbox's emulator. Everything else in it is
+/// relative and already right. The machine's shape cannot change across a
+/// restore, so a spec asking for another one is refused here, with both
+/// shapes named, rather than deep inside the VMM. An ACPI hotplug counts
 /// what it added in the recorded memory size, which virtio-mem does not.
 pub(crate) fn retarget(snapshot: &mut Value, spec: &VmSpec) -> Result<()> {
     let vcpus = snapshot["cpus"]["boot_vcpus"].as_u64().unwrap_or(0);
@@ -230,6 +231,20 @@ pub(crate) fn retarget(snapshot: &mut Value, spec: &VmSpec) -> Result<()> {
              VM is {} vcpu / {expected} MiB with {} MiB to plug",
             spec.vcpus, spec.mem_hotplug_mib
         )));
+    }
+    match (
+        &spec.tpm,
+        snapshot.get("tpm").is_some_and(|tpm| !tpm.is_null()),
+    ) {
+        (Some(tpm), true) => snapshot["tpm"]["socket"] = json!(super::tpm::socket(tpm)),
+        (None, false) => {}
+        (_, has_tpm) => {
+            return Err(Error::Snapshot(format!(
+                "the snapshot's guest {} a TPM and this VM {}",
+                if has_tpm { "has" } else { "does not have" },
+                if has_tpm { "does not" } else { "asks for one" }
+            )));
+        }
     }
     for device in ["serial", "console"] {
         if snapshot[device]["mode"] == "File" && snapshot[device]["file"] != CONSOLE_PIPE {
@@ -555,6 +570,34 @@ mod tests {
         assert!(retarget(&mut snapshot.clone(), &windows).is_err());
         windows.mem_plugged_mib = 2048;
         retarget(&mut snapshot, &windows).unwrap();
+    }
+
+    /// A restore talks to its own sandbox's TPM, and only a guest that had
+    /// one is given one.
+    #[test]
+    fn a_restore_takes_its_own_tpm() {
+        let tpm = |dir: &str| crate::TpmSpec {
+            swtpm: "swtpm".into(),
+            dir: dir.into(),
+            uid: 300_000,
+        };
+        let mut windows = spec();
+        windows.guest_os = GuestOs::Windows;
+        windows.vcpus = 2;
+        windows.mem_mib = 4096;
+        windows.tpm = Some(tpm("/var/lib/burrow/tpm/sbx_a"));
+        let mut snapshot = vm_config(&windows, &config(), "x86_64").unwrap();
+        windows.tpm = Some(tpm("/var/lib/burrow/tpm/sbx_b"));
+        retarget(&mut snapshot, &windows).unwrap();
+        assert_eq!(
+            snapshot["tpm"]["socket"],
+            "/var/lib/burrow/tpm/sbx_b/swtpm.sock"
+        );
+        windows.tpm = None;
+        assert!(retarget(&mut snapshot.clone(), &windows).is_err());
+        let mut plain = vm_config(&windows, &config(), "x86_64").unwrap();
+        windows.tpm = Some(tpm("/var/lib/burrow/tpm/sbx_b"));
+        assert!(retarget(&mut plain, &windows).is_err());
     }
 
     /// The TPM socket is named by its absolute path, which a jail binds in.
