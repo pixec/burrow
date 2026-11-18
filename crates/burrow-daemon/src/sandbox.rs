@@ -14111,7 +14111,6 @@ pub(crate) mod tests {
             memory: Default::default(),
             disk_index: Default::default(),
             logs: Default::default(),
-            is_casync: true,
         });
         manager
             .sandboxes
