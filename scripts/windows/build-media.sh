@@ -17,7 +17,8 @@
 # PRODUCT_KEY (default Windows 11 Pro's generic key; empty for evaluation
 # media, which takes none), ADMIN_PASSWORD (the built-in Administrator's;
 # unset, a random one is made and printed once), RDP (1 turns Remote Desktop
-# on and opens its firewall rule; off by default).
+# on and opens its firewall rule; off by default), APPLY (1 has pe.cmd apply
+# the image itself instead of running Setup, which Windows 11 needs).
 # Needs: wimlib-imagex cabextract mkfs.fat mcopy python3, 7z for an ISO.
 set -eu
 src=$1
@@ -87,6 +88,7 @@ else
   rm -f "$work/install.wim"
 fi
 echo burrow > "$iso/burrow-media.txt"
+[ "${APPLY:-0}" = 1 ] && echo apply > "$iso/burrow-apply.txt"
 
 # WinPE (boot.wim): our launcher, the unattend and the drivers.
 mkdir -p "$work/pe/drivers"

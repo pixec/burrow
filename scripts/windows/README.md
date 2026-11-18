@@ -1,7 +1,7 @@
 # Windows guests under Cloud Hypervisor
 
-Windows Server 2022 runs as a Burrow sandbox under Cloud Hypervisor v54 on
-x86_64: create, exec, stop/start, delete, warm creates, fork, snapshots,
+Windows Server 2022 and Windows 11 IoT Enterprise LTSC 2024 run as Burrow
+sandboxes under Cloud Hypervisor v54 on x86_64: create, exec, stop/start, delete, warm creates, fork, snapshots,
 durable state and moves, passwords, Remote Desktop, activation and a
 per-sandbox TPM all work through `burrow`. Windows on arm64 does not boot on
 the Mac harness; see the last section.
@@ -37,6 +37,45 @@ is activated.
   RNG when it changes, so clones of one snapshot draw different random
   numbers from the start. The agent does nothing with the handshake's
   entropy.
+
+## Windows 11
+
+Windows 11 IoT Enterprise LTSC 2024 (build 26100), from its evaluation ISO
+(`fetch-iso.sh win11`, fwlink 2270353), installs and runs as a template with
+`"tpm": true`. Cloud Hypervisor's documentation lists the same edition. Its
+requirements are UEFI (`CLOUDHV.fd`), a TPM 2.0, 2 vCPUs and a disk of about
+64 GiB; `run-vm.sh` defaults to all of them, and attaches swtpm unless
+`TPM=off`. IoT Enterprise LTSC needs neither Secure Boot nor a TPM, and
+`pe.cmd` sets WinPE's `LabConfig` bypasses for other editions all the same,
+since `CLOUDHV.fd` has no Secure Boot.
+
+```sh
+sh fetch-iso.sh win11 ~/win/win11-iot-ltsc-eval.iso
+VIRTIO_OS=w11 VIRTIO_ARCH=amd64 sh fetch-virtio.sh ~/win
+APPLY=1 ARCH=amd64 IMAGE="IoT Enterprise LTSC" PRODUCT_KEY= ADMIN_PASSWORD=... \
+  sh build-media.sh ~/win/win11-iot-ltsc-eval.iso ~/win/virtio-amd64 \
+  target/x86_64-pc-windows-gnullvm/release/burrow-guest.exe ~/win/media.img
+DIR=/var/lib/burrow/win11-build VCPUS=4 MEMORY_MIB=6144 sh run-vm.sh install
+```
+
+- 24H2 Setup checks that a driver package names the disk controller's
+  hardware IDs, and refuses the disk otherwise (`Windows needs the driver
+  for device [Red Hat VirtIO SCSI controller]`). viostor's INF names QEMU's
+  subsystem ID (`SUBSYS_11001AF4`), and Cloud Hypervisor's virtio-blk has
+  `SUBSYS_10421AF4`, which matches only the INF's compatible ID. Loading
+  the driver with `drvload` or `pnputil` in WinPE does not change Setup's
+  answer, and WinPE's Setup has no `/installdrivers`. So `APPLY=1` has
+  `pe.cmd` do Setup's work itself: partition disk 0 as the unattend does,
+  `dism /Apply-Image`, `dism /Add-Driver`, `bcdboot`, and the unattend in
+  `Windows\Panther` with the `$OEM$` files in place for the specialize and
+  oobe passes and `SetupComplete.cmd`. The install takes about 10 minutes.
+- The VM installs without a NIC, so Plug and Play binds virtio-net on the
+  first boot that has one, while the agent already answers. The agent waits
+  up to 60 s for the adapter before it applies the handshake's network.
+- `max_phys_bits`: Cloud Hypervisor's documentation notes Windows was tested
+  with at least 39 address bits and that a host with more may need
+  `max_phys_bits` set. Burrow does not set it, and Server 2022 and Windows
+  11 boot with the host's 48 bits on AMD Zen 4.
 
 ## Credentials and identity
 
@@ -165,7 +204,8 @@ What works and what does not under Cloud Hypervisor v54:
 - BitLocker cannot use it: `manage-bde -protectors -add C: -tpm` fails with
   `0x80284001`, as does `Get-Tpm`.
 - It is not ready for attestation: there is no measured-boot event log.
-- Whether Windows 11 Setup accepts it is unverified.
+- Windows 11 IoT Enterprise LTSC runs with it, and a TPM-backed key
+  (Microsoft Platform Crypto Provider) signs; see Windows 11.
 
 The cause is what Cloud Hypervisor gives the guest, not Burrow. Its ACPI
 `TPM2` table (revision 3, 52 bytes, CRB) has no event-log area, and its
@@ -228,7 +268,9 @@ raise these.
   `max_mem_mib`, in 128 MiB steps and at most eight additions per boot; its
   vCPUs are CH's ACPI CPU hotplug up to the node's CPU count, as a Linux
   guest's. Server 2022 Standard Evaluation brings both online at once, as
-  Datacenter does. Windows ejects neither again, and CH, asked for less,
+  Datacenter does. Windows 11 brings memory online at once, and lists added
+  vCPUs as processor devices but schedules on them only after a restart
+  (inside the guest, which CH serves at its new count, or a `burrow boot`). Windows ejects neither again, and CH, asked for less,
   would record the smaller shape in the config a snapshot carries while the
   guest kept the larger, so a smaller vCPU count or memory for a running
   guest is never sent to CH: it is kept on the sandbox as
@@ -263,9 +305,10 @@ raise these.
 
 | File | What |
 | --- | --- |
+| `fetch-iso.sh` | x86_64 evaluation ISO: Server 2022 or Windows 11 IoT Enterprise LTSC 2024 |
 | `fetch-uup.sh` | UUP set from Microsoft's CDN (Windows 11 arm64) |
 | `fetch-virtio.sh` | virtio-win drivers for `VIRTIO_OS` (w11, 2k22, ...) and `VIRTIO_ARCH` (ARM64, amd64); macOS or Linux |
-| `build-media.sh` | installer disk from an ISO or UUP set; `ARCH`, `IMAGE`, `PRODUCT_KEY`, `ADMIN_PASSWORD`, `RDP` |
+| `build-media.sh` | installer disk from an ISO or UUP set; `ARCH`, `IMAGE`, `PRODUCT_KEY`, `ADMIN_PASSWORD`, `RDP`, `APPLY` |
 | `autounattend.xml`, `pe.cmd`, `winpeshl.ini`, `SetupComplete.cmd` | unattended install |
 | `run-vm.sh`, `stop-vm.sh` | install/run/restore by hand under CH; `CH`, `FW`, `TPM`, `TPM_DIR`, `VCPUS`, `MEMORY_MIB`, `DISK_MIB` |
 | `restore-test.sh` | snapshot once, restore twice, time it and check clock, RNG and network |
@@ -285,7 +328,6 @@ DIR=/var/lib/burrow/spike-win VCPUS=4 MEMORY_MIB=6144 sh run-vm.sh install
 ## Still to do
 
 - A template import command for installed disks.
-- A Windows 11 template, for the TPM path.
 - PPI and a measured-boot log for the TPM, in Cloud Hypervisor and its
   firmware.
 

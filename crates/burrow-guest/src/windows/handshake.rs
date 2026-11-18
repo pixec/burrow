@@ -352,6 +352,22 @@ fn replace_in_root_store(wanted: &[Vec<u8>]) -> anyhow::Result<()> {
     result
 }
 
+/// [`adapter`], waited for: on the first boot that has a NIC, Plug and Play
+/// installs virtio-net's driver for it while the agent is already serving.
+fn wait_for_adapter() -> anyhow::Result<(u32, Vec<std::net::Ipv6Addr>)> {
+    let started = std::time::Instant::now();
+    loop {
+        match adapter() {
+            Ok(found) => return Ok(found),
+            Err(err) if started.elapsed() > ADAPTER_WAIT => return Err(err),
+            Err(_) => std::thread::sleep(std::time::Duration::from_millis(500)),
+        }
+    }
+}
+
+/// How long a handshake waits for the NIC's driver to come up.
+const ADAPTER_WAIT: std::time::Duration = std::time::Duration::from_secs(60);
+
 /// The adapter the host's network is on, and the global IPv6 addresses it
 /// holds: the first Ethernet adapter, which in a burrow VM is the one
 /// virtio-net device.
@@ -467,7 +483,7 @@ fn apply_network(config: &guestpb::NetworkConfig) -> anyhow::Result<()> {
     if held.as_ref() == Some(config) {
         return Ok(());
     }
-    let (index, v6) = adapter()?;
+    let (index, v6) = wait_for_adapter()?;
     for step in netcfg::steps(index, config, &v6)? {
         let output = std::process::Command::new("netsh")
             .args(&step.args)
