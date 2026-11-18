@@ -1340,56 +1340,6 @@ impl Store {
         Ok(rows.into_iter().map(|(value,)| value).collect())
     }
 
-    /// Whether what the object store held before snapshots and volumes had
-    /// rows has been recorded.
-    ///
-    /// Temporary, like [`Self::record_stored_inventory`]: it exists for the
-    /// release that gives snapshots and volumes rows, and the release after
-    /// removes both, the `stored_inventory` table, the nodes'
-    /// `is_inventory_recorded` column, the recording branch of
-    /// [`Self::reconcile_node`] and the orchestrator's
-    /// `record_stored_inventory`.
-    pub async fn is_stored_inventory_recorded(&self) -> Result<bool> {
-        let row: (i64,) = on_pool!(self, pool => sqlx::query_as(
-            "SELECT is_recorded FROM stored_inventory WHERE id=1",
-        )
-        .fetch_one(pool)
-        .await)?;
-        Ok(row.0 != 0)
-    }
-
-    /// Records, once, the snapshots and volumes the object store holds.
-    /// Temporary: see [`Self::is_stored_inventory_recorded`].
-    pub async fn record_stored_inventory(
-        &self,
-        snapshots: &[String],
-        volumes: &[String],
-        at_ms: i64,
-    ) -> Result<()> {
-        on_pool!(self, pool => {
-            let mut tx = pool.begin().await?;
-            for id in snapshots {
-                sqlx::query("INSERT INTO snapshots (id, at_ms) VALUES ($1, $2) ON CONFLICT (id) DO NOTHING")
-                    .bind(id)
-                    .bind(at_ms)
-                    .execute(&mut *tx)
-                    .await?;
-            }
-            for name in volumes {
-                sqlx::query("INSERT INTO volumes (name, at_ms) VALUES ($1, $2) ON CONFLICT (name) DO NOTHING")
-                    .bind(name)
-                    .bind(at_ms)
-                    .execute(&mut *tx)
-                    .await?;
-            }
-            sqlx::query("UPDATE stored_inventory SET is_recorded=1 WHERE id=1")
-                .execute(&mut *tx)
-                .await?;
-            tx.commit().await?;
-        });
-        Ok(())
-    }
-
     /// The placements written at or after `since_ms` by the database's
     /// clock and the ids deleted since then, or every placement for `None`,
     /// with the database's time before anything was read.
@@ -1526,19 +1476,6 @@ impl Store {
         };
         let (unnamed_snapshots, unnamed_volumes) =
             (unnamed("snapshots", "id"), unnamed("volumes", "name"));
-        let record = |table: &str, key: &str| match self.is_postgres() {
-            true => format!(
-                "INSERT INTO {table} ({key}, at_ms)
-                 SELECT x, $2 FROM jsonb_array_elements_text($1::jsonb) AS x
-                 WHERE true ON CONFLICT ({key}) DO NOTHING"
-            ),
-            false => format!(
-                "INSERT INTO {table} ({key}, at_ms) SELECT value, $2 FROM json_each($1)
-                 WHERE true ON CONFLICT ({key}) DO NOTHING"
-            ),
-        };
-        let (record_snapshots, record_volumes) =
-            (record("snapshots", "id"), record("volumes", "name"));
         let outcome = on_pool!(self, pool => {
             let mut tx = pool.begin().await?;
             let applied = sqlx::query(
@@ -1734,51 +1671,14 @@ impl Store {
                         .execute(&mut *tx)
                         .await?;
                 }
-                // Temporary, with the columns it reads: records what a node
-                // held before snapshots and volumes had rows, and destroys
-                // nothing for want of a row until the object store's holdings
-                // are recorded. The release after this ships removes it.
-                let recorded: (i64, i64) = sqlx::query_as(
-                    "SELECT is_inventory_recorded,
-                        (SELECT is_recorded FROM stored_inventory WHERE id=1)
-                     FROM nodes WHERE id=$1",
-                )
-                .bind(&node.id)
-                .fetch_one(&mut *tx)
-                .await?;
-                let (destroy_snapshots, destroy_volumes) = match recorded {
-                    (_, 0) if recorded.0 != 0 => (Vec::new(), Vec::new()),
-                    (0, _) => {
-                        for (sql, listing) in
-                            [(&record_snapshots, &snapshots), (&record_volumes, &volumes)]
-                        {
-                            sqlx::query(sql)
-                                .bind(listing)
-                                .bind(node.last_heartbeat_ms)
-                                .execute(&mut *tx)
-                                .await?;
-                        }
-                        sqlx::query("UPDATE nodes SET is_inventory_recorded=1 WHERE id=$1")
-                            .bind(&node.id)
-                            .execute(&mut *tx)
-                            .await?;
-                        (Vec::new(), Vec::new())
-                    }
-                    _ => {
-                        let unnamed_snapshots: Vec<(String,)> = sqlx::query_as(&unnamed_snapshots)
-                            .bind(&snapshots)
-                            .fetch_all(&mut *tx)
-                            .await?;
-                        let unnamed_volumes: Vec<(String,)> = sqlx::query_as(&unnamed_volumes)
-                            .bind(&volumes)
-                            .fetch_all(&mut *tx)
-                            .await?;
-                        (
-                            unnamed_snapshots.into_iter().map(|(id,)| id).collect(),
-                            unnamed_volumes.into_iter().map(|(name,)| name).collect(),
-                        )
-                    }
-                };
+                let unnamed_snapshots: Vec<(String,)> = sqlx::query_as(&unnamed_snapshots)
+                    .bind(&snapshots)
+                    .fetch_all(&mut *tx)
+                    .await?;
+                let unnamed_volumes: Vec<(String,)> = sqlx::query_as(&unnamed_volumes)
+                    .bind(&volumes)
+                    .fetch_all(&mut *tx)
+                    .await?;
 
                 let unanswered: Vec<(String,)> = sqlx::query_as(
                     "SELECT p.id FROM placements p
@@ -1798,8 +1698,8 @@ impl Store {
                     lost,
                     restated,
                     unanswered: unanswered.into_iter().map(|(id,)| id).collect(),
-                    destroy_snapshots,
-                    destroy_volumes,
+                    destroy_snapshots: unnamed_snapshots.into_iter().map(|(id,)| id).collect(),
+                    destroy_volumes: unnamed_volumes.into_iter().map(|(name,)| name).collect(),
                 })
             }
         });
@@ -2032,8 +1932,8 @@ impl Store {
                 "INSERT INTO nodes
                    (id, idx, info, status, wg_key, wg_endpoint, last_heartbeat_ms,
                     is_reported, cpu_capacity_millis, committed_cpu_millis, free_mem_mib,
-                    reserved_cpu_millis, reserved_mem_mib, is_inventory_recorded)
-                 VALUES ($1, $2, $3, $4, $5, $6, $7, 0, $8, 0, 0, 0, 0, 0)
+                    reserved_cpu_millis, reserved_mem_mib)
+                 VALUES ($1, $2, $3, $4, $5, $6, $7, 0, $8, 0, 0, 0, 0)
                  ON CONFLICT (id) DO UPDATE SET
                    idx=excluded.idx, info=excluded.info, status=excluded.status,
                    wg_key=excluded.wg_key, wg_endpoint=excluded.wg_endpoint,
@@ -3575,9 +3475,8 @@ mod tests {
         assert!(store.get_placement("pending").await.unwrap().is_some());
     }
 
-    /// A node holding snapshots and volumes no row names destroys them,
-    /// except at the first heartbeat of a node from before they had rows,
-    /// which records what it holds instead.
+    /// A node holding snapshots and volumes no row names destroys them, from
+    /// its first heartbeat.
     #[tokio::test]
     async fn snapshots_and_volumes_no_row_names_are_destroyed() {
         let store = Store::open_in_memory().await.unwrap();
@@ -3587,72 +3486,9 @@ mod tests {
         let mut beat = report("n1", 1, &[]);
         beat.snapshots = vec!["snap_kept".into(), "snap_gone".into()];
         beat.volumes = vec!["data".into(), "scratch".into()];
-        assert!(!store.is_stored_inventory_recorded().await.unwrap());
-        store.record_stored_inventory(&[], &[], 1).await.unwrap();
-        on_pool!(store, pool => sqlx::query("UPDATE nodes SET is_inventory_recorded=1")
-            .execute(pool)
-            .await
-            .map(drop)
-            .unwrap());
         let out = applied(apply(&store, &beat).await);
         assert_eq!(out.destroy_snapshots, ["snap_gone"]);
         assert_eq!(out.destroy_volumes, ["scratch"]);
-
-        // A node known before the upgrade records what it holds, once.
-        reporting(&store, "old").await;
-        let mut sql_old = report("old", 1, &[]);
-        on_pool!(store, pool => sqlx::query("UPDATE nodes SET is_inventory_recorded=0 WHERE id='old'")
-            .execute(pool)
-            .await
-            .map(drop)
-            .unwrap());
-        sql_old.snapshots = vec!["snap_old".into()];
-        sql_old.volumes = vec!["vol_old".into()];
-        let out = applied(apply(&store, &sql_old).await);
-        assert!(out.destroy_snapshots.is_empty() && out.destroy_volumes.is_empty());
-        assert!(store.snapshot_ids().await.unwrap().contains("snap_old"));
-        assert!(store.remove_volume("vol_old").await.unwrap());
-        sql_old.seq = 2;
-        assert_eq!(
-            applied(apply(&store, &sql_old).await).destroy_volumes,
-            ["vol_old"]
-        );
-
-        store
-            .record_stored_inventory(&["snap_stored".into()], &["vol_stored".into()], 5)
-            .await
-            .unwrap();
-        assert!(store.is_stored_inventory_recorded().await.unwrap());
-        assert!(store.volume_names().await.unwrap().contains("vol_stored"));
-    }
-
-    /// While the snapshots and volumes from before their rows are still
-    /// being recorded, a node registering anew, perhaps written off before
-    /// the upgrade, records what it holds, and nothing is destroyed until the
-    /// object store's holdings are recorded too.
-    #[tokio::test]
-    async fn nothing_from_before_rows_is_destroyed_while_it_is_recorded() {
-        let store = Store::open_in_memory().await.unwrap();
-        reporting(&store, "returning").await;
-        let mut beat = report("returning", 1, &[]);
-        beat.snapshots = vec!["snap_before".into()];
-        beat.volumes = vec!["vol_before".into()];
-        let out = applied(apply(&store, &beat).await);
-        assert!(out.destroy_snapshots.is_empty() && out.destroy_volumes.is_empty());
-        assert!(store.snapshot_ids().await.unwrap().contains("snap_before"));
-
-        beat.seq = 2;
-        beat.snapshots.push("snap_fetched".into());
-        let out = applied(apply(&store, &beat).await);
-        assert!(
-            out.destroy_snapshots.is_empty(),
-            "{:?}",
-            out.destroy_snapshots
-        );
-        store.record_stored_inventory(&[], &[], 1).await.unwrap();
-        beat.seq = 3;
-        let out = applied(apply(&store, &beat).await);
-        assert_eq!(out.destroy_snapshots, ["snap_fetched"]);
     }
 
     /// Only rows whose report changed are rewritten, and a row the node

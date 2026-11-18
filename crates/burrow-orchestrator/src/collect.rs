@@ -28,13 +28,9 @@ pub struct Collected {
 }
 
 /// One pass through the first healthy node with the object store. `None`
-/// when no node could be asked, or the object store's holdings from before
-/// snapshots and volumes had rows are not recorded yet.
+/// when no node could be asked.
 pub async fn once(state: &OrchestratorState) -> Option<Collected> {
     let store = state.sandboxes.store();
-    if !store.is_stored_inventory_recorded().await.ok()? {
-        return None;
-    }
     for node_id in state.nodes.healthy_ids() {
         let Some(endpoint) = state.nodes.endpoint(&node_id) else {
             continue;
@@ -364,11 +360,8 @@ mod tests {
                 ..Default::default()
             })
             .await;
-        assert_eq!(once(&api.0).await, None);
-        store
-            .record_stored_inventory(&["snap_kept".into()], &["vol_kept".into()], 1)
-            .await
-            .unwrap();
+        store.insert_snapshot("snap_kept", 1).await.unwrap();
+        store.insert_volume("vol_kept", 1).await.unwrap();
 
         let collected = once(&api.0).await.unwrap();
         assert_eq!(

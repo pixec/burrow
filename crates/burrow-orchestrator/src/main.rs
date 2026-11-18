@@ -887,7 +887,6 @@ async fn reap_dead_nodes(state: Arc<OrchestratorState>, expiry: Option<std::time
                 write_off_node(&state, &node_id, expiry).await;
             }
         }
-        record_stored_inventory(&state).await;
         // A replica that died half way through a create leaves its claims on
         // an id and a name with no sandbox behind them.
         if let Some(store) = &state.store {
@@ -912,63 +911,6 @@ async fn reap_dead_nodes(state: Arc<OrchestratorState>, expiry: Option<std::time
 /// How long deleted placement ids are kept for replicas catching up, far
 /// past the furthest back one reads.
 const PLACEMENT_DELETES_KEPT_MS: i64 = 600_000;
-
-/// Records, once, the snapshots and volumes the object store held before
-/// they had rows, as any node with the store lists them. Exists for the
-/// release that gives them rows; the release after removes it, with the
-/// store's recording (see `Store::is_stored_inventory_recorded`).
-async fn record_stored_inventory(state: &OrchestratorState) {
-    let store = state.sandboxes.store();
-    if store.is_stored_inventory_recorded().await.unwrap_or(true) {
-        return;
-    }
-    for node_id in state.nodes.healthy_ids() {
-        let Some(endpoint) = state.nodes.endpoint(&node_id) else {
-            continue;
-        };
-        let Ok(mut client) = crate::api::connect_node(endpoint, state.node_token.as_deref()).await
-        else {
-            continue;
-        };
-        let snapshots = client
-            .list_durable_snapshots(nodepb::NodeListSnapshotsRequest {
-                sandbox_id: String::new(),
-            })
-            .await;
-        let volumes = client
-            .list_durable_volumes(burrow_proto::api::v1::ListVolumesRequest {
-                node_id: String::new(),
-            })
-            .await;
-        let (Ok(snapshots), Ok(volumes)) = (snapshots, volumes) else {
-            continue;
-        };
-        let snapshots: Vec<String> = snapshots
-            .into_inner()
-            .snapshots
-            .into_iter()
-            .map(|snapshot| snapshot.id)
-            .collect();
-        let volumes: Vec<String> = volumes
-            .into_inner()
-            .volumes
-            .into_iter()
-            .map(|volume| volume.name)
-            .collect();
-        match store
-            .record_stored_inventory(&snapshots, &volumes, burrow_common::unix_now_ms())
-            .await
-        {
-            Ok(()) => tracing::info!(
-                snapshots = snapshots.len(),
-                volumes = volumes.len(),
-                "recorded the snapshots and volumes the object store held"
-            ),
-            Err(err) => tracing::warn!(%err, "could not record what the object store holds"),
-        }
-        return;
-    }
-}
 
 /// Writes off one node, if this replica still leads and the node is still
 /// silent in the store, which another replica's heartbeat may have updated

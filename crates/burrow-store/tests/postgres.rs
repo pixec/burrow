@@ -68,7 +68,6 @@ async fn the_control_tables_round_trip_on_postgres() {
         .reconcile_node(&first, |_| None, |_, _| None)
         .await
         .unwrap();
-    store.record_stored_inventory(&[], &[], 1).await.unwrap();
     let report = NodeReport {
         node: NodeRow {
             id: node.clone(),
