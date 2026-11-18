@@ -80,18 +80,24 @@ def build_template(
     timeout: float = 30 * 60.0,
 ) -> BuiltTemplate:
     """Runs a build over `transport` and reports what the server published."""
-    if not (template._base or template._image or template._ipsw):
+    if not (template._base or template._image or template._ipsw or template._disk):
         raise BurrowError(
-            "a template build needs a base: call from_template, from_image or from_ipsw",
+            "a template build needs a base: call from_template, from_image, from_ipsw or "
+            "from_disk",
             "invalid_argument",
         )
     request = api_pb2.BuildTemplateRequest(
         name=name,
         # An OCI base takes the place of a template base; sending both
         # would leave the node to guess which was meant.
-        **{"from": "" if template._image or template._ipsw else template._base},
+        **{"from": "" if template._image or template._ipsw or template._disk else template._base},
         from_image=template._image,
         from_ipsw=template._ipsw,
+        # An installed Windows disk in the node's imports directory, which
+        # that node imports.
+        from_disk=template._disk,
+        node_id=template._disk_node,
+        is_tpm=template._tpm,
         steps=[api_pb2.BuildStep(run=step) for step in template._steps],
         # Zero is the node's default for the guest being built: 1 vCPU and
         # 1024 MiB for Linux, the restore image's minimum for macOS.
@@ -185,12 +191,30 @@ class TemplateBuilder:
         self._base = ""
         self._image = ""
         self._ipsw = ""
+        self._disk = ""
+        self._disk_node = ""
+        self._tpm = False
         self._steps: List[str] = []
 
     def from_template(self, name: str) -> "TemplateBuilder":
         """Sets the burrow template to start from. A build needs a base: this,
-        `from_image` or `from_ipsw`."""
+        `from_image`, `from_ipsw` or `from_disk`."""
         self._base = name
+        self._image = ""
+        self._ipsw = ""
+        self._disk = ""
+        return self
+
+    def from_disk(self, disk: str, node: str, *, tpm: bool = False) -> "TemplateBuilder":
+        """Imports an installed Windows disk, made by `scripts/windows`, as a
+        Cloud Hypervisor template: `disk` is its file name in the imports
+        directory under `node`'s data directory. `tpm` gives each sandbox a
+        TPM 2.0 of its own, as Windows 11 expects. The template takes no
+        steps, and its build is distributed to other nodes like any other.
+        """
+        self._disk = disk
+        self._disk_node = node
+        self._tpm = tpm
         self._image = ""
         self._ipsw = ""
         return self

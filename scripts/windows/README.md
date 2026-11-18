@@ -218,21 +218,24 @@ device, and a firmware build with the Tcg2 stack, would be needed.
 
 ## Making a template
 
-A Windows template is a directory under the node's templates dir holding the
-installed raw disk as `rootfs.ext4` and an `image.json`:
+A Windows template is a build imported from the installed disk. Put
+`win.raw` in the node's imports directory, `<data-dir>/imports`, and import
+it there; the build is distributed to other nodes as any other is:
 
-```json
-{
-  "env": [],
-  "working_dir": "",
-  "cmd": ["cmd.exe"],
-  "hypervisor": "cloud-hypervisor",
-  "guest_os": "windows"
-}
+```sh
+mv win.raw /var/lib/burrow/imports/win2022.raw
+burrow templates import-disk win2022 --disk win2022.raw --node node_a
+burrow templates import-disk win11 --disk win11.raw --node node_a --tpm
 ```
 
-`env` and `working_dir` must be there: without them the file silently loads
-as a default Linux Firecracker template. There is no import command yet.
+The import takes a file name, never a path, so a caller cannot have a node
+read an arbitrary file into a build. The node clones the disk as the
+build's `rootfs.ext4` (a reflink where the filesystem has them), hashes it
+and records the image config every sandbox boots with: `guest_os`
+`windows`, `hypervisor` `cloud-hypervisor`, `cmd` `cmd.exe`, and `tpm` when
+asked. The disk is left in place. The API is `BuildTemplateRequest` with
+`from_disk`, `node_id` and `is_tpm`; the SDKs' builders take
+`from_disk(disk, node, tpm=...)` and `fromDisk(disk, node, { tpm })`.
 
 Every sandbox's root disk is charged at its full size against the node's disk
 cap, so the 64 GiB install disk was shrunk to 24 GiB (NTFS shrunk inside, the
@@ -327,7 +330,6 @@ DIR=/var/lib/burrow/spike-win VCPUS=4 MEMORY_MIB=6144 sh run-vm.sh install
 
 ## Still to do
 
-- A template import command for installed disks.
 - PPI and a measured-boot log for the TPM, in Cloud Hypervisor and its
   firmware.
 

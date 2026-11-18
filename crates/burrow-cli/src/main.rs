@@ -1806,6 +1806,24 @@ enum TemplatesCommand {
         #[arg(long = "allow-domain")]
         allow_domains: Vec<String>,
     },
+    /// Import an installed Windows disk as a template: a raw disk made by
+    /// scripts/windows, placed in the node's imports directory
+    /// (`<data-dir>/imports`). The build is distributed to other nodes as
+    /// any other is.
+    ImportDisk {
+        /// Template to publish the build under, `name` or `name:tag`.
+        name: String,
+        /// The disk's file name in the node's imports directory.
+        #[arg(long)]
+        disk: String,
+        /// The node holding the disk.
+        #[arg(long)]
+        node: String,
+        /// Give each sandbox of the template a TPM 2.0 of its own, as
+        /// Windows 11 expects.
+        #[arg(long)]
+        tpm: bool,
+    },
     /// Remove a template, or one tag of it as `name:tag`. Builds no tag
     /// keeps are dropped once nothing uses them.
     Rm { name: String },
@@ -2937,6 +2955,21 @@ async fn main() -> anyhow::Result<()> {
                 mem_mib,
                 disk_mib,
                 allow_domains,
+                ..Default::default()
+            };
+            build_template(&mut client, request).await?
+        }
+        Command::Templates(TemplatesCommand::ImportDisk {
+            name,
+            disk,
+            node,
+            tpm,
+        }) => {
+            let request = api::BuildTemplateRequest {
+                name,
+                from_disk: disk,
+                node_id: node,
+                is_tpm: tpm,
                 ..Default::default()
             };
             build_template(&mut client, request).await?

@@ -379,7 +379,7 @@ message BuildTemplateRequest {
   string name = 1;
   // Template to start from: `name`, `name:tag`, `name@sha256:<hex>` or
   // `sha256:<hex>`, resolved to one build before the build starts. Required unless
-  // `from_image`, `kits` or `from_ipsw` takes its place: burrow has no
+  // `from_image`, `kits`, `from_ipsw` or `from_disk` takes its place: burrow has no
   // built-in image to fall back on, and choosing one would boot something the
   // caller did not ask for.
   string from = 2;
@@ -426,6 +426,17 @@ message BuildTemplateRequest {
   // Hypervisor. Recorded with the template, by name and digest; every
   // sandbox and warm snapshot of it boots this kernel.
   string kernel = 13;
+  // An installed Windows disk to import as a Cloud Hypervisor template: the
+  // name of a raw disk image (`win.raw` from scripts/windows) in the
+  // `imports` directory under `node_id`'s data directory. Takes the place of
+  // `from`, `from_image`, `kits` and `from_ipsw`; `steps` must be empty.
+  string from_disk = 14;
+  // The node holding `from_disk`, which imports it. Required with it, and
+  // only taken with it.
+  string node_id = 15;
+  // Each sandbox of a `from_disk` build gets a TPM 2.0 of its own, as
+  // Windows 11 expects. Recorded with the build.
+  bool is_tpm = 16;
 }
 
 message BuildDone {

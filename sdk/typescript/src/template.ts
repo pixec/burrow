@@ -137,14 +137,34 @@ export class TemplateBuilder {
   private base = "";
   private image = "";
   private ipsw = "";
+  private disk = "";
+  private diskNode = "";
+  private tpm = false;
   private readonly steps: BuildStep[] = [];
 
   /**
    * Sets the burrow template to start from. A build needs a base: this,
-   * {@link fromImage} or {@link fromIpsw}.
+   * {@link fromImage}, {@link fromIpsw} or {@link fromDisk}.
    */
   fromTemplate(name: string): this {
     this.base = name;
+    this.image = "";
+    this.ipsw = "";
+    this.disk = "";
+    return this;
+  }
+
+  /**
+   * Imports an installed Windows disk, made by `scripts/windows`, as a Cloud
+   * Hypervisor template: `disk` is its file name in the imports directory
+   * under `node`'s data directory. `tpm` gives each sandbox a TPM 2.0 of its
+   * own, as Windows 11 expects. The template takes no steps, and its build
+   * is distributed to other nodes like any other.
+   */
+  fromDisk(disk: string, node: string, options: { tpm?: boolean } = {}): this {
+    this.disk = disk;
+    this.diskNode = node;
+    this.tpm = options.tpm ?? false;
     this.image = "";
     this.ipsw = "";
     return this;
@@ -233,9 +253,9 @@ export class TemplateBuilder {
 
   /** @internal The `BuildTemplateRequest` this builder describes. */
   toRequest(name: string, options: BuildOptions) {
-    if (!this.base && !this.image && !this.ipsw) {
+    if (!this.base && !this.image && !this.ipsw && !this.disk) {
       throw new BurrowError(
-        "a template build needs a base: call fromTemplate, fromImage or fromIpsw",
+        "a template build needs a base: call fromTemplate, fromImage, fromIpsw or fromDisk",
         "invalid_argument",
       );
     }
@@ -243,9 +263,12 @@ export class TemplateBuilder {
       name,
       // An OCI base takes the place of a template base; sending both would
       // leave the node to guess which was meant.
-      from: this.image || this.ipsw ? "" : this.base,
+      from: this.image || this.ipsw || this.disk ? "" : this.base,
       fromImage: this.image,
       fromIpsw: this.ipsw,
+      fromDisk: this.disk,
+      nodeId: this.diskNode,
+      isTpm: this.tpm,
       steps: this.steps,
       // Zero is the node's default for the guest being built.
       vcpus: options.vcpus ?? 0,

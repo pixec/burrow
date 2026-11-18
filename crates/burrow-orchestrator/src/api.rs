@@ -3524,8 +3524,10 @@ impl Burrow for ApiService {
             false => crate::builds::target(&req.name)?,
         };
         req.name = name.clone();
-        let is_on_base =
-            req.from_image.is_empty() && req.kits.is_empty() && req.from_ipsw.is_empty();
+        let is_on_base = req.from_image.is_empty()
+            && req.kits.is_empty()
+            && req.from_ipsw.is_empty()
+            && req.from_disk.is_empty();
         if is_on_base {
             let from = match req.from.is_empty() {
                 true => "default",
@@ -3533,13 +3535,37 @@ impl Burrow for ApiService {
             };
             req.from = crate::builds::resolve(&store, from).await?;
         }
-        let want = build_placement(&req);
-        let node_id = match self.0.nodes.place_for(&want) {
-            Ok(node_id) => node_id,
-            Err(crate::registry::PlacementError::TemplateNotOnAnyNode(build)) => {
-                self.replicate_then_place(&build, &want).await?
+        let node_id = match (req.from_disk.is_empty(), req.node_id.is_empty()) {
+            // The disk is on one node, which imports it.
+            (false, false) if burrow_common::build::validate_name(&req.from_disk).is_ok() => {
+                req.node_id.clone()
             }
-            Err(err) => return Err(placement_status(err)),
+            (false, false) => {
+                return Err(Status::invalid_argument(format!(
+                    "from_disk {:?} names a file in the node's imports directory, not a path",
+                    req.from_disk
+                )));
+            }
+            (false, true) => {
+                return Err(Status::invalid_argument(
+                    "a disk import names the node holding the disk in node_id",
+                ));
+            }
+            (true, false) => {
+                return Err(Status::invalid_argument(
+                    "node_id is taken only with from_disk; other builds are placed",
+                ));
+            }
+            (true, true) => {
+                let want = build_placement(&req);
+                match self.0.nodes.place_for(&want) {
+                    Ok(node_id) => node_id,
+                    Err(crate::registry::PlacementError::TemplateNotOnAnyNode(build)) => {
+                        self.replicate_then_place(&build, &want).await?
+                    }
+                    Err(err) => return Err(placement_status(err)),
+                }
+            }
         };
         let mut client = self.node_client(&node_id).await?;
         let mut recorder = crate::builds::Recorder::begin(

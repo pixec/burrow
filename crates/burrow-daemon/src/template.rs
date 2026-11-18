@@ -279,9 +279,12 @@ pub async fn refuse_legacy(data_dir: &Path) -> Result<(), String> {
     names.sort();
     Err(format!(
         "{} holds templates in the layout before builds ({}), which this build does not \
-         support: pull or build them again, then remove the directory",
+         support: pull or build them again, then remove the directory; move a Windows \
+         template's {} into {} first and import it with `burrow templates import-disk`",
         legacy.display(),
-        names.join(", ")
+        names.join(", "),
+        crate::rootdisk::IMAGE,
+        data_dir.join(from_disk::IMPORTS_DIR).display()
     ))
 }
 
@@ -544,6 +547,171 @@ impl Built {
     }
 }
 
+/// Importing an installed Windows disk as a build.
+///
+/// The disk is one `scripts/windows` installed: a GPT disk with the system
+/// partition last and the agent installed as a service. The node takes it
+/// from its `imports` directory, never from an arbitrary path, clones it as
+/// the build's image (a reflink where the filesystem has them) and records
+/// the image config every sandbox of the build boots with. The disk is left
+/// where it was.
+pub mod from_disk {
+    use std::path::Path;
+
+    use tonic::Status;
+
+    use super::{Built, LogTx, event};
+    use burrow_proto::api::v1 as api;
+    use burrow_vmm::HypervisorExt as _;
+
+    /// Where a node takes disks to import from, under its data directory.
+    pub const IMPORTS_DIR: &str = "imports";
+
+    /// Checks a disk import's request and builds the image config it
+    /// records, before anything is read.
+    pub(crate) fn plan(
+        request: &api::BuildTemplateRequest,
+        hypervisor: &str,
+    ) -> Result<crate::oci::ImageEnvironment, Status> {
+        if !request.steps.is_empty()
+            || !request.from.is_empty()
+            || !request.from_image.is_empty()
+            || !request.kits.is_empty()
+            || !request.from_ipsw.is_empty()
+        {
+            return Err(Status::invalid_argument(
+                "a disk import takes no steps and no base; the disk is the whole image",
+            ));
+        }
+        if super::validate_name(&request.from_disk).is_err() {
+            return Err(Status::invalid_argument(format!(
+                "from_disk {:?} names a file in the node's {IMPORTS_DIR} directory, not a path",
+                request.from_disk
+            )));
+        }
+        let environment = crate::oci::ImageEnvironment {
+            cmd: vec!["cmd.exe".into()],
+            hypervisor: hypervisor.to_string(),
+            guest_os: burrow_vmm::GuestOs::Windows.as_str().to_string(),
+            tpm: request.is_tpm,
+            ..Default::default()
+        };
+        let (hypervisor, guest_os) = environment.machine()?;
+        if !hypervisor.capabilities().runs(guest_os) {
+            return Err(Status::failed_precondition(format!(
+                "{hypervisor} on this node cannot run {guest_os} guests"
+            )));
+        }
+        Ok(environment)
+    }
+
+    /// Imports `request.from_disk` and publishes it as a build.
+    pub(crate) async fn import(
+        manager: &crate::sandbox::SandboxManager,
+        data_dir: &Path,
+        request: &api::BuildTemplateRequest,
+        tx: &LogTx,
+    ) -> Result<Built, Status> {
+        let hypervisor = super::chosen_hypervisor(
+            manager,
+            &request.hypervisor,
+            burrow_vmm::Hypervisor::CloudHypervisor.as_str(),
+        )?;
+        let environment = plan(request, &hypervisor)?;
+        let dir = data_dir.join(IMPORTS_DIR);
+        let source = dir.join(&request.from_disk);
+        let meta = tokio::fs::symlink_metadata(&source).await.map_err(|_| {
+            Status::not_found(format!(
+                "no disk {} in {} on this node",
+                request.from_disk,
+                dir.display()
+            ))
+        })?;
+        if !meta.is_file() || meta.len() == 0 || !meta.len().is_multiple_of(512) {
+            return Err(Status::invalid_argument(format!(
+                "{} is not a raw disk image: it has to be a regular file of whole 512-byte \
+                 sectors",
+                source.display()
+            )));
+        }
+        let _ = tx.try_send(event(api::build_log::Event::Step(format!(
+            "importing {} ({} MiB)",
+            request.from_disk,
+            meta.len() / burrow_common::disk::MIB
+        ))));
+        let staging = super::staging_dir(data_dir, "disk").await?;
+        let imported = async {
+            crate::rootdisk::clone(&source, &staging.join(crate::rootdisk::IMAGE))
+                .await
+                .map_err(|err| Status::internal(format!("copying the disk: {err}")))?;
+            let manifest = super::manifest_for(&staging, &environment, String::new()).await?;
+            let key = super::publish(data_dir, &staging, &manifest).await?;
+            Ok::<_, Status>((key, manifest))
+        }
+        .await;
+        let (key, manifest) = match imported {
+            Ok(imported) => imported,
+            Err(err) => {
+                let _ = tokio::fs::remove_dir_all(&staging).await;
+                return Err(err);
+            }
+        };
+        Ok(Built {
+            name: request.name.clone(),
+            key,
+            manifest,
+            parent: String::new(),
+        })
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        fn request(disk: &str) -> api::BuildTemplateRequest {
+            api::BuildTemplateRequest {
+                name: "win11".into(),
+                from_disk: disk.into(),
+                is_tpm: true,
+                ..Default::default()
+            }
+        }
+
+        /// The import records a Windows Cloud Hypervisor image config with
+        /// the TPM asked for, and takes a file name, never a path or a base.
+        #[test]
+        fn a_disk_import_records_windows_and_takes_only_a_file_name() {
+            let windows = burrow_vmm::Hypervisor::CloudHypervisor
+                .capabilities()
+                .runs(burrow_vmm::GuestOs::Windows);
+            match plan(&request("win.raw"), "cloud-hypervisor") {
+                Ok(environment) => {
+                    assert!(windows);
+                    assert_eq!(environment.guest_os, "windows");
+                    assert_eq!(environment.hypervisor, "cloud-hypervisor");
+                    assert!(environment.tpm);
+                    assert_eq!(environment.cmd, ["cmd.exe"]);
+                }
+                Err(err) => {
+                    assert!(!windows);
+                    assert_eq!(err.code(), tonic::Code::FailedPrecondition);
+                }
+            }
+            for disk in ["../win.raw", "/root/win.raw", "a/b", ".hidden", ""] {
+                assert_eq!(
+                    plan(&request(disk), "cloud-hypervisor").unwrap_err().code(),
+                    tonic::Code::InvalidArgument,
+                    "{disk:?}"
+                );
+            }
+            let mut with_steps = request("win.raw");
+            with_steps.steps = vec![api::BuildStep { run: "ver".into() }];
+            assert!(plan(&with_steps, "cloud-hypervisor").is_err());
+            assert!(plan(&request("win.raw"), "firecracker").is_err());
+        }
+    }
+}
+
 /// Runs a build and streams its logs.
 ///
 /// Spawned as a task by the caller; every exit path removes the build sandbox,
@@ -562,6 +730,9 @@ pub async fn build(
     // A macOS template is a whole installed machine, not a rootfs, and is
     // neither captured nor warmed like one.
     let built = match crate::macnode::plan(&data_dir, &request).await {
+        Ok(None) if !request.from_disk.is_empty() => {
+            from_disk::import(&manager, &data_dir, &request, &tx).await
+        }
         Ok(Some(plan)) => {
             crate::macnode::build(&manager, &data_dir, &node_id, plan, &guest_binary, &tx).await
         }
