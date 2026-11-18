@@ -98,8 +98,7 @@ pub struct Manifest {
     pub placement: u64,
     pub state: String,
     pub template: String,
-    /// The build it was created from. Empty for one from before builds.
-    #[serde(default)]
+    /// The build it was created from.
     pub build_digest: String,
     pub vcpus: u32,
     pub mem_mib: u32,

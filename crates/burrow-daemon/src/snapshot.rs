@@ -93,8 +93,7 @@ pub struct Manifest {
     pub id: String,
     pub sandbox_id: String,
     pub template: String,
-    /// The build its sandbox ran. Empty for one taken before builds.
-    #[serde(default)]
+    /// The build its sandbox ran.
     pub build_digest: String,
     pub vcpus: u32,
     pub mem_mib: u32,

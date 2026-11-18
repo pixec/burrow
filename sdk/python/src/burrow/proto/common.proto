@@ -600,8 +600,7 @@ message Sandbox {
   // It has a TPM of its own, as its template asked when it was created.
   bool is_tpm = 42;
   // The build it was created from, `sha256:<hex>`: its identity, where
-  // `template` is what the caller named it by. Empty for a sandbox created
-  // before builds.
+  // `template` is what the caller named it by.
   string build_digest = 43;
 }
 
@@ -796,8 +795,7 @@ message Snapshot {
   int64 created_at_unix_ms = 18;
   // 0 means the snapshot does not expire.
   int64 expires_at_unix_ms = 19;
-  // The build its sandbox ran, `sha256:<hex>`. Empty for a snapshot taken
-  // before builds.
+  // The build its sandbox ran, `sha256:<hex>`.
   string build_digest = 22;
 }
 

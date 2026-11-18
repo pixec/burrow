@@ -194,8 +194,7 @@ pub struct Manifest {
     pub hypervisor: String,
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub guest_os: String,
-    /// The guest agent installed in it. Empty when not known, as for a
-    /// template migrated from before builds.
+    /// The guest agent installed in it. Empty when not known.
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub agent: String,
     #[serde(default, skip_serializing_if = "String::is_empty")]

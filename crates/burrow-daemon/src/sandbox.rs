@@ -1648,9 +1648,7 @@ pub struct RunningSandbox {
     /// Fixed for the sandbox's life, and held outside the record because the
     /// record is rebuilt from policy while these two never change.
     id: String,
-    /// The build it was created from, by directory key: empty for a sandbox
-    /// from before builds, or one taken up from the object store whose build
-    /// this node has never had.
+    /// The build it was created from, by directory key.
     build: String,
     /// Its template's, and fixed for its life the same way: every VM it ever
     /// runs, and every snapshot it leaves, is this hypervisor's.
@@ -3182,8 +3180,7 @@ impl RestoreSource<'_> {
         }
     }
 
-    /// The build the state was made from, by directory key; empty when it
-    /// predates builds.
+    /// The build the state was made from, by directory key.
     fn build(&self) -> String {
         match self {
             Self::Sandbox(source, _) => source.build().to_string(),
@@ -10927,8 +10924,8 @@ impl SandboxManager {
             return Ok(());
         }
         let template = sandbox.template_ref();
-        // A build never changes, so a sandbox whose build is not here, or
-        // that predates builds, already has the kernel it would take.
+        // A build never changes, so a sandbox whose build is not here already
+        // has the kernel it would take.
         let source = self
             .config
             .builds_dir()

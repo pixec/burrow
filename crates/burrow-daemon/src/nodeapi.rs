@@ -957,7 +957,7 @@ impl NodeService for NodeApi {
             (
                 crate::template::key_of(&previous.build_digest).map_err(|_| {
                     Status::failed_precondition(format!(
-                        "sandbox {id} predates builds; recreate it from a template"
+                        "sandbox {id} records no build; recreate it from a template"
                     ))
                 })?,
                 std::mem::take(&mut previous.template),
