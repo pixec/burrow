@@ -65,17 +65,14 @@ pub struct Meta {
     pub name: String,
     pub size_mib: u64,
     pub created_at_ms: i64,
-    #[serde(default)]
     pub labels: HashMap<String, String>,
     /// The guest OS whose filesystem the image holds, from the first
     /// writable mount: ext4 from a Linux guest, NTFS from a Windows one,
     /// HFS+ from a macOS one. Empty until then.
-    #[serde(default)]
     pub guest_os: String,
     /// Another node took the volume over while this one was away, so this
     /// copy is no longer the volume: never listed, claimed or uploaded, and
     /// removed once nothing holds it.
-    #[serde(default)]
     pub is_lost: bool,
 }
 

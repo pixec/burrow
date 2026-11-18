@@ -103,7 +103,6 @@ struct Packed {
     config: Value,
     state: Value,
     /// The highest host port the VMM had handed out, or 0 if none was seen.
-    #[serde(default)]
     last_host_port: u32,
 }
 
@@ -945,8 +944,10 @@ mod tests {
         }))
         .unwrap();
         assert_eq!(last_host_port(&packed), FIRST_HOST_PORT + 4);
-        let packed: Packed =
-            serde_json::from_value(json!({ "config": {}, "state": state })).unwrap();
+        let packed: Packed = serde_json::from_value(json!({
+            "config": {}, "state": state, "last_host_port": 0
+        }))
+        .unwrap();
         assert_eq!(last_host_port(&packed), FIRST_HOST_PORT + 1);
     }
 

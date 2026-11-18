@@ -104,7 +104,6 @@ pub struct Manifest {
     pub max_mem_mib: u32,
     /// The guest was shown the host's virtualization extensions, and its
     /// restore must be too.
-    #[serde(default)]
     pub is_nested_virt_enabled: bool,
     /// Unix milliseconds. Retention evicts the oldest first, and two
     /// snapshots taken inside one second would otherwise be ordered
@@ -136,28 +135,23 @@ pub struct Manifest {
     /// The kernel the guest ran, the only one its memory restores onto: the
     /// node's name for it, and its digest. The kernel goes to the store as a
     /// blob under its digest.
-    #[serde(default)]
     pub kernel: String,
     pub kernel_digest: String,
     /// The guest's OS, which says what it boots from; empty is Linux.
-    #[serde(default)]
     pub guest_os: String,
     /// The UEFI firmware a firmware guest booted, by digest, filled in when
     /// uploaded: the blob it is in the store under, as `kernel_digest` is for a
     /// kernel.
-    #[serde(default)]
     pub firmware_digest: String,
     /// The template's image by content, filled in when uploaded: chunks under
     /// `images/`, which the disk's index is a diff against.
     pub rootfs_digest: String,
     /// The inspection root its guest trusted, when it was inspected; see
     /// [`crate::durable::Manifest::inspection_root`].
-    #[serde(default)]
     pub inspection_root: String,
     /// The snapshot is a machine's disk and nothing of its memory: a macOS
     /// guest's, whose saved state restores only on the Mac that wrote it. A
     /// sandbox made from it boots cold.
-    #[serde(default)]
     pub is_disk_only: bool,
 }
 

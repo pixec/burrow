@@ -95,7 +95,6 @@ pub struct Manifest {
     pub node_id: String,
     /// The placement generation `node_id` held it at. A node never writes
     /// over a newer placement's manifest, and adopts only at a newer one.
-    #[serde(default)]
     pub placement: u64,
     pub state: String,
     pub template: String,
@@ -109,7 +108,6 @@ pub struct Manifest {
     pub boot_mem_mib: u32,
     pub max_mem_mib: u32,
     /// See [`crate::snapshot::Manifest::is_nested_virt_enabled`].
-    #[serde(default)]
     pub is_nested_virt_enabled: bool,
     pub is_systemd: bool,
     pub arch: String,
@@ -121,12 +119,10 @@ pub struct Manifest {
     pub cpu: crate::cpuid::Cpu,
     /// The kernel the guest ran, by the node's name for it and by digest:
     /// the only one its memory restores onto.
-    #[serde(default)]
     pub kernel: String,
     pub kernel_digest: String,
     /// The UEFI firmware a firmware guest booted, by digest: the blob it is in
     /// the store under, as `kernel_digest` is for a kernel.
-    #[serde(default)]
     pub firmware_digest: String,
     /// The template's image. The disk's index is a diff against it, by
     /// chunk, and it is in the store under `images/`.
@@ -138,25 +134,20 @@ pub struct Manifest {
     /// and keyed by where each sits in its record. The orchestrator only ever
     /// sees them redacted, so this is the one place an adopting node can get
     /// them back from.
-    #[serde(default)]
     pub secrets: std::collections::BTreeMap<String, String>,
     /// SHA-256 of the TLS inspection root the guest was told to trust, when
     /// it is inspected. Its processes hold that root in memory, so the state
     /// restores only on a node whose leaves chain to the same one. Empty when
     /// it is not inspected.
-    #[serde(default)]
     pub inspection_root: String,
     /// [`CHECKPOINT_DISK`] or [`CHECKPOINT_MEMORY`] for state uploaded while
     /// the sandbox ran; empty for a suspend's.
-    #[serde(default)]
     pub checkpoint: String,
     /// Unix milliseconds the checkpoint was captured at.
-    #[serde(default)]
     pub checkpoint_at_ms: i64,
     /// The generation of each writable volume a memory checkpoint was taken
     /// with. The guest's memory holds those volumes' caches, so it restores
     /// only over the same generations, and boots on its disk otherwise.
-    #[serde(default)]
     pub volumes: std::collections::BTreeMap<String, u64>,
     /// The template's environment as the sandbox ran with it: its systemd
     /// mode, guest OS, image environment and Kit. A node adopting the sandbox

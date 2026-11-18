@@ -67,9 +67,7 @@ pub struct Manifest {
     pub state: String,
     pub size_mib: u64,
     pub created_at_ms: i64,
-    #[serde(default)]
     pub labels: HashMap<String, String>,
-    #[serde(default)]
     pub guest_os: String,
     pub uploaded_at_ms: i64,
 }

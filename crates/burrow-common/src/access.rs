@@ -52,7 +52,6 @@ pub struct Claims {
     pub sub: String,
     pub ops: Vec<String>,
     /// Guest user every exec runs as; empty is root.
-    #[serde(default)]
     pub user: String,
     pub iat: u64,
     pub exp: u64,
