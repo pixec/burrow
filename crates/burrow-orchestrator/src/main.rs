@@ -395,14 +395,6 @@ impl NodeRegistry for NodeRegistryService {
         if let Some(info) = &req.info {
             burrow_common::tags::validate_labels(&info.labels)?;
         }
-        // A node that does not number its reports cannot have a delayed one
-        // told apart, and lists no generations to compare.
-        if req.report_seq == 0 {
-            return Err(Status::failed_precondition(
-                "this node's burrowd does not number its heartbeats; upgrade it along with the \
-                 orchestrator",
-            ));
-        }
         let mut status = req.status.unwrap_or_default();
         let volumes = std::mem::take(&mut status.volumes);
         self.0.nodes.touch(&req.node_id);

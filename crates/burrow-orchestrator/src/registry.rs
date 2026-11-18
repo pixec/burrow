@@ -2086,8 +2086,8 @@ mod tests {
         assert!(matches!(none, Err(PlacementError::NoNodeWithHypervisor(_))));
     }
 
-    /// A policy using a field an old node would drop is placed only on a node
-    /// that names it, and one using none of them anywhere.
+    /// A policy using a field a node's platform does not enforce is placed
+    /// only on a node that names it, and one using none of them anywhere.
     #[test]
     fn a_policy_is_placed_only_where_its_fields_are_enforced() {
         use burrow_common::features;

@@ -440,7 +440,7 @@ message HeartbeatRequest {
   repeated string swept_snapshots = 8;
   // Rises with every heartbeat the node sends, across its restarts. The
   // orchestrator ignores one no higher than the last it applied, so a delayed
-  // heartbeat cannot undo what a later one settled. 0 is refused.
+  // heartbeat cannot undo what a later one settled. 0 is never applied.
   uint64 report_seq = 7;
 }
 
