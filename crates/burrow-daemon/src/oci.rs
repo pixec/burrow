@@ -1172,7 +1172,7 @@ pub(crate) fn unpack_layer(layer: &Path, dest: &Path) -> std::io::Result<()> {
         // A pure-Rust decoder, so the cross-compiled node build needs no C
         // toolchain for a format most registries do not use yet.
         Compression::Zstd => {
-            let decoder = ruzstd::StreamingDecoder::new(file)
+            let decoder = ruzstd::decoding::StreamingDecoder::new(file)
                 .map_err(|err| std::io::Error::other(format!("zstd layer: {err}")))?;
             apply_entries(tar::Archive::new(Budgeted::new(decoder)), dest)
         }
