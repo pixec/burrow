@@ -15,6 +15,7 @@ burrow-net = { workspace = true }
 burrow-store = { workspace = true }
 uuid = { workspace = true }
 prost = { workspace = true }
+tonic-prost = { workspace = true }
 sha2 = { workspace = true }
 hex = { workspace = true }
 serde = { workspace = true }

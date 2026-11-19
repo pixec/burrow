@@ -3,7 +3,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     unsafe {
         std::env::set_var("PROTOC", protoc_bin_vendored::protoc_bin_path()?);
     }
-    tonic_build::configure().compile_protos(
+    tonic_prost_build::configure().compile_protos(
         &[
             "proto/common.proto",
             "proto/api.proto",

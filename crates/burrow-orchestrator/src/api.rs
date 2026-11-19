@@ -5686,7 +5686,7 @@ mod create_tests {
         fn call(&mut self, req: http::Request<tonic::body::Body>) -> Self::Future {
             let node = self.clone();
             Box::pin(async move {
-                let mut grpc = tonic::server::Grpc::new(tonic::codec::ProstCodec::default());
+                let mut grpc = tonic::server::Grpc::new(tonic_prost::ProstCodec::default());
                 Ok(grpc.unary(node, req).await)
             })
         }
@@ -5981,7 +5981,7 @@ mod relay_tests {
 
         fn call(&mut self, req: http::Request<tonic::body::Body>) -> Self::Future {
             Box::pin(async move {
-                let mut grpc = tonic::server::Grpc::new(tonic::codec::ProstCodec::default())
+                let mut grpc = tonic::server::Grpc::new(tonic_prost::ProstCodec::default())
                     .apply_max_message_size_config(
                         Some(burrow_proto::MAX_MESSAGE_BYTES),
                         Some(burrow_proto::MAX_MESSAGE_BYTES),

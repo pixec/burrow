@@ -294,7 +294,7 @@ mod tests {
             Box::pin(async move {
                 macro_rules! serve {
                     ($service:expr) => {
-                        tonic::server::Grpc::new(tonic::codec::ProstCodec::default())
+                        tonic::server::Grpc::new(tonic_prost::ProstCodec::default())
                             .unary($service, req)
                             .await
                     };

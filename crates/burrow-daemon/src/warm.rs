@@ -1969,7 +1969,7 @@ mod shape_tests {
             }
             let ops = self.0.clone();
             Box::pin(async move {
-                let mut grpc = tonic::server::Grpc::new(tonic::codec::ProstCodec::default());
+                let mut grpc = tonic::server::Grpc::new(tonic_prost::ProstCodec::default());
                 Ok(grpc.unary(RootDisk(ops), req).await)
             })
         }

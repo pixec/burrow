@@ -47,9 +47,10 @@ tailcat-rs = { git = "https://github.com/pixec/tailcat-rs", rev = "641ba434e452b
 tokio = { version = "1", features = ["full"] }
 tokio-stream = "0.1"
 tokio-util = { version = "0.7", features = ["io"] }
-tonic = "0.13"
-prost = "0.13"
-tonic-build = "0.13"
+tonic = "0.14"
+prost = "0.14"
+tonic-prost = "0.14"
+tonic-prost-build = "0.14"
 protoc-bin-vendored = "3"
 
 hyper = { version = "1", features = ["client", "http1"] }
