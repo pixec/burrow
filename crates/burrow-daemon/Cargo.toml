@@ -39,6 +39,7 @@ base64 = { workspace = true }
 ruzstd = { workspace = true }
 zstd = { workspace = true }
 reqwest = { workspace = true }
+rustls = { workspace = true }
 serde = { workspace = true }
 futures = { workspace = true }
 flate2 = { workspace = true }

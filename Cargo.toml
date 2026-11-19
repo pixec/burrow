@@ -104,7 +104,7 @@ rustls = { version = "0.23", default-features = false, features = ["ring", "std"
 rustls-pemfile = "2"
 ring = "0.17"
 webpki-roots = "0.26"
-reqwest = { version = "0.12", default-features = false, features = ["rustls-tls-native-roots", "json", "stream"] }
+reqwest = { version = "0.13", default-features = false, features = ["rustls-no-provider", "json", "stream", "form", "query"] }
 flate2 = "1"
 memchr = "2"
 tar = "0.4"

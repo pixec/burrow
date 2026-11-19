@@ -482,6 +482,12 @@ pub fn is_usable_bundle_path(path: &str) -> bool {
 /// password is presented. See [`Registry::fetch_token`].
 const KNOWN_TOKEN_SERVICES: &[(&str, &str)] = &[(DEFAULT_REGISTRY, "auth.docker.io")];
 
+/// reqwest takes its TLS provider from the process default.
+pub(crate) fn http_client() -> reqwest::ClientBuilder {
+    let _ = rustls::crypto::ring::default_provider().install_default();
+    reqwest::Client::builder()
+}
+
 /// A registry client that carries its bearer token between requests.
 struct Registry {
     http: reqwest::Client,
@@ -500,7 +506,7 @@ impl Registry {
         credential: Option<auth::Credential>,
         insecure: Vec<String>,
     ) -> Result<Self, Status> {
-        let http = reqwest::Client::builder()
+        let http = http_client()
             .user_agent(concat!("burrow/", env!("CARGO_PKG_VERSION")))
             // Layers are large and registries can be slow, but a stalled pull
             // must not hang a build forever. The read timeout is per chunk

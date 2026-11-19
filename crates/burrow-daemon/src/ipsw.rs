@@ -129,7 +129,7 @@ static FETCHING: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 /// its size and the catalogue's checksum before it takes its name. An image
 /// already there was checked when it got it, and is used as it is.
 pub async fn fetch_latest(data_dir: &Path, progress: impl Fn(String)) -> Result<PathBuf, Status> {
-    let client = reqwest::Client::builder()
+    let client = crate::oci::http_client()
         .connect_timeout(Duration::from_secs(30))
         .read_timeout(Duration::from_secs(120))
         .build()
