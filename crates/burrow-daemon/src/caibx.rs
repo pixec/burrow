@@ -122,7 +122,9 @@ pub fn decode(bytes: &[u8]) -> Result<ImageIndex, String> {
     let mut chunks = BTreeMap::new();
     let mut size = 0;
     for (n, item) in items[..count * ITEM_SIZE]
-        .chunks_exact(ITEM_SIZE)
+        .as_chunks::<ITEM_SIZE>()
+        .0
+        .iter()
         .enumerate()
     {
         let n = n as u64;

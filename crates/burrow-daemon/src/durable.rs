@@ -1261,8 +1261,10 @@ async fn read_offsets(path: &Path) -> Vec<u64> {
     tokio::fs::read(path)
         .await
         .unwrap_or_default()
-        .chunks_exact(8)
-        .map(|chunk| u64::from_le_bytes(chunk.try_into().expect("8 bytes")))
+        .as_chunks::<8>()
+        .0
+        .iter()
+        .map(|chunk| u64::from_le_bytes(*chunk))
         .collect()
 }
 

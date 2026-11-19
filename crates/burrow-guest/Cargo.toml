@@ -14,7 +14,6 @@ tokio = { workspace = true }
 tokio-stream = { workspace = true }
 tonic = { workspace = true }
 futures = { workspace = true }
-async-stream = { workspace = true }
 anyhow = { workspace = true }
 sha2 = { workspace = true }
 serde_json = { workspace = true }
@@ -27,6 +26,7 @@ hyper-util = { workspace = true }
 tower = { workspace = true }
 
 [target.'cfg(target_os = "linux")'.dependencies]
+async-stream = { workspace = true }
 tar = { workspace = true }
 tokio-vsock = { workspace = true }
 nix = { workspace = true }
@@ -35,6 +35,7 @@ netlink-packet-route = { workspace = true }
 sha-crypt = { workspace = true }
 
 [target.'cfg(target_os = "macos")'.dependencies]
+async-stream = { workspace = true }
 tar = { workspace = true }
 nix = { workspace = true }
 base64 = { workspace = true }

@@ -18,11 +18,6 @@ tracing = { workspace = true }
 nix = { workspace = true, features = ["sched", "user"] }
 libc = { workspace = true }
 
-# The page-fault handler is Linux-only; keeping it off the default target lets
-# `cargo build` still work on a macOS dev machine.
-[target.'cfg(target_os = "linux")'.dependencies]
-userfaultfd = { workspace = true }
-
 # Virtualization.framework, for macOS guests on a Mac node.
 [target.'cfg(target_os = "macos")'.dependencies]
 objc2 = "0.6"

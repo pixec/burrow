@@ -25,7 +25,8 @@ impl AsyncPipe {
         if unsafe { nix::libc::fcntl(raw, nix::libc::F_SETFL, flags | nix::libc::O_NONBLOCK) } < 0 {
             return Err(io::Error::last_os_error());
         }
-        Ok(Self(AsyncFd::new(fd)?))
+        // SAFETY: AsyncFd takes ownership of fd.
+        Ok(Self(unsafe { AsyncFd::register(fd)? }))
     }
 
     pub fn raw_fd(&self) -> std::os::fd::RawFd {

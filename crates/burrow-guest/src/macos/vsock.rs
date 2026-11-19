@@ -113,7 +113,8 @@ impl Listener {
         let flags = check(unsafe { libc::fcntl(fd.as_raw_fd(), libc::F_GETFL) })?;
         // SAFETY: as above.
         check(unsafe { libc::fcntl(fd.as_raw_fd(), libc::F_SETFL, flags | libc::O_NONBLOCK) })?;
-        Ok(Self(AsyncFd::new(fd)?))
+        // SAFETY: the listener owns fd and AsyncFd takes it.
+        Ok(Self(unsafe { AsyncFd::register(fd)? }))
     }
 
     /// The next connection and the cid it came from.

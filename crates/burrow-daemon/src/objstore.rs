@@ -709,7 +709,7 @@ pub(crate) mod fake {
                 && bucket.is_none()
                 && faults
                     .slow_downs
-                    .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |n| n.checked_sub(1))
+                    .try_update(Ordering::Relaxed, Ordering::Relaxed, |n| n.checked_sub(1))
                     .is_ok();
             if method == "PUT" {
                 let now = faults.in_flight.fetch_add(1, Ordering::Relaxed) + 1;

@@ -698,8 +698,10 @@ fn read_plan(path: &Path) -> Vec<u64> {
         return Vec::new();
     };
     bytes
-        .chunks_exact(8)
-        .map(|chunk| u64::from_le_bytes(chunk.try_into().expect("8 bytes")))
+        .as_chunks::<8>()
+        .0
+        .iter()
+        .map(|chunk| u64::from_le_bytes(*chunk))
         .collect()
 }
 

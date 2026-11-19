@@ -255,10 +255,10 @@ fn start(
     if pidfd >= 0 {
         // SAFETY: a descriptor CLONE_PIDFD or pidfd_open gave this process.
         let pidfd = unsafe { OwnedFd::from_raw_fd(pidfd) };
-        child.pidfd = Some(tokio::io::unix::AsyncFd::with_interest(
-            pidfd,
-            tokio::io::Interest::READABLE,
-        )?);
+        // SAFETY: AsyncFd takes ownership of pidfd.
+        child.pidfd = Some(unsafe {
+            tokio::io::unix::AsyncFd::register_with_interest(pidfd, tokio::io::Interest::READABLE)?
+        });
     }
     Ok((
         Spawned {

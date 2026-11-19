@@ -299,10 +299,9 @@ mod linux {
         // calls on memory prepared above before it execs.
         let child = match unsafe { fork() }? {
             ForkResult::Child => {
-                let err = confine(plan).and_then(|()| {
+                let err: std::io::Result<()> = confine(plan).and_then(|()| {
                     SigSet::empty().thread_set_mask()?;
-                    fexecve(&program, &argv, &[] as &[CString])?;
-                    Ok(())
+                    match fexecve(&program, &argv, &[] as &[CString])? {}
                 });
                 eprintln!(
                     "cloud-hypervisor jail: {}",

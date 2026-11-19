@@ -166,8 +166,10 @@ pub fn read_map(file: &File) -> io::Result<Option<PageMap>> {
     let map = PageMap {
         pages,
         words: bytes
-            .chunks_exact(8)
-            .map(|word| u64::from_le_bytes(word.try_into().expect("8 bytes")))
+            .as_chunks::<8>()
+            .0
+            .iter()
+            .map(|word| u64::from_le_bytes(*word))
             .collect(),
     };
     if map.checksum() != checksum {
