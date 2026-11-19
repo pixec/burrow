@@ -14381,7 +14381,9 @@ pub(crate) mod tests {
 
         manager.destroy_unlisted(&[unlisted(3)]);
         for _ in 0..100 {
-            if manager.list().await.is_empty() {
+            if manager.list().await.is_empty()
+                && manager.store.list_sandboxes().await.unwrap().is_empty()
+            {
                 break;
             }
             tokio::time::sleep(std::time::Duration::from_millis(20)).await;
