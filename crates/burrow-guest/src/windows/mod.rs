@@ -28,6 +28,8 @@ mod service;
 #[cfg(windows)]
 mod token;
 #[cfg(windows)]
+mod tpm;
+#[cfg(windows)]
 pub mod users;
 pub mod volumes;
 #[cfg(windows)]

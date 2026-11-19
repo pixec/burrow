@@ -62,6 +62,15 @@ pub fn set_dword(key: &str, value: &str, data: u32) -> Result<(), Status> {
     Ok(())
 }
 
+/// Deletes a value under HKEY_LOCAL_MACHINE; one that is not there is
+/// already gone.
+pub fn delete_value(key: &str, value: &str) {
+    use windows_sys::Win32::System::Registry::{HKEY_LOCAL_MACHINE, RegDeleteKeyValueW};
+    let (key_w, value_w) = (win::wide(key), win::wide(value));
+    // SAFETY: both names are NUL-terminated.
+    unsafe { RegDeleteKeyValueW(HKEY_LOCAL_MACHINE, key_w.as_ptr(), value_w.as_ptr()) };
+}
+
 fn netsh(args: &[&str]) -> Result<(), Status> {
     let output = std::process::Command::new("netsh")
         .args(args)

@@ -161,6 +161,25 @@ save its volatile state, which a `start` (memory restore) resumes from, while
 a cold boot drops it. Whether a sandbox has a TPM is fixed at create, on its
 record.
 
+A template keeps the TPM ownership Windows recorded during the install:
+the SRK's hash and the owner and lockout authorizations under
+`HKLM\SYSTEM\CurrentControlSet\Services\TPM\WMI\Admin`. Each sandbox's TPM
+is new, so Windows has to clear it, take ownership and create an SRK again
+(System log, TPM-WMI 519 "SRK has changed or is not present" and 1027), and
+the Platform Crypto Provider only uses that SRK from the next boot. Left to
+itself this went wrong two ways: `Tpm-Maintenance` failed with
+`TBS_E_INTERNAL_ERROR` (0x80284001) before noticing the new TPM, and kept
+failing against the stale record, which a warm snapshot then gave every
+warm create; or it provisioned on the boot after the computer-name restart,
+with no boot after it. Either way TPM-backed keys failed
+(`NTE_PROV_TYPE_NOT_DEF`, `TPM 2.0: The Handle is not correct`) until a
+restart. So on a cold boot's handshake the agent waits for TPM Base
+Services, reads the SRK's persistent handle (`TPM2_ReadPublic` of
+0x81000001) and, when it is missing, deletes the stale record, runs
+`Tpm-Maintenance` until the SRK exists (up to 90 s) and restarts the guest,
+together with the computer-name restart where there is one. A warm build
+goes through the same handshake, so its snapshot holds a provisioned TPM.
+
 Copies carry the TPM. Forks, snapshots, checkpoints (disk and memory),
 stored state, moves and warm snapshots pack swtpm's state files
 (`tpm2-00.permall`, and `tpm2-00.volatilestate` when there is one; the same

@@ -65,8 +65,14 @@ pub async fn handshake(
     crate::windows::volumes::mount(&req.volumes).await?;
 
     // A cold boot restarts to take its name; a restored guest takes it at
-    // its next boot rather than lose the state it was restored for.
-    let is_restarting = match req.hostname.as_str() {
+    // its next boot rather than lose the state it was restored for. A TPM
+    // provisioned on this boot needs the same restart.
+    let is_provisioned = !req.is_restored
+        && !crate::windows::machine::is_restarting()
+        && tokio::task::spawn_blocking(crate::windows::tpm::provision)
+            .await
+            .unwrap_or(false);
+    let is_renamed = match req.hostname.as_str() {
         _ if crate::windows::machine::is_restarting() => true,
         "" => false,
         name => match crate::windows::machine::rename(name) {
@@ -77,6 +83,7 @@ pub async fn handshake(
             }
         },
     };
+    let is_restarting = is_renamed || is_provisioned;
     if is_restarting && !crate::windows::machine::is_restarting() {
         crate::windows::machine::restart_soon();
     }
