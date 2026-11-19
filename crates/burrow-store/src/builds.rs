@@ -4,6 +4,8 @@
 //! append-only log: a tag resolves to its newest assignment whose build is
 //! ready, so a build that is still running or failed never moves one.
 
+use sqlx::AssertSqlSafe;
+
 use super::{Db, Result, Store};
 
 pub const BUILDING: &str = "building";
@@ -322,9 +324,9 @@ impl Store {
     }
 
     pub async fn get_build(&self, digest: &str) -> Result<Option<BuildRow>> {
-        let row: Option<BuildRaw> = on_pool!(self, pool => sqlx::query_as(&format!(
+        let row: Option<BuildRaw> = on_pool!(self, pool => sqlx::query_as(AssertSqlSafe(format!(
             "SELECT {BUILD_COLUMNS} FROM template_builds WHERE digest=$1"
-        ))
+        )))
         .bind(digest)
         .fetch_optional(pool)
         .await)?;
@@ -333,11 +335,11 @@ impl Store {
 
     /// Builds of `template`, or of every template, oldest first.
     pub async fn list_builds(&self, template: Option<&str>) -> Result<Vec<BuildRow>> {
-        let rows: Vec<BuildRaw> = on_pool!(self, pool => sqlx::query_as(&format!(
+        let rows: Vec<BuildRaw> = on_pool!(self, pool => sqlx::query_as(AssertSqlSafe(format!(
             "SELECT {BUILD_COLUMNS} FROM template_builds
              WHERE $1 = '' OR template = $1
              ORDER BY created_at, id"
-        ))
+        )))
         .bind(template.unwrap_or_default())
         .fetch_all(pool)
         .await)?;

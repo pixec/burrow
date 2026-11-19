@@ -6,7 +6,7 @@ license.workspace = true
 
 [dependencies]
 burrow-proto = { workspace = true }
-sqlx = { version = "0.8", default-features = false, features = ["runtime-tokio", "tls-rustls-ring-webpki", "sqlite", "postgres", "migrate", "macros"] }
+sqlx = { version = "0.9", default-features = false, features = ["runtime-tokio", "tls-rustls-ring-webpki", "sqlite", "postgres", "migrate", "macros"] }
 serde = { workspace = true }
 serde_json = { workspace = true }
 thiserror = { workspace = true }

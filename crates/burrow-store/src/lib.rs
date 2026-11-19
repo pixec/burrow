@@ -19,6 +19,7 @@ use std::path::Path;
 use std::str::FromStr as _;
 
 use serde::{Deserialize, Serialize};
+use sqlx::AssertSqlSafe;
 use sqlx::postgres::{PgPool, PgPoolOptions};
 use sqlx::sqlite::{
     SqliteConnectOptions, SqliteJournalMode, SqlitePool, SqlitePoolOptions, SqliteSynchronous,
@@ -769,8 +770,7 @@ impl Store {
              FROM sessions WHERE sandbox_id=$1 ORDER BY started_at_ms DESC, {} DESC",
             self.session_order()
         );
-        let rows: Vec<(String, String, i64, i64, i64, i64)> =
-            on_pool!(self, pool => sqlx::query_as(&sql).bind(sandbox_id).fetch_all(pool).await)?;
+        let rows: Vec<(String, String, i64, i64, i64, i64)> = on_pool!(self, pool => sqlx::query_as(AssertSqlSafe(&*sql)).bind(sandbox_id).fetch_all(pool).await)?;
         Ok(rows
             .into_iter()
             .map(
@@ -803,7 +803,7 @@ impl Store {
              )",
             self.session_order()
         );
-        let done = on_pool!(self, pool => sqlx::query(&sql)
+        let done = on_pool!(self, pool => sqlx::query(AssertSqlSafe(&*sql))
             .bind(sandbox_id)
             .bind(keep as i64)
             .execute(pool)
@@ -869,7 +869,7 @@ impl Store {
         }
         sql.push_str(" ORDER BY seq LIMIT $2");
         let rows: Vec<EventRaw> = on_pool!(self, pool => {
-            let mut query = sqlx::query_as(&sql).bind(after_seq as i64).bind(limit as i64);
+            let mut query = sqlx::query_as(AssertSqlSafe(&*sql)).bind(after_seq as i64).bind(limit as i64);
             if let Some(id) = sandbox_id {
                 query = query.bind(id);
             }
@@ -889,7 +889,7 @@ impl Store {
             "SELECT {EVENT_COLUMNS} FROM events WHERE node_id=$1 AND node_seq > $2
              ORDER BY node_seq LIMIT $3"
         );
-        let rows: Vec<EventRaw> = on_pool!(self, pool => sqlx::query_as(&sql)
+        let rows: Vec<EventRaw> = on_pool!(self, pool => sqlx::query_as(AssertSqlSafe(&*sql))
             .bind(node_id)
             .bind(after_node_seq as i64)
             .bind(limit as i64)
@@ -903,7 +903,7 @@ impl Store {
         let sql = format!(
             "SELECT {EVENT_COLUMNS} FROM events WHERE sandbox_id=$1 ORDER BY seq DESC LIMIT 1"
         );
-        let row: Option<EventRaw> = on_pool!(self, pool => sqlx::query_as(&sql)
+        let row: Option<EventRaw> = on_pool!(self, pool => sqlx::query_as(AssertSqlSafe(&*sql))
             .bind(sandbox_id)
             .fetch_optional(pool)
             .await)?;
@@ -991,7 +991,7 @@ impl Store {
             i64,
         );
         let rows: Vec<Raw> = on_pool!(self, pool => {
-            let mut query = sqlx::query_as(&sql).bind(limit);
+            let mut query = sqlx::query_as(AssertSqlSafe(&*sql)).bind(limit);
             if let Some(id) = &filter.sandbox_id {
                 query = query.bind(id);
             }
@@ -1163,9 +1163,9 @@ impl Store {
     pub async fn remove_placement(&self, id: &str) -> Result<Option<PlacementRow>> {
         let row: Option<PlacementRaw> = on_pool!(self, pool => {
             let mut tx = pool.begin().await?;
-            let row = sqlx::query_as(&format!(
+            let row = sqlx::query_as(AssertSqlSafe(format!(
                 "DELETE FROM placements WHERE id=$1 RETURNING {PLACEMENT_COLUMNS}"
-            ))
+            )))
             .bind(id)
             .fetch_optional(&mut *tx)
             .await?;
@@ -1212,9 +1212,9 @@ impl Store {
     }
 
     pub async fn get_placement(&self, id: &str) -> Result<Option<PlacementRow>> {
-        let row: Option<PlacementRaw> = on_pool!(self, pool => sqlx::query_as(&format!(
+        let row: Option<PlacementRaw> = on_pool!(self, pool => sqlx::query_as(AssertSqlSafe(format!(
             "SELECT {PLACEMENT_COLUMNS} FROM placements WHERE id=$1"
-        ))
+        )))
         .bind(id)
         .fetch_optional(pool)
         .await)?;
@@ -1270,7 +1270,7 @@ impl Store {
         let removal = on_pool!(self, pool => {
             let mut tx = pool.begin().await?;
             let held: Option<(String,)> =
-                sqlx::query_as(&format!("SELECT name FROM volumes WHERE name=$1{lock}"))
+                sqlx::query_as(AssertSqlSafe(format!("SELECT name FROM volumes WHERE name=$1{lock}")))
                     .bind(name)
                     .fetch_optional(&mut *tx)
                     .await?;
@@ -1309,7 +1309,7 @@ impl Store {
         let sql = format!(
             "INSERT INTO {table} ({key}, at_ms) VALUES ($1, $2) ON CONFLICT ({key}) DO NOTHING"
         );
-        let done = on_pool!(self, pool => sqlx::query(&sql)
+        let done = on_pool!(self, pool => sqlx::query(AssertSqlSafe(&*sql))
             .bind(value)
             .bind(at_ms)
             .execute(pool)
@@ -1320,7 +1320,7 @@ impl Store {
 
     async fn remove_named(&self, table: &str, key: &str, value: &str) -> Result<bool> {
         let sql = format!("DELETE FROM {table} WHERE {key}=$1");
-        let done = on_pool!(self, pool => sqlx::query(&sql)
+        let done = on_pool!(self, pool => sqlx::query(AssertSqlSafe(&*sql))
             .bind(value)
             .execute(pool)
             .await
@@ -1334,7 +1334,7 @@ impl Store {
         key: &str,
     ) -> Result<std::collections::HashSet<String>> {
         let sql = format!("SELECT {key} FROM {table}");
-        let rows: Vec<(String,)> = on_pool!(self, pool => sqlx::query_as(&sql)
+        let rows: Vec<(String,)> = on_pool!(self, pool => sqlx::query_as(AssertSqlSafe(&*sql))
             .fetch_all(pool)
             .await)?;
         Ok(rows.into_iter().map(|(value,)| value).collect())
@@ -1368,7 +1368,7 @@ impl Store {
                 }
                 None => Vec::new(),
             };
-            let mut query = sqlx::query_as::<_, PlacementRaw>(&rows_sql);
+            let mut query = sqlx::query_as::<_, PlacementRaw>(AssertSqlSafe(&*rows_sql));
             if let Some(since) = since_ms {
                 query = query.bind(since);
             }
@@ -1394,9 +1394,9 @@ impl Store {
     }
 
     pub async fn list_placements(&self) -> Result<Vec<PlacementRow>> {
-        let rows: Vec<PlacementRaw> = on_pool!(self, pool => sqlx::query_as(&format!(
+        let rows: Vec<PlacementRaw> = on_pool!(self, pool => sqlx::query_as(AssertSqlSafe(format!(
             "SELECT {PLACEMENT_COLUMNS} FROM placements ORDER BY id"
-        ))
+        )))
         .fetch_all(pool)
         .await)?;
         Ok(rows.into_iter().map(placement_row).collect())
@@ -1512,13 +1512,13 @@ impl Store {
                 }
                 sqlx::query(fill).bind(&listing).execute(&mut *tx).await?;
 
-                let replaced: Vec<PlacementRaw> = sqlx::query_as(&format!(
+                let replaced: Vec<PlacementRaw> = sqlx::query_as(AssertSqlSafe(format!(
                     "UPDATE placements SET node_id=$1, missed=0, version=placements.version + 1
                      FROM reported r
                      WHERE placements.node_id='' AND r.id = placements.id
                        AND r.generation = placements.generation
                      RETURNING {PLACEMENT_COLUMNS_OF_PLACEMENTS}"
-                ))
+                )))
                 .bind(&node.id)
                 .fetch_all(&mut *tx)
                 .await?;
@@ -1550,10 +1550,10 @@ impl Store {
                 .execute(&mut *tx)
                 .await?;
 
-                let missing: Vec<PlacementRaw> = sqlx::query_as(&format!(
+                let missing: Vec<PlacementRaw> = sqlx::query_as(AssertSqlSafe(format!(
                     "SELECT {PLACEMENT_COLUMNS} FROM placements
                      WHERE node_id=$1 AND missed >= {LOST_AFTER_MISSES} ORDER BY id{lock}"
-                ))
+                )))
                 .bind(&node.id)
                 .fetch_all(&mut *tx)
                 .await?;
@@ -1586,12 +1586,12 @@ impl Store {
                 .bind(report.usage_before_ms)
                 .execute(&mut *tx)
                 .await?;
-                let stale: Vec<PlacementRaw> = sqlx::query_as(&format!(
+                let stale: Vec<PlacementRaw> = sqlx::query_as(AssertSqlSafe(format!(
                     "SELECT {PLACEMENT_COLUMNS_OF_P} FROM placements p
                      JOIN reported r ON r.id = p.id AND r.generation = p.generation
                      WHERE p.node_id=$1 AND r.in_flight = 0 AND p.report_hash <> r.hash
                      ORDER BY p.id"
-                ))
+                )))
                 .bind(&node.id)
                 .fetch_all(&mut *tx)
                 .await?;
@@ -1637,7 +1637,7 @@ impl Store {
                            AND placements.generation = v.column3 AND placements.node_id = $1
                          RETURNING placements.id"
                     );
-                    let mut query = sqlx::query_as::<_, (String,)>(&sql).bind(&node.id);
+                    let mut query = sqlx::query_as::<_, (String,)>(AssertSqlSafe(&*sql)).bind(&node.id);
                     for (row, hash) in rows.iter().zip(hashes) {
                         query = query
                             .bind(&row.id)
@@ -1671,11 +1671,11 @@ impl Store {
                         .execute(&mut *tx)
                         .await?;
                 }
-                let unnamed_snapshots: Vec<(String,)> = sqlx::query_as(&unnamed_snapshots)
+                let unnamed_snapshots: Vec<(String,)> = sqlx::query_as(AssertSqlSafe(&*unnamed_snapshots))
                     .bind(&snapshots)
                     .fetch_all(&mut *tx)
                     .await?;
-                let unnamed_volumes: Vec<(String,)> = sqlx::query_as(&unnamed_volumes)
+                let unnamed_volumes: Vec<(String,)> = sqlx::query_as(AssertSqlSafe(&*unnamed_volumes))
                     .bind(&volumes)
                     .fetch_all(&mut *tx)
                     .await?;
@@ -2045,9 +2045,9 @@ impl Store {
             .await?
             .rows_affected();
             if done == 1 {
-                let rows: Vec<PlacementRaw> = sqlx::query_as(&format!(
+                let rows: Vec<PlacementRaw> = sqlx::query_as(AssertSqlSafe(format!(
                     "SELECT {PLACEMENT_COLUMNS} FROM placements WHERE node_id=$1 ORDER BY id{lock}"
-                ))
+                )))
                 .bind(id)
                 .fetch_all(&mut *tx)
                 .await?;
@@ -2432,7 +2432,7 @@ impl Store {
 
     pub async fn open_usage(&self, sandbox_id: &str) -> Result<Option<OpenUsageRow>> {
         let sql = format!("SELECT {OPEN_USAGE_COLUMNS} FROM usage_open WHERE sandbox_id=$1");
-        let row: Option<OpenUsageRaw> = on_pool!(self, pool => sqlx::query_as(&sql)
+        let row: Option<OpenUsageRaw> = on_pool!(self, pool => sqlx::query_as(AssertSqlSafe(&*sql))
             .bind(sandbox_id)
             .fetch_optional(pool)
             .await)?;
@@ -2447,7 +2447,7 @@ impl Store {
         }
         sql.push_str(" ORDER BY sandbox_id");
         let rows: Vec<OpenUsageRaw> = on_pool!(self, pool => {
-            let mut query = sqlx::query_as(&sql);
+            let mut query = sqlx::query_as(AssertSqlSafe(&*sql));
             if let Some(node_id) = node_id {
                 query = query.bind(node_id);
             }
@@ -2495,7 +2495,7 @@ impl Store {
              WHERE usage_open.sandbox_id = x.id AND usage_open.node_id=$1
                AND usage_open.seen_at < $2 AND usage_open.started_at <= $2"
         );
-        on_pool!(self, pool => sqlx::query(&sql)
+        on_pool!(self, pool => sqlx::query(AssertSqlSafe(&*sql))
             .bind(node_id)
             .bind(at_ms)
             .bind(&totals)
@@ -2644,7 +2644,7 @@ impl Store {
         }
         sql.push_str(" ORDER BY id LIMIT $2");
         let rows: Vec<UsageRaw> = on_pool!(self, pool => {
-            let mut query = sqlx::query_as(&sql)
+            let mut query = sqlx::query_as(AssertSqlSafe(&*sql))
                 .bind(filter.after_id as i64)
                 .bind(filter.limit as i64);
             if let Some(from) = filter.from_ms {
