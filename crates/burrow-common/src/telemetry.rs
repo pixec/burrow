@@ -22,7 +22,7 @@ use tracing_subscriber::util::SubscriberInitExt;
 pub struct Telemetry {
     service_name: &'static str,
     endpoint: Option<String>,
-    provider: Option<opentelemetry_sdk::trace::TracerProvider>,
+    provider: Option<opentelemetry_sdk::trace::SdkTracerProvider>,
     meters: Option<opentelemetry_sdk::metrics::SdkMeterProvider>,
 }
 
@@ -45,12 +45,9 @@ impl Telemetry {
                 return;
             }
         };
-        let reader = opentelemetry_sdk::metrics::PeriodicReader::builder(
-            exporter,
-            opentelemetry_sdk::runtime::Tokio,
-        )
-        .with_interval(interval)
-        .build();
+        let reader = opentelemetry_sdk::metrics::PeriodicReader::builder(exporter)
+            .with_interval(interval)
+            .build();
         let meters = opentelemetry_sdk::metrics::SdkMeterProvider::builder()
             .with_reader(reader)
             .with_resource(resource(self.service_name))
@@ -77,10 +74,12 @@ impl Telemetry {
 }
 
 fn resource(service_name: &'static str) -> Resource {
-    Resource::new([
-        KeyValue::new("service.name", service_name),
-        KeyValue::new("service.version", env!("CARGO_PKG_VERSION")),
-    ])
+    Resource::builder_empty()
+        .with_attributes([
+            KeyValue::new("service.name", service_name),
+            KeyValue::new("service.version", env!("CARGO_PKG_VERSION")),
+        ])
+        .build()
 }
 
 /// Installs the global subscriber.
@@ -148,16 +147,16 @@ pub fn init(service_name: &'static str, otlp_endpoint: Option<&str>) -> Telemetr
 fn build_provider(
     service_name: &'static str,
     endpoint: &str,
-) -> Result<opentelemetry_sdk::trace::TracerProvider, Box<dyn std::error::Error>> {
+) -> Result<opentelemetry_sdk::trace::SdkTracerProvider, Box<dyn std::error::Error>> {
     let exporter = opentelemetry_otlp::SpanExporter::builder()
         .with_tonic()
         .with_endpoint(endpoint)
         .build()?;
 
-    Ok(opentelemetry_sdk::trace::TracerProvider::builder()
+    Ok(opentelemetry_sdk::trace::SdkTracerProvider::builder()
         // Batched, so an unreachable collector backs up in a bounded queue
         // instead of blocking whatever emitted the span.
-        .with_batch_exporter(exporter, opentelemetry_sdk::runtime::Tokio)
+        .with_batch_exporter(exporter)
         .with_resource(resource(service_name))
         .build())
 }
@@ -220,6 +219,6 @@ pub mod propagation {
         let parent = opentelemetry::global::get_text_map_propagator(|propagator| {
             propagator.extract(&MetadataExtractor(metadata))
         });
-        tracing::Span::current().set_parent(parent);
+        let _ = tracing::Span::current().set_parent(parent);
     }
 }
