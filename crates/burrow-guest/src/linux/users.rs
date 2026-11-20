@@ -386,24 +386,17 @@ pub async fn set_password(
     })
 }
 
-/// `password` as a `$6$` SHA-512 crypt string with a fresh salt.
+/// `password` as a `$6$` SHA-512 crypt string with a fresh 16-character salt.
 fn crypt(password: &str) -> Result<String, Status> {
-    const SALT: &[u8] = b"./0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz";
-    let mut bytes = [0u8; 16];
+    use sha_crypt::PasswordHasher as _;
+    let mut salt = [0u8; 12];
     std::fs::File::open("/dev/urandom")
-        .and_then(|mut random| std::io::Read::read_exact(&mut random, &mut bytes))
+        .and_then(|mut random| std::io::Read::read_exact(&mut random, &mut salt))
         .map_err(|err| Status::internal(format!("reading a salt: {err}")))?;
-    let salt: String = bytes
-        .iter()
-        .map(|b| char::from(SALT[usize::from(*b) % SALT.len()]))
-        .collect();
-    let hash = sha_crypt::sha512_crypt_b64(
-        password.as_bytes(),
-        salt.as_bytes(),
-        &sha_crypt::Sha512Params::default(),
-    )
-    .map_err(|err| Status::internal(format!("hashing the password: {err:?}")))?;
-    Ok(format!("$6${salt}${hash}"))
+    let hash = sha_crypt::ShaCrypt::SHA512
+        .hash_password_with_salt(password.as_bytes(), &salt)
+        .map_err(|err| Status::internal(format!("hashing the password: {err}")))?;
+    Ok(hash.to_string())
 }
 
 pub async fn create_group(name: &str) -> Result<guestpb::CreateGroupResponse, Status> {
