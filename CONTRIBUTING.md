@@ -55,7 +55,7 @@ If you touched the SDKs or the protos, also run:
 (cd sdk/python && pip install -e '.[dev]' && pytest && python scripts/genproto.py --check)
 ```
 
-After changing a `.proto` file, run `scripts/sync-protos.sh` to update the SDK copies, then regenerate the Python modules with `python sdk/python/scripts/genproto.py` on Python 3.9 with the pinned `grpcio-tools`.
+After changing a `.proto` file, run `scripts/sync-protos.sh` to update the SDK copies, then regenerate the Python modules with `python sdk/python/scripts/genproto.py` on Python 3.10 with the pinned `grpcio-tools`.
 
 When you open your pull request:
 

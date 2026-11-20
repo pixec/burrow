@@ -6,7 +6,7 @@ import warnings
 from . import api_pb2 as api__pb2
 from . import common_pb2 as common__pb2
 
-GRPC_GENERATED_VERSION = '1.80.0'
+GRPC_GENERATED_VERSION = '1.85.3'
 GRPC_VERSION = grpc.__version__
 _version_not_supported = False
 
@@ -26,7 +26,7 @@ if _version_not_supported:
     )
 
 
-class BurrowStub(object):
+class BurrowStub:
     """Public control-plane API, served by burrow-orchestrator.
     Per-sandbox RPCs are routed to the node that owns the sandbox.
     """
@@ -394,7 +394,7 @@ class BurrowStub(object):
                 _registered_method=True)
 
 
-class BurrowServicer(object):
+class BurrowServicer:
     """Public control-plane API, served by burrow-orchestrator.
     Per-sandbox RPCs are routed to the node that owns the sandbox.
     """
@@ -1264,7 +1264,7 @@ def add_BurrowServicer_to_server(servicer, server):
 
 
  # This class is part of an EXPERIMENTAL API.
-class Burrow(object):
+class Burrow:
     """Public control-plane API, served by burrow-orchestrator.
     Per-sandbox RPCs are routed to the node that owns the sandbox.
     """
@@ -3187,7 +3187,7 @@ class Burrow(object):
             _registered_method=True)
 
 
-class AccessStub(object):
+class AccessStub:
     """Exec and files for one sandbox, served by the node that holds it rather
     than by the orchestrator. Authenticated by a token from IssueAccess, which
     names the sandbox and the node: a token is refused for any other sandbox,
@@ -3222,7 +3222,7 @@ class AccessStub(object):
                 _registered_method=True)
 
 
-class AccessServicer(object):
+class AccessServicer:
     """Exec and files for one sandbox, served by the node that holds it rather
     than by the orchestrator. Authenticated by a token from IssueAccess, which
     names the sandbox and the node: a token is refused for any other sandbox,
@@ -3288,7 +3288,7 @@ def add_AccessServicer_to_server(servicer, server):
 
 
  # This class is part of an EXPERIMENTAL API.
-class Access(object):
+class Access:
     """Exec and files for one sandbox, served by the node that holds it rather
     than by the orchestrator. Authenticated by a token from IssueAccess, which
     names the sandbox and the node: a token is refused for any other sandbox,

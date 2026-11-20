@@ -9,7 +9,7 @@ description = "Python client for Burrow, self-hosted microVM sandboxes for runni
 readme = "README.md"
 license = "MIT"
 license-files = ["LICENSE"]
-requires-python = ">=3.9"
+requires-python = ">=3.10"
 authors = [{ name = "Pixec Technologies", email = "oss+burrow@pixec.net" }]
 keywords = ["sandbox", "microvm", "firecracker", "cloud-hypervisor", "agents"]
 classifiers = [
@@ -21,14 +21,14 @@ classifiers = [
   "Typing :: Typed",
 ]
 # Floors match what the committed `_pb` modules were generated against:
-# api_pb2_grpc.py refuses grpcio older than 1.80, and api_pb2.py validates
-# the protobuf runtime at 6.31.1. Older wheels fail at import, not at use.
-dependencies = ["grpcio>=1.80", "protobuf>=6.31"]
+# api_pb2_grpc.py refuses grpcio older than 1.85.3, and api_pb2.py validates
+# the protobuf runtime at 7.35.1. Older wheels fail at import, not at use.
+dependencies = ["grpcio>=1.85.3", "protobuf>=7.35.1"]
 
 [project.optional-dependencies]
 # Pinned to the release that produced the committed `_pb`, so a regenerate
 # does not silently move the runtime floors above.
-dev = ["grpcio-tools==1.80.0", "pytest>=7"]
+dev = ["grpcio-tools==1.85.3", "pytest>=7"]
 
 [project.urls]
 Homepage = "https://burrow.pixec.net"

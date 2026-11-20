@@ -54,8 +54,7 @@ jobs:
   # so there are two ways to drift: the copies, checked above, and the
   # generated modules, checked here.
   python-sdk:
-    # ubuntu-latest is 26.04, which has no Python 3.9 build.
-    runs-on: ubuntu-24.04
+    runs-on: ubuntu-latest
     defaults:
       run:
         working-directory: sdk/python
@@ -66,7 +65,7 @@ jobs:
         with:
           # The floor in pyproject.toml, so testing here keeps that floor
           # honest.
-          python-version: "3.9"
+          python-version: "3.10"
 
       # `dev` pins grpcio-tools to the minor that produced the committed _pb,
       # which is what makes the drift check below meaningful.

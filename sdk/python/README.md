@@ -11,7 +11,7 @@ The Python SDK for [Burrow](https://burrow.pixec.net): microVM sandboxes for unt
 pip install pixec-burrow
 ```
 
-Python 3.9 or newer.
+Python 3.10 or newer.
 
 ```python
 from burrow import Sandbox

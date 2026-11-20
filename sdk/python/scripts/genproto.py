@@ -26,10 +26,10 @@ OUT = ROOT / "src" / "burrow" / "_pb"
 FILES = ["common.proto", "api.proto"]
 
 # The generator decides the runtime floors the generated modules enforce at
-# import: grpcio-tools 1.80 emits a `_pb` that refuses grpcio<1.80 and
-# validates protobuf 6.31.1. Regenerating with a different minor moves those
+# import: grpcio-tools 1.85 emits a `_pb` that refuses grpcio<1.85.3 and
+# validates protobuf 7.35.1. Regenerating with a different minor moves those
 # floors without touching pyproject.toml, so the two are pinned together.
-GRPCIO_TOOLS = "1.80"
+GRPCIO_TOOLS = "1.85"
 
 
 def check_toolchain() -> None:
