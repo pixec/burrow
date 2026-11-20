@@ -50,6 +50,19 @@ jobs:
       - name: SDK protos are in sync
         run: scripts/sync-protos.sh --check
 
+  # A RustSec advisory against anything in Cargo.lock fails the build.
+  # Unmaintained, unsound and yanked crates are reported without failing it.
+  audit:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Install cargo-audit
+        run: cargo install cargo-audit --locked --version 0.23.0
+
+      - name: Audit
+        run: cargo audit
+
   # The Python SDK additionally commits code generated from its proto copies,
   # so there are two ways to drift: the copies, checked above, and the
   # generated modules, checked here.
