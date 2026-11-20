@@ -8327,6 +8327,11 @@ impl SandboxManager {
             .lock()
             .await
             .values()
+            .filter(|sandbox| {
+                !sandbox
+                    .id()
+                    .starts_with(crate::template::BUILD_SANDBOX_PREFIX)
+            })
             .map(|sandbox| report(sandbox.record(), sandbox.generation()))
             .collect();
         reports.extend(

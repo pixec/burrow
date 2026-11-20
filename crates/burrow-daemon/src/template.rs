@@ -46,6 +46,10 @@ pub fn builds_dir(data_dir: &Path) -> PathBuf {
 /// A build's manifest, beside its artifacts. Its digest is the build's.
 pub const MANIFEST: &str = "manifest.json";
 
+/// Prefix of the id of a sandbox a build runs its steps in. Such a sandbox
+/// is the node's own and has no row in the store, so it is never reported.
+pub(crate) const BUILD_SANDBOX_PREFIX: &str = "bld_";
+
 /// Prefix of a build being assembled, renamed into place once complete.
 const STAGING_PREFIX: &str = ".tmp-";
 
@@ -944,7 +948,10 @@ async fn run_build(
     }
 
     let network = build_network(&request.allow_domains);
-    let build_id = format!("bld_{}", burrow_common::SandboxId::generate());
+    let build_id = format!(
+        "{BUILD_SANDBOX_PREFIX}{}",
+        burrow_common::SandboxId::generate()
+    );
     let policy = common::Policy {
         resources: Some(common::ResourcePolicy {
             vcpus: request.vcpus.max(1),

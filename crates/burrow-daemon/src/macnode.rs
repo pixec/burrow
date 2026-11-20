@@ -564,7 +564,11 @@ async fn install(
 ) -> Result<(), Status> {
     // The installer and the first boot are a running macOS guest each, for
     // the whole build.
-    let build_id = format!("bld_{}", burrow_common::SandboxId::generate());
+    let build_id = format!(
+        "{}{}",
+        crate::template::BUILD_SANDBOX_PREFIX,
+        burrow_common::SandboxId::generate()
+    );
     let _slot = manager.reserve_mac_slot(&build_id, GuestOs::MacOs).await?;
     let ipsw = match ipsw {
         Ipsw::Path(path) => {
@@ -750,7 +754,11 @@ async fn derive(
     building: &Path,
     tx: &crate::template::LogTx,
 ) -> Result<(), Status> {
-    let build_id = format!("bld_{}", burrow_common::SandboxId::generate());
+    let build_id = format!(
+        "{}{}",
+        crate::template::BUILD_SANDBOX_PREFIX,
+        burrow_common::SandboxId::generate()
+    );
     let policy = common::Policy {
         resources: Some(common::ResourcePolicy {
             vcpus: plan.vcpus.unwrap_or(0),
