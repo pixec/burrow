@@ -77,8 +77,8 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 sysinfo = "0.33"
 tokio-vsock = "0.7"
-rtnetlink = "0.23"
-netlink-packet-route = "0.33"
+rtnetlink = "0.24"
+netlink-packet-route = "0.34"
 futures = "0.3"
 nix = { version = "0.31", features = ["mount", "process", "fs", "time", "ioctl", "signal", "term", "socket", "uio", "mman", "poll", "hostname"] }
 tower = "0.5"
