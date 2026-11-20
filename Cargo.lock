@@ -677,7 +677,7 @@ dependencies = [
 name = "burrow-common"
 version = "0.1.0"
 dependencies = [
- "base64 0.22.1",
+ "base64 0.23.1",
  "hex",
  "jsonwebtoken",
  "opentelemetry",
@@ -708,7 +708,7 @@ dependencies = [
  "aws-sdk-s3",
  "aws-smithy-async",
  "aws-smithy-http-client",
- "base64 0.22.1",
+ "base64 0.23.1",
  "burrow-common",
  "burrow-diskread",
  "burrow-net",
@@ -770,7 +770,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "async-stream",
- "base64 0.22.1",
+ "base64 0.23.1",
  "burrow-proto",
  "futures",
  "hyper-util",
@@ -796,7 +796,7 @@ dependencies = [
 name = "burrow-net"
 version = "0.1.0"
 dependencies = [
- "base64 0.22.1",
+ "base64 0.23.1",
  "boringtun",
  "burrow-proto",
  "burrow-proxy",
@@ -855,7 +855,7 @@ dependencies = [
 name = "burrow-proxy"
 version = "0.1.0"
 dependencies = [
- "base64 0.22.1",
+ "base64 0.23.1",
  "burrow-common",
  "burrow-proto",
  "burrow-store",

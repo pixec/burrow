@@ -91,7 +91,7 @@ libc = "0.2"
 sha2 = "0.11"
 sha1 = "0.11"
 hex = "0.4"
-base64 = "0.22"
+base64 = "0.23"
 # Access tokens. No backend feature: burrow-common installs its own, Ed25519
 # through ring, so no RSA or ECDSA code is linked in.
 jsonwebtoken = { version = "11", default-features = false }
