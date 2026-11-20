@@ -111,9 +111,10 @@ pub struct ServeArgs {
         env = "BURROWD_UNJAILED_CLOUD_HYPERVISOR"
     )]
     pub is_cloud_hypervisor_unjailed: bool,
-    /// Bucket snapshots are copied to so they outlive this node, as
-    /// `s3://bucket[/prefix]`. Credentials come from AWS_ACCESS_KEY_ID and
-    /// AWS_SECRET_ACCESS_KEY. Unset keeps snapshots node-local.
+    /// The fleet's bucket, as `s3://bucket[/prefix]`: every template build,
+    /// and the snapshots, suspended sandboxes and volumes that outlive this
+    /// node. Required. Credentials come from AWS_ACCESS_KEY_ID and
+    /// AWS_SECRET_ACCESS_KEY.
     #[arg(long, env = "BURROW_OBJECT_STORE")]
     pub object_store: Option<String>,
     /// The store's S3 endpoint, e.g. `https://s3.eu-west-1.amazonaws.com` or
@@ -1885,17 +1886,17 @@ pub async fn run(args: ServeArgs) -> anyhow::Result<()> {
                      at once can both run it"
                 ),
             }
-            tracing::info!(
-                store = store.describe(),
-                "snapshots are copied to the object store"
-            );
+            tracing::info!(store = store.describe(), "using the object store");
             crate::chunks::refuse_old_format(&store)
                 .await
                 .map_err(|err| anyhow::anyhow!("--object-store: {}", err.message()))?;
             Some(store)
         }
         (Some(_), None) => anyhow::bail!("--object-store needs --object-store-endpoint"),
-        (None, _) => None,
+        (None, _) => anyhow::bail!(
+            "burrowd needs an object store: every node takes its template builds from it. \
+             Pass --object-store and --object-store-endpoint"
+        ),
     };
     let store_vault = match &args.object_store_key_file {
         Some(path) => {

@@ -27,8 +27,12 @@ codesign --force --sign - "$guest"
 # this node from inside colima as host.lima.internal, which lands on the
 # Mac's loopback too. So do the harness nodes' WireGuard packets, over UDP.
 # Published ports listen on --listen's address, 127.0.0.1, since the
-# advertised name does not resolve on the Mac.
-exec env RUST_LOG="${RUST_LOG:-info}" "$bin" serve \
+# advertised name does not resolve on the Mac. The harness object store is
+# published on the loopback too, with its committed keys.
+exec env RUST_LOG="${RUST_LOG:-info}" \
+  AWS_ACCESS_KEY_ID="${AWS_ACCESS_KEY_ID:-burrow}" \
+  AWS_SECRET_ACCESS_KEY="${AWS_SECRET_ACCESS_KEY:-dev-objstore-secret}" \
+  "$bin" serve \
   --orchestrator http://127.0.0.1:7070 \
   --listen 127.0.0.1:7171 --advertise host.lima.internal:7171 \
   --access-listen 127.0.0.1:7173 --access-advertise http://host.lima.internal:7173 \
@@ -38,5 +42,7 @@ exec env RUST_LOG="${RUST_LOG:-info}" "$bin" serve \
   --guest-binary "$guest" \
   --mesh-endpoint host.lima.internal:51820 --mesh-listen-address 127.0.0.1 \
   --data-dir "$data" --hypervisors vz \
+  --object-store s3://burrow/dev --object-store-endpoint http://127.0.0.1:9000 \
+  --object-store-key-file "$root/deploy/dev/objstore/store.key" \
   --dns-listen 127.0.0.1:5354 --proxy-listen 127.0.0.1:3129 \
   --no-tailcat "$@"

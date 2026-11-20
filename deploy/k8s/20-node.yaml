@@ -84,15 +84,16 @@ spec:
             - 0.0.0.0:7081
             - --edge-domain
             - $(NODE_NAME).sandbox.example.com
-            # Optional: copy every snapshot to S3 so it can be restored on
-            # another node, and survives this one. Needs AWS_ACCESS_KEY_ID and
-            # AWS_SECRET_ACCESS_KEY in env, from a secret.
-            # - --object-store
-            # - s3://burrow-snapshots
-            # - --object-store-endpoint
-            # - https://s3.eu-west-1.amazonaws.com
-            # - --object-store-region
-            # - eu-west-1
+            # The fleet's object store, which every node needs: template
+            # builds, and the snapshots, suspended sandboxes and volumes that
+            # outlive a node. Credentials come from the burrow-object-store
+            # secret below.
+            - --object-store
+            - s3://burrow
+            - --object-store-endpoint
+            - https://s3.eu-west-1.amazonaws.com
+            - --object-store-region
+            - eu-west-1
             # Optional: one fleet TLS inspection root, so an inspected sandbox
             # can move between nodes. Without it each node generates its own
             # and keeps its inspected sandboxes. Run `burrowd ca init` once and
@@ -125,6 +126,16 @@ spec:
                 secretKeyRef:
                   name: burrow-tokens
                   key: node-token
+            - name: AWS_ACCESS_KEY_ID
+              valueFrom:
+                secretKeyRef:
+                  name: burrow-object-store
+                  key: access-key-id
+            - name: AWS_SECRET_ACCESS_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: burrow-object-store
+                  key: secret-access-key
             - name: RUST_LOG
               value: info
           # What burrowd itself needs, not what its sandboxes do: a sandbox is

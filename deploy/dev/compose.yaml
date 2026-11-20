@@ -44,17 +44,22 @@ services:
     volumes:
       - ./otel-collector.yaml:/etc/otel/config.yaml:ro
 
-  # S3 for the harness, so snapshots can be restored on the node that did not
-  # take them. versitygw serves a directory as a bucket store; the nodes
-  # create the bucket themselves. The keys are the committed dev ones. 1.0.14
-  # ignored If-Match and If-None-Match, which the lease on a stored sandbox
-  # needs, so a node refuses to start on it.
+  # The fleet's object store, which every node needs: template builds live
+  # here, with the snapshots, suspended sandboxes and volumes that outlive a
+  # node. versitygw serves a directory as a bucket store; the nodes create the
+  # bucket themselves. The keys are the committed dev ones. 1.0.14 ignored
+  # If-Match and If-None-Match, which the lease on a stored sandbox needs, so
+  # a node refuses to start on it.
   objstore:
     image: versity/versitygw:v1.10.0
     command: ["--port", ":9000", "posix", "/data"]
     environment:
       ROOT_ACCESS_KEY_ID: burrow
       ROOT_SECRET_ACCESS_KEY: dev-objstore-secret
+    ports:
+      # Loopback only, for a macOS node on this machine
+      # (scripts/macos/node.sh); the committed keys open it.
+      - "127.0.0.1:9000:9000"
     volumes:
       - burrow-objstore-data:/data
 

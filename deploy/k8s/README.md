@@ -88,7 +88,14 @@ openssl genpkey -algorithm ed25519 -out access.key
 kubectl -n burrow create secret generic burrow-keys \
   --from-file=secrets.key --from-file=access.key
 rm secrets.key access.key
+kubectl -n burrow create secret generic burrow-object-store \
+  --from-literal=access-key-id=... \
+  --from-literal=secret-access-key=...
 ```
+
+`burrow-object-store` holds the credentials for the bucket every node takes
+its template builds from; set the bucket, endpoint and region in
+`20-node.yaml`.
 
 `database-url` is the orchestrator's PostgreSQL; with `05-postgres.yaml`, take
 the URI from the `burrow-postgres-app` secret CloudNativePG creates and set it
@@ -162,9 +169,8 @@ burrow nodes ls
   `burrow nodes drain` first, or the sandboxes
   on it are lost rather than suspended.
 - **`hostPath` state.** `/var/lib/burrow` follows the machine, not the pod.
-  Without `--object-store`, sandboxes, snapshots and volumes never leave the
-  machine, so wiping it wipes them. With one, durable sandboxes, snapshots and
-  volumes survive it.
+  Template builds come back from the object store, as do durable sandboxes,
+  snapshots and volumes; anything else on the machine goes with it.
 - **Placement labels are per DaemonSet.** The downward API cannot read a
   machine's labels, so `--label` is set in the manifest. For pools that differ,
   run one DaemonSet per pool with its own `nodeSelector` and `--label` flags,

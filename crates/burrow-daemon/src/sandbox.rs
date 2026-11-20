@@ -236,8 +236,8 @@ pub struct NodeConfig {
     pub drop_log: firewall::DropLog,
     /// Whether and through which relay sandboxes here can be shared.
     pub share: crate::share::ShareOptions,
-    /// Where snapshots are copied so they outlive this node. `None` keeps
-    /// them node-local.
+    /// The fleet's object store: builds, and the snapshots and stored state
+    /// that outlive this node. Every node is started with one.
     pub object_store: Option<crate::objstore::ObjectStore>,
     /// Seals the brokered credentials of a sandbox stored in `object_store`,
     /// shared by every node so whichever adopts it can open them.
