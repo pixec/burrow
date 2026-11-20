@@ -139,6 +139,53 @@ pub fn kernel_panic(console: &str) -> Option<&str> {
         .map(str::trim)
 }
 
+/// The line a guest kernel reported a crash on, if the console holds one: an
+/// oops, a `BUG:` other than a lockup report it recovers from, or a panic.
+/// Only kernel lines count, which carry the kernel's timestamp.
+pub fn kernel_crash(console: &str) -> Option<&str> {
+    console.lines().find_map(|line| {
+        let message = line.trim_start().strip_prefix('[')?.split_once(']')?;
+        message.0.trim().parse::<f64>().ok()?;
+        let message = message.1.trim_start();
+        let is_crash = message.starts_with("Oops")
+            || message.starts_with("Internal error: Oops")
+            || message.starts_with("Kernel panic - not syncing")
+            || (message.starts_with("BUG: ") && !message.contains("lockup"));
+        is_crash.then(|| line.trim())
+    })
+}
+
+/// How often [`wait_for_kernel_crash`] reads what the guest wrote.
+const CRASH_POLL: std::time::Duration = std::time::Duration::from_millis(200);
+
+/// Waits until the console in `workdir` shows a [`kernel_crash`], and returns
+/// its line. Never returns for a guest that does not crash.
+pub async fn wait_for_kernel_crash(workdir: &Path) -> String {
+    let path = workdir.join(LOG);
+    let (mut read, mut pending) = (0u64, Vec::new());
+    loop {
+        if let Ok(mut file) = tokio::fs::File::open(&path).await {
+            let len = file.metadata().await.map_or(0, |meta| meta.len());
+            if len < read {
+                (read, pending) = (0, Vec::new());
+            }
+            if len > read && file.seek(std::io::SeekFrom::Start(read)).await.is_ok() {
+                let before = pending.len();
+                let _ = file.read_to_end(&mut pending).await;
+                read += (pending.len() - before) as u64;
+                if let Some(end) = pending.iter().rposition(|byte| *byte == b'\n') {
+                    let lines = String::from_utf8_lossy(&pending[..end]).into_owned();
+                    if let Some(line) = kernel_crash(&lines) {
+                        return line.to_string();
+                    }
+                    pending.drain(..=end);
+                }
+            }
+        }
+        tokio::time::sleep(CRASH_POLL).await;
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -206,5 +253,59 @@ mod tests {
             Some("[    0.5] Kernel panic - not syncing: VFS: Unable to mount root fs")
         );
         assert_eq!(kernel_panic("all fine"), None);
+    }
+
+    /// The oops a warm guest restored hours after its snapshot printed, and
+    /// the reports a guest survives, which do not count.
+    #[test]
+    fn a_kernel_crash_is_found_on_the_console() {
+        let oops = "[13230.230000] BUG: kernel NULL pointer dereference, address: 0000000000000059\n\
+                    [13230.231000] #PF: supervisor read access in kernel mode\n\
+                    [13230.232000] Oops: Oops: 0000 [#1] SMP NOPTI\n";
+        assert_eq!(
+            kernel_crash(oops),
+            Some("[13230.230000] BUG: kernel NULL pointer dereference, address: 0000000000000059")
+        );
+        let arm = "[    7.1] Unable to handle kernel NULL pointer dereference\n\
+                   [    7.1] Internal error: Oops: 0000000096000004 [#1] SMP\n";
+        assert_eq!(
+            kernel_crash(arm),
+            Some("[    7.1] Internal error: Oops: 0000000096000004 [#1] SMP")
+        );
+        let panic = "[    0.5] Kernel panic - not syncing: VFS: Unable to mount root fs\n";
+        assert!(kernel_crash(panic).is_some());
+
+        let survived = "[   30.0] BUG: soft lockup - CPU#0 stuck for 22s! [init:1]\n\
+                        [   31.0] BUG: workqueue lockup - pool cpus=0\n\
+                        [   32.0] WARNING: at __enqueue_entity+0x384/0x3b8\n\
+                        [   32.1] ---[ end trace 0000000000000000 ]---\n\
+                        BUG: printed by a program\n";
+        assert_eq!(kernel_crash(survived), None);
+    }
+
+    /// The wait reads only whole lines, so a lockup report is not taken for a
+    /// crash before the end of its line arrives.
+    #[tokio::test]
+    async fn the_wait_ends_at_a_crash_and_not_before() {
+        let dir = workdir("crash");
+        std::fs::write(dir.join(LOG), "[    1.0] booting\n[    2.0] BUG: soft lo").unwrap();
+        let waiting = tokio::spawn({
+            let dir = dir.clone();
+            async move { wait_for_kernel_crash(&dir).await }
+        });
+        tokio::time::sleep(CRASH_POLL * 2).await;
+        assert!(!waiting.is_finished());
+        let mut log = std::fs::OpenOptions::new()
+            .append(true)
+            .open(dir.join(LOG))
+            .unwrap();
+        std::io::Write::write_all(&mut log, b"ckup - CPU#0 stuck\n[    3.0] Oops: 0000 [#1]\n")
+            .unwrap();
+        let line = tokio::time::timeout(CRASH_POLL * 10, waiting)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(line, "[    3.0] Oops: 0000 [#1]");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
