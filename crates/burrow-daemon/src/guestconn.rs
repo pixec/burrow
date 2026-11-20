@@ -113,6 +113,36 @@ pub async fn connect_when_ready(
     }
 }
 
+/// The guest's kernel crashed, so its agent will never come up.
+#[derive(Debug)]
+pub struct KernelCrashed(pub String);
+
+impl std::fmt::Display for KernelCrashed {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "the guest kernel crashed: {}", self.0)
+    }
+}
+
+impl std::error::Error for KernelCrashed {}
+
+/// Resolves once the console in `workdir` shows the guest's kernel crashed.
+pub async fn kernel_crashed(workdir: &std::path::Path) -> anyhow::Error {
+    KernelCrashed(burrow_vmm::console::wait_for_kernel_crash(workdir).await).into()
+}
+
+/// [`connect_when_ready`], giving up as soon as the guest's kernel crashes
+/// rather than at the timeout.
+pub async fn connect_unless_crashed(
+    guest: GuestAddr,
+    workdir: &std::path::Path,
+    timeout: std::time::Duration,
+) -> anyhow::Result<(GuestClient<Channel>, Option<std::time::Instant>)> {
+    tokio::select! {
+        connected = connect_when_ready(guest, timeout) => connected,
+        crashed = kernel_crashed(workdir) => Err(crashed),
+    }
+}
+
 /// Fresh entropy and the host clock, for the guest to apply on handshake.
 pub fn handshake_request(restored: bool) -> burrow_proto::guest::v1::HandshakeRequest {
     handshake_with_network(restored, None)

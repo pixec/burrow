@@ -1390,6 +1390,7 @@ fn spawn_handshake(
     let weak = Arc::downgrade(sandbox);
     let guest_os = sandbox.guest_os();
     let upgrade = manager.config.upgrade_for(guest_os).cloned();
+    let console = sandbox.workdir.clone();
     tokio::spawn(async move {
         let began = std::time::Instant::now();
         // Which step the deadline caught, so a guest that never came up says
@@ -1405,7 +1406,8 @@ fn spawn_handshake(
         if guest_os == burrow_vmm::GuestOs::Windows {
             bound += guestconn::RESTART_TIMEOUT + timeout;
         }
-        let outcome = match tokio::time::timeout(bound, async {
+        let dial = dialing.as_ref().map(guestconn::Dialing::abort_handle);
+        let handshaking = tokio::time::timeout(bound, async {
             let (agent, accepted_at) = match dialing {
                 Some(dialing) => dialing.await??,
                 None => guestconn::connect_when_ready(guest.clone(), timeout).await?,
@@ -1437,19 +1439,37 @@ fn spawn_handshake(
                     .await?;
             }
             Ok::<_, anyhow::Error>((agent, features))
-        })
-        .await
-        {
-            Ok(outcome) => outcome,
-            Err(_) => Err(anyhow::anyhow!(
-                "stalled {} after {timeout:?}",
-                step.lock().unwrap()
-            )),
+        });
+        // A guest whose kernel crashed will never answer, so it is given up on
+        // at once rather than at the deadline.
+        let outcome = tokio::select! {
+            handshook = handshaking => match handshook {
+                Ok(outcome) => outcome,
+                Err(_) => Err(anyhow::anyhow!(
+                    "stalled {} after {timeout:?}",
+                    step.lock().unwrap()
+                )),
+            },
+            crashed = guestconn::kernel_crashed(&console) => Err(crashed),
         };
+        if let Some(dial) = dial {
+            dial.abort();
+        }
 
         let is_snapshot_suspect = outcome
             .as_ref()
             .is_err_and(|err| warm.is_some() && is_snapshot_suspect(*reached.lock().unwrap(), err));
+        let outcome = match (outcome, warm.as_ref().filter(|_| is_snapshot_suspect)) {
+            (Err(err), Some(origin)) => match weak.upgrade() {
+                Some(sandbox) => match manager.boot_cold_after_warm(&sandbox, origin, &err).await {
+                    ColdFallback::NotTried => Err(err),
+                    ColdFallback::Booted => return,
+                    ColdFallback::Failed(reason) => Err(anyhow::anyhow!(reason)),
+                },
+                None => Err(err),
+            },
+            (outcome, _) => outcome,
+        };
         let (state, ready) = match outcome {
             Ok(ready) => (Handshake::Done, Some(ready)),
             Err(err) => (Handshake::Failed(error_chain(&*err)), None),
@@ -1517,11 +1537,7 @@ fn spawn_handshake(
                     Some(vm) => (no_agent_reason(vm, NoAgent::Stalled(err)).await, true),
                     None => (err, false),
                 };
-                tracing::error!(
-                    sandbox = id,
-                    reason,
-                    "the guest agent never came up; reclaiming the sandbox"
-                );
+                tracing::error!(sandbox = id, reason, "the guest agent never came up");
                 // A sandbox deleted under its handshake lost its VM to the
                 // delete, which says nothing about the snapshot.
                 let is_registered = manager.sandboxes.lock().await.contains_key(&id);
@@ -1536,15 +1552,10 @@ fn spawn_handshake(
                         .await;
                 }
                 // This task is the one place that knows the guest has been
-                // given up on, so it is the one that gives back what the
-                // sandbox is holding: nothing else is waiting to fail the
-                // create, which returned as soon as the VM was up.
-                //
-                // Released first: the teardown can only stop the VMM while it
-                // holds the sandbox alone, and this task's own reference would
-                // otherwise be the one keeping it shared.
+                // given up on: nothing else is waiting to fail the create,
+                // which returned as soon as the VM was up.
                 drop(sandbox);
-                manager.reclaim_unconfirmed(&id).await;
+                manager.stop_unconfirmed(&id).await;
             }
             _ => {}
         }
@@ -1562,11 +1573,15 @@ enum Reached {
 }
 
 /// Whether a failed warm handshake says the snapshot restored a broken guest:
-/// its vsock never accepted, or the connection failed under the handshake
-/// before the agent answered it with anything. An agent that answered, even
-/// with an error, came up, and a handshake that went quiet after the guest
-/// accepted is as likely an overloaded node as a broken snapshot.
+/// its kernel crashed, its vsock never accepted, or the connection failed
+/// under the handshake before the agent answered it with anything. An agent
+/// that answered, even with an error, came up, and a handshake that went quiet
+/// after the guest accepted is as likely an overloaded node as a broken
+/// snapshot.
 fn is_snapshot_suspect(reached: Reached, err: &anyhow::Error) -> bool {
+    if err.is::<guestconn::KernelCrashed>() {
+        return true;
+    }
     match reached {
         Reached::Nothing => true,
         Reached::Accepted => err
@@ -1574,6 +1589,16 @@ fn is_snapshot_suspect(reached: Reached, err: &anyhow::Error) -> bool {
             .is_some_and(|status| std::error::Error::source(status).is_some()),
         Reached::Answered => false,
     }
+}
+
+/// What became of a warm create whose restored guest never came up.
+#[derive(Debug, PartialEq, Eq)]
+enum ColdFallback {
+    /// Not booted cold: the sandbox is gone, or is not one that can be.
+    NotTried,
+    Booted,
+    /// The cold boot failed too, for this reason.
+    Failed(String),
 }
 
 /// How long after discarding a warm snapshot whose guest never came up the
@@ -2535,16 +2560,19 @@ impl RunningSandbox {
         let guest = vm.guest();
         // `restored: true` is what tells the guest to reseed its RNG and reset
         // its clock, which it cannot know on its own.
-        let handshook = match guestconn::connect_when_ready(guest.clone(), agent_timeout).await {
-            Ok((agent, _)) => {
-                phases.mark("dial");
-                guestconn::handshake_upgrading(agent, guest, request, upgrade, agent_timeout)
-                    .await
-                    .map(|(agent, response)| (agent, response.features))
-                    .map_err(|err| NoAgent::Handshake(err.message().to_string()))
-            }
-            Err(err) => Err(NoAgent::Unreachable(agent_timeout, error_chain(&*err))),
-        };
+        let handshook =
+            match guestconn::connect_unless_crashed(guest.clone(), &self.workdir, agent_timeout)
+                .await
+            {
+                Ok((agent, _)) => {
+                    phases.mark("dial");
+                    guestconn::handshake_upgrading(agent, guest, request, upgrade, agent_timeout)
+                        .await
+                        .map(|(agent, response)| (agent, response.features))
+                        .map_err(|err| NoAgent::Handshake(err.message().to_string()))
+                }
+                Err(err) => Err(NoAgent::Unreachable(agent_timeout, error_chain(&*err))),
+            };
         let (agent, features) = match handshook {
             Ok(handshook) => handshook,
             Err(failure) => {
@@ -2697,7 +2725,8 @@ impl RunningSandbox {
         let mut vm = Vm::boot(spec.clone())
             .await
             .map_err(|err| Status::internal(format!("boot failed: {err}")))?;
-        let connected = guestconn::connect_when_ready(vm.guest(), agent_timeout).await;
+        let connected =
+            guestconn::connect_unless_crashed(vm.guest(), &spec.workdir, agent_timeout).await;
         drop(cold_boot);
         let (agent, _) = match connected {
             Ok(ready) => ready,
@@ -3392,6 +3421,8 @@ async fn no_agent_reason(vm: &mut Vm, failure: NoAgent) -> String {
     let tail = lines[lines.len().saturating_sub(CONSOLE_LINES)..].join("\n");
     let why = if let Some(panic) = burrow_vmm::console::kernel_panic(&console) {
         format!("the guest kernel panicked: {panic}")
+    } else if let Some(crash) = burrow_vmm::console::kernel_crash(&console) {
+        format!("the guest kernel crashed: {crash}")
     } else if let Some(status) = vm.exit_status() {
         let output = vm.vmm_log_tail(20).await;
         if output == tail {
@@ -7941,41 +7972,154 @@ impl SandboxManager {
         }
     }
 
-    /// Gives back everything a sandbox whose guest never answered is holding.
+    /// Stops a sandbox whose guest never answered, on its disk, with the
+    /// reason in its record.
     ///
     /// A warm create returns once the VM is restored, so a handshake that ends
-    /// in failure has no create left to fail: the sandbox is registered and
-    /// keeps its tap, its address lease and its working directory until
-    /// something deletes it. Nothing would, because the create looked like it
-    /// succeeded.
+    /// in failure has no create left to fail. The sandbox stays, stopped, so
+    /// its caller sees why and can boot or delete it as any other: one that
+    /// vanished instead could no longer be deleted by a caller who still held
+    /// it.
     ///
     /// Idempotent, and correct from either side of registration: the handshake
     /// task calls it when it gives up, and the paths that register a sandbox
-    /// call it once the sandbox is theirs. Whichever runs second does the work,
-    /// so the window between a create's provisioning and its registration is
-    /// not one a failure can fall through.
-    async fn reclaim_unconfirmed(&self, id: &str) {
+    /// call it once the sandbox is theirs. Whichever runs second finds it
+    /// stopped, so the window between a create's provisioning and its
+    /// registration is not one a failure can fall through.
+    async fn stop_unconfirmed(&self, id: &str) {
         // Re-read rather than trusted from when the failure was recorded: a
         // resume handshakes for itself and clears it, and a sandbox that has
-        // since come up must not be destroyed over a VM that is gone.
-        let failed = |sandbox: &Arc<RunningSandbox>| {
-            matches!(&*sandbox.handshake.borrow(), Handshake::Failed(_))
+        // since come up must not be stopped over a VM that is gone.
+        let Some(sandbox) = self.sandboxes.lock().await.get(id).cloned() else {
+            return;
         };
-
-        // Not registered yet: the create that provisioned it still holds it and
-        // reclaims it itself once it is registered.
-        if !self.sandboxes.lock().await.get(id).is_some_and(failed) {
+        let Handshake::Failed(err) = sandbox.handshake.borrow().clone() else {
+            return;
+        };
+        if !sandbox.is_running() {
             return;
         }
-        // At `error` because this is a create the caller was told had
-        // succeeded, and it is about to stop existing.
         tracing::error!(
             sandbox = id,
-            "the guest agent never came up; releasing the sandbox's tap, lease and directory"
+            "the guest agent never came up; stopping the sandbox on its disk"
         );
-        if let Err(err) = self.delete(id).await {
-            tracing::error!(sandbox = id, %err, "could not reclaim a sandbox with no agent");
+        if let Err(err) = sandbox.shutdown().await {
+            tracing::warn!(
+                sandbox = id,
+                err = err.message(),
+                "could not stop a sandbox with no agent"
+            );
         }
+        sandbox.base_record.lock().unwrap().state_reason = format!(
+            "its guest agent never came up after it was created, so it was stopped on its disk; \
+             `burrow boot` starts it again: {err}"
+        );
+        self.resync_public(&sandbox).await;
+        self.volumes.release_all(id);
+        self.persist(&sandbox).await;
+        self.close_session(&sandbox, ENDED_FAILED).await;
+        self.announce_now();
+    }
+
+    /// Boots a warm-created sandbox cold in place once the guest restored
+    /// from its snapshot has failed to come up with `err`, keeping its id,
+    /// address, volumes and resources, so the create still ends in a working
+    /// sandbox. The snapshot is discarded and rebuilt.
+    async fn boot_cold_after_warm(
+        &self,
+        sandbox: &Arc<RunningSandbox>,
+        warm: &WarmOrigin,
+        err: &anyhow::Error,
+    ) -> ColdFallback {
+        let id = sandbox.id();
+        let is_held = self
+            .sandboxes
+            .lock()
+            .await
+            .get(id)
+            .is_some_and(|held| Arc::ptr_eq(held, sandbox));
+        if !is_held
+            || crate::macnode::is_macos(sandbox.guest_os())
+            || *sandbox.handshake.borrow() != Handshake::Pending
+        {
+            return ColdFallback::NotTried;
+        }
+        let reason = match &mut *sandbox.vm.lock().await {
+            Some(vm) => no_agent_reason(vm, NoAgent::Stalled(error_chain(&**err))).await,
+            None => return ColdFallback::NotTried,
+        };
+        tracing::warn!(
+            sandbox = id,
+            reason,
+            "the guest restored from a warm snapshot never came up; booting the sandbox cold"
+        );
+        if let Ok(restored) =
+            crate::warm::Restored::of(&sandbox.workdir.join(sandbox.layout().state))
+        {
+            self.discard_failed_warm(warm, &restored, "its restored guest never came up")
+                .await;
+        }
+        let booted = async {
+            sandbox.shutdown().await?;
+            self.close_session(sandbox, ENDED_FAILED).await;
+            self.volumes.release_all(id);
+            self.restage_cold(sandbox).await?;
+            self.start_now(id, true).await
+        }
+        .await;
+        if let Err(cold) = booted {
+            tracing::error!(
+                sandbox = id,
+                err = cold.message(),
+                "the sandbox did not boot cold either"
+            );
+            return ColdFallback::Failed(format!(
+                "{}; booted cold instead, it failed too: {}",
+                error_chain(&**err),
+                cold.message()
+            ));
+        }
+        // Deleted while it booted: the delete took the sandbox out of the
+        // registry before this VM existed, so it is this task's to stop.
+        if !self
+            .sandboxes
+            .lock()
+            .await
+            .get(id)
+            .is_some_and(|held| Arc::ptr_eq(held, sandbox))
+        {
+            let _ = sandbox.shutdown().await;
+            return ColdFallback::Booted;
+        }
+        self.emit(sandbox, EVENT_AGENT_READY, "").await;
+        tracing::info!(sandbox = id, "booted cold after its warm restore failed");
+        ColdFallback::Booted
+    }
+
+    /// Readies a warm-created sandbox's directory for a cold boot: a fresh
+    /// root disk from its template in place of the snapshot's, and a fresh
+    /// TPM in place of the snapshot's, as a cold create gets.
+    async fn restage_cold(&self, sandbox: &RunningSandbox) -> Result<(), Status> {
+        let io = |err: std::io::Error| Status::internal(format!("making a fresh root disk: {err}"));
+        let disk = sandbox.workdir.join(crate::rootdisk::ROOT_DISK);
+        match tokio::fs::remove_file(&disk).await {
+            Err(err) if err.kind() != std::io::ErrorKind::NotFound => return Err(io(err)),
+            _ => {}
+        }
+        self.spares
+            .take(&self.config.builds_dir(), sandbox.build(), &disk)
+            .await
+            .map_err(io)?;
+        let disk_mib = sandbox
+            .record()
+            .policy
+            .and_then(|policy| policy.resources)
+            .unwrap_or_default()
+            .disk_mib;
+        crate::rootdisk::grow(&disk, disk_mib).await?;
+        let _ = tokio::fs::remove_file(sandbox.workdir.join(crate::warm::PREFETCH_PLAN)).await;
+        let _ = tokio::fs::remove_dir_all(self.config.tpm_dir(sandbox.id())).await;
+        Ok(())
     }
 
     /// Keeps every running guest's clock on the node's, which a handshake sets
@@ -8702,11 +8846,11 @@ impl SandboxManager {
         let record = sandbox.record();
         self.persist(&sandbox).await;
         phases.mark("persist");
-        // The other half of the reclaim: a warm create's handshake may have
+        // The other half of the stop: a warm create's handshake may have
         // given up while this was still registering, when there was nothing in
-        // the registry to reclaim. A no-op in every other case.
-        self.reclaim_unconfirmed(&id).await;
-        phases.mark("reclaim");
+        // the registry to stop. A no-op in every other case.
+        self.stop_unconfirmed(&id).await;
+        phases.mark("unconfirmed");
         tracing::info!(
             sandbox = id,
             warm = from_warm,
@@ -9326,8 +9470,9 @@ impl SandboxManager {
             // down rather than leaving an unusable sandbox in the registry. The
             // first connection that succeeds is kept, rather than probing with
             // one and then dialling another.
-            let connected = guestconn::connect_when_ready(
+            let connected = guestconn::connect_unless_crashed(
                 guard.vm().guest(),
+                &workdir,
                 self.config.agent_timeout(guest_os),
             )
             .await;
@@ -15766,15 +15911,14 @@ pub(crate) mod tests {
 
     /// A warm create returns before its guest has answered, so the handshake
     /// task is the only thing left that learns the guest never came. It used to
-    /// record the failure and leave the sandbox registered, holding its tap,
-    /// its address lease and its working directory until something deleted it,
-    /// which nothing would: the create looked like it had succeeded.
+    /// delete the sandbox, which its caller then could not delete: the node
+    /// and the store no longer knew it. It is stopped on its disk instead,
+    /// with the reason in its record, and a delete of it succeeds and gives
+    /// back its address lease.
     #[tokio::test]
-    async fn a_terminal_handshake_failure_reclaims_the_sandbox() {
+    async fn a_sandbox_whose_agent_never_came_up_is_stopped_and_deletable() {
         let manager = manager().await;
         let sandbox = running("sbx_no_agent");
-        // The registry and the allocator as a warm create leaves them: the
-        // record is registered and its lease is held.
         let (id, block) = (sandbox.id(), sandbox.lease.block);
         manager.ipam().await.unwrap().reserve(id, block).unwrap();
         manager
@@ -15795,30 +15939,152 @@ pub(crate) mod tests {
             std::time::Duration::from_millis(1),
             None,
         );
-        // The registry's reference is the one that matters; a test holding
-        // another would look like an in-flight request.
-        drop(sandbox);
-
-        // The lease goes back last, after the registry entry and the firewall
-        // re-render, so it is the condition to wait on.
         for _ in 0..200 {
-            if manager.ipam().await.unwrap().get("sbx_no_agent").is_none() {
+            if !sandbox.is_running() {
                 break;
             }
             tokio::time::sleep(std::time::Duration::from_millis(10)).await;
         }
+        assert_eq!(sandbox.record().state, common::SandboxState::Stopped as i32);
         assert!(
-            manager.sandboxes.lock().await.is_empty(),
-            "a sandbox whose agent never came up was left registered"
+            sandbox
+                .record()
+                .state_reason
+                .contains("its guest agent never came up"),
+            "{}",
+            sandbox.record().state_reason
         );
+        assert!(manager.sandboxes.lock().await.contains_key("sbx_no_agent"));
+        drop(sandbox);
+
+        manager.delete("sbx_no_agent").await.unwrap();
+        assert!(manager.sandboxes.lock().await.is_empty());
         assert!(
             manager.ipam().await.unwrap().get("sbx_no_agent").is_none(),
             "its address lease was not released"
         );
     }
 
+    /// A guest whose kernel crashed is given up on as soon as its console
+    /// says so, long before the handshake's deadline.
+    #[tokio::test]
+    async fn a_handshake_ends_at_a_guest_kernel_crash() {
+        let manager = manager().await;
+        let sandbox = running("sbx_oops");
+        tokio::fs::create_dir_all(&sandbox.workdir).await.unwrap();
+        tokio::fs::write(
+            sandbox.workdir.join(burrow_vmm::console::LOG),
+            "[13230.244114] BUG: kernel NULL pointer dereference, address: 0000000000000059\n",
+        )
+        .await
+        .unwrap();
+        sandbox.handshake.send_replace(Handshake::Pending);
+        let began = std::time::Instant::now();
+        spawn_handshake(
+            &manager,
+            &sandbox,
+            burrow_proto::guest::v1::HandshakeRequest::default(),
+            None,
+            None,
+            std::time::Duration::from_secs(60),
+            None,
+        );
+        let mut verdict = sandbox.handshake.subscribe();
+        let failed = tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            verdict.wait_for(|state| *state != Handshake::Pending),
+        )
+        .await
+        .unwrap()
+        .unwrap()
+        .clone();
+        assert!(began.elapsed() < std::time::Duration::from_secs(10));
+        let Handshake::Failed(err) = failed else {
+            panic!("{failed:?}");
+        };
+        assert!(err.contains("the guest kernel crashed"), "{err}");
+        let _ = tokio::fs::remove_dir_all(&sandbox.workdir).await;
+    }
+
+    /// A cold boot after a failed warm restore takes a fresh root disk from
+    /// the template, at the size the sandbox asked for, and a fresh TPM, as a
+    /// cold create does, rather than booting what the snapshot left.
+    #[tokio::test]
+    async fn a_cold_boot_after_a_warm_restore_starts_from_the_template() {
+        let manager = manager().await;
+        let sandbox = running("sbx_restage");
+        tokio::fs::create_dir_all(&sandbox.workdir).await.unwrap();
+        let template = manager.config.builds_dir().join("default");
+        tokio::fs::create_dir_all(&template).await.unwrap();
+        let image = vec![7u8; burrow_common::disk::MIB as usize];
+        tokio::fs::write(template.join(TEMPLATE_ROOTFS), &image)
+            .await
+            .unwrap();
+        let disk = sandbox.workdir.join(crate::rootdisk::ROOT_DISK);
+        tokio::fs::write(&disk, b"the snapshot's disk")
+            .await
+            .unwrap();
+        tokio::fs::write(sandbox.workdir.join(crate::warm::PREFETCH_PLAN), b"plan")
+            .await
+            .unwrap();
+        let tpm = manager.config.tpm_dir(sandbox.id());
+        tokio::fs::create_dir_all(&tpm).await.unwrap();
+        tokio::fs::write(tpm.join("tpm2-00.permall"), b"the snapshot's tpm")
+            .await
+            .unwrap();
+        sandbox.base_record.lock().unwrap().policy = Some(common::Policy {
+            resources: Some(common::ResourcePolicy {
+                disk_mib: 2,
+                ..Default::default()
+            }),
+            ..Default::default()
+        });
+
+        manager.restage_cold(&sandbox).await.unwrap();
+        let made = tokio::fs::read(&disk).await.unwrap();
+        assert_eq!(made.len() as u64, 2 * burrow_common::disk::MIB);
+        assert_eq!(&made[..image.len()], &image[..]);
+        assert!(!sandbox.workdir.join(crate::warm::PREFETCH_PLAN).exists());
+        assert!(!tpm.exists());
+        let _ = tokio::fs::remove_dir_all(&sandbox.workdir).await;
+    }
+
+    /// Only a sandbox still registered under its VM is booted cold: one
+    /// deleted under its handshake, or left with no VM, is not.
+    #[tokio::test]
+    async fn a_cold_boot_is_not_tried_for_a_sandbox_gone_or_without_a_vm() {
+        let manager = manager().await;
+        let sandbox = running("sbx_cold_gone");
+        sandbox.handshake.send_replace(Handshake::Pending);
+        let warm = WarmOrigin {
+            template: "default".into(),
+            dir: std::env::temp_dir().join("burrow-warm-unused"),
+            shape: crate::warm::Shape {
+                vcpus: 1,
+                mem_mib: 512,
+                disk_mib: 0,
+                max_mem_mib: 0,
+            },
+        };
+        let err = anyhow::anyhow!("agent did not accept");
+        assert_eq!(
+            manager.boot_cold_after_warm(&sandbox, &warm, &err).await,
+            ColdFallback::NotTried
+        );
+        manager
+            .sandboxes
+            .lock()
+            .await
+            .insert(sandbox.id().to_string(), sandbox.clone());
+        assert_eq!(
+            manager.boot_cold_after_warm(&sandbox, &warm, &err).await,
+            ColdFallback::NotTried
+        );
+        assert!(sandbox.is_running());
+    }
+
     /// A warm sandbox whose handshake failed because it had no VM, as one
-    /// deleted under its handshake has not, is reclaimed without its snapshot
+    /// deleted under its handshake has not, is stopped without its snapshot
     /// being blamed.
     #[tokio::test]
     async fn a_failed_handshake_without_a_vm_keeps_the_warm_snapshot() {
@@ -15861,14 +16127,13 @@ pub(crate) mod tests {
                 },
             }),
         );
-        drop(sandbox);
         for _ in 0..200 {
-            if manager.ipam().await.unwrap().get("sbx_warm_gone").is_none() {
+            if !sandbox.is_running() {
                 break;
             }
             tokio::time::sleep(std::time::Duration::from_millis(10)).await;
         }
-        assert!(manager.sandboxes.lock().await.is_empty());
+        assert_eq!(sandbox.record().state, common::SandboxState::Stopped as i32);
         assert!(warm_dir.join(state).exists(), "the snapshot was blamed");
         let _ = std::fs::remove_dir_all(&warm_dir);
     }
@@ -15894,6 +16159,9 @@ pub(crate) mod tests {
         assert!(!is_snapshot_suspect(Reached::Accepted, &stalled()));
         assert!(!is_snapshot_suspect(Reached::Answered, &transport()));
         assert!(!is_snapshot_suspect(Reached::Answered, &refused()));
+        let crashed = || anyhow::Error::from(guestconn::KernelCrashed("Oops".into()));
+        assert!(is_snapshot_suspect(Reached::Accepted, &crashed()));
+        assert!(is_snapshot_suspect(Reached::Answered, &crashed()));
     }
 
     #[test]
