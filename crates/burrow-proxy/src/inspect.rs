@@ -23,6 +23,7 @@ use std::collections::HashMap;
 use std::path::Path;
 use std::sync::{Arc, RwLock};
 
+use rustls::pki_types::pem::PemObject as _;
 use rustls::pki_types::{CertificateDer, PrivateKeyDer};
 
 use crate::policy::{Decision, SandboxPolicy};
@@ -169,7 +170,7 @@ pub fn fingerprint(der: &[u8]) -> String {
 /// [`fingerprint`] of the first certificate in `pem`, or empty when it holds
 /// none.
 pub fn pem_fingerprint(pem: &str) -> String {
-    rustls_pemfile::certs(&mut pem.as_bytes())
+    CertificateDer::pem_slice_iter(pem.as_bytes())
         .next()
         .and_then(Result::ok)
         .map(|der| fingerprint(&der))
@@ -179,7 +180,7 @@ pub fn pem_fingerprint(pem: &str) -> String {
 /// The certificates in a PEM file, as DER.
 fn read_certificates(path: &Path) -> Result<Vec<CertificateDer<'static>>, String> {
     let pem = std::fs::read(path).map_err(|err| format!("reading {}: {err}", path.display()))?;
-    let certificates = rustls_pemfile::certs(&mut pem.as_slice())
+    let certificates = CertificateDer::pem_slice_iter(&pem)
         .collect::<Result<Vec<_>, _>>()
         .map_err(|err| format!("parsing {}: {err}", path.display()))?;
     if certificates.is_empty() {
@@ -272,7 +273,7 @@ pub fn issue_node_ca(
 ) -> Result<(String, String), String> {
     let root_key =
         rcgen::KeyPair::from_pem(root_key_pem).map_err(|err| format!("root key: {err}"))?;
-    let root_der = rustls_pemfile::certs(&mut root_pem.as_bytes())
+    let root_der = CertificateDer::pem_slice_iter(root_pem.as_bytes())
         .next()
         .ok_or("the root file holds no certificate")?
         .map_err(|err| format!("root certificate: {err}"))?;
@@ -384,7 +385,7 @@ impl Authority {
     }
 
     fn from_pem(cert_pem: &str, key_pem: &str) -> Result<Self, String> {
-        let der = rustls_pemfile::certs(&mut cert_pem.as_bytes())
+        let der = CertificateDer::pem_slice_iter(cert_pem.as_bytes())
             .next()
             .ok_or("no certificate in the ca file")?
             .map_err(|err| format!("ca certificate: {err}"))?;
@@ -688,7 +689,7 @@ mod tests {
     /// that trusts only `root_pem`.
     async fn handshake(authority: &Authority, root_pem: &str, host: &str) -> Result<(), String> {
         let mut roots = rustls::RootCertStore::empty();
-        for der in rustls_pemfile::certs(&mut root_pem.as_bytes()) {
+        for der in CertificateDer::pem_slice_iter(root_pem.as_bytes()) {
             roots.add(der.unwrap()).unwrap();
         }
         let client = rustls::ClientConfig::builder()
@@ -721,7 +722,7 @@ mod tests {
         let root_pem = std::fs::read_to_string(&root).unwrap();
         assert_eq!(a.certificate_pem().trim(), root_pem.trim());
         assert_eq!(a.root_fingerprint(), b.root_fingerprint());
-        let root_der = rustls_pemfile::certs(&mut root_pem.as_bytes())
+        let root_der = CertificateDer::pem_slice_iter(root_pem.as_bytes())
             .next()
             .unwrap()
             .unwrap();

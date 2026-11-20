@@ -260,8 +260,9 @@ mod tests {
     /// The test's endpoint is on loopback, so no public authority will sign for
     /// it; this is the only reason the crate's tests can dial one at all.
     fn trust(authority: &Authority) {
-        let mut pem = authority.certificate_pem().as_bytes();
-        for der in rustls_pemfile::certs(&mut pem) {
+        use rustls::pki_types::pem::PemObject as _;
+        let pem = authority.certificate_pem();
+        for der in rustls::pki_types::CertificateDer::pem_slice_iter(pem.as_bytes()) {
             crate::inspect::trust_in_tests(der.unwrap());
         }
     }

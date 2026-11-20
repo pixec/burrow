@@ -26,7 +26,6 @@ hex = { workspace = true }
 base64 = { workspace = true }
 tokio-rustls = { workspace = true }
 rustls = { workspace = true }
-rustls-pemfile = { workspace = true }
 webpki-roots = { workspace = true }
 burrow-proto = { workspace = true }
 burrow-store = { workspace = true }
