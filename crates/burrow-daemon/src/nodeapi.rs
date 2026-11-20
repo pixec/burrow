@@ -1099,6 +1099,25 @@ impl NodeService for NodeApi {
         Ok(Response::new(nodepb::NodeDeleteResponse {}))
     }
 
+    async fn list_stored_builds(
+        &self,
+        _req: Request<nodepb::NodeListStoredBuildsRequest>,
+    ) -> Result<Response<nodepb::NodeListStoredBuildsResponse>, Status> {
+        let store = self.sandboxes.object_store()?;
+        Ok(Response::new(nodepb::NodeListStoredBuildsResponse {
+            digests: crate::buildstore::stored(store, crate::buildstore::GRACE).await?,
+        }))
+    }
+
+    async fn purge_stored_build(
+        &self,
+        req: Request<nodepb::NodePurgeBuildRequest>,
+    ) -> Result<Response<nodepb::NodeDeleteResponse>, Status> {
+        let store = self.sandboxes.object_store()?;
+        crate::buildstore::purge(store, &req.into_inner().digest, crate::buildstore::GRACE).await?;
+        Ok(Response::new(nodepb::NodeDeleteResponse {}))
+    }
+
     async fn get_console(
         &self,
         req: Request<api::GetConsoleRequest>,

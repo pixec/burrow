@@ -103,6 +103,12 @@ service NodeService {
   rpc ListTemplates(burrow.api.v1.ListTemplatesRequest) returns (burrow.api.v1.ListTemplatesResponse);
   rpc DeleteTemplate(burrow.api.v1.DeleteTemplateRequest) returns (burrow.api.v1.DeleteTemplateResponse);
 
+  // Builds in the object store. A node fetches a build it lacks from the
+  // store itself; these two let the orchestrator collect the builds no row
+  // keeps.
+  rpc ListStoredBuilds(NodeListStoredBuildsRequest) returns (NodeListStoredBuildsResponse);
+  rpc PurgeStoredBuild(NodePurgeBuildRequest) returns (NodeDeleteResponse);
+
   rpc ExposePort(burrow.api.v1.ExposePortRequest) returns (burrow.api.v1.PortMapping);
   rpc ListPorts(NodeSandboxRef) returns (burrow.api.v1.ListPortsResponse);
   rpc ClosePort(burrow.api.v1.ClosePortRequest) returns (burrow.api.v1.ClosePortResponse);
@@ -215,6 +221,18 @@ message NodeListSnapshotsRequest {
   // Empty lists every snapshot this node holds, which is what reconciliation
   // wants.
   string sandbox_id = 1;
+}
+
+// Builds whose manifests the object store has held for longer than the
+// node's grace, so the orchestrator can collect those no row keeps.
+message NodeListStoredBuildsRequest {}
+
+message NodeListStoredBuildsResponse {
+  repeated string digests = 1;
+}
+
+message NodePurgeBuildRequest {
+  string digest = 1;
 }
 
 message NodeSandboxRef {

@@ -1,6 +1,8 @@
 //! Collects what the object store holds that no row references: the stored
 //! state of deleted sandboxes, snapshots and volumes whose node was not
-//! there to delete it, or was not told in time.
+//! there to delete it, or was not told in time, and the builds retention
+//! dropped. A build's files go with each node's own chunk collection once no
+//! build in the store names them.
 //!
 //! A delete removes the row and succeeds at once. Whatever a reachable node
 //! was holding it deletes then, and an absent node at its next heartbeat;
@@ -25,6 +27,7 @@ pub struct Collected {
     pub sandboxes: usize,
     pub snapshots: usize,
     pub volumes: usize,
+    pub builds: usize,
 }
 
 /// One pass through the first healthy node with the object store. `None`
@@ -66,6 +69,12 @@ pub async fn once(state: &OrchestratorState) -> Option<Collected> {
             .ok()?
             .into_inner()
             .volumes;
+        let builds = client
+            .list_stored_builds(nodepb::NodeListStoredBuildsRequest {})
+            .await
+            .ok()?
+            .into_inner()
+            .digests;
 
         // Read after the listings: a row written since is for something a
         // node has not made yet, and one deleted since is collected next time.
@@ -78,6 +87,21 @@ pub async fn once(state: &OrchestratorState) -> Option<Collected> {
             .collect();
         let named_snapshots = store.snapshot_ids().await.ok()?;
         let named_volumes = store.volume_names().await.ok()?;
+        // A build is kept while its row is; retention drops a row rather
+        // than deleting it. Without the template store nothing is judged.
+        let kept_builds: Option<HashSet<String>> = match &state.store {
+            Some(builds) => Some(
+                builds
+                    .list_builds(None)
+                    .await
+                    .ok()?
+                    .into_iter()
+                    .filter(|build| build.status != burrow_store::DROPPED)
+                    .map(|build| build.digest)
+                    .collect(),
+            ),
+            None => None,
+        };
 
         let mut collected = Collected::default();
         for id in stored.iter().filter(|id| !placed.contains(*id)) {
@@ -128,12 +152,30 @@ pub async fn once(state: &OrchestratorState) -> Option<Collected> {
                 }
             }
         }
+        for digest in builds.iter().filter(|digest| {
+            kept_builds
+                .as_ref()
+                .is_some_and(|kept| !kept.contains(*digest))
+        }) {
+            match client
+                .purge_stored_build(nodepb::NodePurgeBuildRequest {
+                    digest: digest.clone(),
+                })
+                .await
+            {
+                Ok(_) => collected.builds += 1,
+                Err(err) => {
+                    tracing::warn!(build = digest, %err, "could not collect a stored build")
+                }
+            }
+        }
         if collected != Collected::default() {
             tracing::info!(
                 node_id,
                 sandboxes = collected.sandboxes,
                 snapshots = collected.snapshots,
                 volumes = collected.volumes,
+                builds = collected.builds,
                 "collected stored state no row references"
             );
         }
@@ -173,6 +215,7 @@ mod tests {
         sandboxes: Vec<String>,
         snapshots: Vec<String>,
         volumes: Vec<(String, Option<String>)>,
+        builds: Vec<String>,
         removed: Arc<Mutex<Vec<String>>>,
     }
 
@@ -250,6 +293,28 @@ mod tests {
         }
     );
     unary!(
+        ListBuilds,
+        nodepb::NodeListStoredBuildsRequest,
+        nodepb::NodeListStoredBuildsResponse,
+        |node, _r| {
+            nodepb::NodeListStoredBuildsResponse {
+                digests: node.builds,
+            }
+        }
+    );
+    unary!(
+        PurgeBuild,
+        nodepb::NodePurgeBuildRequest,
+        nodepb::NodeDeleteResponse,
+        |node, request| {
+            node.removed
+                .lock()
+                .unwrap()
+                .push(request.into_inner().digest);
+            nodepb::NodeDeleteResponse {}
+        }
+    );
+    unary!(
         PurgeSandbox,
         nodepb::NodeSandboxRef,
         nodepb::NodeDeleteResponse,
@@ -306,6 +371,8 @@ mod tests {
                     "ListDurableVolumes" => serve!(ListVolumes(node)),
                     "PurgeSandbox" => serve!(PurgeSandbox(node)),
                     "DeleteSnapshot" => serve!(DeleteSnapshot(node)),
+                    "ListStoredBuilds" => serve!(ListBuilds(node)),
+                    "PurgeStoredBuild" => serve!(PurgeBuild(node)),
                     _ => serve!(PurgeVolume(node)),
                 })
             })
@@ -313,8 +380,9 @@ mod tests {
     }
 
     /// Deleted while their nodes were away, a sandbox, a snapshot and a
-    /// volume left state in the object store. The collector removes exactly
-    /// that, and only once what the store held before rows is recorded.
+    /// volume left state in the object store, and retention dropped a build
+    /// another build outlived. The collector removes exactly that, and only
+    /// once what the store held before rows is recorded.
     #[tokio::test]
     async fn stored_state_no_row_references_is_collected() {
         let node = Stored {
@@ -326,6 +394,7 @@ mod tests {
                 ("kit-kept".into(), Some("sbx_kept".into())),
                 ("kit-deleted".into(), Some("sbx_deleted".into())),
             ],
+            builds: vec![build('a'), build('b'), build('c')],
             ..Default::default()
         };
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -335,7 +404,24 @@ mod tests {
                 .add_service(node.clone())
                 .serve_with_incoming(tonic::transport::server::TcpIncoming::from(listener)),
         );
-        let api = crate::api::tests::replica(crate::sandboxes::SandboxRegistry::in_memory().await);
+        let rows = Arc::new(burrow_store::Store::open_in_memory().await.unwrap());
+        let mut api = crate::api::tests::replica(
+            crate::sandboxes::SandboxRegistry::open(Arc::clone(&rows))
+                .await
+                .unwrap(),
+        );
+        for (id, c) in [("b1", 'a'), ("b2", 'b')] {
+            rows.put_ready_build(&burrow_store::BuildRow {
+                id: id.into(),
+                digest: build(c),
+                template: "t".into(),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        }
+        rows.drop_builds(&[build('b')], 1).await.unwrap();
+        Arc::get_mut(&mut api.0).unwrap().store = Some(Arc::clone(&rows));
         api.0
             .nodes
             .register(
@@ -370,13 +456,26 @@ mod tests {
                 sandboxes: 1,
                 snapshots: 1,
                 volumes: 2,
+                builds: 2,
             }
         );
         let mut removed = node.removed.lock().unwrap().clone();
         removed.sort();
+        let (dropped, orphaned) = (build('b'), build('c'));
         assert_eq!(
             removed,
-            ["kit-deleted", "sbx_deleted", "snap_deleted", "vol_deleted"]
+            [
+                "kit-deleted",
+                "sbx_deleted",
+                dropped.as_str(),
+                orphaned.as_str(),
+                "snap_deleted",
+                "vol_deleted"
+            ]
         );
+    }
+
+    fn build(c: char) -> String {
+        format!("sha256:{}", c.to_string().repeat(64))
     }
 }

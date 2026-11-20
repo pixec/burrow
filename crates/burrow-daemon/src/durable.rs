@@ -1373,6 +1373,7 @@ pub async fn collect_garbage(
     }
 
     stale += crate::volstore::collect_refs(store, GARBAGE_GRACE, &mut referenced).await?;
+    crate::buildstore::remote_refs(store, &mut images).await?;
     let images =
         crate::rootdisk::remote_image_refs(store, &images, GARBAGE_GRACE, &mut referenced).await?;
     let removed = crate::chunks::collect_garbage(store, &referenced, GARBAGE_GRACE).await?;

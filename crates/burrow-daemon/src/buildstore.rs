@@ -30,6 +30,10 @@ use crate::objstore::ObjectStore;
 
 const BUILDS: &str = "builds/";
 
+/// How long a build's manifest is in the store before the orchestrator may
+/// collect it: longer than any upload takes to be reported.
+pub const GRACE: std::time::Duration = std::time::Duration::from_secs(3600);
+
 /// Where a build's manifest is kept in the store.
 pub fn manifest_key(key: &str) -> String {
     format!("{BUILDS}{key}.json")
@@ -287,6 +291,74 @@ async fn local_chunks(data_dir: &Path, blobs: &BlobStore) -> HashMap<String, Loc
     chunks
 }
 
+/// The builds whose manifests the store has held for longer than `grace`,
+/// for the orchestrator to collect those no row keeps.
+pub async fn stored(
+    store: &ObjectStore,
+    grace: std::time::Duration,
+) -> Result<Vec<String>, Status> {
+    let cutoff = std::time::SystemTime::now() - grace;
+    Ok(store
+        .list_aged(BUILDS)
+        .await?
+        .into_iter()
+        .filter(|(_, modified)| modified.is_some_and(|at| at <= cutoff))
+        .filter_map(|(key, _)| {
+            let hex = key.strip_prefix(BUILDS)?.strip_suffix(".json")?;
+            Digest::parse(hex).map(|digest| digest.to_string())
+        })
+        .collect())
+}
+
+/// Deletes a build's manifest from the store, unless it was put again
+/// within `grace`: a node uploading the same build again is about to report
+/// it. Its files go with the collector's next pass once no build names them.
+pub async fn purge(
+    store: &ObjectStore,
+    digest: &str,
+    grace: std::time::Duration,
+) -> Result<bool, Status> {
+    let key = crate::template::key_of(digest)?;
+    let object = manifest_key(&key);
+    let cutoff = std::time::SystemTime::now() - grace;
+    match store.modified(&object).await? {
+        Some(at) if at <= cutoff => {
+            store.delete(&object).await?;
+            Ok(true)
+        }
+        _ => Ok(false),
+    }
+}
+
+/// The digests of every file the builds in the store name, for the
+/// collector: their indexes and chunks are kept while a build names them.
+pub async fn remote_refs(
+    store: &ObjectStore,
+    images: &mut std::collections::HashSet<String>,
+) -> Result<(), Status> {
+    for key in store.list(BUILDS).await? {
+        let Some(hex) = key
+            .strip_prefix(BUILDS)
+            .and_then(|rest| rest.strip_suffix(".json"))
+        else {
+            continue;
+        };
+        let Some(digest) = Digest::parse(hex) else {
+            continue;
+        };
+        let Some(bytes) = store.get_bytes(&key).await? else {
+            continue;
+        };
+        // A manifest that cannot be read stops the pass rather than leaving
+        // its files unreferenced.
+        let text = String::from_utf8(bytes)
+            .map_err(|_| Status::data_loss(format!("build {digest}'s manifest is not UTF-8")))?;
+        let manifest = Manifest::verified(&text, &digest).map_err(Status::data_loss)?;
+        images.extend(artifacts(&manifest)?.into_iter().map(|(_, digest)| digest));
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use std::sync::atomic::Ordering;
@@ -446,5 +518,50 @@ mod tests {
         assert!(may_fetch(&Manifest::default(), false).is_ok());
         let _ = std::fs::remove_dir_all(&a);
         let _ = std::fs::remove_dir_all(&b);
+    }
+
+    /// A build is listed for collection once its manifest is past the
+    /// grace, purged only then, and its files go with the next chunk
+    /// collection once no build names them.
+    #[tokio::test]
+    async fn a_purged_build_leaves_its_files_to_the_collector() {
+        let (store, _, objects) = crate::objstore::fake::controlled().await;
+        let a = scratch("purge");
+        let key = build(&a, &disk(&[2]), "").await;
+        upload(&store, &a, &key, "").await.unwrap();
+        let digest = crate::template::digest_of(&key);
+        let grace = std::time::Duration::from_secs(3600);
+        assert!(stored(&store, grace).await.unwrap().is_empty());
+        assert!(!purge(&store, &digest, grace).await.unwrap());
+
+        let collector = crate::snapshot::SnapshotStore::new(
+            &a.join("collector"),
+            Some(store.clone()),
+            HashMap::new(),
+        );
+        objects
+            .lock()
+            .unwrap()
+            .age("", std::time::Duration::from_secs(3 * 24 * 3600));
+        crate::durable::collect_garbage(&store, &collector)
+            .await
+            .unwrap();
+        assert!(!objects.lock().unwrap().keys("chunks.castr/").is_empty());
+        assert!(!objects.lock().unwrap().keys("images/").is_empty());
+
+        assert_eq!(stored(&store, grace).await.unwrap(), vec![digest.clone()]);
+        assert!(purge(&store, &digest, grace).await.unwrap());
+        // The first pass takes the indexes, the next the chunks they named.
+        for _ in 0..2 {
+            crate::durable::collect_garbage(&store, &collector)
+                .await
+                .unwrap();
+        }
+        let objects = objects.lock().unwrap();
+        assert!(objects.keys("builds/").is_empty());
+        assert!(objects.keys("images/").is_empty());
+        assert!(objects.keys("chunks.castr/").is_empty());
+        drop(objects);
+        let _ = std::fs::remove_dir_all(&a);
     }
 }
