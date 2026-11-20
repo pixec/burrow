@@ -7084,7 +7084,8 @@ impl SandboxManager {
         if want <= current {
             return Ok(());
         }
-        let mut sys = sysinfo::System::new();
+        let mut sys = sysinfo::System::new()
+            .map_err(|err| Status::internal(format!("reading memory: {err}")))?;
         sys.refresh_memory();
         let available = sys.available_memory() / burrow_common::disk::MIB;
         let needed = u64::from(want - current);
@@ -7618,7 +7619,8 @@ impl SandboxManager {
         }
         self.admit_cpu(0, u64::from(shape.vcpus) * 1000).await?;
         let available_mib = {
-            let mut sys = sysinfo::System::new();
+            let mut sys = sysinfo::System::new()
+                .map_err(|err| Status::internal(format!("reading memory: {err}")))?;
             sys.refresh_memory();
             sys.available_memory() / burrow_common::disk::MIB
         };

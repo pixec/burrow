@@ -639,7 +639,7 @@ impl ServeArgs {
             None if !self.access_listen.ip().is_unspecified() => {
                 self.access_listen.ip().to_string()
             }
-            None => sysinfo::System::host_name().unwrap_or_else(|| "localhost".into()),
+            None => sysinfo::System::host_name().unwrap_or_else(|_| "localhost".into()),
         };
         format!("{scheme}://{host}:{port}")
     }
@@ -755,7 +755,7 @@ fn parse_vmm_overhead(value: &str) -> Result<(burrow_vmm::Hypervisor, u32), Stri
 }
 
 fn local_node_info(args: &ServeArgs) -> anyhow::Result<NodeInfo> {
-    let mut sys = sysinfo::System::new();
+    let mut sys = sysinfo::System::new()?;
     sys.refresh_memory();
     // Refused at startup rather than at registration: a node that came up and
     // then quietly registered without the labels it was given would be placed
@@ -913,8 +913,11 @@ fn warm_policy(args: &ServeArgs) -> crate::warm::WarmPolicy {
 }
 
 async fn current_status(sandboxes: &SandboxManager, data_dir: &std::path::Path) -> NodeStatus {
-    let mut sys = sysinfo::System::new();
-    sys.refresh_memory();
+    let sys = sysinfo::System::new().map(|mut sys| {
+        sys.refresh_memory();
+        sys
+    });
+    let available = || sys.as_ref().map_or(0, sysinfo::System::available_memory);
 
     let mut builds = Vec::new();
     let mut kit_builds = Vec::new();
@@ -932,10 +935,10 @@ async fn current_status(sandboxes: &SandboxManager, data_dir: &std::path::Path) 
     }
     // sysinfo undercounts on macOS; see `macnode::available_memory`.
     #[cfg(target_os = "macos")]
-    let avail = crate::macnode::available_memory().unwrap_or_else(|| sys.available_memory());
+    let avail = crate::macnode::available_memory().unwrap_or_else(available);
     #[cfg(not(target_os = "macos"))]
-    let avail = match sys.available_memory() {
-        0 => sys.free_memory(),
+    let avail = match available() {
+        0 => sys.as_ref().map_or(0, sysinfo::System::free_memory),
         n => n,
     };
     NodeStatus {

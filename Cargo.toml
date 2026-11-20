@@ -75,7 +75,7 @@ anyhow = "1"
 clap = { version = "4", features = ["derive", "env"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
-sysinfo = "0.33"
+sysinfo = "0.40"
 tokio-vsock = "0.7"
 rtnetlink = "0.24"
 netlink-packet-route = "0.34"
