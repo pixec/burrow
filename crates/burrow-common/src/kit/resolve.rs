@@ -234,7 +234,7 @@ pub fn lock_digest(resolved: &Resolved) -> String {
         hasher.update(kit.digest.as_bytes());
         hasher.update(b"\n");
     }
-    format!("{:x}", hasher.finalize())
+    hex::encode(hasher.finalize())
 }
 
 #[cfg(test)]

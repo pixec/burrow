@@ -10,6 +10,7 @@ serde = { workspace = true }
 serde_json = { workspace = true }
 regex = { workspace = true }
 sha2 = { workspace = true }
+hex = { workspace = true }
 # For the edge machinery both routers share: reading a request head off a
 # socket is half of what is being shared, and a pure-function half would leave
 # the bound on the read in two places.

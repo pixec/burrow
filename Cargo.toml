@@ -88,8 +88,8 @@ opentelemetry_sdk = { version = "0.33", features = ["rt-tokio"] }
 opentelemetry-otlp = { version = "0.33", features = ["grpc-tonic"] }
 tracing-opentelemetry = "0.34"
 libc = "0.2"
-sha2 = "0.10"
-sha1 = "0.10"
+sha2 = "0.11"
+sha1 = "0.11"
 hex = "0.4"
 base64 = "0.22"
 # Access tokens. No backend feature: burrow-common installs its own, Ed25519
