@@ -7426,8 +7426,9 @@ impl SandboxManager {
             manager.build_user(&key).await
         })
         .await?;
-        self.forget_build_warm(&crate::template::key_of(digest)?)
-            .await;
+        let key = crate::template::key_of(digest)?;
+        self.forget_build_warm(&key).await;
+        self.spares.forget(&key).await;
         Ok(())
     }
 

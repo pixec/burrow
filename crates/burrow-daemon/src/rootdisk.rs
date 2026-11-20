@@ -504,7 +504,8 @@ pub fn changed_since(disk: &Path, base: &Path) -> Option<bool> {
 #[derive(Clone)]
 pub struct Spares {
     dir: PathBuf,
-    held: std::sync::Arc<Mutex<HashMap<String, PathBuf>>>,
+    /// One spare per template, with the version of its image it copies.
+    held: std::sync::Arc<Mutex<HashMap<String, (String, PathBuf)>>>,
     filling: std::sync::Arc<Mutex<std::collections::HashSet<String>>>,
 }
 
@@ -533,27 +534,31 @@ impl Spares {
         if is_clonable(&image, dir) && clone(&image, dest).await? == Made::Clone {
             return Ok(());
         }
-        let key = spare_key(template, &image)?;
-        let spare = self.held.lock().unwrap().remove(&key);
+        let version = image_version(&image)?;
+        let spare = self.held.lock().unwrap().remove(template);
         let taken = match spare {
-            Some(spare) => tokio::fs::rename(&spare, dest).await.is_ok(),
+            Some((held, spare)) if held == version => tokio::fs::rename(&spare, dest).await.is_ok(),
+            Some((_, stale)) => {
+                let _ = tokio::fs::remove_file(stale).await;
+                false
+            }
             None => false,
         };
         if !taken && !tokio::fs::try_exists(dest).await.unwrap_or(false) {
             clone(&image, dest).await?;
         }
-        self.refill(key, image);
+        self.refill(template.to_string(), version, image);
         Ok(())
     }
 
     /// Copies a template's image into a spare behind whatever took the last.
-    fn refill(&self, key: String, image: PathBuf) {
-        if !self.filling.lock().unwrap().insert(key.clone()) {
+    fn refill(&self, template: String, version: String, image: PathBuf) {
+        if !self.filling.lock().unwrap().insert(template.clone()) {
             return;
         }
         let spares = self.clone();
         tokio::spawn(async move {
-            let path = spares.dir.join(format!("{key}.ext4"));
+            let path = spares.dir.join(format!("{template}-{version}.ext4"));
             let made = async {
                 tokio::fs::create_dir_all(&spares.dir).await?;
                 let temp = path.with_extension("tmp");
@@ -562,24 +567,41 @@ impl Spares {
             }
             .await;
             match made {
+                // A template deleted while its spare was copied keeps none.
+                Ok(()) if !tokio::fs::try_exists(&image).await.unwrap_or(false) => {
+                    let _ = tokio::fs::remove_file(&path).await;
+                }
                 Ok(()) => {
-                    let stale = spares.held.lock().unwrap().insert(key.clone(), path);
-                    if let Some(stale) = stale {
+                    let stale = spares
+                        .held
+                        .lock()
+                        .unwrap()
+                        .insert(template.clone(), (version, path.clone()));
+                    if let Some((_, stale)) = stale.filter(|(_, stale)| *stale != path) {
                         let _ = tokio::fs::remove_file(stale).await;
                     }
                 }
-                Err(err) => tracing::warn!(spare = key, %err, "could not make a spare disk"),
+                Err(err) => tracing::warn!(spare = template, %err, "could not make a spare disk"),
             }
-            spares.filling.lock().unwrap().remove(&key);
+            spares.filling.lock().unwrap().remove(&template);
         });
+    }
+
+    /// Drops a deleted template's spare.
+    pub async fn forget(&self, template: &str) {
+        let spare = self.held.lock().unwrap().remove(template);
+        if let Some((_, spare)) = spare {
+            let _ = tokio::fs::remove_file(spare).await;
+        }
     }
 }
 
-/// A spare is of one version of a template's image, named by its inode.
-fn spare_key(template: &str, image: &Path) -> std::io::Result<String> {
+/// Which version of a template's image a spare copies: the file's inode and
+/// modification time.
+fn image_version(image: &Path) -> std::io::Result<String> {
     use std::os::unix::fs::MetadataExt as _;
     let meta = std::fs::metadata(image)?;
-    Ok(format!("{template}-{}-{}", meta.ino(), meta.mtime()))
+    Ok(format!("{}-{}", meta.ino(), meta.mtime()))
 }
 
 /// An image a root disk was cloned from: the file, its digest, and the
@@ -902,6 +924,35 @@ pub async fn materialise(
 
 #[cfg(test)]
 mod tests {
+    /// A template keeps one spare: a new version of its image replaces the
+    /// old one, and deleting the template drops it.
+    #[tokio::test]
+    async fn a_template_keeps_one_spare_and_loses_it_when_deleted() {
+        let root = std::env::temp_dir().join(format!("burrow-spares-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let image = root.join("builds/t").join(IMAGE);
+        std::fs::create_dir_all(image.parent().unwrap()).unwrap();
+        let spares = Spares::new(root.join("spares"));
+        let filled = |spares: &Spares| {
+            let spares = spares.clone();
+            async move {
+                while !spares.filling.lock().unwrap().is_empty() {
+                    tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+                }
+                std::fs::read_dir(&spares.dir).map_or(0, |dir| dir.count())
+            }
+        };
+        for bytes in [b"one".as_slice(), b"two"] {
+            let _ = std::fs::remove_file(&image);
+            std::fs::write(&image, bytes).unwrap();
+            spares.refill("t".into(), image_version(&image).unwrap(), image.clone());
+            assert_eq!(filled(&spares).await, 1);
+        }
+        spares.forget("t").await;
+        assert_eq!(filled(&spares).await, 0);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
     use super::*;
 
     fn scratch(name: &str) -> PathBuf {
