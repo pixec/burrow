@@ -11,7 +11,7 @@
 # build a month later would otherwise produce a different image. This is the
 # multi-arch manifest list, so it still resolves per platform for the
 # amd64/arm64 pair the release workflow builds.
-FROM debian:bookworm-slim@sha256:88200866dfff7ea7f5cbcb6ec7c8a701889efe6fe859fe64d6990e4b07ea4171
+FROM debian:bookworm-slim@sha256:734a72b3d6142a71993b4bc580ca01d8ca687f77a2c422d96a961d3376b179bc
 
 ARG TARGETARCH
 

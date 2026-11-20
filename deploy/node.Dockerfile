@@ -17,7 +17,7 @@
 # build a month later would otherwise produce a different image. This is the
 # multi-arch manifest list, so it still resolves per platform for the
 # amd64/arm64 pair the release workflow builds.
-FROM debian:bookworm-slim@sha256:88200866dfff7ea7f5cbcb6ec7c8a701889efe6fe859fe64d6990e4b07ea4171 AS base
+FROM debian:bookworm-slim@sha256:734a72b3d6142a71993b4bc580ca01d8ca687f77a2c422d96a961d3376b179bc AS base
 
 ARG FIRECRACKER_VERSION=v1.16.1
 # Set by BuildKit as amd64/arm64. Empty on the legacy builder, which is what
@@ -37,9 +37,9 @@ ARG FC_SHA256_AARCH64=8d0e69f6d6f9a1724551f607f18504052c16c1828ee3d4d7b6e6c73380
 
 # The second hypervisor, for templates built with `--hypervisor
 # cloud-hypervisor`. A static binary per arch, checksummed like firecracker's.
-ARG CH_VERSION=v54.0
-ARG CH_SHA256_X86_64=4f4f98a3d661a40f3e5272627cc895a1b2e525f2f6bedf5f895f9cd21ba5c65b
-ARG CH_SHA256_AARCH64=e8a6d9786ea678e739f1a386682846e93742dcb9c7b6e3e0c62e3bda6cff0ef3
+ARG CH_VERSION=v54.1
+ARG CH_SHA256_X86_64=f9ffb9646783233d1f0fb09e77db1fca66499d1041e63bc011b90683c0d49933
+ARG CH_SHA256_AARCH64=96ef17679a4a75be8eefa1956dd645a57f7974ec50565090ea9298f9bbb761ad
 # UEFI firmware from Cloud Hypervisor's edk2 fork. Linux guests boot their
 # kernel directly and never load it; it is here for firmware-booted guests.
 ARG CH_EDK2=ch-97eeb7b09
