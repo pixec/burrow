@@ -62,7 +62,7 @@ nfq = "0.2"
 # A macOS guest's NIC is a socket pair; this is what polices it.
 burrow-net = { workspace = true, features = ["usernet"] }
 # The issuer and serial trustd files a trusted root under.
-x509-parser = "0.16"
+x509-parser = { workspace = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }

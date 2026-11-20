@@ -144,10 +144,8 @@ const CHAIN_CHECK_HOST: &str = "chain-check.burrow.invalid";
 
 /// A certificate authority for inspected connections.
 pub struct Authority {
-    /// The signing certificate as rcgen needs it: the node CA's name and key
-    /// identifier, re-signed by its own key. Never presented to anyone.
-    ca: rcgen::Certificate,
-    key: rcgen::KeyPair,
+    /// The node CA's name, key identifier and key, as rcgen signs with them.
+    ca: rcgen::Issuer<'static, rcgen::KeyPair>,
     /// The node CA exactly as it was issued, sent behind every leaf.
     ca_der: CertificateDer<'static>,
     /// What guests trust, in PEM: the fleet root, or the node CA itself when
@@ -202,17 +200,21 @@ fn pem_of(der: &[u8]) -> String {
     pem
 }
 
-/// A CA certificate's parameters, refusing one that is not a CA.
-fn ca_params(der: &CertificateDer<'_>, what: &str) -> Result<rcgen::CertificateParams, String> {
-    let params = rcgen::CertificateParams::from_ca_cert_der(der)
+/// When a CA certificate stops being valid, refusing one that is not a CA.
+fn ca_not_after(der: &CertificateDer<'_>, what: &str) -> Result<time::OffsetDateTime, String> {
+    let (_, cert) = x509_parser::parse_x509_certificate(der)
         .map_err(|err| format!("parsing the {what}: {err}"))?;
-    if !matches!(params.is_ca, rcgen::IsCa::Ca(_)) {
+    let is_ca = cert
+        .basic_constraints()
+        .map_err(|err| format!("parsing the {what}: {err}"))?
+        .is_some_and(|constraints| constraints.value.ca);
+    if !is_ca {
         return Err(format!(
             "the {what} is not a CA certificate (its basic constraints do not say CA:TRUE); \
              issue one with `burrowd ca issue`"
         ));
     }
-    Ok(params)
+    Ok(cert.validity().not_after.to_datetime())
 }
 
 /// Parameters for a CA certificate valid from now for `lifetime`.
@@ -274,8 +276,8 @@ pub fn issue_node_ca(
         .next()
         .ok_or("the root file holds no certificate")?
         .map_err(|err| format!("root certificate: {err}"))?;
-    let root = ca_params(&root_der, "root certificate")?
-        .self_signed(&root_key)
+    ca_not_after(&root_der, "root certificate")?;
+    let root = rcgen::Issuer::from_ca_cert_der(&root_der, root_key)
         .map_err(|err| format!("root certificate: {err}"))?;
     let key = rcgen::KeyPair::generate().map_err(|err| format!("node key: {err}"))?;
     let mut params = new_ca_params(
@@ -285,7 +287,7 @@ pub fn issue_node_ca(
     )?;
     params.use_authority_key_identifier_extension = true;
     let node = params
-        .signed_by(&key, &root, &root_key)
+        .signed_by(&key, &root)
         .map_err(|err| format!("signing the node certificate: {err}"))?;
     let key_pem = key.serialize_pem();
     Authority::with_root(node.der(), &key_pem, &root_der)?;
@@ -363,7 +365,7 @@ impl Authority {
         key_pem: &str,
         root: &CertificateDer<'static>,
     ) -> Result<Self, String> {
-        ca_params(root, "root certificate")?;
+        ca_not_after(root, "root certificate")?;
         let authority = Self::from_der(node, key_pem, root)?;
         authority.check_chain(root)?;
         Ok(authority)
@@ -395,20 +397,17 @@ impl Authority {
         root: &CertificateDer<'static>,
     ) -> Result<Self, String> {
         let key = rcgen::KeyPair::from_pem(key_pem).map_err(|err| format!("ca key: {err}"))?;
-        let params = ca_params(der, "node CA certificate")?;
-        let expires_at = std::time::SystemTime::from(params.not_after);
+        let not_after = ca_not_after(der, "node CA certificate")?;
+        let expires_at = std::time::SystemTime::from(not_after);
         if expires_at <= std::time::SystemTime::now() {
             return Err(format!(
-                "the node CA certificate expired at {}; issue a new one with `burrowd ca issue`",
-                params.not_after
+                "the node CA certificate expired at {not_after}; issue a new one with `burrowd ca issue`"
             ));
         }
-        let ca = params
-            .self_signed(&key)
+        let ca = rcgen::Issuer::from_ca_cert_der(der, key)
             .map_err(|err| format!("ca certificate: {err}"))?;
         Ok(Self {
             ca,
-            key,
             ca_der: der.clone(),
             root_pem: pem_of(root),
             root_fingerprint: fingerprint(root),
@@ -484,7 +483,7 @@ impl Authority {
         params.not_before = now - std::time::Duration::from_secs(3600);
         params.not_after = (now + LEAF_LIFETIME).min(time::OffsetDateTime::from(self.expires_at));
         let leaf = params
-            .signed_by(&key, &self.ca, &self.key)
+            .signed_by(&key, &self.ca)
             .map_err(|err| format!("signing a leaf for {host}: {err}"))?;
         Ok((CertificateDer::from(leaf.der().to_vec()), key))
     }
@@ -780,14 +779,11 @@ mod tests {
         let root_key =
             rcgen::KeyPair::from_pem(&std::fs::read_to_string(dir.join("root.key")).unwrap())
                 .unwrap();
-        let issuer = rcgen::CertificateParams::from_ca_cert_pem(&root_pem)
-            .unwrap()
-            .self_signed(&root_key)
-            .unwrap();
+        let issuer = rcgen::Issuer::from_ca_cert_pem(&root_pem, root_key).unwrap();
         let key = rcgen::KeyPair::generate().unwrap();
         let leaf = rcgen::CertificateParams::new(vec!["node.example".into()])
             .unwrap()
-            .signed_by(&key, &issuer, &root_key)
+            .signed_by(&key, &issuer)
             .unwrap();
         std::fs::write(dir.join("leaf.pem"), leaf.pem()).unwrap();
         std::fs::write(dir.join("leaf.key"), key.serialize_pem()).unwrap();
@@ -822,13 +818,17 @@ mod tests {
         let (cert, key, root) = fleet(&dir, "node-a");
         let ca = Authority::load(&cert, &key, &root).unwrap();
         let (leaf, _) = ca.mint("example.com").unwrap();
-        let params = rcgen::CertificateParams::from_ca_cert_der(&leaf).unwrap();
-        assert_eq!(
-            params.extended_key_usages,
-            vec![rcgen::ExtendedKeyUsagePurpose::ServerAuth]
+        let (_, leaf) = x509_parser::parse_x509_certificate(&leaf).unwrap();
+        let usages = leaf.extended_key_usage().unwrap().unwrap().value;
+        assert!(usages.server_auth && !usages.any && !usages.client_auth);
+        assert!(usages.other.is_empty());
+        let validity = leaf.validity();
+        let (not_before, not_after) = (
+            validity.not_before.to_datetime(),
+            validity.not_after.to_datetime(),
         );
-        assert!(params.not_after - params.not_before < time::Duration::days(825));
-        assert!(std::time::SystemTime::from(params.not_after) <= ca.expires_at());
+        assert!(not_after - not_before < time::Duration::days(825));
+        assert!(std::time::SystemTime::from(not_after) <= ca.expires_at());
         let _ = std::fs::remove_dir_all(&dir);
     }
 
