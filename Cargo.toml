@@ -80,7 +80,7 @@ tokio-vsock = "0.7"
 rtnetlink = "0.24"
 netlink-packet-route = "0.34"
 futures = "0.3"
-nix = { version = "0.31", features = ["mount", "process", "fs", "time", "ioctl", "signal", "term", "socket", "uio", "mman", "poll", "hostname"] }
+nix = { version = "0.32", features = ["mount", "process", "fs", "time", "ioctl", "signal", "term", "socket", "uio", "mman", "poll", "hostname"] }
 tower = "0.5"
 async-stream = "0.3"
 opentelemetry = "0.33"

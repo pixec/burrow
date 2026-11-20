@@ -643,7 +643,7 @@ dependencies = [
  "ip_network",
  "ip_network_table",
  "libc",
- "nix",
+ "nix 0.31.3",
  "parking_lot",
  "portable-atomic",
  "rand_core 0.6.4",
@@ -666,7 +666,7 @@ dependencies = [
  "anyhow",
  "burrow-proto",
  "clap",
- "nix",
+ "nix 0.32.0",
  "serde_json",
  "tokio",
  "tokio-stream",
@@ -774,7 +774,7 @@ dependencies = [
  "futures",
  "hyper-util",
  "netlink-packet-route",
- "nix",
+ "nix 0.32.0",
  "rtnetlink",
  "serde",
  "serde_json",
@@ -865,7 +865,7 @@ dependencies = [
  "http-body-util",
  "hyper",
  "hyper-util",
- "nix",
+ "nix 0.32.0",
  "rcgen",
  "regex",
  "rustls",
@@ -907,7 +907,7 @@ dependencies = [
  "hyper",
  "hyper-util",
  "libc",
- "nix",
+ "nix 0.32.0",
  "objc2",
  "objc2-app-kit",
  "objc2-foundation",
@@ -2434,6 +2434,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "nix"
+version = "0.32.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "77730ed34f01f4990cb2ea67fec715ecebc6fab9a6396cf83c5529b13f581bdc"
+dependencies = [
+ "bitflags 2.13.1",
+ "cfg-if",
+ "cfg_aliases",
+ "libc",
+ "memoffset",
+]
+
+[[package]]
 name = "nom"
 version = "7.1.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3328,7 +3341,7 @@ dependencies = [
  "netlink-packet-route",
  "netlink-proto",
  "netlink-sys",
- "nix",
+ "nix 0.31.3",
  "tokio",
 ]
 
@@ -4043,7 +4056,7 @@ dependencies = [
  "crypto_box",
  "hex",
  "hmac 0.12.1",
- "nix",
+ "nix 0.31.3",
  "rand 0.8.8",
  "rand_core 0.6.4",
  "reqwest 0.12.28",
@@ -4608,7 +4621,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "6ba782755fc073877e567c2253c0be48e4aa9a254c232d36d3985dfae0bd5205"
 dependencies = [
  "libc",
- "nix",
+ "nix 0.31.3",
 ]
 
 [[package]]
