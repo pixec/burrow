@@ -94,7 +94,7 @@ hex = "0.4"
 base64 = "0.23"
 # Access tokens. No backend feature: burrow-common installs its own, Ed25519
 # through ring, so no RSA or ECDSA code is linked in.
-jsonwebtoken = { version = "11", default-features = false }
+jsonwebtoken = { version = "12", default-features = false }
 ruzstd = "0.9"
 zstd = { version = "0.14", default-features = false }
 rcgen = { version = "0.13", features = ["x509-parser"] }
