@@ -638,6 +638,9 @@ async fn unpack(spec: &VmSpec, jail: Option<&ChJail>) -> Result<(PathBuf, Value,
     let packed: Packed =
         serde_json::from_slice(&tokio::fs::read(spec.workdir.join(STATE_FILE)).await?)?;
     let last_host_port = last_host_port(&packed);
+    let mut state = packed.state;
+    let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH);
+    restamp_clock(&mut state, now.map_or(0, |now| now.as_nanos() as u64));
     let mut vm_config = packed.config;
     config::retarget(&mut vm_config, spec)?;
     jail::set_landlock(&mut vm_config, jail.is_some());
@@ -647,7 +650,7 @@ async fn unpack(spec: &VmSpec, jail: Option<&ChJail>) -> Result<(PathBuf, Value,
     let _ = tokio::fs::remove_dir_all(&dir).await;
     tokio::fs::create_dir_all(&dir).await?;
     tokio::fs::write(dir.join("config.json"), serde_json::to_vec(&written)?).await?;
-    tokio::fs::write(dir.join("state.json"), serde_json::to_vec(&packed.state)?).await?;
+    tokio::fs::write(dir.join("state.json"), serde_json::to_vec(&state)?).await?;
     // Linked: the VMM only reads it, so every sandbox of a warm template
     // restores from the one file.
     let memory = spec.workdir.join(MEMORY_FILE);
@@ -660,6 +663,49 @@ async fn unpack(spec: &VmSpec, jail: Option<&ChJail>) -> Result<(PathBuf, Value,
         std::os::unix::fs::chown(&memory, Some(jail.uid), Some(jail.gid))?;
     }
     Ok((dir, vm_config, last_host_port))
+}
+
+/// `KVM_CLOCK_REALTIME`, on the kvmclock an x86 snapshot saves.
+const KVM_CLOCK_REALTIME: u32 = 1 << 2;
+
+/// Stamps the guest clock a snapshot saved as taken at `now_ns`, so the guest
+/// resumes with its clock where it stopped.
+///
+/// Cloud Hypervisor advances a restored guest's clock by the host wall time
+/// since the snapshot: kvmclock through `KVM_CLOCK_REALTIME` on x86, the
+/// virtual counter on aarch64. A warm snapshot restored hours after it was
+/// built then jumps its guest's scheduler clock by hours under the running
+/// task, and the EEVDF arithmetic of a 7.x guest kernel overflows on that
+/// runtime and crashes in `pick_task_fair`. The handshake sets the wall clock.
+fn restamp_clock(state: &mut Value, now_ns: u64) {
+    let Some(text) = state["snapshot_data"]["state"].as_str() else {
+        return;
+    };
+    let Ok(mut vm) = serde_json::from_str::<Value>(text) else {
+        return;
+    };
+    let Some(clock) = vm.get_mut("clock") else {
+        return;
+    };
+    if let Some(bytes) = clock.get_mut("Kvm").and_then(Value::as_array_mut) {
+        if bytes.len() < 24 {
+            return;
+        }
+        let flags = (8..12).fold(0u32, |flags, i| {
+            flags | ((bytes[i].as_u64().unwrap_or(0) as u32) << (8 * (i - 8)))
+        });
+        if flags & KVM_CLOCK_REALTIME == 0 {
+            return;
+        }
+        for (byte, value) in bytes[16..24].iter_mut().zip(now_ns.to_le_bytes()) {
+            *byte = value.into();
+        }
+    } else if let Some(stamp) = clock.get_mut("host_realtime_ns") {
+        *stamp = now_ns.into();
+    } else {
+        return;
+    }
+    state["snapshot_data"]["state"] = vm.to_string().into();
 }
 
 /// The highest host port the snapshotted VMM was seen to hand out, or that a
@@ -934,6 +980,55 @@ mod tests {
         );
         crate::firecracker::vsock::untrack_ports(&uds);
         let _ = tokio::fs::remove_dir_all(&dir).await;
+    }
+
+    fn vm_state(clock: Value) -> Value {
+        let vm = json!({ "clock": clock, "common_cpuid": [] }).to_string();
+        json!({ "snapshots": {}, "snapshot_data": { "state": vm } })
+    }
+
+    fn clock_of(state: &Value) -> Value {
+        serde_json::from_str::<Value>(state["snapshot_data"]["state"].as_str().unwrap()).unwrap()
+            ["clock"]
+            .clone()
+    }
+
+    /// A kvmclock saved with the host's wall time is advanced by the wall time
+    /// since on restore, which jumped a warm guest's clock by the hours since
+    /// its snapshot was built. Its wall time becomes the restore's.
+    #[test]
+    fn a_restore_moves_the_saved_kvmclock_wall_time_to_now() {
+        let mut saved = [0u8; 48];
+        saved[..8].copy_from_slice(&5_000_000_000u64.to_le_bytes());
+        saved[8..12].copy_from_slice(&(KVM_CLOCK_REALTIME | 1 << 3).to_le_bytes());
+        saved[16..24].copy_from_slice(&1_000u64.to_le_bytes());
+        let mut state = vm_state(json!({ "Kvm": saved.to_vec() }));
+        let now = 1_795_165_474_106_746_855u64;
+        restamp_clock(&mut state, now);
+        let mut want = saved;
+        want[16..24].copy_from_slice(&now.to_le_bytes());
+        assert_eq!(clock_of(&state), json!({ "Kvm": want.to_vec() }));
+
+        let mut unstamped = saved;
+        unstamped[8..12].copy_from_slice(&0u32.to_le_bytes());
+        let mut state = vm_state(json!({ "Kvm": unstamped.to_vec() }));
+        restamp_clock(&mut state, now);
+        assert_eq!(clock_of(&state), json!({ "Kvm": unstamped.to_vec() }));
+    }
+
+    #[test]
+    fn a_restore_moves_the_saved_counter_wall_time_to_now() {
+        let mut state = vm_state(json!({
+            "cntvct": 123, "host_realtime_ns": 1_000, "cntfrq": 1_000_000_000
+        }));
+        restamp_clock(&mut state, 9_000);
+        assert_eq!(
+            clock_of(&state),
+            json!({ "cntvct": 123, "host_realtime_ns": 9_000, "cntfrq": 1_000_000_000 })
+        );
+        let mut clockless = json!({ "snapshots": {} });
+        restamp_clock(&mut clockless, 9_000);
+        assert_eq!(clockless, json!({ "snapshots": {} }));
     }
 
     #[test]
