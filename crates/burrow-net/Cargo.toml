@@ -16,7 +16,7 @@ base64 = { workspace = true }
 libc = { workspace = true }
 # UDP sockets have to set IP_TRANSPARENT before bind; tokio's UdpSocket
 # does not expose that order.
-socket2 = "0.5"
+socket2 = "0.6"
 # A userspace stack for nodes with no nftables (macOS guests under
 # Virtualization.framework). Off by default: only such a node needs smoltcp
 # and the proxy linked into this crate.
