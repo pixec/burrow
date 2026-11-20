@@ -70,7 +70,7 @@ service NodeService {
   rpc UpdateTags(NodeUpdateTagsRequest) returns (burrow.common.v1.Sandbox);
   rpc UpdateAccessPolicy(NodeUpdateAccessRequest) returns (burrow.common.v1.Sandbox);
 
-  // Snapshots. Node-local like templates, so all four act on this node's own
+  // Snapshots. Node-local, so all four act on this node's own
   // store; the orchestrator routes by the node it recorded for the snapshot.
   rpc CreateSnapshot(NodeCreateSnapshotRequest) returns (burrow.common.v1.Snapshot);
   rpc ListSnapshots(NodeListSnapshotsRequest) returns (burrow.api.v1.ListSnapshotsResponse);
@@ -102,12 +102,6 @@ service NodeService {
   rpc BuildTemplate(burrow.api.v1.BuildTemplateRequest) returns (stream burrow.api.v1.BuildLog);
   rpc ListTemplates(burrow.api.v1.ListTemplatesRequest) returns (burrow.api.v1.ListTemplatesResponse);
   rpc DeleteTemplate(burrow.api.v1.DeleteTemplateRequest) returns (burrow.api.v1.DeleteTemplateResponse);
-
-  // Build distribution, by digest. A build is only runnable on a node that
-  // holds it; these three RPCs copy one from a peer.
-  rpc GetTemplateManifest(TemplateManifestRequest) returns (TemplateManifest);
-  rpc FetchBlob(BlobRequest) returns (stream BlobChunk);
-  rpc PullTemplate(PullTemplateRequest) returns (PullTemplateResponse);
 
   rpc ExposePort(burrow.api.v1.ExposePortRequest) returns (burrow.api.v1.PortMapping);
   rpc ListPorts(NodeSandboxRef) returns (burrow.api.v1.ListPortsResponse);
@@ -221,41 +215,6 @@ message NodeListSnapshotsRequest {
   // Empty lists every snapshot this node holds, which is what reconciliation
   // wants.
   string sandbox_id = 1;
-}
-
-// A build, by its digest and canonical manifest. The manifest names every
-// artifact by content, so a node can tell what it already has without
-// transferring anything, and verifies the manifest against the digest.
-//
-// Warm snapshots are deliberately absent: they encode host cpu features and
-// the exact hypervisor version, so the receiving node builds its own.
-message TemplateManifest {
-  string digest = 1;
-  string manifest = 2;
-}
-
-message TemplateManifestRequest {
-  string digest = 1;
-}
-
-message BlobRequest {
-  string digest = 1;
-}
-
-message BlobChunk {
-  bytes data = 1;
-}
-
-message PullTemplateRequest {
-  // Node to pull from, as an address this node can dial.
-  string source_address = 1;
-  TemplateManifest manifest = 2;
-}
-
-message PullTemplateResponse {
-  uint64 bytes_transferred = 1;
-  // Artifacts that were already present and did not need transferring.
-  uint32 blobs_reused = 2;
 }
 
 message NodeSandboxRef {

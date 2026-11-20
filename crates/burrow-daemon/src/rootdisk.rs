@@ -688,6 +688,47 @@ pub async fn image_of(blobs: &crate::blobs::BlobStore, path: &Path) -> Result<Im
     })
 }
 
+/// Records `index` as the chunk index of the image at `path`, whose digest
+/// is `digest`, as [`image_of`] would after reading it, so neither it nor a
+/// build fetch taking chunks from the file reads it again.
+pub async fn remember(
+    blobs: &crate::blobs::BlobStore,
+    path: &Path,
+    digest: &str,
+    index: &ImageIndex,
+) -> std::io::Result<()> {
+    use std::os::unix::fs::MetadataExt as _;
+    let parsed = crate::blobs::Digest::parse(digest)
+        .ok_or_else(|| std::io::Error::other(format!("{digest:?} is not a sha-256 digest")))?;
+    let meta = tokio::fs::metadata(path).await?;
+    let index_file = blobs.index_path(&parsed);
+    let known_path = blobs.inode_record(meta.dev(), meta.ino());
+    if let Some(parent) = known_path.parent() {
+        tokio::fs::create_dir_all(parent).await?;
+    }
+    let json = serde_json::to_vec(index).map_err(std::io::Error::other)?;
+    crate::fsync::replace(&index_file, &index_file.with_extension("tmp"), json).await?;
+    let known = Known {
+        dev: meta.dev(),
+        ino: meta.ino(),
+        size: meta.len(),
+        mtime_ns: meta.mtime() as i128 * 1_000_000_000 + meta.mtime_nsec() as i128,
+        digest: digest.to_string(),
+    };
+    tokio::fs::write(
+        &known_path,
+        serde_json::to_vec(&known).map_err(std::io::Error::other)?,
+    )
+    .await
+}
+
+/// The chunk index recorded for the image with `digest`, if one is.
+pub async fn remembered(blobs: &crate::blobs::BlobStore, digest: &str) -> Option<ImageIndex> {
+    let parsed = crate::blobs::Digest::parse(digest)?;
+    let bytes = tokio::fs::read(blobs.index_path(&parsed)).await.ok()?;
+    serde_json::from_slice(&bytes).ok()
+}
+
 /// A file's SHA-256 and its chunk index, from one sequential read.
 fn index_file(path: &Path) -> std::io::Result<(String, ImageIndex)> {
     let file = std::fs::File::open(path)?;

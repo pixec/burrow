@@ -4076,6 +4076,52 @@ impl SandboxManager {
         )))
     }
 
+    /// The fleet's object store, which every node is started with.
+    #[allow(clippy::result_large_err)]
+    pub fn object_store(&self) -> Result<&crate::objstore::ObjectStore, Status> {
+        self.config
+            .object_store
+            .as_ref()
+            .ok_or_else(|| Status::failed_precondition("this node has no object store"))
+    }
+
+    /// Fetches the build in `key` from the object store unless this node
+    /// holds it, refused for one this node could not run.
+    #[allow(clippy::result_large_err)]
+    pub async fn ensure_build(&self, key: &str) -> Result<(), Status> {
+        if crate::template::read_manifest(&self.config.data_dir, key)
+            .await
+            .is_some()
+        {
+            return Ok(());
+        }
+        let accept = |manifest: &burrow_common::build::Manifest| {
+            crate::buildstore::may_fetch(manifest, cfg!(target_os = "macos"))?;
+            let environment: crate::oci::ImageEnvironment = match &manifest.config {
+                serde_json::Value::Null => Default::default(),
+                config => serde_json::from_value(config.clone())
+                    .map_err(|err| Status::data_loss(format!("image config: {err}")))?,
+            };
+            let (hypervisor, _) = environment.machine()?;
+            self.require_hypervisor(hypervisor)
+        };
+        let fetched =
+            crate::buildstore::fetch(self.object_store()?, &self.config.data_dir, key, accept)
+                .await?;
+        if fetched {
+            self.announce_now();
+        }
+        Ok(())
+    }
+
+    /// Holds the build in `key` for a create, fetching it first where this
+    /// node does not hold it.
+    pub(crate) async fn use_build(&self, key: &str) -> Result<crate::template::BuildUse, Status> {
+        let held = crate::template::hold(key).await;
+        self.ensure_build(key).await?;
+        Ok(held)
+    }
+
     /// Refuses nested virtualization where the guest could not be given it:
     /// under a hypervisor that masks the extensions, or on a node whose KVM
     /// has nesting off.
@@ -8801,7 +8847,7 @@ impl SandboxManager {
         // either refuses or happens before this create looks for it.
         let _build = match template.is_empty() {
             true => None,
-            false => match crate::template::use_build(&self.config.data_dir, &template).await {
+            false => match self.use_build(&template).await {
                 Ok(held) => Some(held),
                 Err(err) => {
                     self.creating.lock().await.remove(&id);

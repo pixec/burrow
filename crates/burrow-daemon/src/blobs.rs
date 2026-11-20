@@ -1,16 +1,9 @@
 //! Content-addressed store for template artifacts.
 //!
-//! Templates are node-local, so moving one between nodes needs a name for an
-//! artifact that does not depend on where it came from, and a way to accept one
-//! from a peer without trusting it. Both fall out of storing artifacts under
-//! their SHA-256 digest: identical artifacts dedupe, "does this node have it"
-//! is answerable without a transfer, and a received blob is hashed as it
-//! arrives and adopted only if the digest matches, so a peer that serves the
-//! wrong bytes poisons nothing.
-//!
-//! Warm snapshots are deliberately not distributable: they encode host CPU
-//! features and the exact Firecracker version, so a receiving node builds its
-//! own from the kernel and rootfs it pulled.
+//! Artifacts are kept under their SHA-256 digest, so identical artifacts
+//! dedupe, "does this node have it" is answerable without a transfer, and a
+//! received blob is hashed as it arrives and adopted only if the digest
+//! matches, so a source that serves the wrong bytes poisons nothing.
 
 use std::io;
 use std::path::{Path, PathBuf};
@@ -21,7 +14,7 @@ use tokio::io::AsyncWriteExt;
 /// A SHA-256 digest, lowercase hex.
 ///
 /// Parsed rather than passed as a bare string because it names a path: an
-/// unchecked digest with a `/` or `..` in it would let a peer address any file
+/// unchecked digest with a `/` or `..` in it would let a caller address any file
 /// on the node.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct Digest(String);
@@ -53,14 +46,8 @@ const CHUNK: usize = 1024 * 1024;
 /// Most a single blob transfer may write before it is abandoned.
 ///
 /// A byte cap, not a time limit: digest verification only happens once the
-/// stream ends, so a peer (or a node impersonating one) that never ends it
-/// would otherwise fill the disk. What bounds how *long* one may run is the
-/// per-chunk deadline in `template::distribute::fetch_blob`; a peer that
-/// trickles bytes slowly enough is stopped by that rather than by this.
-///
-/// Matches the OCI pull path's own [`crate::oci`] layer cap, since a
-/// peer-distributed template's rootfs and kernel are exactly what an OCI pull
-/// would fetch instead.
+/// stream ends, so a source that never ends it would otherwise fill the disk.
+/// Matches the OCI pull path's own [`crate::oci`] layer cap.
 const MAX_BLOB_BYTES: u64 = 8 * 1024 * 1024 * 1024;
 
 pub struct BlobStore {
@@ -401,7 +388,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// The point of content addressing: a peer that serves the wrong bytes
+    /// The point of content addressing: a source that serves the wrong bytes
     /// must not be able to install them as the template everyone else runs.
     #[tokio::test]
     async fn a_blob_that_does_not_match_its_digest_is_rejected() {
@@ -447,10 +434,9 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// A peer (or a node impersonating one) that never sends the chunk which
-    /// would complete or fail the digest check must not be able to stream
-    /// forever and fill the disk. The cap is shrunk here rather than
-    /// transferring gigabytes to prove it.
+    /// A source that never sends the chunk which would complete or fail the
+    /// digest check must not be able to stream forever and fill the disk.
+    /// The cap is shrunk here rather than transferring gigabytes to prove it.
     #[tokio::test]
     async fn a_transfer_past_the_cap_is_abandoned_and_cleaned_up() {
         let dir = scratch("oversized");

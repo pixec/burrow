@@ -531,23 +531,26 @@ pub async fn patch(
     Ok(fetched)
 }
 
-/// Fetches one chunk and checks it is what its digest says. The store retries
-/// each request itself; this retries a body cut off mid-read.
+/// Fetches one chunk and checks it is what its digest says.
 async fn fetch_chunk(store: &ObjectStore, digest: &str) -> Result<Vec<u8>, Status> {
+    let bytes = get_chunk(store, digest).await?;
+    if digest_of(&bytes) != digest {
+        return Err(Status::data_loss(format!(
+            "chunk {digest} from the object store does not match its digest"
+        )));
+    }
+    Ok(bytes)
+}
+
+/// Fetches one chunk unchecked, for a caller that checks the whole file. The
+/// store retries each request itself; this retries a body cut off mid-read.
+async fn get_chunk(store: &ObjectStore, digest: &str) -> Result<Vec<u8>, Status> {
     let mut delay = std::time::Duration::from_millis(100);
     let mut attempt = 0;
     loop {
         attempt += 1;
         match store.get_bytes(&chunk_key(digest)).await {
-            Ok(Some(packed)) => {
-                let bytes = decompress(digest, &packed)?;
-                if digest_of(&bytes) == digest {
-                    return Ok(bytes);
-                }
-                return Err(Status::data_loss(format!(
-                    "chunk {digest} from the object store does not match its digest"
-                )));
-            }
+            Ok(Some(packed)) => return decompress(digest, &packed),
             Ok(None) => {
                 return Err(Status::data_loss(format!(
                     "chunk {digest} is missing from the object store"
@@ -616,6 +619,118 @@ pub async fn get_image(store: &ObjectStore, index: &ImageIndex, path: &Path) -> 
     }
     file.sync_data()
         .map_err(|err| Status::internal(format!("flushing {}: {err}", path.display())))
+}
+
+/// Chunks fetched or read ahead while [`assemble`] writes a file in order.
+const ASSEMBLE_WINDOW: usize = 32;
+
+/// A chunk this node already holds: the file it is in, verified whole, and
+/// its offset there.
+pub type LocalChunk = (Arc<PathBuf>, u64);
+
+/// What [`assemble`] took from where.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct Assembled {
+    pub fetched_bytes: u64,
+    pub reused_bytes: u64,
+}
+
+/// Writes the file `index` describes to `dest`, taking each chunk from
+/// `local` where this node holds it and from the store otherwise, and hashes
+/// it in order on the way. Refused unless the whole file hashes to
+/// `expected`; `dest` is then the caller's to remove.
+pub async fn assemble(
+    store: &ObjectStore,
+    index: &ImageIndex,
+    local: &HashMap<String, LocalChunk>,
+    dest: &Path,
+    expected: &str,
+) -> Result<Assembled, Status> {
+    if index.chunk_size == 0 || index.chunk_size > CHUNK_SIZE {
+        return Err(Status::data_loss(format!(
+            "an index cut in {} byte chunks",
+            index.chunk_size
+        )));
+    }
+    let file = create_sized(dest, index.size)
+        .map_err(|err| Status::internal(format!("creating {}: {err}", dest.display())))?;
+    let (size, chunk_size) = (index.size, index.chunk_size);
+    let (tx, mut rx) = tokio::sync::mpsc::channel::<(u64, Option<Vec<u8>>)>(ASSEMBLE_WINDOW);
+    let writer = tokio::task::spawn_blocking(move || {
+        let mut whole = Sha256::new();
+        let zeroes = vec![0u8; chunk_size as usize];
+        while let Some((start, bytes)) = rx.blocking_recv() {
+            match bytes {
+                None => whole.update(&zeroes[..(size - start).min(chunk_size) as usize]),
+                Some(bytes) => {
+                    whole.update(&bytes);
+                    write_chunk(&file, start, &bytes)?;
+                }
+            }
+        }
+        file.sync_data()?;
+        Ok::<_, std::io::Error>(hex::encode(whole.finalize()))
+    });
+
+    let fetched = std::sync::atomic::AtomicU64::new(0);
+    let reused = std::sync::atomic::AtomicU64::new(0);
+    let mut chunks = futures::stream::iter(0..size.div_ceil(chunk_size))
+        .map(|n| {
+            let (start, end) = index.range(n);
+            let digest = index.chunks.get(&n);
+            let (fetched, reused) = (&fetched, &reused);
+            async move {
+                let Some(digest) = digest else {
+                    return Ok((start, None));
+                };
+                if let Some((path, offset)) = local.get(digest) {
+                    match read_local(Arc::clone(path), *offset, end - start).await {
+                        Ok(bytes) => {
+                            reused.fetch_add(end - start, std::sync::atomic::Ordering::Relaxed);
+                            return Ok((start, Some(bytes)));
+                        }
+                        Err(err) => tracing::debug!(digest, %err, "a local chunk is unreadable"),
+                    }
+                }
+                // Each chunk is left to the whole file's digest: hashing it
+                // on its own as well costs a quarter of a fetch.
+                let bytes = get_chunk(store, digest).await?;
+                fetched.fetch_add(bytes.len() as u64, std::sync::atomic::Ordering::Relaxed);
+                Ok::<_, Status>((start, Some(bytes)))
+            }
+        })
+        .buffered(ASSEMBLE_WINDOW);
+    while let Some(chunk) = chunks.next().await {
+        if tx.send(chunk?).await.is_err() {
+            break;
+        }
+    }
+    drop(chunks);
+    drop(tx);
+    let actual = writer
+        .await
+        .map_err(|err| Status::internal(format!("writing {}: {err}", dest.display())))?
+        .map_err(|err| Status::internal(format!("writing {}: {err}", dest.display())))?;
+    if actual != expected {
+        return Err(Status::data_loss(format!(
+            "{} assembled from the object store hashes as {actual}, not {expected}",
+            dest.display()
+        )));
+    }
+    Ok(Assembled {
+        fetched_bytes: fetched.into_inner(),
+        reused_bytes: reused.into_inner(),
+    })
+}
+
+async fn read_local(path: Arc<PathBuf>, offset: u64, len: u64) -> std::io::Result<Vec<u8>> {
+    tokio::task::spawn_blocking(move || {
+        let mut bytes = vec![0u8; len as usize];
+        std::fs::File::open(path.as_path())?.read_exact_at(&mut bytes, offset)?;
+        Ok(bytes)
+    })
+    .await
+    .map_err(std::io::Error::other)?
 }
 
 fn create_sized(path: &Path, size: u64) -> std::io::Result<std::fs::File> {

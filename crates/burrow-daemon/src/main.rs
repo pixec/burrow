@@ -5,6 +5,7 @@
 mod access;
 mod blobs;
 mod boot;
+mod buildstore;
 mod ca;
 mod caibx;
 mod chunks;

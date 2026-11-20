@@ -22,8 +22,6 @@ pub struct NodeApi {
     pub node_id: std::sync::Arc<std::sync::Mutex<String>>,
     pub data_dir: std::path::PathBuf,
     pub store: std::sync::Arc<burrow_store::Store>,
-    /// Presented when this node dials another to pull a template.
-    pub cluster_token: Option<String>,
     /// Guest agent binary, installed into images imported from OCI. Those
     /// images have no init of their own, and a VM booted without one panics.
     /// A macOS template build installs it too.
@@ -398,18 +396,11 @@ impl NodeApi {
         Ok((req.user, req.group, agent))
     }
 
-    /// The directory key of the build `digest` names, refused when this node
-    /// does not hold it.
+    /// The directory key of the build `digest` names, fetched first where
+    /// this node does not hold it.
     async fn held_build(&self, digest: &str) -> Result<String, Status> {
         let key = crate::template::key_of(digest)?;
-        if crate::template::read_manifest(&self.data_dir, &key)
-            .await
-            .is_none()
-        {
-            return Err(Status::not_found(format!(
-                "build {digest} is not on this node"
-            )));
-        }
+        self.sandboxes.ensure_build(&key).await?;
         Ok(key)
     }
 
@@ -1421,81 +1412,6 @@ impl NodeService for NodeApi {
         self.sandboxes.delete_build(&req.into_inner().name).await?;
         self.sandboxes.announce_now();
         Ok(Response::new(api::DeleteTemplateResponse {}))
-    }
-
-    async fn get_template_manifest(
-        &self,
-        req: Request<nodepb::TemplateManifestRequest>,
-    ) -> Result<Response<nodepb::TemplateManifest>, Status> {
-        let req = req.into_inner();
-        let manifest = crate::template::distribute::manifest(&self.data_dir, &req.digest).await?;
-        Ok(Response::new(manifest))
-    }
-
-    type FetchBlobStream = BoxStream<nodepb::BlobChunk>;
-
-    /// Streams a stored artifact to a peer.
-    ///
-    /// Chunked rather than sent whole: a rootfs is hundreds of megabytes and
-    /// neither side should have to hold it in memory.
-    async fn fetch_blob(
-        &self,
-        req: Request<nodepb::BlobRequest>,
-    ) -> Result<Response<Self::FetchBlobStream>, Status> {
-        use tokio::io::AsyncReadExt;
-
-        let mut file =
-            crate::template::distribute::open_blob(&self.data_dir, &req.into_inner().digest)
-                .await?;
-
-        let stream = async_stream::try_stream! {
-            let mut buffer = vec![0u8; 1024 * 1024];
-            loop {
-                let read = file
-                    .read(&mut buffer)
-                    .await
-                    .map_err(|err| Status::internal(format!("reading blob: {err}")))?;
-                if read == 0 {
-                    break;
-                }
-                yield nodepb::BlobChunk { data: buffer[..read].to_vec() };
-            }
-        };
-        Ok(Response::new(Box::pin(stream)))
-    }
-
-    async fn pull_template(
-        &self,
-        req: Request<nodepb::PullTemplateRequest>,
-    ) -> Result<Response<nodepb::PullTemplateResponse>, Status> {
-        let req = req.into_inner();
-        let manifest = req
-            .manifest
-            .ok_or_else(|| Status::invalid_argument("manifest is required"))?;
-        // A build whose hypervisor this node does not run is one it could
-        // hold and never boot. Refused before a byte is copied.
-        let verified = crate::template::distribute::verify(&manifest)?;
-        let environment: crate::oci::ImageEnvironment = serde_json::from_value(verified.config)
-            .map_err(|err| Status::invalid_argument(format!("image config: {err}")))?;
-        let (hypervisor, _) = environment.machine()?;
-        self.sandboxes.require_hypervisor(hypervisor)?;
-        let (bytes_transferred, blobs_reused) = crate::template::distribute::pull(
-            &self.data_dir,
-            &req.source_address,
-            &manifest,
-            self.cluster_token.as_deref(),
-        )
-        .await?;
-        // The point of pulling was to be placed on; say so at once.
-        self.sandboxes.announce_now();
-        // The snapshot is the one artifact that does not travel, so a node
-        // that received a build warms it itself. Never blocks the pull.
-        self.sandboxes
-            .warm_template(&crate::template::key_of(&manifest.digest)?);
-        Ok(Response::new(nodepb::PullTemplateResponse {
-            bytes_transferred,
-            blobs_reused,
-        }))
     }
 
     async fn expose_port(

@@ -56,9 +56,6 @@ pub struct Placement {
     /// what the node reports with the node's own rule
     /// ([`burrow_common::disk`]), so a node is not chosen only to refuse.
     pub disk_bytes: u64,
-    /// Consider nodes that do not hold the template yet, because the caller
-    /// intends to copy it there first.
-    pub is_template_transfer_allowed: bool,
     /// Labels the node must carry, all of them, matched exactly.
     ///
     /// Burrow's stand-in for regions: operators label their nodes and a caller
@@ -179,10 +176,6 @@ pub enum PlacementError {
         /// what ruled the nodes out.
         disk_note: String,
     },
-    #[error(
-        "no node has template {0:?}; templates are node-local, so build or warm it on a node that can run it"
-    )]
-    TemplateNotOnAnyNode(String),
     #[error(
         "the private network's other members are on node {0}, which cannot take this sandbox, \
          and no node mesh is configured to reach them from another node; start the nodes with \
@@ -1025,19 +1018,17 @@ impl NodeRegistry {
 
     /// Picks a node that can actually run the sandbox being asked for.
     ///
-    /// Two constraints are hard, because ignoring either produces a sandbox
-    /// that looks fine and is not:
-    ///
-    /// - **The template must be present.** Images are node-local, so a node
-    ///   without the template cannot boot it at all.
-    /// - **Private-network peers must be co-located.** Membership is enforced
-    ///   per node, so two members placed on different nodes would silently
-    ///   fail to reach each other rather than erroring.
+    /// Private-network peers must be co-located where no mesh joins the
+    /// nodes, because ignoring that produces a sandbox that looks fine and is
+    /// not: membership is enforced per node, so two members placed on
+    /// different nodes would silently fail to reach each other rather than
+    /// erroring.
     ///
     /// Among eligible nodes, one already holding a warm snapshot of the
-    /// template at the shape asked for wins (a ~300ms
-    /// create against a ~1.5s one), and the least-loaded node breaks the
-    /// remaining ties. "Least loaded" means the node whose *tightest* dimension
+    /// template at the shape asked for wins (a ~300ms create against a ~1.5s
+    /// one), then one holding the build, which any other fetches from the
+    /// object store first, and the least-loaded node breaks the remaining
+    /// ties. "Least loaded" means the node whose *tightest* dimension
     /// has the most headroom: a memory-rich but cpu-saturated node would
     /// otherwise look like the best place for more work.
     pub fn place_for(&self, want: &Placement) -> Result<String, PlacementError> {
@@ -1156,21 +1147,7 @@ impl NodeRegistry {
         }
         let live = holding;
 
-        let with_template: Vec<_> = live
-            .iter()
-            .filter(|e| {
-                want.is_template_transfer_allowed
-                    || want.template.is_empty()
-                    // A node that has not reported yet is given the benefit of
-                    // the doubt; one that has is taken at its word.
-                    || !e.is_reported
-                    || e.status.builds.contains(&want.template)
-            })
-            .collect();
-        if with_template.is_empty() {
-            return Err(PlacementError::TemplateNotOnAnyNode(want.template.clone()));
-        }
-        let gaps: Vec<_> = with_template
+        let gaps: Vec<_> = live
             .iter()
             .map(|e| kernel_gap(e, nodes.values(), want))
             .collect();
@@ -1179,7 +1156,7 @@ impl NodeRegistry {
                 gaps.into_iter().flatten().collect::<Vec<_>>().join("; "),
             ));
         }
-        let with_template: Vec<_> = with_template
+        let with_kernel: Vec<_> = live
             .into_iter()
             .zip(gaps)
             .filter_map(|(e, gap)| gap.is_none().then_some(e))
@@ -1190,7 +1167,7 @@ impl NodeRegistry {
         if let Some(node_id) = &want.prefer_node
             && !want.is_mesh_available
         {
-            return with_template
+            return with_kernel
                 .iter()
                 .find(|e| e.info.id == *node_id)
                 .map(|e| e.info.id.clone())
@@ -1198,8 +1175,8 @@ impl NodeRegistry {
         }
 
         let pending = self.pending.lock().unwrap();
-        let candidates: Vec<&NodeEntry> = with_template.iter().map(|e| **e).collect();
-        let with_room: Vec<_> = with_template
+        let candidates: Vec<&NodeEntry> = with_kernel.clone();
+        let with_room: Vec<_> = with_kernel
             .into_iter()
             .filter(|e| is_fit(e, &pending, want))
             .collect();
@@ -1226,6 +1203,9 @@ impl NodeRegistry {
                     // Same node as the peers: no encryption, no extra hop.
                     want.prefer_node.as_deref() == Some(e.info.id.as_str()),
                     holds_warm(e, want),
+                    // A node without the build fetches it from the object
+                    // store first.
+                    want.template.is_empty() || e.status.builds.contains(&want.template),
                     // Headroom on the tightest dimension, in thousandths so it
                     // orders as an integer.
                     (headroom(e, &pending) * 1000.0) as i64,
@@ -1399,11 +1379,8 @@ impl NodeRegistry {
         hosts
     }
 
-    /// Whether a node already reports holding the build `template`.
-    ///
-    /// Read from the node's last heartbeat, so a build pulled since then
-    /// reads as absent and the pull is a no-op the node resolves itself.
-    pub fn has_template(&self, node_id: &str, template: &str) -> bool {
+    /// Whether a node last reported holding the build `template`.
+    pub fn holds_build(&self, node_id: &str, template: &str) -> bool {
         self.nodes
             .lock()
             .unwrap()
@@ -1418,19 +1395,6 @@ impl NodeRegistry {
             .unwrap()
             .get(node_id)
             .is_some_and(|e| e.status.kit_builds.iter().any(|t| t == template))
-    }
-
-    /// A healthy node holding the build `template`, to copy it from.
-    ///
-    /// Any node holding it will do: a build is named by its contents, so
-    /// every copy is the same copy. Draining nodes are eligible, since they
-    /// refuse new sandboxes, not reads.
-    pub fn source_for_template(&self, template: &str) -> Option<(String, String)> {
-        let nodes = self.nodes.lock().unwrap();
-        nodes
-            .values()
-            .find(|e| e.is_healthy() && e.status.builds.iter().any(|t| t == template))
-            .map(|e| (e.info.id.clone(), e.info.address.clone()))
     }
 
     /// Every known node's id and last status.
@@ -2158,9 +2122,10 @@ mod tests {
         assert!(!offers(&none, "firecracker"));
     }
 
+    /// A node holding the build wins over a roomier one that would fetch it
+    /// first.
     #[test]
-    fn a_node_without_the_template_is_not_eligible() {
-        // Images are node-local; placing here would fail at boot instead.
+    fn a_node_holding_the_build_wins() {
         let registry = registry(&[
             ("a", status(&["other"], &[], 9999)),
             ("b", status(&["wanted"], &[], 1)),
@@ -2179,18 +2144,18 @@ mod tests {
         );
     }
 
+    /// A node without the build fetches it from the object store, so a
+    /// build no node holds still places.
     #[test]
-    fn a_template_no_node_holds_is_an_error_not_a_guess() {
+    fn a_build_no_node_holds_is_placed_for_a_fetch() {
         let registry = registry(&[("a", status(&["other"], &[], 100))]);
-        let err = registry
+        let placed = registry
             .place_for(&Placement {
                 template: "missing".into(),
-                prefer_node: None,
-                is_mesh_available: false,
                 ..Default::default()
             })
-            .unwrap_err();
-        assert!(matches!(err, PlacementError::TemplateNotOnAnyNode(_)));
+            .unwrap();
+        assert_eq!(placed, "a");
     }
 
     #[test]
@@ -2700,79 +2665,6 @@ mod tests {
                 .unwrap();
             assert_eq!(chosen, "large");
         }
-    }
-
-    /// A node that has the template is not the only candidate: it can be
-    /// copied to one that has room.
-    #[test]
-    fn a_template_holder_can_be_found_to_copy_from() {
-        let registry = registry(&[
-            ("holder", status(&["python"], &[], 100)),
-            ("empty", status(&[], &[], 100)),
-        ]);
-        let (node_id, address) = registry.source_for_template("python").expect("a holder");
-        assert_eq!(node_id, "holder");
-        assert_eq!(address, "holder:7071");
-        assert!(registry.source_for_template("nonexistent").is_none());
-    }
-
-    /// Relaxing the template constraint is what lets placement consider a node
-    /// the template has not reached yet.
-    #[test]
-    fn allowing_a_transfer_widens_placement_to_nodes_without_the_template() {
-        // Reports an inventory, and the wanted template is not in it. An
-        // *empty* inventory means "has not reported yet" and is treated as
-        // usable, which is a different case.
-        let registry = registry(&[("other-images", status(&["node"], &[], 100))]);
-        let want = Placement {
-            template: "python".into(),
-            ..Default::default()
-        };
-        assert!(matches!(
-            registry.place_for(&want).unwrap_err(),
-            PlacementError::TemplateNotOnAnyNode(_)
-        ));
-        assert_eq!(
-            registry
-                .place_for(&Placement {
-                    is_template_transfer_allowed: true,
-                    ..want
-                })
-                .unwrap(),
-            "other-images"
-        );
-    }
-
-    /// "Holds no templates" and "has not said yet" are the same empty list on
-    /// the wire, and confusing them sends sandboxes to a node that cannot run
-    /// them.
-    #[test]
-    fn a_node_that_reports_an_empty_inventory_is_not_a_candidate() {
-        let registry = NodeRegistry::default();
-        let _ = registry.register(
-            NodeInfo {
-                id: "fresh".into(),
-                address: "fresh:7071".into(),
-                ..Default::default()
-            },
-            "key".into(),
-            "fresh:51820".into(),
-            None,
-        );
-
-        let want = Placement {
-            template: "python".into(),
-            ..Default::default()
-        };
-        // Before any heartbeat it gets the benefit of the doubt.
-        assert_eq!(registry.place_for(&want).unwrap(), "fresh");
-
-        // Having now said it holds nothing, it is taken at its word.
-        registry.heartbeat("fresh", NodeStatus::default(), None);
-        assert!(matches!(
-            registry.place_for(&want).unwrap_err(),
-            PlacementError::TemplateNotOnAnyNode(_)
-        ));
     }
 
     /// A node is charged a guest's whole cgroup ceiling, with the VMM

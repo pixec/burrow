@@ -2215,7 +2215,7 @@ pub async fn run(args: ServeArgs) -> anyhow::Result<()> {
     // A node has no client-facing surface: everything on it is reached over the
     // node-facing hop, from the orchestrator or from a peer node. So one secret
     // guards all of it, in both directions -- the NodeService interceptor, the
-    // sandbox proxy prelude, peer template pulls, and registration.
+    // sandbox proxy prelude, and registration.
     //
     // `--api-key` is the fallback only so the single-binary dev setup, where
     // one token is handed to everything, keeps working. Sharing the client key
@@ -2243,9 +2243,6 @@ pub async fn run(args: ServeArgs) -> anyhow::Result<()> {
         node_id: node_id.clone(),
         data_dir: args.data_dir.clone(),
         store: Arc::clone(&store),
-        // Pulling a template means dialling a peer node, which is guarded by
-        // the same cluster secret this node presents to the orchestrator.
-        cluster_token: tokens.first().cloned(),
         guest_binary: args.guest_binary.clone(),
         registry_credentials: crate::oci::auth::Store::load(&args.registry_auth).await,
         insecure_registries: args.insecure_registry.clone(),
@@ -2259,7 +2256,7 @@ pub async fn run(args: ServeArgs) -> anyhow::Result<()> {
     }
     let cluster_token = tokens.first().cloned();
     // One token for the whole node-facing hop, so what this node accepts is
-    // also what it presents when registering and when dialling a peer.
+    // also what it presents when registering and to a peer's sandbox proxy.
     let registration_token = cluster_token.clone();
     sandboxes
         .metrics()

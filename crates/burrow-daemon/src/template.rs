@@ -206,11 +206,17 @@ impl Drop for BuildUse {
     }
 }
 
+/// Holds the build in `key` for a create, before it is looked for.
+pub(crate) async fn hold(key: &str) -> BuildUse {
+    *IN_USE.lock().await.entry(key.to_string()).or_default() += 1;
+    BuildUse(key.to_string())
+}
+
 /// Holds the build in `key` for a create, refused when this node does not
 /// hold all of it.
+#[cfg(test)]
 pub(crate) async fn use_build(data_dir: &Path, key: &str) -> Result<BuildUse, Status> {
-    *IN_USE.lock().await.entry(key.to_string()).or_default() += 1;
-    let held = BuildUse(key.to_string());
+    let held = hold(key).await;
     if read_manifest(data_dir, key).await.is_none() {
         return Err(Status::not_found(format!(
             "build {} is not on this node",
@@ -622,6 +628,16 @@ pub mod from_disk {
             burrow_vmm::Hypervisor::CloudHypervisor.as_str(),
         )?;
         let environment = plan(request, &hypervisor)?;
+        stage(data_dir, request, &environment, tx).await
+    }
+
+    /// Clones `request.from_disk` and publishes it with `environment`.
+    async fn stage(
+        data_dir: &Path,
+        request: &api::BuildTemplateRequest,
+        environment: &crate::oci::ImageEnvironment,
+        tx: &LogTx,
+    ) -> Result<Built, Status> {
         let dir = data_dir.join(IMPORTS_DIR);
         let source = dir.join(&request.from_disk);
         let meta = tokio::fs::symlink_metadata(&source).await.map_err(|_| {
@@ -648,7 +664,7 @@ pub mod from_disk {
             crate::rootdisk::clone(&source, &staging.join(crate::rootdisk::IMAGE))
                 .await
                 .map_err(|err| Status::internal(format!("copying the disk: {err}")))?;
-            let manifest = super::manifest_for(&staging, &environment, String::new()).await?;
+            let manifest = super::manifest_for(&staging, environment, String::new()).await?;
             let key = super::publish(data_dir, &staging, &manifest).await?;
             Ok::<_, Status>((key, manifest))
         }
@@ -713,6 +729,54 @@ pub mod from_disk {
             assert!(plan(&with_steps, "cloud-hypervisor").is_err());
             assert!(plan(&request("win.raw"), "firecracker").is_err());
         }
+
+        /// An imported disk is uploaded like any build, and another node
+        /// fetches it whole with the config it was imported with.
+        #[tokio::test]
+        async fn an_imported_disk_is_uploaded_and_fetched() {
+            let root =
+                std::env::temp_dir().join(format!("burrow-import-upload-{}", std::process::id()));
+            let _ = std::fs::remove_dir_all(&root);
+            let (a, b) = (root.join("a"), root.join("b"));
+            std::fs::create_dir_all(a.join(IMPORTS_DIR)).unwrap();
+            let disk: Vec<u8> = (0..3 * 1024 * 1024u32).map(|n| (n % 251) as u8).collect();
+            std::fs::write(a.join(IMPORTS_DIR).join("win.raw"), &disk).unwrap();
+            let environment = crate::oci::ImageEnvironment {
+                cmd: vec!["cmd.exe".into()],
+                hypervisor: "cloud-hypervisor".into(),
+                guest_os: "windows".into(),
+                tpm: true,
+                ..Default::default()
+            };
+            let (tx, _rx) = tokio::sync::mpsc::channel(8);
+            let built = stage(&a, &request("win.raw"), &environment, &tx)
+                .await
+                .unwrap();
+            let (store, _, objects) = crate::objstore::fake::controlled().await;
+            crate::buildstore::upload(&store, &a, &built.key, "")
+                .await
+                .unwrap();
+            assert_eq!(
+                objects.lock().unwrap().keys("images/"),
+                [crate::rootdisk::remote_index_key(
+                    &built.manifest.rootfs.digest
+                )]
+            );
+            assert!(
+                crate::buildstore::fetch(&store, &b, &built.key, |_| Ok(()))
+                    .await
+                    .unwrap()
+            );
+            let fetched = super::super::builds_dir(&b).join(&built.key);
+            assert_eq!(
+                std::fs::read(fetched.join(crate::rootdisk::IMAGE)).unwrap(),
+                disk
+            );
+            let config = crate::oci::image_environment(&b, &built.key).await;
+            assert_eq!(config.guest_os, "windows");
+            assert!(config.tpm);
+            let _ = std::fs::remove_dir_all(&root);
+        }
     }
 }
 
@@ -731,6 +795,12 @@ pub async fn build(
     insecure: Vec<String>,
     tx: LogTx,
 ) {
+    if !request.from.is_empty()
+        && let Err(status) = async { manager.ensure_build(&key_of(&request.from)?).await }.await
+    {
+        let _ = tx.send(Err(status)).await;
+        return;
+    }
     // A macOS template is a whole installed machine, not a rootfs, and is
     // neither captured nor warmed like one.
     let built = match crate::macnode::plan(&data_dir, &request).await {
@@ -762,14 +832,34 @@ pub async fn build(
             return;
         }
     };
-    let _ = tx
-        .send(event(api::build_log::Event::Done(built.done())))
-        .await;
+    let reported = async {
+        let store = manager.object_store()?;
+        report(store, &data_dir, &built, api::build_log::Event::Done, &tx).await
+    };
+    if let Err(status) = reported.await {
+        let _ = tx.send(Err(status)).await;
+        return;
+    }
     // Whoever just built a template is about to create from it, and a build
     // with no snapshot cold-boots.
     if built.manifest.guest_os != burrow_vmm::GuestOs::MacOs.as_str() {
         manager.warm_template(&built.key);
     }
+}
+
+/// Uploads a build, then reports it as `event`: the orchestrator records
+/// and tags what a node reports, so nothing is reported that the object
+/// store does not hold.
+async fn report(
+    store: &crate::objstore::ObjectStore,
+    data_dir: &Path,
+    built: &Built,
+    event: fn(api::BuildDone) -> api::build_log::Event,
+    tx: &LogTx,
+) -> Result<(), Status> {
+    crate::buildstore::upload(store, data_dir, &built.key, &built.parent).await?;
+    let _ = tx.send(self::event(event(built.done()))).await;
+    Ok(())
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -841,9 +931,14 @@ async fn run_build(
         if request.steps.is_empty() {
             return Ok(base);
         }
-        let _ = tx
-            .send(event(api::build_log::Event::Layer(base.done())))
-            .await;
+        report(
+            manager.object_store()?,
+            data_dir,
+            &base,
+            api::build_log::Event::Layer,
+            tx,
+        )
+        .await?;
         (base.key, base.manifest, hypervisor, kernel)
     } else {
         if request.from.is_empty() {
@@ -876,7 +971,7 @@ async fn run_build(
         (key, manifest, hypervisor, kernel)
     };
 
-    let _base = use_build(data_dir, &base_key).await?;
+    let _base = manager.use_build(&base_key).await?;
     // Steps run on a systemd base, under its systemd, and the image they make
     // keeps it, with the base's boot options.
     let base = crate::oci::image_environment(data_dir, &base_key).await;
@@ -1103,10 +1198,14 @@ impl Step<'_> {
                     manifest: captured.clone(),
                     parent: current.clone(),
                 };
-                let _ = self
-                    .tx
-                    .send(event(api::build_log::Event::Layer(layer.done())))
-                    .await;
+                report(
+                    self.manager.object_store()?,
+                    self.data_dir,
+                    &layer,
+                    api::build_log::Event::Layer,
+                    self.tx,
+                )
+                .await?;
             }
             parent = std::mem::replace(&mut current, key);
             manifest = Some(captured);
@@ -1270,332 +1369,6 @@ pub(crate) async fn exec_streaming(
     Ok(exit)
 }
 
-/// Build distribution: serving a build's artifacts to peers and pulling one
-/// from a peer, by digest.
-///
-/// The seam the object store takes over: a node fetching a build it lacks
-/// reads the same manifest and wants the same artifacts by digest, wherever
-/// they come from.
-pub mod distribute {
-    use std::path::Path;
-
-    use tonic::Status;
-
-    use crate::blobs::{BlobStore, Digest};
-    use burrow_common::build::Manifest;
-    use burrow_proto::node::v1 as nodepb;
-
-    /// The files of a build that travel as blobs, with their digests: the
-    /// rootfs and the kernel. The warm snapshot does not: it is tied to the
-    /// host that took it, so a receiving node warms the build itself.
-    fn artifacts(manifest: &Manifest) -> Result<Vec<(String, Digest)>, Status> {
-        let mut wanted = vec![(manifest.rootfs.file.clone(), &manifest.rootfs.digest)];
-        if !manifest.kernel.is_empty() {
-            wanted.push((crate::boot::KERNEL.to_string(), &manifest.kernel));
-        }
-        wanted
-            .into_iter()
-            .map(|(file, digest)| {
-                super::validate_name(&file)?;
-                let digest = Digest::parse(digest).ok_or_else(|| {
-                    Status::invalid_argument(format!("{file}: not a sha-256 digest"))
-                })?;
-                Ok((file, digest))
-            })
-            .collect()
-    }
-
-    /// A local build's manifest, its artifacts stored as blobs on the way so
-    /// a fetch has something to serve. Nothing is hashed: the manifest
-    /// already names every artifact.
-    pub async fn manifest(
-        data_dir: &Path,
-        digest: &str,
-    ) -> Result<nodepb::TemplateManifest, Status> {
-        let key = super::key_of(digest)?;
-        let manifest = super::read_manifest(data_dir, &key)
-            .await
-            .ok_or_else(|| Status::not_found(format!("no build {digest}")))?;
-        // An installed macOS machine stays on the Mac that installed it until
-        // builds are fetched from the object store.
-        if !manifest.files.is_empty() {
-            return Err(Status::failed_precondition(format!(
-                "build {digest} is an installed macOS machine, which stays on the Mac that \
-                 installed it"
-            )));
-        }
-        let dir = super::builds_dir(data_dir).join(&key);
-        let store = BlobStore::new(data_dir);
-        for (file, digest) in artifacts(&manifest)? {
-            store
-                .adopt(&dir.join(&file), &digest)
-                .await
-                .map_err(|err| Status::internal(format!("storing {file}: {err}")))?;
-        }
-        Ok(nodepb::TemplateManifest {
-            digest: super::digest_of(&key),
-            manifest: super::manifest_bytes(data_dir, &key)
-                .await
-                .ok_or_else(|| Status::not_found(format!("no build {digest}")))?,
-        })
-    }
-
-    /// Opens a stored blob for streaming to a peer.
-    pub async fn open_blob(data_dir: &Path, digest: &str) -> Result<tokio::fs::File, Status> {
-        // Parsed, not trusted: the digest names a path, and an unchecked one
-        // would let a peer ask for any file on this node.
-        let digest = Digest::parse(digest)
-            .ok_or_else(|| Status::invalid_argument("not a sha-256 digest"))?;
-        let store = BlobStore::new(data_dir);
-        tokio::fs::File::open(store.path(&digest))
-            .await
-            .map_err(|_| Status::not_found(format!("no blob {digest}")))
-    }
-
-    /// The manifest a peer sent, verified against the digest it claims.
-    pub fn verify(manifest: &nodepb::TemplateManifest) -> Result<Manifest, Status> {
-        let digest = burrow_common::build::Digest::parse(&manifest.digest)
-            .ok_or_else(|| Status::invalid_argument("not a build digest"))?;
-        Manifest::verified(&manifest.manifest, &digest).map_err(Status::data_loss)
-    }
-
-    /// Fetches whatever of the build this node is missing and installs it.
-    ///
-    /// Returns `(bytes_transferred, blobs_reused)`. A node that already has
-    /// an artifact, say a shared kernel or a retried pull, transfers nothing
-    /// for it, and one that already holds the build transfers nothing at all.
-    pub async fn pull(
-        data_dir: &Path,
-        source_address: &str,
-        wire: &nodepb::TemplateManifest,
-        token: Option<&str>,
-    ) -> Result<(u64, u32), Status> {
-        // The manifest travels from the source through the orchestrator, and
-        // a compromised peer controls it verbatim; it is only trusted once it
-        // hashes to the digest the orchestrator asked for.
-        let manifest = verify(wire)?;
-        let key = super::key_of(&wire.digest)?;
-        if super::read_manifest(data_dir, &key).await.is_some() {
-            return Ok((0, 0));
-        }
-        let wanted = artifacts(&manifest)?;
-        let store = BlobStore::new(data_dir);
-        let mut transferred = 0;
-        let mut reused = 0;
-        let mut client = None;
-        for (_, digest) in &wanted {
-            if store.has(digest).await {
-                reused += 1;
-                continue;
-            }
-            // Connected lazily: a pull where everything is already present
-            // should not need the peer at all.
-            if client.is_none() {
-                client = Some(connect(source_address, token).await?);
-            }
-            transferred += fetch_blob(client.as_mut().expect("connected"), &store, digest).await?;
-        }
-
-        // Assembled beside the builds and published with one rename, so a
-        // create sees either nothing or the whole build.
-        let staging = super::staging_dir(data_dir, &key).await?;
-        let assembled = async {
-            for (file, digest) in &wanted {
-                store
-                    .materialise(digest, &staging.join(file))
-                    .await
-                    .map_err(|err| Status::internal(format!("installing {file}: {err}")))?;
-            }
-            super::publish_bytes(data_dir, &staging, wire.manifest.as_bytes()).await
-        }
-        .await;
-        if assembled.is_err() {
-            let _ = tokio::fs::remove_dir_all(&staging).await;
-        }
-        assembled?;
-
-        tracing::info!(
-            build = wire.digest,
-            source = source_address,
-            transferred,
-            reused,
-            "build pulled from peer"
-        );
-        Ok((transferred, reused))
-    }
-
-    /// Presents the cluster token when dialling a peer node.
-    #[derive(Clone)]
-    pub struct PeerAuth(Option<String>);
-
-    impl tonic::service::Interceptor for PeerAuth {
-        fn call(&mut self, mut req: tonic::Request<()>) -> Result<tonic::Request<()>, Status> {
-            if let Some(token) = &self.0 {
-                let value = format!("Bearer {token}")
-                    .parse()
-                    .map_err(|_| Status::internal("malformed node token"))?;
-                req.metadata_mut().insert("authorization", value);
-            }
-            Ok(req)
-        }
-    }
-
-    type PeerClient = nodepb::node_service_client::NodeServiceClient<
-        tonic::service::interceptor::InterceptedService<tonic::transport::Channel, PeerAuth>,
-    >;
-
-    async fn connect(address: &str, token: Option<&str>) -> Result<PeerClient, Status> {
-        let endpoint = if address.starts_with("http") {
-            address.to_string()
-        } else {
-            format!("http://{address}")
-        };
-        let channel = tonic::transport::Endpoint::try_from(endpoint)
-            .map_err(|err| Status::invalid_argument(format!("source address: {err}")))?
-            .connect()
-            .await
-            .map_err(|err| Status::unavailable(format!("cannot reach {address}: {err}")))?;
-
-        Ok(
-            nodepb::node_service_client::NodeServiceClient::with_interceptor(
-                channel,
-                PeerAuth(token.map(str::to_string)),
-            ),
-        )
-    }
-
-    /// Longest a peer may go without sending the next chunk of a blob.
-    const BLOB_CHUNK_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
-
-    async fn fetch_blob(
-        client: &mut PeerClient,
-        store: &BlobStore,
-        digest: &Digest,
-    ) -> Result<u64, Status> {
-        let mut stream = client
-            .fetch_blob(nodepb::BlobRequest {
-                digest: digest.to_string(),
-            })
-            .await?
-            .into_inner();
-
-        let mut writer = store
-            .receive(digest.clone())
-            .await
-            .map_err(|err| Status::internal(format!("staging blob: {err}")))?;
-        let mut bytes = 0u64;
-        // Per chunk, not for the transfer as a whole: a rootfs is gigabytes and
-        // may legitimately take minutes, but a peer that opens the stream and
-        // then says nothing must not hold a fetch open for the life of the
-        // node.
-        while let Some(chunk) = tokio::time::timeout(BLOB_CHUNK_TIMEOUT, stream.message())
-            .await
-            .map_err(|_| {
-                Status::deadline_exceeded(format!(
-                    "peer sent nothing for {BLOB_CHUNK_TIMEOUT:?} while serving blob {digest}"
-                ))
-            })??
-        {
-            bytes += chunk.data.len() as u64;
-            writer
-                .write(&chunk.data)
-                .await
-                .map_err(|err| Status::internal(format!("writing blob: {err}")))?;
-        }
-        // Rejects a peer that served the wrong bytes rather than installing
-        // them as the image everyone runs.
-        writer
-            .finish()
-            .await
-            .map_err(|err| Status::data_loss(err.to_string()))?;
-        Ok(bytes)
-    }
-
-    #[cfg(test)]
-    mod tests {
-        use super::*;
-
-        fn scratch(name: &str) -> std::path::PathBuf {
-            let dir = std::env::temp_dir()
-                .join(format!("burrow-distribute-{}-{name}", std::process::id()));
-            let _ = std::fs::remove_dir_all(&dir);
-            std::fs::create_dir_all(&dir).unwrap();
-            dir
-        }
-
-        async fn build(data_dir: &Path, config: &crate::oci::ImageEnvironment) -> String {
-            let staging = super::super::staging_dir(data_dir, "test").await.unwrap();
-            tokio::fs::write(staging.join(crate::rootdisk::IMAGE), b"rootfs")
-                .await
-                .unwrap();
-            tokio::fs::write(staging.join(crate::boot::KERNEL), b"kernel")
-                .await
-                .unwrap();
-            let manifest = super::super::manifest_for(&staging, config, String::new())
-                .await
-                .unwrap();
-            super::super::publish(data_dir, &staging, &manifest)
-                .await
-                .unwrap()
-        }
-
-        /// A build's manifest carries its image config, so the environment
-        /// and trust bundles an image names travel with it, and naming the
-        /// build is enough to read it back.
-        #[tokio::test]
-        async fn a_build_is_described_by_its_manifest_without_hashing_again() {
-            let source = scratch("source");
-            let config = crate::oci::ImageEnvironment {
-                env: vec!["PATH=/usr/bin".into(), "CURL_CA_BUNDLE=/cacert.pem".into()],
-                working_dir: "/app".into(),
-                ..Default::default()
-            };
-            let key = build(&source, &config).await;
-            let wire = manifest(&source, &key).await.unwrap();
-            assert_eq!(wire.digest, super::super::digest_of(&key));
-            let parsed = verify(&wire).unwrap();
-            assert_eq!(parsed.config["working_dir"], "/app");
-            assert!(
-                BlobStore::new(&source)
-                    .has(&Digest::parse(&parsed.rootfs.digest).unwrap())
-                    .await
-            );
-
-            let environment = crate::oci::image_environment(&source, &key).await;
-            assert_eq!(environment.trust_bundles()[0].path, "/cacert.pem");
-            let _ = std::fs::remove_dir_all(&source);
-        }
-
-        /// A manifest that does not hash to the digest it travels under is
-        /// refused before anything is fetched or written.
-        #[tokio::test]
-        async fn a_manifest_that_does_not_match_its_digest_is_refused() {
-            let source = scratch("tampered");
-            let dest = scratch("tampered-dest");
-            let key = build(&source, &Default::default()).await;
-            let mut wire = manifest(&source, &key).await.unwrap();
-            wire.manifest = wire.manifest.replace("rootfs.ext4", "../../etc");
-            assert!(pull(&dest, "unused:0", &wire, None).await.is_err());
-            assert!(!super::super::builds_dir(&dest).exists());
-            let _ = std::fs::remove_dir_all(&source);
-            let _ = std::fs::remove_dir_all(&dest);
-        }
-
-        /// A pull of a build this node already holds transfers nothing.
-        #[tokio::test]
-        async fn a_build_already_held_is_not_pulled_again() {
-            let source = scratch("held");
-            let key = build(&source, &Default::default()).await;
-            let wire = manifest(&source, &key).await.unwrap();
-            assert_eq!(
-                pull(&source, "unused:0", &wire, None).await.unwrap(),
-                (0, 0)
-            );
-            let _ = std::fs::remove_dir_all(&source);
-        }
-    }
-}
-
 /// Caching build steps, so a rebuild only re-runs what changed.
 ///
 /// Each step's result is a build of its own, keyed by the build the step ran
@@ -1725,6 +1498,50 @@ mod tests {
             .unwrap();
         let manifest = manifest_for(&staging, config, String::new()).await.unwrap();
         publish(data_dir, &staging, &manifest).await.unwrap()
+    }
+
+    /// A build is reported only once it is in the object store, and not at
+    /// all when the upload fails, so the orchestrator never tags a build the
+    /// store does not hold.
+    #[tokio::test]
+    async fn a_build_is_reported_only_once_uploaded() {
+        let data_dir = std::env::temp_dir().join(format!("burrow-report-{}", std::process::id()));
+        let _ = tokio::fs::remove_dir_all(&data_dir).await;
+        let key = staged(&data_dir, b"rootfs", &Default::default()).await;
+        let built = Built {
+            name: "t".into(),
+            manifest: read_manifest(&data_dir, &key).await.unwrap(),
+            key: key.clone(),
+            parent: String::new(),
+        };
+        let (store, faults, objects) = crate::objstore::fake::controlled().await;
+        let (tx, mut rx) = mpsc::channel(4);
+
+        faults
+            .slow_downs
+            .store(usize::MAX / 2, std::sync::atomic::Ordering::Relaxed);
+        report(&store, &data_dir, &built, api::build_log::Event::Done, &tx)
+            .await
+            .unwrap_err();
+        assert!(rx.try_recv().is_err());
+        assert!(objects.lock().unwrap().keys("builds/").is_empty());
+
+        faults
+            .slow_downs
+            .store(0, std::sync::atomic::Ordering::Relaxed);
+        report(&store, &data_dir, &built, api::build_log::Event::Done, &tx)
+            .await
+            .unwrap();
+        let reported = rx.try_recv().unwrap().unwrap();
+        assert!(matches!(
+            reported.event,
+            Some(api::build_log::Event::Done(done)) if done.digest == digest_of(&key)
+        ));
+        assert_eq!(
+            objects.lock().unwrap().keys("builds/"),
+            [crate::buildstore::manifest_key(&key)]
+        );
+        let _ = tokio::fs::remove_dir_all(&data_dir).await;
     }
 
     /// A node with templates in the old layout refuses to start; leftover

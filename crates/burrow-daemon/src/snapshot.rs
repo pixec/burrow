@@ -18,7 +18,7 @@
 //!   place, and the manifest is written last, so a crash never leaves a
 //!   half-copied snapshot that reads as complete.
 //!
-//! Node-local by default, like a template: a snapshot encodes host cpu
+//! Node-local by default: a snapshot encodes host cpu
 //! features and the exact Firecracker version. With an object store
 //! configured a published snapshot is also uploaded, behind the create, and a
 //! node that lacks one fetches it on the first create that asks; the

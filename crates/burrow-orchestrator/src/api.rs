@@ -342,9 +342,9 @@ impl ApiService {
         if activation.is_some() {
             req.node_labels.extend(self.0.byol_node_labels.clone());
         }
-        // Refused here as well as on the node: placement charges a node and
-        // may replicate a template before the create is ever sent, and none of
-        // that should be spent on a request the node will reject anyway.
+        // Refused here as well as on the node: placement charges a node
+        // before the create is ever sent, and that should not be spent on a
+        // request the node will reject anyway.
         burrow_common::tags::validate(&req.tags)?;
         burrow_common::tags::validate_labels(&req.node_labels)?;
         // A name has to be settled before placement: refusing a duplicate
@@ -564,11 +564,6 @@ impl ApiService {
                 mem => mem as u64,
             },
             disk_bytes: crate::registry::disk_bytes(resources.as_ref()),
-            // First pass insists the template is already there; only if that
-            // finds nothing do we consider copying it.
-            is_template_transfer_allowed: false,
-            // Carried into the transfer pass too, so copying a template never
-            // widens placement past the hardware the caller asked for.
             node_labels: req.node_labels,
             arch: String::new(),
             hypervisor_version: String::new(),
@@ -632,19 +627,10 @@ impl ApiService {
                          written off"
                     )));
                 }
-                // The node is not a choice here, so the template has to come to
-                // it rather than the sandbox going where the template is.
-                self.replicate_to(&build, &node_id).await?;
                 node_id
             }
             None => match self.place(&want).await {
                 Ok(node_id) => node_id,
-                // Every node that could take the sandbox lacks the template.
-                // Refusing would make placement hostage to wherever a build
-                // happened to land, so copy the template to a node with room.
-                Err(crate::registry::PlacementError::TemplateNotOnAnyNode(name)) => {
-                    self.replicate_then_place(&name, &want).await?
-                }
                 Err(err) => {
                     return Err(match err {
                         crate::registry::PlacementError::NoHealthyNode
@@ -893,95 +879,6 @@ impl ApiService {
         }
     }
 
-    /// Copies a template onto a node that has room, and returns that node.
-    ///
-    /// The transfer is node-to-node: the orchestrator names a source and a
-    /// target and stays off the data path, so a rootfs never crosses the
-    /// control plane.
-    async fn replicate_then_place(
-        &self,
-        template: &str,
-        want: &crate::registry::Placement,
-    ) -> Result<String, Status> {
-        // Only to tell whether placement chose the node that already holds it;
-        // `replicate_to` looks the source up again when there is work to do.
-        let Some((source_id, _)) = self.0.nodes.source_for_template(template) else {
-            return Err(Status::not_found(format!(
-                "no node has template {template:?}; import it with `burrow pull`"
-            )));
-        };
-
-        let target = self
-            .place(&crate::registry::Placement {
-                is_template_transfer_allowed: true,
-                ..want.clone()
-            })
-            .await
-            .map_err(|err| match err {
-                // A constraint the fleet cannot satisfy is not a capacity
-                // problem, and telling a caller to try again later would be
-                // telling them to wait for something that will not happen.
-                crate::registry::PlacementError::NoNodeWithLabels(_) => {
-                    Status::failed_precondition(err.to_string())
-                }
-                err => Status::resource_exhausted(err.to_string()),
-            })?;
-        if target == source_id {
-            // The source had room after all; nothing to copy.
-            return Ok(target);
-        }
-        self.replicate_to(template, &target).await?;
-        Ok(target)
-    }
-
-    /// Copies a template onto one named node, which is already decided.
-    ///
-    /// A volume pins placement the way a snapshot does, and a pinned node that
-    /// happens not to hold the template would otherwise fail the create with a
-    /// missing-file error rather than fetching what it needs.
-    async fn replicate_to(&self, template: &str, target: &str) -> Result<(), Status> {
-        if self.0.nodes.has_template(target, template) {
-            return Ok(());
-        }
-        let Some((source_id, source_address)) = self.0.nodes.source_for_template(template) else {
-            return Err(Status::unavailable(format!(
-                "no reachable node holds build {template}"
-            )));
-        };
-        if source_id == target {
-            return Ok(());
-        }
-
-        let manifest = {
-            let mut source = self.node_client(&source_id).await?;
-            source
-                .get_template_manifest(nodepb::TemplateManifestRequest {
-                    digest: template.to_string(),
-                })
-                .await?
-                .into_inner()
-        };
-
-        let mut client = self.node_client(target).await?;
-        let result = client
-            .pull_template(nodepb::PullTemplateRequest {
-                source_address,
-                manifest: Some(manifest),
-            })
-            .await?
-            .into_inner();
-
-        tracing::info!(
-            template,
-            from = source_id,
-            to = target,
-            bytes = result.bytes_transferred,
-            reused = result.blobs_reused,
-            "build replicated to place a sandbox"
-        );
-        Ok(())
-    }
-
     /// Address a client outside the sandbox uses to reach a published port:
     /// the node's advertised host with the published port substituted.
     fn node_host(&self, node_id: &str, host_port: u32) -> String {
@@ -1168,10 +1065,20 @@ impl ApiService {
         subject: crate::secrets::Subject<'_>,
     ) -> Result<HashMap<String, String>, Status> {
         let mut out = HashMap::new();
-        if !self.0.nodes.is_kit_template(node_id, template) {
+        // A node about to fetch the build has not reported it, so its
+        // manifest says instead.
+        let manifest = match self.0.nodes.holds_build(node_id, template) {
+            _ if template.is_empty() => return Ok(out),
+            true if !self.0.nodes.is_kit_template(node_id, template) => return Ok(out),
+            _ => crate::builds::manifest(crate::builds::store(&self.0)?, template).await?,
+        };
+        if manifest
+            .config
+            .get("kit")
+            .is_none_or(serde_json::Value::is_null)
+        {
             return Ok(out);
         }
-        let manifest = crate::builds::manifest(crate::builds::store(&self.0)?, template).await?;
         let Some(secrets) = &self.0.secrets else {
             return Ok(out);
         };
@@ -2037,8 +1944,6 @@ impl ApiService {
                 mem => mem as u64,
             },
             disk_bytes: crate::registry::disk_bytes(Some(&resources)),
-            // The kernel and rootfs travel with the state.
-            is_template_transfer_allowed: true,
             node_labels,
             arch: sandbox.arch.clone(),
             // A disk checkpoint is booted, not restored, so any version will
@@ -2430,12 +2335,6 @@ impl Burrow for ApiService {
             false => crate::builds::resolve(crate::builds::store(&self.0)?, &req.template).await?,
         };
         let judged = &build;
-        // The build has to be where the sandbox is, the one it already runs
-        // included, which the node may since have lost: its disks and volumes
-        // do not move, so the build comes to them.
-        if !judged.is_empty() {
-            self.replicate_to(judged, &node_id).await?;
-        }
         let (mut client, _admitted) = self.admitted_node_for(&id).await?;
         let subject = crate::secrets::Subject {
             id: &id,
@@ -3152,7 +3051,6 @@ impl Burrow for ApiService {
             // A volume's image is the volume's, which disk admission does
             // not count yet.
             disk_bytes: 0,
-            is_template_transfer_allowed: true,
             node_labels: req.node_labels.clone(),
             arch: String::new(),
             hypervisor_version: String::new(),
@@ -3556,16 +3454,11 @@ impl Burrow for ApiService {
                     "node_id is taken only with from_disk; other builds are placed",
                 ));
             }
-            (true, true) => {
-                let want = build_placement(&req);
-                match self.0.nodes.place_for(&want) {
-                    Ok(node_id) => node_id,
-                    Err(crate::registry::PlacementError::TemplateNotOnAnyNode(build)) => {
-                        self.replicate_then_place(&build, &want).await?
-                    }
-                    Err(err) => return Err(placement_status(err)),
-                }
-            }
+            (true, true) => self
+                .0
+                .nodes
+                .place_for(&build_placement(&req))
+                .map_err(placement_status)?,
         };
         let mut client = self.node_client(&node_id).await?;
         let mut recorder = crate::builds::Recorder::begin(

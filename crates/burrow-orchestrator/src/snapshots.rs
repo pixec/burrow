@@ -1,9 +1,9 @@
 //! Which node holds which snapshot.
 //!
 //! A snapshot encodes host cpu features and the exact Firecracker version, so
-//! it can only be restored where it was taken. That makes it node-local like a
-//! template, and makes this table the thing that decides where a create from a
-//! snapshot is placed.
+//! it can only be restored where it was taken. That makes it node-local, and
+//! makes this table the thing that decides where a create from a snapshot is
+//! placed.
 //!
 //! Which snapshots exist is the store's: each has a row, written before its
 //! node is asked to take it, and a node destroys any snapshot no row names.

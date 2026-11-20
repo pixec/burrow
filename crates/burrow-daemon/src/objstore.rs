@@ -536,6 +536,27 @@ pub(crate) mod fake {
     }
 
     impl Objects {
+        /// The keys under `prefix`.
+        pub fn keys(&self, prefix: &str) -> Vec<String> {
+            let prefix = format!("/test/{prefix}");
+            let mut keys: Vec<String> = self
+                .by_key
+                .keys()
+                .filter_map(|key| key.strip_prefix("/test/"))
+                .filter(|key| format!("/test/{key}").starts_with(&prefix))
+                .map(str::to_string)
+                .collect();
+            keys.sort();
+            keys
+        }
+
+        /// Replaces the body of the object at `key`.
+        pub fn overwrite(&mut self, key: &str, bytes: Vec<u8>) {
+            if let Some((body, _)) = self.by_key.get_mut(&format!("/test/{key}")) {
+                *body = bytes;
+            }
+        }
+
         /// Makes every object under `prefix` read as written `by` ago.
         pub fn age(&mut self, prefix: &str, by: std::time::Duration) {
             let prefix = format!("/test/{prefix}");
@@ -559,6 +580,8 @@ pub(crate) mod fake {
         pub most_in_flight: AtomicUsize,
         /// GETs of keys ending in this fail with `500`.
         pub failing_gets: Mutex<Option<String>>,
+        /// Chunks read, counted per GET.
+        pub chunk_gets: AtomicUsize,
     }
 
     /// A store on a loopback port. `honours_conditions` false is a store that
@@ -717,6 +740,9 @@ pub(crate) mod fake {
                 let delay = faults.put_delay_ms.load(Ordering::Relaxed) as u64;
                 tokio::time::sleep(std::time::Duration::from_millis(delay)).await;
                 faults.in_flight.fetch_sub(1, Ordering::Relaxed);
+            }
+            if method == "GET" && key.contains("/chunks.castr/") {
+                faults.chunk_gets.fetch_add(1, Ordering::Relaxed);
             }
             let (is_listing, object) = (listing.is_some(), key.clone());
             let failing = method == "GET"
