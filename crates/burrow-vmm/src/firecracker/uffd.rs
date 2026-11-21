@@ -26,10 +26,10 @@
 //! The handler runs on a dedicated OS thread, not the tokio runtime: a fault is
 //! a stalled vCPU, so it must never queue behind unrelated async work.
 //!
-//! With huge pages on, a fault is answered with the whole 2 MiB block around
-//! it, which is then collapsed into a huge page in Firecracker's address
-//! space. The kernel never allocates a huge page for a range registered with
-//! a userfaultfd, so served a page at a time a restored guest ran on 4 KiB
+//! With huge pages on, the whole 2 MiB block around a fault is filled and
+//! then collapsed into a huge page in Firecracker's address space. The
+//! kernel never allocates a huge page for a range registered with a
+//! userfaultfd, so served a page at a time a restored guest ran on 4 KiB
 //! mappings for good: every first touch was a fault, a round trip through
 //! this thread and, nested, an exit to the outer hypervisor, and touching
 //! 1 GiB took 16 s against 0.3 s on Cloud Hypervisor. A block costs 2 MiB of
@@ -315,9 +315,11 @@ impl AsRef<memfile::Layer> for Layer {
 /// are zeroes to the guest.
 type Served = Mutex<memfile::PageMap>;
 
-/// Tells the handler thread to stop, waking it out of any poll at once.
+/// Tells the handler thread to stop, or that the VM is restored, waking it
+/// out of any poll at once.
 struct Stop {
     flag: AtomicBool,
+    is_restored: AtomicBool,
     wake: OwnedFd,
 }
 
@@ -330,6 +332,7 @@ impl Stop {
         }
         Ok(Self {
             flag: AtomicBool::new(false),
+            is_restored: AtomicBool::new(false),
             // SAFETY: the descriptor was just created and is named nowhere else.
             wake: unsafe { OwnedFd::from_raw_fd(fd) },
         })
@@ -337,6 +340,15 @@ impl Stop {
 
     fn signal(&self) {
         self.flag.store(true, Ordering::Relaxed);
+        self.wake();
+    }
+
+    fn restored(&self) {
+        self.is_restored.store(true, Ordering::Relaxed);
+        self.wake();
+    }
+
+    fn wake(&self) {
         let one = 1u64;
         // SAFETY: `one` is eight readable bytes, what an eventfd write takes.
         unsafe { libc::write(self.wake.as_raw_fd(), (&raw const one).cast(), 8) };
@@ -344,6 +356,10 @@ impl Stop {
 
     fn is_set(&self) -> bool {
         self.flag.load(Ordering::Relaxed)
+    }
+
+    fn is_restored(&self) -> bool {
+        self.is_restored.load(Ordering::Relaxed)
     }
 
     /// Waits until `fd` is readable or the stop is signalled, returning
@@ -369,6 +385,13 @@ impl Stop {
             } else {
                 Err(err)
             };
+        }
+        // Drained once the restore has woken it, or every poll after would
+        // return at once. A stop is left readable: nothing polls after it.
+        if fds[1].revents != 0 && !self.is_set() {
+            let mut count = 0u64;
+            // SAFETY: `count` is eight writable bytes, what an eventfd read takes.
+            unsafe { libc::read(self.wake.as_raw_fd(), (&raw mut count).cast(), 8) };
         }
         Ok(fds[0].revents != 0)
     }
@@ -471,19 +494,47 @@ impl Collapse {
 }
 
 /// Answers faults a block at a time, collapsing each into a huge page.
+///
+/// Until the VM is restored a fault is answered with its page alone, and its
+/// block is filled once the restore is done and no fault is waiting. The
+/// restore's few faults are Firecracker and KVM putting the VM back together,
+/// one after another, and filling and collapsing a block took milliseconds
+/// each on a nested host. Once restored, a block's first fault is answered
+/// the same way and a second one with the whole block, so a guest walking
+/// through memory does not take a fault per page.
 struct Blocks {
     zeroes: Backing,
     collapse: Collapse,
+    /// Blocks to fill once the handler is idle, by their start address.
+    waiting: std::collections::VecDeque<u64>,
+    is_waiting: std::collections::HashSet<u64>,
+    /// Blocks waiting or filled, which are not filled again.
+    seen: std::collections::HashSet<u64>,
 }
 
 impl Blocks {
-    /// Fills `page` whatever the record says, then every page of the block
-    /// around it not served yet, and wakes the block.
-    ///
-    /// Only `page` must be filled: the guest asked for nothing else. A
-    /// neighbour that cannot be, its contents failing to arrive or its memory
-    /// to be charged, ends the filling and leaves the block on small pages,
-    /// with the rest to fault in on their own.
+    fn new(zeroes: Backing, collapse: Collapse) -> Self {
+        Self {
+            zeroes,
+            collapse,
+            waiting: std::collections::VecDeque::new(),
+            is_waiting: std::collections::HashSet::new(),
+            seen: std::collections::HashSet::new(),
+        }
+    }
+
+    /// Leaves the block around `page` to be filled once idle, unless it has
+    /// been already.
+    fn defer(&mut self, region: &RegionMapping, page: u64) {
+        let (start, _) = region.block_of(page);
+        if self.seen.insert(start) {
+            self.is_waiting.insert(start);
+            self.waiting.push_back(start);
+        }
+    }
+
+    /// Answers a fault on `page`: with the whole block when it is waiting
+    /// and the VM is restored, else with the page alone.
     fn serve(
         &mut self,
         fd: RawFd,
@@ -491,9 +542,76 @@ impl Blocks {
         page: u64,
         layers: &[Layer],
         served: &Served,
+        is_restored: bool,
+    ) -> io::Result<()> {
+        let (start, _) = region.block_of(page);
+        let layer = memfile::resolve(layers, region.offset_of(page));
+        let size = region.page_size as u64;
+        if is_restored && self.is_waiting.remove(&start) {
+            fill(
+                fd,
+                region,
+                page,
+                size,
+                layer,
+                layers,
+                Some(&self.zeroes),
+                served,
+                UFFDIO_COPY_MODE_DONTWAKE,
+            )?;
+            return self.fill_block(fd, region, start, layers, served);
+        }
+        fill(
+            fd,
+            region,
+            page,
+            size,
+            layer,
+            layers,
+            Some(&self.zeroes),
+            served,
+            0,
+        )?;
+        self.defer(region, page);
+        Ok(())
+    }
+
+    /// Fills the oldest waiting block.
+    fn fill_next(
+        &mut self,
+        fd: RawFd,
+        regions: &[RegionMapping],
+        layers: &[Layer],
+        served: &Served,
+    ) -> io::Result<()> {
+        let Some(start) = self.waiting.pop_front() else {
+            return Ok(());
+        };
+        if !self.is_waiting.remove(&start) {
+            return Ok(());
+        }
+        match regions.iter().find(|region| region.is_in_region(start)) {
+            Some(region) => self.fill_block(fd, region, start, layers, served),
+            None => Ok(()),
+        }
+    }
+
+    /// Fills every page of the block at `at` not served yet, collapses it
+    /// and wakes it.
+    ///
+    /// A page that cannot be filled, its contents failing to arrive or its
+    /// memory to be charged, ends the filling and leaves the block on small
+    /// pages, with the rest to fault in on their own.
+    fn fill_block(
+        &mut self,
+        fd: RawFd,
+        region: &RegionMapping,
+        at: u64,
+        layers: &[Layer],
+        served: &Served,
     ) -> io::Result<()> {
         let size = region.page_size as u64;
-        let (start, end) = region.block_of(page);
+        let (start, end) = region.block_of(at);
         let fill = |at: u64, len: u64, layer: Option<usize>| {
             fill(
                 fd,
@@ -507,7 +625,6 @@ impl Blocks {
                 UFFDIO_COPY_MODE_DONTWAKE,
             )
         };
-        fill(page, size, memfile::resolve(layers, region.offset_of(page)))?;
         let runs = {
             let served = served.lock().unwrap();
             let is_missing = |at: u64| !served.contains(region.offset_of(at) / memfile::PAGE);
@@ -603,12 +720,12 @@ fn write_plan(path: &Path, offsets: &[u64]) -> io::Result<()> {
 /// This is the whole point of recording: a restored guest otherwise takes
 /// thousands of individual faults, each one a stalled vCPU and a round trip
 /// into this process. Filling them in one pass turns that into a sequential
-/// copy.
+/// copy. With huge pages on, their blocks are filled once the handler is idle.
 fn prefetch(
     fd: RawFd,
     regions: &[RegionMapping],
     layers: &[Layer],
-    zeroes: Option<&Backing>,
+    mut blocks: Option<&mut Blocks>,
     served: &Served,
     offsets: &[u64],
 ) -> usize {
@@ -649,9 +766,19 @@ fn prefetch(
         }
         let start = region.base_host_virt_addr + (offset - region.offset);
         let len = (end - at) as u64 * page_size;
+        let zeroes = blocks.as_deref().map(|blocks| &blocks.zeroes);
         // A missing page is simply skipped, and with it the rest of its run.
         if fill(fd, region, start, len, layer, layers, zeroes, served, 0).is_ok() {
             filled += end - at;
+            if let Some(blocks) = blocks.as_deref_mut()
+                && page_size == memfile::PAGE
+            {
+                let mut page = start & !(BLOCK - 1);
+                while page < start + len {
+                    blocks.defer(region, page.max(start));
+                    page += BLOCK;
+                }
+            }
         }
         at = end;
     }
@@ -745,6 +872,11 @@ impl UffdBackend {
         })
     }
 
+    /// Tells the handler the VM is restored, so it may fill blocks.
+    pub fn restored(&self) {
+        self.stop.restored();
+    }
+
     /// The pages a diff of this VM holds, at most: every page served so far.
     pub fn served_pages(&self) -> memfile::PageMap {
         self.served.lock().unwrap().clone()
@@ -782,10 +914,7 @@ fn serve(
     // As soon as Firecracker connects, while the peer is the process that
     // did: its pid could be reused while the layout is waited for.
     let mut blocks = if plan.is_huge_page_fill_enabled {
-        Some(Blocks {
-            zeroes: Backing::zeroes()?,
-            collapse: Collapse::of(&stream),
-        })
+        Some(Blocks::new(Backing::zeroes()?, Collapse::of(&stream)))
     } else {
         None
     };
@@ -820,7 +949,7 @@ fn serve(
                 uffd.as_raw_fd(),
                 &regions,
                 &layers,
-                blocks.as_ref().map(|blocks| &blocks.zeroes),
+                blocks.as_mut(),
                 served,
                 &offsets,
             );
@@ -941,8 +1070,18 @@ fn handle_faults(
             return Ok(faulted);
         }
         // Firecracker makes the descriptor non-blocking, so a bare read spun
-        // a host core for as long as the guest ran.
-        if !stop.wait(fd, -1)? {
+        // a host core for as long as the guest ran. Waiting blocks are filled
+        // only while no fault is.
+        let is_filling = stop.is_restored()
+            && blocks
+                .as_deref()
+                .is_some_and(|blocks| !blocks.waiting.is_empty());
+        if !stop.wait(fd, if is_filling { 0 } else { -1 })? {
+            if let Some(blocks) = blocks.as_deref_mut()
+                && !stop.is_set()
+            {
+                blocks.fill_next(fd, regions, layers, served)?;
+            }
             continue;
         }
         // SAFETY: `fd` is the userfaultfd and `buf` is exactly one message.
@@ -976,7 +1115,7 @@ fn handle_faults(
                 faulted.insert(region.offset_of(page));
                 match blocks.as_deref_mut() {
                     Some(blocks) if region.page_size as u64 == memfile::PAGE => {
-                        blocks.serve(fd, region, page, layers, served)?
+                        blocks.serve(fd, region, page, layers, served, stop.is_restored())?
                     }
                     _ => copy_page(fd, region, page, layers, served)?,
                 }
@@ -1367,23 +1506,23 @@ mod tests {
         fn prefetch(
             &self,
             layers: &[Layer],
-            blocks: Option<&Blocks>,
+            blocks: Option<&mut Blocks>,
             served: &Served,
             pages: impl Iterator<Item = u64>,
         ) -> usize {
             let plan: Vec<u64> = pages.map(|page| page * memfile::PAGE).collect();
-            let zeroes = blocks.map(|blocks| &blocks.zeroes);
             prefetch(
                 self.uffd.as_raw_fd(),
                 &self.regions,
                 layers,
-                zeroes,
+                blocks,
                 served,
                 &plan,
             )
         }
 
-        /// Serves faults from `layers` while `guest` runs, then stops.
+        /// Serves faults from `layers` to a restored VM while `guest` runs,
+        /// then stops.
         fn serve(
             &self,
             layers: Vec<Layer>,
@@ -1391,13 +1530,27 @@ mod tests {
             served: &Served,
             guest: impl FnOnce(),
         ) -> std::collections::BTreeSet<u64> {
+            self.serve_restoring(layers, blocks, served, |stop| {
+                stop.restored();
+                guest();
+            })
+        }
+
+        /// As [`Self::serve`], with `guest` saying when the VM is restored.
+        fn serve_restoring(
+            &self,
+            layers: Vec<Layer>,
+            blocks: Option<&mut Blocks>,
+            served: &Served,
+            guest: impl FnOnce(&Stop),
+        ) -> std::collections::BTreeSet<u64> {
             let stop = Stop::new().unwrap();
             std::thread::scope(|scope| {
                 let handler = scope.spawn({
                     let stop = &stop;
                     move || handle_faults(&self.uffd, &self.regions, &layers, served, stop, blocks)
                 });
-                guest();
+                guest(&stop);
                 stop.signal();
                 handler.join().unwrap().unwrap()
             })
@@ -1426,9 +1579,9 @@ mod tests {
     }
 
     fn blocks() -> Blocks {
-        Blocks {
-            zeroes: Backing::zeroes().unwrap(),
-            collapse: Collapse {
+        Blocks::new(
+            Backing::zeroes().unwrap(),
+            Collapse {
                 // SAFETY: pidfd_open takes a pid and flags.
                 pidfd: match unsafe { libc::syscall(libc::SYS_pidfd_open, std::process::id(), 0) } {
                     // SAFETY: the descriptor was just created and is named
@@ -1439,7 +1592,7 @@ mod tests {
                 has_collapsed: false,
                 paused_until: None,
             },
-        }
+        )
     }
 
     /// A base that has not arrived where `missing` says, failing whoever asks
@@ -1479,7 +1632,7 @@ mod tests {
         assert_eq!(
             guest.prefetch(
                 &layers,
-                blocks.as_deref(),
+                blocks.as_deref_mut(),
                 &served,
                 (505..520).chain(1000..1010)
             ),
@@ -1506,11 +1659,53 @@ mod tests {
     }
 
     #[test]
-    fn a_fault_fills_and_collapses_its_block_around_prefetched_pages() {
+    fn a_fault_and_prefetched_pages_are_filled_with_their_blocks() {
         let after_one = serve_a_guest("blocks", Some(&mut blocks()));
-        let block = 1500 / (BLOCK / memfile::PAGE) * (BLOCK / memfile::PAGE);
-        assert!((block..block + BLOCK / memfile::PAGE).all(|page| after_one.contains(page)));
-        assert_eq!(after_one.count(), BLOCK / memfile::PAGE + 25);
+        assert!(after_one.contains(1500));
+    }
+
+    /// The first fault in a block is answered with its page, and the block
+    /// is filled behind it once the VM is restored.
+    #[test]
+    fn a_block_is_filled_behind_its_first_fault_once_restored() {
+        let guest = Guest::new("behind");
+        let layers = vec![guest.layer(vec![(0, PAGES * memfile::PAGE)], None)];
+        let served = Mutex::new(memfile::PageMap::new(PAGES));
+        let per_block = BLOCK / memfile::PAGE;
+        let block = 1500 / per_block * per_block;
+        let mut blocks = blocks();
+        guest.serve_restoring(layers, Some(&mut blocks), &served, |restored| {
+            assert_eq!(guest.read(1500), 1501);
+            std::thread::sleep(Duration::from_millis(20));
+            assert_eq!(served.lock().unwrap().count(), 1);
+            restored.restored();
+            let deadline = Instant::now() + Duration::from_secs(5);
+            while served.lock().unwrap().count() < per_block {
+                assert!(Instant::now() < deadline, "the block was never filled");
+                std::thread::sleep(Duration::from_millis(1));
+            }
+        });
+        let served = served.lock().unwrap();
+        assert!((block..block + per_block).all(|page| served.contains(page)));
+        assert_eq!(served.count(), per_block);
+    }
+
+    /// A second fault in a block still waiting fills the block before it is
+    /// answered.
+    #[test]
+    fn a_second_fault_in_a_block_fills_it() {
+        let guest = Guest::new("second");
+        let layers = vec![guest.layer(vec![(0, PAGES * memfile::PAGE)], None)];
+        let served = Mutex::new(memfile::PageMap::new(PAGES));
+        let per_block = BLOCK / memfile::PAGE;
+        let block = 1500 / per_block * per_block;
+        let mut blocks = blocks();
+        guest.serve(layers, Some(&mut blocks), &served, || {
+            assert_eq!(guest.read(1500), 1501);
+            assert_eq!(guest.read(1501), 1502);
+            let served = served.lock().unwrap();
+            assert!((block..block + per_block).all(|page| served.contains(page)));
+        });
     }
 
     #[test]
@@ -1531,7 +1726,7 @@ mod tests {
             });
             let layers = vec![guest.layer(vec![(0, PAGES * memfile::PAGE)], Some(source.clone()))];
             let served = Mutex::new(memfile::PageMap::new(PAGES));
-            assert_eq!(guest.prefetch(&layers, blocks.as_ref(), &served, 10..20), 0);
+            assert_eq!(guest.prefetch(&layers, blocks.as_mut(), &served, 10..20), 0);
             assert_eq!(served.lock().unwrap().count(), 0);
             *source.missing.lock().unwrap() = None;
             guest.serve(layers, blocks.as_mut(), &served, || {

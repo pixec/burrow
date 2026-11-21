@@ -654,6 +654,10 @@ impl MicroVm {
             let _ = self.process.kill().await;
             return Err(err);
         }
+        #[cfg(target_os = "linux")]
+        if let Some(memory) = &self.memory {
+            memory.restored();
+        }
         self.phases.mark("load");
         // The VMM's own time, not the time it spent waiting to be loaded.
         self.boot_latency += start.elapsed();
