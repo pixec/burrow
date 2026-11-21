@@ -1531,6 +1531,16 @@ fn spawn_handshake(
                 );
             }
             Handshake::Failed(err) if recorded => {
+                // A sandbox deleted under its handshake lost its VM to the
+                // delete, which says nothing about the guest or the snapshot.
+                // One still registering is not deleted, and is reclaimed once
+                // it is registered.
+                let is_registered = manager.sandboxes.lock().await.contains_key(&id);
+                let is_deleted = !is_registered && !manager.creating.lock().await.contains_key(&id);
+                if is_deleted {
+                    tracing::info!(sandbox = id, err, "deleted before its guest handshook");
+                    return;
+                }
                 // Loud, and with the console, because nothing else will report
                 // it: the create it belonged to has already returned.
                 let (reason, has_vm) = match &mut *sandbox.vm.lock().await {
@@ -1538,12 +1548,7 @@ fn spawn_handshake(
                     None => (err, false),
                 };
                 tracing::error!(sandbox = id, reason, "the guest agent never came up");
-                // A sandbox deleted under its handshake lost its VM to the
-                // delete, which says nothing about the snapshot.
-                let is_registered = manager.sandboxes.lock().await.contains_key(&id);
-                if let Some(warm) = warm
-                    .as_ref()
-                    .filter(|_| is_snapshot_suspect && has_vm && is_registered)
+                if let Some(warm) = warm.as_ref().filter(|_| is_snapshot_suspect && has_vm)
                     && let Ok(restored) =
                         crate::warm::Restored::of(&sandbox.workdir.join(sandbox.layout().state))
                 {
@@ -14146,6 +14151,19 @@ pub(crate) mod tests {
 
     /// A manager with no VMs behind it. Shared with the node edge's tests,
     /// which need a sandbox map to miss in.
+    /// What sends a node's first heartbeat as soon as it registers.
+    #[tokio::test]
+    async fn a_report_announced_before_the_wait_is_sent_at_once() {
+        let manager = manager().await;
+        manager.announce_now();
+        tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            manager.wait_to_report(std::time::Duration::from_secs(3600)),
+        )
+        .await
+        .expect("the wait returned at once");
+    }
+
     pub(crate) async fn manager() -> SandboxManager {
         let temp = tempfile::tempdir().unwrap();
         let mut manager = SandboxManager::new(
