@@ -45,18 +45,19 @@ pub async fn create_named(_: &str, _: &Lease) -> Result<String> {
 /// paths where the device may never have been created.
 #[cfg(target_os = "linux")]
 pub async fn delete(name: &str) {
-    let Some(index) = linux::index_of(name) else {
-        return;
-    };
     let removed = async {
         let (connection, handle, _) = rtnetlink::new_connection()?;
         let connection = tokio::spawn(connection);
-        let removed = handle.link().del(index).execute().await;
+        let removed = match linux::link_index(&handle, name).await {
+            Some(index) => handle.link().del(index).execute().await.map(|()| true),
+            None => Ok(false),
+        };
         connection.abort();
         removed.map_err(std::io::Error::other)
     };
     match removed.await {
-        Ok(()) => tracing::debug!(tap = name, "tap device removed"),
+        Ok(true) => tracing::debug!(tap = name, "tap device removed"),
+        Ok(false) => {}
         Err(err) => tracing::warn!(tap = name, %err, "could not remove a tap device"),
     }
 }
@@ -87,11 +88,24 @@ mod linux {
         _union: [u8; 22],
     }
 
-    pub(super) fn index_of(name: &str) -> Option<u32> {
+    /// The index of a device that exists. Asked about a name that does
+    /// not, the kernel runs modprobe for a module of that name, which cost a
+    /// create 6 ms; [`link_index`] asks without.
+    fn index_of(name: &str) -> Option<u32> {
         let name = std::ffi::CString::new(name).ok()?;
         // SAFETY: a NUL-terminated name.
         let index = unsafe { libc::if_nametoindex(name.as_ptr()) };
         (index != 0).then_some(index)
+    }
+
+    /// The index of the device called `name`, if there is one.
+    pub(super) async fn link_index(handle: &Handle, name: &str) -> Option<u32> {
+        use futures::TryStreamExt as _;
+        let mut links = handle.link().get().match_name(name.to_string()).execute();
+        match links.try_next().await {
+            Ok(Some(link)) => Some(link.header.index),
+            _ => None,
+        }
     }
 
     fn netlink(err: rtnetlink::Error) -> std::io::Error {
@@ -139,12 +153,27 @@ mod linux {
     }
 
     pub(super) async fn configure(handle: &Handle, name: &str, lease: &Lease) -> Result<()> {
-        if let Some(stale) = index_of(name) {
+        if let Some(stale) = link_index(handle, name).await {
             let _ = handle.link().del(stale).execute().await;
         }
-        add_tap(name)?;
-        let index = index_of(name)
-            .ok_or_else(|| std::io::Error::other(format!("tap {name} vanished once made")))?;
+        // Off the caller's task: registering a device is the slow part of
+        // making one, and a create stages its disk and VMM alongside.
+        let owned = name.to_string();
+        let index = tokio::task::spawn_blocking(move || {
+            add_tap(&owned)?;
+            // Router advertisements are refused before the interface is up,
+            // so the guest never learns an address from anything but us.
+            // Burrow assigns both families itself, and a tap that
+            // autoconfigured from a neighbouring router would carry an
+            // address no rule names. Duplicate detection is off too: the
+            // link has one other end, and the gateway address would
+            // otherwise be unusable for the first second.
+            quiet_ipv6(&owned);
+            index_of(&owned)
+                .ok_or_else(|| std::io::Error::other(format!("tap {owned} vanished once made")))
+        })
+        .await
+        .map_err(std::io::Error::other)??;
         // The tap is persistent, so one left half made by a failure below
         // would outlive the create that made it.
         let made = address(handle, name, index, lease).await;
@@ -161,14 +190,6 @@ mod linux {
             .execute()
             .await
             .map_err(netlink)?;
-
-        // Router advertisements are refused before the interface is up, so
-        // the guest never learns an address from anything but us. Burrow
-        // assigns both families itself, and a tap that autoconfigured from a
-        // neighbouring router would carry an address no rule names. Duplicate
-        // detection is off too: the link has one other end, and the gateway
-        // address would otherwise be unusable for the first second.
-        quiet_ipv6(name);
 
         // Non-fatal: a host with IPv6 compiled out still runs sandboxes, they
         // just have no v6 link. Failing the create would take the v4 sandbox

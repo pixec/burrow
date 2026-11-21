@@ -859,6 +859,7 @@ dependencies = [
  "burrow-proto",
  "burrow-proxy",
  "burrow-vmm",
+ "futures",
  "libc",
  "rtnetlink",
  "serde_json",

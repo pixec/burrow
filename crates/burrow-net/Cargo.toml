@@ -29,6 +29,7 @@ x25519-dalek = { version = "2", features = ["static_secrets", "getrandom"], opti
 
 [target.'cfg(target_os = "linux")'.dependencies]
 rtnetlink = { workspace = true }
+futures = { workspace = true }
 
 [features]
 usernet = ["dep:smoltcp", "dep:burrow-proxy", "dep:boringtun", "dep:x25519-dalek"]
