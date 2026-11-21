@@ -9242,10 +9242,18 @@ impl SandboxManager {
             // way still has its tap taken down; removing one never made is a
             // no-op.
             guard.tap = Some(tap_name.clone()).filter(|name| !name.is_empty());
+            // On a task of its own, as the rules are, so starting the VMM is
+            // not held up by the work the others do on this one. Dropped, it
+            // kills the VMM it made.
+            let launch = async {
+                tokio::spawn(Vm::launch(spec))
+                    .await
+                    .map_err(|err| burrow_vmm::Error::from(std::io::Error::other(err)))?
+            };
             let (disk, (tap, tap_ms), (launched, launch_ms), (rules, rules_ms)) = tokio::join!(
                 disk,
                 tap_timed,
-                timed(Vm::launch(spec)),
+                timed(launch),
                 timed(self.rule_ahead(ruled))
             );
             // Recorded before anything is inspected: the tap may well have
