@@ -446,10 +446,7 @@ impl VzVm {
     /// it was last restored from, which the framework will not overwrite.
     pub async fn snapshot(&self) -> Result<Duration> {
         let path = self.workdir.join(SAVE_FILE);
-        match std::fs::remove_file(&path) {
-            Err(err) if err.kind() != std::io::ErrorKind::NotFound => return Err(err.into()),
-            _ => {}
-        }
+        crate::snapfile::replace_target(&path).await?;
         let url = OnQueue(file_url(&path));
         self.machine
             .call(move |vm, done| unsafe {

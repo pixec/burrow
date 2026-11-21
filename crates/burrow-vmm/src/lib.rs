@@ -18,6 +18,7 @@ pub mod console;
 mod error;
 mod guest;
 mod http;
+mod snapfile;
 mod vsock;
 
 pub mod cloud_hypervisor;

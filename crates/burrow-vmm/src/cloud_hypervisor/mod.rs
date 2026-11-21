@@ -513,11 +513,10 @@ impl ChVm {
 
     /// Snapshots the **paused** VM into its layout.
     ///
-    /// Both files are replaced by rename rather than written in place, for
-    /// the reason Firecracker's are unlinked first: a sandbox restored from a
-    /// warm snapshot holds them as hard links to the template's, and writing
-    /// through a link would publish this guest's memory as the image every
-    /// later sandbox restores.
+    /// Both files are replaced by rename rather than written in place, so a
+    /// sandbox restored from a warm snapshot, which holds them as hard links
+    /// to the template's, never writes through a link (see
+    /// [`crate::snapfile`]).
     pub async fn snapshot(&self) -> Result<()> {
         let dir = self.workdir.join(SNAPSHOT_DIR);
         let _ = tokio::fs::remove_dir_all(&dir).await;

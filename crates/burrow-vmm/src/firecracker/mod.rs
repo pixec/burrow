@@ -247,27 +247,11 @@ pub struct MicroVm {
     memory: Option<UffdBackend>,
 }
 
-/// Unlinks the files a snapshot is about to be written to.
-///
-/// Sandboxes created from a warm snapshot **hard-link** the template's
-/// `snapshot.vmstate` and `snapshot.mem` into their working directory, which is
-/// what makes a create cheap. Firecracker then writes a new snapshot to those
-/// same relative paths, and writing through a hard link writes into the
-/// template: one sandbox's entire guest memory becomes the image every later
-/// sandbox restores from. That is a cross-sandbox leak of whatever was in RAM,
-/// credentials included, not merely a corrupted template.
-///
-/// Unlinking first gives Firecracker a fresh inode and leaves the template
-/// untouched. It is safe while the VM is running: an open mapping of the old
-/// inode (the page-fault handler's) keeps serving the memory the guest is still
-/// using until the VMM exits.
+/// Unlinks the files a snapshot is about to be written to (see
+/// [`crate::snapfile`]).
 async fn detach_snapshot_targets(workdir: &Path, mem_file: &str) -> Result<()> {
     for name in [SNAPSHOT_FILE, mem_file] {
-        match tokio::fs::remove_file(workdir.join(name)).await {
-            Ok(()) => {}
-            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
-            Err(err) => return Err(err.into()),
-        }
+        crate::snapfile::replace_target(&workdir.join(name)).await?;
     }
     Ok(())
 }
