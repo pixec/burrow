@@ -433,52 +433,43 @@ impl Warm {
 /// The snapshot in `dir`, if it is complete, in the current format, of its
 /// template's kernel and, when `agent` is given, built with that agent.
 async fn read_warm(dir: &Path, agents: Option<&Agents>) -> Option<Warm> {
+    let (dir, agents) = (dir.to_path_buf(), agents.cloned());
+    tokio::task::spawn_blocking(move || read_warm_now(&dir, agents.as_ref()))
+        .await
+        .ok()
+        .flatten()
+}
+
+/// [`read_warm`] on the calling thread. A create reads every snapshot on the
+/// node to charge its disk, so its dozen small reads each are made in one
+/// blocking call rather than a dozen.
+fn read_warm_now(dir: &Path, agents: Option<&Agents>) -> Option<Warm> {
     use std::os::unix::fs::MetadataExt as _;
 
-    let hypervisor: Hypervisor = tokio::fs::read_to_string(dir.join(HYPERVISOR_FILE))
-        .await
-        .ok()?
-        .trim()
-        .parse()
-        .ok()?;
-    let format = tokio::fs::read_to_string(dir.join("format")).await.ok()?;
-    if !is_current_format(&format) {
+    let read = |name: &str| std::fs::read_to_string(dir.join(name)).ok();
+    let hypervisor: Hypervisor = read(HYPERVISOR_FILE)?.trim().parse().ok()?;
+    if !is_current_format(&read("format")?) {
         return None;
     }
-    let guest_os = burrow_vmm::GuestOs::from_record(
-        tokio::fs::read_to_string(dir.join(GUEST_OS_FILE))
-            .await
-            .ok()?
-            .trim(),
-    )?;
-    if let Some(shipped) = agents.and_then(|agents| agents.get(&guest_os)) {
-        let built_with = tokio::fs::read_to_string(dir.join(AGENT_FILE)).await.ok()?;
-        if built_with.trim() != shipped {
-            return None;
-        }
+    let guest_os = burrow_vmm::GuestOs::from_record(read(GUEST_OS_FILE)?.trim())?;
+    if let Some(shipped) = agents.and_then(|agents| agents.get(&guest_os))
+        && read(AGENT_FILE)?.trim() != shipped
+    {
+        return None;
     }
-    let shape = Shape::parse(&tokio::fs::read_to_string(dir.join(SHAPE_FILE)).await.ok()?)?;
-    let sizes = tokio::fs::read_to_string(dir.join(SIZES_FILE)).await.ok()?;
+    let shape = Shape::parse(&read(SHAPE_FILE)?)?;
+    let sizes = read(SIZES_FILE)?;
     let sizes = parse_sizes(&sizes)?;
     for file in hypervisor.layout().files().chain([ROOT_DISK]) {
-        let meta = tokio::fs::metadata(dir.join(file)).await.ok()?;
+        let meta = std::fs::metadata(dir.join(file)).ok()?;
         if sizes.get(file) != Some(&meta.len()) {
             return None;
         }
     }
-    let bytes = tokio::fs::read_to_string(dir.join(BYTES_FILE))
-        .await
-        .ok()?
-        .trim()
-        .parse()
-        .ok()?;
-    let used_at = match tokio::fs::read_to_string(dir.join(USED_FILE)).await {
-        Ok(text) => text.trim().parse().ok(),
-        Err(_) => None,
-    };
-    let used_at = match used_at {
+    let bytes = read(BYTES_FILE)?.trim().parse().ok()?;
+    let used_at = match read(USED_FILE).and_then(|text| text.trim().parse().ok()) {
         Some(at) => at,
-        None => tokio::fs::metadata(dir.join("format")).await.ok()?.mtime(),
+        None => std::fs::metadata(dir.join("format")).ok()?.mtime(),
     };
     Some(Warm {
         dir: dir.to_path_buf(),
@@ -619,35 +610,41 @@ pub async fn discard_restored(dir: &Path, restored: &Restored) -> std::io::Resul
 
 /// Every usable warm snapshot of `template`.
 pub async fn list(templates_dir: &Path, template: &str) -> Vec<Warm> {
-    let mut out = Vec::new();
-    let Ok(mut entries) = tokio::fs::read_dir(warm_dir(templates_dir, template)).await else {
-        return out;
-    };
-    while let Ok(Some(entry)) = entries.next_entry().await {
-        if let Some(warm) = read_warm(&entry.path(), agent()).await {
-            out.push(warm);
-        }
-    }
+    let dir = warm_dir(templates_dir, template);
+    tokio::task::spawn_blocking(move || list_now(&dir))
+        .await
+        .unwrap_or_default()
+}
+
+fn list_now(dir: &Path) -> Vec<Warm> {
+    let mut out: Vec<Warm> = std::fs::read_dir(dir)
+        .into_iter()
+        .flatten()
+        .flatten()
+        .filter_map(|entry| read_warm_now(&entry.path(), agent()))
+        .collect();
     out.sort_by_key(|warm| (warm.shape.vcpus, warm.shape.mem_mib));
     out
 }
 
 /// Every usable warm snapshot on the node, by build.
 pub async fn list_all(templates_dir: &Path) -> Vec<(String, Warm)> {
-    let mut out = Vec::new();
-    let Ok(mut templates) = tokio::fs::read_dir(warm_root(templates_dir)).await else {
-        return out;
-    };
-    while let Ok(Some(entry)) = templates.next_entry().await {
-        let name = entry.file_name().to_string_lossy().into_owned();
-        if name.starts_with('.') || name.contains('.') {
-            continue;
+    let root = warm_root(templates_dir);
+    tokio::task::spawn_blocking(move || {
+        let mut out = Vec::new();
+        for entry in std::fs::read_dir(&root).into_iter().flatten().flatten() {
+            let name = entry.file_name().to_string_lossy().into_owned();
+            if name.starts_with('.') || name.contains('.') {
+                continue;
+            }
+            for warm in list_now(&entry.path()) {
+                out.push((name.clone(), warm));
+            }
         }
-        for warm in list(templates_dir, &name).await {
-            out.push((name.clone(), warm));
-        }
-    }
-    out
+        out
+    })
+    .await
+    .unwrap_or_default()
 }
 
 /// What under `template`'s warm directory cannot be restored: snapshots in
@@ -729,10 +726,12 @@ pub async fn clone_warm_disk(
     let warm = &snapshot.dir;
     crate::rootdisk::clone(&warm.join(ROOT_DISK), &workdir.join(ROOT_DISK)).await?;
     phases.mark("disk");
-    // Best effort: a snapshot whose use went unrecorded is only evicted a
-    // little sooner than it should be.
-    let _ = tokio::fs::write(warm.join(USED_FILE), burrow_common::unix_now().to_string()).await;
-    phases.mark("used");
+    // Best effort, and behind the create: a snapshot whose use went
+    // unrecorded is only evicted a little sooner than it should be.
+    let used = warm.join(USED_FILE);
+    tokio::spawn(async move {
+        let _ = tokio::fs::write(used, burrow_common::unix_now().to_string()).await;
+    });
     Ok(())
 }
 
