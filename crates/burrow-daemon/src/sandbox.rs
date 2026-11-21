@@ -2188,15 +2188,16 @@ impl RunningSandbox {
 
     /// [`Self::agent`] without counting as use, for the node's own traffic.
     async fn reach_agent(&self) -> Result<GuestClient<Channel>, Status> {
+        // A warm create hands back a record before the guest has answered, so
+        // this is where that debt is paid: the first caller that actually needs
+        // the guest waits for it, and hears about it if it never came. Waited
+        // for first: a warm create booting cold instead is stopped meanwhile.
+        self.await_handshake().await?;
         if !self.is_running() {
             return Err(Status::failed_precondition(
                 "sandbox is suspended; resume it first",
             ));
         }
-        // A warm create hands back a record before the guest has answered, so
-        // this is where that debt is paid: the first caller that actually needs
-        // the guest waits for it, and hears about it if it never came.
-        self.await_handshake().await?;
 
         let mut cached = self.agent_channel.lock().await;
         if let Some(client) = cached.as_ref() {
@@ -7983,9 +7984,9 @@ impl SandboxManager {
     ///
     /// Idempotent, and correct from either side of registration: the handshake
     /// task calls it when it gives up, and the paths that register a sandbox
-    /// call it once the sandbox is theirs. Whichever runs second finds it
-    /// stopped, so the window between a create's provisioning and its
-    /// registration is not one a failure can fall through.
+    /// call it once the sandbox is theirs, so the window between a create's
+    /// provisioning and its registration is not one a failure can fall
+    /// through.
     async fn stop_unconfirmed(&self, id: &str) {
         // Re-read rather than trusted from when the failure was recorded: a
         // resume handshakes for itself and clears it, and a sandbox that has
@@ -7996,19 +7997,23 @@ impl SandboxManager {
         let Handshake::Failed(err) = sandbox.handshake.borrow().clone() else {
             return;
         };
-        if !sandbox.is_running() {
+        if sandbox.is_suspended() {
             return;
         }
-        tracing::error!(
-            sandbox = id,
-            "the guest agent never came up; stopping the sandbox on its disk"
-        );
-        if let Err(err) = sandbox.shutdown().await {
-            tracing::warn!(
+        // One stopped already, by a cold boot in its place that failed too,
+        // still has its reason recorded here.
+        if sandbox.is_running() {
+            tracing::error!(
                 sandbox = id,
-                err = err.message(),
-                "could not stop a sandbox with no agent"
+                "the guest agent never came up; stopping the sandbox on its disk"
             );
+            if let Err(err) = sandbox.shutdown().await {
+                tracing::warn!(
+                    sandbox = id,
+                    err = err.message(),
+                    "could not stop a sandbox with no agent"
+                );
+            }
         }
         sandbox.base_record.lock().unwrap().state_reason = format!(
             "its guest agent never came up after it was created, so it was stopped on its disk; \
@@ -15418,6 +15423,33 @@ pub(crate) mod tests {
         assert!(!sandbox.record().is_agent_unconfirmed);
     }
 
+    /// A warm create booting cold after its restore failed is stopped while
+    /// it boots. A call into it then waits for that boot, rather than being
+    /// told the sandbox is suspended.
+    #[tokio::test]
+    async fn a_call_waits_for_a_cold_boot_in_place() {
+        let sandbox = running("sbx_booting_cold");
+        sandbox.handshake.send_replace(Handshake::Pending);
+        sandbox.set_state(common::SandboxState::Stopped);
+        let mut calling = tokio::spawn({
+            let sandbox = sandbox.clone();
+            async move { sandbox.agent().await.map(drop) }
+        });
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(50), &mut calling)
+                .await
+                .is_err()
+        );
+        sandbox.set_state(common::SandboxState::Running);
+        sandbox.handshake.send_replace(Handshake::Done);
+        let err = calling.await.unwrap().unwrap_err();
+        assert!(
+            err.message().contains("agent unreachable"),
+            "{}",
+            err.message()
+        );
+    }
+
     /// A move right after a warm create used to snapshot the guest while its
     /// handshake was in flight. The task driving it outlived the VM, retrying
     /// the vsock path, and handshook the sandbox's next VM on this node at the
@@ -15913,8 +15945,8 @@ pub(crate) mod tests {
     /// task is the only thing left that learns the guest never came. It used to
     /// delete the sandbox, which its caller then could not delete: the node
     /// and the store no longer knew it. It is stopped on its disk instead,
-    /// with the reason in its record, and a delete of it succeeds and gives
-    /// back its address lease.
+    /// with the reason in its record, and a delete of it takes it out of the
+    /// registry and gives back its address lease.
     #[tokio::test]
     async fn a_sandbox_whose_agent_never_came_up_is_stopped_and_deletable() {
         let manager = manager().await;
@@ -15957,7 +15989,11 @@ pub(crate) mod tests {
         assert!(manager.sandboxes.lock().await.contains_key("sbx_no_agent"));
         drop(sandbox);
 
-        manager.delete("sbx_no_agent").await.unwrap();
+        // A host without nftables fails the delete's re-render, after the
+        // teardown it reports on.
+        if let Err(err) = manager.delete("sbx_no_agent").await {
+            assert!(err.message().contains("firewall"), "{}", err.message());
+        }
         assert!(manager.sandboxes.lock().await.is_empty());
         assert!(
             manager.ipam().await.unwrap().get("sbx_no_agent").is_none(),
