@@ -20,7 +20,6 @@
 
 mod config;
 pub mod jail;
-pub mod tpm;
 
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
@@ -151,7 +150,7 @@ impl ChVm {
         };
         let read_only = jail::absolute_paths(&vm_config);
         if let Some(tpm) = &spec.tpm {
-            tpm::start(tpm, true).await?;
+            crate::swtpm::start(tpm, true).await?;
         }
         let spawned = Self::spawn(&spec, &config, &[], read_only).await;
         let mut vm = without_tpm_on_error(&spec, spawned).await?;
@@ -199,7 +198,7 @@ impl ChVm {
         let (restore_dir, vm_config, last_host_port) = unpack(&spec, config.jail.as_ref()).await?;
         let read_only = jail::absolute_paths(&vm_config);
         if let Some(tpm) = &spec.tpm {
-            tpm::start(tpm, false).await?;
+            crate::swtpm::start(tpm, false).await?;
         }
         let source = jail::vmm_workdir(&spec.workdir, config.jail.as_ref())?.join(RESTORE_DIR);
         let source_url = format!("file://{}", source.display());
@@ -358,7 +357,7 @@ impl ChVm {
             }
         }
         if let Some(tpm) = &self.tpm {
-            tpm::stop(tpm, true).await;
+            crate::swtpm::stop(tpm, true).await;
         }
     }
 
@@ -614,9 +613,9 @@ async fn without_tpm_on_error(spec: &VmSpec, spawned: Result<ChVm>) -> Result<Ch
         return spawned;
     };
     match &spawned {
-        Err(_) => tpm::stop(tpm, false).await,
+        Err(_) => crate::swtpm::stop(tpm, false).await,
         Ok(vm) => {
-            if let (Some(cgroup), Some(pid)) = (vm.cgroup.as_ref(), tpm::pid(tpm))
+            if let (Some(cgroup), Some(pid)) = (vm.cgroup.as_ref(), crate::swtpm::pid(tpm))
                 && let Err(err) = cgroup.add(pid)
             {
                 tracing::warn!(%err, pid, "could not move swtpm into the VM's cgroup");

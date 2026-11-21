@@ -183,7 +183,7 @@ pub(crate) fn vm_config(
         vm["vsock"] = json!({ "id": "vsock", "cid": GUEST_CID, "socket": VSOCK_UDS });
     }
     if let Some(tpm) = &spec.tpm {
-        vm["tpm"] = json!({ "socket": super::tpm::socket(tpm) });
+        vm["tpm"] = json!({ "socket": crate::swtpm::socket(tpm) });
     }
     Ok(vm)
 }
@@ -236,7 +236,7 @@ pub(crate) fn retarget(snapshot: &mut Value, spec: &VmSpec) -> Result<()> {
         &spec.tpm,
         snapshot.get("tpm").is_some_and(|tpm| !tpm.is_null()),
     ) {
-        (Some(tpm), true) => snapshot["tpm"]["socket"] = json!(super::tpm::socket(tpm)),
+        (Some(tpm), true) => snapshot["tpm"]["socket"] = json!(crate::swtpm::socket(tpm)),
         (None, false) => {}
         (_, has_tpm) => {
             return Err(Error::Snapshot(format!(

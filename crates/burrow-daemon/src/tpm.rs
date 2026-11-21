@@ -20,7 +20,7 @@ pub const FILE: &str = "tpm.state";
 
 /// Packs the TPM state in `dir`, whose emulator has stopped, into `dest`.
 pub async fn pack(dir: &Path, dest: &Path) -> Result<(), Status> {
-    burrow_vmm::cloud_hypervisor::tpm::pack(dir, dest)
+    burrow_vmm::swtpm::pack(dir, dest)
         .await
         .map_err(|err| Status::internal(format!("capturing the TPM: {err}")))
 }
@@ -32,7 +32,7 @@ pub async fn take(workdir: &Path, dir: &Path) -> Result<bool, Status> {
     if !tokio::fs::try_exists(&packed).await.unwrap_or(false) {
         return Ok(false);
     }
-    burrow_vmm::cloud_hypervisor::tpm::unpack(&packed, dir)
+    burrow_vmm::swtpm::unpack(&packed, dir)
         .await
         .map_err(|err| Status::internal(format!("restoring the TPM: {err}")))?;
     let _ = tokio::fs::remove_file(&packed).await;

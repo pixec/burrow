@@ -23,6 +23,7 @@ mod vsock;
 pub mod cloud_hypervisor;
 pub mod firecracker;
 pub mod memfile;
+pub mod swtpm;
 #[cfg(target_os = "macos")]
 pub mod vz;
 
