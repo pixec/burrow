@@ -6,7 +6,6 @@ mod model;
 mod process;
 #[cfg(target_os = "linux")]
 pub mod uffd;
-pub mod vsock;
 
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
@@ -470,25 +469,6 @@ impl MicroVm {
 
     pub async fn instance_info(&self) -> Result<InstanceInfo> {
         self.api.instance_info().await
-    }
-
-    /// Host-side Unix socket backing the guest's vsock device.
-    pub fn vsock_uds_path(&self) -> PathBuf {
-        self.spec.workdir.join(VSOCK_UDS)
-    }
-
-    /// Opens a connection to a guest vsock port. Reconnect after every resume;
-    /// connections do not survive a pause.
-    pub async fn connect_vsock(&self, port: u32) -> Result<tokio::net::UnixStream> {
-        vsock::connect(&self.vsock_uds_path(), port).await
-    }
-
-    /// Waits for a guest vsock listener to accept, which is the agent's
-    /// readiness signal (and far more precise than console scraping).
-    pub async fn wait_for_vsock(&self, port: u32, timeout: Duration) -> Result<Duration> {
-        crate::GuestAddr::in_workdir(&self.spec.workdir)
-            .wait(port, timeout)
-            .await
     }
 
     pub async fn pause(&self) -> Result<()> {

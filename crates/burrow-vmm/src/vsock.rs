@@ -1,8 +1,8 @@
-//! Host side of Firecracker's "hybrid" vsock.
+//! Host side of the "hybrid" vsock Firecracker and Cloud Hypervisor expose.
 //!
-//! Firecracker does not expose a real `AF_VSOCK` socket to the host. Instead
-//! the host connects to a Unix socket and speaks a short text handshake to say
-//! which guest port it wants:
+//! Neither VMM exposes a real `AF_VSOCK` socket to the host. Instead the host
+//! connects to a Unix socket and speaks a short text handshake to say which
+//! guest port it wants:
 //!
 //! ```text
 //! host -> "CONNECT 1024\n"
@@ -31,11 +31,19 @@ const MAX_HANDSHAKE_LEN: usize = 64;
 
 /// How long the guest gets to answer `CONNECT`.
 ///
-/// Firecracker accepts the Unix socket the moment the VM is up, whether or not
+/// The VMM accepts the Unix socket the moment the VM is up, whether or not
 /// anything inside the guest is listening, so a connect that succeeds proves
 /// nothing until the reply arrives. A guest that accepts and then goes quiet
 /// would otherwise park the caller on this read forever.
 pub const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// How many of a fresh VMM's first host ports a restore skips when the
+/// snapshotted VMM used them.
+const STALE_PORT_WINDOW: u32 = 64;
+const STALE_PORT_TIMEOUT: Duration = Duration::from_secs(2);
+/// A guest port nothing listens on, which the guest refuses at once, so a
+/// skipped host port costs a round trip and never reaches the agent.
+const UNLISTENED_PORT: u32 = u32::MAX - 1;
 
 /// The highest host port each tracked socket's VMM has handed out, from the
 /// `OK <port>` replies. Only sockets [`track_ports`] registered are recorded.
@@ -120,6 +128,51 @@ async fn handshake(uds_path: &Path, port: u32) -> Result<UnixStream> {
     Ok(stream)
 }
 
+/// Uses up the host ports the snapshotted VMM handed out, from the VMM's
+/// `first` up to `last`, so no new connection is given one of them.
+///
+/// The restored guest still holds a socket for each connection it had not
+/// yet closed, and Linux sends one more RST for such a socket when its owner
+/// closes it, even one the host has already seen reset. A fresh VMM hands out
+/// its first ports again, so that RST tore down whichever new connection had
+/// the same port, and a resume's handshake failed as "transport error" right
+/// after connecting. Connections the host had already closed are not in the
+/// snapshot's vsock state, so the ports are those the VMM was seen to give
+/// out, not only those it still held. Cloud Hypervisor itself carries the
+/// port it reached across a snapshot only from cloud-hypervisor#9318, which
+/// v54 predates.
+///
+/// Only the first ports matter, so the skip stops at the window: the guest
+/// closes its stale sockets soon after it resumes, long before a fresh VMM
+/// counts up to ports further on. The
+/// connections are made at once, since the VMM gives out a port for each in
+/// whatever order it takes them.
+pub(crate) async fn skip_stale_ports(uds: &Path, first: u32, last: u32) {
+    if last < first {
+        return;
+    }
+    let last = last.min(first + STALE_PORT_WINDOW - 1);
+    let mut skipping = tokio::task::JoinSet::new();
+    for _ in first..=last {
+        let uds = uds.to_path_buf();
+        skipping.spawn(async move {
+            let _ = connect(&uds, UNLISTENED_PORT).await;
+        });
+    }
+    if tokio::time::timeout(STALE_PORT_TIMEOUT, skipping.join_all())
+        .await
+        .is_err()
+    {
+        tracing::warn!(
+            uds = %uds.display(),
+            ports = last - first + 1,
+            "the guest did not refuse every skipped vsock port in time; a new connection may \
+             still be given a port the restored guest holds"
+        );
+    }
+    note_port(uds, last);
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -180,5 +233,55 @@ mod tests {
         untrack_ports(&path);
         assert_eq!(highest_port(&path), 0);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A resumed guest's agent closed the socket of the connection the host
+    /// had closed just before the suspend, and its RST reset the handshake of
+    /// the restored VMM's first connection, given the same port. Every port
+    /// the snapshotted VMM used is skipped, each against a port the guest
+    /// refuses, up to the end of the window, and a restore of a VMM that used
+    /// none skips nothing. A skip never lowers the highest port recorded.
+    #[tokio::test]
+    async fn a_restore_skips_every_host_port_the_snapshotted_vmm_used() {
+        const FIRST: u32 = 1 << 30;
+        let dir = std::env::temp_dir().join(format!("burrow-vsock-ports-{}", std::process::id()));
+        tokio::fs::create_dir_all(&dir).await.unwrap();
+        let uds = dir.join(crate::VSOCK_UDS);
+        let _ = tokio::fs::remove_file(&uds).await;
+        let listener = tokio::net::UnixListener::bind(&uds).unwrap();
+        let refused = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let requests = refused.clone();
+        let _serving = tokio::spawn(async move {
+            use tokio::io::AsyncReadExt as _;
+            while let Ok((mut stream, _)) = listener.accept().await {
+                let mut line = vec![0u8; "CONNECT 4294967294\n".len()];
+                let _ = stream.read_exact(&mut line).await;
+                requests
+                    .lock()
+                    .unwrap()
+                    .push(String::from_utf8_lossy(&line).into_owned());
+            }
+        });
+        track_ports(&uds, 0);
+        skip_stale_ports(&uds, FIRST, 0).await;
+        assert!(refused.lock().unwrap().is_empty());
+
+        skip_stale_ports(&uds, FIRST, FIRST + 2).await;
+        assert_eq!(
+            *refused.lock().unwrap(),
+            vec![format!("CONNECT {UNLISTENED_PORT}\n"); 3]
+        );
+        assert_eq!(highest_port(&uds), FIRST + 2);
+
+        note_port(&uds, FIRST + 10);
+        skip_stale_ports(&uds, FIRST, FIRST + 2).await;
+        assert_eq!(highest_port(&uds), FIRST + 10);
+
+        refused.lock().unwrap().clear();
+        skip_stale_ports(&uds, FIRST, FIRST + STALE_PORT_WINDOW + 5).await;
+        assert_eq!(refused.lock().unwrap().len(), STALE_PORT_WINDOW as usize);
+        assert_eq!(highest_port(&uds), FIRST + STALE_PORT_WINDOW - 1);
+        untrack_ports(&uds);
+        let _ = tokio::fs::remove_dir_all(&dir).await;
     }
 }

@@ -18,6 +18,7 @@ pub mod console;
 mod error;
 mod guest;
 mod http;
+mod vsock;
 
 pub mod cloud_hypervisor;
 pub mod firecracker;

@@ -3,7 +3,7 @@
 //! Firecracker and Cloud Hypervisor both terminate the host side of vsock
 //! themselves and expose it as a Unix socket in the VM's working directory,
 //! with a text handshake naming the guest port (see
-//! [`crate::firecracker::vsock`]). Each VM has a vsock device of its own
+//! [`crate::vsock`]). Each VM has a vsock device of its own
 //! behind its own socket, so every guest can use the same CID and nothing on
 //! the host has to hand them out.
 
@@ -13,7 +13,7 @@ use std::time::{Duration, Instant};
 use tokio::net::UnixStream;
 
 use crate::error::{Error, Result};
-use crate::firecracker::vsock;
+use crate::vsock;
 
 /// The Unix socket backing a VM's vsock device, relative to its working
 /// directory. Fixed, so a snapshot restored in another sandbox's directory
