@@ -1136,6 +1136,10 @@ async fn registration_loop(
             ?interval,
             "registered with orchestrator"
         );
+        // Placement needs the node's free resources, which only a heartbeat
+        // carries, so the first goes at once: waiting out the interval
+        // refused every create for 5 s after the node started.
+        sandboxes.announce_now();
 
         let mut ca_warned: Option<std::time::Instant> = None;
         loop {
