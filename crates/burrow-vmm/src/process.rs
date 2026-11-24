@@ -5,6 +5,7 @@ use std::process::ExitStatus;
 use std::time::{Duration, Instant};
 
 use crate::cgroup::Cgroup;
+use crate::child::Child;
 use crate::error::{Error, Result};
 
 /// How long a VMM gets to listen on its API socket.
@@ -14,44 +15,6 @@ const SOCKET_TIMEOUT: Duration = Duration::from_secs(5);
 /// thread, a slice at a time between checks that it still runs.
 const SOCKET_POLL: Duration = Duration::from_micros(100);
 const SOCKET_SLICE: Duration = Duration::from_millis(20);
-
-pub(crate) enum ChildProcess {
-    Cloned(crate::child::Child),
-    Command(tokio::process::Child),
-}
-
-impl ChildProcess {
-    fn id(&self) -> Option<u32> {
-        match self {
-            Self::Cloned(child) => child.id(),
-            Self::Command(child) => child.id(),
-        }
-    }
-
-    fn try_wait(&mut self) -> std::io::Result<Option<ExitStatus>> {
-        match self {
-            Self::Cloned(child) => child.try_wait(),
-            Self::Command(child) => child.try_wait(),
-        }
-    }
-
-    async fn wait(&mut self) -> std::io::Result<ExitStatus> {
-        match self {
-            Self::Cloned(child) => child.wait().await,
-            Self::Command(child) => child.wait().await,
-        }
-    }
-
-    async fn kill(&mut self) -> std::io::Result<()> {
-        match self {
-            Self::Cloned(child) => {
-                child.start_kill()?;
-                child.wait().await.map(|_| ())
-            }
-            Self::Command(child) => child.kill().await,
-        }
-    }
-}
 
 /// Where a VMM's own output goes, which says why it exited.
 pub(crate) enum Output {
@@ -63,13 +26,13 @@ pub(crate) enum Output {
 
 /// A spawned VMM, with the cgroup it runs in, held until it is reaped.
 pub(crate) struct VmmProcess {
-    child: ChildProcess,
+    child: Child,
     output: Output,
     cgroup: Option<Cgroup>,
 }
 
 impl VmmProcess {
-    pub(crate) fn new(child: ChildProcess, output: Output, cgroup: Option<Cgroup>) -> Self {
+    pub(crate) fn new(child: Child, output: Output, cgroup: Option<Cgroup>) -> Self {
         Self {
             child,
             output,
@@ -155,7 +118,8 @@ impl VmmProcess {
 
     /// SIGKILLs the VMM and reaps it.
     pub(crate) async fn kill(&mut self) -> Result<()> {
-        self.child.kill().await?;
+        self.child.start_kill()?;
+        self.child.wait().await?;
         Ok(())
     }
 
@@ -204,16 +168,12 @@ mod tests {
         )
         .unwrap();
         bind(fd.as_raw_fd(), &UnixAddr::new(&path).unwrap()).unwrap();
-        let child = tokio::process::Command::new("sleep")
-            .arg("30")
-            .kill_on_drop(true)
-            .spawn()
-            .unwrap();
-        let mut process = VmmProcess::new(
-            ChildProcess::Command(child),
-            Output::Log(dir.join("vmm.log")),
-            None,
-        );
+        let log = dir.join("vmm.log");
+        let child =
+            crate::child::spawn_logged(Path::new("/bin/sleep"), &["30".into()], &dir, None, &log)
+                .await
+                .unwrap();
+        let mut process = VmmProcess::new(child, Output::Log(log), None);
 
         let early =
             tokio::time::timeout(Duration::from_millis(100), process.wait_for_socket(&path)).await;

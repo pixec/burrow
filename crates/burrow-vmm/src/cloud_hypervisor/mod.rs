@@ -22,18 +22,16 @@ mod config;
 pub mod jail;
 
 use std::path::{Path, PathBuf};
-use std::process::Stdio;
 use std::time::{Duration, Instant};
 
 use hyper::Method;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
-use tokio::process::Command;
 
 use crate::cgroup::Cgroup;
 use crate::error::{Error, Result};
 use crate::http::UnixHttp;
-use crate::process::{ChildProcess, Output, VmmProcess};
+use crate::process::{Output, VmmProcess};
 use crate::{DriveSpec, GuestOs, VSOCK_UDS, VmSpec};
 
 pub use jail::ChJail;
@@ -247,9 +245,9 @@ impl ChVm {
     }
 
     /// Starts the VMM with its API socket, inside the VM's cgroup from
-    /// before it execs: the cgroup is made first and joined by the child, so
-    /// the VMM (jailed, its helper, and the VMM that inherits it) never runs
-    /// outside its caps. `read_only` are the host files the VM config names
+    /// before it execs: the cgroup is made first and the child cloned into it,
+    /// so the VMM (jailed, its helper, and the VMM that inherits it) never
+    /// runs outside its caps. `read_only` are the host files the VM config names
     /// absolutely, which a jail has to bind in.
     async fn spawn(
         spec: &VmSpec,
@@ -269,28 +267,25 @@ impl ChVm {
         crate::vsock::track_ports(&spec.workdir.join(VSOCK_UDS), 0);
 
         let api_socket = format!("path={API_SOCK}");
-        let mut command = match &config.jail {
-            None => {
-                let mut command = Command::new(&config.bin);
-                command
-                    .current_dir(&spec.workdir)
-                    .args(["--api-socket", &api_socket])
-                    .args(extra);
-                command
-            }
-            Some(jail) => jail::Plan {
-                workdir: std::path::absolute(&spec.workdir)?,
-                uid: jail.uid,
-                gid: jail.gid,
-                read_only,
-                program: config.bin.clone(),
-                args: ["--api-socket", &api_socket]
-                    .iter()
-                    .chain(extra)
-                    .map(|arg| arg.to_string())
-                    .collect(),
-            }
-            .command(jail),
+        let vmm_args: Vec<String> = ["--api-socket", &api_socket]
+            .iter()
+            .chain(extra)
+            .map(|arg| arg.to_string())
+            .collect();
+        let (program, args): (&Path, Vec<std::ffi::OsString>) = match &config.jail {
+            None => (&config.bin, vmm_args.into_iter().map(Into::into).collect()),
+            Some(jail) => (
+                &jail.helper,
+                jail::Plan {
+                    workdir: std::path::absolute(&spec.workdir)?,
+                    uid: jail.uid,
+                    gid: jail.gid,
+                    read_only,
+                    program: config.bin.clone(),
+                    args: vmm_args,
+                }
+                .helper_args(),
+            ),
         };
         let cgroup = Cgroup::for_vm(
             spec.cgroup_root.as_deref(),
@@ -298,29 +293,18 @@ impl ChVm {
             &spec.limits,
             spec.is_limits_required,
         )?;
-        let spawned = async {
-            if let Some(cgroup) = &cgroup {
-                cgroup.join_before_exec(&mut command)?;
-            }
-            let log = std::fs::File::create(spec.workdir.join(VMM_LOG))?;
-            let log_err = log.try_clone()?;
-            Ok::<_, Error>(
-                command
-                    .stdin(Stdio::null())
-                    .stdout(Stdio::from(log))
-                    .stderr(Stdio::from(log_err))
-                    .kill_on_drop(true)
-                    .spawn()?,
-            )
-        }
+        let log = spec.workdir.join(VMM_LOG);
+        let spawned = crate::child::spawn_logged(
+            program,
+            &args,
+            &spec.workdir,
+            cgroup.as_ref().map(Cgroup::path),
+            &log,
+        )
         .await;
         let mut vm = Self {
             api: UnixHttp::new(socket.clone()),
-            process: VmmProcess::new(
-                ChildProcess::Command(spawned?),
-                Output::Log(spec.workdir.join(VMM_LOG)),
-                cgroup,
-            ),
+            process: VmmProcess::new(spawned?, Output::Log(log), cgroup),
             workdir: spec.workdir.clone(),
             vmm_workdir: jail::vmm_workdir(&spec.workdir, config.jail.as_ref())?,
             jail: config.jail.clone(),
@@ -909,16 +893,12 @@ mod tests {
     async fn a_restore_that_never_loads_times_out_with_the_last_error() {
         let dir = std::env::temp_dir().join(format!("burrow-ch-wait-{}", std::process::id()));
         tokio::fs::create_dir_all(&dir).await.unwrap();
-        let child = Command::new("sleep")
-            .arg("30")
-            .kill_on_drop(true)
-            .spawn()
-            .unwrap();
-        let mut process = VmmProcess::new(
-            ChildProcess::Command(child),
-            Output::Log(dir.join(VMM_LOG)),
-            None,
-        );
+        let log = dir.join(VMM_LOG);
+        let child =
+            crate::child::spawn_logged(Path::new("/bin/sleep"), &["30".into()], &dir, None, &log)
+                .await
+                .unwrap();
+        let mut process = VmmProcess::new(child, Output::Log(log), None);
         let api = UnixHttp::new(dir.join(API_SOCK));
         let err = wait_until_loaded(&mut process, &api, Duration::from_millis(50))
             .await

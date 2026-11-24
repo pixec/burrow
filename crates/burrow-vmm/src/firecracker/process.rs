@@ -6,7 +6,7 @@ use tokio::net::unix::pipe;
 
 use crate::cgroup::Cgroup;
 use crate::error::{Error, Result};
-use crate::process::{ChildProcess, Output, VmmProcess};
+use crate::process::{Output, VmmProcess};
 
 /// Firecracker accepts only alphanumerics and hyphens in `--id`, and panics
 /// on anything else. Burrow's own ids use underscores (`sbx_1a2b…`), so they
@@ -186,7 +186,7 @@ pub(crate) async fn spawn(
         Box::new(pipe::Receiver::from_owned_fd(spawned.stderr)?),
     ];
     let mut process = VmmProcess::new(
-        ChildProcess::Cloned(spawned.child),
+        spawned.child,
         Output::Console(workdir.to_path_buf()),
         cgroup,
     );

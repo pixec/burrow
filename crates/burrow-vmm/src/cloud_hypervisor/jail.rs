@@ -3,8 +3,8 @@
 //! burrowd runs itself again as a short helper ([`HELPER_ARG`]), which builds
 //! the jail and execs the VMM inside it:
 //!
-//! - started inside the VM's cgroup, joined before the helper execs, so the
-//!   VMM it forks is counted and capped from its first instruction;
+//! - started inside the VM's cgroup, cloned into it (see [`crate::child`]),
+//!   so the VMM it forks is counted and capped from its first instruction;
 //! - new mount, IPC, PID and network namespaces. The VMM is PID 1 of its own
 //!   and sees no other process; its NIC is a tap descriptor burrowd opened and
 //!   handed over the API socket, so it needs no network of its own either;
@@ -28,7 +28,6 @@
 use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
-use tokio::process::Command;
 
 /// The first argument that makes burrowd the helper instead of itself.
 pub const HELPER_ARG: &str = "__cloud-hypervisor-jail";
@@ -114,12 +113,14 @@ pub(crate) struct Plan {
 }
 
 impl Plan {
-    pub(crate) fn command(&self, jail: &ChJail) -> Command {
-        let mut command = Command::new(&jail.helper);
-        command
-            .arg(HELPER_ARG)
-            .arg(serde_json::to_string(self).expect("a plan serialises"));
-        command
+    /// What the helper is run with.
+    pub(crate) fn helper_args(&self) -> Vec<std::ffi::OsString> {
+        vec![
+            HELPER_ARG.into(),
+            serde_json::to_string(self)
+                .expect("a plan serialises")
+                .into(),
+        ]
     }
 }
 
@@ -499,10 +500,7 @@ mod tests {
             program: "/usr/local/bin/cloud-hypervisor".into(),
             args: vec!["--api-socket".into(), "path=ch.sock".into()],
         };
-        let command = plan.command(&jail());
-        let std = command.as_std();
-        assert_eq!(std.get_program(), "/proc/self/exe");
-        let args: Vec<_> = std.get_args().collect();
+        let args = plan.helper_args();
         assert_eq!(args.len(), 2);
         assert_eq!(args[0], HELPER_ARG);
         let read: Plan = serde_json::from_str(&args[1].to_string_lossy()).unwrap();

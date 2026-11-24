@@ -108,8 +108,52 @@ pub async fn spawn(
     cwd: &Path,
     cgroup: Option<&Path>,
 ) -> io::Result<Spawned> {
+    let (stdin_read, stdin_write) = pipe()?;
+    let (stdout_read, stdout_write) = pipe()?;
+    let (stderr_read, stderr_write) = pipe()?;
+    let child = start(
+        program,
+        args,
+        cwd,
+        cgroup,
+        [stdin_read, stdout_write, stderr_write],
+    )
+    .await?;
+    Ok(Spawned {
+        child,
+        stdin: stdin_write,
+        stdout: stdout_read,
+        stderr: stderr_read,
+    })
+}
+
+/// [`spawn`], with no input and its output written to `log`.
+#[cfg(target_os = "linux")]
+pub async fn spawn_logged(
+    program: &Path,
+    args: &[OsString],
+    cwd: &Path,
+    cgroup: Option<&Path>,
+    log: &Path,
+) -> io::Result<Child> {
+    let null = open_above_stdio(Path::new("/dev/null"), false)?;
+    let log = above_stdio(std::fs::File::create(log)?.into())?;
+    let log_err = log.try_clone()?;
+    start(program, args, cwd, cgroup, [null, log, log_err]).await
+}
+
+/// Starts the child with `stdio` as its standard streams, and waits for it to
+/// exec.
+#[cfg(target_os = "linux")]
+async fn start(
+    program: &Path,
+    args: &[OsString],
+    cwd: &Path,
+    cgroup: Option<&Path>,
+    stdio: [OwnedFd; 3],
+) -> io::Result<Child> {
     use tokio::io::AsyncReadExt as _;
-    let (spawned, status_read) = start(program, args, cwd, cgroup)?;
+    let (child, status_read) = fork_exec(program, args, cwd, cgroup, stdio)?;
     let mut errno = Vec::new();
     tokio::net::unix::pipe::Receiver::from_owned_fd(status_read)?
         .read_to_end(&mut errno)
@@ -122,18 +166,19 @@ pub async fn spawn(
             "the child reported a malformed exec failure",
         ));
     }
-    Ok(spawned)
+    Ok(child)
 }
 
 /// The child started and the read end of its exec status pipe, which reaches
 /// end of file once the exec succeeds.
 #[cfg(target_os = "linux")]
-fn start(
+fn fork_exec(
     program: &Path,
     args: &[OsString],
     cwd: &Path,
     cgroup: Option<&Path>,
-) -> io::Result<(Spawned, OwnedFd)> {
+    stdio: [OwnedFd; 3],
+) -> io::Result<(Child, OwnedFd)> {
     use std::os::fd::{AsRawFd as _, FromRawFd as _};
 
     let program = cstring(program.as_os_str())?;
@@ -144,9 +189,6 @@ fn start(
     argv_ptrs.push(std::ptr::null());
     let cwd = cstring(cwd.as_os_str())?;
 
-    let (stdin_read, stdin_write) = pipe()?;
-    let (stdout_read, stdout_write) = pipe()?;
-    let (stderr_read, stderr_write) = pipe()?;
     // Carries errno back if exec fails; closed by the exec when it succeeds.
     let (status_read, status_write) = pipe()?;
     let cgroup_dir = cgroup.map(|dir| open_above_stdio(dir, false)).transpose()?;
@@ -211,12 +253,8 @@ fn start(
             {
                 fail(status);
             }
-            for (from, to) in [
-                (stdin_read.as_raw_fd(), 0),
-                (stdout_write.as_raw_fd(), 1),
-                (stderr_write.as_raw_fd(), 2),
-            ] {
-                if libc::dup2(from, to) < 0 {
+            for (to, from) in stdio.iter().enumerate() {
+                if libc::dup2(from.as_raw_fd(), to as libc::c_int) < 0 {
                     fail(status);
                 }
             }
@@ -240,14 +278,7 @@ fn start(
         pidfd: None,
         status: None,
     };
-    drop((
-        status_write,
-        stdin_read,
-        stdout_write,
-        stderr_write,
-        cgroup_dir,
-        cgroup_procs,
-    ));
+    drop((status_write, stdio, cgroup_dir, cgroup_procs));
     if pidfd < 0 {
         // SAFETY: opens a pidfd for this process's own unreaped child.
         pidfd = unsafe { libc::syscall(libc::SYS_pidfd_open, child.pid, 0) } as libc::c_int;
@@ -260,15 +291,7 @@ fn start(
             tokio::io::unix::AsyncFd::register_with_interest(pidfd, tokio::io::Interest::READABLE)?
         });
     }
-    Ok((
-        Spawned {
-            child,
-            stdin: stdin_write,
-            stdout: stdout_read,
-            stderr: stderr_read,
-        },
-        status_read,
-    ))
+    Ok((child, status_read))
 }
 
 /// Elsewhere there is no cgroup to clone into, and only the tests run a VMM.
@@ -302,6 +325,34 @@ pub async fn spawn(
         stdin: stdin.into(),
         stdout: stdout.into(),
         stderr: stderr.into(),
+    })
+}
+
+/// [`spawn`], with no input and its output written to `log`.
+#[cfg(not(target_os = "linux"))]
+pub async fn spawn_logged(
+    program: &Path,
+    args: &[OsString],
+    cwd: &Path,
+    cgroup: Option<&Path>,
+    log: &Path,
+) -> io::Result<Child> {
+    use std::process::Stdio;
+    if cgroup.is_some() {
+        return Err(io::ErrorKind::Unsupported.into());
+    }
+    let log = std::fs::File::create(log)?;
+    let log_err = log.try_clone()?;
+    let child = std::process::Command::new(program)
+        .args(args)
+        .current_dir(cwd)
+        .stdin(Stdio::null())
+        .stdout(log)
+        .stderr(log_err)
+        .spawn()?;
+    Ok(Child {
+        pid: child.id() as libc::pid_t,
+        status: None,
     })
 }
 

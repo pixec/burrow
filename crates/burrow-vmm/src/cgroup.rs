@@ -182,29 +182,6 @@ impl Cgroup {
         }
     }
 
-    /// Has a command's child join this cgroup before it execs, so the VMM is
-    /// in it from its first instruction rather than moved in once it already
-    /// runs, uncapped and uncounted until then. Its children and threads are
-    /// inherited into it.
-    pub(crate) fn join_before_exec(&self, command: &mut tokio::process::Command) -> Result<()> {
-        use std::os::fd::AsRawFd as _;
-        let procs = std::fs::OpenOptions::new()
-            .write(true)
-            .open(self.path.join("cgroup.procs"))?;
-        // SAFETY: the hook runs between fork and exec, where only
-        // async-signal-safe calls are allowed; it makes one write(2) of a
-        // static buffer to a descriptor opened above. "0" is the writer.
-        unsafe {
-            command.pre_exec(move || {
-                match libc::write(procs.as_raw_fd(), b"0".as_ptr().cast(), 1) {
-                    1 => Ok(()),
-                    _ => Err(std::io::Error::last_os_error()),
-                }
-            });
-        }
-        Ok(())
-    }
-
     /// Writes the CPU and IO limits, on a new cgroup or a running VMM's. One
     /// left at 0 or empty is put back to the kernel's default.
     pub fn set_limits(&self, limits: &Limits) -> Result<()> {
