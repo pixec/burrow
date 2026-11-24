@@ -28,11 +28,12 @@ use std::time::{Duration, Instant};
 use hyper::Method;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
-use tokio::process::{Child, Command};
+use tokio::process::Command;
 
 use crate::cgroup::Cgroup;
 use crate::error::{Error, Result};
 use crate::http::UnixHttp;
+use crate::process::{ChildProcess, Output, VmmProcess};
 use crate::{DriveSpec, GuestOs, VSOCK_UDS, VmSpec};
 
 pub use jail::ChJail;
@@ -100,7 +101,7 @@ struct Packed {
 
 /// A running (or paused) Cloud Hypervisor VM.
 pub struct ChVm {
-    child: Child,
+    process: VmmProcess,
     api: UnixHttp,
     workdir: PathBuf,
     /// [`Self::workdir`] as the VMM sees it.
@@ -109,8 +110,6 @@ pub struct ChVm {
     /// What [`config::disk`] opens a hotplugged drive for.
     guest_os: GuestOs,
     boot_latency: Duration,
-    /// Held for the VM's lifetime; removed once the process is reaped.
-    cgroup: Option<Cgroup>,
     /// The input side of an interactive console.
     console_in: Option<tokio::net::unix::OwnedWriteHalf>,
     /// Copies the console into its log, until the VM is stopped.
@@ -317,19 +316,22 @@ impl ChVm {
         .await;
         let mut vm = Self {
             api: UnixHttp::new(socket.clone()),
-            child: spawned?,
+            process: VmmProcess::new(
+                ChildProcess::Command(spawned?),
+                Output::Log(spec.workdir.join(VMM_LOG)),
+                cgroup,
+            ),
             workdir: spec.workdir.clone(),
             vmm_workdir: jail::vmm_workdir(&spec.workdir, config.jail.as_ref())?,
             jail: config.jail.clone(),
             guest_os: spec.guest_os,
             boot_latency: Duration::ZERO,
-            cgroup,
             console_in: None,
             console,
             tpm: spec.tpm.clone(),
             boot_mem: u64::from(spec.mem_mib) * 1024 * 1024,
         };
-        if let Err(err) = wait_for_socket(&mut vm.child, &socket, &spec.workdir).await {
+        if let Err(err) = vm.process.wait_for_socket(&socket).await {
             vm.stop().await;
             return Err(err);
         }
@@ -344,16 +346,16 @@ impl ChVm {
         if let Some(console) = &self.console {
             console.abort();
         }
-        match (&self.jail, self.child.id()) {
+        match (&self.jail, self.process.pid()) {
             (Some(_), Some(pid)) => {
                 let _ = nix::sys::signal::kill(
                     nix::unistd::Pid::from_raw(pid as i32),
                     nix::sys::signal::Signal::SIGTERM,
                 );
-                let _ = self.child.wait().await;
+                let _ = self.process.wait().await;
             }
             _ => {
-                let _ = self.child.kill().await;
+                let _ = self.process.kill().await;
             }
         }
         if let Some(tpm) = &self.tpm {
@@ -416,7 +418,7 @@ impl ChVm {
     /// Waits for a `--restore` to finish loading. The API answers once the
     /// VMM is up, and reports the VM paused once its state is in.
     async fn wait_until_loaded(&mut self) -> Result<()> {
-        wait_until_loaded(&mut self.child, &self.api, &self.workdir, RESTORE_TIMEOUT).await
+        wait_until_loaded(&mut self.process, &self.api, RESTORE_TIMEOUT).await
     }
 
     /// An API failure with what the VMM logged about it, which is where Cloud
@@ -432,18 +434,18 @@ impl ChVm {
                 method,
                 path,
                 status,
-                body: format!("{body}\n{}", tail(&self.workdir.join(VMM_LOG), 10).await),
+                body: format!("{body}\n{}", self.process.output_tail(10).await),
             },
             err => err,
         }
     }
 
     pub fn pid(&self) -> Option<u32> {
-        self.child.id()
+        self.process.pid()
     }
 
     pub fn has_exited(&mut self) -> bool {
-        matches!(self.child.try_wait(), Ok(Some(_)))
+        self.process.has_exited()
     }
 
     pub fn boot_latency(&self) -> Duration {
@@ -451,11 +453,11 @@ impl ChVm {
     }
 
     pub fn cpu_usage_usec(&self) -> Option<u64> {
-        self.cgroup.as_ref()?.cpu_usage_usec()
+        self.process.cpu_usage_usec()
     }
 
     pub fn cgroup(&self) -> Option<&Cgroup> {
-        self.cgroup.as_ref()
+        self.process.cgroup()
     }
 
     pub fn workdir(&self) -> &Path {
@@ -468,12 +470,12 @@ impl ChVm {
 
     /// The VMM's own output, which says why it exited.
     pub async fn vmm_log_tail(&self, lines: usize) -> String {
-        tail(&self.workdir.join(VMM_LOG), lines).await
+        self.process.output_tail(lines).await
     }
 
     /// How the process ended, once it has.
     pub fn exit_status(&mut self) -> Option<std::process::ExitStatus> {
-        self.child.try_wait().ok().flatten()
+        self.process.exit_status()
     }
 
     /// Connects to an interactive console once the VMM listens on it, and
@@ -600,7 +602,7 @@ impl ChVm {
         self.stop().await;
         let _ = tokio::fs::remove_file(self.workdir.join(API_SOCK)).await;
         // Only removable once it holds no processes, so this follows the reap.
-        drop(self.cgroup.take());
+        self.process.release_cgroup();
         Ok(())
     }
 }
@@ -614,7 +616,7 @@ async fn without_tpm_on_error(spec: &VmSpec, spawned: Result<ChVm>) -> Result<Ch
     match &spawned {
         Err(_) => crate::swtpm::stop(tpm, false).await,
         Ok(vm) => {
-            if let (Some(cgroup), Some(pid)) = (vm.cgroup.as_ref(), crate::swtpm::pid(tpm))
+            if let (Some(cgroup), Some(pid)) = (vm.process.cgroup(), crate::swtpm::pid(tpm))
                 && let Err(err) = cgroup.add(pid)
             {
                 tracing::warn!(%err, pid, "could not move swtpm into the VM's cgroup");
@@ -744,19 +746,13 @@ fn taps(vm_config: &Value) -> Vec<(String, String)> {
 /// adopt, fork or warm create that asked for it forever; the caller kills the
 /// VMM on any error.
 async fn wait_until_loaded(
-    child: &mut Child,
+    process: &mut VmmProcess,
     api: &UnixHttp,
-    workdir: &Path,
     timeout: Duration,
 ) -> Result<()> {
     let deadline = Instant::now() + timeout;
     loop {
-        if let Some(status) = child.try_wait()? {
-            return Err(Error::EarlyExit {
-                status: status.to_string(),
-                tail: tail(&workdir.join(VMM_LOG), 20).await,
-            });
-        }
+        process.check_running().await?;
         let last = match api.get_json::<Value>("/api/v1/vm.info").await {
             Ok(info) if matches!(info["state"].as_str(), Some("Paused" | "Running")) => {
                 return Ok(());
@@ -768,33 +764,6 @@ async fn wait_until_loaded(
             return Err(Error::Timeout {
                 what: format!("the restored vm to load (last vm.info: {last})"),
                 timeout_ms: timeout.as_millis() as u64,
-            });
-        }
-        tokio::time::sleep(POLL).await;
-    }
-}
-
-async fn wait_for_socket(child: &mut Child, socket: &Path, workdir: &Path) -> Result<()> {
-    let deadline = Instant::now() + SOCKET_TIMEOUT;
-    loop {
-        // Accepting, for the reason Firecracker's is waited for that way: the
-        // file exists from bind, and a jailed restore's first call would be
-        // refused if it landed before the listen.
-        if tokio::net::UnixStream::connect(socket).await.is_ok() {
-            return Ok(());
-        }
-        // A VMM that died on startup will never create the socket; surface
-        // what it logged instead of waiting out the timeout.
-        if let Some(status) = child.try_wait()? {
-            return Err(Error::EarlyExit {
-                status: status.to_string(),
-                tail: tail(&workdir.join(VMM_LOG), 20).await,
-            });
-        }
-        if Instant::now() >= deadline {
-            return Err(Error::SocketTimeout {
-                path: socket.to_path_buf(),
-                timeout_ms: SOCKET_TIMEOUT.as_millis() as u64,
             });
         }
         tokio::time::sleep(POLL).await;
@@ -841,14 +810,6 @@ async fn capture_console(
     _jail: Option<&ChJail>,
 ) -> Result<Option<crate::console::Capture>> {
     Ok(None)
-}
-
-async fn tail(path: &Path, n: usize) -> String {
-    let Ok(text) = tokio::fs::read_to_string(path).await else {
-        return String::new();
-    };
-    let lines: Vec<&str> = text.lines().collect();
-    lines[lines.len().saturating_sub(n)..].join("\n")
 }
 
 #[cfg(test)]
@@ -948,13 +909,18 @@ mod tests {
     async fn a_restore_that_never_loads_times_out_with_the_last_error() {
         let dir = std::env::temp_dir().join(format!("burrow-ch-wait-{}", std::process::id()));
         tokio::fs::create_dir_all(&dir).await.unwrap();
-        let mut child = Command::new("sleep")
+        let child = Command::new("sleep")
             .arg("30")
             .kill_on_drop(true)
             .spawn()
             .unwrap();
+        let mut process = VmmProcess::new(
+            ChildProcess::Command(child),
+            Output::Log(dir.join(VMM_LOG)),
+            None,
+        );
         let api = UnixHttp::new(dir.join(API_SOCK));
-        let err = wait_until_loaded(&mut child, &api, &dir, Duration::from_millis(50))
+        let err = wait_until_loaded(&mut process, &api, Duration::from_millis(50))
             .await
             .unwrap_err();
         let _ = tokio::fs::remove_dir_all(&dir).await;
@@ -962,53 +928,5 @@ mod tests {
             panic!("expected a timeout, got {err}");
         };
         assert!(what.contains("last vm.info"), "{what}");
-    }
-
-    /// The socket file exists from bind; an API call made before the VMM
-    /// listens is refused, which failed restores with "Connection refused".
-    #[tokio::test]
-    async fn a_socket_is_ready_once_it_listens_not_once_it_exists() {
-        use nix::sys::socket::{
-            AddressFamily, Backlog, SockFlag, SockType, UnixAddr, bind, listen, socket,
-        };
-        use std::os::fd::AsRawFd as _;
-
-        let dir = std::env::temp_dir().join(format!("burrow-ch-listen-{}", std::process::id()));
-        tokio::fs::create_dir_all(&dir).await.unwrap();
-        let path = dir.join(API_SOCK);
-        let _ = tokio::fs::remove_file(&path).await;
-        let fd = socket(
-            AddressFamily::Unix,
-            SockType::Stream,
-            SockFlag::empty(),
-            None,
-        )
-        .unwrap();
-        bind(fd.as_raw_fd(), &UnixAddr::new(&path).unwrap()).unwrap();
-        let mut child = Command::new("sleep")
-            .arg("30")
-            .kill_on_drop(true)
-            .spawn()
-            .unwrap();
-
-        let early = tokio::time::timeout(
-            Duration::from_millis(100),
-            wait_for_socket(&mut child, &path, &dir),
-        )
-        .await;
-        assert!(
-            early.is_err(),
-            "a bound socket that is not listening is not ready"
-        );
-
-        listen(&fd, Backlog::new(1).unwrap()).unwrap();
-        tokio::time::timeout(
-            Duration::from_secs(1),
-            wait_for_socket(&mut child, &path, &dir),
-        )
-        .await
-        .expect("ready once listening")
-        .unwrap();
-        let _ = tokio::fs::remove_dir_all(&dir).await;
     }
 }

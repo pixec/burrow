@@ -18,6 +18,7 @@ pub mod console;
 mod error;
 mod guest;
 mod http;
+mod process;
 mod snapfile;
 mod vsock;
 

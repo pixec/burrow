@@ -12,12 +12,16 @@ use std::time::{Duration, Instant};
 
 pub use api::FcApi;
 pub use model::{InstanceInfo, NetworkOverride, SnapshotType, VmState};
-pub use process::{FcProcess, Jail};
+pub use process::Jail;
 #[cfg(target_os = "linux")]
 pub use uffd::UffdBackend;
 
+use tokio::io::AsyncWriteExt as _;
+use tokio::net::unix::pipe;
+
 use crate::cgroup::{Cgroup, Limits};
-use crate::error::Result;
+use crate::error::{Error, Result};
+use crate::process::VmmProcess;
 use crate::{DriveSpec, NetSpec, VmSpec};
 use model::*;
 
@@ -232,14 +236,15 @@ impl MicroVmSpec {
 
 /// A running (or paused) Firecracker VM.
 pub struct MicroVm {
-    process: FcProcess,
+    process: VmmProcess,
+    /// Firecracker's stdin, which is wired to the guest serial port, giving a
+    /// way to drive a guest that has no agent yet (dev and rescue only).
+    console_in: pipe::Sender,
     api: FcApi,
     spec: MicroVmSpec,
     /// Time from process spawn to a successful `InstanceStart`.
     boot_latency: Duration,
     phases: crate::Phases,
-    /// Held for the VM's lifetime; removed once the process is reaped.
-    cgroup: Option<Cgroup>,
     /// Serves this VM's page faults when restored with lazy memory. Dropped
     /// only after the VMM is gone, because a live guest whose faults stop being
     /// answered hangs instead of failing.
@@ -261,7 +266,7 @@ async fn detach_snapshot_targets(workdir: &Path, mem_file: &str) -> Result<()> {
 async fn spawn(
     spec: &MicroVmSpec,
     phases: &mut crate::Phases,
-) -> Result<(FcProcess, Option<Cgroup>)> {
+) -> Result<(VmmProcess, pipe::Sender)> {
     let cgroup = Cgroup::for_vm(
         spec.cgroup_root.as_deref(),
         &spec.vm_id,
@@ -272,18 +277,17 @@ async fn spawn(
         cgroup.forbid_swap()?;
     }
     phases.mark("cgroup");
-    let process = FcProcess::spawn(
+    process::spawn(
         &spec.firecracker_bin,
         &spec.vm_id,
         &spec.workdir,
         API_SOCK,
         spec.jail.as_ref(),
         spec.is_pci_enabled,
-        cgroup.as_ref(),
+        cgroup,
         phases,
     )
-    .await;
-    Ok((process?, cgroup))
+    .await
 }
 
 impl MicroVm {
@@ -294,18 +298,18 @@ impl MicroVm {
         if spec.is_vsock_enabled {
             crate::guest::clear_stale_sockets(&spec.workdir).await?;
         }
-        let (process, cgroup) = spawn(&spec, &mut phases).await?;
+        let (process, console_in) = spawn(&spec, &mut phases).await?;
         let api = FcApi::new(spec.workdir.join(API_SOCK));
 
         // Configure, then start. Any failure here kills the VMM so we never
         // leak a half-configured firecracker process.
         let mut vm = Self {
             process,
+            console_in,
             api,
             spec,
             boot_latency: Duration::ZERO,
             phases,
-            cgroup,
             #[cfg(target_os = "linux")]
             memory: None,
         };
@@ -420,35 +424,53 @@ impl MicroVm {
     /// under no cgroup, which is the same condition that leaves its cpu cap
     /// unenforced.
     pub fn cpu_usage_usec(&self) -> Option<u64> {
-        self.cgroup.as_ref()?.cpu_usage_usec()
+        self.process.cpu_usage_usec()
     }
 
     pub fn cgroup(&self) -> Option<&Cgroup> {
-        self.cgroup.as_ref()
+        self.process.cgroup()
     }
 
-    pub fn console_log_path(&self) -> &Path {
-        self.process.console_log_path()
+    pub fn console_log_path(&self) -> PathBuf {
+        self.spec.workdir.join(crate::console::LOG)
     }
 
     pub async fn console_tail(&self, lines: usize) -> String {
-        self.process.console_tail(lines).await
+        self.process.output_tail(lines).await
     }
 
     pub fn exit_status(&mut self) -> Option<std::process::ExitStatus> {
         self.process.exit_status()
     }
 
-    /// Writes to the guest serial console (dev/rescue path; see
-    /// [`FcProcess::console_write`]).
+    /// Writes to the guest serial console. Only useful for guests running a
+    /// getty/shell on ttyS0; the supported control path is the guest agent.
     pub async fn console_write(&mut self, input: &str) -> Result<()> {
-        self.process.console_write(input).await
+        self.console_in.write_all(input.as_bytes()).await?;
+        self.console_in.flush().await?;
+        Ok(())
     }
 
     /// Waits for a marker string in the guest's serial output. Until the guest
     /// agent exists this is how we know a guest reached userspace.
     pub async fn wait_for_console(&self, marker: &str, timeout: Duration) -> Result<Duration> {
-        self.process.wait_for_console(marker, timeout).await
+        let console_log = self.console_log_path();
+        let start = Instant::now();
+        let deadline = start + timeout;
+        loop {
+            if let Ok(text) = tokio::fs::read_to_string(&console_log).await
+                && text.contains(marker)
+            {
+                return Ok(start.elapsed());
+            }
+            if Instant::now() >= deadline {
+                return Err(Error::Timeout {
+                    what: format!("console marker {marker:?}"),
+                    timeout_ms: timeout.as_millis() as u64,
+                });
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
     }
 
     pub async fn instance_info(&self) -> Result<InstanceInfo> {
@@ -556,15 +578,15 @@ impl MicroVm {
             crate::guest::clear_stale_sockets(&spec.workdir).await?;
         }
         phases.mark("sockets");
-        let (process, cgroup) = spawn(&spec, &mut phases).await?;
+        let (process, console_in) = spawn(&spec, &mut phases).await?;
         let api = FcApi::new(spec.workdir.join(API_SOCK));
         Ok(Self {
             process,
+            console_in,
             api,
             spec,
             boot_latency: start.elapsed(),
             phases,
-            cgroup,
             #[cfg(target_os = "linux")]
             memory: None,
         })
@@ -714,7 +736,7 @@ impl MicroVm {
         }
         // Only removable once it holds no processes, so this must follow the
         // reap rather than accompany it.
-        drop(self.cgroup.take());
+        self.process.release_cgroup();
         result
     }
 }
