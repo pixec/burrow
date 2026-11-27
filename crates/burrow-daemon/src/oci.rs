@@ -22,6 +22,7 @@
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
+use burrow_proto::common::v1 as common;
 use serde::Deserialize;
 use tonic::Status;
 
@@ -246,6 +247,64 @@ pub struct ImageEnvironment {
     /// what Windows 11 will not install or boot without.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub tpm: bool,
+    /// Every sandbox of this template gets a display of this resolution, with
+    /// a keyboard and a tablet.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub display: Option<Display>,
+}
+
+/// A display's resolution in pixels.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, Deserialize)]
+pub struct Display {
+    pub width: u32,
+    pub height: u32,
+}
+
+impl Display {
+    /// The resolution `display` asks for, refused unless it is one a
+    /// display may have.
+    pub fn from_proto(display: &common::Display) -> Result<Self, Status> {
+        if !burrow_display::is_valid_mode(display.width, display.height) {
+            return Err(Status::invalid_argument(format!(
+                "a display of {}x{} is outside {}x{} to {}x{}",
+                display.width,
+                display.height,
+                burrow_display::MIN_WIDTH,
+                burrow_display::MIN_HEIGHT,
+                burrow_display::MAX_WIDTH,
+                burrow_display::MAX_HEIGHT
+            )));
+        }
+        Ok(Self {
+            width: display.width,
+            height: display.height,
+        })
+    }
+
+    pub fn to_proto(self) -> common::Display {
+        common::Display {
+            width: self.width,
+            height: self.height,
+        }
+    }
+
+    /// A sandbox's display: the template decides whether it has one, and
+    /// its record the resolution, where a create asked for its own.
+    pub fn of(environment: &ImageEnvironment, recorded: Option<&common::Display>) -> Option<Self> {
+        let template = environment.display?;
+        Some(
+            recorded
+                .and_then(|recorded| Self::from_proto(recorded).ok())
+                .unwrap_or(template),
+        )
+    }
+
+    pub fn spec(self) -> burrow_vmm::DisplaySpec {
+        burrow_vmm::DisplaySpec {
+            width: self.width,
+            height: self.height,
+        }
+    }
 }
 
 /// A systemd template's boot options, which its image sets with labels.
@@ -930,6 +989,7 @@ pub async fn pull(
             kernel: String::new(),
             kernel_digest: String::new(),
             tpm: false,
+            display: None,
         },
         digest,
         layer_digests,
@@ -1426,6 +1486,50 @@ mod tests {
         assert_eq!(
             detail.as_deref(),
             Some("MANIFEST_UNKNOWN: manifest unknown")
+        );
+    }
+
+    /// The template decides whether a sandbox has a display, and the
+    /// sandbox's record its resolution.
+    #[test]
+    fn a_display_comes_from_the_template_and_its_resolution_from_the_record() {
+        let headless = ImageEnvironment::default();
+        let recorded = common::Display {
+            width: 1920,
+            height: 1080,
+        };
+        assert_eq!(Display::of(&headless, Some(&recorded)), None);
+        let template = ImageEnvironment {
+            display: Some(Display {
+                width: 1280,
+                height: 800,
+            }),
+            ..Default::default()
+        };
+        assert_eq!(Display::of(&template, None), template.display);
+        assert_eq!(
+            Display::of(&template, Some(&recorded)),
+            Some(Display {
+                width: 1920,
+                height: 1080
+            })
+        );
+        let wrong = common::Display {
+            width: 1,
+            height: 1,
+        };
+        assert_eq!(Display::of(&template, Some(&wrong)), template.display);
+        assert!(Display::from_proto(&wrong).is_err());
+        let json = serde_json::to_value(&template).unwrap();
+        assert_eq!(
+            json["display"],
+            serde_json::json!({ "width": 1280, "height": 800 })
+        );
+        assert!(
+            serde_json::to_value(&headless)
+                .unwrap()
+                .get("display")
+                .is_none()
         );
     }
 

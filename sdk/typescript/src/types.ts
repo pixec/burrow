@@ -595,6 +595,11 @@ export interface SandboxInfo {
    * last attempt went; `null` for none.
    */
   activation: WindowsActivation | null;
+  /**
+   * Its display's resolution, for a sandbox of a template with a display;
+   * `null` for a headless one.
+   */
+  display: DisplayResolution | null;
   /** Public addresses of either family attached to it. */
   publicIps: PublicIp[];
   /**
@@ -1357,4 +1362,10 @@ export interface UsageReport {
   sums: UsageSum[];
   /** Pass as `afterId` for the next page; 0 when there is none. */
   nextAfterId: number;
+}
+
+/** A display's resolution in pixels, from 640x480 to 3840x2160. */
+export interface DisplayResolution {
+  width: number;
+  height: number;
 }

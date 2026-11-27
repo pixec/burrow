@@ -21,3 +21,16 @@ test("a disk import names the disk, its node and the TPM", () => {
     ["", "win.raw", "node_a", true],
   );
 });
+
+test("a disk import asks for a display and a sandbox reports it", () => {
+  const request = new TemplateBuilder()
+    .fromDisk("win.raw", "node_a", { display: { width: 1280, height: 800 } })
+    .toRequest("win22", {});
+  assert.deepEqual(request.display, { width: 1280, height: 800 });
+  assert.equal(new TemplateBuilder().fromDisk("win.raw", "node_a").toRequest("win22", {}).display, undefined);
+  assert.deepEqual(toSandboxInfo({ id: "s", display: { width: 1920, height: 1080 } }).display, {
+    width: 1920,
+    height: 1080,
+  });
+  assert.equal(toSandboxInfo({ id: "s" }).display, null);
+});

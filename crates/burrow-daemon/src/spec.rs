@@ -31,6 +31,7 @@ pub(crate) struct Sandbox<'a> {
     pub systemd: Option<&'a crate::oci::SystemdBoot>,
     pub is_console_verbose: bool,
     pub is_tpm: bool,
+    pub display: Option<crate::oci::Display>,
 }
 
 pub(crate) fn sandbox(config: &NodeConfig, guest: &Guest, sandbox: &Sandbox) -> MachineSpec {
@@ -43,6 +44,7 @@ pub(crate) fn sandbox(config: &NodeConfig, guest: &Guest, sandbox: &Sandbox) -> 
     } = *guest;
     let resources = sandbox.resources;
     let mut spec = base(config, guest);
+    spec.devices.display = sandbox.display.map(crate::oci::Display::spec);
     let capabilities = hypervisor.capabilities();
     spec.cpu.vcpus = resources.vcpus.max(1);
     if capabilities.is_vcpu_hotplug_supported {
@@ -127,8 +129,9 @@ pub(crate) fn warm(
     shape: Shape,
     systemd: Option<&crate::oci::SystemdBoot>,
     tpm: Option<TpmSpec>,
+    display: Option<crate::oci::Display>,
 ) -> MachineSpec {
-    let mut spec = shaped(config, guest, shape);
+    let mut spec = shaped(config, guest, shape, display);
     boot(
         &mut spec,
         format!(
@@ -144,8 +147,10 @@ pub(crate) fn warm(
 
 /// The restore of a warm snapshot that records which pages a create faults
 /// on.
+/// Only a backend serving lazy memory profiles, and none of those has a
+/// display.
 pub(crate) fn profile(config: &NodeConfig, guest: &Guest, shape: Shape) -> MachineSpec {
-    let mut spec = shaped(config, guest, shape);
+    let mut spec = shaped(config, guest, shape, None);
     spec.restore.memory.record_prefetch = Some(crate::warm::PREFETCH_PLAN.to_string());
     spec
 }
@@ -169,8 +174,14 @@ fn base(config: &NodeConfig, guest: &Guest) -> MachineSpec {
 }
 
 /// [`base`] at a warm snapshot's shape, capped as one.
-fn shaped(config: &NodeConfig, guest: &Guest, shape: Shape) -> MachineSpec {
+fn shaped(
+    config: &NodeConfig,
+    guest: &Guest,
+    shape: Shape,
+    display: Option<crate::oci::Display>,
+) -> MachineSpec {
     let mut spec = base(config, guest);
+    spec.devices.display = display.map(crate::oci::Display::spec);
     spec.cpu.vcpus = shape.vcpus;
     spec.memory.mib = shape.mem_mib;
     spec.memory.hotplug_mib = crate::sandbox::hotplug_region(
@@ -187,16 +198,21 @@ fn shaped(config: &NodeConfig, guest: &Guest, shape: Shape) -> MachineSpec {
     spec
 }
 
-/// The VMM's cgroup, capped for `resources` and a guest of `mem_mib`.
+/// The VMM's cgroup, capped for `resources` and a guest of `mem_mib`, with
+/// room for the display's frame where it has one.
 fn confine(
     spec: &mut MachineSpec,
     config: &NodeConfig,
     resources: &common::ResourcePolicy,
     mem_mib: u32,
 ) {
+    let display_mib = match spec.devices.display {
+        Some(_) => burrow_vmm::DISPLAY_OVERHEAD_MIB,
+        None => 0,
+    };
     spec.limits = crate::sandbox::cgroup_limits(
         resources,
-        config.memory_ceiling_mib(spec.hypervisor(), mem_mib),
+        config.memory_ceiling_mib(spec.hypervisor(), mem_mib) + display_mib,
     );
     spec.cgroup_root = config.cgroup_root.clone();
     spec.is_limits_required = config.is_resource_limits_required;

@@ -138,6 +138,7 @@ def _to_sandbox_info(raw: common_pb2.Sandbox) -> SandboxInfo:
             if raw.HasField("activation")
             else None
         ),
+        display=(raw.display.width, raw.display.height) if raw.HasField("display") else None,
     )
 
 

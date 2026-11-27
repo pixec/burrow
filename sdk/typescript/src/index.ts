@@ -55,6 +55,7 @@ export type {
   CommandState,
   CreateOptions,
   DiskCapacity,
+  DisplayResolution,
   DrainOptions,
   EventKind,
   EventsOptions,

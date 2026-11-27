@@ -873,6 +873,7 @@ pub async fn build_warm_snapshot(
         shape,
         environment.booted_systemd(),
         tpm.clone(),
+        environment.display,
     );
 
     let outcome = match cold_boots.admit(&vm_id).await {

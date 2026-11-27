@@ -606,6 +606,15 @@ message Sandbox {
   // Windows guest giving up neither vCPUs nor memory while it runs.
   // `policy.resources` is the machine it runs as until then.
   PendingResources pending_resources = 44;
+  // Its display, for a sandbox of a template with one: the resolution its
+  // guest is offered, the template's unless the create asked for another.
+  Display display = 45;
+}
+
+// A display's resolution in pixels, from 640x480 to 3840x2160.
+message Display {
+  uint32 width = 1;
+  uint32 height = 2;
 }
 
 // Fields of 0 are not pending.

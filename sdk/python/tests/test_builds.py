@@ -39,6 +39,21 @@ def test_a_disk_import_names_the_disk_its_node_and_the_tpm():
     assert getattr(request, "from") == ""
 
 
+def test_a_disk_import_asks_for_a_display_and_a_sandbox_reports_it():
+    recorder = Recorder()
+    build_template(
+        recorder, TemplateBuilder().from_disk("win.raw", "node_a", display=(1280, 800)), "win22"
+    )
+    request = recorder.requests[0]
+    assert (request.display.width, request.display.height) == (1280, 800)
+    headless = Recorder()
+    build_template(headless, TemplateBuilder().from_disk("win.raw", "node_a"), "win22")
+    assert not headless.requests[0].HasField("display")
+    raw = common_pb2.Sandbox(id="s", display=common_pb2.Display(width=1920, height=1080))
+    assert _to_sandbox_info(raw).display == (1920, 1080)
+    assert _to_sandbox_info(common_pb2.Sandbox(id="s")).display is None
+
+
 def test_a_listing_names_the_tag_and_the_build_it_resolves_to():
     info = to_template_info(api_pb2.TemplateInfo(name="t", tag="v1", digest=DIGEST, status="ready"))
     assert (info.tag, info.digest, info.status) == ("v1", DIGEST, "ready")

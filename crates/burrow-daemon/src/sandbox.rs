@@ -4808,6 +4808,7 @@ impl SandboxManager {
                 systemd: environment.booted_systemd(),
                 is_console_verbose: stored_policy.is_console_verbose,
                 is_tpm: record.is_tpm,
+                display: crate::oci::Display::of(&environment, record.display.as_ref()),
             },
         );
 
@@ -9102,6 +9103,7 @@ impl SandboxManager {
                     systemd: environment.booted_systemd(),
                     is_console_verbose: policy.is_console_verbose,
                     is_tpm: environment.tpm,
+                    display: environment.display,
                 },
             )
         };
@@ -9525,6 +9527,7 @@ impl SandboxManager {
             inspection_root_fingerprint: inspection_root,
             kernel,
             is_tpm: environment.tpm,
+            display: environment.display.map(crate::oci::Display::to_proto),
             // Tags and name are stamped a moment later by the caller's
             // create; usage, reachability and the handshake are filled in
             // from the live sandbox on every read.
@@ -10694,6 +10697,7 @@ impl SandboxManager {
                 systemd: environment.booted_systemd(),
                 is_console_verbose: policy.is_console_verbose,
                 is_tpm,
+                display: environment.display,
             },
         );
         // The template's plan names the pages its agent touches on the way to
@@ -10790,6 +10794,7 @@ impl SandboxManager {
             kernel,
             public_ips,
             is_tpm,
+            display: environment.display.map(crate::oci::Display::to_proto),
             ..Default::default()
         };
         tracing::info!(
@@ -11179,6 +11184,7 @@ impl SandboxManager {
                 systemd: environment.booted_systemd(),
                 is_console_verbose: policy.is_console_verbose,
                 is_tpm: record.is_tpm,
+                display: crate::oci::Display::of(&environment, record.display.as_ref()),
             },
         );
         let from = self.boundary(&sandbox).await;
@@ -12742,6 +12748,7 @@ impl SandboxManager {
                 systemd: manifest.is_systemd.then_some(&manifest.image.systemd_boot),
                 is_console_verbose: policy.is_console_verbose,
                 is_tpm,
+                display: crate::oci::Display::of(&manifest.image, record.display.as_ref()),
             },
         );
         let record = common::Sandbox {

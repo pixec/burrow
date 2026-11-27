@@ -178,6 +178,7 @@ impl KitTemplate {
             kernel: String::new(),
             kernel_digest: String::new(),
             tpm: false,
+            display: None,
         }
     }
 }

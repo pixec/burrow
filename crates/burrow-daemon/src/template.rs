@@ -604,12 +604,22 @@ pub mod from_disk {
             hypervisor: hypervisor.to_string(),
             guest_os: burrow_vmm::GuestOs::Windows.as_str().to_string(),
             tpm: request.is_tpm,
+            display: request
+                .display
+                .as_ref()
+                .map(crate::oci::Display::from_proto)
+                .transpose()?,
             ..Default::default()
         };
         let (hypervisor, guest_os) = environment.machine()?;
         if !hypervisor.capabilities().runs(guest_os) {
             return Err(Status::failed_precondition(format!(
                 "{hypervisor} on this node cannot run {guest_os} guests"
+            )));
+        }
+        if environment.display.is_some() && !hypervisor.capabilities().is_display_supported {
+            return Err(Status::failed_precondition(format!(
+                "{hypervisor} cannot give a guest a display"
             )));
         }
         Ok(environment)
@@ -730,6 +740,44 @@ pub mod from_disk {
             assert!(plan(&request("win.raw"), "firecracker").is_err());
         }
 
+        /// A display is recorded with the build at a resolution it may
+        /// have, and a template without one is headless.
+        #[test]
+        fn a_disk_import_records_its_display() {
+            if !burrow_vmm::Hypervisor::CloudHypervisor
+                .capabilities()
+                .runs(burrow_vmm::GuestOs::Windows)
+            {
+                return;
+            }
+            assert_eq!(
+                plan(&request("win.raw"), "cloud-hypervisor")
+                    .unwrap()
+                    .display,
+                None
+            );
+            let mut with_display = request("win.raw");
+            with_display.display = Some(burrow_proto::common::v1::Display {
+                width: 1280,
+                height: 800,
+            });
+            assert_eq!(
+                plan(&with_display, "cloud-hypervisor").unwrap().display,
+                Some(crate::oci::Display {
+                    width: 1280,
+                    height: 800
+                })
+            );
+            with_display.display = Some(burrow_proto::common::v1::Display {
+                width: 8000,
+                height: 800,
+            });
+            assert_eq!(
+                plan(&with_display, "cloud-hypervisor").unwrap_err().code(),
+                tonic::Code::InvalidArgument
+            );
+        }
+
         /// An imported disk is uploaded like any build, and another node
         /// fetches it whole with the config it was imported with.
         #[tokio::test]
@@ -795,6 +843,14 @@ pub async fn build(
     insecure: Vec<String>,
     tx: LogTx,
 ) {
+    if request.display.is_some() && request.from_disk.is_empty() {
+        let _ = tx
+            .send(Err(Status::invalid_argument(
+                "display is taken only with from_disk",
+            )))
+            .await;
+        return;
+    }
     if !request.from.is_empty()
         && let Err(status) = async { manager.ensure_build(&key_of(&request.from)?).await }.await
     {

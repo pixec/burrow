@@ -3,7 +3,7 @@ import { Buffer } from "node:buffer";
 import { withClient, withConnection } from "./client.js";
 import { BurrowError } from "./errors.js";
 import type { ConnectionOptions, TransportOptions } from "./transport.js";
-import type { CallOptions, KernelInfo } from "./types.js";
+import type { CallOptions, DisplayResolution, KernelInfo } from "./types.js";
 import { toKernelInfo } from "./wire.js";
 
 /** One step of a template build. */
@@ -140,6 +140,7 @@ export class TemplateBuilder {
   private disk = "";
   private diskNode = "";
   private tpm = false;
+  private display: DisplayResolution | undefined;
   private readonly steps: BuildStep[] = [];
 
   /**
@@ -158,13 +159,19 @@ export class TemplateBuilder {
    * Imports an installed Windows disk, made by `scripts/windows`, as a Cloud
    * Hypervisor template: `disk` is its file name in the imports directory
    * under `node`'s data directory. `tpm` gives each sandbox a TPM 2.0 of its
-   * own, as Windows 11 expects. The template takes no steps, and its build
-   * is distributed to other nodes like any other.
+   * own, as Windows 11 expects. `display` gives each sandbox a display of
+   * that resolution, with a keyboard and a tablet. The template takes no
+   * steps, and its build is distributed to other nodes like any other.
    */
-  fromDisk(disk: string, node: string, options: { tpm?: boolean } = {}): this {
+  fromDisk(
+    disk: string,
+    node: string,
+    options: { tpm?: boolean; display?: DisplayResolution } = {},
+  ): this {
     this.disk = disk;
     this.diskNode = node;
     this.tpm = options.tpm ?? false;
+    this.display = options.display;
     this.image = "";
     this.ipsw = "";
     return this;
@@ -269,6 +276,7 @@ export class TemplateBuilder {
       fromDisk: this.disk,
       nodeId: this.diskNode,
       isTpm: this.tpm,
+      display: this.display,
       steps: this.steps,
       // Zero is the node's default for the guest being built.
       vcpus: options.vcpus ?? 0,

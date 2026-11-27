@@ -12,6 +12,7 @@ path = "src/main.rs"
 burrow-proto = { workspace = true }
 burrow-common = { workspace = true }
 burrow-vmm = { workspace = true }
+burrow-display = { workspace = true }
 burrow-net = { workspace = true }
 burrow-proxy = { workspace = true }
 burrow-store = { workspace = true }

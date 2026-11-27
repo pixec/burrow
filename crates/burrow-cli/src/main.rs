@@ -1552,6 +1552,14 @@ fn parse_tmpfs_mount(raw: &str, mut rest: &str) -> anyhow::Result<common::Volume
     })
 }
 
+/// A display resolution, `1920x1080`.
+fn parse_resolution(text: &str) -> Result<common::Display, String> {
+    text.split_once(['x', 'X'])
+        .and_then(|(w, h)| Some((w.parse().ok()?, h.parse().ok()?)))
+        .map(|(width, height)| common::Display { width, height })
+        .ok_or_else(|| format!("{text:?} is not a resolution like 1920x1080"))
+}
+
 /// A size in MiB for `config resources`, as [`parse_mib`] reads one.
 fn parse_size_mib(size: &str) -> Result<u32, String> {
     parse_mib(size)
@@ -1823,6 +1831,10 @@ enum TemplatesCommand {
         /// Windows 11 expects.
         #[arg(long)]
         tpm: bool,
+        /// Give each sandbox of the template a display of this resolution,
+        /// as WIDTHxHEIGHT, with a keyboard and a tablet.
+        #[arg(long, value_parser = parse_resolution)]
+        display: Option<common::Display>,
     },
     /// Remove a template, or one tag of it as `name:tag`. Builds no tag
     /// keeps are dropped once nothing uses them.
@@ -2964,12 +2976,14 @@ async fn main() -> anyhow::Result<()> {
             disk,
             node,
             tpm,
+            display,
         }) => {
             let request = api::BuildTemplateRequest {
                 name,
                 from_disk: disk,
                 node_id: node,
                 is_tpm: tpm,
+                display,
                 ..Default::default()
             };
             build_template(&mut client, request).await?
@@ -5100,6 +5114,9 @@ fn print_config(sandbox: &common::Sandbox) {
             bytes(sandbox.tx_bytes)
         ),
     );
+    if let Some(display) = &sandbox.display {
+        field("display", &format!("{}x{}", display.width, display.height));
+    }
     if let Some(activation) = &sandbox.activation {
         let source = match (
             activation.is_product_key_installed,
@@ -6407,6 +6424,16 @@ mod tests {
             status: Some(status),
             is_healthy: true,
             last_heartbeat_at_unix_ms: 0,
+        }
+    }
+
+    #[test]
+    fn a_resolution_is_width_by_height() {
+        let display = super::parse_resolution("1920x1080").unwrap();
+        assert_eq!((display.width, display.height), (1920, 1080));
+        assert_eq!(super::parse_resolution("1280X800").unwrap().height, 800);
+        for bad in ["1920", "x1080", "1920x", "wide x tall", "-1x5"] {
+            assert!(super::parse_resolution(bad).is_err(), "{bad}");
         }
     }
 

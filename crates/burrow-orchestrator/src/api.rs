@@ -3454,6 +3454,11 @@ impl Burrow for ApiService {
                     "node_id is taken only with from_disk; other builds are placed",
                 ));
             }
+            (true, true) if req.display.is_some() => {
+                return Err(Status::invalid_argument(
+                    "display is taken only with from_disk",
+                ));
+            }
             (true, true) => self
                 .0
                 .nodes

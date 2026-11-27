@@ -4,9 +4,9 @@ from __future__ import annotations
 
 import base64
 import sys
-from typing import Any, Callable, Dict, List, Optional, Union
+from typing import Any, Callable, Dict, List, Optional, Tuple, Union
 
-from ._pb import api_pb2
+from ._pb import api_pb2, common_pb2
 from ._transport import Transport
 from ._wire import kernel as to_kernel
 from .errors import BurrowError
@@ -98,6 +98,11 @@ def build_template(
         from_disk=template._disk,
         node_id=template._disk_node,
         is_tpm=template._tpm,
+        display=(
+            common_pb2.Display(width=template._display[0], height=template._display[1])
+            if template._display
+            else None
+        ),
         steps=[api_pb2.BuildStep(run=step) for step in template._steps],
         # Zero is the node's default for the guest being built: 1 vCPU and
         # 1024 MiB for Linux, the restore image's minimum for macOS.
@@ -194,6 +199,7 @@ class TemplateBuilder:
         self._disk = ""
         self._disk_node = ""
         self._tpm = False
+        self._display: Optional[Tuple[int, int]] = None
         self._steps: List[str] = []
 
     def from_template(self, name: str) -> "TemplateBuilder":
@@ -205,16 +211,26 @@ class TemplateBuilder:
         self._disk = ""
         return self
 
-    def from_disk(self, disk: str, node: str, *, tpm: bool = False) -> "TemplateBuilder":
+    def from_disk(
+        self,
+        disk: str,
+        node: str,
+        *,
+        tpm: bool = False,
+        display: Optional[Tuple[int, int]] = None,
+    ) -> "TemplateBuilder":
         """Imports an installed Windows disk, made by `scripts/windows`, as a
         Cloud Hypervisor template: `disk` is its file name in the imports
         directory under `node`'s data directory. `tpm` gives each sandbox a
-        TPM 2.0 of its own, as Windows 11 expects. The template takes no
-        steps, and its build is distributed to other nodes like any other.
+        TPM 2.0 of its own, as Windows 11 expects. `display` gives each
+        sandbox a display of that (width, height), with a keyboard and a
+        tablet. The template takes no steps, and its build is distributed to
+        other nodes like any other.
         """
         self._disk = disk
         self._disk_node = node
         self._tpm = tpm
+        self._display = display
         self._image = ""
         self._ipsw = ""
         return self

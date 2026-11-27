@@ -182,6 +182,9 @@ export function toSandboxInfo(raw: any): SandboxInfo {
           checkedAt: dateOrNull(raw.activation.checkedAtUnixMs),
         }
       : null,
+    display: raw.display
+      ? { width: Number(raw.display.width ?? 0), height: Number(raw.display.height ?? 0) }
+      : null,
   };
 }
 

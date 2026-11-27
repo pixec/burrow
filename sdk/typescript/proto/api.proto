@@ -437,6 +437,10 @@ message BuildTemplateRequest {
   // Each sandbox of a `from_disk` build gets a TPM 2.0 of its own, as
   // Windows 11 expects. Recorded with the build.
   bool is_tpm = 16;
+  // Each sandbox of a `from_disk` build gets a display of this resolution,
+  // with a keyboard and a tablet. Unset builds a headless template. Recorded
+  // with the build.
+  burrow.common.v1.Display display = 17;
 }
 
 message BuildDone {

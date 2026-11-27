@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from datetime import datetime
-from typing import Dict, List, Optional, Union
+from typing import Dict, List, Optional, Tuple, Union
 
 
 @dataclass
@@ -305,6 +305,9 @@ class SandboxInfo:
     # How a Windows guest created with an activation activates, and how the
     # last attempt went.
     activation: Optional[WindowsActivation] = None
+    # Its display's resolution as (width, height), for a sandbox of a
+    # template with a display.
+    display: Optional[Tuple[int, int]] = None
 
 
 @dataclass
