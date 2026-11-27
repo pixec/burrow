@@ -2403,7 +2403,7 @@ pub(crate) fn warm_request(
 /// itself. An id like `../../etc` becomes a path this sandbox's own workdir
 /// setup will `remove_dir_all` and recreate, so it gets the same charset and
 /// length the orchestrator already holds a caller-chosen sandbox id to.
-fn validate_sandbox_id(field: &str, id: &str) -> Result<(), Status> {
+pub(crate) fn validate_sandbox_id(field: &str, id: &str) -> Result<(), Status> {
     if id.is_empty() {
         return Err(Status::invalid_argument(format!("{field} is required")));
     }

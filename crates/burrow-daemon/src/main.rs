@@ -15,6 +15,7 @@ mod cpuid;
 mod delivery;
 mod devvm;
 mod diskcap;
+mod display;
 mod droplog;
 mod durable;
 mod edge;
@@ -66,6 +67,9 @@ enum Command {
     /// Development commands for the microVM layer.
     #[command(subcommand)]
     Vm(VmCommand),
+    /// Look at a sandbox's display from its node.
+    #[command(subcommand)]
+    Display(display::DisplayCommand),
 }
 
 #[derive(Subcommand)]
@@ -130,5 +134,6 @@ async fn run(args: Args) -> anyhow::Result<()> {
         Command::Vm(VmCommand::Agent(args)) => devvm::agent_boot(args).await,
         Command::Vm(VmCommand::Exec { boot, cmd }) => devvm::agent_exec(boot, cmd).await,
         Command::Vm(VmCommand::Clones(args)) => devvm::clone_divergence(args).await,
+        Command::Display(command) => display::run(command).await,
     }
 }
