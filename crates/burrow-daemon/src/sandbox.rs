@@ -11143,13 +11143,18 @@ impl SandboxManager {
         loop {
             {
                 let vm = sandbox.vm.lock().await;
-                let Some(Vm::Vz(vz)) = vm.as_ref() else {
-                    return Err(Status::failed_precondition(format!(
+                let not_macos = || {
+                    Status::failed_precondition(format!(
                         "sandbox {id} is not a running macOS guest"
-                    )));
+                    ))
                 };
-                if vz.wait_stopped(std::time::Duration::ZERO).await.is_ok() {
-                    break;
+                let Some(vm) = vm.as_ref() else {
+                    return Err(not_macos());
+                };
+                match vm.wait_stopped(std::time::Duration::ZERO).await {
+                    Ok(()) => break,
+                    Err(burrow_vmm::Error::Unsupported { .. }) => return Err(not_macos()),
+                    Err(_) => {}
                 }
             }
             if std::time::Instant::now() >= deadline {

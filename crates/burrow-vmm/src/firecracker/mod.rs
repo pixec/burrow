@@ -21,6 +21,7 @@ use tokio::net::unix::pipe;
 
 use crate::cgroup::{Cgroup, Limits};
 use crate::error::{Error, Result};
+use crate::machine::Machine;
 use crate::process::VmmProcess;
 use crate::{DriveSpec, NetSpec, VmSpec};
 use model::*;
@@ -396,59 +397,8 @@ impl MicroVm {
         &self.spec
     }
 
-    pub fn pid(&self) -> Option<u32> {
-        self.process.pid()
-    }
-
-    pub async fn request_memory(&self, plugged_mib: u32) -> Result<()> {
-        self.api.request_memory(plugged_mib).await
-    }
-
-    pub async fn plugged_memory(&self) -> Result<u32> {
-        Ok(self.api.memory_hotplug().await?.plugged_size_mib)
-    }
-
-    pub fn has_exited(&mut self) -> bool {
-        self.process.has_exited()
-    }
-
-    pub fn boot_latency(&self) -> Duration {
-        self.boot_latency
-    }
-
-    pub fn phases(&self) -> &crate::Phases {
-        &self.phases
-    }
-
-    /// Host CPU this VM has consumed, in microseconds. `None` when the VM runs
-    /// under no cgroup, which is the same condition that leaves its cpu cap
-    /// unenforced.
-    pub fn cpu_usage_usec(&self) -> Option<u64> {
-        self.process.cpu_usage_usec()
-    }
-
-    pub fn cgroup(&self) -> Option<&Cgroup> {
-        self.process.cgroup()
-    }
-
     pub fn console_log_path(&self) -> PathBuf {
         self.spec.workdir.join(crate::console::LOG)
-    }
-
-    pub async fn console_tail(&self, lines: usize) -> String {
-        self.process.output_tail(lines).await
-    }
-
-    pub fn exit_status(&mut self) -> Option<std::process::ExitStatus> {
-        self.process.exit_status()
-    }
-
-    /// Writes to the guest serial console. Only useful for guests running a
-    /// getty/shell on ttyS0; the supported control path is the guest agent.
-    pub async fn console_write(&mut self, input: &str) -> Result<()> {
-        self.console_in.write_all(input.as_bytes()).await?;
-        self.console_in.flush().await?;
-        Ok(())
     }
 
     /// Waits for a marker string in the guest's serial output. Until the guest
@@ -475,20 +425,6 @@ impl MicroVm {
 
     pub async fn instance_info(&self) -> Result<InstanceInfo> {
         self.api.instance_info().await
-    }
-
-    pub async fn pause(&self) -> Result<()> {
-        self.api.set_vm_state(VmState::Paused).await
-    }
-
-    pub async fn resume(&self) -> Result<()> {
-        self.api.set_vm_state(VmState::Resumed).await
-    }
-
-    /// Snapshots a **paused** VM into `snapshot.vmstate` + `snapshot.mem` in
-    /// the working directory.
-    pub async fn snapshot(&self, kind: SnapshotType) -> Result<()> {
-        self.snapshot_to(kind, SNAPSHOT_MEM_FILE).await
     }
 
     /// Snapshots a **paused** VM, writing memory to `mem_file`.
@@ -530,35 +466,6 @@ impl MicroVm {
             return Ok(memory.served_pages());
         }
         Ok(crate::memfile::map_from_extents(path)?)
-    }
-
-    /// Whether a diff taken now can record exactly which pages it holds.
-    pub fn can_map_diff(&self) -> bool {
-        self.is_lazy_memory_active() || crate::memfile::are_holes_exact()
-    }
-
-    /// Attaches a drive to a running VM.
-    ///
-    /// Only possible with `is_pci_enabled`, and the guest sees nothing until it
-    /// rescans its PCI bus: firecracker has no way to notify it. This is how a
-    /// volume reaches a sandbox restored from a warm snapshot, which was
-    /// captured without it.
-    pub async fn attach_drive(&self, drive: &DriveSpec) -> Result<()> {
-        self.api
-            .add_drive(&Drive::from_spec(drive, self.spec.io_engine))
-            .await
-    }
-
-    /// Tells the running guest that a drive's file changed size, which the
-    /// caller has already changed.
-    pub async fn resize_drive(&self, id: &str) -> Result<()> {
-        let drive = self
-            .spec
-            .drives
-            .iter()
-            .find(|drive| drive.id == id)
-            .ok_or_else(|| crate::Error::NoDrive(id.to_string()))?;
-        self.api.update_drive(id, &drive.path).await
     }
 
     /// Starts a fresh VMM process and restores a snapshot from `workdir`
@@ -728,8 +635,35 @@ impl MicroVm {
             false
         }
     }
+}
 
-    pub async fn kill(mut self) -> Result<()> {
+impl Machine for MicroVm {
+    fn hypervisor(&self) -> crate::Hypervisor {
+        crate::Hypervisor::Firecracker
+    }
+
+    fn workdir(&self) -> &Path {
+        &self.spec.workdir
+    }
+
+    fn boot_latency(&self) -> Duration {
+        self.boot_latency
+    }
+
+    async fn pause(&self) -> Result<()> {
+        self.api.set_vm_state(VmState::Paused).await
+    }
+
+    async fn resume(&self) -> Result<()> {
+        self.api.set_vm_state(VmState::Resumed).await
+    }
+
+    async fn snapshot(&self) -> Result<()> {
+        self.snapshot_to(SnapshotType::Full, SNAPSHOT_MEM_FILE)
+            .await
+    }
+
+    async fn kill(mut self) -> Result<()> {
         let result = self.process.kill().await;
         // Strictly after the VMM is reaped: stopping the handler while a guest
         // is still running would stall it on its next fault rather than fail.
@@ -742,6 +676,71 @@ impl MicroVm {
         // reap rather than accompany it.
         self.process.release_cgroup();
         result
+    }
+
+    fn phases(&self) -> crate::Phases {
+        self.phases.clone()
+    }
+
+    async fn console_tail(&self, lines: usize) -> String {
+        crate::console::tail(&self.spec.workdir, lines).await
+    }
+
+    /// Writes to the guest serial console. Only useful for guests running a
+    /// getty/shell on ttyS0; the supported control path is the guest agent.
+    async fn console_write(&mut self, input: &str) -> Result<()> {
+        self.console_in.write_all(input.as_bytes()).await?;
+        self.console_in.flush().await?;
+        Ok(())
+    }
+
+    /// Whether a diff taken now can record exactly which pages it holds.
+    fn can_map_diff(&self) -> bool {
+        self.is_lazy_memory_active() || crate::memfile::are_holes_exact()
+    }
+
+    /// Attaches a drive to a running VM.
+    ///
+    /// Only possible with `is_pci_enabled`, and the guest sees nothing until it
+    /// rescans its PCI bus: firecracker has no way to notify it. This is how a
+    /// volume reaches a sandbox restored from a warm snapshot, which was
+    /// captured without it.
+    async fn attach_drive(&self, drive: &DriveSpec) -> Result<()> {
+        self.api
+            .add_drive(&Drive::from_spec(drive, self.spec.io_engine))
+            .await
+    }
+
+    /// Tells the running guest that a drive's file changed size, which the
+    /// caller has already changed; the size is the file's.
+    async fn resize_disk(&self, id: &str, _bytes: u64) -> Result<()> {
+        let drive = self
+            .spec
+            .drives
+            .iter()
+            .find(|drive| drive.id == id)
+            .ok_or_else(|| crate::Error::NoDrive(id.to_string()))?;
+        self.api.update_drive(id, &drive.path).await
+    }
+
+    async fn request_memory(&self, plugged_mib: u32) -> Result<()> {
+        self.api.request_memory(plugged_mib).await
+    }
+
+    async fn plugged_memory(&self) -> Result<u32> {
+        Ok(self.api.memory_hotplug().await?.plugged_size_mib)
+    }
+
+    async fn snapshot_diff(&self, mem_file: &str) -> Result<()> {
+        self.snapshot_to(SnapshotType::Diff, mem_file).await
+    }
+
+    fn process(&self) -> Option<&VmmProcess> {
+        Some(&self.process)
+    }
+
+    fn process_mut(&mut self) -> Option<&mut VmmProcess> {
+        Some(&mut self.process)
     }
 }
 

@@ -52,6 +52,7 @@ use tokio::sync::oneshot;
 use tokio::task::JoinHandle;
 
 use crate::error::{Error, Result};
+use crate::machine::Machine as _;
 use crate::{Boot, GuestOs, Hypervisor, VSOCK_UDS, VmSpec};
 
 pub use install::{InstallSpec, InstalledImage, install, root_drive};
@@ -412,39 +413,47 @@ impl VzVm {
             process: None,
         })
     }
+}
 
-    pub fn workdir(&self) -> &Path {
+impl crate::machine::Machine for VzVm {
+    fn hypervisor(&self) -> Hypervisor {
+        Hypervisor::Vz
+    }
+
+    fn workdir(&self) -> &Path {
         &self.workdir
     }
 
-    pub fn boot_latency(&self) -> Duration {
+    fn boot_latency(&self) -> Duration {
         self.boot_latency
     }
 
-    pub fn pid(&self) -> Option<u32> {
+    fn pid(&self) -> Option<u32> {
         self.process.map(|process| process.pid as u32)
     }
 
     /// Host CPU the machine's service process has spent, in microseconds.
-    pub fn cpu_usage_usec(&self) -> Option<u64> {
+    fn cpu_usage_usec(&self) -> Option<u64> {
         self.process.as_ref()?.cpu_usage_usec()
     }
 
-    pub async fn pause(&self) -> Result<Duration> {
+    async fn pause(&self) -> Result<()> {
         self.machine
             .call(|vm, done| unsafe { vm.pauseWithCompletionHandler(&done) })
             .await
+            .map(drop)
     }
 
-    pub async fn resume(&self) -> Result<Duration> {
+    async fn resume(&self) -> Result<()> {
         self.machine
             .call(|vm, done| unsafe { vm.resumeWithCompletionHandler(&done) })
             .await
+            .map(drop)
     }
 
     /// Saves a **paused** machine into its [`SAVE_FILE`], replacing the one
     /// it was last restored from, which the framework will not overwrite.
-    pub async fn snapshot(&self) -> Result<Duration> {
+    async fn snapshot(&self) -> Result<()> {
         let path = self.workdir.join(SAVE_FILE);
         crate::snapfile::replace_target(&path).await?;
         let url = OnQueue(file_url(&path));
@@ -453,30 +462,12 @@ impl VzVm {
                 vm.saveMachineStateToURL_completionHandler(url.get(), &done)
             })
             .await
-    }
-
-    /// Waits for the guest to shut itself down, as after a `shutdown -h` in
-    /// it.
-    pub async fn wait_stopped(&self, timeout: Duration) -> Result<()> {
-        let deadline = Instant::now() + timeout;
-        loop {
-            let state = self.machine.with_vm(|vm| unsafe { vm.state() }).await?;
-            if state == VZVirtualMachineState::Stopped || state == VZVirtualMachineState::Error {
-                return Ok(());
-            }
-            if Instant::now() >= deadline {
-                return Err(Error::Timeout {
-                    what: "the guest to shut down".into(),
-                    timeout_ms: timeout.as_millis() as u64,
-                });
-            }
-            tokio::time::sleep(Duration::from_millis(500)).await;
-        }
+            .map(drop)
     }
 
     /// Hard stop, with no chance for the guest to shut down, unless it has
     /// already stopped itself.
-    pub async fn kill(self) -> Result<()> {
+    async fn kill(self) -> Result<()> {
         if let Some(bridge) = &self.bridge {
             bridge.abort();
         }
@@ -494,6 +485,25 @@ impl VzVm {
         }
         let _ = std::fs::remove_file(self.workdir.join(VSOCK_UDS));
         Ok(())
+    }
+
+    /// Waits for the guest to shut itself down, as after a `shutdown -h` in
+    /// it.
+    async fn wait_stopped(&self, timeout: Duration) -> Result<()> {
+        let deadline = Instant::now() + timeout;
+        loop {
+            let state = self.machine.with_vm(|vm| unsafe { vm.state() }).await?;
+            if state == VZVirtualMachineState::Stopped || state == VZVirtualMachineState::Error {
+                return Ok(());
+            }
+            if Instant::now() >= deadline {
+                return Err(Error::Timeout {
+                    what: "the guest to shut down".into(),
+                    timeout_ms: timeout.as_millis() as u64,
+                });
+            }
+            tokio::time::sleep(Duration::from_millis(500)).await;
+        }
     }
 }
 

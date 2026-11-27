@@ -7,10 +7,10 @@
 //! which backend it is talking to.
 //!
 //! The backends are an enum rather than trait objects. The set is closed and
-//! lives in this crate, every operation is async (which a `dyn` trait can only
-//! express by boxing each future), and a `match` makes a new backend answer for
-//! every operation at compile time instead of inheriting a default that does
-//! the wrong thing quietly.
+//! lives in this crate, and every operation is async, which a `dyn` trait can
+//! only express by boxing each future. Each variant implements
+//! [`machine::Machine`], whose defaults refuse what a backend cannot do, and
+//! [`Vm`] dispatches to it.
 
 mod cgroup;
 mod child;
@@ -19,6 +19,7 @@ mod error;
 mod guest;
 mod http;
 pub mod jail;
+mod machine;
 mod process;
 mod snapfile;
 mod vsock;
@@ -39,6 +40,7 @@ pub use error::{Error, Result};
 pub use firecracker::{FirecrackerConfig, IoEngine, Jail, MemorySource, PageSource};
 pub use guest::{GUEST_CID, GuestAddr, VSOCK_UDS};
 pub use jail::JailLayout;
+use machine::Machine;
 pub use memfile::{data_extents, merge_chain};
 #[cfg(target_os = "macos")]
 pub use vz::{MacOsBoot, Requirements, VzConfig};
@@ -567,6 +569,18 @@ impl VmSpec {
     }
 }
 
+/// Runs `$body` with `$vm` bound to the backend VM inside a [`Vm`].
+macro_rules! dispatch {
+    ($self:expr, $vm:ident => $body:expr) => {
+        match $self {
+            Vm::Firecracker($vm) => $body,
+            Vm::CloudHypervisor($vm) => $body,
+            #[cfg(target_os = "macos")]
+            Vm::Vz($vm) => $body,
+        }
+    };
+}
+
 /// A running (or paused) VM under any backend. Boxed, since each carries
 /// hundreds of bytes of process and spec and the handle is moved through
 /// every lifecycle call.
@@ -621,12 +635,7 @@ impl Vm {
     }
 
     pub fn hypervisor(&self) -> Hypervisor {
-        match self {
-            Self::Firecracker(_) => Hypervisor::Firecracker,
-            Self::CloudHypervisor(_) => Hypervisor::CloudHypervisor,
-            #[cfg(target_os = "macos")]
-            Self::Vz(_) => Hypervisor::Vz,
-        }
+        dispatch!(self, vm => vm.hypervisor())
     }
 
     pub fn capabilities(&self) -> Capabilities {
@@ -635,12 +644,7 @@ impl Vm {
 
     /// Where the guest's vsock listeners are reached from the host.
     pub fn guest(&self) -> GuestAddr {
-        match self {
-            Self::Firecracker(vm) => GuestAddr::in_workdir(&vm.spec().workdir),
-            Self::CloudHypervisor(vm) => GuestAddr::in_workdir(vm.workdir()),
-            #[cfg(target_os = "macos")]
-            Self::Vz(vm) => GuestAddr::in_workdir(vm.workdir()),
-        }
+        dispatch!(self, vm => GuestAddr::in_workdir(vm.workdir()))
     }
 
     /// Waits for a guest vsock listener to accept, which is the agent's
@@ -649,127 +653,72 @@ impl Vm {
         self.guest().wait(port, timeout).await
     }
 
+    /// The VMM's pid; for vz, the XPC service the framework spawned for the
+    /// machine.
     pub fn pid(&self) -> Option<u32> {
-        match self {
-            Self::Firecracker(vm) => vm.pid(),
-            Self::CloudHypervisor(vm) => vm.pid(),
-            // The XPC service the framework spawned for the machine.
-            #[cfg(target_os = "macos")]
-            Self::Vz(vm) => vm.pid(),
-        }
+        dispatch!(self, vm => vm.pid())
     }
 
     /// Whether the VMM process has exited on its own. A vz machine runs in a
     /// service process this node does not own, so it never reads as exited.
     pub fn has_exited(&mut self) -> bool {
-        match self {
-            Self::Firecracker(vm) => vm.has_exited(),
-            Self::CloudHypervisor(vm) => vm.has_exited(),
-            #[cfg(target_os = "macos")]
-            Self::Vz(_) => false,
-        }
+        dispatch!(self, vm => vm.process_mut().is_some_and(|process| process.has_exited()))
     }
 
-    /// From spawning the VMM to a guest that is running or ready to.
     /// The phases of this VM's start; empty for a backend that does not
     /// record them.
     pub fn phases(&self) -> Phases {
-        match self {
-            Self::Firecracker(vm) => vm.phases().clone(),
-            Self::CloudHypervisor(_) => Phases::default(),
-            #[cfg(target_os = "macos")]
-            Self::Vz(_) => Phases::default(),
-        }
+        dispatch!(self, vm => vm.phases())
     }
 
+    /// From spawning the VMM to a guest that is running or ready to.
     pub fn boot_latency(&self) -> Duration {
-        match self {
-            Self::Firecracker(vm) => vm.boot_latency(),
-            Self::CloudHypervisor(vm) => vm.boot_latency(),
-            #[cfg(target_os = "macos")]
-            Self::Vz(vm) => vm.boot_latency(),
-        }
+        dispatch!(self, vm => vm.boot_latency())
     }
 
     /// Host CPU this VM has consumed, in microseconds; `None` without a
     /// cgroup, or for a vz machine whose process could not be found.
     pub fn cpu_usage_usec(&self) -> Option<u64> {
-        match self {
-            Self::Firecracker(vm) => vm.cpu_usage_usec(),
-            Self::CloudHypervisor(vm) => vm.cpu_usage_usec(),
-            #[cfg(target_os = "macos")]
-            Self::Vz(vm) => vm.cpu_usage_usec(),
-        }
+        dispatch!(self, vm => vm.cpu_usage_usec())
     }
 
     /// How the VMM process ended, once it has.
     pub fn exit_status(&mut self) -> Option<std::process::ExitStatus> {
-        match self {
-            Self::Firecracker(vm) => vm.exit_status(),
-            Self::CloudHypervisor(vm) => vm.exit_status(),
-            #[cfg(target_os = "macos")]
-            Self::Vz(_) => None,
-        }
+        dispatch!(self, vm => vm.process_mut()?.exit_status())
     }
 
     /// The last of what the VMM itself printed. Firecracker's goes to the
     /// console log with the guest's.
     pub async fn vmm_log_tail(&self, lines: usize) -> String {
-        match self {
-            Self::Firecracker(vm) => vm.console_tail(lines).await,
-            Self::CloudHypervisor(vm) => vm.vmm_log_tail(lines).await,
-            #[cfg(target_os = "macos")]
-            Self::Vz(_) => String::new(),
+        match self.process() {
+            Some(process) => process.output_tail(lines).await,
+            None => String::new(),
         }
     }
 
+    /// The last of the guest's serial console. A macOS guest writes nothing
+    /// to one.
     pub async fn console_tail(&self, lines: usize) -> String {
-        match self {
-            Self::Firecracker(vm) => vm.console_tail(lines).await,
-            Self::CloudHypervisor(vm) => vm.console_tail(lines).await,
-            // A macOS guest writes nothing to a serial console.
-            #[cfg(target_os = "macos")]
-            Self::Vz(_) => String::new(),
-        }
+        dispatch!(self, vm => vm.console_tail(lines).await)
     }
 
     /// Writes to the guest serial console, for dev and rescue only.
     pub async fn console_write(&mut self, input: &str) -> Result<()> {
-        match self {
-            Self::Firecracker(vm) => Ok(vm.console_write(input).await?),
-            Self::CloudHypervisor(vm) => vm.console_write(input).await,
-            #[cfg(target_os = "macos")]
-            Self::Vz(_) => Err(Error::ConsoleUnavailable),
-        }
+        dispatch!(self, vm => vm.console_write(input).await)
     }
 
     pub async fn pause(&self) -> Result<()> {
-        match self {
-            Self::Firecracker(vm) => Ok(vm.pause().await?),
-            Self::CloudHypervisor(vm) => vm.pause().await,
-            #[cfg(target_os = "macos")]
-            Self::Vz(vm) => vm.pause().await.map(drop),
-        }
+        dispatch!(self, vm => vm.pause().await)
     }
 
     pub async fn resume(&self) -> Result<()> {
-        match self {
-            Self::Firecracker(vm) => Ok(vm.resume().await?),
-            Self::CloudHypervisor(vm) => vm.resume().await,
-            #[cfg(target_os = "macos")]
-            Self::Vz(vm) => vm.resume().await.map(drop),
-        }
+        dispatch!(self, vm => vm.resume().await)
     }
 
     /// Snapshots a **paused** VM in full, into its [`Layout`].
     pub async fn snapshot(&self) -> Result<()> {
         let _outside = self.snapshotting();
-        match self {
-            Self::Firecracker(vm) => Ok(vm.snapshot(firecracker::SnapshotType::Full).await?),
-            Self::CloudHypervisor(vm) => vm.snapshot().await,
-            #[cfg(target_os = "macos")]
-            Self::Vz(vm) => vm.snapshot().await.map(drop),
-        }
+        dispatch!(self, vm => vm.snapshot().await)
     }
 
     /// Snapshots a **paused** VM's dirtied pages into `mem_file`, layered over
@@ -777,33 +726,28 @@ impl Vm {
     /// [`Capabilities::is_diff_snapshot_supported`].
     pub async fn snapshot_diff(&self, mem_file: &str) -> Result<()> {
         let _outside = self.snapshotting();
-        match self {
-            Self::Firecracker(vm) => Ok(vm
-                .snapshot_to(firecracker::SnapshotType::Diff, mem_file)
-                .await?),
-            Self::CloudHypervisor(_) => Err(Error::Unsupported {
-                hypervisor: Hypervisor::CloudHypervisor,
-                what: "take a diff snapshot",
-            }),
-            #[cfg(target_os = "macos")]
-            Self::Vz(_) => Err(Error::Unsupported {
-                hypervisor: Hypervisor::Vz,
-                what: "take a diff snapshot",
-            }),
-        }
+        dispatch!(self, vm => vm.snapshot_diff(mem_file).await)
+    }
+
+    /// Waits for the guest to shut itself down, as after a `shutdown -h` in
+    /// it. Only a vz machine is watched for that.
+    pub async fn wait_stopped(&self, timeout: Duration) -> Result<()> {
+        dispatch!(self, vm => vm.wait_stopped(timeout).await)
+    }
+
+    fn process(&self) -> Option<&process::VmmProcess> {
+        dispatch!(self, vm => vm.process())
+    }
+
+    fn cgroup(&self) -> Option<&Cgroup> {
+        self.process()?.cgroup()
     }
 
     /// Moves the VMM out of its cgroup for a snapshot, so the page cache the
     /// write fills is not charged against the guest's memory ceiling. A VMM
     /// that cannot be moved snapshots where it is, only slower.
     fn snapshotting(&self) -> Option<cgroup::Snapshotting<'_>> {
-        let cgroup = match self {
-            Self::Firecracker(vm) => vm.cgroup(),
-            Self::CloudHypervisor(vm) => vm.cgroup(),
-            #[cfg(target_os = "macos")]
-            Self::Vz(_) => None,
-        }?;
-        cgroup
+        self.cgroup()?
             .snapshotting()
             .inspect_err(
                 |err| tracing::warn!(%err, "could not move the vmm out of its cgroup to snapshot"),
@@ -814,24 +758,13 @@ impl Vm {
     /// Whether a diff taken now would know exactly which pages it holds. A
     /// suspend or checkpoint that cannot takes a full snapshot instead.
     pub fn can_map_diff(&self) -> bool {
-        match self {
-            Self::Firecracker(vm) => vm.can_map_diff(),
-            _ => false,
-        }
+        dispatch!(self, vm => vm.can_map_diff())
     }
 
     /// Attaches a drive to the running guest. Only where
     /// [`Capabilities::is_drive_hotplug_supported`].
     pub async fn attach_drive(&self, drive: &DriveSpec) -> Result<()> {
-        match self {
-            Self::Firecracker(vm) => Ok(vm.attach_drive(drive).await?),
-            Self::CloudHypervisor(vm) => vm.attach_drive(drive).await,
-            #[cfg(target_os = "macos")]
-            Self::Vz(_) => Err(Error::Unsupported {
-                hypervisor: Hypervisor::Vz,
-                what: "attach a drive to a running guest",
-            }),
-        }
+        dispatch!(self, vm => vm.attach_drive(drive).await)
     }
 
     /// Tells the running guest that the drive `id` is now `bytes` long.
@@ -839,49 +772,25 @@ impl Vm {
     /// caller has grown already. Only where
     /// [`Capabilities::is_live_disk_growth_supported`].
     pub async fn resize_disk(&self, id: &str, bytes: u64) -> Result<()> {
-        match self {
-            Self::CloudHypervisor(vm) => vm.resize_disk(id, bytes).await,
-            Self::Firecracker(vm) => Ok(vm.resize_drive(id).await?),
-            #[cfg(target_os = "macos")]
-            Self::Vz(_) => Err(Error::Unsupported {
-                hypervisor: Hypervisor::Vz,
-                what: "grow a disk the guest has mounted",
-            }),
-        }
+        dispatch!(self, vm => vm.resize_disk(id, bytes).await)
     }
 
     /// Sets the running guest's vCPUs to `vcpus`, within the
     /// [`VmSpec::max_vcpus`] it was booted with.
     /// Only where [`Capabilities::is_vcpu_hotplug_supported`].
     pub async fn resize_vcpus(&self, vcpus: u32) -> Result<()> {
-        match self {
-            Self::CloudHypervisor(vm) => vm.resize_vcpus(vcpus).await,
-            Self::Firecracker(_) => Err(Error::Unsupported {
-                hypervisor: Hypervisor::Firecracker,
-                what: "change a running guest's vcpus",
-            }),
-            #[cfg(target_os = "macos")]
-            Self::Vz(_) => Err(Error::Unsupported {
-                hypervisor: Hypervisor::Vz,
-                what: "change a running guest's vcpus",
-            }),
-        }
+        dispatch!(self, vm => vm.resize_vcpus(vcpus).await)
     }
 
     /// Moves the running VMM's CPU and IO limits.
     pub fn set_limits(&self, limits: &Limits) -> Result<()> {
-        let cgroup = match self {
-            Self::Firecracker(vm) => vm.cgroup(),
-            Self::CloudHypervisor(vm) => vm.cgroup(),
-            #[cfg(target_os = "macos")]
-            Self::Vz(_) => {
-                return Err(Error::Unsupported {
-                    hypervisor: Hypervisor::Vz,
-                    what: "limit a machine's host CPU or IO",
-                });
-            }
+        let Some(process) = self.process() else {
+            return Err(Error::Unsupported {
+                hypervisor: self.hypervisor(),
+                what: "limit a machine's host CPU or IO",
+            });
         };
-        match cgroup {
+        match process.cgroup() {
             Some(cgroup) => cgroup.set_limits(limits),
             None => Err(Error::CgroupUnavailable {
                 reason: "this VM runs under no cgroup".into(),
@@ -923,38 +832,19 @@ impl Vm {
     }
 
     async fn request_memory(&self, plugged_mib: u32) -> Result<()> {
-        match self {
-            Self::Firecracker(vm) => Ok(vm.request_memory(plugged_mib).await?),
-            Self::CloudHypervisor(vm) => vm.request_memory(plugged_mib).await,
-            #[cfg(target_os = "macos")]
-            Self::Vz(_) => Err(Error::Unsupported {
-                hypervisor: Hypervisor::Vz,
-                what: "change a running guest's memory",
-            }),
-        }
+        dispatch!(self, vm => vm.request_memory(plugged_mib).await)
     }
 
     /// MiB of the hotplug region the guest has plugged.
     pub async fn plugged_memory(&self) -> Result<u32> {
-        match self {
-            Self::Firecracker(vm) => Ok(vm.plugged_memory().await?),
-            Self::CloudHypervisor(vm) => vm.plugged_memory().await,
-            #[cfg(target_os = "macos")]
-            Self::Vz(_) => Ok(0),
-        }
+        dispatch!(self, vm => vm.plugged_memory().await)
     }
 
     /// Moves the VMM's memory cap. A grow raises it before memory is plugged
     /// and a shrink lowers it once memory is out, so the cap never sits below
     /// what the guest holds.
     pub fn set_memory_limit(&self, mib: u32) -> Result<()> {
-        let cgroup = match self {
-            Self::Firecracker(vm) => vm.cgroup(),
-            Self::CloudHypervisor(vm) => vm.cgroup(),
-            #[cfg(target_os = "macos")]
-            Self::Vz(_) => None,
-        };
-        match cgroup {
+        match self.cgroup() {
             Some(cgroup) => cgroup.set_memory(mib),
             None => Ok(()),
         }
@@ -962,12 +852,7 @@ impl Vm {
 
     /// Stops the VMM and reaps it, then releases its cgroup.
     pub async fn kill(self) -> Result<()> {
-        match self {
-            Self::Firecracker(vm) => Ok(vm.kill().await?),
-            Self::CloudHypervisor(vm) => vm.kill().await,
-            #[cfg(target_os = "macos")]
-            Self::Vz(vm) => vm.kill().await,
-        }
+        dispatch!(self, vm => (*vm).kill().await)
     }
 }
 

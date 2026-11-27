@@ -726,10 +726,7 @@ async fn first_boot(
         ssh.sudo("launchctl disable system/com.openssh.sshd; shutdown -h +0")
             .await
             .ok();
-        let burrow_vmm::Vm::Vz(vz) = &vm else {
-            unreachable!("booted with the vz backend")
-        };
-        vz.wait_stopped(SHUTDOWN).await?;
+        vm.wait_stopped(SHUTDOWN).await?;
         anyhow::Ok(())
     }
     .await;

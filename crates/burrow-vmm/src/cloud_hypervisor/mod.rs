@@ -31,6 +31,7 @@ use serde_json::{Value, json};
 use crate::cgroup::Cgroup;
 use crate::error::{Error, Result};
 use crate::http::UnixHttp;
+use crate::machine::Machine;
 use crate::process::{Output, VmmProcess};
 use crate::{DriveSpec, GuestOs, VSOCK_UDS, VmSpec};
 
@@ -424,44 +425,6 @@ impl ChVm {
         }
     }
 
-    pub fn pid(&self) -> Option<u32> {
-        self.process.pid()
-    }
-
-    pub fn has_exited(&mut self) -> bool {
-        self.process.has_exited()
-    }
-
-    pub fn boot_latency(&self) -> Duration {
-        self.boot_latency
-    }
-
-    pub fn cpu_usage_usec(&self) -> Option<u64> {
-        self.process.cpu_usage_usec()
-    }
-
-    pub fn cgroup(&self) -> Option<&Cgroup> {
-        self.process.cgroup()
-    }
-
-    pub fn workdir(&self) -> &Path {
-        &self.workdir
-    }
-
-    pub async fn console_tail(&self, lines: usize) -> String {
-        crate::console::tail(&self.workdir, lines).await
-    }
-
-    /// The VMM's own output, which says why it exited.
-    pub async fn vmm_log_tail(&self, lines: usize) -> String {
-        self.process.output_tail(lines).await
-    }
-
-    /// How the process ended, once it has.
-    pub fn exit_status(&mut self) -> Option<std::process::ExitStatus> {
-        self.process.exit_status()
-    }
-
     /// Connects to an interactive console once the VMM listens on it, and
     /// copies what the guest writes there to the console log.
     async fn attach_console(&mut self) -> Result<()> {
@@ -482,18 +445,26 @@ impl ChVm {
         self.console_in = Some(input);
         Ok(())
     }
+}
 
-    pub async fn console_write(&mut self, input: &str) -> Result<()> {
-        use tokio::io::AsyncWriteExt as _;
-        let console = self.console_in.as_mut().ok_or(Error::ConsoleUnavailable)?;
-        Ok(console.write_all(input.as_bytes()).await?)
+impl Machine for ChVm {
+    fn hypervisor(&self) -> crate::Hypervisor {
+        crate::Hypervisor::CloudHypervisor
     }
 
-    pub async fn pause(&self) -> Result<()> {
+    fn workdir(&self) -> &Path {
+        &self.workdir
+    }
+
+    fn boot_latency(&self) -> Duration {
+        self.boot_latency
+    }
+
+    async fn pause(&self) -> Result<()> {
         self.api.put_empty("/api/v1/vm.pause").await
     }
 
-    pub async fn resume(&self) -> Result<()> {
+    async fn resume(&self) -> Result<()> {
         self.api.put_empty("/api/v1/vm.resume").await
     }
 
@@ -503,7 +474,7 @@ impl ChVm {
     /// sandbox restored from a warm snapshot, which holds them as hard links
     /// to the template's, never writes through a link (see
     /// [`crate::snapfile`]).
-    pub async fn snapshot(&self) -> Result<()> {
+    async fn snapshot(&self) -> Result<()> {
         let dir = self.workdir.join(SNAPSHOT_DIR);
         let _ = tokio::fs::remove_dir_all(&dir).await;
         tokio::fs::create_dir_all(&dir).await?;
@@ -530,9 +501,27 @@ impl ChVm {
         Ok(())
     }
 
+    async fn kill(mut self) -> Result<()> {
+        self.stop().await;
+        let _ = tokio::fs::remove_file(self.workdir.join(API_SOCK)).await;
+        // Only removable once it holds no processes, so this follows the reap.
+        self.process.release_cgroup();
+        Ok(())
+    }
+
+    async fn console_tail(&self, lines: usize) -> String {
+        crate::console::tail(&self.workdir, lines).await
+    }
+
+    async fn console_write(&mut self, input: &str) -> Result<()> {
+        use tokio::io::AsyncWriteExt as _;
+        let console = self.console_in.as_mut().ok_or(Error::ConsoleUnavailable)?;
+        Ok(console.write_all(input.as_bytes()).await?)
+    }
+
     /// Attaches a drive to the running guest, which sees it once it rescans
     /// its PCI bus.
-    pub async fn attach_drive(&self, drive: &DriveSpec) -> Result<()> {
+    async fn attach_drive(&self, drive: &DriveSpec) -> Result<()> {
         self.api
             .call(
                 Method::PUT,
@@ -545,7 +534,7 @@ impl ChVm {
 
     /// Resizes a disk under the running guest, which Cloud Hypervisor tells
     /// it of with a config change.
-    pub async fn resize_disk(&self, id: &str, bytes: u64) -> Result<()> {
+    async fn resize_disk(&self, id: &str, bytes: u64) -> Result<()> {
         self.api
             .put(
                 "/api/v1/vm.resize-disk",
@@ -554,10 +543,17 @@ impl ChVm {
             .await
     }
 
+    /// Hotplugs or unplugs vCPUs.
+    async fn resize_vcpus(&self, vcpus: u32) -> Result<()> {
+        self.api
+            .put("/api/v1/vm.resize", &json!({ "desired_vcpus": vcpus }))
+            .await
+    }
+
     /// Sets the guest's memory to its boot memory plus `plugged_mib`, which
     /// its virtio-mem driver then works towards; an ACPI hotplug adds it at
     /// once.
-    pub async fn request_memory(&self, plugged_mib: u32) -> Result<()> {
+    async fn request_memory(&self, plugged_mib: u32) -> Result<()> {
         self.api
             .put(
                 "/api/v1/vm.resize",
@@ -569,25 +565,18 @@ impl ChVm {
     /// `memory_actual_size` counts what the virtio-mem device has plugged,
     /// not what it was asked for. An ACPI hotplug moves the recorded memory
     /// size itself, which it counts.
-    pub async fn plugged_memory(&self) -> Result<u32> {
+    async fn plugged_memory(&self) -> Result<u32> {
         let info: Value = self.api.get_json("/api/v1/vm.info").await?;
         let actual = info["memory_actual_size"].as_u64().unwrap_or(self.boot_mem);
         Ok((actual.saturating_sub(self.boot_mem) / (1024 * 1024)) as u32)
     }
 
-    /// Hotplugs or unplugs vCPUs.
-    pub async fn resize_vcpus(&self, vcpus: u32) -> Result<()> {
-        self.api
-            .put("/api/v1/vm.resize", &json!({ "desired_vcpus": vcpus }))
-            .await
+    fn process(&self) -> Option<&VmmProcess> {
+        Some(&self.process)
     }
 
-    pub async fn kill(mut self) -> Result<()> {
-        self.stop().await;
-        let _ = tokio::fs::remove_file(self.workdir.join(API_SOCK)).await;
-        // Only removable once it holds no processes, so this follows the reap.
-        self.process.release_cgroup();
-        Ok(())
+    fn process_mut(&mut self) -> Option<&mut VmmProcess> {
+        Some(&mut self.process)
     }
 }
 
