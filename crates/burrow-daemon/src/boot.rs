@@ -15,9 +15,9 @@ pub const FIRMWARE: &str = "firmware.fd";
 
 /// The boot file of a `guest_os` guest.
 pub fn file(guest_os: GuestOs) -> &'static str {
-    match guest_os {
-        GuestOs::Windows => FIRMWARE,
-        GuestOs::Linux | GuestOs::MacOs => KERNEL,
+    match guest_os.profile().boots_firmware {
+        true => FIRMWARE,
+        false => KERNEL,
     }
 }
 

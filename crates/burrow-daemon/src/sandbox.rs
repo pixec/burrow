@@ -11,6 +11,7 @@ use tokio::sync::Mutex;
 use tonic::{Status, transport::Channel};
 
 use burrow_common::cpu::cpus_text;
+use burrow_common::hypervisor::MemoryHotplug;
 use burrow_net::ipam::AddressPool;
 use burrow_net::{Ipam, Lease, firewall, tap};
 use burrow_proto::common::v1 as common;
@@ -62,18 +63,14 @@ pub(crate) fn require_min_machine(
 /// killed next leaves them as the guest last saw them. Best effort: a guest
 /// that has stopped answering is stopped all the same.
 async fn flush_guest(sandbox: &RunningSandbox) {
-    let cmd: &[&str] = match burrow_vmm::GuestOs::from_record(&sandbox.record().guest_os) {
-        Some(burrow_vmm::GuestOs::Windows) => &[
-            "powershell.exe",
-            "-NoProfile",
-            "-NonInteractive",
-            "-Command",
-            "Get-Volume | Where-Object FileSystem -eq NTFS | Write-VolumeCache -ErrorAction SilentlyContinue",
-        ],
-        _ => &["sync"],
-    };
+    let guest_os = burrow_vmm::GuestOs::from_record(&sandbox.record().guest_os).unwrap_or_default();
     let start = burrow_proto::guest::v1::ExecStart {
-        cmd: cmd.iter().map(|arg| arg.to_string()).collect(),
+        cmd: guest_os
+            .profile()
+            .flush_command
+            .iter()
+            .map(|arg| arg.to_string())
+            .collect(),
         ..Default::default()
     };
     let _ = tokio::time::timeout(
@@ -83,11 +80,11 @@ async fn flush_guest(sandbox: &RunningSandbox) {
     .await;
 }
 
-/// Freezes a Linux guest's root filesystem through its agent and leaves it
-/// frozen, for a VM about to be killed. False where it could not be.
+/// Freezes a guest's root filesystem through its agent and leaves it frozen,
+/// for a VM about to be killed. False where it could not be.
 async fn freeze_root(sandbox: &RunningSandbox) -> bool {
     use burrow_proto::guest::v1::{RootDiskRequest, root_disk_request::Op};
-    if sandbox.guest_os() != burrow_vmm::GuestOs::Linux {
+    if !sandbox.guest_os().profile().is_root_freezable {
         return false;
     }
     let Ok(mut agent) = sandbox.agent().await else {
@@ -621,17 +618,17 @@ pub(crate) fn max_mem_mib(mem_mib: u32, requested: u32) -> u32 {
 /// driver and only ever takes memory.
 fn can_plug_memory(hypervisor: Hypervisor, guest_os: burrow_vmm::GuestOs) -> bool {
     let capabilities = hypervisor.capabilities();
-    match guest_os {
-        burrow_vmm::GuestOs::Linux => capabilities.is_memory_hotplug_supported,
-        burrow_vmm::GuestOs::Windows => capabilities.is_acpi_memory_hotplug_supported,
-        burrow_vmm::GuestOs::MacOs => false,
+    match guest_os.profile().memory_hotplug {
+        Some(MemoryHotplug::VirtioMem) => capabilities.is_memory_hotplug_supported,
+        Some(MemoryHotplug::Acpi) => capabilities.is_acpi_memory_hotplug_supported,
+        None => false,
     }
 }
 
 /// What a running guest's memory moves in above what it booted with.
 fn memory_step_mib(guest_os: burrow_vmm::GuestOs) -> u32 {
-    match guest_os {
-        burrow_vmm::GuestOs::Windows => burrow_vmm::ACPI_MEMORY_BLOCK_MIB,
+    match guest_os.profile().memory_hotplug {
+        Some(MemoryHotplug::Acpi) => burrow_vmm::ACPI_MEMORY_BLOCK_MIB,
         _ => burrow_vmm::MEMORY_BLOCK_MIB,
     }
 }
@@ -782,29 +779,27 @@ fn plan_reshape(
     if reshape.is_empty() {
         return Ok(reshape);
     }
-    match from.guest_os {
-        burrow_vmm::GuestOs::Linux => {}
-        burrow_vmm::GuestOs::Windows => {
-            let shrinks = [
-                ("vcpus", reshape.vcpus, from.vcpus),
-                ("mem_mib", reshape.mem_mib, from.mem_mib),
-            ];
-            if let Some((field, Some(want), current)) = shrinks
-                .into_iter()
-                .find(|(_, want, current)| want.is_some_and(|want| want < *current))
-            {
-                return Err(Status::failed_precondition(format!(
-                    "{what} restores a Windows guest at {field} {current}, and {WINDOWS_KEEPS} \
-                     while it runs; ask for at least {current} instead of {want}, or shut it \
-                     down and boot it smaller"
-                )));
-            }
-        }
-        burrow_vmm::GuestOs::MacOs => {
+    let profile = from.guest_os.profile();
+    if !profile.can_reshape_restored {
+        return Err(Status::failed_precondition(format!(
+            "{what} of a {} guest keeps its source's {} vcpu / {} MiB / {} MiB disk; leave \
+             vcpus, mem_mib and disk_mib unset",
+            from.guest_os, from.vcpus, from.mem_mib, from.disk_mib
+        )));
+    }
+    if !profile.can_shrink_running {
+        let shrinks = [
+            ("vcpus", reshape.vcpus, from.vcpus),
+            ("mem_mib", reshape.mem_mib, from.mem_mib),
+        ];
+        if let Some((field, Some(want), current)) = shrinks
+            .into_iter()
+            .find(|(_, want, current)| want.is_some_and(|want| want < *current))
+        {
             return Err(Status::failed_precondition(format!(
-                "{what} of a {} guest keeps its source's {} vcpu / {} MiB / {} MiB disk; leave \
-                 vcpus, mem_mib and disk_mib unset",
-                from.guest_os, from.vcpus, from.mem_mib, from.disk_mib
+                "{what} restores a Windows guest at {field} {current}, and {WINDOWS_KEEPS} \
+                 while it runs; ask for at least {current} instead of {want}, or shut it \
+                 down and boot it smaller"
             )));
         }
     }
@@ -1412,8 +1407,8 @@ fn spawn_handshake(
         let guest_timing = std::sync::Mutex::new(None);
         let reached = std::sync::Mutex::new(Reached::Nothing);
         let mut bound = timeout + guestconn::UPGRADE_TIMEOUT;
-        // A Windows guest restarting for its name boots again, on top.
-        if guest_os == burrow_vmm::GuestOs::Windows {
+        // A guest restarting for its name boots again, on top.
+        if guest_os.profile().restarts_for_name {
             bound += guestconn::RESTART_TIMEOUT + timeout;
         }
         let dial = dialing.as_ref().map(guestconn::Dialing::abort_handle);
@@ -6295,7 +6290,7 @@ impl SandboxManager {
             self.require_checkpoint_store()?;
         }
         if lifetimes.is_memory_checkpointed == Some(true)
-            && crate::macnode::is_macos(sandbox.guest_os())
+            && sandbox.guest_os().profile().is_disk_only_snapshot
         {
             return Err(Status::failed_precondition(MAC_MEMORY_STAYS));
         }
@@ -6583,7 +6578,7 @@ impl SandboxManager {
         if mib == current {
             return Ok((ResourceChange::Unchanged, 0, String::new()));
         }
-        if guest_os == burrow_vmm::GuestOs::Windows && mib < current {
+        if !guest_os.profile().can_shrink_disk && mib < current {
             return Err(Status::failed_precondition(format!(
                 "a Windows guest's disk only grows: NTFS is not shrunk offline; sandbox {id} \
                  keeps at least its {current} MiB"
@@ -6844,7 +6839,7 @@ impl SandboxManager {
             && sandbox.state.load(std::sync::atomic::Ordering::Relaxed)
                 == common::SandboxState::Stopped as i32;
         let is_kept = |want: u32, current: u32| {
-            guest_os == burrow_vmm::GuestOs::Windows && slot.is_some() && want < current
+            !guest_os.profile().can_shrink_running && slot.is_some() && want < current
         };
         let pending = |what: &str, previous: u32, want: u32| ResourceOutcome {
             change: ResourceChange::Pending as i32,
@@ -7068,7 +7063,7 @@ impl SandboxManager {
             )));
         }
         if want > current
-            && guest_os == burrow_vmm::GuestOs::Linux
+            && guest_os.profile().memory_hotplug == Some(MemoryHotplug::VirtioMem)
             && let Some(why) = no_virtio_mem(&sandbox.workdir).await
         {
             return Ok(refuse(why));
@@ -9414,7 +9409,7 @@ impl SandboxManager {
                 &lease,
                 &[],
                 hypervisor.capabilities().is_tap_networked,
-                from_warm || guest_os == burrow_vmm::GuestOs::Windows,
+                from_warm || guest_os.profile().boots_firmware,
             ),
             self.inspection_ca_for(&policy),
             self.trust_bundles_for(&template, &policy).await,
@@ -9759,7 +9754,7 @@ impl SandboxManager {
         self.require_settled(sandbox_id)?;
         crate::snapshot::validate_id(&snapshot_id)?;
         let sandbox = self.get(sandbox_id).await?;
-        let is_disk_only = crate::macnode::is_macos(sandbox.guest_os());
+        let is_disk_only = sandbox.guest_os().profile().is_disk_only_snapshot;
         let capture = sandbox.workdir.join(format!(".capture-{snapshot_id}"));
         let is_captured = sandbox.is_running() && !is_disk_only;
         if is_captured {
@@ -11197,7 +11192,7 @@ impl SandboxManager {
                 &sandbox.lease,
                 &sandbox.record().public_ips,
                 sandbox.hypervisor.capabilities().is_tap_networked,
-                guest_os == burrow_vmm::GuestOs::Windows,
+                guest_os.profile().boots_firmware,
             ),
             self.inspection_ca_for(&policy),
             self.trust_bundles_in(&environment, &policy),
@@ -13070,9 +13065,10 @@ impl SandboxManager {
         self.require_vmm(sandbox).await?;
         let is_memory = sandbox.lifetime().is_memory_checkpointed
             && sandbox.layout().memory.is_some()
-            && !crate::macnode::is_macos(
-                burrow_vmm::GuestOs::from_record(&sandbox.record().guest_os).unwrap_or_default(),
-            );
+            && !burrow_vmm::GuestOs::from_record(&sandbox.record().guest_os)
+                .unwrap_or_default()
+                .profile()
+                .is_disk_only_snapshot;
         if self.is_unchanged_since(sandbox, since, is_memory).await {
             tracing::debug!(
                 sandbox = sandbox.id(),

@@ -158,6 +158,60 @@ impl GuestOs {
         at_least.max(self.agent_timeout())
     }
 
+    /// How the node treats a guest of this OS.
+    pub fn profile(self) -> GuestProfile {
+        match self {
+            Self::Linux => GuestProfile {
+                flush_command: &["sync"],
+                warm_command: &["sh", "-c", "true"],
+                boots_firmware: false,
+                is_root_freezable: true,
+                memory_hotplug: Some(MemoryHotplug::VirtioMem),
+                can_shrink_running: true,
+                can_shrink_disk: true,
+                can_reshape_restored: true,
+                restarts_for_name: false,
+                settles_after_boot: false,
+                is_network_clearable: true,
+                is_disk_only_snapshot: false,
+            },
+            Self::Windows => GuestProfile {
+                flush_command: &[
+                    "powershell.exe",
+                    "-NoProfile",
+                    "-NonInteractive",
+                    "-Command",
+                    "Get-Volume | Where-Object FileSystem -eq NTFS | Write-VolumeCache -ErrorAction SilentlyContinue",
+                ],
+                warm_command: &["cmd.exe", "/c", "rem"],
+                boots_firmware: true,
+                is_root_freezable: false,
+                memory_hotplug: Some(MemoryHotplug::Acpi),
+                can_shrink_running: false,
+                can_shrink_disk: false,
+                can_reshape_restored: true,
+                restarts_for_name: true,
+                settles_after_boot: true,
+                is_network_clearable: false,
+                is_disk_only_snapshot: false,
+            },
+            Self::MacOs => GuestProfile {
+                flush_command: &["sync"],
+                warm_command: &["sh", "-c", "true"],
+                boots_firmware: false,
+                is_root_freezable: false,
+                memory_hotplug: None,
+                can_shrink_running: true,
+                can_shrink_disk: true,
+                can_reshape_restored: false,
+                restarts_for_name: false,
+                settles_after_boot: false,
+                is_network_clearable: false,
+                is_disk_only_snapshot: true,
+            },
+        }
+    }
+
     /// The hypervisor a template of this OS gets when its build names none.
     pub fn default_hypervisor(self) -> Hypervisor {
         match self {
@@ -166,6 +220,49 @@ impl GuestOs {
             Self::MacOs => Hypervisor::Vz,
         }
     }
+}
+
+/// How the node treats a guest of one OS, beyond what its hypervisor can do.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct GuestProfile {
+    /// What has the guest write what it holds in memory back to its disks.
+    pub flush_command: &'static [&'static str],
+    /// What a warm build runs once, so a clone's first exec does not fault
+    /// in the agent's spawn path one page at a time.
+    pub warm_command: &'static [&'static str],
+    /// Boots UEFI firmware rather than the template's kernel, so no kernel
+    /// command line carries its address: the handshake always does.
+    pub boots_firmware: bool,
+    /// The root filesystem can be frozen through the agent.
+    pub is_root_freezable: bool,
+    /// How memory reaches the running guest, if it can.
+    pub memory_hotplug: Option<MemoryHotplug>,
+    /// vCPUs and memory can be taken from the running guest.
+    pub can_shrink_running: bool,
+    /// The disk can be shrunk while the guest is shut down.
+    pub can_shrink_disk: bool,
+    /// A fork or restore can take a shape other than its source's.
+    pub can_reshape_restored: bool,
+    /// The guest restarts to take its name, which boots it again inside the
+    /// first handshake.
+    pub restarts_for_name: bool,
+    /// The guest is busy for minutes after a boot, which a warm snapshot
+    /// waits out.
+    pub settles_after_boot: bool,
+    /// The agent can drop the guest's address before a warm snapshot.
+    pub is_network_clearable: bool,
+    /// A snapshot holds the disk alone: the guest's memory stays with the
+    /// machine.
+    pub is_disk_only_snapshot: bool,
+}
+
+/// How memory is plugged into a running guest.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MemoryHotplug {
+    /// Into a virtio-mem region, and out of it again.
+    VirtioMem,
+    /// As ACPI DIMMs, which the guest never gives back.
+    Acpi,
 }
 
 impl std::fmt::Display for GuestOs {

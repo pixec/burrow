@@ -884,8 +884,8 @@ pub async fn build_warm_snapshot(
                 &lease,
                 trust,
                 config.upgrade_for(guest_os),
-                capabilities.is_tap_networked && guest_os == burrow_vmm::GuestOs::Linux,
-                guest_os == burrow_vmm::GuestOs::Windows,
+                capabilities.is_tap_networked && guest_os.profile().is_network_clearable,
+                guest_os.profile().settles_after_boot,
             )
             .await
         }
@@ -1136,12 +1136,12 @@ async fn warm_up(
     let start = burrow_proto::guest::v1::ExecInput {
         input: Some(burrow_proto::guest::v1::exec_input::Input::Start(
             burrow_proto::guest::v1::ExecStart {
-                cmd: match guest_os {
-                    burrow_vmm::GuestOs::Windows => {
-                        vec!["cmd.exe".into(), "/c".into(), "rem".into()]
-                    }
-                    _ => vec!["sh".into(), "-c".into(), "true".into()],
-                },
+                cmd: guest_os
+                    .profile()
+                    .warm_command
+                    .iter()
+                    .map(|arg| arg.to_string())
+                    .collect(),
                 ..Default::default()
             },
         )),
