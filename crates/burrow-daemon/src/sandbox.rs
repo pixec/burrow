@@ -3263,7 +3263,7 @@ impl RunningSandbox {
         environment: &crate::oci::ImageEnvironment,
     ) -> Result<crate::snapshot::Staged, Status> {
         self.capture_machine(dest, environment).await?;
-        let _ = tokio::fs::remove_file(dest.join(crate::macnode::MACHINE_ID)).await;
+        let _ = tokio::fs::remove_file(dest.join(burrow_vmm::VZ_MACHINE_ID_FILE)).await;
         Ok(crate::snapshot::Staged {
             sandbox_id: self.id.clone(),
             template: self.template_ref(),
@@ -3275,7 +3275,7 @@ impl RunningSandbox {
             boot_mem_mib: self.boot_mem_mib(),
             max_mem_mib: self.max_mem_mib(),
             is_nested_virt_enabled: false,
-            disk_mib: size_mib(&dest.join(crate::macnode::DISK)),
+            disk_mib: size_mib(&dest.join(burrow_vmm::VZ_DISK_FILE)),
             kernel: None,
             chain: Vec::new(),
             inspection_root: String::new(),
@@ -13043,7 +13043,7 @@ impl SandboxManager {
                 .config
                 .builds_dir()
                 .join(sandbox.build())
-                .join(crate::macnode::DISK),
+                .join(burrow_vmm::VZ_DISK_FILE),
             false => sandbox.workdir.join(TEMPLATE_ROOTFS),
         };
         tokio::fs::try_exists(&path)

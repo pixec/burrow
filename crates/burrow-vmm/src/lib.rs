@@ -35,7 +35,10 @@ pub mod vz;
 
 use std::time::Duration;
 
-pub use caps::{Capabilities, HypervisorExt, Layout, VZ_SAVE_FILE, is_nested_virt_supported};
+pub use caps::{
+    Capabilities, HypervisorExt, Layout, VZ_AUX_FILE, VZ_DISK_FILE, VZ_HARDWARE_MODEL_FILE,
+    VZ_MACHINE_ID_FILE, VZ_REQUIREMENTS_FILE, VZ_SAVE_FILE, is_nested_virt_supported,
+};
 pub use cgroup::{Cgroup, Limits, is_io_weight_supported, sweep_empty_cgroups};
 pub use cloud_hypervisor::{ChJail, CloudHypervisorConfig};
 pub use error::{Error, Result};

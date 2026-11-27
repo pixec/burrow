@@ -912,9 +912,9 @@ pub const CHECKPOINT_BASE: &str = "checkpoint-base.ext4";
 /// The small files a macOS machine needs beside its disk and auxiliary
 /// storage to boot as the same Mac.
 const MACHINE_FILES: [&str; 3] = [
-    crate::macnode::HARDWARE_MODEL,
-    crate::macnode::REQUIREMENTS,
-    crate::macnode::MACHINE_ID,
+    burrow_vmm::VZ_HARDWARE_MODEL_FILE,
+    burrow_vmm::VZ_REQUIREMENTS_FILE,
+    burrow_vmm::VZ_MACHINE_ID_FILE,
 ];
 
 impl Manifest {
@@ -929,7 +929,7 @@ impl Manifest {
 
     fn disk_file(&self) -> &'static str {
         match self.is_machine() {
-            true => crate::macnode::DISK,
+            true => burrow_vmm::VZ_DISK_FILE,
             false => crate::rootdisk::ROOT_DISK,
         }
     }
@@ -1011,7 +1011,7 @@ pub async fn upload_disk_checkpoint(
     let generation = (now_ms as u64).max(previous.map_or(0, |p| p.manifest.generation + 1));
     crate::chunks::put_index(store, &index_key(&id, generation, disk_file), &disk_index).await?;
     if is_machine {
-        let aux = crate::macnode::AUX;
+        let aux = burrow_vmm::VZ_AUX_FILE;
         let index = crate::chunks::put_image(
             store,
             workdir,
@@ -1133,7 +1133,7 @@ pub async fn stage_disk(
     let disk_path = dest.join(disk_file);
     crate::rootdisk::materialise(store, &disk_index, image.as_ref(), &disk_path).await?;
     if is_machine {
-        let aux = crate::macnode::AUX;
+        let aux = burrow_vmm::VZ_AUX_FILE;
         let index = crate::chunks::read_index(store, &index_key(id, manifest.generation, aux))
             .await?
             .ok_or_else(|| missing(aux))?;
@@ -1627,14 +1627,14 @@ pub(crate) mod tests {
         let root = std::env::temp_dir().join(format!("burrow-mac-{}", uuid::Uuid::new_v4()));
         let template = root.join("data-a/builds").join("c".repeat(64));
         std::fs::create_dir_all(&template).unwrap();
-        let base = std::fs::File::create(template.join(crate::macnode::DISK)).unwrap();
+        let base = std::fs::File::create(template.join(burrow_vmm::VZ_DISK_FILE)).unwrap();
         base.set_len(4 << 20).unwrap();
         base.write_all_at(&[1; 4096], 0).unwrap();
         drop(base);
         let workdir = root.join("a");
         std::fs::create_dir_all(&workdir).unwrap();
-        let disk = workdir.join(crate::macnode::DISK);
-        crate::rootdisk::clone(&template.join(crate::macnode::DISK), &disk)
+        let disk = workdir.join(burrow_vmm::VZ_DISK_FILE);
+        crate::rootdisk::clone(&template.join(burrow_vmm::VZ_DISK_FILE), &disk)
             .await
             .unwrap();
         std::fs::OpenOptions::new()
@@ -1643,7 +1643,7 @@ pub(crate) mod tests {
             .unwrap()
             .write_all_at(&[5; 4096], 3 << 20)
             .unwrap();
-        std::fs::write(workdir.join(crate::macnode::AUX), [7u8; 8192]).unwrap();
+        std::fs::write(workdir.join(burrow_vmm::VZ_AUX_FILE), [7u8; 8192]).unwrap();
         for file in MACHINE_FILES {
             std::fs::write(workdir.join(file), file.as_bytes()).unwrap();
         }
@@ -1664,7 +1664,7 @@ pub(crate) mod tests {
             &blobs,
             &workdir,
             &capture,
-            Some(&template.join(crate::macnode::DISK)),
+            Some(&template.join(burrow_vmm::VZ_DISK_FILE)),
             Stamp::of(&disk).unwrap(),
             draft,
             None,
@@ -1687,8 +1687,8 @@ pub(crate) mod tests {
         let other = root.join("data-b/builds").join("c".repeat(64));
         std::fs::create_dir_all(&other).unwrap();
         crate::rootdisk::clone(
-            &template.join(crate::macnode::DISK),
-            &other.join(crate::macnode::DISK),
+            &template.join(burrow_vmm::VZ_DISK_FILE),
+            &other.join(burrow_vmm::VZ_DISK_FILE),
         )
         .await
         .unwrap();
@@ -1702,7 +1702,7 @@ pub(crate) mod tests {
         stage_disk(&store, &snapshots, &held.manifest, &dest)
             .await
             .unwrap();
-        for file in [crate::macnode::DISK, crate::macnode::AUX]
+        for file in [burrow_vmm::VZ_DISK_FILE, burrow_vmm::VZ_AUX_FILE]
             .into_iter()
             .chain(MACHINE_FILES)
         {

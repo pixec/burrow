@@ -8,6 +8,25 @@ use crate::{GuestOs, Hypervisor, MachineSpec, RestoreSpec, cloud_hypervisor, fir
 /// of state a Mac node wrote.
 pub const VZ_SAVE_FILE: &str = "snapshot.vzsave";
 
+/// The files a macOS machine is beside its save file, named here so a node
+/// without the framework can carry them through the object store.
+/// The disk macOS is installed on. Cloned, never copied.
+pub const VZ_DISK_FILE: &str = "disk.img";
+
+/// The boot firmware's NVRAM. Written by the guest, so cloned per sandbox.
+pub const VZ_AUX_FILE: &str = "aux.img";
+
+/// The hardware model the template was installed for, as the framework's
+/// opaque data representation.
+pub const VZ_HARDWARE_MODEL_FILE: &str = "hardware-model";
+
+/// The machine identifier, ditto. Fresh per sandbox, except that a saved
+/// state only restores into the identity it was saved from.
+pub const VZ_MACHINE_ID_FILE: &str = "machine-id";
+
+/// The [`crate::vz::Requirements`] the template was installed with.
+pub const VZ_REQUIREMENTS_FILE: &str = "requirements.json";
+
 /// What this crate knows about each hypervisor: what its backend can do and
 /// the files its snapshots are made of.
 pub trait HypervisorExt {
@@ -131,16 +150,16 @@ pub struct Capabilities {
     /// grow the filesystem on it. Without it a disk grows only while its
     /// sandbox is shut down.
     pub is_live_disk_growth_supported: bool,
-    /// A running guest can be given vCPUs up to [`CpuSpec::max_vcpus`] and
+    /// A running guest can be given vCPUs up to [`crate::CpuSpec::max_vcpus`] and
     /// have them taken away again ([`crate::Vm::resize_vcpus`]).
     pub is_vcpu_hotplug_supported: bool,
     /// A Linux guest can be booted with a virtio-mem region of
-    /// [`MemorySpec::hotplug_mib`] and have memory plugged into it and
+    /// [`crate::MemorySpec::hotplug_mib`] and have memory plugged into it and
     /// unplugged from it while it runs ([`crate::Vm::resize_memory`]). The guest
     /// kernel needs `CONFIG_VIRTIO_MEM`.
     pub is_memory_hotplug_supported: bool,
     /// A Windows guest, which has no virtio-mem driver, can be booted with an
-    /// ACPI hotplug region of [`MemorySpec::hotplug_mib`] and have memory
+    /// ACPI hotplug region of [`crate::MemorySpec::hotplug_mib`] and have memory
     /// added to it in [`crate::ACPI_MEMORY_BLOCK_MIB`] steps while it runs, at most
     /// [`crate::ACPI_MEMORY_SLOTS`] times per boot. Nothing added is taken away
     /// until the guest boots again.

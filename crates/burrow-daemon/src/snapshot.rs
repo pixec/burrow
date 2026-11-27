@@ -57,8 +57,8 @@ pub const COMMAND_LOGS: &str = "command-logs";
 /// and auxiliary storage: what a cold boot reads, and the image environment,
 /// so a Mac without the template can boot it.
 const MACHINE_FILES: [&str; 3] = [
-    crate::macnode::HARDWARE_MODEL,
-    crate::macnode::REQUIREMENTS,
+    burrow_vmm::VZ_HARDWARE_MODEL_FILE,
+    burrow_vmm::VZ_REQUIREMENTS_FILE,
     crate::oci::SANDBOX_ENVIRONMENT,
 ];
 
@@ -616,7 +616,7 @@ impl SnapshotStore {
         let base = self
             .builds_dir()
             .join(crate::template::key_of(&manifest.build_digest).unwrap_or_default())
-            .join(crate::macnode::DISK);
+            .join(burrow_vmm::VZ_DISK_FILE);
         let image = match tokio::fs::try_exists(&base).await.unwrap_or(false) {
             true => {
                 let image = crate::rootdisk::image_of(&self.blobs, &base).await?;
@@ -625,12 +625,12 @@ impl SnapshotStore {
             }
             false => None,
         };
-        let disk = crate::macnode::DISK;
+        let disk = burrow_vmm::VZ_DISK_FILE;
         let index =
             crate::chunks::put_disk(remote, &dir.join(disk), image.as_ref(), &Default::default())
                 .await?;
         crate::chunks::put_index(remote, &index_key(id, disk), &index).await?;
-        let aux = crate::macnode::AUX;
+        let aux = burrow_vmm::VZ_AUX_FILE;
         let index =
             crate::chunks::put_image(remote, dir, &[aux.to_string()], None, &Default::default())
                 .await?;
@@ -894,12 +894,12 @@ impl SnapshotStore {
                 .await?,
             ),
         };
-        let disk = crate::macnode::DISK;
+        let disk = burrow_vmm::VZ_DISK_FILE;
         let index = crate::chunks::read_index(remote, &index_key(id, disk))
             .await?
             .ok_or_else(|| missing(disk))?;
         crate::rootdisk::materialise(remote, &index, image.as_ref(), &dir.join(disk)).await?;
-        let aux = crate::macnode::AUX;
+        let aux = burrow_vmm::VZ_AUX_FILE;
         let index = crate::chunks::read_index(remote, &index_key(id, aux))
             .await?
             .ok_or_else(|| missing(aux))?;
@@ -1915,19 +1915,19 @@ mod tests {
         for data in ["a", "b"] {
             let template = scratch.join(data).join("builds").join(&key);
             std::fs::create_dir_all(&template).unwrap();
-            let base = std::fs::File::create(template.join(crate::macnode::DISK)).unwrap();
+            let base = std::fs::File::create(template.join(burrow_vmm::VZ_DISK_FILE)).unwrap();
             base.set_len(4 << 20).unwrap();
             base.write_all_at(&[1; 4096], 0).unwrap();
         }
         let taken = SnapshotStore::new(&scratch.join("a"), None, HashMap::new());
         let id = burrow_common::SnapshotId::generate().to_string();
         let dir = taken.begin(&id).await.unwrap();
-        let disk = dir.join(crate::macnode::DISK);
+        let disk = dir.join(burrow_vmm::VZ_DISK_FILE);
         crate::rootdisk::clone(
             &scratch
                 .join("a/builds")
                 .join(&key)
-                .join(crate::macnode::DISK),
+                .join(burrow_vmm::VZ_DISK_FILE),
             &disk,
         )
         .await
@@ -1938,7 +1938,7 @@ mod tests {
             .unwrap()
             .write_all_at(&[9; 4096], 2 << 20)
             .unwrap();
-        std::fs::write(dir.join(crate::macnode::AUX), [3u8; 4096]).unwrap();
+        std::fs::write(dir.join(burrow_vmm::VZ_AUX_FILE), [3u8; 4096]).unwrap();
         for file in MACHINE_FILES {
             std::fs::write(dir.join(file), file.as_bytes()).unwrap();
         }
@@ -1969,7 +1969,7 @@ mod tests {
         let elsewhere =
             SnapshotStore::new(&scratch.join("b"), Some(remote.clone()), HashMap::new());
         let fetched = elsewhere.machine_dir(&id).await.unwrap();
-        for file in [crate::macnode::DISK, crate::macnode::AUX]
+        for file in [burrow_vmm::VZ_DISK_FILE, burrow_vmm::VZ_AUX_FILE]
             .into_iter()
             .chain(MACHINE_FILES)
         {

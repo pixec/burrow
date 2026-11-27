@@ -223,7 +223,7 @@ mod macos {
 
     /// The MAC the `vz` driver derives from the machine identifier.
     fn derived_mac(dir: &Path) -> Result<[u8; 6]> {
-        let id = std::fs::read(dir.join(vz::MACHINE_ID_FILE))?;
+        let id = std::fs::read(dir.join(burrow_vmm::VZ_MACHINE_ID_FILE))?;
         let hash = id.iter().fold(0xcbf29ce484222325u64, |h, b| {
             (h ^ u64::from(*b)).wrapping_mul(0x100000001b3)
         });

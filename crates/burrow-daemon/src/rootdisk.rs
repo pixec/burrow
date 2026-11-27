@@ -771,7 +771,7 @@ pub async fn local_image(
     }
     let mut entries = tokio::fs::read_dir(templates_dir).await.ok()?;
     while let Ok(Some(entry)) = entries.next_entry().await {
-        for name in [IMAGE, crate::macnode::DISK] {
+        for name in [IMAGE, burrow_vmm::VZ_DISK_FILE] {
             let path = entry.path().join(name);
             if !tokio::fs::try_exists(&path).await.unwrap_or(false) {
                 continue;

@@ -28,21 +28,11 @@ pub fn is_macos(guest_os: GuestOs) -> bool {
 pub fn disk_file(guest_os: GuestOs) -> Option<&'static str> {
     #[cfg(target_os = "macos")]
     if guest_os == GuestOs::MacOs {
-        return Some(burrow_vmm::vz::DISK_FILE);
+        return Some(burrow_vmm::VZ_DISK_FILE);
     }
     let _ = guest_os;
     None
 }
-
-/// The files a macOS machine is, by the names [`burrow_vmm::vz`] gives them:
-/// its disk, its boot firmware's storage, and the small files a cold boot
-/// reads beside them. Named here too so a Linux node can carry them through
-/// the object store without the framework.
-pub const DISK: &str = "disk.img";
-pub const AUX: &str = "aux.img";
-pub const HARDWARE_MODEL: &str = "hardware-model";
-pub const REQUIREMENTS: &str = "requirements.json";
-pub const MACHINE_ID: &str = "machine-id";
 
 /// Clones the machine in `workdir` into `dest` as a cold boot needs it: its
 /// disk and auxiliary storage, its hardware model and requirements, and a
@@ -509,14 +499,14 @@ pub(crate) async fn machine_manifest(
         guest_os: GuestOs::MacOs.as_str().to_string(),
         ..Default::default()
     };
-    let disk = dir.join(DISK);
+    let disk = dir.join(burrow_vmm::VZ_DISK_FILE);
     let bytes = tokio::fs::metadata(&disk).await.map_err(failed)?.len();
     let digest = crate::blobs::hash_file(&disk).await.map_err(failed)?;
     let mut files = std::collections::BTreeMap::new();
     let mut entries = tokio::fs::read_dir(dir).await.map_err(failed)?;
     while let Some(entry) = entries.next_entry().await.map_err(failed)? {
         let name = entry.file_name().to_string_lossy().into_owned();
-        if name == DISK
+        if name == burrow_vmm::VZ_DISK_FILE
             || name == crate::template::MANIFEST
             || !entry.file_type().await.map_err(failed)?.is_file()
         {
@@ -530,7 +520,7 @@ pub(crate) async fn machine_manifest(
     Ok(burrow_common::build::Manifest {
         version: burrow_common::build::MANIFEST_VERSION,
         rootfs: burrow_common::build::Artifact {
-            file: DISK.to_string(),
+            file: burrow_vmm::VZ_DISK_FILE.to_string(),
             digest: digest.to_string(),
             bytes,
         },
@@ -822,7 +812,7 @@ async fn derive(
 /// A failure is logged and the boot goes on without it.
 pub async fn seed(workdir: &Path, pem: &str) {
     #[cfg(target_os = "macos")]
-    if let Err(err) = seed_disk(&workdir.join(burrow_vmm::vz::DISK_FILE), pem).await {
+    if let Err(err) = seed_disk(&workdir.join(burrow_vmm::VZ_DISK_FILE), pem).await {
         tracing::warn!(
             workdir = %workdir.display(),
             "could not write the inspection root and the agent's Full Disk Access onto the \
@@ -842,7 +832,7 @@ pub async fn seed(workdir: &Path, pem: &str) {
 pub async fn resize_disk(workdir: &Path, mib: u32) -> Result<(), Status> {
     #[cfg(target_os = "macos")]
     {
-        let disk = workdir.join(burrow_vmm::vz::DISK_FILE);
+        let disk = workdir.join(burrow_vmm::VZ_DISK_FILE);
         let disk = disk.to_string_lossy();
         let bytes = u64::from(mib) * burrow_common::disk::MIB;
         let limits = plist(&["image", "resize", "--image-only", "--plist", &disk])
@@ -1284,17 +1274,6 @@ pub fn available_memory() -> Option<u64> {
 
 #[cfg(test)]
 mod tests {
-    #[cfg(target_os = "macos")]
-    #[test]
-    fn the_machine_files_are_the_frameworks() {
-        use burrow_vmm::vz;
-        assert_eq!(super::DISK, vz::DISK_FILE);
-        assert_eq!(super::AUX, vz::AUX_FILE);
-        assert_eq!(super::HARDWARE_MODEL, vz::HARDWARE_MODEL_FILE);
-        assert_eq!(super::REQUIREMENTS, vz::REQUIREMENTS_FILE);
-        assert_eq!(super::MACHINE_ID, vz::MACHINE_ID_FILE);
-    }
-
     use super::*;
 
     #[cfg(target_os = "macos")]
@@ -1370,7 +1349,7 @@ mod tests {
         let pem = std::env::var("BURROW_MAC_ROOT")
             .map(|path| std::fs::read_to_string(path).unwrap())
             .unwrap_or_default();
-        seed_disk(&Path::new(&workdir).join(burrow_vmm::vz::DISK_FILE), &pem)
+        seed_disk(&Path::new(&workdir).join(burrow_vmm::VZ_DISK_FILE), &pem)
             .await
             .unwrap();
     }

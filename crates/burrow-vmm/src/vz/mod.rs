@@ -57,23 +57,10 @@ use crate::{Boot, GuestOs, Hypervisor, MachineSpec, VSOCK_UDS};
 
 pub use install::{InstallSpec, InstalledImage, install, root_drive};
 
-/// The disk macOS is installed on. Cloned, never copied.
-pub const DISK_FILE: &str = "disk.img";
-
 /// How every disk is attached: host caching left to the framework, and guest
 /// flushes synchronized all the way to permanent storage.
 const DISK_CACHING: VZDiskImageCachingMode = VZDiskImageCachingMode::Automatic;
 const DISK_SYNCHRONIZATION: VZDiskImageSynchronizationMode = VZDiskImageSynchronizationMode::Full;
-/// The boot firmware's NVRAM. Written by the guest, so cloned per sandbox.
-pub const AUX_FILE: &str = "aux.img";
-/// The hardware model the template was installed for, as the framework's
-/// opaque data representation.
-pub const HARDWARE_MODEL_FILE: &str = "hardware-model";
-/// The machine identifier, ditto. Fresh per sandbox, except that a saved
-/// state only restores into the identity it was saved from.
-pub const MACHINE_ID_FILE: &str = "machine-id";
-/// The [`Requirements`] the template was installed with.
-pub const REQUIREMENTS_FILE: &str = "requirements.json";
 pub use crate::VZ_SAVE_FILE as SAVE_FILE;
 
 /// The display a guest is given. Headless or not, a macOS guest gets the same
@@ -157,9 +144,9 @@ impl MacOsBoot {
     /// The machine whose files sit in `dir` under the standard names.
     pub fn read(dir: &Path) -> Result<Self> {
         Ok(Self {
-            aux: AUX_FILE.into(),
-            hardware_model: HARDWARE_MODEL_FILE.into(),
-            machine_id: MACHINE_ID_FILE.into(),
+            aux: crate::VZ_AUX_FILE.into(),
+            hardware_model: crate::VZ_HARDWARE_MODEL_FILE.into(),
+            machine_id: crate::VZ_MACHINE_ID_FILE.into(),
             requirements: Requirements::read(dir)?,
         })
     }
@@ -213,12 +200,15 @@ impl Requirements {
     /// What the machine directory at `dir` was installed with.
     pub fn read(dir: &Path) -> Result<Self> {
         Ok(serde_json::from_slice(&std::fs::read(
-            dir.join(REQUIREMENTS_FILE),
+            dir.join(crate::VZ_REQUIREMENTS_FILE),
         )?)?)
     }
 
     pub(crate) fn write(&self, dir: &Path) -> Result<()> {
-        std::fs::write(dir.join(REQUIREMENTS_FILE), serde_json::to_vec(self)?)?;
+        std::fs::write(
+            dir.join(crate::VZ_REQUIREMENTS_FILE),
+            serde_json::to_vec(self)?,
+        )?;
         Ok(())
     }
 
@@ -767,16 +757,16 @@ pub fn configuration(
 /// The template must be stopped: its disk is cloned as the state left it.
 pub fn clone_machine(template: &Path, workdir: &Path, is_identity_kept: bool) -> Result<MacOsBoot> {
     std::fs::create_dir_all(workdir)?;
-    for file in [DISK_FILE, AUX_FILE] {
+    for file in [crate::VZ_DISK_FILE, crate::VZ_AUX_FILE] {
         clonefile(&template.join(file), &workdir.join(file))?;
     }
-    for file in [HARDWARE_MODEL_FILE, REQUIREMENTS_FILE] {
+    for file in [crate::VZ_HARDWARE_MODEL_FILE, crate::VZ_REQUIREMENTS_FILE] {
         std::fs::copy(template.join(file), workdir.join(file))?;
     }
     if is_identity_kept {
         std::fs::copy(
-            template.join(MACHINE_ID_FILE),
-            workdir.join(MACHINE_ID_FILE),
+            template.join(crate::VZ_MACHINE_ID_FILE),
+            workdir.join(crate::VZ_MACHINE_ID_FILE),
         )?;
         if template.join(SAVE_FILE).exists() {
             clonefile(&template.join(SAVE_FILE), &workdir.join(SAVE_FILE))?;
@@ -799,7 +789,7 @@ fn clonefile(src: &Path, dst: &Path) -> Result<()> {
 
 pub(crate) fn write_machine_id(dir: &Path) -> Result<()> {
     let id = unsafe { VZMacMachineIdentifier::new().dataRepresentation() };
-    std::fs::write(dir.join(MACHINE_ID_FILE), id.to_vec())?;
+    std::fs::write(dir.join(crate::VZ_MACHINE_ID_FILE), id.to_vec())?;
     Ok(())
 }
 

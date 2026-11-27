@@ -18,8 +18,8 @@ use objc2_virtualization::{
 use tokio::sync::oneshot;
 
 use super::{
-    AUX_FILE, DISK_FILE, HARDWARE_MODEL_FILE, MacOsBoot, OnQueue, Requirements, VzConfig, VzVm,
-    dropped, file_url, invalid, ns_error, write_machine_id,
+    MacOsBoot, OnQueue, Requirements, VzConfig, VzVm, dropped, file_url, invalid, ns_error,
+    write_machine_id,
 };
 use crate::error::Result;
 use crate::{Backend, Boot, DriveSpec, GuestOs, MachineSpec, NetSpec};
@@ -87,12 +87,12 @@ pub async fn install(
         requirements.check(vcpus, mem_mib)?;
         requirements.write(dir)?;
         std::fs::write(
-            dir.join(HARDWARE_MODEL_FILE),
+            dir.join(crate::VZ_HARDWARE_MODEL_FILE),
             model.dataRepresentation().to_vec(),
         )?;
         VZMacAuxiliaryStorage::initCreatingStorageAtURL_hardwareModel_options_error(
             VZMacAuxiliaryStorage::alloc(),
-            &file_url(&dir.join(AUX_FILE)),
+            &file_url(&dir.join(crate::VZ_AUX_FILE)),
             &model,
             VZMacAuxiliaryStorageInitializationOptions::empty(),
         )
@@ -110,7 +110,7 @@ pub async fn install(
         }
     };
     write_machine_id(dir)?;
-    create_disk(&dir.join(DISK_FILE), spec.disk_bytes).await?;
+    create_disk(&dir.join(crate::VZ_DISK_FILE), spec.disk_bytes).await?;
 
     let vm = VzVm::create(&template_spec(dir, &installed)?, &VzConfig::default()).await?;
     let ipsw = OnQueue(file_url(ipsw));
@@ -175,7 +175,7 @@ fn template_spec(dir: &Path, installed: &InstalledImage) -> Result<MachineSpec> 
 pub fn root_drive() -> DriveSpec {
     DriveSpec {
         id: "disk".into(),
-        path: DISK_FILE.into(),
+        path: crate::VZ_DISK_FILE.into(),
         is_root: true,
         is_read_only: false,
     }

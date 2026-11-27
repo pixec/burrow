@@ -146,7 +146,7 @@ mod macos {
     /// A MAC derived from the machine identifier, so each machine keeps its
     /// DHCP lease (and address) across boots and its clones get their own.
     fn derived_mac(dir: &str) -> Result<String> {
-        let id = std::fs::read(Path::new(dir).join(vz::MACHINE_ID_FILE))?;
+        let id = std::fs::read(Path::new(dir).join(burrow_vmm::VZ_MACHINE_ID_FILE))?;
         let hash = id.iter().fold(0xcbf29ce484222325u64, |h, b| {
             (h ^ u64::from(*b)).wrapping_mul(0x100000001b3)
         });
