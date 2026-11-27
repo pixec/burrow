@@ -19,11 +19,11 @@ pub use uffd::UffdBackend;
 use tokio::io::AsyncWriteExt as _;
 use tokio::net::unix::pipe;
 
-use crate::cgroup::{Cgroup, Limits};
+use crate::cgroup::Cgroup;
 use crate::error::{Error, Result};
 use crate::machine::Machine;
 use crate::process::VmmProcess;
-use crate::{DriveSpec, NetSpec, VmSpec};
+use crate::{DriveSpec, VmSpec};
 use model::*;
 
 /// How this node runs Firecracker.
@@ -53,47 +53,27 @@ pub enum IoEngine {
     Async,
 }
 
-/// The neutral spec, as Firecracker is configured from it. Firecracker boots
-/// only a kernel.
-pub(crate) fn spec(spec: VmSpec, config: FirecrackerConfig) -> crate::Result<MicroVmSpec> {
-    let crate::Boot::Kernel { kernel, cmdline } = spec.boot else {
-        return Err(crate::Error::Unsupported {
+/// The kernel and command line a spec boots: Firecracker boots nothing else.
+fn kernel(spec: &VmSpec) -> Result<(&str, &str)> {
+    match &spec.boot {
+        crate::Boot::Kernel { kernel, cmdline } => Ok((kernel, cmdline)),
+        _ => Err(Error::Unsupported {
             hypervisor: crate::Hypervisor::Firecracker,
             what: "boot anything but a kernel",
-        });
-    };
+        }),
+    }
+}
+
+/// Refuses a spec Firecracker cannot run.
+pub(crate) fn check(spec: &VmSpec) -> Result<()> {
+    kernel(spec)?;
     if spec.is_nested_virt_enabled {
-        return Err(crate::Error::Unsupported {
+        return Err(Error::Unsupported {
             hypervisor: crate::Hypervisor::Firecracker,
             what: "give a guest nested virtualization",
         });
     }
-    Ok(MicroVmSpec {
-        vm_id: spec.vm_id,
-        workdir: spec.workdir,
-        firecracker_bin: config.bin,
-        kernel,
-        boot_args: cmdline,
-        drives: spec.drives,
-        is_pci_enabled: spec.is_pci_enabled,
-        vcpus: spec.vcpus,
-        mem_mib: spec.mem_mib,
-        mem_hotplug_mib: spec.mem_hotplug_mib,
-        net: spec.net,
-        is_vsock_enabled: spec.is_vsock_enabled,
-        is_dirty_pages_tracked: spec.is_dirty_pages_tracked,
-        jail: config.jail,
-        io_engine: config.io_engine,
-        is_huge_page_fill_enabled: config.is_huge_page_fill_enabled,
-        is_memory_lazy: spec.is_memory_lazy,
-        memory_chain: spec.memory_chain,
-        prefetch: spec.prefetch,
-        record_prefetch: spec.record_prefetch,
-        memory_source: spec.memory_source,
-        limits: spec.limits,
-        cgroup_root: spec.cgroup_root,
-        is_limits_required: spec.is_limits_required,
-    })
+    Ok(())
 }
 
 /// A memory file that is still being filled in while a guest runs from it.
@@ -137,104 +117,6 @@ pub const SNAPSHOT_MEM_FILE: &str = "snapshot.mem";
 
 pub use crate::guest::GUEST_CID;
 
-#[derive(Debug, Clone)]
-pub struct MicroVmSpec {
-    pub vm_id: String,
-    /// Working directory; all resource paths are relative to it.
-    pub workdir: PathBuf,
-    pub firecracker_bin: PathBuf,
-    /// Kernel path relative to `workdir`.
-    pub kernel: String,
-    pub boot_args: String,
-    pub drives: Vec<DriveSpec>,
-    /// Put virtio devices on a PCI bus instead of MMIO.
-    ///
-    /// Required for hotplug, which is the only way to attach a volume to a
-    /// sandbox restored from a warm snapshot: a snapshot restores only into
-    /// the drive set it was captured with, and the warm snapshot is shared by
-    /// every sandbox restored from it. Enabling it changes the transport for
-    /// every device, so a snapshot taken under one setting cannot be restored
-    /// under the other.
-    pub is_pci_enabled: bool,
-    pub vcpus: u32,
-    pub mem_mib: u32,
-    /// The virtio-mem region above `mem_mib`; 0 for none. Ignored by a
-    /// restore, which takes the device from the snapshot.
-    pub mem_hotplug_mib: u32,
-    pub net: Option<NetSpec>,
-    /// Enable virtio-vsock, the transport the guest agent speaks.
-    pub is_vsock_enabled: bool,
-    /// Needed for diff snapshots. Firecracker only turns on KVM's dirty log
-    /// for a restore that maps the memory file directly.
-    pub is_dirty_pages_tracked: bool,
-    /// Confines firecracker to a chroot under an unprivileged uid. `None`
-    /// runs it as root with the host filesystem visible.
-    pub jail: Option<process::Jail>,
-    pub io_engine: IoEngine,
-    /// Answer each fault on lazily served memory with the 2 MiB block around
-    /// it, collapsed into a huge page, rather than with the one page.
-    pub is_huge_page_fill_enabled: bool,
-    /// Serve guest memory lazily on restore instead of letting the kernel page
-    /// the whole memory file in. Ignored on a cold boot, which has no memory
-    /// file to serve from.
-    pub is_memory_lazy: bool,
-    /// Memory files to restore from, oldest first: a full base followed by any
-    /// diff snapshots layered over it. Empty means the conventional
-    /// `snapshot.mem` alone. More than one entry forces the page-fault handler
-    /// on, because a chain has no single file for the kernel to map.
-    pub memory_chain: Vec<String>,
-    /// Pages to populate before the guest runs, relative to the working
-    /// directory. Recorded from an earlier restore of the same snapshot.
-    pub prefetch: Option<String>,
-    /// Where to record the pages this VM faults on, relative to the working
-    /// directory. Set only when profiling a snapshot.
-    pub record_prefetch: Option<String>,
-    /// Where the base of `memory_chain` is still being filled in from. Forces
-    /// the page-fault handler on, since the kernel would map the holes as
-    /// zeroes.
-    pub memory_source: Option<MemorySource>,
-    /// Host resource caps. Applied to the VMM process, so they bound the guest
-    /// and Firecracker's own overhead together.
-    pub limits: Limits,
-    /// cgroup2 mount point; `None` disables limit enforcement.
-    pub cgroup_root: Option<PathBuf>,
-    /// Whether a sandbox may run when its limits could not be applied. False
-    /// keeps the stack usable where cgroups are unavailable, at the cost of
-    /// unbounded CPU; true refuses to run an unbounded guest at all.
-    pub is_limits_required: bool,
-}
-
-impl MicroVmSpec {
-    pub fn new(vm_id: impl Into<String>, workdir: impl Into<PathBuf>) -> Self {
-        Self {
-            vm_id: vm_id.into(),
-            workdir: workdir.into(),
-            firecracker_bin: PathBuf::from("/usr/local/bin/firecracker"),
-            kernel: "vmlinux".into(),
-            boot_args: crate::DEFAULT_BOOT_ARGS.into(),
-            drives: Vec::new(),
-            is_pci_enabled: false,
-            vcpus: 1,
-            mem_mib: 512,
-            mem_hotplug_mib: 0,
-            net: None,
-            is_vsock_enabled: false,
-            is_dirty_pages_tracked: false,
-            prefetch: None,
-            record_prefetch: None,
-            memory_source: None,
-            jail: None,
-            io_engine: IoEngine::Sync,
-            is_huge_page_fill_enabled: true,
-            is_memory_lazy: false,
-            memory_chain: Vec::new(),
-            limits: Limits::default(),
-            cgroup_root: Some(PathBuf::from("/sys/fs/cgroup")),
-            is_limits_required: false,
-        }
-    }
-}
-
 /// A running (or paused) Firecracker VM.
 pub struct MicroVm {
     process: VmmProcess,
@@ -242,7 +124,8 @@ pub struct MicroVm {
     /// way to drive a guest that has no agent yet (dev and rescue only).
     console_in: pipe::Sender,
     api: FcApi,
-    spec: MicroVmSpec,
+    spec: VmSpec,
+    config: FirecrackerConfig,
     /// Time from process spawn to a successful `InstanceStart`.
     boot_latency: Duration,
     phases: crate::Phases,
@@ -265,7 +148,8 @@ async fn detach_snapshot_targets(workdir: &Path, mem_file: &str) -> Result<()> {
 /// Starts the VMM inside the VM's cgroup, made first so the VMM joins it
 /// before it execs and never runs outside its caps.
 async fn spawn(
-    spec: &MicroVmSpec,
+    spec: &VmSpec,
+    config: &FirecrackerConfig,
     phases: &mut crate::Phases,
 ) -> Result<(VmmProcess, pipe::Sender)> {
     let cgroup = Cgroup::for_vm(
@@ -279,11 +163,11 @@ async fn spawn(
     }
     phases.mark("cgroup");
     process::spawn(
-        &spec.firecracker_bin,
+        &config.bin,
         &spec.vm_id,
         &spec.workdir,
         API_SOCK,
-        spec.jail.as_ref(),
+        config.jail.as_ref(),
         spec.is_pci_enabled,
         cgroup,
         phases,
@@ -293,13 +177,14 @@ async fn spawn(
 
 impl MicroVm {
     /// Spawns the VMM, applies the configuration, and starts the instance.
-    pub async fn boot(spec: MicroVmSpec) -> Result<Self> {
+    pub async fn boot(spec: VmSpec, config: FirecrackerConfig) -> Result<Self> {
+        check(&spec)?;
         let start = Instant::now();
         let mut phases = crate::Phases::start();
         if spec.is_vsock_enabled {
             crate::guest::clear_stale_sockets(&spec.workdir).await?;
         }
-        let (process, console_in) = spawn(&spec, &mut phases).await?;
+        let (process, console_in) = spawn(&spec, &config, &mut phases).await?;
         let api = FcApi::new(spec.workdir.join(API_SOCK));
 
         // Configure, then start. Any failure here kills the VMM so we never
@@ -309,6 +194,7 @@ impl MicroVm {
             console_in,
             api,
             spec,
+            config,
             boot_latency: Duration::ZERO,
             phases,
             #[cfg(target_os = "linux")]
@@ -353,17 +239,18 @@ impl MicroVm {
                 .await?;
         }
 
+        let (kernel, cmdline) = kernel(&self.spec)?;
         self.api
             .set_boot_source(&BootSource {
-                kernel_image_path: self.spec.kernel.clone(),
-                boot_args: self.spec.boot_args.clone(),
+                kernel_image_path: kernel.into(),
+                boot_args: cmdline.into(),
                 initrd_path: None,
             })
             .await?;
 
         for drive in &self.spec.drives {
             self.api
-                .add_drive(&Drive::from_spec(drive, self.spec.io_engine))
+                .add_drive(&Drive::from_spec(drive, self.config.io_engine))
                 .await?;
         }
 
@@ -393,7 +280,7 @@ impl MicroVm {
         &self.api
     }
 
-    pub fn spec(&self) -> &MicroVmSpec {
+    pub fn spec(&self) -> &VmSpec {
         &self.spec
     }
 
@@ -471,27 +358,29 @@ impl MicroVm {
     /// Starts a fresh VMM process and restores a snapshot from `workdir`
     /// instead of cold-booting. `spec` must describe the same resources
     /// (tap name, drive paths) as the snapshotted VM.
-    pub async fn restore(spec: MicroVmSpec, resume: bool) -> Result<Self> {
-        Self::launch(spec).await?.load(resume).await
+    pub async fn restore(spec: VmSpec, config: FirecrackerConfig, resume: bool) -> Result<Self> {
+        Self::launch(spec, config).await?.load(resume).await
     }
 
     /// Starts the VMM a restore loads its snapshot into. Nothing in the
     /// working directory is read until [`Self::load`], so the snapshot's files
     /// may still be arriving while this runs.
-    pub async fn launch(spec: MicroVmSpec) -> Result<Self> {
+    pub async fn launch(spec: VmSpec, config: FirecrackerConfig) -> Result<Self> {
+        check(&spec)?;
         let start = Instant::now();
         let mut phases = crate::Phases::start();
         if spec.is_vsock_enabled {
             crate::guest::clear_stale_sockets(&spec.workdir).await?;
         }
         phases.mark("sockets");
-        let (process, console_in) = spawn(&spec, &mut phases).await?;
+        let (process, console_in) = spawn(&spec, &config, &mut phases).await?;
         let api = FcApi::new(spec.workdir.join(API_SOCK));
         Ok(Self {
             process,
             console_in,
             api,
             spec,
+            config,
             boot_latency: start.elapsed(),
             phases,
             #[cfg(target_os = "linux")]
@@ -597,7 +486,7 @@ impl MicroVm {
             &uffd::MemoryPlan {
                 chain,
                 owner: self
-                    .spec
+                    .config
                     .jail
                     .as_ref()
                     .map(|jail| (jail.layout.uid, jail.layout.gid)),
@@ -612,7 +501,7 @@ impl MicroVm {
                     .as_ref()
                     .map(|name| self.spec.workdir.join(name)),
                 base_source: self.spec.memory_source.as_ref().map(|s| s.0.clone()),
-                is_huge_page_fill_enabled: self.spec.is_huge_page_fill_enabled,
+                is_huge_page_fill_enabled: self.config.is_huge_page_fill_enabled,
             },
         )?;
         self.memory = Some(backend);
@@ -707,7 +596,7 @@ impl Machine for MicroVm {
     /// captured without it.
     async fn attach_drive(&self, drive: &DriveSpec) -> Result<()> {
         self.api
-            .add_drive(&Drive::from_spec(drive, self.spec.io_engine))
+            .add_drive(&Drive::from_spec(drive, self.config.io_engine))
             .await
     }
 
@@ -756,14 +645,11 @@ mod tests {
             io_engine: IoEngine::Sync,
             is_huge_page_fill_enabled: true,
         };
-        let backend = crate::Backend::Firecracker(config.clone());
+        let backend = crate::Backend::Firecracker(config);
         let mut vm = VmSpec::new("sbx_1", "/tmp/sbx_1", backend);
-        assert!(spec(vm.clone(), config.clone()).is_ok());
+        assert!(check(&vm).is_ok());
         vm.is_nested_virt_enabled = true;
-        assert!(matches!(
-            spec(vm, config),
-            Err(crate::Error::Unsupported { .. })
-        ));
+        assert!(matches!(check(&vm), Err(crate::Error::Unsupported { .. })));
     }
 
     /// A warm-created sandbox shares its snapshot files with the template by

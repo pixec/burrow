@@ -459,7 +459,14 @@ pub struct VmSpec {
     /// In the order the guest sees them: it finds its disks by position.
     pub drives: Vec<DriveSpec>,
     /// Put virtio devices on a PCI bus instead of MMIO. Firecracker only: Cloud
-    /// Hypervisor is always PCI. See [`firecracker::MicroVmSpec::is_pci_enabled`].
+    /// Hypervisor is always PCI.
+    ///
+    /// Required for hotplug, which is the only way to attach a volume to a
+    /// sandbox restored from a warm snapshot: a snapshot restores only into
+    /// the drive set it was captured with, and the warm snapshot is shared by
+    /// every sandbox restored from it. Enabling it changes the transport for
+    /// every device, so a snapshot taken under one setting cannot be restored
+    /// under the other.
     pub is_pci_enabled: bool,
     pub vcpus: u32,
     /// vCPUs the guest is booted able to take, where
@@ -480,15 +487,30 @@ pub struct VmSpec {
 
     /// Enable virtio-vsock, the transport the guest agent speaks.
     pub is_vsock_enabled: bool,
-    /// Needed for diff snapshots.
+    /// Needed for diff snapshots. Firecracker only turns on KVM's dirty log
+    /// for a restore that maps the memory file directly.
     pub is_dirty_pages_tracked: bool,
     /// The lazy-memory knobs below are honoured only where
-    /// [`Capabilities::is_lazy_memory_supported`]; see
-    /// [`firecracker::MicroVmSpec`] for each.
+    /// [`Capabilities::is_lazy_memory_supported`].
+    ///
+    /// Serve guest memory lazily on restore instead of letting the kernel page
+    /// the whole memory file in. Ignored on a cold boot, which has no memory
+    /// file to serve from.
     pub is_memory_lazy: bool,
+    /// Memory files to restore from, oldest first: a full base followed by any
+    /// diff snapshots layered over it. Empty means the conventional memory
+    /// file alone. More than one entry forces the page-fault handler on,
+    /// because a chain has no single file for the kernel to map.
     pub memory_chain: Vec<String>,
+    /// Pages to populate before the guest runs, relative to the working
+    /// directory. Recorded from an earlier restore of the same snapshot.
     pub prefetch: Option<String>,
+    /// Where to record the pages this VM faults on, relative to the working
+    /// directory. Set only when profiling a snapshot.
     pub record_prefetch: Option<String>,
+    /// Where the base of `memory_chain` is still being filled in from. Forces
+    /// the page-fault handler on, since the kernel would map the holes as
+    /// zeroes.
     pub memory_source: Option<MemorySource>,
     /// Host resource caps, applied to the VMM process.
     pub limits: Limits,
@@ -596,7 +618,7 @@ impl Vm {
     pub async fn boot(spec: VmSpec) -> Result<Self> {
         match spec.backend.clone() {
             Backend::Firecracker(config) => Ok(Self::Firecracker(Box::new(
-                firecracker::MicroVm::boot(firecracker::spec(spec, config)?).await?,
+                firecracker::MicroVm::boot(spec, config).await?,
             ))),
             Backend::CloudHypervisor(config) => Ok(Self::CloudHypervisor(Box::new(
                 cloud_hypervisor::ChVm::boot(spec, config).await?,
@@ -611,7 +633,7 @@ impl Vm {
     pub async fn launch(spec: VmSpec) -> Result<Restoring> {
         match spec.backend.clone() {
             Backend::Firecracker(config) => Ok(Restoring::Firecracker(Box::new(
-                firecracker::MicroVm::launch(firecracker::spec(spec, config)?).await?,
+                firecracker::MicroVm::launch(spec, config).await?,
             ))),
             _ => Ok(Restoring::Later(Box::new(spec))),
         }
@@ -622,7 +644,7 @@ impl Vm {
     pub async fn restore(spec: VmSpec, resume: bool) -> Result<Self> {
         match spec.backend.clone() {
             Backend::Firecracker(config) => Ok(Self::Firecracker(Box::new(
-                firecracker::MicroVm::restore(firecracker::spec(spec, config)?, resume).await?,
+                firecracker::MicroVm::restore(spec, config, resume).await?,
             ))),
             Backend::CloudHypervisor(config) => Ok(Self::CloudHypervisor(Box::new(
                 cloud_hypervisor::ChVm::restore(spec, config, resume).await?,
