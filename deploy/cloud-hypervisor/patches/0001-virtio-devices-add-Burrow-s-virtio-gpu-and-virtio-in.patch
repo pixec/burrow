@@ -1,0 +1,869 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Pixec <noreply@pixec.net>
+Subject: [PATCH 1/3] virtio-devices: add Burrow's virtio-gpu and virtio-input
+ devices
+
+---
+ Cargo.lock                            |   9 +
+ virtio-devices/Cargo.toml             |   1 +
+ virtio-devices/src/display.rs         | 738 ++++++++++++++++++++++++++
+ virtio-devices/src/lib.rs             |   1 +
+ virtio-devices/src/seccomp_filters.rs |  29 +
+ 5 files changed, 778 insertions(+)
+ create mode 100644 virtio-devices/src/display.rs
+
+diff --git a/Cargo.lock b/Cargo.lock
+index 2e528b4..4207461 100644
+--- a/Cargo.lock
++++ b/Cargo.lock
+@@ -386,6 +386,14 @@ version = "3.20.3"
+ source = "registry+https://github.com/rust-lang/crates.io-index"
+ checksum = "72f5acc6cb2ba439de613abc23857ec3d78374d8ed5ac84e9d11336e87da8649"
+ 
++[[package]]
++name = "burrow-display"
++version = "0.1.0"
++dependencies = [
++ "libc",
++ "serde",
++]
++
+ [[package]]
+ name = "byteorder"
+ version = "1.5.0"
+@@ -2724,6 +2732,7 @@ version = "0.1.0"
+ dependencies = [
+  "anyhow",
+  "block",
++ "burrow-display",
+  "byteorder",
+  "epoll",
+  "event_monitor",
+diff --git a/virtio-devices/Cargo.toml b/virtio-devices/Cargo.toml
+index 3262618..b62abf5 100644
+--- a/virtio-devices/Cargo.toml
++++ b/virtio-devices/Cargo.toml
+@@ -14,6 +14,7 @@ sev_snp = ["mshv-ioctls"]
+ [dependencies]
+ anyhow = { workspace = true }
+ block = { path = "../block" }
++burrow-display = { path = "../../burrow-display" }
+ byteorder = { workspace = true }
+ epoll = { workspace = true }
+ event_monitor = { path = "../event_monitor" }
+diff --git a/virtio-devices/src/display.rs b/virtio-devices/src/display.rs
+new file mode 100644
+index 0000000..09a059b
+--- /dev/null
++++ b/virtio-devices/src/display.rs
+@@ -0,0 +1,738 @@
++// Copyright © 2026 Pixec
++//
++// SPDX-License-Identifier: Apache-2.0
++
++//! Burrow's display: a virtio-gpu 2D device with one scanout and virtio-input
++//! keyboard and tablet devices, all three backed by the `burrow-display`
++//! crate. Frames leave and input arrives on a Unix socket, served by a thread
++//! of its own for the life of the VMM.
++
++use std::fmt::Debug;
++use std::os::unix::io::AsRawFd;
++use std::os::unix::net::UnixListener;
++use std::path::Path;
++use std::result;
++use std::sync::atomic::AtomicBool;
++use std::sync::{Arc, Barrier};
++use std::{fs, io, thread};
++
++use anyhow::anyhow;
++use burrow_display::gpu::{self, Gpu as GpuModel, GpuState};
++use burrow_display::input::{self, InputState, Kind};
++pub use burrow_display::is_valid_mode;
++use burrow_display::server::{Display, Hooks};
++use event_monitor::event;
++use log::error;
++use seccompiler::{SeccompAction, apply_filter};
++use serde::{Deserialize, Serialize};
++use virtio_queue::{Queue, QueueT};
++use vm_memory::{Bytes, GuestAddress, GuestAddressSpace, GuestMemoryAtomic};
++use vm_migration::{Migratable, MigratableError, Pausable, Snapshot, Snapshottable, Transportable};
++use vm_virtio::checked_descriptor::DescriptorChainExt;
++use vmm_sys_util::eventfd::EventFd;
++
++use super::{
++    ActivateError, ActivateResult, EPOLL_HELPER_EVENT_LAST, EpollHelper, EpollHelperError,
++    EpollHelperHandler, VIRTIO_F_VERSION_1, VirtioCommon, VirtioDevice, VirtioDeviceType,
++};
++use crate::device::ActivationContext;
++use crate::seccomp_filters::{Thread, get_seccomp_filter};
++use crate::{GuestMemoryMmap, VirtioInterrupt, VirtioInterruptType};
++
++const GPU_QUEUE_SIZES: &[u16] = &[256, 16];
++const INPUT_QUEUE_SIZES: &[u16] = &[64, 64];
++
++const QUEUE_0_EVENT: u16 = EPOLL_HELPER_EVENT_LAST + 1;
++const QUEUE_1_EVENT: u16 = EPOLL_HELPER_EVENT_LAST + 2;
++const HOST_EVENT: u16 = EPOLL_HELPER_EVENT_LAST + 3;
++
++struct Memory<'a>(&'a GuestMemoryMmap);
++
++impl burrow_display::GuestMemory for Memory<'_> {
++    fn read(&self, addr: u64, buf: &mut [u8]) -> result::Result<(), burrow_display::MemoryError> {
++        self.0
++            .read_slice(buf, GuestAddress(addr))
++            .map_err(|_| burrow_display::MemoryError)
++    }
++}
++
++#[derive(Deserialize, Serialize)]
++pub struct GpuDeviceState {
++    pub avail_features: u64,
++    pub acked_features: u64,
++    pub gpu: GpuState,
++}
++
++#[derive(Deserialize, Serialize)]
++pub struct InputDeviceState {
++    pub avail_features: u64,
++    pub acked_features: u64,
++    pub input: InputState,
++}
++
++/// The three devices of one display, sharing its socket.
++pub struct DisplayDevices {
++    pub gpu: Gpu,
++    pub keyboard: Input,
++    pub tablet: Input,
++}
++
++/// What a restore brings back of each device.
++#[derive(Default)]
++pub struct DisplayStates {
++    pub gpu: Option<GpuDeviceState>,
++    pub keyboard: Option<InputDeviceState>,
++    pub tablet: Option<InputDeviceState>,
++}
++
++pub fn new_display(
++    ids: [String; 3],
++    width: u32,
++    height: u32,
++    socket: &Path,
++    seccomp_action: &SeccompAction,
++    exit_evt: &EventFd,
++    states: &DisplayStates,
++) -> io::Result<DisplayDevices> {
++    let invalid = |e: gpu::StateError| io::Error::new(io::ErrorKind::InvalidData, e);
++    let gpu_state = match &states.gpu {
++        Some(state) => GpuModel::restore(state.gpu.clone()).map_err(invalid)?,
++        None => GpuModel::new(width, height),
++    };
++    let input_state = |state: &Option<InputDeviceState>, kind| match state {
++        Some(state) => input::Input::restore(state.input).map_err(invalid),
++        None => Ok(input::Input::new(kind)),
++    };
++    let inputs = [
++        input_state(&states.keyboard, Kind::Keyboard)?,
++        input_state(&states.tablet, Kind::Tablet)?,
++    ];
++
++    let gpu_evt = EventFd::new(libc::EFD_NONBLOCK)?;
++    let input_evts = [
++        EventFd::new(libc::EFD_NONBLOCK)?,
++        EventFd::new(libc::EFD_NONBLOCK)?,
++    ];
++    let wake = |evt: &EventFd| -> io::Result<Box<dyn Fn() + Send + Sync>> {
++        let evt = evt.try_clone()?;
++        Ok(Box::new(move || {
++            let _ = evt.write(1);
++        }))
++    };
++    let hooks = Hooks {
++        gpu: wake(&gpu_evt)?,
++        input: [wake(&input_evts[0])?, wake(&input_evts[1])?],
++    };
++    let display = Arc::new(Display::new(gpu_state, inputs, hooks)?);
++
++    match fs::remove_file(socket) {
++        Err(e) if e.kind() != io::ErrorKind::NotFound => return Err(e),
++        _ => {}
++    }
++    let listener = UnixListener::bind(socket)?;
++    let filter = get_seccomp_filter(seccomp_action, Thread::DisplaySocket)
++        .map_err(|e| io::Error::other(format!("{e:?}")))?;
++    let thread_exit_evt = exit_evt.try_clone()?;
++    let server = Arc::clone(&display);
++    thread::Builder::new()
++        .name("display-socket".to_string())
++        .spawn(move || {
++            if !filter.is_empty()
++                && let Err(e) = apply_filter(&filter)
++            {
++                error!("Error applying seccomp filter: {e:?}");
++                thread_exit_evt.write(1).ok();
++                return;
++            }
++            if let Err(e) = server.serve(&listener) {
++                error!("The display socket failed: {e}");
++            }
++        })?;
++
++    let [gpu_id, keyboard_id, tablet_id] = ids;
++    let [keyboard_evt, tablet_evt] = input_evts;
++    Ok(DisplayDevices {
++        gpu: Gpu {
++            common: common(
++                VirtioDeviceType::Gpu,
++                GPU_QUEUE_SIZES,
++                (1 << VIRTIO_F_VERSION_1) | (1 << gpu::F_EDID),
++                states
++                    .gpu
++                    .as_ref()
++                    .map(|s| (s.avail_features, s.acked_features)),
++            ),
++            id: gpu_id,
++            display: Arc::clone(&display),
++            host_evt: gpu_evt,
++            seccomp_action: seccomp_action.clone(),
++            exit_evt: exit_evt.try_clone()?,
++        },
++        keyboard: Input {
++            common: common(
++                VirtioDeviceType::Input,
++                INPUT_QUEUE_SIZES,
++                1 << VIRTIO_F_VERSION_1,
++                states
++                    .keyboard
++                    .as_ref()
++                    .map(|s| (s.avail_features, s.acked_features)),
++            ),
++            id: keyboard_id,
++            kind: Kind::Keyboard,
++            display: Arc::clone(&display),
++            host_evt: keyboard_evt,
++            seccomp_action: seccomp_action.clone(),
++            exit_evt: exit_evt.try_clone()?,
++        },
++        tablet: Input {
++            common: common(
++                VirtioDeviceType::Input,
++                INPUT_QUEUE_SIZES,
++                1 << VIRTIO_F_VERSION_1,
++                states
++                    .tablet
++                    .as_ref()
++                    .map(|s| (s.avail_features, s.acked_features)),
++            ),
++            id: tablet_id,
++            kind: Kind::Tablet,
++            display,
++            host_evt: tablet_evt,
++            seccomp_action: seccomp_action.clone(),
++            exit_evt: exit_evt.try_clone()?,
++        },
++    })
++}
++
++fn common(
++    device_type: VirtioDeviceType,
++    queue_sizes: &[u16],
++    features: u64,
++    restored: Option<(u64, u64)>,
++) -> VirtioCommon {
++    let (avail_features, acked_features, paused) = match restored {
++        Some((avail, acked)) => (avail, acked, true),
++        None => (features, 0, false),
++    };
++    VirtioCommon {
++        device_type: device_type as u32,
++        queue_sizes: queue_sizes.to_vec(),
++        paused_sync: Some(Arc::new(Barrier::new(2))),
++        avail_features,
++        acked_features,
++        min_queues: 2,
++        paused: Arc::new(AtomicBool::new(paused)),
++        ..Default::default()
++    }
++}
++
++fn handler_error(what: &str, e: impl Debug) -> EpollHelperError {
++    EpollHelperError::HandleEvent(anyhow!("{what}: {e:?}"))
++}
++
++pub struct Gpu {
++    common: VirtioCommon,
++    id: String,
++    display: Arc<Display>,
++    host_evt: EventFd,
++    seccomp_action: SeccompAction,
++    exit_evt: EventFd,
++}
++
++struct GpuHandler {
++    mem: GuestMemoryAtomic<GuestMemoryMmap>,
++    control: Queue,
++    cursor: Queue,
++    control_evt: EventFd,
++    cursor_evt: EventFd,
++    host_evt: EventFd,
++    display: Arc<Display>,
++    interrupt_cb: Arc<dyn VirtioInterrupt>,
++    kill_evt: EventFd,
++    pause_evt: EventFd,
++}
++
++impl GpuHandler {
++    fn process_control(&mut self) -> result::Result<bool, EpollHelperError> {
++        let mem = self.mem.memory();
++        let mut gpu = self.display.gpu.lock().unwrap();
++        let mut used = false;
++        while let Some(mut chain) = self.control.pop_descriptor_chain(self.mem.memory()) {
++            let descs: Vec<_> = chain
++                .checked_iter(None)
++                .collect::<result::Result<_, _>>()
++                .map_err(|e| handler_error("bad descriptor", e))?;
++            let mut request = Vec::new();
++            for desc in descs.iter().filter(|d| !d.is_write_only()) {
++                let len = desc.len() as usize;
++                if request.len() + len > gpu::MAX_REQUEST {
++                    break;
++                }
++                let start = request.len();
++                request.resize(start + len, 0);
++                chain
++                    .memory()
++                    .read_slice(&mut request[start..], desc.addr())
++                    .map_err(|e| handler_error("reading a request", e))?;
++            }
++            let mut response = Vec::new();
++            gpu.process(&Memory(&mem), &request, &mut response);
++            let mut written = 0;
++            for desc in descs.iter().filter(|d| d.is_write_only()) {
++                if written == response.len() {
++                    break;
++                }
++                let n = (desc.len() as usize).min(response.len() - written);
++                chain
++                    .memory()
++                    .write_slice(&response[written..written + n], desc.addr())
++                    .map_err(|e| handler_error("writing a response", e))?;
++                written += n;
++            }
++            self.control
++                .add_used(chain.memory(), chain.head_index(), written as u32)
++                .map_err(|e| handler_error("adding used", e))?;
++            used = true;
++        }
++        if gpu.has_notices() {
++            self.display.notify();
++        }
++        Ok(used)
++    }
++
++    fn process_cursor(&mut self) -> result::Result<bool, EpollHelperError> {
++        let mem = self.mem.memory();
++        let mut gpu = self.display.gpu.lock().unwrap();
++        let mut used = false;
++        while let Some(mut chain) = self.cursor.pop_descriptor_chain(self.mem.memory()) {
++            let descs: Vec<_> = chain
++                .checked_iter(None)
++                .collect::<result::Result<_, _>>()
++                .map_err(|e| handler_error("bad descriptor", e))?;
++            if let Some(desc) = descs.iter().find(|d| !d.is_write_only()) {
++                let mut request = vec![0u8; (desc.len() as usize).min(64)];
++                chain
++                    .memory()
++                    .read_slice(&mut request, desc.addr())
++                    .map_err(|e| handler_error("reading a request", e))?;
++                gpu.process_cursor(&Memory(&mem), &request);
++            }
++            self.cursor
++                .add_used(chain.memory(), chain.head_index(), 0)
++                .map_err(|e| handler_error("adding used", e))?;
++            used = true;
++        }
++        if gpu.has_notices() {
++            self.display.notify();
++        }
++        Ok(used)
++    }
++
++    fn service(&mut self) -> result::Result<(), EpollHelperError> {
++        let mem = self.mem.memory();
++        let mut gpu = self.display.gpu.lock().unwrap();
++        if gpu.service(&Memory(&mem)) {
++            self.interrupt_cb
++                .trigger(VirtioInterruptType::Config)
++                .map_err(|e| handler_error("signalling a config change", e))?;
++        }
++        if gpu.has_notices() {
++            self.display.notify();
++        }
++        Ok(())
++    }
++
++    fn signal(&self, queue: u16) -> result::Result<(), EpollHelperError> {
++        self.interrupt_cb
++            .trigger(VirtioInterruptType::Queue(queue))
++            .map_err(|e| handler_error("signalling a queue", e))
++    }
++
++    fn run(
++        &mut self,
++        paused: &AtomicBool,
++        paused_sync: &Barrier,
++    ) -> result::Result<(), EpollHelperError> {
++        let mut helper = EpollHelper::new(&self.kill_evt, &self.pause_evt)?;
++        helper.add_event(self.control_evt.as_raw_fd(), QUEUE_0_EVENT)?;
++        helper.add_event(self.cursor_evt.as_raw_fd(), QUEUE_1_EVENT)?;
++        helper.add_event(self.host_evt.as_raw_fd(), HOST_EVENT)?;
++        helper.run(paused, paused_sync, self)?;
++        Ok(())
++    }
++}
++
++impl EpollHelperHandler for GpuHandler {
++    fn handle_event(
++        &mut self,
++        _helper: &mut EpollHelper,
++        event: &epoll::Event,
++    ) -> result::Result<(), EpollHelperError> {
++        match event.data as u16 {
++            QUEUE_0_EVENT => {
++                let _ = self.control_evt.read();
++                if self.process_control()? {
++                    self.signal(0)?;
++                }
++            }
++            QUEUE_1_EVENT => {
++                let _ = self.cursor_evt.read();
++                if self.process_cursor()? {
++                    self.signal(1)?;
++                }
++            }
++            HOST_EVENT => {
++                let _ = self.host_evt.read();
++                self.service()?;
++            }
++            other => return Err(handler_error("unexpected event", other)),
++        }
++        Ok(())
++    }
++}
++
++impl VirtioDevice for Gpu {
++    fn device_type(&self) -> u32 {
++        self.common.device_type
++    }
++
++    fn queue_max_sizes(&self) -> &[u16] {
++        &self.common.queue_sizes
++    }
++
++    fn features(&self) -> u64 {
++        self.common.avail_features
++    }
++
++    fn ack_features(&mut self, value: u64) {
++        self.common.ack_features(value);
++    }
++
++    fn config_size(&self) -> Option<u64> {
++        Some(gpu::CONFIG_SIZE as u64)
++    }
++
++    fn read_config(&self, offset: u64, data: &mut [u8]) {
++        self.display.gpu.lock().unwrap().read_config(offset, data);
++    }
++
++    fn write_config(&mut self, offset: u64, data: &[u8]) {
++        self.display.gpu.lock().unwrap().write_config(offset, data);
++    }
++
++    fn activate(&mut self, context: ActivationContext) -> ActivateResult {
++        let ActivationContext {
++            mem,
++            interrupt_cb,
++            mut queues,
++            device_status,
++        } = context;
++        self.common.activate(&queues, Arc::clone(&interrupt_cb))?;
++        let (kill_evt, pause_evt) = self.common.dup_eventfds()?;
++        let (_, control, control_evt) = queues.remove(0);
++        let (_, cursor, cursor_evt) = queues.remove(0);
++        let mut handler = GpuHandler {
++            mem,
++            control,
++            cursor,
++            control_evt,
++            cursor_evt,
++            host_evt: self
++                .host_evt
++                .try_clone()
++                .map_err(ActivateError::CloneEventFd)?,
++            display: Arc::clone(&self.display),
++            interrupt_cb: Arc::clone(&interrupt_cb),
++            kill_evt,
++            pause_evt,
++        };
++        self.display.set_gpu_active(true);
++        // A subscription or resize that arrived before the driver did.
++        let _ = self.host_evt.write(1);
++        let paused = Arc::clone(&self.common.paused);
++        let paused_sync = self.common.paused_sync.clone();
++        self.common.spawn_worker(
++            &self.id,
++            &self.seccomp_action,
++            Thread::VirtioGpu,
++            &self.exit_evt,
++            device_status,
++            interrupt_cb,
++            move || handler.run(&paused, paused_sync.as_ref().unwrap()),
++        )?;
++        event!("virtio-device", "activated", "id", &self.id);
++        Ok(())
++    }
++
++    fn reset(&mut self) {
++        self.common.reset();
++        self.display.set_gpu_active(false);
++        self.display.gpu.lock().unwrap().reset();
++        self.display.notify();
++        event!("virtio-device", "reset", "id", &self.id);
++    }
++}
++
++impl Pausable for Gpu {
++    fn pause(&mut self) -> result::Result<(), MigratableError> {
++        self.common.pause()
++    }
++
++    fn resume(&mut self) -> result::Result<(), MigratableError> {
++        self.common.resume()
++    }
++}
++
++impl Snapshottable for Gpu {
++    fn id(&self) -> String {
++        self.id.clone()
++    }
++
++    fn snapshot(&mut self) -> result::Result<Snapshot, MigratableError> {
++        Snapshot::new_from_state(&GpuDeviceState {
++            avail_features: self.common.avail_features,
++            acked_features: self.common.acked_features,
++            gpu: self.display.gpu.lock().unwrap().state(),
++        })
++    }
++}
++
++impl Transportable for Gpu {}
++impl Migratable for Gpu {}
++
++pub struct Input {
++    common: VirtioCommon,
++    id: String,
++    kind: Kind,
++    display: Arc<Display>,
++    host_evt: EventFd,
++    seccomp_action: SeccompAction,
++    exit_evt: EventFd,
++}
++
++struct InputHandler {
++    mem: GuestMemoryAtomic<GuestMemoryMmap>,
++    events: Queue,
++    status: Queue,
++    events_evt: EventFd,
++    status_evt: EventFd,
++    host_evt: EventFd,
++    kind: Kind,
++    display: Arc<Display>,
++    interrupt_cb: Arc<dyn VirtioInterrupt>,
++    kill_evt: EventFd,
++    pause_evt: EventFd,
++}
++
++impl InputHandler {
++    /// Moves queued host events into the buffers the guest has posted.
++    fn deliver(&mut self) -> result::Result<bool, EpollHelperError> {
++        let mut input = self.display.inputs[self.kind.index()].lock().unwrap();
++        let mut used = false;
++        while let Some(event) = input.peek() {
++            let Some(mut chain) = self.events.pop_descriptor_chain(self.mem.memory()) else {
++                break;
++            };
++            let descs: Vec<_> = chain
++                .checked_iter(None)
++                .collect::<result::Result<_, _>>()
++                .map_err(|e| handler_error("bad descriptor", e))?;
++            let mut written = 0;
++            if let Some(desc) = descs
++                .iter()
++                .find(|d| d.is_write_only() && d.len() as usize >= input::EVENT_SIZE)
++            {
++                chain
++                    .memory()
++                    .write_slice(&event.to_bytes(), desc.addr())
++                    .map_err(|e| handler_error("writing an event", e))?;
++                written = input::EVENT_SIZE as u32;
++            }
++            self.events
++                .add_used(chain.memory(), chain.head_index(), written)
++                .map_err(|e| handler_error("adding used", e))?;
++            input.pop();
++            used = true;
++        }
++        Ok(used)
++    }
++
++    /// LED state from the guest, which nothing shows.
++    fn drain_status(&mut self) -> result::Result<bool, EpollHelperError> {
++        let mut used = false;
++        while let Some(chain) = self.status.pop_descriptor_chain(self.mem.memory()) {
++            self.status
++                .add_used(chain.memory(), chain.head_index(), 0)
++                .map_err(|e| handler_error("adding used", e))?;
++            used = true;
++        }
++        Ok(used)
++    }
++
++    fn signal(&self, queue: u16) -> result::Result<(), EpollHelperError> {
++        self.interrupt_cb
++            .trigger(VirtioInterruptType::Queue(queue))
++            .map_err(|e| handler_error("signalling a queue", e))
++    }
++
++    fn run(
++        &mut self,
++        paused: &AtomicBool,
++        paused_sync: &Barrier,
++    ) -> result::Result<(), EpollHelperError> {
++        let mut helper = EpollHelper::new(&self.kill_evt, &self.pause_evt)?;
++        helper.add_event(self.events_evt.as_raw_fd(), QUEUE_0_EVENT)?;
++        helper.add_event(self.status_evt.as_raw_fd(), QUEUE_1_EVENT)?;
++        helper.add_event(self.host_evt.as_raw_fd(), HOST_EVENT)?;
++        helper.run(paused, paused_sync, self)?;
++        Ok(())
++    }
++}
++
++impl EpollHelperHandler for InputHandler {
++    fn handle_event(
++        &mut self,
++        _helper: &mut EpollHelper,
++        event: &epoll::Event,
++    ) -> result::Result<(), EpollHelperError> {
++        match event.data as u16 {
++            QUEUE_0_EVENT | HOST_EVENT => {
++                let _ = self.events_evt.read();
++                let _ = self.host_evt.read();
++                if self.deliver()? {
++                    self.signal(0)?;
++                }
++            }
++            QUEUE_1_EVENT => {
++                let _ = self.status_evt.read();
++                if self.drain_status()? {
++                    self.signal(1)?;
++                }
++            }
++            other => return Err(handler_error("unexpected event", other)),
++        }
++        Ok(())
++    }
++}
++
++impl VirtioDevice for Input {
++    fn device_type(&self) -> u32 {
++        self.common.device_type
++    }
++
++    fn queue_max_sizes(&self) -> &[u16] {
++        &self.common.queue_sizes
++    }
++
++    fn features(&self) -> u64 {
++        self.common.avail_features
++    }
++
++    fn ack_features(&mut self, value: u64) {
++        self.common.ack_features(value);
++    }
++
++    fn config_size(&self) -> Option<u64> {
++        Some(input::CONFIG_SIZE as u64)
++    }
++
++    fn read_config(&self, offset: u64, data: &mut [u8]) {
++        self.display.inputs[self.kind.index()]
++            .lock()
++            .unwrap()
++            .read_config(offset, data);
++    }
++
++    fn write_config(&mut self, offset: u64, data: &[u8]) {
++        self.display.inputs[self.kind.index()]
++            .lock()
++            .unwrap()
++            .write_config(offset, data);
++    }
++
++    fn activate(&mut self, context: ActivationContext) -> ActivateResult {
++        let ActivationContext {
++            mem,
++            interrupt_cb,
++            mut queues,
++            device_status,
++        } = context;
++        self.common.activate(&queues, Arc::clone(&interrupt_cb))?;
++        let (kill_evt, pause_evt) = self.common.dup_eventfds()?;
++        let (_, events, events_evt) = queues.remove(0);
++        let (_, status, status_evt) = queues.remove(0);
++        let mut handler = InputHandler {
++            mem,
++            events,
++            status,
++            events_evt,
++            status_evt,
++            host_evt: self
++                .host_evt
++                .try_clone()
++                .map_err(ActivateError::CloneEventFd)?,
++            kind: self.kind,
++            display: Arc::clone(&self.display),
++            interrupt_cb: Arc::clone(&interrupt_cb),
++            kill_evt,
++            pause_evt,
++        };
++        let paused = Arc::clone(&self.common.paused);
++        let paused_sync = self.common.paused_sync.clone();
++        self.common.spawn_worker(
++            &self.id,
++            &self.seccomp_action,
++            Thread::VirtioInput,
++            &self.exit_evt,
++            device_status,
++            interrupt_cb,
++            move || handler.run(&paused, paused_sync.as_ref().unwrap()),
++        )?;
++        event!("virtio-device", "activated", "id", &self.id);
++        Ok(())
++    }
++
++    fn reset(&mut self) {
++        self.common.reset();
++        self.display.inputs[self.kind.index()]
++            .lock()
++            .unwrap()
++            .reset();
++        event!("virtio-device", "reset", "id", &self.id);
++    }
++}
++
++impl Pausable for Input {
++    fn pause(&mut self) -> result::Result<(), MigratableError> {
++        self.display.inputs[self.kind.index()]
++            .lock()
++            .unwrap()
++            .clear_pending();
++        self.common.pause()
++    }
++
++    fn resume(&mut self) -> result::Result<(), MigratableError> {
++        self.common.resume()
++    }
++}
++
++impl Snapshottable for Input {
++    fn id(&self) -> String {
++        self.id.clone()
++    }
++
++    fn snapshot(&mut self) -> result::Result<Snapshot, MigratableError> {
++        Snapshot::new_from_state(&InputDeviceState {
++            avail_features: self.common.avail_features,
++            acked_features: self.common.acked_features,
++            input: self.display.inputs[self.kind.index()]
++                .lock()
++                .unwrap()
++                .state(),
++        })
++    }
++}
++
++impl Transportable for Input {}
++impl Migratable for Input {}
+diff --git a/virtio-devices/src/lib.rs b/virtio-devices/src/lib.rs
+index 1d4e28b..556e561 100644
+--- a/virtio-devices/src/lib.rs
++++ b/virtio-devices/src/lib.rs
+@@ -22,6 +22,7 @@
+ pub mod balloon;
+ pub mod block;
+ mod console;
++pub mod display;
+ pub mod epoll_helper;
+ mod iommu;
+ pub mod mem;
+diff --git a/virtio-devices/src/seccomp_filters.rs b/virtio-devices/src/seccomp_filters.rs
+index 37cc6be..5d296e1 100644
+--- a/virtio-devices/src/seccomp_filters.rs
++++ b/virtio-devices/src/seccomp_filters.rs
+@@ -16,9 +16,12 @@
+ 
+ #[derive(Clone, Copy)]
+ pub enum Thread {
++    DisplaySocket,
+     VirtioBalloon,
+     VirtioBlock,
+     VirtioConsole,
++    VirtioGpu,
++    VirtioInput,
+     VirtioIommu,
+     VirtioMem,
+     VirtioNet,
+@@ -319,6 +322,29 @@ fn virtio_vsock_thread_rules() -> Vec<(i64, Vec<SeccompRule>)> {
+     ]
+ }
+ 
++fn display_socket_thread_rules() -> Vec<(i64, Vec<SeccompRule>)> {
++    vec![
++        (libc::SYS_accept4, vec![]),
++        #[cfg(target_arch = "x86_64")]
++        (libc::SYS_poll, vec![]),
++        (libc::SYS_ppoll, vec![]),
++        (libc::SYS_recvmsg, vec![]),
++        (libc::SYS_sendmsg, vec![]),
++        (libc::SYS_setsockopt, vec![]),
++    ]
++}
++
++fn virtio_gpu_thread_rules() -> Vec<(i64, Vec<SeccompRule>)> {
++    vec![
++        (libc::SYS_ftruncate, vec![]),
++        (libc::SYS_memfd_create, vec![]),
++    ]
++}
++
++fn virtio_input_thread_rules() -> Vec<(i64, Vec<SeccompRule>)> {
++    vec![]
++}
++
+ fn virtio_watchdog_thread_rules() -> Vec<(i64, Vec<SeccompRule>)> {
+     vec![
+         (libc::SYS_sched_getaffinity, vec![]),
+@@ -329,9 +355,12 @@ fn virtio_watchdog_thread_rules() -> Vec<(i64, Vec<SeccompRule>)> {
+ 
+ fn get_seccomp_rules(thread_type: Thread) -> Vec<(i64, Vec<SeccompRule>)> {
+     let mut rules = match thread_type {
++        Thread::DisplaySocket => display_socket_thread_rules(),
+         Thread::VirtioBalloon => virtio_balloon_thread_rules(),
+         Thread::VirtioBlock => virtio_block_thread_rules(),
+         Thread::VirtioConsole => virtio_console_thread_rules(),
++        Thread::VirtioGpu => virtio_gpu_thread_rules(),
++        Thread::VirtioInput => virtio_input_thread_rules(),
+         Thread::VirtioIommu => virtio_iommu_thread_rules(),
+         Thread::VirtioMem => virtio_mem_thread_rules(),
+         Thread::VirtioNet => virtio_net_thread_rules(),

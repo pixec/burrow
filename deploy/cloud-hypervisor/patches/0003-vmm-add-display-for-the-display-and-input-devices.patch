@@ -1,0 +1,346 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Pixec <noreply@pixec.net>
+Subject: [PATCH 3/3] vmm: add --display for the display and input devices
+
+---
+ cloud-hypervisor/src/main.rs | 14 ++++++---
+ vmm/src/config.rs            | 48 +++++++++++++++++++++++++++++
+ vmm/src/device_manager.rs    | 60 ++++++++++++++++++++++++++++++++++++
+ vmm/src/lib.rs               |  1 +
+ vmm/src/vm_config.rs         | 23 ++++++++++++++
+ 5 files changed, 142 insertions(+), 4 deletions(-)
+
+diff --git a/cloud-hypervisor/src/main.rs b/cloud-hypervisor/src/main.rs
+index 65eb8cc..6321d69 100644
+--- a/cloud-hypervisor/src/main.rs
++++ b/cloud-hypervisor/src/main.rs
+@@ -39,10 +39,10 @@
+ #[cfg(feature = "ivshmem")]
+ use vmm::vm_config::IvshmemConfig;
+ use vmm::vm_config::{
+-    BalloonConfig, ConsoleConfig, DeviceConfig, DiskConfig, FsConfig, GenericVhostUserConfig,
+-    LandlockConfig, NetConfig, NumaConfig, PciSegmentConfig, PlatformConfig, PmemConfig,
+-    RateLimiterGroupConfig, RngConfig, RtcConfig, SerialConfig, TpmConfig, UserDeviceConfig,
+-    VdpaConfig, VmConfig, VsockConfig,
++    BalloonConfig, ConsoleConfig, DeviceConfig, DiskConfig, DisplayConfig, FsConfig,
++    GenericVhostUserConfig, LandlockConfig, NetConfig, NumaConfig, PciSegmentConfig,
++    PlatformConfig, PmemConfig, RateLimiterGroupConfig, RngConfig, RtcConfig, SerialConfig,
++    TpmConfig, UserDeviceConfig, VdpaConfig, VmConfig, VsockConfig,
+ };
+ use vmm_sys_util::eventfd::EventFd;
+ use vmm_sys_util::signal::block_signal;
+@@ -313,6 +313,11 @@ fn get_cli_options_sorted(
+             .num_args(1..)
+             .action(ArgAction::Append)
+             .group("vm-config"),
++        Arg::new("display")
++            .long("display")
++            .num_args(1)
++            .help(DisplayConfig::SYNTAX)
++            .group("vm-config"),
+         Arg::new("event-monitor")
+             .long("event-monitor")
+             .help("Path to report events on: path=<path> or fd=<fd>")
+@@ -1185,6 +1190,7 @@ fn test_valid_vm_config_default() {
+             pci_segments: None,
+             platform: None,
+             tpm: None,
++            display: None,
+             preserved_fds: None,
+             landlock_enable: false,
+             landlock_rules: None,
+diff --git a/vmm/src/config.rs b/vmm/src/config.rs
+index a721b76..6f22c05 100644
+--- a/vmm/src/config.rs
++++ b/vmm/src/config.rs
+@@ -24,6 +24,7 @@
+ use virtio_bindings::virtio_blk::VIRTIO_BLK_ID_BYTES;
+ use virtio_bindings::virtio_ids::*;
+ use virtio_devices::block::MINIMUM_BLOCK_QUEUE_SIZE;
++use virtio_devices::display::is_valid_mode;
+ use virtio_devices::vhost_user::VIRTIO_FS_TAG_LEN;
+ use virtio_devices::{RateLimiterConfig, TokenBucketConfig, net, vhost_user};
+ 
+@@ -178,6 +179,12 @@ pub enum Error {
+     /// Missing path for TPM device
+     #[error("Error parsing --tpm: path missing")]
+     ParseTpmPathMissing,
++    /// Failed parsing the display
++    #[error("Error parsing --display")]
++    ParseDisplay(#[source] OptionParserError),
++    /// Missing or invalid display parameters
++    #[error("Error parsing --display: width, height and socket are required")]
++    ParseDisplayMissing,
+     #[cfg(feature = "ivshmem")]
+     /// Missing path for ivsmem device
+     #[error("Error parsing --ivshmem: path missing")]
+@@ -550,6 +557,7 @@ pub struct VmParams<'a> {
+     pub pci_segments: Option<Vec<&'a str>>,
+     pub platform: Option<&'a str>,
+     pub tpm: Option<&'a str>,
++    pub display: Option<&'a str>,
+     #[cfg(feature = "igvm")]
+     pub igvm: Option<&'a str>,
+     #[cfg(feature = "sev_snp")]
+@@ -623,6 +631,7 @@ pub fn from_arg_matches(args: &'a ArgMatches) -> Self {
+         #[cfg(feature = "guest_debug")]
+         let gdb = args.contains_id("gdb");
+         let tpm: Option<&str> = args.get_one::<String>("tpm").map(|x| x as &str);
++        let display: Option<&str> = args.get_one::<String>("display").map(|x| x as &str);
+         #[cfg(feature = "igvm")]
+         let igvm = args.get_one::<String>("igvm").map(|x| x as &str);
+         #[cfg(feature = "sev_snp")]
+@@ -671,6 +680,7 @@ pub fn from_arg_matches(args: &'a ArgMatches) -> Self {
+             pci_segments,
+             platform,
+             tpm,
++            display,
+             #[cfg(feature = "igvm")]
+             igvm,
+             #[cfg(feature = "sev_snp")]
+@@ -3241,6 +3251,37 @@ pub fn parse(tpm: &str) -> Result<Self> {
+     }
+ }
+ 
++impl DisplayConfig {
++    pub const SYNTAX: &'static str = "Display and input devices \
++        \"width=<pixels>,height=<pixels>,socket=</path/to/a/socket>\"";
++
++    pub fn parse(display: &str) -> Result<Self> {
++        let mut parser = OptionParser::new();
++        parser.add("width").add("height").add("socket");
++        parser.parse(display).map_err(Error::ParseDisplay)?;
++        let width = parser
++            .convert::<u32>("width")
++            .map_err(Error::ParseDisplay)?
++            .ok_or(Error::ParseDisplayMissing)?;
++        let height = parser
++            .convert::<u32>("height")
++            .map_err(Error::ParseDisplay)?
++            .ok_or(Error::ParseDisplayMissing)?;
++        let socket = parser
++            .get("socket")
++            .map(PathBuf::from)
++            .ok_or(Error::ParseDisplayMissing)?;
++        if !is_valid_mode(width, height) {
++            return Err(Error::ParseDisplayMissing);
++        }
++        Ok(DisplayConfig {
++            width,
++            height,
++            socket,
++        })
++    }
++}
++
+ impl LandlockConfig {
+     pub const SYNTAX: &'static str = "Landlock parameters \
+         \"path=<path/to/{file/dir}>,access=[rw]\"";
+@@ -4056,6 +4097,8 @@ pub fn parse(vm_params: VmParams) -> Result<Self> {
+             });
+         }
+ 
++        let display = vm_params.display.map(DisplayConfig::parse).transpose()?;
++
+         #[cfg(feature = "guest_debug")]
+         let gdb = vm_params.gdb;
+ 
+@@ -4110,6 +4153,7 @@ pub fn parse(vm_params: VmParams) -> Result<Self> {
+             pci_segments,
+             platform,
+             tpm,
++            display,
+             preserved_fds: None,
+             landlock_enable: vm_params.landlock_enable,
+             landlock_rules,
+@@ -4244,6 +4288,7 @@ fn clone(&self) -> Self {
+             pci_segments: self.pci_segments.clone(),
+             platform: self.platform.clone(),
+             tpm: self.tpm.clone(),
++            display: self.display.clone(),
+             preserved_fds: self
+                 .preserved_fds
+                 .as_ref()
+@@ -5733,6 +5778,7 @@ fn test_restore_config_validation() {
+             pci_segments: None,
+             platform: None,
+             tpm: None,
++            display: None,
+             preserved_fds: None,
+             net: Some(vec![
+                 NetConfig {
+@@ -5974,6 +6020,7 @@ fn test_restore_config_vfio_fds_validation() {
+                 ..platform_fixture()
+             }),
+             tpm: None,
++            display: None,
+             preserved_fds: None,
+             net: None,
+             landlock_enable: false,
+@@ -6172,6 +6219,7 @@ fn test_config_validation() {
+             pci_segments: None,
+             platform: None,
+             tpm: None,
++            display: None,
+             preserved_fds: None,
+             landlock_enable: false,
+             landlock_rules: None,
+diff --git a/vmm/src/device_manager.rs b/vmm/src/device_manager.rs
+index 5644b2c..b22d418 100644
+--- a/vmm/src/device_manager.rs
++++ b/vmm/src/device_manager.rs
+@@ -113,6 +113,7 @@
+ use vfio_ioctls::VfioIommufd;
+ use vfio_ioctls::{VfioContainer, VfioDevice, VfioDeviceFd, VfioOps};
+ use virtio_devices::block::Error as VirtioBlockError;
++use virtio_devices::display::{DisplayStates, new_display};
+ use virtio_devices::transport::{
+     VIRTIO_CONFIG_BAR_INDEX, VIRTIO_SHM_BAR_INDEX, VirtioPciDevice, VirtioPciDeviceActivator,
+     VirtioTransport,
+@@ -203,6 +204,7 @@
+ const VDPA_DEVICE_NAME_PREFIX: &str = "_vdpa";
+ const VSOCK_DEVICE_NAME_PREFIX: &str = "_vsock";
+ const WATCHDOG_DEVICE_NAME: &str = "__watchdog";
++const DISPLAY_DEVICE_NAMES: [&str; 3] = ["__gpu", "__keyboard", "__tablet"];
+ const VFIO_DEVICE_NAME_PREFIX: &str = "_vfio";
+ const VFIO_USER_DEVICE_NAME_PREFIX: &str = "_vfio_user";
+ const VIRTIO_PCI_DEVICE_NAME_PREFIX: &str = "_virtio-pci";
+@@ -306,6 +308,10 @@ pub enum DeviceManagerError {
+     #[error("Cannot create virtio-watchdog device")]
+     CreateVirtioWatchdog(#[source] io::Error),
+ 
++    /// Cannot create the display devices
++    #[error("Cannot create the display devices")]
++    CreateDisplay(#[source] io::Error),
++
+     /// Cannot create serial manager
+     #[error("Cannot create serial manager")]
+     CreateSerialManager(#[source] SerialManagerError),
+@@ -2805,6 +2811,8 @@ fn make_virtio_devices(&mut self, snapshot: Option<&Snapshot>) -> DeviceManagerR
+         // Add virtio-watchdog device
+         self.make_virtio_watchdog_devices(snapshot)?;
+ 
++        self.make_display_devices(snapshot)?;
++
+         // Add vDPA devices if required
+         self.make_vdpa_devices(snapshot)?;
+ 
+@@ -3897,6 +3905,58 @@ fn make_virtio_watchdog_devices(
+         Ok(())
+     }
+ 
++    fn make_display_devices(&mut self, snapshot: Option<&Snapshot>) -> DeviceManagerResult<()> {
++        let Some(config) = self.config.lock().unwrap().display.clone() else {
++            return Ok(());
++        };
++        info!(
++            "Creating display devices: {}x{} on {}",
++            config.width,
++            config.height,
++            config.socket.display()
++        );
++        let [gpu, keyboard, tablet] = DISPLAY_DEVICE_NAMES;
++        let states = DisplayStates {
++            gpu: state_from_id(snapshot, gpu).map_err(DeviceManagerError::RestoreGetState)?,
++            keyboard: state_from_id(snapshot, keyboard)
++                .map_err(DeviceManagerError::RestoreGetState)?,
++            tablet: state_from_id(snapshot, tablet).map_err(DeviceManagerError::RestoreGetState)?,
++        };
++        let devices = new_display(
++            DISPLAY_DEVICE_NAMES.map(String::from),
++            config.width,
++            config.height,
++            &config.socket,
++            &self.seccomp_action,
++            &self.exit_evt,
++            &states,
++        )
++        .map_err(DeviceManagerError::CreateDisplay)?;
++        self.add_display_device(gpu, devices.gpu);
++        self.add_display_device(keyboard, devices.keyboard);
++        self.add_display_device(tablet, devices.tablet);
++        Ok(())
++    }
++
++    fn add_display_device<T>(&mut self, id: &str, device: T)
++    where
++        T: virtio_devices::VirtioDevice + Migratable + 'static,
++    {
++        let device = Arc::new(Mutex::new(device));
++        self.virtio_devices.push(MetaVirtioDevice {
++            virtio_device: Arc::clone(&device) as Arc<Mutex<dyn virtio_devices::VirtioDevice>>,
++            pci_common: PciDeviceCommonConfig {
++                id: Some(id.to_string()),
++                ..Default::default()
++            },
++            dma_handler: None,
++        });
++        self.device_tree.lock().unwrap().insert(
++            id.to_string(),
++            DeviceNode::new(id.to_string(), Some(device)),
++        );
++    }
++
+     fn make_vdpa_device(
+         &mut self,
+         vdpa_cfg: &mut VdpaConfig,
+diff --git a/vmm/src/lib.rs b/vmm/src/lib.rs
+index da26842..02ac1cd 100644
+--- a/vmm/src/lib.rs
++++ b/vmm/src/lib.rs
+@@ -3734,6 +3734,7 @@ fn create_dummy_vm_config() -> Box<VmConfig> {
+             pci_segments: None,
+             platform: None,
+             tpm: None,
++            display: None,
+             preserved_fds: None,
+             landlock_enable: false,
+             landlock_rules: None,
+diff --git a/vmm/src/vm_config.rs b/vmm/src/vm_config.rs
+index d45495a..552d33e 100644
+--- a/vmm/src/vm_config.rs
++++ b/vmm/src/vm_config.rs
+@@ -1212,6 +1212,23 @@ fn apply_landlock(&self, landlock: &mut Landlock) -> LandlockResult<()> {
+     }
+ }
+ 
++#[derive(Clone, Debug, PartialEq, Eq, Deserialize, Serialize)]
++pub struct DisplayConfig {
++    pub width: u32,
++    pub height: u32,
++    pub socket: PathBuf,
++}
++
++impl ApplyLandlock for DisplayConfig {
++    fn apply_landlock(&self, landlock: &mut Landlock) -> LandlockResult<()> {
++        if let Some(parent) = self.socket.parent() {
++            landlock.add_rule_with_access(parent, "w")?;
++        }
++        landlock.add_rule_with_access(&self.socket, "rw")?;
++        Ok(())
++    }
++}
++
+ #[derive(Clone, Debug, PartialEq, Eq, Deserialize, Serialize)]
+ pub struct LandlockConfig {
+     pub path: PathBuf,
+@@ -1271,6 +1288,8 @@ pub struct VmConfig {
+     pub pci_segments: Option<Box<[PciSegmentConfig]>>,
+     pub platform: Option<PlatformConfig>,
+     pub tpm: Option<TpmConfig>,
++    #[serde(default)]
++    pub display: Option<DisplayConfig>,
+     // Preserved FDs are the ones that share the same life-time as its holding
+     // VmConfig instance, such as FDs for creating TAP devices.
+     // Preserved FDs will stay open as long as the holding VmConfig instance is
+@@ -1375,6 +1394,10 @@ pub(crate) fn apply_landlock(&self) -> LandlockResult<()> {
+             tpm_config.apply_landlock(&mut landlock)?;
+         }
+ 
++        if let Some(display_config) = &self.display {
++            display_config.apply_landlock(&mut landlock)?;
++        }
++
+         if self.net.is_some() {
+             landlock.add_rule_with_access(Path::new("/dev/net/tun"), "rw")?;
+         }

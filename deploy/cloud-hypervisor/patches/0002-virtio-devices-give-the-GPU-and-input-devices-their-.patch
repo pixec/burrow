@@ -1,0 +1,36 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Pixec <noreply@pixec.net>
+Subject: [PATCH 2/3] virtio-devices: give the GPU and input devices their PCI
+ classes
+
+---
+ virtio-devices/src/transport/pci_device.rs | 9 +++++++++
+ 1 file changed, 9 insertions(+)
+
+diff --git a/virtio-devices/src/transport/pci_device.rs b/virtio-devices/src/transport/pci_device.rs
+index 42b1c72..0819e60 100644
+--- a/virtio-devices/src/transport/pci_device.rs
++++ b/virtio-devices/src/transport/pci_device.rs
+@@ -239,6 +239,7 @@ struct VirtioPciCfgCapInfo {
+ 
+ #[derive(Copy, Clone)]
+ pub(super) enum PciVirtioSubclass {
++    Other = 0x80,
+     NonTransitionalBase = 0xff,
+ }
+ 
+@@ -511,6 +512,14 @@ pub fn new(
+                 PciClassCode::MassStorage,
+                 &PciMassStorageSubclass::MassStorage as &dyn PciSubclass,
+             ),
++            VirtioDeviceType::Gpu => (
++                PciClassCode::DisplayController,
++                &PciVirtioSubclass::Other as &dyn PciSubclass,
++            ),
++            VirtioDeviceType::Input => (
++                PciClassCode::InputDevice,
++                &PciVirtioSubclass::Other as &dyn PciSubclass,
++            ),
+             _ => (
+                 PciClassCode::Other,
+                 &PciVirtioSubclass::NonTransitionalBase as &dyn PciSubclass,

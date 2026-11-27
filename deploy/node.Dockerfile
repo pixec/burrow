@@ -13,6 +13,26 @@
 #
 #   docker buildx build --target release -f deploy/node.Dockerfile -t burrow-node .
 
+# Cloud Hypervisor is built from its vendored release source with Burrow's
+# display device patched in (deploy/cloud-hypervisor). The source tarball is
+# checksummed like every binary below. Bump CH_VERSION and CH_SRC_SHA256
+# together, and rebase the patches onto the new release.
+FROM rust:1.100.0-slim-bookworm@sha256:bb875b0f8ce726053e259034848c471840e96bfe591fd52556178ae9a05e6126 AS cloud-hypervisor
+ARG CH_VERSION=v54.1
+ARG CH_SRC_SHA256=7f030190ea1d47c45d1a6eff02b94378987091cf60c2462ee0a6105e5dfdb78a
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        ca-certificates curl musl-tools patch xz-utils && \
+    rm -rf /var/lib/apt/lists/* && \
+    rustup target add "$(uname -m)-unknown-linux-musl"
+COPY deploy/cloud-hypervisor /build/cloud-hypervisor
+COPY crates/burrow-display /build/burrow-display
+RUN set -eu; \
+    curl -fsSL -o /build/src.tar.xz \
+        "https://github.com/cloud-hypervisor/cloud-hypervisor/releases/download/${CH_VERSION}/cloud-hypervisor-${CH_VERSION}.tar.xz"; \
+    echo "${CH_SRC_SHA256}  /build/src.tar.xz" | sha256sum -c -; \
+    sh /build/cloud-hypervisor/build.sh /build/src.tar.xz /build/burrow-display /build/cloud-hypervisor-bin; \
+    rm -f /build/src.tar.xz
+
 # Pinned by digest, not by tag: `bookworm-slim` is republished, so the same
 # build a month later would otherwise produce a different image. This is the
 # multi-arch manifest list, so it still resolves per platform for the
@@ -35,11 +55,6 @@ ARG FC_ARCH=""
 ARG FC_SHA256_X86_64=382a02a869e4d6d5cb14c40577f9545e8458021ea8b0b2d3fc10ec14d9c242e6
 ARG FC_SHA256_AARCH64=8d0e69f6d6f9a1724551f607f18504052c16c1828ee3d4d7b6e6c73380871e0e
 
-# The second hypervisor, for templates built with `--hypervisor
-# cloud-hypervisor`. A static binary per arch, checksummed like firecracker's.
-ARG CH_VERSION=v54.1
-ARG CH_SHA256_X86_64=f9ffb9646783233d1f0fb09e77db1fca66499d1041e63bc011b90683c0d49933
-ARG CH_SHA256_AARCH64=96ef17679a4a75be8eefa1956dd645a57f7974ec50565090ea9298f9bbb761ad
 # UEFI firmware from Cloud Hypervisor's edk2 fork. Linux guests boot their
 # kernel directly and never load it; it is here for firmware-booted guests.
 ARG CH_EDK2=ch-97eeb7b09
@@ -105,21 +120,17 @@ RUN set -eu; \
         esac; \
     fi; \
     case "$arch" in \
-        x86_64) bin=cloud-hypervisor-static; want="$CH_SHA256_X86_64"; \
-                fw=CLOUDHV.fd; fw_want="$CH_EDK2_SHA256_X86_64" ;; \
-        aarch64) bin=cloud-hypervisor-static-aarch64; want="$CH_SHA256_AARCH64"; \
-                 fw=CLOUDHV_EFI.fd; fw_want="$CH_EDK2_SHA256_AARCH64" ;; \
+        x86_64) fw=CLOUDHV.fd; fw_want="$CH_EDK2_SHA256_X86_64" ;; \
+        aarch64) fw=CLOUDHV_EFI.fd; fw_want="$CH_EDK2_SHA256_AARCH64" ;; \
         *) echo "unsupported arch: $arch" >&2; exit 1 ;; \
     esac; \
-    curl -fsSL -o /usr/local/bin/cloud-hypervisor \
-        "https://github.com/cloud-hypervisor/cloud-hypervisor/releases/download/${CH_VERSION}/${bin}"; \
-    echo "${want}  /usr/local/bin/cloud-hypervisor" | sha256sum -c -; \
-    chmod 0755 /usr/local/bin/cloud-hypervisor; \
     mkdir -p /usr/local/share/cloud-hypervisor; \
     curl -fsSL -o "/usr/local/share/cloud-hypervisor/${fw}" \
         "https://github.com/cloud-hypervisor/edk2/releases/download/${CH_EDK2}/${fw}"; \
-    echo "${fw_want}  /usr/local/share/cloud-hypervisor/${fw}" | sha256sum -c -; \
-    cloud-hypervisor --version
+    echo "${fw_want}  /usr/local/share/cloud-hypervisor/${fw}" | sha256sum -c -
+
+COPY --from=cloud-hypervisor /build/cloud-hypervisor-bin /usr/local/bin/cloud-hypervisor
+RUN cloud-hypervisor --version
 
 RUN set -eu; \
     arch="$FC_ARCH"; \
