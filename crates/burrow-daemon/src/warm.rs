@@ -33,7 +33,7 @@ use std::path::{Path, PathBuf};
 use tonic::Status;
 
 use burrow_proto::common::v1 as common;
-use burrow_vmm::{Hypervisor, HypervisorExt, MachineSpec, NetSpec, Vm};
+use burrow_vmm::{Hypervisor, HypervisorExt, MachineSpec, Vm};
 
 use crate::rootdisk::{IMAGE, ROOT_DISK};
 use crate::sandbox::NodeConfig;
@@ -783,7 +783,6 @@ pub async fn build_warm_snapshot(
             "template {template} runs under {hypervisor}, which this node does not offer"
         )));
     }
-    let backend = config.backend(hypervisor);
     let capabilities = hypervisor.capabilities();
 
     // Assembled beside the live snapshot and swapped in at the end. Rebuilding
@@ -855,42 +854,26 @@ pub async fn build_warm_snapshot(
         .await
         .map_err(|err| Status::internal(format!("warm tap: {err}")))?;
 
-    let mut spec = MachineSpec::new(vm_id.clone(), &run_dir, backend.clone());
-    spec.guest_os = guest_os;
-    // Baked into the snapshot: a restore takes its machine configuration from
-    // here, not from what a later caller asks for.
-    spec.cpu.vcpus = shape.vcpus;
-    spec.memory.mib = shape.mem_mib;
-    spec.memory.hotplug_mib =
-        crate::sandbox::hotplug_region(hypervisor, guest_os, shape.mem_mib, shape.max_mem_mib);
-    spec.devices.drives = crate::rootdisk::drives();
-    spec.devices.is_vsock_enabled = true;
-    spec.devices.net = Some(NetSpec {
-        tap: tap.clone(),
-        guest_mac: Some(lease.guest_mac()),
-    });
-    spec.boot = burrow_vmm::Boot::Kernel {
-        kernel: "vmlinux".into(),
-        cmdline: format!(
-            "{} {} init=/usr/bin/burrow-guest {} {} {}",
-            burrow_vmm::DEFAULT_BOOT_ARGS,
-            crate::rootdisk::BOOT_ARGS,
-            lease.kernel_ip_arg(""),
-            crate::sandbox::guest_mode_arg(environment.booted_systemd(), hypervisor, true),
-            crate::sandbox::guest_boot_args(&config.extra_boot_args, config.is_console_verbose)
-        ),
-    };
-    if boot == crate::boot::FIRMWARE {
-        spec.boot = crate::boot::firmware_boot();
-    }
     // A TPM template's snapshot holds a TPM, made fresh for the build, which
     // every sandbox restored from it starts with a copy of.
     let tpm = environment.tpm.then(|| config.tpm(&vm_id, lease.block));
     if let Some(tpm) = &tpm {
         let _ = tokio::fs::remove_dir_all(&tpm.dir).await;
     }
-    spec.devices.tpm = tpm.clone();
-    apply_confinement(&mut spec, config, shape);
+    let spec = crate::spec::warm(
+        config,
+        &crate::spec::Guest {
+            id: &vm_id,
+            workdir: &run_dir,
+            hypervisor,
+            guest_os,
+            lease: &lease,
+            tap: &tap,
+        },
+        shape,
+        environment.booted_systemd(),
+        tpm.clone(),
+    );
 
     let outcome = match cold_boots.admit(&vm_id).await {
         Ok(cold_boot) => {
@@ -918,7 +901,7 @@ pub async fn build_warm_snapshot(
             // page-fault handler records faults, or replays a plan.
             if capabilities.is_lazy_memory_supported
                 && let Err(err) = profile_restore(
-                    &vm_id, &run_dir, &backend, config, &pool, shape, trust, guest_os,
+                    &vm_id, &run_dir, hypervisor, config, &pool, shape, trust, guest_os,
                 )
                 .await
             {
@@ -1033,24 +1016,6 @@ pub async fn build_warm_snapshot(
             Err(err)
         }
     }
-}
-
-/// Gives a warm VM the same cgroup and limits a sandbox of this shape would
-/// get. The jail travels with the backend.
-///
-/// Kept beside the two specs that need it rather than derived from a sandbox's,
-/// because a warm VM has no policy and no lease to build one from; what it
-/// shares with a sandbox is exactly the confinement, and that is what is copied.
-fn apply_confinement(spec: &mut MachineSpec, config: &NodeConfig, shape: Shape) {
-    spec.cgroup_root = config.cgroup_root.clone();
-    spec.is_limits_required = config.is_resource_limits_required;
-    spec.limits = crate::sandbox::cgroup_limits(
-        &burrow_proto::common::v1::ResourcePolicy {
-            vcpus: shape.vcpus,
-            ..Default::default()
-        },
-        config.memory_ceiling_mib(spec.hypervisor(), shape.mem_mib),
-    );
 }
 
 /// Moves what the jailed build produced into the directory it is published
@@ -1196,7 +1161,7 @@ async fn warm_up(
 async fn profile_restore(
     vm_id: &str,
     dir: &Path,
-    backend: &burrow_vmm::Backend,
+    hypervisor: Hypervisor,
     config: &NodeConfig,
     pool: &burrow_net::ipam::AddressPool,
     shape: Shape,
@@ -1216,23 +1181,18 @@ async fn profile_restore(
     // The build's own id, not one of its own: under the jailer the chroot is
     // derived from the id, and this VM restores the files that are inside the
     // one the build already filled.
-    let mut spec = MachineSpec::new(vm_id.to_string(), dir, backend.clone());
-    spec.devices.drives = crate::rootdisk::drives();
-    spec.devices.is_vsock_enabled = true;
-    spec.devices.net = Some(NetSpec {
-        tap: tap.clone(),
-        guest_mac: Some(lease.guest_mac()),
-    });
-    spec.cpu.vcpus = shape.vcpus;
-    spec.memory.mib = shape.mem_mib;
-    spec.memory.hotplug_mib = crate::sandbox::hotplug_region(
-        backend.hypervisor(),
-        burrow_vmm::GuestOs::Linux,
-        shape.mem_mib,
-        shape.max_mem_mib,
+    let spec = crate::spec::profile(
+        config,
+        &crate::spec::Guest {
+            id: vm_id,
+            workdir: dir,
+            hypervisor,
+            guest_os: burrow_vmm::GuestOs::Linux,
+            lease: &lease,
+            tap: &tap,
+        },
+        shape,
     );
-    spec.restore.memory.record_prefetch = Some(PREFETCH_PLAN.to_string());
-    apply_confinement(&mut spec, config, shape);
 
     // The profiling guest writes to the disk *after* the snapshot was taken,
     // so a clone restoring that snapshot would find a disk that had moved

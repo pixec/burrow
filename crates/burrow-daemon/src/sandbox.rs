@@ -15,9 +15,7 @@ use burrow_net::ipam::AddressPool;
 use burrow_net::{Ipam, Lease, firewall, tap};
 use burrow_proto::common::v1 as common;
 use burrow_proto::guest::v1::guest_client::GuestClient;
-use burrow_vmm::{
-    DriveSpec, GuestAddr, Hypervisor, HypervisorExt, Layout, MachineSpec, NetSpec, Vm,
-};
+use burrow_vmm::{DriveSpec, GuestAddr, Hypervisor, HypervisorExt, Layout, MachineSpec, Vm};
 
 use crate::guestconn;
 use crate::rootdisk::IMAGE as TEMPLATE_ROOTFS;
@@ -36,7 +34,7 @@ const TEMPLATE_KERNEL: &str = crate::boot::KERNEL;
 /// chroot: a path outside it does not exist as far as the VMM is concerned.
 /// The link shares the inode, so the volume's bytes are not copied and
 /// removing the sandbox's directory does not remove the volume.
-fn volume_image(index: usize) -> String {
+pub(crate) fn volume_image(index: usize) -> String {
     match cfg!(target_os = "macos") {
         true => format!("volume{index}.img"),
         false => format!("volume{index}.ext4"),
@@ -585,7 +583,7 @@ const REASON_MEMORY_DISCARDED: &str = "stopped while suspended, and the guest co
                                        it had not written to its disk is lost";
 
 /// Guest memory when the policy names none.
-const DEFAULT_MEM_MIB: u32 = 512;
+pub(crate) const DEFAULT_MEM_MIB: u32 = 512;
 
 /// `burrowd --memory-hotplug-max-mib`: the most a sandbox's memory grows to
 /// by default, and the most it may ask to.
@@ -710,7 +708,7 @@ const ACTIVATION_STATUS_MAX: usize = 512;
 /// The vCPUs a guest of `vcpus` boots able to take: up to the node's CPU
 /// count where the hypervisor hotplugs them. It costs the guest a few per-CPU
 /// areas for each possible vCPU and the VMM nothing until one is plugged.
-fn max_vcpus(hypervisor: Hypervisor, vcpus: u32) -> u32 {
+pub(crate) fn max_vcpus(hypervisor: Hypervisor, vcpus: u32) -> u32 {
     match hypervisor.capabilities().is_vcpu_hotplug_supported {
         true => std::thread::available_parallelism()
             .map_or(vcpus, |n| n.get() as u32)
@@ -4799,18 +4797,23 @@ impl SandboxManager {
         let environment =
             crate::oci::sandbox_environment(&self.config.data_dir, &workdir, &record.template)
                 .await;
-        let spec = self.build_spec(
-            &row.id,
-            &workdir,
-            hypervisor,
-            guest_os,
-            &resources,
-            &lease,
-            &row.tap,
-            &volumes,
-            environment.booted_systemd(),
-            stored_policy.is_console_verbose,
-            record.is_tpm,
+        let spec = crate::spec::sandbox(
+            &self.config,
+            &crate::spec::Guest {
+                id: &row.id,
+                workdir: &workdir,
+                hypervisor,
+                guest_os,
+                lease: &lease,
+                tap: &row.tap,
+            },
+            &crate::spec::Sandbox {
+                resources: &resources,
+                volumes: &volumes,
+                systemd: environment.booted_systemd(),
+                is_console_verbose: stored_policy.is_console_verbose,
+                is_tpm: record.is_tpm,
+            },
         );
 
         let sandbox = Arc::new(RunningSandbox {
@@ -8600,117 +8603,6 @@ impl SandboxManager {
         out
     }
 
-    /// Builds the VM description for a sandbox.
-    ///
-    /// Shared by creation and recovery: a restored VM has to be described
-    /// with the same resources it was snapshotted with, so the two paths must
-    /// not be able to drift apart.
-    #[allow(clippy::too_many_arguments)]
-    fn build_spec(
-        &self,
-        id: &str,
-        workdir: &Path,
-        hypervisor: Hypervisor,
-        guest_os: burrow_vmm::GuestOs,
-        resources: &common::ResourcePolicy,
-        lease: &Lease,
-        tap_name: &str,
-        volumes: &[common::VolumeMount],
-        systemd: Option<&crate::oci::SystemdBoot>,
-        is_console_verbose: bool,
-        is_tpm: bool,
-    ) -> MachineSpec {
-        let mut spec = MachineSpec::new(id.to_string(), workdir, self.config.backend(hypervisor));
-        spec.guest_os = guest_os;
-        let capabilities = hypervisor.capabilities();
-        spec.cpu.vcpus = resources.vcpus.max(1);
-        if capabilities.is_vcpu_hotplug_supported {
-            spec.cpu.max_vcpus = max_vcpus(hypervisor, spec.cpu.vcpus);
-        }
-        let mem_mib = if resources.mem_mib == 0 {
-            DEFAULT_MEM_MIB
-        } else {
-            resources.mem_mib
-        };
-        // What the VM booted with, which a restore must describe; what has
-        // been plugged since sits in the hotplug region above it.
-        spec.memory.mib = match resources.boot_mem_mib {
-            0 => mem_mib,
-            boot => boot.min(mem_mib),
-        };
-        spec.memory.plugged_mib = mem_mib - spec.memory.mib;
-        spec.memory.hotplug_mib =
-            hotplug_region(hypervisor, guest_os, spec.memory.mib, resources.max_mem_mib);
-
-        spec.limits = cgroup_limits(
-            resources,
-            self.config.memory_ceiling_mib(spec.hypervisor(), mem_mib),
-        );
-        spec.cgroup_root = self.config.cgroup_root.clone();
-        spec.is_limits_required = self.config.is_resource_limits_required;
-        // Only consulted on restore; a cold boot has no memory file to serve.
-        spec.restore.memory.is_lazy =
-            self.config.is_memory_lazy && capabilities.is_lazy_memory_supported;
-        // Required for diff snapshots, and only useful for them. It costs a
-        // little guest write performance, which is a good trade against
-        // writing the whole of memory on every suspend.
-        spec.restore.is_dirty_pages_tracked = true;
-
-        spec.devices.drives = crate::rootdisk::drives();
-        // After the sandbox's own disks, so the guest devices follow them and
-        // match what the handshake tells the agent to mount.
-        for (index, mount) in crate::volume::block_mounts(volumes) {
-            spec.devices.drives.push(DriveSpec {
-                id: crate::volume::drive_id(index, guest_os),
-                path: volume_image(index),
-                is_root: false,
-                is_read_only: mount.is_read_only,
-            });
-        }
-        spec.devices.is_vsock_enabled = true;
-        spec.is_nested_virt_enabled = resources.is_nested_virt_enabled;
-        spec.devices.net = Some(NetSpec {
-            tap: tap_name.to_string(),
-            guest_mac: Some(lease.guest_mac()),
-        });
-        spec.boot = burrow_vmm::Boot::Kernel {
-            kernel: TEMPLATE_KERNEL.into(),
-            cmdline: format!(
-                "{} {} init=/usr/bin/burrow-guest {} burrow.dns={} burrow.ip6={}/{} burrow.ip6gw={} {} {}",
-                burrow_vmm::DEFAULT_BOOT_ARGS,
-                crate::rootdisk::BOOT_ARGS,
-                lease.kernel_ip_arg(&guestconn::hostname(id)),
-                lease.host_ip,
-                lease.guest_ip6(),
-                lease.prefix_len6(),
-                lease.host_ip6(),
-                guest_mode_arg(systemd, hypervisor, false),
-                guest_boot_args(
-                    &self.config.extra_boot_args,
-                    is_console_verbose || self.config.is_console_verbose
-                )
-            ),
-        };
-        if crate::boot::file(guest_os) == crate::boot::FIRMWARE {
-            spec.boot = crate::boot::firmware_boot();
-        }
-        if is_tpm {
-            spec.devices.tpm = Some(self.config.tpm(id, lease.block));
-        }
-        if crate::macnode::is_macos(guest_os)
-            && let Err(err) = crate::macnode::apply(&mut spec, resources)
-        {
-            // Booting the unchanged spec fails with the backend's own
-            // refusal; this says why it got there.
-            tracing::warn!(
-                sandbox = id,
-                err = err.message(),
-                "cannot describe the macOS machine"
-            );
-        }
-        spec
-    }
-
     /// Creates a sandbox, on a task of its own: a caller that gives up does
     /// not stop it half way, holding a lease, a tap and a VMM nothing will
     /// release. The sandbox it makes is registered and reported like any
@@ -9199,18 +9091,23 @@ impl SandboxManager {
             let is_hotplugged = is_warm || (capabilities.is_drive_hotplug_supported && !is_macos);
             let boot_volumes: &[common::VolumeMount] =
                 if is_hotplugged { &[] } else { &policy.volumes };
-            self.build_spec(
-                &id,
-                &workdir,
-                hypervisor,
-                guest_os,
-                &resources,
-                &lease,
-                &tap_name,
-                boot_volumes,
-                environment.booted_systemd(),
-                policy.is_console_verbose,
-                environment.tpm,
+            crate::spec::sandbox(
+                &self.config,
+                &crate::spec::Guest {
+                    id: &id,
+                    workdir: &workdir,
+                    hypervisor,
+                    guest_os,
+                    lease: &lease,
+                    tap: &tap_name,
+                },
+                &crate::spec::Sandbox {
+                    resources: &resources,
+                    volumes: boot_volumes,
+                    systemd: environment.booted_systemd(),
+                    is_console_verbose: policy.is_console_verbose,
+                    is_tpm: environment.tpm,
+                },
             )
         };
 
@@ -10783,21 +10680,26 @@ impl SandboxManager {
             },
             _ => self.image_environment(&source.build()).await,
         };
-        let mut spec = self.build_spec(
-            &id,
-            &workdir,
-            hypervisor,
-            guest_os,
-            &resources,
-            &lease,
-            &tap_name,
-            match is_attached {
-                true => &policy.volumes,
-                false => &[],
+        let mut spec = crate::spec::sandbox(
+            &self.config,
+            &crate::spec::Guest {
+                id: &id,
+                workdir: &workdir,
+                hypervisor,
+                guest_os,
+                lease: &lease,
+                tap: &tap_name,
             },
-            environment.booted_systemd(),
-            policy.is_console_verbose,
-            is_tpm,
+            &crate::spec::Sandbox {
+                resources: &resources,
+                volumes: match is_attached {
+                    true => &policy.volumes,
+                    false => &[],
+                },
+                systemd: environment.booted_systemd(),
+                is_console_verbose: policy.is_console_verbose,
+                is_tpm,
+            },
         );
         // The template's plan names the pages its agent touches on the way to
         // a usable handshake, which is the same code whether the guest was
@@ -11266,18 +11168,23 @@ impl SandboxManager {
                 true => (&[], &policy.volumes),
                 false => (&policy.volumes, &[]),
             };
-        let mut spec = self.build_spec(
-            id,
-            &sandbox.workdir,
-            sandbox.hypervisor,
-            guest_os,
-            &resources,
-            &sandbox.lease,
-            &sandbox.tap,
-            boot_volumes,
-            environment.booted_systemd(),
-            policy.is_console_verbose,
-            record.is_tpm,
+        let mut spec = crate::spec::sandbox(
+            &self.config,
+            &crate::spec::Guest {
+                id,
+                workdir: &sandbox.workdir,
+                hypervisor: sandbox.hypervisor,
+                guest_os,
+                lease: &sandbox.lease,
+                tap: &sandbox.tap,
+            },
+            &crate::spec::Sandbox {
+                resources: &resources,
+                volumes: boot_volumes,
+                systemd: environment.booted_systemd(),
+                is_console_verbose: policy.is_console_verbose,
+                is_tpm: record.is_tpm,
+            },
         );
         let from = self.boundary(&sandbox).await;
         if let Err(err) = self.usernets.attach(id, &sandbox.lease, &mut spec) {
@@ -12824,18 +12731,23 @@ impl SandboxManager {
                     .await);
             }
         };
-        let spec = self.build_spec(
-            &id,
-            &workdir,
-            hypervisor,
-            guest_os,
-            &resources,
-            &lease,
-            &tap_name,
-            &policy.volumes,
-            manifest.is_systemd.then_some(&manifest.image.systemd_boot),
-            policy.is_console_verbose,
-            is_tpm,
+        let spec = crate::spec::sandbox(
+            &self.config,
+            &crate::spec::Guest {
+                id: &id,
+                workdir: &workdir,
+                hypervisor,
+                guest_os,
+                lease: &lease,
+                tap: &tap_name,
+            },
+            &crate::spec::Sandbox {
+                resources: &resources,
+                volumes: &policy.volumes,
+                systemd: manifest.is_systemd.then_some(&manifest.image.systemd_boot),
+                is_console_verbose: policy.is_console_verbose,
+                is_tpm,
+            },
         );
         let record = common::Sandbox {
             id: id.clone(),

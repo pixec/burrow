@@ -38,6 +38,7 @@ mod sandboxproxy;
 mod serve;
 mod share;
 mod snapshot;
+mod spec;
 mod staged;
 mod template;
 mod tpm;
