@@ -20,6 +20,10 @@ use crate::vsock;
 /// binds its own.
 pub const VSOCK_UDS: &str = "vsock.sock";
 
+/// The display device's socket, relative to its VM's working directory
+/// ([`crate::Devices::display`]).
+pub const DISPLAY_UDS: &str = burrow_display::SOCKET;
+
 /// The CID every guest is given: 0 to 2 are reserved, and with a device per
 /// VM there is nothing for two guests to collide over.
 pub const GUEST_CID: u32 = 3;
@@ -86,7 +90,7 @@ pub(crate) async fn clear_stale_sockets(workdir: &Path) -> Result<()> {
     while let Some(entry) = entries.next_entry().await? {
         let name = entry.file_name();
         let Some(name) = name.to_str() else { continue };
-        if name == VSOCK_UDS || name.starts_with(&format!("{VSOCK_UDS}_")) {
+        if name == VSOCK_UDS || name == DISPLAY_UDS || name.starts_with(&format!("{VSOCK_UDS}_")) {
             tokio::fs::remove_file(entry.path()).await?;
         }
     }

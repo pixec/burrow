@@ -51,6 +51,7 @@ impl HypervisorExt for Hypervisor {
                 is_memory_hotplug_supported: true,
                 is_acpi_memory_hotplug_supported: false,
                 is_nested_virt_supported: false,
+                is_display_supported: false,
             },
             // Cloud Hypervisor copies guest memory in at restore, and its
             // own on-demand mode cannot be pointed at burrow's page-fault
@@ -77,6 +78,8 @@ impl HypervisorExt for Hypervisor {
                 is_memory_hotplug_supported: true,
                 is_acpi_memory_hotplug_supported: cfg!(target_arch = "x86_64"),
                 is_nested_virt_supported: cfg!(target_arch = "x86_64"),
+                // Burrow's display device, patched into the node's build.
+                is_display_supported: true,
             },
             // The framework saves a machine as one opaque file, reads it back
             // itself and attaches storage only at configuration time.
@@ -97,6 +100,7 @@ impl HypervisorExt for Hypervisor {
                 is_memory_hotplug_supported: false,
                 is_acpi_memory_hotplug_supported: false,
                 is_nested_virt_supported: false,
+                is_display_supported: false,
             },
         }
     }
@@ -168,6 +172,10 @@ pub struct Capabilities {
     /// KVM itself ([`MachineSpec::is_nested_virt_enabled`]). Firecracker masks
     /// them out of every guest's CPUID.
     pub is_nested_virt_supported: bool,
+    /// The guest can be given a display and input devices
+    /// ([`crate::Devices::display`]), whose frames and input go through
+    /// [`crate::DISPLAY_UDS`] in its working directory.
+    pub is_display_supported: bool,
 }
 
 impl Capabilities {
@@ -185,6 +193,14 @@ impl Capabilities {
         };
         if spec.is_nested_virt_enabled && !self.is_nested_virt_supported {
             return refuse("give a guest nested virtualization");
+        }
+        if let Some(display) = &spec.devices.display {
+            if !self.is_display_supported {
+                return refuse("give a guest a display");
+            }
+            if !burrow_display::is_valid_mode(display.width, display.height) {
+                return refuse("give a guest a display of that size");
+            }
         }
         if let Some(restore) = restore
             && !self.is_lazy_memory_supported

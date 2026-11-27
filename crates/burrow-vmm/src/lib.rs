@@ -43,13 +43,13 @@ pub use cgroup::{Cgroup, Limits, is_io_weight_supported, sweep_empty_cgroups};
 pub use cloud_hypervisor::{ChJail, CloudHypervisorConfig};
 pub use error::{Error, Result};
 pub use firecracker::{FirecrackerConfig, IoEngine, Jail, MemorySource, PageSource};
-pub use guest::{GUEST_CID, GuestAddr, VSOCK_UDS};
+pub use guest::{DISPLAY_UDS, GUEST_CID, GuestAddr, VSOCK_UDS};
 pub use jail::JailLayout;
 use machine::Machine;
 pub use memfile::{data_extents, merge_chain};
 pub use spec::{
-    Backend, Boot, ConsoleSpec, CpuSpec, Devices, DriveSpec, MachineSpec, MemorySpec, NetSpec,
-    RestoreMemory, RestoreSpec, TpmSpec,
+    Backend, Boot, ConsoleSpec, CpuSpec, DISPLAY_OVERHEAD_MIB, Devices, DisplaySpec, DriveSpec,
+    MachineSpec, MemorySpec, NetSpec, RestoreMemory, RestoreSpec, TpmSpec,
 };
 #[cfg(target_os = "macos")]
 pub use vz::{MacOsBoot, Requirements, VzConfig};
@@ -238,6 +238,11 @@ impl Vm {
     /// Where the guest's vsock listeners are reached from the host.
     pub fn guest(&self) -> GuestAddr {
         dispatch!(self, vm => GuestAddr::in_workdir(vm.workdir()))
+    }
+
+    /// The display socket, for a VM with a display.
+    pub fn display(&self) -> Option<std::path::PathBuf> {
+        dispatch!(self, vm => vm.display())
     }
 
     /// Waits for a guest vsock listener to accept, which is the agent's

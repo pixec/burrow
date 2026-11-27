@@ -6,6 +6,7 @@ license.workspace = true
 
 [dependencies]
 burrow-common = { workspace = true }
+burrow-display = { workspace = true }
 tokio = { workspace = true }
 hyper = { workspace = true }
 hyper-util = { workspace = true }

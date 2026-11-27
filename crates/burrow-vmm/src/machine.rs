@@ -26,6 +26,11 @@ pub(crate) trait Machine {
     /// Stops the VMM and reaps it, then releases its cgroup.
     async fn kill(self) -> Result<()>;
 
+    /// The display socket, for a VM given a display.
+    fn display(&self) -> Option<std::path::PathBuf> {
+        None
+    }
+
     /// The VMM process, where this node spawned one.
     fn process(&self) -> Option<&VmmProcess> {
         None

@@ -186,6 +186,13 @@ pub(crate) fn vm_config(
     if let Some(tpm) = &spec.devices.tpm {
         vm["tpm"] = json!({ "socket": crate::swtpm::socket(tpm) });
     }
+    if let Some(display) = &spec.devices.display {
+        vm["display"] = json!({
+            "width": display.width,
+            "height": display.height,
+            "socket": crate::DISPLAY_UDS,
+        });
+    }
     Ok(vm)
 }
 
@@ -246,6 +253,18 @@ pub(crate) fn retarget(snapshot: &mut Value, spec: &MachineSpec) -> Result<()> {
                 if has_tpm { "does not" } else { "asks for one" }
             )));
         }
+    }
+    let has_display = snapshot.get("display").is_some_and(|d| !d.is_null());
+    if has_display != spec.devices.display.is_some() {
+        return Err(Error::Snapshot(format!(
+            "the snapshot's guest {} a display and this VM {}",
+            if has_display { "has" } else { "does not have" },
+            if has_display {
+                "does not"
+            } else {
+                "asks for one"
+            }
+        )));
     }
     for device in ["serial", "console"] {
         if snapshot[device]["mode"] == "File" && snapshot[device]["file"] != CONSOLE_PIPE {
@@ -598,6 +617,41 @@ mod tests {
         assert!(retarget(&mut snapshot.clone(), &windows).is_err());
         let mut plain = vm_config(&windows, &config(), "x86_64").unwrap();
         windows.devices.tpm = Some(tpm("/var/lib/burrow/tpm/sbx_b"));
+        assert!(retarget(&mut plain, &windows).is_err());
+    }
+
+    /// The display listens in the working directory, so a restore in another
+    /// sandbox's directory serves its own, and only a guest that had one is
+    /// given one.
+    #[test]
+    fn a_display_is_relative_and_kept_across_a_restore() {
+        let mut windows = spec();
+        windows.guest_os = GuestOs::Windows;
+        windows.cpu.vcpus = 2;
+        windows.memory.mib = 4096;
+        assert_eq!(
+            vm_config(&windows, &config(), "x86_64")
+                .unwrap()
+                .get("display"),
+            None
+        );
+        windows.devices.display = Some(crate::DisplaySpec {
+            width: 1280,
+            height: 800,
+        });
+        let mut snapshot = vm_config(&windows, &config(), "x86_64").unwrap();
+        assert_eq!(
+            snapshot["display"],
+            json!({ "width": 1280, "height": 800, "socket": "display.sock" })
+        );
+        retarget(&mut snapshot, &windows).unwrap();
+        let mut headless = windows.clone();
+        headless.devices.display = None;
+        assert!(matches!(
+            retarget(&mut snapshot.clone(), &headless),
+            Err(Error::Snapshot(_))
+        ));
+        let mut plain = vm_config(&headless, &config(), "x86_64").unwrap();
         assert!(retarget(&mut plain, &windows).is_err());
     }
 

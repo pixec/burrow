@@ -167,6 +167,21 @@ pub struct Devices {
     /// A TPM 2.0 for the guest, from an swtpm the backend starts and stops
     /// with the VMM. Cloud Hypervisor only.
     pub tpm: Option<TpmSpec>,
+    /// A display with a keyboard and a tablet, where
+    /// [`Capabilities::is_display_supported`].
+    pub display: Option<DisplaySpec>,
+}
+
+/// What a VM with a display may hold in host memory beyond one without: the
+/// frame a subscribed client reads, up to 3840x2160, and the cursor.
+pub const DISPLAY_OVERHEAD_MIB: u32 = 40;
+
+/// The display's preferred mode when the VM boots. A restore keeps the mode
+/// the snapshot holds.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DisplaySpec {
+    pub width: u32,
+    pub height: u32,
 }
 
 /// Where the guest's serial console goes.
@@ -249,6 +264,7 @@ impl MachineSpec {
                 is_vsock_enabled: false,
                 console: ConsoleSpec::Captured,
                 tpm: None,
+                display: None,
             },
             restore: RestoreSpec::default(),
             limits: Limits::default(),

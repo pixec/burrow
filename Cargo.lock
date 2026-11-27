@@ -921,6 +921,7 @@ version = "0.1.0"
 dependencies = [
  "block2",
  "burrow-common",
+ "burrow-display",
  "bytes",
  "dispatch2",
  "http-body-util",

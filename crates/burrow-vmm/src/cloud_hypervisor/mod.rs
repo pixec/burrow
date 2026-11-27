@@ -115,6 +115,7 @@ pub struct ChVm {
     console: Option<crate::console::Capture>,
     /// The guest's TPM emulator, stopped with the VMM.
     tpm: Option<crate::TpmSpec>,
+    is_display_enabled: bool,
     /// The memory the guest booted with, in bytes, which the hotplug region
     /// sits above.
     boot_mem: u64,
@@ -305,6 +306,7 @@ impl ChVm {
             console_in: None,
             console,
             tpm: spec.devices.tpm.clone(),
+            is_display_enabled: spec.devices.display.is_some(),
             boot_mem: u64::from(spec.memory.mib) * 1024 * 1024,
         };
         if let Err(err) = vm.process.wait_for_socket(&socket).await {
@@ -445,6 +447,11 @@ impl Machine for ChVm {
 
     fn workdir(&self) -> &Path {
         &self.workdir
+    }
+
+    fn display(&self) -> Option<std::path::PathBuf> {
+        self.is_display_enabled
+            .then(|| self.workdir.join(crate::DISPLAY_UDS))
     }
 
     fn boot_latency(&self) -> Duration {

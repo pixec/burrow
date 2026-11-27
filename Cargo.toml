@@ -40,6 +40,7 @@ license = "AGPL-3.0-only"
 burrow-proto = { path = "crates/burrow-proto" }
 burrow-common = { path = "crates/burrow-common" }
 burrow-vmm = { path = "crates/burrow-vmm" }
+burrow-display = { path = "crates/burrow-display" }
 burrow-net = { path = "crates/burrow-net" }
 burrow-proxy = { path = "crates/burrow-proxy" }
 burrow-store = { path = "crates/burrow-store" }
