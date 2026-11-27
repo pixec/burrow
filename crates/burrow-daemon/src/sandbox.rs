@@ -314,7 +314,10 @@ impl NodeConfig {
             Hypervisor::Firecracker => {
                 burrow_vmm::Backend::Firecracker(burrow_vmm::FirecrackerConfig {
                     bin: self.firecracker_bin.clone(),
-                    jail: self.jail_for(hypervisor).cloned(),
+                    jail: self
+                        .jail
+                        .clone()
+                        .filter(|_| self.jail_for(hypervisor).is_some()),
                     io_engine: self.firecracker_io_engine,
                     is_huge_page_fill_enabled: self.is_firecracker_huge_page_fill_enabled,
                 })
@@ -333,7 +336,7 @@ impl NodeConfig {
     }
 
     /// The jail a VM under `hypervisor` runs in, where it can run in one.
-    pub(crate) fn jail_for(&self, hypervisor: Hypervisor) -> Option<&burrow_vmm::Jail> {
+    pub(crate) fn jail_for(&self, hypervisor: Hypervisor) -> Option<&burrow_vmm::JailLayout> {
         // Cloud Hypervisor's own confinement is off only where the operator
         // turned it off: see `--unjailed-cloud-hypervisor`.
         let is_jailed = match hypervisor {
@@ -343,6 +346,7 @@ impl NodeConfig {
         };
         self.jail
             .as_ref()
+            .map(|jail| &jail.layout)
             .filter(|_| hypervisor.capabilities().is_jailable && is_jailed)
     }
 
@@ -402,7 +406,7 @@ impl NodeConfig {
     /// is `workdir`: under the jail the one its chroot sits in.
     fn tree_of<'a>(&self, workdir: &'a Path) -> &'a Path {
         match &self.jail {
-            Some(jail) => jail.tree_of(workdir),
+            Some(jail) => jail.layout.tree_of(workdir),
             None => workdir,
         }
     }
@@ -412,7 +416,7 @@ impl NodeConfig {
     /// data directory otherwise.
     pub(crate) fn disk_dir(&self) -> PathBuf {
         match &self.jail {
-            Some(jail) if jail.chroot_base.exists() => jail.chroot_base.clone(),
+            Some(jail) if jail.layout.chroot_base.exists() => jail.layout.chroot_base.clone(),
             _ => self.data_dir.clone(),
         }
     }
@@ -5000,7 +5004,7 @@ impl SandboxManager {
                 .map(|id| sandboxes_root.join(id))
                 .collect::<std::collections::HashSet<_>>(),
         )];
-        if let Some(jail) = &self.config.jail {
+        if let Some(jail) = self.config.jail.as_ref().map(|jail| &jail.layout) {
             for hypervisor in Hypervisor::ALL {
                 roots.push((
                     jail.hypervisor_dir(hypervisor),
@@ -13502,7 +13506,7 @@ pub(crate) fn guest_mode_arg(
 /// life of the volume.
 pub(crate) async fn grant_to_jail(
     workdir: &Path,
-    jail: &burrow_vmm::Jail,
+    jail: &burrow_vmm::JailLayout,
     shared: &std::collections::HashSet<String>,
 ) -> std::io::Result<()> {
     let workdir = workdir.to_path_buf();

@@ -18,6 +18,7 @@ pub mod console;
 mod error;
 mod guest;
 mod http;
+pub mod jail;
 mod process;
 mod snapfile;
 mod vsock;
@@ -37,6 +38,7 @@ pub use cloud_hypervisor::{ChJail, CloudHypervisorConfig};
 pub use error::{Error, Result};
 pub use firecracker::{FirecrackerConfig, IoEngine, Jail, MemorySource, PageSource};
 pub use guest::{GUEST_CID, GuestAddr, VSOCK_UDS};
+pub use jail::JailLayout;
 pub use memfile::{data_extents, merge_chain};
 #[cfg(target_os = "macos")]
 pub use vz::{MacOsBoot, Requirements, VzConfig};

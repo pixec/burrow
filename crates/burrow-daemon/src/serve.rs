@@ -575,9 +575,11 @@ impl ServeArgs {
     fn jail(&self) -> Option<burrow_vmm::Jail> {
         self.jailer.as_ref().map(|jailer| burrow_vmm::Jail {
             jailer: jailer.clone(),
-            uid: self.jail_uid,
-            gid: self.jail_gid,
-            chroot_base: self.chroot_base.clone(),
+            layout: burrow_vmm::JailLayout {
+                uid: self.jail_uid,
+                gid: self.jail_gid,
+                chroot_base: self.chroot_base.clone(),
+            },
         })
     }
 

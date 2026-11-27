@@ -689,7 +689,11 @@ impl MicroVm {
             &self.spec.workdir,
             &uffd::MemoryPlan {
                 chain,
-                owner: self.spec.jail.as_ref().map(|jail| (jail.uid, jail.gid)),
+                owner: self
+                    .spec
+                    .jail
+                    .as_ref()
+                    .map(|jail| (jail.layout.uid, jail.layout.gid)),
                 prefetch: self
                     .spec
                     .prefetch
