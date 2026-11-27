@@ -6157,6 +6157,36 @@ impl SandboxManager {
     }
 
     /// Records how a Windows sandbox activates.
+    /// Offers a sandbox's display `display` in place of its template's
+    /// resolution, and keeps it for the sandbox's next boot.
+    pub async fn set_display(
+        &self,
+        id: &str,
+        display: &common::Display,
+    ) -> Result<common::Sandbox, Status> {
+        use crate::display::FrameSource as _;
+
+        let wanted = crate::oci::Display::from_proto(display)?;
+        let sandbox = self.get(id).await?;
+        if sandbox.base_record.lock().unwrap().display.is_none() {
+            return Err(Status::failed_precondition(format!(
+                "{id}'s template has no display"
+            )));
+        }
+        let socket = sandbox.workdir.join(burrow_vmm::DISPLAY_UDS);
+        let unavailable =
+            |err: std::io::Error| Status::unavailable(format!("{id}'s display: {err}"));
+        crate::display::SocketSource::connect(&socket)
+            .await
+            .map_err(unavailable)?
+            .resize(wanted.width, wanted.height)
+            .await
+            .map_err(unavailable)?;
+        sandbox.base_record.lock().unwrap().display = Some(wanted.to_proto());
+        self.persist(&sandbox).await;
+        Ok(sandbox.record())
+    }
+
     pub async fn set_activation(
         &self,
         id: &str,

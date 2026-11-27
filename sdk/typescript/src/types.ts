@@ -765,6 +765,11 @@ export interface CreateOptions extends CallOptions, HandleOptions {
    */
   activation?: { productKeySecret?: string; kmsHost?: string };
   /**
+   * A resolution for the sandbox's display in place of its template's. Only
+   * for a template with a display.
+   */
+  displayResolution?: DisplayResolution;
+  /**
    * Snapshot id to start from. The sandbox **restores** that state instead of
    * booting, so it arrives with the snapshot's processes and memory, and
    * `template` and `resources` may not disagree with what the snapshot

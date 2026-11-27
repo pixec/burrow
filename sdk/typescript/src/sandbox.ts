@@ -412,6 +412,7 @@ export class Sandbox {
             kmsHost: options.activation.kmsHost ?? "",
           }
         : undefined,
+      displayResolution: options.displayResolution,
     };
   }
 

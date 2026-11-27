@@ -1066,6 +1066,9 @@ message CreateSandboxRequest {
   // Windows guests: activates with the caller's own license, at create and
   // at every boot. The status is on the sandbox's `activation`.
   ActivationRequest activation = 12;
+  // A resolution for the sandbox's display in place of its template's. The
+  // guest is offered it once it is up. Only for a template with a display.
+  burrow.common.v1.Display display_resolution = 13;
 }
 
 message ActivationRequest {

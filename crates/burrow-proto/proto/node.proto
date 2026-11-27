@@ -190,6 +190,8 @@ message NodeCreateRequest {
   // The build to boot, `sha256:<hex>`, resolved by the orchestrator. Empty
   // for a create from a snapshot, which carries its own.
   string build_digest = 13;
+  // A resolution for the display in place of the template's.
+  burrow.common.v1.Display display_resolution = 14;
 }
 
 message NodeActivation {

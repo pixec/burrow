@@ -486,6 +486,7 @@ impl ApiService {
                     credentials: HashMap::new(),
                     is_remote_desktop_enabled: req.is_remote_desktop_enabled,
                     activation,
+                    display_resolution: req.display_resolution,
                 })
                 .await;
             let (mut sandbox, reserved) = answered(created, reserved)?;
@@ -707,6 +708,7 @@ impl ApiService {
                 credentials,
                 is_remote_desktop_enabled: req.is_remote_desktop_enabled,
                 activation,
+                display_resolution: req.display_resolution,
             })
             .await;
         let (mut sandbox, reserved) = answered(created, reserved)?;

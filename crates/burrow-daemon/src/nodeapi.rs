@@ -598,6 +598,9 @@ impl NodeService for NodeApi {
                     "remote desktop and activation are for windows guests",
                 ));
             }
+            if req.display_resolution.is_some() {
+                return Err(Status::failed_precondition("a kit template has no display"));
+            }
             let request = KitCreate {
                 id: req.sandbox_id,
                 build,
@@ -619,6 +622,10 @@ impl NodeService for NodeApi {
         let activation = req.activation;
         if let Some(activation) = &activation {
             validate_activation(activation)?;
+        }
+        let display = req.display_resolution;
+        if let Some(display) = &display {
+            crate::oci::Display::from_proto(display)?;
         }
         let mut sandbox = if req.snapshot.is_empty() {
             self.sandboxes
@@ -668,6 +675,15 @@ impl NodeService for NodeApi {
                 .activation;
             self.sandboxes
                 .activate_in_background(sandbox.id.clone(), activation.product_key);
+        }
+        if let Some(display) = display {
+            match self.sandboxes.set_display(&sandbox.id, &display).await {
+                Ok(record) => sandbox.display = record.display,
+                Err(err) => {
+                    self.delete_failed(&sandbox.id).await;
+                    return Err(err);
+                }
+            }
         }
         if is_remote_desktop_enabled {
             match self.enable_remote_desktop(&sandbox.id).await {

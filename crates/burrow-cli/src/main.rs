@@ -1018,6 +1018,10 @@ struct CreateFlags {
     /// create and at every boot.
     #[arg(long)]
     kms_host: Option<String>,
+    /// A resolution for the sandbox's display in place of its template's,
+    /// as WIDTHxHEIGHT. Only for a template with a display.
+    #[arg(long, value_parser = parse_resolution)]
+    display_resolution: Option<common::Display>,
 }
 
 impl CreateFlags {
@@ -1052,6 +1056,7 @@ impl CreateFlags {
             || self.is_remote_desktop_enabled
             || self.product_key_secret.is_some()
             || self.kms_host.is_some()
+            || self.display_resolution.is_some()
             || self.network.is_stated()
             || self.access.is_stated()
     }
@@ -3644,6 +3649,7 @@ fn create_request(flags: CreateFlags) -> anyhow::Result<api::CreateSandboxReques
         is_remote_desktop_enabled,
         product_key_secret,
         kms_host,
+        display_resolution,
     } = flags;
     let tags = parse_pairs("--tag", &tags)?;
     // A snapshot carries its own template, so nothing is sent unless the
@@ -3714,6 +3720,7 @@ fn create_request(flags: CreateFlags) -> anyhow::Result<api::CreateSandboxReques
                 kms_host: kms_host.unwrap_or_default(),
             }
         }),
+        display_resolution,
     })
 }
 
@@ -7417,6 +7424,7 @@ mod tests {
                 is_remote_desktop_enabled: false,
                 product_key_secret: None,
                 kms_host: None,
+                display_resolution: None,
                 template: None,
                 kit_args: Vec::new(),
                 kit_env: Vec::new(),

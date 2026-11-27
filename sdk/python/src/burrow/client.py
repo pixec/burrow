@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import time
 from datetime import datetime
-from typing import Any, Callable, Dict, Iterator, List, Optional
+from typing import Any, Callable, Dict, Iterator, List, Optional, Tuple
 
 from ._pb import api_pb2, common_pb2
 from ._policy import to_policy
@@ -53,6 +53,7 @@ class Sandboxes:
         remote_desktop: bool = False,
         product_key_secret: str = "",
         kms_host: str = "",
+        display_resolution: Optional[Tuple[int, int]] = None,
         tags: Optional[Dict[str, str]] = None,
         node_labels: Optional[Dict[str, str]] = None,
         public_ips: Optional[List[str]] = None,
@@ -94,6 +95,9 @@ class Sandboxes:
         `remote_desktop` and nowhere else. `product_key_secret` names a stored
         secret holding your own product key and `kms_host` your KMS host,
         activated at create and at every boot; `activation` says how it went.
+
+        `display_resolution` offers the sandbox's display a (width, height) in
+        place of its template's, for a template with a display.
         """
         # A snapshot carries its own template, and one that disagrees is an
         # error, so nothing is sent as if the caller had asked for it. Without
@@ -131,6 +135,8 @@ class Sandboxes:
         if product_key_secret or kms_host:
             request.activation.product_key_secret = product_key_secret
             request.activation.kms_host = kms_host
+        if display_resolution:
+            request.display_resolution.width, request.display_resolution.height = display_resolution
         request.policy.is_console_verbose = verbose_console
         raw = self._transport.unary("CreateSandbox", request, timeout)
         sandbox = Sandbox(self._transport.retain(), _to_sandbox_info(raw), True, auto_resume, env)
