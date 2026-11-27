@@ -33,7 +33,7 @@ use crate::error::{Error, Result};
 use crate::http::UnixHttp;
 use crate::machine::Machine;
 use crate::process::{Output, VmmProcess};
-use crate::{DriveSpec, GuestOs, VSOCK_UDS, VmSpec};
+use crate::{DriveSpec, GuestOs, MachineSpec, VSOCK_UDS};
 
 pub use jail::ChJail;
 
@@ -130,7 +130,7 @@ impl Drop for ChVm {
 }
 
 impl ChVm {
-    pub(crate) async fn boot(spec: VmSpec, config: CloudHypervisorConfig) -> Result<Self> {
+    pub(crate) async fn boot(spec: MachineSpec, config: CloudHypervisorConfig) -> Result<Self> {
         let started = Instant::now();
         let mut vm_config = config::vm_config(&spec, &config, std::env::consts::ARCH)?;
         // A jailed VMM cannot open a tap, so its NICs are added once it
@@ -147,7 +147,7 @@ impl ChVm {
             None => Vec::new(),
         };
         let read_only = jail::absolute_paths(&vm_config);
-        if let Some(tpm) = &spec.tpm {
+        if let Some(tpm) = &spec.devices.tpm {
             crate::swtpm::start(tpm, true).await?;
         }
         let spawned = Self::spawn(&spec, &config, &[], read_only).await;
@@ -158,7 +158,7 @@ impl ChVm {
                 vm.add_net(nic).await?;
             }
             vm.api.put_empty("/api/v1/vm.boot").await?;
-            if spec.is_console_interactive {
+            if spec.devices.console == crate::ConsoleSpec::Interactive {
                 vm.attach_console().await?;
             }
             Ok(())
@@ -179,23 +179,14 @@ impl ChVm {
     }
 
     pub(crate) async fn restore(
-        spec: VmSpec,
+        spec: MachineSpec,
         config: CloudHypervisorConfig,
         resume: bool,
     ) -> Result<Self> {
         let started = Instant::now();
-        // A chain or a base still arriving needs burrow's page-fault handler,
-        // which this VMM cannot be pointed at; the daemon only asks where it
-        // can.
-        if spec.memory_chain.len() > 1 || spec.memory_source.is_some() {
-            return Err(Error::Unsupported {
-                hypervisor: crate::Hypervisor::CloudHypervisor,
-                what: "restore from a memory chain or from memory still arriving",
-            });
-        }
         let (restore_dir, vm_config, last_host_port) = unpack(&spec, config.jail.as_ref()).await?;
         let read_only = jail::absolute_paths(&vm_config);
-        if let Some(tpm) = &spec.tpm {
+        if let Some(tpm) = &spec.devices.tpm {
             crate::swtpm::start(tpm, false).await?;
         }
         let source = jail::vmm_workdir(&spec.workdir, config.jail.as_ref())?.join(RESTORE_DIR);
@@ -214,7 +205,7 @@ impl ChVm {
                 vm.restore_jailed(&source_url, &vm_config).await?;
             }
             vm.wait_until_loaded().await?;
-            if spec.is_console_interactive {
+            if spec.devices.console == crate::ConsoleSpec::Interactive {
                 vm.attach_console().await?;
             }
             if resume {
@@ -251,7 +242,7 @@ impl ChVm {
     /// runs outside its caps. `read_only` are the host files the VM config names
     /// absolutely, which a jail has to bind in.
     async fn spawn(
-        spec: &VmSpec,
+        spec: &MachineSpec,
         config: &CloudHypervisorConfig,
         extra: &[&str],
         read_only: Vec<PathBuf>,
@@ -313,8 +304,8 @@ impl ChVm {
             boot_latency: Duration::ZERO,
             console_in: None,
             console,
-            tpm: spec.tpm.clone(),
-            boot_mem: u64::from(spec.mem_mib) * 1024 * 1024,
+            tpm: spec.devices.tpm.clone(),
+            boot_mem: u64::from(spec.memory.mib) * 1024 * 1024,
         };
         if let Err(err) = vm.process.wait_for_socket(&socket).await {
             vm.stop().await;
@@ -582,8 +573,8 @@ impl Machine for ChVm {
 
 /// Stops the TPM emulator started for a VMM that did not start, and moves
 /// it into the cgroup of one that did.
-async fn without_tpm_on_error(spec: &VmSpec, spawned: Result<ChVm>) -> Result<ChVm> {
-    let Some(tpm) = &spec.tpm else {
+async fn without_tpm_on_error(spec: &MachineSpec, spawned: Result<ChVm>) -> Result<ChVm> {
+    let Some(tpm) = &spec.devices.tpm else {
         return spawned;
     };
     match &spawned {
@@ -605,7 +596,7 @@ async fn without_tpm_on_error(spec: &VmSpec, spawned: Result<ChVm>) -> Result<Ch
 ///
 /// Landlock follows this VMM rather than the one snapshotted: its rules name
 /// the jail's paths, which a VMM run unjailed does not have.
-async fn unpack(spec: &VmSpec, jail: Option<&ChJail>) -> Result<(PathBuf, Value, u32)> {
+async fn unpack(spec: &MachineSpec, jail: Option<&ChJail>) -> Result<(PathBuf, Value, u32)> {
     let packed: Packed =
         serde_json::from_slice(&tokio::fs::read(spec.workdir.join(STATE_FILE)).await?)?;
     let last_host_port = last_host_port(&packed);

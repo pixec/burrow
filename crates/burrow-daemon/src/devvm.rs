@@ -11,8 +11,8 @@ use std::time::Duration;
 use clap::Args;
 
 use burrow_vmm::{
-    Backend, CloudHypervisorConfig, DriveSpec, FirecrackerConfig, Hypervisor, HypervisorExt, Vm,
-    VmSpec,
+    Backend, CloudHypervisorConfig, DriveSpec, FirecrackerConfig, Hypervisor, HypervisorExt,
+    MachineSpec, Vm,
 };
 
 #[derive(Args, Clone)]
@@ -65,13 +65,14 @@ impl VmBootArgs {
         burrow_vmm::GuestOs::Linux.agent_timeout_at_least(Duration::from_secs(self.timeout))
     }
 
-    fn spec(&self, vm_id: impl Into<String>) -> VmSpec {
+    fn spec(&self, vm_id: impl Into<String>) -> MachineSpec {
         let backend = match self.hypervisor {
             Hypervisor::Firecracker => Backend::Firecracker(FirecrackerConfig {
                 bin: self.firecracker.clone(),
                 jail: None,
                 io_engine: Default::default(),
                 is_huge_page_fill_enabled: true,
+                is_pci_enabled: false,
             }),
             Hypervisor::CloudHypervisor => Backend::CloudHypervisor(CloudHypervisorConfig {
                 bin: self.cloud_hypervisor.clone(),
@@ -89,15 +90,15 @@ impl VmBootArgs {
             #[cfg(not(target_os = "macos"))]
             Hypervisor::Vz => unreachable!("vz runs on macOS only"),
         };
-        let mut spec = VmSpec::new(vm_id, &self.workdir, backend);
+        let mut spec = MachineSpec::new(vm_id, &self.workdir, backend);
         // A dev box often has no delegated cgroup, and these runs are not
         // what limits are for.
         spec.cgroup_root = None;
         // `floor` and `snapshot` type into the guest's shell.
-        spec.is_console_interactive = true;
-        spec.vcpus = self.vcpus;
-        spec.mem_mib = self.mem_mib;
-        spec.drives = vec![DriveSpec::root_ro(&self.rootfs)];
+        spec.devices.console = burrow_vmm::ConsoleSpec::Interactive;
+        spec.cpu.vcpus = self.vcpus;
+        spec.memory.mib = self.mem_mib;
+        spec.devices.drives = vec![DriveSpec::root_ro(&self.rootfs)];
         // Squashfs and ext4 roots both come up on /dev/vda as the first drive.
         spec.boot = self.boot(format!(
             "{} root=/dev/vda ro {}",
@@ -223,8 +224,8 @@ fn median(values: &mut [u64]) -> u64 {
 /// and that gRPC rides over it.
 pub async fn agent_boot(args: VmBootArgs) -> anyhow::Result<()> {
     let mut spec = args.spec("agenttest");
-    spec.drives = vec![DriveSpec::root_ro(&args.rootfs)];
-    spec.is_vsock_enabled = true;
+    spec.devices.drives = vec![DriveSpec::root_ro(&args.rootfs)];
+    spec.devices.is_vsock_enabled = true;
     spec.boot = args.boot(format!(
         "{} root=/dev/vda ro init=/usr/bin/burrow-guest {}",
         burrow_vmm::DEFAULT_BOOT_ARGS,
@@ -287,7 +288,7 @@ pub async fn agent_exec(args: VmBootArgs, cmd: Vec<String>) -> anyhow::Result<()
 /// Boots a VM running the agent rootfs and waits for the agent to accept.
 async fn boot_agent_vm(args: &VmBootArgs, id: &str) -> anyhow::Result<Vm> {
     let mut spec = args.spec(id);
-    spec.is_vsock_enabled = true;
+    spec.devices.is_vsock_enabled = true;
     spec.boot = args.boot(format!(
         "{} root=/dev/vda ro init=/usr/bin/burrow-guest {}",
         burrow_vmm::DEFAULT_BOOT_ARGS,
@@ -392,7 +393,7 @@ pub async fn clone_divergence(args: VmBootArgs) -> anyhow::Result<()> {
 
         let mut spec = args.spec(name);
         spec.workdir = dir;
-        spec.is_vsock_enabled = true;
+        spec.devices.is_vsock_enabled = true;
         let vm = Vm::restore(spec, true).await?;
         vm.wait_for_vsock(crate::guestconn::AGENT_PORT, args.agent_timeout())
             .await?;

@@ -11,7 +11,7 @@
 //! A machine boots from [`crate::Boot::MacOs`]: the auxiliary storage its boot
 //! firmware keeps state in, the hardware model it was installed for and the
 //! machine identifier that makes it one particular Mac, with its installed
-//! disk the first of [`crate::VmSpec::drives`]. A template is such a set of
+//! disk the first of [`crate::Devices::drives`]. A template is such a set of
 //! files made by [`install`]; a sandbox's are APFS clones of them made by
 //! [`clone_machine`], which cost no disk until the guest writes.
 //!
@@ -53,7 +53,7 @@ use tokio::task::JoinHandle;
 
 use crate::error::{Error, Result};
 use crate::machine::Machine as _;
-use crate::{Boot, GuestOs, Hypervisor, VSOCK_UDS, VmSpec};
+use crate::{Boot, GuestOs, Hypervisor, MachineSpec, VSOCK_UDS};
 
 pub use install::{InstallSpec, InstalledImage, install, root_drive};
 
@@ -121,7 +121,7 @@ pub fn host_version() -> String {
 /// How this node runs Virtualization.framework guests.
 #[derive(Debug, Clone, Default)]
 pub struct VzConfig {
-    /// Where the guest's NIC leads, when [`VmSpec::net`] asks for one.
+    /// Where the guest's NIC leads, when [`crate::Devices::net`] asks for one.
     pub network: Network,
     /// Passed on a boot, which only the first boot after an install honours.
     /// For the template pipeline; a sandbox boots an already set up disk.
@@ -143,7 +143,7 @@ pub enum Network {
 
 /// A macOS machine's platform identity, the boot source [`install`] makes
 /// and [`clone_machine`] copies. Paths are relative to the VM's working
-/// directory, as every path in a [`VmSpec`] is.
+/// directory, as every path in a [`MachineSpec`] is.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MacOsBoot {
     pub aux: String,
@@ -256,7 +256,7 @@ impl Requirements {
 
 /// The macOS boot `spec` asks for, refused unless it is one this backend can
 /// give a machine of its shape.
-fn macos_boot(spec: &VmSpec) -> Result<&MacOsBoot> {
+fn macos_boot(spec: &MachineSpec) -> Result<&MacOsBoot> {
     let Boot::MacOs(boot) = &spec.boot else {
         return Err(Error::Unsupported {
             hypervisor: Hypervisor::Vz,
@@ -269,7 +269,7 @@ fn macos_boot(spec: &VmSpec) -> Result<&MacOsBoot> {
             what: "run a guest other than macOS",
         });
     }
-    boot.requirements.check(spec.vcpus, spec.mem_mib)?;
+    boot.requirements.check(spec.cpu.vcpus, spec.memory.mib)?;
     Ok(boot)
 }
 
@@ -331,7 +331,7 @@ pub struct VzVm {
 }
 
 impl VzVm {
-    pub(crate) async fn boot(spec: VmSpec, config: VzConfig) -> Result<Self> {
+    pub(crate) async fn boot(spec: MachineSpec, config: VzConfig) -> Result<Self> {
         let started = Instant::now();
         let starting = process::STARTS.lock().await;
         let before = process::services();
@@ -356,7 +356,7 @@ impl VzVm {
     /// Restores the machine from the [`SAVE_FILE`] in its working directory,
     /// which must have been saved from a machine of the same identity and
     /// shape, and whose disk must be as it was when the state was saved.
-    pub(crate) async fn restore(spec: VmSpec, config: VzConfig, resume: bool) -> Result<Self> {
+    pub(crate) async fn restore(spec: MachineSpec, config: VzConfig, resume: bool) -> Result<Self> {
         let started = Instant::now();
         let restoring = process::STARTS.lock().await;
         let before = process::services();
@@ -384,7 +384,7 @@ impl VzVm {
 
     /// Configures the machine `spec` describes on a queue of its own,
     /// stopped, with its vsock bridge listening.
-    async fn create(spec: &VmSpec, config: &VzConfig) -> Result<Self> {
+    async fn create(spec: &MachineSpec, config: &VzConfig) -> Result<Self> {
         let configuration = OnQueue(configuration(spec, config)?);
         let queue = DispatchQueue::new(&format!("burrow.vz.{}", spec.vm_id), None);
         let (tx, rx) = oneshot::channel();
@@ -401,7 +401,7 @@ impl VzVm {
         });
         let vm = rx.await.map_err(|_| dropped())?;
         let machine = Machine(Arc::new(Inner { vm, queue }));
-        let bridge = match spec.is_vsock_enabled {
+        let bridge = match spec.devices.is_vsock_enabled {
             true => Some(machine.serve_vsock(&spec.workdir.join(VSOCK_UDS))?),
             false => None,
         };
@@ -653,7 +653,7 @@ fn disk_attachment(
 /// save and restore. Public for a caller that drives a machine on the main
 /// queue itself, as a window must.
 pub fn configuration(
-    spec: &VmSpec,
+    spec: &MachineSpec,
     node: &VzConfig,
 ) -> Result<Retained<VZVirtualMachineConfiguration>> {
     let boot = macos_boot(spec)?;
@@ -682,11 +682,11 @@ pub fn configuration(
         let config = VZVirtualMachineConfiguration::new();
         config.setPlatform(&platform);
         config.setBootLoader(Some(&VZMacOSBootLoader::new()));
-        config.setCPUCount(spec.vcpus as usize);
-        config.setMemorySize(u64::from(spec.mem_mib) << 20);
+        config.setCPUCount(spec.cpu.vcpus as usize);
+        config.setMemorySize(u64::from(spec.memory.mib) << 20);
 
         let mut disks = Vec::new();
-        for drive in &spec.drives {
+        for drive in &spec.devices.drives {
             let attachment = disk_attachment(&dir.join(&drive.path), drive.is_read_only)?;
             disks.push(
                 VZVirtioBlockDeviceConfiguration::initWithAttachment(
@@ -698,7 +698,7 @@ pub fn configuration(
         }
         config.setStorageDevices(&NSArray::from_retained_slice(&disks));
 
-        if let Some(spec_net) = &spec.net {
+        if let Some(spec_net) = &spec.devices.net {
             let net = VZVirtioNetworkDeviceConfiguration::new();
             match &node.network {
                 Network::Nat => net.setAttachment(Some(&VZNATNetworkDeviceAttachment::new())),
@@ -725,7 +725,7 @@ pub fn configuration(
             config.setNetworkDevices(&NSArray::from_retained_slice(&[net.into_super()]));
         }
 
-        if spec.is_vsock_enabled {
+        if spec.devices.is_vsock_enabled {
             config.setSocketDevices(&NSArray::from_retained_slice(&[
                 VZVirtioSocketDeviceConfiguration::new().into_super(),
             ]));

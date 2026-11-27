@@ -1,4 +1,4 @@
-//! The `VmConfig` Cloud Hypervisor is created with, built from a [`VmSpec`].
+//! The `VmConfig` Cloud Hypervisor is created with, built from a [`MachineSpec`].
 //!
 //! Every path in it is relative and resolved against the VM's working
 //! directory, which is the VMM's own cwd. Cloud Hypervisor writes the config
@@ -8,7 +8,7 @@
 use serde_json::{Value, json};
 
 use crate::error::{Error, Result};
-use crate::{Boot, GUEST_CID, GuestOs, Hypervisor, VSOCK_UDS, VmSpec};
+use crate::{Boot, GUEST_CID, GuestOs, Hypervisor, MachineSpec, VSOCK_UDS};
 
 use super::{CONSOLE_PIPE, CloudHypervisorConfig};
 
@@ -94,7 +94,7 @@ fn firmware(boot: &Boot, config: &CloudHypervisorConfig) -> String {
 
 /// The `vm.create` body for `spec` on `arch`.
 pub(crate) fn vm_config(
-    spec: &VmSpec,
+    spec: &MachineSpec,
     config: &CloudHypervisorConfig,
     arch: &str,
 ) -> Result<Value> {
@@ -112,7 +112,7 @@ pub(crate) fn vm_config(
         // Windows has no virtio-console driver.
         (Boot::Kernel { .. } | Boot::Firmware { .. }, GuestOs::Windows) => {
             let (min_vcpus, min_mem_mib) = GuestOs::Windows.min_machine();
-            if spec.vcpus < min_vcpus || spec.mem_mib < min_mem_mib {
+            if spec.cpu.vcpus < min_vcpus || spec.memory.mib < min_mem_mib {
                 return Err(Error::Unsupported {
                     hypervisor: Hypervisor::CloudHypervisor,
                     what: "boot windows with fewer than 2 vcpus or 4096 MiB",
@@ -137,12 +137,13 @@ pub(crate) fn vm_config(
         }
     };
     let disks: Vec<Value> = spec
+        .devices
         .drives
         .iter()
         .map(|drive| disk(drive, spec.guest_os))
         .collect();
     let mut vm = json!({
-        "cpus": { "boot_vcpus": spec.vcpus, "max_vcpus": spec.max_vcpus.max(spec.vcpus) },
+        "cpus": { "boot_vcpus": spec.cpu.vcpus, "max_vcpus": spec.cpu.max_vcpus.max(spec.cpu.vcpus) },
         "memory": memory(spec),
         "payload": payload,
         // In the order given, which is the order the guest probes and names
@@ -151,7 +152,7 @@ pub(crate) fn vm_config(
         "serial": serial,
         "console": console,
     });
-    if spec.is_console_interactive {
+    if spec.devices.console == crate::ConsoleSpec::Interactive {
         let socket = super::jail::vmm_workdir(&spec.workdir, config.jail.as_ref())?
             .join(super::CONSOLE_SOCK);
         for device in ["serial", "console"] {
@@ -172,17 +173,17 @@ pub(crate) fn vm_config(
     if spec.guest_os == GuestOs::Windows && arch == "x86_64" {
         vm["cpus"]["kvm_hyperv"] = json!(true);
     }
-    if let Some(net) = &spec.net {
+    if let Some(net) = &spec.devices.net {
         let mut nic = nic(&net.tap);
         if let Some(mac) = &net.guest_mac {
             nic["mac"] = json!(mac);
         }
         vm["net"] = json!([nic]);
     }
-    if spec.is_vsock_enabled {
+    if spec.devices.is_vsock_enabled {
         vm["vsock"] = json!({ "id": "vsock", "cid": GUEST_CID, "socket": VSOCK_UDS });
     }
-    if let Some(tpm) = &spec.tpm {
+    if let Some(tpm) = &spec.devices.tpm {
         vm["tpm"] = json!({ "socket": crate::swtpm::socket(tpm) });
     }
     Ok(vm)
@@ -191,14 +192,14 @@ pub(crate) fn vm_config(
 /// Boot memory, and the hotplug region above it when there is one: a
 /// virtio-mem device for Linux, and ACPI DIMM slots for Windows, which has no
 /// virtio-mem driver.
-fn memory(spec: &VmSpec) -> Value {
-    let mut memory = json!({ "size": u64::from(spec.mem_mib) * MIB });
-    if spec.mem_hotplug_mib > 0 {
+fn memory(spec: &MachineSpec) -> Value {
+    let mut memory = json!({ "size": u64::from(spec.memory.mib) * MIB });
+    if spec.memory.hotplug_mib > 0 {
         memory["hotplug_method"] = json!(match spec.guest_os {
             GuestOs::Windows => "Acpi",
             _ => "VirtioMem",
         });
-        memory["hotplug_size"] = json!(u64::from(spec.mem_hotplug_mib) * MIB);
+        memory["hotplug_size"] = json!(u64::from(spec.memory.hotplug_mib) * MIB);
     }
     memory
 }
@@ -211,29 +212,29 @@ fn memory(spec: &VmSpec) -> Value {
 /// restore, so a spec asking for another one is refused here, with both
 /// shapes named, rather than deep inside the VMM. An ACPI hotplug counts
 /// what it added in the recorded memory size, which virtio-mem does not.
-pub(crate) fn retarget(snapshot: &mut Value, spec: &VmSpec) -> Result<()> {
+pub(crate) fn retarget(snapshot: &mut Value, spec: &MachineSpec) -> Result<()> {
     let vcpus = snapshot["cpus"]["boot_vcpus"].as_u64().unwrap_or(0);
     let memory = snapshot["memory"]["size"].as_u64().unwrap_or(0) / MIB;
     let region = snapshot["memory"]["hotplug_size"].as_u64().unwrap_or(0) / MIB;
     let expected = match snapshot["memory"]["hotplug_method"].as_str() {
-        Some("Acpi") => spec.mem_mib + spec.mem_plugged_mib,
-        _ => spec.mem_mib,
+        Some("Acpi") => spec.memory.mib + spec.memory.plugged_mib,
+        _ => spec.memory.mib,
     };
     if (vcpus, memory, region)
         != (
-            u64::from(spec.vcpus),
+            u64::from(spec.cpu.vcpus),
             u64::from(expected),
-            u64::from(spec.mem_hotplug_mib),
+            u64::from(spec.memory.hotplug_mib),
         )
     {
         return Err(Error::Snapshot(format!(
             "the snapshot is of {vcpus} vcpu / {memory} MiB with {region} MiB to plug and this \
              VM is {} vcpu / {expected} MiB with {} MiB to plug",
-            spec.vcpus, spec.mem_hotplug_mib
+            spec.cpu.vcpus, spec.memory.hotplug_mib
         )));
     }
     match (
-        &spec.tpm,
+        &spec.devices.tpm,
         snapshot.get("tpm").is_some_and(|tpm| !tpm.is_null()),
     ) {
         (Some(tpm), true) => snapshot["tpm"]["socket"] = json!(crate::swtpm::socket(tpm)),
@@ -269,7 +270,7 @@ pub(crate) fn retarget(snapshot: &mut Value, spec: &VmSpec) -> Result<()> {
             }
         )));
     }
-    if let (Some(net), Some(nics)) = (&spec.net, snapshot["net"].as_array_mut()) {
+    if let (Some(net), Some(nics)) = (&spec.devices.net, snapshot["net"].as_array_mut()) {
         for nic in nics.iter_mut().filter(|nic| nic["id"] == NET_ID) {
             nic["tap"] = json!(net.tap);
         }
@@ -291,19 +292,19 @@ mod tests {
         }
     }
 
-    fn spec() -> VmSpec {
-        let mut spec = VmSpec::new(
+    fn spec() -> MachineSpec {
+        let mut spec = MachineSpec::new(
             "sbx_1",
             "/var/lib/burrow/sandboxes/sbx_1",
             Backend::CloudHypervisor(config()),
         );
-        spec.vcpus = 2;
-        spec.mem_mib = 1024;
+        spec.cpu.vcpus = 2;
+        spec.memory.mib = 1024;
         spec.boot = Boot::Kernel {
             kernel: "vmlinux".into(),
             cmdline: "console=ttyS0 root=/dev/vda ro".into(),
         };
-        spec.drives = vec![
+        spec.devices.drives = vec![
             DriveSpec::root_ro("rootfs.ext4"),
             DriveSpec::scratch_rw("scratch.ext4"),
             DriveSpec {
@@ -313,11 +314,11 @@ mod tests {
                 is_read_only: true,
             },
         ];
-        spec.net = Some(NetSpec {
+        spec.devices.net = Some(NetSpec {
             tap: "bt7".into(),
             guest_mac: Some("06:00:0a:00:00:1e".into()),
         });
-        spec.is_vsock_enabled = true;
+        spec.devices.is_vsock_enabled = true;
         spec
     }
 
@@ -354,7 +355,7 @@ mod tests {
             json!({ "size": 1024 * MIB })
         );
         let mut grown = spec();
-        grown.mem_hotplug_mib = 15 * 1024;
+        grown.memory.hotplug_mib = 15 * 1024;
         let vm = vm_config(&grown, &config(), "aarch64").unwrap();
         assert_eq!(
             vm["memory"],
@@ -432,7 +433,7 @@ mod tests {
     #[test]
     fn an_interactive_console_listens_where_the_vmm_can_bind() {
         let mut spec = spec();
-        spec.is_console_interactive = true;
+        spec.devices.console = crate::ConsoleSpec::Interactive;
         let arm = vm_config(&spec, &config(), "aarch64").unwrap();
         assert_eq!(arm["serial"]["mode"], "Off");
         assert_eq!(
@@ -454,8 +455,8 @@ mod tests {
     fn windows_boots_firmware_on_the_uart() {
         let mut windows = spec();
         windows.guest_os = GuestOs::Windows;
-        windows.vcpus = 4;
-        windows.mem_mib = 8192;
+        windows.cpu.vcpus = 4;
+        windows.memory.mib = 8192;
         let vm = vm_config(&windows, &config(), "aarch64").unwrap();
         assert_eq!(vm["payload"], json!({ "firmware": DEFAULT_FIRMWARE }));
         assert_eq!(vm["cpus"], json!({ "boot_vcpus": 4, "max_vcpus": 4 }));
@@ -511,13 +512,13 @@ mod tests {
     fn what_it_cannot_run_is_refused_by_name() {
         let mut windows = spec();
         windows.guest_os = GuestOs::Windows;
-        windows.mem_mib = 4095;
+        windows.memory.mib = 4095;
         assert!(matches!(
             vm_config(&windows, &config(), "aarch64"),
             Err(Error::Unsupported { .. })
         ));
-        windows.mem_mib = 4096;
-        windows.vcpus = 1;
+        windows.memory.mib = 4096;
+        windows.cpu.vcpus = 1;
         assert!(vm_config(&windows, &config(), "aarch64").is_err());
         assert!(vm_config(&spec(), &config(), "riscv64").is_err());
     }
@@ -529,13 +530,13 @@ mod tests {
         let mut snapshot = vm_config(&spec(), &config(), "aarch64").unwrap();
         snapshot["net"][0]["tap"] = json!("btwarm");
         let mut mine = spec();
-        mine.net.as_mut().unwrap().tap = "bt12".into();
+        mine.devices.net.as_mut().unwrap().tap = "bt12".into();
         retarget(&mut snapshot, &mine).unwrap();
         assert_eq!(snapshot["net"][0]["tap"], "bt12");
         // The guest keeps the MAC it was snapshotted with.
         assert_eq!(snapshot["net"][0]["mac"], "06:00:0a:00:00:1e");
 
-        mine.mem_mib = 2048;
+        mine.memory.mib = 2048;
         assert!(matches!(
             retarget(&mut snapshot, &mine),
             Err(Error::Snapshot(_))
@@ -560,15 +561,15 @@ mod tests {
     fn windows_memory_plugs_over_acpi() {
         let mut windows = spec();
         windows.guest_os = GuestOs::Windows;
-        windows.vcpus = 2;
-        windows.mem_mib = 4096;
-        windows.mem_hotplug_mib = 4096;
+        windows.cpu.vcpus = 2;
+        windows.memory.mib = 4096;
+        windows.memory.hotplug_mib = 4096;
         let mut snapshot = vm_config(&windows, &config(), "x86_64").unwrap();
         assert_eq!(snapshot["memory"]["hotplug_method"], "Acpi");
         assert_eq!(snapshot["memory"]["hotplug_size"], 4096 * MIB);
         snapshot["memory"]["size"] = json!(6144 * MIB);
         assert!(retarget(&mut snapshot.clone(), &windows).is_err());
-        windows.mem_plugged_mib = 2048;
+        windows.memory.plugged_mib = 2048;
         retarget(&mut snapshot, &windows).unwrap();
     }
 
@@ -583,20 +584,20 @@ mod tests {
         };
         let mut windows = spec();
         windows.guest_os = GuestOs::Windows;
-        windows.vcpus = 2;
-        windows.mem_mib = 4096;
-        windows.tpm = Some(tpm("/var/lib/burrow/tpm/sbx_a"));
+        windows.cpu.vcpus = 2;
+        windows.memory.mib = 4096;
+        windows.devices.tpm = Some(tpm("/var/lib/burrow/tpm/sbx_a"));
         let mut snapshot = vm_config(&windows, &config(), "x86_64").unwrap();
-        windows.tpm = Some(tpm("/var/lib/burrow/tpm/sbx_b"));
+        windows.devices.tpm = Some(tpm("/var/lib/burrow/tpm/sbx_b"));
         retarget(&mut snapshot, &windows).unwrap();
         assert_eq!(
             snapshot["tpm"]["socket"],
             "/var/lib/burrow/tpm/sbx_b/swtpm.sock"
         );
-        windows.tpm = None;
+        windows.devices.tpm = None;
         assert!(retarget(&mut snapshot.clone(), &windows).is_err());
         let mut plain = vm_config(&windows, &config(), "x86_64").unwrap();
-        windows.tpm = Some(tpm("/var/lib/burrow/tpm/sbx_b"));
+        windows.devices.tpm = Some(tpm("/var/lib/burrow/tpm/sbx_b"));
         assert!(retarget(&mut plain, &windows).is_err());
     }
 
@@ -605,9 +606,9 @@ mod tests {
     fn a_tpm_socket_is_named_by_its_path() {
         let mut windows = spec();
         windows.guest_os = GuestOs::Windows;
-        windows.vcpus = 2;
-        windows.mem_mib = 4096;
-        windows.tpm = Some(crate::TpmSpec {
+        windows.cpu.vcpus = 2;
+        windows.memory.mib = 4096;
+        windows.devices.tpm = Some(crate::TpmSpec {
             swtpm: "swtpm".into(),
             dir: "/var/lib/burrow/tpm/sbx_a".into(),
             uid: 300_000,

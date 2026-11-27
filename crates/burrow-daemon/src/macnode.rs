@@ -16,7 +16,7 @@ use std::path::Path;
 
 use burrow_proto::api::v1 as api;
 use burrow_proto::common::v1 as common;
-use burrow_vmm::{GuestOs, VmSpec};
+use burrow_vmm::{GuestOs, MachineSpec};
 use tonic::Status;
 
 /// Whether `guest_os` is a macOS guest, which only a Mac build can name.
@@ -91,36 +91,37 @@ pub async fn prepare(template_dir: &Path, workdir: &Path, root_pem: &str) -> std
 /// source and disk, the resources asked for or the installed macOS's
 /// minimums, and vsock for the agent.
 #[allow(clippy::result_large_err)]
-pub fn apply(spec: &mut VmSpec, resources: &common::ResourcePolicy) -> Result<(), Status> {
+pub fn apply(spec: &mut MachineSpec, resources: &common::ResourcePolicy) -> Result<(), Status> {
     #[cfg(target_os = "macos")]
     {
         let boot = burrow_vmm::MacOsBoot::read(&spec.workdir)
             .map_err(|err| Status::failed_precondition(format!("macOS machine: {err}")))?;
-        spec.vcpus = match resources.vcpus {
+        spec.cpu.vcpus = match resources.vcpus {
             0 => boot.requirements.min_vcpus,
             vcpus => vcpus,
         };
-        spec.mem_mib = match resources.mem_mib {
+        spec.memory.mib = match resources.mem_mib {
             0 => boot.requirements.min_mem_mib,
             mem_mib => mem_mib,
         };
         boot.requirements
-            .check(spec.vcpus, spec.mem_mib)
+            .check(spec.cpu.vcpus, spec.memory.mib)
             .map_err(|err| Status::invalid_argument(err.to_string()))?;
         spec.boot = burrow_vmm::Boot::MacOs(boot);
         // The clone's disk in place of the Linux root and scratch; volumes
         // stay, after it.
         let volumes: Vec<_> = spec
+            .devices
             .drives
             .drain(..)
             .filter(|drive| drive.id.starts_with(burrow_vmm::vz::VOLUME_DISK_PREFIX))
             .collect();
-        spec.drives = std::iter::once(burrow_vmm::vz::root_drive())
+        spec.devices.drives = std::iter::once(burrow_vmm::vz::root_drive())
             .chain(volumes)
             .collect();
         // The lease's NIC stays, its tap name unused: the guest's link is the
         // socket pair `UserNets::attach` gives it.
-        spec.is_vsock_enabled = true;
+        spec.devices.is_vsock_enabled = true;
         spec.cgroup_root = None;
         Ok(())
     }
@@ -670,7 +671,7 @@ async fn first_boot(
             b[0], b[1], b[2], b[3], b[4]
         )
     };
-    let mut spec = VmSpec::new(
+    let mut spec = MachineSpec::new(
         format!("template-{name}"),
         dir,
         burrow_vmm::Backend::Vz(burrow_vmm::VzConfig {
@@ -685,15 +686,15 @@ async fn first_boot(
         }),
     );
     spec.guest_os = GuestOs::MacOs;
-    spec.vcpus = vcpus;
-    spec.mem_mib = mem_mib;
+    spec.cpu.vcpus = vcpus;
+    spec.memory.mib = mem_mib;
     spec.boot = burrow_vmm::Boot::MacOs(boot);
-    spec.drives = vec![burrow_vmm::vz::root_drive()];
-    spec.net = Some(burrow_vmm::NetSpec {
+    spec.devices.drives = vec![burrow_vmm::vz::root_drive()];
+    spec.devices.net = Some(burrow_vmm::NetSpec {
         tap: String::new(),
         guest_mac: Some(mac.clone()),
     });
-    spec.is_vsock_enabled = true;
+    spec.devices.is_vsock_enabled = true;
     spec.cgroup_root = None;
     // The installer's machine holds the auxiliary storage until the framework
     // has freed it, a moment after the install returns.
@@ -1726,7 +1727,7 @@ impl UserNets {
         &self,
         sandbox_id: &str,
         lease: &burrow_net::ipam::Lease,
-        spec: &mut VmSpec,
+        spec: &mut MachineSpec,
     ) -> Result<(), Status> {
         #[cfg(target_os = "macos")]
         {
@@ -1734,7 +1735,7 @@ impl UserNets {
             let burrow_vmm::Backend::Vz(config) = &mut spec.backend else {
                 return Ok(());
             };
-            if spec.net.is_none() {
+            if spec.devices.net.is_none() {
                 return Ok(());
             }
             let mut inner = self.inner.lock().unwrap();

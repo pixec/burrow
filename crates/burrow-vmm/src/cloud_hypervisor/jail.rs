@@ -3,7 +3,7 @@
 //! burrowd runs itself again as a short helper ([`HELPER_ARG`]), which builds
 //! the jail and execs the VMM inside it:
 //!
-//! - started inside the VM's cgroup, cloned into it (see [`crate::child`]),
+//! - started inside the VM's cgroup, cloned into it with `clone3`,
 //!   so the VMM it forks is counted and capped from its first instruction;
 //! - new mount, IPC, PID and network namespaces. The VMM is PID 1 of its own
 //!   and sees no other process; its NIC is a tap descriptor burrowd opened and

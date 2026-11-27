@@ -44,7 +44,7 @@ mod macos {
     use std::time::Instant;
 
     use burrow_vmm::vz::{self, VzConfig};
-    use burrow_vmm::{Backend, Boot, GuestOs, Layout, NetSpec, Vm, VmSpec};
+    use burrow_vmm::{Backend, Boot, GuestOs, Layout, MachineSpec, NetSpec, Vm};
     use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
     use tokio::net::UnixListener;
 
@@ -112,23 +112,23 @@ mod macos {
         cpus: Option<u32>,
         mem_mib: Option<u32>,
         mac: Option<String>,
-    ) -> Result<VmSpec> {
+    ) -> Result<MachineSpec> {
         let boot = vz::MacOsBoot::read(Path::new(dir))?;
-        let mut spec = VmSpec::new(
+        let mut spec = MachineSpec::new(
             dir.rsplit('/').next().unwrap_or(dir),
             dir,
             Backend::Vz(node),
         );
         spec.guest_os = GuestOs::MacOs;
-        spec.vcpus = cpus.unwrap_or(boot.requirements.min_vcpus);
-        spec.mem_mib = mem_mib.unwrap_or(boot.requirements.min_mem_mib);
+        spec.cpu.vcpus = cpus.unwrap_or(boot.requirements.min_vcpus);
+        spec.memory.mib = mem_mib.unwrap_or(boot.requirements.min_mem_mib);
         spec.boot = Boot::MacOs(boot);
-        spec.drives = vec![vz::root_drive()];
-        spec.net = Some(NetSpec {
+        spec.devices.drives = vec![vz::root_drive()];
+        spec.devices.net = Some(NetSpec {
             tap: String::new(),
             guest_mac: Some(mac.map_or_else(|| derived_mac(dir), Ok)?),
         });
-        spec.is_vsock_enabled = true;
+        spec.devices.is_vsock_enabled = true;
         Ok(spec)
     }
 
@@ -250,14 +250,15 @@ mod macos {
         Ok(())
     }
 
-    async fn run(spec: VmSpec) -> Result<()> {
+    async fn run(spec: MachineSpec) -> Result<()> {
         let layout: Layout = spec.layout();
         let save = spec.workdir.join(layout.state);
         println!(
             "{} vCPUs, {} MiB, mac {}",
-            spec.vcpus,
-            spec.mem_mib,
-            spec.net
+            spec.cpu.vcpus,
+            spec.memory.mib,
+            spec.devices
+                .net
                 .as_ref()
                 .and_then(|n| n.guest_mac.as_deref())
                 .unwrap_or("random")
@@ -353,11 +354,11 @@ mod macos {
         use objc2_foundation::{NSError, NSPoint, NSRect, NSSize, NSString};
         use objc2_virtualization::{VZVirtualMachine, VZVirtualMachineState, VZVirtualMachineView};
 
-        use burrow_vmm::{Backend, VmSpec, vz};
+        use burrow_vmm::{Backend, MachineSpec, vz};
 
         use super::Result;
 
-        pub fn run(spec: &VmSpec) -> Result<()> {
+        pub fn run(spec: &MachineSpec) -> Result<()> {
             let Backend::Vz(node) = &spec.backend else {
                 return Err("not a vz spec".into());
             };

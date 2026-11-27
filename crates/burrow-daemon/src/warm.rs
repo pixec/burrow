@@ -33,7 +33,7 @@ use std::path::{Path, PathBuf};
 use tonic::Status;
 
 use burrow_proto::common::v1 as common;
-use burrow_vmm::{Hypervisor, HypervisorExt, NetSpec, Vm, VmSpec};
+use burrow_vmm::{Hypervisor, HypervisorExt, MachineSpec, NetSpec, Vm};
 
 use crate::rootdisk::{IMAGE, ROOT_DISK};
 use crate::sandbox::NodeConfig;
@@ -855,20 +855,17 @@ pub async fn build_warm_snapshot(
         .await
         .map_err(|err| Status::internal(format!("warm tap: {err}")))?;
 
-    let mut spec = VmSpec::new(vm_id.clone(), &run_dir, backend.clone());
+    let mut spec = MachineSpec::new(vm_id.clone(), &run_dir, backend.clone());
     spec.guest_os = guest_os;
-    // Taken under the transport it will be restored under: a snapshot does not
-    // cross between PCI and MMIO.
-    spec.is_pci_enabled = true;
     // Baked into the snapshot: a restore takes its machine configuration from
     // here, not from what a later caller asks for.
-    spec.vcpus = shape.vcpus;
-    spec.mem_mib = shape.mem_mib;
-    spec.mem_hotplug_mib =
+    spec.cpu.vcpus = shape.vcpus;
+    spec.memory.mib = shape.mem_mib;
+    spec.memory.hotplug_mib =
         crate::sandbox::hotplug_region(hypervisor, guest_os, shape.mem_mib, shape.max_mem_mib);
-    spec.drives = crate::rootdisk::drives();
-    spec.is_vsock_enabled = true;
-    spec.net = Some(NetSpec {
+    spec.devices.drives = crate::rootdisk::drives();
+    spec.devices.is_vsock_enabled = true;
+    spec.devices.net = Some(NetSpec {
         tap: tap.clone(),
         guest_mac: Some(lease.guest_mac()),
     });
@@ -892,7 +889,7 @@ pub async fn build_warm_snapshot(
     if let Some(tpm) = &tpm {
         let _ = tokio::fs::remove_dir_all(&tpm.dir).await;
     }
-    spec.tpm = tpm.clone();
+    spec.devices.tpm = tpm.clone();
     apply_confinement(&mut spec, config, shape);
 
     let outcome = match cold_boots.admit(&vm_id).await {
@@ -1044,7 +1041,7 @@ pub async fn build_warm_snapshot(
 /// Kept beside the two specs that need it rather than derived from a sandbox's,
 /// because a warm VM has no policy and no lease to build one from; what it
 /// shares with a sandbox is exactly the confinement, and that is what is copied.
-fn apply_confinement(spec: &mut VmSpec, config: &NodeConfig, shape: Shape) {
+fn apply_confinement(spec: &mut MachineSpec, config: &NodeConfig, shape: Shape) {
     spec.cgroup_root = config.cgroup_root.clone();
     spec.is_limits_required = config.is_resource_limits_required;
     spec.limits = crate::sandbox::cgroup_limits(
@@ -1219,23 +1216,22 @@ async fn profile_restore(
     // The build's own id, not one of its own: under the jailer the chroot is
     // derived from the id, and this VM restores the files that are inside the
     // one the build already filled.
-    let mut spec = VmSpec::new(vm_id.to_string(), dir, backend.clone());
-    spec.is_pci_enabled = true;
-    spec.drives = crate::rootdisk::drives();
-    spec.is_vsock_enabled = true;
-    spec.net = Some(NetSpec {
+    let mut spec = MachineSpec::new(vm_id.to_string(), dir, backend.clone());
+    spec.devices.drives = crate::rootdisk::drives();
+    spec.devices.is_vsock_enabled = true;
+    spec.devices.net = Some(NetSpec {
         tap: tap.clone(),
         guest_mac: Some(lease.guest_mac()),
     });
-    spec.vcpus = shape.vcpus;
-    spec.mem_mib = shape.mem_mib;
-    spec.mem_hotplug_mib = crate::sandbox::hotplug_region(
+    spec.cpu.vcpus = shape.vcpus;
+    spec.memory.mib = shape.mem_mib;
+    spec.memory.hotplug_mib = crate::sandbox::hotplug_region(
         backend.hypervisor(),
         burrow_vmm::GuestOs::Linux,
         shape.mem_mib,
         shape.max_mem_mib,
     );
-    spec.record_prefetch = Some(PREFETCH_PLAN.to_string());
+    spec.restore.memory.record_prefetch = Some(PREFETCH_PLAN.to_string());
     apply_confinement(&mut spec, config, shape);
 
     // The profiling guest writes to the disk *after* the snapshot was taken,
@@ -1308,7 +1304,7 @@ where
 
 #[allow(clippy::too_many_arguments)]
 async fn snapshot_when_ready(
-    spec: VmSpec,
+    spec: MachineSpec,
     cold_boot: crate::coldboot::ColdBoot,
     agent_timeout: std::time::Duration,
     lease: &burrow_net::ipam::Lease,

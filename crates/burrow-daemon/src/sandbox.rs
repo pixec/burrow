@@ -15,7 +15,9 @@ use burrow_net::ipam::AddressPool;
 use burrow_net::{Ipam, Lease, firewall, tap};
 use burrow_proto::common::v1 as common;
 use burrow_proto::guest::v1::guest_client::GuestClient;
-use burrow_vmm::{DriveSpec, GuestAddr, Hypervisor, HypervisorExt, Layout, NetSpec, Vm, VmSpec};
+use burrow_vmm::{
+    DriveSpec, GuestAddr, Hypervisor, HypervisorExt, Layout, MachineSpec, NetSpec, Vm,
+};
 
 use crate::guestconn;
 use crate::rootdisk::IMAGE as TEMPLATE_ROOTFS;
@@ -320,6 +322,12 @@ impl NodeConfig {
                         .filter(|_| self.jail_for(hypervisor).is_some()),
                     io_engine: self.firecracker_io_engine,
                     is_huge_page_fill_enabled: self.is_firecracker_huge_page_fill_enabled,
+                    // Volumes are hotplugged onto sandboxes restored from a
+                    // warm snapshot, and hotplug needs PCI. Set for every VM
+                    // rather than only those with volumes, because a snapshot
+                    // cannot be restored under a different transport than it
+                    // was taken with, and warm snapshots are shared.
+                    is_pci_enabled: true,
                 })
             }
             Hypervisor::CloudHypervisor => {
@@ -1752,7 +1760,7 @@ pub struct RunningSandbox {
     /// Kept so a suspended sandbox can be restored with byte-identical
     /// resource paths, which a restore requires. Replaced by a boot from a
     /// stop, which describes the drives afresh.
-    spec: std::sync::Mutex<VmSpec>,
+    spec: std::sync::Mutex<MachineSpec>,
     /// A live channel to this sandbox's agent.
     ///
     /// Reused across calls: a vsock connect plus an HTTP/2 handshake into a
@@ -1924,6 +1932,7 @@ impl RunningSandbox {
         self.spec
             .lock()
             .unwrap()
+            .devices
             .tpm
             .as_ref()
             .map(|tpm| tpm.dir.clone())
@@ -1987,6 +1996,7 @@ impl RunningSandbox {
     fn snapshot_files(&self, memory: Option<&str>) -> Vec<String> {
         let spec = self.spec.lock().unwrap();
         let drives: Vec<String> = spec
+            .devices
             .drives
             .iter()
             .filter(|drive| !drive.is_read_only)
@@ -2002,6 +2012,7 @@ impl RunningSandbox {
         self.spec
             .lock()
             .unwrap()
+            .devices
             .drives
             .iter()
             .filter(|drive| !drive.is_read_only && !crate::volume::is_volume_drive(&drive.id))
@@ -2025,7 +2036,7 @@ impl RunningSandbox {
         let (max_vcpus, cpu_floor_millis) = {
             let spec = self.spec.lock().unwrap();
             (
-                spec.max_vcpus,
+                spec.cpu.max_vcpus,
                 spec.limits
                     .cpu_max_millis
                     .max(spec.limits.cpu_reserve_millis),
@@ -2045,7 +2056,7 @@ impl RunningSandbox {
     }
 
     pub fn vcpus(&self) -> u32 {
-        self.spec.lock().unwrap().vcpus
+        self.spec.lock().unwrap().cpu.vcpus
     }
 
     /// Host CPU this node is charged for the sandbox, in thousandths of a
@@ -2053,7 +2064,7 @@ impl RunningSandbox {
     pub fn cpu_charge_millis(&self) -> u64 {
         let spec = self.spec.lock().unwrap();
         burrow_common::cpu::charge_millis(
-            spec.vcpus,
+            spec.cpu.vcpus,
             spec.limits.cpu_max_millis,
             spec.limits.cpu_reserve_millis,
         )
@@ -2064,13 +2075,13 @@ impl RunningSandbox {
     /// what has been plugged since.
     pub fn mem_mib(&self) -> u32 {
         let spec = self.spec.lock().unwrap();
-        spec.mem_mib + spec.mem_plugged_mib
+        spec.memory.mib + spec.memory.plugged_mib
     }
 
     /// What the VM booted with, the floor a running guest's memory shrinks
     /// to.
     pub fn boot_mem_mib(&self) -> u32 {
-        self.spec.lock().unwrap().mem_mib
+        self.spec.lock().unwrap().memory.mib
     }
 
     /// What the memory may grow to while the VM runs.
@@ -2548,13 +2559,13 @@ impl RunningSandbox {
         }
 
         let mut spec = self.spec.lock().unwrap().clone();
-        spec.memory_chain = self.memory_chain.lock().await.clone();
+        spec.restore.memory.chain = self.memory_chain.lock().await.clone();
         // Without the page-fault handler a base still arriving cannot be
         // served as the guest asks for it, so it has to be all here first.
         if !self.hypervisor.capabilities().is_lazy_memory_supported {
             self.durable.settle_memory().await;
         }
-        spec.memory_source = self.durable.arriving().map(|h| burrow_vmm::MemorySource(h));
+        spec.restore.memory.source = self.durable.arriving().map(|h| burrow_vmm::MemorySource(h));
         record_working_set(&mut spec, is_stored);
         let limits = spec.limits.clone();
         phases.mark("spec");
@@ -2706,7 +2717,7 @@ impl RunningSandbox {
     #[tracing::instrument(skip_all, fields(sandbox = %self.id()))]
     async fn boot(
         &self,
-        spec: VmSpec,
+        spec: MachineSpec,
         request: burrow_proto::guest::v1::HandshakeRequest,
         agent_timeout: std::time::Duration,
         upgrade: Option<&guestconn::GuestUpgrade>,
@@ -2988,7 +2999,7 @@ impl RunningSandbox {
             None => Err(Status::internal("the sandbox's TPM has no directory")),
         };
         let mut spec = self.spec.lock().unwrap().clone();
-        spec.memory_chain = self.memory_chain.lock().await.clone();
+        spec.restore.memory.chain = self.memory_chain.lock().await.clone();
         let limits = spec.limits.clone();
         let restored = Vm::restore(spec, true).await;
         let paused_for = paused.elapsed();
@@ -6881,7 +6892,7 @@ impl SandboxManager {
                     Ok(()) => match slot.as_ref() {
                         None => outcome(ResourceChange::NextBoot, current_vcpus, want),
                         Some(vm) => {
-                            let max_vcpus = sandbox.spec.lock().unwrap().max_vcpus;
+                            let max_vcpus = sandbox.spec.lock().unwrap().cpu.max_vcpus;
                             if !sandbox.hypervisor.capabilities().is_vcpu_hotplug_supported {
                                 refuse(
                                     &format!(
@@ -6967,12 +6978,12 @@ impl SandboxManager {
             {
                 let mut spec = sandbox.spec.lock().unwrap();
                 if let Some(n) = new_vcpus {
-                    spec.vcpus = n;
+                    spec.cpu.vcpus = n;
                 }
                 if let Some(mib) = new_mem {
                     match slot.is_some() {
-                        true => spec.mem_plugged_mib = mib - spec.mem_mib,
-                        false => (spec.mem_mib, spec.mem_plugged_mib) = (mib, 0),
+                        true => spec.memory.plugged_mib = mib - spec.memory.mib,
+                        false => (spec.memory.mib, spec.memory.plugged_mib) = (mib, 0),
                     }
                     spec.limits.memory_mib = self.config.memory_ceiling_mib(spec.hypervisor(), mib);
                 }
@@ -7020,7 +7031,7 @@ impl SandboxManager {
         let current = sandbox.mem_mib();
         let boot = sandbox.boot_mem_mib();
         let max = sandbox.max_mem_mib();
-        let region = sandbox.spec.lock().unwrap().mem_hotplug_mib;
+        let region = sandbox.spec.lock().unwrap().memory.hotplug_mib;
         let refuse = |reason: String| ResourceOutcome {
             change: ResourceChange::Refused as i32,
             previous: current,
@@ -8608,13 +8619,13 @@ impl SandboxManager {
         systemd: Option<&crate::oci::SystemdBoot>,
         is_console_verbose: bool,
         is_tpm: bool,
-    ) -> VmSpec {
-        let mut spec = VmSpec::new(id.to_string(), workdir, self.config.backend(hypervisor));
+    ) -> MachineSpec {
+        let mut spec = MachineSpec::new(id.to_string(), workdir, self.config.backend(hypervisor));
         spec.guest_os = guest_os;
         let capabilities = hypervisor.capabilities();
-        spec.vcpus = resources.vcpus.max(1);
+        spec.cpu.vcpus = resources.vcpus.max(1);
         if capabilities.is_vcpu_hotplug_supported {
-            spec.max_vcpus = max_vcpus(hypervisor, spec.vcpus);
+            spec.cpu.max_vcpus = max_vcpus(hypervisor, spec.cpu.vcpus);
         }
         let mem_mib = if resources.mem_mib == 0 {
             DEFAULT_MEM_MIB
@@ -8623,13 +8634,13 @@ impl SandboxManager {
         };
         // What the VM booted with, which a restore must describe; what has
         // been plugged since sits in the hotplug region above it.
-        spec.mem_mib = match resources.boot_mem_mib {
+        spec.memory.mib = match resources.boot_mem_mib {
             0 => mem_mib,
             boot => boot.min(mem_mib),
         };
-        spec.mem_plugged_mib = mem_mib - spec.mem_mib;
-        spec.mem_hotplug_mib =
-            hotplug_region(hypervisor, guest_os, spec.mem_mib, resources.max_mem_mib);
+        spec.memory.plugged_mib = mem_mib - spec.memory.mib;
+        spec.memory.hotplug_mib =
+            hotplug_region(hypervisor, guest_os, spec.memory.mib, resources.max_mem_mib);
 
         spec.limits = cgroup_limits(
             resources,
@@ -8638,31 +8649,27 @@ impl SandboxManager {
         spec.cgroup_root = self.config.cgroup_root.clone();
         spec.is_limits_required = self.config.is_resource_limits_required;
         // Only consulted on restore; a cold boot has no memory file to serve.
-        spec.is_memory_lazy = self.config.is_memory_lazy && capabilities.is_lazy_memory_supported;
+        spec.restore.memory.is_lazy =
+            self.config.is_memory_lazy && capabilities.is_lazy_memory_supported;
         // Required for diff snapshots, and only useful for them. It costs a
         // little guest write performance, which is a good trade against
         // writing the whole of memory on every suspend.
-        spec.is_dirty_pages_tracked = true;
-        // Volumes are hotplugged onto sandboxes restored from a warm snapshot,
-        // and hotplug needs PCI. Set for every VM rather than only those with
-        // volumes, because a snapshot cannot be restored under a different
-        // transport than it was taken with, and warm snapshots are shared.
-        spec.is_pci_enabled = true;
+        spec.restore.is_dirty_pages_tracked = true;
 
-        spec.drives = crate::rootdisk::drives();
+        spec.devices.drives = crate::rootdisk::drives();
         // After the sandbox's own disks, so the guest devices follow them and
         // match what the handshake tells the agent to mount.
         for (index, mount) in crate::volume::block_mounts(volumes) {
-            spec.drives.push(DriveSpec {
+            spec.devices.drives.push(DriveSpec {
                 id: crate::volume::drive_id(index, guest_os),
                 path: volume_image(index),
                 is_root: false,
                 is_read_only: mount.is_read_only,
             });
         }
-        spec.is_vsock_enabled = true;
+        spec.devices.is_vsock_enabled = true;
         spec.is_nested_virt_enabled = resources.is_nested_virt_enabled;
-        spec.net = Some(NetSpec {
+        spec.devices.net = Some(NetSpec {
             tap: tap_name.to_string(),
             guest_mac: Some(lease.guest_mac()),
         });
@@ -8688,7 +8695,7 @@ impl SandboxManager {
             spec.boot = crate::boot::firmware_boot();
         }
         if is_tpm {
-            spec.tpm = Some(self.config.tpm(id, lease.block));
+            spec.devices.tpm = Some(self.config.tpm(id, lease.block));
         }
         if crate::macnode::is_macos(guest_os)
             && let Err(err) = crate::macnode::apply(&mut spec, resources)
@@ -9263,7 +9270,7 @@ impl SandboxManager {
                     .await
                     .unwrap_or(false)
             {
-                spec.prefetch = Some(crate::warm::PREFETCH_PLAN.to_string());
+                spec.restore.memory.prefetch = Some(crate::warm::PREFETCH_PLAN.to_string());
             }
             if let Err(err) = self.usernets.attach(&id, &lease, &mut spec) {
                 return Err(guard.fail(err).await);
@@ -10807,12 +10814,12 @@ impl SandboxManager {
                     .await
                     .unwrap_or(false);
             if linked || merged {
-                spec.prefetch = Some(crate::warm::PREFETCH_PLAN.to_string());
+                spec.restore.memory.prefetch = Some(crate::warm::PREFETCH_PLAN.to_string());
             }
         }
         let boot_spec = spec.clone();
-        spec.memory_chain = chain.clone();
-        spec.memory_source = arriving.clone().map(|h| burrow_vmm::MemorySource(h));
+        spec.restore.memory.chain = chain.clone();
+        spec.restore.memory.source = arriving.clone().map(|h| burrow_vmm::MemorySource(h));
         record_working_set(&mut spec, self.config.object_store.is_some());
         phases.mark("spec");
 
@@ -13316,13 +13323,13 @@ impl SandboxManager {
 /// whose state goes to the object store. Only where the handler serves memory
 /// anyway: asking for a recording turns it on, and for a single snapshot file
 /// the kernel serves memory more cheaply.
-fn record_working_set(spec: &mut VmSpec, is_stored: bool) {
-    let is_served = spec.is_memory_lazy
-        || spec.memory_chain.len() > 1
-        || spec.prefetch.is_some()
-        || spec.memory_source.is_some();
+fn record_working_set(spec: &mut MachineSpec, is_stored: bool) {
+    let is_served = spec.restore.memory.is_lazy
+        || spec.restore.memory.chain.len() > 1
+        || spec.restore.memory.prefetch.is_some()
+        || spec.restore.memory.source.is_some();
     if is_stored && is_served {
-        spec.record_prefetch = Some(crate::durable::WORKING_SET.to_string());
+        spec.restore.memory.record_prefetch = Some(crate::durable::WORKING_SET.to_string());
     }
 }
 
@@ -15356,7 +15363,7 @@ pub(crate) mod tests {
             base_record: std::sync::Mutex::new(common::Sandbox::default()),
             state: std::sync::atomic::AtomicI32::new(common::SandboxState::Running as i32),
             vm: Mutex::new(None),
-            spec: std::sync::Mutex::new(VmSpec::new(
+            spec: std::sync::Mutex::new(MachineSpec::new(
                 id,
                 &workdir,
                 burrow_vmm::Backend::Firecracker(burrow_vmm::FirecrackerConfig {
@@ -15364,6 +15371,7 @@ pub(crate) mod tests {
                     jail: None,
                     io_engine: Default::default(),
                     is_huge_page_fill_enabled: true,
+                    is_pci_enabled: false,
                 }),
             )),
             agent_channel: Mutex::new(None),
@@ -15652,6 +15660,7 @@ pub(crate) mod tests {
                 jail: None,
                 io_engine: Default::default(),
                 is_huge_page_fill_enabled: true,
+                is_pci_enabled: false,
             });
             spec.cgroup_root = None;
             spec.clone()
@@ -16325,7 +16334,7 @@ pub(crate) mod tests {
             base_record: std::sync::Mutex::new(common::Sandbox::default()),
             state: std::sync::atomic::AtomicI32::new(common::SandboxState::Running as i32),
             vm: Mutex::new(None),
-            spec: std::sync::Mutex::new(VmSpec::new(
+            spec: std::sync::Mutex::new(MachineSpec::new(
                 "sbx_a",
                 &workdir,
                 burrow_vmm::Backend::Firecracker(burrow_vmm::FirecrackerConfig {
@@ -16333,6 +16342,7 @@ pub(crate) mod tests {
                     jail: None,
                     io_engine: Default::default(),
                     is_huge_page_fill_enabled: true,
+                    is_pci_enabled: false,
                 }),
             )),
             agent_channel: Mutex::new(None),
@@ -16366,7 +16376,7 @@ pub(crate) mod tests {
         ));
         std::fs::create_dir_all(&workdir).unwrap();
         let sandbox = sandbox_in(workdir.clone());
-        sandbox.spec.lock().unwrap().drives = vec![
+        sandbox.spec.lock().unwrap().devices.drives = vec![
             DriveSpec::root_rw(crate::rootdisk::ROOT_DISK),
             DriveSpec {
                 id: "volume0".into(),
@@ -16419,7 +16429,7 @@ pub(crate) mod tests {
         ));
         std::fs::create_dir_all(&workdir).unwrap();
         let sandbox = sandbox_in(workdir.clone());
-        sandbox.spec.lock().unwrap().drives =
+        sandbox.spec.lock().unwrap().devices.drives =
             vec![DriveSpec::scratch_rw(crate::rootdisk::ROOT_DISK)];
         std::fs::write(workdir.join("snapshot.vmstate"), b"x").unwrap();
         // No memory file: the snapshot did not land, so the suspend must not.

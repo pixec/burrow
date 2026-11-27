@@ -12,7 +12,7 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use burrow_proto::guest::v1 as guestpb;
-use burrow_vmm::{DriveSpec, Vm, VmSpec};
+use burrow_vmm::{DriveSpec, MachineSpec, Vm};
 use tonic::Status;
 
 /// The helper's root, in the node's data directory and, while it runs, in the
@@ -55,7 +55,7 @@ impl Resizer {
         &self,
         data_dir: &Path,
         guest_binary: &Path,
-        mut spec: VmSpec,
+        mut spec: MachineSpec,
         disk: &str,
         target_bytes: u64,
         vmm_overhead_mib: u32,
@@ -81,7 +81,7 @@ impl Resizer {
                 burrow_vmm::DEFAULT_BOOT_ARGS
             ),
         };
-        spec.drives = vec![
+        spec.devices.drives = vec![
             DriveSpec::root_ro(HELPER_IMAGE),
             DriveSpec {
                 id: "disk".into(),
@@ -90,9 +90,9 @@ impl Resizer {
                 is_read_only: false,
             },
         ];
-        spec.net = None;
-        spec.vcpus = 1;
-        spec.mem_mib = HELPER_MEM_MIB;
+        spec.devices.net = None;
+        spec.cpu.vcpus = 1;
+        spec.memory.mib = HELPER_MEM_MIB;
         spec.limits = crate::sandbox::cgroup_limits(
             &burrow_proto::common::v1::ResourcePolicy {
                 vcpus: 1,
@@ -101,13 +101,13 @@ impl Resizer {
             spec.hypervisor()
                 .memory_ceiling_mib(HELPER_MEM_MIB, vmm_overhead_mib),
         );
-        spec.is_vsock_enabled = true;
-        spec.is_dirty_pages_tracked = false;
-        spec.is_memory_lazy = false;
-        spec.memory_chain.clear();
-        spec.prefetch = None;
-        spec.record_prefetch = None;
-        spec.memory_source = None;
+        spec.devices.is_vsock_enabled = true;
+        spec.restore.is_dirty_pages_tracked = false;
+        spec.restore.memory.is_lazy = false;
+        spec.restore.memory.chain.clear();
+        spec.restore.memory.prefetch = None;
+        spec.restore.memory.record_prefetch = None;
+        spec.restore.memory.source = None;
         let result = run(spec, target_bytes, agent_timeout).await;
         let _ = tokio::fs::remove_file(&linked).await;
         result
@@ -115,7 +115,7 @@ impl Resizer {
 }
 
 async fn run(
-    spec: VmSpec,
+    spec: MachineSpec,
     target_bytes: u64,
     agent_timeout: Duration,
 ) -> Result<guestpb::RootDiskResponse, Status> {

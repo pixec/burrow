@@ -22,7 +22,7 @@ use super::{
     dropped, file_url, invalid, ns_error, write_machine_id,
 };
 use crate::error::Result;
-use crate::{Backend, Boot, DriveSpec, GuestOs, NetSpec, VmSpec};
+use crate::{Backend, Boot, DriveSpec, GuestOs, MachineSpec, NetSpec};
 
 const PROGRESS_INTERVAL: Duration = Duration::from_secs(10);
 
@@ -157,14 +157,14 @@ pub async fn install(
 
 /// The machine the installer runs, as Apple's sample configures it: the
 /// template's own files, NAT, no vsock.
-fn template_spec(dir: &Path, installed: &InstalledImage) -> Result<VmSpec> {
-    let mut spec = VmSpec::new("install", dir, Backend::Vz(VzConfig::default()));
+fn template_spec(dir: &Path, installed: &InstalledImage) -> Result<MachineSpec> {
+    let mut spec = MachineSpec::new("install", dir, Backend::Vz(VzConfig::default()));
     spec.guest_os = GuestOs::MacOs;
     spec.boot = Boot::MacOs(MacOsBoot::read(dir)?);
-    spec.drives = vec![root_drive()];
-    spec.vcpus = installed.vcpus;
-    spec.mem_mib = installed.mem_mib;
-    spec.net = Some(NetSpec {
+    spec.devices.drives = vec![root_drive()];
+    spec.cpu.vcpus = installed.vcpus;
+    spec.memory.mib = installed.mem_mib;
+    spec.devices.net = Some(NetSpec {
         tap: String::new(),
         guest_mac: None,
     });

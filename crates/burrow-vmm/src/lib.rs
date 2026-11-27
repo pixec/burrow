@@ -9,9 +9,10 @@
 //! The backends are an enum rather than trait objects. The set is closed and
 //! lives in this crate, and every operation is async, which a `dyn` trait can
 //! only express by boxing each future. Each variant implements
-//! [`machine::Machine`], whose defaults refuse what a backend cannot do, and
+//! `Machine`, whose defaults refuse what a backend cannot do, and
 //! [`Vm`] dispatches to it.
 
+mod caps;
 mod cgroup;
 mod child;
 pub mod console;
@@ -22,6 +23,7 @@ pub mod jail;
 mod machine;
 mod process;
 mod snapfile;
+mod spec;
 mod vsock;
 
 pub mod cloud_hypervisor;
@@ -31,9 +33,9 @@ pub mod swtpm;
 #[cfg(target_os = "macos")]
 pub mod vz;
 
-use std::path::PathBuf;
 use std::time::Duration;
 
+pub use caps::{Capabilities, HypervisorExt, Layout, VZ_SAVE_FILE, is_nested_virt_supported};
 pub use cgroup::{Cgroup, Limits, is_io_weight_supported, sweep_empty_cgroups};
 pub use cloud_hypervisor::{ChJail, CloudHypervisorConfig};
 pub use error::{Error, Result};
@@ -42,6 +44,10 @@ pub use guest::{GUEST_CID, GuestAddr, VSOCK_UDS};
 pub use jail::JailLayout;
 use machine::Machine;
 pub use memfile::{data_extents, merge_chain};
+pub use spec::{
+    Backend, Boot, ConsoleSpec, CpuSpec, Devices, DriveSpec, MachineSpec, MemorySpec, NetSpec,
+    RestoreMemory, RestoreSpec, TpmSpec,
+};
 #[cfg(target_os = "macos")]
 pub use vz::{MacOsBoot, Requirements, VzConfig};
 
@@ -122,7 +128,7 @@ impl std::fmt::Display for Phases {
 pub enum Restoring {
     Firecracker(Box<firecracker::MicroVm>),
     /// A backend that starts and loads in one step, which happens at load.
-    Later(Box<VmSpec>),
+    Later(Box<MachineSpec>),
 }
 
 impl Restoring {
@@ -140,54 +146,6 @@ impl Restoring {
     }
 }
 
-/// A disk the guest sees, in the order it sees them.
-#[derive(Debug, Clone)]
-pub struct DriveSpec {
-    pub id: String,
-    /// Path relative to the VM working directory.
-    pub path: String,
-    pub is_root: bool,
-    pub is_read_only: bool,
-}
-
-impl DriveSpec {
-    pub fn root_ro(path: impl Into<String>) -> Self {
-        Self {
-            id: "rootfs".into(),
-            path: path.into(),
-            is_root: true,
-            is_read_only: true,
-        }
-    }
-
-    /// The sandbox's own root disk, which the guest mounts read-write as `/`.
-    pub fn root_rw(path: impl Into<String>) -> Self {
-        Self {
-            id: "rootfs".into(),
-            path: path.into(),
-            is_root: true,
-            is_read_only: false,
-        }
-    }
-
-    pub fn scratch_rw(path: impl Into<String>) -> Self {
-        Self {
-            id: "scratch".into(),
-            path: path.into(),
-            is_root: false,
-            is_read_only: false,
-        }
-    }
-}
-
-#[derive(Debug, Clone)]
-pub struct NetSpec {
-    /// Host tap device name. A restore names the sandbox's own, whatever the
-    /// snapshot was taken with.
-    pub tap: String,
-    pub guest_mac: Option<String>,
-}
-
 pub use burrow_common::hypervisor::{GuestOs, Hypervisor};
 
 const MEMORY_POLL: Duration = Duration::from_millis(50);
@@ -195,401 +153,6 @@ const MEMORY_POLL: Duration = Duration::from_millis(50);
 /// taken to have stopped where it is.
 const MEMORY_STALL: Duration = Duration::from_secs(3);
 const MEMORY_TIMEOUT: Duration = Duration::from_secs(120);
-
-/// The framework's save file, device state and memory in one: both halves of
-/// the vz backend's [`Layout`]. Named here so every build knows the layout
-/// of state a Mac node wrote.
-pub const VZ_SAVE_FILE: &str = "snapshot.vzsave";
-
-/// What this crate knows about each hypervisor: what its backend can do and
-/// the files its snapshots are made of.
-pub trait HypervisorExt {
-    fn capabilities(self) -> Capabilities;
-    /// The files a snapshot of this hypervisor's VM is made of.
-    fn layout(self) -> Layout;
-}
-
-impl HypervisorExt for Hypervisor {
-    fn capabilities(self) -> Capabilities {
-        match self {
-            Self::Firecracker => Capabilities {
-                is_diff_snapshot_supported: true,
-                is_lazy_memory_supported: true,
-                is_drive_hotplug_supported: true,
-                is_jailable: true,
-                guest_oses: &[GuestOs::Linux],
-                is_warm_pool_supported: true,
-                is_tap_networked: true,
-                is_live_disk_growth_supported: true,
-                is_vcpu_hotplug_supported: false,
-                is_memory_hotplug_supported: true,
-                is_acpi_memory_hotplug_supported: false,
-                is_nested_virt_supported: false,
-            },
-            // Cloud Hypervisor copies guest memory in at restore, and its
-            // own on-demand mode cannot be pointed at burrow's page-fault
-            // handler: no chains, no prefetch plans, no memory still arriving
-            // from the object store.
-            Self::CloudHypervisor => Capabilities {
-                is_diff_snapshot_supported: false,
-                is_lazy_memory_supported: false,
-                is_drive_hotplug_supported: true,
-                is_jailable: true,
-                // Windows on arm64 needs a vPMU, which KVM on the hosts tried
-                // could not give it.
-                guest_oses: if cfg!(target_arch = "x86_64") {
-                    &[GuestOs::Linux, GuestOs::Windows]
-                } else {
-                    &[GuestOs::Linux]
-                },
-                is_warm_pool_supported: true,
-                is_tap_networked: true,
-                is_live_disk_growth_supported: true,
-                // arm64 KVM creates every vCPU before the VM first runs, and
-                // refuses one created after with EBUSY.
-                is_vcpu_hotplug_supported: cfg!(target_arch = "x86_64"),
-                is_memory_hotplug_supported: true,
-                is_acpi_memory_hotplug_supported: cfg!(target_arch = "x86_64"),
-                is_nested_virt_supported: cfg!(target_arch = "x86_64"),
-            },
-            // The framework saves a machine as one opaque file, reads it back
-            // itself and attaches storage only at configuration time.
-            Self::Vz => Capabilities {
-                is_diff_snapshot_supported: false,
-                is_lazy_memory_supported: false,
-                is_drive_hotplug_supported: false,
-                is_jailable: false,
-                guest_oses: &[GuestOs::MacOs],
-                // A restore takes longer than a cold boot, and a saved state
-                // restores into only one running machine at a time.
-                is_warm_pool_supported: false,
-                is_tap_networked: false,
-                is_live_disk_growth_supported: false,
-                is_vcpu_hotplug_supported: false,
-                // A running machine's memory can only be ballooned below what
-                // it was configured with, never raised.
-                is_memory_hotplug_supported: false,
-                is_acpi_memory_hotplug_supported: false,
-                is_nested_virt_supported: false,
-            },
-        }
-    }
-
-    fn layout(self) -> Layout {
-        match self {
-            Self::Firecracker => Layout {
-                state: firecracker::SNAPSHOT_FILE,
-                memory: Some(firecracker::SNAPSHOT_MEM_FILE),
-            },
-            Self::CloudHypervisor => Layout {
-                state: cloud_hypervisor::STATE_FILE,
-                memory: Some(cloud_hypervisor::MEMORY_FILE),
-            },
-            Self::Vz => Layout {
-                state: VZ_SAVE_FILE,
-                memory: None,
-            },
-        }
-    }
-}
-
-/// What a backend can do, which is all the daemon branches on.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct Capabilities {
-    /// A snapshot can record only the pages dirtied since the last one, layered
-    /// over it as a chain, so a suspend writes a fraction of the guest.
-    pub is_diff_snapshot_supported: bool,
-    /// Restored memory can be served by burrow's page-fault handler: a chain of
-    /// layers, a prefetch plan, a base still arriving from the object store.
-    /// Without it a restore needs the whole memory image on disk first.
-    pub is_lazy_memory_supported: bool,
-    /// A drive can be attached to a running guest. It is how a volume reaches a
-    /// sandbox restored from a snapshot taken without it; without it such a
-    /// sandbox has to boot cold to get one.
-    pub is_drive_hotplug_supported: bool,
-    /// The VMM can run confined to the sandbox's directory as an unprivileged
-    /// uid: Firecracker under its jailer, Cloud Hypervisor in the jail burrowd
-    /// builds for it. A backend without it keeps its files in the ordinary
-    /// sandbox directory and runs as the daemon does.
-    pub is_jailable: bool,
-    /// Guests it can boot.
-    pub guest_oses: &'static [GuestOs],
-    /// Restoring a template's warm snapshot beats booting it, and one
-    /// snapshot can be restored into many sandboxes at once.
-    pub is_warm_pool_supported: bool,
-    /// The guest's NIC is a host tap, which the node's firewall polices. A
-    /// backend without one has no network until it is given its own.
-    pub is_tap_networked: bool,
-    /// A running guest can be told its disk grew ([`Vm::resize_disk`]), and
-    /// grow the filesystem on it. Without it a disk grows only while its
-    /// sandbox is shut down.
-    pub is_live_disk_growth_supported: bool,
-    /// A running guest can be given vCPUs up to [`VmSpec::max_vcpus`] and
-    /// have them taken away again ([`Vm::resize_vcpus`]).
-    pub is_vcpu_hotplug_supported: bool,
-    /// A Linux guest can be booted with a virtio-mem region of
-    /// [`VmSpec::mem_hotplug_mib`] and have memory plugged into it and
-    /// unplugged from it while it runs ([`Vm::resize_memory`]). The guest
-    /// kernel needs `CONFIG_VIRTIO_MEM`.
-    pub is_memory_hotplug_supported: bool,
-    /// A Windows guest, which has no virtio-mem driver, can be booted with an
-    /// ACPI hotplug region of [`VmSpec::mem_hotplug_mib`] and have memory
-    /// added to it in [`ACPI_MEMORY_BLOCK_MIB`] steps while it runs, at most
-    /// [`ACPI_MEMORY_SLOTS`] times per boot. Nothing added is taken away
-    /// until the guest boots again.
-    pub is_acpi_memory_hotplug_supported: bool,
-    /// A guest can be shown the host's virtualization extensions and run
-    /// KVM itself ([`VmSpec::is_nested_virt_enabled`]). Firecracker masks
-    /// them out of every guest's CPUID.
-    pub is_nested_virt_supported: bool,
-}
-
-impl Capabilities {
-    pub fn runs(&self, os: GuestOs) -> bool {
-        self.guest_oses.contains(&os)
-    }
-}
-
-/// Whether this host's KVM lets a guest run KVM itself: `kvm_amd` or
-/// `kvm_intel` loaded with `nested` on, which a node that is itself a VM has
-/// only where its own host passes the extensions through.
-pub fn is_nested_virt_supported() -> bool {
-    ["kvm_amd", "kvm_intel"].iter().any(|module| {
-        std::fs::read_to_string(format!("/sys/module/{module}/parameters/nested"))
-            .is_ok_and(|value| is_on(&value))
-    })
-}
-
-/// A KVM module parameter's reading: `kvm_amd` prints an int, `kvm_intel` a
-/// bool.
-fn is_on(value: &str) -> bool {
-    matches!(value.trim(), "1" | "Y")
-}
-
-/// Where a snapshot's two halves live in a VM's working directory.
-///
-/// Fixed names, identical for every sandbox under one hypervisor, which is what
-/// lets a snapshot be linked from one sandbox's directory into another's and
-/// restored there unchanged.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct Layout {
-    /// The device and vCPU state, small, rewritten by every snapshot.
-    pub state: &'static str,
-    /// The guest's memory, or the base of its chain where diffs are supported.
-    /// `None` where the backend saves memory inside the state file, so there
-    /// is no memory image to chunk, serve lazily or layer diffs over.
-    pub memory: Option<&'static str>,
-}
-
-impl Layout {
-    /// The snapshot's files, state first.
-    pub fn files(&self) -> impl Iterator<Item = &'static str> {
-        std::iter::once(self.state).chain(self.memory)
-    }
-
-    /// The diff written by a suspend while `index` layers already exist.
-    pub fn diff(index: usize) -> String {
-        format!("snapshot.diff{index}.mem")
-    }
-
-    /// The index [`Self::diff`] named `file` with, if it is a diff at all.
-    pub fn diff_index(file: &str) -> Option<usize> {
-        file.strip_prefix("snapshot.diff")
-            .and_then(|rest| rest.strip_suffix(".mem"))
-            .and_then(|index| index.parse().ok())
-    }
-}
-
-/// The hypervisor a VM runs under, and how this node runs it.
-#[derive(Debug, Clone)]
-pub enum Backend {
-    Firecracker(FirecrackerConfig),
-    CloudHypervisor(CloudHypervisorConfig),
-    #[cfg(target_os = "macos")]
-    Vz(VzConfig),
-}
-
-impl Backend {
-    pub fn hypervisor(&self) -> Hypervisor {
-        match self {
-            Self::Firecracker(_) => Hypervisor::Firecracker,
-            Self::CloudHypervisor(_) => Hypervisor::CloudHypervisor,
-            #[cfg(target_os = "macos")]
-            Self::Vz(_) => Hypervisor::Vz,
-        }
-    }
-}
-
-impl Default for Boot {
-    /// The template's own kernel, which is every Linux sandbox's boot.
-    fn default() -> Self {
-        Self::Kernel {
-            kernel: "vmlinux".into(),
-            cmdline: DEFAULT_BOOT_ARGS.into(),
-        }
-    }
-}
-
-/// What the machine boots from, beneath its drives.
-#[derive(Debug, Clone)]
-pub enum Boot {
-    /// A Linux kernel, relative to the VM's working directory, with its
-    /// command line.
-    Kernel { kernel: String, cmdline: String },
-    /// UEFI firmware, which boots the first drive. `None` is the one the
-    /// backend ships; a Windows guest under Cloud Hypervisor gets that even
-    /// when its spec names a kernel, as it always has.
-    Firmware { firmware: Option<PathBuf> },
-    /// A macOS install's own boot loader and platform identity.
-    #[cfg(target_os = "macos")]
-    MacOs(MacOsBoot),
-}
-
-/// Everything needed to start or restore one VM.
-///
-/// Paths are relative to `workdir`, so a snapshot restored in another
-/// sandbox's directory finds the same files under the same names.
-#[derive(Debug, Clone)]
-pub struct VmSpec {
-    pub vm_id: String,
-    pub workdir: PathBuf,
-    pub backend: Backend,
-    pub guest_os: GuestOs,
-    pub boot: Boot,
-    /// In the order the guest sees them: it finds its disks by position.
-    pub drives: Vec<DriveSpec>,
-    /// Put virtio devices on a PCI bus instead of MMIO. Firecracker only: Cloud
-    /// Hypervisor is always PCI.
-    ///
-    /// Required for hotplug, which is the only way to attach a volume to a
-    /// sandbox restored from a warm snapshot: a snapshot restores only into
-    /// the drive set it was captured with, and the warm snapshot is shared by
-    /// every sandbox restored from it. Enabling it changes the transport for
-    /// every device, so a snapshot taken under one setting cannot be restored
-    /// under the other.
-    pub is_pci_enabled: bool,
-    pub vcpus: u32,
-    /// vCPUs the guest is booted able to take, where
-    /// [`Capabilities::is_vcpu_hotplug_supported`]; never below `vcpus`.
-    pub max_vcpus: u32,
-    /// The memory the guest boots with.
-    pub mem_mib: u32,
-    /// The virtio-mem region above it, which memory is plugged into while the
-    /// guest runs; 0 for none. A multiple of [`MEMORY_REGION_ALIGN_MIB`], and
-    /// only where [`Capabilities::is_memory_hotplug_supported`]. A restore
-    /// takes the region and what is plugged in it from the snapshot.
-    pub mem_hotplug_mib: u32,
-    /// How much of the region is plugged now: none at a boot, what the
-    /// snapshot holds at a restore, and whatever [`Vm::resize_memory`] reached
-    /// since.
-    pub mem_plugged_mib: u32,
-    pub net: Option<NetSpec>,
-
-    /// Enable virtio-vsock, the transport the guest agent speaks.
-    pub is_vsock_enabled: bool,
-    /// Needed for diff snapshots. Firecracker only turns on KVM's dirty log
-    /// for a restore that maps the memory file directly.
-    pub is_dirty_pages_tracked: bool,
-    /// The lazy-memory knobs below are honoured only where
-    /// [`Capabilities::is_lazy_memory_supported`].
-    ///
-    /// Serve guest memory lazily on restore instead of letting the kernel page
-    /// the whole memory file in. Ignored on a cold boot, which has no memory
-    /// file to serve from.
-    pub is_memory_lazy: bool,
-    /// Memory files to restore from, oldest first: a full base followed by any
-    /// diff snapshots layered over it. Empty means the conventional memory
-    /// file alone. More than one entry forces the page-fault handler on,
-    /// because a chain has no single file for the kernel to map.
-    pub memory_chain: Vec<String>,
-    /// Pages to populate before the guest runs, relative to the working
-    /// directory. Recorded from an earlier restore of the same snapshot.
-    pub prefetch: Option<String>,
-    /// Where to record the pages this VM faults on, relative to the working
-    /// directory. Set only when profiling a snapshot.
-    pub record_prefetch: Option<String>,
-    /// Where the base of `memory_chain` is still being filled in from. Forces
-    /// the page-fault handler on, since the kernel would map the holes as
-    /// zeroes.
-    pub memory_source: Option<MemorySource>,
-    /// Host resource caps, applied to the VMM process.
-    pub limits: Limits,
-    /// cgroup2 mount point; `None` disables limit enforcement.
-    pub cgroup_root: Option<PathBuf>,
-    pub is_limits_required: bool,
-    /// Puts a Cloud Hypervisor guest's console on a socket the caller holds,
-    /// so it takes input the way Firecracker's does on its stdin. For the dev
-    /// harness: output reaches the console log only while the VM's handle is
-    /// alive to copy it there.
-    pub is_console_interactive: bool,
-    /// Shows the guest the host's virtualization extensions (SVM or VMX), so
-    /// it gets a `/dev/kvm` of its own. Only where
-    /// [`Capabilities::is_nested_virt_supported`], on a host whose KVM has
-    /// nesting on ([`is_nested_virt_supported`]); the guest kernel needs
-    /// `CONFIG_KVM_AMD` or `CONFIG_KVM_INTEL`.
-    pub is_nested_virt_enabled: bool,
-    /// A TPM 2.0 for the guest, from an swtpm the backend starts and stops
-    /// with the VMM. Cloud Hypervisor only.
-    pub tpm: Option<TpmSpec>,
-}
-
-/// Where a guest's TPM emulator comes from and keeps its state.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct TpmSpec {
-    pub swtpm: PathBuf,
-    /// The emulator's state and control socket, outside the VM's working
-    /// directory.
-    pub dir: PathBuf,
-    /// The uid and gid the emulator runs as: its sandbox's alone, neither
-    /// root, the jail's, nor another sandbox's, so it can neither read
-    /// another TPM's state nor signal another process.
-    pub uid: u32,
-}
-
-impl VmSpec {
-    pub fn new(vm_id: impl Into<String>, workdir: impl Into<PathBuf>, backend: Backend) -> Self {
-        Self {
-            vm_id: vm_id.into(),
-            workdir: workdir.into(),
-            backend,
-            guest_os: GuestOs::Linux,
-            boot: Boot::default(),
-            drives: Vec::new(),
-            is_pci_enabled: false,
-            vcpus: 1,
-            max_vcpus: 0,
-            mem_mib: 512,
-            mem_hotplug_mib: 0,
-            mem_plugged_mib: 0,
-            net: None,
-            is_vsock_enabled: false,
-            is_dirty_pages_tracked: false,
-            is_memory_lazy: false,
-            memory_chain: Vec::new(),
-            prefetch: None,
-            record_prefetch: None,
-            memory_source: None,
-            limits: Limits::default(),
-            cgroup_root: Some(PathBuf::from("/sys/fs/cgroup")),
-            is_limits_required: false,
-            is_console_interactive: false,
-            is_nested_virt_enabled: false,
-            tpm: None,
-        }
-    }
-
-    pub fn hypervisor(&self) -> Hypervisor {
-        self.backend.hypervisor()
-    }
-
-    pub fn capabilities(&self) -> Capabilities {
-        self.hypervisor().capabilities()
-    }
-
-    pub fn layout(&self) -> Layout {
-        self.hypervisor().layout()
-    }
-}
 
 /// Runs `$body` with `$vm` bound to the backend VM inside a [`Vm`].
 macro_rules! dispatch {
@@ -614,8 +177,9 @@ pub enum Vm {
 }
 
 impl Vm {
-    /// Starts a VM and boots its guest from [`VmSpec::boot`].
-    pub async fn boot(spec: VmSpec) -> Result<Self> {
+    /// Starts a VM and boots its guest from [`MachineSpec::boot`].
+    pub async fn boot(spec: MachineSpec) -> Result<Self> {
+        spec.capabilities().check(&spec, None)?;
         match spec.backend.clone() {
             Backend::Firecracker(config) => Ok(Self::Firecracker(Box::new(
                 firecracker::MicroVm::boot(spec, config).await?,
@@ -630,18 +194,22 @@ impl Vm {
 
     /// Starts the VMM for [`Restoring::load`], before the snapshot it loads
     /// need be in `spec.workdir`, so the two can be made ready together.
-    pub async fn launch(spec: VmSpec) -> Result<Restoring> {
+    pub async fn launch(spec: MachineSpec) -> Result<Restoring> {
         match spec.backend.clone() {
-            Backend::Firecracker(config) => Ok(Restoring::Firecracker(Box::new(
-                firecracker::MicroVm::launch(spec, config).await?,
-            ))),
+            Backend::Firecracker(config) => {
+                spec.capabilities().check(&spec, Some(&spec.restore))?;
+                Ok(Restoring::Firecracker(Box::new(
+                    firecracker::MicroVm::launch(spec, config).await?,
+                )))
+            }
             _ => Ok(Restoring::Later(Box::new(spec))),
         }
     }
 
     /// Starts a VM from the snapshot in `spec.workdir` instead of booting.
     /// `spec` must describe the same machine the snapshot was taken of.
-    pub async fn restore(spec: VmSpec, resume: bool) -> Result<Self> {
+    pub async fn restore(spec: MachineSpec, resume: bool) -> Result<Self> {
+        spec.capabilities().check(&spec, Some(&spec.restore))?;
         match spec.backend.clone() {
             Backend::Firecracker(config) => Ok(Self::Firecracker(Box::new(
                 firecracker::MicroVm::restore(spec, config, resume).await?,
@@ -798,7 +366,7 @@ impl Vm {
     }
 
     /// Sets the running guest's vCPUs to `vcpus`, within the
-    /// [`VmSpec::max_vcpus`] it was booted with.
+    /// [`CpuSpec::max_vcpus`] it was booted with.
     /// Only where [`Capabilities::is_vcpu_hotplug_supported`].
     pub async fn resize_vcpus(&self, vcpus: u32) -> Result<()> {
         dispatch!(self, vm => vm.resize_vcpus(vcpus).await)
@@ -875,71 +443,5 @@ impl Vm {
     /// Stops the VMM and reaps it, then releases its cgroup.
     pub async fn kill(self) -> Result<()> {
         dispatch!(self, vm => (*vm).kill().await)
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn nesting_reads_on_from_either_kvm_module() {
-        assert!(is_on("1\n"));
-        assert!(is_on("Y\n"));
-        assert!(!is_on("0\n"));
-        assert!(!is_on("N\n"));
-    }
-
-    #[test]
-    fn names_round_trip_and_an_empty_record_is_refused() {
-        for hypervisor in Hypervisor::ALL {
-            assert_eq!(hypervisor.as_str().parse::<Hypervisor>(), Ok(hypervisor));
-        }
-        assert_eq!(Hypervisor::from_record(""), None);
-        assert_eq!(Hypervisor::from_record("kvmtool"), None);
-        assert_eq!(GuestOs::from_record(""), Some(GuestOs::Linux));
-    }
-
-    /// A Windows template has no Firecracker to fall back on, and a Linux one
-    /// keeps the backend every existing sandbox runs under.
-    #[test]
-    fn the_default_hypervisor_follows_the_guest() {
-        assert_eq!(GuestOs::Linux.default_hypervisor(), Hypervisor::Firecracker);
-        assert_eq!(
-            GuestOs::Windows.default_hypervisor(),
-            Hypervisor::CloudHypervisor
-        );
-    }
-
-    /// Two backends sharing a file name would let one restore the other's
-    /// snapshot, which fails deep inside the VMM rather than at a check.
-    #[test]
-    fn each_backend_owns_distinct_snapshot_files() {
-        let fc = Hypervisor::Firecracker.layout();
-        assert_eq!(fc.state, "snapshot.vmstate");
-        assert_eq!(fc.memory, Some("snapshot.mem"));
-        for hypervisor in &Hypervisor::ALL[1..] {
-            let layout = hypervisor.layout();
-            for name in layout.files() {
-                assert!(fc.files().all(|fc| fc != name), "{name} is shared");
-                assert_eq!(Layout::diff_index(name), None);
-            }
-        }
-    }
-
-    /// Only a backend that keeps memory inside its state has no memory file,
-    /// which is what keeps the daemon from chunking or serving one.
-    #[test]
-    fn memory_is_a_file_of_its_own_on_linux_backends() {
-        assert!(Hypervisor::Firecracker.layout().memory.is_some());
-        assert!(Hypervisor::CloudHypervisor.layout().memory.is_some());
-    }
-
-    #[test]
-    fn diffs_are_numbered_and_parsed_back() {
-        assert_eq!(Layout::diff(3), "snapshot.diff3.mem");
-        assert_eq!(Layout::diff_index("snapshot.diff10.mem"), Some(10));
-        assert_eq!(Layout::diff_index("snapshot.mem"), None);
-        assert_eq!(Layout::diff_index("snapshot.diffx.mem"), None);
     }
 }

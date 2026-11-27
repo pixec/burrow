@@ -44,7 +44,7 @@ mod macos {
     use burrow_proxy::policy::NetworkMode;
     use burrow_proxy::{AuditLog, EgressEvent, SandboxPolicy};
     use burrow_vmm::vz::{self, VzConfig};
-    use burrow_vmm::{Backend, Boot, GuestOs, NetSpec, Vm, VmSpec};
+    use burrow_vmm::{Backend, Boot, GuestOs, MachineSpec, NetSpec, Vm};
     use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
     use tokio::sync::watch;
 
@@ -127,13 +127,13 @@ mod macos {
             network: vz::Network::Datagram(guest_end),
             ..VzConfig::default()
         };
-        let mut spec = VmSpec::new("usernet", dir, Backend::Vz(config));
+        let mut spec = MachineSpec::new("usernet", dir, Backend::Vz(config));
         spec.guest_os = GuestOs::MacOs;
-        spec.vcpus = cpus.unwrap_or(boot.requirements.min_vcpus);
-        spec.mem_mib = mem_mib.unwrap_or(boot.requirements.min_mem_mib);
+        spec.cpu.vcpus = cpus.unwrap_or(boot.requirements.min_vcpus);
+        spec.memory.mib = mem_mib.unwrap_or(boot.requirements.min_mem_mib);
         spec.boot = Boot::MacOs(boot);
-        spec.drives = vec![vz::root_drive()];
-        spec.net = Some(NetSpec {
+        spec.devices.drives = vec![vz::root_drive()];
+        spec.devices.net = Some(NetSpec {
             tap: String::new(),
             guest_mac: Some(
                 mac.iter()
@@ -142,7 +142,7 @@ mod macos {
                     .join(":"),
             ),
         });
-        spec.is_vsock_enabled = true;
+        spec.devices.is_vsock_enabled = true;
         let vm = Vm::boot(spec).await?;
         println!(
             "started in {:?}; ssh -p {ssh_port} burrow@127.0.0.1",
